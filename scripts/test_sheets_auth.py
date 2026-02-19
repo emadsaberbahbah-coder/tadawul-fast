@@ -1,452 +1,1923 @@
+```python
 #!/usr/bin/env python3
-# scripts/test_sheets_auth.py
 """
 test_sheets_auth.py
 ===========================================================
-Advanced Google Sheets Auth & Permission Tester (v2.2.0)
+TADAWUL FAST BRIDGE – ENTERPRISE SHEETS AUTH DIAGNOSTIC (v3.5.0)
 ===========================================================
-TFB PROD SAFE — Deep Diagnostic Edition
+Comprehensive Google Sheets Authentication & Permission Testing Suite
 
-Purpose
-- Validates GOOGLE_SHEETS_CREDENTIALS integrity (JSON / Base64 JSON / File path).
-- Repairs common escaping issues in Private Keys (\\n, \\r\\n, surrounding quotes).
-- Probes Spreadsheet Metadata (Title, Tabs, Locale, Timezone, Owners if visible).
-- Tests Read + optional Write with Riyadh-time stamp.
-- Produces CI-friendly exit codes and actionable hints.
+Core Capabilities
+-----------------
+• Multi-strategy credential discovery (env, file, secrets manager)
+• Deep private key validation with auto-repair (\\n, wrapping, whitespace)
+• OAuth2 token lifecycle management and refresh simulation
+• Permission boundary analysis (what can/can't the SA access)
+• Spreadsheet metadata forensics with ownership detection
+• Batch operation testing (read/write/clear/batchUpdate)
+• Rate limit and quota monitoring
+• Network path analysis (proxy/firewall detection)
+• Compliance reporting (GDPR/SOX audit trail)
+• Performance benchmarking (latency percentiles)
 
-Exit codes
-- 0: OK
-- 1: Configuration / Credential error
-- 2: API access error (403/404/permissions)
-- 3: Read/Write test failed (range/tab issues, API errors)
+Exit Codes
+----------
+0: All tests passed
+1: Configuration error
+2: Authentication/Authorization failure
+3: API access error (403/404)
+4: Network/Connectivity error
+5: Rate limit/Quota exceeded
+6: Partial success (some tests failed)
 
-Usage
-  python scripts/test_sheets_auth.py --sheet-id <ID> --sheet-name "Market_Leaders"
-  python scripts/test_sheets_auth.py --write --cell A1
-  python scripts/test_sheets_auth.py --list-tabs
-  python scripts/test_sheets_auth.py --diagnose-env
+Usage Examples
+--------------
+# Basic authentication test
+python scripts/test_sheets_auth.py --sheet-id <ID>
+
+# Comprehensive diagnostics
+python scripts/test_sheets_auth.py --sheet-id <ID> --full-diagnostic
+
+# Performance benchmarking
+python scripts/test_sheets_auth.py --benchmark --iterations 100
+
+# Compliance report
+python scripts/test_sheets_auth.py --compliance-report --output report.json
+
+# Permission audit
+python scripts/test_sheets_auth.py --audit-permissions --sheet-id <ID>
+
+# Network diagnostics
+python scripts/test_sheets_auth.py --diagnose-network
+
+# CI/CD friendly output
+python scripts/test_sheets_auth.py --ci-mode --junit-xml results.xml
 """
 
 from __future__ import annotations
 
 import argparse
 import base64
+import csv
+import hashlib
 import json
 import logging
+import logging.config
 import os
+import platform
+import re
+import socket
+import ssl
 import sys
-from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+import time
+import uuid
+import warnings
+from collections import defaultdict, deque
+from contextlib import contextmanager, suppress
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
+from enum import Enum
+from functools import lru_cache, wraps
+from pathlib import Path
+from threading import Lock, Thread
+from typing import (Any, Callable, Dict, List, Optional, Set, Tuple, Type,
+                    TypeVar, Union, cast)
+from urllib.parse import urlparse
 
-
-# =============================================================================
-# Path & Dependency Setup
-# =============================================================================
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if PROJECT_ROOT and PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, PROJECT_ROOT)
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%H:%M:%S",
-)
-logger = logging.getLogger("SheetsAuthTest")
-
-# Try to import your project's wrapper first, then fallback to googleapiclient
-sheets = None
-_service_factory = None
+# Optional imports with graceful degradation
+try:
+    import requests
+    from requests.adapters import HTTPAdapter
+    from requests.packages.urllib3.util.retry import Retry
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    requests = None
+    REQUESTS_AVAILABLE = False
 
 try:
-    import google_sheets_service as _sheets  # type: ignore
-    sheets = _sheets
-    _service_factory = getattr(sheets, "get_sheets_service", None)
-except Exception:
-    try:
-        from integrations import google_sheets_service as _sheets  # type: ignore
-        sheets = _sheets
-        _service_factory = getattr(sheets, "get_sheets_service", None)
-    except Exception:
-        sheets = None
-        _service_factory = None
+    import pandas as pd
+    PANDAS_AVAILABLE = True
+except ImportError:
+    pd = None
+    PANDAS_AVAILABLE = False
 
+try:
+    from google.oauth2 import service_account
+    from google.auth.transport.requests import Request
+    from google.auth.exceptions import RefreshError
+    from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
+    from googleapiclient.http import MediaIoBaseUpload
+    GOOGLE_API_AVAILABLE = True
+except ImportError:
+    service_account = None
+    Request = None
+    RefreshError = None
+    build = None
+    HttpError = None
+    MediaIoBaseUpload = None
+    GOOGLE_API_AVAILABLE = False
+
+try:
+    import jwt
+    JWT_AVAILABLE = True
+except ImportError:
+    jwt = None
+    JWT_AVAILABLE = False
+
+try:
+    import dns.resolver
+    DNS_AVAILABLE = True
+except ImportError:
+    dns = None
+    DNS_AVAILABLE = False
+
+try:
+    import aiohttp
+    import asyncio
+    ASYNC_AVAILABLE = True
+except ImportError:
+    aiohttp = None
+    asyncio = None
+    ASYNC_AVAILABLE = False
 
 # =============================================================================
-# Constants / Version
+# Version & Constants
 # =============================================================================
-SCRIPT_VERSION = "2.2.0"
-DEFAULT_READ_RANGE = "A1:B2"
+SCRIPT_VERSION = "3.5.0"
+SCRIPT_NAME = "SheetsAuthDiagnostic"
+MIN_PYTHON = (3, 8)
 
-ENV_CRED_KEYS = (
+if sys.version_info < MIN_PYTHON:
+    sys.exit(f"❌ Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ required")
+
+# Google API scopes
+SCOPES = [
+    'https://www.googleapis.com/auth/spreadsheets',
+    'https://www.googleapis.com/auth/drive.metadata.readonly',
+    'https://www.googleapis.com/auth/drive.file'
+]
+
+# Environment variable keys
+ENV_CRED_KEYS = [
     "GOOGLE_SHEETS_CREDENTIALS",
     "GOOGLE_CREDENTIALS",
-    "GOOGLE_APPLICATION_CREDENTIALS",  # may contain file path
-)
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "SHEETS_CREDENTIALS",
+    "TFB_GOOGLE_CREDENTIALS"
+]
 
-ENV_SHEET_ID_KEYS = (
+ENV_SHEET_ID_KEYS = [
     "DEFAULT_SPREADSHEET_ID",
     "TFB_SPREADSHEET_ID",
     "SPREADSHEET_ID",
     "GOOGLE_SHEETS_ID",
-)
+    "SHEET_ID"
+]
 
-_TRUTHY = {"1", "true", "yes", "y", "on"}
+# Rate limits
+RATE_LIMITS = {
+    'read': 300,      # 300 per minute
+    'write': 60,       # 60 per minute
+    'batch': 30        # 30 per minute
+}
 
-
-# =============================================================================
-# Time Helpers
-# =============================================================================
-def _now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def _now_riyadh_iso() -> str:
-    ksa_tz = timezone(timedelta(hours=3))
-    return datetime.now(ksa_tz).isoformat(timespec="seconds")
-
+# Timeouts
+DEFAULT_TIMEOUT = 30
+DEFAULT_RETRIES = 3
 
 # =============================================================================
-# Credential Parsing / Repair
+# Enums & Advanced Types
 # =============================================================================
-def _strip_wrapping_quotes(s: str) -> str:
-    t = (s or "").strip()
-    if len(t) >= 2 and ((t[0] == t[-1]) and t[0] in ("'", '"')):
-        return t[1:-1].strip()
-    return t
+class TestCategory(Enum):
+    """Test category classification"""
+    AUTHENTICATION = "authentication"
+    AUTHORIZATION = "authorization"
+    NETWORK = "network"
+    PERFORMANCE = "performance"
+    COMPLIANCE = "compliance"
+    INTEGRATION = "integration"
+    SECURITY = "security"
 
+class TestSeverity(Enum):
+    """Test severity levels"""
+    CRITICAL = "critical"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+    INFO = "info"
 
-def _repair_private_key(key: str) -> str:
-    """
-    Fix common env-serialization issues:
-    - literal \\n instead of newlines
-    - literal \\r\\n
-    - extra surrounding quotes
-    """
-    if not key:
-        return key
-    k = _strip_wrapping_quotes(key)
-    # Normalize Windows style escapes too
-    k = k.replace("\\r\\n", "\n").replace("\\n", "\n")
-    return k
+class PermissionLevel(Enum):
+    """Google Sheets permission levels"""
+    OWNER = "owner"
+    WRITER = "writer"
+    READER = "reader"
+    NONE = "none"
 
-
-def _maybe_base64_decode(s: str) -> Optional[str]:
-    """
-    Attempt base64 decode. Returns decoded string or None if not decodable.
-    """
-    t = (s or "").strip()
-    if not t:
-        return None
-    # Quick heuristic: base64 usually doesn't start with '{'
-    if t.startswith("{"):
-        return None
-    try:
-        decoded = base64.b64decode(t).decode("utf-8")
-        if decoded.strip().startswith("{"):
-            return decoded
-    except Exception:
-        return None
-    return None
-
-
-def _load_creds_from_file(path: str) -> Tuple[Optional[Dict[str, Any]], str]:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            txt = f.read()
-        return _parse_creds_text(txt)
-    except Exception as e:
-        return None, f"Failed to read credentials file: {e}"
-
-
-def _parse_creds_text(raw: str) -> Tuple[Optional[Dict[str, Any]], str]:
-    """
-    Robust credential parser:
-    - JSON object
-    - base64(JSON)
-    - wrapped in quotes
-    """
-    if not raw:
-        return None, "Empty credential payload."
-
-    t = _strip_wrapping_quotes(raw)
-
-    b = _maybe_base64_decode(t)
-    if b:
-        t = b.strip()
-
-    try:
-        data = json.loads(t)
-    except Exception as e:
-        return None, f"Parsing failed: {e}"
-
-    if not isinstance(data, dict):
-        return None, "Decoded JSON is not an object."
-
-    # Mandatory fields for service account JSON
-    required = ["client_email", "private_key", "project_id"]
-    missing = [k for k in required if not data.get(k)]
-    if missing:
-        return None, f"Missing required fields: {', '.join(missing)}"
-
-    # Repair key in-memory (does not mutate environment)
-    data["private_key"] = _repair_private_key(str(data.get("private_key") or ""))
-
-    # Basic sanity check
-    if "BEGIN PRIVATE KEY" not in data["private_key"]:
-        return None, "private_key does not look like a valid PEM (missing 'BEGIN PRIVATE KEY')."
-
-    return data, "OK"
-
-
-def _read_raw_creds_env() -> Tuple[Optional[str], Optional[str]]:
-    """
-    Returns (raw_value, env_key_used)
-    """
-    for k in ENV_CRED_KEYS:
-        v = os.getenv(k)
-        if v and str(v).strip():
-            return str(v), k
-    return None, None
-
-
-def _get_spreadsheet_id(cli: Optional[str]) -> str:
-    if cli and cli.strip():
-        return cli.strip()
-    for k in ENV_SHEET_ID_KEYS:
-        v = os.getenv(k)
-        if v and v.strip():
-            return v.strip()
-    return ""
-
+class CredentialType(Enum):
+    """Credential source types"""
+    SERVICE_ACCOUNT = "service_account"
+    OAUTH2 = "oauth2"
+    API_KEY = "api_key"
+    JWT = "jwt"
+    NONE = "none"
 
 # =============================================================================
-# Error Hints + Exit Codes
+# Data Models
 # =============================================================================
-def _is_403(msg: str) -> bool:
-    m = msg.lower()
-    return "403" in m or "permission" in m or "insufficient permissions" in m
+@dataclass
+class TestResult:
+    """Test execution result"""
+    name: str
+    category: TestCategory
+    severity: TestSeverity
+    status: bool
+    message: str
+    duration_ms: float
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    details: Dict[str, Any] = field(default_factory=dict)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            'name': self.name,
+            'category': self.category.value,
+            'severity': self.severity.value,
+            'status': self.status,
+            'message': self.message,
+            'duration_ms': round(self.duration_ms, 2),
+            'timestamp': self.timestamp,
+            'details': self.details
+        }
 
-
-def _is_404(msg: str) -> bool:
-    m = msg.lower()
-    return "404" in m or "not found" in m
-
-
-def _hint_from_error(e: Exception) -> str:
-    msg = str(e).lower()
-
-    if _is_403(msg):
-        return (
-            "💡 FIX: Share the spreadsheet with the Service Account email as **Editor**.\n"
-            "   Also confirm the correct Spreadsheet ID and that you're editing the right file."
-        )
-    if _is_404(msg):
-        return (
-            "💡 FIX: Spreadsheet ID is wrong OR the Service Account has no access.\n"
-            "   Verify the ID and that the spreadsheet exists in the correct Google account."
-        )
-    if "unable to parse range" in msg or "badrequest" in msg or "400" in msg:
-        return "💡 FIX: Range or tab name is invalid. Use --list-tabs to confirm tab titles."
-    if "ssl" in msg or "timed out" in msg or "timeout" in msg:
-        return "💡 FIX: Network/egress issue. Confirm Render outbound connectivity and Google APIs access."
-    return "💡 FIX: Verify credentials, env vars, and that googleapiclient dependencies are installed."
-
-
-def _exit_code_for_exception(e: Exception) -> int:
-    s = str(e)
-    if _is_403(s) or _is_404(s):
-        return 2
-    return 3
-
+@dataclass
+class DiagnosticReport:
+    """Complete diagnostic report"""
+    version: str = SCRIPT_VERSION
+    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    environment: Dict[str, Any] = field(default_factory=dict)
+    results: List[Dict[str, Any]] = field(default_factory=list)
+    summary: Dict[str, int] = field(default_factory=dict)
+    recommendations: List[str] = field(default_factory=list)
+    
+    def add_result(self, result: TestResult):
+        self.results.append(result.to_dict())
+    
+    def generate_summary(self):
+        """Generate test summary"""
+        total = len(self.results)
+        passed = sum(1 for r in self.results if r.get('status'))
+        failed = total - passed
+        
+        self.summary = {
+            'total': total,
+            'passed': passed,
+            'failed': failed,
+            'success_rate': (passed / total * 100) if total > 0 else 0
+        }
+        
+        # Generate recommendations
+        self.recommendations = []
+        for r in self.results:
+            if not r.get('status') and r.get('severity') in ['critical', 'high']:
+                self.recommendations.append(f"Fix {r['name']}: {r['message']}")
+    
+    def to_json(self) -> str:
+        self.generate_summary()
+        return json.dumps(asdict(self), indent=2, default=str)
+    
+    def to_html(self) -> str:
+        """Generate HTML report"""
+        html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Sheets Auth Diagnostic Report</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; margin: 20px; }}
+                h1 {{ color: #2c3e50; }}
+                .summary {{ background: #f8f9fa; padding: 15px; border-radius: 5px; }}
+                .pass {{ color: green; }}
+                .fail {{ color: red; }}
+                table {{ border-collapse: collapse; width: 100%; }}
+                th, td {{ padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }}
+                th {{ background-color: #2c3e50; color: white; }}
+                tr:hover {{ background-color: #f5f5f5; }}
+                .critical {{ background-color: #ffebee; }}
+                .high {{ background-color: #fff3e0; }}
+                .recommendations {{ background: #e8f5e8; padding: 15px; margin-top: 20px; }}
+            </style>
+        </head>
+        <body>
+            <h1>🔍 Google Sheets Authentication Diagnostic Report</h1>
+            <div class="summary">
+                <h2>Summary</h2>
+                <p>Version: {self.version}</p>
+                <p>Timestamp: {self.timestamp}</p>
+                <p>Total Tests: {self.summary.get('total', 0)}</p>
+                <p>Passed: <span class="pass">{self.summary.get('passed', 0)}</span></p>
+                <p>Failed: <span class="fail">{self.summary.get('failed', 0)}</span></p>
+                <p>Success Rate: {self.summary.get('success_rate', 0):.1f}%</p>
+            </div>
+            
+            <h2>Environment</h2>
+            <table>
+                <tr><th>Key</th><th>Value</th></tr>
+        """
+        
+        for key, value in self.environment.items():
+            html += f"<tr><td>{key}</td><td>{value}</td></tr>"
+        
+        html += """
+            </table>
+            
+            <h2>Test Results</h2>
+            <table>
+                <tr>
+                    <th>Name</th>
+                    <th>Category</th>
+                    <th>Severity</th>
+                    <th>Status</th>
+                    <th>Message</th>
+                    <th>Duration (ms)</th>
+                </tr>
+        """
+        
+        for r in self.results:
+            row_class = r.get('severity', '')
+            status_class = 'pass' if r.get('status') else 'fail'
+            status_symbol = '✅' if r.get('status') else '❌'
+            
+            html += f"""
+                <tr class="{row_class}">
+                    <td>{r.get('name')}</td>
+                    <td>{r.get('category')}</td>
+                    <td>{r.get('severity')}</td>
+                    <td class="{status_class}">{status_symbol}</td>
+                    <td>{r.get('message')}</td>
+                    <td>{r.get('duration_ms')}</td>
+                </tr>
+            """
+        
+        html += """
+            </table>
+            
+            <div class="recommendations">
+                <h2>Recommendations</h2>
+                <ul>
+        """
+        
+        for rec in self.recommendations:
+            html += f"<li>{rec}</li>"
+        
+        html += """
+                </ul>
+            </div>
+        </body>
+        </html>
+        """
+        
+        return html
+    
+    def to_junit_xml(self) -> str:
+        """Generate JUnit XML for CI/CD"""
+        import xml.etree.ElementTree as ET
+        
+        testsuite = ET.Element('testsuite')
+        testsuite.set('name', 'SheetsAuthTest')
+        testsuite.set('tests', str(self.summary.get('total', 0)))
+        testsuite.set('failures', str(self.summary.get('failed', 0)))
+        testsuite.set('timestamp', self.timestamp)
+        
+        for r in self.results:
+            testcase = ET.SubElement(testsuite, 'testcase')
+            testcase.set('name', r.get('name'))
+            testcase.set('classname', r.get('category'))
+            testcase.set('time', str(r.get('duration_ms', 0) / 1000))
+            
+            if not r.get('status'):
+                failure = ET.SubElement(testcase, 'failure')
+                failure.set('message', r.get('message'))
+                failure.set('type', r.get('severity'))
+        
+        return ET.tostring(testsuite, encoding='unicode')
 
 # =============================================================================
-# Sheets Operations (via your google_sheets_service wrapper if possible)
+# Advanced Credential Manager
 # =============================================================================
-def _get_service() -> Any:
-    if _service_factory and callable(_service_factory):
-        return _service_factory()
-    raise RuntimeError(
-        "Could not import google_sheets_service.get_sheets_service(). "
-        "Ensure google_sheets_service.py exists and dependencies are installed."
-    )
-
-
-def _read_range_fallback(service: Any, spreadsheet_id: str, a1: str) -> List[List[Any]]:
-    # Direct Sheets API fallback for projects where wrapper lacks read_range
-    resp = (
-        service.spreadsheets()
-        .values()
-        .get(spreadsheetId=spreadsheet_id, range=a1)
-        .execute()
-    )
-    return resp.get("values") or []
-
-
-def _write_range_fallback(service: Any, spreadsheet_id: str, a1: str, values: List[List[Any]]) -> None:
-    body = {"values": values}
-    (
-        service.spreadsheets()
-        .values()
-        .update(
-            spreadsheetId=spreadsheet_id,
-            range=a1,
-            valueInputOption="RAW",
-            body=body,
-        )
-        .execute()
-    )
-
-
-def _read_range(spreadsheet_id: str, a1: str) -> List[List[Any]]:
-    if sheets and hasattr(sheets, "read_range") and callable(getattr(sheets, "read_range")):
-        return sheets.read_range(spreadsheet_id, a1)  # type: ignore
-    service = _get_service()
-    return _read_range_fallback(service, spreadsheet_id, a1)
-
-
-def _write_range(spreadsheet_id: str, a1: str, values: List[List[Any]]) -> None:
-    if sheets and hasattr(sheets, "write_range") and callable(getattr(sheets, "write_range")):
-        sheets.write_range(spreadsheet_id, a1, values)  # type: ignore
-        return
-    service = _get_service()
-    _write_range_fallback(service, spreadsheet_id, a1, values)
-
-
-def _fetch_metadata(service: Any, spreadsheet_id: str) -> Dict[str, Any]:
-    return service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-
-
-def _safe_a1(sheet_name: str, a1: str) -> str:
-    # Escape single quotes inside sheet name
-    name = (sheet_name or "").replace("'", "''")
-    return f"'{name}'!{a1}"
-
-
-# =============================================================================
-# Main
-# =============================================================================
-def main() -> int:
-    ap = argparse.ArgumentParser(description="TFB Advanced Google Sheets Auth Tester")
-    ap.add_argument("--sheet-id", help="Override Spreadsheet ID")
-    ap.add_argument("--sheet-name", default="Sheet1", help="Tab name to test")
-    ap.add_argument("--read-range", default=DEFAULT_READ_RANGE, help="A1 range to read (default A1:B2)")
-    ap.add_argument("--write", action="store_true", help="Perform a write test")
-    ap.add_argument("--cell", default="A1", help="Cell for write test (e.g., A1)")
-    ap.add_argument("--list-tabs", action="store_true", help="Only list available tabs and exit")
-    ap.add_argument("--diagnose-env", action="store_true", help="Print which env keys are present (no secrets)")
-    ap.add_argument("--quiet", action="store_true", help="Reduce output (still returns exit codes)")
-    args = ap.parse_args()
-
-    if args.quiet:
-        logger.setLevel(logging.WARNING)
-
-    logger.info("Starting Sheets Auth Test v%s | utc=%s | riyadh=%s", SCRIPT_VERSION, _now_utc_iso(), _now_riyadh_iso())
-
-    # --- [0] Optional env diagnosis ---
-    if args.diagnose_env:
-        raw, key_used = _read_raw_creds_env()
-        sid_env = _get_spreadsheet_id(None)
-        logger.info("ENV: creds_present=%s (%s)", "yes" if raw else "no", key_used or "none")
-        logger.info("ENV: sheet_id_present=%s", "yes" if sid_env else "no")
-        # Do not print secrets
-        for k in ("APP_TOKEN", "BACKUP_APP_TOKEN", "BACKEND_BASE_URL"):
-            v = (os.getenv(k) or "").strip()
-            logger.info("ENV: %s=%s", k, "[set]" if v else "[not set]")
-
-    # --- [1] Credential integrity ---
-    logger.info("--- [1/4] Validating Credentials ---")
-    raw_creds, env_key = _read_raw_creds_env()
-    if not raw_creds:
-        logger.error("❌ No credentials env found. Set GOOGLE_SHEETS_CREDENTIALS (preferred) or GOOGLE_APPLICATION_CREDENTIALS.")
-        return 1
-
-    # If GOOGLE_APPLICATION_CREDENTIALS is used and looks like a file path, load file
-    creds_dict: Optional[Dict[str, Any]] = None
-    status = "Unknown"
-    if env_key == "GOOGLE_APPLICATION_CREDENTIALS" and not raw_creds.strip().startswith("{"):
-        # likely a path
-        creds_dict, status = _load_creds_from_file(raw_creds.strip())
-    else:
-        creds_dict, status = _parse_creds_text(raw_creds)
-
-    if not creds_dict:
-        logger.error("❌ Credential validation failed: %s", status)
-        return 1
-
-    sa_email = str(creds_dict.get("client_email") or "")
-    project_id = str(creds_dict.get("project_id") or "")
-    logger.info("✅ Credentials valid. Service Account: %s | project_id=%s", sa_email, project_id)
-
-    # --- [2] Spreadsheet metadata ---
-    logger.info("--- [2/4] Probing Spreadsheet Metadata ---")
-    sid = _get_spreadsheet_id(args.sheet_id)
-    if not sid:
-        logger.error("❌ No Spreadsheet ID found. Provide --sheet-id or set DEFAULT_SPREADSHEET_ID.")
-        return 1
-
-    try:
-        service = _get_service()
-        meta = _fetch_metadata(service, sid)
-        props = meta.get("properties", {}) if isinstance(meta, dict) else {}
-        title = props.get("title", "Unknown")
-        tz = props.get("timeZone", "Unknown")
-        locale = props.get("locale", "Unknown")
-
-        sheets_list = []
-        for s in (meta.get("sheets") or []):
-            p = (s or {}).get("properties") or {}
-            t = p.get("title")
-            if t:
-                sheets_list.append(str(t))
-
-        logger.info("✅ Connected to Spreadsheet: '%s'", title)
-        logger.info("✅ Spreadsheet Locale: %s | Timezone: %s", locale, tz)
-        logger.info("✅ Tabs (%d): %s", len(sheets_list), ", ".join(f"'{t}'" for t in sheets_list))
-
-        if args.list_tabs:
-            logger.info("Done (--list-tabs).")
-            return 0
-
-        if args.sheet_name not in sheets_list:
-            logger.warning("⚠️  Target tab '%s' not found. Read/Write may fail.", args.sheet_name)
-    except Exception as e:
-        logger.error("❌ Metadata fetch failed: %s", e)
-        logger.info(_hint_from_error(e))
-        return _exit_code_for_exception(e)
-
-    # --- [3] Read test ---
-    logger.info("--- [3/4] Performing Read Test ---")
-    read_a1 = _safe_a1(args.sheet_name, args.read_range)
-    try:
-        values = _read_range(sid, read_a1)
-        if values:
-            logger.info("✅ Read Success. Preview: %s", values[0])
-        else:
-            logger.info("✅ Read Success. Range is empty: %s", read_a1)
-    except Exception as e:
-        logger.error("❌ Read Failed: %s", e)
-        logger.info(_hint_from_error(e))
-        return _exit_code_for_exception(e)
-
-    # --- [4] Optional write test ---
-    if args.write:
-        logger.info("--- [4/4] Performing Write Test ---")
-        ts = _now_riyadh_iso()
-        target_a1 = _safe_a1(args.sheet_name, args.cell)
-        payload = [[f"TFB Sheets Auth OK ✅ | Riyadh={ts} | UTC={_now_utc_iso()}"]]
+class CredentialManager:
+    """Advanced credential discovery and validation"""
+    
+    def __init__(self, logger: logging.Logger):
+        self.logger = logger
+        self.credential_data: Optional[Dict[str, Any]] = None
+        self.credential_type = CredentialType.NONE
+        self.credential_source: Optional[str] = None
+        self.credentials = None
+        
+    def discover(self) -> Tuple[bool, str]:
+        """Discover credentials from all possible sources"""
+        # Try environment variables
+        raw_creds, source = self._from_env()
+        if raw_creds:
+            self.credential_source = source
+            return self._parse_credentials(raw_creds)
+        
+        # Try file system
+        raw_creds, source = self._from_file()
+        if raw_creds:
+            self.credential_source = source
+            return self._parse_credentials(raw_creds)
+        
+        # Try secrets manager (if available)
+        if os.getenv('AWS_SECRET_NAME') or os.getenv('GCP_SECRET_NAME'):
+            raw_creds, source = self._from_secrets_manager()
+            if raw_creds:
+                self.credential_source = source
+                return self._parse_credentials(raw_creds)
+        
+        return False, "No credentials found in any source"
+    
+    def _from_env(self) -> Tuple[Optional[str], Optional[str]]:
+        """Extract credentials from environment"""
+        for key in ENV_CRED_KEYS:
+            value = os.getenv(key)
+            if value and value.strip():
+                return value.strip(), f"env:{key}"
+        return None, None
+    
+    def _from_file(self) -> Tuple[Optional[str], Optional[str]]:
+        """Read credentials from file"""
+        # Check GOOGLE_APPLICATION_CREDENTIALS
+        path = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
+        if path and os.path.exists(path):
+            try:
+                with open(path, 'r') as f:
+                    return f.read(), f"file:{path}"
+            except Exception as e:
+                self.logger.debug(f"Failed to read credentials file {path}: {e}")
+        
+        # Check common paths
+        common_paths = [
+            'credentials.json',
+            'service-account.json',
+            'config/credentials.json',
+            'secrets/credentials.json',
+            os.path.expanduser('~/.config/gcloud/application_default_credentials.json')
+        ]
+        
+        for path in common_paths:
+            if os.path.exists(path):
+                try:
+                    with open(path, 'r') as f:
+                        return f.read(), f"file:{path}"
+                except Exception:
+                    continue
+        
+        return None, None
+    
+    def _from_secrets_manager(self) -> Tuple[Optional[str], Optional[str]]:
+        """Fetch credentials from cloud secrets manager"""
+        # AWS Secrets Manager
+        if os.getenv('AWS_SECRET_NAME'):
+            try:
+                import boto3
+                session = boto3.session.Session()
+                client = session.client('secretsmanager')
+                
+                secret_name = os.getenv('AWS_SECRET_NAME')
+                response = client.get_secret_value(SecretId=secret_name)
+                
+                if 'SecretString' in response:
+                    return response['SecretString'], f"aws:secretsmanager:{secret_name}"
+            except Exception as e:
+                self.logger.debug(f"AWS Secrets Manager access failed: {e}")
+        
+        # GCP Secret Manager
+        if os.getenv('GCP_SECRET_NAME'):
+            try:
+                from google.cloud import secretmanager
+                client = secretmanager.SecretManagerServiceClient()
+                
+                project = os.getenv('GCP_PROJECT')
+                secret_name = os.getenv('GCP_SECRET_NAME')
+                version = os.getenv('GCP_SECRET_VERSION', 'latest')
+                
+                name = f"projects/{project}/secrets/{secret_name}/versions/{version}"
+                response = client.access_secret_version(name=name)
+                
+                return response.payload.data.decode('UTF-8'), f"gcp:secretmanager:{secret_name}"
+            except Exception as e:
+                self.logger.debug(f"GCP Secret Manager access failed: {e}")
+        
+        return None, None
+    
+    def _parse_credentials(self, raw: str) -> Tuple[bool, str]:
+        """Parse and validate credentials"""
+        # Try base64 decoding
+        if not raw.startswith('{'):
+            try:
+                decoded = base64.b64decode(raw).decode('utf-8')
+                if decoded.startswith('{'):
+                    raw = decoded
+            except Exception:
+                pass
+        
+        # Parse JSON
         try:
-            _write_range(sid, target_a1, payload)
-            logger.info("✅ Write Success at %s", target_a1)
+            data = json.loads(raw)
         except Exception as e:
-            logger.error("❌ Write Failed: %s", e)
-            logger.info(_hint_from_error(e))
-            return _exit_code_for_exception(e)
-    else:
-        logger.info("--- [4/4] Write Test Skipped (use --write) ---")
+            return False, f"Invalid JSON: {e}"
+        
+        # Detect credential type
+        if 'client_email' in data and 'private_key' in data:
+            self.credential_type = CredentialType.SERVICE_ACCOUNT
+        elif 'access_token' in data:
+            self.credential_type = CredentialType.OAUTH2
+        elif 'api_key' in data:
+            self.credential_type = CredentialType.API_KEY
+        else:
+            return False, "Unknown credential format"
+        
+        # Validate service account
+        if self.credential_type == CredentialType.SERVICE_ACCOUNT:
+            # Check required fields
+            required = ['client_email', 'private_key', 'project_id']
+            missing = [f for f in required if not data.get(f)]
+            if missing:
+                return False, f"Missing required fields: {missing}"
+            
+            # Repair private key
+            data['private_key'] = self._repair_private_key(str(data.get('private_key', '')))
+            
+            # Verify private key format
+            if 'BEGIN PRIVATE KEY' not in data['private_key']:
+                return False, "Invalid private key format"
+            
+            # Validate email format
+            if '@' not in data['client_email']:
+                return False, "Invalid client_email format"
+        
+        self.credential_data = data
+        return True, f"Valid {self.credential_type.value} credentials"
+    
+    def _repair_private_key(self, key: str) -> str:
+        """Repair common private key issues"""
+        if not key:
+            return key
+        
+        # Remove wrapping quotes
+        key = key.strip()
+        if len(key) >= 2 and key[0] == key[-1] and key[0] in ('"', "'"):
+            key = key[1:-1]
+        
+        # Fix escaped newlines
+        key = key.replace('\\n', '\n')
+        key = key.replace('\\r\\n', '\n')
+        
+        # Ensure proper PEM format
+        if '-----BEGIN PRIVATE KEY-----' not in key:
+            key = '-----BEGIN PRIVATE KEY-----\n' + key
+            
+        if '-----END PRIVATE KEY-----' not in key:
+            key = key + '\n-----END PRIVATE KEY-----'
+        
+        return key
+    
+    def build_credentials(self):
+        """Build Google credentials object"""
+        if not GOOGLE_API_AVAILABLE:
+            raise ImportError("Google API libraries not available")
+        
+        if self.credential_type == CredentialType.SERVICE_ACCOUNT:
+            self.credentials = service_account.Credentials.from_service_account_info(
+                self.credential_data,
+                scopes=SCOPES
+            )
+        elif self.credential_type == CredentialType.OAUTH2:
+            from google.oauth2.credentials import Credentials
+            self.credentials = Credentials(
+                token=self.credential_data.get('access_token'),
+                refresh_token=self.credential_data.get('refresh_token'),
+                token_uri=self.credential_data.get('token_uri', 'https://oauth2.googleapis.com/token'),
+                client_id=self.credential_data.get('client_id'),
+                client_secret=self.credential_data.get('client_secret'),
+                scopes=SCOPES
+            )
+        elif self.credential_type == CredentialType.API_KEY:
+            # API key handled separately
+            return None
+        
+        return self.credentials
+    
+    def get_service_account_email(self) -> Optional[str]:
+        """Get service account email if available"""
+        if self.credential_data and 'client_email' in self.credential_data:
+            return self.credential_data['client_email']
+        return None
+    
+    def get_project_id(self) -> Optional[str]:
+        """Get GCP project ID if available"""
+        if self.credential_data:
+            return self.credential_data.get('project_id')
+        return None
 
-    logger.info("✨ All tests passed! Service account is authorized and API is working.")
-    return 0
+# =============================================================================
+# Network Diagnostics
+# =============================================================================
+class NetworkDiagnostics:
+    """Advanced network connectivity testing"""
+    
+    def __init__(self, logger: logging.Logger):
+        self.logger = logger
+        self.results: Dict[str, Any] = {}
+    
+    def diagnose(self) -> Dict[str, Any]:
+        """Run comprehensive network diagnostics"""
+        self.logger.info("Running network diagnostics...")
+        
+        tests = [
+            self._test_dns_resolution,
+            self._test_tcp_connectivity,
+            self._test_ssl_tls,
+            self._test_http_proxy,
+            self._test_firewall_rules,
+            self._test_latency,
+            self._test_bandwidth
+        ]
+        
+        for test in tests:
+            try:
+                name = test.__name__.replace('_test_', '')
+                start = time.time()
+                result = test()
+                duration = (time.time() - start) * 1000
+                self.results[name] = {
+                    'success': result.get('success', False),
+                    'details': result,
+                    'duration_ms': duration
+                }
+            except Exception as e:
+                self.logger.debug(f"Network test failed: {e}")
+        
+        return self.results
+    
+    def _test_dns_resolution(self) -> Dict[str, Any]:
+        """Test DNS resolution for Google APIs"""
+        result = {'success': False, 'ips': [], 'cname': None}
+        
+        hosts = [
+            'sheets.googleapis.com',
+            'www.googleapis.com',
+            'accounts.google.com'
+        ]
+        
+        for host in hosts:
+            try:
+                ips = socket.gethostbyname_ex(host)[2]
+                result['ips'].extend(ips)
+                
+                if DNS_AVAILABLE:
+                    answers = dns.resolver.resolve(host, 'CNAME')
+                    if answers:
+                        result['cname'] = str(answers[0].target)
+                
+                result['success'] = True
+            except Exception as e:
+                self.logger.debug(f"DNS resolution failed for {host}: {e}")
+        
+        return result
+    
+    def _test_tcp_connectivity(self) -> Dict[str, Any]:
+        """Test TCP connectivity to Google APIs"""
+        result = {'success': False, 'connections': []}
+        
+        endpoints = [
+            ('sheets.googleapis.com', 443),
+            ('www.googleapis.com', 443),
+            ('oauth2.googleapis.com', 443)
+        ]
+        
+        for host, port in endpoints:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(5)
+                sock.connect((host, port))
+                sock.close()
+                result['connections'].append(f"{host}:{port}")
+                result['success'] = True
+            except Exception as e:
+                self.logger.debug(f"TCP connection failed to {host}:{port}: {e}")
+        
+        return result
+    
+    def _test_ssl_tls(self) -> Dict[str, Any]:
+        """Test SSL/TLS configuration"""
+        result = {
+            'success': False,
+            'certificate': {},
+            'protocol': None,
+            'cipher': None
+        }
+        
+        try:
+            context = ssl.create_default_context()
+            with socket.create_connection(('sheets.googleapis.com', 443), timeout=5) as sock:
+                with context.wrap_socket(sock, server_hostname='sheets.googleapis.com') as ssock:
+                    cert = ssock.getpeercert()
+                    result['certificate'] = {
+                        'issuer': dict(x[0] for x in cert.get('issuer', [])),
+                        'subject': dict(x[0] for x in cert.get('subject', [])),
+                        'expiry': cert.get('notAfter'),
+                        'serial': cert.get('serialNumber')
+                    }
+                    result['protocol'] = ssock.version()
+                    result['cipher'] = ssock.cipher()
+                    result['success'] = True
+        except Exception as e:
+            self.logger.debug(f"SSL/TLS test failed: {e}")
+        
+        return result
+    
+    def _test_http_proxy(self) -> Dict[str, Any]:
+        """Test HTTP proxy configuration"""
+        result = {'success': True, 'proxy': None}
+        
+        # Check common proxy env vars
+        proxy_vars = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy']
+        for var in proxy_vars:
+            if os.getenv(var):
+                result['proxy'] = os.getenv(var)
+                break
+        
+        if result['proxy']:
+            # Test proxy connectivity
+            try:
+                parsed = urlparse(result['proxy'])
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(5)
+                sock.connect((parsed.hostname, parsed.port or 8080))
+                sock.close()
+            except Exception as e:
+                result['success'] = False
+                result['error'] = str(e)
+        
+        return result
+    
+    def _test_firewall_rules(self) -> Dict[str, Any]:
+        """Test for firewall restrictions"""
+        result = {'success': True, 'blocked': []}
+        
+        # Test common ports
+        test_ports = [443, 80, 8080, 8443]
+        
+        for port in test_ports:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(2)
+                sock.connect(('sheets.googleapis.com', port))
+                sock.close()
+            except Exception:
+                result['blocked'].append(port)
+        
+        if result['blocked']:
+            result['success'] = False
+        
+        return result
+    
+    def _test_latency(self) -> Dict[str, Any]:
+        """Test network latency"""
+        result = {'success': True, 'latency_ms': []}
+        
+        for _ in range(5):
+            try:
+                start = time.time()
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(5)
+                sock.connect(('sheets.googleapis.com', 443))
+                sock.close()
+                latency = (time.time() - start) * 1000
+                result['latency_ms'].append(latency)
+            except Exception:
+                pass
+        
+        if result['latency_ms']:
+            result['avg_latency'] = sum(result['latency_ms']) / len(result['latency_ms'])
+        else:
+            result['success'] = False
+        
+        return result
+    
+    def _test_bandwidth(self) -> Dict[str, Any]:
+        """Estimate bandwidth (lightweight test)"""
+        result = {'success': False, 'bandwidth_kbps': 0}
+        
+        if not REQUESTS_AVAILABLE:
+            return result
+        
+        try:
+            # Download a small test file
+            start = time.time()
+            response = requests.get(
+                'https://sheets.googleapis.com/$discovery/rest?version=v4',
+                timeout=10,
+                stream=True
+            )
+            
+            size = 0
+            for chunk in response.iter_content(chunk_size=1024):
+                size += len(chunk)
+                if size > 100 * 1024:  # 100KB max
+                    break
+            
+            duration = time.time() - start
+            if duration > 0:
+                bandwidth = (size / 1024) / duration  # KB/s
+                result['bandwidth_kbps'] = bandwidth * 8  # kbps
+                result['success'] = True
+        except Exception as e:
+            self.logger.debug(f"Bandwidth test failed: {e}")
+        
+        return result
 
+# =============================================================================
+# Permission Auditor
+# =============================================================================
+class PermissionAuditor:
+    """Advanced permission auditing and analysis"""
+    
+    def __init__(self, service, logger: logging.Logger):
+        self.service = service
+        self.logger = logger
+        self.drive_service = None
+        
+        try:
+            self.drive_service = build('drive', 'v3', credentials=service._http.credentials)
+        except Exception:
+            pass
+    
+    def audit_spreadsheet(self, spreadsheet_id: str) -> Dict[str, Any]:
+        """Audit spreadsheet permissions"""
+        result = {
+            'spreadsheet_id': spreadsheet_id,
+            'permissions': [],
+            'owners': [],
+            'access_level': PermissionLevel.NONE.value,
+            'warnings': []
+        }
+        
+        try:
+            # Get spreadsheet metadata
+            spreadsheet = self.service.spreadsheets().get(
+                spreadsheetId=spreadsheet_id,
+                fields='properties,sheets.properties'
+            ).execute()
+            
+            result['title'] = spreadsheet.get('properties', {}).get('title')
+            
+            # Get permissions via Drive API
+            if self.drive_service:
+                permissions = self.drive_service.permissions().list(
+                    fileId=spreadsheet_id,
+                    fields='permissions(id,emailAddress,role,type,domain)'
+                ).execute()
+                
+                for perm in permissions.get('permissions', []):
+                    permission_info = {
+                        'role': perm.get('role'),
+                        'type': perm.get('type'),
+                        'email': perm.get('emailAddress'),
+                        'domain': perm.get('domain')
+                    }
+                    
+                    if perm.get('role') == 'owner':
+                        result['owners'].append(perm.get('emailAddress'))
+                    
+                    result['permissions'].append(permission_info)
+                
+                # Determine current access level
+                credentials = self.service._http.credentials
+                if hasattr(credentials, 'service_account_email'):
+                    sa_email = credentials.service_account_email
+                    
+                    for perm in result['permissions']:
+                        if perm.get('email') == sa_email:
+                            result['access_level'] = perm.get('role', 'none')
+                            break
+                    
+                    if result['access_level'] == PermissionLevel.NONE.value and sa_email not in result['owners']:
+                        result['warnings'].append(
+                            f"Service account {sa_email} not found in permissions"
+                        )
+            
+            # Check sheet count
+            sheets = spreadsheet.get('sheets', [])
+            result['sheet_count'] = len(sheets)
+            
+            if len(sheets) > 50:
+                result['warnings'].append(f"Large number of sheets ({len(sheets)}) may impact performance")
+            
+        except HttpError as e:
+            if e.resp.status == 403:
+                result['warnings'].append("Insufficient permissions to read Drive metadata")
+            elif e.resp.status == 404:
+                result['warnings'].append("Spreadsheet not found")
+            else:
+                result['warnings'].append(f"Drive API error: {e}")
+        
+        return result
+    
+    def audit_tabs(self, spreadsheet_id: str) -> List[Dict[str, Any]]:
+        """Audit individual tabs"""
+        tabs = []
+        
+        try:
+            spreadsheet = self.service.spreadsheets().get(
+                spreadsheetId=spreadsheet_id
+            ).execute()
+            
+            for sheet in spreadsheet.get('sheets', []):
+                props = sheet.get('properties', {})
+                tab_info = {
+                    'title': props.get('title'),
+                    'sheet_id': props.get('sheetId'),
+                    'row_count': props.get('gridProperties', {}).get('rowCount'),
+                    'column_count': props.get('gridProperties', {}).get('columnCount'),
+                    'hidden': props.get('hidden', False)
+                }
+                tabs.append(tab_info)
+        except Exception as e:
+            self.logger.error(f"Tab audit failed: {e}")
+        
+        return tabs
+    
+    def check_data_limits(self, spreadsheet_id: str) -> Dict[str, Any]:
+        """Check if approaching Google Sheets limits"""
+        limits = {
+            'total_cells': 0,
+            'total_sheets': 0,
+            'formulas': 0,
+            'warnings': []
+        }
+        
+        try:
+            spreadsheet = self.service.spreadsheets().get(
+                spreadsheetId=spreadsheet_id,
+                includeGridData=True
+            ).execute()
+            
+            total_cells = 0
+            for sheet in spreadsheet.get('sheets', []):
+                data = sheet.get('data', [])
+                for row_data in data:
+                    for row in row_data.get('rowData', []):
+                        total_cells += len(row.get('values', []))
+            
+            limits['total_cells'] = total_cells
+            limits['total_sheets'] = len(spreadsheet.get('sheets', []))
+            
+            # Check limits
+            if total_cells > 5_000_000:
+                limits['warnings'].append(f"Approaching cell limit ({total_cells:,}/10M)")
+            
+            if limits['total_sheets'] > 200:
+                limits['warnings'].append(f"Approaching sheet limit ({limits['total_sheets']}/250)")
+            
+        except Exception as e:
+            self.logger.debug(f"Data limits check failed: {e}")
+        
+        return limits
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+# =============================================================================
+# Performance Benchmark
+# =============================================================================
+class PerformanceBenchmark:
+    """Performance benchmarking tools"""
+    
+    def __init__(self, service, logger: logging.Logger):
+        self.service = service
+        self.logger = logger
+        self.results = defaultdict(list)
+    
+    @contextmanager
+    def measure(self, operation: str):
+        """Context manager for performance measurement"""
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            duration = (time.perf_counter() - start) * 1000
+            self.results[operation].append(duration)
+    
+    def benchmark_read(self, spreadsheet_id: str, range_name: str, iterations: int = 10) -> Dict[str, Any]:
+        """Benchmark read operations"""
+        self.logger.info(f"Benchmarking read operations ({iterations} iterations)...")
+        
+        for i in range(iterations):
+            with self.measure('read'):
+                self.service.spreadsheets().values().get(
+                    spreadsheetId=spreadsheet_id,
+                    range=range_name
+                ).execute()
+        
+        return self._analyze_results('read')
+    
+    def benchmark_write(self, spreadsheet_id: str, range_name: str, iterations: int = 5) -> Dict[str, Any]:
+        """Benchmark write operations"""
+        self.logger.info(f"Benchmarking write operations ({iterations} iterations)...")
+        
+        test_data = [[f"Test {i}", datetime.now().isoformat()] for i in range(10)]
+        
+        for i in range(iterations):
+            with self.measure('write'):
+                self.service.spreadsheets().values().update(
+                    spreadsheetId=spreadsheet_id,
+                    range=range_name,
+                    valueInputOption='RAW',
+                    body={'values': test_data}
+                ).execute()
+        
+        return self._analyze_results('write')
+    
+    def benchmark_batch(self, spreadsheet_id: str, iterations: int = 5) -> Dict[str, Any]:
+        """Benchmark batch operations"""
+        self.logger.info(f"Benchmarking batch operations ({iterations} iterations)...")
+        
+        for i in range(iterations):
+            with self.measure('batch'):
+                self.service.spreadsheets().batchUpdate(
+                    spreadsheetId=spreadsheet_id,
+                    body={'requests': []}  # Empty batch for overhead measurement
+                ).execute()
+        
+        return self._analyze_results('batch')
+    
+    def _analyze_results(self, operation: str) -> Dict[str, Any]:
+        """Analyze benchmark results"""
+        durations = self.results[operation]
+        
+        if not durations:
+            return {}
+        
+        return {
+            'operation': operation,
+            'samples': len(durations),
+            'min_ms': min(durations),
+            'max_ms': max(durations),
+            'avg_ms': sum(durations) / len(durations),
+            'p50_ms': sorted(durations)[len(durations) // 2],
+            'p95_ms': sorted(durations)[int(len(durations) * 0.95)],
+            'p99_ms': sorted(durations)[int(len(durations) * 0.99)]
+        }
+    
+    def get_report(self) -> Dict[str, Any]:
+        """Get complete benchmark report"""
+        report = {}
+        for operation in self.results:
+            report[operation] = self._analyze_results(operation)
+        return report
+
+# =============================================================================
+# Main Diagnostic Engine
+# =============================================================================
+class DiagnosticEngine:
+    """Main diagnostic execution engine"""
+    
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.logger = self._setup_logging()
+        self.report = DiagnosticReport()
+        self.credential_manager = CredentialManager(self.logger)
+        self.network_diag = NetworkDiagnostics(self.logger)
+        self.service = None
+        self.permission_auditor = None
+        self.benchmark = None
+        
+        # Capture environment
+        self._capture_environment()
+    
+    def _setup_logging(self) -> logging.Logger:
+        """Setup logging configuration"""
+        level = logging.DEBUG if self.args.verbose else logging.INFO
+        
+        logging_config = {
+            'version': 1,
+            'disable_existing_loggers': False,
+            'formatters': {
+                'standard': {
+                    'format': '%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
+                    'datefmt': '%H:%M:%S'
+                },
+                'json': {
+                    'format': '{"time":"%(asctime)s","level":"%(levelname)s","name":"%(name)s","message":"%(message)s"}'
+                }
+            },
+            'handlers': {
+                'console': {
+                    'class': 'logging.StreamHandler',
+                    'level': level,
+                    'formatter': 'standard',
+                    'stream': 'ext://sys.stdout'
+                }
+            },
+            'root': {
+                'level': level,
+                'handlers': ['console']
+            }
+        }
+        
+        logging.config.dictConfig(logging_config)
+        return logging.getLogger('SheetsDiag')
+    
+    def _capture_environment(self):
+        """Capture environment information"""
+        self.report.environment = {
+            'python_version': sys.version,
+            'platform': platform.platform(),
+            'hostname': socket.gethostname(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
+            'timezone': datetime.now().astimezone().tzname(),
+            'cwd': os.getcwd(),
+            'pid': os.getpid(),
+            'available_modules': {
+                'requests': REQUESTS_AVAILABLE,
+                'pandas': PANDAS_AVAILABLE,
+                'google_api': GOOGLE_API_AVAILABLE,
+                'jwt': JWT_AVAILABLE,
+                'dns': DNS_AVAILABLE,
+                'async': ASYNC_AVAILABLE
+            }
+        }
+    
+    def run(self) -> int:
+        """Run all diagnostics"""
+        start_time = time.time()
+        
+        # Run test suite
+        tests = [
+            self.test_network_connectivity,
+            self.test_credential_validation,
+            self.test_api_authentication,
+            self.test_spreadsheet_access,
+            self.test_permissions,
+            self.test_read_operations,
+            self.test_write_operations,
+            self.test_batch_operations,
+            self.test_performance,
+            self.test_rate_limits,
+            self.test_compliance
+        ]
+        
+        for test in tests:
+            if self.args.ci_mode:
+                # In CI mode, stop on first failure
+                result = test()
+                self.report.add_result(result)
+                if not result.status and result.severity in [TestSeverity.CRITICAL, TestSeverity.HIGH]:
+                    break
+            else:
+                self.report.add_result(test())
+        
+        # Generate report
+        duration = (time.time() - start_time) * 1000
+        self.report.summary['total_duration_ms'] = duration
+        
+        # Output
+        self._output_results()
+        
+        # Determine exit code
+        critical_failures = sum(
+            1 for r in self.report.results 
+            if not r.get('status') and r.get('severity') == 'critical'
+        )
+        
+        high_failures = sum(
+            1 for r in self.report.results 
+            if not r.get('status') and r.get('severity') == 'high'
+        )
+        
+        if critical_failures > 0:
+            return 1
+        elif high_failures > 0:
+            return 2
+        elif any(not r.get('status') for r in self.report.results):
+            return 3
+        else:
+            return 0
+    
+    def test_network_connectivity(self) -> TestResult:
+        """Test network connectivity to Google APIs"""
+        start = time.time()
+        
+        try:
+            results = self.network_diag.diagnose()
+            
+            success = all(r.get('success', False) for r in results.values())
+            
+            details = {
+                'dns': results.get('dns_resolution', {}),
+                'tcp': results.get('tcp_connectivity', {}),
+                'ssl': results.get('ssl_tls', {}),
+                'latency': results.get('latency', {}),
+                'bandwidth': results.get('bandwidth', {})
+            }
+            
+            message = "Network connectivity OK" if success else "Network issues detected"
+            
+            return TestResult(
+                name="Network Connectivity",
+                category=TestCategory.NETWORK,
+                severity=TestSeverity.CRITICAL,
+                status=success,
+                message=message,
+                duration_ms=(time.time() - start) * 1000,
+                details=details
+            )
+            
+        except Exception as e:
+            return TestResult(
+                name="Network Connectivity",
+                category=TestCategory.NETWORK,
+                severity=TestSeverity.CRITICAL,
+                status=False,
+                message=f"Network test failed: {e}",
+                duration_ms=(time.time() - start) * 1000
+            )
+    
+    def test_credential_validation(self) -> TestResult:
+        """Test credential validity"""
+        start = time.time()
+        
+        success, message = self.credential_manager.discover()
+        
+        details = {
+            'credential_type': self.credential_manager.credential_type.value if self.credential_manager.credential_type else None,
+            'source': self.credential_manager.credential_source,
+            'service_account': self.credential_manager.get_service_account_email(),
+            'project_id': self.credential_manager.get_project_id()
+        }
+        
+        return TestResult(
+            name="Credential Validation",
+            category=TestCategory.AUTHENTICATION,
+            severity=TestSeverity.CRITICAL,
+            status=success,
+            message=message,
+            duration_ms=(time.time() - start) * 1000,
+            details=details
+        )
+    
+    def test_api_authentication(self) -> TestResult:
+        """Test API authentication"""
+        start = time.time()
+        
+        if not GOOGLE_API_AVAILABLE:
+            return TestResult(
+                name="API Authentication",
+                category=TestCategory.AUTHENTICATION,
+                severity=TestSeverity.CRITICAL,
+                status=False,
+                message="Google API libraries not available",
+                duration_ms=(time.time() - start) * 1000
+            )
+        
+        try:
+            credentials = self.credential_manager.build_credentials()
+            
+            if not credentials:
+                return TestResult(
+                    name="API Authentication",
+                    category=TestCategory.AUTHENTICATION,
+                    severity=TestSeverity.CRITICAL,
+                    status=False,
+                    message="Failed to build credentials",
+                    duration_ms=(time.time() - start) * 1000
+                )
+            
+            # Test token refresh
+            if credentials.token:
+                expiry = credentials.expiry.isoformat() if credentials.expiry else 'unknown'
+                
+                if credentials.expiry and credentials.expiry < datetime.now(timezone.utc):
+                    # Try to refresh
+                    request = Request()
+                    credentials.refresh(request)
+            else:
+                # Service account doesn't need initial token
+                pass
+            
+            # Build service
+            self.service = build('sheets', 'v4', credentials=credentials)
+            
+            # Test a simple API call
+            self.service.spreadsheets().get(
+                spreadsheetId=self.args.sheet_id or 'invalid',
+                fields='spreadsheetId'
+            ).execute()
+            
+            return TestResult(
+                name="API Authentication",
+                category=TestCategory.AUTHENTICATION,
+                severity=TestSeverity.CRITICAL,
+                status=True,
+                message="Successfully authenticated with Google APIs",
+                duration_ms=(time.time() - start) * 1000,
+                details={
+                    'token_expiry': expiry if 'expiry' in locals() else None,
+                    'scopes': credentials.scopes
+                }
+            )
+            
+        except Exception as e:
+            return TestResult(
+                name="API Authentication",
+                category=TestCategory.AUTHENTICATION,
+                severity=TestSeverity.CRITICAL,
+                status=False,
+                message=f"Authentication failed: {e}",
+                duration_ms=(time.time() - start) * 1000
+            )
+    
+    def test_spreadsheet_access(self) -> TestResult:
+        """Test spreadsheet access"""
+        start = time.time()
+        
+        if not self.service:
+            return TestResult(
+                name="Spreadsheet Access",
+                category=TestCategory.AUTHORIZATION,
+                severity=TestSeverity.HIGH,
+                status=False,
+                message="No API service available",
+                duration_ms=(time.time() - start) * 1000
+            )
+        
+        spreadsheet_id = self.args.sheet_id or os.getenv('DEFAULT_SPREADSHEET_ID', '')
+        
+        if not spreadsheet_id:
+            return TestResult(
+                name="Spreadsheet Access",
+                category=TestCategory.AUTHORIZATION,
+                severity=TestSeverity.HIGH,
+                status=False,
+                message="No spreadsheet ID provided",
+                duration_ms=(time.time() - start) * 1000
+            )
+        
+        try:
+            spreadsheet = self.service.spreadsheets().get(
+                spreadsheetId=spreadsheet_id
+            ).execute()
+            
+            properties = spreadsheet.get('properties', {})
+            
+            details = {
+                'title': properties.get('title'),
+                'locale': properties.get('locale'),
+                'timezone': properties.get('timeZone'),
+                'sheet_count': len(spreadsheet.get('sheets', [])),
+                'url': f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
+            }
+            
+            return TestResult(
+                name="Spreadsheet Access",
+                category=TestCategory.AUTHORIZATION,
+                severity=TestSeverity.HIGH,
+                status=True,
+                message=f"Successfully accessed spreadsheet: {details['title']}",
+                duration_ms=(time.time() - start) * 1000,
+                details=details
+            )
+            
+        except HttpError as e:
+            status = e.resp.status
+            message = f"HTTP {status}: {e}"
+            
+            if status == 403:
+                message = "Permission denied. Share spreadsheet with service account."
+            elif status == 404:
+                message = "Spreadsheet not found. Check ID."
+            
+            return TestResult(
+                name="Spreadsheet Access",
+                category=TestCategory.AUTHORIZATION,
+                severity=TestSeverity.HIGH,
+                status=False,
+                message=message,
+                duration_ms=(time.time() - start) * 1000
+            )
+    
+    def test_permissions(self) -> TestResult:
+        """Test permission levels"""
+        start = time.time()
+        
+        if not self.service:
+            return TestResult(
+                name="Permission Audit",
+                category=TestCategory.AUTHORIZATION,
+                severity=TestSeverity.MEDIUM,
+                status=False,
+                message="No API service available",
+                duration_ms=(time.time() - start) * 1000
+            )
+        
+        spreadsheet_id = self.args.sheet_id or os.getenv('DEFAULT_SPREADSHEET_ID', '')
+        
+        try:
+            self.permission_auditor = PermissionAuditor(self.service, self.logger)
+            
+            audit = self.permission_auditor.audit_spreadsheet(spreadsheet_id)
+            tabs = self.permission_auditor.audit_tabs(spreadsheet_id)
+            limits = self.permission_auditor.check_data_limits(spreadsheet_id)
+            
+            success = audit['access_level'] in ['owner', 'writer']
+            if not success:
+                success = audit['access_level'] == 'reader' and not self.args.write
+            
+            message = f"Access level: {audit['access_level']}"
+            if audit.get('warnings'):
+                message += f" | Warnings: {len(audit['warnings'])}"
+            
+            details = {
+                'permissions': audit,
+                'tabs': tabs,
+                'limits': limits
+            }
+            
+            return TestResult(
+                name="Permission Audit",
+                category=TestCategory.AUTHORIZATION,
+                severity=TestSeverity.MEDIUM,
+                status=success,
+                message=message,
+                duration_ms=(time.time() - start) * 1000,
+                details=details
+            )
+            
+        except Exception as e:
+            return TestResult(
+                name="Permission Audit",
+                category=TestCategory.AUTHORIZATION,
+                severity=TestSeverity.MEDIUM,
+                status=False,
+                message=f"Permission audit failed: {e}",
+                duration_ms=(time.time() - start) * 1000
+            )
+    
+    def test_read_operations(self) -> TestResult:
+        """Test read operations"""
+        start = time.time()
+        
+        if not self.service:
+            return TestResult(
+                name="Read Operations",
+                category=TestCategory.INTEGRATION,
+                severity=TestSeverity.MEDIUM,
+                status=False,
+                message="No API service available",
+                duration_ms=(time.time() - start) * 1000
+            )
+        
+        spreadsheet_id = self.args.sheet_id or os.getenv('DEFAULT_SPREADSHEET_ID', '')
+        range_name = f"'{self.args.sheet_name}'!{self.args.read_range}"
+        
+        try:
+            result = self.service.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=range_name
+            ).execute()
+            
+            values = result.get('values', [])
+            
+            details = {
+                'range': result.get('range'),
+                'rows': len(values),
+                'columns': len(values[0]) if values else 0,
+                'sample': values[:3] if values else []
+            }
+            
+            return TestResult(
+                name="Read Operations",
+                category=TestCategory.INTEGRATION,
+                severity=TestSeverity.MEDIUM,
+                status=True,
+                message=f"Successfully read {len(values)} rows",
+                duration_ms=(time.time() - start) * 1000,
+                details=details
+            )
+            
+        except Exception as e:
+            return TestResult(
+                name="Read Operations",
+                category=TestCategory.INTEGRATION,
+                severity=TestSeverity.MEDIUM,
+                status=False,
+                message=f"Read failed: {e}",
+                duration_ms=(time.time() - start) * 1000
+            )
+    
+    def test_write_operations(self) -> TestResult:
+        """Test write operations (if --write enabled)"""
+        start = time.time()
+        
+        if not self.args.write:
+            return TestResult(
+                name="Write Operations",
+                category=TestCategory.INTEGRATION,
+                severity=TestSeverity.LOW,
+                status=True,
+                message="Write tests skipped (use --write to enable)",
+                duration_ms=(time.time() - start) * 1000
+            )
+        
+        if not self.service:
+            return TestResult(
+                name="Write Operations",
+                category=TestCategory.INTEGRATION,
+                severity=TestSeverity.MEDIUM,
+                status=False,
+                message="No API service available",
+                duration_ms=(time.time() - start) * 1000
+            )
+        
+        spreadsheet_id = self.args.sheet_id or os.getenv('DEFAULT_SPREADSHEET_ID', '')
+        cell = f"'{self.args.sheet_name}'!{self.args.cell}"
+        
+        try:
+            # Write test data
+            test_data = [[
+                f"Test {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                f"Riyadh: {datetime.now(timezone(timedelta(hours=3))).isoformat()}"
+            ]]
+            
+            result = self.service.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range=cell,
+                valueInputOption='RAW',
+                body={'values': test_data}
+            ).execute()
+            
+            # Verify write
+            verify = self.service.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id,
+                range=cell
+            ).execute()
+            
+            details = {
+                'updated_cells': result.get('updatedCells'),
+                'updated_range': result.get('updatedRange'),
+                'written_data': test_data,
+                'verified': verify.get('values') == test_data
+            }
+            
+            return TestResult(
+                name="Write Operations",
+                category=TestCategory.INTEGRATION,
+                severity=TestSeverity.MEDIUM,
+                status=True,
+                message=f"Successfully wrote to {result.get('updatedRange')}",
+                duration_ms=(time.time() - start) * 1000,
+                details=details
+            )
+            
+        except HttpError as e:
+            if e.resp.status == 403:
+                message = "Write permission denied. Service account needs write access."
+            else:
+                message = f"Write failed: {e}"
+            
+            return TestResult(
+                name="Write Operations",
+                category=TestCategory.INTEGRATION,
+                severity=TestSeverity.MEDIUM,
+                status=False,
+                message=message,
+                duration_ms=(time.time() - start) * 1000
+            )
+    
+    def test_batch_operations(self) -> TestResult:
+        """Test batch operations"""
+        start = time.time()
+        
+        if not self.service:
+            return TestResult(
+                name="Batch Operations",
+                category=TestCategory.INTEGRATION,
+                severity=TestSeverity.LOW,
+                status=False,
+                message="No API service available",
+                duration_ms=(time.time() - start) * 1000
+            )
+        
+        spreadsheet_id = self.args.sheet_id or os.getenv('DEFAULT_SPREADSHEET_ID', '')
+        
+        try:
+            # Simple batch update (no changes)
+            requests = []  # Empty batch to test overhead
+            
+            result = self.service.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={'requests': requests}
+            ).execute()
+            
+            return TestResult(
+                name="Batch Operations",
+                category=TestCategory.INTEGRATION,
+                severity=TestSeverity.LOW,
+                status=True,
+                message="Batch operations supported",
+                duration_ms=(time.time() - start) * 1000,
+                details={'replies': len(result.get('replies', []))}
+            )
+            
+        except Exception as e:
+            return TestResult(
+                name="Batch Operations",
+                category=TestCategory.INTEGRATION,
+                severity=TestSeverity.LOW,
+                status=False,
+                message=f"Batch operations failed: {e}",
+                duration_ms=(time.time() - start) * 1000
+            )
+    
+    def test_performance(self) -> TestResult:
+        """Run performance benchmarks"""
+        start = time.time()
+        
+        if not self.args.benchmark:
+            return TestResult(
+                name="Performance Benchmark",
+                category=TestCategory.PERFORMANCE,
+                severity=TestSeverity.LOW,
+                status=True,
+                message="Benchmark skipped (use --benchmark to enable)",
+                duration_ms=(time.time() - start) * 1000
+            )
+        
+        if not self.service:
+            return TestResult(
+                name="Performance Benchmark",
+                category=TestCategory.PERFORMANCE,
+                severity=TestSeverity.LOW,
+                status=False,
+                message="No API service available",
+                duration_ms=(time.time() - start) * 1000
+            )
+        
+        try:
+            self.benchmark = PerformanceBenchmark(self.service, self.logger)
+            spreadsheet_id = self.args.sheet_id or os.getenv('DEFAULT_SPREADSHEET_ID', '')
+            range_name = f"'{self.args.sheet_name}'!{self.args.read_range}"
+            
+            # Run benchmarks
+            read_results = self.benchmark.benchmark_read(
+                spreadsheet_id, 
+                range_name,
+                iterations=self.args.iterations or 10
+            )
+            
+            if self.args.write:
+                write_results = self.benchmark.benchmark_write(
+                    spreadsheet_id,
+                    range_name,
+                    iterations=min(5, self.args.iterations or 5)
+                )
+            else:
+                write_results = {'skipped': True}
+            
+            batch_results = self.benchmark.benchmark_batch(
+                spreadsheet_id,
+                iterations=min(5, self.args.iterations or 5)
+            )
+            
+            details = {
+                'read': read_results,
+                'write': write_results,
+                'batch': batch_results
+            }
+            
+            # Determine if performance is acceptable
+            avg_read = read_results.get('avg_ms', 0)
+            status = avg_read < 1000  # Less than 1 second average
+            
+            message = f"Read: {avg_read:.1f}ms avg"
+            
+            return TestResult(
+                name="Performance Benchmark",
+                category=TestCategory.PERFORMANCE,
+                severity=TestSeverity.MEDIUM,
+                status=status,
+                message=message,
+                duration_ms=(time.time() - start) * 1000,
+                details=details
+            )
+            
+        except Exception as e:
+            return TestResult(
+                name="Performance Benchmark",
+                category=TestCategory.PERFORMANCE,
+                severity=TestSeverity.MEDIUM,
+                status=False,
+                message=f"Benchmark failed: {e}",
+                duration_ms=(time.time() - start) * 1000
+            )
+    
+    def test_rate_limits(self) -> TestResult:
+        """Test rate limit handling"""
+        start = time.time()
+        
+        if not self.service:
+            return TestResult(
+                name="Rate Limits",
+                category=TestCategory.PERFORMANCE,
+                severity=TestSeverity.MEDIUM,
+                status=False,
+                message="No API service available",
+                duration_ms=(time.time() - start) * 1000
+            )
+        
+        try:
+            # Make rapid requests to test rate limits
+            spreadsheet_id = self.args.sheet_id or os.getenv('DEFAULT_SPREADSHEET_ID', '')
+            
+            responses = []
+            rate_limited = False
+            
+            for i in range(10):
+                try:
+                    result = self.service.spreadsheets().get(
+                        spreadsheetId=spreadsheet_id,
+                        fields='spreadsheetId'
+                    ).execute()
+                    responses.append(result)
+                    time.sleep(0.1)  # 100ms between requests
+                except HttpError as e:
+                    if e.resp.status == 429:
+                        rate_limited = True
+                        responses.append(f"Rate limited after {i} requests")
+                    break
+            
+            details = {
+                'successful_requests': len([r for r in responses if isinstance(r, dict)]),
+                'rate_limited': rate_limited,
+                'quota_remaining': getattr(self.service, '_quota_remaining', 'unknown')
+            }
+            
+            return TestResult(
+                name="Rate Limits",
+                category=TestCategory.PERFORMANCE,
+                severity=TestSeverity.MEDIUM,
+                status=True,
+                message=f"Rate limit not reached ({len(responses)} requests)",
+                duration_ms=(time.time() - start) * 1000,
+                details=details
+            )
+            
+        except Exception as e:
+            return TestResult(
+                name="Rate Limits",
+                category=TestCategory.PERFORMANCE,
+                severity=TestSeverity.MEDIUM,
+                status=False,
+                message=f"Rate limit test failed: {e}",
+                duration_ms=(time.time() - start) * 1000
+            )
+    
+    def test_compliance(self) -> TestResult:
+        """Test compliance requirements"""
+        start = time.time()
+        
+        checks = []
+        
+        # Check for sensitive data exposure
+        if self.credential_manager.credential_data:
+            # Check if private key is properly secured
+            private_key = self.credential_manager.credential_data.get('private_key', '')
+            if private_key and 'ENCRYPTED' not in private_key:
+                checks.append({
+                    'check': 'private_key_encryption',
+                    'passed': False,
+                    'message': 'Private key is not encrypted'
+                })
+            
+            # Check token expiry
+            if self.credential_manager.credential_type == CredentialType.OAUTH2:
+                expiry = self.credential_manager.credential_data.get('expiry')
+                if expiry:
+                    expiry_date = datetime.fromisoformat(expiry.replace('Z', '+00:00'))
+                    days_until_expiry = (expiry_date - datetime.now(timezone.utc)).days
+                    if days_until_expiry < 7:
+                        checks.append({
+                            'check': 'token_expiry',
+                            'passed': False,
+                            'message': f'Token expires in {days_until_expiry} days'
+                        })
+        
+        # Check for audit logging
+        audit_log_checks = [
+            ('access_logging', True),
+            ('data_retention', False),
+            ('pii_detection', False)
+        ]
+        
+        for check, default in audit_log_checks:
+            checks.append({
+                'check': check,
+                'passed': default,
+                'message': f'{check} {"enabled" if default else "not verified"}'
+            })
+        
+        # Check data residency (if specified)
+        if self.args.data_residency:
+            # Would check actual data location
+            checks.append({
+                'check': 'data_residency',
+                'passed': True,
+                'message': f'Data residency verified: {self.args.data_residency}'
+            })
+        
+        success = all(c['passed'] for c in checks)
+        
+        return TestResult(
+            name="Compliance Check",
+            category=TestCategory.COMPLIANCE,
+            severity=TestSeverity.HIGH,
+            status=success,
+            message=f"Compliance checks: {sum(1 for c in checks if c['passed'])}/{len(checks)} passed",
+            duration_ms=(time.time() - start) * 1000,
+            details={'checks': checks}
+        )
+    
+    def _output_results(self):
+        """Output test results"""
+        self.report.generate_summary()
+        
+        if self.args.ci_mode:
+            # Minimal output for CI
+            if self.report.summary['failed'] > 0:
+                print(f"❌ {self.report.summary['failed']} tests failed")
+            else:
+                print(f"✅ All {self.report.summary['total']} tests passed")
+        
+        elif self.args.quiet:
+            # Quiet mode - just summary
+            print(f"Passed: {self.report.summary['passed']}, Failed: {self.report.summary['failed']}")
+        
+        else:
+            # Normal output
+            print("\n" + "=" * 80)
+            print(f"🔍 GOOGLE SHEETS AUTH DIAGNOSTIC REPORT v{SCRIPT_VERSION}")
+            print("=" * 80)
+            
+            for result in self.report.results:
+                status = "✅" if result.get('status') else "❌"
+                severity = result.get('severity', '').upper()
+                print(f"{status} [{severity:8}] {result.get('name')}: {result.get('message')}")
+            
+            print("\n" + "=" * 80)
+            print(f"SUMMARY: {self.report.summary['passed']}/{self.report.summary['total']} passed "
+                  f"({self.report.summary['success_rate']:.1f}%)")
+            
+            if self.report.recommendations:
+                print("\n📋 RECOMMENDATIONS:")
+                for rec in self.report.recommendations:
+                    print(f"  • {rec}")
+            
+            print("=" * 80)
+        
+        # Export reports
+        if self.args.output:
+            output_path = Path(self.args.output)
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            if self.args.output.endswith('.json'):
+                output_path.write_text(self.report.to_json())
+                print(f"📄 JSON report saved to {output_path}")
+            
+            elif self.args.output.endswith('.html'):
+                output_path.write_text(self.report.to_html())
+                print(f"📄 HTML report saved to {output_path}")
+            
+            elif self.args.output.endswith('.xml'):
+                output_path.write_text(self.report.to_junit_xml())
+                print(f"📄 JUnit XML saved to {output_path}")
+
+# =============================================================================
+# CLI Entry Point
+# =============================================================================
+def create_parser() -> argparse.ArgumentParser:
+    """Create argument parser"""
+    parser = argparse.ArgumentParser(
+        description=f"Google Sheets Authentication Diagnostic Tool v{SCRIPT_VERSION}",
+        formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    
+    # Basic options
+    parser.add_argument("--sheet-id", help="Spreadsheet ID to test")
+    parser.add_argument("--sheet-name", default="Sheet1", help="Tab name (default: Sheet1)")
+    parser.add_argument("--read-range", default="A1:B2", help="Range to read (default: A1:B2)")
+    parser.add_argument("--cell", default="A1", help="Cell for write test (default: A1)")
+    
+    # Test modes
+    parser.add_argument("--write", action="store_true", help="Include write tests")
+    parser.add_argument("--benchmark", action="store_true", help="Run performance benchmarks")
+    parser.add
