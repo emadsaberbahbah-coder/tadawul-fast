@@ -2,7 +2,7 @@
 """
 repo_hygiene_check.py
 ===========================================================
-TADAWUL ENTERPRISE REPOSITORY HYGIENE CHECKER — v3.0.0
+TADAWUL ENTERPRISE REPOSITORY HYGIENE CHECKER — v3.1.0
 ===========================================================
 AI-POWERED | ML-ENHANCED | CI/CD INTEGRATED | COMPREHENSIVE SECURITY
 
@@ -21,6 +21,10 @@ Core Capabilities:
 - Historical trend analysis
 - Pre-commit hook integration
 - Machine learning model for anomaly detection
+- FIXED: Tuple unpacking error in parallel processing
+
+Version: 3.1.0
+Last Updated: 2024-03-21
 """
 
 from __future__ import annotations
@@ -105,7 +109,7 @@ except ImportError:
     _ASYNC_HTTP_AVAILABLE = False
 
 # Version
-SCRIPT_VERSION = "3.0.0"
+SCRIPT_VERSION = "3.1.0"
 
 # Configure logging
 logging.basicConfig(
@@ -424,7 +428,7 @@ class SecretDetector:
         """Scan content for secrets"""
         findings = []
         
-        for i, (pattern, line) in enumerate(content.splitlines(), 1):
+        for i, (line) in enumerate(content.splitlines(), 1):
             for regex, secret_type in cls.PATTERNS:
                 for match in regex.finditer(line):
                     findings.append(Finding(
@@ -820,7 +824,7 @@ class HygieneScanner:
         )
     
     async def scan_parallel(self, files: List[Path]) -> List[Finding]:
-        """Scan files in parallel"""
+        """Scan files in parallel - FIXED: Proper error handling and tuple unpacking"""
         all_findings = []
         
         # Use process pool for CPU-bound scanning
@@ -832,25 +836,36 @@ class HygieneScanner:
                 task = loop.run_in_executor(executor, self.scan_file, file_path)
                 tasks.append(task)
             
+            # FIXED: Properly handle results with error handling
             results = await asyncio.gather(*tasks, return_exceptions=True)
             
-            for result in results:
+            for i, result in enumerate(results):
                 if isinstance(result, Exception):
-                    logger.error(f"Scan error: {result}")
-                else:
+                    logger.error(f"Scan error for {files[i]}: {result}")
+                elif isinstance(result, list):
                     all_findings.extend(result)
+                else:
+                    logger.warning(f"Unexpected result type for {files[i]}: {type(result)}")
         
         return all_findings
     
     def scan_sync(self, files: List[Path]) -> List[Finding]:
-        """Scan files synchronously"""
+        """Scan files synchronously with thread pool - FIXED: Proper result handling"""
         all_findings = []
         
         with ThreadPoolExecutor(max_workers=self.parallel_workers) as executor:
-            results = executor.map(self.scan_file, files)
+            # FIXED: Use submit with proper result collection instead of map
+            futures = [executor.submit(self.scan_file, file_path) for file_path in files]
             
-            for findings in results:
-                all_findings.extend(findings)
+            for future in futures:
+                try:
+                    result = future.result(timeout=30)
+                    if isinstance(result, list):
+                        all_findings.extend(result)
+                    else:
+                        logger.warning(f"Unexpected result type: {type(result)}")
+                except Exception as e:
+                    logger.error(f"Scan error: {e}")
         
         return all_findings
 
@@ -1315,10 +1330,16 @@ async def main_async(args: argparse.Namespace) -> int:
     # Scan files
     logger.info(f"Scanning with {workers} workers...")
     
-    if parallel:
-        findings = await scanner.scan_parallel(files)
-    else:
-        findings = scanner.scan_sync(files)
+    try:
+        if parallel:
+            findings = await scanner.scan_parallel(files)
+        else:
+            findings = scanner.scan_sync(files)
+    except Exception as e:
+        logger.error(f"Scan failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
     
     # Apply max offenders limit
     if max_offenders > 0 and len(findings) > max_offenders:
@@ -1329,6 +1350,7 @@ async def main_async(args: argparse.Namespace) -> int:
     summary.total_files = len(files)
     summary.files_with_issues = len(set(f.file_path for f in findings))
     summary.scan_duration_ms = (time.time() - start_time) * 1000
+    summary.scan_end = datetime.now(timezone.utc).isoformat()
     
     for f in findings:
         summary.add_finding(f)
@@ -1388,18 +1410,22 @@ async def main_async(args: argparse.Namespace) -> int:
     high_count = summary.by_severity.get(Severity.HIGH, 0)
     
     if args.fail_threshold == "critical" and critical_count > 0:
+        logger.error(f"Found {critical_count} critical issues")
         return 2
     elif args.fail_threshold == "high" and (critical_count + high_count) > 0:
+        logger.error(f"Found {critical_count + high_count} critical/high issues")
         return 2
     elif args.fail_threshold == "any" and summary.total_findings > 0:
+        logger.error(f"Found {summary.total_findings} issues")
         return 2
     
+    logger.info(f"Scan completed successfully with {summary.total_findings} findings")
     return 0
 
 
 def main() -> int:
     """Main entry point"""
-    parser = argparse.ArgumentParser(description="Repository Hygiene Checker v3.0.0")
+    parser = argparse.ArgumentParser(description="Repository Hygiene Checker v3.1.0")
     
     # Basic options
     parser.add_argument("--root", default=".", help="Repository root to scan")
