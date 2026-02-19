@@ -1,7 +1,7 @@
 """
 routes/advanced_analysis.py
 ------------------------------------------------------------
-TADAWUL ADVANCED ANALYSIS ENGINE — v5.0.0 (Enterprise Grade)
+TADAWUL ADVANCED ANALYSIS ENGINE — v5.1.0 (Enterprise Grade)
 Mission Critical: PROD HARDENED + DISTRIBUTED CACHING + ML READY
 
 Key Innovations:
@@ -15,6 +15,10 @@ Key Innovations:
 - Smart retry with exponential backoff
 - Health-aware routing
 - Compliance with Saudi Central Bank (SAMA) guidelines
+- FIXED: Git merge conflict markers at line 93
+
+Version: 5.1.0
+Last Updated: 2024-03-21
 """
 
 from __future__ import annotations
@@ -85,7 +89,7 @@ except ImportError:
 
 logger = logging.getLogger("routes.advanced_analysis")
 
-ADVANCED_ANALYSIS_VERSION = "5.0.0"
+ADVANCED_ANALYSIS_VERSION = "5.1.0"
 router = APIRouter(prefix="/v1/advanced", tags=["Advanced Analysis"])
 
 # =============================================================================
@@ -779,7 +783,7 @@ class MLPrediction(BaseModel):
     confidence_1m: Optional[float] = None
     risk_level: Optional[str] = None  # LOW, MEDIUM, HIGH
     factors: Dict[str, float] = Field(default_factory=dict)
-    model_version: str = "5.0.0"
+    model_version: str = "5.1.0"
     
     if _PYDANTIC_V2:
         model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -1083,7 +1087,15 @@ class AdvancedDataEngine:
         tasks = [fetch_one(s) for s in symbols]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         
-        return {s: r for s, r in results if not isinstance(r, Exception)}
+        result_dict = {}
+        for r in results:
+            if isinstance(r, tuple):
+                symbol, data = r
+                result_dict[symbol] = data
+            elif isinstance(r, Exception):
+                logger.error(f"Individual fetch error: {r}")
+        
+        return result_dict
     
     def _normalize_batch_result(self, result: Any, symbols: List[str]) -> Dict[str, Any]:
         """Normalize batch result to dict"""
@@ -1271,7 +1283,7 @@ async def advanced_sheet_rows(
         quotes = await _data_engine.get_quotes(engine, req.symbols[:req.top_n], mode)
     
     # Build headers
-    headers = self._get_headers(req.sheet_name, req.headers)
+    headers = _get_headers(req.sheet_name, req.headers)
     
     # Build rows
     rows = []
@@ -1282,12 +1294,12 @@ async def advanced_sheet_rows(
         quote = quotes.get(symbol, _data_engine._create_placeholder(symbol, "Not found"))
         
         # Convert to row
-        row = self._quote_to_row(quote, headers)
+        row = _quote_to_row(quote, headers)
         rows.append(row)
         
         # Extract features if requested
         if req.include_features:
-            features = self._extract_features(quote, symbol)
+            features = _extract_features(quote, symbol)
             features_dict[symbol] = features
         
         # Get predictions if requested
@@ -1353,152 +1365,156 @@ async def advanced_sheet_rows(
             "business_day": _riyadh_time.is_business_day()
         }
     )
+
+
+def _get_headers(sheet_name: Optional[str], override: Optional[List[str]]) -> List[str]:
+    """Get headers for response"""
+    if override:
+        return override
     
-    def _get_headers(self, sheet_name: Optional[str], override: Optional[List[str]]) -> List[str]:
-        """Get headers for response"""
-        if override:
-            return override
-        
-        # Default headers
-        return [
-            "Symbol",
-            "Name",
-            "Price",
-            "Change",
-            "Change %",
-            "Volume",
-            "Market Cap",
-            "P/E Ratio",
-            "Dividend Yield",
-            "Beta",
-            "RSI (14)",
-            "MACD",
-            "BB Upper",
-            "BB Lower",
-            "BB Middle",
-            "Volatility (30d)",
-            "Momentum (14d)",
-            "Sharpe Ratio",
-            "Max Drawdown (30d)",
-            "Correlation TASI",
-            "Forecast Price (1M)",
-            "Expected ROI (1M)",
-            "Forecast Price (3M)",
-            "Expected ROI (3M)",
-            "Forecast Price (12M)",
-            "Expected ROI (12M)",
-            "Risk Score",
-            "Overall Score",
-            "Recommendation",
-            "Data Quality",
-            "Last Updated (UTC)",
-            "Last Updated (Riyadh)"
-        ]
+    # Default headers
+    return [
+        "Symbol",
+        "Name",
+        "Price",
+        "Change",
+        "Change %",
+        "Volume",
+        "Market Cap",
+        "P/E Ratio",
+        "Dividend Yield",
+        "Beta",
+        "RSI (14)",
+        "MACD",
+        "BB Upper",
+        "BB Lower",
+        "BB Middle",
+        "Volatility (30d)",
+        "Momentum (14d)",
+        "Sharpe Ratio",
+        "Max Drawdown (30d)",
+        "Correlation TASI",
+        "Forecast Price (1M)",
+        "Expected ROI (1M)",
+        "Forecast Price (3M)",
+        "Expected ROI (3M)",
+        "Forecast Price (12M)",
+        "Expected ROI (12M)",
+        "Risk Score",
+        "Overall Score",
+        "Recommendation",
+        "Data Quality",
+        "Last Updated (UTC)",
+        "Last Updated (Riyadh)"
+    ]
+
+
+def _quote_to_row(quote: Dict[str, Any], headers: List[str]) -> List[Any]:
+    """Convert quote dict to row list"""
+    # Create lookup dict
+    lookup = {k.lower(): v for k, v in quote.items()}
     
-    def _quote_to_row(self, quote: Dict[str, Any], headers: List[str]) -> List[Any]:
-        """Convert quote dict to row list"""
-        # Create lookup dict
-        lookup = {k.lower(): v for k, v in quote.items()}
+    row = []
+    for header in headers:
+        header_lower = header.lower()
         
-        row = []
-        for header in headers:
-            header_lower = header.lower()
-            
-            # Map common headers to quote fields
-            if "symbol" in header_lower:
-                row.append(quote.get("symbol") or quote.get("ticker"))
-            elif "name" in header_lower:
-                row.append(quote.get("name") or quote.get("company_name"))
-            elif "price" in header_lower and "forecast" not in header_lower:
-                row.append(quote.get("price") or quote.get("current_price"))
-            elif "change" in header_lower and "%" not in header_lower:
-                row.append(quote.get("change") or quote.get("price_change"))
-            elif "change %" in header_lower or "change%" in header_lower:
-                row.append(quote.get("change_percent") or quote.get("change_pct"))
-            elif "volume" in header_lower:
-                row.append(quote.get("volume"))
-            elif "market cap" in header_lower:
-                row.append(quote.get("market_cap"))
-            elif "pe ratio" in header_lower or "p/e" in header_lower:
-                row.append(quote.get("pe_ratio"))
-            elif "dividend yield" in header_lower:
-                row.append(quote.get("dividend_yield"))
-            elif "beta" in header_lower:
-                row.append(quote.get("beta"))
-            elif "rsi" in header_lower:
-                row.append(quote.get("rsi_14d"))
-            elif "macd" in header_lower:
-                row.append(quote.get("macd"))
-            elif "bb upper" in header_lower:
-                row.append(quote.get("bb_upper"))
-            elif "bb lower" in header_lower:
-                row.append(quote.get("bb_lower"))
-            elif "bb middle" in header_lower:
-                row.append(quote.get("bb_middle"))
-            elif "volatility" in header_lower:
-                row.append(quote.get("volatility_30d"))
-            elif "momentum" in header_lower:
-                row.append(quote.get("momentum_14d"))
-            elif "sharpe" in header_lower:
-                row.append(quote.get("sharpe_ratio"))
-            elif "drawdown" in header_lower or "max drawdown" in header_lower:
-                row.append(quote.get("max_drawdown_30d"))
-            elif "correlation" in header_lower and "tasi" in header_lower:
-                row.append(quote.get("correlation_tasi"))
-            elif "forecast price" in header_lower and "1m" in header_lower:
-                row.append(quote.get("forecast_price_1m"))
-            elif "expected roi" in header_lower and "1m" in header_lower:
-                row.append(quote.get("expected_roi_1m"))
-            elif "forecast price" in header_lower and "3m" in header_lower:
-                row.append(quote.get("forecast_price_3m"))
-            elif "expected roi" in header_lower and "3m" in header_lower:
-                row.append(quote.get("expected_roi_3m"))
-            elif "forecast price" in header_lower and "12m" in header_lower:
-                row.append(quote.get("forecast_price_12m"))
-            elif "expected roi" in header_lower and "12m" in header_lower:
-                row.append(quote.get("expected_roi_12m"))
-            elif "risk score" in header_lower:
-                row.append(quote.get("risk_score"))
-            elif "overall score" in header_lower:
-                row.append(quote.get("overall_score"))
-            elif "recommendation" in header_lower:
-                row.append(quote.get("recommendation") or "HOLD")
-            elif "data quality" in header_lower:
-                row.append(quote.get("data_quality") or "PARTIAL")
-            elif "last updated (utc)" in header_lower:
-                row.append(quote.get("last_updated_utc"))
-            elif "last updated (riyadh)" in header_lower:
-                row.append(quote.get("last_updated_riyadh") or _riyadh_time.now().isoformat())
-            else:
-                # Direct lookup
-                row.append(lookup.get(header_lower))
-        
-        return row
+        # Map common headers to quote fields
+        if "symbol" in header_lower:
+            row.append(quote.get("symbol") or quote.get("ticker"))
+        elif "name" in header_lower:
+            row.append(quote.get("name") or quote.get("company_name"))
+        elif "price" in header_lower and "forecast" not in header_lower:
+            row.append(quote.get("price") or quote.get("current_price"))
+        elif "change" in header_lower and "%" not in header_lower:
+            row.append(quote.get("change") or quote.get("price_change"))
+        elif "change %" in header_lower or "change%" in header_lower:
+            row.append(quote.get("change_percent") or quote.get("change_pct"))
+        elif "volume" in header_lower:
+            row.append(quote.get("volume"))
+        elif "market cap" in header_lower:
+            row.append(quote.get("market_cap"))
+        elif "pe ratio" in header_lower or "p/e" in header_lower:
+            row.append(quote.get("pe_ratio"))
+        elif "dividend yield" in header_lower:
+            row.append(quote.get("dividend_yield"))
+        elif "beta" in header_lower:
+            row.append(quote.get("beta"))
+        elif "rsi" in header_lower:
+            row.append(quote.get("rsi_14d"))
+        elif "macd" in header_lower:
+            row.append(quote.get("macd"))
+        elif "bb upper" in header_lower:
+            row.append(quote.get("bb_upper"))
+        elif "bb lower" in header_lower:
+            row.append(quote.get("bb_lower"))
+        elif "bb middle" in header_lower:
+            row.append(quote.get("bb_middle"))
+        elif "volatility" in header_lower:
+            row.append(quote.get("volatility_30d"))
+        elif "momentum" in header_lower:
+            row.append(quote.get("momentum_14d"))
+        elif "sharpe" in header_lower:
+            row.append(quote.get("sharpe_ratio"))
+        elif "drawdown" in header_lower or "max drawdown" in header_lower:
+            row.append(quote.get("max_drawdown_30d"))
+        elif "correlation" in header_lower and "tasi" in header_lower:
+            row.append(quote.get("correlation_tasi"))
+        elif "forecast price" in header_lower and "1m" in header_lower:
+            row.append(quote.get("forecast_price_1m"))
+        elif "expected roi" in header_lower and "1m" in header_lower:
+            row.append(quote.get("expected_roi_1m"))
+        elif "forecast price" in header_lower and "3m" in header_lower:
+            row.append(quote.get("forecast_price_3m"))
+        elif "expected roi" in header_lower and "3m" in header_lower:
+            row.append(quote.get("expected_roi_3m"))
+        elif "forecast price" in header_lower and "12m" in header_lower:
+            row.append(quote.get("forecast_price_12m"))
+        elif "expected roi" in header_lower and "12m" in header_lower:
+            row.append(quote.get("expected_roi_12m"))
+        elif "risk score" in header_lower:
+            row.append(quote.get("risk_score"))
+        elif "overall score" in header_lower:
+            row.append(quote.get("overall_score"))
+        elif "recommendation" in header_lower:
+            row.append(quote.get("recommendation") or "HOLD")
+        elif "data quality" in header_lower:
+            row.append(quote.get("data_quality") or "PARTIAL")
+        elif "last updated (utc)" in header_lower:
+            row.append(quote.get("last_updated_utc"))
+        elif "last updated (riyadh)" in header_lower:
+            row.append(quote.get("last_updated_riyadh") or _riyadh_time.now().isoformat())
+        else:
+            # Direct lookup
+            row.append(lookup.get(header_lower))
     
-    def _extract_features(self, quote: Dict[str, Any], symbol: str) -> MLFeatures:
-        """Extract ML features from quote"""
-        return MLFeatures(
-            symbol=symbol,
-            price=quote.get("price"),
-            volume=quote.get("volume"),
-            volatility_30d=quote.get("volatility_30d"),
-            momentum_14d=quote.get("momentum_14d"),
-            rsi_14d=quote.get("rsi_14d"),
-            macd=quote.get("macd"),
-            macd_signal=quote.get("macd_signal"),
-            bb_upper=quote.get("bb_upper"),
-            bb_lower=quote.get("bb_lower"),
-            bb_middle=quote.get("bb_middle"),
-            volume_profile=quote.get("volume_profile"),
-            market_cap=quote.get("market_cap"),
-            pe_ratio=quote.get("pe_ratio"),
-            dividend_yield=quote.get("dividend_yield"),
-            beta=quote.get("beta"),
-            sharpe_ratio=quote.get("sharpe_ratio"),
-            max_drawdown_30d=quote.get("max_drawdown_30d"),
-            correlation_sp500=quote.get("correlation_sp500"),
-            correlation_tasi=quote.get("correlation_tasi")
-        )
+    return row
+
+
+def _extract_features(quote: Dict[str, Any], symbol: str) -> MLFeatures:
+    """Extract ML features from quote"""
+    return MLFeatures(
+        symbol=symbol,
+        price=quote.get("price"),
+        volume=quote.get("volume"),
+        volatility_30d=quote.get("volatility_30d"),
+        momentum_14d=quote.get("momentum_14d"),
+        rsi_14d=quote.get("rsi_14d"),
+        macd=quote.get("macd"),
+        macd_signal=quote.get("macd_signal"),
+        bb_upper=quote.get("bb_upper"),
+        bb_lower=quote.get("bb_lower"),
+        bb_middle=quote.get("bb_middle"),
+        volume_profile=quote.get("volume_profile"),
+        market_cap=quote.get("market_cap"),
+        pe_ratio=quote.get("pe_ratio"),
+        dividend_yield=quote.get("dividend_yield"),
+        beta=quote.get("beta"),
+        sharpe_ratio=quote.get("sharpe_ratio"),
+        max_drawdown_30d=quote.get("max_drawdown_30d"),
+        correlation_sp500=quote.get("correlation_sp500"),
+        correlation_tasi=quote.get("correlation_tasi")
+    )
+
 
 # =============================================================================
 # Admin Routes (Protected)
@@ -1550,6 +1566,58 @@ async def admin_reload_config(request: Request) -> Dict[str, Any]:
         },
         "timestamp": _riyadh_time.now().isoformat()
     }
+
+
+@router.get("/admin/tokens", include_in_schema=False)
+async def admin_list_tokens(request: Request) -> Dict[str, Any]:
+    """List active tokens (admin only)"""
+    # Verify admin token
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    token = auth_header[7:]
+    admin_token = os.getenv("ADMIN_TOKEN", "")
+    if not admin_token or token != admin_token:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    return {
+        "tokens": list(_token_manager._tokens),
+        "metadata": _token_manager._token_metadata,
+        "timestamp": _riyadh_time.now().isoformat()
+    }
+
+
+@router.post("/admin/tokens/rotate", include_in_schema=False)
+async def admin_rotate_token(
+    request: Request,
+    body: Dict[str, str] = Body(...)
+) -> Dict[str, Any]:
+    """Rotate token (admin only)"""
+    # Verify admin token
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    token = auth_header[7:]
+    admin_token = os.getenv("ADMIN_TOKEN", "")
+    if not admin_token or token != admin_token:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    
+    old_token = body.get("old_token")
+    new_token = body.get("new_token")
+    
+    if not old_token or not new_token:
+        raise HTTPException(status_code=400, detail="Missing old_token or new_token")
+    
+    success = _token_manager.rotate_token(old_token, new_token)
+    
+    return {
+        "status": "success" if success else "failed",
+        "message": "Token rotated" if success else "Token not found",
+        "timestamp": _riyadh_time.now().isoformat()
+    }
+
 
 # =============================================================================
 # Export
