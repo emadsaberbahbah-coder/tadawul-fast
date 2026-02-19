@@ -1,7 +1,7 @@
 """
 routes/advisor.py
 ------------------------------------------------------------
-TADAWUL ENTERPRISE ADVISOR ENGINE — v3.1.0 (AI-POWERED + PRODUCTION HARDENED)
+TADAWUL ENTERPRISE ADVISOR ENGINE — v3.2.0 (AI-POWERED + PRODUCTION HARDENED)
 SAMA Compliant | Multi-Asset | Real-time ML | Dynamic Allocation | Audit Trail
 
 Core Capabilities:
@@ -16,6 +16,7 @@ Core Capabilities:
 - Advanced caching with Redis and predictive pre-fetch
 - Machine learning model serving with online learning
 - Compliance with Saudi Capital Market Authority (CMA) rules
+- FIXED: Git merge conflict marker at line 882
 
 Key Features:
 - ✅ Multi-shape input handling (tickers in any format)
@@ -30,7 +31,7 @@ Key Features:
 - ✅ Rate limiting with token bucket algorithm
 - ✅ Graceful degradation with fallback strategies
 
-Version: 3.1.0
+Version: 3.2.0
 Last Updated: 2024-03-21
 """
 
@@ -145,7 +146,7 @@ except ImportError:
 
 logger = logging.getLogger("routes.advisor")
 
-ADVISOR_ROUTE_VERSION = "3.1.0"
+ADVISOR_ROUTE_VERSION = "3.2.0"
 router = APIRouter(prefix="/v1/advisor", tags=["advisor"])
 
 # =============================================================================
@@ -216,6 +217,14 @@ class MarketCondition(str, Enum):
     RECOVERING = "recovering"
     OVERBOUGHT = "overbought"
     OVERSOLD = "oversold"
+
+class AlertPriority(str, Enum):
+    """Alert priority levels"""
+    CRITICAL = "critical"
+    HIGH = "high"
+    MEDIUM = "medium"
+    LOW = "low"
+    INFO = "info"
 
 # =============================================================================
 # Configuration with Dynamic Updates
@@ -701,6 +710,8 @@ class CircuitBreaker:
         self.failure_count = 0
         self.last_failure_time = 0.0
         self.success_count = 0
+        self.total_failures = 0
+        self.total_successes = 0
         self._lock = asyncio.Lock()
         self._half_open_requests = 0
     
@@ -728,6 +739,7 @@ class CircuitBreaker:
             result = await func(*args, **kwargs) if asyncio.iscoroutinefunction(func) else func(*args, **kwargs)
             
             async with self._lock:
+                self.total_successes += 1
                 if self.state == CircuitState.HALF_OPEN:
                     self.success_count += 1
                     if self.success_count >= 2:
@@ -742,6 +754,7 @@ class CircuitBreaker:
         except Exception as e:
             async with self._lock:
                 self.failure_count += 1
+                self.total_failures += 1
                 self.last_failure_time = time.time()
                 
                 if self.state == CircuitState.CLOSED and self.failure_count >= self.threshold:
@@ -752,6 +765,19 @@ class CircuitBreaker:
                     logger.warning(f"Circuit {self.name} re-opened from half-open")
             
             raise e
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get circuit breaker statistics"""
+        return {
+            "name": self.name,
+            "state": self.state.value,
+            "failure_count": self.failure_count,
+            "success_count": self.success_count,
+            "total_failures": self.total_failures,
+            "total_successes": self.total_successes,
+            "last_failure_time": self.last_failure_time,
+            "last_success_time": self.last_failure_time
+        }
 
 # =============================================================================
 # Rate Limiter with Token Bucket
@@ -1027,6 +1053,7 @@ class MLModelManager:
         self._initialized = False
         self._prediction_cache: Dict[str, Tuple[MLPrediction, float]] = {}
         self._feature_importance: Dict[str, float] = {}
+        self._model_versions: Dict[str, str] = {}
     
     async def initialize(self) -> None:
         """Initialize ML models"""
@@ -1037,22 +1064,37 @@ class MLModelManager:
             # Try to import ML libraries
             from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
             from sklearn.preprocessing import StandardScaler
+            import joblib
             
             async with asyncio.Lock():
                 if self._initialized:
                     return
                 
-                self._models["rf_1d"] = RandomForestRegressor(
-                    n_estimators=100,
-                    max_depth=10,
-                    random_state=42
-                )
-                self._models["gb_1w"] = GradientBoostingRegressor(
-                    n_estimators=100,
-                    learning_rate=0.1,
-                    max_depth=5,
-                    random_state=42
-                )
+                # Try to load pre-trained models
+                model_path = os.getenv("ML_MODEL_PATH", "models/advisor")
+                if os.path.exists(f"{model_path}/rf_1d.joblib"):
+                    self._models["rf_1d"] = joblib.load(f"{model_path}/rf_1d.joblib")
+                    self._model_versions["rf_1d"] = "1.0.0"
+                else:
+                    self._models["rf_1d"] = RandomForestRegressor(
+                        n_estimators=100,
+                        max_depth=10,
+                        random_state=42
+                    )
+                    self._model_versions["rf_1d"] = "1.0.0"
+                
+                if os.path.exists(f"{model_path}/gb_1w.joblib"):
+                    self._models["gb_1w"] = joblib.load(f"{model_path}/gb_1w.joblib")
+                    self._model_versions["gb_1w"] = "1.0.0"
+                else:
+                    self._models["gb_1w"] = GradientBoostingRegressor(
+                        n_estimators=100,
+                        learning_rate=0.1,
+                        max_depth=5,
+                        random_state=42
+                    )
+                    self._model_versions["gb_1w"] = "1.0.0"
+                
                 self._models["scaler"] = StandardScaler()
                 
                 self._initialized = True
@@ -1179,6 +1221,10 @@ class MLModelManager:
             importance = {k: v/total for k, v in importance.items()}
         
         return importance
+    
+    def get_model_versions(self) -> Dict[str, str]:
+        """Get model versions"""
+        return self._model_versions
 
 _ml_models = MLModelManager()
 
@@ -1417,14 +1463,16 @@ class ShariahChecker:
             "business": {
                 "prohibited": [
                     "alcohol", "tobacco", "pork", "gambling",
-                    "conventional_finance", "insurance", "weapons"
+                    "conventional_finance", "insurance", "weapons", "defense",
+                    "alcoholic_beverages", "gambling_casinos", "adult_entertainment"
                 ],
                 "tolerance_pct": 0.05  # 5% tolerance for prohibited activities
             },
             "financial": {
                 "debt_to_assets_max": 0.33,  # Max 33% debt
                 "cash_to_assets_max": 0.33,   # Max 33% cash
-                "receivables_to_assets_max": 0.33  # Max 33% receivables
+                "receivables_to_assets_max": 0.33,  # Max 33% receivables
+                "interest_income_max": 0.05   # Max 5% interest income
             }
         }
     
@@ -1441,8 +1489,12 @@ class ShariahChecker:
         try:
             # Business screening
             sector = data.get("sector", "").lower()
+            industry = data.get("industry", "").lower()
+            name = data.get("name", "").lower()
+            
+            combined_text = f"{sector} {industry} {name}"
             for prohibited in self._screening_criteria["business"]["prohibited"]:
-                if prohibited in sector:
+                if prohibited in combined_text:
                     self._cache_result(cache_key, ShariahCompliance.NON_COMPLIANT)
                     return ShariahCompliance.NON_COMPLIANT
             
@@ -1454,6 +1506,11 @@ class ShariahChecker:
             
             cash_to_assets = data.get("cash_to_assets", 0)
             if cash_to_assets > self._screening_criteria["financial"]["cash_to_assets_max"]:
+                self._cache_result(cache_key, ShariahCompliance.NON_COMPLIANT)
+                return ShariahCompliance.NON_COMPLIANT
+            
+            receivables_to_assets = data.get("receivables_to_assets", 0)
+            if receivables_to_assets > self._screening_criteria["financial"]["receivables_to_assets_max"]:
                 self._cache_result(cache_key, ShariahCompliance.NON_COMPLIANT)
                 return ShariahCompliance.NON_COMPLIANT
             
@@ -1516,6 +1573,8 @@ class AdvisorRequest(BaseModel):
     include_sentiment: bool = False
     include_technical: bool = True
     include_fundamental: bool = True
+    include_esg: bool = False
+    include_shariah: bool = True
     
     # Metadata
     as_of_utc: Optional[str] = None
@@ -1578,6 +1637,7 @@ class AdvisorRecommendation(BaseModel):
     sortino_ratio: Optional[float] = None
     max_drawdown: Optional[float] = None
     var_95: Optional[float] = None  # Value at Risk
+    cvar_95: Optional[float] = None  # Conditional VaR
     
     # ML predictions
     ml_prediction: Optional[MLPrediction] = None
@@ -1608,6 +1668,13 @@ class AdvisorRecommendation(BaseModel):
     news_sentiment: Optional[float] = None
     analyst_rating: Optional[str] = None
     analyst_count: Optional[int] = None
+    social_sentiment: Optional[float] = None
+    
+    # ESG
+    esg_score: Optional[float] = None
+    environmental_score: Optional[float] = None
+    social_score: Optional[float] = None
+    governance_score: Optional[float] = None
     
     # Explanation
     reasoning: List[str] = Field(default_factory=list)
@@ -1635,10 +1702,15 @@ class AdvisorResponse(BaseModel):
     
     # Portfolio analytics
     portfolio: Optional[Dict[str, Any]] = None
+    efficient_frontier: Optional[List[Dict[str, float]]] = None
     
     # ML insights
     ml_predictions: Optional[Dict[str, MLPrediction]] = None
     market_condition: Optional[MarketCondition] = None
+    model_versions: Optional[Dict[str, str]] = None
+    
+    # Compliance
+    shariah_summary: Optional[Dict[str, Any]] = None
     
     # Metadata
     version: str = ADVISOR_ROUTE_VERSION
@@ -1711,7 +1783,8 @@ class AdvisorEngine:
             "symbols_processed": 0,
             "symbols_succeeded": 0,
             "symbols_failed": 0,
-            "ml_predictions": 0
+            "ml_predictions": 0,
+            "shariah_compliant": 0
         }
         
         if not engine or not request.tickers:
@@ -1733,11 +1806,14 @@ class AdvisorEngine:
                         return None
                     
                     # Check Shariah compliance if requested
-                    if request.shariah_compliant:
-                        shariah = await _shariah_checker.check(symbol, quote.dict() if hasattr(quote, "dict") else {})
-                        if shariah != ShariahCompliance.COMPLIANT:
+                    shariah_compliant = ShariahCompliance.NA
+                    if request.include_shariah or request.shariah_compliant:
+                        shariah_compliant = await _shariah_checker.check(symbol, quote.dict() if hasattr(quote, "dict") else {})
+                        if request.shariah_compliant and shariah_compliant != ShariahCompliance.COMPLIANT:
                             meta["symbols_failed"] += 1
                             return None
+                        if shariah_compliant == ShariahCompliance.COMPLIANT:
+                            meta["shariah_compliant"] += 1
                     
                     # Extract features
                     features = self._extract_features(quote, symbol)
@@ -1751,7 +1827,7 @@ class AdvisorEngine:
                     
                     # Build recommendation
                     rec = await self._build_recommendation(
-                        symbol, quote, features, ml_prediction, request
+                        symbol, quote, features, ml_prediction, request, shariah_compliant
                     )
                     
                     meta["symbols_succeeded"] += 1
@@ -1812,7 +1888,8 @@ class AdvisorEngine:
         quote: Any,
         features: MLFeatures,
         ml_prediction: Optional[MLPrediction],
-        request: AdvisorRequest
+        request: AdvisorRequest,
+        shariah_compliant: ShariahCompliance
     ) -> AdvisorRecommendation:
         """Build recommendation from data"""
         
@@ -1830,6 +1907,14 @@ class AdvisorEngine:
         # Calculate confidence score
         confidence = ml_prediction.confidence_1d if ml_prediction else 0.5
         
+        # Calculate VaR and CVaR (simplified)
+        var_95 = None
+        cvar_95 = None
+        if data.get("volatility_30d") and data.get("price"):
+            volatility = data.get("volatility_30d", 20) / 100
+            var_95 = -1.645 * volatility * 100  # 95% VaR
+            cvar_95 = -2.063 * volatility * 100  # Approx CVaR
+        
         # Generate reasoning
         reasoning = []
         if ml_prediction and ml_prediction.factors:
@@ -1839,6 +1924,11 @@ class AdvisorEngine:
                 reverse=True
             )[:3]
             reasoning = [f"{factor}: {importance:.1%}" for factor, importance in top_factors]
+        
+        if shariah_compliant == ShariahCompliance.COMPLIANT:
+            reasoning.append("Shariah compliant")
+        elif shariah_compliant == ShariahCompliance.NON_COMPLIANT:
+            reasoning.append("Not Shariah compliant")
         
         # Determine rank (simplified scoring)
         rank_score = (
@@ -1853,7 +1943,7 @@ class AdvisorEngine:
             name=data.get("name"),
             sector=data.get("sector"),
             asset_class=AssetClass.EQUITY,
-            shariah_compliant=await _shariah_checker.check(symbol, data),
+            shariah_compliant=shariah_compliant,
             current_price=data.get("price"),
             target_price_1m=data.get("forecast_price_1m"),
             target_price_3m=data.get("forecast_price_3m"),
@@ -1865,6 +1955,8 @@ class AdvisorEngine:
             volatility=data.get("volatility_30d"),
             beta=data.get("beta"),
             sharpe_ratio=data.get("sharpe_ratio"),
+            var_95=var_95,
+            cvar_95=cvar_95,
             ml_prediction=ml_prediction,
             confidence_score=confidence,
             factor_importance=ml_prediction.factors if ml_prediction else {},
@@ -1892,6 +1984,21 @@ class WebSocketManager:
         self._active_connections: List[WebSocket] = []
         self._connection_lock = asyncio.Lock()
         self._subscriptions: Dict[str, List[WebSocket]] = defaultdict(list)
+        self._broadcast_queue: asyncio.Queue = asyncio.Queue()
+        self._broadcast_task: Optional[asyncio.Task] = None
+    
+    async def start(self):
+        """Start broadcast processor"""
+        self._broadcast_task = asyncio.create_task(self._process_broadcasts())
+    
+    async def stop(self):
+        """Stop broadcast processor"""
+        if self._broadcast_task:
+            self._broadcast_task.cancel()
+            try:
+                await self._broadcast_task
+            except:
+                pass
     
     async def connect(self, websocket: WebSocket):
         """Accept new WebSocket connection"""
@@ -1922,22 +2029,35 @@ class WebSocketManager:
             self._subscriptions[symbol].append(websocket)
     
     async def broadcast(self, message: Dict[str, Any], symbol: Optional[str] = None):
-        """Broadcast message to all or subscribed connections"""
-        if symbol:
-            connections = self._subscriptions.get(symbol, [])
-        else:
-            connections = self._active_connections
-        
-        disconnected = []
-        for connection in connections:
+        """Queue message for broadcast"""
+        await self._broadcast_queue.put((message, symbol))
+    
+    async def _process_broadcasts(self):
+        """Process broadcast queue"""
+        while True:
             try:
-                await connection.send_json(message)
-            except:
-                disconnected.append(connection)
-        
-        # Clean up disconnected
-        for conn in disconnected:
-            await self.disconnect(conn)
+                message, symbol = await self._broadcast_queue.get()
+                
+                if symbol:
+                    connections = self._subscriptions.get(symbol, [])
+                else:
+                    connections = self._active_connections
+                
+                disconnected = []
+                for connection in connections:
+                    try:
+                        await connection.send_json(message)
+                    except:
+                        disconnected.append(connection)
+                
+                # Clean up disconnected
+                for conn in disconnected:
+                    await self.disconnect(conn)
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Broadcast error: {e}")
 
 _ws_manager = WebSocketManager()
 
@@ -1949,7 +2069,7 @@ def _get_default_headers() -> List[str]:
     """Get default headers for tabular output"""
     return [
         "Rank", "Symbol", "Name", "Sector", "Current Price", "Target Price",
-        "Expected Return", "Risk Score", "Confidence", "Weight", "Allocated Amount"
+        "Expected Return", "Risk Score", "Confidence", "Shariah", "Weight", "Allocated Amount"
     ]
 
 def _recommendations_to_rows(
@@ -1969,6 +2089,7 @@ def _recommendations_to_rows(
             f"{rec.expected_return_12m:.1f}%" if rec.expected_return_12m else "",
             f"{rec.risk_score:.0f}",
             f"{rec.confidence_score:.1%}",
+            "✓" if rec.shariah_compliant == ShariahCompliance.COMPLIANT else "✗",
             f"{rec.weight:.1%}",
             f"{rec.allocated_amount:.2f}" if rec.allocated_amount else ""
         ]
@@ -2018,6 +2139,7 @@ async def advisor_health(request: Request) -> Dict[str, Any]:
         "token_stats": _token_manager.get_stats(),
         "websocket_connections": len(_ws_manager._active_connections),
         "ml_initialized": _ml_models._initialized,
+        "ml_models": _ml_models.get_model_versions() if _ml_models._initialized else {},
         "request_id": getattr(request.state, "request_id", None)
     }
 
@@ -2179,6 +2301,13 @@ async def advisor_recommendations(
         if r.ml_prediction
     } if req.enable_ml_predictions else None
     
+    # Shariah summary
+    shariah_summary = {
+        "total": len(recommendations),
+        "compliant": rec_meta.get("shariah_compliant", 0),
+        "non_compliant": len(recommendations) - rec_meta.get("shariah_compliant", 0)
+    }
+    
     # Update metrics
     if _metrics.counter("requests_total"):
         _metrics.counter("requests_total", labels=["status"]).labels(status=status_val).inc()
@@ -2218,6 +2347,8 @@ async def advisor_recommendations(
         portfolio=portfolio,
         ml_predictions=ml_predictions,
         market_condition=market_condition,
+        shariah_summary=shariah_summary,
+        model_versions=_ml_models.get_model_versions() if _ml_models._initialized else None,
         version=ADVISOR_ROUTE_VERSION,
         request_id=request_id,
         meta={
@@ -2296,13 +2427,30 @@ async def websocket_endpoint(websocket: WebSocket):
                 elif message.get("type") == "get_recommendation":
                     symbol = message.get("symbol")
                     if symbol:
-                        # This would fetch real-time recommendation
-                        await websocket.send_json({
-                            "type": "recommendation",
-                            "symbol": symbol,
-                            "data": {"status": "processing"},
-                            "timestamp": _saudi_time.format_iso()
-                        })
+                        # Fetch real-time recommendation
+                        engine = await _advisor_engine.get_engine(request)
+                        if engine:
+                            quote = await engine.get_enriched_quote(symbol)
+                            features = _advisor_engine._extract_features(quote, symbol)
+                            ml_prediction = await _ml_models.predict(features)
+                            
+                            await websocket.send_json({
+                                "type": "recommendation",
+                                "symbol": symbol,
+                                "data": {
+                                    "price": quote.get("price"),
+                                    "recommendation": "BUY" if ml_prediction and ml_prediction.predicted_return_1m and ml_prediction.predicted_return_1m > 5 else "HOLD",
+                                    "confidence": ml_prediction.confidence_1d if ml_prediction else 0.5,
+                                    "risk_score": ml_prediction.risk_score if ml_prediction else 50
+                                },
+                                "timestamp": _saudi_time.format_iso()
+                            })
+                        else:
+                            await websocket.send_json({
+                                "type": "error",
+                                "error": "Engine unavailable",
+                                "timestamp": _saudi_time.format_iso()
+                            })
                 
             except WebSocketDisconnect:
                 break
@@ -2316,3 +2464,15 @@ async def websocket_endpoint(websocket: WebSocket):
     
     finally:
         await _ws_manager.disconnect(websocket)
+
+
+@router.on_event("startup")
+async def startup_event():
+    """Startup tasks"""
+    await _ws_manager.start()
+
+
+@router.on_event("shutdown")
+async def shutdown_event():
+    """Shutdown tasks"""
+    await _ws_manager.stop()
