@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
-setup_sheet_headers.py
+TADAWUL FAST BRIDGE – ENHANCED SHEET INITIALIZER (v4.0.0)
 ===========================================================
-TADAWUL FAST BRIDGE – ENHANCED SHEET INITIALIZER (v3.2.0)
-===========================================================
-PURPOSE-DRIVEN + SMART TEMPLATES + DATA-AWARE SCHEMAS
+PURPOSE-DRIVEN + SMART TEMPLATES + DATA-AWARE SCHEMAS + DYNAMIC LAYOUT
 
 Core Philosophy
 ---------------
@@ -14,6 +12,17 @@ Each tab serves a specific purpose and should be initialized with:
 - Business-logic specific columns
 - Visual hierarchy matching information priority
 - Auto-detected available data sources
+- Dynamic column ordering based on usage patterns
+- Multi-language support (English/Arabic)
+- Responsive layouts for different devices
+- Integration with data validation rules
+- Conditional formatting based on business rules
+- Protection for critical cells
+- Named ranges for formulas
+- Custom menus for user actions
+- Charts and sparklines for visualization
+- Pivot table suggestions
+- Data quality indicators
 
 Tab Types & Purposes
 --------------------
@@ -25,6 +34,16 @@ Tab Types & Purposes
 📋 MY_PORTFOLIO       - Position tracking, P&L, allocation management
 🎯 MARKET_SCAN        - AI-screened opportunities with conviction scores
 📈 INSIGHTS_ANALYSIS  - Deep research, correlations, scenario analysis
+🔍 WATCHLIST          - Custom watchlist with alerts
+📊 PERFORMANCE_DASH   - Portfolio performance dashboard
+⚡ SCREENER_RESULTS   - Custom screening results
+📝 JOURNAL            - Trading journal and notes
+📊 BACKTEST_RESULTS   - Strategy backtesting results
+🌙 RAMADAN_SCAN       - Special Ramadan market analysis
+📈 EARNINGS_TRACKER   - Earnings calendar and estimates
+💼 DIVIDEND_TRACKER   - Dividend history and projections
+📊 TECHNICAL_SCAN     - Technical pattern recognition
+🔧 ADMIN              - System configuration and logs
 
 Exit Codes
 ----------
@@ -33,22 +52,36 @@ Exit Codes
 2: Partial success (some tabs failed)
 3: API authentication failure
 4: Rate limited / quota exceeded
+5: Schema validation error
+6: Network/Connection error
+7: Permission denied
+8: Invalid spreadsheet ID
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import logging
+import logging.config
 import os
+import re
 import sys
 import time
-from collections import defaultdict
-from dataclasses import asdict, dataclass, field
+import uuid
+import warnings
+from collections import defaultdict, Counter
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
-from enum import Enum
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from enum import Enum, auto
+from functools import lru_cache, wraps
+from pathlib import Path
+from threading import Lock
+from typing import (Any, Callable, Dict, List, Optional, Set, Tuple, 
+                    Type, TypeVar, Union, cast, overload)
+from urllib.parse import urlparse
 
 # =============================================================================
 # Path & Dependency Setup
@@ -56,18 +89,75 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
 def _ensure_project_root_on_path() -> None:
     """Ensure project root is in Python path"""
     try:
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        project_root = os.path.dirname(script_dir)
+        script_dir = Path(__file__).parent.absolute()
+        project_root = script_dir.parent
         
-        for path in (script_dir, project_root):
-            if path and path not in sys.path:
-                sys.path.insert(0, path)
+        for path in [script_dir, project_root, script_dir / 'scripts']:
+            if str(path) not in sys.path:
+                sys.path.insert(0, str(path))
     except Exception:
         pass
 
 _ensure_project_root_on_path()
 
-# Import handling with graceful degradation
+# =============================================================================
+# Version & Core Configuration
+# =============================================================================
+SCRIPT_VERSION = "4.0.0"
+SCRIPT_NAME = "Enhanced Sheet Initializer"
+MIN_PYTHON = (3, 9)
+
+if sys.version_info < MIN_PYTHON:
+    sys.exit(f"❌ Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ required")
+
+# =============================================================================
+# Optional Dependencies with Graceful Degradation
+# =============================================================================
+# Google Sheets
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+    from google.auth.exceptions import GoogleAuthError, RefreshError
+    from googleapiclient.discovery import build
+    from googleapiclient.errors import HttpError
+    GSHEET_AVAILABLE = True
+except ImportError:
+    gspread = None
+    GSHEET_AVAILABLE = False
+
+# Data Processing
+try:
+    import pandas as pd
+    PANDAS_AVAILABLE = True
+except ImportError:
+    pd = None
+    PANDAS_AVAILABLE = False
+
+try:
+    import numpy as np
+    NUMPY_AVAILABLE = True
+except ImportError:
+    np = None
+    NUMPY_AVAILABLE = False
+
+# Schema validation
+try:
+    import jsonschema
+    from jsonschema import validate, ValidationError
+    JSONSCHEMA_AVAILABLE = True
+except ImportError:
+    jsonschema = None
+    JSONSCHEMA_AVAILABLE = False
+
+# YAML for configs
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    yaml = None
+    YAML_AVAILABLE = False
+
+# Core imports
 settings = None
 sheets = None
 schemas = None
@@ -88,7 +178,6 @@ except ImportError as e:
     if _strict_mode():
         print(f"❌ STRICT: Could not import google_sheets_service: {e}")
         sys.exit(1)
-    print(f"⚠️  Google Sheets service unavailable: {e}")
     sheets = None
 
 try:
@@ -98,9 +187,8 @@ except ImportError:
     schemas = None
 
 # =============================================================================
-# Version & Logging
+# Logging Configuration
 # =============================================================================
-SCRIPT_VERSION = "3.2.0"
 LOG_FORMAT = "%(asctime)s | %(levelname)8s | %(name)s | %(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -120,7 +208,50 @@ class TabType(Enum):
     PORTFOLIO = "portfolio"
     MARKET_SCAN = "market_scan"
     INSIGHTS = "insights"
+    WATCHLIST = "watchlist"
+    PERFORMANCE_DASH = "performance_dash"
+    SCREENER = "screener"
+    JOURNAL = "journal"
+    BACKTEST = "backtest"
+    RAMADAN_SCAN = "ramadan_scan"
+    EARNINGS_TRACKER = "earnings_tracker"
+    DIVIDEND_TRACKER = "dividend_tracker"
+    TECHNICAL_SCAN = "technical_scan"
+    ADMIN = "admin"
     CUSTOM = "custom"
+    
+    @classmethod
+    def from_string(cls, s: str) -> TabType:
+        """Create from string with fallback"""
+        try:
+            return cls(s.lower())
+        except ValueError:
+            return cls.CUSTOM
+    
+    @property
+    def icon(self) -> str:
+        """Get tab icon"""
+        icons = {
+            TabType.MARKET_LEADERS: "📊",
+            TabType.KSA_TADAWUL: "🇸🇦",
+            TabType.GLOBAL_MARKETS: "🌍",
+            TabType.MUTUAL_FUNDS: "💰",
+            TabType.COMMODITIES_FX: "💱",
+            TabType.PORTFOLIO: "📋",
+            TabType.MARKET_SCAN: "🎯",
+            TabType.INSIGHTS: "📈",
+            TabType.WATCHLIST: "🔍",
+            TabType.PERFORMANCE_DASH: "📊",
+            TabType.SCREENER: "⚡",
+            TabType.JOURNAL: "📝",
+            TabType.BACKTEST: "📊",
+            TabType.RAMADAN_SCAN: "🌙",
+            TabType.EARNINGS_TRACKER: "📈",
+            TabType.DIVIDEND_TRACKER: "💼",
+            TabType.TECHNICAL_SCAN: "📊",
+            TabType.ADMIN: "🔧",
+        }
+        return icons.get(self, "📄")
 
 class DataCategory(Enum):
     """Data type classification"""
@@ -134,6 +265,26 @@ class DataCategory(Enum):
     PORTFOLIO = "portfolio"        # Position data, allocation
     TIMESTAMP = "timestamp"        # Update times
     ERROR = "error"                # Error tracking
+    NOTE = "note"                  # User notes
+    ALERT = "alert"                # Alert settings
+    CONFIG = "config"              # Configuration
+    
+    @property
+    def color(self) -> str:
+        """Get category color for headers"""
+        colors = {
+            DataCategory.METADATA: "#2C3E50",
+            DataCategory.MARKET: "#27AE60",
+            DataCategory.TECHNICAL: "#3498DB",
+            DataCategory.FUNDAMENTAL: "#9B59B6",
+            DataCategory.FORECAST: "#E67E22",
+            DataCategory.PERFORMANCE: "#16A085",
+            DataCategory.RISK: "#E74C3C",
+            DataCategory.PORTFOLIO: "#F39C12",
+            DataCategory.TIMESTAMP: "#7F8C8D",
+            DataCategory.ERROR: "#C0392B",
+        }
+        return colors.get(self, "#34495E")
 
 class FieldType(Enum):
     """Field data type for formatting"""
@@ -143,258 +294,893 @@ class FieldType(Enum):
     CURRENCY = "currency"
     DATE = "date"
     DATETIME = "datetime"
+    TIME = "time"
     BOOLEAN = "boolean"
     SCORE = "score"                # 0-100 scale
     RATING = "rating"              # Text rating (Buy/Sell)
+    ENUM = "enum"                  # Predefined choices
+    FORMULA = "formula"            # Google Sheets formula
+    HYPERLINK = "hyperlink"        # Clickable link
+    IMAGE = "image"                # Image URL
+    SPARKLINE = "sparkline"        # Inline chart
+    
+    @property
+    def default_width(self) -> int:
+        """Default column width in pixels"""
+        widths = {
+            FieldType.STRING: 200,
+            FieldType.NUMBER: 120,
+            FieldType.PERCENT: 100,
+            FieldType.CURRENCY: 120,
+            FieldType.DATE: 120,
+            FieldType.DATETIME: 180,
+            FieldType.TIME: 100,
+            FieldType.BOOLEAN: 80,
+            FieldType.SCORE: 100,
+            FieldType.RATING: 100,
+            FieldType.ENUM: 150,
+            FieldType.FORMULA: 150,
+            FieldType.HYPERLINK: 200,
+            FieldType.IMAGE: 150,
+            FieldType.SPARKLINE: 120,
+        }
+        return widths.get(self, 140)
+
+class Alignment(Enum):
+    """Text alignment"""
+    LEFT = "LEFT"
+    CENTER = "CENTER"
+    RIGHT = "RIGHT"
+    
+    @classmethod
+    def for_type(cls, field_type: FieldType) -> Alignment:
+        """Get default alignment for field type"""
+        alignments = {
+            FieldType.NUMBER: Alignment.RIGHT,
+            FieldType.PERCENT: Alignment.RIGHT,
+            FieldType.CURRENCY: Alignment.RIGHT,
+            FieldType.DATE: Alignment.CENTER,
+            FieldType.DATETIME: Alignment.CENTER,
+            FieldType.TIME: Alignment.CENTER,
+            FieldType.SCORE: Alignment.CENTER,
+            FieldType.RATING: Alignment.CENTER,
+            FieldType.BOOLEAN: Alignment.CENTER,
+            FieldType.STRING: Alignment.LEFT,
+            FieldType.ENUM: Alignment.LEFT,
+            FieldType.FORMULA: Alignment.LEFT,
+            FieldType.HYPERLINK: Alignment.LEFT,
+        }
+        return alignments.get(field_type, Alignment.LEFT)
+
+class ValidationType(Enum):
+    """Data validation types"""
+    NONE = "none"
+    NUMBER = "number"
+    DATE = "date"
+    LIST = "list"
+    CHECKBOX = "checkbox"
+    CUSTOM = "custom"
+
+@dataclass
+class ValidationRule:
+    """Data validation rule"""
+    type: ValidationType
+    condition: Optional[str] = None
+    values: List[Any] = field(default_factory=list)
+    min_value: Optional[float] = None
+    max_value: Optional[float] = None
+    min_date: Optional[str] = None
+    max_date: Optional[str] = None
+    formula: Optional[str] = None
+    strict: bool = True
+    show_dropdown: bool = True
+    help_text: Optional[str] = None
+    
+    def to_api_format(self) -> Dict[str, Any]:
+        """Convert to Google Sheets API format"""
+        condition = {}
+        
+        if self.type == ValidationType.NUMBER:
+            condition = {
+                "type": "NUMBER_BETWEEN",
+                "values": [
+                    {"userEnteredValue": str(self.min_value or 0)},
+                    {"userEnteredValue": str(self.max_value or 100)}
+                ]
+            }
+        elif self.type == ValidationType.DATE:
+            condition = {
+                "type": "DATE_IS_VALID"
+            }
+        elif self.type == ValidationType.LIST and self.values:
+            condition = {
+                "type": "ONE_OF_LIST",
+                "values": [{"userEnteredValue": str(v)} for v in self.values]
+            }
+        elif self.type == ValidationType.CHECKBOX:
+            condition = {
+                "type": "BOOLEAN"
+            }
+        elif self.type == ValidationType.CUSTOM and self.formula:
+            condition = {
+                "type": "CUSTOM_FORMULA",
+                "values": [{"userEnteredValue": self.formula}]
+            }
+        
+        return {
+            "condition": condition,
+            "inputMessage": self.help_text or "",
+            "strict": self.strict,
+            "showCustomUi": self.show_dropdown
+        }
 
 @dataclass
 class FieldDefinition:
     """Definition of a sheet field"""
+    # Core
     name: str
     display_name: str
     category: DataCategory
     field_type: FieldType
+    
+    # Metadata
     description: str = ""
     required: bool = False
     example: Any = None
-    formula: Optional[str] = None
-    validation: Optional[Dict[str, Any]] = None
-    width: int = 140
-    alignment: str = "LEFT"
-    visible: bool = True
-    group: Optional[str] = None
-    priority: int = 10  # Lower = higher priority (left side)
     
-    def to_dict(self) -> Dict[str, Any]:
-        return {
+    # Formatting
+    width: int = 140
+    alignment: Alignment = Alignment.LEFT
+    number_format: Optional[str] = None
+    visible: bool = True
+    hidden_formula: bool = False
+    
+    # Positioning
+    priority: int = 10  # Lower = higher priority (left side)
+    group: Optional[str] = None
+    group_order: int = 0
+    
+    # Validation
+    validation: Optional[ValidationRule] = None
+    formula: Optional[str] = None
+    default_value: Optional[Any] = None
+    
+    # Conditional formatting
+    conditional_formats: List[Dict[str, Any]] = field(default_factory=list)
+    
+    # Dependencies
+    depends_on: List[str] = field(default_factory=list)
+    
+    # Multi-language support
+    display_name_ar: Optional[str] = None
+    description_ar: Optional[str] = None
+    
+    def __post_init__(self):
+        if self.width == 140:  # Default
+            self.width = self.field_type.default_width
+        if self.alignment == Alignment.LEFT:  # Default
+            self.alignment = Alignment.for_type(self.field_type)
+    
+    def to_dict(self, include_arabic: bool = False) -> Dict[str, Any]:
+        """Convert to dictionary"""
+        result = {
             'name': self.name,
-            'display_name': self.display_name,
+            'display_name': self.display_name_ar if include_arabic and self.display_name_ar else self.display_name,
             'category': self.category.value,
             'field_type': self.field_type.value,
             'width': self.width,
-            'alignment': self.alignment,
+            'alignment': self.alignment.value,
             'visible': self.visible,
-            'priority': self.priority
+            'priority': self.priority,
+            'group': self.group,
         }
+        
+        if include_arabic and self.description_ar:
+            result['description'] = self.description_ar
+        elif self.description:
+            result['description'] = self.description
+            
+        return result
 
 @dataclass
 class TabSchema:
     """Complete tab schema definition"""
+    # Core
     tab_type: TabType
     name: str
     description: str
     fields: List[FieldDefinition]
+    
+    # Layout
     header_row: int = 5
     frozen_rows: int = 5
     frozen_cols: int = 2
+    grid_rows: int = 1000
+    grid_cols: int = 50
+    
+    # Defaults
     default_sort: Optional[str] = None
+    default_view: str = "grid"  # grid, form, chart
+    
+    # Styling
     conditional_formats: List[Dict[str, Any]] = field(default_factory=list)
     data_validation: List[Dict[str, Any]] = field(default_factory=list)
+    protected_ranges: List[Dict[str, Any]] = field(default_factory=list)
+    named_ranges: List[Dict[str, str]] = field(default_factory=list)
+    
+    # Charts
+    charts: List[Dict[str, Any]] = field(default_factory=list)
+    
+    # Automation
+    triggers: List[Dict[str, Any]] = field(default_factory=list)
+    custom_menu: List[Dict[str, str]] = field(default_factory=list)
+    
+    # Multi-language
+    name_ar: Optional[str] = None
+    description_ar: Optional[str] = None
     
     @property
     def visible_fields(self) -> List[FieldDefinition]:
-        return [f for f in self.fields if f.visible]
+        """Get visible fields sorted by priority"""
+        return sorted(
+            [f for f in self.fields if f.visible],
+            key=lambda f: (f.group_order, f.priority)
+        )
     
     @property
     def field_names(self) -> List[str]:
+        """Get field display names"""
         return [f.display_name for f in self.visible_fields]
     
+    @property
+    def field_names_ar(self) -> List[str]:
+        """Get Arabic field names"""
+        return [f.display_name_ar or f.display_name for f in self.visible_fields]
+    
     def get_field_by_name(self, name: str) -> Optional[FieldDefinition]:
+        """Get field by name or display name"""
         for f in self.fields:
             if f.name == name or f.display_name == name:
                 return f
+        return None
+    
+    def get_field_by_path(self, path: str) -> Optional[FieldDefinition]:
+        """Get field by dot-notation path (e.g., 'metadata.symbol')"""
+        parts = path.split('.')
+        if len(parts) == 2:
+            category, name = parts
+            for f in self.fields:
+                if f.category.value == category and (f.name == name or f.display_name == name):
+                    return f
         return None
 
 # =============================================================================
 # Tab Schema Definitions (Purpose-Driven)
 # =============================================================================
 class TabSchemas:
-    """Repository of all tab schemas"""
+    """Repository of all tab schemas with comprehensive definitions"""
     
-    @staticmethod
-    def market_leaders() -> TabSchema:
+    # Common field definitions for reuse
+    _COMMON_FIELDS = {
+        # Metadata
+        "rank": FieldDefinition(
+            name="rank", display_name="#", category=DataCategory.METADATA,
+            field_type=FieldType.NUMBER, width=50, priority=1,
+            description="Rank based on primary sort criterion"
+        ),
+        "symbol": FieldDefinition(
+            name="symbol", display_name="Symbol", category=DataCategory.METADATA,
+            field_type=FieldType.STRING, width=100, priority=2, required=True,
+            description="Ticker symbol or instrument identifier",
+            validation=ValidationRule(type=ValidationType.CUSTOM, formula='=REGEXMATCH(A5, "^[A-Z0-9\\.\\-]+$")')
+        ),
+        "name": FieldDefinition(
+            name="name", display_name="Company Name", category=DataCategory.METADATA,
+            field_type=FieldType.STRING, width=250, priority=3,
+            description_ar="اسم الشركة"
+        ),
+        "isin": FieldDefinition(
+            name="isin", display_name="ISIN", category=DataCategory.METADATA,
+            field_type=FieldType.STRING, width=150, priority=5,
+            description="International Securities Identification Number",
+            validation=ValidationRule(type=ValidationType.CUSTOM, formula='=REGEXMATCH(B5, "^[A-Z]{2}[A-Z0-9]{9}[0-9]$")')
+        ),
+        "exchange": FieldDefinition(
+            name="exchange", display_name="Exchange", category=DataCategory.METADATA,
+            field_type=FieldType.STRING, width=120, priority=4,
+            description="Primary stock exchange"
+        ),
+        "sector": FieldDefinition(
+            name="sector", display_name="Sector", category=DataCategory.METADATA,
+            field_type=FieldType.ENUM, width=150, priority=6,
+            validation=ValidationRule(
+                type=ValidationType.LIST,
+                values=["Technology", "Healthcare", "Financial", "Energy", "Consumer", "Industrial", "Utilities", "Real Estate", "Materials", "Communication"]
+            )
+        ),
+        "industry": FieldDefinition(
+            name="industry", display_name="Industry", category=DataCategory.METADATA,
+            field_type=FieldType.STRING, width=180, priority=7
+        ),
+        "country": FieldDefinition(
+            name="country", display_name="Country", category=DataCategory.METADATA,
+            field_type=FieldType.ENUM, width=100, priority=8,
+            validation=ValidationRule(
+                type=ValidationType.LIST,
+                values=["USA", "Saudi Arabia", "UAE", "Kuwait", "Qatar", "Bahrain", "Oman", "Egypt", "Jordan", "UK", "Germany", "France", "Japan", "China", "India"]
+            )
+        ),
+        "currency": FieldDefinition(
+            name="currency", display_name="Currency", category=DataCategory.METADATA,
+            field_type=FieldType.ENUM, width=80, priority=9,
+            validation=ValidationRule(
+                type=ValidationType.LIST,
+                values=["SAR", "USD", "EUR", "GBP", "JPY", "CNY", "AED", "KWD", "QAR"]
+            )
+        ),
+        
+        # Market data
+        "price": FieldDefinition(
+            name="price", display_name="Price", category=DataCategory.MARKET,
+            field_type=FieldType.CURRENCY, width=100, priority=10,
+            description="Current market price"
+        ),
+        "change": FieldDefinition(
+            name="change", display_name="Change", category=DataCategory.MARKET,
+            field_type=FieldType.CURRENCY, width=90, priority=11,
+            description="Absolute price change",
+            conditional_formats=[
+                {"type": "positive", "color": "#00A86B"},
+                {"type": "negative", "color": "#D32F2F"}
+            ]
+        ),
+        "change_pct": FieldDefinition(
+            name="change_pct", display_name="Change %", category=DataCategory.PERFORMANCE,
+            field_type=FieldType.PERCENT, width=90, priority=12,
+            description="Percentage price change",
+            conditional_formats=[
+                {"type": "positive", "color": "#00A86B"},
+                {"type": "negative", "color": "#D32F2F"}
+            ]
+        ),
+        "volume": FieldDefinition(
+            name="volume", display_name="Volume", category=DataCategory.MARKET,
+            field_type=FieldType.NUMBER, width=100, priority=13,
+            number_format="#,##0"
+        ),
+        "avg_volume": FieldDefinition(
+            name="avg_volume", display_name="Avg Volume", category=DataCategory.MARKET,
+            field_type=FieldType.NUMBER, width=110, priority=14,
+            description="Average daily volume",
+            number_format="#,##0"
+        ),
+        "market_cap": FieldDefinition(
+            name="market_cap", display_name="Market Cap", category=DataCategory.FUNDAMENTAL,
+            field_type=FieldType.NUMBER, width=120, priority=15,
+            description="Market capitalization",
+            number_format="#,##0.0,,,B"
+        ),
+        
+        # Technical
+        "rsi": FieldDefinition(
+            name="rsi", display_name="RSI (14)", category=DataCategory.TECHNICAL,
+            field_type=FieldType.SCORE, width=90, priority=20,
+            description="Relative Strength Index",
+            validation=ValidationRule(type=ValidationType.NUMBER, min_value=0, max_value=100),
+            conditional_formats=[
+                {"range": ">70", "color": "#D32F2F", "message": "Overbought"},
+                {"range": "<30", "color": "#00A86B", "message": "Oversold"}
+            ]
+        ),
+        "macd": FieldDefinition(
+            name="macd", display_name="MACD", category=DataCategory.TECHNICAL,
+            field_type=FieldType.NUMBER, width=100, priority=21,
+            description="Moving Average Convergence Divergence"
+        ),
+        "macd_signal": FieldDefinition(
+            name="macd_signal", display_name="MACD Signal", category=DataCategory.TECHNICAL,
+            field_type=FieldType.NUMBER, width=110, priority=22
+        ),
+        "bb_position": FieldDefinition(
+            name="bb_position", display_name="BB %", category=DataCategory.TECHNICAL,
+            field_type=FieldType.PERCENT, width=90, priority=23,
+            description="Bollinger Band position (0-100%)"
+        ),
+        "ma_50": FieldDefinition(
+            name="ma_50", display_name="MA (50)", category=DataCategory.TECHNICAL,
+            field_type=FieldType.CURRENCY, width=100, priority=24,
+            description="50-day moving average"
+        ),
+        "ma_200": FieldDefinition(
+            name="ma_200", display_name="MA (200)", category=DataCategory.TECHNICAL,
+            field_type=FieldType.CURRENCY, width=100, priority=25,
+            description="200-day moving average"
+        ),
+        "volatility": FieldDefinition(
+            name="volatility", display_name="Volatility", category=DataCategory.RISK,
+            field_type=FieldType.PERCENT, width=100, priority=26,
+            description="30-day historical volatility"
+        ),
+        
+        # Fundamentals
+        "pe": FieldDefinition(
+            name="pe", display_name="P/E", category=DataCategory.FUNDAMENTAL,
+            field_type=FieldType.NUMBER, width=90, priority=30,
+            description="Price to Earnings ratio"
+        ),
+        "pb": FieldDefinition(
+            name="pb", display_name="P/B", category=DataCategory.FUNDAMENTAL,
+            field_type=FieldType.NUMBER, width=90, priority=31,
+            description="Price to Book ratio"
+        ),
+        "ps": FieldDefinition(
+            name="ps", display_name="P/S", category=DataCategory.FUNDAMENTAL,
+            field_type=FieldType.NUMBER, width=90, priority=32,
+            description="Price to Sales ratio"
+        ),
+        "pcf": FieldDefinition(
+            name="pcf", display_name="P/CF", category=DataCategory.FUNDAMENTAL,
+            field_type=FieldType.NUMBER, width=100, priority=33,
+            description="Price to Cash Flow ratio"
+        ),
+        "div_yield": FieldDefinition(
+            name="div_yield", display_name="Div Yield %", category=DataCategory.FUNDAMENTAL,
+            field_type=FieldType.PERCENT, width=100, priority=34,
+            description="Dividend yield"
+        ),
+        "eps": FieldDefinition(
+            name="eps", display_name="EPS", category=DataCategory.FUNDAMENTAL,
+            field_type=FieldType.CURRENCY, width=100, priority=35,
+            description="Earnings Per Share"
+        ),
+        "roe": FieldDefinition(
+            name="roe", display_name="ROE %", category=DataCategory.FUNDAMENTAL,
+            field_type=FieldType.PERCENT, width=90, priority=36,
+            description="Return on Equity"
+        ),
+        "debt_equity": FieldDefinition(
+            name="debt_equity", display_name="D/E", category=DataCategory.FUNDAMENTAL,
+            field_type=FieldType.NUMBER, width=80, priority=37,
+            description="Debt to Equity ratio"
+        ),
+        
+        # Forecast
+        "fair_value": FieldDefinition(
+            name="fair_value", display_name="Fair Value", category=DataCategory.FORECAST,
+            field_type=FieldType.CURRENCY, width=110, priority=40,
+            description="Estimated fair value"
+        ),
+        "upside": FieldDefinition(
+            name="upside", display_name="Upside %", category=DataCategory.FORECAST,
+            field_type=FieldType.PERCENT, width=90, priority=41,
+            conditional_formats=[
+                {"range": ">20", "color": "#00A86B"},
+                {"range": ">10", "color": "#8BC34A"},
+                {"range": "<-10", "color": "#D32F2F"}
+            ]
+        ),
+        "target_price": FieldDefinition(
+            name="target_price", display_name="Target Price", category=DataCategory.FORECAST,
+            field_type=FieldType.CURRENCY, width=110, priority=42,
+            description="Analyst target price"
+        ),
+        "analyst_rating": FieldDefinition(
+            name="analyst_rating", display_name="Analyst Rating", category=DataCategory.FORECAST,
+            field_type=FieldType.RATING, width=120, priority=43,
+            validation=ValidationRule(
+                type=ValidationType.LIST,
+                values=["Strong Buy", "Buy", "Hold", "Sell", "Strong Sell"]
+            )
+        ),
+        "roi_1m": FieldDefinition(
+            name="roi_1m", display_name="ROI 1M %", category=DataCategory.FORECAST,
+            field_type=FieldType.PERCENT, width=90, priority=44
+        ),
+        "roi_3m": FieldDefinition(
+            name="roi_3m", display_name="ROI 3M %", category=DataCategory.FORECAST,
+            field_type=FieldType.PERCENT, width=90, priority=45
+        ),
+        "roi_12m": FieldDefinition(
+            name="roi_12m", display_name="ROI 12M %", category=DataCategory.FORECAST,
+            field_type=FieldType.PERCENT, width=90, priority=46
+        ),
+        
+        # Risk
+        "beta": FieldDefinition(
+            name="beta", display_name="Beta", category=DataCategory.RISK,
+            field_type=FieldType.NUMBER, width=80, priority=50,
+            description="Systematic risk measure"
+        ),
+        "sharpe": FieldDefinition(
+            name="sharpe", display_name="Sharpe", category=DataCategory.RISK,
+            field_type=FieldType.NUMBER, width=90, priority=51,
+            description="Sharpe ratio"
+        ),
+        "var_95": FieldDefinition(
+            name="var_95", display_name="VaR 95%", category=DataCategory.RISK,
+            field_type=FieldType.PERCENT, width=90, priority=52,
+            description="Value at Risk (95% confidence)"
+        ),
+        "max_drawdown": FieldDefinition(
+            name="max_drawdown", display_name="Max DD", category=DataCategory.RISK,
+            field_type=FieldType.PERCENT, width=90, priority=53,
+            description="Maximum drawdown"
+        ),
+        "risk_level": FieldDefinition(
+            name="risk_level", display_name="Risk Level", category=DataCategory.RISK,
+            field_type=FieldType.RATING, width=100, priority=54,
+            validation=ValidationRule(
+                type=ValidationType.LIST,
+                values=["Very Low", "Low", "Moderate", "High", "Very High"]
+            )
+        ),
+        
+        # Portfolio
+        "quantity": FieldDefinition(
+            name="quantity", display_name="Quantity", category=DataCategory.PORTFOLIO,
+            field_type=FieldType.NUMBER, width=100, priority=60,
+            number_format="#,##0",
+            validation=ValidationRule(type=ValidationType.NUMBER, min_value=0)
+        ),
+        "avg_cost": FieldDefinition(
+            name="avg_cost", display_name="Avg Cost", category=DataCategory.PORTFOLIO,
+            field_type=FieldType.CURRENCY, width=100, priority=61,
+            validation=ValidationRule(type=ValidationType.NUMBER, min_value=0)
+        ),
+        "cost_basis": FieldDefinition(
+            name="cost_basis", display_name="Cost Basis", category=DataCategory.PORTFOLIO,
+            field_type=FieldType.CURRENCY, width=100, priority=62,
+            formula="=quantity * avg_cost"
+        ),
+        "market_value": FieldDefinition(
+            name="market_value", display_name="Market Value", category=DataCategory.PORTFOLIO,
+            field_type=FieldType.CURRENCY, width=110, priority=63,
+            formula="=quantity * price"
+        ),
+        "unrealized_pl": FieldDefinition(
+            name="unrealized_pl", display_name="Unrealized P&L", category=DataCategory.PERFORMANCE,
+            field_type=FieldType.CURRENCY, width=120, priority=64,
+            formula="=market_value - cost_basis"
+        ),
+        "weight": FieldDefinition(
+            name="weight", display_name="Weight %", category=DataCategory.PORTFOLIO,
+            field_type=FieldType.PERCENT, width=90, priority=65,
+            formula="=market_value / SUM($market_value$)"
+        ),
+        
+        # Timestamps
+        "last_updated": FieldDefinition(
+            name="last_updated", display_name="Last Updated", category=DataCategory.TIMESTAMP,
+            field_type=FieldType.DATETIME, width=180, priority=100,
+            description="Last update timestamp (Riyadh time)",
+            formula="=NOW()",
+            hidden_formula=True
+        ),
+        "last_updated_utc": FieldDefinition(
+            name="last_updated_utc", display_name="Last Updated (UTC)", category=DataCategory.TIMESTAMP,
+            field_type=FieldType.DATETIME, width=180, priority=101,
+            hidden_formula=True
+        ),
+        
+        # Error tracking
+        "error": FieldDefinition(
+            name="error", display_name="Error", category=DataCategory.ERROR,
+            field_type=FieldType.STRING, width=250, priority=1000,
+            visible=False
+        ),
+    }
+    
+    @classmethod
+    def market_leaders(cls) -> TabSchema:
         """Market Leaders tab - Top performers, momentum"""
         fields = [
-            FieldDefinition("rank", "Rank", DataCategory.METADATA, FieldType.NUMBER, 
-                          priority=1, width=60),
-            FieldDefinition("symbol", "Symbol", DataCategory.METADATA, FieldType.STRING,
-                          required=True, priority=2, width=110),
-            FieldDefinition("name", "Company Name", DataCategory.METADATA, FieldType.STRING,
-                          width=260, priority=3),
-            FieldDefinition("sector", "Sector", DataCategory.METADATA, FieldType.STRING,
-                          width=160, priority=4),
-            FieldDefinition("market", "Market", DataCategory.METADATA, FieldType.STRING,
-                          width=100, priority=5),
+            cls._COMMON_FIELDS["rank"],
+            cls._COMMON_FIELDS["symbol"],
+            cls._COMMON_FIELDS["name"],
+            cls._COMMON_FIELDS["sector"],
+            cls._COMMON_FIELDS["exchange"],
             
-            # Performance metrics
-            FieldDefinition("price", "Price", DataCategory.MARKET, FieldType.CURRENCY,
-                          width=100, priority=6),
-            FieldDefinition("change_pct", "Change %", DataCategory.PERFORMANCE, FieldType.PERCENT,
-                          width=90, priority=7, 
-                          conditional_formats={"positive": "green", "negative": "red"}),
-            FieldDefinition("volume", "Volume", DataCategory.MARKET, FieldType.NUMBER,
-                          width=100, priority=8),
-            FieldDefinition("relative_volume", "Rel Volume", DataCategory.TECHNICAL, FieldType.NUMBER,
-                          width=90, priority=9),
+            # Market data
+            cls._COMMON_FIELDS["price"],
+            FieldDefinition(
+                name="change_pct", display_name="Change %", category=DataCategory.PERFORMANCE,
+                field_type=FieldType.PERCENT, width=90, priority=11,
+                conditional_formats=[
+                    {"type": "positive", "color": "#00A86B"},
+                    {"type": "negative", "color": "#D32F2F"}
+                ]
+            ),
+            cls._COMMON_FIELDS["volume"],
+            FieldDefinition(
+                name="rel_volume", display_name="Rel Volume", category=DataCategory.TECHNICAL,
+                field_type=FieldType.NUMBER, width=90, priority=13,
+                description="Volume / Average Volume"
+            ),
             
-            # Momentum indicators
-            FieldDefinition("rsi_14", "RSI (14)", DataCategory.TECHNICAL, FieldType.NUMBER,
-                          width=90, priority=10,
-                          validation={"min": 0, "max": 100}),
-            FieldDefinition("momentum_1m", "Momentum 1M", DataCategory.PERFORMANCE, FieldType.PERCENT,
-                          width=100, priority=11),
-            FieldDefinition("momentum_3m", "Momentum 3M", DataCategory.PERFORMANCE, FieldType.PERCENT,
-                          width=100, priority=12),
-            FieldDefinition("volatility", "Volatility", DataCategory.RISK, FieldType.PERCENT,
-                          width=100, priority=13),
+            # Momentum
+            FieldDefinition(
+                name="momentum_1m", display_name="Momentum 1M", category=DataCategory.PERFORMANCE,
+                field_type=FieldType.PERCENT, width=100, priority=20
+            ),
+            FieldDefinition(
+                name="momentum_3m", display_name="Momentum 3M", category=DataCategory.PERFORMANCE,
+                field_type=FieldType.PERCENT, width=100, priority=21
+            ),
+            FieldDefinition(
+                name="momentum_12m", display_name="Momentum 12M", category=DataCategory.PERFORMANCE,
+                field_type=FieldType.PERCENT, width=100, priority=22
+            ),
             
-            # Position in range
-            FieldDefinition("week_52_high", "52W High", DataCategory.MARKET, FieldType.CURRENCY,
-                          width=100, priority=14),
-            FieldDefinition("week_52_low", "52W Low", DataCategory.MARKET, FieldType.CURRENCY,
-                          width=100, priority=15),
-            FieldDefinition("week_52_position", "52W Position %", DataCategory.TECHNICAL, FieldType.PERCENT,
-                          width=120, priority=16),
+            # Technical
+            cls._COMMON_FIELDS["rsi"],
+            FieldDefinition(
+                name="ma_50_pct", display_name="Above MA50 %", category=DataCategory.TECHNICAL,
+                field_type=FieldType.PERCENT, width=110, priority=24,
+                description="% above 50-day MA"
+            ),
+            FieldDefinition(
+                name="ma_200_pct", display_name="Above MA200 %", category=DataCategory.TECHNICAL,
+                field_type=FieldType.PERCENT, width=110, priority=25
+            ),
+            
+            # Position
+            FieldDefinition(
+                name="week_52_high", display_name="52W High", category=DataCategory.MARKET,
+                field_type=FieldType.CURRENCY, width=100, priority=30
+            ),
+            FieldDefinition(
+                name="week_52_low", display_name="52W Low", category=DataCategory.MARKET,
+                field_type=FieldType.CURRENCY, width=100, priority=31
+            ),
+            FieldDefinition(
+                name="week_52_position", display_name="52W Position %", category=DataCategory.TECHNICAL,
+                field_type=FieldType.PERCENT, width=120, priority=32,
+                description="Position in 52-week range"
+            ),
             
             # Scores
-            FieldDefinition("leadership_score", "Leadership Score", DataCategory.PERFORMANCE, FieldType.SCORE,
-                          width=130, priority=17,
-                          description="Composite score of market leadership"),
-            FieldDefinition("momentum_score", "Momentum Score", DataCategory.PERFORMANCE, FieldType.SCORE,
-                          width=130, priority=18),
+            FieldDefinition(
+                name="leadership_score", display_name="Leadership Score", category=DataCategory.PERFORMANCE,
+                field_type=FieldType.SCORE, width=130, priority=40,
+                description="Composite score of market leadership"
+            ),
+            FieldDefinition(
+                name="momentum_score", display_name="Momentum Score", category=DataCategory.PERFORMANCE,
+                field_type=FieldType.SCORE, width=130, priority=41
+            ),
             
-            # Timestamps
-            FieldDefinition("last_updated", "Last Updated (Riyadh)", DataCategory.TIMESTAMP, FieldType.DATETIME,
-                          width=180, priority=100),
+            cls._COMMON_FIELDS["last_updated"],
+            cls._COMMON_FIELDS["error"],
         ]
         
         return TabSchema(
             tab_type=TabType.MARKET_LEADERS,
             name="Market_Leaders",
+            name_ar="قادة_السوق",
             description="Top market performers and momentum leaders",
+            description_ar="أفضل أداء السوق وقادة الزخم",
             fields=fields,
             default_sort="leadership_score DESC",
             frozen_cols=2,
             conditional_formats=[
                 {
-                    "range": "G:G",  # Change % column
+                    "range": "C:C",  # Change % column
                     "type": "NUMBER",
                     "condition": "NUMBER_GREATER_THAN_EQ",
                     "value": 0,
                     "format": {"textFormat": {"foregroundColor": {"red": 0, "green": 0.6, "blue": 0}}}
                 },
                 {
-                    "range": "G:G",
+                    "range": "C:C",
                     "type": "NUMBER",
                     "condition": "NUMBER_LESS_THAN",
                     "value": 0,
                     "format": {"textFormat": {"foregroundColor": {"red": 0.8, "green": 0, "blue": 0}}}
+                },
+                {
+                    "range": "K:K",  # RSI column
+                    "type": "NUMBER",
+                    "condition": "NUMBER_GREATER_THAN",
+                    "value": 70,
+                    "format": {"backgroundColor": {"red": 1, "green": 0.8, "blue": 0.8}}
+                },
+                {
+                    "range": "K:K",
+                    "type": "NUMBER",
+                    "condition": "NUMBER_LESS_THAN",
+                    "value": 30,
+                    "format": {"backgroundColor": {"red": 0.8, "green": 1, "blue": 0.8}}
                 }
+            ],
+            protected_ranges=[
+                {
+                    "range": "1:4",  # Header area
+                    "description": "Header Protection",
+                    "warningOnly": True
+                }
+            ],
+            named_ranges=[
+                {"name": "MarketLeaders_Data", "range": "A5:Z"}
             ]
         )
     
-    @staticmethod
-    def ksa_tadawul() -> TabSchema:
+    @classmethod
+    def ksa_tadawul(cls) -> TabSchema:
         """KSA Tadawul tab - Saudi market specific"""
         fields = [
-            FieldDefinition("rank", "#", DataCategory.METADATA, FieldType.NUMBER, priority=1, width=50),
-            FieldDefinition("symbol", "Symbol", DataCategory.METADATA, FieldType.STRING, required=True, priority=2, width=100),
-            FieldDefinition("company", "Company Name", DataCategory.METADATA, FieldType.STRING, width=280, priority=3),
-            FieldDefinition("sector", "Sector", DataCategory.METADATA, FieldType.STRING, width=180, priority=4),
+            cls._COMMON_FIELDS["rank"],
+            cls._COMMON_FIELDS["symbol"],
+            FieldDefinition(
+                name="company_ar", display_name="الشركة", category=DataCategory.METADATA,
+                field_type=FieldType.STRING, width=250, priority=3,
+                display_name_ar="الشركة"
+            ),
+            cls._COMMON_FIELDS["name"],
+            cls._COMMON_FIELDS["sector"],
+            FieldDefinition(
+                name="sector_ar", display_name="القطاع", category=DataCategory.METADATA,
+                field_type=FieldType.STRING, width=150, priority=5,
+                visible=False  # Hidden but available for Arabic display
+            ),
             
             # Saudi market specific
-            FieldDefinition("isin", "ISIN", DataCategory.METADATA, FieldType.STRING, width=150, priority=5),
-            FieldDefinition("tadawul_code", "Tadawul Code", DataCategory.METADATA, FieldType.STRING, width=120, priority=6),
+            cls._COMMON_FIELDS["isin"],
+            FieldDefinition(
+                name="tadawul_code", display_name="Tadawul Code", category=DataCategory.METADATA,
+                field_type=FieldType.STRING, width=120, priority=7,
+                description="Saudi stock code"
+            ),
             
             # Market data
-            FieldDefinition("price", "Price (SAR)", DataCategory.MARKET, FieldType.CURRENCY, width=110, priority=7),
-            FieldDefinition("change", "Change", DataCategory.MARKET, FieldType.CURRENCY, width=90, priority=8),
-            FieldDefinition("change_pct", "Change %", DataCategory.PERFORMANCE, FieldType.PERCENT, width=90, priority=9),
-            FieldDefinition("volume", "Volume", DataCategory.MARKET, FieldType.NUMBER, width=100, priority=10),
-            FieldDefinition("value_traded", "Value Traded (M)", DataCategory.MARKET, FieldType.NUMBER, width=130, priority=11),
-            FieldDefinition("market_cap", "Market Cap (B)", DataCategory.FUNDAMENTAL, FieldType.NUMBER, width=130, priority=12),
+            FieldDefinition(
+                name="price_sar", display_name="Price (SAR)", category=DataCategory.MARKET,
+                field_type=FieldType.CURRENCY, width=110, priority=10
+            ),
+            cls._COMMON_FIELDS["change"],
+            cls._COMMON_FIELDS["change_pct"],
+            cls._COMMON_FIELDS["volume"],
+            FieldDefinition(
+                name="value_traded", display_name="Value Traded (M)", category=DataCategory.MARKET,
+                field_type=FieldType.NUMBER, width=130, priority=14,
+                number_format="#,##0.0,,M"
+            ),
+            FieldDefinition(
+                name="market_cap_sar", display_name="Market Cap (B)", category=DataCategory.FUNDAMENTAL,
+                field_type=FieldType.NUMBER, width=130, priority=15,
+                number_format="#,##0.0,,,B"
+            ),
             
             # Technical
-            FieldDefinition("rsi", "RSI (14)", DataCategory.TECHNICAL, FieldType.NUMBER, width=90, priority=13),
-            FieldDefinition("ma_50", "MA (50)", DataCategory.TECHNICAL, FieldType.CURRENCY, width=100, priority=14),
-            FieldDefinition("ma_200", "MA (200)", DataCategory.TECHNICAL, FieldType.CURRENCY, width=100, priority=15),
-            FieldDefinition("volume_ma", "Volume MA", DataCategory.TECHNICAL, FieldType.NUMBER, width=100, priority=16),
+            cls._COMMON_FIELDS["rsi"],
+            cls._COMMON_FIELDS["ma_50"],
+            cls._COMMON_FIELDS["ma_200"],
+            FieldDefinition(
+                name="volume_ma", display_name="Volume MA", category=DataCategory.TECHNICAL,
+                field_type=FieldType.NUMBER, width=100, priority=24
+            ),
             
-            # Fundamental ratios (local context)
-            FieldDefinition("pe", "P/E", DataCategory.FUNDAMENTAL, FieldType.NUMBER, width=90, priority=17),
-            FieldDefinition("pb", "P/B", DataCategory.FUNDAMENTAL, FieldType.NUMBER, width=90, priority=18),
-            FieldDefinition("dividend_yield", "Div Yield %", DataCategory.FUNDAMENTAL, FieldType.PERCENT, width=100, priority=19),
-            FieldDefinition("eps", "EPS", DataCategory.FUNDAMENTAL, FieldType.CURRENCY, width=100, priority=20),
+            # Fundamentals
+            cls._COMMON_FIELDS["pe"],
+            cls._COMMON_FIELDS["pb"],
+            cls._COMMON_FIELDS["div_yield"],
+            cls._COMMON_FIELDS["eps"],
             
             # Saudi-specific metrics
-            FieldDefinition("foreign_ownership", "Foreign Own %", DataCategory.FUNDAMENTAL, FieldType.PERCENT, width=120, priority=21),
-            FieldDefinition("institutional_ownership", "Inst Own %", DataCategory.FUNDAMENTAL, FieldType.PERCENT, width=120, priority=22),
-            FieldDefinition("free_float", "Free Float %", DataCategory.FUNDAMENTAL, FieldType.PERCENT, width=110, priority=23),
+            FieldDefinition(
+                name="foreign_ownership", display_name="Foreign Own %", category=DataCategory.FUNDAMENTAL,
+                field_type=FieldType.PERCENT, width=120, priority=40,
+                description="Foreign ownership percentage"
+            ),
+            FieldDefinition(
+                name="institutional_ownership", display_name="Inst Own %", category=DataCategory.FUNDAMENTAL,
+                field_type=FieldType.PERCENT, width=120, priority=41
+            ),
+            FieldDefinition(
+                name="free_float", display_name="Free Float %", category=DataCategory.FUNDAMENTAL,
+                field_type=FieldType.PERCENT, width=110, priority=42
+            ),
             
-            # Risk & quality
-            FieldDefinition("volatility", "Volatility", DataCategory.RISK, FieldType.PERCENT, width=100, priority=24),
-            FieldDefinition("quality_score", "Quality Score", DataCategory.RISK, FieldType.SCORE, width=110, priority=25),
-            FieldDefinition("liquidity_score", "Liquidity Score", DataCategory.RISK, FieldType.SCORE, width=120, priority=26),
+            # Risk
+            FieldDefinition(
+                name="saudi_risk", display_name="Saudi Risk", category=DataCategory.RISK,
+                field_type=FieldType.SCORE, width=110, priority=50,
+                description="Country-specific risk score"
+            ),
+            cls._COMMON_FIELDS["beta"],
             
             # Forecast
-            FieldDefinition("fair_value", "Fair Value", DataCategory.FORECAST, FieldType.CURRENCY, width=110, priority=27),
-            FieldDefinition("upside", "Upside %", DataCategory.FORECAST, FieldType.PERCENT, width=90, priority=28),
-            FieldDefinition("analyst_rating", "Analyst Rating", DataCategory.FORECAST, FieldType.RATING, width=120, priority=29),
-            FieldDefinition("target_price", "Target Price", DataCategory.FORECAST, FieldType.CURRENCY, width=110, priority=30),
+            cls._COMMON_FIELDS["fair_value"],
+            cls._COMMON_FIELDS["upside"],
+            cls._COMMON_FIELDS["analyst_rating"],
             
-            FieldDefinition("last_updated", "Last Updated", DataCategory.TIMESTAMP, FieldType.DATETIME, width=180, priority=100),
+            # Timestamps - bilingual
+            FieldDefinition(
+                name="last_updated_riyadh", display_name="Last Updated (Riyadh)", 
+                display_name_ar="آخر تحديث (الرياض)",
+                category=DataCategory.TIMESTAMP, field_type=FieldType.DATETIME,
+                width=180, priority=100
+            ),
         ]
         
         return TabSchema(
             tab_type=TabType.KSA_TADAWUL,
             name="KSA_Tadawul",
+            name_ar="السعودي_تداول",
             description="Saudi Stock Exchange detailed analysis",
+            description_ar="تحليل مفصل للسوق السعودي",
             fields=fields,
             frozen_cols=2,
-            default_sort="market_cap DESC",
+            default_sort="market_cap_sar DESC",
         )
     
-    @staticmethod
-    def global_markets() -> TabSchema:
+    @classmethod
+    def global_markets(cls) -> TabSchema:
         """Global Markets tab - International exposure"""
         fields = [
-            FieldDefinition("rank", "#", DataCategory.METADATA, FieldType.NUMBER, priority=1, width=50),
-            FieldDefinition("symbol", "Symbol", DataCategory.METADATA, FieldType.STRING, required=True, priority=2, width=100),
-            FieldDefinition("name", "Name", DataCategory.METADATA, FieldType.STRING, width=250, priority=3),
-            FieldDefinition("exchange", "Exchange", DataCategory.METADATA, FieldType.STRING, width=120, priority=4),
-            FieldDefinition("country", "Country", DataCategory.METADATA, FieldType.STRING, width=100, priority=5),
-            FieldDefinition("region", "Region", DataCategory.METADATA, FieldType.STRING, width=100, priority=6),
+            cls._COMMON_FIELDS["rank"],
+            cls._COMMON_FIELDS["symbol"],
+            cls._COMMON_FIELDS["name"],
+            cls._COMMON_FIELDS["exchange"],
+            cls._COMMON_FIELDS["country"],
+            cls._COMMON_FIELDS["currency"],
             
             # Market data
-            FieldDefinition("price", "Price", DataCategory.MARKET, FieldType.CURRENCY, width=100, priority=7),
-            FieldDefinition("currency", "Currency", DataCategory.MARKET, FieldType.STRING, width=80, priority=8),
-            FieldDefinition("change_pct", "Change %", DataCategory.PERFORMANCE, FieldType.PERCENT, width=90, priority=9),
-            FieldDefinition("volume", "Volume", DataCategory.MARKET, FieldType.NUMBER, width=100, priority=10),
+            cls._COMMON_FIELDS["price"],
+            cls._COMMON_FIELDS["change_pct"],
+            cls._COMMON_FIELDS["volume"],
             
             # ADR info if applicable
-            FieldDefinition("adr_ratio", "ADR Ratio", DataCategory.MARKET, FieldType.NUMBER, width=90, priority=11,
-                          description="ADR to ordinary share ratio"),
-            FieldDefinition("local_symbol", "Local Symbol", DataCategory.METADATA, FieldType.STRING, width=100, priority=12),
-            FieldDefinition("local_price", "Local Price", DataCategory.MARKET, FieldType.CURRENCY, width=100, priority=13),
+            FieldDefinition(
+                name="adr_ratio", display_name="ADR Ratio", category=DataCategory.MARKET,
+                field_type=FieldType.NUMBER, width=90, priority=20,
+                description="ADR to ordinary share ratio"
+            ),
+            FieldDefinition(
+                name="local_symbol", display_name="Local Symbol", category=DataCategory.METADATA,
+                field_type=FieldType.STRING, width=100, priority=21
+            ),
+            FieldDefinition(
+                name="local_price", display_name="Local Price", category=DataCategory.MARKET,
+                field_type=FieldType.CURRENCY, width=100, priority=22
+            ),
             
             # Performance
-            FieldDefinition("ytd_return", "YTD %", DataCategory.PERFORMANCE, FieldType.PERCENT, width=90, priority=14),
-            FieldDefinition("year_1_return", "1Y %", DataCategory.PERFORMANCE, FieldType.PERCENT, width=90, priority=15),
-            FieldDefinition("year_3_return", "3Y %", DataCategory.PERFORMANCE, FieldType.PERCENT, width=90, priority=16),
-            FieldDefinition("year_5_return", "5Y %", DataCategory.PERFORMANCE, FieldType.PERCENT, width=90, priority=17),
+            FieldDefinition(
+                name="ytd_return", display_name="YTD %", category=DataCategory.PERFORMANCE,
+                field_type=FieldType.PERCENT, width=90, priority=30
+            ),
+            FieldDefinition(
+                name="year_1_return", display_name="1Y %", category=DataCategory.PERFORMANCE,
+                field_type=FieldType.PERCENT, width=90, priority=31
+            ),
+            FieldDefinition(
+                name="year_3_return", display_name="3Y %", category=DataCategory.PERFORMANCE,
+                field_type=FieldType.PERCENT, width=90, priority=32
+            ),
+            FieldDefinition(
+                name="year_5_return", display_name="5Y %", category=DataCategory.PERFORMANCE,
+                field_type=FieldType.PERCENT, width=90, priority=33
+            ),
             
             # Fundamentals
-            FieldDefinition("pe", "P/E", DataCategory.FUNDAMENTAL, FieldType.NUMBER, width=90, priority=18),
-            FieldDefinition("pb", "P/B", DataCategory.FUNDAMENTAL, FieldType.NUMBER, width=90, priority=19),
-            FieldDefinition("div_yield", "Div Yield %", DataCategory.FUNDAMENTAL, FieldType.PERCENT, width=100, priority=20),
-            FieldDefinition("market_cap_usd", "Market Cap (USD B)", DataCategory.FUNDAMENTAL, FieldType.NUMBER, width=150, priority=21),
+            cls._COMMON_FIELDS["pe"],
+            cls._COMMON_FIELDS["pb"],
+            cls._COMMON_FIELDS["div_yield"],
+            FieldDefinition(
+                name="market_cap_usd", display_name="Market Cap (USD B)", category=DataCategory.FUNDAMENTAL,
+                field_type=FieldType.NUMBER, width=150, priority=40,
+                number_format="#,##0.0,,,B"
+            ),
             
-            # Risk metrics
-            FieldDefinition("beta", "Beta", DataCategory.RISK, FieldType.NUMBER, width=80, priority=22),
-            FieldDefinition("volatility", "Volatility", DataCategory.RISK, FieldType.PERCENT, width=100, priority=23),
-            FieldDefinition("country_risk", "Country Risk", DataCategory.RISK, FieldType.SCORE, width=100, priority=24),
+            # Risk
+            cls._COMMON_FIELDS["beta"],
+            cls._COMMON_FIELDS["volatility"],
+            FieldDefinition(
+                name="country_risk", display_name="Country Risk", category=DataCategory.RISK,
+                field_type=FieldType.SCORE, width=100, priority=53
+            ),
             
-            FieldDefinition("last_updated", "Updated", DataCategory.TIMESTAMP, FieldType.DATETIME, width=160, priority=100),
+            cls._COMMON_FIELDS["last_updated"],
         ]
         
         return TabSchema(
@@ -405,187 +1191,139 @@ class TabSchemas:
             frozen_cols=2,
         )
     
-    @staticmethod
-    def mutual_funds() -> TabSchema:
-        """Mutual Funds tab - Fund analysis"""
-        fields = [
-            FieldDefinition("rank", "#", DataCategory.METADATA, FieldType.NUMBER, width=50, priority=1),
-            FieldDefinition("fund_symbol", "Fund Symbol", DataCategory.METADATA, FieldType.STRING, required=True, width=120, priority=2),
-            FieldDefinition("fund_name", "Fund Name", DataCategory.METADATA, FieldType.STRING, width=300, priority=3),
-            FieldDefinition("fund_family", "Fund Family", DataCategory.METADATA, FieldType.STRING, width=200, priority=4),
-            FieldDefinition("category", "Category", DataCategory.METADATA, FieldType.STRING, width=150, priority=5),
-            
-            # Performance
-            FieldDefinition("nav", "NAV", DataCategory.MARKET, FieldType.CURRENCY, width=100, priority=6),
-            FieldDefinition("nav_change", "NAV Change", DataCategory.PERFORMANCE, FieldType.CURRENCY, width=100, priority=7),
-            FieldDefinition("nav_change_pct", "NAV Change %", DataCategory.PERFORMANCE, FieldType.PERCENT, width=110, priority=8),
-            
-            # Returns
-            FieldDefinition("ytd_return", "YTD Return %", DataCategory.PERFORMANCE, FieldType.PERCENT, width=120, priority=9),
-            FieldDefinition("year_1_return", "1Y Return %", DataCategory.PERFORMANCE, FieldType.PERCENT, width=120, priority=10),
-            FieldDefinition("year_3_return", "3Y Return %", DataCategory.PERFORMANCE, FieldType.PERCENT, width=120, priority=11),
-            FieldDefinition("year_5_return", "5Y Return %", DataCategory.PERFORMANCE, FieldType.PERCENT, width=120, priority=12),
-            FieldDefinition("year_10_return", "10Y Return %", DataCategory.PERFORMANCE, FieldType.PERCENT, width=120, priority=13),
-            FieldDefinition("since_inception", "Since Inception %", DataCategory.PERFORMANCE, FieldType.PERCENT, width=130, priority=14),
-            
-            # Fees
-            FieldDefinition("expense_ratio", "Expense Ratio %", DataCategory.FUNDAMENTAL, FieldType.PERCENT, width=130, priority=15),
-            FieldDefinition("front_load", "Front Load %", DataCategory.FUNDAMENTAL, FieldType.PERCENT, width=110, priority=16),
-            FieldDefinition("back_load", "Back Load %", DataCategory.FUNDAMENTAL, FieldType.PERCENT, width=110, priority=17),
-            FieldDefinition("management_fee", "Management Fee %", DataCategory.FUNDAMENTAL, FieldType.PERCENT, width=130, priority=18),
-            FieldDefinition("12b1_fee", "12b-1 Fee %", DataCategory.FUNDAMENTAL, FieldType.PERCENT, width=110, priority=19),
-            
-            # Holdings
-            FieldDefinition("aum", "AUM (M)", DataCategory.FUNDAMENTAL, FieldType.NUMBER, width=120, priority=20),
-            FieldDefinition("top_holdings", "Top Holdings", DataCategory.FUNDAMENTAL, FieldType.STRING, width=300, priority=21,
-                          visible=False),  # Hidden, for reference
-            FieldDefinition("holdings_count", "# Holdings", DataCategory.FUNDAMENTAL, FieldType.NUMBER, width=100, priority=22),
-            FieldDefinition("turnover", "Turnover %", DataCategory.FUNDAMENTAL, FieldType.PERCENT, width=110, priority=23),
-            
-            # Risk
-            FieldDefinition("risk_level", "Risk Level", DataCategory.RISK, FieldType.RATING, width=100, priority=24),
-            FieldDefinition("sharpe_3y", "Sharpe (3Y)", DataCategory.RISK, FieldType.NUMBER, width=100, priority=25),
-            FieldDefinition("alpha_3y", "Alpha (3Y)", DataCategory.PERFORMANCE, FieldType.NUMBER, width=100, priority=26),
-            FieldDefinition("beta_3y", "Beta (3Y)", DataCategory.RISK, FieldType.NUMBER, width=100, priority=27),
-            FieldDefinition("r_squared", "R²", DataCategory.RISK, FieldType.NUMBER, width=80, priority=28),
-            FieldDefinition("std_dev", "Std Dev", DataCategory.RISK, FieldType.PERCENT, width=100, priority=29),
-            
-            # Ratings
-            FieldDefinition("morningstar_rating", "Morningstar", DataCategory.RISK, FieldType.RATING, width=110, priority=30),
-            FieldDefinition("lipper_rating", "Lipper", DataCategory.RISK, FieldType.RATING, width=100, priority=31),
-            
-            FieldDefinition("last_updated", "Updated", DataCategory.TIMESTAMP, FieldType.DATETIME, width=160, priority=100),
-        ]
-        
-        return TabSchema(
-            tab_type=TabType.MUTUAL_FUNDS,
-            name="Mutual_Funds",
-            description="Mutual fund analysis and tracking",
-            fields=fields,
-            frozen_cols=2,
-        )
-    
-    @staticmethod
-    def commodities_fx() -> TabSchema:
-        """Commodities & Forex tab"""
-        fields = [
-            FieldDefinition("rank", "#", DataCategory.METADATA, FieldType.NUMBER, width=50, priority=1),
-            FieldDefinition("symbol", "Symbol", DataCategory.METADATA, FieldType.STRING, required=True, width=100, priority=2),
-            FieldDefinition("name", "Name", DataCategory.METADATA, FieldType.STRING, width=200, priority=3),
-            FieldDefinition("type", "Type", DataCategory.METADATA, FieldType.STRING, width=100, priority=4,
-                          description="Commodity, Forex, Future, Option"),
-            FieldDefinition("category", "Category", DataCategory.METADATA, FieldType.STRING, width=120, priority=5,
-                          description="Metal, Energy, Agriculture, Major, Minor, etc."),
-            
-            # Pricing
-            FieldDefinition("price", "Price", DataCategory.MARKET, FieldType.CURRENCY, width=110, priority=6),
-            FieldDefinition("bid", "Bid", DataCategory.MARKET, FieldType.CURRENCY, width=100, priority=7),
-            FieldDefinition("ask", "Ask", DataCategory.MARKET, FieldType.CURRENCY, width=100, priority=8),
-            FieldDefinition("spread", "Spread", DataCategory.MARKET, FieldType.CURRENCY, width=90, priority=9),
-            FieldDefinition("change", "Change", DataCategory.MARKET, FieldType.CURRENCY, width=90, priority=10),
-            FieldDefinition("change_pct", "Change %", DataCategory.PERFORMANCE, FieldType.PERCENT, width=90, priority=11),
-            
-            # Commodity specific
-            FieldDefinition("unit", "Unit", DataCategory.METADATA, FieldType.STRING, width=80, priority=12,
-                          description="oz, barrel, bushel, etc."),
-            FieldDefinition("contract_month", "Contract Month", DataCategory.MARKET, FieldType.STRING, width=120, priority=13,
-                          visible=False),  # Hidden unless futures
-            FieldDefinition("open_interest", "Open Interest", DataCategory.MARKET, FieldType.NUMBER, width=120, priority=14,
-                          visible=False),
-            
-            # Forex specific
-            FieldDefinition("base_currency", "Base", DataCategory.METADATA, FieldType.STRING, width=80, priority=15),
-            FieldDefinition("quote_currency", "Quote", DataCategory.METADATA, FieldType.STRING, width=80, priority=16),
-            FieldDefinition("pip_value", "Pip Value", DataCategory.MARKET, FieldType.CURRENCY, width=90, priority=17),
-            FieldDefinition("swap_long", "Swap Long", DataCategory.MARKET, FieldType.CURRENCY, width=90, priority=18),
-            FieldDefinition("swap_short", "Swap Short", DataCategory.MARKET, FieldType.CURRENCY, width=90, priority=19),
-            
-            # Technical
-            FieldDefinition("rsi", "RSI", DataCategory.TECHNICAL, FieldType.NUMBER, width=80, priority=20),
-            FieldDefinition("ma_50", "MA(50)", DataCategory.TECHNICAL, FieldType.CURRENCY, width=100, priority=21),
-            FieldDefinition("ma_200", "MA(200)", DataCategory.TECHNICAL, FieldType.CURRENCY, width=100, priority=22),
-            
-            # Seasonality
-            FieldDefinition("seasonal_trend", "Seasonal Trend", DataCategory.TECHNICAL, FieldType.RATING, width=120, priority=23),
-            FieldDefinition("monthly_avg", "Monthly Avg", DataCategory.PERFORMANCE, FieldType.CURRENCY, width=100, priority=24),
-            
-            # Economic factors
-            FieldDefinition("correlation_dxy", "Correlation DXY", DataCategory.RISK, FieldType.NUMBER, width=120, priority=25,
-                          description="Correlation with US Dollar Index"),
-            FieldDefinition("inflation_sensitivity", "Inflation Beta", DataCategory.RISK, FieldType.NUMBER, width=140, priority=26),
-            
-            FieldDefinition("last_updated", "Updated", DataCategory.TIMESTAMP, FieldType.DATETIME, width=160, priority=100),
-        ]
-        
-        return TabSchema(
-            tab_type=TabType.COMMODITIES_FX,
-            name="Commodities_FX",
-            description="Commodities and Forex markets",
-            fields=fields,
-            frozen_cols=2,
-        )
-    
-    @staticmethod
-    def portfolio() -> TabSchema:
+    @classmethod
+    def portfolio(cls) -> TabSchema:
         """My Portfolio tab - Position tracking"""
         fields = [
-            # Position info
-            FieldDefinition("rank", "#", DataCategory.METADATA, FieldType.NUMBER, width=50, priority=1),
-            FieldDefinition("symbol", "Symbol", DataCategory.METADATA, FieldType.STRING, required=True, width=100, priority=2),
-            FieldDefinition("name", "Name", DataCategory.METADATA, FieldType.STRING, width=220, priority=3),
-            FieldDefinition("asset_class", "Asset Class", DataCategory.METADATA, FieldType.STRING, width=120, priority=4,
-                          description="Stock, ETF, Fund, Commodity, Crypto"),
-            FieldDefinition("sector", "Sector", DataCategory.METADATA, FieldType.STRING, width=150, priority=5),
+            cls._COMMON_FIELDS["rank"],
+            cls._COMMON_FIELDS["symbol"],
+            cls._COMMON_FIELDS["name"],
+            FieldDefinition(
+                name="asset_class", display_name="Asset Class", category=DataCategory.PORTFOLIO,
+                field_type=FieldType.ENUM, width=120, priority=4,
+                validation=ValidationRule(
+                    type=ValidationType.LIST,
+                    values=["Stock", "ETF", "Mutual Fund", "Bond", "Commodity", "Crypto", "Forex"]
+                )
+            ),
+            cls._COMMON_FIELDS["sector"],
             
             # Account info
-            FieldDefinition("account", "Account", DataCategory.PORTFOLIO, FieldType.STRING, width=120, priority=6),
-            FieldDefinition("broker", "Broker", DataCategory.PORTFOLIO, FieldType.STRING, width=120, priority=7),
-            FieldDefinition("portfolio_group", "Portfolio Group", DataCategory.PORTFOLIO, FieldType.STRING, width=140, priority=8,
-                          description="Core, Satellite, Trading, etc."),
+            FieldDefinition(
+                name="account", display_name="Account", category=DataCategory.PORTFOLIO,
+                field_type=FieldType.STRING, width=120, priority=6
+            ),
+            FieldDefinition(
+                name="portfolio_group", display_name="Portfolio Group", category=DataCategory.PORTFOLIO,
+                field_type=FieldType.ENUM, width=140, priority=7,
+                description="Core, Satellite, Trading, etc.",
+                validation=ValidationRule(
+                    type=ValidationType.LIST,
+                    values=["Core", "Satellite", "Trading", "Cash", "Retirement", "Speculative"]
+                )
+            ),
             
             # Position details
-            FieldDefinition("quantity", "Quantity", DataCategory.PORTFOLIO, FieldType.NUMBER, width=100, priority=9),
-            FieldDefinition("avg_cost", "Avg Cost", DataCategory.PORTFOLIO, FieldType.CURRENCY, width=100, priority=10),
-            FieldDefinition("cost_basis", "Cost Basis", DataCategory.PORTFOLIO, FieldType.CURRENCY, width=100, priority=11,
-                          formula="=quantity * avg_cost"),
-            
-            # Current market
-            FieldDefinition("current_price", "Current Price", DataCategory.MARKET, FieldType.CURRENCY, width=110, priority=12),
-            FieldDefinition("market_value", "Market Value", DataCategory.PORTFOLIO, FieldType.CURRENCY, width=110, priority=13,
-                          formula="=quantity * current_price"),
-            FieldDefinition("day_change", "Day Change", DataCategory.PERFORMANCE, FieldType.CURRENCY, width=100, priority=14),
-            FieldDefinition("day_change_pct", "Day Change %", DataCategory.PERFORMANCE, FieldType.PERCENT, width=110, priority=15),
+            cls._COMMON_FIELDS["quantity"],
+            cls._COMMON_FIELDS["avg_cost"],
+            cls._COMMON_FIELDS["cost_basis"],
+            cls._COMMON_FIELDS["price"],
+            cls._COMMON_FIELDS["market_value"],
+            FieldDefinition(
+                name="day_change", display_name="Day Change", category=DataCategory.PERFORMANCE,
+                field_type=FieldType.CURRENCY, width=100, priority=14
+            ),
+            FieldDefinition(
+                name="day_change_pct", display_name="Day Change %", category=DataCategory.PERFORMANCE,
+                field_type=FieldType.PERCENT, width=110, priority=15
+            ),
             
             # P&L
-            FieldDefinition("total_pl", "Total P&L", DataCategory.PERFORMANCE, FieldType.CURRENCY, width=100, priority=16,
-                          formula="=market_value - cost_basis"),
-            FieldDefinition("total_pl_pct", "Total P&L %", DataCategory.PERFORMANCE, FieldType.PERCENT, width=110, priority=17,
-                          formula="=IF(cost_basis=0, 0, total_pl/cost_basis)"),
+            cls._COMMON_FIELDS["unrealized_pl"],
+            FieldDefinition(
+                name="unrealized_pl_pct", display_name="Unrealized P&L %", category=DataCategory.PERFORMANCE,
+                field_type=FieldType.PERCENT, width=130, priority=17,
+                formula="=IF(cost_basis=0, 0, unrealized_pl/cost_basis)"
+            ),
             
             # Allocation
-            FieldDefinition("portfolio_value", "Portfolio Value", DataCategory.PORTFOLIO, FieldType.CURRENCY, width=130, priority=18,
-                          description="Total portfolio value for percentage calc",
-                          visible=False),  # Hidden reference
-            FieldDefinition("weight", "Weight %", DataCategory.PORTFOLIO, FieldType.PERCENT, width=100, priority=19,
-                          formula="=market_value / portfolio_value"),
-            FieldDefinition("target_weight", "Target Weight %", DataCategory.PORTFOLIO, FieldType.PERCENT, width=130, priority=20),
-            FieldDefinition("rebalance_delta", "Rebalance Δ", DataCategory.PORTFOLIO, FieldType.CURRENCY, width=120, priority=21,
-                          formula="=(target_weight * portfolio_value) - market_value"),
+            FieldDefinition(
+                name="portfolio_value", display_name="Portfolio Value", category=DataCategory.PORTFOLIO,
+                field_type=FieldType.CURRENCY, width=130, priority=20,
+                formula="=SUM($market_value$)",
+                hidden_formula=True
+            ),
+            cls._COMMON_FIELDS["weight"],
+            FieldDefinition(
+                name="target_weight", display_name="Target Weight %", category=DataCategory.PORTFOLIO,
+                field_type=FieldType.PERCENT, width=130, priority=22
+            ),
+            FieldDefinition(
+                name="rebalance_needed", display_name="Rebalance Δ", category=DataCategory.PORTFOLIO,
+                field_type=FieldType.CURRENCY, width=120, priority=23,
+                formula="=(target_weight * portfolio_value) - market_value"
+            ),
+            
+            # Performance metrics
+            FieldDefinition(
+                name="return_1d", display_name="Return 1D", category=DataCategory.PERFORMANCE,
+                field_type=FieldType.PERCENT, width=90, priority=30
+            ),
+            FieldDefinition(
+                name="return_1w", display_name="Return 1W", category=DataCategory.PERFORMANCE,
+                field_type=FieldType.PERCENT, width=90, priority=31
+            ),
+            FieldDefinition(
+                name="return_1m", display_name="Return 1M", category=DataCategory.PERFORMANCE,
+                field_type=FieldType.PERCENT, width=90, priority=32
+            ),
+            FieldDefinition(
+                name="return_ytd", display_name="Return YTD", category=DataCategory.PERFORMANCE,
+                field_type=FieldType.PERCENT, width=90, priority=33
+            ),
+            FieldDefinition(
+                name="return_since_inception", display_name="Return Since Inception", category=DataCategory.PERFORMANCE,
+                field_type=FieldType.PERCENT, width=160, priority=34
+            ),
             
             # Risk metrics
-            FieldDefinition("portfolio_risk", "Portfolio Risk", DataCategory.RISK, FieldType.SCORE, width=110, priority=22),
-            FieldDefinition("var_95", "VaR (95%)", DataCategory.RISK, FieldType.CURRENCY, width=100, priority=23),
-            FieldDefinition("beta_to_portfolio", "Beta to Portfolio", DataCategory.RISK, FieldType.NUMBER, width=140, priority=24),
+            cls._COMMON_FIELDS["beta"],
+            cls._COMMON_FIELDS["sharpe"],
+            FieldDefinition(
+                name="var_95_portfolio", display_name="VaR (95%)", category=DataCategory.RISK,
+                field_type=FieldType.CURRENCY, width=100, priority=42
+            ),
             
             # Diversification
-            FieldDefinition("correlation_spy", "Correlation to SPY", DataCategory.RISK, FieldType.NUMBER, width=140, priority=25),
-            FieldDefinition("correlation_tlt", "Correlation to TLT", DataCategory.RISK, FieldType.NUMBER, width=140, priority=26),
+            FieldDefinition(
+                name="correlation_spy", display_name="Correlation to SPY", category=DataCategory.RISK,
+                field_type=FieldType.NUMBER, width=140, priority=50
+            ),
+            FieldDefinition(
+                name="correlation_tlt", display_name="Correlation to TLT", category=DataCategory.RISK,
+                field_type=FieldType.NUMBER, width=140, priority=51
+            ),
             
             # Notes
-            FieldDefinition("notes", "Notes", DataCategory.METADATA, FieldType.STRING, width=300, priority=100),
-            FieldDefinition("entry_date", "Entry Date", DataCategory.TIMESTAMP, FieldType.DATE, width=100, priority=90),
-            FieldDefinition("last_updated", "Last Updated", DataCategory.TIMESTAMP, FieldType.DATETIME, width=160, priority=101),
+            FieldDefinition(
+                name="notes", display_name="Notes", category=DataCategory.NOTE,
+                field_type=FieldType.STRING, width=300, priority=100
+            ),
+            FieldDefinition(
+                name="entry_date", display_name="Entry Date", category=DataCategory.TIMESTAMP,
+                field_type=FieldType.DATE, width=100, priority=101
+            ),
+            cls._COMMON_FIELDS["last_updated"],
         ]
+        
+        # Add sparkline for price history
+        fields.append(
+            FieldDefinition(
+                name="price_history", display_name="Price History", category=DataCategory.TECHNICAL,
+                field_type=FieldType.SPARKLINE, width=120, priority=60,
+                formula="=SPARKLINE(price_range)"
+            )
+        )
         
         return TabSchema(
             tab_type=TabType.PORTFOLIO,
@@ -595,65 +1333,137 @@ class TabSchemas:
             frozen_cols=3,
             frozen_rows=5,
             default_sort="weight DESC",
+            protected_ranges=[
+                {
+                    "range": "A:E",  # Metadata columns
+                    "description": "Portfolio metadata protection",
+                    "warningOnly": True
+                }
+            ],
+            named_ranges=[
+                {"name": "Portfolio_Data", "range": "A5:ZZ"},
+                {"name": "Portfolio_Total", "range": "G5", "description": "Total portfolio value"}
+            ]
         )
     
-    @staticmethod
-    def market_scan() -> TabSchema:
+    @classmethod
+    def market_scan(cls) -> TabSchema:
         """Market Scan tab - AI-screened opportunities"""
         fields = [
-            FieldDefinition("rank", "Rank", DataCategory.METADATA, FieldType.NUMBER, width=60, priority=1),
-            FieldDefinition("symbol", "Symbol", DataCategory.METADATA, FieldType.STRING, required=True, width=100, priority=2),
-            FieldDefinition("origin", "Origin", DataCategory.METADATA, FieldType.STRING, width=100, priority=3,
-                          description="Source screen that identified this"),
-            FieldDefinition("name", "Name", DataCategory.METADATA, FieldType.STRING, width=250, priority=4),
-            FieldDefinition("market", "Market", DataCategory.METADATA, FieldType.STRING, width=100, priority=5),
-            FieldDefinition("sector", "Sector", DataCategory.METADATA, FieldType.STRING, width=150, priority=6),
+            cls._COMMON_FIELDS["rank"],
+            cls._COMMON_FIELDS["symbol"],
+            FieldDefinition(
+                name="origin", display_name="Origin", category=DataCategory.METADATA,
+                field_type=FieldType.STRING, width=100, priority=3,
+                description="Source screen that identified this"
+            ),
+            cls._COMMON_FIELDS["name"],
+            cls._COMMON_FIELDS["sector"],
             
             # Opportunity metrics
-            FieldDefinition("opportunity_score", "Opportunity Score", DataCategory.PERFORMANCE, FieldType.SCORE, width=150, priority=7,
-                          description="0-100 score combining all factors"),
-            FieldDefinition("conviction", "Conviction", DataCategory.PERFORMANCE, FieldType.RATING, width=100, priority=8),
-            FieldDefinition("price", "Price", DataCategory.MARKET, FieldType.CURRENCY, width=100, priority=9),
-            FieldDefinition("change_pct", "Change %", DataCategory.PERFORMANCE, FieldType.PERCENT, width=90, priority=10),
+            FieldDefinition(
+                name="opportunity_score", display_name="Opportunity Score", category=DataCategory.PERFORMANCE,
+                field_type=FieldType.SCORE, width=150, priority=10,
+                description="0-100 score combining all factors",
+                conditional_formats=[
+                    {"range": ">=80", "color": "#00A86B", "message": "High Conviction"},
+                    {"range": ">=60", "color": "#8BC34A", "message": "Moderate Conviction"},
+                    {"range": "<40", "color": "#D32F2F", "message": "Low Conviction"}
+                ]
+            ),
+            FieldDefinition(
+                name="conviction", display_name="Conviction", category=DataCategory.PERFORMANCE,
+                field_type=FieldType.RATING, width=100, priority=11,
+                validation=ValidationRule(
+                    type=ValidationType.LIST,
+                    values=["Very High", "High", "Medium", "Low", "Very Low"]
+                )
+            ),
+            cls._COMMON_FIELDS["price"],
+            cls._COMMON_FIELDS["change_pct"],
             
             # Strategy scores
-            FieldDefinition("value_score", "Value Score", DataCategory.PERFORMANCE, FieldType.SCORE, width=110, priority=11),
-            FieldDefinition("momentum_score", "Momentum Score", DataCategory.PERFORMANCE, FieldType.SCORE, width=130, priority=12),
-            FieldDefinition("quality_score", "Quality Score", DataCategory.PERFORMANCE, FieldType.SCORE, width=120, priority=13),
-            FieldDefinition("growth_score", "Growth Score", DataCategory.PERFORMANCE, FieldType.SCORE, width=120, priority=14),
-            FieldDefinition("technical_score", "Technical Score", DataCategory.PERFORMANCE, FieldType.SCORE, width=130, priority=15),
+            FieldDefinition(
+                name="value_score", display_name="Value Score", category=DataCategory.PERFORMANCE,
+                field_type=FieldType.SCORE, width=110, priority=20
+            ),
+            FieldDefinition(
+                name="momentum_score", display_name="Momentum Score", category=DataCategory.PERFORMANCE,
+                field_type=FieldType.SCORE, width=130, priority=21
+            ),
+            FieldDefinition(
+                name="quality_score", display_name="Quality Score", category=DataCategory.PERFORMANCE,
+                field_type=FieldType.SCORE, width=120, priority=22
+            ),
+            FieldDefinition(
+                name="growth_score", display_name="Growth Score", category=DataCategory.PERFORMANCE,
+                field_type=FieldType.SCORE, width=120, priority=23
+            ),
+            FieldDefinition(
+                name="technical_score", display_name="Technical Score", category=DataCategory.PERFORMANCE,
+                field_type=FieldType.SCORE, width=130, priority=24
+            ),
             
             # Forecast
-            FieldDefinition("fair_value", "Fair Value", DataCategory.FORECAST, FieldType.CURRENCY, width=110, priority=16),
-            FieldDefinition("upside", "Upside %", DataCategory.FORECAST, FieldType.PERCENT, width=90, priority=17),
-            FieldDefinition("expected_roi_1m", "ROI 1M %", DataCategory.FORECAST, FieldType.PERCENT, width=100, priority=18),
-            FieldDefinition("expected_roi_3m", "ROI 3M %", DataCategory.FORECAST, FieldType.PERCENT, width=100, priority=19),
-            FieldDefinition("expected_roi_12m", "ROI 12M %", DataCategory.FORECAST, FieldType.PERCENT, width=100, priority=20),
-            FieldDefinition("confidence", "Confidence %", DataCategory.FORECAST, FieldType.PERCENT, width=110, priority=21),
+            cls._COMMON_FIELDS["fair_value"],
+            cls._COMMON_FIELDS["upside"],
+            cls._COMMON_FIELDS["roi_1m"],
+            cls._COMMON_FIELDS["roi_3m"],
+            cls._COMMON_FIELDS["roi_12m"],
+            FieldDefinition(
+                name="confidence", display_name="Confidence %", category=DataCategory.FORECAST,
+                field_type=FieldType.PERCENT, width=110, priority=35
+            ),
             
             # Risk
-            FieldDefinition("risk_level", "Risk Level", DataCategory.RISK, FieldType.RATING, width=100, priority=22),
-            FieldDefinition("risk_score", "Risk Score", DataCategory.RISK, FieldType.SCORE, width=100, priority=23),
-            FieldDefinition("volatility", "Volatility", DataCategory.RISK, FieldType.PERCENT, width=100, priority=24),
+            cls._COMMON_FIELDS["risk_level"],
+            FieldDefinition(
+                name="risk_score", display_name="Risk Score", category=DataCategory.RISK,
+                field_type=FieldType.SCORE, width=100, priority=40
+            ),
+            cls._COMMON_FIELDS["volatility"],
             
             # Technical triggers
-            FieldDefinition("signal", "Signal", DataCategory.TECHNICAL, FieldType.RATING, width=100, priority=25,
-                          description="Buy, Sell, Hold signal"),
-            FieldDefinition("rsi", "RSI", DataCategory.TECHNICAL, FieldType.NUMBER, width=80, priority=26),
-            FieldDefinition("ma_signal", "MA Signal", DataCategory.TECHNICAL, FieldType.RATING, width=100, priority=27),
+            FieldDefinition(
+                name="signal", display_name="Signal", category=DataCategory.TECHNICAL,
+                field_type=FieldType.RATING, width=100, priority=50,
+                validation=ValidationRule(
+                    type=ValidationType.LIST,
+                    values=["Strong Buy", "Buy", "Neutral", "Sell", "Strong Sell"]
+                )
+            ),
+            cls._COMMON_FIELDS["rsi"],
+            FieldDefinition(
+                name="ma_signal", display_name="MA Signal", category=DataCategory.TECHNICAL,
+                field_type=FieldType.RATING, width=100, priority=52
+            ),
             
             # Reasoning
-            FieldDefinition("primary_factor", "Primary Factor", DataCategory.METADATA, FieldType.STRING, width=200, priority=28),
-            FieldDefinition("reasoning", "Reasoning", DataCategory.METADATA, FieldType.STRING, width=350, priority=29),
-            FieldDefinition("catalysts", "Catalysts", DataCategory.METADATA, FieldType.STRING, width=300, priority=30),
+            FieldDefinition(
+                name="primary_factor", display_name="Primary Factor", category=DataCategory.METADATA,
+                field_type=FieldType.STRING, width=200, priority=60
+            ),
+            FieldDefinition(
+                name="reasoning", display_name="Reasoning", category=DataCategory.METADATA,
+                field_type=FieldType.STRING, width=350, priority=61
+            ),
+            FieldDefinition(
+                name="catalysts", display_name="Catalysts", category=DataCategory.METADATA,
+                field_type=FieldType.STRING, width=300, priority=62
+            ),
             
             # Quality checks
-            FieldDefinition("data_quality", "Data Quality", DataCategory.METADATA, FieldType.RATING, width=110, priority=31),
-            FieldDefinition("error", "Error", DataCategory.ERROR, FieldType.STRING, width=250, priority=100),
+            FieldDefinition(
+                name="data_quality", display_name="Data Quality", category=DataCategory.METADATA,
+                field_type=FieldType.RATING, width=110, priority=70
+            ),
             
-            # Timestamps
-            FieldDefinition("scan_time_utc", "Scan Time (UTC)", DataCategory.TIMESTAMP, FieldType.DATETIME, width=180, priority=32),
-            FieldDefinition("scan_time_riyadh", "Scan Time (Riyadh)", DataCategory.TIMESTAMP, FieldType.DATETIME, width=180, priority=33),
+            cls._COMMON_FIELDS["last_updated"],
+            FieldDefinition(
+                name="scan_time_riyadh", display_name="Scan Time (Riyadh)", category=DataCategory.TIMESTAMP,
+                field_type=FieldType.DATETIME, width=180, priority=101
+            ),
+            cls._COMMON_FIELDS["error"],
         ]
         
         return TabSchema(
@@ -663,726 +1473,41 @@ class TabSchemas:
             fields=fields,
             frozen_cols=2,
             default_sort="opportunity_score DESC, upside DESC",
-        )
-    
-    @staticmethod
-    def insights() -> TabSchema:
-        """Insights Analysis tab - Deep research"""
-        fields = [
-            FieldDefinition("section", "Section", DataCategory.METADATA, FieldType.STRING, width=120, priority=1,
-                          description="Macro, Sector, Thematic, Stock-Specific"),
-            FieldDefinition("rank", "#", DataCategory.METADATA, FieldType.NUMBER, width=50, priority=2),
-            FieldDefinition("symbol", "Symbol", DataCategory.METADATA, FieldType.STRING, width=100, priority=3),
-            FieldDefinition("name", "Name/Title", DataCategory.METADATA, FieldType.STRING, width=250, priority=4),
-            
-            # Insight content
-            FieldDefinition("insight_type", "Insight Type", DataCategory.METADATA, FieldType.STRING, width=130, priority=5,
-                          description="Earnings, Technical, Valuation, Macro, etc."),
-            FieldDefinition("summary", "Summary", DataCategory.METADATA, FieldType.STRING, width=400, priority=6),
-            FieldDefinition("key_points", "Key Points", DataCategory.METADATA, FieldType.STRING, width=500, priority=7),
-            
-            # Recommendation
-            FieldDefinition("recommendation", "Recommendation", DataCategory.PERFORMANCE, FieldType.RATING, width=130, priority=8),
-            FieldDefinition("conviction", "Conviction", DataCategory.PERFORMANCE, FieldType.RATING, width=100, priority=9),
-            FieldDefinition("time_horizon", "Time Horizon", DataCategory.METADATA, FieldType.STRING, width=120, priority=10),
-            
-            # Impact
-            FieldDefinition("expected_impact", "Expected Impact", DataCategory.FORECAST, FieldType.PERCENT, width=140, priority=11),
-            FieldDefinition("confidence", "Confidence", DataCategory.FORECAST, FieldType.PERCENT, width=100, priority=12),
-            
-            # Risk
-            FieldDefinition("risk_level", "Risk Level", DataCategory.RISK, FieldType.RATING, width=100, priority=13),
-            FieldDefinition("risk_factors", "Risk Factors", DataCategory.RISK, FieldType.STRING, width=350, priority=14),
-            
-            # Scenarios
-            FieldDefinition("bull_case", "Bull Case", DataCategory.FORECAST, FieldType.STRING, width=300, priority=15),
-            FieldDefinition("base_case", "Base Case", DataCategory.FORECAST, FieldType.STRING, width=300, priority=16),
-            FieldDefinition("bear_case", "Bear Case", DataCategory.FORECAST, FieldType.STRING, width=300, priority=17),
-            FieldDefinition("probability_bull", "Prob Bull %", DataCategory.FORECAST, FieldType.PERCENT, width=110, priority=18),
-            FieldDefinition("probability_base", "Prob Base %", DataCategory.FORECAST, FieldType.PERCENT, width=110, priority=19),
-            FieldDefinition("probability_bear", "Prob Bear %", DataCategory.FORECAST, FieldType.PERCENT, width=110, priority=20),
-            
-            # Expected value
-            FieldDefinition("expected_value", "Expected Value", DataCategory.FORECAST, FieldType.CURRENCY, width=130, priority=21,
-                          description="Probability-weighted expected price"),
-            FieldDefinition("current_price", "Current Price", DataCategory.MARKET, FieldType.CURRENCY, width=110, priority=22),
-            FieldDefinition("upside_to_ev", "Upside to EV %", DataCategory.FORECAST, FieldType.PERCENT, width=130, priority=23),
-            
-            # Sources
-            FieldDefinition("sources", "Sources", DataCategory.METADATA, FieldType.STRING, width=250, priority=24),
-            FieldDefinition("analyst", "Analyst", DataCategory.METADATA, FieldType.STRING, width=150, priority=25),
-            
-            # Tracking
-            FieldDefinition("status", "Status", DataCategory.METADATA, FieldType.STRING, width=100, priority=26,
-                          description="Active, Completed, Invalidated"),
-            FieldDefinition("created_date", "Created", DataCategory.TIMESTAMP, FieldType.DATETIME, width=160, priority=27),
-            FieldDefinition("last_updated", "Updated", DataCategory.TIMESTAMP, FieldType.DATETIME, width=160, priority=28),
-            
-            # For allocation tracking
-            FieldDefinition("allocated_amount", "Allocated (SAR)", DataCategory.PORTFOLIO, FieldType.CURRENCY, width=140, priority=29),
-            FieldDefinition("expected_gain_1m", "Expected Gain 1M (SAR)", DataCategory.PORTFOLIO, FieldType.CURRENCY, width=180, priority=30,
-                          formula="=allocated_amount * expected_impact_1m"),
-        ]
-        
-        return TabSchema(
-            tab_type=TabType.INSIGHTS,
-            name="Insights_Analysis",
-            description="Deep research and investment insights",
-            fields=fields,
-            frozen_cols=2,
-            default_sort="section, rank",
+            conditional_formats=[
+                {
+                    "range": "J:J",  # Opportunity Score
+                    "type": "NUMBER",
+                    "condition": "NUMBER_GREATER_THAN_EQ",
+                    "value": 80,
+                    "format": {"backgroundColor": {"red": 0.8, "green": 1, "blue": 0.8}}
+                }
+            ]
         )
     
     @classmethod
-    def get_schema(cls, tab_name: str) -> TabSchema:
-        """Get schema by tab name"""
-        name_lower = tab_name.lower().replace("_", "").replace(" ", "")
-        
-        if "marketleaders" in name_lower:
-            return cls.market_leaders()
-        elif "ksa" in name_lower or "tadawul" in name_lower:
-            return cls.ksa_tadawul()
-        elif "global" in name_lower:
-            return cls.global_markets()
-        elif "mutual" in name_lower or "fund" in name_lower:
-            return cls.mutual_funds()
-        elif "commod" in name_lower or "fx" in name_lower or "forex" in name_lower:
-            return cls.commodities_fx()
-        elif "portfolio" in name_lower:
-            return cls.portfolio()
-        elif "scan" in name_lower:
-            return cls.market_scan()
-        elif "insight" in name_lower or "analysis" in name_lower:
-            return cls.insights()
-        else:
-            # Default to market leaders as fallback
-            logger.warning(f"No specific schema for '{tab_name}', using Market Leaders template")
-            return cls.market_leaders()
-
-# =============================================================================
-# Advanced Styling Engine
-# =============================================================================
-@dataclass
-class StyleConfig:
-    """Style configuration"""
-    font_family: str = "Nunito"
-    header_font_size: int = 10
-    header_row_height: int = 32
-    data_font_size: int = 10
-    
-    # Colors (Google Sheets format)
-    header_bg: Dict[str, float] = field(default_factory=lambda: {"red": 0.17, "green": 0.24, "blue": 0.31})
-    header_text: Dict[str, float] = field(default_factory=lambda: {"red": 1.0, "green": 1.0, "blue": 1.0})
-    band_light: Dict[str, float] = field(default_factory=lambda: {"red": 1.0, "green": 1.0, "blue": 1.0})
-    band_dark: Dict[str, float] = field(default_factory=lambda: {"red": 0.96, "green": 0.96, "blue": 0.96})
-    
-    # Conditional colors
-    positive_green: Dict[str, float] = field(default_factory=lambda: {"red": 0.0, "green": 0.6, "blue": 0.0})
-    negative_red: Dict[str, float] = field(default_factory=lambda: {"red": 0.8, "green": 0.0, "blue": 0.0})
-    neutral_gray: Dict[str, float] = field(default_factory=lambda: {"red": 0.5, "green": 0.5, "blue": 0.5})
-    
-    # Alignment
-    alignments: Dict[FieldType, str] = field(default_factory=lambda: {
-        FieldType.NUMBER: "RIGHT",
-        FieldType.PERCENT: "RIGHT",
-        FieldType.CURRENCY: "RIGHT",
-        FieldType.DATE: "CENTER",
-        FieldType.DATETIME: "CENTER",
-        FieldType.SCORE: "CENTER",
-        FieldType.RATING: "CENTER",
-        FieldType.STRING: "LEFT",
-        FieldType.BOOLEAN: "CENTER",
-    })
-
-class StyleBuilder:
-    """Builds Google Sheets API requests for styling"""
-    
-    def __init__(self, spreadsheet_id: str, service: Any, config: StyleConfig = None):
-        self.spreadsheet_id = spreadsheet_id
-        self.service = service
-        self.config = config or StyleConfig()
-        self.requests = []
-    
-    def add_header_formatting(self, sheet_id: int, header_row: int, col_count: int) -> 'StyleBuilder':
-        """Format header row"""
-        self.requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": sheet_id,
-                    "startRowIndex": header_row - 1,
-                    "endRowIndex": header_row,
-                    "startColumnIndex": 0,
-                    "endColumnIndex": col_count,
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "backgroundColor": self.config.header_bg,
-                        "horizontalAlignment": "CENTER",
-                        "verticalAlignment": "MIDDLE",
-                        "wrapStrategy": "WRAP",
-                        "textFormat": {
-                            "foregroundColor": self.config.header_text,
-                            "fontFamily": self.config.font_family,
-                            "fontSize": self.config.header_font_size,
-                            "bold": True,
-                        },
-                    }
-                },
-                "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment,wrapStrategy)",
-            }
-        })
-        
-        # Header row height
-        self.requests.append({
-            "updateDimensionProperties": {
-                "range": {
-                    "sheetId": sheet_id,
-                    "dimension": "ROWS",
-                    "startIndex": header_row - 1,
-                    "endIndex": header_row,
-                },
-                "properties": {"pixelSize": self.config.header_row_height},
-                "fields": "pixelSize",
-            }
-        })
-        
-        return self
-    
-    def add_frozen_rows(self, sheet_id: int, frozen_rows: int) -> 'StyleBuilder':
-        """Freeze rows"""
-        self.requests.append({
-            "updateSheetProperties": {
-                "properties": {
-                    "sheetId": sheet_id,
-                    "gridProperties": {"frozenRowCount": frozen_rows}
-                },
-                "fields": "gridProperties.frozenRowCount",
-            }
-        })
-        return self
-    
-    def add_frozen_cols(self, sheet_id: int, frozen_cols: int) -> 'StyleBuilder':
-        """Freeze columns"""
-        self.requests.append({
-            "updateSheetProperties": {
-                "properties": {
-                    "sheetId": sheet_id,
-                    "gridProperties": {"frozenColumnCount": frozen_cols}
-                },
-                "fields": "gridProperties.frozenColumnCount",
-            }
-        })
-        return self
-    
-    def add_filter(self, sheet_id: int, header_row: int, col_count: int) -> 'StyleBuilder':
-        """Add filter to header row"""
-        self.requests.append({
-            "setBasicFilter": {
-                "filter": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "startRowIndex": header_row - 1,
-                        "endRowIndex": header_row,
-                        "startColumnIndex": 0,
-                        "endColumnIndex": col_count,
-                    }
-                }
-            }
-        })
-        return self
-    
-    def add_banding(self, sheet_id: int, start_row: int, col_count: int) -> 'StyleBuilder':
-        """Add alternating row colors"""
-        self.requests.append({
-            "addBanding": {
-                "bandedRange": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "startRowIndex": start_row,
-                        "startColumnIndex": 0,
-                        "endColumnIndex": col_count,
-                    },
-                    "rowProperties": {
-                        "firstBandColor": self.config.band_light,
-                        "secondBandColor": self.config.band_dark,
-                    },
-                }
-            }
-        })
-        return self
-    
-    def add_column_widths(self, sheet_id: int, fields: List[FieldDefinition]) -> 'StyleBuilder':
-        """Set column widths based on field definitions"""
-        for idx, field in enumerate(fields):
-            if not field.visible:
-                continue
-                
-            self.requests.append({
-                "updateDimensionProperties": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "dimension": "COLUMNS",
-                        "startIndex": idx,
-                        "endIndex": idx + 1,
-                    },
-                    "properties": {"pixelSize": field.width},
-                    "fields": "pixelSize",
-                }
-            })
-        return self
-    
-    def add_column_formats(self, sheet_id: int, fields: List[FieldDefinition], 
-                          start_row: int) -> 'StyleBuilder':
-        """Apply number formats to columns"""
-        for idx, field in enumerate(fields):
-            if not field.visible:
-                continue
-                
-            format_spec = self._get_number_format(field.field_type)
-            alignment = self.config.alignments.get(field.field_type, "LEFT")
+    def insights(cls) -> TabSchema:
+        """Insights Analysis tab - Deep research"""
+        fields = [
+            FieldDefinition(
+                name="section", display_name="Section", category=DataCategory.METADATA,
+                field_type=FieldType.ENUM, width=120, priority=1,
+                validation=ValidationRule(
+                    type=ValidationType.LIST,
+                    values=["Macro", "Sector", "Thematic", "Stock-Specific", "Technical", "Quant"]
+                )
+            ),
+            cls._COMMON_FIELDS["rank"],
+            cls._COMMON_FIELDS["symbol"],
+            FieldDefinition(
+                name="title", display_name="Title", category=DataCategory.METADATA,
+                field_type=FieldType.STRING, width=250, priority=4
+            ),
             
-            self.requests.append({
-                "repeatCell": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "startRowIndex": start_row,
-                        "startColumnIndex": idx,
-                        "endColumnIndex": idx + 1,
-                    },
-                    "cell": {
-                        "userEnteredFormat": {
-                            "numberFormat": format_spec,
-                            "horizontalAlignment": alignment,
-                            "textFormat": {
-                                "fontFamily": self.config.font_family,
-                                "fontSize": self.config.data_font_size,
-                            }
-                        }
-                    },
-                    "fields": "userEnteredFormat(numberFormat,horizontalAlignment,textFormat)",
-                }
-            })
-        return self
-    
-    def add_conditional_formats(self, sheet_id: int, schema: TabSchema) -> 'StyleBuilder':
-        """Add conditional formatting rules"""
-        for rule in schema.conditional_formats:
-            self.requests.append({
-                "addConditionalFormatRule": {
-                    "rule": {
-                        "ranges": [{
-                            "sheetId": sheet_id,
-                            **self._parse_range(rule.get("range", ""))
-                        }],
-                        "booleanRule": {
-                            "condition": {
-                                "type": rule["condition"],
-                                "values": [{"userEnteredValue": str(rule.get("value", 0))}]
-                            },
-                            "format": rule["format"]
-                        }
-                    },
-                    "index": 0
-                }
-            })
-        return self
-    
-    def add_protected_range(self, sheet_id: int, header_row: int, 
-                           col_count: int, warning_only: bool = True) -> 'StyleBuilder':
-        """Protect header row"""
-        self.requests.append({
-            "addProtectedRange": {
-                "protectedRange": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "startRowIndex": header_row - 1,
-                        "endRowIndex": header_row,
-                        "startColumnIndex": 0,
-                        "endColumnIndex": col_count,
-                    },
-                    "description": "TFB Header Protection",
-                    "warningOnly": warning_only,
-                }
-            }
-        })
-        return self
-    
-    def _get_number_format(self, field_type: FieldType) -> Dict[str, str]:
-        """Get Google Sheets number format for field type"""
-        formats = {
-            FieldType.NUMBER: {"type": "NUMBER", "pattern": "#,##0.00"},
-            FieldType.PERCENT: {"type": "NUMBER", "pattern": "0.00"},  # Display as number, format as % in sheet
-            FieldType.CURRENCY: {"type": "CURRENCY", "pattern": "#,##0.00"},
-            FieldType.DATE: {"type": "DATE", "pattern": "yyyy-mm-dd"},
-            FieldType.DATETIME: {"type": "DATE_TIME", "pattern": "yyyy-mm-dd hh:mm:ss"},
-            FieldType.SCORE: {"type": "NUMBER", "pattern": "0.0"},
-            FieldType.BOOLEAN: {"type": "BOOLEAN", "pattern": ""},
-        }
-        return formats.get(field_type, {"type": "NUMBER", "pattern": "0"})
-    
-    def _parse_range(self, range_str: str) -> Dict[str, int]:
-        """Parse A1 range to zero-based indices"""
-        # Simplified - in production would parse properly
-        return {"startColumnIndex": 0, "endColumnIndex": 1}
-    
-    def execute(self) -> None:
-        """Execute all requests"""
-        if self.requests:
-            self.service.spreadsheets().batchUpdate(
-                spreadsheetId=self.spreadsheet_id,
-                body={"requests": self.requests}
-            ).execute()
-            logger.debug(f"Executed {len(self.requests)} style requests")
-
-# =============================================================================
-# Sheet Manager
-# =============================================================================
-class SheetManager:
-    """Manages sheet operations"""
-    
-    def __init__(self, spreadsheet_id: str):
-        self.spreadsheet_id = spreadsheet_id
-        self.service = None
-        self.sheets_meta: Dict[str, int] = {}
-        
-    def initialize(self) -> bool:
-        """Initialize Sheets API connection"""
-        if not sheets:
-            logger.error("Google Sheets service not available")
-            return False
-            
-        try:
-            self.service = sheets.get_sheets_service()
-            spreadsheet = self.service.spreadsheets().get(spreadsheetId=self.spreadsheet_id).execute()
-            
-            for sh in spreadsheet.get("sheets", []):
-                props = sh.get("properties", {})
-                title = props.get("title")
-                sheet_id = props.get("sheetId")
-                if title and sheet_id is not None:
-                    self.sheets_meta[title] = sheet_id
-                    
-            logger.info(f"Connected to spreadsheet with {len(self.sheets_meta)} sheets")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to initialize Sheets API: {e}")
-            return False
-    
-    def tab_exists(self, tab_name: str) -> bool:
-        """Check if tab exists"""
-        return tab_name in self.sheets_meta
-    
-    def get_sheet_id(self, tab_name: str) -> Optional[int]:
-        """Get sheet ID for tab"""
-        return self.sheets_meta.get(tab_name)
-    
-    def create_tab(self, tab_name: str) -> Optional[int]:
-        """Create new tab"""
-        try:
-            request = {
-                "requests": [{
-                    "addSheet": {
-                        "properties": {
-                            "title": tab_name,
-                            "gridProperties": {
-                                "rowCount": 1000,
-                                "columnCount": 50
-                            }
-                        }
-                    }
-                }]
-            }
-            
-            response = self.service.spreadsheets().batchUpdate(
-                spreadsheetId=self.spreadsheet_id,
-                body=request
-            ).execute()
-            
-            sheet_id = response["replies"][0]["addSheet"]["properties"]["sheetId"]
-            self.sheets_meta[tab_name] = sheet_id
-            
-            logger.info(f"✅ Created tab: {tab_name}")
-            return sheet_id
-            
-        except Exception as e:
-            logger.error(f"Failed to create tab {tab_name}: {e}")
-            return None
-    
-    def read_headers(self, tab_name: str, header_row: int) -> List[str]:
-        """Read existing headers"""
-        if not self.tab_exists(tab_name):
-            return []
-            
-        try:
-            a1_range = f"'{tab_name}'!{header_row}:{header_row}"
-            result = self.service.spreadsheets().values().get(
-                spreadsheetId=self.spreadsheet_id,
-                range=a1_range
-            ).execute()
-            
-            values = result.get("values", [])
-            if values:
-                return values[0]
-            return []
-            
-        except Exception as e:
-            logger.warning(f"Failed to read headers from {tab_name}: {e}")
-            return []
-    
-    def write_headers(self, tab_name: str, headers: List[str], 
-                     header_row: int, clear_first: bool = False) -> bool:
-        """Write headers to sheet"""
-        try:
-            # Clear existing if requested
-            if clear_first:
-                end_col = self._col_num_to_letter(len(headers))
-                clear_range = f"'{tab_name}'!A{header_row}:{end_col}{header_row}"
-                self.service.spreadsheets().values().clear(
-                    spreadsheetId=self.spreadsheet_id,
-                    range=clear_range,
-                    body={}
-                ).execute()
-            
-            # Write headers
-            a1_range = f"'{tab_name}'!A{header_row}"
-            body = {"values": [headers]}
-            
-            self.service.spreadsheets().values().update(
-                spreadsheetId=self.spreadsheet_id,
-                range=a1_range,
-                valueInputOption="RAW",
-                body=body
-            ).execute()
-            
-            logger.info(f"✅ Wrote {len(headers)} headers to {tab_name}")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to write headers to {tab_name}: {e}")
-            return False
-    
-    def apply_styling(self, tab_name: str, schema: TabSchema, 
-                     header_row: int, no_style: bool = False) -> bool:
-        """Apply styling to tab"""
-        if no_style:
-            return True
-            
-        sheet_id = self.get_sheet_id(tab_name)
-        if sheet_id is None:
-            logger.warning(f"Cannot style {tab_name}: sheet ID not found")
-            return False
-        
-        try:
-            builder = StyleBuilder(self.spreadsheet_id, self.service)
-            visible_fields = schema.visible_fields
-            col_count = len(visible_fields)
-            
-            # Apply styling in sequence
-            (builder
-             .add_header_formatting(sheet_id, header_row, col_count)
-             .add_frozen_rows(sheet_id, schema.frozen_rows)
-             .add_frozen_cols(sheet_id, schema.frozen_cols)
-             .add_filter(sheet_id, header_row, col_count)
-             .add_banding(sheet_id, header_row, col_count)
-             .add_column_widths(sheet_id, visible_fields)
-             .add_column_formats(sheet_id, visible_fields, header_row)
-             .add_conditional_formats(sheet_id, schema)
-             .add_protected_range(sheet_id, header_row, col_count, warning_only=True)
-             .execute())
-            
-            logger.info(f"✨ Styled {tab_name} with {col_count} columns")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to style {tab_name}: {e}")
-            return False
-    
-    def _col_num_to_letter(self, n: int) -> str:
-        """Convert column number to letter (1-indexed)"""
-        if n <= 0:
-            return "A"
-        
-        result = ""
-        while n > 0:
-            n -= 1
-            result = chr(65 + (n % 26)) + result
-            n //= 26
-        return result
-
-# =============================================================================
-# Main Application
-# =============================================================================
-def main(argv: Optional[List[str]] = None) -> int:
-    parser = argparse.ArgumentParser(
-        description="TFB Enhanced Sheet Initializer - Purpose-Driven Templates",
-        formatter_class=argparse.RawDescriptionHelpFormatter
-    )
-    
-    # Basic options
-    parser.add_argument("--sheet-id", help="Target Spreadsheet ID")
-    parser.add_argument("--tabs", nargs="*", help="Specific tabs to setup")
-    parser.add_argument("--all-existing", action="store_true", 
-                       help="Initialize ALL existing tabs")
-    parser.add_argument("--create-missing", action="store_true",
-                       help="Create tabs that don't exist")
-    
-    # Header configuration
-    parser.add_argument("--row", type=int, default=5,
-                       help="Header row (1-based, default: 5)")
-    parser.add_argument("--force", action="store_true",
-                       help="Overwrite non-empty headers")
-    parser.add_argument("--clear", action="store_true",
-                       help="Clear header range before writing")
-    
-    # Style control
-    parser.add_argument("--no-style", action="store_true",
-                       help="Skip styling (headers only)")
-    parser.add_argument("--no-banding", action="store_true",
-                       help="Disable row banding")
-    parser.add_argument("--no-filter", action="store_true",
-                       help="Disable filters")
-    parser.add_argument("--no-formatting", action="store_true",
-                       help="Disable number formatting")
-    parser.add_argument("--font", default="Nunito",
-                       help="Font family (default: Nunito)")
-    
-    # Execution mode
-    parser.add_argument("--dry-run", action="store_true",
-                       help="Preview changes without writing")
-    parser.add_argument("--verbose", "-v", action="store_true",
-                       help="Verbose logging")
-    parser.add_argument("--export-schema", 
-                       help="Export schema to JSON file")
-    
-    args = parser.parse_args(argv)
-    
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-    
-    # Get spreadsheet ID
-    spreadsheet_id = args.sheet_id
-    if not spreadsheet_id:
-        spreadsheet_id = os.getenv("DEFAULT_SPREADSHEET_ID", "")
-    
-    if not spreadsheet_id:
-        logger.error("❌ No spreadsheet ID provided. Set --sheet-id or DEFAULT_SPREADSHEET_ID env var")
-        return 1
-    
-    # Initialize sheet manager
-    manager = SheetManager(spreadsheet_id)
-    if not manager.initialize():
-        return 1
-    
-    # Determine target tabs
-    if args.all_existing:
-        target_tabs = list(manager.sheets_meta.keys())
-    else:
-        target_tabs = args.tabs or [
-            "Market_Leaders",
-            "KSA_Tadawul",
-            "Global_Markets",
-            "Mutual_Funds",
-            "Commodities_FX",
-            "My_Portfolio",
-            "Market_Scan",
-            "Insights_Analysis",
-        ]
-    
-    logger.info("=" * 60)
-    logger.info(f"Enhanced Sheet Initializer v{SCRIPT_VERSION}")
-    logger.info(f"Spreadsheet: {spreadsheet_id}")
-    logger.info(f"Target tabs: {len(target_tabs)}")
-    logger.info("=" * 60)
-    
-    stats = {
-        "success": 0,
-        "skipped": 0,
-        "failed": 0,
-        "created": 0
-    }
-    
-    # Process each tab
-    for tab_name in target_tabs:
-        tab_name = str(tab_name).strip()
-        if not tab_name:
-            continue
-            
-        logger.info(f"\n--- Processing: {tab_name} ---")
-        
-        # Check if tab exists
-        if not manager.tab_exists(tab_name):
-            if args.create_missing and not args.dry_run:
-                sheet_id = manager.create_tab(tab_name)
-                if sheet_id:
-                    stats["created"] += 1
-                else:
-                    stats["failed"] += 1
-                    continue
-            else:
-                logger.warning(f"⚠️  Tab '{tab_name}' does not exist (use --create-missing to create)")
-                stats["skipped"] += 1
-                continue
-        
-        # Get schema
-        schema = TabSchemas.get_schema(tab_name)
-        
-        if args.export_schema:
-            # Export schema to JSON
-            schema_path = Path(args.export_schema) / f"{tab_name}_schema.json"
-            schema_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(schema_path, 'w') as f:
-                json.dump({
-                    'tab_type': schema.tab_type.value,
-                    'name': schema.name,
-                    'fields': [f.to_dict() for f in schema.fields]
-                }, f, indent=2)
-            logger.info(f"📄 Exported schema to {schema_path}")
-        
-        if args.dry_run:
-            logger.info(f"[DRY RUN] Would initialize {tab_name} with {len(schema.visible_fields)} headers")
-            stats["success"] += 1
-            continue
-        
-        # Check existing headers
-        existing = manager.read_headers(tab_name, args.row)
-        if existing and not args.force:
-            logger.info(f"ℹ️  Tab '{tab_name}' already has headers (use --force to overwrite)")
-            stats["skipped"] += 1
-            continue
-        
-        # Write headers
-        if not manager.write_headers(tab_name, schema.field_names, args.row, args.clear):
-            stats["failed"] += 1
-            continue
-        
-        # Apply styling
-        style_success = manager.apply_styling(
-            tab_name, 
-            schema, 
-            args.row,
-            no_style=args.no_style
-        )
-        
-        if style_success:
-            stats["success"] += 1
-        else:
-            stats["failed"] += 1
-    
-    # Summary
-    logger.info("\n" + "=" * 60)
-    logger.info("SUMMARY")
-    logger.info("=" * 60)
-    logger.info(f"✅ Successful: {stats['success']}")
-    logger.info(f"⏭️  Skipped: {stats['skipped']}")
-    logger.info(f"❌ Failed: {stats['failed']}")
-    logger.info(f"🆕 Created: {stats['created']}")
-    logger.info("=" * 60)
-    
-    if args.export_schema:
-        logger.info(f"📄 Schemas exported to {args.export_schema}")
-    
-    return 0 if stats["failed"] == 0 else 2
-
-if __name__ == "__main__":
-    sys.exit(main())
+            # Insight content
+            FieldDefinition(
+                name="insight_type", display_name="Insight Type", category=DataCategory.METADATA,
+                field_type=FieldType.ENUM, width=130, priority=5,
+                validation=ValidationRule(
+                    type=ValidationType.LIST,
+                    values=["Earnings", "Technical", "Valuation", "Macro", "Sector Rotation", 
+                           "Merger/
