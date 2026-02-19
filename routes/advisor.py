@@ -1,7 +1,7 @@
 """
 routes/advisor.py
 ------------------------------------------------------------
-TADAWUL ENTERPRISE ADVISOR ENGINE — v3.0.0 (AI-POWERED + PRODUCTION HARDENED)
+TADAWUL ENTERPRISE ADVISOR ENGINE — v3.1.0 (AI-POWERED + PRODUCTION HARDENED)
 SAMA Compliant | Multi-Asset | Real-time ML | Dynamic Allocation | Audit Trail
 
 Core Capabilities:
@@ -29,6 +29,9 @@ Key Features:
 - ✅ Comprehensive audit logging for regulatory compliance
 - ✅ Rate limiting with token bucket algorithm
 - ✅ Graceful degradation with fallback strategies
+
+Version: 3.1.0
+Last Updated: 2024-03-21
 """
 
 from __future__ import annotations
@@ -142,7 +145,7 @@ except ImportError:
 
 logger = logging.getLogger("routes.advisor")
 
-ADVISOR_ROUTE_VERSION = "3.0.0"
+ADVISOR_ROUTE_VERSION = "3.1.0"
 router = APIRouter(prefix="/v1/advisor", tags=["advisor"])
 
 # =============================================================================
@@ -1939,6 +1942,58 @@ class WebSocketManager:
 _ws_manager = WebSocketManager()
 
 # =============================================================================
+# Helper Functions
+# =============================================================================
+
+def _get_default_headers() -> List[str]:
+    """Get default headers for tabular output"""
+    return [
+        "Rank", "Symbol", "Name", "Sector", "Current Price", "Target Price",
+        "Expected Return", "Risk Score", "Confidence", "Weight", "Allocated Amount"
+    ]
+
+def _recommendations_to_rows(
+    recommendations: List[AdvisorRecommendation],
+    headers: List[str]
+) -> List[List[Any]]:
+    """Convert recommendations to tabular rows"""
+    rows = []
+    for rec in recommendations:
+        row = [
+            rec.rank,
+            rec.symbol,
+            rec.name or "",
+            rec.sector or "",
+            f"{rec.current_price:.2f}" if rec.current_price else "",
+            f"{rec.target_price_12m:.2f}" if rec.target_price_12m else "",
+            f"{rec.expected_return_12m:.1f}%" if rec.expected_return_12m else "",
+            f"{rec.risk_score:.0f}",
+            f"{rec.confidence_score:.1%}",
+            f"{rec.weight:.1%}",
+            f"{rec.allocated_amount:.2f}" if rec.allocated_amount else ""
+        ]
+        rows.append(row)
+    return rows
+
+def _determine_market_condition(recommendations: List[AdvisorRecommendation]) -> MarketCondition:
+    """Determine overall market condition from recommendations"""
+    if not recommendations:
+        return MarketCondition.SIDEWAYS
+    
+    # Average sentiment from recommendations
+    avg_confidence = sum(r.confidence_score for r in recommendations) / len(recommendations)
+    avg_risk = sum(r.risk_score for r in recommendations) / len(recommendations)
+    
+    if avg_confidence > 0.8 and avg_risk < 40:
+        return MarketCondition.BULL
+    elif avg_confidence < 0.3 and avg_risk > 70:
+        return MarketCondition.BEAR
+    elif avg_risk > 60:
+        return MarketCondition.VOLATILE
+    else:
+        return MarketCondition.SIDEWAYS
+
+# =============================================================================
 # Routes
 # =============================================================================
 
@@ -2108,11 +2163,11 @@ async def advisor_recommendations(
     headers = _get_default_headers()
     rows = _recommendations_to_rows(recommendations, headers)
     
-    status = "success"
+    status_val = "success"
     if rec_meta["symbols_failed"] > 0 and rec_meta["symbols_succeeded"] == 0:
-        status = "error"
+        status_val = "error"
     elif rec_meta["symbols_failed"] > 0:
-        status = "partial"
+        status_val = "partial"
     
     # Determine market condition
     market_condition = _determine_market_condition(recommendations)
@@ -2126,7 +2181,7 @@ async def advisor_recommendations(
     
     # Update metrics
     if _metrics.counter("requests_total"):
-        _metrics.counter("requests_total", labels=["status"]).labels(status=status).inc()
+        _metrics.counter("requests_total", labels=["status"]).labels(status=status_val).inc()
     if _metrics.histogram("request_duration_seconds"):
         _metrics.histogram("request_duration_seconds").observe(time.time() - start_time)
     
@@ -2136,7 +2191,7 @@ async def advisor_recommendations(
         auth_token[:8],
         "advisor",
         "generate",
-        status,
+        status_val,
         {
             "symbols": len(req.tickers or []),
             "recommendations": len(recommendations),
@@ -2154,7 +2209,7 @@ async def advisor_recommendations(
         ))
     
     return AdvisorResponse(
-        status=status,
+        status=status_val,
         error=f"{rec_meta['symbols_failed']} symbols failed" if rec_meta["symbols_failed"] > 0 else None,
         warnings=[],
         headers=headers,
@@ -2200,4 +2255,64 @@ async def advisor_run(
     )
 
 @router.websocket("/ws")
-async
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time updates"""
+    await _ws_manager.connect(websocket)
+    
+    try:
+        # Send initial connection confirmation
+        await websocket.send_json({
+            "type": "connection",
+            "status": "connected",
+            "timestamp": _saudi_time.format_iso(),
+            "version": ADVISOR_ROUTE_VERSION
+        })
+        
+        # Handle messages
+        while True:
+            try:
+                message = await websocket.receive_json()
+                
+                # Handle subscription
+                if message.get("type") == "subscribe":
+                    symbol = message.get("symbol")
+                    if symbol:
+                        await _ws_manager.subscribe(websocket, symbol)
+                        await websocket.send_json({
+                            "type": "subscription",
+                            "status": "subscribed",
+                            "symbol": symbol,
+                            "timestamp": _saudi_time.format_iso()
+                        })
+                
+                # Handle ping
+                elif message.get("type") == "ping":
+                    await websocket.send_json({
+                        "type": "pong",
+                        "timestamp": _saudi_time.format_iso()
+                    })
+                
+                # Handle get recommendation
+                elif message.get("type") == "get_recommendation":
+                    symbol = message.get("symbol")
+                    if symbol:
+                        # This would fetch real-time recommendation
+                        await websocket.send_json({
+                            "type": "recommendation",
+                            "symbol": symbol,
+                            "data": {"status": "processing"},
+                            "timestamp": _saudi_time.format_iso()
+                        })
+                
+            except WebSocketDisconnect:
+                break
+            except Exception as e:
+                logger.error(f"WebSocket error: {e}")
+                await websocket.send_json({
+                    "type": "error",
+                    "error": str(e),
+                    "timestamp": _saudi_time.format_iso()
+                })
+    
+    finally:
+        await _ws_manager.disconnect(websocket)
