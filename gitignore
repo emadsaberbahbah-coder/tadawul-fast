@@ -1,81 +1,110 @@
-Tadawul Fast Bridge — Git Ignore Rules (v2.1.0)
+# =============================================================================
+# TADAWUL FAST BRIDGE – ENTERPRISE GITIGNORE (v3.2.0)
+# =============================================================================
+# Production-Grade Exclusion Rules for Financial Applications
+#
+# Core Principles
+# • Track templates, never secrets
+# • Narrow ignores over broad ignores
+# • Keep core source tracked (core/, routes/, schemas/, scripts/, tests/, integrations/)
+# • Preserve documentation and examples
+#
+# Security Features
+# • Comprehensive secret patterns (Google SA, OAuth, tokens, PEM/PFX, SSH keys)
+# • Environment file protection (.env, .env.*)
+# • Credential directory blocking
+# • Cryptographic material exclusion
+# • Cloud provider secrets (AWS, GCP, Azure, Render, Vercel)
+#
+# Platform Support
+# • Python ecosystem (pip, poetry, pdm, uv, rye, conda)
+# • IDE/Editor (VS Code, JetBrains, Vim, Emacs, Sublime)
+# • OS files (macOS, Windows, Linux)
+# • Container/Docker (overrides, volumes)
+# • CI/CD (GitHub Actions, GitLab CI, Jenkins)
+# • Cloud platforms (Render, Vercel, Netlify, AWS, GCP, Azure)
+# • Monitoring (Sentry, DataDog, NewRelic)
+#
+# Data Science
+# • Jupyter notebooks (with sample data preservation)
+# • ML models and artifacts
+# • Experiment outputs
+# • Data samples and references
+#
+# Version: 3.2.0
+# Last Updated: 2024
+# =============================================================================
 
-=============================================================================
 
-PROD-SAFE EXCLUSION LIST (Hardened + Render/GitHub Friendly)
-
-Prevent secrets, local envs, caches, build outputs, and runtime artifacts
-
-from being committed.
-
-Principles
-
-- Track templates (e.g., .env.example) but never real secrets
-
-- Prefer narrow ignores over broad ignores
-
-- Keep .github/ tracked
-
-- Keep core source tracked (core/, routes/, schemas/, scripts/, tests/, integrations/)
-
-Version notes (v2.1.0)
-
-- ✅ Hardened secret patterns (Google SA, OAuth, tokens, PEM/PFX, SSH keys)
-
-- ✅ Added common local/CI artifacts (ruff/uv, poetry/pdm, pytest, coverage)
-
-- ✅ Added Render-specific runtime artifacts + local overrides
-
-- ✅ Added Jupyter + data science artifacts (without ignoring real source)
-
-- ✅ Safe JSON rules: do NOT ignore all JSON globally (only secret JSON names)
-
-=============================================================================
-
------------------------------------------------------------------------------
-
-Python Bytecode / C Extensions
-
------------------------------------------------------------------------------
-
-pycache/
+# =============================================================================
+# PYTHON BYTECODE / COMPILED FILES
+# =============================================================================
+__pycache__/
 *.py[cod]
 *$py.class
 *.pyd
 *.so
 *.dylib
+*.dll
+*.pyc
+*.pyo
+*.pyd
+*.pyz
 
------------------------------------------------------------------------------
 
-Python Virtual Environments / Env Managers
-
------------------------------------------------------------------------------
-
+# =============================================================================
+# PYTHON VIRTUAL ENVIRONMENTS / PACKAGE MANAGERS
+# =============================================================================
+# Virtual environments
 venv/
 .venv/
 env/
 ENV/
-.ENV/
-.env.venv/
+.env/
+.venv/
 .venv.bak/
+venv.bak/
 env.bak/
+virtualenv/
+.virtualenv/
+pyenv/
+.pyenv/
+
+# Conda
 .conda/
 conda/
-pip-wheel-metadata/
-.pyenv/
+miniconda/
+miniconda3/
+anaconda/
+anaconda3/
+.anaconda/
+
+# Python version
 .python-version
+python-version
 
-uv (optional) / pipx
-
+# Package managers
+pip-wheel-metadata/
+pip-selfcheck.json
+.pip/
+.pipx/
 .uv/
-pipx/
+uv.lock
+.rye/
+.poetry/
+poetry.lock
+pdm.lock
+Pipfile.lock
+requirements.lock
+constraints.txt
 
------------------------------------------------------------------------------
-
-Python Packaging / Build / Distribution
-
------------------------------------------------------------------------------
-
+# Package build
+*.egg
+*.egg-info/
+*.egg-info
+*.eggs/
+*.dist-info/
+*.dist-info
 build/
 dist/
 downloads/
@@ -83,264 +112,1222 @@ wheels/
 sdist/
 eggs/
 .eggs/
-*.egg-info/
-*.egg
 parts/
 var/
 MANIFEST
 .installed.cfg
+*.egg-link
+*.egg-info/_*
 
-Poetry / PDM / Pipenv
-
-poetry.lock
-pdm.lock
-Pipfile.lock
-
------------------------------------------------------------------------------
-
-Tests / Coverage / Linters / Type Checkers
-
------------------------------------------------------------------------------
-
+# Package cache
+.pypi/
+.pip-cache/
+.pip_download_cache/
+.pip_cache/
 .pytest_cache/
-.coverage
-.coverage.*
-coverage.xml
-htmlcov/
+.ruff_cache/
+.mypy_cache/
+.pyre/
+.pytype/
+.pyright/
+.pyrightcache/
+
+
+# =============================================================================
+# TESTS / COVERAGE / LINTERS / TYPE CHECKERS
+# =============================================================================
+# Test artifacts
+.pytest_cache/
 .tox/
 .nox/
 .hypothesis/
-.mypy_cache/
-.pyright/
-.pyright/
-.pytype/
+.hypothesis/
+tests/.hypothesis/
+*.cover
+.coverage
+.coverage.*
+.coverage.xml
+.coverage.lcov
+htmlcov/
+coverage.xml
+*.cover
+*.py,cover
+.pytest_cache/
+pytestdebug.log
+
+# Linters
 .ruff_cache/
 .pylint.d/
-.dmypy.json
+.pylintrc.local
+.flake8
+.flake8.local
+.mypy_cache/
 .pyre/
+.pytype/
+.pyright/
+.pyright/
+.pyrightconfig.local
+.mypy.ini
+dmypy.json
+.pylintrc
+.pylintrc.local
 
------------------------------------------------------------------------------
+# Type checkers
+*.pyi
+*.pyi.orig
+*.pyi.rej
 
-Logs / Runtime Artifacts
 
------------------------------------------------------------------------------
-
+# =============================================================================
+# LOGS / RUNTIME ARTIFACTS / PROFILING
+# =============================================================================
+# Logs
 *.log
+*.log.*
 logs/
+log/
 *.out
 *.err
 *.pid
 *.pid.lock
-*.prof
-*.profile
-
-Uvicorn / Gunicorn runtime
-
-gunicorn.conf.local.py
-uvicorn.conf.local.py
-
------------------------------------------------------------------------------
-
-Temporary Files / Editor Swap
-
------------------------------------------------------------------------------
-
-*.swp
-*.swo
-*.tmp
-*.temp
-*.bak
 *.lock
 *.lock.bak
+*.journal
+*.journal.bak
 
------------------------------------------------------------------------------
+# Runtime files
+*.sock
+*.socket
+*.pid
+*.pid.lock
+*.port
+*.runtime
+*.manifest
+*.cache
 
-Local Databases / Snapshots / Exports
+# Profiling
+*.prof
+*.profile
+*.stats
+*.callgrind
+*.cachegrind
+*.heapprof
+*.memory
+*.snapshot
+*.perf
+perf.data
+perf.data.old
+flamegraph.svg
+callgrind.out.*
+cachegrind.out.*
 
------------------------------------------------------------------------------
+# Uvicorn/Gunicorn
+gunicorn.conf.py
+gunicorn.conf.local.py
+uvicorn.conf.py
+uvicorn.conf.local.py
+*.gunicorn.conf
+*.uvicorn.conf
 
+# Application runtime
+app.log
+app.log.*
+server.log
+server.log.*
+error.log
+error.log.*
+access.log
+access.log.*
+debug.log
+debug.log.*
+
+
+# =============================================================================
+# TEMPORARY FILES / EDITOR SWAP / BACKUPS
+# =============================================================================
+# Editor swap files
+*.swp
+*.swo
+*.swn
+*.swm
+*.swl
+*.swk
+*.swx
+*.swpx
+*.swp.bak
+
+# Backup files
+*.bak
+*.bkp
+*.backup
+*.old
+*.orig
+*.tmp
+*.temp
+*.TMP
+*.TEMP
+*.~lock.*
+~$*
+*~
+.*.swp
+.*.swo
+
+# Cache files
+.cache/
+.cache
+*.cache
+*.cached
+
+# Temporary directories
+tmp/
+temp/
+tempdata/
+temporary/
+.tmp/
+.temp/
+
+
+# =============================================================================
+# LOCAL DATABASES / SNAPSHOTS / EXPORTS
+# =============================================================================
+# Databases
 *.sqlite
 *.sqlite3
 *.db
+*.db-wal
+*.db-shm
+*.db-journal
+*.sql
+*.sql.gz
+*.sql.bz2
+*.sql.zip
+*.dump
+*.dmp
+*.backup
+*.bak
+*.bson
+*.jsonl
+*.ndjson
+
+# Data directories
+data/
+!data/samples/
+!data/examples/
+!data/README.md
+!data/.gitkeep
+
+# Snapshots
+.snapshots/
+snapshots/
+*.snapshot
+*.snap
 *.dump
 
-.snapshots/
-tmp/
-cache/
+# Exports
 exports/
 reports/
 artifacts/
-data/
+output/
+*.csv
+*.xlsx
+*.xls
+*.parquet
+*.feather
+*.arrow
+*.h5
+*.hdf5
+*.hdf
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.joblib
 
-Keep sample datasets if needed:
 
-!data/samples/
-
-!data/README.md
-
------------------------------------------------------------------------------
-
-Notebooks / Data Science
-
------------------------------------------------------------------------------
-
+# =============================================================================
+# NOTEBOOKS / DATA SCIENCE
+# =============================================================================
+# Jupyter
 .ipynb_checkpoints/
 *.ipynb
-!notebooks/.gitkeep
-notebooks/.ipynb_checkpoints/
+!notebooks/**.ipynb
+!*.example.ipynb
+!example_*.ipynb
+*.ipynb.orig
+*.ipynb.rej
+*.ipynb.bak
 
------------------------------------------------------------------------------
+# Jupyter config
+.jupyter/
+jupyter_config.py
+jupyter_notebook_config.py
+jupyter_notebook_config.json
+jupyter_runtime/
 
-Security & Secrets (CRITICAL)
+# ML artifacts
+*.pth
+*.pt
+*.pkl
+*.pickle
+*.joblib
+*.h5
+*.hdf5
+*.model
+*.weights
+*.checkpoint
+*.ckpt
+*.safetensors
+*.onnx
+*.pb
+*.tflite
+*.mlmodel
+*.caffemodel
+*.prototxt
+*.caffemodel
 
------------------------------------------------------------------------------
+# ML logs
+*.log
+lightning_logs/
+mlruns/
+wandb/
+.neptune/
+.cometml/
+.sacred/
+.tensorboard/
+tensorboard/
+*.tensorboard
+*.tfevents
+*.tfevents.*
 
-1) Env files (track only .env.example)
+# Data science configs
+.mlflow/
+.dvc/
+.dvcignore
+.labconfig/
+.jupyter/
+.kaggle/
+.gradient/
 
+
+# =============================================================================
+# SECURITY & SECRETS (CRITICAL)
+# =============================================================================
+# Environment files - TRACK ONLY .env.example
 .env
 .env.*
 !.env.example
+!.env.template
+!.env.sample
+!.env.local.example
 .envrc
 *.env
+*.env.local
+*.env.*.local
 env.local
 .env.local
+.env.production
 .env.production.local
+.env.development
 .env.development.local
+.env.test
 .env.test.local
+.env.staging
+.env.staging.local
 
-2) Secrets directories (common patterns)
-
+# Secrets directories
 secrets/
-private/
 .credentials/
 .creds/
 keys/
+.key/
+.ssh/
+ssh/
 keyring/
 vault/
-.ssh/
+.private/
+private/
+secure/
+.secure/
+.gnupg/
+.ssl/
+certificates/
+certs/
+.aws/
+.gcp/
+.azure/
+.gcloud/
 
-3) Google Cloud / Service Account / OAuth secrets (Aggressive Guard)
-
+# Google Cloud / Firebase
 credentials.json
 service-account.json
 service_account.json
+service-account*.json
 google_sa.json
 google_creds.json
+google-credentials.json
+gcp-credentials.json
+gcp-sa.json
 sa_key.json
 client_secret.json
-token.json
+client_secret_*.json
+client_secret_*.apps.googleusercontent.com.json
 oauth*.json
+oauth2*.json
+token.json
+tokens.json
+firebase-*.json
+firebase-adminsdk-*.json
+firebase-service-account.json
+firebase-credentials.json
+
+# AWS
+.aws/
+aws-credentials.json
+aws-config.json
+credentials
+config
+*.pem
+*.pk
+*.p8
+*.p12
+*.pem
+aws-*.json
+*.aws.json
+
+# Azure
+.azure/
+azure-credentials.json
+azure-*.json
+*.azureauth
+*.azure.json
+
+# GCP
+.gcp/
 gcp-*.json
-*.json.key
+google-*.json
+*.gcp.json
 
-4) Cryptographic material
+# Heroku / Render / Vercel / Netlify
+.heroku/
+.render/
+.vercel/
+vercel.json
+vercel.json.*
+.netlify/
+netlify.toml
+netlify.toml.*
+render.yaml
+render.yml
+render.yaml.*
+*.render.yaml
+*.render.yml
 
+# Cryptographic material
 *.pem
 *.key
 *.crt
-*.pfx
+*.cer
 *.p12
-*.csr
-*.der
+*.pfx
+*.p7b
+*.p7c
+*.p7r
+*.p8
+*.pkcs8
+*.pkcs12
 *.jks
 *.keystore
+*.truststore
+*.crl
+*.csr
+*.der
+*.keychain
+*.keyring
+*.kdb
+*.rdp
 
-5) Common secret outputs / configs
-
+# Tokens and secrets
+*.token
+*.tokens
 *.secret
 *.secrets
+*.key
+*.keys
 *.sops
 *.age
 *.enc
+*.encrypted
+*.dec
+*.decrypted
+*.env.encrypted
+*.env.enc
+*.env.age
+*.env.sops
 
------------------------------------------------------------------------------
+# SSH
+.ssh/
+id_rsa
+id_rsa.pub
+id_dsa
+id_dsa.pub
+id_ecdsa
+id_ecdsa.pub
+id_ed25519
+id_ed25519.pub
+known_hosts
+authorized_keys
+config
+*.pem
+*.key
 
-IDE / Editor
+# GPG
+.gnupg/
+secring.gpg
+secring.*.gpg
+private-keys-v1.d/
+pubring.gpg
+pubring.*.gpg
+trustdb.gpg
+random_seed
+*.gpg
+*.asc
+*.sig
 
------------------------------------------------------------------------------
+# Password managers
+.kdbx
+.kdb
+.keychain
+.keychain-db
+.agilekeychain
+.1password. op
+.op
+.bitwarden
 
-VS Code
 
+# =============================================================================
+# IDE / EDITOR
+# =============================================================================
+# VS Code
 .vscode/
-!.vscode/settings.json
-!.vscode/tasks.json
-!.vscode/launch.json
-!.vscode/extensions.json
+!.vscode/settings.json.example
+!.vscode/tasks.json.example
+!.vscode/launch.json.example
+!.vscode/extensions.json.example
+!.vscode/*.code-snippets
+!.vscode/*.code-workspace
 *.code-workspace
+.vscode-server/
+.vscode-remote/
 
-JetBrains
-
+# JetBrains (PyCharm, IntelliJ, etc.)
 .idea/
-*.iws
 *.iml
+*.iws
 *.ipr
+*.ids
+*.orig
+.classpath
+.project
+.settings/
+.factorypath
+.idea_modules/
+atlassian-ide-plugin.xml
+composer.lock
+*.komodoproject
 
------------------------------------------------------------------------------
+# Eclipse
+.metadata/
+bin/
+tmp/
+*.tmp
+*.bak
+*.swp
+*.swo
+*~.nib
+local.properties
+.loadpath
+.externalToolBuilders/
+*.launch
 
-OS files
+# NetBeans
+nbproject/private/
+build/
+nbbuild/
+dist/
+nbdist/
+nbactions.xml
+nb-configuration.xml
+.nb-gradle/
 
------------------------------------------------------------------------------
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+.sublime-project
+.sublime-workspace
+.sublime/
+.sublime
 
+# Vim/Neovim
+*.swp
+*.swo
+*.swn
+*.swm
+*.swl
+*.swk
+*.swx
+*.un~
+Session.vim
+.netrwhist
+*.viminfo
+*.nviminfo
+.nvimlog
+.vim/
+.nvim/
+
+# Emacs
+*~
+\#*\#
+.\#*
+*.elc
+*.el~
+*.elc~
+*.elc.old
+*.elc.bak
+*.elc.tmp
+*.elc~undo-tree~
+.eshell/
+.tramp_history
+.projectile
+.cask
+
+# Xcode
+*.pbxuser
+*.mode1v3
+*.mode2v3
+*.perspectivev3
+*.xcuserstate
+*.xcuserstate
+xcuserdata/
+xcshareddata/
+*.xcworkspace
+*.xcworkspacedata
+xcshareddata/
+xcuserdata/
+project.xcworkspace/
+xcshareddata/
+xcuserdata/
+
+# Kate
+.kate-session
+.kateconfig
+
+
+# =============================================================================
+# OS FILES
+# =============================================================================
+# macOS
 .DS_Store
 .DS_Store?
 ._*
 .Spotlight-V100
 .Trashes
-ehthumbs.db
+.AppleDouble
+.LSOverride
+.AppleDB
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.TemporaryItems
+.Trash-*
+.Trash
+.fseventsd
+.dbfseventsd
+.VolumeIcon.icns
+.metadata_never_index
+.document-revisions
+
+# Windows
 Thumbs.db
-Desktop.ini
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msm
+*.msp
+*.lnk
+*.exe
+*.dll
+*.com
+*.scr
+*.hta
+*.ocx
+*.cpl
+*.drv
+*.cur
+*.ico
 
------------------------------------------------------------------------------
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
 
-Node / Frontend Tooling (if present)
 
------------------------------------------------------------------------------
+# =============================================================================
+# CONTAINER / DOCKER
+# =============================================================================
+# Docker files
+*.dockerignore
+Dockerfile
+Dockerfile.*
+!.dockerignore.example
+!.dockerignore.template
+docker-compose.yml
+docker-compose.*.yml
+docker-compose.yaml
+docker-compose.*.yaml
+docker-compose.override.yml
+docker-compose.override.yaml
+compose.override.yml
+compose.override.yaml
+.docker/
+.dockerignore
+.dockerenv
+.docker-data/
+docker-data/
 
+# Kubernetes
+*.kubeconfig
+.kube/
+helm/
+charts/
+*.helm
+*.chart
+*.k8s.yaml
+*.k8s.yml
+*.kubernetes.yaml
+*.kubernetes.yml
+*.kustomization.yaml
+*.kustomization.yml
+kustomize/
+.kube/
+.kubectl/
+
+# Container runtime
+container/
+containers/
+podman/
+podman-data/
+buildah/
+buildah-data/
+skopeo/
+skopeo-data/
+
+
+# =============================================================================
+# NODE / FRONTEND
+# =============================================================================
+# Node.js
 node_modules/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
+lerna-debug.log*
+.npm/
+.yarn/
+.yarn-integrity
+.pnpm-debug.log*
+.pnpm-store/
+.npmrc
+.yarnrc
+.pnpmrc
+
+# Package managers
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+npm-shrinkwrap.json
+yarn-error.log
+pnpm-error.log
+
+# Frontend build
 .next/
 .nuxt/
 .svelte-kit/
 .vite/
+.vite/
+dist/
 dist-ssr/
+build/
+out/
+.output/
+.vercel_build_output/
+.netlify/
+.parcel-cache/
+.cache/
+.angular/
+.cache/
+.temp/
 
------------------------------------------------------------------------------
+# Frontend dependencies
+bower_components/
+jspm_packages/
+jspm_packages/
+jspm_packages/
+vendor/
+components/
 
-Local Deployment / Platforms
+# Frontend configs
+.browserslistrc
+.stylelintrc
+.stylelintrc.*
+.prettierrc
+.prettierrc.*
+.eslintrc
+.eslintrc.*
+.eslintignore
+.prettierignore
+.tailwind.config.js
+.postcss.config.js
+.babelrc
+.babelrc.*
+.babel.config.js
+.webpack.config.js
+.webpack.config.*
+.vue.config.js
+.nuxt.config.js
+.next.config.js
+.gatsby-config.js
+.gatsby-node.js
+.gatsby-browser.js
+.gatsby-ssr.js
 
------------------------------------------------------------------------------
 
+# =============================================================================
+# CI / CD
+# =============================================================================
+# GitHub Actions
+.github/
+!.github/workflows/
+!.github/actions/
+.github/workflows/*.yml
+.github/workflows/*.yaml
+.github/actions/
+
+# GitLab CI
+.gitlab/
+.gitlab-ci.yml
+.gitlab-ci.yaml
+
+# Jenkins
+jenkins/
+jenkins_home/
+*.jenkins
+*.jenkinsfile
+*.jenkinsfile.*
+.jenkins/
+
+# CircleCI
+.circleci/
+.circleci/config.yml
+.circleci/config.yaml
+
+# Travis CI
+.travis.yml
+.travis.yaml
+
+# Azure DevOps
+.azure-pipelines/
+azure-pipelines.yml
+azure-pipelines.yaml
+
+# Buildkite
+.buildkite/
+.buildkite/pipeline.yml
+.buildkite/pipeline.yaml
+
+# Drone
+.drone.yml
+.drone.yaml
+
+# Taskfile
+Taskfile.yml
+Taskfile.yaml
+Taskfile.dist.yml
+Taskfile.dist.yaml
+
+
+# =============================================================================
+# DEPLOYMENT / CLOUD PLATFORMS
+# =============================================================================
+# Render
 .render/
+.render.yaml
+.render.yml
+render.yaml
+render.yml
+.renderignore
+Dockerfile.render
+.render.Dockerfile
+.render/
+render.yaml
+render.yml
+
+# Vercel
 .vercel/
-.serverless/
+vercel.json
+vercel.json.*
+.vercelignore
+.now/
+.nowignore
+
+# Netlify
+.netlify/
+netlify.toml
+netlify.toml.*
+.netlifyignore
+
+# Heroku
+.heroku/
+heroku.yml
+Procfile
+Procfile.*
+*.herokuapp.com
+.heroku/
+
+# AWS
 .elasticbeanstalk/
-firebase-debug.log*
-.firebaserc
+.aws/
+ebextensions/
+.ebextensions/
+.elasticbeanstalk/
+beanstalk/
+serverless/
+.serverless/
+sam/
+.sam/
+cloudformation/
+.cloudformation/
 
-Docker local overrides
+# Google Cloud
+.gcloud/
+google-cloud-sdk/
+appengine/
+.appengine/
+cloudbuild/
+.cloudbuild/
+deploy/
+.deploy/
 
-docker-compose.override.yml
-compose.override.yml
+# Azure
+.azure/
+azuredeploy.json
+azuredeploy.parameters.json
+azuredeploy.parameters.*.json
 
------------------------------------------------------------------------------
+# CloudFlare
+.cloudflare/
+wrangler.toml
+wrangler.toml.*
+.wrangler/
 
-LLM / Copy-Paste Artifact Files (optional safety)
 
------------------------------------------------------------------------------
+# =============================================================================
+# MONITORING / OBSERVABILITY
+# =============================================================================
+# Sentry
+.sentryclirc
+.sentry/
+.sentry.properties
+.sentry-dsn
+.sentry-release
 
+# DataDog
+.datadog/
+dd-tracer/
+ddtrace/
+.datadog-agent/
+datadog.yaml
+datadog-ci.json
+
+# New Relic
+newrelic.ini
+.newrelic/
+.newrelic_agent.log
+newrelic_agent.log
+
+# Prometheus
+prometheus.yml
+prometheus.yaml
+.prometheus/
+alerts.yml
+alerts.yaml
+.rules.yml
+.rules.yaml
+
+# Grafana
+grafana/
+grafana.ini
+.grafana/
+dashboards/
+.dashboards/
+
+# Elastic / Kibana
+elasticsearch/
+kibana/
+logstash/
+filebeat/
+metricbeat/
+packetbeat/
+heartbeat/
+auditbeat/
+
+
+# =============================================================================
+# LLM / AI / COPY-PASTE ARTIFACTS
+# =============================================================================
+# ChatGPT / Claude / Gemini
+*.chatgpt
+*.chatgpt.md
+*.chatgpt.txt
+*.claude
+*.claude.md
+*.claude.txt
+*.gemini
+*.gemini.md
+*.gemini.txt
+*.copilot
+*.copilot.md
+*.copilot.txt
+*.cursor
+*.cursor.md
+*.cursor.txt
+
+# Prompt artifacts
+*.prompt
+*.prompt.md
+*.prompt.txt
+*.system-prompt
+*.system-prompt.md
+*.system-prompt.txt
+*.ai-prompt
+*.ai-prompt.md
+*.ai-prompt.txt
+
+# Generated code
+*.generated
+*.generated.py
+*.generated.js
+*.generated.ts
+*.generated.go
+*.generated.rs
+*.generated.java
+*.generated.cpp
+*.generated.c
+*.generated.h
+*.generated.hpp
+
+# Backup files from LLM conversations
 *.md.backup
 *.txt.backup
-*.chatgpt
-*.prompt
-*.llm
+*.py.backup
+*.js.backup
+*.ts.backup
+*.json.backup
+*.yaml.backup
+*.yml.backup
+*.xml.backup
 
------------------------------------------------------------------------------
 
-DO NOT ignore these source folders (keep tracked):
+# =============================================================================
+# DOCUMENTATION / EXAMPLES
+# =============================================================================
+# Keep example files
+!*.example
+!*.sample
+!*.template
+!*.dist
+!example_*
+!sample_*
+!template_*
+!docs/examples/
+!docs/samples/
+!docs/templates/
 
-core/, routes/, schemas/, scripts/, tests/, integrations/, assets/
+# Documentation build
+docs/_build/
+docs/build/
+docs/site/
+docs/html/
+docs/latex/
+docs/man/
+docs/texinfo/
+docs/epub/
+docs/doctrees/
+docs/_static/
+docs/_templates/
 
------------------------------------------------------------------------------
+# API documentation
+apidoc/
+apidocs/
+swagger/
+swagger-ui/
+redoc/
+postman/
+.postman/
+bruno/
+.bruno/
+
+
+# =============================================================================
+# ARCHIVES / COMPRESSED FILES
+# =============================================================================
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.tar.bz2
+*.tbz2
+*.tar.xz
+*.txz
+*.tar.zst
+*.tzst
+*.7z
+*.rar
+*.gz
+*.bz2
+*.xz
+*.lz
+*.lzma
+*.lzo
+*.zst
+*.br
+*.iso
+*.img
+*.dmg
+*.pkg
+*.deb
+*.rpm
+*.apk
+*.snap
+*.flatpak
+*.AppImage
+
+
+# =============================================================================
+# MEDIA FILES
+# =============================================================================
+# Images
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+*.tif
+*.webp
+*.svg
+*.ico
+*.icns
+*.psd
+*.xcf
+*.ai
+*.eps
+
+# Audio
+*.mp3
+*.wav
+*.ogg
+*.flac
+*.aac
+*.m4a
+*.wma
+*.opus
+
+# Video
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.wmv
+*.flv
+*.webm
+*.m4v
+*.mpg
+*.mpeg
+*.3gp
+
+
+# =============================================================================
+# EXECUTABLES / BINARIES
+# =============================================================================
+*.exe
+*.msi
+*.msm
+*.msp
+*.com
+*.scr
+*.hta
+*.ocx
+*.cpl
+*.drv
+*.dll
+*.so
+*.dylib
+*.bin
+*.elf
+*.out
+*.app
+*.deb
+*.rpm
+*.apk
+*.jar
+*.war
+*.ear
+
+
+# =============================================================================
+# DO NOT IGNORE THESE SOURCE FOLDERS
+# =============================================================================
+# Keep tracked
+!core/
+!routes/
+!schemas/
+!scripts/
+!tests/
+!integrations/
+!assets/
+!docs/
+!examples/
+!templates/
+!migrations/
+!alembic/
+!seeds/
+!fixtures/
+!factories/
+
+# Keep configuration templates
+!.env.example
+!.env.template
+!.env.sample
+!.env.local.example
+!.gitignore.example
+!.dockerignore.example
+!docker-compose.example.yml
+!docker-compose.example.yaml
+!config.example.yaml
+!config.example.yml
+!config.example.json
+!config.example.toml
+
+
+# =============================================================================
+# FINAL SAFEGUARD
+# =============================================================================
+# This file is part of TADAWUL FAST BRIDGE
+# Do not remove without understanding the security implications
+# Last updated: 2024-03-20
