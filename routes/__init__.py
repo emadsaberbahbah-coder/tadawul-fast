@@ -1,33 +1,31 @@
+#!/usr/bin/env python3
 """
 routes/__init__.py
 ------------------------------------------------------------
 Routes package initialization (PROD SAFE) — v2.5.0 (Advanced)
 
 Enhanced with:
-- Async module existence checking
-- Circuit breaker pattern for module loading
-- Metrics collection
-- Lazy loading support
-- Better error categorization
-- Performance monitoring hooks
+- ✅ Async module existence checking
+- ✅ Circuit breaker pattern for module loading
+- ✅ Metrics collection & Performance monitoring hooks
+- ✅ Lazy loading support & Zero-cost initialization
+- ✅ Better error categorization & graceful degradation
+- ✅ Complete dynamic router discovery (mount plans, groups)
 """
 
 from __future__ import annotations
 
 import asyncio
-import fnmatch
 import importlib.util
 import os
-import pkgutil
-import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from functools import lru_cache, wraps
-from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from contextlib import contextmanager
+from collections import defaultdict
 
 ROUTES_PACKAGE_VERSION = "2.5.0"
 
@@ -65,7 +63,7 @@ class ModuleGroup(Enum):
         }
         return priorities.get(self.value, 9)
 
-@dataclass
+@dataclass(slots=True)
 class ModuleInfo:
     """Information about a discovered module."""
     name: str
@@ -77,7 +75,7 @@ class ModuleInfo:
     last_checked: Optional[datetime] = None
     metrics: Dict[str, Any] = field(default_factory=dict)
 
-@dataclass
+@dataclass(slots=True)
 class DiscoveryResult:
     """Result of module discovery operation."""
     module: str
@@ -227,6 +225,19 @@ _circuit_breaker = CircuitBreaker()
 # ---------------------------------------------------------------------
 # Enhanced module existence checking
 # ---------------------------------------------------------------------
+
+def _normalize_module_path(module_path: str) -> str:
+    """Normalize file paths to Python dot notation."""
+    if not module_path: 
+        return ""
+    s = str(module_path).strip()
+    if s.endswith(".py"): 
+        s = s[:-3]
+    if s.endswith("/__init__") or s.endswith("\\__init__"): 
+        s = s[:-9]
+    s = s.replace("/", ".").replace("\\", ".")
+    return s
+
 @lru_cache(maxsize=4096)
 def _module_exists_cached(module_path: str) -> Tuple[bool, Optional[str]]:
     """
@@ -244,7 +255,9 @@ def _module_exists_cached(module_path: str) -> Tuple[bool, Optional[str]]:
         
         # Verify it's actually a module we can import
         if spec.origin is None and not spec.has_location:
-            return False, "Module has no location"
+            # It might be a namespace package
+            if spec.submodule_search_locations is None:
+                return False, "Module has no location and is not a namespace package"
         
         return True, None
     except ModuleNotFoundError as e:
@@ -279,9 +292,6 @@ def module_exists(module_path: str, use_cache: bool = True) -> bool:
                 _module_exists_cached.cache_clear()
                 exists, error = _module_exists_cached(mp)
                 _metrics.record_module_check(mp, hit_cache=False)
-                if not exists and error:
-                    # Log error for debugging
-                    pass
             
             return exists
     except Exception:
@@ -292,7 +302,12 @@ async def module_exists_async(module_path: str, timeout: float = 5.0) -> bool:
     Async version of module_exists with timeout.
     Useful for concurrent checks during startup.
     """
-    loop = asyncio.get_event_loop()
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # Fallback if no loop is running
+        return module_exists(module_path)
+        
     try:
         return await asyncio.wait_for(
             loop.run_in_executor(None, module_exists, module_path),
@@ -331,18 +346,6 @@ async def module_exists_any_async(candidates: Sequence[str]) -> Tuple[bool, Opti
             return True, c
     
     return False, None
-
-def _first_existing(candidates: Sequence[str]) -> Optional[str]:
-    """Find first existing module from candidates."""
-    for c in candidates or []:
-        if module_exists(c):
-            return c
-    return None
-
-async def _first_existing_async(candidates: Sequence[str]) -> Optional[str]:
-    """Async version of _first_existing."""
-    exists, found = await module_exists_any_async(candidates)
-    return found if exists else None
 
 # ---------------------------------------------------------------------
 # Enhanced grouping
@@ -451,8 +454,44 @@ async def check_modules_batch_async(modules: Sequence[str]) -> Dict[str, Discove
     return results
 
 # ---------------------------------------------------------------------
-# Enhanced mount plan with detailed module info
+# Core Router Discovery Implementations
 # ---------------------------------------------------------------------
+
+def get_routes_version() -> str:
+    """Get the version of the routes package."""
+    return ROUTES_PACKAGE_VERSION
+
+def get_expected_router_modules() -> List[str]:
+    """Return the canonical list of expected router modules."""
+    return [
+        "routes.health",
+        "routes.auth",
+        "routes.legacy_service",
+        "routes.data_engine",
+        "routes.investment_advisor",
+        "routes.portfolio",
+        "routes.websockets",
+        "routes.analytics",
+        "routes.market_data",
+        "routes.argaam",
+        "routes.tadawul"
+    ]
+
+def get_expected_router_groups() -> Dict[str, List[str]]:
+    """Group expected modules deterministically by priority."""
+    groups = defaultdict(list)
+    for mod in get_expected_router_modules():
+        groups[_group_of(mod).value].append(mod)
+    return dict(groups)
+
+def get_available_router_modules() -> List[str]:
+    """Filter expected modules to only those actually importable."""
+    return [m for m in get_expected_router_modules() if module_exists(m)]
+
+def get_router_discovery() -> Dict[str, bool]:
+    """Return a mapping of expected modules to their existence status."""
+    return {m: module_exists(m) for m in get_expected_router_modules()}
+
 def get_mount_plan_detailed(expected: Optional[Sequence[str]] = None) -> List[ModuleInfo]:
     """
     Get detailed mount plan with full module information.
@@ -469,10 +508,10 @@ def get_mount_plan_detailed(expected: Optional[Sequence[str]] = None) -> List[Mo
         
         info = ModuleInfo(
             name=module,
-            path=None,  # Would need spec to get path
+            path=None, 
             group=group,
             status=ModuleStatus.AVAILABLE if result and result.found else ModuleStatus.MISSING,
-            last_checked=datetime.now(),
+            last_checked=datetime.now(timezone.utc),
             metrics={
                 "check_time_ms": result.time_taken_ms if result else 0
             }
@@ -488,6 +527,47 @@ def get_mount_plan_detailed(expected: Optional[Sequence[str]] = None) -> List[Mo
     plan.sort(key=lambda x: (x.group.priority, x.name))
     return plan
 
+def get_mount_plan() -> List[str]:
+    """Return a priority-sorted list of module names safe to mount."""
+    detailed = get_mount_plan_detailed()
+    return [m.name for m in detailed if m.status == ModuleStatus.AVAILABLE]
+
+def get_recommended_imports() -> str:
+    """Generate safe, boilerplate try-except import code for available modules."""
+    available = get_mount_plan()
+    imports = []
+    for mod in available:
+        mod_clean = mod.replace("routes.", "")
+        imports.append(f"try:\n    from {mod} import router as {mod_clean}_router\n    app.include_router({mod_clean}_router)\nexcept ImportError as e:\n    logger.warning(f'Failed to mount {mod}: {{e}}')")
+    
+    return "\n\n".join(imports)
+
+def get_dependency_audit() -> Dict[str, Any]:
+    """Audit the router layer, returning stats on missing vs available modules."""
+    expected = get_expected_router_modules()
+    available = get_available_router_modules()
+    missing = list(set(expected) - set(available))
+    
+    return {
+        "status": "healthy" if len(available) > 0 else "critical",
+        "total_expected": len(expected),
+        "total_available": len(available),
+        "total_missing": len(missing),
+        "available_modules": available,
+        "missing_modules": missing,
+        "package_version": ROUTES_PACKAGE_VERSION
+    }
+
+def get_routes_debug_snapshot() -> Dict[str, Any]:
+    """Base debug snapshot of the routes layer."""
+    return {
+        "version": ROUTES_PACKAGE_VERSION,
+        "discovery": get_router_discovery(),
+        "mount_plan": get_mount_plan(),
+        "audit": get_dependency_audit(),
+        "timestamp_utc": datetime.now(timezone.utc).isoformat()
+    }
+
 # ---------------------------------------------------------------------
 # Caching control
 # ---------------------------------------------------------------------
@@ -502,8 +582,8 @@ def invalidate_module_cache(module: Optional[str] = None) -> None:
     if module is None:
         clear_module_cache()
     else:
-        # For specific module, we need to clear all and rely on lazy re-population
-        # Could be optimized with better cache key management
+        # LRU cache doesn't support specific key invalidation natively without internal hacks.
+        # Clearing all is safe and fast enough.
         clear_module_cache()
 
 def get_cache_info() -> Dict[str, Any]:
@@ -526,7 +606,6 @@ def get_routes_debug_snapshot_enhanced() -> Dict[str, Any]:
     """
     base_snapshot = get_routes_debug_snapshot()
     
-    # Add enhanced information
     base_snapshot.update({
         "enhanced_version": ROUTES_PACKAGE_VERSION,
         "metrics": get_metrics().get_stats(),
@@ -535,17 +614,11 @@ def get_routes_debug_snapshot_enhanced() -> Dict[str, Any]:
             "open_circuits": list(_circuit_breaker._open),
             "failure_counts": _circuit_breaker._failures.copy()
         },
-        "timestamp": datetime.now().isoformat(),
         "python_version": os.sys.version,
         "platform": os.sys.platform
     })
     
     return base_snapshot
-
-# ---------------------------------------------------------------------
-# Keep all original functions for backward compatibility
-# ---------------------------------------------------------------------
-# [Include all original functions here...]
 
 # ---------------------------------------------------------------------
 # Extended exports
