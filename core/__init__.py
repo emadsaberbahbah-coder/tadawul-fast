@@ -2,16 +2,16 @@
 # core/__init__.py
 """
 ================================================================================
-Core Package Initializer — v3.0.0 (ADVANCED PRODUCTION)
+Core Package Initializer — v5.0.0 (ADVANCED ENTERPRISE)
 ================================================================================
 Financial Data Platform Core — Lazy Loading, Engine Management, Symbol Resolution
 
-What's new in v3.0.0:
-- ✅ Advanced lazy-loading with hierarchical resolution
+What's new in v5.0.0:
+- ✅ Full alignment with v5.1.0 Symbol Normalization (ISIN, CUSIP, Options, MIC)
+- ✅ Advanced lazy-loading with hierarchical resolution and cache capping
 - ✅ Multi-engine support with failover strategies
-- ✅ Comprehensive symbol normalization integration (v4.0.0)
-- ✅ Circuit breaker pattern for failed imports
-- ✅ Performance metrics and monitoring
+- ✅ Circuit breaker pattern for failed dynamic imports
+- ✅ Performance metrics and monitoring with High-Performance JSON handling
 - ✅ Debug logging with configurable levels
 - ✅ Thread-safe singleton management
 - ✅ Schema validation and type safety
@@ -20,12 +20,11 @@ What's new in v3.0.0:
 - ✅ Never crashes app startup (all exports are best-effort)
 
 Key Features:
-- Zero runtime overhead (lazy imports)
+- Zero runtime overhead (lazy imports via PEP 562)
 - Thread-safe singletons
 - Configurable debug logging
 - Comprehensive error handling
-- Type hints for IDE support
-- Backward compatible with v1.x and v2.x
+- Backward compatible with v1.x, v2.x, and v3.x
 """
 
 from __future__ import annotations
@@ -40,7 +39,20 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar, Un
 from enum import Enum
 from dataclasses import dataclass, field
 
-__version__ = "3.0.0"
+# ---------------------------------------------------------------------------
+# High-Performance JSON fallback
+# ---------------------------------------------------------------------------
+try:
+    import orjson
+    def json_loads(data: Union[str, bytes]) -> Any:
+        return orjson.loads(data)
+except ImportError:
+    import json
+    def json_loads(data: Union[str, bytes]) -> Any:
+        return json.loads(data)
+
+
+__version__ = "5.0.0"
 __core_version__ = __version__
 
 # ============================================================================
@@ -87,7 +99,7 @@ def _monitor_import(func: Callable) -> Callable:
             elapsed = time.perf_counter() - start
             func_name = func.__name__
             with _import_lock:
-                _import_times[func_name] = _import_times.get(func_name, 0) + elapsed
+                _import_times[func_name] = _import_times.get(func_name, 0.0) + elapsed
                 if elapsed > 0.1:  # Log slow imports (>100ms)
                     _dbg(f"Slow import: {func_name} took {elapsed:.3f}s", "warn")
     return wrapper
@@ -122,38 +134,50 @@ def _dbg(msg: str, level: str = "info") -> None:
 # ============================================================================
 
 class ThreadSafeCache:
-    """Thread-safe cache with TTL support."""
+    """Thread-safe cache with TTL and simple Size bounding support."""
     
-    def __init__(self):
+    def __init__(self, max_size: int = 2000):
         self._cache: Dict[str, Any] = {}
         self._lock = threading.RLock()
         self._timestamps: Dict[str, float] = {}
+        self._max_size = max_size
     
     def get(self, key: str, default: Any = None) -> Any:
-        with self._lock:
-            return self._cache.get(key, default)
-    
-    def set(self, key: str, value: Any, ttl: Optional[float] = None) -> Any:
-        with self._lock:
-            self._cache[key] = value
-            if ttl is not None:
-                self._timestamps[key] = time.time() + ttl
-            return value
-    
-    def get_or_set(self, key: str, factory: Callable[[], Any], ttl: Optional[float] = None) -> Any:
         with self._lock:
             if key in self._cache:
                 # Check TTL
                 if key in self._timestamps and time.time() > self._timestamps[key]:
                     del self._cache[key]
                     del self._timestamps[key]
-                else:
-                    return self._cache[key]
-            
-            value = factory()
+                    return default
+                return self._cache[key]
+            return default
+    
+    def set(self, key: str, value: Any, ttl: Optional[float] = None) -> Any:
+        with self._lock:
+            # Prevent unbound memory growth
+            if len(self._cache) >= self._max_size and key not in self._cache:
+                # Naive eviction: remove oldest 10%
+                keys_to_remove = list(self._cache.keys())[:int(self._max_size * 0.1)]
+                for k in keys_to_remove:
+                    self._cache.pop(k, None)
+                    self._timestamps.pop(k, None)
+
             self._cache[key] = value
             if ttl is not None:
                 self._timestamps[key] = time.time() + ttl
+            else:
+                self._timestamps.pop(key, None)
+            return value
+    
+    def get_or_set(self, key: str, factory: Callable[[], Any], ttl: Optional[float] = None) -> Any:
+        with self._lock:
+            val = self.get(key)
+            if val is not None:
+                return val
+            
+            value = factory()
+            self.set(key, value, ttl)
             return value
     
     def clear(self) -> None:
@@ -349,7 +373,7 @@ def get_settings() -> Any:
 
 
 # ============================================================================
-# Symbol Normalization Integration (v4.0.0)
+# Symbol Normalization Integration (v5.1.0 Aligned)
 # ============================================================================
 
 _SYMBOL_MODULE = "core.symbols.normalize"
@@ -374,7 +398,14 @@ _SYMBOL_EXPORTS = [
     "is_etf",
     "is_special_symbol",
     "is_index_or_fx",  # Legacy alias
+    "is_isin",         # Added in v5.1.0
+    "is_cusip",        # Added in v5.1.0
+    "is_sedol",        # Added in v5.1.0
+    "is_option",       # Added in v5.1.0
     
+    # Options helpers
+    "parse_occ_option", # Added in v5.1.0
+
     # Provider formatting
     "to_yahoo_symbol",
     "to_finnhub_symbol",
@@ -382,6 +413,7 @@ _SYMBOL_EXPORTS = [
     "to_bloomberg_symbol",
     "to_reuters_symbol",
     "to_google_symbol",
+    "to_tradingview_symbol", # Added in v5.0.0
     
     # Provider variants
     "yahoo_symbol_variants",
@@ -396,6 +428,7 @@ _SYMBOL_EXPORTS = [
     "standardize_share_class",
     "get_primary_exchange",
     "get_currency_from_symbol",
+    "get_mic_code",    # Added in v5.1.0
     
     # Enums
     "MarketType",
@@ -1073,6 +1106,13 @@ __all__ = [
     "is_etf",
     "is_special_symbol",
     "is_index_or_fx",
+    "is_isin",
+    "is_cusip",
+    "is_sedol",
+    "is_option",
+    
+    # Options
+    "parse_occ_option",
     
     # Provider formatting
     "to_yahoo_symbol",
@@ -1081,6 +1121,7 @@ __all__ = [
     "to_bloomberg_symbol",
     "to_reuters_symbol",
     "to_google_symbol",
+    "to_tradingview_symbol",
     
     # Provider variants
     "yahoo_symbol_variants",
@@ -1095,6 +1136,7 @@ __all__ = [
     "standardize_share_class",
     "get_primary_exchange",
     "get_currency_from_symbol",
+    "get_mic_code",
     
     # Symbol enums
     "MarketType",
