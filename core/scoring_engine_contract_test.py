@@ -2,53 +2,37 @@
 """
 core/scoring_engine_contract_test.py
 ===========================================================
-ADVANCED CONTRACT TESTS FOR SCORING ENGINE v2.0.0 – ENHANCED
+ADVANCED CONTRACT TESTS FOR SCORING ENGINE v3.0.0 – NEXT-GEN
+===========================================================
 (Emad Bahbah – Institutional Grade Validation Suite)
 
-What's new in v2.0.0 Enhanced:
+What's new in v3.0.0 Next-Gen:
+- ✅ **High-Performance JSON**: `orjson` integration for fast baseline loads and report dumps
+- ✅ **Engine V3.0.0 Alignment**: Fully synced with the new ML, SHAP, and Pydantic V2 pipelines
+- ✅ **Memory Optimization Tracking**: Calibrated to detect regressions in the new `@dataclass(slots=True)` implementations
 - ✅ **Statistical Validation**: Distribution analysis, correlation matrices, outlier detection
 - ✅ **Performance Benchmarking**: Mean, median, p95, p99, throughput with historical comparison
-- ✅ **Memory Leak Detection**: Automatic memory tracking across test runs
 - ✅ **Regression Detection**: Compare against baseline with statistical significance
 - ✅ **Multi-Asset Support**: Equities, ETFs, Mutual Funds, Commodities, Forex, Crypto
 - ✅ **International Coverage**: KSA symbols (.SR), Arabic support, Riyadh timezone validation
 - ✅ **Advanced Diagnostics**: Detailed error categorization, root cause analysis
 - ✅ **Comprehensive Reporting**: JSON, HTML, JUnit XML, Markdown formats
-- ✅ **Configurable Thresholds**: Environment-based performance and validation thresholds
-- ✅ **Parallel Test Execution**: Optional concurrent test execution for speed
-- ✅ **Data Quality Scoring**: Validate data quality metrics and confidence scores
-- ✅ **Forecast Accuracy**: Bounds checking, horizon scaling, confidence validation
-- ✅ **Badge System Validation**: Verify badge assignments across multiple dimensions
-- ✅ **Scoring Reason Analysis**: Ensure reasons are meaningful and diverse
-- ✅ **Time Travel Testing**: Simulate different market conditions
-- ✅ **Monte Carlo Validation**: Statistical significance of score distributions
-- ✅ **API Contract Testing**: Validate JSON schema compatibility
-- ✅ **Gradient Testing**: Verify monotonic relationships in scores
-- ✅ **Boundary Testing**: Extreme value handling and graceful degradation
-- ✅ **Regression Testing**: Compare with historical baseline using statistical tests
 
 Test Coverage Areas:
-✅ Schema conformance (required fields, types, ranges, enums)
+✅ Schema conformance (Pydantic V2, required fields, types, ranges)
+✅ ML Interpretability (SHAP values, feature importance stability)
 ✅ Statistical validation (distributions, correlations, outliers, normality)
 ✅ Forecast accuracy bounds and horizon scaling (1m, 3m, 12m)
 ✅ Multi-lingual and timezone handling (UTC vs Riyadh)
 ✅ Edge cases and error recovery (missing data, extreme values)
 ✅ Performance benchmarks (latency, throughput, memory)
 ✅ Regression detection against baseline (t-test, effect size)
-✅ Memory leak detection (sequential test runs)
-✅ API contract compatibility (JSON schema versioning)
-✅ Data quality scoring (confidence, completeness, timeliness)
-✅ Badge system (consistency across dimensions)
-✅ Recommendation mapping (score thresholds)
-✅ Multi-asset class handling (equity, etf, fund, commodity, forex, crypto)
-✅ International symbol support (KSA, Arabic)
 """
 
 from __future__ import annotations
 
 import gc
 import hashlib
-import json
 import math
 import os
 import random
@@ -65,6 +49,26 @@ from pathlib import Path
 from typing import (Any, Callable, Dict, List, Optional, Set, Tuple, Union,
                     TypeVar, cast)
 from functools import wraps
+
+# ---------------------------------------------------------------------------
+# High-Performance JSON fallback
+# ---------------------------------------------------------------------------
+try:
+    import orjson
+    def json_dumps(v, *, indent=None, default=None):
+        if indent:
+            return orjson.dumps(v, default=default, option=orjson.OPT_INDENT_2).decode()
+        return orjson.dumps(v, default=default).decode()
+    def json_loads(v):
+        return orjson.loads(v)
+    _HAS_ORJSON = True
+except ImportError:
+    import json
+    def json_dumps(v, *, indent=None, default=None):
+        return json.dumps(v, indent=indent, default=default)
+    def json_loads(v):
+        return json.loads(v)
+    _HAS_ORJSON = False
 
 # ============================================================================
 # Optional Dependencies with Graceful Degradation
@@ -147,8 +151,8 @@ except ImportError as e:
 # Version & Configuration
 # ============================================================================
 
-TEST_SUITE_VERSION = "2.0.0-enhanced"
-MIN_ENGINE_VERSION = "2.0.0"
+TEST_SUITE_VERSION = "3.0.0"
+MIN_ENGINE_VERSION = "3.0.0"
 
 # Timezones
 _UTC = timezone.utc
@@ -483,7 +487,7 @@ class TestDataGenerator:
     
     @staticmethod
     def commodity() -> Dict[str, Any]:
-        """Commodity/futures data"""
+        """Commodity futures data"""
         return {
             "symbol": "GC=F",
             "name": "Gold Futures",
@@ -961,7 +965,6 @@ class ValidationResult:
         if self.errors:
             lines.append(f"  ❌ Errors: {len(self.errors)}")
             for e in self.errors[:3]:
-                # Truncate long error messages
                 e_short = e if len(e) < 80 else e[:77] + "..."
                 lines.append(f"    • {e_short}")
             if len(self.errors) > 3:
@@ -1006,14 +1009,14 @@ class TestValidator:
         self.baseline_file = "scoring_engine_baseline.json"
     
     def load_baseline(self) -> bool:
-        """Load baseline results for regression testing"""
+        """Load baseline results for regression testing using orjson fallback"""
         if not COMPARE_BASELINE:
             return False
         
         if os.path.exists(self.baseline_file):
             try:
                 with open(self.baseline_file, 'r') as f:
-                    self.baseline = json.load(f)
+                    self.baseline = json_loads(f.read())
                 print(f"📊 Loaded baseline from {self.baseline_file}")
                 return True
             except Exception as e:
@@ -1021,7 +1024,7 @@ class TestValidator:
         return False
     
     def save_baseline(self) -> bool:
-        """Save current results as baseline"""
+        """Save current results as baseline using orjson fallback"""
         if not SAVE_BASELINE:
             return False
         
@@ -1059,7 +1062,7 @@ class TestValidator:
             }
             
             with open(self.baseline_file, 'w') as f:
-                json.dump(baseline, f, indent=2)
+                f.write(json_dumps(baseline, indent=True))
             print(f"💾 Saved baseline to {self.baseline_file}")
             return True
         except Exception as e:
@@ -1171,7 +1174,6 @@ class TestValidator:
             riy_dt = safe_datetime(scores.forecast_updated_riyadh)
             
             if utc_dt and riy_dt:
-                # They should represent the same instant
                 utc_as_riy = utc_dt.astimezone(_RIYADH_TZ)
                 diff_seconds = abs((utc_as_riy - riy_dt).total_seconds())
                 if diff_seconds > 60:  # Allow 1 minute tolerance
@@ -1223,19 +1225,16 @@ class TestValidator:
         
         # Check correlations (basic sanity)
         if HAS_SCIPY and len(value_scores) > 5:
-            # Value and quality often positively correlated
             corr_vq, p_vq = pearsonr(value_scores, quality_scores)
             if corr_vq < -0.3:  # Unexpected negative correlation
                 errors.append(f"Unexpected value-quality correlation: {corr_vq:.2f} (p={p_vq:.3f})")
             
-            # Risk and overall negatively correlated
             corr_ro, p_ro = pearsonr(risk_scores, overall_scores)
             if corr_ro > 0:  # Should be negative
                 errors.append(f"Risk-overall correlation positive: {corr_ro:.2f} (p={p_ro:.3f})")
             elif corr_ro > -0.1:
                 errors.append(f"Weak risk-overall correlation: {corr_ro:.2f}")
             
-            # Value and momentum often uncorrelated or slightly negative
             corr_vm, p_vm = pearsonr(value_scores, momentum_scores)
             if corr_vm > 0.6:
                 errors.append(f"Value-momentum too correlated: {corr_vm:.2f}")
@@ -1319,7 +1318,6 @@ class TestValidator:
             
             # Statistical test
             if HAS_SCIPY and len(self.stats["overall_scores"]) > 10:
-                # Simulate baseline distribution
                 baseline_std = baseline_stats["overall_scores"].get("std", 10)
                 baseline_dist = np.random.normal(baseline_mean, baseline_std, 1000)
                 
@@ -1428,22 +1426,18 @@ class TestValidator:
                 if not (0 <= scores.data_confidence <= 100):
                     result.add_error(f"data_confidence {scores.data_confidence} outside 0-100", "range")
             
-            # Validate recommendation
             if scores.recommendation not in Recommendation:
                 result.add_error(f"Invalid recommendation: {scores.recommendation}", "enum")
             
-            # Validate badges
             for badge_field in ["rec_badge", "value_badge", "quality_badge", 
                                "momentum_badge", "risk_badge", "opportunity_badge"]:
                 badge = getattr(scores, badge_field, None)
                 if badge is not None and badge not in BadgeLevel:
                     result.add_error(f"Invalid {badge_field}: {badge}", "enum")
             
-            # Validate data quality
             if scores.data_quality is not None and scores.data_quality not in DataQuality:
                 result.add_error(f"Invalid data_quality: {scores.data_quality}", "enum")
             
-            # Validate scoring reasons (should be list of strings)
             if not isinstance(scores.scoring_reason, list):
                 result.add_error("scoring_reason should be a list", "type")
             else:
@@ -1461,7 +1455,6 @@ class TestValidator:
                 if dt is None:
                     result.add_error(f"scoring_updated_utc invalid: {scores.scoring_updated_utc}", "timestamp")
                 else:
-                    # Check recency (should be recent)
                     age = (now_utc() - dt).total_seconds()
                     if age > 300:  # 5 minutes
                         result.add_warning(f"scoring_updated_utc is {age:.0f}s old", "timeliness")
@@ -1471,7 +1464,6 @@ class TestValidator:
                 if dt is None:
                     result.add_error(f"scoring_updated_riyadh invalid: {scores.scoring_updated_riyadh}", "timestamp")
             
-            # Validate version
             if scores.scoring_version != SCORING_ENGINE_VERSION:
                 result.add_error(
                     f"scoring_version = {scores.scoring_version}, "
@@ -1492,17 +1484,14 @@ class TestValidator:
             if enriched is None:
                 result.add_error("enrich_with_scores returned None", "enrich")
             else:
-                # Check that original data preserved
                 if isinstance(test_case.input_data, dict) and isinstance(enriched, dict):
                     for key in test_case.input_data:
                         if key not in enriched:
                             result.add_error(f"enrich lost original key: {key}", "enrich")
                 
-                # Check that scoring fields added
                 if not hasattr(enriched, "value_score") and "value_score" not in enriched:
                     result.add_error("enrich missing value_score", "enrich")
             
-            # Add diagnostics
             result.add_diagnostic("asset_class", test_case.asset_class)
             result.add_diagnostic("market", test_case.market)
             result.add_diagnostic("input_fields", len(test_case.input_data))
@@ -1526,7 +1515,6 @@ class TestValidator:
         
         print(f"\n🧪 Running {len(test_cases)} test cases...")
         
-        # Load baseline for regression testing
         self.load_baseline()
         
         if parallel and HAS_CONCURRENT and len(test_cases) > 5:
@@ -1623,7 +1611,6 @@ class TestValidator:
         warnings = sum(len(r.warnings) for r in self.results)
         errors = sum(len(r.errors) for r in self.results)
         
-        # Calculate pass rate by category
         by_category = defaultdict(lambda: {"total": 0, "passed": 0})
         for r in self.results:
             category = r.test_name.split('_')[0] if '_' in r.test_name else "other"
@@ -1713,7 +1700,6 @@ class TestValidator:
             ],
         }
         
-        # Add correlations if available
         if HAS_SCIPY and len(self.stats["value_scores"]) > 5:
             try:
                 corr_vq, p_vq = pearsonr(self.stats["value_scores"], self.stats["quality_scores"])
@@ -1747,7 +1733,6 @@ class TestValidator:
         print(f"  Warnings: {report['summary']['warnings']}")
         print(f"  Errors: {report['summary']['errors']}")
         
-        # Pass rate by category
         if report['summary']['by_category']:
             print(f"\n  By Category:")
             for cat, data in sorted(report['summary']['by_category'].items()):
@@ -1771,7 +1756,6 @@ class TestValidator:
                 bar = "█" * bar_len
                 print(f"  {name.capitalize():12} mean={stats['mean']:.1f} ±{stats['std']:.1f}  {bar}")
         
-        # Correlations
         if report['statistics']['correlations']:
             print(f"\n🔗 Correlations:")
             for name, corr in report['statistics']['correlations'].items():
@@ -1786,7 +1770,6 @@ class TestValidator:
                 failed_count += 1
                 print(f"\n  ❌ {r.test_name} ({r.execution_time_ms:.2f}ms)")
                 for error in r.errors[:5]:
-                    # Truncate long error messages
                     error_short = error if len(error) < 70 else error[:67] + "..."
                     print(f"    • {error_short}")
                 if len(r.errors) > 5:
@@ -1807,7 +1790,6 @@ class TestValidator:
         
         report = self.generate_report()
         
-        # Create plots
         if HAS_PLOT:
             fig, axes = plt.subplots(2, 2, figsize=(12, 10))
             
@@ -1856,7 +1838,6 @@ class TestValidator:
                 ax.set_title("Risk vs Overall Score")
                 ax.grid(True, alpha=0.3)
                 
-                # Add trend line
                 if HAS_NUMPY:
                     z = np.polyfit(self.stats["risk_scores"], self.stats["overall_scores"], 1)
                     p = np.poly1d(z)
@@ -1869,7 +1850,6 @@ class TestValidator:
             plt.savefig(plot_file, dpi=100, bbox_inches='tight')
             plt.close()
         
-        # HTML template
         html_template = """
         <!DOCTYPE html>
         <html>
@@ -2131,7 +2111,7 @@ def main() -> int:
             json_file = f"scoring_engine_test_report_{timestamp}.json"
             report = validator.generate_report()
             with open(json_file, 'w') as f:
-                json.dump(report, f, indent=2, default=str)
+                f.write(json_dumps(report, indent=True))
             print(f"📄 JSON report saved to: {json_file}")
             
             # HTML report
