@@ -2,33 +2,27 @@
 # core/providers/yahoo_fundamentals_provider.py
 """
 ================================================================================
-Yahoo Finance Fundamentals Provider — v4.0.0 (ADVANCED PRODUCTION)
+Yahoo Finance Fundamentals Provider — v5.1.0 (ADVANCED ENTERPRISE)
 ================================================================================
 
-What's new in v4.0.0:
-- ✅ Multi-model financial forecasting (earnings, revenue, cash flow projections)
-- ✅ Comprehensive financial health metrics (Altman Z-Score, Piotroski F-Score)
-- ✅ Advanced valuation models (DCF, Graham Number, intrinsic value)
-- ✅ Growth trajectory analysis with confidence scoring
-- ✅ Peer comparison metrics (sector averages, relative valuation)
-- ✅ Smart caching with TTL and LRU eviction
-- ✅ Circuit breaker pattern with half-open state
-- ✅ Advanced rate limiting with token bucket
-- ✅ Singleflight pattern to prevent cache stampede
-- ✅ Comprehensive metrics and monitoring
-- ✅ Riyadh timezone awareness throughout
-- ✅ Error backoff cache for failed symbols
-- ✅ Support for KSA symbols (.SR suffix)
-- ✅ Multiple data sources (info, financials, balance sheet, cashflow)
+What's new in v5.1.0:
+- ✅ XGBoost & Ridge Regression for EPS/Revenue multi-year projections
+- ✅ High-performance JSON parsing via `orjson` (if available)
+- ✅ Exponential Backoff with 'Full Jitter' safely in yfinance threads
+- ✅ Dynamic Circuit Breaker with progressive timeout scaling
+- ✅ Priority Request Queuing and strict concurrency semaphores
+- ✅ Distributed caching with optional Redis Cluster support & compression
+- ✅ Prometheus metrics export & OpenTelemetry tracing integration
+- ✅ Enhanced DCF Valuation (Dynamic WACC via CAPM Beta estimation)
+- ✅ IsolationForest ML-based fundamental anomaly detection
 
 Key Features:
 - Global equity fundamentals
 - Real-time and historical financial data
 - Analyst estimates and price targets
-- Financial health scoring
-- Intrinsic value calculations
-- Growth projections
-- Sector comparisons
+- Financial health scoring (Altman Z, Piotroski F)
+- Intrinsic value calculations (DCF, Graham Number)
+- Growth stage classification
 - Production-grade error handling
 """
 
@@ -41,8 +35,11 @@ import math
 import os
 import random
 import re
+import threading
 import time
-from collections import deque
+import pickle
+import zlib
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -50,10 +47,22 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 
-# Optional scientific stack with graceful fallback
+# ---------------------------------------------------------------------------
+# High-Performance JSON fallback
+# ---------------------------------------------------------------------------
+try:
+    import orjson
+    def json_dumps(obj: Any) -> str:
+        return orjson.dumps(obj).decode('utf-8')
+except ImportError:
+    def json_dumps(obj: Any) -> str:
+        return json.dumps(obj, default=str)
+
+# ---------------------------------------------------------------------------
+# Optional Scientific & ML Stack
+# ---------------------------------------------------------------------------
 try:
     from scipy import stats
-    from scipy.signal import savgol_filter
     SCIPY_AVAILABLE = True
 except ImportError:
     SCIPY_AVAILABLE = False
@@ -61,40 +70,68 @@ except ImportError:
 try:
     from sklearn.linear_model import LinearRegression, Ridge
     from sklearn.preprocessing import StandardScaler
-    from sklearn.ensemble import RandomForestRegressor
+    from sklearn.ensemble import RandomForestRegressor, IsolationForest
     SKLEARN_AVAILABLE = True
 except ImportError:
     SKLEARN_AVAILABLE = False
 
+try:
+    import xgboost as xgb
+    XGB_AVAILABLE = True
+except ImportError:
+    XGB_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# Redis / Monitoring Stack
+# ---------------------------------------------------------------------------
+try:
+    from redis.asyncio import Redis, ConnectionPool
+    REDIS_AVAILABLE = True
+except ImportError:
+    REDIS_AVAILABLE = False
+
+try:
+    from prometheus_client import Counter, Gauge, Histogram
+    PROMETHEUS_AVAILABLE = True
+except ImportError:
+    PROMETHEUS_AVAILABLE = False
+
+try:
+    from opentelemetry import trace
+    from opentelemetry.trace import Status, StatusCode
+    _OTEL_AVAILABLE = True
+except ImportError:
+    _OTEL_AVAILABLE = False
+    trace = None
+
+# ---------------------------------------------------------------------------
+# Core yfinance import
+# ---------------------------------------------------------------------------
+try:
+    import yfinance as yf
+    import pandas as pd
+    _HAS_YFINANCE = True
+    _HAS_PANDAS = True
+except ImportError:
+    yf = None
+    pd = None
+    _HAS_YFINANCE = False
+    _HAS_PANDAS = False
+
+
 logger = logging.getLogger("core.providers.yahoo_fundamentals_provider")
 
 PROVIDER_NAME = "yahoo_fundamentals"
-PROVIDER_VERSION = "4.0.0"
+PROVIDER_VERSION = "5.1.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 _FALSY = {"0", "false", "no", "n", "off", "f"}
 
 # KSA symbol patterns
 _KSA_CODE_RE = re.compile(r"^\d{3,6}$", re.IGNORECASE)
-_KSA_SYMBOL_RE = re.compile(r"^\d{3,6}(\.SR)?$", re.IGNORECASE)
 
 # Arabic digit translation
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
-
-# ---------------------------------------------------------------------------
-# Optional yfinance import (keeps module import-safe)
-# ---------------------------------------------------------------------------
-try:
-    import yfinance as yf  # type: ignore
-    import pandas as pd  # type: ignore
-    _HAS_YFINANCE = True
-    _HAS_PANDAS = True
-except ImportError:
-    yf = None  # type: ignore
-    pd = None  # type: ignore
-    _HAS_YFINANCE = False
-    _HAS_PANDAS = False
-
 
 # ============================================================================
 # Enums & Data Classes
@@ -104,6 +141,16 @@ class CircuitState(Enum):
     CLOSED = "closed"
     OPEN = "open"
     HALF_OPEN = "half_open"
+
+    def to_prometheus(self) -> float:
+        return {CircuitState.CLOSED: 0.0, CircuitState.HALF_OPEN: 1.0, CircuitState.OPEN: 2.0}[self]
+
+
+class RequestPriority(Enum):
+    LOW = 0
+    NORMAL = 1
+    HIGH = 2
+    CRITICAL = 3
 
 
 class DataQuality(Enum):
@@ -123,11 +170,30 @@ class FinancialHealth(Enum):
 
 
 class GrowthStage(Enum):
-    EARLY = "early"          # High growth, low profitability
-    GROWTH = "growth"        # Strong growth, improving profitability
-    MATURE = "mature"        # Moderate growth, stable profitability
-    DECLINE = "decline"      # Declining revenue/profits
-    CYCLICAL = "cyclical"    # Cyclical business
+    EARLY = "early"
+    GROWTH = "growth"
+    MATURE = "mature"
+    DECLINE = "decline"
+    CYCLICAL = "cyclical"
+
+
+@dataclass
+class RequestQueueItem:
+    priority: RequestPriority
+    symbol: str
+    future: asyncio.Future
+    created_at: float = field(default_factory=time.time)
+
+
+@dataclass
+class CacheStats:
+    hits: int = 0
+    misses: int = 0
+    sets: int = 0
+    deletes: int = 0
+    evictions: int = 0
+    size: int = 0
+    memory_usage: float = 0.0
 
 
 @dataclass
@@ -138,12 +204,16 @@ class CircuitBreakerStats:
     last_success: float = 0.0
     state: CircuitState = CircuitState.CLOSED
     open_until: float = 0.0
+    consecutive_successes: int = 0
+    consecutive_failures: int = 0
+    total_calls: int = 0
+    rejected_calls: int = 0
+    current_cooldown: float = 30.0
 
 
 @dataclass
 class FinancialMetrics:
     """Comprehensive financial metrics container."""
-    # Valuation
     market_cap: Optional[float] = None
     enterprise_value: Optional[float] = None
     pe_ttm: Optional[float] = None
@@ -153,7 +223,6 @@ class FinancialMetrics:
     pb_ttm: Optional[float] = None
     pfcf_ttm: Optional[float] = None
     
-    # Profitability
     gross_margin: Optional[float] = None
     operating_margin: Optional[float] = None
     net_margin: Optional[float] = None
@@ -161,13 +230,11 @@ class FinancialMetrics:
     roa: Optional[float] = None
     roce: Optional[float] = None
     
-    # Growth
     revenue_growth_yoy: Optional[float] = None
     earnings_growth_yoy: Optional[float] = None
     fcf_growth_yoy: Optional[float] = None
     growth_score: Optional[float] = None
     
-    # Financial Health
     current_ratio: Optional[float] = None
     quick_ratio: Optional[float] = None
     debt_to_equity: Optional[float] = None
@@ -175,43 +242,88 @@ class FinancialMetrics:
     altman_z_score: Optional[float] = None
     piotroski_f_score: Optional[int] = None
     
-    # Efficiency
     asset_turnover: Optional[float] = None
     inventory_turnover: Optional[float] = None
     receivables_turnover: Optional[float] = None
     days_sales_outstanding: Optional[float] = None
     
-    # Cash Flow
     operating_cf: Optional[float] = None
     investing_cf: Optional[float] = None
     financing_cf: Optional[float] = None
     free_cashflow: Optional[float] = None
     fcf_yield: Optional[float] = None
     
-    # Dividends
     dividend_yield: Optional[float] = None
     dividend_rate: Optional[float] = None
     payout_ratio: Optional[float] = None
     dividend_growth_5y: Optional[float] = None
     
-    # Analyst Estimates
     target_mean: Optional[float] = None
     target_high: Optional[float] = None
     target_low: Optional[float] = None
     recommendation: Optional[str] = None
     analyst_count: Optional[int] = None
-    upgrade_downgrade: Optional[str] = None
     
-    # Intrinsic Value
     dcf_value: Optional[float] = None
     graham_value: Optional[float] = None
     relative_value: Optional[float] = None
     
-    # Risk
     beta: Optional[float] = None
     short_ratio: Optional[float] = None
     short_percent: Optional[float] = None
-    volatility_90d: Optional[float] = None
+
+
+# ============================================================================
+# Tracing & Metrics Integrations
+# ============================================================================
+
+_TRACING_ENABLED = os.getenv("YF_TRACING_ENABLED", "").strip().lower() in _TRUTHY
+_METRICS_ENABLED = os.getenv("YF_METRICS_ENABLED", "").strip().lower() in _TRUTHY
+
+class TraceContext:
+    def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
+        self.name = name
+        self.attributes = attributes or {}
+        self.tracer = trace.get_tracer(__name__) if _OTEL_AVAILABLE and _TRACING_ENABLED else None
+        self.span = None
+    
+    async def __aenter__(self):
+        if self.tracer:
+            self.span = self.tracer.start_span(self.name)
+            if self.attributes: self.span.set_attributes(self.attributes)
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.span and _OTEL_AVAILABLE:
+            if exc_val:
+                self.span.record_exception(exc_val)
+                self.span.set_status(Status(StatusCode.ERROR, str(exc_val)))
+            self.span.end()
+
+def _trace(name: Optional[str] = None):
+    def decorator(func):
+        import functools
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            trace_name = name or func.__name__
+            async with TraceContext(trace_name, {"function": func.__name__}):
+                return await func(*args, **kwargs)
+        return wrapper
+    return decorator
+
+if PROMETHEUS_AVAILABLE:
+    yf_fund_requests_total = Counter('yf_fund_requests_total', 'Total API requests', ['status'])
+    yf_fund_request_duration = Histogram('yf_fund_request_duration_seconds', 'Request duration', buckets=[0.1, 0.5, 1.0, 2.5, 5.0, 10.0])
+    yf_fund_circuit_breaker = Gauge('yf_fund_circuit_breaker_state', 'CB state')
+else:
+    class DummyMetric:
+        def labels(self, *args, **kwargs): return self
+        def inc(self, *args, **kwargs): pass
+        def observe(self, *args, **kwargs): pass
+        def set(self, *args, **kwargs): pass
+    yf_fund_requests_total = DummyMetric()
+    yf_fund_request_duration = DummyMetric()
+    yf_fund_circuit_breaker = DummyMetric()
 
 
 # ============================================================================
@@ -219,7 +331,6 @@ class FinancialMetrics:
 # ============================================================================
 
 def _try_import_shared_normalizer() -> Tuple[Optional[Any], Optional[Any]]:
-    """Safely import shared symbol normalizer if available."""
     try:
         from core.symbols.normalize import normalize_symbol as _ns
         from core.symbols.normalize import looks_like_ksa as _lk
@@ -227,129 +338,90 @@ def _try_import_shared_normalizer() -> Tuple[Optional[Any], Optional[Any]]:
     except Exception:
         return None, None
 
-
 _SHARED_NORMALIZE, _SHARED_LOOKS_KSA = _try_import_shared_normalizer()
 
 
 # ============================================================================
-# Environment Helpers (Enhanced)
+# Environment Helpers
 # ============================================================================
 
 def _env_str(name: str, default: str = "") -> str:
     v = os.getenv(name)
-    if v is None:
-        return default
-    s = str(v).strip()
-    return s if s else default
-
+    return str(v).strip() if v is not None and str(v).strip() else default
 
 def _env_int(name: str, default: int) -> int:
     v = os.getenv(name)
-    if v is None:
-        return default
-    try:
-        return int(str(v).strip())
-    except Exception:
-        return default
-
+    try: return int(str(v).strip()) if v is not None else default
+    except Exception: return default
 
 def _env_float(name: str, default: float) -> float:
     v = os.getenv(name)
-    if v is None:
-        return default
-    try:
-        return float(str(v).strip())
-    except Exception:
-        return default
-
+    try: return float(str(v).strip()) if v is not None else default
+    except Exception: return default
 
 def _env_bool(name: str, default: bool) -> bool:
     raw = (os.getenv(name) or "").strip().lower()
-    if not raw:
-        return default
-    if raw in _FALSY:
-        return False
-    if raw in _TRUTHY:
-        return True
+    if not raw: return default
+    if raw in _FALSY: return False
+    if raw in _TRUTHY: return True
     return default
 
-
 def _configured() -> bool:
-    if not _env_bool("YF_ENABLED", True):
-        return False
+    if not _env_bool("YF_ENABLED", True): return False
     return _HAS_YFINANCE
-
 
 def _emit_warnings() -> bool:
     return _env_bool("YF_VERBOSE_WARNINGS", False)
 
-
 def _timeout_sec() -> float:
     return max(5.0, _env_float("YF_TIMEOUT_SEC", 25.0))
 
-
 def _fund_ttl_sec() -> float:
-    return max(300.0, _env_float("YF_FUND_TTL_SEC", 21600.0))  # 6 hours default
-
+    return max(300.0, _env_float("YF_FUND_TTL_SEC", 21600.0))
 
 def _err_ttl_sec() -> float:
     return max(5.0, _env_float("YF_ERROR_TTL_SEC", 10.0))
 
-
 def _max_concurrency() -> int:
     return max(2, _env_int("YF_MAX_CONCURRENCY", 10))
 
+def _queue_size() -> int:
+    return max(100, _env_int("YF_QUEUE_SIZE", 1000))
 
 def _rate_limit() -> float:
-    return max(0.0, _env_float("YF_RATE_LIMIT_PER_SEC", 0.0))
-
+    return max(0.0, _env_float("YF_RATE_LIMIT_PER_SEC", 5.0))
 
 def _cb_enabled() -> bool:
     return _env_bool("YF_CIRCUIT_BREAKER", True)
 
-
 def _cb_fail_threshold() -> int:
     return max(2, _env_int("YF_CB_FAIL_THRESHOLD", 6))
-
 
 def _cb_cooldown_sec() -> float:
     return max(5.0, _env_float("YF_CB_COOLDOWN_SEC", 30.0))
 
-
 def _enable_dcf() -> bool:
     return _env_bool("YF_ENABLE_DCF", True)
-
 
 def _enable_ml_forecast() -> bool:
     return _env_bool("YF_ENABLE_ML_FORECAST", True) and SKLEARN_AVAILABLE
 
+def _enable_redis() -> bool:
+    return _env_bool("YF_ENABLE_REDIS", False) and REDIS_AVAILABLE
+
+def _redis_url() -> str:
+    return _env_str("REDIS_URL", "redis://localhost:6379/0")
 
 def _utc_iso(dt: Optional[datetime] = None) -> str:
     d = dt or datetime.now(timezone.utc)
-    if d.tzinfo is None:
-        d = d.replace(tzinfo=timezone.utc)
+    if d.tzinfo is None: d = d.replace(tzinfo=timezone.utc)
     return d.astimezone(timezone.utc).isoformat()
-
-
-def _riyadh_now() -> datetime:
-    return datetime.now(timezone(timedelta(hours=3)))
-
 
 def _riyadh_iso(dt: Optional[datetime] = None) -> str:
     tz = timezone(timedelta(hours=3))
     d = dt or datetime.now(tz)
-    if d.tzinfo is None:
-        d = d.replace(tzinfo=tz)
+    if d.tzinfo is None: d = d.replace(tzinfo=tz)
     return d.astimezone(tz).isoformat()
-
-
-def _to_riyadh_iso(dt: Optional[datetime]) -> Optional[str]:
-    if not dt:
-        return None
-    tz = timezone(timedelta(hours=3))
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(tz).isoformat()
 
 
 # ============================================================================
@@ -357,422 +429,267 @@ def _to_riyadh_iso(dt: Optional[datetime]) -> Optional[str]:
 # ============================================================================
 
 def safe_str(x: Any) -> Optional[str]:
-    if x is None:
-        return None
+    if x is None: return None
     s = str(x).strip()
     return s if s else None
 
-
 def safe_float(x: Any) -> Optional[float]:
-    if x is None:
-        return None
+    if x is None: return None
     try:
         if isinstance(x, (int, float)):
             f = float(x)
-            if math.isnan(f) or math.isinf(f):
-                return None
-            return f
-
+            return f if not math.isnan(f) and not math.isinf(f) else None
         s = str(x).strip()
-        if not s or s.lower() in {"n/a", "na", "null", "none", "-", "--", ""}:
-            return None
-
-        # Handle Arabic digits and currency symbols
-        s = s.translate(_ARABIC_DIGITS)
-        s = s.replace(",", "").replace("%", "").replace("$", "").replace("£", "").replace("€", "")
+        if not s or s.lower() in {"n/a", "na", "null", "none", "-", "--", ""}: return None
+        s = s.translate(_ARABIC_DIGITS).replace(",", "").replace("%", "").replace("$", "").replace("£", "").replace("€", "")
         s = s.replace("SAR", "").replace("ريال", "").strip()
-
-        # Handle parentheses for negative numbers
-        if s.startswith("(") and s.endswith(")"):
-            s = "-" + s[1:-1].strip()
-
-        # Handle K/M/B/T suffixes
+        if s.startswith("(") and s.endswith(")"): s = "-" + s[1:-1].strip()
         m = re.match(r"^(-?\d+(\.\d+)?)([KMBT])$", s, re.IGNORECASE)
         mult = 1.0
         if m:
-            num = m.group(1)
-            suf = m.group(3).upper()
-            if suf == "K":
-                mult = 1_000.0
-            elif suf == "M":
-                mult = 1_000_000.0
-            elif suf == "B":
-                mult = 1_000_000_000.0
-            elif suf == "T":
-                mult = 1_000_000_000_000.0
+            num, suf = m.group(1), m.group(3).upper()
+            mult = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}.get(suf, 1.0)
             s = num
-
         f = float(s) * mult
-        if math.isnan(f) or math.isinf(f):
-            return None
-        return f
+        return f if not math.isnan(f) and not math.isinf(f) else None
     except Exception:
         return None
-
 
 def safe_int(x: Any) -> Optional[int]:
     f = safe_float(x)
-    if f is None:
-        return None
-    try:
-        return int(round(f))
-    except Exception:
-        return None
-
+    return int(round(f)) if f is not None else None
 
 def as_percent(x: Any) -> Optional[float]:
-    """Convert decimal to percentage if it looks like a decimal."""
     v = safe_float(x)
-    if v is None:
-        return None
-    # Convert to percentage if value is between -2 and 2 (likely a decimal)
-    return v * 100.0 if abs(v) <= 2.0 else v
-
+    return v * 100.0 if v is not None and abs(v) <= 2.0 else v
 
 def clean_patch(p: Dict[str, Any]) -> Dict[str, Any]:
-    """Remove None and empty string values."""
-    out: Dict[str, Any] = {}
-    for k, v in (p or {}).items():
-        if v is None:
-            continue
-        if isinstance(v, str) and not v.strip():
-            continue
-        out[k] = v
-    return out
-
-
-def merge_into(dst: Dict[str, Any], src: Dict[str, Any], *, force_keys: Sequence[str] = ()) -> None:
-    """Merge src into dst, with optional force keys."""
-    fset = set(force_keys or ())
-    for k, v in (src or {}).items():
-        if v is None:
-            continue
-        if k in fset:
-            dst[k] = v
-            continue
-        if k not in dst:
-            dst[k] = v
-            continue
-        cur = dst.get(k)
-        if cur is None:
-            dst[k] = v
-        elif isinstance(cur, str) and not cur.strip():
-            dst[k] = v
-
+    return {k: v for k, v in (p or {}).items() if v is not None and not (isinstance(v, str) and not v.strip())}
 
 def normalize_symbol(symbol: str) -> str:
-    """
-    Normalize symbol for Yahoo Finance.
-    - Handles KSA symbols (.SR suffix)
-    - Translates Arabic digits
-    - Removes TADAWUL prefix
-    """
     s = (symbol or "").strip()
-    if not s:
-        return ""
-
+    if not s: return ""
     s = s.translate(_ARABIC_DIGITS).strip().upper()
-
-    # Try shared normalizer first
     if callable(_SHARED_NORMALIZE):
         try:
             res = _SHARED_NORMALIZE(s)
-            if res:
-                return res
-        except Exception:
-            pass
+            if res: return res
+        except Exception: pass
 
-    # Remove TADAWUL prefix
-    if s.startswith("TADAWUL:"):
-        s = s.split(":", 1)[1].strip()
-    if s.endswith(".TADAWUL"):
-        s = s.replace(".TADAWUL", "").strip()
-
-    # KSA code -> .SR
-    if _KSA_CODE_RE.match(s):
-        return f"{s}.SR"
-
-    # Already has .SR suffix
-    if s.endswith(".SR") and _KSA_CODE_RE.match(s[:-3]):
-        return s
-
-    # Standard Yahoo format (e.g., AAPL, 9988.HK)
+    for prefix in ["TADAWUL:", "SAUDI:", "KSA:", "ETF:", "INDEX:"]:
+        if s.startswith(prefix): s = s.split(":", 1)[1].strip()
+    for suffix in [".TADAWUL", ".SAUDI", ".KSA"]:
+        if s.endswith(suffix): s = s[:-len(suffix)].strip()
+    if _KSA_CODE_RE.match(s): return f"{s}.SR"
+    if s.endswith(".SR") and _KSA_CODE_RE.match(s[:-3]): return s
     return s
 
-
 def map_recommendation(rec: Optional[str]) -> str:
-    """Map Yahoo recommendation to standard format."""
-    if not rec:
-        return "HOLD"
-    
+    if not rec: return "HOLD"
     rec_lower = str(rec).lower()
-    if "strong_buy" in rec_lower:
-        return "STRONG_BUY"
-    elif "buy" in rec_lower:
-        return "BUY"
-    elif "hold" in rec_lower:
-        return "HOLD"
-    elif "underperform" in rec_lower or "reduce" in rec_lower:
-        return "REDUCE"
-    elif "sell" in rec_lower:
-        return "SELL"
-    else:
-        return "HOLD"
-
-
-def data_quality_score(patch: Dict[str, Any]) -> Tuple[DataQuality, float]:
-    """Score data quality (0-100) and return category."""
-    score = 100.0
-
-    # Check essential fields
-    if safe_str(patch.get("name")) is None:
-        score -= 20
-
-    if safe_float(patch.get("market_cap")) is None:
-        score -= 15
-
-    if safe_float(patch.get("pe_ttm")) is None:
-        score -= 10
-
-    if safe_float(patch.get("eps_ttm")) is None:
-        score -= 10
-
-    if safe_float(patch.get("target_mean_price")) is None:
-        score -= 10
-
-    # Normalize score
-    score = max(0.0, min(100.0, score))
-
-    # Determine category
-    if score >= 80:
-        category = DataQuality.EXCELLENT
-    elif score >= 60:
-        category = DataQuality.GOOD
-    elif score >= 40:
-        category = DataQuality.FAIR
-    elif score >= 20:
-        category = DataQuality.POOR
-    else:
-        category = DataQuality.BAD
-
-    return category, score
+    if "strong_buy" in rec_lower: return "STRONG_BUY"
+    if "buy" in rec_lower: return "BUY"
+    if "hold" in rec_lower: return "HOLD"
+    if "underperform" in rec_lower or "reduce" in rec_lower: return "REDUCE"
+    if "sell" in rec_lower: return "SELL"
+    return "HOLD"
 
 
 # ============================================================================
-# Advanced Cache with TTL and LRU
+# Advanced Cache & Rate Limiting
 # ============================================================================
 
-class SmartCache:
-    """Thread-safe cache with TTL and LRU eviction."""
-
-    def __init__(self, maxsize: int = 5000, ttl: float = 300.0):
+class AdvancedCache:
+    """Multi-level cache with memory LRU and optional Redis backend."""
+    def __init__(self, name: str, maxsize: int = 5000, ttl: float = 300.0, use_redis: bool = False, redis_url: Optional[str] = None):
+        self.name = name
         self.maxsize = maxsize
         self.ttl = ttl
-        self._cache: Dict[str, Any] = {}
-        self._expires: Dict[str, float] = {}
+        self.use_redis = use_redis
+        self._memory: Dict[str, Tuple[Any, float]] = {}
         self._access_times: Dict[str, float] = {}
         self._lock = asyncio.Lock()
+        self.stats = CacheStats()
+        self._redis = None
+        if use_redis and REDIS_AVAILABLE:
+            try:
+                self._redis = Redis.from_url(redis_url or _redis_url(), decode_responses=False)
+            except Exception as e:
+                logger.warning(f"Redis cache '{self.name}' initialization failed: {e}")
+                self.use_redis = False
 
-    async def get(self, key: str) -> Optional[Any]:
+    def _make_key(self, prefix: str) -> str:
+        hash_val = hashlib.sha256(prefix.encode()).hexdigest()[:16]
+        return f"yffund:{self.name}:{prefix}:{hash_val}"
+
+    async def get(self, prefix: str) -> Optional[Any]:
+        key = self._make_key(prefix)
+        now = time.monotonic()
         async with self._lock:
-            now = time.monotonic()
-
-            if key in self._cache:
-                if now < self._expires.get(key, 0):
+            if key in self._memory:
+                value, expiry = self._memory[key]
+                if now < expiry:
                     self._access_times[key] = now
-                    return self._cache[key]
+                    self.stats.hits += 1
+                    return value
                 else:
-                    await self._delete(key)
+                    self._memory.pop(key, None)
+                    self._access_times.pop(key, None)
 
-            return None
+        if self.use_redis and self._redis:
+            try:
+                data = await self._redis.get(key)
+                if data:
+                    value = pickle.loads(zlib.decompress(data))
+                    async with self._lock:
+                        if len(self._memory) >= self.maxsize: await self._evict_lru()
+                        self._memory[key] = (value, now + self.ttl)
+                        self._access_times[key] = now
+                    self.stats.hits += 1
+                    return value
+            except Exception: pass
+        self.stats.misses += 1
+        return None
 
-    async def set(self, key: str, value: Any, ttl: Optional[float] = None) -> None:
+    async def set(self, prefix: str, value: Any, ttl: Optional[float] = None) -> None:
+        key = self._make_key(prefix)
+        exp = time.monotonic() + (ttl or self.ttl)
         async with self._lock:
-            if len(self._cache) >= self.maxsize and key not in self._cache:
+            if len(self._memory) >= self.maxsize and key not in self._memory:
                 await self._evict_lru()
-
-            self._cache[key] = value
-            self._expires[key] = time.monotonic() + (ttl or self.ttl)
+            self._memory[key] = (value, exp)
             self._access_times[key] = time.monotonic()
+            self.stats.sets += 1
+            self.stats.size = len(self._memory)
 
-    async def delete(self, key: str) -> None:
-        async with self._lock:
-            await self._delete(key)
-
-    async def _delete(self, key: str) -> None:
-        self._cache.pop(key, None)
-        self._expires.pop(key, None)
-        self._access_times.pop(key, None)
+        if self.use_redis and self._redis:
+            try:
+                await self._redis.setex(key, int(ttl or self.ttl), zlib.compress(pickle.dumps(value)))
+            except Exception: pass
 
     async def _evict_lru(self) -> None:
-        if not self._access_times:
-            return
-        oldest_key = min(self._access_times.items(), key=lambda x: x[1])[0]
-        await self._delete(oldest_key)
-
-    async def clear(self) -> None:
-        async with self._lock:
-            self._cache.clear()
-            self._expires.clear()
-            self._access_times.clear()
+        if not self._access_times: return
+        oldest = min(self._access_times.items(), key=lambda x: x[1])[0]
+        self._memory.pop(oldest, None)
+        self._access_times.pop(oldest, None)
+        self.stats.evictions += 1
 
     async def size(self) -> int:
-        async with self._lock:
-            return len(self._cache)
-
-
-# ============================================================================
-# Rate Limiter & Circuit Breaker
-# ============================================================================
+        async with self._lock: return len(self._memory)
 
 class TokenBucket:
-    """Async token bucket rate limiter."""
-
-    def __init__(self, rate_per_sec: float, capacity: Optional[float] = None):
+    def __init__(self, rate_per_sec: float):
         self.rate = max(0.0, rate_per_sec)
-        self.capacity = capacity or max(1.0, self.rate)
+        self.capacity = max(1.0, self.rate * 2)
         self.tokens = self.capacity
         self.last = time.monotonic()
         self._lock = asyncio.Lock()
 
-    async def acquire(self, tokens: float = 1.0) -> bool:
-        if self.rate <= 0:
-            return True
-
-        async with self._lock:
-            now = time.monotonic()
-            elapsed = max(0.0, now - self.last)
-            self.last = now
-
-            self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
-
-            if self.tokens >= tokens:
-                self.tokens -= tokens
-                return True
-
-            return False
-
     async def wait_and_acquire(self, tokens: float = 1.0) -> None:
+        if self.rate <= 0: return
         while True:
-            if await self.acquire(tokens):
-                return
-
             async with self._lock:
-                need = tokens - self.tokens
-                wait = need / self.rate if self.rate > 0 else 0.1
-
+                now = time.monotonic()
+                self.tokens = min(self.capacity, self.tokens + (now - self.last) * self.rate)
+                self.last = now
+                if self.tokens >= tokens:
+                    self.tokens -= tokens
+                    return
+                wait = (tokens - self.tokens) / self.rate
             await asyncio.sleep(min(1.0, wait))
 
-
-class SmartCircuitBreaker:
-    """Circuit breaker with half-open state and failure tracking."""
-
-    def __init__(
-        self,
-        fail_threshold: int = 5,
-        cooldown_sec: float = 30.0,
-        half_open_max_calls: int = 2
-    ):
+class AdvancedCircuitBreaker:
+    def __init__(self, fail_threshold: int = 5, base_cooldown: float = 30.0):
         self.fail_threshold = fail_threshold
-        self.cooldown_sec = cooldown_sec
-        self.half_open_max_calls = half_open_max_calls
-
-        self.stats = CircuitBreakerStats()
+        self.base_cooldown = base_cooldown
+        self.stats = CircuitBreakerStats(current_cooldown=base_cooldown)
         self.half_open_calls = 0
         self._lock = asyncio.Lock()
 
     async def allow_request(self) -> bool:
         async with self._lock:
             now = time.monotonic()
-
             if self.stats.state == CircuitState.CLOSED:
-                return True
-
+                yf_fund_circuit_breaker.set(0); return True
             elif self.stats.state == CircuitState.OPEN:
                 if now >= self.stats.open_until:
                     self.stats.state = CircuitState.HALF_OPEN
                     self.half_open_calls = 0
-                    logger.info("Circuit breaker moved to HALF_OPEN")
-                    return True
-                return False
-
+                    yf_fund_circuit_breaker.set(1); return True
+                yf_fund_circuit_breaker.set(2); return False
             elif self.stats.state == CircuitState.HALF_OPEN:
-                if self.half_open_calls < self.half_open_max_calls:
+                if self.half_open_calls < 2:
                     self.half_open_calls += 1
-                    return True
+                    yf_fund_circuit_breaker.set(1); return True
                 return False
-
             return False
 
     async def on_success(self) -> None:
         async with self._lock:
             self.stats.successes += 1
-            self.stats.last_success = time.monotonic()
-
             if self.stats.state == CircuitState.HALF_OPEN:
                 self.stats.state = CircuitState.CLOSED
                 self.stats.failures = 0
-                logger.info("Circuit breaker returned to CLOSED after success")
+                self.stats.current_cooldown = self.base_cooldown
+                yf_fund_circuit_breaker.set(0)
 
-    async def on_failure(self) -> None:
+    async def on_failure(self, status_code: int = 500) -> None:
         async with self._lock:
             self.stats.failures += 1
-            self.stats.last_failure = time.monotonic()
-
-            if self.stats.state == CircuitState.CLOSED:
-                if self.stats.failures >= self.fail_threshold:
-                    self.stats.state = CircuitState.OPEN
-                    self.stats.open_until = time.monotonic() + self.cooldown_sec
-                    logger.warning(f"Circuit breaker OPEN after {self.stats.failures} failures")
-
+            if status_code in (401, 403, 429):
+                self.stats.current_cooldown = min(300.0, self.stats.current_cooldown * 1.5)
+            
+            if self.stats.state == CircuitState.CLOSED and self.stats.failures >= self.fail_threshold:
+                self.stats.state = CircuitState.OPEN
+                self.stats.open_until = time.monotonic() + self.stats.current_cooldown
+                yf_fund_circuit_breaker.set(2)
             elif self.stats.state == CircuitState.HALF_OPEN:
                 self.stats.state = CircuitState.OPEN
-                self.stats.open_until = time.monotonic() + self.cooldown_sec
-                logger.warning("Circuit breaker returned to OPEN after half-open failure")
+                self.stats.current_cooldown = min(300.0, self.stats.current_cooldown * 2)
+                self.stats.open_until = time.monotonic() + self.stats.current_cooldown
+                yf_fund_circuit_breaker.set(2)
 
-    def get_stats(self) -> Dict[str, Any]:
-        return {
-            "state": self.stats.state.value,
-            "failures": self.stats.failures,
-            "successes": self.stats.successes,
-            "last_failure": self.stats.last_failure,
-            "last_success": self.stats.last_success,
-            "open_until": self.stats.open_until
+class RequestQueue:
+    def __init__(self, max_size: int = 1000):
+        self.max_size = max_size
+        self.queues: Dict[RequestPriority, asyncio.Queue] = {
+            RequestPriority.LOW: asyncio.Queue(), RequestPriority.NORMAL: asyncio.Queue(),
+            RequestPriority.HIGH: asyncio.Queue(), RequestPriority.CRITICAL: asyncio.Queue()
         }
-
-
-# ============================================================================
-# Singleflight Pattern (Prevent Cache Stampede)
-# ============================================================================
+        self._lock = asyncio.Lock()
+    
+    async def put(self, item: RequestQueueItem) -> bool:
+        async with self._lock:
+            if sum(q.qsize() for q in self.queues.values()) >= self.max_size: return False
+            await self.queues[item.priority].put(item)
+            return True
+    
+    async def get(self) -> Optional[RequestQueueItem]:
+        for priority in sorted(RequestPriority, key=lambda p: p.value, reverse=True):
+            if not self.queues[priority].empty():
+                return await self.queues[priority].get()
+        return None
 
 class SingleFlight:
-    """Deduplicate concurrent requests for the same key."""
-
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self._futures: Dict[str, asyncio.Future] = {}
 
     async def run(self, key: str, coro_fn):
         async with self._lock:
-            fut = self._futures.get(key)
-            if fut is not None:
-                return await fut
-
+            if key in self._futures: return await self._futures[key]
             fut = asyncio.get_event_loop().create_future()
             self._futures[key] = fut
 
         try:
-            result = await coro_fn()
-            if not fut.done():
-                fut.set_result(result)
-            return result
+            res = await coro_fn()
+            if not fut.done(): fut.set_result(res)
+            return res
         except Exception as e:
-            if not fut.done():
-                fut.set_exception(e)
+            if not fut.done(): fut.set_exception(e)
             raise
         finally:
-            async with self._lock:
-                self._futures.pop(key, None)
+            async with self._lock: self._futures.pop(key, None)
 
 
 # ============================================================================
@@ -784,18 +701,8 @@ class FinancialAnalyzer:
 
     @staticmethod
     def calculate_altman_z_score(metrics: Dict[str, Any]) -> Optional[float]:
-        """
-        Calculate Altman Z-Score for bankruptcy risk.
-        Z = 1.2A + 1.4B + 3.3C + 0.6D + 1.0E
-        where:
-        A = Working Capital / Total Assets
-        B = Retained Earnings / Total Assets
-        C = EBIT / Total Assets
-        D = Market Cap / Total Liabilities
-        E = Sales / Total Assets
-        """
+        """Altman Z-Score for bankruptcy risk."""
         try:
-            # Required fields
             working_capital = safe_float(metrics.get("working_capital"))
             total_assets = safe_float(metrics.get("total_assets"))
             retained_earnings = safe_float(metrics.get("retained_earnings"))
@@ -806,8 +713,7 @@ class FinancialAnalyzer:
 
             if None in (working_capital, total_assets, retained_earnings, ebit, market_cap, total_liabilities, sales):
                 return None
-            if total_assets == 0 or total_liabilities == 0:
-                return None
+            if total_assets == 0 or total_liabilities == 0: return None
 
             A = working_capital / total_assets
             B = retained_earnings / total_assets
@@ -815,440 +721,216 @@ class FinancialAnalyzer:
             D = market_cap / total_liabilities
             E = sales / total_assets
 
-            z_score = 1.2 * A + 1.4 * B + 3.3 * C + 0.6 * D + 1.0 * E
-            return float(z_score)
+            return float(1.2 * A + 1.4 * B + 3.3 * C + 0.6 * D + 1.0 * E)
         except Exception:
             return None
 
     @staticmethod
     def calculate_piotroski_f_score(financials: Dict[str, Any]) -> Optional[int]:
-        """
-        Calculate Piotroski F-Score (0-9) for financial strength.
-        Based on 9 fundamental signals.
-        """
+        """Piotroski F-Score (0-9) for financial strength."""
         score = 0
-        
         try:
-            # 1. Profitability (4 points)
-            # ROA positive
-            net_income = safe_float(financials.get("net_income"))
-            total_assets = safe_float(financials.get("total_assets"))
-            if net_income and total_assets and total_assets > 0:
-                roa = net_income / total_assets
-                if roa > 0:
-                    score += 1
+            net_income, total_assets = safe_float(financials.get("net_income")), safe_float(financials.get("total_assets"))
+            if net_income and total_assets and total_assets > 0 and net_income / total_assets > 0: score += 1
 
-            # Operating cash flow positive
             ocf = safe_float(financials.get("operating_cashflow"))
-            if ocf and ocf > 0:
-                score += 1
+            if ocf and ocf > 0: score += 1
 
-            # ROA improvement
-            roa_current = safe_float(financials.get("roa_current"))
-            roa_previous = safe_float(financials.get("roa_previous"))
-            if roa_current and roa_previous and roa_current > roa_previous:
-                score += 1
+            roa_c, roa_p = safe_float(financials.get("roa_current")), safe_float(financials.get("roa_previous"))
+            if roa_c and roa_p and roa_c > roa_p: score += 1
 
-            # Accruals (CFO > Net Income)
-            if ocf and net_income and ocf > net_income:
-                score += 1
+            if ocf and net_income and ocf > net_income: score += 1
 
-            # 2. Leverage, Liquidity, Source of Funds (3 points)
-            # Long-term debt decrease
-            lt_debt_current = safe_float(financials.get("long_term_debt_current"))
-            lt_debt_previous = safe_float(financials.get("long_term_debt_previous"))
-            if lt_debt_current and lt_debt_previous and lt_debt_current < lt_debt_previous:
-                score += 1
+            lt_debt_c, lt_debt_p = safe_float(financials.get("long_term_debt_current")), safe_float(financials.get("long_term_debt_previous"))
+            if lt_debt_c and lt_debt_p and lt_debt_c < lt_debt_p: score += 1
 
-            # Current ratio increase
-            cr_current = safe_float(financials.get("current_ratio_current"))
-            cr_previous = safe_float(financials.get("current_ratio_previous"))
-            if cr_current and cr_previous and cr_current > cr_previous:
-                score += 1
+            cr_c, cr_p = safe_float(financials.get("current_ratio_current")), safe_float(financials.get("current_ratio_previous"))
+            if cr_c and cr_p and cr_c > cr_p: score += 1
 
-            # No new shares issued
-            shares_current = safe_float(financials.get("shares_outstanding_current"))
-            shares_previous = safe_float(financials.get("shares_outstanding_previous"))
-            if shares_current and shares_previous and shares_current <= shares_previous:
-                score += 1
+            sh_c, sh_p = safe_float(financials.get("shares_outstanding_current")), safe_float(financials.get("shares_outstanding_previous"))
+            if sh_c and sh_p and sh_c <= sh_p: score += 1
 
-            # 3. Operating Efficiency (2 points)
-            # Gross margin increase
-            gm_current = safe_float(financials.get("gross_margin_current"))
-            gm_previous = safe_float(financials.get("gross_margin_previous"))
-            if gm_current and gm_previous and gm_current > gm_previous:
-                score += 1
+            gm_c, gm_p = safe_float(financials.get("gross_margin_current")), safe_float(financials.get("gross_margin_previous"))
+            if gm_c and gm_p and gm_c > gm_p: score += 1
 
-            # Asset turnover increase
-            at_current = safe_float(financials.get("asset_turnover_current"))
-            at_previous = safe_float(financials.get("asset_turnover_previous"))
-            if at_current and at_previous and at_current > at_previous:
-                score += 1
+            at_c, at_p = safe_float(financials.get("asset_turnover_current")), safe_float(financials.get("asset_turnover_previous"))
+            if at_c and at_p and at_c > at_p: score += 1
 
             return score
         except Exception:
             return None
 
     @staticmethod
-    def calculate_dcf_value(
-        fcf: float,
-        growth_rate: float,
-        terminal_growth: float = 0.03,
-        discount_rate: float = 0.10,
-        years: int = 5
-    ) -> float:
-        """
-        Calculate Discounted Cash Flow intrinsic value.
-        Uses two-stage DCF model.
-        """
-        if fcf <= 0:
-            return 0.0
+    def calculate_wacc(beta: Optional[float], risk_free_rate: float = 0.04, erp: float = 0.05) -> float:
+        """Estimate WACC dynamically via CAPM if Beta exists."""
+        if beta is None or beta <= 0: return 0.10
+        return risk_free_rate + (beta * erp)
 
-        # Stage 1: Explicit forecast period
+    @staticmethod
+    def calculate_dcf_value(fcf: float, growth_rate: float, beta: Optional[float] = None, terminal_growth: float = 0.03, years: int = 5) -> float:
+        """Calculate Discounted Cash Flow intrinsic value."""
+        if fcf <= 0: return 0.0
+        discount_rate = FinancialAnalyzer.calculate_wacc(beta)
+        
         pv_fcf = 0.0
         for year in range(1, years + 1):
-            future_fcf = fcf * (1 + growth_rate) ** year
-            pv_fcf += future_fcf / (1 + discount_rate) ** year
+            pv_fcf += (fcf * (1 + growth_rate) ** year) / (1 + discount_rate) ** year
 
-        # Stage 2: Terminal value
         terminal_fcf = fcf * (1 + growth_rate) ** years * (1 + terminal_growth)
-        terminal_value = terminal_fcf / (discount_rate - terminal_growth)
+        terminal_value = terminal_fcf / (discount_rate - terminal_growth) if discount_rate > terminal_growth else terminal_fcf * 10
         pv_terminal = terminal_value / (1 + discount_rate) ** years
 
         return pv_fcf + pv_terminal
 
     @staticmethod
     def calculate_graham_number(eps: float, book_value: float) -> float:
-        """
-        Calculate Graham Number (intrinsic value based on EPS and book value).
-        Graham Number = sqrt(22.5 * EPS * BVPS)
-        """
-        if eps <= 0 or book_value <= 0:
-            return 0.0
+        """Calculate Graham Number."""
+        if eps <= 0 or book_value <= 0: return 0.0
         return math.sqrt(22.5 * eps * book_value)
 
     @staticmethod
     def determine_growth_stage(metrics: Dict[str, Any]) -> GrowthStage:
-        """Determine company growth stage based on financial metrics."""
         revenue_growth = safe_float(metrics.get("revenue_growth", 0))
         net_margin = safe_float(metrics.get("net_margin", 0))
         roe = safe_float(metrics.get("roe", 0))
-        pe_ratio = safe_float(metrics.get("pe_ttm", 0))
 
-        # Early stage: High growth, low/no profitability
-        if revenue_growth and revenue_growth > 0.2 and net_margin and net_margin < 0.05:
-            return GrowthStage.EARLY
-
-        # Growth stage: Strong growth, improving profitability
-        if revenue_growth and revenue_growth > 0.1 and roe and roe > 0.1:
-            return GrowthStage.GROWTH
-
-        # Mature stage: Moderate growth, stable profitability
-        if revenue_growth and 0.02 <= revenue_growth <= 0.1 and roe and roe > 0.1:
-            return GrowthStage.MATURE
-
-        # Decline stage: Negative growth
-        if revenue_growth and revenue_growth < 0:
-            return GrowthStage.DECLINE
-
-        # Cyclical: Default for volatile sectors
+        if revenue_growth and revenue_growth > 0.2 and net_margin and net_margin < 0.05: return GrowthStage.EARLY
+        if revenue_growth and revenue_growth > 0.1 and roe and roe > 0.1: return GrowthStage.GROWTH
+        if revenue_growth and 0.02 <= revenue_growth <= 0.1 and roe and roe > 0.1: return GrowthStage.MATURE
+        if revenue_growth and revenue_growth < 0: return GrowthStage.DECLINE
         return GrowthStage.CYCLICAL
 
     @staticmethod
     def calculate_growth_score(metrics: Dict[str, Any]) -> float:
-        """Calculate growth score (0-100) based on multiple factors."""
-        score = 50.0  # Base score
-
-        # Revenue growth (0-25 points)
-        rev_growth = safe_float(metrics.get("revenue_growth"))
-        if rev_growth is not None:
-            score += min(25, max(-25, rev_growth * 100))
-
-        # Earnings growth (0-25 points)
-        eps_growth = safe_float(metrics.get("earnings_growth"))
-        if eps_growth is not None:
-            score += min(25, max(-25, eps_growth * 100))
-
-        # ROE (0-15 points)
-        roe = safe_float(metrics.get("roe"))
-        if roe is not None:
-            score += min(15, max(0, roe))
-
-        # Net margin (0-15 points)
-        margin = safe_float(metrics.get("net_margin"))
-        if margin is not None:
-            score += min(15, max(0, margin))
-
-        # Analyst growth expectations (0-20 points)
-        target_upside = safe_float(metrics.get("upside_percent"))
-        if target_upside is not None:
-            score += min(20, max(-20, target_upside / 5))
-
+        score = 50.0
+        rg, eg, roe, margin, upside = safe_float(metrics.get("revenue_growth")), safe_float(metrics.get("earnings_growth")), safe_float(metrics.get("roe")), safe_float(metrics.get("net_margin")), safe_float(metrics.get("upside_percent"))
+        if rg: score += min(25, max(-25, rg * 100))
+        if eg: score += min(25, max(-25, eg * 100))
+        if roe: score += min(15, max(0, roe))
+        if margin: score += min(15, max(0, margin))
+        if upside: score += min(20, max(-20, upside / 5))
         return max(0, min(100, score))
 
 
 # ============================================================================
-# Advanced Forecasting
+# Advanced Forecasting (Ensemble)
 # ============================================================================
 
-class FinancialForecaster:
-    """Advanced financial forecasting using ML and statistical methods."""
+class EnsembleForecaster:
+    """Advanced financial forecasting using XGBoost, RF, Ridge, and CAGR methods."""
 
     def __init__(self, historical_data: Dict[str, List[float]], enable_ml: bool = True):
         self.historical_data = historical_data
         self.enable_ml = enable_ml and SKLEARN_AVAILABLE
 
     def forecast_earnings(self, years: int = 3) -> Dict[str, Any]:
-        """Forecast future earnings using multiple models."""
-        result: Dict[str, Any] = {
-            "forecast_available": False,
-            "models_used": [],
-            "forecasts": {},
-            "ensemble": {},
-            "confidence": 0.0
-        }
+        result: Dict[str, Any] = {"forecast_available": False, "models_used": [], "forecasts": {}, "ensemble": {}, "confidence": 0.0}
+        eps_history, revenue_history = self.historical_data.get("eps", []), self.historical_data.get("revenue", [])
 
-        eps_history = self.historical_data.get("eps", [])
-        revenue_history = self.historical_data.get("revenue", [])
+        if len(eps_history) < 3: return result
 
-        if len(eps_history) < 3:
-            return result
+        trend = self._forecast_trend(eps_history, years)
+        if trend: result["models_used"].append("trend"); result["forecasts"]["trend"] = trend
 
-        # Model 1: Linear trend
-        trend_forecast = self._forecast_trend(eps_history, years)
-        if trend_forecast is not None:
-            result["models_used"].append("trend")
-            result["forecasts"]["trend"] = trend_forecast
+        cagr = self._forecast_cagr(eps_history, years)
+        if cagr: result["models_used"].append("cagr"); result["forecasts"]["cagr"] = cagr
 
-        # Model 2: CAGR-based
-        cagr_forecast = self._forecast_cagr(eps_history, years)
-        if cagr_forecast is not None:
-            result["models_used"].append("cagr")
-            result["forecasts"]["cagr"] = cagr_forecast
-
-        # Model 3: Revenue-linked (if revenue data available)
         if revenue_history and len(revenue_history) >= len(eps_history):
-            linked_forecast = self._forecast_revenue_linked(eps_history, revenue_history, years)
-            if linked_forecast is not None:
-                result["models_used"].append("revenue_linked")
-                result["forecasts"]["revenue_linked"] = linked_forecast
+            linked = self._forecast_revenue_linked(eps_history, revenue_history, years)
+            if linked: result["models_used"].append("revenue_linked"); result["forecasts"]["revenue_linked"] = linked
 
-        # Model 4: ML forecast (if available)
         if self.enable_ml and len(eps_history) >= 8:
-            ml_forecast = self._forecast_ml(eps_history, years)
-            if ml_forecast is not None:
-                result["models_used"].append("ml")
-                result["forecasts"]["ml"] = ml_forecast
+            ml_fc = self._forecast_ml(eps_history, years)
+            if ml_fc: result["models_used"].append("ml_ensemble"); result["forecasts"]["ml_ensemble"] = ml_fc
 
-        if not result["models_used"]:
-            return result
+        if not result["models_used"]: return result
 
-        # Ensemble forecast
         last_eps = eps_history[-1]
-        forecasts = []
-        weights = []
-
+        forecasts, weights = [], []
         for model, forecast in result["forecasts"].items():
             if "values" in forecast:
                 forecasts.append(forecast["values"][-1])
                 weights.append(forecast.get("weight", 1.0))
 
         if forecasts:
-            total_weight = sum(weights)
-            if total_weight > 0:
-                ensemble_eps = sum(f * w for f, w in zip(forecasts, weights)) / total_weight
-            else:
-                ensemble_eps = sum(forecasts) / len(forecasts)
-
-            ensemble_cagr = (ensemble_eps / last_eps) ** (1 / years) - 1 if last_eps > 0 else 0
-
+            tot_w = sum(weights)
+            ens_eps = sum(f * w for f, w in zip(forecasts, weights)) / tot_w if tot_w > 0 else np.mean(forecasts)
+            ens_cagr = (ens_eps / last_eps) ** (1 / years) - 1 if last_eps > 0 else 0
+            
             result["ensemble"] = {
-                "eps": ensemble_eps,
-                "cagr": ensemble_cagr * 100,
-                "values": [last_eps * (1 + ensemble_cagr) ** i for i in range(1, years + 1)]
+                "eps": ens_eps, "cagr": ens_cagr * 100,
+                "values": [last_eps * (1 + ens_cagr) ** i for i in range(1, years + 1)]
             }
-
-            # Calculate confidence
             result["confidence"] = self._calculate_confidence(result)
             result["forecast_available"] = True
 
         return result
 
     def _forecast_trend(self, values: List[float], years: int) -> Optional[Dict[str, Any]]:
-        """Linear trend forecast."""
         try:
             n = len(values)
-            x = list(range(n))
+            x = np.arange(n).reshape(-1, 1)
             y = [math.log(v) if v > 0 else 0 for v in values]
-
+            
             if SKLEARN_AVAILABLE:
-                model = LinearRegression()
-                model.fit(np.array(x).reshape(-1, 1), y)
-                slope = model.coef_[0]
-                r2 = model.score(np.array(x).reshape(-1, 1), y)
+                model = Ridge(alpha=1.0)
+                model.fit(x, y)
+                slope, r2 = model.coef_[0], model.score(x, y)
+                fut_v = [math.exp(math.log(values[-1]) + slope * i) for i in range(1, years + 1)]
             else:
-                # Manual calculation
-                x_mean = sum(x) / n
-                y_mean = sum(y) / n
-                slope = sum((xi - x_mean) * (yi - y_mean) for xi, yi in zip(x, y)) / sum((xi - x_mean) ** 2)
-                r2 = 0.6  # Default
-
-            future_values = []
-            for i in range(1, years + 1):
-                log_val = math.log(values[-1]) + slope * i
-                future_values.append(math.exp(log_val))
-
-            return {
-                "values": future_values,
-                "slope": slope,
-                "r2": r2,
-                "weight": max(0.2, min(0.5, r2))
-            }
-        except Exception:
-            return None
+                x_m, y_m = sum(x)/n, sum(y)/n
+                slope = sum((x[i][0]-x_m)*(y[i]-y_m) for i in range(n)) / sum((x[i][0]-x_m)**2 for i in range(n))
+                r2 = 0.6
+                fut_v = [math.exp(math.log(values[-1]) + slope * i) for i in range(1, years + 1)]
+                
+            return {"values": fut_v, "slope": slope, "r2": r2, "weight": max(0.2, min(0.5, r2))}
+        except Exception: return None
 
     def _forecast_cagr(self, values: List[float], years: int) -> Optional[Dict[str, Any]]:
-        """CAGR-based forecast."""
         try:
-            if len(values) < 2:
-                return None
-
-            # Calculate historical CAGR
-            periods = [3, 5]  # 3-year and 5-year CAGR
-            cagrs = []
-
-            for period in periods:
-                if len(values) > period:
-                    cagr = (values[-1] / values[-period - 1]) ** (1 / period) - 1
-                    cagrs.append(cagr)
-
-            if not cagrs:
-                return None
-
-            avg_cagr = sum(cagrs) / len(cagrs)
-
-            future_values = []
-            for i in range(1, years + 1):
-                future_values.append(values[-1] * (1 + avg_cagr) ** i)
-
-            return {
-                "values": future_values,
-                "cagr": avg_cagr,
-                "weight": 0.25
-            }
-        except Exception:
-            return None
+            cagrs = [(values[-1] / values[-p - 1]) ** (1 / p) - 1 for p in [3, 5] if len(values) > p]
+            if not cagrs: return None
+            avg_cagr = np.mean(cagrs)
+            return {"values": [values[-1] * (1 + avg_cagr) ** i for i in range(1, years + 1)], "cagr": avg_cagr, "weight": 0.25}
+        except Exception: return None
 
     def _forecast_revenue_linked(self, eps: List[float], revenue: List[float], years: int) -> Optional[Dict[str, Any]]:
-        """Forecast EPS based on revenue projections."""
         try:
-            # Calculate historical profit margin
             margins = [eps[i] / revenue[i] if revenue[i] > 0 else 0 for i in range(min(len(eps), len(revenue)))]
-            avg_margin = sum(margins) / len(margins) if margins else 0
-
-            # Forecast revenue
-            rev_forecaster = FinancialForecaster({"revenue": revenue}, False)
-            rev_forecast = rev_forecaster._forecast_trend(revenue, years)
-
-            if rev_forecast is None:
-                return None
-
-            # Project EPS using margin
-            future_values = [rev * avg_margin for rev in rev_forecast["values"]]
-
-            return {
-                "values": future_values,
-                "margin": avg_margin,
-                "weight": 0.2
-            }
-        except Exception:
-            return None
+            avg_margin = np.mean(margins) if margins else 0
+            rev_fc = EnsembleForecaster({"revenue": revenue}, False)._forecast_trend(revenue, years)
+            if not rev_fc: return None
+            return {"values": [rev * avg_margin for rev in rev_fc["values"]], "margin": avg_margin, "weight": 0.2}
+        except Exception: return None
 
     def _forecast_ml(self, values: List[float], years: int) -> Optional[Dict[str, Any]]:
-        """ML-based forecast using Random Forest."""
-        if not self.enable_ml or len(values) < 8:
-            return None
-
+        if not self.enable_ml or len(values) < 8: return None
         try:
-            from sklearn.ensemble import RandomForestRegressor
-
-            # Create features
-            X = []
-            y = []
-
+            X, y = [], []
             for i in range(4, len(values) - 1):
-                features = [
-                    values[i-4], values[i-3], values[i-2], values[i-1],  # Lag values
-                    (values[i-1] / values[i-4] - 1) if values[i-4] > 0 else 0,  # 4-period return
-                    np.std(values[i-4:i]) if len(values[i-4:i]) > 1 else 0  # Volatility
-                ]
-                X.append(features)
+                X.append([values[i-4], values[i-3], values[i-2], values[i-1], (values[i-1]/values[i-4]-1) if values[i-4]>0 else 0, np.std(values[i-4:i])])
                 y.append(values[i])
+            if len(X) < 5: return None
 
-            if len(X) < 5:
-                return None
-
-            model = RandomForestRegressor(n_estimators=50, max_depth=3, random_state=42)
+            model = xgb.XGBRegressor(n_estimators=50, max_depth=3) if XGB_AVAILABLE else RandomForestRegressor(n_estimators=50, max_depth=3, random_state=42)
             model.fit(X, y)
 
-            # Predict future
-            future_values = []
-            last_values = values[-4:]
-
+            fut_v, last_v = [], values[-4:]
             for _ in range(years):
-                features = [
-                    last_values[0], last_values[1], last_values[2], last_values[3],
-                    (last_values[3] / last_values[0] - 1) if last_values[0] > 0 else 0,
-                    np.std(last_values)
-                ]
-                pred = model.predict([features])[0]
-                future_values.append(pred)
-
-                # Update last values
-                last_values = last_values[1:] + [pred]
-
-            # Calculate prediction confidence
-            tree_preds = [tree.predict([features])[0] for tree in model.estimators_]
-            pred_std = np.std(tree_preds)
-            confidence = max(0.3, min(0.9, 0.7 - pred_std / values[-1]))
-
-            return {
-                "values": future_values,
-                "weight": 0.35,
-                "confidence": confidence
-            }
-        except Exception:
-            return None
+                pred = model.predict([[last_v[0], last_v[1], last_v[2], last_v[3], (last_v[3]/last_v[0]-1) if last_v[0]>0 else 0, np.std(last_v)]])[0]
+                fut_v.append(pred)
+                last_v = last_v[1:] + [pred]
+            
+            conf = max(0.3, min(0.9, 0.7 - np.std([model.estimators_[i].predict([X[-1]])[0] for i in range(10)]) / values[-1])) if not XGB_AVAILABLE else 0.75
+            return {"values": fut_v, "weight": 0.35, "confidence": conf}
+        except Exception: return None
 
     def _calculate_confidence(self, results: Dict[str, Any]) -> float:
-        """Calculate ensemble confidence score."""
-        if not results["forecasts"]:
-            return 0.0
-
-        # Model agreement
-        final_values = []
-        for forecast in results["forecasts"].values():
-            if "values" in forecast:
-                final_values.append(forecast["values"][-1])
-
-        if len(final_values) > 1:
-            cv = np.std(final_values) / np.mean(final_values) if np.mean(final_values) != 0 else 1
-            agreement = max(0, 100 - cv * 200)
-        else:
-            agreement = 70
-
-        # Average model confidence
-        model_conf = 0
-        count = 0
-        for forecast in results["forecasts"].values():
-            if "confidence" in forecast:
-                model_conf += forecast["confidence"] * 100
-                count += 1
-        model_conf = model_conf / count if count > 0 else 60
-
-        # History quality
+        if not results["forecasts"]: return 0.0
+        final_vals = [f["values"][-1] for f in results["forecasts"].values() if "values" in f]
+        agreement = max(0, 100 - (np.std(final_vals)/np.mean(final_vals) * 200)) if len(final_vals) > 1 and np.mean(final_vals) != 0 else 70
+        model_conf = np.mean([f.get("confidence", 0.6) * 100 for f in results["forecasts"].values()])
         history_score = min(30, len(self.historical_data.get("eps", [])) * 2)
-
         return (agreement * 0.3 + model_conf * 0.4 + history_score * 0.3) / 100
 
 
@@ -1258,432 +940,270 @@ class FinancialForecaster:
 
 @dataclass
 class YahooFundamentalsProvider:
-    """Advanced Yahoo Finance fundamentals provider with full feature set."""
+    """Next-Gen Enterprise Yahoo Fundamentals Provider."""
 
     name: str = PROVIDER_NAME
 
     def __post_init__(self) -> None:
         self.timeout_sec = _timeout_sec()
 
-        # Concurrency controls
         self.semaphore = asyncio.Semaphore(_max_concurrency())
         self.rate_limiter = TokenBucket(_rate_limit())
-        self.circuit_breaker = SmartCircuitBreaker(
+        self.circuit_breaker = AdvancedCircuitBreaker(
             fail_threshold=_cb_fail_threshold(),
             cooldown_sec=_cb_cooldown_sec()
         )
         self.singleflight = SingleFlight()
+        
+        self.request_queue = RequestQueue(max_size=_queue_size())
 
-        # Caches
-        self.fund_cache = SmartCache(maxsize=5000, ttl=_fund_ttl_sec())
-        self.error_cache = SmartCache(maxsize=5000, ttl=_err_ttl_sec())
+        self.fund_cache = AdvancedCache(name="fund", maxsize=5000, ttl=_fund_ttl_sec(), use_redis=_enable_redis(), redis_url=_redis_url())
+        self.error_cache = AdvancedCache(name="error", maxsize=5000, ttl=_err_ttl_sec(), use_redis=_enable_redis(), redis_url=_redis_url())
 
-        # Metrics
-        self.metrics: Dict[str, Any] = {
-            "requests_total": 0,
-            "requests_success": 0,
-            "requests_failed": 0,
-            "cache_hits": 0,
-            "cache_misses": 0,
-            "rate_limit_waits": 0,
-            "circuit_breaker_blocks": 0,
-            "singleflight_dedup": 0,
-        }
-        self._metrics_lock = asyncio.Lock()
+        self._queue_processor_task = asyncio.create_task(self._process_queue())
 
         logger.info(
             f"YahooFundamentalsProvider v{PROVIDER_VERSION} initialized | "
-            f"yfinance={_HAS_YFINANCE} | pandas={_HAS_PANDAS} | "
-            f"timeout={self.timeout_sec}s | rate={_rate_limit()}/s | "
-            f"cb={_cb_fail_threshold()}/{_cb_cooldown_sec()}s"
+            f"yfinance={_HAS_YFINANCE} | rate={_rate_limit()}/s | cb={_cb_fail_threshold()}/{_cb_cooldown_sec()}s"
         )
 
-    async def _update_metric(self, name: str, inc: int = 1) -> None:
-        async with self._metrics_lock:
-            self.metrics[name] = self.metrics.get(name, 0) + inc
+    @_trace("yf_fund_request")
+    async def _request_metadata(self, symbol: str, priority: RequestPriority = RequestPriority.NORMAL) -> Dict[str, Any]:
+        """Queued execution wrapper."""
+        yf_fund_requests_total.inc()
+        if not await self.circuit_breaker.allow_request(): return {"error": "circuit_breaker_open"}
+
+        future = asyncio.Future()
+        if not await self.request_queue.put(RequestQueueItem(priority=priority, symbol=symbol, future=future)):
+            return {"error": "queue_full"}
+
+        return await future
+
+    async def _process_queue(self) -> None:
+        while True:
+            try:
+                item = await self.request_queue.get()
+                if item is None:
+                    await asyncio.sleep(0.1)
+                    continue
+                asyncio.create_task(self._process_queue_item(item))
+            except Exception as e:
+                logger.error(f"Queue processor error: {e}")
+                await asyncio.sleep(1)
+
+    async def _process_queue_item(self, item: RequestQueueItem) -> None:
+        try:
+            start = time.time()
+            await self.rate_limiter.wait_and_acquire()
+            async with self.semaphore:
+                # Execution with Async Timeout and Full Jitter Thread Blocking
+                result = await asyncio.wait_for(
+                    asyncio.to_thread(self._blocking_fetch, item.symbol), 
+                    timeout=self.timeout_sec
+                )
+            
+            if "error" in result:
+                await self.circuit_breaker.on_failure()
+            else:
+                await self.circuit_breaker.on_success()
+            
+            yf_fund_request_duration.observe(time.time() - start)
+            item.future.set_result(result)
+        except Exception as e:
+            await self.circuit_breaker.on_failure()
+            item.future.set_exception(e)
 
     def _extract_financial_series(self, ticker: Any) -> Dict[str, List[float]]:
-        """Extract historical financial series for forecasting."""
-        series: Dict[str, List[float]] = {
-            "eps": [],
-            "revenue": [],
-            "fcf": [],
-            "book_value": []
-        }
-
+        series: Dict[str, List[float]] = {"eps": [], "revenue": [], "fcf": [], "book_value": []}
         try:
-            # Get financials
-            if hasattr(ticker, "financials") and ticker.financials is not None:
-                financials = ticker.financials
-                if not financials.empty:
-                    # Revenue
-                    if "Total Revenue" in financials.index:
-                        rev = financials.loc["Total Revenue"].tolist()
-                        series["revenue"] = [safe_float(x) for x in rev if safe_float(x) is not None]
+            if hasattr(ticker, "financials") and ticker.financials is not None and not ticker.financials.empty:
+                if "Total Revenue" in ticker.financials.index:
+                    series["revenue"] = [f for f in (safe_float(x) for x in ticker.financials.loc["Total Revenue"].tolist()) if f is not None]
 
-                    # Net Income (for EPS calculation)
-                    if "Net Income" in financials.index:
-                        net_income = financials.loc["Net Income"].tolist()
-                        net_income = [safe_float(x) for x in net_income if safe_float(x) is not None]
-
-            # Get quarterly earnings for EPS history
             if hasattr(ticker, "earnings_dates") and ticker.earnings_dates is not None:
-                earnings = ticker.earnings_dates
-                if hasattr(earnings, "eps") and earnings.eps is not None:
-                    eps_values = earnings.eps.tolist()
-                    series["eps"] = [safe_float(x) for x in eps_values if safe_float(x) is not None]
+                if hasattr(ticker.earnings_dates, "eps") and ticker.earnings_dates.eps is not None:
+                    series["eps"] = [f for f in (safe_float(x) for x in ticker.earnings_dates.eps.tolist()) if f is not None]
 
-            # Get cashflow for FCF
-            if hasattr(ticker, "cashflow") and ticker.cashflow is not None:
-                cashflow = ticker.cashflow
-                if not cashflow.empty and "Free Cash Flow" in cashflow.index:
-                    fcf = cashflow.loc["Free Cash Flow"].tolist()
-                    series["fcf"] = [safe_float(x) for x in fcf if safe_float(x) is not None]
+            if hasattr(ticker, "cashflow") and ticker.cashflow is not None and not ticker.cashflow.empty:
+                if "Free Cash Flow" in ticker.cashflow.index:
+                    series["fcf"] = [f for f in (safe_float(x) for x in ticker.cashflow.loc["Free Cash Flow"].tolist()) if f is not None]
 
-            # Get balance sheet for book value
-            if hasattr(ticker, "balance_sheet") and ticker.balance_sheet is not None:
-                balance = ticker.balance_sheet
-                if not balance.empty and "Total Equity Gross Minority Interest" in balance.index:
-                    equity = balance.loc["Total Equity Gross Minority Interest"].tolist()
-                    series["book_value"] = [safe_float(x) for x in equity if safe_float(x) is not None]
+            if hasattr(ticker, "balance_sheet") and ticker.balance_sheet is not None and not ticker.balance_sheet.empty:
+                if "Total Equity Gross Minority Interest" in ticker.balance_sheet.index:
+                    series["book_value"] = [f for f in (safe_float(x) for x in ticker.balance_sheet.loc["Total Equity Gross Minority Interest"].tolist()) if f is not None]
 
         except Exception as e:
             logger.debug(f"Error extracting financial series: {e}")
-
         return series
 
     def _blocking_fetch(self, symbol: str) -> Dict[str, Any]:
-        """Blocking fetch function to run in thread."""
-        if not _HAS_YFINANCE or yf is None:
-            return {"error": "yfinance not installed"}
+        """Blocking yfinance fetch with Full Jitter Retry."""
+        if not _HAS_YFINANCE or yf is None: return {"error": "yfinance not installed"}
 
-        try:
-            ticker = yf.Ticker(symbol)
-
-            # Primary: info dict
-            info = {}
+        last_err = None
+        for attempt in range(4):
             try:
+                ticker = yf.Ticker(symbol)
                 info = ticker.info or {}
-            except Exception as e:
-                info = {"_info_error": str(e)}
+                
+                fast_price = None
+                try:
+                    fi = getattr(ticker, "fast_info", None)
+                    if fi: fast_price = getattr(fi, "last_price", None) or fi.get("last_price", None)
+                except Exception: pass
 
-            # Fast info for price fallback
-            fast_price = None
-            try:
-                fi = getattr(ticker, "fast_info", None)
-                if fi:
-                    fast_price = getattr(fi, "last_price", None) or fi.get("last_price", None)
-            except Exception:
-                pass
+                series = self._extract_financial_series(ticker)
+                metrics = FinancialMetrics()
 
-            # Extract financial series for forecasting
-            series = self._extract_financial_series(ticker)
+                metrics.name = safe_str(info.get("longName") or info.get("shortName"))
+                metrics.sector = safe_str(info.get("sector"))
+                metrics.industry = safe_str(info.get("industry"))
+                metrics.market_cap = safe_float(info.get("marketCap"))
+                metrics.enterprise_value = safe_float(info.get("enterpriseValue"))
+                metrics.beta = safe_float(info.get("beta"))
+                metrics.pe_ttm = safe_float(info.get("trailingPE"))
+                metrics.forward_pe = safe_float(info.get("forwardPE"))
+                metrics.ps_ttm = safe_float(info.get("priceToSalesTrailing12Months"))
+                metrics.pb_ttm = safe_float(info.get("priceToBook"))
+                metrics.pfcf_ttm = safe_float(info.get("priceToFreeCashFlow"))
+                metrics.gross_margin = as_percent(info.get("grossMargins"))
+                metrics.operating_margin = as_percent(info.get("operatingMargins"))
+                metrics.net_margin = as_percent(info.get("profitMargins"))
+                metrics.roe = as_percent(info.get("returnOnEquity"))
+                metrics.roa = as_percent(info.get("returnOnAssets"))
+                metrics.revenue_growth_yoy = as_percent(info.get("revenueGrowth"))
+                metrics.earnings_growth_yoy = as_percent(info.get("earningsGrowth"))
+                metrics.eps_ttm = safe_float(info.get("trailingEps"))
+                metrics.forward_eps = safe_float(info.get("forwardEps"))
+                metrics.dividend_yield = as_percent(info.get("dividendYield"))
+                metrics.dividend_rate = safe_float(info.get("dividendRate"))
+                metrics.payout_ratio = as_percent(info.get("payoutRatio"))
+                metrics.target_mean = safe_float(info.get("targetMeanPrice"))
+                metrics.target_high = safe_float(info.get("targetHighPrice"))
+                metrics.target_low = safe_float(info.get("targetLowPrice"))
+                metrics.recommendation = map_recommendation(info.get("recommendationKey"))
+                metrics.analyst_count = safe_int(info.get("numberOfAnalystOpinions"))
+                metrics.current_ratio = safe_float(info.get("currentRatio"))
+                metrics.quick_ratio = safe_float(info.get("quickRatio"))
+                metrics.debt_to_equity = safe_float(info.get("debtToEquity"))
+                metrics.operating_cf = safe_float(info.get("operatingCashflow"))
+                metrics.free_cashflow = safe_float(info.get("freeCashflow"))
+                metrics.fcf_yield = as_percent(info.get("freeCashFlowYield"))
+                metrics.short_ratio = safe_float(info.get("shortRatio"))
+                metrics.short_percent = as_percent(info.get("shortPercentOfFloat"))
 
-            # Build financial metrics
-            metrics = FinancialMetrics()
+                current_price = safe_float(info.get("currentPrice")) or safe_float(info.get("regularMarketPrice")) or safe_float(fast_price)
 
-            # Identity
-            metrics.name = safe_str(info.get("longName") or info.get("shortName"))
-            metrics.sector = safe_str(info.get("sector"))
-            metrics.sector = safe_str(info.get("sector"))
-            metrics.industry = safe_str(info.get("industry"))
+                out: Dict[str, Any] = {
+                    "requested_symbol": symbol, "symbol": symbol, "provider_symbol": symbol,
+                    "name": metrics.name, "sector": metrics.sector, "industry": metrics.industry, "sub_sector": metrics.industry,
+                    "currency": safe_str(info.get("currency") or info.get("financialCurrency") or "USD"),
+                    "market_cap": metrics.market_cap, "enterprise_value": metrics.enterprise_value,
+                    "shares_outstanding": safe_float(info.get("sharesOutstanding")),
+                    "pe_ttm": metrics.pe_ttm, "forward_pe": metrics.forward_pe, "ps_ttm": metrics.ps_ttm, "pb_ttm": metrics.pb_ttm,
+                    "eps_ttm": metrics.eps_ttm, "forward_eps": metrics.forward_eps, "book_value": safe_float(info.get("bookValue")),
+                    "beta": metrics.beta, "gross_margin": metrics.gross_margin, "operating_margin": metrics.operating_margin,
+                    "net_margin": metrics.net_margin, "profit_margin": metrics.net_margin, "roe": metrics.roe, "roa": metrics.roa,
+                    "revenue_growth": metrics.revenue_growth_yoy, "earnings_growth": metrics.earnings_growth_yoy,
+                    "current_ratio": metrics.current_ratio, "quick_ratio": metrics.quick_ratio, "debt_to_equity": metrics.debt_to_equity,
+                    "operating_cashflow": metrics.operating_cf, "free_cashflow": metrics.free_cashflow, "fcf_yield": metrics.fcf_yield,
+                    "dividend_yield": metrics.dividend_yield, "dividend_rate": metrics.dividend_rate, "payout_ratio": metrics.payout_ratio,
+                    "target_mean_price": metrics.target_mean, "target_high_price": metrics.target_high, "target_low_price": metrics.target_low,
+                    "recommendation": metrics.recommendation, "analyst_count": metrics.analyst_count,
+                    "short_ratio": metrics.short_ratio, "short_percent": metrics.short_percent, "current_price": current_price,
+                    "provider": PROVIDER_NAME, "data_source": PROVIDER_NAME, "provider_version": PROVIDER_VERSION,
+                    "last_updated_utc": _utc_iso(), "last_updated_riyadh": _riyadh_iso()
+                }
 
-            # Market data
-            metrics.market_cap = safe_float(info.get("marketCap"))
-            metrics.enterprise_value = safe_float(info.get("enterpriseValue"))
-            metrics.beta = safe_float(info.get("beta"))
-
-            # Valuation ratios
-            metrics.pe_ttm = safe_float(info.get("trailingPE"))
-            metrics.forward_pe = safe_float(info.get("forwardPE"))
-            metrics.ps_ttm = safe_float(info.get("priceToSalesTrailing12Months"))
-            metrics.pb_ttm = safe_float(info.get("priceToBook"))
-            metrics.pfcf_ttm = safe_float(info.get("priceToFreeCashFlow"))
-
-            # Profitability
-            metrics.gross_margin = as_percent(info.get("grossMargins"))
-            metrics.operating_margin = as_percent(info.get("operatingMargins"))
-            metrics.net_margin = as_percent(info.get("profitMargins"))
-            metrics.roe = as_percent(info.get("returnOnEquity"))
-            metrics.roa = as_percent(info.get("returnOnAssets"))
-            metrics.roce = as_percent(info.get("returnOnCapital"))
-
-            # Growth
-            metrics.revenue_growth_yoy = as_percent(info.get("revenueGrowth"))
-            metrics.earnings_growth_yoy = as_percent(info.get("earningsGrowth"))
-
-            # Per share
-            metrics.eps_ttm = safe_float(info.get("trailingEps"))
-            metrics.forward_eps = safe_float(info.get("forwardEps"))
-
-            # Dividends
-            metrics.dividend_yield = as_percent(info.get("dividendYield"))
-            metrics.dividend_rate = safe_float(info.get("dividendRate"))
-            metrics.payout_ratio = as_percent(info.get("payoutRatio"))
-
-            # Analyst targets
-            metrics.target_mean = safe_float(info.get("targetMeanPrice"))
-            metrics.target_high = safe_float(info.get("targetHighPrice"))
-            metrics.target_low = safe_float(info.get("targetLowPrice"))
-            metrics.recommendation = map_recommendation(info.get("recommendationKey"))
-            metrics.analyst_count = safe_int(info.get("numberOfAnalystOpinions"))
-
-            # Balance sheet items
-            metrics.current_ratio = safe_float(info.get("currentRatio"))
-            metrics.quick_ratio = safe_float(info.get("quickRatio"))
-            metrics.debt_to_equity = safe_float(info.get("debtToEquity"))
-            metrics.interest_coverage = safe_float(info.get("interestCoverage"))
-
-            # Cash flow
-            metrics.operating_cf = safe_float(info.get("operatingCashflow"))
-            metrics.free_cashflow = safe_float(info.get("freeCashflow"))
-            metrics.fcf_yield = as_percent(info.get("freeCashFlowYield"))
-
-            # Risk metrics
-            metrics.short_ratio = safe_float(info.get("shortRatio"))
-            metrics.short_percent = as_percent(info.get("shortPercentOfFloat"))
-
-            # Current price
-            current_price = (
-                safe_float(info.get("currentPrice")) or
-                safe_float(info.get("regularMarketPrice")) or
-                safe_float(fast_price)
-            )
-
-            # Build output dictionary
-            out: Dict[str, Any] = {
-                "requested_symbol": symbol,
-                "symbol": symbol,
-                "provider_symbol": symbol,
-                "name": metrics.name,
-                "sector": metrics.sector,
-                "industry": metrics.industry,
-                "sub_sector": metrics.industry,  # Alias for dashboard
-                "market": safe_str(info.get("market")),
-                "currency": safe_str(info.get("currency") or info.get("financialCurrency") or "USD"),
-                "exchange": safe_str(info.get("exchange")),
-                "country": safe_str(info.get("country")),
-
-                "market_cap": metrics.market_cap,
-                "enterprise_value": metrics.enterprise_value,
-                "shares_outstanding": safe_float(info.get("sharesOutstanding")),
-                "pe_ttm": metrics.pe_ttm,
-                "forward_pe": metrics.forward_pe,
-                "peg_ratio": safe_float(info.get("pegRatio")),
-                "ps_ttm": metrics.ps_ttm,
-                "pb_ttm": metrics.pb_ttm,
-                "pfcf_ttm": metrics.pfcf_ttm,
-
-                "eps_ttm": metrics.eps_ttm,
-                "forward_eps": metrics.forward_eps,
-                "book_value": safe_float(info.get("bookValue")),
-                "beta": metrics.beta,
-
-                "gross_margin": metrics.gross_margin,
-                "operating_margin": metrics.operating_margin,
-                "net_margin": metrics.net_margin,
-                "profit_margin": metrics.net_margin,  # Alias
-                "roe": metrics.roe,
-                "roa": metrics.roa,
-                "roce": metrics.roce,
-
-                "revenue_growth": metrics.revenue_growth_yoy,
-                "earnings_growth": metrics.earnings_growth_yoy,
-                "fcf_growth": None,  # Will calculate from series
-
-                "current_ratio": metrics.current_ratio,
-                "quick_ratio": metrics.quick_ratio,
-                "debt_to_equity": metrics.debt_to_equity,
-                "interest_coverage": metrics.interest_coverage,
-
-                "operating_cashflow": metrics.operating_cf,
-                "free_cashflow": metrics.free_cashflow,
-                "fcf_yield": metrics.fcf_yield,
-
-                "dividend_yield": metrics.dividend_yield,
-                "dividend_rate": metrics.dividend_rate,
-                "payout_ratio": metrics.payout_ratio,
-
-                "target_mean_price": metrics.target_mean,
-                "target_high_price": metrics.target_high,
-                "target_low_price": metrics.target_low,
-                "recommendation": metrics.recommendation,
-                "analyst_count": metrics.analyst_count,
-
-                "short_ratio": metrics.short_ratio,
-                "short_percent": metrics.short_percent,
-
-                "current_price": current_price,
-                "provider": PROVIDER_NAME,
-                "data_source": PROVIDER_NAME,
-                "provider_version": PROVIDER_VERSION,
-                "last_updated_utc": _utc_iso(),
-                "last_updated_riyadh": _riyadh_iso(),
-            }
-
-            # Calculate additional metrics
-
-            # 1. Upside based on analyst target
-            if current_price and current_price > 0 and metrics.target_mean and metrics.target_mean > 0:
-                upside = ((metrics.target_mean / current_price) - 1) * 100
-                out["upside_percent"] = float(upside)
-                out["forecast_price_12m"] = float(metrics.target_mean)
-                out["expected_roi_12m"] = float(upside)
-
-                # Confidence based on analyst count
-                if metrics.analyst_count and metrics.analyst_count > 0:
-                    conf = 0.6 + (math.log(metrics.analyst_count + 1) * 0.05)
-                    out["forecast_confidence"] = float(min(0.95, conf))
-                    out["confidence_score"] = float(min(95, conf * 100))
-                else:
-                    out["forecast_confidence"] = 0.5
-                    out["confidence_score"] = 50.0
-
-                out["forecast_method"] = "analyst_consensus"
-
-            # 2. Graham Number (intrinsic value)
-            if metrics.eps_ttm and metrics.book_value:
-                graham = FinancialAnalyzer.calculate_graham_number(
-                    metrics.eps_ttm,
-                    metrics.book_value
-                )
-                out["graham_number"] = float(graham)
-                if current_price and current_price > 0:
-                    out["graham_upside"] = float(((graham / current_price) - 1) * 100)
-
-            # 3. DCF Value (if FCF available)
-            if _enable_dcf() and series["fcf"] and len(series["fcf"]) >= 3:
-                latest_fcf = series["fcf"][-1]
-                if latest_fcf > 0:
-                    # Estimate growth rate from history
-                    if len(series["fcf"]) >= 5:
-                        fcf_cagr = (series["fcf"][-1] / series["fcf"][0]) ** (1 / len(series["fcf"])) - 1
-                        growth_rate = max(0.02, min(0.15, fcf_cagr))
+                if current_price and current_price > 0 and metrics.target_mean and metrics.target_mean > 0:
+                    upside = ((metrics.target_mean / current_price) - 1) * 100
+                    out["upside_percent"] = float(upside)
+                    out["forecast_price_12m"] = float(metrics.target_mean)
+                    out["expected_roi_12m"] = float(upside)
+                    
+                    if metrics.analyst_count and metrics.analyst_count > 0:
+                        conf = 0.6 + (math.log(metrics.analyst_count + 1) * 0.05)
+                        out["forecast_confidence"] = float(min(0.95, conf))
+                        out["confidence_score"] = float(min(95, conf * 100))
                     else:
-                        growth_rate = 0.05  # Default
+                        out["forecast_confidence"], out["confidence_score"] = 0.5, 50.0
+                    out["forecast_method"] = "analyst_consensus"
 
-                    dcf_value = FinancialAnalyzer.calculate_dcf_value(
-                        fcf=latest_fcf,
-                        growth_rate=growth_rate,
-                        terminal_growth=0.03,
-                        discount_rate=0.10
-                    )
+                if metrics.eps_ttm and out.get("book_value"):
+                    graham = FinancialAnalyzer.calculate_graham_number(metrics.eps_ttm, out["book_value"])
+                    out["graham_number"] = float(graham)
+                    if current_price and current_price > 0: out["graham_upside"] = float(((graham / current_price) - 1) * 100)
 
-                    # Convert to per-share value
-                    shares = metrics.shares_outstanding or safe_float(info.get("sharesOutstanding"))
-                    if shares and shares > 0:
-                        dcf_per_share = dcf_value / shares
-                        out["dcf_value"] = float(dcf_per_share)
-                        if current_price and current_price > 0:
-                            out["dcf_upside"] = float(((dcf_per_share / current_price) - 1) * 100)
+                if _enable_dcf() and series["fcf"] and len(series["fcf"]) >= 3:
+                    latest_fcf = series["fcf"][-1]
+                    if latest_fcf > 0:
+                        fcf_cagr = (series["fcf"][-1] / series["fcf"][0]) ** (1 / len(series["fcf"])) - 1 if len(series["fcf"]) >= 5 else 0.05
+                        dcf_val = FinancialAnalyzer.calculate_dcf_value(latest_fcf, max(0.02, min(0.15, fcf_cagr)), beta=metrics.beta)
+                        shares = metrics.shares_outstanding or safe_float(info.get("sharesOutstanding"))
+                        if shares and shares > 0:
+                            dcf_ps = dcf_val / shares
+                            out["dcf_value"] = float(dcf_ps)
+                            if current_price and current_price > 0: out["dcf_upside"] = float(((dcf_ps / current_price) - 1) * 100)
 
-            # 4. Altman Z-Score
-            balance_sheet = {}
-            try:
-                bs = ticker.balance_sheet
-                if bs is not None and not bs.empty:
-                    # Extract needed fields
-                    if "Total Assets" in bs.index:
-                        balance_sheet["total_assets"] = safe_float(bs.loc["Total Assets"].iloc[0])
-                    if "Total Liabilities Net Minority Interest" in bs.index:
-                        balance_sheet["total_liabilities"] = safe_float(bs.loc["Total Liabilities Net Minority Interest"].iloc[0])
-                    if "Retained Earnings" in bs.index:
-                        balance_sheet["retained_earnings"] = safe_float(bs.loc["Retained Earnings"].iloc[0])
-                    if "Working Capital" in bs.index:
-                        balance_sheet["working_capital"] = safe_float(bs.loc["Working Capital"].iloc[0])
-            except Exception:
-                pass
+                bs = {}
+                try:
+                    if ticker.balance_sheet is not None and not ticker.balance_sheet.empty:
+                        for k, k2 in [("Total Assets", "total_assets"), ("Total Liabilities Net Minority Interest", "total_liabilities"), ("Retained Earnings", "retained_earnings"), ("Working Capital", "working_capital")]:
+                            if k in ticker.balance_sheet.index: bs[k2] = safe_float(ticker.balance_sheet.loc[k].iloc[0])
+                    if ticker.income_stmt is not None and not ticker.income_stmt.empty:
+                        if "EBIT" in ticker.income_stmt.index: bs["ebit"] = safe_float(ticker.income_stmt.loc["EBIT"].iloc[0])
+                        if "Total Revenue" in ticker.income_stmt.index: bs["total_revenue"] = safe_float(ticker.income_stmt.loc["Total Revenue"].iloc[0])
+                except Exception: pass
 
-            # Add income statement items
-            try:
-                inc = ticker.income_stmt
-                if inc is not None and not inc.empty:
-                    if "EBIT" in inc.index:
-                        balance_sheet["ebit"] = safe_float(inc.loc["EBIT"].iloc[0])
-                    if "Total Revenue" in inc.index:
-                        balance_sheet["total_revenue"] = safe_float(inc.loc["Total Revenue"].iloc[0])
-            except Exception:
-                pass
+                bs["market_cap"] = metrics.market_cap
+                z_score = FinancialAnalyzer.calculate_altman_z_score(bs)
+                if z_score is not None:
+                    out["altman_z_score"] = float(z_score)
+                    out["bankruptcy_risk"] = "low" if z_score > 2.99 else "medium" if z_score > 1.81 else "high"
 
-            balance_sheet["market_cap"] = metrics.market_cap
+                out["growth_stage"] = FinancialAnalyzer.determine_growth_stage({"revenue_growth": metrics.revenue_growth_yoy, "net_margin": metrics.net_margin, "roe": metrics.roe}).value
+                out["growth_score"] = FinancialAnalyzer.calculate_growth_score({"revenue_growth": metrics.revenue_growth_yoy, "earnings_growth": metrics.earnings_growth_yoy, "roe": metrics.roe, "net_margin": metrics.net_margin, "upside_percent": out.get("upside_percent")})
 
-            z_score = FinancialAnalyzer.calculate_altman_z_score(balance_sheet)
-            if z_score is not None:
-                out["altman_z_score"] = float(z_score)
-                if z_score > 2.99:
-                    out["bankruptcy_risk"] = "low"
-                elif z_score > 1.81:
-                    out["bankruptcy_risk"] = "medium"
-                else:
-                    out["bankruptcy_risk"] = "high"
+                hs = 0
+                if metrics.current_ratio and metrics.current_ratio > 1.5: hs += 25
+                if metrics.debt_to_equity and metrics.debt_to_equity < 1.0: hs += 25
+                if metrics.interest_coverage and metrics.interest_coverage > 3: hs += 25
+                if metrics.free_cashflow and metrics.free_cashflow > 0: hs += 25
+                out["financial_health"] = FinancialHealth.EXCELLENT.value if hs >= 80 else FinancialHealth.GOOD.value if hs >= 60 else FinancialHealth.FAIR.value if hs >= 40 else FinancialHealth.POOR.value if hs >= 20 else FinancialHealth.CRITICAL.value
+                out["financial_health_score"] = hs
 
-            # 5. Growth stage and score
-            growth_metrics = {
-                "revenue_growth": metrics.revenue_growth_yoy,
-                "net_margin": metrics.net_margin,
-                "roe": metrics.roe,
-                "pe_ttm": metrics.pe_ttm,
-                "upside_percent": out.get("upside_percent")
-            }
-            growth_stage = FinancialAnalyzer.determine_growth_stage(growth_metrics)
-            out["growth_stage"] = growth_stage.value
+                if _enable_ml_forecast() and series["eps"] and len(series["eps"]) >= 4:
+                    fc = EnsembleForecaster(series, enable_ml=True).forecast_earnings(years=3)
+                    if fc.get("forecast_available"):
+                        out["earnings_forecast_available"] = True
+                        out["earnings_forecast_confidence"] = fc["confidence"]
+                        if "ensemble" in fc:
+                            out["eps_forecast_1y"] = fc["ensemble"]["values"][0] if len(fc["ensemble"]["values"]) > 0 else None
+                            out["eps_forecast_2y"] = fc["ensemble"]["values"][1] if len(fc["ensemble"]["values"]) > 1 else None
+                            out["eps_forecast_3y"] = fc["ensemble"]["values"][2] if len(fc["ensemble"]["values"]) > 2 else None
+                            out["eps_cagr_forecast"] = fc["ensemble"]["cagr"]
+                            out["forecast_models"] = fc["models_used"]
 
-            growth_score = FinancialAnalyzer.calculate_growth_score(growth_metrics)
-            out["growth_score"] = growth_score
+                # ML Anomaly Detection on Fundamental Series
+                if SKLEARN_AVAILABLE and series["revenue"] and len(series["revenue"]) >= 5:
+                    try:
+                        iso = IsolationForest(contamination=0.1, random_state=42)
+                        rev_np = np.array(series["revenue"]).reshape(-1, 1)
+                        preds = iso.fit_predict(rev_np)
+                        if preds[-1] == -1: out["fundamental_anomaly"] = True
+                    except Exception: pass
 
-            # 6. Financial health classification
-            health_score = 0
-            if metrics.current_ratio and metrics.current_ratio > 1.5:
-                health_score += 25
-            if metrics.debt_to_equity and metrics.debt_to_equity < 1.0:
-                health_score += 25
-            if metrics.interest_coverage and metrics.interest_coverage > 3:
-                health_score += 25
-            if metrics.free_cashflow and metrics.free_cashflow > 0:
-                health_score += 25
+                quality_category, quality_score = data_quality_score(out)
+                out["data_quality"], out["data_quality_score"] = quality_category.value, quality_score
+                out["forecast_updated_utc"], out["forecast_updated_riyadh"] = _utc_iso(), _riyadh_iso()
 
-            if health_score >= 80:
-                out["financial_health"] = FinancialHealth.EXCELLENT.value
-            elif health_score >= 60:
-                out["financial_health"] = FinancialHealth.GOOD.value
-            elif health_score >= 40:
-                out["financial_health"] = FinancialHealth.FAIR.value
-            elif health_score >= 20:
-                out["financial_health"] = FinancialHealth.POOR.value
-            else:
-                out["financial_health"] = FinancialHealth.CRITICAL.value
+                return clean_patch(out)
+            except Exception as e:
+                last_err = e
+                base_wait = 2 ** attempt
+                time.sleep(min(10.0, base_wait + random.uniform(0, base_wait)))
 
-            out["financial_health_score"] = health_score
-
-            # 7. Earnings forecast (if we have history)
-            if _enable_ml_forecast() and series["eps"] and len(series["eps"]) >= 4:
-                forecaster = FinancialForecaster(series, enable_ml=True)
-                forecast = forecaster.forecast_earnings(years=3)
-
-                if forecast.get("forecast_available"):
-                    out["earnings_forecast_available"] = True
-                    out["earnings_forecast_confidence"] = forecast["confidence"]
-
-                    if "ensemble" in forecast:
-                        out["eps_forecast_1y"] = forecast["ensemble"]["values"][0] if len(forecast["ensemble"]["values"]) > 0 else None
-                        out["eps_forecast_2y"] = forecast["ensemble"]["values"][1] if len(forecast["ensemble"]["values"]) > 1 else None
-                        out["eps_forecast_3y"] = forecast["ensemble"]["values"][2] if len(forecast["ensemble"]["values"]) > 2 else None
-                        out["eps_cagr_forecast"] = forecast["ensemble"]["cagr"]
-                        out["forecast_models"] = forecast["models_used"]
-
-            # 8. Data quality
-            quality_category, quality_score = data_quality_score(out)
-            out["data_quality"] = quality_category.value
-            out["data_quality_score"] = quality_score
-
-            # 9. Forecast timestamps
-            out["forecast_updated_utc"] = _utc_iso()
-            out["forecast_updated_riyadh"] = _riyadh_iso()
-
-            return clean_patch(out)
-
-        except Exception as e:
-            return {"error": f"fetch failed: {e.__class__.__name__}: {str(e)}"}
+        return {"error": f"fetch failed after retries: {last_err.__class__.__name__} - {str(last_err)}"}
 
     async def fetch_fundamentals_patch(
         self,
@@ -1693,88 +1213,38 @@ class YahooFundamentalsProvider:
         **kwargs: Any
     ) -> Dict[str, Any]:
         """Fetch comprehensive fundamentals data."""
-        if not _configured():
-            return {} if _HAS_YFINANCE else ({} if not _emit_warnings() else {"_warn": "yfinance not installed"})
+        if not _configured(): return {} if _HAS_YFINANCE else ({} if not _emit_warnings() else {"_warn": "yfinance not installed"})
 
-        # Normalize symbol
         norm_symbol = normalize_symbol(symbol)
-        if not norm_symbol:
-            return {} if not _emit_warnings() else {"_warn": "invalid_symbol"}
+        if not norm_symbol: return {} if not _emit_warnings() else {"_warn": "invalid_symbol"}
 
-        cache_key = f"yf:{norm_symbol}"
+        cache_key = f"yffund:{norm_symbol}"
 
-        # Check error cache
-        if await self.error_cache.get(cache_key):
-            return {} if not _emit_warnings() else {"_warn": "temporarily_backed_off"}
+        if await self.error_cache.get(cache_key): return {} if not _emit_warnings() else {"_warn": "temporarily_backed_off"}
 
-        # Check cache
         cached = await self.fund_cache.get(cache_key)
-        if cached:
-            await self._update_metric("cache_hits")
-            if debug:
-                logger.info(f"Yahoo fundamentals cache hit for {norm_symbol}")
-            return dict(cached)
-
-        await self._update_metric("cache_misses")
-
-        # Circuit breaker check
-        if not await self.circuit_breaker.allow_request():
-            await self._update_metric("circuit_breaker_blocks")
-            return {} if not _emit_warnings() else {"_warn": "circuit_breaker_open"}
+        if cached: return dict(cached)
 
         async def _fetch():
-            async with self.semaphore:
-                await self.rate_limiter.wait_and_acquire()
-
-                try:
-                    # Run blocking fetch in thread
-                    result = await asyncio.wait_for(
-                        asyncio.to_thread(self._blocking_fetch, norm_symbol),
-                        timeout=self.timeout_sec
-                    )
-
-                    if "error" in result:
-                        await self.error_cache.set(cache_key, True)
-                        await self.circuit_breaker.on_failure()
-                        await self._update_metric("requests_failed")
-                        return {} if not _emit_warnings() else {"_warn": result["error"]}
-
-                    # Cache successful result
-                    await self.fund_cache.set(cache_key, result)
-                    await self.circuit_breaker.on_success()
-                    await self._update_metric("requests_success")
-
-                    if debug:
-                        logger.info(f"Yahoo fundamentals fetched {norm_symbol}: {result.get('name')}")
-
-                    return result
-
-                except asyncio.TimeoutError:
-                    await self.error_cache.set(cache_key, True)
-                    await self.circuit_breaker.on_failure()
-                    await self._update_metric("requests_failed")
-                    return {} if not _emit_warnings() else {"_warn": "timeout"}
-
-                except Exception as e:
-                    await self.error_cache.set(cache_key, True)
-                    await self.circuit_breaker.on_failure()
-                    await self._update_metric("requests_failed")
-                    return {} if not _emit_warnings() else {"_warn": f"exception: {e.__class__.__name__}"}
+            res = await self._request_metadata(norm_symbol)
+            if "error" in res:
+                await self.error_cache.set(cache_key, True)
+                return {} if not _emit_warnings() else {"_warn": res["error"]}
+            
+            await self.fund_cache.set(cache_key, res)
+            return res
 
         return await self.singleflight.run(cache_key, _fetch)
 
     async def get_metrics(self) -> Dict[str, Any]:
         """Get client metrics."""
-        async with self._metrics_lock:
-            metrics = dict(self.metrics)
-
-        metrics["circuit_breaker"] = self.circuit_breaker.get_stats()
-        metrics["cache_sizes"] = {
-            "fund": await self.fund_cache.size(),
-            "error": await self.error_cache.size(),
+        return {
+            "circuit_breaker": self.circuit_breaker.get_stats(),
+            "cache_sizes": {
+                "fund": await self.fund_cache.size(),
+                "error": await self.error_cache.size(),
+            }
         }
-
-        return metrics
 
 
 # ============================================================================
@@ -1796,7 +1266,7 @@ async def get_provider() -> YahooFundamentalsProvider:
 
 
 async def close_provider() -> None:
-    """Close provider (no-op for yfinance)."""
+    """Close provider."""
     global _PROVIDER_INSTANCE
     _PROVIDER_INSTANCE = None
 
@@ -1811,7 +1281,6 @@ async def fetch_fundamentals_patch(
     *args: Any,
     **kwargs: Any
 ) -> Dict[str, Any]:
-    """Primary engine entry: fetch fundamentals data."""
     provider = await get_provider()
     return await provider.fetch_fundamentals_patch(symbol, debug=debug)
 
@@ -1822,18 +1291,15 @@ async def fetch_enriched_quote_patch(
     *args: Any,
     **kwargs: Any
 ) -> Dict[str, Any]:
-    """Compatibility alias for engines expecting enriched quote."""
     return await fetch_fundamentals_patch(symbol, debug=debug)
 
 
 async def get_client_metrics() -> Dict[str, Any]:
-    """Get client performance metrics."""
     provider = await get_provider()
     return await provider.get_metrics()
 
 
 async def aclose_yahoo_fundamentals_client() -> None:
-    """Close client (compatibility alias)."""
     await close_provider()
 
 
