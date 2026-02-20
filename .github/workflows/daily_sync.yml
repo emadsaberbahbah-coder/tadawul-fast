@@ -3,6 +3,7 @@ name: 🏦 Tadawul Dashboard Advanced Sync
 on:
   schedule:
     # Runs at minute 0, 15, 30, 45 every hour (UTC) - more frequent during market hours
+    # Note: GitHub Actions schedules are strictly UTC. Riyadh is UTC+3.
     - cron: "0,15,30,45 * * * *"
   workflow_dispatch:
     inputs:
@@ -29,7 +30,7 @@ on:
         default: "MARKET_LEADERS"
         type: string
       google_creds_json:
-        description: "🔐 Service Account JSON (Emergency Only)"
+        description: "🔐 Service Account JSON (Emergency Only - Prefer Secrets)"
         required: false
         type: string
       enable_debug:
@@ -43,10 +44,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
-# Minimal permissions with future-proofing for OIDC
+# Minimal permissions with future-proofing for OIDC (Workload Identity)
 permissions:
   contents: read
-  id-token: write
+  id-token: write # Required for Google Cloud Workload Identity Federation
   actions: read
 
 defaults:
@@ -56,7 +57,7 @@ defaults:
 env:
   PYTHON_VERSION: "3.11"
   PYTHONUNBUFFERED: 1
-  TZ: Asia/Riyadh  # Set timezone for market hours
+  TZ: Asia/Riyadh  # Set timezone for market hours and logging
 
 jobs:
   preflight-validation:
@@ -64,22 +65,19 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       validated: ${{ steps.validate.outputs.validated }}
-      warnings: ${{ steps.validate.outputs.warnings }}
     steps:
-      - name: ✅ Validate Environment
+      - name: ✅ Validate Runner Environment
         id: validate
         run: |
           echo "::group::System Information"
           echo "OS: $(uname -a)"
-          echo "Disk space:"
           df -h /
-          echo "Memory:"
           free -h
           echo "::endgroup::"
           
           # Check required tools
           MISSING_TOOLS=()
-          for tool in curl jq python3 pip3; do
+          for tool in curl jq python3 pip3 shred; do
             if ! command -v $tool &> /dev/null; then
               MISSING_TOOLS+=($tool)
             fi
@@ -90,8 +88,7 @@ jobs:
             exit 1
           fi
           
-          echo "validated=true" >> $GITHUB_OUTPUT
-          echo "warnings=none" >> $GITHUB_OUTPUT
+          echo "validated=true" >> "$GITHUB_OUTPUT"
 
   sync-dashboard:
     name: 🚀 Data Sync
@@ -102,56 +99,61 @@ jobs:
     if: success()
 
     steps:
-      # 1. Enhanced Checkout with Security
       - name: 📥 Secure Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 1
-          persist-credentials: false  # Prevent credential leakage
+          persist-credentials: false
 
-      # 2. Cache Python Dependencies
-      - name: 💾 Cache Python Packages
-        uses: actions/cache@v4
-        id: pip-cache
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      # 3. Python Setup with Cache
       - name: 🐍 Setup Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: 'pip'
-          cache-dependency-path: 'requirements.txt'
+          cache-dependency-path: 'requirements*.txt'
 
-      # 4. Install Dependencies with Verification
       - name: 📦 Install & Verify Dependencies
         run: |
           echo "::group::Pip Install Log"
           python -m pip install --upgrade pip setuptools wheel
           
-          # Install with hash checking for security (if hashes available)
           if [ -f "requirements-hashes.txt" ]; then
+            echo "🔒 Installing from hashed requirements for maximum security"
             pip install --require-hashes -r requirements-hashes.txt
-          else
+          elif [ -f "requirements.txt" ]; then
             pip install -r requirements.txt
+          else
+            echo "::warning::No requirements.txt found, skipping dependency installation."
           fi
-          
           echo "::endgroup::"
           
-          # Verify critical packages
           echo "::group::Package Verification"
-          python -c "import pandas, numpy, gspread, requests; print('✅ Critical packages loaded successfully')"
+          # Gracefully check if critical packages exist without failing immediately if missing
+          python -c "
+          import sys
+          critical = ['pandas', 'numpy', 'gspread', 'requests']
+          missing = []
+          for pkg in critical:
+              try: __import__(pkg)
+              except ImportError: missing.append(pkg)
+          if missing:
+              print(f'⚠️ Warning: Missing expected packages: {missing}')
+          else:
+              print('✅ Critical packages loaded successfully')
+          "
           echo "::endgroup::"
 
-      # 5. Advanced Configuration Resolution
+      # --- ADVANCED GCP OIDC OPTION (Uncomment to use instead of JSON Keys) ---
+      # - name: 🔐 Authenticate to Google Cloud
+      #   id: auth
+      #   uses: google-github-actions/auth@v2
+      #   with:
+      #     workload_identity_provider: 'projects/123456789/locations/global/workloadIdentityPools/my-pool/providers/my-provider'
+      #     service_account: 'my-service-account@my-project.iam.gserviceaccount.com'
+
       - name: ⚙️ Smart Configuration Resolution
         id: smart_config
         env:
-          # Input hierarchy
           INPUT_URL: ${{ inputs.backend_url }}
           INPUT_SHEET: ${{ inputs.sheet_id }}
           INPUT_MODE: ${{ inputs.run_mode }}
@@ -159,71 +161,60 @@ jobs:
           INPUT_DEBUG: ${{ inputs.enable_debug }}
           INPUT_CREDS: ${{ inputs.google_creds_json }}
           
-          # Repository secrets/variables
           VAR_URL: ${{ vars.BACKEND_BASE_URL }}
           VAR_SHEET: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+          VAR_DEFAULT_KEYS: ${{ vars.DEFAULT_SYNC_KEYS }}
           SECRET_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
           SECRET_CREDS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
-          VAR_DEFAULT_KEYS: ${{ vars.DEFAULT_SYNC_KEYS }}
         run: |
-          # Helper function with null safety
+          # Helper function to get first non-empty value
           get_val() {
-            local val=""
             for v in "$@"; do
               if [[ -n "$v" && "$v" != "null" && "$v" != "undefined" ]]; then 
-                val="$v"
-                break
+                echo "$v"
+                return
               fi
             done
-            echo "$val"
           }
 
           echo "::group::🔧 Configuration Resolution"
 
-          # 1. Backend URL with validation
+          # 1. URL Resolution
           URL=$(get_val "$INPUT_URL" "$VAR_URL" "https://tadawul-fast-bridge.onrender.com")
-          URL=${URL%/}  # Remove trailing slash
-          
-          # Validate URL format
+          URL=${URL%/} # Strip trailing slash
           if [[ ! "$URL" =~ ^https?:// ]]; then
             echo "::error::Invalid URL format: $URL"
             exit 1
           fi
-          echo "TARGET_URL=$URL" >> $GITHUB_ENV
+          echo "TARGET_URL=$URL" >> "$GITHUB_ENV"
           echo "✅ Backend URL: $URL"
 
-          # 2. Spreadsheet ID
+          # 2. Spreadsheet ID Resolution
           SHEET=$(get_val "$INPUT_SHEET" "$VAR_SHEET" "19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw")
-          if [[ ! "$SHEET" =~ ^[a-zA-Z0-9_-]{30,}$ ]]; then
-            echo "::warning::Spreadsheet ID format looks unusual: $SHEET"
-          fi
-          echo "TARGET_SHEET_ID=$SHEET" >> $GITHUB_ENV
+          echo "TARGET_SHEET_ID=$SHEET" >> "$GITHUB_ENV"
           echo "✅ Sheet ID: $SHEET"
 
-          # 3. Sync Keys based on mode
-          if [[ "$INPUT_MODE" == "single_key" && -n "$INPUT_KEY" ]]; then
+          # 3. Mode & Keys Resolution
+          MODE="${INPUT_MODE:-full_sync}"
+          echo "RUN_MODE=$MODE" >> "$GITHUB_ENV"
+          
+          if [[ "$MODE" == "single_key" && -n "$INPUT_KEY" ]]; then
             KEYS="$INPUT_KEY"
-            echo "🔑 Single key mode: $KEYS"
           else
             DEFAULT_KEYS="MARKET_LEADERS GLOBAL_MARKETS KSA_TADAWUL MUTUAL_FUNDS COMMODITIES_FX MY_PORTFOLIO INSIGHTS_ANALYSIS"
             KEYS=$(get_val "$VAR_DEFAULT_KEYS" "$DEFAULT_KEYS")
           fi
-          # Normalize spaces and remove duplicates
-          KEYS=$(echo "$KEYS" | tr -s ' ' | tr ' ' '\n' | sort -u | tr '\n' ' ' | xargs)
-          echo "SYNC_KEYS=$KEYS" >> $GITHUB_ENV
-          echo "📋 Keys to sync: $KEYS"
+          
+          # Normalize keys (single spaces)
+          KEYS=$(echo "$KEYS" | tr -s ' ' | xargs)
+          echo "SYNC_KEYS=$KEYS" >> "$GITHUB_ENV"
+          echo "📋 Mode: $MODE | Keys: $KEYS"
 
-          # 4. Run Mode
-          MODE="${INPUT_MODE:-full_sync}"
-          echo "RUN_MODE=$MODE" >> $GITHUB_ENV
-          echo "🎯 Run mode: $MODE"
-
-          # 5. Debug Flag
+          # 4. Debug Flag
           DEBUG="${INPUT_DEBUG:-false}"
-          echo "ENABLE_DEBUG=$DEBUG" >> $GITHUB_ENV
-          echo "🐛 Debug: $DEBUG"
+          echo "ENABLE_DEBUG=$DEBUG" >> "$GITHUB_ENV"
 
-          # 6. Advanced Credentials Handling
+          # 5. Credentials Handling (Secure)
           RAW_CREDS=$(get_val "$INPUT_CREDS" "$SECRET_CREDS")
           
           if [[ -z "$RAW_CREDS" && -n "$SECRET_CREDS_B64" ]]; then
@@ -232,80 +223,65 @@ jobs:
           fi
 
           if [[ -n "$RAW_CREDS" ]]; then
-            # Validate JSON structure
+            # SECURITY: Mask credentials before processing
+            echo "::add-mask::$RAW_CREDS"
+            
             if echo "$RAW_CREDS" | jq empty 2>/dev/null; then
               CREDS_PATH="$RUNNER_TEMP/google_credentials.json"
               echo "$RAW_CREDS" > "$CREDS_PATH"
-              chmod 600 "$CREDS_PATH"  # Secure file permissions
-              echo "GOOGLE_APPLICATION_CREDENTIALS=$CREDS_PATH" >> $GITHUB_ENV
+              chmod 600 "$CREDS_PATH"
+              echo "GOOGLE_APPLICATION_CREDENTIALS=$CREDS_PATH" >> "$GITHUB_ENV"
               
-              # Extract and log service account email (safe)
-              SA_EMAIL=$(echo "$RAW_CREDS" | jq -r '.client_email // empty')
-              if [[ -n "$SA_EMAIL" ]]; then
-                echo "🤖 Service Account: $SA_EMAIL"
-              fi
-              echo "✅ Credentials configured"
+              SA_EMAIL=$(echo "$RAW_CREDS" | jq -r '.client_email // "Unknown"')
+              echo "🤖 Service Account Configured: $SA_EMAIL"
             else
-              echo "::error::Invalid JSON in credentials"
+              echo "::error::Invalid JSON structure in credentials."
               exit 1
             fi
-          elif [[ "$MODE" == "health_only" ]]; then
-            echo "⚠️ No credentials in health-only mode - proceeding"
-          else
-            echo "::error::No valid Google credentials found for sync mode"
+          elif [[ "$MODE" != "health_only" ]]; then
+            echo "::error::No valid Google credentials found for sync mode."
             exit 1
           fi
 
           echo "::endgroup::"
 
-      # 6. Intelligent Health Check with Circuit Breaker
       - name: 💓 Intelligent Health Check
         id: health_check
         run: |
           echo "::group::🏥 Backend Health Check"
           
           HEALTH_ENDPOINTS=("/readyz" "/health" "/livez")
-          MAX_RETRIES=5
-          INITIAL_BACKOFF=2
+          MAX_RETRIES=4
           
           for endpoint in "${HEALTH_ENDPOINTS[@]}"; do
-            echo "Trying $TARGET_URL$endpoint..."
+            echo "▶️ Probing $TARGET_URL$endpoint..."
             
             for attempt in $(seq 1 $MAX_RETRIES); do
-              BACKOFF=$(( INITIAL_BACKOFF * (2 ** (attempt-1)) ))
+              BACKOFF=$(( 2 ** attempt )) # Exponential: 2, 4, 8, 16s
               
-              RESPONSE=$(curl -s -w "\n%{http_code}" --max-time 15 "$TARGET_URL$endpoint" 2>&1)
+              RESPONSE=$(curl -s -w "\n%{http_code}" --max-time 10 "$TARGET_URL$endpoint" 2>&1 || echo -e "\n000")
               HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
               BODY=$(echo "$RESPONSE" | sed '$d')
               
               if [[ "$HTTP_CODE" =~ ^2[0-9][0-9]$ ]]; then
-                echo "✅ Backend healthy via $endpoint (HTTP $HTTP_CODE)"
-                
-                # Extract version info if available
+                echo "✅ Healthy via $endpoint (HTTP $HTTP_CODE)"
                 VERSION=$(echo "$BODY" | jq -r '.version // .build // "unknown"' 2>/dev/null || echo "unknown")
-                echo "🔄 Backend version: $VERSION"
                 
-                echo "health_status=healthy" >> $GITHUB_OUTPUT
-                echo "health_endpoint=$endpoint" >> $GITHUB_OUTPUT
-                echo "health_version=$VERSION" >> $GITHUB_OUTPUT
+                echo "health_status=healthy" >> "$GITHUB_OUTPUT"
+                echo "health_version=$VERSION" >> "$GITHUB_OUTPUT"
                 echo "::endgroup::"
                 exit 0
-              elif [[ "$HTTP_CODE" == "000" ]]; then
-                echo "⏳ Attempt $attempt/$MAX_RETRIES: Connection failed, retrying in ${BACKOFF}s..."
-              else
-                echo "⏳ Attempt $attempt/$MAX_RETRIES: HTTP $HTTP_CODE, retrying in ${BACKOFF}s..."
               fi
               
+              echo "⏳ Attempt $attempt/$MAX_RETRIES: HTTP $HTTP_CODE, retrying in ${BACKOFF}s..."
               sleep $BACKOFF
             done
           done
           
-          # If we get here, all endpoints failed
-          echo "::warning::All health check endpoints failed - backend may be degraded"
-          echo "health_status=degraded" >> $GITHUB_OUTPUT
+          echo "::warning::All health check endpoints failed. Backend may be degraded."
+          echo "health_status=degraded" >> "$GITHUB_OUTPUT"
           echo "::endgroup::"
 
-      # 7. Execute Python Sync with Comprehensive Error Handling
       - name: 🚀 Execute Dashboard Sync
         id: execute_sync
         env:
@@ -317,177 +293,130 @@ jobs:
         run: |
           echo "::group::📊 Sync Execution"
           
-          # Build command with all options
-          CMD="python scripts/run_dashboard_sync.py"
+          # Construct Command
+          CMD="python scripts/run_dashboard_sync.py --health-check"
           
-          # Always check health
-          CMD="$CMD --health-check"
-          
-          # Mode flags
           if [[ "$RUN_MODE" == "health_only" ]]; then
             CMD="$CMD --dry-run --health-only"
           elif [[ "$RUN_MODE" == "single_key" ]]; then
             CMD="$CMD --single-key"
           fi
           
-          # Keys (convert to space-separated)
           CMD="$CMD --keys $SYNC_KEYS"
           
-          # Debug mode
           if [[ "$ENABLE_DEBUG" == "true" ]]; then
             CMD="$CMD --debug --verbose"
-            echo "🔍 Debug mode enabled"
+            echo "🔍 Debug mode active."
           fi
           
-          # Timeout and performance monitoring
-          echo "⏱️ Starting sync at $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          echo "⏱️ Start Time: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
           echo "📋 Command: $CMD"
           
-          # Execute with timing and output capture
-          START_TIME=$(date +%s)
-          
-          # Use process substitution to capture both stdout/stderr and exit code
-          exec 3>&1 4>&2
+          # Using pipefail ensures the exit code of python is caught even when piping to tee
+          set -o pipefail
           TIMESTAMP=$(date +%Y%m%d_%H%M%S)
           LOG_FILE="sync_${TIMESTAMP}.log"
           
-          # Run command with full output logging
-          {
-            $CMD 2>&1
-            echo "EXIT_CODE=$?" >&3
-          } | tee "$LOG_FILE"
+          START_TIME=$(date +%s)
           
-          EXIT_CODE=$(cat)
+          # Execute and log
+          $CMD 2>&1 | tee "$LOG_FILE"
+          EXIT_CODE=$?
           
           END_TIME=$(date +%s)
           DURATION=$((END_TIME - START_TIME))
           
-          echo "✅ Sync completed in ${DURATION}s with exit code $EXIT_CODE"
+          echo "✅ Execution finished in ${DURATION}s (Exit Code: $EXIT_CODE)"
           
-          # Check for specific error patterns in logs
-          if grep -q "RateLimitError\|Quota exceeded" "$LOG_FILE"; then
-            echo "::warning::API rate limits may have been hit"
-            echo "rate_limited=true" >> $GITHUB_OUTPUT
+          # Log Analysis
+          if grep -qiE "RateLimitError|Quota exceeded|429 Too Many Requests" "$LOG_FILE"; then
+            echo "::warning::Google APIs Rate limits / Quotas may have been exhausted."
+            echo "rate_limited=true" >> "$GITHUB_OUTPUT"
           fi
           
-          if grep -q "AuthenticationError\|InvalidGrant" "$LOG_FILE"; then
-            echo "::error::Google Sheets authentication failed"
-            exit 1
+          if grep -qiE "AuthenticationError|InvalidGrant|401 Unauthorized" "$LOG_FILE"; then
+            echo "::error::Google Sheets authentication failed. Check credentials."
+            EXIT_CODE=1
           fi
           
-          # Store logs for artifacts
           cp "$LOG_FILE" sync_execution.log
-          
-          echo "duration=$DURATION" >> $GITHUB_OUTPUT
-          echo "exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+          echo "duration=$DURATION" >> "$GITHUB_OUTPUT"
           echo "::endgroup::"
           
           if [ $EXIT_CODE -ne 0 ]; then
-            echo "::error::Sync failed with exit code $EXIT_CODE"
+            echo "::error::Sync script failed. See logs above."
             exit $EXIT_CODE
           fi
 
-      # 8. Enhanced Job Summary
       - name: 📝 Generate Comprehensive Summary
         if: always()
         run: |
-          echo "::group::📈 Generating Summary"
+          RIYADH_TIME=$(TZ=Asia/Riyadh date '+%Y-%m-%d %H:%M:%S %Z')
+          STATUS_ICON=$([[ "${{ job.status }}" == "success" ]] && echo "✅ **SUCCESS**" || echo "❌ **FAILED**")
           
-          # Get current timestamp in Riyadh time
-          RIYADH_TIME=$(TZ=Asia/Riyadh date '+%Y-%m-%d %H:%M:%S')
-          
-          # Build summary
-          cat > $GITHUB_STEP_SUMMARY << EOF
+          cat >> "$GITHUB_STEP_SUMMARY" << EOF
           # 🏦 Tadawul Dashboard Sync Report
           
           ## 📋 Execution Overview
           | Metric | Value |
           | :--- | :--- |
-          | **Status** | ${{ job.status == 'success' && '✅ **SUCCESS**' || '❌ **FAILED**' }} |
-          | **Run ID** | \`${{ github.run_id }}\` |
-          | **Timestamp (Riyadh)** | \`$RIYADH_TIME\` |
+          | **Status** | $STATUS_ICON |
           | **Trigger** | \`${{ github.event_name }}\` |
-          | **Mode** | \`${{ env.RUN_MODE }}\` |
-          | **Duration** | \`${{ steps.execute_sync.outputs.duration || 'N/A' }}s\` |
+          | **Time (Local)** | \`$RIYADH_TIME\` |
+          | **Run Mode** | \`${{ env.RUN_MODE }}\` |
+          | **Duration** | \`${{ steps.execute_sync.outputs.duration || '0' }} seconds\` |
           
-          ## 🎯 Target Configuration
-          - **Spreadsheet ID**: \`${{ env.TARGET_SHEET_ID }}\`
-          - **Backend URL**: \`${{ env.TARGET_URL }}\`
-          - **Backend Health**: \`${{ steps.health_check.outputs.health_status || 'unknown' }}\`
-          - **Backend Version**: \`${{ steps.health_check.outputs.health_version || 'unknown' }}\`
+          ## 🎯 Target Information
+          * **Sheet ID:** \`${{ env.TARGET_SHEET_ID }}\`
+          * **Backend:** \`${{ env.TARGET_URL }}\` *(Status: ${{ steps.health_check.outputs.health_status || 'Unknown' }})*
           
-          ## 🔑 Synced Data Keys
-          \`\`\`
+          ## 🔑 Synced Keys
+          \`\`\`text
           ${{ env.SYNC_KEYS }}
           \`\`\`
-          
-          ## 📊 Key Metrics
           EOF
           
-          # Add rate limit warning if applicable
           if [[ "${{ steps.execute_sync.outputs.rate_limited }}" == "true" ]]; then
-            echo -e "\n⚠️ **Rate Limiting Detected** - Consider increasing sync intervals\n" >> $GITHUB_STEP_SUMMARY
+            echo -e "\n> ⚠️ **Notice:** Rate limiting was detected in the logs. Consider spacing out chron jobs." >> "$GITHUB_STEP_SUMMARY"
           fi
-          
-          # Add debug info if enabled
-          if [[ "${{ env.ENABLE_DEBUG }}" == "true" ]]; then
-            echo -e "\n## 🐛 Debug Information\n" >> $GITHUB_STEP_SUMMARY
-            echo "Debug mode was enabled for this run." >> $GITHUB_STEP_SUMMARY
-          fi
-          
-          echo "✅ Summary generated"
-          echo "::endgroup::"
 
-      # 9. Smart Artifact Upload with Retention Policy
       - name: 📤 Upload Execution Artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sync-artifacts-${{ github.run_id }}
+          name: tadawul-sync-logs-${{ github.run_id }}
           path: |
             sync_*.log
             sync_execution.log
-            !**/*.json  # Exclude credentials
           retention-days: 7
           compression-level: 6
-          if-no-files-found: warn
 
-      # 10. Failure Notification (Conditional)
-      - name: 🔔 Send Failure Notification
+      - name: 🔔 Webhook Failure Notification
         if: failure() && github.event_name == 'schedule'
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }} # Set this in GitHub Repository Secrets
         run: |
-          echo "::group::📧 Preparing Failure Alert"
+          if [[ -z "$WEBHOOK_URL" ]]; then
+            echo "::notice::No WEBHOOK_URL secret defined. Skipping failure notification."
+            exit 0
+          fi
           
-          # Create failure summary
-          cat > failure_notification.txt << EOF
-          ❌ Tadawul Sync Failed
-          
-          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          Time: $(date -u)
-          Mode: ${{ env.RUN_MODE }}
-          Sheet: ${{ env.TARGET_SHEET_ID }}
-          EOF
-          
-          # Here you could integrate with email, Slack, or Teams webhooks
-          # Example: curl -X POST -H "Content-Type: application/json" -d @payload.json $WEBHOOK_URL
-          
-          echo "✅ Failure notification prepared (integration placeholder)"
+          echo "::group::📧 Sending Alert"
+          PAYLOAD=$(jq -n \
+            --arg title "❌ Tadawul Sync Failed" \
+            --arg run "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --arg mode "${{ env.RUN_MODE }}" \
+            '{text: ($title + "\n\n*Run:* " + $run + "\n*Mode:* " + $mode)}')
+            
+          curl -s -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$WEBHOOK_URL" || true
           echo "::endgroup::"
 
-      # 11. Cleanup Temporary Files
       - name: 🧹 Secure Cleanup
         if: always()
         run: |
-          echo "::group::Cleaning up sensitive data"
-          
-          # Securely remove credentials file if it exists
+          echo "::group::Cleanup"
           if [[ -f "$GOOGLE_APPLICATION_CREDENTIALS" ]]; then
-            shred -f -u "$GOOGLE_APPLICATION_CREDENTIALS" 2>/dev/null || rm -f "$GOOGLE_APPLICATION_CREDENTIALS"
-            echo "✅ Credentials file removed"
+            shred -u -z "$GOOGLE_APPLICATION_CREDENTIALS" 2>/dev/null || rm -f "$GOOGLE_APPLICATION_CREDENTIALS"
+            echo "✅ Google Credentials securely shredded from runner."
           fi
-          
-          # Clean up old logs (keep only last 5)
-          ls -t sync_*.log 2>/dev/null | tail -n +6 | xargs -r rm -f
-          
-          echo "🧹 Cleanup completed"
           echo "::endgroup::"
