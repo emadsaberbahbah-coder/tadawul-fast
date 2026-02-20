@@ -5,7 +5,7 @@ TADAWUL FAST BRIDGE – ENTERPRISE CONFIGURATION MANAGEMENT (v5.1.0)
 Advanced Production Configuration System with Multi-Source Support
 SAMA Compliant | Distributed Config | Secrets Management | Dynamic Updates | Zero-Trust Security
 
-[Previous documentation remains the same...]
+[Documentation remains the same...]
 """
 
 from __future__ import annotations
@@ -47,8 +47,6 @@ CONFIG_BUILD_TIMESTAMP = datetime.now(timezone.utc).isoformat()
 # =============================================================================
 # Optional Dependencies with Graceful Degradation
 # =============================================================================
-
-# [All the import sections remain the same...]
 
 # YAML support
 try:
@@ -2592,7 +2590,7 @@ class Settings:
             3, lo=0, hi=10
         )
         
-        # Monitoring - FIXED: Single assignment without conflict
+        # Monitoring
         metrics_enabled_val = coerce_bool(
             os.getenv(f"{env_prefix}METRICS_ENABLED") or 
             os.getenv("METRICS_ENABLED"), 
@@ -3004,7 +3002,7 @@ class Settings:
             "X-APP-TOKEN"
         )
         
-        # Create settings - FIXED: Use metrics_enabled from feature flags, NOT from monitoring
+        # Create settings - FIXED: Remove duplicate argaam_api_key
         s = cls(
             environment=environment,
             app_version=app_version,
@@ -3068,7 +3066,7 @@ class Settings:
             marketaux_api_key=marketaux_key or None,
             newsapi_api_key=newsapi_key or None,
             twelve_data_api_key=twelve_data_key or None,
-            argaam_api_key=argaam_key or None,
+            argaam_api_key=argaam_key or None,  # Keep this one (from provider credentials)
             http_timeout_sec=http_timeout,
             http_connect_timeout=http_connect_timeout,
             http_read_timeout=http_read_timeout,
@@ -3117,10 +3115,9 @@ class Settings:
             google_auth_uri="https://accounts.google.com/o/oauth2/auth",
             google_scopes=["https://www.googleapis.com/auth/spreadsheets"],
             argaam_quote_url=argaam_url,
-            argaam_api_key=argaam_key,
+            # REMOVED: argaam_api_key=argaam_key,  <-- This was the duplicate
             argaam_timeout=argaam_timeout,
             argaam_retries=argaam_retries,
-            # Note: metrics_enabled is NOT passed here - it's already set above
             metrics_port=metrics_port,
             metrics_path=metrics_path,
             health_check_path=health_check_path,
