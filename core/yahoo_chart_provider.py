@@ -1,18 +1,23 @@
+#!/usr/bin/env python3
 """
 core/yahoo_chart_provider.py
 ===========================================================
-ADVANCED COMPATIBILITY SHIM + REPO HYGIENE — v1.0.0
+ADVANCED COMPATIBILITY SHIM + REPO HYGIENE — v2.0.0
 (Emad Bahbah – Production Architecture)
 
 INSTITUTIONAL GRADE · ZERO DOWNTIME · COMPLETE BACKWARD COMPATIBILITY
+
+What's new in v2.0.0 (Next-Gen Enterprise):
+- ✅ **Signature Caching**: `inspect.signature` is now LRU-cached to eliminate reflection overhead
+- ✅ **Memory Optimization**: Applied `@dataclass(slots=True)` to telemetry and provider models
+- ✅ **Distributed Tracing**: OpenTelemetry `TraceContext` applied to legacy delegations
+- ✅ **Prometheus Metrics**: High-resolution latency and success rate tracking for the shim layer
+- ✅ **High-Performance JSON**: Standard `orjson` fallback integration
 
 Purpose
 - Production-safe compatibility layer between legacy imports and canonical provider
 - Zero-downtime migration path for provider restructuring
 - Complete backward compatibility with all historical function signatures
-- Advanced error recovery with circuit breaker pattern
-- Performance monitoring and telemetry hooks
-- Thread-safe caching of provider availability
 
 Why This Exists
 The canonical Yahoo Chart provider now lives at:
@@ -22,17 +27,6 @@ This top-level module MUST remain valid Python forever because:
     - Hundreds of legacy imports may still do `import core.yahoo_chart_provider`
     - Cron jobs, notebooks, and deployed services may have hard dependencies
     - Zero-downtime deployments require backward compatibility
-
-What This Shim Provides
-✅ Import-safe (never crashes app startup)
-✅ Complete API surface coverage (all historical functions)
-✅ Intelligent fallback with circuit breaker pattern
-✅ Performance metrics and telemetry
-✅ Thread-safe caching of provider availability
-✅ Graceful degradation with error recovery
-✅ Full type hints and runtime type safety
-✅ Memory-efficient lazy imports
-✅ Zero external dependencies
 """
 
 from __future__ import annotations
@@ -46,11 +40,90 @@ import warnings
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from functools import lru_cache
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union, Awaitable, TypeVar, cast
 from collections.abc import Awaitable as AwaitableABC
 
+# ---------------------------------------------------------------------------
+# High-Performance JSON fallback
+# ---------------------------------------------------------------------------
+try:
+    import orjson
+    def json_dumps(v, *, default=None): return orjson.dumps(v, default=default).decode()
+    def json_loads(v): return orjson.loads(v)
+    _HAS_ORJSON = True
+except ImportError:
+    import json
+    def json_dumps(v, *, default=None): return json.dumps(v, default=default)
+    def json_loads(v): return json.loads(v)
+    _HAS_ORJSON = False
+
+# ---------------------------------------------------------------------------
+# Monitoring & Tracing
+# ---------------------------------------------------------------------------
+try:
+    from prometheus_client import Counter, Histogram
+    _PROMETHEUS_AVAILABLE = True
+    shim_requests_total = Counter('shim_yahoo_requests_total', 'Total requests to Yahoo shim', ['function', 'status'])
+    shim_request_duration = Histogram('shim_yahoo_duration_seconds', 'Yahoo shim request duration', ['function'])
+except ImportError:
+    _PROMETHEUS_AVAILABLE = False
+    class DummyMetric:
+        def labels(self, *args, **kwargs): return self
+        def inc(self, *args, **kwargs): pass
+        def observe(self, *args, **kwargs): pass
+    shim_requests_total = DummyMetric()
+    shim_request_duration = DummyMetric()
+
+try:
+    from opentelemetry import trace
+    from opentelemetry.trace import Status, StatusCode
+    _OTEL_AVAILABLE = True
+    tracer = trace.get_tracer(__name__)
+except ImportError:
+    _OTEL_AVAILABLE = False
+    class DummySpan:
+        def set_attribute(self, *args, **kwargs): pass
+        def set_status(self, *args, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args, **kwargs): pass
+    class DummyTracer:
+        def start_as_current_span(self, *args, **kwargs): return DummySpan()
+    tracer = DummyTracer()
+
+import os
+_TRACING_ENABLED = os.getenv("CORE_TRACING_ENABLED", "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+class TraceContext:
+    """OpenTelemetry trace context manager (Sync and Async compatible)."""
+    def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
+        self.name = name
+        self.attributes = attributes or {}
+        self.tracer = tracer if _OTEL_AVAILABLE and _TRACING_ENABLED else None
+        self.span = None
+    
+    def __enter__(self):
+        if self.tracer:
+            self.span = self.tracer.start_as_current_span(self.name)
+            if self.attributes:
+                self.span.set_attributes(self.attributes)
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.span and _OTEL_AVAILABLE:
+            if exc_val:
+                self.span.record_exception(exc_val)
+                self.span.set_status(Status(StatusCode.ERROR, str(exc_val)))
+            self.span.__exit__(exc_type, exc_val, exc_tb)
+
+    async def __aenter__(self):
+        return self.__enter__()
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        return self.__exit__(exc_type, exc_val, exc_tb)
+
 # Version
-SHIM_VERSION = "1.0.0"
+SHIM_VERSION = "2.0.0"
 MIN_CANONICAL_VERSION = "0.4.0"
 
 # -----------------------------------------------------------------------------
@@ -88,7 +161,7 @@ class ShimConfig:
 # Telemetry & Metrics
 # -----------------------------------------------------------------------------
 
-@dataclass
+@dataclass(slots=True)
 class CallMetrics:
     """Metrics for a single function call"""
     function_name: str
@@ -233,7 +306,7 @@ class CircuitBreaker:
                     raise CircuitBreakerOpenError(f"Circuit breaker open after {self.failure_count} failures")
         
         try:
-            result = await func(*args, **kwargs)
+            result = await func(*args, **kwargs) if asyncio.iscoroutinefunction(func) else func(*args, **kwargs)
             await self._record_success()
             return result
         except Exception as e:
@@ -268,7 +341,7 @@ class CircuitBreakerOpenError(Exception):
 # Provider Cache
 # -----------------------------------------------------------------------------
 
-@dataclass
+@dataclass(slots=True)
 class ProviderInfo:
     """Information about canonical provider"""
     module: Any
@@ -305,22 +378,23 @@ class ProviderCache:
     
     async def _load_provider(self) -> Optional[ProviderInfo]:
         """Load provider information"""
-        try:
-            # Attempt import with circuit breaker
-            provider = await self._circuit_breaker.call(self._import_provider)
-            return provider
-        except Exception as e:
-            return ProviderInfo(
-                module=None,
-                version="unknown",
-                functions={},
-                available=False,
-                last_check=time.time(),
-                error=str(e),
-            )
+        with TraceContext("shim_load_provider"):
+            try:
+                # Attempt import with circuit breaker
+                provider = await self._circuit_breaker.call(self._import_provider)
+                return provider
+            except Exception as e:
+                return ProviderInfo(
+                    module=None,
+                    version="unknown",
+                    functions={},
+                    available=False,
+                    last_check=time.time(),
+                    error=str(e),
+                )
     
-    def _import_provider(self) -> ProviderInfo:
-        """Actual provider import (synchronous)"""
+    async def _import_provider(self) -> ProviderInfo:
+        """Actual provider import"""
         try:
             import core.providers.yahoo_chart_provider as canonical
             
@@ -351,11 +425,23 @@ class ProviderCache:
 _provider_cache = ProviderCache()
 
 # -----------------------------------------------------------------------------
+# Signature Caching (Performance)
+# -----------------------------------------------------------------------------
+
+@lru_cache(maxsize=128)
+def _get_cached_signature_parameters(func: Callable) -> Dict[str, inspect.Parameter]:
+    """Cache function signatures to eliminate inspect overhead on hot paths."""
+    try:
+        return inspect.signature(func).parameters
+    except Exception:
+        return {}
+
+
+# -----------------------------------------------------------------------------
 # Shim Function Factory
 # -----------------------------------------------------------------------------
 
 T = TypeVar('T')
-
 
 class ShimFunction:
     """Wrapper for shim functions with intelligent delegation"""
@@ -375,60 +461,56 @@ class ShimFunction:
     
     async def __call__(self, *args, **kwargs) -> Any:
         """Execute with intelligent delegation"""
-        # Track execution for telemetry
         start_time = time.time()
         
-        try:
-            # Try to get canonical function
-            provider = await _provider_cache.get_provider()
-            
-            if provider and provider.available:
-                canonical_func = provider.functions.get(self.canonical_name)
-                if canonical_func:
-                    # Check if we need to adapt arguments
-                    adapted_args, adapted_kwargs = self._adapt_arguments(
-                        canonical_func, args, kwargs
-                    )
-                    
-                    # Execute canonical function
-                    result = await self._execute_canonical(
-                        canonical_func, adapted_args, adapted_kwargs
-                    )
-                    
-                    # Post-process result
-                    result = self._post_process(result, kwargs.get("symbol", ""))
-                    
-                    # Record success
+        with TraceContext(f"shim_{self.name}"):
+            try:
+                provider = await _provider_cache.get_provider()
+                
+                if provider and provider.available:
+                    canonical_func = provider.functions.get(self.canonical_name)
+                    if canonical_func:
+                        adapted_args, adapted_kwargs = self._adapt_arguments(
+                            canonical_func, args, kwargs
+                        )
+                        
+                        result = await self._execute_canonical(
+                            canonical_func, adapted_args, adapted_kwargs
+                        )
+                        
+                        result = self._post_process(result, kwargs.get("symbol", ""))
+                        await self._record_metrics(start_time, True)
+                        shim_requests_total.labels(function=self.name, status="success").inc()
+                        shim_request_duration.labels(function=self.name).observe(time.time() - start_time)
+                        return result
+                
+                if self.fallback_factory:
+                    self._logger.warning(f"Using fallback for {self.name}")
+                    result = await self._execute_fallback(*args, **kwargs)
                     await self._record_metrics(start_time, True)
-                    
+                    shim_requests_total.labels(function=self.name, status="fallback").inc()
                     return result
-            
-            # Fallback to default implementation
-            if self.fallback_factory:
-                self._logger.warning(f"Using fallback for {self.name}")
-                result = await self._execute_fallback(*args, **kwargs)
+                
+                result = self.default_factory(*args, **kwargs)
+                if inspect.isawaitable(result):
+                    result = await result
                 await self._record_metrics(start_time, True)
+                shim_requests_total.labels(function=self.name, status="default").inc()
                 return result
-            
-            # No fallback, use default factory
-            result = self.default_factory(*args, **kwargs)
-            await self._record_metrics(start_time, True)
-            return result
-            
-        except Exception as e:
-            await self._record_metrics(start_time, False, e)
-            
-            # Attempt recovery if configured
-            if ShimConfig.FALLBACK_ON_ERROR and self.fallback_factory:
-                self._logger.error(f"Error in {self.name}: {e}, using fallback")
-                return await self._execute_fallback(*args, **kwargs)
-            
-            # Return error payload
-            return self._create_error_payload(
-                kwargs.get("symbol", ""),
-                str(e),
-                where=self.name,
-            )
+                
+            except Exception as e:
+                await self._record_metrics(start_time, False, e)
+                shim_requests_total.labels(function=self.name, status="error").inc()
+                
+                if ShimConfig.FALLBACK_ON_ERROR and self.fallback_factory:
+                    self._logger.error(f"Error in {self.name}: {e}, using fallback")
+                    return await self._execute_fallback(*args, **kwargs)
+                
+                return self._create_error_payload(
+                    kwargs.get("symbol", ""),
+                    str(e),
+                    where=self.name,
+                )
     
     def _adapt_arguments(
         self,
@@ -436,30 +518,27 @@ class ShimFunction:
         args: Tuple,
         kwargs: Dict,
     ) -> Tuple[Tuple, Dict]:
-        """Adapt arguments to match function signature"""
+        """Adapt arguments to match function signature using LRU Cache"""
         try:
-            sig = inspect.signature(func)
+            parameters = _get_cached_signature_parameters(func)
+            if not parameters: return args, kwargs
             
-            # Filter kwargs to only those accepted
             filtered_kwargs = {}
             for name, value in kwargs.items():
-                if name in sig.parameters or any(
-                    p.kind == p.VAR_KEYWORD for p in sig.parameters.values()
+                if name in parameters or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()
                 ):
                     filtered_kwargs[name] = value
             
             return args, filtered_kwargs
         except Exception:
-            # If signature inspection fails, pass through
             return args, kwargs
     
     async def _execute_canonical(self, func: Callable, args: Tuple, kwargs: Dict) -> Any:
-        """Execute canonical function (sync or async)"""
+        """Execute canonical function"""
         result = func(*args, **kwargs)
-        
         if inspect.isawaitable(result):
             return await result
-        
         return result
     
     async def _execute_fallback(self, *args, **kwargs) -> Any:
@@ -468,10 +547,8 @@ class ShimFunction:
             raise NotImplementedError(f"No fallback for {self.name}")
         
         result = self.fallback_factory(*args, **kwargs)
-        
         if inspect.isawaitable(result):
             return await result
-        
         return result
     
     def _post_process(self, result: Any, symbol: str) -> Any:
@@ -483,20 +560,16 @@ class ShimFunction:
     def _ensure_quote_shape(self, data: Dict[str, Any], symbol: str) -> Dict[str, Any]:
         """Ensure quote-like output with minimal fields"""
         result = dict(data)
-        
-        # Ensure required fields
         result.setdefault("symbol", symbol.upper() if symbol else "")
         result.setdefault("status", "ok" if not result.get("error") else "error")
         result.setdefault("data_source", DATA_SOURCE)
         result.setdefault("shim_version", SHIM_VERSION)
         
-        # Set data quality based on error presence
         if result.get("error"):
             result.setdefault("data_quality", DataQuality.ERROR.value)
         elif not result.get("data_quality"):
             result.setdefault("data_quality", DataQuality.OK.value)
         
-        # Ensure timestamp
         if not result.get("last_updated_utc"):
             result["last_updated_utc"] = self._now_utc_iso()
         
@@ -552,7 +625,6 @@ class ShimFunction:
 # Default implementations (fallbacks when canonical not available)
 
 def _default_get_quote(symbol: str, *args, **kwargs) -> Dict[str, Any]:
-    """Default get_quote implementation"""
     return {
         "symbol": symbol.upper() if symbol else "",
         "status": "error",
@@ -565,7 +637,6 @@ def _default_get_quote(symbol: str, *args, **kwargs) -> Dict[str, Any]:
 
 
 async def _default_fetch_quote(symbol: str, *args, **kwargs) -> Dict[str, Any]:
-    """Default fetch_quote implementation"""
     return _default_get_quote(symbol, *args, **kwargs)
 
 
@@ -575,7 +646,6 @@ async def _default_get_quote_patch(
     *args,
     **kwargs,
 ) -> Dict[str, Any]:
-    """Default get_quote_patch implementation"""
     result = dict(base or {})
     quote = await _default_fetch_quote(symbol, *args, **kwargs)
     result.update(quote)
@@ -583,7 +653,6 @@ async def _default_get_quote_patch(
 
 
 async def _default_fetch_history(symbol: str, *args, **kwargs) -> List[Dict[str, Any]]:
-    """Default history implementation"""
     return []
 
 
@@ -644,7 +713,6 @@ yahoo_chart_quote = ShimFunction(
     fallback_factory=_default_fetch_quote,
 )
 
-# History functions
 fetch_price_history = ShimFunction(
     name="fetch_price_history",
     default_factory=_default_fetch_history,
@@ -694,7 +762,6 @@ class ClientManager:
         self._closed = False
     
     async def get_client(self):
-        """Get or create client"""
         if self._closed:
             raise RuntimeError("Client manager is closed")
         
@@ -704,7 +771,6 @@ class ClientManager:
             return self._client
     
     async def _create_client(self):
-        """Create client instance"""
         provider = await _provider_cache.get_provider()
         if provider and provider.available and hasattr(provider.module, "YahooChartProvider"):
             try:
@@ -714,7 +780,6 @@ class ClientManager:
         return None
     
     async def close(self):
-        """Close client and cleanup"""
         async with self._lock:
             if self._client and hasattr(self._client, "aclose"):
                 try:
@@ -729,12 +794,10 @@ _client_manager = ClientManager()
 
 
 async def aclose_yahoo_chart_client() -> None:
-    """Close the Yahoo Chart client"""
     await _client_manager.close()
 
 
 async def aclose_yahoo_client() -> None:
-    """Alias for backward compatibility"""
     await aclose_yahoo_chart_client()
 
 
@@ -754,11 +817,9 @@ class YahooChartProvider:
         self._client = None
     
     async def __aenter__(self):
-        """Async context manager entry"""
         return self
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Async context manager exit"""
         await self.aclose()
     
     async def get_quote_patch(
@@ -768,8 +829,6 @@ class YahooChartProvider:
         *args,
         **kwargs,
     ) -> Dict[str, Any]:
-        """Get quote patch"""
-        # Try to use canonical client if available
         if self._client is None:
             self._client = await _client_manager.get_client()
         
@@ -779,11 +838,9 @@ class YahooChartProvider:
             except Exception:
                 pass
         
-        # Fallback to shim function
         return await get_quote_patch(symbol, base, *args, **kwargs)
     
     async def fetch_quote(self, symbol: str, debug: bool = False, *args, **kwargs) -> Dict[str, Any]:
-        """Fetch quote"""
         if self._client and hasattr(self._client, "fetch_quote"):
             try:
                 return await self._client.fetch_quote(symbol, debug, *args, **kwargs)
@@ -793,7 +850,6 @@ class YahooChartProvider:
         return await fetch_quote(symbol, debug=debug, *args, **kwargs)
     
     async def aclose(self) -> None:
-        """Close client"""
         if self._client and hasattr(self._client, "aclose"):
             try:
                 await self._client.aclose()
@@ -841,19 +897,14 @@ def get_version() -> str:
 # Module Initialization
 # -----------------------------------------------------------------------------
 
-# Setup logging
 logging.basicConfig(level=ShimConfig.LOG_LEVEL)
 logger = logging.getLogger("core.yahoo_chart_provider")
-logger.info(f"Yahoo Chart Provider Shim v{SHIM_VERSION} initialized")
 
-# Get provider version from cache (async, but we don't await here)
 try:
     loop = asyncio.get_event_loop()
     if loop.is_running():
-        # Can't run async code, schedule for later
         asyncio.create_task(_provider_cache.get_provider())
     else:
-        # Run synchronously
         loop.run_until_complete(_provider_cache.get_provider())
 except Exception:
     pass
@@ -905,20 +956,16 @@ __all__ = [
 # Self-Test
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
-    import asyncio
-    
     async def test_shim():
         print(f"\n🔧 Testing Yahoo Chart Provider Shim v{SHIM_VERSION}")
         print("=" * 60)
         
-        # Test provider status
         status = await get_provider_status()
         print(f"\n📊 Provider Status:")
         print(f"  Available: {status['provider_available']}")
         print(f"  Version: {status['provider_version']}")
         print(f"  Error: {status['provider_error']}")
         
-        # Test quote function
         print(f"\n📈 Testing fetch_quote:")
         result = await fetch_quote("AAPL")
         print(f"  Symbol: {result.get('symbol')}")
@@ -927,7 +974,6 @@ if __name__ == "__main__":
         if result.get('error'):
             print(f"  Error: {result.get('error')}")
         
-        # Test telemetry
         stats = _telemetry.get_stats()
         print(f"\n📉 Telemetry:")
         print(f"  Total calls: {stats.get('total_calls', 0)}")
