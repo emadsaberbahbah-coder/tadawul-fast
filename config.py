@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TADAWUL FAST BRIDGE – ENTERPRISE CONFIGURATION MANAGEMENT (v5.0.0)
+TADAWUL FAST BRIDGE – ENTERPRISE CONFIGURATION MANAGEMENT (v5.1.0)
 ==================================================================
 Advanced Production Configuration System with Multi-Source Support
 SAMA Compliant | Distributed Config | Secrets Management | Dynamic Updates | Zero-Trust Security
@@ -173,8 +173,8 @@ from typing import (Any, Callable, Dict, List, Optional, Set, Tuple, Type,
 from urllib.parse import urljoin, urlparse
 
 # Version
-CONFIG_VERSION = "5.0.0"
-CONFIG_SCHEMA_VERSION = "2.0"
+CONFIG_VERSION = "5.1.0"
+CONFIG_SCHEMA_VERSION = "2.1"
 CONFIG_BUILD_TIMESTAMP = datetime.now(timezone.utc).isoformat()
 
 # =============================================================================
@@ -400,6 +400,7 @@ if PROMETHEUS_AVAILABLE:
     config_warnings_total = Counter('config_warnings_total', 'Total configuration warnings', ['type'])
     config_cache_hits = Counter('config_cache_hits', 'Configuration cache hits', ['level'])
     config_cache_misses = Counter('config_cache_misses', 'Configuration cache misses', ['level'])
+    config_requests_total = Counter('config_requests_total', 'Total configuration requests', ['source', 'status'])
 else:
     # Dummy metrics
     class DummyMetric:
@@ -422,6 +423,7 @@ else:
     config_warnings_total = DummyMetric()
     config_cache_hits = DummyMetric()
     config_cache_misses = DummyMetric()
+    config_requests_total = DummyMetric()
 
 # =============================================================================
 # Enums & Types
@@ -608,6 +610,23 @@ class ValidationLevel(Enum):
     SCHEMA = "schema"
     BUSINESS = "business"
 
+class ConfigEncryptionAlgorithm(Enum):
+    """Encryption algorithms for config values"""
+    FERNET = "fernet"
+    AES_GCM = "aes_gcm"
+    CHACHA20 = "chacha20"
+    NONE = "none"
+
+class ConfigFormat(Enum):
+    """Configuration file formats"""
+    JSON = "json"
+    YAML = "yaml"
+    TOML = "toml"
+    ENV = "env"
+    INI = "ini"
+    XML = "xml"
+    PROPERTIES = "properties"
+
 # =============================================================================
 # Exceptions
 # =============================================================================
@@ -633,6 +652,18 @@ class ReloadError(ConfigurationError):
 
 class CircuitBreakerOpenError(ConfigurationError):
     """Circuit breaker is open"""
+    pass
+
+class ConfigNotFoundError(ConfigurationError):
+    """Configuration not found"""
+    pass
+
+class ConfigPermissionError(ConfigurationError):
+    """Permission denied for configuration"""
+    pass
+
+class ConfigVersionError(ConfigurationError):
+    """Configuration version mismatch"""
     pass
 
 # =============================================================================
@@ -851,7 +882,7 @@ def mask_secret(s: Optional[str], reveal_first: int = 2, reveal_last: int = 4) -
 def mask_secret_dict(d: Dict[str, Any], sensitive_keys: Optional[List[str]] = None) -> Dict[str, Any]:
     """Mask sensitive values in dictionary"""
     if sensitive_keys is None:
-        sensitive_keys = ['token', 'password', 'secret', 'key', 'credential', 'auth']
+        sensitive_keys = ['token', 'password', 'secret', 'key', 'credential', 'auth', 'api_key', 'api_secret']
     
     result = {}
     for k, v in d.items():
@@ -859,8 +890,8 @@ def mask_secret_dict(d: Dict[str, Any], sensitive_keys: Optional[List[str]] = No
             result[k] = mask_secret_dict(v, sensitive_keys)
         elif isinstance(v, list):
             result[k] = [mask_secret_dict(item, sensitive_keys) if isinstance(item, dict) else item for item in v]
-        elif any(s in k.lower() for s in sensitive_keys) and isinstance(v, str):
-            result[k] = mask_secret(v)
+        elif any(s in k.lower() for s in sensitive_keys) and isinstance(v, (str, bytes)):
+            result[k] = mask_secret(str(v))
         else:
             result[k] = v
     return result
@@ -939,9 +970,11 @@ def repair_private_key(key: str) -> str:
     
     return key
 
-def decrypt_value(encrypted: str, key: Optional[str] = None, context: Optional[Dict[str, Any]] = None) -> Optional[str]:
+def decrypt_value(encrypted: str, key: Optional[str] = None, 
+                  context: Optional[Dict[str, Any]] = None,
+                  algorithm: ConfigEncryptionAlgorithm = ConfigEncryptionAlgorithm.FERNET) -> Optional[str]:
     """Decrypt encrypted configuration value with context"""
-    if not CRYPTO_AVAILABLE or not Fernet:
+    if not CRYPTO_AVAILABLE:
         logger.warning("Cryptography not available, returning original value")
         return encrypted
     
@@ -953,35 +986,65 @@ def decrypt_value(encrypted: str, key: Optional[str] = None, context: Optional[D
         return encrypted
     
     try:
-        # Handle Fernet key format
-        if len(key) != 32 and not key.endswith('='):
+        if algorithm == ConfigEncryptionAlgorithm.FERNET:
+            if not Fernet:
+                raise EncryptionError("Fernet not available")
+            
+            # Handle Fernet key format
+            if len(key) != 32 and not key.endswith('='):
+                # Derive key
+                kdf = PBKDF2HMAC(
+                    algorithm=hashes.SHA256(),
+                    length=32,
+                    salt=b'salt_' + str(uuid.uuid4()).encode()[:8],
+                    iterations=100000,
+                    backend=default_backend()
+                )
+                key_bytes = kdf.derive(key.encode())
+                key = base64.urlsafe_b64encode(key_bytes).decode()
+            
+            f = Fernet(key.encode() if isinstance(key, str) else key)
+            decrypted = f.decrypt(encrypted.encode() if isinstance(encrypted, str) else encrypted)
+            result = decrypted.decode()
+            
+            # Verify context if present
+            if context:
+                try:
+                    payload = json.loads(result)
+                    if isinstance(payload, dict) and "data" in payload and "context" in payload:
+                        if payload["context"] != context:
+                            logger.warning("Context mismatch in decryption")
+                        return payload["data"]
+                except:
+                    pass
+            
+            return result
+            
+        elif algorithm == ConfigEncryptionAlgorithm.AES_GCM:
+            # AES-GCM implementation
+            import hashlib
+            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+            
             # Derive key
-            kdf = PBKDF2HMAC(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=b'salt_' + str(uuid.uuid4()).encode()[:8],
-                iterations=100000,
-                backend=default_backend()
-            )
-            key_bytes = kdf.derive(key.encode())
-            key = base64.urlsafe_b64encode(key_bytes).decode()
-        
-        f = Fernet(key.encode() if isinstance(key, str) else key)
-        decrypted = f.decrypt(encrypted.encode() if isinstance(encrypted, str) else encrypted)
-        result = decrypted.decode()
-        
-        # Verify context if present
-        if context:
-            try:
-                payload = json.loads(result)
-                if isinstance(payload, dict) and "data" in payload and "context" in payload:
-                    if payload["context"] != context:
-                        logger.warning("Context mismatch in decryption")
-                    return payload["data"]
-            except:
-                pass
-        
-        return result
+            key_bytes = hashlib.sha256(key.encode()).digest()
+            
+            # Decode encrypted data
+            data = base64.b64decode(encrypted)
+            nonce = data[:12]
+            ciphertext = data[12:-16]
+            tag = data[-16:]
+            
+            # Decrypt
+            cipher = Cipher(algorithms.AES(key_bytes), modes.GCM(nonce, tag), backend=default_backend())
+            decryptor = cipher.decryptor()
+            result = decryptor.update(ciphertext) + decryptor.finalize()
+            
+            return result.decode()
+            
+        else:
+            logger.warning(f"Unsupported encryption algorithm: {algorithm}")
+            return encrypted
+            
     except InvalidToken:
         logger.error("Invalid encryption token")
         return None
@@ -989,9 +1052,11 @@ def decrypt_value(encrypted: str, key: Optional[str] = None, context: Optional[D
         logger.error(f"Failed to decrypt value: {e}")
         return None
 
-def encrypt_value(value: str, key: Optional[str] = None, context: Optional[Dict[str, Any]] = None) -> Optional[str]:
+def encrypt_value(value: str, key: Optional[str] = None, 
+                  context: Optional[Dict[str, Any]] = None,
+                  algorithm: ConfigEncryptionAlgorithm = ConfigEncryptionAlgorithm.FERNET) -> Optional[str]:
     """Encrypt configuration value with context"""
-    if not CRYPTO_AVAILABLE or not Fernet:
+    if not CRYPTO_AVAILABLE:
         logger.warning("Cryptography not available, returning original value")
         return value
     
@@ -1003,26 +1068,55 @@ def encrypt_value(value: str, key: Optional[str] = None, context: Optional[Dict[
         return value
     
     try:
-        # Add context to encryption (prevents replay attacks)
-        if context:
-            value = json.dumps({"data": value, "context": context})
-        
-        # Handle Fernet key format
-        if len(key) != 32 and not key.endswith('='):
+        if algorithm == ConfigEncryptionAlgorithm.FERNET:
+            if not Fernet:
+                raise EncryptionError("Fernet not available")
+            
+            # Add context to encryption (prevents replay attacks)
+            if context:
+                value = json.dumps({"data": value, "context": context})
+            
+            # Handle Fernet key format
+            if len(key) != 32 and not key.endswith('='):
+                # Derive key
+                kdf = PBKDF2HMAC(
+                    algorithm=hashes.SHA256(),
+                    length=32,
+                    salt=b'salt_' + str(uuid.uuid4()).encode()[:8],
+                    iterations=100000,
+                    backend=default_backend()
+                )
+                key_bytes = kdf.derive(key.encode())
+                key = base64.urlsafe_b64encode(key_bytes).decode()
+            
+            f = Fernet(key.encode() if isinstance(key, str) else key)
+            encrypted = f.encrypt(value.encode())
+            return encrypted.decode()
+            
+        elif algorithm == ConfigEncryptionAlgorithm.AES_GCM:
+            # AES-GCM implementation
+            import hashlib
+            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+            
             # Derive key
-            kdf = PBKDF2HMAC(
-                algorithm=hashes.SHA256(),
-                length=32,
-                salt=b'salt_' + str(uuid.uuid4()).encode()[:8],
-                iterations=100000,
-                backend=default_backend()
-            )
-            key_bytes = kdf.derive(key.encode())
-            key = base64.urlsafe_b64encode(key_bytes).decode()
-        
-        f = Fernet(key.encode() if isinstance(key, str) else key)
-        encrypted = f.encrypt(value.encode())
-        return encrypted.decode()
+            key_bytes = hashlib.sha256(key.encode()).digest()
+            
+            # Generate random nonce
+            nonce = os.urandom(12)
+            
+            # Encrypt
+            cipher = Cipher(algorithms.AES(key_bytes), modes.GCM(nonce), backend=default_backend())
+            encryptor = cipher.encryptor()
+            ciphertext = encryptor.update(value.encode()) + encryptor.finalize()
+            
+            # Combine nonce + ciphertext + tag
+            result = base64.b64encode(nonce + ciphertext + encryptor.tag).decode()
+            return result
+            
+        else:
+            logger.warning(f"Unsupported encryption algorithm: {algorithm}")
+            return value
+            
     except Exception as e:
         logger.error(f"Failed to encrypt value: {e}")
         return None
@@ -1040,24 +1134,28 @@ def compute_hash(obj: Any) -> str:
     except:
         return str(id(obj))
 
-def deep_merge(dict1: Dict, dict2: Dict, overwrite: bool = True) -> Dict:
-    """Deep merge two dictionaries"""
+def deep_merge(dict1: Dict, dict2: Dict, overwrite: bool = True, 
+               merge_lists: bool = False, deduplicate: bool = True) -> Dict:
+    """Deep merge two dictionaries with advanced options"""
     result = dict1.copy()
     
     for key, value in dict2.items():
         if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-            result[key] = deep_merge(result[key], value, overwrite)
-        elif key in result and isinstance(result[key], list) and isinstance(value, list):
-            # Merge lists without duplicates
-            combined = result[key] + value
-            # Remove duplicates while preserving order
-            seen = set()
-            result[key] = []
-            for item in combined:
-                item_str = json.dumps(item, sort_keys=True) if isinstance(item, (dict, list)) else str(item)
-                if item_str not in seen:
-                    seen.add(item_str)
-                    result[key].append(item)
+            result[key] = deep_merge(result[key], value, overwrite, merge_lists, deduplicate)
+        elif key in result and isinstance(result[key], list) and isinstance(value, list) and merge_lists:
+            # Merge lists
+            if deduplicate:
+                # Remove duplicates while preserving order
+                combined = result[key] + value
+                seen = set()
+                result[key] = []
+                for item in combined:
+                    item_str = json.dumps(item, sort_keys=True) if isinstance(item, (dict, list)) else str(item)
+                    if item_str not in seen:
+                        seen.add(item_str)
+                        result[key].append(item)
+            else:
+                result[key] = result[key] + value
         elif key in result and overwrite:
             result[key] = value
         elif key not in result:
@@ -1086,6 +1184,60 @@ def structured_log(level: str, message: str, **kwargs):
         getattr(logger, level.lower())(message, **log_data)
     else:
         getattr(logger, level.lower())(f"{message} - {json.dumps(log_data)}")
+
+def parse_file_format(path: Union[str, Path]) -> ConfigFormat:
+    """Parse file format from extension"""
+    path = Path(path)
+    ext = path.suffix.lower()
+    
+    if ext in {'.json'}:
+        return ConfigFormat.JSON
+    elif ext in {'.yaml', '.yml'}:
+        return ConfigFormat.YAML
+    elif ext in {'.toml'}:
+        return ConfigFormat.TOML
+    elif ext in {'.env', '.envrc'}:
+        return ConfigFormat.ENV
+    elif ext in {'.ini', '.cfg', '.conf'}:
+        return ConfigFormat.INI
+    elif ext in {'.xml'}:
+        return ConfigFormat.XML
+    elif ext in {'.properties'}:
+        return ConfigFormat.PROPERTIES
+    else:
+        return ConfigFormat.JSON
+
+def load_file_content(path: Path, format: Optional[ConfigFormat] = None) -> Dict[str, Any]:
+    """Load configuration file with appropriate parser"""
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+    
+    content = path.read_text(encoding='utf-8')
+    format = format or parse_file_format(path)
+    
+    if format == ConfigFormat.JSON:
+        return json.loads(content)
+    elif format == ConfigFormat.YAML:
+        if not YAML_AVAILABLE:
+            raise ImportError("PyYAML required for YAML config files")
+        return yaml.safe_load(content)
+    elif format == ConfigFormat.TOML:
+        if not TOML_AVAILABLE:
+            raise ImportError("toml required for TOML config files")
+        return toml.loads(content)
+    elif format == ConfigFormat.ENV:
+        # Parse .env format
+        result = {}
+        for line in content.splitlines():
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if '=' in line:
+                key, value = line.split('=', 1)
+                result[key.strip()] = value.strip()
+        return result
+    else:
+        raise ValueError(f"Unsupported file format: {format}")
 
 # =============================================================================
 # Timezone Helpers
@@ -1135,11 +1287,13 @@ def to_riyadh_iso(dt: Optional[datetime]) -> Optional[str]:
 class CircuitBreaker:
     """Circuit breaker for external service calls with exponential backoff"""
     
-    def __init__(self, name: str, threshold: int = 5, timeout: float = 60.0, half_open_requests: int = 3):
+    def __init__(self, name: str, threshold: int = 5, timeout: float = 60.0, 
+                 half_open_requests: int = 3, success_threshold: int = 2):
         self.name = name
         self.threshold = threshold
         self.base_timeout = timeout
         self.half_open_requests = half_open_requests
+        self.success_threshold = success_threshold
         
         self.state = CircuitBreakerState.CLOSED
         self.failure_count = 0
@@ -1150,6 +1304,7 @@ class CircuitBreaker:
         self.total_failures = 0
         self.total_successes = 0
         self.half_open_calls = 0
+        self.last_state_change = time.time()
         self._lock = RLock()
     
     def _get_timeout(self) -> float:
@@ -1171,6 +1326,7 @@ class CircuitBreaker:
                         self.state = CircuitBreakerState.HALF_OPEN
                         self.half_open_calls = 0
                         self.success_count = 0
+                        self.last_state_change = time.time()
                         logger.info(f"Circuit {self.name} entering HALF_OPEN")
                     else:
                         raise CircuitBreakerOpenError(f"Circuit {self.name} is OPEN")
@@ -1189,9 +1345,10 @@ class CircuitBreaker:
                     self.consecutive_failures = 0
                     
                     if self.state == CircuitBreakerState.HALF_OPEN:
-                        if self.success_count >= 2:
+                        if self.success_count >= self.success_threshold:
                             self.state = CircuitBreakerState.CLOSED
                             self.failure_count = 0
+                            self.last_state_change = time.time()
                             logger.info(f"Circuit {self.name} CLOSED")
                     
                     config_requests_total.labels(source=self.name, status='success').inc()
@@ -1207,9 +1364,11 @@ class CircuitBreaker:
                     
                     if self.state == CircuitBreakerState.CLOSED and self.failure_count >= self.threshold:
                         self.state = CircuitBreakerState.OPEN
+                        self.last_state_change = time.time()
                         logger.warning(f"Circuit {self.name} OPEN after {self.failure_count} failures")
                     elif self.state == CircuitBreakerState.HALF_OPEN:
                         self.state = CircuitBreakerState.OPEN
+                        self.last_state_change = time.time()
                         logger.warning(f"Circuit {self.name} re-OPEN from HALF_OPEN")
                     
                     config_errors_total.labels(type=self.name).inc()
@@ -1226,6 +1385,7 @@ class CircuitBreaker:
                         self.state = CircuitBreakerState.HALF_OPEN
                         self.half_open_calls = 0
                         self.success_count = 0
+                        self.last_state_change = time.time()
                         logger.info(f"Circuit {self.name} entering HALF_OPEN")
                     else:
                         raise CircuitBreakerOpenError(f"Circuit {self.name} is OPEN")
@@ -1244,9 +1404,10 @@ class CircuitBreaker:
                     self.consecutive_failures = 0
                     
                     if self.state == CircuitBreakerState.HALF_OPEN:
-                        if self.success_count >= 2:
+                        if self.success_count >= self.success_threshold:
                             self.state = CircuitBreakerState.CLOSED
                             self.failure_count = 0
+                            self.last_state_change = time.time()
                             logger.info(f"Circuit {self.name} CLOSED")
                     
                     config_loads_total.labels(source=self.name, status='success').inc()
@@ -1262,9 +1423,11 @@ class CircuitBreaker:
                     
                     if self.state == CircuitBreakerState.CLOSED and self.failure_count >= self.threshold:
                         self.state = CircuitBreakerState.OPEN
+                        self.last_state_change = time.time()
                         logger.warning(f"Circuit {self.name} OPEN after {self.failure_count} failures")
                     elif self.state == CircuitBreakerState.HALF_OPEN:
                         self.state = CircuitBreakerState.OPEN
+                        self.last_state_change = time.time()
                         logger.warning(f"Circuit {self.name} re-OPEN from HALF_OPEN")
                     
                     config_errors_total.labels(type=self.name).inc()
@@ -1286,10 +1449,24 @@ class CircuitBreaker:
                 "total_failures": self.total_failures,
                 "success_rate": self.total_successes / self.total_calls if self.total_calls > 0 else 1.0,
                 "current_failure_count": self.failure_count,
+                "current_success_count": self.success_count,
                 "consecutive_failures": self.consecutive_failures,
                 "timeout_sec": self._get_timeout(),
                 "half_open_requests": self.half_open_requests,
+                "success_threshold": self.success_threshold,
+                "last_state_change": datetime.fromtimestamp(self.last_state_change).isoformat(),
+                "state_duration_sec": time.time() - self.last_state_change,
             }
+    
+    def reset(self) -> None:
+        """Reset circuit breaker to closed state"""
+        with self._lock:
+            self.state = CircuitBreakerState.CLOSED
+            self.failure_count = 0
+            self.success_count = 0
+            self.consecutive_failures = 0
+            self.last_state_change = time.time()
+            logger.info(f"Circuit {self.name} manually reset to CLOSED")
 
 # =============================================================================
 # Configuration Cache
@@ -1298,14 +1475,19 @@ class CircuitBreaker:
 class ConfigCache:
     """Multi-level cache for configuration values"""
     
-    def __init__(self, maxsize: int = 1000, ttl: int = 300):
+    def __init__(self, maxsize: int = 1000, ttl: int = 300, 
+                 enable_compression: bool = False,
+                 compression_level: int = 6):
         self.maxsize = maxsize
         self.ttl = ttl
+        self.enable_compression = enable_compression
+        self.compression_level = compression_level
         self._cache: Dict[str, Tuple[Any, float]] = {}
         self._access_times: Dict[str, float] = {}
         self._lock = RLock()
         self.hits = 0
         self.misses = 0
+        self.evictions = 0
     
     def get(self, key: str) -> Optional[Any]:
         """Get value from cache"""
@@ -1317,10 +1499,20 @@ class ConfigCache:
                     self._access_times[key] = now
                     self.hits += 1
                     config_cache_hits.labels(level='memory').inc()
+                    
+                    # Decompress if needed
+                    if self.enable_compression and isinstance(value, bytes):
+                        try:
+                            value = zlib.decompress(value).decode('utf-8')
+                            value = json.loads(value)
+                        except:
+                            pass
+                    
                     return value
                 else:
                     del self._cache[key]
                     del self._access_times[key]
+                    self.evictions += 1
             self.misses += 1
             config_cache_misses.labels(level='memory').inc()
             return None
@@ -1328,12 +1520,24 @@ class ConfigCache:
     def set(self, key: str, value: Any, ttl: Optional[int] = None) -> None:
         """Set value in cache"""
         with self._lock:
+            # Compress if enabled
+            if self.enable_compression:
+                try:
+                    if isinstance(value, (dict, list)):
+                        value = json.dumps(value)
+                    if isinstance(value, str):
+                        value = zlib.compress(value.encode('utf-8'), level=self.compression_level)
+                except:
+                    pass
+            
             # Evict if full
             if len(self._cache) >= self.maxsize and key not in self._cache:
                 # Remove oldest
-                oldest_key = min(self._access_times.items(), key=lambda x: x[1])[0]
-                del self._cache[oldest_key]
-                del self._access_times[oldest_key]
+                if self._access_times:
+                    oldest_key = min(self._access_times.items(), key=lambda x: x[1])[0]
+                    del self._cache[oldest_key]
+                    del self._access_times[oldest_key]
+                    self.evictions += 1
             
             self._cache[key] = (value, time.time() + (ttl or self.ttl))
             self._access_times[key] = time.time()
@@ -1351,6 +1555,7 @@ class ConfigCache:
             self._access_times.clear()
             self.hits = 0
             self.misses = 0
+            self.evictions = 0
     
     def get_stats(self) -> Dict[str, Any]:
         """Get cache statistics"""
@@ -1362,8 +1567,19 @@ class ConfigCache:
                 "ttl": self.ttl,
                 "hits": self.hits,
                 "misses": self.misses,
+                "evictions": self.evictions,
                 "hit_rate": self.hits / total if total > 0 else 0,
+                "compression_enabled": self.enable_compression,
+                "compression_level": self.compression_level if self.enable_compression else None,
             }
+    
+    def get_or_set(self, key: str, generator: Callable[[], Any], ttl: Optional[int] = None) -> Any:
+        """Get from cache or generate and set"""
+        value = self.get(key)
+        if value is None:
+            value = generator()
+            self.set(key, value, ttl)
+        return value
 
 # =============================================================================
 # Pydantic Models (Optional)
@@ -2052,7 +2268,7 @@ class Settings:
     argaam_retries: int = 3
     
     # Monitoring
-    metrics_enabled: bool = True
+    metrics_enabled: bool = True  # FIXED: Defined only once
     metrics_port: int = 9090
     metrics_path: str = "/metrics"
     health_check_path: str = "/health"
@@ -2086,6 +2302,10 @@ class Settings:
     ai_seed: Optional[int] = None
     ai_cache_responses: bool = True
     ai_cache_ttl: int = 3600
+    
+    # Encryption
+    encryption_algorithm: ConfigEncryptionAlgorithm = ConfigEncryptionAlgorithm.FERNET
+    encryption_key: Optional[str] = None
     
     # Diagnostics
     boot_errors: Tuple[str, ...] = field(default_factory=tuple)
@@ -2504,9 +2724,8 @@ class Settings:
             3, lo=0, hi=10
         )
         
-        # Monitoring
-        # Fixed: Use a single assignment for metrics_enabled
-        metrics_enabled = coerce_bool(
+        # Monitoring - FIXED: Single assignment
+        metrics_enabled_val = coerce_bool(
             os.getenv(f"{env_prefix}METRICS_ENABLED") or 
             os.getenv("METRICS_ENABLED"), 
             True
@@ -2874,6 +3093,23 @@ class Settings:
             3600, lo=60, hi=86400
         )
         
+        # Encryption
+        encryption_algorithm_name = strip_value(
+            os.getenv(f"{env_prefix}ENCRYPTION_ALGORITHM") or 
+            os.getenv("ENCRYPTION_ALGORITHM") or 
+            "fernet"
+        ).lower()
+        encryption_algorithm = ConfigEncryptionAlgorithm.FERNET
+        for algo in ConfigEncryptionAlgorithm:
+            if algo.value == encryption_algorithm_name:
+                encryption_algorithm = algo
+                break
+        
+        encryption_key = strip_value(
+            os.getenv(f"{env_prefix}ENCRYPTION_KEY") or 
+            os.getenv("ENCRYPTION_KEY")
+        ) or None
+        
         # Version
         app_version = strip_value(
             os.getenv(f"{env_prefix}APP_VERSION") or 
@@ -3016,7 +3252,7 @@ class Settings:
             argaam_api_key=argaam_key,
             argaam_timeout=argaam_timeout,
             argaam_retries=argaam_retries,
-            metrics_enabled=metrics_enabled,
+            metrics_enabled=metrics_enabled_val,  # Using the value from env
             metrics_port=metrics_port,
             metrics_path=metrics_path,
             health_check_path=health_check_path,
@@ -3048,6 +3284,8 @@ class Settings:
             ai_seed=ai_seed,
             ai_cache_responses=ai_cache_responses,
             ai_cache_ttl=ai_cache_ttl,
+            encryption_algorithm=encryption_algorithm,
+            encryption_key=encryption_key,
             config_sources=config_sources,
         )
         
@@ -3087,16 +3325,9 @@ class Settings:
         source_type = ConfigSource.YAML_FILE if path.suffix in {'.yaml', '.yml'} else ConfigSource.JSON_FILE
         config_sources['file'] = source_type
         
-        content = path.read_text(encoding='utf-8')
-        
         try:
-            if path.suffix in {'.yaml', '.yml'}:
-                if not YAML_AVAILABLE:
-                    raise ImportError("PyYAML required for YAML config files")
-                data = yaml.safe_load(content)
-            else:
-                data = json.loads(content)
-        except (ParserError, ScannerError, json.JSONDecodeError) as e:
+            data = load_file_content(path)
+        except Exception as e:
             raise ValueError(f"Failed to parse config file: {e}")
         
         if not isinstance(data, dict):
@@ -3750,6 +3981,10 @@ class Settings:
         if self.historical_batch_size > 50:
             warnings.append(f"Large historical batch size ({self.historical_batch_size}) may cause timeouts")
         
+        # Encryption
+        if self.encryption_key and len(self.encryption_key) < 16:
+            warnings.append(f"Encryption key is short ({len(self.encryption_key)} chars). Use at least 16 chars.")
+        
         # JSON Schema validation
         if schema and JSONSCHEMA_AVAILABLE:
             try:
@@ -4045,6 +4280,24 @@ class Settings:
         }
         return key_map.get(provider)
     
+    def decrypt_secret(self, encrypted_value: str, context: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """Decrypt a secret using configured encryption"""
+        return decrypt_value(
+            encrypted_value, 
+            key=self.encryption_key,
+            context=context,
+            algorithm=self.encryption_algorithm
+        )
+    
+    def encrypt_secret(self, value: str, context: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """Encrypt a secret using configured encryption"""
+        return encrypt_value(
+            value,
+            key=self.encryption_key,
+            context=context,
+            algorithm=self.encryption_algorithm
+        )
+    
     # =========================================================================
     # Masking
     # =========================================================================
@@ -4071,6 +4324,9 @@ class Settings:
         d['datadog_api_key'] = mask_secret(self.datadog_api_key)
         d['datadog_app_key'] = mask_secret(self.datadog_app_key)
         d['newrelic_license_key'] = mask_secret(self.newrelic_license_key)
+        
+        # Mask encryption key
+        d['encryption_key'] = mask_secret(self.encryption_key)
         
         # Mask credentials
         d['google_creds'] = "PRESENT" if self.google_creds else "MISSING"
@@ -4104,6 +4360,7 @@ class Settings:
         d['environment'] = self.environment.value
         d['log_level'] = self.log_level.value
         d['cache_backend'] = self.cache_backend.value
+        d['encryption_algorithm'] = self.encryption_algorithm.value
         
         # Mask provider configs
         masked_provider_configs = {}
@@ -4131,6 +4388,7 @@ class Settings:
         d['environment'] = self.environment.value
         d['log_level'] = self.log_level.value
         d['cache_backend'] = self.cache_backend.value
+        d['encryption_algorithm'] = self.encryption_algorithm.value
         d['config_sources'] = {k: v.value for k, v in self.config_sources.items()}
         
         # Handle Path
@@ -4238,6 +4496,8 @@ class Settings:
                 'tokens_count': len([t for t in [self.app_token, self.backup_app_token] if t]),
                 'session_timeout': 3600,
                 'jwt_configured': False,
+                'encryption_enabled': bool(self.encryption_key),
+                'encryption_algorithm': self.encryption_algorithm.value if self.encryption_key else None,
             },
             'data_protection': {
                 'encryption_at_rest': bool(self.database_url),
@@ -4494,6 +4754,7 @@ class DynamicConfig:
         self._reload_thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._cache = ConfigCache(maxsize=100, ttl=30)
+        self._circuit_breakers: Dict[str, CircuitBreaker] = {}
         
         # Add initial snapshot
         self._add_to_history(initial_settings)
@@ -4524,6 +4785,13 @@ class DynamicConfig:
         """Get configuration history"""
         with self._lock:
             return self._history.copy()
+    
+    def get_circuit_breaker(self, name: str) -> CircuitBreaker:
+        """Get or create circuit breaker"""
+        with self._lock:
+            if name not in self._circuit_breakers:
+                self._circuit_breakers[name] = CircuitBreaker(name)
+            return self._circuit_breakers[name]
     
     def reload(self, source: str = "manual") -> bool:
         """Reload configuration from sources
@@ -4865,6 +5133,8 @@ class DynamicConfig:
                 'is_valid': self._settings.is_valid(),
                 'error_count': len(self._settings.boot_errors),
                 'warning_count': len(self._settings.boot_warnings),
+                'circuit_breakers': {name: cb.get_stats() for name, cb in self._circuit_breakers.items()},
+                'cache_stats': self._cache.get_stats(),
             }
 
 # =============================================================================
@@ -4909,7 +5179,7 @@ class DistributedConfigManager:
                         f"config:services:{service_id}",
                         mapping={
                             'timestamp': datetime.now(timezone.utc).isoformat(),
-                            'hash': settings.hash() if settings else self._settings.hash(),
+                            'hash': (settings or self._settings).hash(),
                             'environment': (settings or self._settings).environment.value,
                         }
                     )
@@ -5373,6 +5643,8 @@ __all__ = [
     "CircuitBreakerState",
     "FeatureStage",
     "ValidationLevel",
+    "ConfigEncryptionAlgorithm",
+    "ConfigFormat",
     
     # Exceptions
     "ConfigurationError",
@@ -5381,6 +5653,9 @@ __all__ = [
     "EncryptionError",
     "ReloadError",
     "CircuitBreakerOpenError",
+    "ConfigNotFoundError",
+    "ConfigPermissionError",
+    "ConfigVersionError",
     
     # Main classes
     "Settings",
@@ -5440,6 +5715,8 @@ __all__ = [
     "riyadh_now",
     "utc_iso",
     "riyadh_iso",
+    "parse_file_format",
+    "load_file_content",
     
     # Context managers
     "override_settings",
