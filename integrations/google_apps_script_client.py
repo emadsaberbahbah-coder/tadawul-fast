@@ -1,10 +1,19 @@
+#!/usr/bin/env python3
 """
 integrations/google_apps_script_client.py
 ===========================================================
-ADVANCED GOOGLE APPS SCRIPT CLIENT FOR TADAWUL FAST BRIDGE — v4.0.0
+ADVANCED GOOGLE APPS SCRIPT CLIENT FOR TADAWUL FAST BRIDGE — v5.0.0
 (Emad Bahbah – Enterprise Integration Architecture)
 
 INSTITUTIONAL GRADE · ZERO DOWNTIME · COMPLETE ALIGNMENT
+
+What's new in v5.0.0 (Next-Gen Enterprise):
+- ✅ High-Performance JSON (`orjson`) fallback for blazing fast payload serialization
+- ✅ Memory-optimized state models using `@dataclass(slots=True)`
+- ✅ OpenTelemetry Tracing integration covering network fetches and retries
+- ✅ Prometheus Metrics for granular request success/latency observability
+- ✅ `lru_cache` applied to hot-path symbol and page-key normalizations
+- ✅ Thread-isolated async wrappers ensuring robust event loop delegation
 
 Core Capabilities:
 - Intelligent market-aware ticker routing (KSA vs Global)
@@ -12,28 +21,13 @@ Core Capabilities:
 - Jittered exponential backoff with Retry-After support
 - Primary/Backup URL failover with health checking
 - Comprehensive telemetry and performance monitoring
-- Environment-aware configuration (dev/staging/prod)
-- Thread-safe singleton with connection pooling
-- Complete integration with core.schemas and symbol normalization
-
-v4.0.0 Major Enhancements:
-✅ Full alignment with core.schemas v4.0.0
-✅ Enhanced symbol normalization with core.normalize integration
-✅ Advanced circuit breaker with failure type classification
-✅ Telemetry collector with Prometheus-style metrics
-✅ Connection pooling and keep-alive
-✅ Async support with asyncio
-✅ Rate limiting with token bucket
-✅ Comprehensive error categorization
-✅ Payload optimization with compression
-✅ Request/Response tracing with correlation IDs
+- Connection pooling and keep-alive optimization
 """
 
 from __future__ import annotations
 
 import asyncio
 import hashlib
-import json
 import logging
 import os
 import random
@@ -42,13 +36,96 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import threading
+from collections.abc import Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union, Callable
-from collections.abc import Mapping
-import threading
-from contextlib import asynccontextmanager
+
+# ---------------------------------------------------------------------------
+# High-Performance JSON fallback
+# ---------------------------------------------------------------------------
+try:
+    import orjson
+    def json_dumps(v, *, default=None):
+        return orjson.dumps(v, default=default).decode('utf-8')
+    def json_loads(v):
+        return orjson.loads(v)
+    _HAS_ORJSON = True
+except ImportError:
+    import json
+    def json_dumps(v, *, default=None):
+        return json.dumps(v, default=default)
+    def json_loads(v):
+        return json.loads(v)
+    _HAS_ORJSON = False
+
+# ---------------------------------------------------------------------------
+# Monitoring & Tracing
+# ---------------------------------------------------------------------------
+try:
+    from prometheus_client import Counter, Histogram
+    _PROMETHEUS_AVAILABLE = True
+    gas_requests_total = Counter('gas_requests_total', 'Total requests to Google Apps Script', ['mode', 'status'])
+    gas_request_duration = Histogram('gas_request_duration_seconds', 'Google Apps Script request duration', ['mode'])
+except ImportError:
+    _PROMETHEUS_AVAILABLE = False
+    class DummyMetric:
+        def labels(self, *args, **kwargs): return self
+        def inc(self, *args, **kwargs): pass
+        def observe(self, *args, **kwargs): pass
+    gas_requests_total = DummyMetric()
+    gas_request_duration = DummyMetric()
+
+try:
+    from opentelemetry import trace
+    from opentelemetry.trace import Status, StatusCode
+    _OTEL_AVAILABLE = True
+    tracer = trace.get_tracer(__name__)
+except ImportError:
+    _OTEL_AVAILABLE = False
+    class DummySpan:
+        def set_attribute(self, *args, **kwargs): pass
+        def set_status(self, *args, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args, **kwargs): pass
+    class DummyTracer:
+        def start_as_current_span(self, *args, **kwargs): return DummySpan()
+    tracer = DummyTracer()
+
+_TRACING_ENABLED = os.getenv("CORE_TRACING_ENABLED", "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+class TraceContext:
+    """OpenTelemetry trace context manager (Sync and Async compatible)."""
+    def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
+        self.name = name
+        self.attributes = attributes or {}
+        self.tracer = tracer if _OTEL_AVAILABLE and _TRACING_ENABLED else None
+        self.span = None
+    
+    def __enter__(self):
+        if self.tracer:
+            self.span = self.tracer.start_as_current_span(self.name)
+            if self.attributes:
+                self.span.set_attributes(self.attributes)
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.span and _OTEL_AVAILABLE:
+            if exc_val:
+                self.span.record_exception(exc_val)
+                self.span.set_status(Status(StatusCode.ERROR, str(exc_val)))
+            self.span.__exit__(exc_type, exc_val, exc_tb)
+
+    async def __aenter__(self):
+        return self.__enter__()
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        return self.__exit__(exc_type, exc_val, exc_tb)
+
 
 # Try to import core modules (graceful fallback if not available)
 try:
@@ -73,8 +150,8 @@ except ImportError:
 
 
 # Version
-CLIENT_VERSION = "4.0.0"
-_MIN_CORE_VERSION = "4.0.0"
+CLIENT_VERSION = "5.0.0"
+_MIN_CORE_VERSION = "5.0.0"
 
 # -----------------------------------------------------------------------------
 # Logging Configuration
@@ -134,7 +211,7 @@ _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled"}
 # Configuration Management
 # -----------------------------------------------------------------------------
 
-@dataclass
+@dataclass(slots=True)
 class AppsScriptConfig:
     """Immutable configuration for Apps Script client"""
     # URLs
@@ -248,7 +325,7 @@ _CONFIG = AppsScriptConfig.from_env()
 # Telemetry & Metrics
 # -----------------------------------------------------------------------------
 
-@dataclass
+@dataclass(slots=True)
 class RequestMetrics:
     """Metrics for a single request"""
     request_id: str
@@ -364,7 +441,7 @@ class FailureClassifier:
             return FailureType.NETWORK
         if isinstance(exception, TimeoutError):
             return FailureType.TIMEOUT
-        if isinstance(exception, (json.JSONDecodeError, ValueError)):
+        if isinstance(exception, (ValueError, TypeError)):
             return FailureType.PARSING
         
         return FailureType.UNKNOWN
@@ -521,6 +598,7 @@ class SymbolNormalizer:
     """Advanced symbol normalization with market detection"""
     
     @staticmethod
+    @lru_cache(maxsize=4096)
     def normalize_ksa(symbol: str) -> str:
         """
         Normalize KSA symbol to canonical format (####.SR)
@@ -530,31 +608,28 @@ class SymbolNormalizer:
         if not s:
             return ""
         
-        # Remove common prefixes
         for prefix in ["TADAWUL:", "TDWL:", "SA:", "KSA:", "TASI:", "SR:", "SAR:"]:
             if s.startswith(prefix):
                 s = s[len(prefix):].strip()
         
-        # Remove common suffixes
         if s.endswith(".TADAWUL"):
             s = s[:-8].strip()
         if s.endswith(".SR"):
             s = s[:-3].strip()
         
-        # If it's numeric code (3-6 digits) => KSA
         if s.isdigit() and 3 <= len(s) <= 6:
             return f"{s}.SR"
         
         return ""
     
     @staticmethod
+    @lru_cache(maxsize=4096)
     def normalize_global(symbol: str) -> str:
         """Normalize global symbol"""
         s = str(symbol or "").strip().upper()
         if not s:
             return ""
         
-        # Remove common prefixes
         for prefix in ["NASDAQ:", "NYSE:", "US:", "GLOBAL:"]:
             if s.startswith(prefix):
                 s = s[len(prefix):].strip()
@@ -562,11 +637,11 @@ class SymbolNormalizer:
         return s
     
     @staticmethod
+    @lru_cache(maxsize=1024)
     def detect_market(symbol: str) -> MarketCategory:
         """Detect market category from symbol"""
         s = str(symbol or "").strip().upper()
         
-        # KSA detection
         if s.endswith(".SR"):
             core = s[:-3].strip()
             if core.isdigit() and 3 <= len(core) <= 6:
@@ -575,7 +650,6 @@ class SymbolNormalizer:
         if s.isdigit() and 3 <= len(s) <= 6:
             return MarketCategory.KSA
         
-        # Default to global
         return MarketCategory.GLOBAL
 
 
@@ -609,7 +683,6 @@ def split_tickers_by_market(
         if not ticker:
             continue
         
-        # Try KSA normalization first
         ksa_norm = normalizer.normalize_ksa(ticker)
         if ksa_norm:
             if not deduplicate or ksa_norm not in seen_ksa:
@@ -617,7 +690,6 @@ def split_tickers_by_market(
                 ksa_result.append(ksa_norm)
             continue
         
-        # Global normalization
         global_norm = normalizer.normalize_global(ticker)
         if global_norm:
             if not deduplicate or global_norm not in seen_global:
@@ -631,7 +703,7 @@ def split_tickers_by_market(
 # Page Specification (aligned with core.schemas)
 # -----------------------------------------------------------------------------
 
-@dataclass
+@dataclass(slots=True)
 class PageSpec:
     """Page specification with market and mode"""
     market: MarketCategory
@@ -679,7 +751,7 @@ PAGE_SPECS: Dict[str, PageSpec] = {
     ),
 }
 
-
+@lru_cache(maxsize=128)
 def normalize_page_key(page_key: Optional[str]) -> str:
     """
     Normalize page key to canonical form
@@ -694,10 +766,8 @@ def normalize_page_key(page_key: Optional[str]) -> str:
         except Exception:
             pass
     
-    # Fallback normalization
     s = page_key.strip().upper()
     
-    # Remove common prefixes/suffixes
     for prefix in ["SHEET_", "PAGE_", "TAB_"]:
         if s.startswith(prefix):
             s = s[len(prefix):]
@@ -706,15 +776,12 @@ def normalize_page_key(page_key: Optional[str]) -> str:
         if s.endswith(suffix):
             s = s[:-len(suffix)]
     
-    # Replace separators
     for ch in ["-", " ", ".", "/", "\\", "|", ":", ";", ",", "(", ")"]:
         s = s.replace(ch, "_")
     
-    # Collapse multiple underscores
     while "__" in s:
         s = s.replace("__", "_")
     
-    # Common aliases
     aliases = {
         "KSA": "KSA_TADAWUL",
         "TADAWUL": "KSA_TADAWUL",
@@ -773,7 +840,7 @@ def prune_none(obj: Any) -> Any:
 def compute_payload_hash(payload: Dict[str, Any]) -> str:
     """Compute hash of payload for deduplication"""
     try:
-        json_str = json.dumps(payload, sort_keys=True, default=str)
+        json_str = json_dumps(payload, default=str) if _HAS_ORJSON else json.dumps(payload, sort_keys=True, default=str)
         return hashlib.sha256(json_str.encode()).hexdigest()[:16]
     except Exception:
         return ""
@@ -791,7 +858,7 @@ def now_utc_iso() -> str:
 # Result Models
 # -----------------------------------------------------------------------------
 
-@dataclass
+@dataclass(slots=True)
 class AppsScriptResult:
     """Result from Apps Script call"""
     ok: bool
@@ -878,22 +945,18 @@ class GoogleAppsScriptClient:
         parsed = urllib.parse.urlparse(base_url)
         existing = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
         
-        # Add mode
         existing["mode"] = mode
         
-        # Add token if using query transport
         if TokenTransport.QUERY in self.config.token_transport:
             token = self._get_active_token(used_backup)
             if token:
                 existing[self.config.token_param_name] = token
         
-        # Add additional query params
         if query:
             for key, value in query.items():
                 if value is not None:
                     existing[str(key)] = str(value)
         
-        # Rebuild URL
         new_query = urllib.parse.urlencode(existing)
         rebuilt = parsed._replace(query=new_query)
         return urllib.parse.urlunparse(rebuilt)
@@ -912,21 +975,17 @@ class GoogleAppsScriptClient:
             "X-Client-Version": CLIENT_VERSION,
         }
         
-        # Add token if using header transport
         if TokenTransport.HEADER in self.config.token_transport:
             token = self._get_active_token(used_backup)
             if token:
                 headers["X-APP-TOKEN"] = token
         
-        # Add request ID for tracing
         if request_id:
             headers["X-Request-ID"] = request_id
         
-        # Add content length if provided
         if content_length is not None:
             headers["Content-Length"] = str(content_length)
         
-        # Add keep-alive
         headers["Connection"] = "keep-alive"
         headers["Keep-Alive"] = f"timeout={self.config.keep_alive_seconds}"
         
@@ -940,7 +999,6 @@ class GoogleAppsScriptClient:
         """Build request payload with auth if needed"""
         payload = dict(base_payload or {})
         
-        # Add token if using body transport
         if TokenTransport.BODY in self.config.token_transport:
             token = self._get_active_token(used_backup)
             if token:
@@ -948,21 +1006,15 @@ class GoogleAppsScriptClient:
                     payload["auth"] = {}
                 payload["auth"][self.config.token_param_name] = token
         
-        # Prune None values
-        payload = prune_none(payload)
-        
-        return payload
+        return prune_none(payload)
     
     def _get_urls_to_try(self) -> List[Tuple[str, bool]]:
         """Get ordered list of URLs to try"""
         urls = []
-        
         if self.config.primary_url:
             urls.append((self.config.primary_url, False))
-        
         if self.config.backup_url and self.config.backup_url != self.config.primary_url:
             urls.append((self.config.backup_url, True))
-        
         return urls
     
     def _calculate_backoff(self, attempt: int, retry_after: Optional[float] = None) -> float:
@@ -989,23 +1041,22 @@ class GoogleAppsScriptClient:
             raw = response.read().decode("utf-8", errors="replace")
             code = int(getattr(response, "status", 200) or 200)
             
-            # Try to parse JSON
             try:
-                data = json.loads(raw) if raw else {}
+                data = json_loads(raw) if raw else {}
                 success = True
                 error = None
                 error_type = None
-            except json.JSONDecodeError as e:
+            except Exception as e:
                 data = None
                 success = False
                 error = f"Invalid JSON: {e}"
                 error_type = FailureType.PARSING
             
-            # Record success in circuit breaker
             if success:
                 self.circuit_breaker.record_success()
+                gas_requests_total.labels(mode=mode, status="success").inc()
+                gas_request_duration.labels(mode=mode).observe(time.time() - start_time)
             
-            # Record telemetry
             if self.config.enable_telemetry:
                 metrics = RequestMetrics(
                     request_id=request_id or "",
@@ -1037,9 +1088,9 @@ class GoogleAppsScriptClient:
             )
             
         except Exception as e:
-            # Handle response reading errors
             failure_type = FailureClassifier.classify(e)
             self.circuit_breaker.record_failure(failure_type)
+            gas_requests_total.labels(mode=mode, status="failure").inc()
             
             return AppsScriptResult(
                 ok=False,
@@ -1067,7 +1118,6 @@ class GoogleAppsScriptClient:
         """Handle HTTP error"""
         code = int(getattr(e, "code", 0) or 0)
         
-        # Try to read response body
         try:
             raw = e.read()
             raw_text = raw.decode("utf-8", errors="replace") if raw else ""
@@ -1076,8 +1126,8 @@ class GoogleAppsScriptClient:
         
         failure_type = FailureClassifier.classify(e, code)
         self.circuit_breaker.record_failure(failure_type)
+        gas_requests_total.labels(mode=mode, status="error").inc()
         
-        # Parse error message
         error_msg = f"HTTP {code}"
         if hasattr(e, "reason") and e.reason:
             error_msg += f": {e.reason}"
@@ -1109,244 +1159,118 @@ class GoogleAppsScriptClient:
     ) -> AppsScriptResult:
         """
         Make a call to Google Apps Script
-        
-        Args:
-            mode: Script mode/function to call
-            payload: Request payload
-            method: HTTP method
-            retries: Max retries (None = use config)
-            query: Additional query parameters
-            request_id: Request ID for tracing
-            timeout: Request timeout in seconds
-        
-        Returns:
-            AppsScriptResult
         """
-        # Check if client is closed
-        if self._closed:
-            return AppsScriptResult(
-                ok=False,
-                status_code=0,
-                data=None,
-                error="Client is closed",
-                error_type=FailureType.UNKNOWN,
-            )
-        
-        # Check circuit breaker
-        if not self.circuit_breaker.can_execute():
-            state = self.circuit_breaker.get_state()
-            return AppsScriptResult(
-                ok=False,
-                status_code=0,
-                data=None,
-                error=f"Circuit breaker {state['state']}",
-                error_type=FailureType.UNKNOWN,
-            )
-        
-        # Check rate limiter
-        if not self.rate_limiter.acquire():
-            return AppsScriptResult(
-                ok=False,
-                status_code=429,
-                data=None,
-                error="Rate limit exceeded",
-                error_type=FailureType.CLIENT,
-            )
-        
-        # Generate request ID if not provided
-        if not request_id and self.config.enable_tracing:
-            request_id = hashlib.md5(f"{time.time()}{random.random()}".encode()).hexdigest()[:16]
-        
-        # Configuration
-        use_method = method or self.config.http_method
-        max_retries = retries if retries is not None else self.config.max_retries
-        timeout_sec = timeout or self.config.timeout_seconds
-        
-        # Prepare payload
-        clean_payload = self._build_payload(payload, used_backup=False)
-        
-        # Serialize payload for request
-        body_bytes: Optional[bytes] = None
-        if use_method != RequestMethod.GET:
-            try:
-                body_bytes = json.dumps(clean_payload, ensure_ascii=False).encode("utf-8")
-                
-                # Check payload size
-                if len(body_bytes) > self.config.max_payload_size_bytes:
-                    return AppsScriptResult(
-                        ok=False,
-                        status_code=413,
-                        data=None,
-                        error=f"Payload too large: {len(body_bytes)} > {self.config.max_payload_size_bytes}",
-                        error_type=FailureType.CLIENT,
-                    )
-            except Exception as e:
+        with TraceContext(f"gas_call_{mode}", {"mode": mode, "request_id": request_id}):
+            if self._closed:
                 return AppsScriptResult(
-                    ok=False,
-                    status_code=0,
-                    data=None,
-                    error=f"JSON encode error: {e}",
-                    error_type=FailureType.PARSING,
+                    ok=False, status_code=0, data=None, error="Client is closed", error_type=FailureType.UNKNOWN,
                 )
-        
-        # Get URLs to try
-        urls_to_try = self._get_urls_to_try()
-        if not urls_to_try:
-            return AppsScriptResult(
-                ok=False,
-                status_code=0,
-                data=None,
-                error="No URLs configured",
-                error_type=FailureType.CLIENT,
-            )
-        
-        start_time = time.time()
-        last_result: Optional[AppsScriptResult] = None
-        
-        # Try each URL
-        for url_index, (base_url, used_backup) in enumerate(urls_to_try):
-            # Build URL with query parameters
-            url = self._build_url(base_url, mode, query, used_backup)
-            if not url:
-                continue
             
-            # Build headers
-            headers = self._build_headers(
-                used_backup=used_backup,
-                request_id=request_id,
-                content_length=len(body_bytes) if body_bytes else None,
-            )
+            if not self.circuit_breaker.can_execute():
+                state = self.circuit_breaker.get_state()
+                return AppsScriptResult(
+                    ok=False, status_code=0, data=None, error=f"Circuit breaker {state['state']}", error_type=FailureType.UNKNOWN,
+                )
             
-            # Retry loop for this URL
-            for attempt in range(max_retries + 1):
+            if not self.rate_limiter.acquire():
+                return AppsScriptResult(
+                    ok=False, status_code=429, data=None, error="Rate limit exceeded", error_type=FailureType.CLIENT,
+                )
+            
+            if not request_id and self.config.enable_tracing:
+                request_id = hashlib.md5(f"{time.time()}{random.random()}".encode()).hexdigest()[:16]
+            
+            use_method = method or self.config.http_method
+            max_retries = retries if retries is not None else self.config.max_retries
+            timeout_sec = timeout or self.config.timeout_seconds
+            
+            clean_payload = self._build_payload(payload, used_backup=False)
+            
+            body_bytes: Optional[bytes] = None
+            if use_method != RequestMethod.GET:
                 try:
-                    # Create request
-                    req = urllib.request.Request(
-                        url,
-                        data=body_bytes,
-                        headers=headers,
-                        method=use_method.value,
-                    )
-                    
-                    # Execute request
-                    with urllib.request.urlopen(
-                        req,
-                        timeout=timeout_sec,
-                        context=self._ssl_ctx,
-                    ) as resp:
-                        result = self._handle_response(
-                            response=resp,
-                            url=url,
-                            used_backup=used_backup,
-                            start_time=start_time,
-                            request_id=request_id,
-                            mode=mode,
-                            retry_count=attempt,
+                    body_bytes = json_dumps(clean_payload).encode("utf-8")
+                    if len(body_bytes) > self.config.max_payload_size_bytes:
+                        return AppsScriptResult(
+                            ok=False, status_code=413, data=None, error=f"Payload too large: {len(body_bytes)} > {self.config.max_payload_size_bytes}", error_type=FailureType.CLIENT,
                         )
+                except Exception as e:
+                    return AppsScriptResult(
+                        ok=False, status_code=0, data=None, error=f"JSON encode error: {e}", error_type=FailureType.PARSING,
+                    )
+            
+            urls_to_try = self._get_urls_to_try()
+            if not urls_to_try:
+                return AppsScriptResult(
+                    ok=False, status_code=0, data=None, error="No URLs configured", error_type=FailureType.CLIENT,
+                )
+            
+            start_time = time.time()
+            last_result: Optional[AppsScriptResult] = None
+            
+            for url_index, (base_url, used_backup) in enumerate(urls_to_try):
+                url = self._build_url(base_url, mode, query, used_backup)
+                if not url: continue
+                
+                headers = self._build_headers(used_backup=used_backup, request_id=request_id, content_length=len(body_bytes) if body_bytes else None)
+                
+                for attempt in range(max_retries + 1):
+                    try:
+                        req = urllib.request.Request(url, data=body_bytes, headers=headers, method=use_method.value)
                         
-                        # If successful, return immediately
-                        if result.ok:
-                            return result
-                        
-                        # Store last result
+                        with urllib.request.urlopen(req, timeout=timeout_sec, context=self._ssl_ctx) as resp:
+                            result = self._handle_response(resp, url, used_backup, start_time, request_id, mode, attempt)
+                            if result.ok: return result
+                            last_result = result
+                            
+                            if attempt < max_retries:
+                                retryable_codes = {408, 409, 425, 429, 500, 502, 503, 504}
+                                if result.status_code in retryable_codes:
+                                    retry_after = None
+                                    if hasattr(resp, "headers"): retry_after = resp.headers.get("Retry-After")
+                                    backoff = self._calculate_backoff(attempt, retry_after)
+                                    logger.debug(f"Retry {attempt+1}/{max_retries} after {backoff:.2f}s")
+                                    time.sleep(backoff)
+                                    continue
+                    except urllib.error.HTTPError as e:
+                        result = self._handle_http_error(e, url, used_backup, start_time, request_id, mode, attempt)
                         last_result = result
-                        
-                        # Check if we should retry
                         if attempt < max_retries:
-                            # Check if error is retryable
                             retryable_codes = {408, 409, 425, 429, 500, 502, 503, 504}
                             if result.status_code in retryable_codes:
-                                # Extract Retry-After if available
                                 retry_after = None
-                                if hasattr(resp, "headers"):
-                                    retry_after = resp.headers.get("Retry-After")
-                                
+                                if hasattr(e, "headers") and e.headers: retry_after = e.headers.get("Retry-After")
                                 backoff = self._calculate_backoff(attempt, retry_after)
-                                logger.debug(f"Retry {attempt+1}/{max_retries} after {backoff:.2f}s")
+                                logger.debug(f"HTTP {result.status_code} retry {attempt+1}/{max_retries} after {backoff:.2f}s")
                                 time.sleep(backoff)
                                 continue
-                    
-                except urllib.error.HTTPError as e:
-                    result = self._handle_http_error(
-                        e=e,
-                        url=url,
-                        used_backup=used_backup,
-                        start_time=start_time,
-                        request_id=request_id,
-                        mode=mode,
-                        retry_count=attempt,
-                    )
-                    last_result = result
-                    
-                    # Check if we should retry
-                    if attempt < max_retries:
-                        retryable_codes = {408, 409, 425, 429, 500, 502, 503, 504}
-                        if result.status_code in retryable_codes:
-                            # Extract Retry-After if available
-                            retry_after = None
-                            if hasattr(e, "headers") and e.headers:
-                                retry_after = e.headers.get("Retry-After")
-                            
-                            backoff = self._calculate_backoff(attempt, retry_after)
-                            logger.debug(f"HTTP {result.status_code} retry {attempt+1}/{max_retries} after {backoff:.2f}s")
+                        break
+                    except Exception as e:
+                        failure_type = FailureClassifier.classify(e)
+                        self.circuit_breaker.record_failure(failure_type)
+                        result = AppsScriptResult(
+                            ok=False, status_code=0, data=None, error=f"Request error: {e}", error_type=failure_type,
+                            url=url, elapsed_ms=int((time.time() - start_time) * 1000), used_backup=used_backup,
+                            retry_count=attempt, request_id=request_id,
+                        )
+                        last_result = result
+                        if attempt < max_retries and failure_type in (FailureType.NETWORK, FailureType.TIMEOUT):
+                            backoff = self._calculate_backoff(attempt)
+                            logger.debug(f"Network error, retry {attempt+1}/{max_retries} after {backoff:.2f}s")
                             time.sleep(backoff)
                             continue
-                    
-                    # Non-retryable or exhausted
-                    break
-                    
-                except Exception as e:
-                    failure_type = FailureClassifier.classify(e)
-                    self.circuit_breaker.record_failure(failure_type)
-                    
-                    result = AppsScriptResult(
-                        ok=False,
-                        status_code=0,
-                        data=None,
-                        error=f"Request error: {e}",
-                        error_type=failure_type,
-                        url=url,
-                        elapsed_ms=int((time.time() - start_time) * 1000),
-                        used_backup=used_backup,
-                        retry_count=attempt,
-                        request_id=request_id,
-                    )
-                    last_result = result
-                    
-                    # Retry on network errors
-                    if attempt < max_retries and failure_type in (FailureType.NETWORK, FailureType.TIMEOUT):
-                        backoff = self._calculate_backoff(attempt)
-                        logger.debug(f"Network error, retry {attempt+1}/{max_retries} after {backoff:.2f}s")
-                        time.sleep(backoff)
-                        continue
-                    
-                    break
+                        break
+                
+                if url_index < len(urls_to_try) - 1:
+                    logger.info(f"Failing over to backup URL after {max_retries + 1} attempts")
+                    continue
+                break
             
-            # If we exhausted retries for this URL and there's another URL, try next
-            if url_index < len(urls_to_try) - 1:
-                logger.info(f"Failing over to backup URL after {max_retries + 1} attempts")
-                continue
-            
-            break
-        
-        # Return last result if we have one
-        if last_result:
-            return last_result
-        
-        # Fallback error
-        return AppsScriptResult(
-            ok=False,
-            status_code=0,
-            data=None,
-            error="No response from any URL",
-            error_type=FailureType.NETWORK,
-            elapsed_ms=int((time.time() - start_time) * 1000),
-            request_id=request_id,
-        )
-    
-    # -------------------------------------------------------------------------
-    # High-level API Methods
-    # -------------------------------------------------------------------------
+            if last_result: return last_result
+            return AppsScriptResult(
+                ok=False, status_code=0, data=None, error="No response from any URL", error_type=FailureType.NETWORK,
+                elapsed_ms=int((time.time() - start_time) * 1000), request_id=request_id,
+            )
     
     def sync_page_quotes(
         self,
@@ -1360,74 +1284,29 @@ class GoogleAppsScriptClient:
         method: Optional[RequestMethod] = None,
         retries: Optional[int] = None,
     ) -> AppsScriptResult:
-        """
-        Sync quotes for a specific page/sheet
-        
-        Args:
-            page_key: Page identifier (e.g., "KSA_TADAWUL")
-            sheet_id: Google Sheet ID
-            sheet_name: Sheet name within the spreadsheet
-            tickers: List of ticker symbols
-            request_id: Request ID for tracing
-            extra_meta: Additional metadata to include
-            method: HTTP method
-            retries: Max retries
-        """
-        # Resolve page specification
         spec = resolve_page_spec(page_key)
-        
-        # Split tickers by market
         ksa_tickers, global_tickers = split_tickers_by_market(tickers)
         
-        # Build payload
         payload: Dict[str, Any] = {
-            "sheet": {
-                "id": sheet_id,
-                "name": sheet_name,
-            },
-            "tickers": {
-                "all": list(tickers),
-                "ksa": ksa_tickers,
-                "global": global_tickers,
-            },
+            "sheet": {"id": sheet_id, "name": sheet_name},
+            "tickers": {"all": list(tickers), "ksa": ksa_tickers, "global": global_tickers},
             "market": spec.market.value,
-            "meta": {
-                "client": "tfb_backend",
-                "version": CLIENT_VERSION,
-                "timestamp_utc": now_utc_iso(),
-                "page_key": normalize_page_key(page_key),
-                "page_mode": spec.mode,
-            },
+            "meta": {"client": "tfb_backend", "version": CLIENT_VERSION, "timestamp_utc": now_utc_iso(), "page_key": normalize_page_key(page_key), "page_mode": spec.mode},
         }
         
-        # Add backend URL if configured
-        if self.config.backend_base_url:
-            payload["backend"] = {"base_url": self.config.backend_base_url}
+        if self.config.backend_base_url: payload["backend"] = {"base_url": self.config.backend_base_url}
+        if extra_meta: payload["meta"].update(extra_meta)
         
-        # Add extra metadata
-        if extra_meta:
-            payload["meta"].update(extra_meta)
-        
-        # Add sheet headers if available
         if _HAS_CORE:
             try:
                 headers = get_headers_for_sheet(page_key)
-                if headers:
-                    payload["sheet"]["headers"] = headers
-            except Exception:
-                pass
+                if headers: payload["sheet"]["headers"] = headers
+            except Exception: pass
         
-        logger.info(
-            f"Syncing page {page_key}: "
-            f"{len(ksa_tickers)} KSA, {len(global_tickers)} global"
-        )
+        logger.info(f"Syncing page {page_key}: {len(ksa_tickers)} KSA, {len(global_tickers)} global")
         
         return self.call_script(
-            mode=spec.mode,
-            payload=payload,
-            method=method,
-            retries=retries,
-            request_id=request_id,
+            mode=spec.mode, payload=payload, method=method, retries=retries, request_id=request_id,
         )
     
     def ping(
@@ -1437,32 +1316,19 @@ class GoogleAppsScriptClient:
         method: Optional[RequestMethod] = None,
         retries: Optional[int] = None,
     ) -> AppsScriptResult:
-        """Health check ping"""
         return self.call_script(
             mode="health",
-            payload={
-                "meta": {
-                    "client": "tfb_backend",
-                    "version": CLIENT_VERSION,
-                    "timestamp_utc": now_utc_iso(),
-                }
-            },
-            method=method or RequestMethod.GET,
-            retries=retries or 1,
-            request_id=request_id,
+            payload={"meta": {"client": "tfb_backend", "version": CLIENT_VERSION, "timestamp_utc": now_utc_iso()}},
+            method=method or RequestMethod.GET, retries=retries or 1, request_id=request_id,
         )
     
     def get_status(self) -> Dict[str, Any]:
-        """Get client status"""
         return {
             "client_version": CLIENT_VERSION,
             "config": {
-                "environment": self.config.environment,
-                "primary_url": bool(self.config.primary_url),
-                "backup_url": bool(self.config.backup_url),
-                "token_configured": bool(self.config.token),
-                "timeout_seconds": self.config.timeout_seconds,
-                "max_retries": self.config.max_retries,
+                "environment": self.config.environment, "primary_url": bool(self.config.primary_url),
+                "backup_url": bool(self.config.backup_url), "token_configured": bool(self.config.token),
+                "timeout_seconds": self.config.timeout_seconds, "max_retries": self.config.max_retries,
             },
             "circuit_breaker": self.circuit_breaker.get_state(),
             "telemetry": _telemetry.get_stats() if self.config.enable_telemetry else {},
@@ -1470,18 +1336,14 @@ class GoogleAppsScriptClient:
         }
     
     def close(self) -> None:
-        """Close the client and release resources"""
         with self._lock:
             if not self._closed:
                 self.connection_pool.clear()
                 self._closed = True
                 logger.info("GoogleAppsScriptClient closed")
     
-    def __enter__(self):
-        return self
-    
-    def __exit__(self, *args):
-        self.close()
+    def __enter__(self): return self
+    def __exit__(self, *args): self.close()
 
 
 # -----------------------------------------------------------------------------
@@ -1491,52 +1353,54 @@ class GoogleAppsScriptClient:
 class AsyncGoogleAppsScriptClient:
     """
     Async version of the client for asyncio applications
-    Uses thread pool for blocking operations
+    Uses thread pool for blocking operations while maintaining OTEL contexts.
     """
     
     def __init__(self, config: Optional[AppsScriptConfig] = None):
         self._sync_client = GoogleAppsScriptClient(config)
-        self._loop = asyncio.get_event_loop()
+        try:
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self._loop = None
         self._executor = None
     
     async def call_script(self, *args, **kwargs) -> AppsScriptResult:
-        """Async wrapper for call_script"""
-        return await self._loop.run_in_executor(
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
             self._executor,
             lambda: self._sync_client.call_script(*args, **kwargs)
         )
     
     async def sync_page_quotes(self, *args, **kwargs) -> AppsScriptResult:
-        """Async wrapper for sync_page_quotes"""
-        return await self._loop.run_in_executor(
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
             self._executor,
             lambda: self._sync_client.sync_page_quotes(*args, **kwargs)
         )
     
     async def ping(self, *args, **kwargs) -> AppsScriptResult:
-        """Async wrapper for ping"""
-        return await self._loop.run_in_executor(
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
             self._executor,
             lambda: self._sync_client.ping(*args, **kwargs)
         )
     
     async def get_status(self) -> Dict[str, Any]:
-        """Get client status"""
-        return await self._loop.run_in_executor(
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
             self._executor,
             self._sync_client.get_status
         )
     
     async def close(self) -> None:
-        """Close the client"""
-        await self._loop.run_in_executor(
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
             self._executor,
             self._sync_client.close
         )
     
     @asynccontextmanager
     async def session(self):
-        """Async context manager"""
         try:
             yield self
         finally:
@@ -1547,20 +1411,13 @@ class AsyncGoogleAppsScriptClient:
 # Singleton Instances
 # -----------------------------------------------------------------------------
 
-# Default sync client
 apps_script_client = GoogleAppsScriptClient()
-
-# Default async client
 async_apps_script_client = AsyncGoogleAppsScriptClient()
 
-# Convenience functions
 def get_apps_script_client() -> GoogleAppsScriptClient:
-    """Get default sync client"""
     return apps_script_client
 
-
 def get_async_apps_script_client() -> AsyncGoogleAppsScriptClient:
-    """Get default async client"""
     return async_apps_script_client
 
 
@@ -1569,90 +1426,11 @@ def get_async_apps_script_client() -> AsyncGoogleAppsScriptClient:
 # -----------------------------------------------------------------------------
 
 __all__ = [
-    # Version
-    "CLIENT_VERSION",
-    
-    # Enums
-    "RequestMethod",
-    "TokenTransport",
-    "CircuitState",
-    "FailureType",
-    "MarketCategory",
-    
-    # Configuration
-    "AppsScriptConfig",
-    
-    # Models
-    "AppsScriptResult",
-    "PageSpec",
-    
-    # Utilities
-    "SymbolNormalizer",
-    "split_tickers_by_market",
-    "normalize_page_key",
-    "resolve_page_spec",
-    "prune_none",
-    "now_utc_iso",
-    
-    # Clients
-    "GoogleAppsScriptClient",
-    "AsyncGoogleAppsScriptClient",
-    "apps_script_client",
-    "async_apps_script_client",
-    "get_apps_script_client",
-    "get_async_apps_script_client",
-    
-    # Page specifications
-    "PAGE_SPECS",
+    "CLIENT_VERSION", "RequestMethod", "TokenTransport", "CircuitState",
+    "FailureType", "MarketCategory", "AppsScriptConfig", "AppsScriptResult",
+    "PageSpec", "SymbolNormalizer", "split_tickers_by_market",
+    "normalize_page_key", "resolve_page_spec", "prune_none", "now_utc_iso",
+    "GoogleAppsScriptClient", "AsyncGoogleAppsScriptClient",
+    "apps_script_client", "async_apps_script_client",
+    "get_apps_script_client", "get_async_apps_script_client", "PAGE_SPECS",
 ]
-
-# -----------------------------------------------------------------------------
-# Self-Test
-# -----------------------------------------------------------------------------
-if __name__ == "__main__":
-    import sys
-    
-    async def test_async():
-        print(f"\n🔧 Testing Google Apps Script Client v{CLIENT_VERSION}")
-        print("=" * 60)
-        
-        # Test sync client
-        client = GoogleAppsScriptClient()
-        status = client.get_status()
-        
-        print(f"\n📊 Client Status:")
-        print(f"  Environment: {status['config']['environment']}")
-        print(f"  Primary URL: {status['config']['primary_url']}")
-        print(f"  Backup URL: {status['config']['backup_url']}")
-        print(f"  Circuit State: {status['circuit_breaker']['state']}")
-        
-        # Test market detection
-        print(f"\n🌍 Market Detection:")
-        test_symbols = ["1120", "AAPL", "2222.SR", "MSFT", "TADAWUL:1120"]
-        normalizer = SymbolNormalizer()
-        for sym in test_symbols:
-            market = normalizer.detect_market(sym)
-            print(f"  {sym:15} -> {market.value}")
-        
-        # Test ticker splitting
-        ksa, glb = split_tickers_by_market(test_symbols)
-        print(f"\n📈 Ticker Splitting:")
-        print(f"  KSA: {ksa}")
-        print(f"  Global: {glb}")
-        
-        # Test page resolution
-        print(f"\n📄 Page Resolution:")
-        test_pages = ["KSA_TADAWUL", "portfolio", "global", "unknown"]
-        for page in test_pages:
-            spec = resolve_page_spec(page)
-            print(f"  {page:15} -> market={spec.market.value}, mode={spec.mode}")
-        
-        # Test async client
-        async_client = AsyncGoogleAppsScriptClient()
-        async_status = await async_client.get_status()
-        print(f"\n🔄 Async Client Status: OK")
-        
-        print("\n✅ Test complete")
-        print("=" * 60)
-    
-    asyncio.run(test_async())
