@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
 """
-symbols_reader.py
-===========================================================
-TADAWUL FAST BRIDGE – ENTERPRISE SYMBOLS READER (v4.5.0)
-===========================================================
-Advanced Intelligent Symbol Discovery & Management System
+core/symbols_reader.py
+================================================================================
+TADAWUL FAST BRIDGE – ENTERPRISE SYMBOLS READER (v7.5.0)
+================================================================================
+QUANTUM EDITION | INTELLIGENT DISCOVERY | ASYNC ORCHESTRATION
+
+What's new in v7.5.0:
+- ✅ High-Performance JSON (`orjson`): Blazing fast serialization for cached sheets.
+- ✅ Memory Optimization: `@dataclass(slots=True)` reduces memory footprint during large scans.
+- ✅ Async Thread Pooling: Non-blocking Google Sheets API calls using `asyncio.to_thread`.
+- ✅ Full Jitter Exponential Backoff: Protects against Google API rate limits (429s).
+- ✅ Multi-Tier Caching: Zlib-compressed Memory (L1) + Redis (L2) cache architecture.
+- ✅ OpenTelemetry Tracing: Granular observability across discovery strategies.
+- ✅ Prometheus Metrics: Real-time tracking of discovery performance and cache hits.
 
 Core Capabilities
 -----------------
@@ -12,52 +21,16 @@ Core Capabilities
 • Intelligent column detection with confidence scoring
 • Symbol normalization with KSA/Global classification
 • Multi-source aggregation (Google Sheets, CSV, JSON, API)
-• Advanced caching with TTL and invalidation
 • Symbol relationship mapping (parent/child, ETFs, indices)
 • Sector/Industry classification enrichment
-• Symbol validation against live market data
-• Duplicate detection and resolution
-• Origin tracking for auditability
-• Rate-limited sheet access with retries
-• Comprehensive metadata and diagnostics
-
-Architecture
-------------
-┌─────────────────────────────────────────────────────────┐
-│                    Symbols Reader                        │
-├─────────────────────────────────────────────────────────┤
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐    │
-│  │   Registry  │  │   Detector  │  │ Normalizer  │    │
-│  │   Manager   │  │   Engine    │  │   Pipeline  │    │
-│  └─────────────┘  └─────────────┘  └─────────────┘    │
-├─────────────────────────────────────────────────────────┤
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐    │
-│  │   Cache     │  │   Origin    │  │   Enricher  │    │
-│  │   Layer     │  │   Tracker   │  │   Engine    │    │
-│  └─────────────┘  └─────────────┘  └─────────────┘    │
-└─────────────────────────────────────────────────────────┘
-
-Supported Symbol Formats
-------------------------
-• KSA/Tadawul: 1120, 1120.SR, 1120.SR, 1120SR
-• Global: AAPL, MSFT, GOOGL, BRK.B, BF-B
-• Indices: ^GSPC, ^IXIC, ^DJI, .SPX
-• ETFs: SPY, QQQ, IVV, ARKK
-• Mutual Funds: VFINX, VTSAX, FXAIX
-• Currencies: EURUSD=X, GBPUSD=X, JPY=X
-• Cryptocurrencies: BTC-USD, ETH-USD, XRP-USD
-• Commodities: GC=F, CL=F, SI=F
-
-Version: 4.5.0
-Last Updated: 2024-03-20
 """
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import csv
 import hashlib
-import json
 import logging
 import logging.config
 import os
@@ -67,25 +40,34 @@ import re
 import threading
 import time
 import uuid
+import zlib
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from functools import lru_cache, wraps
 from pathlib import Path
 from typing import (Any, Callable, Dict, Generator, Iterable, List, Optional,
-                    Set, Tuple, Type, TypeVar, Union, cast)
+                    Set, Tuple, Type, TypeVar, Union, cast, Awaitable)
 
-# =============================================================================
-# Version & Core Configuration
-# =============================================================================
-VERSION = "4.5.0"
-SCHEMA_VERSION = "2.0"
-MIN_PYTHON = (3, 8)
-
-if sys.version_info < MIN_PYTHON:
-    sys.exit(f"❌ Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ required")
+# ---------------------------------------------------------------------------
+# High-Performance JSON fallback
+# ---------------------------------------------------------------------------
+try:
+    import orjson
+    def json_dumps(v, *, default=None):
+        return orjson.dumps(v, default=default).decode('utf-8')
+    def json_loads(v):
+        return orjson.loads(v)
+    _HAS_ORJSON = True
+except ImportError:
+    import json
+    def json_dumps(v, *, default=None):
+        return json.dumps(v, default=default)
+    def json_loads(v):
+        return json.loads(v)
+    _HAS_ORJSON = False
 
 # =============================================================================
 # Optional Dependencies with Graceful Degradation
@@ -99,7 +81,7 @@ try:
 except ImportError:
     Credentials = None
     build = None
-    HttpError = None
+    HttpError = Exception
     GOOGLE_API_AVAILABLE = False
 
 # CSV/Data processing
@@ -110,15 +92,6 @@ except ImportError:
     pd = None
     PANDAS_AVAILABLE = False
 
-# Async HTTP
-try:
-    import aiohttp
-    import aiohttp.client_exceptions
-    ASYNC_HTTP_AVAILABLE = True
-except ImportError:
-    aiohttp = None
-    ASYNC_HTTP_AVAILABLE = False
-
 # Machine Learning (optional)
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
@@ -126,6 +99,40 @@ try:
     ML_AVAILABLE = True
 except ImportError:
     ML_AVAILABLE = False
+
+# Redis Cache
+try:
+    import redis.asyncio as aioredis
+    from redis.asyncio import Redis
+    REDIS_AVAILABLE = True
+except ImportError:
+    aioredis = None
+    Redis = None
+    REDIS_AVAILABLE = False
+
+# Monitoring & Tracing
+try:
+    from prometheus_client import Counter, Histogram, Gauge
+    PROMETHEUS_AVAILABLE = True
+except ImportError:
+    PROMETHEUS_AVAILABLE = False
+
+try:
+    from opentelemetry import trace
+    from opentelemetry.trace import Status, StatusCode
+    OTEL_AVAILABLE = True
+    tracer = trace.get_tracer(__name__)
+except ImportError:
+    OTEL_AVAILABLE = False
+    class DummySpan:
+        def set_attribute(self, *args, **kwargs): pass
+        def set_status(self, *args, **kwargs): pass
+        def record_exception(self, *args, **kwargs): pass
+        def __enter__(self): return self
+        def __exit__(self, *args, **kwargs): pass
+    class DummyTracer:
+        def start_as_current_span(self, *args, **kwargs): return DummySpan()
+    tracer = DummyTracer()
 
 # =============================================================================
 # Logging Configuration
@@ -137,10 +144,55 @@ logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=DATE_FORMAT)
 logger = logging.getLogger("symbols_reader")
 
 # =============================================================================
-# Enums & Types
+# Metrics & Tracing
+# =============================================================================
+
+_TRACING_ENABLED = os.getenv("CORE_TRACING_ENABLED", "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+class TraceContext:
+    """OpenTelemetry trace context manager."""
+    def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
+        self.name = name
+        self.attributes = attributes or {}
+        self.tracer = tracer if OTEL_AVAILABLE and _TRACING_ENABLED else None
+        self.span = None
+    
+    def __enter__(self):
+        if self.tracer:
+            self.span = self.tracer.start_as_current_span(self.name)
+            if self.attributes:
+                self.span.set_attributes(self.attributes)
+        return self
+    
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.span and OTEL_AVAILABLE:
+            if exc_val:
+                self.span.record_exception(exc_val)
+                self.span.set_status(Status(StatusCode.ERROR, str(exc_val)))
+            self.span.__exit__(exc_type, exc_val, exc_tb)
+
+    async def __aenter__(self): return self.__enter__()
+    async def __aexit__(self, exc_type, exc_val, exc_tb): return self.__exit__(exc_type, exc_val, exc_tb)
+
+if PROMETHEUS_AVAILABLE:
+    reader_requests_total = Counter('symbols_reader_requests_total', 'Total read requests', ['sheet', 'status'])
+    reader_discovery_duration = Histogram('symbols_reader_discovery_duration_seconds', 'Discovery duration', ['strategy'])
+    reader_cache_hits = Counter('symbols_reader_cache_hits_total', 'Cache hits', ['level'])
+    reader_cache_misses = Counter('symbols_reader_cache_misses_total', 'Cache misses', ['level'])
+else:
+    class DummyMetric:
+        def labels(self, *args, **kwargs): return self
+        def inc(self, *args, **kwargs): pass
+        def observe(self, *args, **kwargs): pass
+    reader_requests_total = DummyMetric()
+    reader_discovery_duration = DummyMetric()
+    reader_cache_hits = DummyMetric()
+    reader_cache_misses = DummyMetric()
+
+# =============================================================================
+# Enums & Types (Memory Optimized)
 # =============================================================================
 class SymbolType(Enum):
-    """Symbol classification types"""
     KSA = "ksa"
     GLOBAL = "global"
     INDEX = "index"
@@ -152,7 +204,6 @@ class SymbolType(Enum):
     UNKNOWN = "unknown"
 
 class DiscoveryStrategy(Enum):
-    """Symbol discovery strategies"""
     HEADER = "header"
     DATA_SCAN = "data_scan"
     ML = "ml"
@@ -160,20 +211,12 @@ class DiscoveryStrategy(Enum):
     DEFAULT = "default"
 
 class ConfidenceLevel(Enum):
-    """Confidence levels for detection"""
     HIGH = "high"
     MEDIUM = "medium"
     LOW = "low"
     NONE = "none"
 
-class CacheBackend(Enum):
-    """Cache backends"""
-    MEMORY = "memory"
-    REDIS = "redis"
-    DISK = "disk"
-    NONE = "none"
-
-@dataclass
+@dataclass(slots=True)
 class SymbolMetadata:
     """Rich symbol metadata"""
     symbol: str
@@ -192,13 +235,13 @@ class SymbolMetadata:
     currency: Optional[str] = None
     name: Optional[str] = None
     is_active: bool = True
-    discovered_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    last_validated: Optional[datetime] = None
+    discovered_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    last_validated: Optional[str] = None
     validation_status: Optional[str] = None
     tags: List[str] = field(default_factory=list)
     properties: Dict[str, Any] = field(default_factory=dict)
 
-@dataclass
+@dataclass(slots=True)
 class PageSpec:
     """Page specification with enhanced metadata"""
     key: str
@@ -212,9 +255,7 @@ class PageSpec:
     required: bool = False
     description: str = ""
     tags: List[str] = field(default_factory=list)
-    pre_processor: Optional[Callable] = None
-    post_processor: Optional[Callable] = None
-    cache_ttl: Optional[int] = None  # Override global cache TTL
+    cache_ttl: Optional[int] = None
 
 # =============================================================================
 # Utility Functions
@@ -233,180 +274,140 @@ _TICKER_PATTERNS = {
         re.compile(r'^\d{4}$'),  # 1120
         re.compile(r'^\d{4}\.SR$', re.IGNORECASE),  # 1120.SR
         re.compile(r'^\d{4}SR$', re.IGNORECASE),  # 1120SR
-        re.compile(r'^[0-9]{4}\.(SR|TADAWUL)$', re.IGNORECASE),  # 1120.SR, 1120.TADAWUL
+        re.compile(r'^[0-9]{4}\.(SR|TADAWUL)$', re.IGNORECASE),
     ],
     'global': [
         re.compile(r'^[A-Z]{1,5}$'),  # AAPL, MSFT
-        re.compile(r'^[A-Z]{1,4}\.[A-Z]{1,2}$'),  # BRK.B, BF.B
-        re.compile(r'^[A-Z]{1,5}-[A-Z]{1,5}$'),  # BRK-A, BRK-B
+        re.compile(r'^[A-Z]{1,4}\.[A-Z]{1,2}$'),  # BRK.B
+        re.compile(r'^[A-Z]{1,5}-[A-Z]{1,5}$'),  # BRK-A
     ],
     'index': [
-        re.compile(r'^\^[A-Z]{2,5}$'),  # ^GSPC, ^IXIC
-        re.compile(r'^\.[A-Z]{2,5}$'),  # .SPX, .DJI
-        re.compile(r'^[A-Z]{2,5}\.INDX$', re.IGNORECASE),  # SPX.INDX
+        re.compile(r'^\^[A-Z]{2,5}$'),  # ^GSPC
+        re.compile(r'^\.[A-Z]{2,5}$'),  # .SPX
+        re.compile(r'^[A-Z]{2,5}\.INDX$', re.IGNORECASE),
     ],
     'etf': [
-        re.compile(r'^[A-Z]{3,5}$'),  # SPY, QQQ, IVV
-        re.compile(r'^[A-Z]{3,5}\.[A-Z]{2}$'),  # VOO.AS, IWDA.L
+        re.compile(r'^[A-Z]{3,5}$'),
+        re.compile(r'^[A-Z]{3,5}\.[A-Z]{2}$'),
     ],
     'mutual_fund': [
-        re.compile(r'^[A-Z]{5}$'),  # VFINX, VTSAX
-        re.compile(r'^[A-Z]{5}\.[A-Z]{2}$'),  # VFINX.US
+        re.compile(r'^[A-Z]{5}$'),
+        re.compile(r'^[A-Z]{5}\.[A-Z]{2}$'),
     ],
     'currency': [
-        re.compile(r'^[A-Z]{6}=X$'),  # EURUSD=X
-        re.compile(r'^[A-Z]{3}/[A-Z]{3}$'),  # EUR/USD
-        re.compile(r'^[A-Z]{3}[A-Z]{3}$'),  # EURUSD
+        re.compile(r'^[A-Z]{6}=X$'),
+        re.compile(r'^[A-Z]{3}/[A-Z]{3}$'),
+        re.compile(r'^[A-Z]{3}[A-Z]{3}$'),
     ],
     'crypto': [
-        re.compile(r'^[A-Z]{3,5}-USD$'),  # BTC-USD
-        re.compile(r'^[A-Z]{3,5}/USD$'),  # BTC/USD
-        re.compile(r'^[A-Z]{3,5}$'),  # BTC (if context known)
+        re.compile(r'^[A-Z]{3,5}-USD$'),
+        re.compile(r'^[A-Z]{3,5}/USD$'),
+        re.compile(r'^[A-Z]{3,5}$'),
     ],
     'commodity': [
-        re.compile(r'^[A-Z]{2}=F$'),  # GC=F, CL=F
-        re.compile(r'^[A-Z]{2}\d{2}=F$'),  # GCZ24=F
+        re.compile(r'^[A-Z]{2}=F$'),
+        re.compile(r'^[A-Z]{2}\d{2}=F$'),
     ]
 }
 
 def strip_value(v: Any) -> str:
-    """Strip whitespace from value"""
-    try:
-        return str(v).strip()
-    except Exception:
-        return ""
-
-def strip_wrapping_quotes(s: str) -> str:
-    """Remove wrapping quotes from string"""
-    t = strip_value(s)
-    if len(t) >= 2 and ((t[0] == t[-1] == '"') or (t[0] == t[-1] == "'")):
-        return t[1:-1].strip()
-    return t
+    try: return str(v).strip()
+    except Exception: return ""
 
 def coerce_bool(v: Any, default: bool = False) -> bool:
-    """Coerce value to boolean"""
-    if isinstance(v, bool):
-        return v
+    if isinstance(v, bool): return v
     s = strip_value(v).lower()
-    if not s:
-        return default
-    if s in _TRUTHY:
-        return True
-    if s in _FALSY:
-        return False
+    if not s: return default
+    if s in _TRUTHY: return True
+    if s in _FALSY: return False
     return default
 
-def coerce_int(v: Any, default: int, *, lo: Optional[int] = None, hi: Optional[int] = None) -> int:
-    """Coerce value to integer with bounds"""
-    try:
-        x = int(float(strip_value(v)))
-    except (ValueError, TypeError):
-        x = default
-    if lo is not None and x < lo:
-        x = lo
-    if hi is not None and x > hi:
-        x = hi
-    return x
-
-def coerce_float(v: Any, default: float, *, lo: Optional[float] = None, hi: Optional[float] = None) -> float:
-    """Coerce value to float with bounds"""
-    try:
-        x = float(strip_value(v))
-    except (ValueError, TypeError):
-        x = default
-    if lo is not None and x < lo:
-        x = lo
-    if hi is not None and x > hi:
-        x = hi
-    return x
-
 def get_env_bool(key: str, default: bool = False) -> bool:
-    """Get boolean from environment"""
     return coerce_bool(os.getenv(key), default)
 
 def get_env_int(key: str, default: int, **kwargs) -> int:
-    """Get integer from environment"""
-    return coerce_int(os.getenv(key), default, **kwargs)
+    try: return int(float(os.getenv(key, str(default)).strip()))
+    except Exception: return default
 
 def get_env_float(key: str, default: float, **kwargs) -> float:
-    """Get float from environment"""
-    return coerce_float(os.getenv(key), default, **kwargs)
+    try: return float(os.getenv(key, str(default)).strip())
+    except Exception: return default
 
 def get_env_str(key: str, default: str = "") -> str:
-    """Get string from environment"""
     return strip_value(os.getenv(key)) or default
 
-def get_env_list(key: str, default: Optional[List[str]] = None) -> List[str]:
-    """Get list from environment (comma-separated)"""
-    value = os.getenv(key)
-    if not value:
-        return default or []
-    return [v.strip() for v in value.split(",") if v.strip()]
-
-def now_utc_iso() -> str:
-    """Get current UTC time in ISO format"""
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-
-def now_riyadh_iso() -> str:
-    """Get current Riyadh time in ISO format"""
-    tz = timezone(timedelta(hours=3))
-    return datetime.now(tz).isoformat(timespec="milliseconds")
-
-def mask_secret(s: Optional[str], reveal_first: int = 3, reveal_last: int = 3) -> str:
-    """Mask secret string for logging"""
-    if s is None:
-        return "MISSING"
-    x = strip_value(s)
-    if not x:
-        return "EMPTY"
-    if len(x) < reveal_first + reveal_last + 4:
-        return "***"
-    return f"{x[:reveal_first]}...{x[-reveal_last:]}"
-
 def split_cell(cell: Any) -> List[str]:
-    """Split cell content into tokens"""
     raw = strip_value(cell)
-    if not raw:
-        return []
-    # Split by common separators: comma, space, newline, semicolon, pipe, tab
+    if not raw: return []
     parts = re.split(r"[\s,;|\t\n\r]+", raw)
     return [p.strip() for p in parts if p and p.strip()]
+
+# =============================================================================
+# Full Jitter Backoff
+# =============================================================================
+
+class FullJitterBackoff:
+    """Safe retry mechanism implementing AWS Full Jitter Backoff."""
+    def __init__(self, max_retries: int = 4, base_delay: float = 1.0, max_delay: float = 30.0):
+        self.max_retries = max_retries
+        self.base_delay = base_delay
+        self.max_delay = max_delay
+
+    async def execute_async(self, func: Callable, *args, **kwargs) -> Any:
+        last_err = None
+        for attempt in range(self.max_retries):
+            try:
+                return await func(*args, **kwargs)
+            except Exception as e:
+                last_err = e
+                # Only retry on rate limits or server errors
+                error_str = str(e).lower()
+                retryable = any(x in error_str for x in ["rate limit", "quota", "429", "500", "502", "503", "timeout"])
+                
+                if not retryable or attempt == self.max_retries - 1:
+                    raise
+                temp = min(self.max_delay, self.base_delay * (2 ** attempt))
+                await asyncio.sleep(random.uniform(0, temp))
+        raise last_err
+
+    def execute_sync(self, func: Callable, *args, **kwargs) -> Any:
+        last_err = None
+        for attempt in range(self.max_retries):
+            try:
+                return func(*args, **kwargs)
+            except Exception as e:
+                last_err = e
+                error_str = str(e).lower()
+                retryable = any(x in error_str for x in ["rate limit", "quota", "429", "500", "502", "503", "timeout"])
+                
+                if not retryable or attempt == self.max_retries - 1:
+                    raise
+                temp = min(self.max_delay, self.base_delay * (2 ** attempt))
+                time.sleep(random.uniform(0, temp))
+        raise last_err
 
 # =============================================================================
 # Configuration
 # =============================================================================
 class Config:
-    """Configuration manager for symbols reader"""
+    DEFAULT_HEADER_ROW = get_env_int("TFB_SYMBOL_HEADER_ROW", 5)
+    DEFAULT_START_ROW = get_env_int("TFB_SYMBOL_START_ROW", 6)
+    DEFAULT_MAX_ROWS = get_env_int("TFB_SYMBOL_MAX_ROWS", 5000)
 
-    # Row configuration
-    DEFAULT_HEADER_ROW = get_env_int("TFB_SYMBOL_HEADER_ROW", 5, lo=1, hi=100)
-    DEFAULT_START_ROW = get_env_int("TFB_SYMBOL_START_ROW", 6, lo=2, hi=10000)
-    DEFAULT_MAX_ROWS = get_env_int("TFB_SYMBOL_MAX_ROWS", 5000, lo=10, hi=100000)
-
-    # Cache configuration
-    CACHE_TTL_SEC = get_env_float("TFB_SYMBOLS_CACHE_TTL_SEC", 45.0, lo=1.0, hi=3600.0)
+    CACHE_TTL_SEC = get_env_float("TFB_SYMBOLS_CACHE_TTL_SEC", 300.0)
     CACHE_DISABLE = get_env_bool("TFB_SYMBOLS_CACHE_DISABLE", False)
-    CACHE_BACKEND = get_env_str("TFB_SYMBOLS_CACHE_BACKEND", "memory")
-    CACHE_MAX_SIZE = get_env_int("TFB_SYMBOLS_CACHE_MAX_SIZE", 1000, lo=10, hi=10000)
+    CACHE_BACKEND = get_env_str("TFB_SYMBOLS_CACHE_BACKEND", "redis" if REDIS_AVAILABLE else "memory")
+    CACHE_MAX_SIZE = get_env_int("TFB_SYMBOLS_CACHE_MAX_SIZE", 1000)
+    CACHE_COMPRESSION = get_env_bool("TFB_SYMBOLS_CACHE_COMPRESSION", True)
 
-    # Performance
-    MAX_RETRIES = get_env_int("TFB_SYMBOLS_MAX_RETRIES", 3, lo=0, hi=10)
-    RETRY_DELAY = get_env_float("TFB_SYMBOLS_RETRY_DELAY", 0.5, lo=0.1, hi=5.0)
-    BATCH_SIZE = get_env_int("TFB_SYMBOLS_BATCH_SIZE", 100, lo=10, hi=1000)
-    REQUEST_TIMEOUT = get_env_float("TFB_SYMBOLS_TIMEOUT", 30.0, lo=5.0, hi=120.0)
+    MAX_RETRIES = get_env_int("TFB_SYMBOLS_MAX_RETRIES", 4)
+    REQUEST_TIMEOUT = get_env_float("TFB_SYMBOLS_TIMEOUT", 30.0)
 
-    # Validation
-    VALIDATE_SYMBOLS = get_env_bool("TFB_SYMBOLS_VALIDATE", True)
-    VALIDATION_TIMEOUT = get_env_float("TFB_SYMBOLS_VALIDATION_TIMEOUT", 5.0, lo=1.0, hi=30.0)
+    ML_DETECTION_ENABLED = get_env_bool("TFB_SYMBOLS_ML_DETECTION", True) and ML_AVAILABLE
+    ML_CONFIDENCE_THRESHOLD = get_env_float("TFB_SYMBOLS_ML_CONFIDENCE", 0.8)
 
-    # ML detection
-    ML_DETECTION_ENABLED = get_env_bool("TFB_SYMBOLS_ML_DETECTION", False)
-    ML_CONFIDENCE_THRESHOLD = get_env_float("TFB_SYMBOLS_ML_CONFIDENCE", 0.8, lo=0.0, hi=1.0)
-
-    # Logging
     LOG_DETECTION = get_env_bool("TFB_SYMBOLS_LOG_DETECTION", True)
     LOG_PERFORMANCE = get_env_bool("TFB_SYMBOLS_LOG_PERFORMANCE", True)
-
 
 config = Config()
 
@@ -414,717 +415,124 @@ config = Config()
 # Page Registry
 # =============================================================================
 PAGE_REGISTRY: Dict[str, PageSpec] = {
-    # Market data pages
     "MARKET_LEADERS": PageSpec(
         key="MARKET_LEADERS",
         sheet_names=("Market_Leaders", "Market Leaders", "Leaders"),
-        header_row=5,
-        start_row=6,
-        max_rows=2000,
         header_candidates=("SYMBOL", "TICKER", "CODE"),
         symbol_type=SymbolType.GLOBAL,
-        description="Top market performers and momentum leaders",
-        tags=["market", "leaders", "performance"],
+        description="Top market performers",
     ),
     "GLOBAL_MARKETS": PageSpec(
         key="GLOBAL_MARKETS",
         sheet_names=("Global_Markets", "Global Markets", "World Markets"),
-        header_row=5,
-        start_row=6,
-        max_rows=3000,
         header_candidates=("SYMBOL", "TICKER", "CODE"),
         symbol_type=SymbolType.GLOBAL,
         description="Global equity markets and indices",
-        tags=["global", "markets", "indices"],
     ),
     "KSA_TADAWUL": PageSpec(
         key="KSA_TADAWUL",
         sheet_names=("KSA_Tadawul", "KSA Tadawul", "Tadawul", "Saudi Market"),
-        header_row=5,
-        start_row=6,
-        max_rows=500,
         header_candidates=("SYMBOL", "TICKER", "CODE", "ISIN"),
         symbol_type=SymbolType.KSA,
-        description="Saudi Stock Exchange (Tadawul)",
-        tags=["ksa", "tadawul", "saudi"],
+        description="Saudi Stock Exchange",
     ),
     "MUTUAL_FUNDS": PageSpec(
         key="MUTUAL_FUNDS",
         sheet_names=("Mutual_Funds", "Mutual Funds", "Funds"),
-        header_row=5,
-        start_row=6,
-        max_rows=1000,
         header_candidates=("SYMBOL", "TICKER", "FUND", "CODE"),
         symbol_type=SymbolType.MUTUAL_FUND,
-        description="Mutual funds and ETFs",
-        tags=["funds", "mutual", "etf"],
     ),
     "COMMODITIES_FX": PageSpec(
         key="COMMODITIES_FX",
         sheet_names=("Commodities_FX", "Commodities & FX", "FX & Commodities"),
-        header_row=5,
-        start_row=6,
-        max_rows=500,
         header_candidates=("SYMBOL", "TICKER", "PAIR", "COMMODITY"),
         symbol_type=SymbolType.COMMODITY,
-        description="Commodities and Forex pairs",
-        tags=["commodities", "fx", "forex"],
     ),
-
-    # Portfolio and analysis pages
     "MY_PORTFOLIO": PageSpec(
         key="MY_PORTFOLIO",
         sheet_names=("My_Portfolio", "My Portfolio", "Portfolio"),
-        header_row=5,
-        start_row=6,
-        max_rows=500,
         header_candidates=("SYMBOL", "TICKER", "CODE", "ASSET"),
         symbol_type=SymbolType.GLOBAL,
         required=False,
-        description="User portfolio holdings",
-        tags=["portfolio", "holdings"],
     ),
     "INSIGHTS_ANALYSIS": PageSpec(
         key="INSIGHTS_ANALYSIS",
         sheet_names=("Insights_Analysis", "Insights Analysis", "Analysis"),
-        header_row=5,
-        start_row=6,
-        max_rows=200,
         header_candidates=("SYMBOL", "TICKER", "CODE"),
         symbol_type=SymbolType.GLOBAL,
-        description="Investment insights and analysis",
-        tags=["insights", "analysis"],
-    ),
-    "INVESTMENT_ADVISOR": PageSpec(
-        key="INVESTMENT_ADVISOR",
-        sheet_names=("Investment_Advisor", "Investment Advisor", "Advisor"),
-        header_row=5,
-        start_row=6,
-        max_rows=200,
-        header_candidates=("SYMBOL", "TICKER", "CODE"),
-        symbol_type=SymbolType.GLOBAL,
-        description="Investment advisor recommendations",
-        tags=["advisor", "recommendations"],
-    ),
-    "MARKET_SCAN": PageSpec(
-        key="MARKET_SCAN",
-        sheet_names=("Market_Scan", "Market Scan", "Scan Results"),
-        header_row=5,
-        start_row=6,
-        max_rows=500,
-        header_candidates=("SYMBOL", "TICKER", "CODE"),
-        symbol_type=SymbolType.GLOBAL,
-        description="AI-powered market scan results",
-        tags=["scan", "opportunities"],
-    ),
-
-    # Special pages
-    "WATCHLIST": PageSpec(
-        key="WATCHLIST",
-        sheet_names=("Watchlist", "Watch List", "Watch_List"),
-        header_row=5,
-        start_row=6,
-        max_rows=500,
-        header_candidates=("SYMBOL", "TICKER", "CODE"),
-        symbol_type=SymbolType.GLOBAL,
-        description="User watchlist",
-        tags=["watchlist", "tracking"],
-    ),
-    "HOT_LIST": PageSpec(
-        key="HOT_LIST",
-        sheet_names=("Hot_List", "Hot List", "Hotlist"),
-        header_row=5,
-        start_row=6,
-        max_rows=200,
-        header_candidates=("SYMBOL", "TICKER", "CODE"),
-        symbol_type=SymbolType.GLOBAL,
-        description="Hot stocks and momentum picks",
-        tags=["hot", "momentum"],
-    ),
-    "DIVIDEND_KINGS": PageSpec(
-        key="DIVIDEND_KINGS",
-        sheet_names=("Dividend_Kings", "Dividend Kings", "Dividend Aristocrats"),
-        header_row=5,
-        start_row=6,
-        max_rows=200,
-        header_candidates=("SYMBOL", "TICKER", "CODE"),
-        symbol_type=SymbolType.GLOBAL,
-        description="Dividend aristocrats and kings",
-        tags=["dividend", "income"],
-    ),
-    "IPO_CALENDAR": PageSpec(
-        key="IPO_CALENDAR",
-        sheet_names=("IPO_Calendar", "IPO Calendar", "Upcoming IPOs"),
-        header_row=5,
-        start_row=6,
-        max_rows=200,
-        header_candidates=("SYMBOL", "TICKER", "COMPANY"),
-        symbol_type=SymbolType.GLOBAL,
-        description="Upcoming IPOs",
-        tags=["ipo", "calendar"],
-    ),
-    "EARNINGS_CALENDAR": PageSpec(
-        key="EARNINGS_CALENDAR",
-        sheet_names=("Earnings_Calendar", "Earnings Calendar", "Earnings"),
-        header_row=5,
-        start_row=6,
-        max_rows=500,
-        header_candidates=("SYMBOL", "TICKER", "CODE"),
-        symbol_type=SymbolType.GLOBAL,
-        description="Earnings calendar",
-        tags=["earnings", "calendar"],
-    ),
-    "ECONOMIC_CALENDAR": PageSpec(
-        key="ECONOMIC_CALENDAR",
-        sheet_names=("Economic_Calendar", "Economic Calendar", "Economic Data"),
-        header_row=5,
-        start_row=6,
-        max_rows=200,
-        header_candidates=("EVENT", "INDICATOR"),
-        symbol_type=SymbolType.UNKNOWN,
-        description="Economic calendar",
-        tags=["economic", "calendar"],
-    ),
-    "CRYPTO_MARKET": PageSpec(
-        key="CRYPTO_MARKET",
-        sheet_names=("Crypto_Market", "Crypto Market", "Cryptocurrencies"),
-        header_row=5,
-        start_row=6,
-        max_rows=500,
-        header_candidates=("SYMBOL", "TICKER", "COIN"),
-        symbol_type=SymbolType.CRYPTO,
-        description="Cryptocurrency market",
-        tags=["crypto", "blockchain"],
     ),
 }
-
 
 def resolve_key(key: str) -> str:
     """Resolve canonical page key from alias"""
     k = strip_value(key).upper().replace("-", "_").replace(" ", "_")
-
-    # Common aliases
     aliases = {
-        "KSA": "KSA_TADAWUL",
-        "TADAWUL": "KSA_TADAWUL",
-        "TASI": "KSA_TADAWUL",
-        "SAUDI": "KSA_TADAWUL",
-        "GLOBAL": "GLOBAL_MARKETS",
-        "WORLD": "GLOBAL_MARKETS",
-        "INTERNATIONAL": "GLOBAL_MARKETS",
-        "LEADERS": "MARKET_LEADERS",
-        "MARKETLEADERS": "MARKET_LEADERS",
-        "PORTFOLIO": "MY_PORTFOLIO",
-        "MYPORTFOLIO": "MY_PORTFOLIO",
-        "INSIGHTS": "INSIGHTS_ANALYSIS",
-        "ANALYSIS": "INSIGHTS_ANALYSIS",
-        "ADVISOR": "INVESTMENT_ADVISOR",
-        "INVESTMENTADVISOR": "INVESTMENT_ADVISOR",
-        "SCAN": "MARKET_SCAN",
-        "MARKETSCAN": "MARKET_SCAN",
-        "WATCH": "WATCHLIST",
-        "WATCHLIST": "WATCHLIST",
-        "HOT": "HOT_LIST",
-        "HOTLIST": "HOT_LIST",
-        "DIVIDEND": "DIVIDEND_KINGS",
-        "DIVIDENDKINGS": "DIVIDEND_KINGS",
-        "IPO": "IPO_CALENDAR",
-        "EARNINGS": "EARNINGS_CALENDAR",
-        "ECONOMIC": "ECONOMIC_CALENDAR",
-        "CRYPTO": "CRYPTO_MARKET",
-        "CRYPTOCURRENCY": "CRYPTO_MARKET",
+        "KSA": "KSA_TADAWUL", "TADAWUL": "KSA_TADAWUL", "SAUDI": "KSA_TADAWUL",
+        "GLOBAL": "GLOBAL_MARKETS", "WORLD": "GLOBAL_MARKETS",
+        "PORTFOLIO": "MY_PORTFOLIO", "MYPORTFOLIO": "MY_PORTFOLIO",
+        "INSIGHTS": "INSIGHTS_ANALYSIS", "ANALYSIS": "INSIGHTS_ANALYSIS",
+        "LEADERS": "MARKET_LEADERS", "FUNDS": "MUTUAL_FUNDS",
+        "COMMODITIES": "COMMODITIES_FX", "FX": "COMMODITIES_FX",
     }
-
     return aliases.get(k, k)
 
-
 # =============================================================================
-# Google Sheets Authentication
-# =============================================================================
-class GoogleSheetsAuth:
-    """Enhanced Google Sheets authentication with multiple strategies"""
-
-    def __init__(self):
-        self.credentials = None
-        self.service = None
-        self._lock = threading.Lock()
-
-    def _repair_private_key(self, key: str) -> str:
-        """Repair private key with common issues"""
-        if not key:
-            return key
-        # Fix escaped newlines
-        key = key.replace('\\n', '\n')
-        key = key.replace('\\r\\n', '\n')
-        return key
-
-    def _decode_base64_if_needed(self, s: str) -> str:
-        """Decode base64 if string appears to be base64 encoded"""
-        t = strip_wrapping_quotes(s)
-        if not t or t.startswith("{"):
-            return t
-        # Check if it looks like base64 (no spaces, length multiple of 4, base64 chars)
-        if len(t) < 50 or not re.match(r'^[A-Za-z0-9+/=]+$', t):
-            return t
-        try:
-            decoded = base64.b64decode(t, validate=True).decode("utf-8", errors="replace").strip()
-            if decoded.startswith("{"):
-                return decoded
-        except Exception:
-            pass
-        return t
-
-    def _parse_json_credentials(self, raw: str) -> Optional[Dict[str, Any]]:
-        """Parse JSON credentials with repair"""
-        t = self._decode_base64_if_needed(raw)
-        try:
-            obj = json.loads(t)
-            if isinstance(obj, dict):
-                if "private_key" in obj and isinstance(obj["private_key"], str):
-                    obj["private_key"] = self._repair_private_key(obj["private_key"])
-                return obj
-        except Exception as e:
-            logger.debug(f"Failed to parse JSON credentials: {e}")
-        return None
-
-    def _load_from_file(self, path: str) -> Optional[Dict[str, Any]]:
-        """Load credentials from file"""
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                content = f.read()
-            return self._parse_json_credentials(content)
-        except Exception as e:
-            logger.debug(f"Failed to load credentials from file {path}: {e}")
-        return None
-
-    def load_credentials(self) -> Optional[Dict[str, Any]]:
-        """Load credentials from various sources"""
-        # Try environment variables in order
-        for env_var in ["GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS"]:
-            raw = os.getenv(env_var)
-            if raw:
-                creds = self._parse_json_credentials(raw)
-                if creds:
-                    logger.info(f"Loaded credentials from {env_var}")
-                    return creds
-
-        # Try GOOGLE_APPLICATION_CREDENTIALS file
-        path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-        if path and os.path.exists(path):
-            creds = self._load_from_file(path)
-            if creds:
-                logger.info(f"Loaded credentials from {path}")
-                return creds
-
-        # Try default paths
-        default_paths = [
-            "credentials.json",
-            "service-account.json",
-            "google-creds.json",
-            "config/credentials.json",
-            "secrets/credentials.json",
-        ]
-
-        for path in default_paths:
-            if os.path.exists(path):
-                creds = self._load_from_file(path)
-                if creds:
-                    logger.info(f"Loaded credentials from {path}")
-                    return creds
-
-        logger.warning("No Google Sheets credentials found")
-        return None
-
-    def get_service(self):
-        """Get or create Google Sheets service"""
-        if self.service is not None:
-            return self.service
-
-        with self._lock:
-            if self.service is not None:
-                return self.service
-
-            if not GOOGLE_API_AVAILABLE:
-                logger.error("Google API libraries not available")
-                return None
-
-            creds_info = self.load_credentials()
-            if not creds_info:
-                return None
-
-            try:
-                scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
-                credentials = Credentials.from_service_account_info(creds_info, scopes=scopes)
-                self.service = build("sheets", "v4", credentials=credentials, cache_discovery=False)
-                logger.info("Google Sheets service initialized")
-                return self.service
-            except Exception as e:
-                logger.error(f"Failed to initialize Google Sheets service: {e}")
-                return None
-
-
-# =============================================================================
-# Symbol Normalizer
-# =============================================================================
-class SymbolNormalizer:
-    """Advanced symbol normalization with type detection"""
-
-    def __init__(self):
-        self.cache: Dict[str, Tuple[str, SymbolType]] = {}
-        self._lock = threading.Lock()
-
-    def normalize(self, raw: str) -> Tuple[str, SymbolType]:
-        """Normalize symbol and detect type"""
-        with self._lock:
-            if raw in self.cache:
-                return self.cache[raw]
-
-        s = strip_value(raw).upper()
-
-        # Remove common prefixes/suffixes
-        prefixes = ["$", "#", "^", "NYSE:", "NASDAQ:", "TADAWUL:", "SR:", "SAUDI:"]
-        suffixes = [".SR", ".SA", ".AB", ".TADAWUL", ".NYSE", ".NASDAQ"]
-
-        for p in prefixes:
-            if s.startswith(p):
-                s = s[len(p):]
-                break
-
-        for suf in suffixes:
-            if s.endswith(suf):
-                s = s[:-len(suf)]
-                break
-
-        # Detect symbol type
-        symbol_type = self._detect_type(s, raw)
-
-        # Normalize KSA symbols to standard format
-        if symbol_type == SymbolType.KSA:
-            if re.match(r'^\d{4}$', s):
-                s = f"{s}.SR"
-            elif re.match(r'^\d{4}SR$', s):
-                s = f"{s[:4]}.SR"
-            elif re.match(r'^\d{4}\.SR$', s, re.IGNORECASE):
-                s = s.upper()
-
-        with self._lock:
-            self.cache[raw] = (s, symbol_type)
-            if len(self.cache) > 10000:  # Limit cache size
-                # Remove oldest 20%
-                remove = len(self.cache) // 5
-                for _ in range(remove):
-                    self.cache.pop(next(iter(self.cache)))
-
-        return s, symbol_type
-
-    def _detect_type(self, normalized: str, original: str) -> SymbolType:
-        """Detect symbol type based on patterns"""
-        # Check original for clues
-        orig_upper = original.upper()
-
-        if ".SR" in orig_upper or "TADAWUL" in orig_upper or "SAUDI" in orig_upper:
-            return SymbolType.KSA
-
-        # Check patterns
-        for pattern in _TICKER_PATTERNS['ksa']:
-            if pattern.match(normalized) or pattern.match(orig_upper):
-                return SymbolType.KSA
-
-        for pattern in _TICKER_PATTERNS['index']:
-            if pattern.match(orig_upper):
-                return SymbolType.INDEX
-
-        for pattern in _TICKER_PATTERNS['crypto']:
-            if pattern.match(orig_upper):
-                return SymbolType.CRYPTO
-
-        for pattern in _TICKER_PATTERNS['currency']:
-            if pattern.match(orig_upper):
-                return SymbolType.CURRENCY
-
-        for pattern in _TICKER_PATTERNS['commodity']:
-            if pattern.match(orig_upper):
-                return SymbolType.COMMODITY
-
-        for pattern in _TICKER_PATTERNS['etf']:
-            if pattern.match(normalized):
-                return SymbolType.ETF
-
-        for pattern in _TICKER_PATTERNS['mutual_fund']:
-            if pattern.match(normalized):
-                return SymbolType.MUTUAL_FUND
-
-        for pattern in _TICKER_PATTERNS['global']:
-            if pattern.match(normalized):
-                return SymbolType.GLOBAL
-
-        return SymbolType.UNKNOWN
-
-    def is_ksa(self, symbol: str) -> bool:
-        """Check if symbol is KSA"""
-        _, sym_type = self.normalize(symbol)
-        return sym_type == SymbolType.KSA
-
-    def is_valid(self, symbol: str) -> bool:
-        """Check if symbol is valid"""
-        norm, sym_type = self.normalize(symbol)
-        if not norm:
-            return False
-        if sym_type == SymbolType.UNKNOWN:
-            return False
-        if norm in _BLOCKLIST_EXACT:
-            return False
-        return True
-
-
-normalizer = SymbolNormalizer()
-
-# =============================================================================
-# Symbol Validator (optional)
-# =============================================================================
-class SymbolValidator:
-    """Validate symbols against live market data"""
-
-    def __init__(self):
-        self.cache: Dict[str, Tuple[bool, float]] = {}
-        self._lock = threading.Lock()
-
-    async def validate(self, symbol: str, timeout: float = 5.0) -> bool:
-        """Validate symbol by checking with provider"""
-        # Check cache
-        with self._lock:
-            if symbol in self.cache:
-                valid, timestamp = self.cache[symbol]
-                if time.time() - timestamp < 3600:  # 1 hour cache
-                    return valid
-
-        if not ASYNC_HTTP_AVAILABLE:
-            return True  # Can't validate without aiohttp
-
-        norm, sym_type = normalizer.normalize(symbol)
-
-        # Try multiple providers
-        valid = await self._check_with_providers(norm, timeout)
-
-        with self._lock:
-            self.cache[symbol] = (valid, time.time())
-            if len(self.cache) > 1000:
-                # Remove oldest
-                remove = len(self.cache) // 5
-                for _ in range(remove):
-                    self.cache.pop(next(iter(self.cache)))
-
-        return valid
-
-    async def _check_with_providers(self, symbol: str, timeout: float) -> bool:
-        """Check symbol with multiple providers"""
-        # Simplified - would check with actual providers
-        return True
-
-
-validator = SymbolValidator() if config.VALIDATE_SYMBOLS else None
-
-# =============================================================================
-# ML Detection Engine (optional)
-# =============================================================================
-class MLDetectionEngine:
-    """Machine learning based symbol detection"""
-
-    def __init__(self):
-        self.model = None
-        self.vectorizer = None
-        self.trained = False
-        self._lock = threading.Lock()
-
-    def train(self, positive_samples: List[str], negative_samples: List[str]):
-        """Train the model on labeled samples"""
-        if not ML_AVAILABLE:
-            return
-
-        with self._lock:
-            # Create training data
-            texts = positive_samples + negative_samples
-            labels = [1] * len(positive_samples) + [0] * len(negative_samples)
-
-            # Vectorize
-            self.vectorizer = TfidfVectorizer(
-                analyzer='char',
-                ngram_range=(2, 5),
-                max_features=1000
-            )
-            X = self.vectorizer.fit_transform(texts)
-
-            # Train
-            self.model = RandomForestClassifier(n_estimators=100)
-            self.model.fit(X, labels)
-            self.trained = True
-
-    def predict(self, text: str) -> Tuple[bool, float]:
-        """Predict if text contains symbols"""
-        if not self.trained or not ML_AVAILABLE:
-            return False, 0.0
-
-        with self._lock:
-            X = self.vectorizer.transform([text])
-            proba = self.model.predict_proba(X)[0]
-            confidence = proba[1]  # Probability of positive class
-            return confidence > config.ML_CONFIDENCE_THRESHOLD, confidence
-
-
-ml_detector = MLDetectionEngine() if config.ML_DETECTION_ENABLED else None
-
-# =============================================================================
-# Cache Manager
-# =============================================================================
-class CacheManager:
-    """Multi-backend cache manager for symbols"""
-
-    def __init__(self):
-        self.backend = config.CACHE_BACKEND
-        self.ttl = config.CACHE_TTL_SEC
-        self.max_size = config.CACHE_MAX_SIZE
-        self._memory_cache: Dict[str, Tuple[float, Any]] = {}
-        self._memory_lock = threading.Lock()
-        self._redis_client = None
-
-        if self.backend == "redis":
-            self._init_redis()
-
-    def _init_redis(self):
-        """Initialize Redis client"""
-        redis_url = os.getenv("REDIS_URL")
-        if redis_url:
-            try:
-                import redis
-                self._redis_client = redis.from_url(redis_url, decode_responses=True)
-                logger.info("Redis cache initialized")
-            except ImportError:
-                logger.warning("Redis not available, falling back to memory cache")
-                self.backend = "memory"
-            except Exception as e:
-                logger.warning(f"Redis connection failed: {e}, falling back to memory")
-                self.backend = "memory"
-
-    def _make_key(self, *parts) -> str:
-        """Generate cache key"""
-        key = ":".join(str(p) for p in parts)
-        if len(key) > 200:
-            key = hashlib.sha256(key.encode()).hexdigest()
-        return f"sym:{key}"
-
-    def get(self, key: str) -> Optional[Any]:
-        """Get from cache"""
-        cache_key = self._make_key(key)
-
-        # Try Redis first
-        if self.backend == "redis" and self._redis_client:
-            try:
-                value = self._redis_client.get(cache_key)
-                if value:
-                    return pickle.loads(base64.b64decode(value))
-            except Exception as e:
-                logger.debug(f"Redis get failed: {e}")
-
-        # Try memory cache
-        with self._memory_lock:
-            if cache_key in self._memory_cache:
-                timestamp, value = self._memory_cache[cache_key]
-                if time.time() - timestamp < self.ttl:
-                    return value
-                else:
-                    del self._memory_cache[cache_key]
-
-        return None
-
-    def set(self, key: str, value: Any) -> None:
-        """Set in cache"""
-        cache_key = self._make_key(key)
-
-        # Set in Redis
-        if self.backend == "redis" and self._redis_client:
-            try:
-                pickled = base64.b64encode(pickle.dumps(value)).decode()
-                self._redis_client.setex(cache_key, int(self.ttl), pickled)
-            except Exception as e:
-                logger.debug(f"Redis set failed: {e}")
-
-        # Set in memory
-        with self._memory_lock:
-            self._memory_cache[cache_key] = (time.time(), value)
-
-            # Prune if too large
-            if len(self._memory_cache) > self.max_size:
-                # Remove oldest 20%
-                sorted_items = sorted(self._memory_cache.items(), key=lambda x: x[1][0])
-                remove_count = len(self._memory_cache) // 5
-                for i in range(remove_count):
-                    if i < len(sorted_items):
-                        del self._memory_cache[sorted_items[i][0]]
-
-    def delete(self, key: str) -> None:
-        """Delete from cache"""
-        cache_key = self._make_key(key)
-
-        if self.backend == "redis" and self._redis_client:
-            try:
-                self._redis_client.delete(cache_key)
-            except Exception:
-                pass
-
-        with self._memory_lock:
-            if cache_key in self._memory_cache:
-                del self._memory_cache[cache_key]
-
-    def clear(self) -> None:
-        """Clear all cache"""
-        if self.backend == "redis" and self._redis_client:
-            try:
-                for key in self._redis_client.scan_iter("sym:*"):
-                    self._redis_client.delete(key)
-            except Exception:
-                pass
-
-        with self._memory_lock:
-            self._memory_cache.clear()
-
-
-cache = CacheManager()
-
-# =============================================================================
-# Google Sheets Reader
+# Google Sheets Authentication & Service
 # =============================================================================
 class GoogleSheetsReader:
-    """Enhanced Google Sheets reader with retries and error handling"""
+    """Enhanced Google Sheets reader with Async isolation and Exponential Backoff"""
 
     def __init__(self):
-        self.auth = GoogleSheetsAuth()
         self._service = None
         self._lock = threading.Lock()
+        self.backoff = FullJitterBackoff(max_retries=config.MAX_RETRIES)
 
     def _get_service(self):
-        """Get service with lazy initialization"""
         if self._service is not None:
             return self._service
 
         with self._lock:
             if self._service is not None:
                 return self._service
-            self._service = self.auth.get_service()
-            return self._service
+
+            if not GOOGLE_API_AVAILABLE:
+                logger.error("Google API libraries not available")
+                return None
+
+            try:
+                # Resolve credentials
+                creds_raw = os.getenv("GOOGLE_SHEETS_CREDENTIALS") or os.getenv("GOOGLE_CREDENTIALS")
+                if not creds_raw:
+                    path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+                    if path and os.path.exists(path):
+                        with open(path, "r", encoding="utf-8") as f:
+                            creds_raw = f.read()
+                
+                if not creds_raw:
+                    raise ValueError("No credentials found in environment")
+
+                # Parse and repair
+                if not creds_raw.startswith("{"):
+                    creds_raw = base64.b64decode(creds_raw).decode("utf-8")
+                
+                creds_dict = json_loads(creds_raw)
+                if "private_key" in creds_dict:
+                    creds_dict["private_key"] = creds_dict["private_key"].replace('\\n', '\n')
+
+                scopes = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+                credentials = Credentials.from_service_account_info(creds_dict, scopes=scopes)
+                self._service = build("sheets", "v4", credentials=credentials, cache_discovery=False)
+                logger.info("Google Sheets service initialized")
+                return self._service
+            except Exception as e:
+                logger.error(f"Failed to initialize Google Sheets service: {e}")
+                return None
 
     def _safe_sheet_name(self, name: str) -> str:
-        """Escape sheet name for A1 notation"""
-        n = strip_value(name)
-        if not n:
-            return "Sheet1"
-        if "'" in n or " " in n or "-" in n:
-            return f"'{n.replace(chr(39), chr(39)*2)}'"
-        return n
+        n = strip_value(name) or "Sheet1"
+        return f"'{n.replace(chr(39), chr(39)*2)}'" if any(c in n for c in ("'", " ", "-")) else n
 
     def _col_to_letter(self, col: int) -> str:
-        """Convert 1-based column index to letter"""
-        if col <= 0:
-            return "A"
         letters = ""
         while col > 0:
             col -= 1
@@ -1133,246 +541,303 @@ class GoogleSheetsReader:
         return letters or "A"
 
     def read_range(self, spreadsheet_id: str, range_a1: str) -> List[List[Any]]:
-        """Read range with retries and exponential backoff"""
+        """Synchronous read with backoff"""
         service = self._get_service()
-        if not service:
-            return []
+        if not service: return []
 
-        for attempt in range(config.MAX_RETRIES):
-            try:
-                t0 = time.perf_counter()
-                result = service.spreadsheets().values().get(
-                    spreadsheetId=spreadsheet_id,
-                    range=range_a1,
-                    valueRenderOption="UNFORMATTED_VALUE",
-                    dateTimeRenderOption="SERIAL_NUMBER"
-                ).execute()
-                elapsed = (time.perf_counter() - t0) * 1000
-
-                if config.LOG_PERFORMANCE:
-                    logger.debug(f"Sheet read {range_a1}: {elapsed:.1f}ms")
-
-                return result.get("values", [])
-
-            except HttpError as e:
-                if e.resp.status in [429, 500, 502, 503, 504]:
-                    # Retry on rate limits and server errors
-                    wait = config.RETRY_DELAY * (2 ** attempt) + random.uniform(0, 0.1)
-                    logger.debug(f"Retry {attempt + 1}/{config.MAX_RETRIES} after {wait:.2f}s: {e}")
-                    time.sleep(wait)
-                else:
-                    logger.error(f"Sheet error {range_a1}: {e}")
-                    return []
-
-            except Exception as e:
-                logger.error(f"Unexpected error reading {range_a1}: {e}")
-                return []
-
-        logger.error(f"Max retries exceeded for {range_a1}")
-        return []
-
-    def list_sheets(self, spreadsheet_id: str) -> List[str]:
-        """List all sheet names in spreadsheet"""
-        service = self._get_service()
-        if not service:
-            return []
+        def _execute():
+            t0 = time.perf_counter()
+            result = service.spreadsheets().values().get(
+                spreadsheetId=spreadsheet_id, range=range_a1,
+                valueRenderOption="UNFORMATTED_VALUE", dateTimeRenderOption="SERIAL_NUMBER"
+            ).execute()
+            if config.LOG_PERFORMANCE:
+                logger.debug(f"Sheet read {range_a1}: {(time.perf_counter() - t0)*1000:.1f}ms")
+            return result.get("values", [])
 
         try:
+            with TraceContext("sheets_read_range", {"range": range_a1}):
+                return self.backoff.execute_sync(_execute)
+        except Exception as e:
+            logger.error(f"Failed to read range {range_a1}: {e}")
+            return []
+            
+    async def read_range_async(self, spreadsheet_id: str, range_a1: str) -> List[List[Any]]:
+        """Asynchronous wrapper for read_range to avoid blocking the event loop"""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self.read_range, spreadsheet_id, range_a1)
+
+    def list_sheets(self, spreadsheet_id: str) -> List[str]:
+        service = self._get_service()
+        if not service: return []
+        def _execute():
             metadata = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
-            return [
-                sheet["properties"]["title"]
-                for sheet in metadata.get("sheets", [])
-                if sheet.get("properties", {}).get("title")
-            ]
+            return [sheet["properties"]["title"] for sheet in metadata.get("sheets", []) if sheet.get("properties", {}).get("title")]
+        
+        try: return self.backoff.execute_sync(_execute)
         except Exception as e:
             logger.error(f"Failed to list sheets: {e}")
             return []
 
-    def get_sheet_metadata(self, spreadsheet_id: str, sheet_name: str) -> Optional[Dict[str, Any]]:
-        """Get sheet metadata including grid properties"""
-        service = self._get_service()
-        if not service:
-            return None
+sheets_reader = GoogleSheetsReader()
 
-        try:
-            safe_name = self._safe_sheet_name(sheet_name)
-            range_a1 = f"{safe_name}!A1:ZZ1"  # Just to get sheet ID
+# =============================================================================
+# Cache Manager (Multi-Tier Zlib)
+# =============================================================================
+class AdvancedCache:
+    """Multi-tier Cache (Memory L1 + Redis L2) with Zlib Compression"""
+    def __init__(self):
+        self._memory_cache: Dict[str, Tuple[float, bytes]] = {}
+        self._memory_lock = asyncio.Lock()
+        self._redis_client: Optional[Redis] = None
+        self._stats = {"l1_hits": 0, "l2_hits": 0, "misses": 0}
 
-            # Get spreadsheet with sheet ID
-            result = service.spreadsheets().get(
-                spreadsheetId=spreadsheet_id,
-                ranges=[f"{safe_name}!A1"],
-                includeGridData=False
-            ).execute()
+        if config.CACHE_BACKEND == "redis" and REDIS_AVAILABLE:
+            redis_url = os.getenv("REDIS_URL")
+            if redis_url:
+                try:
+                    self._redis_client = aioredis.from_url(redis_url, decode_responses=False, max_connections=20)
+                    logger.info("Redis L2 cache initialized")
+                except Exception as e:
+                    logger.warning(f"Redis initialization failed, falling back to L1 only: {e}")
 
-            for sheet in result.get("sheets", []):
-                props = sheet.get("properties", {})
-                if props.get("title") == sheet_name:
-                    return {
-                        "sheet_id": props.get("sheetId"),
-                        "title": props.get("title"),
-                        "row_count": props.get("gridProperties", {}).get("rowCount", 0),
-                        "column_count": props.get("gridProperties", {}).get("columnCount", 0),
-                        "hidden": props.get("hidden", False),
-                    }
+    def _make_key(self, *parts) -> str:
+        key = ":".join(str(p) for p in parts)
+        if len(key) > 100: key = hashlib.sha256(key.encode()).hexdigest()
+        return f"sym_reader:{key}"
 
-        except Exception as e:
-            logger.error(f"Failed to get sheet metadata: {e}")
+    def _compress(self, data: Any) -> bytes:
+        pickled = pickle.dumps(data)
+        return zlib.compress(pickled, level=6) if config.CACHE_COMPRESSION else pickled
 
+    def _decompress(self, data: bytes) -> Any:
+        return pickle.loads(zlib.decompress(data)) if config.CACHE_COMPRESSION else pickle.loads(data)
+
+    async def get(self, *key_parts) -> Optional[Any]:
+        if config.CACHE_DISABLE: return None
+        key = self._make_key(*key_parts)
+        now = time.time()
+
+        # Check L1 Memory Cache
+        async with self._memory_lock:
+            if key in self._memory_cache:
+                expiry, data = self._memory_cache[key]
+                if now < expiry:
+                    self._stats["l1_hits"] += 1
+                    reader_cache_hits.labels(level="L1").inc()
+                    return self._decompress(data)
+                else:
+                    del self._memory_cache[key]
+
+        # Check L2 Redis Cache
+        if self._redis_client:
+            try:
+                data = await self._redis_client.get(key)
+                if data:
+                    self._stats["l2_hits"] += 1
+                    reader_cache_hits.labels(level="L2").inc()
+                    # Backfill L1
+                    async with self._memory_lock:
+                        self._memory_cache[key] = (now + config.CACHE_TTL_SEC, data)
+                    return self._decompress(data)
+            except Exception as e:
+                logger.debug(f"Redis get failed: {e}")
+
+        self._stats["misses"] += 1
+        reader_cache_misses.labels(level="ALL").inc()
         return None
 
+    async def set(self, value: Any, *key_parts) -> None:
+        if config.CACHE_DISABLE: return
+        key = self._make_key(*key_parts)
+        data = self._compress(value)
+        expiry = time.time() + config.CACHE_TTL_SEC
 
-sheets_reader = GoogleSheetsReader()
+        async with self._memory_lock:
+            if len(self._memory_cache) >= config.CACHE_MAX_SIZE:
+                oldest = min(self._memory_cache.items(), key=lambda x: x[1][0])[0]
+                del self._memory_cache[oldest]
+            self._memory_cache[key] = (expiry, data)
+
+        if self._redis_client:
+            try:
+                await self._redis_client.setex(key, int(config.CACHE_TTL_SEC), data)
+            except Exception as e:
+                logger.debug(f"Redis set failed: {e}")
+
+cache = AdvancedCache()
+
+# =============================================================================
+# Symbol Normalizer
+# =============================================================================
+
+class SymbolNormalizer:
+    @staticmethod
+    def _try_core_import() -> Any:
+        try:
+            from core.symbols.normalize import normalize_symbol
+            return normalize_symbol
+        except ImportError:
+            return None
+
+    def __init__(self):
+        self._core_norm = self._try_core_import()
+
+    @lru_cache(maxsize=4096)
+    def normalize(self, raw: str) -> Tuple[str, SymbolType]:
+        s = strip_value(raw).upper()
+        if not s: return "", SymbolType.UNKNOWN
+
+        # Use core normalizer if available
+        if self._core_norm:
+            try:
+                core_res = self._core_norm(raw)
+                if core_res: s = core_res
+            except Exception: pass
+
+        # Fallback local normalization
+        for p in ["$", "#", "^", "NYSE:", "NASDAQ:", "TADAWUL:", "SR:", "SAUDI:"]:
+            if s.startswith(p): s = s[len(p):]
+        for suf in [".SR", ".SA", ".AB", ".TADAWUL", ".NYSE", ".NASDAQ"]:
+            if s.endswith(suf): s = s[:-len(suf)]
+
+        # Detect Type
+        sym_type = SymbolType.UNKNOWN
+        if ".SR" in raw.upper() or "TADAWUL" in raw.upper() or "SAUDI" in raw.upper(): sym_type = SymbolType.KSA
+        else:
+            for pattern in _TICKER_PATTERNS['ksa']:
+                if pattern.match(s) or pattern.match(raw.upper()):
+                    sym_type = SymbolType.KSA; break
+            if sym_type == SymbolType.UNKNOWN:
+                for cat, patterns in _TICKER_PATTERNS.items():
+                    if cat == 'ksa': continue
+                    for pattern in patterns:
+                        if pattern.match(s) or pattern.match(raw.upper()):
+                            sym_type = SymbolType(cat); break
+                    if sym_type != SymbolType.UNKNOWN: break
+
+        if sym_type == SymbolType.KSA:
+            if re.match(r'^\d{4}$', s): s = f"{s}.SR"
+            elif re.match(r'^\d{4}SR$', s): s = f"{s[:4]}.SR"
+            elif re.match(r'^\d{4}\.SR$', s, re.IGNORECASE): s = s.upper()
+
+        if sym_type == SymbolType.UNKNOWN: sym_type = SymbolType.GLOBAL
+        return s, sym_type
+
+    def is_valid(self, symbol: str) -> bool:
+        norm, sym_type = self.normalize(symbol)
+        if not norm or sym_type == SymbolType.UNKNOWN or norm in _BLOCKLIST_EXACT: return False
+        return True
+
+normalizer = SymbolNormalizer()
+
+# =============================================================================
+# ML Detection Engine
+# =============================================================================
+class MLDetectionEngine:
+    def __init__(self):
+        self.model = None
+        self.vectorizer = None
+        self.trained = False
+        self._lock = asyncio.Lock()
+
+    async def train(self, positive_samples: List[str], negative_samples: List[str]):
+        if not ML_AVAILABLE: return
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            def _train():
+                texts = positive_samples + negative_samples
+                labels = [1] * len(positive_samples) + [0] * len(negative_samples)
+                self.vectorizer = TfidfVectorizer(analyzer='char', ngram_range=(2, 5), max_features=1000)
+                X = self.vectorizer.fit_transform(texts)
+                self.model = RandomForestClassifier(n_estimators=100, n_jobs=-1)
+                self.model.fit(X, labels)
+                self.trained = True
+            await loop.run_in_executor(None, _train)
+
+    async def predict(self, text: str) -> Tuple[bool, float]:
+        if not self.trained or not ML_AVAILABLE: return False, 0.0
+        async with self._lock:
+            loop = asyncio.get_running_loop()
+            def _predict():
+                X = self.vectorizer.transform([text])
+                return self.model.predict_proba(X)[0][1]
+            confidence = await loop.run_in_executor(None, _predict)
+            return confidence > config.ML_CONFIDENCE_THRESHOLD, confidence
+
+ml_detector = MLDetectionEngine() if config.ML_DETECTION_ENABLED else None
 
 # =============================================================================
 # Column Detection Engine
 # =============================================================================
+
 class ColumnDetectionEngine:
-    """Intelligent column detection with multiple strategies"""
+    async def detect(self, spreadsheet_id: str, sheet_name: str, spec: PageSpec) -> Tuple[Optional[str], DiscoveryStrategy, float, Dict[str, Any]]:
+        with TraceContext("detect_symbol_column", {"sheet": sheet_name}):
+            # 1. Header Strategy
+            col, conf, meta = await self._detect_by_header(spreadsheet_id, sheet_name, spec)
+            if col and conf >= spec.confidence_threshold: return col, DiscoveryStrategy.HEADER, conf, meta
 
-    def __init__(self):
-        self.strategies = [
-            ("header", self._detect_by_header),
-            ("data_scan", self._detect_by_data),
-        ]
-        if ml_detector:
-            self.strategies.append(("ml", self._detect_by_ml))
+            # 2. Data Scan Strategy
+            col, conf, meta = await self._detect_by_data(spreadsheet_id, sheet_name, spec)
+            if col and conf >= spec.confidence_threshold: return col, DiscoveryStrategy.DATA_SCAN, conf, meta
 
-    def detect(self, spreadsheet_id: str, sheet_name: str, spec: PageSpec) -> Tuple[Optional[str], DiscoveryStrategy, float, Dict[str, Any]]:
-        """
-        Detect symbol column with confidence score.
-        Returns: (column_letter, strategy, confidence, metadata)
-        """
-        results = []
-
-        for strategy_name, detector in self.strategies:
-            col, confidence, metadata = detector(spreadsheet_id, sheet_name, spec)
-            if col and confidence >= spec.confidence_threshold:
-                results.append((col, strategy_name, confidence, metadata))
-
-        if not results:
+            # 3. Fallback
             return "B", DiscoveryStrategy.DEFAULT, 0.5, {"reason": "fallback to B"}
 
-        # Sort by confidence
-        results.sort(key=lambda x: x[2], reverse=True)
-        best = results[0]
-
-        return best[0], DiscoveryStrategy(best[1]), best[2], best[3]
-
-    def _detect_by_header(self, spreadsheet_id: str, sheet_name: str, spec: PageSpec) -> Tuple[Optional[str], float, Dict[str, Any]]:
-        """Detect column by header text"""
+    async def _detect_by_header(self, spreadsheet_id: str, sheet_name: str, spec: PageSpec) -> Tuple[Optional[str], float, Dict[str, Any]]:
         range_a1 = f"{sheets_reader._safe_sheet_name(sheet_name)}!A{spec.header_row}:ZZ{spec.header_row}"
-        values = sheets_reader.read_range(spreadsheet_id, range_a1)
-
-        if not values or not values[0]:
-            return None, 0.0, {}
-
+        values = await sheets_reader.read_range_async(spreadsheet_id, range_a1)
+        if not values or not values[0]: return None, 0.0, {}
+        
         headers = [strip_value(h).upper() for h in values[0]]
-
-        # Look for exact matches first
         for idx, header in enumerate(headers, 1):
-            if header in spec.header_candidates:
-                col = sheets_reader._col_to_letter(idx)
-                return col, 1.0, {"matched_header": header, "column": idx}
-
-        # Look for partial matches
-        best_score = 0.0
-        best_col = None
-        best_match = ""
-
+            if header in spec.header_candidates: return sheets_reader._col_to_letter(idx), 1.0, {"matched_header": header}
+            
+        best_score, best_col, best_match = 0.0, None, ""
         for idx, header in enumerate(headers, 1):
-            if not header:
-                continue
+            if not header: continue
             for candidate in spec.header_candidates:
                 if candidate in header:
                     score = len(candidate) / len(header) if header else 0
-                    if score > best_score:
-                        best_score = score
-                        best_col = sheets_reader._col_to_letter(idx)
-                        best_match = candidate
-
-        if best_col and best_score >= 0.5:
-            return best_col, best_score, {"matched_header": best_match, "similarity": best_score}
-
+                    if score > best_score: best_score, best_col, best_match = score, sheets_reader._col_to_letter(idx), candidate
+                    
+        if best_col and best_score >= 0.5: return best_col, best_score, {"matched_header": best_match, "similarity": best_score}
         return None, 0.0, {}
 
-    def _detect_by_data(self, spreadsheet_id: str, sheet_name: str, spec: PageSpec) -> Tuple[Optional[str], float, Dict[str, Any]]:
-        """Detect column by scanning data for ticker patterns"""
-        # Sample rows
+    async def _detect_by_data(self, spreadsheet_id: str, sheet_name: str, spec: PageSpec) -> Tuple[Optional[str], float, Dict[str, Any]]:
         sample_size = min(200, spec.max_rows // 10)
         end_row = spec.start_row + sample_size - 1
-
         range_a1 = f"{sheets_reader._safe_sheet_name(sheet_name)}!A{spec.start_row}:ZZ{end_row}"
-        values = sheets_reader.read_range(spreadsheet_id, range_a1)
+        values = await sheets_reader.read_range_async(spreadsheet_id, range_a1)
+        if not values: return None, 0.0, {}
 
-        if not values:
-            return None, 0.0, {}
-
-        # Score each column
         max_cols = max((len(row) for row in values), default=0)
         col_scores = defaultdict(lambda: {"hits": 0, "total": 0, "cells": 0})
 
         for row in values:
             for col_idx in range(max_cols):
-                if col_idx >= len(row):
-                    continue
-
-                cell = row[col_idx]
-                if cell is None:
-                    continue
-
-                tokens = split_cell(cell)
-                if not tokens:
-                    continue
-
+                if col_idx >= len(row) or row[col_idx] is None: continue
+                tokens = split_cell(row[col_idx])
+                if not tokens: continue
                 col_scores[col_idx]["cells"] += 1
                 col_scores[col_idx]["total"] += len(tokens)
-
                 for token in tokens:
-                    norm, sym_type = normalizer.normalize(token)
-                    if normalizer.is_valid(norm):
-                        col_scores[col_idx]["hits"] += 1
+                    norm, _ = normalizer.normalize(token)
+                    if normalizer.is_valid(norm): col_scores[col_idx]["hits"] += 1
 
-        # Calculate best column
-        best_col = None
-        best_score = 0.0
-        best_stats = {}
-
+        best_col, best_score, best_stats = None, 0.0, {}
         for col_idx, stats in col_scores.items():
-            if stats["total"] < 5:  # Need enough data
-                continue
-
+            if stats["total"] < 5: continue
             hit_rate = stats["hits"] / stats["total"] if stats["total"] else 0
             cell_coverage = stats["cells"] / len(values) if values else 0
-
-            # Combined score
             score = hit_rate * 0.7 + cell_coverage * 0.3
-
             if score > best_score:
-                best_score = score
-                best_col = sheets_reader._col_to_letter(col_idx + 1)
-                best_stats = {
-                    "hits": stats["hits"],
-                    "total": stats["total"],
-                    "cells": stats["cells"],
-                    "hit_rate": hit_rate,
-                    "cell_coverage": cell_coverage,
-                }
+                best_score, best_col = score, sheets_reader._col_to_letter(col_idx + 1)
+                best_stats = {"hit_rate": hit_rate, "cell_coverage": cell_coverage}
 
-        if best_col and best_score >= 0.3:
-            return best_col, best_score, best_stats
-
+        if best_col and best_score >= 0.3: return best_col, best_score, best_stats
         return None, 0.0, {}
-
-    def _detect_by_ml(self, spreadsheet_id: str, sheet_name: str, spec: PageSpec) -> Tuple[Optional[str], float, Dict[str, Any]]:
-        """Detect column using ML model"""
-        if not ml_detector or not ml_detector.trained:
-            return None, 0.0, {}
-
-        # Similar to data detection but using ML
-        # Simplified - would use trained model
-        return None, 0.0, {}
-
 
 detector = ColumnDetectionEngine()
 
@@ -1380,392 +845,159 @@ detector = ColumnDetectionEngine()
 # Symbol Extractor
 # =============================================================================
 class SymbolExtractor:
-    """Extract and normalize symbols from raw data"""
-
-    def __init__(self):
-        self.normalizer = normalizer
-
     def extract_from_column(self, values: List[List[Any]], column_letter: str) -> List[SymbolMetadata]:
-        """Extract symbols from a column"""
         col_idx = self._letter_to_col(column_letter) - 1
         symbols = []
-
         for row_idx, row in enumerate(values, start=config.DEFAULT_START_ROW):
-            if not row or col_idx >= len(row):
-                continue
-
-            cell = row[col_idx]
-            if cell is None:
-                continue
-
-            tokens = split_cell(cell)
-
-            for token in tokens:
-                norm, sym_type = self.normalizer.normalize(token)
-
-                if not norm or not self.normalizer.is_valid(norm):
-                    continue
-
-                metadata = SymbolMetadata(
-                    symbol=norm,
-                    normalized=norm,
-                    symbol_type=sym_type,
-                    origin="sheet",
-                    discovery_strategy=DiscoveryStrategy.DATA_SCAN,
-                    confidence=ConfidenceLevel.HIGH if sym_type != SymbolType.UNKNOWN else ConfidenceLevel.LOW,
-                    sheet_name=None,  # Set by caller
-                    column=column_letter,
-                    row=row_idx,
-                    raw_value=token,
-                    discovered_at=datetime.now(timezone.utc),
-                )
-
-                symbols.append(metadata)
-
+            if not row or col_idx >= len(row) or row[col_idx] is None: continue
+            for token in split_cell(row[col_idx]):
+                norm, sym_type = normalizer.normalize(token)
+                if norm and normalizer.is_valid(norm):
+                    symbols.append(SymbolMetadata(
+                        symbol=norm, normalized=norm, symbol_type=sym_type, origin="sheet",
+                        discovery_strategy=DiscoveryStrategy.DATA_SCAN,
+                        confidence=ConfidenceLevel.HIGH if sym_type != SymbolType.UNKNOWN else ConfidenceLevel.LOW,
+                        column=column_letter, row=row_idx, raw_value=token
+                    ))
         return symbols
 
     def _letter_to_col(self, letter: str) -> int:
-        """Convert column letter to 1-based index"""
         col = 0
-        for ch in letter.upper():
-            col = col * 26 + (ord(ch) - ord('A') + 1)
+        for ch in letter.upper(): col = col * 26 + (ord(ch) - ord('A') + 1)
         return col
-
 
 extractor = SymbolExtractor()
 
 # =============================================================================
-# Main API
+# Main Async API
 # =============================================================================
-def get_page_symbols(key: str, spreadsheet_id: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Get symbols from a page with rich metadata.
 
-    Returns:
-    {
-        "all": [...],           # All normalized symbols
-        "ksa": [...],            # KSA symbols only
-        "global": [...],         # Global symbols only
-        "by_type": {...},        # Symbols grouped by type
-        "metadata": [...],       # Detailed metadata for each symbol
-        "origin": str,           # Origin page key
-        "discovery": {...},      # Discovery metadata
-        "performance": {...},    # Performance metrics
-        "cache_hit": bool,       # Whether result was cached
-        "timestamp": str,        # UTC timestamp
-        "version": str,          # Reader version
-    }
-    """
+async def get_page_symbols_async(key: str, spreadsheet_id: Optional[str] = None) -> Dict[str, Any]:
+    """Async engine to get symbols from a page with rich metadata."""
     start_time = time.perf_counter()
-
-    # Resolve spreadsheet ID
     sid = strip_value(spreadsheet_id) or os.getenv("DEFAULT_SPREADSHEET_ID") or os.getenv("SPREADSHEET_ID")
+    
     if not sid:
-        logger.error("No spreadsheet ID provided")
-        return {
-            "all": [],
-            "error": "No spreadsheet ID",
-            "status": "error",
-        }
+        return {"all": [], "error": "No spreadsheet ID", "status": "error"}
 
-    # Resolve page key
     canonical_key = resolve_key(key)
     spec = PAGE_REGISTRY.get(canonical_key)
+    if not spec: return {"all": [], "error": f"Unknown page key: {key}", "status": "error"}
 
-    if not spec:
-        logger.warning(f"Unknown page key: {key} (resolved to {canonical_key})")
-        return {
-            "all": [],
-            "error": f"Unknown page key: {key}",
-            "status": "error",
-        }
-
-    # Check cache
-    cache_key = f"page:{sid}:{canonical_key}:{spec.header_row}:{spec.start_row}:{spec.max_rows}"
-    cached = cache.get(cache_key)
-
+    # Cache Check
+    cached = await cache.get("page", sid, canonical_key, spec.header_row, spec.start_row, spec.max_rows)
     if cached is not None:
         cached["cache_hit"] = True
-        if config.LOG_PERFORMANCE:
-            elapsed = (time.perf_counter() - start_time) * 1000
-            logger.debug(f"Cache hit for {key} ({elapsed:.1f}ms)")
         return cached
 
-    # Try each sheet name
-    all_symbols: List[SymbolMetadata] = []
-    best_result = None
-    best_confidence = 0.0
-
+    best_result, best_confidence = None, 0.0
     for sheet_name in spec.sheet_names:
-        # Detect symbol column
-        col, strategy, confidence, detect_meta = detector.detect(sid, sheet_name, spec)
+        col, strategy, confidence, detect_meta = await detector.detect(sid, sheet_name, spec)
+        if not col or confidence < spec.confidence_threshold: continue
 
-        if not col or confidence < spec.confidence_threshold:
-            continue
-
-        # Read data
         end_row = spec.start_row + spec.max_rows - 1
         range_a1 = f"{sheets_reader._safe_sheet_name(sheet_name)}!{col}{spec.start_row}:{col}{end_row}"
-        values = sheets_reader.read_range(sid, range_a1)
+        values = await sheets_reader.read_range_async(sid, range_a1)
+        if not values: continue
 
-        if not values:
-            continue
-
-        # Extract symbols
         symbols = extractor.extract_from_column(values, col)
-
-        # Add sheet info
         for sym in symbols:
             sym.sheet_name = sheet_name
             sym.origin = canonical_key
             sym.discovery_strategy = strategy
-            if strategy == DiscoveryStrategy.HEADER and confidence > 0.9:
-                sym.confidence = ConfidenceLevel.HIGH
-            elif confidence > 0.7:
-                sym.confidence = ConfidenceLevel.MEDIUM
-            else:
-                sym.confidence = ConfidenceLevel.LOW
+            sym.confidence = ConfidenceLevel.HIGH if strategy == DiscoveryStrategy.HEADER and confidence > 0.9 else ConfidenceLevel.MEDIUM if confidence > 0.7 else ConfidenceLevel.LOW
 
         if len(symbols) > best_confidence:
-            best_confidence = len(symbols)
-            best_result = (sheet_name, col, strategy, confidence, detect_meta, symbols)
+            best_confidence, best_result = len(symbols), (sheet_name, col, strategy, confidence, detect_meta, symbols)
 
-    # Process best result
+    elapsed = (time.perf_counter() - start_time) * 1000
+    
     if best_result:
         sheet_name, col, strategy, confidence, detect_meta, symbols = best_result
-
-        # Group by type
-        all_syms = []
-        ksa_syms = []
-        global_syms = []
-        by_type = defaultdict(list)
-
+        all_syms, ksa_syms, global_syms, by_type = [], [], [], defaultdict(list)
         for sym in symbols:
             all_syms.append(sym.symbol)
             by_type[sym.symbol_type.value].append(sym.symbol)
-            if sym.symbol_type == SymbolType.KSA:
-                ksa_syms.append(sym.symbol)
-            else:
-                global_syms.append(sym.symbol)
-
-        # Build result
-        elapsed = (time.perf_counter() - start_time) * 1000
+            if sym.symbol_type == SymbolType.KSA: ksa_syms.append(sym.symbol)
+            else: global_syms.append(sym.symbol)
 
         result = {
-            "all": all_syms,
-            "ksa": ksa_syms,
-            "global": global_syms,
-            "by_type": dict(by_type),
-            "metadata": [asdict(sym) for sym in symbols],
-            "origin": canonical_key,
-            "discovery": {
-                "sheet": sheet_name,
-                "column": col,
-                "strategy": strategy.value,
-                "confidence": confidence,
-                "detection": detect_meta,
-            },
-            "performance": {
-                "elapsed_ms": round(elapsed, 2),
-                "symbol_count": len(symbols),
-                "unique_count": len(set(all_syms)),
-            },
-            "cache_hit": False,
-            "timestamp": now_utc_iso(),
-            "version": VERSION,
-            "status": "success",
+            "all": all_syms, "ksa": ksa_syms, "global": global_syms, "by_type": dict(by_type),
+            "metadata": [asdict(sym) for sym in symbols], "origin": canonical_key,
+            "discovery": {"sheet": sheet_name, "column": col, "strategy": strategy.value, "confidence": confidence, "detection": detect_meta},
+            "performance": {"elapsed_ms": round(elapsed, 2), "symbol_count": len(symbols), "unique_count": len(set(all_syms))},
+            "cache_hit": False, "timestamp": datetime.now(timezone.utc).isoformat(), "version": VERSION, "status": "success",
         }
-
-        # Cache result
-        cache.set(cache_key, result)
-
-        if config.LOG_DETECTION:
-            logger.info(f"Found {len(all_syms)} symbols in {key} (col {col}, {strategy.value}, {confidence:.2f})")
-
+        await cache.set(result, "page", sid, canonical_key, spec.header_row, spec.start_row, spec.max_rows)
+        reader_requests_total.labels(sheet=canonical_key, status="success").inc()
         return result
 
-    # No symbols found
-    elapsed = (time.perf_counter() - start_time) * 1000
-
     result = {
-        "all": [],
-        "ksa": [],
-        "global": [],
-        "by_type": {},
-        "metadata": [],
-        "origin": canonical_key,
-        "discovery": None,
-        "performance": {
-            "elapsed_ms": round(elapsed, 2),
-            "symbol_count": 0,
-            "unique_count": 0,
-        },
-        "cache_hit": False,
-        "timestamp": now_utc_iso(),
-        "version": VERSION,
-        "status": "empty",
-        "warning": "No symbols found in any sheet",
+        "all": [], "ksa": [], "global": [], "by_type": {}, "metadata": [], "origin": canonical_key, "discovery": None,
+        "performance": {"elapsed_ms": round(elapsed, 2), "symbol_count": 0, "unique_count": 0},
+        "cache_hit": False, "timestamp": datetime.now(timezone.utc).isoformat(), "version": VERSION, "status": "empty", "warning": "No symbols found"
     }
-
-    cache.set(cache_key, result)
-    logger.warning(f"No symbols found for {key}")
+    await cache.set(result, "page", sid, canonical_key, spec.header_row, spec.start_row, spec.max_rows)
+    reader_requests_total.labels(sheet=canonical_key, status="empty").inc()
     return result
 
-
-def get_universe(keys: List[str], spreadsheet_id: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Aggregate symbols from multiple pages.
-
-    Returns:
-    {
-        "symbols": [...],        # Unique symbols across all pages
-        "by_origin": {...},      # Symbols grouped by origin page
-        "by_type": {...},        # Symbols grouped by type
-        "origin_map": {...},     # Map symbol -> origin page
-        "metadata": {...},       # Metadata for each page
-        "performance": {...},    # Aggregated performance metrics
-    }
-    """
+async def get_universe_async(keys: List[str], spreadsheet_id: Optional[str] = None) -> Dict[str, Any]:
     start_time = time.perf_counter()
+    sid = strip_value(spreadsheet_id) or os.getenv("DEFAULT_SPREADSHEET_ID")
+    if not sid: return {"symbols": [], "error": "No spreadsheet ID", "status": "error"}
 
-    sid = strip_value(spreadsheet_id) or os.getenv("DEFAULT_SPREADSHEET_ID") or os.getenv("SPREADSHEET_ID")
-    if not sid:
-        return {
-            "symbols": [],
-            "error": "No spreadsheet ID",
-            "status": "error",
-        }
-
-    all_symbols = []
-    origin_map = {}
-    by_origin = defaultdict(list)
-    by_type = defaultdict(list)
-    page_metadata = {}
-    total_time = 0
-
-    for key in keys:
-        t0 = time.perf_counter()
-        result = get_page_symbols(key, spreadsheet_id=sid)
-        elapsed = (time.perf_counter() - t0) * 1000
-        total_time += elapsed
-
+    all_symbols, origin_map, by_origin, by_type, page_metadata = [], {}, defaultdict(list), defaultdict(list), {}
+    
+    tasks = [get_page_symbols_async(key, sid) for key in keys]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    for key, result in zip(keys, results):
         canonical_key = resolve_key(key)
-
-        if result.get("status") == "success" and result.get("all"):
+        if isinstance(result, dict) and result.get("status") == "success" and result.get("all"):
             symbols = result["all"]
-            page_metadata[canonical_key] = {
-                "count": len(symbols),
-                "elapsed_ms": round(elapsed, 2),
-                "status": result.get("status"),
-                "discovery": result.get("discovery"),
-            }
-
+            page_metadata[canonical_key] = {"count": len(symbols), "elapsed_ms": result["performance"]["elapsed_ms"], "status": result.get("status"), "discovery": result.get("discovery")}
             for sym in symbols:
                 if sym not in origin_map:
                     origin_map[sym] = canonical_key
                     all_symbols.append(sym)
                     by_origin[canonical_key].append(sym)
+            if "metadata" in result:
+                for meta in result["metadata"]:
+                    if meta["symbol"] in origin_map: by_type[meta["symbol_type"]].append(meta["symbol"])
 
-        # Also add by_type from metadata
-        if "metadata" in result:
-            for meta in result["metadata"]:
-                if meta["symbol"] in origin_map:
-                    by_type[meta["symbol_type"]].append(meta["symbol"])
-
-    # Deduplicate by_type
-    for type_name in by_type:
-        by_type[type_name] = list(set(by_type[type_name]))
-
-    # Sort for consistency
+    for type_name in by_type: by_type[type_name] = list(set(by_type[type_name]))
     all_symbols.sort()
-    for key in by_origin:
-        by_origin[key].sort()
-    for type_name in by_type:
-        by_type[type_name].sort()
-
-    elapsed = (time.perf_counter() - start_time) * 1000
 
     return {
-        "symbols": all_symbols,
-        "by_origin": dict(by_origin),
-        "by_type": dict(by_type),
-        "origin_map": origin_map,
-        "metadata": page_metadata,
-        "performance": {
-            "elapsed_ms": round(elapsed, 2),
-            "pages_processed": len(keys),
-            "pages_with_data": len([k for k, v in page_metadata.items() if v.get("count", 0) > 0]),
-            "total_symbols": len(all_symbols),
-        },
-        "timestamp": now_utc_iso(),
-        "version": VERSION,
-        "status": "success",
+        "symbols": all_symbols, "by_origin": dict(by_origin), "by_type": dict(by_type), "origin_map": origin_map, "metadata": page_metadata,
+        "performance": {"elapsed_ms": round((time.perf_counter() - start_time) * 1000, 2), "pages_processed": len(keys), "pages_with_data": len(page_metadata), "total_symbols": len(all_symbols)},
+        "timestamp": datetime.now(timezone.utc).isoformat(), "version": VERSION, "status": "success",
     }
 
+
+# Synchronous Wrappers for CLI/Backward Compatibility
+def get_page_symbols(key: str, spreadsheet_id: Optional[str] = None) -> Dict[str, Any]:
+    try:
+        loop = asyncio.get_running_loop()
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            return loop.run_until_complete(get_page_symbols_async(key, spreadsheet_id))
+    except RuntimeError:
+        return asyncio.run(get_page_symbols_async(key, spreadsheet_id))
+
+def get_universe(keys: List[str], spreadsheet_id: Optional[str] = None) -> Dict[str, Any]:
+    try:
+        loop = asyncio.get_running_loop()
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            return loop.run_until_complete(get_universe_async(keys, spreadsheet_id))
+    except RuntimeError:
+        return asyncio.run(get_universe_async(keys, spreadsheet_id))
 
 def list_tabs(spreadsheet_id: Optional[str] = None) -> List[str]:
-    """List all tabs in spreadsheet"""
-    sid = strip_value(spreadsheet_id) or os.getenv("DEFAULT_SPREADSHEET_ID") or os.getenv("SPREADSHEET_ID")
-    if not sid:
-        logger.error("No spreadsheet ID provided")
-        return []
+    sid = strip_value(spreadsheet_id) or os.getenv("DEFAULT_SPREADSHEET_ID")
+    if not sid: return []
     return sheets_reader.list_sheets(sid)
-
-
-def validate_symbols(symbols: List[str], timeout: float = 5.0) -> Dict[str, Any]:
-    """Validate symbols against live market data"""
-    if not validator:
-        return {
-            "valid": symbols,
-            "invalid": [],
-            "status": "validation_disabled",
-        }
-
-    import asyncio
-
-    async def validate_all():
-        results = {}
-        for sym in symbols:
-            valid = await validator.validate(sym, timeout)
-            results[sym] = valid
-        return results
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        results = loop.run_until_complete(validate_all())
-    finally:
-        loop.close()
-
-    valid = [sym for sym, is_valid in results.items() if is_valid]
-    invalid = [sym for sym, is_valid in results.items() if not is_valid]
-
-    return {
-        "valid": valid,
-        "invalid": invalid,
-        "total": len(symbols),
-        "valid_count": len(valid),
-        "invalid_count": len(invalid),
-        "status": "success",
-    }
-
-
-def get_symbol_metadata(symbol: str) -> Optional[SymbolMetadata]:
-    """Get rich metadata for a single symbol"""
-    norm, sym_type = normalizer.normalize(symbol)
-
-    if not norm:
-        return None
-
-    return SymbolMetadata(
-        symbol=norm,
-        normalized=norm,
-        symbol_type=sym_type,
-        origin="direct",
-        discovery_strategy=DiscoveryStrategy.EXPLICIT,
-        confidence=ConfidenceLevel.HIGH,
-        discovered_at=datetime.now(timezone.utc),
-    )
 
 
 # =============================================================================
@@ -1773,102 +1005,39 @@ def get_symbol_metadata(symbol: str) -> Optional[SymbolMetadata]:
 # =============================================================================
 if __name__ == "__main__":
     import argparse
-
     parser = argparse.ArgumentParser(description=f"TFB Symbols Reader v{VERSION}")
     parser.add_argument("--sheet-id", help="Spreadsheet ID override")
     parser.add_argument("--key", default="KSA", help="Page key (e.g., KSA, GLOBAL, LEADERS)")
     parser.add_argument("--keys", nargs="+", help="Multiple keys for universe")
     parser.add_argument("--list-tabs", action="store_true", help="List tabs and exit")
-    parser.add_argument("--validate", help="Validate symbol")
-    parser.add_argument("--validate-list", help="Validate symbols from file")
     parser.add_argument("--output", choices=["text", "json"], default="text", help="Output format")
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
     parser.add_argument("--no-cache", action="store_true", help="Disable cache")
 
     args = parser.parse_args()
 
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-
-    if args.no_cache:
-        config.CACHE_DISABLE = True
+    if args.verbose: logging.getLogger().setLevel(logging.DEBUG)
+    if args.no_cache: config.CACHE_DISABLE = True
 
     if args.list_tabs:
         tabs = list_tabs(args.sheet_id)
-        if args.output == "json":
-            print(json.dumps({"tabs": tabs}, indent=2))
-        else:
-            print("\n".join(tabs) if tabs else "No tabs found")
+        print(json_dumps({"tabs": tabs}) if args.output == "json" else "\n".join(tabs) if tabs else "No tabs found")
         sys.exit(0)
 
-    if args.validate:
-        meta = get_symbol_metadata(args.validate)
-        if args.output == "json":
-            print(json.dumps(asdict(meta) if meta else {"error": "Invalid symbol"}, indent=2))
-        else:
-            if meta:
-                print(f"Symbol: {meta.symbol}")
-                print(f"Normalized: {meta.normalized}")
-                print(f"Type: {meta.symbol_type.value}")
-                print(f"Valid: {normalizer.is_valid(meta.symbol)}")
-            else:
-                print(f"Invalid symbol: {args.validate}")
-        sys.exit(0)
+    result = get_universe(args.keys, spreadsheet_id=args.sheet_id) if args.keys else get_page_symbols(args.key, spreadsheet_id=args.sheet_id)
 
-    if args.validate_list:
-        try:
-            with open(args.validate_list, "r") as f:
-                symbols = [line.strip() for line in f if line.strip()]
-            results = validate_symbols(symbols)
-            if args.output == "json":
-                print(json.dumps(results, indent=2))
-            else:
-                print(f"Valid: {len(results['valid'])}/{results['total']}")
-                if results['invalid']:
-                    print(f"Invalid: {', '.join(results['invalid'])}")
-        except Exception as e:
-            print(f"Error: {e}")
-        sys.exit(0)
-
-    if args.keys:
-        result = get_universe(args.keys, spreadsheet_id=args.sheet_id)
+    if args.output == "json": print(json_dumps(result))
     else:
-        result = get_page_symbols(args.key, spreadsheet_id=args.sheet_id)
-
-    if args.output == "json":
-        print(json.dumps(result, indent=2, default=str))
-    else:
-        status = result.get("status", "unknown")
-        symbols = result.get("all", [])
-
-        print(f"Symbols Reader v{VERSION}")
-        print(f"Status: {status}")
-        print(f"Key: {args.key or args.keys}")
-        print(f"Count: {len(symbols)}")
-
-        if "discovery" in result and result["discovery"]:
-            d = result["discovery"]
-            print(f"Sheet: {d.get('sheet')}")
-            print(f"Column: {d.get('column')}")
-            print(f"Strategy: {d.get('strategy')}")
-            print(f"Confidence: {d.get('confidence', 0):.2f}")
-
-        if "performance" in result:
-            p = result["performance"]
-            print(f"Time: {p.get('elapsed_ms', 0):.1f}ms")
-
+        print(f"Symbols Reader v{VERSION}\nStatus: {result.get('status', 'unknown')}\nCount: {len(result.get('all', result.get('symbols', [])))}")
+        if "performance" in result: print(f"Time: {result['performance'].get('elapsed_ms', 0):.1f}ms")
         if "by_type" in result:
-            bt = result["by_type"]
             print("\nBy Type:")
-            for type_name, syms in bt.items():
-                print(f"  {type_name}: {len(syms)}")
+            for t_name, syms in result["by_type"].items(): print(f"  {t_name}: {len(syms)}")
+        symbols = result.get("all", result.get("symbols", []))
+        if symbols: print("\nPreview:\n  " + ", ".join(symbols[:20]))
 
-        if symbols:
-            print("\nPreview (first 20):")
-            print("  " + ", ".join(symbols[:20]))
-
-        if "cache_hit" in result and result["cache_hit"]:
-            print("\n(Cache hit)")
-
-        if "warning" in result:
-            print(f"\nWarning: {result['warning']}")
+__all__ = [
+    "VERSION", "SymbolType", "DiscoveryStrategy", "ConfidenceLevel", "SymbolMetadata", "PageSpec",
+    "get_page_symbols", "get_page_symbols_async", "get_universe", "get_universe_async", "list_tabs",
+    "PAGE_REGISTRY", "normalizer", "extractor", "detector"
+]
