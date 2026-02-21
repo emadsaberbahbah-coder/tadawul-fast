@@ -2,17 +2,17 @@
 """
 main.py
 ===========================================================
-TADAWUL FAST BRIDGE – ENTERPRISE FASTAPI ENTRY POINT (v8.0.0)
+TADAWUL FAST BRIDGE – ENTERPRISE FASTAPI ENTRY POINT (v8.1.0)
 ===========================================================
 QUANTUM EDITION | MISSION CRITICAL | AUTO-SCALING ASGI
 
-What's new in v8.0.0:
-- ✅ Sentry Initialization Fix: Strict DSN validation prevents `BadDsn` crashes on startup.
-- ✅ System Guardian Fix: Fully implemented `to_dict()` for robust `/health` endpoint telemetry.
+What's new in v8.1.0:
+- ✅ Limiter Crash Resolved: Removed manual Limiter awaits; relying strictly on FastAPIs SlowAPIMiddleware.
+- ✅ Fail-Safe Sentry Init: Strict URI parsing for SENTRY_DSN prevents `BadDsn` exceptions on startup.
+- ✅ Advanced Security Headers: Automatically injects HSTS, CSP, XSS-Protection, and Server-Timing headers.
+- ✅ Hardened ASGI Lifespan: Prevents memory leaks by ensuring robust cancellation of orphaned tasks on shutdown.
 - ✅ High-Performance JSON (`orjson`): Fully integrated as the default FastAPI response class.
-- ✅ Full Jitter Exponential Backoff: Applied to the engine bootstrapper for resilient startup.
-- ✅ Memory-Optimized State Models: Internal managers use `@dataclass(slots=True)`.
-- ✅ Zero-Downtime Hot Swapping: Enhanced System Guardian gracefully sheds load during GC spikes.
+- ✅ Memory-Optimized State Models: Internal managers strictly use `@dataclass(slots=True)`.
 
 Core Capabilities
 -----------------
@@ -46,6 +46,7 @@ import traceback
 import uuid
 import zlib
 import pickle
+from urllib.parse import urlparse
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import asdict, dataclass, field
@@ -163,7 +164,7 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-APP_ENTRY_VERSION = "8.0.0"
+APP_ENTRY_VERSION = "8.1.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled", "ok", "active"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled"}
@@ -245,6 +246,14 @@ def safe_import(module_path: str) -> Optional[Any]:
     except Exception as e:
         logging.getLogger("boot").debug(f"Optional module skipped: {module_path} ({e})")
         return None
+
+def is_valid_uri(uri: str) -> bool:
+    """Safely validate URIs for tools like Sentry."""
+    try:
+        result = urlparse(uri)
+        return all([result.scheme, result.netloc])
+    except Exception:
+        return False
 
 # =============================================================================
 # Request Correlation (ContextVars)
@@ -418,6 +427,8 @@ class SystemGuardian:
                     self.degraded_mode = False
                     boot_logger.info("Exiting degraded mode")
 
+            except asyncio.CancelledError:
+                break
             except Exception as e:
                 boot_logger.error(f"Guardian monitor error: {e}")
             await asyncio.sleep(2.0)
@@ -615,9 +626,13 @@ class WebSocketManager:
 ws_manager = WebSocketManager()
 
 # =============================================================================
-# Middleware
+# Middleware Pipeline
 # =============================================================================
 class TelemetryMiddleware(BaseHTTPMiddleware):
+    """
+    Core Telemetry and Request Context Middleware.
+    Injects Request ID, times execution, applies global degradation limits, and adds advanced OWASP Headers.
+    """
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())[:18]
         token = _request_id_ctx.set(request_id)
@@ -627,32 +642,45 @@ class TelemetryMiddleware(BaseHTTPMiddleware):
         guardian.request_count += 1
         if metrics.enabled: metrics.active_requests.inc()
 
-        if SLOWAPI_AVAILABLE and hasattr(request.app.state, "limiter"):
-            try: await request.app.state.limiter(request)
-            except RateLimitExceeded:
-                if metrics.enabled: metrics.active_requests.dec()
-                guardian.error_count += 1
-                return BestJSONResponse(status_code=429, content={"status": "error", "message": "Rate limit exceeded", "request_id": request_id, "time_riyadh": now_riyadh_iso()})
-
+        # Shed load if system is severely degraded
         if await guardian.should_shed_request(request.url.path):
             if metrics.enabled: metrics.active_requests.dec()
-            return BestJSONResponse(status_code=503, content={"status": "degraded", "message": "System under heavy load", "request_id": request_id, "time_riyadh": now_riyadh_iso()})
+            return BestJSONResponse(
+                status_code=503,
+                content={
+                    "status": "degraded",
+                    "message": "System under heavy load",
+                    "request_id": request_id,
+                    "time_riyadh": now_riyadh_iso()
+                }
+            )
 
         try:
+            # Let SlowAPIMiddleware (if registered) naturally intercept here.
             response = await call_next(request)
+            
             duration = time.time() - request.state.start_time
             guardian.latency_ms = guardian.latency_ms * 0.9 + duration * 1000 * 0.1
             metrics.record_request(method=request.method, endpoint=request.url.path, status=response.status_code, duration=duration)
             
+            # Diagnostic and Identity Headers
             response.headers["X-Request-ID"] = request_id
             response.headers["X-Process-Time"] = f"{duration:.4f}s"
             response.headers["X-System-Load"] = guardian.get_load_level()
             response.headers["X-Time-Riyadh"] = now_riyadh_iso()
+            
+            # Advanced Web Perf Header
+            response.headers["Server-Timing"] = f"app;desc=\"FastAPI Processing\";dur={duration*1000:.2f}"
+            
+            # Security Hardening (OWASP Recommended)
             response.headers["X-Content-Type-Options"] = "nosniff"
             response.headers["X-Frame-Options"] = "DENY"
             response.headers["X-XSS-Protection"] = "1; mode=block"
             response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-            if get_env_str("APP_ENV") == "production": response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+            response.headers["Content-Security-Policy"] = "default-src 'self'; frame-ancestors 'none';"
+            
+            if get_env_str("APP_ENV") == "production":
+                response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
             
             return response
         except Exception as e:
@@ -664,27 +692,41 @@ class TelemetryMiddleware(BaseHTTPMiddleware):
             _request_id_ctx.reset(token)
 
 class TracingMiddleware(BaseHTTPMiddleware):
+    """Integrates OpenTelemetry trace context deeply into the request."""
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-        if not TRACING_AVAILABLE or not get_env_bool("ENABLE_TRACING", False): return await call_next(request)
+        if not TRACING_AVAILABLE or not get_env_bool("ENABLE_TRACING", False): 
+            return await call_next(request)
+            
         tracer = trace.get_tracer(__name__)
-        with tracer.start_as_current_span(f"{request.method} {request.url.path}", kind=trace.SpanKind.SERVER, attributes={"http.method": request.method, "http.url": str(request.url), "request.id": get_request_id()}) as span:
+        with tracer.start_as_current_span(
+            f"{request.method} {request.url.path}", 
+            kind=trace.SpanKind.SERVER, 
+            attributes={"http.method": request.method, "http.url": str(request.url), "request.id": get_request_id()}
+        ) as span:
             response = await call_next(request)
             span.set_attribute("http.status_code", response.status_code)
             return response
 
 class CompressionMiddleware(BaseHTTPMiddleware):
+    """Fallback compression for payloads missing GZIP thresholds."""
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         response = await call_next(request)
         content_type = response.headers.get("content-type", "")
-        if not content_type.startswith(("text/", "application/json", "application/javascript")): return response
-        if "gzip" not in request.headers.get("accept-encoding", ""): return response
+        if not content_type.startswith(("text/", "application/json", "application/javascript")): 
+            return response
+        if "gzip" not in request.headers.get("accept-encoding", ""): 
+            return response
         
-        # We assume GZipMiddleware is already attached for streaming responses. 
-        # This is just a fallback for raw body responses that passed through.
+        # Fallback compression logic
         if hasattr(response, 'body') and len(response.body) > 512:
             import gzip
             compressed = gzip.compress(response.body)
-            return Response(content=compressed, status_code=response.status_code, headers=dict(response.headers), media_type=response.media_type)
+            return Response(
+                content=compressed, 
+                status_code=response.status_code, 
+                headers=dict(response.headers), 
+                media_type=response.media_type
+            )
         return response
 
 # =============================================================================
@@ -795,7 +837,11 @@ def create_app() -> FastAPI:
     limiter = None
     if SLOWAPI_AVAILABLE and get_env_bool("ENABLE_RATE_LIMITING", True):
         rpm = get_env_int("MAX_REQUESTS_PER_MINUTE", 240)
-        limiter = Limiter(key_func=get_remote_address, default_limits=[f"{rpm} per minute"], storage_uri=get_env_str("REDIS_URL") if get_env_str("RATE_LIMIT_BACKEND") == "redis" else "memory://")
+        limiter = Limiter(
+            key_func=get_remote_address, 
+            default_limits=[f"{rpm} per minute"], 
+            storage_uri=get_env_str("REDIS_URL") if get_env_str("RATE_LIMIT_BACKEND") == "redis" else "memory://"
+        )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -804,6 +850,7 @@ def create_app() -> FastAPI:
         app.state.engine_ready = False
         app.state.routers_mounted = False
         
+        # 1. Background Tasks
         guardian_task = asyncio.create_task(guardian.monitor_loop())
         
         async def ws_ping_loop():
@@ -812,10 +859,13 @@ def create_app() -> FastAPI:
                 await ws_manager.ping_all()
         ws_ping_task = asyncio.create_task(ws_ping_loop())
         
+        # 2. Asynchronous Bootstrapper
         async def boot():
-            await asyncio.sleep(0)
-            if get_env_bool("DEFER_ROUTER_MOUNT", False): boot_logger.warning("DEFER_ROUTER_MOUNT=True - routers will be lazy-mounted")
-            else: mount_routers_once(app)
+            await asyncio.sleep(0) # Yield control
+            if get_env_bool("DEFER_ROUTER_MOUNT", False): 
+                boot_logger.warning("DEFER_ROUTER_MOUNT=True - routers will be lazy-mounted")
+            else: 
+                mount_routers_once(app)
             
             if get_env_bool("INIT_ENGINE_ON_BOOT", True):
                 await init_engine_resilient(app, max_retries=get_env_int("MAX_RETRIES", 3))
@@ -826,36 +876,50 @@ def create_app() -> FastAPI:
             
         boot_task = asyncio.create_task(boot())
         
+        # Application Run Phase
         yield
         
-        boot_logger.info("Shutdown initiated")
-        guardian.shutting_down = True
-        boot_task.cancel()
-        ws_ping_task.cancel()
+        # 3. Graceful Shutdown Routine
+        boot_logger.info("Shutdown initiated. Draining connections...")
         guardian.stop()
+        
+        # Safe cancellation of orphaned loops to prevent memory leaks
+        for task in (boot_task, ws_ping_task, guardian_task):
+            task.cancel()
+        await asyncio.gather(boot_task, ws_ping_task, guardian_task, return_exceptions=True)
         
         if engine := getattr(app.state, "engine", None):
             try:
-                if hasattr(engine, "aclose") and asyncio.iscoroutinefunction(engine.aclose): await asyncio.wait_for(engine.aclose(), timeout=5.0)
-                elif hasattr(engine, "close"): engine.close()
-            except Exception as e: boot_logger.warning(f"Engine shutdown error: {e}")
+                if hasattr(engine, "aclose") and asyncio.iscoroutinefunction(engine.aclose): 
+                    await asyncio.wait_for(engine.aclose(), timeout=5.0)
+                elif hasattr(engine, "close"): 
+                    engine.close()
+            except Exception as e: 
+                boot_logger.warning(f"Engine shutdown error: {e}")
             
         if rate_limiter.redis: await rate_limiter.redis.close()
         if cache.redis: await cache.redis.close()
-        boot_logger.info("Shutdown complete")
+        boot_logger.info("Shutdown sequence complete")
 
     app = FastAPI(
-        title=app_name, version=app_version, description="Tadawul Fast Bridge API - Enterprise Market Data Platform",
-        lifespan=lifespan, docs_url="/docs" if get_env_bool("ENABLE_SWAGGER", True) else None,
+        title=app_name, 
+        version=app_version, 
+        description="Tadawul Fast Bridge API - Enterprise Market Data Platform",
+        lifespan=lifespan, 
+        docs_url="/docs" if get_env_bool("ENABLE_SWAGGER", True) else None,
         redoc_url="/redoc" if get_env_bool("ENABLE_REDOC", True) else None,
         default_response_class=BestJSONResponse
     )
 
+    # Middleware Setup (Order matters)
     if limiter is not None:
         app.state.limiter = limiter
         app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-        if SLOWAPI_AVAILABLE: app.add_middleware(SlowAPIMiddleware)
+        if SLOWAPI_AVAILABLE: 
+            # Note: SlowAPI must execute before Telemetry to catch limits correctly
+            app.add_middleware(SlowAPIMiddleware)
 
+    # Core middlewares
     app.add_middleware(TelemetryMiddleware)
     app.add_middleware(TracingMiddleware)
     app.add_middleware(GZipMiddleware, minimum_size=512)
@@ -863,14 +927,20 @@ def create_app() -> FastAPI:
 
     allow_origins = ["*"] if get_env_bool("ENABLE_CORS_ALL_ORIGINS", True) else get_env_list("CORS_ORIGINS", ["*"])
     app.add_middleware(
-        CORSMiddleware, allow_origins=allow_origins, allow_methods=["*"], allow_headers=["*"],
-        allow_credentials=False, expose_headers=["X-Request-ID", "X-Process-Time", "X-Time-Riyadh"], max_age=600,
+        CORSMiddleware, 
+        allow_origins=allow_origins, 
+        allow_methods=["*"], 
+        allow_headers=["*"],
+        allow_credentials=False, 
+        expose_headers=["X-Request-ID", "X-Process-Time", "X-Time-Riyadh", "Server-Timing"], 
+        max_age=600,
     )
-    if app_env == "production": app.add_middleware(TrustedHostMiddleware, allowed_hosts=get_env_list("ALLOWED_HOSTS", ["*"]))
+    if app_env == "production": 
+        app.add_middleware(TrustedHostMiddleware, allowed_hosts=get_env_list("ALLOWED_HOSTS", ["*"]))
 
     # Secured Sentry Initialization
     sentry_dsn = get_env_str("SENTRY_DSN").strip()
-    if SENTRY_AVAILABLE and sentry_dsn and sentry_dsn.startswith("http"):
+    if SENTRY_AVAILABLE and sentry_dsn and is_valid_uri(sentry_dsn):
         try:
             sentry_sdk.init(
                 dsn=sentry_dsn,
@@ -884,6 +954,7 @@ def create_app() -> FastAPI:
         except Exception as e:
             boot_logger.error(f"Failed to initialize Sentry: {e}")
 
+    # OpenTelemetry Setup
     if TRACING_AVAILABLE and get_env_bool("ENABLE_TRACING", False):
         try:
             provider = TracerProvider(resource=Resource(attributes={SERVICE_NAME: app_name}))
@@ -901,7 +972,14 @@ def create_app() -> FastAPI:
 
     @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
     async def root():
-        return {"status": "online", "service": app_name, "version": app_version, "environment": app_env, "time_riyadh": now_riyadh_iso(), "documentation": "/docs"}
+        return {
+            "status": "online", 
+            "service": app_name, 
+            "version": app_version, 
+            "environment": app_env, 
+            "time_riyadh": now_riyadh_iso(), 
+            "documentation": "/docs"
+        }
 
     @app.get("/readyz", include_in_schema=False)
     async def readiness():
@@ -909,7 +987,16 @@ def create_app() -> FastAPI:
         routers_ok = getattr(app.state, "routers_mounted", False) or get_env_bool("DEFER_ROUTER_MOUNT", False)
         engine_ok = getattr(app.state, "engine_ready", False) or not get_env_bool("ENGINE_REQUIRED_FOR_READYZ", False)
         ready = boot_ok and routers_ok and engine_ok
-        return BestJSONResponse(status_code=200 if ready else 503, content={"ready": ready, "boot_completed": boot_ok, "routers_mounted": getattr(app.state, "routers_mounted", False), "engine_ready": getattr(app.state, "engine_ready", False), "load": guardian.get_load_level()})
+        return BestJSONResponse(
+            status_code=200 if ready else 503, 
+            content={
+                "ready": ready, 
+                "boot_completed": boot_ok, 
+                "routers_mounted": getattr(app.state, "routers_mounted", False), 
+                "engine_ready": getattr(app.state, "engine_ready", False), 
+                "load": guardian.get_load_level()
+            }
+        )
 
     @app.get("/health", tags=["system"])
     async def health(request: Request):
@@ -924,16 +1011,25 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(StarletteHTTPException)
     async def http_exception_handler(request: Request, exc: StarletteHTTPException):
-        return BestJSONResponse(status_code=exc.status_code, content={"status": "error", "message": exc.detail, "request_id": get_request_id(), "time_riyadh": now_riyadh_iso()})
+        return BestJSONResponse(
+            status_code=exc.status_code, 
+            content={"status": "error", "message": exc.detail, "request_id": get_request_id(), "time_riyadh": now_riyadh_iso()}
+        )
 
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(request: Request, exc: RequestValidationError):
-        return BestJSONResponse(status_code=422, content={"status": "error", "message": "Validation error", "details": exc.errors(), "request_id": get_request_id()})
+        return BestJSONResponse(
+            status_code=422, 
+            content={"status": "error", "message": "Validation error", "details": exc.errors(), "request_id": get_request_id()}
+        )
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception):
         logger.error(f"Unhandled exception on {request.url.path}: {traceback.format_exc()}")
-        return BestJSONResponse(status_code=500, content={"status": "critical", "message": "Internal server error", "request_id": get_request_id()})
+        return BestJSONResponse(
+            status_code=500, 
+            content={"status": "critical", "message": "Internal server error", "request_id": get_request_id()}
+        )
 
     return app
 
