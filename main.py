@@ -2,16 +2,16 @@
 """
 main.py
 ===========================================================
-TADAWUL FAST BRIDGE – ENTERPRISE FASTAPI ENTRY POINT (v7.5.0)
+TADAWUL FAST BRIDGE – ENTERPRISE FASTAPI ENTRY POINT (v8.0.0)
 ===========================================================
 QUANTUM EDITION | MISSION CRITICAL | AUTO-SCALING ASGI
 
-What's new in v7.5.0:
+What's new in v8.0.0:
+- ✅ Sentry Initialization Fix: Strict DSN validation prevents `BadDsn` crashes on startup.
+- ✅ System Guardian Fix: Fully implemented `to_dict()` for robust `/health` endpoint telemetry.
 - ✅ High-Performance JSON (`orjson`): Fully integrated as the default FastAPI response class.
 - ✅ Full Jitter Exponential Backoff: Applied to the engine bootstrapper for resilient startup.
-- ✅ Memory-Optimized State Models: Internal managers use `@dataclass(slots=True)` to prevent fragmentation.
-- ✅ Zlib Compressed Caching: Redis/Memory multi-tier cache now supports high-speed binary compression.
-- ✅ OpenTelemetry Tracing: Deep middleware integration capturing exact request lifecycles.
+- ✅ Memory-Optimized State Models: Internal managers use `@dataclass(slots=True)`.
 - ✅ Zero-Downtime Hot Swapping: Enhanced System Guardian gracefully sheds load during GC spikes.
 
 Core Capabilities
@@ -25,7 +25,6 @@ Core Capabilities
 • Prometheus metrics export
 • Structured logging with multiple outputs (JSON, text)
 • Graceful shutdown with connection draining
-• Degraded mode operation under load
 """
 
 from __future__ import annotations
@@ -49,7 +48,7 @@ import zlib
 import pickle
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from functools import lru_cache, wraps
@@ -164,7 +163,7 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-APP_ENTRY_VERSION = "7.5.0"
+APP_ENTRY_VERSION = "8.0.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled", "ok", "active"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled"}
@@ -209,7 +208,8 @@ def get_env_float(key: str, default: float) -> float:
     except (ValueError, TypeError): return default
 
 def get_env_str(key: str, default: str = "") -> str:
-    return strip_value(os.getenv(key)) or default
+    v = os.getenv(key)
+    return str(v).strip() if v is not None and str(v).strip() else default
 
 def get_env_list(key: str, default: Optional[List[str]] = None) -> List[str]:
     v = os.getenv(key)
@@ -283,7 +283,6 @@ class JSONFormatter(logging.Formatter):
 def configure_logging() -> None:
     log_level = get_env_str("LOG_LEVEL", "INFO").upper()
     log_json = get_env_bool("LOG_JSON", False)
-    log_format = get_env_str("LOG_FORMAT", "detailed")
     
     if log_level not in ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]: log_level = "INFO"
 
@@ -372,6 +371,24 @@ class SystemGuardian:
         if self.latency_ms > self.degraded_enter_lag * 0.7: return "high"
         if self.latency_ms > self.degraded_enter_lag * 0.4: return "medium"
         return "low"
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Export current diagnostics and metrics."""
+        return {
+            "status": self.get_status(),
+            "load_level": self.get_load_level(),
+            "metrics": {
+                "latency_ms": round(self.latency_ms, 2),
+                "memory_mb": round(self.memory_mb, 2),
+                "cpu_percent": round(self.cpu_percent, 2),
+                "request_count": self.request_count,
+                "error_count": self.error_count,
+                "active_connections": self.active_connections,
+                "background_tasks": self.background_tasks,
+            },
+            "boot_time_utc": self.boot_time_utc,
+            "boot_time_riyadh": self.boot_time_riyadh,
+        }
 
     async def should_shed_request(self, path: str) -> bool:
         if not self.degraded_mode or not get_env_bool("DEGRADED_SHED_ENABLED", True): return False
@@ -625,7 +642,7 @@ class TelemetryMiddleware(BaseHTTPMiddleware):
             response = await call_next(request)
             duration = time.time() - request.state.start_time
             guardian.latency_ms = guardian.latency_ms * 0.9 + duration * 1000 * 0.1
-            metrics.record_request(method=request.method, endpoint=request.url.path, status=response.status_code, duration=duration, request_size=int(request.headers.get("content-length", 0)), response_size=int(response.headers.get("content-length", 0)))
+            metrics.record_request(method=request.method, endpoint=request.url.path, status=response.status_code, duration=duration)
             
             response.headers["X-Request-ID"] = request_id
             response.headers["X-Process-Time"] = f"{duration:.4f}s"
@@ -851,16 +868,31 @@ def create_app() -> FastAPI:
     )
     if app_env == "production": app.add_middleware(TrustedHostMiddleware, allowed_hosts=get_env_list("ALLOWED_HOSTS", ["*"]))
 
-    if SENTRY_AVAILABLE and get_env_str("SENTRY_DSN"):
-        sentry_sdk.init(dsn=get_env_str("SENTRY_DSN"), environment=app_env, release=app_version, traces_sample_rate=get_env_float("SENTRY_TRACES_SAMPLE_RATE", 0.1), integrations=[LoggingIntegration(level=logging.INFO, event_level=logging.ERROR)])
-        if SentryAsgiMiddleware: app.add_middleware(SentryAsgiMiddleware)
+    # Secured Sentry Initialization
+    sentry_dsn = get_env_str("SENTRY_DSN").strip()
+    if SENTRY_AVAILABLE and sentry_dsn and sentry_dsn.startswith("http"):
+        try:
+            sentry_sdk.init(
+                dsn=sentry_dsn,
+                environment=app_env,
+                release=app_version,
+                traces_sample_rate=get_env_float("SENTRY_TRACES_SAMPLE_RATE", 0.1),
+                integrations=[LoggingIntegration(level=logging.INFO, event_level=logging.ERROR)]
+            )
+            if SentryAsgiMiddleware:
+                app.add_middleware(SentryAsgiMiddleware)
+        except Exception as e:
+            boot_logger.error(f"Failed to initialize Sentry: {e}")
 
     if TRACING_AVAILABLE and get_env_bool("ENABLE_TRACING", False):
-        provider = TracerProvider(resource=Resource(attributes={SERVICE_NAME: app_name}))
-        exporter = OTLPSpanExporter(endpoint=get_env_str("OTLP_ENDPOINT")) if get_env_str("OTLP_ENDPOINT") else None
-        if exporter: provider.add_span_processor(BatchSpanProcessor(exporter))
-        trace.set_tracer_provider(provider)
-        FastAPIInstrumentor.instrument_app(app)
+        try:
+            provider = TracerProvider(resource=Resource(attributes={SERVICE_NAME: app_name}))
+            exporter = OTLPSpanExporter(endpoint=get_env_str("OTLP_ENDPOINT")) if get_env_str("OTLP_ENDPOINT") else None
+            if exporter: provider.add_span_processor(BatchSpanProcessor(exporter))
+            trace.set_tracer_provider(provider)
+            FastAPIInstrumentor.instrument_app(app)
+        except Exception as e:
+            boot_logger.error(f"Failed to initialize OpenTelemetry: {e}")
 
     if PROMETHEUS_AVAILABLE and get_env_bool("ENABLE_METRICS", True):
         @app.get("/metrics", include_in_schema=False)
@@ -881,7 +913,14 @@ def create_app() -> FastAPI:
 
     @app.get("/health", tags=["system"])
     async def health(request: Request):
-        return {"status": "healthy" if getattr(app.state, "engine_ready", False) and not guardian.degraded_mode else "degraded", "service": {"name": app_name, "version": app_version, "environment": app_env}, "vitals": guardian.to_dict()["metrics"], "boot": {"engine_ready": getattr(app.state, "engine_ready", False)}, "routers": getattr(app.state, "router_report", {"mounted": [], "failed": []}), "trace_id": get_request_id()}
+        return {
+            "status": "healthy" if getattr(app.state, "engine_ready", False) and not guardian.degraded_mode else "degraded",
+            "service": {"name": app_name, "version": app_version, "environment": app_env},
+            "vitals": guardian.to_dict()["metrics"],
+            "boot": {"engine_ready": getattr(app.state, "engine_ready", False)},
+            "routers": getattr(app.state, "router_report", {"mounted": [], "failed": []}),
+            "trace_id": get_request_id()
+        }
 
     @app.exception_handler(StarletteHTTPException)
     async def http_exception_handler(request: Request, exc: StarletteHTTPException):
@@ -898,7 +937,9 @@ def create_app() -> FastAPI:
 
     return app
 
+
 app = create_app()
+
 
 if __name__ == "__main__":
     import uvicorn
