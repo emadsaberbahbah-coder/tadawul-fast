@@ -2,18 +2,17 @@
 """
 core/symbols_reader.py
 ================================================================================
-TADAWUL FAST BRIDGE – ENTERPRISE SYMBOLS READER (v7.5.0)
+TADAWUL FAST BRIDGE – ENTERPRISE SYMBOLS READER (v8.0.0)
 ================================================================================
 QUANTUM EDITION | INTELLIGENT DISCOVERY | ASYNC ORCHESTRATION
 
-What's new in v7.5.0:
+What's new in v8.0.0:
+- ✅ O(1) LRU Caching: Upgraded from O(N) eviction to `OrderedDict` for instant memory pruning.
+- ✅ SingleFlight Coalescing: Prevents cache stampedes by combining identical concurrent Google Sheets requests.
+- ✅ Executor Segregation: Dedicated ThreadPools for I/O (Network) and CPU (ML/Zlib) to protect the ASGI loop.
+- ✅ Hardened Sync Wrappers: Bulletproof synchronous fallbacks utilizing isolated thread loops.
+- ✅ Structural Logging: `structlog` integration for Datadog/Kibana observability.
 - ✅ High-Performance JSON (`orjson`): Blazing fast serialization for cached sheets.
-- ✅ Memory Optimization: `@dataclass(slots=True)` reduces memory footprint during large scans.
-- ✅ Async Thread Pooling: Non-blocking Google Sheets API calls using `asyncio.to_thread`.
-- ✅ Full Jitter Exponential Backoff: Protects against Google API rate limits (429s).
-- ✅ Multi-Tier Caching: Zlib-compressed Memory (L1) + Redis (L2) cache architecture.
-- ✅ OpenTelemetry Tracing: Granular observability across discovery strategies.
-- ✅ Prometheus Metrics: Real-time tracking of discovery performance and cache hits.
 
 Core Capabilities
 -----------------
@@ -29,10 +28,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import csv
 import hashlib
 import logging
-import logging.config
 import os
 import pickle
 import random
@@ -41,7 +40,7 @@ import threading
 import time
 import uuid
 import zlib
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -135,13 +134,29 @@ except ImportError:
     tracer = DummyTracer()
 
 # =============================================================================
-# Logging Configuration
+# Logging & Executors
 # =============================================================================
 LOG_FORMAT = "%(asctime)s | %(levelname)8s | %(name)s | %(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
-logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=DATE_FORMAT)
-logger = logging.getLogger("symbols_reader")
+if os.getenv("JSON_LOGS", "false").lower() == "true":
+    import structlog
+    structlog.configure(
+        processors=[
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.add_log_level,
+            structlog.processors.JSONRenderer(),
+        ],
+        logger_factory=structlog.PrintLoggerFactory(),
+    )
+    logger = structlog.get_logger("symbols_reader")
+else:
+    logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=DATE_FORMAT)
+    logger = logging.getLogger("symbols_reader")
+
+# Dedicated Executors to prevent ASGI loop starvation
+_IO_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=10, thread_name_prefix="SymReadIO")
+_CPU_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="SymReadCPU")
 
 # =============================================================================
 # Metrics & Tracing
@@ -192,7 +207,7 @@ else:
 # =============================================================================
 # Enums & Types (Memory Optimized)
 # =============================================================================
-class SymbolType(Enum):
+class SymbolType(str, Enum):
     KSA = "ksa"
     GLOBAL = "global"
     INDEX = "index"
@@ -203,14 +218,14 @@ class SymbolType(Enum):
     COMMODITY = "commodity"
     UNKNOWN = "unknown"
 
-class DiscoveryStrategy(Enum):
+class DiscoveryStrategy(str, Enum):
     HEADER = "header"
     DATA_SCAN = "data_scan"
     ML = "ml"
     EXPLICIT = "explicit"
     DEFAULT = "default"
 
-class ConfidenceLevel(Enum):
+class ConfidenceLevel(str, Enum):
     HIGH = "high"
     MEDIUM = "medium"
     LOW = "low"
@@ -343,7 +358,7 @@ def split_cell(cell: Any) -> List[str]:
     return [p.strip() for p in parts if p and p.strip()]
 
 # =============================================================================
-# Full Jitter Backoff
+# Full Jitter Backoff & SingleFlight
 # =============================================================================
 
 class FullJitterBackoff:
@@ -386,6 +401,34 @@ class FullJitterBackoff:
                 time.sleep(random.uniform(0, temp))
         raise last_err
 
+class SingleFlight:
+    """Deduplicates concurrent executions of identical tasks."""
+    def __init__(self):
+        self._calls: Dict[str, asyncio.Future] = {}
+        self._lock = asyncio.Lock()
+
+    async def execute(self, key: str, coro_func: Callable[[], Awaitable[Any]]) -> Any:
+        async with self._lock:
+            if key in self._calls:
+                return await self._calls[key]
+            fut = asyncio.get_running_loop().create_future()
+            self._calls[key] = fut
+
+        try:
+            result = await coro_func()
+            if not fut.done():
+                fut.set_result(result)
+            return result
+        except Exception as e:
+            if not fut.done():
+                fut.set_exception(e)
+            raise
+        finally:
+            async with self._lock:
+                self._calls.pop(key, None)
+
+_SINGLE_FLIGHT = SingleFlight()
+
 # =============================================================================
 # Configuration
 # =============================================================================
@@ -397,7 +440,7 @@ class Config:
     CACHE_TTL_SEC = get_env_float("TFB_SYMBOLS_CACHE_TTL_SEC", 300.0)
     CACHE_DISABLE = get_env_bool("TFB_SYMBOLS_CACHE_DISABLE", False)
     CACHE_BACKEND = get_env_str("TFB_SYMBOLS_CACHE_BACKEND", "redis" if REDIS_AVAILABLE else "memory")
-    CACHE_MAX_SIZE = get_env_int("TFB_SYMBOLS_CACHE_MAX_SIZE", 1000)
+    CACHE_MAX_SIZE = get_env_int("TFB_SYMBOLS_CACHE_MAX_SIZE", 10000)
     CACHE_COMPRESSION = get_env_bool("TFB_SYMBOLS_CACHE_COMPRESSION", True)
 
     MAX_RETRIES = get_env_int("TFB_SYMBOLS_MAX_RETRIES", 4)
@@ -563,9 +606,9 @@ class GoogleSheetsReader:
             return []
             
     async def read_range_async(self, spreadsheet_id: str, range_a1: str) -> List[List[Any]]:
-        """Asynchronous wrapper for read_range to avoid blocking the event loop"""
+        """Asynchronous wrapper for read_range delegated to I/O thread pool."""
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self.read_range, spreadsheet_id, range_a1)
+        return await loop.run_in_executor(_IO_EXECUTOR, self.read_range, spreadsheet_id, range_a1)
 
     def list_sheets(self, spreadsheet_id: str) -> List[str]:
         service = self._get_service()
@@ -582,12 +625,13 @@ class GoogleSheetsReader:
 sheets_reader = GoogleSheetsReader()
 
 # =============================================================================
-# Cache Manager (Multi-Tier Zlib)
+# Cache Manager (O(1) LRU + Multi-Tier Zlib)
 # =============================================================================
 class AdvancedCache:
-    """Multi-tier Cache (Memory L1 + Redis L2) with Zlib Compression"""
+    """Multi-tier Cache (Memory L1 + Redis L2) with Zlib Compression and O(1) LRU eviction."""
     def __init__(self):
-        self._memory_cache: Dict[str, Tuple[float, bytes]] = {}
+        # OrderedDict allows O(1) pops and move_to_end for true LRU tracking
+        self._memory_cache: OrderedDict[str, Tuple[float, bytes]] = OrderedDict()
         self._memory_lock = asyncio.Lock()
         self._redis_client: Optional[Redis] = None
         self._stats = {"l1_hits": 0, "l2_hits": 0, "misses": 0}
@@ -618,14 +662,17 @@ class AdvancedCache:
         key = self._make_key(*key_parts)
         now = time.time()
 
-        # Check L1 Memory Cache
+        # Check L1 Memory Cache (O(1) lookups and eviction updates)
         async with self._memory_lock:
             if key in self._memory_cache:
                 expiry, data = self._memory_cache[key]
                 if now < expiry:
+                    self._memory_cache.move_to_end(key)
                     self._stats["l1_hits"] += 1
                     reader_cache_hits.labels(level="L1").inc()
-                    return self._decompress(data)
+                    # Decompression on CPU executor
+                    loop = asyncio.get_running_loop()
+                    return await loop.run_in_executor(_CPU_EXECUTOR, self._decompress, data)
                 else:
                     del self._memory_cache[key]
 
@@ -638,8 +685,12 @@ class AdvancedCache:
                     reader_cache_hits.labels(level="L2").inc()
                     # Backfill L1
                     async with self._memory_lock:
+                        if len(self._memory_cache) >= config.CACHE_MAX_SIZE:
+                            self._memory_cache.popitem(last=False)
                         self._memory_cache[key] = (now + config.CACHE_TTL_SEC, data)
-                    return self._decompress(data)
+                    
+                    loop = asyncio.get_running_loop()
+                    return await loop.run_in_executor(_CPU_EXECUTOR, self._decompress, data)
             except Exception as e:
                 logger.debug(f"Redis get failed: {e}")
 
@@ -650,14 +701,18 @@ class AdvancedCache:
     async def set(self, value: Any, *key_parts) -> None:
         if config.CACHE_DISABLE: return
         key = self._make_key(*key_parts)
-        data = self._compress(value)
+        
+        # Compression on CPU executor
+        loop = asyncio.get_running_loop()
+        data = await loop.run_in_executor(_CPU_EXECUTOR, self._compress, value)
+        
         expiry = time.time() + config.CACHE_TTL_SEC
 
         async with self._memory_lock:
-            if len(self._memory_cache) >= config.CACHE_MAX_SIZE:
-                oldest = min(self._memory_cache.items(), key=lambda x: x[1][0])[0]
-                del self._memory_cache[oldest]
+            if key not in self._memory_cache and len(self._memory_cache) >= config.CACHE_MAX_SIZE:
+                self._memory_cache.popitem(last=False)
             self._memory_cache[key] = (expiry, data)
+            self._memory_cache.move_to_end(key)
 
         if self._redis_client:
             try:
@@ -750,10 +805,11 @@ class MLDetectionEngine:
                 labels = [1] * len(positive_samples) + [0] * len(negative_samples)
                 self.vectorizer = TfidfVectorizer(analyzer='char', ngram_range=(2, 5), max_features=1000)
                 X = self.vectorizer.fit_transform(texts)
-                self.model = RandomForestClassifier(n_estimators=100, n_jobs=-1)
+                # Restrict n_jobs so it doesn't exhaust the system during fast async events
+                self.model = RandomForestClassifier(n_estimators=100, n_jobs=2)
                 self.model.fit(X, labels)
                 self.trained = True
-            await loop.run_in_executor(None, _train)
+            await loop.run_in_executor(_CPU_EXECUTOR, _train)
 
     async def predict(self, text: str) -> Tuple[bool, float]:
         if not self.trained or not ML_AVAILABLE: return False, 0.0
@@ -762,7 +818,7 @@ class MLDetectionEngine:
             def _predict():
                 X = self.vectorizer.transform([text])
                 return self.model.predict_proba(X)[0][1]
-            confidence = await loop.run_in_executor(None, _predict)
+            confidence = await loop.run_in_executor(_CPU_EXECUTOR, _predict)
             return confidence > config.ML_CONFIDENCE_THRESHOLD, confidence
 
 ml_detector = MLDetectionEngine() if config.ML_DETECTION_ENABLED else None
@@ -872,18 +928,10 @@ extractor = SymbolExtractor()
 # Main Async API
 # =============================================================================
 
-async def get_page_symbols_async(key: str, spreadsheet_id: Optional[str] = None) -> Dict[str, Any]:
-    """Async engine to get symbols from a page with rich metadata."""
+async def _get_page_symbols_internal(key: str, sid: str, canonical_key: str, spec: PageSpec) -> Dict[str, Any]:
+    """Inner logic for getting page symbols to be wrapped by SingleFlight"""
     start_time = time.perf_counter()
-    sid = strip_value(spreadsheet_id) or os.getenv("DEFAULT_SPREADSHEET_ID") or os.getenv("SPREADSHEET_ID")
     
-    if not sid:
-        return {"all": [], "error": "No spreadsheet ID", "status": "error"}
-
-    canonical_key = resolve_key(key)
-    spec = PAGE_REGISTRY.get(canonical_key)
-    if not spec: return {"all": [], "error": f"Unknown page key: {key}", "status": "error"}
-
     # Cache Check
     cached = await cache.get("page", sid, canonical_key, spec.header_row, spec.start_row, spec.max_rows)
     if cached is not None:
@@ -941,6 +989,22 @@ async def get_page_symbols_async(key: str, spreadsheet_id: Optional[str] = None)
     reader_requests_total.labels(sheet=canonical_key, status="empty").inc()
     return result
 
+
+async def get_page_symbols_async(key: str, spreadsheet_id: Optional[str] = None) -> Dict[str, Any]:
+    """Async engine to get symbols from a page utilizing SingleFlight deduplication."""
+    sid = strip_value(spreadsheet_id) or os.getenv("DEFAULT_SPREADSHEET_ID") or os.getenv("SPREADSHEET_ID")
+    
+    if not sid:
+        return {"all": [], "error": "No spreadsheet ID", "status": "error"}
+
+    canonical_key = resolve_key(key)
+    spec = PAGE_REGISTRY.get(canonical_key)
+    if not spec: return {"all": [], "error": f"Unknown page key: {key}", "status": "error"}
+
+    flight_key = f"{sid}:{canonical_key}"
+    return await _SINGLE_FLIGHT.execute(flight_key, lambda: _get_page_symbols_internal(key, sid, canonical_key, spec))
+
+
 async def get_universe_async(keys: List[str], spreadsheet_id: Optional[str] = None) -> Dict[str, Any]:
     start_time = time.perf_counter()
     sid = strip_value(spreadsheet_id) or os.getenv("DEFAULT_SPREADSHEET_ID")
@@ -979,18 +1043,46 @@ async def get_universe_async(keys: List[str], spreadsheet_id: Optional[str] = No
 def get_page_symbols(key: str, spreadsheet_id: Optional[str] = None) -> Dict[str, Any]:
     try:
         loop = asyncio.get_running_loop()
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            return loop.run_until_complete(get_page_symbols_async(key, spreadsheet_id))
+        # Create an isolated event loop in a new thread to run the async task synchronously
+        # This prevents "This event loop is already running" errors.
+        res_box = [None]
+        err_box = [None]
+        def _run():
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            try:
+                res_box[0] = new_loop.run_until_complete(get_page_symbols_async(key, spreadsheet_id))
+            except Exception as e:
+                err_box[0] = e
+            finally:
+                new_loop.close()
+        t = threading.Thread(target=_run)
+        t.start()
+        t.join()
+        if err_box[0]: raise err_box[0]
+        return res_box[0]
     except RuntimeError:
         return asyncio.run(get_page_symbols_async(key, spreadsheet_id))
 
 def get_universe(keys: List[str], spreadsheet_id: Optional[str] = None) -> Dict[str, Any]:
     try:
         loop = asyncio.get_running_loop()
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor() as pool:
-            return loop.run_until_complete(get_universe_async(keys, spreadsheet_id))
+        res_box = [None]
+        err_box = [None]
+        def _run():
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            try:
+                res_box[0] = new_loop.run_until_complete(get_universe_async(keys, spreadsheet_id))
+            except Exception as e:
+                err_box[0] = e
+            finally:
+                new_loop.close()
+        t = threading.Thread(target=_run)
+        t.start()
+        t.join()
+        if err_box[0]: raise err_box[0]
+        return res_box[0]
     except RuntimeError:
         return asyncio.run(get_universe_async(keys, spreadsheet_id))
 
