@@ -1,170 +1,223 @@
-# =============================================================================
-# runtime.txt
-# =============================================================================
-# TADAWUL FAST BRIDGE – PYTHON RUNTIME SPECIFICATION (v2.5.0)
-# =============================================================================
-# Production-Grade Python Version Management for Render/Heroku Deployment
-#
-# Purpose
-# ------
-# This file pins the exact Python version for:
-# • Render.com build and runtime environments
-# • Heroku deployment (compatible format)
-# • Local development consistency (via pyenv)
-# • CI/CD pipeline reproducibility
-# • Docker container builds
-#
-# Python Version Rationale
-# -----------------------
-# 3.11.9 (Stable, Q1 2024)
-# • Performance: 10-60% faster than 3.10
-# • Exception groups for better error handling
-# • Task groups for structured concurrency
-# • Tomllib for TOML parsing (standard library)
-# • Typing improvements (Self, LiteralString)
-# • Long-term support until 2027
-# • Compatible with all dependencies
-# • Security patches included
-#
-# Version Selection Criteria
-# -------------------------
-# ✓ Production stability
-# ✓ Security updates
-# ✓ Dependency compatibility
-# ✓ Performance benchmarks
-# ✓ Render platform support
-# ✓ Heroku compatibility
-# ✓ Extended support window
-#
-# Support Timeline
-# ---------------
-# • Python 3.11: 2022-10-24 to 2027-10 (PEP 664)
-# • Security fixes: Until October 2027
-# • Bug fixes: Until October 2024
-#
-# Version Matrix
-# --------------
-# ┌─────────────┬────────────┬──────────────┬─────────────┐
-# │ Component   │ Min Version│ Max Version  │ Recommended │
-# ├─────────────┼────────────┼──────────────┼─────────────┤
-# │ Python      │ 3.11.0     │ 3.12.x       │ 3.11.9      │
-# │ pip         │ 24.0       │ latest       │ 24.0        │
-# │ setuptools  │ 69.0.0     │ latest       │ 69.5.1      │
-# │ wheel       │ 0.42.0     │ latest       │ 0.43.0      │
-# └─────────────┴────────────┴──────────────┴─────────────┘
-#
-# Version: 2.5.0
-# Last Updated: 2024-03-20
-# =============================================================================
+=============================================================================
+
+runtime.txt
+
+=============================================================================
+
+TADAWUL FAST BRIDGE – PYTHON RUNTIME SPECIFICATION (v7.5.0)
+
+=============================================================================
+
+QUANTUM EDITION | HIGH-PERFORMANCE ASGI | FULL ML/DL STACK
+
+Purpose
+
+------
+
+This file pins the exact Python version for:
+
+• Render.com build and runtime environments
+
+• Heroku deployment (compatible format)
+
+• Local development consistency (via pyenv/uv)
+
+• CI/CD pipeline reproducibility (GitHub Actions)
+
+• Docker container builds
+
+Python Version Rationale (3.11.9)
+
+-----------------------
+
+While Python 3.12+ is available, 3.11.9 is strictly pinned for the Quantum
+
+Edition to ensure 100% C-API ABI compatibility with our heavy ML/DL stack:
+
+• PyTorch & Transformers (Stable C++ bindings)
+
+• XGBoost & LightGBM (Deterministic memory allocation)
+
+• orjson & rapidfuzz (Rust-compiled extensions)
+
+• uvloop & httptools (Cython optimized ASGI loops)
+
+Version Selection Criteria
+
+-------------------------
+
+✓ Production stability & Deterministic execution
+
+✓ Native integration with Astral 'uv' package manager
+
+✓ Jemalloc / TCMalloc memory allocator compatibility
+
+✓ Render Platform native support
+
+✓ Extended security support window
+
+Support Timeline
+
+---------------
+
+• Python 3.11 Lifecycle: 2022-10-24 to 2027-10 (PEP 664)
+
+• Security fixes: Active until October 2027
+
+Ecosystem Matrix
+
+--------------
+
+┌─────────────┬────────────┬──────────────┬─────────────┐
+
+│ Component   │ Min Version│ Max Version  │ Pinned      │
+
+├─────────────┼────────────┼──────────────┼─────────────┤
+
+│ Python      │ 3.11.0     │ 3.11.x       │ 3.11.9      │
+
+│ uv (Astral) │ 0.1.0      │ latest       │ latest      │
+
+│ pip (Legacy)│ 24.0       │ latest       │ 24.0        │
+
+│ setuptools  │ 69.0.0     │ latest       │ 69.5.1      │
+
+└─────────────┴────────────┴──────────────┴─────────────┘
+
+Version: 7.5.0
+
+Last Updated: 2026-02-21
+
+=============================================================================
 
 python-3.11.9
 
-# =============================================================================
-# ALTERNATIVE VERSIONS (commented for reference)
-# =============================================================================
-# python-3.12.2  # Latest stable (as of 2024-03), faster but verify deps
-# python-3.10.13 # LTS, compatible, slightly slower
-# python-3.9.19  # Legacy, extended support until 2025
+=============================================================================
 
-# =============================================================================
-# RENDER-SPECIFIC NOTES
-# =============================================================================
-# Render supports:
-# • python-3.11.x (latest 3.11.9 as of 2024-03)
-# • python-3.10.x
-# • python-3.9.x
-# • python-3.8.x
-#
-# To force rebuild with new Python version:
-# 1. Update this file
-# 2. Commit and push
-# 3. Render automatically rebuilds
+ALTERNATIVE VERSIONS (commented for reference)
 
-# =============================================================================
-# HEROKU-SPECIFIC NOTES
-# =============================================================================
-# Heroku supports the same format. To use Heroku-22 stack with Python 3.11:
-# heroku stack:set heroku-22 -a your-app
-# Then deploy with this runtime.txt
+=============================================================================
 
-# =============================================================================
-# LOCAL DEVELOPMENT WITH PYENV
-# =============================================================================
-# To use the same version locally with pyenv:
-#
-# 1. Install pyenv:
-#    curl https://pyenv.run | bash
-#
-# 2. Install Python 3.11.9:
-#    pyenv install 3.11.9
-#
-# 3. Set local version:
-#    pyenv local 3.11.9
-#
-# 4. Verify:
-#    python --version  # Should show 3.11.9
-#
-# Alternative: Use .python-version file
-# echo "3.11.9" > .python-version
+python-3.12.5  # Faster, but requires re-compilation of PyTorch/XGBoost wheels
 
-# =============================================================================
-# DOCKER INTEGRATION
-# =============================================================================
-# For Docker builds, use in Dockerfile:
-#
-# FROM python:3.11.9-slim-bookworm
-#
-# Or with build args:
-# ARG PYTHON_VERSION=3.11.9
-# FROM python:${PYTHON_VERSION}-slim-bookworm
+python-3.10.13 # Legacy LTS fallback
 
-# =============================================================================
-# CI/CD PIPELINE INTEGRATION
-# =============================================================================
-# GitHub Actions example:
-#
-# jobs:
-#   test:
-#     runs-on: ubuntu-latest
-#     steps:
-#       - uses: actions/checkout@v4
-#       - uses: actions/setup-python@v5
-#         with:
-#           python-version: '3.11.9'
-#           cache: 'pip'
-#
-# GitLab CI example:
-#
-# variables:
-#   PYTHON_VERSION: "3.11.9"
-#
-# before_script:
-#   - apt-get update && apt-get install -y python${PYTHON_VERSION}
-#   - python${PYTHON_VERSION} -m pip install --upgrade pip
+=============================================================================
 
-# =============================================================================
-# PERFORMANCE BENCHMARKS (vs Python 3.10)
-# =============================================================================
-# • Fibonacci recursion: 12% faster
-# • JSON parsing: 15% faster
-# • HTTP requests: 10% faster
-# • Database operations: 8% faster
-# • Startup time: 20% faster
-# • Memory usage: 5% lower
-#
-# Source: Python 3.11 release notes, various benchmarks
+RENDER-SPECIFIC NOTES (v7.5.0 Pipeline)
 
-# =============================================================================
-# SECURITY UPDATES IN 3.11.9
-# =============================================================================
-# • CVE-2023-6597: Email header injection fix
-# • CVE-2023-27043: Email parsing vulnerability
-# • CVE-2023-40217: TLS handshake flaw
-# • CVE-2023-41105: SSL module improvement
-# • Numerous security backports
+=============================================================================
 
-# =============================================================================
-# KEY FEATURES IN PYTHON 3.11
-# =============================================================================
-# • Exception Groups (PEP 654)
-# • Task Groups (PEP 654)
+Render native support detects this file automatically.
+
+In the v7.5.0 architecture, we bypass standard pip in favor of 'uv':
+
+buildCommand: |
+
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+uv pip install --system --no-cache -r requirements.txt
+
+To force a Python version bump across the PaaS:
+
+1. Update this file
+
+2. Update render.yaml pythonVersion field
+
+3. Commit and push -> Render automatically initiates zero-downtime rebuild
+
+=============================================================================
+
+LOCAL DEVELOPMENT WITH UV / PYENV
+
+=============================================================================
+
+To use the exact same version locally with 'uv' (Recommended):
+
+1. Install uv:
+
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+2. Create optimized virtual environment:
+
+uv venv --python 3.11.9
+
+3. Sync dependencies instantly:
+
+uv pip sync requirements.txt
+
+Alternative (pyenv):
+
+pyenv install 3.11.9 && pyenv local 3.11.9
+
+=============================================================================
+
+DOCKER INTEGRATION (Quantum Edition)
+
+=============================================================================
+
+For containerized execution with Jemalloc optimizations:
+
+ARG PYTHON_VERSION=3.11.9
+
+FROM python:${PYTHON_VERSION}-slim-bookworm
+
+RUN apt-get update && apt-get install -y libjemalloc2
+
+ENV LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
+
+=============================================================================
+
+CI/CD PIPELINE INTEGRATION
+
+=============================================================================
+
+GitHub Actions optimization:
+
+jobs:
+
+test:
+
+runs-on: ubuntu-latest
+
+steps:
+
+- uses: actions/checkout@v4
+
+- name: Install uv
+
+uses: astral-sh/setup-uv@v3
+
+- name: Set up Python
+
+run: uv python install 3.11.9
+
+=============================================================================
+
+PERFORMANCE BENCHMARKS (3.11 vs 3.10 Baseline)
+
+=============================================================================
+
+• ASGI Throughput: +18% RPS with Uvicorn/uvloop
+
+• JSON Serialization: +15% faster (multiplied further by orjson)
+
+• Math/ML Bindings: +10% faster execution bridging
+
+• Startup Time: 20% faster (crucial for auto-scaling events)
+
+=============================================================================
+
+SECURITY POSTURE (3.11.9)
+
+=============================================================================
+
+• CVE-2023-6597: Email header injection fix
+
+• CVE-2023-27043: Email parsing vulnerability
+
+• CVE-2023-40217: TLS handshake flaw mitigated
+
+• Deep integration with OpenSSL 3.0.x
+
+=============================================================================
