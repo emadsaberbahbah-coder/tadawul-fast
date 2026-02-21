@@ -109,7 +109,7 @@ nltk>=3.9.0,<4.0.0
 beautifulsoup4>=4.12.3,<5.0.0
 lxml>=5.3.0,<6.0.0
 feedparser>=6.0.11,<7.0.0
-googletrans==4.0.0rc1  # Async translation for news intelligence
+googletrans==4.0.2  # Async translation for news intelligence (compatible with modern httpx)
 
 # =============================================================================
 # GOOGLE CLOUD INTEGRATION & SHEETS
