@@ -15,6 +15,7 @@ What's new in v5.0.0:
 - ✅ Enhanced XGBoost integration for Provider Selection ML scoring
 - ✅ Multi-Region Support & Real-Time WebSocket Streaming
 - ✅ Predictive Prefetching & Cache Warming
+- ✅ Fixed: Added missing Singleton Management and `get_engine()` exports
 
 Key Features:
 - Intelligent provider discovery and ML-based scoring
