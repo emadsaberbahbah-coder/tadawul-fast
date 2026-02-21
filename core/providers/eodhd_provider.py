@@ -15,7 +15,7 @@ What's new in v4.0.0:
 - ✅ ADDED: Strict Type Coercion for NaN/Inf anomalies.
 - ✅ ENHANCED: Memory management using zero-copy slicing where possible.
 - ✅ ENHANCED: Market Regime Detection using statistical rolling distributions.
-- ✅ ENHANCED: Concurrency model with strict Semaphore bounds.
+- ✅ ENHANCED: Concurrency model with strict Semaphore bounds and Singleflight.
 
 Key Features:
 - Global equity, index, forex, commodity coverage
@@ -34,7 +34,6 @@ from __future__ import annotations
 import asyncio
 import functools
 import hashlib
-import json
 import logging
 import math
 import os
@@ -60,6 +59,7 @@ try:
     def json_loads(data: Union[str, bytes]) -> Any:
         return orjson.loads(data)
 except ImportError:
+    import json
     def json_loads(data: Union[str, bytes]) -> Any:
         return json.loads(data)
 
@@ -123,7 +123,7 @@ DEFAULT_BASE_URL = "https://eodhistoricaldata.com/api"
 DEFAULT_TIMEOUT_SEC = 15.0
 DEFAULT_RETRY_ATTEMPTS = 4
 DEFAULT_MAX_CONCURRENCY = 40
-DEFAULT_RATE_LIMIT = 5.0  # requests per second
+DEFAULT_RATE_LIMIT = 5.0  # requests per second (typical for EODHD basic tiers)
 DEFAULT_CIRCUIT_BREAKER_THRESHOLD = 5
 DEFAULT_CIRCUIT_BREAKER_TIMEOUT = 30.0
 DEFAULT_QUEUE_SIZE = 2000
@@ -152,14 +152,12 @@ class CircuitState(Enum):
     OPEN = "open"
     HALF_OPEN = "half_open"
 
-
 class MarketRegime(Enum):
     BULL = "bull"
     BEAR = "bear"
     VOLATILE = "volatile"
     SIDEWAYS = "sideways"
     UNKNOWN = "unknown"
-
 
 class AssetClass(Enum):
     EQUITY = "equity"
@@ -171,13 +169,11 @@ class AssetClass(Enum):
     BOND = "bond"
     UNKNOWN = "unknown"
 
-
 class RequestPriority(Enum):
     LOW = 0
     NORMAL = 1
     HIGH = 2
     CRITICAL = 3
-
 
 @dataclass
 class CircuitBreakerStats:
@@ -191,7 +187,6 @@ class CircuitBreakerStats:
     total_successes: int = 0
     current_cooldown: float = DEFAULT_CIRCUIT_BREAKER_TIMEOUT
 
-
 @dataclass
 class RequestQueueItem:
     priority: RequestPriority
@@ -204,12 +199,11 @@ class RequestQueueItem:
 
 
 # ============================================================================
-# Tracing Integration
+# Tracing & Metrics Integration
 # ============================================================================
 
 class TraceContext:
     """OpenTelemetry trace context manager."""
-    
     def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
         self.name = name
         self.attributes = attributes or {}
@@ -230,9 +224,7 @@ class TraceContext:
                 self.span.set_status(Status(StatusCode.ERROR, str(exc_val)))
             self.span.end()
 
-
 def _trace(name: Optional[str] = None):
-    """Decorator to trace async functions."""
     def decorator(func):
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
@@ -242,444 +234,209 @@ def _trace(name: Optional[str] = None):
         return wrapper
     return decorator
 
-
-# ============================================================================
-# Prometheus Metrics
-# ============================================================================
-
 class MetricsRegistry:
-    """Prometheus metrics registry."""
-    
     def __init__(self, namespace: str = "eodhd"):
         self.namespace = namespace
         self._metrics: Dict[str, Any] = {}
         self._lock = threading.RLock()
-        
         if _PROMETHEUS_AVAILABLE and _METRICS_ENABLED:
             self._init_metrics()
     
     def _init_metrics(self):
         with self._lock:
-            self._metrics["requests_total"] = Counter(
-                f"{self.namespace}_requests_total",
-                "Total number of requests",
-                ["endpoint", "status"]
-            )
-            self._metrics["request_duration_seconds"] = Histogram(
-                f"{self.namespace}_request_duration_seconds",
-                "Request duration in seconds",
-                ["endpoint"],
-                buckets=[0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]
-            )
-            self._metrics["cache_hits_total"] = Counter(
-                f"{self.namespace}_cache_hits_total",
-                "Total cache hits",
-                ["cache_type"]
-            )
-            self._metrics["cache_misses_total"] = Counter(
-                f"{self.namespace}_cache_misses_total",
-                "Total cache misses",
-                ["cache_type"]
-            )
-            self._metrics["circuit_breaker_state"] = Gauge(
-                f"{self.namespace}_circuit_breaker_state",
-                "Circuit breaker state (1=closed, 0=open, -1=half-open)"
-            )
-            self._metrics["rate_limiter_tokens"] = Gauge(
-                f"{self.namespace}_rate_limiter_tokens",
-                "Current tokens in rate limiter"
-            )
-            self._metrics["queue_size"] = Gauge(
-                f"{self.namespace}_queue_size",
-                "Current request queue size"
-            )
-            self._metrics["active_requests"] = Gauge(
-                f"{self.namespace}_active_requests",
-                "Number of active requests"
-            )
-            self._metrics["symbol_variants_generated"] = Counter(
-                f"{self.namespace}_symbol_variants_generated",
-                "Number of symbol variants generated",
-                ["asset_class"]
-            )
+            self._metrics["requests_total"] = Counter(f"{self.namespace}_requests_total", "Total requests", ["endpoint", "status"])
+            self._metrics["request_duration_seconds"] = Histogram(f"{self.namespace}_request_duration_seconds", "Duration", ["endpoint"], buckets=[0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0])
+            self._metrics["cache_hits_total"] = Counter(f"{self.namespace}_cache_hits_total", "Cache hits", ["cache_type"])
+            self._metrics["cache_misses_total"] = Counter(f"{self.namespace}_cache_misses_total", "Cache misses", ["cache_type"])
+            self._metrics["circuit_breaker_state"] = Gauge(f"{self.namespace}_circuit_breaker_state", "Circuit breaker state")
+            self._metrics["queue_size"] = Gauge(f"{self.namespace}_queue_size", "Queue size")
     
     def inc(self, name: str, value: float = 1.0, labels: Optional[Dict[str, str]] = None):
-        if not _PROMETHEUS_AVAILABLE or not _METRICS_ENABLED:
-            return
+        if not _PROMETHEUS_AVAILABLE or not _METRICS_ENABLED: return
         with self._lock:
             metric = self._metrics.get(name)
-            if metric:
-                if labels:
-                    metric.labels(**labels).inc(value)
-                else:
-                    metric.inc(value)
+            if metric: metric.labels(**labels).inc(value) if labels else metric.inc(value)
     
     def observe(self, name: str, value: float, labels: Optional[Dict[str, str]] = None):
-        if not _PROMETHEUS_AVAILABLE or not _METRICS_ENABLED:
-            return
+        if not _PROMETHEUS_AVAILABLE or not _METRICS_ENABLED: return
         with self._lock:
             metric = self._metrics.get(name)
-            if metric:
-                if labels:
-                    metric.labels(**labels).observe(value)
-                else:
-                    metric.observe(value)
+            if metric: metric.labels(**labels).observe(value) if labels else metric.observe(value)
     
     def set(self, name: str, value: float, labels: Optional[Dict[str, str]] = None):
-        if not _PROMETHEUS_AVAILABLE or not _METRICS_ENABLED:
-            return
+        if not _PROMETHEUS_AVAILABLE or not _METRICS_ENABLED: return
         with self._lock:
             metric = self._metrics.get(name)
-            if metric:
-                if labels:
-                    metric.labels(**labels).set(value)
-                else:
-                    metric.set(value)
-    
-    def get_metrics(self) -> str:
-        if not _PROMETHEUS_AVAILABLE:
-            return ""
-        from prometheus_client import generate_latest, REGISTRY
-        return generate_latest(REGISTRY).decode('utf-8')
-
+            if metric: metric.labels(**labels).set(value) if labels else metric.set(value)
 
 _METRICS = MetricsRegistry()
 
 
 # ============================================================================
-# Environment Helpers
+# Environment & Utilities
 # ============================================================================
 
-def _env_str(name: str, default: str = "") -> str:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    s = str(v).strip()
-    return s if s else default
-
+def _env_bool(name: str, default: bool = True) -> bool:
+    raw = (os.getenv(name) or "").strip().lower()
+    if not raw: return default
+    return raw in {"1", "true", "yes", "y", "on", "t"}
 
 def _env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    try:
-        return int(str(v).strip())
-    except Exception:
-        return default
-
+    try: return int(os.getenv(name, str(default)))
+    except Exception: return default
 
 def _env_float(name: str, default: float) -> float:
-    v = os.getenv(name)
-    if v is None:
-        return default
+    try: return float(os.getenv(name, str(default)))
+    except Exception: return default
+
+def _env_str(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
+
+def safe_float(val: Any) -> Optional[float]:
+    if val is None: return None
     try:
-        return float(str(v).strip())
-    except Exception:
-        return default
+        if isinstance(val, (int, float)):
+            f = float(val)
+            return f if not math.isnan(f) and not math.isinf(f) else None
+        s = str(val).strip().replace(",", "")
+        f = float(s)
+        return f if not math.isnan(f) and not math.isinf(f) else None
+    except Exception: return None
 
+def safe_str(val: Any) -> Optional[str]:
+    return str(val).strip() if val is not None and str(val).strip() else None
 
-def _env_bool(name: str, default: bool) -> bool:
-    raw = (os.getenv(name) or "").strip().lower()
-    if not raw:
-        return default
-    if raw in _FALSY:
-        return False
-    if raw in _TRUTHY:
-        return True
-    return default
+def pick(d: Any, *keys: str) -> Any:
+    if not isinstance(d, dict): return None
+    for k in keys:
+        if k in d: return d[k]
+    return None
 
+def clean_patch(patch: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in patch.items() if v is not None}
+
+def merge_into(dst: Dict[str, Any], src: Dict[str, Any], *, force_keys: Sequence[str] = ()) -> None:
+    fset = set(force_keys or ())
+    for k, v in (src or {}).items():
+        if v is None: continue
+        if k in fset or k not in dst or dst.get(k) is None or (isinstance(dst.get(k), str) and not dst.get(k).strip()):
+            dst[k] = v
+
+def position_52w(cur: Optional[float], lo: Optional[float], hi: Optional[float]) -> Optional[float]:
+    if cur is None or lo is None or hi is None: return None
+    if hi == lo: return 50.0
+    try: return (cur - lo) / (hi - lo) * 100.0
+    except Exception: return None
 
 def _utc_iso(dt: Optional[datetime] = None) -> str:
     d = dt or datetime.now(timezone.utc)
-    if d.tzinfo is None:
-        d = d.replace(tzinfo=timezone.utc)
+    if d.tzinfo is None: d = d.replace(tzinfo=timezone.utc)
     return d.astimezone(timezone.utc).isoformat()
 
-
-def _riyadh_now() -> datetime:
-    return datetime.now(timezone(timedelta(hours=3)))
-
-
-def _riyadh_iso(dt: Optional[datetime] = None) -> str:
+def _to_riyadh_iso(dt: Optional[datetime]) -> Optional[str]:
+    if not dt: return None
     tz = timezone(timedelta(hours=3))
-    d = dt or datetime.now(tz)
-    if d.tzinfo is None:
-        d = d.replace(tzinfo=tz)
-    return d.astimezone(tz).isoformat()
-
-
-def _utc_now() -> datetime:
-    return datetime.now(timezone.utc)
-
-
-def _utc_now_iso() -> str:
-    return _utc_now().isoformat()
-
-
-def _generate_request_id() -> str:
-    return str(uuid.uuid4())
-
-
-def _token() -> Optional[str]:
-    for k in ("EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"):
-        v = (os.getenv(k) or "").strip()
-        if v:
-            return v
-    return None
-
-
-def _base_url() -> str:
-    return _env_str("EODHD_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
-
-
-def _ua() -> str:
-    return _env_str("EODHD_UA", USER_AGENT_DEFAULT)
-
-
-def _default_exchange() -> str:
-    ex = _env_str("EODHD_DEFAULT_EXCHANGE", "US").strip().upper()
-    return ex or "US"
-
-
-def _timeout_default() -> float:
-    for k in ("EODHD_TIMEOUT_S", "HTTP_TIMEOUT_SEC", "HTTP_TIMEOUT"):
-        v = (os.getenv(k) or "").strip()
-        if v:
-            try:
-                t = float(v)
-                if t > 0:
-                    return t
-            except Exception:
-                pass
-    return DEFAULT_TIMEOUT_SEC
-
-
-def _retry_attempts() -> int:
-    r = _env_int("EODHD_RETRY_ATTEMPTS", _env_int("MAX_RETRIES", DEFAULT_RETRY_ATTEMPTS))
-    return max(1, int(r))
-
-
-def _rate_limit() -> float:
-    return _env_float("EODHD_RATE_LIMIT", DEFAULT_RATE_LIMIT)
-
-
-def _circuit_breaker_threshold() -> int:
-    return _env_int("EODHD_CB_THRESHOLD", DEFAULT_CIRCUIT_BREAKER_THRESHOLD)
-
-
-def _circuit_breaker_timeout() -> float:
-    return _env_float("EODHD_CB_TIMEOUT", DEFAULT_CIRCUIT_BREAKER_TIMEOUT)
-
-
-def _enable_fundamentals() -> bool:
-    return _env_bool("EODHD_ENABLE_FUNDAMENTALS", True)
-
-
-def _enable_history() -> bool:
-    return _env_bool("EODHD_ENABLE_HISTORY", True)
-
-
-def _enable_forecast() -> bool:
-    return _env_bool("EODHD_ENABLE_FORECAST", True)
-
-
-def _enable_ml() -> bool:
-    return _env_bool("EODHD_ENABLE_ML", True)
-
-
-def _verbose_warn() -> bool:
-    return _env_bool("EODHD_VERBOSE_WARNINGS", False)
-
+    if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(tz).isoformat()
 
 def _allow_ksa() -> bool:
     return _env_bool("ALLOW_EODHD_KSA", False) or _env_bool("EODHD_ALLOW_KSA", False)
 
+def _default_exchange() -> str:
+    return _env_str("EODHD_DEFAULT_EXCHANGE", "US").upper()
 
-def _quote_ttl_sec() -> float:
-    ttl = _env_float("EODHD_QUOTE_TTL_SEC", 12.0)
-    return max(5.0, float(ttl if ttl > 0 else 12.0))
-
-
-def _fund_ttl_sec() -> float:
-    ttl = _env_float("EODHD_FUND_TTL_SEC", 21600.0)  # 6 hours
-    return max(300.0, float(ttl if ttl > 0 else 21600.0))
-
-
-def _history_ttl_sec() -> float:
-    ttl = _env_float("EODHD_HISTORY_TTL_SEC", 1800.0)  # 30 minutes
-    return max(300.0, float(ttl if ttl > 0 else 1800.0))
-
-
-def _history_days() -> int:
-    d = _env_int("EODHD_HISTORY_DAYS", 500)
-    return max(60, int(d))
-
-
-def _history_points_max() -> int:
-    n = _env_int("EODHD_HISTORY_POINTS_MAX", 1000)
-    return max(100, int(n))
-
-
-def _queue_size() -> int:
-    return _env_int("EODHD_QUEUE_SIZE", DEFAULT_QUEUE_SIZE)
-
-
-def _json_env_map(name: str) -> Dict[str, str]:
-    raw = _env_str(name, "")
-    if not raw:
-        return {}
+def normalize_eodhd_symbol(symbol: str) -> str:
+    """Normalizes symbols for EODHD."""
+    s = (symbol or "").strip().upper()
+    if not s: return ""
+    
+    # Check shared normalizer if present
     try:
-        obj = json.loads(raw)
-        if isinstance(obj, dict):
-            out: Dict[str, str] = {}
-            for k, v in obj.items():
-                ks = str(k).strip()
-                vs = str(v).strip()
-                if ks and vs:
-                    out[ks.upper()] = vs
-            return out
-    except Exception:
-        return {}
-    return {}
+        from core.symbols.normalize import normalize_symbol
+        core_norm = normalize_symbol(s)
+        if core_norm: s = core_norm
+    except ImportError:
+        pass
+
+    if s.endswith(".SR"):
+        return f"{s[:-3]}.SR"
+    
+    if "." in s:
+        return s
+    
+    # EODHD usually expects .US for US stocks if not using the US endpoint exclusively,
+    # but their primary endpoint works without .US for major tickers. We default to appending the default exchange.
+    ex = _default_exchange()
+    if ex and s.isalpha() and len(s) <= 5:
+        return f"{s}.{ex}"
+        
+    return s
 
 
 # ============================================================================
-# Cache with TTL & LRU Eviction
+# Concurrency, Caching & Circuit Breaking
 # ============================================================================
 
 class SmartCache:
-    """Thread-safe cache with TTL and LRU eviction."""
-
     def __init__(self, maxsize: int = 5000, ttl: float = 300.0):
         self.maxsize = maxsize
         self.ttl = ttl
-        self._cache: Dict[str, Any] = {}
-        self._expires: Dict[str, float] = {}
-        self._access_times: Dict[str, float] = {}
-        self._hits: int = 0
-        self._misses: int = 0
+        self._cache: Dict[str, Tuple[float, Any]] = {}
         self._lock = asyncio.Lock()
 
     async def get(self, key: str) -> Optional[Any]:
         async with self._lock:
-            now = time.monotonic()
             if key in self._cache:
-                if now < self._expires.get(key, 0):
-                    self._access_times[key] = now
-                    self._hits += 1
+                expiry, val = self._cache[key]
+                if time.monotonic() < expiry:
                     _METRICS.inc("cache_hits_total", 1, {"cache_type": "memory"})
-                    return self._cache[key]
+                    return val
                 else:
-                    await self._delete(key)
-            self._misses += 1
+                    del self._cache[key]
             _METRICS.inc("cache_misses_total", 1, {"cache_type": "memory"})
             return None
 
     async def set(self, key: str, value: Any, ttl: Optional[float] = None) -> None:
         async with self._lock:
             if len(self._cache) >= self.maxsize and key not in self._cache:
-                await self._evict_lru()
-            self._cache[key] = value
-            self._expires[key] = time.monotonic() + (ttl or self.ttl)
-            self._access_times[key] = time.monotonic()
-
-    async def delete(self, key: str) -> None:
-        async with self._lock:
-            await self._delete(key)
-
-    async def _delete(self, key: str) -> None:
-        self._cache.pop(key, None)
-        self._expires.pop(key, None)
-        self._access_times.pop(key, None)
-
-    async def _evict_lru(self) -> None:
-        if not self._access_times:
-            return
-        oldest_key = min(self._access_times.items(), key=lambda x: x[1])[0]
-        await self._delete(oldest_key)
-
-    async def clear(self) -> None:
-        async with self._lock:
-            self._cache.clear()
-            self._expires.clear()
-            self._access_times.clear()
-            self._hits = 0
-            self._misses = 0
+                oldest = min(self._cache.items(), key=lambda x: x[1][0])[0]
+                del self._cache[oldest]
+            self._cache[key] = (time.monotonic() + (ttl or self.ttl), value)
 
     async def size(self) -> int:
-        async with self._lock:
-            return len(self._cache)
+        async with self._lock: return len(self._cache)
 
-    def get_stats(self) -> Dict[str, Any]:
-        total = self._hits + self._misses
-        return {
-            "size": len(self._cache),
-            "maxsize": self.maxsize,
-            "ttl": self.ttl,
-            "hits": self._hits,
-            "misses": self._misses,
-            "hit_rate": self._hits / total if total > 0 else 0,
-            "utilization": len(self._cache) / self.maxsize if self.maxsize > 0 else 0
-        }
+    async def clear(self):
+        async with self._lock: self._cache.clear()
 
-
-# ============================================================================
-# Rate Limiter & Circuit Breaker (Dynamic)
-# ============================================================================
 
 class TokenBucket:
-    """Async token bucket rate limiter."""
-
     def __init__(self, rate_per_sec: float, capacity: Optional[float] = None):
         self.rate = max(0.0, rate_per_sec)
         self.capacity = capacity or max(1.0, self.rate)
         self.tokens = self.capacity
         self.last = time.monotonic()
         self._lock = asyncio.Lock()
-        self._total_acquired = 0
-        self._total_rejected = 0
 
     async def acquire(self, tokens: float = 1.0) -> bool:
-        if self.rate <= 0:
-            self._total_acquired += 1
-            return True
-
+        if self.rate <= 0: return True
         async with self._lock:
             now = time.monotonic()
-            elapsed = max(0.0, now - self.last)
+            self.tokens = min(self.capacity, self.tokens + max(0.0, now - self.last) * self.rate)
             self.last = now
-            self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
-
             if self.tokens >= tokens:
                 self.tokens -= tokens
-                self._total_acquired += 1
-                _METRICS.set("rate_limiter_tokens", self.tokens)
                 return True
-
-            self._total_rejected += 1
             return False
 
     async def wait_and_acquire(self, tokens: float = 1.0) -> None:
         while True:
-            if await self.acquire(tokens):
-                return
-            async with self._lock:
-                need = tokens - self.tokens
-                wait = need / self.rate if self.rate > 0 else 0.1
+            if await self.acquire(tokens): return
+            async with self._lock: wait = (tokens - self.tokens) / self.rate if self.rate > 0 else 0.1
             await asyncio.sleep(min(1.0, wait))
-
-    def get_stats(self) -> Dict[str, Any]:
-        return {
-            "rate": self.rate, "capacity": self.capacity,
-            "current_tokens": self.tokens,
-            "utilization": 1.0 - (self.tokens / self.capacity) if self.capacity > 0 else 0,
-            "total_acquired": self._total_acquired, "total_rejected": self._total_rejected
-        }
 
 
 class DynamicCircuitBreaker:
-    """Circuit breaker that progressively scales timeouts for severe degradation."""
-    
     def __init__(self, fail_threshold: int = 5, base_cooldown: float = 30.0):
         self.fail_threshold = fail_threshold
         self.base_cooldown = base_cooldown
@@ -691,21 +448,17 @@ class DynamicCircuitBreaker:
         async with self._lock:
             now = time.monotonic()
             if self.stats.state == CircuitState.CLOSED:
-                _METRICS.set("circuit_breaker_state", 1)
-                return True
+                _METRICS.set("circuit_breaker_state", 1); return True
             elif self.stats.state == CircuitState.OPEN:
                 if now >= self.stats.open_until:
                     self.stats.state = CircuitState.HALF_OPEN
                     self.half_open_calls = 0
-                    _METRICS.set("circuit_breaker_state", -1)
-                    return True
-                _METRICS.set("circuit_breaker_state", 0)
-                return False
+                    _METRICS.set("circuit_breaker_state", -1); return True
+                _METRICS.set("circuit_breaker_state", 0); return False
             elif self.stats.state == CircuitState.HALF_OPEN:
                 if self.half_open_calls < 2:
                     self.half_open_calls += 1
-                    _METRICS.set("circuit_breaker_state", -1)
-                    return True
+                    _METRICS.set("circuit_breaker_state", -1); return True
                 return False
             return False
 
@@ -723,8 +476,6 @@ class DynamicCircuitBreaker:
         async with self._lock:
             self.stats.failures += 1
             self.stats.total_failures += 1
-            
-            # Progressive backoff for extreme failures
             if status_code in (401, 403, 429):
                 self.stats.current_cooldown = min(300.0, self.stats.current_cooldown * 1.5)
             
@@ -738,232 +489,479 @@ class DynamicCircuitBreaker:
                 self.stats.open_until = time.monotonic() + self.stats.current_cooldown
                 _METRICS.set("circuit_breaker_state", 0)
 
-    def get_stats(self) -> Dict[str, Any]:
-        return {
-            "state": self.stats.state.value,
-            "failures": self.stats.failures,
-            "successes": self.stats.successes,
-            "total_failures": self.stats.total_failures,
-            "total_successes": self.stats.total_successes,
-            "open_until": self.stats.open_until,
-            "current_cooldown": self.stats.current_cooldown
-        }
 
-
-# ============================================================================
-# Request Queue
-# ============================================================================
-
-class RequestQueue:
-    """Priority-based request queue."""
-    
-    def __init__(self, max_size: int = 1000):
-        self.max_size = max_size
-        self.queues: Dict[RequestPriority, asyncio.Queue] = {
-            RequestPriority.LOW: asyncio.Queue(),
-            RequestPriority.NORMAL: asyncio.Queue(),
-            RequestPriority.HIGH: asyncio.Queue(),
-            RequestPriority.CRITICAL: asyncio.Queue()
-        }
+class SingleFlight:
+    def __init__(self):
+        self._calls: Dict[str, asyncio.Future] = {}
         self._lock = asyncio.Lock()
-        self._total_queued = 0
-        self._total_processed = 0
-    
-    async def put(self, item: RequestQueueItem) -> bool:
+
+    async def execute(self, key: str, coro_func: Callable) -> Any:
         async with self._lock:
-            total_size = sum(q.qsize() for q in self.queues.values())
-            if total_size >= self.max_size:
-                return False
-            
-            await self.queues[item.priority].put(item)
-            self._total_queued += 1
-            _METRICS.set("queue_size", total_size + 1)
-            return True
-    
-    async def get(self) -> Optional[RequestQueueItem]:
-        for priority in sorted(RequestPriority, key=lambda p: p.value, reverse=True):
-            queue = self.queues[priority]
-            if not queue.empty():
-                item = await queue.get()
-                self._total_processed += 1
-                total_size = sum(q.qsize() for q in self.queues.values())
-                _METRICS.set("queue_size", total_size)
-                return item
-        return None
-    
-    def get_stats(self) -> Dict[str, Any]:
-        return {
-            "max_size": self.max_size,
-            "current_sizes": {p.value: q.qsize() for p, q in self.queues.items()},
-            "total_queued": self._total_queued,
-            "total_processed": self._total_processed,
-            "utilization": sum(q.qsize() for q in self.queues.values()) / self.max_size if self.max_size > 0 else 0
+            if key in self._calls:
+                return await self._calls[key]
+            fut = asyncio.get_running_loop().create_future()
+            self._calls[key] = fut
+
+        try:
+            result = await coro_func()
+            if not fut.done(): fut.set_result(result)
+            return result
+        except Exception as e:
+            if not fut.done(): fut.set_exception(e)
+            raise
+        finally:
+            async with self._lock:
+                self._calls.pop(key, None)
+
+
+# ============================================================================
+# Technical Analysis Engine
+# ============================================================================
+
+class TechnicalIndicators:
+    @staticmethod
+    def sma(prices: List[float], window: int) -> List[Optional[float]]:
+        if len(prices) < window: return [None] * len(prices)
+        result = [None] * (window - 1)
+        for i in range(window - 1, len(prices)):
+            result.append(sum(prices[i - window + 1:i + 1]) / window)
+        return result
+
+    @staticmethod
+    def ema(prices: List[float], window: int) -> List[Optional[float]]:
+        if len(prices) < window: return [None] * len(prices)
+        result = [None] * (window - 1)
+        multiplier = 2.0 / (window + 1)
+        ema = sum(prices[:window]) / window
+        result.append(ema)
+        for price in prices[window:]:
+            ema = (price - ema) * multiplier + ema
+            result.append(ema)
+        return result
+
+    @staticmethod
+    def macd(prices: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> Dict[str, List[Optional[float]]]:
+        if len(prices) < slow:
+            return {"macd": [None]*len(prices), "signal": [None]*len(prices), "histogram": [None]*len(prices)}
+        ema_f, ema_s = TechnicalIndicators.ema(prices, fast), TechnicalIndicators.ema(prices, slow)
+        macd_line = [f - s if f is not None and s is not None else None for f, s in zip(ema_f, ema_s)]
+        valid_macd = [x for x in macd_line if x is not None]
+        sig_line = TechnicalIndicators.ema(valid_macd, signal) if valid_macd else []
+        padded_sig = [None] * (len(prices) - len(sig_line)) + sig_line
+        hist = [m - s if m is not None and s is not None else None for m, s in zip(macd_line, padded_sig)]
+        return {"macd": macd_line, "signal": padded_sig, "histogram": hist}
+
+    @staticmethod
+    def rsi(prices: List[float], window: int = 14) -> List[Optional[float]]:
+        if len(prices) < window + 1: return [None] * len(prices)
+        deltas = np.diff(prices)
+        result = [None] * window
+        
+        window_deltas = deltas[:window]
+        avg_gain = sum(d for d in window_deltas if d > 0) / window
+        avg_loss = sum(-d for d in window_deltas if d < 0) / window
+        
+        rs = avg_gain / avg_loss if avg_loss != 0 else float('inf')
+        result.append(100.0 - (100.0 / (1.0 + rs)) if avg_loss != 0 else 100.0)
+
+        for d in deltas[window:]:
+            gain = d if d > 0 else 0
+            loss = -d if d < 0 else 0
+            avg_gain = (avg_gain * (window - 1) + gain) / window
+            avg_loss = (avg_loss * (window - 1) + loss) / window
+            rs = avg_gain / avg_loss if avg_loss != 0 else float('inf')
+            result.append(100.0 - (100.0 / (1.0 + rs)) if avg_loss != 0 else 100.0)
+        return result
+
+    @staticmethod
+    def bollinger_bands(prices: List[float], window: int = 20, num_std: float = 2.0) -> Dict[str, List[Optional[float]]]:
+        if len(prices) < window:
+            return {"middle": [None]*len(prices), "upper": [None]*len(prices), "lower": [None]*len(prices), "bandwidth": [None]*len(prices)}
+        middle = TechnicalIndicators.sma(prices, window)
+        upper, lower, bandwidth = [None]*(window-1), [None]*(window-1), [None]*(window-1)
+        for i in range(window - 1, len(prices)):
+            std = float(np.std(prices[i - window + 1:i + 1]))
+            m = middle[i]
+            if m is not None:
+                u, l = m + num_std * std, m - num_std * std
+                upper.append(u); lower.append(l)
+                bandwidth.append((u - l) / m if m != 0 else None)
+            else:
+                upper.append(None); lower.append(None); bandwidth.append(None)
+        return {"middle": middle, "upper": upper, "lower": lower, "bandwidth": bandwidth}
+
+    @staticmethod
+    def ichimoku_cloud(highs: List[float], lows: List[float], conversion: int = 9, base: int = 26, span: int = 52) -> Dict[str, List[Optional[float]]]:
+        length = len(highs)
+        tenkan_sen, kijun_sen, senkou_span_a, senkou_span_b = [None] * length, [None] * length, [None] * length, [None] * length
+        for i in range(length):
+            if i >= conversion - 1: tenkan_sen[i] = (max(highs[i - conversion + 1:i + 1]) + min(lows[i - conversion + 1:i + 1])) / 2
+            if i >= base - 1: kijun_sen[i] = (max(highs[i - base + 1:i + 1]) + min(lows[i - base + 1:i + 1])) / 2
+            if tenkan_sen[i] is not None and kijun_sen[i] is not None: senkou_span_a[i] = (tenkan_sen[i] + kijun_sen[i]) / 2
+            if i >= span - 1: senkou_span_b[i] = (max(highs[i - span + 1:i + 1]) + min(lows[i - span + 1:i + 1])) / 2
+        return {"tenkan_sen": tenkan_sen, "kijun_sen": kijun_sen, "senkou_span_a": senkou_span_a, "senkou_span_b": senkou_span_b}
+
+    @staticmethod
+    def stochastic_oscillator(highs: List[float], lows: List[float], closes: List[float], k_window: int = 14, d_window: int = 3) -> Dict[str, List[Optional[float]]]:
+        length = len(closes)
+        k_line = [None] * length
+        for i in range(k_window - 1, length):
+            hh = max(highs[i - k_window + 1:i + 1])
+            ll = min(lows[i - k_window + 1:i + 1])
+            k_line[i] = 50.0 if hh - ll == 0 else 100 * ((closes[i] - ll) / (hh - ll))
+        valid_k = [x for x in k_line if x is not None]
+        d_line = TechnicalIndicators.sma(valid_k, d_window)
+        padded_d = [None] * (length - len(d_line)) + d_line
+        return {"%k": k_line, "%d": padded_d}
+
+
+# ============================================================================
+# ML Ensemble Forecaster
+# ============================================================================
+
+class EnsembleForecaster:
+    """Multi-model ensemble utilizing Statsmodels, XGBoost, Random Forest, and Heuristics."""
+
+    def __init__(self, prices: List[float], enable_ml: bool = True):
+        self.prices = prices
+        self.enable_ml = enable_ml
+
+    def forecast(self, horizon_days: int = 252) -> Dict[str, Any]:
+        if len(self.prices) < 50:
+            return {"forecast_available": False, "reason": "insufficient_history"}
+
+        results = {
+            "forecast_available": True, "horizon_days": horizon_days,
+            "models_used": [], "forecasts": {}, "ensemble": {},
+            "confidence": 0.0
         }
+        forecasts, weights = [], []
+
+        # 1. Trend Baseline
+        trend = self._forecast_trend(horizon_days)
+        if trend:
+            results["models_used"].append("trend")
+            results["forecasts"]["trend"] = trend
+            forecasts.append(trend["price"])
+            weights.append(0.15)
+
+        # 2. Real ARIMA (Statsmodels) or fallback
+        arima = self._forecast_arima(horizon_days)
+        if arima:
+            results["models_used"].append("arima")
+            results["forecasts"]["arima"] = arima
+            forecasts.append(arima["price"])
+            weights.append(0.3)
+
+        # 3. XGBoost / Random Forest
+        if self.enable_ml and SKLEARN_AVAILABLE:
+            ml_forecast = self._forecast_ml(horizon_days)
+            if ml_forecast:
+                results["models_used"].append("ml_tree")
+                results["forecasts"]["ml_tree"] = ml_forecast
+                forecasts.append(ml_forecast["price"])
+                weights.append(0.55)
+
+        if not forecasts:
+            return {"forecast_available": False, "reason": "no_models_converged"}
+
+        ensemble_price = float(np.average(forecasts, weights=weights))
+        ensemble_std = float(np.std(forecasts)) if len(forecasts) > 1 else float(ensemble_price * 0.05)
+        
+        results["ensemble"] = {
+            "price": ensemble_price,
+            "roi_pct": float(((ensemble_price / self.prices[-1]) - 1) * 100),
+            "std_dev": ensemble_std,
+            "price_range_low": float(ensemble_price - 1.96 * ensemble_std),
+            "price_range_high": float(ensemble_price + 1.96 * ensemble_std)
+        }
+        
+        results["confidence"] = float(self._calculate_confidence(results))
+        return results
+
+    def _forecast_trend(self, horizon: int) -> Optional[Dict[str, Any]]:
+        try:
+            n = min(len(self.prices), 252)
+            y = np.log(self.prices[-n:])
+            x = np.arange(n).reshape(-1, 1)
+            x_mean, y_mean = np.mean(x), np.mean(y)
+            slope = np.sum((x.flatten() - x_mean) * (y - y_mean)) / np.sum((x.flatten() - x_mean) ** 2)
+            intercept = y_mean - slope * x_mean
+            future_x = n + horizon
+            price = np.exp(intercept + slope * future_x)
+            return {"price": float(price), "weight": 0.15}
+        except Exception: return None
+
+    def _forecast_arima(self, horizon: int) -> Optional[Dict[str, Any]]:
+        try:
+            if STATSMODELS_AVAILABLE and len(self.prices) >= 100:
+                model = StatsARIMA(self.prices[-252:], order=(5, 1, 0))
+                fitted = model.fit()
+                price = float(fitted.forecast(steps=horizon).iloc[-1])
+                return {"price": price, "weight": 0.3}
+        except Exception: pass
+            
+        try:
+            recent = self.prices[-min(60, len(self.prices)):]
+            returns = np.diff(recent) / recent[:-1]
+            drift = np.mean(returns)
+            price = self.prices[-1] * ((1 + drift) ** horizon)
+            return {"price": float(price), "weight": 0.1}
+        except Exception: return None
+
+    def _forecast_ml(self, horizon: int) -> Optional[Dict[str, Any]]:
+        if not SKLEARN_AVAILABLE or len(self.prices) < 100: return None
+        try:
+            X, y = [], []
+            for i in range(60, len(self.prices) - 5):
+                feats = [self.prices[i] / self.prices[i-w] - 1 for w in [5, 10, 20]]
+                vol = np.std([self.prices[j]/self.prices[j-1]-1 for j in range(i-20, i)])
+                feats.append(vol)
+                X.append(feats)
+                y.append(self.prices[i+5] / self.prices[i] - 1)
+            
+            if len(X) < 20: return None
+
+            if XGB_AVAILABLE: model = xgb.XGBRegressor(n_estimators=50, max_depth=3, learning_rate=0.05, n_jobs=-1)
+            else: model = RandomForestRegressor(n_estimators=50, max_depth=4, random_state=42)
+            model.fit(X, y)
+            
+            curr_feats = [self.prices[-1]/self.prices[-1-w]-1 for w in [5, 10, 20]]
+            curr_vol = np.std(np.diff(self.prices[-21:]) / self.prices[-21:-1])
+            curr_feats.append(curr_vol)
+            
+            pred_return = model.predict([curr_feats])[0]
+            price = self.prices[-1] * (1 + pred_return) ** (horizon / 5)
+            return {"price": float(price), "predicted_return": float(pred_return), "weight": 0.55}
+        except Exception as e:
+            logger.debug(f"ML forecast failed: {e}")
+            return None
+
+    def _calculate_confidence(self, results: Dict[str, Any]) -> float:
+        if not results.get("forecasts"): return 0.0
+        prices = [f["price"] for f in results["forecasts"].values()]
+        cv = np.std(prices) / np.mean(prices) if len(prices) > 1 and np.mean(prices) != 0 else 0.5
+        consistency = max(0, 100 - cv * 300)
+        return float(min(100, max(0, consistency)))
 
 
 # ============================================================================
-# Symbol Normalization
+# EODHD Client implementation
 # ============================================================================
 
-_KSA_RE = re.compile(r"^\d{3,6}(\.SR)?$", re.IGNORECASE)
-_EXCH_SUFFIX_RE = re.compile(r"^(.+)\.([A-Z0-9]{2,10})$")
-_INDEX_PREFIX_RE = re.compile(r"^\^([A-Z0-9]+)$")
-_FOREX_SUFFIX_RE = re.compile(r"^(.+)=X$")
-_COMMODITY_SUFFIX_RE = re.compile(r"^(.+)=F$")
+class EODHDClient:
+    def __init__(self):
+        self.api_key = _token()
+        self.base_url = _env_str("EODHD_BASE_URL", DEFAULT_BASE_URL)
+        
+        self.timeout_sec = _env_float("EODHD_TIMEOUT_SEC", DEFAULT_TIMEOUT_SEC)
+        self.retry_attempts = _env_int("EODHD_RETRY_ATTEMPTS", DEFAULT_RETRY_ATTEMPTS)
+        
+        self.circuit_breaker = DynamicCircuitBreaker(
+            fail_threshold=_env_int("EODHD_CB_THRESHOLD", DEFAULT_CIRCUIT_BREAKER_THRESHOLD),
+            base_cooldown=_env_float("EODHD_CB_TIMEOUT", DEFAULT_CIRCUIT_BREAKER_TIMEOUT)
+        )
+        self.rate_limiter = TokenBucket(rate_per_sec=_env_float("EODHD_RATE_LIMIT", DEFAULT_RATE_LIMIT))
+        self.semaphore = asyncio.Semaphore(_env_int("EODHD_MAX_CONCURRENCY", DEFAULT_MAX_CONCURRENCY))
+        self.singleflight = SingleFlight()
+        
+        self.quote_cache = SmartCache(maxsize=5000, ttl=_env_float("EODHD_QUOTE_TTL_SEC", 12.0))
+        self.history_cache = SmartCache(maxsize=2000, ttl=_env_float("EODHD_HISTORY_TTL_SEC", 1800.0))
+        self.fund_cache = SmartCache(maxsize=2000, ttl=_env_float("EODHD_FUND_TTL_SEC", 21600.0))
 
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(self.timeout_sec),
+            limits=httpx.Limits(max_keepalive_connections=50, max_connections=100),
+            http2=True
+        )
 
-def looks_like_ksa(symbol: str) -> bool:
-    s = (symbol or "").strip().upper()
-    if not s: return False
-    if s.endswith(".SR"): return True
-    if s.isdigit() and 3 <= len(s) <= 6: return True
-    return bool(_KSA_RE.match(s))
+    def _base_params(self) -> Dict[str, str]:
+        return {"api_token": self.api_key or "demo", "fmt": "json"}
 
+    @_trace("eodhd_request")
+    async def _request(self, endpoint: str, params: Dict[str, Any]) -> Tuple[Optional[Union[dict, list]], Optional[str]]:
+        if not self.api_key: return None, "API key missing"
+        if not await self.circuit_breaker.allow_request(): return None, "circuit_breaker_open"
 
-def split_exchange_suffix(sym: str) -> Tuple[str, Optional[str]]:
-    s = (sym or "").strip().upper()
-    if not s: return "", None
-    m = _EXCH_SUFFIX_RE.match(s)
-    if not m: return s, None
-    base = (m.group(1) or "").strip()
-    exch = (m.group(2) or "").strip()
-    if not base or not exch: return s, None
-    return base, exch
+        await self.rate_limiter.wait_and_acquire()
+        url = f"{self.base_url.rstrip('/')}/{endpoint.lstrip('/')}"
+        req_params = {**self._base_params(), **params}
 
+        last_err = None
+        async with self.semaphore:
+            for attempt in range(self.retry_attempts):
+                try:
+                    resp = await self._client.get(url, params=req_params)
+                    status = resp.status_code
+                    
+                    if status == 429:
+                        await self.circuit_breaker.on_failure(status)
+                        await asyncio.sleep(min(30, int(resp.headers.get("Retry-After", 5))))
+                        continue
+                        
+                    if 500 <= status < 600:
+                        await self.circuit_breaker.on_failure(status)
+                        base_wait = 2 ** attempt
+                        jitter = random.uniform(0, base_wait)
+                        await asyncio.sleep(min(10.0, base_wait + jitter))
+                        continue
 
-def detect_asset_class(symbol: str) -> AssetClass:
-    s = (symbol or "").strip().upper()
-    base, exch = split_exchange_suffix(s)
-    if exch in ("INDX", "INDEX"): return AssetClass.INDEX
-    if exch in ("FOREX", "FX"): return AssetClass.FOREX
-    if exch in ("COMM", "COM", "CMD"): return AssetClass.COMMODITY
-    if exch in ("ETF", "ETP"): return AssetClass.ETF
-    if exch in ("FUND", "MF"): return AssetClass.FUND
-    if exch in ("BOND", "GBOND"): return AssetClass.BOND
+                    if status >= 400 and status != 404:
+                        return None, f"HTTP {status}"
 
-    if _INDEX_PREFIX_RE.match(s): return AssetClass.INDEX
-    if _FOREX_SUFFIX_RE.match(s): return AssetClass.FOREX
-    if _COMMODITY_SUFFIX_RE.match(s): return AssetClass.COMMODITY
-    if s.endswith(".TO") or s.endswith(".V") or s.endswith(".L"): return AssetClass.EQUITY
-    return AssetClass.EQUITY
+                    try:
+                        data = json_loads(resp.content)
+                    except Exception:
+                        return None, "invalid_json_payload"
 
+                    await self.circuit_breaker.on_success()
+                    return data, None
+                    
+                except httpx.RequestError as e:
+                    last_err = f"network_error_{e.__class__.__name__}"
+                    base_wait = 2 ** attempt
+                    await asyncio.sleep(min(10.0, base_wait + random.uniform(0, base_wait)))
 
-_DEFAULT_INDEX_ALIASES: Dict[str, str] = {
-    "TASI": "TASI.INDX", "NOMU": "NOMU.INDX", "SPX": "^GSPC.INDX",
-    "IXIC": "^IXIC.INDX", "DJI": "^DJI.INDX", "FTSE": "^FTSE.INDX",
-    "N225": "^N225.INDX", "HSI": "^HSI.INDX",
-}
+            await self.circuit_breaker.on_failure()
+            return None, last_err or "max_retries_exceeded"
 
-_DEFAULT_COMMODITY_ALIASES: Dict[str, str] = {
-    "GC=F": "GC.COMM", "SI=F": "SI.COMM", "CL=F": "CL.COMM",
-    "BZ=F": "BZ.COMM", "NG=F": "NG.COMM", "HG=F": "HG.COMM",
-    "ZW=F": "ZW.COMM", "ZC=F": "ZC.COMM", "ZS=F": "ZS.COMM",
-}
+    async def fetch_quote(self, symbol: str) -> Dict[str, Any]:
+        sym = normalize_eodhd_symbol(symbol)
+        if not sym: return {}
+        
+        cache_key = f"quote:{sym}"
+        if cached := await self.quote_cache.get(cache_key): return cached
+        
+        async def _fetch():
+            data, err = await self._request(f"real-time/{sym}", {})
+            if err or not isinstance(data, dict): return {}
+            
+            res = {
+                "symbol": sym,
+                "current_price": safe_float(data.get("close")),
+                "previous_close": safe_float(data.get("previousClose")),
+                "day_high": safe_float(data.get("high")),
+                "day_low": safe_float(data.get("low")),
+                "volume": safe_float(data.get("volume")),
+                "timestamp": _utc_iso()
+            }
+            await self.quote_cache.set(cache_key, res)
+            return res
+            
+        return await self.singleflight.execute(cache_key, _fetch)
 
-_DEFAULT_FOREX_ALIASES: Dict[str, str] = {
-    "EURUSD=X": "EUR.FOREX", "GBPUSD=X": "GBP.FOREX", "USDJPY=X": "JPY.FOREX",
-    "USDCHF=X": "CHF.FOREX", "AUDUSD=X": "AUD.FOREX", "USDCAD=X": "CAD.FOREX",
-    "NZDUSD=X": "NZD.FOREX", "SAR=X": "SAR.FOREX",
-}
+    async def fetch_history(self, symbol: str) -> Dict[str, Any]:
+        sym = normalize_eodhd_symbol(symbol)
+        if not sym: return {}
+        
+        cache_key = f"history:{sym}"
+        if cached := await self.history_cache.get(cache_key): return cached
+        
+        async def _fetch():
+            from_date = (datetime.now() - timedelta(days=_env_int("EODHD_HISTORY_DAYS", 500))).strftime('%Y-%m-%d')
+            data, err = await self._request(f"eod/{sym}", {"from": from_date})
+            if err or not isinstance(data, list): return {}
+            
+            prices = [safe_float(day.get('close')) for day in data if safe_float(day.get('close')) is not None]
+            volumes = [safe_float(day.get('volume')) for day in data if safe_float(day.get('volume')) is not None]
+            
+            res = {"history_points": len(prices)}
+            if len(prices) > 20:
+                ti = TechnicalIndicators()
+                rsi = ti.rsi(prices)
+                macd = ti.macd(prices)
+                bb = ti.bollinger_bands(prices)
+                
+                res["rsi_14"] = rsi[-1] if rsi else None
+                res["macd"] = macd["macd"][-1] if macd["macd"] else None
+                res["bb_upper"] = bb["upper"][-1] if bb["upper"] else None
+                res["bb_lower"] = bb["lower"][-1] if bb["lower"] else None
+                
+                if _env_bool("EODHD_ENABLE_FORECAST", True):
+                    fc = EnsembleForecaster(prices).forecast(252)
+                    if fc.get("forecast_available"):
+                        res["forecast_price_12m"] = fc["ensemble"]["price"]
+                        res["expected_roi_12m"] = fc["ensemble"]["roi_pct"]
+                        res["forecast_confidence"] = fc["confidence"]
+                        
+            await self.history_cache.set(cache_key, res)
+            return res
+            
+        return await self.singleflight.execute(cache_key, _fetch)
 
-_INDEX_ALIASES = {**_DEFAULT_INDEX_ALIASES, **_json_env_map("EODHD_INDEX_ALIASES_JSON")}
-_COMMODITY_ALIASES = {**_DEFAULT_COMMODITY_ALIASES, **_json_env_map("EODHD_COMMODITY_ALIASES_JSON")}
-_FOREX_ALIASES = {**_DEFAULT_FOREX_ALIASES, **_json_env_map("EODHD_FOREX_ALIASES_JSON")}
+    async def fetch_fundamentals(self, symbol: str) -> Dict[str, Any]:
+        sym = normalize_eodhd_symbol(symbol)
+        if not sym: return {}
+        
+        cache_key = f"fund:{sym}"
+        if cached := await self.fund_cache.get(cache_key): return cached
+        
+        async def _fetch():
+            data, err = await self._request(f"fundamentals/{sym}", {})
+            if err or not isinstance(data, dict): return {}
+            
+            gen = data.get("General", {})
+            val = data.get("Valuation", {})
+            shares = data.get("SharesStats", {})
+            
+            res = {
+                "name": safe_str(gen.get("Name")),
+                "sector": safe_str(gen.get("Sector")),
+                "industry": safe_str(gen.get("Industry")),
+                "market_cap": safe_float(gen.get("MarketCapitalization")),
+                "pe_ttm": safe_float(val.get("TrailingPE")),
+                "forward_pe": safe_float(val.get("ForwardPE")),
+                "pb": safe_float(val.get("PriceBookMRQ")),
+                "dividend_yield": safe_float(val.get("ForwardAnnualDividendYield")) * 100 if safe_float(val.get("ForwardAnnualDividendYield")) else None,
+                "eps_ttm": safe_float(val.get("TrailingEps")),
+                "shares_outstanding": safe_float(shares.get("SharesOutstanding")),
+            }
+            await self.fund_cache.set(cache_key, res)
+            return res
+            
+        return await self.singleflight.execute(cache_key, _fetch)
 
+    async def fetch_enriched_quote_patch(self, symbol: str) -> Dict[str, Any]:
+        sym = normalize_eodhd_symbol(symbol)
+        if not sym: return {"error": "Invalid symbol"}
+        
+        if _allow_ksa() == False and sym.endswith(".SR"):
+            return {"error": "KSA symbols blocked for EODHD"}
+            
+        tasks = [self.fetch_quote(sym)]
+        if _env_bool("EODHD_ENABLE_HISTORY", True): tasks.append(self.fetch_history(sym))
+        if _env_bool("EODHD_ENABLE_FUNDAMENTALS", True): tasks.append(self.fetch_fundamentals(sym))
+            
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        res = {"symbol": symbol, "normalized_symbol": sym, "provider": PROVIDER_NAME, "last_updated_utc": _utc_iso()}
+        
+        for r in results:
+            if isinstance(r, dict):
+                merge_into(res, r)
+                
+        return clean_patch(res)
 
-def generate_symbol_variants(raw_symbol: str) -> Tuple[List[str], AssetClass]:
-    s = (raw_symbol or "").strip().upper()
-    if not s: return [], AssetClass.UNKNOWN
-
-    if s in _INDEX_ALIASES:
-        _METRICS.inc("symbol_variants_generated", 1, {"asset_class": "index"})
-        return [_INDEX_ALIASES[s], s], AssetClass.INDEX
-    if s in _COMMODITY_ALIASES:
-        _METRICS.inc("symbol_variants_generated", 1, {"asset_class": "commodity"})
-        return [_COMMODITY_ALIASES[s], s], AssetClass.COMMODITY
-    if s in _FOREX_ALIASES:
-        _METRICS.inc("symbol_variants_generated", 1, {"asset_class": "forex"})
-        return [_FOREX_ALIASES[s], s], AssetClass.FOREX
-
-    asset_class = detect_asset_class(s)
-    variants: List[str] = []
-    seen: Set[str] = set()
-
-    if asset_class == AssetClass.INDEX:
-        variants.append(f"{s[1:]}.INDX" if s.startswith("^") else f"{s}.INDX")
-        variants.append(s)
-    elif asset_class == AssetClass.FOREX:
-        variants.append(f"{s[:-2]}.FOREX" if s.endswith("=X") else f"{s}.FOREX")
-        variants.append(s)
-    elif asset_class == AssetClass.COMMODITY:
-        variants.append(f"{s[:-2]}.COMM" if s.endswith("=F") else f"{s}.COMM")
-        variants.append(s)
-    else:
-        base, exch = split_exchange_suffix(s)
-        if exch:
-            variants.extend([s, base])
-        else:
-            variants.extend([f"{s}.{_default_exchange()}", s])
-
-    if asset_class == AssetClass.EQUITY:
-        for v in list(variants):
-            b, e = split_exchange_suffix(v)
-            if e:
-                b1, b2 = b.replace(".", "-"), b.replace("-", ".")
-                if b1 != b and b1 not in seen: variants.append(f"{b1}.{e}")
-                if b2 != b and b2 != b1 and b2 not in seen: variants.append(f"{b2}.{e}")
-
-    final: List[str] = []
-    for v in variants:
-        if v and v not in seen:
-            seen.add(v)
-            final.append(v)
-
-    _METRICS.inc("symbol_variants_generated", len(final), {"asset_class": asset_class.value})
-    return final, asset_class
-
+    async def aclose(self):
+        await self._client.aclose()
 
 # ============================================================================
-# Numeric Helpers
+# Singleton & Public API
 # ============================================================================
 
-def safe_float(val: Any) -> Optional[float]:
-    if val is None: return None
-    try:
-        if isinstance(val, (int, float)):
-            f = float(val)
-            if math.isnan(f) or math.isinf(f): return None
-            return f
-        s = str(val).strip()
-        if not s or s in {"-", "—", "N/A", "NA", "null", "None", ""}: return None
-        s = s.replace(",", "").replace("%", "").replace("$", "").replace("£", "").replace("€", "")
-        if s.startswith("(") and s.endswith(")"): s = "-" + s[1:-1].strip()
-        m = re.match(r"^(-?\d+(\.\d+)?)([KMB])$", s, re.IGNORECASE)
-        mult = 1.0
-        if m:
-            num = m.group(1)
-            suf = m.group(3).upper()
-            mult = 1_000.0 if suf == "K" else 1_000_000.0 if suf == "M" else 1_000_000_000.0
-            s = num
-        f = float(s) * mult
-        if math.isnan(f) or math.isinf(f): return None
-        return f
-    except Exception:
-        return None
+_INSTANCE: Optional[EODHDClient] = None
+_LOCK = asyncio.Lock()
 
-def safe_int(val: Any) -> Optional[int]:
-    f = safe_float(val)
-    return int(round(f)) if f is not None else None
+async def get_client() -> EODHDClient:
+    global _INSTANCE
+    if _INSTANCE is None:
+        async with _LOCK:
+            if _INSTANCE is None:
+                _INSTANCE = EODHDClient()
+    return _INSTANCE
 
-def safe_str(val: Any) -> Optional[str]:
-    if val is None: return None
-    s = str(val).strip()
-    return s if s else None
+async def fetch_enriched_quote_patch(symbol: str, *args, **kwargs) -> Dict[str, Any]:
+    client = await get_client()
+    return await client.fetch_enriched_quote_patch(symbol)
 
-def pick(d: Any, *keys: str) -> Any:
-    if not isinstance(d, dict): return None
-    for k in keys:
-        if k in d: return d[k]
-    return None
-
-def position_52w(cur: Optional[float], lo: Optional[float
+__all__ = ["fetch_enriched_quote_patch", "PROVIDER_NAME", "PROVIDER_VERSION", "EODHDClient", "get_client"]
