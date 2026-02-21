@@ -2,9 +2,16 @@
 """
 run_dashboard_sync.py
 ===========================================================
-TADAWUL ENTERPRISE DASHBOARD SYNCHRONIZER — v5.0.0
+TADAWUL ENTERPRISE DASHBOARD SYNCHRONIZER — v6.0.0
 ===========================================================
-AI-POWERED | ML-ENHANCED | DISTRIBUTED | REAL-TIME | SAMA COMPLIANT
+QUANTUM EDITION | AI-POWERED | DISTRIBUTED | NON-BLOCKING
+
+What's new in v6.0.0:
+- ✅ Persistent ThreadPoolExecutor: Eliminates thread-creation overhead for CPU-heavy ML (IsolationForest) and I/O tasks.
+- ✅ Memory-Optimized Models: Applied `@dataclass(slots=True)` to minimize memory footprint during massive multi-page syncs.
+- ✅ High-Performance JSON (`orjson`): Integrated for ultra-fast payload delivery and report generation.
+- ✅ Full Jitter Exponential Backoff: Network retries now use jittered backoff to prevent thundering herds on APIs.
+- ✅ Robust Asyncio Lifecycle: Hardened event loop handling and graceful teardown of AIOHTTP sessions and Redis pools.
 
 Core Capabilities:
 - AI-powered anomaly detection before writing to sheets
@@ -13,15 +20,7 @@ Core Capabilities:
 - Distributed locking for concurrent execution
 - SAMA-compliant audit logging
 - Multi-region failover (KSA, UAE, Bahrain)
-- Predictive caching with Redis
-- Circuit breaker pattern for API calls
-- Advanced retry strategies with exponential backoff
 - Webhook notifications (Slack, Email, Teams)
-- Prometheus metrics integration
-- Parallel page processing with rate limiting
-- Data validation with ML models
-- Automatic rollback on validation failure
-- Comprehensive audit trails
 """
 
 from __future__ import annotations
@@ -29,9 +28,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import concurrent.futures
 import hashlib
 import hmac
-import json
 import logging
 import math
 import os
@@ -63,6 +62,25 @@ from typing import (
     cast,
 )
 from urllib.parse import urlparse, quote
+
+# ---------------------------------------------------------------------------
+# High-Performance JSON fallback
+# ---------------------------------------------------------------------------
+try:
+    import orjson
+    def json_dumps(v: Any, *, indent: int = 0) -> str: 
+        option = orjson.OPT_INDENT_2 if indent else 0
+        return orjson.dumps(v, option=option).decode('utf-8')
+    def json_loads(v: Union[str, bytes]) -> Any: 
+        return orjson.loads(v)
+    _HAS_ORJSON = True
+except ImportError:
+    import json
+    def json_dumps(v: Any, *, indent: int = 0) -> str: 
+        return json.dumps(v, indent=indent if indent else None)
+    def json_loads(v: Union[str, bytes]) -> Any: 
+        return json.loads(v)
+    _HAS_ORJSON = False
 
 # Optional ML/AI libraries
 try:
@@ -99,13 +117,6 @@ try:
 except ImportError:
     _PROMETHEUS_AVAILABLE = False
 
-# Optional Slack/Webhook
-try:
-    import aiohttp
-    _SLACK_AVAILABLE = True
-except ImportError:
-    _SLACK_AVAILABLE = False
-
 # Optional OpenTelemetry
 try:
     from opentelemetry import trace
@@ -116,7 +127,7 @@ except ImportError:
     _OTEL_AVAILABLE = False
 
 # Version
-SCRIPT_VERSION = "5.0.0"
+SCRIPT_VERSION = "6.0.0"
 
 # Configure logging
 logging.basicConfig(
@@ -125,6 +136,9 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("DashboardSync")
+
+# Global CPU Executor for blocking operations
+_CPU_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="SyncWorker")
 
 # Regex for A1 notation
 _A1_CELL_RE = re.compile(r"^\$?[A-Za-z]+\$?\d+$")
@@ -197,10 +211,10 @@ class LockStatus(str, Enum):
     FAILED = "failed"
 
 # =============================================================================
-# Data Models
+# Data Models (Memory Optimized)
 # =============================================================================
 
-@dataclass
+@dataclass(slots=True)
 class SyncTask:
     """Sync task definition"""
     key: str
@@ -215,7 +229,7 @@ class SyncTask:
     priority: int = 5  # 1-10, lower = higher priority
 
 
-@dataclass
+@dataclass(slots=True)
 class SyncResult:
     """Sync operation result"""
     task_key: str
@@ -269,7 +283,7 @@ class SyncResult:
         }
 
 
-@dataclass
+@dataclass(slots=True)
 class SyncSummary:
     """Overall sync summary"""
     version: str = SCRIPT_VERSION
@@ -334,17 +348,14 @@ def _utc_now() -> datetime:
     """Get current UTC datetime"""
     return datetime.now(timezone.utc)
 
-
 def _utc_now_iso() -> str:
     """Get current UTC time in ISO format"""
     return _utc_now().isoformat()
-
 
 def _riyadh_now() -> datetime:
     """Get current Riyadh time"""
     tz = timezone(timedelta(hours=3))
     return datetime.now(tz)
-
 
 def _riyadh_now_iso() -> str:
     """Get current Riyadh time in ISO format"""
@@ -360,13 +371,11 @@ def _safe_int(x: Any, default: int) -> int:
     except Exception:
         return default
 
-
 def _safe_float(x: Any, default: float) -> float:
     try:
         return float(str(x).strip())
     except Exception:
         return default
-
 
 def _safe_bool(x: Any, default: bool = False) -> bool:
     if x is None:
@@ -376,7 +385,6 @@ def _safe_bool(x: Any, default: bool = False) -> bool:
     s = str(x).strip().lower()
     return s in ("true", "1", "yes", "y", "on")
 
-
 def _get_spreadsheet_id(cli_id: Optional[str]) -> str:
     if cli_id:
         return cli_id.strip()
@@ -384,7 +392,6 @@ def _get_spreadsheet_id(cli_id: Optional[str]) -> str:
     if sid:
         return sid
     return (os.getenv("DEFAULT_SPREADSHEET_ID") or "").strip()
-
 
 def _backend_base_url() -> str:
     env_url = (os.getenv("BACKEND_BASE_URL") or "").strip()
@@ -394,7 +401,6 @@ def _backend_base_url() -> str:
     if s_url:
         return s_url.rstrip("/")
     return "http://127.0.0.1:8000"
-
 
 def _canon_key(user_key: str) -> str:
     k = str(user_key or "").strip().upper().replace("-", "_").replace(" ", "_")
@@ -408,7 +414,6 @@ def _canon_key(user_key: str) -> str:
         "AI": "INSIGHTS_ANALYSIS",
     }
     return aliases.get(k, k)
-
 
 def _resolve_sheet_name(key: str) -> str:
     """Resolve sheet name from task key"""
@@ -427,7 +432,6 @@ def _resolve_sheet_name(key: str) -> str:
     if key == "INSIGHTS_ANALYSIS":
         return "AI Insights"
     return key.title().replace("_", " ")
-
 
 def _validate_a1_cell(a1: str) -> str:
     s = (a1 or "").strip()
@@ -473,7 +477,6 @@ class MetricsRegistry:
         if name not in self._gauges and _PROMETHEUS_AVAILABLE:
             self._gauges[name] = Gauge(f"{self.namespace}_{name}", description)
         return self._gauges.get(name)
-
 
 _metrics = MetricsRegistry()
 
@@ -521,7 +524,6 @@ class DistributedLock:
             return True  # No Redis, assume single instance
         
         try:
-            # SET NX with TTL
             acquired = await self.redis.set(
                 self.lock_key,
                 self.lock_value,
@@ -532,7 +534,6 @@ class DistributedLock:
             
             if self.acquired:
                 logger.info(f"Lock acquired: {self.lock_key}")
-                
                 if _metrics.gauge("locks_active"):
                     _metrics.gauge("locks_active").inc()
             
@@ -567,7 +568,6 @@ class DistributedLock:
             
             if released:
                 logger.info(f"Lock released: {self.lock_key}")
-                
                 if _metrics.gauge("locks_active"):
                     _metrics.gauge("locks_active").dec()
             
@@ -597,7 +597,7 @@ class CircuitBreaker:
         self.failure_threshold = failure_threshold
         self.timeout = timeout_seconds
         self.failure_count = 0
-        self.last_failure_time = 0
+        self.last_failure_time = 0.0
         self.state = "closed"  # closed, open, half_open
         self._lock = asyncio.Lock()
     
@@ -648,7 +648,7 @@ class CircuitBreaker:
 
 
 # =============================================================================
-# ML Anomaly Detection
+# ML Anomaly Detection & Quality Scoring
 # =============================================================================
 
 class AnomalyDetector:
@@ -667,12 +667,12 @@ class AnomalyDetector:
         """Initialize ML model"""
         if not _ML_AVAILABLE:
             return
-        
         try:
             self.model = IsolationForest(
                 contamination=0.1,
                 random_state=42,
-                n_estimators=100
+                n_estimators=100,
+                n_jobs=-1
             )
             self.scaler = StandardScaler()
             self.initialized = True
@@ -683,118 +683,90 @@ class AnomalyDetector:
     def extract_features(self, row: List[Any], headers: List[str]) -> Optional[List[float]]:
         """Extract features from data row"""
         features = []
-        
-        # Map headers to indices
         header_map = {h.lower(): i for i, h in enumerate(headers)}
         
-        # Extract numerical features
         for feature in self.feature_names:
             if feature in header_map:
                 idx = header_map[feature]
                 val = row[idx] if idx < len(row) else None
                 try:
-                    fval = float(val) if val is not None else 0.0
-                    features.append(fval)
+                    features.append(float(val) if val is not None else 0.0)
                 except (ValueError, TypeError):
                     features.append(0.0)
             else:
                 features.append(0.0)
-        
         return features
-    
-    def detect(self, rows: List[List[Any]], headers: List[str]) -> Tuple[List[int], List[float]]:
-        """
-        Detect anomalies in data rows
-        Returns: (anomaly_indices, anomaly_scores)
-        """
-        if not self.initialized or not rows:
-            return [], []
-        
+
+    def _detect_sync(self, rows: List[List[Any]], headers: List[str]) -> Tuple[List[int], List[float]]:
+        """Synchronous backend for detect."""
+        if not self.initialized or not rows: return [], []
         try:
-            # Extract features for all rows
-            X = []
-            valid_indices = []
-            
+            X, valid_indices = [], []
             for i, row in enumerate(rows):
                 features = self.extract_features(row, headers)
                 if features and any(f != 0.0 for f in features):
                     X.append(features)
                     valid_indices.append(i)
             
-            if len(X) < 10:
-                return [], []
+            if len(X) < 10: return [], []
             
-            # Scale and predict
             X_scaled = self.scaler.fit_transform(X)
             predictions = self.model.fit_predict(X_scaled)
             scores = self.model.score_samples(X_scaled)
             
-            # Normalize scores to 0-1
             scores = 1.0 / (1.0 + np.exp(-scores))
-            
-            # Return anomaly indices (prediction = -1)
             anomaly_indices = [valid_indices[i] for i, p in enumerate(predictions) if p == -1]
             anomaly_scores = [float(scores[i]) for i, p in enumerate(predictions) if p == -1]
-            
             return anomaly_indices, anomaly_scores
-            
         except Exception as e:
             logger.error(f"Anomaly detection failed: {e}")
             return [], []
+    
+    async def detect(self, rows: List[List[Any]], headers: List[str]) -> Tuple[List[int], List[float]]:
+        """Detect anomalies in data rows asynchronously."""
+        if not self.initialized or not rows: return [], []
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(_CPU_EXECUTOR, self._detect_sync, rows, headers)
 
-
-# =============================================================================
-# Quality Scorer
-# =============================================================================
 
 class QualityScorer:
     """Data quality scoring system"""
     
-    @staticmethod
-    def score_data(rows: List[List[Any]], headers: List[str]) -> Tuple[float, List[str]]:
-        """
-        Score data quality and return issues
-        Returns: (score 0-100, issues)
-        """
-        if not rows or not headers:
-            return 0.0, ["No data"]
-        
+    def _score_sync(self, rows: List[List[Any]], headers: List[str]) -> Tuple[float, List[str]]:
+        if not rows or not headers: return 0.0, ["No data"]
         score = 100.0
         issues = []
         
-        # Check for empty rows
         empty_rows = sum(1 for r in rows if not r or all(v in (None, "", 0) for v in r))
         if empty_rows > 0:
-            empty_pct = empty_rows / len(rows)
-            score -= empty_pct * 30
+            score -= (empty_rows / len(rows)) * 30
             issues.append(f"{empty_rows} empty rows")
         
-        # Check for missing values
         total_cells = len(rows) * len(headers)
         missing_cells = sum(1 for r in rows for v in r if v in (None, "", "N/A"))
         if missing_cells > 0:
-            missing_pct = missing_cells / total_cells
-            score -= missing_pct * 40
+            score -= (missing_cells / total_cells) * 40
             issues.append(f"{missing_cells} missing cells")
         
-        # Check for price columns
         price_idx = next((i for i, h in enumerate(headers) if "price" in h.lower()), None)
         if price_idx is not None:
             zero_prices = sum(1 for r in rows if r and len(r) > price_idx and r[price_idx] in (0, 0.0, None))
             if zero_prices > 0:
-                zero_pct = zero_prices / len(rows)
-                score -= zero_pct * 50
+                score -= (zero_prices / len(rows)) * 50
                 issues.append(f"{zero_prices} zero prices")
         
-        # Check for consistency
         for col_idx, header in enumerate(headers):
-            # Check column has some data
             col_values = [r[col_idx] for r in rows if r and len(r) > col_idx]
             if not col_values or all(v in (None, "", 0) for v in col_values):
                 score -= 10
                 issues.append(f"Column '{header}' has no data")
         
-        return max(0, min(100, score)), issues
+        return max(0.0, min(100.0, score)), issues
+
+    async def score_data(self, rows: List[List[Any]], headers: List[str]) -> Tuple[float, List[str]]:
+        """Score data quality and return issues."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(_CPU_EXECUTOR, self._score_sync, rows, headers)
 
 
 # =============================================================================
@@ -802,80 +774,97 @@ class QualityScorer:
 # =============================================================================
 
 class AsyncHTTPClient:
-    """Async HTTP client with connection pooling"""
+    """Async HTTP client with connection pooling and Full Jitter Backoff"""
     
     def __init__(self, timeout_seconds: float = 30.0, max_connections: int = 100):
         self.timeout = ClientTimeout(total=timeout_seconds)
-        self.connector = TCPConnector(limit=max_connections, ttl_dns_cache=300)
+        self.max_connections = max_connections
         self.session: Optional[ClientSession] = None
         self.circuit_breakers: Dict[str, CircuitBreaker] = {}
     
     async def get_session(self) -> ClientSession:
-        """Get or create session"""
         if not self.session and _AIOHTTP_AVAILABLE:
+            connector = TCPConnector(limit=self.max_connections, ttl_dns_cache=300)
             self.session = ClientSession(
                 timeout=self.timeout,
-                connector=self.connector,
+                connector=connector,
                 headers={"User-Agent": f"TFB-DashboardSync/{SCRIPT_VERSION}"}
             )
         return self.session
     
     async def close(self):
-        """Close session"""
         if self.session:
             await self.session.close()
             self.session = None
     
-    async def get_json(self, url: str, timeout_seconds: Optional[float] = None) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
-        """GET JSON with circuit breaker"""
+    async def post_json(self, url: str, payload: dict, timeout_seconds: Optional[float] = None) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
+        """POST JSON with Full Jitter and Circuit Breaker"""
         if not _AIOHTTP_AVAILABLE:
-            return self._get_json_sync(url, timeout_seconds or 30.0)
+            return self._post_json_sync(url, payload, timeout_seconds or 30.0)
         
-        # Get or create circuit breaker
         domain = urlparse(url).netloc
         if domain not in self.circuit_breakers:
             self.circuit_breakers[domain] = CircuitBreaker(domain)
-        
         cb = self.circuit_breakers[domain]
         
         async def _fetch():
             session = await self.get_session()
             timeout = timeout_seconds or 30.0
             
-            try:
-                async with session.get(url, timeout=timeout) as resp:
-                    status = resp.status
-                    if status != 200:
-                        text = await resp.text()
-                        return None, f"HTTP {status}: {text[:200]}", status
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    async with session.post(url, json=payload, timeout=timeout) as resp:
+                        status = resp.status
+                        if status == 429 or (500 <= status < 600):
+                            if attempt == max_retries - 1:
+                                return None, f"HTTP {status} after {max_retries} attempts", status
+                            # Full Jitter Backoff
+                            base_wait = 2 ** attempt
+                            jitter = random.uniform(0, base_wait)
+                            await asyncio.sleep(min(15.0, base_wait + jitter))
+                            continue
+                        
+                        if status != 200:
+                            text = await resp.text()
+                            return None, f"HTTP {status}: {text[:200]}", status
+                        
+                        # Use orjson if available for faster parsing
+                        raw = await resp.read()
+                        data = json_loads(raw)
+                        return data, None, status
+                        
+                except asyncio.TimeoutError:
+                    if attempt == max_retries - 1: return None, "Timeout", 408
+                except Exception as e:
+                    if attempt == max_retries - 1: return None, str(e), 0
                     
-                    data = await resp.json()
-                    return data, None, status
-                    
-            except asyncio.TimeoutError:
-                return None, "Timeout", 408
-            except Exception as e:
-                return None, str(e), 0
-        
+                base_wait = 2 ** attempt
+                await asyncio.sleep(min(10.0, base_wait + random.uniform(0, base_wait)))
+
         try:
             return await cb.call(_fetch)
         except Exception as e:
             return None, f"Circuit breaker: {e}", 503
     
-    def _get_json_sync(self, url: str, timeout_sec: float) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
-        """Synchronous fallback"""
+    def _post_json_sync(self, url: str, payload: dict, timeout_sec: float) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
         import urllib.request
         import urllib.error
         
+        data_bytes = json_dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=data_bytes,
+            method="POST",
+            headers={"Content-Type": "application/json", "User-Agent": f"TFB-DashboardSync/{SCRIPT_VERSION}"}
+        )
         try:
-            req = urllib.request.Request(url, method="GET", headers={"User-Agent": f"TFB-DashboardSync/{SCRIPT_VERSION}"})
             with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
                 code = int(resp.getcode() or 0)
                 raw = resp.read()
-                if not raw:
-                    return None, "Empty response body", code
+                if not raw: return None, "Empty response body", code
                 try:
-                    data = json.loads(raw.decode("utf-8", errors="replace"))
+                    data = json_loads(raw)
                     return data, None, code
                 except Exception:
                     return None, "Non-JSON response", code
@@ -883,7 +872,6 @@ class AsyncHTTPClient:
             return None, f"HTTPError {e.code}", e.code
         except Exception as e:
             return None, str(e), 0
-
 
 _http_client = AsyncHTTPClient()
 
@@ -898,28 +886,14 @@ class WebhookNotifier:
     def __init__(self):
         self.slack_webhook = os.getenv("SLACK_WEBHOOK_URL")
         self.teams_webhook = os.getenv("TEAMS_WEBHOOK_URL")
-        self.discord_webhook = os.getenv("DISCORD_WEBHOOK_URL")
     
     async def send(self, severity: AlertSeverity, title: str, message: str, data: Optional[Dict[str, Any]] = None):
-        """Send notification to all configured channels"""
         tasks = []
-        
-        if self.slack_webhook:
-            tasks.append(self._send_slack(severity, title, message, data))
-        
-        if self.teams_webhook:
-            tasks.append(self._send_teams(severity, title, message, data))
-        
-        if self.discord_webhook:
-            tasks.append(self._send_discord(severity, title, message, data))
-        
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        if self.slack_webhook: tasks.append(self._send_slack(severity, title, message, data))
+        if tasks: await asyncio.gather(*tasks, return_exceptions=True)
     
     async def _send_slack(self, severity: AlertSeverity, title: str, message: str, data: Optional[Dict[str, Any]] = None):
-        """Send to Slack"""
-        if not self.slack_webhook or not _AIOHTTP_AVAILABLE:
-            return
+        if not self.slack_webhook or not _AIOHTTP_AVAILABLE: return
         
         color = {
             AlertSeverity.INFO: "good",
@@ -928,60 +902,19 @@ class WebhookNotifier:
             AlertSeverity.CRITICAL: "danger",
         }.get(severity, "good")
         
-        blocks = [
-            {
-                "type": "section",
-                "text": {
-                    "type": "mrkdwn",
-                    "text": f"*{title}*\n{message}"
-                }
-            }
-        ]
+        blocks = [{"type": "section", "text": {"type": "mrkdwn", "text": f"*{title}*\n{message}"}}]
         
         if data:
-            fields = []
-            for key, value in list(data.items())[:6]:
-                fields.append({
-                    "type": "mrkdwn",
-                    "text": f"*{key}:* {value}"
-                })
-            
-            if fields:
-                blocks.append({
-                    "type": "section",
-                    "fields": fields
-                })
+            fields = [{"type": "mrkdwn", "text": f"*{k}:* {v}"} for k, v in list(data.items())[:6]]
+            if fields: blocks.append({"type": "section", "fields": fields})
         
-        payload = {
-            "attachments": [{
-                "color": color,
-                "blocks": blocks,
-                "ts": int(time.time())
-            }]
-        }
+        payload = {"attachments": [{"color": color, "blocks": blocks, "ts": int(time.time())}]}
         
         try:
             session = await _http_client.get_session()
             await session.post(self.slack_webhook, json=payload)
         except Exception as e:
             logger.error(f"Slack notification failed: {e}")
-    
-    async def _send_teams(self, severity: AlertSeverity, title: str, message: str, data: Optional[Dict[str, Any]] = None):
-        """Send to Microsoft Teams"""
-        if not self.teams_webhook:
-            return
-        
-        # Teams webhook implementation
-        pass
-    
-    async def _send_discord(self, severity: AlertSeverity, title: str, message: str, data: Optional[Dict[str, Any]] = None):
-        """Send to Discord"""
-        if not self.discord_webhook:
-            return
-        
-        # Discord webhook implementation
-        pass
-
 
 _notifier = WebhookNotifier()
 
@@ -993,69 +926,13 @@ _notifier = WebhookNotifier()
 def _build_tasks(validation_level: ValidationLevel = ValidationLevel.BASIC) -> List[SyncTask]:
     """Build task registry"""
     return [
-        SyncTask(
-            key="KSA_TADAWUL",
-            description="KSA Tadawul Market",
-            gateway=GatewayType.KSA,
-            method_name="refresh_sheet_with_enriched_quotes",
-            sheet_name="KSA Tadawul",
-            validation_level=validation_level,
-            priority=1,
-        ),
-        SyncTask(
-            key="MARKET_LEADERS",
-            description="Market Leaders",
-            gateway=GatewayType.ENRICHED,
-            method_name="refresh_sheet_with_enriched_quotes",
-            sheet_name="Market Leaders",
-            validation_level=validation_level,
-            priority=2,
-        ),
-        SyncTask(
-            key="GLOBAL_MARKETS",
-            description="Global Markets",
-            gateway=GatewayType.ENRICHED,
-            method_name="refresh_sheet_with_enriched_quotes",
-            sheet_name="Global Markets",
-            validation_level=validation_level,
-            priority=3,
-        ),
-        SyncTask(
-            key="MUTUAL_FUNDS",
-            description="Mutual Funds",
-            gateway=GatewayType.ENRICHED,
-            method_name="refresh_sheet_with_enriched_quotes",
-            sheet_name="Mutual Funds",
-            validation_level=validation_level,
-            priority=4,
-        ),
-        SyncTask(
-            key="COMMODITIES_FX",
-            description="Commodities & FX",
-            gateway=GatewayType.ENRICHED,
-            method_name="refresh_sheet_with_enriched_quotes",
-            sheet_name="Commodities & FX",
-            validation_level=validation_level,
-            priority=5,
-        ),
-        SyncTask(
-            key="MY_PORTFOLIO",
-            description="My Portfolio",
-            gateway=GatewayType.ENRICHED,
-            method_name="refresh_sheet_with_enriched_quotes",
-            sheet_name="My Portfolio",
-            validation_level=validation_level,
-            priority=6,
-        ),
-        SyncTask(
-            key="INSIGHTS_ANALYSIS",
-            description="AI Insights",
-            gateway=GatewayType.AI,
-            method_name="refresh_sheet_with_ai_analysis",
-            sheet_name="AI Insights",
-            validation_level=validation_level,
-            priority=7,
-        ),
+        SyncTask(key="KSA_TADAWUL", description="KSA Tadawul Market", gateway=GatewayType.KSA, method_name="refresh_sheet_with_enriched_quotes", sheet_name="KSA Tadawul", validation_level=validation_level, priority=1),
+        SyncTask(key="MARKET_LEADERS", description="Market Leaders", gateway=GatewayType.ENRICHED, method_name="refresh_sheet_with_enriched_quotes", sheet_name="Market Leaders", validation_level=validation_level, priority=2),
+        SyncTask(key="GLOBAL_MARKETS", description="Global Markets", gateway=GatewayType.ENRICHED, method_name="refresh_sheet_with_enriched_quotes", sheet_name="Global Markets", validation_level=validation_level, priority=3),
+        SyncTask(key="MUTUAL_FUNDS", description="Mutual Funds", gateway=GatewayType.ENRICHED, method_name="refresh_sheet_with_enriched_quotes", sheet_name="Mutual Funds", validation_level=validation_level, priority=4),
+        SyncTask(key="COMMODITIES_FX", description="Commodities & FX", gateway=GatewayType.ENRICHED, method_name="refresh_sheet_with_enriched_quotes", sheet_name="Commodities & FX", validation_level=validation_level, priority=5),
+        SyncTask(key="MY_PORTFOLIO", description="My Portfolio", gateway=GatewayType.ENRICHED, method_name="refresh_sheet_with_enriched_quotes", sheet_name="My Portfolio", validation_level=validation_level, priority=6),
+        SyncTask(key="INSIGHTS_ANALYSIS", description="AI Insights", gateway=GatewayType.AI, method_name="refresh_sheet_with_ai_analysis", sheet_name="AI Insights", validation_level=validation_level, priority=7),
     ]
 
 
@@ -1064,40 +941,18 @@ def _build_tasks(validation_level: ValidationLevel = ValidationLevel.BASIC) -> L
 # =============================================================================
 
 def _read_symbols(key: str, spreadsheet_id: str, max_symbols: int) -> List[str]:
-    """Read symbols for a page"""
     sym_data = symbols_reader.get_page_symbols(key, spreadsheet_id=spreadsheet_id)
+    symbols = sym_data.get("all") or sym_data.get("symbols") or [] if isinstance(sym_data, dict) else sym_data or []
     
-    symbols: List[str]
-    if isinstance(sym_data, dict):
-        symbols = sym_data.get("all") or sym_data.get("symbols") or []
-    else:
-        symbols = sym_data or []
-    
-    # Clean and deduplicate
-    out: List[str] = []
-    seen = set()
-    
+    out, seen = [], set()
     for s in symbols:
         t = str(s or "").strip()
-        if not t:
-            continue
-        
+        if not t: continue
         u = t.upper()
-        if u in {"SYMBOL", "TICKER", "#", ""}:
-            continue
-        if u.startswith("#"):
-            continue
-        if u in seen:
-            continue
+        if u in {"SYMBOL", "TICKER", "#", ""} or u.startswith("#") or u in seen: continue
+        seen.add(u); out.append(u)
         
-        seen.add(u)
-        out.append(u)
-    
-    # Apply limit
-    if max_symbols > 0 and len(out) > max_symbols:
-        out = out[:max_symbols]
-    
-    return out
+    return out[:max_symbols] if max_symbols > 0 else out
 
 
 # =============================================================================
@@ -1105,126 +960,34 @@ def _read_symbols(key: str, spreadsheet_id: str, max_symbols: int) -> List[str]:
 # =============================================================================
 
 async def _execute_gateway(
-    task: SyncTask,
-    spreadsheet_id: str,
-    symbols: List[str],
-    start_cell: str,
-    clear: bool,
-    gateway_override: Optional[str] = None,
+    task: SyncTask, spreadsheet_id: str, symbols: List[str], start_cell: str, clear: bool, gateway_override: Optional[str] = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[str], Optional[GatewayType]]:
-    """Execute gateway call"""
     
     sheet_name = task.sheet_name or _resolve_sheet_name(task.key)
     gateway = gateway_override or task.gateway.value
     
-    # Map gateway to endpoint
-    if gateway == "argaam" or (task.gateway == GatewayType.KSA and gateway_override == "argaam"):
-        endpoint = "/v1/argaam/sheet-rows"
-    elif gateway == "ai":
-        endpoint = "/v1/analysis/sheet-rows"
-    elif gateway == "advanced":
-        endpoint = "/v1/advanced/sheet-rows"
-    else:  # enriched
-        endpoint = "/v1/enriched/sheet-rows"
+    endpoint = {
+        "argaam": "/v1/argaam/sheet-rows",
+        "ai": "/v1/analysis/sheet-rows",
+        "advanced": "/v1/advanced/sheet-rows",
+    }.get(gateway, "/v1/enriched/sheet-rows")
     
-    # Build payload
-    payload = {
-        "sheet_name": sheet_name,
-        "tickers": symbols,
-        "refresh": True,
-        "include_meta": True,
-    }
+    payload = {"sheet_name": sheet_name, "tickers": symbols, "refresh": True, "include_meta": True}
+    url = f"{_backend_base_url()}{endpoint}"
     
-    # Make request
-    backend_url = _backend_base_url()
-    url = f"{backend_url}{endpoint}"
-    
-    if _AIOHTTP_AVAILABLE:
-        session = await _http_client.get_session()
-        try:
-            async with session.post(url, json=payload, timeout=30) as resp:
-                if resp.status != 200:
-                    text = await resp.text()
-                    return None, f"HTTP {resp.status}: {text[:200]}", None
-                
-                data = await resp.json()
-                return data, None, GatewayType(gateway)
-        except Exception as e:
-            return None, str(e), None
-    else:
-        # Synchronous fallback
-        import urllib.request
-        import json
-        
-        data_bytes = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=data_bytes,
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "User-Agent": f"TFB-DashboardSync/{SCRIPT_VERSION}"
-            }
-        )
-        
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                if resp.getcode() != 200:
-                    return None, f"HTTP {resp.getcode()}", None
-                
-                raw = resp.read()
-                data = json.loads(raw.decode("utf-8"))
-                return data, None, GatewayType(gateway)
-        except Exception as e:
-            return None, str(e), None
-
-
-# =============================================================================
-# Safety Checks
-# =============================================================================
+    data, err, _ = await _http_client.post_json(url, payload, timeout_seconds=30.0)
+    return data, err, GatewayType(gateway)
 
 def _validate_response(res: Dict[str, Any], symbols: List[str]) -> Tuple[bool, Optional[str], List[str]]:
-    """
-    Validate response for safety
-    Returns: (is_safe, error_message, warnings)
-    """
     warnings = []
-    
-    # Check response type
-    if not isinstance(res, dict):
-        return False, "Response is not a dictionary", warnings
-    
-    # Check headers
+    if not isinstance(res, dict): return False, "Response is not a dictionary", warnings
     headers = res.get("headers")
-    if headers is None:
-        return False, "Missing 'headers' in response", warnings
+    if not isinstance(headers, list) or len(headers) == 0: return False, "Missing or empty headers", warnings
+    if res.get("rows") is not None and not isinstance(res.get("rows"), list): return False, "'rows' is not a list", warnings
+    if str(res.get("status") or "").lower() in ("error", "failed"): return True, None, warnings
     
-    if not isinstance(headers, list):
-        return False, "'headers' is not a list", warnings
-    
-    if len(headers) == 0:
-        return False, "Empty headers - would clear sheet", warnings
-    
-    # Check rows
-    rows = res.get("rows")
-    if rows is not None and not isinstance(rows, list):
-        return False, "'rows' is not a list", warnings
-    
-    # Check status
-    status = str(res.get("status") or "").lower()
-    if status in ("error", "failed"):
-        return True, None, warnings  # Safe to report error
-    
-    # Check rows_written vs symbols
-    rows_written = 0
-    for k in ("rows_written", "written_rows", "rows", "count"):
-        v = res.get(k)
-        if isinstance(v, int):
-            rows_written = v
-            break
-    
-    if symbols and rows_written == 0:
-        warnings.append("Zero rows written for non-empty symbol list")
+    rows_written = res.get("rows_written", res.get("written_rows", res.get("count", 0)))
+    if symbols and rows_written == 0: warnings.append("Zero rows written for non-empty symbol list")
     
     return True, None, warnings
 
@@ -1234,163 +997,82 @@ def _validate_response(res: Dict[str, Any], symbols: List[str]) -> Tuple[bool, O
 # =============================================================================
 
 async def run_task(
-    task: SyncTask,
-    spreadsheet_id: str,
-    start_cell: str,
-    clear: bool,
-    ksa_gateway: str,
-    max_symbols: int,
-    anomaly_detector: Optional[AnomalyDetector] = None,
-    quality_scorer: Optional[QualityScorer] = None,
-    dry_run: bool = False,
+    task: SyncTask, spreadsheet_id: str, start_cell: str, clear: bool, ksa_gateway: str, max_symbols: int,
+    anomaly_detector: Optional[AnomalyDetector] = None, quality_scorer: Optional[QualityScorer] = None, dry_run: bool = False,
 ) -> SyncResult:
-    """Run a single sync task"""
-    
-    result = SyncResult(
-        task_key=task.key,
-        status=SyncStatus.PENDING,
-        start_time=_utc_now(),
-    )
+    result = SyncResult(task_key=task.key, status=SyncStatus.PENDING, start_time=_utc_now())
     
     try:
-        # Read symbols
         symbols = _read_symbols(task.key, spreadsheet_id, max_symbols)
         result.symbols_requested = len(symbols)
         
-        if not symbols:
+        if not symbols or dry_run:
             result.status = SyncStatus.SKIPPED
-            result.end_time = _utc_now()
-            result.duration_ms = (result.end_time - result.start_time).total_seconds() * 1000
+            result.meta["dry_run"] = dry_run
             return result
+            
+        gateway_plan = ["enriched", "argaam", "enriched"] if ksa_gateway == "auto" and task.gateway == GatewayType.KSA else [ksa_gateway, "enriched"] if task.gateway == GatewayType.KSA else [task.gateway.value]
         
-        if dry_run:
-            result.status = SyncStatus.SKIPPED
-            result.end_time = _utc_now()
-            result.duration_ms = (result.end_time - result.start_time).total_seconds() * 1000
-            result.meta["dry_run"] = True
-            return result
-        
-        # Determine gateway strategy for KSA
-        gateway_plan = [task.gateway.value]
-        if task.gateway == GatewayType.KSA:
-            if ksa_gateway == "auto":
-                gateway_plan = ["enriched", "argaam", "enriched"]
-            elif ksa_gateway == "argaam":
-                gateway_plan = ["argaam", "enriched"]
-            else:
-                gateway_plan = ["enriched", "argaam"]
-        
-        # Execute with retries and gateway fallback
         last_error = None
         for gateway in gateway_plan:
             for attempt in range(task.retry_count):
                 try:
                     result.gateway_attempts += 1
-                    
-                    data, error, used_gateway = await _execute_gateway(
-                        task=task,
-                        spreadsheet_id=spreadsheet_id,
-                        symbols=symbols,
-                        start_cell=start_cell,
-                        clear=clear,
-                        gateway_override=gateway if gateway != task.gateway.value else None,
-                    )
+                    data, error, used_gateway = await _execute_gateway(task, spreadsheet_id, symbols, start_cell, clear, gateway_override=gateway if gateway != task.gateway.value else None)
                     
                     if error:
                         last_error = error
                         if attempt < task.retry_count - 1:
-                            # Exponential backoff
-                            delay = (2 ** attempt) + random.uniform(0, 0.1)
-                            await asyncio.sleep(delay)
+                            base_wait = 2 ** attempt
+                            await asyncio.sleep(min(10.0, base_wait + random.uniform(0, base_wait)))
                         continue
-                    
+                        
                     if not data:
                         last_error = "Empty response"
                         continue
-                    
-                    # Validate response
+                        
                     is_safe, safety_error, warnings = _validate_response(data, symbols)
                     result.warnings.extend(warnings)
-                    
                     if not is_safe:
                         last_error = safety_error or "Unsafe response"
                         continue
-                    
-                    # Extract metrics
-                    for k in ("rows_written", "written_rows", "rows", "count"):
-                        v = data.get(k)
-                        if isinstance(v, int):
-                            result.rows_written = v
-                            break
-                    
+                        
+                    result.rows_written = data.get("rows_written", data.get("count", 0))
                     result.rows_failed = max(0, len(symbols) - result.rows_written)
                     result.symbols_processed = len(symbols)
                     result.gateway_used = used_gateway
                     
-                    # Get headers and rows for validation
-                    headers = data.get("headers", [])
-                    rows = data.get("rows", [])
-                    
-                    # Quality scoring
+                    headers, rows = data.get("headers", []), data.get("rows", [])
                     if quality_scorer:
-                        score, issues = quality_scorer.score_data(rows, headers)
-                        result.validation_score = score
-                        result.warnings.extend(issues)
-                    
-                    # Anomaly detection
+                        score, issues = await quality_scorer.score_data(rows, headers)
+                        result.validation_score, result.warnings = score, result.warnings + issues
                     if anomaly_detector and rows:
-                        anomaly_indices, anomaly_scores = anomaly_detector.detect(rows, headers)
+                        anomaly_indices, anomaly_scores = await anomaly_detector.detect(rows, headers)
                         if anomaly_indices:
-                            result.anomalies_detected = [
-                                f"Row {i+1} (score: {s:.2f})"
-                                for i, s in zip(anomaly_indices, anomaly_scores)
-                            ]
+                            result.anomalies_detected = [f"Row {i+1} (score: {s:.2f})" for i, s in zip(anomaly_indices, anomaly_scores)]
+                            
+                    if result.rows_failed == 0: result.status = SyncStatus.SUCCESS
+                    elif result.rows_written > 0: result.status = SyncStatus.PARTIAL
+                    else: result.status = SyncStatus.FAILED
                     
-                    # Determine status
-                    if result.rows_failed == 0:
-                        result.status = SyncStatus.SUCCESS
-                    elif result.rows_written > 0:
-                        result.status = SyncStatus.PARTIAL
-                    else:
-                        result.status = SyncStatus.FAILED
-                    
-                    # Add metadata
-                    result.meta.update({
-                        "gateway": gateway,
-                        "attempt": attempt + 1,
-                        "headers_count": len(headers),
-                        "response_status": data.get("status"),
-                        "time_utc": _utc_now_iso(),
-                        "time_riyadh": _riyadh_now_iso(),
-                    })
-                    
-                    # Success, break out of loops
+                    result.meta.update({"gateway": gateway, "attempt": attempt + 1, "headers_count": len(headers), "response_status": data.get("status"), "time_utc": _utc_now_iso(), "time_riyadh": _riyadh_now_iso()})
                     break
-                    
                 except Exception as e:
                     last_error = str(e)
                     if attempt < task.retry_count - 1:
-                        delay = (2 ** attempt) + random.uniform(0, 0.1)
-                        await asyncio.sleep(delay)
+                        await asyncio.sleep(min(10.0, (2 ** attempt) + random.uniform(0, 1)))
             
-            # If we got a result, break gateway loop
-            if result.status != SyncStatus.PENDING:
-                break
-        
-        # If still pending, all attempts failed
+            if result.status != SyncStatus.PENDING: break
+            
         if result.status == SyncStatus.PENDING:
-            result.status = SyncStatus.FAILED
-            result.error = last_error or "All gateways failed"
-        
+            result.status, result.error = SyncStatus.FAILED, last_error or "All gateways failed"
+            
     except Exception as e:
-        result.status = SyncStatus.FAILED
-        result.error = str(e)
+        result.status, result.error = SyncStatus.FAILED, str(e)
         logger.exception(f"Task {task.key} failed: {e}")
-    
     finally:
         result.end_time = _utc_now()
         result.duration_ms = (result.end_time - result.start_time).total_seconds() * 1000
-    
     return result
 
 
@@ -1398,361 +1080,73 @@ async def run_task(
 # Preflight Checks
 # =============================================================================
 
-async def _preflight_check(
-    spreadsheet_id: str,
-    backend_url: str,
-    tasks: List[SyncTask],
-    timeout_sec: float = 10.0,
-) -> Tuple[bool, List[str]]:
-    """Run preflight checks"""
+async def _preflight_check(spreadsheet_id: str, backend_url: str, tasks: List[SyncTask], timeout_sec: float = 10.0) -> Tuple[bool, List[str]]:
     logger.info("Running preflight checks...")
-    
     issues = []
     
-    # 1) Google Sheets API
     try:
         sheets_service.get_sheets_service()
         logger.info("✅ Google Sheets API: Connected")
     except Exception as e:
-        issues.append(f"Google Sheets API: {e}")
-        logger.error(f"❌ Google Sheets API: {e}")
-    
-    # 2) Backend health
+        issues.append(f"Google Sheets API: {e}"); logger.error(f"❌ Google Sheets API: {e}")
+        
     for path in ["/readyz", "/health", "/v1/enriched/health"]:
         data, err, code = await _http_client.get_json(f"{backend_url}{path}", timeout_sec)
         if code == 200 and isinstance(data, dict):
-            logger.info(f"✅ Backend API: Connected ({path})")
-            break
+            logger.info(f"✅ Backend API: Connected ({path})"); break
     else:
-        issues.append(f"Backend API unreachable at {backend_url}")
-        logger.error(f"❌ Backend API: Unreachable at {backend_url}")
-    
-    # 3) Required endpoints
-    required_endpoints = set()
+        issues.append(f"Backend API unreachable at {backend_url}"); logger.error(f"❌ Backend API: Unreachable")
+        
+    req_eps = set()
     for task in tasks:
-        if task.gateway == GatewayType.ENRICHED:
-            required_endpoints.add("/v1/enriched/health")
-        elif task.gateway == GatewayType.ARGAAM:
-            required_endpoints.add("/v1/argaam/health")
-        elif task.gateway == GatewayType.AI:
-            required_endpoints.add("/v1/analysis/health")
-        elif task.gateway == GatewayType.KSA:
-            required_endpoints.add("/v1/enriched/health")
-            required_endpoints.add("/v1/argaam/health")
-    
-    for endpoint in required_endpoints:
-        data, err, code = await _http_client.get_json(f"{backend_url}{endpoint}", timeout_sec)
-        if code == 200:
-            logger.info(f"✅ {endpoint}: OK")
-        else:
-            issues.append(f"{endpoint}: {err or f'HTTP {code}'}")
-            logger.warning(f"⚠️  {endpoint}: {err or f'HTTP {code}'}")
-    
+        req_eps.add({"enriched": "/v1/enriched/health", "argaam": "/v1/argaam/health", "ai": "/v1/analysis/health", "ksa": "/v1/argaam/health"}.get(task.gateway.value, "/v1/enriched/health"))
+        
+    for ep in req_eps:
+        data, err, code = await _http_client.get_json(f"{backend_url}{ep}", timeout_sec)
+        if code == 200: logger.info(f"✅ {ep}: OK")
+        else: issues.append(f"{ep}: {err or f'HTTP {code}'}"); logger.warning(f"⚠️  {ep}: {err or f'HTTP {code}'}")
+        
     return len(issues) == 0, issues
 
 
 # =============================================================================
-# Summary Generation
+# Summary & Export
 # =============================================================================
 
 def _generate_summary(results: List[SyncResult]) -> SyncSummary:
-    """Generate sync summary"""
-    
-    summary = SyncSummary()
-    summary.total_tasks = len(results)
-    
-    durations = []
-    validation_scores = []
+    summary = SyncSummary(total_tasks=len(results))
+    durations, validation_scores = [], []
     
     for r in results:
-        # Count by status
-        if r.status == SyncStatus.SUCCESS:
-            summary.successful_tasks += 1
-        elif r.status == SyncStatus.PARTIAL:
-            summary.partial_tasks += 1
-        elif r.status == SyncStatus.FAILED:
-            summary.failed_tasks += 1
-        elif r.status == SyncStatus.SKIPPED:
-            summary.skipped_tasks += 1
+        if r.status == SyncStatus.SUCCESS: summary.successful_tasks += 1
+        elif r.status == SyncStatus.PARTIAL: summary.partial_tasks += 1
+        elif r.status == SyncStatus.FAILED: summary.failed_tasks += 1
+        elif r.status == SyncStatus.SKIPPED: summary.skipped_tasks += 1
         
-        # Metrics
         summary.total_symbols += r.symbols_requested
         summary.total_rows_written += r.rows_written
         summary.total_rows_failed += r.rows_failed
-        
-        # Duration
         durations.append(r.duration_ms)
+        if r.validation_score > 0: validation_scores.append(r.validation_score)
         
-        # Validation
-        if r.validation_score > 0:
-            validation_scores.append(r.validation_score)
-        
-        # Gateway stats
         if r.gateway_used:
             gw = r.gateway_used.value
-            if gw not in summary.gateway_stats:
-                summary.gateway_stats[gw] = {
-                    "attempts": 0,
-                    "successes": 0,
-                    "failures": 0,
-                }
+            if gw not in summary.gateway_stats: summary.gateway_stats[gw] = {"attempts": 0, "successes": 0, "failures": 0}
             summary.gateway_stats[gw]["attempts"] += r.gateway_attempts
-            if r.status in (SyncStatus.SUCCESS, SyncStatus.PARTIAL):
-                summary.gateway_stats[gw]["successes"] += 1
-            else:
-                summary.gateway_stats[gw]["failures"] += 1
+            if r.status in (SyncStatus.SUCCESS, SyncStatus.PARTIAL): summary.gateway_stats[gw]["successes"] += 1
+            else: summary.gateway_stats[gw]["failures"] += 1
+            
+        if r.error: summary.errors.append({"task": r.task_key, "error": r.error, "request_id": r.request_id})
         
-        # Errors
-        if r.error:
-            summary.errors.append({
-                "task": r.task_key,
-                "error": r.error,
-                "request_id": r.request_id,
-            })
-    
-    # Duration stats
     if durations:
-        summary.avg_duration_ms = sum(durations) / len(durations)
-        summary.max_duration_ms = max(durations)
-        summary.min_duration_ms = min(durations)
-    
-    # Validation stats
-    if validation_scores:
-        summary.avg_validation_score = sum(validation_scores) / len(validation_scores)
+        summary.avg_duration_ms, summary.max_duration_ms, summary.min_duration_ms = sum(durations)/len(durations), max(durations), min(durations)
+    if validation_scores: summary.avg_validation_score = sum(validation_scores) / len(validation_scores)
     
     summary.end_time = _utc_now()
     summary.duration_ms = (summary.end_time - summary.start_time).total_seconds() * 1000
-    
     return summary
 
-
-# =============================================================================
-# Main Async Function
-# =============================================================================
-
-async def main_async(args: argparse.Namespace) -> int:
-    """Async main function"""
-    
-    start_time = time.time()
-    
-    # Configuration
-    sid = _get_spreadsheet_id(args.sheet_id)
-    if not sid:
-        logger.error("No Spreadsheet ID found")
-        return 1
-    
-    try:
-        start_cell = _validate_a1_cell(args.start_cell)
-    except Exception as e:
-        logger.error(f"Invalid start cell: {e}")
-        return 1
-    
-    retries = _safe_int(args.retries, 1)
-    retries = max(0, min(5, retries))
-    
-    backoff_base = _safe_float(args.backoff_base, 1.2)
-    backoff_cap = _safe_float(args.backoff_cap, 8.0)
-    
-    max_symbols = _safe_int(args.max_symbols, 0)
-    max_symbols = max(0, min(2000, max_symbols))
-    
-    parallel = _safe_bool(args.parallel, True)
-    parallel_workers = _safe_int(args.workers, 5)
-    
-    validation_level = ValidationLevel(args.validation) if args.validation else ValidationLevel.BASIC
-    
-    # Build tasks
-    all_tasks = _build_tasks(validation_level)
-    
-    if args.keys:
-        wanted = {_canon_key(k) for k in args.keys}
-        tasks = [t for t in all_tasks if _canon_key(t.key) in wanted]
-    else:
-        tasks = all_tasks
-    
-    if not tasks:
-        logger.warning("No tasks selected")
-        return 0
-    
-    # Preflight checks
-    if not args.no_preflight:
-        backend_url = _backend_base_url()
-        preflight_ok, issues = await _preflight_check(sid, backend_url, tasks)
-        if not preflight_ok and args.fail_on_preflight:
-            logger.error("Preflight checks failed")
-            return 1
-    
-    # Distributed lock
-    redis_client = None
-    if _REDIS_AVAILABLE and os.getenv("REDIS_URL"):
-        try:
-            redis_client = await aioredis.from_url(
-                os.getenv("REDIS_URL"),
-                encoding="utf-8",
-                decode_responses=True
-            )
-        except Exception as e:
-            logger.warning(f"Redis unavailable: {e}")
-    
-    lock_key = f"sync:{sid}:{','.join(sorted(t.key for t in tasks))}"
-    
-    async with DistributedLock(redis_client, lock_key, ttl_seconds=300) as lock:
-        if not lock.acquired and not args.force:
-            logger.error("Could not acquire distributed lock - another sync may be running")
-            return 1
-        
-        logger.info(f"Starting sync for {len(tasks)} dashboard(s)...")
-        
-        # Initialize ML components
-        anomaly_detector = AnomalyDetector() if validation_level == ValidationLevel.ML else None
-        if anomaly_detector:
-            await anomaly_detector.initialize()
-        
-        quality_scorer = QualityScorer() if validation_level != ValidationLevel.NONE else None
-        
-        # Run tasks
-        results: List[SyncResult] = []
-        
-        if parallel and len(tasks) > 1:
-            # Run in parallel with semaphore
-            semaphore = asyncio.Semaphore(parallel_workers)
-            
-            async def run_with_semaphore(task):
-                async with semaphore:
-                    return await run_task(
-                        task=task,
-                        spreadsheet_id=sid,
-                        start_cell=start_cell,
-                        clear=bool(args.clear),
-                        ksa_gateway=args.ksa_gw,
-                        max_symbols=max_symbols,
-                        anomaly_detector=anomaly_detector,
-                        quality_scorer=quality_scorer,
-                        dry_run=bool(args.dry_run),
-                    )
-            
-            tasks_coros = [run_with_semaphore(task) for task in tasks]
-            results = await asyncio.gather(*tasks_coros, return_exceptions=True)
-            
-            # Process results
-            processed_results = []
-            for i, r in enumerate(results):
-                if isinstance(r, Exception):
-                    logger.error(f"Task {tasks[i].key} failed: {r}")
-                    processed_results.append(SyncResult(
-                        task_key=tasks[i].key,
-                        status=SyncStatus.FAILED,
-                        start_time=_utc_now(),
-                        end_time=_utc_now(),
-                        error=str(r),
-                    ))
-                else:
-                    processed_results.append(r)
-            
-            results = processed_results
-            
-        else:
-            # Run sequentially
-            for task in tasks:
-                result = await run_task(
-                    task=task,
-                    spreadsheet_id=sid,
-                    start_cell=start_cell,
-                    clear=bool(args.clear),
-                    ksa_gateway=args.ksa_gw,
-                    max_symbols=max_symbols,
-                    anomaly_detector=anomaly_detector,
-                    quality_scorer=quality_scorer,
-                    dry_run=bool(args.dry_run),
-                )
-                results.append(result)
-                
-                # Cooldown between tasks
-                if not args.dry_run and len(tasks) > 1:
-                    await asyncio.sleep(1.5)
-        
-        # Generate summary
-        summary = _generate_summary(results)
-        
-        # Log results
-        logger.info("=" * 60)
-        logger.info(f"SYNC COMPLETE - {summary.successful_tasks} success, {summary.partial_tasks} partial, {summary.failed_tasks} failed")
-        logger.info(f"Symbols: {summary.total_symbols} | Rows Written: {summary.total_rows_written}")
-        logger.info(f"Duration: {summary.duration_ms:.2f}ms")
-        logger.info("=" * 60)
-        
-        # Detailed results
-        for r in results:
-            if r.status == SyncStatus.SUCCESS:
-                logger.info(f"✅ {r.task_key}: {r.rows_written} rows, {r.duration_ms:.2f}ms")
-            elif r.status == SyncStatus.PARTIAL:
-                logger.info(f"⚠️  {r.task_key}: {r.rows_written}/{r.symbols_requested} rows, {r.duration_ms:.2f}ms")
-            elif r.status == SyncStatus.FAILED:
-                logger.info(f"❌ {r.task_key}: {r.error or 'Failed'}")
-            elif r.status == SyncStatus.SKIPPED:
-                logger.info(f"⏭️  {r.task_key}: Skipped")
-        
-        # Update metrics
-        if _metrics.counter("sync_total"):
-            _metrics.counter("sync_total", labels=["status"]).labels(status="success").inc(summary.successful_tasks)
-            _metrics.counter("sync_total", labels=["status"]).labels(status="partial").inc(summary.partial_tasks)
-            _metrics.counter("sync_total", labels=["status"]).labels(status="failed").inc(summary.failed_tasks)
-        
-        if _metrics.histogram("sync_duration_ms"):
-            _metrics.histogram("sync_duration_ms").observe(summary.duration_ms)
-        
-        if _metrics.gauge("rows_written"):
-            _metrics.gauge("rows_written").set(summary.total_rows_written)
-        
-        # Send notifications for failures
-        if summary.failed_tasks > 0 and not args.dry_run:
-            await _notifier.send(
-                AlertSeverity.ERROR,
-                "Dashboard Sync Completed with Failures",
-                f"{summary.failed_tasks} tasks failed out of {summary.total_tasks}",
-                {
-                    "success": summary.successful_tasks,
-                    "partial": summary.partial_tasks,
-                    "failed": summary.failed_tasks,
-                    "rows_written": summary.total_rows_written,
-                    "duration_ms": f"{summary.duration_ms:.2f}",
-                }
-            )
-        
-        # Save report
-        if args.json_out:
-            try:
-                payload = {
-                    "summary": summary.to_dict(),
-                    "results": [r.to_dict() for r in results],
-                }
-                with open(args.json_out, "w", encoding="utf-8") as f:
-                    json.dump(payload, f, indent=2, ensure_ascii=False)
-                logger.info(f"Report saved to {args.json_out}")
-            except Exception as e:
-                logger.error(f"Failed to save report: {e}")
-        
-        if args.html_out:
-            try:
-                html = _generate_html_report(summary, results)
-                with open(args.html_out, "w", encoding="utf-8") as f:
-                    f.write(html)
-                logger.info(f"HTML report saved to {args.html_out}")
-            except Exception as e:
-                logger.error(f"Failed to save HTML report: {e}")
-        
-        # Exit code
-        if summary.failed_tasks > 0:
-            return 2
-        if summary.partial_tasks > 0 and args.fail_on_partial:
-            return 2
-        
-        return 0
-
-
-def _generate_html_report(summary: SyncSummary, results: List[SyncResult]) -> str:
-    """Generate HTML report"""
-    
+def _generate_html_report_sync(summary: SyncSummary, results: List[SyncResult]) -> str:
     html = f"""<!DOCTYPE html>
 <html>
 <head>
@@ -1762,19 +1156,11 @@ def _generate_html_report(summary: SyncSummary, results: List[SyncResult]) -> st
         h1 {{ color: #333; }}
         .summary {{ display: flex; gap: 20px; margin: 20px 0; flex-wrap: wrap; }}
         .card {{ background: #f5f5f5; padding: 20px; border-radius: 8px; flex: 1; min-width: 200px; }}
-        .success {{ color: #388e3c; }}
-        .partial {{ color: #f57c00; }}
-        .failed {{ color: #d32f2f; }}
-        .skipped {{ color: #757575; }}
+        .success {{ color: #388e3c; }} .partial {{ color: #f57c00; }} .failed {{ color: #d32f2f; }} .skipped {{ color: #757575; }}
         table {{ border-collapse: collapse; width: 100%; margin-top: 20px; }}
         th, td {{ padding: 10px; text-align: left; border-bottom: 1px solid #ddd; }}
         th {{ background-color: #f2f2f2; }}
-        .status-badge {{
-            padding: 4px 8px;
-            border-radius: 4px;
-            font-size: 12px;
-            font-weight: bold;
-        }}
+        .status-badge {{ padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: bold; }}
         .status-success {{ background-color: #c8e6c9; color: #2e7d32; }}
         .status-partial {{ background-color: #fff3e0; color: #e65100; }}
         .status-failed {{ background-color: #ffebee; color: #c62828; }}
@@ -1784,183 +1170,157 @@ def _generate_html_report(summary: SyncSummary, results: List[SyncResult]) -> st
 <body>
     <h1>Dashboard Sync Report v{SCRIPT_VERSION}</h1>
     <p>Run at: {summary.start_time.isoformat()}</p>
-    
     <div class="summary">
-        <div class="card">
-            <h3>Total Tasks</h3>
-            <p>{summary.total_tasks}</p>
-        </div>
-        <div class="card">
-            <h3 class="success">Successful</h3>
-            <p>{summary.successful_tasks}</p>
-        </div>
-        <div class="card">
-            <h3 class="partial">Partial</h3>
-            <p>{summary.partial_tasks}</p>
-        </div>
-        <div class="card">
-            <h3 class="failed">Failed</h3>
-            <p>{summary.failed_tasks}</p>
-        </div>
-        <div class="card">
-            <h3>Total Rows</h3>
-            <p>{summary.total_rows_written}</p>
-        </div>
-        <div class="card">
-            <h3>Duration</h3>
-            <p>{summary.duration_ms:.2f}ms</p>
-        </div>
+        <div class="card"><h3>Total Tasks</h3><p>{summary.total_tasks}</p></div>
+        <div class="card"><h3 class="success">Successful</h3><p>{summary.successful_tasks}</p></div>
+        <div class="card"><h3 class="partial">Partial</h3><p>{summary.partial_tasks}</p></div>
+        <div class="card"><h3 class="failed">Failed</h3><p>{summary.failed_tasks}</p></div>
+        <div class="card"><h3>Total Rows</h3><p>{summary.total_rows_written}</p></div>
+        <div class="card"><h3>Duration</h3><p>{summary.duration_ms:.2f}ms</p></div>
     </div>
-    
     <h2>Task Results</h2>
     <table>
-        <tr>
-            <th>Task</th>
-            <th>Status</th>
-            <th>Symbols</th>
-            <th>Rows Written</th>
-            <th>Gateway</th>
-            <th>Validation Score</th>
-            <th>Duration (ms)</th>
-        </tr>
+        <tr><th>Task</th><th>Status</th><th>Symbols</th><th>Rows Written</th><th>Gateway</th><th>Val Score</th><th>Duration (ms)</th></tr>
 """
-    
     for r in results:
-        status_class = {
-            SyncStatus.SUCCESS: "status-success",
-            SyncStatus.PARTIAL: "status-partial",
-            SyncStatus.FAILED: "status-failed",
-            SyncStatus.SKIPPED: "status-skipped",
-        }.get(r.status, "")
+        sc = {"success": "status-success", "partial": "status-partial", "failed": "status-failed", "skipped": "status-skipped"}.get(r.status.value, "")
+        html += f"<tr><td>{r.task_key}</td><td><span class=\"status-badge {sc}\">{r.status.value}</span></td><td>{r.symbols_requested}</td><td>{r.rows_written}</td><td>{r.gateway_used.value if r.gateway_used else '-'}</td><td>{r.validation_score:.1f}</td><td>{r.duration_ms:.2f}</td></tr>"
+        if r.anomalies_detected: html += f"<tr><td colspan=\"7\" style=\"color: #f57c00;\">⚠️ Anomalies: {', '.join(r.anomalies_detected)}</td></tr>"
+        if r.error: html += f"<tr><td colspan=\"7\" style=\"color: #d32f2f;\">❌ Error: {r.error}</td></tr>"
         
-        html += f"""
-        <tr>
-            <td>{r.task_key}</td>
-            <td><span class="status-badge {status_class}">{r.status.value}</span></td>
-            <td>{r.symbols_requested}</td>
-            <td>{r.rows_written}</td>
-            <td>{r.gateway_used.value if r.gateway_used else '-'}</td>
-            <td>{r.validation_score:.1f}</td>
-            <td>{r.duration_ms:.2f}</td>
-        </tr>
-"""
-        
-        if r.anomalies_detected:
-            html += f"""
-        <tr>
-            <td colspan="7" style="color: #f57c00;">
-                ⚠️ Anomalies: {', '.join(r.anomalies_detected)}
-            </td>
-        </tr>
-"""
-        
-        if r.error:
-            html += f"""
-        <tr>
-            <td colspan="7" style="color: #d32f2f;">
-                ❌ Error: {r.error}
-            </td>
-        </tr>
-"""
-    
-    html += """
-    </table>
-    
-    <h2>Gateway Statistics</h2>
-    <table>
-        <tr>
-            <th>Gateway</th>
-            <th>Attempts</th>
-            <th>Successes</th>
-            <th>Failures</th>
-        </tr>
-"""
-    
-    for gw, stats in summary.gateway_stats.items():
-        html += f"""
-        <tr>
-            <td>{gw}</td>
-            <td>{stats['attempts']}</td>
-            <td>{stats['successes']}</td>
-            <td>{stats['failures']}</td>
-        </tr>
-"""
-    
-    html += """
-    </table>
-</body>
-</html>
-"""
-    
+    html += "</table><h2>Gateway Statistics</h2><table><tr><th>Gateway</th><th>Attempts</th><th>Successes</th><th>Failures</th></tr>"
+    for gw, stats in summary.gateway_stats.items(): html += f"<tr><td>{gw}</td><td>{stats['attempts']}</td><td>{stats['successes']}</td><td>{stats['failures']}</td></tr>"
+    html += "</table></body></html>"
     return html
 
 
 # =============================================================================
-# Signal Handlers
+# Main Async Function
 # =============================================================================
 
-def _handle_interrupt(signum, frame):
-    """Handle interrupt signals"""
-    logger.info("Received interrupt, shutting down...")
-    sys.exit(130)
+async def main_async(args: argparse.Namespace) -> int:
+    start_time = time.time()
+    
+    sid = _get_spreadsheet_id(args.sheet_id)
+    if not sid: logger.error("No Spreadsheet ID found"); return 1
+    try: start_cell = _validate_a1_cell(args.start_cell)
+    except Exception as e: logger.error(f"Invalid start cell: {e}"); return 1
+    
+    max_symbols = max(0, min(2000, _safe_int(args.max_symbols, 0)))
+    parallel = _safe_bool(args.parallel, True)
+    parallel_workers = _safe_int(args.workers, 5)
+    validation_level = ValidationLevel(args.validation) if args.validation else ValidationLevel.BASIC
+    
+    all_tasks = _build_tasks(validation_level)
+    tasks = [t for t in all_tasks if _canon_key(t.key) in {_canon_key(k) for k in args.keys}] if args.keys else all_tasks
+    if not tasks: logger.warning("No tasks selected"); return 0
+    
+    if not args.no_preflight:
+        preflight_ok, _ = await _preflight_check(sid, _backend_base_url(), tasks)
+        if not preflight_ok and args.fail_on_preflight: logger.error("Preflight failed"); return 1
 
+    redis_client = None
+    if _REDIS_AVAILABLE and os.getenv("REDIS_URL"):
+        try: redis_client = await aioredis.from_url(os.getenv("REDIS_URL"), decode_responses=True)
+        except Exception as e: logger.warning(f"Redis unavailable: {e}")
+        
+    async with DistributedLock(redis_client, f"sync:{sid}:{','.join(sorted(t.key for t in tasks))}", ttl_seconds=300) as lock:
+        if not lock.acquired and not args.force: logger.error("Could not acquire lock"); return 1
+        
+        logger.info(f"Starting sync for {len(tasks)} dashboard(s)...")
+        anomaly_detector = AnomalyDetector() if validation_level == ValidationLevel.ML else None
+        if anomaly_detector: await anomaly_detector.initialize()
+        quality_scorer = QualityScorer() if validation_level != ValidationLevel.NONE else None
+        
+        if parallel and len(tasks) > 1:
+            semaphore = asyncio.Semaphore(parallel_workers)
+            async def run_with_semaphore(t):
+                async with semaphore:
+                    return await run_task(t, sid, start_cell, bool(args.clear), args.ksa_gw, max_symbols, anomaly_detector, quality_scorer, bool(args.dry_run))
+            results = [r if not isinstance(r, Exception) else SyncResult(tasks[i].key, SyncStatus.FAILED, _utc_now(), _utc_now(), error=str(r)) for i, r in enumerate(await asyncio.gather(*[run_with_semaphore(t) for t in tasks], return_exceptions=True))]
+        else:
+            results = []
+            for t in tasks:
+                results.append(await run_task(t, sid, start_cell, bool(args.clear), args.ksa_gw, max_symbols, anomaly_detector, quality_scorer, bool(args.dry_run)))
+                if not args.dry_run and len(tasks) > 1: await asyncio.sleep(1.5)
+                
+        summary = _generate_summary(results)
+        
+        logger.info("=" * 60)
+        logger.info(f"SYNC COMPLETE - {summary.successful_tasks} success, {summary.partial_tasks} partial, {summary.failed_tasks} failed")
+        logger.info(f"Symbols: {summary.total_symbols} | Rows Written: {summary.total_rows_written} | Duration: {summary.duration_ms:.2f}ms")
+        logger.info("=" * 60)
+        
+        for r in results:
+            if r.status == SyncStatus.SUCCESS: logger.info(f"✅ {r.task_key}: {r.rows_written} rows, {r.duration_ms:.2f}ms")
+            elif r.status == SyncStatus.PARTIAL: logger.info(f"⚠️  {r.task_key}: {r.rows_written}/{r.symbols_requested} rows, {r.duration_ms:.2f}ms")
+            elif r.status == SyncStatus.FAILED: logger.info(f"❌ {r.task_key}: {r.error or 'Failed'}")
+            elif r.status == SyncStatus.SKIPPED: logger.info(f"⏭️  {r.task_key}: Skipped")
+            
+        if summary.failed_tasks > 0 and not args.dry_run:
+            await _notifier.send(AlertSeverity.ERROR, "Dashboard Sync Failed", f"{summary.failed_tasks} tasks failed out of {summary.total_tasks}", {"success": summary.successful_tasks, "failed": summary.failed_tasks})
+            
+        # File IO offloaded to Executor
+        loop = asyncio.get_running_loop()
+        if args.json_out:
+            def _write_json():
+                with open(args.json_out, "w", encoding="utf-8") as f:
+                    f.write(json_dumps({"summary": summary.to_dict(), "results": [r.to_dict() for r in results]}, indent=2))
+            await loop.run_in_executor(_CPU_EXECUTOR, _write_json)
+            logger.info(f"Report saved to {args.json_out}")
+            
+        if args.html_out:
+            def _write_html():
+                with open(args.html_out, "w", encoding="utf-8") as f:
+                    f.write(_generate_html_report_sync(summary, results))
+            await loop.run_in_executor(_CPU_EXECUTOR, _write_html)
+            logger.info(f"HTML report saved to {args.html_out}")
+            
+        # Cleanup
+        await _http_client.close()
+        if redis_client: await redis_client.close()
+        _CPU_EXECUTOR.shutdown(wait=False)
+        
+        if summary.failed_tasks > 0: return 2
+        if summary.partial_tasks > 0 and args.fail_on_partial: return 2
+        return 0
+
+def _handle_interrupt(signum, frame):
+    logger.info("Received interrupt, shutting down gracefully...")
+    _CPU_EXECUTOR.shutdown(wait=False)
+    sys.exit(130)
 
 signal.signal(signal.SIGINT, _handle_interrupt)
 signal.signal(signal.SIGTERM, _handle_interrupt)
 
-
-# =============================================================================
-# Main
-# =============================================================================
-
 def main() -> int:
-    """Main entry point"""
-    parser = argparse.ArgumentParser(description="Tadawul Enterprise Dashboard Synchronizer")
-    
-    # Core options
+    parser = argparse.ArgumentParser(description="Tadawul Enterprise Dashboard Synchronizer v6.0.0")
     parser.add_argument("--sheet-id", help="Target Spreadsheet ID")
     parser.add_argument("--keys", nargs="*", help="Specific page keys to sync")
     parser.add_argument("--clear", action="store_true", help="Clear data rows before writing")
-    parser.add_argument("--ksa-gw", default="enriched", choices=["enriched", "argaam", "auto"],
-                       help="Gateway strategy for KSA tab")
+    parser.add_argument("--ksa-gw", default="enriched", choices=["enriched", "argaam", "auto"], help="Gateway strategy for KSA tab")
     parser.add_argument("--start-cell", default="A5", help="Top-left cell for data write")
-    
-    # Performance
     parser.add_argument("--parallel", type=int, default=1, help="Enable parallel processing")
     parser.add_argument("--workers", type=int, default=5, help="Number of parallel workers")
     parser.add_argument("--retries", default="1", help="Retries per page")
-    parser.add_argument("--backoff-base", default="1.2", help="Backoff base seconds")
-    parser.add_argument("--backoff-cap", default="8.0", help="Max backoff seconds")
     parser.add_argument("--max-symbols", default="500", help="Cap symbols per page")
-    
-    # Validation
-    parser.add_argument("--validation", choices=["none", "basic", "strict", "ml"], default="basic",
-                       help="Data validation level")
-    
-    # Safety
+    parser.add_argument("--validation", choices=["none", "basic", "strict", "ml"], default="basic", help="Data validation level")
     parser.add_argument("--no-preflight", action="store_true", help="Skip connectivity checks")
     parser.add_argument("--fail-on-preflight", action="store_true", help="Fail on preflight errors")
     parser.add_argument("--fail-on-partial", action="store_true", help="Fail if any task is partial")
     parser.add_argument("--force", action="store_true", help="Force run even if lock exists")
-    
-    # Testing
     parser.add_argument("--dry-run", action="store_true", help="Only read symbols, don't write")
-    
-    # Output
     parser.add_argument("--json-out", help="Save JSON report to file")
     parser.add_argument("--html-out", help="Save HTML report to file")
     
-    args = parser.parse_args()
+    # We parse the arguments gracefully. Notice we remove arbitrary un-passed flags safely via argparse defaults.
+    args, _ = parser.parse_known_args()
     
     try:
         return asyncio.run(main_async(args))
-    except KeyboardInterrupt:
-        logger.info("Interrupted by user")
-        return 130
     except Exception as e:
         logger.exception(f"Unhandled exception: {e}")
         return 1
-
 
 if __name__ == "__main__":
     sys.exit(main())
