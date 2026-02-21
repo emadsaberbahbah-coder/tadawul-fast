@@ -21,7 +21,6 @@
 # └─────────────────────────────────────────────────────────────┘
 #
 # Core Capabilities
-# • Jemalloc / TCMalloc memory allocator injection
 # • Ultra-fast dependencies resolution using Astral 'uv'
 # • Zero-downtime deployments (blue-green native)
 # • Distributed tracing and Prometheus metrics sidecars
@@ -76,29 +75,20 @@ services:
     pullRequestPreviewsEnabled: true
     
     env: python
-    pythonVersion: 3.11.9
+    pythonVersion: 3.11  # Using 3.11 instead of 3.11.9 to utilize Render's pre-compiled binaries
     
     buildCommand: |
-      # 1. Install system dependencies & Jemalloc (Memory Optimization)
-      apt-get update && apt-get install -y --no-install-recommends \
-        build-essential \
-        libffi-dev \
-        libssl-dev \
-        curl \
-        libjemalloc2 \
-        && rm -rf /var/lib/apt/lists/*
-      
-      # 2. Install 'uv' for ultra-fast dependency resolution
+      # 1. Install 'uv' for ultra-fast dependency resolution
       curl -LsSf https://astral.sh/uv/install.sh | sh
       export PATH="$HOME/.cargo/bin:$PATH"
       
-      # 3. Install dependencies
+      # 2. Install dependencies
       uv pip install --system --no-cache -r requirements.txt
       
-      # 4. Install Optional High-Performance Packages
+      # 3. Install Optional High-Performance Packages
       uv pip install --system --no-cache uvloop httptools orjson opentelemetry-api opentelemetry-sdk prometheus-client
       
-      # 5. Compile Python bytecode for zero-overhead startup
+      # 4. Compile Python bytecode for zero-overhead startup
       python -m compileall -q -f \
         -x "(tests|examples|docs|venv|\.git|__pycache__)" \
         .
@@ -107,10 +97,6 @@ services:
     
     startCommand: |
       chmod +x scripts/*.sh
-      
-      # Inject Jemalloc for High-Performance Memory Allocation
-      export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
-      export MALLOC_CONF="background_thread:true,metadata_thp:auto,dirty_decay_ms:10000,muzzy_decay_ms:10000"
       
       # Start the application using the enterprise launcher
       exec scripts/start_web.sh
@@ -160,7 +146,7 @@ services:
     plan: starter
     branch: main
     autoDeploy: true
-    pythonVersion: 3.11.9
+    pythonVersion: 3.11
     
     buildCommand: |
       curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -169,7 +155,6 @@ services:
       python -m compileall -q main.py core scripts
     
     startCommand: |
-      export LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2
       python scripts/worker.py
     
     scaling:
