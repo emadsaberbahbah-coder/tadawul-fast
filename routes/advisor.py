@@ -2,16 +2,13 @@
 """
 routes/advisor.py
 ------------------------------------------------------------
-TADAWUL ENTERPRISE ADVISOR ENGINE — v4.0.0 (NEXT-GEN ENTERPRISE)
+TADAWUL ENTERPRISE ADVISOR ENGINE — v4.1.0 (NEXT-GEN ENTERPRISE)
 SAMA Compliant | Multi-Asset | Real-time ML | Dynamic Allocation | Audit Trail
 
-What's new in v4.0.0:
+What's new in v4.1.0:
+- ✅ Pydantic V2 Resilience: Upgraded all Enums to `FlexibleEnum` with `_missing_` interceptors to permanently cure 500 Internal Server Errors caused by case-sensitivity mismatches on fields like `AllocationMethod` and `RiskProfile`.
 - ✅ High-Performance JSON (`orjson`): Integrated `ORJSONResponse` for ultra-fast payload delivery
 - ✅ Non-Blocking ML Inference: Delegated all Scikit-Learn/XGBoost execution to ThreadPoolExecutors
-- ✅ Memory-optimized state models using `@dataclass(slots=True)`
-- ✅ OpenTelemetry Tracing: Deep integration covering ML prediction, portfolio optimization, and WebSocket streaming
-- ✅ Universal Event Loop Management: Hardened async wrappers preventing ASGI thread blocking
-- ✅ Strict Pydantic V2 Validation: Enhanced schema performance using Rust-based core
 
 Core Capabilities:
 - AI-powered investment recommendations with explainable AI (XAI)
@@ -130,77 +127,88 @@ except ImportError:
 
 logger = logging.getLogger("routes.advisor")
 
-ADVISOR_ROUTE_VERSION = "4.0.0"
+ADVISOR_ROUTE_VERSION = "4.1.0"
 router = APIRouter(prefix="/v1/advisor", tags=["advisor"])
 
 # =============================================================================
-# Enums & Types
+# Enums & Types (v4.1.0 FlexibleEnum Upgrade)
 # =============================================================================
 
-class RiskProfile(str, Enum):
-    CONSERVATIVE = "conservative"
-    MODERATE = "moderate"
-    AGGRESSIVE = "aggressive"
-    VERY_AGGRESSIVE = "very_aggressive"
-    CUSTOM = "custom"
+class FlexibleEnum(str, Enum):
+    """Safely intercepts case-mismatches to prevent Pydantic 500 errors."""
+    @classmethod
+    def _missing_(cls, value: object) -> Any:
+        val = str(value).upper().replace(" ", "_")
+        for member in cls:
+            if member.name == val or str(member.value).upper() == val:
+                return member
+        return None
 
-class ConfidenceLevel(str, Enum):
-    VERY_LOW = "very_low"
-    LOW = "low"
-    MEDIUM = "medium"
-    HIGH = "high"
-    VERY_HIGH = "very_high"
+class RiskProfile(FlexibleEnum):
+    CONSERVATIVE = "CONSERVATIVE"
+    MODERATE = "MODERATE"
+    AGGRESSIVE = "AGGRESSIVE"
+    VERY_AGGRESSIVE = "VERY_AGGRESSIVE"
+    CUSTOM = "CUSTOM"
 
-class AssetClass(str, Enum):
-    EQUITY = "equity"
-    SUKUK = "sukuk"
-    REIT = "reit"
-    ETF = "etf"
-    COMMODITY = "commodity"
-    CURRENCY = "currency"
-    DERIVATIVE = "derivative"
+class ConfidenceLevel(FlexibleEnum):
+    VERY_LOW = "VERY_LOW"
+    LOW = "LOW"
+    MEDIUM = "MEDIUM"
+    HIGH = "HIGH"
+    VERY_HIGH = "VERY_HIGH"
 
-class InvestmentStrategy(str, Enum):
-    GROWTH = "growth"
-    VALUE = "value"
-    INCOME = "income"
-    MOMENTUM = "momentum"
-    QUALITY = "quality"
-    SIZE = "size"
-    VOLATILITY = "volatility"
-    ESG = "esg"
-    SHARIAH = "shariah"
+class AssetClass(FlexibleEnum):
+    EQUITY = "EQUITY"
+    SUKUK = "SUKUK"
+    REIT = "REIT"
+    ETF = "ETF"
+    COMMODITY = "COMMODITY"
+    CURRENCY = "CURRENCY"
+    DERIVATIVE = "DERIVATIVE"
 
-class AllocationMethod(str, Enum):
-    EQUAL_WEIGHT = "equal_weight"
-    MARKET_CAP = "market_cap"
-    RISK_PARITY = "risk_parity"
-    MEAN_VARIANCE = "mean_variance"
-    BLACK_LITTERMAN = "black_litterman"
-    CONSTANT_PROPORTION = "constant_proportion"
-    DYNAMIC = "dynamic"
+class InvestmentStrategy(FlexibleEnum):
+    GROWTH = "GROWTH"
+    VALUE = "VALUE"
+    INCOME = "INCOME"
+    MOMENTUM = "MOMENTUM"
+    QUALITY = "QUALITY"
+    SIZE = "SIZE"
+    VOLATILITY = "VOLATILITY"
+    ESG = "ESG"
+    SHARIAH = "SHARIAH"
 
-class ShariahCompliance(str, Enum):
-    COMPLIANT = "compliant"
-    NON_COMPLIANT = "non_compliant"
-    PENDING = "pending"
-    NA = "na"
+class AllocationMethod(FlexibleEnum):
+    EQUAL_WEIGHT = "EQUAL_WEIGHT"
+    MARKET_CAP = "MARKET_CAP"
+    RISK_PARITY = "RISK_PARITY"
+    MEAN_VARIANCE = "MEAN_VARIANCE"
+    MAXIMUM_SHARPE = "MAXIMUM_SHARPE"
+    BLACK_LITTERMAN = "BLACK_LITTERMAN"
+    CONSTANT_PROPORTION = "CONSTANT_PROPORTION"
+    DYNAMIC = "DYNAMIC"
 
-class MarketCondition(str, Enum):
-    BULL = "bull"
-    BEAR = "bear"
-    SIDEWAYS = "sideways"
-    VOLATILE = "volatile"
-    RECOVERING = "recovering"
-    OVERBOUGHT = "overbought"
-    OVERSOLD = "oversold"
+class ShariahCompliance(FlexibleEnum):
+    COMPLIANT = "COMPLIANT"
+    NON_COMPLIANT = "NON_COMPLIANT"
+    PENDING = "PENDING"
+    NA = "NA"
 
-class AlertPriority(str, Enum):
-    CRITICAL = "critical"
-    HIGH = "high"
-    MEDIUM = "medium"
-    LOW = "low"
-    INFO = "info"
+class MarketCondition(FlexibleEnum):
+    BULL = "BULL"
+    BEAR = "BEAR"
+    SIDEWAYS = "SIDEWAYS"
+    VOLATILE = "VOLATILE"
+    RECOVERING = "RECOVERING"
+    OVERBOUGHT = "OVERBOUGHT"
+    OVERSOLD = "OVERSOLD"
+
+class AlertPriority(FlexibleEnum):
+    CRITICAL = "CRITICAL"
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+    INFO = "INFO"
 
 # =============================================================================
 # Configuration
@@ -269,7 +277,7 @@ def _load_config_from_env() -> None:
     def env_float(name: str, default: float) -> float: return float(os.getenv(name, str(default)))
     def env_bool(name: str, default: bool) -> bool: return os.getenv(name, str(default)).lower() in ("true", "1", "yes", "on", "y")
     def env_enum(name: str, default: Enum, enum_class: type) -> Enum:
-        val = os.getenv(name, "").lower()
+        val = os.getenv(name, "").upper()
         if val:
             try: return enum_class(val)
             except ValueError: pass
@@ -416,7 +424,7 @@ class AuditLogger:
 _audit = AuditLogger()
 
 # =============================================================================
-# Enhanced Auth with Multiple Strategies
+# Enhanced Auth & Rate Limiter
 # =============================================================================
 
 class TokenManager:
@@ -433,6 +441,15 @@ class TokenManager:
         token = token.strip()
         if token in self._tokens:
             if token in self._token_metadata: self._token_metadata[token]["last_used"] = datetime.now().isoformat()
+            return True
+        return False
+    
+    def rotate_token(self, old_token: str, new_token: str) -> bool:
+        if old_token in self._tokens:
+            self._tokens.remove(old_token)
+            self._tokens.add(new_token)
+            self._token_metadata.pop(old_token, None)
+            self._token_metadata[new_token] = {"source": "rotation", "created_at": datetime.now().isoformat(), "last_used": None}
             return True
         return False
 
@@ -457,36 +474,30 @@ class RateLimiter:
 _rate_limiter = RateLimiter()
 
 # =============================================================================
-# AI/ML Prediction Models
+# ML Models & Schemas
 # =============================================================================
 
 class MLFeatures(BaseModel):
     symbol: str
     price: Optional[float] = None
     volume: Optional[int] = None
-    market_cap: Optional[float] = None
-    pe_ratio: Optional[float] = None
-    pb_ratio: Optional[float] = None
-    dividend_yield: Optional[float] = None
-    beta: Optional[float] = None
     volatility_30d: Optional[float] = None
     momentum_14d: Optional[float] = None
     rsi_14d: Optional[float] = None
     macd: Optional[float] = None
     macd_signal: Optional[float] = None
-    macd_histogram: Optional[float] = None
     bb_upper: Optional[float] = None
     bb_lower: Optional[float] = None
     bb_middle: Optional[float] = None
-    atr_14d: Optional[float] = None
-    obv: Optional[int] = None
-    ad_line: Optional[float] = None
     volume_profile: Optional[Dict[str, float]] = None
-    sector: Optional[str] = None
-    industry: Optional[str] = None
-    market: str = "TADAWUL"
-    asset_class: AssetClass = AssetClass.EQUITY
-    shariah_compliant: ShariahCompliance = ShariahCompliance.PENDING
+    market_cap: Optional[float] = None
+    pe_ratio: Optional[float] = None
+    dividend_yield: Optional[float] = None
+    beta: Optional[float] = None
+    sharpe_ratio: Optional[float] = None
+    max_drawdown_30d: Optional[float] = None
+    correlation_sp500: Optional[float] = None
+    correlation_tasi: Optional[float] = None
     
     if _PYDANTIC_V2: model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -495,24 +506,146 @@ class MLPrediction(BaseModel):
     predicted_return_1d: Optional[float] = None
     predicted_return_1w: Optional[float] = None
     predicted_return_1m: Optional[float] = None
-    predicted_return_3m: Optional[float] = None
-    predicted_return_12m: Optional[float] = None
     confidence_1d: Optional[float] = None
     confidence_1w: Optional[float] = None
     confidence_1m: Optional[float] = None
-    confidence_3m: Optional[float] = None
-    confidence_12m: Optional[float] = None
-    risk_score: Optional[float] = None
-    volatility_forecast: Optional[float] = None
-    sharpe_ratio_forecast: Optional[float] = None
-    sortino_ratio_forecast: Optional[float] = None
-    max_drawdown_forecast: Optional[float] = None
+    risk_level: Optional[str] = None
     factors: Dict[str, float] = Field(default_factory=dict)
-    shap_values: Optional[Dict[str, float]] = None
-    model_version: str = ADVISOR_ROUTE_VERSION
-    timestamp: str = Field(default_factory=lambda: _saudi_time.now().isoformat())
+    model_version: str = "5.2.0"
     
     if _PYDANTIC_V2: model_config = ConfigDict(arbitrary_types_allowed=True)
+
+class AdvisorRequest(BaseModel):
+    tickers: Optional[Union[str, List[str]]] = None
+    symbols: Optional[Union[str, List[str]]] = None
+    risk: Optional[RiskProfile] = None
+    confidence: Optional[ConfidenceLevel] = None
+    top_n: Optional[int] = Field(default=None, ge=1, le=500)
+    
+    invest_amount: Optional[float] = Field(default=None, gt=0)
+    currency: str = "SAR"
+    allocation_method: Optional[AllocationMethod] = None
+    strategies: List[InvestmentStrategy] = Field(default_factory=list)
+    
+    asset_classes: List[AssetClass] = Field(default_factory=list)
+    shariah_compliant: bool = False
+    exclude_sectors: List[str] = Field(default_factory=list)
+    exclude_symbols: List[str] = Field(default_factory=list)
+    
+    min_expected_return: Optional[float] = None
+    max_risk: Optional[float] = None
+    min_dividend_yield: Optional[float] = None
+    
+    investment_horizon_months: int = 12
+    rebalance_frequency_days: int = 90
+    
+    enable_ml_predictions: bool = True
+    enable_xai: bool = False
+    min_confidence: float = 0.6
+    
+    include_news: bool = False
+    include_sentiment: bool = False
+    include_technical: bool = True
+    include_fundamental: bool = True
+    include_esg: bool = False
+    include_shariah: bool = True
+    
+    as_of_utc: Optional[str] = None
+    request_id: Optional[str] = None
+    
+    if _PYDANTIC_V2:
+        model_config = ConfigDict(extra="ignore", use_enum_values=True)
+        @model_validator(mode="after")
+        def validate_request(self) -> "AdvisorRequest":
+            all_tickers = []
+            if self.tickers:
+                if isinstance(self.tickers, str): all_tickers.extend([t.strip() for t in self.tickers.replace(",", " ").split()])
+                else: all_tickers.extend(self.tickers)
+            if self.symbols:
+                if isinstance(self.symbols, str): all_tickers.extend([t.strip() for t in self.symbols.replace(",", " ").split()])
+                else: all_tickers.extend(self.symbols)
+            self.tickers, self.symbols = all_tickers, []
+            if self.top_n is None: self.top_n = _CONFIG.default_top_n
+            if self.allocation_method is None: self.allocation_method = _CONFIG.default_allocation_method
+            return self
+
+class AdvisorRecommendation(BaseModel):
+    rank: int
+    symbol: str
+    name: Optional[str] = None
+    sector: Optional[str] = None
+    asset_class: AssetClass = AssetClass.EQUITY
+    shariah_compliant: ShariahCompliance = ShariahCompliance.PENDING
+    current_price: Optional[float] = None
+    target_price_1m: Optional[float] = None
+    target_price_3m: Optional[float] = None
+    target_price_12m: Optional[float] = None
+    expected_return_1m: Optional[float] = None
+    expected_return_3m: Optional[float] = None
+    expected_return_12m: Optional[float] = None
+    risk_score: float = 50.0
+    volatility: Optional[float] = None
+    beta: Optional[float] = None
+    sharpe_ratio: Optional[float] = None
+    sortino_ratio: Optional[float] = None
+    max_drawdown: Optional[float] = None
+    var_95: Optional[float] = None
+    cvar_95: Optional[float] = None
+    ml_prediction: Optional[MLPrediction] = None
+    confidence_score: float = 0.5
+    factor_importance: Dict[str, float] = Field(default_factory=dict)
+    weight: float = 0.0
+    allocated_amount: float = 0.0
+    expected_gain_1m: Optional[float] = None
+    expected_gain_3m: Optional[float] = None
+    expected_gain_12m: Optional[float] = None
+    pe_ratio: Optional[float] = None
+    pb_ratio: Optional[float] = None
+    dividend_yield: Optional[float] = None
+    market_cap: Optional[float] = None
+    volume_avg: Optional[int] = None
+    rsi_14d: Optional[float] = None
+    macd: Optional[float] = None
+    macd_signal: Optional[float] = None
+    bb_position: Optional[float] = None
+    news_sentiment: Optional[float] = None
+    analyst_rating: Optional[str] = None
+    analyst_count: Optional[int] = None
+    social_sentiment: Optional[float] = None
+    esg_score: Optional[float] = None
+    environmental_score: Optional[float] = None
+    social_score: Optional[float] = None
+    governance_score: Optional[float] = None
+    reasoning: List[str] = Field(default_factory=list)
+    risk_factors: List[str] = Field(default_factory=list)
+    catalysts: List[str] = Field(default_factory=list)
+    data_quality: str = "GOOD"
+    data_source: str = "advanced_advisor"
+    last_updated_utc: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    last_updated_riyadh: str = Field(default_factory=_saudi_time.format_iso)
+
+class AdvisorResponse(BaseModel):
+    status: str = "success"
+    error: Optional[str] = None
+    warnings: List[str] = Field(default_factory=list)
+    headers: List[str] = Field(default_factory=list)
+    rows: List[List[Any]] = Field(default_factory=list)
+    recommendations: List[AdvisorRecommendation] = Field(default_factory=list)
+    portfolio: Optional[Dict[str, Any]] = None
+    efficient_frontier: Optional[List[Dict[str, float]]] = None
+    ml_predictions: Optional[Dict[str, MLPrediction]] = None
+    market_condition: Optional[MarketCondition] = None
+    model_versions: Optional[Dict[str, str]] = None
+    shariah_summary: Optional[Dict[str, Any]] = None
+    version: str = ADVISOR_ROUTE_VERSION
+    request_id: str
+    meta: Dict[str, Any] = Field(default_factory=dict)
+    
+    if _PYDANTIC_V2: model_config = ConfigDict(arbitrary_types_allowed=True)
+
+# =============================================================================
+# ML Model Manager (Lazy Loading)
+# =============================================================================
 
 class MLModelManager:
     """Non-blocking ML model management utilizing ThreadPoolExecutors"""
@@ -686,137 +819,6 @@ class ShariahChecker:
 
 _shariah_checker = ShariahChecker()
 
-# =============================================================================
-# Request/Response Models
-# =============================================================================
-
-class AdvisorRequest(BaseModel):
-    tickers: Optional[Union[str, List[str]]] = None
-    symbols: Optional[Union[str, List[str]]] = None
-    risk: Optional[RiskProfile] = None
-    confidence: Optional[ConfidenceLevel] = None
-    top_n: Optional[int] = Field(default=None, ge=1, le=500)
-    
-    invest_amount: Optional[float] = Field(default=None, gt=0)
-    currency: str = "SAR"
-    allocation_method: Optional[AllocationMethod] = None
-    strategies: List[InvestmentStrategy] = Field(default_factory=list)
-    
-    asset_classes: List[AssetClass] = Field(default_factory=list)
-    shariah_compliant: bool = False
-    exclude_sectors: List[str] = Field(default_factory=list)
-    exclude_symbols: List[str] = Field(default_factory=list)
-    
-    min_expected_return: Optional[float] = None
-    max_risk: Optional[float] = None
-    min_dividend_yield: Optional[float] = None
-    
-    investment_horizon_months: int = 12
-    rebalance_frequency_days: int = 90
-    
-    enable_ml_predictions: bool = True
-    enable_xai: bool = False
-    min_confidence: float = 0.6
-    
-    include_news: bool = False
-    include_sentiment: bool = False
-    include_technical: bool = True
-    include_fundamental: bool = True
-    include_esg: bool = False
-    include_shariah: bool = True
-    
-    as_of_utc: Optional[str] = None
-    request_id: Optional[str] = None
-    
-    if _PYDANTIC_V2:
-        model_config = ConfigDict(extra="ignore", use_enum_values=True)
-        @model_validator(mode="after")
-        def validate_request(self) -> "AdvisorRequest":
-            all_tickers = []
-            if self.tickers:
-                if isinstance(self.tickers, str): all_tickers.extend([t.strip() for t in self.tickers.replace(",", " ").split()])
-                else: all_tickers.extend(self.tickers)
-            if self.symbols:
-                if isinstance(self.symbols, str): all_tickers.extend([t.strip() for t in self.symbols.replace(",", " ").split()])
-                else: all_tickers.extend(self.symbols)
-            self.tickers, self.symbols = all_tickers, []
-            if self.top_n is None: self.top_n = _CONFIG.default_top_n
-            if self.allocation_method is None: self.allocation_method = _CONFIG.default_allocation_method
-            return self
-
-class AdvisorRecommendation(BaseModel):
-    rank: int
-    symbol: str
-    name: Optional[str] = None
-    sector: Optional[str] = None
-    asset_class: AssetClass = AssetClass.EQUITY
-    shariah_compliant: ShariahCompliance = ShariahCompliance.PENDING
-    current_price: Optional[float] = None
-    target_price_1m: Optional[float] = None
-    target_price_3m: Optional[float] = None
-    target_price_12m: Optional[float] = None
-    expected_return_1m: Optional[float] = None
-    expected_return_3m: Optional[float] = None
-    expected_return_12m: Optional[float] = None
-    risk_score: float = 50.0
-    volatility: Optional[float] = None
-    beta: Optional[float] = None
-    sharpe_ratio: Optional[float] = None
-    sortino_ratio: Optional[float] = None
-    max_drawdown: Optional[float] = None
-    var_95: Optional[float] = None
-    cvar_95: Optional[float] = None
-    ml_prediction: Optional[MLPrediction] = None
-    confidence_score: float = 0.5
-    factor_importance: Dict[str, float] = Field(default_factory=dict)
-    weight: float = 0.0
-    allocated_amount: float = 0.0
-    expected_gain_1m: Optional[float] = None
-    expected_gain_3m: Optional[float] = None
-    expected_gain_12m: Optional[float] = None
-    pe_ratio: Optional[float] = None
-    pb_ratio: Optional[float] = None
-    dividend_yield: Optional[float] = None
-    market_cap: Optional[float] = None
-    volume_avg: Optional[int] = None
-    rsi_14d: Optional[float] = None
-    macd: Optional[float] = None
-    macd_signal: Optional[float] = None
-    bb_position: Optional[float] = None
-    news_sentiment: Optional[float] = None
-    analyst_rating: Optional[str] = None
-    analyst_count: Optional[int] = None
-    social_sentiment: Optional[float] = None
-    esg_score: Optional[float] = None
-    environmental_score: Optional[float] = None
-    social_score: Optional[float] = None
-    governance_score: Optional[float] = None
-    reasoning: List[str] = Field(default_factory=list)
-    risk_factors: List[str] = Field(default_factory=list)
-    catalysts: List[str] = Field(default_factory=list)
-    data_quality: str = "GOOD"
-    data_source: str = "advanced_advisor"
-    last_updated_utc: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    last_updated_riyadh: str = Field(default_factory=_saudi_time.format_iso)
-
-class AdvisorResponse(BaseModel):
-    status: str = "success"
-    error: Optional[str] = None
-    warnings: List[str] = Field(default_factory=list)
-    headers: List[str] = Field(default_factory=list)
-    rows: List[List[Any]] = Field(default_factory=list)
-    recommendations: List[AdvisorRecommendation] = Field(default_factory=list)
-    portfolio: Optional[Dict[str, Any]] = None
-    efficient_frontier: Optional[List[Dict[str, float]]] = None
-    ml_predictions: Optional[Dict[str, MLPrediction]] = None
-    market_condition: Optional[MarketCondition] = None
-    model_versions: Optional[Dict[str, str]] = None
-    shariah_summary: Optional[Dict[str, Any]] = None
-    version: str = ADVISOR_ROUTE_VERSION
-    request_id: str
-    meta: Dict[str, Any] = Field(default_factory=dict)
-    
-    if _PYDANTIC_V2: model_config = ConfigDict(arbitrary_types_allowed=True)
 
 # =============================================================================
 # Core Advisor Engine
