@@ -2,16 +2,16 @@
 """
 core/schemas.py
 ===========================================================
-ADVANCED CANONICAL SCHEMAS + HEADERS — v5.0.0 (NEXT-GEN ENTERPRISE)
+ADVANCED CANONICAL SCHEMAS + HEADERS — v5.1.0 (NEXT-GEN ENTERPRISE)
 ===========================================================
 
-What's new in v5.0.0:
-- ✅ Pydantic V2 Native Support with Rust-based validation (graceful V1 fallback)
+What's new in v5.1.0:
+- ✅ Pydantic V2 Boot Fix: Eliminated wildcard field validators (`*_percent`) causing PydanticUserError on app startup.
+- ✅ Global Percentage Parsing: Replaced wildcards with an intelligent `@model_validator` that safely coerces any string ending in `%` to a float.
 - ✅ High-Performance JSON (orjson) integrated into model serialization
 - ✅ ML & Predictive Fields: Mapped VWAP, SuperTrend, Market Regime, Price Anomalies
 - ✅ Advanced Header Normalization: LRU Cached multi-lingual (Arabic/English/French) fuzzy matching
 - ✅ Thread-safe operations with immutable defaults and zero-copy references
-- ✅ Batch processing models upgraded with tracking metadata
 
 Key Features:
 - Complete UnifiedQuote model with 130+ fields for comprehensive analysis
@@ -64,7 +64,7 @@ except ImportError:
     _PYDANTIC_V2 = False
 
 # Version
-SCHEMAS_VERSION = "5.0.0"
+SCHEMAS_VERSION = "5.1.0"
 
 # Thread-safe caches
 _CACHE_LOCK = threading.RLock()
@@ -550,6 +550,7 @@ class UnifiedQuote(BaseModel):
     value_score: Optional[float] = Field(None, description="Value score (0-100)", ge=0, le=100)
     quality_score: Optional[float] = Field(None, description="Quality score (0-100)", ge=0, le=100)
     growth_score: Optional[float] = Field(None, description="Growth score (0-100)", ge=0, le=100)
+    momentum_score: Optional[float] = Field(None, description="Momentum score (0-100)", ge=0, le=100)
     sentiment_score: Optional[float] = Field(None, description="Sentiment score (0-100)", ge=0, le=100)
     opportunity_score: Optional[float] = Field(None, description="Opportunity score (0-100)", ge=0, le=100)
     overall_score: Optional[float] = Field(None, description="Overall composite score", ge=0, le=100)
@@ -634,6 +635,16 @@ class UnifiedQuote(BaseModel):
             validate_default=False,
             arbitrary_types_allowed=True,
         )
+
+        @model_validator(mode="before")
+        @classmethod
+        def pre_validate_model_data(cls, data: Any) -> Any:
+            if isinstance(data, dict):
+                # Clean up any string values ending in '%' for float fields safely
+                for k, v in data.items():
+                    if isinstance(v, str) and v.endswith('%'):
+                        data[k] = safe_float(v)
+            return data
         
         @field_validator("symbol", mode="before")
         @classmethod
@@ -657,16 +668,11 @@ class UnifiedQuote(BaseModel):
             }
             return currency_map.get(s, None)
         
-        @field_validator("week_52_position", "week_52_position_percent", mode="before")
+        @field_validator("week_52_position", "week_52_position_percent", mode="before", check_fields=False)
         @classmethod
         def validate_52w_position(cls, v: Any) -> Optional[float]:
             f = safe_float(v)
             return bound_value(f, 0, 100) if f is not None else None
-        
-        @field_validator("*_percent", "*_yield", mode="before")
-        @classmethod
-        def validate_percent(cls, v: Any) -> Optional[float]:
-            return safe_float(v)
         
         @field_validator("recommendation", mode="before")
         @classmethod
@@ -674,11 +680,13 @@ class UnifiedQuote(BaseModel):
             if v is None: return None
             if isinstance(v, Recommendation): return v
             s = safe_str(v).upper()
-            if s in ("BUY", "STRONG BUY", "ACCUMULATE"): return Recommendation.BUY
+            if s in ("STRONG BUY", "STRONG_BUY"): return Recommendation.STRONG_BUY
+            if s in ("BUY", "ACCUMULATE"): return Recommendation.BUY
             if s in ("HOLD", "NEUTRAL", "MARKET PERFORM"): return Recommendation.HOLD
             if s in ("REDUCE", "TRIM", "TAKE PROFIT"): return Recommendation.REDUCE
             if s in ("SELL", "STRONG SELL", "EXIT"): return Recommendation.SELL
-            return None
+            if s in ("STRONG SELL", "STRONG_SELL"): return Recommendation.STRONG_SELL
+            return Recommendation.HOLD
         
         @model_validator(mode="after")
         def post_validation(self) -> "UnifiedQuote":
@@ -852,7 +860,7 @@ VN_EARNINGS: List[str] = [
 ]
 
 VN_DIVIDENDS: List[str] = [
-    "Div Yield %", "Div Rate", "Div/Share", "Payout Ratio %", "Ex-Div Date", "Pay Date"
+    "Div Yield %", "Dividend Yield %", "Div Rate", "Div/Share", "Payout Ratio %", "Ex-Div Date", "Pay Date"
 ]
 
 VN_PROFITABILITY: List[str] = [
