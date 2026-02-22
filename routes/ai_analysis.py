@@ -2,13 +2,13 @@
 """
 routes/ai_analysis.py
 ------------------------------------------------------------
-TADAWUL ENTERPRISE AI ANALYSIS ENGINE — v8.2.0 (NEXT-GEN ENTERPRISE)
+TADAWUL ENTERPRISE AI ANALYSIS ENGINE — v8.4.0 (NEXT-GEN ENTERPRISE)
 SAMA Compliant | Real-time ML | Predictive Analytics | Distributed Caching
 
-What's new in v8.2.0:
-- ✅ Serialization Safety: Fully migrated `sheet-rows` to use `SheetAnalysisResponse` with `model_dump(mode='json')` to prevent `orjson` from crashing on nested Pydantic models and Enums.
-- ✅ Code Readability: Refactored massive one-liners into clean, PEP-8 compliant structures.
-- ✅ JSON Fallback Fix: Hardened `orjson.dumps` with `default=str` to catch any stray objects.
+What's new in v8.4.0:
+- ✅ Serialization Safety: Fully migrated all endpoints to use `model_dump(mode='json', exclude_none=True)`.
+- ✅ NaN & Infinity Protection: Added a recursive `clean_nans` interceptor to prevent `orjson` from throwing 500 errors on missing upstream mathematical data.
+- ✅ JSON Fallback Fix: Hardened `orjson.dumps` with `default=str` via a custom `BestJSONResponse` renderer to catch any stray unhandled objects.
 - ✅ Pydantic V2 Resilience: Upgraded all Enums to `FlexibleEnum` with `_missing_` interceptors to cure case-sensitivity mismatches.
 - ✅ Non-Blocking ML Inference: Delegated all Scikit-Learn/Ensemble execution to ThreadPoolExecutors.
 
@@ -57,22 +57,43 @@ from fastapi import (
 )
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+def clean_nans(obj: Any) -> Any:
+    """Recursively replaces NaN and Infinity with None to prevent orjson 500 crashes."""
+    if isinstance(obj, dict):
+        return {k: clean_nans(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [clean_nans(v) for v in obj]
+    elif isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return None
+    return obj
+
 # ---------------------------------------------------------------------------
 # High-Performance JSON fallback
 # ---------------------------------------------------------------------------
 try:
     import orjson
-    from fastapi.responses import ORJSONResponse as BestJSONResponse
-    def json_dumps(v, *, default=None): 
-        # V8.2 FIX: Added safe string fallback for unhandled types (like Enums)
-        return orjson.dumps(v, default=default or str).decode('utf-8')
+    from fastapi.responses import Response
+
+    class BestJSONResponse(Response):
+        media_type = "application/json"
+        def render(self, content: Any) -> bytes:
+            # V8.4 FIX: Strip NaNs and force default=str for rogue Enums
+            return orjson.dumps(clean_nans(content), default=str)
+
+    def json_dumps(v, *, default=str): 
+        return orjson.dumps(clean_nans(v), default=default).decode('utf-8')
     def json_loads(v): return orjson.loads(v)
     _HAS_ORJSON = True
 except ImportError:
     import json
-    from fastapi.responses import JSONResponse as BestJSONResponse
-    def json_dumps(v, *, default=None): 
-        return json.dumps(v, default=default or str)
+    from fastapi.responses import JSONResponse as BaseJSONResponse
+
+    class BestJSONResponse(BaseJSONResponse):
+        def render(self, content: Any) -> bytes:
+            return json.dumps(clean_nans(content), default=str, ensure_ascii=False).encode("utf-8")
+
+    def json_dumps(v, *, default=str): 
+        return json.dumps(clean_nans(v), default=default)
     def json_loads(v): return json.loads(v)
     _HAS_ORJSON = False
 
@@ -140,7 +161,7 @@ except ImportError:
 
 logger = logging.getLogger("routes.ai_analysis")
 
-AI_ANALYSIS_VERSION = "8.2.0"
+AI_ANALYSIS_VERSION = "8.4.0"
 router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 
 # =============================================================================
@@ -398,19 +419,13 @@ class SaudiTime:
         self._tz = timezone(timedelta(hours=3))
         self._trading_hours = {"start": "10:00", "end": "15:00"}
         self._weekend_days = [4, 5] 
-        self._holidays = {
-            "2024-02-22", "2024-04-10", "2024-04-11", "2024-04-12", 
-            "2024-06-16", "2024-06-17", "2024-06-18", "2024-09-23"
-        }
+        self._holidays = {"2024-02-22", "2024-04-10", "2024-04-11", "2024-04-12", "2024-06-16", "2024-06-17", "2024-06-18", "2024-09-23"}
     
-    def now(self) -> datetime: 
-        return datetime.now(self._tz)
+    def now(self) -> datetime: return datetime.now(self._tz)
     
-    def now_iso(self) -> str: 
-        return self.now().isoformat(timespec="milliseconds")
+    def now_iso(self) -> str: return self.now().isoformat(timespec="milliseconds")
     
-    def now_utc_iso(self) -> str: 
-        return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+    def now_utc_iso(self) -> str: return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
     
     def is_trading_day(self, dt: Optional[datetime] = None) -> bool:
         dt = dt or self.now()
@@ -432,8 +447,7 @@ class SaudiTime:
             dt = datetime.fromisoformat(utc_dt.replace("Z", "+00:00")) if isinstance(utc_dt, str) else utc_dt
             if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
             return dt.astimezone(self._tz).isoformat(timespec="milliseconds")
-        except Exception: 
-            return ""
+        except Exception: return ""
 
 _saudi_time = SaudiTime()
 
@@ -479,8 +493,7 @@ class CacheManager:
     async def get(self, key: str, namespace: str = "ai") -> Optional[Any]:
         cache_key = self._get_cache_key(key, namespace)
         self._access_patterns[key].append(time.time())
-        if len(self._access_patterns[key]) > 100: 
-            self._access_patterns[key] = self._access_patterns[key][-100:]
+        if len(self._access_patterns[key]) > 100: self._access_patterns[key] = self._access_patterns[key][-100:]
         
         async with self._lock:
             if cache_key in self._local_cache:
@@ -488,8 +501,7 @@ class CacheManager:
                 if expiry > time.time():
                     self._stats["hits"] += 1
                     return value
-                else: 
-                    del self._local_cache[cache_key]
+                else: del self._local_cache[cache_key]
         
         if self._redis_cache:
             try:
@@ -501,8 +513,7 @@ class CacheManager:
                     async with self._lock:
                         self._local_cache[cache_key] = (value, time.time() + (_CONFIG.cache_ttl_seconds // 2))
                     return value
-                else: 
-                    self._stats["redis_misses"] += 1
+                else: self._stats["redis_misses"] += 1
             except Exception as e:
                 logger.debug(f"Redis get failed: {e}")
                 self._stats["redis_misses"] += 1
@@ -519,28 +530,21 @@ class CacheManager:
         async with self._lock:
             if len(self._local_cache) >= _CONFIG.cache_max_size:
                 items = sorted(self._local_cache.items(), key=lambda x: x[1][1])
-                for k, _ in items[:_CONFIG.cache_max_size // 5]: 
-                    del self._local_cache[k]
+                for k, _ in items[:_CONFIG.cache_max_size // 5]: del self._local_cache[k]
             self._local_cache[cache_key] = (value, expiry)
         
-        if predictive: 
-            self._predictive_cache[key] = value
+        if predictive: self._predictive_cache[key] = value
         
         if self._redis_cache:
-            try: 
-                await self._redis_cache.setex(cache_key, ttl, self._compress(value))
-            except Exception as e: 
-                logger.debug(f"Redis set failed: {e}")
+            try: await self._redis_cache.setex(cache_key, ttl, self._compress(value))
+            except Exception as e: logger.debug(f"Redis set failed: {e}")
     
     async def delete(self, key: str, namespace: str = "ai") -> None:
         cache_key = self._get_cache_key(key, namespace)
-        async with self._lock: 
-            self._local_cache.pop(cache_key, None)
+        async with self._lock: self._local_cache.pop(cache_key, None)
         if self._redis_cache:
-            try: 
-                await self._redis_cache.delete(cache_key)
-            except Exception: 
-                pass
+            try: await self._redis_cache.delete(cache_key)
+            except Exception: pass
         self._predictive_cache.pop(key, None)
     
     async def pre_fetch(self, keys: List[str]) -> Dict[str, Any]:
@@ -556,16 +560,7 @@ class CacheManager:
     
     def get_stats(self) -> Dict[str, Any]:
         total = self._stats["hits"] + self._stats["misses"]
-        return {
-            "hits": self._stats["hits"], 
-            "misses": self._stats["misses"], 
-            "redis_hits": self._stats["redis_hits"], 
-            "redis_misses": self._stats["redis_misses"], 
-            "hit_rate": self._stats["hits"] / total if total > 0 else 0, 
-            "local_cache_size": len(self._local_cache), 
-            "predictive_cache_size": len(self._predictive_cache), 
-            "tracked_keys": len(self._access_patterns)
-        }
+        return {"hits": self._stats["hits"], "misses": self._stats["misses"], "redis_hits": self._stats["redis_hits"], "redis_misses": self._stats["redis_misses"], "hit_rate": self._stats["hits"] / total if total > 0 else 0, "local_cache_size": len(self._local_cache), "predictive_cache_size": len(self._predictive_cache), "tracked_keys": len(self._access_patterns)}
 
 _cache = CacheManager()
 
@@ -580,9 +575,7 @@ class CircuitStateEnum(str, Enum):
 
 class CircuitBreaker:
     def __init__(self, name: str, threshold: int = 5, timeout: float = 60.0):
-        self.name = name
-        self.threshold = threshold
-        self.timeout = timeout
+        self.name, self.threshold, self.timeout = name, threshold, timeout
         self.state = CircuitStateEnum.CLOSED
         self.failure_count, self.last_failure_time, self.success_count = 0, 0.0, 0
         self._lock = asyncio.Lock()
@@ -593,11 +586,9 @@ class CircuitBreaker:
             if self.state == CircuitStateEnum.OPEN:
                 if time.time() - self.last_failure_time > self.timeout:
                     self.state, self.success_count, self._half_open_requests = CircuitStateEnum.HALF_OPEN, 0, 0
-                else: 
-                    raise Exception(f"Circuit {self.name} is OPEN")
+                else: raise Exception(f"Circuit {self.name} is OPEN")
             if self.state == CircuitStateEnum.HALF_OPEN:
-                if self._half_open_requests >= _CONFIG.half_open_requests: 
-                    raise Exception(f"Circuit {self.name} half-open limit reached")
+                if self._half_open_requests >= _CONFIG.half_open_requests: raise Exception(f"Circuit {self.name} half-open limit reached")
                 self._half_open_requests += 1
         try:
             result = await func(*args, **kwargs) if asyncio.iscoroutinefunction(func) else func(*args, **kwargs)
@@ -606,8 +597,7 @@ class CircuitBreaker:
                     self.success_count += 1
                     if self.success_count >= 2:
                         self.state, self.failure_count = CircuitStateEnum.CLOSED, 0
-                else: 
-                    self.failure_count = 0
+                else: self.failure_count = 0
             return result
         except Exception as e:
             async with self._lock:
@@ -626,20 +616,16 @@ class RequestCoalescer:
     
     async def execute(self, key: str, coro: Awaitable) -> Any:
         async with self._lock:
-            if key in self._pending: 
-                return await self._pending[key]
+            if key in self._pending: return await self._pending[key]
             future = asyncio.Future()
             self._pending[key] = future
         try:
             result = await coro
-            if not future.done(): 
-                future.set_result(result)
+            if not future.done(): future.set_result(result)
         except Exception as e:
-            if not future.done(): 
-                future.set_exception(e)
+            if not future.done(): future.set_exception(e)
         finally:
-            async with self._lock: 
-                self._pending.pop(key, None)
+            async with self._lock: self._pending.pop(key, None)
         return await future
 
 _coalescer = RequestCoalescer()
@@ -673,12 +659,9 @@ class AdaptiveConcurrencyController:
         error_rate = sum(self.error_window) / len(self.error_window) if self.error_window else 0
         new_concurrency = self.current_concurrency
         
-        if error_rate > 0.1: 
-            new_concurrency = max(1, int(self.current_concurrency * 0.7))
-        elif avg_latency > 1000: 
-            new_concurrency = max(1, int(self.current_concurrency * 0.9))
-        elif error_rate < 0.01 and avg_latency < 500: 
-            new_concurrency = min(20, int(self.current_concurrency * 1.1))
+        if error_rate > 0.1: new_concurrency = max(1, int(self.current_concurrency * 0.7))
+        elif avg_latency > 1000: new_concurrency = max(1, int(self.current_concurrency * 0.9))
+        elif error_rate < 0.01 and avg_latency < 500: new_concurrency = min(20, int(self.current_concurrency * 1.1))
         
         self.current_concurrency = new_concurrency
         self.last_adjustment = time.time()
@@ -697,31 +680,16 @@ class AuditLogger:
     
     async def log(self, event: str, user_id: Optional[str], resource: str, action: str, status: str, details: Dict[str, Any], request_id: Optional[str] = None) -> None:
         if not _CONFIG.enable_audit_log: return
-        entry = {
-            "timestamp": _saudi_time.now_iso(), 
-            "event_id": str(uuid.uuid4()), 
-            "event": event, 
-            "user_id": user_id, 
-            "resource": resource, 
-            "action": action, 
-            "status": status, 
-            "details": details, 
-            "request_id": request_id, 
-            "version": AI_ANALYSIS_VERSION, 
-            "environment": os.getenv("APP_ENV", "production")
-        }
+        entry = {"timestamp": _saudi_time.now_iso(), "event_id": str(uuid.uuid4()), "event": event, "user_id": user_id, "resource": resource, "action": action, "status": status, "details": details, "request_id": request_id, "version": AI_ANALYSIS_VERSION, "environment": os.getenv("APP_ENV", "production")}
         async with self._buffer_lock:
             self._audit_buffer.append(entry)
-            if len(self._audit_buffer) >= 100: 
-                asyncio.create_task(self._flush())
+            if len(self._audit_buffer) >= 100: asyncio.create_task(self._flush())
     
     async def _flush(self) -> None:
         async with self._buffer_lock:
             buffer, self._audit_buffer = self._audit_buffer.copy(), []
-        try: 
-            logger.info(f"Audit flush: {len(buffer)} entries")
-        except Exception as e: 
-            logger.error(f"Audit flush failed: {e}")
+        try: logger.info(f"Audit flush: {len(buffer)} entries")
+        except Exception as e: logger.error(f"Audit flush failed: {e}")
 
 _audit_logger = AuditLogger()
 
@@ -742,8 +710,7 @@ class TokenManager:
         if not self._tokens: return True
         token = token.strip()
         if token in self._tokens:
-            if token in self._token_metadata: 
-                self._token_metadata[token]["last_used"] = datetime.now().isoformat()
+            if token in self._token_metadata: self._token_metadata[token]["last_used"] = datetime.now().isoformat()
             return True
         return False
 
@@ -759,8 +726,7 @@ class RateLimiter:
         async with self._lock:
             now = time.time()
             count, reset_time = self._buckets.get(key, (0, now + window))
-            if now > reset_time: 
-                count, reset_time = 0, now + window
+            if now > reset_time: count, reset_time = 0, now + window
             if count < requests:
                 self._buckets[key] = (count + 1, reset_time)
                 return True
@@ -832,9 +798,7 @@ class MLFeatures(BaseModel):
     analyst_count: Optional[int] = None
     data_quality: DataQuality = DataQuality.GOOD
     timestamp: str = Field(default_factory=_saudi_time.now_iso)
-    
-    if _PYDANTIC_V2: 
-        model_config = ConfigDict(arbitrary_types_allowed=True, use_enum_values=True)
+    if _PYDANTIC_V2: model_config = ConfigDict(arbitrary_types_allowed=True, use_enum_values=True)
 
 class MLPrediction(BaseModel):
     symbol: str
@@ -863,9 +827,7 @@ class MLPrediction(BaseModel):
     model_version: str = AI_ANALYSIS_VERSION
     recommendation: Recommendation = Recommendation.HOLD
     recommendation_strength: float = 0.0
-    
-    if _PYDANTIC_V2: 
-        model_config = ConfigDict(arbitrary_types_allowed=True, use_enum_values=True)
+    if _PYDANTIC_V2: model_config = ConfigDict(arbitrary_types_allowed=True, use_enum_values=True)
 
 class SingleAnalysisResponse(BaseModel):
     symbol: str
@@ -934,9 +896,7 @@ class SingleAnalysisResponse(BaseModel):
     last_updated_riyadh: Optional[str] = None
     data_quality: DataQuality = DataQuality.MISSING
     error: Optional[str] = None
-    
-    if _PYDANTIC_V2: 
-        model_config = ConfigDict(use_enum_values=True)
+    if _PYDANTIC_V2: model_config = ConfigDict(use_enum_values=True)
 
 class BatchAnalysisResponse(BaseModel):
     results: List[SingleAnalysisResponse] = Field(default_factory=list)
@@ -945,9 +905,7 @@ class BatchAnalysisResponse(BaseModel):
     warnings: List[str] = Field(default_factory=list)
     version: str = AI_ANALYSIS_VERSION
     meta: Dict[str, Any] = Field(default_factory=dict)
-    
-    if _PYDANTIC_V2: 
-        model_config = ConfigDict(arbitrary_types_allowed=True)
+    if _PYDANTIC_V2: model_config = ConfigDict(arbitrary_types_allowed=True)
 
 class SheetAnalysisResponse(BaseModel):
     status: str = "success"
@@ -959,9 +917,7 @@ class SheetAnalysisResponse(BaseModel):
     version: str = AI_ANALYSIS_VERSION
     request_id: str
     meta: Dict[str, Any] = Field(default_factory=dict)
-    
-    if _PYDANTIC_V2: 
-        model_config = ConfigDict(arbitrary_types_allowed=True)
+    if _PYDANTIC_V2: model_config = ConfigDict(arbitrary_types_allowed=True)
 
 class ScoreboardResponse(BaseModel):
     headers: List[str] = Field(default_factory=list)
@@ -970,9 +926,8 @@ class ScoreboardResponse(BaseModel):
     error: Optional[str] = None
     version: str = AI_ANALYSIS_VERSION
     meta: Dict[str, Any] = Field(default_factory=dict)
-    
-    if _PYDANTIC_V2: 
-        model_config = ConfigDict(arbitrary_types_allowed=True)
+    if _PYDANTIC_V2: model_config = ConfigDict(arbitrary_types_allowed=True)
+
 
 class AdvancedSheetRequest(BaseModel):
     tickers: List[str] = Field(default_factory=list)
@@ -994,13 +949,10 @@ class AdvancedSheetRequest(BaseModel):
             seen, result = set(), []
             for s in all_symbols:
                 normalized = str(s).strip().upper()
-                if normalized.startswith("TADAWUL:"): 
-                    normalized = normalized.split(":", 1)[1]
-                if normalized.endswith(".TADAWUL"): 
-                    normalized = normalized.replace(".TADAWUL", "")
+                if normalized.startswith("TADAWUL:"): normalized = normalized.split(":", 1)[1]
+                if normalized.endswith(".TADAWUL"): normalized = normalized.replace(".TADAWUL", "")
                 if normalized and normalized not in seen:
-                    seen.add(normalized)
-                    result.append(normalized)
+                    seen.add(normalized); result.append(normalized)
             self.symbols, self.tickers = result, []
             return self
 
@@ -1017,35 +969,23 @@ class MLModelManager:
         self._prediction_cache: Dict[str, Tuple[MLPrediction, float]] = {}
         self._lock = asyncio.Lock()
         self._circuit_breaker = CircuitBreaker("ml_models")
-        self._feature_names = [
-            "price", "volume", "rsi_14d", "macd", "bb_position", 
-            "volatility_30d", "momentum_20d", "return_20d", "beta", 
-            "market_cap", "pe_ratio", "dividend_yield"
-        ]
+        self._feature_names = ["price", "volume", "rsi_14d", "macd", "bb_position", "volatility_30d", "momentum_20d", "return_20d", "beta", "market_cap", "pe_ratio", "dividend_yield"]
     
     async def initialize(self) -> None:
         if self._initialized or not _ML_AVAILABLE: return
         async with self._lock:
             if self._initialized: return
             try:
-                self._models["rf_1d"] = RandomForestRegressor(
-                    n_estimators=_CONFIG.rf_n_estimators, max_depth=_CONFIG.rf_max_depth, random_state=42
-                )
-                self._models["rf_1w"] = RandomForestRegressor(
-                    n_estimators=_CONFIG.rf_n_estimators, max_depth=_CONFIG.rf_max_depth, random_state=42
-                )
-                self._models["gb_1m"] = GradientBoostingRegressor(
-                    n_estimators=_CONFIG.gb_n_estimators, learning_rate=_CONFIG.gb_learning_rate, max_depth=5, random_state=42
-                )
+                self._models["rf_1d"] = RandomForestRegressor(n_estimators=_CONFIG.rf_n_estimators, max_depth=_CONFIG.rf_max_depth, random_state=42)
+                self._models["rf_1w"] = RandomForestRegressor(n_estimators=_CONFIG.rf_n_estimators, max_depth=_CONFIG.rf_max_depth, random_state=42)
+                self._models["gb_1m"] = GradientBoostingRegressor(n_estimators=_CONFIG.gb_n_estimators, learning_rate=_CONFIG.gb_learning_rate, max_depth=5, random_state=42)
                 self._scalers["standard"] = StandardScaler()
                 self._initialized = True
                 logger.info("ML models initialized")
-                if _metrics.gauge("ml_models_loaded"): 
-                    _metrics.gauge("ml_models_loaded").set(1)
+                if _metrics.gauge("ml_models_loaded"): _metrics.gauge("ml_models_loaded").set(1)
             except Exception as e:
                 logger.error(f"ML initialization failed: {e}")
-                if _metrics.gauge("ml_models_loaded"): 
-                    _metrics.gauge("ml_models_loaded").set(0)
+                if _metrics.gauge("ml_models_loaded"): _metrics.gauge("ml_models_loaded").set(0)
     
     async def predict(self, features: MLFeatures) -> Optional[MLPrediction]:
         if not self._initialized or not _ML_AVAILABLE: return None
@@ -1086,8 +1026,7 @@ class MLModelManager:
                     if _CONFIG.feature_importance_enabled and hasattr(self._models["rf_1d"], "feature_importances_"):
                         importance = dict(zip(self._feature_names, self._models["rf_1d"].feature_importances_))
                         total = sum(importance.values())
-                        if total > 0: 
-                            importance = {k: v/total for k, v in importance.items()}
+                        if total > 0: importance = {k: v/total for k, v in importance.items()}
                         
                     top_factors = sorted(importance.items(), key=lambda x: x[1], reverse=True)[:5]
                     top_factor_names = [f"{k}: {v:.1%}" for k, v in top_factors]
@@ -1100,19 +1039,10 @@ class MLModelManager:
                     else: rec, rec_strength = Recommendation.HOLD, 0.5
                     
                     return MLPrediction(
-                        symbol=features.symbol, 
-                        predicted_return_1d=float(pred_1d), 
-                        predicted_return_1w=float(pred_1w),
-                        predicted_return_1m=float(pred_1m), 
-                        confidence_1d=float(confidence), 
-                        confidence_1w=float(confidence * 0.9),
-                        confidence_1m=float(confidence * 0.8), 
-                        risk_score=float(risk_score), 
-                        signal_1d=signal,
-                        feature_importance=importance, 
-                        top_factors=top_factor_names, 
-                        recommendation=rec, 
-                        recommendation_strength=rec_strength
+                        symbol=features.symbol, predicted_return_1d=float(pred_1d), predicted_return_1w=float(pred_1w),
+                        predicted_return_1m=float(pred_1m), confidence_1d=float(confidence), confidence_1w=float(confidence * 0.9),
+                        confidence_1m=float(confidence * 0.8), risk_score=float(risk_score), signal_1d=signal,
+                        feature_importance=importance, top_factors=top_factor_names, recommendation=rec, recommendation_strength=rec_strength
                     )
                 
                 import concurrent.futures
@@ -1128,20 +1058,7 @@ class MLModelManager:
         return await self._circuit_breaker.execute(_do_predict)
     
     def _extract_features(self, features: MLFeatures) -> List[float]:
-        feature_map = {
-            "price": features.price, 
-            "volume": features.volume, 
-            "rsi_14d": features.rsi_14d, 
-            "macd": features.macd, 
-            "bb_position": features.bb_position, 
-            "volatility_30d": features.volatility_30d, 
-            "momentum_20d": features.momentum_20d, 
-            "return_20d": features.return_20d, 
-            "beta": features.beta, 
-            "market_cap": features.market_cap, 
-            "pe_ratio": features.pe_ratio, 
-            "dividend_yield": features.dividend_yield
-        }
+        feature_map = {"price": features.price, "volume": features.volume, "rsi_14d": features.rsi_14d, "macd": features.macd, "bb_position": features.bb_position, "volatility_30d": features.volatility_30d, "momentum_20d": features.momentum_20d, "return_20d": features.return_20d, "beta": features.beta, "market_cap": features.market_cap, "pe_ratio": features.pe_ratio, "dividend_yield": features.dividend_yield}
         return [float(feature_map.get(name) or 0.0) for name in self._feature_names]
 
 _ml_models = MLModelManager()
@@ -1208,38 +1125,19 @@ class AnalysisEngine:
                     fetched = {r[0]: r[1] for r in results_gathered if isinstance(r, tuple)}
                 
                 stats["from_engine"] += len(fetched)
-                for symbol, data in fetched.items(): 
-                    await _cache.set(cache_keys[symbol], data, ttl=_CONFIG.cache_ttl_seconds)
+                for symbol, data in fetched.items(): await _cache.set(cache_keys[symbol], data, ttl=_CONFIG.cache_ttl_seconds)
                 results.update(fetched)
             except Exception as e:
                 logger.error(f"Engine fetch failed: {e}")
                 stats["errors"] += len(symbols_to_fetch)
-                for symbol in symbols_to_fetch: 
-                    results[symbol] = self._create_placeholder(symbol, str(e))
+                for symbol in symbols_to_fetch: results[symbol] = self._create_placeholder(symbol, str(e))
                 
         if include_ml and _CONFIG.enable_ml_predictions:
             await _ml_models.initialize()
             for symbol, data in results.items():
-                if data and not isinstance(data, dict): 
-                    data = self._to_dict(data)
+                if data and not isinstance(data, dict): data = self._to_dict(data)
                 if data and "error" not in data:
-                    features = MLFeatures(
-                        symbol=symbol, 
-                        price=data.get("price"), 
-                        volume=data.get("volume"), 
-                        market_cap=data.get("market_cap"), 
-                        pe_ratio=data.get("pe_ratio"), 
-                        pb_ratio=data.get("pb_ratio"), 
-                        dividend_yield=data.get("dividend_yield"), 
-                        beta=data.get("beta"), 
-                        volatility_30d=data.get("volatility_30d"), 
-                        momentum_14d=data.get("momentum_14d"), 
-                        rsi_14d=data.get("rsi_14d"), 
-                        macd=data.get("macd"), 
-                        macd_signal=data.get("macd_signal"), 
-                        sector=data.get("sector"), 
-                        industry=data.get("industry")
-                    )
+                    features = MLFeatures(symbol=symbol, price=data.get("price"), volume=data.get("volume"), market_cap=data.get("market_cap"), pe_ratio=data.get("pe_ratio"), pb_ratio=data.get("pb_ratio"), dividend_yield=data.get("dividend_yield"), beta=data.get("beta"), volatility_30d=data.get("volatility_30d"), momentum_14d=data.get("momentum_14d"), rsi_14d=data.get("rsi_14d"), macd=data.get("macd"), macd_signal=data.get("macd_signal"), sector=data.get("sector"), industry=data.get("industry"))
                     if ml_pred := await _ml_models.predict(features):
                         data["ml_prediction"] = ml_pred.model_dump() if _PYDANTIC_V2 else ml_pred.dict()
                         stats["ml_predictions"] += 1
@@ -1257,14 +1155,7 @@ class AnalysisEngine:
         return {"raw": str(obj)}
         
     def _create_placeholder(self, symbol: str, error: str) -> Dict[str, Any]:
-        return {
-            "symbol": symbol.upper(), 
-            "error": error, 
-            "data_quality": DataQuality.MISSING.value, 
-            "last_updated_utc": _saudi_time.now_utc_iso(), 
-            "last_updated_riyadh": _saudi_time.to_riyadh(_saudi_time.now_utc_iso()), 
-            "recommendation": Recommendation.HOLD.value
-        }
+        return {"symbol": symbol.upper(), "error": error, "data_quality": DataQuality.MISSING, "last_updated_utc": _saudi_time.now_utc_iso(), "last_updated_riyadh": _saudi_time.to_riyadh(_saudi_time.now_utc_iso()), "recommendation": Recommendation.HOLD}
 
 _analysis_engine = AnalysisEngine()
 
@@ -1280,8 +1171,7 @@ class WebSocketManager:
         self._broadcast_queue: asyncio.Queue = asyncio.Queue()
         self._broadcast_task: Optional[asyncio.Task] = None
     
-    async def start(self): 
-        self._broadcast_task = asyncio.create_task(self._process_broadcasts())
+    async def start(self): self._broadcast_task = asyncio.create_task(self._process_broadcasts())
     
     async def stop(self):
         if self._broadcast_task:
@@ -1291,26 +1181,19 @@ class WebSocketManager:
     
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
-        async with self._connection_lock: 
-            self._active_connections.append(websocket)
-        if _metrics.gauge("websocket_connections"): 
-            _metrics.gauge("websocket_connections").set(len(self._active_connections))
-        if self._broadcast_task is None: 
-            self._broadcast_task = asyncio.create_task(self._process_broadcasts())
+        async with self._connection_lock: self._active_connections.append(websocket)
+        if _metrics.gauge("websocket_connections"): _metrics.gauge("websocket_connections").set(len(self._active_connections))
+        if self._broadcast_task is None: self._broadcast_task = asyncio.create_task(self._process_broadcasts())
     
     async def disconnect(self, websocket: WebSocket):
         async with self._connection_lock:
-            if websocket in self._active_connections: 
-                self._active_connections.remove(websocket)
+            if websocket in self._active_connections: self._active_connections.remove(websocket)
             for symbol in list(self._subscriptions.keys()):
-                if websocket in self._subscriptions[symbol]: 
-                    self._subscriptions[symbol].remove(websocket)
-        if _metrics.gauge("websocket_connections"): 
-            _metrics.gauge("websocket_connections").set(len(self._active_connections))
+                if websocket in self._subscriptions[symbol]: self._subscriptions[symbol].remove(websocket)
+        if _metrics.gauge("websocket_connections"): _metrics.gauge("websocket_connections").set(len(self._active_connections))
     
     async def subscribe(self, websocket: WebSocket, symbol: str):
-        async with self._connection_lock: 
-            self._subscriptions[symbol.upper()].append(websocket)
+        async with self._connection_lock: self._subscriptions[symbol.upper()].append(websocket)
     
     async def unsubscribe(self, websocket: WebSocket, symbol: str):
         async with self._connection_lock:
@@ -1324,29 +1207,24 @@ class WebSocketManager:
         while True:
             try:
                 await asyncio.sleep(5)
-                await self.broadcast({
-                    "type": "market_summary", 
-                    "timestamp": _saudi_time.now_iso(), 
-                    "trading_hours": _saudi_time.is_trading_hours(), 
-                    "active_connections": len(self._active_connections)
-                })
+                await self.broadcast({"type": "market_summary", "timestamp": _saudi_time.now_iso(), "trading_hours": _saudi_time.is_trading_hours(), "active_connections": len(self._active_connections)})
                 message, symbol = await self._broadcast_queue.get()
                 connections = self._subscriptions.get(symbol.upper(), []) if symbol else self._active_connections
                 disconnected = []
+                
+                # Render the payload ONCE as a string for extreme performance 
+                msg_str = json_dumps(message)
+                
                 for connection in connections:
-                    try: 
+                    try:
                         if _HAS_ORJSON:
-                            await connection.send_text(json_dumps(message)) 
-                        else: 
+                            await connection.send_text(msg_str)
+                        else:
                             await connection.send_json(message)
-                    except Exception: 
-                        disconnected.append(connection)
-                for conn in disconnected: 
-                    await self.disconnect(conn)
-            except asyncio.CancelledError: 
-                break
-            except Exception as e: 
-                logger.error(f"Broadcast error: {e}")
+                    except Exception: disconnected.append(connection)
+                for conn in disconnected: await self.disconnect(conn)
+            except asyncio.CancelledError: break
+            except Exception as e: logger.error(f"Broadcast error: {e}")
 
 _ws_manager = WebSocketManager()
 
@@ -1365,14 +1243,44 @@ def _parse_tickers(tickers_str: str) -> List[str]:
     return unique
 
 def _get_default_headers() -> List[str]:
-    return [
-        "Symbol", "Name", "Price", "Change %", "Volume", "Market Cap", 
-        "P/E Ratio", "Dividend Yield", "RSI (14)", "MACD", "BB Position", 
-        "Volatility", "Overall Score", "Risk Score", "Recommendation", 
-        "Expected ROI 1M", "Forecast Price 1M", "Expected ROI 3M", "Forecast Price 3M", 
-        "Expected ROI 12M", "Forecast Price 12M", "ML Confidence", "Signal", 
-        "Data Quality", "Error", "Last Updated (UTC)", "Last Updated (Riyadh)"
-    ]
+    return ["Symbol", "Name", "Price", "Change %", "Volume", "Market Cap", "P/E Ratio", "Dividend Yield", "RSI (14)", "MACD", "BB Position", "Volatility", "Overall Score", "Risk Score", "Recommendation", "Expected ROI 1M", "Forecast Price 1M", "Expected ROI 3M", "Forecast Price 3M", "Expected ROI 12M", "Forecast Price 12M", "ML Confidence", "Signal", "Data Quality", "Error", "Last Updated (UTC)", "Last Updated (Riyadh)"]
+
+def _get_sheet_headers(sheet_name: str) -> List[str]: return _get_default_headers()
+
+def _map_header_to_field(header: str, data: Dict[str, Any]) -> Any:
+    h = header.lower()
+    if "symbol" in h: return data.get("symbol", "")
+    if "name" in h: return data.get("name", "")
+    if "price" in h and "forecast" not in h: return data.get("price")
+    if "change %" in h or "change%" in h: return data.get("change_pct")
+    if "change" in h: return data.get("change")
+    if "volume" in h: return data.get("volume")
+    if "market cap" in h: return data.get("market_cap")
+    if "p/e" in h or "pe ratio" in h: return data.get("pe_ratio")
+    if "dividend" in h: return data.get("dividend_yield")
+    if "rsi" in h: return data.get("rsi_14d")
+    if "macd" in h: return data.get("macd")
+    if "bb position" in h: return data.get("bb_position")
+    if "volatility" in h: return data.get("volatility_30d")
+    if "overall score" in h: return data.get("overall_score")
+    if "risk score" in h: return data.get("risk_score")
+    if "recommendation" in h: return data.get("recommendation", "HOLD")
+    if "expected roi 1m" in h: return data.get("expected_roi_1m")
+    if "expected roi 3m" in h: return data.get("expected_roi_3m")
+    if "expected roi 12m" in h: return data.get("expected_roi_12m")
+    if "forecast price 1m" in h: return data.get("forecast_price_1m")
+    if "forecast price 3m" in h: return data.get("forecast_price_3m")
+    if "forecast price 12m" in h: return data.get("forecast_price_12m")
+    if "ml confidence" in h: return data.get("ml_prediction", {}).get("confidence_1m", 0.5)
+    if "signal" in h: return data.get("ml_prediction", {}).get("signal_1m", "neutral").upper()
+    if "data quality" in h: return data.get("data_quality", "UNKNOWN")
+    if "error" in h: return data.get("error")
+    if "last updated (utc)" in h: return data.get("last_updated_utc")
+    if "last updated (riyadh)" in h: return data.get("last_updated_riyadh")
+    return None
+
+def _build_sheet_rows(headers: List[str], symbols: List[str], results: Dict[str, Any]) -> List[List[Any]]:
+    return [[_map_header_to_field(header, results.get(symbol, {})) for header in headers] for symbol in symbols]
 
 def _quote_to_response(data: Dict[str, Any]) -> SingleAnalysisResponse:
     ml_pred = data.get("ml_prediction")
@@ -1389,39 +1297,15 @@ def _quote_to_response(data: Dict[str, Any]) -> SingleAnalysisResponse:
     data_quality = DataQuality.MISSING if data.get("error") else DataQuality.POOR if not data.get("price") else DataQuality.GOOD
     
     return SingleAnalysisResponse(
-        symbol=data.get("symbol", "UNKNOWN"), 
-        name=data.get("name"), 
-        asset_class=AssetClass.EQUITY, 
-        market_region=MarketRegion.SAUDI,
-        price=data.get("price"), 
-        volume=data.get("volume"), 
-        change=data.get("change"), 
-        change_pct=data.get("change_pct"),
-        market_cap=data.get("market_cap"), 
-        pe_ratio=data.get("pe_ratio"), 
-        pb_ratio=data.get("pb_ratio"), 
-        dividend_yield=data.get("dividend_yield"),
-        rsi_14d=data.get("rsi_14d"), 
-        macd=data.get("macd"), 
-        bb_position=data.get("bb_position"), 
-        volatility_30d=data.get("volatility_30d"),
-        beta=data.get("beta"), 
-        momentum_1m=data.get("momentum_1m"), 
-        overall_score=data.get("overall_score"), 
-        risk_score=data.get("risk_score"),
-        recommendation=data.get("recommendation", Recommendation.HOLD), 
-        confidence_level=confidence, 
-        expected_roi_1m=data.get("expected_roi_1m"),
-        expected_roi_3m=data.get("expected_roi_3m"), 
-        expected_roi_12m=data.get("expected_roi_12m"), 
-        forecast_price_1m=data.get("forecast_price_1m"),
-        forecast_price_3m=data.get("forecast_price_3m"), 
-        forecast_price_12m=data.get("forecast_price_12m"), 
-        ml_prediction=ml_prediction,
-        data_quality=data_quality, 
-        error=data.get("error"), 
-        last_updated_utc=data.get("last_updated_utc"), 
-        last_updated_riyadh=data.get("last_updated_riyadh")
+        symbol=data.get("symbol", "UNKNOWN"), name=data.get("name"), asset_class=AssetClass.EQUITY, market_region=MarketRegion.SAUDI,
+        price=data.get("price"), volume=data.get("volume"), change=data.get("change"), change_pct=data.get("change_pct"),
+        market_cap=data.get("market_cap"), pe_ratio=data.get("pe_ratio"), pb_ratio=data.get("pb_ratio"), dividend_yield=data.get("dividend_yield"),
+        rsi_14d=data.get("rsi_14d"), macd=data.get("macd"), bb_position=data.get("bb_position"), volatility_30d=data.get("volatility_30d"),
+        beta=data.get("beta"), momentum_1m=data.get("momentum_1m"), overall_score=data.get("overall_score"), risk_score=data.get("risk_score"),
+        recommendation=data.get("recommendation", Recommendation.HOLD), confidence_level=confidence, expected_roi_1m=data.get("expected_roi_1m"),
+        expected_roi_3m=data.get("expected_roi_3m"), expected_roi_12m=data.get("expected_roi_12m"), forecast_price_1m=data.get("forecast_price_1m"),
+        forecast_price_3m=data.get("forecast_price_3m"), forecast_price_12m=data.get("forecast_price_12m"), ml_prediction=ml_prediction,
+        data_quality=data_quality, error=data.get("error"), last_updated_utc=data.get("last_updated_utc"), last_updated_riyadh=data.get("last_updated_riyadh")
     )
 
 
@@ -1434,54 +1318,38 @@ async def health(request: Request) -> Dict[str, Any]:
         "engine": {"available": engine is not None, "type": type(engine).__name__ if engine else "none"},
         "ml": {"initialized": _ml_models._initialized}, "cache": _cache.get_stats(),
         "websocket": {"connections": len(_ws_manager._active_connections), "subscriptions": len(_ws_manager._subscriptions)},
-        "config": {
-            "batch_size": _CONFIG.batch_size, 
-            "batch_concurrency": _CONFIG.batch_concurrency, 
-            "max_tickers": _CONFIG.max_tickers, 
-            "enable_ml": _CONFIG.enable_ml_predictions, 
-            "enable_shariah": _CONFIG.enable_shariah_filter
-        },
+        "config": {"batch_size": _CONFIG.batch_size, "batch_concurrency": _CONFIG.batch_concurrency, "max_tickers": _CONFIG.max_tickers, "enable_ml": _CONFIG.enable_ml_predictions, "enable_shariah": _CONFIG.enable_shariah_filter},
         "request_id": getattr(request.state, "request_id", None)
     }
 
-
 @router.get("/metrics")
 async def metrics() -> Response:
-    if not _PROMETHEUS_AVAILABLE: 
-        return BestJSONResponse(status_code=503, content={"error": "Metrics not available"})
+    if not _PROMETHEUS_AVAILABLE: return BestJSONResponse(status_code=503, content={"error": "Metrics not available"})
     from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
-
 @router.get("/quote", response_model=SingleAnalysisResponse)
 async def get_quote(
-    request: Request, 
-    symbol: str = Query(..., description="Ticker/Symbol"), 
-    include_ml: bool = Query(True, description="Include ML predictions"),
-    token: Optional[str] = Query(default=None), 
-    x_app_token: Optional[str] = Header(None, alias="X-APP-TOKEN"), 
-    authorization: Optional[str] = Header(None, alias="Authorization")
+    request: Request, symbol: str = Query(..., description="Ticker/Symbol"), include_ml: bool = Query(True, description="Include ML predictions"),
+    token: Optional[str] = Query(default=None), x_app_token: Optional[str] = Header(None, alias="X-APP-TOKEN"), authorization: Optional[str] = Header(None, alias="Authorization")
 ) -> BestJSONResponse:
     request_id = str(uuid.uuid4())
     start_time = time.time()
     
     client_ip = request.client.host if request.client else "unknown"
-    if not await _rate_limiter.check(client_ip): 
-        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded")
-    
+    if not await _rate_limiter.check(client_ip): raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded")
     auth_token = x_app_token or token or (authorization[7:] if authorization and authorization.startswith("Bearer ") else "")
-    if not _token_manager.validate_token(auth_token): 
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+    if not _token_manager.validate_token(auth_token): raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
     
     symbol = symbol.strip().upper()
     if not symbol: 
         resp = SingleAnalysisResponse(symbol="UNKNOWN", error="No symbol provided", data_quality=DataQuality.MISSING)
-        return BestJSONResponse(content=resp.model_dump(mode='json') if _PYDANTIC_V2 else json_loads(resp.json()))
+        return BestJSONResponse(content=resp.model_dump(mode='json', exclude_none=True) if _PYDANTIC_V2 else json_loads(resp.json(exclude_none=True)))
     
     engine = await _analysis_engine.get_engine(request)
     if not engine: 
         resp = SingleAnalysisResponse(symbol=symbol, error="Engine unavailable", data_quality=DataQuality.MISSING)
-        return BestJSONResponse(content=resp.model_dump(mode='json') if _PYDANTIC_V2 else json_loads(resp.json()))
+        return BestJSONResponse(content=resp.model_dump(mode='json', exclude_none=True) if _PYDANTIC_V2 else json_loads(resp.json(exclude_none=True)))
     
     results, stats = await _analysis_engine.get_quotes(engine, [symbol], include_ml=include_ml)
     data = results.get(symbol, _analysis_engine._create_placeholder(symbol, "No data"))
@@ -1492,101 +1360,63 @@ async def get_quote(
     
     asyncio.create_task(_audit_logger.log("get_quote", auth_token[:8], "quote", "read", "success", {"symbol": symbol, "duration": time.time() - start_time}, request_id))
     
-    # V8.2 FIX: Added mode='json' to natively serialize the FlexibleEnum strings without orjson crashing
-    return BestJSONResponse(content=response.model_dump(mode='json') if _PYDANTIC_V2 else json_loads(response.json()))
-
+    return BestJSONResponse(content=response.model_dump(mode='json', exclude_none=True) if _PYDANTIC_V2 else json_loads(response.json(exclude_none=True)))
 
 @router.post("/quote", response_model=SingleAnalysisResponse)
 async def post_quote(
-    request: Request, 
-    body: Dict[str, Any] = Body(default_factory=dict), 
-    include_ml: bool = Query(True, description="Include ML predictions"),
-    token: Optional[str] = Query(default=None), 
-    x_app_token: Optional[str] = Header(None, alias="X-APP-TOKEN"), 
-    authorization: Optional[str] = Header(None, alias="Authorization")
+    request: Request, body: Dict[str, Any] = Body(default_factory=dict), include_ml: bool = Query(True, description="Include ML predictions"),
+    token: Optional[str] = Query(default=None), x_app_token: Optional[str] = Header(None, alias="X-APP-TOKEN"), authorization: Optional[str] = Header(None, alias="Authorization")
 ) -> BestJSONResponse:
     symbol = body.get("symbol") or body.get("ticker") or body.get("Symbol") or ""
     return await get_quote(request=request, symbol=symbol, include_ml=include_ml, token=token, x_app_token=x_app_token, authorization=authorization)
 
-
 @router.get("/quotes", response_model=BatchAnalysisResponse)
 async def get_quotes(
-    request: Request, 
-    tickers: str = Query(default="", description="Tickers: 'AAPL,MSFT 1120.SR'"), 
-    top_n: int = Query(default=0, ge=0, le=5000),
-    include_ml: bool = Query(True, description="Include ML predictions"), 
-    token: Optional[str] = Query(default=None),
-    x_app_token: Optional[str] = Header(None, alias="X-APP-TOKEN"), 
-    authorization: Optional[str] = Header(None, alias="Authorization")
+    request: Request, tickers: str = Query(default="", description="Tickers: 'AAPL,MSFT 1120.SR'"), top_n: int = Query(default=0, ge=0, le=5000),
+    include_ml: bool = Query(True, description="Include ML predictions"), token: Optional[str] = Query(default=None),
+    x_app_token: Optional[str] = Header(None, alias="X-APP-TOKEN"), authorization: Optional[str] = Header(None, alias="Authorization")
 ) -> BestJSONResponse:
     request_id = str(uuid.uuid4())
     start_time = time.time()
     
     client_ip = request.client.host if request.client else "unknown"
-    if not await _rate_limiter.check(client_ip): 
-        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded")
-    
+    if not await _rate_limiter.check(client_ip): raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded")
     auth_token = x_app_token or token or (authorization[7:] if authorization and authorization.startswith("Bearer ") else "")
-    if not _token_manager.validate_token(auth_token): 
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+    if not _token_manager.validate_token(auth_token): raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
     
     symbols = _parse_tickers(tickers)
     if not symbols: 
         resp = BatchAnalysisResponse(status="skipped", results=[], version=AI_ANALYSIS_VERSION, meta={"reason": "No tickers provided"})
-        return BestJSONResponse(content=resp.model_dump(mode='json') if _PYDANTIC_V2 else json_loads(resp.json()))
-    
+        return BestJSONResponse(content=resp.model_dump(mode='json', exclude_none=True) if _PYDANTIC_V2 else json_loads(resp.json(exclude_none=True)))
     symbols = symbols[:min(top_n, _CONFIG.max_tickers)] if top_n > 0 else symbols[:_CONFIG.max_tickers]
     
     engine = await _analysis_engine.get_engine(request)
     if not engine: 
         resp = BatchAnalysisResponse(status="error", error="Engine unavailable", results=[], version=AI_ANALYSIS_VERSION)
-        return BestJSONResponse(content=resp.model_dump(mode='json') if _PYDANTIC_V2 else json_loads(resp.json()))
+        return BestJSONResponse(content=resp.model_dump(mode='json', exclude_none=True) if _PYDANTIC_V2 else json_loads(resp.json(exclude_none=True)))
     
     results, stats = await _analysis_engine.get_quotes(engine, symbols, include_ml=include_ml)
     responses = [_quote_to_response(results.get(symbol) or _analysis_engine._create_placeholder(symbol, "No data")) for symbol in symbols]
     
     asyncio.create_task(_audit_logger.log("get_quotes", auth_token[:8], "quotes", "read", "success", {"symbols": len(symbols), "duration": time.time() - start_time, "stats": stats}, request_id))
     
-    response = BatchAnalysisResponse(
-        status="success", 
-        results=responses, 
-        version=AI_ANALYSIS_VERSION, 
-        meta={
-            "requested": len(symbols), "from_cache": stats["from_cache"], 
-            "from_engine": stats["from_engine"], "ml_predictions": stats["ml_predictions"], 
-            "errors": stats["errors"], "duration_ms": (time.time() - start_time) * 1000, 
-            "timestamp_utc": _saudi_time.now_utc_iso(), "timestamp_riyadh": _saudi_time.now_iso()
-        }
-    )
-    
-    # V8.2 FIX: Safe JSON dump handling for the full Batch payload
-    return BestJSONResponse(content=response.model_dump(mode='json') if _PYDANTIC_V2 else json_loads(response.json()))
-
+    response = BatchAnalysisResponse(status="success", results=responses, version=AI_ANALYSIS_VERSION, meta={"requested": len(symbols), "from_cache": stats["from_cache"], "from_engine": stats["from_engine"], "ml_predictions": stats["ml_predictions"], "errors": stats["errors"], "duration_ms": (time.time() - start_time) * 1000, "timestamp_utc": _saudi_time.now_utc_iso(), "timestamp_riyadh": _saudi_time.now_iso()})
+    return BestJSONResponse(content=response.model_dump(mode='json', exclude_none=True) if _PYDANTIC_V2 else json_loads(response.json(exclude_none=True)))
 
 @router.post("/quotes", response_model=BatchAnalysisResponse)
 async def batch_quotes(
-    request: Request, 
-    body: Dict[str, Any] = Body(default_factory=dict), 
-    include_ml: bool = Query(True, description="Include ML predictions"),
-    token: Optional[str] = Query(default=None), 
-    x_app_token: Optional[str] = Header(None, alias="X-APP-TOKEN"), 
-    authorization: Optional[str] = Header(None, alias="Authorization")
+    request: Request, body: Dict[str, Any] = Body(default_factory=dict), include_ml: bool = Query(True, description="Include ML predictions"),
+    token: Optional[str] = Query(default=None), x_app_token: Optional[str] = Header(None, alias="X-APP-TOKEN"), authorization: Optional[str] = Header(None, alias="Authorization")
 ) -> BestJSONResponse:
     tickers = body.get("tickers") or body.get("symbols") or body if isinstance(body, list) else []
-    if isinstance(tickers, list): 
-        tickers = ",".join(str(t) for t in tickers)
+    if isinstance(tickers, list): tickers = ",".join(str(t) for t in tickers)
     return await get_quotes(request=request, tickers=tickers, include_ml=include_ml, token=token, x_app_token=x_app_token, authorization=authorization)
-
 
 @router.post("/sheet-rows", response_model=SheetAnalysisResponse)
 async def sheet_rows(
-    request: Request, 
-    body: Dict[str, Any] = Body(...), 
-    mode: str = Query(default="", description="Mode hint"),
-    token: Optional[str] = Query(default=None, description="Auth token"), 
-    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-    authorization: Optional[str] = Header(default=None, alias="Authorization"), 
-    x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID")
+    request: Request, body: Dict[str, Any] = Body(...), mode: str = Query(default="", description="Mode hint"),
+    token: Optional[str] = Query(default=None, description="Auth token"), x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"), x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID")
 ) -> BestJSONResponse:
     request_id = x_request_id or str(uuid.uuid4())
     start_time = time.time()
@@ -1596,49 +1426,27 @@ async def sheet_rows(
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded")
     
     auth_token = x_app_token or token or ""
-    if authorization and authorization.startswith("Bearer "): 
-        auth_token = authorization[7:]
-    if not _token_manager.validate_token(auth_token): 
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+    if authorization and authorization.startswith("Bearer "): auth_token = authorization[7:]
+    if not _token_manager.validate_token(auth_token): raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
     
     async with TraceContext("parse_request", {"request_id": request_id}):
-        try: 
-            req = AdvancedSheetRequest.model_validate(body) if _PYDANTIC_V2 else AdvancedSheetRequest.parse_obj(body)
+        try: req = AdvancedSheetRequest.model_validate(body) if _PYDANTIC_V2 else AdvancedSheetRequest.parse_obj(body)
         except Exception as e:
-            err_resp = SheetAnalysisResponse(
-                status="error", 
-                headers=[], 
-                rows=[], 
-                error=f"Invalid request: {str(e)}", 
-                version=AI_ANALYSIS_VERSION, 
-                request_id=request_id, 
-                meta={"duration_ms": (time.time() - start_time) * 1000}
-            )
-            return BestJSONResponse(status_code=400, content=err_resp.model_dump(mode='json') if _PYDANTIC_V2 else json_loads(err_resp.json()))
+            err_resp = SheetAnalysisResponse(status="error", headers=[], rows=[], error=f"Invalid request: {str(e)}", version=AI_ANALYSIS_VERSION, request_id=request_id, meta={"duration_ms": (time.time() - start_time) * 1000})
+            return BestJSONResponse(status_code=400, content=err_resp.model_dump(mode='json', exclude_none=True) if _PYDANTIC_V2 else json_loads(err_resp.json(exclude_none=True)))
     
-    if req.include_predictions: 
-        asyncio.create_task(_ml_models.initialize())
+    if req.include_predictions: asyncio.create_task(_ml_models.initialize())
     
     engine = await _analysis_engine.get_engine(request)
     if not engine: 
-        err_resp = SheetAnalysisResponse(
-            status="error", 
-            headers=[], 
-            rows=[], 
-            error="Data engine unavailable", 
-            version=AI_ANALYSIS_VERSION, 
-            request_id=request_id, 
-            meta={"duration_ms": (time.time() - start_time) * 1000}
-        )
-        return BestJSONResponse(status_code=503, content=err_resp.model_dump(mode='json') if _PYDANTIC_V2 else json_loads(err_resp.json()))
+        err_resp = SheetAnalysisResponse(status="error", headers=[], rows=[], error="Data engine unavailable", version=AI_ANALYSIS_VERSION, request_id=request_id, meta={"duration_ms": (time.time() - start_time) * 1000})
+        return BestJSONResponse(status_code=503, content=err_resp.model_dump(mode='json', exclude_none=True) if _PYDANTIC_V2 else json_loads(err_resp.json(exclude_none=True)))
     
     async with TraceContext("fetch_quotes", {"symbol_count": len(req.symbols), "mode": mode}):
         quotes, _ = await _analysis_engine.get_quotes(engine, req.symbols[:req.top_n], include_ml=True)
     
-    headers = req.headers or _get_default_headers()
-    rows = []
-    features_dict = {} if req.include_features else None
-    predictions_dict = {} if req.include_predictions else None
+    headers = req.headers or ["Symbol", "Name", "Price", "Change", "Change %", "Volume", "Market Cap", "P/E Ratio", "Dividend Yield", "Beta", "RSI (14)", "MACD", "BB Upper", "BB Lower", "BB Middle", "Volatility (30d)", "Momentum (14d)", "Sharpe Ratio", "Max Drawdown (30d)", "Correlation TASI", "Forecast Price (1M)", "Expected ROI (1M)", "Forecast Price (3M)", "Expected ROI (3M)", "Forecast Price (12M)", "Expected ROI (12M)", "Risk Score", "Overall Score", "Recommendation", "Data Quality", "Last Updated (UTC)", "Last Updated (Riyadh)"]
+    rows, features_dict, predictions_dict = [], {} if req.include_features else None, {} if req.include_predictions else None
     
     for symbol in req.symbols[:req.top_n]:
         quote = quotes.get(symbol, _analysis_engine._create_placeholder(symbol, "Not found"))
@@ -1678,107 +1486,60 @@ async def sheet_rows(
             elif "expected roi" in h_lower and "12m" in h_lower: row.append(lookup.get("expected_roi_12m"))
             elif "risk score" in h_lower: row.append(lookup.get("risk_score"))
             elif "overall score" in h_lower: row.append(lookup.get("overall_score"))
-            elif "recommendation" in h_lower: row.append(lookup.get("recommendation") or "HOLD")
-            elif "data quality" in h_lower: row.append(lookup.get("data_quality") or "PARTIAL")
+            elif "recommendation" in h_lower: row.append(str(lookup.get("recommendation", "HOLD")))
+            elif "data quality" in h_lower: row.append(str(lookup.get("data_quality", "PARTIAL")))
             elif "last updated (utc)" in h_lower: row.append(lookup.get("last_updated_utc"))
             elif "last updated (riyadh)" in h_lower: row.append(lookup.get("last_updated_riyadh") or _saudi_time.now().isoformat())
             else: row.append(lookup.get(h_lower))
         rows.append(row)
-
+        
         if req.include_features:
-            features = MLFeatures(
-                symbol=symbol, 
-                price=lookup.get("price"), 
-                volume=lookup.get("volume"), 
-                volatility_30d=lookup.get("volatility_30d"), 
-                momentum_14d=lookup.get("momentum_14d"), 
-                rsi_14d=lookup.get("rsi_14d"), 
-                macd=lookup.get("macd"), 
-                macd_signal=lookup.get("macd_signal"), 
-                bb_upper=lookup.get("bb_upper"), 
-                bb_lower=lookup.get("bb_lower"), 
-                bb_middle=lookup.get("bb_middle"), 
-                volume_profile=lookup.get("volume_profile"), 
-                market_cap=lookup.get("market_cap"), 
-                pe_ratio=lookup.get("pe_ratio"), 
-                dividend_yield=lookup.get("dividend_yield"), 
-                beta=lookup.get("beta"), 
-                sharpe_ratio=lookup.get("sharpe_ratio"), 
-                max_drawdown_30d=lookup.get("max_drawdown_30d"), 
-                correlation_sp500=lookup.get("correlation_sp500"), 
-                correlation_tasi=lookup.get("correlation_tasi")
-            )
+            features = MLFeatures(symbol=symbol, price=lookup.get("price"), volume=lookup.get("volume"), volatility_30d=lookup.get("volatility_30d"), momentum_14d=lookup.get("momentum_14d"), rsi_14d=lookup.get("rsi_14d"), macd=lookup.get("macd"), macd_signal=lookup.get("macd_signal"), bb_upper=lookup.get("bb_upper"), bb_lower=lookup.get("bb_lower"), bb_middle=lookup.get("bb_middle"), volume_profile=lookup.get("volume_profile"), market_cap=lookup.get("market_cap"), pe_ratio=lookup.get("pe_ratio"), dividend_yield=lookup.get("dividend_yield"), beta=lookup.get("beta"), sharpe_ratio=lookup.get("sharpe_ratio"), max_drawdown_30d=lookup.get("max_drawdown_30d"), correlation_sp500=lookup.get("correlation_sp500"), correlation_tasi=lookup.get("correlation_tasi"))
             features_dict[symbol] = features
         if req.include_predictions and features_dict and symbol in features_dict:
-            if prediction := await _ml_models.predict(features_dict[symbol]): 
-                predictions_dict[symbol] = prediction
+            if prediction := await _ml_models.predict(features_dict[symbol]): predictions_dict[symbol] = prediction
 
     error_count = sum(1 for q in quotes.values() if isinstance(q, dict) and "error" in q)
     status_str = "success" if error_count == 0 else "partial" if error_count < len(req.symbols[:req.top_n]) else "error"
     
-    if _PROMETHEUS_AVAILABLE:
+    if PROMETHEUS_AVAILABLE:
         _metrics.counter("requests_total", "Requests", ["status"]).labels(status=status_str).inc()
         _metrics.histogram("request_duration_seconds", "Duration").observe(time.time() - start_time)
         
     asyncio.create_task(_audit_logger.log("sheet_rows_request", auth_token[:8], "sheet_rows", "read", status_str, {"request_id": request_id, "symbols": len(req.symbols), "duration": time.time() - start_time}))
-    if _CONFIG.adaptive_concurrency and _concurrency_controller.should_adjust(): 
-        _concurrency_controller.adjust()
+    if _CONFIG.adaptive_concurrency and _concurrency_controller.should_adjust(): _concurrency_controller.adjust()
     _concurrency_controller.record_request((time.time() - start_time) * 1000, status_str == "success")
     
-    # V8.2 FIX: Return proper Pydantic model serialized natively
     response = SheetAnalysisResponse(
-        status=status_str,
-        headers=headers,
-        rows=rows,
-        features=features_dict if req.include_features else None,
-        predictions=predictions_dict if req.include_predictions else None,
-        error=f"{error_count} errors" if error_count > 0 else None,
-        version=AI_ANALYSIS_VERSION,
-        request_id=request_id,
-        meta={
-            "duration_ms": (time.time() - start_time) * 1000, 
-            "requested": len(req.symbols[:req.top_n]), 
-            "errors": error_count, 
-            "cache_stats": _cache.get_stats(), 
-            "concurrency": _concurrency_controller.current_concurrency, 
-            "riyadh_time": _saudi_time.now_iso(), 
-            "business_day": _saudi_time.is_trading_day()
-        }
+        status=status_str, headers=headers, rows=rows, features=features_dict, predictions=predictions_dict, error=f"{error_count} errors" if error_count > 0 else None, version=AI_ANALYSIS_VERSION, request_id=request_id, meta={"duration_ms": (time.time() - start_time) * 1000, "requested": len(req.symbols[:req.top_n]), "errors": error_count, "cache_stats": _cache.get_stats(), "concurrency": _concurrency_controller.current_concurrency, "riyadh_time": _saudi_time.now_iso(), "business_day": _saudi_time.is_trading_day()}
     )
-    
-    return BestJSONResponse(content=response.model_dump(mode='json') if _PYDANTIC_V2 else json_loads(response.json()))
-
+    return BestJSONResponse(content=response.model_dump(mode='json', exclude_none=True) if _PYDANTIC_V2 else json_loads(response.json(exclude_none=True)))
 
 @router.get("/scoreboard", response_model=ScoreboardResponse)
 async def scoreboard(
-    request: Request, 
-    tickers: str = Query(default="", description="Tickers: 'AAPL,MSFT 1120.SR'"), 
-    top_n: int = Query(default=20, ge=1, le=200),
-    token: Optional[str] = Query(default=None), 
-    x_app_token: Optional[str] = Header(None, alias="X-APP-TOKEN"), 
-    authorization: Optional[str] = Header(None, alias="Authorization")
+    request: Request, tickers: str = Query(default="", description="Tickers: 'AAPL,MSFT 1120.SR'"), top_n: int = Query(default=20, ge=1, le=200),
+    token: Optional[str] = Query(default=None), x_app_token: Optional[str] = Header(None, alias="X-APP-TOKEN"), authorization: Optional[str] = Header(None, alias="Authorization")
 ) -> BestJSONResponse:
     request_id = str(uuid.uuid4())
     start_time = time.time()
     
     client_ip = request.client.host if request.client else "unknown"
     auth_token = x_app_token or token or (authorization[7:] if authorization and authorization.startswith("Bearer ") else "")
-    if not _token_manager.validate_token(auth_token): 
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+    if not _token_manager.validate_token(auth_token): raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
     
     if not _CONFIG.enable_scoreboard: 
         resp = ScoreboardResponse(status="disabled", error="Scoreboard disabled", headers=[], rows=[], version=AI_ANALYSIS_VERSION)
-        return BestJSONResponse(content=resp.model_dump(mode='json') if _PYDANTIC_V2 else json_loads(resp.json()))
+        return BestJSONResponse(content=resp.model_dump(mode='json', exclude_none=True) if _PYDANTIC_V2 else json_loads(resp.json(exclude_none=True)))
     
     symbols = _parse_tickers(tickers)[:top_n]
     if not symbols: 
         resp = ScoreboardResponse(status="skipped", headers=[], rows=[], version=AI_ANALYSIS_VERSION, meta={"reason": "No tickers provided"})
-        return BestJSONResponse(content=resp.model_dump(mode='json') if _PYDANTIC_V2 else json_loads(resp.json()))
+        return BestJSONResponse(content=resp.model_dump(mode='json', exclude_none=True) if _PYDANTIC_V2 else json_loads(resp.json(exclude_none=True)))
     
     engine = await _analysis_engine.get_engine(request)
     if not engine: 
         resp = ScoreboardResponse(status="error", error="Engine unavailable", headers=[], rows=[], version=AI_ANALYSIS_VERSION)
-        return BestJSONResponse(content=resp.model_dump(mode='json') if _PYDANTIC_V2 else json_loads(resp.json()))
+        return BestJSONResponse(content=resp.model_dump(mode='json', exclude_none=True) if _PYDANTIC_V2 else json_loads(resp.json(exclude_none=True)))
     
     results, stats = await _analysis_engine.get_quotes(engine, symbols, include_ml=True)
     headers = ["Rank", "Symbol", "Name", "Price", "Change %", "Overall Score", "Risk Score", "Recommendation", "Expected ROI 1M", "Expected ROI 3M", "Expected ROI 12M", "ML Confidence", "Signal", "Last Updated"]
@@ -1787,47 +1548,14 @@ async def scoreboard(
     for symbol in symbols:
         if not (data := results.get(symbol)): continue
         ml_pred = data.get("ml_prediction", {})
-        items.append({
-            "symbol": symbol, 
-            "name": data.get("name", ""), 
-            "price": data.get("price"), 
-            "change_pct": data.get("change_pct"), 
-            "overall_score": data.get("overall_score") or 50.0, 
-            "risk_score": data.get("risk_score") or 50.0, 
-            "recommendation": data.get("recommendation", "HOLD"), 
-            "expected_roi_1m": data.get("expected_roi_1m"), 
-            "expected_roi_3m": data.get("expected_roi_3m"), 
-            "expected_roi_12m": data.get("expected_roi_12m"), 
-            "confidence": ml_pred.get("confidence_1m", 0.5) if ml_pred else 0.5, 
-            "signal": ml_pred.get("signal_1m", "neutral") if ml_pred else "neutral", 
-            "last_updated": data.get("last_updated_riyadh", "")
-        })
+        items.append({"symbol": symbol, "name": data.get("name", ""), "price": data.get("price"), "change_pct": data.get("change_pct"), "overall_score": data.get("overall_score") or 50.0, "risk_score": data.get("risk_score") or 50.0, "recommendation": data.get("recommendation", "HOLD"), "expected_roi_1m": data.get("expected_roi_1m"), "expected_roi_3m": data.get("expected_roi_3m"), "expected_roi_12m": data.get("expected_roi_12m"), "confidence": ml_pred.get("confidence_1m", 0.5) if ml_pred else 0.5, "signal": ml_pred.get("signal_1m", "neutral") if ml_pred else "neutral", "last_updated": data.get("last_updated_riyadh", "")})
         
     items.sort(key=lambda x: x["overall_score"], reverse=True)
     for i, item in enumerate(items[:top_n], 1):
-        rows.append([
-            i, item["symbol"], item["name"], item["price"], item["change_pct"], 
-            item["overall_score"], item["risk_score"], str(item["recommendation"]), 
-            item["expected_roi_1m"], item["expected_roi_3m"], item["expected_roi_12m"], 
-            f"{item['confidence']:.1%}", str(item["signal"]).upper(), item["last_updated"]
-        ])
+        rows.append([i, item["symbol"], item["name"], item["price"], item["change_pct"], item["overall_score"], item["risk_score"], str(item["recommendation"]), item["expected_roi_1m"], item["expected_roi_3m"], item["expected_roi_12m"], f"{item['confidence']:.1%}", str(item["signal"]).upper(), item["last_updated"]])
         
-    response = ScoreboardResponse(
-        status="success", 
-        headers=headers, 
-        rows=rows, 
-        version=AI_ANALYSIS_VERSION, 
-        meta={
-            "total": len(items), 
-            "displayed": min(len(items), top_n), 
-            "duration_ms": (time.time() - start_time) * 1000, 
-            "timestamp_riyadh": _saudi_time.now_iso()
-        }
-    )
-    
-    # V8.2 FIX: Safe Pydantic serialization
-    return BestJSONResponse(content=response.model_dump(mode='json') if _PYDANTIC_V2 else json_loads(response.json()))
-
+    response = ScoreboardResponse(status="success", headers=headers, rows=rows, version=AI_ANALYSIS_VERSION, meta={"total": len(items), "displayed": min(len(items), top_n), "duration_ms": (time.time() - start_time) * 1000, "timestamp_riyadh": _saudi_time.now_iso()})
+    return BestJSONResponse(content=response.model_dump(mode='json', exclude_none=True) if _PYDANTIC_V2 else json_loads(response.json(exclude_none=True)))
 
 @router.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: Optional[str] = Query(None)):
@@ -1839,39 +1567,27 @@ async def websocket_endpoint(websocket: WebSocket, token: Optional[str] = Query(
         return
     await _ws_manager.connect(websocket)
     try:
-        if _HAS_ORJSON:
-            await websocket.send_text(json_dumps({"type": "connection", "status": "connected", "timestamp": _saudi_time.now_iso(), "version": AI_ANALYSIS_VERSION})) 
-        else: 
-            await websocket.send_json({"type": "connection", "status": "connected", "timestamp": _saudi_time.now_iso(), "version": AI_ANALYSIS_VERSION})
-        
+        init_msg = json_dumps({"type": "connection", "status": "connected", "timestamp": _saudi_time.now_iso(), "version": AI_ANALYSIS_VERSION})
+        await websocket.send_text(init_msg) if _HAS_ORJSON else await websocket.send_json({"type": "connection", "status": "connected", "timestamp": _saudi_time.now_iso(), "version": AI_ANALYSIS_VERSION})
         while True:
             try:
                 data = await websocket.receive_json()
                 if data.get("type") == "subscribe" and (symbol := data.get("symbol")):
                     await _ws_manager.subscribe(websocket, symbol)
-                    if _HAS_ORJSON:
-                        await websocket.send_text(json_dumps({"type": "subscribed", "symbol": symbol, "timestamp": _saudi_time.now_iso()})) 
-                    else: 
-                        await websocket.send_json({"type": "subscribed", "symbol": symbol, "timestamp": _saudi_time.now_iso()})
+                    msg = json_dumps({"type": "subscribed", "symbol": symbol, "timestamp": _saudi_time.now_iso()})
+                    await websocket.send_text(msg) if _HAS_ORJSON else await websocket.send_json({"type": "subscribed", "symbol": symbol, "timestamp": _saudi_time.now_iso()})
                 elif data.get("type") == "unsubscribe" and (symbol := data.get("symbol")):
                     await _ws_manager.unsubscribe(websocket, symbol)
-                    if _HAS_ORJSON:
-                        await websocket.send_text(json_dumps({"type": "unsubscribed", "symbol": symbol, "timestamp": _saudi_time.now_iso()})) 
-                    else: 
-                        await websocket.send_json({"type": "unsubscribed", "symbol": symbol, "timestamp": _saudi_time.now_iso()})
+                    msg = json_dumps({"type": "unsubscribed", "symbol": symbol, "timestamp": _saudi_time.now_iso()})
+                    await websocket.send_text(msg) if _HAS_ORJSON else await websocket.send_json({"type": "unsubscribed", "symbol": symbol, "timestamp": _saudi_time.now_iso()})
                 elif data.get("type") == "ping":
-                    if _HAS_ORJSON:
-                        await websocket.send_text(json_dumps({"type": "pong", "timestamp": _saudi_time.now_iso()})) 
-                    else: 
-                        await websocket.send_json({"type": "pong", "timestamp": _saudi_time.now_iso()})
-            except WebSocketDisconnect: 
-                break
+                    msg = json_dumps({"type": "pong", "timestamp": _saudi_time.now_iso()})
+                    await websocket.send_text(msg) if _HAS_ORJSON else await websocket.send_json({"type": "pong", "timestamp": _saudi_time.now_iso()})
+            except WebSocketDisconnect: break
             except Exception as e:
                 logger.error(f"WebSocket error: {e}")
-                if _HAS_ORJSON:
-                    await websocket.send_text(json_dumps({"type": "error", "error": str(e), "timestamp": _saudi_time.now_iso()})) 
-                else: 
-                    await websocket.send_json({"type": "error", "error": str(e), "timestamp": _saudi_time.now_iso()})
+                msg = json_dumps({"type": "error", "error": str(e), "timestamp": _saudi_time.now_iso()})
+                await websocket.send_text(msg) if _HAS_ORJSON else await websocket.send_json({"type": "error", "error": str(e), "timestamp": _saudi_time.now_iso()})
     finally:
         await _ws_manager.disconnect(websocket)
 
