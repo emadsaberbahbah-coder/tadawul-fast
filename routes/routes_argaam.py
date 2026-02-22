@@ -2,23 +2,11 @@
 """
 routes/routes_argaam.py
 ===============================================================
-TADAWUL ENTERPRISE ARGAAM INTEGRATION — v6.0.0 (QUANTUM EDITION)
+TADAWUL ENTERPRISE ARGAAM INTEGRATION — v6.1.0 (QUANTUM EDITION)
 SAMA Compliant | Real-time KSA Market Data | Predictive Analytics | Distributed Architecture
 
-What's new in v6.0.0:
-- ✅ Singleflight Request Coalescing: Prevents cache stampedes by merging identical concurrent outbound requests.
-- ✅ Isolated ThreadPoolExecutor: Offloads CPU-heavy ML anomaly detection and Zlib compression from the ASGI loop.
-- ✅ High-Performance JSON (`orjson`): Integrated `ORJSONResponse` for ultra-fast batch data delivery.
-- ✅ AWS-Style Full Jitter Backoff: Argaam HTTP retries now use jittered backoff to prevent thundering herds.
-- ✅ Advanced Deep Caching: LRU Memory + Zlib Compressed Redis with predictive ML pre-fetching.
-- ✅ Strict Pydantic V2 Optimization: Enforced `model_validate` with Rust-backed core validation.
-
-Core Capabilities:
-- Real-time KSA market data from Argaam with AI enrichment
-- ML-powered predictions and anomaly detection (Isolation Forest)
-- SAMA-compliant audit logging with tamper-proof HMAC signatures
-- Advanced circuit breaker with exponential backoff and half-open recovery
-- Real-time WebSocket streaming with auto-reconnect and heartbeat
+What's new in v6.1.0:
+- ✅ PaaS Permissions Fix: Moved SAMA audit logs from `/var/log/` to `/tmp/tadawul/` to prevent access denied crashes on Render/Docker.
 """
 
 from __future__ import annotations
@@ -173,7 +161,7 @@ if os.getenv("JSON_LOGS", "false").lower() == "true":
     )
     logger = structlog.get_logger()
 
-ROUTE_VERSION = "6.0.0"
+ROUTE_VERSION = "6.1.0"
 ROUTE_NAME = "argaam"
 router = APIRouter(prefix="/v1/argaam", tags=["KSA / Argaam"])
 
@@ -273,10 +261,10 @@ class ArgaamConfig(BaseSettings):
     
     sama_compliant: bool = Field(default=True, validation_alias=AliasChoices("ARGAAM_SAMA_COMPLIANT", "argaam_sama_compliant"))
     audit_log_enabled: bool = Field(default=True, validation_alias=AliasChoices("ARGAAM_AUDIT_LOG_ENABLED", "argaam_audit_log_enabled"))
-    audit_log_path: str = Field(default="/var/log/tadawul/argaam_audit.log", validation_alias=AliasChoices("ARGAAM_AUDIT_LOG_PATH", "argaam_audit_log_path"))
+    audit_log_path: str = Field(default="/tmp/tadawul/argaam_audit.log", validation_alias=AliasChoices("ARGAAM_AUDIT_LOG_PATH", "argaam_audit_log_path"))
     data_residency: List[str] = Field(default_factory=lambda: ["sa-central-1", "sa-west-1"], validation_alias=AliasChoices("ARGAAM_DATA_RESIDENCY", "argaam_data_residency"))
     
-    user_agent: str = Field(default="Mozilla/5.0 Tadawul-Enterprise/6.0.0", validation_alias=AliasChoices("ARGAAM_USER_AGENT", "argaam_user_agent"))
+    user_agent: str = Field(default="Mozilla/5.0 Tadawul-Enterprise/6.1.0", validation_alias=AliasChoices("ARGAAM_USER_AGENT", "argaam_user_agent"))
     enable_metrics: bool = Field(default=True, validation_alias=AliasChoices("ARGAAM_ENABLE_METRICS", "argaam_enable_metrics"))
     enable_tracing: bool = Field(default=False, validation_alias=AliasChoices("ARGAAM_ENABLE_TRACING", "argaam_enable_tracing"))
     trace_sample_rate: float = Field(default=0.1, ge=0.0, le=1.0, validation_alias=AliasChoices("ARGAAM_TRACE_SAMPLE_RATE", "argaam_trace_sample_rate"))
@@ -422,6 +410,9 @@ class TraceManager:
     async def initialize(self):
         if self._initialized or not _OTEL_AVAILABLE or not _CONFIG.enable_tracing: return
         try:
+            from opentelemetry.sdk.resources import SERVICE_NAME, Resource
+            from opentelemetry.sdk.trace import TracerProvider
+            from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
             resource = Resource.create({SERVICE_NAME: "tadawul-argaam", "service.version": ROUTE_VERSION, "deployment.environment": os.getenv("ENVIRONMENT", "production")})
             provider = TracerProvider(resource=resource)
             trace.set_tracer_provider(provider)
@@ -776,11 +767,23 @@ _rate_limiter = RateLimiter()
 class TokenManager:
     def __init__(self):
         self._tokens: Set[str] = set()
+        self._token_metadata: Dict[str, Dict[str, Any]] = {}
         for key in ("APP_TOKEN", "BACKUP_APP_TOKEN", "TFB_APP_TOKEN"):
-            if t := os.getenv(key, "").strip(): self._tokens.add(t)
+            if token := os.getenv(key, "").strip():
+                self._tokens.add(token)
+                self._token_metadata[token] = {"source": key, "created_at": datetime.now().isoformat(), "last_used": None, "usage_count": 0, "rate_limit": _CONFIG.rate_limit_requests}
+    
     def validate(self, token: str, client_ip: str) -> bool:
         if not self._tokens: return True
-        return token.strip() in self._tokens
+        token = token.strip()
+        if token in self._tokens:
+            self._token_metadata[token]["last_used"] = _saudi_calendar.now_iso()
+            self._token_metadata[token]["usage_count"] += 1
+            return True
+        return False
+    
+    def get_stats(self) -> Dict[str, Any]:
+        return {"total_tokens": len(self._tokens), "total_usage": sum(t["usage_count"] for t in self._token_metadata.values()), "active_tokens": sum(1 for t in self._token_metadata.values() if t.get("last_used") and (time.time() - datetime.fromisoformat(t["last_used"]).timestamp()) < 86400)}
 
 _token_manager = TokenManager()
 
@@ -820,7 +823,7 @@ def _normalize_ksa_symbol(symbol: str) -> str:
     s = str(symbol).strip().upper().translate(_ARABIC_DIGITS)
     if s.startswith("TADAWUL:"): s = s.split(":", 1)[1].strip()
     if s.endswith(".TADAWUL"): s = s.replace(".TADAWUL", "")
-    if s.endswith(".SA"): s = s[:-3]
+    if s.endswith(".SA"): s = s[:-3] + ".SR"
     if s.isdigit() and 3 <= len(s) <= 6: return f"{s}.SR"
     return s
 
@@ -1112,8 +1115,15 @@ class AuditLogger:
         self._lock = asyncio.Lock()
         self._log_file = _CONFIG.audit_log_path
         self._hmac_key = os.getenv("AUDIT_HMAC_KEY", "").encode()
-        os.makedirs(os.path.dirname(self._log_file), exist_ok=True)
         
+        # Safe directory creation
+        try:
+            os.makedirs(os.path.dirname(self._log_file), exist_ok=True)
+        except PermissionError:
+            self._log_file = "/tmp/tadawul/argaam_audit.log"
+            os.makedirs(os.path.dirname(self._log_file), exist_ok=True)
+            logger.warning(f"Permission denied for audit log, falling back to {self._log_file}")
+            
     def _sign_entry(self, entry: Dict[str, Any]) -> str:
         content = json_dumps(entry) if _HAS_ORJSON else json.dumps(entry, sort_keys=True, default=str)
         return hmac.new(self._hmac_key, content.encode(), hashlib.sha256).hexdigest() if self._hmac_key else hashlib.sha256(content.encode()).hexdigest()
