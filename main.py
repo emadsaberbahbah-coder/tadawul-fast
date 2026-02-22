@@ -2,17 +2,16 @@
 """
 main.py
 ===========================================================
-TADAWUL FAST BRIDGE – ENTERPRISE FASTAPI ENTRY POINT (v8.2.0)
+TADAWUL FAST BRIDGE – ENTERPRISE FASTAPI ENTRY POINT (v8.3.0)
 ===========================================================
 QUANTUM EDITION | MISSION CRITICAL | DIRECT MOUNT
 
-What's new in v8.2.0:
+What's new in v8.3.0:
+- ✅ Engine Discovery Fix: Targets `core.data_engine` directly rather than the deprecated `v2` namespace.
+- ✅ Traceback Visibility: `safe_import` now loudly logs the exact `ImportError` tracebacks so broken routers can be debugged immediately.
+- ✅ Broadened Router Plan: Added fallback namespaces (e.g., `core.enriched_quote`) to catch routers living in the `core/` directory.
 - ✅ Guaranteed Routing: Removed the deferred "lazy mount" logic that caused 404 errors. All routers are now strictly mounted synchronously on boot.
 - ✅ ReadyZ Patch: Added the `"status": "ok"` field to the `/readyz` endpoint to satisfy external completeness tests.
-- ✅ Limiter Crash Resolved: Relying strictly on FastAPI's SlowAPIMiddleware.
-- ✅ Fail-Safe Sentry Init: Strict URI parsing for SENTRY_DSN prevents `BadDsn` exceptions on startup.
-- ✅ Advanced Security Headers: Automatically injects HSTS, CSP, XSS-Protection, and Server-Timing headers.
-- ✅ Hardened ASGI Lifespan: Prevents memory leaks by ensuring robust cancellation of orphaned tasks on shutdown.
 
 Core Capabilities
 -----------------
@@ -23,7 +22,6 @@ Core Capabilities
 • Advanced rate limiting with slowapi integration
 • Prometheus metrics export
 • Structured logging with multiple outputs (JSON, text)
-• Graceful shutdown with connection draining
 """
 
 from __future__ import annotations
@@ -163,7 +161,7 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-APP_ENTRY_VERSION = "8.2.0"
+APP_ENTRY_VERSION = "8.3.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled", "ok", "active"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled"}
@@ -241,9 +239,11 @@ def get_cpu_percent() -> float:
     return 0.0
 
 def safe_import(module_path: str) -> Optional[Any]:
-    try: return import_module(module_path)
+    try: 
+        return import_module(module_path)
     except Exception as e:
-        logging.getLogger("boot").debug(f"Optional module skipped: {module_path} ({e})")
+        # V8.3: Stop swallowing exceptions so we can actually debug broken routes!
+        logging.getLogger("boot").error(f"❌ Failed to import '{module_path}': {e}\n{traceback.format_exc()}")
         return None
 
 def is_valid_uri(uri: str) -> bool:
@@ -737,7 +737,8 @@ async def init_engine_resilient(app: FastAPI, max_retries: int = 3) -> None:
     
     for attempt in range(max_retries):
         try:
-            engine_module = safe_import("core.data_engine_v2")
+            # V8.3 Fix: Try core.data_engine first, then fallback to core.data_engine_v2
+            engine_module = safe_import("core.data_engine") or safe_import("core.data_engine_v2")
             if not engine_module or not hasattr(engine_module, "get_engine"):
                 app.state.engine_error = "Engine module not available"
                 boot_logger.warning(app.state.engine_error)
@@ -770,11 +771,11 @@ async def init_engine_resilient(app: FastAPI, max_retries: int = 3) -> None:
 # =============================================================================
 ROUTER_PLAN: List[Tuple[str, List[str]]] = [
     ("Advanced", ["routes.advanced_analysis", "routes.advanced"]),
-    ("Advisor", ["routes.investment_advisor", "routes.advisor"]),
+    ("Advisor", ["routes.advisor", "routes.investment_advisor", "core.investment_advisor"]),
     ("KSA", ["routes.routes_argaam", "routes.argaam"]),
-    ("Enriched", ["routes.enriched_quote", "routes.enriched"]),
+    ("Enriched", ["routes.enriched_quote", "routes.enriched", "core.enriched_quote"]),
     ("Analysis", ["routes.ai_analysis", "routes.analysis"]),
-    ("System", ["routes.config", "routes.system"]),
+    ("System", ["routes.config", "routes.system", "core.legacy_service"]),
     ("WebSocket", ["routes.websocket"]),
     ("Metrics", ["routes.metrics"]),
     ("Health", ["routes.health"]),
