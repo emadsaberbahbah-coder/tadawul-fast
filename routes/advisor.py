@@ -2,14 +2,14 @@
 """
 routes/advisor.py
 ------------------------------------------------------------
-TADAWUL ENTERPRISE ADVISOR ENGINE — v4.4.0 (NEXT-GEN ENTERPRISE)
+TADAWUL ENTERPRISE ADVISOR ENGINE — v4.5.0 (NEXT-GEN ENTERPRISE)
 SAMA Compliant | Multi-Asset | Real-time ML | Dynamic Allocation | Audit Trail
 
-What's new in v4.4.0:
-- ✅ Code Readability & PEP-8 Alignment: Completely unpacked all massive one-liners into clean, structured Python for enhanced maintainability.
-- ✅ Centralized Serialization: `_serialize_response` strictly enforced to safely strip `None` values and protect `orjson` from Enum/UUID casting errors.
-- ✅ Strict ML Feature Coercion: Safely coalesces missing numeric values to `0.0` before ML inference.
-- ✅ WebSocket Loop Optimization: Rendered payloads are cached as strings before broadcasting to prevent redundant JSON encoding.
+What's new in v4.5.0:
+- ✅ Strict Missing Data Handling: Introduced `_safe_float` to sanitize `NaN` and `Infinity` into `None` natively during data extraction.
+- ✅ Pydantic Serialization Fix: Transitioned to `model_dump(mode='python')` to prevent Rust-core crashes on mathematical anomalies, delegating final cleanup to `orjson`.
+- ✅ Complete Endpoint Sandboxing: Core routes are strictly wrapped in exception handlers to prevent raw 500 Internal Server Errors from escaping.
+- ✅ Code Readability & PEP-8 Alignment: Unpacked all massive one-liners into clean, structured Python.
 - ✅ Division-by-Zero Guards: Hardened the Portfolio Optimizer Modern Portfolio Theory (MPT) mathematics.
 
 Core Capabilities:
@@ -33,6 +33,7 @@ import random
 import re
 import time
 import uuid
+import traceback
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, is_dataclass
@@ -52,15 +53,42 @@ from fastapi import (
 )
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
+def clean_nans(obj: Any) -> Any:
+    """Recursively replaces NaN and Infinity with None to prevent orjson 500 crashes."""
+    if isinstance(obj, dict):
+        return {k: clean_nans(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [clean_nans(v) for v in obj]
+    elif isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+        return None
+    return obj
+
+def _safe_float(v: Any, default: Optional[float] = None) -> Optional[float]:
+    """Safely cast to float, rejecting NaN and Infinity."""
+    if v is None:
+        return default
+    try:
+        f = float(v)
+        if math.isnan(f) or math.isinf(f):
+            return default
+        return f
+    except (TypeError, ValueError):
+        return default
+
 # ---------------------------------------------------------------------------
 # High-Performance JSON fallback
 # ---------------------------------------------------------------------------
 try:
     import orjson
-    from fastapi.responses import ORJSONResponse as BestJSONResponse
+    from fastapi.responses import Response
     
+    class BestJSONResponse(Response):
+        media_type = "application/json"
+        def render(self, content: Any) -> bytes:
+            return orjson.dumps(clean_nans(content), default=str)
+            
     def json_dumps(v, *, default=str): 
-        return orjson.dumps(v, default=default).decode('utf-8')
+        return orjson.dumps(clean_nans(v), default=default).decode('utf-8')
         
     def json_loads(v): 
         return orjson.loads(v)
@@ -68,10 +96,14 @@ try:
     _HAS_ORJSON = True
 except ImportError:
     import json
-    from fastapi.responses import JSONResponse as BestJSONResponse
+    from fastapi.responses import JSONResponse as BaseJSONResponse
     
+    class BestJSONResponse(BaseJSONResponse):
+        def render(self, content: Any) -> bytes:
+            return json.dumps(clean_nans(content), default=str, ensure_ascii=False).encode("utf-8")
+            
     def json_dumps(v, *, default=str): 
-        return json.dumps(v, default=default)
+        return json.dumps(clean_nans(v), default=default)
         
     def json_loads(v): 
         return json.loads(v)
@@ -143,11 +175,11 @@ except ImportError:
 
 logger = logging.getLogger("routes.advisor")
 
-ADVISOR_ROUTE_VERSION = "4.4.0"
+ADVISOR_ROUTE_VERSION = "4.5.0"
 router = APIRouter(prefix="/v1/advisor", tags=["advisor"])
 
 # =============================================================================
-# Enums & Types (v4.4.0 FlexibleEnum Upgrade)
+# Enums & Types (v4.5.0 FlexibleEnum Upgrade)
 # =============================================================================
 
 class FlexibleEnum(str, Enum):
@@ -232,7 +264,7 @@ class AlertPriority(FlexibleEnum):
 
 @dataclass(slots=True)
 class AdvisorConfig:
-    """Dynamic configuration with hot-reload support"""
+    """Dynamic configuration with memory optimization"""
     max_concurrent_requests: int = 100
     default_top_n: int = 50
     max_top_n: int = 500
@@ -751,8 +783,10 @@ def _serialize_response(model_instance: BaseModel) -> Dict[str, Any]:
     Strips None values to reduce payload size and prevents 500 errors on Enums.
     """
     if _PYDANTIC_V2:
-        return model_instance.model_dump(mode='json', exclude_none=True)
-    return json_loads(model_instance.json(exclude_none=True))
+        # Use mode='python' to properly export structures for json serialization down the line
+        raw_dict = model_instance.model_dump(mode='python', exclude_none=True)
+        return clean_nans(raw_dict)
+    return clean_nans(json_loads(model_instance.json(exclude_none=True)))
 
 # =============================================================================
 # ML Model Manager (Lazy Loading)
@@ -854,7 +888,7 @@ class PortfolioOptimizer:
             
         try:
             n = len(symbols)
-            returns = np.array([expected_returns.get(s, 0.0) for s in symbols])
+            returns = np.array([_safe_float(expected_returns.get(s, 0.0), 0.0) for s in symbols])
             
             if cov_matrix is None: 
                 cov_matrix = np.eye(n) * 0.1
@@ -1108,18 +1142,18 @@ class AdvisorEngine:
     def _extract_features(self, data: Dict[str, Any], symbol: str) -> MLFeatures:
         return MLFeatures(
             symbol=symbol, 
-            price=data.get("price") or 0.0, 
-            volume=data.get("volume") or 0, 
-            market_cap=data.get("market_cap") or 0.0,
-            pe_ratio=data.get("pe_ratio") or 0.0, 
-            pb_ratio=data.get("pb_ratio") or 0.0, 
-            dividend_yield=data.get("dividend_yield") or 0.0,
-            beta=data.get("beta") or 1.0, 
-            volatility_30d=data.get("volatility_30d") or 0.0, 
-            momentum_14d=data.get("momentum_14d") or 0.0,
-            rsi_14d=data.get("rsi_14d") or 50.0, 
-            macd=data.get("macd") or 0.0, 
-            macd_signal=data.get("macd_signal") or 0.0
+            price=_safe_float(data.get("price") or data.get("current_price")), 
+            volume=_safe_float(data.get("volume"), 0), 
+            market_cap=_safe_float(data.get("market_cap")),
+            pe_ratio=_safe_float(data.get("pe_ratio") or data.get("pe_ttm")), 
+            pb_ratio=_safe_float(data.get("pb_ratio") or data.get("pb")), 
+            dividend_yield=_safe_float(data.get("dividend_yield")),
+            beta=_safe_float(data.get("beta"), 1.0), 
+            volatility_30d=_safe_float(data.get("volatility_30d")), 
+            momentum_14d=_safe_float(data.get("momentum_14d") or data.get("returns_1m")),
+            rsi_14d=_safe_float(data.get("rsi_14d") or data.get("rsi_14"), 50.0), 
+            macd=_safe_float(data.get("macd") or data.get("macd_line")), 
+            macd_signal=_safe_float(data.get("macd_signal"))
         )
     
     async def _build_recommendation(
@@ -1136,10 +1170,10 @@ class AdvisorEngine:
         confidence = ml_prediction.confidence_1d if ml_prediction else 0.5
         
         var_95, cvar_95 = None, None
-        price = data.get("price")
+        price = _safe_float(data.get("current_price") or data.get("price"))
         
         if data.get("volatility_30d") and price:
-            volatility = data.get("volatility_30d", 20) / 100
+            volatility = _safe_float(data.get("volatility_30d"), 20) / 100
             var_95 = -1.645 * volatility * 100 
             cvar_95 = -2.063 * volatility * 100 
             
@@ -1163,27 +1197,27 @@ class AdvisorEngine:
             asset_class=AssetClass.EQUITY, 
             shariah_compliant=shariah_compliant, 
             current_price=price,
-            target_price_1m=data.get("forecast_price_1m"), 
-            target_price_3m=data.get("forecast_price_3m"),
-            target_price_12m=data.get("forecast_price_12m"), 
-            expected_return_1m=data.get("expected_roi_1m"),
-            expected_return_3m=data.get("expected_roi_3m"), 
-            expected_return_12m=data.get("expected_roi_12m"),
+            target_price_1m=_safe_float(data.get("forecast_price_1m")), 
+            target_price_3m=_safe_float(data.get("forecast_price_3m")),
+            target_price_12m=_safe_float(data.get("forecast_price_12m")), 
+            expected_return_1m=_safe_float(data.get("expected_roi_1m")),
+            expected_return_3m=_safe_float(data.get("expected_roi_3m")), 
+            expected_return_12m=_safe_float(data.get("expected_roi_12m")),
             risk_score=risk_score, 
-            volatility=data.get("volatility_30d"), 
-            beta=data.get("beta"),
-            sharpe_ratio=data.get("sharpe_ratio"), 
+            volatility=_safe_float(data.get("volatility_30d")), 
+            beta=_safe_float(data.get("beta")),
+            sharpe_ratio=_safe_float(data.get("sharpe_ratio")), 
             var_95=var_95, 
             cvar_95=cvar_95, 
             ml_prediction=ml_prediction,
             confidence_score=confidence, 
             factor_importance=ml_prediction.factors if ml_prediction else {},
-            pe_ratio=data.get("pe_ratio"), 
-            pb_ratio=data.get("pb_ratio"), 
-            dividend_yield=data.get("dividend_yield"),
-            market_cap=data.get("market_cap"), 
-            rsi_14d=data.get("rsi_14d"), 
-            macd=data.get("macd"),
+            pe_ratio=_safe_float(data.get("pe_ratio") or data.get("pe_ttm")), 
+            pb_ratio=_safe_float(data.get("pb_ratio") or data.get("pb")), 
+            dividend_yield=_safe_float(data.get("dividend_yield")),
+            market_cap=_safe_float(data.get("market_cap")), 
+            rsi_14d=_safe_float(data.get("rsi_14d") or data.get("rsi_14")), 
+            macd=_safe_float(data.get("macd")),
             reasoning=reasoning, 
             data_quality="GOOD" if price else "PARTIAL"
         )
@@ -1349,110 +1383,118 @@ async def advisor_recommendations(
     request_id = x_request_id or str(uuid.uuid4())
     start_time = time.time()
     
-    client_ip = request.client.host if request.client else "unknown"
-    if not await _rate_limiter.check(client_ip): 
-        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded")
-    
-    auth_token = x_app_token or token or ""
-    if authorization and authorization.startswith("Bearer "): 
-        auth_token = authorization[7:]
-    if not _token_manager.validate_token(auth_token): 
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-    
-    async with TraceContext("parse_request", {"request_id": request_id}):
-        try:
-            req = AdvisorRequest.model_validate(body) if _PYDANTIC_V2 else AdvisorRequest.parse_obj(body)
-            req.request_id = request_id
-        except Exception as e:
-            await _audit.log("validation_error", auth_token[:8], "advisor", "recommendations", "error", {"error": str(e)}, request_id)
-            err_resp = {"status": "error", "error": f"Invalid request: {str(e)}", "headers": [], "rows": [], "request_id": request_id, "meta": {"duration_ms": (time.time() - start_time) * 1000}}
-            return BestJSONResponse(status_code=400, content=err_resp)
-    
-    if req.enable_ml_predictions: 
-        asyncio.create_task(_ml_models.initialize())
-    
-    async with TraceContext("get_engine"):
-        engine = await _advisor_engine.get_engine(request)
+    try:
+        client_ip = request.client.host if request.client else "unknown"
+        if not await _rate_limiter.check(client_ip): 
+            raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded")
         
-    if not engine: 
-        err_resp = {"status": "error", "error": "Advisor engine unavailable", "headers": [], "rows": [], "request_id": request_id, "meta": {"duration_ms": (time.time() - start_time) * 1000}}
-        return BestJSONResponse(status_code=503, content=err_resp)
-    
-    async with TraceContext("get_recommendations", {"symbol_count": len(req.tickers or []), "top_n": req.top_n}):
-        recommendations, rec_meta = await _advisor_engine.get_recommendations(req, engine, request_id)
-    
-    portfolio = None
-    async with TraceContext("optimize_portfolio"):
-        if recommendations and req.invest_amount:
-            expected_returns = {r.symbol: (r.expected_return_12m or 0) / 100.0 for r in recommendations}
-            symbols = [r.symbol for r in recommendations]
-            portfolio = await _portfolio_optimizer.optimize(
-                symbols, 
-                expected_returns, 
-                constraints={
-                    "max_position_pct": _CONFIG.max_position_pct, 
-                    "min_position_pct": _CONFIG.min_position_pct
-                }
-            )
-            for rec in recommendations:
-                rec.weight = portfolio["weights"].get(rec.symbol, 0)
-                rec.allocated_amount = rec.weight * req.invest_amount
-                if rec.expected_return_1m: rec.expected_gain_1m = rec.allocated_amount * (rec.expected_return_1m / 100.0)
-                if rec.expected_return_3m: rec.expected_gain_3m = rec.allocated_amount * (rec.expected_return_3m / 100.0)
-                if rec.expected_return_12m: rec.expected_gain_12m = rec.allocated_amount * (rec.expected_return_12m / 100.0)
-    
-    headers = _get_default_headers()
-    rows = _recommendations_to_rows(recommendations, headers)
-    status_val = "success" if rec_meta["symbols_failed"] == 0 else "partial" if rec_meta["symbols_succeeded"] > 0 else "error"
-    market_condition = _determine_market_condition(recommendations)
-    ml_predictions = {r.symbol: r.ml_prediction for r in recommendations if r.ml_prediction} if req.enable_ml_predictions else None
-    shariah_summary = {"total": len(recommendations), "compliant": rec_meta.get("shariah_compliant", 0), "non_compliant": len(recommendations) - rec_meta.get("shariah_compliant", 0)}
-    
-    if _PROMETHEUS_AVAILABLE: 
-        _metrics.counter("requests_total", "Request totals", ["status"]).labels(status=status_val).inc()
-    
-    asyncio.create_task(_audit.log(
-        "recommendations", 
-        auth_token[:8], 
-        "advisor", 
-        "generate", 
-        status_val, 
-        {
-            "symbols": len(req.tickers or []), 
-            "recommendations": len(recommendations), 
-            "portfolio_value": req.invest_amount
-        }, 
-        request_id
-    ))
-    
-    response = AdvisorResponse(
-        status=status_val, 
-        error=f"{rec_meta['symbols_failed']} symbols failed" if rec_meta["symbols_failed"] > 0 else None,
-        warnings=[], 
-        headers=headers, 
-        rows=rows, 
-        recommendations=recommendations, 
-        portfolio=portfolio,
-        ml_predictions=ml_predictions, 
-        market_condition=market_condition, 
-        shariah_summary=shariah_summary,
-        model_versions=_ml_models.get_model_versions() if _ml_models._initialized else None, 
-        version=ADVISOR_ROUTE_VERSION,
-        request_id=request_id, 
-        meta={
-            "duration_ms": (time.time() - start_time) * 1000, 
-            "symbols_processed": rec_meta["symbols_processed"], 
-            "symbols_succeeded": rec_meta["symbols_succeeded"], 
-            "symbols_failed": rec_meta["symbols_failed"], 
-            "ml_predictions": rec_meta["ml_predictions"], 
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(), 
-            "timestamp_riyadh": _saudi_time.format_iso(), 
-            "trading_hours": _saudi_time.is_trading_hours()
-        }
-    )
-    
-    # V4.4.0 FIX: Strip None fields entirely to save bandwidth & prevent generic parse errors on Pydantic Enums
-    return BestJSONResponse(content=_serialize_response(response))
+        auth_token = x_app_token or token or ""
+        if authorization and authorization.startswith("Bearer "): 
+            auth_token = authorization[7:]
+        if not _token_manager.validate_token(auth_token): 
+            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+        
+        async with TraceContext("parse_request", {"request_id": request_id}):
+            try:
+                req = AdvisorRequest.model_validate(body) if _PYDANTIC_V2 else AdvisorRequest.parse_obj(body)
+                req.request_id = request_id
+            except Exception as e:
+                await _audit.log("validation_error", auth_token[:8], "advisor", "recommendations", "error", {"error": str(e)}, request_id)
+                err_resp = {"status": "error", "error": f"Invalid request: {str(e)}", "headers": [], "rows": [], "request_id": request_id, "meta": {"duration_ms": (time.time() - start_time) * 1000}}
+                return BestJSONResponse(status_code=400, content=err_resp)
+        
+        if req.enable_ml_predictions: 
+            asyncio.create_task(_ml_models.initialize())
+        
+        async with TraceContext("get_engine"):
+            engine = await _advisor_engine.get_engine(request)
+            
+        if not engine: 
+            err_resp = {"status": "error", "error": "Advisor engine unavailable", "headers": [], "rows": [], "request_id": request_id, "meta": {"duration_ms": (time.time() - start_time) * 1000}}
+            return BestJSONResponse(status_code=503, content=err_resp)
+        
+        async with TraceContext("get_recommendations", {"symbol_count": len(req.tickers or []), "top_n": req.top_n}):
+            recommendations, rec_meta = await _advisor_engine.get_recommendations(req, engine, request_id)
+        
+        portfolio = None
+        async with TraceContext("optimize_portfolio"):
+            if recommendations and req.invest_amount:
+                expected_returns = {r.symbol: (r.expected_return_12m or 0) / 100.0 for r in recommendations}
+                symbols = [r.symbol for r in recommendations]
+                portfolio = await _portfolio_optimizer.optimize(
+                    symbols, 
+                    expected_returns, 
+                    constraints={
+                        "max_position_pct": _CONFIG.max_position_pct, 
+                        "min_position_pct": _CONFIG.min_position_pct
+                    }
+                )
+                for rec in recommendations:
+                    rec.weight = portfolio["weights"].get(rec.symbol, 0)
+                    rec.allocated_amount = rec.weight * req.invest_amount
+                    if rec.expected_return_1m: rec.expected_gain_1m = rec.allocated_amount * (rec.expected_return_1m / 100.0)
+                    if rec.expected_return_3m: rec.expected_gain_3m = rec.allocated_amount * (rec.expected_return_3m / 100.0)
+                    if rec.expected_return_12m: rec.expected_gain_12m = rec.allocated_amount * (rec.expected_return_12m / 100.0)
+        
+        headers = _get_default_headers()
+        rows = _recommendations_to_rows(recommendations, headers)
+        status_val = "success" if rec_meta["symbols_failed"] == 0 else "partial" if rec_meta["symbols_succeeded"] > 0 else "error"
+        market_condition = _determine_market_condition(recommendations)
+        ml_predictions = {r.symbol: r.ml_prediction for r in recommendations if r.ml_prediction} if req.enable_ml_predictions else None
+        shariah_summary = {"total": len(recommendations), "compliant": rec_meta.get("shariah_compliant", 0), "non_compliant": len(recommendations) - rec_meta.get("shariah_compliant", 0)}
+        
+        if _PROMETHEUS_AVAILABLE: 
+            _metrics.counter("requests_total", "Request totals", ["status"]).labels(status=status_val).inc()
+        
+        asyncio.create_task(_audit.log(
+            "recommendations", 
+            auth_token[:8], 
+            "advisor", 
+            "generate", 
+            status_val, 
+            {
+                "symbols": len(req.tickers or []), 
+                "recommendations": len(recommendations), 
+                "portfolio_value": req.invest_amount
+            }, 
+            request_id
+        ))
+        
+        response = AdvisorResponse(
+            status=status_val, 
+            error=f"{rec_meta['symbols_failed']} symbols failed" if rec_meta["symbols_failed"] > 0 else None,
+            warnings=[], 
+            headers=headers, 
+            rows=rows, 
+            recommendations=recommendations, 
+            portfolio=portfolio,
+            ml_predictions=ml_predictions, 
+            market_condition=market_condition, 
+            shariah_summary=shariah_summary,
+            model_versions=_ml_models.get_model_versions() if _ml_models._initialized else None, 
+            version=ADVISOR_ROUTE_VERSION,
+            request_id=request_id, 
+            meta={
+                "duration_ms": (time.time() - start_time) * 1000, 
+                "symbols_processed": rec_meta["symbols_processed"], 
+                "symbols_succeeded": rec_meta["symbols_succeeded"], 
+                "symbols_failed": rec_meta["symbols_failed"], 
+                "ml_predictions": rec_meta["ml_predictions"], 
+                "timestamp_utc": datetime.now(timezone.utc).isoformat(), 
+                "timestamp_riyadh": _saudi_time.format_iso(), 
+                "trading_hours": _saudi_time.is_trading_hours()
+            }
+        )
+        
+        # V4.5.0 FIX: Strip None fields entirely to save bandwidth & prevent generic parse errors on Pydantic Enums
+        return BestJSONResponse(content=_serialize_response(response))
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Global catch in recommendations: {e}\n{traceback.format_exc()}")
+        err_resp = {"status": "error", "error": f"Internal Server Error: {e}", "headers": [], "rows": [], "request_id": request_id, "meta": {"duration_ms": (time.time() - start_time) * 1000}}
+        return BestJSONResponse(status_code=500, content=err_resp)
 
 
 @router.post("/run")
@@ -1545,5 +1587,4 @@ async def shutdown_event():
     await _ws_manager.stop()
 
 
-__all__ = ["router"]
 __all__ = ["router"]
