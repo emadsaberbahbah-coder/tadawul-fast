@@ -2,13 +2,14 @@
 """
 routes/ai_analysis.py
 ------------------------------------------------------------
-TADAWUL ENTERPRISE AI ANALYSIS ENGINE — v8.1.0 (NEXT-GEN ENTERPRISE)
+TADAWUL ENTERPRISE AI ANALYSIS ENGINE — v8.2.0 (NEXT-GEN ENTERPRISE)
 SAMA Compliant | Real-time ML | Predictive Analytics | Distributed Caching
 
-What's new in v8.1.0:
-- ✅ Pydantic V2 Resilience: Upgraded all Enums to `FlexibleEnum` with `_missing_` interceptors to permanently cure 500 Internal Server Errors caused by case-sensitivity mismatches.
-- ✅ High-Performance JSON (`orjson`): Integrated `ORJSONResponse` for ultra-fast predictive payload delivery
-- ✅ Non-Blocking ML Inference: Delegated all Scikit-Learn/Ensemble execution to ThreadPoolExecutors
+What's new in v8.2.0:
+- ✅ JSON Serialization Fix: Enforced Pydantic's `model_dump(mode='json')` and added a `default=str` fallback to `orjson` to permanently cure 500 Internal Server Errors when serializing Enums.
+- ✅ Pydantic V2 Resilience: Upgraded all Enums to `FlexibleEnum` with `_missing_` interceptors to cure case-sensitivity mismatches.
+- ✅ High-Performance JSON (`orjson`): Integrated `ORJSONResponse` for ultra-fast predictive payload delivery.
+- ✅ Non-Blocking ML Inference: Delegated all Scikit-Learn/Ensemble execution to ThreadPoolExecutors.
 
 Core Capabilities:
 - Real-time ML-powered analysis with ensemble models
@@ -61,13 +62,16 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 try:
     import orjson
     from fastapi.responses import ORJSONResponse as BestJSONResponse
-    def json_dumps(v, *, default=None): return orjson.dumps(v, default=default).decode('utf-8')
+    def json_dumps(v, *, default=None): 
+        # V8.2 FIX: Added safe string fallback for unhandled types (like Enums)
+        return orjson.dumps(v, default=default or str).decode('utf-8')
     def json_loads(v): return orjson.loads(v)
     _HAS_ORJSON = True
 except ImportError:
     import json
     from fastapi.responses import JSONResponse as BestJSONResponse
-    def json_dumps(v, *, default=None): return json.dumps(v, default=default)
+    def json_dumps(v, *, default=None): 
+        return json.dumps(v, default=default or str)
     def json_loads(v): return json.loads(v)
     _HAS_ORJSON = False
 
@@ -135,7 +139,7 @@ except ImportError:
 
 logger = logging.getLogger("routes.ai_analysis")
 
-AI_ANALYSIS_VERSION = "8.1.0"
+AI_ANALYSIS_VERSION = "8.2.0"
 router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 
 # =============================================================================
@@ -1318,7 +1322,9 @@ async def get_quote(
     response.last_updated_riyadh = _saudi_time.now_iso()
     
     asyncio.create_task(_audit_logger.log("get_quote", auth_token[:8], "quote", "read", "success", {"symbol": symbol, "duration": time.time() - start_time}, request_id))
-    return BestJSONResponse(content=json_loads(json_dumps(response.model_dump() if _PYDANTIC_V2 else response.dict())))
+    
+    # V8.2 FIX: Added mode='json' to natively serialize the FlexibleEnum strings without orjson crashing
+    return BestJSONResponse(content=response.model_dump(mode='json') if _PYDANTIC_V2 else json_loads(response.json()))
 
 @router.post("/quote", response_model=SingleAnalysisResponse)
 async def post_quote(
@@ -1343,11 +1349,11 @@ async def get_quotes(
     if not _token_manager.validate_token(auth_token): raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
     
     symbols = _parse_tickers(tickers)
-    if not symbols: return BestJSONResponse(content=json_loads(json_dumps(BatchAnalysisResponse(status="skipped", results=[], version=AI_ANALYSIS_VERSION, meta={"reason": "No tickers provided"}).model_dump() if _PYDANTIC_V2 else BatchAnalysisResponse(status="skipped", results=[], version=AI_ANALYSIS_VERSION, meta={"reason": "No tickers provided"}).dict())))
+    if not symbols: return BestJSONResponse(content=json_loads(json_dumps(BatchAnalysisResponse(status="skipped", results=[], version=AI_ANALYSIS_VERSION, meta={"reason": "No tickers provided"}).model_dump(mode='json') if _PYDANTIC_V2 else BatchAnalysisResponse(status="skipped", results=[], version=AI_ANALYSIS_VERSION, meta={"reason": "No tickers provided"}).dict())))
     symbols = symbols[:min(top_n, _CONFIG.max_tickers)] if top_n > 0 else symbols[:_CONFIG.max_tickers]
     
     engine = await _analysis_engine.get_engine(request)
-    if not engine: return BestJSONResponse(content=json_loads(json_dumps(BatchAnalysisResponse(status="error", error="Engine unavailable", results=[], version=AI_ANALYSIS_VERSION).model_dump() if _PYDANTIC_V2 else BatchAnalysisResponse(status="error", error="Engine unavailable", results=[], version=AI_ANALYSIS_VERSION).dict())))
+    if not engine: return BestJSONResponse(content=json_loads(json_dumps(BatchAnalysisResponse(status="error", error="Engine unavailable", results=[], version=AI_ANALYSIS_VERSION).model_dump(mode='json') if _PYDANTIC_V2 else BatchAnalysisResponse(status="error", error="Engine unavailable", results=[], version=AI_ANALYSIS_VERSION).dict())))
     
     results, stats = await _analysis_engine.get_quotes(engine, symbols, include_ml=include_ml)
     responses = [_quote_to_response(results.get(symbol) or _analysis_engine._create_placeholder(symbol, "No data")) for symbol in symbols]
@@ -1355,7 +1361,9 @@ async def get_quotes(
     asyncio.create_task(_audit_logger.log("get_quotes", auth_token[:8], "quotes", "read", "success", {"symbols": len(symbols), "duration": time.time() - start_time, "stats": stats}, request_id))
     
     response = BatchAnalysisResponse(status="success", results=responses, version=AI_ANALYSIS_VERSION, meta={"requested": len(symbols), "from_cache": stats["from_cache"], "from_engine": stats["from_engine"], "ml_predictions": stats["ml_predictions"], "errors": stats["errors"], "duration_ms": (time.time() - start_time) * 1000, "timestamp_utc": _saudi_time.now_utc_iso(), "timestamp_riyadh": _saudi_time.now_iso()})
-    return BestJSONResponse(content=json_loads(json_dumps(response.model_dump() if _PYDANTIC_V2 else response.dict())))
+    
+    # V8.2 FIX: Safe JSON dump handling for the full Batch payload
+    return BestJSONResponse(content=response.model_dump(mode='json') if _PYDANTIC_V2 else json_loads(response.json()))
 
 @router.post("/quotes", response_model=BatchAnalysisResponse)
 async def batch_quotes(
@@ -1437,12 +1445,18 @@ async def sheet_rows(
             elif "expected roi" in h_lower and "12m" in h_lower: row.append(lookup.get("expected_roi_12m"))
             elif "risk score" in h_lower: row.append(lookup.get("risk_score"))
             elif "overall score" in h_lower: row.append(lookup.get("overall_score"))
-            elif "recommendation" in h_lower: row.append(lookup.get("recommendation") or "HOLD")
-            elif "data quality" in h_lower: row.append(lookup.get("data_quality") or "PARTIAL")
+            elif "recommendation" in h_lower: row.append(str(lookup.get("recommendation", "HOLD")))
+            elif "data quality" in h_lower: row.append(str(lookup.get("data_quality", "PARTIAL")))
             elif "last updated (utc)" in h_lower: row.append(lookup.get("last_updated_utc"))
             elif "last updated (riyadh)" in h_lower: row.append(lookup.get("last_updated_riyadh") or _saudi_time.now().isoformat())
             else: row.append(lookup.get(h_lower))
         rows.append(row)
+        
+        if req.include_features:
+            features = MLFeatures(symbol=symbol, price=lookup.get("price"), volume=lookup.get("volume"), volatility_30d=lookup.get("volatility_30d"), momentum_14d=lookup.get("momentum_14d"), rsi_14d=lookup.get("rsi_14d"), macd=lookup.get("macd"), macd_signal=lookup.get("macd_signal"), bb_upper=lookup.get("bb_upper"), bb_lower=lookup.get("bb_lower"), bb_middle=lookup.get("bb_middle"), volume_profile=lookup.get("volume_profile"), market_cap=lookup.get("market_cap"), pe_ratio=lookup.get("pe_ratio"), dividend_yield=lookup.get("dividend_yield"), beta=lookup.get("beta"), sharpe_ratio=lookup.get("sharpe_ratio"), max_drawdown_30d=lookup.get("max_drawdown_30d"), correlation_sp500=lookup.get("correlation_sp500"), correlation_tasi=lookup.get("correlation_tasi"))
+            features_dict[symbol] = features
+        if req.include_predictions and features_dict and symbol in features_dict:
+            if prediction := await _ml_models.predict(features_dict[symbol]): predictions_dict[symbol] = prediction
 
     error_count = sum(1 for q in quotes.values() if isinstance(q, dict) and "error" in q)
     status_str = "success" if error_count == 0 else "partial" if error_count < len(req.symbols[:req.top_n]) else "error"
@@ -1455,9 +1469,10 @@ async def sheet_rows(
     if _CONFIG.adaptive_concurrency and _concurrency_controller.should_adjust(): _concurrency_controller.adjust()
     _concurrency_controller.record_request((time.time() - start_time) * 1000, status_str == "success")
     
+    # V8.2 FIX: Use safe default=str to seamlessly stringify Enums inside the raw Python list
     return BestJSONResponse(content=json_loads(json_dumps({
         "status": status_str, "headers": headers, "rows": rows, "features": features_dict, "predictions": predictions_dict, "error": f"{error_count} errors" if error_count > 0 else None, "version": AI_ANALYSIS_VERSION, "request_id": request_id, "meta": {"duration_ms": (time.time() - start_time) * 1000, "requested": len(req.symbols[:req.top_n]), "errors": error_count, "cache_stats": _cache.get_stats(), "concurrency": _concurrency_controller.current_concurrency, "riyadh_time": _saudi_time.now_iso(), "business_day": _saudi_time.is_trading_day()}
-    })))
+    }, default=str)))
 
 @router.get("/scoreboard")
 async def scoreboard(
@@ -1471,13 +1486,13 @@ async def scoreboard(
     auth_token = x_app_token or token or (authorization[7:] if authorization and authorization.startswith("Bearer ") else "")
     if not _token_manager.validate_token(auth_token): raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
     
-    if not _CONFIG.enable_scoreboard: return BestJSONResponse(content=json_loads(json_dumps(ScoreboardResponse(status="disabled", error="Scoreboard disabled", headers=[], rows=[], version=AI_ANALYSIS_VERSION).model_dump() if _PYDANTIC_V2 else ScoreboardResponse(status="disabled", error="Scoreboard disabled", headers=[], rows=[], version=AI_ANALYSIS_VERSION).dict())))
+    if not _CONFIG.enable_scoreboard: return BestJSONResponse(content=json_loads(json_dumps(ScoreboardResponse(status="disabled", error="Scoreboard disabled", headers=[], rows=[], version=AI_ANALYSIS_VERSION).model_dump(mode='json') if _PYDANTIC_V2 else ScoreboardResponse(status="disabled", error="Scoreboard disabled", headers=[], rows=[], version=AI_ANALYSIS_VERSION).dict())))
     
     symbols = _parse_tickers(tickers)[:top_n]
-    if not symbols: return BestJSONResponse(content=json_loads(json_dumps(ScoreboardResponse(status="skipped", headers=[], rows=[], version=AI_ANALYSIS_VERSION, meta={"reason": "No tickers provided"}).model_dump() if _PYDANTIC_V2 else ScoreboardResponse(status="skipped", headers=[], rows=[], version=AI_ANALYSIS_VERSION, meta={"reason": "No tickers provided"}).dict())))
+    if not symbols: return BestJSONResponse(content=json_loads(json_dumps(ScoreboardResponse(status="skipped", headers=[], rows=[], version=AI_ANALYSIS_VERSION, meta={"reason": "No tickers provided"}).model_dump(mode='json') if _PYDANTIC_V2 else ScoreboardResponse(status="skipped", headers=[], rows=[], version=AI_ANALYSIS_VERSION, meta={"reason": "No tickers provided"}).dict())))
     
     engine = await _analysis_engine.get_engine(request)
-    if not engine: return BestJSONResponse(content=json_loads(json_dumps(ScoreboardResponse(status="error", error="Engine unavailable", headers=[], rows=[], version=AI_ANALYSIS_VERSION).model_dump() if _PYDANTIC_V2 else ScoreboardResponse(status="error", error="Engine unavailable", headers=[], rows=[], version=AI_ANALYSIS_VERSION).dict())))
+    if not engine: return BestJSONResponse(content=json_loads(json_dumps(ScoreboardResponse(status="error", error="Engine unavailable", headers=[], rows=[], version=AI_ANALYSIS_VERSION).model_dump(mode='json') if _PYDANTIC_V2 else ScoreboardResponse(status="error", error="Engine unavailable", headers=[], rows=[], version=AI_ANALYSIS_VERSION).dict())))
     
     results, stats = await _analysis_engine.get_quotes(engine, symbols, include_ml=True)
     headers = ["Rank", "Symbol", "Name", "Price", "Change %", "Overall Score", "Risk Score", "Recommendation", "Expected ROI 1M", "Expected ROI 3M", "Expected ROI 12M", "ML Confidence", "Signal", "Last Updated"]
@@ -1490,10 +1505,12 @@ async def scoreboard(
         
     items.sort(key=lambda x: x["overall_score"], reverse=True)
     for i, item in enumerate(items[:top_n], 1):
-        rows.append([i, item["symbol"], item["name"], item["price"], item["change_pct"], item["overall_score"], item["risk_score"], item["recommendation"], item["expected_roi_1m"], item["expected_roi_3m"], item["expected_roi_12m"], f"{item['confidence']:.1%}", item["signal"].upper(), item["last_updated"]])
+        rows.append([i, item["symbol"], item["name"], item["price"], item["change_pct"], item["overall_score"], item["risk_score"], str(item["recommendation"]), item["expected_roi_1m"], item["expected_roi_3m"], item["expected_roi_12m"], f"{item['confidence']:.1%}", str(item["signal"]).upper(), item["last_updated"]])
         
     response = ScoreboardResponse(status="success", headers=headers, rows=rows, version=AI_ANALYSIS_VERSION, meta={"total": len(items), "displayed": min(len(items), top_n), "duration_ms": (time.time() - start_time) * 1000, "timestamp_riyadh": _saudi_time.now_iso()})
-    return BestJSONResponse(content=json_loads(json_dumps(response.model_dump() if _PYDANTIC_V2 else response.dict())))
+    
+    # V8.2 FIX: Safe Pydantic serialization
+    return BestJSONResponse(content=response.model_dump(mode='json') if _PYDANTIC_V2 else json_loads(response.json()))
 
 @router.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, token: Optional[str] = Query(None)):
