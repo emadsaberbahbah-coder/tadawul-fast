@@ -2,13 +2,14 @@
 """
 routes/advisor.py
 ------------------------------------------------------------
-TADAWUL ENTERPRISE ADVISOR ENGINE — v4.1.0 (NEXT-GEN ENTERPRISE)
+TADAWUL ENTERPRISE ADVISOR ENGINE — v4.2.0 (NEXT-GEN ENTERPRISE)
 SAMA Compliant | Multi-Asset | Real-time ML | Dynamic Allocation | Audit Trail
 
-What's new in v4.1.0:
-- ✅ Pydantic V2 Resilience: Upgraded all Enums to `FlexibleEnum` with `_missing_` interceptors to permanently cure 500 Internal Server Errors caused by case-sensitivity mismatches on fields like `AllocationMethod` and `RiskProfile`.
-- ✅ High-Performance JSON (`orjson`): Integrated `ORJSONResponse` for ultra-fast payload delivery
-- ✅ Non-Blocking ML Inference: Delegated all Scikit-Learn/XGBoost execution to ThreadPoolExecutors
+What's new in v4.2.0:
+- ✅ JSON Serialization Fix: Enforced Pydantic's `model_dump(mode='json')` and added a `default=str` fallback to `orjson` to permanently cure 500 Internal Server Errors when serializing Enums.
+- ✅ Pydantic V2 Resilience: Upgraded all Enums to `FlexibleEnum` with `_missing_` interceptors to permanently cure case-sensitivity mismatches.
+- ✅ High-Performance JSON (`orjson`): Integrated `ORJSONResponse` for ultra-fast payload delivery.
+- ✅ Non-Blocking ML Inference: Delegated all Scikit-Learn/XGBoost execution to ThreadPoolExecutors.
 
 Core Capabilities:
 - AI-powered investment recommendations with explainable AI (XAI)
@@ -56,13 +57,16 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 try:
     import orjson
     from fastapi.responses import ORJSONResponse as BestJSONResponse
-    def json_dumps(v, *, default=None): return orjson.dumps(v, default=default).decode('utf-8')
+    def json_dumps(v, *, default=None): 
+        # V4.2 FIX: Added safe string fallback for unhandled types (like Enums)
+        return orjson.dumps(v, default=default or str).decode('utf-8')
     def json_loads(v): return orjson.loads(v)
     _HAS_ORJSON = True
 except ImportError:
     import json
     from fastapi.responses import JSONResponse as BestJSONResponse
-    def json_dumps(v, *, default=None): return json.dumps(v, default=default)
+    def json_dumps(v, *, default=None): 
+        return json.dumps(v, default=default or str)
     def json_loads(v): return json.loads(v)
     _HAS_ORJSON = False
 
@@ -127,7 +131,7 @@ except ImportError:
 
 logger = logging.getLogger("routes.advisor")
 
-ADVISOR_ROUTE_VERSION = "4.1.0"
+ADVISOR_ROUTE_VERSION = "4.2.0"
 router = APIRouter(prefix="/v1/advisor", tags=["advisor"])
 
 # =============================================================================
@@ -1112,7 +1116,8 @@ async def advisor_recommendations(
         request_id=request_id, meta={"duration_ms": (time.time() - start_time) * 1000, "symbols_processed": rec_meta["symbols_processed"], "symbols_succeeded": rec_meta["symbols_succeeded"], "symbols_failed": rec_meta["symbols_failed"], "ml_predictions": rec_meta["ml_predictions"], "timestamp_utc": datetime.now(timezone.utc).isoformat(), "timestamp_riyadh": _saudi_time.format_iso(), "trading_hours": _saudi_time.is_trading_hours()}
     )
     
-    return BestJSONResponse(content=json_loads(json_dumps(response.model_dump() if _PYDANTIC_V2 else response.dict())))
+    # V4.2 FIX: Added mode='json' to natively serialize the FlexibleEnum strings without orjson crashing
+    return BestJSONResponse(content=response.model_dump(mode='json') if _PYDANTIC_V2 else json_loads(response.json()))
 
 @router.post("/run", response_model=AdvisorResponse)
 async def advisor_run(request: Request, body: Dict[str, Any] = Body(...), token: Optional[str] = Query(default=None), x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"), authorization: Optional[str] = Header(default=None, alias="Authorization"), x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID")) -> BestJSONResponse:
@@ -1146,3 +1151,6 @@ async def startup_event():
 @router.on_event("shutdown")
 async def shutdown_event():
     await _ws_manager.stop()
+
+__all__ = ["router"]
+__all__ = ["router"]
