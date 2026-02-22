@@ -2,29 +2,24 @@
 """
 core/data_engine.py
 ================================================================================
-Enterprise Data Engine — v6.2.0 (ADVANCED ENTERPRISE)
+Enterprise Data Engine — v6.3.0 (ADVANCED ENTERPRISE)
 ================================================================================
 Financial Data Platform — Core Data Engine with Multi-Version Support
 
-What's new in v6.2.0:
+What's new in v6.3.0:
+- ✅ Critical Lock Fix: Safely decoupled `asyncio.Lock()` from `threading.RLock()` to prevent "RLock does not support async context" crashes.
+- ✅ Traceback Visibility: `V2Discovery` now loudly prints the exact Python Traceback if the real Data Engine fails to load.
+- ✅ V4/V5 Discovery: Added automatic resolution for `DataEngineV4` and `DataEngineV5` classes.
 - ✅ High-performance JSON parsing via `orjson` (if available)
-- ✅ Memory-optimized state models using `@dataclass(slots=True)`
 - ✅ OpenTelemetry Tracing integration for sync and async execution
-- ✅ Full Jitter Exponential Backoff for Distributed Cache cluster connections
-- ✅ Dynamic Circuit Breaker with progressive timeout scaling (up to 300s)
-- ✅ Advanced singleflight execution to prevent cache stampedes
-- ✅ Zlib compression automatically applied to Redis and Memcached payloads
-- ✅ Fully aligned with the v5.x provider ecosystem and core configuration
 
 Core Capabilities:
-- Multi-version engine support (v1, v2, v3) with automatic detection
+- Multi-version engine support (v1, v2, v3, v4, v5) with automatic detection
 - Advanced lazy loading with circuit breaker pattern
 - Thread-safe singleton management with double-checked locking
 - Smart caching with TTL, LRU eviction, and payload compression
 - Comprehensive error handling with retry strategies
 - Full async/await support with timeout controls
-- Type-safe responses with Pydantic v2 compatibility
-- Detailed telemetry and distributed tracing
 - Never crashes startup: all functions are defensive
 """
 
@@ -39,6 +34,7 @@ import random
 import sys
 import threading
 import time
+import traceback
 import uuid
 import zlib
 import pickle
@@ -57,7 +53,7 @@ from typing import (
 # Version Information
 # ============================================================================
 
-__version__ = "6.2.0"
+__version__ = "6.3.0"
 ADAPTER_VERSION = __version__
 
 # ============================================================================
@@ -1133,6 +1129,8 @@ class V2ModuleInfo:
     engine_class: Optional[Type] = None
     engine_v2_class: Optional[Type] = None
     engine_v3_class: Optional[Type] = None
+    engine_v4_class: Optional[Type] = None
+    engine_v5_class: Optional[Type] = None
     unified_quote_class: Optional[Type] = None
     has_module_funcs: bool = False
     error: Optional[str] = None
@@ -1164,10 +1162,12 @@ class V2Discovery:
                 engine_class = getattr(mod, "DataEngine", None) or getattr(mod, "Engine", None)
                 engine_v2_class = getattr(mod, "DataEngineV2", None)
                 engine_v3_class = getattr(mod, "DataEngineV3", None)
+                engine_v4_class = getattr(mod, "DataEngineV4", None)
+                engine_v5_class = getattr(mod, "DataEngineV5", None)
                 uq_class = getattr(mod, "UnifiedQuote", None)
                 has_funcs = any(callable(getattr(mod, name, None)) for name in ["get_quote", "get_quotes", "get_enriched_quote", "get_enriched_quotes"])
 
-                if not (engine_class or engine_v2_class or engine_v3_class or has_funcs or uq_class):
+                if not (engine_class or engine_v2_class or engine_v3_class or engine_v4_class or engine_v5_class or has_funcs or uq_class):
                     raise ImportError("No usable exports found in core.data_engine_v2")
 
                 if uq_class is None:
@@ -1179,6 +1179,7 @@ class V2Discovery:
                 self._info = V2ModuleInfo(
                     module=mod, version=version, engine_class=engine_class,
                     engine_v2_class=engine_v2_class, engine_v3_class=engine_v3_class,
+                    engine_v4_class=engine_v4_class, engine_v5_class=engine_v5_class,
                     unified_quote_class=uq_class, has_module_funcs=has_funcs,
                 )
                 self._mode = EngineMode.V2 if engine_v2_class else EngineMode.LEGACY
@@ -1187,6 +1188,7 @@ class V2Discovery:
 
             except Exception as e:
                 self._mode, self._error = EngineMode.STUB, str(e)
+                logger.error(f"❌ CRITICAL: Failed to load Data Engine V2. Falling back to STUB. Error: {e}\n{traceback.format_exc()}")
                 _dbg(f"V2 discovery failed: {e}", "warn")
                 return self._mode, None, self._error
 
@@ -1307,7 +1309,8 @@ class EngineManager:
     """Thread-safe engine manager with singleton pattern."""
 
     def __init__(self):
-        self._lock = threading.RLock()
+        self._async_lock = None
+        self._sync_lock = threading.RLock()
         self._engine: Optional[Any] = None
         self._v2_info: Optional[V2ModuleInfo] = None
         self._mode = EngineMode.UNKNOWN
@@ -1316,6 +1319,11 @@ class EngineManager:
         self._rate_limiter = TokenBucket(rate_per_sec=100.0)
         self._cache = DistributedCache(backend=CacheBackend.MEMORY, default_ttl=300, max_size=10000, compression=True)
         self._stats: Dict[str, Any] = {"created_at": _utc_now_iso(), "requests": 0, "errors": 0, "cache_hits": 0, "cache_misses": 0}
+
+    def _get_async_lock(self):
+        if self._async_lock is None:
+            self._async_lock = asyncio.Lock()
+        return self._async_lock
 
     def _discover(self) -> Tuple[EngineMode, Optional[V2ModuleInfo], Optional[str]]:
         if self._mode != EngineMode.UNKNOWN: return self._mode, self._v2_info, self._error
@@ -1353,7 +1361,7 @@ class EngineManager:
                 engine = _async_run(_maybe_await(getattr(info.module, "get_engine")()))
                 if engine is not None: return engine
             except Exception: pass
-        for cls in [info.engine_v3_class, info.engine_v2_class, info.engine_class]:
+        for cls in [info.engine_v5_class, info.engine_v4_class, info.engine_v3_class, info.engine_v2_class, info.engine_class]:
             if cls is not None:
                 engine = self._instantiate_engine(cls)
                 if engine is not None: return engine
@@ -1361,7 +1369,7 @@ class EngineManager:
 
     async def get_engine(self) -> Any:
         if self._engine is not None: return self._engine
-        async with self._lock:
+        async with self._get_async_lock():
             if self._engine is not None: return self._engine
             await self._rate_limiter.wait_and_acquire()
             async def _create_engine():
@@ -1391,7 +1399,8 @@ class EngineManager:
             _dbg(f"Error closing engine: {e}", "error")
 
     def get_stats(self) -> Dict[str, Any]:
-        stats = dict(self._stats)
+        with self._sync_lock:
+            stats = dict(self._stats)
         stats["mode"] = self._mode.value
         stats["v2_available"] = (self._mode in (EngineMode.V2, EngineMode.LEGACY))
         stats["engine_active"] = self._engine is not None
@@ -1404,7 +1413,7 @@ class EngineManager:
         return stats
 
     def record_request(self, success: bool = True) -> None:
-        with self._lock:
+        with self._sync_lock:
             self._stats["requests"] = self._stats.get("requests", 0) + 1
             if not success: self._stats["errors"] = self._stats.get("errors", 0) + 1
 
@@ -1476,10 +1485,10 @@ async def _call_engine_single(engine: Any, symbol: str, *, enriched: bool, use_c
         cache_key = f"quote:{norm_symbol}:{'enriched' if enriched else 'basic'}"
         cached = await _ENGINE_MANAGER.get_cache().get("quotes", cache_key)
         if cached is not None:
-            _ENGINE_MANAGER._stats["cache_hits"] += 1
+            with _ENGINE_MANAGER._sync_lock: _ENGINE_MANAGER._stats["cache_hits"] += 1
             _METRICS.inc("cache_hits_total", 1, {"cache_type": "engine"})
             return cached
-        _ENGINE_MANAGER._stats["cache_misses"] += 1
+        with _ENGINE_MANAGER._sync_lock: _ENGINE_MANAGER._stats["cache_misses"] += 1
         _METRICS.inc("cache_misses_total", 1, {"cache_type": "engine"})
 
     func_name = "get_enriched_quote" if enriched else "get_quote"
@@ -1524,11 +1533,11 @@ async def _call_engine_batch(engine: Any, symbols: List[str], *, enriched: bool,
             cached = await cache.get("quotes", cache_key)
             if cached is not None:
                 cached_results[i] = cached
-                _ENGINE_MANAGER._stats["cache_hits"] += 1
+                with _ENGINE_MANAGER._sync_lock: _ENGINE_MANAGER._stats["cache_hits"] += 1
                 _METRICS.inc("cache_hits_total", 1, {"cache_type": "engine"})
             else:
                 missing_indices.append(i)
-                _ENGINE_MANAGER._stats["cache_misses"] += 1
+                with _ENGINE_MANAGER._sync_lock: _ENGINE_MANAGER._stats["cache_misses"] += 1
                 _METRICS.inc("cache_misses_total", 1, {"cache_type": "engine"})
         
         if not missing_indices: return [cached_results[i] for i in range(len(symbols))]
