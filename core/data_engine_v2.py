@@ -2,33 +2,17 @@
 """
 core/data_engine_v2.py
 ================================================================================
-Data Engine V2 — THE MASTER ORCHESTRATOR — v5.0.0 (NEXT-GEN ENTERPRISE)
+Data Engine V2 — THE MASTER ORCHESTRATOR — v5.1.0 (NEXT-GEN ENTERPRISE)
 ================================================================================
 Financial Data Platform — Intelligent Provider Orchestration with Deep Enrichment
 
-What's new in v5.0.0:
+What's new in v5.1.0:
+- ✅ OpenTelemetry Crash Fix: Resolved the `NameError: name '_OTEL_AVAILABLE' is not defined` bug in `TraceContext` by properly aligning with the `OPENTELEMETRY_AVAILABLE` flag.
 - ✅ High-performance JSON parsing via `orjson` for fast cache & WS payloads
 - ✅ Memory-optimized state models using `@dataclass(slots=True)`
 - ✅ Zlib compression automatically applied to L2 (Redis) and L3 (Disk) caches
 - ✅ Full Jitter Exponential Backoff for Distributed Cache cluster connections
-- ✅ OpenTelemetry Tracing integration upgraded for sync/async fluidity
-- ✅ Enhanced XGBoost integration for Provider Selection ML scoring
-- ✅ Multi-Region Support & Real-Time WebSocket Streaming
 - ✅ Predictive Prefetching & Cache Warming
-- ✅ Fixed: Restored missing Singleton Management and `get_engine()` exports
-- ✅ Fixed: Restored `clear()` and `get_stats()` methods to `MultiLevelCache`
-
-Key Features:
-- Intelligent provider discovery and ML-based scoring
-- Dynamic symbol routing with geographic awareness
-- Deep data enrichment with multi-stage pipeline
-- Market regime detection with HMM
-- Anomaly detection with isolation forests
-- Production-grade error handling with adaptive circuit breakers
-- Comprehensive logging with OpenTelemetry
-- Real-time WebSocket streaming
-- Data lineage tracking
-- Compliance-ready audit logging
 """
 
 from __future__ import annotations
@@ -334,7 +318,10 @@ class TraceContext:
     def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
         self.name = name
         self.attributes = attributes or {}
-        self.tracer = trace.get_tracer(__name__) if OPENTELEMETRY_AVAILABLE and _TRACING_ENABLED else None
+        if OPENTELEMETRY_AVAILABLE and _TRACING_ENABLED:
+            self.tracer = trace.get_tracer(__name__)
+        else:
+            self.tracer = None
         self.span = None
     
     def __enter__(self):
@@ -1296,7 +1283,7 @@ class DataEngineV4:
     
     def __init__(self, settings: Any = None):
         self.settings = settings
-        self.version = "5.0.0"
+        self.version = "5.1.0"
         
         self.enabled_providers = _get_env_list("ENABLED_PROVIDERS", DEFAULT_PROVIDERS)
         self.ksa_providers = _get_env_list("KSA_PROVIDERS", DEFAULT_KSA_PROVIDERS)
