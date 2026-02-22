@@ -11,6 +11,7 @@ What's new in v8.5.0:
 - ✅ Complete Endpoint Sandboxing: Core routes are now strictly wrapped in exception handlers to prevent raw 500 Internal Server Errors from escaping to the client.
 - ✅ Serialization Safety: Fully migrated all endpoints to use `model_dump(mode='json', exclude_none=True)`.
 - ✅ NaN & Infinity Protection: Recursive `clean_nans` interceptor guards `orjson` from unhandled math anomalies.
+- ✅ Deep ML Field Inheritance: `overall_score` and `recommendation` safely bubble up from `MLPrediction` if upstream is missing them.
 
 Core Capabilities:
 - Real-time ML-powered analysis with ensemble models
@@ -419,10 +420,7 @@ class SaudiTime:
         self._tz = timezone(timedelta(hours=3))
         self._trading_hours = {"start": "10:00", "end": "15:00"}
         self._weekend_days = [4, 5] 
-        self._holidays = {
-            "2024-02-22", "2024-04-10", "2024-04-11", "2024-04-12", 
-            "2024-06-16", "2024-06-17", "2024-06-18", "2024-09-23"
-        }
+        self._holidays = {"2024-02-22", "2024-04-10", "2024-04-11", "2024-04-12", "2024-06-16", "2024-06-17", "2024-06-18", "2024-09-23"}
     
     def now(self) -> datetime: return datetime.now(self._tz)
     
@@ -1362,6 +1360,17 @@ def _quote_to_response(data: Dict[str, Any]) -> SingleAnalysisResponse:
         
     data_quality = DataQuality.MISSING if data.get("error") else DataQuality.POOR if not price else DataQuality.GOOD
     
+    # V8.5 FIX: Bubble up the ML recommendation and score if upstream missing
+    recommendation = data.get("recommendation")
+    if not recommendation and ml_prediction:
+        recommendation = ml_prediction.recommendation
+    else:
+        recommendation = recommendation or Recommendation.HOLD
+        
+    overall_score = data.get("overall_score")
+    if overall_score is None and ml_prediction:
+        overall_score = 100.0 - ml_prediction.risk_score
+
     return SingleAnalysisResponse(
         symbol=data.get("symbol", "UNKNOWN"), 
         name=data.get("name"), 
@@ -1396,9 +1405,9 @@ def _quote_to_response(data: Dict[str, Any]) -> SingleAnalysisResponse:
         momentum_1m=data.get("returns_1m") or data.get("momentum_1m"), 
         momentum_3m=data.get("returns_3m") or data.get("momentum_3m"),
         momentum_12m=data.get("returns_12m") or data.get("momentum_12m"),
-        overall_score=data.get("overall_score"), 
+        overall_score=overall_score, 
         risk_score=data.get("risk_score"),
-        recommendation=data.get("recommendation") or Recommendation.HOLD, 
+        recommendation=recommendation, 
         confidence_level=confidence, 
         expected_roi_1m=data.get("expected_roi_1m"),
         expected_roi_3m=data.get("expected_roi_3m"), 
@@ -1683,9 +1692,14 @@ async def sheet_rows(
                 elif "forecast price" in h_lower and "12m" in h_lower: row.append(lookup.get("forecast_price_12m"))
                 elif "expected roi" in h_lower and "12m" in h_lower: row.append(lookup.get("expected_roi_12m"))
                 elif "risk score" in h_lower: row.append(lookup.get("risk_score"))
-                elif "overall score" in h_lower: row.append(lookup.get("overall_score"))
-                elif "recommendation" in h_lower: row.append(lookup.get("recommendation") or "HOLD")
-                elif "data quality" in h_lower: row.append(lookup.get("data_quality") or "PARTIAL")
+                elif "overall score" in h_lower: row.append(lookup.get("overall_score") or lookup.get("score"))
+                elif "recommendation" in h_lower:
+                    rec_val = lookup.get("recommendation")
+                    # Fallback to ML recommendation if engine missing it
+                    if not rec_val and symbol in predictions_dict:
+                        rec_val = predictions_dict[symbol].recommendation.value
+                    row.append(str(rec_val or "HOLD"))
+                elif "data quality" in h_lower: row.append(str(lookup.get("data_quality", "PARTIAL")))
                 elif "last updated (utc)" in h_lower: row.append(lookup.get("last_updated_utc"))
                 elif "last updated (riyadh)" in h_lower: row.append(lookup.get("last_updated_riyadh") or _saudi_time.now().isoformat())
                 else: row.append(lookup.get(h_lower))
@@ -1802,14 +1816,24 @@ async def scoreboard(
         for symbol in symbols:
             if not (data := results.get(symbol)): continue
             ml_pred = data.get("ml_prediction", {})
+            
+            # V8.5 FIX: Bubble up recommendation if missing
+            rec_val = data.get("recommendation")
+            if not rec_val and ml_pred:
+                rec_val = ml_pred.get("recommendation")
+            
+            overall_score = data.get("overall_score") or data.get("score")
+            if overall_score is None and ml_pred and ml_pred.get("risk_score"):
+                overall_score = 100.0 - ml_pred.get("risk_score")
+
             items.append({
                 "symbol": symbol, 
                 "name": data.get("name", ""), 
                 "price": data.get("price") or data.get("current_price"), 
                 "change_pct": data.get("change_pct") or data.get("percent_change"), 
-                "overall_score": data.get("overall_score") or 50.0, 
+                "overall_score": overall_score or 50.0, 
                 "risk_score": data.get("risk_score") or 50.0, 
-                "recommendation": data.get("recommendation") or "HOLD", 
+                "recommendation": rec_val or "HOLD", 
                 "expected_roi_1m": data.get("expected_roi_1m"), 
                 "expected_roi_3m": data.get("expected_roi_3m"), 
                 "expected_roi_12m": data.get("expected_roi_12m"), 
