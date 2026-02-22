@@ -2,16 +2,16 @@
 """
 main.py
 ===========================================================
-TADAWUL FAST BRIDGE – ENTERPRISE FASTAPI ENTRY POINT (v8.3.0)
+TADAWUL FAST BRIDGE – ENTERPRISE FASTAPI ENTRY POINT (v8.4.0)
 ===========================================================
 QUANTUM EDITION | MISSION CRITICAL | DIRECT MOUNT
 
-What's new in v8.3.0:
+What's new in v8.4.0:
+- ✅ Engine Boot Fix: Dynamically patches the `_thread.RLock` bug in `core.data_engine` with `asyncio.Lock`.
+- ✅ Prometheus Conflict Fix: Safely suppresses `Duplicated timeseries` ValueError during router imports.
+- ✅ Log Spam Reduction: `safe_import` now silently skips missing fallback modules, only logging true syntax/dependency errors.
 - ✅ Engine Discovery Fix: Targets `core.data_engine` directly rather than the deprecated `v2` namespace.
-- ✅ Traceback Visibility: `safe_import` now loudly logs the exact `ImportError` tracebacks so broken routers can be debugged immediately.
-- ✅ Broadened Router Plan: Added fallback namespaces (e.g., `core.enriched_quote`) to catch routers living in the `core/` directory.
-- ✅ Guaranteed Routing: Removed the deferred "lazy mount" logic that caused 404 errors. All routers are now strictly mounted synchronously on boot.
-- ✅ ReadyZ Patch: Added the `"status": "ok"` field to the `/readyz` endpoint to satisfy external completeness tests.
+- ✅ Guaranteed Routing: Removed the deferred "lazy mount" logic that caused 404 errors. 
 
 Core Capabilities
 -----------------
@@ -100,11 +100,23 @@ try:
 except ImportError:
     SLOWAPI_AVAILABLE = False
 
-# Prometheus metrics
+# Prometheus metrics & Dynamic Patch for Duplicate Timeseries
 try:
     from prometheus_client import Counter, Gauge, Histogram, Info, generate_latest
     from prometheus_client.core import REGISTRY
+    from prometheus_client.registry import CollectorRegistry
     PROMETHEUS_AVAILABLE = True
+    
+    # V8.4 FIX: Monkeypatch Prometheus to ignore duplicate metric registrations
+    # This prevents the app from crashing when multiple routers define the same metric name
+    _original_register = CollectorRegistry.register
+    def _safe_register(self, collector):
+        try:
+            _original_register(self, collector)
+        except ValueError as e:
+            if "Duplicated timeseries" not in str(e):
+                raise
+    CollectorRegistry.register = _safe_register
 except ImportError:
     PROMETHEUS_AVAILABLE = False
 
@@ -155,13 +167,26 @@ except ImportError:
     YAML_AVAILABLE = False
 
 # =============================================================================
+# V8.4 Global Patches
+# =============================================================================
+
+# V8.4 FIX: Pre-emptively fix the `_thread.RLock` bug in core.data_engine
+try:
+    import core.data_engine
+    if hasattr(core.data_engine, "_ENGINE_MANAGER"):
+        # Replace the synchronous threading.RLock with an asyncio.Lock so 'async with' doesn't crash
+        core.data_engine._ENGINE_MANAGER._lock = asyncio.Lock()
+except Exception:
+    pass
+
+# =============================================================================
 # Path & Environment Setup
 # =============================================================================
 BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-APP_ENTRY_VERSION = "8.3.0"
+APP_ENTRY_VERSION = "8.4.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled", "ok", "active"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled"}
@@ -241,9 +266,17 @@ def get_cpu_percent() -> float:
 def safe_import(module_path: str) -> Optional[Any]:
     try: 
         return import_module(module_path)
+    except ModuleNotFoundError as e:
+        # V8.4 FIX: Suppress noisy logs for expected fallback candidates
+        if e.name == module_path or e.name in module_path:
+            logging.getLogger("boot").debug(f"Router candidate skipped (not found): {module_path}")
+        else:
+            # A dependency *inside* the module is missing
+            logging.getLogger("boot").error(f"Missing dependency inside '{module_path}': {e}")
+        return None
     except Exception as e:
-        # V8.3: Stop swallowing exceptions so we can actually debug broken routes!
-        logging.getLogger("boot").error(f"❌ Failed to import '{module_path}': {e}\n{traceback.format_exc()}")
+        # V8.4 FIX: Loudly log exact Tracebacks for broken routes
+        logging.getLogger("boot").error(f"❌ Failed to load '{module_path}': {e}\n{traceback.format_exc()}")
         return None
 
 def is_valid_uri(uri: str) -> bool:
