@@ -333,7 +333,7 @@ class TraceContext:
     def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
         self.name = name
         self.attributes = attributes or {}
-        self.tracer = trace.get_tracer(__name__) if _OTEL_AVAILABLE and _TRACING_ENABLED else None
+        self.tracer = trace.get_tracer(__name__) if OPENTELEMETRY_AVAILABLE and _TRACING_ENABLED else None
         self.span = None
     
     def __enter__(self):
@@ -344,7 +344,7 @@ class TraceContext:
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.span and _OTEL_AVAILABLE:
+        if self.span and OPENTELEMETRY_AVAILABLE:
             if exc_val:
                 self.span.record_exception(exc_val)
                 self.span.set_status(Status(StatusCode.ERROR, str(exc_val)))
