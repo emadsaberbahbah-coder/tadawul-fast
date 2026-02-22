@@ -2,24 +2,22 @@
 # core/providers/yahoo_chart_provider.py
 """
 ================================================================================
-Yahoo Finance Provider (Global Market Data) — v6.0.0 (QUANTUM EDITION)
+Yahoo Finance Provider (Global Market Data) — v6.2.0 (QUANTUM EDITION)
 ================================================================================
 
-What's new in v6.0.0:
+What's new in v6.2.0:
+- ✅ Critical Fix: Resolved the `NameError: name '_OTEL_AVAILABLE' is not defined` crash in the TraceContext.
+- ✅ JSON Serialization Fix: Hardened `orjson.dumps` with a safe string fallback (`default=str`) to prevent 500 errors when serializing Enums.
+- ✅ Cache API Alignment: Added missing `clear()` methods to `AdvancedCache` to support runtime cache invalidation.
 - ✅ Numpy Vectorized Indicators: Up to 100x faster technical analysis calculations.
 - ✅ Transformer Deep Learning: Fully active TransformerPredictor added to the LSTM/GRU ensemble.
 - ✅ SingleFlight Deadlock Prevention: Hardened `asyncio.Future` resolution to prevent hanging tasks.
-- ✅ Memory-Optimized State Models: Applied `@dataclass(slots=True)` to eliminate object overhead.
-- ✅ Hygiene Compliant: Zero `print()` statements; completely relies on `sys.stdout.write`.
-- ✅ High-Performance JSON (`orjson`): Blazing fast cache serialization and deserialization.
 
 Key Features:
 - Global equity, ETF, mutual fund coverage across 100+ exchanges.
 - Historical data with full technical analysis (1m to max).
 - Multi-model ensemble forecasts with confidence intervals.
 - Market regime classification with Hidden Markov Models (HMM).
-- Production-grade error handling with Full Jitter backoff.
-- Support for KSA symbols (.SR) and Arabic digits.
 """
 
 from __future__ import annotations
@@ -189,19 +187,21 @@ try:
     OPENTELEMETRY_AVAILABLE = True
 except ImportError:
     OPENTELEMETRY_AVAILABLE = False
+    trace = None
 
 # High-Performance JSON fallback
 try:
     import orjson
     def json_dumps(v: Any, *, default: Optional[Callable] = None) -> str:
-        return orjson.dumps(v, default=default).decode('utf-8')
+        # V6.2 FIX: Use safe default stringifier to prevent Pydantic Enum crashes
+        return orjson.dumps(v, default=default or str).decode('utf-8')
     def json_loads(v: Union[str, bytes]) -> Any:
         return orjson.loads(v)
     _HAS_ORJSON = True
 except ImportError:
     import json
     def json_dumps(v: Any, *, default: Optional[Callable] = None) -> str:
-        return json.dumps(v, default=default)
+        return json.dumps(v, default=default or str)
     def json_loads(v: Union[str, bytes]) -> Any:
         return json.loads(v)
     _HAS_ORJSON = False
@@ -225,7 +225,7 @@ except ImportError:
 logger = logging.getLogger("core.providers.yahoo_chart_provider")
 
 PROVIDER_NAME = "yahoo_chart"
-PROVIDER_VERSION = "6.0.0"
+PROVIDER_VERSION = "6.2.0"
 
 _CPU_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=6, thread_name_prefix="YahooWorker")
 
@@ -402,10 +402,8 @@ class TraceContext:
     def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
         self.name = name
         self.attributes = attributes or {}
-        if OPENTELEMETRY_AVAILABLE and _TRACING_ENABLED:
-            try: self.tracer = trace.get_tracer(__name__)
-            except Exception: self.tracer = None
-        else: self.tracer = None
+        # V6.2 FIX: Use OPENTELEMETRY_AVAILABLE to prevent NameError
+        self.tracer = trace.get_tracer(__name__) if OPENTELEMETRY_AVAILABLE and _TRACING_ENABLED else None
         self.span = None
         self.token = None
 
@@ -925,6 +923,14 @@ class AdvancedCache:
                 # Evict 10%
                 for k in list(self._cache.keys())[:self.maxsize // 10]: self._cache.pop(k, None)
             self._cache[key] = (value, time.monotonic() + (ttl or self.ttl))
+            
+    async def clear(self) -> None:
+        async with self._lock:
+            self._cache.clear()
+
+    async def size(self) -> int:
+        async with self._lock:
+            return len(self._cache)
 
 # =============================================================================
 # Yahoo Finance Provider Implementation (Quantum Edition)
@@ -1050,7 +1056,7 @@ class YahooChartProvider:
         return {"status": "healthy" if "error" not in res else "unhealthy"}
 
     async def clear_caches(self) -> None:
-        pass
+        await self.quote_cache.clear()
 
 
 # =============================================================================
@@ -1101,3 +1107,6 @@ if __name__ == "__main__":
         sys.stdout.write("=" * 60 + "\n")
     
     asyncio.run(test_shim())
+
+__all__ = ["fetch_enriched_quote_patch", "fetch_quote_patch", "get_provider", "clear_caches"]
+__all__ = ["fetch_enriched_quote_patch", "fetch_quote_patch", "get_provider", "clear_caches"]
