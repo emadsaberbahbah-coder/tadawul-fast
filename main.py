@@ -2,25 +2,24 @@
 """
 main.py
 ===========================================================
-TADAWUL FAST BRIDGE – ENTERPRISE FASTAPI ENTRY POINT (v8.1.0)
+TADAWUL FAST BRIDGE – ENTERPRISE FASTAPI ENTRY POINT (v8.2.0)
 ===========================================================
-QUANTUM EDITION | MISSION CRITICAL | AUTO-SCALING ASGI
+QUANTUM EDITION | MISSION CRITICAL | DIRECT MOUNT
 
-What's new in v8.1.0:
-- ✅ Limiter Crash Resolved: Removed manual Limiter awaits; relying strictly on FastAPIs SlowAPIMiddleware.
+What's new in v8.2.0:
+- ✅ Guaranteed Routing: Removed the deferred "lazy mount" logic that caused 404 errors. All routers are now strictly mounted synchronously on boot.
+- ✅ ReadyZ Patch: Added the `"status": "ok"` field to the `/readyz` endpoint to satisfy external completeness tests.
+- ✅ Limiter Crash Resolved: Relying strictly on FastAPI's SlowAPIMiddleware.
 - ✅ Fail-Safe Sentry Init: Strict URI parsing for SENTRY_DSN prevents `BadDsn` exceptions on startup.
 - ✅ Advanced Security Headers: Automatically injects HSTS, CSP, XSS-Protection, and Server-Timing headers.
 - ✅ Hardened ASGI Lifespan: Prevents memory leaks by ensuring robust cancellation of orphaned tasks on shutdown.
-- ✅ High-Performance JSON (`orjson`): Fully integrated as the default FastAPI response class.
-- ✅ Memory-Optimized State Models: Internal managers strictly use `@dataclass(slots=True)`.
 
 Core Capabilities
 -----------------
 • Multi-layer middleware pipeline with telemetry, security, and performance
-• Intelligent request routing with lazy router mounting
+• Intelligent request routing
 • Comprehensive health monitoring with system guardian
 • Distributed tracing and request correlation
-• Circuit breaker pattern for external services
 • Advanced rate limiting with slowapi integration
 • Prometheus metrics export
 • Structured logging with multiple outputs (JSON, text)
@@ -164,7 +163,7 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-APP_ENTRY_VERSION = "8.1.0"
+APP_ENTRY_VERSION = "8.2.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled", "ok", "active"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled"}
@@ -862,10 +861,6 @@ def create_app() -> FastAPI:
         # 2. Asynchronous Bootstrapper
         async def boot():
             await asyncio.sleep(0) # Yield control
-            if get_env_bool("DEFER_ROUTER_MOUNT", False): 
-                boot_logger.warning("DEFER_ROUTER_MOUNT=True - routers will be lazy-mounted")
-            else: 
-                mount_routers_once(app)
             
             if get_env_bool("INIT_ENGINE_ON_BOOT", True):
                 await init_engine_resilient(app, max_retries=get_env_int("MAX_RETRIES", 3))
@@ -965,6 +960,9 @@ def create_app() -> FastAPI:
         except Exception as e:
             boot_logger.error(f"Failed to initialize OpenTelemetry: {e}")
 
+    # FORCE MOUNT ROUTERS SYNCHRONOUSLY
+    mount_routers_once(app)
+
     if PROMETHEUS_AVAILABLE and get_env_bool("ENABLE_METRICS", True):
         @app.get("/metrics", include_in_schema=False)
         async def metrics_endpoint():
@@ -984,12 +982,13 @@ def create_app() -> FastAPI:
     @app.get("/readyz", include_in_schema=False)
     async def readiness():
         boot_ok = getattr(app.state, "boot_completed", False)
-        routers_ok = getattr(app.state, "routers_mounted", False) or get_env_bool("DEFER_ROUTER_MOUNT", False)
+        routers_ok = getattr(app.state, "routers_mounted", False)
         engine_ok = getattr(app.state, "engine_ready", False) or not get_env_bool("ENGINE_REQUIRED_FOR_READYZ", False)
         ready = boot_ok and routers_ok and engine_ok
         return BestJSONResponse(
             status_code=200 if ready else 503, 
             content={
+                "status": "ok" if ready else "degraded",
                 "ready": ready, 
                 "boot_completed": boot_ok, 
                 "routers_mounted": getattr(app.state, "routers_mounted", False), 
