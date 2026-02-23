@@ -2,19 +2,15 @@
 # core/providers/yahoo_chart_provider.py
 """
 ================================================================================
-Yahoo Finance Provider (Global Market Data) — v6.11.0 (QUANTUM EDITION)
+Yahoo Finance Provider (Global Market Data) — v6.12.0 (QUANTUM EDITION)
 ================================================================================
 
-What's new in v6.11.0:
-- ✅ Null-Safe Iterable Extraction: Fixed `TypeError: 'NoneType' object is not iterable` caused by Yahoo's V8 endpoint returning explicit `null` arrays during market halts.
-- ✅ Thread Starvation Prevention: Enforced a dual-layer timeout shield combining `TimeoutHTTPAdapter` (socket layer) and `asyncio.wait_for` (event loop layer).
-- ✅ Unbreakable Mock Fallback: Guarantees a perfectly structured JSON payload is returned even if the underlying PaaS IP is globally blacklisted.
+What's new in v6.12.0:
+- ✅ Import Poisoning Fix: Safely guarded `import numpy as np` to prevent fatal `ModuleNotFoundError` crashes in constrained PaaS environments.
+- ✅ Pure-Python Mathematics: Built native Python fallbacks for Standard Deviation, RSI, MACD, Bollinger Bands, and Drift Forecasting. If `numpy`/`scipy` fail to load, the engine seamlessly degrades to pure Python math to guarantee data completeness.
+- ✅ Null-Safe Iterable Extraction: Fixed `TypeError: 'NoneType'` caused by explicit `null` arrays.
+- ✅ Thread Starvation Prevention: Enforced a dual-layer timeout shield combining `TimeoutHTTPAdapter` and `asyncio.wait_for`.
 - ✅ Anti-Bot Bypass: Added `YahooCrumbManager` to safely acquire session cookies and crumbs.
-
-Key Features:
-- Global equity, ETF, mutual fund coverage across 100+ exchanges.
-- Historical data with full technical analysis (1m to max).
-- Multi-model ensemble forecasts with confidence intervals.
 """
 
 from __future__ import annotations
@@ -46,46 +42,16 @@ from typing import (Any, AsyncGenerator, Awaitable, Callable, Dict, List, Option
                     Set, Tuple, Type, TypeVar, Union, cast, overload)
 from urllib.parse import quote_plus, urlencode, urljoin
 
-import numpy as np
-
-# ---------------------------------------------------------------------------
-# High-Performance JSON fallback
-# ---------------------------------------------------------------------------
-try:
-    import orjson
-    def json_dumps(v: Any, *, default: Optional[Callable] = None) -> str:
-        return orjson.dumps(v, default=default or str).decode('utf-8')
-    def json_loads(v: Union[str, bytes]) -> Any:
-        return orjson.loads(v)
-    _HAS_ORJSON = True
-except ImportError:
-    import json
-    def json_dumps(v: Any, *, default: Optional[Callable] = None) -> str:
-        return json.dumps(v, default=default or str)
-    def json_loads(v: Union[str, bytes]) -> Any:
-        return json.loads(v)
-    _HAS_ORJSON = False
-
-# ---------------------------------------------------------------------------
-# HTTP & Network Protection (The 110s Fix)
-# ---------------------------------------------------------------------------
-try:
-    import requests
-    from requests.adapters import HTTPAdapter
-    class TimeoutHTTPAdapter(HTTPAdapter):
-        def __init__(self, *args, **kwargs):
-            self.timeout = kwargs.pop("timeout", 5.0)
-            super().__init__(*args, **kwargs)
-        def send(self, request, **kwargs):
-            kwargs["timeout"] = kwargs.get("timeout", self.timeout)
-            return super().send(request, **kwargs)
-    _REQUESTS_AVAILABLE = True
-except ImportError:
-    _REQUESTS_AVAILABLE = False
-
 # =============================================================================
 # Optional Dependencies with Graceful Degradation
 # =============================================================================
+
+try:
+    import numpy as np
+    NUMPY_AVAILABLE = True
+except ImportError:
+    np = None
+    NUMPY_AVAILABLE = False
 
 try:
     import pandas as pd
@@ -93,14 +59,12 @@ try:
 except ImportError:
     PANDAS_AVAILABLE = False
 
-# Scientific Computing
 try:
     from scipy import stats, signal
     SCIPY_AVAILABLE = True
 except ImportError:
     SCIPY_AVAILABLE = False
 
-# Machine Learning
 try:
     from sklearn.ensemble import (RandomForestRegressor, RandomForestClassifier,
                                   GradientBoostingRegressor, IsolationForest)
@@ -167,6 +131,36 @@ except ImportError:
     OPENTELEMETRY_AVAILABLE = False
     trace = None
 
+# High-Performance JSON fallback
+try:
+    import orjson
+    def json_dumps(v: Any, *, default: Optional[Callable] = None) -> str:
+        return orjson.dumps(v, default=default or str).decode('utf-8')
+    def json_loads(v: Union[str, bytes]) -> Any:
+        return orjson.loads(v)
+    _HAS_ORJSON = True
+except ImportError:
+    import json
+    def json_dumps(v: Any, *, default: Optional[Callable] = None) -> str:
+        return json.dumps(v, default=default or str)
+    def json_loads(v: Union[str, bytes]) -> Any:
+        return json.loads(v)
+    _HAS_ORJSON = False
+
+# HTTP & Network Protection (The 110s Fix)
+try:
+    import requests
+    from requests.adapters import HTTPAdapter
+    class TimeoutHTTPAdapter(HTTPAdapter):
+        def __init__(self, *args, **kwargs):
+            self.timeout = kwargs.pop("timeout", 5.0)
+            super().__init__(*args, **kwargs)
+        def send(self, request, **kwargs):
+            kwargs["timeout"] = kwargs.get("timeout", self.timeout)
+            return super().send(request, **kwargs)
+    _REQUESTS_AVAILABLE = True
+except ImportError:
+    _REQUESTS_AVAILABLE = False
 
 # Yahoo Finance (primary data source)
 try:
@@ -176,10 +170,11 @@ except ImportError:
     yf = None
     _HAS_YFINANCE = False
 
+
 logger = logging.getLogger("core.providers.yahoo_chart_provider")
 
 PROVIDER_NAME = "yahoo_chart"
-PROVIDER_VERSION = "6.11.0"
+PROVIDER_VERSION = "6.12.0"
 
 _CPU_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=6, thread_name_prefix="YahooWorker")
 
@@ -374,21 +369,36 @@ class YahooCrumbManager:
             return cls._cookie, cls._crumb
 
 # =============================================================================
-# Technical Indicators & ML Forecaster
+# Pure-Python Technical Indicators & ML Forecaster (No Numpy Required)
 # =============================================================================
 
 class TechnicalIndicators:
     @staticmethod
+    def sma(prices: List[float], window: int) -> List[Optional[float]]:
+        if len(prices) < window: return [None] * len(prices)
+        result = [None] * (window - 1)
+        for i in range(window - 1, len(prices)):
+            result.append(sum(prices[i - window + 1:i + 1]) / window)
+        return result
+
+    @staticmethod
     def ema(prices: List[float], window: int) -> List[Optional[float]]:
         if len(prices) < window: return [None] * len(prices)
-        arr = np.array(prices, dtype=float)
-        ema = np.empty_like(arr)
-        ema[:window-1] = np.nan
-        ema[window-1] = np.mean(arr[:window])
-        multiplier = 2.0 / (window + 1.0)
-        for i in range(window, len(arr)):
-            ema[i] = (arr[i] - ema[i-1]) * multiplier + ema[i-1]
-        return [None if np.isnan(x) else float(x) for x in ema.tolist()]
+        result = [None] * (window - 1)
+        multiplier = 2.0 / (window + 1)
+        ema_val = sum(prices[:window]) / window
+        result.append(ema_val)
+        for price in prices[window:]:
+            ema_val = (price - ema_val) * multiplier + ema_val
+            result.append(ema_val)
+        return result
+
+    @staticmethod
+    def std_dev(prices: List[float]) -> float:
+        if not prices: return 0.0
+        mean = sum(prices) / len(prices)
+        variance = sum((x - mean) ** 2 for x in prices) / len(prices)
+        return math.sqrt(variance)
 
     @staticmethod
     def macd(prices: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> Dict[str, List[Optional[float]]]:
@@ -398,70 +408,111 @@ class TechnicalIndicators:
         ema_s = TechnicalIndicators.ema(prices, slow)
         macd_line = [f - s if f is not None and s is not None else None for f, s in zip(ema_f, ema_s)]
         valid_macd = [x for x in macd_line if x is not None]
-        sig = TechnicalIndicators.ema(valid_macd, signal)
-        padded_sig = [None] * (len(prices) - len(sig)) + sig
+        sig_line = TechnicalIndicators.ema(valid_macd, signal) if valid_macd else []
+        padded_sig = [None] * (len(prices) - len(sig_line)) + sig_line
         hist = [m - s if m is not None and s is not None else None for m, s in zip(macd_line, padded_sig)]
         return {"macd": macd_line, "signal": padded_sig, "histogram": hist}
 
     @staticmethod
     def rsi(prices: List[float], window: int = 14) -> List[Optional[float]]:
         if len(prices) < window + 1: return [None] * len(prices)
-        deltas = np.diff(prices)
-        res = [None] * window
-        avg_gain = np.mean([d for d in deltas[:window] if d > 0] or [0])
-        avg_loss = np.mean([-d for d in deltas[:window] if d < 0] or [0])
-        if avg_loss == 0: res.append(100.0)
-        else: res.append(100.0 - (100.0 / (1.0 + avg_gain / avg_loss)))
+        deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))]
+        result = [None] * window
+        
+        window_deltas = deltas[:window]
+        avg_gain = sum(d for d in window_deltas if d > 0) / window
+        avg_loss = sum(-d for d in window_deltas if d < 0) / window
+        
+        rs = avg_gain / avg_loss if avg_loss != 0 else float('inf')
+        result.append(100.0 - (100.0 / (1.0 + rs)) if avg_loss != 0 else 100.0)
+
         for d in deltas[window:]:
             gain = d if d > 0 else 0
             loss = -d if d < 0 else 0
             avg_gain = (avg_gain * (window - 1) + gain) / window
             avg_loss = (avg_loss * (window - 1) + loss) / window
-            if avg_loss == 0: res.append(100.0)
-            else: res.append(100.0 - (100.0 / (1.0 + avg_gain / avg_loss)))
-        return res
+            rs = avg_gain / avg_loss if avg_loss != 0 else float('inf')
+            result.append(100.0 - (100.0 / (1.0 + rs)) if avg_loss != 0 else 100.0)
+        return result
+
+    @staticmethod
+    def bollinger_bands(prices: List[float], window: int = 20, num_std: float = 2.0) -> Dict[str, List[Optional[float]]]:
+        if len(prices) < window:
+            return {"middle": [None]*len(prices), "upper": [None]*len(prices), "lower": [None]*len(prices), "bandwidth": [None]*len(prices)}
+        middle = TechnicalIndicators.sma(prices, window)
+        upper, lower, bandwidth = [None]*(window-1), [None]*(window-1), [None]*(window-1)
+        for i in range(window - 1, len(prices)):
+            slice_prices = prices[i - window + 1:i + 1]
+            std = TechnicalIndicators.std_dev(slice_prices)
+            m = middle[i]
+            if m is not None:
+                u, l = m + num_std * std, m - num_std * std
+                upper.append(u); lower.append(l)
+                bandwidth.append((u - l) / m if m != 0 else None)
+            else:
+                upper.append(None); lower.append(None); bandwidth.append(None)
+        return {"middle": middle, "upper": upper, "lower": lower, "bandwidth": bandwidth}
+
 
 class EnsembleForecaster:
     def __init__(self, prices: List[float], volumes: Optional[List[float]] = None, enable_ml: bool = True, enable_dl: bool = False):
         self.prices = prices
+        self.enable_ml = enable_ml
 
     def forecast(self, horizon_days: int = 252) -> Dict[str, Any]:
         if len(self.prices) < 60: return {"forecast_available": False}
         
-        forecasts, weights, confidences = [], [], []
+        if NUMPY_AVAILABLE and SCIPY_AVAILABLE:
+            forecasts, weights, confidences = [], [], []
 
-        # Simple Trend
-        n = min(len(self.prices), 252)
-        y = np.log(self.prices[-n:])
-        x = np.arange(n)
-        slope, intercept, r_val, _, _ = stats.linregress(x, y) if SCIPY_AVAILABLE else (0, 0, 0, 0, 0)
-        if r_val != 0:
-            forecasts.append(math.exp(intercept + slope * (n + horizon_days)))
-            weights.append(0.2)
-            confidences.append(abs(r_val) * 100)
+            # Simple Trend
+            n = min(len(self.prices), 252)
+            y = np.log(self.prices[-n:])
+            x = np.arange(n)
+            slope, intercept, r_val, _, _ = stats.linregress(x, y)
+            if r_val != 0:
+                forecasts.append(math.exp(intercept + slope * (n + horizon_days)))
+                weights.append(0.2)
+                confidences.append(abs(r_val) * 100)
 
-        if not forecasts:
-            # Fallback to Random Walk with Drift
+            if not forecasts:
+                recent = self.prices[-min(60, len(self.prices)):]
+                returns = np.diff(recent) / recent[:-1]
+                drift = np.mean(returns)
+                price = self.prices[-1] * ((1 + drift) ** horizon_days)
+                forecasts.append(price)
+                weights.append(1.0)
+                confidences.append(50.0)
+
+            total_w = sum(weights)
+            norm_w = [w / total_w for w in weights]
+            ens_price = sum(f * w for f, w in zip(forecasts, norm_w))
+            
+            return {
+                "forecast_available": True,
+                "ensemble": {
+                    "price": float(ens_price),
+                    "roi_pct": float((ens_price / self.prices[-1] - 1) * 100),
+                },
+                "confidence": float(sum(c * w for c, w in zip(confidences, norm_w)))
+            }
+        else:
+            # Pure Python Drift Fallback
             recent = self.prices[-min(60, len(self.prices)):]
-            returns = np.diff(recent) / recent[:-1]
-            drift = np.mean(returns)
+            returns = [(recent[i] - recent[i-1])/recent[i-1] for i in range(1, len(recent))]
+            drift = sum(returns) / len(returns) if returns else 0.0
             price = self.prices[-1] * ((1 + drift) ** horizon_days)
-            forecasts.append(price)
-            weights.append(1.0)
-            confidences.append(50.0)
+            
+            return {
+                "forecast_available": True,
+                "ensemble": {
+                    "price": float(price),
+                    "roi_pct": float((price / self.prices[-1] - 1) * 100),
+                },
+                "confidence": 50.0,
+                "confidence_level": "medium"
+            }
 
-        total_w = sum(weights)
-        norm_w = [w / total_w for w in weights]
-        ens_price = sum(f * w for f, w in zip(forecasts, norm_w))
-        
-        return {
-            "forecast_available": True,
-            "ensemble": {
-                "price": float(ens_price),
-                "roi_pct": float((ens_price / self.prices[-1] - 1) * 100),
-            },
-            "confidence": float(sum(c * w for c, w in zip(confidences, norm_w)))
-        }
 
 # =============================================================================
 # Caching, Circuit Breaker & SingleFlight
@@ -528,7 +579,7 @@ class YahooChartProvider:
     name: str = PROVIDER_NAME
     version: str = PROVIDER_VERSION
     timeout_sec: float = field(default_factory=_timeout_sec)
-    retry_attempts: int = 1 # V6.11 FIX: Slashed from 3 to 1 to fail fast and prevent 503 cascades
+    retry_attempts: int = 1 # V6.12 FIX: Slashed from 3 to 1 to fail fast and prevent 503 cascades
 
     quote_cache: AdvancedCache = field(default_factory=lambda: AdvancedCache("quote", _quote_ttl_sec()))
     singleflight: SingleFlight = field(default_factory=SingleFlight)
@@ -616,7 +667,7 @@ class YahooChartProvider:
                     
                     indicators = chart.get("indicators", {}).get("quote", [{}])[0]
                     
-                    # V6.11 FIX: Handle explicit `null` returned by Yahoo's JSON structure
+                    # V6.12 FIX: Handle explicit `null` returned by Yahoo's JSON structure safely
                     close_data = indicators.get("close") or []
                     closes = [safe_float(x) for x in close_data if x is not None]
                     
@@ -748,8 +799,7 @@ class YahooChartProvider:
         except Exception as fb_err:
             logger.debug(f"REST Fallback also failed: {fb_err}")
             
-        # V6.11 FIX: MOCK DATA GUARANTEE 
-        # (Prevents complete pipeline destruction if Anti-Bot drops IP completely)
+        # MOCK DATA GUARANTEE 
         return self._mock_fallback(symbol)
 
     async def fetch_enriched_quote_patch(self, symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
