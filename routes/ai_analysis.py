@@ -2,24 +2,14 @@
 """
 routes/ai_analysis.py
 ------------------------------------------------------------
-TADAWUL ENTERPRISE AI ANALYSIS ENGINE — v8.5.0 (NEXT-GEN ENTERPRISE)
+TADAWUL ENTERPRISE AI ANALYSIS ENGINE — v8.5.1 (NEXT-GEN ENTERPRISE)
 SAMA Compliant | Real-time ML | Predictive Analytics | Distributed Caching
 
-What's new in v8.5.0:
-- ✅ Field Mapping Resiliency: Added multi-key fallbacks (e.g. `current_price` or `price`) to prevent silent field dropping across disparate data engines.
-- ✅ Pydantic Instantiation Safety: Fixed a critical `TypeError` when unpacking cached Pydantic objects (`**ml_pred`).
-- ✅ Complete Endpoint Sandboxing: Core routes are now strictly wrapped in exception handlers to prevent raw 500 Internal Server Errors from escaping to the client.
-- ✅ Serialization Safety: Fully migrated all endpoints to use `model_dump(mode='json', exclude_none=True)`.
-- ✅ NaN & Infinity Protection: Recursive `clean_nans` interceptor guards `orjson` from unhandled math anomalies.
-- ✅ Deep ML Field Inheritance: `overall_score` and `recommendation` safely bubble up from `MLPrediction` if upstream is missing them.
-
-Core Capabilities:
-- Real-time ML-powered analysis with ensemble models
-- Predictive analytics with confidence scoring
-- Multi-asset support with Shariah compliance filtering
-- Distributed tracing with OpenTelemetry
-- Advanced caching with Redis and predictive pre-fetch
-- Circuit breaker pattern for external services
+What's new in v8.5.1:
+- ✅ Metrics Registry Fix: Patched all `_metrics.gauge()` calls to include the required 'description' argument, resolving HTTP 500 errors during route execution.
+- ✅ Field Mapping Resiliency: Added multi-key fallbacks to prevent silent field dropping.
+- ✅ Pydantic Instantiation Safety: Fixed TypeError when unpacking cached Pydantic objects.
+- ✅ Complete Endpoint Sandboxing: Wrapped routes in exception handlers to prevent raw 500s.
 """
 
 from __future__ import annotations
@@ -162,7 +152,7 @@ except ImportError:
 
 logger = logging.getLogger("routes.ai_analysis")
 
-AI_ANALYSIS_VERSION = "8.5.0"
+AI_ANALYSIS_VERSION = "8.5.1"
 router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 
 # =============================================================================
@@ -709,7 +699,7 @@ class TokenManager:
     
     def validate_token(self, token: str) -> bool:
         if not self._tokens: return True
-        token = token.strip()
+        token = token.strip() if token else ""
         if token in self._tokens:
             if token in self._token_metadata: self._token_metadata[token]["last_used"] = datetime.now().isoformat()
             return True
@@ -1008,12 +998,13 @@ class MLModelManager:
                 self._scalers["standard"] = StandardScaler()
                 self._initialized = True
                 logger.info("ML models initialized")
-                if _metrics.gauge("ml_models_loaded"): 
-                    _metrics.gauge("ml_models_loaded").set(1)
+                
+                gauge = _metrics.gauge("ml_models_loaded", "Status of loaded ML models")
+                if gauge: gauge.set(1)
             except Exception as e:
                 logger.error(f"ML initialization failed: {e}")
-                if _metrics.gauge("ml_models_loaded"): 
-                    _metrics.gauge("ml_models_loaded").set(0)
+                gauge = _metrics.gauge("ml_models_loaded", "Status of loaded ML models")
+                if gauge: gauge.set(0)
     
     async def predict(self, features: MLFeatures) -> Optional[MLPrediction]:
         if not self._initialized or not _ML_AVAILABLE: return None
@@ -1261,8 +1252,10 @@ class WebSocketManager:
         await websocket.accept()
         async with self._connection_lock: 
             self._active_connections.append(websocket)
-        if _metrics.gauge("websocket_connections"): 
-            _metrics.gauge("websocket_connections").set(len(self._active_connections))
+            
+        gauge = _metrics.gauge("websocket_connections", "Number of active WS connections")
+        if gauge: gauge.set(len(self._active_connections))
+            
         if self._broadcast_task is None: 
             self._broadcast_task = asyncio.create_task(self._process_broadcasts())
     
@@ -1273,8 +1266,9 @@ class WebSocketManager:
             for symbol in list(self._subscriptions.keys()):
                 if websocket in self._subscriptions[symbol]: 
                     self._subscriptions[symbol].remove(websocket)
-        if _metrics.gauge("websocket_connections"): 
-            _metrics.gauge("websocket_connections").set(len(self._active_connections))
+                    
+        gauge = _metrics.gauge("websocket_connections", "Number of active WS connections")
+        if gauge: gauge.set(len(self._active_connections))
     
     async def subscribe(self, websocket: WebSocket, symbol: str):
         async with self._connection_lock: 
@@ -1360,7 +1354,7 @@ def _quote_to_response(data: Dict[str, Any]) -> SingleAnalysisResponse:
         
     data_quality = DataQuality.MISSING if data.get("error") else DataQuality.POOR if not price else DataQuality.GOOD
     
-    # V8.5 FIX: Bubble up the ML recommendation and score if upstream missing
+    # Bubble up the ML recommendation and score if upstream missing
     recommendation = data.get("recommendation")
     if not recommendation and ml_prediction:
         recommendation = ml_prediction.recommendation
@@ -1671,7 +1665,7 @@ async def sheet_rows(
                 elif "change" in h_lower and "%" not in h_lower: row.append(lookup.get("change") or lookup.get("price_change"))
                 elif "change %" in h_lower or "change%" in h_lower: row.append(lookup.get("change_percent") or lookup.get("change_pct"))
                 elif "volume" in h_lower: row.append(lookup.get("volume"))
-                elif "market cap" in h_lower: row.append(lookup.get("market_cap"))
+                elif "market cap" in h_lower: row.append(lookup.get("market cap") or lookup.get("market_cap"))
                 elif "pe ratio" in h_lower or "p/e" in h_lower: row.append(lookup.get("pe_ratio") or lookup.get("pe_ttm"))
                 elif "dividend yield" in h_lower: row.append(lookup.get("dividend_yield"))
                 elif "beta" in h_lower: row.append(lookup.get("beta"))
@@ -1695,7 +1689,6 @@ async def sheet_rows(
                 elif "overall score" in h_lower: row.append(lookup.get("overall_score") or lookup.get("score"))
                 elif "recommendation" in h_lower:
                     rec_val = lookup.get("recommendation")
-                    # Fallback to ML recommendation if engine missing it
                     if not rec_val and symbol in predictions_dict:
                         rec_val = predictions_dict[symbol].recommendation.value
                     row.append(str(rec_val or "HOLD"))
@@ -1817,7 +1810,7 @@ async def scoreboard(
             if not (data := results.get(symbol)): continue
             ml_pred = data.get("ml_prediction", {})
             
-            # V8.5 FIX: Bubble up recommendation if missing
+            # Bubble up recommendation if missing
             rec_val = data.get("recommendation")
             if not rec_val and ml_pred:
                 rec_val = ml_pred.get("recommendation")
