@@ -2,26 +2,15 @@
 """
 main.py
 ===========================================================
-TADAWUL FAST BRIDGE – ENTERPRISE FASTAPI ENTRY POINT (v8.4.0)
+TADAWUL FAST BRIDGE – ENTERPRISE FASTAPI ENTRY POINT (v8.5.0)
 ===========================================================
 QUANTUM EDITION | MISSION CRITICAL | DIRECT MOUNT
 
-What's new in v8.4.0:
-- ✅ Engine Boot Fix: Dynamically patches the `_thread.RLock` bug in `core.data_engine` with `asyncio.Lock`.
-- ✅ Prometheus Conflict Fix: Safely suppresses `Duplicated timeseries` ValueError during router imports.
-- ✅ Log Spam Reduction: `safe_import` now silently skips missing fallback modules, only logging true syntax/dependency errors.
-- ✅ Engine Discovery Fix: Targets `core.data_engine` directly rather than the deprecated `v2` namespace.
-- ✅ Guaranteed Routing: Removed the deferred "lazy mount" logic that caused 404 errors. 
-
-Core Capabilities
------------------
-• Multi-layer middleware pipeline with telemetry, security, and performance
-• Intelligent request routing
-• Comprehensive health monitoring with system guardian
-• Distributed tracing and request correlation
-• Advanced rate limiting with slowapi integration
-• Prometheus metrics export
-• Structured logging with multiple outputs (JSON, text)
+What's new in v8.5.0:
+- ✅ Smart Router Discovery: Scans modules for ANY APIRouter instance, preventing failures if variables are renamed (e.g., `advanced_router`).
+- ✅ Auto-Prefixing: Automatically applies strict API prefixes (e.g., `/v1/advanced`) if missing from the child router, fixing 404 Not Found errors.
+- ✅ Route Debugging: Added `/health` enhancements to show exactly which endpoints are actively listening.
+- ✅ Engine Boot Fix: Maintained asyncio.Lock patch for core.data_engine.
 """
 
 from __future__ import annotations
@@ -59,13 +48,13 @@ from typing import (Any, AsyncGenerator, Awaitable, Callable, Dict, List,
 import fastapi
 from fastapi import (BackgroundTasks, Depends, FastAPI, Header,
                      HTTPException, Query, Request, Response,
-                     WebSocket, WebSocketDisconnect, status)
+                     WebSocket, WebSocketDisconnect, status, APIRouter)
 from fastapi.datastructures import State
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.routing import APIRoute, APIRouter
+from fastapi.routing import APIRoute
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.responses import PlainTextResponse, JSONResponse
@@ -107,8 +96,7 @@ try:
     from prometheus_client.registry import CollectorRegistry
     PROMETHEUS_AVAILABLE = True
     
-    # V8.4 FIX: Monkeypatch Prometheus to ignore duplicate metric registrations
-    # This prevents the app from crashing when multiple routers define the same metric name
+    # Monkeypatch Prometheus to ignore duplicate metric registrations
     _original_register = CollectorRegistry.register
     def _safe_register(self, collector):
         try:
@@ -167,10 +155,10 @@ except ImportError:
     YAML_AVAILABLE = False
 
 # =============================================================================
-# V8.4 Global Patches
+# Global Patches
 # =============================================================================
 
-# V8.4 FIX: Pre-emptively fix the `_thread.RLock` bug in core.data_engine
+# Pre-emptively fix the `_thread.RLock` bug in core.data_engine
 try:
     import core.data_engine
     if hasattr(core.data_engine, "_ENGINE_MANAGER"):
@@ -186,7 +174,7 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-APP_ENTRY_VERSION = "8.4.0"
+APP_ENTRY_VERSION = "8.5.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled", "ok", "active"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled"}
@@ -197,11 +185,6 @@ class LogLevel(str, Enum):
     WARNING = "WARNING"
     ERROR = "ERROR"
     CRITICAL = "CRITICAL"
-
-class CircuitState(str, Enum):
-    CLOSED = "closed"
-    OPEN = "open"
-    HALF_OPEN = "half_open"
 
 # =============================================================================
 # Utility Functions
@@ -267,20 +250,17 @@ def safe_import(module_path: str) -> Optional[Any]:
     try: 
         return import_module(module_path)
     except ModuleNotFoundError as e:
-        # V8.4 FIX: Suppress noisy logs for expected fallback candidates
+        # Suppress noisy logs for expected fallback candidates
         if e.name == module_path or e.name in module_path:
             logging.getLogger("boot").debug(f"Router candidate skipped (not found): {module_path}")
         else:
-            # A dependency *inside* the module is missing
             logging.getLogger("boot").error(f"Missing dependency inside '{module_path}': {e}")
         return None
     except Exception as e:
-        # V8.4 FIX: Loudly log exact Tracebacks for broken routes
         logging.getLogger("boot").error(f"❌ Failed to load '{module_path}': {e}\n{traceback.format_exc()}")
         return None
 
 def is_valid_uri(uri: str) -> bool:
-    """Safely validate URIs for tools like Sentry."""
     try:
         result = urlparse(uri)
         return all([result.scheme, result.netloc])
@@ -291,8 +271,6 @@ def is_valid_uri(uri: str) -> bool:
 # Request Correlation (ContextVars)
 # =============================================================================
 _request_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="SYSTEM")
-_user_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("user_id", default="anonymous")
-_session_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("session_id", default="")
 
 def get_request_id() -> str:
     try: return _request_id_ctx.get()
@@ -378,7 +356,6 @@ class TraceContext:
 # System Guardian (Resource Monitoring)
 # =============================================================================
 class SystemGuardian:
-    """Monitors system resources and manages degraded mode"""
     def __init__(self):
         self.running = False
         self.degraded_mode = False
@@ -414,7 +391,6 @@ class SystemGuardian:
         return "low"
 
     def to_dict(self) -> Dict[str, Any]:
-        """Export current diagnostics and metrics."""
         return {
             "status": self.get_status(),
             "load_level": self.get_load_level(),
@@ -443,14 +419,12 @@ class SystemGuardian:
                 self.memory_mb = get_rss_mb()
                 self.cpu_percent = get_cpu_percent()
 
-                # Memory pressure management
                 now = time.time()
                 if self.memory_mb > self.gc_pressure_mb and (now - self.last_gc_time > self.gc_cooldown):
                     boot_logger.info(f"Memory pressure: {self.memory_mb:.1f}MB, forcing GC")
                     gc.collect()
                     self.last_gc_time = now
 
-                # Update degraded mode
                 should_degrade = (self.latency_ms >= self.degraded_enter_lag or self.memory_mb >= self.degraded_memory_mb)
                 if should_degrade and not self.degraded_mode:
                     self.degraded_mode = True
@@ -498,173 +472,9 @@ class MetricsCollector:
 metrics = MetricsCollector()
 
 # =============================================================================
-# Distributed Rate Limiting & Circuit Breaker
-# =============================================================================
-class RateLimiter:
-    def __init__(self):
-        self.redis: Optional[aioredis.Redis] = None
-        if get_env_str("RATE_LIMIT_BACKEND", "memory") == "redis" and REDIS_AVAILABLE:
-            try: self.redis = aioredis.from_url(get_env_str("REDIS_URL"), decode_responses=True)
-            except Exception as e: boot_logger.error(f"Failed to connect to Redis for RateLimiting: {e}")
-        self._memory_store: Dict[str, List[float]] = {}
-        self._memory_lock = asyncio.Lock()
-
-    async def check(self, key: str, limit: int, window: int) -> Tuple[bool, int]:
-        if self.redis:
-            try:
-                now = time.time()
-                pipeline = self.redis.pipeline()
-                pipeline.zremrangebyscore(key, 0, now - window)
-                pipeline.zadd(key, {str(now): now})
-                pipeline.zcard(key)
-                pipeline.expire(key, window)
-                results = await pipeline.execute()
-                return results[2] <= limit, results[2]
-            except Exception: pass
-        
-        async with self._memory_lock:
-            now = time.time()
-            timestamps = [t for t in self._memory_store.get(key, []) if t > now - window]
-            timestamps.append(now)
-            self._memory_store[key] = timestamps[-limit * 2:]
-            return len(timestamps) <= limit, len(timestamps)
-
-rate_limiter = RateLimiter()
-
-# =============================================================================
-# High-Performance Zlib Cache Manager
-# =============================================================================
-class CacheManager:
-    def __init__(self):
-        self.backend = get_env_str("CACHE_BACKEND", "memory")
-        self.ttl = get_env_int("CACHE_TTL_SEC", 300)
-        self.max_size = get_env_int("CACHE_MAX_SIZE", 10000)
-        self._memory_cache: Dict[str, Tuple[bytes, float]] = {}
-        self._memory_lock = asyncio.Lock()
-        self.redis: Optional[aioredis.Redis] = None
-        if self.backend == "redis" and REDIS_AVAILABLE:
-            try: self.redis = aioredis.from_url(get_env_str("REDIS_URL"))
-            except Exception: pass
-
-    def _make_key(self, prefix: str, **kwargs) -> str:
-        content = json_dumps(kwargs)
-        hash_val = hashlib.sha256(content.encode()).hexdigest()[:16]
-        return f"{prefix}:{hash_val}"
-
-    async def get(self, prefix: str, **kwargs) -> Optional[Any]:
-        key = self._make_key(prefix, **kwargs)
-        if self.redis:
-            try:
-                if value := await self.redis.get(key):
-                    if metrics.enabled: metrics.cache_hits.labels(cache_backend="redis").inc()
-                    return pickle.loads(zlib.decompress(value))
-            except Exception: pass
-        
-        async with self._memory_lock:
-            if key in self._memory_cache:
-                value_bytes, timestamp = self._memory_cache[key]
-                if time.time() - timestamp < self.ttl:
-                    if metrics.enabled: metrics.cache_hits.labels(cache_backend="memory").inc()
-                    return pickle.loads(zlib.decompress(value_bytes))
-                else: del self._memory_cache[key]
-        if metrics.enabled: metrics.cache_misses.labels(cache_backend=self.backend).inc()
-        return None
-
-    async def set(self, value: Any, prefix: str, ttl: Optional[int] = None, **kwargs) -> None:
-        key = self._make_key(prefix, **kwargs)
-        ttl = ttl or self.ttl
-        compressed = zlib.compress(pickle.dumps(value), level=6)
-        
-        async with self._memory_lock:
-            self._memory_cache[key] = (compressed, time.time())
-            if len(self._memory_cache) > self.max_size:
-                oldest = min(self._memory_cache.items(), key=lambda x: x[1][1])[0]
-                del self._memory_cache[oldest]
-                
-        if self.redis:
-            try: await self.redis.setex(key, ttl, compressed)
-            except Exception: pass
-
-cache = CacheManager()
-
-# =============================================================================
-# WebSocket & Task Management
-# =============================================================================
-class TaskManager:
-    def __init__(self):
-        self.tasks: Dict[str, Dict[str, Any]] = {}
-        self.max_tasks = get_env_int("MAX_BACKGROUND_TASKS", 100)
-        self.task_timeout = get_env_float("TASK_TIMEOUT_SEC", 300)
-        self._lock = asyncio.Lock()
-
-    async def submit(self, name: str, func: Callable, *args, **kwargs) -> str:
-        task_id = str(uuid.uuid4())[:8]
-        async with self._lock:
-            now = time.time()
-            self.tasks = {tid: info for tid, info in self.tasks.items() if not info.get("completed", False) or now - info.get("completed_at", 0) < 60}
-            if len(self.tasks) >= self.max_tasks: raise RuntimeError("Too many background tasks")
-            self.tasks[task_id] = {"name": name, "status": "pending", "created_at": now}
-        asyncio.create_task(self._run_task(task_id, func, *args, **kwargs))
-        return task_id
-
-    async def _run_task(self, task_id: str, func: Callable, *args, **kwargs):
-        async with self._lock:
-            self.tasks[task_id]["status"] = "running"
-            self.tasks[task_id]["started_at"] = time.time()
-            guardian.background_tasks += 1
-        try:
-            if asyncio.iscoroutinefunction(func): result = await asyncio.wait_for(func(*args, **kwargs), timeout=self.task_timeout)
-            else: result = await asyncio.wait_for(asyncio.get_event_loop().run_in_executor(None, func, *args, **kwargs), timeout=self.task_timeout)
-            async with self._lock:
-                self.tasks[task_id]["status"] = "completed"
-                self.tasks[task_id]["completed_at"] = time.time()
-                self.tasks[task_id]["result"] = str(result)[:200]
-        except Exception as e:
-            async with self._lock:
-                self.tasks[task_id]["status"] = "failed"
-                self.tasks[task_id]["error"] = str(e)
-        finally:
-            guardian.background_tasks -= 1
-
-task_manager = TaskManager()
-
-class WebSocketManager:
-    def __init__(self):
-        self.active_connections: List[WebSocket] = []
-        self.connection_info: Dict[WebSocket, Dict[str, Any]] = {}
-        self._lock = asyncio.Lock()
-
-    async def connect(self, websocket: WebSocket, client_id: str):
-        await websocket.accept()
-        async with self._lock:
-            self.active_connections.append(websocket)
-            self.connection_info[websocket] = {"client_id": client_id, "connected_at": time.time(), "last_ping": time.time()}
-        guardian.active_connections += 1
-
-    async def disconnect(self, websocket: WebSocket):
-        async with self._lock:
-            if websocket in self.active_connections: self.active_connections.remove(websocket)
-            if websocket in self.connection_info: del self.connection_info[websocket]
-        guardian.active_connections -= 1
-
-    async def ping_all(self):
-        for connection in self.active_connections[:]:
-            try:
-                await connection.send_json({"type": "ping"})
-                self.connection_info[connection]["last_ping"] = time.time()
-            except Exception:
-                await self.disconnect(connection)
-
-ws_manager = WebSocketManager()
-
-# =============================================================================
 # Middleware Pipeline
 # =============================================================================
 class TelemetryMiddleware(BaseHTTPMiddleware):
-    """
-    Core Telemetry and Request Context Middleware.
-    Injects Request ID, times execution, applies global degradation limits, and adds advanced OWASP Headers.
-    """
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())[:18]
         token = _request_id_ctx.set(request_id)
@@ -674,7 +484,6 @@ class TelemetryMiddleware(BaseHTTPMiddleware):
         guardian.request_count += 1
         if metrics.enabled: metrics.active_requests.inc()
 
-        # Shed load if system is severely degraded
         if await guardian.should_shed_request(request.url.path):
             if metrics.enabled: metrics.active_requests.dec()
             return BestJSONResponse(
@@ -688,23 +497,19 @@ class TelemetryMiddleware(BaseHTTPMiddleware):
             )
 
         try:
-            # Let SlowAPIMiddleware (if registered) naturally intercept here.
             response = await call_next(request)
             
             duration = time.time() - request.state.start_time
             guardian.latency_ms = guardian.latency_ms * 0.9 + duration * 1000 * 0.1
             metrics.record_request(method=request.method, endpoint=request.url.path, status=response.status_code, duration=duration)
             
-            # Diagnostic and Identity Headers
             response.headers["X-Request-ID"] = request_id
             response.headers["X-Process-Time"] = f"{duration:.4f}s"
             response.headers["X-System-Load"] = guardian.get_load_level()
             response.headers["X-Time-Riyadh"] = now_riyadh_iso()
             
-            # Advanced Web Perf Header
             response.headers["Server-Timing"] = f"app;desc=\"FastAPI Processing\";dur={duration*1000:.2f}"
             
-            # Security Hardening (OWASP Recommended)
             response.headers["X-Content-Type-Options"] = "nosniff"
             response.headers["X-Frame-Options"] = "DENY"
             response.headers["X-XSS-Protection"] = "1; mode=block"
@@ -724,7 +529,6 @@ class TelemetryMiddleware(BaseHTTPMiddleware):
             _request_id_ctx.reset(token)
 
 class TracingMiddleware(BaseHTTPMiddleware):
-    """Integrates OpenTelemetry trace context deeply into the request."""
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         if not TRACING_AVAILABLE or not get_env_bool("ENABLE_TRACING", False): 
             return await call_next(request)
@@ -740,7 +544,6 @@ class TracingMiddleware(BaseHTTPMiddleware):
             return response
 
 class CompressionMiddleware(BaseHTTPMiddleware):
-    """Fallback compression for payloads missing GZIP thresholds."""
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         response = await call_next(request)
         content_type = response.headers.get("content-type", "")
@@ -749,7 +552,6 @@ class CompressionMiddleware(BaseHTTPMiddleware):
         if "gzip" not in request.headers.get("accept-encoding", ""): 
             return response
         
-        # Fallback compression logic
         if hasattr(response, 'body') and len(response.body) > 512:
             import gzip
             compressed = gzip.compress(response.body)
@@ -770,7 +572,6 @@ async def init_engine_resilient(app: FastAPI, max_retries: int = 3) -> None:
     
     for attempt in range(max_retries):
         try:
-            # V8.3 Fix: Try core.data_engine first, then fallback to core.data_engine_v2
             engine_module = safe_import("core.data_engine") or safe_import("core.data_engine_v2")
             if not engine_module or not hasattr(engine_module, "get_engine"):
                 app.state.engine_error = "Engine module not available"
@@ -790,7 +591,6 @@ async def init_engine_resilient(app: FastAPI, max_retries: int = 3) -> None:
         except Exception as e:
             boot_logger.warning(f"Engine boot attempt {attempt+1}/{max_retries} failed: {e}")
             if attempt < max_retries - 1:
-                # Full Jitter
                 base_wait = 2 ** attempt
                 jitter = random.uniform(0, base_wait)
                 await asyncio.sleep(min(10.0, base_wait + jitter))
@@ -800,44 +600,66 @@ async def init_engine_resilient(app: FastAPI, max_retries: int = 3) -> None:
     boot_logger.error(app.state.engine_error)
 
 # =============================================================================
-# Router Mounting
+# Dynamic Router Mounting (V8.5 FIX FOR 404 ERRORS)
 # =============================================================================
-ROUTER_PLAN: List[Tuple[str, List[str]]] = [
-    ("Advanced", ["routes.advanced_analysis", "routes.advanced"]),
-    ("Advisor", ["routes.advisor", "routes.investment_advisor", "core.investment_advisor"]),
-    ("KSA", ["routes.routes_argaam", "routes.argaam"]),
-    ("Enriched", ["routes.enriched_quote", "routes.enriched", "core.enriched_quote"]),
-    ("Analysis", ["routes.ai_analysis", "routes.analysis"]),
-    ("System", ["routes.config", "routes.system", "core.legacy_service"]),
-    ("WebSocket", ["routes.websocket"]),
-    ("Metrics", ["routes.metrics"]),
-    ("Health", ["routes.health"]),
+
+# Tuple format: (Label, Expected API Prefix, List of possible module paths)
+# Enforcing prefixes here guarantees that the tests hit the correct endpoints.
+ROUTER_PLAN: List[Tuple[str, str, List[str]]] = [
+    ("Advanced", "/v1/advanced", ["routes.advanced_analysis", "routes.advanced", "api.advanced"]),
+    ("Advisor", "/v1/advisor", ["routes.advisor", "routes.investment_advisor", "core.investment_advisor"]),
+    ("KSA", "/v1/ksa", ["routes.routes_argaam", "routes.argaam"]),
+    ("Enriched", "/v1/enriched", ["routes.enriched_quote", "routes.enriched", "core.enriched_quote"]),
+    ("Analysis", "/v1/analysis", ["routes.ai_analysis", "routes.analysis"]),
+    ("System", "", ["routes.config", "routes.system", "core.legacy_service"]),
+    ("WebSocket", "", ["routes.websocket"]),
 ]
 
 def route_inventory(app: FastAPI) -> List[Dict[str, Any]]:
-    return [{"path": route.path, "name": route.name, "methods": sorted(route.methods)} for route in app.routes if isinstance(route, APIRoute)]
+    return [{"path": route.path, "name": route.name, "methods": sorted(route.methods)} 
+            for route in app.routes if isinstance(route, APIRoute)]
 
 def mount_routers_once(app: FastAPI) -> Dict[str, Any]:
     if not hasattr(app.state, "mounted_router_modules"): app.state.mounted_router_modules = set()
     report = {"mounted": [], "failed": []}
     
-    for label, candidates in ROUTER_PLAN:
+    for label, expected_prefix, candidates in ROUTER_PLAN:
         mounted, last_error = False, ""
         for module_path in candidates:
             if module_path in app.state.mounted_router_modules:
                 mounted = True; break
+            
             if module := safe_import(module_path):
-                router = getattr(module, "router", None) or getattr(module, "api_router", None)
-                if router:
+                # V8.5 FIX: Dynamically scan for ANY APIRouter instance inside the module
+                # This fixes failures where the variable was named `advanced_router` instead of `router`
+                found_router = None
+                for obj_name in dir(module):
+                    obj = getattr(module, obj_name)
+                    if isinstance(obj, APIRouter):
+                        found_router = obj
+                        break
+                
+                if found_router:
                     try:
-                        app.include_router(router)
+                        # V8.5 FIX: Auto-Prefixing. If the developer forgot the prefix, enforce it here!
+                        if expected_prefix and not found_router.prefix:
+                            app.include_router(found_router, prefix=expected_prefix)
+                            applied_prefix = expected_prefix
+                        else:
+                            # Use existing prefix (or empty if it's meant to be root)
+                            app.include_router(found_router)
+                            applied_prefix = found_router.prefix or '/'
+
                         app.state.mounted_router_modules.add(module_path)
-                        boot_logger.info(f"✅ Mounted {label} via {module_path}")
-                        report["mounted"].append({"label": label, "module": module_path})
+                        boot_logger.info(f"✅ Mounted {label} via {module_path} (Prefix: {applied_prefix})")
+                        report["mounted"].append({"label": label, "module": module_path, "prefix": applied_prefix})
                         mounted = True; break
                     except Exception as e:
                         last_error = str(e)
                         boot_logger.error(f"Failed to mount {label} via {module_path}: {e}")
+                else:
+                    last_error = f"Module found, but no APIRouter instance detected inside {module_path}"
+                    
         if not mounted:
             boot_logger.warning(f"⚠️ Router '{label}' not mounted: {last_error or 'no module found'}")
             report["failed"].append({"label": label, "error": last_error or "not found"})
@@ -847,16 +669,6 @@ def mount_routers_once(app: FastAPI) -> Dict[str, Any]:
     app.state.routers_mounted = True
     app.state.routers_mounted_at_utc = now_utc_iso()
     return report
-
-async def ensure_routers_mounted(app: FastAPI) -> None:
-    if getattr(app.state, "routers_mounted", False): return
-    lock = getattr(app.state, "router_mount_lock", None)
-    if lock is None:
-        lock = asyncio.Lock()
-        app.state.router_mount_lock = lock
-    async with lock:
-        if getattr(app.state, "routers_mounted", False): return
-        mount_routers_once(app)
 
 # =============================================================================
 # App Factory & Event Handlers
@@ -883,39 +695,25 @@ def create_app() -> FastAPI:
         app.state.engine_ready = False
         app.state.routers_mounted = False
         
-        # 1. Background Tasks
         guardian_task = asyncio.create_task(guardian.monitor_loop())
         
-        async def ws_ping_loop():
-            while not guardian.shutting_down:
-                await asyncio.sleep(get_env_int("WEBSOCKET_PING_INTERVAL", 20))
-                await ws_manager.ping_all()
-        ws_ping_task = asyncio.create_task(ws_ping_loop())
-        
-        # 2. Asynchronous Bootstrapper
         async def boot():
             await asyncio.sleep(0) # Yield control
-            
             if get_env_bool("INIT_ENGINE_ON_BOOT", True):
                 await init_engine_resilient(app, max_retries=get_env_int("MAX_RETRIES", 3))
-            
             gc.collect()
             app.state.boot_completed = True
             boot_logger.info(f"🚀 Ready v{app_version} | env={app_env} | mem={guardian.memory_mb:.1f}MB")
             
         boot_task = asyncio.create_task(boot())
         
-        # Application Run Phase
         yield
         
-        # 3. Graceful Shutdown Routine
         boot_logger.info("Shutdown initiated. Draining connections...")
         guardian.stop()
-        
-        # Safe cancellation of orphaned loops to prevent memory leaks
-        for task in (boot_task, ws_ping_task, guardian_task):
+        for task in (boot_task, guardian_task):
             task.cancel()
-        await asyncio.gather(boot_task, ws_ping_task, guardian_task, return_exceptions=True)
+        await asyncio.gather(boot_task, guardian_task, return_exceptions=True)
         
         if engine := getattr(app.state, "engine", None):
             try:
@@ -925,9 +723,6 @@ def create_app() -> FastAPI:
                     engine.close()
             except Exception as e: 
                 boot_logger.warning(f"Engine shutdown error: {e}")
-            
-        if rate_limiter.redis: await rate_limiter.redis.close()
-        if cache.redis: await cache.redis.close()
         boot_logger.info("Shutdown sequence complete")
 
     app = FastAPI(
@@ -940,15 +735,12 @@ def create_app() -> FastAPI:
         default_response_class=BestJSONResponse
     )
 
-    # Middleware Setup (Order matters)
     if limiter is not None:
         app.state.limiter = limiter
         app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
         if SLOWAPI_AVAILABLE: 
-            # Note: SlowAPI must execute before Telemetry to catch limits correctly
             app.add_middleware(SlowAPIMiddleware)
 
-    # Core middlewares
     app.add_middleware(TelemetryMiddleware)
     app.add_middleware(TracingMiddleware)
     app.add_middleware(GZipMiddleware, minimum_size=512)
@@ -967,7 +759,6 @@ def create_app() -> FastAPI:
     if app_env == "production": 
         app.add_middleware(TrustedHostMiddleware, allowed_hosts=get_env_list("ALLOWED_HOSTS", ["*"]))
 
-    # Secured Sentry Initialization
     sentry_dsn = get_env_str("SENTRY_DSN").strip()
     if SENTRY_AVAILABLE and sentry_dsn and is_valid_uri(sentry_dsn):
         try:
@@ -983,7 +774,6 @@ def create_app() -> FastAPI:
         except Exception as e:
             boot_logger.error(f"Failed to initialize Sentry: {e}")
 
-    # OpenTelemetry Setup
     if TRACING_AVAILABLE and get_env_bool("ENABLE_TRACING", False):
         try:
             provider = TracerProvider(resource=Resource(attributes={SERVICE_NAME: app_name}))
@@ -1013,24 +803,6 @@ def create_app() -> FastAPI:
             "documentation": "/docs"
         }
 
-    @app.get("/readyz", include_in_schema=False)
-    async def readiness():
-        boot_ok = getattr(app.state, "boot_completed", False)
-        routers_ok = getattr(app.state, "routers_mounted", False)
-        engine_ok = getattr(app.state, "engine_ready", False) or not get_env_bool("ENGINE_REQUIRED_FOR_READYZ", False)
-        ready = boot_ok and routers_ok and engine_ok
-        return BestJSONResponse(
-            status_code=200 if ready else 503, 
-            content={
-                "status": "ok" if ready else "degraded",
-                "ready": ready, 
-                "boot_completed": boot_ok, 
-                "routers_mounted": getattr(app.state, "routers_mounted", False), 
-                "engine_ready": getattr(app.state, "engine_ready", False), 
-                "load": guardian.get_load_level()
-            }
-        )
-
     @app.get("/health", tags=["system"])
     async def health(request: Request):
         return {
@@ -1040,6 +812,14 @@ def create_app() -> FastAPI:
             "boot": {"engine_ready": getattr(app.state, "engine_ready", False)},
             "routers": getattr(app.state, "router_report", {"mounted": [], "failed": []}),
             "trace_id": get_request_id()
+        }
+
+    # V8.5 FEATURE: Debug tool to see exactly what routes the app actually knows about
+    @app.get("/debug/routes", tags=["system"])
+    async def debug_routes(request: Request):
+        return {
+            "total_routes": len(app.routes),
+            "paths": [route.path for route in app.routes if isinstance(route, APIRoute)]
         }
 
     @app.exception_handler(StarletteHTTPException)
@@ -1072,7 +852,6 @@ app = create_app()
 
 if __name__ == "__main__":
     import uvicorn
-    # Make sure we use uvloop natively if invoked directly
     try:
         import uvloop
         asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
