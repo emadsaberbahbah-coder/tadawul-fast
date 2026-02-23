@@ -2,23 +2,14 @@
 """
 routes/advisor.py
 ------------------------------------------------------------
-TADAWUL ENTERPRISE ADVISOR ENGINE — v4.5.0 (NEXT-GEN ENTERPRISE)
+TADAWUL ENTERPRISE ADVISOR ENGINE — v4.5.1 (NEXT-GEN ENTERPRISE)
 SAMA Compliant | Multi-Asset | Real-time ML | Dynamic Allocation | Audit Trail
 
-What's new in v4.5.0:
-- ✅ Strict Missing Data Handling: Introduced `_safe_float` to sanitize `NaN` and `Infinity` into `None` natively during data extraction.
-- ✅ Pydantic Serialization Fix: Transitioned to `model_dump(mode='python')` to prevent Rust-core crashes on mathematical anomalies, delegating final cleanup to `orjson`.
-- ✅ Complete Endpoint Sandboxing: Core routes are strictly wrapped in exception handlers to prevent raw 500 Internal Server Errors from escaping.
-- ✅ Code Readability & PEP-8 Alignment: Unpacked all massive one-liners into clean, structured Python.
+What's new in v4.5.1:
+- ✅ OpenTelemetry Tracing Fix: Correctly unrolls the Span context manager before calling `.set_attributes()`, permanently fixing the `_AgnosticContextManager` 500 error.
+- ✅ Hardened Fallback Tracing: Added `DummyContextManager` to ensure zero-crash execution even if OpenTelemetry is entirely missing.
+- ✅ Strict Missing Data Handling: `_safe_float` sanitizes `NaN` and `Infinity` into `None` natively during data extraction.
 - ✅ Division-by-Zero Guards: Hardened the Portfolio Optimizer Modern Portfolio Theory (MPT) mathematics.
-
-Core Capabilities:
-- AI-powered investment recommendations with explainable AI (XAI)
-- Real-time market data integration with predictive analytics
-- Dynamic portfolio allocation with risk-parity and Black-Litterman
-- SAMA (Saudi Central Bank) compliance with secure audit trails
-- Circuit breaker pattern for external dependencies
-- Real-time WebSocket streaming for live recommendation updates
 """
 
 from __future__ import annotations
@@ -133,6 +124,7 @@ except ImportError:
     _OTEL_AVAILABLE = False
     
     class DummySpan:
+        def set_attributes(self, *args, **kwargs): pass
         def set_attribute(self, *args, **kwargs): pass
         def set_status(self, *args, **kwargs): pass
         def __enter__(self): return self
@@ -140,8 +132,13 @@ except ImportError:
         def record_exception(self, *args, **kwargs): pass
         def end(self): pass
         
+    class DummyContextManager:
+        def __init__(self, span): self.span = span
+        def __enter__(self): return self.span
+        def __exit__(self, *args, **kwargs): pass
+
     class DummyTracer:
-        def start_as_current_span(self, *args, **kwargs): return DummySpan()
+        def start_as_current_span(self, *args, **kwargs): return DummyContextManager(DummySpan())
         def start_span(self, *args, **kwargs): return DummySpan()
         
     tracer = DummyTracer()
@@ -175,11 +172,11 @@ except ImportError:
 
 logger = logging.getLogger("routes.advisor")
 
-ADVISOR_ROUTE_VERSION = "4.5.0"
+ADVISOR_ROUTE_VERSION = "4.5.1"
 router = APIRouter(prefix="/v1/advisor", tags=["advisor"])
 
 # =============================================================================
-# Enums & Types (v4.5.0 FlexibleEnum Upgrade)
+# Enums & Types
 # =============================================================================
 
 class FlexibleEnum(str, Enum):
@@ -388,27 +385,38 @@ class MetricsRegistry:
 _metrics = MetricsRegistry()
 
 class TraceContext:
-    """OpenTelemetry trace context manager (Sync and Async compatible)."""
+    """Safe OpenTelemetry trace context manager. Unrolls context managers to extract Spans."""
     def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
         self.name = name
         self.attributes = attributes or {}
         self.tracer = tracer if _OTEL_AVAILABLE and _CONFIG.enable_tracing else None
+        self._span_cm = None
         self.span = None
-        self.token = None
     
     def __enter__(self):
         if self.tracer:
-            self.span = self.tracer.start_as_current_span(self.name)
-            if self.attributes:
-                self.span.set_attributes(self.attributes)
+            try:
+                # Retrieve the context manager
+                self._span_cm = self.tracer.start_as_current_span(self.name)
+                # Enter it to retrieve the actual Span
+                self.span = self._span_cm.__enter__()
+                # Safely set attributes on the resolved Span
+                if self.attributes and hasattr(self.span, "set_attributes"):
+                    self.span.set_attributes(self.attributes)
+            except Exception as e:
+                pass # Fail gracefully if tracing encounters an anomaly
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.span and _OTEL_AVAILABLE:
-            if exc_val:
-                self.span.record_exception(exc_val)
-                self.span.set_status(Status(StatusCode.ERROR, str(exc_val)))
-            self.span.__exit__(exc_type, exc_val, exc_tb)
+        if self.span and self._span_cm:
+            try:
+                if exc_val and hasattr(self.span, "record_exception"):
+                    self.span.record_exception(exc_val)
+                    if hasattr(self.span, "set_status"):
+                        self.span.set_status(Status(StatusCode.ERROR, str(exc_val)))
+                self._span_cm.__exit__(exc_type, exc_val, exc_tb)
+            except Exception:
+                pass
 
     async def __aenter__(self):
         return self.__enter__()
@@ -1281,7 +1289,7 @@ class WebSocketManager:
                     try: 
                         if _HAS_ORJSON:
                             await connection.send_text(msg_str)
-                        else: 
+                        else:
                             await connection.send_json(message)
                     except Exception: 
                         disconnected.append(connection)
@@ -1486,7 +1494,7 @@ async def advisor_recommendations(
             }
         )
         
-        # V4.5.0 FIX: Strip None fields entirely to save bandwidth & prevent generic parse errors on Pydantic Enums
+        # Strip None fields entirely to save bandwidth & prevent generic parse errors on Pydantic Enums
         return BestJSONResponse(content=_serialize_response(response))
 
     except HTTPException:
