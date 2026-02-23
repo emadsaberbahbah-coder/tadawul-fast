@@ -2,25 +2,22 @@
 """
 core/data_engine.py
 ================================================================================
-Enterprise Data Engine — v6.3.0 (ADVANCED ENTERPRISE)
+Enterprise Data Engine — v6.4.0 (ADVANCED ENTERPRISE)
 ================================================================================
 Financial Data Platform — Core Data Engine with Multi-Version Support
 
-What's new in v6.3.0:
-- ✅ Critical Lock Fix: Safely decoupled `asyncio.Lock()` from `threading.RLock()` to prevent "RLock does not support async context" crashes.
-- ✅ Traceback Visibility: `V2Discovery` now loudly prints the exact Python Traceback if the real Data Engine fails to load.
-- ✅ V4/V5 Discovery: Added automatic resolution for `DataEngineV4` and `DataEngineV5` classes.
-- ✅ High-performance JSON parsing via `orjson` (if available)
-- ✅ OpenTelemetry Tracing integration for sync and async execution
+What's new in v6.4.0:
+- ✅ Emergency Data Rescuer: Built-in proxy and fallback API bypasses Render/Yahoo IP blocks automatically.
+- ✅ Transparent Self-Healing: If underlying engines return missing prices, the Rescuer patches the payload before returning to the ML pipelines.
+- ✅ Critical Lock Fix: Safely decoupled `asyncio.Lock()` from `threading.RLock()`.
+- ✅ High-performance JSON parsing via `orjson`.
+- ✅ OpenTelemetry Tracing integration for sync and async execution.
 
 Core Capabilities:
 - Multi-version engine support (v1, v2, v3, v4, v5) with automatic detection
 - Advanced lazy loading with circuit breaker pattern
 - Thread-safe singleton management with double-checked locking
 - Smart caching with TTL, LRU eviction, and payload compression
-- Comprehensive error handling with retry strategies
-- Full async/await support with timeout controls
-- Never crashes startup: all functions are defensive
 """
 
 from __future__ import annotations
@@ -53,7 +50,7 @@ from typing import (
 # Version Information
 # ============================================================================
 
-__version__ = "6.3.0"
+__version__ = "6.4.0"
 ADAPTER_VERSION = __version__
 
 # ============================================================================
@@ -535,7 +532,6 @@ class DynamicCircuitBreaker:
                 else:
                     raise Exception(f"Circuit {self.name} is OPEN (cooldown: {self.current_timeout}s)")
             
-            # In half-open, we allow 1 request to pass through for testing (enforced by success threshold checks logic elsewhere or concurrency limits)
             pass
         
         try:
@@ -571,7 +567,6 @@ class DynamicCircuitBreaker:
                         _dbg(f"Circuit {self.name} opened after {self.failure_count} failures", "warning")
                 elif self.state == CircuitState.HALF_OPEN:
                     self.state = CircuitState.OPEN
-                    # Progressive backoff
                     self.current_timeout = min(self.max_timeout_seconds, self.current_timeout * 1.5)
                     _METRICS.set("circuit_breaker_state", 0, {"name": self.name})
                     _dbg(f"Circuit {self.name} re-opened. Cooldown scaled to {self.current_timeout}s", "warning")
@@ -809,41 +804,142 @@ class DistributedCache:
 
 
 # ============================================================================
-# Singleflight Pattern (Prevent Cache Stampede)
+# Emergency Data Rescuer (Bypasses Provider Blocks)
 # ============================================================================
 
-class SingleFlight:
-    """Deduplicate concurrent requests for the same key."""
+class EmergencyDataRescuer:
+    """Detects missing prices (due to Yahoo/Render IP Blocks) and attempts rescue via proxy or fallback APIs."""
 
-    def __init__(self) -> None:
-        self._lock = asyncio.Lock()
-        self._futures: Dict[str, asyncio.Future] = {}
-        self._stats: Dict[str, int] = defaultdict(int)
+    @classmethod
+    async def rescue_quote(cls, quote_obj: Any, symbol: str) -> Any:
+        # Initialize an empty quote object if None
+        if quote_obj is None:
+            UQ = get_unified_quote_class()
+            quote_obj = UQ(symbol=symbol, data_quality="MISSING", error="Upstream returned None")
 
-    async def run(self, key: str, coro_fn):
-        async with self._lock:
-            fut = self._futures.get(key)
-            if fut is not None:
-                self._stats[key] += 1
-                return await fut
-            fut = asyncio.get_event_loop().create_future()
-            self._futures[key] = fut
+        is_dict = isinstance(quote_obj, dict)
+        
+        # Check if price already exists and is valid
+        price = quote_obj.get("current_price") or quote_obj.get("price") if is_dict else getattr(quote_obj, "current_price", None) or getattr(quote_obj, "price", None)
+        
+        if price is not None:
+            try:
+                if float(price) > 0: return quote_obj
+            except Exception:
+                pass
 
+        _dbg(f"Data Rescuer triggered for {symbol}: Price missing (Potential IP Block)", "warn")
+
+        data = await cls._fetch_data(symbol)
+        if data:
+            if is_dict:
+                quote_obj["current_price"] = data["price"]
+                quote_obj["price"] = data["price"]
+                quote_obj["volume"] = data["volume"]
+                quote_obj["previous_close"] = data["prev_close"]
+                quote_obj["data_quality"] = "RESCUED"
+                quote_obj["error"] = None
+                
+                if data["price"] and data["prev_close"]:
+                    change = data["price"] - data["prev_close"]
+                    pct = (change / data["prev_close"]) * 100 if data["prev_close"] else 0
+                    quote_obj["price_change"] = change
+                    quote_obj["change"] = change
+                    quote_obj["percent_change"] = pct
+                    quote_obj["change_pct"] = pct
+            else:
+                if hasattr(quote_obj, "current_price"): quote_obj.current_price = data["price"]
+                if hasattr(quote_obj, "price"): quote_obj.price = data["price"]
+                if hasattr(quote_obj, "volume"): quote_obj.volume = data["volume"]
+                if hasattr(quote_obj, "previous_close"): quote_obj.previous_close = data["prev_close"]
+                if hasattr(quote_obj, "data_quality"): quote_obj.data_quality = "RESCUED"
+                if hasattr(quote_obj, "error"): quote_obj.error = None
+                
+                if data["price"] and data["prev_close"]:
+                    change = data["price"] - data["prev_close"]
+                    pct = (change / data["prev_close"]) * 100 if data["prev_close"] else 0
+                    if hasattr(quote_obj, "price_change"): quote_obj.price_change = change
+                    if hasattr(quote_obj, "change"): quote_obj.change = change
+                    if hasattr(quote_obj, "percent_change"): quote_obj.percent_change = pct
+                    if hasattr(quote_obj, "change_pct"): quote_obj.change_pct = pct
+
+            _dbg(f"Successfully rescued {symbol} with price {data['price']}", "info")
+
+        return quote_obj
+
+    @classmethod
+    async def _fetch_data(cls, symbol: str) -> Optional[Dict[str, float]]:
         try:
-            result = await coro_fn()
-            if not fut.done():
-                fut.set_result(result)
-            return result
-        except Exception as e:
-            if not fut.done():
-                fut.set_exception(e)
-            raise
-        finally:
-            async with self._lock:
-                self._futures.pop(key, None)
+            import aiohttp
+        except ImportError:
+            return None
 
-    def get_stats(self) -> Dict[str, int]:
-        return dict(self._stats)
+        keys = {
+            "alphavantage": os.getenv("ALPHAVANTAGE_API_KEY"),
+            "fmp": os.getenv("FMP_API_KEY"),
+            "finnhub": os.getenv("FINNHUB_API_KEY")
+        }
+        proxy = os.getenv("HTTP_PROXY") or os.getenv("PROXY_URL") or os.getenv("HTTPS_PROXY")
+        
+        async with aiohttp.ClientSession() as session:
+            # 1. Try Yahoo Finance with advanced spoofing & proxy
+            try:
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                    "Accept": "application/json",
+                    "Cache-Control": "no-cache",
+                    "Pragma": "no-cache"
+                }
+                url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1d"
+                async with session.get(url, headers=headers, proxy=proxy, timeout=3) as resp:
+                    if resp.status == 200:
+                        j = await resp.json()
+                        meta = j.get("chart", {}).get("result", [{}])[0].get("meta", {})
+                        price = meta.get("regularMarketPrice")
+                        if price:
+                            return {
+                                "price": float(price),
+                                "prev_close": float(meta.get("chartPreviousClose", price)),
+                                "volume": float(meta.get("regularMarketVolume", 0))
+                            }
+            except Exception:
+                pass
+
+            # 2. Try AlphaVantage Fallback
+            if keys["alphavantage"]:
+                try:
+                    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={keys['alphavantage']}"
+                    async with session.get(url, timeout=3) as resp:
+                        if resp.status == 200:
+                            j = await resp.json()
+                            gq = j.get("Global Quote", {})
+                            if "05. price" in gq:
+                                return {
+                                    "price": float(gq["05. price"]),
+                                    "prev_close": float(gq.get("08. previous close", gq["05. price"])),
+                                    "volume": float(gq.get("06. volume", 0))
+                                }
+                except Exception:
+                    pass
+
+            # 3. Try Financial Modeling Prep Fallback
+            if keys["fmp"]:
+                fmp_sym = symbol
+                try:
+                    url = f"https://financialmodelingprep.com/api/v3/quote/{fmp_sym}?apikey={keys['fmp']}"
+                    async with session.get(url, timeout=3) as resp:
+                        if resp.status == 200:
+                            j = await resp.json()
+                            if isinstance(j, list) and len(j) > 0 and "price" in j[0]:
+                                return {
+                                    "price": float(j[0]["price"]),
+                                    "prev_close": float(j[0].get("previousClose", j[0]["price"])),
+                                    "volume": float(j[0].get("volume", 0))
+                                }
+                except Exception:
+                    pass
+
+        return None
 
 
 # ============================================================================
@@ -910,11 +1006,6 @@ def _safe_bool(x: Any, default: bool = False) -> bool:
 def _safe_int(x: Any, default: Optional[int] = None) -> Optional[int]:
     if x is None: return default
     try: return int(float(str(x).strip()))
-    except Exception: return default
-
-def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
-    if x is None: return default
-    try: return float(str(x).strip())
     except Exception: return default
 
 def _utc_now() -> datetime:
@@ -1497,7 +1588,8 @@ async def _call_engine_single(engine: Any, symbol: str, *, enriched: bool, use_c
         try:
             result = await _maybe_await(module_func(norm_symbol))
             result = _unwrap_payload(result)
-            if use_cache and result and not getattr(result, 'error', None):
+            result = await EmergencyDataRescuer.rescue_quote(result, norm_symbol)
+            if use_cache and result and getattr(result, 'data_quality', None) != "MISSING":
                 await _ENGINE_MANAGER.get_cache().set("quotes", cache_key, result, ttl)
             return result
         except Exception as e:
@@ -1507,7 +1599,8 @@ async def _call_engine_single(engine: Any, symbol: str, *, enriched: bool, use_c
         try:
             result = await _call_engine_method(engine, method_name, norm_symbol)
             result = _unwrap_payload(result)
-            if use_cache and result and not getattr(result, 'error', None):
+            result = await EmergencyDataRescuer.rescue_quote(result, norm_symbol)
+            if use_cache and result and getattr(result, 'data_quality', None) != "MISSING":
                 await _ENGINE_MANAGER.get_cache().set("quotes", cache_key, result, ttl)
             return result
         except (AttributeError, NotImplementedError): continue
@@ -1552,10 +1645,14 @@ async def _call_engine_batch(engine: Any, symbols: List[str], *, enriched: bool,
         try:
             result = await _maybe_await(module_func(missing_symbols))
             aligned = _align_batch_results(_unwrap_payload(result), missing_symbols)
+            
+            for idx in range(len(aligned)):
+                aligned[idx] = await EmergencyDataRescuer.rescue_quote(aligned[idx], missing_symbols[idx])
+
             if use_cache:
                 cache = _ENGINE_MANAGER.get_cache()
                 for sym, res in zip(missing_symbols, aligned):
-                    if res and not getattr(res, 'error', None):
+                    if res and getattr(res, 'data_quality', None) != "MISSING":
                         await cache.set("quotes", f"quote:{sym}:{'enriched' if enriched else 'basic'}", res, ttl)
             
             final_results, cache_idx = [], 0
@@ -1572,10 +1669,14 @@ async def _call_engine_batch(engine: Any, symbols: List[str], *, enriched: bool,
         try:
             result = await _call_engine_method(engine, method_name, missing_symbols)
             aligned = _align_batch_results(_unwrap_payload(result), missing_symbols)
+            
+            for idx in range(len(aligned)):
+                aligned[idx] = await EmergencyDataRescuer.rescue_quote(aligned[idx], missing_symbols[idx])
+
             if use_cache:
                 cache = _ENGINE_MANAGER.get_cache()
                 for sym, res in zip(missing_symbols, aligned):
-                    if res and not getattr(res, 'error', None):
+                    if res and getattr(res, 'data_quality', None) != "MISSING":
                         await cache.set("quotes", f"quote:{sym}:{'enriched' if enriched else 'basic'}", res, ttl)
             
             final_results, cache_idx = [], 0
@@ -1861,26 +1962,34 @@ class DataEngine:
 
     async def get_quote(self, symbol: str, use_cache: bool = True) -> Any:
         engine = await self._ensure()
-        try: return _finalize_quote(_unwrap_payload(await _call_engine_single(engine, symbol, enriched=False, use_cache=use_cache)))
+        try: 
+            res = _finalize_quote(_unwrap_payload(await _call_engine_single(engine, symbol, enriched=False, use_cache=use_cache)))
+            return await EmergencyDataRescuer.rescue_quote(res, symbol)
         except Exception: return await get_quote(symbol, use_cache=use_cache)
 
     async def get_quotes(self, symbols: List[str], use_cache: bool = True) -> List[Any]:
         engine = await self._ensure()
         try:
             aligned = _align_batch_results(await _call_engine_batch(engine, symbols, enriched=False, use_cache=use_cache), symbols)
-            return [_finalize_quote(_unwrap_payload(x)) if x is not None else StubUnifiedQuote(symbol=_safe_str(s), error="Missing", request_id=self._request_id).finalize() for x, s in zip(aligned, symbols)]
+            out = [_finalize_quote(_unwrap_payload(x)) if x is not None else StubUnifiedQuote(symbol=_safe_str(s), error="Missing", request_id=self._request_id).finalize() for x, s in zip(aligned, symbols)]
+            for i in range(len(out)): out[i] = await EmergencyDataRescuer.rescue_quote(out[i], symbols[i])
+            return out
         except Exception: return await get_quotes(symbols, use_cache=use_cache)
 
     async def get_enriched_quote(self, symbol: str, use_cache: bool = True) -> Any:
         engine = await self._ensure()
-        try: return _finalize_quote(_unwrap_payload(await _call_engine_single(engine, symbol, enriched=True, use_cache=use_cache)))
+        try: 
+            res = _finalize_quote(_unwrap_payload(await _call_engine_single(engine, symbol, enriched=True, use_cache=use_cache)))
+            return await EmergencyDataRescuer.rescue_quote(res, symbol)
         except Exception: return await get_enriched_quote(symbol, use_cache=use_cache)
 
     async def get_enriched_quotes(self, symbols: List[str], use_cache: bool = True) -> List[Any]:
         engine = await self._ensure()
         try:
             aligned = _align_batch_results(await _call_engine_batch(engine, symbols, enriched=True, use_cache=use_cache), symbols)
-            return [_finalize_quote(_unwrap_payload(x)) if x is not None else StubUnifiedQuote(symbol=_safe_str(s), error="Missing", request_id=self._request_id).finalize() for x, s in zip(aligned, symbols)]
+            out = [_finalize_quote(_unwrap_payload(x)) if x is not None else StubUnifiedQuote(symbol=_safe_str(s), error="Missing", request_id=self._request_id).finalize() for x, s in zip(aligned, symbols)]
+            for i in range(len(out)): out[i] = await EmergencyDataRescuer.rescue_quote(out[i], symbols[i])
+            return out
         except Exception: return await get_enriched_quotes(symbols, use_cache=use_cache)
 
     async def aclose(self) -> None:
