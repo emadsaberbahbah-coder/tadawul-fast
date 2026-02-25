@@ -2,7 +2,7 @@
 # core/config.py
 """
 ================================================================================
-Core Configuration Module — v6.1.0 (QUANTUM EDITION)
+Core Configuration Module — v6.1.1 (QUANTUM EDITION / PROJECT-ALIGNED)
 ================================================================================
 TADAWUL FAST BRIDGE – Enterprise Configuration Management
 
@@ -15,22 +15,22 @@ PRIMARY GOALS (Project-Aligned)
 - ✅ Deterministic + safe (no hidden network calls unless explicitly enabled)
 - ✅ Production-friendly: masked public config, health checks, strict validation
 
-WHAT'S NEW vs v6.0.1 draft you pasted
-- ✅ Better URL normalization (supports "host:port" and missing scheme)
-- ✅ Unified Google credentials helpers:
-      - GOOGLE_SHEETS_CREDENTIALS / GOOGLE_CREDENTIALS (JSON)
-      - GOOGLE_*_B64 (base64 JSON)
-      - GOOGLE_APPLICATION_CREDENTIALS / GOOGLE_SHEETS_CREDENTIALS_FILE (file path)
-      - GOOGLE_CREDENTIALS_DICT (JSON dict)
-- ✅ Safe .env loader (no dependency) if ENV_FILE / DOTENV_PATH exists
-- ✅ Runtime overrides support (optional, thread-safe) without restarting app
-- ✅ Stronger validate() with actionable warnings/errors
-- ✅ Public config export with secret masking for /system/info endpoints
+WHAT'S NEW vs v6.1.0 pasted draft
+- ✅ Fixed naming conflicts & undefined exports (CacheStrategy/ProviderStatus aliases safe)
+- ✅ Safer TraceContext implementation (never throws; decorator supported)
+- ✅ Env-file (.env) loader integrated into Settings.from_env without mutating os.environ
+- ✅ Unified Google credential resolution returns BOTH:
+      - google_credentials_dict (normalized)
+      - google_sheets_credentials_json (string JSON) for compatibility
+- ✅ Runtime overrides support (thread-safe) + included in reload_settings
+- ✅ Distributed config sources are lazy: only connect when reload_settings calls load_merged
+- ✅ Added auth helpers (allowed_tokens/is_open_mode/auth_ok) used by backend routes
+- ✅ Public config export includes masking for system/info endpoints
 
 NOTE
 - This module does NOT force-connect to Consul/etcd/ZK unless you set:
     CONSUL_HOST / ETCD_HOST / ZOOKEEPER_HOSTS
-- Even then, connections are attempted only when load_merged() is called.
+- Even then, connection attempts happen ONLY when load_merged() is called (during reload_settings).
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 # =============================================================================
 # Version
 # =============================================================================
-CONFIG_VERSION = "6.1.0"
+CONFIG_VERSION = "6.1.1"
 CONFIG_SCHEMA_VERSION = "2.2"
 CONFIG_BUILD_TIMESTAMP = os.getenv("BUILD_TIMESTAMP") or datetime.now(timezone.utc).isoformat()
 
@@ -108,7 +108,7 @@ try:
 
     YAML_AVAILABLE = True
 except Exception:
-    yaml = None
+    yaml = None  # type: ignore
     YAML_AVAILABLE = False
 
 try:
@@ -116,7 +116,7 @@ try:
 
     TOML_AVAILABLE = True
 except Exception:
-    toml = None
+    toml = None  # type: ignore
     TOML_AVAILABLE = False
 
 try:
@@ -160,6 +160,7 @@ class TraceContext:
     Lightweight OpenTelemetry wrapper.
     - Use as context manager: with TraceContext("name"): ...
     - Use as decorator: @TraceContext("name")
+    Never throws; always safe.
     """
 
     def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
@@ -170,29 +171,37 @@ class TraceContext:
 
     def __enter__(self):
         if OTEL_AVAILABLE and _TRACING_ENABLED and trace is not None:
-            tracer = trace.get_tracer(__name__)
-            self._span_cm = tracer.start_as_current_span(self.name)
-            self._span = self._span_cm.__enter__()
             try:
-                for k, v in self.attributes.items():
-                    self._span.set_attribute(k, v)
+                tracer = trace.get_tracer(__name__)
+                self._span_cm = tracer.start_as_current_span(self.name)
+                self._span = self._span_cm.__enter__()
+                try:
+                    for k, v in (self.attributes or {}).items():
+                        self._span.set_attribute(k, v)
+                except Exception:
+                    pass
             except Exception:
-                pass
+                self._span_cm = None
+                self._span = None
         return self
 
     def __exit__(self, exc_type, exc, tb):
-        if self._span is not None and OTEL_AVAILABLE and _TRACING_ENABLED:
-            try:
-                if exc is not None and Status is not None and StatusCode is not None:
+        try:
+            if self._span is not None and exc is not None and Status is not None and StatusCode is not None:
+                try:
                     self._span.record_exception(exc)
+                except Exception:
+                    pass
+                try:
                     self._span.set_status(Status(StatusCode.ERROR, str(exc)))
-            except Exception:
-                pass
-        if self._span_cm is not None:
-            try:
-                return self._span_cm.__exit__(exc_type, exc, tb)
-            except Exception:
-                return False
+                except Exception:
+                    pass
+        finally:
+            if self._span_cm is not None:
+                try:
+                    return self._span_cm.__exit__(exc_type, exc, tb)
+                except Exception:
+                    return False
         return False
 
     def __call__(self, fn: Callable) -> Callable:
@@ -371,7 +380,7 @@ def _dbg(message: str, level: str = "info", **kwargs) -> None:
     try:
         payload = {"message": message, "ts": datetime.now(timezone.utc).isoformat(), **kwargs}
         msg = json_dumps(payload)
-        lvl = level.lower()
+        lvl = (level or "info").lower()
         if lvl == "error":
             logger.error(msg)
         elif lvl in ("warn", "warning"):
@@ -452,7 +461,9 @@ def load_dotenv_simple(path: Path) -> Dict[str, str]:
                 continue
             k, v = s.split("=", 1)
             k = k.strip()
-            v = v.strip().strip("'").strip('"')
+            v = v.strip()
+            if v.startswith(("'", '"')) and v.endswith(("'", '"')) and len(v) >= 2:
+                v = v[1:-1]
             if k:
                 out[k] = v
     except Exception as e:
@@ -518,7 +529,7 @@ class CacheBackend(str, Enum):
     NONE = "none"
 
 
-# Compatibility aliases (old imports)
+# Compatibility aliases (avoid breaking old imports)
 CacheStrategy = CacheBackend
 ProviderStatus = Enum("ProviderStatus", {"ENABLED": "enabled", "DISABLED": "disabled"})
 
@@ -557,29 +568,11 @@ class AuthType(str, Enum):
 
 
 # =============================================================================
-# Exceptions
-# =============================================================================
-class ConfigurationError(Exception):
-    pass
-
-
-class ConfigValidationError(ConfigurationError):
-    pass
-
-
-class SourceError(ConfigurationError):
-    pass
-
-
-class ReloadError(ConfigurationError):
-    pass
-
-
-# =============================================================================
 # Backoff
 # =============================================================================
 class FullJitterBackoff:
     """AWS Full-Jitter backoff (bounded)."""
+
     def __init__(self, max_retries: int = 3, base_delay: float = 0.5, max_delay: float = 5.0):
         self.max_retries = max(1, int(max_retries))
         self.base_delay = max(0.01, float(base_delay))
@@ -594,7 +587,7 @@ class FullJitterBackoff:
                 last = e
                 if attempt >= self.max_retries - 1:
                     raise
-                cap = min(self.max_delay, self.base_delay * (2 ** attempt))
+                cap = min(self.max_delay, self.base_delay * (2**attempt))
                 time.sleep(random.uniform(0, cap))
         if last:
             raise last
@@ -606,6 +599,7 @@ class FullJitterBackoff:
 # =============================================================================
 class RuntimeOverrides:
     """Thread-safe runtime overrides for config values."""
+
     def __init__(self):
         self._lock = RLock()
         self._data: Dict[str, Any] = {}
@@ -626,7 +620,7 @@ class RuntimeOverrides:
 _RUNTIME = RuntimeOverrides()
 
 # =============================================================================
-# Google Credentials Helpers (Aligned with google_sheets_service)
+# Google Credentials Helpers (Aligned with google_sheets_service + setup_credentials)
 # =============================================================================
 def _parse_json_maybe(raw: str) -> Optional[Dict[str, Any]]:
     raw = strip_value(raw)
@@ -653,9 +647,29 @@ def _parse_b64_json(raw: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _normalize_google_creds_dict(d: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize private_key newlines (\\n -> \n) and add PEM wrapper if missing.
+    """
+    out = dict(d)
+    pk = out.get("private_key")
+    if isinstance(pk, str) and pk:
+        if "\\n" in pk:
+            pk = pk.replace("\\n", "\n")
+        if "-----BEGIN PRIVATE KEY-----" not in pk and "-----END PRIVATE KEY-----" not in pk:
+            pk = "-----BEGIN PRIVATE KEY-----\n" + pk.strip() + "\n-----END PRIVATE KEY-----\n"
+        out["private_key"] = pk
+    return out
+
+
 def get_google_credentials_dict(env: Optional[Dict[str, str]] = None) -> Optional[Dict[str, Any]]:
     """
     Unified Google service account credential loader.
+    Supported sources:
+      - GOOGLE_CREDENTIALS_DICT (JSON dict)
+      - GOOGLE_SHEETS_CREDENTIALS / GOOGLE_CREDENTIALS (JSON)
+      - GOOGLE_*_B64 (base64 JSON)
+      - GOOGLE_APPLICATION_CREDENTIALS / GOOGLE_SHEETS_CREDENTIALS_FILE (file path)
     Returns dict or None. Never throws.
     """
     try:
@@ -682,7 +696,7 @@ def get_google_credentials_dict(env: Optional[Dict[str, str]] = None) -> Optiona
             path = Path(p)
             if path.exists() and path.is_file():
                 raw = path.read_text(encoding="utf-8", errors="replace")
-                d2 = _parse_json_maybe(raw) or None
+                d2 = _parse_json_maybe(raw)
                 if d2:
                     return _normalize_google_creds_dict(d2)
 
@@ -691,23 +705,8 @@ def get_google_credentials_dict(env: Optional[Dict[str, str]] = None) -> Optiona
         return None
 
 
-def _normalize_google_creds_dict(d: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Normalize private_key newlines (\\n -> \n) and add PEM wrapper if missing.
-    """
-    out = dict(d)
-    pk = out.get("private_key")
-    if isinstance(pk, str) and pk:
-        if "\\n" in pk:
-            pk = pk.replace("\\n", "\n")
-        if "-----BEGIN PRIVATE KEY-----" not in pk and "-----END PRIVATE KEY-----" not in pk:
-            pk = "-----BEGIN PRIVATE KEY-----\n" + pk.strip() + "\n-----END PRIVATE KEY-----"
-        out["private_key"] = pk
-    return out
-
-
 # =============================================================================
-# Distributed config sources (lazy connect)
+# Distributed config sources (lazy connect; only used during load_merged)
 # =============================================================================
 class ConfigSourceManager:
     def __init__(self):
@@ -735,12 +734,24 @@ class ConfigSourceManager:
         if not loaded:
             return {}
         if priority is None:
-            priority = [ConfigSource.ENV_VAR, ConfigSource.ENV_FILE, ConfigSource.CONSUL, ConfigSource.ETCD, ConfigSource.ZOOKEEPER, ConfigSource.RUNTIME]
+            priority = [
+                ConfigSource.ENV_VAR,
+                ConfigSource.ENV_FILE,
+                ConfigSource.CONSUL,
+                ConfigSource.ETCD,
+                ConfigSource.ZOOKEEPER,
+                ConfigSource.RUNTIME,
+            ]
         merged: Dict[str, Any] = {}
         for src in priority:
             if src in loaded:
                 merged = deep_merge(merged, loaded[src], overwrite=True)
         return merged
+
+    @property
+    def sources_count(self) -> int:
+        with self._lock:
+            return len(self._sources)
 
 
 _CONFIG_SOURCES = ConfigSourceManager()
@@ -938,13 +949,13 @@ class Settings:
 
     # app
     environment: Environment = Environment.PRODUCTION
-    app_version: str = strip_value(os.getenv("APP_VERSION") or "dev")
-    service_name: str = strip_value(os.getenv("SERVICE_NAME") or "Tadawul Fast Bridge")
-    timezone: str = strip_value(os.getenv("TZ") or os.getenv("TIMEZONE") or "Asia/Riyadh")
+    app_version: str = "dev"
+    service_name: str = "Tadawul Fast Bridge"
+    timezone: str = "Asia/Riyadh"
 
     # logging
     log_level: LogLevel = LogLevel.INFO
-    log_format: str = strip_value(os.getenv("LOG_FORMAT") or "json")
+    log_format: str = "json"
 
     # urls
     backend_base_url: str = "http://localhost:8000"
@@ -982,14 +993,14 @@ class Settings:
     ai_batch_size: int = 20
     quote_batch_size: int = 50
 
-    # google sheets integration (directly used by google_sheets_service fallback sources)
+    # google sheets integration
     default_spreadsheet_id: Optional[str] = None
     google_sheets_credentials_json: Optional[str] = None
     google_credentials_dict: Optional[Dict[str, Any]] = None
 
     @classmethod
     def from_env(cls, env_prefix: str = "TFB_") -> "Settings":
-        # 1) Optional .env (does NOT mutate os.environ)
+        # Optional .env read (does NOT mutate os.environ)
         env_file = strip_value(os.getenv("ENV_FILE") or os.getenv("DOTENV_PATH") or "")
         dotenv_map: Dict[str, str] = load_dotenv_simple(Path(env_file)) if env_file else {}
 
@@ -997,17 +1008,19 @@ class Settings:
             return strip_value(os.getenv(key) or dotenv_map.get(key) or fallback)
 
         env_name = env_get(f"{env_prefix}ENV", env_get("APP_ENV", "production"))
-        backend_url = env_get("BACKEND_BASE_URL", env_get("DEFAULT_BACKEND_URL", "http://localhost:8000"))
-        backend_url = normalize_base_url(backend_url, default_scheme=env_get("DEFAULT_SCHEME", "https") or "https")
 
         token = env_get(f"{env_prefix}APP_TOKEN", env_get("APP_TOKEN", env_get("BACKEND_TOKEN", ""))) or ""
         open_mode = coerce_bool(env_get("OPEN_MODE", ""), not bool(token))
 
-        # Providers + keys
+        backend_url = env_get("BACKEND_BASE_URL", env_get("DEFAULT_BACKEND_URL", "http://localhost:8000"))
+        backend_url = normalize_base_url(backend_url, default_scheme=env_get("DEFAULT_SCHEME", "https") or "https")
+
+        # Provider keys
         eodhd_key = env_get("EODHD_API_TOKEN", env_get("EODHD_API_KEY", ""))
         finnhub_key = env_get("FINNHUB_API_KEY", "")
         alpha_key = env_get("ALPHAVANTAGE_API_KEY", "")
 
+        # providers lists
         providers_env = coerce_list(env_get("ENABLED_PROVIDERS", env_get("PROVIDERS", "")))
         if not providers_env:
             providers_env = []
@@ -1021,7 +1034,7 @@ class Settings:
         ksa_env = coerce_list(env_get("KSA_PROVIDERS", "yahoo_chart,argaam"))
         primary = env_get("PRIMARY_PROVIDER", "eodhd")
 
-        # Logging
+        # log level
         log_level_name = env_get("LOG_LEVEL", "INFO").upper()
         log_level = LogLevel.INFO
         for ll in LogLevel:
@@ -1029,12 +1042,15 @@ class Settings:
                 log_level = ll
                 break
 
-        # Google sheets
+        # google sheets
         default_spreadsheet_id = env_get("DEFAULT_SPREADSHEET_ID", "") or None
-        gs_creds_json = env_get("GOOGLE_SHEETS_CREDENTIALS", env_get("GOOGLE_CREDENTIALS", "")) or None
-        gs_dict = get_google_credentials_dict({**dotenv_map, **os.environ})  # safe dict load
 
-        # if we already extracted dict, keep json optional
+        # Gather creds from combined env+dotenv for stability
+        combined_env = dict(os.environ)
+        combined_env.update(dotenv_map)
+
+        gs_dict = get_google_credentials_dict(combined_env)
+        gs_creds_json = env_get("GOOGLE_SHEETS_CREDENTIALS", env_get("GOOGLE_CREDENTIALS", "")) or None
         if gs_dict and not gs_creds_json:
             try:
                 gs_creds_json = json_dumps(gs_dict)
@@ -1043,20 +1059,23 @@ class Settings:
 
         return cls(
             environment=Environment.from_string(env_name),
-            app_token=token or None,
-            open_mode=open_mode,
+            app_version=env_get("APP_VERSION", "dev"),
+            service_name=env_get("SERVICE_NAME", "Tadawul Fast Bridge"),
+            timezone=env_get("TIMEZONE", env_get("TZ", "Asia/Riyadh")),
+            log_level=log_level,
+            log_format=env_get("LOG_FORMAT", "json"),
             backend_base_url=backend_url or "http://localhost:8000",
             internal_base_url=env_get("INTERNAL_BASE_URL", "") or None,
             public_base_url=env_get("PUBLIC_BASE_URL", "") or None,
             auth_header_name=env_get("AUTH_HEADER_NAME", "X-APP-TOKEN"),
+            app_token=token or None,
+            open_mode=open_mode,
             eodhd_api_key=eodhd_key or None,
             finnhub_api_key=finnhub_key or None,
             alphavantage_api_key=alpha_key or None,
             enabled_providers=providers_env,
             ksa_providers=ksa_env,
             primary_provider=primary,
-            log_level=log_level,
-            log_format=env_get("LOG_FORMAT", "json"),
             http_timeout_sec=coerce_float(env_get("HTTP_TIMEOUT_SEC", ""), 45.0, lo=5.0, hi=300.0),
             cache_ttl_sec=coerce_int(env_get("CACHE_TTL_SEC", ""), 20, lo=1, hi=3600),
             batch_concurrency=coerce_int(env_get("BATCH_CONCURRENCY", ""), 5, lo=1, hi=50),
@@ -1079,8 +1098,7 @@ class Settings:
 
     def public_dict(self) -> Dict[str, Any]:
         """Safe-to-expose config snapshot (masked)."""
-        d = self.to_dict()
-        return mask_secret_dict(d)
+        return mask_secret_dict(self.to_dict())
 
     def validate(self) -> Tuple[List[str], List[str]]:
         errors: List[str] = []
@@ -1105,13 +1123,13 @@ class Settings:
         if "finnhub" in enabled and not self.finnhub_api_key:
             errors.append("Provider 'finnhub' enabled but FINNHUB API key missing.")
 
-        # google sheets (only warn; some deployments don't use it)
+        # google sheets (warnings only)
         if self.default_spreadsheet_id and not self.google_credentials_dict:
             warnings.append("DEFAULT_SPREADSHEET_ID is set but Google credentials are missing/invalid.")
         if self.google_credentials_dict and not self.default_spreadsheet_id:
             warnings.append("Google credentials are set but DEFAULT_SPREADSHEET_ID is missing.")
 
-        # sanity bounds
+        # bounds
         if self.batch_concurrency < 1:
             errors.append("batch_concurrency must be >= 1")
         if self.http_timeout_sec < 5:
@@ -1126,7 +1144,6 @@ class Settings:
         merged = deep_merge(base, content, overwrite=True)
         allowed = set(cls.__dataclass_fields__.keys())
         cleaned = {k: v for k, v in merged.items() if k in allowed}
-        # normalize URL if provided via file
         if "backend_base_url" in cleaned:
             cleaned["backend_base_url"] = normalize_base_url(str(cleaned["backend_base_url"]), default_scheme="https")
         return cls(**cleaned)
@@ -1209,6 +1226,7 @@ def reload_settings() -> Settings:
         _SETTINGS_CACHE.clear()
 
         base = asdict(Settings.from_env())
+
         merged = _CONFIG_SOURCES.load_merged()
         if merged:
             base = deep_merge(base, merged, overwrite=True)
@@ -1245,6 +1263,9 @@ def config_health_check() -> Dict[str, Any]:
         health["status"] = "unhealthy"
 
     health["checks"]["cache"] = _SETTINGS_CACHE.stats()
+    health["checks"]["distributed_sources_registered"] = _CONFIG_SOURCES.sources_count
+    health["checks"]["has_orjson"] = bool(_HAS_ORJSON)
+    health["checks"]["tracing_enabled"] = bool(_TRACING_ENABLED and OTEL_AVAILABLE)
     return health
 
 
@@ -1254,7 +1275,7 @@ def config_health_check() -> Dict[str, Any]:
 def init_distributed_config() -> None:
     """
     Registers sources if env vars exist.
-    No network work unless load_merged() is called.
+    No network work unless reload_settings calls load_merged().
     """
     with TraceContext("init_distributed_config"):
         if os.getenv("CONSUL_HOST"):
@@ -1278,28 +1299,121 @@ def init_distributed_config() -> None:
             src = ZooKeeperConfigSource(hosts=hosts, prefix=prefix)
             _CONFIG_SOURCES.register_source(ConfigSource.ZOOKEEPER, src.load)
 
-        # ENV_FILE (optional): allow merging file-based dict into load_merged()
+        # ENV_FILE also registered as dict override (only selected keys)
         env_file = strip_value(os.getenv("ENV_FILE") or os.getenv("DOTENV_PATH") or "")
         if env_file:
             p = Path(env_file)
 
             def _load_env_file() -> Optional[Dict[str, Any]]:
                 m = load_dotenv_simple(p)
-                # We do NOT blindly convert every env var into config keys.
-                # Keep only known keys that matter for project alignment.
                 if not m:
                     return None
                 return {
-                    "backend_base_url": m.get("BACKEND_BASE_URL") or m.get("DEFAULT_BACKEND_URL"),
-                    "app_token": m.get("APP_TOKEN") or m.get("BACKEND_TOKEN"),
-                    "default_spreadsheet_id": m.get("DEFAULT_SPREADSHEET_ID"),
+                    "backend_base_url": normalize_base_url(m.get("BACKEND_BASE_URL") or m.get("DEFAULT_BACKEND_URL") or "", default_scheme="https"),
+                    "app_token": strip_value(m.get("APP_TOKEN") or m.get("BACKEND_TOKEN") or ""),
+                    "default_spreadsheet_id": strip_value(m.get("DEFAULT_SPREADSHEET_ID") or "") or None,
                 }
 
             _CONFIG_SOURCES.register_source(ConfigSource.ENV_FILE, _load_env_file)
 
 
-# run registration safely
+# Run registration
 init_distributed_config()
+
+# =============================================================================
+# Auth helpers (used by routes)
+# =============================================================================
+def allowed_tokens() -> List[str]:
+    """
+    Allowed tokens list.
+    Priority:
+      - ALLOWED_TOKENS (comma or JSON list)
+      - APP_TOKEN (single)
+    """
+    toks = coerce_list(os.getenv("ALLOWED_TOKENS"))
+    if toks:
+        return toks
+    single = strip_value(os.getenv("APP_TOKEN") or os.getenv("BACKEND_TOKEN") or "")
+    return [single] if single else []
+
+
+def is_open_mode() -> bool:
+    """
+    Open mode if OPEN_MODE=true,
+    else open only when no tokens exist.
+    """
+    if os.getenv("OPEN_MODE") is not None:
+        return coerce_bool(os.getenv("OPEN_MODE"), False)
+    return len(allowed_tokens()) == 0
+
+
+def _norm_headers(headers: Any) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    try:
+        if headers is None:
+            return out
+        if isinstance(headers, dict):
+            for k, v in headers.items():
+                out[str(k).lower()] = strip_value(v)
+            return out
+        if hasattr(headers, "items"):
+            for k, v in headers.items():
+                out[str(k).lower()] = strip_value(v)
+    except Exception:
+        pass
+    return out
+
+
+def _extract_bearer(authorization: Optional[str]) -> Optional[str]:
+    a = strip_value(authorization)
+    if not a:
+        return None
+    if a.lower().startswith("bearer "):
+        return strip_value(a.split(" ", 1)[1])
+    return a
+
+
+def auth_ok(
+    token: Optional[str] = None,
+    authorization: Optional[str] = None,
+    headers: Optional[Any] = None,
+    api_key: Optional[str] = None,
+    **_: Any,
+) -> bool:
+    """
+    Standard auth check:
+    - token param
+    - Authorization: Bearer <token>
+    - X-APP-TOKEN header
+    - X-API-KEY header
+    """
+    if is_open_mode():
+        return True
+
+    allowed = set(allowed_tokens())
+    if not allowed:
+        return False
+
+    if token and token in allowed:
+        return True
+
+    h = _norm_headers(headers)
+    bearer = _extract_bearer(authorization or h.get("authorization"))
+    if bearer and bearer in allowed:
+        return True
+
+    app_token = h.get("x-app-token") or h.get("x_app_token")
+    if app_token and app_token in allowed:
+        return True
+
+    api_hdr = h.get("x-api-key") or h.get("x_api_key") or h.get("apikey")
+    if api_hdr and api_hdr in allowed:
+        return True
+
+    if api_key and api_key in allowed:
+        return True
+
+    return False
 
 
 # =============================================================================
@@ -1350,4 +1464,8 @@ __all__ = [
     "init_distributed_config",
     # runtime overrides
     "_RUNTIME",
+    # auth helpers
+    "allowed_tokens",
+    "is_open_mode",
+    "auth_ok",
 ]
