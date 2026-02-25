@@ -2,15 +2,14 @@
 """
 main.py
 ===========================================================
-TADAWUL FAST BRIDGE – ENTERPRISE FASTAPI ENTRY POINT (v8.5.0)
+TADAWUL FAST BRIDGE – ENTERPRISE FASTAPI ENTRY POINT (v8.5.1)
 ===========================================================
 QUANTUM EDITION | MISSION CRITICAL | DIRECT MOUNT
 
-What's new in v8.5.0:
-- ✅ Smart Router Discovery: Scans modules for ANY APIRouter instance, preventing failures if variables are renamed (e.g., `advanced_router`).
-- ✅ Auto-Prefixing: Automatically applies strict API prefixes (e.g., `/v1/advanced`) if missing from the child router, fixing 404 Not Found errors.
-- ✅ Route Debugging: Added `/health` enhancements to show exactly which endpoints are actively listening.
-- ✅ Engine Boot Fix: Maintained asyncio.Lock patch for core.data_engine.
+What's new in v8.5.1:
+- ✅ Router Prefix Normalization: fixes cases where child routers use "/advanced" but plan expects "/v1/advanced"
+- ✅ Optional Routers: "WebSocket" can be optional without producing WARNING noise if module doesn't exist
+- ✅ Keeps v8.5.0 Smart Router Discovery + Auto-Prefixing + Route Debugging + Engine Boot Fix
 """
 
 from __future__ import annotations
@@ -65,12 +64,14 @@ from starlette.responses import PlainTextResponse, JSONResponse
 try:
     import orjson
     from fastapi.responses import ORJSONResponse as BestJSONResponse
+
     def json_dumps(v, *, default=None): return orjson.dumps(v, default=default).decode('utf-8')
     def json_loads(v): return orjson.loads(v)
     _HAS_ORJSON = True
 except ImportError:
     import json
     from fastapi.responses import JSONResponse as BestJSONResponse
+
     def json_dumps(v, *, default=None): return json.dumps(v, default=default)
     def json_loads(v): return json.loads(v)
     _HAS_ORJSON = False
@@ -95,7 +96,7 @@ try:
     from prometheus_client.core import REGISTRY
     from prometheus_client.registry import CollectorRegistry
     PROMETHEUS_AVAILABLE = True
-    
+
     # Monkeypatch Prometheus to ignore duplicate metric registrations
     _original_register = CollectorRegistry.register
     def _safe_register(self, collector):
@@ -174,7 +175,7 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-APP_ENTRY_VERSION = "8.5.0"
+APP_ENTRY_VERSION = "8.5.1"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled", "ok", "active"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled"}
@@ -247,7 +248,7 @@ def get_cpu_percent() -> float:
     return 0.0
 
 def safe_import(module_path: str) -> Optional[Any]:
-    try: 
+    try:
         return import_module(module_path)
     except ModuleNotFoundError as e:
         # Suppress noisy logs for expected fallback candidates
@@ -302,8 +303,9 @@ class JSONFormatter(logging.Formatter):
 def configure_logging() -> None:
     log_level = get_env_str("LOG_LEVEL", "INFO").upper()
     log_json = get_env_bool("LOG_JSON", False)
-    
-    if log_level not in ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]: log_level = "INFO"
+
+    if log_level not in ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]:
+        log_level = "INFO"
 
     root_logger = logging.getLogger()
     root_logger.setLevel(log_level)
@@ -338,13 +340,13 @@ class TraceContext:
         self.attributes = attributes or {}
         self.tracer = trace.get_tracer(__name__) if TRACING_AVAILABLE and get_env_bool("ENABLE_TRACING", False) else None
         self.span = None
-    
+
     async def __aenter__(self):
         if self.tracer:
             self.span = self.tracer.start_as_current_span(self.name)
             if self.attributes: self.span.set_attributes(self.attributes)
         return self
-    
+
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self.span and TRACING_AVAILABLE:
             if exc_val:
@@ -374,7 +376,7 @@ class SystemGuardian:
         self.degraded_enter_lag = get_env_float("DEGRADED_ENTER_LAG_MS", 500)
         self.degraded_exit_lag = get_env_float("DEGRADED_EXIT_LAG_MS", 150)
         self.degraded_memory_mb = get_env_int("DEGRADED_MEMORY_MB", 1024)
-        
+
         self.boot_time_utc = now_utc_iso()
         self.boot_time_riyadh = now_riyadh_iso()
 
@@ -408,7 +410,8 @@ class SystemGuardian:
         }
 
     async def should_shed_request(self, path: str) -> bool:
-        if not self.degraded_mode or not get_env_bool("DEGRADED_SHED_ENABLED", True): return False
+        if not self.degraded_mode or not get_env_bool("DEGRADED_SHED_ENABLED", True):
+            return False
         shed_paths = get_env_list("DEGRADED_SHED_PATHS", ["/v1/analysis", "/v1/advanced", "/v1/advisor"])
         return any(path.startswith(p) for p in shed_paths if p)
 
@@ -453,12 +456,17 @@ class MetricsCollector:
         self.enabled = PROMETHEUS_AVAILABLE and get_env_bool("ENABLE_METRICS", True)
         if self.enabled:
             self.request_count = Counter("http_requests_total", "Total HTTP requests", ["method", "endpoint", "status"])
-            self.request_duration = Histogram("http_request_duration_seconds", "HTTP request duration", ["method", "endpoint"], buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10))
+            self.request_duration = Histogram(
+                "http_request_duration_seconds",
+                "HTTP request duration",
+                ["method", "endpoint"],
+                buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10),
+            )
             self.active_requests = Gauge("http_requests_active", "Active HTTP requests")
             self.error_count = Counter("http_errors_total", "Total HTTP errors", ["method", "endpoint", "error_type"])
             self.cache_hits = Counter("cache_hits_total", "Total cache hits", ["cache_backend"])
             self.cache_misses = Counter("cache_misses_total", "Total cache misses", ["cache_backend"])
-            
+
     def record_request(self, method: str, endpoint: str, status: int, duration: float):
         if not self.enabled: return
         endpoint = endpoint or "root"
@@ -480,7 +488,7 @@ class TelemetryMiddleware(BaseHTTPMiddleware):
         token = _request_id_ctx.set(request_id)
         request.state.request_id = request_id
         request.state.start_time = time.time()
-        
+
         guardian.request_count += 1
         if metrics.enabled: metrics.active_requests.inc()
 
@@ -498,27 +506,27 @@ class TelemetryMiddleware(BaseHTTPMiddleware):
 
         try:
             response = await call_next(request)
-            
+
             duration = time.time() - request.state.start_time
             guardian.latency_ms = guardian.latency_ms * 0.9 + duration * 1000 * 0.1
             metrics.record_request(method=request.method, endpoint=request.url.path, status=response.status_code, duration=duration)
-            
+
             response.headers["X-Request-ID"] = request_id
             response.headers["X-Process-Time"] = f"{duration:.4f}s"
             response.headers["X-System-Load"] = guardian.get_load_level()
             response.headers["X-Time-Riyadh"] = now_riyadh_iso()
-            
+
             response.headers["Server-Timing"] = f"app;desc=\"FastAPI Processing\";dur={duration*1000:.2f}"
-            
+
             response.headers["X-Content-Type-Options"] = "nosniff"
             response.headers["X-Frame-Options"] = "DENY"
             response.headers["X-XSS-Protection"] = "1; mode=block"
             response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
             response.headers["Content-Security-Policy"] = "default-src 'self'; frame-ancestors 'none';"
-            
+
             if get_env_str("APP_ENV") == "production":
                 response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-            
+
             return response
         except Exception as e:
             guardian.error_count += 1
@@ -530,13 +538,13 @@ class TelemetryMiddleware(BaseHTTPMiddleware):
 
 class TracingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-        if not TRACING_AVAILABLE or not get_env_bool("ENABLE_TRACING", False): 
+        if not TRACING_AVAILABLE or not get_env_bool("ENABLE_TRACING", False):
             return await call_next(request)
-            
+
         tracer = trace.get_tracer(__name__)
         with tracer.start_as_current_span(
-            f"{request.method} {request.url.path}", 
-            kind=trace.SpanKind.SERVER, 
+            f"{request.method} {request.url.path}",
+            kind=trace.SpanKind.SERVER,
             attributes={"http.method": request.method, "http.url": str(request.url), "request.id": get_request_id()}
         ) as span:
             response = await call_next(request)
@@ -547,18 +555,18 @@ class CompressionMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         response = await call_next(request)
         content_type = response.headers.get("content-type", "")
-        if not content_type.startswith(("text/", "application/json", "application/javascript")): 
+        if not content_type.startswith(("text/", "application/json", "application/javascript")):
             return response
-        if "gzip" not in request.headers.get("accept-encoding", ""): 
+        if "gzip" not in request.headers.get("accept-encoding", ""):
             return response
-        
+
         if hasattr(response, 'body') and len(response.body) > 512:
             import gzip
             compressed = gzip.compress(response.body)
             return Response(
-                content=compressed, 
-                status_code=response.status_code, 
-                headers=dict(response.headers), 
+                content=compressed,
+                status_code=response.status_code,
+                headers=dict(response.headers),
                 media_type=response.media_type
             )
         return response
@@ -569,7 +577,7 @@ class CompressionMiddleware(BaseHTTPMiddleware):
 async def init_engine_resilient(app: FastAPI, max_retries: int = 3) -> None:
     app.state.engine_ready = False
     app.state.engine_error = None
-    
+
     for attempt in range(max_retries):
         try:
             engine_module = safe_import("core.data_engine") or safe_import("core.data_engine_v2")
@@ -577,10 +585,10 @@ async def init_engine_resilient(app: FastAPI, max_retries: int = 3) -> None:
                 app.state.engine_error = "Engine module not available"
                 boot_logger.warning(app.state.engine_error)
                 return
-                
+
             get_engine_fn = getattr(engine_module, "get_engine")
             engine = await get_engine_fn() if asyncio.iscoroutinefunction(get_engine_fn) else get_engine_fn()
-            
+
             if engine:
                 app.state.engine = engine
                 app.state.engine_ready = True
@@ -594,76 +602,140 @@ async def init_engine_resilient(app: FastAPI, max_retries: int = 3) -> None:
                 base_wait = 2 ** attempt
                 jitter = random.uniform(0, base_wait)
                 await asyncio.sleep(min(10.0, base_wait + jitter))
-                
+
     app.state.engine_ready = False
     app.state.engine_error = "CRITICAL: Engine failed to initialize after retries"
     boot_logger.error(app.state.engine_error)
 
 # =============================================================================
-# Dynamic Router Mounting (V8.5 FIX FOR 404 ERRORS)
+# Dynamic Router Mounting (v8.5.1)
 # =============================================================================
 
-# Tuple format: (Label, Expected API Prefix, List of possible module paths)
+@dataclass(frozen=True)
+class RouterSpec:
+    label: str
+    expected_prefix: str
+    candidates: List[str]
+    required: bool = True  # if False => missing module won't produce WARNING
+
 # Enforcing prefixes here guarantees that the tests hit the correct endpoints.
-ROUTER_PLAN: List[Tuple[str, str, List[str]]] = [
-    ("Advanced", "/v1/advanced", ["routes.advanced_analysis", "routes.advanced", "api.advanced"]),
-    ("Advisor", "/v1/advisor", ["routes.advisor", "routes.investment_advisor", "core.investment_advisor"]),
-    ("KSA", "/v1/ksa", ["routes.routes_argaam", "routes.argaam"]),
-    ("Enriched", "/v1/enriched", ["routes.enriched_quote", "routes.enriched", "core.enriched_quote"]),
-    ("Analysis", "/v1/analysis", ["routes.ai_analysis", "routes.analysis"]),
-    ("System", "", ["routes.config", "routes.system", "core.legacy_service"]),
-    ("WebSocket", "", ["routes.websocket"]),
+ROUTER_PLAN: List[RouterSpec] = [
+    RouterSpec("Advanced", "/v1/advanced", ["routes.advanced_analysis", "routes.advanced", "api.advanced"], True),
+    RouterSpec("Advisor", "/v1/advisor", ["routes.advisor", "routes.investment_advisor", "core.investment_advisor"], True),
+    RouterSpec("KSA", "/v1/ksa", ["routes.routes_argaam", "routes.argaam"], True),
+    RouterSpec("Enriched", "/v1/enriched", ["routes.enriched_quote", "routes.enriched", "core.enriched_quote"], True),
+    RouterSpec("Analysis", "/v1/analysis", ["routes.ai_analysis", "routes.analysis"], True),
+    RouterSpec("System", "", ["routes.config", "routes.system", "core.legacy_service"], True),
+    RouterSpec("WebSocket", "", ["routes.websocket"], False),  # optional (no warning if absent)
 ]
 
 def route_inventory(app: FastAPI) -> List[Dict[str, Any]]:
-    return [{"path": route.path, "name": route.name, "methods": sorted(route.methods)} 
-            for route in app.routes if isinstance(route, APIRoute)]
+    return [
+        {"path": route.path, "name": route.name, "methods": sorted(route.methods)}
+        for route in app.routes if isinstance(route, APIRoute)
+    ]
+
+@contextmanager
+def _temp_router_prefix(router: APIRouter, new_prefix: str):
+    old = getattr(router, "prefix", "")
+    try:
+        router.prefix = new_prefix or ""
+        yield
+    finally:
+        try:
+            router.prefix = old or ""
+        except Exception:
+            pass
+
+def _find_any_apirouter(module: Any) -> Optional[APIRouter]:
+    # Dynamically scan for ANY APIRouter instance inside the module
+    for obj_name in dir(module):
+        try:
+            obj = getattr(module, obj_name)
+        except Exception:
+            continue
+        if isinstance(obj, APIRouter):
+            return obj
+    return None
+
+def _mount_with_prefix_normalization(app: FastAPI, child: APIRouter, expected_prefix: str) -> str:
+    """
+    Returns the applied prefix used for mounting.
+    """
+    child_prefix = (getattr(child, "prefix", "") or "").strip()
+
+    # If this router is meant to be root/system, mount as-is.
+    if not expected_prefix:
+        app.include_router(child)
+        return child_prefix or "/"
+
+    # Case 1: child has no prefix => we apply strict /v1 prefix
+    if not child_prefix or child_prefix == "/":
+        app.include_router(child, prefix=expected_prefix)
+        return expected_prefix
+
+    # Case 2: child already matches strict prefix
+    if child_prefix == expected_prefix or child_prefix.startswith(expected_prefix + "/"):
+        app.include_router(child)
+        return child_prefix
+
+    # Case 3: common mistake: child uses "/advanced" but plan expects "/v1/advanced"
+    # If expected endswith child (e.g., "/v1/advanced" endswith "/advanced"), we can safely
+    # strip child prefix during mounting (one-time) and apply expected prefix.
+    if expected_prefix.endswith(child_prefix) and expected_prefix.startswith("/v1/"):
+        with _temp_router_prefix(child, ""):
+            app.include_router(child, prefix=expected_prefix)
+        return expected_prefix
+
+    # Otherwise: mount as-is but log a clear warning about mismatch.
+    boot_logger.warning(
+        f"Router prefix mismatch: expected='{expected_prefix}' but router.prefix='{child_prefix}'. "
+        f"Mounting router as-is (paths may differ)."
+    )
+    app.include_router(child)
+    return child_prefix or "/"
 
 def mount_routers_once(app: FastAPI) -> Dict[str, Any]:
-    if not hasattr(app.state, "mounted_router_modules"): app.state.mounted_router_modules = set()
-    report = {"mounted": [], "failed": []}
-    
-    for label, expected_prefix, candidates in ROUTER_PLAN:
-        mounted, last_error = False, ""
-        for module_path in candidates:
-            if module_path in app.state.mounted_router_modules:
-                mounted = True; break
-            
-            if module := safe_import(module_path):
-                # V8.5 FIX: Dynamically scan for ANY APIRouter instance inside the module
-                # This fixes failures where the variable was named `advanced_router` instead of `router`
-                found_router = None
-                for obj_name in dir(module):
-                    obj = getattr(module, obj_name)
-                    if isinstance(obj, APIRouter):
-                        found_router = obj
-                        break
-                
-                if found_router:
-                    try:
-                        # V8.5 FIX: Auto-Prefixing. If the developer forgot the prefix, enforce it here!
-                        if expected_prefix and not found_router.prefix:
-                            app.include_router(found_router, prefix=expected_prefix)
-                            applied_prefix = expected_prefix
-                        else:
-                            # Use existing prefix (or empty if it's meant to be root)
-                            app.include_router(found_router)
-                            applied_prefix = found_router.prefix or '/'
+    if not hasattr(app.state, "mounted_router_modules"):
+        app.state.mounted_router_modules = set()
 
-                        app.state.mounted_router_modules.add(module_path)
-                        boot_logger.info(f"✅ Mounted {label} via {module_path} (Prefix: {applied_prefix})")
-                        report["mounted"].append({"label": label, "module": module_path, "prefix": applied_prefix})
-                        mounted = True; break
-                    except Exception as e:
-                        last_error = str(e)
-                        boot_logger.error(f"Failed to mount {label} via {module_path}: {e}")
-                else:
-                    last_error = f"Module found, but no APIRouter instance detected inside {module_path}"
-                    
+    report: Dict[str, Any] = {"mounted": [], "failed": []}
+
+    for spec in ROUTER_PLAN:
+        mounted, last_error = False, ""
+        for module_path in spec.candidates:
+            if module_path in app.state.mounted_router_modules:
+                mounted = True
+                break
+
+            module = safe_import(module_path)
+            if not module:
+                last_error = "no module found"
+                continue
+
+            found_router = _find_any_apirouter(module)
+            if not found_router:
+                last_error = f"Module found, but no APIRouter instance detected inside {module_path}"
+                continue
+
+            try:
+                applied_prefix = _mount_with_prefix_normalization(app, found_router, spec.expected_prefix)
+                app.state.mounted_router_modules.add(module_path)
+                boot_logger.info(f"✅ Mounted {spec.label} via {module_path} (Prefix: {applied_prefix})")
+                report["mounted"].append({"label": spec.label, "module": module_path, "prefix": applied_prefix})
+                mounted = True
+                break
+            except Exception as e:
+                last_error = str(e)
+                boot_logger.error(f"Failed to mount {spec.label} via {module_path}: {e}")
+
         if not mounted:
-            boot_logger.warning(f"⚠️ Router '{label}' not mounted: {last_error or 'no module found'}")
-            report["failed"].append({"label": label, "error": last_error or "not found"})
-            
+            if spec.required:
+                boot_logger.warning(f"⚠️ Router '{spec.label}' not mounted: {last_error or 'not found'}")
+            else:
+                boot_logger.info(f"ℹ️ Optional router '{spec.label}' not mounted: {last_error or 'not found'}")
+            report["failed"].append({"label": spec.label, "error": last_error or "not found"})
+
     app.state.router_report = report
     app.state.routes_snapshot = route_inventory(app)
     app.state.routers_mounted = True
@@ -683,8 +755,8 @@ def create_app() -> FastAPI:
     if SLOWAPI_AVAILABLE and get_env_bool("ENABLE_RATE_LIMITING", True):
         rpm = get_env_int("MAX_REQUESTS_PER_MINUTE", 240)
         limiter = Limiter(
-            key_func=get_remote_address, 
-            default_limits=[f"{rpm} per minute"], 
+            key_func=get_remote_address,
+            default_limits=[f"{rpm} per minute"],
             storage_uri=get_env_str("REDIS_URL") if get_env_str("RATE_LIMIT_BACKEND") == "redis" else "memory://"
         )
 
@@ -694,42 +766,42 @@ def create_app() -> FastAPI:
         app.state.boot_completed = False
         app.state.engine_ready = False
         app.state.routers_mounted = False
-        
+
         guardian_task = asyncio.create_task(guardian.monitor_loop())
-        
+
         async def boot():
-            await asyncio.sleep(0) # Yield control
+            await asyncio.sleep(0)  # Yield control
             if get_env_bool("INIT_ENGINE_ON_BOOT", True):
                 await init_engine_resilient(app, max_retries=get_env_int("MAX_RETRIES", 3))
             gc.collect()
             app.state.boot_completed = True
             boot_logger.info(f"🚀 Ready v{app_version} | env={app_env} | mem={guardian.memory_mb:.1f}MB")
-            
+
         boot_task = asyncio.create_task(boot())
-        
+
         yield
-        
+
         boot_logger.info("Shutdown initiated. Draining connections...")
         guardian.stop()
         for task in (boot_task, guardian_task):
             task.cancel()
         await asyncio.gather(boot_task, guardian_task, return_exceptions=True)
-        
+
         if engine := getattr(app.state, "engine", None):
             try:
-                if hasattr(engine, "aclose") and asyncio.iscoroutinefunction(engine.aclose): 
+                if hasattr(engine, "aclose") and asyncio.iscoroutinefunction(engine.aclose):
                     await asyncio.wait_for(engine.aclose(), timeout=5.0)
-                elif hasattr(engine, "close"): 
+                elif hasattr(engine, "close"):
                     engine.close()
-            except Exception as e: 
+            except Exception as e:
                 boot_logger.warning(f"Engine shutdown error: {e}")
         boot_logger.info("Shutdown sequence complete")
 
     app = FastAPI(
-        title=app_name, 
-        version=app_version, 
+        title=app_name,
+        version=app_version,
         description="Tadawul Fast Bridge API - Enterprise Market Data Platform",
-        lifespan=lifespan, 
+        lifespan=lifespan,
         docs_url="/docs" if get_env_bool("ENABLE_SWAGGER", True) else None,
         redoc_url="/redoc" if get_env_bool("ENABLE_REDOC", True) else None,
         default_response_class=BestJSONResponse
@@ -738,7 +810,7 @@ def create_app() -> FastAPI:
     if limiter is not None:
         app.state.limiter = limiter
         app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-        if SLOWAPI_AVAILABLE: 
+        if SLOWAPI_AVAILABLE:
             app.add_middleware(SlowAPIMiddleware)
 
     app.add_middleware(TelemetryMiddleware)
@@ -748,15 +820,15 @@ def create_app() -> FastAPI:
 
     allow_origins = ["*"] if get_env_bool("ENABLE_CORS_ALL_ORIGINS", True) else get_env_list("CORS_ORIGINS", ["*"])
     app.add_middleware(
-        CORSMiddleware, 
-        allow_origins=allow_origins, 
-        allow_methods=["*"], 
+        CORSMiddleware,
+        allow_origins=allow_origins,
+        allow_methods=["*"],
         allow_headers=["*"],
-        allow_credentials=False, 
-        expose_headers=["X-Request-ID", "X-Process-Time", "X-Time-Riyadh", "Server-Timing"], 
+        allow_credentials=False,
+        expose_headers=["X-Request-ID", "X-Process-Time", "X-Time-Riyadh", "Server-Timing"],
         max_age=600,
     )
-    if app_env == "production": 
+    if app_env == "production":
         app.add_middleware(TrustedHostMiddleware, allowed_hosts=get_env_list("ALLOWED_HOSTS", ["*"]))
 
     sentry_dsn = get_env_str("SENTRY_DSN").strip()
@@ -778,7 +850,8 @@ def create_app() -> FastAPI:
         try:
             provider = TracerProvider(resource=Resource(attributes={SERVICE_NAME: app_name}))
             exporter = OTLPSpanExporter(endpoint=get_env_str("OTLP_ENDPOINT")) if get_env_str("OTLP_ENDPOINT") else None
-            if exporter: provider.add_span_processor(BatchSpanProcessor(exporter))
+            if exporter:
+                provider.add_span_processor(BatchSpanProcessor(exporter))
             trace.set_tracer_provider(provider)
             FastAPIInstrumentor.instrument_app(app)
         except Exception as e:
@@ -795,11 +868,11 @@ def create_app() -> FastAPI:
     @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
     async def root():
         return {
-            "status": "online", 
-            "service": app_name, 
-            "version": app_version, 
-            "environment": app_env, 
-            "time_riyadh": now_riyadh_iso(), 
+            "status": "online",
+            "service": app_name,
+            "version": app_version,
+            "environment": app_env,
+            "time_riyadh": now_riyadh_iso(),
             "documentation": "/docs"
         }
 
@@ -814,7 +887,7 @@ def create_app() -> FastAPI:
             "trace_id": get_request_id()
         }
 
-    # V8.5 FEATURE: Debug tool to see exactly what routes the app actually knows about
+    # Debug tool to see exactly what routes the app actually knows about
     @app.get("/debug/routes", tags=["system"])
     async def debug_routes(request: Request):
         return {
@@ -825,14 +898,14 @@ def create_app() -> FastAPI:
     @app.exception_handler(StarletteHTTPException)
     async def http_exception_handler(request: Request, exc: StarletteHTTPException):
         return BestJSONResponse(
-            status_code=exc.status_code, 
+            status_code=exc.status_code,
             content={"status": "error", "message": exc.detail, "request_id": get_request_id(), "time_riyadh": now_riyadh_iso()}
         )
 
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(request: Request, exc: RequestValidationError):
         return BestJSONResponse(
-            status_code=422, 
+            status_code=422,
             content={"status": "error", "message": "Validation error", "details": exc.errors(), "request_id": get_request_id()}
         )
 
@@ -840,15 +913,13 @@ def create_app() -> FastAPI:
     async def unhandled_exception_handler(request: Request, exc: Exception):
         logger.error(f"Unhandled exception on {request.url.path}: {traceback.format_exc()}")
         return BestJSONResponse(
-            status_code=500, 
+            status_code=500,
             content={"status": "critical", "message": "Internal server error", "request_id": get_request_id()}
         )
 
     return app
 
-
 app = create_app()
-
 
 if __name__ == "__main__":
     import uvicorn
@@ -857,7 +928,7 @@ if __name__ == "__main__":
         asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
     except ImportError:
         pass
-        
+
     port = get_env_int("PORT", 8000)
     host = get_env_str("HOST", "0.0.0.0")
     workers = get_env_int("WORKER_COUNT", 1)
