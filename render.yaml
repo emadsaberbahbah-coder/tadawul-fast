@@ -1,143 +1,112 @@
 # =============================================================================
 # render.yaml
 # =============================================================================
-# TADAWUL FAST BRIDGE – ENTERPRISE RENDER DEPLOYMENT BLUEPRINT (v7.5.0)
-# =============================================================================
-# QUANTUM EDITION | HIGH-PERFORMANCE ASGI | AUTO-SCALING INFRASTRUCTURE
-#
-# Architecture
-# ┌─────────────────────────────────────────────────────────────┐
-# │                    Render Platform (PaaS)                   │
-# ├─────────────────────────────────────────────────────────────┤
-# │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐       │
-# │  │   Web API    │  │   Redis      │  │   Worker     │       │
-# │  │   Service    │  │   Cluster    │  │   Service    │       │
-# │  └──────────────┘  └──────────────┘  └──────────────┘       │
-# │         │                 │                 │               │
-# │         ▼                 ▼                 ▼               │
-# │  ┌──────────────────────────────────────────────────┐       │
-# │  │      PostgreSQL (Primary Relational Store)       │       │
-# │  └──────────────────────────────────────────────────┘       │
-# └─────────────────────────────────────────────────────────────┘
-#
-# Core Capabilities
-# • Ultra-fast dependencies resolution using Astral 'uv'
-# • Zero-downtime deployments (blue-green native)
-# • Distributed tracing and Prometheus metrics sidecars
-# • Circuit breaker & rate limit clustering via Redis
-#
-# Version: 7.5.0
+# TADAWUL FAST BRIDGE – RENDER BLUEPRINT (v7.5.0) — VALIDATED STRUCTURE
+# Notes:
+# - Uses Render Blueprint spec fields only (root + services + envVarGroups)
+# - Cron jobs are defined as services with type: cron (no root-level cronJobs)
+# - Key Value (Redis-compatible) uses type: keyvalue and ipAllowList: [] (internal-only)
+# - Autoscaling uses supported fields only (min/max + targetCPU/Memory)
+# - Security headers should be set in FastAPI middleware (Blueprint headers apply to static sites)
 # =============================================================================
 
-# =============================================================================
-# GLOBAL SETTINGS
-# =============================================================================
-defaultRegion: frankfurt  # Optimal for Saudi Arabia/Middle East latency
-defaultPlan: starter      # Minimum baseline for enterprise Python performance
-defaultEnv: production
-branch: main
+# Preview environments (multi-service). Optional.
+previews:
+  generation: automatic
+  expireAfterDays: 7
 
-buildFilter:
-  paths:
-    - main.py
-    - core/**
-    - routes/**
-    - schemas/**
-    - scripts/**
-    - integrations/**
-    - requirements.txt
-    - render.yaml
-  ignoredPaths:
-    - tests/**
-    - docs/**
-    - examples/**
-    - .github/**
-    - .vscode/**
-    - .gitignore
-    - README.md
-
-# =============================================================================
-# SERVICES
-# =============================================================================
 services:
   # -------------------------------------------------------------------------
-  # 1. Primary FastAPI Application
+  # 1) Primary FastAPI Application (Web Service)
   # -------------------------------------------------------------------------
   - type: web
     name: tadawul-fast-bridge
     runtime: python
     region: frankfurt
-    plan: pro               # Recommended for Production (v7.5.0)
+    plan: pro
     branch: main
+
+    # Zero-downtime health check endpoint
     healthCheckPath: /readyz
-    healthCheckTimeout: 10
-    autoDeploy: true
-    pullRequestPreviewsEnabled: true
-    
-    env: python
-    pythonVersion: 3.11  # Using 3.11 instead of 3.11.9 to utilize Render's pre-compiled binaries
-    
+
+    # Auto deploys (replaces deprecated autoDeploy: true)
+    autoDeployTrigger: commit
+
+    # Pull request previews for this service (replaces pullRequestPreviewsEnabled)
+    previews:
+      generation: automatic
+      plan: starter
+      numInstances: 1
+
+    buildFilter:
+      paths:
+        - main.py
+        - core/**
+        - routes/**
+        - schemas/**
+        - scripts/**
+        - integrations/**
+        - requirements.txt
+        - runtime.txt
+        - render.yaml
+      ignoredPaths:
+        - tests/**
+        - docs/**
+        - examples/**
+        - .github/**
+        - .vscode/**
+        - .gitignore
+        - README.md
+
     buildCommand: |
-      # 1. Install 'uv' for ultra-fast dependency resolution
+      set -euo pipefail
+
+      # 1) Install uv (Astral) for fast dependency resolution
       curl -LsSf https://astral.sh/uv/install.sh | sh
       export PATH="$HOME/.cargo/bin:$PATH"
-      
-      # 2. Install dependencies
+
+      # 2) Install dependencies
       uv pip install --system --no-cache -r requirements.txt
-      
-      # 3. Install Optional High-Performance Packages
+
+      # 3) Optional performance/observability packages (safe if already pinned)
       uv pip install --system --no-cache uvloop httptools orjson opentelemetry-api opentelemetry-sdk prometheus-client
-      
-      # 4. Compile Python bytecode for zero-overhead startup
-      python -m compileall -q -f \
-        -x "(tests|examples|docs|venv|\.git|__pycache__)" \
-        .
-      
-      echo "✅ Quantum Edition Build completed successfully"
-    
+
+      # 4) Compile Python bytecode for faster cold start
+      python -m compileall -q -f -x "(tests|examples|docs|venv|\.git|__pycache__)" .
+
+      echo "✅ Build completed"
+
     startCommand: |
-      chmod +x scripts/*.sh
-      
-      # Start the application using the enterprise launcher
+      set -euo pipefail
+      chmod +x scripts/start_web.sh
       exec scripts/start_web.sh
-    
+
+    # Autoscaling (supported fields only)
     scaling:
       minInstances: 2
       maxInstances: 10
-      targetMemoryPercent: 80     # Allow internal GC to manage memory before scaling
+      targetMemoryPercent: 80
       targetCPUPercent: 75
-      targetConcurrentRequests: 150
-    
-    resources:
-      memory: 2GB
-      cpu: 1
-    
-    healthCheck:
-      path: /readyz
-      timeout: 10
-      interval: 15
-      retries: 5
-      successThreshold: 1
-      failureThreshold: 3
-    
+
+    # Custom domains
     domains:
       - api.tadawulfb.com
       - api.tadawulfastbridge.com
-    
-    headers:
-      - key: X-Content-Type-Options
-        value: nosniff
-      - key: X-Frame-Options
-        value: DENY
-      - key: X-XSS-Protection
-        value: 1; mode=block
-      - key: Referrer-Policy
-        value: strict-origin-when-cross-origin
-      - key: Strict-Transport-Security
-        value: max-age=31536000; includeSubDomains; preload
+
+    # Environment groups applied to this service
+    envVars:
+      - fromGroup: tfb-core
+      - fromGroup: tfb-logging
+      - fromGroup: tfb-server
+      - fromGroup: tfb-security
+      - fromGroup: tfb-features
+      - fromGroup: tfb-providers
+      - fromGroup: tfb-cache
+      - fromGroup: tfb-sheets
+      - fromGroup: tfb-resources
 
   # -------------------------------------------------------------------------
-  # 2. Background Worker Service
+  # 2) Background Worker Service
   # -------------------------------------------------------------------------
   - type: worker
     name: tadawul-worker
@@ -145,72 +114,164 @@ services:
     region: frankfurt
     plan: starter
     branch: main
-    autoDeploy: true
-    pythonVersion: 3.11
-    
+    autoDeployTrigger: commit
+
+    buildFilter:
+      paths:
+        - main.py
+        - core/**
+        - routes/**
+        - schemas/**
+        - scripts/**
+        - integrations/**
+        - requirements.txt
+        - runtime.txt
+        - render.yaml
+      ignoredPaths:
+        - tests/**
+        - docs/**
+        - examples/**
+        - .github/**
+        - .vscode/**
+        - .gitignore
+        - README.md
+
     buildCommand: |
+      set -euo pipefail
       curl -LsSf https://astral.sh/uv/install.sh | sh
       export PATH="$HOME/.cargo/bin:$PATH"
       uv pip install --system --no-cache -r requirements.txt
       python -m compileall -q main.py core scripts
-    
+
     startCommand: |
+      set -euo pipefail
       python scripts/worker.py
-    
-    scaling:
-      minInstances: 1
-      maxInstances: 3
-      targetMemoryPercent: 75
-    
-    resources:
-      memory: 1GB
-      cpu: 0.5
+
+    envVars:
+      - fromGroup: tfb-core
+      - fromGroup: tfb-logging
+      - fromGroup: tfb-security
+      - fromGroup: tfb-features
+      - fromGroup: tfb-providers
+      - fromGroup: tfb-cache
+      - fromGroup: tfb-resources
 
   # -------------------------------------------------------------------------
-  # 3. Redis Distributed Cache
+  # 3) Redis-Compatible Cache (Render Key Value)
   # -------------------------------------------------------------------------
-  - type: redis
+  - type: keyvalue
     name: tadawul-redis
     region: frankfurt
     plan: starter
-    ipAllowList:
-      - source: 0.0.0.0/0
-        description: Allow all internal services
+
+    # Required for Key Value. Empty list => internal-only (no public internet access)
+    ipAllowList: []
+
     maxmemoryPolicy: allkeys-lru
 
   # -------------------------------------------------------------------------
-  # 4. Documentation Static Site
+  # 4) Documentation Static Site
   # -------------------------------------------------------------------------
-  - type: static
+  - type: web
     name: tadawul-docs
+    runtime: static
     region: frankfurt
     plan: free
     branch: main
+    autoDeployTrigger: commit
+
     buildCommand: |
+      set -euo pipefail
       mkdir -p public
       cp -r docs/* public/ || true
       echo "Tadawul Fast Bridge v7.5.0 Documentation" > public/index.html
-    publishPath: public
+
+    staticPublishPath: public
+
     headers:
       - path: /*
         name: Cache-Control
         value: public, max-age=3600
 
+  # -------------------------------------------------------------------------
+  # 5) Cron Jobs (defined as services with type: cron)
+  # -------------------------------------------------------------------------
+  - type: cron
+    name: cache-cleanup
+    runtime: python
+    region: frankfurt
+    plan: starter
+    branch: main
+    schedule: "0 3 * * *"
+
+    buildCommand: |
+      set -euo pipefail
+      curl -LsSf https://astral.sh/uv/install.sh | sh
+      export PATH="$HOME/.cargo/bin:$PATH"
+      uv pip install --system --no-cache -r requirements.txt
+
+    startCommand: python scripts/cleanup_cache.py
+
+    envVars:
+      - fromGroup: tfb-core
+      - fromGroup: tfb-logging
+      - fromGroup: tfb-cache
+      - fromGroup: tfb-resources
+
+  - type: cron
+    name: model-drift-check
+    runtime: python
+    region: frankfurt
+    plan: starter
+    branch: main
+    schedule: "0 4 * * 0"
+
+    buildCommand: |
+      set -euo pipefail
+      curl -LsSf https://astral.sh/uv/install.sh | sh
+      export PATH="$HOME/.cargo/bin:$PATH"
+      uv pip install --system --no-cache -r requirements.txt
+
+    startCommand: python scripts/drift_detection.py
+
+    envVars:
+      - fromGroup: tfb-core
+      - fromGroup: tfb-logging
+      - fromGroup: tfb-features
+      - fromGroup: tfb-resources
+
+  - type: cron
+    name: refresh-provider-data
+    runtime: python
+    region: frankfurt
+    plan: starter
+    branch: main
+    schedule: "*/30 * * * *"
+
+    buildCommand: |
+      set -euo pipefail
+      curl -LsSf https://astral.sh/uv/install.sh | sh
+      export PATH="$HOME/.cargo/bin:$PATH"
+      uv pip install --system --no-cache -r requirements.txt
+
+    startCommand: python scripts/refresh_data.py
+
+    envVars:
+      - fromGroup: tfb-core
+      - fromGroup: tfb-logging
+      - fromGroup: tfb-providers
+      - fromGroup: tfb-cache
+      - fromGroup: tfb-resources
+
 # =============================================================================
-# ENVIRONMENT VARIABLES
+# ENVIRONMENT VARIABLE GROUPS
 # =============================================================================
 envVarGroups:
-  # ===========================================================================
+  # =======================================================================
   # CORE RUNTIME CONFIGURATION
-  # ===========================================================================
+  # =======================================================================
   - name: tfb-core
     envVars:
-      - key: PYTHONUNBUFFERED
-        value: "1"
-      - key: PYTHONDONTWRITEBYTECODE
-        value: "1"
-      - key: PYTHONHASHSEED
-        value: "random"
       - key: TZ
         value: "Asia/Riyadh"
       - key: APP_NAME
@@ -221,14 +282,16 @@ envVarGroups:
         value: "7.5.0"
       - key: SERVICE_VERSION
         value: "7.5.0"
-      - key: RENDER_GIT_COMMIT
-        fromService: RENDER_GIT_COMMIT
-      - key: RENDER_INSTANCE_ID
-        fromService: RENDER_INSTANCE_ID
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: PYTHONDONTWRITEBYTECODE
+        value: "1"
+      - key: PYTHONHASHSEED
+        value: "random"
 
-  # ===========================================================================
-  # LOGGING & OBSERVABILITY (v7.5.0 Upgrades)
-  # ===========================================================================
+  # =======================================================================
+  # LOGGING & OBSERVABILITY
+  # =======================================================================
   - name: tfb-logging
     envVars:
       - key: LOG_LEVEL
@@ -244,13 +307,11 @@ envVarGroups:
       - key: DATA_ENGINE_PERF_MONITORING
         value: "1"
 
-  # ===========================================================================
-  # WEB SERVER CONFIGURATION
-  # ===========================================================================
+  # =======================================================================
+  # WEB SERVER CONFIGURATION (app reads these; Render provides PORT automatically)
+  # =======================================================================
   - name: tfb-server
     envVars:
-      - key: PORT
-        fromService: PORT
       - key: HOST
         value: "0.0.0.0"
       - key: WORKERS
@@ -270,9 +331,9 @@ envVarGroups:
       - key: BACKLOG
         value: "4096"
 
-  # ===========================================================================
+  # =======================================================================
   # SECURITY & AUTHENTICATION
-  # ===========================================================================
+  # =======================================================================
   - name: tfb-security
     envVars:
       - key: REQUIRE_AUTH
@@ -294,9 +355,9 @@ envVarGroups:
       - key: BACKUP_APP_TOKEN
         sync: false
 
-  # ===========================================================================
+  # =======================================================================
   # FEATURE FLAGS & MACHINE LEARNING
-  # ===========================================================================
+  # =======================================================================
   - name: tfb-features
     envVars:
       - key: ADVISOR_ENABLED
@@ -316,9 +377,9 @@ envVarGroups:
       - key: CIRCUIT_BREAKER_ENABLED
         value: "1"
 
-  # ===========================================================================
+  # =======================================================================
   # DATA PROVIDERS
-  # ===========================================================================
+  # =======================================================================
   - name: tfb-providers
     envVars:
       - key: ENABLED_PROVIDERS
@@ -334,9 +395,9 @@ envVarGroups:
       - key: ARGAAM_API_KEY
         sync: false
 
-  # ===========================================================================
+  # =======================================================================
   # CACHE CONFIGURATION
-  # ===========================================================================
+  # =======================================================================
   - name: tfb-cache
     envVars:
       - key: CACHE_BACKEND
@@ -348,12 +409,12 @@ envVarGroups:
       - key: REDIS_URL
         fromService:
           name: tadawul-redis
-          type: redis
+          type: keyvalue
           property: connectionString
 
-  # ===========================================================================
+  # =======================================================================
   # GOOGLE SHEETS INTEGRATION
-  # ===========================================================================
+  # =======================================================================
   - name: tfb-sheets
     envVars:
       - key: GOOGLE_SHEETS_CREDENTIALS
@@ -365,9 +426,9 @@ envVarGroups:
       - key: SHEETS_USE_BATCH_UPDATE
         value: "true"
 
-  # ===========================================================================
+  # =======================================================================
   # RESOURCE MANAGEMENT (System Guardian)
-  # ===========================================================================
+  # =======================================================================
   - name: tfb-resources
     envVars:
       - key: GC_PRESSURE_MB
@@ -378,65 +439,3 @@ envVarGroups:
         value: "1"
       - key: MAX_FD_LIMIT
         value: "65536"
-
-# =============================================================================
-# BACKGROUND JOBS
-# =============================================================================
-cronJobs:
-  # Daily cache cleanup
-  - name: cache-cleanup
-    schedule: "0 3 * * *"  # 3 AM daily
-    command: python scripts/cleanup_cache.py
-  
-  # ML Model Drift Detection
-  - name: model-drift-check
-    schedule: "0 4 * * 0"  # 4 AM Sunday
-    command: python scripts/drift_detection.py
-
-  # Data refresh
-  - name: refresh-provider-data
-    schedule: "*/30 * * * *"  # Every 30 minutes
-    command: python scripts/refresh_data.py
-
-# =============================================================================
-# MAINTENANCE PAGES
-# =============================================================================
-maintenance:
-  path: /maintenance
-  statusCode: 503
-  body: |
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Maintenance - Tadawul Fast Bridge</title>
-        <style>
-            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; text-align: center; padding: 50px; background-color: #f9fafb;}
-            h1 { color: #111827; }
-            .message { color: #374151; margin: 20px 0; font-size: 1.2rem; }
-        </style>
-    </head>
-    <body>
-        <h1>🔄 System Upgrading</h1>
-        <div class="message">Tadawul Fast Bridge is undergoing scheduled enterprise maintenance. We'll be back online momentarily.</div>
-        <div>Riyadh Time: {{ .now | date "2006-01-02 15:04:05" }}</div>
-    </body>
-    </html>
-
-# =============================================================================
-# SECURITY SCANNING
-# =============================================================================
-security:
-  vulnerabilityScanning: true
-  dependencyScanning:
-    enabled: true
-    schedule: "0 0 * * *"
-  containerScanning:
-    enabled: true
-    schedule: "0 0 * * 0"
-
-# =============================================================================
-# METADATA
-# =============================================================================
-version: 7.5.0
-lastUpdated: 2026-02-21
-author: Tadawul Fast Bridge Architecture Team
