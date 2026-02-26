@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """
 main.py
-===========================================================
-TADAWUL FAST BRIDGE – ENTERPRISE FASTAPI ENTRY POINT (v8.5.1)
-===========================================================
+================================================================================
+TADAWUL FAST BRIDGE – ENTERPRISE FASTAPI ENTRY POINT (v8.5.2)
+================================================================================
 QUANTUM EDITION | MISSION CRITICAL | DIRECT MOUNT
 
-What's new in v8.5.1:
-- ✅ Router Prefix Normalization: fixes cases where child routers use "/advanced" but plan expects "/v1/advanced"
-- ✅ Optional Routers: "WebSocket" can be optional without producing WARNING noise if module doesn't exist
-- ✅ Keeps v8.5.0 Smart Router Discovery + Auto-Prefixing + Route Debugging + Engine Boot Fix
+v8.5.2 (This patch)
+- ✅ Fix blank /docs: use unpkg Swagger UI assets (avoid jsDelivr blocking)
+- ✅ Fix CSP for docs/redoc: allow required CDN + inline scripts for Swagger UI
+- ✅ Auth Bridge: accept X-APP-TOKEN (and token query) by mapping to Authorization: Bearer
+- ✅ Fix metrics gauge bug: prevent double active_requests.dec() on shed path
+- ✅ Prefer core.data_engine_v2 before core.data_engine
+- ✅ Avoid double gzip: skip custom compression when Content-Encoding is already set
 """
 
 from __future__ import annotations
@@ -17,46 +20,38 @@ from __future__ import annotations
 import asyncio
 import contextvars
 import gc
-import hashlib
-import inspect
 import logging
-import logging.config
-import logging.handlers
 import os
 import random
-import socket
 import sys
 import time
 import traceback
 import uuid
-import zlib
-import pickle
 from urllib.parse import urlparse
-from collections import defaultdict, deque
 from contextlib import asynccontextmanager, contextmanager
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from functools import lru_cache, wraps
 from importlib import import_module
 from pathlib import Path
-from threading import Lock, Thread
-from typing import (Any, AsyncGenerator, Awaitable, Callable, Dict, List,
-                    Optional, Set, Tuple, Type, TypeVar, Union, cast)
+from typing import Any, Dict, List, Optional
 
 import fastapi
-from fastapi import (BackgroundTasks, Depends, FastAPI, Header,
-                     HTTPException, Query, Request, Response,
-                     WebSocket, WebSocketDisconnect, status, APIRouter)
-from fastapi.datastructures import State
+from fastapi import FastAPI, Header, HTTPException, Request, Response, status, APIRouter
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.routing import APIRoute
+from fastapi.openapi.docs import (
+    get_swagger_ui_html,
+    get_swagger_ui_oauth2_redirect_html,
+    get_redoc_html,
+)
+
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
-from starlette.responses import PlainTextResponse, JSONResponse
+from starlette.responses import PlainTextResponse, JSONResponse, HTMLResponse
 
 # ---------------------------------------------------------------------------
 # High-Performance JSON fallback
@@ -65,15 +60,23 @@ try:
     import orjson
     from fastapi.responses import ORJSONResponse as BestJSONResponse
 
-    def json_dumps(v, *, default=None): return orjson.dumps(v, default=default).decode('utf-8')
-    def json_loads(v): return orjson.loads(v)
+    def json_dumps(v, *, default=None) -> str:
+        return orjson.dumps(v, default=default).decode("utf-8")
+
+    def json_loads(v):
+        return orjson.loads(v)
+
     _HAS_ORJSON = True
 except ImportError:
     import json
     from fastapi.responses import JSONResponse as BestJSONResponse
 
-    def json_dumps(v, *, default=None): return json.dumps(v, default=default)
-    def json_loads(v): return json.loads(v)
+    def json_dumps(v, *, default=None) -> str:
+        return json.dumps(v, default=default)
+
+    def json_loads(v):
+        return json.loads(v)
+
     _HAS_ORJSON = False
 
 # =============================================================================
@@ -92,19 +95,20 @@ except ImportError:
 
 # Prometheus metrics & Dynamic Patch for Duplicate Timeseries
 try:
-    from prometheus_client import Counter, Gauge, Histogram, Info, generate_latest
-    from prometheus_client.core import REGISTRY
+    from prometheus_client import Counter, Gauge, Histogram, generate_latest
     from prometheus_client.registry import CollectorRegistry
     PROMETHEUS_AVAILABLE = True
 
     # Monkeypatch Prometheus to ignore duplicate metric registrations
     _original_register = CollectorRegistry.register
+
     def _safe_register(self, collector):
         try:
             _original_register(self, collector)
         except ValueError as e:
             if "Duplicated timeseries" not in str(e):
                 raise
+
     CollectorRegistry.register = _safe_register
 except ImportError:
     PROMETHEUS_AVAILABLE = False
@@ -149,21 +153,14 @@ try:
 except ImportError:
     PSUTIL_AVAILABLE = False
 
-try:
-    import yaml
-    YAML_AVAILABLE = True
-except ImportError:
-    YAML_AVAILABLE = False
-
 # =============================================================================
 # Global Patches
 # =============================================================================
 
-# Pre-emptively fix the `_thread.RLock` bug in core.data_engine
+# Pre-emptively fix the `_thread.RLock` bug in core.data_engine (if present)
 try:
     import core.data_engine
     if hasattr(core.data_engine, "_ENGINE_MANAGER"):
-        # Replace the synchronous threading.RLock with an asyncio.Lock so 'async with' doesn't crash
         core.data_engine._ENGINE_MANAGER._lock = asyncio.Lock()
 except Exception:
     pass
@@ -175,10 +172,11 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-APP_ENTRY_VERSION = "8.5.1"
+APP_ENTRY_VERSION = "8.5.2"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled", "ok", "active"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled"}
+
 
 class LogLevel(str, Enum):
     DEBUG = "DEBUG"
@@ -187,71 +185,98 @@ class LogLevel(str, Enum):
     ERROR = "ERROR"
     CRITICAL = "CRITICAL"
 
+
 # =============================================================================
 # Utility Functions
 # =============================================================================
-
 def strip_value(v: Any) -> str:
-    try: return str(v).strip()
-    except Exception: return ""
+    try:
+        return str(v).strip()
+    except Exception:
+        return ""
+
 
 def coerce_bool(v: Any, default: bool = False) -> bool:
-    if isinstance(v, bool): return v
+    if isinstance(v, bool):
+        return v
     s = strip_value(v).lower()
-    if not s: return default
-    if s in _TRUTHY: return True
-    if s in _FALSY: return False
+    if not s:
+        return default
+    if s in _TRUTHY:
+        return True
+    if s in _FALSY:
+        return False
     return default
+
 
 def get_env_bool(key: str, default: bool = False) -> bool:
     return coerce_bool(os.getenv(key), default)
 
+
 def get_env_int(key: str, default: int) -> int:
-    try: return int(float(os.getenv(key, str(default)).strip()))
-    except (ValueError, TypeError): return default
+    try:
+        return int(float(os.getenv(key, str(default)).strip()))
+    except (ValueError, TypeError):
+        return default
+
 
 def get_env_float(key: str, default: float) -> float:
-    try: return float(os.getenv(key, str(default)).strip())
-    except (ValueError, TypeError): return default
+    try:
+        return float(os.getenv(key, str(default)).strip())
+    except (ValueError, TypeError):
+        return default
+
 
 def get_env_str(key: str, default: str = "") -> str:
     v = os.getenv(key)
     return str(v).strip() if v is not None and str(v).strip() else default
 
+
 def get_env_list(key: str, default: Optional[List[str]] = None) -> List[str]:
     v = os.getenv(key)
-    if not v: return default or []
+    if not v:
+        return default or []
     return [x.strip() for x in v.split(",") if x.strip()]
+
 
 def now_utc_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
 
 def now_riyadh_iso() -> str:
     tz = timezone(timedelta(hours=3))
     return datetime.now(tz).isoformat(timespec="milliseconds")
 
+
 def get_rss_mb() -> float:
     if PSUTIL_AVAILABLE:
-        try: return psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
-        except Exception: pass
+        try:
+            return psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
+        except Exception:
+            pass
     try:
         with open("/proc/self/status", "r") as f:
             for line in f:
-                if line.startswith("VmRSS:"): return float(line.split()[1]) / 1024
-    except Exception: pass
+                if line.startswith("VmRSS:"):
+                    return float(line.split()[1]) / 1024
+    except Exception:
+        pass
     return 0.0
+
 
 def get_cpu_percent() -> float:
     if PSUTIL_AVAILABLE:
-        try: return psutil.Process(os.getpid()).cpu_percent(interval=None)
-        except Exception: pass
+        try:
+            return psutil.Process(os.getpid()).cpu_percent(interval=None)
+        except Exception:
+            pass
     return 0.0
+
 
 def safe_import(module_path: str) -> Optional[Any]:
     try:
         return import_module(module_path)
     except ModuleNotFoundError as e:
-        # Suppress noisy logs for expected fallback candidates
         if e.name == module_path or e.name in module_path:
             logging.getLogger("boot").debug(f"Router candidate skipped (not found): {module_path}")
         else:
@@ -261,6 +286,7 @@ def safe_import(module_path: str) -> Optional[Any]:
         logging.getLogger("boot").error(f"❌ Failed to load '{module_path}': {e}\n{traceback.format_exc()}")
         return None
 
+
 def is_valid_uri(uri: str) -> bool:
     try:
         result = urlparse(uri)
@@ -268,14 +294,19 @@ def is_valid_uri(uri: str) -> bool:
     except Exception:
         return False
 
+
 # =============================================================================
 # Request Correlation (ContextVars)
 # =============================================================================
 _request_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="SYSTEM")
 
+
 def get_request_id() -> str:
-    try: return _request_id_ctx.get()
-    except Exception: return "SYSTEM"
+    try:
+        return _request_id_ctx.get()
+    except Exception:
+        return "SYSTEM"
+
 
 # =============================================================================
 # Advanced Logging Configuration
@@ -284,6 +315,7 @@ class RequestIDFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         record.request_id = getattr(record, "request_id", None) or get_request_id()
         return True
+
 
 class JSONFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
@@ -296,9 +328,10 @@ class JSONFormatter(logging.Formatter):
             "module": record.module,
             "function": record.funcName,
         }
-        if record.exc_info: log_entry["exception"] = self.formatException(record.exc_info)
-        if hasattr(record, "extra"): log_entry.update(record.extra)
+        if record.exc_info:
+            log_entry["exception"] = self.formatException(record.exc_info)
         return json_dumps(log_entry)
+
 
 def configure_logging() -> None:
     log_level = get_env_str("LOG_LEVEL", "INFO").upper()
@@ -327,32 +360,10 @@ def configure_logging() -> None:
     logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
     logging.getLogger("asyncio").setLevel(logging.WARNING)
 
+
 configure_logging()
 logger = logging.getLogger("main")
 boot_logger = logging.getLogger("boot")
-
-# =============================================================================
-# OpenTelemetry Tracing
-# =============================================================================
-class TraceContext:
-    def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
-        self.name = name
-        self.attributes = attributes or {}
-        self.tracer = trace.get_tracer(__name__) if TRACING_AVAILABLE and get_env_bool("ENABLE_TRACING", False) else None
-        self.span = None
-
-    async def __aenter__(self):
-        if self.tracer:
-            self.span = self.tracer.start_as_current_span(self.name)
-            if self.attributes: self.span.set_attributes(self.attributes)
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.span and TRACING_AVAILABLE:
-            if exc_val:
-                self.span.record_exception(exc_val)
-                self.span.set_status(Status(StatusCode.ERROR, str(exc_val)))
-            self.span.end()
 
 # =============================================================================
 # System Guardian (Resource Monitoring)
@@ -381,15 +392,21 @@ class SystemGuardian:
         self.boot_time_riyadh = now_riyadh_iso()
 
     def get_status(self) -> str:
-        if self.shutting_down: return "shutting_down"
-        if self.degraded_mode: return "degraded"
-        if self.latency_ms > self.degraded_enter_lag * 0.5: return "busy"
+        if self.shutting_down:
+            return "shutting_down"
+        if self.degraded_mode:
+            return "degraded"
+        if self.latency_ms > self.degraded_enter_lag * 0.5:
+            return "busy"
         return "healthy"
 
     def get_load_level(self) -> str:
-        if self.latency_ms > self.degraded_enter_lag: return "critical"
-        if self.latency_ms > self.degraded_enter_lag * 0.7: return "high"
-        if self.latency_ms > self.degraded_enter_lag * 0.4: return "medium"
+        if self.latency_ms > self.degraded_enter_lag:
+            return "critical"
+        if self.latency_ms > self.degraded_enter_lag * 0.7:
+            return "high"
+        if self.latency_ms > self.degraded_enter_lag * 0.4:
+            return "medium"
         return "low"
 
     def to_dict(self) -> Dict[str, Any]:
@@ -431,7 +448,9 @@ class SystemGuardian:
                 should_degrade = (self.latency_ms >= self.degraded_enter_lag or self.memory_mb >= self.degraded_memory_mb)
                 if should_degrade and not self.degraded_mode:
                     self.degraded_mode = True
-                    boot_logger.warning(f"Entering degraded mode: lag={self.latency_ms:.1f}ms, mem={self.memory_mb:.1f}MB")
+                    boot_logger.warning(
+                        f"Entering degraded mode: lag={self.latency_ms:.1f}ms, mem={self.memory_mb:.1f}MB"
+                    )
                 elif not should_degrade and self.degraded_mode and self.latency_ms <= self.degraded_exit_lag:
                     self.degraded_mode = False
                     boot_logger.info("Exiting degraded mode")
@@ -445,6 +464,7 @@ class SystemGuardian:
     def stop(self):
         self.running = False
         self.shutting_down = True
+
 
 guardian = SystemGuardian()
 
@@ -464,24 +484,99 @@ class MetricsCollector:
             )
             self.active_requests = Gauge("http_requests_active", "Active HTTP requests")
             self.error_count = Counter("http_errors_total", "Total HTTP errors", ["method", "endpoint", "error_type"])
-            self.cache_hits = Counter("cache_hits_total", "Total cache hits", ["cache_backend"])
-            self.cache_misses = Counter("cache_misses_total", "Total cache misses", ["cache_backend"])
 
     def record_request(self, method: str, endpoint: str, status: int, duration: float):
-        if not self.enabled: return
+        if not self.enabled:
+            return
         endpoint = endpoint or "root"
         self.request_count.labels(method=method, endpoint=endpoint, status=str(status)).inc()
         self.request_duration.labels(method=method, endpoint=endpoint).observe(duration)
 
     def record_error(self, method: str, endpoint: str, error_type: str):
-        if not self.enabled: return
+        if not self.enabled:
+            return
         self.error_count.labels(method=method, endpoint=endpoint, error_type=error_type).inc()
+
 
 metrics = MetricsCollector()
 
 # =============================================================================
-# Middleware Pipeline
+# Middleware: Auth Bridge (X-APP-TOKEN -> Authorization: Bearer ...)
 # =============================================================================
+class AuthHeaderBridgeMiddleware(BaseHTTPMiddleware):
+    """
+    Compatibility bridge:
+    - If Authorization header is missing:
+        - Use query param ?token=... OR header X-APP-TOKEN (x-app-token)
+        - Inject Authorization: Bearer <token> into ASGI scope headers
+    This makes /v1/enriched/* accept X-APP-TOKEN clients without changing router auth logic.
+    """
+
+    @staticmethod
+    def _get_first_header(scope_headers: List[tuple], key_lower: bytes) -> Optional[bytes]:
+        for k, v in scope_headers:
+            if k == key_lower:
+                return v
+        return None
+
+    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
+        try:
+            scope = request.scope
+            hdrs = list(scope.get("headers") or [])
+            # ASGI headers are lower-case bytes
+            auth_v = self._get_first_header(hdrs, b"authorization")
+            if auth_v:
+                return await call_next(request)
+
+            token_q = request.query_params.get("token")
+            token_h = self._get_first_header(hdrs, b"x-app-token")
+
+            token = (token_q or (token_h.decode("utf-8") if token_h else "")).strip()
+            if token:
+                bearer = f"Bearer {token}".encode("utf-8")
+                hdrs.append((b"authorization", bearer))
+                scope["headers"] = hdrs
+        except Exception:
+            # Never break requests because of the bridge
+            pass
+
+        return await call_next(request)
+
+# =============================================================================
+# Middleware: Telemetry + Security Headers
+# =============================================================================
+def _is_docs_path(path: str) -> bool:
+    return (
+        path == "/docs"
+        or path.startswith("/docs/")
+        or path == "/redoc"
+        or path.startswith("/redoc")
+    )
+
+def _csp_for_docs() -> str:
+    # Swagger UI needs:
+    # - external JS/CSS from unpkg (and we keep jsdelivr as fallback)
+    # - inline script block in the HTML
+    # - fetch to /openapi.json
+    return (
+        "default-src 'self'; "
+        "base-uri 'self'; "
+        "frame-ancestors 'none'; "
+        "img-src 'self' https: data:; "
+        "style-src 'self' 'unsafe-inline' https://unpkg.com https://cdn.jsdelivr.net; "
+        "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://unpkg.com https://cdn.jsdelivr.net; "
+        "connect-src 'self'; "
+        "font-src 'self' https://unpkg.com https://cdn.jsdelivr.net data:;"
+    )
+
+def _csp_strict() -> str:
+    # For API JSON endpoints, keep it tight (doesn't affect JSON anyway).
+    return (
+        "default-src 'none'; "
+        "base-uri 'none'; "
+        "frame-ancestors 'none'"
+    )
+
 class TelemetryMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())[:18]
@@ -490,21 +585,22 @@ class TelemetryMiddleware(BaseHTTPMiddleware):
         request.state.start_time = time.time()
 
         guardian.request_count += 1
-        if metrics.enabled: metrics.active_requests.inc()
-
-        if await guardian.should_shed_request(request.url.path):
-            if metrics.enabled: metrics.active_requests.dec()
-            return BestJSONResponse(
-                status_code=503,
-                content={
-                    "status": "degraded",
-                    "message": "System under heavy load",
-                    "request_id": request_id,
-                    "time_riyadh": now_riyadh_iso()
-                }
-            )
+        if metrics.enabled:
+            metrics.active_requests.inc()
 
         try:
+            if await guardian.should_shed_request(request.url.path):
+                # IMPORTANT: do NOT decrement here (finally will do it).
+                return BestJSONResponse(
+                    status_code=503,
+                    content={
+                        "status": "degraded",
+                        "message": "System under heavy load",
+                        "request_id": request_id,
+                        "time_riyadh": now_riyadh_iso(),
+                    },
+                )
+
             response = await call_next(request)
 
             duration = time.time() - request.state.start_time
@@ -515,27 +611,36 @@ class TelemetryMiddleware(BaseHTTPMiddleware):
             response.headers["X-Process-Time"] = f"{duration:.4f}s"
             response.headers["X-System-Load"] = guardian.get_load_level()
             response.headers["X-Time-Riyadh"] = now_riyadh_iso()
-
-            response.headers["Server-Timing"] = f"app;desc=\"FastAPI Processing\";dur={duration*1000:.2f}"
+            response.headers["Server-Timing"] = f'app;desc="FastAPI Processing";dur={duration*1000:.2f}'
 
             response.headers["X-Content-Type-Options"] = "nosniff"
             response.headers["X-Frame-Options"] = "DENY"
             response.headers["X-XSS-Protection"] = "1; mode=block"
             response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-            response.headers["Content-Security-Policy"] = "default-src 'self'; frame-ancestors 'none';"
+
+            # CSP: docs need relaxed CSP; APIs can remain strict.
+            if _is_docs_path(request.url.path):
+                response.headers["Content-Security-Policy"] = _csp_for_docs()
+            else:
+                response.headers["Content-Security-Policy"] = _csp_strict()
 
             if get_env_str("APP_ENV") == "production":
                 response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
 
             return response
+
         except Exception as e:
             guardian.error_count += 1
             metrics.record_error(method=request.method, endpoint=request.url.path, error_type=type(e).__name__)
             raise
         finally:
-            if metrics.enabled: metrics.active_requests.dec()
+            if metrics.enabled:
+                metrics.active_requests.dec()
             _request_id_ctx.reset(token)
 
+# =============================================================================
+# Middleware: Tracing (optional)
+# =============================================================================
 class TracingMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         if not TRACING_AVAILABLE or not get_env_bool("ENABLE_TRACING", False):
@@ -545,34 +650,49 @@ class TracingMiddleware(BaseHTTPMiddleware):
         with tracer.start_as_current_span(
             f"{request.method} {request.url.path}",
             kind=trace.SpanKind.SERVER,
-            attributes={"http.method": request.method, "http.url": str(request.url), "request.id": get_request_id()}
+            attributes={"http.method": request.method, "http.url": str(request.url), "request.id": get_request_id()},
         ) as span:
             response = await call_next(request)
             span.set_attribute("http.status_code", response.status_code)
             return response
 
+# =============================================================================
+# Middleware: Safe extra compression (optional; avoids double gzip)
+# =============================================================================
 class CompressionMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
         response = await call_next(request)
-        content_type = response.headers.get("content-type", "")
-        if not content_type.startswith(("text/", "application/json", "application/javascript")):
-            return response
-        if "gzip" not in request.headers.get("accept-encoding", ""):
+
+        # If already encoded by GZipMiddleware or upstream, do nothing.
+        if response.headers.get("content-encoding"):
             return response
 
-        if hasattr(response, 'body') and len(response.body) > 512:
-            import gzip
-            compressed = gzip.compress(response.body)
-            return Response(
-                content=compressed,
-                status_code=response.status_code,
-                headers=dict(response.headers),
-                media_type=response.media_type
-            )
-        return response
+        content_type = (response.headers.get("content-type", "") or "").lower()
+        if not content_type.startswith(("text/", "application/json", "application/javascript", "text/html")):
+            return response
+        if "gzip" not in (request.headers.get("accept-encoding", "") or ""):
+            return response
+
+        body = getattr(response, "body", None)
+        if not body or not isinstance(body, (bytes, bytearray)) or len(body) <= 512:
+            return response
+
+        import gzip
+        compressed = gzip.compress(body)
+        new_headers = dict(response.headers)
+        new_headers["Content-Encoding"] = "gzip"
+        # Content-Length will be recalculated by Starlette if omitted; keep it clean:
+        new_headers.pop("Content-Length", None)
+
+        return Response(
+            content=compressed,
+            status_code=response.status_code,
+            headers=new_headers,
+            media_type=response.media_type,
+        )
 
 # =============================================================================
-# Full Jitter Bootstrap
+# Engine Bootstrap (resilient)
 # =============================================================================
 async def init_engine_resilient(app: FastAPI, max_retries: int = 3) -> None:
     app.state.engine_ready = False
@@ -580,7 +700,8 @@ async def init_engine_resilient(app: FastAPI, max_retries: int = 3) -> None:
 
     for attempt in range(max_retries):
         try:
-            engine_module = safe_import("core.data_engine") or safe_import("core.data_engine_v2")
+            # Prefer V2 first
+            engine_module = safe_import("core.data_engine_v2") or safe_import("core.data_engine")
             if not engine_module or not hasattr(engine_module, "get_engine"):
                 app.state.engine_error = "Engine module not available"
                 boot_logger.warning(app.state.engine_error)
@@ -595,7 +716,9 @@ async def init_engine_resilient(app: FastAPI, max_retries: int = 3) -> None:
                 app.state.engine_error = None
                 boot_logger.info(f"Data Engine ready: {type(engine).__name__}")
                 return
+
             raise RuntimeError("Engine returned None")
+
         except Exception as e:
             boot_logger.warning(f"Engine boot attempt {attempt+1}/{max_retries} failed: {e}")
             if attempt < max_retries - 1:
@@ -608,17 +731,15 @@ async def init_engine_resilient(app: FastAPI, max_retries: int = 3) -> None:
     boot_logger.error(app.state.engine_error)
 
 # =============================================================================
-# Dynamic Router Mounting (v8.5.1)
+# Dynamic Router Mounting
 # =============================================================================
-
 @dataclass(frozen=True)
 class RouterSpec:
     label: str
     expected_prefix: str
     candidates: List[str]
-    required: bool = True  # if False => missing module won't produce WARNING
+    required: bool = True
 
-# Enforcing prefixes here guarantees that the tests hit the correct endpoints.
 ROUTER_PLAN: List[RouterSpec] = [
     RouterSpec("Advanced", "/v1/advanced", ["routes.advanced_analysis", "routes.advanced", "api.advanced"], True),
     RouterSpec("Advisor", "/v1/advisor", ["routes.advisor", "routes.investment_advisor", "core.investment_advisor"], True),
@@ -626,7 +747,7 @@ ROUTER_PLAN: List[RouterSpec] = [
     RouterSpec("Enriched", "/v1/enriched", ["routes.enriched_quote", "routes.enriched", "core.enriched_quote"], True),
     RouterSpec("Analysis", "/v1/analysis", ["routes.ai_analysis", "routes.analysis"], True),
     RouterSpec("System", "", ["routes.config", "routes.system", "core.legacy_service"], True),
-    RouterSpec("WebSocket", "", ["routes.websocket"], False),  # optional (no warning if absent)
+    RouterSpec("WebSocket", "", ["routes.websocket"], False),
 ]
 
 def route_inventory(app: FastAPI) -> List[Dict[str, Any]]:
@@ -648,7 +769,6 @@ def _temp_router_prefix(router: APIRouter, new_prefix: str):
             pass
 
 def _find_any_apirouter(module: Any) -> Optional[APIRouter]:
-    # Dynamically scan for ANY APIRouter instance inside the module
     for obj_name in dir(module):
         try:
             obj = getattr(module, obj_name)
@@ -659,35 +779,25 @@ def _find_any_apirouter(module: Any) -> Optional[APIRouter]:
     return None
 
 def _mount_with_prefix_normalization(app: FastAPI, child: APIRouter, expected_prefix: str) -> str:
-    """
-    Returns the applied prefix used for mounting.
-    """
     child_prefix = (getattr(child, "prefix", "") or "").strip()
 
-    # If this router is meant to be root/system, mount as-is.
     if not expected_prefix:
         app.include_router(child)
         return child_prefix or "/"
 
-    # Case 1: child has no prefix => we apply strict /v1 prefix
     if not child_prefix or child_prefix == "/":
         app.include_router(child, prefix=expected_prefix)
         return expected_prefix
 
-    # Case 2: child already matches strict prefix
     if child_prefix == expected_prefix or child_prefix.startswith(expected_prefix + "/"):
         app.include_router(child)
         return child_prefix
 
-    # Case 3: common mistake: child uses "/advanced" but plan expects "/v1/advanced"
-    # If expected endswith child (e.g., "/v1/advanced" endswith "/advanced"), we can safely
-    # strip child prefix during mounting (one-time) and apply expected prefix.
     if expected_prefix.endswith(child_prefix) and expected_prefix.startswith("/v1/"):
         with _temp_router_prefix(child, ""):
             app.include_router(child, prefix=expected_prefix)
         return expected_prefix
 
-    # Otherwise: mount as-is but log a clear warning about mismatch.
     boot_logger.warning(
         f"Router prefix mismatch: expected='{expected_prefix}' but router.prefix='{child_prefix}'. "
         f"Mounting router as-is (paths may differ)."
@@ -743,9 +853,8 @@ def mount_routers_once(app: FastAPI) -> Dict[str, Any]:
     return report
 
 # =============================================================================
-# App Factory & Event Handlers
+# App Factory
 # =============================================================================
-
 def create_app() -> FastAPI:
     app_env = get_env_str("APP_ENV", "production")
     app_name = get_env_str("APP_NAME", "Tadawul Fast Bridge")
@@ -757,7 +866,7 @@ def create_app() -> FastAPI:
         limiter = Limiter(
             key_func=get_remote_address,
             default_limits=[f"{rpm} per minute"],
-            storage_uri=get_env_str("REDIS_URL") if get_env_str("RATE_LIMIT_BACKEND") == "redis" else "memory://"
+            storage_uri=get_env_str("REDIS_URL") if get_env_str("RATE_LIMIT_BACKEND") == "redis" else "memory://",
         )
 
     @asynccontextmanager
@@ -770,7 +879,7 @@ def create_app() -> FastAPI:
         guardian_task = asyncio.create_task(guardian.monitor_loop())
 
         async def boot():
-            await asyncio.sleep(0)  # Yield control
+            await asyncio.sleep(0)
             if get_env_bool("INIT_ENGINE_ON_BOOT", True):
                 await init_engine_resilient(app, max_retries=get_env_int("MAX_RETRIES", 3))
             gc.collect()
@@ -797,22 +906,26 @@ def create_app() -> FastAPI:
                 boot_logger.warning(f"Engine shutdown error: {e}")
         boot_logger.info("Shutdown sequence complete")
 
+    # IMPORTANT:
+    # - disable default FastAPI docs endpoints
+    # - we register custom /docs and /redoc using unpkg assets
     app = FastAPI(
         title=app_name,
         version=app_version,
         description="Tadawul Fast Bridge API - Enterprise Market Data Platform",
         lifespan=lifespan,
-        docs_url="/docs" if get_env_bool("ENABLE_SWAGGER", True) else None,
-        redoc_url="/redoc" if get_env_bool("ENABLE_REDOC", True) else None,
-        default_response_class=BestJSONResponse
+        docs_url=None,
+        redoc_url=None,
+        default_response_class=BestJSONResponse,
     )
 
+    # Rate limit support
     if limiter is not None:
         app.state.limiter = limiter
         app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-        if SLOWAPI_AVAILABLE:
-            app.add_middleware(SlowAPIMiddleware)
+        app.add_middleware(SlowAPIMiddleware)
 
+    # Core middlewares (order matters; last-added runs first)
     app.add_middleware(TelemetryMiddleware)
     app.add_middleware(TracingMiddleware)
     app.add_middleware(GZipMiddleware, minimum_size=512)
@@ -828,9 +941,11 @@ def create_app() -> FastAPI:
         expose_headers=["X-Request-ID", "X-Process-Time", "X-Time-Riyadh", "Server-Timing"],
         max_age=600,
     )
+
     if app_env == "production":
         app.add_middleware(TrustedHostMiddleware, allowed_hosts=get_env_list("ALLOWED_HOSTS", ["*"]))
 
+    # Sentry
     sentry_dsn = get_env_str("SENTRY_DSN").strip()
     if SENTRY_AVAILABLE and sentry_dsn and is_valid_uri(sentry_dsn):
         try:
@@ -839,13 +954,14 @@ def create_app() -> FastAPI:
                 environment=app_env,
                 release=app_version,
                 traces_sample_rate=get_env_float("SENTRY_TRACES_SAMPLE_RATE", 0.1),
-                integrations=[LoggingIntegration(level=logging.INFO, event_level=logging.ERROR)]
+                integrations=[LoggingIntegration(level=logging.INFO, event_level=logging.ERROR)],
             )
             if SentryAsgiMiddleware:
                 app.add_middleware(SentryAsgiMiddleware)
         except Exception as e:
             boot_logger.error(f"Failed to initialize Sentry: {e}")
 
+    # OpenTelemetry (optional)
     if TRACING_AVAILABLE and get_env_bool("ENABLE_TRACING", False):
         try:
             provider = TracerProvider(resource=Resource(attributes={SERVICE_NAME: app_name}))
@@ -857,56 +973,84 @@ def create_app() -> FastAPI:
         except Exception as e:
             boot_logger.error(f"Failed to initialize OpenTelemetry: {e}")
 
+    # Custom Docs (unpkg) — fixes jsDelivr blocking + works with our CSP exceptions
+    if get_env_bool("ENABLE_SWAGGER", True):
+        @app.get("/docs", include_in_schema=False)
+        async def custom_swagger_ui_html() -> HTMLResponse:
+            return get_swagger_ui_html(
+                openapi_url=app.openapi_url,
+                title=f"{app.title} - Swagger UI",
+                oauth2_redirect_url="/docs/oauth2-redirect",
+                swagger_js_url="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js",
+                swagger_css_url="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css",
+            )
+
+        @app.get("/docs/oauth2-redirect", include_in_schema=False)
+        async def swagger_ui_redirect() -> HTMLResponse:
+            return get_swagger_ui_oauth2_redirect_html()
+
+    if get_env_bool("ENABLE_REDOC", True):
+        @app.get("/redoc", include_in_schema=False)
+        async def redoc_html() -> HTMLResponse:
+            return get_redoc_html(
+                openapi_url=app.openapi_url,
+                title=f"{app.title} - ReDoc",
+                redoc_js_url="https://unpkg.com/redoc@next/bundles/redoc.standalone.js",
+            )
+
     # FORCE MOUNT ROUTERS SYNCHRONOUSLY
     mount_routers_once(app)
 
+    # Prometheus metrics
     if PROMETHEUS_AVAILABLE and get_env_bool("ENABLE_METRICS", True):
         @app.get("/metrics", include_in_schema=False)
         async def metrics_endpoint():
-            return Response(content=generate_latest(), media_type="text/plain")
+            return Response(content=generate_latest(), media_type="text/plain; version=0.0.4; charset=utf-8")
 
+    # Root + health + debug
     @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
     async def root():
         return {
             "status": "online",
             "service": app_name,
             "version": app_version,
+            "entry_version": APP_ENTRY_VERSION,
             "environment": app_env,
             "time_riyadh": now_riyadh_iso(),
-            "documentation": "/docs"
+            "documentation": "/docs",
         }
 
     @app.get("/health", tags=["system"])
     async def health(request: Request):
         return {
             "status": "healthy" if getattr(app.state, "engine_ready", False) and not guardian.degraded_mode else "degraded",
-            "service": {"name": app_name, "version": app_version, "environment": app_env},
+            "service": {"name": app_name, "version": app_version, "entry_version": APP_ENTRY_VERSION, "environment": app_env},
             "vitals": guardian.to_dict()["metrics"],
             "boot": {"engine_ready": getattr(app.state, "engine_ready", False)},
             "routers": getattr(app.state, "router_report", {"mounted": [], "failed": []}),
-            "trace_id": get_request_id()
+            "trace_id": get_request_id(),
         }
 
-    # Debug tool to see exactly what routes the app actually knows about
     @app.get("/debug/routes", tags=["system"])
     async def debug_routes(request: Request):
         return {
             "total_routes": len(app.routes),
-            "paths": [route.path for route in app.routes if isinstance(route, APIRoute)]
+            "paths": [route.path for route in app.routes if isinstance(route, APIRoute)],
         }
 
+    # Exception handlers
     @app.exception_handler(StarletteHTTPException)
     async def http_exception_handler(request: Request, exc: StarletteHTTPException):
         return BestJSONResponse(
             status_code=exc.status_code,
-            content={"status": "error", "message": exc.detail, "request_id": get_request_id(), "time_riyadh": now_riyadh_iso()}
+            content={"status": "error", "message": exc.detail, "request_id": get_request_id(), "time_riyadh": now_riyadh_iso()},
         )
 
     @app.exception_handler(RequestValidationError)
     async def validation_exception_handler(request: Request, exc: RequestValidationError):
         return BestJSONResponse(
             status_code=422,
-            content={"status": "error", "message": "Validation error", "details": exc.errors(), "request_id": get_request_id()}
+            content={"status": "error", "message": "Validation error", "details": exc.errors(), "request_id": get_request_id()},
         )
 
     @app.exception_handler(Exception)
@@ -914,10 +1058,14 @@ def create_app() -> FastAPI:
         logger.error(f"Unhandled exception on {request.url.path}: {traceback.format_exc()}")
         return BestJSONResponse(
             status_code=500,
-            content={"status": "critical", "message": "Internal server error", "request_id": get_request_id()}
+            content={"status": "critical", "message": "Internal server error", "request_id": get_request_id()},
         )
 
+    # Add Auth Bridge LAST so it executes FIRST (outermost)
+    app.add_middleware(AuthHeaderBridgeMiddleware)
+
     return app
+
 
 app = create_app()
 
