@@ -5,15 +5,16 @@ core/data_engine_v2.py
 Data Engine V2 — THE MASTER ORCHESTRATOR — v5.1.1 (RELIABILITY PATCH)
 ================================================================================
 
-Fixes in v5.1.1 (your current production blockers):
-- ✅ Provider imports fixed: supports BOTH `providers.*` (your repo) and legacy `core.providers.*`
-- ✅ Symbol normalization fixed: supports BOTH `symbols.normalize` and legacy `core.symbols.normalize`
-- ✅ Provider call compatibility: works with async OR sync provider functions
-- ✅ Patch key normalization: maps `price` -> `current_price` (prevents MISSING data_quality)
-- ✅ Removes undefined `_PYDANTIC_V2` crash risk (safe serialization for cache/ws)
+Purpose (v5.1.1):
+- Provider imports fixed: supports BOTH `providers.*` (your repo) and legacy `core.providers.*`
+- Symbol normalization fixed: supports BOTH `symbols.normalize` and legacy `core.symbols.normalize`
+- Provider call compatibility: works with async OR sync provider functions
+- Patch key normalization: maps `price` -> `current_price` (prevents MISSING data_quality)
+- Safe serialization (no `_PYDANTIC_V2` risk)
+- Adds ROOT_DIR to sys.path to stop "No module named 'providers'"
 
-Result:
-- AAPL / 2222.SR will stop returning all-null payloads once providers load successfully.
+Expected outcome:
+- Providers will import correctly (if they exist in repo), and quotes will stop returning all-null payloads.
 """
 
 from __future__ import annotations
@@ -24,30 +25,50 @@ import logging
 import math
 import os
 import pickle
-import random
+import sys
 import time
 import uuid
 import zlib
-from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Set, Tuple, Union
 from importlib import import_module
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+# ---------------------------------------------------------------------------
+# Ensure repo root is importable (fixes "No module named 'providers'")
+# core/data_engine_v2.py -> core/ -> ROOT
+# ---------------------------------------------------------------------------
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+__version__ = "5.1.1"
+
+logger = logging.getLogger("core.data_engine_v2")
 
 # ---------------------------------------------------------------------------
 # High-Performance JSON fallback
 # ---------------------------------------------------------------------------
 try:
     import orjson
-    def json_loads(data: Union[str, bytes]) -> Any: return orjson.loads(data)
-    def json_dumps(obj: Any) -> str: return orjson.dumps(obj, default=str).decode("utf-8")
+
+    def json_loads(data: Union[str, bytes]) -> Any:
+        return orjson.loads(data)
+
+    def json_dumps(obj: Any) -> str:
+        return orjson.dumps(obj, default=str).decode("utf-8")
+
 except ImportError:
     import json
-    def json_loads(data: Union[str, bytes]) -> Any: return json.loads(data)
-    def json_dumps(obj: Any) -> str: return json.dumps(obj, default=str)
 
-logger = logging.getLogger("core.data_engine_v2")
+    def json_loads(data: Union[str, bytes]) -> Any:
+        return json.loads(data)
+
+    def json_dumps(obj: Any) -> str:
+        return json.dumps(obj, default=str)
+
 
 # ---------------------------------------------------------------------------
 # Pydantic safe detection
@@ -63,36 +84,55 @@ def _model_to_dict(obj: Any) -> Dict[str, Any]:
     # pydantic v1
     if hasattr(obj, "dict") and callable(getattr(obj, "dict")):
         return obj.dict()
-    # dataclass-like
+    # dataclass-like / plain object
     if hasattr(obj, "__dict__"):
         return dict(obj.__dict__)
     return {"result": obj}
+
 
 # ---------------------------------------------------------------------------
 # UnifiedQuote import (keep fallback safe)
 # ---------------------------------------------------------------------------
 try:
     from core.schemas import UnifiedQuote  # type: ignore
+
     SCHEMAS_AVAILABLE = True
 except Exception:
     SCHEMAS_AVAILABLE = False
     try:
         from pydantic import BaseModel
-    except Exception:
+        from pydantic import Field
+    except Exception:  # pragma: no cover
         BaseModel = object  # type: ignore
+        Field = lambda default=None, **kwargs: default  # type: ignore
 
     class UnifiedQuote(BaseModel):  # type: ignore
-        symbol: str
+        symbol: str = Field(default="")
+        symbol_normalized: Optional[str] = None
+        requested_symbol: Optional[str] = None
+
+        # canonical price fields
         current_price: Optional[float] = None
+        price: Optional[float] = None
+        previous_close: Optional[float] = None
+
+        # metadata
         data_quality: str = "MISSING"
+        error: Optional[str] = None
+        warning: Optional[str] = None
+        info: Optional[Any] = None
         latency_ms: Optional[float] = None
         data_sources: Optional[List[str]] = None
         provider_latency: Optional[Dict[str, float]] = None
+        last_updated_utc: Optional[str] = None
+        last_updated_riyadh: Optional[str] = None
+
         class Config:
             extra = "ignore"
 
+
 # ---------------------------------------------------------------------------
-# Local Enums used by DataEngineV4
+# Enums
 # ---------------------------------------------------------------------------
 class QuoteQuality(str, Enum):
     EXCELLENT = "EXCELLENT"
@@ -101,6 +141,7 @@ class QuoteQuality(str, Enum):
     POOR = "POOR"
     MISSING = "MISSING"
 
+
 class MarketRegime(str, Enum):
     BULL = "bull"
     BEAR = "bear"
@@ -108,73 +149,85 @@ class MarketRegime(str, Enum):
     SIDEWAYS = "sideways"
     UNKNOWN = "unknown"
 
+
 class DataSource(str, Enum):
     CACHE = "cache"
     PRIMARY = "primary"
     FALLBACK = "fallback"
     ENRICHMENT = "enrichment"
 
+
 # ---------------------------------------------------------------------------
 # Symbol normalization (IMPORTANT FIX)
 # Supports BOTH layouts:
-# - symbols/normalize.py  (your repo list)
+# - symbols/normalize.py  (your repo)
 # - core/symbols/normalize.py (legacy)
 # ---------------------------------------------------------------------------
-SYMBOL_NORMALIZATION_AVAILABLE = False
-
-def _fallback_normalize_symbol(s: str) -> str:
-    return (s or "").strip().upper()
-
 def _fallback_is_ksa(s: str) -> bool:
     u = (s or "").strip().upper()
+    if u.startswith("TADAWUL:"):
+        u = u.split(":", 1)[1].strip()
     if u.endswith(".SR"):
-        return True
-    if u.isdigit() and 3 <= len(u) <= 6:
-        return True
-    return False
+        code = u[:-3].strip()
+        return code.isdigit() and 3 <= len(code) <= 6
+    return u.isdigit() and 3 <= len(u) <= 6
+
+
+def _fallback_normalize_symbol(s: str) -> str:
+    u = (s or "").strip().upper()
+    if not u:
+        return ""
+    if u.startswith("TADAWUL:"):
+        u = u.split(":", 1)[1].strip()
+    # normalize Saudi tickers to 2222.SR
+    if _fallback_is_ksa(u):
+        if u.endswith(".SR"):
+            code = u[:-3].strip()
+            return f"{code}.SR"
+        if u.isdigit():
+            return f"{u}.SR"
+    return u
+
 
 def _fallback_to_yahoo_symbol(s: str) -> str:
     u = _fallback_normalize_symbol(s)
+    # for KSA, Yahoo needs 2222.SR
     if _fallback_is_ksa(u):
         return u if u.endswith(".SR") else f"{u}.SR"
     return u
 
+
+# Try preferred imports first
 try:
-    # Preferred (per your repo listing)
     from symbols.normalize import normalize_symbol as normalize_symbol  # type: ignore
     from symbols.normalize import is_ksa as is_ksa  # type: ignore
+
     try:
         from symbols.normalize import to_yahoo_symbol as to_yahoo_symbol  # type: ignore
     except Exception:
         to_yahoo_symbol = _fallback_to_yahoo_symbol  # type: ignore
-    SYMBOL_NORMALIZATION_AVAILABLE = True
+
 except Exception:
     try:
-        # Legacy
         from core.symbols.normalize import normalize_symbol as normalize_symbol  # type: ignore
         from core.symbols.normalize import is_ksa as is_ksa  # type: ignore
+
         try:
             from core.symbols.normalize import to_yahoo_symbol as to_yahoo_symbol  # type: ignore
         except Exception:
             to_yahoo_symbol = _fallback_to_yahoo_symbol  # type: ignore
-        SYMBOL_NORMALIZATION_AVAILABLE = True
+
     except Exception:
         normalize_symbol = _fallback_normalize_symbol  # type: ignore
         is_ksa = _fallback_is_ksa  # type: ignore
         to_yahoo_symbol = _fallback_to_yahoo_symbol  # type: ignore
 
+
 def get_symbol_info(symbol: str) -> Dict[str, Any]:
-    """
-    Unified symbol info used for provider selection.
-    """
     norm = normalize_symbol(symbol) if callable(normalize_symbol) else _fallback_normalize_symbol(symbol)
     ksa = bool(is_ksa(norm)) if callable(is_ksa) else _fallback_is_ksa(norm)
-    return {
-        "raw": symbol,
-        "normalized": norm,
-        "market": "KSA" if ksa else "GLOBAL",
-        "is_ksa": ksa,
-    }
+    return {"raw": symbol, "normalized": norm, "market": "KSA" if ksa else "GLOBAL", "is_ksa": ksa}
+
 
 # ---------------------------------------------------------------------------
 # Env helpers
@@ -183,11 +236,6 @@ def _get_env_list(key: str, default: str) -> List[str]:
     raw = os.getenv(key, default)
     return [s.strip().lower() for s in raw.split(",") if s.strip()]
 
-def _get_env_bool(key: str, default: bool = False) -> bool:
-    raw = os.getenv(key, "").strip().lower()
-    if not raw:
-        return default
-    return raw in {"1", "true", "yes", "y", "on", "enabled", "enable"}
 
 def _get_env_int(key: str, default: int) -> int:
     try:
@@ -195,29 +243,27 @@ def _get_env_int(key: str, default: int) -> int:
     except Exception:
         return default
 
+
 def _get_env_float(key: str, default: float) -> float:
     try:
         return float(os.getenv(key, str(default)))
     except Exception:
         return default
 
+
 # ---------------------------------------------------------------------------
 # Time helpers
 # ---------------------------------------------------------------------------
-def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
 def _now_utc_iso() -> str:
-    return _now_utc().isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
-def _now_riyadh() -> datetime:
-    return datetime.now(timezone(timedelta(hours=3)))
 
 def _now_riyadh_iso() -> str:
-    return _now_riyadh().isoformat()
+    return datetime.now(timezone(timedelta(hours=3))).isoformat()
+
 
 # ---------------------------------------------------------------------------
-# Safe type helpers
+# Patch helpers
 # ---------------------------------------------------------------------------
 def _safe_float(x: Any) -> Optional[float]:
     if x is None:
@@ -230,14 +276,12 @@ def _safe_float(x: Any) -> Optional[float]:
     except Exception:
         return None
 
+
 def _clean_patch(patch: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in patch.items() if v is not None and v != ""}
 
-# ---------------------------------------------------------------------------
-# Patch key normalization (IMPORTANT FIX)
-# Providers often return `price` not `current_price`.
-# Without this, data_quality stays MISSING.
-# ---------------------------------------------------------------------------
+
+# Providers often return `price` not `current_price`
 _PATCH_ALIASES: Dict[str, str] = {
     "price": "current_price",
     "last_price": "current_price",
@@ -252,6 +296,7 @@ _PATCH_ALIASES: Dict[str, str] = {
     "low": "day_low",
 }
 
+
 def _normalize_patch_keys(patch: Dict[str, Any]) -> Dict[str, Any]:
     if not patch:
         return {}
@@ -259,17 +304,15 @@ def _normalize_patch_keys(patch: Dict[str, Any]) -> Dict[str, Any]:
     for src, dst in _PATCH_ALIASES.items():
         if src in out and (dst not in out or out.get(dst) in (None, "", 0)):
             out[dst] = out.get(src)
-    # also keep `price` field if consumer expects it
+    # keep `price` aligned
     if "current_price" in out and ("price" not in out or out.get("price") in (None, "", 0)):
         out["price"] = out.get("current_price")
     return out
 
-# ============================================================================
-# Provider configuration (IMPORTANT FIX)
-# Your repo uses `providers.*`, older drafts used `core.providers.*`.
-# We support both.
-# ============================================================================
 
+# ============================================================================
+# Provider configuration (supports BOTH providers.* and core.providers.*)
+# ============================================================================
 DEFAULT_PROVIDERS = "tadawul,argaam,yahoo_chart,yahoo_fundamentals,finnhub,eodhd"
 DEFAULT_KSA_PROVIDERS = "tadawul,argaam,yahoo_chart"
 DEFAULT_GLOBAL_PROVIDERS = "yahoo_chart,yahoo_fundamentals,finnhub,eodhd"
@@ -283,7 +326,6 @@ PROVIDER_PRIORITIES = {
     "eodhd": 60,
 }
 
-# Candidate module paths for each provider (try in order)
 PROVIDER_MODULE_CANDIDATES: Dict[str, List[str]] = {
     "tadawul": ["providers.tadawul_provider", "core.providers.tadawul_provider"],
     "argaam": ["providers.argaam_provider", "core.providers.argaam_provider"],
@@ -293,7 +335,6 @@ PROVIDER_MODULE_CANDIDATES: Dict[str, List[str]] = {
     "eodhd": ["providers.eodhd_provider", "core.providers.eodhd_provider"],
 }
 
-# Preferred function names (we will also try fallbacks)
 PROVIDER_FUNCTIONS: Dict[str, List[str]] = {
     "tadawul": ["fetch_enriched_quote_patch", "fetch_quote_patch", "fetch_patch"],
     "argaam": ["fetch_enriched_quote_patch", "fetch_quote_patch", "fetch_patch"],
@@ -303,16 +344,16 @@ PROVIDER_FUNCTIONS: Dict[str, List[str]] = {
     "eodhd": ["fetch_enriched_quote_patch", "fetch_quote_patch", "fetch_patch"],
 }
 
+
 def _import_provider(provider_name: str) -> Tuple[Optional[Any], Optional[str]]:
-    candidates = PROVIDER_MODULE_CANDIDATES.get(provider_name, [])
-    last_err = None
-    for module_path in candidates:
+    last_err: Optional[str] = None
+    for module_path in PROVIDER_MODULE_CANDIDATES.get(provider_name, []):
         try:
             return import_module(module_path), None
         except Exception as e:
             last_err = f"{module_path}: {e!r}"
-            continue
     return None, last_err or "no candidates"
+
 
 def _pick_provider_callable(module: Any, provider_name: str) -> Optional[Callable]:
     for fn_name in PROVIDER_FUNCTIONS.get(provider_name, ["fetch_enriched_quote_patch"]):
@@ -321,16 +362,17 @@ def _pick_provider_callable(module: Any, provider_name: str) -> Optional[Callabl
             return fn
     return None
 
+
 async def _call_maybe_async(fn: Callable, *args, **kwargs) -> Any:
     out = fn(*args, **kwargs)
     if asyncio.iscoroutine(out) or asyncio.isfuture(out):
         return await out
     return out
 
+
 # ============================================================================
 # Provider Stats / Registry
 # ============================================================================
-
 @dataclass(slots=True)
 class ProviderStats:
     name: str
@@ -341,6 +383,7 @@ class ProviderStats:
     circuit_open_until: Optional[datetime] = None
     last_error: Optional[str] = None
     last_import_error: Optional[str] = None
+    last_import_attempt_utc: float = 0.0
 
     @property
     def avg_latency_ms(self) -> float:
@@ -353,7 +396,9 @@ class ProviderStats:
 
     @property
     def is_circuit_open(self) -> bool:
-        return _now_utc() < self.circuit_open_until if self.circuit_open_until else False
+        if not self.circuit_open_until:
+            return False
+        return datetime.now(timezone.utc) < self.circuit_open_until
 
     def record_success(self, latency_ms: float) -> None:
         self.success_count += 1
@@ -370,20 +415,38 @@ class ProviderStats:
         threshold = _get_env_int("PROVIDER_CIRCUIT_BREAKER_THRESHOLD", 5)
         cooldown = _get_env_int("PROVIDER_CIRCUIT_BREAKER_COOLDOWN", 60)
         if self.consecutive_failures >= threshold:
-            self.circuit_open_until = _now_utc() + timedelta(seconds=cooldown)
+            self.circuit_open_until = datetime.now(timezone.utc) + timedelta(seconds=cooldown)
+
 
 class ProviderRegistry:
+    """
+    Keeps provider module + stats.
+    If initial import fails, we retry import periodically (every PROVIDER_IMPORT_RETRY_SEC).
+    """
+
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self._providers: Dict[str, Tuple[Optional[Any], ProviderStats]] = {}
 
     async def get_provider(self, name: str) -> Tuple[Optional[Any], ProviderStats]:
+        retry_sec = _get_env_int("PROVIDER_IMPORT_RETRY_SEC", 60)
+        now = time.time()
         async with self._lock:
             if name not in self._providers:
                 module, import_err = _import_provider(name)
-                stats = ProviderStats(name=name, last_import_error=import_err)
+                stats = ProviderStats(name=name, last_import_error=import_err, last_import_attempt_utc=now)
                 self._providers[name] = (module, stats)
-            return self._providers[name]
+                return self._providers[name]
+
+            module, stats = self._providers[name]
+            # retry import if failed and enough time passed
+            if module is None and stats.last_import_error and (now - stats.last_import_attempt_utc) >= retry_sec:
+                module2, import_err2 = _import_provider(name)
+                stats.last_import_error = import_err2
+                stats.last_import_attempt_utc = now
+                self._providers[name] = (module2, stats)
+                module = module2
+            return module, stats
 
     async def record_success(self, name: str, latency_ms: float) -> None:
         async with self._lock:
@@ -397,7 +460,7 @@ class ProviderRegistry:
 
     async def get_stats(self) -> Dict[str, Any]:
         async with self._lock:
-            out = {}
+            out: Dict[str, Any] = {}
             for name, (_, s) in self._providers.items():
                 out[name] = {
                     "success": s.success_count,
@@ -410,8 +473,9 @@ class ProviderRegistry:
                 }
             return out
 
+
 # ============================================================================
-# Cache (L1 memory + optional disk)
+# Cache (L1 memory + disk)
 # ============================================================================
 class MultiLevelCache:
     def __init__(self, name: str, l1_ttl: int = 60, l3_ttl: int = 3600, max_l1_size: int = 5000):
@@ -447,6 +511,7 @@ class MultiLevelCache:
     async def get(self, **kwargs) -> Optional[Any]:
         key = self._key(**kwargs)
         now = time.time()
+
         async with self._lock:
             if key in self._l1:
                 val, exp = self._l1[key]
@@ -470,20 +535,21 @@ class MultiLevelCache:
     async def set(self, value: Any, **kwargs) -> None:
         key = self._key(**kwargs)
         now = time.time()
+
         async with self._lock:
-            if len(self._l1) >= self.max_l1_size:
+            if len(self._l1) >= self.max_l1_size and self._l1_access:
                 oldest = min(self._l1_access.items(), key=lambda x: x[1])[0]
                 self._l1.pop(oldest, None)
                 self._l1_access.pop(oldest, None)
             self._l1[key] = (value, now + self.l1_ttl)
             self._l1_access[key] = now
 
-        # disk write async-ish
         try:
             with open(os.path.join(self._dir, key), "wb") as f:
                 f.write(self._compress(value))
         except Exception:
             pass
+
 
 # ============================================================================
 # SingleFlight
@@ -512,13 +578,14 @@ class SingleFlight:
             async with self._lock:
                 self._calls.pop(key, None)
 
+
 # ============================================================================
-# DataEngineV4
+# DataEngineV4 (v5.1.1)
 # ============================================================================
 class DataEngineV4:
     def __init__(self, settings: Any = None):
         self.settings = settings
-        self.version = "5.1.1"
+        self.version = __version__
 
         self.enabled_providers = _get_env_list("ENABLED_PROVIDERS", DEFAULT_PROVIDERS)
         self.ksa_providers = _get_env_list("KSA_PROVIDERS", DEFAULT_KSA_PROVIDERS)
@@ -558,71 +625,83 @@ class DataEngineV4:
                 return symbol
         return symbol
 
-    async def _fetch_patch(self, provider: str, symbol: str) -> Tuple[str, Optional[Dict[str, Any]], float, Optional[str]]:
+    async def _fetch_patch(
+        self, provider: str, symbol: str
+    ) -> Tuple[str, Optional[Dict[str, Any]], float, Optional[str]]:
         start = time.time()
-        module, stats = await self._registry.get_provider(provider)
 
-        if stats.is_circuit_open:
-            return provider, None, 0.0, "circuit_open"
-
-        if module is None:
-            err = stats.last_import_error or "provider module missing"
-            await self._registry.record_failure(provider, err)
-            return provider, None, (time.time() - start) * 1000, err
-
-        fn = _pick_provider_callable(module, provider)
-        if fn is None:
-            err = f"no callable fetch function for provider '{provider}'"
-            await self._registry.record_failure(provider, err)
-            return provider, None, (time.time() - start) * 1000, err
-
-        provider_symbol = self._provider_symbol(provider, symbol)
-
+        await self._sem.acquire()
         try:
-            # timeout wrapper compatible with py3.11+ and safe fallback
+            module, stats = await self._registry.get_provider(provider)
+
+            if stats.is_circuit_open:
+                return provider, None, 0.0, "circuit_open"
+
+            if module is None:
+                err = stats.last_import_error or "provider module missing"
+                await self._registry.record_failure(provider, err)
+                return provider, None, (time.time() - start) * 1000, err
+
+            fn = _pick_provider_callable(module, provider)
+            if fn is None:
+                err = f"no callable fetch function for provider '{provider}'"
+                await self._registry.record_failure(provider, err)
+                return provider, None, (time.time() - start) * 1000, err
+
+            provider_symbol = self._provider_symbol(provider, symbol)
+
             try:
-                async with asyncio.timeout(self.request_timeout):
-                    res = await _call_maybe_async(fn, provider_symbol)
-            except AttributeError:
-                res = await asyncio.wait_for(_call_maybe_async(fn, provider_symbol), timeout=self.request_timeout)
+                # Python 3.11+ fast timeout
+                try:
+                    async with asyncio.timeout(self.request_timeout):
+                        res = await _call_maybe_async(fn, provider_symbol)
+                except AttributeError:
+                    res = await asyncio.wait_for(_call_maybe_async(fn, provider_symbol), timeout=self.request_timeout)
 
-            latency = (time.time() - start) * 1000
-            if isinstance(res, dict) and res and "error" not in res:
-                res2 = _normalize_patch_keys(_clean_patch(res))
-                await self._registry.record_success(provider, latency)
-                return provider, res2, latency, None
+                latency = (time.time() - start) * 1000
 
-            # dict but error or empty
-            err = None
-            if isinstance(res, dict):
-                err = res.get("error") or "empty_result"
-            else:
-                err = "non_dict_result"
-            await self._registry.record_failure(provider, str(err))
-            return provider, None, latency, str(err)
+                if isinstance(res, dict) and res and "error" not in res:
+                    patch = _normalize_patch_keys(_clean_patch(res))
+                    await self._registry.record_success(provider, latency)
+                    return provider, patch, latency, None
 
-        except Exception as e:
-            latency = (time.time() - start) * 1000
-            await self._registry.record_failure(provider, repr(e))
-            return provider, None, latency, repr(e)
+                err = "empty_result"
+                if isinstance(res, dict):
+                    err = str(res.get("error") or "empty_result")
+                else:
+                    err = "non_dict_result"
 
-    def _merge(self, symbol: str, norm: str, patches: List[Tuple[str, Dict[str, Any], float]]) -> Dict[str, Any]:
+                await self._registry.record_failure(provider, err)
+                return provider, None, latency, err
+
+            except Exception as e:
+                latency = (time.time() - start) * 1000
+                await self._registry.record_failure(provider, repr(e))
+                return provider, None, latency, repr(e)
+
+        finally:
+            self._sem.release()
+
+    def _merge(self, requested_symbol: str, norm: str, patches: List[Tuple[str, Dict[str, Any], float]]) -> Dict[str, Any]:
         merged: Dict[str, Any] = {
             "symbol": norm,
             "symbol_normalized": norm,
-            "requested_symbol": symbol,
+            "requested_symbol": requested_symbol,
             "last_updated_utc": _now_utc_iso(),
             "last_updated_riyadh": _now_riyadh_iso(),
             "data_sources": [],
             "provider_latency": {},
         }
 
+        protected = {"symbol", "symbol_normalized", "requested_symbol"}
+
         for prov, patch, latency in patches:
             merged["data_sources"].append(prov)
             merged["provider_latency"][prov] = round(latency, 2)
 
-            # prefer fill-missing strategy
             for k, v in patch.items():
+                if k in protected:
+                    continue
                 if v is None:
                     continue
                 if k not in merged or merged.get(k) in (None, "", 0):
@@ -637,9 +716,10 @@ class DataEngineV4:
         return merged
 
     def _data_quality(self, quote: UnifiedQuote) -> str:
-        # minimal: requires current_price
         cp = getattr(quote, "current_price", None)
-        return QuoteQuality.MISSING.value if not cp else QuoteQuality.GOOD.value
+        if _safe_float(cp) is None:
+            return QuoteQuality.MISSING.value
+        return QuoteQuality.GOOD.value
 
     async def get_enriched_quote(self, symbol: str, use_cache: bool = True) -> UnifiedQuote:
         return await self._singleflight.execute(f"quote:{symbol}", lambda: self._get_enriched_quote_impl(symbol, use_cache))
@@ -664,40 +744,47 @@ class DataEngineV4:
         if not providers:
             return UnifiedQuote(symbol=norm, data_quality=QuoteQuality.MISSING.value, error="No providers available")  # type: ignore
 
-        # take top 3 by priority
         top = providers[:3]
+        gathered = await asyncio.gather(*[self._fetch_patch(p, norm) for p in top], return_exceptions=True)
 
         results: List[Tuple[str, Optional[Dict[str, Any]], float, Optional[str]]] = []
-        async with self._sem:
-            gathered = await asyncio.gather(*[self._fetch_patch(p, norm) for p in top], return_exceptions=True)
         for r in gathered:
             if isinstance(r, tuple) and len(r) == 4:
                 results.append(r)
 
-        patches_ok: List[Tuple[str, Dict[str, Any], float]] = [(p, patch, lat) for (p, patch, lat, err) in results if patch]
+        patches_ok: List[Tuple[str, Dict[str, Any], float]] = [(p, patch, lat) for (p, patch, lat, _) in results if patch]
 
         if not patches_ok:
-            # build helpful error message
             stats = await self._registry.get_stats()
             err_detail = {
-                "symbol": symbol,
+                "requested": symbol,
                 "normalized": norm,
                 "attempted_providers": top,
                 "provider_stats": {k: stats.get(k) for k in top},
-                "errors": [{ "provider": p, "error": err, "latency_ms": round(lat, 2) } for (p, _, lat, err) in results],
+                "errors": [{"provider": p, "error": err, "latency_ms": round(lat, 2)} for (p, _, lat, err) in results],
             }
-            return UnifiedQuote(symbol=norm, data_quality=QuoteQuality.MISSING.value, error="No data available", debug=err_detail)  # type: ignore
+            # keep debug safely stringified (schema-safe)
+            return UnifiedQuote(
+                symbol=norm,
+                symbol_normalized=norm,
+                requested_symbol=symbol,
+                data_quality=QuoteQuality.MISSING.value,
+                error="No data available",
+                info=json_dumps(err_detail),
+                data_sources=[],
+                provider_latency={},
+                last_updated_utc=_now_utc_iso(),
+                last_updated_riyadh=_now_riyadh_iso(),
+            )  # type: ignore
 
         merged = self._merge(symbol, norm, patches_ok)
         quote = UnifiedQuote(**merged)
 
-        # derive data_quality
         try:
             quote.data_quality = self._data_quality(quote)  # type: ignore
         except Exception:
             pass
 
-        # cache
         if use_cache:
             await self._cache.set(_model_to_dict(quote), symbol=norm)
 
@@ -709,7 +796,7 @@ class DataEngineV4:
         batch = _get_env_int("BATCH_SIZE", 15)
         out: List[UnifiedQuote] = []
         for i in range(0, len(symbols), batch):
-            part = symbols[i:i + batch]
+            part = symbols[i : i + batch]
             out.extend(await asyncio.gather(*[self.get_enriched_quote(s) for s in part]))
         return out
 
@@ -728,11 +815,13 @@ class DataEngineV4:
             "provider_stats": await self._registry.get_stats(),
         }
 
+
 # ============================================================================
 # Singleton exports
 # ============================================================================
 _ENGINE_INSTANCE: Optional[DataEngineV4] = None
 _ENGINE_LOCK = asyncio.Lock()
+
 
 async def get_engine() -> DataEngineV4:
     global _ENGINE_INSTANCE
@@ -742,22 +831,33 @@ async def get_engine() -> DataEngineV4:
                 _ENGINE_INSTANCE = DataEngineV4()
     return _ENGINE_INSTANCE
 
+
 async def close_engine() -> None:
     global _ENGINE_INSTANCE
     if _ENGINE_INSTANCE:
         await _ENGINE_INSTANCE.aclose()
         _ENGINE_INSTANCE = None
 
+
 def get_cache() -> Any:
     global _ENGINE_INSTANCE
     return getattr(_ENGINE_INSTANCE, "_cache", None)
+
 
 DataEngine = DataEngineV4
 DataEngineV2 = DataEngineV4
 DataEngineV3 = DataEngineV4
 
 __all__ = [
-    "DataEngineV4", "DataEngineV3", "DataEngineV2", "DataEngine",
-    "get_engine", "close_engine", "get_cache",
-    "QuoteQuality", "MarketRegime", "DataSource",
+    "DataEngineV4",
+    "DataEngineV3",
+    "DataEngineV2",
+    "DataEngine",
+    "get_engine",
+    "close_engine",
+    "get_cache",
+    "QuoteQuality",
+    "MarketRegime",
+    "DataSource",
+    "__version__",
 ]
