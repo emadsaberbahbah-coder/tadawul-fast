@@ -2,134 +2,78 @@
 """
 core/providers/argaam_provider.py
 ===============================================================
-Argaam Provider (KSA Market Data) — v4.0.0 (Next-Gen Enterprise)
-PROD SAFE + ASYNC + ADVANCED ML + HIGH-FREQ CAPABLE
+Argaam Provider (KSA Market Data) — v4.1.0 (RELIABILITY + ROUTER COMPAT)
+PROD SAFE + ASYNC + ENGINE PATCH FORMAT
 
-What's new in v4.0.0:
-- ✅ ADDED: XGBoost integration for superior ML forecasting accuracy.
-- ✅ ADDED: Actual statsmodels ARIMA integration (with random-walk fallback).
-- ✅ ADDED: High-performance JSON parsing via `orjson` (if available).
-- ✅ ADDED: Exponential Backoff with 'Full Jitter' to prevent thundering herds.
-- ✅ ADDED: Dynamic Circuit Breaker with progressive timeout scaling.
-- ✅ ADDED: Ichimoku Cloud and Stochastic Oscillator indicators.
-- ✅ ADDED: SuperTrend directional momentum indicator.
-- ✅ ADDED: Strict Type Coercion for NaN/Inf anomalies.
-- ✅ ENHANCED: Memory management using zero-copy slicing where possible.
-- ✅ ENHANCED: Market Regime Detection using statistical rolling distributions.
+Why this revision:
+- Fixes KSA router health: adds a real provider object + get_provider() factory
+- Fixes engine behavior: NEVER returns {} on failure (returns {"error": "..."} instead)
+- Works whether caller is:
+    - DataEngineV4 (expects fetch_enriched_quote_patch / fetch_patch style functions)
+    - KSA router (expects get_provider()/provider object with get_quote/quote)
+- Supports URL templates via env (no hard-coded Argaam endpoints):
+    ARGAAM_QUOTE_URL   e.g. "https://.../quote?symbol={symbol}"
+    ARGAAM_PROFILE_URL e.g. "https://.../profile?symbol={symbol}"
+    ARGAAM_HISTORY_URL e.g. "https://.../history?symbol={symbol}"
+  Notes:
+    - {symbol} will be filled with BOTH "2222" and "2222.SR" variants automatically.
+    - If URLs are not configured, provider returns a clear error (not empty dict).
 
-Core Capabilities:
-- Enterprise-grade async API client with comprehensive error handling
-- Multi-model ensemble forecasting (XGBoost, ARIMA, Random Forest, Seasonal)
-- Market regime detection and sentiment analysis
-- Advanced technical indicators suite
-- Smart anomaly detection for data quality
-- Adaptive rate limiting with token bucket
-- Circuit breaker with half-open state and progressive cooldowns
-- Distributed tracing and Prometheus metrics
-- Memory-efficient streaming parsers for large histories
-- Advanced caching with TTL and LRU
-- Full async/await with connection pooling
+Exports:
+- fetch_enriched_quote_patch(symbol)  -> dict patch
+- fetch_patch(symbol)                -> alias
+- get_provider() / provider          -> router compatibility
 """
 
 from __future__ import annotations
 
 import asyncio
-import functools
-import hashlib
 import json
 import logging
 import math
 import os
 import random
 import re
-import threading
 import time
 import uuid
-from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from enum import Enum
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
-
-import httpx
-import numpy as np
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 # ---------------------------------------------------------------------------
-# High-Performance JSON fallback
+# Optional deps (keep PROD safe)
 # ---------------------------------------------------------------------------
 try:
-    import orjson
-    def json_loads(data: Union[str, bytes]) -> Any:
-        return orjson.loads(data)
-except ImportError:
-    def json_loads(data: Union[str, bytes]) -> Any:
-        return json.loads(data)
-
-# ---------------------------------------------------------------------------
-# Optional Scientific & ML Stack
-# ---------------------------------------------------------------------------
-try:
-    from scipy import stats
-    SCIPY_AVAILABLE = True
-except ImportError:
-    SCIPY_AVAILABLE = False
+    import httpx  # type: ignore
+    _HTTPX_AVAILABLE = True
+except Exception:
+    httpx = None  # type: ignore
+    _HTTPX_AVAILABLE = False
 
 try:
-    from sklearn.linear_model import LinearRegression
-    from sklearn.ensemble import RandomForestRegressor
-    SKLEARN_AVAILABLE = True
-except ImportError:
-    SKLEARN_AVAILABLE = False
-
-try:
-    import xgboost as xgb
-    XGB_AVAILABLE = True
-except ImportError:
-    XGB_AVAILABLE = False
-
-try:
-    from statsmodels.tsa.arima.model import ARIMA as StatsARIMA
-    import warnings
-    from statsmodels.tools.sm_exceptions import ConvergenceWarning
-    warnings.simplefilter('ignore', ConvergenceWarning)
-    STATSMODELS_AVAILABLE = True
-except ImportError:
-    STATSMODELS_AVAILABLE = False
-
-# ---------------------------------------------------------------------------
-# Tracing and Metrics Stack
-# ---------------------------------------------------------------------------
-try:
-    from opentelemetry import trace
-    from opentelemetry.trace import Status, StatusCode
-    _OTEL_AVAILABLE = True
-except ImportError:
-    _OTEL_AVAILABLE = False
-    trace = None
-
-try:
-    from prometheus_client import Counter, Histogram, Gauge
-    _PROMETHEUS_AVAILABLE = True
-except ImportError:
-    _PROMETHEUS_AVAILABLE = False
+    import orjson  # type: ignore
+    def _json_loads(b: Union[str, bytes]) -> Any:
+        return orjson.loads(b)
+except Exception:
+    def _json_loads(b: Union[str, bytes]) -> Any:
+        return json.loads(b)
 
 logger = logging.getLogger("core.providers.argaam_provider")
 
 PROVIDER_NAME = "argaam"
-PROVIDER_VERSION = "4.0.0"
+PROVIDER_VERSION = "4.1.0"
 
-# ============================================================================
-# Configuration & Constants
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+DEFAULT_TIMEOUT_SEC = float(os.getenv("ARGAAM_TIMEOUT_SEC", "20") or "20")
+DEFAULT_RETRY_ATTEMPTS = int(os.getenv("ARGAAM_RETRY_ATTEMPTS", "3") or "3")
+DEFAULT_MAX_CONCURRENCY = int(os.getenv("ARGAAM_MAX_CONCURRENCY", "10") or "10")
+DEFAULT_CACHE_TTL_SEC = float(os.getenv("ARGAAM_CACHE_TTL_SEC", "20") or "20")
 
-DEFAULT_TIMEOUT_SEC = 25.0
-DEFAULT_RETRY_ATTEMPTS = 4
-DEFAULT_MAX_CONCURRENCY = 40
-DEFAULT_RATE_LIMIT = 15.0  # requests per second
-DEFAULT_CIRCUIT_BREAKER_THRESHOLD = 5
-DEFAULT_CIRCUIT_BREAKER_TIMEOUT = 30.0
-DEFAULT_QUEUE_SIZE = 2000
-DEFAULT_PRIORITY_LEVELS = 4
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled"}
+_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+_KSA_CODE_RE = re.compile(r"^\d{3,6}$")
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -137,82 +81,23 @@ USER_AGENT = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
-_TRUTHY = {"1", "true", "yes", "y", "on", "t"}
-_FALSY = {"0", "false", "no", "n", "off", "f"}
+# URL templates (must be set in env to actually fetch data)
+ARGAAM_QUOTE_URL = (os.getenv("ARGAAM_QUOTE_URL") or "").strip()
+ARGAAM_PROFILE_URL = (os.getenv("ARGAAM_PROFILE_URL") or "").strip()
+ARGAAM_HISTORY_URL = (os.getenv("ARGAAM_HISTORY_URL") or "").strip()
 
-_KSA_CODE_RE = re.compile(r"^\d{3,6}$", re.IGNORECASE)
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
 
-_TRACING_ENABLED = os.getenv("ARGAAM_TRACING_ENABLED", "").strip().lower() in _TRUTHY
-_METRICS_ENABLED = os.getenv("ARGAAM_METRICS_ENABLED", "").strip().lower() in _TRUTHY
+def _now_utc_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-
-class CircuitState(Enum):
-    CLOSED = "closed"
-    OPEN = "open"
-    HALF_OPEN = "half_open"
-
-
-class MarketRegime(Enum):
-    BULL = "bull"
-    BEAR = "bear"
-    VOLATILE = "volatile"
-    SIDEWAYS = "sideways"
-    UNKNOWN = "unknown"
-
-
-class Sentiment(Enum):
-    BULLISH = "bullish"
-    BEARISH = "bearish"
-    NEUTRAL = "neutral"
-    VERY_BULLISH = "very_bullish"
-    VERY_BEARISH = "very_bearish"
-
-
-class RequestPriority(Enum):
-    LOW = 0
-    NORMAL = 1
-    HIGH = 2
-    CRITICAL = 3
-
-
-@dataclass
-class CircuitBreakerStats:
-    failures: int = 0
-    successes: int = 0
-    last_failure: float = 0.0
-    last_success: float = 0.0
-    state: CircuitState = CircuitState.CLOSED
-    open_until: float = 0.0
-    total_failures: int = 0
-    total_successes: int = 0
-    current_cooldown: float = DEFAULT_CIRCUIT_BREAKER_TIMEOUT
-
-
-@dataclass
-class RequestQueueItem:
-    priority: RequestPriority
-    url: str
-    endpoint_type: str
-    cache_key: Optional[str]
-    use_cache: bool
-    future: asyncio.Future
-    created_at: float = field(default_factory=time.time)
-
-
-# ============================================================================
-# Core Environment & Utility Helpers
-# ============================================================================
-
-def _env_bool(name: str, default: bool = True) -> bool:
+def _env_bool(name: str, default: bool = False) -> bool:
     raw = (os.getenv(name) or "").strip().lower()
     if not raw:
         return default
-    if raw in _FALSY:
-        return False
-    if raw in _TRUTHY:
-        return True
-    return default
+    return raw in _TRUTHY
 
 def _safe_float(val: Any) -> Optional[float]:
     if val is None:
@@ -225,14 +110,15 @@ def _safe_float(val: Any) -> Optional[float]:
             return f
 
         s = str(val).strip()
-        if not s or s in {"-", "—", "N/A", "NA", "null", "None"}:
+        if not s or s.lower() in {"-", "—", "n/a", "na", "null", "none"}:
             return None
 
         s = s.translate(_ARABIC_DIGITS)
         s = s.replace("٬", ",").replace("٫", ".")
         s = s.replace("−", "-")
-        s = s.replace("SAR", "").replace("ريال", "").replace("USD", "").strip()
-        s = s.replace("%", "").replace(",", "").replace("+", "").strip()
+        s = s.replace("%", "")
+        s = s.replace(",", "")
+        s = s.replace("SAR", "").replace("ريال", "").strip()
 
         if s.startswith("(") and s.endswith(")"):
             s = "-" + s[1:-1].strip()
@@ -261,7 +147,7 @@ def normalize_ksa_symbol(symbol: str) -> str:
     if raw.startswith("TADAWUL:"):
         raw = raw.split(":", 1)[1].strip()
     if raw.endswith(".TADAWUL"):
-        raw = raw.replace(".TADAWUL", "").strip()
+        raw = raw[:-len(".TADAWUL")].strip()
 
     if raw.endswith(".SR"):
         code = raw[:-3].strip()
@@ -271,553 +157,356 @@ def normalize_ksa_symbol(symbol: str) -> str:
         return f"{raw}.SR"
     return ""
 
-def _unwrap_common_envelopes(data: Union[dict, list]) -> Union[dict, list]:
-    current = data
+def _ksa_code(symbol_norm: str) -> str:
+    # "2222.SR" -> "2222"
+    s = (symbol_norm or "").strip().upper()
+    return s[:-3] if s.endswith(".SR") else s
+
+def _unwrap_common_envelopes(data: Any) -> Any:
+    cur = data
     for _ in range(4):
-        if isinstance(current, dict):
-            found = False
-            for key in ("data", "result", "payload", "response", "items", "results"):
-                if key in current and isinstance(current[key], (dict, list)):
-                    current = current[key]
-                    found = True
+        if isinstance(cur, dict):
+            for k in ("data", "result", "payload", "response", "items", "results"):
+                if k in cur and isinstance(cur[k], (dict, list)):
+                    cur = cur[k]
                     break
-            if not found:
+            else:
                 break
         else:
             break
-    return current
+    return cur
 
-# ============================================================================
-# Tracing & Metrics
-# ============================================================================
+def _first_existing(d: Dict[str, Any], keys: List[str]) -> Any:
+    for k in keys:
+        if k in d and d[k] is not None and d[k] != "":
+            return d[k]
+    return None
 
-class TraceContext:
-    def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
-        self.name = name
-        self.attributes = attributes or {}
-        self.tracer = trace.get_tracer(__name__) if _OTEL_AVAILABLE and _TRACING_ENABLED else None
-        self.span = None
+def _normalize_patch_keys(patch: Dict[str, Any]) -> Dict[str, Any]:
+    # Engine expects current_price / previous_close etc.
+    aliases = {
+        "price": "current_price",
+        "last_price": "current_price",
+        "last": "current_price",
+        "close": "previous_close",
+        "prev_close": "previous_close",
+        "change": "price_change",
+        "change_pct": "percent_change",
+        "change_percent": "percent_change",
+        "pct_change": "percent_change",
+        "open": "day_open",
+        "high": "day_high",
+        "low": "day_low",
+    }
+    out = dict(patch or {})
+    for src, dst in aliases.items():
+        if src in out and (dst not in out or out.get(dst) in (None, "", 0)):
+            out[dst] = out.get(src)
+    # keep coherence
+    if out.get("current_price") is not None and out.get("price") in (None, "", 0):
+        out["price"] = out.get("current_price")
+    if out.get("price") is not None and out.get("current_price") in (None, "", 0):
+        out["current_price"] = out.get("price")
+    return out
 
-    async def __aenter__(self):
-        if self.tracer:
-            self.span = self.tracer.start_span(self.name)
-            if self.attributes:
-                self.span.set_attributes(self.attributes)
-        return self
+def _error_patch(symbol: str, message: str, *, requested_symbol: Optional[str] = None) -> Dict[str, Any]:
+    return {
+        "symbol": normalize_ksa_symbol(symbol) or symbol,
+        "requested_symbol": requested_symbol or symbol,
+        "provider": PROVIDER_NAME,
+        "provider_version": PROVIDER_VERSION,
+        "data_quality": "MISSING",
+        "error": message,
+        "last_updated_utc": _now_utc_iso(),
+    }
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.span and _OTEL_AVAILABLE:
-            if exc_val:
-                self.span.record_exception(exc_val)
-                self.span.set_status(Status(StatusCode.ERROR, str(exc_val)))
-            self.span.end()
+# ---------------------------------------------------------------------------
+# Simple TTL cache (in-memory)
+# ---------------------------------------------------------------------------
 
-def _trace(name: Optional[str] = None):
-    def decorator(func):
-        @functools.wraps(func)
-        async def wrapper(*args, **kwargs):
-            trace_name = name or func.__name__
-            async with TraceContext(trace_name, {"function": func.__name__}):
-                return await func(*args, **kwargs)
-        return wrapper
-    return decorator
+@dataclass
+class _CacheItem:
+    exp: float
+    value: Any
 
-# ============================================================================
-# Advanced Technical Indicators
-# ============================================================================
-
-class TechnicalIndicators:
-    """Comprehensive suite of financial technical indicators."""
-    
-    @staticmethod
-    def sma(prices: List[float], window: int) -> List[Optional[float]]:
-        if len(prices) < window: return [None] * len(prices)
-        result = [None] * (window - 1)
-        for i in range(window - 1, len(prices)):
-            result.append(sum(prices[i - window + 1:i + 1]) / window)
-        return result
-    
-    @staticmethod
-    def ema(prices: List[float], window: int) -> List[Optional[float]]:
-        if len(prices) < window: return [None] * len(prices)
-        result = [None] * (window - 1)
-        multiplier = 2.0 / (window + 1)
-        ema = sum(prices[:window]) / window
-        result.append(ema)
-        for price in prices[window:]:
-            ema = (price - ema) * multiplier + ema
-            result.append(ema)
-        return result
-    
-    @staticmethod
-    def macd(prices: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> Dict[str, List[Optional[float]]]:
-        if len(prices) < slow:
-            return {"macd": [None]*len(prices), "signal": [None]*len(prices), "histogram": [None]*len(prices)}
-        ema_f, ema_s = TechnicalIndicators.ema(prices, fast), TechnicalIndicators.ema(prices, slow)
-        macd_line = [f - s if f is not None and s is not None else None for f, s in zip(ema_f, ema_s)]
-        valid_macd = [x for x in macd_line if x is not None]
-        sig_line = TechnicalIndicators.ema(valid_macd, signal)
-        padded_sig = [None] * (len(prices) - len(sig_line)) + sig_line
-        hist = [m - s if m is not None and s is not None else None for m, s in zip(macd_line, padded_sig)]
-        return {"macd": macd_line, "signal": padded_sig, "histogram": hist}
-
-    @staticmethod
-    def rsi(prices: List[float], window: int = 14) -> List[Optional[float]]:
-        if len(prices) < window + 1: return [None] * len(prices)
-        deltas = np.diff(prices)
-        result = [None] * window
-        
-        # Initial smoothing
-        window_deltas = deltas[:window]
-        avg_gain = sum(d for d in window_deltas if d > 0) / window
-        avg_loss = sum(-d for d in window_deltas if d < 0) / window
-        
-        rs = avg_gain / avg_loss if avg_loss != 0 else float('inf')
-        result.append(100.0 - (100.0 / (1.0 + rs)) if avg_loss != 0 else 100.0)
-
-        for d in deltas[window:]:
-            gain = d if d > 0 else 0
-            loss = -d if d < 0 else 0
-            avg_gain = (avg_gain * (window - 1) + gain) / window
-            avg_loss = (avg_loss * (window - 1) + loss) / window
-            rs = avg_gain / avg_loss if avg_loss != 0 else float('inf')
-            result.append(100.0 - (100.0 / (1.0 + rs)) if avg_loss != 0 else 100.0)
-        return result
-
-    @staticmethod
-    def ichimoku_cloud(highs: List[float], lows: List[float], conversion: int = 9, base: int = 26, span: int = 52) -> Dict[str, List[Optional[float]]]:
-        """Calculates Ichimoku Cloud Components."""
-        length = len(highs)
-        tenkan_sen = [None] * length
-        kijun_sen = [None] * length
-        senkou_span_a = [None] * length
-        senkou_span_b = [None] * length
-
-        for i in range(length):
-            if i >= conversion - 1:
-                period_high = max(highs[i - conversion + 1:i + 1])
-                period_low = min(lows[i - conversion + 1:i + 1])
-                tenkan_sen[i] = (period_high + period_low) / 2
-                
-            if i >= base - 1:
-                period_high = max(highs[i - base + 1:i + 1])
-                period_low = min(lows[i - base + 1:i + 1])
-                kijun_sen[i] = (period_high + period_low) / 2
-                
-            if tenkan_sen[i] is not None and kijun_sen[i] is not None:
-                # Span A is shifted forward by base periods (handled by caller alignment usually, but kept raw here)
-                senkou_span_a[i] = (tenkan_sen[i] + kijun_sen[i]) / 2
-
-            if i >= span - 1:
-                period_high = max(highs[i - span + 1:i + 1])
-                period_low = min(lows[i - span + 1:i + 1])
-                senkou_span_b[i] = (period_high + period_low) / 2
-
-        return {
-            "tenkan_sen": tenkan_sen,
-            "kijun_sen": kijun_sen,
-            "senkou_span_a": senkou_span_a,
-            "senkou_span_b": senkou_span_b
-        }
-
-    @staticmethod
-    def stochastic_oscillator(highs: List[float], lows: List[float], closes: List[float], k_window: int = 14, d_window: int = 3) -> Dict[str, List[Optional[float]]]:
-        """Stochastic Oscillator %K and %D."""
-        length = len(closes)
-        k_line = [None] * length
-        for i in range(k_window - 1, length):
-            highest_high = max(highs[i - k_window + 1:i + 1])
-            lowest_low = min(lows[i - k_window + 1:i + 1])
-            if highest_high - lowest_low == 0:
-                k_line[i] = 50.0
-            else:
-                k_line[i] = 100 * ((closes[i] - lowest_low) / (highest_high - lowest_low))
-        
-        valid_k = [x for x in k_line if x is not None]
-        d_line = TechnicalIndicators.sma(valid_k, d_window)
-        padded_d = [None] * (length - len(d_line)) + d_line
-        return {"%k": k_line, "%d": padded_d}
-
-
-# ============================================================================
-# Advanced ML Ensemble Forecaster
-# ============================================================================
-
-class EnsembleForecaster:
-    """Multi-model ensemble utilizing Statsmodels, XGBoost, Random Forest, and Heuristics."""
-    
-    def __init__(self, prices: List[float], enable_ml: bool = True):
-        self.prices = prices
-        self.enable_ml = enable_ml
-        self.feature_importance: Dict[str, float] = {}
-
-    def forecast(self, horizon_days: int = 252) -> Dict[str, Any]:
-        if len(self.prices) < 50:
-            return {"forecast_available": False, "reason": "insufficient_history"}
-
-        results = {
-            "forecast_available": True, "horizon_days": horizon_days,
-            "models_used": [], "forecasts": {}, "ensemble": {},
-            "confidence": 0.0, "feature_importance": {}
-        }
-        
-        forecasts, weights = [], []
-
-        # 1. Trend Baseline
-        trend = self._forecast_trend(horizon_days)
-        if trend:
-            results["models_used"].append("trend")
-            results["forecasts"]["trend"] = trend
-            forecasts.append(trend["price"])
-            weights.append(0.15)
-
-        # 2. Real ARIMA (Statsmodels) or fallback
-        arima = self._forecast_arima(horizon_days)
-        if arima:
-            results["models_used"].append("arima")
-            results["forecasts"]["arima"] = arima
-            forecasts.append(arima["price"])
-            weights.append(0.3)
-
-        # 3. XGBoost / Random Forest
-        if self.enable_ml:
-            ml_forecast = self._forecast_ml(horizon_days)
-            if ml_forecast:
-                results["models_used"].append("ml_tree")
-                results["forecasts"]["ml_tree"] = ml_forecast
-                forecasts.append(ml_forecast["price"])
-                weights.append(0.55)
-
-        if not forecasts:
-            return {"forecast_available": False, "reason": "no_models_converged"}
-
-        ensemble_price = np.average(forecasts, weights=weights)
-        ensemble_std = np.std(forecasts) if len(forecasts) > 1 else ensemble_price * 0.05
-        
-        results["ensemble"] = {
-            "price": ensemble_price,
-            "roi_pct": (ensemble_price / self.prices[-1] - 1) * 100,
-            "std_dev": ensemble_std,
-            "price_range_low": ensemble_price - 1.96 * ensemble_std,
-            "price_range_high": ensemble_price + 1.96 * ensemble_std
-        }
-        results["confidence"] = self._calculate_confidence(results)
-        
-        return results
-
-    def _forecast_trend(self, horizon: int) -> Optional[Dict[str, Any]]:
-        try:
-            n = min(len(self.prices), 252)
-            y = np.log(self.prices[-n:])
-            x = np.arange(n).reshape(-1, 1)
-            
-            x_mean, y_mean = np.mean(x), np.mean(y)
-            slope = np.sum((x.flatten() - x_mean) * (y - y_mean)) / np.sum((x.flatten() - x_mean) ** 2)
-            intercept = y_mean - slope * x_mean
-            
-            future_x = n + horizon
-            price = np.exp(intercept + slope * future_x)
-            return {"price": float(price), "weight": 0.15}
-        except Exception:
-            return None
-
-    def _forecast_arima(self, horizon: int) -> Optional[Dict[str, Any]]:
-        try:
-            if STATSMODELS_AVAILABLE and len(self.prices) >= 100:
-                model = StatsARIMA(self.prices[-252:], order=(5, 1, 0)) # Simple AR(5) for momentum
-                fitted = model.fit()
-                forecast = fitted.forecast(steps=horizon)
-                price = float(forecast.iloc[-1])
-                return {"price": price, "weight": 0.3}
-        except Exception:
-            pass
-            
-        # Fallback to Random Walk with Drift
-        try:
-            recent = self.prices[-min(60, len(self.prices)):]
-            returns = np.diff(recent) / recent[:-1]
-            drift = np.mean(returns)
-            price = self.prices[-1] * ((1 + drift) ** horizon)
-            return {"price": float(price), "weight": 0.1}
-        except Exception:
-            return None
-
-    def _forecast_ml(self, horizon: int) -> Optional[Dict[str, Any]]:
-        if not SKLEARN_AVAILABLE or len(self.prices) < 100:
-            return None
-        
-        try:
-            X, y = [], []
-            for i in range(60, len(self.prices) - 5):
-                feats = [
-                    self.prices[i] / self.prices[i-w] - 1 for w in [5, 10, 20]
-                ]
-                vol = np.std([self.prices[j]/self.prices[j-1]-1 for j in range(i-20, i)])
-                feats.append(vol)
-                X.append(feats)
-                y.append(self.prices[i+5] / self.prices[i] - 1)
-            
-            if len(X) < 20: return None
-
-            if XGB_AVAILABLE:
-                model = xgb.XGBRegressor(n_estimators=50, max_depth=3, learning_rate=0.05, n_jobs=-1)
-            else:
-                model = RandomForestRegressor(n_estimators=50, max_depth=4, random_state=42)
-            
-            model.fit(X, y)
-            
-            curr_feats = [self.prices[-1]/self.prices[-1-w]-1 for w in [5, 10, 20]]
-            curr_vol = np.std(np.diff(self.prices[-21:]) / self.prices[-21:-1])
-            curr_feats.append(curr_vol)
-            
-            pred_return = model.predict([curr_feats])[0]
-            price = self.prices[-1] * (1 + pred_return) ** (horizon / 5)
-            
-            return {"price": float(price), "predicted_return": float(pred_return), "weight": 0.55}
-        except Exception as e:
-            logger.debug(f"ML forecast failed: {e}")
-            return None
-
-    def _calculate_confidence(self, results: Dict[str, Any]) -> float:
-        if not results.get("forecasts"): return 0.0
-        prices = [f["price"] for f in results["forecasts"].values()]
-        cv = np.std(prices) / np.mean(prices) if len(prices) > 1 and np.mean(prices) != 0 else 0.5
-        consistency = max(0, 100 - cv * 300)
-        return min(100, max(0, consistency))
-
-
-# ============================================================================
-# Dynamic Circuit Breaker
-# ============================================================================
-
-class DynamicCircuitBreaker:
-    """Circuit breaker that progressively scales timeouts for severe degradation."""
-    
-    def __init__(self, fail_threshold: int = 5, base_cooldown: float = 30.0):
-        self.fail_threshold = fail_threshold
-        self.base_cooldown = base_cooldown
-        self.stats = CircuitBreakerStats(current_cooldown=base_cooldown)
-        self.half_open_calls = 0
+class _TTLCache:
+    def __init__(self, max_size: int = 2000) -> None:
+        self._max = max_size
+        self._d: Dict[str, _CacheItem] = {}
         self._lock = asyncio.Lock()
 
-    async def allow_request(self) -> bool:
+    async def get(self, key: str) -> Any:
+        now = time.monotonic()
         async with self._lock:
-            now = time.monotonic()
-            if self.stats.state == CircuitState.CLOSED:
-                return True
-            elif self.stats.state == CircuitState.OPEN:
-                if now >= self.stats.open_until:
-                    self.stats.state = CircuitState.HALF_OPEN
-                    self.half_open_calls = 0
-                    return True
-                return False
-            elif self.stats.state == CircuitState.HALF_OPEN:
-                if self.half_open_calls < 2:
-                    self.half_open_calls += 1
-                    return True
-                return False
-            return False
+            it = self._d.get(key)
+            if not it:
+                return None
+            if now >= it.exp:
+                self._d.pop(key, None)
+                return None
+            return it.value
 
-    async def on_success(self) -> None:
+    async def set(self, key: str, value: Any, ttl: float) -> None:
+        now = time.monotonic()
         async with self._lock:
-            self.stats.successes += 1
-            if self.stats.state == CircuitState.HALF_OPEN:
-                self.stats.state = CircuitState.CLOSED
-                self.stats.failures = 0
-                self.stats.current_cooldown = self.base_cooldown
+            if len(self._d) >= self._max:
+                # random eviction (cheap + safe)
+                for k in random.sample(list(self._d.keys()), k=min(200, len(self._d))):
+                    self._d.pop(k, None)
+            self._d[key] = _CacheItem(exp=now + max(1.0, ttl), value=value)
 
-    async def on_failure(self, status_code: int = 500) -> None:
-        async with self._lock:
-            self.stats.failures += 1
-            # Progressive backoff for extreme failures (e.g., Auth or severe 429)
-            if status_code in (401, 403, 429):
-                self.stats.current_cooldown = min(300.0, self.stats.current_cooldown * 1.5)
-            
-            if self.stats.state == CircuitState.CLOSED and self.stats.failures >= self.fail_threshold:
-                self.stats.state = CircuitState.OPEN
-                self.stats.open_until = time.monotonic() + self.stats.current_cooldown
-            elif self.stats.state == CircuitState.HALF_OPEN:
-                self.stats.state = CircuitState.OPEN
-                self.stats.current_cooldown = min(300.0, self.stats.current_cooldown * 2)
-                self.stats.open_until = time.monotonic() + self.stats.current_cooldown
-
-
-# ============================================================================
-# Argaam Client implementation
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Client
+# ---------------------------------------------------------------------------
 
 class ArgaamClient:
-    """Next-Gen Async Argaam Client."""
-    
     def __init__(self) -> None:
         self.client_id = str(uuid.uuid4())[:8]
-        
-        self.quote_url = os.getenv("ARGAAM_QUOTE_URL", "")
-        self.profile_url = os.getenv("ARGAAM_PROFILE_URL", "")
-        self.history_url = os.getenv("ARGAAM_HISTORY_URL", "")
-        
-        self.retry_attempts = DEFAULT_RETRY_ATTEMPTS
-        
-        self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(DEFAULT_TIMEOUT_SEC),
-            limits=httpx.Limits(max_keepalive_connections=50, max_connections=100),
-            http2=True
-        )
-        
-        self.circuit_breaker = DynamicCircuitBreaker()
-        self.semaphore = asyncio.Semaphore(DEFAULT_MAX_CONCURRENCY)
-        
-        # Simple Memory Cache
-        self._cache: Dict[str, Tuple[float, Any]] = {}
-        self._cache_lock = asyncio.Lock()
+        self.quote_url = ARGAAM_QUOTE_URL
+        self.profile_url = ARGAAM_PROFILE_URL
+        self.history_url = ARGAAM_HISTORY_URL
 
-    def _base_headers(self) -> Dict[str, str]:
-        return {
-            "User-Agent": USER_AGENT,
-            "Accept": "application/json",
-            "X-Client-ID": self.client_id,
-        }
+        self.timeout_sec = DEFAULT_TIMEOUT_SEC
+        self.retry_attempts = max(1, DEFAULT_RETRY_ATTEMPTS)
+        self._sem = asyncio.Semaphore(max(1, DEFAULT_MAX_CONCURRENCY))
+        self._cache = _TTLCache(max_size=int(os.getenv("ARGAAM_CACHE_MAX", "2000") or "2000"))
 
-    @_trace("argaam_request")
-    async def _request(self, url: str, cache_key: str, cache_ttl: float = 60.0) -> Tuple[Optional[dict], Optional[str]]:
-        """Executes HTTP requests with Jitter-backoff, parsing via orjson, and CB protection."""
-        # 1. Cache Check
-        async with self._cache_lock:
-            if cache_key in self._cache:
-                exp, data = self._cache[cache_key]
-                if time.monotonic() < exp:
-                    return data, None
-                else:
-                    del self._cache[cache_key]
+        self._client = None
+        if _HTTPX_AVAILABLE:
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(self.timeout_sec),
+                limits=httpx.Limits(max_keepalive_connections=20, max_connections=40),
+                headers={
+                    "User-Agent": USER_AGENT,
+                    "Accept": "application/json",
+                    "X-Client-ID": self.client_id,
+                },
+            )
 
-        # 2. Circuit Breaker
-        if not await self.circuit_breaker.allow_request():
-            return None, "circuit_breaker_open"
+    def _is_configured(self) -> bool:
+        return bool(self.quote_url)
 
-        # 3. Execution with Semaphore & Retries (Full Jitter)
-        async with self.semaphore:
-            last_err = None
+    def _build_url_candidates(self, template: str, symbol_norm: str) -> List[str]:
+        """
+        Some APIs want "2222", others want "2222.SR".
+        We generate both candidates and try in order.
+        """
+        if not template:
+            return []
+        code = _ksa_code(symbol_norm)
+        full = symbol_norm
+        urls = []
+        # {symbol} placeholder
+        if "{symbol}" in template:
+            urls.append(template.replace("{symbol}", code))
+            if full != code:
+                urls.append(template.replace("{symbol}", full))
+        else:
+            # If user put a raw base URL without placeholder, try appending
+            urls.append(template.rstrip("/") + "/" + code)
+            if full != code:
+                urls.append(template.rstrip("/") + "/" + full)
+        # de-dupe
+        seen = set()
+        out = []
+        for u in urls:
+            if u and u not in seen:
+                seen.add(u)
+                out.append(u)
+        return out
+
+    async def _get_json(self, url: str, cache_key: str, ttl: float) -> Tuple[Optional[Any], Optional[str]]:
+        # cache
+        cached = await self._cache.get(cache_key)
+        if cached is not None:
+            return cached, None
+
+        if not self._client:
+            return None, "httpx_not_available"
+
+        async with self._sem:
+            last_err: Optional[str] = None
             for attempt in range(self.retry_attempts):
                 try:
-                    resp = await self._client.get(url, headers=self._base_headers())
-                    status = resp.status_code
-                    
-                    if status == 429:
-                        await self.circuit_breaker.on_failure(status)
-                        await asyncio.sleep(min(30, int(resp.headers.get("Retry-After", 5))))
-                        continue
-                        
-                    if 500 <= status < 600:
-                        await self.circuit_breaker.on_failure(status)
-                        # Full Jitter Exponential Backoff
-                        base_wait = 2 ** attempt
-                        jitter = random.uniform(0, base_wait)
-                        await asyncio.sleep(min(10.0, base_wait + jitter))
+                    r = await self._client.get(url)
+                    sc = int(getattr(r, "status_code", 0) or 0)
+
+                    if sc == 429:
+                        # backoff + retry
+                        wait = min(15.0, (2 ** attempt) + random.uniform(0, 1.0))
+                        await asyncio.sleep(wait)
+                        last_err = "rate_limited_429"
                         continue
 
-                    if status >= 400 and status != 404:
-                        return None, f"HTTP {status}"
+                    if 500 <= sc < 600:
+                        wait = min(10.0, (2 ** attempt) + random.uniform(0, 1.0))
+                        await asyncio.sleep(wait)
+                        last_err = f"server_error_{sc}"
+                        continue
 
-                    # Success -> Fast Parse
+                    if sc >= 400:
+                        return None, f"http_{sc}"
+
                     try:
-                        data = _unwrap_common_envelopes(json_loads(resp.content))
+                        payload = _unwrap_common_envelopes(_json_loads(r.content))
                     except Exception:
-                        return None, "invalid_json_payload"
+                        return None, "invalid_json"
 
-                    await self.circuit_breaker.on_success()
-                    
-                    # Store in Cache
-                    async with self._cache_lock:
-                        if len(self._cache) > 5000:
-                            # Rudimentary random eviction to prevent memory leaks
-                            keys_to_delete = random.sample(list(self._cache.keys()), 500)
-                            for k in keys_to_delete: self._cache.pop(k, None)
-                        self._cache[cache_key] = (time.monotonic() + cache_ttl, data)
-                        
-                    return data, None
-                    
-                except httpx.RequestError as e:
-                    last_err = f"network_error_{e.__class__.__name__}"
-                    base_wait = 2 ** attempt
-                    await asyncio.sleep(min(10.0, base_wait + random.uniform(0, base_wait)))
+                    await self._cache.set(cache_key, payload, ttl)
+                    return payload, None
 
-            await self.circuit_breaker.on_failure()
+                except Exception as e:
+                    last_err = f"network_error:{e.__class__.__name__}"
+                    wait = min(10.0, (2 ** attempt) + random.uniform(0, 1.0))
+                    await asyncio.sleep(wait)
+
             return None, last_err or "max_retries_exceeded"
 
-    async def get_enriched(self, symbol: str) -> Dict[str, Any]:
-        """Fetch fully enriched Next-Gen data (quote + profile + history + analytics)."""
-        sym = normalize_ksa_symbol(symbol)
-        if not sym or not self.quote_url: return {}
-
-        # Parallel Fetch
-        tasks = []
-        if self.quote_url:
-            tasks.append(self._request(self.quote_url.replace("{symbol}", sym), f"q:{sym}", 15.0))
-        if self.history_url:
-            tasks.append(self._request(self.history_url.replace("{symbol}", sym), f"h:{sym}", 1200.0))
-            
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        quote_data = results[0][0] if len(results) > 0 and isinstance(results[0], tuple) else {}
-        history_data = results[1][0] if len(results) > 1 and isinstance(results[1], tuple) else None
-
-        result = {
+    def _parse_quote_patch(self, symbol_norm: str, quote_data: Any, profile_data: Any = None) -> Dict[str, Any]:
+        """
+        Turn unknown provider payload into UnifiedQuote-like patch.
+        We use heuristics: look for common keys in dicts.
+        """
+        out: Dict[str, Any] = {
+            "symbol": symbol_norm,
+            "symbol_normalized": symbol_norm,
             "provider": PROVIDER_NAME,
             "provider_version": PROVIDER_VERSION,
-            "requested_symbol": symbol,
-            "normalized_symbol": sym,
-            "data_timestamp_utc": datetime.now(timezone.utc).isoformat()
+            "last_updated_utc": _now_utc_iso(),
         }
 
-        # Inject standard quote fields safely
-        if quote_data and isinstance(quote_data, dict):
-            for k, v in quote_data.items():
-                if v is not None: result[k] = v
+        q = quote_data if isinstance(quote_data, dict) else {}
+        p = profile_data if isinstance(profile_data, dict) else {}
 
-        # Analytics Engine
-        if history_data:
-            prices = []
-            volumes = []
-            if isinstance(history_data, list) and history_data and isinstance(history_data[0], (list, tuple)):
-                for row in history_data[-500:]:
-                    if len(row) >= 5 and _safe_float(row[4]) is not None:
-                        prices.append(float(row[4]))
-                        if len(row) >= 6 and _safe_float(row[5]) is not None:
-                            volumes.append(float(row[5]))
+        # common fields
+        name = _first_existing(p, ["name", "companyName", "company_name", "longName"]) or _first_existing(q, ["name", "companyName"])
+        sector = _first_existing(p, ["sector"]) or _first_existing(q, ["sector"])
+        currency = _first_existing(q, ["currency"]) or _first_existing(p, ["currency"]) or "SAR"
 
-            if len(prices) > 20:
-                result["analytics_available"] = True
-                
-                # Technicals
-                ti = TechnicalIndicators()
-                rsi = ti.rsi(prices)
-                result["rsi_14"] = rsi[-1] if rsi else None
-                
-                macd = ti.macd(prices)
-                result["macd"] = macd["macd"][-1] if macd["macd"] else None
-                
-                if len(prices) == len(volumes) and len(prices) > 0:
-                    result["stochastic_k"] = ti.stochastic_oscillator(prices, prices, prices)["%k"][-1]
+        price_raw = _first_existing(q, ["current_price", "price", "last", "lastPrice", "closePrice", "tradePrice"])
+        prev_raw = _first_existing(q, ["previous_close", "prev_close", "previousClose", "close", "yesterdayClose"])
+        ch_raw = _first_existing(q, ["price_change", "change", "chg"])
+        pct_raw = _first_existing(q, ["percent_change", "change_percent", "changePct", "pct_change"])
 
-                # ML Ensemble Forecast
-                forecaster = EnsembleForecaster(prices, enable_ml=XGB_AVAILABLE or SKLEARN_AVAILABLE)
-                forecast = forecaster.forecast(252)
-                if forecast.get("forecast_available"):
-                    result["forecast_1y_price"] = forecast["ensemble"]["price"]
-                    result["forecast_confidence"] = forecast["confidence"]
+        out["name"] = name
+        out["sector"] = sector
+        out["currency"] = currency
+        out["current_price"] = _safe_float(price_raw)
+        out["price"] = out["current_price"]
+        out["previous_close"] = _safe_float(prev_raw)
+        out["price_change"] = _safe_float(ch_raw)
+        # pct sometimes already percent (e.g. 1.23) or ratio (0.0123). keep as-is; enriched router can format.
+        out["percent_change"] = _safe_float(pct_raw)
 
-        return result
+        out["volume"] = _safe_float(_first_existing(q, ["volume", "vol", "tradedVolume"]))
+
+        # KSA identification
+        out["exchange"] = out.get("exchange") or "TADAWUL"
+        out["market"] = out.get("market") or "KSA"
+
+        # data quality (minimal)
+        out["data_quality"] = "GOOD" if out.get("current_price") is not None else "MISSING"
+        return _normalize_patch_keys(out)
+
+    async def get_enriched_patch(self, symbol: str) -> Dict[str, Any]:
+        symbol_norm = normalize_ksa_symbol(symbol)
+        if not symbol_norm:
+            return _error_patch(symbol, "invalid_ksa_symbol")
+
+        if not self._is_configured():
+            return _error_patch(symbol_norm, "ARGAAM_QUOTE_URL not configured (set env var)")
+
+        quote_urls = self._build_url_candidates(self.quote_url, symbol_norm)
+        prof_urls = self._build_url_candidates(self.profile_url, symbol_norm) if self.profile_url else []
+        # history currently unused for patch in this reliability version (kept for future)
+        # hist_urls = self._build_url_candidates(self.history_url, symbol_norm) if self.history_url else []
+
+        # quote (required)
+        quote_data = None
+        quote_err = None
+        for u in quote_urls:
+            quote_data, quote_err = await self._get_json(u, f"q:{symbol_norm}:{u}", ttl=DEFAULT_CACHE_TTL_SEC)
+            if quote_data is not None:
+                break
+
+        if quote_data is None:
+            return _error_patch(symbol_norm, f"quote_fetch_failed: {quote_err or 'unknown'}")
+
+        # profile (optional)
+        profile_data = None
+        if prof_urls:
+            for u in prof_urls:
+                profile_data, _ = await self._get_json(u, f"p:{symbol_norm}:{u}", ttl=max(60.0, DEFAULT_CACHE_TTL_SEC))
+                if profile_data is not None:
+                    break
+
+        patch = self._parse_quote_patch(symbol_norm, quote_data, profile_data)
+        patch["requested_symbol"] = symbol
+        patch["data_sources"] = [PROVIDER_NAME]
+        return patch
 
     async def close(self) -> None:
-        await self._client.aclose()
+        try:
+            if self._client:
+                await self._client.aclose()
+        except Exception:
+            pass
 
 
-# ============================================================================
-# Singleton & Public Export
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Provider object for KSA router compatibility
+# ---------------------------------------------------------------------------
+
+class ArgaamProvider:
+    """
+    Router expects a provider object that has methods like:
+    - get_quote(symbol=...)
+    - quote(symbol=...)
+    - fetch_quote(symbol=...)
+    This class provides them all.
+    """
+    name = PROVIDER_NAME
+    version = PROVIDER_VERSION
+
+    def __init__(self) -> None:
+        self._client: Optional[ArgaamClient] = None
+        self._lock = asyncio.Lock()
+
+    async def _get_client(self) -> ArgaamClient:
+        async with self._lock:
+            if self._client is None:
+                self._client = ArgaamClient()
+            return self._client
+
+    async def get_quote(self, symbol: str) -> Dict[str, Any]:
+        c = await self._get_client()
+        return await c.get_enriched_patch(symbol)
+
+    async def quote(self, symbol: str) -> Dict[str, Any]:
+        return await self.get_quote(symbol)
+
+    async def fetch_quote(self, symbol: str) -> Dict[str, Any]:
+        return await self.get_quote(symbol)
+
+    async def fetch_enriched_quote_patch(self, symbol: str) -> Dict[str, Any]:
+        # DataEngine compatibility
+        return await self.get_quote(symbol)
+
+    async def close(self) -> None:
+        if self._client:
+            await self._client.close()
+            self._client = None
+
+
+# ---------------------------------------------------------------------------
+# Singleton exports
+# ---------------------------------------------------------------------------
 
 _CLIENT_INSTANCE: Optional[ArgaamClient] = None
 _CLIENT_LOCK = asyncio.Lock()
+
+_PROVIDER_INSTANCE: Optional[ArgaamProvider] = None
+_PROVIDER_LOCK = asyncio.Lock()
 
 async def get_client() -> ArgaamClient:
     global _CLIENT_INSTANCE
@@ -833,20 +522,47 @@ async def close_client() -> None:
         await _CLIENT_INSTANCE.close()
         _CLIENT_INSTANCE = None
 
-async def fetch_enriched_patch(symbol: str, *args, **kwargs) -> Dict[str, Any]:
-    client = await get_client()
-    return await client.get_enriched(symbol)
+async def get_provider() -> ArgaamProvider:
+    global _PROVIDER_INSTANCE
+    if _PROVIDER_INSTANCE is None:
+        async with _PROVIDER_LOCK:
+            if _PROVIDER_INSTANCE is None:
+                _PROVIDER_INSTANCE = ArgaamProvider()
+    return _PROVIDER_INSTANCE
 
-# Aliases for cross-compatibility
-fetch_enriched_quote_patch = fetch_enriched_patch
-fetch_quote_and_enrichment_patch = fetch_enriched_patch
+# Provide a module-level provider object too (router sometimes checks "provider" attr)
+provider = ArgaamProvider()
+
+# ---------------------------------------------------------------------------
+# Engine-facing functions (DataEngineV4)
+# ---------------------------------------------------------------------------
+
+async def fetch_enriched_quote_patch(symbol: str, *args, **kwargs) -> Dict[str, Any]:
+    """
+    Main function used by DataEngineV4.
+    Must return a dict patch. On failure MUST include "error".
+    """
+    c = await get_client()
+    patch = await c.get_enriched_patch(symbol)
+    # Ensure engine sees failure if needed
+    if not isinstance(patch, dict) or not patch:
+        return _error_patch(symbol, "empty_patch")
+    return patch
+
+# aliases (engine tries multiple names)
+fetch_patch = fetch_enriched_quote_patch
+fetch_quote_patch = fetch_enriched_quote_patch
 
 __all__ = [
     "PROVIDER_NAME",
     "PROVIDER_VERSION",
-    "fetch_enriched_patch",
+    "normalize_ksa_symbol",
     "fetch_enriched_quote_patch",
-    "fetch_quote_and_enrichment_patch",
+    "fetch_patch",
+    "fetch_quote_patch",
+    "get_client",
     "close_client",
-    "normalize_ksa_symbol"
+    "ArgaamProvider",
+    "get_provider",
+    "provider",
 ]
