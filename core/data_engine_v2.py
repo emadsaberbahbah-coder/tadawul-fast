@@ -2,19 +2,19 @@
 """
 core/data_engine_v2.py
 ================================================================================
-Data Engine V2 — THE MASTER ORCHESTRATOR — v5.1.1 (RELIABILITY PATCH)
+Data Engine V2 — THE MASTER ORCHESTRATOR — v5.1.2 (GREEN STABLE PATCH)
 ================================================================================
 
-Purpose (v5.1.1):
-- Provider imports fixed: supports BOTH `providers.*` (your repo) and legacy `core.providers.*`
-- Symbol normalization fixed: supports BOTH `symbols.normalize` and legacy `core.symbols.normalize`
-- Provider call compatibility: works with async OR sync provider functions
-- Patch key normalization: maps `price` -> `current_price` (prevents MISSING data_quality)
-- Safe serialization (no `_PYDANTIC_V2` risk)
-- Adds ROOT_DIR to sys.path to stop "No module named 'providers'"
-
-Expected outcome:
-- Providers will import correctly (if they exist in repo), and quotes will stop returning all-null payloads.
+Fixes vs your pasted v5.1.1 draft:
+- ✅ SingleFlight fixed (no awaiting while holding lock) to avoid deadlocks
+- ✅ Semaphore usage fixed (async with) so we never release without acquire
+- ✅ Cache L1 warmed on disk hit (faster repeated reads)
+- ✅ Safer JSON/orjson helpers (consistent bytes/str handling)
+- ✅ Keeps your dual-import compatibility:
+      - providers.* and core.providers.*
+      - symbols.normalize and core.symbols.normalize
+- ✅ Keeps patch key normalization (price -> current_price)
+================================================================================
 """
 
 from __future__ import annotations
@@ -27,7 +27,6 @@ import os
 import pickle
 import sys
 import time
-import uuid
 import zlib
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -44,7 +43,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.1.1"
+__version__ = "5.1.2"
 
 logger = logging.getLogger("core.data_engine_v2")
 
@@ -52,22 +51,25 @@ logger = logging.getLogger("core.data_engine_v2")
 # High-Performance JSON fallback
 # ---------------------------------------------------------------------------
 try:
-    import orjson
+    import orjson  # type: ignore
 
     def json_loads(data: Union[str, bytes]) -> Any:
         return orjson.loads(data)
 
     def json_dumps(obj: Any) -> str:
+        # default=str is valid callable for orjson
         return orjson.dumps(obj, default=str).decode("utf-8")
 
-except ImportError:
-    import json
+except Exception:
+    import json  # type: ignore
 
     def json_loads(data: Union[str, bytes]) -> Any:
+        if isinstance(data, (bytes, bytearray)):
+            data = data.decode("utf-8", errors="replace")
         return json.loads(data)
 
     def json_dumps(obj: Any) -> str:
-        return json.dumps(obj, default=str)
+        return json.dumps(obj, default=str, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +88,10 @@ def _model_to_dict(obj: Any) -> Dict[str, Any]:
         return obj.dict()
     # dataclass-like / plain object
     if hasattr(obj, "__dict__"):
-        return dict(obj.__dict__)
+        try:
+            return dict(obj.__dict__)
+        except Exception:
+            pass
     return {"result": obj}
 
 
@@ -100,11 +105,12 @@ try:
 except Exception:
     SCHEMAS_AVAILABLE = False
     try:
-        from pydantic import BaseModel
-        from pydantic import Field
+        from pydantic import BaseModel, Field  # type: ignore
     except Exception:  # pragma: no cover
         BaseModel = object  # type: ignore
-        Field = lambda default=None, **kwargs: default  # type: ignore
+
+        def Field(default=None, **kwargs):  # type: ignore
+            return default
 
     class UnifiedQuote(BaseModel):  # type: ignore
         symbol: str = Field(default="")
@@ -179,7 +185,6 @@ def _fallback_normalize_symbol(s: str) -> str:
         return ""
     if u.startswith("TADAWUL:"):
         u = u.split(":", 1)[1].strip()
-    # normalize Saudi tickers to 2222.SR
     if _fallback_is_ksa(u):
         if u.endswith(".SR"):
             code = u[:-3].strip()
@@ -191,13 +196,11 @@ def _fallback_normalize_symbol(s: str) -> str:
 
 def _fallback_to_yahoo_symbol(s: str) -> str:
     u = _fallback_normalize_symbol(s)
-    # for KSA, Yahoo needs 2222.SR
     if _fallback_is_ksa(u):
         return u if u.endswith(".SR") else f"{u}.SR"
     return u
 
 
-# Try preferred imports first
 try:
     from symbols.normalize import normalize_symbol as normalize_symbol  # type: ignore
     from symbols.normalize import is_ksa as is_ksa  # type: ignore
@@ -278,10 +281,9 @@ def _safe_float(x: Any) -> Optional[float]:
 
 
 def _clean_patch(patch: Dict[str, Any]) -> Dict[str, Any]:
-    return {k: v for k, v in patch.items() if v is not None and v != ""}
+    return {k: v for k, v in (patch or {}).items() if v is not None and v != ""}
 
 
-# Providers often return `price` not `current_price`
 _PATCH_ALIASES: Dict[str, str] = {
     "price": "current_price",
     "last_price": "current_price",
@@ -304,7 +306,6 @@ def _normalize_patch_keys(patch: Dict[str, Any]) -> Dict[str, Any]:
     for src, dst in _PATCH_ALIASES.items():
         if src in out and (dst not in out or out.get(dst) in (None, "", 0)):
             out[dst] = out.get(src)
-    # keep `price` aligned
     if "current_price" in out and ("price" not in out or out.get("price") in (None, "", 0)):
         out["price"] = out.get("current_price")
     return out
@@ -431,6 +432,7 @@ class ProviderRegistry:
     async def get_provider(self, name: str) -> Tuple[Optional[Any], ProviderStats]:
         retry_sec = _get_env_int("PROVIDER_IMPORT_RETRY_SEC", 60)
         now = time.time()
+
         async with self._lock:
             if name not in self._providers:
                 module, import_err = _import_provider(name)
@@ -439,13 +441,14 @@ class ProviderRegistry:
                 return self._providers[name]
 
             module, stats = self._providers[name]
-            # retry import if failed and enough time passed
+
             if module is None and stats.last_import_error and (now - stats.last_import_attempt_utc) >= retry_sec:
                 module2, import_err2 = _import_provider(name)
                 stats.last_import_error = import_err2
                 stats.last_import_attempt_utc = now
                 self._providers[name] = (module2, stats)
                 module = module2
+
             return module, stats
 
     async def record_success(self, name: str, latency_ms: float) -> None:
@@ -490,7 +493,8 @@ class MultiLevelCache:
         os.makedirs(self._dir, exist_ok=True)
 
     def _key(self, **kwargs) -> str:
-        h = hashlib.sha256(json_dumps(kwargs).encode()).hexdigest()[:16]
+        payload = json_dumps(kwargs)
+        h = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
         return f"{self.name}:{h}"
 
     def _compress(self, data: Any) -> bytes:
@@ -527,7 +531,17 @@ class MultiLevelCache:
                 if (time.time() - os.path.getmtime(disk_path)) <= self.l3_ttl:
                     with open(disk_path, "rb") as f:
                         raw = f.read()
-                    return self._decompress(raw)
+                    val = self._decompress(raw)
+                    if val is not None:
+                        # warm L1 on disk hit
+                        async with self._lock:
+                            if len(self._l1) >= self.max_l1_size and self._l1_access:
+                                oldest = min(self._l1_access.items(), key=lambda x: x[1])[0]
+                                self._l1.pop(oldest, None)
+                                self._l1_access.pop(oldest, None)
+                            self._l1[key] = (val, now + self.l1_ttl)
+                            self._l1_access[key] = now
+                    return val
             except Exception:
                 pass
         return None
@@ -552,7 +566,7 @@ class MultiLevelCache:
 
 
 # ============================================================================
-# SingleFlight
+# SingleFlight (FIXED)
 # ============================================================================
 class SingleFlight:
     def __init__(self) -> None:
@@ -560,11 +574,19 @@ class SingleFlight:
         self._calls: Dict[str, asyncio.Future] = {}
 
     async def execute(self, key: str, coro_func: Callable[[], Any]) -> Any:
+        # Lock only for future creation / lookup (no await inside lock)
         async with self._lock:
-            if key in self._calls:
-                return await self._calls[key]
-            fut = asyncio.get_running_loop().create_future()
-            self._calls[key] = fut
+            fut = self._calls.get(key)
+            if fut is None:
+                fut = asyncio.get_running_loop().create_future()
+                self._calls[key] = fut
+                owner = True
+            else:
+                owner = False
+
+        if not owner:
+            return await fut  # type: ignore
+
         try:
             res = await coro_func()
             if not fut.done():
@@ -580,7 +602,7 @@ class SingleFlight:
 
 
 # ============================================================================
-# DataEngineV4 (v5.1.1)
+# DataEngineV4 (v5.1.2)
 # ============================================================================
 class DataEngineV4:
     def __init__(self, settings: Any = None):
@@ -604,7 +626,7 @@ class DataEngineV4:
             max_l1_size=_get_env_int("CACHE_L1_MAX", 5000),
         )
 
-        logger.info(f"DataEngineV4 v{self.version} initialized with {len(self.enabled_providers)} providers")
+        logger.info("DataEngineV4 v%s initialized with %s providers", self.version, len(self.enabled_providers))
 
     async def aclose(self) -> None:
         return
@@ -617,7 +639,6 @@ class DataEngineV4:
         return providers
 
     def _provider_symbol(self, provider: str, symbol: str) -> str:
-        # Yahoo providers need Yahoo-style symbols; others accept normalized.
         if provider.startswith("yahoo"):
             try:
                 return to_yahoo_symbol(symbol)  # type: ignore
@@ -630,8 +651,7 @@ class DataEngineV4:
     ) -> Tuple[str, Optional[Dict[str, Any]], float, Optional[str]]:
         start = time.time()
 
-        await self._sem.acquire()
-        try:
+        async with self._sem:
             module, stats = await self._registry.get_provider(provider)
 
             if stats.is_circuit_open:
@@ -651,7 +671,7 @@ class DataEngineV4:
             provider_symbol = self._provider_symbol(provider, symbol)
 
             try:
-                # Python 3.11+ fast timeout
+                # Python 3.11+ timeout context; fallback for older
                 try:
                     async with asyncio.timeout(self.request_timeout):
                         res = await _call_maybe_async(fn, provider_symbol)
@@ -679,9 +699,6 @@ class DataEngineV4:
                 await self._registry.record_failure(provider, repr(e))
                 return provider, None, latency, repr(e)
 
-        finally:
-            self._sem.release()
-
     def _merge(self, requested_symbol: str, norm: str, patches: List[Tuple[str, Dict[str, Any], float]]) -> Dict[str, Any]:
         merged: Dict[str, Any] = {
             "symbol": norm,
@@ -707,7 +724,6 @@ class DataEngineV4:
                 if k not in merged or merged.get(k) in (None, "", 0):
                     merged[k] = v
 
-        # ensure current_price + price coherence
         if merged.get("current_price") is None and merged.get("price") is not None:
             merged["current_price"] = merged.get("price")
         if merged.get("price") is None and merged.get("current_price") is not None:
@@ -722,7 +738,10 @@ class DataEngineV4:
         return QuoteQuality.GOOD.value
 
     async def get_enriched_quote(self, symbol: str, use_cache: bool = True) -> UnifiedQuote:
-        return await self._singleflight.execute(f"quote:{symbol}", lambda: self._get_enriched_quote_impl(symbol, use_cache))
+        return await self._singleflight.execute(
+            f"quote:{symbol}",
+            lambda: self._get_enriched_quote_impl(symbol, use_cache),
+        )
 
     async def _get_enriched_quote_impl(self, symbol: str, use_cache: bool = True) -> UnifiedQuote:
         norm = normalize_symbol(symbol) if callable(normalize_symbol) else _fallback_normalize_symbol(symbol)
@@ -763,8 +782,7 @@ class DataEngineV4:
                 "provider_stats": {k: stats.get(k) for k in top},
                 "errors": [{"provider": p, "error": err, "latency_ms": round(lat, 2)} for (p, _, lat, err) in results],
             }
-            # keep debug safely stringified (schema-safe)
-            return UnifiedQuote(
+            return UnifiedQuote(  # type: ignore
                 symbol=norm,
                 symbol_normalized=norm,
                 requested_symbol=symbol,
@@ -775,7 +793,7 @@ class DataEngineV4:
                 provider_latency={},
                 last_updated_utc=_now_utc_iso(),
                 last_updated_riyadh=_now_riyadh_iso(),
-            )  # type: ignore
+            )
 
         merged = self._merge(symbol, norm, patches_ok)
         quote = UnifiedQuote(**merged)
