@@ -2,15 +2,14 @@
 # core/providers/yahoo_fundamentals_provider.py
 """
 ================================================================================
-Yahoo Finance Fundamentals Provider — v5.1.1 (STABLE ENTERPRISE)
+Yahoo Finance Fundamentals Provider — v5.1.2 (GREEN STABLE ENTERPRISE)
 ================================================================================
 
-This revision fixes runtime-breaking issues found in the pasted v5.1.0 draft:
-- ✅ Adds missing `import json` used by fallback json_dumps
-- ✅ Fixes Circuit Breaker init + adds get_stats()
-- ✅ Adds missing data_quality_score()
-- ✅ Fixes Prometheus Counter usage with `.labels(status=...)`
-- ✅ Removes event-loop-fragile background queue task creation (still supports concurrency + rate limit)
+Fixes vs your pasted v5.1.1 draft:
+- ✅ OpenTelemetry tracing fixed (start_as_current_span context manager)
+- ✅ Removes non-standard span.set_attributes() usage (uses set_attribute per key)
+- ✅ SingleFlight fixed (no await while holding lock) + uses get_running_loop()
+- ✅ Safe Prometheus usage kept (labels().inc(), observe(), gauge.set())
 - ✅ Keeps engine-compatible public API:
       - fetch_fundamentals_patch()
       - fetch_enriched_quote_patch()
@@ -22,6 +21,7 @@ This revision fixes runtime-breaking issues found in the pasted v5.1.0 draft:
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import json
 import logging
@@ -42,7 +42,7 @@ import numpy as np
 logger = logging.getLogger("core.providers.yahoo_fundamentals_provider")
 
 PROVIDER_NAME = "yahoo_fundamentals"
-PROVIDER_VERSION = "5.1.1"
+PROVIDER_VERSION = "5.1.2"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 _FALSY = {"0", "false", "no", "n", "off", "f"}
@@ -99,15 +99,12 @@ except Exception:
 
 try:
     import yfinance as yf  # type: ignore
-    import pandas as pd  # type: ignore
+    import pandas as pd  # type: ignore  # noqa: F401
 
     _HAS_YFINANCE = True
-    _HAS_PANDAS = True
 except Exception:
     yf = None  # type: ignore
-    pd = None  # type: ignore
     _HAS_YFINANCE = False
-    _HAS_PANDAS = False
 
 
 # ---------------------------------------------------------------------------
@@ -149,35 +146,54 @@ else:
 
 
 # ---------------------------------------------------------------------------
-# Tracing helpers (safe)
+# Tracing helpers (safe + correct)
 # ---------------------------------------------------------------------------
 _TRACING_ENABLED = (os.getenv("YF_TRACING_ENABLED", "").strip().lower() in _TRUTHY) and _OTEL_AVAILABLE
 
 
 class TraceContext:
+    """
+    Correct OTEL handling:
+    tracer.start_as_current_span() returns a context manager.
+    Enter it to get span (maybe None).
+    """
     def __init__(self, name: str, attrs: Optional[Dict[str, Any]] = None):
         self.name = name
         self.attrs = attrs or {}
-        self.tracer = trace.get_tracer(__name__) if (_TRACING_ENABLED and trace) else None
+        self._cm = None
         self.span = None
+        self.tracer = trace.get_tracer(__name__) if (_TRACING_ENABLED and trace) else None
 
     async def __aenter__(self):
         if self.tracer:
-            self.span = self.tracer.start_span(self.name)
-            if self.attrs:
-                self.span.set_attributes(self.attrs)
+            self._cm = self.tracer.start_as_current_span(self.name)
+            self.span = self._cm.__enter__()
+            if self.span and self.attrs:
+                for k, v in self.attrs.items():
+                    try:
+                        self.span.set_attribute(k, v)
+                    except Exception:
+                        pass
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
-        if self.span and _OTEL_AVAILABLE:
-            if exc and Status and StatusCode:
+        if self.span and _OTEL_AVAILABLE and exc and Status and StatusCode:
+            try:
                 self.span.record_exception(exc)
                 self.span.set_status(Status(StatusCode.ERROR, str(exc)))
-            self.span.end()
+            except Exception:
+                pass
+        if self._cm:
+            try:
+                self._cm.__exit__(exc_type, exc, tb)
+            except Exception:
+                pass
+        return False
 
 
 def _trace(name: Optional[str] = None):
     def deco(func):
+        @functools.wraps(func)
         async def wrapper(*args, **kwargs):
             if not _TRACING_ENABLED:
                 return await func(*args, **kwargs)
@@ -399,7 +415,7 @@ def map_recommendation(rec: Optional[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Quality scoring (missing in old draft)
+# Quality scoring
 # ---------------------------------------------------------------------------
 class DataQuality(Enum):
     EXCELLENT = "excellent"
@@ -410,18 +426,13 @@ class DataQuality(Enum):
 
 
 def data_quality_score(patch: Dict[str, Any]) -> Tuple[DataQuality, float]:
-    """
-    Score completeness + sanity. Returns (category, score 0..100).
-    """
     score = 0.0
 
-    # Core identity
     if safe_str(patch.get("symbol")):
         score += 10
     if safe_str(patch.get("name")):
         score += 5
 
-    # Core price/market
     if safe_float(patch.get("current_price")):
         score += 12
     if safe_float(patch.get("market_cap")):
@@ -429,7 +440,6 @@ def data_quality_score(patch: Dict[str, Any]) -> Tuple[DataQuality, float]:
     if safe_str(patch.get("currency")):
         score += 3
 
-    # Valuation
     if safe_float(patch.get("pe_ttm")):
         score += 7
     if safe_float(patch.get("pb_ttm")):
@@ -437,25 +447,21 @@ def data_quality_score(patch: Dict[str, Any]) -> Tuple[DataQuality, float]:
     if safe_float(patch.get("ps_ttm")):
         score += 6
 
-    # Profitability
     if safe_float(patch.get("net_margin")) is not None:
         score += 8
     if safe_float(patch.get("roe")) is not None:
         score += 8
 
-    # Growth
     if safe_float(patch.get("revenue_growth")) is not None:
         score += 7
     if safe_float(patch.get("earnings_growth")) is not None:
         score += 6
 
-    # Targets
     if safe_float(patch.get("target_mean_price")):
         score += 6
     if safe_int(patch.get("analyst_count")) is not None:
         score += 6
 
-    # Sanity penalties
     cp = safe_float(patch.get("current_price"))
     if cp is not None and cp <= 0:
         score -= 20
@@ -486,9 +492,7 @@ class CacheStats:
 
 
 class AdvancedCache:
-    """
-    Memory LRU-ish cache with TTL + optional Redis (compressed pickle).
-    """
+    """Memory TTL cache + optional Redis (compressed pickle)."""
     def __init__(self, name: str, maxsize: int, ttl: float, use_redis: bool, redis_url: str):
         self.name = name
         self.maxsize = maxsize
@@ -623,12 +627,7 @@ class CircuitBreakerStats:
 
 
 class AdvancedCircuitBreaker:
-    """
-    Simple, correct circuit breaker.
-    - CLOSED: allow all
-    - OPEN: reject until open_until
-    - HALF_OPEN: allow 1 probe call
-    """
+    """Simple, correct circuit breaker (CLOSED/OPEN/HALF_OPEN)."""
     def __init__(self, fail_threshold: int, cooldown_sec: float):
         self.fail_threshold = max(1, int(fail_threshold))
         self.stats = CircuitBreakerStats(cooldown_sec=float(cooldown_sec))
@@ -640,6 +639,7 @@ class AdvancedCircuitBreaker:
             return True
         async with self._lock:
             now = time.monotonic()
+
             if self.stats.state == CircuitState.CLOSED:
                 yf_fund_circuit_breaker_state.set(self.stats.state.to_numeric())
                 return True
@@ -667,8 +667,7 @@ class AdvancedCircuitBreaker:
             return
         async with self._lock:
             self.stats.successes += 1
-            if self.stats.state in (CircuitState.HALF_OPEN, CircuitState.OPEN):
-                self.stats.state = CircuitState.CLOSED
+            self.stats.state = CircuitState.CLOSED
             self.stats.failures = 0
             self._half_open_probe_used = False
             yf_fund_circuit_breaker_state.set(self.stats.state.to_numeric())
@@ -681,19 +680,16 @@ class AdvancedCircuitBreaker:
             self.stats.failures += 1
             self.stats.last_failure_ts = now
 
-            # throttle harder on 429 etc
             cooldown = self.stats.cooldown_sec
             if status_code in (401, 403, 429):
                 cooldown = min(300.0, cooldown * 1.5)
 
-            if self.stats.failures >= self.fail_threshold:
+            if self.stats.state == CircuitState.HALF_OPEN:
+                self.stats.state = CircuitState.OPEN
+                self.stats.open_until_ts = now + min(300.0, cooldown * 2)
+            elif self.stats.failures >= self.fail_threshold:
                 self.stats.state = CircuitState.OPEN
                 self.stats.open_until_ts = now + cooldown
-            else:
-                # if already half-open and failed => open
-                if self.stats.state == CircuitState.HALF_OPEN:
-                    self.stats.state = CircuitState.OPEN
-                    self.stats.open_until_ts = now + min(300.0, cooldown * 2)
 
             yf_fund_circuit_breaker_state.set(self.stats.state.to_numeric())
 
@@ -711,16 +707,25 @@ class AdvancedCircuitBreaker:
 
 
 class SingleFlight:
+    """Ensure only one in-flight fetch per key."""
     def __init__(self) -> None:
         self._lock = asyncio.Lock()
         self._futs: Dict[str, asyncio.Future] = {}
 
     async def run(self, key: str, coro_fn):
+        # Fast path: existing future (DON'T await under lock)
         async with self._lock:
-            if key in self._futs:
-                return await self._futs[key]
-            fut = asyncio.get_event_loop().create_future()
-            self._futs[key] = fut
+            fut = self._futs.get(key)
+            if fut is not None:
+                pass
+            else:
+                loop = asyncio.get_running_loop()
+                fut = loop.create_future()
+                self._futs[key] = fut
+                fut_owner = True
+        # If not owner, just await
+        if "fut_owner" not in locals():
+            return await fut  # type: ignore
 
         try:
             res = await coro_fn()
@@ -786,45 +791,8 @@ class YahooFundamentalsProvider:
             _cb_cooldown_sec(),
         )
 
-    def _extract_series(self, ticker: Any) -> Dict[str, List[float]]:
-        """
-        Best-effort extraction of EPS, revenue, FCF series. Robust to yfinance schema changes.
-        """
-        series: Dict[str, List[float]] = {"eps": [], "revenue": [], "fcf": [], "book_value": []}
-        try:
-            # Revenue from annual financials if available
-            fin = getattr(ticker, "financials", None)
-            if fin is not None and hasattr(fin, "empty") and not fin.empty:
-                if "Total Revenue" in fin.index:
-                    vals = fin.loc["Total Revenue"].tolist()
-                    series["revenue"] = [v for v in (safe_float(x) for x in vals) if v is not None]
-
-            # Cashflow / Free Cash Flow
-            cf = getattr(ticker, "cashflow", None)
-            if cf is not None and hasattr(cf, "empty") and not cf.empty:
-                for key in ("Free Cash Flow", "FreeCashFlow"):
-                    if key in cf.index:
-                        vals = cf.loc[key].tolist()
-                        series["fcf"] = [v for v in (safe_float(x) for x in vals) if v is not None]
-                        break
-
-            # Book value / equity from balance sheet
-            bs = getattr(ticker, "balance_sheet", None)
-            if bs is not None and hasattr(bs, "empty") and not bs.empty:
-                for key in ("Total Stockholder Equity", "Total Equity Gross Minority Interest"):
-                    if key in bs.index:
-                        vals = bs.loc[key].tolist()
-                        series["book_value"] = [v for v in (safe_float(x) for x in vals) if v is not None]
-                        break
-        except Exception:
-            pass
-        return series
-
     def _blocking_fetch(self, symbol: str) -> Dict[str, Any]:
-        """
-        Blocking fetch with full-jitter retry.
-        Runs inside asyncio.to_thread() to avoid blocking loop.
-        """
+        """Blocking fetch with full-jitter retry. Runs in to_thread()."""
         if not _HAS_YFINANCE or yf is None:
             return {"error": "yfinance_not_installed"}
 
@@ -835,7 +803,6 @@ class YahooFundamentalsProvider:
                 t = yf.Ticker(symbol)
                 info = t.info or {}
 
-                # best effort current price
                 fast_price = None
                 try:
                     fi = getattr(t, "fast_info", None)
@@ -902,7 +869,6 @@ class YahooFundamentalsProvider:
                     "short_percent": as_percent(info.get("shortPercentOfFloat")),
                 }
 
-                # Upside / confidence if target exists
                 if current_price and current_price > 0:
                     tm = safe_float(out.get("target_mean_price"))
                     if tm and tm > 0:
@@ -910,6 +876,7 @@ class YahooFundamentalsProvider:
                         out["upside_percent"] = float(upside)
                         out["forecast_price_12m"] = float(tm)
                         out["expected_roi_12m"] = float(upside)
+
                         ac = safe_int(out.get("analyst_count"))
                         if ac and ac > 0:
                             conf = 0.6 + (math.log(ac + 1) * 0.05)
@@ -919,7 +886,6 @@ class YahooFundamentalsProvider:
                             out["forecast_confidence"], out["confidence_score"] = 0.5, 50.0
                         out["forecast_method"] = "analyst_consensus"
 
-                # Quality score
                 dq, dq_score = data_quality_score(out)
                 out["data_quality"] = dq.value
                 out["data_quality_score"] = dq_score
@@ -948,7 +914,6 @@ class YahooFundamentalsProvider:
 
         cache_key = f"fund:{norm}"
 
-        # short backoff cache for repeated failures
         if await self.err_cache.get(cache_key):
             return {} if not _emit_warnings() else {"_warn": "temporarily_backed_off"}
 
@@ -958,6 +923,7 @@ class YahooFundamentalsProvider:
 
         async def _do_fetch():
             t0 = time.time()
+
             if not await self.circuit_breaker.allow_request():
                 yf_fund_requests_total.labels(status="cb_open").inc()
                 return {} if not _emit_warnings() else {"_warn": "circuit_breaker_open"}
@@ -996,11 +962,13 @@ class YahooFundamentalsProvider:
                 await self.circuit_breaker.on_failure(status_code=504)
                 await self.err_cache.set(cache_key, True, ttl=_err_ttl_sec())
                 return {} if not _emit_warnings() else {"_warn": "timeout"}
+
             except Exception as e:
                 yf_fund_requests_total.labels(status="exception").inc()
                 await self.circuit_breaker.on_failure(status_code=500)
                 await self.err_cache.set(cache_key, True, ttl=_err_ttl_sec())
                 return {} if not _emit_warnings() else {"_warn": f"exception: {type(e).__name__}"}
+
             finally:
                 try:
                     yf_fund_request_duration.observe(max(0.0, time.time() - t0))
