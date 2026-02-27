@@ -2,23 +2,25 @@
 """
 env.py
 ================================================================================
-TADAWUL FAST BRIDGE – ENTERPRISE ENVIRONMENT MANAGER (v7.5.1)
+TADAWUL FAST BRIDGE – ENTERPRISE ENVIRONMENT MANAGER (v7.5.2)
 ================================================================================
 STABLE EDITION | DISTRIBUTED CONFIG | HOT-RELOAD | SECRETS MANAGEMENT
 
-Fixes vs v7.5.0 draft:
+Fixes vs v7.5.0 / v7.5.1:
 - ✅ Always imports `json` (even if orjson exists) to avoid NameError
 - ✅ Correct OpenTelemetry span usage (context manager) + safe attribute setting
 - ✅ Adds missing `coerce_dict` utility (exported in __all__)
-- ✅ Keeps your public API + backward compatibility exports
+- ✅ JSON file loader uses json_loads consistently
+- ✅ Prometheus dummy metrics support .labels().inc() / .observe()
+- ✅ Keeps public API + backward compatibility exports
 """
 
 from __future__ import annotations
 
 import base64
+import json  # ALWAYS available, even if orjson exists
 import logging
 import os
-import random
 import re
 import socket
 import sys
@@ -29,9 +31,6 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-from urllib.parse import urlparse
-
-import json  # ✅ ALWAYS available, even if orjson is installed
 
 # ---------------------------------------------------------------------------
 # High-Performance JSON fallback
@@ -50,6 +49,7 @@ try:
 
     _HAS_ORJSON = True
 except Exception:
+
     def json_loads(data: Union[str, bytes]) -> Any:
         return json.loads(data)
 
@@ -62,7 +62,7 @@ except Exception:
 # =============================================================================
 # Version & Core Configuration
 # =============================================================================
-ENV_VERSION = "7.5.1"
+ENV_VERSION = "7.5.2"
 ENV_SCHEMA_VERSION = "2.1"
 MIN_PYTHON = (3, 8)
 
@@ -77,6 +77,7 @@ if sys.version_info < MIN_PYTHON:
 # YAML support
 try:
     import yaml  # type: ignore
+
     YAML_AVAILABLE = True
 except Exception:
     yaml = None  # type: ignore
@@ -85,6 +86,7 @@ except Exception:
 # Monitoring & Tracing
 try:
     from prometheus_client import Counter, Histogram  # type: ignore
+
     PROMETHEUS_AVAILABLE = True
 except Exception:
     PROMETHEUS_AVAILABLE = False
@@ -95,6 +97,7 @@ _TRACING_ENABLED = os.getenv("CORE_TRACING_ENABLED", "").strip().lower() in {"1"
 try:
     from opentelemetry import trace  # type: ignore
     from opentelemetry.trace import Status, StatusCode  # type: ignore
+
     OTEL_AVAILABLE = True
     _TRACER = trace.get_tracer(__name__)
 except Exception:
@@ -102,11 +105,15 @@ except Exception:
     Status = StatusCode = None  # type: ignore
 
     class _DummyCM:
-        def __enter__(self): return None
-        def __exit__(self, *args, **kwargs): return False
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *args, **kwargs):
+            return False
 
     class _DummyTracer:
-        def start_as_current_span(self, *args, **kwargs): return _DummyCM()
+        def start_as_current_span(self, *args, **kwargs):
+            return _DummyCM()
 
     _TRACER = _DummyTracer()  # type: ignore
 
@@ -131,10 +138,16 @@ if PROMETHEUS_AVAILABLE:
         buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
     )
 else:
+
     class _DummyMetric:
-        def labels(self, *args, **kwargs): return self
-        def inc(self, *args, **kwargs): return None
-        def observe(self, *args, **kwargs): return None
+        def labels(self, *args, **kwargs):
+            return self
+
+        def inc(self, *args, **kwargs):
+            return None
+
+        def observe(self, *args, **kwargs):
+            return None
 
     env_config_loads_total = _DummyMetric()
     env_config_errors_total = _DummyMetric()
@@ -159,6 +172,7 @@ class TraceContext:
     - start_as_current_span() returns a context manager
     - __enter__ returns the span (or None)
     """
+
     def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
         self.name = name
         self.attributes = attributes or {}
@@ -256,17 +270,20 @@ _FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled", "inactive"
 
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
+
 def strip_value(v: Any) -> str:
     try:
         return str(v).strip()
     except Exception:
         return ""
 
+
 def strip_wrapping_quotes(s: str) -> str:
     t = strip_value(s)
     if len(t) >= 2 and ((t[0] == t[-1] == '"') or (t[0] == t[-1] == "'")):
         return t[1:-1].strip()
     return t
+
 
 def coerce_bool(v: Any, default: bool = False) -> bool:
     if isinstance(v, bool):
@@ -280,6 +297,7 @@ def coerce_bool(v: Any, default: bool = False) -> bool:
         return False
     return default
 
+
 def coerce_int(v: Any, default: int, *, lo: Optional[int] = None, hi: Optional[int] = None) -> int:
     try:
         x = int(float(strip_value(v)))
@@ -291,6 +309,7 @@ def coerce_int(v: Any, default: int, *, lo: Optional[int] = None, hi: Optional[i
         x = hi
     return x
 
+
 def coerce_float(v: Any, default: float, *, lo: Optional[float] = None, hi: Optional[float] = None) -> float:
     try:
         x = float(strip_value(v))
@@ -301,6 +320,7 @@ def coerce_float(v: Any, default: float, *, lo: Optional[float] = None, hi: Opti
     if hi is not None and x > hi:
         x = hi
     return x
+
 
 def coerce_list(v: Any, default: Optional[List[str]] = None) -> List[str]:
     if v is None:
@@ -320,9 +340,9 @@ def coerce_list(v: Any, default: Optional[List[str]] = None) -> List[str]:
     parts = re.split(r"[\s,;|]+", s)
     return [strip_value(x) for x in parts if strip_value(x)]
 
+
 def coerce_dict(v: Any, default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """
-    ✅ Missing in your v7.5.0 draft.
     Accepts dict or JSON string. Returns dict or default.
     """
     if isinstance(v, dict):
@@ -336,6 +356,7 @@ def coerce_dict(v: Any, default: Optional[Dict[str, Any]] = None) -> Dict[str, A
     except Exception:
         return default or {}
 
+
 def get_first_env(*keys: str) -> Optional[str]:
     for k in keys:
         v = os.getenv(k)
@@ -343,11 +364,13 @@ def get_first_env(*keys: str) -> Optional[str]:
             return strip_value(v)
     return None
 
+
 def get_first_env_int(*keys: str, default: int, **kwargs) -> int:
     v = get_first_env(*keys)
     if v is None:
         return default
     return coerce_int(v, default, **kwargs)
+
 
 def get_first_env_float(*keys: str, default: float, **kwargs) -> float:
     v = get_first_env(*keys)
@@ -355,11 +378,13 @@ def get_first_env_float(*keys: str, default: float, **kwargs) -> float:
         return default
     return coerce_float(v, default, **kwargs)
 
+
 def get_first_env_list(*keys: str, default: Optional[List[str]] = None) -> List[str]:
     v = get_first_env(*keys)
     if v is None:
         return default or []
     return coerce_list(v, default)
+
 
 def mask_secret(s: Optional[str], reveal_first: int = 3, reveal_last: int = 3) -> str:
     if s is None:
@@ -371,11 +396,13 @@ def mask_secret(s: Optional[str], reveal_first: int = 3, reveal_last: int = 3) -
         return "***"
     return f"{x[:reveal_first]}...{x[-reveal_last:]}"
 
+
 def is_valid_url(url: str) -> bool:
     u = strip_value(url)
     if not u:
         return False
     return bool(_URL_RE.match(u))
+
 
 def repair_private_key(key: str) -> str:
     if not key:
@@ -387,12 +414,12 @@ def repair_private_key(key: str) -> str:
         key = key.rstrip() + "\n-----END PRIVATE KEY-----"
     return key
 
+
 def repair_json_creds(raw: str) -> Optional[Dict[str, Any]]:
     t = strip_wrapping_quotes(raw or "")
     if not t:
         return None
 
-    # Try base64 decode if it doesn't look like JSON
     if not t.startswith("{") and len(t) > 50:
         try:
             decoded = base64.b64decode(t, validate=False).decode("utf-8", errors="replace").strip()
@@ -411,6 +438,7 @@ def repair_json_creds(raw: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.debug("Failed to parse Google credentials: %s", e)
     return None
+
 
 def get_system_info() -> Dict[str, Any]:
     info: Dict[str, Any] = {
@@ -443,8 +471,7 @@ class ConfigSourceLoader:
             if not line or line.startswith("#") or "=" not in line:
                 continue
             k, v = line.split("=", 1)
-            v = strip_wrapping_quotes(v.strip())
-            cfg[k.strip()] = v
+            cfg[k.strip()] = strip_wrapping_quotes(v.strip())
         return cfg
 
     @staticmethod
@@ -458,9 +485,6 @@ class ConfigSourceLoader:
 
     @staticmethod
     def from_json_file(path: Union[str, Path]) -> Dict[str, Any]:
-        """
-        ✅ fixed: always uses json_loads (works with orjson or std json)
-        """
         p = Path(path)
         if not p.exists():
             return {}
@@ -755,6 +779,7 @@ _settings_instance: Optional[Settings] = None
 _dynamic_config: Optional[DynamicConfig] = None
 _init_lock = threading.Lock()
 
+
 def get_settings() -> Settings:
     global _settings_instance
     if _settings_instance is None:
@@ -762,6 +787,7 @@ def get_settings() -> Settings:
             if _settings_instance is None:
                 _settings_instance = Settings.from_env()
     return _settings_instance
+
 
 def get_dynamic_config() -> DynamicConfig:
     global _dynamic_config
@@ -771,24 +797,29 @@ def get_dynamic_config() -> DynamicConfig:
                 _dynamic_config = DynamicConfig(get_settings())
     return _dynamic_config
 
+
 def reload_config() -> bool:
     return get_dynamic_config().reload()
+
 
 def compliance_report() -> Dict[str, Any]:
     return get_settings().compliance_report()
 
+
 def feature_enabled(feature: str) -> bool:
     return get_settings().feature_enabled(feature)
 
+
 class CompatibilitySettings:
-    def __init__(self, settings: Settings):
-        object.__setattr__(self, "_settings", settings)
+    def __init__(self, settings_obj: Settings):
+        object.__setattr__(self, "_settings", settings_obj)
 
     def __getattr__(self, name: str):
         return getattr(self._settings, name)
 
     def __setattr__(self, name: str, value: Any):
         raise AttributeError("Settings are immutable")
+
 
 settings = CompatibilitySettings(get_settings())
 
