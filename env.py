@@ -2,23 +2,21 @@
 """
 env.py
 ================================================================================
-TADAWUL FAST BRIDGE – ENTERPRISE ENVIRONMENT MANAGER (v7.5.2)
+TADAWUL FAST BRIDGE – ENTERPRISE ENVIRONMENT MANAGER (v7.5.3)
 ================================================================================
 STABLE EDITION | DISTRIBUTED CONFIG | HOT-RELOAD | SECRETS MANAGEMENT
 
-Fixes vs v7.5.0 / v7.5.1:
-- ✅ Always imports `json` (even if orjson exists) to avoid NameError
-- ✅ Correct OpenTelemetry span usage (context manager) + safe attribute setting
-- ✅ Adds missing `coerce_dict` utility (exported in __all__)
-- ✅ JSON file loader uses json_loads consistently
-- ✅ Prometheus dummy metrics support .labels().inc() / .observe()
-- ✅ Keeps public API + backward compatibility exports
+Fixes vs v7.5.2:
+- ✅ Adds missing get_first_env_bool() (commonly imported elsewhere)
+- ✅ Adds common Render flags to Settings (DEBUG/Swagger/Redoc/Defer/InitEngine)
+- ✅ Exports helper getters in __all__ (int/float/bool/list) to avoid import errors
+- ✅ Keeps existing behavior and defaults (no breaking changes)
 """
 
 from __future__ import annotations
 
 import base64
-import json  # ALWAYS available, even if orjson exists
+import json  # ALWAYS available
 import logging
 import os
 import re
@@ -27,7 +25,7 @@ import sys
 import threading
 import time
 from dataclasses import asdict, dataclass, field, replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -45,7 +43,7 @@ try:
 
     def json_dumps(obj: Any, *, indent: int = 0) -> str:
         option = orjson.OPT_INDENT_2 if indent else 0
-        return orjson.dumps(obj, option=option).decode("utf-8")
+        return orjson.dumps(obj, option=option, default=str).decode("utf-8")
 
     _HAS_ORJSON = True
 except Exception:
@@ -62,7 +60,7 @@ except Exception:
 # =============================================================================
 # Version & Core Configuration
 # =============================================================================
-ENV_VERSION = "7.5.2"
+ENV_VERSION = "7.5.3"
 ENV_SCHEMA_VERSION = "2.1"
 MIN_PYTHON = (3, 8)
 
@@ -83,7 +81,7 @@ except Exception:
     yaml = None  # type: ignore
     YAML_AVAILABLE = False
 
-# Monitoring & Tracing
+# Monitoring
 try:
     from prometheus_client import Counter, Histogram  # type: ignore
 
@@ -92,6 +90,7 @@ except Exception:
     PROMETHEUS_AVAILABLE = False
     Counter = Histogram = None  # type: ignore
 
+# Tracing
 _TRACING_ENABLED = os.getenv("CORE_TRACING_ENABLED", "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 try:
@@ -105,15 +104,11 @@ except Exception:
     Status = StatusCode = None  # type: ignore
 
     class _DummyCM:
-        def __enter__(self):
-            return None
-
-        def __exit__(self, *args, **kwargs):
-            return False
+        def __enter__(self): return None
+        def __exit__(self, *args, **kwargs): return False
 
     class _DummyTracer:
-        def start_as_current_span(self, *args, **kwargs):
-            return _DummyCM()
+        def start_as_current_span(self, *args, **kwargs): return _DummyCM()
 
     _TRACER = _DummyTracer()  # type: ignore
 
@@ -122,16 +117,8 @@ except Exception:
 # Metrics (safe)
 # =============================================================================
 if PROMETHEUS_AVAILABLE:
-    env_config_loads_total = Counter(
-        "env_config_loads_total",
-        "Total configuration loads",
-        ["source", "status"],
-    )
-    env_config_errors_total = Counter(
-        "env_config_errors_total",
-        "Total configuration errors",
-        ["type"],
-    )
+    env_config_loads_total = Counter("env_config_loads_total", "Total configuration loads", ["source", "status"])
+    env_config_errors_total = Counter("env_config_errors_total", "Total configuration errors", ["type"])
     env_config_reload_duration = Histogram(
         "env_config_reload_duration_seconds",
         "Configuration reload duration (seconds)",
@@ -140,14 +127,9 @@ if PROMETHEUS_AVAILABLE:
 else:
 
     class _DummyMetric:
-        def labels(self, *args, **kwargs):
-            return self
-
-        def inc(self, *args, **kwargs):
-            return None
-
-        def observe(self, *args, **kwargs):
-            return None
+        def labels(self, *args, **kwargs): return self
+        def inc(self, *args, **kwargs): return None
+        def observe(self, *args, **kwargs): return None
 
     env_config_loads_total = _DummyMetric()
     env_config_errors_total = _DummyMetric()
@@ -267,7 +249,6 @@ class AuthMethod(str, Enum):
 # =============================================================================
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled", "ok", "active", "prod"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled", "inactive", "dev"}
-
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
 
@@ -342,9 +323,6 @@ def coerce_list(v: Any, default: Optional[List[str]] = None) -> List[str]:
 
 
 def coerce_dict(v: Any, default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """
-    Accepts dict or JSON string. Returns dict or default.
-    """
     if isinstance(v, dict):
         return v
     s = strip_value(v)
@@ -363,6 +341,13 @@ def get_first_env(*keys: str) -> Optional[str]:
         if v is not None and strip_value(v):
             return strip_value(v)
     return None
+
+
+def get_first_env_bool(*keys: str, default: bool = False) -> bool:
+    v = get_first_env(*keys)
+    if v is None:
+        return default
+    return coerce_bool(v, default)
 
 
 def get_first_env_int(*keys: str, default: int, **kwargs) -> int:
@@ -509,6 +494,14 @@ class Settings:
 
     TIMEZONE_DEFAULT: str = "Asia/Riyadh"
 
+    # Common runtime flags (Render)
+    DEBUG: bool = False
+    DEFER_ROUTER_MOUNT: bool = False
+    INIT_ENGINE_ON_BOOT: bool = True
+    ENABLE_SWAGGER: bool = True
+    ENABLE_REDOC: bool = True
+
+    # Auth
     AUTH_HEADER_NAME: str = "X-APP-TOKEN"
     APP_TOKEN: Optional[str] = None
     BACKUP_APP_TOKEN: Optional[str] = None
@@ -516,15 +509,18 @@ class Settings:
     ALLOW_QUERY_TOKEN: bool = False
     OPEN_MODE: bool = False
 
+    # Features
     AI_ANALYSIS_ENABLED: bool = True
     ADVANCED_ANALYSIS_ENABLED: bool = True
     ADVISOR_ENABLED: bool = True
     RATE_LIMIT_ENABLED: bool = True
 
+    # Rate limits
     MAX_REQUESTS_PER_MINUTE: int = 240
     MAX_RETRIES: int = 2
     RETRY_DELAY: float = 0.6
 
+    # Backend / cache
     BACKEND_BASE_URL: str = "http://127.0.0.1:8000"
     ENGINE_CACHE_TTL_SEC: int = 20
     CACHE_MAX_SIZE: int = 5000
@@ -533,14 +529,17 @@ class Settings:
 
     HTTP_TIMEOUT_SEC: float = 45.0
 
+    # Sheets layout
     TFB_SYMBOL_HEADER_ROW: int = 5
     TFB_SYMBOL_START_ROW: int = 6
 
+    # Google integration
     DEFAULT_SPREADSHEET_ID: Optional[str] = None
     GOOGLE_SHEETS_CREDENTIALS: Optional[str] = None
     GOOGLE_APPS_SCRIPT_URL: Optional[str] = None
     GOOGLE_APPS_SCRIPT_BACKUP_URL: Optional[str] = None
 
+    # Provider keys
     EODHD_API_KEY: Optional[str] = None
     EODHD_BASE_URL: Optional[str] = None
     FINNHUB_API_KEY: Optional[str] = None
@@ -550,6 +549,7 @@ class Settings:
     TWELVEDATA_API_KEY: Optional[str] = None
     MARKETSTACK_API_KEY: Optional[str] = None
 
+    # KSA providers
     ARGAAM_QUOTE_URL: Optional[str] = None
     ARGAAM_API_KEY: Optional[str] = None
     TADAWUL_QUOTE_URL: Optional[str] = None
@@ -558,19 +558,23 @@ class Settings:
     TADAWUL_REFRESH_INTERVAL: int = 60
     KSA_DISALLOW_EODHD: bool = True
 
+    # Provider lists
     ENABLED_PROVIDERS: List[str] = field(default_factory=lambda: ["eodhd", "finnhub"])
     KSA_PROVIDERS: List[str] = field(default_factory=lambda: ["yahoo_chart", "argaam"])
     PRIMARY_PROVIDER: str = "eodhd"
 
+    # Batching
     AI_BATCH_SIZE: int = 20
     AI_MAX_TICKERS: int = 500
     ADV_BATCH_SIZE: int = 25
     BATCH_CONCURRENCY: int = 5
 
+    # Render
     RENDER_API_KEY: Optional[str] = None
     RENDER_SERVICE_ID: Optional[str] = None
     RENDER_SERVICE_NAME: Optional[str] = None
 
+    # CORS
     ENABLE_CORS_ALL_ORIGINS: bool = False
     CORS_ORIGINS: str = ""
 
@@ -582,31 +586,22 @@ class Settings:
     def from_env(cls) -> "Settings":
         env_name = strip_value(get_first_env("APP_ENV", "ENVIRONMENT") or "production").lower()
 
+        # Auto providers
         auto_global: List[str] = []
-        if get_first_env("EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"):
-            auto_global.append("eodhd")
-        if get_first_env("FINNHUB_API_KEY", "FINNHUB_TOKEN"):
-            auto_global.append("finnhub")
-        if get_first_env("FMP_API_KEY"):
-            auto_global.append("fmp")
-        if get_first_env("ALPHA_VANTAGE_API_KEY"):
-            auto_global.append("alphavantage")
-        if get_first_env("TWELVEDATA_API_KEY"):
-            auto_global.append("twelvedata")
-        if get_first_env("MARKETSTACK_API_KEY"):
-            auto_global.append("marketstack")
-        if not auto_global:
-            auto_global = ["eodhd", "finnhub"]
+        if get_first_env("EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"): auto_global.append("eodhd")
+        if get_first_env("FINNHUB_API_KEY", "FINNHUB_TOKEN"): auto_global.append("finnhub")
+        if get_first_env("FMP_API_KEY"): auto_global.append("fmp")
+        if get_first_env("ALPHA_VANTAGE_API_KEY"): auto_global.append("alphavantage")
+        if get_first_env("TWELVEDATA_API_KEY"): auto_global.append("twelvedata")
+        if get_first_env("MARKETSTACK_API_KEY"): auto_global.append("marketstack")
+        if not auto_global: auto_global = ["eodhd", "finnhub"]
 
         auto_ksa: List[str] = []
-        if get_first_env("ARGAAM_QUOTE_URL"):
-            auto_ksa.append("argaam")
-        if get_first_env("TADAWUL_QUOTE_URL"):
-            auto_ksa.append("tadawul")
+        if get_first_env("ARGAAM_QUOTE_URL"): auto_ksa.append("argaam")
+        if get_first_env("TADAWUL_QUOTE_URL"): auto_ksa.append("tadawul")
         if coerce_bool(get_first_env("ENABLE_YAHOO_CHART_KSA", "ENABLE_YFINANCE_KSA"), True):
             auto_ksa.insert(0, "yahoo_chart")
-        if not auto_ksa:
-            auto_ksa = ["yahoo_chart", "argaam"]
+        if not auto_ksa: auto_ksa = ["yahoo_chart", "argaam"]
 
         google_creds_raw = get_first_env("GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS") or ""
         google_creds_obj = repair_json_creds(google_creds_raw)
@@ -616,35 +611,51 @@ class Settings:
             APP_NAME=get_first_env("APP_NAME", "SERVICE_NAME", "APP_TITLE") or "Tadawul Fast Bridge",
             APP_VERSION=get_first_env("APP_VERSION", "SERVICE_VERSION", "VERSION") or "dev",
             APP_ENV=env_name,
+
             LOG_LEVEL=get_first_env("LOG_LEVEL") or "INFO",
             LOG_JSON=coerce_bool(get_first_env("LOG_JSON"), False),
             LOG_FORMAT=get_first_env("LOG_FORMAT") or "",
+
             TIMEZONE_DEFAULT=get_first_env("APP_TIMEZONE", "TIMEZONE_DEFAULT", "TZ") or "Asia/Riyadh",
+
+            DEBUG=get_first_env_bool("DEBUG", default=False),
+            DEFER_ROUTER_MOUNT=get_first_env_bool("DEFER_ROUTER_MOUNT", default=False),
+            INIT_ENGINE_ON_BOOT=get_first_env_bool("INIT_ENGINE_ON_BOOT", default=True),
+            ENABLE_SWAGGER=get_first_env_bool("ENABLE_SWAGGER", default=True),
+            ENABLE_REDOC=get_first_env_bool("ENABLE_REDOC", default=True),
+
             AUTH_HEADER_NAME=get_first_env("AUTH_HEADER_NAME", "TOKEN_HEADER_NAME") or "X-APP-TOKEN",
             APP_TOKEN=get_first_env("APP_TOKEN", "TFB_APP_TOKEN"),
             BACKUP_APP_TOKEN=get_first_env("BACKUP_APP_TOKEN"),
             REQUIRE_AUTH=coerce_bool(get_first_env("REQUIRE_AUTH"), True),
             ALLOW_QUERY_TOKEN=coerce_bool(get_first_env("ALLOW_QUERY_TOKEN"), False),
             OPEN_MODE=coerce_bool(get_first_env("OPEN_MODE"), False),
+
             AI_ANALYSIS_ENABLED=coerce_bool(get_first_env("AI_ANALYSIS_ENABLED"), True),
             ADVANCED_ANALYSIS_ENABLED=coerce_bool(get_first_env("ADVANCED_ANALYSIS_ENABLED", "ADVANCED_ENABLED"), True),
             ADVISOR_ENABLED=coerce_bool(get_first_env("ADVISOR_ENABLED"), True),
             RATE_LIMIT_ENABLED=coerce_bool(get_first_env("ENABLE_RATE_LIMITING", "RATE_LIMIT_ENABLED"), True),
+
             MAX_REQUESTS_PER_MINUTE=get_first_env_int("MAX_REQUESTS_PER_MINUTE", default=240, lo=30, hi=5000),
             MAX_RETRIES=get_first_env_int("MAX_RETRIES", default=2, lo=0, hi=10),
             RETRY_DELAY=get_first_env_float("RETRY_DELAY", default=0.6, lo=0.0, hi=30.0),
+
             BACKEND_BASE_URL=get_first_env("BACKEND_BASE_URL", "TFB_BASE_URL") or "http://127.0.0.1:8000",
             ENGINE_CACHE_TTL_SEC=get_first_env_int("ENGINE_CACHE_TTL_SEC", "CACHE_DEFAULT_TTL", default=20, lo=5, hi=3600),
             CACHE_MAX_SIZE=get_first_env_int("CACHE_MAX_SIZE", default=5000, lo=100, hi=500000),
             CACHE_SAVE_INTERVAL=get_first_env_int("CACHE_SAVE_INTERVAL", default=300, lo=30, hi=86400),
             CACHE_BACKUP_ENABLED=coerce_bool(get_first_env("CACHE_BACKUP_ENABLED"), True),
+
             HTTP_TIMEOUT_SEC=get_first_env_float("HTTP_TIMEOUT_SEC", "HTTP_TIMEOUT", default=45.0, lo=5.0, hi=180.0),
+
             TFB_SYMBOL_HEADER_ROW=get_first_env_int("TFB_SYMBOL_HEADER_ROW", default=5, lo=1, hi=1000),
             TFB_SYMBOL_START_ROW=get_first_env_int("TFB_SYMBOL_START_ROW", default=6, lo=1, hi=1000),
+
             DEFAULT_SPREADSHEET_ID=get_first_env("DEFAULT_SPREADSHEET_ID", "SPREADSHEET_ID", "GOOGLE_SHEETS_ID"),
             GOOGLE_SHEETS_CREDENTIALS=google_creds_str,
             GOOGLE_APPS_SCRIPT_URL=get_first_env("GOOGLE_APPS_SCRIPT_URL"),
             GOOGLE_APPS_SCRIPT_BACKUP_URL=get_first_env("GOOGLE_APPS_SCRIPT_BACKUP_URL"),
+
             EODHD_API_KEY=get_first_env("EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"),
             EODHD_BASE_URL=get_first_env("EODHD_BASE_URL"),
             FINNHUB_API_KEY=get_first_env("FINNHUB_API_KEY", "FINNHUB_TOKEN"),
@@ -653,6 +664,7 @@ class Settings:
             ALPHA_VANTAGE_API_KEY=get_first_env("ALPHA_VANTAGE_API_KEY"),
             TWELVEDATA_API_KEY=get_first_env("TWELVEDATA_API_KEY"),
             MARKETSTACK_API_KEY=get_first_env("MARKETSTACK_API_KEY"),
+
             ARGAAM_QUOTE_URL=get_first_env("ARGAAM_QUOTE_URL"),
             ARGAAM_API_KEY=get_first_env("ARGAAM_API_KEY"),
             TADAWUL_QUOTE_URL=get_first_env("TADAWUL_QUOTE_URL"),
@@ -660,18 +672,23 @@ class Settings:
             TADAWUL_MAX_SYMBOLS=get_first_env_int("TADAWUL_MAX_SYMBOLS", default=1500, lo=10, hi=50000),
             TADAWUL_REFRESH_INTERVAL=get_first_env_int("TADAWUL_REFRESH_INTERVAL", default=60, lo=5, hi=3600),
             KSA_DISALLOW_EODHD=coerce_bool(get_first_env("KSA_DISALLOW_EODHD"), True),
+
             ENABLED_PROVIDERS=get_first_env_list("ENABLED_PROVIDERS", "PROVIDERS", default=auto_global),
             KSA_PROVIDERS=get_first_env_list("KSA_PROVIDERS", default=auto_ksa),
             PRIMARY_PROVIDER=get_first_env("PRIMARY_PROVIDER") or (auto_global[0] if auto_global else "eodhd"),
+
             AI_BATCH_SIZE=get_first_env_int("AI_BATCH_SIZE", default=20, lo=1, hi=200),
             AI_MAX_TICKERS=get_first_env_int("AI_MAX_TICKERS", default=500, lo=1, hi=20000),
             ADV_BATCH_SIZE=get_first_env_int("ADV_BATCH_SIZE", default=25, lo=1, hi=500),
             BATCH_CONCURRENCY=get_first_env_int("BATCH_CONCURRENCY", default=5, lo=1, hi=50),
+
             RENDER_API_KEY=get_first_env("RENDER_API_KEY"),
             RENDER_SERVICE_ID=get_first_env("RENDER_SERVICE_ID"),
             RENDER_SERVICE_NAME=get_first_env("RENDER_SERVICE_NAME"),
+
             ENABLE_CORS_ALL_ORIGINS=coerce_bool(get_first_env("ENABLE_CORS_ALL_ORIGINS", "CORS_ALL_ORIGINS"), False),
             CORS_ORIGINS=get_first_env("CORS_ORIGINS") or "",
+
             config_sources={"env": ConfigSource.ENV_VAR},
         )
 
@@ -682,7 +699,7 @@ class Settings:
         errors: List[str] = []
         warns: List[str] = []
 
-        if not self.OPEN_MODE and not self.APP_TOKEN:
+        if not self.OPEN_MODE and self.REQUIRE_AUTH and not self.APP_TOKEN:
             errors.append("Authentication required but no APP_TOKEN configured.")
         if self.OPEN_MODE and self.APP_TOKEN:
             warns.append("OPEN_MODE enabled while APP_TOKEN exists. Endpoints exposed publicly.")
@@ -829,6 +846,13 @@ APP_VERSION = settings.APP_VERSION
 APP_ENV = settings.APP_ENV
 LOG_LEVEL = settings.LOG_LEVEL
 TIMEZONE_DEFAULT = settings.TIMEZONE_DEFAULT
+
+DEBUG = settings.DEBUG
+DEFER_ROUTER_MOUNT = settings.DEFER_ROUTER_MOUNT
+INIT_ENGINE_ON_BOOT = settings.INIT_ENGINE_ON_BOOT
+ENABLE_SWAGGER = settings.ENABLE_SWAGGER
+ENABLE_REDOC = settings.ENABLE_REDOC
+
 AUTH_HEADER_NAME = settings.AUTH_HEADER_NAME
 TFB_SYMBOL_HEADER_ROW = settings.TFB_SYMBOL_HEADER_ROW
 TFB_SYMBOL_START_ROW = settings.TFB_SYMBOL_START_ROW
@@ -852,6 +876,7 @@ PRIMARY_PROVIDER = settings.PRIMARY_PROVIDER
 
 __all__ = [
     "ENV_VERSION",
+    "ENV_SCHEMA_VERSION",
     "Environment",
     "LogLevel",
     "ProviderType",
@@ -874,11 +899,20 @@ __all__ = [
     "coerce_list",
     "coerce_dict",
     "get_first_env",
+    "get_first_env_bool",
+    "get_first_env_int",
+    "get_first_env_float",
+    "get_first_env_list",
     "mask_secret",
     "is_valid_url",
     "repair_private_key",
     "repair_json_creds",
     "get_system_info",
+    "DEBUG",
+    "DEFER_ROUTER_MOUNT",
+    "INIT_ENGINE_ON_BOOT",
+    "ENABLE_SWAGGER",
+    "ENABLE_REDOC",
     "APP_NAME",
     "APP_VERSION",
     "APP_ENV",
