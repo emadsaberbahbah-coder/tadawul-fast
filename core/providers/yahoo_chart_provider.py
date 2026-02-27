@@ -2,10 +2,10 @@
 # core/providers/yahoo_chart_provider.py
 """
 ================================================================================
-Yahoo Chart Provider (Global Market Data) — v6.4.0 (Production Hardened)
+Yahoo Chart Provider (Global Market Data) — v6.5.0 (Loader-Compatible + Prod Safe)
 ================================================================================
 
-Goals
+What this provider guarantees
 - ✅ No startup crashes (all optional deps safe)
 - ✅ Async-friendly: threadpool for yfinance (blocking)
 - ✅ Deterministic + safe fallbacks (no heavy ML required)
@@ -14,18 +14,17 @@ Goals
     volume, market_cap, currency, name, exchange,
     price_change, percent_change, week_52_position_pct,
     rsi_14, volatility_30d,
-    forecast_price_1m/3m/12m, expected_roi_1m/3m/12m, forecast_confidence,
+    forecast_price_1m/3m/12m, expected_roi_1m/3m/12m, forecast_confidence (0..1),
     last_updated_utc, last_updated_riyadh, history_last_utc
 
 - ✅ Keeps backward-compatible aliases:
     price, prev_close, 52w_high, 52w_low, change, change_pct
 
-Hardening fixes vs v6.3.0
-- ✅ Prometheus dummy metrics won't break when `.labels()` is called
-- ✅ Circuit breaker gauge safe even when Prometheus is missing
-- ✅ Avoids exceptions on `fast_info` attribute differences
-- ✅ More robust history handling + symbol normalization
-- ✅ SingleFlight avoids dead futures and handles cancelled tasks safely
+Loader compatibility (important)
+- Some loaders only accept a provider instance / factory / Provider class without awaiting:
+  This module exports:
+    provider, PROVIDER, Provider, get_provider(), build_provider(), create_provider(), provider_factory()
+
 ================================================================================
 """
 
@@ -33,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import json
 import logging
 import math
 import os
@@ -99,7 +99,7 @@ except Exception:
     Counter = Histogram = Gauge = _DummyMetric  # type: ignore
 
 # =============================================================================
-# OpenTelemetry (optional)
+# OpenTelemetry (optional) — SAFE
 # =============================================================================
 try:
     from opentelemetry import trace  # type: ignore
@@ -128,7 +128,9 @@ except Exception:
             return False
 
 
-# JSON helper (orjson safe default=str)
+# =============================================================================
+# JSON helper (orjson optional, safe)
+# =============================================================================
 try:
     import orjson  # type: ignore
 
@@ -137,7 +139,6 @@ try:
 
     _HAS_ORJSON = True
 except Exception:
-    import json
 
     def json_dumps(v: Any) -> str:
         return json.dumps(v, default=str, ensure_ascii=False)
@@ -151,7 +152,7 @@ logger = logging.getLogger("core.providers.yahoo_chart_provider")
 logger.addHandler(logging.NullHandler())
 
 PROVIDER_NAME = "yahoo_chart"
-PROVIDER_VERSION = "6.4.0"
+PROVIDER_VERSION = "6.5.0"
 
 # =============================================================================
 # Env helpers (safe)
@@ -199,7 +200,7 @@ def _env_bool(name: str, default: bool) -> bool:
 def _configured() -> bool:
     if not _env_bool("YAHOO_ENABLED", True):
         return False
-    return _HAS_YFINANCE
+    return bool(_HAS_YFINANCE)
 
 
 def _timeout_sec() -> float:
@@ -327,6 +328,7 @@ def normalize_symbol(symbol: str) -> str:
     if not s:
         return ""
     s = s.translate(_ARABIC_DIGITS).strip().upper()
+    # if numeric, treat as KSA
     if _KSA_CODE_RE.match(s):
         return f"{s}.SR"
     return s
@@ -360,13 +362,14 @@ def clean_dict(d: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # =============================================================================
-# Metrics
+# Metrics (safe even without Prometheus)
 # =============================================================================
 yahoo_requests_total = Counter("yahoo_requests_total", "Total Yahoo requests", ["symbol", "op", "status"])
 yahoo_request_duration = Histogram("yahoo_request_duration_seconds", "Yahoo request duration", ["symbol", "op"])
 yahoo_cache_hits_total = Counter("yahoo_cache_hits_total", "Yahoo cache hits", ["symbol"])
 yahoo_cache_misses_total = Counter("yahoo_cache_misses_total", "Yahoo cache misses", ["symbol"])
 yahoo_circuit_state = Gauge("yahoo_circuit_state", "Yahoo circuit breaker state", ["state"])
+
 
 # =============================================================================
 # Rate limiter (token bucket)
@@ -553,7 +556,8 @@ def _rsi_14(closes: List[float]) -> Optional[float]:
                 return 100.0
             rs = avg_gain / avg_loss
             return float(100.0 - (100.0 / (1.0 + rs)))
-        # pure python
+
+        # pure python fallback
         n = 14
         diffs = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
         gains = [d if d > 0 else 0.0 for d in diffs]
@@ -572,6 +576,7 @@ def _rsi_14(closes: List[float]) -> Optional[float]:
 
 
 def _volatility_30d(closes: List[float]) -> Optional[float]:
+    # annualized volatility based on last 30 trading days log returns
     if len(closes) < 31:
         return None
     try:
@@ -585,6 +590,7 @@ def _volatility_30d(closes: List[float]) -> Optional[float]:
             if math.isnan(vol) or math.isinf(vol):
                 return None
             return vol
+
         rets = []
         for i in range(1, len(window)):
             if window[i - 1] > 0 and window[i] > 0:
@@ -599,6 +605,10 @@ def _volatility_30d(closes: List[float]) -> Optional[float]:
 
 
 def _simple_forecast(closes: List[float], horizon_days: int) -> Tuple[Optional[float], Optional[float], float]:
+    """
+    Simple log-linear forecast:
+    returns (forecast_price, expected_roi_pct, confidence_0_1)
+    """
     if len(closes) < 60 or horizon_days <= 0:
         return None, None, 0.0
     try:
@@ -628,6 +638,7 @@ def _simple_forecast(closes: List[float], horizon_days: int) -> Tuple[Optional[f
 
         last = float(closes[-1])
         roi_pct = (forecast_price / last - 1.0) * 100.0
+
         vol = _volatility_30d(closes) or 0.25
         conf = max(0.05, min(0.95, (max(0.0, min(1.0, r2)) * 0.8 + 0.2) * (1.0 / (1.0 + max(0.0, vol - 0.25)))))
         return forecast_price, roi_pct, conf
@@ -638,7 +649,8 @@ def _simple_forecast(closes: List[float], horizon_days: int) -> Tuple[Optional[f
 # =============================================================================
 # Provider Implementation
 # =============================================================================
-_CPU_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=6, thread_name_prefix="YahooWorker")
+_CPU_WORKERS = max(2, _env_int("YAHOO_THREADPOOL_WORKERS", 6))
+_CPU_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=_CPU_WORKERS, thread_name_prefix="YahooWorker")
 
 
 def _get_attr(obj: Any, *names: str) -> Any:
@@ -646,8 +658,11 @@ def _get_attr(obj: Any, *names: str) -> Any:
         try:
             if obj is None:
                 return None
-            if isinstance(obj, dict) and n in obj:
-                return obj.get(n)
+            # dict-like
+            if isinstance(obj, dict):
+                if n in obj:
+                    return obj.get(n)
+            # object-like
             if hasattr(obj, n):
                 return getattr(obj, n)
         except Exception:
@@ -671,9 +686,18 @@ class YahooChartProvider:
     _rate: TokenBucket = field(default_factory=lambda: TokenBucket(_rate_limit_per_sec(), float(_rate_limit_burst())))
     _cb: CircuitBreaker = field(default_factory=lambda: CircuitBreaker(_cb_fail_threshold(), _cb_cooldown_sec(), _cb_success_threshold()))
 
+    # ----------------------------
+    # Core blocking fetch (yfinance)
+    # ----------------------------
     def _blocking_fetch(self, symbol: str) -> Dict[str, Any]:
         if not _HAS_YFINANCE or yf is None:
-            return {"symbol": symbol, "error": "yfinance_not_installed", "data_source": PROVIDER_NAME, "provider_version": PROVIDER_VERSION}
+            return {
+                "symbol": symbol,
+                "error": "yfinance_not_installed",
+                "provider": PROVIDER_NAME,
+                "provider_version": PROVIDER_VERSION,
+                "data_sources": [PROVIDER_NAME],
+            }
 
         last_err: Optional[Exception] = None
 
@@ -682,13 +706,13 @@ class YahooChartProvider:
                 t0 = time.time()
                 ticker = yf.Ticker(symbol)
 
-                # fast_info (may be dict-like or object depending on yfinance version)
+                # fast_info (dict-like or object-like depending on yfinance version)
                 try:
                     fast_info = ticker.fast_info
                 except Exception:
                     fast_info = None
 
-                # info (can be slow/unreliable)
+                # info can be slow; tolerate failures
                 try:
                     info = ticker.info
                 except Exception:
@@ -696,11 +720,12 @@ class YahooChartProvider:
 
                 out: Dict[str, Any] = {
                     "symbol": symbol,
-                    "data_source": PROVIDER_NAME,
+                    "provider": PROVIDER_NAME,
                     "provider_version": PROVIDER_VERSION,
+                    "data_sources": [PROVIDER_NAME],
                 }
 
-                # Price + prev close
+                # Prices
                 price = safe_float(_get_attr(fast_info, "last_price", "lastPrice", "regularMarketPrice"))
                 prev_close = safe_float(_get_attr(fast_info, "previous_close", "previousClose", "regularMarketPreviousClose"))
 
@@ -738,13 +763,20 @@ class YahooChartProvider:
                     name = safe_str(info.get("shortName") or info.get("longName"))
                     exchange = safe_str(info.get("exchange") or info.get("fullExchangeName"))
 
-                # History (for indicators + fallback price)
+                # History (for indicators + fallback price + fallback 52w + prev_close)
                 closes: List[float] = []
                 hist_last_dt: Optional[datetime] = None
+                last_hist_row = None
 
                 try:
                     hist = ticker.history(period=_history_period(), interval=_history_interval(), auto_adjust=False)
                     if hist is not None and not getattr(hist, "empty", True):
+                        try:
+                            last_hist_row = hist.iloc[-1] if hasattr(hist, "iloc") else None
+                        except Exception:
+                            last_hist_row = None
+
+                        # closes
                         try:
                             if _HAS_PANDAS and pd is not None:
                                 c = hist["Close"].dropna().astype(float).tolist()
@@ -755,14 +787,41 @@ class YahooChartProvider:
                         except Exception:
                             closes = []
 
+                        # last timestamp
                         try:
                             idx = hist.index[-1]
                             hist_last_dt = idx.to_pydatetime() if hasattr(idx, "to_pydatetime") else idx
                         except Exception:
                             hist_last_dt = None
 
+                        # fallback price
                         if price is None and closes:
                             price = float(closes[-1])
+
+                        # fallback prev close
+                        if prev_close is None and len(closes) >= 2:
+                            prev_close = float(closes[-2])
+
+                        # fallback 52w from history if missing
+                        if (w52_high is None or w52_low is None) and closes:
+                            try:
+                                window = closes[-252:] if len(closes) > 252 else closes
+                                w52_high = w52_high or max(window)
+                                w52_low = w52_low or min(window)
+                            except Exception:
+                                pass
+
+                        # fallback day high/low from last row if missing
+                        if last_hist_row is not None:
+                            try:
+                                if day_high is None:
+                                    day_high = safe_float(last_hist_row.get("High") if hasattr(last_hist_row, "get") else last_hist_row["High"])
+                                if day_low is None:
+                                    day_low = safe_float(last_hist_row.get("Low") if hasattr(last_hist_row, "get") else last_hist_row["Low"])
+                                if volume is None:
+                                    volume = safe_float(last_hist_row.get("Volume") if hasattr(last_hist_row, "get") else last_hist_row["Volume"])
+                            except Exception:
+                                pass
                 except Exception:
                     closes = []
 
@@ -770,48 +829,54 @@ class YahooChartProvider:
                     raise ValueError("no_price_from_yahoo")
 
                 # Canonical keys
-                out["current_price"] = price
-                out["previous_close"] = prev_close
-                out["day_high"] = day_high
-                out["day_low"] = day_low
-                out["week_52_high"] = w52_high
-                out["week_52_low"] = w52_low
-                out["volume"] = volume
-                out["market_cap"] = market_cap
+                out["current_price"] = float(price)
+                out["previous_close"] = float(prev_close) if prev_close is not None else None
+                out["day_high"] = float(day_high) if day_high is not None else None
+                out["day_low"] = float(day_low) if day_low is not None else None
+                out["week_52_high"] = float(w52_high) if w52_high is not None else None
+                out["week_52_low"] = float(w52_low) if w52_low is not None else None
+                out["volume"] = float(volume) if volume is not None else None
+                out["market_cap"] = float(market_cap) if market_cap is not None else None
                 out["currency"] = currency
                 out["name"] = name
                 out["exchange"] = exchange
 
                 # Derived canonical
-                if prev_close is not None and prev_close != 0:
-                    chg = price - prev_close
-                    out["price_change"] = chg
-                    out["percent_change"] = (chg / prev_close) * 100.0
+                if out.get("previous_close") not in (None, 0.0):
+                    chg = out["current_price"] - float(out["previous_close"])
+                    out["price_change"] = float(chg)
+                    out["percent_change"] = float((chg / float(out["previous_close"])) * 100.0)
 
-                if w52_high is not None and w52_low is not None and w52_high != w52_low:
-                    out["week_52_position_pct"] = ((price - w52_low) / (w52_high - w52_low)) * 100.0
+                if out.get("week_52_high") is not None and out.get("week_52_low") is not None and out["week_52_high"] != out["week_52_low"]:
+                    out["week_52_position_pct"] = float(
+                        ((out["current_price"] - out["week_52_low"]) / (out["week_52_high"] - out["week_52_low"])) * 100.0
+                    )
 
                 # Indicators + Forecasts
                 if closes:
-                    out["rsi_14"] = _rsi_14(closes)
-                    out["volatility_30d"] = _volatility_30d(closes)
+                    rsi = _rsi_14(closes)
+                    vol = _volatility_30d(closes)
+                    if rsi is not None:
+                        out["rsi_14"] = float(rsi)
+                    if vol is not None:
+                        out["volatility_30d"] = float(vol)  # 0..1-ish (annualized)
 
                     f1, roi1, c1 = _simple_forecast(closes, horizon_days=30)
                     f3, roi3, c3 = _simple_forecast(closes, horizon_days=90)
                     f12, roi12, c12 = _simple_forecast(closes, horizon_days=365)
 
                     if f1 is not None:
-                        out["forecast_price_1m"] = f1
-                        out["expected_roi_1m"] = roi1
+                        out["forecast_price_1m"] = float(f1)
+                        out["expected_roi_1m"] = float(roi1) if roi1 is not None else None
                     if f3 is not None:
-                        out["forecast_price_3m"] = f3
-                        out["expected_roi_3m"] = roi3
+                        out["forecast_price_3m"] = float(f3)
+                        out["expected_roi_3m"] = float(roi3) if roi3 is not None else None
                     if f12 is not None:
-                        out["forecast_price_12m"] = f12
-                        out["expected_roi_12m"] = roi12
+                        out["forecast_price_12m"] = float(f12)
+                        out["expected_roi_12m"] = float(roi12) if roi12 is not None else None
 
                     conf = max(0.0, min(1.0, min([x for x in [c1, c3, c12] if x is not None] or [0.0])))
-                    out["forecast_confidence"] = conf
+                    out["forecast_confidence"] = float(conf)  # 0..1
 
                 # Timestamps
                 out["last_updated_utc"] = _utc_iso()
@@ -819,12 +884,13 @@ class YahooChartProvider:
                 if hist_last_dt is not None:
                     out["history_last_utc"] = _utc_iso(hist_last_dt)
 
-                # Simple data quality score
-                score = 0
+                # Data quality score (0..1)
+                filled = 0
                 for k in ("current_price", "previous_close", "volume", "week_52_high", "week_52_low"):
                     if out.get(k) is not None:
-                        score += 1
-                out["data_quality_score"] = score / 5.0
+                        filled += 1
+                out["data_quality_score"] = float(filled / 5.0)
+
                 out["_fetch_ms"] = int((time.time() - t0) * 1000)
 
                 # Backward-compatible aliases
@@ -845,17 +911,22 @@ class YahooChartProvider:
         return {
             "symbol": symbol,
             "error": f"fetch_failed: {str(last_err)}",
-            "data_source": PROVIDER_NAME,
+            "provider": PROVIDER_NAME,
             "provider_version": PROVIDER_VERSION,
+            "data_sources": [PROVIDER_NAME],
         }
 
+    # ----------------------------
+    # Public async API
+    # ----------------------------
     async def fetch_enriched_quote_patch(self, symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         if not _configured():
             return {
                 "symbol": symbol,
                 "error": "provider_disabled_or_yfinance_missing",
-                "data_source": PROVIDER_NAME,
+                "provider": PROVIDER_NAME,
                 "provider_version": PROVIDER_VERSION,
+                "data_sources": [PROVIDER_NAME],
             }
 
         sym = normalize_symbol(symbol)
@@ -863,13 +934,22 @@ class YahooChartProvider:
             return {
                 "symbol": symbol,
                 "error": "invalid_symbol",
-                "data_source": PROVIDER_NAME,
+                "provider": PROVIDER_NAME,
                 "provider_version": PROVIDER_VERSION,
+                "data_sources": [PROVIDER_NAME],
             }
 
+        # Circuit breaker
         if not await self._cb.allow():
-            return {"symbol": sym, "error": "circuit_open", "data_source": PROVIDER_NAME, "provider_version": PROVIDER_VERSION}
+            return {
+                "symbol": sym,
+                "error": "circuit_open",
+                "provider": PROVIDER_NAME,
+                "provider_version": PROVIDER_VERSION,
+                "data_sources": [PROVIDER_NAME],
+            }
 
+        # Cache
         cached = await self.quote_cache.get(sym, kind="quote")
         if cached is not None:
             yahoo_cache_hits_total.labels(symbol=sym).inc()
@@ -910,8 +990,9 @@ class YahooChartProvider:
                     return {
                         "symbol": sym,
                         "error": f"exception: {e}",
-                        "data_source": PROVIDER_NAME,
+                        "provider": PROVIDER_NAME,
                         "provider_version": PROVIDER_VERSION,
+                        "data_sources": [PROVIDER_NAME],
                     }
 
         return await self.singleflight.run(f"yahoo:{sym}", _do_fetch)
@@ -928,7 +1009,13 @@ class YahooChartProvider:
             if isinstance(r, dict):
                 out[s] = r
             else:
-                out[s] = {"symbol": s, "error": str(r), "data_source": PROVIDER_NAME, "provider_version": PROVIDER_VERSION}
+                out[s] = {
+                    "symbol": s,
+                    "error": str(r),
+                    "provider": PROVIDER_NAME,
+                    "provider_version": PROVIDER_VERSION,
+                    "data_sources": [PROVIDER_NAME],
+                }
         return out
 
     async def clear_caches(self) -> None:
@@ -944,23 +1031,28 @@ class YahooChartProvider:
             "has_pandas": _HAS_PANDAS,
             "has_orjson": _HAS_ORJSON,
             "has_yfinance": _HAS_YFINANCE,
+            "threadpool_workers": _CPU_WORKERS,
         }
 
     async def health_check(self) -> Dict[str, Any]:
         sample = os.getenv("YAHOO_HEALTH_SYMBOL", "AAPL")
         res = await self.fetch_enriched_quote_patch(sample, debug=False)
         ok = isinstance(res, dict) and not res.get("error") and res.get("current_price") is not None
-        return {"status": "healthy" if ok else "unhealthy", "sample": sample, "error": res.get("error") if isinstance(res, dict) else str(res)}
+        return {
+            "status": "healthy" if ok else "unhealthy",
+            "sample": sample,
+            "error": res.get("error") if isinstance(res, dict) else str(res),
+        }
 
 
 # =============================================================================
-# Singleton + Exports
+# Async singleton (engine-friendly)
 # =============================================================================
 _PROVIDER_INSTANCE: Optional[YahooChartProvider] = None
 _PROVIDER_LOCK = asyncio.Lock()
 
 
-async def get_provider() -> YahooChartProvider:
+async def aget_provider() -> YahooChartProvider:
     global _PROVIDER_INSTANCE
     if _PROVIDER_INSTANCE is None:
         async with _PROVIDER_LOCK:
@@ -970,7 +1062,7 @@ async def get_provider() -> YahooChartProvider:
 
 
 async def fetch_enriched_quote_patch(symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return await (await get_provider()).fetch_enriched_quote_patch(symbol, debug=debug, *args, **kwargs)
+    return await (await aget_provider()).fetch_enriched_quote_patch(symbol, debug=debug, *args, **kwargs)
 
 
 # Compatibility alias
@@ -978,19 +1070,19 @@ fetch_quote_patch = fetch_enriched_quote_patch
 
 
 async def fetch_batch_patch(symbols: List[str], debug: bool = False) -> Dict[str, Dict[str, Any]]:
-    return await (await get_provider()).fetch_batch(symbols, debug=debug)
+    return await (await aget_provider()).fetch_batch(symbols, debug=debug)
 
 
 async def get_client_metrics() -> Dict[str, Any]:
-    return await (await get_provider()).get_metrics()
+    return await (await aget_provider()).get_metrics()
 
 
 async def health_check() -> Dict[str, Any]:
-    return await (await get_provider()).health_check()
+    return await (await aget_provider()).health_check()
 
 
 async def clear_caches() -> None:
-    await (await get_provider()).clear_caches()
+    await (await aget_provider()).clear_caches()
 
 
 async def aclose_yahoo_client() -> None:
@@ -998,6 +1090,48 @@ async def aclose_yahoo_client() -> None:
     _PROVIDER_INSTANCE = None
 
 
+# =============================================================================
+# Loader-friendly adapter (NO await required to obtain provider)
+# =============================================================================
+class YahooProviderAdapter:
+    async def get_quote(self, symbol: str) -> Dict[str, Any]:
+        return await fetch_enriched_quote_patch(symbol)
+
+    async def quote(self, symbol: str) -> Dict[str, Any]:
+        return await fetch_enriched_quote_patch(symbol)
+
+    async def fetch_quote(self, symbol: str) -> Dict[str, Any]:
+        return await fetch_enriched_quote_patch(symbol)
+
+    async def close(self) -> None:
+        await aclose_yahoo_client()
+
+
+# Export loader-friendly names
+provider = YahooProviderAdapter()
+PROVIDER = provider
+Provider = YahooProviderAdapter
+
+
+def get_provider():
+    return provider
+
+
+def build_provider():
+    return provider
+
+
+def create_provider():
+    return provider
+
+
+def provider_factory():
+    return provider
+
+
+# =============================================================================
+# CLI test
+# =============================================================================
 if __name__ == "__main__":
     import sys
 
@@ -1012,7 +1146,10 @@ if __name__ == "__main__":
 
 
 __all__ = [
-    "get_provider",
+    "PROVIDER_NAME",
+    "PROVIDER_VERSION",
+    # engine async exports
+    "aget_provider",
     "fetch_enriched_quote_patch",
     "fetch_quote_patch",
     "fetch_batch_patch",
@@ -1020,4 +1157,12 @@ __all__ = [
     "health_check",
     "clear_caches",
     "aclose_yahoo_client",
+    # loader-friendly exports
+    "provider",
+    "PROVIDER",
+    "Provider",
+    "get_provider",
+    "build_provider",
+    "create_provider",
+    "provider_factory",
 ]
