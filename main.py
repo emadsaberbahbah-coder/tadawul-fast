@@ -1,28 +1,33 @@
 #!/usr/bin/env python3
 """
-audit_data_quality.py
+scripts/audit_data_quality.py
 ================================================================================
-TADAWUL FAST BRIDGE — ENTERPRISE DATA QUALITY AUDITOR (v4.2.0)
+TADAWUL FAST BRIDGE — ENTERPRISE DATA QUALITY AUDITOR (v4.3.0)
 ================================================================================
-Aligned • Production-safe • Non-blocking exports • Engine-compatible
+Aligned • Production-safe • Engine-compatible • Async-safe exports • Deterministic
 
-Key fixes vs your pasted v4.0.0
-- ✅ Aligns with your current adapter layer: uses `core.data_engine` (not core.data_engine_v2)
-- ✅ Never passes unsupported kwargs (e.g., refresh=...) to engine methods
-- ✅ Fixes optional-deps crashes (numpy/pandas not installed → no NameError)
-- ✅ Correctly interprets `--refresh` as "bypass cache" (use_cache=False)
-- ✅ Stronger symbol/page loading fallbacks (supports integrations.symbols_reader / symbols_reader)
-- ✅ Exports are async-safe (file writes run in executor)
-- ✅ Cleaner, deterministic audit logic + stable severity rules
-- ✅ Removes heavy unused stacks (seaborn/websockets/etc.) to reduce startup risk
+Why this revision (vs your pasted v4.2.0):
+- ✅ FIX: `safe_str()` was missing → caused runtime crash during audits
+- ✅ FIX: Export section used `asyncio.gather()` outside an event loop → RuntimeError
+- ✅ Better engine-compatibility:
+     - handles list results that don’t contain symbol by mapping back to input order
+     - never passes unsupported kwargs
+- ✅ Stronger timestamp handling:
+     - accepts multiple timestamp fields
+     - avoids crashing on non-ISO strings
+- ✅ Safer concurrency:
+     - bounded semaphore
+     - avoids creating an event-loop Future outside loop
+- ✅ Cleaner exit codes and robust shutdown
 
 CLI examples
-- python audit_data_quality.py --keys MARKET_LEADERS MY_PORTFOLIO --sheet-id "<SID>" --refresh 1 --json-out report.json --csv-out alerts.csv
-- python audit_data_quality.py --keys MARKET_LEADERS --max-symbols 200 --refresh 0
+- python scripts/audit_data_quality.py --keys MARKET_LEADERS MY_PORTFOLIO --sheet-id "<SID>" --refresh 1 --json-out report.json --csv-out alerts.csv
+- python scripts/audit_data_quality.py --keys MARKET_LEADERS --max-symbols 200 --refresh 0
 
 Environment
 - DEFAULT_SPREADSHEET_ID : fallback Sheet ID
 - AUDIT_BATCH_SIZE       : default 200
+- AUDIT_MAX_WORKERS      : thread pool size for file exports
 - AUDIT_HMAC_KEY         : optional HMAC signing for exported JSON
 """
 
@@ -44,6 +49,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+
 
 # -----------------------------------------------------------------------------
 # High-performance JSON (orjson optional)
@@ -68,6 +74,7 @@ except Exception:
         return json.loads(v)
 
     _HAS_ORJSON = False
+
 
 # -----------------------------------------------------------------------------
 # Optional numeric/data libs (guarded)
@@ -98,10 +105,11 @@ except Exception:
     pq = None  # type: ignore
     _HAS_PARQUET = False
 
+
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
-SERVICE_VERSION = "4.2.0"
+SERVICE_VERSION = "4.3.0"
 logger = logging.getLogger("TFB.Audit")
 logging.basicConfig(
     level=logging.INFO,
@@ -109,13 +117,20 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 
+
 # -----------------------------------------------------------------------------
-# Executors (global, persistent)
+# Executors (global, persistent) - used ONLY for file writes / CPU-light work
 # -----------------------------------------------------------------------------
+def _clamp_int(v: int, lo: int, hi: int) -> int:
+    return max(lo, min(hi, v))
+
+
+_MAX_WORKERS = _clamp_int(int(os.getenv("AUDIT_MAX_WORKERS", "8") or "8"), 2, 32)
 _CPU_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=max(4, int(os.getenv("AUDIT_MAX_WORKERS", "8"))),
+    max_workers=_MAX_WORKERS,
     thread_name_prefix="AuditWorker",
 )
+
 
 # -----------------------------------------------------------------------------
 # Enums
@@ -177,7 +192,7 @@ class AuditConfig:
     min_history_points_soft: int = 60
     min_history_points_hard: int = 20
 
-    # output
+    # output (informational)
     export_formats: List[str] = field(default_factory=lambda: ["json", "csv"])
 
     def to_dict(self) -> Dict[str, Any]:
@@ -295,6 +310,19 @@ _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _RIYADH_TZ = timezone(timedelta(hours=3))
 
 
+def safe_str(x: Any, default: str = "") -> str:
+    """Missing in v4.2.0. Keep it extremely defensive."""
+    try:
+        if x is None:
+            return default
+        if isinstance(x, (bytes, bytearray)):
+            return x.decode("utf-8", errors="replace").strip()
+        s = str(x).strip()
+        return s if s else default
+    except Exception:
+        return default
+
+
 def _utc_iso(dt: Optional[datetime] = None) -> str:
     d = dt or datetime.now(timezone.utc)
     if d.tzinfo is None:
@@ -318,17 +346,24 @@ def _riyadh_iso(utc_iso: Optional[str] = None) -> str:
 def _parse_iso_time(iso_str: Optional[str]) -> Optional[datetime]:
     if not iso_str:
         return None
+    s = safe_str(iso_str, "")
+    if not s:
+        return None
+    # tolerate Z
+    s = s.replace("Z", "+00:00")
     try:
-        return datetime.fromisoformat(str(iso_str).replace("Z", "+00:00"))
+        return datetime.fromisoformat(s)
     except Exception:
         return None
 
 
-def _age_hours(utc_iso: Optional[str]) -> Optional[float]:
-    dt = _parse_iso_time(utc_iso)
+def _age_hours(utc_iso_str: Optional[str]) -> Optional[float]:
+    dt = _parse_iso_time(utc_iso_str)
     if not dt:
         return None
     try:
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
         return (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 3600.0
     except Exception:
         return None
@@ -343,13 +378,16 @@ def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
         if isinstance(x, (int, float)):
             f = float(x)
             return default if (math.isnan(f) or math.isinf(f)) else f
-        s = str(x).strip()
+        s = safe_str(x, "")
         if not s:
             return default
         s = s.translate(_ARABIC_DIGITS).replace(",", "")
         if s.endswith("%"):
             s = s[:-1].strip()
-        return float(s) if s else default
+        f = float(s) if s else default
+        if f is None:
+            return default
+        return default if (math.isnan(f) or math.isinf(f)) else float(f)
     except Exception:
         return default
 
@@ -363,12 +401,11 @@ def _safe_int(x: Any, default: int = 0) -> int:
 
 
 def _norm_symbol(sym: Any) -> str:
-    s = ("" if sym is None else str(sym)).strip().upper()
+    s = safe_str(sym, "").upper()
     if not s:
         return ""
     s = s.translate(_ARABIC_DIGITS)
     s = s.replace("TADAWUL:", "").replace(".TADAWUL", "")
-    # numeric -> .SR
     if s.isdigit() and 3 <= len(s) <= 6:
         return f"{s}.SR"
     return s
@@ -448,27 +485,32 @@ def _get_page_symbols(symbols_reader: Any, page_key: str, spreadsheet_id: str) -
     """
     if symbols_reader is None:
         return []
+
     candidates = [
         getattr(symbols_reader, "get_page_symbols", None),
         getattr(symbols_reader, "get_symbols_for_page", None),
         getattr(symbols_reader, "read_page_symbols", None),
     ]
+
     for fn in candidates:
-        if callable(fn):
+        if not callable(fn):
+            continue
+        # Try preferred signature
+        try:
+            res = fn(page_key, spreadsheet_id=spreadsheet_id)
+            if isinstance(res, (list, tuple, set)):
+                return [_norm_symbol(x) for x in res if _norm_symbol(x)]
+        except TypeError:
+            # Might accept reversed order
             try:
-                res = fn(page_key, spreadsheet_id=spreadsheet_id)
+                res = fn(spreadsheet_id, page_key)
                 if isinstance(res, (list, tuple, set)):
                     return [_norm_symbol(x) for x in res if _norm_symbol(x)]
-            except TypeError:
-                # might accept (spreadsheet_id, key) order
-                try:
-                    res = fn(spreadsheet_id, page_key)
-                    if isinstance(res, (list, tuple, set)):
-                        return [_norm_symbol(x) for x in res if _norm_symbol(x)]
-                except Exception:
-                    pass
             except Exception:
                 pass
+        except Exception:
+            pass
+
     return []
 
 
@@ -498,10 +540,48 @@ def _obj_to_dict(x: Any) -> Dict[str, Any]:
 
 def _coerce_symbol_from_quote(q: Dict[str, Any]) -> str:
     for k in ("symbol", "requested_symbol", "ticker", "code", "id"):
-        v = q.get(k)
-        s = _norm_symbol(v)
+        s = _norm_symbol(q.get(k))
         if s:
             return s
+    return ""
+
+
+def _pick_timestamp_utc(q: Dict[str, Any]) -> str:
+    """
+    Tries multiple keys, returns best-effort ISO string or "".
+    Never throws.
+    """
+    for k in (
+        "last_updated_utc",
+        "forecast_updated_utc",
+        "timestamp_utc",
+        "updated_at_utc",
+        "updated_utc",
+        "ts_utc",
+    ):
+        v = safe_str(q.get(k), "")
+        if v and _parse_iso_time(v):
+            return v.replace("Z", "+00:00")
+    # Sometimes providers return epoch seconds/ms
+    for k in ("timestamp", "ts", "updated_at"):
+        v = q.get(k)
+        if isinstance(v, (int, float)) and v > 0:
+            try:
+                # heuristic: ms if too large
+                secs = float(v) / 1000.0 if float(v) > 2_000_000_000 else float(v)
+                dt = datetime.fromtimestamp(secs, tz=timezone.utc)
+                return dt.isoformat()
+            except Exception:
+                pass
+        s = safe_str(v, "")
+        if s.isdigit():
+            try:
+                n = int(s)
+                secs = n / 1000.0 if n > 2_000_000_000 else n
+                dt = datetime.fromtimestamp(secs, tz=timezone.utc)
+                return dt.isoformat()
+            except Exception:
+                pass
     return ""
 
 
@@ -525,7 +605,6 @@ async def _fetch_quotes_map(
         return {}
 
     out: Dict[str, Dict[str, Any]] = {}
-
     get_many = getattr(de, "get_enriched_quotes", None)
     get_one = getattr(de, "get_enriched_quote", None)
 
@@ -534,21 +613,52 @@ async def _fetch_quotes_map(
         for part in _chunk(symbols, max(1, int(batch_size))):
             try:
                 res = await _maybe_await(get_many(part, use_cache=use_cache, ttl=ttl))
-                # expected list aligned to inputs, but be defensive
+
+                # Defensive normalization:
+                # 1) dict mapping
                 if isinstance(res, dict):
                     for k, v in res.items():
-                        out[_norm_symbol(k)] = _obj_to_dict(v)
-                elif isinstance(res, list):
+                        kk = _norm_symbol(k)
+                        if kk:
+                            out[kk] = _obj_to_dict(v)
+                    continue
+
+                # 2) list/tuple result
+                if isinstance(res, (list, tuple)):
+                    # Try to map by embedded symbol first
+                    temp: Dict[str, Dict[str, Any]] = {}
                     for item in res:
                         qd = _obj_to_dict(item)
                         sym = _coerce_symbol_from_quote(qd)
-                        if not sym:
-                            continue
-                        out[sym] = qd
-                else:
-                    # unexpected
-                    for s in part:
-                        out[s] = {"error": f"unexpected get_enriched_quotes type: {type(res).__name__}"}
+                        if sym:
+                            temp[sym] = qd
+
+                    # If we got a good map, use it
+                    if temp:
+                        out.update(temp)
+                        # Fill missing by index alignment if needed
+                        if len(temp) < len(part):
+                            for idx, s in enumerate(part):
+                                if s in out:
+                                    continue
+                                if idx < len(res):
+                                    out[s] = _obj_to_dict(res[idx])
+                                else:
+                                    out[s] = {"error": "missing quote row"}
+                        continue
+
+                    # Otherwise assume order aligns with input (best-effort)
+                    for idx, s in enumerate(part):
+                        if idx < len(res):
+                            out[s] = _obj_to_dict(res[idx])
+                        else:
+                            out[s] = {"error": "missing quote row"}
+                    continue
+
+                # Unexpected type
+                for s in part:
+                    out[s] = {"error": f"unexpected get_enriched_quotes type: {type(res).__name__}"}
+
             except Exception as e:
                 for s in part:
                     out[s] = {"error": f"get_enriched_quotes failed: {e}"}
@@ -588,7 +698,6 @@ async def _fetch_quotes_map(
 # -----------------------------------------------------------------------------
 def _coerce_confidence_pct(x: Any) -> float:
     v = _safe_float(x, 0.0) or 0.0
-    # if 0..1 → convert
     return float(v * 100.0) if 0.0 <= v <= 1.0 else float(v)
 
 
@@ -604,7 +713,7 @@ def _infer_history_points(q: Dict[str, Any]) -> int:
 
 
 def _derive_provider(q: Dict[str, Any]) -> str:
-    return str(q.get("data_source") or q.get("provider") or "unknown").strip() or "unknown"
+    return safe_str(q.get("data_source") or q.get("provider") or q.get("source") or "unknown", "unknown") or "unknown"
 
 
 def _detect_basic_anomalies(q: Dict[str, Any], config: AuditConfig) -> List[AnomalyType]:
@@ -615,7 +724,7 @@ def _detect_basic_anomalies(q: Dict[str, Any], config: AuditConfig) -> List[Anom
     vol = _safe_float(q.get("volume"), None)
     if vol is not None and vol >= 2_000_000:
         anomalies.append(AnomalyType.VOLUME_SURGE)
-    age = _age_hours(q.get("last_updated_utc"))
+    age = _age_hours(_pick_timestamp_utc(q))
     if age is not None and age >= config.stale_hours:
         anomalies.append(AnomalyType.STALE_DATA)
     if q.get("error"):
@@ -623,49 +732,73 @@ def _detect_basic_anomalies(q: Dict[str, Any], config: AuditConfig) -> List[Anom
     return anomalies
 
 
+_REMEDIATION_MAP: Dict[str, RemediationAction] = {
+    "ZERO_PRICE": RemediationAction(
+        issue="ZERO_PRICE",
+        action="Failover provider / bypass cache / verify symbol mapping",
+        priority=AlertPriority.P1,
+        estimated_time_minutes=10,
+        automated=True,
+    ),
+    "PROVIDER_ERROR": RemediationAction(
+        issue="PROVIDER_ERROR",
+        action="Failover provider / trigger rescue path / bypass cache",
+        priority=AlertPriority.P1,
+        estimated_time_minutes=10,
+        automated=True,
+    ),
+    "HARD_STALE_DATA": RemediationAction(
+        issue="HARD_STALE_DATA",
+        action="Reduce TTL / provider refresh audit / mark stale block",
+        priority=AlertPriority.P2,
+        estimated_time_minutes=20,
+        automated=False,
+    ),
+    "STALE_DATA": RemediationAction(
+        issue="STALE_DATA",
+        action="Reduce TTL / verify provider update frequency",
+        priority=AlertPriority.P3,
+        estimated_time_minutes=30,
+        automated=False,
+    ),
+    "INSUFFICIENT_HISTORY": RemediationAction(
+        issue="INSUFFICIENT_HISTORY",
+        action="Use shorter indicator windows / treat as recently-listed / relax history rules",
+        priority=AlertPriority.P4,
+        estimated_time_minutes=15,
+        automated=False,
+    ),
+}
+
+
 def _remediation_for_issues(issues: List[str]) -> List[RemediationAction]:
     actions: List[RemediationAction] = []
-    for i in issues[:3]:
-        if i in {"ZERO_PRICE", "PROVIDER_ERROR", "HARD_STALE_DATA"}:
+    for key in issues:
+        if key in _REMEDIATION_MAP:
+            # copy to avoid sharing created_at between results
+            src = _REMEDIATION_MAP[key]
             actions.append(
                 RemediationAction(
-                    issue=i,
-                    action="Failover provider / trigger rescue path / bypass cache",
-                    priority=AlertPriority.P1,
-                    estimated_time_minutes=10,
-                    automated=True,
+                    issue=src.issue,
+                    action=src.action,
+                    priority=src.priority,
+                    estimated_time_minutes=src.estimated_time_minutes,
+                    automated=src.automated,
                 )
             )
-        elif i in {"STALE_DATA"}:
-            actions.append(
-                RemediationAction(
-                    issue=i,
-                    action="Lower cache TTL / verify provider update frequency",
-                    priority=AlertPriority.P3,
-                    estimated_time_minutes=30,
-                    automated=False,
-                )
+        if len(actions) >= 3:
+            break
+    # fallback
+    if not actions and issues:
+        actions.append(
+            RemediationAction(
+                issue=issues[0],
+                action="Review mapping keys / provider payload fields",
+                priority=AlertPriority.P4,
+                estimated_time_minutes=20,
+                automated=False,
             )
-        elif i in {"INSUFFICIENT_HISTORY"}:
-            actions.append(
-                RemediationAction(
-                    issue=i,
-                    action="Use shorter indicators window / mark as recently listed",
-                    priority=AlertPriority.P4,
-                    estimated_time_minutes=15,
-                    automated=False,
-                )
-            )
-        else:
-            actions.append(
-                RemediationAction(
-                    issue=i,
-                    action="Review and validate mapping keys",
-                    priority=AlertPriority.P4,
-                    estimated_time_minutes=20,
-                    automated=False,
-                )
-            )
+        )
     return actions
 
 
@@ -679,7 +812,8 @@ def _compute_quality_score(q: Dict[str, Any], config: AuditConfig) -> Tuple[floa
     elif price > config.max_price:
         score -= 10
 
-    age = _age_hours(q.get("last_updated_utc"))
+    ts = _pick_timestamp_utc(q)
+    age = _age_hours(ts)
     if age is None:
         score -= 20
     elif age > config.hard_stale_hours:
@@ -725,7 +859,7 @@ def _compute_severity(issues: List[str], quality: DataQuality) -> AuditSeverity:
 def _compute_provider_health(q: Dict[str, Any], config: AuditConfig) -> ProviderHealth:
     if q.get("error"):
         return ProviderHealth.UNHEALTHY
-    age = _age_hours(q.get("last_updated_utc"))
+    age = _age_hours(_pick_timestamp_utc(q))
     if age is None:
         return ProviderHealth.UNKNOWN
     if age > config.hard_stale_hours:
@@ -735,20 +869,17 @@ def _compute_provider_health(q: Dict[str, Any], config: AuditConfig) -> Provider
     return ProviderHealth.HEALTHY
 
 
-async def _audit_one(
-    symbol: str,
-    page: str,
-    q: Dict[str, Any],
-    config: AuditConfig,
-) -> AuditResult:
-    symbol_n = _norm_symbol(symbol) or symbol
+async def _audit_one(symbol: str, page: str, q: Dict[str, Any], config: AuditConfig) -> AuditResult:
+    symbol_n = _norm_symbol(symbol) or safe_str(symbol, "UNKNOWN")
     provider = _derive_provider(q)
+
     price = _safe_float(q.get("current_price") or q.get("price"), None)
     chg_pct = _safe_float(q.get("percent_change") or q.get("change_pct"), None)
     volume = _safe_int(q.get("volume"), 0) or None
     mcap = _safe_float(q.get("market_cap"), None)
-    last_upd = safe_str(q.get("last_updated_utc") or q.get("forecast_updated_utc") or q.get("timestamp_utc"))
-    age = _age_hours(last_upd) if last_upd else _age_hours(q.get("last_updated_utc"))
+
+    last_upd = _pick_timestamp_utc(q)
+    age = _age_hours(last_upd) if last_upd else None
 
     issues: List[str] = []
 
@@ -757,11 +888,11 @@ async def _audit_one(
     if price is not None and price > config.max_price:
         issues.append("PRICE_TOO_HIGH")
 
-    if age is None:
+    if not last_upd:
         issues.append("NO_TIMESTAMP")
-    elif age > config.hard_stale_hours:
+    elif age is not None and age > config.hard_stale_hours:
         issues.append("HARD_STALE_DATA")
-    elif age > config.stale_hours:
+    elif age is not None and age > config.stale_hours:
         issues.append("STALE_DATA")
 
     hist_pts = _infer_history_points(q)
@@ -774,20 +905,19 @@ async def _audit_one(
     if q.get("error"):
         issues.append("PROVIDER_ERROR")
 
-    # zombie heuristic
-    dq_raw = str(q.get("data_quality") or "").strip().upper()
+    # zombie heuristic (keep conservative)
+    dq_raw = safe_str(q.get("data_quality"), "").strip().upper()
     if ("ZERO_PRICE" in issues and ("STALE_DATA" in issues or "HARD_STALE_DATA" in issues)) or dq_raw in {"MISSING", "BAD"}:
         issues.append("ZOMBIE_TICKER")
 
-    quality_score, quality = _compute_quality_score(q, config)
+    _, quality = _compute_quality_score(q, config)
     anomalies = _detect_basic_anomalies(q, config)
     severity = _compute_severity(issues, quality)
     phealth = _compute_provider_health(q, config)
 
     strategy_notes: List[str] = []
-    # minimal strategy flags (safe, optional fields)
     r1w = _safe_float(q.get("returns_1w"), None)
-    trend = str(q.get("trend_signal") or "").strip().upper()
+    trend = safe_str(q.get("trend_signal"), "").strip().upper()
     if trend == "UPTREND" and r1w is not None and r1w < -4.0:
         strategy_notes.append("TREND_BREAK_BEAR")
     if trend == "DOWNTREND" and r1w is not None and r1w > 4.0:
@@ -807,16 +937,16 @@ async def _audit_one(
         volume=volume,
         market_cap=mcap,
         age_hours=age,
-        last_updated_utc=last_upd,
+        last_updated_utc=last_upd or None,
         last_updated_riyadh=_riyadh_iso(last_upd) if last_upd else _riyadh_iso(),
         history_points=hist_pts,
         confidence_pct=round(_coerce_confidence_pct(q.get("forecast_confidence")), 1),
         issues=_dedupe_preserve(issues),
         strategy_notes=_dedupe_preserve(strategy_notes),
-        anomalies=list(dict.fromkeys(anomalies)),  # keep order, unique
+        anomalies=_dedupe_preserve([a for a in anomalies]),  # type: ignore[arg-type]
         remediation_actions=remediation,
         root_cause=("Provider data unavailable" if "PROVIDER_ERROR" in issues else None),
-        error=safe_str(q.get("error")),
+        error=safe_str(q.get("error"), "") or None,
     )
 
 
@@ -838,7 +968,7 @@ def _generate_summary(results: List[AuditResult]) -> AuditSummary:
 # Exporters (async-safe)
 # -----------------------------------------------------------------------------
 def _maybe_sign_json(payload: Dict[str, Any]) -> Dict[str, Any]:
-    key = (os.getenv("AUDIT_HMAC_KEY") or "").strip()
+    key = safe_str(os.getenv("AUDIT_HMAC_KEY"), "")
     if not key:
         return payload
     try:
@@ -855,7 +985,7 @@ async def _export_json(path: str, data: Dict[str, Any]) -> None:
     loop = asyncio.get_running_loop()
     payload = _maybe_sign_json(data)
 
-    def _write():
+    def _write() -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(json_dumps(payload))
@@ -866,6 +996,7 @@ async def _export_json(path: str, data: Dict[str, Any]) -> None:
 async def _export_csv(path: str, results: List[AuditResult]) -> None:
     if not results:
         return
+
     loop = asyncio.get_running_loop()
     headers = [
         "symbol",
@@ -885,31 +1016,32 @@ async def _export_csv(path: str, results: List[AuditResult]) -> None:
         "last_updated_utc",
     ]
 
-    def _write():
+    def _write() -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.DictWriter(f, fieldnames=headers)
             w.writeheader()
             for r in results:
                 d = r.to_dict()
-                row = {
-                    "symbol": d.get("symbol"),
-                    "page": d.get("page"),
-                    "provider": d.get("provider"),
-                    "severity": d.get("severity"),
-                    "data_quality": d.get("data_quality"),
-                    "provider_health": d.get("provider_health"),
-                    "price": d.get("price"),
-                    "change_pct": d.get("change_pct"),
-                    "age_hours": d.get("age_hours"),
-                    "history_points": d.get("history_points"),
-                    "confidence_pct": d.get("confidence_pct"),
-                    "issues": ", ".join(d.get("issues") or []),
-                    "anomalies": ", ".join(d.get("anomalies") or []),
-                    "error": d.get("error"),
-                    "last_updated_utc": d.get("last_updated_utc"),
-                }
-                w.writerow(row)
+                w.writerow(
+                    {
+                        "symbol": d.get("symbol"),
+                        "page": d.get("page"),
+                        "provider": d.get("provider"),
+                        "severity": d.get("severity"),
+                        "data_quality": d.get("data_quality"),
+                        "provider_health": d.get("provider_health"),
+                        "price": d.get("price"),
+                        "change_pct": d.get("change_pct"),
+                        "age_hours": d.get("age_hours"),
+                        "history_points": d.get("history_points"),
+                        "confidence_pct": d.get("confidence_pct"),
+                        "issues": ", ".join(d.get("issues") or []),
+                        "anomalies": ", ".join(d.get("anomalies") or []),
+                        "error": d.get("error"),
+                        "last_updated_utc": d.get("last_updated_utc"),
+                    }
+                )
 
     await loop.run_in_executor(_CPU_EXECUTOR, _write)
 
@@ -917,9 +1049,10 @@ async def _export_csv(path: str, results: List[AuditResult]) -> None:
 async def _export_parquet(path: str, results: List[AuditResult]) -> None:
     if not (_HAS_PARQUET and _HAS_PANDAS and results):
         return
+
     loop = asyncio.get_running_loop()
 
-    def _write():
+    def _write() -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         df = pd.DataFrame([r.to_dict() for r in results])  # type: ignore
         table = pa.Table.from_pandas(df)  # type: ignore
@@ -931,15 +1064,23 @@ async def _export_parquet(path: str, results: List[AuditResult]) -> None:
 async def _export_excel(path: str, results: List[AuditResult], summary: AuditSummary) -> None:
     if not _HAS_PANDAS:
         return
+
     loop = asyncio.get_running_loop()
 
-    def _write():
+    def _write() -> None:
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         with pd.ExcelWriter(path, engine="openpyxl") as writer:  # type: ignore
             pd.DataFrame([r.to_dict() for r in results]).to_excel(writer, sheet_name="Audit Results", index=False)  # type: ignore
             pd.DataFrame([summary.to_dict()]).to_excel(writer, sheet_name="Summary", index=False)  # type: ignore
 
     await loop.run_in_executor(_CPU_EXECUTOR, _write)
+
+
+async def _run_exports(export_tasks: List[Awaitable[None]]) -> None:
+    """Run export coroutines safely inside an event loop (fixes v4.2.0 gather issue)."""
+    if not export_tasks:
+        return
+    await asyncio.gather(*export_tasks)
 
 
 # -----------------------------------------------------------------------------
@@ -955,7 +1096,12 @@ async def run_audit(
     config: AuditConfig,
 ) -> Tuple[List[AuditResult], AuditSummary]:
     if not DEPS.ok:
-        logger.error("Dependencies not loaded. symbols_reader=%s, data_engine=%s, err=%s", bool(DEPS.symbols_reader), bool(DEPS.data_engine), DEPS.err)
+        logger.error(
+            "Dependencies not loaded. symbols_reader=%s, data_engine=%s, err=%s",
+            bool(DEPS.symbols_reader),
+            bool(DEPS.data_engine),
+            DEPS.err,
+        )
         return [], AuditSummary()
 
     sid = (spreadsheet_id or os.getenv("DEFAULT_SPREADSHEET_ID", "")).strip()
@@ -963,12 +1109,12 @@ async def run_audit(
         logger.error("No spreadsheet_id provided and DEFAULT_SPREADSHEET_ID is empty.")
         return [], AuditSummary()
 
-    # refresh => bypass cache
     use_cache = not bool(refresh)
-    ttl = None  # leave None to respect engine defaults
+    ttl = None  # respect engine defaults
+    batch_size = max(50, int(os.getenv("AUDIT_BATCH_SIZE", "200") or "200"))
 
-    batch_size = max(50, int(os.getenv("AUDIT_BATCH_SIZE", "200")))
-    sem = asyncio.Semaphore(max(1, int(concurrency)))
+    # hard clamp concurrency (avoid huge fan-out)
+    sem = asyncio.Semaphore(max(1, min(int(concurrency), 48)))
 
     all_results: List[AuditResult] = []
     start = time.time()
@@ -981,7 +1127,7 @@ async def run_audit(
         symbols = _get_page_symbols(DEPS.symbols_reader, page_key, sid)
         symbols = _dedupe_preserve(symbols)
         if max_symbols_per_page > 0:
-            symbols = symbols[: max_symbols_per_page]
+            symbols = symbols[: int(max_symbols_per_page)]
 
         if not symbols:
             logger.warning("No symbols for page=%s", page_key)
@@ -1009,15 +1155,23 @@ async def run_audit(
 # -----------------------------------------------------------------------------
 def main() -> None:
     p = argparse.ArgumentParser(description="TFB Data Quality Auditor")
-    p.add_argument("--keys", nargs="*", default=["MARKET_LEADERS"], help="Sheet page keys to audit (e.g., MARKET_LEADERS)")
+    p.add_argument(
+        "--keys",
+        nargs="*",
+        default=["MARKET_LEADERS"],
+        help="Sheet page keys to audit (e.g., MARKET_LEADERS)",
+    )
     p.add_argument("--sheet-id", dest="sheet_id", default="", help="Google Sheet ID (fallback: DEFAULT_SPREADSHEET_ID)")
     p.add_argument("--refresh", type=int, default=1, help="1=bypass cache (fresh), 0=use cache")
     p.add_argument("--concurrency", type=int, default=12)
     p.add_argument("--max-symbols", type=int, default=0, help="limit symbols per page (0=all)")
+
     p.add_argument("--json-out", default="", help="write JSON report")
     p.add_argument("--csv-out", default="", help="write CSV alerts")
     p.add_argument("--parquet-out", default="", help="write Parquet (optional deps)")
     p.add_argument("--excel-out", default="", help="write Excel (requires pandas+openpyxl)")
+
+    p.add_argument("--alerts-only", type=int, default=0, help="1=only export alerts; 0=export all results in JSON")
     args = p.parse_args()
 
     config = AuditConfig()
@@ -1037,19 +1191,31 @@ def main() -> None:
 
     alerts = [r for r in results if r.severity != AuditSeverity.OK]
 
-    # Exports
+    # Exports (FIX: run gather inside an event loop)
     export_tasks: List[Awaitable[None]] = []
+
     if args.json_out:
-        export_tasks.append(_export_json(args.json_out, {"summary": summary.to_dict(), "results": [r.to_dict() for r in results], "alerts": [r.to_dict() for r in alerts]}))
+        if int(args.alerts_only) == 1:
+            payload = {"summary": summary.to_dict(), "alerts": [r.to_dict() for r in alerts]}
+        else:
+            payload = {
+                "summary": summary.to_dict(),
+                "results": [r.to_dict() for r in results],
+                "alerts": [r.to_dict() for r in alerts],
+            }
+        export_tasks.append(_export_json(args.json_out, payload))
+
     if args.csv_out:
         export_tasks.append(_export_csv(args.csv_out, alerts))
+
     if args.parquet_out:
         export_tasks.append(_export_parquet(args.parquet_out, results))
+
     if args.excel_out:
         export_tasks.append(_export_excel(args.excel_out, results, summary))
 
     if export_tasks:
-        asyncio.run(asyncio.gather(*export_tasks))
+        asyncio.run(_run_exports(export_tasks))
 
     logger.info(
         "Audit Complete | assets=%s | critical=%s | high=%s | medium=%s | duration_ms=%.0f",
@@ -1060,7 +1226,7 @@ def main() -> None:
         summary.audit_duration_ms,
     )
 
-    # Exit code policy
+    # Exit code policy (stable)
     exit_code = 0
     if summary.by_severity.get("CRITICAL", 0) > 0:
         exit_code = 3
