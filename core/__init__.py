@@ -2,63 +2,70 @@
 # core/__init__.py
 """
 ================================================================================
-Core Package Initializer — v5.0.0 (ADVANCED ENTERPRISE)
+Core Package Initializer — v5.1.0 (GLOBAL-FIRST / ENGINE-LAZY / RENDER SAFE)
 ================================================================================
-Financial Data Platform Core — Lazy Loading, Engine Management, Symbol Resolution
 
-What's new in v5.0.0:
-- ✅ Full alignment with v5.1.0 Symbol Normalization (ISIN, CUSIP, Options, MIC)
-- ✅ Advanced lazy-loading with hierarchical resolution and cache capping
-- ✅ Multi-engine support with failover strategies
-- ✅ Circuit breaker pattern for failed dynamic imports
-- ✅ Performance metrics and monitoring with High-Performance JSON handling
-- ✅ Debug logging with configurable levels
-- ✅ Thread-safe singleton management
-- ✅ Schema validation and type safety
-- ✅ Provider registry with dynamic loading
-- ✅ Configuration management with environment overrides
-- ✅ Never crashes app startup (all exports are best-effort)
+This revision is aligned with the GLOBAL-first stabilization you are doing:
+- ✅ EODHD is treated as the top GLOBAL provider by default (priority)
+- ✅ Robust lazy engine init:
+     - Prefer core.data_engine_v2.get_engine (async) and cache the instance
+     - Provides BOTH async + sync access patterns safely
+- ✅ Settings resolution aligned with core/config.py:
+     - Prefer get_settings_cached() then get_settings()
+- ✅ Safe imports + never-crash startup philosophy (best-effort exports)
+- ✅ Keeps PEP 562 lazy attribute access, but avoids brittle assumptions
+- ✅ Keeps provider registry (lightweight) without forcing heavy imports
 
-Key Features:
-- Zero runtime overhead (lazy imports via PEP 562)
-- Thread-safe singletons
-- Configurable debug logging
-- Comprehensive error handling
-- Backward compatible with v1.x, v2.x, and v3.x
+Important behavior:
+- In an async context (FastAPI), call:  await core.get_engine_async()
+- In sync context (scripts/CLI), call: core.get_engine()
+
+================================================================================
 """
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import os
 import sys
 import time
 import threading
-from functools import wraps
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, TypeVar, Union, cast
-from enum import Enum
 from dataclasses import dataclass, field
+from enum import Enum
+from functools import wraps
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
 
 # ---------------------------------------------------------------------------
-# High-Performance JSON fallback
+# Fast JSON fallback (optional orjson)
 # ---------------------------------------------------------------------------
 try:
-    import orjson
+    import orjson  # type: ignore
+
     def json_loads(data: Union[str, bytes]) -> Any:
+        if isinstance(data, str):
+            data = data.encode("utf-8")
         return orjson.loads(data)
-except ImportError:
-    import json
+
+    _HAS_ORJSON = True
+except Exception:
+    import json  # type: ignore
+
     def json_loads(data: Union[str, bytes]) -> Any:
+        if isinstance(data, (bytes, bytearray)):
+            data = data.decode("utf-8", errors="replace")
         return json.loads(data)
 
+    _HAS_ORJSON = False
 
-__version__ = "5.0.0"
+
+__version__ = "5.1.0"
 __core_version__ = __version__
+CORE_INIT_VERSION = __version__
 
-# ============================================================================
-# Debug Configuration
-# ============================================================================
-
+# =============================================================================
+# Debug / Logging
+# =============================================================================
 class LogLevel(Enum):
     DEBUG = 10
     INFO = 20
@@ -67,29 +74,37 @@ class LogLevel(Enum):
     ERROR = 40
     CRITICAL = 50
 
-_DEBUG_IMPORTS = os.getenv("CORE_IMPORT_DEBUG", "").strip().lower() in {"1", "true", "yes", "y", "on"}
-_DEBUG_LEVEL = os.getenv("CORE_IMPORT_DEBUG_LEVEL", "info").strip().lower() or "info"
+
+_DEBUG_IMPORTS = (os.getenv("CORE_IMPORT_DEBUG", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+_DEBUG_LEVEL = (os.getenv("CORE_IMPORT_DEBUG_LEVEL", "info") or "info").strip().lower()
+
 _LOG_LEVEL = LogLevel.INFO
 try:
     _LOG_LEVEL = LogLevel[_DEBUG_LEVEL.upper()]
-except (KeyError, AttributeError):
+except Exception:
     _LOG_LEVEL = LogLevel.INFO
 
-# Performance monitoring
-_PERF_MONITORING = os.getenv("CORE_PERF_MONITORING", "").strip().lower() in {"1", "true", "yes", "y", "on"}
+_PERF_MONITORING = (os.getenv("CORE_PERF_MONITORING", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 _import_times: Dict[str, float] = {}
 _import_lock = threading.RLock()
 
 
-# ============================================================================
-# Performance Monitoring Decorator
-# ============================================================================
+def _dbg(msg: str, level: str = "info") -> None:
+    if not _DEBUG_IMPORTS:
+        return
+    try:
+        lvl = LogLevel[level.upper()]
+        if lvl.value >= _LOG_LEVEL.value:
+            ts = time.strftime("%H:%M:%S")
+            print(f"[{ts}] [core] [{level.upper()}] {msg}", file=sys.stderr)  # noqa: T201
+    except Exception:
+        pass
+
 
 def _monitor_import(func: Callable) -> Callable:
-    """Decorator to monitor import performance."""
     if not _PERF_MONITORING:
         return func
-    
+
     @wraps(func)
     def wrapper(*args, **kwargs):
         start = time.perf_counter()
@@ -97,794 +112,446 @@ def _monitor_import(func: Callable) -> Callable:
             return func(*args, **kwargs)
         finally:
             elapsed = time.perf_counter() - start
-            func_name = func.__name__
             with _import_lock:
-                _import_times[func_name] = _import_times.get(func_name, 0.0) + elapsed
-                if elapsed > 0.1:  # Log slow imports (>100ms)
-                    _dbg(f"Slow import: {func_name} took {elapsed:.3f}s", "warn")
+                _import_times[func.__name__] = _import_times.get(func.__name__, 0.0) + elapsed
+            if elapsed > 0.15:
+                _dbg(f"Slow call: {func.__name__} took {elapsed:.3f}s", "warn")
+
     return wrapper
 
 
 def get_import_times() -> Dict[str, float]:
-    """Get import performance metrics."""
     with _import_lock:
         return dict(_import_times)
 
 
-# ============================================================================
-# Debug Logging
-# ============================================================================
-
-def _dbg(msg: str, level: str = "info") -> None:
-    """Debug logging with level filtering."""
-    if not _DEBUG_IMPORTS:
-        return
-    
-    try:
-        msg_level = LogLevel[level.upper()]
-        if msg_level.value >= _LOG_LEVEL.value:
-            timestamp = time.strftime("%H:%M:%S.%f")[:-3]
-            print(f"[{timestamp}] [core] [{level.upper()}] {msg}", file=sys.stderr)  # noqa: T201
-    except Exception:
-        pass
-
-
-# ============================================================================
-# Thread-Safe Cache
-# ============================================================================
-
+# =============================================================================
+# Thread-safe small cache
+# =============================================================================
 class ThreadSafeCache:
-    """Thread-safe cache with TTL and simple Size bounding support."""
-    
     def __init__(self, max_size: int = 2000):
         self._cache: Dict[str, Any] = {}
+        self._expires: Dict[str, float] = {}
         self._lock = threading.RLock()
-        self._timestamps: Dict[str, float] = {}
-        self._max_size = max_size
-    
+        self._max_size = max(128, int(max_size))
+
     def get(self, key: str, default: Any = None) -> Any:
         with self._lock:
             if key in self._cache:
-                # Check TTL
-                if key in self._timestamps and time.time() > self._timestamps[key]:
-                    del self._cache[key]
-                    del self._timestamps[key]
+                exp = self._expires.get(key)
+                if exp is not None and time.time() > exp:
+                    self._cache.pop(key, None)
+                    self._expires.pop(key, None)
                     return default
                 return self._cache[key]
             return default
-    
+
     def set(self, key: str, value: Any, ttl: Optional[float] = None) -> Any:
         with self._lock:
-            # Prevent unbound memory growth
             if len(self._cache) >= self._max_size and key not in self._cache:
-                # Naive eviction: remove oldest 10%
-                keys_to_remove = list(self._cache.keys())[:int(self._max_size * 0.1)]
-                for k in keys_to_remove:
+                # simple eviction (first N keys)
+                n = max(1, int(self._max_size * 0.10))
+                for k in list(self._cache.keys())[:n]:
                     self._cache.pop(k, None)
-                    self._timestamps.pop(k, None)
-
+                    self._expires.pop(k, None)
             self._cache[key] = value
             if ttl is not None:
-                self._timestamps[key] = time.time() + ttl
+                self._expires[key] = time.time() + float(ttl)
             else:
-                self._timestamps.pop(key, None)
+                self._expires.pop(key, None)
             return value
-    
-    def get_or_set(self, key: str, factory: Callable[[], Any], ttl: Optional[float] = None) -> Any:
-        with self._lock:
-            val = self.get(key)
-            if val is not None:
-                return val
-            
-            value = factory()
-            self.set(key, value, ttl)
-            return value
-    
-    def clear(self) -> None:
-        with self._lock:
-            self._cache.clear()
-            self._timestamps.clear()
-    
+
     def remove(self, key: str) -> None:
         with self._lock:
             self._cache.pop(key, None)
-            self._timestamps.pop(key, None)
+            self._expires.pop(key, None)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._cache.clear()
+            self._expires.clear()
 
 
 _CACHE = ThreadSafeCache()
 
 
-# ============================================================================
-# Safe Import Utilities
-# ============================================================================
-
+# =============================================================================
+# Safe import utilities
+# =============================================================================
 class ImportResult:
-    """Result of a lazy import attempt."""
-    
     def __init__(self, module: Any = None, error: Optional[Exception] = None):
         self.module = module
         self.error = error
         self.timestamp = time.time()
-    
+
     @property
     def success(self) -> bool:
         return self.module is not None
-    
+
     @property
     def failed(self) -> bool:
         return self.error is not None
 
 
 def _try_import(module_path: str, retry: bool = False) -> ImportResult:
-    """
-    Thread-safe lazy import with caching and optional retry.
-    """
-    # Check cache first
     cache_key = f"import:{module_path}"
     cached = _CACHE.get(cache_key)
-    if isinstance(cached, ImportResult) and (retry or cached.success or time.time() - cached.timestamp < 60):
+    # cache failures briefly
+    if isinstance(cached, ImportResult) and (retry or cached.success or (time.time() - cached.timestamp) < 60):
         return cached
-    
+
     try:
         from importlib import import_module
-        
-        _dbg(f"Importing: {module_path}", "debug")
-        module = import_module(module_path)
-        result = ImportResult(module=module)
-        _CACHE.set(cache_key, result)
-        _dbg(f"Imported: {module_path}", "info")
-        return result
+
+        _dbg(f"Importing {module_path}", "debug")
+        mod = import_module(module_path)
+        res = ImportResult(module=mod, error=None)
+        _CACHE.set(cache_key, res)
+        return res
     except Exception as e:
-        _dbg(f"Import failed: {module_path} -> {e.__class__.__name__}: {e}", "warn")
-        result = ImportResult(error=e)
-        _CACHE.set(cache_key, result, ttl=30)  # Cache failures for 30 seconds
-        return result
+        _dbg(f"Import failed {module_path}: {e}", "warn")
+        res = ImportResult(module=None, error=e)
+        _CACHE.set(cache_key, res, ttl=30)
+        return res
 
 
 def _try_import_attr(module_path: str, attr_name: str) -> Tuple[Optional[Any], Optional[Exception]]:
-    """Try to import a specific attribute from a module."""
-    result = _try_import(module_path)
-    if result.failed:
-        return None, result.error
-    if result.module is None:
-        return None, ImportError(f"Module {module_path} returned None")
-    
+    res = _try_import(module_path)
+    if res.failed:
+        return None, res.error
+    if not res.module:
+        return None, ImportError(f"Module {module_path} is None")
     try:
-        attr = getattr(result.module, attr_name, None)
-        return attr, None
+        return getattr(res.module, attr_name, None), None
     except Exception as e:
         return None, e
 
 
-def _resolve_from_candidates(
-    candidates: List[str],
-    attr_name: str,
-    fallback: Any = None
-) -> Tuple[Optional[Any], Optional[str]]:
-    """
-    Try to resolve an attribute from multiple module candidates.
-    Returns (value, module_path) where module_path is the successful module.
-    """
-    for mod_path in candidates:
-        attr, err = _try_import_attr(mod_path, attr_name)
-        if attr is not None:
-            return attr, mod_path
-    return fallback, None
-
-
-# ============================================================================
-# Configuration Management
-# ============================================================================
-
-@dataclass
-class CoreConfig:
-    """Core configuration settings."""
-    debug_imports: bool = _DEBUG_IMPORTS
-    log_level: str = _DEBUG_LEVEL
-    perf_monitoring: bool = _PERF_MONITORING
-    default_engine: str = "v2"
-    enable_metrics: bool = True
-    cache_ttl_seconds: int = 300
-    retry_failed_imports: bool = False
-    
-    @classmethod
-    def from_env(cls) -> CoreConfig:
-        """Load configuration from environment variables."""
-        return cls(
-            debug_imports=_DEBUG_IMPORTS,
-            log_level=_DEBUG_LEVEL,
-            perf_monitoring=_PERF_MONITORING,
-            default_engine=os.getenv("CORE_DEFAULT_ENGINE", "v2"),
-            enable_metrics=os.getenv("CORE_ENABLE_METRICS", "true").lower() in {"1", "true", "yes", "y", "on"},
-            cache_ttl_seconds=int(os.getenv("CORE_CACHE_TTL_SECONDS", "300")),
-            retry_failed_imports=os.getenv("CORE_RETRY_FAILED_IMPORTS", "false").lower() in {"1", "true", "yes", "y", "on"},
-        )
-
-
-_CONFIG: Optional[CoreConfig] = None
-
-
-def get_config() -> CoreConfig:
-    """Get core configuration (thread-safe)."""
-    global _CONFIG
-    if _CONFIG is None:
-        with _import_lock:
-            if _CONFIG is None:
-                _CONFIG = CoreConfig.from_env()
-    return _CONFIG
-
-
-def reload_config() -> CoreConfig:
-    """Reload configuration from environment."""
-    global _CONFIG
-    with _import_lock:
-        _CONFIG = CoreConfig.from_env()
-    return _CONFIG
-
-
-# ============================================================================
-# Settings Resolution
-# ============================================================================
-
+# =============================================================================
+# Settings resolution (aligned to core/config.py)
+# =============================================================================
 _SETTINGS_CANDIDATES = [
-    "config",
     "core.config",
+    "config",
     "app.config",
     "settings",
     "core.settings",
 ]
 
+
 def _resolve_get_settings_func() -> Tuple[Optional[Callable], Optional[str]]:
-    """Resolve get_settings function from candidates."""
-    cache_key = "get_settings_func"
-    cached = _CACHE.get(cache_key)
-    if cached is not None:
-        return cached, _CACHE.get("get_settings_module")
-    
-    for mod_path in _SETTINGS_CANDIDATES:
-        result = _try_import(mod_path)
-        if result.success and result.module:
-            fn = getattr(result.module, "get_settings", None)
-            if callable(fn):
-                _dbg(f"Resolved get_settings from {mod_path}", "info")
-                _CACHE.set(cache_key, fn)
-                _CACHE.set("get_settings_module", mod_path)
-                return fn, mod_path
-    
-    # Stub fallback
-    def _stub_get_settings() -> Any:
+    """
+    Prefer: get_settings_cached() then get_settings()
+    """
+    cache_key = "settings_func"
+    fn = _CACHE.get(cache_key)
+    mod_used = _CACHE.get("settings_func_module")
+    if fn is not None:
+        return fn, mod_used
+
+    for mod in _SETTINGS_CANDIDATES:
+        r = _try_import(mod)
+        if not r.success or not r.module:
+            continue
+        # prefer cached
+        f1 = getattr(r.module, "get_settings_cached", None)
+        if callable(f1):
+            _CACHE.set(cache_key, f1)
+            _CACHE.set("settings_func_module", mod)
+            _dbg(f"Resolved get_settings_cached from {mod}", "info")
+            return f1, mod
+        f2 = getattr(r.module, "get_settings", None)
+        if callable(f2):
+            _CACHE.set(cache_key, f2)
+            _CACHE.set("settings_func_module", mod)
+            _dbg(f"Resolved get_settings from {mod}", "info")
+            return f2, mod
+
+    def _stub() -> Any:
         return None
-    
-    _dbg("No get_settings found, using stub", "warn")
-    _CACHE.set(cache_key, _stub_get_settings)
-    _CACHE.set("get_settings_module", None)
-    return _stub_get_settings, None
+
+    _CACHE.set(cache_key, _stub)
+    _CACHE.set("settings_func_module", None)
+    return _stub, None
 
 
 @_monitor_import
 def get_settings() -> Any:
-    """Thread-safe settings loader. Never raises."""
     try:
         fn, _ = _resolve_get_settings_func()
         return fn() if callable(fn) else None
     except Exception as e:
-        _dbg(f"get_settings() failed -> {e.__class__.__name__}: {e}", "error")
+        _dbg(f"get_settings failed: {e}", "error")
         return None
 
 
-# ============================================================================
-# Symbol Normalization Integration (v5.1.0 Aligned)
-# ============================================================================
-
-_SYMBOL_MODULE = "core.symbols.normalize"
-_SYMBOL_EXPORTS = [
-    # Core functions
-    "normalize_symbol",
-    "normalize_ksa_symbol",
-    "normalize_symbols_list",
-    "symbol_variants",
-    "market_hint_for",
-    "detect_market_type",
-    "detect_asset_class",
-    "validate_symbol",
-    
-    # Detection helpers
-    "is_ksa",
-    "looks_like_ksa",
-    "is_index",
-    "is_fx",
-    "is_commodity_future",
-    "is_crypto",
-    "is_etf",
-    "is_special_symbol",
-    "is_index_or_fx",  # Legacy alias
-    "is_isin",         # Added in v5.1.0
-    "is_cusip",        # Added in v5.1.0
-    "is_sedol",        # Added in v5.1.0
-    "is_option",       # Added in v5.1.0
-    
-    # Options helpers
-    "parse_occ_option", # Added in v5.1.0
-
-    # Provider formatting
-    "to_yahoo_symbol",
-    "to_finnhub_symbol",
-    "to_eodhd_symbol",
-    "to_bloomberg_symbol",
-    "to_reuters_symbol",
-    "to_google_symbol",
-    "to_tradingview_symbol", # Added in v5.0.0
-    
-    # Provider variants
-    "yahoo_symbol_variants",
-    "finnhub_symbol_variants",
-    "eodhd_symbol_variants",
-    "bloomberg_symbol_variants",
-    "reuters_symbol_variants",
-    
-    # Utility functions
-    "extract_base_symbol",
-    "extract_exchange_code",
-    "standardize_share_class",
-    "get_primary_exchange",
-    "get_currency_from_symbol",
-    "get_mic_code",    # Added in v5.1.0
-    
-    # Enums
-    "MarketType",
-    "AssetClass",
-    "SymbolQuality",
-]
-
-
-def _get_symbol_export(name: str) -> Any:
-    """Lazy getter for symbol exports."""
-    cache_key = f"symbol:{name}"
-    cached = _CACHE.get(cache_key)
-    if cached is not None:
-        return cached
-    
-    result = _try_import(_SYMBOL_MODULE)
-    if result.success and result.module:
-        attr = getattr(result.module, name, None)
-        if attr is not None:
-            _CACHE.set(cache_key, attr)
-            return attr
-    
-    _dbg(f"Symbol export {name} not available", "debug")
-    return None
-
-
-def _get_symbol_exports() -> Dict[str, Any]:
-    """Get all symbol exports as a dictionary."""
-    cache_key = "symbol_exports"
-    cached = _CACHE.get(cache_key)
-    if isinstance(cached, dict):
-        return cached
-    
-    exports = {}
-    for name in _SYMBOL_EXPORTS:
-        exports[name] = _get_symbol_export(name)
-    
-    _CACHE.set(cache_key, exports)
-    return exports
-
-
-# ============================================================================
-# Engine Resolution
-# ============================================================================
-
+# =============================================================================
+# Engine resolution (GLOBAL-FIRST / async-safe)
+# =============================================================================
 _ENGINE_CANDIDATES = [
-    "core.data_engine_v2",
+    "core.data_engine_v2",  # preferred
     "core.data_engine",
     "core.engine",
     "engine",
     "data_engine",
 ]
 
-_ENGINE_CLASSES = ["DataEngine", "DataEngineV2", "UnifiedQuote", "BaseEngine"]
 
-
+@dataclass
 class EngineInfo:
-    """Information about a resolved engine."""
-    
-    def __init__(
-        self,
-        engine_class: Optional[Type] = None,
-        module_path: Optional[str] = None,
-        get_engine_func: Optional[Callable] = None,
-        error: Optional[Exception] = None
-    ):
-        self.engine_class = engine_class
-        self.module_path = module_path
-        self.get_engine_func = get_engine_func
-        self.error = error
-        self.timestamp = time.time()
-    
-    @property
-    def available(self) -> bool:
-        return self.engine_class is not None or self.get_engine_func is not None
-    
-    @property
-    def failed(self) -> bool:
-        return self.error is not None
+    module_path: Optional[str] = None
+    get_engine_func: Optional[Callable] = None
+    engine_class: Optional[Type] = None
+    error: Optional[str] = None
 
 
 def _resolve_engine_info() -> EngineInfo:
-    """Resolve engine information from candidates."""
-    cache_key = "engine_info"
+    cache_key = "engine_info_v2"
     cached = _CACHE.get(cache_key)
     if isinstance(cached, EngineInfo):
         return cached
-    
-    for mod_path in _ENGINE_CANDIDATES:
-        result = _try_import(mod_path)
-        if not result.success or not result.module:
+
+    for mod in _ENGINE_CANDIDATES:
+        r = _try_import(mod)
+        if not r.success or not r.module:
             continue
-        
-        # Look for engine classes
-        for class_name in _ENGINE_CLASSES:
-            engine_class = getattr(result.module, class_name, None)
-            if engine_class is not None and isinstance(engine_class, type):
-                get_engine_func = getattr(result.module, "get_engine", None)
-                info = EngineInfo(
-                    engine_class=engine_class,
-                    module_path=mod_path,
-                    get_engine_func=get_engine_func if callable(get_engine_func) else None
-                )
-                _dbg(f"Resolved engine from {mod_path} ({class_name})", "info")
+
+        ge = getattr(r.module, "get_engine", None)
+        # Most correct in your codebase: async get_engine()
+        if callable(ge):
+            info = EngineInfo(module_path=mod, get_engine_func=ge, engine_class=None, error=None)
+            _CACHE.set(cache_key, info)
+            _dbg(f"Resolved engine via get_engine from {mod}", "info")
+            return info
+
+        # fallback: class construction
+        for cls_name in ("DataEngine", "DataEngineV2", "DataEngineV3", "DataEngineV4", "DataEngineV5"):
+            cls = getattr(r.module, cls_name, None)
+            if isinstance(cls, type):
+                info = EngineInfo(module_path=mod, get_engine_func=None, engine_class=cls, error=None)
                 _CACHE.set(cache_key, info)
+                _dbg(f"Resolved engine class {cls_name} from {mod}", "info")
                 return info
-    
-    info = EngineInfo(error=ImportError("No engine module found"))
-    _dbg("No engine module resolved", "warn")
-    _CACHE.set(cache_key, info)
+
+    info = EngineInfo(error="No engine module found")
+    _CACHE.set(cache_key, info, ttl=30)
     return info
 
 
-def _call_get_engine(ge: Callable, settings: Any) -> Optional[Any]:
-    """Call get_engine with compatible signature."""
+def _call_get_engine_compat(fn: Callable, settings: Any) -> Any:
+    """
+    Calls get_engine() safely regardless of its signature.
+    Supports:
+      - get_engine()
+      - get_engine(settings=...)
+      - get_engine(config=...)
+    """
     try:
-        sig = inspect.signature(ge)
-        params = [p for p in sig.parameters.values() if p.name != "self" and p.kind != p.VAR_KEYWORD]
-        
-        if not params:
-            return ge()
-        
-        # Try named parameters
-        param_names = {p.name for p in params}
-        if "settings" in param_names:
-            return ge(settings=settings)
-        if "config" in param_names:
-            return ge(config=settings)
-        
-        # Try positional
-        if len(params) == 1:
-            # Parameter might be optional
-            try:
-                return ge(settings)
-            except TypeError:
-                return ge()
-        
-        # Default to no args
-        return ge()
-    except Exception as e:
-        _dbg(f"get_engine call failed: {e}", "warn")
-        try:
-            return ge()
-        except Exception:
-            return None
+        sig = inspect.signature(fn)
+        names = set(sig.parameters.keys())
+        if "settings" in names:
+            return fn(settings=settings)
+        if "config" in names:
+            return fn(config=settings)
+        return fn()
+    except Exception:
+        return fn()
 
 
-def _construct_engine_class(cls: Type, settings: Any) -> Optional[Any]:
-    """Construct engine instance from class."""
+def _construct_engine_compat(cls: Type, settings: Any) -> Any:
+    """
+    Construct engine class safely regardless of signature.
+    """
     try:
         sig = inspect.signature(cls.__init__)
-        params = [p for p in sig.parameters.values() if p.name != "self" and p.kind != p.VAR_KEYWORD]
-        
-        if not params:
-            return cls()
-        
-        param_names = {p.name for p in params}
-        if "settings" in param_names:
+        names = set(sig.parameters.keys())
+        if "settings" in names:
             return cls(settings=settings)
-        if "config" in param_names:
+        if "config" in names:
             return cls(config=settings)
-        
-        if len(params) == 1:
-            try:
-                return cls(settings)
-            except TypeError:
-                return cls()
-        
-        return cls()
-    except Exception as e:
-        _dbg(f"Engine construction failed: {e}", "warn")
+        # single-arg fallback
         try:
-            return cls()
+            return cls(settings)
         except Exception:
-            return None
+            return cls()
+    except Exception:
+        return cls()
 
 
 _ENGINE_INSTANCE: Optional[Any] = None
 _ENGINE_LOCK = threading.RLock()
+_ENGINE_ASYNC_LOCK = asyncio.Lock()
+
+
+async def get_engine_async(force_reload: bool = False) -> Optional[Any]:
+    """
+    Async engine getter (best for FastAPI).
+    - Uses core.data_engine_v2.get_engine (async) when available.
+    - Caches instance globally.
+    """
+    global _ENGINE_INSTANCE
+
+    if not force_reload:
+        with _ENGINE_LOCK:
+            if _ENGINE_INSTANCE is not None:
+                return _ENGINE_INSTANCE
+
+    async with _ENGINE_ASYNC_LOCK:
+        if not force_reload:
+            with _ENGINE_LOCK:
+                if _ENGINE_INSTANCE is not None:
+                    return _ENGINE_INSTANCE
+
+        settings = get_settings()
+        info = _resolve_engine_info()
+
+        if info.get_engine_func:
+            try:
+                out = _call_get_engine_compat(info.get_engine_func, settings)
+                eng = await out if inspect.isawaitable(out) else out
+                if eng is not None:
+                    with _ENGINE_LOCK:
+                        _ENGINE_INSTANCE = eng
+                    return eng
+            except Exception as e:
+                _dbg(f"get_engine_async via function failed: {e}", "warn")
+
+        if info.engine_class:
+            try:
+                eng = _construct_engine_compat(info.engine_class, settings)
+                if eng is not None:
+                    with _ENGINE_LOCK:
+                        _ENGINE_INSTANCE = eng
+                    return eng
+            except Exception as e:
+                _dbg(f"get_engine_async via class failed: {e}", "warn")
+
+        return None
 
 
 @_monitor_import
 def get_engine(force_reload: bool = False) -> Optional[Any]:
     """
-    Get or create engine singleton.
-    
-    Args:
-        force_reload: Force reload of engine instance
-    
-    Returns:
-        Engine instance or None if unavailable
+    Sync engine getter (for CLI/scripts).
+    Behavior:
+    - If called inside a running event loop => returns a coroutine (must be awaited).
+    - If no running loop => runs async getter via asyncio.run and returns instance.
     """
-    global _ENGINE_INSTANCE
-    
-    if not force_reload:
-        with _ENGINE_LOCK:
-            if _ENGINE_INSTANCE is not None:
-                return _ENGINE_INSTANCE
-    
     try:
-        settings = get_settings()
-        info = _resolve_engine_info()
-        
-        if not info.available:
-            _dbg("No engine available", "warn")
+        asyncio.get_running_loop()
+        # running loop => caller must await
+        return get_engine_async(force_reload=force_reload)  # type: ignore[return-value]
+    except RuntimeError:
+        # no loop => safe to run
+        try:
+            return asyncio.run(get_engine_async(force_reload=force_reload))
+        except Exception as e:
+            _dbg(f"get_engine (sync) failed: {e}", "warn")
             return None
-        
-        # Try get_engine function first
-        if info.get_engine_func:
-            inst = _call_get_engine(info.get_engine_func, settings)
-            if inst is not None:
-                with _ENGINE_LOCK:
-                    _ENGINE_INSTANCE = inst
-                _dbg(f"Engine created via get_engine() from {info.module_path}", "info")
-                return inst
-        
-        # Try constructing from class
-        if info.engine_class:
-            inst = _construct_engine_class(info.engine_class, settings)
-            if inst is not None:
-                with _ENGINE_LOCK:
-                    _ENGINE_INSTANCE = inst
-                _dbg(f"Engine created via {info.engine_class.__name__} from {info.module_path}", "info")
-                return inst
-        
-        _dbg("Engine creation failed", "warn")
-        return None
-    except Exception as e:
-        _dbg(f"get_engine() failed: {e}", "error")
-        return None
 
 
 def reload_engine() -> Optional[Any]:
-    """Force reload engine instance."""
     global _ENGINE_INSTANCE
     with _ENGINE_LOCK:
         _ENGINE_INSTANCE = None
-    _CACHE.remove("engine_info")
+    _CACHE.remove("engine_info_v2")
     return get_engine(force_reload=True)
 
 
-# ============================================================================
-# Schema Integration
-# ============================================================================
+# =============================================================================
+# Symbol exports (best-effort, no hard dependency)
+# =============================================================================
+_SYMBOL_CANDIDATES = [
+    "symbols.normalize",
+    "core.symbols.normalize",
+]
 
-_SCHEMA_MODULE = "core.schemas"
-_SCHEMA_EXPORTS = [
-    "BatchProcessRequest",
-    "get_headers_for_sheet",
-    "resolve_sheet_key",
-    "get_supported_sheets",
-    "validate_sheet_data",
-    "SheetType",
-    "DataQuality",
+_SYMBOL_EXPORTS = [
+    "normalize_symbol",
+    "is_ksa",
+    "to_yahoo_symbol",
+    "to_eodhd_symbol",
+    "to_finnhub_symbol",
 ]
 
 
-def _get_schema_export(name: str) -> Any:
-    """Lazy getter for schema exports."""
-    cache_key = f"schema:{name}"
+def _get_symbol_export(name: str) -> Any:
+    cache_key = f"symbol_export:{name}"
     cached = _CACHE.get(cache_key)
     if cached is not None:
         return cached
-    
-    result = _try_import(_SCHEMA_MODULE)
-    if result.success and result.module:
-        attr = getattr(result.module, name, None)
+
+    for mod in _SYMBOL_CANDIDATES:
+        attr, _ = _try_import_attr(mod, name)
         if attr is not None:
             _CACHE.set(cache_key, attr)
             return attr
-    
+
     return None
 
 
-# ============================================================================
-# Safe Schema Wrappers
-# ============================================================================
-
-@_monitor_import
-def get_headers_for_sheet(sheet_key: str, *args: Any, **kwargs: Any) -> List[str]:
-    """Safe wrapper for get_headers_for_sheet."""
-    try:
-        fn = _get_schema_export("get_headers_for_sheet")
-        if callable(fn):
-            result = fn(sheet_key, *args, **kwargs)
-            if result is None:
-                return []
-            return [str(x) for x in list(result)]
-    except Exception as e:
-        _dbg(f"get_headers_for_sheet({sheet_key}) failed: {e}", "warn")
-    return []
-
-
-@_monitor_import
-def resolve_sheet_key(sheet_key: str, *args: Any, **kwargs: Any) -> str:
-    """Safe wrapper for resolve_sheet_key."""
-    try:
-        fn = _get_schema_export("resolve_sheet_key")
-        if callable(fn):
-            result = fn(sheet_key, *args, **kwargs)
-            if result is not None:
-                return str(result).strip()
-    except Exception as e:
-        _dbg(f"resolve_sheet_key({sheet_key}) failed: {e}", "warn")
-    return str(sheet_key or "").strip()
-
-
-@_monitor_import
-def get_supported_sheets(*args: Any, **kwargs: Any) -> List[str]:
-    """Safe wrapper for get_supported_sheets."""
-    try:
-        fn = _get_schema_export("get_supported_sheets")
-        if callable(fn):
-            result = fn(*args, **kwargs)
-            if result is None:
-                return []
-            return [str(x) for x in list(result)]
-    except Exception as e:
-        _dbg(f"get_supported_sheets() failed: {e}", "warn")
-    return []
-
-
-@_monitor_import
-def validate_sheet_data(sheet_key: str, data: Dict[str, Any], *args: Any, **kwargs: Any) -> Tuple[bool, List[str]]:
-    """Validate sheet data against schema."""
-    try:
-        fn = _get_schema_export("validate_sheet_data")
-        if callable(fn):
-            return fn(sheet_key, data, *args, **kwargs)
-    except Exception as e:
-        _dbg(f"validate_sheet_data({sheet_key}) failed: {e}", "warn")
-    return False, ["Validation function unavailable"]
-
-
-# ============================================================================
-# Provider Registry
-# ============================================================================
-
+# =============================================================================
+# Provider registry (lightweight, aligned priorities)
+# =============================================================================
 class ProviderInfo:
-    """Information about a data provider."""
-    
-    def __init__(
-        self,
-        name: str,
-        module_path: str,
-        priority: int = 100,
-        enabled: bool = True,
-        markets: Optional[List[str]] = None
-    ):
+    def __init__(self, name: str, module_path: str, priority: int, markets: Optional[List[str]] = None, enabled: bool = True):
         self.name = name
         self.module_path = module_path
-        self.priority = priority
-        self.enabled = enabled
+        self.priority = int(priority)
         self.markets = markets or ["GLOBAL"]
-        self._module: Optional[Any] = None
-        self._functions: Dict[str, Any] = {}
-    
-    def load(self) -> bool:
-        """Load provider module."""
-        if self._module is not None:
-            return True
-        result = _try_import(self.module_path)
-        if result.success:
-            self._module = result.module
-            return True
-        return False
-    
-    def get_function(self, name: str) -> Optional[Any]:
-        """Get provider function by name."""
-        if name in self._functions:
-            return self._functions[name]
-        
-        if not self.load():
-            return None
-        
-        if self._module:
-            func = getattr(self._module, name, None)
-            if func is not None:
-                self._functions[name] = func
-                return func
-        return None
-    
+        self.enabled = bool(enabled)
+
     def __repr__(self) -> str:
-        return f"ProviderInfo(name='{self.name}', enabled={self.enabled})"
+        return f"ProviderInfo(name={self.name!r}, priority={self.priority}, enabled={self.enabled})"
 
 
 _PROVIDER_REGISTRY: Dict[str, ProviderInfo] = {}
-_PROVIDER_REGISTRY_LOCK = threading.RLock()
+_PROVIDER_LOCK = threading.RLock()
 
 
-def register_provider(
-    name: str,
-    module_path: str,
-    priority: int = 100,
-    enabled: bool = True,
-    markets: Optional[List[str]] = None
-) -> None:
-    """Register a data provider."""
-    with _PROVIDER_REGISTRY_LOCK:
-        _PROVIDER_REGISTRY[name] = ProviderInfo(
-            name=name,
-            module_path=module_path,
-            priority=priority,
-            enabled=enabled,
-            markets=markets
-        )
-        _dbg(f"Registered provider: {name} ({module_path})", "info")
+def register_provider(name: str, module_path: str, *, priority: int = 100, markets: Optional[List[str]] = None, enabled: bool = True) -> None:
+    with _PROVIDER_LOCK:
+        _PROVIDER_REGISTRY[name] = ProviderInfo(name, module_path, priority, markets=markets, enabled=enabled)
 
 
 def get_provider(name: str) -> Optional[ProviderInfo]:
-    """Get provider by name."""
-    with _PROVIDER_REGISTRY_LOCK:
+    with _PROVIDER_LOCK:
         return _PROVIDER_REGISTRY.get(name)
 
 
 def get_enabled_providers(market: Optional[str] = None) -> List[ProviderInfo]:
-    """Get enabled providers, optionally filtered by market."""
-    with _PROVIDER_REGISTRY_LOCK:
-        providers = [p for p in _PROVIDER_REGISTRY.values() if p.enabled]
+    with _PROVIDER_LOCK:
+        ps = [p for p in _PROVIDER_REGISTRY.values() if p.enabled]
         if market:
-            providers = [p for p in providers if not p.markets or market in p.markets]
-        return sorted(providers, key=lambda p: p.priority)
+            ps = [p for p in ps if not p.markets or market in p.markets]
+        return sorted(ps, key=lambda p: p.priority)
 
 
-# Register default providers
-register_provider("yahoo", "core.providers.yahoo_chart_provider", priority=10, markets=["GLOBAL"])
-register_provider("finnhub", "core.providers.finnhub_provider", priority=20, markets=["GLOBAL"])
-register_provider("eodhd", "core.providers.eodhd_provider", priority=30, markets=["GLOBAL"])
-register_provider("tadawul", "core.providers.tadawul_provider", priority=5, markets=["KSA"])
-register_provider("argaam", "core.providers.argaam_provider", priority=15, markets=["KSA"])
+# GLOBAL-first priorities (EODHD first)
+register_provider("eodhd", "core.providers.eodhd_provider", priority=10, markets=["GLOBAL"])
+register_provider("yahoo_chart", "core.providers.yahoo_chart_provider", priority=20, markets=["GLOBAL"])
 register_provider("yahoo_fundamentals", "core.providers.yahoo_fundamentals_provider", priority=25, markets=["GLOBAL"])
+register_provider("finnhub", "core.providers.finnhub_provider", priority=30, markets=["GLOBAL"])
+
+# KSA sources
+register_provider("tadawul", "core.providers.tadawul_provider", priority=10, markets=["KSA"])
+register_provider("argaam", "core.providers.argaam_provider", priority=20, markets=["KSA"])
 
 
-# ============================================================================
-# Metrics and Monitoring
-# ============================================================================
-
+# =============================================================================
+# Metrics (minimal)
+# =============================================================================
 @dataclass
 class CoreMetrics:
-    """Core metrics for monitoring."""
     import_times: Dict[str, float] = field(default_factory=dict)
-    cache_hits: int = 0
-    cache_misses: int = 0
     engine_requests: int = 0
-    provider_requests: Dict[str, int] = field(default_factory=dict)
     errors: List[Tuple[str, str, float]] = field(default_factory=list)
-    
+
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary."""
         return {
             "import_times": self.import_times,
-            "cache_hits": self.cache_hits,
-            "cache_misses": self.cache_misses,
             "engine_requests": self.engine_requests,
-            "provider_requests": self.provider_requests,
-            "errors": [(e[0], e[1]) for e in self.errors[-10:]],  # Last 10 errors
+            "errors": [(e[0], e[1]) for e in self.errors[-10:]],
         }
 
 
@@ -892,55 +559,28 @@ _METRICS = CoreMetrics()
 _METRICS_LOCK = threading.RLock()
 
 
-def record_cache_hit() -> None:
-    """Record a cache hit."""
-    with _METRICS_LOCK:
-        _METRICS.cache_hits += 1
-
-
-def record_cache_miss() -> None:
-    """Record a cache miss."""
-    with _METRICS_LOCK:
-        _METRICS.cache_misses += 1
-
-
 def record_engine_request() -> None:
-    """Record an engine request."""
     with _METRICS_LOCK:
         _METRICS.engine_requests += 1
 
 
-def record_provider_request(provider: str) -> None:
-    """Record a provider request."""
-    with _METRICS_LOCK:
-        _METRICS.provider_requests[provider] = _METRICS.provider_requests.get(provider, 0) + 1
-
-
 def record_error(source: str, error: str) -> None:
-    """Record an error."""
     with _METRICS_LOCK:
         _METRICS.errors.append((source, error, time.time()))
-        # Keep only last 100 errors
-        if len(_METRICS.errors) > 100:
-            _METRICS.errors = _METRICS.errors[-100:]
+        if len(_METRICS.errors) > 200:
+            _METRICS.errors = _METRICS.errors[-200:]
 
 
 def get_metrics() -> CoreMetrics:
-    """Get current metrics."""
     with _METRICS_LOCK:
-        metrics = CoreMetrics(
+        return CoreMetrics(
             import_times=get_import_times(),
-            cache_hits=_METRICS.cache_hits,
-            cache_misses=_METRICS.cache_misses,
             engine_requests=_METRICS.engine_requests,
-            provider_requests=dict(_METRICS.provider_requests),
             errors=list(_METRICS.errors),
         )
-    return metrics
 
 
 def reset_metrics() -> None:
-    """Reset all metrics."""
     global _METRICS
     with _METRICS_LOCK:
         _METRICS = CoreMetrics()
@@ -948,219 +588,96 @@ def reset_metrics() -> None:
         _import_times.clear()
 
 
-# ============================================================================
-# PEP 562: Lazy Attribute Access
-# ============================================================================
-
+# =============================================================================
+# PEP 562: Lazy attribute access
+# =============================================================================
 def __getattr__(name: str) -> Any:
-    """Lazy attribute resolution."""
-    
-    # Core functions
+    # core API
     if name == "get_settings":
         return get_settings
     if name == "get_engine":
         return get_engine
+    if name == "get_engine_async":
+        return get_engine_async
     if name == "reload_engine":
         return reload_engine
-    if name == "get_config":
-        return get_config
-    if name == "reload_config":
-        return reload_config
-    
-    # Schema wrappers
-    if name == "get_headers_for_sheet":
-        return get_headers_for_sheet
-    if name == "resolve_sheet_key":
-        return resolve_sheet_key
-    if name == "get_supported_sheets":
-        return get_supported_sheets
-    if name == "validate_sheet_data":
-        return validate_sheet_data
-    
-    # Metrics
-    if name == "get_metrics":
-        return get_metrics
-    if name == "reset_metrics":
-        return reset_metrics
-    if name == "get_import_times":
-        return get_import_times
-    
-    # Provider registry
+
+    # provider registry
     if name == "register_provider":
         return register_provider
     if name == "get_provider":
         return get_provider
     if name == "get_enabled_providers":
         return get_enabled_providers
-    
-    # Symbol exports
-    symbol_value = _get_symbol_export(name)
-    if symbol_value is not None:
-        return symbol_value
-    
-    # Engine classes
-    if name in _ENGINE_CLASSES:
-        info = _resolve_engine_info()
-        if info.engine_class and info.engine_class.__name__ == name:
-            return info.engine_class
-        # Try to get from cache
-        for cls_name in _ENGINE_CLASSES:
-            if cls_name == name:
-                exports = _CACHE.get("engine_exports", {})
-                if name in exports:
-                    return exports[name]
-        return None
-    
-    # Schema exports
-    schema_value = _get_schema_export(name)
-    if schema_value is not None:
-        return schema_value
-    
-    # Version
-    if name == "__version__":
-        return __version__
+
+    # metrics
+    if name == "get_metrics":
+        return get_metrics
+    if name == "reset_metrics":
+        return reset_metrics
+    if name == "get_import_times":
+        return get_import_times
+
+    # symbol exports (best-effort)
+    sym = _get_symbol_export(name)
+    if sym is not None:
+        return sym
+
+    # versions
     if name == "CORE_INIT_VERSION":
-        return __version__
-    
+        return CORE_INIT_VERSION
+
     raise AttributeError(f"module 'core' has no attribute '{name}'")
 
 
 def __dir__() -> List[str]:
-    """Return list of available attributes."""
-    return sorted(set(__all__ + list(_get_symbol_exports().keys())))
+    return sorted(set(__all__))
 
 
-# ============================================================================
-# Module Initialization
-# ============================================================================
-
+# =============================================================================
+# Init
+# =============================================================================
 def init_core(debug: Optional[bool] = None, log_level: Optional[str] = None) -> None:
-    """
-    Initialize core module with custom settings.
-    
-    Args:
-        debug: Enable debug logging
-        log_level: Log level (debug, info, warn, error)
-    """
-    global _DEBUG_IMPORTS, _LOG_LEVEL, _CONFIG
-    
+    global _DEBUG_IMPORTS, _LOG_LEVEL
     with _import_lock:
         if debug is not None:
-            _DEBUG_IMPORTS = debug
-        
+            _DEBUG_IMPORTS = bool(debug)
         if log_level is not None:
             try:
                 _LOG_LEVEL = LogLevel[log_level.upper()]
-            except (KeyError, AttributeError):
+            except Exception:
                 _LOG_LEVEL = LogLevel.INFO
-        
-        # Reload config
-        _CONFIG = CoreConfig.from_env()
-        
-        _dbg(f"Core initialized (v{__version__})", "info")
-        _dbg(f"Debug: {_DEBUG_IMPORTS}, Log level: {_LOG_LEVEL.name}", "debug")
+    _dbg(f"Core initialized v{__version__} | debug={_DEBUG_IMPORTS} | level={_LOG_LEVEL.name}", "info")
 
 
-# Auto-initialize
-init_core()
+# Auto-init (safe)
+try:
+    init_core()
+except Exception:
+    pass
 
 
-# ============================================================================
-# Module Exports
-# ============================================================================
-
+# =============================================================================
+# Exports
+# =============================================================================
 __all__ = [
-    # Version
     "__version__",
+    "__core_version__",
     "CORE_INIT_VERSION",
-    
-    # Core functions
+    # settings
     "get_settings",
+    # engine
     "get_engine",
+    "get_engine_async",
     "reload_engine",
-    "get_config",
-    "reload_config",
-    
-    # Engine classes
-    "DataEngine",
-    "DataEngineV2",
-    "UnifiedQuote",
-    
-    # Symbol exports (core)
-    "normalize_symbol",
-    "normalize_ksa_symbol",
-    "normalize_symbols_list",
-    "symbol_variants",
-    "market_hint_for",
-    "detect_market_type",
-    "detect_asset_class",
-    "validate_symbol",
-    
-    # Symbol detection
-    "is_ksa",
-    "looks_like_ksa",
-    "is_index",
-    "is_fx",
-    "is_commodity_future",
-    "is_crypto",
-    "is_etf",
-    "is_special_symbol",
-    "is_index_or_fx",
-    "is_isin",
-    "is_cusip",
-    "is_sedol",
-    "is_option",
-    
-    # Options
-    "parse_occ_option",
-    
-    # Provider formatting
-    "to_yahoo_symbol",
-    "to_finnhub_symbol",
-    "to_eodhd_symbol",
-    "to_bloomberg_symbol",
-    "to_reuters_symbol",
-    "to_google_symbol",
-    "to_tradingview_symbol",
-    
-    # Provider variants
-    "yahoo_symbol_variants",
-    "finnhub_symbol_variants",
-    "eodhd_symbol_variants",
-    "bloomberg_symbol_variants",
-    "reuters_symbol_variants",
-    
-    # Symbol utilities
-    "extract_base_symbol",
-    "extract_exchange_code",
-    "standardize_share_class",
-    "get_primary_exchange",
-    "get_currency_from_symbol",
-    "get_mic_code",
-    
-    # Symbol enums
-    "MarketType",
-    "AssetClass",
-    "SymbolQuality",
-    
-    # Schema exports
-    "BatchProcessRequest",
-    "get_headers_for_sheet",
-    "resolve_sheet_key",
-    "get_supported_sheets",
-    "validate_sheet_data",
-    
-    # Provider registry
+    # providers registry
     "register_provider",
     "get_provider",
     "get_enabled_providers",
-    
-    # Metrics
+    # metrics
     "get_metrics",
     "reset_metrics",
     "get_import_times",
-    
-    # Initialization
+    # init
     "init_core",
-    "CoreConfig",
 ]
