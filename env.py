@@ -2,15 +2,30 @@
 """
 env.py
 ================================================================================
-TADAWUL FAST BRIDGE – ENTERPRISE ENVIRONMENT MANAGER (v7.5.3)
+TADAWUL FAST BRIDGE – ENTERPRISE ENVIRONMENT MANAGER (v7.6.0)
 ================================================================================
-STABLE EDITION | DISTRIBUTED CONFIG | HOT-RELOAD | SECRETS MANAGEMENT
+RENDER-SAFE | STARTUP-SAFE | GLOBAL-FIRST | HOT-RELOAD | SECRETS-SAFE
 
-Fixes vs v7.5.2:
-- ✅ Adds missing get_first_env_bool() (commonly imported elsewhere)
-- ✅ Adds common Render flags to Settings (DEBUG/Swagger/Redoc/Defer/InitEngine)
-- ✅ Exports helper getters in __all__ (int/float/bool/list) to avoid import errors
-- ✅ Keeps existing behavior and defaults (no breaking changes)
+Why this revision (vs v7.5.3 you pasted)?
+- ✅ DEPLOY-SAFE AUTH DEFAULTS (prevents “boot_errors” causing app exit before port bind)
+    - If no tokens are configured, REQUIRE_AUTH defaults to False and OPEN_MODE defaults to True
+    - If tokens exist, REQUIRE_AUTH defaults to True and OPEN_MODE defaults to False
+    - Explicit env vars (OPEN_MODE / REQUIRE_AUTH) always win
+- ✅ Google credentials normalization expanded:
+    - GOOGLE_SHEETS_CREDENTIALS / GOOGLE_CREDENTIALS (JSON)
+    - GOOGLE_*_B64 (base64 JSON)
+    - GOOGLE_APPLICATION_CREDENTIALS / GOOGLE_*_FILE (file path)
+    - Repairs private_key newlines safely
+- ✅ Adds GLOBAL EODHD defaults:
+    - EODHD_DEFAULT_EXCHANGE / EODHD_APPEND_EXCHANGE_SUFFIX
+- ✅ Makes JSON fallback robust for bytes input
+- ✅ Normalizes providers lists (lowercase + dedupe) deterministically
+- ✅ Keeps backward-compatible exports (get_first_env_bool/int/float/list + constants)
+
+IMPORTANT:
+This module must NEVER do network I/O at import time.
+It must NEVER raise due to missing optional deps.
+It must NEVER force-exit unless Python is truly unsupported.
 """
 
 from __future__ import annotations
@@ -29,6 +44,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
 
 # ---------------------------------------------------------------------------
 # High-Performance JSON fallback
@@ -49,6 +65,9 @@ try:
 except Exception:
 
     def json_loads(data: Union[str, bytes]) -> Any:
+        # FIX: tolerate bytes safely
+        if isinstance(data, (bytes, bytearray)):
+            data = data.decode("utf-8", errors="replace")
         return json.loads(data)
 
     def json_dumps(obj: Any, *, indent: int = 0) -> str:
@@ -60,11 +79,12 @@ except Exception:
 # =============================================================================
 # Version & Core Configuration
 # =============================================================================
-ENV_VERSION = "7.5.3"
-ENV_SCHEMA_VERSION = "2.1"
+ENV_VERSION = "7.6.0"
+ENV_SCHEMA_VERSION = "2.2"
 MIN_PYTHON = (3, 8)
 
 if sys.version_info < MIN_PYTHON:
+    # Hard stop only if Python is truly unsupported.
     sys.exit(f"❌ Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ required")
 
 
@@ -104,11 +124,15 @@ except Exception:
     Status = StatusCode = None  # type: ignore
 
     class _DummyCM:
-        def __enter__(self): return None
-        def __exit__(self, *args, **kwargs): return False
+        def __enter__(self):  # noqa
+            return None
+
+        def __exit__(self, *args, **kwargs):  # noqa
+            return False
 
     class _DummyTracer:
-        def start_as_current_span(self, *args, **kwargs): return _DummyCM()
+        def start_as_current_span(self, *args, **kwargs):  # noqa
+            return _DummyCM()
 
     _TRACER = _DummyTracer()  # type: ignore
 
@@ -127,9 +151,14 @@ if PROMETHEUS_AVAILABLE:
 else:
 
     class _DummyMetric:
-        def labels(self, *args, **kwargs): return self
-        def inc(self, *args, **kwargs): return None
-        def observe(self, *args, **kwargs): return None
+        def labels(self, *args, **kwargs):  # noqa
+            return self
+
+        def inc(self, *args, **kwargs):  # noqa
+            return None
+
+        def observe(self, *args, **kwargs):  # noqa
+            return None
 
     env_config_loads_total = _DummyMetric()
     env_config_errors_total = _DummyMetric()
@@ -311,6 +340,7 @@ def coerce_list(v: Any, default: Optional[List[str]] = None) -> List[str]:
     s = strip_value(v)
     if not s:
         return default or []
+    # JSON-like lists
     if s.startswith(("[", "(")):
         try:
             parsed = json_loads(s.replace("'", '"'))
@@ -400,11 +430,26 @@ def repair_private_key(key: str) -> str:
     return key
 
 
+def _read_text_file_if_exists(path: str) -> Optional[str]:
+    try:
+        p = Path(strip_value(path))
+        if p.exists() and p.is_file():
+            return p.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    return None
+
+
 def repair_json_creds(raw: str) -> Optional[Dict[str, Any]]:
+    """
+    Accepts JSON or base64 JSON.
+    Returns dict or None. Never throws.
+    """
     t = strip_wrapping_quotes(raw or "")
     if not t:
         return None
 
+    # base64 attempt
     if not t.startswith("{") and len(t) > 50:
         try:
             decoded = base64.b64decode(t, validate=False).decode("utf-8", errors="replace").strip()
@@ -423,6 +468,120 @@ def repair_json_creds(raw: str) -> Optional[Dict[str, Any]]:
     except Exception as e:
         logger.debug("Failed to parse Google credentials: %s", e)
     return None
+
+
+def resolve_google_credentials() -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """
+    Expanded credential resolution (Render-safe).
+    Returns (json_string, dict) or (None, None).
+    Priority:
+      1) GOOGLE_CREDENTIALS_DICT (JSON dict string)
+      2) GOOGLE_SHEETS_CREDENTIALS / GOOGLE_CREDENTIALS (JSON or base64 JSON)
+      3) GOOGLE_*_B64 (base64 JSON)
+      4) GOOGLE_APPLICATION_CREDENTIALS / GOOGLE_*_FILE (file path)
+    """
+    # 1) explicit dict
+    d_raw = get_first_env("GOOGLE_CREDENTIALS_DICT") or ""
+    if d_raw.startswith("{") and d_raw.endswith("}"):
+        d = repair_json_creds(d_raw)
+        if d:
+            return (json_dumps(d), d)
+
+    # 2) raw JSON or base64 JSON
+    raw = get_first_env("GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS") or ""
+    if raw:
+        d = repair_json_creds(raw)
+        if d:
+            return (json_dumps(d), d)
+
+    # 3) base64 variants
+    b64 = get_first_env("GOOGLE_SHEETS_CREDENTIALS_B64", "GOOGLE_CREDENTIALS_B64") or ""
+    if b64:
+        # support "b64:..."
+        b = strip_value(b64)
+        if b.lower().startswith("b64:"):
+            b = b.split(":", 1)[1].strip()
+        try:
+            decoded = base64.b64decode(b.encode("utf-8"), validate=False).decode("utf-8", errors="replace")
+            d = repair_json_creds(decoded)
+            if d:
+                return (json_dumps(d), d)
+        except Exception:
+            pass
+
+    # 4) file paths
+    fp = get_first_env(
+        "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_SHEETS_CREDENTIALS_FILE",
+        "GOOGLE_CREDENTIALS_FILE",
+    ) or ""
+    if fp:
+        txt = _read_text_file_if_exists(fp)
+        if txt:
+            d = repair_json_creds(txt)
+            if d:
+                return (json_dumps(d), d)
+
+    return (None, None)
+
+
+def normalize_providers(items: List[str]) -> List[str]:
+    """Lowercase + dedupe while preserving order."""
+    out: List[str] = []
+    seen: set = set()
+    for x in items or []:
+        s = strip_value(x).lower()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def get_allowed_tokens() -> List[str]:
+    """
+    Collect allowed tokens from:
+    - ALLOWED_TOKENS / TFB_ALLOWED_TOKENS / APP_TOKENS (comma/list)
+    - APP_TOKEN / BACKUP_APP_TOKEN
+    """
+    toks = get_first_env_list("ALLOWED_TOKENS", "TFB_ALLOWED_TOKENS", "APP_TOKENS", default=[])
+    toks = [strip_value(t) for t in toks if strip_value(t)]
+    t1 = get_first_env("APP_TOKEN", "TFB_APP_TOKEN") or ""
+    t2 = get_first_env("BACKUP_APP_TOKEN") or ""
+    if t1 and t1 not in toks:
+        toks.append(t1)
+    if t2 and t2 not in toks:
+        toks.append(t2)
+    return toks
+
+
+def derive_auth_flags(
+    *,
+    require_auth_env: Optional[str],
+    open_mode_env: Optional[str],
+    tokens_exist: bool,
+) -> Tuple[bool, bool]:
+    """
+    Compute (REQUIRE_AUTH, OPEN_MODE) in a deploy-safe way.
+    - Explicit env vars always win.
+    - If no tokens configured:
+        REQUIRE_AUTH defaults False, OPEN_MODE defaults True
+    - If tokens configured:
+        REQUIRE_AUTH defaults True, OPEN_MODE defaults False
+    """
+    # require_auth
+    if require_auth_env is not None:
+        require_auth = coerce_bool(require_auth_env, False)
+    else:
+        require_auth = bool(tokens_exist)
+
+    # open_mode
+    if open_mode_env is not None:
+        open_mode = coerce_bool(open_mode_env, False)
+    else:
+        open_mode = (not require_auth) and (not tokens_exist)
+
+    return bool(require_auth), bool(open_mode)
 
 
 def get_system_info() -> Dict[str, Any]:
@@ -535,7 +694,7 @@ class Settings:
 
     # Google integration
     DEFAULT_SPREADSHEET_ID: Optional[str] = None
-    GOOGLE_SHEETS_CREDENTIALS: Optional[str] = None
+    GOOGLE_SHEETS_CREDENTIALS: Optional[str] = None  # normalized JSON string
     GOOGLE_APPS_SCRIPT_URL: Optional[str] = None
     GOOGLE_APPS_SCRIPT_BACKUP_URL: Optional[str] = None
 
@@ -548,6 +707,10 @@ class Settings:
     ALPHA_VANTAGE_API_KEY: Optional[str] = None
     TWELVEDATA_API_KEY: Optional[str] = None
     MARKETSTACK_API_KEY: Optional[str] = None
+
+    # GLOBAL EODHD defaults (align with core/config.py)
+    EODHD_DEFAULT_EXCHANGE: str = "US"
+    EODHD_APPEND_EXCHANGE_SUFFIX: bool = True
 
     # KSA providers
     ARGAAM_QUOTE_URL: Optional[str] = None
@@ -578,6 +741,7 @@ class Settings:
     ENABLE_CORS_ALL_ORIGINS: bool = False
     CORS_ORIGINS: str = ""
 
+    # Diagnostics
     boot_errors: Tuple[str, ...] = field(default_factory=tuple)
     boot_warnings: Tuple[str, ...] = field(default_factory=tuple)
     config_sources: Dict[str, ConfigSource] = field(default_factory=dict)
@@ -588,74 +752,97 @@ class Settings:
 
         # Auto providers
         auto_global: List[str] = []
-        if get_first_env("EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"): auto_global.append("eodhd")
-        if get_first_env("FINNHUB_API_KEY", "FINNHUB_TOKEN"): auto_global.append("finnhub")
-        if get_first_env("FMP_API_KEY"): auto_global.append("fmp")
-        if get_first_env("ALPHA_VANTAGE_API_KEY"): auto_global.append("alphavantage")
-        if get_first_env("TWELVEDATA_API_KEY"): auto_global.append("twelvedata")
-        if get_first_env("MARKETSTACK_API_KEY"): auto_global.append("marketstack")
-        if not auto_global: auto_global = ["eodhd", "finnhub"]
+        if get_first_env("EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"):
+            auto_global.append("eodhd")
+        if get_first_env("FINNHUB_API_KEY", "FINNHUB_TOKEN"):
+            auto_global.append("finnhub")
+        if get_first_env("FMP_API_KEY"):
+            auto_global.append("fmp")
+        if get_first_env("ALPHA_VANTAGE_API_KEY"):
+            auto_global.append("alphavantage")
+        if get_first_env("TWELVEDATA_API_KEY"):
+            auto_global.append("twelvedata")
+        if get_first_env("MARKETSTACK_API_KEY"):
+            auto_global.append("marketstack")
+        if not auto_global:
+            auto_global = ["eodhd", "finnhub"]
 
         auto_ksa: List[str] = []
-        if get_first_env("ARGAAM_QUOTE_URL"): auto_ksa.append("argaam")
-        if get_first_env("TADAWUL_QUOTE_URL"): auto_ksa.append("tadawul")
+        if get_first_env("ARGAAM_QUOTE_URL"):
+            auto_ksa.append("argaam")
+        if get_first_env("TADAWUL_QUOTE_URL"):
+            auto_ksa.append("tadawul")
         if coerce_bool(get_first_env("ENABLE_YAHOO_CHART_KSA", "ENABLE_YFINANCE_KSA"), True):
             auto_ksa.insert(0, "yahoo_chart")
-        if not auto_ksa: auto_ksa = ["yahoo_chart", "argaam"]
+        if not auto_ksa:
+            auto_ksa = ["yahoo_chart", "argaam"]
 
-        google_creds_raw = get_first_env("GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS") or ""
-        google_creds_obj = repair_json_creds(google_creds_raw)
-        google_creds_str = json_dumps(google_creds_obj) if google_creds_obj else None
+        # Google creds (expanded)
+        gs_json, gs_dict = resolve_google_credentials()
+        google_creds_str = gs_json if (gs_json and gs_dict) else (gs_json or None)
+
+        # Tokens + safe auth defaults
+        app_token = get_first_env("APP_TOKEN", "TFB_APP_TOKEN")
+        backup_token = get_first_env("BACKUP_APP_TOKEN")
+        tokens_exist = bool(get_allowed_tokens())
+
+        require_auth_env = os.getenv("REQUIRE_AUTH")
+        open_mode_env = os.getenv("OPEN_MODE")
+        require_auth, open_mode = derive_auth_flags(
+            require_auth_env=require_auth_env,
+            open_mode_env=open_mode_env,
+            tokens_exist=tokens_exist,
+        )
+
+        enabled_providers = normalize_providers(
+            get_first_env_list("ENABLED_PROVIDERS", "PROVIDERS", default=auto_global)
+        )
+        ksa_providers = normalize_providers(get_first_env_list("KSA_PROVIDERS", default=auto_ksa))
+
+        primary_provider = strip_value(get_first_env("PRIMARY_PROVIDER") or (enabled_providers[0] if enabled_providers else "eodhd")).lower()
+
+        # Ensure primary is in enabled (non-fatal; just warning)
+        if primary_provider and primary_provider not in enabled_providers:
+            enabled_providers = [primary_provider] + [p for p in enabled_providers if p != primary_provider]
 
         s = cls(
             APP_NAME=get_first_env("APP_NAME", "SERVICE_NAME", "APP_TITLE") or "Tadawul Fast Bridge",
             APP_VERSION=get_first_env("APP_VERSION", "SERVICE_VERSION", "VERSION") or "dev",
             APP_ENV=env_name,
-
             LOG_LEVEL=get_first_env("LOG_LEVEL") or "INFO",
             LOG_JSON=coerce_bool(get_first_env("LOG_JSON"), False),
             LOG_FORMAT=get_first_env("LOG_FORMAT") or "",
-
             TIMEZONE_DEFAULT=get_first_env("APP_TIMEZONE", "TIMEZONE_DEFAULT", "TZ") or "Asia/Riyadh",
-
             DEBUG=get_first_env_bool("DEBUG", default=False),
             DEFER_ROUTER_MOUNT=get_first_env_bool("DEFER_ROUTER_MOUNT", default=False),
             INIT_ENGINE_ON_BOOT=get_first_env_bool("INIT_ENGINE_ON_BOOT", default=True),
             ENABLE_SWAGGER=get_first_env_bool("ENABLE_SWAGGER", default=True),
             ENABLE_REDOC=get_first_env_bool("ENABLE_REDOC", default=True),
-
             AUTH_HEADER_NAME=get_first_env("AUTH_HEADER_NAME", "TOKEN_HEADER_NAME") or "X-APP-TOKEN",
-            APP_TOKEN=get_first_env("APP_TOKEN", "TFB_APP_TOKEN"),
-            BACKUP_APP_TOKEN=get_first_env("BACKUP_APP_TOKEN"),
-            REQUIRE_AUTH=coerce_bool(get_first_env("REQUIRE_AUTH"), True),
+            APP_TOKEN=app_token,
+            BACKUP_APP_TOKEN=backup_token,
+            REQUIRE_AUTH=require_auth,
             ALLOW_QUERY_TOKEN=coerce_bool(get_first_env("ALLOW_QUERY_TOKEN"), False),
-            OPEN_MODE=coerce_bool(get_first_env("OPEN_MODE"), False),
-
+            OPEN_MODE=open_mode,
             AI_ANALYSIS_ENABLED=coerce_bool(get_first_env("AI_ANALYSIS_ENABLED"), True),
             ADVANCED_ANALYSIS_ENABLED=coerce_bool(get_first_env("ADVANCED_ANALYSIS_ENABLED", "ADVANCED_ENABLED"), True),
             ADVISOR_ENABLED=coerce_bool(get_first_env("ADVISOR_ENABLED"), True),
             RATE_LIMIT_ENABLED=coerce_bool(get_first_env("ENABLE_RATE_LIMITING", "RATE_LIMIT_ENABLED"), True),
-
             MAX_REQUESTS_PER_MINUTE=get_first_env_int("MAX_REQUESTS_PER_MINUTE", default=240, lo=30, hi=5000),
             MAX_RETRIES=get_first_env_int("MAX_RETRIES", default=2, lo=0, hi=10),
             RETRY_DELAY=get_first_env_float("RETRY_DELAY", default=0.6, lo=0.0, hi=30.0),
-
             BACKEND_BASE_URL=get_first_env("BACKEND_BASE_URL", "TFB_BASE_URL") or "http://127.0.0.1:8000",
             ENGINE_CACHE_TTL_SEC=get_first_env_int("ENGINE_CACHE_TTL_SEC", "CACHE_DEFAULT_TTL", default=20, lo=5, hi=3600),
             CACHE_MAX_SIZE=get_first_env_int("CACHE_MAX_SIZE", default=5000, lo=100, hi=500000),
             CACHE_SAVE_INTERVAL=get_first_env_int("CACHE_SAVE_INTERVAL", default=300, lo=30, hi=86400),
             CACHE_BACKUP_ENABLED=coerce_bool(get_first_env("CACHE_BACKUP_ENABLED"), True),
-
             HTTP_TIMEOUT_SEC=get_first_env_float("HTTP_TIMEOUT_SEC", "HTTP_TIMEOUT", default=45.0, lo=5.0, hi=180.0),
-
             TFB_SYMBOL_HEADER_ROW=get_first_env_int("TFB_SYMBOL_HEADER_ROW", default=5, lo=1, hi=1000),
             TFB_SYMBOL_START_ROW=get_first_env_int("TFB_SYMBOL_START_ROW", default=6, lo=1, hi=1000),
-
             DEFAULT_SPREADSHEET_ID=get_first_env("DEFAULT_SPREADSHEET_ID", "SPREADSHEET_ID", "GOOGLE_SHEETS_ID"),
             GOOGLE_SHEETS_CREDENTIALS=google_creds_str,
             GOOGLE_APPS_SCRIPT_URL=get_first_env("GOOGLE_APPS_SCRIPT_URL"),
             GOOGLE_APPS_SCRIPT_BACKUP_URL=get_first_env("GOOGLE_APPS_SCRIPT_BACKUP_URL"),
-
             EODHD_API_KEY=get_first_env("EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"),
             EODHD_BASE_URL=get_first_env("EODHD_BASE_URL"),
             FINNHUB_API_KEY=get_first_env("FINNHUB_API_KEY", "FINNHUB_TOKEN"),
@@ -664,7 +851,10 @@ class Settings:
             ALPHA_VANTAGE_API_KEY=get_first_env("ALPHA_VANTAGE_API_KEY"),
             TWELVEDATA_API_KEY=get_first_env("TWELVEDATA_API_KEY"),
             MARKETSTACK_API_KEY=get_first_env("MARKETSTACK_API_KEY"),
-
+            # EODHD defaults
+            EODHD_DEFAULT_EXCHANGE=strip_value(get_first_env("EODHD_DEFAULT_EXCHANGE", "EODHD_SYMBOL_SUFFIX_DEFAULT") or "US").upper(),
+            EODHD_APPEND_EXCHANGE_SUFFIX=coerce_bool(get_first_env("EODHD_APPEND_EXCHANGE_SUFFIX"), True),
+            # KSA
             ARGAAM_QUOTE_URL=get_first_env("ARGAAM_QUOTE_URL"),
             ARGAAM_API_KEY=get_first_env("ARGAAM_API_KEY"),
             TADAWUL_QUOTE_URL=get_first_env("TADAWUL_QUOTE_URL"),
@@ -672,23 +862,22 @@ class Settings:
             TADAWUL_MAX_SYMBOLS=get_first_env_int("TADAWUL_MAX_SYMBOLS", default=1500, lo=10, hi=50000),
             TADAWUL_REFRESH_INTERVAL=get_first_env_int("TADAWUL_REFRESH_INTERVAL", default=60, lo=5, hi=3600),
             KSA_DISALLOW_EODHD=coerce_bool(get_first_env("KSA_DISALLOW_EODHD"), True),
-
-            ENABLED_PROVIDERS=get_first_env_list("ENABLED_PROVIDERS", "PROVIDERS", default=auto_global),
-            KSA_PROVIDERS=get_first_env_list("KSA_PROVIDERS", default=auto_ksa),
-            PRIMARY_PROVIDER=get_first_env("PRIMARY_PROVIDER") or (auto_global[0] if auto_global else "eodhd"),
-
+            # Provider lists
+            ENABLED_PROVIDERS=enabled_providers,
+            KSA_PROVIDERS=ksa_providers,
+            PRIMARY_PROVIDER=primary_provider or "eodhd",
+            # Batching
             AI_BATCH_SIZE=get_first_env_int("AI_BATCH_SIZE", default=20, lo=1, hi=200),
             AI_MAX_TICKERS=get_first_env_int("AI_MAX_TICKERS", default=500, lo=1, hi=20000),
             ADV_BATCH_SIZE=get_first_env_int("ADV_BATCH_SIZE", default=25, lo=1, hi=500),
             BATCH_CONCURRENCY=get_first_env_int("BATCH_CONCURRENCY", default=5, lo=1, hi=50),
-
+            # Render
             RENDER_API_KEY=get_first_env("RENDER_API_KEY"),
             RENDER_SERVICE_ID=get_first_env("RENDER_SERVICE_ID"),
             RENDER_SERVICE_NAME=get_first_env("RENDER_SERVICE_NAME"),
-
+            # CORS
             ENABLE_CORS_ALL_ORIGINS=coerce_bool(get_first_env("ENABLE_CORS_ALL_ORIGINS", "CORS_ALL_ORIGINS"), False),
             CORS_ORIGINS=get_first_env("CORS_ORIGINS") or "",
-
             config_sources={"env": ConfigSource.ENV_VAR},
         )
 
@@ -696,17 +885,30 @@ class Settings:
         return replace(s, boot_errors=tuple(errors), boot_warnings=tuple(warns))
 
     def validate(self) -> Tuple[List[str], List[str]]:
+        """
+        Deploy-safe validation:
+        - DO NOT create fatal errors unless something is truly inconsistent
+          (e.g., REQUIRE_AUTH=true while OPEN_MODE=false and no tokens exist).
+        """
         errors: List[str] = []
         warns: List[str] = []
 
-        if not self.OPEN_MODE and self.REQUIRE_AUTH and not self.APP_TOKEN:
-            errors.append("Authentication required but no APP_TOKEN configured.")
-        if self.OPEN_MODE and self.APP_TOKEN:
-            warns.append("OPEN_MODE enabled while APP_TOKEN exists. Endpoints exposed publicly.")
-        if "eodhd" in self.ENABLED_PROVIDERS and not self.EODHD_API_KEY:
+        # Auth consistency (safe)
+        if self.REQUIRE_AUTH and not self.OPEN_MODE:
+            if not get_allowed_tokens():
+                errors.append("REQUIRE_AUTH=true but no tokens configured (APP_TOKEN/BACKUP_APP_TOKEN/ALLOWED_TOKENS).")
+        if self.OPEN_MODE and get_allowed_tokens():
+            warns.append("OPEN_MODE=true while tokens exist. Service may be publicly exposed unintentionally.")
+
+        # Provider keys as warnings (not fatal to start)
+        if "eodhd" in (self.ENABLED_PROVIDERS or []) and not self.EODHD_API_KEY:
             warns.append("Provider 'eodhd' enabled but EODHD_API_KEY missing.")
-        if "finnhub" in self.ENABLED_PROVIDERS and not self.FINNHUB_API_KEY:
+        if "finnhub" in (self.ENABLED_PROVIDERS or []) and not self.FINNHUB_API_KEY:
             warns.append("Provider 'finnhub' enabled but FINNHUB_API_KEY missing.")
+
+        # URL sanity
+        if self.BACKEND_BASE_URL and not is_valid_url(self.BACKEND_BASE_URL):
+            warns.append(f"BACKEND_BASE_URL does not look like a URL: {self.BACKEND_BASE_URL!r}")
 
         return errors, warns
 
@@ -718,6 +920,7 @@ class Settings:
         d["FINNHUB_API_KEY"] = mask_secret(self.FINNHUB_API_KEY)
         d["GOOGLE_SHEETS_CREDENTIALS"] = "PRESENT" if self.GOOGLE_SHEETS_CREDENTIALS else "MISSING"
         d["config_sources"] = {k: v.value for k, v in self.config_sources.items()}
+        d["allowed_tokens_count"] = len(get_allowed_tokens())
         return d
 
     def compliance_report(self) -> Dict[str, Any]:
@@ -730,6 +933,7 @@ class Settings:
                 "auth_enabled": self.REQUIRE_AUTH and not self.OPEN_MODE,
                 "rate_limiting": self.RATE_LIMIT_ENABLED,
                 "tokens_masked": {"app_token": mask_secret(self.APP_TOKEN)},
+                "allowed_tokens_count": len(get_allowed_tokens()),
             },
             "validation": {"errors": errors, "warnings": warns, "is_valid": len(errors) == 0},
         }
@@ -891,6 +1095,7 @@ __all__ = [
     "compliance_report",
     "feature_enabled",
     "settings",
+    # helpers
     "strip_value",
     "strip_wrapping_quotes",
     "coerce_bool",
@@ -907,7 +1112,11 @@ __all__ = [
     "is_valid_url",
     "repair_private_key",
     "repair_json_creds",
+    "resolve_google_credentials",
+    "get_allowed_tokens",
+    "derive_auth_flags",
     "get_system_info",
+    # exported constants
     "DEBUG",
     "DEFER_ROUTER_MOUNT",
     "INIT_ENGINE_ON_BOOT",
