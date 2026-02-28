@@ -1,459 +1,488 @@
 #!/usr/bin/env bash
-# ======================================================================
-# TADAWUL FAST BRIDGE – ENTERPRISE WEB LAUNCHER (v6.0.0)
-# ======================================================================
-# QUANTUM EDITION | AUTO-SCALING | HIGH-PERFORMANCE | NON-BLOCKING
+# ==============================================================================
+# TADAWUL FAST BRIDGE – RENDER-SAFE WEB LAUNCHER (v6.2.0)
+# ==============================================================================
+# هدف النسخة دي:
+# - تمنع “No open ports detected” على Render
+# - ما تفشل قبل فتح البورت بسبب checks اختيارية (DB/Redis/metrics)
+# - تشخّص سبب فشل import بوضوح (Full traceback)
+# - تلتزم بـ PORT / WEB_CONCURRENCY / LOG_LEVEL مثل Render
 #
-# Core Capabilities:
-# • Intelligent process management with automatic worker scaling
-# • Memory allocator auto-tuning (Jemalloc / TCMalloc detection)
-# • Multi-mode execution (development/production/performance/benchmark)
-# • Advanced health monitoring with zero-dependency Python probes
-# • Dynamic configuration with hot-reload and zero-downtime support
-# • Performance profiling and Prometheus metrics collection via Socat
-# • Graceful shutdown with connection draining across Nginx & ASGI
-# • Memory/CPU limits enforcement and cgroups awareness
-# • Chaos engineering experiments support (Latency/Fault injection)
-# • Automatic certificate management and SSL termination
-# • Blue-green deployment and Canary release capabilities
-#
-# Architecture:
-#   ┌─────────────────────────────────────┐
-#   │           Load Balancer             │
-#   └───────────────┬─────────────────────┘
-#                   │
-#   ┌───────────────┴─────────────────────┐
-#   │      Application Server (This)      │
-#   ├─────────────────────────────────────┤
-#   │ • Nginx (Static/Reverse Proxy)      │
-#   │ • Gunicorn (Multi-worker Manager)   │
-#   │ • Uvicorn (High-Performance ASGI)   │
-#   │ • Redis (Distributed Cache)         │
-#   │ • PostgreSQL (Primary DB)           │
-#   └─────────────────────────────────────┘
-# ======================================================================
+# IMPORTANT:
+# - Render لازم يشغل هذا الملف كـ Start Command:
+#     bash scripts/start_web.sh
+#   أو:
+#     ./scripts/start_web.sh
+# ==============================================================================
 
 set -euo pipefail
 IFS=$'\n\t'
 
-# ======================================================================
-# Version Information
-# ======================================================================
-readonly SCRIPT_VERSION="6.0.0"
-readonly SCRIPT_NAME="TFB Enterprise Web Launcher (Quantum Edition)"
-readonly MIN_BASH_VERSION="4.0"
+# ------------------------------------------------------------------------------
+# Version / Basics
+# ------------------------------------------------------------------------------
+readonly SCRIPT_VERSION="6.2.0"
+readonly MIN_BASH_MAJOR="4"
 
-# Check bash version
-if (( BASH_VERSINFO[0] < 4 )); then
-    echo "❌ Error: Bash 4.0 or higher required" >&2
-    exit 1
+if (( BASH_VERSINFO[0] < MIN_BASH_MAJOR )); then
+  echo "❌ Bash ${MIN_BASH_MAJOR}.0+ required (found ${BASH_VERSINFO[0]}.${BASH_VERSINFO[1]})." >&2
+  exit 1
 fi
 
-# ======================================================================
-# Configuration (with defaults)
-# ======================================================================
-
-# Application settings
-readonly APP_MODULE="${APP_MODULE:-main:app}"
-readonly APP_DIR="${APP_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
-readonly APP_ENV="${APP_ENV:-production}"
-readonly APP_VERSION="${APP_VERSION:-$(git describe --tags --always 2>/dev/null || echo "v6.0.0")}"
-
-# Server settings
-readonly HOST="${HOST:-0.0.0.0}"
-readonly PORT="${PORT:-8000}"
-readonly WORKERS="${WORKERS:-}"
-readonly WORKER_CLASS="${WORKER_CLASS:-}"
-readonly WORKER_CONNECTIONS="${WORKER_CONNECTIONS:-2048}"
-readonly WORKER_MAX_REQUESTS="${WORKER_MAX_REQUESTS:-10000}"
-readonly WORKER_MAX_REQUESTS_JITTER="${WORKER_MAX_REQUESTS_JITTER:-1000}"
-readonly WORKER_TIMEOUT="${WORKER_TIMEOUT:-120}"
-readonly WORKER_GRACEFUL_TIMEOUT="${WORKER_GRACEFUL_TIMEOUT:-30}"
-readonly WORKER_KEEPALIVE="${WORKER_KEEPALIVE:-5}"
-
-# Performance tuning
-readonly BACKLOG="${BACKLOG:-4096}"
-readonly LIMIT_CONCURRENCY="${LIMIT_CONCURRENCY:-}"
-readonly WEB_CONCURRENCY_MAX="${WEB_CONCURRENCY_MAX:-16}"
-readonly WORKERS_PER_CORE="${WORKERS_PER_CORE:-2}"
-readonly WORKERS_PER_GB="${WORKERS_PER_GB:-2}"
-
-# Resource limits
-readonly MAX_MEMORY_MB="${MAX_MEMORY_MB:-}"
-readonly MAX_CPU_PERCENT="${MAX_CPU_PERCENT:-}"
-readonly MAX_FD_LIMIT="${MAX_FD_LIMIT:-65536}"
-
-# Timeouts
-readonly TIMEOUT_KEEP_ALIVE="${TIMEOUT_KEEP_ALIVE:-65}"
-readonly TIMEOUT_GRACEFUL="${TIMEOUT_GRACEFUL:-30}"
-readonly TIMEOUT_REQUEST="${TIMEOUT_REQUEST:-60}"
-
-# Logging
-readonly LOG_LEVEL="${LOG_LEVEL:-info}"
-readonly LOG_FORMAT="${LOG_FORMAT:-json}"
-readonly ACCESS_LOG="${ACCESS_LOG:-true}"
-readonly ACCESS_LOG_FORMAT="${ACCESS_LOG_FORMAT:-%(h)s %(l)s %(u)s %(t)s \"%(r)s\" %(s)s %(b)s \"%(f)s\" \"%(a)s\" %({X-Request-Id}i)s %(L)s}"
-
-# SSL/TLS
-readonly SSL_CERT_FILE="${SSL_CERT_FILE:-}"
-readonly SSL_KEY_FILE="${SSL_KEY_FILE:-}"
-readonly SSL_CA_BUNDLE="${SSL_CA_BUNDLE:-}"
-
-# External services
-readonly REDIS_URL="${REDIS_URL:-}"
-readonly POSTGRES_URL="${POSTGRES_URL:-}"
-
-# Monitoring
-readonly METRICS_PORT="${METRICS_PORT:-9090}"
-readonly HEALTH_CHECK_PATH="${HEALTH_CHECK_PATH:-/health}"
-
-# Feature flags
-readonly ENABLE_METRICS="${ENABLE_METRICS:-true}"
-readonly ENABLE_BLUE_GREEN="${ENABLE_BLUE_GREEN:-false}"
-readonly ENABLE_CHAOS="${ENABLE_CHAOS:-false}"
-readonly CHAOS_FAILURE_RATE="${CHAOS_FAILURE_RATE:-0.0}"
-readonly CHAOS_LATENCY_MS="${CHAOS_LATENCY_MS:-0}"
-
-# PIDs tracking for graceful shutdown
-NGINX_PID=""
-METRICS_PID=""
-SERVER_PID=""
-
-# ======================================================================
-# Utility Functions
-# ======================================================================
-
+# ------------------------------------------------------------------------------
+# Colors (safe with set -u)
+# ------------------------------------------------------------------------------
 readonly COLOR_RESET='\033[0m'
 readonly COLOR_RED='\033[0;31m'
 readonly COLOR_GREEN='\033[0;32m'
 readonly COLOR_YELLOW='\033[1;33m'
 readonly COLOR_BLUE='\033[0;34m'
+readonly COLOR_CYAN='\033[0;36m'
 readonly COLOR_BOLD='\033[1m'
 
-log_info() { echo -e "${COLOR_GREEN}ℹ${COLOR_RESET} $1" >&2; }
-log_warn() { echo -e "${COLOR_YELLOW}⚠${COLOR_RESET} $1" >&2; }
-log_error() { echo -e "${COLOR_RED}✗${COLOR_RESET} $1" >&2; }
-log_success() { echo -e "${COLOR_GREEN}✓${COLOR_RESET} $1" >&2; }
-log_debug() { if [[ "${LOG_LEVEL}" == "debug" ]]; then echo -e "${COLOR_BLUE}🔍${COLOR_RESET} $1" >&2; fi; }
+log_info()    { echo -e "${COLOR_GREEN}ℹ${COLOR_RESET} $*" >&2; }
+log_warn()    { echo -e "${COLOR_YELLOW}⚠${COLOR_RESET} $*" >&2; }
+log_error()   { echo -e "${COLOR_RED}✗${COLOR_RESET} $*" >&2; }
+log_success() { echo -e "${COLOR_GREEN}✓${COLOR_RESET} $*" >&2; }
+log_debug()   { [[ "${LOG_LEVEL:-info}" == "debug" ]] && echo -e "${COLOR_BLUE}🔍${COLOR_RESET} $*" >&2 || true; }
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
 
-get_cpu_cores() {
-    if command_exists nproc; then nproc 2>/dev/null || echo "1"
-    elif [[ -f /proc/cpuinfo ]]; then grep -c ^processor /proc/cpuinfo 2>/dev/null || echo "1"
-    else echo "1"; fi
+# ------------------------------------------------------------------------------
+# Safe env parsing
+# ------------------------------------------------------------------------------
+as_int() {
+  # usage: as_int "raw" "default"
+  local raw="${1:-}"
+  local def="${2:-0}"
+  case "$raw" in
+    ""|*[!0-9]*) printf "%s" "$def" ;;
+    *) printf "%s" "$raw" ;;
+  esac
 }
 
-get_memory_mb() {
-    if command_exists free; then free -m | awk '/^Mem:/ {print $7}' 2>/dev/null || echo "0"
-    else echo "0"; fi
+is_true() {
+  local v="$(printf "%s" "${1:-}" | tr '[:upper:]' '[:lower:]' | xargs)"
+  case "$v" in
+    1|true|yes|y|on) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ------------------------------------------------------------------------------
+# Paths / App
+# ------------------------------------------------------------------------------
+readonly APP_DIR="${APP_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
+readonly PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+# Uvicorn/Gunicorn app import string
+# IMPORTANT: must be like "main:app"
+readonly APP_MODULE="${APP_MODULE:-main:app}"
+
+# Render-friendly networking
+readonly HOST="${HOST:-0.0.0.0}"
+readonly PORT="$(as_int "${PORT:-8000}" "8000")"
+
+# Logging / mode
+readonly LOG_LEVEL="$(printf "%s" "${LOG_LEVEL:-info}" | tr '[:upper:]' '[:lower:]')"
+readonly ACCESS_LOG="${ACCESS_LOG:-true}"
+
+# Concurrency preference (Render uses WEB_CONCURRENCY)
+readonly WEB_CONCURRENCY="$(as_int "${WEB_CONCURRENCY:-}" "0")"
+readonly WORKERS_ENV="$(as_int "${WORKERS:-}" "0")"
+readonly WEB_CONCURRENCY_MAX="$(as_int "${WEB_CONCURRENCY_MAX:-8}" "8")"
+
+# Uvicorn tuning (aligned to Render typical flags)
+readonly UVICORN_KEEPALIVE="$(as_int "${UVICORN_KEEPALIVE:-75}" "75")"
+readonly UVICORN_GRACEFUL_TIMEOUT="$(as_int "${UVICORN_GRACEFUL_TIMEOUT:-30}" "30")"
+readonly UVICORN_BACKLOG="$(as_int "${UVICORN_BACKLOG:-2048}" "2048")"
+
+# Optional limits
+readonly UVICORN_LIMIT_CONCURRENCY_RAW="${UVICORN_LIMIT_CONCURRENCY:-}"
+readonly UVICORN_LIMIT_MAX_REQUESTS_RAW="${UVICORN_LIMIT_MAX_REQUESTS:-}"
+
+# Use Gunicorn?
+# Safer defaults: only if (workers>1) AND gunicorn exists OR explicitly enabled.
+readonly USE_GUNICORN="${USE_GUNICORN:-}"
+
+# Prefer uvicorn-worker package if installed
+readonly WORKER_CLASS="${WORKER_CLASS:-}"
+
+# Optional external services checks (OFF by default to avoid deploy failures)
+readonly CHECK_DATABASE="${CHECK_DATABASE:-false}"
+readonly CHECK_REDIS="${CHECK_REDIS:-false}"
+readonly POSTGRES_URL="${POSTGRES_URL:-}"
+readonly REDIS_URL="${REDIS_URL:-}"
+
+# Optional metrics daemon (OFF by default)
+readonly ENABLE_METRICS="${ENABLE_METRICS:-false}"
+readonly METRICS_PORT="$(as_int "${METRICS_PORT:-9090}" "9090")"
+
+# ------------------------------------------------------------------------------
+# cgroup-aware resource helpers (safe)
+# ------------------------------------------------------------------------------
+get_cpu_cores() {
+  if command_exists nproc; then
+    nproc 2>/dev/null || echo "1"
+    return
+  fi
+  echo "$(as_int "$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)" 1)"
+}
+
+get_memory_limit_mb() {
+  # cgroup v2: /sys/fs/cgroup/memory.max (bytes or "max")
+  if [[ -f /sys/fs/cgroup/memory.max ]]; then
+    local v
+    v="$(cat /sys/fs/cgroup/memory.max 2>/dev/null || echo "max")"
+    if [[ "$v" != "max" ]]; then
+      if [[ "$v" =~ ^[0-9]+$ ]] && (( v > 0 )); then
+        echo $(( v / 1024 / 1024 ))
+        return
+      fi
+    fi
+  fi
+
+  # cgroup v1: /sys/fs/cgroup/memory/memory.limit_in_bytes
+  if [[ -f /sys/fs/cgroup/memory/memory.limit_in_bytes ]]; then
+    local v
+    v="$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes 2>/dev/null || echo 0)"
+    if [[ "$v" =~ ^[0-9]+$ ]] && (( v > 0 )); then
+      echo $(( v / 1024 / 1024 ))
+      return
+    fi
+  fi
+
+  # fallback: free -m (available memory)
+  if command_exists free; then
+    free -m | awk '/^Mem:/ {print $7}' 2>/dev/null || echo "0"
+    return
+  fi
+
+  echo "0"
 }
 
 calculate_workers() {
-    local cpu_cores=$(get_cpu_cores)
-    local memory_mb=$(get_memory_mb)
-    local max_workers=$((${WEB_CONCURRENCY_MAX:-16}))
-    
-    local cpu_workers=$((cpu_cores * WORKERS_PER_CORE + 1))
-    local memory_workers=0
-    
-    if [[ "$memory_mb" -gt 0 ]]; then
-        memory_workers=$((memory_mb / 250)) # Reserve 250MB per worker
-    fi
-    
-    local workers=$((cpu_workers < memory_workers || memory_workers == 0 ? cpu_workers : memory_workers))
-    if [[ "$workers" -gt "$max_workers" ]]; then workers="$max_workers"; fi
-    if [[ "$workers" -lt 1 ]]; then workers=1; fi
-    
-    echo "$workers"
+  # Conservative: avoid OOM on Render small instances
+  local cpu
+  local mem_mb
+  cpu="$(as_int "$(get_cpu_cores)" 1)"
+  mem_mb="$(as_int "$(get_memory_limit_mb)" 0)"
+
+  # baseline: cpu*2+1
+  local cpu_workers=$(( cpu * 2 + 1 ))
+
+  # memory-based cap: ~700MB per worker (ML libs installed => heavy)
+  local mem_workers=1
+  if (( mem_mb > 0 )); then
+    mem_workers=$(( mem_mb / 700 ))
+    if (( mem_workers < 1 )); then mem_workers=1; fi
+  fi
+
+  local w="$cpu_workers"
+  if (( mem_workers > 0 && mem_workers < w )); then
+    w="$mem_workers"
+  fi
+
+  # clamp hard
+  if (( w < 1 )); then w=1; fi
+  if (( w > WEB_CONCURRENCY_MAX )); then w="$WEB_CONCURRENCY_MAX"; fi
+
+  echo "$w"
 }
 
-# ======================================================================
-# Environment Tuning (Quantum Edition Upgrades)
-# ======================================================================
+resolve_workers() {
+  # Priority: WEB_CONCURRENCY > WORKERS > calculated
+  if (( WEB_CONCURRENCY > 0 )); then
+    echo "$(_clamp "$WEB_CONCURRENCY" 1 "$WEB_CONCURRENCY_MAX")"
+    return
+  fi
+  if (( WORKERS_ENV > 0 )); then
+    echo "$(_clamp "$WORKERS_ENV" 1 "$WEB_CONCURRENCY_MAX")"
+    return
+  fi
+  echo "$(calculate_workers)"
+}
 
+_clamp() {
+  local v="$1" lo="$2" hi="$3"
+  if (( v < lo )); then echo "$lo"; return; fi
+  if (( v > hi )); then echo "$hi"; return; fi
+  echo "$v"
+}
+
+# ------------------------------------------------------------------------------
+# Environment tuning (safe)
+# ------------------------------------------------------------------------------
 optimize_environment() {
-    log_debug "Optimizing Python environment for high-throughput..."
-    
-    # 1. Threading bounds to prevent CPU context switching overhead
-    export OMP_NUM_THREADS=1
-    export OPENBLAS_NUM_THREADS=1
-    export MKL_NUM_THREADS=1
-    
-    # 2. Memory Allocator Detection (Jemalloc/TCMalloc)
-    if [[ -z "${LD_PRELOAD:-}" ]]; then
-        if [ -f "/usr/lib/x86_64-linux-gnu/libjemalloc.so.2" ]; then
-            export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libjemalloc.so.2"
-            export MALLOC_CONF="background_thread:true,metadata_thp:auto,dirty_decay_ms:10000,muzzy_decay_ms:10000"
-            log_success "Jemalloc memory allocator injected."
-        elif [ -f "/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4" ]; then
-            export LD_PRELOAD="/usr/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4"
-            log_success "TCMalloc memory allocator injected."
-        fi
-    fi
-    
-    # 3. Increase File Descriptors
-    local fd_limit=$(ulimit -n)
-    if [[ "$fd_limit" -lt "$MAX_FD_LIMIT" ]]; then
-        ulimit -n "$MAX_FD_LIMIT" 2>/dev/null || log_warn "Could not increase FD limit to $MAX_FD_LIMIT"
-    fi
+  log_debug "Optimizing environment (safe defaults)..."
+
+  # prevent BLAS thread explosion
+  export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
+  export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
+  export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+  export NUMEXPR_NUM_THREADS="${NUMEXPR_NUM_THREADS:-1}"
+
+  # add app dir to PYTHONPATH
+  export PYTHONPATH="${APP_DIR}:${PYTHONPATH:-}"
+
+  # increase FD limit if possible (don’t fail deploy if not permitted)
+  local max_fd="${MAX_FD_LIMIT:-65536}"
+  local cur_fd
+  cur_fd="$(ulimit -n 2>/dev/null || echo 0)"
+  if [[ "$cur_fd" =~ ^[0-9]+$ ]] && (( cur_fd > 0 && cur_fd < max_fd )); then
+    ulimit -n "$max_fd" 2>/dev/null || log_warn "Could not increase FD limit to ${max_fd}"
+  fi
 }
 
-# ======================================================================
-# Health Checks (Zero-Dependency Python Probes)
-# ======================================================================
+# ------------------------------------------------------------------------------
+# Mandatory checks (deployment-safe)
+# ------------------------------------------------------------------------------
+check_python_environment() {
+  if ! command_exists "$PYTHON_BIN"; then
+    log_error "Python binary not found: ${PYTHON_BIN}"
+    return 1
+  fi
+
+  # Must be able to import uvicorn
+  if ! "$PYTHON_BIN" - <<'PY' >/dev/null 2>&1
+import uvicorn
+PY
+  then
+    log_error "Python cannot import uvicorn. (requirements/build issue)"
+    return 1
+  fi
+
+  log_success "Python environment OK"
+  return 0
+}
 
 check_app_import() {
-    log_debug "Checking application import..."
-    local module="${APP_MODULE%%:*}"
-    local app="${APP_MODULE##*:}"
-    
-    if ! python3 -c "import $module; getattr($module, '$app')" 2>/dev/null; then
-        log_error "Failed to import $APP_MODULE"
-        return 1
-    fi
-    log_success "Application import OK"
-    return 0
+  # This is the most important check to diagnose "No open ports detected".
+  # Print FULL traceback so Render logs show the true failure.
+  log_info "Checking ASGI import: ${APP_MODULE}"
+  local module="${APP_MODULE%%:*}"
+  local app="${APP_MODULE##*:}"
+
+  "$PYTHON_BIN" - <<PY
+import importlib, traceback, sys
+mod_name = "${module}"
+app_name = "${app}"
+try:
+    mod = importlib.import_module(mod_name)
+    obj = getattr(mod, app_name)
+    if obj is None:
+        raise RuntimeError(f"{mod_name}:{app_name} is None")
+    print("OK")
+except Exception as e:
+    print("IMPORT_FAILED:", e, file=sys.stderr)
+    traceback.print_exc()
+    sys.exit(1)
+PY
+  log_success "ASGI import OK"
+  return 0
 }
 
 check_database() {
-    if [[ -z "${POSTGRES_URL}" ]]; then return 0; fi
-    log_debug "Checking database connection..."
-    
-    if ! python3 -c "
-import sys, asyncio
-try:
-    import asyncpg
-    async def check():
-        conn = await asyncpg.connect('${POSTGRES_URL}', timeout=5.0)
-        await conn.close()
-    asyncio.run(check())
-    sys.exit(0)
-except ImportError:
-    from sqlalchemy import create_engine
-    engine = create_engine('${POSTGRES_URL}')
-    conn = engine.connect()
-    conn.close()
-    sys.exit(0)
-except Exception as e:
-    sys.exit(1)
-" 2>/dev/null; then
-        log_error "Database connection failed"
-        return 6
-    fi
-    log_success "Database connection OK"
-    return 0
+  is_true "$CHECK_DATABASE" || return 0
+  [[ -n "$POSTGRES_URL" ]] || { log_warn "CHECK_DATABASE=true but POSTGRES_URL empty; skipping."; return 0; }
+
+  log_info "Checking Postgres connectivity (optional)..."
+  "$PYTHON_BIN" - <<PY || { log_error "Database connection failed (optional)"; return 6; }
+import asyncio, sys
+import asyncpg
+
+async def main():
+    conn = await asyncpg.connect("${POSTGRES_URL}", timeout=5.0)
+    await conn.close()
+
+asyncio.run(main())
+print("DB_OK")
+PY
+  log_success "Database connection OK"
+  return 0
 }
 
 check_redis() {
-    if [[ -z "${REDIS_URL}" ]]; then return 0; fi
-    log_debug "Checking Redis connection..."
-    
-    if ! python3 -c "
-import sys, asyncio
-try:
-    import redis.asyncio as redis
-    async def check():
-        r = redis.from_url('${REDIS_URL}', socket_timeout=3.0)
-        await r.ping()
-        await r.close()
-    asyncio.run(check())
-    sys.exit(0)
-except Exception:
-    sys.exit(1)
-" 2>/dev/null; then
-        log_error "Redis connection failed"
-        return 7
-    fi
-    log_success "Redis connection OK"
-    return 0
+  is_true "$CHECK_REDIS" || return 0
+  [[ -n "$REDIS_URL" ]] || { log_warn "CHECK_REDIS=true but REDIS_URL empty; skipping."; return 0; }
+
+  log_info "Checking Redis connectivity (optional)..."
+  "$PYTHON_BIN" - <<PY || { log_error "Redis connection failed (optional)"; return 7; }
+import asyncio, sys
+import redis.asyncio as redis
+
+async def main():
+    r = redis.from_url("${REDIS_URL}", socket_timeout=3.0)
+    await r.ping()
+    await r.close()
+
+asyncio.run(main())
+print("REDIS_OK")
+PY
+  log_success "Redis connection OK"
+  return 0
 }
 
-# ======================================================================
-# Monitoring & Chaos
-# ======================================================================
-
+# ------------------------------------------------------------------------------
+# Optional monitoring (OFF by default)
+# ------------------------------------------------------------------------------
 setup_monitoring() {
-    if [[ "$ENABLE_METRICS" != "true" || ! command_exists socat ]]; then return 0; fi
-    log_info "Setting up Prometheus metrics endpoint on port ${METRICS_PORT}..."
-    
-    (
-        while true; do
-            local RESPONSE="HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n# HELP app_up App Status\napp_up 1\n"
-            echo -e "$RESPONSE" | socat -v -t 5 TCP-LISTEN:${METRICS_PORT},reuseaddr,fork STDIO >/dev/null 2>&1 || true
-        done
-    ) &
-    METRICS_PID=$!
-    log_success "Monitoring daemon started (PID: $METRICS_PID)"
+  is_true "$ENABLE_METRICS" || return 0
+  if ! command_exists socat; then
+    log_warn "ENABLE_METRICS=true but socat not installed; skipping metrics."
+    return 0
+  fi
+
+  log_info "Starting simple metrics endpoint on :${METRICS_PORT} (optional)..."
+  (
+    while true; do
+      local RESPONSE="HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n# HELP app_up App Status\napp_up 1\n"
+      echo -e "$RESPONSE" | socat -t 5 TCP-LISTEN:${METRICS_PORT},reuseaddr,fork STDIO >/dev/null 2>&1 || true
+    done
+  ) &
+  disown || true
 }
 
-setup_chaos() {
-    if [[ "$ENABLE_CHAOS" != "true" ]]; then return 0; fi
-    log_warn "CHAOS ENGINEERING ENABLED - Failure Rate: ${CHAOS_FAILURE_RATE}, Latency: ${CHAOS_LATENCY_MS}ms"
-    export CHAOS_FAILURE_RATE
-    export CHAOS_LATENCY_MS
+# ------------------------------------------------------------------------------
+# Runner selection
+# ------------------------------------------------------------------------------
+detect_best_gunicorn_worker() {
+  # prefer uvicorn-worker if installed
+  if [[ -n "$WORKER_CLASS" ]]; then
+    echo "$WORKER_CLASS"
+    return
+  fi
+  if "$PYTHON_BIN" - <<'PY' >/dev/null 2>&1
+import uvicorn_worker  # noqa
+PY
+  then
+    echo "uvicorn_worker.UvicornWorker"
+    return
+  fi
+  echo "uvicorn.workers.UvicornWorker"
 }
 
-# ======================================================================
-# Server Runners
-# ======================================================================
+should_use_gunicorn() {
+  # Explicit override
+  if [[ -n "$USE_GUNICORN" ]]; then
+    is_true "$USE_GUNICORN" && return 0 || return 1
+  fi
 
-run_gunicorn() {
-    local worker_count="$1"
-    local worker_class="${WORKER_CLASS:-uvicorn.workers.UvicornWorker}"
-    
-    log_info "🚀 Starting Gunicorn with ${worker_count} workers (${worker_class})"
-    
-    local cmd=(
-        gunicorn
-        "$APP_MODULE"
-        --bind "${HOST}:${PORT}"
-        --workers "$worker_count"
-        --worker-class "$worker_class"
-        --worker-connections "$WORKER_CONNECTIONS"
-        --max-requests "$WORKER_MAX_REQUESTS"
-        --max-requests-jitter "$WORKER_MAX_REQUESTS_JITTER"
-        --timeout "$WORKER_TIMEOUT"
-        --graceful-timeout "$WORKER_GRACEFUL_TIMEOUT"
-        --keepalive "$WORKER_KEEPALIVE"
-        --backlog "$BACKLOG"
-        --log-level "$LOG_LEVEL"
-        --worker-tmp-dir /dev/shm
-        --capture-output
-        --enable-stdio-inheritance
-    )
-    
-    if [[ "$ACCESS_LOG" == "true" ]]; then
-        cmd+=(--access-logfile - --access-logformat "$ACCESS_LOG_FORMAT" --error-logfile -)
-    fi
-    
-    if [[ -n "$SSL_CERT_FILE" ]] && [[ -n "$SSL_KEY_FILE" ]]; then
-        cmd+=(--certfile "$SSL_CERT_FILE" --keyfile "$SSL_KEY_FILE")
-    fi
-    
-    export PYTHONPATH="${APP_DIR}:${PYTHONPATH:-}"
-    
-    # Execute in background to capture PID
-    "${cmd[@]}" &
-    SERVER_PID=$!
-    wait $SERVER_PID
+  # Default: use gunicorn only if installed and workers > 1
+  command_exists gunicorn || return 1
+  local w="$1"
+  (( w > 1 )) && return 0
+  return 1
 }
 
 run_uvicorn() {
-    local worker_count="$1"
-    log_info "🚀 Starting Uvicorn with ${worker_count} workers"
-    
-    local cmd=(
-        python3 -m uvicorn
-        "$APP_MODULE"
-        --host "$HOST"
-        --port "$PORT"
-        --proxy-headers
-        --forwarded-allow-ips "*"
-        --lifespan on
-        --timeout-keep-alive "$TIMEOUT_KEEP_ALIVE"
-        --timeout-graceful-shutdown "$TIMEOUT_GRACEFUL"
-        --log-level "$LOG_LEVEL"
-        --no-server-header
-        --date-header
-    )
-    
-    # Inject high-performance loops if available
-    if python3 -c "import uvloop" 2>/dev/null; then cmd+=(--loop uvloop); fi
-    if python3 -c "import httptools" 2>/dev/null; then cmd+=(--http httptools); fi
-    
-    if [[ "$worker_count" -gt 1 ]]; then
-        cmd+=(--workers "$worker_count")
-    fi
-    
-    if [[ "$ACCESS_LOG" == "true" ]]; then
-        cmd+=(--access-log)
-    else
-        cmd+=(--no-access-log)
-    fi
-    
-    if [[ -n "$SSL_CERT_FILE" ]] && [[ -n "$SSL_KEY_FILE" ]]; then
-        cmd+=(--ssl-certfile "$SSL_CERT_FILE" --ssl-keyfile "$SSL_KEY_FILE")
-    fi
-    
-    if [[ "${APP_ENV}" == "development" ]]; then
-        cmd+=(--reload)
-    fi
-    
-    export PYTHONPATH="${APP_DIR}:${PYTHONPATH:-}"
-    
-    # Execute in background to capture PID
-    "${cmd[@]}" &
-    SERVER_PID=$!
-    wait $SERVER_PID
+  local worker_count="$1"
+
+  log_info "🚀 Launching Uvicorn | app=${APP_MODULE} | bind=${HOST}:${PORT} | workers=${worker_count}"
+
+  local cmd=(
+    "$PYTHON_BIN" -m uvicorn
+    "${APP_MODULE}"
+    --host "${HOST}"
+    --port "${PORT}"
+    --proxy-headers
+    --forwarded-allow-ips "*"
+    --lifespan on
+    --timeout-keep-alive "${UVICORN_KEEPALIVE}"
+    --timeout-graceful-shutdown "${UVICORN_GRACEFUL_TIMEOUT}"
+    --backlog "${UVICORN_BACKLOG}"
+    --log-level "${LOG_LEVEL}"
+    --no-server-header
+  )
+
+  # Optional tuning if available
+  if "$PYTHON_BIN" -c "import uvloop" >/dev/null 2>&1; then cmd+=(--loop uvloop); fi
+  if "$PYTHON_BIN" -c "import httptools" >/dev/null 2>&1; then cmd+=(--http httptools); fi
+
+  # Optional limits
+  if [[ "${UVICORN_LIMIT_CONCURRENCY_RAW}" =~ ^[0-9]+$ ]] && (( UVICORN_LIMIT_CONCURRENCY_RAW > 0 )); then
+    cmd+=(--limit-concurrency "${UVICORN_LIMIT_CONCURRENCY_RAW}")
+  fi
+  if [[ "${UVICORN_LIMIT_MAX_REQUESTS_RAW}" =~ ^[0-9]+$ ]] && (( UVICORN_LIMIT_MAX_REQUESTS_RAW > 0 )); then
+    cmd+=(--limit-max-requests "${UVICORN_LIMIT_MAX_REQUESTS_RAW}")
+  fi
+
+  if (( worker_count > 1 )); then
+    cmd+=(--workers "${worker_count}")
+  fi
+
+  if is_true "$ACCESS_LOG"; then
+    cmd+=(--access-log)
+  else
+    cmd+=(--no-access-log)
+  fi
+
+  # IMPORTANT: exec to keep process in foreground (Render expects this)
+  exec "${cmd[@]}"
 }
 
-# ======================================================================
-# Graceful Shutdown Handler
-# ======================================================================
+run_gunicorn() {
+  local worker_count="$1"
+  local worker_class
+  worker_class="$(detect_best_gunicorn_worker)"
 
-cleanup() {
-    log_info "Initiating graceful shutdown sequence..."
-    
-    if [[ -n "$NGINX_PID" ]] && ps -p $NGINX_PID > /dev/null; then
-        log_debug "Shutting down Nginx ($NGINX_PID)..."
-        kill -QUIT $NGINX_PID || true
-    fi
-    
-    if [[ -n "$METRICS_PID" ]] && ps -p $METRICS_PID > /dev/null; then
-        log_debug "Shutting down Metrics Daemon ($METRICS_PID)..."
-        kill -TERM $METRICS_PID || true
-    fi
-    
-    if [[ -n "$SERVER_PID" ]] && ps -p $SERVER_PID > /dev/null; then
-        log_debug "Shutting down Application Server ($SERVER_PID)..."
-        kill -TERM $SERVER_PID || true
-        wait $SERVER_PID 2>/dev/null || true
-    fi
-    
-    log_success "Shutdown complete."
-    exit 0
+  log_info "🚀 Launching Gunicorn | app=${APP_MODULE} | bind=${HOST}:${PORT} | workers=${worker_count} | class=${worker_class}"
+
+  local cmd=(
+    gunicorn
+    "${APP_MODULE}"
+    --bind "${HOST}:${PORT}"
+    --workers "${worker_count}"
+    --worker-class "${worker_class}"
+    --worker-connections "$(as_int "${WORKER_CONNECTIONS:-2048}" "2048")"
+    --max-requests "$(as_int "${WORKER_MAX_REQUESTS:-0}" "0")"
+    --max-requests-jitter "$(as_int "${WORKER_MAX_REQUESTS_JITTER:-0}" "0")"
+    --timeout "$(as_int "${WORKER_TIMEOUT:-120}" "120")"
+    --graceful-timeout "$(as_int "${WORKER_GRACEFUL_TIMEOUT:-30}" "30")"
+    --keepalive "$(as_int "${WORKER_KEEPALIVE:-5}" "5")"
+    --backlog "${UVICORN_BACKLOG}"
+    --log-level "${LOG_LEVEL}"
+    --capture-output
+    --access-logfile -
+    --error-logfile -
+  )
+
+  # IMPORTANT: exec to keep process in foreground
+  exec "${cmd[@]}"
 }
 
-trap cleanup SIGINT SIGTERM SIGQUIT
-
-# ======================================================================
-# Main Execution Flow
-# ======================================================================
-
+# ------------------------------------------------------------------------------
+# Main
+# ------------------------------------------------------------------------------
 main() {
-    # Parse Arguments (Simplified for brevity, typically done via env vars in containers)
-    for arg in "$@"; do
-        case $arg in
-            --dev) export APP_ENV="development" ;;
-            --perf) export LOG_LEVEL="warning" ;;
-        esac
-    done
+  echo -e "${COLOR_CYAN}${COLOR_BOLD}"
+  echo "==========================================================="
+  echo " TADAWUL FAST BRIDGE WEB LAUNCHER v${SCRIPT_VERSION}"
+  echo "==========================================================="
+  echo -e "${COLOR_RESET}"
 
-    echo -e "${COLOR_CYAN}${COLOR_BOLD}"
-    echo "==========================================================="
-    echo " TADAWUL FAST BRIDGE WEB LAUNCHER v${SCRIPT_VERSION}"
-    echo "===========================================================${COLOR_RESET}"
+  optimize_environment
 
-    optimize_environment
-    
-    check_python_environment || exit 1
-    check_app_import || exit 1
-    check_database || exit 6
-    check_redis || exit 7
+  check_python_environment || exit 1
+  check_app_import || exit 1
 
-    setup_chaos
-    setup_monitoring
+  # Optional checks (OFF by default to avoid deploy failures)
+  check_database || exit $?
+  check_redis || exit $?
 
-    local calculated_workers=${WORKERS:-$(calculate_workers)}
-    
-    if [[ "${APP_ENV}" == "development" ]]; then
-        run_uvicorn 1
-    elif command_exists gunicorn && [[ "$calculated_workers" -gt 1 ]]; then
-        run_gunicorn "$calculated_workers" "${WORKER_CLASS:-uvicorn.workers.UvicornWorker}"
-    else
-        run_uvicorn "$calculated_workers"
-    fi
+  setup_monitoring
+
+  local workers
+  workers="$(resolve_workers)"
+
+  log_info "Resolved workers = ${workers} (WEB_CONCURRENCY=${WEB_CONCURRENCY}, WORKERS=${WORKERS_ENV}, MAX=${WEB_CONCURRENCY_MAX})"
+  log_info "Boot: HOST=${HOST} PORT=${PORT} LOG_LEVEL=${LOG_LEVEL} ACCESS_LOG=${ACCESS_LOG}"
+
+  if should_use_gunicorn "${workers}"; then
+    run_gunicorn "${workers}"
+  else
+    run_uvicorn "${workers}"
+  fi
 }
 
 main "$@"
