@@ -2,22 +2,24 @@
 # core/enriched_quote.py
 """
 ================================================================================
-Enriched Quote Router — v5.1.0 (GLOBAL-FIRST / ENGINE-LAZY / SHEET-STABLE)
+Enriched Quote Router — v5.2.0 (GLOBAL-FIRST / ENGINE-LAZY / SHEET-RATIO-SAFE)
 ================================================================================
 Financial Data Platform — High-Performance Aggregation and Sheet Mapping
 
-Aligned fixes for your current GLOBAL plan (EODHD as PRIMARY):
-- ✅ Fixes “No engine available” by robust lazy engine init + caching in app.state.engine
-- ✅ Strong canonical symbol output:
+Key fixes (targets your “wrong % ratios” issue in Google Sheets):
+- ✅ Sheet-safe percent outputs: ALL % columns now emit **decimal fractions** (e.g., 0.9877 => 98.77%)
+  so Google Sheets Percent format will NOT explode values (no more 9877% from 98.77).
+- ✅ Computed % fields are computed in FRACTION form:
+     - Change %      = (Price/PrevClose - 1)         (fraction)
+     - 52W Position  = (Price-52WLow)/(52WHigh-52WLow) (fraction)
+     - Turnover %    = Volume/SharesOutstanding      (fraction)
+     - Upside %      = (FairValue/Price - 1)         (fraction)
+- ✅ Fixes “No engine available” with robust lazy engine init + caching in app.state.engine
+- ✅ Canonical symbol output rules:
      - If request is "AAPL" => output stays "AAPL" (even if upstream uses "AAPL.US")
      - If KSA => always keeps ".SR"
-- ✅ Sheet mapping updated to support new EODHD provider keys:
-     - high_52w / low_52w / position_52w_pct
-     - avg_vol_30d / volatility_30d
-     - change / change_pct
-- ✅ Smarter percent handling (avoids multiplying already-percent values like 1.2%)
-- ✅ Better batch mapping and fallback logic
-- ✅ Auth header compatibility: X-APP-TOKEN, X-API-Key, Authorization Bearer
+- ✅ Updated mapping supports provider keys from EODHD/Finnhub/Yahoo variants
+- ✅ Auth header compatibility: X-APP-TOKEN, X-API-Key, Authorization: Bearer <token>
 - ✅ Production-safe error handling + optional debug traceback
 
 Endpoints:
@@ -73,13 +75,13 @@ except Exception:
     _PROMETHEUS_AVAILABLE = False
 
     class DummyMetric:
-        def labels(self, *args, **kwargs):  # noqa
+        def labels(self, *args, **kwargs):
             return self
 
-        def inc(self, *args, **kwargs):  # noqa
+        def inc(self, *args, **kwargs):
             pass
 
-        def observe(self, *args, **kwargs):  # noqa
+        def observe(self, *args, **kwargs):
             pass
 
     router_requests_total = DummyMetric()
@@ -87,7 +89,6 @@ except Exception:
 
 try:
     from opentelemetry import trace  # type: ignore
-    from opentelemetry.trace import Status, StatusCode  # type: ignore
 
     _OTEL_AVAILABLE = True
     tracer = trace.get_tracer(__name__)
@@ -95,20 +96,20 @@ except Exception:
     _OTEL_AVAILABLE = False
 
     class DummySpan:
-        def set_attribute(self, *args, **kwargs):  # noqa
+        def set_attribute(self, *args, **kwargs):
             pass
 
-        def set_status(self, *args, **kwargs):  # noqa
+        def set_status(self, *args, **kwargs):
             pass
 
-        def __enter__(self):  # noqa
+        def __enter__(self):
             return self
 
-        def __exit__(self, *args, **kwargs):  # noqa
+        def __exit__(self, *args, **kwargs):
             pass
 
     class DummyTracer:
-        def start_as_current_span(self, *args, **kwargs):  # noqa
+        def start_as_current_span(self, *args, **kwargs):
             return DummySpan()
 
     tracer = DummyTracer()
@@ -119,6 +120,7 @@ except Exception:
 def _fallback_normalize_symbol(s: str) -> str:
     return (s or "").strip().upper()
 
+
 try:
     from symbols.normalize import normalize_symbol as _normalize_symbol  # type: ignore
 except Exception:
@@ -127,7 +129,7 @@ except Exception:
     except Exception:
         _normalize_symbol = _fallback_normalize_symbol  # type: ignore
 
-__version__ = "5.1.0"
+__version__ = "5.2.0"
 ROUTER_VERSION = __version__
 
 logger = logging.getLogger("core.enriched_quote")
@@ -152,17 +154,16 @@ ENRICHED_HEADERS_61: List[str] = [
     "Last Updated (UTC)", "Last Updated (Riyadh)",
 ]
 
-# Backward alias (your older name)
+# Backward alias (older name)
 ENRICHED_HEADERS_59 = ENRICHED_HEADERS_61
 
+# Field groups for data quality scoring (presence-based)
 FIELD_CATEGORIES = {
     "identity": {"symbol", "name", "sector", "industry", "sub_sector", "market", "currency", "exchange"},
     "price": {"current_price", "previous_close", "day_open", "day_high", "day_low", "volume", "vwap"},
-    # Support both old + new names
     "range": {"week_52_high", "week_52_low", "week_52_position_pct", "high_52w", "low_52w", "position_52w_pct"},
     "fundamentals": {"market_cap", "pe_ttm", "forward_pe", "eps_ttm", "forward_eps", "pb", "ps", "beta", "dividend_yield"},
     "technicals": {"rsi_14", "volatility_30d"},
-    "forecast": {"expected_roi_1m", "expected_roi_3m", "expected_roi_12m", "forecast_price_1m", "forecast_price_3m", "forecast_price_12m", "forecast_confidence"},
     "scores": {"quality_score", "value_score", "momentum_score", "risk_score", "overall_score", "opportunity_score"},
 }
 
@@ -195,7 +196,13 @@ def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
     if x is None:
         return default
     try:
-        return float(str(x).strip())
+        if isinstance(x, (int, float)) and not isinstance(x, bool):
+            f = float(x)
+        else:
+            f = float(str(x).strip())
+        if math.isnan(f) or math.isinf(f):
+            return default
+        return f
     except Exception:
         return default
 
@@ -204,12 +211,8 @@ def _is_truthy(v: Any) -> bool:
     return str(v or "").strip().lower() in _TRUTHY
 
 
-def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-
 def _now_utc_iso() -> str:
-    return _now_utc().isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 def _now_riyadh_iso() -> str:
@@ -239,34 +242,6 @@ def _to_riyadh_iso(dt: Any) -> Optional[str]:
         return _safe_str(dt)
 
 
-def _to_percent_smart(x: Any) -> Optional[float]:
-    """
-    Smart percent:
-    - if value looks like fraction (<=1 in abs) => *100
-    - else treat as already-percent
-    Works well for:
-      - dividend_yield: 0.02 => 2.0
-      - ROE: 0.15 => 15.0
-      - change_pct: 1.2 => 1.2 (already percent)
-    """
-    f = _safe_float(x)
-    if f is None:
-        return None
-    if -1.0 <= f <= 1.0:
-        return round(f * 100.0, 6)
-    return round(f, 6)
-
-
-def _to_volatility_smart(x: Any) -> Optional[float]:
-    f = _safe_float(x)
-    if f is None:
-        return None
-    # If it looks like fraction volatility, convert to %
-    if 0.0 <= f <= 1.0:
-        return round(f * 100.0, 6)
-    return round(f, 6)
-
-
 def _split_symbols(raw: str) -> List[str]:
     s = (raw or "").replace("\n", " ").replace("\t", " ").strip().replace(",", " ")
     return [p.strip() for p in s.split(" ") if p.strip()]
@@ -280,6 +255,7 @@ def _normalize_recommendation(rec: Any) -> str:
         return "HOLD"
     if s in _RECOMMENDATIONS:
         return s
+
     s2 = re.sub(r"[\s\-_/]+", " ", s).strip()
     if "STRONG BUY" in s2:
         return "STRONG_BUY"
@@ -299,14 +275,12 @@ def _as_payload(obj: Any) -> Dict[str, Any]:
         return {}
     if isinstance(obj, dict):
         return jsonable_encoder(obj)
-    # pydantic v2
-    if hasattr(obj, "model_dump") and callable(obj.model_dump):
+    if hasattr(obj, "model_dump") and callable(obj.model_dump):  # pydantic v2
         try:
             return jsonable_encoder(obj.model_dump())
         except Exception:
             pass
-    # pydantic v1
-    if hasattr(obj, "dict") and callable(obj.dict):
+    if hasattr(obj, "dict") and callable(obj.dict):  # pydantic v1
         try:
             return jsonable_encoder(obj.dict())
         except Exception:
@@ -341,33 +315,27 @@ def _is_ksa_symbol(s: str) -> bool:
 
 def _canonical_output_symbol(raw_symbol: str, payload: Dict[str, Any]) -> str:
     """
-    Strong canonical output rules:
-    - If request is KSA code => output as NNNN.SR
-    - If request is GLOBAL plain ticker => output stays raw upper (AAPL), even if upstream uses AAPL.US
-    - If request includes dot (except SR rules) => keep normalized of raw
+    Canonical output:
+    - KSA codes => NNNN.SR
+    - GLOBAL plain tickers => keep as requested (AAPL stays AAPL)
     """
     raw = _safe_str(raw_symbol).upper()
     if not raw:
-        # fallback to payload
         return _safe_str(payload.get("symbol_normalized") or payload.get("symbol") or "").upper()
 
-    # KSA normalization (force .SR)
     if _is_ksa_symbol(raw):
         if raw.endswith(".SR"):
             return raw
         if raw.isdigit():
             return f"{raw}.SR"
-        # if it came like TADAWUL:1120
         if raw.startswith("TADAWUL:"):
             code = raw.split(":", 1)[1].strip()
             if code.isdigit():
                 return f"{code}.SR"
 
-    # GLOBAL: if raw has no dot => keep raw (AAPL) even if payload has AAPL.US
     if "." not in raw:
         return raw
 
-    # Otherwise, normalize raw
     try:
         return _normalize_symbol(raw)
     except Exception:
@@ -381,34 +349,91 @@ def _origin_from_symbol(symbol: str) -> str:
     return "GLOBAL_MARKETS"
 
 
-def _compute_52w_position(price: Any, low: Any, high: Any) -> Optional[float]:
-    p, l, h = _safe_float(price), _safe_float(low), _safe_float(high)
-    if p is None or l is None or h is None or h == l:
+# -------------------------
+# Sheet-safe ratio helpers
+# -------------------------
+
+def _percent_to_fraction(x: Any) -> Optional[float]:
+    """
+    Converts a percent-like value to a fraction suitable for Google Sheets % format.
+
+    Accepts:
+    - "0.79%" -> 0.0079
+    - 0.0079  -> 0.0079   (already fraction)
+    - 0.79    -> 0.0079   (assume percent-points when > 0.2 for % fields is risky, so avoid here)
+    - 34.71   -> 0.3471   (percent-points)
+    - 0.3471  -> 0.3471   (fraction)
+
+    IMPORTANT:
+    - This is used ONLY where the source value is known to be “percent-ish”.
+    - For daily change %, we prefer computing from price/prev_close to avoid ambiguity.
+    """
+    if x is None:
         return None
-    return round(((p - l) / (h - l)) * 100.0, 6)
+    if isinstance(x, str):
+        s = x.strip()
+        if not s:
+            return None
+        if s.endswith("%"):
+            f = _safe_float(s[:-1])
+            return None if f is None else f / 100.0
+        f = _safe_float(s)
+    else:
+        f = _safe_float(x)
+
+    if f is None:
+        return None
+
+    # If it's clearly percent-points (e.g., 12.5 meaning 12.5%), convert.
+    if abs(f) > 1.5:
+        return f / 100.0
+
+    # Otherwise assume it's already a fraction (0.12 => 12%).
+    return f
 
 
-def _compute_turnover(volume: Any, shares: Any) -> Optional[float]:
-    v, s = _safe_float(volume), _safe_float(shares)
+def _compute_change(price: Any, prev_close: Any) -> Tuple[Optional[float], Optional[float]]:
+    p = _safe_float(price)
+    pc = _safe_float(prev_close)
+    if p is None or pc is None or pc == 0:
+        return None, None
+    change = p - pc
+    pct_fraction = (p / pc) - 1.0
+    return round(change, 8), round(pct_fraction, 10)
+
+
+def _compute_52w_position_fraction(price: Any, low_52w: Any, high_52w: Any) -> Optional[float]:
+    p = _safe_float(price)
+    lo = _safe_float(low_52w)
+    hi = _safe_float(high_52w)
+    if p is None or lo is None or hi is None or hi == lo:
+        return None
+    return (p - lo) / (hi - lo)
+
+
+def _compute_turnover_fraction(volume: Any, shares_outstanding: Any) -> Optional[float]:
+    v = _safe_float(volume)
+    s = _safe_float(shares_outstanding)
     if v is None or s is None or s == 0:
         return None
-    return round((v / s) * 100.0, 6)
+    return v / s
 
 
 def _compute_value_traded(price: Any, volume: Any) -> Optional[float]:
-    p, v = _safe_float(price), _safe_float(volume)
+    p = _safe_float(price)
+    v = _safe_float(volume)
     if p is None or v is None:
         return None
-    return round(p * v, 6)
+    return p * v
 
 
-def _compute_free_float_mcap(mcap: Any, free_float: Any) -> Optional[float]:
-    m, f = _safe_float(mcap), _safe_float(free_float)
-    if m is None or f is None:
+def _compute_free_float_mcap(market_cap: Any, free_float_fraction_or_pct: Any) -> Optional[float]:
+    m = _safe_float(market_cap)
+    ff = _percent_to_fraction(free_float_fraction_or_pct)
+    if m is None or ff is None:
         return None
-    if f > 1.5:  # percent
-        f = f / 100.0
-    return m * max(0.0, min(1.0, f))
+    ff = max(0.0, min(1.0, ff))
+    return m * ff
 
 
 def _compute_liquidity_score(value_traded: Any) -> Optional[float]:
@@ -421,13 +446,6 @@ def _compute_liquidity_score(value_traded: Any) -> Optional[float]:
         return max(0.0, min(100.0, round(score, 2)))
     except Exception:
         return None
-
-
-def _compute_change_and_pct(price: Any, prev: Any) -> Tuple[Optional[float], Optional[float]]:
-    p, pc = _safe_float(price), _safe_float(prev)
-    if p is None or pc is None or pc == 0:
-        return None, None
-    return round(p - pc, 8), round((p / pc - 1.0) * 100.0, 8)
 
 
 def _compute_fair_value(payload: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[str]]:
@@ -446,15 +464,15 @@ def _compute_fair_value(payload: Dict[str, Any]) -> Tuple[Optional[float], Optio
     if fair is None or fair <= 0:
         return None, None, None
 
-    upside = round((fair / price - 1.0) * 100.0, 6)
+    upside_fraction = (fair / price) - 1.0
     label = (
-        "Undervalued" if upside >= 20 else
-        "Moderately Undervalued" if upside >= 10 else
-        "Fairly Valued" if upside >= -10 else
-        "Moderately Overvalued" if upside >= -20 else
+        "Undervalued" if upside_fraction >= 0.20 else
+        "Moderately Undervalued" if upside_fraction >= 0.10 else
+        "Fairly Valued" if upside_fraction >= -0.10 else
+        "Moderately Overvalued" if upside_fraction >= -0.20 else
         "Overvalued"
     )
-    return fair, upside, label
+    return fair, upside_fraction, label
 
 
 def _compute_data_quality(payload: Dict[str, Any]) -> str:
@@ -480,7 +498,8 @@ def _compute_data_quality(payload: Dict[str, Any]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Header mapping (UPDATED for EODHD v4.1.0 keys)
+# Header mapping (sheet-ready)
+# NOTE: For % columns, we output FRACTIONS (0..1) so Sheets Percent format works.
 # ---------------------------------------------------------------------------
 _HEADER_MAP: Dict[str, HeaderSpec] = {
     "rank": (("rank",), None),
@@ -497,11 +516,11 @@ _HEADER_MAP: Dict[str, HeaderSpec] = {
     "price": (("current_price", "last_price", "price", "regular_market_price"), None),
     "prev close": (("previous_close", "prev_close", "regular_market_previous_close"), None),
 
-    # change: prefer provider change; else compute from price/prev_close
+    # Change: prefer provided; else compute
     "change": (("change", "price_change", "regular_market_change"), None),
 
-    # change %: accept change_pct first
-    "change %": (("change_pct", "percent_change", "change_percent", "regular_market_change_percent"), _to_percent_smart),
+    # Change %: we prefer computing from price/prev_close (fraction). Provided values used only if needed.
+    "change %": (("change_pct", "percent_change", "change_percent", "regular_market_change_percent"), _percent_to_fraction),
 
     "day high": (("day_high", "regular_market_day_high"), None),
     "day low": (("day_low", "regular_market_day_low"), None),
@@ -509,14 +528,20 @@ _HEADER_MAP: Dict[str, HeaderSpec] = {
     # 52W (support both old + new)
     "52w high": (("high_52w", "week_52_high", "fifty_two_week_high", "year_high"), None),
     "52w low": (("low_52w", "week_52_low", "fifty_two_week_low", "year_low"), None),
-    "52w position %": (("position_52w_pct", "week_52_position_pct", "position_52w"), _to_percent_smart),
+    "52w position %": (("position_52w_pct", "week_52_position_pct", "position_52w"), _percent_to_fraction),
 
     "volume": (("volume", "regular_market_volume"), None),
     "avg vol 30d": (("avg_vol_30d", "avg_volume_30d", "average_volume", "average_daily_volume"), None),
     "value traded": (("value_traded", "traded_value", "turnover_value"), None),
-    "turnover %": (("turnover_percent", "turnover_pct"), _to_percent_smart),
+
+    # Turnover %: output fraction
+    "turnover %": (("turnover_percent", "turnover_pct"), _percent_to_fraction),
+
     "shares outstanding": (("shares_outstanding", "shares_out"), None),
-    "free float %": (("free_float", "free_float_percent"), _to_percent_smart),
+
+    # Free float %: output fraction
+    "free float %": (("free_float", "free_float_percent"), _percent_to_fraction),
+
     "market cap": (("market_cap", "market_capitalization"), None),
     "free float mkt cap": (("free_float_market_cap", "free_float_mkt_cap"), None),
 
@@ -530,22 +555,26 @@ _HEADER_MAP: Dict[str, HeaderSpec] = {
     "p/s": (("ps", "price_to_sales", "price_sales"), None),
     "ev/ebitda": (("ev_ebitda", "enterprise_value_to_ebitda"), None),
 
-    "dividend yield": (("dividend_yield",), _to_percent_smart),
+    # Dividend Yield / Payout / Margins / ROE/ROA / Growth: output fraction for sheets
+    "dividend yield": (("dividend_yield",), _percent_to_fraction),
     "dividend rate": (("dividend_rate",), None),
-    "payout ratio": (("payout_ratio",), _to_percent_smart),
-    "beta": (("beta",), None),
+    "payout ratio": (("payout_ratio",), _percent_to_fraction),
 
-    "roe": (("roe", "return_on_equity"), _to_percent_smart),
-    "roa": (("roa", "return_on_assets"), _to_percent_smart),
-    "net margin": (("net_margin", "profit_margin"), _to_percent_smart),
-    "ebitda margin": (("ebitda_margin",), _to_percent_smart),
-    "revenue growth": (("revenue_growth",), _to_percent_smart),
-    "net income growth": (("net_income_growth",), _to_percent_smart),
-    "volatility 30d": (("volatility_30d", "vol_30d_ann"), _to_volatility_smart),
+    "beta": (("beta",), None),
+    "roe": (("roe", "return_on_equity"), _percent_to_fraction),
+    "roa": (("roa", "return_on_assets"), _percent_to_fraction),
+    "net margin": (("net_margin", "profit_margin"), _percent_to_fraction),
+    "ebitda margin": (("ebitda_margin",), _percent_to_fraction),
+    "revenue growth": (("revenue_growth",), _percent_to_fraction),
+    "net income growth": (("net_income_growth",), _percent_to_fraction),
+
+    # Volatility: output fraction for sheets
+    "volatility 30d": (("volatility_30d", "vol_30d_ann"), _percent_to_fraction),
+
     "rsi 14": (("rsi_14", "rsi14"), None),
 
     "fair value": (("fair_value", "target_price", "forecast_price_3m", "forecast_price_12m"), None),
-    "upside %": (("upside_percent", "upside_pct"), _to_percent_smart),
+    "upside %": (("upside_percent", "upside_pct"), _percent_to_fraction),
     "valuation label": (("valuation_label",), None),
 
     "value score": (("value_score",), None),
@@ -577,7 +606,6 @@ class EnrichedQuote:
     def from_unified(cls, unified: Any) -> "EnrichedQuote":
         payload = _as_payload(_unwrap_tuple(_unwrap_container(unified)))
 
-        # Ensure canonical symbol behavior (router-level)
         requested = payload.get("requested_symbol") or payload.get("symbol") or ""
         output_symbol = _canonical_output_symbol(str(requested), payload)
         if output_symbol:
@@ -587,6 +615,7 @@ class EnrichedQuote:
         if "recommendation" in payload:
             payload["recommendation"] = _normalize_recommendation(payload["recommendation"])
 
+        payload.setdefault("origin", _origin_from_symbol(payload.get("symbol", "")))
         payload.setdefault("last_updated_utc", _now_utc_iso())
         payload.setdefault("last_updated_riyadh", _to_riyadh_iso(payload["last_updated_utc"]))
         payload.setdefault("data_quality", _compute_data_quality(payload))
@@ -613,28 +642,57 @@ class EnrichedQuote:
             val = self._get_first(fields)
             return val if val is not None else _origin_from_symbol(self.payload.get("symbol", ""))
 
-        # computed: change / pct
-        if h == "change":
-            val = self._get_first(fields)
-            if val is not None:
-                return val
-            ch, _ = _compute_change_and_pct(
+        # -------------------------
+        # Sheet-safe computed fields
+        # -------------------------
+        if h in ("change", "change %"):
+            # Always prefer computing from price/prev_close (removes ambiguity + fixes Sheets scaling)
+            ch, pct_frac = _compute_change(
                 self.payload.get("current_price") or self.payload.get("price"),
                 self.payload.get("previous_close"),
             )
-            self._computed[h] = ch
-            return ch
+            if h == "change":
+                val = self._get_first(fields)
+                v = val if val is not None else ch
+                self._computed[h] = v
+                return v
 
-        if h == "change %":
+            # change % (fraction)
+            if pct_frac is not None:
+                self._computed[h] = pct_frac
+                return pct_frac
+
+            # fallback to provided if compute not possible
             val = self._get_first(fields)
-            if val is not None:
-                return transform(val) if transform else val
-            _, pct = _compute_change_and_pct(
+            v = transform(val) if (transform and val is not None) else val
+            self._computed[h] = v
+            return v
+
+        if h == "52w position %":
+            pos_frac = _compute_52w_position_fraction(
                 self.payload.get("current_price") or self.payload.get("price"),
-                self.payload.get("previous_close"),
+                self.payload.get("low_52w") or self.payload.get("week_52_low"),
+                self.payload.get("high_52w") or self.payload.get("week_52_high"),
             )
-            self._computed[h] = pct
-            return pct
+            if pos_frac is not None:
+                self._computed[h] = pos_frac
+                return pos_frac
+
+            val = self._get_first(fields)
+            v = transform(val) if (transform and val is not None) else val
+            self._computed[h] = v
+            return v
+
+        if h == "turnover %":
+            turn_frac = _compute_turnover_fraction(self.payload.get("volume"), self.payload.get("shares_outstanding"))
+            if turn_frac is not None:
+                self._computed[h] = turn_frac
+                return turn_frac
+
+            val = self._get_first(fields)
+            v = transform(val) if (transform and val is not None) else val
+            self._computed[h] = v
+            return v
 
         if h == "value traded":
             val = self._get_first(fields)
@@ -648,26 +706,6 @@ class EnrichedQuote:
                 self.payload["value_traded"] = vt
             self._computed[h] = vt
             return vt
-
-        if h == "52w position %":
-            val = self._get_first(fields)
-            if val is not None:
-                return transform(val) if transform else val
-            pos = _compute_52w_position(
-                self.payload.get("current_price") or self.payload.get("price"),
-                self.payload.get("low_52w") or self.payload.get("week_52_low"),
-                self.payload.get("high_52w") or self.payload.get("week_52_high"),
-            )
-            self._computed[h] = pos
-            return pos
-
-        if h == "turnover %":
-            val = self._get_first(fields)
-            if val is not None:
-                return transform(val) if transform else val
-            to = _compute_turnover(self.payload.get("volume"), self.payload.get("shares_outstanding"))
-            self._computed[h] = to
-            return to
 
         if h == "free float mkt cap":
             val = self._get_first(fields)
@@ -691,15 +729,19 @@ class EnrichedQuote:
             return ls
 
         if h in ("fair value", "upside %", "valuation label"):
-            fair, upside, label = _compute_fair_value(self.payload)
+            fair, upside_frac, label = _compute_fair_value(self.payload)
             if h == "fair value":
                 v = self._get_first(fields)
                 return v if v is not None else fair
             if h == "upside %":
+                # Prefer computed (fraction)
+                if upside_frac is not None:
+                    self._computed[h] = upside_frac
+                    return upside_frac
                 v = self._get_first(fields)
-                if v is not None:
-                    return transform(v) if transform else v
-                return upside
+                v2 = transform(v) if (transform and v is not None) else v
+                self._computed[h] = v2
+                return v2
             if h == "valuation label":
                 v = self._get_first(fields)
                 return v if v is not None else label
@@ -716,6 +758,7 @@ class EnrichedQuote:
                 return transform(val) if transform else val
             return _to_riyadh_iso(self.payload.get("last_updated_utc"))
 
+        # Default
         val = self._get_first(fields)
         if transform and val is not None:
             try:
@@ -745,6 +788,11 @@ async def _maybe_await(v: Any) -> Any:
     return v
 
 
+_ENGINE_INIT_LOCK = asyncio.Lock()
+_ENGINE_LAST_FAIL_AT = 0.0
+_ENGINE_FAIL_TTL_SEC = 10.0
+
+
 async def _get_or_init_engine(request: Request) -> Tuple[Optional[Any], str, Optional[str]]:
     """
     Returns (engine, source, error).
@@ -758,29 +806,72 @@ async def _get_or_init_engine(request: Request) -> Tuple[Optional[Any], str, Opt
     except Exception:
         pass
 
-    # 2) load via core.data_engine_v2.get_engine
-    try:
-        from core.data_engine_v2 import get_engine  # type: ignore
+    # throttle repeated failures
+    global _ENGINE_LAST_FAIL_AT
+    if time.time() - _ENGINE_LAST_FAIL_AT < _ENGINE_FAIL_TTL_SEC:
+        return None, "engine_init_throttled", "recent_engine_init_failure"
 
-        eng = get_engine()
-        engine = await eng if inspect.isawaitable(eng) else eng
+    async with _ENGINE_INIT_LOCK:
+        # re-check after lock
         try:
-            request.app.state.engine = engine
+            engine = getattr(request.app.state, "engine", None)
+            if engine is not None:
+                return engine, "app.state.engine", None
         except Exception:
             pass
-        return engine, "core.data_engine_v2.get_engine", None
-    except Exception as e:
-        return None, "core.data_engine_v2.get_engine", repr(e)
+
+        # 2) try core.data_engine_v2.get_engine
+        try:
+            from core.data_engine_v2 import get_engine  # type: ignore
+
+            eng = get_engine()
+            engine = await eng if inspect.isawaitable(eng) else eng
+            try:
+                request.app.state.engine = engine
+            except Exception:
+                pass
+            return engine, "core.data_engine_v2.get_engine", None
+        except Exception as e:
+            last_err = repr(e)
+
+        # 3) try alternate layout data_engine_v2.get_engine
+        try:
+            from data_engine_v2 import get_engine as get_engine2  # type: ignore
+
+            eng2 = get_engine2()
+            engine2 = await eng2 if inspect.isawaitable(eng2) else eng2
+            try:
+                request.app.state.engine = engine2
+            except Exception:
+                pass
+            return engine2, "data_engine_v2.get_engine", None
+        except Exception as e:
+            last_err = f"{last_err} | alt:{repr(e)}"
+
+        # 4) last attempt: legacy engine module (if exists)
+        try:
+            from core.data_engine import get_engine as get_engine_legacy  # type: ignore
+
+            eng3 = get_engine_legacy()
+            engine3 = await eng3 if inspect.isawaitable(eng3) else eng3
+            try:
+                request.app.state.engine = engine3
+            except Exception:
+                pass
+            return engine3, "core.data_engine.get_engine", None
+        except Exception as e:
+            last_err = f"{last_err} | legacy:{repr(e)}"
+
+        _ENGINE_LAST_FAIL_AT = time.time()
+        return None, "engine_init_failed", last_err
 
 
 async def _call_engine(request: Request, symbol: str) -> EngineCall:
     start = time.time()
-
     engine, src, err = await _get_or_init_engine(request)
     if engine is None:
         return EngineCall(error="No engine available", source=src, latency_ms=(time.time() - start) * 1000)
 
-    # Try standard methods
     for method in ("get_enriched_quote", "get_quote"):
         fn = getattr(engine, method, None)
         if callable(fn):
@@ -796,7 +887,6 @@ async def _call_engine(request: Request, symbol: str) -> EngineCall:
 
 async def _call_engine_batch(request: Request, symbols: List[str]) -> EngineCall:
     start = time.time()
-
     engine, src, err = await _get_or_init_engine(request)
     if engine is None:
         return EngineCall(error="No batch engine available", source=src, latency_ms=(time.time() - start) * 1000)
@@ -827,14 +917,15 @@ def _is_authorized(request: Request) -> bool:
         pass
 
     # Accept your header + common variants
-    token = (
+    x_token = (
         request.headers.get("X-APP-TOKEN")
         or request.headers.get("X-App-Token")
         or request.headers.get("X-API-Key")
         or request.headers.get("X-Api-Key")
-        or request.headers.get("Authorization")
     )
-    if not token:
+    authz = request.headers.get("Authorization")
+
+    if not x_token and not authz:
         return False
 
     # Use core.config.auth_ok if available
@@ -842,7 +933,7 @@ def _is_authorized(request: Request) -> bool:
         from core.config import auth_ok  # type: ignore
 
         if callable(auth_ok):
-            return bool(auth_ok(token=token, headers=dict(request.headers)))
+            return bool(auth_ok(token=x_token, authorization=authz, headers=dict(request.headers)))
     except Exception:
         # If REQUIRE_AUTH explicitly true and auth_ok missing => deny
         req = str(os.getenv("REQUIRE_AUTH", "")).strip().lower() in _TRUTHY
@@ -948,24 +1039,18 @@ def _canonicalize_payload(raw_symbol: str, payload: Dict[str, Any], source: str)
         payload["symbol_normalized"] = out_symbol
         payload["symbol"] = out_symbol
 
-    # Source & timestamps
     payload.setdefault("data_source", source)
     payload.setdefault("last_updated_utc", _now_utc_iso())
     payload.setdefault("last_updated_riyadh", _to_riyadh_iso(payload["last_updated_utc"]))
+    payload.setdefault("origin", _origin_from_symbol(payload.get("symbol", "")))
 
-    # Recommendation
     if "recommendation" in payload:
         payload["recommendation"] = _normalize_recommendation(payload.get("recommendation"))
 
-    # Ensure origin field exists (useful for sheets)
-    payload.setdefault("origin", _origin_from_symbol(payload.get("symbol", "")))
-
-    # Ensure data_quality exists
     if not payload.get("data_quality"):
         payload["data_quality"] = _compute_data_quality(payload)
 
     return payload
-
 
 # ============================================================================
 
@@ -1103,27 +1188,28 @@ async def get_enriched_quotes(
 
             if call.result is not None and not call.error:
                 if isinstance(call.result, list):
-                    # Engine likely returns list in same order
                     for raw, res in zip(raw_list, call.result):
                         payload = _as_payload(res)
                         payload = _canonicalize_payload(raw, payload, call.source)
                         items.append(payload)
 
                 elif isinstance(call.result, dict):
-                    # Symbol-keyed dict (best-effort)
+                    # build lookup by canonical output symbol
                     lookup: Dict[str, Dict[str, Any]] = {}
                     for k, v in call.result.items():
                         p = _as_payload(v)
                         sym = p.get("requested_symbol") or p.get("symbol_normalized") or p.get("symbol") or p.get("normalized_symbol") or k
-                        if sym:
-                            lookup[_canonical_output_symbol(str(sym), p)] = p
+                        key = _canonical_output_symbol(str(sym), p)
+                        if key:
+                            lookup[key] = p
+
                     for raw in raw_list:
                         key = _canonical_output_symbol(raw, {})
                         payload = lookup.get(key, {"error": "no_data", "data_quality": "MISSING", "data_source": "none"})
                         payload = _canonicalize_payload(raw, payload, call.source)
                         items.append(payload)
 
-            # Fallback per-symbol for missing items
+            # Fallback per-symbol if batch returned nothing / partial
             if len(items) < len(raw_list):
                 cfg = _get_concurrency_config()
                 sem = asyncio.Semaphore(cfg["concurrency"])
