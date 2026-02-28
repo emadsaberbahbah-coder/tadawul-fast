@@ -2,655 +2,805 @@
 """
 routes/__init__.py
 ------------------------------------------------------------
-Routes package initialization (PROD SAFE) — v2.5.0 (Advanced)
+Routes package initialization (PROD SAFE) — v2.6.0 (TFB Aligned)
 
-Enhanced with:
-- ✅ Async module existence checking
-- ✅ Circuit breaker pattern for module loading
-- ✅ Metrics collection & Performance monitoring hooks
-- ✅ Lazy loading support & Zero-cost initialization
-- ✅ Better error categorization & graceful degradation
-- ✅ Complete dynamic router discovery (mount plans, groups)
+Design goals
+- ✅ Render/Prod-safe: zero network, zero heavy imports at module import-time
+- ✅ Deterministic mount order via groups + priorities
+- ✅ Fast existence checks (find_spec) with caching + async helpers
+- ✅ Circuit breaker for IMPORT failures (not for mere "missing")
+- ✅ Dynamic router discovery (optional) + static expected list (default, repo-aligned)
+- ✅ Graceful degradation: missing/broken routers don't crash unless strict mode enabled
+- ✅ Rich debug snapshot for health endpoints / logs
+
+TFB alignment (default expected routers)
+- routes.config
+- routes.enriched_quote
+- routes.advanced_analysis
+- routes.ai_analysis
+- routes.advisor
+- routes.investment_advisor
+- routes.routes_argaam
+
+Environment overrides (optional)
+- ROUTES_EXPECTED="routes.config,routes.enriched_quote,..."
+- ROUTES_AUTO_DISCOVER=1             (scan package via pkgutil; off by default)
+- ROUTES_STRICT=1                    (raise on import failures for "required" modules)
+- ROUTES_REQUIRED="routes.config,..." (comma list; only used when ROUTES_STRICT=1)
+- ROUTES_IMPORT_TIMEOUT_SEC=5        (async import timeout)
 """
 
 from __future__ import annotations
 
 import asyncio
+import importlib
 import importlib.util
 import os
+import pkgutil
+import sys
 import time
+from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from functools import lru_cache, wraps
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple
-from contextlib import contextmanager
-from collections import defaultdict
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
-ROUTES_PACKAGE_VERSION = "2.5.0"
+ROUTES_PACKAGE_VERSION = "2.6.0"
 
-# ---------------------------------------------------------------------
+# =============================================================================
 # Enums and Types
-# ---------------------------------------------------------------------
+# =============================================================================
 class ModuleStatus(Enum):
-    """Status of a module in the discovery process."""
-    AVAILABLE = "available"
-    MISSING = "missing"
-    ERROR = "error"
-    PENDING = "pending"
-    LOADED = "loaded"
-    FAILED = "failed"
+    AVAILABLE = "available"   # spec exists (importable in principle)
+    MISSING = "missing"       # spec not found
+    ERROR = "error"           # unexpected error during check
+    LOADED = "loaded"         # imported + router extracted
+    FAILED = "failed"         # import failed or router attr missing
+
+
+class ErrorCategory(Enum):
+    NOT_FOUND = "not_found"
+    IMPORT_ERROR = "import_error"
+    ROUTER_MISSING = "router_missing"
+    INVALID = "invalid"
+    TIMEOUT = "timeout"
+    UNKNOWN = "unknown"
+
 
 class ModuleGroup(Enum):
-    """Module groups for deterministic mounting."""
     SECURITY = "security"
     SYSTEM = "system"
     CORE = "core"
+    ANALYSIS = "analysis"
     ADVISOR = "advisor"
     KSA = "ksa"
     OTHER = "other"
-    
+
     @property
     def priority(self) -> int:
-        """Get mount priority (lower = earlier)."""
         priorities = {
             "security": 0,
             "system": 1,
             "core": 2,
-            "advisor": 3,
-            "ksa": 4,
-            "other": 9
+            "analysis": 3,
+            "advisor": 4,
+            "ksa": 5,
+            "other": 9,
         }
         return priorities.get(self.value, 9)
 
+
 @dataclass(slots=True)
 class ModuleInfo:
-    """Information about a discovered module."""
     name: str
-    path: Optional[str]
     group: ModuleGroup
-    status: ModuleStatus = ModuleStatus.PENDING
+    status: ModuleStatus = ModuleStatus.MISSING
     error: Optional[str] = None
-    load_time: Optional[float] = None
-    last_checked: Optional[datetime] = None
+    error_category: Optional[ErrorCategory] = None
+    load_time_ms: Optional[float] = None
+    last_checked_utc: Optional[str] = None
+    router_attr: str = "router"
+    router_found: bool = False
     metrics: Dict[str, Any] = field(default_factory=dict)
+
 
 @dataclass(slots=True)
 class DiscoveryResult:
-    """Result of module discovery operation."""
     module: str
     found: bool
     candidates_tried: List[str]
     time_taken_ms: float
     error: Optional[str] = None
+    error_category: Optional[ErrorCategory] = None
 
-# ---------------------------------------------------------------------
-# Metrics and Monitoring
-# ---------------------------------------------------------------------
+
+@dataclass(slots=True)
+class RouterSpec:
+    """
+    Minimal contract for mounting.
+    - module: python module path
+    - router_attr: attribute to fetch (default "router")
+    - required: if strict mode is enabled, failures raise for required routers only
+    """
+    module: str
+    group: ModuleGroup
+    router_attr: str = "router"
+    required: bool = False
+
+
+# =============================================================================
+# Metrics (lightweight, no deps)
+# =============================================================================
 class RoutesMetrics:
-    """Collect metrics about route discovery and loading."""
-    
     def __init__(self):
-        self._discovery_times: List[float] = []
-        self._module_checks: Dict[str, int] = {}
+        self._start = time.time()
+        self._discovery_ms: List[float] = []
+        self._exists_checks: Dict[str, int] = {}
+        self._import_attempts: Dict[str, int] = {}
         self._errors: Dict[str, int] = {}
-        self._cache_hits: int = 0
-        self._cache_misses: int = 0
-        self._start_time = time.time()
-    
-    def record_discovery(self, time_ms: float) -> None:
-        """Record module discovery time."""
-        self._discovery_times.append(time_ms)
-    
-    def record_module_check(self, module: str, hit_cache: bool) -> None:
-        """Record module existence check."""
-        self._module_checks[module] = self._module_checks.get(module, 0) + 1
+        self._cache_hits = 0
+        self._cache_misses = 0
+
+    def record_discovery(self, ms: float) -> None:
+        self._discovery_ms.append(float(ms))
+
+    def record_exists_check(self, module: str, hit_cache: bool) -> None:
+        self._exists_checks[module] = self._exists_checks.get(module, 0) + 1
         if hit_cache:
             self._cache_hits += 1
         else:
             self._cache_misses += 1
-    
-    def record_error(self, error_type: str) -> None:
-        """Record an error occurrence."""
-        self._errors[error_type] = self._errors.get(error_type, 0) + 1
-    
+
+    def record_import(self, module: str) -> None:
+        self._import_attempts[module] = self._import_attempts.get(module, 0) + 1
+
+    def record_error(self, category: Union[str, ErrorCategory]) -> None:
+        key = category.value if isinstance(category, ErrorCategory) else str(category)
+        self._errors[key] = self._errors.get(key, 0) + 1
+
     def get_stats(self) -> Dict[str, Any]:
-        """Get current metrics."""
+        total = len(self._discovery_ms)
+        avg = (sum(self._discovery_ms) / total) if total else 0.0
+        denom = self._cache_hits + self._cache_misses
+        hit_rate = (self._cache_hits / denom) if denom else 0.0
         return {
-            "uptime_seconds": time.time() - self._start_time,
-            "total_discoveries": len(self._discovery_times),
-            "avg_discovery_time_ms": sum(self._discovery_times) / len(self._discovery_times) if self._discovery_times else 0,
-            "modules_checked": len(self._module_checks),
-            "total_checks": sum(self._module_checks.values()),
-            "cache_hit_rate": self._cache_hits / (self._cache_hits + self._cache_misses) if (self._cache_hits + self._cache_misses) > 0 else 0,
-            "errors_by_type": self._errors.copy(),
+            "uptime_seconds": time.time() - self._start,
+            "discoveries": total,
+            "avg_discovery_time_ms": avg,
+            "exists_checks_unique": len(self._exists_checks),
+            "exists_checks_total": sum(self._exists_checks.values()),
+            "import_attempts_unique": len(self._import_attempts),
+            "import_attempts_total": sum(self._import_attempts.values()),
+            "cache_hit_rate": hit_rate,
+            "errors_by_category": dict(self._errors),
         }
-    
+
     def reset(self) -> None:
-        """Reset all metrics."""
         self.__init__()
+
 
 _metrics = RoutesMetrics()
 
+
 def get_metrics() -> RoutesMetrics:
-    """Get the global metrics instance."""
     return _metrics
 
-# ---------------------------------------------------------------------
-# Performance decorators
-# ---------------------------------------------------------------------
+
+# =============================================================================
+# Timing decorators
+# =============================================================================
 def timed(func: Callable) -> Callable:
-    """Time function execution."""
     @wraps(func)
     def wrapper(*args, **kwargs):
         start = time.perf_counter()
         try:
-            result = func(*args, **kwargs)
-            return result
+            return func(*args, **kwargs)
         finally:
-            elapsed = (time.perf_counter() - start) * 1000  # ms
-            _metrics.record_discovery(elapsed)
+            _metrics.record_discovery((time.perf_counter() - start) * 1000.0)
     return wrapper
 
+
 def async_timed(func: Callable[..., Awaitable]) -> Callable[..., Awaitable]:
-    """Time async function execution."""
     @wraps(func)
     async def wrapper(*args, **kwargs):
         start = time.perf_counter()
         try:
-            result = await func(*args, **kwargs)
-            return result
+            return await func(*args, **kwargs)
         finally:
-            elapsed = (time.perf_counter() - start) * 1000  # ms
-            _metrics.record_discovery(elapsed)
+            _metrics.record_discovery((time.perf_counter() - start) * 1000.0)
     return wrapper
 
-# ---------------------------------------------------------------------
-# Circuit Breaker for module loading
-# ---------------------------------------------------------------------
+
+# =============================================================================
+# Circuit breaker (IMPORT failures only)
+# =============================================================================
 class CircuitBreaker:
-    """Circuit breaker pattern to prevent repeated failures."""
-    
-    def __init__(self, failure_threshold: int = 5, reset_timeout: float = 60.0):
-        self.failure_threshold = failure_threshold
-        self.reset_timeout = reset_timeout
+    """
+    Protects repeated import failures.
+    Missing spec is NOT a failure; only exceptions during import/router extraction are failures.
+    """
+    def __init__(self, failure_threshold: int = 3, reset_timeout_sec: float = 60.0):
+        self.failure_threshold = max(1, int(failure_threshold))
+        self.reset_timeout_sec = max(5.0, float(reset_timeout_sec))
         self._failures: Dict[str, int] = {}
         self._last_failure: Dict[str, float] = {}
         self._open: Set[str] = set()
-    
+
     def record_failure(self, module: str) -> None:
-        """Record a module failure."""
         now = time.time()
         self._failures[module] = self._failures.get(module, 0) + 1
         self._last_failure[module] = now
-        
         if self._failures[module] >= self.failure_threshold:
             self._open.add(module)
-    
+
     def record_success(self, module: str) -> None:
-        """Record a module success."""
         self._failures.pop(module, None)
         self._last_failure.pop(module, None)
         self._open.discard(module)
-    
+
     def is_open(self, module: str) -> bool:
-        """Check if circuit is open for module."""
         if module not in self._open:
             return False
-        
-        # Check if we should auto-reset
         last = self._last_failure.get(module)
-        if last and (time.time() - last) > self.reset_timeout:
+        if last and (time.time() - last) > self.reset_timeout_sec:
+            # auto reset
             self._open.discard(module)
             self._failures.pop(module, None)
+            self._last_failure.pop(module, None)
             return False
-        
         return True
-    
+
     @contextmanager
     def guard(self, module: str):
-        """Context manager for circuit breaker protection."""
         if self.is_open(module):
             raise RuntimeError(f"Circuit breaker open for module: {module}")
-        
         try:
             yield
             self.record_success(module)
-        except Exception as e:
+        except Exception:
             self.record_failure(module)
-            raise e
+            raise
 
-_circuit_breaker = CircuitBreaker()
+    def snapshot(self) -> Dict[str, Any]:
+        return {
+            "open": sorted(self._open),
+            "failure_counts": dict(self._failures),
+            "threshold": self.failure_threshold,
+            "reset_timeout_sec": self.reset_timeout_sec,
+        }
 
-# ---------------------------------------------------------------------
-# Enhanced module existence checking
-# ---------------------------------------------------------------------
 
-def _normalize_module_path(module_path: str) -> str:
-    """Normalize file paths to Python dot notation."""
-    if not module_path: 
+_circuit_breaker = CircuitBreaker(
+    failure_threshold=int(os.getenv("ROUTES_CB_THRESHOLD", "3") or "3"),
+    reset_timeout_sec=float(os.getenv("ROUTES_CB_RESET_TIMEOUT_SEC", "60") or "60"),
+)
+
+# =============================================================================
+# Existence checks
+# =============================================================================
+def _normalize_module_name(module_path: str) -> str:
+    if not module_path:
         return ""
     s = str(module_path).strip()
-    if s.endswith(".py"): 
+    if not s:
+        return ""
+    # allow "routes/foo.py" or "routes\\foo.py"
+    s = s.replace("\\", "/")
+    if s.endswith(".py"):
         s = s[:-3]
-    if s.endswith("/__init__") or s.endswith("\\__init__"): 
+    if s.endswith("/__init__"):
         s = s[:-9]
-    s = s.replace("/", ".").replace("\\", ".")
-    return s
+    s = s.replace("/", ".")
+    return s.strip(".")
+
 
 @lru_cache(maxsize=4096)
-def _module_exists_cached(module_path: str) -> Tuple[bool, Optional[str]]:
+def _find_spec_cached(module_name: str) -> Tuple[bool, Optional[str]]:
     """
-    Core module existence check with error capture.
-    Returns (exists, error_message).
+    Returns (exists, error_message). Never raises.
     """
-    mp = _normalize_module_path(module_path)
-    if not mp:
-        return False, "Empty module path"
-    
+    mn = _normalize_module_name(module_name)
+    if not mn:
+        return False, "empty module name"
     try:
-        spec = importlib.util.find_spec(mp)
+        spec = importlib.util.find_spec(mn)
         if spec is None:
-            return False, "Module spec not found"
-        
-        # Verify it's actually a module we can import
-        if spec.origin is None and not spec.has_location:
-            # It might be a namespace package
-            if spec.submodule_search_locations is None:
-                return False, "Module has no location and is not a namespace package"
-        
+            return False, "spec not found"
+        # namespace pkg is OK
+        if spec.origin is None and not spec.has_location and spec.submodule_search_locations is None:
+            return False, "no location and not namespace package"
         return True, None
     except ModuleNotFoundError as e:
-        return False, f"Module not found: {str(e)}"
+        return False, f"module not found: {e}"
     except ValueError as e:
-        return False, f"Invalid module name: {str(e)}"
+        return False, f"invalid module name: {e}"
     except Exception as e:
-        _metrics.record_error(type(e).__name__)
-        return False, f"Unexpected error: {str(e)}"
+        _metrics.record_error(ErrorCategory.UNKNOWN)
+        return False, f"unexpected error: {e}"
+
 
 @timed
-def module_exists(module_path: str, use_cache: bool = True) -> bool:
-    """
-    Check module availability WITHOUT importing it.
-    Enhanced with metrics and error capture.
-    """
-    mp = _normalize_module_path(module_path)
-    if not mp:
-        return False
-    
-    # Check circuit breaker
-    if _circuit_breaker.is_open(mp):
-        return False
-    
-    try:
-        with _circuit_breaker.guard(mp):
-            if use_cache:
-                exists, _ = _module_exists_cached(mp)
-                _metrics.record_module_check(mp, hit_cache=True)
-            else:
-                # Bypass cache for fresh check
-                _module_exists_cached.cache_clear()
-                exists, error = _module_exists_cached(mp)
-                _metrics.record_module_check(mp, hit_cache=False)
-            
-            return exists
-    except Exception:
+def module_exists(module_path: str, *, use_cache: bool = True) -> bool:
+    mn = _normalize_module_name(module_path)
+    if not mn:
+        _metrics.record_error(ErrorCategory.INVALID)
         return False
 
-async def module_exists_async(module_path: str, timeout: float = 5.0) -> bool:
-    """
-    Async version of module_exists with timeout.
-    Useful for concurrent checks during startup.
-    """
+    if use_cache:
+        ok, _ = _find_spec_cached(mn)
+        _metrics.record_exists_check(mn, hit_cache=True)
+        return bool(ok)
+
+    # no-cache path: do not clear global cache (avoid perf cliff)
     try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        # Fallback if no loop is running
-        return module_exists(module_path)
-        
+        spec = importlib.util.find_spec(mn)
+        _metrics.record_exists_check(mn, hit_cache=False)
+        return spec is not None
+    except Exception:
+        _metrics.record_error(ErrorCategory.UNKNOWN)
+        _metrics.record_exists_check(mn, hit_cache=False)
+        return False
+
+
+@async_timed
+async def module_exists_async(module_path: str, *, timeout: float = 5.0, use_cache: bool = True) -> bool:
     try:
-        return await asyncio.wait_for(
-            loop.run_in_executor(None, module_exists, module_path),
-            timeout=timeout
-        )
+        return await asyncio.wait_for(asyncio.to_thread(module_exists, module_path, use_cache=use_cache), timeout=timeout)
     except asyncio.TimeoutError:
-        _metrics.record_error("timeout")
+        _metrics.record_error(ErrorCategory.TIMEOUT)
         return False
     except Exception:
-        _metrics.record_error("async_error")
+        _metrics.record_error(ErrorCategory.UNKNOWN)
         return False
+
 
 @timed
 def module_exists_any(candidates: Sequence[str]) -> Tuple[bool, Optional[str]]:
-    """
-    Check if any candidate module exists.
-    Returns (exists, first_existing).
-    """
     for c in candidates or []:
         if module_exists(c):
             return True, c
     return False, None
 
-async def module_exists_any_async(candidates: Sequence[str]) -> Tuple[bool, Optional[str]]:
-    """
-    Async version checking multiple candidates concurrently.
-    """
+
+@async_timed
+async def module_exists_any_async(candidates: Sequence[str], *, timeout: float = 5.0) -> Tuple[bool, Optional[str]]:
     if not candidates:
         return False, None
-    
-    tasks = [module_exists_async(c) for c in candidates]
+    tasks = [module_exists_async(c, timeout=timeout) for c in candidates]
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    
     for c, r in zip(candidates, results):
         if isinstance(r, bool) and r:
             return True, c
-    
     return False, None
 
-# ---------------------------------------------------------------------
-# Enhanced grouping
-# ---------------------------------------------------------------------
-def _group_of(module_path: str) -> ModuleGroup:
-    """
-    Classify module into a group for deterministic mounting.
-    Enhanced with more granular patterns.
-    """
-    ml = (module_path or "").lower()
-    
-    # Security patterns
-    security_patterns = (
-        "auth", "security", "middleware", "rate_limit", "ratelimit", 
-        "token", "jwt", "oauth", "permission", "rbac", "cors"
-    )
-    if any(p in ml for p in security_patterns):
+
+# =============================================================================
+# Grouping (TFB-aligned)
+# =============================================================================
+def _group_of(module_name: str) -> ModuleGroup:
+    ml = (module_name or "").lower()
+
+    if any(k in ml for k in ("auth", "security", "middleware", "rate", "jwt", "token", "cors")):
         return ModuleGroup.SECURITY
-    
-    # System patterns
-    system_patterns = (
-        "config", "health", "system", "status", "ping", "meta", 
-        "version", "info", "metrics", "monitoring", "ready", "live"
-    )
-    if any(p in ml for p in system_patterns):
+
+    if any(k in ml for k in ("health", "status", "ping", "meta", "version", "config", "ready", "live")):
         return ModuleGroup.SYSTEM
-    
-    # Advisor patterns
-    if "advisor" in ml or "adviser" in ml:
+
+    if any(k in ml for k in ("advanced_analysis", "ai_analysis", "analysis")):
+        return ModuleGroup.ANALYSIS
+
+    if any(k in ml for k in ("advisor", "investment_advisor", "adviser")):
         return ModuleGroup.ADVISOR
-    
-    # KSA patterns
-    ksa_patterns = ("argaam", "tadawul", "ksa", "saudi", "sr", "riyad", "jeddah")
-    if any(p in ml for p in ksa_patterns):
+
+    if any(k in ml for k in ("argaam", "tadawul", "routes_argaam", "ksa", "saudi")):
         return ModuleGroup.KSA
-    
-    # Core patterns
-    core_patterns = (
-        "enriched", "analysis", "quote", "legacy", "signals", 
-        "insights", "fundamental", "technical", "market", "stock"
-    )
-    if any(p in ml for p in core_patterns):
+
+    if any(k in ml for k in ("enriched", "quote", "quotes", "market", "engine")):
         return ModuleGroup.CORE
-    
+
     return ModuleGroup.OTHER
 
-# ---------------------------------------------------------------------
-# Enhanced discovery with batch operations
-# ---------------------------------------------------------------------
-@timed
-def check_modules_batch(modules: Sequence[str]) -> Dict[str, DiscoveryResult]:
-    """
-    Check multiple modules in batch.
-    Returns detailed results for each module.
-    """
-    results = {}
-    for module in modules or []:
-        start = time.perf_counter()
-        found = module_exists(module)
-        elapsed = (time.perf_counter() - start) * 1000
-        
-        results[module] = DiscoveryResult(
-            module=module,
-            found=found,
-            candidates_tried=[module],
-            time_taken_ms=elapsed
-        )
-    
-    return results
 
-async def check_modules_batch_async(modules: Sequence[str]) -> Dict[str, DiscoveryResult]:
-    """
-    Async batch check of multiple modules.
-    """
-    if not modules:
-        return {}
-    
-    async def check_one(module: str) -> DiscoveryResult:
-        start = time.perf_counter()
-        found = await module_exists_async(module)
-        elapsed = (time.perf_counter() - start) * 1000
-        
-        return DiscoveryResult(
-            module=module,
-            found=found,
-            candidates_tried=[module],
-            time_taken_ms=elapsed
-        )
-    
-    tasks = [check_one(m) for m in modules]
-    results_list = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    results = {}
-    for module, result in zip(modules, results_list):
-        if isinstance(result, DiscoveryResult):
-            results[module] = result
-        else:
-            results[module] = DiscoveryResult(
-                module=module,
-                found=False,
-                candidates_tried=[module],
-                time_taken_ms=0,
-                error=str(result) if result else "Unknown error"
-            )
-    
-    return results
+# =============================================================================
+# Discovery (expected list + optional auto-discover)
+# =============================================================================
+def _parse_env_list(name: str) -> List[str]:
+    raw = (os.getenv(name, "") or "").strip()
+    if not raw:
+        return []
+    return [x.strip() for x in raw.split(",") if x.strip()]
 
-# ---------------------------------------------------------------------
-# Core Router Discovery Implementations
-# ---------------------------------------------------------------------
 
 def get_routes_version() -> str:
-    """Get the version of the routes package."""
     return ROUTES_PACKAGE_VERSION
 
+
 def get_expected_router_modules() -> List[str]:
-    """Return the canonical list of expected router modules."""
+    """
+    Default: repo-aligned list (based on your project structure).
+    Override via ROUTES_EXPECTED.
+    """
+    override = _parse_env_list("ROUTES_EXPECTED")
+    if override:
+        return [_normalize_module_name(x) for x in override if _normalize_module_name(x)]
+
+    # TFB aligned defaults (do NOT include non-existent "routes.health" unless you have it)
     return [
-        "routes.health",
-        "routes.auth",
-        "routes.legacy_service",
-        "routes.data_engine",
+        "routes.config",
+        "routes.enriched_quote",
+        "routes.advanced_analysis",
+        "routes.ai_analysis",
+        "routes.advisor",
         "routes.investment_advisor",
-        "routes.portfolio",
-        "routes.websockets",
-        "routes.analytics",
-        "routes.market_data",
-        "routes.argaam",
-        "routes.tadawul"
+        "routes.routes_argaam",
     ]
 
+
 def get_expected_router_groups() -> Dict[str, List[str]]:
-    """Group expected modules deterministically by priority."""
     groups = defaultdict(list)
     for mod in get_expected_router_modules():
         groups[_group_of(mod).value].append(mod)
-    return dict(groups)
+    # stable ordering
+    return {k: sorted(v) for k, v in groups.items()}
 
-def get_available_router_modules() -> List[str]:
-    """Filter expected modules to only those actually importable."""
-    return [m for m in get_expected_router_modules() if module_exists(m)]
 
-def get_router_discovery() -> Dict[str, bool]:
-    """Return a mapping of expected modules to their existence status."""
-    return {m: module_exists(m) for m in get_expected_router_modules()}
+def _auto_discover_router_modules() -> List[str]:
+    """
+    Optional discovery by scanning the 'routes' package.
+    Safe: only lists module names; no imports.
+    Enabled with ROUTES_AUTO_DISCOVER=1.
+    """
+    auto = coerce_bool(os.getenv("ROUTES_AUTO_DISCOVER", ""), False)
+    if not auto:
+        return []
+    try:
+        # this is our own package; should exist
+        import routes as _routes_pkg  # type: ignore
+
+        discovered: List[str] = []
+        for m in pkgutil.iter_modules(_routes_pkg.__path__, prefix="routes."):
+            name = getattr(m, "name", "")
+            if not name:
+                continue
+            # ignore private modules
+            if name.split(".")[-1].startswith("_"):
+                continue
+            discovered.append(name)
+        return sorted(set(discovered))
+    except Exception:
+        _metrics.record_error(ErrorCategory.UNKNOWN)
+        return []
+
+
+def get_router_discovery(expected: Optional[Sequence[str]] = None) -> Dict[str, bool]:
+    exp = list(expected) if expected is not None else get_expected_router_modules()
+    exp2 = [_normalize_module_name(x) for x in exp if _normalize_module_name(x)]
+    return {m: module_exists(m) for m in exp2}
+
+
+def get_available_router_modules(expected: Optional[Sequence[str]] = None) -> List[str]:
+    exp = list(expected) if expected is not None else get_expected_router_modules()
+    exp2 = [_normalize_module_name(x) for x in exp if _normalize_module_name(x)]
+    return [m for m in exp2 if module_exists(m)]
+
+
+# =============================================================================
+# Batch checking
+# =============================================================================
+@timed
+def check_modules_batch(modules: Sequence[str]) -> Dict[str, DiscoveryResult]:
+    results: Dict[str, DiscoveryResult] = {}
+    for module in modules or []:
+        m = _normalize_module_name(module)
+        start = time.perf_counter()
+        ok = module_exists(m)
+        elapsed = (time.perf_counter() - start) * 1000.0
+        results[m] = DiscoveryResult(module=m, found=ok, candidates_tried=[m], time_taken_ms=elapsed)
+    return results
+
+
+@async_timed
+async def check_modules_batch_async(modules: Sequence[str], *, timeout: float = 5.0) -> Dict[str, DiscoveryResult]:
+    mods = [_normalize_module_name(m) for m in (modules or []) if _normalize_module_name(m)]
+    if not mods:
+        return {}
+    async def one(m: str) -> DiscoveryResult:
+        start = time.perf_counter()
+        ok = await module_exists_async(m, timeout=timeout)
+        elapsed = (time.perf_counter() - start) * 1000.0
+        return DiscoveryResult(module=m, found=ok, candidates_tried=[m], time_taken_ms=elapsed)
+    res_list = await asyncio.gather(*[one(m) for m in mods], return_exceptions=True)
+    out: Dict[str, DiscoveryResult] = {}
+    for m, r in zip(mods, res_list):
+        if isinstance(r, DiscoveryResult):
+            out[m] = r
+        else:
+            out[m] = DiscoveryResult(module=m, found=False, candidates_tried=[m], time_taken_ms=0.0, error=str(r), error_category=ErrorCategory.UNKNOWN)
+    return out
+
+
+# =============================================================================
+# Mount plan (detailed + simple)
+# =============================================================================
+def _required_set_from_env() -> Set[str]:
+    req = set(_parse_env_list("ROUTES_REQUIRED"))
+    return {_normalize_module_name(x) for x in req if _normalize_module_name(x)}
+
 
 def get_mount_plan_detailed(expected: Optional[Sequence[str]] = None) -> List[ModuleInfo]:
-    """
-    Get detailed mount plan with full module information.
-    """
     exp = list(expected) if expected is not None else get_expected_router_modules()
-    
-    # Batch check for efficiency
-    results = check_modules_batch(exp)
-    
-    plan = []
-    for module in exp:
-        result = results.get(module)
+    auto = _auto_discover_router_modules()
+    merged = list(dict.fromkeys([_normalize_module_name(x) for x in (exp + auto) if _normalize_module_name(x)]))
+
+    required = _required_set_from_env()
+    batch = check_modules_batch(merged)
+
+    plan: List[ModuleInfo] = []
+    now = datetime.now(timezone.utc).isoformat()
+
+    for module in merged:
+        result = batch.get(module)
+        found = bool(result.found) if result else False
         group = _group_of(module)
-        
+
         info = ModuleInfo(
             name=module,
-            path=None, 
             group=group,
-            status=ModuleStatus.AVAILABLE if result and result.found else ModuleStatus.MISSING,
-            last_checked=datetime.now(timezone.utc),
-            metrics={
-                "check_time_ms": result.time_taken_ms if result else 0
-            }
+            status=ModuleStatus.AVAILABLE if found else ModuleStatus.MISSING,
+            last_checked_utc=now,
+            router_attr="router",
+            router_found=False,
+            metrics={"check_time_ms": float(result.time_taken_ms) if result else 0.0, "required": bool(module in required)},
         )
-        
-        if result and result.error:
-            info.error = result.error
-            info.status = ModuleStatus.ERROR
-        
         plan.append(info)
-    
-    # Sort by group priority then name
+
     plan.sort(key=lambda x: (x.group.priority, x.name))
     return plan
 
-def get_mount_plan() -> List[str]:
-    """Return a priority-sorted list of module names safe to mount."""
-    detailed = get_mount_plan_detailed()
+
+def get_mount_plan(expected: Optional[Sequence[str]] = None) -> List[str]:
+    detailed = get_mount_plan_detailed(expected)
     return [m.name for m in detailed if m.status == ModuleStatus.AVAILABLE]
 
-def get_recommended_imports() -> str:
-    """Generate safe, boilerplate try-except import code for available modules."""
-    available = get_mount_plan()
-    imports = []
-    for mod in available:
-        mod_clean = mod.replace("routes.", "")
-        imports.append(f"try:\n    from {mod} import router as {mod_clean}_router\n    app.include_router({mod_clean}_router)\nexcept ImportError as e:\n    logger.warning(f'Failed to mount {mod}: {{e}}')")
-    
-    return "\n\n".join(imports)
 
-def get_dependency_audit() -> Dict[str, Any]:
-    """Audit the router layer, returning stats on missing vs available modules."""
-    expected = get_expected_router_modules()
-    available = get_available_router_modules()
-    missing = list(set(expected) - set(available))
-    
+# =============================================================================
+# Safe import + router extraction
+# =============================================================================
+def _classify_import_error(e: Exception) -> ErrorCategory:
+    if isinstance(e, ModuleNotFoundError):
+        return ErrorCategory.NOT_FOUND
+    if isinstance(e, ImportError):
+        return ErrorCategory.IMPORT_ERROR
+    return ErrorCategory.UNKNOWN
+
+
+def load_router(module: str, *, router_attr: str = "router") -> Tuple[Optional[Any], ModuleInfo]:
+    """
+    Import module and extract router attr.
+    Never imports at package import-time; called by app boot.
+    """
+    m = _normalize_module_name(module)
+    info = ModuleInfo(name=m, group=_group_of(m), status=ModuleStatus.MISSING, router_attr=router_attr, router_found=False)
+    info.last_checked_utc = datetime.now(timezone.utc).isoformat()
+
+    # existence first
+    ok, err = _find_spec_cached(m)
+    _metrics.record_exists_check(m, hit_cache=True)
+    if not ok:
+        info.status = ModuleStatus.MISSING
+        info.error = err
+        info.error_category = ErrorCategory.NOT_FOUND
+        return None, info
+
+    # circuit breaker for imports
+    if _circuit_breaker.is_open(m):
+        info.status = ModuleStatus.FAILED
+        info.error = "Circuit breaker open (import failures)"
+        info.error_category = ErrorCategory.IMPORT_ERROR
+        _metrics.record_error(ErrorCategory.IMPORT_ERROR)
+        return None, info
+
+    start = time.perf_counter()
+    try:
+        with _circuit_breaker.guard(m):
+            _metrics.record_import(m)
+            mod = importlib.import_module(m)
+            router = getattr(mod, router_attr, None)
+            if router is None:
+                info.status = ModuleStatus.FAILED
+                info.error = f"Router attribute '{router_attr}' not found"
+                info.error_category = ErrorCategory.ROUTER_MISSING
+                _metrics.record_error(ErrorCategory.ROUTER_MISSING)
+                return None, info
+
+            info.status = ModuleStatus.LOADED
+            info.router_found = True
+            return router, info
+    except Exception as e:
+        info.status = ModuleStatus.FAILED
+        info.error = str(e)
+        info.error_category = _classify_import_error(e)
+        _metrics.record_error(info.error_category)
+        return None, info
+    finally:
+        info.load_time_ms = (time.perf_counter() - start) * 1000.0
+
+
+async def load_router_async(module: str, *, router_attr: str = "router", timeout: Optional[float] = None) -> Tuple[Optional[Any], ModuleInfo]:
+    t = float(timeout if timeout is not None else float(os.getenv("ROUTES_IMPORT_TIMEOUT_SEC", "5") or "5"))
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(load_router, module, router_attr=router_attr), timeout=t)
+    except asyncio.TimeoutError:
+        info = ModuleInfo(
+            name=_normalize_module_name(module),
+            group=_group_of(module),
+            status=ModuleStatus.FAILED,
+            error="import timeout",
+            error_category=ErrorCategory.TIMEOUT,
+            router_attr=router_attr,
+            router_found=False,
+            last_checked_utc=datetime.now(timezone.utc).isoformat(),
+        )
+        _metrics.record_error(ErrorCategory.TIMEOUT)
+        return None, info
+
+
+def build_router_specs(expected: Optional[Sequence[str]] = None) -> List[RouterSpec]:
+    """
+    Convert discovery plan into RouterSpec list.
+    Required modules are controlled by ROUTES_REQUIRED (only used with ROUTES_STRICT=1).
+    """
+    required = _required_set_from_env()
+    mods = get_mount_plan(expected)
+    specs = []
+    for m in mods:
+        specs.append(RouterSpec(module=m, group=_group_of(m), router_attr="router", required=(m in required)))
+    specs.sort(key=lambda x: (x.group.priority, x.module))
+    return specs
+
+
+def mount_routers(app: Any, *, expected: Optional[Sequence[str]] = None, strict: Optional[bool] = None) -> Dict[str, Any]:
+    """
+    Mount routers into a FastAPI app (or compatible object exposing include_router()).
+
+    Returns a report dict:
+      {mounted: [...], failed: [...], missing: [...], strict: bool}
+    """
+    strict_mode = coerce_bool(os.getenv("ROUTES_STRICT", ""), False) if strict is None else bool(strict)
+    required = _required_set_from_env()
+
+    report = {"mounted": [], "failed": [], "missing": [], "strict": strict_mode}
+
+    for spec in build_router_specs(expected):
+        router, info = load_router(spec.module, router_attr=spec.router_attr)
+        if router is not None:
+            try:
+                app.include_router(router)  # FastAPI style
+                report["mounted"].append(spec.module)
+            except Exception as e:
+                info.status = ModuleStatus.FAILED
+                info.error = f"include_router failed: {e}"
+                info.error_category = ErrorCategory.UNKNOWN
+                report["failed"].append(info)
+                if strict_mode and (spec.required or spec.module in required):
+                    raise
+        else:
+            # distinguish missing vs failed
+            if info.status == ModuleStatus.MISSING:
+                report["missing"].append(info)
+                if strict_mode and (spec.required or spec.module in required):
+                    raise RuntimeError(f"Required router missing: {spec.module} ({info.error})")
+            else:
+                report["failed"].append(info)
+                if strict_mode and (spec.required or spec.module in required):
+                    raise RuntimeError(f"Required router failed: {spec.module} ({info.error})")
+
+    return report
+
+
+# =============================================================================
+# Debug / Audit
+# =============================================================================
+def get_dependency_audit(expected: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+    exp = list(expected) if expected is not None else get_expected_router_modules()
+    auto = _auto_discover_router_modules()
+    merged = list(dict.fromkeys([_normalize_module_name(x) for x in (exp + auto) if _normalize_module_name(x)]))
+
+    discovery = get_router_discovery(merged)
+    available = [m for m, ok in discovery.items() if ok]
+    missing = [m for m, ok in discovery.items() if not ok]
+
+    status = "healthy" if available else "critical"
     return {
-        "status": "healthy" if len(available) > 0 else "critical",
-        "total_expected": len(expected),
+        "status": status,
+        "total_expected": len(merged),
         "total_available": len(available),
         "total_missing": len(missing),
-        "available_modules": available,
-        "missing_modules": missing,
-        "package_version": ROUTES_PACKAGE_VERSION
+        "available_modules": sorted(available),
+        "missing_modules": sorted(missing),
+        "package_version": ROUTES_PACKAGE_VERSION,
+        "auto_discover_enabled": coerce_bool(os.getenv("ROUTES_AUTO_DISCOVER", ""), False),
     }
 
+
+def clear_module_cache() -> None:
+    _find_spec_cached.cache_clear()
+
+
+def get_cache_info() -> Dict[str, Any]:
+    ci = _find_spec_cached.cache_info()
+    denom = ci.hits + ci.misses
+    return {
+        "hits": ci.hits,
+        "misses": ci.misses,
+        "maxsize": ci.maxsize,
+        "currsize": ci.currsize,
+        "hit_rate": (ci.hits / denom) if denom else 0.0,
+    }
+
+
 def get_routes_debug_snapshot() -> Dict[str, Any]:
-    """Base debug snapshot of the routes layer."""
     return {
         "version": ROUTES_PACKAGE_VERSION,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "expected_groups": get_expected_router_groups(),
         "discovery": get_router_discovery(),
         "mount_plan": get_mount_plan(),
         "audit": get_dependency_audit(),
-        "timestamp_utc": datetime.now(timezone.utc).isoformat()
     }
 
-# ---------------------------------------------------------------------
-# Caching control
-# ---------------------------------------------------------------------
-def clear_module_cache() -> None:
-    """Clear all module existence caches."""
-    _module_exists_cached.cache_clear()
 
-def invalidate_module_cache(module: Optional[str] = None) -> None:
-    """
-    Invalidate cache for a specific module or all modules.
-    """
-    if module is None:
-        clear_module_cache()
-    else:
-        # LRU cache doesn't support specific key invalidation natively without internal hacks.
-        # Clearing all is safe and fast enough.
-        clear_module_cache()
-
-def get_cache_info() -> Dict[str, Any]:
-    """Get cache statistics."""
-    cache_info = _module_exists_cached.cache_info()
-    return {
-        "hits": cache_info.hits,
-        "misses": cache_info.misses,
-        "maxsize": cache_info.maxsize,
-        "currsize": cache_info.currsize,
-        "hit_rate": cache_info.hits / (cache_info.hits + cache_info.misses) if (cache_info.hits + cache_info.misses) > 0 else 0
-    }
-
-# ---------------------------------------------------------------------
-# Enhanced debug snapshot
-# ---------------------------------------------------------------------
 def get_routes_debug_snapshot_enhanced() -> Dict[str, Any]:
-    """
-    Enhanced debug snapshot with metrics and cache info.
-    """
-    base_snapshot = get_routes_debug_snapshot()
-    
-    base_snapshot.update({
-        "enhanced_version": ROUTES_PACKAGE_VERSION,
-        "metrics": get_metrics().get_stats(),
-        "cache_info": get_cache_info(),
-        "circuit_breaker": {
-            "open_circuits": list(_circuit_breaker._open),
-            "failure_counts": _circuit_breaker._failures.copy()
-        },
-        "python_version": os.sys.version,
-        "platform": os.sys.platform
-    })
-    
-    return base_snapshot
+    base = get_routes_debug_snapshot()
+    base.update(
+        {
+            "metrics": get_metrics().get_stats(),
+            "cache_info": get_cache_info(),
+            "circuit_breaker": _circuit_breaker.snapshot(),
+            "python": {"version": sys.version, "platform": sys.platform},
+        }
+    )
+    return base
 
-# ---------------------------------------------------------------------
-# Extended exports
-# ---------------------------------------------------------------------
+
+# =============================================================================
+# Exports
+# =============================================================================
 __all__ = [
-    # Original exports
     "ROUTES_PACKAGE_VERSION",
     "get_routes_version",
-    "get_expected_router_modules",
-    "get_expected_router_groups",
-    "module_exists",
-    "module_exists_any",
-    "get_available_router_modules",
-    "get_router_discovery",
-    "get_recommended_imports",
-    "get_mount_plan",
-    "get_routes_debug_snapshot",
-    "get_dependency_audit",
-    
-    # New exports
     "ModuleStatus",
+    "ErrorCategory",
     "ModuleGroup",
     "ModuleInfo",
     "DiscoveryResult",
+    "RouterSpec",
+    # existence checks
+    "module_exists",
     "module_exists_async",
+    "module_exists_any",
     "module_exists_any_async",
     "check_modules_batch",
     "check_modules_batch_async",
+    # discovery/mount plan
+    "get_expected_router_modules",
+    "get_expected_router_groups",
+    "get_available_router_modules",
+    "get_router_discovery",
+    "get_mount_plan",
     "get_mount_plan_detailed",
+    "build_router_specs",
+    # import/mount
+    "load_router",
+    "load_router_async",
+    "mount_routers",
+    # audit/debug
+    "get_dependency_audit",
+    "get_routes_debug_snapshot",
     "get_routes_debug_snapshot_enhanced",
     "clear_module_cache",
-    "invalidate_module_cache",
     "get_cache_info",
     "get_metrics",
     "CircuitBreaker",
