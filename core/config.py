@@ -2,22 +2,27 @@
 # core/config.py
 """
 ================================================================================
-Core Configuration Module — v5.3.0 (GLOBAL-FIRST / EODHD PRIMARY / RENDER SAFE)
+Core Configuration Module — v5.4.0 (RENDER-SAFE / STARTUP-SAFE / GLOBAL-FIRST)
 ================================================================================
 TADAWUL FAST BRIDGE – Enterprise Configuration Management
 
-Why this revision?
-- ✅ Make GLOBAL configuration explicit + robust (EODHD as primary provider)
-- ✅ Prevent “missing info” by exposing the full provider/feature/config surface
-- ✅ Safer auth behavior with REQUIRE_AUTH / OPEN_MODE / BACKUP_APP_TOKEN
-- ✅ Stronger Google credentials normalization (JSON / base64 / file path)
-- ✅ Consistent env names with your Render env list
-- ✅ Never breaks startup (optional deps are safe; all reads are defensive)
+Primary goal of this revision:
+- ✅ Avoid deploy/startup failures (NO network calls, NO heavy init at import-time)
+- ✅ Keep configuration surface complete and explicit (GLOBAL-first, EODHD primary)
+- ✅ Defensive env parsing + safe optional dependencies
+- ✅ Google credentials normalization (JSON / base64 / file path)
+- ✅ Distributed config sources are LAZY and opt-in (won’t block Render port binding)
 
-Key outcomes for your GLOBAL work:
-- You can enforce: PRIMARY_PROVIDER=eodhd and ENABLED_PROVIDERS includes eodhd
-- Add global EODHD defaults (EODHD_DEFAULT_EXCHANGE, EODHD_APPEND_EXCHANGE_SUFFIX)
-  so the engine/providers can normalize tickers like AAPL -> AAPL.US when needed.
+What changed vs v5.3.0 you pasted:
+- ✅ IMPORTANT: Distributed config sources no longer connect at import-time
+  (Consul/ETCD/ZooKeeper clients are created only when `reload_settings()` is called)
+- ✅ Added explicit DISTRIBUTED_CONFIG_ENABLED flag (default: off unless host vars present)
+- ✅ Settings cache TTL configurable (CORE_SETTINGS_CACHE_TTL)
+- ✅ More defensive auth defaults (never throws, validation is non-fatal unless you call it)
+- ✅ Safer URL normalization + masking utilities kept
+
+Safe-by-default philosophy:
+- Importing this module must NEVER crash, NEVER hang, NEVER do network I/O.
 """
 
 from __future__ import annotations
@@ -32,7 +37,7 @@ import time
 import uuid
 import zlib
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from threading import RLock
@@ -41,7 +46,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Un
 # =============================================================================
 # Version
 # =============================================================================
-__version__ = "5.3.0"
+__version__ = "5.4.0"
 CONFIG_VERSION = __version__
 CONFIG_BUILD_TIMESTAMP = datetime.now(timezone.utc).isoformat()
 
@@ -64,6 +69,7 @@ try:
 
     _HAS_ORJSON = True
 except Exception:
+
     def json_loads(data: Union[str, bytes]) -> Any:
         if isinstance(data, bytes):
             data = data.decode("utf-8", errors="replace")
@@ -79,6 +85,7 @@ except Exception:
 # =============================================================================
 try:
     import yaml  # type: ignore
+
     _HAS_YAML = True
 except Exception:
     yaml = None  # type: ignore
@@ -86,6 +93,7 @@ except Exception:
 
 try:
     import toml  # type: ignore
+
     _HAS_TOML = True
 except Exception:
     toml = None  # type: ignore
@@ -94,6 +102,7 @@ except Exception:
 # Encryption (optional)
 try:
     from cryptography.fernet import Fernet, InvalidToken  # type: ignore
+
     _HAS_CRYPTO = True
 except Exception:
     Fernet = None  # type: ignore
@@ -104,6 +113,7 @@ except Exception:
 try:
     from opentelemetry import trace  # type: ignore
     from opentelemetry.trace import Status, StatusCode  # type: ignore
+
     _OTEL_AVAILABLE = True
 except Exception:
     trace = None  # type: ignore
@@ -111,9 +121,10 @@ except Exception:
     StatusCode = None  # type: ignore
     _OTEL_AVAILABLE = False
 
-# Distributed sources (optional)
+# Distributed config libs (optional) — IMPORT ONLY, do not connect at import time
 try:
     import consul  # type: ignore
+
     _CONSUL_AVAILABLE = True
 except Exception:
     consul = None  # type: ignore
@@ -121,6 +132,7 @@ except Exception:
 
 try:
     import etcd3  # type: ignore
+
     _ETCD_AVAILABLE = True
 except Exception:
     etcd3 = None  # type: ignore
@@ -128,6 +140,7 @@ except Exception:
 
 try:
     from kazoo.client import KazooClient  # type: ignore
+
     _ZOOKEEPER_AVAILABLE = True
 except Exception:
     KazooClient = None  # type: ignore
@@ -137,6 +150,7 @@ except Exception:
 # Debug logging helper (never throws)
 # =============================================================================
 _DEBUG = (os.getenv("CORE_CONFIG_DEBUG", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
 
 def _dbg(message: str, level: str = "info", **kwargs: Any) -> None:
     if not _DEBUG:
@@ -156,12 +170,18 @@ def _dbg(message: str, level: str = "info", **kwargs: Any) -> None:
     except Exception:
         pass
 
+
 # =============================================================================
 # TraceContext (safe)
 # =============================================================================
 _TRACING_ENABLED = (os.getenv("CORE_TRACING_ENABLED", "") or os.getenv("TRACING_ENABLED", "")).strip().lower() in {
-    "1", "true", "yes", "y", "on"
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
 }
+
 
 class TraceContext:
     """
@@ -169,6 +189,7 @@ class TraceContext:
     - Use as context manager: with TraceContext("name"): ...
     - Use as decorator: @TraceContext("name")
     """
+
     def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
         self.name = name
         self.attributes = attributes or {}
@@ -214,9 +235,11 @@ class TraceContext:
         def wrapper(*args, **kwargs):
             with TraceContext(self.name, self.attributes):
                 return fn(*args, **kwargs)
+
         wrapper.__name__ = getattr(fn, "__name__", "wrapped")
         wrapper.__doc__ = getattr(fn, "__doc__", None)
         return wrapper
+
 
 # =============================================================================
 # Coercion helpers
@@ -225,6 +248,7 @@ _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "active"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "inactive"}
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
+
 def strip_value(v: Any) -> str:
     if v is None:
         return ""
@@ -232,6 +256,7 @@ def strip_value(v: Any) -> str:
         return str(v).strip()
     except Exception:
         return ""
+
 
 def coerce_bool(v: Any, default: bool) -> bool:
     s = strip_value(v).lower()
@@ -242,6 +267,7 @@ def coerce_bool(v: Any, default: bool) -> bool:
     if s in _FALSY:
         return False
     return default
+
 
 def coerce_int(v: Any, default: int, *, lo: Optional[int] = None, hi: Optional[int] = None) -> int:
     try:
@@ -254,6 +280,7 @@ def coerce_int(v: Any, default: int, *, lo: Optional[int] = None, hi: Optional[i
         x = hi
     return x
 
+
 def coerce_float(v: Any, default: float, *, lo: Optional[float] = None, hi: Optional[float] = None) -> float:
     try:
         x = float(v) if isinstance(v, (int, float)) else float(strip_value(v))
@@ -264,6 +291,7 @@ def coerce_float(v: Any, default: float, *, lo: Optional[float] = None, hi: Opti
     if hi is not None and x > hi:
         x = hi
     return x
+
 
 def coerce_list(v: Any, default: Optional[List[str]] = None) -> List[str]:
     if default is None:
@@ -285,6 +313,7 @@ def coerce_list(v: Any, default: Optional[List[str]] = None) -> List[str]:
             pass
     return [x.strip() for x in s.split(",") if x.strip()]
 
+
 def coerce_dict(v: Any, default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if default is None:
         default = {}
@@ -303,16 +332,30 @@ def coerce_dict(v: Any, default: Optional[Dict[str, Any]] = None) -> Dict[str, A
         pass
     return default
 
+
 def is_valid_url(url: str) -> bool:
     return bool(_URL_RE.match(strip_value(url)))
+
 
 # =============================================================================
 # Sensitive masking helpers
 # =============================================================================
 SENSITIVE_KEYS = {
-    "token", "secret", "key", "api_key", "apikey", "password", "credential",
-    "authorization", "bearer", "jwt", "private_key", "client_secret", "encryption_key",
+    "token",
+    "secret",
+    "key",
+    "api_key",
+    "apikey",
+    "password",
+    "credential",
+    "authorization",
+    "bearer",
+    "jwt",
+    "private_key",
+    "client_secret",
+    "encryption_key",
 }
+
 
 def mask_secret(s: Optional[str], reveal_first: int = 2, reveal_last: int = 4) -> Optional[str]:
     if not s:
@@ -321,6 +364,7 @@ def mask_secret(s: Optional[str], reveal_first: int = 2, reveal_last: int = 4) -
     if len(s) <= reveal_first + reveal_last + 3:
         return "***"
     return s[:reveal_first] + "..." + s[-reveal_last:]
+
 
 def mask_secret_dict(d: Dict[str, Any], sensitive_keys: Optional[Set[str]] = None) -> Dict[str, Any]:
     if sensitive_keys is None:
@@ -338,6 +382,7 @@ def mask_secret_dict(d: Dict[str, Any], sensitive_keys: Optional[Set[str]] = Non
             out[k] = v
     return out
 
+
 # =============================================================================
 # Deep merge + file loader (safe)
 # =============================================================================
@@ -354,6 +399,7 @@ def deep_merge(base: Dict[str, Any], override: Dict[str, Any], *, overwrite: boo
             if overwrite or k not in out:
                 out[k] = copy.deepcopy(v)
     return out
+
 
 def load_file_content(path: Path) -> Dict[str, Any]:
     """Load config from JSON/YAML/TOML. Never throws; returns {} on failure."""
@@ -377,11 +423,13 @@ def load_file_content(path: Path) -> Dict[str, Any]:
             obj = toml.loads(raw)
             return obj if isinstance(obj, dict) else {}
 
+        # fallback: try JSON
         obj = json_loads(raw)
         return obj if isinstance(obj, dict) else {}
     except Exception as e:
         _dbg("load_file_content failed", "warning", path=str(path), error=str(e))
         return {}
+
 
 # =============================================================================
 # Enums
@@ -400,6 +448,7 @@ class Environment(str, Enum):
         except Exception:
             return cls.PRODUCTION
 
+
 class LogLevel(str, Enum):
     TRACE = "TRACE"
     DEBUG = "DEBUG"
@@ -407,6 +456,7 @@ class LogLevel(str, Enum):
     WARNING = "WARNING"
     ERROR = "ERROR"
     CRITICAL = "CRITICAL"
+
 
 class AuthType(str, Enum):
     NONE = "none"
@@ -418,11 +468,13 @@ class AuthType(str, Enum):
     BASIC = "basic"
     MULTI = "multi"
 
+
 class CacheStrategy(str, Enum):
     MEMORY = "memory"
     REDIS = "redis"
     MEMCACHED = "memcached"
     NONE = "none"
+
 
 class ConfigSource(str, Enum):
     ENV = "env"
@@ -433,16 +485,19 @@ class ConfigSource(str, Enum):
     DEFAULT = "default"
     RUNTIME = "runtime"
 
+
 class ConfigStatus(str, Enum):
     ACTIVE = "active"
     ROLLED_BACK = "rolled_back"
     ARCHIVED = "archived"
+
 
 class EncryptionMethod(str, Enum):
     NONE = "none"
     BASE64 = "base64"
     AES = "aes"
     FERNET = "fernet"
+
 
 # =============================================================================
 # Encryption helper (optional crypto)
@@ -467,7 +522,7 @@ class ConfigEncryption:
             if self.method == EncryptionMethod.BASE64:
                 return base64.b64encode(value.encode("utf-8")).decode("utf-8")
             if self.method == EncryptionMethod.AES:
-                # Not real AES: compress+base64 (safe transport placeholder)
+                # transport-safe placeholder (compress + base64)
                 return base64.b64encode(zlib.compress(value.encode("utf-8"))).decode("utf-8")
             return value
         except Exception:
@@ -486,6 +541,7 @@ class ConfigEncryption:
             return value
         except Exception:
             return value
+
 
 # =============================================================================
 # Versioning (minimal, safe)
@@ -511,6 +567,7 @@ class ConfigVersion:
             "status": self.status.value,
         }
 
+
 class ConfigVersionManager:
     def __init__(self, max_versions: int = 100):
         self.max_versions = max(10, int(max_versions))
@@ -521,16 +578,19 @@ class ConfigVersionManager:
         with self._lock:
             self._versions.append(v)
             if len(self._versions) > self.max_versions:
-                self._versions = self._versions[-self.max_versions:]
+                self._versions = self._versions[-self.max_versions :]
 
     def history(self, limit: int = 20) -> List[ConfigVersion]:
         with self._lock:
-            return list(reversed(self._versions[-max(1, int(limit)):]))
+            return list(reversed(self._versions[-max(1, int(limit)) :]))
+
 
 _VERSION_MANAGER = ConfigVersionManager(max_versions=100)
 
+
 def get_version_manager() -> ConfigVersionManager:
     return _VERSION_MANAGER
+
 
 def save_config_version(
     changes: Dict[str, Tuple[Any, Any]],
@@ -553,6 +613,7 @@ def save_config_version(
     except Exception:
         pass
 
+
 # =============================================================================
 # Google credentials normalization
 # =============================================================================
@@ -560,13 +621,13 @@ def _maybe_b64_decode(s: str) -> Optional[str]:
     s2 = strip_value(s)
     if not s2:
         return None
-    # support "b64:...."
     if s2.lower().startswith("b64:"):
         s2 = s2.split(":", 1)[1].strip()
     try:
         return base64.b64decode(s2.encode("utf-8")).decode("utf-8", errors="replace")
     except Exception:
         return None
+
 
 def _read_text_file_if_exists(p: str) -> Optional[str]:
     try:
@@ -577,13 +638,14 @@ def _read_text_file_if_exists(p: str) -> Optional[str]:
         return None
     return None
 
+
 def normalize_google_credentials() -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
     """
     Returns (credentials_json_string, credentials_dict).
     Accepts:
       - GOOGLE_SHEETS_CREDENTIALS / GOOGLE_CREDENTIALS as JSON string
       - GOOGLE_*_B64 (base64 JSON)
-      - GOOGLE_APPLICATION_CREDENTIALS / GOOGLE_SHEETS_CREDENTIALS_FILE as file path
+      - GOOGLE_APPLICATION_CREDENTIALS / GOOGLE_*_FILE as file path
       - GOOGLE_CREDENTIALS_DICT as JSON dict string
     """
     # 1) dict env
@@ -604,7 +666,6 @@ def normalize_google_credentials() -> Tuple[Optional[str], Optional[Dict[str, An
             if isinstance(d, dict):
                 return (raw, d)
         except Exception:
-            # keep raw as json string if caller wants it, but dict may be None
             return (raw, None)
 
     # 3) base64 variants
@@ -642,6 +703,7 @@ def normalize_google_credentials() -> Tuple[Optional[str], Optional[Dict[str, An
 
     return (None, None)
 
+
 # =============================================================================
 # Settings (core)
 # =============================================================================
@@ -668,9 +730,9 @@ class Settings:
     require_auth: bool = True
     open_mode: bool = False
     app_token: Optional[str] = None
-    backup_app_token: Optional[str] = None  # BACKUP_APP_TOKEN supported
+    backup_app_token: Optional[str] = None
 
-    # Backend (for internal integrations)
+    # Backend (internal integrations)
     backend_base_url: str = "http://localhost:8000"
 
     # Providers (GLOBAL + KSA)
@@ -681,6 +743,7 @@ class Settings:
     # Provider keys + base URLs
     eodhd_api_key: Optional[str] = None
     eodhd_base_url: str = "https://eodhd.com/api"
+
     finnhub_api_key: Optional[str] = None
     fmp_api_key: Optional[str] = None
     alphavantage_api_key: Optional[str] = None
@@ -688,6 +751,8 @@ class Settings:
     twelvedata_api_key: Optional[str] = None
 
     fmp_base_url: Optional[str] = None
+
+    # EODHD global defaults
     eodhd_symbol_suffix_default: str = "US"
     eodhd_append_exchange_suffix: bool = True  # AAPL -> AAPL.US when needed
 
@@ -727,7 +792,6 @@ class Settings:
 
     @classmethod
     def from_env(cls) -> "Settings":
-        # --- base ---
         env_name = strip_value(os.getenv("APP_ENV") or os.getenv("TFB_ENV") or "production")
 
         # Render-style meta
@@ -738,8 +802,10 @@ class Settings:
         token = strip_value(os.getenv("APP_TOKEN") or os.getenv("TFB_APP_TOKEN") or os.getenv("BACKEND_TOKEN") or "")
         backup_token = strip_value(os.getenv("BACKUP_APP_TOKEN") or "")
 
-        require_auth = coerce_bool(os.getenv("REQUIRE_AUTH"), bool(token or backup_token))
-        # OPEN_MODE explicit wins; else open only if auth is not required and no tokens exist
+        # Default: require auth if you provided a token, else respect REQUIRE_AUTH or default True
+        require_auth = coerce_bool(os.getenv("REQUIRE_AUTH"), bool(token or backup_token) or True)
+
+        # OPEN_MODE explicit wins; else open only when require_auth is false AND no tokens exist
         if os.getenv("OPEN_MODE") is not None:
             open_mode = coerce_bool(os.getenv("OPEN_MODE"), False)
         else:
@@ -749,19 +815,23 @@ class Settings:
         eodhd_key = strip_value(os.getenv("EODHD_API_TOKEN") or os.getenv("EODHD_API_KEY") or os.getenv("EODHD_KEY") or "")
         finnhub_key = strip_value(os.getenv("FINNHUB_API_KEY") or os.getenv("FINNHUB_KEY") or "")
         fmp_key = strip_value(os.getenv("FMP_API_KEY") or "")
-        alpha_key = strip_value(os.getenv("ALPHA_VANTAGE_API_KEY") or os.getenv("ALPHAVANTAGE_API_KEY") or os.getenv("ALPHAVANTAGE_KEY") or "")
+        alpha_key = strip_value(
+            os.getenv("ALPHA_VANTAGE_API_KEY")
+            or os.getenv("ALPHAVANTAGE_API_KEY")
+            or os.getenv("ALPHAVANTAGE_KEY")
+            or ""
+        )
         marketstack_key = strip_value(os.getenv("MARKETSTACK_API_KEY") or "")
         twelvedata_key = strip_value(os.getenv("TWELVEDATA_API_KEY") or "")
 
         eodhd_base_url = strip_value(os.getenv("EODHD_BASE_URL") or "https://eodhd.com/api")
         fmp_base_url = strip_value(os.getenv("FMP_BASE_URL") or "") or None
 
-        # EODHD global defaults
         eodhd_suffix_default = strip_value(os.getenv("EODHD_DEFAULT_EXCHANGE") or os.getenv("EODHD_SYMBOL_SUFFIX_DEFAULT") or "US")
         eodhd_append_suffix = coerce_bool(os.getenv("EODHD_APPEND_EXCHANGE_SUFFIX"), True)
 
         # Providers list
-        enabled_providers = coerce_list(os.getenv("ENABLED_PROVIDERS") or os.getenv("PROVIDERS"))
+        enabled_providers = [p.lower() for p in coerce_list(os.getenv("ENABLED_PROVIDERS") or os.getenv("PROVIDERS"))]
         if not enabled_providers:
             enabled_providers = []
             if eodhd_key:
@@ -773,7 +843,7 @@ class Settings:
             if not enabled_providers:
                 enabled_providers = ["eodhd"]
 
-        ksa_providers = coerce_list(os.getenv("KSA_PROVIDERS") or "yahoo_chart,argaam")
+        ksa_providers = [p.lower() for p in coerce_list(os.getenv("KSA_PROVIDERS") or "yahoo_chart,argaam")]
         primary_provider = strip_value(os.getenv("PRIMARY_PROVIDER") or "eodhd").lower()
 
         # Logging
@@ -787,7 +857,9 @@ class Settings:
         log_json = coerce_bool(os.getenv("LOG_JSON"), True)
 
         # Backend base URL
-        backend_base_url = strip_value(os.getenv("BACKEND_BASE_URL") or os.getenv("DEFAULT_BACKEND_URL") or "http://localhost:8000")
+        backend_base_url = strip_value(
+            os.getenv("BACKEND_BASE_URL") or os.getenv("DEFAULT_BACKEND_URL") or "http://localhost:8000"
+        )
 
         # Feature flags
         advanced_analysis_enabled = coerce_bool(os.getenv("ADVANCED_ANALYSIS_ENABLED"), True)
@@ -798,7 +870,7 @@ class Settings:
         # HTTP / Retry / Cache / Engine
         http_timeout_sec = coerce_float(os.getenv("HTTP_TIMEOUT_SEC"), 45.0, lo=5.0, hi=300.0)
         max_retries = coerce_int(os.getenv("MAX_RETRIES"), 2, lo=0, hi=20)
-        retry_delay_sec = coerce_float(os.getenv("RETRY_DELAY"), 1.0, lo=0.0, hi=30.0)
+        retry_delay_sec = coerce_float(os.getenv("RETRY_DELAY") or os.getenv("RETRY_DELAY_SEC"), 1.0, lo=0.0, hi=30.0)
 
         cache_ttl_sec = coerce_int(os.getenv("CACHE_TTL_SEC") or os.getenv("CACHE_DEFAULT_TTL"), 20, lo=1, hi=3600)
         engine_cache_ttl_sec = coerce_int(os.getenv("ENGINE_CACHE_TTL_SEC"), 60, lo=1, hi=86400)
@@ -814,11 +886,9 @@ class Settings:
         # Sheets
         default_spreadsheet_id = strip_value(os.getenv("DEFAULT_SPREADSHEET_ID") or "") or None
         gs_json, gs_dict = normalize_google_credentials()
-
         google_apps_script_url = strip_value(os.getenv("GOOGLE_APPS_SCRIPT_URL") or "") or None
         google_apps_script_backup_url = strip_value(os.getenv("GOOGLE_APPS_SCRIPT_BACKUP_URL") or "") or None
 
-        # TZ
         tz = strip_value(os.getenv("TZ") or "Asia/Riyadh")
 
         return cls(
@@ -827,23 +897,18 @@ class Settings:
             timezone=tz,
             app_name=app_name,
             app_version=app_version,
-
             log_level=log_level,
             log_format=log_format,
             log_json=log_json,
-
             auth_header_name=strip_value(os.getenv("AUTH_HEADER_NAME") or "X-APP-TOKEN"),
             require_auth=require_auth,
             open_mode=open_mode,
             app_token=token or None,
             backup_app_token=backup_token or None,
-
             backend_base_url=backend_base_url,
-
             enabled_providers=enabled_providers,
             ksa_providers=ksa_providers,
             primary_provider=primary_provider,
-
             eodhd_api_key=eodhd_key or None,
             eodhd_base_url=eodhd_base_url,
             finnhub_api_key=finnhub_key or None,
@@ -852,31 +917,23 @@ class Settings:
             marketstack_api_key=marketstack_key or None,
             twelvedata_api_key=twelvedata_key or None,
             fmp_base_url=fmp_base_url,
-
             eodhd_symbol_suffix_default=eodhd_suffix_default or "US",
             eodhd_append_exchange_suffix=eodhd_append_suffix,
-
             tadawul_market_enabled=tadawul_market_enabled,
             ksa_disallow_eodhd=ksa_disallow_eodhd,
-
             advanced_analysis_enabled=advanced_analysis_enabled,
             ai_analysis_enabled=ai_analysis_enabled,
-
             http_timeout_sec=http_timeout_sec,
             max_retries=max_retries,
             retry_delay_sec=retry_delay_sec,
-
             cache_ttl_sec=cache_ttl_sec,
             engine_cache_ttl_sec=engine_cache_ttl_sec,
             cache_max_size=cache_max_size,
-
             batch_concurrency=batch_concurrency,
             ai_batch_size=ai_batch_size,
             quote_batch_size=quote_batch_size,
-
             init_engine_on_boot=init_engine_on_boot,
             defer_router_mount=defer_router_mount,
-
             default_spreadsheet_id=default_spreadsheet_id,
             google_sheets_credentials_json=gs_json,
             google_credentials_dict=gs_dict,
@@ -885,14 +942,12 @@ class Settings:
         )
 
     def validate(self) -> Tuple[List[str], List[str]]:
+        """
+        Validation is NON-FATAL by design.
+        Your app should decide how to treat errors (health endpoint may degrade).
+        """
         errors: List[str] = []
         warnings_list: List[str] = []
-
-        # auth consistency
-        if self.require_auth and not (self.app_token or self.backup_app_token) and not self.open_mode:
-            errors.append("REQUIRE_AUTH=true but no APP_TOKEN/BACKUP_APP_TOKEN configured and OPEN_MODE=false.")
-        if self.open_mode and (self.app_token or self.backup_app_token):
-            warnings_list.append("OPEN_MODE=true while tokens exist. Endpoints may be publicly exposed.")
 
         if self.backend_base_url and not is_valid_url(self.backend_base_url):
             warnings_list.append(f"backend_base_url does not look like a URL: {self.backend_base_url!r}")
@@ -901,12 +956,18 @@ class Settings:
 
         if "eodhd" in enabled_lower and not self.eodhd_api_key:
             errors.append("Provider 'eodhd' is enabled but EODHD_API_KEY is missing.")
-        if "finnhub" in enabled_lower and not self.finnhub_api_key and "finnhub" in enabled_lower:
-            warnings_list.append("Provider 'finnhub' enabled but FINNHUB_API_KEY missing (will fail if selected).")
+
         if self.primary_provider and self.primary_provider.lower() not in enabled_lower:
             warnings_list.append(
                 f"PRIMARY_PROVIDER={self.primary_provider!r} not included in ENABLED_PROVIDERS={self.enabled_providers!r}."
             )
+
+        if self.require_auth and not self.open_mode:
+            if not (self.app_token or self.backup_app_token or allowed_tokens()):
+                errors.append("REQUIRE_AUTH=true but no APP_TOKEN/BACKUP_APP_TOKEN/ALLOWED_TOKENS configured (and OPEN_MODE=false).")
+
+        if self.open_mode and (self.app_token or self.backup_app_token):
+            warnings_list.append("OPEN_MODE=true while tokens exist. Service may be publicly exposed unintentionally.")
 
         return errors, warnings_list
 
@@ -922,6 +983,7 @@ class Settings:
         allowed = set(cls.__dataclass_fields__.keys())
         cleaned = {k: v for k, v in merged.items() if k in allowed}
         return cls(**cleaned)
+
 
 # =============================================================================
 # Settings cache + API
@@ -956,10 +1018,14 @@ class SettingsCache:
         with self._lock:
             return {"size": len(self._cache), "ttl": self._ttl}
 
-_SETTINGS_CACHE = SettingsCache(ttl_seconds=30)
+
+_SETTINGS_CACHE_TTL = coerce_int(os.getenv("CORE_SETTINGS_CACHE_TTL"), 30, lo=1, hi=3600)
+_SETTINGS_CACHE = SettingsCache(ttl_seconds=_SETTINGS_CACHE_TTL)
+
 
 def get_settings() -> Settings:
     return Settings.from_env()
+
 
 def get_settings_cached(force_reload: bool = False) -> Settings:
     with TraceContext("get_settings_cached"):
@@ -972,8 +1038,9 @@ def get_settings_cached(force_reload: bool = False) -> Settings:
         _SETTINGS_CACHE.set("settings", s)
         return s
 
+
 # =============================================================================
-# Distributed sources (optional, safe, env-driven)
+# Distributed sources (optional, LAZY, safe, env-driven)
 # =============================================================================
 class ConfigSourceManager:
     def __init__(self):
@@ -996,42 +1063,56 @@ class ConfigSourceManager:
                     _dbg("distributed source load failed", "warning", source=src.value, error=str(e))
         return merged
 
+
 _CONFIG_SOURCES = ConfigSourceManager()
+_DISTRIBUTED_INIT_DONE = False
+_DISTRIBUTED_INIT_LOCK = RLock()
+
+
+def _distributed_enabled() -> bool:
+    # Explicit flag OR presence of a host var (but still lazy, no connection at import time)
+    if os.getenv("DISTRIBUTED_CONFIG_ENABLED") is not None:
+        return coerce_bool(os.getenv("DISTRIBUTED_CONFIG_ENABLED"), False)
+    return bool(os.getenv("CONSUL_HOST") or os.getenv("ETCD_HOST") or os.getenv("ZOOKEEPER_HOSTS"))
+
 
 class ConsulConfigSource:
+    """
+    LAZY: does NOT connect in __init__.
+    """
+
     def __init__(self, host: str, port: int, token: Optional[str], prefix: str):
         self.host = host
         self.port = port
         self.token = token
         self.prefix = prefix
-        self.client = None
-        self.ok = False
-        if _CONSUL_AVAILABLE and consul is not None:
-            try:
-                self.client = consul.Consul(host=host, port=port, token=token)
-                self.client.status.leader()
-                self.ok = True
-            except Exception as e:
-                _dbg("consul connect failed", "warning", error=str(e))
 
     def load(self) -> Optional[Dict[str, Any]]:
-        if not self.ok or self.client is None:
+        if not (_CONSUL_AVAILABLE and consul is not None):
             return None
         try:
-            _, data = self.client.kv.get(self.prefix, recurse=True)
+            client = consul.Consul(host=self.host, port=self.port, token=self.token)  # type: ignore
+            _, data = client.kv.get(self.prefix, recurse=True)  # type: ignore
             if not data:
                 return None
+
             out: Dict[str, Any] = {}
             for item in data:
                 k = item.get("Key") or ""
                 raw = item.get("Value")
                 if not k or raw is None:
                     continue
-                rel = k[len(self.prefix) + 1:] if k.startswith(self.prefix) else k
+                rel = k[len(self.prefix) + 1 :] if k.startswith(self.prefix) else k
+
                 try:
-                    val = json_loads(raw.decode("utf-8", errors="replace"))
+                    txt = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
+                    try:
+                        val = json_loads(txt)
+                    except Exception:
+                        val = txt
                 except Exception:
-                    val = raw.decode("utf-8", errors="replace")
+                    continue
+
                 parts = [p for p in rel.split("/") if p]
                 cur = out
                 for p in parts[:-1]:
@@ -1041,37 +1122,41 @@ class ConsulConfigSource:
                     cur = cur[p]
                 if parts:
                     cur[parts[-1]] = val
+
             return out or None
         except Exception as e:
             _dbg("consul load failed", "warning", error=str(e))
             return None
 
+
 class EtcdConfigSource:
+    """
+    LAZY: does NOT connect in __init__.
+    """
+
     def __init__(self, host: str, port: int, prefix: str):
         self.host = host
         self.port = port
         self.prefix = prefix
-        self.client = None
-        self.ok = False
-        if _ETCD_AVAILABLE and etcd3 is not None:
-            try:
-                self.client = etcd3.client(host=host, port=port)
-                self.ok = True
-            except Exception as e:
-                _dbg("etcd connect failed", "warning", error=str(e))
 
     def load(self) -> Optional[Dict[str, Any]]:
-        if not self.ok or self.client is None:
+        if not (_ETCD_AVAILABLE and etcd3 is not None):
             return None
         try:
+            client = etcd3.client(host=self.host, port=self.port)  # type: ignore
             out: Dict[str, Any] = {}
-            for value, meta in self.client.get_prefix(self.prefix):
+            for value, meta in client.get_prefix(self.prefix):  # type: ignore
                 key = (meta.key or b"").decode("utf-8", errors="replace")
-                rel = key[len(self.prefix):].lstrip("/")
+                rel = key[len(self.prefix) :].lstrip("/")
                 try:
-                    val = json_loads(value.decode("utf-8", errors="replace"))
+                    txt = value.decode("utf-8", errors="replace") if isinstance(value, (bytes, bytearray)) else str(value)
+                    try:
+                        val = json_loads(txt)
+                    except Exception:
+                        val = txt
                 except Exception:
-                    val = value.decode("utf-8", errors="replace")
+                    continue
+
                 parts = [p for p in rel.split("/") if p]
                 cur = out
                 for p in parts[:-1]:
@@ -1081,39 +1166,41 @@ class EtcdConfigSource:
                     cur = cur[p]
                 if parts:
                     cur[parts[-1]] = val
+
             return out or None
         except Exception as e:
             _dbg("etcd load failed", "warning", error=str(e))
             return None
 
+
 class ZooKeeperConfigSource:
-    def __init__(self, hosts: str, prefix: str):
+    """
+    LAZY: client is created inside load() with a small timeout.
+    """
+
+    def __init__(self, hosts: str, prefix: str, start_timeout_sec: int = 3):
         self.hosts = hosts
         self.prefix = prefix
-        self.client = None
-        self.ok = False
-        if _ZOOKEEPER_AVAILABLE and KazooClient is not None:
-            try:
-                self.client = KazooClient(hosts=hosts)
-                self.client.start(timeout=5)
-                self.ok = True
-            except Exception as e:
-                _dbg("zookeeper connect failed", "warning", error=str(e))
+        self.start_timeout_sec = max(1, int(start_timeout_sec))
 
     def load(self) -> Optional[Dict[str, Any]]:
-        if not self.ok or self.client is None:
+        if not (_ZOOKEEPER_AVAILABLE and KazooClient is not None):
             return None
+        client = None
         try:
+            client = KazooClient(hosts=self.hosts)  # type: ignore
+            client.start(timeout=self.start_timeout_sec)
+
             out: Dict[str, Any] = {}
 
             def walk(path: str, cur: Dict[str, Any]) -> None:
-                if not self.client.exists(path):
+                if not client.exists(path):
                     return
-                children = self.client.get_children(path)
+                children = client.get_children(path)
                 for child in children:
                     child_path = f"{path}/{child}"
-                    data, _ = self.client.get(child_path)
-                    sub = self.client.get_children(child_path)
+                    data, _ = client.get(child_path)
+                    sub = client.get_children(child_path)
                     if sub:
                         cur.setdefault(child, {})
                         if isinstance(cur[child], dict):
@@ -1131,54 +1218,79 @@ class ZooKeeperConfigSource:
         except Exception as e:
             _dbg("zookeeper load failed", "warning", error=str(e))
             return None
+        finally:
+            try:
+                if client is not None:
+                    client.stop()
+                    client.close()
+            except Exception:
+                pass
+
 
 def init_distributed_config() -> None:
-    """Register distributed sources only if env vars exist. No forced connections."""
-    with TraceContext("init_distributed_config"):
-        if os.getenv("CONSUL_HOST"):
-            host = strip_value(os.getenv("CONSUL_HOST") or "localhost")
-            port = coerce_int(os.getenv("CONSUL_PORT"), 8500, lo=1, hi=65535)
-            token = strip_value(os.getenv("CONSUL_TOKEN")) or None
-            prefix = strip_value(os.getenv("CONSUL_PREFIX") or "config/tadawul")
-            src = ConsulConfigSource(host=host, port=port, token=token, prefix=prefix)
-            _CONFIG_SOURCES.register_source(ConfigSource.CONSUL, src.load)
+    """
+    Register distributed sources only if env vars exist and feature is enabled.
+    STARTUP-SAFE: registers loaders only; no connections here.
+    """
+    global _DISTRIBUTED_INIT_DONE
+    with _DISTRIBUTED_INIT_LOCK:
+        if _DISTRIBUTED_INIT_DONE:
+            return
+        _DISTRIBUTED_INIT_DONE = True
 
-        if os.getenv("ETCD_HOST"):
-            host = strip_value(os.getenv("ETCD_HOST") or "localhost")
-            port = coerce_int(os.getenv("ETCD_PORT"), 2379, lo=1, hi=65535)
-            prefix = strip_value(os.getenv("ETCD_PREFIX") or "/config/tadawul")
-            src = EtcdConfigSource(host=host, port=port, prefix=prefix)
-            _CONFIG_SOURCES.register_source(ConfigSource.ETCD, src.load)
+        if not _distributed_enabled():
+            return
 
-        if os.getenv("ZOOKEEPER_HOSTS"):
-            hosts = strip_value(os.getenv("ZOOKEEPER_HOSTS") or "localhost:2181")
-            prefix = strip_value(os.getenv("ZOOKEEPER_PREFIX") or "/config/tadawul")
-            src = ZooKeeperConfigSource(hosts=hosts, prefix=prefix)
-            _CONFIG_SOURCES.register_source(ConfigSource.ZOOKEEPER, src.load)
+        with TraceContext("init_distributed_config"):
+            if os.getenv("CONSUL_HOST"):
+                host = strip_value(os.getenv("CONSUL_HOST") or "localhost")
+                port = coerce_int(os.getenv("CONSUL_PORT"), 8500, lo=1, hi=65535)
+                token = strip_value(os.getenv("CONSUL_TOKEN")) or None
+                prefix = strip_value(os.getenv("CONSUL_PREFIX") or "config/tadawul")
+                src = ConsulConfigSource(host=host, port=port, token=token, prefix=prefix)
+                _CONFIG_SOURCES.register_source(ConfigSource.CONSUL, src.load)
 
-# Run once safely
-init_distributed_config()
+            if os.getenv("ETCD_HOST"):
+                host = strip_value(os.getenv("ETCD_HOST") or "localhost")
+                port = coerce_int(os.getenv("ETCD_PORT"), 2379, lo=1, hi=65535)
+                prefix = strip_value(os.getenv("ETCD_PREFIX") or "/config/tadawul")
+                src = EtcdConfigSource(host=host, port=port, prefix=prefix)
+                _CONFIG_SOURCES.register_source(ConfigSource.ETCD, src.load)
+
+            if os.getenv("ZOOKEEPER_HOSTS"):
+                hosts = strip_value(os.getenv("ZOOKEEPER_HOSTS") or "localhost:2181")
+                prefix = strip_value(os.getenv("ZOOKEEPER_PREFIX") or "/config/tadawul")
+                zkt = coerce_int(os.getenv("ZOOKEEPER_START_TIMEOUT_SEC"), 3, lo=1, hi=10)
+                src = ZooKeeperConfigSource(hosts=hosts, prefix=prefix, start_timeout_sec=zkt)
+                _CONFIG_SOURCES.register_source(ConfigSource.ZOOKEEPER, src.load)
+
 
 def reload_settings() -> Settings:
     """
     Reload settings by merging distributed overrides into env-derived settings.
-    Distributed overrides keys must match Settings dataclass fields to take effect.
+    - distributed init is LAZY and safe
+    - overrides keys must match Settings dataclass fields
     """
     with TraceContext("reload_settings"):
+        init_distributed_config()
         _SETTINGS_CACHE.clear()
+
         base = asdict(Settings.from_env())
         merged = _CONFIG_SOURCES.load_merged()
         if merged:
             base = deep_merge(base, merged, overwrite=True)
+
         allowed = set(Settings.__dataclass_fields__.keys())
         cleaned = {k: v for k, v in base.items() if k in allowed}
         new_settings = Settings(**cleaned)
         _SETTINGS_CACHE.set("settings", new_settings)
         return new_settings
 
+
 def config_health_check() -> Dict[str, Any]:
     health: Dict[str, Any] = {"status": "healthy", "checks": {}, "warnings": [], "errors": []}
     try:
+        init_distributed_config()
         s = get_settings_cached()
         health["checks"]["settings_accessible"] = True
         errs, warns = s.validate()
@@ -1200,6 +1312,7 @@ def config_health_check() -> Dict[str, Any]:
     health["checks"]["tracing_enabled"] = bool(_TRACING_ENABLED and _OTEL_AVAILABLE)
     return health
 
+
 # =============================================================================
 # Auth helpers (used by API)
 # =============================================================================
@@ -1213,16 +1326,18 @@ def allowed_tokens() -> List[str]:
       4) APP_TOKEN + BACKUP_APP_TOKEN
     """
     toks = coerce_list(os.getenv("ALLOWED_TOKENS") or os.getenv("TFB_ALLOWED_TOKENS") or os.getenv("APP_TOKENS"))
+    toks = [t for t in toks if t]
     if toks:
         return toks
     t1 = strip_value(os.getenv("APP_TOKEN") or os.getenv("TFB_APP_TOKEN") or "")
     t2 = strip_value(os.getenv("BACKUP_APP_TOKEN") or "")
-    out = []
+    out: List[str] = []
     if t1:
         out.append(t1)
     if t2 and t2 not in out:
         out.append(t2)
     return out
+
 
 def is_open_mode() -> bool:
     """
@@ -1235,6 +1350,7 @@ def is_open_mode() -> bool:
 
     req = coerce_bool(os.getenv("REQUIRE_AUTH"), False)
     return (not req) and (len(allowed_tokens()) == 0)
+
 
 def _norm_headers(headers: Any) -> Dict[str, str]:
     out: Dict[str, str] = {}
@@ -1252,6 +1368,7 @@ def _norm_headers(headers: Any) -> Dict[str, str]:
         pass
     return out
 
+
 def _extract_bearer(authorization: Optional[str]) -> Optional[str]:
     a = strip_value(authorization)
     if not a:
@@ -1259,6 +1376,7 @@ def _extract_bearer(authorization: Optional[str]) -> Optional[str]:
     if a.lower().startswith("bearer "):
         return strip_value(a.split(" ", 1)[1])
     return a
+
 
 def auth_ok(
     token: Optional[str] = None,
@@ -1303,13 +1421,16 @@ def auth_ok(
 
     return False
 
+
 def mask_settings(settings: Optional[Settings] = None) -> Dict[str, Any]:
     s = settings or get_settings_cached()
     d = s.to_dict()
     d = mask_secret_dict(d, set(SENSITIVE_KEYS))
-    d["open_mode"] = bool(is_open_mode())
+    d["open_mode_effective"] = bool(is_open_mode())
     d["token_count"] = len(allowed_tokens())
+    d["config_version"] = CONFIG_VERSION
     return d
+
 
 # =============================================================================
 # Exports
