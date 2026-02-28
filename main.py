@@ -1,996 +1,1084 @@
 #!/usr/bin/env python3
 """
-main.py
+audit_data_quality.py
 ================================================================================
-TADAWUL FAST BRIDGE – ENTERPRISE FASTAPI ENTRY POINT (v8.5.3)
+TADAWUL FAST BRIDGE — ENTERPRISE DATA QUALITY AUDITOR (v4.2.0)
 ================================================================================
-QUANTUM EDITION | MISSION CRITICAL | DIRECT MOUNT
+Aligned • Production-safe • Non-blocking exports • Engine-compatible
 
-v8.5.3 FIXES
-- ✅ Fix TraceContext: start_as_current_span returns a context manager; we now enter it correctly
-- ✅ Keep Auth Bridge: accept X-APP-TOKEN by mapping to Authorization: Bearer
-- ✅ Fix /docs blank: serve Swagger UI from unpkg + relax CSP ONLY for docs/redoc
-- ✅ Error responses keep request_id consistent (request.state.request_id)
-- ✅ Fix metrics gauge: no double active_requests.dec() on shed path
+Key fixes vs your pasted v4.0.0
+- ✅ Aligns with your current adapter layer: uses `core.data_engine` (not core.data_engine_v2)
+- ✅ Never passes unsupported kwargs (e.g., refresh=...) to engine methods
+- ✅ Fixes optional-deps crashes (numpy/pandas not installed → no NameError)
+- ✅ Correctly interprets `--refresh` as "bypass cache" (use_cache=False)
+- ✅ Stronger symbol/page loading fallbacks (supports integrations.symbols_reader / symbols_reader)
+- ✅ Exports are async-safe (file writes run in executor)
+- ✅ Cleaner, deterministic audit logic + stable severity rules
+- ✅ Removes heavy unused stacks (seaborn/websockets/etc.) to reduce startup risk
+
+CLI examples
+- python audit_data_quality.py --keys MARKET_LEADERS MY_PORTFOLIO --sheet-id "<SID>" --refresh 1 --json-out report.json --csv-out alerts.csv
+- python audit_data_quality.py --keys MARKET_LEADERS --max-symbols 200 --refresh 0
+
+Environment
+- DEFAULT_SPREADSHEET_ID : fallback Sheet ID
+- AUDIT_BATCH_SIZE       : default 200
+- AUDIT_HMAC_KEY         : optional HMAC signing for exported JSON
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
-import contextvars
-import gc
+import concurrent.futures
+import csv
+import hashlib
+import hmac
 import logging
+import math
 import os
-import random
 import sys
 import time
-import traceback
-import uuid
-from urllib.parse import urlparse
-from contextlib import asynccontextmanager, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from importlib import import_module
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
-from fastapi import FastAPI, Request, Response, APIRouter
-from fastapi.exceptions import RequestValidationError
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from fastapi.routing import APIRoute
-from fastapi.openapi.docs import (
-    get_swagger_ui_html,
-    get_swagger_ui_oauth2_redirect_html,
-    get_redoc_html,
-)
-from starlette.exceptions import HTTPException as StarletteHTTPException
-from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
-from starlette.responses import JSONResponse, HTMLResponse
-
-# ---------------------------------------------------------------------------
-# High-Performance JSON fallback
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# High-performance JSON (orjson optional)
+# -----------------------------------------------------------------------------
 try:
-    import orjson
-    from fastapi.responses import ORJSONResponse as BestJSONResponse
+    import orjson  # type: ignore
 
-    def json_dumps(v, *, default=None) -> str:
-        return orjson.dumps(v, default=default).decode("utf-8")
+    def json_dumps(v: Any, *, default: Optional[Callable] = None) -> str:
+        return orjson.dumps(v, default=default or str).decode("utf-8")
+
+    def json_loads(v: Union[str, bytes]) -> Any:
+        return orjson.loads(v)
 
     _HAS_ORJSON = True
-except ImportError:
-    import json
-    from fastapi.responses import JSONResponse as BestJSONResponse
+except Exception:
+    import json  # noqa
 
-    def json_dumps(v, *, default=None) -> str:
-        return json.dumps(v, default=default)
+    def json_dumps(v: Any, *, default: Optional[Callable] = None) -> str:
+        return json.dumps(v, default=default or str, ensure_ascii=False)
+
+    def json_loads(v: Union[str, bytes]) -> Any:
+        return json.loads(v)
 
     _HAS_ORJSON = False
 
-# =============================================================================
-# Optional Dependencies with Graceful Degradation
-# =============================================================================
-
-# Rate limiting
+# -----------------------------------------------------------------------------
+# Optional numeric/data libs (guarded)
+# -----------------------------------------------------------------------------
 try:
-    from slowapi import Limiter, _rate_limit_exceeded_handler
-    from slowapi.errors import RateLimitExceeded
-    from slowapi.util import get_remote_address
-    from slowapi.middleware import SlowAPIMiddleware
-    SLOWAPI_AVAILABLE = True
-except ImportError:
-    SLOWAPI_AVAILABLE = False
+    import numpy as np  # type: ignore
 
-# Prometheus metrics
-try:
-    from prometheus_client import Counter, Gauge, Histogram, generate_latest
-    from prometheus_client.registry import CollectorRegistry
-    PROMETHEUS_AVAILABLE = True
-
-    # Ignore duplicate registrations
-    _original_register = CollectorRegistry.register
-
-    def _safe_register(self, collector):
-        try:
-            _original_register(self, collector)
-        except ValueError as e:
-            if "Duplicated timeseries" not in str(e):
-                raise
-
-    CollectorRegistry.register = _safe_register
-except ImportError:
-    PROMETHEUS_AVAILABLE = False
-
-# OpenTelemetry tracing
-try:
-    from opentelemetry import trace
-    from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
-    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-    from opentelemetry.sdk.trace import TracerProvider
-    from opentelemetry.sdk.trace.export import BatchSpanProcessor
-    from opentelemetry.sdk.resources import SERVICE_NAME, Resource
-    from opentelemetry.trace import Status, StatusCode
-    TRACING_AVAILABLE = True
-except ImportError:
-    TRACING_AVAILABLE = False
-    trace = None
-    Status = None
-    StatusCode = None
-
-# Sentry
-try:
-    import sentry_sdk
-    from sentry_sdk.integrations.logging import LoggingIntegration
-    try:
-        from sentry_sdk.integrations.asgi import SentryAsgiMiddleware
-    except ImportError:
-        SentryAsgiMiddleware = None
-    SENTRY_AVAILABLE = True
-except ImportError:
-    SENTRY_AVAILABLE = False
-    SentryAsgiMiddleware = None
-
-# psutil
-try:
-    import psutil
-    PSUTIL_AVAILABLE = True
-except ImportError:
-    PSUTIL_AVAILABLE = False
-
-# =============================================================================
-# Global Patches
-# =============================================================================
-# Fix possible async lock misuse in core.data_engine (if present)
-try:
-    import core.data_engine
-    if hasattr(core.data_engine, "_ENGINE_MANAGER"):
-        core.data_engine._ENGINE_MANAGER._lock = asyncio.Lock()
+    _HAS_NUMPY = True
 except Exception:
-    pass
+    np = None  # type: ignore
+    _HAS_NUMPY = False
 
-# =============================================================================
-# Path & Environment Setup
-# =============================================================================
-BASE_DIR = Path(__file__).resolve().parent
-if str(BASE_DIR) not in sys.path:
-    sys.path.insert(0, str(BASE_DIR))
+try:
+    import pandas as pd  # type: ignore
 
-APP_ENTRY_VERSION = "8.5.3"
+    _HAS_PANDAS = True
+except Exception:
+    pd = None  # type: ignore
+    _HAS_PANDAS = False
 
-_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled", "ok", "active"}
-_FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled"}
+try:
+    import pyarrow as pa  # type: ignore
+    import pyarrow.parquet as pq  # type: ignore
 
+    _HAS_PARQUET = True
+except Exception:
+    pa = None  # type: ignore
+    pq = None  # type: ignore
+    _HAS_PARQUET = False
 
-class LogLevel(str, Enum):
-    DEBUG = "DEBUG"
-    INFO = "INFO"
-    WARNING = "WARNING"
-    ERROR = "ERROR"
-    CRITICAL = "CRITICAL"
-
-
-def strip_value(v: Any) -> str:
-    try:
-        return str(v).strip()
-    except Exception:
-        return ""
-
-
-def coerce_bool(v: Any, default: bool = False) -> bool:
-    if isinstance(v, bool):
-        return v
-    s = strip_value(v).lower()
-    if not s:
-        return default
-    if s in _TRUTHY:
-        return True
-    if s in _FALSY:
-        return False
-    return default
-
-
-def get_env_bool(key: str, default: bool = False) -> bool:
-    return coerce_bool(os.getenv(key), default)
-
-
-def get_env_int(key: str, default: int) -> int:
-    try:
-        return int(float(os.getenv(key, str(default)).strip()))
-    except (ValueError, TypeError):
-        return default
-
-
-def get_env_float(key: str, default: float) -> float:
-    try:
-        return float(os.getenv(key, str(default)).strip())
-    except (ValueError, TypeError):
-        return default
-
-
-def get_env_str(key: str, default: str = "") -> str:
-    v = os.getenv(key)
-    return str(v).strip() if v is not None and str(v).strip() else default
-
-
-def get_env_list(key: str, default: Optional[List[str]] = None) -> List[str]:
-    v = os.getenv(key)
-    if not v:
-        return default or []
-    return [x.strip() for x in v.split(",") if x.strip()]
-
-
-def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
-
-
-def now_riyadh_iso() -> str:
-    tz = timezone(timedelta(hours=3))
-    return datetime.now(tz).isoformat(timespec="milliseconds")
-
-
-def get_rss_mb() -> float:
-    if PSUTIL_AVAILABLE:
-        try:
-            return psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
-        except Exception:
-            pass
-    try:
-        with open("/proc/self/status", "r") as f:
-            for line in f:
-                if line.startswith("VmRSS:"):
-                    return float(line.split()[1]) / 1024
-    except Exception:
-        pass
-    return 0.0
-
-
-def safe_import(module_path: str) -> Optional[Any]:
-    try:
-        return import_module(module_path)
-    except ModuleNotFoundError:
-        logging.getLogger("boot").debug(f"Router candidate skipped (not found): {module_path}")
-        return None
-    except Exception as e:
-        logging.getLogger("boot").error(f"❌ Failed to load '{module_path}': {e}\n{traceback.format_exc()}")
-        return None
-
-
-def is_valid_uri(uri: str) -> bool:
-    try:
-        result = urlparse(uri)
-        return all([result.scheme, result.netloc])
-    except Exception:
-        return False
-
-
-# =============================================================================
-# Request Correlation
-# =============================================================================
-_request_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("request_id", default="SYSTEM")
-
-
-def get_request_id() -> str:
-    try:
-        return _request_id_ctx.get()
-    except Exception:
-        return "SYSTEM"
-
-
-# =============================================================================
+# -----------------------------------------------------------------------------
 # Logging
-# =============================================================================
-class RequestIDFilter(logging.Filter):
-    def filter(self, record: logging.LogRecord) -> bool:
-        record.request_id = getattr(record, "request_id", None) or get_request_id()
-        return True
+# -----------------------------------------------------------------------------
+SERVICE_VERSION = "4.2.0"
+logger = logging.getLogger("TFB.Audit")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
+# -----------------------------------------------------------------------------
+# Executors (global, persistent)
+# -----------------------------------------------------------------------------
+_CPU_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=max(4, int(os.getenv("AUDIT_MAX_WORKERS", "8"))),
+    thread_name_prefix="AuditWorker",
+)
+
+# -----------------------------------------------------------------------------
+# Enums
+# -----------------------------------------------------------------------------
+class AuditSeverity(str, Enum):
+    CRITICAL = "CRITICAL"
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+    INFO = "INFO"
+    OK = "OK"
 
 
-class JSONFormatter(logging.Formatter):
-    def format(self, record: logging.LogRecord) -> str:
-        log_entry = {
-            "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
-            "level": record.levelname,
-            "logger": record.name,
-            "request_id": getattr(record, "request_id", "SYSTEM"),
-            "message": record.getMessage(),
-            "module": record.module,
-            "function": record.funcName,
-        }
-        if record.exc_info:
-            log_entry["exception"] = self.formatException(record.exc_info)
-        return json_dumps(log_entry)
+class DataQuality(str, Enum):
+    EXCELLENT = "EXCELLENT"
+    GOOD = "GOOD"
+    FAIR = "FAIR"
+    POOR = "POOR"
+    CRITICAL = "CRITICAL"
+    UNKNOWN = "UNKNOWN"
 
 
-def configure_logging() -> None:
-    log_level = get_env_str("LOG_LEVEL", "INFO").upper()
-    log_json = get_env_bool("LOG_JSON", False)
-
-    if log_level not in ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]:
-        log_level = "INFO"
-
-    root_logger = logging.getLogger()
-    root_logger.setLevel(log_level)
-
-    for handler in root_logger.handlers[:]:
-        root_logger.removeHandler(handler)
-
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(log_level)
-    console_handler.addFilter(RequestIDFilter())
-
-    if log_json or _HAS_ORJSON:
-        console_handler.setFormatter(JSONFormatter())
-    else:
-        fmt = "%(asctime)s | %(levelname)8s | [%(request_id)s] | %(name)s | %(message)s"
-        console_handler.setFormatter(logging.Formatter(fmt, datefmt="%H:%M:%S"))
-
-    root_logger.addHandler(console_handler)
-    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-    logging.getLogger("asyncio").setLevel(logging.WARNING)
+class ProviderHealth(str, Enum):
+    HEALTHY = "HEALTHY"
+    DEGRADED = "DEGRADED"
+    UNHEALTHY = "UNHEALTHY"
+    UNKNOWN = "UNKNOWN"
 
 
-configure_logging()
-logger = logging.getLogger("main")
-boot_logger = logging.getLogger("boot")
-
-# =============================================================================
-# TraceContext (FIXED)
-# =============================================================================
-class TraceContext:
-    """
-    Usage:
-        async with TraceContext("name", {"k":"v"}):
-            ...
-    Fix: OpenTelemetry start_as_current_span returns a context manager, not a span.
-    """
-
-    def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
-        self.name = name
-        self.attributes = attributes or {}
-        self.enabled = TRACING_AVAILABLE and get_env_bool("ENABLE_TRACING", False)
-        self.tracer = trace.get_tracer(__name__) if self.enabled else None
-        self._cm = None
-        self.span = None
-
-    async def __aenter__(self):
-        if not self.tracer:
-            return self
-        try:
-            # context manager -> enter to get the actual span
-            self._cm = self.tracer.start_as_current_span(self.name)
-            self.span = self._cm.__enter__()
-            if self.attributes and self.span:
-                for k, v in self.attributes.items():
-                    try:
-                        self.span.set_attribute(str(k), v)
-                    except Exception:
-                        pass
-        except Exception:
-            # never break request due to tracing
-            self._cm = None
-            self.span = None
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if not self._cm:
-            return False
-        try:
-            if exc_val and self.span and TRACING_AVAILABLE and Status is not None and StatusCode is not None:
-                try:
-                    self.span.record_exception(exc_val)
-                except Exception:
-                    pass
-                try:
-                    self.span.set_status(Status(StatusCode.ERROR, str(exc_val)))
-                except Exception:
-                    pass
-        finally:
-            try:
-                self._cm.__exit__(exc_type, exc_val, exc_tb)
-            except Exception:
-                pass
-        return False
+class AnomalyType(str, Enum):
+    PRICE_SPIKE = "PRICE_SPIKE"
+    VOLUME_SURGE = "VOLUME_SURGE"
+    STALE_DATA = "STALE_DATA"
+    MISSING_DATA = "MISSING_DATA"
+    OUTLIER = "OUTLIER"
 
 
-# =============================================================================
-# System Guardian
-# =============================================================================
-class SystemGuardian:
-    def __init__(self):
-        self.running = False
-        self.degraded_mode = False
-        self.shutting_down = False
-        self.latency_ms: float = 0.0
-        self.memory_mb: float = 0.0
-        self.request_count: int = 0
-        self.error_count: int = 0
+class AlertPriority(str, Enum):
+    P1 = "P1"
+    P2 = "P2"
+    P3 = "P3"
+    P4 = "P4"
+    P5 = "P5"
 
-        self.last_gc_time: float = 0.0
-        self.gc_pressure_mb = get_env_int("GC_PRESSURE_MB", 420)
-        self.gc_cooldown = get_env_float("GC_COOLDOWN_SEC", 60)
-        self.degraded_enter_lag = get_env_float("DEGRADED_ENTER_LAG_MS", 500)
-        self.degraded_exit_lag = get_env_float("DEGRADED_EXIT_LAG_MS", 150)
-        self.degraded_memory_mb = get_env_int("DEGRADED_MEMORY_MB", 1024)
 
-        self.boot_time_utc = now_utc_iso()
-        self.boot_time_riyadh = now_riyadh_iso()
+# -----------------------------------------------------------------------------
+# Config + Results
+# -----------------------------------------------------------------------------
+@dataclass(slots=True)
+class AuditConfig:
+    stale_hours: float = 72.0
+    hard_stale_hours: float = 168.0
+    min_price: float = 0.01
+    max_price: float = 1_000_000.0
+    max_abs_change_pct: float = 60.0
+    min_confidence_pct: float = 30.0
 
-    def get_load_level(self) -> str:
-        if self.latency_ms > self.degraded_enter_lag:
-            return "critical"
-        if self.latency_ms > self.degraded_enter_lag * 0.7:
-            return "high"
-        if self.latency_ms > self.degraded_enter_lag * 0.4:
-            return "medium"
-        return "low"
+    # history expectations (lightweight)
+    min_history_points_soft: int = 60
+    min_history_points_hard: int = 20
+
+    # output
+    export_formats: List[str] = field(default_factory=lambda: ["json", "csv"])
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {k: getattr(self, k) for k in self.__slots__}
+
+
+@dataclass(slots=True)
+class RemediationAction:
+    issue: str
+    action: str
+    priority: AlertPriority
+    estimated_time_minutes: int
+    automated: bool = False
+    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+
+
+@dataclass(slots=True)
+class AuditResult:
+    symbol: str
+    page: str
+    provider: str
+    severity: AuditSeverity
+    data_quality: DataQuality
+    provider_health: ProviderHealth
+
+    price: Optional[float] = None
+    change_pct: Optional[float] = None
+    volume: Optional[int] = None
+    market_cap: Optional[float] = None
+    age_hours: Optional[float] = None
+    last_updated_utc: Optional[str] = None
+    last_updated_riyadh: Optional[str] = None
+    history_points: int = 0
+    confidence_pct: float = 0.0
+
+    issues: List[str] = field(default_factory=list)
+    strategy_notes: List[str] = field(default_factory=list)
+    anomalies: List[AnomalyType] = field(default_factory=list)
+
+    remediation_actions: List[RemediationAction] = field(default_factory=list)
+    root_cause: Optional[str] = None
+    error: Optional[str] = None
+
+    audit_timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    audit_version: str = SERVICE_VERSION
 
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "metrics": {
-                "latency_ms": round(self.latency_ms, 2),
-                "memory_mb": round(self.memory_mb, 2),
-                "request_count": self.request_count,
-                "error_count": self.error_count,
-            },
-            "boot_time_utc": self.boot_time_utc,
-            "boot_time_riyadh": self.boot_time_riyadh,
+            "symbol": self.symbol,
+            "page": self.page,
+            "provider": self.provider,
+            "severity": self.severity.value,
+            "data_quality": self.data_quality.value,
+            "provider_health": self.provider_health.value,
+            "price": self.price,
+            "change_pct": self.change_pct,
+            "volume": self.volume,
+            "market_cap": self.market_cap,
+            "age_hours": self.age_hours,
+            "last_updated_utc": self.last_updated_utc,
+            "last_updated_riyadh": self.last_updated_riyadh,
+            "history_points": self.history_points,
+            "confidence_pct": self.confidence_pct,
+            "issues": list(self.issues),
+            "strategy_notes": list(self.strategy_notes),
+            "anomalies": [a.value for a in self.anomalies],
+            "remediation_actions": [
+                {
+                    "issue": a.issue,
+                    "action": a.action,
+                    "priority": a.priority.value,
+                    "estimated_time_minutes": a.estimated_time_minutes,
+                    "automated": a.automated,
+                    "created_at": a.created_at,
+                }
+                for a in self.remediation_actions
+            ],
+            "root_cause": self.root_cause,
+            "error": self.error,
+            "audit_timestamp": self.audit_timestamp,
+            "audit_version": self.audit_version,
         }
 
-    async def should_shed_request(self, path: str) -> bool:
-        if not self.degraded_mode or not get_env_bool("DEGRADED_SHED_ENABLED", True):
-            return False
-        shed_paths = get_env_list("DEGRADED_SHED_PATHS", ["/v1/analysis", "/v1/advanced", "/v1/advisor"])
-        return any(path.startswith(p) for p in shed_paths if p)
 
-    async def monitor_loop(self):
-        self.running = True
-        while self.running and not self.shutting_down:
-            try:
-                self.memory_mb = get_rss_mb()
-                now = time.time()
-                if self.memory_mb > self.gc_pressure_mb and (now - self.last_gc_time > self.gc_cooldown):
-                    boot_logger.info(f"Memory pressure: {self.memory_mb:.1f}MB, forcing GC")
-                    gc.collect()
-                    self.last_gc_time = now
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                boot_logger.error(f"Guardian monitor error: {e}")
-            await asyncio.sleep(2.0)
+@dataclass(slots=True)
+class AuditSummary:
+    total_assets: int = 0
+    by_severity: Dict[str, int] = field(default_factory=dict)
+    by_quality: Dict[str, int] = field(default_factory=dict)
+    by_provider_health: Dict[str, int] = field(default_factory=dict)
+    issue_counts: Dict[str, int] = field(default_factory=dict)
+    anomaly_counts: Dict[str, int] = field(default_factory=dict)
+    audit_duration_ms: float = 0.0
+    audit_timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    audit_version: str = SERVICE_VERSION
 
-    def stop(self):
-        self.running = False
-        self.shutting_down = True
-
-
-guardian = SystemGuardian()
-
-# =============================================================================
-# Metrics
-# =============================================================================
-class MetricsCollector:
-    def __init__(self):
-        self.enabled = PROMETHEUS_AVAILABLE and get_env_bool("ENABLE_METRICS", True)
-        if self.enabled:
-            self.active_requests = Gauge("http_requests_active", "Active HTTP requests")
-            self.request_count = Counter("http_requests_total", "Total HTTP requests", ["method", "endpoint", "status"])
-            self.request_duration = Histogram(
-                "http_request_duration_seconds",
-                "HTTP request duration",
-                ["method", "endpoint"],
-                buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10),
-            )
-
-    def record(self, method: str, endpoint: str, status_code: int, duration: float):
-        if not self.enabled:
-            return
-        self.request_count.labels(method=method, endpoint=endpoint or "root", status=str(status_code)).inc()
-        self.request_duration.labels(method=method, endpoint=endpoint or "root").observe(duration)
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "total_assets": self.total_assets,
+            "by_severity": dict(self.by_severity),
+            "by_quality": dict(self.by_quality),
+            "by_provider_health": dict(self.by_provider_health),
+            "issue_counts": dict(self.issue_counts),
+            "anomaly_counts": dict(self.anomaly_counts),
+            "audit_duration_ms": self.audit_duration_ms,
+            "audit_timestamp": self.audit_timestamp,
+            "audit_version": self.audit_version,
+        }
 
 
-metrics = MetricsCollector()
-
-# =============================================================================
-# Docs/CSP helpers
-# =============================================================================
-def _is_docs_path(path: str) -> bool:
-    return path == "/docs" or path.startswith("/docs/") or path == "/redoc" or path.startswith("/redoc")
+# -----------------------------------------------------------------------------
+# Utilities
+# -----------------------------------------------------------------------------
+_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+_RIYADH_TZ = timezone(timedelta(hours=3))
 
 
-def _csp_for_docs() -> str:
-    # Swagger UI / ReDoc need CDN scripts/styles + inline scripts
-    return (
-        "default-src 'self'; "
-        "base-uri 'self'; "
-        "frame-ancestors 'none'; "
-        "img-src 'self' https: data:; "
-        "style-src 'self' 'unsafe-inline' https://unpkg.com https://cdn.jsdelivr.net; "
-        "script-src 'self' 'unsafe-inline' 'unsafe-eval' https://unpkg.com https://cdn.jsdelivr.net; "
-        "connect-src 'self'; "
-        "font-src 'self' https://unpkg.com https://cdn.jsdelivr.net data:;"
-    )
+def _utc_iso(dt: Optional[datetime] = None) -> str:
+    d = dt or datetime.now(timezone.utc)
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d.astimezone(timezone.utc).isoformat()
 
 
-def _csp_strict() -> str:
-    return "default-src 'none'; base-uri 'none'; frame-ancestors 'none'"
+def _riyadh_iso(utc_iso: Optional[str] = None) -> str:
+    try:
+        if utc_iso:
+            dt = datetime.fromisoformat(str(utc_iso).replace("Z", "+00:00"))
+        else:
+            dt = datetime.now(timezone.utc)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(_RIYADH_TZ).isoformat()
+    except Exception:
+        return datetime.now(_RIYADH_TZ).isoformat()
 
 
-# =============================================================================
-# Middleware: Auth Bridge
-# =============================================================================
-class AuthHeaderBridgeMiddleware(BaseHTTPMiddleware):
-    """
-    If Authorization is missing, map:
-      - query param token=...
-      - header X-APP-TOKEN
-    into: Authorization: Bearer <token>
-    """
-
-    @staticmethod
-    def _get(scope_headers: List[tuple], key: bytes) -> Optional[bytes]:
-        for k, v in scope_headers:
-            if k == key:
-                return v
+def _parse_iso_time(iso_str: Optional[str]) -> Optional[datetime]:
+    if not iso_str:
+        return None
+    try:
+        return datetime.fromisoformat(str(iso_str).replace("Z", "+00:00"))
+    except Exception:
         return None
 
-    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-        try:
-            scope = request.scope
-            hdrs = list(scope.get("headers") or [])
-            if self._get(hdrs, b"authorization"):
-                return await call_next(request)
 
-            token_q = (request.query_params.get("token") or "").strip()
-            token_h = self._get(hdrs, b"x-app-token")
-            token = token_q or ((token_h.decode("utf-8").strip()) if token_h else "")
-
-            if token:
-                hdrs.append((b"authorization", f"Bearer {token}".encode("utf-8")))
-                scope["headers"] = hdrs
-        except Exception:
-            pass
-
-        return await call_next(request)
-
-# =============================================================================
-# Middleware: Telemetry
-# =============================================================================
-class TelemetryMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-        request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())[:18]
-        ctx_token = _request_id_ctx.set(request_id)
-        request.state.request_id = request_id
-        request.state.start_time = time.time()
-
-        guardian.request_count += 1
-        if metrics.enabled:
-            metrics.active_requests.inc()
-
-        try:
-            if await guardian.should_shed_request(request.url.path):
-                # do NOT dec here; finally will handle it once
-                resp = BestJSONResponse(
-                    status_code=503,
-                    content={
-                        "status": "degraded",
-                        "message": "System under heavy load",
-                        "request_id": request_id,
-                        "time_riyadh": now_riyadh_iso(),
-                    },
-                )
-                resp.headers["X-Request-ID"] = request_id
-                resp.headers["X-Time-Riyadh"] = now_riyadh_iso()
-                return resp
-
-            response = await call_next(request)
-
-            duration = time.time() - request.state.start_time
-            guardian.latency_ms = guardian.latency_ms * 0.9 + duration * 1000 * 0.1
-            if metrics.enabled:
-                metrics.record(request.method, request.url.path, response.status_code, duration)
-
-            response.headers["X-Request-ID"] = request_id
-            response.headers["X-Process-Time"] = f"{duration:.4f}s"
-            response.headers["X-System-Load"] = guardian.get_load_level()
-            response.headers["X-Time-Riyadh"] = now_riyadh_iso()
-
-            response.headers["X-Content-Type-Options"] = "nosniff"
-            response.headers["X-Frame-Options"] = "DENY"
-            response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-
-            response.headers["Content-Security-Policy"] = _csp_for_docs() if _is_docs_path(request.url.path) else _csp_strict()
-            if get_env_str("APP_ENV", "production") == "production":
-                response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-
-            return response
-
-        finally:
-            if metrics.enabled:
-                metrics.active_requests.dec()
-            _request_id_ctx.reset(ctx_token)
-
-# =============================================================================
-# Compression (safe)
-# =============================================================================
-class CompressionMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next: RequestResponseEndpoint) -> Response:
-        response = await call_next(request)
-        if response.headers.get("content-encoding"):
-            return response
-        # Let GZipMiddleware do most work; keep this conservative.
-        return response
-
-# =============================================================================
-# Router Mounting
-# =============================================================================
-@dataclass(frozen=True)
-class RouterSpec:
-    label: str
-    expected_prefix: str
-    candidates: List[str]
-    required: bool = True
-
-ROUTER_PLAN: List[RouterSpec] = [
-    RouterSpec("Advanced", "/v1/advanced", ["routes.advanced_analysis", "routes.advanced", "api.advanced"], True),
-    RouterSpec("Advisor", "/v1/advisor", ["routes.advisor", "routes.investment_advisor", "core.investment_advisor"], True),
-    RouterSpec("KSA", "/v1/ksa", ["routes.routes_argaam", "routes.argaam"], True),
-    RouterSpec("Enriched", "/v1/enriched", ["routes.enriched_quote", "routes.enriched", "core.enriched_quote"], True),
-    RouterSpec("Analysis", "/v1/analysis", ["routes.ai_analysis", "routes.analysis"], True),
-    RouterSpec("System", "", ["routes.config", "routes.system", "core.legacy_service"], True),
-    RouterSpec("WebSocket", "", ["routes.websocket"], False),
-]
-
-def _find_any_apirouter(module: Any) -> Optional[APIRouter]:
-    for name in dir(module):
-        try:
-            obj = getattr(module, name)
-        except Exception:
-            continue
-        if isinstance(obj, APIRouter):
-            return obj
-    return None
-
-@contextmanager
-def _temp_router_prefix(router: APIRouter, new_prefix: str):
-    old = getattr(router, "prefix", "")
+def _age_hours(utc_iso: Optional[str]) -> Optional[float]:
+    dt = _parse_iso_time(utc_iso)
+    if not dt:
+        return None
     try:
-        router.prefix = new_prefix or ""
-        yield
-    finally:
+        return (datetime.now(timezone.utc) - dt.astimezone(timezone.utc)).total_seconds() / 3600.0
+    except Exception:
+        return None
+
+
+def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
+    if x is None:
+        return default
+    try:
+        if isinstance(x, bool):
+            return default
+        if isinstance(x, (int, float)):
+            f = float(x)
+            return default if (math.isnan(f) or math.isinf(f)) else f
+        s = str(x).strip()
+        if not s:
+            return default
+        s = s.translate(_ARABIC_DIGITS).replace(",", "")
+        if s.endswith("%"):
+            s = s[:-1].strip()
+        return float(s) if s else default
+    except Exception:
+        return default
+
+
+def _safe_int(x: Any, default: int = 0) -> int:
+    try:
+        v = _safe_float(x, None)
+        return int(round(v)) if v is not None else default
+    except Exception:
+        return default
+
+
+def _norm_symbol(sym: Any) -> str:
+    s = ("" if sym is None else str(sym)).strip().upper()
+    if not s:
+        return ""
+    s = s.translate(_ARABIC_DIGITS)
+    s = s.replace("TADAWUL:", "").replace(".TADAWUL", "")
+    # numeric -> .SR
+    if s.isdigit() and 3 <= len(s) <= 6:
+        return f"{s}.SR"
+    return s
+
+
+def _dedupe_preserve(items: Iterable[str]) -> List[str]:
+    out: List[str] = []
+    seen: Set[str] = set()
+    for x in items:
+        if not x:
+            continue
+        if x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    return out
+
+
+async def _maybe_await(x: Any) -> Any:
+    import inspect
+
+    return await x if inspect.isawaitable(x) else x
+
+
+def _chunk(lst: List[str], n: int) -> List[List[str]]:
+    if n <= 0:
+        return [lst]
+    return [lst[i : i + n] for i in range(0, len(lst), n)]
+
+
+# -----------------------------------------------------------------------------
+# Deps: symbols_reader + core.data_engine
+# -----------------------------------------------------------------------------
+@dataclass(slots=True)
+class Deps:
+    ok: bool
+    symbols_reader: Any
+    data_engine: Any
+    err: Optional[str] = None
+
+
+def _load_deps() -> Deps:
+    sr = None
+    de = None
+    err = None
+
+    # symbols reader: try a few known locations
+    for mod_name in ("integrations.symbols_reader", "symbols_reader", "integrations.symbols", "core.symbols_reader"):
         try:
-            router.prefix = old or ""
+            sr = __import__(mod_name, fromlist=["*"])
+            break
+        except Exception:
+            sr = None
+
+    # data engine wrapper (preferred)
+    try:
+        from core import data_engine as _de  # type: ignore
+
+        de = _de
+    except Exception as e:
+        de = None
+        err = f"core.data_engine import failed: {e}"
+
+    ok = bool(sr and de)
+    return Deps(ok=ok, symbols_reader=sr, data_engine=de, err=err)
+
+
+DEPS = _load_deps()
+
+
+def _get_page_symbols(symbols_reader: Any, page_key: str, spreadsheet_id: str) -> List[str]:
+    """
+    Supports:
+      - symbols_reader.get_page_symbols(key, spreadsheet_id=...)
+      - symbols_reader.get_symbols_for_page(...)
+      - symbols_reader.read_page_symbols(...)
+    """
+    if symbols_reader is None:
+        return []
+    candidates = [
+        getattr(symbols_reader, "get_page_symbols", None),
+        getattr(symbols_reader, "get_symbols_for_page", None),
+        getattr(symbols_reader, "read_page_symbols", None),
+    ]
+    for fn in candidates:
+        if callable(fn):
+            try:
+                res = fn(page_key, spreadsheet_id=spreadsheet_id)
+                if isinstance(res, (list, tuple, set)):
+                    return [_norm_symbol(x) for x in res if _norm_symbol(x)]
+            except TypeError:
+                # might accept (spreadsheet_id, key) order
+                try:
+                    res = fn(spreadsheet_id, page_key)
+                    if isinstance(res, (list, tuple, set)):
+                        return [_norm_symbol(x) for x in res if _norm_symbol(x)]
+                except Exception:
+                    pass
+            except Exception:
+                pass
+    return []
+
+
+# -----------------------------------------------------------------------------
+# Fetch quotes (aligned with core.data_engine public API)
+# -----------------------------------------------------------------------------
+def _obj_to_dict(x: Any) -> Dict[str, Any]:
+    if x is None:
+        return {}
+    if isinstance(x, dict):
+        return x
+    if hasattr(x, "model_dump") and callable(getattr(x, "model_dump")):
+        try:
+            return x.model_dump()
+        except Exception:
+            pass
+    if hasattr(x, "dict") and callable(getattr(x, "dict")):
+        try:
+            return x.dict()
+        except Exception:
+            pass
+    try:
+        return dict(getattr(x, "__dict__", {}) or {})
+    except Exception:
+        return {}
+
+
+def _coerce_symbol_from_quote(q: Dict[str, Any]) -> str:
+    for k in ("symbol", "requested_symbol", "ticker", "code", "id"):
+        v = q.get(k)
+        s = _norm_symbol(v)
+        if s:
+            return s
+    return ""
+
+
+async def _fetch_quotes_map(
+    symbols: List[str],
+    *,
+    use_cache: bool,
+    ttl: Optional[int],
+    batch_size: int,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Uses `core.data_engine.get_enriched_quotes()` if available; otherwise falls back to per-symbol calls.
+    Returns: { SYMBOL: quote_dict }
+    """
+    de = DEPS.data_engine
+    if de is None:
+        return {s: {"error": "core.data_engine not available"} for s in symbols}
+
+    symbols = _dedupe_preserve([_norm_symbol(s) for s in symbols if _norm_symbol(s)])
+    if not symbols:
+        return {}
+
+    out: Dict[str, Dict[str, Any]] = {}
+
+    get_many = getattr(de, "get_enriched_quotes", None)
+    get_one = getattr(de, "get_enriched_quote", None)
+
+    # Batch path
+    if callable(get_many):
+        for part in _chunk(symbols, max(1, int(batch_size))):
+            try:
+                res = await _maybe_await(get_many(part, use_cache=use_cache, ttl=ttl))
+                # expected list aligned to inputs, but be defensive
+                if isinstance(res, dict):
+                    for k, v in res.items():
+                        out[_norm_symbol(k)] = _obj_to_dict(v)
+                elif isinstance(res, list):
+                    for item in res:
+                        qd = _obj_to_dict(item)
+                        sym = _coerce_symbol_from_quote(qd)
+                        if not sym:
+                            continue
+                        out[sym] = qd
+                else:
+                    # unexpected
+                    for s in part:
+                        out[s] = {"error": f"unexpected get_enriched_quotes type: {type(res).__name__}"}
+            except Exception as e:
+                for s in part:
+                    out[s] = {"error": f"get_enriched_quotes failed: {e}"}
+
+        # fill missing with per-symbol (rare)
+        missing = [s for s in symbols if s not in out]
+        if missing and callable(get_one):
+            for s in missing:
+                try:
+                    q = await _maybe_await(get_one(s, use_cache=use_cache, ttl=ttl))
+                    out[s] = _obj_to_dict(q)
+                except Exception as e:
+                    out[s] = {"error": f"get_enriched_quote failed: {e}"}
+
+        return out
+
+    # Fallback per-symbol path
+    if callable(get_one):
+        sem = asyncio.Semaphore(24)
+
+        async def one(s: str) -> Tuple[str, Dict[str, Any]]:
+            async with sem:
+                try:
+                    q = await _maybe_await(get_one(s, use_cache=use_cache, ttl=ttl))
+                    return s, _obj_to_dict(q)
+                except Exception as e:
+                    return s, {"error": f"get_enriched_quote failed: {e}"}
+
+        pairs = await asyncio.gather(*[one(s) for s in symbols], return_exceptions=False)
+        return {s: q for s, q in pairs}
+
+    return {s: {"error": "No core.data_engine quote functions available"} for s in symbols}
+
+
+# -----------------------------------------------------------------------------
+# Audit logic
+# -----------------------------------------------------------------------------
+def _coerce_confidence_pct(x: Any) -> float:
+    v = _safe_float(x, 0.0) or 0.0
+    # if 0..1 → convert
+    return float(v * 100.0) if 0.0 <= v <= 1.0 else float(v)
+
+
+def _infer_history_points(q: Dict[str, Any]) -> int:
+    if "history_points" in q:
+        return _safe_int(q.get("history_points"), 0)
+    if "history_len" in q:
+        return _safe_int(q.get("history_len"), 0)
+    h = q.get("history")
+    if isinstance(h, list):
+        return len(h)
+    return 0
+
+
+def _derive_provider(q: Dict[str, Any]) -> str:
+    return str(q.get("data_source") or q.get("provider") or "unknown").strip() or "unknown"
+
+
+def _detect_basic_anomalies(q: Dict[str, Any], config: AuditConfig) -> List[AnomalyType]:
+    anomalies: List[AnomalyType] = []
+    chg = _safe_float(q.get("percent_change") or q.get("change_pct"), None)
+    if chg is not None and abs(chg) >= max(30.0, config.max_abs_change_pct * 0.75):
+        anomalies.append(AnomalyType.PRICE_SPIKE)
+    vol = _safe_float(q.get("volume"), None)
+    if vol is not None and vol >= 2_000_000:
+        anomalies.append(AnomalyType.VOLUME_SURGE)
+    age = _age_hours(q.get("last_updated_utc"))
+    if age is not None and age >= config.stale_hours:
+        anomalies.append(AnomalyType.STALE_DATA)
+    if q.get("error"):
+        anomalies.append(AnomalyType.MISSING_DATA)
+    return anomalies
+
+
+def _remediation_for_issues(issues: List[str]) -> List[RemediationAction]:
+    actions: List[RemediationAction] = []
+    for i in issues[:3]:
+        if i in {"ZERO_PRICE", "PROVIDER_ERROR", "HARD_STALE_DATA"}:
+            actions.append(
+                RemediationAction(
+                    issue=i,
+                    action="Failover provider / trigger rescue path / bypass cache",
+                    priority=AlertPriority.P1,
+                    estimated_time_minutes=10,
+                    automated=True,
+                )
+            )
+        elif i in {"STALE_DATA"}:
+            actions.append(
+                RemediationAction(
+                    issue=i,
+                    action="Lower cache TTL / verify provider update frequency",
+                    priority=AlertPriority.P3,
+                    estimated_time_minutes=30,
+                    automated=False,
+                )
+            )
+        elif i in {"INSUFFICIENT_HISTORY"}:
+            actions.append(
+                RemediationAction(
+                    issue=i,
+                    action="Use shorter indicators window / mark as recently listed",
+                    priority=AlertPriority.P4,
+                    estimated_time_minutes=15,
+                    automated=False,
+                )
+            )
+        else:
+            actions.append(
+                RemediationAction(
+                    issue=i,
+                    action="Review and validate mapping keys",
+                    priority=AlertPriority.P4,
+                    estimated_time_minutes=20,
+                    automated=False,
+                )
+            )
+    return actions
+
+
+def _compute_quality_score(q: Dict[str, Any], config: AuditConfig) -> Tuple[float, DataQuality]:
+    score = 100.0
+    price = _safe_float(q.get("current_price") or q.get("price"), None)
+    if price is None:
+        score -= 35
+    elif price <= 0 or price < config.min_price:
+        score -= 25
+    elif price > config.max_price:
+        score -= 10
+
+    age = _age_hours(q.get("last_updated_utc"))
+    if age is None:
+        score -= 20
+    elif age > config.hard_stale_hours:
+        score -= 25
+    elif age > config.stale_hours:
+        score -= 12
+
+    if q.get("error"):
+        score -= 30
+
+    hist = _infer_history_points(q)
+    if hist < config.min_history_points_hard:
+        score -= 20
+    elif hist < config.min_history_points_soft:
+        score -= 8
+
+    conf = _coerce_confidence_pct(q.get("forecast_confidence"))
+    if 0 < conf < config.min_confidence_pct:
+        score -= 5
+
+    score = float(max(0.0, min(100.0, score)))
+    if score >= 90:
+        return score, DataQuality.EXCELLENT
+    if score >= 75:
+        return score, DataQuality.GOOD
+    if score >= 60:
+        return score, DataQuality.FAIR
+    if score >= 40:
+        return score, DataQuality.POOR
+    return score, DataQuality.CRITICAL
+
+
+def _compute_severity(issues: List[str], quality: DataQuality) -> AuditSeverity:
+    if any(i in {"PROVIDER_ERROR", "ZERO_PRICE", "HARD_STALE_DATA", "ZOMBIE_TICKER"} for i in issues):
+        return AuditSeverity.CRITICAL
+    if issues and quality in {DataQuality.POOR, DataQuality.CRITICAL}:
+        return AuditSeverity.HIGH
+    if issues:
+        return AuditSeverity.MEDIUM
+    return AuditSeverity.OK
+
+
+def _compute_provider_health(q: Dict[str, Any], config: AuditConfig) -> ProviderHealth:
+    if q.get("error"):
+        return ProviderHealth.UNHEALTHY
+    age = _age_hours(q.get("last_updated_utc"))
+    if age is None:
+        return ProviderHealth.UNKNOWN
+    if age > config.hard_stale_hours:
+        return ProviderHealth.UNHEALTHY
+    if age > config.stale_hours:
+        return ProviderHealth.DEGRADED
+    return ProviderHealth.HEALTHY
+
+
+async def _audit_one(
+    symbol: str,
+    page: str,
+    q: Dict[str, Any],
+    config: AuditConfig,
+) -> AuditResult:
+    symbol_n = _norm_symbol(symbol) or symbol
+    provider = _derive_provider(q)
+    price = _safe_float(q.get("current_price") or q.get("price"), None)
+    chg_pct = _safe_float(q.get("percent_change") or q.get("change_pct"), None)
+    volume = _safe_int(q.get("volume"), 0) or None
+    mcap = _safe_float(q.get("market_cap"), None)
+    last_upd = safe_str(q.get("last_updated_utc") or q.get("forecast_updated_utc") or q.get("timestamp_utc"))
+    age = _age_hours(last_upd) if last_upd else _age_hours(q.get("last_updated_utc"))
+
+    issues: List[str] = []
+
+    if price is None or price < config.min_price:
+        issues.append("ZERO_PRICE")
+    if price is not None and price > config.max_price:
+        issues.append("PRICE_TOO_HIGH")
+
+    if age is None:
+        issues.append("NO_TIMESTAMP")
+    elif age > config.hard_stale_hours:
+        issues.append("HARD_STALE_DATA")
+    elif age > config.stale_hours:
+        issues.append("STALE_DATA")
+
+    hist_pts = _infer_history_points(q)
+    if hist_pts < config.min_history_points_hard:
+        issues.append("INSUFFICIENT_HISTORY")
+
+    if chg_pct is not None and abs(chg_pct) > config.max_abs_change_pct:
+        issues.append("EXTREME_DAILY_MOVE")
+
+    if q.get("error"):
+        issues.append("PROVIDER_ERROR")
+
+    # zombie heuristic
+    dq_raw = str(q.get("data_quality") or "").strip().upper()
+    if ("ZERO_PRICE" in issues and ("STALE_DATA" in issues or "HARD_STALE_DATA" in issues)) or dq_raw in {"MISSING", "BAD"}:
+        issues.append("ZOMBIE_TICKER")
+
+    quality_score, quality = _compute_quality_score(q, config)
+    anomalies = _detect_basic_anomalies(q, config)
+    severity = _compute_severity(issues, quality)
+    phealth = _compute_provider_health(q, config)
+
+    strategy_notes: List[str] = []
+    # minimal strategy flags (safe, optional fields)
+    r1w = _safe_float(q.get("returns_1w"), None)
+    trend = str(q.get("trend_signal") or "").strip().upper()
+    if trend == "UPTREND" and r1w is not None and r1w < -4.0:
+        strategy_notes.append("TREND_BREAK_BEAR")
+    if trend == "DOWNTREND" and r1w is not None and r1w > 4.0:
+        strategy_notes.append("TREND_BREAK_BULL")
+
+    remediation = _remediation_for_issues(issues)
+
+    return AuditResult(
+        symbol=symbol_n,
+        page=page,
+        provider=provider,
+        severity=severity,
+        data_quality=quality,
+        provider_health=phealth,
+        price=price,
+        change_pct=chg_pct,
+        volume=volume,
+        market_cap=mcap,
+        age_hours=age,
+        last_updated_utc=last_upd,
+        last_updated_riyadh=_riyadh_iso(last_upd) if last_upd else _riyadh_iso(),
+        history_points=hist_pts,
+        confidence_pct=round(_coerce_confidence_pct(q.get("forecast_confidence")), 1),
+        issues=_dedupe_preserve(issues),
+        strategy_notes=_dedupe_preserve(strategy_notes),
+        anomalies=list(dict.fromkeys(anomalies)),  # keep order, unique
+        remediation_actions=remediation,
+        root_cause=("Provider data unavailable" if "PROVIDER_ERROR" in issues else None),
+        error=safe_str(q.get("error")),
+    )
+
+
+def _generate_summary(results: List[AuditResult]) -> AuditSummary:
+    s = AuditSummary()
+    s.total_assets = len(results)
+    for r in results:
+        s.by_severity[r.severity.value] = s.by_severity.get(r.severity.value, 0) + 1
+        s.by_quality[r.data_quality.value] = s.by_quality.get(r.data_quality.value, 0) + 1
+        s.by_provider_health[r.provider_health.value] = s.by_provider_health.get(r.provider_health.value, 0) + 1
+        for issue in r.issues:
+            s.issue_counts[issue] = s.issue_counts.get(issue, 0) + 1
+        for an in r.anomalies:
+            s.anomaly_counts[an.value] = s.anomaly_counts.get(an.value, 0) + 1
+    return s
+
+
+# -----------------------------------------------------------------------------
+# Exporters (async-safe)
+# -----------------------------------------------------------------------------
+def _maybe_sign_json(payload: Dict[str, Any]) -> Dict[str, Any]:
+    key = (os.getenv("AUDIT_HMAC_KEY") or "").strip()
+    if not key:
+        return payload
+    try:
+        body = json_dumps(payload).encode("utf-8")
+        sig = hmac.new(key.encode("utf-8"), body, hashlib.sha256).hexdigest()
+        payload2 = dict(payload)
+        payload2["_hmac_sha256"] = sig
+        return payload2
+    except Exception:
+        return payload
+
+
+async def _export_json(path: str, data: Dict[str, Any]) -> None:
+    loop = asyncio.get_running_loop()
+    payload = _maybe_sign_json(data)
+
+    def _write():
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(json_dumps(payload))
+
+    await loop.run_in_executor(_CPU_EXECUTOR, _write)
+
+
+async def _export_csv(path: str, results: List[AuditResult]) -> None:
+    if not results:
+        return
+    loop = asyncio.get_running_loop()
+    headers = [
+        "symbol",
+        "page",
+        "provider",
+        "severity",
+        "data_quality",
+        "provider_health",
+        "price",
+        "change_pct",
+        "age_hours",
+        "history_points",
+        "confidence_pct",
+        "issues",
+        "anomalies",
+        "error",
+        "last_updated_utc",
+    ]
+
+    def _write():
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=headers)
+            w.writeheader()
+            for r in results:
+                d = r.to_dict()
+                row = {
+                    "symbol": d.get("symbol"),
+                    "page": d.get("page"),
+                    "provider": d.get("provider"),
+                    "severity": d.get("severity"),
+                    "data_quality": d.get("data_quality"),
+                    "provider_health": d.get("provider_health"),
+                    "price": d.get("price"),
+                    "change_pct": d.get("change_pct"),
+                    "age_hours": d.get("age_hours"),
+                    "history_points": d.get("history_points"),
+                    "confidence_pct": d.get("confidence_pct"),
+                    "issues": ", ".join(d.get("issues") or []),
+                    "anomalies": ", ".join(d.get("anomalies") or []),
+                    "error": d.get("error"),
+                    "last_updated_utc": d.get("last_updated_utc"),
+                }
+                w.writerow(row)
+
+    await loop.run_in_executor(_CPU_EXECUTOR, _write)
+
+
+async def _export_parquet(path: str, results: List[AuditResult]) -> None:
+    if not (_HAS_PARQUET and _HAS_PANDAS and results):
+        return
+    loop = asyncio.get_running_loop()
+
+    def _write():
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        df = pd.DataFrame([r.to_dict() for r in results])  # type: ignore
+        table = pa.Table.from_pandas(df)  # type: ignore
+        pq.write_table(table, path)  # type: ignore
+
+    await loop.run_in_executor(_CPU_EXECUTOR, _write)
+
+
+async def _export_excel(path: str, results: List[AuditResult], summary: AuditSummary) -> None:
+    if not _HAS_PANDAS:
+        return
+    loop = asyncio.get_running_loop()
+
+    def _write():
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        with pd.ExcelWriter(path, engine="openpyxl") as writer:  # type: ignore
+            pd.DataFrame([r.to_dict() for r in results]).to_excel(writer, sheet_name="Audit Results", index=False)  # type: ignore
+            pd.DataFrame([summary.to_dict()]).to_excel(writer, sheet_name="Summary", index=False)  # type: ignore
+
+    await loop.run_in_executor(_CPU_EXECUTOR, _write)
+
+
+# -----------------------------------------------------------------------------
+# Orchestrator
+# -----------------------------------------------------------------------------
+async def run_audit(
+    *,
+    keys: List[str],
+    spreadsheet_id: str,
+    refresh: bool,
+    concurrency: int,
+    max_symbols_per_page: int,
+    config: AuditConfig,
+) -> Tuple[List[AuditResult], AuditSummary]:
+    if not DEPS.ok:
+        logger.error("Dependencies not loaded. symbols_reader=%s, data_engine=%s, err=%s", bool(DEPS.symbols_reader), bool(DEPS.data_engine), DEPS.err)
+        return [], AuditSummary()
+
+    sid = (spreadsheet_id or os.getenv("DEFAULT_SPREADSHEET_ID", "")).strip()
+    if not sid:
+        logger.error("No spreadsheet_id provided and DEFAULT_SPREADSHEET_ID is empty.")
+        return [], AuditSummary()
+
+    # refresh => bypass cache
+    use_cache = not bool(refresh)
+    ttl = None  # leave None to respect engine defaults
+
+    batch_size = max(50, int(os.getenv("AUDIT_BATCH_SIZE", "200")))
+    sem = asyncio.Semaphore(max(1, int(concurrency)))
+
+    all_results: List[AuditResult] = []
+    start = time.time()
+
+    for key in keys:
+        page_key = (key or "").strip()
+        if not page_key:
+            continue
+
+        symbols = _get_page_symbols(DEPS.symbols_reader, page_key, sid)
+        symbols = _dedupe_preserve(symbols)
+        if max_symbols_per_page > 0:
+            symbols = symbols[: max_symbols_per_page]
+
+        if not symbols:
+            logger.warning("No symbols for page=%s", page_key)
+            continue
+
+        logger.info("Page=%s | symbols=%s | use_cache=%s", page_key, len(symbols), use_cache)
+
+        quotes_map = await _fetch_quotes_map(symbols, use_cache=use_cache, ttl=ttl, batch_size=batch_size)
+
+        async def audit_one(sym: str) -> AuditResult:
+            async with sem:
+                q = quotes_map.get(sym) or {}
+                return await _audit_one(sym, page_key, q, config)
+
+        page_results = await asyncio.gather(*[audit_one(s) for s in symbols], return_exceptions=False)
+        all_results.extend(page_results)
+
+    summary = _generate_summary(all_results)
+    summary.audit_duration_ms = (time.time() - start) * 1000.0
+    return all_results, summary
+
+
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
+def main() -> None:
+    p = argparse.ArgumentParser(description="TFB Data Quality Auditor")
+    p.add_argument("--keys", nargs="*", default=["MARKET_LEADERS"], help="Sheet page keys to audit (e.g., MARKET_LEADERS)")
+    p.add_argument("--sheet-id", dest="sheet_id", default="", help="Google Sheet ID (fallback: DEFAULT_SPREADSHEET_ID)")
+    p.add_argument("--refresh", type=int, default=1, help="1=bypass cache (fresh), 0=use cache")
+    p.add_argument("--concurrency", type=int, default=12)
+    p.add_argument("--max-symbols", type=int, default=0, help="limit symbols per page (0=all)")
+    p.add_argument("--json-out", default="", help="write JSON report")
+    p.add_argument("--csv-out", default="", help="write CSV alerts")
+    p.add_argument("--parquet-out", default="", help="write Parquet (optional deps)")
+    p.add_argument("--excel-out", default="", help="write Excel (requires pandas+openpyxl)")
+    args = p.parse_args()
+
+    config = AuditConfig()
+
+    t0 = time.time()
+    results, summary = asyncio.run(
+        run_audit(
+            keys=list(args.keys or []),
+            spreadsheet_id=args.sheet_id,
+            refresh=bool(args.refresh),
+            concurrency=int(args.concurrency),
+            max_symbols_per_page=int(args.max_symbols),
+            config=config,
+        )
+    )
+    summary.audit_duration_ms = (time.time() - t0) * 1000.0
+
+    alerts = [r for r in results if r.severity != AuditSeverity.OK]
+
+    # Exports
+    export_tasks: List[Awaitable[None]] = []
+    if args.json_out:
+        export_tasks.append(_export_json(args.json_out, {"summary": summary.to_dict(), "results": [r.to_dict() for r in results], "alerts": [r.to_dict() for r in alerts]}))
+    if args.csv_out:
+        export_tasks.append(_export_csv(args.csv_out, alerts))
+    if args.parquet_out:
+        export_tasks.append(_export_parquet(args.parquet_out, results))
+    if args.excel_out:
+        export_tasks.append(_export_excel(args.excel_out, results, summary))
+
+    if export_tasks:
+        asyncio.run(asyncio.gather(*export_tasks))
+
+    logger.info(
+        "Audit Complete | assets=%s | critical=%s | high=%s | medium=%s | duration_ms=%.0f",
+        summary.total_assets,
+        summary.by_severity.get("CRITICAL", 0),
+        summary.by_severity.get("HIGH", 0),
+        summary.by_severity.get("MEDIUM", 0),
+        summary.audit_duration_ms,
+    )
+
+    # Exit code policy
+    exit_code = 0
+    if summary.by_severity.get("CRITICAL", 0) > 0:
+        exit_code = 3
+    elif summary.by_severity.get("HIGH", 0) > 0:
+        exit_code = 2
+    elif summary.by_severity.get("MEDIUM", 0) > 0:
+        exit_code = 1
+
+    try:
+        _CPU_EXECUTOR.shutdown(wait=False, cancel_futures=True)  # py3.9+
+    except Exception:
+        try:
+            _CPU_EXECUTOR.shutdown(wait=False)
         except Exception:
             pass
 
-def _mount_with_prefix_normalization(app: FastAPI, child: APIRouter, expected_prefix: str) -> str:
-    child_prefix = (getattr(child, "prefix", "") or "").strip()
+    raise SystemExit(exit_code)
 
-    if not expected_prefix:
-        app.include_router(child)
-        return child_prefix or "/"
-
-    if not child_prefix or child_prefix == "/":
-        app.include_router(child, prefix=expected_prefix)
-        return expected_prefix
-
-    if child_prefix == expected_prefix or child_prefix.startswith(expected_prefix + "/"):
-        app.include_router(child)
-        return child_prefix
-
-    if expected_prefix.endswith(child_prefix) and expected_prefix.startswith("/v1/"):
-        with _temp_router_prefix(child, ""):
-            app.include_router(child, prefix=expected_prefix)
-        return expected_prefix
-
-    boot_logger.warning(
-        f"Router prefix mismatch: expected='{expected_prefix}' but router.prefix='{child_prefix}'. Mounting as-is."
-    )
-    app.include_router(child)
-    return child_prefix or "/"
-
-def mount_routers_once(app: FastAPI) -> Dict[str, Any]:
-    if not hasattr(app.state, "mounted_router_modules"):
-        app.state.mounted_router_modules = set()
-
-    report: Dict[str, Any] = {"mounted": [], "failed": []}
-
-    for spec in ROUTER_PLAN:
-        mounted, last_error = False, ""
-        for module_path in spec.candidates:
-            if module_path in app.state.mounted_router_modules:
-                mounted = True
-                break
-
-            module = safe_import(module_path)
-            if not module:
-                last_error = "no module found"
-                continue
-
-            router = _find_any_apirouter(module)
-            if not router:
-                last_error = f"no APIRouter found in {module_path}"
-                continue
-
-            try:
-                applied_prefix = _mount_with_prefix_normalization(app, router, spec.expected_prefix)
-                app.state.mounted_router_modules.add(module_path)
-                boot_logger.info(f"✅ Mounted {spec.label} via {module_path} (Prefix: {applied_prefix})")
-                report["mounted"].append({"label": spec.label, "module": module_path, "prefix": applied_prefix})
-                mounted = True
-                break
-            except Exception as e:
-                last_error = str(e)
-
-        if not mounted:
-            if spec.required:
-                boot_logger.warning(f"⚠️ Router '{spec.label}' not mounted: {last_error or 'not found'}")
-            else:
-                boot_logger.info(f"ℹ️ Optional router '{spec.label}' not mounted: {last_error or 'not found'}")
-            report["failed"].append({"label": spec.label, "error": last_error or "not found"})
-
-    app.state.router_report = report
-    return report
-
-# =============================================================================
-# Engine bootstrap
-# =============================================================================
-async def init_engine_resilient(app: FastAPI, max_retries: int = 3) -> None:
-    app.state.engine_ready = False
-    app.state.engine_error = None
-
-    for attempt in range(max_retries):
-        try:
-            engine_module = safe_import("core.data_engine_v2") or safe_import("core.data_engine")
-            if not engine_module or not hasattr(engine_module, "get_engine"):
-                app.state.engine_error = "Engine module not available"
-                boot_logger.warning(app.state.engine_error)
-                return
-
-            get_engine_fn = getattr(engine_module, "get_engine")
-            engine = await get_engine_fn() if asyncio.iscoroutinefunction(get_engine_fn) else get_engine_fn()
-
-            if engine:
-                app.state.engine = engine
-                app.state.engine_ready = True
-                app.state.engine_error = None
-                boot_logger.info(f"Data Engine ready: {type(engine).__name__}")
-                return
-
-            raise RuntimeError("Engine returned None")
-        except Exception as e:
-            boot_logger.warning(f"Engine boot attempt {attempt+1}/{max_retries} failed: {e}")
-            if attempt < max_retries - 1:
-                base_wait = 2 ** attempt
-                await asyncio.sleep(min(10.0, base_wait + random.uniform(0, base_wait)))
-
-    app.state.engine_ready = False
-    app.state.engine_error = "CRITICAL: Engine failed to initialize after retries"
-    boot_logger.error(app.state.engine_error)
-
-# =============================================================================
-# App Factory
-# =============================================================================
-def create_app() -> FastAPI:
-    app_env = get_env_str("APP_ENV", "production")
-    app_name = get_env_str("APP_NAME", "Tadawul Fast Bridge")
-    app_version = get_env_str("APP_VERSION", APP_ENTRY_VERSION)
-
-    limiter = None
-    if SLOWAPI_AVAILABLE and get_env_bool("ENABLE_RATE_LIMITING", True):
-        rpm = get_env_int("MAX_REQUESTS_PER_MINUTE", 240)
-        limiter = Limiter(
-            key_func=get_remote_address,
-            default_limits=[f"{rpm} per minute"],
-            storage_uri=get_env_str("REDIS_URL") if get_env_str("RATE_LIMIT_BACKEND") == "redis" else "memory://",
-        )
-
-    @asynccontextmanager
-    async def lifespan(app: FastAPI):
-        guardian_task = asyncio.create_task(guardian.monitor_loop())
-
-        async def boot():
-            await asyncio.sleep(0)
-            if get_env_bool("INIT_ENGINE_ON_BOOT", True):
-                await init_engine_resilient(app, max_retries=get_env_int("MAX_RETRIES", 3))
-            gc.collect()
-            boot_logger.info(f"🚀 Ready v{app_version} | entry={APP_ENTRY_VERSION} | env={app_env} | mem={guardian.memory_mb:.1f}MB")
-
-        boot_task = asyncio.create_task(boot())
-        yield
-        guardian.stop()
-        for t in (boot_task, guardian_task):
-            t.cancel()
-        await asyncio.gather(boot_task, guardian_task, return_exceptions=True)
-
-    # Disable FastAPI built-in docs; we provide custom unpkg docs
-    app = FastAPI(
-        title=app_name,
-        version=app_version,
-        description="Tadawul Fast Bridge API - Enterprise Market Data Platform",
-        lifespan=lifespan,
-        docs_url=None,
-        redoc_url=None,
-        default_response_class=BestJSONResponse,
-    )
-
-    # Rate limiting
-    if limiter is not None:
-        app.state.limiter = limiter
-        app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-        app.add_middleware(SlowAPIMiddleware)
-
-    # Middlewares (auth bridge added LAST to run FIRST)
-    app.add_middleware(TelemetryMiddleware)
-    app.add_middleware(GZipMiddleware, minimum_size=512)
-    app.add_middleware(CompressionMiddleware)
-
-    allow_origins = ["*"] if get_env_bool("ENABLE_CORS_ALL_ORIGINS", True) else get_env_list("CORS_ORIGINS", ["*"])
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=allow_origins,
-        allow_methods=["*"],
-        allow_headers=["*"],
-        allow_credentials=False,
-        expose_headers=["X-Request-ID", "X-Process-Time", "X-Time-Riyadh", "Server-Timing"],
-        max_age=600,
-    )
-
-    if app_env == "production":
-        app.add_middleware(TrustedHostMiddleware, allowed_hosts=get_env_list("ALLOWED_HOSTS", ["*"]))
-
-    # Sentry (optional)
-    sentry_dsn = get_env_str("SENTRY_DSN").strip()
-    if SENTRY_AVAILABLE and sentry_dsn and is_valid_uri(sentry_dsn):
-        try:
-            sentry_sdk.init(
-                dsn=sentry_dsn,
-                environment=app_env,
-                release=app_version,
-                traces_sample_rate=get_env_float("SENTRY_TRACES_SAMPLE_RATE", 0.1),
-                integrations=[LoggingIntegration(level=logging.INFO, event_level=logging.ERROR)],
-            )
-            if SentryAsgiMiddleware:
-                app.add_middleware(SentryAsgiMiddleware)
-        except Exception as e:
-            boot_logger.error(f"Failed to initialize Sentry: {e}")
-
-    # OpenTelemetry (optional)
-    if TRACING_AVAILABLE and get_env_bool("ENABLE_TRACING", False):
-        try:
-            provider = TracerProvider(resource=Resource(attributes={SERVICE_NAME: app_name}))
-            endpoint = get_env_str("OTLP_ENDPOINT")
-            if endpoint:
-                exporter = OTLPSpanExporter(endpoint=endpoint)
-                provider.add_span_processor(BatchSpanProcessor(exporter))
-            trace.set_tracer_provider(provider)
-            FastAPIInstrumentor.instrument_app(app)
-        except Exception as e:
-            boot_logger.error(f"Failed to initialize OpenTelemetry: {e}")
-
-    # Custom Swagger UI (unpkg)
-    if get_env_bool("ENABLE_SWAGGER", True):
-        @app.get("/docs", include_in_schema=False)
-        async def custom_docs() -> HTMLResponse:
-            return get_swagger_ui_html(
-                openapi_url=app.openapi_url,
-                title=f"{app.title} - Swagger UI",
-                oauth2_redirect_url="/docs/oauth2-redirect",
-                swagger_js_url="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js",
-                swagger_css_url="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css",
-            )
-
-        @app.get("/docs/oauth2-redirect", include_in_schema=False)
-        async def docs_redirect() -> HTMLResponse:
-            return get_swagger_ui_oauth2_redirect_html()
-
-    if get_env_bool("ENABLE_REDOC", True):
-        @app.get("/redoc", include_in_schema=False)
-        async def custom_redoc() -> HTMLResponse:
-            return get_redoc_html(
-                openapi_url=app.openapi_url,
-                title=f"{app.title} - ReDoc",
-                redoc_js_url="https://unpkg.com/redoc@next/bundles/redoc.standalone.js",
-            )
-
-    # Mount routers
-    mount_routers_once(app)
-
-    # Prometheus
-    if PROMETHEUS_AVAILABLE and get_env_bool("ENABLE_METRICS", True):
-        @app.get("/metrics", include_in_schema=False)
-        async def metrics_endpoint():
-            return Response(content=generate_latest(), media_type="text/plain; version=0.0.4; charset=utf-8")
-
-    @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
-    async def root():
-        return {
-            "status": "online",
-            "service": app_name,
-            "version": app_version,
-            "entry_version": APP_ENTRY_VERSION,
-            "environment": app_env,
-            "time_riyadh": now_riyadh_iso(),
-            "documentation": "/docs",
-        }
-
-    @app.get("/health", tags=["system"])
-    async def health(request: Request):
-        return {
-            "status": "healthy" if getattr(app.state, "engine_ready", False) and not guardian.degraded_mode else "degraded",
-            "service": {"name": app_name, "version": app_version, "entry_version": APP_ENTRY_VERSION, "environment": app_env},
-            "vitals": guardian.to_dict()["metrics"],
-            "boot": {"engine_ready": getattr(app.state, "engine_ready", False)},
-            "routers": getattr(app.state, "router_report", {"mounted": [], "failed": []}),
-            "request_id": getattr(request.state, "request_id", get_request_id()),
-        }
-
-    @app.get("/debug/routes", tags=["system"])
-    async def debug_routes(request: Request):
-        return {
-            "total_routes": len(app.routes),
-            "paths": [route.path for route in app.routes if isinstance(route, APIRoute)],
-        }
-
-    # Exception handlers (keep request_id stable)
-    @app.exception_handler(StarletteHTTPException)
-    async def http_exception_handler(request: Request, exc: StarletteHTTPException):
-        rid = getattr(request.state, "request_id", None) or get_request_id()
-        resp = BestJSONResponse(
-            status_code=exc.status_code,
-            content={"status": "error", "message": exc.detail, "request_id": rid, "time_riyadh": now_riyadh_iso()},
-        )
-        resp.headers["X-Request-ID"] = rid
-        return resp
-
-    @app.exception_handler(RequestValidationError)
-    async def validation_exception_handler(request: Request, exc: RequestValidationError):
-        rid = getattr(request.state, "request_id", None) or get_request_id()
-        resp = BestJSONResponse(
-            status_code=422,
-            content={"status": "error", "message": "Validation error", "details": exc.errors(), "request_id": rid},
-        )
-        resp.headers["X-Request-ID"] = rid
-        return resp
-
-    @app.exception_handler(Exception)
-    async def unhandled_exception_handler(request: Request, exc: Exception):
-        rid = getattr(request.state, "request_id", None) or get_request_id()
-        logger.error(f"Unhandled exception on {request.url.path}: {traceback.format_exc()}")
-        resp = BestJSONResponse(
-            status_code=500,
-            content={"status": "error", "message": f"Internal Server Error: {exc}", "request_id": rid},
-        )
-        resp.headers["X-Request-ID"] = rid
-        return resp
-
-    # Add Auth Bridge LAST so it runs FIRST
-    app.add_middleware(AuthHeaderBridgeMiddleware)
-
-    return app
-
-
-app = create_app()
 
 if __name__ == "__main__":
-    import uvicorn
-    port = get_env_int("PORT", 8000)
-    host = get_env_str("HOST", "0.0.0.0")
-    workers = get_env_int("WORKER_COUNT", 1)
-
-    uvicorn.run(
-        "main:app",
-        host=host,
-        port=port,
-        workers=workers,
-        log_level=get_env_str("LOG_LEVEL", "info").lower(),
-        proxy_headers=True,
-        forwarded_allow_ips="*",
-        timeout_keep_alive=get_env_int("KEEPALIVE_TIMEOUT", 65),
-        timeout_graceful_shutdown=get_env_int("GRACEFUL_TIMEOUT", 30),
-        access_log=get_env_bool("UVICORN_ACCESS_LOG", False),
-        server_header=False,
-        date_header=True,
-    )
+    main()
