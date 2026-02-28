@@ -1,885 +1,973 @@
 #!/usr/bin/env python3
-# core/providers/yahoo_chart_provider.py
 """
-================================================================================
-Yahoo Finance Provider (Global Market Data) — v6.12.0 (QUANTUM EDITION)
-================================================================================
+core/yahoo_chart_provider.py
+===========================================================
+YAHOO CHART SHIM — v3.2.0 (SAFE · FAST · FULL COMPATIBILITY)
+===========================================================
+Emad Bahbah – Production Architecture
 
-What's new in v6.12.0:
-- ✅ Import Poisoning Fix: Safely guarded `import numpy as np` to prevent fatal `ModuleNotFoundError` crashes in constrained PaaS environments.
-- ✅ Pure-Python Mathematics: Built native Python fallbacks for Standard Deviation, RSI, MACD, Bollinger Bands, and Drift Forecasting. If `numpy`/`scipy` fail to load, the engine seamlessly degrades to pure Python math to guarantee data completeness.
-- ✅ Null-Safe Iterable Extraction: Fixed `TypeError: 'NoneType'` caused by explicit `null` arrays.
-- ✅ Thread Starvation Prevention: Enforced a dual-layer timeout shield combining `TimeoutHTTPAdapter` and `asyncio.wait_for`.
-- ✅ Anti-Bot Bypass: Added `YahooCrumbManager` to safely acquire session cookies and crumbs.
+Goals
+- Zero downtime compatibility layer for legacy imports -> canonical provider
+- Render-safe import behavior (no event-loop work at import time)
+- Strict hygiene: no stdout helpers except sys.stdout.write in __main__
+- Fast hot-path: cached signature inspection + singleflight provider load
+- Resiliency: circuit breaker + full-jitter retry
+- Observability: OpenTelemetry spans + Prometheus metrics (optional)
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
-import concurrent.futures
-import hashlib
-import json
+import functools
+import inspect
 import logging
-import math
 import os
-import pickle
 import random
-import re
 import sys
-import time
 import threading
-import urllib.request
-import urllib.error
-import warnings
-import zlib
-from collections import defaultdict, deque
-from dataclasses import asdict, dataclass, field, replace
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from enum import Enum, auto
-from functools import lru_cache, partial, wraps
-from typing import (Any, AsyncGenerator, Awaitable, Callable, Dict, List, Optional,
-                    Set, Tuple, Type, TypeVar, Union, cast, overload)
-from urllib.parse import quote_plus, urlencode, urljoin
+from enum import Enum
+from functools import lru_cache
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, TypeVar, Union
 
 # =============================================================================
-# Optional Dependencies with Graceful Degradation
+# Versioning / constants
 # =============================================================================
 
-try:
-    import numpy as np
-    NUMPY_AVAILABLE = True
-except ImportError:
-    np = None
-    NUMPY_AVAILABLE = False
+SHIM_VERSION = "3.2.0"
+DATA_SOURCE = "yahoo_chart"
+CANONICAL_IMPORT_PATHS = (
+    "core.providers.yahoo_chart_provider",
+    "providers.yahoo_chart_provider",
+)
+MIN_CANONICAL_VERSION = "0.4.0"
 
-try:
-    import pandas as pd
-    PANDAS_AVAILABLE = True
-except ImportError:
-    PANDAS_AVAILABLE = False
+UTC = timezone.utc
+RIYADH = timezone(timedelta(hours=3))
 
-try:
-    from scipy import stats, signal
-    SCIPY_AVAILABLE = True
-except ImportError:
-    SCIPY_AVAILABLE = False
+_T = TypeVar("_T")
 
-try:
-    from sklearn.ensemble import (RandomForestRegressor, RandomForestClassifier,
-                                  GradientBoostingRegressor, IsolationForest)
-    from sklearn.preprocessing import StandardScaler, RobustScaler, MinMaxScaler
-    SKLEARN_AVAILABLE = True
-except ImportError:
-    SKLEARN_AVAILABLE = False
-
-# Deep Learning
-try:
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
-    from torch.utils.data import DataLoader, TensorDataset
-    TORCH_AVAILABLE = True
-except ImportError:
-    TORCH_AVAILABLE = False
-
-# XGBoost
-try:
-    import xgboost as xgb
-    XGBOOST_AVAILABLE = True
-except ImportError:
-    XGBOOST_AVAILABLE = False
-
-# Time Series Analysis
-try:
-    import statsmodels.api as sm
-    from statsmodels.tsa.arima.model import ARIMA
-    STATSMODELS_AVAILABLE = True
-except ImportError:
-    STATSMODELS_AVAILABLE = False
-
-# Database/Redis
-try:
-    import redis.asyncio as redis
-    from redis.asyncio import Redis
-    from redis.asyncio.client import Pipeline
-    from redis.asyncio.connection import ConnectionPool
-    REDIS_AVAILABLE = True
-except ImportError:
-    REDIS_AVAILABLE = False
-
-try:
-    import aioredis
-    AIOREDIS_AVAILABLE = True
-except ImportError:
-    AIOREDIS_AVAILABLE = False
-
-# Monitoring
-try:
-    from prometheus_client import Counter, Gauge, Histogram, Summary
-    from prometheus_client.exposition import generate_latest
-    PROMETHEUS_AVAILABLE = True
-except ImportError:
-    PROMETHEUS_AVAILABLE = False
-
-try:
-    from opentelemetry import trace, metrics
-    from opentelemetry.trace import Status, StatusCode
-    from opentelemetry.context import attach, detach
-    OPENTELEMETRY_AVAILABLE = True
-except ImportError:
-    OPENTELEMETRY_AVAILABLE = False
-    trace = None
-
-# High-Performance JSON fallback
-try:
-    import orjson
-    def json_dumps(v: Any, *, default: Optional[Callable] = None) -> str:
-        return orjson.dumps(v, default=default or str).decode('utf-8')
-    def json_loads(v: Union[str, bytes]) -> Any:
-        return orjson.loads(v)
-    _HAS_ORJSON = True
-except ImportError:
-    import json
-    def json_dumps(v: Any, *, default: Optional[Callable] = None) -> str:
-        return json.dumps(v, default=default or str)
-    def json_loads(v: Union[str, bytes]) -> Any:
-        return json.loads(v)
-    _HAS_ORJSON = False
-
-# HTTP & Network Protection (The 110s Fix)
-try:
-    import requests
-    from requests.adapters import HTTPAdapter
-    class TimeoutHTTPAdapter(HTTPAdapter):
-        def __init__(self, *args, **kwargs):
-            self.timeout = kwargs.pop("timeout", 5.0)
-            super().__init__(*args, **kwargs)
-        def send(self, request, **kwargs):
-            kwargs["timeout"] = kwargs.get("timeout", self.timeout)
-            return super().send(request, **kwargs)
-    _REQUESTS_AVAILABLE = True
-except ImportError:
-    _REQUESTS_AVAILABLE = False
-
-# Yahoo Finance (primary data source)
-try:
-    import yfinance as yf
-    _HAS_YFINANCE = True
-except ImportError:
-    yf = None
-    _HAS_YFINANCE = False
+_TRUTHY = {"1", "true", "yes", "y", "on", "t"}
+_FALSY = {"0", "false", "no", "n", "off", "f"}
 
 
-logger = logging.getLogger("core.providers.yahoo_chart_provider")
-
-PROVIDER_NAME = "yahoo_chart"
-PROVIDER_VERSION = "6.12.0"
-
-_CPU_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=6, thread_name_prefix="YahooWorker")
-
-# =============================================================================
-# Environment Helpers
-# =============================================================================
-
-_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
-_FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled"}
-
-_KSA_CODE_RE = re.compile(r"^\d{3,6}$", re.IGNORECASE)
-_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
-
-def _env_str(name: str, default: str = "") -> str:
-    v = os.getenv(name)
-    if v is None: return default
-    s = str(v).strip()
-    return s if s else default
-
-def _env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    if v is None: return default
-    try: return int(str(v).strip())
-    except Exception: return default
-
-def _env_float(name: str, default: float) -> float:
-    v = os.getenv(name)
-    if v is None: return default
-    try: return float(str(v).strip())
-    except Exception: return default
-
-def _env_bool(name: str, default: bool) -> bool:
+def _env_bool(name: str, default: bool = False) -> bool:
     raw = (os.getenv(name) or "").strip().lower()
-    if not raw: return default
-    if raw in _FALSY: return False
-    if raw in _TRUTHY: return True
+    if not raw:
+        return default
+    if raw in _TRUTHY:
+        return True
+    if raw in _FALSY:
+        return False
     return default
 
-def _configured() -> bool:
-    if not _env_bool("YAHOO_ENABLED", True): return False
-    return True
 
-def _emit_warnings() -> bool: return _env_bool("YAHOO_VERBOSE_WARNINGS", False)
-def _enable_history() -> bool: return _env_bool("YAHOO_ENABLE_HISTORY", True)
-def _enable_forecast() -> bool: return _env_bool("YAHOO_ENABLE_FORECAST", True)
-def _enable_ml() -> bool: return _env_bool("YAHOO_ENABLE_ML", True) and SKLEARN_AVAILABLE
-def _enable_deep_learning() -> bool: return _env_bool("YAHOO_ENABLE_DEEP_LEARNING", False) and TORCH_AVAILABLE
-
-def _timeout_sec() -> float: return max(5.0, _env_float("YAHOO_TIMEOUT_SEC", 15.0))
-def _quote_ttl_sec() -> float: return max(5.0, _env_float("YAHOO_QUOTE_TTL_SEC", 15.0))
-def _hist_period() -> str: return _env_str("YAHOO_HISTORY_PERIOD", "2y")
-def _hist_interval() -> str: return _env_str("YAHOO_HISTORY_INTERVAL", "1d")
-
-USER_AGENT_DEFAULT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
-
-# =============================================================================
-# Timezone Utilities
-# =============================================================================
-
-def _utc_now() -> datetime: return datetime.now(timezone.utc)
-def _riyadh_now() -> datetime: return datetime.now(timezone(timedelta(hours=3)))
-def _utc_iso(dt: Optional[datetime] = None) -> str:
-    d = dt or _utc_now()
-    if d.tzinfo is None: d = d.replace(tzinfo=timezone.utc)
-    return d.astimezone(timezone.utc).isoformat()
-def _riyadh_iso(dt: Optional[datetime] = None) -> str:
-    tz = timezone(timedelta(hours=3))
-    d = dt or datetime.now(tz)
-    if d.tzinfo is None: d = d.replace(tzinfo=tz)
-    return d.astimezone(tz).isoformat()
-def _to_riyadh(dt: Optional[datetime]) -> Optional[datetime]:
-    if not dt: return None
-    tz = timezone(timedelta(hours=3))
-    if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(tz)
-def _to_riyadh_iso(dt: Optional[datetime]) -> Optional[str]:
-    rd = _to_riyadh(dt)
-    return rd.isoformat() if rd else None
-
-# =============================================================================
-# Safe Type Helpers
-# =============================================================================
-
-def safe_str(x: Any) -> Optional[str]:
-    if x is None: return None
-    s = str(x).strip()
-    return s if s else None
-
-def safe_float(x: Any) -> Optional[float]:
-    if x is None: return None
+def _env_int(name: str, default: int, lo: Optional[int] = None, hi: Optional[int] = None) -> int:
     try:
-        if isinstance(x, (int, float)):
-            f = float(x)
-            if math.isnan(f) or math.isinf(f): return None
-            return f
-        s = str(x).strip()
-        if not s or s.lower() in {"n/a", "na", "null", "none", "-", "--", "", "nan"}: return None
-        s = s.translate(_ARABIC_DIGITS)
-        s = s.replace(",", "").replace("%", "").replace("+", "").replace("$", "").replace("£", "").replace("€", "")
-        s = s.replace("SAR", "").replace("ريال", "").replace("USD", "").replace("EUR", "").strip()
-        if s.startswith("(") and s.endswith(")"): s = "-" + s[1:-1].strip()
-        m = re.match(r"^(-?\d+(\.\d+)?)([KMBT])$", s, re.IGNORECASE)
-        mult = 1.0
-        if m:
-            num, suf = m.group(1), m.group(3).upper()
-            mult = {"K": 1e3, "M": 1e6, "B": 1e9, "T": 1e12}.get(suf, 1.0)
-            s = num
-        f = float(s) * mult
-        if math.isnan(f) or math.isinf(f): return None
-        return f
-    except Exception: return None
+        v = int(float((os.getenv(name) or str(default)).strip()))
+    except Exception:
+        v = default
+    if lo is not None and v < lo:
+        v = lo
+    if hi is not None and v > hi:
+        v = hi
+    return v
+
+
+def _env_float(name: str, default: float, lo: Optional[float] = None, hi: Optional[float] = None) -> float:
+    try:
+        v = float((os.getenv(name) or str(default)).strip())
+    except Exception:
+        v = default
+    if lo is not None and v < lo:
+        v = lo
+    if hi is not None and v > hi:
+        v = hi
+    return v
+
+
+def _utc_iso(dt: Optional[datetime] = None) -> str:
+    d = dt or datetime.now(UTC)
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=UTC)
+    return d.astimezone(UTC).isoformat()
+
+
+def _riyadh_iso(dt: Optional[datetime] = None) -> str:
+    d = dt or datetime.now(UTC)
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=UTC)
+    return d.astimezone(RIYADH).isoformat()
+
+
+def _safe_symbol(s: Any) -> str:
+    try:
+        x = str(s or "").strip().upper()
+        return x
+    except Exception:
+        return ""
+
 
 # =============================================================================
-# Tracing & Metrics
+# JSON helpers (optional orjson)
+# =============================================================================
+try:
+    import orjson  # type: ignore
+
+    def json_dumps(v: Any, *, default: Any = str) -> str:
+        return orjson.dumps(v, default=default).decode("utf-8")
+
+    def json_loads(v: Union[str, bytes]) -> Any:
+        if isinstance(v, str):
+            v = v.encode("utf-8")
+        return orjson.loads(v)
+
+    _HAS_ORJSON = True
+except Exception:
+    import json
+
+    def json_dumps(v: Any, *, default: Any = str) -> str:
+        return json.dumps(v, default=default, ensure_ascii=False)
+
+    def json_loads(v: Union[str, bytes]) -> Any:
+        if isinstance(v, (bytes, bytearray)):
+            v = v.decode("utf-8", errors="replace")
+        return json.loads(v)
+
+    _HAS_ORJSON = False
+
+
+# =============================================================================
+# Logging
 # =============================================================================
 
-_TRACING_ENABLED = os.getenv("CORE_TRACING_ENABLED", "").strip().lower() in _TRUTHY
+_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+logging.basicConfig(
+    level=getattr(logging, _LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)8s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("core.yahoo_chart_shim")
+
+
+# =============================================================================
+# Prometheus (optional)
+# =============================================================================
+try:
+    from prometheus_client import Counter, Histogram, Gauge  # type: ignore
+
+    _PROM_AVAILABLE = True
+    shim_requests_total = Counter(
+        "tfb_yahoo_shim_requests_total",
+        "Total requests handled by yahoo shim",
+        ["fn", "status"],
+    )
+    shim_request_seconds = Histogram(
+        "tfb_yahoo_shim_request_seconds",
+        "Yahoo shim request duration (seconds)",
+        ["fn"],
+    )
+    shim_provider_available = Gauge(
+        "tfb_yahoo_shim_provider_available",
+        "Canonical provider availability (1/0)",
+    )
+    shim_cb_state = Gauge(
+        "tfb_yahoo_shim_circuit_state",
+        "Circuit state (0=closed,1=half,2=open)",
+    )
+except Exception:
+    _PROM_AVAILABLE = False
+
+    class _DummyMetric:
+        def labels(self, *args, **kwargs):
+            return self
+
+        def inc(self, *args, **kwargs):
+            return None
+
+        def observe(self, *args, **kwargs):
+            return None
+
+        def set(self, *args, **kwargs):
+            return None
+
+    shim_requests_total = _DummyMetric()
+    shim_request_seconds = _DummyMetric()
+    shim_provider_available = _DummyMetric()
+    shim_cb_state = _DummyMetric()
+
+
+# =============================================================================
+# OpenTelemetry (optional)
+# =============================================================================
+try:
+    from opentelemetry import trace  # type: ignore
+    from opentelemetry.trace import Status, StatusCode  # type: ignore
+
+    _OTEL_AVAILABLE = True
+    _TRACER = trace.get_tracer(__name__)
+except Exception:
+    _OTEL_AVAILABLE = False
+    _TRACER = None
+    Status = None  # type: ignore
+    StatusCode = None  # type: ignore
+
+_TRACING_ENABLED = _env_bool("CORE_TRACING_ENABLED", False)
+
 
 class TraceContext:
+    """
+    Sync + async context manager.
+    Uses start_as_current_span safely (works with stdlib OTEL tracer).
+    """
+
     def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
         self.name = name
         self.attributes = attributes or {}
-        self.tracer = trace.get_tracer(__name__) if OPENTELEMETRY_AVAILABLE and _TRACING_ENABLED else None
-        self.span = None
-        self.token = None
+        self._cm = None
+        self._span = None
 
-    async def __aenter__(self):
-        if self.tracer:
-            self.span = self.tracer.start_span(self.name)
-            self.token = attach(self.span)
-            if self.attributes: self.span.set_attributes(self.attributes)
+    def __enter__(self):
+        if _OTEL_AVAILABLE and _TRACING_ENABLED and _TRACER is not None:
+            try:
+                self._cm = _TRACER.start_as_current_span(self.name)
+                self._span = self._cm.__enter__()
+                for k, v in (self.attributes or {}).items():
+                    try:
+                        self._span.set_attribute(str(k), v)
+                    except Exception:
+                        pass
+            except Exception:
+                self._cm = None
+                self._span = None
         return self
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.span:
-            if exc_val:
-                self.span.record_exception(exc_val)
-                self.span.set_status(Status(StatusCode.ERROR, str(exc_val)))
-            self.span.end()
-            if self.token: detach(self.token)
-
-# =============================================================================
-# Yahoo Crumb Manager (Anti-Bot Bypass)
-# =============================================================================
-
-class YahooCrumbManager:
-    """Safely acquires and caches Yahoo Finance Session Cookies and Crumbs."""
-    _cookie = ""
-    _crumb = ""
-    _lock = threading.Lock()
-    _last_fetch = 0.0
-
-    @classmethod
-    def get(cls) -> Tuple[str, str]:
-        with cls._lock:
-            # Cache crumb for 10 minutes to avoid hitting the API too often
-            if cls._crumb and cls._cookie and (time.time() - cls._last_fetch < 600):
-                return cls._cookie, cls._crumb
-            
-            try:
-                cookie_jar = urllib.request.HTTPCookieProcessor()
-                opener = urllib.request.build_opener(cookie_jar)
-                
-                # 1. Hit the front page to get a session cookie
-                req1 = urllib.request.Request("https://fc.yahoo.com", headers={"User-Agent": USER_AGENT_DEFAULT})
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            if self._span is not None and exc_val is not None and Status is not None and StatusCode is not None:
                 try:
-                    opener.open(req1, timeout=5.0)
+                    self._span.record_exception(exc_val)
                 except Exception:
-                    pass 
-                    
-                cookies = "; ".join([f"{c.name}={c.value}" for c in cookie_jar.cookiejar])
-                
-                # 2. Get the Crumb
-                req2 = urllib.request.Request("https://query1.finance.yahoo.com/v1/test/getcrumb", headers={
-                    "User-Agent": USER_AGENT_DEFAULT,
-                    "Cookie": cookies
-                })
-                resp2 = opener.open(req2, timeout=5.0)
-                crumb = resp2.read().decode("utf-8").strip()
-                
-                if crumb:
-                    cls._crumb = crumb
-                    cls._cookie = cookies
-                    cls._last_fetch = time.time()
-            except Exception as e:
-                logger.debug(f"Crumb fetch failed: {e}")
-            
-            return cls._cookie, cls._crumb
+                    pass
+                try:
+                    self._span.set_status(Status(StatusCode.ERROR, str(exc_val)))
+                except Exception:
+                    pass
+        finally:
+            if self._cm is not None:
+                try:
+                    return self._cm.__exit__(exc_type, exc_val, exc_tb)
+                except Exception:
+                    return False
+        return False
 
-# =============================================================================
-# Pure-Python Technical Indicators & ML Forecaster (No Numpy Required)
-# =============================================================================
+    async def __aenter__(self):
+        return self.__enter__()
 
-class TechnicalIndicators:
-    @staticmethod
-    def sma(prices: List[float], window: int) -> List[Optional[float]]:
-        if len(prices) < window: return [None] * len(prices)
-        result = [None] * (window - 1)
-        for i in range(window - 1, len(prices)):
-            result.append(sum(prices[i - window + 1:i + 1]) / window)
-        return result
-
-    @staticmethod
-    def ema(prices: List[float], window: int) -> List[Optional[float]]:
-        if len(prices) < window: return [None] * len(prices)
-        result = [None] * (window - 1)
-        multiplier = 2.0 / (window + 1)
-        ema_val = sum(prices[:window]) / window
-        result.append(ema_val)
-        for price in prices[window:]:
-            ema_val = (price - ema_val) * multiplier + ema_val
-            result.append(ema_val)
-        return result
-
-    @staticmethod
-    def std_dev(prices: List[float]) -> float:
-        if not prices: return 0.0
-        mean = sum(prices) / len(prices)
-        variance = sum((x - mean) ** 2 for x in prices) / len(prices)
-        return math.sqrt(variance)
-
-    @staticmethod
-    def macd(prices: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> Dict[str, List[Optional[float]]]:
-        if len(prices) < slow:
-            return {"macd": [None]*len(prices), "signal": [None]*len(prices), "histogram": [None]*len(prices)}
-        ema_f = TechnicalIndicators.ema(prices, fast)
-        ema_s = TechnicalIndicators.ema(prices, slow)
-        macd_line = [f - s if f is not None and s is not None else None for f, s in zip(ema_f, ema_s)]
-        valid_macd = [x for x in macd_line if x is not None]
-        sig_line = TechnicalIndicators.ema(valid_macd, signal) if valid_macd else []
-        padded_sig = [None] * (len(prices) - len(sig_line)) + sig_line
-        hist = [m - s if m is not None and s is not None else None for m, s in zip(macd_line, padded_sig)]
-        return {"macd": macd_line, "signal": padded_sig, "histogram": hist}
-
-    @staticmethod
-    def rsi(prices: List[float], window: int = 14) -> List[Optional[float]]:
-        if len(prices) < window + 1: return [None] * len(prices)
-        deltas = [prices[i] - prices[i-1] for i in range(1, len(prices))]
-        result = [None] * window
-        
-        window_deltas = deltas[:window]
-        avg_gain = sum(d for d in window_deltas if d > 0) / window
-        avg_loss = sum(-d for d in window_deltas if d < 0) / window
-        
-        rs = avg_gain / avg_loss if avg_loss != 0 else float('inf')
-        result.append(100.0 - (100.0 / (1.0 + rs)) if avg_loss != 0 else 100.0)
-
-        for d in deltas[window:]:
-            gain = d if d > 0 else 0
-            loss = -d if d < 0 else 0
-            avg_gain = (avg_gain * (window - 1) + gain) / window
-            avg_loss = (avg_loss * (window - 1) + loss) / window
-            rs = avg_gain / avg_loss if avg_loss != 0 else float('inf')
-            result.append(100.0 - (100.0 / (1.0 + rs)) if avg_loss != 0 else 100.0)
-        return result
-
-    @staticmethod
-    def bollinger_bands(prices: List[float], window: int = 20, num_std: float = 2.0) -> Dict[str, List[Optional[float]]]:
-        if len(prices) < window:
-            return {"middle": [None]*len(prices), "upper": [None]*len(prices), "lower": [None]*len(prices), "bandwidth": [None]*len(prices)}
-        middle = TechnicalIndicators.sma(prices, window)
-        upper, lower, bandwidth = [None]*(window-1), [None]*(window-1), [None]*(window-1)
-        for i in range(window - 1, len(prices)):
-            slice_prices = prices[i - window + 1:i + 1]
-            std = TechnicalIndicators.std_dev(slice_prices)
-            m = middle[i]
-            if m is not None:
-                u, l = m + num_std * std, m - num_std * std
-                upper.append(u); lower.append(l)
-                bandwidth.append((u - l) / m if m != 0 else None)
-            else:
-                upper.append(None); lower.append(None); bandwidth.append(None)
-        return {"middle": middle, "upper": upper, "lower": lower, "bandwidth": bandwidth}
-
-
-class EnsembleForecaster:
-    def __init__(self, prices: List[float], volumes: Optional[List[float]] = None, enable_ml: bool = True, enable_dl: bool = False):
-        self.prices = prices
-        self.enable_ml = enable_ml
-
-    def forecast(self, horizon_days: int = 252) -> Dict[str, Any]:
-        if len(self.prices) < 60: return {"forecast_available": False}
-        
-        if NUMPY_AVAILABLE and SCIPY_AVAILABLE:
-            forecasts, weights, confidences = [], [], []
-
-            # Simple Trend
-            n = min(len(self.prices), 252)
-            y = np.log(self.prices[-n:])
-            x = np.arange(n)
-            slope, intercept, r_val, _, _ = stats.linregress(x, y)
-            if r_val != 0:
-                forecasts.append(math.exp(intercept + slope * (n + horizon_days)))
-                weights.append(0.2)
-                confidences.append(abs(r_val) * 100)
-
-            if not forecasts:
-                recent = self.prices[-min(60, len(self.prices)):]
-                returns = np.diff(recent) / recent[:-1]
-                drift = np.mean(returns)
-                price = self.prices[-1] * ((1 + drift) ** horizon_days)
-                forecasts.append(price)
-                weights.append(1.0)
-                confidences.append(50.0)
-
-            total_w = sum(weights)
-            norm_w = [w / total_w for w in weights]
-            ens_price = sum(f * w for f, w in zip(forecasts, norm_w))
-            
-            return {
-                "forecast_available": True,
-                "ensemble": {
-                    "price": float(ens_price),
-                    "roi_pct": float((ens_price / self.prices[-1] - 1) * 100),
-                },
-                "confidence": float(sum(c * w for c, w in zip(confidences, norm_w)))
-            }
-        else:
-            # Pure Python Drift Fallback
-            recent = self.prices[-min(60, len(self.prices)):]
-            returns = [(recent[i] - recent[i-1])/recent[i-1] for i in range(1, len(recent))]
-            drift = sum(returns) / len(returns) if returns else 0.0
-            price = self.prices[-1] * ((1 + drift) ** horizon_days)
-            
-            return {
-                "forecast_available": True,
-                "ensemble": {
-                    "price": float(price),
-                    "roi_pct": float((price / self.prices[-1] - 1) * 100),
-                },
-                "confidence": 50.0,
-                "confidence_level": "medium"
-            }
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        return self.__exit__(exc_type, exc_val, exc_tb)
 
 
 # =============================================================================
-# Caching, Circuit Breaker & SingleFlight
+# Data Quality
 # =============================================================================
+class DataQuality(str, Enum):
+    EXCELLENT = "EXCELLENT"
+    HIGH = "HIGH"
+    MEDIUM = "MEDIUM"
+    LOW = "LOW"
+    STALE = "STALE"
+    OK = "OK"
+    PARTIAL = "PARTIAL"
+    MISSING = "MISSING"
+    ERROR = "ERROR"
 
+
+# =============================================================================
+# Telemetry (in-memory, thread-safe)
+# =============================================================================
+@dataclass(slots=True)
+class CallMetrics:
+    fn: str
+    start_mono: float
+    end_mono: float
+    ok: bool
+    error_type: Optional[str] = None
+    duration_ms: float = field(init=False)
+
+    def __post_init__(self):
+        self.duration_ms = max(0.0, (self.end_mono - self.start_mono) * 1000.0)
+
+
+class TelemetryCollector:
+    def __init__(self, max_items: int = 1500):
+        self._lock = threading.RLock()
+        self._max = max(200, int(max_items))
+        self._calls: List[CallMetrics] = []
+
+    def record(self, m: CallMetrics) -> None:
+        if not _env_bool("SHIM_YAHOO_TELEMETRY", True):
+            return
+        with self._lock:
+            self._calls.append(m)
+            if len(self._calls) > self._max:
+                self._calls = self._calls[-self._max :]
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            calls = list(self._calls)
+
+        if not calls:
+            return {}
+
+        total = len(calls)
+        ok = sum(1 for c in calls if c.ok)
+        durations = sorted(c.duration_ms for c in calls)
+        p50 = durations[total // 2]
+        p95 = durations[min(total - 1, int(total * 0.95))]
+        p99 = durations[min(total - 1, int(total * 0.99))]
+
+        by_fn: Dict[str, Dict[str, Any]] = {}
+        for c in calls:
+            s = by_fn.setdefault(c.fn, {"calls": 0, "ok": 0, "fail": 0, "dur_ms_sum": 0.0})
+            s["calls"] += 1
+            s["ok"] += 1 if c.ok else 0
+            s["fail"] += 0 if c.ok else 1
+            s["dur_ms_sum"] += c.duration_ms
+
+        for s in by_fn.values():
+            s["avg_duration_ms"] = s["dur_ms_sum"] / max(1, s["calls"])
+            s["success_rate"] = s["ok"] / max(1, s["calls"])
+            s.pop("dur_ms_sum", None)
+
+        return {
+            "total_calls": total,
+            "success_rate": ok / max(1, total),
+            "avg_duration_ms": sum(durations) / max(1, total),
+            "p50_duration_ms": p50,
+            "p95_duration_ms": p95,
+            "p99_duration_ms": p99,
+            "by_fn": by_fn,
+        }
+
+
+_TELEMETRY = TelemetryCollector()
+
+
+def _track(fn_name: str, start_mono: float, ok: bool, err: Optional[BaseException] = None) -> None:
+    _TELEMETRY.record(
+        CallMetrics(
+            fn=fn_name,
+            start_mono=start_mono,
+            end_mono=time.monotonic(),
+            ok=ok,
+            error_type=(err.__class__.__name__ if err else None),
+        )
+    )
+
+
+# =============================================================================
+# SingleFlight (async)
+# =============================================================================
 class SingleFlight:
-    def __init__(self) -> None:
+    def __init__(self):
         self._lock = asyncio.Lock()
-        self._futures: Dict[str, asyncio.Future] = {}
+        self._futs: Dict[str, asyncio.Future] = {}
 
-    async def run(self, key: str, coro_fn: Callable[[], Awaitable[Any]]) -> Any:
+    async def do(self, key: str, coro_fn: Callable[[], Awaitable[_T]]) -> _T:
+        fut: Optional[asyncio.Future] = None
+        leader = False
+
         async with self._lock:
-            fut = self._futures.get(key)
-            if fut is not None: return await fut
-            fut = asyncio.get_running_loop().create_future()
-            self._futures[key] = fut
+            fut = self._futs.get(key)
+            if fut is None:
+                fut = asyncio.get_running_loop().create_future()
+                self._futs[key] = fut
+                leader = True
+
+        if not leader:
+            return await fut  # type: ignore
 
         try:
             res = await coro_fn()
-            if not fut.done(): fut.set_result(res)
+            if not fut.done():
+                fut.set_result(res)
             return res
         except Exception as e:
-            if not fut.done(): fut.set_exception(e)
+            if not fut.done():
+                fut.set_exception(e)
             raise
         finally:
-            async with self._lock: self._futures.pop(key, None)
+            async with self._lock:
+                self._futs.pop(key, None)
 
-class AdvancedCache:
-    def __init__(self, name: str, ttl: float = 300.0, maxsize: int = 5000):
-        self.name, self.ttl, self.maxsize = name, ttl, maxsize
-        self._cache: Dict[str, Tuple[Any, float]] = {}
-        self._lock = asyncio.Lock()
-
-    async def get(self, prefix: str, **kwargs) -> Optional[Any]:
-        key = f"{self.name}:{prefix}:{hashlib.md5(json_dumps(kwargs).encode()).hexdigest()[:16]}"
-        async with self._lock:
-            if key in self._cache:
-                val, exp = self._cache[key]
-                if time.monotonic() < exp: return val
-                del self._cache[key]
-        return None
-
-    async def set(self, value: Any, prefix: str, ttl: Optional[float] = None, **kwargs) -> None:
-        key = f"{self.name}:{prefix}:{hashlib.md5(json_dumps(kwargs).encode()).hexdigest()[:16]}"
-        async with self._lock:
-            if len(self._cache) >= self.maxsize and key not in self._cache:
-                for k in list(self._cache.keys())[:self.maxsize // 10]: self._cache.pop(k, None)
-            self._cache[key] = (value, time.monotonic() + (ttl or self.ttl))
-            
-    async def clear(self) -> None:
-        async with self._lock:
-            self._cache.clear()
-
-    async def size(self) -> int:
-        async with self._lock:
-            return len(self._cache)
 
 # =============================================================================
-# Yahoo Finance Provider Implementation (Quantum Edition)
+# Full Jitter retry (async)
 # =============================================================================
+class FullJitterBackoff:
+    def __init__(self, attempts: int = 2, base: float = 0.4, cap: float = 4.0):
+        self.attempts = max(0, int(attempts))
+        self.base = max(0.05, float(base))
+        self.cap = max(self.base, float(cap))
 
-@dataclass(slots=True)
-class YahooChartProvider:
-    name: str = PROVIDER_NAME
-    version: str = PROVIDER_VERSION
-    timeout_sec: float = field(default_factory=_timeout_sec)
-    retry_attempts: int = 1 # V6.12 FIX: Slashed from 3 to 1 to fail fast and prevent 503 cascades
+    async def run(self, fn: Callable[[], Awaitable[_T]]) -> _T:
+        last: Optional[BaseException] = None
+        total_tries = max(1, self.attempts + 1)
 
-    quote_cache: AdvancedCache = field(default_factory=lambda: AdvancedCache("quote", _quote_ttl_sec()))
-    singleflight: SingleFlight = field(default_factory=SingleFlight)
-
-    def _mock_fallback(self, symbol: str) -> Dict[str, Any]:
-        """Ultimate fallback to prevent pipeline destruction and satisfy test contracts."""
-        logger.error(f"Total failure or timeout for {symbol}. Returning synthetic mock data to prevent pipeline crash.")
-        base_price = 150.0 if symbol == "AAPL" else 300.0 if symbol == "MSFT" else 2000.0 if symbol == "GOOGL" else 100.0
-        price = base_price + random.uniform(-5, 5)
-        
-        return {
-            "symbol": symbol,
-            "current_price": price,
-            "previous_close": price * 0.99,
-            "day_high": price * 1.02,
-            "day_low": price * 0.98,
-            "market_cap": base_price * 1e9,
-            "volume": random.randint(1000000, 50000000),
-            "price_change": price * 0.01,
-            "percent_change": 1.0,
-            "rsi_14": random.uniform(40, 60),
-            "rsi_14d": random.uniform(40, 60),
-            "macd": random.uniform(0, 1),
-            "macd_signal": random.uniform(0, 1),
-            "expected_roi_1m": random.uniform(1, 5),
-            "expected_roi_3m": random.uniform(2, 8),
-            "expected_roi_12m": random.uniform(5, 15),
-            "forecast_price_1m": price * 1.02,
-            "forecast_price_3m": price * 1.05,
-            "forecast_price_12m": price * 1.10,
-            "forecast_confidence": 65.0,
-            "data_quality": "GOOD",
-            "data_source": "yahoo_mock_fallback",
-            "last_updated_utc": datetime.now(timezone.utc).isoformat()
-        }
-
-    def _fallback_fetch(self, symbol: str) -> Dict[str, Any]:
-        """REST API fallback using v8 chart endpoint and v7 quote endpoint."""
-        cookie, crumb = YahooCrumbManager.get()
-        headers = {"User-Agent": USER_AGENT_DEFAULT}
-        if cookie: headers["Cookie"] = cookie
-        
-        out = {"symbol": symbol, "data_source": "yahoo_chart_fallback"}
-        
-        # 1. Fetch Quote (V7)
-        try:
-            url_v7 = f"https://query2.finance.yahoo.com/v7/finance/quote?symbols={symbol}"
-            if crumb: url_v7 += f"&crumb={crumb}"
-            
-            req = urllib.request.Request(url_v7, headers=headers)
-            with urllib.request.urlopen(req, timeout=5.0) as resp:
-                data = json_loads(resp.read())
-                res = data.get("quoteResponse", {}).get("result", [])
-                if res:
-                    q = res[0]
-                    out["current_price"] = safe_float(q.get("regularMarketPrice"))
-                    out["previous_close"] = safe_float(q.get("regularMarketPreviousClose"))
-                    out["day_high"] = safe_float(q.get("regularMarketDayHigh"))
-                    out["day_low"] = safe_float(q.get("regularMarketDayLow"))
-                    out["market_cap"] = safe_float(q.get("marketCap"))
-                    out["volume"] = safe_float(q.get("regularMarketVolume"))
-                    out["price_change"] = safe_float(q.get("regularMarketChange"))
-                    out["percent_change"] = safe_float(q.get("regularMarketChangePercent"))
-        except Exception as e:
-            logger.debug(f"Fallback V7 quote failed: {e}")
-            
-        # 2. Fetch History (V8 - Bypasses Crumb for basic charts)
-        try:
-            url_v8 = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=2y"
-            req8 = urllib.request.Request(url_v8, headers={"User-Agent": USER_AGENT_DEFAULT})
-            with urllib.request.urlopen(req8, timeout=5.0) as resp8:
-                data8 = json_loads(resp8.read())
-                res8 = data8.get("chart", {}).get("result", [])
-                if res8:
-                    chart = res8[0]
-                    # Fill missing quote data from v8 meta if V7 failed
-                    meta = chart.get("meta", {})
-                    if not out.get("current_price"):
-                        out["current_price"] = safe_float(meta.get("regularMarketPrice"))
-                        out["previous_close"] = safe_float(meta.get("chartPreviousClose"))
-                        if out.get("current_price") and out.get("previous_close"):
-                            out["price_change"] = out["current_price"] - out["previous_close"]
-                            out["percent_change"] = (out["price_change"] / out["previous_close"]) * 100.0
-                            out["volume"] = safe_float(meta.get("regularMarketVolume"))
-                    
-                    indicators = chart.get("indicators", {}).get("quote", [{}])[0]
-                    
-                    # V6.12 FIX: Handle explicit `null` returned by Yahoo's JSON structure safely
-                    close_data = indicators.get("close") or []
-                    closes = [safe_float(x) for x in close_data if x is not None]
-                    
-                    vol_data = indicators.get("volume") or []
-                    vols = [safe_float(x) for x in vol_data if x is not None]
-                    
-                    if closes and _enable_history():
-                        ti = TechnicalIndicators()
-                        rsi_arr = ti.rsi(closes, 14)
-                        if rsi_arr:
-                            out["rsi_14"] = rsi_arr[-1]
-                            out["rsi_14d"] = rsi_arr[-1]
-                        
-                        mac = ti.macd(closes)
-                        if mac and mac["macd"] and mac["signal"]:
-                            out["macd"] = mac["macd"][-1]
-                            out["macd_signal"] = mac["signal"][-1]
-                        
-                        if _enable_forecast():
-                            fc = EnsembleForecaster(closes, vols, enable_ml=_enable_ml(), enable_dl=_enable_deep_learning()).forecast(252)
-                            if fc.get("forecast_available"):
-                                out["forecast_price_1y"] = fc["ensemble"]["price"]
-                                out["expected_roi_1y"] = fc["ensemble"]["roi_pct"]
-                                out["forecast_price_12m"] = fc["ensemble"]["price"]
-                                out["expected_roi_12m"] = fc["ensemble"]["roi_pct"]
-                                out["forecast_confidence"] = fc["confidence"]
-        except Exception as e:
-            logger.debug(f"Fallback V8 history failed: {e}")
-            
-        if not out.get("current_price"):
-            raise ValueError("No data found on Yahoo REST fallback")
-            
-        out["data_quality"] = "GOOD"
-        out["last_updated_utc"] = datetime.now(timezone.utc).isoformat()
-        return out
-
-    def _blocking_fetch(self, symbol: str) -> Dict[str, Any]:
-        """Blocking yfinance fetch deployed in the threadpool."""
-        if _HAS_YFINANCE and yf is not None and _REQUESTS_AVAILABLE:
-            last_err = None
-            
-            # Setup strict timeout session to prevent thread starvation (The 110s bug fix)
-            session = requests.Session()
-            adapter = TimeoutHTTPAdapter(timeout=5.0)
-            session.mount("https://", adapter)
-            session.mount("http://", adapter)
-            
-            for attempt in range(self.retry_attempts):
-                try:
-                    ticker = yf.Ticker(symbol, session=session)
-                    out = {}
-                    try:
-                        fi = getattr(ticker, "fast_info", None)
-                        if fi:
-                            out["current_price"] = safe_float(getattr(fi, "last_price", None))
-                            out["previous_close"] = safe_float(getattr(fi, "previous_close", None))
-                            out["volume"] = safe_float(getattr(fi, "last_volume", None))
-                            out["day_high"] = safe_float(getattr(fi, "day_high", None))
-                            out["day_low"] = safe_float(getattr(fi, "day_low", None))
-                            out["week_52_high"] = safe_float(getattr(fi, "fifty_two_week_high", None))
-                            out["week_52_low"] = safe_float(getattr(fi, "fifty_two_week_low", None))
-                            out["market_cap"] = safe_float(getattr(fi, "market_cap", None))
-                    except Exception: pass
-                    
-                    closes, vols = [], []
-                    try:
-                        hist = ticker.history(period=_hist_period(), interval=_hist_interval())
-                        if not hist.empty:
-                            closes = [safe_float(x) for x in hist["Close"] if safe_float(x) is not None]
-                            vols = [safe_float(x) for x in hist["Volume"] if safe_float(x) is not None]
-                            if out.get("current_price") is None and closes: 
-                                out["current_price"] = closes[-1]
-                    except Exception: pass
-                    
-                    if out.get("current_price") is None: 
-                        raise ValueError("No price data returned from yfinance.")
-                    
-                    # Enrichment
-                    if out.get("current_price") and out.get("previous_close") and out["previous_close"] != 0:
-                        out["price_change"] = out["current_price"] - out["previous_close"]
-                        out["percent_change"] = (out["price_change"] / out["previous_close"]) * 100.0
-
-                    if closes and _enable_history():
-                        ti = TechnicalIndicators()
-                        rsi_arr = ti.rsi(closes, 14)
-                        if rsi_arr:
-                            out["rsi_14"] = rsi_arr[-1]
-                            out["rsi_14d"] = rsi_arr[-1]
-                            
-                        mac = ti.macd(closes)
-                        if mac and mac["macd"] and mac["signal"]:
-                            out["macd"] = mac["macd"][-1]
-                            out["macd_signal"] = mac["signal"][-1]
-                        
-                        if _enable_forecast():
-                            fc = EnsembleForecaster(closes, vols, enable_ml=_enable_ml(), enable_dl=_enable_deep_learning()).forecast(252)
-                            if fc.get("forecast_available"):
-                                out["forecast_price_1y"] = fc["ensemble"]["price"]
-                                out["expected_roi_1y"] = fc["ensemble"]["roi_pct"]
-                                out["forecast_price_12m"] = fc["ensemble"]["price"]
-                                out["expected_roi_12m"] = fc["ensemble"]["roi_pct"]
-                                out["forecast_confidence"] = fc["confidence"]
-                                
-                    out.update({
-                        "symbol": symbol,
-                        "data_source": "yahoo_chart",
-                        "provider_version": PROVIDER_VERSION,
-                        "last_updated_utc": _utc_iso(),
-                        "last_updated_riyadh": _riyadh_iso(),
-                        "data_quality": "GOOD"
-                    })
-                    return out
-                    
-                except Exception as e:
-                    last_err = e
-                    base_wait = 1.0 * (2 ** attempt)
-                    time.sleep(random.uniform(0, base_wait))
-            
-            logger.warning(f"yfinance failed for {symbol} after {self.retry_attempts} attempts: {last_err}")
-
-        # Fallback to pure REST API
-        try:
-            logger.warning(f"yfinance failed for {symbol}, attempting REST fallback")
-            out = self._fallback_fetch(symbol)
-            if out.get("current_price") is not None:
-                out["data_quality"] = "GOOD"
-                out["last_updated_utc"] = _utc_iso()
-                return out
-        except Exception as fb_err:
-            logger.debug(f"REST Fallback also failed: {fb_err}")
-            
-        # MOCK DATA GUARANTEE 
-        return self._mock_fallback(symbol)
-
-    async def fetch_enriched_quote_patch(self, symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        s = symbol.upper().strip()
-
-        cached = await self.quote_cache.get("quote", symbol=s)
-        if cached: return cached
-
-        async def _fetch():
-            loop = asyncio.get_running_loop()
+        for i in range(total_tries):
             try:
-                res = await asyncio.wait_for(
-                    loop.run_in_executor(_CPU_EXECUTOR, self._blocking_fetch, s),
-                    timeout=self.timeout_sec
+                return await fn()
+            except Exception as e:
+                last = e
+                if i >= total_tries - 1:
+                    break
+                temp = min(self.cap, self.base * (2**i))
+                await asyncio.sleep(random.uniform(0.0, temp))
+
+        raise last if last else RuntimeError("retry_exhausted")
+
+
+# =============================================================================
+# Circuit breaker (async)
+# =============================================================================
+class CircuitState(str, Enum):
+    CLOSED = "closed"
+    HALF = "half_open"
+    OPEN = "open"
+
+
+class CircuitBreakerOpenError(RuntimeError):
+    pass
+
+
+class CircuitBreaker:
+    def __init__(self, threshold: int, timeout_sec: float, half_open_calls: int):
+        self.threshold = max(1, int(threshold))
+        self.timeout_sec = max(1.0, float(timeout_sec))
+        self.half_open_calls = max(1, int(half_open_calls))
+
+        self._lock = asyncio.Lock()
+        self.state = CircuitState.CLOSED
+        self.failures = 0
+        self.opened_mono: Optional[float] = None
+        self.half_used = 0
+        self.half_success = 0
+
+        shim_cb_state.set(0)
+
+    async def allow(self) -> None:
+        async with self._lock:
+            if self.state == CircuitState.CLOSED:
+                shim_cb_state.set(0)
+                return
+
+            if self.state == CircuitState.OPEN:
+                if self.opened_mono is None:
+                    self.opened_mono = time.monotonic()
+                if (time.monotonic() - self.opened_mono) >= self.timeout_sec:
+                    self.state = CircuitState.HALF
+                    self.half_used = 0
+                    self.half_success = 0
+                    shim_cb_state.set(1)
+                    return
+                shim_cb_state.set(2)
+                raise CircuitBreakerOpenError("circuit_open")
+
+            if self.state == CircuitState.HALF:
+                shim_cb_state.set(1)
+                if self.half_used >= self.half_open_calls:
+                    raise CircuitBreakerOpenError("circuit_half_open_limit")
+                self.half_used += 1
+                return
+
+    async def on_ok(self) -> None:
+        async with self._lock:
+            if self.state == CircuitState.HALF:
+                self.half_success += 1
+                if self.half_success >= 2:
+                    self.state = CircuitState.CLOSED
+                    self.failures = 0
+                    self.opened_mono = None
+                    shim_cb_state.set(0)
+            else:
+                self.failures = 0
+
+    async def on_fail(self) -> None:
+        async with self._lock:
+            if self.state == CircuitState.HALF:
+                self.state = CircuitState.OPEN
+                self.opened_mono = time.monotonic()
+                self.failures = self.threshold
+                shim_cb_state.set(2)
+                return
+
+            self.failures += 1
+            if self.failures >= self.threshold:
+                self.state = CircuitState.OPEN
+                self.opened_mono = time.monotonic()
+                shim_cb_state.set(2)
+
+
+# =============================================================================
+# Canonical provider cache (TTL + singleflight)
+# =============================================================================
+@dataclass(slots=True)
+class ProviderInfo:
+    module: Any
+    version: str
+    funcs: Dict[str, Callable[..., Any]]
+    available: bool
+    checked_mono: float
+    error: Optional[str] = None
+
+
+def _version_tuple(v: str) -> Tuple[int, int, int]:
+    try:
+        parts = (v or "").strip().split(".")
+        a = int(parts[0]) if len(parts) > 0 else 0
+        b = int(parts[1]) if len(parts) > 1 else 0
+        c = int(parts[2]) if len(parts) > 2 else 0
+        return (a, b, c)
+    except Exception:
+        return (0, 0, 0)
+
+
+class ProviderCache:
+    def __init__(self):
+        self.ttl = _env_float("SHIM_YAHOO_PROVIDER_TTL_SEC", 300.0, lo=10.0, hi=86400.0)
+        self._lock = asyncio.Lock()
+        self._info: Optional[ProviderInfo] = None
+        self._sf = SingleFlight()
+        self._cb = CircuitBreaker(
+            threshold=_env_int("SHIM_YAHOO_CB_THRESHOLD", 3, lo=1, hi=20),
+            timeout_sec=_env_float("SHIM_YAHOO_CB_TIMEOUT_SEC", 60.0, lo=5.0, hi=600.0),
+            half_open_calls=_env_int("SHIM_YAHOO_CB_HALF_CALLS", 2, lo=1, hi=10),
+        )
+
+    def _valid(self) -> bool:
+        if self._info is None:
+            return False
+        return (time.monotonic() - self._info.checked_mono) < self.ttl
+
+    async def get(self) -> ProviderInfo:
+        async with self._lock:
+            if self._valid():
+                shim_provider_available.set(1 if self._info.available else 0)
+                return self._info
+
+        info = await self._sf.do("provider_load", self._load)
+        async with self._lock:
+            self._info = info
+        shim_provider_available.set(1 if info.available else 0)
+        return info
+
+    async def _load(self) -> ProviderInfo:
+        async def _do_import() -> ProviderInfo:
+            await self._cb.allow()
+            try:
+                mod = None
+                last_err = None
+                for p in CANONICAL_IMPORT_PATHS:
+                    try:
+                        mod = __import__(p, fromlist=["__all__"])
+                        last_err = None
+                        break
+                    except Exception as e:
+                        last_err = e
+                        continue
+
+                if mod is None:
+                    raise ImportError(f"canonical_missing:{last_err.__class__.__name__ if last_err else 'unknown'}")
+
+                ver = str(getattr(mod, "PROVIDER_VERSION", getattr(mod, "VERSION", "unknown")) or "unknown")
+                if _version_tuple(ver) < _version_tuple(MIN_CANONICAL_VERSION):
+                    raise RuntimeError(f"canonical_version_too_old:{ver}")
+
+                funcs: Dict[str, Callable[..., Any]] = {}
+                for name in dir(mod):
+                    if name.startswith("_"):
+                        continue
+                    try:
+                        obj = getattr(mod, name)
+                    except Exception:
+                        continue
+                    if callable(obj):
+                        funcs[name] = obj
+
+                await self._cb.on_ok()
+                return ProviderInfo(
+                    module=mod,
+                    version=ver,
+                    funcs=funcs,
+                    available=True,
+                    checked_mono=time.monotonic(),
+                    error=None,
                 )
-            except asyncio.TimeoutError:
-                logger.error(f"Yahoo fetch timed out for {s} after {self.timeout_sec}s. Engaging mock fallback.")
-                res = self._mock_fallback(s)
-                
-            if "error" not in res:
-                await self.quote_cache.set(res, "quote", symbol=s)
-            return res
+            except Exception as e:
+                await self._cb.on_fail()
+                return ProviderInfo(
+                    module=None,
+                    version="unknown",
+                    funcs={},
+                    available=False,
+                    checked_mono=time.monotonic(),
+                    error=str(e),
+                )
 
-        async with TraceContext("yahoo_fetch", {"symbol": s}):
-            return await self.singleflight.run(f"yahoo:{s}", _fetch)
+        with TraceContext("yahoo_shim.provider_load"):
+            return await _do_import()
+
+
+_PROVIDER = ProviderCache()
+
 
 # =============================================================================
-# Singleton Management & Exports
+# Signature cache
 # =============================================================================
+@lru_cache(maxsize=256)
+def _sig_params(fn: Callable[..., Any]) -> Dict[str, inspect.Parameter]:
+    try:
+        return dict(inspect.signature(fn).parameters)
+    except Exception:
+        return {}
 
-_PROVIDER_INSTANCE: Optional[YahooChartProvider] = None
-_PROVIDER_LOCK = asyncio.Lock()
 
-async def get_provider() -> YahooChartProvider:
-    global _PROVIDER_INSTANCE
-    if _PROVIDER_INSTANCE is None:
-        async with _PROVIDER_LOCK:
-            if _PROVIDER_INSTANCE is None:
-                _PROVIDER_INSTANCE = YahooChartProvider()
-    return _PROVIDER_INSTANCE
+def _adapt_kwargs(fn: Callable[..., Any], kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        params = _sig_params(fn)
+        if not params:
+            return dict(kwargs)
+        accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        if accepts_var_kw:
+            return dict(kwargs)
+        return {k: v for k, v in kwargs.items() if k in params}
+    except Exception:
+        return dict(kwargs)
 
-async def fetch_enriched_quote_patch(symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return await (await get_provider()).fetch_enriched_quote_patch(symbol, debug=debug)
 
-# Aliases
-fetch_quote = fetch_enriched_quote_patch
-get_quote = fetch_enriched_quote_patch
-get_quote_patch = fetch_enriched_quote_patch
-fetch_quote_patch = fetch_enriched_quote_patch
-fetch_quote_and_enrichment_patch = fetch_enriched_quote_patch
-fetch_quote_and_fundamentals_patch = fetch_enriched_quote_patch
-yahoo_chart_quote = fetch_enriched_quote_patch
+async def _maybe_await(v: Any) -> Any:
+    if inspect.isawaitable(v):
+        return await v
+    return v
 
-async def fetch_history(symbol: str, *args, **kwargs) -> List[Dict[str, Any]]:
+
+# =============================================================================
+# Response normalization
+# =============================================================================
+def _ensure_shape(payload: Any, *, symbol: str, provider_version: Optional[str], fn_name: str) -> Any:
+    if not isinstance(payload, dict):
+        return payload
+
+    out = dict(payload)
+    sym = _safe_symbol(out.get("symbol") or symbol)
+    out["symbol"] = sym
+    out.setdefault("symbol_normalized", sym)
+
+    out.setdefault("data_source", DATA_SOURCE)
+    out.setdefault("provider", DATA_SOURCE)
+    out.setdefault("shim_version", SHIM_VERSION)
+    if provider_version:
+        out.setdefault("provider_version", provider_version)
+
+    out.setdefault("last_updated_utc", _utc_iso())
+    out.setdefault("last_updated_riyadh", _riyadh_iso())
+
+    if out.get("error"):
+        out.setdefault("status", "error")
+        out.setdefault("data_quality", DataQuality.ERROR.value)
+        out.setdefault("where", fn_name)
+    else:
+        out.setdefault("status", "ok")
+        out.setdefault("data_quality", out.get("data_quality") or DataQuality.OK.value)
+
+    return out
+
+
+def _error_payload(symbol: str, err: str, *, fn_name: str) -> Dict[str, Any]:
+    sym = _safe_symbol(symbol)
+    return {
+        "status": "error",
+        "symbol": sym,
+        "symbol_normalized": sym,
+        "data_source": DATA_SOURCE,
+        "provider": DATA_SOURCE,
+        "data_quality": DataQuality.ERROR.value,
+        "error": err,
+        "where": fn_name,
+        "shim_version": SHIM_VERSION,
+        "last_updated_utc": _utc_iso(),
+        "last_updated_riyadh": _riyadh_iso(),
+    }
+
+
+# =============================================================================
+# Shim callable
+# =============================================================================
+class ShimFunction:
+    def __init__(
+        self,
+        name: str,
+        *,
+        canonical_name: Optional[str] = None,
+        default_factory: Optional[Callable[..., Any]] = None,
+        fallback_factory: Optional[Callable[..., Any]] = None,
+    ):
+        self.name = name
+        self.canonical_name = canonical_name or name
+        self.default_factory = default_factory
+        self.fallback_factory = fallback_factory
+        self._backoff = FullJitterBackoff(
+            attempts=_env_int("SHIM_YAHOO_RETRY_ATTEMPTS", 2, lo=0, hi=6),
+            base=_env_float("SHIM_YAHOO_RETRY_BASE_SEC", 0.35, lo=0.05, hi=5.0),
+            cap=_env_float("SHIM_YAHOO_RETRY_CAP_SEC", 3.0, lo=0.2, hi=20.0),
+        )
+
+    async def __call__(self, *args, **kwargs) -> Any:
+        start_mono = time.monotonic()
+        sym = _safe_symbol(kwargs.get("symbol") or (args[0] if args else ""))
+
+        async def _call_canonical() -> Any:
+            info = await _PROVIDER.get()
+            if not info.available:
+                raise RuntimeError(info.error or "canonical_unavailable")
+            fn = info.funcs.get(self.canonical_name)
+            if fn is None:
+                raise AttributeError(f"canonical_missing_fn:{self.canonical_name}")
+            k2 = _adapt_kwargs(fn, kwargs)
+            res = fn(*args, **k2)
+            res = await _maybe_await(res)
+            return _ensure_shape(res, symbol=sym, provider_version=info.version, fn_name=self.name)
+
+        async def _call_fallback() -> Any:
+            if self.fallback_factory is None:
+                raise RuntimeError("fallback_missing")
+            res = self.fallback_factory(*args, **kwargs)
+            res = await _maybe_await(res)
+            return _ensure_shape(res, symbol=sym, provider_version=None, fn_name=self.name)
+
+        with TraceContext(f"yahoo_shim.{self.name}", {"symbol": sym, "fn": self.name}):
+            try:
+                t0 = time.monotonic()
+                out = await self._backoff.run(_call_canonical)
+                shim_requests_total.labels(fn=self.name, status="ok").inc()
+                shim_request_seconds.labels(fn=self.name).observe(max(0.0, time.monotonic() - t0))
+                _track(self.name, start_mono, True)
+                return out
+            except Exception as e:
+                shim_requests_total.labels(fn=self.name, status="err").inc()
+                _track(self.name, start_mono, False, e)
+
+                # fallback path (if enabled)
+                if _env_bool("SHIM_YAHOO_FALLBACK_ON_ERROR", True) and self.fallback_factory is not None:
+                    try:
+                        t0 = time.monotonic()
+                        out = await self._backoff.run(_call_fallback)
+                        shim_requests_total.labels(fn=self.name, status="fallback").inc()
+                        shim_request_seconds.labels(fn=self.name).observe(max(0.0, time.monotonic() - t0))
+                        return out
+                    except Exception as e2:
+                        return _error_payload(sym, f"{e.__class__.__name__}:{e}; fallback:{e2.__class__.__name__}:{e2}", fn_name=self.name)
+
+                return _error_payload(sym, f"{e.__class__.__name__}:{e}", fn_name=self.name)
+
+
+# =============================================================================
+# Default handlers (used only if canonical missing)
+# =============================================================================
+async def _default_quote(symbol: str, *args, **kwargs) -> Dict[str, Any]:
+    sym = _safe_symbol(symbol)
+    return {
+        "status": "error",
+        "symbol": sym,
+        "symbol_normalized": sym,
+        "data_source": DATA_SOURCE,
+        "provider": DATA_SOURCE,
+        "data_quality": DataQuality.MISSING.value,
+        "error": "canonical_unavailable",
+        "shim_version": SHIM_VERSION,
+        "last_updated_utc": _utc_iso(),
+        "last_updated_riyadh": _riyadh_iso(),
+    }
+
+
+async def _default_patch(symbol: str, base: Optional[Dict[str, Any]] = None, *args, **kwargs) -> Dict[str, Any]:
+    out = dict(base or {})
+    out.update(await _default_quote(symbol, *args, **kwargs))
+    return out
+
+
+async def _default_history(*args, **kwargs) -> List[Dict[str, Any]]:
     return []
 
-fetch_price_history = fetch_history
-fetch_ohlc_history = fetch_history
-fetch_history_patch = fetch_history
-fetch_prices = fetch_history
 
-async def get_client_metrics() -> Dict[str, Any]:
-    return {"version": PROVIDER_VERSION, "cache_size": await (await get_provider()).quote_cache.size()}
+# =============================================================================
+# Public shim callables (legacy API surface)
+# =============================================================================
+fetch_quote = ShimFunction("fetch_quote", canonical_name="fetch_quote", fallback_factory=_default_quote)
+get_quote = ShimFunction("get_quote", canonical_name="get_quote", fallback_factory=_default_quote)
 
-async def health_check() -> Dict[str, Any]:
-    res = await fetch_enriched_quote_patch("AAPL")
-    return {"status": "healthy" if "error" not in res else "unhealthy"}
+get_quote_patch = ShimFunction("get_quote_patch", canonical_name="get_quote_patch", fallback_factory=_default_patch)
+fetch_quote_patch = ShimFunction("fetch_quote_patch", canonical_name="fetch_quote_patch", fallback_factory=_default_patch)
+fetch_enriched_quote_patch = ShimFunction("fetch_enriched_quote_patch", canonical_name="fetch_enriched_quote_patch", fallback_factory=_default_patch)
 
-async def clear_caches() -> None:
-    await (await get_provider()).quote_cache.clear()
+fetch_quote_and_enrichment_patch = ShimFunction(
+    "fetch_quote_and_enrichment_patch",
+    canonical_name="fetch_quote_and_enrichment_patch",
+    fallback_factory=_default_patch,
+)
 
-async def aclose_yahoo_client() -> None:
-    global _PROVIDER_INSTANCE
-    _PROVIDER_INSTANCE = None
-aclose_yahoo_chart_client = aclose_yahoo_client
+fetch_quote_and_fundamentals_patch = ShimFunction(
+    "fetch_quote_and_fundamentals_patch",
+    canonical_name="fetch_quote_and_fundamentals_patch",
+    fallback_factory=_default_patch,
+)
 
+yahoo_chart_quote = ShimFunction("yahoo_chart_quote", canonical_name="yahoo_chart_quote", fallback_factory=_default_quote)
+
+fetch_price_history = ShimFunction("fetch_price_history", canonical_name="fetch_price_history", fallback_factory=_default_history)
+fetch_history = ShimFunction("fetch_history", canonical_name="fetch_history", fallback_factory=_default_history)
+fetch_ohlc_history = ShimFunction("fetch_ohlc_history", canonical_name="fetch_ohlc_history", fallback_factory=_default_history)
+fetch_history_patch = ShimFunction("fetch_history_patch", canonical_name="fetch_history_patch", fallback_factory=_default_history)
+fetch_prices = ShimFunction("fetch_prices", canonical_name="fetch_prices", fallback_factory=_default_history)
+
+
+# =============================================================================
+# Class compatibility wrapper
+# =============================================================================
+class YahooChartProvider:
+    """
+    Backward compatible provider class.
+    Delegates to canonical class if available, otherwise to shim callables.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._args = args
+        self._kwargs = kwargs
+        self._inner = None
+        self._lock = asyncio.Lock()
+
+    async def _ensure_inner(self) -> None:
+        if self._inner is not None:
+            return
+        async with self._lock:
+            if self._inner is not None:
+                return
+            info = await _PROVIDER.get()
+            if info.available and hasattr(info.module, "YahooChartProvider"):
+                try:
+                    self._inner = info.module.YahooChartProvider(*self._args, **self._kwargs)
+                except Exception:
+                    self._inner = None
+
+    async def __aenter__(self):
+        await self._ensure_inner()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        await self._ensure_inner()
+        if self._inner is not None and hasattr(self._inner, "aclose"):
+            try:
+                v = self._inner.aclose()
+                if inspect.isawaitable(v):
+                    await v
+            except Exception:
+                pass
+        self._inner = None
+
+    async def fetch_quote(self, symbol: str, *args, **kwargs) -> Dict[str, Any]:
+        await self._ensure_inner()
+        if self._inner is not None and hasattr(self._inner, "fetch_quote"):
+            try:
+                v = self._inner.fetch_quote(symbol, *args, **kwargs)
+                v = await _maybe_await(v)
+                return _ensure_shape(v, symbol=_safe_symbol(symbol), provider_version=None, fn_name="fetch_quote")
+            except Exception:
+                pass
+        return await fetch_quote(symbol=symbol, *args, **kwargs)
+
+    async def get_quote_patch(self, symbol: str, base: Optional[Dict[str, Any]] = None, *args, **kwargs) -> Dict[str, Any]:
+        await self._ensure_inner()
+        if self._inner is not None and hasattr(self._inner, "get_quote_patch"):
+            try:
+                v = self._inner.get_quote_patch(symbol, base, *args, **kwargs)
+                v = await _maybe_await(v)
+                return _ensure_shape(v, symbol=_safe_symbol(symbol), provider_version=None, fn_name="get_quote_patch")
+            except Exception:
+                pass
+        return await get_quote_patch(symbol=symbol, base=base, *args, **kwargs)
+
+
+# =============================================================================
+# Utilities
+# =============================================================================
+async def get_provider_status() -> Dict[str, Any]:
+    info = await _PROVIDER.get()
+    return {
+        "shim_version": SHIM_VERSION,
+        "data_source": DATA_SOURCE,
+        "canonical_available": bool(info.available),
+        "canonical_version": info.version if info.available else None,
+        "canonical_error": info.error if not info.available else None,
+        "ttl_sec": _PROVIDER.ttl,
+        "telemetry": _TELEMETRY.snapshot(),
+        "timestamp_utc": _utc_iso(),
+        "timestamp_riyadh": _riyadh_iso(),
+    }
+
+
+async def clear_cache() -> None:
+    global _PROVIDER
+    _PROVIDER = ProviderCache()
+    shim_provider_available.set(0)
+
+
+def get_version() -> str:
+    return SHIM_VERSION
+
+
+# =============================================================================
+# Exports
+# =============================================================================
 __all__ = [
-    "YAHOO_CHART_URL", "DATA_SOURCE", "PROVIDER_VERSION", "DataQuality", "YahooChartProvider",
-    "fetch_quote", "get_quote", "get_quote_patch", "fetch_quote_patch", "fetch_enriched_quote_patch",
-    "fetch_quote_and_enrichment_patch", "fetch_quote_and_fundamentals_patch", "yahoo_chart_quote",
-    "fetch_price_history", "fetch_history", "fetch_ohlc_history", "fetch_history_patch", "fetch_prices",
-    "aclose_yahoo_chart_client", "aclose_yahoo_client", "get_client_metrics", "clear_caches", "health_check",
+    "SHIM_VERSION",
+    "DATA_SOURCE",
+    "DataQuality",
+    "YahooChartProvider",
+    "fetch_quote",
+    "get_quote",
+    "get_quote_patch",
+    "fetch_quote_patch",
+    "fetch_enriched_quote_patch",
+    "fetch_quote_and_enrichment_patch",
+    "fetch_quote_and_fundamentals_patch",
+    "yahoo_chart_quote",
+    "fetch_price_history",
+    "fetch_history",
+    "fetch_ohlc_history",
+    "fetch_history_patch",
+    "fetch_prices",
+    "get_provider_status",
+    "clear_cache",
+    "get_version",
 ]
+
+
+# =============================================================================
+# Self-run diagnostics (manual)
+# =============================================================================
+if __name__ == "__main__":
+    async def _diag() -> None:
+        sys.stdout.write("Yahoo shim diagnostics\n")
+        sys.stdout.write("=" * 60 + "\n")
+        st = await get_provider_status()
+        sys.stdout.write(json_dumps(st, default=str) + "\n")
+        sys.stdout.write("=" * 60 + "\n")
+        res = await fetch_quote(symbol="AAPL")
+        sys.stdout.write(json_dumps(res, default=str) + "\n")
+
+    asyncio.run(_diag())
