@@ -2,31 +2,25 @@
 # scripts/run_sheet_init.py
 """
 ================================================================================
-TADAWUL FAST BRIDGE — SHEET INITIALIZER — v6.1.0 (STABLE / ALIGNED / FAST)
+TADAWUL FAST BRIDGE — SHEET INITIALIZER — v6.2.0 (STABLE / ALIGNED / FAST)
 ================================================================================
 
-Primary goals
-- ✅ Create/initialize tabs with the *correct headers* (aligned with core.schemas + router output)
-- ✅ Apply consistent formatting (Nunito, frozen panes, filter, banding, widths, number formats)
-- ✅ Safe retries with Full-Jitter backoff for Google API throttling/conflicts
-- ✅ Parallel tab initialization (optional) without breaking thread-safety
-- ✅ No hard dependency on openpyxl / gspread (uses Google Sheets API service when available)
+What this script does
+- Creates / initializes tabs using headers aligned to core.schemas (vNext or legacy)
+- Applies consistent formatting (Nunito, frozen panes, filter, banding, widths, number formats)
+- Uses Full-Jitter backoff for Google Sheets API throttling/conflicts (429/409/5xx)
+- Optional parallel initialization (thread pool) with safe retry wrappers
+- NO hard dependency on openpyxl / gspread (uses your google_sheets_service module)
 
-Major fixes vs your pasted script
-- ✅ Removed duplicated FullJitterBackoff (it was defined twice)
-- ✅ Fixed TraceContext usage (proper start_as_current_span + safe fallbacks)
-- ✅ Fixed invalid header read range patterns and safer "headers already exist" detection
-- ✅ Fixed percent formatting pitfall:
-     Your backend often returns percent *points* (e.g., 1.23 = 1.23%),
-     so applying Google PERCENT format would show 123%.
-     We use NUMBER format "0.00" for percent columns by default.
-- ✅ Removed openpyxl range parsing; replaced with lightweight A1 helpers
-- ✅ BatchUpdate request chunking (avoids hitting request limits)
-- ✅ “Core schemas first”:
-     Pulls headers from core.schemas.get_headers_for_sheet(version=legacy|vNext)
-     and falls back to ENRICHED_HEADERS_61 if core.schemas is unavailable.
+Critical fix: Percent “ratio explosion”
+- Your backend currently emits many % fields as *percent points*:
+    1.23 means 1.23% (NOT 0.0123)
+- If Google Sheets column is formatted as PERCENT, it multiplies by 100 and shows 123%
+- Default behavior here: format percent-like columns as NUMBER "0.00"
+- If/when your backend returns fractions (0.0123), you can switch:
+    --percent-mode fraction   (or set TFB_PERCENT_MODE=fraction)
 
-Usage examples
+Usage
 - Initialize standard tabs (create missing):
     python scripts/run_sheet_init.py --create-missing --parallel
 
@@ -39,6 +33,8 @@ Usage examples
 Env
 - DEFAULT_SPREADSHEET_ID (recommended)
 - CORE_TRACING_ENABLED (optional)
+- TFB_PERCENT_MODE=points|fraction  (default: points)
+================================================================================
 """
 
 from __future__ import annotations
@@ -57,12 +53,11 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
-
 # =============================================================================
-# Logging
+# Version + Logging
 # =============================================================================
 
-SCRIPT_VERSION = "6.1.0"
+SCRIPT_VERSION = "6.2.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,7 +65,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("TFB.SheetInit")
-
 
 # =============================================================================
 # Optional deps (safe)
@@ -98,7 +92,6 @@ except Exception:
     Status = None  # type: ignore
     StatusCode = None  # type: ignore
 
-
 # =============================================================================
 # Metrics (safe)
 # =============================================================================
@@ -106,10 +99,13 @@ except Exception:
 class _DummyMetric:
     def labels(self, *args, **kwargs):  # noqa
         return self
+
     def inc(self, *args, **kwargs):  # noqa
         return None
+
     def observe(self, *args, **kwargs):  # noqa
         return None
+
 
 if _PROM_AVAILABLE:
     sheet_ops_total = Counter("tfb_sheet_ops_total", "Sheet operations", ["op", "status"])
@@ -118,7 +114,6 @@ else:
     sheet_ops_total = _DummyMetric()
     sheet_ops_seconds = _DummyMetric()
 
-
 # =============================================================================
 # Time helpers
 # =============================================================================
@@ -126,11 +121,10 @@ else:
 UTC = timezone.utc
 RIYADH = timezone(timedelta(hours=3))
 
+
 def utc_now() -> datetime:
     return datetime.now(UTC)
 
-def riyadh_now() -> datetime:
-    return datetime.now(RIYADH)
 
 def utc_iso(dt: Optional[datetime] = None) -> str:
     d = dt or utc_now()
@@ -145,6 +139,7 @@ def utc_iso(dt: Optional[datetime] = None) -> str:
 
 _TRACING_ENABLED = (os.getenv("CORE_TRACING_ENABLED", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
+
 class TraceContext:
     def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
         self.name = name
@@ -157,11 +152,11 @@ class TraceContext:
             try:
                 self._span_cm = _TRACER.start_as_current_span(self.name)
                 self._span = self._span_cm.__enter__()
-                try:
-                    for k, v in (self.attributes or {}).items():
+                for k, v in (self.attributes or {}).items():
+                    try:
                         self._span.set_attribute(str(k), v)
-                except Exception:
-                    pass
+                    except Exception:
+                        pass
             except Exception:
                 self._span_cm = None
                 self._span = None
@@ -199,7 +194,7 @@ def _http_status_from_error(err: Exception) -> Optional[int]:
     except Exception:
         pass
 
-    # gspread APIError sometimes contains response status
+    # sometimes nested
     try:
         if hasattr(err, "response") and hasattr(err.response, "status_code"):
             return int(err.response.status_code)
@@ -212,6 +207,7 @@ def _http_status_from_error(err: Exception) -> Optional[int]:
 class FullJitterBackoff:
     """
     AWS-style Full Jitter backoff for Google API calls.
+    Retries: 429, 409, 408, 5xx (and unknown limited retries)
     """
 
     def __init__(self, max_retries: int = 5, base_delay: float = 1.0, max_delay: float = 60.0):
@@ -234,10 +230,8 @@ class FullJitterBackoff:
 
                 retryable = False
                 if status is None:
-                    # unknown error: allow limited retries
                     retryable = True
                 else:
-                    # common retryable statuses
                     retryable = status in (429, 409, 408) or (500 <= status <= 599)
 
                 if attempt >= self.max_retries or not retryable:
@@ -248,11 +242,15 @@ class FullJitterBackoff:
                 sleep_s = random.uniform(0, temp)
                 logger.warning(
                     "%s failed (status=%s). retry %s/%s in %.2fs: %s",
-                    op_name, status, attempt + 1, self.max_retries, sleep_s, repr(e),
+                    op_name,
+                    status,
+                    attempt + 1,
+                    self.max_retries,
+                    sleep_s,
+                    repr(e),
                 )
                 time.sleep(sleep_s)
 
-        # should not reach
         raise last_err or RuntimeError("Backoff exhausted")
 
 
@@ -261,16 +259,7 @@ class FullJitterBackoff:
 # =============================================================================
 
 _A1_COL_RE = re.compile(r"^[A-Z]+$", re.IGNORECASE)
-_A1_CELL_RE = re.compile(r"^([A-Z]+)(\d+)$", re.IGNORECASE)
 
-def col_to_index(col: str) -> int:
-    c = (col or "").strip().upper()
-    if not c or not _A1_COL_RE.match(c):
-        raise ValueError(f"Invalid column: {col!r}")
-    n = 0
-    for ch in c:
-        n = n * 26 + (ord(ch) - ord("A") + 1)
-    return n - 1
 
 def index_to_col(idx: int) -> str:
     if idx < 0:
@@ -282,13 +271,31 @@ def index_to_col(idx: int) -> str:
         out = chr(rem + ord("A")) + out
     return out
 
+
 def safe_tab_title(title: str) -> str:
     t = (title or "").strip()
     if not t:
         return "Sheet1"
-    # Google sheets doesn't allow some chars; keep it simple
+    # disallow: []:*?/\ (and keep length safe)
     t = re.sub(r"[\[\]\:\*\?\/\\]", " ", t).strip()
+    t = re.sub(r"\s+", " ", t)
     return t[:99] if len(t) > 99 else t
+
+
+# =============================================================================
+# Percent convention (IMPORTANT)
+# =============================================================================
+
+class PercentMode(str, Enum):
+    POINTS = "points"     # 1.23 means 1.23% (recommended for your current backend)
+    FRACTION = "fraction" # 0.0123 means 1.23% (Sheets percent format friendly)
+
+
+def resolve_percent_mode(cli_value: Optional[str]) -> PercentMode:
+    raw = (cli_value or os.getenv("TFB_PERCENT_MODE") or "points").strip().lower()
+    if raw in {"fraction", "decimal", "dec"}:
+        return PercentMode.FRACTION
+    return PercentMode.POINTS
 
 
 # =============================================================================
@@ -299,10 +306,11 @@ class FieldType(str, Enum):
     STRING = "string"
     NUMBER = "number"
     INT = "int"
-    PERCENT_POINTS = "percent_points"   # IMPORTANT: values are percent points (1.23 means 1.23%)
+    PERCENT = "percent"
     DATE = "date"
     DATETIME = "datetime"
     SCORE = "score"
+
 
 @dataclass(slots=True)
 class FieldDef:
@@ -312,6 +320,7 @@ class FieldDef:
     align: str
     number_format: Optional[Dict[str, str]] = None
 
+
 def infer_field_type(header: str) -> FieldType:
     h = (header or "").strip().lower()
 
@@ -320,22 +329,32 @@ def infer_field_type(header: str) -> FieldType:
     if "date" in h:
         return FieldType.DATE
 
-    # percent-like columns in your system are usually percent POINTS
-    if "%" in h or "percent" in h or "yield" in h or "margin" in h or "growth" in h or "turnover" in h or "upside" in h:
-        return FieldType.PERCENT_POINTS
-
     if any(x in h for x in ("score", "rsi", "rating", "confidence")):
         return FieldType.SCORE
 
-    if any(x in h for x in ("volume", "shares", "count")):
+    if any(x in h for x in ("volume", "shares", "count", "points")):
         return FieldType.INT
+
+    # percent-ish fields (your schema uses lots of these)
+    if (
+        "%" in h
+        or "percent" in h
+        or "yield" in h
+        or "margin" in h
+        or "growth" in h
+        or "turnover" in h
+        or "upside" in h
+        or "position" in h
+    ):
+        return FieldType.PERCENT
 
     if any(x in h for x in ("price", "close", "open", "high", "low", "cap", "eps", "p/e", "p/b", "p/s", "ev/ebitda", "value")):
         return FieldType.NUMBER
 
     return FieldType.STRING
 
-def default_format(ft: FieldType) -> Tuple[int, str, Optional[Dict[str, str]]]:
+
+def default_format(ft: FieldType, percent_mode: PercentMode) -> Tuple[int, str, Optional[Dict[str, str]]]:
     # width, alignment, number_format
     if ft == FieldType.STRING:
         return 220, "LEFT", None
@@ -343,8 +362,12 @@ def default_format(ft: FieldType) -> Tuple[int, str, Optional[Dict[str, str]]]:
         return 120, "RIGHT", {"type": "NUMBER", "pattern": "#,##0"}
     if ft == FieldType.NUMBER:
         return 120, "RIGHT", {"type": "NUMBER", "pattern": "#,##0.00"}
-    if ft == FieldType.PERCENT_POINTS:
-        # IMPORTANT: keep as NUMBER, not PERCENT (backend sends percent points)
+    if ft == FieldType.PERCENT:
+        # CRITICAL:
+        # - points mode: keep NUMBER to avoid x100 in display
+        # - fraction mode: use PERCENT format (Sheet expects 0.0123)
+        if percent_mode == PercentMode.FRACTION:
+            return 100, "RIGHT", {"type": "PERCENT", "pattern": "0.00%"}
         return 100, "RIGHT", {"type": "NUMBER", "pattern": "0.00"}
     if ft == FieldType.DATE:
         return 120, "CENTER", {"type": "DATE", "pattern": "yyyy-mm-dd"}
@@ -354,19 +377,23 @@ def default_format(ft: FieldType) -> Tuple[int, str, Optional[Dict[str, str]]]:
         return 100, "CENTER", {"type": "NUMBER", "pattern": "0.0"}
     return 140, "LEFT", None
 
-def build_field_defs(headers: Sequence[str]) -> List[FieldDef]:
+
+def build_field_defs(headers: Sequence[str], percent_mode: PercentMode) -> List[FieldDef]:
     out: List[FieldDef] = []
     for h in headers:
         ft = infer_field_type(h)
-        w, a, nf = default_format(ft)
-        # compact some known headers
-        hl = h.lower()
+        w, a, nf = default_format(ft, percent_mode)
+
+        hl = (h or "").strip().lower()
         if hl in ("rank", "#"):
             w, a, nf = 60, "CENTER", {"type": "NUMBER", "pattern": "0"}
-        if hl in ("symbol",):
+        elif hl == "symbol":
             w, a, nf = 110, "LEFT", None
-        if hl in ("name", "company name"):
+        elif hl in ("name", "company name"):
             w, a, nf = 260, "LEFT", None
+        elif hl == "error":
+            w, a, nf = 260, "LEFT", None
+
         out.append(FieldDef(header=h, field_type=ft, width=w, align=a, number_format=nf))
     return out
 
@@ -377,13 +404,10 @@ def build_field_defs(headers: Sequence[str]) -> List[FieldDef]:
 
 def _core_schemas_headers(tab_name: str, schema_version: str) -> Optional[List[str]]:
     """
-    Tries to pull headers from core.schemas.
+    Pull headers from core.schemas.get_headers_for_sheet(version=...)
     schema_version: "vNext" or "legacy"
     """
-    candidates = [
-        "core.schemas",
-        "schemas",
-    ]
+    candidates = ["core.schemas", "schemas"]
     for mod in candidates:
         try:
             m = __import__(mod, fromlist=["get_headers_for_sheet", "resolve_sheet_key"])
@@ -396,13 +420,15 @@ def _core_schemas_headers(tab_name: str, schema_version: str) -> Optional[List[s
                         sheet_key = resolve_sheet_key(tab_name)
                     except Exception:
                         sheet_key = tab_name
-                return list(get_headers_for_sheet(sheet_key, version=schema_version))
+                headers = get_headers_for_sheet(sheet_key, version=schema_version)
+                if isinstance(headers, (list, tuple)) and len(headers) >= 10:
+                    return list(headers)
         except Exception:
             continue
     return None
 
 
-# fallback aligned to your router (enriched headers = 61)
+# Fallback aligned to your router (61 columns)
 ENRICHED_HEADERS_61_FALLBACK: List[str] = [
     "Rank", "Symbol", "Origin", "Name", "Sector", "Sub Sector", "Market",
     "Currency", "Listing Date", "Price", "Prev Close", "Change", "Change %", "Day High", "Day Low",
@@ -423,7 +449,7 @@ ENRICHED_HEADERS_61_FALLBACK: List[str] = [
 
 def import_sheets_service_module() -> Optional[Any]:
     """
-    Tries multiple import paths so this script works across repo layouts.
+    Tries multiple import paths.
     Expects module to expose get_sheets_service().
     """
     paths = [
@@ -457,6 +483,7 @@ class StyleConfig:
     band_light: Dict[str, float] = field(default_factory=lambda: {"red": 1.0, "green": 1.0, "blue": 1.0})
     band_dark: Dict[str, float] = field(default_factory=lambda: {"red": 0.96, "green": 0.96, "blue": 0.96})
 
+
 class StyleBuilder:
     def __init__(self, spreadsheet_id: str, service: Any, config: Optional[StyleConfig] = None):
         self.spreadsheet_id = spreadsheet_id
@@ -465,8 +492,8 @@ class StyleBuilder:
         self.requests: List[Dict[str, Any]] = []
 
     def _chunked_batch_update(self, requests: List[Dict[str, Any]], backoff: FullJitterBackoff) -> None:
-        # Google API has practical limits; keep chunks moderate.
-        CHUNK = 350
+        # Keep chunks moderate to avoid payload limits
+        CHUNK = 300
         for i in range(0, len(requests), CHUNK):
             part = requests[i:i + CHUNK]
             backoff.call(
@@ -476,6 +503,17 @@ class StyleBuilder:
                     body={"requests": p},
                 ).execute(),
             )
+
+    def add_resize_grid(self, sheet_id: int, row_count: int, col_count: int) -> None:
+        self.requests.append({
+            "updateSheetProperties": {
+                "properties": {
+                    "sheetId": sheet_id,
+                    "gridProperties": {"rowCount": int(row_count), "columnCount": int(col_count)},
+                },
+                "fields": "gridProperties.rowCount,gridProperties.columnCount",
+            }
+        })
 
     def add_freeze(self, sheet_id: int, frozen_rows: int, frozen_cols: int) -> None:
         self.requests.append({
@@ -510,7 +548,7 @@ class StyleBuilder:
                         },
                     }
                 },
-                "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment,wrapStrategy)"
+                "fields": "userEnteredFormat(backgroundColor,textFormat,horizontalAlignment,verticalAlignment,wrapStrategy)",
             }
         })
         self.requests.append({
@@ -520,6 +558,10 @@ class StyleBuilder:
                 "fields": "pixelSize",
             }
         })
+
+    def clear_basic_filter(self, sheet_id: int) -> None:
+        # Avoid "Filter already exists" errors
+        self.requests.append({"clearBasicFilter": {"sheetId": sheet_id}})
 
     def add_filter(self, sheet_id: int, header_row_1based: int, col_count: int) -> None:
         r0 = max(0, header_row_1based - 1)
@@ -532,7 +574,6 @@ class StyleBuilder:
         })
 
     def add_banding(self, sheet_id: int, data_start_row_1based: int, col_count: int) -> None:
-        # startRowIndex is 0-based; banding should begin at data start row (not header row)
         start = max(0, data_start_row_1based - 1)
         self.requests.append({
             "addBanding": {
@@ -578,10 +619,10 @@ class StyleBuilder:
 
     def add_conditional_formats(self, sheet_id: int, headers: List[str], header_row_1based: int) -> None:
         """
-        Minimal but effective:
-        - Change %: green if >=0, red if <0
-        - Upside %: green if >=10, red if <-10
-        - Error: red background if not blank
+        Minimal rules:
+        - Change %: green >=0, red <0
+        - Upside %: green >=10, red <=-10
+        - Error: light red background if not blank
         """
         data_start = header_row_1based + 1
         start_row = max(0, data_start - 1)
@@ -599,14 +640,14 @@ class StyleBuilder:
                         }],
                         "booleanRule": {
                             "condition": {"type": op, "values": [{"userEnteredValue": str(value)}]},
-                            "format": fmt
-                        }
+                            "format": fmt,
+                        },
                     },
-                    "index": 0
+                    "index": 0,
                 }
             })
 
-        def add_text_not_blank(col_idx: int, rgb: Dict[str, float]):
+        def add_not_blank_bg(col_idx: int, rgb: Dict[str, float]):
             self.requests.append({
                 "addConditionalFormatRule": {
                     "rule": {
@@ -617,15 +658,14 @@ class StyleBuilder:
                             "endColumnIndex": col_idx + 1,
                         }],
                         "booleanRule": {
-                            "condition": {"type": "TEXT_NOT_CONTAINS", "values": [{"userEnteredValue": ""}]},
-                            "format": {"backgroundColor": rgb}
-                        }
+                            "condition": {"type": "NOT_BLANK"},
+                            "format": {"backgroundColor": rgb},
+                        },
                     },
-                    "index": 0
+                    "index": 0,
                 }
             })
 
-        # locate columns by header name
         norm = {h.strip().lower(): i for i, h in enumerate(headers)}
 
         if "change %" in norm:
@@ -640,7 +680,7 @@ class StyleBuilder:
 
         if "error" in norm:
             i = norm["error"]
-            add_text_not_blank(i, {"red": 1.0, "green": 0.85, "blue": 0.85})
+            add_not_blank_bg(i, {"red": 1.0, "green": 0.88, "blue": 0.88})
 
     def execute(self, backoff: FullJitterBackoff) -> None:
         if not self.requests:
@@ -661,9 +701,10 @@ class SheetManager:
         self.sheet_id_by_title: Dict[str, int] = {}
 
     def refresh_meta(self) -> None:
-        def _get():
-            return self.service.spreadsheets().get(spreadsheetId=self.spreadsheet_id).execute()
-        ss = self.backoff.call("spreadsheets.get", _get)
+        ss = self.backoff.call(
+            "spreadsheets.get",
+            lambda: self.service.spreadsheets().get(spreadsheetId=self.spreadsheet_id).execute()
+        )
         self.sheet_id_by_title = {}
         for sh in ss.get("sheets", []):
             props = sh.get("properties", {}) or {}
@@ -678,23 +719,17 @@ class SheetManager:
     def get_sheet_id(self, title: str) -> Optional[int]:
         return self.sheet_id_by_title.get(title)
 
-    def create_tab(self, title: str, rows: int = 2000, cols: int = 80) -> int:
+    def create_tab(self, title: str, rows: int = 2000, cols: int = 100) -> int:
         title = safe_tab_title(title)
-
-        def _create():
-            return self.service.spreadsheets().batchUpdate(
+        resp = self.backoff.call(
+            "addSheet",
+            lambda: self.service.spreadsheets().batchUpdate(
                 spreadsheetId=self.spreadsheet_id,
                 body={"requests": [{
-                    "addSheet": {
-                        "properties": {
-                            "title": title,
-                            "gridProperties": {"rowCount": int(rows), "columnCount": int(cols)},
-                        }
-                    }
+                    "addSheet": {"properties": {"title": title, "gridProperties": {"rowCount": int(rows), "columnCount": int(cols)}}}
                 }]}
             ).execute()
-
-        resp = self.backoff.call("addSheet", _create)
+        )
         sheet_id = int(resp["replies"][0]["addSheet"]["properties"]["sheetId"])
         self.sheet_id_by_title[title] = sheet_id
         return sheet_id
@@ -702,15 +737,11 @@ class SheetManager:
     def read_header_row(self, title: str, header_row_1based: int) -> List[str]:
         title = safe_tab_title(title)
         rng = f"'{title}'!{header_row_1based}:{header_row_1based}"
-
-        def _get():
-            return self.service.spreadsheets().values().get(
-                spreadsheetId=self.spreadsheet_id,
-                range=rng,
-            ).execute()
-
         try:
-            res = self.backoff.call("values.get.headers", _get)
+            res = self.backoff.call(
+                "values.get.headers",
+                lambda: self.service.spreadsheets().values().get(spreadsheetId=self.spreadsheet_id, range=rng).execute()
+            )
             values = res.get("values", [])
             return list(values[0]) if values else []
         except Exception:
@@ -723,25 +754,24 @@ class SheetManager:
         if clear_first:
             end_col = index_to_col(max(0, len(headers) - 1))
             clear_range = f"'{title}'!A{header_row_1based}:{end_col}{header_row_1based}"
-
-            def _clear():
-                return self.service.spreadsheets().values().clear(
+            self.backoff.call(
+                "values.clear.headers",
+                lambda: self.service.spreadsheets().values().clear(
                     spreadsheetId=self.spreadsheet_id,
                     range=clear_range,
                     body={},
                 ).execute()
+            )
 
-            self.backoff.call("values.clear.headers", _clear)
-
-        def _update():
-            return self.service.spreadsheets().values().update(
+        self.backoff.call(
+            "values.update.headers",
+            lambda: self.service.spreadsheets().values().update(
                 spreadsheetId=self.spreadsheet_id,
                 range=start_cell,
                 valueInputOption="RAW",
                 body={"values": [headers]},
             ).execute()
-
-        self.backoff.call("values.update.headers", _update)
+        )
 
 
 # =============================================================================
@@ -758,24 +788,23 @@ DEFAULT_TABS = [
     "Insights_Analysis",
 ]
 
-def normalize_tab_key(tab: str) -> str:
-    t = (tab or "").strip().lower().replace(" ", "_")
-    return t
 
 def pick_headers_for_tab(tab_name: str, schema_version: str) -> List[str]:
-    # Core schemas first
     headers = _core_schemas_headers(tab_name, schema_version)
     if headers and len(headers) >= 10:
         return headers
-
-    # fallback: use enriched headers for all
     return list(ENRICHED_HEADERS_61_FALLBACK)
 
+
 def make_bilingual_headers(headers: List[str]) -> List[str]:
-    # Minimal Arabic mapping for common headers; others stay English.
+    """
+    Single-row bilingual label.
+    NOTE: Use this only if your downstream scripts do NOT require exact header match.
+    """
     ar = {
         "Rank": "الترتيب",
         "Symbol": "الرمز",
+        "Origin": "المصدر",
         "Name": "الاسم",
         "Sector": "القطاع",
         "Sub Sector": "القطاع الفرعي",
@@ -800,26 +829,43 @@ def make_bilingual_headers(headers: List[str]) -> List[str]:
     }
     out = []
     for h in headers:
-        out.append(f"{h} | {ar.get(h, '')}".rstrip(" |"))
+        a = ar.get(h, "")
+        out.append(f"{h} | {a}".rstrip(" |"))
     return out
 
 
 # =============================================================================
-# Worker
+# Worker + concurrency
 # =============================================================================
 
 _IO_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=5, thread_name_prefix="TFB-SheetWorker")
 
-def _headers_non_empty(headers: Sequence[Any]) -> bool:
+
+def _headers_non_empty(headers: Sequence[Any], min_filled: int = 3) -> bool:
     if not headers:
         return False
+    filled = 0
     for x in headers:
         if x is None:
             continue
-        s = str(x).strip()
-        if s:
-            return True
+        if str(x).strip():
+            filled += 1
+            if filled >= min_filled:
+                return True
     return False
+
+
+def _headers_match(existing: Sequence[Any], new_headers: Sequence[str]) -> bool:
+    if not existing:
+        return False
+    # Compare first N non-empty cells (common practical)
+    ex = [str(x).strip() for x in existing if str(x).strip()]
+    nw = [str(x).strip() for x in new_headers if str(x).strip()]
+    if not ex or not nw:
+        return False
+    n = min(len(ex), len(nw), 20)
+    return ex[:n] == nw[:n]
+
 
 def process_tab_sync(
     manager: SheetManager,
@@ -832,39 +878,52 @@ def process_tab_sync(
     create_missing: bool,
     no_style: bool,
     bilingual: bool,
+    dry_run: bool,
+    percent_mode: PercentMode,
+    resize_grid: bool,
+    grid_rows: int,
+    grid_cols: int,
 ) -> Tuple[str, str]:
     """
     Returns: (tab_name, status) where status in {"success","skipped","failed"}
     """
     tab_name = safe_tab_title(tab_name)
 
-    with TraceContext("process_tab_sync", {"tab": tab_name, "schema_version": schema_version}):
+    with TraceContext("process_tab_sync", {"tab": tab_name, "schema_version": schema_version, "percent_mode": percent_mode.value}):
         logger.info("—" * 72)
         logger.info("TAB: %s", tab_name)
 
         if not manager.tab_exists(tab_name):
             if create_missing:
-                try:
-                    sid = manager.create_tab(tab_name)
-                    logger.info("✅ Created tab '%s' (sheetId=%s)", tab_name, sid)
-                except Exception as e:
-                    logger.error("❌ Failed creating tab '%s': %s", tab_name, e)
-                    return tab_name, "failed"
+                if dry_run:
+                    logger.info("[DRY RUN] Would create tab '%s'", tab_name)
+                else:
+                    try:
+                        sid = manager.create_tab(tab_name, rows=grid_rows, cols=max(grid_cols, 60))
+                        logger.info("✅ Created tab '%s' (sheetId=%s)", tab_name, sid)
+                    except Exception as e:
+                        logger.error("❌ Failed creating tab '%s': %s", tab_name, e)
+                        return tab_name, "failed"
             else:
                 logger.warning("⏭️  Tab '%s' missing (use --create-missing)", tab_name)
                 return tab_name, "skipped"
 
         headers = pick_headers_for_tab(tab_name, schema_version)
-
-        if bilingual:
-            headers_to_write = make_bilingual_headers(headers)
-        else:
-            headers_to_write = list(headers)
+        headers_to_write = make_bilingual_headers(headers) if bilingual else list(headers)
 
         existing = manager.read_header_row(tab_name, header_row)
         if _headers_non_empty(existing) and not force:
-            logger.info("⏭️  Headers already exist (use --force to overwrite)")
+            if _headers_match(existing, headers_to_write):
+                logger.info("⏭️  Headers already match (skip)")
+            else:
+                logger.info("⏭️  Headers already exist (use --force to overwrite)")
             return tab_name, "skipped"
+
+        if dry_run:
+            logger.info("[DRY RUN] Would write %d headers to row %d", len(headers_to_write), header_row)
+            if not no_style:
+                logger.info("[DRY RUN] Would style '%s' (percent_mode=%s)", tab_name, percent_mode.value)
+            return tab_name, "success"
 
         # Write headers
         try:
@@ -884,18 +943,29 @@ def process_tab_sync(
                 if sheet_id is None:
                     raise RuntimeError("sheet_id not found after refresh")
 
-                field_defs = build_field_defs(headers)  # IMPORTANT: infer from canonical headers (not bilingual)
+                field_defs = build_field_defs(headers, percent_mode=percent_mode)  # infer from canonical headers
+
                 sb = StyleBuilder(manager.spreadsheet_id, manager.service, StyleConfig())
+
+                col_count = len(headers)
+                if resize_grid:
+                    sb.add_resize_grid(sheet_id, row_count=max(grid_rows, header_row + 50), col_count=max(grid_cols, col_count + 5))
+
                 sb.add_freeze(sheet_id, frozen_rows=header_row, frozen_cols=2)
-                sb.add_header_format(sheet_id, header_row, col_count=len(headers))
-                sb.add_filter(sheet_id, header_row, col_count=len(headers))
-                sb.add_banding(sheet_id, data_start_row_1based=header_row + 1, col_count=len(headers))
+                sb.add_header_format(sheet_id, header_row, col_count=col_count)
+
+                # filter: clear then set (prevents errors)
+                sb.clear_basic_filter(sheet_id)
+                sb.add_filter(sheet_id, header_row, col_count=col_count)
+
+                sb.add_banding(sheet_id, data_start_row_1based=header_row + 1, col_count=col_count)
                 sb.add_column_widths(sheet_id, field_defs)
                 sb.add_column_formats(sheet_id, field_defs, data_start_row_1based=header_row + 1)
                 sb.add_conditional_formats(sheet_id, headers, header_row_1based=header_row)
-                sb.execute(manager.backoff)
 
-                logger.info("✨ Styled '%s' (%d columns)", tab_name, len(headers))
+                sb.execute(manager.backoff)
+                logger.info("✨ Styled '%s' (%d columns) [percent_mode=%s]", tab_name, col_count, percent_mode.value)
+
             except Exception as e:
                 logger.error("❌ Styling failed for '%s': %s", tab_name, e)
                 return tab_name, "failed"
@@ -918,11 +988,13 @@ async def main_async(args: argparse.Namespace) -> int:
         logger.error("❌ No spreadsheet id. Provide --sheet-id or set DEFAULT_SPREADSHEET_ID.")
         return 1
 
-    schema_version = (args.schema_version or "vNext").strip()
-    if schema_version.lower() in {"legacy", "router", "enriched"}:
+    schema_version = (args.schema_version or "vNext").strip().lower()
+    if schema_version in {"legacy", "router", "enriched"}:
         schema_version = "legacy"
     else:
         schema_version = "vNext"
+
+    percent_mode = resolve_percent_mode(args.percent_mode)
 
     sheets_mod = import_sheets_service_module()
     if sheets_mod is None:
@@ -954,6 +1026,7 @@ async def main_async(args: argparse.Namespace) -> int:
     logger.info("TFB Sheet Initializer v%s", SCRIPT_VERSION)
     logger.info("Spreadsheet: %s", spreadsheet_id)
     logger.info("Schema version: %s", schema_version)
+    logger.info("Percent mode: %s", percent_mode.value)
     logger.info("Tabs: %s", ", ".join(target_tabs))
     logger.info("=" * 72)
 
@@ -971,6 +1044,11 @@ async def main_async(args: argparse.Namespace) -> int:
                 create_missing=bool(args.create_missing),
                 no_style=bool(args.no_style),
                 bilingual=bool(args.bilingual),
+                dry_run=bool(args.dry_run),
+                percent_mode=percent_mode,
+                resize_grid=bool(args.resize_grid),
+                grid_rows=int(args.grid_rows),
+                grid_cols=int(args.grid_cols),
             )
             stats[status] = stats.get(status, 0) + 1
             logger.info("RESULT: %s => %s", name, status.upper())
@@ -1007,8 +1085,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--clear", action="store_true", help="Clear header range before writing")
     p.add_argument("--no-style", action="store_true", help="Write headers only (skip styling)")
     p.add_argument("--bilingual", action="store_true", help="Write headers as 'EN | AR' (single row)")
+    p.add_argument("--percent-mode", default=None, help="points | fraction (default: points, or env TFB_PERCENT_MODE)")
     p.add_argument("--retry", type=int, default=3, help="Retry attempts for Google API calls")
     p.add_argument("--parallel", action="store_true", help="Process tabs in parallel")
+    p.add_argument("--dry-run", action="store_true", help="Preview actions without writing/styling")
+    p.add_argument("--resize-grid", action="store_true", help="Resize sheet grid rows/cols to fit headers")
+    p.add_argument("--grid-rows", type=int, default=2000, help="Grid rows when creating/resizing sheets")
+    p.add_argument("--grid-cols", type=int, default=100, help="Grid cols when creating/resizing sheets")
     p.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
 
     args = p.parse_args(argv)
