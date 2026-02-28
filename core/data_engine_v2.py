@@ -2,18 +2,28 @@
 """
 core/data_engine_v2.py
 ================================================================================
-Data Engine V2 — THE MASTER ORCHESTRATOR — v5.1.2 (GREEN STABLE PATCH)
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.2.0 (EODHD PRIMARY / RENDER SAFE)
 ================================================================================
 
-Fixes vs your pasted v5.1.1 draft:
-- ✅ SingleFlight fixed (no awaiting while holding lock) to avoid deadlocks
-- ✅ Semaphore usage fixed (async with) so we never release without acquire
-- ✅ Cache L1 warmed on disk hit (faster repeated reads)
-- ✅ Safer JSON/orjson helpers (consistent bytes/str handling)
-- ✅ Keeps your dual-import compatibility:
+Why this revision (aligned to your GLOBAL-first plan):
+- ✅ Enforces PRIMARY_PROVIDER ordering (GLOBAL: EODHD first by default)
+- ✅ Fixes provider ordering bug (your previous priorities made eodhd last)
+- ✅ KSA safety: optionally disallow EODHD on KSA via KSA_DISALLOW_EODHD unless override enabled
+- ✅ Accepts Settings from core/config.py when available (single source of truth)
+- ✅ Stronger patch normalization (keeps Change / Change % fields consistent)
+- ✅ Better “no data” diagnostics in `info` (kept as dict, not JSON string)
+- ✅ More resilient provider result handling (supports partial patches, keeps error detail)
+- ✅ Maintains your dual-import compatibility:
       - providers.* and core.providers.*
       - symbols.normalize and core.symbols.normalize
-- ✅ Keeps patch key normalization (price -> current_price)
+- ✅ Keeps your SingleFlight fix (no await inside lock)
+- ✅ Keeps multi-level cache (L1 + disk) with L1 warm on disk hit
+
+IMPORTANT:
+- This engine is the correct place to finalize GLOBAL provider selection.
+- The separate “No engine available” message you saw is usually from the route/wiring layer;
+  this file guarantees get_engine() always builds an engine instance when called.
+
 ================================================================================
 """
 
@@ -43,21 +53,22 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.1.2"
+__version__ = "5.2.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 
 # ---------------------------------------------------------------------------
-# High-Performance JSON fallback
+# Fast JSON (orjson optional)
 # ---------------------------------------------------------------------------
 try:
     import orjson  # type: ignore
 
     def json_loads(data: Union[str, bytes]) -> Any:
+        if isinstance(data, str):
+            data = data.encode("utf-8")
         return orjson.loads(data)
 
     def json_dumps(obj: Any) -> str:
-        # default=str is valid callable for orjson
         return orjson.dumps(obj, default=str).decode("utf-8")
 
 except Exception:
@@ -122,7 +133,10 @@ except Exception:
         price: Optional[float] = None
         previous_close: Optional[float] = None
 
-        # metadata
+        # common metadata
+        name: Optional[str] = None
+        currency: Optional[str] = None
+
         data_quality: str = "MISSING"
         error: Optional[str] = None
         warning: Optional[str] = None
@@ -148,14 +162,6 @@ class QuoteQuality(str, Enum):
     MISSING = "MISSING"
 
 
-class MarketRegime(str, Enum):
-    BULL = "bull"
-    BEAR = "bear"
-    VOLATILE = "volatile"
-    SIDEWAYS = "sideways"
-    UNKNOWN = "unknown"
-
-
 class DataSource(str, Enum):
     CACHE = "cache"
     PRIMARY = "primary"
@@ -164,10 +170,9 @@ class DataSource(str, Enum):
 
 
 # ---------------------------------------------------------------------------
-# Symbol normalization (IMPORTANT FIX)
-# Supports BOTH layouts:
-# - symbols/normalize.py  (your repo)
-# - core/symbols/normalize.py (legacy)
+# Symbol normalization (supports BOTH layouts)
+# - symbols/normalize.py
+# - core/symbols/normalize.py
 # ---------------------------------------------------------------------------
 def _fallback_is_ksa(s: str) -> bool:
     u = (s or "").strip().upper()
@@ -233,16 +238,33 @@ def get_symbol_info(symbol: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Settings loader (optional)
+# ---------------------------------------------------------------------------
+def _try_get_settings() -> Any:
+    """
+    Best-effort settings retrieval:
+    - Prefer core.config.get_settings_cached()
+    - Fallback to None if unavailable
+    """
+    try:
+        from core.config import get_settings_cached  # type: ignore
+
+        return get_settings_cached()
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Env helpers
 # ---------------------------------------------------------------------------
 def _get_env_list(key: str, default: str) -> List[str]:
-    raw = os.getenv(key, default)
+    raw = os.getenv(key, default) or default
     return [s.strip().lower() for s in raw.split(",") if s.strip()]
 
 
 def _get_env_int(key: str, default: int) -> int:
     try:
-        return int(os.getenv(key, str(default)))
+        return int(float(os.getenv(key, str(default))))
     except Exception:
         return default
 
@@ -252,6 +274,17 @@ def _get_env_float(key: str, default: float) -> float:
         return float(os.getenv(key, str(default)))
     except Exception:
         return default
+
+
+def _get_env_str(key: str, default: str = "") -> str:
+    return (os.getenv(key, default) or default).strip()
+
+
+def _get_env_bool(key: str, default: bool = False) -> bool:
+    raw = (os.getenv(key) or "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "y", "on", "t"}
 
 
 # ---------------------------------------------------------------------------
@@ -284,15 +317,16 @@ def _clean_patch(patch: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in (patch or {}).items() if v is not None and v != ""}
 
 
+# Normalize patch keys so downstream (sheet formatters) get consistent names:
+# - "change" + "change_pct" (NOT price_change/percent_change)
 _PATCH_ALIASES: Dict[str, str] = {
-    "price": "current_price",
     "last_price": "current_price",
-    "close": "previous_close",
+    "price": "current_price",
     "prev_close": "previous_close",
-    "change": "price_change",
-    "change_pct": "percent_change",
-    "change_percent": "percent_change",
-    "pct_change": "percent_change",
+    "close": "previous_close",
+    "percent_change": "change_pct",
+    "pct_change": "change_pct",
+    "change_percent": "change_pct",
     "open": "day_open",
     "high": "day_high",
     "low": "day_low",
@@ -306,18 +340,42 @@ def _normalize_patch_keys(patch: Dict[str, Any]) -> Dict[str, Any]:
     for src, dst in _PATCH_ALIASES.items():
         if src in out and (dst not in out or out.get(dst) in (None, "", 0)):
             out[dst] = out.get(src)
+
+    # ensure both current_price and price exist
     if "current_price" in out and ("price" not in out or out.get("price") in (None, "", 0)):
         out["price"] = out.get("current_price")
+    if "price" in out and ("current_price" not in out or out.get("current_price") in (None, "", 0)):
+        out["current_price"] = out.get("price")
+
     return out
 
 
+def _is_useful_patch(p: Dict[str, Any]) -> bool:
+    """
+    Decide if a provider patch contains meaningful data.
+    We treat having a price OR name OR currency as useful.
+    """
+    if not isinstance(p, dict) or not p:
+        return False
+    if _safe_float(p.get("current_price")) is not None:
+        return True
+    if _safe_float(p.get("price")) is not None:
+        return True
+    if (p.get("name") or "").strip():
+        return True
+    if (p.get("currency") or "").strip():
+        return True
+    return False
+
+
 # ============================================================================
-# Provider configuration (supports BOTH providers.* and core.providers.*)
+# Provider configuration
 # ============================================================================
 DEFAULT_PROVIDERS = "tadawul,argaam,yahoo_chart,yahoo_fundamentals,finnhub,eodhd"
 DEFAULT_KSA_PROVIDERS = "tadawul,argaam,yahoo_chart"
-DEFAULT_GLOBAL_PROVIDERS = "yahoo_chart,yahoo_fundamentals,finnhub,eodhd"
+DEFAULT_GLOBAL_PROVIDERS = "eodhd,yahoo_chart,yahoo_fundamentals,finnhub"  # GLOBAL-FIRST
 
+# Lower number => earlier (base priority)
 PROVIDER_PRIORITIES = {
     "tadawul": 10,
     "argaam": 20,
@@ -483,9 +541,9 @@ class ProviderRegistry:
 class MultiLevelCache:
     def __init__(self, name: str, l1_ttl: int = 60, l3_ttl: int = 3600, max_l1_size: int = 5000):
         self.name = name
-        self.l1_ttl = l1_ttl
-        self.l3_ttl = l3_ttl
-        self.max_l1_size = max_l1_size
+        self.l1_ttl = max(1, int(l1_ttl))
+        self.l3_ttl = max(1, int(l3_ttl))
+        self.max_l1_size = max(128, int(max_l1_size))
         self._l1: Dict[str, Tuple[Any, float]] = {}
         self._l1_access: Dict[str, float] = {}
         self._lock = asyncio.Lock()
@@ -566,7 +624,7 @@ class MultiLevelCache:
 
 
 # ============================================================================
-# SingleFlight (FIXED)
+# SingleFlight (no await inside lock)
 # ============================================================================
 class SingleFlight:
     def __init__(self) -> None:
@@ -574,7 +632,6 @@ class SingleFlight:
         self._calls: Dict[str, asyncio.Future] = {}
 
     async def execute(self, key: str, coro_func: Callable[[], Any]) -> Any:
-        # Lock only for future creation / lookup (no await inside lock)
         async with self._lock:
             fut = self._calls.get(key)
             if fut is None:
@@ -602,21 +659,45 @@ class SingleFlight:
 
 
 # ============================================================================
-# DataEngineV4 (v5.1.2)
+# DataEngine V5 (v5.2.0)
 # ============================================================================
-class DataEngineV4:
+class DataEngineV5:
     def __init__(self, settings: Any = None):
-        self.settings = settings
+        self.settings = settings if settings is not None else _try_get_settings()
         self.version = __version__
 
-        self.enabled_providers = _get_env_list("ENABLED_PROVIDERS", DEFAULT_PROVIDERS)
-        self.ksa_providers = _get_env_list("KSA_PROVIDERS", DEFAULT_KSA_PROVIDERS)
+        # ---- derive config from Settings if available, else env ----
+        if self.settings is not None:
+            try:
+                enabled = [str(x).lower() for x in (getattr(self.settings, "enabled_providers", None) or [])]
+            except Exception:
+                enabled = []
+            try:
+                ksa_list = [str(x).lower() for x in (getattr(self.settings, "ksa_providers", None) or [])]
+            except Exception:
+                ksa_list = []
+            try:
+                primary = str(getattr(self.settings, "primary_provider", "eodhd") or "eodhd").lower()
+            except Exception:
+                primary = "eodhd"
+        else:
+            enabled = _get_env_list("ENABLED_PROVIDERS", DEFAULT_PROVIDERS)
+            ksa_list = _get_env_list("KSA_PROVIDERS", DEFAULT_KSA_PROVIDERS)
+            primary = _get_env_str("PRIMARY_PROVIDER", "eodhd").lower()
+
+        self.primary_provider = primary or "eodhd"
+        self.enabled_providers = enabled or _get_env_list("ENABLED_PROVIDERS", DEFAULT_PROVIDERS)
+        self.ksa_providers = ksa_list or _get_env_list("KSA_PROVIDERS", DEFAULT_KSA_PROVIDERS)
         self.global_providers = _get_env_list("GLOBAL_PROVIDERS", DEFAULT_GLOBAL_PROVIDERS)
 
+        # performance / timeouts
         self.max_concurrency = _get_env_int("DATA_ENGINE_MAX_CONCURRENCY", 25)
-        self.request_timeout = _get_env_float("DATA_ENGINE_TIMEOUT_SECONDS", 15.0)
+        self.request_timeout = _get_env_float("DATA_ENGINE_TIMEOUT_SECONDS", 20.0)
 
-        self._sem = asyncio.Semaphore(self.max_concurrency)
+        # EODHD KSA block
+        self.ksa_disallow_eodhd = _get_env_bool("KSA_DISALLOW_EODHD", False)
+
+        self._sem = asyncio.Semaphore(max(1, self.max_concurrency))
         self._singleflight = SingleFlight()
         self._registry = ProviderRegistry()
         self._cache = MultiLevelCache(
@@ -626,26 +707,69 @@ class DataEngineV4:
             max_l1_size=_get_env_int("CACHE_L1_MAX", 5000),
         )
 
-        logger.info("DataEngineV4 v%s initialized with %s providers", self.version, len(self.enabled_providers))
+        logger.info(
+            "DataEngineV5 v%s initialized | primary=%s | enabled=%s | ksa=%s | global=%s",
+            self.version,
+            self.primary_provider,
+            len(self.enabled_providers),
+            len(self.ksa_providers),
+            len(self.global_providers),
+        )
 
     async def aclose(self) -> None:
         return
 
+    # -----------------------------
+    # Provider ordering (GLOBAL-first)
+    # -----------------------------
     def _providers_for(self, symbol: str) -> List[str]:
         info = get_symbol_info(symbol)
-        base = self.ksa_providers if info.get("market") == "KSA" else self.global_providers
+        is_ksa_sym = bool(info.get("is_ksa"))
+
+        base = self.ksa_providers if is_ksa_sym else self.global_providers
         providers = [p for p in base if p in self.enabled_providers]
-        providers.sort(key=lambda p: PROVIDER_PRIORITIES.get(p, 999))
+
+        # KSA: optionally drop eodhd unless explicitly allowed elsewhere
+        if is_ksa_sym and self.ksa_disallow_eodhd:
+            providers = [p for p in providers if p != "eodhd"]
+
+        # Ensure primary provider is first for GLOBAL; for KSA keep primary if present
+        if self.primary_provider:
+            if self.primary_provider in self.enabled_providers:
+                if self.primary_provider in providers:
+                    providers.remove(self.primary_provider)
+                    providers.insert(0, self.primary_provider)
+                else:
+                    # only insert if symbol market matches provider intent:
+                    # - for GLOBAL, always allow
+                    # - for KSA, do not auto-insert eodhd when disallowed
+                    if (not is_ksa_sym) or (self.primary_provider != "eodhd") or (not self.ksa_disallow_eodhd):
+                        providers.insert(0, self.primary_provider)
+
+        # Secondary ordering by base priority (stable)
+        def pr(p: str) -> int:
+            return PROVIDER_PRIORITIES.get(p, 999)
+
+        if providers:
+            head = providers[0]
+            tail = sorted(providers[1:], key=pr)
+            return [head] + tail
+
         return providers
 
     def _provider_symbol(self, provider: str, symbol: str) -> str:
+        # Yahoo family should receive Yahoo-formatted symbols
         if provider.startswith("yahoo"):
             try:
                 return to_yahoo_symbol(symbol)  # type: ignore
             except Exception:
                 return symbol
+        # EODHD provider now normalizes inside its own module (AAPL -> AAPL.US)
         return symbol
 
+    # -----------------------------
+    # Provider call
+    # -----------------------------
     async def _fetch_patch(
         self, provider: str, symbol: str
     ) -> Tuple[str, Optional[Dict[str, Any]], float, Optional[str]]:
@@ -671,7 +795,6 @@ class DataEngineV4:
             provider_symbol = self._provider_symbol(provider, symbol)
 
             try:
-                # Python 3.11+ timeout context; fallback for older
                 try:
                     async with asyncio.timeout(self.request_timeout):
                         res = await _call_maybe_async(fn, provider_symbol)
@@ -680,17 +803,19 @@ class DataEngineV4:
 
                 latency = (time.time() - start) * 1000
 
-                if isinstance(res, dict) and res and "error" not in res:
+                if isinstance(res, dict) and res:
                     patch = _normalize_patch_keys(_clean_patch(res))
-                    await self._registry.record_success(provider, latency)
-                    return provider, patch, latency, None
+                    # accept useful patches even if provider includes error fields
+                    if _is_useful_patch(patch):
+                        await self._registry.record_success(provider, latency)
+                        return provider, patch, latency, None
 
-                err = "empty_result"
-                if isinstance(res, dict):
+                    # not useful -> treat as failure and keep error
                     err = str(res.get("error") or "empty_result")
-                else:
-                    err = "non_dict_result"
+                    await self._registry.record_failure(provider, err)
+                    return provider, None, latency, err
 
+                err = "non_dict_or_empty"
                 await self._registry.record_failure(provider, err)
                 return provider, None, latency, err
 
@@ -699,7 +824,12 @@ class DataEngineV4:
                 await self._registry.record_failure(provider, repr(e))
                 return provider, None, latency, repr(e)
 
-    def _merge(self, requested_symbol: str, norm: str, patches: List[Tuple[str, Dict[str, Any], float]]) -> Dict[str, Any]:
+    # -----------------------------
+    # Merge
+    # -----------------------------
+    def _merge(
+        self, requested_symbol: str, norm: str, patches: List[Tuple[str, Dict[str, Any], float]]
+    ) -> Dict[str, Any]:
         merged: Dict[str, Any] = {
             "symbol": norm,
             "symbol_normalized": norm,
@@ -721,9 +851,10 @@ class DataEngineV4:
                     continue
                 if v is None:
                     continue
-                if k not in merged or merged.get(k) in (None, "", 0):
+                if k not in merged or merged.get(k) in (None, "", 0, []):
                     merged[k] = v
 
+        # canonical price sync
         if merged.get("current_price") is None and merged.get("price") is not None:
             merged["current_price"] = merged.get("price")
         if merged.get("price") is None and merged.get("current_price") is not None:
@@ -735,8 +866,12 @@ class DataEngineV4:
         cp = getattr(quote, "current_price", None)
         if _safe_float(cp) is None:
             return QuoteQuality.MISSING.value
+        # basic grading; can be extended later
         return QuoteQuality.GOOD.value
 
+    # -----------------------------
+    # Public API
+    # -----------------------------
     async def get_enriched_quote(self, symbol: str, use_cache: bool = True) -> UnifiedQuote:
         return await self._singleflight.execute(
             f"quote:{symbol}",
@@ -763,7 +898,10 @@ class DataEngineV4:
         if not providers:
             return UnifiedQuote(symbol=norm, data_quality=QuoteQuality.MISSING.value, error="No providers available")  # type: ignore
 
-        top = providers[:3]
+        # GLOBAL-first: try primary + next best fallbacks
+        top_n = _get_env_int("PROVIDER_TOP_N", 3)
+        top = providers[: max(1, top_n)]
+
         gathered = await asyncio.gather(*[self._fetch_patch(p, norm) for p in top], return_exceptions=True)
 
         results: List[Tuple[str, Optional[Dict[str, Any]], float, Optional[str]]] = []
@@ -788,7 +926,7 @@ class DataEngineV4:
                 requested_symbol=symbol,
                 data_quality=QuoteQuality.MISSING.value,
                 error="No data available",
-                info=json_dumps(err_detail),
+                info=err_detail,  # keep as dict (better for /health diagnostics)
                 data_sources=[],
                 provider_latency={},
                 last_updated_utc=_now_utc_iso(),
@@ -811,7 +949,17 @@ class DataEngineV4:
     async def get_enriched_quotes(self, symbols: List[str]) -> List[UnifiedQuote]:
         if not symbols:
             return []
-        batch = _get_env_int("BATCH_SIZE", 15)
+
+        # use env batch size (or settings.quote_batch_size if present)
+        batch = _get_env_int("QUOTE_BATCH_SIZE", 25)
+        try:
+            if self.settings is not None and getattr(self.settings, "quote_batch_size", None):
+                batch = int(getattr(self.settings, "quote_batch_size"))
+        except Exception:
+            pass
+
+        batch = max(1, min(500, batch))
+
         out: List[UnifiedQuote] = []
         for i in range(0, len(symbols), batch):
             part = symbols[i : i + batch]
@@ -827,9 +975,11 @@ class DataEngineV4:
     async def get_stats(self) -> Dict[str, Any]:
         return {
             "version": self.version,
+            "primary_provider": self.primary_provider,
             "enabled_providers": self.enabled_providers,
             "ksa_providers": self.ksa_providers,
             "global_providers": self.global_providers,
+            "ksa_disallow_eodhd": self.ksa_disallow_eodhd,
             "provider_stats": await self._registry.get_stats(),
         }
 
@@ -837,16 +987,16 @@ class DataEngineV4:
 # ============================================================================
 # Singleton exports
 # ============================================================================
-_ENGINE_INSTANCE: Optional[DataEngineV4] = None
+_ENGINE_INSTANCE: Optional[DataEngineV5] = None
 _ENGINE_LOCK = asyncio.Lock()
 
 
-async def get_engine() -> DataEngineV4:
+async def get_engine() -> DataEngineV5:
     global _ENGINE_INSTANCE
     if _ENGINE_INSTANCE is None:
         async with _ENGINE_LOCK:
             if _ENGINE_INSTANCE is None:
-                _ENGINE_INSTANCE = DataEngineV4()
+                _ENGINE_INSTANCE = DataEngineV5()
     return _ENGINE_INSTANCE
 
 
@@ -862,11 +1012,14 @@ def get_cache() -> Any:
     return getattr(_ENGINE_INSTANCE, "_cache", None)
 
 
-DataEngine = DataEngineV4
-DataEngineV2 = DataEngineV4
-DataEngineV3 = DataEngineV4
+# Backwards names
+DataEngineV4 = DataEngineV5
+DataEngineV3 = DataEngineV5
+DataEngineV2 = DataEngineV5
+DataEngine = DataEngineV5
 
 __all__ = [
+    "DataEngineV5",
     "DataEngineV4",
     "DataEngineV3",
     "DataEngineV2",
@@ -875,7 +1028,6 @@ __all__ = [
     "close_engine",
     "get_cache",
     "QuoteQuality",
-    "MarketRegime",
     "DataSource",
     "__version__",
 ]
