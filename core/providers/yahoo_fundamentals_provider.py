@@ -2,11 +2,16 @@
 # core/providers/yahoo_fundamentals_provider.py
 """
 ================================================================================
-Yahoo Finance Fundamentals Provider — v5.2.0 (PROD-HARDENED, ALIGNED)
+Yahoo Finance Fundamentals Provider — v5.2.1 (PROD-HARDENED, ALIGNED)
 ================================================================================
 (Emad Bahbah – Enterprise Integration Architecture)
 
-Key upgrades vs v5.1.2
+v5.2.1 FIXES (vs v5.2.0)
+- ✅ Fix metrics serialization: CacheStats is slots=True so __dict__ is not available
+- ✅ Cache hit correctness: treat cached {} as a valid cached value (is not None)
+- ✅ Lint/runtime clean-up: make LRU eviction sync (no async-without-await)
+
+Key upgrades from earlier versions
 - ✅ Alignment: outputs data_quality as UPPERCASE (EXCELLENT/HIGH/MEDIUM/LOW/ERROR/MISSING/STALE)
 - ✅ Optional deps: removed hard numpy import (no startup crash); yfinance/pandas remain optional
 - ✅ Stronger symbol normalization (Arabic digits + KSA codes -> .SR)
@@ -39,12 +44,12 @@ import zlib
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 logger = logging.getLogger("core.providers.yahoo_fundamentals_provider")
 
 PROVIDER_NAME = "yahoo_fundamentals"
-PROVIDER_VERSION = "5.2.0"
+PROVIDER_VERSION = "5.2.1"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
@@ -512,6 +517,15 @@ class CacheStats:
     evictions: int = 0
     size: int = 0
 
+    def to_dict(self) -> Dict[str, int]:
+        return {
+            "hits": self.hits,
+            "misses": self.misses,
+            "sets": self.sets,
+            "evictions": self.evictions,
+            "size": self.size,
+        }
+
 
 class AdvancedCache:
     """Memory TTL cache + optional Redis (compressed pickle)."""
@@ -541,7 +555,7 @@ class AdvancedCache:
         h = hashlib.sha256(prefix.encode("utf-8")).hexdigest()[:16]
         return f"yffund:{self.name}:{h}:{prefix}"
 
-    async def _evict_lru(self) -> None:
+    def _evict_lru(self) -> None:
         if not self._touch:
             return
         oldest = min(self._touch.items(), key=lambda kv: kv[1])[0]
@@ -570,7 +584,7 @@ class AdvancedCache:
                     val = pickle.loads(zlib.decompress(blob))
                     async with self._lock:
                         if len(self._mem) >= self.maxsize:
-                            await self._evict_lru()
+                            self._evict_lru()
                         self._mem[k] = (val, now + self.ttl)
                         self._touch[k] = now
                         self.stats.hits += 1
@@ -589,7 +603,7 @@ class AdvancedCache:
 
         async with self._lock:
             if len(self._mem) >= self.maxsize and k not in self._mem:
-                await self._evict_lru()
+                self._evict_lru()
             self._mem[k] = (value, exp)
             self._touch[k] = now
             self.stats.sets += 1
@@ -991,7 +1005,7 @@ class YahooFundamentalsProvider:
             return {} if not _emit_warnings() else {"_warn": "temporarily_backed_off"}
 
         cached = await self.fund_cache.get(cache_key)
-        if cached:
+        if cached is not None:
             try:
                 return dict(cached)
             except Exception:
@@ -1065,7 +1079,7 @@ class YahooFundamentalsProvider:
             "timeout_sec": self.timeout_sec,
             "circuit_breaker": self.circuit_breaker.get_stats(),
             "cache_sizes": {"fund": await self.fund_cache.size(), "error": await self.err_cache.size()},
-            "cache_stats": {"fund": self.fund_cache.stats.__dict__, "error": self.err_cache.stats.__dict__},
+            "cache_stats": {"fund": self.fund_cache.stats.to_dict(), "error": self.err_cache.stats.to_dict()},
         }
 
     async def aclose(self) -> None:
