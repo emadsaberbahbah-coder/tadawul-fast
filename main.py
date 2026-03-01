@@ -2,9 +2,16 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v7.0.0)
+TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v7.0.1)
 ================================================================================
 Aligned • Deployment-safe • Minimal import chain • Dynamic router mounting
+
+v7.0.1 improvements vs v7.0.0
+- ✅ Cleaner router diagnostics: separates missing modules vs import errors vs mount errors
+- ✅ Logs full route error details (safe + truncated) so you can fix “missing/failed” fast
+- ✅ Engine warm-up tries core.data_engine_v2 first (matches your logs: DataEngineV5)
+- ✅ Fix duplicate shutdown close call + minor hardening
+- ✅ Adds builtin /ping (very light) for quick connectivity tests
 
 Design goals
 - ✅ NEVER crash at import-time (keep imports light; defer heavy imports to startup)
@@ -12,10 +19,6 @@ Design goals
 - ✅ Works with your env.py + core/config.py patterns (best-effort detection)
 - ✅ Dynamic router discovery via routes/__init__.py (mount plan + graceful degrade)
 - ✅ Safe diagnostics endpoints (guarded in production)
-
-Expected usage
-- Uvicorn/Gunicorn should import: main:app
-- Render Start Command (recommended): python scripts/start_web.py --app main:app
 """
 
 from __future__ import annotations
@@ -25,21 +28,22 @@ import json
 import logging
 import os
 import sys
-import time
 import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
+
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 
+
 # --------------------------------------------------------------------------------------
 # Version
 # --------------------------------------------------------------------------------------
-APP_ENTRY_VERSION = "7.0.0"
+APP_ENTRY_VERSION = "7.0.1"
 
 
 # --------------------------------------------------------------------------------------
@@ -94,7 +98,6 @@ class _JsonFormatter(logging.Formatter):
         }
         if record.exc_info:
             payload["exc"] = self.formatException(record.exc_info)
-        # include a couple common structured fields if present
         for k in ("request_id", "path", "status_code"):
             if hasattr(record, k):
                 payload[k] = getattr(record, k)
@@ -119,7 +122,6 @@ def _setup_logging() -> logging.Logger:
         h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"))
     root.addHandler(h)
 
-    # keep noisy libs reasonable
     logging.getLogger("uvicorn").setLevel(getattr(logging, level, logging.INFO))
     logging.getLogger("uvicorn.error").setLevel(getattr(logging, level, logging.INFO))
     logging.getLogger("uvicorn.access").setLevel(getattr(logging, level, logging.INFO))
@@ -136,29 +138,24 @@ logger = _setup_logging()
 # --------------------------------------------------------------------------------------
 @dataclass(frozen=True)
 class _SettingsView:
-    # core app
     APP_NAME: str = "Tadawul Fast Bridge"
     APP_VERSION: str = "dev"
     APP_ENV: str = "production"
     TIMEZONE_DEFAULT: str = "Asia/Riyadh"
 
-    # runtime flags
     DEBUG: bool = False
     ENABLE_SWAGGER: bool = True
     ENABLE_REDOC: bool = True
     DEFER_ROUTER_MOUNT: bool = False
     INIT_ENGINE_ON_BOOT: bool = True
 
-    # auth
     REQUIRE_AUTH: bool = True
     OPEN_MODE: bool = False
     AUTH_HEADER_NAME: str = "X-APP-TOKEN"
 
-    # cors
     ENABLE_CORS_ALL_ORIGINS: bool = False
     CORS_ORIGINS: str = ""
 
-    # misc
     BACKEND_BASE_URL: str = ""
     ENGINE_CACHE_TTL_SEC: int = 20
     MAX_REQUESTS_PER_MINUTE: int = 240
@@ -277,16 +274,7 @@ def _auth_ok(request: Request) -> bool:
     except Exception:
         pass
 
-    # Simple fallback
-    allowed = set(
-        x
-        for x in (
-            _env_str("APP_TOKEN", ""),
-            _env_str("BACKEND_TOKEN", ""),
-            _env_str("BACKUP_APP_TOKEN", ""),
-        )
-        if x
-    )
+    allowed = {x for x in (_env_str("APP_TOKEN", ""), _env_str("BACKEND_TOKEN", ""), _env_str("BACKUP_APP_TOKEN", "")) if x}
     if not allowed:
         return False
 
@@ -307,15 +295,33 @@ def _auth_ok(request: Request) -> bool:
 # --------------------------------------------------------------------------------------
 # Router mounting (dynamic + safe)
 # --------------------------------------------------------------------------------------
-def _import_router_module(module_name: str) -> Tuple[Optional[Any], Optional[str]]:
+@dataclass
+class _RoutesSnapshot:
+    mounted: List[str]
+    missing: List[str]            # module not found (the module itself)
+    import_errors: Dict[str, str] # module exists but import crashed (dependency/import inside)
+    mount_errors: Dict[str, str]  # include_router/mount(app) crashed
+    no_router: Dict[str, str]     # module imported but has no router/mount
+    strict: bool
+
+
+def _import_router_module(module_name: str) -> Tuple[Optional[Any], Optional[BaseException]]:
     """
-    Returns (module, error_message). Never throws.
+    Returns (module, exception). Never throws.
     """
     try:
         mod = importlib.import_module(module_name)
         return mod, None
     except Exception as e:
-        return None, f"{type(e).__name__}: {e}"
+        return None, e
+
+
+def _err_to_str(e: BaseException, limit: int = 500) -> str:
+    try:
+        s = f"{type(e).__name__}: {e}"
+    except Exception:
+        s = "UnknownError"
+    return s if len(s) <= limit else (s[:limit] + "...(truncated)")
 
 
 def _mount_routes(app: FastAPI) -> Dict[str, Any]:
@@ -324,14 +330,17 @@ def _mount_routes(app: FastAPI) -> Dict[str, Any]:
     Does not fail startup unless ROUTES_STRICT_IMPORT=1.
     """
     strict = _env_bool("ROUTES_STRICT_IMPORT", False)
+
     mounted: List[str] = []
     missing: List[str] = []
-    failed: Dict[str, str] = {}
+    import_errors: Dict[str, str] = {}
+    mount_errors: Dict[str, str] = {}
+    no_router: Dict[str, str] = {}
 
     expected: List[str] = []
     plan: List[str] = []
 
-    # Try to use your advanced routes/__init__.py API
+    # Prefer routes/__init__.py plan
     try:
         routes_pkg = importlib.import_module("routes")
         expected_fn = getattr(routes_pkg, "get_expected_router_modules", None)
@@ -341,10 +350,9 @@ def _mount_routes(app: FastAPI) -> Dict[str, Any]:
         if callable(plan_fn):
             plan = list(plan_fn())
     except Exception:
-        routes_pkg = None  # noqa: F841
+        pass
 
     if not expected:
-        # safe fallback list (matches your routes/__init__.py)
         expected = [
             "routes.health",
             "routes.auth",
@@ -360,21 +368,19 @@ def _mount_routes(app: FastAPI) -> Dict[str, Any]:
         ]
 
     if not plan:
-        plan = expected[:]  # best-effort order
+        plan = expected[:]
 
-    # Mount
     for mod_name in plan:
-        mod, err = _import_router_module(mod_name)
+        mod, exc = _import_router_module(mod_name)
         if mod is None:
-            missing.append(mod_name)
-            if err:
-                failed[mod_name] = err
+            # Distinguish true "module missing" vs "import crashed inside module"
+            if isinstance(exc, ModuleNotFoundError) and getattr(exc, "name", None) == mod_name:
+                missing.append(mod_name)
+            else:
+                import_errors[mod_name] = _err_to_str(exc or Exception("unknown import error"))
             continue
 
-        # router variable
         router = getattr(mod, "router", None)
-
-        # optional: module exposes mount(app)
         mount_fn = getattr(mod, "mount", None)
 
         try:
@@ -382,30 +388,57 @@ def _mount_routes(app: FastAPI) -> Dict[str, Any]:
                 app.include_router(router)
                 mounted.append(mod_name)
                 continue
+
             if callable(mount_fn):
                 mount_fn(app)
                 mounted.append(mod_name)
                 continue
 
-            # no router
-            missing.append(mod_name)
-            failed[mod_name] = "No `router` object or `mount(app)` found"
+            no_router[mod_name] = "No `router` object or `mount(app)` found"
         except Exception as e:
-            failed[mod_name] = f"Mount failed: {type(e).__name__}: {e}"
+            mount_errors[mod_name] = _err_to_str(e)
             if strict:
                 raise
 
-    snapshot = {
-        "mounted": mounted,
-        "missing": missing,
-        "failed": failed,
-        "strict": strict,
-    }
+    snap = _RoutesSnapshot(
+        mounted=mounted,
+        missing=missing,
+        import_errors=import_errors,
+        mount_errors=mount_errors,
+        no_router=no_router,
+        strict=strict,
+    )
 
-    logger.info("Routes mount summary: mounted=%s missing=%s failed=%s", len(mounted), len(missing), len(failed))
-    if failed and strict:
+    # Summary counts (matches your old log style but more accurate)
+    failed_count = len(snap.import_errors) + len(snap.mount_errors) + len(snap.no_router)
+    logger.info(
+        "Routes mount summary: mounted=%s missing=%s failed=%s",
+        len(snap.mounted),
+        len(snap.missing),
+        failed_count,
+    )
+
+    # Log details (safe + truncated)
+    if snap.missing:
+        logger.warning("Routes missing modules: %s", ", ".join(snap.missing))
+    if snap.import_errors:
+        logger.warning("Routes import errors: %s", json.dumps(snap.import_errors, ensure_ascii=False))
+    if snap.mount_errors:
+        logger.warning("Routes mount errors: %s", json.dumps(snap.mount_errors, ensure_ascii=False))
+    if snap.no_router:
+        logger.warning("Routes without router/mount(): %s", json.dumps(snap.no_router, ensure_ascii=False))
+
+    if strict and (snap.missing or snap.import_errors or snap.mount_errors or snap.no_router):
         logger.error("Strict router import enabled; failing startup due to route errors.")
-    return snapshot
+
+    return {
+        "mounted": snap.mounted,
+        "missing": snap.missing,
+        "import_errors": snap.import_errors,
+        "mount_errors": snap.mount_errors,
+        "no_router": snap.no_router,
+        "strict": snap.strict,
+    }
 
 
 # --------------------------------------------------------------------------------------
@@ -429,13 +462,15 @@ def _install_builtin_routes(app: FastAPI) -> None:
 
     @app.get("/health", include_in_schema=False)
     async def health():
-        # keep very light; no heavy imports
         return {"status": "healthy", **_runtime_meta()}
 
     @app.get("/ready", include_in_schema=False)
     async def ready():
-        # readiness is "healthy" unless we explicitly know otherwise
         return {"status": "ready", **_runtime_meta()}
+
+    @app.get("/ping", include_in_schema=False)
+    async def ping():
+        return {"pong": True, **_runtime_meta()}
 
 
 # --------------------------------------------------------------------------------------
@@ -443,34 +478,44 @@ def _install_builtin_routes(app: FastAPI) -> None:
 # --------------------------------------------------------------------------------------
 async def _maybe_init_engine() -> Optional[str]:
     """
-    Optional: initializes core engine if present.
+    Optional: pre-warm the engine.
     Never raises; returns error string on failure.
+    Tries core.data_engine_v2 first (your logs show DataEngineV5).
     """
     if not bool(_SETTINGS.INIT_ENGINE_ON_BOOT):
         return None
+
+    # 1) core.data_engine_v2
     try:
-        de = importlib.import_module("core.data_engine")
-        init_fn = getattr(de, "init_engine", None) or getattr(de, "get_engine", None)
+        de2 = importlib.import_module("core.data_engine_v2")
+        init_fn = getattr(de2, "init_engine", None) or getattr(de2, "get_engine", None)
         if callable(init_fn):
-            # If get_engine exists, calling it should initialize lazily.
             maybe = init_fn()
-            # allow async too
             if hasattr(maybe, "__await__"):
                 await maybe
         return None
     except Exception as e:
-        return f"{type(e).__name__}: {e}"
+        err_v2 = _err_to_str(e)
+
+    # 2) core.data_engine (legacy)
+    try:
+        de1 = importlib.import_module("core.data_engine")
+        init_fn = getattr(de1, "init_engine", None) or getattr(de1, "get_engine", None)
+        if callable(init_fn):
+            maybe = init_fn()
+            if hasattr(maybe, "__await__"):
+                await maybe
+        return None
+    except Exception as e:
+        err_v1 = _err_to_str(e)
+
+    return f"data_engine_v2 failed: {err_v2} | data_engine failed: {err_v1}"
 
 
 # --------------------------------------------------------------------------------------
 # App factory
 # --------------------------------------------------------------------------------------
 def create_app() -> FastAPI:
-    """
-    Factory for Gunicorn/uvicorn.
-    Keep it import-safe.
-    """
-    # Docs toggles
     docs_url = "/docs" if bool(_SETTINGS.ENABLE_SWAGGER) else None
     redoc_url = "/redoc" if bool(_SETTINGS.ENABLE_REDOC) else None
     openapi_url = "/openapi.json" if (docs_url or redoc_url) else None
@@ -499,7 +544,7 @@ def create_app() -> FastAPI:
             max_age=600,
         )
 
-    # Exception handler (ensures we see full errors)
+    # Exception handler
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception):
         logger.error("Unhandled exception: %s", exc, exc_info=True)
@@ -515,14 +560,21 @@ def create_app() -> FastAPI:
 
     _install_builtin_routes(app)
 
-    # Mount routers now unless explicitly deferred
-    routes_snapshot: Dict[str, Any] = {"mounted": [], "missing": [], "failed": {}, "strict": False}
+    # Mount routers now unless deferred
+    routes_snapshot: Dict[str, Any] = {
+        "mounted": [],
+        "missing": [],
+        "import_errors": {},
+        "mount_errors": {},
+        "no_router": {},
+        "strict": False,
+    }
+
     if not bool(_SETTINGS.DEFER_ROUTER_MOUNT):
         try:
             routes_snapshot = _mount_routes(app)
         except Exception as e:
             logger.error("Route mounting crashed: %s", e, exc_info=True)
-            # In strict mode _mount_routes raises; here we preserve the failure semantics
             if _env_bool("ROUTES_STRICT_IMPORT", False):
                 raise
 
@@ -537,7 +589,6 @@ def create_app() -> FastAPI:
     async def debug_settings(request: Request):
         if _SETTINGS.APP_ENV == "production" and not _auth_ok(request):
             return JSONResponse(status_code=401, content={"status": "error", "error": "unauthorized"})
-        # never dump secrets; return only safe view
         return {
             "status": "ok",
             "settings": {
@@ -564,7 +615,6 @@ def create_app() -> FastAPI:
     # Lifespan hooks
     @app.on_event("startup")
     async def on_startup():
-        # If routers were deferred, mount now (still safe)
         if bool(_SETTINGS.DEFER_ROUTER_MOUNT):
             try:
                 _mount_routes(app)
@@ -573,11 +623,8 @@ def create_app() -> FastAPI:
                 if _env_bool("ROUTES_STRICT_IMPORT", False):
                     raise
 
-        # Optional engine init (safe)
         err = await _maybe_init_engine()
         if err:
-            # Do NOT fail startup by default (Render must bind port)
-            # If you want strict behavior: set INIT_ENGINE_STRICT=1
             strict = _env_bool("INIT_ENGINE_STRICT", False)
             if strict:
                 logger.error("Engine init failed (strict): %s", err)
@@ -589,17 +636,14 @@ def create_app() -> FastAPI:
     @app.on_event("shutdown")
     async def on_shutdown():
         # Close optional clients if available
-        for mod_name, fn_name in (
-            ("integrations.google_sheets_service", "close"),
-            ("integrations.google_sheets_service", "close"),
-        ):
-            try:
-                m = importlib.import_module(mod_name)
-                fn = getattr(m, fn_name, None)
-                if callable(fn):
-                    fn()
-            except Exception:
-                pass
+        try:
+            m = importlib.import_module("integrations.google_sheets_service")
+            fn = getattr(m, "close", None)
+            if callable(fn):
+                fn()
+        except Exception:
+            pass
+
         logger.info("Shutdown complete.")
 
     return app
