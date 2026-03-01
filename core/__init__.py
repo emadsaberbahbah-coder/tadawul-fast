@@ -2,19 +2,13 @@
 # core/__init__.py
 """
 ================================================================================
-Core Package Initializer — v5.1.0 (GLOBAL-FIRST / ENGINE-LAZY / RENDER SAFE)
+Core Package Initializer — v5.1.1 (GLOBAL-FIRST / ENGINE-LAZY / RENDER SAFE)
 ================================================================================
 
-This revision is aligned with the GLOBAL-first stabilization you are doing:
-- ✅ EODHD is treated as the top GLOBAL provider by default (priority)
-- ✅ Robust lazy engine init:
-     - Prefer core.data_engine_v2.get_engine (async) and cache the instance
-     - Provides BOTH async + sync access patterns safely
-- ✅ Settings resolution aligned with core/config.py:
-     - Prefer get_settings_cached() then get_settings()
-- ✅ Safe imports + never-crash startup philosophy (best-effort exports)
-- ✅ Keeps PEP 562 lazy attribute access, but avoids brittle assumptions
-- ✅ Keeps provider registry (lightweight) without forcing heavy imports
+Fixes vs v5.1.0
+- ✅ Fix: asyncio.Lock no longer created at import-time (prevents cross-loop issues on Render/FastAPI)
+- ✅ Fix: _try_import(retry=True) now truly retries (bypasses cache)
+- ✅ Hardening: define __all__ early to avoid rare introspection edge-cases during import
 
 Important behavior:
 - In an async context (FastAPI), call:  await core.get_engine_async()
@@ -35,6 +29,9 @@ from dataclasses import dataclass, field
 from enum import Enum
 from functools import wraps
 from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
+
+# Define early to avoid NameError in rare cases (introspection during import)
+__all__: List[str] = []
 
 # ---------------------------------------------------------------------------
 # Fast JSON fallback (optional orjson)
@@ -59,7 +56,7 @@ except Exception:
     _HAS_ORJSON = False
 
 
-__version__ = "5.1.0"
+__version__ = "5.1.1"
 __core_version__ = __version__
 CORE_INIT_VERSION = __version__
 
@@ -194,11 +191,16 @@ class ImportResult:
 
 
 def _try_import(module_path: str, retry: bool = False) -> ImportResult:
+    """
+    retry=True MUST bypass cache (real retry).
+    """
     cache_key = f"import:{module_path}"
     cached = _CACHE.get(cache_key)
-    # cache failures briefly
-    if isinstance(cached, ImportResult) and (retry or cached.success or (time.time() - cached.timestamp) < 60):
-        return cached
+
+    if not retry and isinstance(cached, ImportResult):
+        # cache successes always, cache failures briefly (60s window)
+        if cached.success or (time.time() - cached.timestamp) < 60:
+            return cached
 
     try:
         from importlib import import_module
@@ -380,7 +382,25 @@ def _construct_engine_compat(cls: Type, settings: Any) -> Any:
 
 _ENGINE_INSTANCE: Optional[Any] = None
 _ENGINE_LOCK = threading.RLock()
-_ENGINE_ASYNC_LOCK = asyncio.Lock()
+
+# IMPORTANT: Do NOT create asyncio.Lock at import-time (can bind to wrong loop)
+_ENGINE_ASYNC_LOCK: Optional[asyncio.Lock] = None
+_ENGINE_ASYNC_LOCK_LOOP_ID: Optional[int] = None
+_ENGINE_ASYNC_LOCK_GUARD = threading.RLock()
+
+
+def _get_engine_async_lock() -> asyncio.Lock:
+    """
+    Create/refresh an asyncio lock per running loop to avoid cross-loop issues.
+    """
+    global _ENGINE_ASYNC_LOCK, _ENGINE_ASYNC_LOCK_LOOP_ID
+    loop = asyncio.get_running_loop()
+    lid = id(loop)
+    with _ENGINE_ASYNC_LOCK_GUARD:
+        if _ENGINE_ASYNC_LOCK is None or _ENGINE_ASYNC_LOCK_LOOP_ID != lid:
+            _ENGINE_ASYNC_LOCK = asyncio.Lock()
+            _ENGINE_ASYNC_LOCK_LOOP_ID = lid
+        return _ENGINE_ASYNC_LOCK
 
 
 async def get_engine_async(force_reload: bool = False) -> Optional[Any]:
@@ -396,7 +416,7 @@ async def get_engine_async(force_reload: bool = False) -> Optional[Any]:
             if _ENGINE_INSTANCE is not None:
                 return _ENGINE_INSTANCE
 
-    async with _ENGINE_ASYNC_LOCK:
+    async with _get_engine_async_lock():
         if not force_reload:
             with _ENGINE_LOCK:
                 if _ENGINE_INSTANCE is not None:
@@ -430,7 +450,7 @@ async def get_engine_async(force_reload: bool = False) -> Optional[Any]:
 
 
 @_monitor_import
-def get_engine(force_reload: bool = False) -> Optional[Any]:
+def get_engine(force_reload: bool = False) -> Any:
     """
     Sync engine getter (for CLI/scripts).
     Behavior:
@@ -440,7 +460,7 @@ def get_engine(force_reload: bool = False) -> Optional[Any]:
     try:
         asyncio.get_running_loop()
         # running loop => caller must await
-        return get_engine_async(force_reload=force_reload)  # type: ignore[return-value]
+        return get_engine_async(force_reload=force_reload)
     except RuntimeError:
         # no loop => safe to run
         try:
@@ -450,7 +470,7 @@ def get_engine(force_reload: bool = False) -> Optional[Any]:
             return None
 
 
-def reload_engine() -> Optional[Any]:
+def reload_engine() -> Any:
     global _ENGINE_INSTANCE
     with _ENGINE_LOCK:
         _ENGINE_INSTANCE = None
