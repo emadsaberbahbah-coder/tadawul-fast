@@ -2,25 +2,25 @@
 # core/providers/eodhd_provider.py
 """
 ================================================================================
-EODHD Provider — v4.2.0 (GLOBAL-STABLE / RENDER-SAFE / RATIO-SAFE / PRIMARY)
+EODHD Provider — v4.3.0 (GLOBAL-STABLE / RENDER-SAFE / RATIO-SAFE / PRIMARY)
 ================================================================================
 
-Main goals (aligned with your ratio-safe / sheet-stable pipeline):
-- ✅ GLOBAL-first symbol normalization:
-     - "AAPL" -> "AAPL.US" (configurable; uses core.symbols.normalize.to_eodhd_symbol if available)
-- ✅ Render-safe: NO hard dependency on numpy/orjson/scipy/sklearn/statsmodels, etc.
+v4.3.0 upgrades (aligned with core.symbols.normalize v5.2.0)
+- ✅ FIX: Share-class tickers are no longer mis-detected as “already qualified”
+     BRK.B  -> BRK.B.US   (when EODHD_APPEND_EXCHANGE_SUFFIX=true)
+- ✅ Provider-first normalization:
+     - Uses core.symbols.normalize.to_eodhd_symbol(default_exchange=...)
+     - Falls back safely without breaking KSA (.SR) or special symbols (FX/Index/Futures)
+- ✅ Better error reporting:
+     - Distinguishes missing API key vs HTTP errors vs invalid JSON vs not found
+     - Returns error_detail with actionable info (helps DataEngine diagnose)
+- ✅ More schema-aligned patch keys + aliases:
+     current_price, previous_close, day_high, day_low, volume, currency
+     price_change, percent_change, change, change_pct
+     week_52_high/week_52_low/week_52_position_pct
+- ✅ Render-safe: no hard deps on numpy/pandas/scipy/sklearn/etc.
 - ✅ Production-grade HTTP behavior:
-     - bounded concurrency + soft rate limiter (token bucket)
-     - retries with Full-Jitter exponential backoff
-     - correct handling for 429 (Retry-After)
-- ✅ Ratio-safe outputs:
-     - any "*_pct" and most percent-like fields are returned as **fractions** (0.12 == 12%)
-       so downstream (router) can safely format them as percentages without explosions.
-- ✅ Returns a consistent enriched patch:
-     name, currency, current_price, previous_close, change, change_pct (fraction), etc.
-- ✅ Optional history enrichment:
-     52W high/low, 52W position (fraction), avg vol 30D, volatility 30D (fraction),
-     MA20/MA50/MA200, RSI14, and simple returns (1W/1M/3M/6M/12M) as fractions.
+     bounded concurrency + token bucket + full-jitter retries + 429 Retry-After
 
 Env vars:
 - EODHD_API_KEY (or EODHD_API_TOKEN / EODHD_KEY)
@@ -31,6 +31,8 @@ Env vars:
 - EODHD_RATE_LIMIT_BURST (default: 8.0)
 - EODHD_TIMEOUT_SEC (default: 15)
 - EODHD_RETRY_ATTEMPTS (default: 4)
+- EODHD_RETRY_BASE_DELAY (default: 0.6)
+- EODHD_MAX_CONCURRENCY (default: 20)
 - EODHD_ENABLE_FUNDAMENTALS (default: true)
 - EODHD_ENABLE_HISTORY (default: true)
 - EODHD_HISTORY_DAYS (default: 420)
@@ -57,10 +59,10 @@ import httpx
 logger = logging.getLogger("core.providers.eodhd_provider")
 
 PROVIDER_NAME = "eodhd"
-PROVIDER_VERSION = "4.2.0"
+PROVIDER_VERSION = "4.3.0"
 
 DEFAULT_BASE_URL = "https://eodhistoricaldata.com/api"
-UA_DEFAULT = "TFB-EODHD/4.2.0 (Render)"
+UA_DEFAULT = "TFB-EODHD/4.3.0 (Render)"
 
 # -----------------------------
 # Optional JSON perf (orjson)
@@ -75,7 +77,7 @@ try:
 
     _HAS_ORJSON = True
 except Exception:
-    import json
+    import json  # type: ignore
 
     def json_loads(data: Union[str, bytes]) -> Any:
         if isinstance(data, bytes):
@@ -84,10 +86,11 @@ except Exception:
 
     _HAS_ORJSON = False
 
-_TRUTHY = {"1", "true", "yes", "y", "on", "t"}
-_FALSY = {"0", "false", "no", "n", "off", "f"}
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
+_FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
 
-_US_LIKE_RE = re.compile(r"^[A-Z0-9][A-Z0-9\-\_]{0,11}$")  # allow BRK-B style
+# Accept plain US tickers and dash-share-class (BRK-B). Dot-share-class (BRK.B) is handled by to_eodhd_symbol.
+_US_LIKE_RE = re.compile(r"^[A-Z0-9][A-Z0-9\-_]{0,11}$")
 _KSA_RE = re.compile(r"^\d{3,6}\.SR$", re.IGNORECASE)
 
 
@@ -228,42 +231,54 @@ def _frac_from_percentish(v: Any) -> Optional[float]:
 
 
 # =============================================================================
-# Symbol normalization (GLOBAL fix)
+# Symbol normalization (GLOBAL fix, aligned with normalize.py v5.2.0)
 # =============================================================================
 def normalize_eodhd_symbol(symbol: str) -> str:
     """
     Normalize a symbol for EODHD.
 
     Preferred:
-      - Use core.symbols.normalize.to_eodhd_symbol if available
+      - core.symbols.normalize.to_eodhd_symbol(symbol, default_exchange=...)
+        (v5.2.0 correctly handles share-class tickers BRK.B -> BRK.B.US)
     Fallback:
-      - keep already-qualified: AAPL.US, 7203.T, VOD.L, 2222.SR
-      - if plain US-like ticker: AAPL -> AAPL.US (configurable)
-      - do not modify indices/fx/futures notations (^GSPC, EURUSD=X, GC=F, etc.)
+      - keep KSA (.SR) and already-qualified known formats
+      - for plain US-like tickers: AAPL -> AAPL.US (if append suffix enabled)
+      - do not modify special notations (FX/Index/Futures)
     """
     s = (symbol or "").strip()
     if not s:
         return ""
     s_up = s.upper()
 
-    # optional shared normalizer (best)
+    # Best: project normalizer (pure python, safe)
     try:
         from core.symbols.normalize import to_eodhd_symbol as _to_eodhd_symbol  # type: ignore
 
         if callable(_to_eodhd_symbol):
-            out = _to_eodhd_symbol(s_up)
+            out = _to_eodhd_symbol(s_up, default_exchange=_default_exchange())  # type: ignore[arg-type]
             if isinstance(out, str) and out.strip():
                 return out.strip().upper()
     except Exception:
         pass
 
-    # already qualified
-    if "." in s_up:
-        return s_up
-
-    # do not touch special notations
+    # Do not touch special notations
     if "=" in s_up or "^" in s_up or "/" in s_up:
         return s_up
+
+    # KSA canonical (basic safety)
+    if s_up.endswith(".SR") and _KSA_RE.match(s_up):
+        return s_up
+
+    # If it already looks qualified (has a dot + suffix length >=2)
+    # IMPORTANT: BRK.B is share-class, not qualified.
+    if "." in s_up:
+        base, suf = s_up.rsplit(".", 1)
+        if len(suf) >= 2:  # likely exchange suffix
+            return s_up
+        # len == 1: treat as share class -> needs exchange suffix if enabled
+        if not _append_exchange_suffix():
+            return s_up
+        return f"{s_up}.{_default_exchange()}"
 
     if not _append_exchange_suffix():
         return s_up
@@ -403,7 +418,11 @@ class EODHDClient:
     def _base_params(self) -> Dict[str, str]:
         return {"api_token": self.api_key, "fmt": "json"}
 
-    async def _request_json(self, endpoint: str, params: Optional[Dict[str, Any]] = None) -> Tuple[Optional[Any], Optional[str]]:
+    async def _request_json(
+        self,
+        endpoint: str,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Optional[Any], Optional[str]]:
         if not self.api_key:
             return None, "EODHD_API_KEY missing"
 
@@ -423,10 +442,20 @@ class EODHDClient:
                     # 429 rate limit
                     if sc == 429:
                         ra = r.headers.get("Retry-After")
-                        wait = float(ra) if ra and ra.isdigit() else min(15.0, 1.0 + attempt)
+                        wait = float(ra) if ra and ra.replace(".", "", 1).isdigit() else min(15.0, 1.0 + attempt)
                         last_err = "HTTP 429"
                         await asyncio.sleep(wait)
                         continue
+
+                    # auth errors
+                    if sc in (401, 403):
+                        # EODHD sometimes returns JSON error text; keep it short
+                        body_hint = ""
+                        try:
+                            body_hint = (r.text or "")[:160]
+                        except Exception:
+                            body_hint = ""
+                        return None, f"HTTP {sc} auth_error {body_hint}".strip()
 
                     # transient server errors
                     if 500 <= sc < 600:
@@ -461,7 +490,8 @@ class EODHDClient:
     # Quote
     # ---------------------------------------------------------------------
     async def fetch_quote(self, symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
-        sym = normalize_eodhd_symbol(symbol)
+        sym_raw = (symbol or "").strip().upper()
+        sym = normalize_eodhd_symbol(sym_raw)
         if not sym:
             return {}, "invalid_symbol"
 
@@ -482,30 +512,38 @@ class EODHDClient:
             prev = safe_float(data.get("previousClose"))
             chg = safe_float(data.get("change"))
 
-            # ratio-safe: compute change_pct as FRACTION from price/prev whenever possible
+            # ratio-safe: compute change_pct as FRACTION from close/prev when possible
             change_pct = None
             if close is not None and prev not in (None, 0.0):
                 change_pct = (close / prev) - 1.0
             else:
-                # fallback: change_p often comes as percent-points (0.79 means 0.79%)
-                # Convert percentish -> fraction safely
                 change_pct = _frac_from_percentish(data.get("change_p"))
 
+            # map schema-aligned aliases
             patch = _clean_patch(
                 {
-                    "symbol": (symbol or "").strip().upper(),
+                    "symbol": sym_raw,
                     "symbol_normalized": sym,
                     "provider": PROVIDER_NAME,
                     "data_source": PROVIDER_NAME,
+
                     "current_price": close,
                     "previous_close": prev,
+
+                    "price_change": chg if chg is not None else (close - prev if close is not None and prev is not None else None),
+                    "percent_change": change_pct,
+
+                    # legacy aliases used by older paths
                     "change": chg if chg is not None else (close - prev if close is not None and prev is not None else None),
-                    "change_pct": change_pct,  # FRACTION (0.0079 == 0.79%)
+                    "change_pct": change_pct,
+
                     "day_open": safe_float(data.get("open")),
                     "day_high": safe_float(data.get("high")),
                     "day_low": safe_float(data.get("low")),
                     "volume": safe_float(data.get("volume")),
-                    "currency": safe_str(data.get("currency")) or None,
+
+                    "currency": safe_str(data.get("currency")),
+
                     "last_updated_utc": _utc_iso(),
                     "last_updated_riyadh": _riyadh_iso(),
                 }
@@ -519,7 +557,8 @@ class EODHDClient:
     # Fundamentals
     # ---------------------------------------------------------------------
     async def fetch_fundamentals(self, symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
-        sym = normalize_eodhd_symbol(symbol)
+        sym_raw = (symbol or "").strip().upper()
+        sym = normalize_eodhd_symbol(sym_raw)
         if not sym:
             return {}, "invalid_symbol"
 
@@ -545,10 +584,11 @@ class EODHDClient:
 
             patch = _clean_patch(
                 {
-                    "symbol": (symbol or "").strip().upper(),
+                    "symbol": sym_raw,
                     "symbol_normalized": sym,
                     "provider": PROVIDER_NAME,
                     "data_source": PROVIDER_NAME,
+
                     # identity
                     "name": safe_str(general.get("Name")),
                     "exchange": safe_str(general.get("Exchange")),
@@ -556,9 +596,11 @@ class EODHDClient:
                     "currency": currency,
                     "sector": safe_str(general.get("Sector")),
                     "sub_sector": safe_str(general.get("Industry")),
+
                     # cap / shares
                     "market_cap": safe_float(highlights.get("MarketCapitalization")) or safe_float(general.get("MarketCapitalization")),
                     "shares_outstanding": safe_float(shares.get("SharesOutstanding")),
+
                     # earnings / valuation
                     "eps_ttm": safe_float(highlights.get("EarningsShare")) or safe_float(highlights.get("DilutedEpsTTM")),
                     "pe_ttm": safe_float(valuation.get("TrailingPE")) or safe_float(highlights.get("PERatio")),
@@ -566,13 +608,14 @@ class EODHDClient:
                     "pb": safe_float(valuation.get("PriceBookMRQ")) or safe_float(valuation.get("PriceBook")),
                     "ps": safe_float(valuation.get("PriceSalesTTM")) or safe_float(valuation.get("PriceSales")),
                     "ev_ebitda": safe_float(valuation.get("EnterpriseValueEbitda")) or safe_float(valuation.get("EnterpriseValueEBITDA")),
+
                     # percent-like fields as FRACTIONS
                     "dividend_yield": _frac_from_percentish(highlights.get("DividendYield")),
                     "payout_ratio": _frac_from_percentish(highlights.get("PayoutRatio")),
                     "roe": _frac_from_percentish(highlights.get("ROE")),
                     "roa": _frac_from_percentish(highlights.get("ROA")),
                     "net_margin": _frac_from_percentish(highlights.get("ProfitMargin")),
-                    # timestamps
+
                     "last_updated_utc": _utc_iso(),
                     "last_updated_riyadh": _riyadh_iso(),
                 }
@@ -586,7 +629,8 @@ class EODHDClient:
     # History stats (52W, avg vol, vol, MA, RSI, simple returns)
     # ---------------------------------------------------------------------
     async def fetch_history_stats(self, symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
-        sym = normalize_eodhd_symbol(symbol)
+        sym_raw = (symbol or "").strip().upper()
+        sym = normalize_eodhd_symbol(sym_raw)
         if not sym:
             return {}, "invalid_symbol"
 
@@ -623,17 +667,19 @@ class EODHDClient:
 
             n = len(closes)
             if n < 25:
-                patch = {
-                    "symbol": (symbol or "").strip().upper(),
-                    "symbol_normalized": sym,
-                    "provider": PROVIDER_NAME,
-                    "data_source": PROVIDER_NAME,
-                    "history_points": n,
-                    "history_source": PROVIDER_NAME,
-                    "history_last_utc": last_hist_dt,
-                    "last_updated_utc": _utc_iso(),
-                    "last_updated_riyadh": _riyadh_iso(),
-                }
+                patch = _clean_patch(
+                    {
+                        "symbol": sym_raw,
+                        "symbol_normalized": sym,
+                        "provider": PROVIDER_NAME,
+                        "data_source": PROVIDER_NAME,
+                        "history_points": n,
+                        "history_source": PROVIDER_NAME,
+                        "history_last_utc": last_hist_dt,
+                        "last_updated_utc": _utc_iso(),
+                        "last_updated_riyadh": _riyadh_iso(),
+                    }
+                )
                 await self.hist_cache.set(ck, patch)
                 return patch, None
 
@@ -719,35 +765,40 @@ class EODHDClient:
 
             patch = _clean_patch(
                 {
-                    "symbol": (symbol or "").strip().upper(),
+                    "symbol": sym_raw,
                     "symbol_normalized": sym,
                     "provider": PROVIDER_NAME,
                     "data_source": PROVIDER_NAME,
-                    # 52W
-                    "low_52w": low_52,
-                    "high_52w": high_52,
-                    "position_52w_pct": pos_52_frac,      # FRACTION 0..1 (router will format safely)
-                    "week_52_position_pct": pos_52_frac,  # alias
+
+                    # 52W (schema-aligned + aliases)
+                    "week_52_low": low_52,
+                    "week_52_high": high_52,
+                    "week_52_position_pct": pos_52_frac,      # FRACTION 0..1
+                    "low_52w": low_52,                        # alias
+                    "high_52w": high_52,                      # alias
+                    "position_52w_pct": pos_52_frac,          # alias
+
                     # liquidity / tech
                     "avg_vol_30d": avg_vol_30,
-                    "avg_volume_30d": avg_vol_30,         # alias
-                    "volatility_30d": vol_30,             # FRACTION
+                    "avg_volume_30d": avg_vol_30,             # alias
+                    "volatility_30d": vol_30,                 # FRACTION
                     "rsi_14": rsi14,
                     "ma20": ma20,
                     "ma50": ma50,
                     "ma200": ma200,
+
                     # returns (fractions)
                     "returns_1w": returns_1w,
                     "returns_1m": returns_1m,
                     "returns_3m": returns_3m,
                     "returns_6m": returns_6m,
                     "returns_12m": returns_12m,
-                    "return_1w": returns_1w,   # aliases for other schemas
+                    "return_1w": returns_1w,   # aliases
                     "return_1m": returns_1m,
                     "return_3m": returns_3m,
                     "return_6m": returns_6m,
                     "return_1y": returns_12m,
-                    # meta
+
                     "history_points": n,
                     "history_source": PROVIDER_NAME,
                     "history_last_utc": last_hist_dt,
@@ -776,28 +827,50 @@ class EODHDClient:
         sym_norm = normalize_eodhd_symbol(sym_raw)
 
         if not sym_norm:
-            return {
-                "symbol": sym_raw,
-                "symbol_normalized": "",
-                "provider": PROVIDER_NAME,
-                "data_source": PROVIDER_NAME,
-                "data_quality": "MISSING",
-                "error": "invalid_symbol",
-                "last_updated_utc": now_utc,
-                "last_updated_riyadh": now_riy,
-            }
+            return _clean_patch(
+                {
+                    "symbol": sym_raw,
+                    "symbol_normalized": "",
+                    "provider": PROVIDER_NAME,
+                    "data_source": PROVIDER_NAME,
+                    "data_quality": "MISSING",
+                    "error": "invalid_symbol",
+                    "error_detail": "normalize_eodhd_symbol returned empty",
+                    "last_updated_utc": now_utc,
+                    "last_updated_riyadh": now_riy,
+                }
+            )
+
+        if not self.api_key:
+            # This is the #1 cause of “provider loaded but no compatible quote method succeeded”
+            return _clean_patch(
+                {
+                    "symbol": sym_raw,
+                    "symbol_normalized": sym_norm,
+                    "provider": PROVIDER_NAME,
+                    "data_source": PROVIDER_NAME,
+                    "data_quality": "MISSING",
+                    "error": "missing_api_key",
+                    "error_detail": "EODHD_API_KEY (or EODHD_API_TOKEN/EODHD_KEY) is not set",
+                    "last_updated_utc": now_utc,
+                    "last_updated_riyadh": now_riy,
+                }
+            )
 
         if _KSA_RE.match(sym_norm) and _ksa_blocked_by_default() and not _allow_ksa_override():
-            return {
-                "symbol": sym_raw,
-                "symbol_normalized": sym_norm,
-                "provider": PROVIDER_NAME,
-                "data_source": PROVIDER_NAME,
-                "data_quality": "BLOCKED",
-                "error": "ksa_blocked",
-                "last_updated_utc": now_utc,
-                "last_updated_riyadh": now_riy,
-            }
+            return _clean_patch(
+                {
+                    "symbol": sym_raw,
+                    "symbol_normalized": sym_norm,
+                    "provider": PROVIDER_NAME,
+                    "data_source": PROVIDER_NAME,
+                    "data_quality": "BLOCKED",
+                    "error": "ksa_blocked",
+                    "error_detail": "KSA_DISALLOW_EODHD=true (override with ALLOW_EODHD_KSA=1)",
+                    "last_updated_utc": now_utc,
+                    "last_updated_riyadh": now_riy,
+                }
+            )
 
         enable_fund = _env_bool("EODHD_ENABLE_FUNDAMENTALS", True)
         enable_hist = _env_bool("EODHD_ENABLE_HISTORY", True)
@@ -827,7 +900,7 @@ class EODHDClient:
                 errors.append(f"exception:{r.__class__.__name__}")
                 continue
 
-            patch, err = r  # type: ignore
+            patch, err = r  # type: ignore[misc]
             if err:
                 errors.append(str(err))
             if isinstance(patch, dict) and patch:
@@ -837,6 +910,7 @@ class EODHDClient:
                     if k not in merged or merged.get(k) in (None, "", [], {}):
                         merged[k] = v
 
+        # Determine quality
         if merged.get("current_price") is None:
             merged["data_quality"] = "MISSING"
             merged["error"] = "fetch_failed"
@@ -844,9 +918,19 @@ class EODHDClient:
         else:
             merged["data_quality"] = "OK"
 
-        # ensure canonical fields
+        # Ensure canonical fields
         merged["symbol"] = sym_raw
         merged["symbol_normalized"] = sym_norm
+
+        # Backward-compatible aliases (for older routers/clients)
+        if "current_price" in merged and "price" not in merged:
+            merged["price"] = merged.get("current_price")
+        if "previous_close" in merged and "prev_close" not in merged:
+            merged["prev_close"] = merged.get("previous_close")
+        if "week_52_high" in merged and "52w_high" not in merged:
+            merged["52w_high"] = merged.get("week_52_high")
+        if "week_52_low" in merged and "52w_low" not in merged:
+            merged["52w_low"] = merged.get("week_52_low")
 
         return _clean_patch(merged)
 
@@ -863,6 +947,7 @@ class EODHDClient:
 _INSTANCE: Optional[EODHDClient] = None
 _INSTANCE_LOCK = asyncio.Lock()
 
+
 async def get_client() -> EODHDClient:
     global _INSTANCE
     if _INSTANCE is None:
@@ -871,9 +956,11 @@ async def get_client() -> EODHDClient:
                 _INSTANCE = EODHDClient()
     return _INSTANCE
 
+
 async def fetch_enriched_quote_patch(symbol: str, *args, **kwargs) -> Dict[str, Any]:
     client = await get_client()
     return await client.fetch_enriched_quote_patch(symbol)
+
 
 __all__ = [
     "fetch_enriched_quote_patch",
