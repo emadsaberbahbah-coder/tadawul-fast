@@ -970,3 +970,49 @@ __all__ = [
     "get_client",
     "normalize_eodhd_symbol",
 ]
+# =============================================================================
+# Compatibility wrappers (DataEngine method discovery)
+# =============================================================================
+# Many engines discover provider capabilities by searching for common function names.
+# These wrappers ensure the module ALWAYS exposes a compatible quote method.
+
+async def quote(symbol: str, *args, **kwargs) -> Dict[str, Any]:
+    """
+    Common interface: return a quote dict for ONE symbol.
+    Raise on failure so the engine sets last_err (instead of last_err=None).
+    """
+    client = await get_client()
+    patch, err = await client.fetch_quote(symbol)
+    if err:
+        raise RuntimeError(err)
+    return patch
+
+async def get_quote(symbol: str, *args, **kwargs) -> Dict[str, Any]:
+    return await quote(symbol, *args, **kwargs)
+
+async def fetch_quote(symbol: str, *args, **kwargs) -> Dict[str, Any]:
+    return await quote(symbol, *args, **kwargs)
+
+async def enriched_quote(symbol: str, *args, **kwargs) -> Dict[str, Any]:
+    """
+    Some pipelines expect an "enriched quote" function.
+    """
+    return await fetch_enriched_quote_patch(symbol)
+
+async def fetch_quotes(symbols: List[str], *args, **kwargs) -> List[Dict[str, Any]]:
+    """
+    Batch helper (optional). Returns list of quote dicts (only successful ones).
+    """
+    out: List[Dict[str, Any]] = []
+    for s in symbols or []:
+        try:
+            out.append(await quote(s))
+        except Exception:
+            # keep batch best-effort
+            continue
+    return out
+
+# Make sure exports include these
+__all__ = list(set(__all__ + [
+    "quote", "get_quote", "fetch_quote", "enriched_quote", "fetch_quotes"
+]))
