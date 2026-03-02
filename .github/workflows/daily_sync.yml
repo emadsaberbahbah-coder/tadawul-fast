@@ -143,6 +143,29 @@ jobs:
           "
           echo "::endgroup::"
 
+      - name: 🧪 Run Scoring Engine Contract Tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          echo "::group::Contract Tests"
+
+          # Ensure pytest exists (safe fallback)
+          python -c "import pytest" 2>/dev/null || python -m pip install -q pytest
+
+          # Your file was renamed to test_scoring_engine_contract.py
+          if [ -f "test_scoring_engine_contract.py" ]; then
+            python -m pytest -q test_scoring_engine_contract.py
+          elif [ -f "core/test_scoring_engine_contract.py" ]; then
+            python -m pytest -q core/test_scoring_engine_contract.py
+          elif [ -f "tests/test_scoring_engine_contract.py" ]; then
+            python -m pytest -q tests/test_scoring_engine_contract.py
+          else
+            echo "::error::test_scoring_engine_contract.py not found (root/core/tests)."
+            exit 1
+          fi
+
+          echo "::endgroup::"
+
       # --- ADVANCED GCP OIDC OPTION (Uncomment to use instead of JSON Keys) ---
       # - name: 🔐 Authenticate to Google Cloud
       #   id: auth
