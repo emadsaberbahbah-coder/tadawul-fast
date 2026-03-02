@@ -2,31 +2,38 @@
 # core/enriched_quote.py
 """
 ================================================================================
-Enriched Quote Router — v5.2.0 (GLOBAL-FIRST / ENGINE-LAZY / SHEET-RATIO-SAFE)
+Enriched Quote Router — v5.3.0 (GLOBAL-FIRST / ENGINE-LAZY / SHEET-RATIO-SAFE)
 ================================================================================
 Financial Data Platform — High-Performance Aggregation and Sheet Mapping
 
-Key fixes (targets your “wrong % ratios” issue in Google Sheets):
-- ✅ Sheet-safe percent outputs: ALL % columns now emit **decimal fractions** (e.g., 0.9877 => 98.77%)
-  so Google Sheets Percent format will NOT explode values (no more 9877% from 98.77).
-- ✅ Computed % fields are computed in FRACTION form:
-     - Change %      = (Price/PrevClose - 1)         (fraction)
-     - 52W Position  = (Price-52WLow)/(52WHigh-52WLow) (fraction)
-     - Turnover %    = Volume/SharesOutstanding      (fraction)
-     - Upside %      = (FairValue/Price - 1)         (fraction)
-- ✅ Fixes “No engine available” with robust lazy engine init + caching in app.state.engine
-- ✅ Canonical symbol output rules:
-     - If request is "AAPL" => output stays "AAPL" (even if upstream uses "AAPL.US")
-     - If KSA => always keeps ".SR"
-- ✅ Updated mapping supports provider keys from EODHD/Finnhub/Yahoo variants
-- ✅ Auth header compatibility: X-APP-TOKEN, X-API-Key, Authorization: Bearer <token>
-- ✅ Production-safe error handling + optional debug traceback
+v5.3.0 upgrades (your “green signal” wiring improvements)
+- ✅ Mount-safe + discovery-safe:
+    - Exposes `router` and `get_router()` (standard)
+    - Adds optional `mount(app)` helper (some mount plans use it)
+- ✅ Engine call compatibility:
+    - Tries more engine method names (single + batch)
+    - Supports passing optional kwargs (include_raw / provider) ONLY if engine accepts them
+    - Better error surface: includes engine_source + engine_error (so you see WHY it fails)
+- ✅ Batch fallback correctness:
+    - Fixes “missing items” logic (no longer assumes missing are only the tail)
+- ✅ Sheet-safe percent handling:
+    - Keeps % values as FRACTIONS (0.12 => 12%)
+    - Computes Change% and 52W Position% in FRACTION form whenever possible
+- ✅ Auth alignment:
+    - Uses core.config.auth_ok/is_open_mode if available
+    - Accepts X-APP-TOKEN, Authorization: Bearer, X-API-Key
+- ✅ Operational endpoints:
+    - /v1/enriched/health (includes config health if available)
+    - /v1/enriched/headers
+    - /v1/enriched/quote
+    - /v1/enriched/quotes (GET + POST JSON body)
 
-Endpoints:
-- /v1/enriched/quote
-- /v1/enriched/quotes?format=items|sheet
-- /v1/enriched/headers
-- /v1/enriched/health
+Notes:
+- This router depends on the DataEngine to actually fetch quotes.
+- If your `/quotes` root endpoint still shows:
+    "Provider loaded but no compatible quote method succeeded. last_err=None"
+  then the fix is in provider interface discovery (e.g., EODHD provider wrappers),
+  not in this router. This router will now show that error more clearly.
 """
 
 from __future__ import annotations
@@ -41,9 +48,9 @@ import time
 import traceback
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
-from fastapi import APIRouter, Query, Request
+from fastapi import APIRouter, Body, Query, Request
 from fastapi.encoders import jsonable_encoder
 
 # ---------------------------------------------------------------------------
@@ -129,16 +136,19 @@ except Exception:
     except Exception:
         _normalize_symbol = _fallback_normalize_symbol  # type: ignore
 
-__version__ = "5.2.0"
+__version__ = "5.3.0"
 ROUTER_VERSION = __version__
 
 logger = logging.getLogger("core.enriched_quote")
+
 router = APIRouter(prefix="/v1/enriched", tags=["enriched"])
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "active"}
 _RECOMMENDATIONS = ("STRONG_BUY", "BUY", "HOLD", "REDUCE", "SELL")
 RIYADH_TZ = timezone(timedelta(hours=3))
 
+# ============================================================================
+# Headers (sheet-ready)
 # ============================================================================
 
 ENRICHED_HEADERS_61: List[str] = [
@@ -157,7 +167,6 @@ ENRICHED_HEADERS_61: List[str] = [
 # Backward alias (older name)
 ENRICHED_HEADERS_59 = ENRICHED_HEADERS_61
 
-# Field groups for data quality scoring (presence-based)
 FIELD_CATEGORIES = {
     "identity": {"symbol", "name", "sector", "industry", "sub_sector", "market", "currency", "exchange"},
     "price": {"current_price", "previous_close", "day_open", "day_high", "day_low", "volume", "vwap"},
@@ -169,6 +178,8 @@ FIELD_CATEGORIES = {
 
 HeaderSpec = Tuple[Tuple[str, ...], Optional[Callable[[Any], Any]]]
 
+# ============================================================================
+# Small safety helpers
 # ============================================================================
 
 def _safe_str(x: Any, max_len: int = 0) -> str:
@@ -187,7 +198,8 @@ def _safe_int(x: Any, default: Optional[int] = None) -> Optional[int]:
     if x is None:
         return default
     try:
-        return int(float(str(x).strip()))
+        s = str(x).strip().replace(",", "")
+        return int(float(s))
     except Exception:
         return default
 
@@ -199,7 +211,13 @@ def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
         if isinstance(x, (int, float)) and not isinstance(x, bool):
             f = float(x)
         else:
-            f = float(str(x).strip())
+            s = str(x).strip().replace(",", "")
+            if not s or s.lower() in {"na", "n/a", "null", "none"}:
+                return default
+            if s.endswith("%"):
+                f = float(s[:-1].strip()) / 100.0
+            else:
+                f = float(s)
         if math.isnan(f) or math.isinf(f):
             return default
         return f
@@ -318,6 +336,7 @@ def _canonical_output_symbol(raw_symbol: str, payload: Dict[str, Any]) -> str:
     Canonical output:
     - KSA codes => NNNN.SR
     - GLOBAL plain tickers => keep as requested (AAPL stays AAPL)
+    - If user supplies explicit suffix (e.g., 7203.T) => keep normalized form
     """
     raw = _safe_str(raw_symbol).upper()
     if not raw:
@@ -333,6 +352,7 @@ def _canonical_output_symbol(raw_symbol: str, payload: Dict[str, Any]) -> str:
             if code.isdigit():
                 return f"{code}.SR"
 
+    # Keep plain tickers as-is (AAPL stays AAPL)
     if "." not in raw:
         return raw
 
@@ -355,18 +375,10 @@ def _origin_from_symbol(symbol: str) -> str:
 
 def _percent_to_fraction(x: Any) -> Optional[float]:
     """
-    Converts a percent-like value to a fraction suitable for Google Sheets % format.
-
-    Accepts:
-    - "0.79%" -> 0.0079
-    - 0.0079  -> 0.0079   (already fraction)
-    - 0.79    -> 0.0079   (assume percent-points when > 0.2 for % fields is risky, so avoid here)
-    - 34.71   -> 0.3471   (percent-points)
-    - 0.3471  -> 0.3471   (fraction)
-
-    IMPORTANT:
-    - This is used ONLY where the source value is known to be “percent-ish”.
-    - For daily change %, we prefer computing from price/prev_close to avoid ambiguity.
+    Converts percent-like to fraction for Google Sheets % format.
+    - "12%" -> 0.12
+    - 12    -> 0.12 (percent-points)
+    - 0.12  -> 0.12 (already fraction)
     """
     if x is None:
         return None
@@ -383,12 +395,8 @@ def _percent_to_fraction(x: Any) -> Optional[float]:
 
     if f is None:
         return None
-
-    # If it's clearly percent-points (e.g., 12.5 meaning 12.5%), convert.
     if abs(f) > 1.5:
         return f / 100.0
-
-    # Otherwise assume it's already a fraction (0.12 => 12%).
     return f
 
 
@@ -499,7 +507,7 @@ def _compute_data_quality(payload: Dict[str, Any]) -> str:
 
 # ---------------------------------------------------------------------------
 # Header mapping (sheet-ready)
-# NOTE: For % columns, we output FRACTIONS (0..1) so Sheets Percent format works.
+# NOTE: For % columns, we output FRACTIONS (0..1)
 # ---------------------------------------------------------------------------
 _HEADER_MAP: Dict[str, HeaderSpec] = {
     "rank": (("rank",), None),
@@ -513,33 +521,25 @@ _HEADER_MAP: Dict[str, HeaderSpec] = {
     "currency": (("currency",), None),
     "listing date": (("listing_date", "ipo_date", "ipo"), None),
 
-    "price": (("current_price", "last_price", "price", "regular_market_price"), None),
-    "prev close": (("previous_close", "prev_close", "regular_market_previous_close"), None),
+    "price": (("current_price", "last_price", "price", "close", "regular_market_price"), None),
+    "prev close": (("previous_close", "prev_close", "previousClose", "regular_market_previous_close"), None),
 
-    # Change: prefer provided; else compute
     "change": (("change", "price_change", "regular_market_change"), None),
-
-    # Change %: we prefer computing from price/prev_close (fraction). Provided values used only if needed.
     "change %": (("change_pct", "percent_change", "change_percent", "regular_market_change_percent"), _percent_to_fraction),
 
-    "day high": (("day_high", "regular_market_day_high"), None),
-    "day low": (("day_low", "regular_market_day_low"), None),
+    "day high": (("day_high", "high", "regular_market_day_high"), None),
+    "day low": (("day_low", "low", "regular_market_day_low"), None),
 
-    # 52W (support both old + new)
-    "52w high": (("high_52w", "week_52_high", "fifty_two_week_high", "year_high"), None),
-    "52w low": (("low_52w", "week_52_low", "fifty_two_week_low", "year_low"), None),
+    "52w high": (("high_52w", "week_52_high", "fifty_two_week_high", "year_high", "52w_high"), None),
+    "52w low": (("low_52w", "week_52_low", "fifty_two_week_low", "year_low", "52w_low"), None),
     "52w position %": (("position_52w_pct", "week_52_position_pct", "position_52w"), _percent_to_fraction),
 
     "volume": (("volume", "regular_market_volume"), None),
     "avg vol 30d": (("avg_vol_30d", "avg_volume_30d", "average_volume", "average_daily_volume"), None),
     "value traded": (("value_traded", "traded_value", "turnover_value"), None),
 
-    # Turnover %: output fraction
     "turnover %": (("turnover_percent", "turnover_pct"), _percent_to_fraction),
-
     "shares outstanding": (("shares_outstanding", "shares_out"), None),
-
-    # Free float %: output fraction
     "free float %": (("free_float", "free_float_percent"), _percent_to_fraction),
 
     "market cap": (("market_cap", "market_capitalization"), None),
@@ -555,7 +555,6 @@ _HEADER_MAP: Dict[str, HeaderSpec] = {
     "p/s": (("ps", "price_to_sales", "price_sales"), None),
     "ev/ebitda": (("ev_ebitda", "enterprise_value_to_ebitda"), None),
 
-    # Dividend Yield / Payout / Margins / ROE/ROA / Growth: output fraction for sheets
     "dividend yield": (("dividend_yield",), _percent_to_fraction),
     "dividend rate": (("dividend_rate",), None),
     "payout ratio": (("payout_ratio",), _percent_to_fraction),
@@ -568,9 +567,7 @@ _HEADER_MAP: Dict[str, HeaderSpec] = {
     "revenue growth": (("revenue_growth",), _percent_to_fraction),
     "net income growth": (("net_income_growth",), _percent_to_fraction),
 
-    # Volatility: output fraction for sheets
     "volatility 30d": (("volatility_30d", "vol_30d_ann"), _percent_to_fraction),
-
     "rsi 14": (("rsi_14", "rsi14"), None),
 
     "fair value": (("fair_value", "target_price", "forecast_price_3m", "forecast_price_12m"), None),
@@ -584,15 +581,17 @@ _HEADER_MAP: Dict[str, HeaderSpec] = {
     "risk score": (("risk_score",), None),
     "overall score": (("overall_score", "composite_score"), None),
 
-    "error": (("error", "error_message", "error_detail"), None),
+    "error": (("error", "error_message", "error_detail", "engine_error"), None),
     "recommendation": (("recommendation",), None),
-    "data source": (("data_source", "source", "provider"), None),
+    "data source": (("data_source", "source", "provider", "engine_source"), None),
     "data quality": (("data_quality",), None),
 
     "last updated (utc)": (("last_updated_utc", "as_of_utc", "timestamp_utc"), _to_iso),
     "last updated (riyadh)": (("last_updated_riyadh",), _to_iso),
 }
 
+# ============================================================================
+# EnrichedQuote object
 # ============================================================================
 
 class EnrichedQuote:
@@ -627,6 +626,18 @@ class EnrichedQuote:
                 return self.payload[f]
         return None
 
+    def _get_price(self) -> Any:
+        return self._get_first(_HEADER_MAP["price"][0])
+
+    def _get_prev_close(self) -> Any:
+        return self._get_first(_HEADER_MAP["prev close"][0])
+
+    def _get_52w_high(self) -> Any:
+        return self._get_first(_HEADER_MAP["52w high"][0])
+
+    def _get_52w_low(self) -> Any:
+        return self._get_first(_HEADER_MAP["52w low"][0])
+
     def _get_value(self, header: str) -> Any:
         h = header.strip().lower()
         if h in self._computed:
@@ -646,34 +657,26 @@ class EnrichedQuote:
         # Sheet-safe computed fields
         # -------------------------
         if h in ("change", "change %"):
-            # Always prefer computing from price/prev_close (removes ambiguity + fixes Sheets scaling)
-            ch, pct_frac = _compute_change(
-                self.payload.get("current_price") or self.payload.get("price"),
-                self.payload.get("previous_close"),
-            )
+            ch, pct_frac = _compute_change(self._get_price(), self._get_prev_close())
+
             if h == "change":
                 val = self._get_first(fields)
                 v = val if val is not None else ch
                 self._computed[h] = v
                 return v
 
-            # change % (fraction)
             if pct_frac is not None:
                 self._computed[h] = pct_frac
                 return pct_frac
 
-            # fallback to provided if compute not possible
+            # fallback: percent-like provided
             val = self._get_first(fields)
             v = transform(val) if (transform and val is not None) else val
             self._computed[h] = v
             return v
 
         if h == "52w position %":
-            pos_frac = _compute_52w_position_fraction(
-                self.payload.get("current_price") or self.payload.get("price"),
-                self.payload.get("low_52w") or self.payload.get("week_52_low"),
-                self.payload.get("high_52w") or self.payload.get("week_52_high"),
-            )
+            pos_frac = _compute_52w_position_fraction(self._get_price(), self._get_52w_low(), self._get_52w_high())
             if pos_frac is not None:
                 self._computed[h] = pos_frac
                 return pos_frac
@@ -698,10 +701,7 @@ class EnrichedQuote:
             val = self._get_first(fields)
             if val is not None:
                 return val
-            vt = _compute_value_traded(
-                self.payload.get("current_price") or self.payload.get("price"),
-                self.payload.get("volume"),
-            )
+            vt = _compute_value_traded(self._get_price(), self.payload.get("volume"))
             if vt is not None:
                 self.payload["value_traded"] = vt
             self._computed[h] = vt
@@ -720,10 +720,7 @@ class EnrichedQuote:
             if val is not None:
                 return val
             if self.payload.get("value_traded") is None:
-                self.payload["value_traded"] = _compute_value_traded(
-                    self.payload.get("current_price") or self.payload.get("price"),
-                    self.payload.get("volume"),
-                )
+                self.payload["value_traded"] = _compute_value_traded(self._get_price(), self.payload.get("volume"))
             ls = _compute_liquidity_score(self.payload.get("value_traded"))
             self._computed[h] = ls
             return ls
@@ -734,7 +731,6 @@ class EnrichedQuote:
                 v = self._get_first(fields)
                 return v if v is not None else fair
             if h == "upside %":
-                # Prefer computed (fraction)
                 if upside_frac is not None:
                     self._computed[h] = upside_frac
                     return upside_frac
@@ -768,8 +764,16 @@ class EnrichedQuote:
         return val
 
     def to_row(self, headers: Sequence[str]) -> List[Any]:
-        return [self._get_value(h) for h in headers]
+        # Sheets: prefer "" over null
+        row: List[Any] = []
+        for h in headers:
+            v = self._get_value(h)
+            row.append("" if v is None else v)
+        return row
 
+
+# ============================================================================
+# Engine calling (lazy + signature-safe kwargs)
 # ============================================================================
 
 class EngineCall:
@@ -788,6 +792,23 @@ async def _maybe_await(v: Any) -> Any:
     return v
 
 
+def _filter_kwargs_for_callable(fn: Callable, kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Pass only kwargs the function accepts (prevents TypeError and improves compatibility).
+    """
+    if not kwargs:
+        return {}
+    try:
+        sig = inspect.signature(fn)
+        params = sig.parameters
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return kwargs
+        allowed = set(params.keys())
+        return {k: v for k, v in kwargs.items() if k in allowed}
+    except Exception:
+        return {}
+
+
 _ENGINE_INIT_LOCK = asyncio.Lock()
 _ENGINE_LAST_FAIL_AT = 0.0
 _ENGINE_FAIL_TTL_SEC = 10.0
@@ -796,9 +817,9 @@ _ENGINE_FAIL_TTL_SEC = 10.0
 async def _get_or_init_engine(request: Request) -> Tuple[Optional[Any], str, Optional[str]]:
     """
     Returns (engine, source, error).
-    Caches engine in request.app.state.engine to prevent repeated imports.
+    Caches engine in request.app.state.engine.
     """
-    # 1) already set on app.state
+    # already set
     try:
         engine = getattr(request.app.state, "engine", None)
         if engine is not None:
@@ -806,13 +827,11 @@ async def _get_or_init_engine(request: Request) -> Tuple[Optional[Any], str, Opt
     except Exception:
         pass
 
-    # throttle repeated failures
     global _ENGINE_LAST_FAIL_AT
     if time.time() - _ENGINE_LAST_FAIL_AT < _ENGINE_FAIL_TTL_SEC:
         return None, "engine_init_throttled", "recent_engine_init_failure"
 
     async with _ENGINE_INIT_LOCK:
-        # re-check after lock
         try:
             engine = getattr(request.app.state, "engine", None)
             if engine is not None:
@@ -820,7 +839,9 @@ async def _get_or_init_engine(request: Request) -> Tuple[Optional[Any], str, Opt
         except Exception:
             pass
 
-        # 2) try core.data_engine_v2.get_engine
+        last_err = None
+
+        # core.data_engine_v2.get_engine
         try:
             from core.data_engine_v2 import get_engine  # type: ignore
 
@@ -834,7 +855,7 @@ async def _get_or_init_engine(request: Request) -> Tuple[Optional[Any], str, Opt
         except Exception as e:
             last_err = repr(e)
 
-        # 3) try alternate layout data_engine_v2.get_engine
+        # alt layout
         try:
             from data_engine_v2 import get_engine as get_engine2  # type: ignore
 
@@ -848,7 +869,7 @@ async def _get_or_init_engine(request: Request) -> Tuple[Optional[Any], str, Opt
         except Exception as e:
             last_err = f"{last_err} | alt:{repr(e)}"
 
-        # 4) last attempt: legacy engine module (if exists)
+        # legacy
         try:
             from core.data_engine import get_engine as get_engine_legacy  # type: ignore
 
@@ -866,17 +887,36 @@ async def _get_or_init_engine(request: Request) -> Tuple[Optional[Any], str, Opt
         return None, "engine_init_failed", last_err
 
 
-async def _call_engine(request: Request, symbol: str) -> EngineCall:
+# Try more method names for maximum compatibility
+_ENGINE_SINGLE_METHODS = (
+    "get_enriched_quote",
+    "get_quote",
+    "quote",
+    "fetch_quote",
+    "get_enriched_quote_patch",
+)
+
+_ENGINE_BATCH_METHODS = (
+    "get_enriched_quotes",
+    "get_quotes",
+    "quotes",
+    "fetch_quotes",
+)
+
+
+async def _call_engine(request: Request, symbol: str, *, include_raw: bool = False, provider: Optional[str] = None) -> EngineCall:
     start = time.time()
     engine, src, err = await _get_or_init_engine(request)
     if engine is None:
         return EngineCall(error="No engine available", source=src, latency_ms=(time.time() - start) * 1000)
 
-    for method in ("get_enriched_quote", "get_quote"):
+    call_kwargs = {"include_raw": include_raw, "provider": provider}
+    for method in _ENGINE_SINGLE_METHODS:
         fn = getattr(engine, method, None)
         if callable(fn):
             try:
-                res = await _maybe_await(fn(symbol))
+                kw = _filter_kwargs_for_callable(fn, call_kwargs)
+                res = await _maybe_await(fn(symbol, **kw))
                 res = _unwrap_container(_unwrap_tuple(res))
                 return EngineCall(result=res, source=f"{src}.{method}", latency_ms=(time.time() - start) * 1000)
             except Exception as e:
@@ -885,17 +925,25 @@ async def _call_engine(request: Request, symbol: str) -> EngineCall:
     return EngineCall(error=err or "engine_call_failed", source=src, latency_ms=(time.time() - start) * 1000)
 
 
-async def _call_engine_batch(request: Request, symbols: List[str]) -> EngineCall:
+async def _call_engine_batch(
+    request: Request,
+    symbols: List[str],
+    *,
+    include_raw: bool = False,
+    provider: Optional[str] = None,
+) -> EngineCall:
     start = time.time()
     engine, src, err = await _get_or_init_engine(request)
     if engine is None:
         return EngineCall(error="No batch engine available", source=src, latency_ms=(time.time() - start) * 1000)
 
-    for method in ("get_enriched_quotes", "get_quotes"):
+    call_kwargs = {"include_raw": include_raw, "provider": provider}
+    for method in _ENGINE_BATCH_METHODS:
         fn = getattr(engine, method, None)
         if callable(fn):
             try:
-                res = await _maybe_await(fn(symbols))
+                kw = _filter_kwargs_for_callable(fn, call_kwargs)
+                res = await _maybe_await(fn(symbols, **kw))
                 res = _unwrap_container(_unwrap_tuple(res))
                 if isinstance(res, (list, dict)):
                     return EngineCall(result=res, source=f"{src}.{method}", latency_ms=(time.time() - start) * 1000)
@@ -904,10 +952,13 @@ async def _call_engine_batch(request: Request, symbols: List[str]) -> EngineCall
 
     return EngineCall(error=err or "engine_batch_call_failed", source=src, latency_ms=(time.time() - start) * 1000)
 
+
+# ============================================================================
+# Auth
 # ============================================================================
 
 def _is_authorized(request: Request) -> bool:
-    # Open mode shortcut (preferred)
+    # Open mode shortcut
     try:
         from core.config import is_open_mode  # type: ignore
 
@@ -916,31 +967,37 @@ def _is_authorized(request: Request) -> bool:
     except Exception:
         pass
 
-    # Accept your header + common variants
-    x_token = (
+    # Collect token candidates
+    token = (
         request.headers.get("X-APP-TOKEN")
         or request.headers.get("X-App-Token")
         or request.headers.get("X-API-Key")
         or request.headers.get("X-Api-Key")
+        or request.query_params.get("token")
     )
     authz = request.headers.get("Authorization")
 
-    if not x_token and not authz:
+    if not token and not authz:
         return False
 
-    # Use core.config.auth_ok if available
+    # Use core.config.auth_ok when available
     try:
         from core.config import auth_ok  # type: ignore
 
         if callable(auth_ok):
-            return bool(auth_ok(token=x_token, authorization=authz, headers=dict(request.headers)))
+            return bool(auth_ok(token=token, authorization=authz, headers=dict(request.headers)))
     except Exception:
         # If REQUIRE_AUTH explicitly true and auth_ok missing => deny
         req = str(os.getenv("REQUIRE_AUTH", "")).strip().lower() in _TRUTHY
         return not req
 
-    return True
+    # If we couldn't validate properly, deny by default
+    return False
 
+
+# ============================================================================
+# Request parsing helpers
+# ============================================================================
 
 def _get_symbols_from_request(request: Request, symbols_param: str, tickers_param: str) -> List[str]:
     values: List[str] = []
@@ -977,13 +1034,20 @@ def _get_concurrency_config() -> Dict[str, Any]:
     return {"concurrency": concurrency, "timeout_sec": timeout}
 
 
+# ============================================================================
+# Response builders
+# ============================================================================
+
 def _build_error_response(
     request_id: str,
     error: str,
+    *,
     symbol: str = "",
     status_code: int = 200,
     debug: bool = False,
     trace: Optional[str] = None,
+    engine_source: Optional[str] = None,
+    engine_error: Optional[str] = None,
 ) -> BestJSONResponse:
     content: Dict[str, Any] = {
         "status": "error",
@@ -994,6 +1058,10 @@ def _build_error_response(
     }
     if symbol:
         content["symbol"] = symbol
+    if engine_source:
+        content["engine_source"] = engine_source
+    if engine_error:
+        content["engine_error"] = engine_error
     if debug and trace:
         content["traceback"] = _safe_str(trace, 8000)
     return BestJSONResponse(status_code=status_code, content=content)
@@ -1016,21 +1084,26 @@ def _build_sheet_response(items: List[Dict[str, Any]], request_id: str) -> BestJ
 
 
 def _build_items_response(items: List[Dict[str, Any]], request_id: str) -> BestJSONResponse:
+    # Provide explicit errors list as well (helps Apps Script)
+    errors: List[Dict[str, str]] = []
+    for it in items:
+        if it.get("error"):
+            errors.append({"symbol": _safe_str(it.get("requested_symbol") or it.get("symbol") or ""), "error": _safe_str(it.get("error"))})
     return BestJSONResponse(
         status_code=200,
         content={
             "status": "success",
             "count": len(items),
             "items": items,
+            "errors": errors,
             "request_id": request_id,
             "timestamp_utc": _now_utc_iso(),
         },
     )
 
 
-def _canonicalize_payload(raw_symbol: str, payload: Dict[str, Any], source: str) -> Dict[str, Any]:
+def _canonicalize_payload(raw_symbol: str, payload: Dict[str, Any], engine_source: str) -> Dict[str, Any]:
     payload = payload or {}
-
     raw = (raw_symbol or "").strip()
     payload["requested_symbol"] = raw
 
@@ -1039,7 +1112,8 @@ def _canonicalize_payload(raw_symbol: str, payload: Dict[str, Any], source: str)
         payload["symbol_normalized"] = out_symbol
         payload["symbol"] = out_symbol
 
-    payload.setdefault("data_source", source)
+    payload.setdefault("engine_source", engine_source)
+    payload.setdefault("data_source", engine_source)  # keep older field expected by sheets
     payload.setdefault("last_updated_utc", _now_utc_iso())
     payload.setdefault("last_updated_riyadh", _to_riyadh_iso(payload["last_updated_utc"]))
     payload.setdefault("origin", _origin_from_symbol(payload.get("symbol", "")))
@@ -1052,6 +1126,9 @@ def _canonicalize_payload(raw_symbol: str, payload: Dict[str, Any], source: str)
 
     return payload
 
+
+# ============================================================================
+# Routes
 # ============================================================================
 
 @router.get("/headers", include_in_schema=False)
@@ -1068,13 +1145,25 @@ async def get_headers():
 
 
 @router.get("/health", include_in_schema=False)
-async def health_check():
-    return {
+async def health_check(request: Request):
+    """
+    Health includes config health if available + engine cached state.
+    """
+    info: Dict[str, Any] = {
         "status": "ok",
         "module": "enriched_quote",
         "version": ROUTER_VERSION,
         "timestamp_utc": _now_utc_iso(),
+        "engine_cached": bool(getattr(getattr(request, "app", None), "state", None) and getattr(request.app.state, "engine", None) is not None),
     }
+    try:
+        from core.config import config_health_check  # type: ignore
+
+        if callable(config_health_check):
+            info["config"] = config_health_check()
+    except Exception:
+        pass
+    return info
 
 
 @router.get("/quote")
@@ -1082,8 +1171,10 @@ async def get_enriched_quote(
     request: Request,
     symbol: str = Query("", description="Ticker symbol (AAPL, 1120.SR, ^GSPC, GC=F)"),
     debug: bool = Query(False, description="Include debug information"),
+    include_rows: bool = Query(False, description="Include sheet-ready row"),
     include_headers: bool = Query(False, description="Include headers in response (sheet mode)"),
-    include_rows: bool = Query(False, description="Include sheet-ready rows"),
+    include_raw: bool = Query(False, description="Ask engine/provider to include raw payload if supported"),
+    provider: Optional[str] = Query(None, description="Optional provider override if engine supports it"),
 ):
     request_id = request.headers.get("X-Request-ID", str(uuid.uuid4())[:8])
     dbg = _is_truthy(os.getenv("DEBUG_ERRORS", "0")) or debug
@@ -1102,7 +1193,7 @@ async def get_enriched_quote(
 
         start_time = time.time()
         try:
-            call = await _call_engine(request, raw)
+            call = await _call_engine(request, raw, include_raw=include_raw, provider=provider)
             if call.error or call.result is None:
                 router_requests_total.labels(endpoint="quote", status="no_data").inc()
                 return _build_error_response(
@@ -1111,6 +1202,8 @@ async def get_enriched_quote(
                     symbol=raw,
                     debug=dbg,
                     trace=traceback.format_exc() if dbg else None,
+                    engine_source=call.source,
+                    engine_error=call.error,
                 )
 
             payload = _as_payload(call.result)
@@ -1147,7 +1240,7 @@ async def get_enriched_quote(
 
         except Exception as e:
             router_requests_total.labels(endpoint="quote", status="error").inc()
-            logger.exception("Error processing /quote")
+            logger.exception("Error processing /v1/enriched/quote")
             return _build_error_response(
                 request_id=request_id,
                 error=str(e),
@@ -1164,17 +1257,87 @@ async def get_enriched_quotes(
     tickers: str = Query("", description="Alias for symbols"),
     format: str = Query("items", description="Output format: items | sheet"),
     debug: bool = Query(False, description="Include debug information"),
+    include_raw: bool = Query(False, description="Ask engine/provider to include raw payload if supported"),
+    provider: Optional[str] = Query(None, description="Optional provider override if engine supports it"),
+):
+    return await _quotes_impl(
+        request=request,
+        symbols=_get_symbols_from_request(request, symbols, tickers),
+        fmt=(format or "").strip().lower(),
+        debug=debug,
+        include_raw=include_raw,
+        provider=provider,
+    )
+
+
+@router.post("/quotes")
+async def post_enriched_quotes(
+    request: Request,
+    body: Dict[str, Any] = Body(default_factory=dict),
+):
+    """
+    JSON body supported:
+      {
+        "symbols": ["AAPL","MSFT"],
+        "format": "items" | "sheet",
+        "include_raw": true|false,
+        "provider": "eodhd" (optional),
+        "debug": true|false
+      }
+    """
+    symbols_in = body.get("symbols") or body.get("tickers") or body.get("symbol") or []
+    fmt = str(body.get("format") or "items").strip().lower()
+    include_raw = bool(body.get("include_raw") or False)
+    provider = body.get("provider")
+    debug = bool(body.get("debug") or False)
+
+    # Normalize symbol inputs
+    raw_list: List[str] = []
+    if isinstance(symbols_in, str):
+        raw_list = _split_symbols(symbols_in)
+    elif isinstance(symbols_in, list):
+        raw_list = []
+        for x in symbols_in:
+            raw_list.extend(_split_symbols(str(x)))
+    else:
+        raw_list = []
+
+    # Dedup
+    seen: Set[str] = set()
+    symbols_list: List[str] = []
+    for s in raw_list:
+        if s and s not in seen:
+            seen.add(s)
+            symbols_list.append(s)
+
+    return await _quotes_impl(
+        request=request,
+        symbols=symbols_list,
+        fmt=fmt,
+        debug=debug,
+        include_raw=include_raw,
+        provider=provider if isinstance(provider, str) and provider.strip() else None,
+    )
+
+
+async def _quotes_impl(
+    *,
+    request: Request,
+    symbols: List[str],
+    fmt: str,
+    debug: bool,
+    include_raw: bool,
+    provider: Optional[str],
 ):
     request_id = request.headers.get("X-Request-ID", str(uuid.uuid4())[:8])
     dbg = _is_truthy(os.getenv("DEBUG_ERRORS", "0")) or debug
-    fmt = (format or "").strip().lower()
 
     with tracer.start_as_current_span("router_get_quotes") as span:
         if not _is_authorized(request):
             router_requests_total.labels(endpoint="quotes", status="unauthorized").inc()
             return _build_error_response(request_id=request_id, error="unauthorized", status_code=401)
 
-        raw_list = _get_symbols_from_request(request, symbols, tickers)
+        raw_list = symbols
         if not raw_list:
             router_requests_total.labels(endpoint="quotes", status="empty_symbols_list").inc()
             return _build_error_response(request_id=request_id, error="empty_symbols_list")
@@ -1183,18 +1346,31 @@ async def get_enriched_quotes(
         start_time = time.time()
 
         try:
-            call = await _call_engine_batch(request, raw_list)
+            call = await _call_engine_batch(request, raw_list, include_raw=include_raw, provider=provider)
+
             items: List[Dict[str, Any]] = []
+            got: Set[str] = set()
 
             if call.result is not None and not call.error:
                 if isinstance(call.result, list):
-                    for raw, res in zip(raw_list, call.result):
-                        payload = _as_payload(res)
-                        payload = _canonicalize_payload(raw, payload, call.source)
-                        items.append(payload)
+                    # Best-effort: align by order if engine returned same length, else per-item canonicalization
+                    if len(call.result) == len(raw_list):
+                        for raw, res in zip(raw_list, call.result):
+                            payload = _as_payload(res)
+                            payload = _canonicalize_payload(raw, payload, call.source)
+                            items.append(payload)
+                            got.add(raw)
+                    else:
+                        for res in call.result:
+                            payload = _as_payload(res)
+                            raw = payload.get("requested_symbol") or payload.get("symbol") or payload.get("symbol_normalized") or ""
+                            raw = _safe_str(raw)
+                            payload = _canonicalize_payload(raw, payload, call.source)
+                            items.append(payload)
+                            got.add(raw)
 
                 elif isinstance(call.result, dict):
-                    # build lookup by canonical output symbol
+                    # Build lookup by canonical output symbol
                     lookup: Dict[str, Dict[str, Any]] = {}
                     for k, v in call.result.items():
                         p = _as_payload(v)
@@ -1205,31 +1381,36 @@ async def get_enriched_quotes(
 
                     for raw in raw_list:
                         key = _canonical_output_symbol(raw, {})
-                        payload = lookup.get(key, {"error": "no_data", "data_quality": "MISSING", "data_source": "none"})
+                        payload = lookup.get(key)
+                        if payload is None:
+                            payload = {"error": "no_data", "data_quality": "MISSING"}
                         payload = _canonicalize_payload(raw, payload, call.source)
                         items.append(payload)
+                        got.add(raw)
 
-            # Fallback per-symbol if batch returned nothing / partial
-            if len(items) < len(raw_list):
+            # Fallback per-symbol for those missing / not returned
+            missing = [r for r in raw_list if r not in got]
+            if missing:
                 cfg = _get_concurrency_config()
                 sem = asyncio.Semaphore(cfg["concurrency"])
 
                 async def _fetch_one(raw: str) -> Dict[str, Any]:
                     async with sem:
                         try:
-                            single = await asyncio.wait_for(_call_engine(request, raw), timeout=cfg["timeout_sec"])
+                            single = await asyncio.wait_for(
+                                _call_engine(request, raw, include_raw=include_raw, provider=provider),
+                                timeout=cfg["timeout_sec"],
+                            )
                             if single.result is not None and not single.error:
                                 payload = _as_payload(single.result)
                                 return _canonicalize_payload(raw, payload, single.source)
+                            return _canonicalize_payload(raw, {"error": single.error or "no_data", "data_quality": "MISSING"}, single.source)
                         except asyncio.TimeoutError:
-                            pass
+                            return _canonicalize_payload(raw, {"error": "timeout", "data_quality": "MISSING"}, "timeout")
                         except Exception as e:
-                            logger.debug(f"Sequential fetch failed for {raw}: {e}")
-                        return _canonicalize_payload(raw, {"error": "fetch_failed", "data_quality": "MISSING"}, "none")
+                            return _canonicalize_payload(raw, {"error": f"exception:{e.__class__.__name__}", "data_quality": "MISSING"}, "exception")
 
-                missing = raw_list[len(items):]
-                if missing:
-                    items.extend(await asyncio.gather(*[_fetch_one(r) for r in missing]))
+                items.extend(await asyncio.gather(*[_fetch_one(r) for r in missing]))
 
             router_requests_total.labels(endpoint="quotes", status="success").inc()
             router_request_duration.labels(endpoint="quotes").observe(time.time() - start_time)
@@ -1240,7 +1421,7 @@ async def get_enriched_quotes(
 
         except Exception as e:
             router_requests_total.labels(endpoint="quotes", status="error").inc()
-            logger.exception("Error processing /quotes")
+            logger.exception("Error processing /v1/enriched/quotes")
             return _build_error_response(
                 request_id=request_id,
                 error=str(e),
@@ -1249,8 +1430,32 @@ async def get_enriched_quotes(
             )
 
 
+# ============================================================================
+# Mount helpers (optional)
+# ============================================================================
+
 def get_router() -> APIRouter:
     return router
 
 
-__all__ = ["router", "get_router", "EnrichedQuote", "ENRICHED_HEADERS_61", "ENRICHED_HEADERS_59", "__version__"]
+def mount(app: Any) -> None:
+    """
+    Optional helper for mount plans that call module.mount(app).
+    Safe: does nothing if app is invalid.
+    """
+    try:
+        if app is not None and hasattr(app, "include_router"):
+            app.include_router(router)
+    except Exception:
+        pass
+
+
+__all__ = [
+    "router",
+    "get_router",
+    "mount",
+    "EnrichedQuote",
+    "ENRICHED_HEADERS_61",
+    "ENRICHED_HEADERS_59",
+    "__version__",
+]
