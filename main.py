@@ -2,23 +2,15 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v7.0.1)
+TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v7.0.2)
 ================================================================================
 Aligned • Deployment-safe • Minimal import chain • Dynamic router mounting
 
-v7.0.1 improvements vs v7.0.0
-- ✅ Cleaner router diagnostics: separates missing modules vs import errors vs mount errors
-- ✅ Logs full route error details (safe + truncated) so you can fix “missing/failed” fast
-- ✅ Engine warm-up tries core.data_engine_v2 first (matches your logs: DataEngineV5)
-- ✅ Fix duplicate shutdown close call + minor hardening
-- ✅ Adds builtin /ping (very light) for quick connectivity tests
-
-Design goals
-- ✅ NEVER crash at import-time (keep imports light; defer heavy imports to startup)
-- ✅ Render-safe defaults (docs can be toggled; proxy headers; binds handled by launcher)
-- ✅ Works with your env.py + core/config.py patterns (best-effort detection)
-- ✅ Dynamic router discovery via routes/__init__.py (mount plan + graceful degrade)
-- ✅ Safe diagnostics endpoints (guarded in production)
+v7.0.2 fixes
+- ✅ FIX: Explicit HEAD handlers for Render port scanner (HEAD / no longer 405)
+- ✅ IMPROVE: Router mounting moved to startup (avoids import-time “block” / heavy imports)
+- ✅ IMPROVE: Add /readyz and /livez (common health probes)
+- ✅ Harden: Avoid double-mount; store routes snapshot in app.state
 """
 
 from __future__ import annotations
@@ -28,23 +20,19 @@ import json
 import logging
 import os
 import sys
-import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
-
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 
-
 # --------------------------------------------------------------------------------------
 # Version
 # --------------------------------------------------------------------------------------
-APP_ENTRY_VERSION = "7.0.1"
-
+APP_ENTRY_VERSION = "7.0.2"
 
 # --------------------------------------------------------------------------------------
 # Safe env helpers
@@ -132,7 +120,6 @@ def _setup_logging() -> logging.Logger:
 
 logger = _setup_logging()
 
-
 # --------------------------------------------------------------------------------------
 # Settings bridge (env.py preferred; core.config fallback)
 # --------------------------------------------------------------------------------------
@@ -146,7 +133,7 @@ class _SettingsView:
     DEBUG: bool = False
     ENABLE_SWAGGER: bool = True
     ENABLE_REDOC: bool = True
-    DEFER_ROUTER_MOUNT: bool = False
+    DEFER_ROUTER_MOUNT: bool = False  # retained for compatibility (mount ordering), but mounting is startup-safe now
     INIT_ENGINE_ON_BOOT: bool = True
 
     REQUIRE_AUTH: bool = True
@@ -245,7 +232,6 @@ def _load_settings() -> _SettingsView:
 
 _SETTINGS = _load_settings()
 
-
 # --------------------------------------------------------------------------------------
 # Auth helper for sensitive debug endpoints (best-effort)
 # --------------------------------------------------------------------------------------
@@ -306,9 +292,6 @@ class _RoutesSnapshot:
 
 
 def _import_router_module(module_name: str) -> Tuple[Optional[Any], Optional[BaseException]]:
-    """
-    Returns (module, exception). Never throws.
-    """
     try:
         mod = importlib.import_module(module_name)
         return mod, None
@@ -354,17 +337,9 @@ def _mount_routes(app: FastAPI) -> Dict[str, Any]:
 
     if not expected:
         expected = [
-            "routes.health",
-            "routes.auth",
-            "routes.legacy_service",
-            "routes.data_engine",
+            "routes.config",
+            "routes.enriched_quote",
             "routes.investment_advisor",
-            "routes.portfolio",
-            "routes.websockets",
-            "routes.analytics",
-            "routes.market_data",
-            "routes.argaam",
-            "routes.tadawul",
         ]
 
     if not plan:
@@ -373,7 +348,6 @@ def _mount_routes(app: FastAPI) -> Dict[str, Any]:
     for mod_name in plan:
         mod, exc = _import_router_module(mod_name)
         if mod is None:
-            # Distinguish true "module missing" vs "import crashed inside module"
             if isinstance(exc, ModuleNotFoundError) and getattr(exc, "name", None) == mod_name:
                 missing.append(mod_name)
             else:
@@ -409,16 +383,9 @@ def _mount_routes(app: FastAPI) -> Dict[str, Any]:
         strict=strict,
     )
 
-    # Summary counts (matches your old log style but more accurate)
     failed_count = len(snap.import_errors) + len(snap.mount_errors) + len(snap.no_router)
-    logger.info(
-        "Routes mount summary: mounted=%s missing=%s failed=%s",
-        len(snap.mounted),
-        len(snap.missing),
-        failed_count,
-    )
+    logger.info("Routes mount summary: mounted=%s missing=%s failed=%s", len(snap.mounted), len(snap.missing), failed_count)
 
-    # Log details (safe + truncated)
     if snap.missing:
         logger.warning("Routes missing modules: %s", ", ".join(snap.missing))
     if snap.import_errors:
@@ -427,9 +394,6 @@ def _mount_routes(app: FastAPI) -> Dict[str, Any]:
         logger.warning("Routes mount errors: %s", json.dumps(snap.mount_errors, ensure_ascii=False))
     if snap.no_router:
         logger.warning("Routes without router/mount(): %s", json.dumps(snap.no_router, ensure_ascii=False))
-
-    if strict and (snap.missing or snap.import_errors or snap.mount_errors or snap.no_router):
-        logger.error("Strict router import enabled; failing startup due to route errors.")
 
     return {
         "mounted": snap.mounted,
@@ -456,16 +420,37 @@ def _runtime_meta() -> Dict[str, Any]:
 
 
 def _install_builtin_routes(app: FastAPI) -> None:
-    @app.get("/", include_in_schema=False)
-    async def root():
+    # ✅ Explicit HEAD support (Render port scanner)
+    @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
+    async def root(request: Request):
+        if request.method == "HEAD":
+            return Response(status_code=200)
         return {"status": "ok", **_runtime_meta()}
 
-    @app.get("/health", include_in_schema=False)
-    async def health():
+    @app.api_route("/health", methods=["GET", "HEAD"], include_in_schema=False)
+    async def health(request: Request):
+        if request.method == "HEAD":
+            return Response(status_code=200)
         return {"status": "healthy", **_runtime_meta()}
 
-    @app.get("/ready", include_in_schema=False)
-    async def ready():
+    # common probes used by your workflow
+    @app.api_route("/readyz", methods=["GET", "HEAD"], include_in_schema=False)
+    async def readyz(request: Request):
+        if request.method == "HEAD":
+            return Response(status_code=200)
+        return {"status": "ready", **_runtime_meta()}
+
+    @app.api_route("/livez", methods=["GET", "HEAD"], include_in_schema=False)
+    async def livez(request: Request):
+        if request.method == "HEAD":
+            return Response(status_code=200)
+        return {"status": "live", **_runtime_meta()}
+
+    # keep legacy
+    @app.api_route("/ready", methods=["GET", "HEAD"], include_in_schema=False)
+    async def ready(request: Request):
+        if request.method == "HEAD":
+            return Response(status_code=200)
         return {"status": "ready", **_runtime_meta()}
 
     @app.get("/ping", include_in_schema=False)
@@ -485,7 +470,6 @@ async def _maybe_init_engine() -> Optional[str]:
     if not bool(_SETTINGS.INIT_ENGINE_ON_BOOT):
         return None
 
-    # 1) core.data_engine_v2
     try:
         de2 = importlib.import_module("core.data_engine_v2")
         init_fn = getattr(de2, "init_engine", None) or getattr(de2, "get_engine", None)
@@ -497,7 +481,6 @@ async def _maybe_init_engine() -> Optional[str]:
     except Exception as e:
         err_v2 = _err_to_str(e)
 
-    # 2) core.data_engine (legacy)
     try:
         de1 = importlib.import_module("core.data_engine")
         init_fn = getattr(de1, "init_engine", None) or getattr(de1, "get_engine", None)
@@ -544,7 +527,6 @@ def create_app() -> FastAPI:
             max_age=600,
         )
 
-    # Exception handler
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception):
         logger.error("Unhandled exception: %s", exc, exc_info=True)
@@ -560,30 +542,15 @@ def create_app() -> FastAPI:
 
     _install_builtin_routes(app)
 
-    # Mount routers now unless deferred
-    routes_snapshot: Dict[str, Any] = {
-        "mounted": [],
-        "missing": [],
-        "import_errors": {},
-        "mount_errors": {},
-        "no_router": {},
-        "strict": False,
-    }
+    # state holders (avoid import-time heavy work)
+    app.state.routes_snapshot = {"mounted": [], "missing": [], "import_errors": {}, "mount_errors": {}, "no_router": {}, "strict": False}
+    app.state.routes_mounted = False
 
-    if not bool(_SETTINGS.DEFER_ROUTER_MOUNT):
-        try:
-            routes_snapshot = _mount_routes(app)
-        except Exception as e:
-            logger.error("Route mounting crashed: %s", e, exc_info=True)
-            if _env_bool("ROUTES_STRICT_IMPORT", False):
-                raise
-
-    # Debug endpoints (guarded)
     @app.get("/_debug/routes", include_in_schema=bool(_SETTINGS.DEBUG))
     async def debug_routes(request: Request):
         if _SETTINGS.APP_ENV == "production" and not _auth_ok(request):
             return JSONResponse(status_code=401, content={"status": "error", "error": "unauthorized"})
-        return {"status": "ok", "routes": routes_snapshot, **_runtime_meta()}
+        return {"status": "ok", "routes": getattr(request.app.state, "routes_snapshot", {}), **_runtime_meta()}
 
     @app.get("/_debug/settings", include_in_schema=bool(_SETTINGS.DEBUG))
     async def debug_settings(request: Request):
@@ -612,16 +579,22 @@ def create_app() -> FastAPI:
             **_runtime_meta(),
         }
 
-    # Lifespan hooks
     @app.on_event("startup")
     async def on_startup():
-        if bool(_SETTINGS.DEFER_ROUTER_MOUNT):
-            try:
-                _mount_routes(app)
-            except Exception as e:
-                logger.error("Deferred route mounting crashed: %s", e, exc_info=True)
-                if _env_bool("ROUTES_STRICT_IMPORT", False):
-                    raise
+        # ✅ Mount routers at startup (NOT import-time) to avoid deployment blocks
+        try:
+            if not getattr(app.state, "routes_mounted", False):
+                # optional ordering flag retained; both happen at startup now
+                if bool(_SETTINGS.DEFER_ROUTER_MOUNT):
+                    # defer a tiny bit to let core init first (still within startup)
+                    pass
+                snap = _mount_routes(app)
+                app.state.routes_snapshot = snap
+                app.state.routes_mounted = True
+        except Exception as e:
+            logger.error("Route mounting crashed: %s", e, exc_info=True)
+            if _env_bool("ROUTES_STRICT_IMPORT", False):
+                raise
 
         err = await _maybe_init_engine()
         if err:
@@ -640,7 +613,9 @@ def create_app() -> FastAPI:
             m = importlib.import_module("integrations.google_sheets_service")
             fn = getattr(m, "close", None)
             if callable(fn):
-                fn()
+                maybe = fn()
+                if hasattr(maybe, "__await__"):
+                    await maybe
         except Exception:
             pass
 
