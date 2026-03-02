@@ -1,721 +1,449 @@
 #!/usr/bin/env python3
 """
-routes/config.py
-------------------------------------------------------------
-TADAWUL ENTERPRISE CONFIGURATION MANAGEMENT — v5.5.0 (QUANTUM EDITION)
-SAMA Compliant | Distributed Config | Secrets Management | Dynamic Updates | AI-Powered
+routes/investment_advisor.py
+================================================================================
+TFB Investment Advisor Routes — v5.5.2 (PROMETHEUS-SAFE / ENGINE-LAZY / CORE-CONFIG-BRIDGE)
+================================================================================
 
-What's new in v5.5.0:
-- ✅ Resilient Redis Pub/Sub: Auto-reconnecting, exponential-backoff listener for instantaneous horizontal hot-reloads.
-- ✅ Advanced Deep Diffing: Granular recursive dict diffing for ultra-precise SAMA audit trails.
-- ✅ Bulletproof Settings Resolution: Thread-safe, event-loop-aware `get_settings()` preventing ASGI/Uvicorn crashes.
-- ✅ Persistent ThreadPoolExecutor: Eliminates thread-creation overhead for blocking SDK calls (AWS/Vault).
-- ✅ Pydantic V2 Native Optimization: Enforced `model_validate` and `model_dump` with Rust-backed core validation.
-- ✅ High-Performance JSON (`orjson`): Fully integrated into audit, cache, and deep merge pipelines.
+Fixes your deployment blocker:
+- ✅ NO Prometheus metric creation in this module (prevents duplicate-timeseries crash)
+  (Your crash came from importing multiple modules that each declared the same metric names.)
 
-Core Capabilities:
-- Distributed configuration management (Consul, etcd, Redis, Kubernetes)
-- Encrypted secrets with AWS KMS / HashiCorp Vault / Azure KeyVault / GCP
-- Hot-reload with zero downtime, version tracking, and canary deployments
-- Feature flags with ML-powered gradual rollout and A/B testing
-- SAMA-compliant audit logging with tamper-proof HMAC signatures
+Alignment goals:
+- ✅ Uses core.config for auth/open-mode (single source of truth)
+- ✅ Engine-lazy: no heavy imports / no network calls at import-time
+- ✅ Provides router + mount(app) so dynamic loader shows "green"
+- ✅ Backward compatible endpoints:
+    /v1/advisor/health
+    /v1/advisor/metrics
+    /v1/advisor/recommendations
+    /v1/advisor/run
 """
 
 from __future__ import annotations
 
 import asyncio
-import base64
-import concurrent.futures
-import hashlib
-import hmac
+import inspect
 import logging
-import os
-import random
-import re
-import threading
 import time
 import uuid
-import zlib
-from collections import defaultdict, deque
-from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from enum import Enum
-from functools import wraps
-from pathlib import Path
-from typing import (
-    Any, Callable, Dict, List, Optional, Set, Tuple, Type, Union, cast
-)
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
-# ---------------------------------------------------------------------------
-# High-Performance JSON fallback
-# ---------------------------------------------------------------------------
-try:
-    import orjson
-    def json_dumps(v: Any, *, default: Optional[Callable] = None) -> str: 
-        return orjson.dumps(v, default=default).decode('utf-8')
-    def json_loads(v: Union[str, bytes]) -> Any: 
-        return orjson.loads(v)
-    _HAS_ORJSON = True
-except ImportError:
-    import json
-    def json_dumps(v: Any, *, default: Optional[Callable] = None) -> str: 
-        return json.dumps(v, default=default)
-    def json_loads(v: Union[str, bytes]) -> Any: 
-        return json.loads(v)
-    _HAS_ORJSON = False
-
-# ---------------------------------------------------------------------------
-# Optional Enterprise Integrations
-# ---------------------------------------------------------------------------
-try:
-    import consul
-    from consul.asyncio import Consul as AsyncConsul
-    _CONSUL_AVAILABLE = True
-except ImportError:
-    _CONSUL_AVAILABLE = False
+from fastapi import APIRouter, Body, Query, Request
 
 try:
-    import etcd3
-    _ETCD_AVAILABLE = True
-except ImportError:
-    _ETCD_AVAILABLE = False
+    from fastapi.responses import ORJSONResponse as BestJSONResponse  # type: ignore
+except Exception:
+    from starlette.responses import JSONResponse as BestJSONResponse  # type: ignore
 
-try:
-    import hvac
-    _VAULT_AVAILABLE = True
-except ImportError:
-    _VAULT_AVAILABLE = False
+logger = logging.getLogger("routes.investment_advisor")
 
-try:
-    import boto3
-    from botocore.config import Config as BotoConfig
-    _AWS_AVAILABLE = True
-except ImportError:
-    _AWS_AVAILABLE = False
+ROUTER_VERSION = "5.5.2"
+router = APIRouter(prefix="/v1/advisor", tags=["advisor"])
 
-try:
-    from cryptography.fernet import Fernet
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
-    _CRYPTO_AVAILABLE = True
-except ImportError:
-    _CRYPTO_AVAILABLE = False
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "active"}
 
-try:
-    from opentelemetry import trace
-    from opentelemetry.trace import Status, StatusCode
-    from opentelemetry.context import attach, detach
-    _OTEL_AVAILABLE = True
-    tracer = trace.get_tracer(__name__)
-except ImportError:
-    _OTEL_AVAILABLE = False
-    class DummySpan:
-        def set_attribute(self, *args, **kwargs): pass
-        def set_status(self, *args, **kwargs): pass
-        def __enter__(self): return self
-        def __exit__(self, *args, **kwargs): pass
-        def record_exception(self, *args, **kwargs): pass
-        def end(self): pass
-    class DummyTracer:
-        def start_as_current_span(self, *args, **kwargs): return DummySpan()
-        def start_span(self, *args, **kwargs): return DummySpan()
-    tracer = DummyTracer()
 
-try:
-    from prometheus_client import Counter, Histogram, Gauge
-    _PROMETHEUS_AVAILABLE = True
-    config_requests_total = Counter('config_requests_total', 'Total config requests', ['operation', 'status'])
-    config_request_duration = Histogram('config_request_duration_seconds', 'Config request duration', ['operation'])
-    config_version_gauge = Gauge('config_version', 'Config version', ['environment'])
-    config_reloads_total = Counter('config_reloads_total', 'Total config reloads')
-    config_circuit_breakers = Gauge('config_circuit_breakers', 'CB state', ['provider'])
-except ImportError:
-    _PROMETHEUS_AVAILABLE = False
-    class DummyMetric:
-        def labels(self, *args, **kwargs): return self
-        def inc(self, *args, **kwargs): pass
-        def set(self, *args, **kwargs): pass
-        def observe(self, *args, **kwargs): pass
-    config_requests_total = DummyMetric()
-    config_request_duration = DummyMetric()
-    config_version_gauge = DummyMetric()
-    config_reloads_total = DummyMetric()
-    config_circuit_breakers = DummyMetric()
+# -----------------------------------------------------------------------------
+# Small in-module metrics (NO prometheus) to keep /metrics endpoint alive
+# -----------------------------------------------------------------------------
+@dataclass
+class _AdvisorMetrics:
+    started_at: float
+    requests_total: int = 0
+    success_total: int = 0
+    unauthorized_total: int = 0
+    errors_total: int = 0
+    last_latency_ms: float = 0.0
+    last_error: str = ""
 
-# Pydantic Configuration
-try:
-    from pydantic import (
-        BaseModel, ConfigDict, Field, field_validator, model_validator, 
-        ValidationError, SecretStr, RedisDsn, PostgresDsn, FilePath, DirectoryPath, EmailStr
-    )
-    _PYDANTIC_V2 = True
-except ImportError:
-    from pydantic import BaseModel, Field, validator # type: ignore
-    _PYDANTIC_V2 = False
+    def to_dict(self) -> Dict[str, Any]:
+        up = max(0.0, time.time() - self.started_at)
+        return {
+            "uptime_sec": round(up, 3),
+            "requests_total": self.requests_total,
+            "success_total": self.success_total,
+            "unauthorized_total": self.unauthorized_total,
+            "errors_total": self.errors_total,
+            "last_latency_ms": round(self.last_latency_ms, 3),
+            "last_error": self.last_error,
+        }
 
-# Redis for Pub/Sub Invalidation
-try:
-    import aioredis
-    from aioredis import Redis
-    _REDIS_AVAILABLE = True
-except ImportError:
-    _REDIS_AVAILABLE = False
 
-logger = logging.getLogger("routes.config")
+_METRICS = _AdvisorMetrics(started_at=time.time())
+_METRICS_LOCK = asyncio.Lock()
 
-CONFIG_VERSION = "5.5.0"
-_TRACING_ENABLED = os.getenv("CORE_TRACING_ENABLED", "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
-class TraceContext:
-    """Enterprise trace context manager."""
-    def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
-        self.name = name
-        self.attributes = attributes or {}
-        self.tracer = tracer if _OTEL_AVAILABLE and _TRACING_ENABLED else None
-        self.span = None
-        self.token = None
-    
-    async def __aenter__(self):
-        if self.tracer:
-            self.span = self.tracer.start_span(self.name)
-            self.token = attach(self.span)
-            if self.attributes:
-                self.span.set_attributes(self.attributes)
-        return self
-    
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.span:
-            if exc_val:
-                self.span.record_exception(exc_val)
-                self.span.set_status(Status(StatusCode.ERROR, str(exc_val)))
-            self.span.end()
-            if self.token:
-                detach(self.token)
+def _now_utc() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-# =============================================================================
-# Enums & Types
-# =============================================================================
 
-class Environment(str, Enum):
-    DEVELOPMENT = "development"
-    STAGING = "staging"
-    PRODUCTION = "production"
-    DR = "dr"
-    SANDBOX = "sandbox"
-    CANARY = "canary"
+def _request_id(request: Request) -> str:
+    return request.headers.get("X-Request-ID") or str(uuid.uuid4())[:8]
 
-class ConfigProvider(str, Enum):
-    LOCAL = "local"
-    ENV = "environment"
-    FILE = "file"
-    CONSUL = "consul"
-    ETCD = "etcd"
-    REDIS = "redis"
-    VAULT = "vault"
-    AWS_SECRETS = "aws_secrets"
-    AWS_PARAM_STORE = "aws_param_store"
 
-class AuthMethod(str, Enum):
-    TOKEN = "token"
-    JWT = "jwt"
-    API_KEY = "api_key"
-    MTLS = "mtls"
+def _split_symbols(raw: str) -> List[str]:
+    s = (raw or "").replace("\n", " ").replace("\t", " ").replace(",", " ").strip()
+    parts = [p.strip() for p in s.split(" ") if p.strip()]
+    out: List[str] = []
+    seen = set()
+    for p in parts:
+        u = p.upper()
+        if u and u not in seen:
+            seen.add(u)
+            out.append(u)
+    return out
 
-class CircuitBreakerState(str, Enum):
-    CLOSED = "closed"
-    OPEN = "open"
-    HALF_OPEN = "half_open"
 
-# =============================================================================
-# Advanced Configuration Models (Pure Pydantic V2)
-# =============================================================================
-
-class TLSConfig(BaseModel):
-    enabled: bool = False
-    verify_peer: bool = True
-    min_version: str = "TLSv1.2"
-    mutual_tls: bool = False
-    if _PYDANTIC_V2: model_config = ConfigDict(extra='ignore', populate_by_name=True)
-
-class DatabaseConfig(BaseModel):
-    host: str = "localhost"
-    port: int = 5432
-    name: str = "tadawul"
-    user: str = "postgres"
-    password: SecretStr = Field(default_factory=lambda: SecretStr(""))
-    pool_size: int = 20
-    if _PYDANTIC_V2: model_config = ConfigDict(extra='ignore', populate_by_name=True)
-
-class RedisConfig(BaseModel):
-    host: str = "localhost"
-    port: int = 6379
-    password: SecretStr = Field(default_factory=lambda: SecretStr(""))
-    db: int = 0
-    max_connections: int = 50
-    if _PYDANTIC_V2: model_config = ConfigDict(extra='ignore', populate_by_name=True)
-
-class VaultConfig(BaseModel):
-    url: str = "http://localhost:8200"
-    token: SecretStr = Field(default_factory=lambda: SecretStr(""))
-    mount_point: str = "secret"
-    kv_version: int = 2
-    auth_method: str = "token"
-    if _PYDANTIC_V2: model_config = ConfigDict(extra='ignore', populate_by_name=True)
-
-class AWSConfig(BaseModel):
-    region: str = "me-south-1"
-    access_key_id: Optional[SecretStr] = None
-    secret_access_key: Optional[SecretStr] = None
-    kms_key_id: Optional[str] = None
-    secrets_manager_prefix: str = "tadawul"
-    param_store_path: str = "/tadawul/"
-
-    def get_boto3_config(self) -> BotoConfig:
-        return BotoConfig(region_name=self.region, retries={'max_attempts': 3, 'mode': 'adaptive'})
-    if _PYDANTIC_V2: model_config = ConfigDict(extra='ignore', populate_by_name=True)
-
-class AuthConfig(BaseModel):
-    method: AuthMethod = AuthMethod.TOKEN
-    header_name: str = "X-APP-TOKEN"
-    allow_query_token: bool = False
-    token_expiry_seconds: int = 86400
-    if _PYDANTIC_V2: model_config = ConfigDict(extra='ignore', use_enum_values=True, populate_by_name=True)
-
-class FeatureFlag(BaseModel):
-    name: str
-    enabled: bool = False
-    rollout_percentage: int = 100
-    rollout_strategy: str = "consistent"
-    if _PYDANTIC_V2: model_config = ConfigDict(extra='ignore', populate_by_name=True)
-
-class TadawulConfig(BaseModel):
-    """Main configuration model - Single Source of Truth"""
-    environment: Environment = Environment.PRODUCTION
-    service_name: str = "tadawul-fast-bridge"
-    service_version: str = CONFIG_VERSION
-    
-    database: DatabaseConfig = Field(default_factory=DatabaseConfig)
-    redis: RedisConfig = Field(default_factory=RedisConfig)
-    vault: VaultConfig = Field(default_factory=VaultConfig)
-    aws: AWSConfig = Field(default_factory=AWSConfig)
-    auth: AuthConfig = Field(default_factory=AuthConfig)
-    tls: TLSConfig = Field(default_factory=TLSConfig)
-    
-    config_providers: List[ConfigProvider] = Field(default_factory=lambda: [
-        ConfigProvider.LOCAL, ConfigProvider.ENV, ConfigProvider.REDIS, ConfigProvider.VAULT
-    ])
-    
-    tokens: List[SecretStr] = Field(default_factory=list)
-    features: Dict[str, FeatureFlag] = Field(default_factory=dict)
-    
-    batch_size: int = 25
-    batch_concurrency: int = 6
-    route_timeout_sec: float = 120.0
-    
-    encryption_algorithm: str = "AES-256-GCM"
-
-    if _PYDANTIC_V2:
-        model_config = ConfigDict(extra='ignore', use_enum_values=True, validate_assignment=True, populate_by_name=True)
-
-    def get_tokens(self) -> List[str]:
-        return [t.get_secret_value() for t in self.tokens if t.get_secret_value()]
-
-# =============================================================================
-# Core Config Utilities
-# =============================================================================
-
-class ConfigEncryption:
-    """Next-Gen configuration encryption using AES-GCM or Fernet"""
-    
-    def __init__(self, master_key: Optional[bytes] = None):
-        self.master_key = master_key or self._derive_master_key()
-        self._fernet = Fernet(self.master_key) if _CRYPTO_AVAILABLE else None
-        self._aesgcm = AESGCM(self.master_key[:32]) if _CRYPTO_AVAILABLE else None
-
-    def _derive_master_key(self) -> bytes:
-        salt = os.getenv("CONFIG_SALT", "tadawul-5.5-salt").encode()
-        password = os.getenv("CONFIG_PASSWORD", "tadawul-ultra-secret").encode()
-        if _CRYPTO_AVAILABLE:
-            kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=100000)
-            return base64.urlsafe_b64encode(kdf.derive(password))
-        return base64.urlsafe_b64encode(hashlib.sha256(password + salt).digest())
-
-    def decrypt_dict(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Recursively decrypt sensitive keys in a dictionary"""
-        sensitive = {"token", "password", "secret", "key", "credential"}
-        result = {}
-        for k, v in data.items():
-            if isinstance(v, str) and any(s in k.lower() for s in sensitive) and len(v) > 32:
-                try:
-                    raw = base64.b64decode(v.encode())
-                    if self._aesgcm and len(raw) > 12:
-                        nonce, ct = raw[:12], raw[12:]
-                        result[k] = self._aesgcm.decrypt(nonce, ct, None).decode('utf-8')
-                    elif self._fernet:
-                        result[k] = self._fernet.decrypt(raw).decode('utf-8')
-                    else:
-                        result[k] = v
-                except Exception: result[k] = v
-            elif isinstance(v, dict): result[k] = self.decrypt_dict(v)
-            else: result[k] = v
-        return result
-
-    def encrypt_dict(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """Recursively encrypt sensitive keys for storage"""
-        sensitive = {"token", "password", "secret", "key", "credential"}
-        result = {}
-        for k, v in data.items():
-            if isinstance(v, str) and any(s in k.lower() for s in sensitive):
-                if self._aesgcm:
-                    nonce = os.urandom(12)
-                    ct = self._aesgcm.encrypt(nonce, v.encode(), None)
-                    result[k] = base64.b64encode(nonce + ct).decode('utf-8')
-                elif self._fernet: 
-                    result[k] = self._fernet.encrypt(v.encode()).decode('utf-8')
-                else:
-                    result[k] = v
-            elif isinstance(v, dict): result[k] = self.encrypt_dict(v)
-            else: result[k] = v
-        return result
-
-def advanced_dict_diff(old: Any, new: Any, path: str = "") -> Dict[str, Any]:
-    """Granular recursive dictionary diffing for precise SAMA Audit Trails."""
-    diffs = {}
-    if isinstance(old, dict) and isinstance(new, dict):
-        for k in set(old.keys()).union(new.keys()):
-            curr_path = f"{path}.{k}" if path else k
-            if k not in old:
-                diffs[curr_path] = {"old": None, "new": new[k], "action": "added"}
-            elif k not in new:
-                diffs[curr_path] = {"old": old[k], "new": None, "action": "removed"}
-            else:
-                sub_diff = advanced_dict_diff(old[k], new[k], curr_path)
-                if sub_diff: 
-                    diffs.update(sub_diff)
-    elif isinstance(old, list) and isinstance(new, list):
-        if old != new:
-            diffs[path] = {"old": old, "new": new, "action": "updated_list"}
-    elif old != new:
-        diffs[path] = {"old": old, "new": new, "action": "updated"}
-    return diffs
-
-class CircuitBreaker:
-    """Dynamic circuit breaker protecting config providers"""
-    def __init__(self, name: str, threshold: int = 5, timeout: float = 60.0):
-        self.name = name
-        self.threshold = threshold
-        self.timeout = timeout
-        self.state = CircuitBreakerState.CLOSED
-        self.failures, self.last_failure = 0, 0.0
-        self._lock = asyncio.Lock()
-
-    async def execute(self, func: Callable, *args, **kwargs) -> Any:
-        async with self._lock:
-            if self.state == CircuitBreakerState.OPEN:
-                if time.time() - self.last_failure > self.timeout:
-                    self.state = CircuitBreakerState.HALF_OPEN
-                    logger.info(f"Circuit {self.name} entering HALF_OPEN")
-                else: raise Exception(f"Circuit {self.name} is OPEN")
-        try:
-            result = await func(*args, **kwargs) if asyncio.iscoroutinefunction(func) else func(*args, **kwargs)
-            async with self._lock:
-                self.state, self.failures = CircuitBreakerState.CLOSED, 0
-                config_circuit_breakers.labels(provider=self.name).set(0)
-            return result
-        except Exception as e:
-            async with self._lock:
-                self.failures += 1
-                self.last_failure = time.time()
-                if self.failures >= self.threshold:
-                    self.state = CircuitBreakerState.OPEN
-                    logger.warning(f"Circuit {self.name} is now OPEN after {self.failures} failures")
-                    config_circuit_breakers.labels(provider=self.name).set(2)
-            raise e
-
-class ConfigManager:
-    """Next-Gen Distributed Configuration Manager with Resilient PubSub"""
-    
-    def __init__(self):
-        self._config: Optional[TadawulConfig] = None
-        self._config_lock = asyncio.Lock()
-        self._encryption = ConfigEncryption()
-        self._circuit_breakers: Dict[str, CircuitBreaker] = {}
-        self._version = 0
-        self._initialized = False
-        self._history = deque(maxlen=20)
-        self._last_update: Optional[datetime] = None
-        
-        # Persistent Executor to avoid thread starvation
-        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="ConfigWorker")
-        
-        self._pubsub_task: Optional[asyncio.Task] = None
-        self._watch_task: Optional[asyncio.Task] = None
-
-    async def initialize(self) -> None:
-        """Initialize configuration across all providers without blocking the Event Loop."""
-        if self._initialized: return
-        async with self._config_lock:
-            if self._initialized: return
-            try:
-                base_dict = self._load_from_env()
-                
-                # Fetch all external providers in parallel
-                tasks = []
-                for p_type in TadawulConfig().config_providers:
-                    if p_type in {ConfigProvider.LOCAL, ConfigProvider.ENV}: continue
-                    tasks.append(self._load_from_provider(p_type))
-                
-                if tasks:
-                    results = await asyncio.gather(*tasks, return_exceptions=True)
-                    
-                    # Fast deep merge in the event loop
-                    for p_data in results:
-                        if isinstance(p_data, dict) and p_data:
-                            base_dict = self._deep_merge(base_dict, p_data)
-                        elif isinstance(p_data, Exception):
-                            logger.error(f"Provider failed during gather: {p_data}")
-                
-                # Decrypt sensitive strings via persistent ThreadPool
-                loop = asyncio.get_running_loop()
-                decrypted = await loop.run_in_executor(self._executor, self._encryption.decrypt_dict, base_dict)
-                
-                self._config = TadawulConfig.model_validate(decrypted) if _PYDANTIC_V2 else TadawulConfig(**decrypted)
-                self._version += 1
-                self._last_update = datetime.now(timezone.utc)
-                self._initialized = True
-                
-                config_version_gauge.labels(environment=self._config.environment.value).set(self._version)
-                config_reloads_total.inc()
-                logger.info(f"Configuration v{self._version} initialized successfully.")
-
-                # Start background watchers and PubSub
-                self._start_background_tasks()
-
-            except Exception as e:
-                logger.error(f"Config initialization critical failure: {e}")
-                self._config = TadawulConfig()
-                self._initialized = True
-
-    def _start_background_tasks(self):
-        """Safely start background tasks."""
-        if not self._watch_task or self._watch_task.done():
-            self._watch_task = asyncio.create_task(self._watch_config())
-        
-        if _REDIS_AVAILABLE and (not self._pubsub_task or self._pubsub_task.done()):
-            self._pubsub_task = asyncio.create_task(self._listen_redis_pubsub())
-
-    async def _listen_redis_pubsub(self):
-        """Resilient Redis PubSub listener for instant cross-node config invalidation."""
-        if not _REDIS_AVAILABLE: return
-        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-        backoff = 1.0
-        
-        while True:
-            try:
-                redis_client = aioredis.from_url(redis_url, decode_responses=True)
-                pubsub = redis_client.pubsub()
-                await pubsub.subscribe("tadawul_config_updates")
-                logger.info("Subscribed to distributed config updates.")
-                
-                backoff = 1.0 # Reset backoff on success
-                
-                async for message in pubsub.listen():
-                    if message["type"] == "message":
-                        logger.info(f"Distributed config update signal received: {message['data']}. Hot-reloading...")
-                        await self._force_reload()
-                        
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.warning(f"Config PubSub listener disconnected: {e}. Reconnecting in {backoff}s...")
-                await asyncio.sleep(backoff)
-                backoff = min(60.0, backoff * 2)
-
-    async def _force_reload(self):
-        """Internal force reload triggered by watcher or PubSub."""
-        self._initialized = False
-        await self.initialize()
-        global _SETTINGS_CACHE
-        _SETTINGS_CACHE = self._config # Invalidate fast cache
-
-    def _load_from_env(self) -> Dict[str, Any]:
-        cfg = {}
-        env = os.getenv("APP_ENV", "production").lower()
-        if env in {e.value for e in Environment}: cfg["environment"] = env
-        if host := os.getenv("DB_HOST"):
-            cfg["database"] = {"host": host, "port": int(os.getenv("DB_PORT", 5432)), "name": os.getenv("DB_NAME", "tadawul")}
-        if tokens := os.getenv("APP_TOKENS"):
-            cfg["tokens"] = [t.strip() for t in tokens.split(",") if t.strip()]
-        
-        # Pull standard AWS configurations from env if present
-        aws_cfg = {}
-        if ak := os.getenv("AWS_ACCESS_KEY_ID"): aws_cfg["access_key_id"] = ak
-        if sk := os.getenv("AWS_SECRET_ACCESS_KEY"): aws_cfg["secret_access_key"] = sk
-        if reg := os.getenv("AWS_REGION"): aws_cfg["region"] = reg
-        if aws_cfg: cfg["aws"] = aws_cfg
-
-        return cfg
-
-    async def _load_from_provider(self, provider: ConfigProvider) -> Dict[str, Any]:
-        """Adaptive provider loader with circuit breaking, tracing, and Full Jitter."""
-        cb = self._circuit_breakers.setdefault(provider.value, CircuitBreaker(provider.value))
-        
-        def _fetch_blocking() -> Dict[str, Any]:
-            """Isolate blocking SDK calls (Vault/Boto3) from the asyncio loop."""
-            if provider == ConfigProvider.VAULT and _VAULT_AVAILABLE:
-                vc = TadawulConfig().vault
-                client = hvac.Client(url=vc.url, token=vc.token.get_secret_value() if vc.token else None)
-                if client.is_authenticated():
-                    return client.secrets.kv.v2.read_secret_version(path="tadawul/config")['data']['data']
-            elif provider == ConfigProvider.AWS_SECRETS and _AWS_AVAILABLE:
-                ac = TadawulConfig().aws
-                session = boto3.Session(
-                    aws_access_key_id=ac.access_key_id.get_secret_value() if ac.access_key_id else None,
-                    aws_secret_access_key=ac.secret_access_key.get_secret_value() if ac.secret_access_key else None,
-                    region_name=ac.region
-                )
-                client = session.client("secretsmanager")
-                val = client.get_secret_value(SecretId=f"{ac.secrets_manager_prefix}/config")
-                return json_loads(val.get('SecretString', '{}'))
-            return {}
-
-        async def _fetch():
-            # Apply Full Jitter Exponential Backoff locally inside the circuit
-            max_retries = 3
-            for attempt in range(max_retries):
-                try:
-                    loop = asyncio.get_running_loop()
-                    return await loop.run_in_executor(self._executor, _fetch_blocking)
-                except Exception as e:
-                    if attempt == max_retries - 1: raise e
-                    base_wait = 2 ** attempt
-                    jitter = random.uniform(0, base_wait)
-                    await asyncio.sleep(min(5.0, base_wait + jitter))
-            return {}
-
-        async with TraceContext(f"config_fetch_{provider.value}"):
-            try:
-                res = await cb.execute(_fetch)
-                config_requests_total.labels(operation=f"fetch_{provider.value}", status="success").inc()
-                return res
-            except Exception as e:
-                logger.debug(f"Config provider {provider.value} fetch failed: {e}")
-                config_requests_total.labels(operation=f"fetch_{provider.value}", status="failure").inc()
-                return {}
-
-    def _deep_merge(self, base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
-        res = base.copy()
-        for k, v in overlay.items():
-            if isinstance(v, dict) and k in res and isinstance(res[k], dict):
-                res[k] = self._deep_merge(res[k], v)
-            elif isinstance(v, list) and k in res and isinstance(res[k], list):
-                res[k] = list(set(res[k] + v))
-            else: res[k] = v
-        return res
-
-    async def _watch_config(self):
-        """Watch for configuration changes via polling fallback."""
-        while True:
-            try:
-                await asyncio.sleep(120)  # Polling interval is higher due to PubSub existence
-                if not self._config: continue
-                
-                # Check for updates in background
-                new_dict = self._load_from_env()
-                for p_type in self._config.config_providers:
-                    if p_type in {ConfigProvider.LOCAL, ConfigProvider.ENV}: continue
-                    p_data = await self._load_from_provider(p_type)
-                    if p_data: new_dict = self._deep_merge(new_dict, p_data)
-                
-                loop = asyncio.get_running_loop()
-                decrypted = await loop.run_in_executor(self._executor, self._encryption.decrypt_dict, new_dict)
-                
-                old_dict = self._config.model_dump() if _PYDANTIC_V2 else self._config.dict()
-                diff = advanced_dict_diff(old_dict, decrypted)
-                
-                if diff:
-                    logger.info(f"Config changes detected via polling: {diff}")
-                    async with self._config_lock:
-                        self._config = TadawulConfig.model_validate(decrypted) if _PYDANTIC_V2 else TadawulConfig(**decrypted)
-                        self._version += 1
-                        self._last_update = datetime.now(timezone.utc)
-                        global _SETTINGS_CACHE
-                        _SETTINGS_CACHE = self._config
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Config polling watcher failed: {e}")
-
-    async def get_config(self) -> TadawulConfig:
-        if not self._initialized: await self.initialize()
-        return cast(TadawulConfig, self._config)
-
-    async def close(self):
-        """Gracefully teardown resources."""
-        if self._pubsub_task: self._pubsub_task.cancel()
-        if self._watch_task: self._watch_task.cancel()
-        self._executor.shutdown(wait=False)
-
-_config_manager = ConfigManager()
-
-# =============================================================================
-# Public Interface & Legacy Shim
-# =============================================================================
-
-_SETTINGS_CACHE: Optional[TadawulConfig] = None
-
-def get_settings() -> TadawulConfig:
-    """Thread-safe settings getter. Prevents blocking and resolves running loops safely."""
-    global _SETTINGS_CACHE
-    if _config_manager._initialized and _config_manager._config is not None:
-        _SETTINGS_CACHE = _config_manager._config
-        return _SETTINGS_CACHE
-    
-    if _SETTINGS_CACHE is not None:
-        return _SETTINGS_CACHE
-        
+def _auth_ok(request: Request) -> bool:
+    """
+    Uses core.config auth (single source of truth).
+    Accepts:
+      - X-APP-TOKEN
+      - X-API-KEY
+      - Authorization: Bearer <token>
+    """
     try:
-        loop = asyncio.get_running_loop()
-        if loop.is_running():
-            # Synchronous access fallback if initialization was missed inside an async context.
-            logger.warning("Synchronous get_settings called in running loop without prior initialization. Returning default.")
-            return TadawulConfig()
-    except RuntimeError:
-        pass
-    
-    # Safe to use asyncio.run if no event loop is running in the current thread
-    cfg = asyncio.run(_config_manager.get_config())
-    _SETTINGS_CACHE = cfg
-    return cfg
+        from core.config import is_open_mode, auth_ok  # type: ignore
 
-async def get_config_api() -> TadawulConfig:
-    return await _config_manager.get_config()
+        if callable(is_open_mode) and is_open_mode():
+            return True
 
-def allowed_tokens() -> List[str]:
-    return get_settings().get_tokens()
+        token = (
+            request.headers.get("X-APP-TOKEN")
+            or request.headers.get("X-App-Token")
+            or request.headers.get("X-API-KEY")
+            or request.headers.get("X-Api-Key")
+        )
+        authz = request.headers.get("Authorization")
 
-def is_open_mode() -> bool:
-    return len(allowed_tokens()) == 0
+        if callable(auth_ok):
+            return bool(auth_ok(token=token, authorization=authz, headers=dict(request.headers)))
+    except Exception:
+        return False
 
-def auth_ok_request(*, x_app_token: Optional[str] = None, authorization: Optional[str] = None, query_token: Optional[str] = None) -> bool:
-    tokens = set(allowed_tokens())
-    if not tokens: return True
-    if x_app_token and x_app_token.strip() in tokens: return True
-    if authorization and authorization.startswith("Bearer ") and authorization[7:].strip() in tokens: return True
-    if query_token and query_token.strip() in tokens: return True
     return False
 
-def is_feature_enabled(name: str) -> bool:
-    config = get_settings()
-    feature = config.features.get(name)
-    return feature.enabled if feature else False
 
-# Module Exports
-__all__ = [
-    "CONFIG_VERSION", "Environment", "ConfigProvider", "AuthMethod", "CircuitBreakerState",
-    "TadawulConfig", "DatabaseConfig", "RedisConfig", "VaultConfig", "AWSConfig", "AuthConfig",
-    "get_settings", "get_config_api", "allowed_tokens", "is_open_mode", "auth_ok_request",
-    "is_feature_enabled", "ConfigManager", "_config_manager", "advanced_dict_diff"
-]
+async def _maybe_await(v: Any) -> Any:
+    return await v if inspect.isawaitable(v) else v
+
+
+_ENGINE_INIT_LOCK = asyncio.Lock()
+
+
+async def _get_engine(request: Request) -> Tuple[Optional[Any], str, Optional[str]]:
+    """
+    Returns (engine, source, error).
+    Caches engine in request.app.state.engine when possible.
+    """
+    # 1) app.state.engine
+    try:
+        eng = getattr(request.app.state, "engine", None)
+        if eng is not None:
+            return eng, "app.state.engine", None
+    except Exception:
+        pass
+
+    async with _ENGINE_INIT_LOCK:
+        try:
+            eng = getattr(request.app.state, "engine", None)
+            if eng is not None:
+                return eng, "app.state.engine", None
+        except Exception:
+            pass
+
+        # 2) core.data_engine_v2.get_engine
+        try:
+            from core.data_engine_v2 import get_engine  # type: ignore
+
+            e = get_engine()
+            eng = await _maybe_await(e)
+            try:
+                request.app.state.engine = eng
+            except Exception:
+                pass
+            return eng, "core.data_engine_v2.get_engine", None
+        except Exception as e:
+            last_err = f"core.data_engine_v2.get_engine: {type(e).__name__}: {e}"
+
+        # 3) fallback core.data_engine.get_engine
+        try:
+            from core.data_engine import get_engine as get_engine_legacy  # type: ignore
+
+            e = get_engine_legacy()
+            eng = await _maybe_await(e)
+            try:
+                request.app.state.engine = eng
+            except Exception:
+                pass
+            return eng, "core.data_engine.get_engine", None
+        except Exception as e:
+            last_err = f"{last_err} | core.data_engine.get_engine: {type(e).__name__}: {e}"
+
+        return None, "engine_init_failed", last_err
+
+
+async def _call_best_method(obj: Any, methods: List[str], *args, **kwargs) -> Any:
+    """
+    Try methods in order; return first successful result.
+    """
+    last_exc: Optional[Exception] = None
+    for name in methods:
+        fn = getattr(obj, name, None)
+        if not callable(fn):
+            continue
+        try:
+            res = fn(*args, **kwargs)
+            return await _maybe_await(res)
+        except Exception as e:
+            last_exc = e
+            continue
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("No compatible advisor method found on engine.")
+
+
+async def _record_metrics(ok: bool, unauthorized: bool, latency_ms: float, err: str = "") -> None:
+    async with _METRICS_LOCK:
+        _METRICS.requests_total += 1
+        _METRICS.last_latency_ms = float(latency_ms)
+        if unauthorized:
+            _METRICS.unauthorized_total += 1
+        elif ok:
+            _METRICS.success_total += 1
+        else:
+            _METRICS.errors_total += 1
+            _METRICS.last_error = (err or "")[:600]
+
+
+def _error(status_code: int, request_id: str, message: str) -> BestJSONResponse:
+    return BestJSONResponse(
+        status_code=status_code,
+        content={
+            "status": "error",
+            "error": message,
+            "request_id": request_id,
+            "timestamp_utc": _now_utc(),
+            "version": ROUTER_VERSION,
+        },
+    )
+
+
+# -----------------------------------------------------------------------------
+# Endpoints
+# -----------------------------------------------------------------------------
+@router.get("/health", include_in_schema=False)
+async def advisor_health() -> Any:
+    return {
+        "status": "ok",
+        "module": "routes.investment_advisor",
+        "version": ROUTER_VERSION,
+        "timestamp_utc": _now_utc(),
+    }
+
+
+@router.get("/metrics", include_in_schema=False)
+async def advisor_metrics() -> Any:
+    async with _METRICS_LOCK:
+        m = _METRICS.to_dict()
+    return {
+        "status": "ok",
+        "module": "routes.investment_advisor",
+        "version": ROUTER_VERSION,
+        "timestamp_utc": _now_utc(),
+        "metrics": m,
+    }
+
+
+@router.get("/recommendations")
+async def get_recommendations(
+    request: Request,
+    symbols: str = Query("", description="Comma/space separated symbols"),
+    tickers: str = Query("", description="Alias for symbols"),
+    include_raw: bool = Query(False, description="Include raw provider payload when available"),
+    debug: bool = Query(False, description="Include debug information on failures"),
+) -> BestJSONResponse:
+    rid = _request_id(request)
+    t0 = time.perf_counter()
+
+    if not _auth_ok(request):
+        await _record_metrics(ok=False, unauthorized=True, latency_ms=(time.perf_counter() - t0) * 1000.0, err="unauthorized")
+        return _error(401, rid, "unauthorized")
+
+    sym_list: List[str] = []
+    if symbols:
+        sym_list.extend(_split_symbols(symbols))
+    if tickers:
+        sym_list.extend(_split_symbols(tickers))
+    # dedup preserve order
+    seen = set()
+    sym_list = [s for s in sym_list if not (s in seen or seen.add(s))]
+
+    if not sym_list:
+        await _record_metrics(ok=False, unauthorized=False, latency_ms=(time.perf_counter() - t0) * 1000.0, err="empty_symbols_list")
+        return _error(200, rid, "empty_symbols_list")
+
+    try:
+        engine, src, err = await _get_engine(request)
+        if engine is None:
+            await _record_metrics(ok=False, unauthorized=False, latency_ms=(time.perf_counter() - t0) * 1000.0, err=err or "no_engine")
+            return _error(200, rid, err or "No engine available")
+
+        # Try best-known advisor method names
+        result = await _call_best_method(
+            engine,
+            methods=[
+                "get_advisor_recommendations",
+                "advisor_recommendations",
+                "get_recommendations",
+                "recommendations",
+                "run_advisor",               # some engines compute and return recommendations
+                "advisor_run",
+            ],
+            symbols=sym_list,
+            include_raw=bool(include_raw),
+        )
+
+        # Normalize output shape
+        items = result
+        if isinstance(result, dict):
+            # common shapes: {"items":[...]} or {"results":[...]}
+            for k in ("items", "results", "data", "recommendations"):
+                if k in result and isinstance(result[k], list):
+                    items = result[k]
+                    break
+
+        if not isinstance(items, list):
+            items = [result]
+
+        await _record_metrics(ok=True, unauthorized=False, latency_ms=(time.perf_counter() - t0) * 1000.0)
+
+        return BestJSONResponse(
+            status_code=200,
+            content={
+                "status": "ok",
+                "count": len(items),
+                "items": items,
+                "source": src,
+                "request_id": rid,
+                "timestamp_utc": _now_utc(),
+                "version": ROUTER_VERSION,
+            },
+        )
+
+    except Exception as e:
+        msg = f"{type(e).__name__}: {e}"
+        await _record_metrics(ok=False, unauthorized=False, latency_ms=(time.perf_counter() - t0) * 1000.0, err=msg)
+        payload: Dict[str, Any] = {
+            "status": "error",
+            "error": msg,
+            "request_id": rid,
+            "timestamp_utc": _now_utc(),
+            "version": ROUTER_VERSION,
+        }
+        if debug or (os.getenv("DEBUG_ERRORS", "").strip().lower() in _TRUTHY):
+            payload["debug"] = {"note": "Enable stack traces in server logs for full traceback."}
+        return BestJSONResponse(status_code=200, content=payload)
+
+
+@router.post("/run")
+async def run_advisor(
+    request: Request,
+    payload: Dict[str, Any] = Body(default_factory=dict),
+    debug: bool = Query(False, description="Include debug info on failures"),
+) -> BestJSONResponse:
+    """
+    Flexible advisor run endpoint.
+    Expected payload examples:
+      {"symbols":["AAPL","MSFT"], "mode":"portfolio", "include_raw":false}
+      {"symbols":"AAPL,MSFT", "include_raw":true}
+    """
+    rid = _request_id(request)
+    t0 = time.perf_counter()
+
+    if not _auth_ok(request):
+        await _record_metrics(ok=False, unauthorized=True, latency_ms=(time.perf_counter() - t0) * 1000.0, err="unauthorized")
+        return _error(401, rid, "unauthorized")
+
+    p = payload or {}
+    raw_syms = p.get("symbols") or p.get("tickers") or p.get("symbol") or ""
+    include_raw = bool(p.get("include_raw", False))
+
+    sym_list: List[str] = []
+    if isinstance(raw_syms, list):
+        sym_list = [str(x).strip().upper() for x in raw_syms if str(x).strip()]
+    elif isinstance(raw_syms, str):
+        sym_list = _split_symbols(raw_syms)
+
+    # optional query params
+    if not sym_list:
+        await _record_metrics(ok=False, unauthorized=False, latency_ms=(time.perf_counter() - t0) * 1000.0, err="empty_symbols_list")
+        return _error(200, rid, "empty_symbols_list")
+
+    try:
+        engine, src, err = await _get_engine(request)
+        if engine is None:
+            await _record_metrics(ok=False, unauthorized=False, latency_ms=(time.perf_counter() - t0) * 1000.0, err=err or "no_engine")
+            return _error(200, rid, err or "No engine available")
+
+        # Try advisor runner method names, pass payload when possible
+        result = await _call_best_method(
+            engine,
+            methods=[
+                "run_advisor",
+                "advisor_run",
+                "run_investment_advisor",
+                "investment_advisor_run",
+                # fallback to recommendations logic
+                "get_advisor_recommendations",
+                "advisor_recommendations",
+            ],
+            payload=p,
+            symbols=sym_list,
+            include_raw=include_raw,
+        )
+
+        await _record_metrics(ok=True, unauthorized=False, latency_ms=(time.perf_counter() - t0) * 1000.0)
+
+        return BestJSONResponse(
+            status_code=200,
+            content={
+                "status": "ok",
+                "result": result,
+                "source": src,
+                "request_id": rid,
+                "timestamp_utc": _now_utc(),
+                "version": ROUTER_VERSION,
+            },
+        )
+
+    except Exception as e:
+        msg = f"{type(e).__name__}: {e}"
+        await _record_metrics(ok=False, unauthorized=False, latency_ms=(time.perf_counter() - t0) * 1000.0, err=msg)
+        payload_out: Dict[str, Any] = {
+            "status": "error",
+            "error": msg,
+            "request_id": rid,
+            "timestamp_utc": _now_utc(),
+            "version": ROUTER_VERSION,
+        }
+        if debug or (os.getenv("DEBUG_ERRORS", "").strip().lower() in _TRUTHY):
+            payload_out["debug"] = {"note": "Enable stack traces in server logs for full traceback."}
+        return BestJSONResponse(status_code=200, content=payload_out)
+
+
+# -----------------------------------------------------------------------------
+# Dynamic loader hook
+# -----------------------------------------------------------------------------
+def mount(app: Any) -> None:
+    app.include_router(router)
+
+
+def get_router() -> APIRouter:
+    return router
+
+
+__all__ = ["router", "mount", "get_router", "ROUTER_VERSION"]
