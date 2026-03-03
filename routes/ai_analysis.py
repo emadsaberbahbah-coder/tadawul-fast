@@ -2,13 +2,22 @@
 """
 routes/ai_analysis.py
 ------------------------------------------------------------
-TADAWUL ENTERPRISE AI ANALYSIS ENGINE — v8.5.3 (STABLE + FALLBACK)
+TADAWUL ENTERPRISE AI ANALYSIS ENGINE — v8.6.0 (PHASE 3 SCHEMA-ROWS)
 SAMA Compliant | Resilient Routes | Safe Tracing | No Raw 500s
 
-v8.5.3 Fixes
-- ✅ Adds fallback to /v1/enriched/quote when engine returns "No providers available"
-- ✅ Tries both symbol forms for Saudi tickers: 1120 and 1120.SR
-- ✅ Keeps TraceContext fix (no set_attributes crash)
+PHASE 3 REQUIREMENTS (DONE)
+- ✅ Accept page names + aliases (page_catalog.normalize_page_name)
+- ✅ Return FULL schema headers from schema_registry (not custom headers)
+- ✅ For each row: emit dict with all schema keys, missing => null
+- ✅ Stable ordering:
+     - headers/keys follow schema order
+     - rows follow requested symbols order
+- ✅ Supports computed/analysis fields when enabled (engine enriched output; schema fill guarantees)
+- ✅ Never fails on naming / alias mismatch (clean 400)
+
+Extra:
+- ✅ page="Data_Dictionary" returns schema dictionary rows (JSON) for debugging / Apps Script
+- ✅ Legacy compatibility: optional rows_matrix (list-of-lists) via include_matrix=true
 """
 
 from __future__ import annotations
@@ -24,16 +33,23 @@ import traceback
 import uuid
 import zlib
 import pickle
-from dataclasses import dataclass, field, is_dataclass
+from dataclasses import dataclass, is_dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union, Sequence
 
-from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect, status
+from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, Response, status
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Phase 1/3: Schema + Page Catalog
+# ---------------------------------------------------------------------------
+from core.sheets.schema_registry import get_sheet_spec
+from core.sheets.page_catalog import normalize_page_name, CANONICAL_PAGES
+from core.sheets.data_dictionary import build_data_dictionary_rows
+
+# ---------------------------------------------------------------------------
 # Utility: NaN/Inf safe serialization
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def clean_nans(obj: Any) -> Any:
     if isinstance(obj, dict):
         return {k: clean_nans(v) for k, v in obj.items()}
@@ -43,15 +59,16 @@ def clean_nans(obj: Any) -> Any:
         return None
     return obj
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # JSON response (orjson if available)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 try:
     import orjson
     from fastapi.responses import Response as StarletteResponse
 
     class BestJSONResponse(StarletteResponse):
         media_type = "application/json"
+
         def render(self, content: Any) -> bytes:
             return orjson.dumps(clean_nans(content), default=str)
 
@@ -68,12 +85,12 @@ except Exception:
 
 logger = logging.getLogger("routes.ai_analysis")
 
-AI_ANALYSIS_VERSION = "8.5.3"
+AI_ANALYSIS_VERSION = "8.6.0"
 router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Optional HTTP client for internal fallback
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 try:
     import httpx  # type: ignore
     _HTTPX_AVAILABLE = True
@@ -81,52 +98,64 @@ except Exception:
     httpx = None
     _HTTPX_AVAILABLE = False
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Optional OpenTelemetry (safe)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 try:
-    from opentelemetry import trace
-    from opentelemetry.trace import Status, StatusCode
+    from opentelemetry import trace  # type: ignore
+    from opentelemetry.trace import Status, StatusCode  # type: ignore
     _OTEL_AVAILABLE = True
     _TRACER = trace.get_tracer(__name__)
 except Exception:
-    trace = None
-    Status = None
-    StatusCode = None
+    trace = None  # type: ignore
+    Status = None  # type: ignore
+    StatusCode = None  # type: ignore
     _OTEL_AVAILABLE = False
     _TRACER = None
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Optional Prometheus
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 try:
-    from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
+    from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST  # type: ignore
     _PROMETHEUS_AVAILABLE = True
 except Exception:
     _PROMETHEUS_AVAILABLE = False
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Optional Redis (use redis.asyncio if available)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 try:
-    import redis.asyncio as redis_async
+    import redis.asyncio as redis_async  # type: ignore
     _REDIS_AVAILABLE = True
 except Exception:
-    redis_async = None
+    redis_async = None  # type: ignore
     _REDIS_AVAILABLE = False
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Pydantic (v2 preferred)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 try:
-    from pydantic import BaseModel, ConfigDict, Field, model_validator
+    from pydantic import BaseModel, ConfigDict, Field, model_validator  # type: ignore
     _PYDANTIC_V2 = True
 except Exception:
     from pydantic import BaseModel, Field  # type: ignore
     _PYDANTIC_V2 = False
 
+# ---------------------------------------------------------------------------
+# core.config (preferred auth + feature flags) — optional
+# ---------------------------------------------------------------------------
+try:
+    from core.config import auth_ok, get_settings_cached  # type: ignore
+except Exception:
+    auth_ok = None  # type: ignore
+
+    def get_settings_cached(*args, **kwargs):  # type: ignore
+        return None
+
+
 # =============================================================================
-# Enums (Flexible)
+# Enums (kept; not all used directly, but safe)
 # =============================================================================
 class FlexibleEnum(str, Enum):
     @classmethod
@@ -137,27 +166,6 @@ class FlexibleEnum(str, Enum):
                 return member
         return None
 
-class AssetClass(FlexibleEnum):
-    EQUITY = "EQUITY"
-    SUKUK = "SUKUK"
-    REIT = "REIT"
-    ETF = "ETF"
-    COMMODITY = "COMMODITY"
-    CURRENCY = "CURRENCY"
-    CRYPTO = "CRYPTO"
-    DERIVATIVE = "DERIVATIVE"
-
-class MarketRegion(FlexibleEnum):
-    SAUDI = "SAUDI"
-    UAE = "UAE"
-    QATAR = "QATAR"
-    KUWAIT = "KUWAIT"
-    BAHRAIN = "BAHRAIN"
-    OMAN = "OMAN"
-    EGYPT = "EGYPT"
-    USA = "USA"
-    GLOBAL = "GLOBAL"
-
 class DataQuality(FlexibleEnum):
     EXCELLENT = "EXCELLENT"
     GOOD = "GOOD"
@@ -165,9 +173,6 @@ class DataQuality(FlexibleEnum):
     POOR = "POOR"
     MISSING = "MISSING"
     STALE = "STALE"
-    HIGH = "HIGH"
-    MEDIUM = "MEDIUM"
-    LOW = "LOW"
     ERROR = "ERROR"
 
 class Recommendation(FlexibleEnum):
@@ -179,26 +184,6 @@ class Recommendation(FlexibleEnum):
     STRONG_SELL = "STRONG_SELL"
     UNDER_REVIEW = "UNDER_REVIEW"
 
-class ConfidenceLevel(FlexibleEnum):
-    VERY_HIGH = "VERY_HIGH"
-    HIGH = "HIGH"
-    MEDIUM = "MEDIUM"
-    LOW = "LOW"
-    VERY_LOW = "VERY_LOW"
-
-class SignalType(FlexibleEnum):
-    BULLISH = "BULLISH"
-    BEARISH = "BEARISH"
-    NEUTRAL = "NEUTRAL"
-    OVERBOUGHT = "OVERBOUGHT"
-    OVERSOLD = "OVERSOLD"
-    DIVERGENCE = "DIVERGENCE"
-
-class ShariahCompliance(FlexibleEnum):
-    COMPLIANT = "COMPLIANT"
-    NON_COMPLIANT = "NON_COMPLIANT"
-    PENDING = "PENDING"
-    NA = "NA"
 
 # =============================================================================
 # Time (Riyadh)
@@ -206,8 +191,7 @@ class ShariahCompliance(FlexibleEnum):
 class SaudiTime:
     def __init__(self):
         self._tz = timezone(timedelta(hours=3))
-        self._weekend_days = [4, 5]  # Fri=4, Sat=5 (Mon=0)
-        self._trading_hours = {"start": "10:00", "end": "15:00"}
+        self._weekend_days = [4, 5]  # Fri=4, Sat=5
 
     def now(self) -> datetime:
         return datetime.now(self._tz)
@@ -223,6 +207,7 @@ class SaudiTime:
         return dt.weekday() not in self._weekend_days
 
 _saudi_time = SaudiTime()
+
 
 # =============================================================================
 # Config
@@ -243,19 +228,22 @@ class AIConfig:
     enable_tracing: bool = True
     trace_sample_rate: float = 1.0
 
-    enable_scoreboard: bool = True
     enable_websocket: bool = False
 
 _CONFIG = AIConfig()
 
 def _load_config_from_env() -> None:
     def env_int(name: str, default: int) -> int:
-        try: return int(os.getenv(name, str(default)).strip())
-        except Exception: return default
+        try:
+            return int(os.getenv(name, str(default)).strip())
+        except Exception:
+            return default
 
     def env_float(name: str, default: float) -> float:
-        try: return float(os.getenv(name, str(default)).strip())
-        except Exception: return default
+        try:
+            return float(os.getenv(name, str(default)).strip())
+        except Exception:
+            return default
 
     def env_bool(name: str, default: bool) -> bool:
         v = os.getenv(name, str(default)).strip().lower()
@@ -278,25 +266,9 @@ def _load_config_from_env() -> None:
 
 _load_config_from_env()
 
-# =============================================================================
-# Metrics
-# =============================================================================
-class MetricsRegistry:
-    def __init__(self, namespace: str = "tadawul_ai"):
-        self.namespace = namespace
-        self._counters: Dict[str, Any] = {}
-
-    def counter(self, name: str, description: str, labels: Optional[List[str]] = None) -> Any:
-        if not _PROMETHEUS_AVAILABLE:
-            return None
-        if name not in self._counters:
-            self._counters[name] = Counter(f"{self.namespace}_{name}", description, labelnames=labels or [])
-        return self._counters.get(name)
-
-_metrics = MetricsRegistry()
 
 # =============================================================================
-# ✅ TraceContext (FIXED)
+# ✅ TraceContext (safe)
 # =============================================================================
 class TraceContext:
     def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
@@ -312,7 +284,7 @@ class TraceContext:
         if random.random() > float(_CONFIG.trace_sample_rate or 1.0):
             return self
         try:
-            self._cm = _TRACER.start_as_current_span(self.name)
+            self._cm = _TRACER.start_as_current_span(self.name)  # type: ignore
             self.span = self._cm.__enter__()
             for k, v in self.attributes.items():
                 try:
@@ -330,32 +302,46 @@ class TraceContext:
             return False
         try:
             if exc_val and self.span and Status is not None and StatusCode is not None:
-                try: self.span.record_exception(exc_val)
-                except Exception: pass
-                try: self.span.set_status(Status(StatusCode.ERROR, str(exc_val)))
-                except Exception: pass
+                try:
+                    self.span.record_exception(exc_val)
+                except Exception:
+                    pass
+                try:
+                    self.span.set_status(Status(StatusCode.ERROR, str(exc_val)))
+                except Exception:
+                    pass
         finally:
-            try: self._cm.__exit__(exc_type, exc_val, exc_tb)
-            except Exception: pass
+            try:
+                self._cm.__exit__(exc_type, exc_val, exc_tb)
+            except Exception:
+                pass
         return False
+
 
 # =============================================================================
 # Auth & Rate limiter
 # =============================================================================
 class TokenManager:
+    """
+    Fallback token manager if core.config.auth_ok isn't available.
+    Behavior:
+      - if REQUIRE_API_KEY=true and no tokens configured => DENY (secure by default)
+      - else validate against configured tokens
+    """
     def __init__(self):
         self._tokens: Set[str] = set()
-        for key in ("APP_TOKEN", "BACKUP_APP_TOKEN", "TFB_APP_TOKEN"):
+        for key in ("APP_TOKEN", "BACKUP_APP_TOKEN", "TFB_APP_TOKEN", "BACKEND_TOKEN"):
             t = (os.getenv(key, "") or "").strip()
             if t:
                 self._tokens.add(t)
 
     def validate_token(self, token: str) -> bool:
+        token = (token or "").strip()
         if not _CONFIG.require_api_key:
             return True
         if not self._tokens:
-            return True
-        return (token or "").strip() in self._tokens
+            return False
+        return token in self._tokens
 
 _token_manager = TokenManager()
 
@@ -393,6 +379,7 @@ def _extract_auth_token(token_q: Optional[str], x_app_token: Optional[str], auth
         return x_app_token.strip()
     return ""
 
+
 # =============================================================================
 # Cache Manager
 # =============================================================================
@@ -423,10 +410,10 @@ class CacheManager:
         if not (_CONFIG.enable_redis_cache and _REDIS_AVAILABLE and redis_async):
             return
         try:
-            self._redis = redis_async.from_url(_CONFIG.redis_url, encoding=None, decode_responses=False)
-            logger.info(f"Redis cache enabled: {_CONFIG.redis_url}")
+            self._redis = redis_async.from_url(_CONFIG.redis_url, encoding=None, decode_responses=False)  # type: ignore
+            logger.info("Redis cache enabled")
         except Exception as e:
-            logger.warning(f"Redis init failed: {e}")
+            logger.warning("Redis init failed: %s", e)
             self._redis = None
 
     async def get(self, key: str, namespace: str = "ai") -> Optional[Any]:
@@ -489,89 +476,41 @@ class CacheManager:
 
 _cache = CacheManager()
 
+
 # =============================================================================
-# Pydantic Models (extra="ignore")
+# Request model (Phase 3 schema rows)
 # =============================================================================
-def _pydantic_config():
-    if _PYDANTIC_V2:
-        return ConfigDict(arbitrary_types_allowed=True, use_enum_values=True, extra="ignore")
-    class _Cfg:
-        arbitrary_types_allowed = True
-        use_enum_values = True
-        extra = "ignore"
-    return _Cfg
-
-class SingleAnalysisResponse(BaseModel):
-    symbol: str
-    name: Optional[str] = None
-    price: Optional[float] = None
-    change_pct: Optional[float] = None
-    recommendation: Recommendation = Recommendation.HOLD
-    data_quality: DataQuality = DataQuality.MISSING
-    error: Optional[str] = None
-    last_updated_riyadh: Optional[str] = None
-
-    if _PYDANTIC_V2:
-        model_config = _pydantic_config()
-    else:
-        class Config(_pydantic_config()):  # type: ignore
-            pass
-
-class BatchAnalysisResponse(BaseModel):
-    results: List[SingleAnalysisResponse] = Field(default_factory=list)
-    status: str = "success"
-    error: Optional[str] = None
-    version: str = AI_ANALYSIS_VERSION
-    meta: Dict[str, Any] = Field(default_factory=dict)
-
-    if _PYDANTIC_V2:
-        model_config = _pydantic_config()
-    else:
-        class Config(_pydantic_config()):  # type: ignore
-            pass
-
-class SheetAnalysisResponse(BaseModel):
-    status: str = "success"
-    headers: List[str] = Field(default_factory=list)
-    rows: List[List[Any]] = Field(default_factory=list)
-    error: Optional[str] = None
-    version: str = AI_ANALYSIS_VERSION
-    request_id: str
-    meta: Dict[str, Any] = Field(default_factory=dict)
-
-    if _PYDANTIC_V2:
-        model_config = _pydantic_config()
-    else:
-        class Config(_pydantic_config()):  # type: ignore
-            pass
-
-class AdvancedSheetRequest(BaseModel):
-    tickers: List[str] = Field(default_factory=list)
+class AnalysisSheetRowsRequest(BaseModel):
+    page: str = Field(default="Market_Leaders", description="Sheet/page name or alias (e.g., 'Market Leaders').")
     symbols: List[str] = Field(default_factory=list)
-    top_n: Optional[int] = Field(default=50, ge=1, le=1000)
-    sheet_name: Optional[str] = None
-    headers: Optional[List[str]] = None
+    tickers: List[str] = Field(default_factory=list)  # backward compat
+    top_n: int = Field(default=50, ge=1, le=2000)
+    include_matrix: bool = Field(default=True, description="Include rows_matrix for legacy clients.")
 
     if _PYDANTIC_V2:
         model_config = ConfigDict(extra="ignore")
 
         @model_validator(mode="after")
-        def combine_tickers(self) -> "AdvancedSheetRequest":
-            all_symbols = list(self.tickers or []) + list(self.symbols or [])
-            seen: Set[str] = set()
+        def _combine(self) -> "AnalysisSheetRowsRequest":
+            all_syms = list(self.symbols or []) + list(self.tickers or [])
             out: List[str] = []
-            for s in all_symbols:
-                x = str(s).strip().upper()
-                if x.startswith("TADAWUL:"):
-                    x = x.split(":", 1)[1]
-                if x.endswith(".TADAWUL"):
-                    x = x.replace(".TADAWUL", "")
-                if x and x not in seen:
-                    seen.add(x)
-                    out.append(x)
+            seen = set()
+            for s in all_syms:
+                n = str(s).strip()
+                if not n:
+                    continue
+                n = n.upper()
+                if n.startswith("TADAWUL:"):
+                    n = n.split(":", 1)[1]
+                if n.endswith(".TADAWUL"):
+                    n = n.replace(".TADAWUL", "")
+                if n and n not in seen:
+                    seen.add(n)
+                    out.append(n)
             self.symbols = out
             self.tickers = []
             return self
+
 
 # =============================================================================
 # Engine Access + Enriched Fallback
@@ -583,11 +522,11 @@ def _to_dict(obj: Any) -> Dict[str, Any]:
         return obj
     try:
         if hasattr(obj, "model_dump"):
-            return obj.model_dump()
+            return obj.model_dump(mode="python")
         if hasattr(obj, "dict"):
             return obj.dict()
         if is_dataclass(obj):
-            return {k: v for k, v in obj.__dict__.items() if not k.startswith("_")}
+            return {k: v for k, v in obj.__dict__.items() if not str(k).startswith("_")}
     except Exception:
         pass
     return {"raw": str(obj)}
@@ -614,13 +553,15 @@ async def _fetch_enriched_via_local_http(symbol: str, auth_token: str) -> Option
 
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            r = await client.get(url, params={"symbol": symbol, "debug": False, "include_headers": False, "include_rows": False}, headers=headers)
+            r = await client.get(
+                url,
+                params={"symbol": symbol, "debug": False, "include_headers": False, "include_rows": False},
+                headers=headers,
+            )
             if r.status_code != 200:
                 return None
             data = r.json()
-            if isinstance(data, dict):
-                return data
-            return None
+            return data if isinstance(data, dict) else None
     except Exception:
         return None
 
@@ -637,24 +578,21 @@ class AnalysisEngine:
             pass
 
         async with self._engine_lock:
-            try:
-                from core.data_engine_v2 import get_engine  # type: ignore
-                eng = get_engine()
-                if hasattr(eng, "__await__"):
-                    eng = await eng
-                return eng
-            except Exception:
-                pass
-            try:
-                from core.data_engine import get_engine  # type: ignore
-                eng = get_engine()
-                if hasattr(eng, "__await__"):
-                    eng = await eng
-                return eng
-            except Exception:
-                return None
+            # prefer v2 engine
+            for modpath in ("core.data_engine_v2", "core.data_engine"):
+                try:
+                    mod = __import__(modpath, fromlist=["get_engine"])
+                    get_engine = getattr(mod, "get_engine", None)
+                    if callable(get_engine):
+                        eng = get_engine()
+                        if hasattr(eng, "__await__"):
+                            eng = await eng
+                        return eng
+                except Exception:
+                    continue
+        return None
 
-    async def fetch_enriched(self, request: Request, engine: Any, symbols: List[str], auth_token: str) -> Dict[str, Dict[str, Any]]:
+    async def fetch_enriched(self, request: Request, engine: Any, symbols: List[str], auth_token: str, mode: str = "") -> Dict[str, Dict[str, Any]]:
         """
         Fetch enriched quotes (best-effort). If engine returns "No providers available",
         fallback to local /v1/enriched/quote and try .SR if needed.
@@ -666,7 +604,7 @@ class AnalysisEngine:
             fn = getattr(engine, method, None)
             if callable(fn):
                 try:
-                    res = fn(symbols)
+                    res = fn(symbols, mode=mode) if mode else fn(symbols)
                     if hasattr(res, "__await__"):
                         res = await res
                     if isinstance(res, dict):
@@ -688,7 +626,7 @@ class AnalysisEngine:
                         fn = getattr(engine, m, None)
                         if callable(fn):
                             try:
-                                r = fn(s)
+                                r = fn(s, mode=mode) if mode and "mode" in getattr(fn, "__code__", {}).co_varnames else fn(s)  # best effort
                                 if hasattr(r, "__await__"):
                                     r = await r
                                 return s, _to_dict(r)
@@ -702,15 +640,13 @@ class AnalysisEngine:
                 if isinstance(r, tuple) and len(r) == 2:
                     out[r[0]] = r[1]
 
-        # ✅ Fallback to /v1/enriched/quote for provider failures
+        # Provider fallback to /v1/enriched/quote
         for s in list(symbols):
             d = out.get(s) or {"symbol": s, "error": "Empty result", "data_quality": "MISSING"}
             if _needs_provider_fallback(d):
                 candidates = [s]
-                # if it's a pure numeric Saudi ticker, also try ".SR"
                 if s.isdigit() and len(s) in (3, 4, 5):
                     candidates.append(f"{s}.SR")
-                # if ".SR" given, also try numeric
                 if s.upper().endswith(".SR"):
                     candidates.append(s.split(".", 1)[0])
 
@@ -736,22 +672,91 @@ class AnalysisEngine:
 
 _analysis_engine = AnalysisEngine()
 
-# =============================================================================
-# Helpers
-# =============================================================================
-def _default_headers() -> List[str]:
-    return ["Symbol", "Name", "Price", "Recommendation", "Data Quality", "Error", "Last Updated Riyadh"]
 
-def _row_from_enriched(d: Dict[str, Any]) -> List[Any]:
-    return [
-        d.get("symbol") or d.get("ticker"),
-        d.get("name") or "",
-        d.get("price") or d.get("current_price"),
-        d.get("recommendation") or "HOLD",
-        d.get("data_quality") or ("MISSING" if d.get("error") else "GOOD"),
-        d.get("error"),
-        d.get("last_updated_riyadh") or _saudi_time.now_iso(),
-    ]
+# =============================================================================
+# Phase 3: Schema normalization
+# =============================================================================
+_CANONICAL_ALIASES: Dict[str, Tuple[str, ...]] = {
+    # identity
+    "symbol": ("symbol", "ticker"),
+    "name": ("name", "company_name"),
+    "exchange": ("exchange",),
+    "currency": ("currency",),
+    "asset_class": ("asset_class", "type", "instrument_type"),
+
+    # price
+    "current_price": ("current_price", "price", "last_price"),
+    "previous_close": ("previous_close", "prev_close"),
+    "open_price": ("open_price", "open"),
+    "day_high": ("day_high", "high"),
+    "day_low": ("day_low", "low"),
+    "week_52_high": ("week_52_high", "52w_high", "high_52w"),
+    "week_52_low": ("week_52_low", "52w_low", "low_52w"),
+    "price_change": ("price_change", "change"),
+    "percent_change": ("percent_change", "change_pct", "change_percent"),
+
+    # liquidity
+    "volume": ("volume",),
+    "market_cap": ("market_cap",),
+
+    # fundamentals
+    "pe_ttm": ("pe_ttm", "pe_ratio", "pe"),
+    "dividend_yield": ("dividend_yield",),
+
+    # technical/risk
+    "rsi_14": ("rsi_14", "rsi14", "rsi_14d", "rsi"),
+    "volatility_30d": ("volatility_30d", "vol_30d"),
+    "risk_score": ("risk_score",),
+
+    # forecast/roi
+    "forecast_price_1m": ("forecast_price_1m",),
+    "forecast_price_3m": ("forecast_price_3m",),
+    "forecast_price_12m": ("forecast_price_12m",),
+    "expected_roi_1m": ("expected_roi_1m",),
+    "expected_roi_3m": ("expected_roi_3m",),
+    "expected_roi_12m": ("expected_roi_12m",),
+    "forecast_confidence": ("forecast_confidence",),
+
+    # scores
+    "overall_score": ("overall_score",),
+    "confidence_score": ("confidence_score",),
+    "recommendation": ("recommendation",),
+    "recommendation_reason": ("recommendation_reason",),
+
+    # provenance
+    "last_updated_utc": ("last_updated_utc",),
+    "last_updated_riyadh": ("last_updated_riyadh",),
+    "warnings": ("warnings",),
+    "data_provider": ("data_provider",),
+}
+
+def _normalize_row_to_schema(schema_keys: Sequence[str], raw: Dict[str, Any], *, symbol_fallback: str) -> Dict[str, Any]:
+    raw = raw or {}
+    raw_lc = {str(k).lower(): v for k, v in raw.items()}
+    out: Dict[str, Any] = {}
+
+    for k in schema_keys:
+        v = None
+        if k in raw:
+            v = raw.get(k)
+        elif k.lower() in raw_lc:
+            v = raw_lc.get(k.lower())
+        else:
+            aliases = _CANONICAL_ALIASES.get(k, ())
+            for a in aliases:
+                if a in raw:
+                    v = raw.get(a)
+                    break
+                if a.lower() in raw_lc:
+                    v = raw_lc.get(a.lower())
+                    break
+        out[k] = v
+
+    if "symbol" in out and not out.get("symbol"):
+        out["symbol"] = symbol_fallback
+
+    return out
+
 
 # =============================================================================
 # Routes
@@ -759,25 +764,46 @@ def _row_from_enriched(d: Dict[str, Any]) -> List[Any]:
 @router.get("/health")
 async def health(request: Request) -> Dict[str, Any]:
     engine = await _analysis_engine.get_engine(request)
+    settings = None
+    try:
+        settings = get_settings_cached()
+    except Exception:
+        settings = None
+
     return {
         "status": "ok" if engine else "degraded",
         "version": AI_ANALYSIS_VERSION,
         "timestamp_riyadh": _saudi_time.now_iso(),
         "engine": {"available": bool(engine), "type": type(engine).__name__ if engine else "none"},
         "cache": _cache.stats(),
+        "schema_pages": list(CANONICAL_PAGES),
+        "schema_headers_always": bool(getattr(settings, "schema_headers_always", True)) if settings else True,
+        "computations_enabled": bool(getattr(settings, "computations_enabled", True)) if settings else True,
         "request_id": getattr(request.state, "request_id", None),
     }
 
-@router.post("/sheet-rows", response_model=SheetAnalysisResponse)
+@router.get("/metrics")
+async def metrics() -> Response:
+    if not _PROMETHEUS_AVAILABLE:
+        return BestJSONResponse(status_code=503, content={"error": "Metrics not available"})
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)  # type: ignore
+
+@router.post("/sheet-rows")
 async def sheet_rows(
     request: Request,
     body: Dict[str, Any] = Body(...),
-    mode: str = Query(default="", description="Mode hint"),
-    token: Optional[str] = Query(default=None, description="Auth token"),
+    mode: str = Query(default="", description="Mode hint for engine/provider"),
+    token: Optional[str] = Query(default=None, description="Auth token (query only if ALLOW_QUERY_TOKEN=true)"),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> BestJSONResponse:
+    """
+    Phase 3 schema-driven sheet rows:
+    - page aliases accepted
+    - full schema headers/keys returned
+    - rows are list of dicts with all schema keys (missing => null)
+    """
     start = time.time()
     request_id = x_request_id or getattr(request.state, "request_id", None) or str(uuid.uuid4())[:18]
 
@@ -786,79 +812,176 @@ async def sheet_rows(
         if not await _rate_limiter.check(client_ip):
             raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Rate limit exceeded")
 
+        # Auth token selection
         auth_token = _extract_auth_token(token if _CONFIG.allow_query_token else None, x_app_token, authorization)
-        if not _token_manager.validate_token(auth_token):
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
+        # Prefer core.config auth if available
+        if auth_ok is not None:
+            if not auth_ok(token=auth_token, authorization=authorization, headers={"X-APP-TOKEN": x_app_token, "Authorization": authorization}):
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+        else:
+            if not _token_manager.validate_token(auth_token):
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+        # Parse request
         async with TraceContext("analysis.sheet_rows.parse", {"request_id": request_id}):
             try:
-                req = AdvancedSheetRequest.model_validate(body) if _PYDANTIC_V2 else AdvancedSheetRequest.parse_obj(body)  # type: ignore
+                req = AnalysisSheetRowsRequest.model_validate(body) if _PYDANTIC_V2 else AnalysisSheetRowsRequest.parse_obj(body)  # type: ignore
             except Exception as e:
-                err_resp = SheetAnalysisResponse(
-                    status="error",
-                    headers=[],
-                    rows=[],
-                    error=f"Invalid request: {e}",
-                    version=AI_ANALYSIS_VERSION,
-                    request_id=request_id,
-                    meta={"duration_ms": (time.time() - start) * 1000},
+                return BestJSONResponse(
+                    status_code=400,
+                    content={
+                        "status": "error",
+                        "page": None,
+                        "headers": [],
+                        "keys": [],
+                        "rows": [],
+                        "error": f"Invalid request: {e}",
+                        "version": AI_ANALYSIS_VERSION,
+                        "request_id": request_id,
+                        "meta": {"duration_ms": (time.time() - start) * 1000},
+                    },
                 )
-                return BestJSONResponse(status_code=400, content=err_resp.model_dump(exclude_none=True) if _PYDANTIC_V2 else err_resp.dict(exclude_none=True))  # type: ignore
 
-        symbols = (req.symbols or [])[: (req.top_n or 50)]
-        headers = req.headers or _default_headers()
-
-        if not symbols:
-            resp = SheetAnalysisResponse(
-                status="skipped",
-                headers=headers,
-                rows=[],
-                error="No symbols provided",
-                version=AI_ANALYSIS_VERSION,
-                request_id=request_id,
-                meta={"duration_ms": (time.time() - start) * 1000},
+        # Normalize page alias -> canonical
+        try:
+            page = normalize_page_name(req.page, allow_output_pages=True)
+        except Exception as e:
+            return BestJSONResponse(
+                status_code=400,
+                content={
+                    "status": "error",
+                    "page": req.page,
+                    "headers": [],
+                    "keys": [],
+                    "rows": [],
+                    "error": f"Invalid page: {str(e)}",
+                    "allowed_pages": list(CANONICAL_PAGES),
+                    "version": AI_ANALYSIS_VERSION,
+                    "request_id": request_id,
+                    "meta": {"duration_ms": (time.time() - start) * 1000},
+                },
             )
-            return BestJSONResponse(content=resp.model_dump(exclude_none=True) if _PYDANTIC_V2 else resp.dict(exclude_none=True))  # type: ignore
 
+        # Data_Dictionary path (no engine required)
+        if page == "Data_Dictionary":
+            spec = get_sheet_spec("Data_Dictionary")
+            headers = [c.header for c in spec.columns]
+            keys = [c.key for c in spec.columns]
+
+            rows_dict = build_data_dictionary_rows(include_meta_sheet=True)
+            normalized_rows = [_normalize_row_to_schema(keys, r, symbol_fallback="") for r in rows_dict]
+
+            payload = {
+                "status": "success",
+                "page": page,
+                "headers": headers,
+                "keys": keys,
+                "rows": normalized_rows,
+                "rows_matrix": [[row.get(k) for k in keys] for row in normalized_rows] if req.include_matrix else None,
+                "version": AI_ANALYSIS_VERSION,
+                "request_id": request_id,
+                "meta": {
+                    "duration_ms": (time.time() - start) * 1000,
+                    "count": len(normalized_rows),
+                    "schema_mode": "data_dictionary",
+                },
+            }
+            return BestJSONResponse(content=clean_nans(payload))
+
+        # Resolve schema for requested page
+        try:
+            sheet_spec = get_sheet_spec(page)
+        except Exception as e:
+            return BestJSONResponse(
+                status_code=400,
+                content={
+                    "status": "error",
+                    "page": page,
+                    "headers": [],
+                    "keys": [],
+                    "rows": [],
+                    "error": f"Schema not found for page '{page}': {str(e)}",
+                    "allowed_pages": list(CANONICAL_PAGES),
+                    "version": AI_ANALYSIS_VERSION,
+                    "request_id": request_id,
+                    "meta": {"duration_ms": (time.time() - start) * 1000},
+                },
+            )
+
+        headers = [c.header for c in sheet_spec.columns]
+        keys = [c.key for c in sheet_spec.columns]
+
+        symbols = (req.symbols or [])[: int(req.top_n or 50)]
+        if not symbols:
+            payload = {
+                "status": "skipped",
+                "page": page,
+                "headers": headers,
+                "keys": keys,
+                "rows": [],
+                "rows_matrix": [] if req.include_matrix else None,
+                "error": "No symbols provided",
+                "version": AI_ANALYSIS_VERSION,
+                "request_id": request_id,
+                "meta": {"duration_ms": (time.time() - start) * 1000},
+            }
+            return BestJSONResponse(content=clean_nans(payload))
+
+        # Engine
         engine = await _analysis_engine.get_engine(request)
         if not engine:
-            err_resp = SheetAnalysisResponse(
-                status="error",
-                headers=[],
-                rows=[],
-                error="Data engine unavailable",
-                version=AI_ANALYSIS_VERSION,
-                request_id=request_id,
-                meta={"duration_ms": (time.time() - start) * 1000},
+            return BestJSONResponse(
+                status_code=503,
+                content={
+                    "status": "error",
+                    "page": page,
+                    "headers": headers,
+                    "keys": keys,
+                    "rows": [],
+                    "error": "Data engine unavailable",
+                    "version": AI_ANALYSIS_VERSION,
+                    "request_id": request_id,
+                    "meta": {"duration_ms": (time.time() - start) * 1000},
+                },
             )
-            return BestJSONResponse(status_code=503, content=err_resp.model_dump(exclude_none=True) if _PYDANTIC_V2 else err_resp.dict(exclude_none=True))  # type: ignore
 
+        # Feature flags snapshot (do not affect headers)
+        settings = None
+        try:
+            settings = get_settings_cached()
+        except Exception:
+            settings = None
+
+        computations_enabled = bool(getattr(settings, "computations_enabled", True)) if settings else True
+
+        # Fetch enriched data (best effort)
         async with TraceContext("analysis.sheet_rows.fetch", {"count": len(symbols), "request_id": request_id, "mode": mode or ""}):
-            data_map = await _analysis_engine.fetch_enriched(request, engine, symbols, auth_token=auth_token)
+            data_map = await _analysis_engine.fetch_enriched(request, engine, symbols, auth_token=auth_token, mode=mode or "")
 
-        rows: List[List[Any]] = []
+        # Normalize rows to schema (fill missing keys => None)
+        normalized_rows: List[Dict[str, Any]] = []
         errors = 0
         for s in symbols:
             d = data_map.get(s) or {"symbol": s, "error": "Not found", "data_quality": "MISSING", "last_updated_riyadh": _saudi_time.now_iso()}
             if d.get("error"):
                 errors += 1
-            rows.append(_row_from_enriched(d))
+            row = _normalize_row_to_schema(keys, _to_dict(d), symbol_fallback=s)
+            normalized_rows.append(row)
 
         status_out = "success" if errors == 0 else ("partial" if errors < len(symbols) else "error")
 
-        if _PROMETHEUS_AVAILABLE:
-            c = _metrics.counter("requests_total", "Requests", ["status"])
-            if c:
-                c.labels(status=status_out).inc()
-
-        resp = SheetAnalysisResponse(
-            status=status_out,
-            headers=headers,
-            rows=rows,
-            error=f"{errors} errors" if errors else None,
-            version=AI_ANALYSIS_VERSION,
-            request_id=request_id,
-            meta={
+        payload = {
+            "status": status_out,
+            "page": page,
+            "headers": headers,
+            "keys": keys,
+            "rows": normalized_rows,
+            "rows_matrix": [[row.get(k) for k in keys] for row in normalized_rows] if req.include_matrix else None,
+            "error": f"{errors} errors" if errors else None,
+            "version": AI_ANALYSIS_VERSION,
+            "request_id": request_id,
+            "meta": {
                 "duration_ms": (time.time() - start) * 1000,
                 "requested": len(symbols),
                 "errors": errors,
@@ -866,24 +989,26 @@ async def sheet_rows(
                 "riyadh_time": _saudi_time.now_iso(),
                 "business_day": _saudi_time.is_trading_day(),
                 "mode": mode,
-                "sheet_name": req.sheet_name,
+                "computations_enabled": computations_enabled,
             },
-        )
-        return BestJSONResponse(content=resp.model_dump(exclude_none=True) if _PYDANTIC_V2 else resp.dict(exclude_none=True))  # type: ignore
+        }
+        return BestJSONResponse(content=clean_nans(payload))
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"sheet_rows failed: {e}\n{traceback.format_exc()}")
-        err_resp = SheetAnalysisResponse(
-            status="error",
-            headers=[],
-            rows=[],
-            error=f"Internal Server Error: {e}",
-            version=AI_ANALYSIS_VERSION,
-            request_id=request_id,
-            meta={"duration_ms": (time.time() - start) * 1000},
-        )
-        return BestJSONResponse(status_code=500, content=err_resp.model_dump(exclude_none=True) if _PYDANTIC_V2 else err_resp.dict(exclude_none=True))  # type: ignore
+        logger.error("sheet_rows failed: %s\n%s", e, traceback.format_exc())
+        payload = {
+            "status": "error",
+            "page": None,
+            "headers": [],
+            "keys": [],
+            "rows": [],
+            "error": f"Internal Server Error: {e}",
+            "version": AI_ANALYSIS_VERSION,
+            "request_id": request_id,
+            "meta": {"duration_ms": (time.time() - start) * 1000},
+        }
+        return BestJSONResponse(status_code=500, content=clean_nans(payload))
 
 __all__ = ["router"]
