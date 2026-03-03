@@ -1,39 +1,31 @@
 #!/usr/bin/env python3
-# core/enriched_quote.py
+# routes/enriched_quote.py
 """
 ================================================================================
-Enriched Quote Router — v5.3.0 (GLOBAL-FIRST / ENGINE-LAZY / SHEET-RATIO-SAFE)
+Enriched Quote Router — v5.4.0 (PHASE 4 SCHEMA-ALIGNED / ENGINE-LAZY)
 ================================================================================
-Financial Data Platform — High-Performance Aggregation and Sheet Mapping
+Goal:
+- /v1/enriched/quote must emit KEYS aligned to schema_registry mapping.
+- This becomes the standard row object consumed by sheet-row endpoints and fallbacks.
 
-v5.3.0 upgrades (your “green signal” wiring improvements)
-- ✅ Mount-safe + discovery-safe:
-    - Exposes `router` and `get_router()` (standard)
-    - Adds optional `mount(app)` helper (some mount plans use it)
-- ✅ Engine call compatibility:
-    - Tries more engine method names (single + batch)
-    - Supports passing optional kwargs (include_raw / provider) ONLY if engine accepts them
-    - Better error surface: includes engine_source + engine_error (so you see WHY it fails)
-- ✅ Batch fallback correctness:
-    - Fixes “missing items” logic (no longer assumes missing are only the tail)
-- ✅ Sheet-safe percent handling:
-    - Keeps % values as FRACTIONS (0.12 => 12%)
-    - Computes Change% and 52W Position% in FRACTION form whenever possible
-- ✅ Auth alignment:
-    - Uses core.config.auth_ok/is_open_mode if available
-    - Accepts X-APP-TOKEN, Authorization: Bearer, X-API-Key
-- ✅ Operational endpoints:
-    - /v1/enriched/health (includes config health if available)
-    - /v1/enriched/headers
-    - /v1/enriched/quote
-    - /v1/enriched/quotes (GET + POST JSON body)
+Design:
+- Engine is lazy: request.app.state.engine OR core.data_engine_v2.get_engine()
+- Output is a schema-aligned row dict with guaranteed keys via normalize_row_to_schema()
+- Backward compatible response wrapper:
+    { "status": "success", "data": <row>, ... }
+  PLUS we also copy row keys to the top-level for easy consumers.
+
+Endpoints:
+- GET  /v1/enriched/health
+- GET  /v1/enriched/headers
+- GET  /v1/enriched/quote
+- GET  /v1/enriched/quotes
+- POST /v1/enriched/quotes
 
 Notes:
-- This router depends on the DataEngine to actually fetch quotes.
-- If your `/quotes` root endpoint still shows:
-    "Provider loaded but no compatible quote method succeeded. last_err=None"
-  then the fix is in provider interface discovery (e.g., EODHD provider wrappers),
-  not in this router. This router will now show that error more clearly.
+- Percent-like fields are returned as FRACTIONS (0.12 => 12%) when applicable.
+- No startup network I/O.
+================================================================================
 """
 
 from __future__ import annotations
@@ -62,7 +54,7 @@ except Exception:
     from starlette.responses import JSONResponse as BestJSONResponse  # type: ignore
 
 # ---------------------------------------------------------------------------
-# Monitoring & Tracing (optional)
+# Optional monitoring
 # ---------------------------------------------------------------------------
 try:
     from prometheus_client import Counter, Histogram  # type: ignore
@@ -81,45 +73,43 @@ try:
 except Exception:
     _PROMETHEUS_AVAILABLE = False
 
-    class DummyMetric:
-        def labels(self, *args, **kwargs):
+    class _DummyMetric:
+        def labels(self, *args, **kwargs):  # noqa
             return self
 
-        def inc(self, *args, **kwargs):
-            pass
+        def inc(self, *args, **kwargs):  # noqa
+            return None
 
-        def observe(self, *args, **kwargs):
-            pass
+        def observe(self, *args, **kwargs):  # noqa
+            return None
 
-    router_requests_total = DummyMetric()
-    router_request_duration = DummyMetric()
+    router_requests_total = _DummyMetric()
+    router_request_duration = _DummyMetric()
 
+# ---------------------------------------------------------------------------
+# Optional tracing
+# ---------------------------------------------------------------------------
 try:
     from opentelemetry import trace  # type: ignore
 
-    _OTEL_AVAILABLE = True
     tracer = trace.get_tracer(__name__)
 except Exception:
-    _OTEL_AVAILABLE = False
 
-    class DummySpan:
-        def set_attribute(self, *args, **kwargs):
-            pass
+    class _DummySpan:
+        def set_attribute(self, *args, **kwargs):  # noqa
+            return None
 
-        def set_status(self, *args, **kwargs):
-            pass
-
-        def __enter__(self):
+        def __enter__(self):  # noqa
             return self
 
-        def __exit__(self, *args, **kwargs):
-            pass
+        def __exit__(self, *args, **kwargs):  # noqa
+            return None
 
-    class DummyTracer:
-        def start_as_current_span(self, *args, **kwargs):
-            return DummySpan()
+    class _DummyTracer:
+        def start_as_current_span(self, *args, **kwargs):  # noqa
+            return _DummySpan()
 
-    tracer = DummyTracer()
+    tracer = _DummyTracer()
 
 # ---------------------------------------------------------------------------
 # Symbol normalization (supports both repo layouts)
@@ -136,52 +126,45 @@ except Exception:
     except Exception:
         _normalize_symbol = _fallback_normalize_symbol  # type: ignore
 
-__version__ = "5.3.0"
+# ---------------------------------------------------------------------------
+# Phase 4 normalize helper (preferred)
+# ---------------------------------------------------------------------------
+try:
+    from core.data_engine_v2 import normalize_row_to_schema as _normalize_row_to_schema  # type: ignore
+
+    _HAS_ENGINE_SCHEMA_NORMALIZER = True
+except Exception:
+    _HAS_ENGINE_SCHEMA_NORMALIZER = False
+
+    def _normalize_row_to_schema(schema: Any, rowdict: Dict[str, Any]) -> Dict[str, Any]:  # type: ignore
+        return dict(rowdict or {})
+
+# ---------------------------------------------------------------------------
+# Schema registry (optional)
+# ---------------------------------------------------------------------------
+try:
+    from core.sheets.schema_registry import SCHEMA_REGISTRY  # type: ignore
+
+    _SCHEMA_AVAILABLE = True
+except Exception:
+    SCHEMA_REGISTRY = {}  # type: ignore
+    _SCHEMA_AVAILABLE = False
+
+__version__ = "5.4.0"
 ROUTER_VERSION = __version__
 
-logger = logging.getLogger("core.enriched_quote")
+logger = logging.getLogger("routes.enriched_quote")
 
 router = APIRouter(prefix="/v1/enriched", tags=["enriched"])
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "active"}
-_RECOMMENDATIONS = ("STRONG_BUY", "BUY", "HOLD", "REDUCE", "SELL")
+_RECOMMENDATIONS = ("STRONG_BUY", "BUY", "HOLD", "REDUCE", "SELL", "STRONG_SELL", "UNDER_REVIEW")
 RIYADH_TZ = timezone(timedelta(hours=3))
 
-# ============================================================================
-# Headers (sheet-ready)
-# ============================================================================
 
-ENRICHED_HEADERS_61: List[str] = [
-    "Rank", "Symbol", "Origin", "Name", "Sector", "Sub Sector", "Market",
-    "Currency", "Listing Date", "Price", "Prev Close", "Change", "Change %", "Day High", "Day Low",
-    "52W High", "52W Low", "52W Position %",
-    "Volume", "Avg Vol 30D", "Value Traded", "Turnover %", "Shares Outstanding", "Free Float %", "Market Cap", "Free Float Mkt Cap",
-    "Liquidity Score", "EPS (TTM)", "Forward EPS", "P/E (TTM)", "Forward P/E", "P/B", "P/S", "EV/EBITDA",
-    "Dividend Yield", "Dividend Rate", "Payout Ratio", "Beta",
-    "ROE", "ROA", "Net Margin", "EBITDA Margin", "Revenue Growth", "Net Income Growth", "Volatility 30D", "RSI 14",
-    "Fair Value", "Upside %", "Valuation Label", "Value Score", "Quality Score", "Momentum Score", "Opportunity Score", "Risk Score",
-    "Overall Score", "Error", "Recommendation", "Data Source", "Data Quality",
-    "Last Updated (UTC)", "Last Updated (Riyadh)",
-]
-
-# Backward alias (older name)
-ENRICHED_HEADERS_59 = ENRICHED_HEADERS_61
-
-FIELD_CATEGORIES = {
-    "identity": {"symbol", "name", "sector", "industry", "sub_sector", "market", "currency", "exchange"},
-    "price": {"current_price", "previous_close", "day_open", "day_high", "day_low", "volume", "vwap"},
-    "range": {"week_52_high", "week_52_low", "week_52_position_pct", "high_52w", "low_52w", "position_52w_pct"},
-    "fundamentals": {"market_cap", "pe_ttm", "forward_pe", "eps_ttm", "forward_eps", "pb", "ps", "beta", "dividend_yield"},
-    "technicals": {"rsi_14", "volatility_30d"},
-    "scores": {"quality_score", "value_score", "momentum_score", "risk_score", "overall_score", "opportunity_score"},
-}
-
-HeaderSpec = Tuple[Tuple[str, ...], Optional[Callable[[Any], Any]]]
-
-# ============================================================================
-# Small safety helpers
-# ============================================================================
-
+# =============================================================================
+# Safe helpers
+# =============================================================================
 def _safe_str(x: Any, max_len: int = 0) -> str:
     if x is None:
         return ""
@@ -237,17 +220,6 @@ def _now_riyadh_iso() -> str:
     return datetime.now(RIYADH_TZ).isoformat()
 
 
-def _to_iso(x: Any) -> Optional[str]:
-    if x is None:
-        return None
-    if isinstance(x, datetime):
-        return x.replace(tzinfo=timezone.utc).isoformat() if x.tzinfo is None else x.isoformat()
-    try:
-        return datetime.fromisoformat(str(x).replace("Z", "+00:00")).isoformat()
-    except Exception:
-        return _safe_str(x)
-
-
 def _to_riyadh_iso(dt: Any) -> Optional[str]:
     if dt is None:
         return None
@@ -289,25 +261,32 @@ def _normalize_recommendation(rec: Any) -> str:
 
 
 def _as_payload(obj: Any) -> Dict[str, Any]:
+    """
+    Convert engine return object -> plain dict (safe).
+    """
     if obj is None:
         return {}
     if isinstance(obj, dict):
         return jsonable_encoder(obj)
     if hasattr(obj, "model_dump") and callable(obj.model_dump):  # pydantic v2
         try:
-            return jsonable_encoder(obj.model_dump())
+            return jsonable_encoder(obj.model_dump(mode="python"))
         except Exception:
-            pass
+            try:
+                return jsonable_encoder(obj.model_dump())
+            except Exception:
+                pass
     if hasattr(obj, "dict") and callable(obj.dict):  # pydantic v1
         try:
             return jsonable_encoder(obj.dict())
         except Exception:
             pass
+    if hasattr(obj, "__dict__"):
+        try:
+            return jsonable_encoder(dict(obj.__dict__))
+        except Exception:
+            pass
     return jsonable_encoder({"value": _safe_str(obj)})
-
-
-def _unwrap_tuple(x: Any) -> Any:
-    return x[0] if isinstance(x, tuple) and len(x) >= 1 else x
 
 
 def _unwrap_container(x: Any) -> Any:
@@ -317,6 +296,10 @@ def _unwrap_container(x: Any) -> Any:
         if key in x and isinstance(x[key], (list, dict)):
             return x[key]
     return x
+
+
+def _unwrap_tuple(x: Any) -> Any:
+    return x[0] if isinstance(x, tuple) and len(x) >= 1 else x
 
 
 def _is_ksa_symbol(s: str) -> bool:
@@ -335,7 +318,7 @@ def _canonical_output_symbol(raw_symbol: str, payload: Dict[str, Any]) -> str:
     """
     Canonical output:
     - KSA codes => NNNN.SR
-    - GLOBAL plain tickers => keep as requested (AAPL stays AAPL)
+    - GLOBAL plain tickers => keep as requested
     - If user supplies explicit suffix (e.g., 7203.T) => keep normalized form
     """
     raw = _safe_str(raw_symbol).upper()
@@ -352,7 +335,6 @@ def _canonical_output_symbol(raw_symbol: str, payload: Dict[str, Any]) -> str:
             if code.isdigit():
                 return f"{code}.SR"
 
-    # Keep plain tickers as-is (AAPL stays AAPL)
     if "." not in raw:
         return raw
 
@@ -369,16 +351,33 @@ def _origin_from_symbol(symbol: str) -> str:
     return "GLOBAL_MARKETS"
 
 
-# -------------------------
-# Sheet-safe ratio helpers
-# -------------------------
+# =============================================================================
+# Percent normalization (Sheet-safe fractions)
+# =============================================================================
+_PERCENT_KEYS = {
+    "percent_change",
+    "change_pct",
+    "dividend_yield",
+    "payout_ratio",
+    "roe",
+    "roa",
+    "net_margin",
+    "ebitda_margin",
+    "revenue_growth",
+    "net_income_growth",
+    "free_float",
+    "turnover_percent",
+    "turnover_pct",
+    "week_52_position_pct",
+}
 
-def _percent_to_fraction(x: Any) -> Optional[float]:
+
+def _maybe_fraction(x: Any) -> Optional[float]:
     """
-    Converts percent-like to fraction for Google Sheets % format.
-    - "12%" -> 0.12
-    - 12    -> 0.12 (percent-points)
-    - 0.12  -> 0.12 (already fraction)
+    Convert percent-like numbers to fractions:
+      - "12%" -> 0.12
+      - 12 -> 0.12 (percent points)
+      - 0.12 -> 0.12 (already fraction)
     """
     if x is None:
         return None
@@ -419,363 +418,96 @@ def _compute_52w_position_fraction(price: Any, low_52w: Any, high_52w: Any) -> O
     return (p - lo) / (hi - lo)
 
 
-def _compute_turnover_fraction(volume: Any, shares_outstanding: Any) -> Optional[float]:
-    v = _safe_float(volume)
-    s = _safe_float(shares_outstanding)
-    if v is None or s is None or s == 0:
-        return None
-    return v / s
+def _finalize_row(raw_symbol: str, row: Dict[str, Any], *, engine_source: str = "") -> Dict[str, Any]:
+    """
+    Phase 4: Ensure canonical keys exist + derived values are filled if possible.
+    """
+    row = dict(row or {})
+    row["requested_symbol"] = raw_symbol
 
+    # canonicalize symbol
+    out_symbol = _canonical_output_symbol(raw_symbol, row)
+    if out_symbol:
+        row["symbol_normalized"] = out_symbol
+        row["symbol"] = out_symbol
+    else:
+        row.setdefault("symbol", _safe_str(raw_symbol).upper())
+        row.setdefault("symbol_normalized", row.get("symbol"))
 
-def _compute_value_traded(price: Any, volume: Any) -> Optional[float]:
-    p = _safe_float(price)
-    v = _safe_float(volume)
-    if p is None or v is None:
-        return None
-    return p * v
+    row.setdefault("origin", _origin_from_symbol(row.get("symbol") or ""))
 
+    # timestamps
+    row.setdefault("last_updated_utc", _now_utc_iso())
+    row.setdefault("last_updated_riyadh", _to_riyadh_iso(row.get("last_updated_utc")) or _now_riyadh_iso())
 
-def _compute_free_float_mcap(market_cap: Any, free_float_fraction_or_pct: Any) -> Optional[float]:
-    m = _safe_float(market_cap)
-    ff = _percent_to_fraction(free_float_fraction_or_pct)
-    if m is None or ff is None:
-        return None
-    ff = max(0.0, min(1.0, ff))
-    return m * ff
+    # provenance
+    if engine_source:
+        row.setdefault("engine_source", engine_source)
+        row.setdefault("data_source", engine_source)
 
+    # recommendation normalize
+    if "recommendation" in row:
+        row["recommendation"] = _normalize_recommendation(row.get("recommendation"))
 
-def _compute_liquidity_score(value_traded: Any) -> Optional[float]:
-    vt = _safe_float(value_traded)
-    if vt is None or vt <= 0:
-        return None
+    # canonical price sync
+    if row.get("current_price") is None and row.get("price") is not None:
+        row["current_price"] = row.get("price")
+    if row.get("price") is None and row.get("current_price") is not None:
+        row["price"] = row.get("current_price")
+
+    # change/percent_change (canonical) + aliases
+    if row.get("price_change") is None or row.get("percent_change") is None:
+        ch, pct = _compute_change(row.get("current_price"), row.get("previous_close"))
+        if row.get("price_change") is None and ch is not None:
+            row["price_change"] = ch
+        if row.get("percent_change") is None and pct is not None:
+            row["percent_change"] = pct
+
+    # aliases
+    if row.get("change") is None and row.get("price_change") is not None:
+        row["change"] = row.get("price_change")
+    if row.get("change_pct") is None and row.get("percent_change") is not None:
+        row["change_pct"] = row.get("percent_change")
+    if row.get("price_change") is None and row.get("change") is not None:
+        row["price_change"] = row.get("change")
+    if row.get("percent_change") is None and row.get("change_pct") is not None:
+        row["percent_change"] = row.get("change_pct")
+
+    # 52w position pct (fraction)
+    if row.get("week_52_position_pct") is None:
+        pos = _compute_52w_position_fraction(row.get("current_price"), row.get("week_52_low"), row.get("week_52_high"))
+        if pos is not None:
+            row["week_52_position_pct"] = pos
+
+    # percent fields -> fraction normalization
+    for k in list(_PERCENT_KEYS):
+        if k in row and row[k] is not None:
+            v = _maybe_fraction(row[k])
+            if v is not None:
+                row[k] = v
+
+    # basic data quality
+    if not row.get("data_quality"):
+        row["data_quality"] = "GOOD" if _safe_float(row.get("current_price")) is not None else "MISSING"
+
+    # containers
+    if row.get("data_sources") is None:
+        row["data_sources"] = []
+    if row.get("provider_latency") is None:
+        row["provider_latency"] = {}
+
+    # guarantee schema keys exist (Phase 4 requirement)
     try:
-        log_val = math.log10(vt)
-        score = ((log_val - 6.0) / (11.0 - 6.0)) * 100.0
-        return max(0.0, min(100.0, round(score, 2)))
+        row = _normalize_row_to_schema(None, row)
     except Exception:
-        return None
+        pass
+
+    return row
 
 
-def _compute_fair_value(payload: Dict[str, Any]) -> Tuple[Optional[float], Optional[float], Optional[str]]:
-    price = _safe_float(payload.get("current_price") or payload.get("price"))
-    if price is None or price <= 0:
-        return None, None, None
-
-    fair = (
-        _safe_float(payload.get("fair_value"))
-        or _safe_float(payload.get("target_price"))
-        or _safe_float(payload.get("forecast_price_3m"))
-        or _safe_float(payload.get("forecast_price_12m"))
-        or _safe_float(payload.get("ma200"))
-        or _safe_float(payload.get("ma50"))
-    )
-    if fair is None or fair <= 0:
-        return None, None, None
-
-    upside_fraction = (fair / price) - 1.0
-    label = (
-        "Undervalued" if upside_fraction >= 0.20 else
-        "Moderately Undervalued" if upside_fraction >= 0.10 else
-        "Fairly Valued" if upside_fraction >= -0.10 else
-        "Moderately Overvalued" if upside_fraction >= -0.20 else
-        "Overvalued"
-    )
-    return fair, upside_fraction, label
-
-
-def _compute_data_quality(payload: Dict[str, Any]) -> str:
-    if _safe_float(payload.get("current_price") or payload.get("price")) is None:
-        return "MISSING"
-    score, total = 0, 0
-    for _, fields in FIELD_CATEGORIES.items():
-        hits = sum(1 for f in fields if f in payload and payload[f] is not None)
-        tot = len(fields)
-        if tot > 0:
-            score += hits
-            total += tot
-    if total == 0:
-        return "POOR"
-    pct = (score / total) * 100.0
-    if pct >= 70:
-        return "EXCELLENT"
-    if pct >= 50:
-        return "GOOD"
-    if pct >= 30:
-        return "FAIR"
-    return "POOR"
-
-
-# ---------------------------------------------------------------------------
-# Header mapping (sheet-ready)
-# NOTE: For % columns, we output FRACTIONS (0..1)
-# ---------------------------------------------------------------------------
-_HEADER_MAP: Dict[str, HeaderSpec] = {
-    "rank": (("rank",), None),
-    "symbol": (("symbol", "symbol_normalized", "ticker", "code"), None),
-    "origin": (("origin", "market_region"), None),
-    "name": (("name", "company_name", "long_name"), None),
-    "sector": (("sector",), None),
-    "sub sector": (("sub_sector", "subsector", "industry"), None),
-    "market": (("market", "exchange", "primary_exchange"), None),
-
-    "currency": (("currency",), None),
-    "listing date": (("listing_date", "ipo_date", "ipo"), None),
-
-    "price": (("current_price", "last_price", "price", "close", "regular_market_price"), None),
-    "prev close": (("previous_close", "prev_close", "previousClose", "regular_market_previous_close"), None),
-
-    "change": (("change", "price_change", "regular_market_change"), None),
-    "change %": (("change_pct", "percent_change", "change_percent", "regular_market_change_percent"), _percent_to_fraction),
-
-    "day high": (("day_high", "high", "regular_market_day_high"), None),
-    "day low": (("day_low", "low", "regular_market_day_low"), None),
-
-    "52w high": (("high_52w", "week_52_high", "fifty_two_week_high", "year_high", "52w_high"), None),
-    "52w low": (("low_52w", "week_52_low", "fifty_two_week_low", "year_low", "52w_low"), None),
-    "52w position %": (("position_52w_pct", "week_52_position_pct", "position_52w"), _percent_to_fraction),
-
-    "volume": (("volume", "regular_market_volume"), None),
-    "avg vol 30d": (("avg_vol_30d", "avg_volume_30d", "average_volume", "average_daily_volume"), None),
-    "value traded": (("value_traded", "traded_value", "turnover_value"), None),
-
-    "turnover %": (("turnover_percent", "turnover_pct"), _percent_to_fraction),
-    "shares outstanding": (("shares_outstanding", "shares_out"), None),
-    "free float %": (("free_float", "free_float_percent"), _percent_to_fraction),
-
-    "market cap": (("market_cap", "market_capitalization"), None),
-    "free float mkt cap": (("free_float_market_cap", "free_float_mkt_cap"), None),
-
-    "liquidity score": (("liquidity_score",), None),
-
-    "eps (ttm)": (("eps_ttm", "trailing_eps", "earnings_per_share"), None),
-    "forward eps": (("forward_eps",), None),
-    "p/e (ttm)": (("pe_ttm", "trailing_pe", "price_to_earnings"), None),
-    "forward p/e": (("forward_pe",), None),
-    "p/b": (("pb", "price_to_book", "price_book"), None),
-    "p/s": (("ps", "price_to_sales", "price_sales"), None),
-    "ev/ebitda": (("ev_ebitda", "enterprise_value_to_ebitda"), None),
-
-    "dividend yield": (("dividend_yield",), _percent_to_fraction),
-    "dividend rate": (("dividend_rate",), None),
-    "payout ratio": (("payout_ratio",), _percent_to_fraction),
-
-    "beta": (("beta",), None),
-    "roe": (("roe", "return_on_equity"), _percent_to_fraction),
-    "roa": (("roa", "return_on_assets"), _percent_to_fraction),
-    "net margin": (("net_margin", "profit_margin"), _percent_to_fraction),
-    "ebitda margin": (("ebitda_margin",), _percent_to_fraction),
-    "revenue growth": (("revenue_growth",), _percent_to_fraction),
-    "net income growth": (("net_income_growth",), _percent_to_fraction),
-
-    "volatility 30d": (("volatility_30d", "vol_30d_ann"), _percent_to_fraction),
-    "rsi 14": (("rsi_14", "rsi14"), None),
-
-    "fair value": (("fair_value", "target_price", "forecast_price_3m", "forecast_price_12m"), None),
-    "upside %": (("upside_percent", "upside_pct"), _percent_to_fraction),
-    "valuation label": (("valuation_label",), None),
-
-    "value score": (("value_score",), None),
-    "quality score": (("quality_score",), None),
-    "momentum score": (("momentum_score",), None),
-    "opportunity score": (("opportunity_score",), None),
-    "risk score": (("risk_score",), None),
-    "overall score": (("overall_score", "composite_score"), None),
-
-    "error": (("error", "error_message", "error_detail", "engine_error"), None),
-    "recommendation": (("recommendation",), None),
-    "data source": (("data_source", "source", "provider", "engine_source"), None),
-    "data quality": (("data_quality",), None),
-
-    "last updated (utc)": (("last_updated_utc", "as_of_utc", "timestamp_utc"), _to_iso),
-    "last updated (riyadh)": (("last_updated_riyadh",), _to_iso),
-}
-
-# ============================================================================
-# EnrichedQuote object
-# ============================================================================
-
-class EnrichedQuote:
-    __slots__ = ("payload", "_computed")
-
-    def __init__(self, payload: Dict[str, Any]):
-        self.payload = payload or {}
-        self._computed: Dict[str, Any] = {}
-
-    @classmethod
-    def from_unified(cls, unified: Any) -> "EnrichedQuote":
-        payload = _as_payload(_unwrap_tuple(_unwrap_container(unified)))
-
-        requested = payload.get("requested_symbol") or payload.get("symbol") or ""
-        output_symbol = _canonical_output_symbol(str(requested), payload)
-        if output_symbol:
-            payload["symbol_normalized"] = output_symbol
-            payload["symbol"] = output_symbol
-
-        if "recommendation" in payload:
-            payload["recommendation"] = _normalize_recommendation(payload["recommendation"])
-
-        payload.setdefault("origin", _origin_from_symbol(payload.get("symbol", "")))
-        payload.setdefault("last_updated_utc", _now_utc_iso())
-        payload.setdefault("last_updated_riyadh", _to_riyadh_iso(payload["last_updated_utc"]))
-        payload.setdefault("data_quality", _compute_data_quality(payload))
-        return cls(payload)
-
-    def _get_first(self, fields: Tuple[str, ...]) -> Any:
-        for f in fields:
-            if f in self.payload and self.payload[f] is not None:
-                return self.payload[f]
-        return None
-
-    def _get_price(self) -> Any:
-        return self._get_first(_HEADER_MAP["price"][0])
-
-    def _get_prev_close(self) -> Any:
-        return self._get_first(_HEADER_MAP["prev close"][0])
-
-    def _get_52w_high(self) -> Any:
-        return self._get_first(_HEADER_MAP["52w high"][0])
-
-    def _get_52w_low(self) -> Any:
-        return self._get_first(_HEADER_MAP["52w low"][0])
-
-    def _get_value(self, header: str) -> Any:
-        h = header.strip().lower()
-        if h in self._computed:
-            return self._computed[h]
-
-        spec = _HEADER_MAP.get(h)
-        if not spec:
-            return self.payload.get(h)
-
-        fields, transform = spec
-
-        if h == "origin":
-            val = self._get_first(fields)
-            return val if val is not None else _origin_from_symbol(self.payload.get("symbol", ""))
-
-        # -------------------------
-        # Sheet-safe computed fields
-        # -------------------------
-        if h in ("change", "change %"):
-            ch, pct_frac = _compute_change(self._get_price(), self._get_prev_close())
-
-            if h == "change":
-                val = self._get_first(fields)
-                v = val if val is not None else ch
-                self._computed[h] = v
-                return v
-
-            if pct_frac is not None:
-                self._computed[h] = pct_frac
-                return pct_frac
-
-            # fallback: percent-like provided
-            val = self._get_first(fields)
-            v = transform(val) if (transform and val is not None) else val
-            self._computed[h] = v
-            return v
-
-        if h == "52w position %":
-            pos_frac = _compute_52w_position_fraction(self._get_price(), self._get_52w_low(), self._get_52w_high())
-            if pos_frac is not None:
-                self._computed[h] = pos_frac
-                return pos_frac
-
-            val = self._get_first(fields)
-            v = transform(val) if (transform and val is not None) else val
-            self._computed[h] = v
-            return v
-
-        if h == "turnover %":
-            turn_frac = _compute_turnover_fraction(self.payload.get("volume"), self.payload.get("shares_outstanding"))
-            if turn_frac is not None:
-                self._computed[h] = turn_frac
-                return turn_frac
-
-            val = self._get_first(fields)
-            v = transform(val) if (transform and val is not None) else val
-            self._computed[h] = v
-            return v
-
-        if h == "value traded":
-            val = self._get_first(fields)
-            if val is not None:
-                return val
-            vt = _compute_value_traded(self._get_price(), self.payload.get("volume"))
-            if vt is not None:
-                self.payload["value_traded"] = vt
-            self._computed[h] = vt
-            return vt
-
-        if h == "free float mkt cap":
-            val = self._get_first(fields)
-            if val is not None:
-                return val
-            ffmc = _compute_free_float_mcap(self.payload.get("market_cap"), self.payload.get("free_float"))
-            self._computed[h] = ffmc
-            return ffmc
-
-        if h == "liquidity score":
-            val = self._get_first(fields)
-            if val is not None:
-                return val
-            if self.payload.get("value_traded") is None:
-                self.payload["value_traded"] = _compute_value_traded(self._get_price(), self.payload.get("volume"))
-            ls = _compute_liquidity_score(self.payload.get("value_traded"))
-            self._computed[h] = ls
-            return ls
-
-        if h in ("fair value", "upside %", "valuation label"):
-            fair, upside_frac, label = _compute_fair_value(self.payload)
-            if h == "fair value":
-                v = self._get_first(fields)
-                return v if v is not None else fair
-            if h == "upside %":
-                if upside_frac is not None:
-                    self._computed[h] = upside_frac
-                    return upside_frac
-                v = self._get_first(fields)
-                v2 = transform(v) if (transform and v is not None) else v
-                self._computed[h] = v2
-                return v2
-            if h == "valuation label":
-                v = self._get_first(fields)
-                return v if v is not None else label
-
-        if h == "recommendation":
-            return _normalize_recommendation(self.payload.get("recommendation"))
-
-        if h == "data quality":
-            return self.payload.get("data_quality") or _compute_data_quality(self.payload)
-
-        if h == "last updated (riyadh)":
-            val = self._get_first(fields)
-            if val is not None:
-                return transform(val) if transform else val
-            return _to_riyadh_iso(self.payload.get("last_updated_utc"))
-
-        # Default
-        val = self._get_first(fields)
-        if transform and val is not None:
-            try:
-                return transform(val)
-            except Exception:
-                return val
-        return val
-
-    def to_row(self, headers: Sequence[str]) -> List[Any]:
-        # Sheets: prefer "" over null
-        row: List[Any] = []
-        for h in headers:
-            v = self._get_value(h)
-            row.append("" if v is None else v)
-        return row
-
-
-# ============================================================================
+# =============================================================================
 # Engine calling (lazy + signature-safe kwargs)
-# ============================================================================
-
+# =============================================================================
 class EngineCall:
     __slots__ = ("result", "source", "error", "latency_ms")
 
@@ -793,9 +525,6 @@ async def _maybe_await(v: Any) -> Any:
 
 
 def _filter_kwargs_for_callable(fn: Callable, kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Pass only kwargs the function accepts (prevents TypeError and improves compatibility).
-    """
     if not kwargs:
         return {}
     try:
@@ -819,7 +548,6 @@ async def _get_or_init_engine(request: Request) -> Tuple[Optional[Any], str, Opt
     Returns (engine, source, error).
     Caches engine in request.app.state.engine.
     """
-    # already set
     try:
         engine = getattr(request.app.state, "engine", None)
         if engine is not None:
@@ -841,7 +569,6 @@ async def _get_or_init_engine(request: Request) -> Tuple[Optional[Any], str, Opt
 
         last_err = None
 
-        # core.data_engine_v2.get_engine
         try:
             from core.data_engine_v2 import get_engine  # type: ignore
 
@@ -855,31 +582,16 @@ async def _get_or_init_engine(request: Request) -> Tuple[Optional[Any], str, Opt
         except Exception as e:
             last_err = repr(e)
 
-        # alt layout
         try:
-            from data_engine_v2 import get_engine as get_engine2  # type: ignore
+            from core.data_engine import get_engine as get_engine_legacy  # type: ignore
 
-            eng2 = get_engine2()
+            eng2 = get_engine_legacy()
             engine2 = await eng2 if inspect.isawaitable(eng2) else eng2
             try:
                 request.app.state.engine = engine2
             except Exception:
                 pass
-            return engine2, "data_engine_v2.get_engine", None
-        except Exception as e:
-            last_err = f"{last_err} | alt:{repr(e)}"
-
-        # legacy
-        try:
-            from core.data_engine import get_engine as get_engine_legacy  # type: ignore
-
-            eng3 = get_engine_legacy()
-            engine3 = await eng3 if inspect.isawaitable(eng3) else eng3
-            try:
-                request.app.state.engine = engine3
-            except Exception:
-                pass
-            return engine3, "core.data_engine.get_engine", None
+            return engine2, "core.data_engine.get_engine", None
         except Exception as e:
             last_err = f"{last_err} | legacy:{repr(e)}"
 
@@ -887,16 +599,17 @@ async def _get_or_init_engine(request: Request) -> Tuple[Optional[Any], str, Opt
         return None, "engine_init_failed", last_err
 
 
-# Try more method names for maximum compatibility
+# Prefer dict-returning methods if present
 _ENGINE_SINGLE_METHODS = (
+    "get_enriched_quote_dict",
     "get_enriched_quote",
     "get_quote",
     "quote",
     "fetch_quote",
-    "get_enriched_quote_patch",
 )
 
 _ENGINE_BATCH_METHODS = (
+    "get_enriched_quotes_batch",
     "get_enriched_quotes",
     "get_quotes",
     "quotes",
@@ -904,13 +617,16 @@ _ENGINE_BATCH_METHODS = (
 )
 
 
-async def _call_engine(request: Request, symbol: str, *, include_raw: bool = False, provider: Optional[str] = None) -> EngineCall:
+async def _call_engine(request: Request, symbol: str, *, schema: Any = None) -> EngineCall:
     start = time.time()
     engine, src, err = await _get_or_init_engine(request)
     if engine is None:
         return EngineCall(error="No engine available", source=src, latency_ms=(time.time() - start) * 1000)
 
-    call_kwargs = {"include_raw": include_raw, "provider": provider}
+    # Phase 4: encourage schema normalization inside engine if accepted
+    call_kwargs = {"schema": schema}
+
+    last_err = None
     for method in _ENGINE_SINGLE_METHODS:
         fn = getattr(engine, method, None)
         if callable(fn):
@@ -920,24 +636,20 @@ async def _call_engine(request: Request, symbol: str, *, include_raw: bool = Fal
                 res = _unwrap_container(_unwrap_tuple(res))
                 return EngineCall(result=res, source=f"{src}.{method}", latency_ms=(time.time() - start) * 1000)
             except Exception as e:
-                err = repr(e)
+                last_err = repr(e)
 
-    return EngineCall(error=err or "engine_call_failed", source=src, latency_ms=(time.time() - start) * 1000)
+    return EngineCall(error=last_err or err or "engine_call_failed", source=src, latency_ms=(time.time() - start) * 1000)
 
 
-async def _call_engine_batch(
-    request: Request,
-    symbols: List[str],
-    *,
-    include_raw: bool = False,
-    provider: Optional[str] = None,
-) -> EngineCall:
+async def _call_engine_batch(request: Request, symbols: List[str], *, schema: Any = None) -> EngineCall:
     start = time.time()
     engine, src, err = await _get_or_init_engine(request)
     if engine is None:
-        return EngineCall(error="No batch engine available", source=src, latency_ms=(time.time() - start) * 1000)
+        return EngineCall(error="No engine available", source=src, latency_ms=(time.time() - start) * 1000)
 
-    call_kwargs = {"include_raw": include_raw, "provider": provider}
+    call_kwargs = {"schema": schema}
+
+    last_err = None
     for method in _ENGINE_BATCH_METHODS:
         fn = getattr(engine, method, None)
         if callable(fn):
@@ -948,17 +660,15 @@ async def _call_engine_batch(
                 if isinstance(res, (list, dict)):
                     return EngineCall(result=res, source=f"{src}.{method}", latency_ms=(time.time() - start) * 1000)
             except Exception as e:
-                err = repr(e)
+                last_err = repr(e)
 
-    return EngineCall(error=err or "engine_batch_call_failed", source=src, latency_ms=(time.time() - start) * 1000)
+    return EngineCall(error=last_err or err or "engine_batch_call_failed", source=src, latency_ms=(time.time() - start) * 1000)
 
 
-# ============================================================================
-# Auth
-# ============================================================================
-
+# =============================================================================
+# Auth (align with core.config when available)
+# =============================================================================
 def _is_authorized(request: Request) -> bool:
-    # Open mode shortcut
     try:
         from core.config import is_open_mode  # type: ignore
 
@@ -967,7 +677,6 @@ def _is_authorized(request: Request) -> bool:
     except Exception:
         pass
 
-    # Collect token candidates
     token = (
         request.headers.get("X-APP-TOKEN")
         or request.headers.get("X-App-Token")
@@ -977,67 +686,85 @@ def _is_authorized(request: Request) -> bool:
     )
     authz = request.headers.get("Authorization")
 
-    if not token and not authz:
-        return False
-
-    # Use core.config.auth_ok when available
+    # If auth_ok exists, use it
     try:
         from core.config import auth_ok  # type: ignore
 
         if callable(auth_ok):
             return bool(auth_ok(token=token, authorization=authz, headers=dict(request.headers)))
     except Exception:
-        # If REQUIRE_AUTH explicitly true and auth_ok missing => deny
-        req = str(os.getenv("REQUIRE_AUTH", "")).strip().lower() in _TRUTHY
-        return not req
+        pass
 
-    # If we couldn't validate properly, deny by default
-    return False
+    # Fallback behavior:
+    # - If REQUIRE_AUTH is truthy -> deny when no auth_ok exists
+    require_auth = str(os.getenv("REQUIRE_AUTH", "")).strip().lower() in _TRUTHY
+    if require_auth:
+        return False
+    # open by default if not explicitly required
+    return True
 
 
-# ============================================================================
-# Request parsing helpers
-# ============================================================================
-
-def _get_symbols_from_request(request: Request, symbols_param: str, tickers_param: str) -> List[str]:
-    values: List[str] = []
-    for param in ("symbols", "tickers", "symbol"):
-        try:
-            values.extend(request.query_params.getlist(param))
-        except Exception:
-            pass
-    if symbols_param:
-        values.append(symbols_param)
-    if tickers_param:
-        values.append(tickers_param)
-
-    out: List[str] = []
-    for v in values:
-        out.extend(_split_symbols(v))
-
+# =============================================================================
+# Headers endpoints (schema introspection)
+# =============================================================================
+def _schema_union_keys() -> List[str]:
+    keys: List[str] = []
     seen: Set[str] = set()
-    dedup: List[str] = []
-    for s in out:
-        s = s.strip()
-        if not s:
-            continue
-        if s in seen:
-            continue
-        seen.add(s)
-        dedup.append(s)
-    return dedup
+    if isinstance(SCHEMA_REGISTRY, dict):
+        for _, spec in SCHEMA_REGISTRY.items():
+            cols = getattr(spec, "columns", None) or []
+            for c in cols:
+                k = getattr(c, "key", None)
+                if not k:
+                    continue
+                if k not in seen:
+                    seen.add(k)
+                    keys.append(k)
+    # minimal must-haves
+    for k in ("symbol", "current_price", "previous_close", "price_change", "percent_change", "data_quality", "last_updated_utc", "last_updated_riyadh"):
+        if k not in seen:
+            keys.append(k)
+    return keys
 
 
-def _get_concurrency_config() -> Dict[str, Any]:
-    concurrency = max(1, min(50, _safe_int(os.getenv("ENRICHED_CONCURRENCY", 10), 10) or 10))
-    timeout = max(3.0, min(90.0, _safe_float(os.getenv("ENRICHED_TIMEOUT_SEC", 30.0), 30.0) or 30.0))
-    return {"concurrency": concurrency, "timeout_sec": timeout}
+@router.get("/headers", include_in_schema=False)
+async def get_headers():
+    return BestJSONResponse(
+        status_code=200,
+        content={
+            "status": "success",
+            "schema_union_keys": _schema_union_keys(),
+            "schema_available": bool(_SCHEMA_AVAILABLE),
+            "version": ROUTER_VERSION,
+            "timestamp_utc": _now_utc_iso(),
+        },
+    )
 
 
-# ============================================================================
-# Response builders
-# ============================================================================
+@router.get("/health", include_in_schema=False)
+async def health_check(request: Request):
+    info: Dict[str, Any] = {
+        "status": "ok",
+        "module": "enriched_quote",
+        "version": ROUTER_VERSION,
+        "timestamp_utc": _now_utc_iso(),
+        "engine_cached": bool(getattr(getattr(request, "app", None), "state", None) and getattr(request.app.state, "engine", None) is not None),
+        "schema_available": bool(_SCHEMA_AVAILABLE),
+        "engine_schema_normalizer_available": bool(_HAS_ENGINE_SCHEMA_NORMALIZER),
+    }
+    try:
+        from core.config import config_health_check  # type: ignore
 
+        if callable(config_health_check):
+            info["config"] = config_health_check()
+    except Exception:
+        pass
+    return info
+
+
+# =============================================================================
+# Quote endpoints
+# =============================================================================
 def _build_error_response(
     request_id: str,
     error: str,
@@ -1063,107 +790,8 @@ def _build_error_response(
     if engine_error:
         content["engine_error"] = engine_error
     if debug and trace:
-        content["traceback"] = _safe_str(trace, 8000)
+        content["traceback"] = _safe_str(trace, 12000)
     return BestJSONResponse(status_code=status_code, content=content)
-
-
-def _build_sheet_response(items: List[Dict[str, Any]], request_id: str) -> BestJSONResponse:
-    rows = [EnrichedQuote.from_unified(item).to_row(ENRICHED_HEADERS_61) for item in items]
-    return BestJSONResponse(
-        status_code=200,
-        content={
-            "status": "success",
-            "format": "sheet",
-            "headers": ENRICHED_HEADERS_61,
-            "rows": rows,
-            "count": len(rows),
-            "request_id": request_id,
-            "timestamp_utc": _now_utc_iso(),
-        },
-    )
-
-
-def _build_items_response(items: List[Dict[str, Any]], request_id: str) -> BestJSONResponse:
-    # Provide explicit errors list as well (helps Apps Script)
-    errors: List[Dict[str, str]] = []
-    for it in items:
-        if it.get("error"):
-            errors.append({"symbol": _safe_str(it.get("requested_symbol") or it.get("symbol") or ""), "error": _safe_str(it.get("error"))})
-    return BestJSONResponse(
-        status_code=200,
-        content={
-            "status": "success",
-            "count": len(items),
-            "items": items,
-            "errors": errors,
-            "request_id": request_id,
-            "timestamp_utc": _now_utc_iso(),
-        },
-    )
-
-
-def _canonicalize_payload(raw_symbol: str, payload: Dict[str, Any], engine_source: str) -> Dict[str, Any]:
-    payload = payload or {}
-    raw = (raw_symbol or "").strip()
-    payload["requested_symbol"] = raw
-
-    out_symbol = _canonical_output_symbol(raw, payload)
-    if out_symbol:
-        payload["symbol_normalized"] = out_symbol
-        payload["symbol"] = out_symbol
-
-    payload.setdefault("engine_source", engine_source)
-    payload.setdefault("data_source", engine_source)  # keep older field expected by sheets
-    payload.setdefault("last_updated_utc", _now_utc_iso())
-    payload.setdefault("last_updated_riyadh", _to_riyadh_iso(payload["last_updated_utc"]))
-    payload.setdefault("origin", _origin_from_symbol(payload.get("symbol", "")))
-
-    if "recommendation" in payload:
-        payload["recommendation"] = _normalize_recommendation(payload.get("recommendation"))
-
-    if not payload.get("data_quality"):
-        payload["data_quality"] = _compute_data_quality(payload)
-
-    return payload
-
-
-# ============================================================================
-# Routes
-# ============================================================================
-
-@router.get("/headers", include_in_schema=False)
-async def get_headers():
-    return BestJSONResponse(
-        status_code=200,
-        content={
-            "status": "success",
-            "headers": ENRICHED_HEADERS_61,
-            "version": ROUTER_VERSION,
-            "timestamp_utc": _now_utc_iso(),
-        },
-    )
-
-
-@router.get("/health", include_in_schema=False)
-async def health_check(request: Request):
-    """
-    Health includes config health if available + engine cached state.
-    """
-    info: Dict[str, Any] = {
-        "status": "ok",
-        "module": "enriched_quote",
-        "version": ROUTER_VERSION,
-        "timestamp_utc": _now_utc_iso(),
-        "engine_cached": bool(getattr(getattr(request, "app", None), "state", None) and getattr(request.app.state, "engine", None) is not None),
-    }
-    try:
-        from core.config import config_health_check  # type: ignore
-
-        if callable(config_health_check):
-            info["config"] = config_health_check()
-    except Exception:
-        pass
-    return info
 
 
 @router.get("/quote")
@@ -1171,15 +799,17 @@ async def get_enriched_quote(
     request: Request,
     symbol: str = Query("", description="Ticker symbol (AAPL, 1120.SR, ^GSPC, GC=F)"),
     debug: bool = Query(False, description="Include debug information"),
-    include_rows: bool = Query(False, description="Include sheet-ready row"),
-    include_headers: bool = Query(False, description="Include headers in response (sheet mode)"),
-    include_raw: bool = Query(False, description="Ask engine/provider to include raw payload if supported"),
-    provider: Optional[str] = Query(None, description="Optional provider override if engine supports it"),
+    wrap: bool = Query(True, description="Keep wrapper fields (status/data/request_id)."),
 ):
-    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4())[:8])
+    """
+    Returns schema-aligned row dict for one symbol.
+    - By default returns wrapper + row at top level:
+        { status, request_id, data: <row>, <row keys...> }
+    """
+    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4())[:12])
     dbg = _is_truthy(os.getenv("DEBUG_ERRORS", "0")) or debug
 
-    with tracer.start_as_current_span("router_get_quote") as span:
+    with tracer.start_as_current_span("router_enriched_quote") as span:
         span.set_attribute("symbol", symbol)
 
         if not _is_authorized(request):
@@ -1193,7 +823,7 @@ async def get_enriched_quote(
 
         start_time = time.time()
         try:
-            call = await _call_engine(request, raw, include_raw=include_raw, provider=provider)
+            call = await _call_engine(request, raw, schema=None)
             if call.error or call.result is None:
                 router_requests_total.labels(endpoint="quote", status="no_data").inc()
                 return _build_error_response(
@@ -1207,36 +837,25 @@ async def get_enriched_quote(
                 )
 
             payload = _as_payload(call.result)
-            payload = _canonicalize_payload(raw, payload, call.source)
+            row = _finalize_row(raw, payload, engine_source=call.source)
 
             router_requests_total.labels(endpoint="quote", status="success").inc()
             router_request_duration.labels(endpoint="quote").observe(time.time() - start_time)
 
-            if include_rows:
-                q = EnrichedQuote.from_unified(payload)
-                row = q.to_row(ENRICHED_HEADERS_61)
-                return BestJSONResponse(
-                    status_code=200,
-                    content={
-                        "status": "success",
-                        "format": "sheet",
-                        "headers": ENRICHED_HEADERS_61 if include_headers else [],
-                        "rows": [row],
-                        "count": 1,
-                        "request_id": request_id,
-                        "timestamp_utc": _now_utc_iso(),
-                    },
-                )
-
-            return BestJSONResponse(
-                status_code=200,
-                content={
+            # Backward compatible wrapper + flat row keys
+            if wrap:
+                out: Dict[str, Any] = {
                     "status": "success",
-                    "data": payload,
                     "request_id": request_id,
                     "timestamp_utc": _now_utc_iso(),
-                },
-            )
+                    "engine_source": call.source,
+                    "data": row,
+                }
+                out.update(row)
+                return BestJSONResponse(status_code=200, content=out)
+
+            # Flat only
+            return BestJSONResponse(status_code=200, content=row)
 
         except Exception as e:
             router_requests_total.labels(endpoint="quote", status="error").inc()
@@ -1255,18 +874,16 @@ async def get_enriched_quotes(
     request: Request,
     symbols: str = Query("", description="Comma/space separated symbols"),
     tickers: str = Query("", description="Alias for symbols"),
-    format: str = Query("items", description="Output format: items | sheet"),
+    format: str = Query("items", description="items | dict"),
     debug: bool = Query(False, description="Include debug information"),
-    include_raw: bool = Query(False, description="Ask engine/provider to include raw payload if supported"),
-    provider: Optional[str] = Query(None, description="Optional provider override if engine supports it"),
+    wrap: bool = Query(True, description="Keep wrapper fields (status/items/request_id)."),
 ):
     return await _quotes_impl(
         request=request,
-        symbols=_get_symbols_from_request(request, symbols, tickers),
+        symbols=_dedup_symbols(_split_symbols(symbols) + _split_symbols(tickers)),
         fmt=(format or "").strip().lower(),
         debug=debug,
-        include_raw=include_raw,
-        provider=provider,
+        wrap=wrap,
     )
 
 
@@ -1279,45 +896,44 @@ async def post_enriched_quotes(
     JSON body supported:
       {
         "symbols": ["AAPL","MSFT"],
-        "format": "items" | "sheet",
-        "include_raw": true|false,
-        "provider": "eodhd" (optional),
-        "debug": true|false
+        "format": "items" | "dict",
+        "debug": true|false,
+        "wrap": true|false
       }
     """
     symbols_in = body.get("symbols") or body.get("tickers") or body.get("symbol") or []
     fmt = str(body.get("format") or "items").strip().lower()
-    include_raw = bool(body.get("include_raw") or False)
-    provider = body.get("provider")
     debug = bool(body.get("debug") or False)
+    wrap = bool(body.get("wrap") if body.get("wrap") is not None else True)
 
-    # Normalize symbol inputs
     raw_list: List[str] = []
     if isinstance(symbols_in, str):
         raw_list = _split_symbols(symbols_in)
     elif isinstance(symbols_in, list):
-        raw_list = []
         for x in symbols_in:
             raw_list.extend(_split_symbols(str(x)))
-    else:
-        raw_list = []
-
-    # Dedup
-    seen: Set[str] = set()
-    symbols_list: List[str] = []
-    for s in raw_list:
-        if s and s not in seen:
-            seen.add(s)
-            symbols_list.append(s)
 
     return await _quotes_impl(
         request=request,
-        symbols=symbols_list,
+        symbols=_dedup_symbols(raw_list),
         fmt=fmt,
         debug=debug,
-        include_raw=include_raw,
-        provider=provider if isinstance(provider, str) and provider.strip() else None,
+        wrap=wrap,
     )
+
+
+def _dedup_symbols(symbols: List[str]) -> List[str]:
+    seen: Set[str] = set()
+    out: List[str] = []
+    for s in symbols:
+        s = (s or "").strip()
+        if not s:
+            continue
+        if s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
 
 
 async def _quotes_impl(
@@ -1326,98 +942,96 @@ async def _quotes_impl(
     symbols: List[str],
     fmt: str,
     debug: bool,
-    include_raw: bool,
-    provider: Optional[str],
+    wrap: bool,
 ):
-    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4())[:8])
+    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4())[:12])
     dbg = _is_truthy(os.getenv("DEBUG_ERRORS", "0")) or debug
 
-    with tracer.start_as_current_span("router_get_quotes") as span:
+    with tracer.start_as_current_span("router_enriched_quotes") as span:
         if not _is_authorized(request):
             router_requests_total.labels(endpoint="quotes", status="unauthorized").inc()
             return _build_error_response(request_id=request_id, error="unauthorized", status_code=401)
 
-        raw_list = symbols
-        if not raw_list:
+        if not symbols:
             router_requests_total.labels(endpoint="quotes", status="empty_symbols_list").inc()
             return _build_error_response(request_id=request_id, error="empty_symbols_list")
 
-        span.set_attribute("symbol_count", len(raw_list))
+        span.set_attribute("symbol_count", len(symbols))
         start_time = time.time()
 
         try:
-            call = await _call_engine_batch(request, raw_list, include_raw=include_raw, provider=provider)
+            call = await _call_engine_batch(request, symbols, schema=None)
 
-            items: List[Dict[str, Any]] = []
-            got: Set[str] = set()
+            # Normalize batch result into a dict mapping requested_symbol -> row
+            rows_by_requested: Dict[str, Dict[str, Any]] = {}
 
             if call.result is not None and not call.error:
-                if isinstance(call.result, list):
-                    # Best-effort: align by order if engine returned same length, else per-item canonicalization
-                    if len(call.result) == len(raw_list):
-                        for raw, res in zip(raw_list, call.result):
-                            payload = _as_payload(res)
-                            payload = _canonicalize_payload(raw, payload, call.source)
-                            items.append(payload)
-                            got.add(raw)
-                    else:
-                        for res in call.result:
-                            payload = _as_payload(res)
-                            raw = payload.get("requested_symbol") or payload.get("symbol") or payload.get("symbol_normalized") or ""
-                            raw = _safe_str(raw)
-                            payload = _canonicalize_payload(raw, payload, call.source)
-                            items.append(payload)
-                            got.add(raw)
-
-                elif isinstance(call.result, dict):
-                    # Build lookup by canonical output symbol
-                    lookup: Dict[str, Dict[str, Any]] = {}
+                if isinstance(call.result, dict):
+                    # engine may return dict keyed by input symbol or normalized symbol
                     for k, v in call.result.items():
-                        p = _as_payload(v)
-                        sym = p.get("requested_symbol") or p.get("symbol_normalized") or p.get("symbol") or p.get("normalized_symbol") or k
-                        key = _canonical_output_symbol(str(sym), p)
-                        if key:
-                            lookup[key] = p
+                        payload = _as_payload(v)
+                        # prefer requested_symbol, else key
+                        raw = _safe_str(payload.get("requested_symbol") or k)
+                        rows_by_requested[raw] = _finalize_row(raw, payload, engine_source=call.source)
 
-                    for raw in raw_list:
-                        key = _canonical_output_symbol(raw, {})
-                        payload = lookup.get(key)
-                        if payload is None:
-                            payload = {"error": "no_data", "data_quality": "MISSING"}
-                        payload = _canonicalize_payload(raw, payload, call.source)
-                        items.append(payload)
-                        got.add(raw)
+                elif isinstance(call.result, list):
+                    # best-effort align by order
+                    for raw, v in zip(symbols, call.result):
+                        payload = _as_payload(v)
+                        rows_by_requested[raw] = _finalize_row(raw, payload, engine_source=call.source)
 
-            # Fallback per-symbol for those missing / not returned
-            missing = [r for r in raw_list if r not in got]
+            # Fill missing with per-symbol calls (robust)
+            missing = [s for s in symbols if s not in rows_by_requested]
             if missing:
-                cfg = _get_concurrency_config()
-                sem = asyncio.Semaphore(cfg["concurrency"])
+                cfg_conc = max(1, min(50, _safe_int(os.getenv("ENRICHED_CONCURRENCY", 10), 10) or 10))
+                cfg_timeout = max(3.0, min(90.0, _safe_float(os.getenv("ENRICHED_TIMEOUT_SEC", 30.0), 30.0) or 30.0))
+                sem = asyncio.Semaphore(cfg_conc)
 
                 async def _fetch_one(raw: str) -> Dict[str, Any]:
                     async with sem:
                         try:
-                            single = await asyncio.wait_for(
-                                _call_engine(request, raw, include_raw=include_raw, provider=provider),
-                                timeout=cfg["timeout_sec"],
-                            )
+                            single = await asyncio.wait_for(_call_engine(request, raw, schema=None), timeout=cfg_timeout)
                             if single.result is not None and not single.error:
                                 payload = _as_payload(single.result)
-                                return _canonicalize_payload(raw, payload, single.source)
-                            return _canonicalize_payload(raw, {"error": single.error or "no_data", "data_quality": "MISSING"}, single.source)
+                                return _finalize_row(raw, payload, engine_source=single.source)
+                            # error row
+                            return _finalize_row(raw, {"error": single.error or "no_data", "data_quality": "MISSING"}, engine_source=single.source)
                         except asyncio.TimeoutError:
-                            return _canonicalize_payload(raw, {"error": "timeout", "data_quality": "MISSING"}, "timeout")
+                            return _finalize_row(raw, {"error": "timeout", "data_quality": "MISSING"}, engine_source="timeout")
                         except Exception as e:
-                            return _canonicalize_payload(raw, {"error": f"exception:{e.__class__.__name__}", "data_quality": "MISSING"}, "exception")
+                            return _finalize_row(raw, {"error": f"exception:{e.__class__.__name__}", "data_quality": "MISSING"}, engine_source="exception")
 
-                items.extend(await asyncio.gather(*[_fetch_one(r) for r in missing]))
+                fetched = await asyncio.gather(*[_fetch_one(s) for s in missing])
+                for raw, row in zip(missing, fetched):
+                    rows_by_requested[raw] = row
+
+            # Output shape
+            items: List[Dict[str, Any]] = [rows_by_requested[s] for s in symbols if s in rows_by_requested]
+            out_obj: Union[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]
+            if fmt == "dict":
+                out_obj = {s: rows_by_requested.get(s) for s in symbols}
+            else:
+                out_obj = items
 
             router_requests_total.labels(endpoint="quotes", status="success").inc()
             router_request_duration.labels(endpoint="quotes").observe(time.time() - start_time)
 
-            if fmt == "sheet":
-                return _build_sheet_response(items, request_id)
-            return _build_items_response(items, request_id)
+            if wrap:
+                return BestJSONResponse(
+                    status_code=200,
+                    content={
+                        "status": "success",
+                        "request_id": request_id,
+                        "timestamp_utc": _now_utc_iso(),
+                        "engine_source": call.source,
+                        "count": len(items),
+                        "items": out_obj if fmt != "dict" else None,
+                        "dict": out_obj if fmt == "dict" else None,
+                    },
+                )
+
+            # flat only (no wrapper)
+            return BestJSONResponse(status_code=200, content=out_obj)
 
         except Exception as e:
             router_requests_total.labels(endpoint="quotes", status="error").inc()
@@ -1430,19 +1044,14 @@ async def _quotes_impl(
             )
 
 
-# ============================================================================
+# =============================================================================
 # Mount helpers (optional)
-# ============================================================================
-
+# =============================================================================
 def get_router() -> APIRouter:
     return router
 
 
 def mount(app: Any) -> None:
-    """
-    Optional helper for mount plans that call module.mount(app).
-    Safe: does nothing if app is invalid.
-    """
     try:
         if app is not None and hasattr(app, "include_router"):
             app.include_router(router)
@@ -1454,8 +1063,5 @@ __all__ = [
     "router",
     "get_router",
     "mount",
-    "EnrichedQuote",
-    "ENRICHED_HEADERS_61",
-    "ENRICHED_HEADERS_59",
     "__version__",
 ]
