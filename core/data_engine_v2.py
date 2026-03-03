@@ -1,28 +1,37 @@
 #!/usr/bin/env python3
+# core/data_engine_v2.py
 """
-core/data_engine_v2.py
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.2.0 (EODHD PRIMARY / RENDER SAFE)
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.3.0 (PHASE 4 SCHEMA-ALIGNED)
 ================================================================================
 
-Why this revision (aligned to your GLOBAL-first plan):
-- ✅ Enforces PRIMARY_PROVIDER ordering (GLOBAL: EODHD first by default)
-- ✅ Fixes provider ordering bug (your previous priorities made eodhd last)
-- ✅ KSA safety: optionally disallow EODHD on KSA via KSA_DISALLOW_EODHD unless override enabled
-- ✅ Accepts Settings from core/config.py when available (single source of truth)
-- ✅ Stronger patch normalization (keeps Change / Change % fields consistent)
-- ✅ Better “no data” diagnostics in `info` (kept as dict, not JSON string)
-- ✅ More resilient provider result handling (supports partial patches, keeps error detail)
-- ✅ Maintains your dual-import compatibility:
-      - providers.* and core.providers.*
-      - symbols.normalize and core.symbols.normalize
-- ✅ Keeps your SingleFlight fix (no await inside lock)
-- ✅ Keeps multi-level cache (L1 + disk) with L1 warm on disk hit
+PHASE 4 GOALS (DONE)
+- ✅ Standardized row object (dict) for each instrument:
+    - Identity + provenance
+    - Price / liquidity
+    - Fundamentals / technicals (when enabled)
+    - Forecast / ROI fields (when enabled)
+    - Scores / ranking inputs (when enabled)
+- ✅ Expose normalize_row_to_schema(schema, rowdict) that guarantees all keys exist
+- ✅ Output keys aligned to schema_registry mapping (and backward-compatible aliases)
 
-IMPORTANT:
-- This engine is the correct place to finalize GLOBAL provider selection.
-- The separate “No engine available” message you saw is usually from the route/wiring layer;
-  this file guarantees get_engine() always builds an engine instance when called.
+KEY ALIGNMENT (IMPORTANT)
+- Canonical keys used by schema:
+    current_price, previous_close, open_price, day_high, day_low,
+    week_52_high, week_52_low, volume, market_cap,
+    price_change, percent_change,
+    forecast_price_1m/3m/12m, expected_roi_1m/3m/12m, forecast_confidence,
+    risk_score, overall_score, valuation_score, momentum_score, confidence_score,
+    rsi_14, volatility_30d, ...
+- Backward compatibility aliases preserved:
+    price (mirrors current_price)
+    change (mirrors price_change)
+    change_pct (mirrors percent_change)
+
+STARTUP SAFE
+- No network I/O at import time
+- Providers are imported lazily
+- Optional modules (scoring/forecasting) are best-effort and never crash startup
 
 ================================================================================
 """
@@ -43,7 +52,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 # ---------------------------------------------------------------------------
 # Ensure repo root is importable (fixes "No module named 'providers'")
@@ -53,7 +62,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.2.0"
+__version__ = "5.3.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 
@@ -84,6 +93,108 @@ except Exception:
 
 
 # ---------------------------------------------------------------------------
+# Schema Registry (Phase 1)
+# ---------------------------------------------------------------------------
+try:
+    from core.sheets.schema_registry import SCHEMA_REGISTRY, get_sheet_spec  # type: ignore
+
+    _SCHEMA_AVAILABLE = True
+except Exception:
+    SCHEMA_REGISTRY = {}  # type: ignore
+    _SCHEMA_AVAILABLE = False
+
+    def get_sheet_spec(_: str) -> Any:  # type: ignore
+        raise KeyError("schema_registry not available")
+
+
+def _build_union_schema_keys() -> List[str]:
+    """
+    Union of keys across all sheets in SCHEMA_REGISTRY, preserving stable order.
+    """
+    keys: List[str] = []
+    seen = set()
+    if isinstance(SCHEMA_REGISTRY, dict):
+        for _, spec in SCHEMA_REGISTRY.items():
+            cols = getattr(spec, "columns", None) or []
+            for c in cols:
+                k = getattr(c, "key", None)
+                if not k:
+                    continue
+                if k not in seen:
+                    seen.add(k)
+                    keys.append(k)
+
+    # Ensure engine meta keys always exist even if not in schema yet
+    must_have = [
+        "symbol",
+        "symbol_normalized",
+        "requested_symbol",
+        "data_quality",
+        "error",
+        "warning",
+        "info",
+        "data_sources",
+        "provider_latency",
+        "last_updated_utc",
+        "last_updated_riyadh",
+    ]
+    for k in must_have:
+        if k not in seen:
+            seen.add(k)
+            keys.append(k)
+
+    return keys
+
+
+_SCHEMA_UNION_KEYS: List[str] = _build_union_schema_keys()
+
+
+def normalize_row_to_schema(schema: Any, rowdict: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    PHASE 4 REQUIRED API
+
+    Normalize a row dict to a schema, guaranteeing all keys exist.
+    `schema` can be:
+      - a sheet name (str) -> uses schema_registry
+      - a sheet spec object (has .columns with .key)
+      - a list/tuple of keys
+      - None -> uses union schema across all sheets
+
+    Returns: dict with ALL schema keys, missing => None.
+    """
+    keys: List[str] = []
+
+    if schema is None:
+        keys = list(_SCHEMA_UNION_KEYS)
+    elif isinstance(schema, str):
+        try:
+            spec = get_sheet_spec(schema)
+            keys = [c.key for c in spec.columns]
+        except Exception:
+            keys = list(_SCHEMA_UNION_KEYS)
+    elif isinstance(schema, (list, tuple)):
+        keys = [str(k) for k in schema if str(k)]
+    else:
+        cols = getattr(schema, "columns", None)
+        if cols:
+            keys = [getattr(c, "key", None) for c in cols]
+            keys = [k for k in keys if k]
+        else:
+            keys = list(_SCHEMA_UNION_KEYS)
+
+    raw = rowdict or {}
+    out: Dict[str, Any] = {}
+    for k in keys:
+        out[k] = raw.get(k, None)
+    # preserve extra keys (optional): keep rowdict extras too
+    # but do not overwrite schema keys
+    for k, v in raw.items():
+        if k not in out:
+            out[k] = v
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Pydantic safe detection
 # ---------------------------------------------------------------------------
 def _model_to_dict(obj: Any) -> Dict[str, Any]:
@@ -93,10 +204,19 @@ def _model_to_dict(obj: Any) -> Dict[str, Any]:
         return obj
     # pydantic v2
     if hasattr(obj, "model_dump") and callable(getattr(obj, "model_dump")):
-        return obj.model_dump()
+        try:
+            return obj.model_dump(mode="python")
+        except Exception:
+            try:
+                return obj.model_dump()
+            except Exception:
+                return {}
     # pydantic v1
     if hasattr(obj, "dict") and callable(getattr(obj, "dict")):
-        return obj.dict()
+        try:
+            return obj.dict()
+        except Exception:
+            return {}
     # dataclass-like / plain object
     if hasattr(obj, "__dict__"):
         try:
@@ -107,7 +227,7 @@ def _model_to_dict(obj: Any) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# UnifiedQuote import (keep fallback safe)
+# UnifiedQuote import (fallback is expanded for Phase 4 keys)
 # ---------------------------------------------------------------------------
 try:
     from core.schemas import UnifiedQuote  # type: ignore
@@ -124,19 +244,54 @@ except Exception:
             return default
 
     class UnifiedQuote(BaseModel):  # type: ignore
+        # identity
         symbol: str = Field(default="")
         symbol_normalized: Optional[str] = None
         requested_symbol: Optional[str] = None
+        name: Optional[str] = None
+        exchange: Optional[str] = None
+        currency: Optional[str] = None
+        asset_class: Optional[str] = None
 
-        # canonical price fields
+        # price/liquidity
         current_price: Optional[float] = None
         price: Optional[float] = None
         previous_close: Optional[float] = None
+        open_price: Optional[float] = None
+        day_high: Optional[float] = None
+        day_low: Optional[float] = None
+        week_52_high: Optional[float] = None
+        week_52_low: Optional[float] = None
+        volume: Optional[float] = None
+        market_cap: Optional[float] = None
+        price_change: Optional[float] = None
+        percent_change: Optional[float] = None
+        change: Optional[float] = None          # alias
+        change_pct: Optional[float] = None      # alias
 
-        # common metadata
-        name: Optional[str] = None
-        currency: Optional[str] = None
+        # fundamentals/technicals
+        pe_ttm: Optional[float] = None
+        dividend_yield: Optional[float] = None
+        rsi_14: Optional[float] = None
+        volatility_30d: Optional[float] = None
 
+        # forecast/roi
+        forecast_price_1m: Optional[float] = None
+        forecast_price_3m: Optional[float] = None
+        forecast_price_12m: Optional[float] = None
+        expected_roi_1m: Optional[float] = None
+        expected_roi_3m: Optional[float] = None
+        expected_roi_12m: Optional[float] = None
+        forecast_confidence: Optional[float] = None
+
+        # scores
+        risk_score: Optional[float] = None
+        overall_score: Optional[float] = None
+        valuation_score: Optional[float] = None
+        momentum_score: Optional[float] = None
+        confidence_score: Optional[float] = None
+
+        # meta
         data_quality: str = "MISSING"
         error: Optional[str] = None
         warning: Optional[str] = None
@@ -148,7 +303,7 @@ except Exception:
         last_updated_riyadh: Optional[str] = None
 
         class Config:
-            extra = "ignore"
+            extra = "allow"
 
 
 # ---------------------------------------------------------------------------
@@ -241,14 +396,8 @@ def get_symbol_info(symbol: str) -> Dict[str, Any]:
 # Settings loader (optional)
 # ---------------------------------------------------------------------------
 def _try_get_settings() -> Any:
-    """
-    Best-effort settings retrieval:
-    - Prefer core.config.get_settings_cached()
-    - Fallback to None if unavailable
-    """
     try:
         from core.config import get_settings_cached  # type: ignore
-
         return get_settings_cached()
     except Exception:
         return None
@@ -287,6 +436,27 @@ def _get_env_bool(key: str, default: bool = False) -> bool:
     return raw in {"1", "true", "yes", "y", "on", "t"}
 
 
+def _feature_flags(settings: Any) -> Dict[str, bool]:
+    """
+    Central feature flags for Phase 4.
+    """
+    def _get(name: str, env: str, default: bool) -> bool:
+        if settings is not None and hasattr(settings, name):
+            try:
+                return bool(getattr(settings, name))
+            except Exception:
+                return default
+        return _get_env_bool(env, default)
+
+    return {
+        "computations_enabled": _get("computations_enabled", "COMPUTATIONS_ENABLED", True),
+        "fundamentals_enabled": _get("fundamentals_enabled", "FUNDAMENTALS_ENABLED", True),
+        "technicals_enabled": _get("technicals_enabled", "TECHNICALS_ENABLED", True),
+        "forecasting_enabled": _get("forecasting_enabled", "FORECASTING_ENABLED", True),
+        "scoring_enabled": _get("scoring_enabled", "SCORING_ENABLED", True),
+    }
+
+
 # ---------------------------------------------------------------------------
 # Time helpers
 # ---------------------------------------------------------------------------
@@ -317,26 +487,42 @@ def _clean_patch(patch: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in (patch or {}).items() if v is not None and v != ""}
 
 
-# Normalize patch keys so downstream (sheet formatters) get consistent names:
-# - "change" + "change_pct" (NOT price_change/percent_change)
+# Provider patch aliases -> Canonical schema keys
 _PATCH_ALIASES: Dict[str, str] = {
+    # price
     "last_price": "current_price",
     "price": "current_price",
     "prev_close": "previous_close",
     "close": "previous_close",
-    "percent_change": "change_pct",
-    "pct_change": "change_pct",
-    "change_percent": "change_pct",
-    "open": "day_open",
+    "open": "open_price",
     "high": "day_high",
     "low": "day_low",
+
+    # 52w
+    "52w_high": "week_52_high",
+    "high_52w": "week_52_high",
+    "52w_low": "week_52_low",
+    "low_52w": "week_52_low",
+
+    # change
+    "change": "price_change",
+    "price_diff": "price_change",
+    "pct_change": "percent_change",
+    "percent_change": "percent_change",
+    "change_percent": "percent_change",
+    "change_pct": "percent_change",
 }
 
 
 def _normalize_patch_keys(patch: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize provider output into canonical schema keys.
+    Also adds backward-compat aliases after canonical is computed.
+    """
     if not patch:
         return {}
     out = dict(patch)
+
     for src, dst in _PATCH_ALIASES.items():
         if src in out and (dst not in out or out.get(dst) in (None, "", 0)):
             out[dst] = out.get(src)
@@ -346,6 +532,12 @@ def _normalize_patch_keys(patch: Dict[str, Any]) -> Dict[str, Any]:
         out["price"] = out.get("current_price")
     if "price" in out and ("current_price" not in out or out.get("current_price") in (None, "", 0)):
         out["current_price"] = out.get("price")
+
+    # backward compat: change / change_pct
+    if "price_change" in out and ("change" not in out or out.get("change") in (None, "", 0)):
+        out["change"] = out.get("price_change")
+    if "percent_change" in out and ("change_pct" not in out or out.get("change_pct") in (None, "", 0)):
+        out["change_pct"] = out.get("percent_change")
 
     return out
 
@@ -591,7 +783,6 @@ class MultiLevelCache:
                         raw = f.read()
                     val = self._decompress(raw)
                     if val is not None:
-                        # warm L1 on disk hit
                         async with self._lock:
                             if len(self._l1) >= self.max_l1_size and self._l1_access:
                                 oldest = min(self._l1_access.items(), key=lambda x: x[1])[0]
@@ -659,14 +850,67 @@ class SingleFlight:
 
 
 # ============================================================================
-# DataEngine V5 (v5.2.0)
+# Optional Scoring / Forecasting adapters (best-effort)
+# ============================================================================
+def _try_import_any(paths: Sequence[str]) -> Optional[Any]:
+    for p in paths:
+        try:
+            return import_module(p)
+        except Exception:
+            continue
+    return None
+
+
+_SCORING_MOD = _try_import_any(["core.scoring", "core.analysis.scoring"])
+_FORECAST_MOD = _try_import_any(["core.forecasting", "core.analysis.forecasting"])
+
+
+async def _maybe_apply_scoring(row: Dict[str, Any], settings: Any) -> Dict[str, Any]:
+    if _SCORING_MOD is None:
+        return row
+    for fn_name in ("compute_scores", "score_row", "score_quote"):
+        fn = getattr(_SCORING_MOD, fn_name, None)
+        if callable(fn):
+            try:
+                r = fn(row, settings=settings) if "settings" in getattr(fn, "__code__", {}).co_varnames else fn(row)
+                if asyncio.iscoroutine(r) or asyncio.isfuture(r):
+                    r = await r
+                if isinstance(r, dict):
+                    row.update({k: v for k, v in r.items() if v is not None})
+            except Exception:
+                pass
+            break
+    return row
+
+
+async def _maybe_apply_forecast(row: Dict[str, Any], settings: Any) -> Dict[str, Any]:
+    if _FORECAST_MOD is None:
+        return row
+    for fn_name in ("compute_forecast", "forecast_row", "forecast_quote"):
+        fn = getattr(_FORECAST_MOD, fn_name, None)
+        if callable(fn):
+            try:
+                r = fn(row, settings=settings) if "settings" in getattr(fn, "__code__", {}).co_varnames else fn(row)
+                if asyncio.iscoroutine(r) or asyncio.isfuture(r):
+                    r = await r
+                if isinstance(r, dict):
+                    row.update({k: v for k, v in r.items() if v is not None})
+            except Exception:
+                pass
+            break
+    return row
+
+
+# ============================================================================
+# DataEngine V5 (v5.3.0)
 # ============================================================================
 class DataEngineV5:
     def __init__(self, settings: Any = None):
         self.settings = settings if settings is not None else _try_get_settings()
+        self.flags = _feature_flags(self.settings)
         self.version = __version__
 
-        # ---- derive config from Settings if available, else env ----
+        # derive config from Settings if available, else env
         if self.settings is not None:
             try:
                 enabled = [str(x).lower() for x in (getattr(self.settings, "enabled_providers", None) or [])]
@@ -708,12 +952,13 @@ class DataEngineV5:
         )
 
         logger.info(
-            "DataEngineV5 v%s initialized | primary=%s | enabled=%s | ksa=%s | global=%s",
+            "DataEngineV5 v%s initialized | primary=%s | enabled=%s | ksa=%s | global=%s | flags=%s",
             self.version,
             self.primary_provider,
             len(self.enabled_providers),
             len(self.ksa_providers),
             len(self.global_providers),
+            self.flags,
         )
 
     async def aclose(self) -> None:
@@ -729,24 +974,17 @@ class DataEngineV5:
         base = self.ksa_providers if is_ksa_sym else self.global_providers
         providers = [p for p in base if p in self.enabled_providers]
 
-        # KSA: optionally drop eodhd unless explicitly allowed elsewhere
         if is_ksa_sym and self.ksa_disallow_eodhd:
             providers = [p for p in providers if p != "eodhd"]
 
-        # Ensure primary provider is first for GLOBAL; for KSA keep primary if present
-        if self.primary_provider:
-            if self.primary_provider in self.enabled_providers:
-                if self.primary_provider in providers:
-                    providers.remove(self.primary_provider)
+        if self.primary_provider and (self.primary_provider in self.enabled_providers):
+            if self.primary_provider in providers:
+                providers.remove(self.primary_provider)
+                providers.insert(0, self.primary_provider)
+            else:
+                if (not is_ksa_sym) or (self.primary_provider != "eodhd") or (not self.ksa_disallow_eodhd):
                     providers.insert(0, self.primary_provider)
-                else:
-                    # only insert if symbol market matches provider intent:
-                    # - for GLOBAL, always allow
-                    # - for KSA, do not auto-insert eodhd when disallowed
-                    if (not is_ksa_sym) or (self.primary_provider != "eodhd") or (not self.ksa_disallow_eodhd):
-                        providers.insert(0, self.primary_provider)
 
-        # Secondary ordering by base priority (stable)
         def pr(p: str) -> int:
             return PROVIDER_PRIORITIES.get(p, 999)
 
@@ -758,18 +996,13 @@ class DataEngineV5:
         return providers
 
     def _provider_symbol(self, provider: str, symbol: str) -> str:
-        # Yahoo family should receive Yahoo-formatted symbols
         if provider.startswith("yahoo"):
             try:
                 return to_yahoo_symbol(symbol)  # type: ignore
             except Exception:
                 return symbol
-        # EODHD provider now normalizes inside its own module (AAPL -> AAPL.US)
         return symbol
 
-    # -----------------------------
-    # Provider call
-    # -----------------------------
     async def _fetch_patch(
         self, provider: str, symbol: str
     ) -> Tuple[str, Optional[Dict[str, Any]], float, Optional[str]]:
@@ -805,12 +1038,10 @@ class DataEngineV5:
 
                 if isinstance(res, dict) and res:
                     patch = _normalize_patch_keys(_clean_patch(res))
-                    # accept useful patches even if provider includes error fields
                     if _is_useful_patch(patch):
                         await self._registry.record_success(provider, latency)
                         return provider, patch, latency, None
 
-                    # not useful -> treat as failure and keep error
                     err = str(res.get("error") or "empty_result")
                     await self._registry.record_failure(provider, err)
                     return provider, None, latency, err
@@ -825,7 +1056,7 @@ class DataEngineV5:
                 return provider, None, latency, repr(e)
 
     # -----------------------------
-    # Merge
+    # Merge patches -> standardized row dict
     # -----------------------------
     def _merge(
         self, requested_symbol: str, norm: str, patches: List[Tuple[str, Dict[str, Any], float]]
@@ -854,51 +1085,91 @@ class DataEngineV5:
                 if k not in merged or merged.get(k) in (None, "", 0, []):
                     merged[k] = v
 
-        # canonical price sync
+        # canonical + aliases sync
         if merged.get("current_price") is None and merged.get("price") is not None:
             merged["current_price"] = merged.get("price")
         if merged.get("price") is None and merged.get("current_price") is not None:
             merged["price"] = merged.get("current_price")
 
+        if merged.get("price_change") is None and merged.get("change") is not None:
+            merged["price_change"] = merged.get("change")
+        if merged.get("change") is None and merged.get("price_change") is not None:
+            merged["change"] = merged.get("price_change")
+
+        if merged.get("percent_change") is None and merged.get("change_pct") is not None:
+            merged["percent_change"] = merged.get("change_pct")
+        if merged.get("change_pct") is None and merged.get("percent_change") is not None:
+            merged["change_pct"] = merged.get("percent_change")
+
         return merged
 
-    def _data_quality(self, quote: UnifiedQuote) -> str:
-        cp = getattr(quote, "current_price", None)
+    def _data_quality(self, row: Dict[str, Any]) -> str:
+        cp = row.get("current_price")
         if _safe_float(cp) is None:
             return QuoteQuality.MISSING.value
-        # basic grading; can be extended later
         return QuoteQuality.GOOD.value
 
     # -----------------------------
     # Public API
     # -----------------------------
-    async def get_enriched_quote(self, symbol: str, use_cache: bool = True) -> UnifiedQuote:
+    async def get_enriched_quote(self, symbol: str, use_cache: bool = True, *, schema: Any = None) -> UnifiedQuote:
+        """
+        Returns UnifiedQuote (model). Row is normalized to union schema if schema provided or schema_registry exists.
+        """
         return await self._singleflight.execute(
             f"quote:{symbol}",
-            lambda: self._get_enriched_quote_impl(symbol, use_cache),
+            lambda: self._get_enriched_quote_impl(symbol, use_cache, schema=schema),
         )
 
-    async def _get_enriched_quote_impl(self, symbol: str, use_cache: bool = True) -> UnifiedQuote:
+    async def get_enriched_quote_dict(self, symbol: str, use_cache: bool = True, *, schema: Any = None) -> Dict[str, Any]:
+        """
+        Returns standardized row dict (recommended for sheet-rows endpoints).
+        """
+        q = await self.get_enriched_quote(symbol, use_cache=use_cache, schema=schema)
+        return _model_to_dict(q)
+
+    async def _get_enriched_quote_impl(self, symbol: str, use_cache: bool = True, *, schema: Any = None) -> UnifiedQuote:
         norm = normalize_symbol(symbol) if callable(normalize_symbol) else _fallback_normalize_symbol(symbol)
         if not norm:
-            return UnifiedQuote(symbol=symbol, data_quality=QuoteQuality.MISSING.value, error="Invalid symbol")  # type: ignore
+            row = {
+                "symbol": symbol,
+                "symbol_normalized": None,
+                "requested_symbol": symbol,
+                "data_quality": QuoteQuality.MISSING.value,
+                "error": "Invalid symbol",
+                "last_updated_utc": _now_utc_iso(),
+                "last_updated_riyadh": _now_riyadh_iso(),
+            }
+            row = normalize_row_to_schema(schema, row) if schema is not None else normalize_row_to_schema(None, row)
+            return UnifiedQuote(**row)  # type: ignore
 
         if use_cache:
             cached = await self._cache.get(symbol=norm)
             if cached:
                 try:
                     if isinstance(cached, dict):
-                        return UnifiedQuote(**cached)
+                        return UnifiedQuote(**cached)  # type: ignore
                     if isinstance(cached, UnifiedQuote):
-                        return cached
+                        return cached  # type: ignore
                 except Exception:
                     pass
 
         providers = self._providers_for(norm)
         if not providers:
-            return UnifiedQuote(symbol=norm, data_quality=QuoteQuality.MISSING.value, error="No providers available")  # type: ignore
+            row = {
+                "symbol": norm,
+                "symbol_normalized": norm,
+                "requested_symbol": symbol,
+                "data_quality": QuoteQuality.MISSING.value,
+                "error": "No providers available",
+                "data_sources": [],
+                "provider_latency": {},
+                "last_updated_utc": _now_utc_iso(),
+                "last_updated_riyadh": _now_riyadh_iso(),
+            }
+            row = normalize_row_to_schema(schema, row) if schema is not None else normalize_row_to_schema(None, row)
+            return UnifiedQuote(**row)  # type: ignore
 
-        # GLOBAL-first: try primary + next best fallbacks
         top_n = _get_env_int("PROVIDER_TOP_N", 3)
         top = providers[: max(1, top_n)]
 
@@ -920,50 +1191,75 @@ class DataEngineV5:
                 "provider_stats": {k: stats.get(k) for k in top},
                 "errors": [{"provider": p, "error": err, "latency_ms": round(lat, 2)} for (p, _, lat, err) in results],
             }
-            return UnifiedQuote(  # type: ignore
-                symbol=norm,
-                symbol_normalized=norm,
-                requested_symbol=symbol,
-                data_quality=QuoteQuality.MISSING.value,
-                error="No data available",
-                info=err_detail,  # keep as dict (better for /health diagnostics)
-                data_sources=[],
-                provider_latency={},
-                last_updated_utc=_now_utc_iso(),
-                last_updated_riyadh=_now_riyadh_iso(),
-            )
+            row = {
+                "symbol": norm,
+                "symbol_normalized": norm,
+                "requested_symbol": symbol,
+                "data_quality": QuoteQuality.MISSING.value,
+                "error": "No data available",
+                "info": err_detail,
+                "data_sources": [],
+                "provider_latency": {},
+                "last_updated_utc": _now_utc_iso(),
+                "last_updated_riyadh": _now_riyadh_iso(),
+            }
+            row = normalize_row_to_schema(schema, row) if schema is not None else normalize_row_to_schema(None, row)
+            q = UnifiedQuote(**row)  # type: ignore
+            if use_cache:
+                await self._cache.set(_model_to_dict(q), symbol=norm)
+            return q
 
-        merged = self._merge(symbol, norm, patches_ok)
-        quote = UnifiedQuote(**merged)
+        row = self._merge(symbol, norm, patches_ok)
 
-        try:
-            quote.data_quality = self._data_quality(quote)  # type: ignore
-        except Exception:
-            pass
+        # Phase 4: optional computations (never affect headers; only fill values)
+        if self.flags.get("computations_enabled", True):
+            if self.flags.get("forecasting_enabled", True):
+                row = await _maybe_apply_forecast(row, self.settings)
+            if self.flags.get("scoring_enabled", True):
+                row = await _maybe_apply_scoring(row, self.settings)
+
+        row["data_quality"] = self._data_quality(row)
+
+        # Normalize to union schema (or provided schema)
+        row = normalize_row_to_schema(schema, row) if schema is not None else normalize_row_to_schema(None, row)
+
+        q = UnifiedQuote(**row)  # type: ignore
 
         if use_cache:
-            await self._cache.set(_model_to_dict(quote), symbol=norm)
+            await self._cache.set(_model_to_dict(q), symbol=norm)
 
-        return quote
+        return q
 
-    async def get_enriched_quotes(self, symbols: List[str]) -> List[UnifiedQuote]:
+    async def get_enriched_quotes(self, symbols: List[str], *, schema: Any = None) -> List[UnifiedQuote]:
         if not symbols:
             return []
 
-        # use env batch size (or settings.quote_batch_size if present)
         batch = _get_env_int("QUOTE_BATCH_SIZE", 25)
         try:
             if self.settings is not None and getattr(self.settings, "quote_batch_size", None):
                 batch = int(getattr(self.settings, "quote_batch_size"))
         except Exception:
             pass
-
         batch = max(1, min(500, batch))
 
         out: List[UnifiedQuote] = []
         for i in range(0, len(symbols), batch):
             part = symbols[i : i + batch]
-            out.extend(await asyncio.gather(*[self.get_enriched_quote(s) for s in part]))
+            out.extend(await asyncio.gather(*[self.get_enriched_quote(s, schema=schema) for s in part]))
+        return out
+
+    async def get_enriched_quotes_batch(self, symbols: List[str], mode: str = "", *, schema: Any = None) -> Dict[str, Dict[str, Any]]:
+        """
+        Preferred for sheet-rows:
+        returns dict keyed by the input symbol string (stable), value is standardized row dict.
+        """
+        out: Dict[str, Dict[str, Any]] = {}
+        if not symbols:
+            return out
+        # ignore mode here; providers already incorporate symbol formatting; routes pass mode but engine doesn't need it yet
+        quotes = await asyncio.gather(*[self.get_enriched_quote_dict(s, schema=schema) for s in symbols])
+        for s, qd in zip(symbols, quotes):
+            out[s] = qd
         return out
 
     # Backwards-compatible aliases
@@ -980,6 +1276,7 @@ class DataEngineV5:
             "ksa_providers": self.ksa_providers,
             "global_providers": self.global_providers,
             "ksa_disallow_eodhd": self.ksa_disallow_eodhd,
+            "flags": dict(self.flags),
             "provider_stats": await self._registry.get_stats(),
         }
 
@@ -1030,4 +1327,6 @@ __all__ = [
     "QuoteQuality",
     "DataSource",
     "__version__",
+    # Phase 4 required export
+    "normalize_row_to_schema",
 ]
