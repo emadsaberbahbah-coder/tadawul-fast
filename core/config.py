@@ -2,24 +2,22 @@
 # core/config.py
 """
 ================================================================================
-Core Configuration Module — v5.4.0 (RENDER-SAFE / STARTUP-SAFE / GLOBAL-FIRST)
+Core Configuration Module — v5.5.0 (RENDER-SAFE / STARTUP-SAFE / SCHEMA-AWARE)
 ================================================================================
 TADAWUL FAST BRIDGE – Enterprise Configuration Management
 
-Primary goal of this revision:
+Primary goals:
 - ✅ Avoid deploy/startup failures (NO network calls, NO heavy init at import-time)
-- ✅ Keep configuration surface complete and explicit (GLOBAL-first, EODHD primary)
 - ✅ Defensive env parsing + safe optional dependencies
 - ✅ Google credentials normalization (JSON / base64 / file path)
 - ✅ Distributed config sources are LAZY and opt-in (won’t block Render port binding)
-
-What changed vs v5.3.0 you pasted:
-- ✅ IMPORTANT: Distributed config sources no longer connect at import-time
-  (Consul/ETCD/ZooKeeper clients are created only when `reload_settings()` is called)
-- ✅ Added explicit DISTRIBUTED_CONFIG_ENABLED flag (default: off unless host vars present)
-- ✅ Settings cache TTL configurable (CORE_SETTINGS_CACHE_TTL)
-- ✅ More defensive auth defaults (never throws, validation is non-fatal unless you call it)
-- ✅ Safer URL normalization + masking utilities kept
+- ✅ NEW (Phase 1 alignment):
+     - Allowed pages come from core/sheets/page_catalog.py (aliases + KSA_Tadawul removed)
+     - Schema awareness via core/sheets/schema_registry.py (sheet headers are canonical)
+     - CRITICAL RULE:
+         Headers/columns MUST ALWAYS exist even if computations are disabled.
+         Values can be empty/null, but columns must exist.
+       (This module exposes flags to enforce this across endpoints and sheet writers.)
 
 Safe-by-default philosophy:
 - Importing this module must NEVER crash, NEVER hang, NEVER do network I/O.
@@ -46,7 +44,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Un
 # =============================================================================
 # Version
 # =============================================================================
-__version__ = "5.4.0"
+__version__ = "5.5.0"
 CONFIG_VERSION = __version__
 CONFIG_BUILD_TIMESTAMP = datetime.now(timezone.utc).isoformat()
 
@@ -145,6 +143,75 @@ try:
 except Exception:
     KazooClient = None  # type: ignore
     _ZOOKEEPER_AVAILABLE = False
+
+# =============================================================================
+# Schema / Pages (Phase 1) — OPTIONAL IMPORTS (never crash)
+# =============================================================================
+_HAS_SCHEMA = False
+_SCHEMA_VERSION = None
+_CANONICAL_PAGES_FALLBACK = [
+    "Market_Leaders",
+    "Global_Markets",
+    "Commodities_FX",
+    "Mutual_Funds",
+    "My_Portfolio",
+    "Insights_Analysis",
+    "Top_10_Investments",
+    "Data_Dictionary",
+]
+_TOP10_FEED_PAGES_FALLBACK = [
+    "Market_Leaders",
+    "Global_Markets",
+    "Commodities_FX",
+    "Mutual_Funds",
+    "My_Portfolio",
+]
+_FORBIDDEN_PAGES_FALLBACK = {"KSA_Tadawul", "Advisor_Criteria"}
+
+try:
+    from core.sheets.schema_registry import SCHEMA_VERSION as _SRV, SCHEMA_REGISTRY as _SREG  # type: ignore
+    from core.sheets.page_catalog import (  # type: ignore
+        CANONICAL_PAGES as _CP,
+        TOP10_FEED_PAGES_DEFAULT as _T10,
+        FORBIDDEN_PAGES as _FP,
+        normalize_page_name as _normalize_page_name,
+        get_top10_feed_pages as _get_top10_feed_pages,
+    )
+
+    _HAS_SCHEMA = True
+    _SCHEMA_VERSION = _SRV
+    _CANONICAL_PAGES_FALLBACK = list(_CP)
+    _TOP10_FEED_PAGES_FALLBACK = list(_T10)
+    _FORBIDDEN_PAGES_FALLBACK = set(_FP)
+except Exception:
+    _SREG = {}  # type: ignore
+
+    def _normalize_page_name(page: str, *, allow_output_pages: bool = True) -> str:  # type: ignore
+        # Minimal fallback: accept only known canonical list, forbid legacy.
+        p = (page or "").strip()
+        if not p:
+            raise ValueError("Page name is empty.")
+        if p in _FORBIDDEN_PAGES_FALLBACK:
+            raise ValueError(f"Page '{p}' is forbidden/removed.")
+        if p in _CANONICAL_PAGES_FALLBACK:
+            if not allow_output_pages and p in {"Top_10_Investments", "Data_Dictionary"}:
+                raise ValueError(f"Page '{p}' is output/meta and not allowed for this operation.")
+            return p
+        raise ValueError(f"Unknown page '{p}'. Allowed: {', '.join(sorted(_CANONICAL_PAGES_FALLBACK))}")
+
+    def _get_top10_feed_pages(pages_override: Optional[List[str]] = None) -> List[str]:  # type: ignore
+        base = pages_override or list(_TOP10_FEED_PAGES_FALLBACK)
+        out: List[str] = []
+        seen = set()
+        for p in base:
+            try:
+                cp = _normalize_page_name(p, allow_output_pages=False)
+            except Exception:
+                continue
+            if cp not in seen:
+                seen.add(cp)
+                out.append(cp)
+        return out
 
 # =============================================================================
 # Debug logging helper (never throws)
@@ -705,6 +772,47 @@ def normalize_google_credentials() -> Tuple[Optional[str], Optional[Dict[str, An
 
 
 # =============================================================================
+# Page + Schema helpers (used by routes/sync; import-safe)
+# =============================================================================
+def canonical_pages() -> List[str]:
+    """Returns the canonical set of pages accepted by the backend."""
+    return list(_CANONICAL_PAGES_FALLBACK)
+
+
+def forbidden_pages() -> Set[str]:
+    """Legacy/removed pages (must never be created/written)."""
+    return set(_FORBIDDEN_PAGES_FALLBACK)
+
+
+def normalize_page(page: str, *, allow_output_pages: bool = True) -> str:
+    """Normalize any alias to canonical page name (KSA_Tadawul forbidden)."""
+    return _normalize_page_name(page, allow_output_pages=allow_output_pages)  # type: ignore
+
+
+def top10_feed_pages_default() -> List[str]:
+    """Default eligible pages feeding Top_10_Investments selection universe."""
+    return _get_top10_feed_pages(None)  # type: ignore
+
+
+def schema_known(sheet: str) -> bool:
+    try:
+        return sheet in _SREG  # type: ignore
+    except Exception:
+        return False
+
+
+def schema_headers(sheet: str) -> List[str]:
+    """Returns canonical headers for a sheet if schema_registry is available, else []."""
+    try:
+        spec = _SREG.get(sheet)  # type: ignore
+        if not spec:
+            return []
+        return [c.header for c in spec.columns]
+    except Exception:
+        return []
+
+
+# =============================================================================
 # Settings (core)
 # =============================================================================
 @dataclass(frozen=True)
@@ -712,6 +820,26 @@ class Settings:
     # Meta
     config_version: str = CONFIG_VERSION
     build_timestamp: str = CONFIG_BUILD_TIMESTAMP
+
+    # Schema
+    schema_enabled: bool = True
+    schema_version: str = (_SCHEMA_VERSION or "unknown")
+    # CRITICAL: must be True for Phase 1+ (headers always exist)
+    schema_headers_always: bool = True
+    # When normalizing output rows, missing keys become null (JSON) / "" (Sheets writer decides)
+    schema_fill_missing_with_null: bool = True
+
+    # Pages / Catalog
+    allowed_pages: List[str] = field(default_factory=lambda: canonical_pages())
+    forbidden_pages: List[str] = field(default_factory=lambda: sorted(list(forbidden_pages())))
+    default_data_pages: List[str] = field(default_factory=lambda: [
+        "Market_Leaders",
+        "Global_Markets",
+        "Commodities_FX",
+        "Mutual_Funds",
+        "My_Portfolio",
+    ])
+    top10_feed_pages: List[str] = field(default_factory=lambda: top10_feed_pages_default())
 
     # App
     environment: Environment = Environment.PRODUCTION
@@ -759,6 +887,13 @@ class Settings:
     # Market feature flags
     tadawul_market_enabled: bool = True
     ksa_disallow_eodhd: bool = False
+
+    # Computation feature flags (IMPORTANT: do NOT affect headers)
+    computations_enabled: bool = True
+    fundamentals_enabled: bool = True
+    technicals_enabled: bool = True
+    forecasting_enabled: bool = True
+    scoring_enabled: bool = True
 
     # API feature flags
     advanced_analysis_enabled: bool = True
@@ -861,11 +996,67 @@ class Settings:
             os.getenv("BACKEND_BASE_URL") or os.getenv("DEFAULT_BACKEND_URL") or "http://localhost:8000"
         )
 
-        # Feature flags
+        # Feature flags (do NOT impact headers)
         advanced_analysis_enabled = coerce_bool(os.getenv("ADVANCED_ANALYSIS_ENABLED"), True)
         ai_analysis_enabled = coerce_bool(os.getenv("AI_ANALYSIS_ENABLED"), True)
         tadawul_market_enabled = coerce_bool(os.getenv("TADAWUL_MARKET_ENABLED"), True)
         ksa_disallow_eodhd = coerce_bool(os.getenv("KSA_DISALLOW_EODHD"), False)
+
+        computations_enabled = coerce_bool(os.getenv("COMPUTATIONS_ENABLED"), True)
+        fundamentals_enabled = coerce_bool(os.getenv("FUNDAMENTALS_ENABLED"), True)
+        technicals_enabled = coerce_bool(os.getenv("TECHNICALS_ENABLED"), True)
+        forecasting_enabled = coerce_bool(os.getenv("FORECASTING_ENABLED"), True)
+        scoring_enabled = coerce_bool(os.getenv("SCORING_ENABLED"), True)
+
+        # Schema flags (Phase 1)
+        schema_enabled = coerce_bool(os.getenv("SCHEMA_ENABLED"), True)
+        schema_headers_always = coerce_bool(os.getenv("SCHEMA_HEADERS_ALWAYS"), True)
+        schema_fill_missing_with_null = coerce_bool(os.getenv("SCHEMA_FILL_MISSING_WITH_NULL"), True)
+
+        # Pages (Phase 1): allow env overrides but validate against catalog
+        # NOTE: Forbidden pages are always blocked.
+        allowed_pages_env = coerce_list(os.getenv("ALLOWED_PAGES"))
+        if allowed_pages_env:
+            ap: List[str] = []
+            for p in allowed_pages_env:
+                try:
+                    ap.append(normalize_page(p, allow_output_pages=True))
+                except Exception:
+                    continue
+            allowed_pages = ap or canonical_pages()
+        else:
+            allowed_pages = canonical_pages()
+
+        default_data_pages_env = coerce_list(os.getenv("DEFAULT_DATA_PAGES"))
+        if default_data_pages_env:
+            ddp: List[str] = []
+            for p in default_data_pages_env:
+                try:
+                    cp = normalize_page(p, allow_output_pages=False)
+                    ddp.append(cp)
+                except Exception:
+                    continue
+            default_data_pages = ddp or [
+                "Market_Leaders",
+                "Global_Markets",
+                "Commodities_FX",
+                "Mutual_Funds",
+                "My_Portfolio",
+            ]
+        else:
+            default_data_pages = [
+                "Market_Leaders",
+                "Global_Markets",
+                "Commodities_FX",
+                "Mutual_Funds",
+                "My_Portfolio",
+            ]
+
+        top10_feed_pages_env = coerce_list(os.getenv("TOP10_FEED_PAGES"))
+        if top10_feed_pages_env:
+            top10_feed_pages = _get_top10_feed_pages(top10_feed_pages_env)  # type: ignore
+        else:
+            top10_feed_pages = top10_feed_pages_default()
 
         # HTTP / Retry / Cache / Engine
         http_timeout_sec = coerce_float(os.getenv("HTTP_TIMEOUT_SEC"), 45.0, lo=5.0, hi=300.0)
@@ -892,20 +1083,34 @@ class Settings:
         tz = strip_value(os.getenv("TZ") or "Asia/Riyadh")
 
         return cls(
+            # schema + pages
+            schema_enabled=schema_enabled,
+            schema_version=(_SCHEMA_VERSION or "unknown"),
+            schema_headers_always=schema_headers_always,
+            schema_fill_missing_with_null=schema_fill_missing_with_null,
+            allowed_pages=allowed_pages,
+            forbidden_pages=sorted(list(forbidden_pages())),
+            default_data_pages=default_data_pages,
+            top10_feed_pages=top10_feed_pages,
+            # app
             environment=Environment.from_string(env_name),
             service_name=strip_value(os.getenv("SERVICE_NAME") or "Tadawul Fast Bridge"),
             timezone=tz,
             app_name=app_name,
             app_version=app_version,
+            # logging
             log_level=log_level,
             log_format=log_format,
             log_json=log_json,
+            # auth
             auth_header_name=strip_value(os.getenv("AUTH_HEADER_NAME") or "X-APP-TOKEN"),
             require_auth=require_auth,
             open_mode=open_mode,
             app_token=token or None,
             backup_app_token=backup_token or None,
+            # backend
             backend_base_url=backend_base_url,
+            # providers
             enabled_providers=enabled_providers,
             ksa_providers=ksa_providers,
             primary_provider=primary_provider,
@@ -921,8 +1126,16 @@ class Settings:
             eodhd_append_exchange_suffix=eodhd_append_suffix,
             tadawul_market_enabled=tadawul_market_enabled,
             ksa_disallow_eodhd=ksa_disallow_eodhd,
+            # compute flags (headers still guaranteed by schema_headers_always)
+            computations_enabled=computations_enabled,
+            fundamentals_enabled=fundamentals_enabled,
+            technicals_enabled=technicals_enabled,
+            forecasting_enabled=forecasting_enabled,
+            scoring_enabled=scoring_enabled,
+            # api flags
             advanced_analysis_enabled=advanced_analysis_enabled,
             ai_analysis_enabled=ai_analysis_enabled,
+            # http/cache/concurrency
             http_timeout_sec=http_timeout_sec,
             max_retries=max_retries,
             retry_delay_sec=retry_delay_sec,
@@ -934,6 +1147,7 @@ class Settings:
             quote_batch_size=quote_batch_size,
             init_engine_on_boot=init_engine_on_boot,
             defer_router_mount=defer_router_mount,
+            # sheets
             default_spreadsheet_id=default_spreadsheet_id,
             google_sheets_credentials_json=gs_json,
             google_credentials_dict=gs_dict,
@@ -948,6 +1162,20 @@ class Settings:
         """
         errors: List[str] = []
         warnings_list: List[str] = []
+
+        # Pages sanity
+        for fp in self.forbidden_pages or []:
+            if fp in (self.allowed_pages or []):
+                errors.append(f"Forbidden page '{fp}' appears in allowed_pages. Remove it.")
+
+        # Ensure defaults are allowed
+        for p in (self.default_data_pages or []):
+            if p not in (self.allowed_pages or []):
+                warnings_list.append(f"default_data_pages contains '{p}' which is not in allowed_pages.")
+
+        for p in (self.top10_feed_pages or []):
+            if p not in (self.allowed_pages or []):
+                warnings_list.append(f"top10_feed_pages contains '{p}' which is not in allowed_pages.")
 
         if self.backend_base_url and not is_valid_url(self.backend_base_url):
             warnings_list.append(f"backend_base_url does not look like a URL: {self.backend_base_url!r}")
@@ -968,6 +1196,13 @@ class Settings:
 
         if self.open_mode and (self.app_token or self.backup_app_token):
             warnings_list.append("OPEN_MODE=true while tokens exist. Service may be publicly exposed unintentionally.")
+
+        # Schema expectations
+        if self.schema_enabled and self.schema_headers_always is not True:
+            warnings_list.append("SCHEMA_ENABLED=true but SCHEMA_HEADERS_ALWAYS is not true. This can break column guarantees.")
+
+        if self.schema_enabled and not _HAS_SCHEMA:
+            warnings_list.append("Schema modules not available/importable yet. Falling back to static page list.")
 
         return errors, warnings_list
 
@@ -1077,9 +1312,7 @@ def _distributed_enabled() -> bool:
 
 
 class ConsulConfigSource:
-    """
-    LAZY: does NOT connect in __init__.
-    """
+    """LAZY: does NOT connect in __init__."""
 
     def __init__(self, host: str, port: int, token: Optional[str], prefix: str):
         self.host = host
@@ -1130,9 +1363,7 @@ class ConsulConfigSource:
 
 
 class EtcdConfigSource:
-    """
-    LAZY: does NOT connect in __init__.
-    """
+    """LAZY: does NOT connect in __init__."""
 
     def __init__(self, host: str, port: int, prefix: str):
         self.host = host
@@ -1174,9 +1405,7 @@ class EtcdConfigSource:
 
 
 class ZooKeeperConfigSource:
-    """
-    LAZY: client is created inside load() with a small timeout.
-    """
+    """LAZY: client is created inside load() with a small timeout."""
 
     def __init__(self, hosts: str, prefix: str, start_timeout_sec: int = 3):
         self.hosts = hosts
@@ -1310,6 +1539,8 @@ def config_health_check() -> Dict[str, Any]:
     health["checks"]["distributed_sources"] = len(_CONFIG_SOURCES.sources)
     health["checks"]["has_orjson"] = bool(_HAS_ORJSON)
     health["checks"]["tracing_enabled"] = bool(_TRACING_ENABLED and _OTEL_AVAILABLE)
+    health["checks"]["schema_available"] = bool(_HAS_SCHEMA)
+    health["checks"]["schema_version"] = _SCHEMA_VERSION or "unknown"
     return health
 
 
@@ -1429,6 +1660,8 @@ def mask_settings(settings: Optional[Settings] = None) -> Dict[str, Any]:
     d["open_mode_effective"] = bool(is_open_mode())
     d["token_count"] = len(allowed_tokens())
     d["config_version"] = CONFIG_VERSION
+    d["schema_available"] = bool(_HAS_SCHEMA)
+    d["schema_version"] = _SCHEMA_VERSION or "unknown"
     return d
 
 
@@ -1461,6 +1694,13 @@ __all__ = [
     "load_file_content",
     "mask_secret",
     "mask_secret_dict",
+    # schema/pages
+    "canonical_pages",
+    "forbidden_pages",
+    "normalize_page",
+    "top10_feed_pages_default",
+    "schema_known",
+    "schema_headers",
     # versioning
     "ConfigVersion",
     "ConfigVersionManager",
