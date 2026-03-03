@@ -2,19 +2,25 @@
 """
 routes/advanced_analysis.py
 ------------------------------------------------------------
-TADAWUL ADVANCED ANALYSIS ENGINE — v5.3.2 (PHASE 3 WIRED / COMPLETE)
+TADAWUL ADVANCED ANALYSIS ROUTER — v5.3.3 (PHASE 3 WIRED / STARTUP-SAFE)
 PROD HARDENED + SCHEMA-DRIVEN SHEET-ROWS
 
 Phase 3 design (IMPORTANT):
 - ✅ /v1/advanced/sheet-rows is implemented ONLY in routes/advanced_sheet_rows.py
-- ✅ This module mounts that router and adds:
+- ✅ This module imports that router (same prefix="/v1/advanced") and adds:
     - GET /v1/advanced/health
     - GET /v1/advanced/metrics (optional Prometheus)
 - ✅ Prevents duplicate path registration (FastAPI breaks if /sheet-rows exists twice)
 
-Notes:
-- Startup-safe: no network I/O at import time.
-- Engine access is lazy via request.app.state.engine or core.data_engine_v2.get_engine().
+Hardening upgrades in v5.3.3:
+- ✅ No heavy work at import time (startup-safe)
+- ✅ Engine access is lazy (app.state.engine first; then core.data_engine_v2.get_engine)
+- ✅ Best-effort engine stats/health discovery without raising
+- ✅ Health includes:
+    - schema_pages (from page_catalog) if available
+    - provider/engine stats (if engine exposes get_stats/health*)
+    - request_id passthrough (if middleware set it)
+- ✅ Metrics endpoint returns 503 safely when Prometheus is missing
 """
 
 from __future__ import annotations
@@ -33,9 +39,10 @@ from fastapi import Request, Response
 #   POST /sheet-rows
 from routes.advanced_sheet_rows import router  # noqa: F401
 
+
 logger = logging.getLogger("routes.advanced_analysis")
 
-ADVANCED_ANALYSIS_VERSION = "5.3.2"
+ADVANCED_ANALYSIS_VERSION = "5.3.3"
 
 
 # -----------------------------------------------------------------------------
@@ -87,6 +94,31 @@ def _safe_env_port() -> Optional[str]:
     return p or None
 
 
+async def _maybe_call(obj: Any, name: str) -> Optional[Any]:
+    """
+    Best-effort call obj.<name>(), supporting sync/async.
+    Never raises.
+    """
+    try:
+        fn = getattr(obj, name, None)
+        if not callable(fn):
+            return None
+        out = fn()
+        if hasattr(out, "__await__"):
+            out = await out
+        return out
+    except Exception:
+        return None
+
+
+def _safe_bool_env(name: str, default: bool = False) -> bool:
+    try:
+        v = (os.getenv(name, str(default)) or "").strip().lower()
+        return v in ("1", "true", "yes", "y", "on", "t")
+    except Exception:
+        return default
+
+
 # -----------------------------------------------------------------------------
 # Added endpoints
 # -----------------------------------------------------------------------------
@@ -98,21 +130,40 @@ async def advanced_health(request: Request) -> Dict[str, Any]:
     """
     engine = await _get_engine(request)
 
-    # Best-effort optional engine self-health
+    # schema pages (optional)
+    schema_pages = None
+    try:
+        from core.sheets.page_catalog import CANONICAL_PAGES  # type: ignore
+
+        schema_pages = list(CANONICAL_PAGES)
+    except Exception:
+        schema_pages = None
+
+    # best-effort engine health/stats
     engine_health: Optional[Dict[str, Any]] = None
+    engine_stats: Optional[Dict[str, Any]] = None
+
     if engine is not None:
+        # health-like
         for attr in ("health", "health_check", "get_health"):
-            fn = getattr(engine, attr, None)
-            if callable(fn):
-                try:
-                    r = fn()
-                    if hasattr(r, "__await__"):
-                        r = await r
-                    if isinstance(r, dict):
-                        engine_health = r
-                except Exception:
-                    engine_health = None
+            r = await _maybe_call(engine, attr)
+            if isinstance(r, dict):
+                engine_health = r
                 break
+
+        # stats-like
+        for attr in ("get_stats", "stats", "metrics"):
+            r = await _maybe_call(engine, attr)
+            if isinstance(r, dict):
+                engine_stats = r
+                break
+
+    # request_id passthrough if middleware sets it
+    request_id = None
+    try:
+        request_id = getattr(request.state, "request_id", None)
+    except Exception:
+        request_id = None
 
     return {
         "status": "ok" if engine else "degraded",
@@ -120,7 +171,11 @@ async def advanced_health(request: Request) -> Dict[str, Any]:
         "engine_available": bool(engine),
         "engine_type": _safe_engine_type(engine) if engine else "none",
         "engine_health": engine_health,
+        "engine_stats": engine_stats,
+        "schema_pages": schema_pages,
         "port": _safe_env_port(),
+        "require_auth": _safe_bool_env("REQUIRE_AUTH", True),
+        "request_id": request_id,
     }
 
 
