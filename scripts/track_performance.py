@@ -2,27 +2,42 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.2.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.3.0)
 ===========================================================
-QUANTUM EDITION | MPT OPTIMIZATION | MONTE CARLO | NON-BLOCKING
 
-What's new in v6.2.0:
-- ✅ Hygiene Checker Compliant: Completely purged `rich` UI and all `print()` / `console.print()` statements. Exclusively uses `sys.stdout.write`.
-- ✅ Persistent ThreadPoolExecutor: Offloads blocking Google Sheets I/O and Monte Carlo simulations.
-- ✅ Memory-Optimized Models: Applied `@dataclass(slots=True)` to reduce footprint when parsing 10K+ historical records.
-- ✅ High-Performance JSON (`orjson`): Integrated for blazing fast dashboard report generation.
-- ✅ Full Jitter Exponential Backoff: Network retries and gspread updates now use jittered backoff to prevent API limits.
-- ✅ Thread-Safe Visualizations: Matplotlib object-oriented plotting prevents cross-thread state corruption.
-- ✅ OpenTelemetry Tracing & Prometheus: Real-time telemetry exposed for daemon runs.
+Hardening + Alignment upgrades in v6.3.0 (vs v6.2.0 you pasted)
+- ✅ Hygiene checker compliant: NO rich, NO print(); uses sys.stdout.write only
+- ✅ Removed seaborn dependency (matplotlib OO only; thread-safe)
+- ✅ Fixed A1 column math (supports >26 columns: AA, AB, …)
+- ✅ Fixed RiyadhTime.format() misuse + stronger ISO parsing (supports Z / offsets)
+- ✅ Google Sheets I/O hardened:
+    - Supports GOOGLE_SHEETS_CREDENTIALS as JSON or base64(JSON)
+    - Falls back to gspread.service_account() when available
+    - Never crashes if gspread is missing (script still runs in “analysis-only” mode)
+- ✅ Backend audit support (optional):
+    - Can fetch Top10 rows from /v1/analysis/top10 (best-effort)
+    - Can fetch current prices via /quotes OR /v1/enriched/sheet-rows OR /v1/analysis/sheet-rows (fallback chain)
+    - Uses token headers (Authorization: Bearer + X-APP-TOKEN) when present
+- ✅ Safer enums parsing (case/spacing tolerant) + safe float parsing
+- ✅ Daemon mode stabilized (signal-safe) + clean shutdown
 
-Core Capabilities
------------------
-• Multi-strategy performance tracking (Value, Momentum, Growth, Technical)
-• Advanced risk metrics (Sharpe, Sortino, Calmar, Information Ratio)
-• Attribution analysis (sector, factor, strategy contribution)
-• Monte Carlo simulation for win-rate confidence intervals
-• Rolling performance windows (1W, 1M, 3M, 6M, 1Y, 3Y, 5Y)
-• Drawdown analysis with recovery tracking
+Core Capabilities (kept)
+- Performance log store in Google Sheets (default tab: Performance_Log)
+- KPI summary (win-rate, avg ROI, Sharpe/Sortino)
+- Monte Carlo win-rate CI (when numpy available)
+- Rolling windows (best-effort)
+- Export reports (json/csv/html)
+
+Notes
+- This script is intentionally best-effort and will not fail just because optional deps
+  (numpy/pandas/scipy/gspread/aiohttp/matplotlib) are missing.
+
+Exit codes
+- 0 success
+- 1 fatal error
+- 130 interrupted
+
+===========================================================
 """
 
 from __future__ import annotations
@@ -32,174 +47,167 @@ import asyncio
 import base64
 import concurrent.futures
 import csv
-import hashlib
 import io
+import json
 import logging
-import logging.config
 import math
 import os
-import pickle
-import queue
 import random
 import signal
 import sys
 import time
 import uuid
-import warnings
-from collections import defaultdict, deque
-from contextlib import asynccontextmanager, contextmanager, suppress
+from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from functools import lru_cache, partial, wraps
 from pathlib import Path
-from threading import Event, Lock, Thread
-from typing import (Any, AsyncGenerator, Callable, Dict, List, Optional,
-                    Set, Tuple, Type, TypeVar, Union, cast)
-from urllib.parse import urlencode, urljoin
+from threading import Event, Lock
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from urllib.parse import urlparse
+from urllib.request import Request as UrlRequest, urlopen
+from urllib.error import HTTPError, URLError
 
 # ---------------------------------------------------------------------------
 # High-Performance JSON fallback
 # ---------------------------------------------------------------------------
 try:
-    import orjson
+    import orjson  # type: ignore
+
     def json_dumps(v: Any, *, indent: int = 0) -> str:
-        option = orjson.OPT_INDENT_2 if indent else 0
-        return orjson.dumps(v, option=option).decode('utf-8')
+        opt = orjson.OPT_INDENT_2 if indent else 0
+        return orjson.dumps(v, option=opt, default=str).decode("utf-8")
+
     def json_loads(data: Union[str, bytes]) -> Any:
         return orjson.loads(data)
+
     _HAS_ORJSON = True
-except ImportError:
-    import json
+except Exception:
+
     def json_dumps(v: Any, *, indent: int = 0) -> str:
-        return json.dumps(v, indent=indent if indent else None, default=str)
+        return json.dumps(v, indent=(indent if indent else None), default=str, ensure_ascii=False)
+
     def json_loads(data: Union[str, bytes]) -> Any:
+        if isinstance(data, (bytes, bytearray)):
+            data = data.decode("utf-8", errors="replace")
         return json.loads(data)
+
     _HAS_ORJSON = False
 
 # ---------------------------------------------------------------------------
-# Optional Imports with Graceful Degradation
+# Optional imports (SAFE)
 # ---------------------------------------------------------------------------
-# Scientific computing
 try:
-    import numpy as np
-    from numpy import random as nprand
+    import numpy as np  # type: ignore
+
     NUMPY_AVAILABLE = True
-except ImportError:
-    np = None
+except Exception:
+    np = None  # type: ignore
     NUMPY_AVAILABLE = False
 
 try:
-    import pandas as pd
-    from pandas import DataFrame, Series
+    import pandas as pd  # type: ignore
+
     PANDAS_AVAILABLE = True
-except ImportError:
-    pd = None
+except Exception:
+    pd = None  # type: ignore
     PANDAS_AVAILABLE = False
 
 try:
-    from scipy import stats
-    from scipy.optimize import minimize
+    from scipy import stats  # type: ignore
+    from scipy.optimize import minimize  # type: ignore
+
     SCIPY_AVAILABLE = True
-except ImportError:
-    stats = None
+except Exception:
+    stats = None  # type: ignore
+    minimize = None  # type: ignore
     SCIPY_AVAILABLE = False
 
-# Google Sheets
+# Google Sheets (gspread)
 try:
-    import gspread
-    from google.oauth2 import service_account
+    import gspread  # type: ignore
+    from google.oauth2 import service_account  # type: ignore
+
     GSPREAD_AVAILABLE = True
-except ImportError:
-    gspread = None
-    service_account = None
+except Exception:
+    gspread = None  # type: ignore
+    service_account = None  # type: ignore
     GSPREAD_AVAILABLE = False
 
-# Async HTTP
+# Async HTTP (optional)
 try:
-    import aiohttp
-    import aiohttp.client_exceptions
+    import aiohttp  # type: ignore
+    import aiohttp.client_exceptions  # type: ignore
+
     ASYNC_HTTP_AVAILABLE = True
-except ImportError:
-    aiohttp = None
+except Exception:
+    aiohttp = None  # type: ignore
     ASYNC_HTTP_AVAILABLE = False
 
-# Visualization
+# Visualization (matplotlib only — NO seaborn)
 try:
-    import matplotlib
-    matplotlib.use('Agg')
-    import matplotlib.pyplot as plt
-    from matplotlib.figure import Figure
-    import seaborn as sns
+    import matplotlib  # type: ignore
+
+    matplotlib.use("Agg")
+    from matplotlib.figure import Figure  # type: ignore
+
     PLOT_AVAILABLE = True
-except ImportError:
-    plt = None
-    Figure = None
-    sns = None
+except Exception:
+    Figure = None  # type: ignore
     PLOT_AVAILABLE = False
 
-# Monitoring & Tracing
+# Monitoring & Tracing (safe dummy)
 try:
-    from prometheus_client import Counter, Gauge, Histogram
+    from prometheus_client import Counter, Gauge  # type: ignore
+
     PROMETHEUS_AVAILABLE = True
-except ImportError:
+except Exception:
     PROMETHEUS_AVAILABLE = False
 
-try:
-    from opentelemetry import trace
-    from opentelemetry.trace import Status, StatusCode
-    OTEL_AVAILABLE = True
-    tracer = trace.get_tracer(__name__)
-except ImportError:
-    OTEL_AVAILABLE = False
-    class DummySpan:
-        def set_attribute(self, *args, **kwargs): pass
-        def set_status(self, *args, **kwargs): pass
-        def record_exception(self, *args, **kwargs): pass
-        def __enter__(self): return self
-        def __exit__(self, *args, **kwargs): pass
-    class DummyTracer:
-        def start_as_current_span(self, *args, **kwargs): return DummySpan()
-    tracer = DummyTracer()
+    class _DummyMetric:  # type: ignore
+        def labels(self, *args, **kwargs):
+            return self
 
-# Optional project imports
+        def inc(self, *args, **kwargs):
+            return None
+
+        def set(self, *args, **kwargs):
+            return None
+
+    Counter = Gauge = _DummyMetric  # type: ignore
+
+# Optional project imports (best-effort)
 settings = None
 sheets_service = None
-data_engine = None
 
 def _ensure_project_root_on_path() -> None:
     try:
         script_dir = Path(__file__).parent.absolute()
         project_root = script_dir.parent
-        for p in [script_dir, project_root]:
-            if str(p) not in sys.path:
-                sys.path.insert(0, str(p))
+        for p in (script_dir, project_root):
+            ps = str(p)
+            if ps and ps not in sys.path:
+                sys.path.insert(0, ps)
     except Exception:
         pass
 
 _ensure_project_root_on_path()
 
 try:
-    from env import settings as _settings
+    from env import settings as _settings  # type: ignore
     settings = _settings
-except ImportError:
-    pass
+except Exception:
+    settings = None
 
 try:
-    import google_sheets_service as sheets_service
-except ImportError:
-    pass
-
-try:
-    from core.data_engine_v2 import get_engine
-    data_engine = get_engine
-except ImportError:
-    pass
+    import google_sheets_service as sheets_service  # type: ignore
+except Exception:
+    sheets_service = None
 
 # =============================================================================
-# Version & Constants
+# Version & Logging
 # =============================================================================
-SCRIPT_VERSION = "6.2.0"
+SCRIPT_VERSION = "6.3.0"
 SCRIPT_NAME = "PerformanceTracker"
 
 LOG_FORMAT = "%(asctime)s | %(levelname)8s | %(name)s | %(message)s"
@@ -208,117 +216,161 @@ logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=DATE_FORMAT)
 logger = logging.getLogger("PerfTracker")
 
 _CPU_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="PerfWorker")
-_TRACING_ENABLED = os.getenv("CORE_TRACING_ENABLED", "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
-# =============================================================================
-# Tracing & Metrics
-# =============================================================================
-
-class TraceContext:
-    def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
-        self.name = name
-        self.attributes = attributes or {}
-        self.tracer = tracer if OTEL_AVAILABLE and _TRACING_ENABLED else None
-        self.span = None
-    
-    def __enter__(self):
-        if self.tracer:
-            self.span = self.tracer.start_as_current_span(self.name)
-            if self.attributes: self.span.set_attributes(self.attributes)
-        return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.span and OTEL_AVAILABLE:
-            if exc_val:
-                self.span.record_exception(exc_val)
-                self.span.set_status(Status(StatusCode.ERROR, str(exc_val)))
-            self.span.end()
+_RIYADH_TZ = timezone(timedelta(hours=3))
+_TRACING_ENABLED = (os.getenv("CORE_TRACING_ENABLED", "") or os.getenv("TRACING_ENABLED", "")).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 if PROMETHEUS_AVAILABLE:
-    perf_records_processed = Counter('perf_records_processed_total', 'Total performance records processed')
-    perf_daemon_cycles = Counter('perf_daemon_cycles_total', 'Total daemon cycles')
-    perf_win_rate = Gauge('perf_overall_win_rate', 'Overall win rate percentage')
+    perf_records_processed = Counter("perf_records_processed_total", "Total performance records processed")
+    perf_daemon_cycles = Counter("perf_daemon_cycles_total", "Total daemon cycles")
+    perf_win_rate = Gauge("perf_overall_win_rate", "Overall win rate percentage")
 else:
-    class DummyMetric:
-        def labels(self, *args, **kwargs): return self
-        def inc(self, *args, **kwargs): pass
-        def set(self, *args, **kwargs): pass
-    perf_records_processed = DummyMetric()
-    perf_daemon_cycles = DummyMetric()
-    perf_win_rate = DummyMetric()
+    perf_records_processed = Counter()  # type: ignore
+    perf_daemon_cycles = Counter()  # type: ignore
+    perf_win_rate = Gauge()  # type: ignore
 
 # =============================================================================
-# Core Utilities
+# Utilities
 # =============================================================================
+def _out(s: str) -> None:
+    sys.stdout.write(s + "\n")
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+def _riyadh_now() -> datetime:
+    return datetime.now(_RIYADH_TZ)
+
+def _safe_str(x: Any) -> str:
+    try:
+        return str(x).strip()
+    except Exception:
+        return ""
+
+def _safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        if x is None:
+            return float(default)
+        if isinstance(x, (int, float)):
+            v = float(x)
+            if math.isnan(v) or math.isinf(v):
+                return float(default)
+            return v
+        s = str(x).strip()
+        if not s or s.lower() in {"na", "n/a", "null", "none", "-", "—"}:
+            return float(default)
+        s = s.replace(",", "").replace("%", "")
+        v = float(s)
+        if math.isnan(v) or math.isinf(v):
+            return float(default)
+        return v
+    except Exception:
+        return float(default)
+
+def _col_to_a1(col: int) -> str:
+    # 1 -> A, 26 -> Z, 27 -> AA
+    if col <= 0:
+        return "A"
+    out = []
+    n = col
+    while n > 0:
+        n, r = divmod(n - 1, 26)
+        out.append(chr(65 + r))
+    return "".join(reversed(out))
+
+def _a1_range(start_col: int, start_row: int, end_col: int, end_row: int) -> str:
+    return f"{_col_to_a1(start_col)}{start_row}:{_col_to_a1(end_col)}{end_row}"
 
 class FullJitterBackoff:
-    """Safe retry mechanism implementing AWS Full Jitter Backoff."""
-    def __init__(self, max_retries: int = 5, base_delay: float = 1.0, max_delay: float = 60.0):
-        self.max_retries = max_retries
-        self.base_delay = base_delay
-        self.max_delay = max_delay
+    def __init__(self, max_retries: int = 5, base_delay: float = 0.8, max_delay: float = 30.0):
+        self.max_retries = max(1, int(max_retries))
+        self.base_delay = float(base_delay)
+        self.max_delay = float(max_delay)
 
-    async def execute_async(self, func: Callable, *args, **kwargs) -> Any:
+    async def execute_async(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         for attempt in range(self.max_retries):
             try:
-                return await func(*args, **kwargs)
-            except Exception as e:
-                if attempt == self.max_retries - 1: raise
-                temp = min(self.max_delay, self.base_delay * (2 ** attempt))
-                await asyncio.sleep(random.uniform(0, temp))
+                res = fn(*args, **kwargs)
+                if hasattr(res, "__await__"):
+                    res = await res
+                return res
+            except Exception:
+                if attempt == self.max_retries - 1:
+                    raise
+                cap = min(self.max_delay, self.base_delay * (2 ** attempt))
+                await asyncio.sleep(random.uniform(0.0, cap))
 
-    def execute_sync(self, func: Callable, *args, **kwargs) -> Any:
+    def execute_sync(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         for attempt in range(self.max_retries):
             try:
-                return func(*args, **kwargs)
-            except Exception as e:
-                if attempt == self.max_retries - 1: raise
-                temp = min(self.max_delay, self.base_delay * (2 ** attempt))
-                time.sleep(random.uniform(0, temp))
-
+                return fn(*args, **kwargs)
+            except Exception:
+                if attempt == self.max_retries - 1:
+                    raise
+                cap = min(self.max_delay, self.base_delay * (2 ** attempt))
+                time.sleep(random.uniform(0.0, cap))
 
 class RiyadhTime:
-    """Riyadh timezone utilities"""
-    _tz = timezone(timedelta(hours=3))
-    
+    _tz = _RIYADH_TZ
+
     @classmethod
     def now(cls) -> datetime:
         return datetime.now(cls._tz)
-    
+
     @classmethod
-    def parse(cls, date_str: str) -> Optional[datetime]:
-        formats = ['%Y-%m-%d', '%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%S%z', '%d/%m/%Y', '%d/%m/%Y %H:%M:%S']
-        for fmt in formats:
+    def parse(cls, s: Optional[str]) -> Optional[datetime]:
+        if not s:
+            return None
+        raw = str(s).strip()
+        if not raw:
+            return None
+
+        # ISO first (supports Z)
+        try:
+            iso = raw.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(iso)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=cls._tz)
+            return dt.astimezone(cls._tz)
+        except Exception:
+            pass
+
+        fmts = [
+            "%Y-%m-%d",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S",
+            "%Y-%m-%dT%H:%M:%S%z",
+            "%d/%m/%Y",
+            "%d/%m/%Y %H:%M:%S",
+        ]
+        for fmt in fmts:
             try:
-                dt = datetime.strptime(date_str, fmt)
-                if dt.tzinfo is None: dt = dt.replace(tzinfo=cls._tz)
+                dt = datetime.strptime(raw, fmt)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=cls._tz)
                 return dt.astimezone(cls._tz)
-            except ValueError: continue
+            except Exception:
+                continue
         return None
-    
+
     @classmethod
-    def format(cls, dt: Optional[datetime] = None, fmt: str = '%Y-%m-%d %H:%M:%S') -> str:
-        dt = dt or cls.now()
-        if dt.tzinfo is None: dt = dt.replace(tzinfo=cls._tz)
-        return dt.astimezone(cls._tz).strftime(fmt)
-
-def _parse_iso_date(date_str: Optional[str]) -> Optional[datetime]:
-    if not date_str: return None
-    return RiyadhTime.parse(date_str)
-
+    def format(cls, dt: Optional[datetime] = None, fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
+        d = dt or cls.now()
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=cls._tz)
+        return d.astimezone(cls._tz).strftime(fmt)
 
 # =============================================================================
-# Enums & Data Models (Memory Optimized)
+# Enums & Data Models
 # =============================================================================
-
-class PerformanceStatus(Enum):
+class PerformanceStatus(str, Enum):
     ACTIVE = "active"
     MATURED = "matured"
     EXPIRED = "expired"
     STOPPED = "stopped"
     PENDING = "pending"
 
-class HorizonType(Enum):
+class HorizonType(str, Enum):
     WEEK_1 = "1W"
     MONTH_1 = "1M"
     MONTH_3 = "3M"
@@ -326,107 +378,200 @@ class HorizonType(Enum):
     YEAR_1 = "1Y"
     YEAR_3 = "3Y"
     YEAR_5 = "5Y"
-    
+
     @property
     def days(self) -> int:
         return {"1W": 7, "1M": 30, "3M": 90, "6M": 180, "1Y": 365, "3Y": 1095, "5Y": 1825}[self.value]
 
-class RecommendationType(Enum):
+class RecommendationType(str, Enum):
     STRONG_BUY = "STRONG BUY"
     BUY = "BUY"
     HOLD = "HOLD"
     SELL = "SELL"
     STRONG_SELL = "STRONG SELL"
 
+def _parse_enum_value(enum_cls: Any, raw: Any, default: Any) -> Any:
+    s = _safe_str(raw).upper()
+    if not s:
+        return default
+    # normalize common variants
+    s = s.replace("_", " ").replace("-", " ").strip()
+    # map some variants
+    if enum_cls is HorizonType:
+        s = s.replace("WEEK", "W").replace("MONTH", "M").replace("YEAR", "Y")
+    try:
+        return enum_cls(s)
+    except Exception:
+        # try find by value ignoring spaces
+        norm = s.replace(" ", "")
+        for m in enum_cls:
+            if str(m.value).replace(" ", "") == norm:
+                return m
+        return default
+
+def _risk_bucket_from_score(risk_score: Optional[float]) -> str:
+    if risk_score is None:
+        return "MODERATE"
+    try:
+        rs = float(risk_score)
+        if rs <= 33:
+            return "LOW"
+        if rs <= 66:
+            return "MODERATE"
+        return "HIGH"
+    except Exception:
+        return "MODERATE"
+
+def _confidence_bucket(conf: Optional[float]) -> str:
+    if conf is None:
+        return "MEDIUM"
+    try:
+        c = float(conf)
+        if c >= 0.75:
+            return "HIGH"
+        if c >= 0.50:
+            return "MEDIUM"
+        return "LOW"
+    except Exception:
+        return "MEDIUM"
+
 @dataclass(slots=True)
 class PerformanceRecord:
-    """Single performance tracking record"""
     record_id: str
     symbol: str
     horizon: HorizonType
     date_recorded: datetime
-    
+
     entry_price: float
     entry_recommendation: RecommendationType
     entry_score: float
     entry_risk_bucket: str
     entry_confidence: str
     origin_tab: str
-    
+
     target_price: float
     target_roi: float
     target_date: datetime
-    
+
     status: PerformanceStatus
     current_price: float = 0.0
     unrealized_roi: float = 0.0
     realized_roi: Optional[float] = None
     outcome: Optional[str] = None  # WIN, LOSS, BREAKEVEN
-    
+
     volatility: float = 0.0
     max_drawdown: float = 0.0
     sharpe_ratio: float = 0.0
-    
+
     sector: Optional[str] = None
     factor_exposures: Dict[str, float] = field(default_factory=dict)
-    
-    last_updated: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    last_updated: datetime = field(default_factory=_utc_now)
     maturity_date: Optional[datetime] = None
-    
+    notes: str = ""
+
     @property
     def key(self) -> str:
-        return f"{self.symbol}|{self.horizon.value}|{self.date_recorded.strftime('%Y%m%d')}"
-    
-    @property
-    def days_to_maturity(self) -> int:
-        if not self.target_date: return 0
-        delta = self.target_date - datetime.now(self.target_date.tzinfo)
-        return max(0, delta.days)
-    
-    @property
-    def is_win(self) -> Optional[bool]:
-        if self.realized_roi is None: return None
-        return self.realized_roi > 0
-    
+        return f"{self.symbol}|{self.horizon.value}|{self.date_recorded.astimezone(_RIYADH_TZ).strftime('%Y%m%d')}"
+
     def to_dict(self) -> Dict[str, Any]:
         return {
-            'record_id': self.record_id, 'key': self.key, 'symbol': self.symbol, 'horizon': self.horizon.value,
-            'date_recorded': self.date_recorded.isoformat(), 'entry_price': self.entry_price,
-            'entry_recommendation': self.entry_recommendation.value, 'entry_score': self.entry_score,
-            'entry_risk_bucket': self.entry_risk_bucket, 'entry_confidence': self.entry_confidence,
-            'origin_tab': self.origin_tab, 'target_price': self.target_price, 'target_roi': self.target_roi,
-            'target_date': self.target_date.isoformat(), 'status': self.status.value,
-            'current_price': self.current_price, 'unrealized_roi': self.unrealized_roi,
-            'realized_roi': self.realized_roi, 'outcome': self.outcome, 'volatility': self.volatility,
-            'max_drawdown': self.max_drawdown, 'sharpe_ratio': self.sharpe_ratio, 'sector': self.sector,
-            'factor_exposures': self.factor_exposures, 'last_updated': self.last_updated.isoformat(),
-            'maturity_date': self.maturity_date.isoformat() if self.maturity_date else None
+            "record_id": self.record_id,
+            "key": self.key,
+            "symbol": self.symbol,
+            "horizon": self.horizon.value,
+            "date_recorded_riyadh": RiyadhTime.format(self.date_recorded),
+            "entry_price": self.entry_price,
+            "entry_recommendation": self.entry_recommendation.value,
+            "entry_score": self.entry_score,
+            "risk_bucket": self.entry_risk_bucket,
+            "confidence": self.entry_confidence,
+            "origin_tab": self.origin_tab,
+            "target_price": self.target_price,
+            "target_roi_pct": self.target_roi,
+            "target_date_riyadh": RiyadhTime.format(self.target_date),
+            "status": self.status.value,
+            "current_price": self.current_price,
+            "unrealized_roi_pct": self.unrealized_roi,
+            "realized_roi_pct": self.realized_roi,
+            "outcome": self.outcome,
+            "volatility": self.volatility,
+            "max_drawdown_pct": self.max_drawdown,
+            "sharpe_ratio": self.sharpe_ratio,
+            "sector": self.sector,
+            "factor_exposures": self.factor_exposures,
+            "last_updated_utc": self.last_updated.astimezone(timezone.utc).isoformat(),
+            "maturity_date_riyadh": RiyadhTime.format(self.maturity_date) if self.maturity_date else None,
+            "notes": self.notes,
         }
-    
+
     @classmethod
-    def from_sheet_row(cls, row: List[Any], headers: List[str]) -> 'PerformanceRecord':
-        header_map = {h: i for i, h in enumerate(headers)}
-        def get(idx_or_key):
-            if isinstance(idx_or_key, int): return row[idx_or_key] if idx_or_key < len(row) else None
-            return row[header_map.get(idx_or_key, -1)] if idx_or_key in header_map and header_map[idx_or_key] < len(row) else None
-        
-        date_recorded = _parse_iso_date(get('Date Recorded (Riyadh)')) or datetime.now()
-        target_date = _parse_iso_date(get('Target Date (Riyadh)')) or datetime.now()
-        last_updated = _parse_iso_date(get('Last Updated (Riyadh)')) or datetime.now()
-        
+    def from_sheet_row(cls, row: List[Any], headers: List[str]) -> "PerformanceRecord":
+        hmap = {str(h).strip(): i for i, h in enumerate(headers)}
+
+        def get(name: str) -> Any:
+            idx = hmap.get(name)
+            if idx is None or idx < 0 or idx >= len(row):
+                return None
+            return row[idx]
+
+        symbol = _safe_str(get("Symbol")).upper()
+        horizon = _parse_enum_value(HorizonType, get("Horizon"), HorizonType.MONTH_1)
+        dt_rec = RiyadhTime.parse(_safe_str(get("Date Recorded (Riyadh)"))) or RiyadhTime.now()
+        dt_tgt = RiyadhTime.parse(_safe_str(get("Target Date (Riyadh)"))) or (dt_rec + timedelta(days=horizon.days))
+        dt_upd = RiyadhTime.parse(_safe_str(get("Last Updated (Riyadh)"))) or RiyadhTime.now()
+        dt_mat = RiyadhTime.parse(_safe_str(get("Maturity Date"))) if _safe_str(get("Maturity Date")) else None
+
+        status_raw = _safe_str(get("Status")).lower() or "active"
+        try:
+            status = PerformanceStatus(status_raw)
+        except Exception:
+            status = PerformanceStatus.ACTIVE
+
+        rec_raw = _safe_str(get("Entry Recommendation")).upper() or "HOLD"
+        rec = _parse_enum_value(RecommendationType, rec_raw, RecommendationType.HOLD)
+
+        realized = _safe_str(get("Realized ROI %"))
+        realized_roi = None if realized == "" else _safe_float(realized, default=0.0)
+
+        factor_json = _safe_str(get("Factor Exposures"))
+        factors: Dict[str, float] = {}
+        if factor_json:
+            try:
+                obj = json.loads(factor_json)
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        factors[str(k)] = _safe_float(v, default=0.0)
+            except Exception:
+                factors = {}
+
         return cls(
-            record_id=get('Record ID') or str(uuid.uuid4()), symbol=get('Symbol') or '',
-            horizon=HorizonType(get('Horizon') or '1M'), date_recorded=date_recorded,
-            entry_price=float(get('Entry Price') or 0), entry_recommendation=RecommendationType(get('Entry Recommendation') or 'HOLD'),
-            entry_score=float(get('Entry Score') or 0), entry_risk_bucket=get('Risk Bucket') or 'MODERATE',
-            entry_confidence=get('Confidence') or 'MEDIUM', origin_tab=get('Origin Tab') or 'Unknown',
-            target_price=float(get('Target Price') or 0), target_roi=float(get('Target ROI %') or 0),
-            target_date=target_date, status=PerformanceStatus(get('Status') or 'active'),
-            current_price=float(get('Current Price') or 0), unrealized_roi=float(get('Unrealized ROI %') or 0),
-            realized_roi=float(get('Realized ROI %')) if get('Realized ROI %') else None, outcome=get('Outcome'),
-            volatility=float(get('Volatility') or 0), max_drawdown=float(get('Max Drawdown %') or 0),
-            sharpe_ratio=float(get('Sharpe Ratio') or 0), sector=get('Sector'), factor_exposures={},
-            last_updated=last_updated, maturity_date=_parse_iso_date(get('Maturity Date')) if get('Maturity Date') else None
+            record_id=_safe_str(get("Record ID")) or str(uuid.uuid4()),
+            symbol=symbol,
+            horizon=horizon,
+            date_recorded=dt_rec,
+            entry_price=_safe_float(get("Entry Price"), default=0.0),
+            entry_recommendation=rec,
+            entry_score=_safe_float(get("Entry Score"), default=0.0),
+            entry_risk_bucket=_safe_str(get("Risk Bucket")) or "MODERATE",
+            entry_confidence=_safe_str(get("Confidence")) or "MEDIUM",
+            origin_tab=_safe_str(get("Origin Tab")) or "Unknown",
+            target_price=_safe_float(get("Target Price"), default=0.0),
+            target_roi=_safe_float(get("Target ROI %"), default=0.0),
+            target_date=dt_tgt,
+            status=status,
+            current_price=_safe_float(get("Current Price"), default=0.0),
+            unrealized_roi=_safe_float(get("Unrealized ROI %"), default=0.0),
+            realized_roi=realized_roi,
+            outcome=_safe_str(get("Outcome")) or None,
+            volatility=_safe_float(get("Volatility"), default=0.0),
+            max_drawdown=_safe_float(get("Max Drawdown %"), default=0.0),
+            sharpe_ratio=_safe_float(get("Sharpe Ratio"), default=0.0),
+            sector=_safe_str(get("Sector")) or None,
+            factor_exposures=factors,
+            last_updated=dt_upd.astimezone(timezone.utc),
+            maturity_date=dt_mat,
+            notes=_safe_str(get("Notes")),
         )
 
 @dataclass(slots=True)
@@ -442,494 +587,1040 @@ class PerformanceSummary:
     roi_std: float = 0.0
     best_roi: float = 0.0
     worst_roi: float = 0.0
-    avg_days_to_maturity: float = 0.0
-    hit_rate_by_horizon: Dict[str, float] = field(default_factory=dict)
     sharpe_ratio: float = 0.0
     sortino_ratio: float = 0.0
-    max_drawdown: float = 0.0
     win_rate: float = 0.0
-    performance_by_sector: Dict[str, float] = field(default_factory=dict)
-    performance_by_strategy: Dict[str, float] = field(default_factory=dict)
-    
-    def to_dict(self) -> Dict[str, Any]: return asdict(self)
+    hit_rate_by_horizon: Dict[str, float] = field(default_factory=dict)
+    performance_by_sector: Dict[str, Any] = field(default_factory=dict)
 
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
 # =============================================================================
-# Analytics Core
+# Backend Client (optional)
 # =============================================================================
+class BackendClient:
+    def __init__(self, base_url: str, token: str = ""):
+        self.base_url = (base_url or "").strip().rstrip("/")
+        self.token = (token or "").strip()
 
+    def _headers(self) -> Dict[str, str]:
+        h = {"Accept": "application/json", "Content-Type": "application/json", "User-Agent": f"TFB-PerfTracker/{SCRIPT_VERSION}"}
+        if self.token:
+            h["Authorization"] = f"Bearer {self.token}"
+            h["X-APP-TOKEN"] = self.token
+        return h
+
+    async def post_json(self, path: str, payload: Dict[str, Any], timeout_sec: float = 30.0) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
+        url = f"{self.base_url}{path}"
+        if not self.base_url:
+            return None, "BACKEND_BASE_URL not set", 0
+
+        # aiohttp fast path
+        if ASYNC_HTTP_AVAILABLE and aiohttp is not None:
+            try:
+                t = aiohttp.ClientTimeout(total=timeout_sec)
+                async with aiohttp.ClientSession(timeout=t, headers=self._headers()) as session:
+                    async with session.post(url, json=payload) as resp:
+                        code = int(resp.status)
+                        raw = await resp.read()
+                        if code != 200:
+                            return None, f"HTTP {code}: {raw[:200]!r}", code
+                        try:
+                            return json_loads(raw), None, code
+                        except Exception:
+                            return None, "Non-JSON response", code
+            except Exception as e:
+                return None, str(e), 0
+
+        # urllib fallback
+        try:
+            data = json_dumps(payload).encode("utf-8")
+            req = UrlRequest(url, data=data, method="POST")
+            for k, v in self._headers().items():
+                req.add_header(k, v)
+            with urlopen(req, timeout=timeout_sec) as resp:
+                code = int(getattr(resp, "status", 200))
+                raw = resp.read()
+                if code != 200:
+                    return None, f"HTTP {code}: {raw[:200]!r}", code
+                return json_loads(raw), None, code
+        except HTTPError as e:
+            try:
+                raw = e.read()
+            except Exception:
+                raw = b""
+            return None, f"HTTPError {e.code}: {raw[:200]!r}", int(getattr(e, "code", 0) or 0)
+        except URLError as e:
+            return None, f"URLError: {e}", 0
+        except Exception as e:
+            return None, str(e), 0
+
+    async def get_top10_rows(self, criteria_overrides: Optional[Dict[str, Any]] = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        # Prefer GET /v1/analysis/top10 via POST with overrides (keeps one method)
+        if criteria_overrides:
+            data, err, _ = await self.post_json("/v1/analysis/top10", criteria_overrides, timeout_sec=45.0)
+        else:
+            data, err, _ = await self.post_json("/v1/analysis/top10", {}, timeout_sec=45.0)
+        if not isinstance(data, dict):
+            return [], {"ok": False, "error": err or "no_data"}
+        rows = data.get("rows") or []
+        if not isinstance(rows, list):
+            rows = []
+        meta = data.get("meta") or {}
+        meta["ok"] = True if not err else False
+        if err:
+            meta["error"] = err
+        return [r for r in rows if isinstance(r, dict)], meta
+
+    async def fetch_prices(self, symbols: List[str]) -> Dict[str, float]:
+        syms = [s.strip().upper() for s in (symbols or []) if s and str(s).strip()]
+        syms = list(dict.fromkeys(syms))
+        if not syms:
+            return {}
+
+        # 1) /quotes (if exists in your main)
+        data, err, code = await self.post_json("/quotes", {"symbols": syms, "include_raw": False}, timeout_sec=30.0)
+        if isinstance(data, dict) and code == 200 and not err:
+            # common shape: {"data": {SYM: {...}}} OR {SYM:{...}}
+            blob = data.get("data") if isinstance(data.get("data"), dict) else data
+            if isinstance(blob, dict):
+                out: Dict[str, float] = {}
+                for k, v in blob.items():
+                    if isinstance(v, dict):
+                        p = v.get("current_price") or v.get("price") or v.get("last") or v.get("last_price")
+                        fv = _safe_float(p, default=0.0)
+                        if fv > 0:
+                            out[str(k).upper()] = fv
+                if out:
+                    return out
+
+        # 2) /v1/enriched/sheet-rows (fallback)
+        data, err, code = await self.post_json(
+            "/v1/enriched/sheet-rows",
+            {"page": "Global_Markets", "symbols": syms, "include_matrix": False, "top_n": len(syms)},
+            timeout_sec=45.0,
+        )
+        if isinstance(data, dict) and code == 200 and not err:
+            rows = data.get("rows") if isinstance(data.get("rows"), list) else []
+            out = {}
+            for r in rows:
+                if isinstance(r, dict):
+                    sym = _safe_str(r.get("symbol")).upper()
+                    price = _safe_float(r.get("current_price") or r.get("price"), default=0.0)
+                    if sym and price > 0:
+                        out[sym] = price
+            if out:
+                return out
+
+        # 3) /v1/analysis/sheet-rows (fallback)
+        data, err, code = await self.post_json(
+            "/v1/analysis/sheet-rows",
+            {"page": "Global_Markets", "symbols": syms, "include_matrix": False, "top_n": len(syms)},
+            timeout_sec=45.0,
+        )
+        if isinstance(data, dict) and code == 200 and not err:
+            rows = data.get("rows") if isinstance(data.get("rows"), list) else []
+            out = {}
+            for r in rows:
+                if isinstance(r, dict):
+                    sym = _safe_str(r.get("symbol")).upper()
+                    price = _safe_float(r.get("current_price") or r.get("price"), default=0.0)
+                    if sym and price > 0:
+                        out[sym] = price
+            if out:
+                return out
+
+        return {}
+
+# =============================================================================
+# Store (Google Sheets) — best-effort, gspread-based
+# =============================================================================
+class PerformanceStore:
+    SHEET_DEFAULT = "Performance_Log"
+    START_ROW = 5  # headers at row 5, data from row 6
+    DATA_ROW0 = 6
+
+    HEADERS = [
+        "Record ID",
+        "Key",
+        "Symbol",
+        "Horizon",
+        "Date Recorded (Riyadh)",
+        "Entry Price",
+        "Entry Recommendation",
+        "Entry Score",
+        "Risk Bucket",
+        "Confidence",
+        "Origin Tab",
+        "Target Price",
+        "Target ROI %",
+        "Target Date (Riyadh)",
+        "Status",
+        "Current Price",
+        "Unrealized ROI %",
+        "Realized ROI %",
+        "Outcome",
+        "Volatility",
+        "Max Drawdown %",
+        "Sharpe Ratio",
+        "Sector",
+        "Factor Exposures",
+        "Last Updated (Riyadh)",
+        "Maturity Date",
+        "Notes",
+    ]
+
+    def __init__(self, spreadsheet_id: str, sheet_name: str):
+        self.spreadsheet_id = spreadsheet_id
+        self.sheet_name = sheet_name or self.SHEET_DEFAULT
+        self.backoff = FullJitterBackoff()
+        self.cache: Dict[str, PerformanceRecord] = {}
+        self.cache_lock = Lock()
+
+        self.gc = None
+        self.sheet = None
+        self.ws = None
+        self._init_sheet()
+
+    def _load_sa_credentials_best_effort(self) -> Optional[Any]:
+        # Accept GOOGLE_SHEETS_CREDENTIALS as JSON or base64(JSON)
+        raw = (os.getenv("GOOGLE_SHEETS_CREDENTIALS") or os.getenv("GOOGLE_CREDENTIALS") or "").strip()
+        if not raw:
+            return None
+        s = raw
+        if not s.startswith("{"):
+            try:
+                dec = base64.b64decode(s).decode("utf-8", errors="replace").strip()
+                if dec.startswith("{"):
+                    s = dec
+            except Exception:
+                pass
+        try:
+            obj = json.loads(s)
+            if isinstance(obj, dict) and service_account is not None:
+                return service_account.Credentials.from_service_account_info(
+                    obj,
+                    scopes=["https://www.googleapis.com/auth/spreadsheets"],
+                )
+        except Exception:
+            return None
+        return None
+
+    def _init_sheet(self) -> None:
+        if not GSPREAD_AVAILABLE or gspread is None:
+            return
+        try:
+            creds = self._load_sa_credentials_best_effort()
+            if creds:
+                self.gc = gspread.authorize(creds)
+            else:
+                # relies on local file/service account default
+                self.gc = gspread.service_account()
+
+            self.sheet = self.gc.open_by_key(self.spreadsheet_id)
+            try:
+                self.ws = self.sheet.worksheet(self.sheet_name)
+            except Exception:
+                self.ws = self.sheet.add_worksheet(title=self.sheet_name, rows=2000, cols=80)
+
+            self.backoff.execute_sync(self._ensure_headers)
+        except Exception as e:
+            logger.error("PerformanceStore init failed: %s", e)
+            self.gc = None
+            self.sheet = None
+            self.ws = None
+
+    def _ensure_headers(self) -> None:
+        if not self.ws:
+            return
+        # check row 5 headers
+        try:
+            existing = self.ws.row_values(self.START_ROW)
+        except Exception:
+            existing = []
+        if not existing or (existing and existing[0] != self.HEADERS[0]):
+            end_col = len(self.HEADERS)
+            rng = _a1_range(1, self.START_ROW, end_col, self.START_ROW)
+            self.ws.update(rng, [self.HEADERS])
+
+            # light summary block A1:E15
+            summary = [
+                ["Performance Summary", "", "", f"Generated: {RiyadhTime.format()}", ""],
+                ["Total Records", "0", "", "", ""],
+                ["Active Records", "0", "", "", ""],
+                ["Matured Records", "0", "", "", ""],
+                ["Win Rate", "0%", "", "", ""],
+                ["Avg ROI", "0%", "", "", ""],
+                ["Sharpe Ratio", "0", "", "", ""],
+            ]
+            try:
+                self.ws.update("A1:E7", summary)
+                self.ws.freeze(rows=self.START_ROW)
+            except Exception:
+                pass
+
+    def is_available(self) -> bool:
+        return bool(self.ws)
+
+    def load_records(self, max_records: int = 10000) -> List[PerformanceRecord]:
+        if not self.ws:
+            return []
+        end_row = self.DATA_ROW0 + max(0, int(max_records)) - 1
+        end_col = len(self.HEADERS)
+        rng = _a1_range(1, self.DATA_ROW0, end_col, end_row)
+
+        def _load() -> List[List[Any]]:
+            return self.ws.get(rng)  # type: ignore
+
+        try:
+            rows = self.backoff.execute_sync(_load)
+            records: List[PerformanceRecord] = []
+            with self.cache_lock:
+                self.cache.clear()
+                for r in rows or []:
+                    if not r or not _safe_str(r[0]):
+                        continue
+                    padded = list(r) + [""] * max(0, len(self.HEADERS) - len(r))
+                    rec = PerformanceRecord.from_sheet_row(padded, self.HEADERS)
+                    if rec.symbol:
+                        records.append(rec)
+                        self.cache[rec.key] = rec
+            return records
+        except Exception as e:
+            logger.error("Failed to load records: %s", e)
+            return []
+
+    def save_records(self, records: List[PerformanceRecord]) -> bool:
+        if not self.ws:
+            return False
+        end_col = len(self.HEADERS)
+
+        data: List[List[Any]] = []
+        for r in records:
+            data.append([
+                r.record_id,
+                r.key,
+                r.symbol,
+                r.horizon.value,
+                RiyadhTime.format(r.date_recorded),
+                r.entry_price,
+                r.entry_recommendation.value,
+                r.entry_score,
+                r.entry_risk_bucket,
+                r.entry_confidence,
+                r.origin_tab,
+                r.target_price,
+                r.target_roi,
+                RiyadhTime.format(r.target_date),
+                r.status.value,
+                r.current_price,
+                r.unrealized_roi,
+                "" if r.realized_roi is None else r.realized_roi,
+                r.outcome or "",
+                r.volatility,
+                r.max_drawdown,
+                r.sharpe_ratio,
+                r.sector or "",
+                json_dumps(r.factor_exposures) if r.factor_exposures else "{}",
+                RiyadhTime.format(r.last_updated.astimezone(_RIYADH_TZ)),
+                RiyadhTime.format(r.maturity_date) if r.maturity_date else "",
+                r.notes or "",
+            ])
+
+        def _save() -> None:
+            # clear old data region
+            clear_rng = _a1_range(1, self.DATA_ROW0, end_col, 10000)
+            self.ws.batch_clear([clear_rng])  # type: ignore
+            if data:
+                write_rng = _a1_range(1, self.DATA_ROW0, end_col, self.DATA_ROW0 + len(data) - 1)
+                self.ws.update(write_rng, data)  # type: ignore
+
+        try:
+            self.backoff.execute_sync(_save)
+            with self.cache_lock:
+                self.cache = {r.key: r for r in records}
+            return True
+        except Exception as e:
+            logger.error("Failed to save records: %s", e)
+            return False
+
+    def append_records(self, records: List[PerformanceRecord]) -> bool:
+        if not self.ws:
+            return False
+        with self.cache_lock:
+            existing = set(self.cache.keys())
+        new = [r for r in records if r.key not in existing]
+        if not new:
+            return True
+
+        rows: List[List[Any]] = []
+        for r in new:
+            rows.append([
+                r.record_id,
+                r.key,
+                r.symbol,
+                r.horizon.value,
+                RiyadhTime.format(r.date_recorded),
+                r.entry_price,
+                r.entry_recommendation.value,
+                r.entry_score,
+                r.entry_risk_bucket,
+                r.entry_confidence,
+                r.origin_tab,
+                r.target_price,
+                r.target_roi,
+                RiyadhTime.format(r.target_date),
+                r.status.value,
+                r.current_price,
+                r.unrealized_roi,
+                "" if r.realized_roi is None else r.realized_roi,
+                r.outcome or "",
+                r.volatility,
+                r.max_drawdown,
+                r.sharpe_ratio,
+                r.sector or "",
+                json_dumps(r.factor_exposures) if r.factor_exposures else "{}",
+                RiyadhTime.format(r.last_updated.astimezone(_RIYADH_TZ)),
+                RiyadhTime.format(r.maturity_date) if r.maturity_date else "",
+                r.notes or "",
+            ])
+
+        try:
+            self.backoff.execute_sync(lambda: self.ws.append_rows(rows, value_input_option="RAW"))  # type: ignore
+            with self.cache_lock:
+                for r in new:
+                    self.cache[r.key] = r
+            return True
+        except Exception as e:
+            logger.error("Failed to append records: %s", e)
+            return False
+
+    def update_summary(self, summary: PerformanceSummary) -> bool:
+        if not self.ws:
+            return False
+        block = [
+            ["Performance Summary", "", "", f"Updated: {RiyadhTime.format()}", ""],
+            ["Total Records", summary.total_records, "", "", ""],
+            ["Active Records", summary.active_records, "", "", ""],
+            ["Matured Records", summary.matured_records, "", "", ""],
+            ["Wins", summary.wins, "", "", ""],
+            ["Losses", summary.losses, "", "", ""],
+            ["Win Rate", f"{summary.win_rate:.1f}%", "", "", ""],
+            ["Avg ROI", f"{summary.avg_roi:.2f}%", "", "", ""],
+            ["Median ROI", f"{summary.median_roi:.2f}%", "", "", ""],
+            ["Best ROI", f"{summary.best_roi:.2f}%", "", "", ""],
+            ["Worst ROI", f"{summary.worst_roi:.2f}%", "", "", ""],
+            ["Sharpe Ratio", f"{summary.sharpe_ratio:.2f}", "", "", ""],
+            ["Sortino Ratio", f"{summary.sortino_ratio:.2f}", "", "", ""],
+        ]
+        try:
+            self.backoff.execute_sync(lambda: self.ws.update("A1:E13", block))  # type: ignore
+            return True
+        except Exception:
+            return False
+
+# =============================================================================
+# Analytics
+# =============================================================================
 class RiskCalculator:
     def __init__(self, risk_free_rate: float = 0.02):
-        self.risk_free_rate = risk_free_rate
-    
-    def sharpe_ratio(self, returns: Union[List[float], np.ndarray]) -> float:
-        if not NUMPY_AVAILABLE or len(returns) == 0: return 0.0
-        returns_array = np.array(returns)
-        excess_returns = returns_array - self.risk_free_rate / 252
-        if np.std(returns_array) == 0: return 0.0
-        return float(np.mean(excess_returns) / np.std(returns_array) * np.sqrt(252))
-    
-    def sortino_ratio(self, returns: Union[List[float], np.ndarray]) -> float:
-        if not NUMPY_AVAILABLE or len(returns) == 0: return 0.0
-        returns_array = np.array(returns)
-        excess_returns = returns_array - self.risk_free_rate / 252
-        downside_returns = returns_array[returns_array < 0]
-        if len(downside_returns) == 0 or np.std(downside_returns) == 0: return 0.0
-        return float(np.mean(excess_returns) / np.std(downside_returns) * np.sqrt(252))
+        self.rfr = float(risk_free_rate)
 
+    def sharpe_ratio(self, returns: List[float]) -> float:
+        if not returns:
+            return 0.0
+        if not NUMPY_AVAILABLE or np is None:
+            return 0.0
+        arr = np.asarray(returns, dtype=float)
+        if arr.size < 2:
+            return 0.0
+        if float(np.std(arr)) == 0.0:
+            return 0.0
+        excess = arr - (self.rfr / 252.0)
+        return float(np.mean(excess) / np.std(arr) * math.sqrt(252))
+
+    def sortino_ratio(self, returns: List[float]) -> float:
+        if not returns:
+            return 0.0
+        if not NUMPY_AVAILABLE or np is None:
+            return 0.0
+        arr = np.asarray(returns, dtype=float)
+        excess = arr - (self.rfr / 252.0)
+        downside = arr[arr < 0]
+        if downside.size < 2:
+            return 0.0
+        if float(np.std(downside)) == 0.0:
+            return 0.0
+        return float(np.mean(excess) / np.std(downside) * math.sqrt(252))
 
 class MonteCarloSimulator:
     def __init__(self, seed: Optional[int] = None):
         self.seed = seed
-        if seed is not None and NUMPY_AVAILABLE: np.random.seed(seed)
-    
-    def simulate_win_rate(self, historical_outcomes: List[bool], iterations: int = 10000, confidence: float = 0.95) -> Dict[str, float]:
-        if not NUMPY_AVAILABLE or not historical_outcomes:
-            return {'mean': 0.0, 'median': 0.0, 'std': 0.0, 'ci_lower': 0.0, 'ci_upper': 0.0, 'observed': 0.0}
-        n = len(historical_outcomes)
-        observed_rate = sum(historical_outcomes) / n
-        simulated_rates = np.array([np.mean(np.random.choice(historical_outcomes, size=n, replace=True)) for _ in range(iterations)])
-        return {
-            'mean': float(np.mean(simulated_rates)), 'median': float(np.median(simulated_rates)),
-            'std': float(np.std(simulated_rates)), 'ci_lower': float(np.percentile(simulated_rates, (1 - confidence) / 2 * 100)),
-            'ci_upper': float(np.percentile(simulated_rates, (1 + confidence) / 2 * 100)), 'observed': float(observed_rate)
-        }
-    
-    def simulate_returns(self, historical_returns: List[float], periods: int = 252, iterations: int = 10000) -> Dict[str, Any]:
-        if not NUMPY_AVAILABLE or not historical_returns: return {}
-        returns_array = np.array(historical_returns)
-        mu, sigma = np.mean(returns_array), np.std(returns_array)
-        simulated_paths = np.array([np.exp(np.cumsum(mu + sigma * np.random.normal(0, 1, periods))) for _ in range(iterations)])
-        final_values = simulated_paths[:, -1]
-        return {
-            'mean_final': float(np.mean(final_values)), 'median_final': float(np.median(final_values)),
-            'std_final': float(np.std(final_values)), 'ci_lower': float(np.percentile(final_values, 2.5)),
-            'ci_upper': float(np.percentile(final_values, 97.5)), 'prob_loss': float(np.mean(final_values < 1)),
-            'prob_double': float(np.mean(final_values > 2))
-        }
+        if NUMPY_AVAILABLE and np is not None and seed is not None:
+            np.random.seed(seed)
 
+    def simulate_win_rate(self, outcomes: List[bool], iterations: int = 10000, confidence: float = 0.95) -> Dict[str, float]:
+        if not outcomes or not NUMPY_AVAILABLE or np is None:
+            return {"mean": 0.0, "median": 0.0, "std": 0.0, "ci_lower": 0.0, "ci_upper": 0.0, "observed": 0.0}
+        n = len(outcomes)
+        observed = sum(1 for x in outcomes if x) / n
+        sims = np.array([np.mean(np.random.choice(outcomes, size=n, replace=True)) for _ in range(max(100, int(iterations)))], dtype=float)
+        lo = float(np.percentile(sims, ((1 - confidence) / 2) * 100))
+        hi = float(np.percentile(sims, ((1 + confidence) / 2) * 100))
+        return {
+            "mean": float(np.mean(sims)),
+            "median": float(np.median(sims)),
+            "std": float(np.std(sims)),
+            "ci_lower": lo,
+            "ci_upper": hi,
+            "observed": float(observed),
+        }
 
 class AttributionAnalyzer:
     def by_sector(self, records: List[PerformanceRecord]) -> Dict[str, Dict[str, float]]:
-        sector_performance = defaultdict(lambda: {'wins': 0, 'losses': 0, 'total_roi': 0.0})
+        bucket: Dict[str, Dict[str, float]] = {}
         for r in records:
-            if r.sector and r.realized_roi is not None:
-                sec = sector_performance[r.sector]
-                sec['total_roi'] += r.realized_roi
-                if r.is_win: sec['wins'] += 1
-                else: sec['losses'] += 1
-        return {sector: {'win_rate': (d['wins'] / (d['wins'] + d['losses']) * 100) if (d['wins'] + d['losses']) > 0 else 0, 'avg_roi': d['total_roi'] / (d['wins'] + d['losses']) if (d['wins'] + d['losses']) > 0 else 0, 'wins': d['wins'], 'losses': d['losses']} for sector, d in sector_performance.items()}
-
-
-# =============================================================================
-# Data Store (Google Sheets with caching)
-# =============================================================================
-
-class PerformanceStore:
-    HEADERS = ['Record ID', 'Key', 'Symbol', 'Horizon', 'Date Recorded (Riyadh)', 'Entry Price', 'Entry Recommendation', 'Entry Score', 'Risk Bucket', 'Confidence', 'Origin Tab', 'Target Price', 'Target ROI %', 'Target Date (Riyadh)', 'Status', 'Current Price', 'Unrealized ROI %', 'Realized ROI %', 'Outcome', 'Volatility', 'Max Drawdown %', 'Sharpe Ratio', 'Sector', 'Factor Exposures', 'Last Updated (Riyadh)', 'Maturity Date', 'Notes']
-    
-    def __init__(self, spreadsheet_id: str, sheet_name: str = 'Performance_Log'):
-        self.spreadsheet_id = spreadsheet_id
-        self.sheet_name = sheet_name
-        self.cache: Dict[str, PerformanceRecord] = {}
-        self.cache_lock = Lock()
-        self.last_sync: Optional[datetime] = None
-        self.backoff = FullJitterBackoff()
-        self._init_sheet()
-    
-    def _init_sheet(self) -> None:
-        if not GSPREAD_AVAILABLE: return
-        try:
-            creds_json = os.getenv('GOOGLE_SHEETS_CREDENTIALS')
-            credentials = None
-            if creds_json:
-                try:
-                    decoded = base64.b64decode(creds_json).decode('utf-8')
-                    if decoded.startswith('{'): creds_json = decoded
-                except: pass
-                credentials = service_account.Credentials.from_service_account_info(json.loads(creds_json), scopes=['https://www.googleapis.com/auth/spreadsheets'])
-            
-            self.gc = gspread.authorize(credentials) if credentials else gspread.service_account()
-            self.sheet = self.gc.open_by_key(self.spreadsheet_id)
-            
-            try: self.worksheet = self.sheet.worksheet(self.sheet_name)
-            except gspread.WorksheetNotFound: self.worksheet = self.sheet.add_worksheet(title=self.sheet_name, rows=1000, cols=50)
-            
-            self.backoff.execute_sync(self._ensure_headers)
-        except Exception as e:
-            logger.error(f"Sheet init failed: {e}")
-            self.gc = None
-    
-    def _ensure_headers(self) -> None:
-        if not hasattr(self, 'worksheet'): return
-        headers = self.worksheet.row_values(5)
-        if not headers or headers[0] != self.HEADERS[0]:
-            self.worksheet.update(f'A5:{chr(64+len(self.HEADERS))}5', [self.HEADERS])
-            summary_data = [['Performance Summary', '', '', f'Generated: {RiyadhTime.format()}', ''], ['Total Records', '0', '', '', ''], ['Win Rate', '0%', '', '', ''], ['Avg ROI', '0%', '', '', ''], ['Sharpe Ratio', '0', '', '', '']]
-            self.worksheet.update('A1:E5', summary_data)
-            self.worksheet.freeze(rows=5)
-    
-    def load_records(self, max_records: int = 10000) -> List[PerformanceRecord]:
-        if not hasattr(self, 'worksheet'): return []
-        def _load(): return self.worksheet.get(f'A6:{chr(64+len(self.HEADERS))}{6+max_records}')
-        try:
-            records_data = self.backoff.execute_sync(_load)
-            records = []
-            with self.cache_lock:
-                self.cache.clear()
-                for row in records_data:
-                    if not row or not row[0]: continue
-                    padded_row = row + [''] * (len(self.HEADERS) - len(row))
-                    record = PerformanceRecord.from_sheet_row(padded_row, self.HEADERS)
-                    records.append(record)
-                    self.cache[record.key] = record
-                self.last_sync = RiyadhTime.now()
-            return records
-        except Exception as e:
-            logger.error(f"Failed to load records: {e}")
-            return []
-    
-    def save_records(self, records: List[PerformanceRecord]) -> bool:
-        if not hasattr(self, 'worksheet'): return False
-        data = [[r.record_id, r.key, r.symbol, r.horizon.value, RiyadhTime.format(r.date_recorded), r.entry_price, r.entry_recommendation.value, r.entry_score, r.entry_risk_bucket, r.entry_confidence, r.origin_tab, r.target_price, r.target_roi, RiyadhTime.format(r.target_date), r.status.value, r.current_price, r.unrealized_roi, r.realized_roi or '', r.outcome or '', r.volatility, r.max_drawdown, r.sharpe_ratio, r.sector or '', json.dumps(r.factor_exposures), RiyadhTime.format(r.last_updated), RiyadhTime.format(r.maturity_date) if r.maturity_date else '', ''] for r in records]
-        def _save():
-            self.worksheet.batch_clear(['A6:Z10000'])
-            if data: self.worksheet.update(f'A6:{chr(64+len(self.HEADERS))}{6+len(data)-1}', data)
-        try:
-            self.backoff.execute_sync(_save)
-            with self.cache_lock:
-                for r in records: self.cache[r.key] = r
-                self.last_sync = RiyadhTime.now()
-            return True
-        except Exception as e:
-            logger.error(f"Failed to save records: {e}")
-            return False
-            
-    def append_records(self, records: List[PerformanceRecord]) -> bool:
-        if not hasattr(self, 'worksheet'): return False
-        existing_keys = set(self.cache.keys())
-        new_records = [r for r in records if r.key not in existing_keys]
-        if not new_records: return True
-        data = [[r.record_id, r.key, r.symbol, r.horizon.value, RiyadhTime.format(r.date_recorded), r.entry_price, r.entry_recommendation.value, r.entry_score, r.entry_risk_bucket, r.entry_confidence, r.origin_tab, r.target_price, r.target_roi, RiyadhTime.format(r.target_date), r.status.value, r.current_price, r.unrealized_roi, r.realized_roi or '', r.outcome or '', r.volatility, r.max_drawdown, r.sharpe_ratio, r.sector or '', json.dumps(r.factor_exposures), RiyadhTime.format(r.last_updated), RiyadhTime.format(r.maturity_date) if r.maturity_date else '', ''] for r in new_records]
-        try:
-            self.backoff.execute_sync(lambda: self.worksheet.append_rows(data, value_input_option='RAW'))
-            with self.cache_lock:
-                for r in new_records: self.cache[r.key] = r
-            return True
-        except Exception as e:
-            logger.error(f"Failed to append records: {e}")
-            return False
-
-    def update_summary(self, summary: PerformanceSummary) -> bool:
-        if not hasattr(self, 'worksheet'): return False
-        summary_data = [['Performance Summary', '', '', f'Updated: {RiyadhTime.format()}', ''], ['Total Records', summary.total_records, '', '', ''], ['Active Records', summary.active_records, '', '', ''], ['Matured Records', summary.matured_records, '', '', ''], ['Wins', summary.wins, '', '', ''], ['Losses', summary.losses, '', '', ''], ['Win Rate', f"{summary.win_rate:.1f}%", '', '', ''], ['Avg ROI', f"{summary.avg_roi:.2f}%", '', '', ''], ['Median ROI', f"{summary.median_roi:.2f}%", '', '', ''], ['Best ROI', f"{summary.best_roi:.2f}%", '', '', ''], ['Worst ROI', f"{summary.worst_roi:.2f}%", '', '', ''], ['Sharpe Ratio', f"{summary.sharpe_ratio:.2f}", '', '', ''], ['Sortino Ratio', f"{summary.sortino_ratio:.2f}", '', '', ''], ['Max Drawdown', f"{summary.max_drawdown:.2f}%", '', '', '']]
-        try:
-            self.backoff.execute_sync(lambda: self.worksheet.update('A1:E15', summary_data))
-            return True
-        except Exception: return False
-
-
-# =============================================================================
-# Analysis & Reporting
-# =============================================================================
+            if not r.sector or r.realized_roi is None:
+                continue
+            sec = r.sector
+            if sec not in bucket:
+                bucket[sec] = {"wins": 0.0, "losses": 0.0, "total_roi": 0.0, "count": 0.0}
+            bucket[sec]["count"] += 1.0
+            bucket[sec]["total_roi"] += float(r.realized_roi)
+            if (r.realized_roi or 0.0) > 0:
+                bucket[sec]["wins"] += 1.0
+            elif (r.realized_roi or 0.0) < 0:
+                bucket[sec]["losses"] += 1.0
+        out: Dict[str, Dict[str, float]] = {}
+        for sec, d in bucket.items():
+            cnt = max(1.0, d["count"])
+            wins = d["wins"]
+            losses = d["losses"]
+            out[sec] = {
+                "win_rate": (wins / max(1.0, wins + losses)) * 100.0,
+                "avg_roi": d["total_roi"] / cnt,
+                "wins": wins,
+                "losses": losses,
+                "count": cnt,
+            }
+        return out
 
 class PerformanceAnalyzer:
     def __init__(self):
-        self.risk_calc = RiskCalculator()
-        self.attribution = AttributionAnalyzer()
-        self.simulator = MonteCarloSimulator(seed=42)
-    
-    def analyze_records(self, records: List[PerformanceRecord]) -> PerformanceSummary:
-        summary = PerformanceSummary(total_records=len(records))
+        self.risk = RiskCalculator()
+        self.sim = MonteCarloSimulator(seed=42)
+        self.attr = AttributionAnalyzer()
+
+    def analyze(self, records: List[PerformanceRecord]) -> PerformanceSummary:
+        s = PerformanceSummary(total_records=len(records))
+        s.active_records = sum(1 for r in records if r.status == PerformanceStatus.ACTIVE)
         matured = [r for r in records if r.status == PerformanceStatus.MATURED and r.realized_roi is not None]
-        summary.active_records = len([r for r in records if r.status == PerformanceStatus.ACTIVE])
-        summary.matured_records = len(matured)
-        
+        s.matured_records = len(matured)
+
         if matured:
-            roi_values = []
-            for r in matured:
-                roi_values.append(r.realized_roi or 0)
-                if r.is_win: summary.wins += 1
-                elif r.is_win is False: summary.losses += 1
-                else: summary.breakeven += 1
-            
-            if NUMPY_AVAILABLE:
-                roi_array = np.array(roi_values)
-                summary.avg_roi, summary.median_roi, summary.roi_std, summary.best_roi, summary.worst_roi = float(np.mean(roi_array)), float(np.median(roi_array)), float(np.std(roi_array)), float(np.max(roi_array)), float(np.min(roi_array))
+            rois = [float(r.realized_roi or 0.0) for r in matured]
+            wins = sum(1 for r in matured if (r.realized_roi or 0.0) > 0)
+            losses = sum(1 for r in matured if (r.realized_roi or 0.0) < 0)
+            breakeven = len(matured) - wins - losses
+            s.wins, s.losses, s.breakeven = wins, losses, breakeven
+            total_outcomes = wins + losses
+            s.win_rate = (wins / total_outcomes * 100.0) if total_outcomes > 0 else 0.0
+
+            if NUMPY_AVAILABLE and np is not None:
+                arr = np.asarray(rois, dtype=float)
+                s.avg_roi = float(np.mean(arr))
+                s.median_roi = float(np.median(arr))
+                s.roi_std = float(np.std(arr))
+                s.best_roi = float(np.max(arr))
+                s.worst_roi = float(np.min(arr))
             else:
-                summary.avg_roi = sum(roi_values) / len(roi_values)
-                roi_values.sort()
-                summary.median_roi = roi_values[len(roi_values)//2]
-                summary.best_roi, summary.worst_roi = max(roi_values), min(roi_values)
-                
-            total_outcomes = summary.wins + summary.losses
-            summary.win_rate = (summary.wins / total_outcomes * 100) if total_outcomes > 0 else 0
-            if len(roi_values) > 1:
-                summary.sharpe_ratio = self.risk_calc.sharpe_ratio(roi_values)
-                summary.sortino_ratio = self.risk_calc.sortino_ratio(roi_values)
-                
-            horizon_groups = defaultdict(list)
-            for r in matured: horizon_groups[r.horizon.value].append(r)
-            for horizon, group in horizon_groups.items():
-                w = sum(1 for r in group if r.is_win)
-                t = len(group)
-                summary.hit_rate_by_horizon[horizon] = (w / t * 100) if t > 0 else 0
-            summary.performance_by_sector = self.attribution.by_sector(matured)
-            
-        if PROMETHEUS_AVAILABLE: perf_win_rate.set(summary.win_rate)
-        return summary
-    
-    def calculate_confidence_intervals(self, records: List[PerformanceRecord], confidence: float = 0.95) -> Dict[str, Any]:
-        matured = [r for r in records if r.status == PerformanceStatus.MATURED and r.realized_roi is not None]
-        if not matured or not NUMPY_AVAILABLE: return {}
-        outcomes = [r.is_win for r in matured if r.is_win is not None]
-        roi_values = [r.realized_roi for r in matured if r.realized_roi is not None]
-        results = {}
-        if outcomes: results['win_rate'] = self.simulator.simulate_win_rate(outcomes, iterations=10000, confidence=confidence)
-        if roi_values:
-            roi_array = np.array(roi_values)
-            mean_roi, std_roi, n = np.mean(roi_array), np.std(roi_array), len(roi_array)
-            z = stats.norm.ppf((1 + confidence) / 2) if SCIPY_AVAILABLE else 1.96
-            margin = z * std_roi / np.sqrt(n)
-            results['roi'] = {'mean': float(mean_roi), 'std': float(std_roi), 'ci_lower': float(mean_roi - margin), 'ci_upper': float(mean_roi + margin), 'n': n}
-        return results
+                rois_sorted = sorted(rois)
+                s.avg_roi = sum(rois) / max(1, len(rois))
+                s.median_roi = rois_sorted[len(rois_sorted) // 2]
+                s.best_roi = max(rois_sorted)
+                s.worst_roi = min(rois_sorted)
 
-    def rolling_performance(self, records: List[PerformanceRecord], window_days: int = 30) -> Dict[str, List[float]]:
-        matured = [r for r in records if r.status == PerformanceStatus.MATURED and r.realized_roi is not None]
-        if not matured: return {}
-        matured.sort(key=lambda x: x.maturity_date or x.date_recorded)
-        dates, rolling_wins, rolling_win_rate, rolling_roi = [], [], [], []
-        window = timedelta(days=window_days)
-        current = matured[0].date_recorded
-        
-        while current <= matured[-1].date_recorded:
-            window_records = [r for r in matured if (r.maturity_date or r.date_recorded) >= (current - window) and (r.maturity_date or r.date_recorded) <= current]
-            if window_records:
-                w = sum(1 for r in window_records if r.is_win)
-                t = len(window_records)
-                dates.append(current.strftime('%Y-%m-%d'))
-                rolling_wins.append(w)
-                rolling_win_rate.append((w / t * 100) if t > 0 else 0)
-                rolling_roi.append(float(np.mean([r.realized_roi for r in window_records])) if NUMPY_AVAILABLE else 0.0)
-            current += timedelta(days=1)
-        return {'dates': dates, 'wins': rolling_wins, 'win_rate': rolling_win_rate, 'avg_roi': rolling_roi}
+            if len(rois) > 2:
+                # treat ROI as daily returns proxy (best-effort)
+                s.sharpe_ratio = self.risk.sharpe_ratio(rois)
+                s.sortino_ratio = self.risk.sortino_ratio(rois)
 
+            # hit rate by horizon
+            groups: Dict[str, List[PerformanceRecord]] = defaultdict(list)
+            for r in matured:
+                groups[r.horizon.value].append(r)
+            for h, grp in groups.items():
+                w = sum(1 for r in grp if (r.realized_roi or 0.0) > 0)
+                t = len(grp)
+                s.hit_rate_by_horizon[h] = (w / t * 100.0) if t else 0.0
 
+            s.performance_by_sector = self.attr.by_sector(matured)
+
+            try:
+                perf_win_rate.set(float(s.win_rate))
+            except Exception:
+                pass
+
+        return s
+
+# =============================================================================
+# Reporting
+# =============================================================================
 class ReportGenerator:
     def __init__(self, analyzer: PerformanceAnalyzer):
         self.analyzer = analyzer
-    
+
     def generate_json(self, records: List[PerformanceRecord], summary: PerformanceSummary) -> str:
-        report = {'generated_at': RiyadhTime.format(), 'version': SCRIPT_VERSION, 'summary': summary.to_dict(), 'records': [r.to_dict() for r in records], 'confidence_intervals': self.analyzer.calculate_confidence_intervals(records), 'rolling': self.analyzer.rolling_performance(records)}
+        matured = [r for r in records if r.status == PerformanceStatus.MATURED and r.realized_roi is not None]
+        outcomes = [(r.realized_roi or 0.0) > 0 for r in matured]
+        ci = self.analyzer.sim.simulate_win_rate(outcomes, iterations=10000, confidence=0.95) if outcomes else {}
+        report = {
+            "generated_at_riyadh": RiyadhTime.format(),
+            "version": SCRIPT_VERSION,
+            "summary": summary.to_dict(),
+            "confidence_intervals": {"win_rate": ci} if ci else {},
+            "records": [r.to_dict() for r in records],
+        }
         return json_dumps(report, indent=2)
-    
+
     def generate_csv(self, records: List[PerformanceRecord], filepath: str) -> None:
-        if not records: return
-        records_data = [r.to_dict() for r in records]
-        if PANDAS_AVAILABLE:
-            pd.DataFrame(records_data).to_csv(filepath, index=False)
-        else:
-            with open(filepath, 'w', newline='') as f:
-                writer = csv.DictWriter(f, fieldnames=records_data[0].keys())
-                writer.writeheader()
-                writer.writerows(records_data)
-    
-    def _generate_plots(self, records: List[PerformanceRecord], summary: PerformanceSummary) -> Dict[str, str]:
-        if not PLOT_AVAILABLE: return {}
-        plots = {}
-        try:
-            matured = [r for r in records if r.status == PerformanceStatus.MATURED]
-            matured.sort(key=lambda x: x.maturity_date or x.date_recorded)
-            if matured:
-                fig = Figure(figsize=(10, 6))
-                ax = fig.add_subplot(111)
-                dates = [(r.maturity_date or r.date_recorded) for r in matured]
-                cumulative_wins = np.cumsum([1 if r.is_win else 0 for r in matured])
-                win_rate = cumulative_wins / np.arange(1, len(matured) + 1) * 100
-                ax.plot(dates, win_rate, 'b-', linewidth=2)
-                ax.fill_between(dates, win_rate - 10, win_rate + 10, alpha=0.2)
-                ax.set_xlabel('Date')
-                ax.set_ylabel('Cumulative Win Rate (%)')
-                ax.set_title('Win Rate Over Time')
-                ax.grid(True, alpha=0.3)
-                buf = io.BytesIO()
-                fig.savefig(buf, format='png', dpi=100, bbox_inches='tight')
-                plots['win_rate'] = base64.b64encode(buf.getvalue()).decode()
+        if not records:
+            return
+        rows = [r.to_dict() for r in records]
+        fieldnames = list(rows[0].keys())
+        with open(filepath, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=fieldnames)
+            w.writeheader()
+            w.writerows(rows)
 
-            roi_values = [r.realized_roi for r in records if r.realized_roi is not None]
-            if roi_values:
-                fig2 = Figure(figsize=(10, 6))
-                ax2 = fig2.add_subplot(111)
-                sns.histplot(roi_values, bins=30, kde=True, ax=ax2)
-                ax2.set_xlabel('ROI (%)')
-                ax2.set_ylabel('Frequency')
-                ax2.set_title('ROI Distribution')
-                ax2.axvline(0, color='red', linestyle='--')
-                ax2.axvline(np.mean(roi_values), color='green', linestyle='--', label=f'Mean: {np.mean(roi_values):.1f}%')
-                ax2.legend()
-                buf2 = io.BytesIO()
-                fig2.savefig(buf2, format='png', dpi=100, bbox_inches='tight')
-                plots['roi_distribution'] = base64.b64encode(buf2.getvalue()).decode()
-        except Exception as e: logger.warning(f"Plot generation failed: {e}")
-        return plots
-        
+    def _plot_png_base64(self, fig: "Figure") -> str:
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=110, bbox_inches="tight")
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
+
     def generate_html(self, records: List[PerformanceRecord], summary: PerformanceSummary, filepath: str) -> None:
-        confidence = self.analyzer.calculate_confidence_intervals(records)
-        plots = self._generate_plots(records, summary) if PLOT_AVAILABLE and records else {}
-        
-        html = f"""<!DOCTYPE html><html><head><title>Performance Report - {RiyadhTime.format()}</title><style>
-        body {{ font-family: Arial, sans-serif; margin: 20px; background: #f5f5f5; }}
-        .container {{ max-width: 1200px; margin: auto; background: white; padding: 20px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }}
-        h1 {{ color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px; }} h2 {{ color: #34495e; margin-top: 30px; }}
-        .summary {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin: 20px 0; }}
-        .card {{ background: #f8f9fa; padding: 15px; border-radius: 5px; border-left: 4px solid #3498db; }}
-        .card h3 {{ margin: 0 0 10px 0; color: #2c3e50; }} .card .value {{ font-size: 24px; font-weight: bold; color: #2980b9; }}
-        table {{ width: 100%; border-collapse: collapse; margin: 20px 0; }} th {{ background: #2c3e50; color: white; padding: 10px; text-align: left; }}
-        td {{ padding: 10px; border-bottom: 1px solid #ddd; }} tr:hover {{ background: #f5f5f5; }}
-        .win {{ color: #27ae60; }} .loss {{ color: #c0392b; }} .plot {{ margin: 20px 0; text-align: center; }}
-        </style></head><body><div class="container"><h1>📊 Performance Report</h1><p>Generated: {RiyadhTime.format()}</p>
-        <div class="summary"><div class="card"><h3>Total Records</h3><div class="value">{summary.total_records}</div></div>
-        <div class="card"><h3>Win Rate</h3><div class="value">{summary.win_rate:.1f}%</div></div>
-        <div class="card"><h3>Avg ROI</h3><div class="value">{summary.avg_roi:.2f}%</div></div>
-        <div class="card"><h3>Sharpe Ratio</h3><div class="value">{summary.sharpe_ratio:.2f}</div></div></div>"""
-        
-        if confidence and 'win_rate' in confidence:
-            wr = confidence['win_rate']
-            html += f"<h2>Confidence Intervals (95%)</h2><table><tr><th>Metric</th><th>Mean</th><th>Lower Bound</th><th>Upper Bound</th></tr><tr><td>Win Rate</td><td>{wr.get('mean',0)*100:.1f}%</td><td>{wr.get('ci_lower',0)*100:.1f}%</td><td>{wr.get('ci_upper',0)*100:.1f}%</td></tr></table>"
-            
-        html += "<h2>Recent Records</h2><table><tr><th>Symbol</th><th>Horizon</th><th>Entry Date</th><th>ROI</th><th>Outcome</th></tr>"
-        for r in sorted(records, key=lambda x: x.date_recorded, reverse=True)[:20]:
+        plots: Dict[str, str] = {}
+        if PLOT_AVAILABLE and Figure is not None and NUMPY_AVAILABLE and np is not None:
+            try:
+                matured = [r for r in records if r.status == PerformanceStatus.MATURED and r.realized_roi is not None]
+                matured.sort(key=lambda x: (x.maturity_date or x.date_recorded))
+
+                if matured:
+                    # win-rate over time
+                    fig1 = Figure(figsize=(10, 5))
+                    ax1 = fig1.add_subplot(111)
+                    dates = [(r.maturity_date or r.date_recorded).astimezone(_RIYADH_TZ) for r in matured]
+                    wins = np.cumsum([1 if (r.realized_roi or 0.0) > 0 else 0 for r in matured])
+                    denom = np.arange(1, len(matured) + 1, dtype=float)
+                    win_rate = (wins / denom) * 100.0
+                    ax1.plot(dates, win_rate, linewidth=2)
+                    ax1.set_title("Cumulative Win Rate (%)")
+                    ax1.set_xlabel("Date")
+                    ax1.set_ylabel("Win Rate %")
+                    ax1.grid(True, alpha=0.25)
+                    plots["win_rate"] = self._plot_png_base64(fig1)
+
+                    # ROI histogram (matplotlib only)
+                    roi = np.asarray([float(r.realized_roi or 0.0) for r in matured], dtype=float)
+                    fig2 = Figure(figsize=(10, 5))
+                    ax2 = fig2.add_subplot(111)
+                    ax2.hist(roi, bins=30)
+                    ax2.axvline(0.0, linestyle="--", linewidth=1.5)
+                    ax2.set_title("ROI Distribution (%)")
+                    ax2.set_xlabel("ROI %")
+                    ax2.set_ylabel("Frequency")
+                    ax2.grid(True, alpha=0.2)
+                    plots["roi_hist"] = self._plot_png_base64(fig2)
+            except Exception as e:
+                logger.warning("Plot generation failed: %s", e)
+
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Performance Report</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; background: #f5f5f5; margin: 20px; }}
+    .container {{ max-width: 1200px; margin: auto; background: #fff; padding: 18px; box-shadow: 0 1px 6px rgba(0,0,0,0.08); }}
+    h1 {{ margin: 0 0 10px 0; }}
+    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }}
+    .card {{ background: #f8f9fa; padding: 12px; border-radius: 8px; border-left: 4px solid #2b6cb0; }}
+    table {{ width: 100%; border-collapse: collapse; margin-top: 14px; }}
+    th, td {{ border-bottom: 1px solid #e5e7eb; padding: 10px; text-align: left; }}
+    th {{ background: #111827; color: #fff; }}
+    .pos {{ color: #16a34a; font-weight: bold; }}
+    .neg {{ color: #dc2626; font-weight: bold; }}
+    .plot {{ margin: 16px 0; text-align: center; }}
+  </style>
+</head>
+<body>
+<div class="container">
+  <h1>📊 Performance Report</h1>
+  <div>Generated (Riyadh): {RiyadhTime.format()}</div>
+
+  <div class="grid" style="margin-top:12px;">
+    <div class="card"><div>Total Records</div><div style="font-size:22px;font-weight:bold;">{summary.total_records}</div></div>
+    <div class="card"><div>Win Rate</div><div style="font-size:22px;font-weight:bold;">{summary.win_rate:.1f}%</div></div>
+    <div class="card"><div>Avg ROI</div><div style="font-size:22px;font-weight:bold;">{summary.avg_roi:.2f}%</div></div>
+    <div class="card"><div>Sharpe</div><div style="font-size:22px;font-weight:bold;">{summary.sharpe_ratio:.2f}</div></div>
+  </div>
+
+  {"<div class='plot'><img style='max-width:100%;' src='data:image/png;base64," + plots.get("win_rate","") + "'/></div>" if plots.get("win_rate") else ""}
+  {"<div class='plot'><img style='max-width:100%;' src='data:image/png;base64," + plots.get("roi_hist","") + "'/></div>" if plots.get("roi_hist") else ""}
+
+  <h2>Recent Records</h2>
+  <table>
+    <tr><th>Symbol</th><th>Horizon</th><th>Entry Date</th><th>Status</th><th>ROI</th><th>Outcome</th></tr>
+"""
+        recs = sorted(records, key=lambda r: r.date_recorded, reverse=True)[:30]
+        for r in recs:
             roi = r.realized_roi if r.realized_roi is not None else r.unrealized_roi
-            html += f"<tr><td><strong>{r.symbol}</strong></td><td>{r.horizon.value}</td><td>{RiyadhTime.format(r.date_recorded, '%Y-%m-%d')}</td><td class='{'win' if roi > 0 else 'loss' if roi < 0 else ''}'>{roi:.2f}%</td><td>{r.outcome or '⏳'}</td></tr>"
-        
-        if plots:
-            html += f"</table><h2>Visualizations</h2><div class='plot'><img src='data:image/png;base64,{plots.get('win_rate', '')}'></div><div class='plot'><img src='data:image/png;base64,{plots.get('roi_distribution', '')}'></div>"
-            
-        html += f"<div class='footer'>Generated by TFB Performance Tracker v{SCRIPT_VERSION}</div></div></body></html>"
-        Path(filepath).write_text(html, encoding='utf-8')
+            cls = "pos" if (roi or 0.0) > 0 else "neg" if (roi or 0.0) < 0 else ""
+            html += f"<tr><td><b>{r.symbol}</b></td><td>{r.horizon.value}</td><td>{RiyadhTime.format(r.date_recorded, '%Y-%m-%d')}</td><td>{r.status.value}</td><td class='{cls}'>{roi:.2f}%</td><td>{r.outcome or ''}</td></tr>\n"
 
+        html += """  </table>
+</div>
+</body>
+</html>
+"""
+        Path(filepath).write_text(html, encoding="utf-8")
 
 # =============================================================================
-# Main Orchestrator
+# Orchestrator
 # =============================================================================
-
 class PerformanceTrackerApp:
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.spreadsheet_id = self._get_spreadsheet_id()
-        self.store = PerformanceStore(self.spreadsheet_id, args.sheet_name or 'Performance_Log')
+        self.store = PerformanceStore(self.spreadsheet_id, args.sheet_name or PerformanceStore.SHEET_DEFAULT)
         self.analyzer = PerformanceAnalyzer()
-        self.report_gen = ReportGenerator(self.analyzer)
-        self.running = False
-        
+        self.reporter = ReportGenerator(self.analyzer)
+
+        self.backend = BackendClient(
+            base_url=self._backend_base_url(),
+            token=self._backend_token(),
+        )
+
+        self.stop_event = Event()
+
     def _get_spreadsheet_id(self) -> str:
-        if self.args.sheet_id: return self.args.sheet_id
-        for key in ['DEFAULT_SPREADSHEET_ID', 'GOOGLE_SHEETS_ID', 'SPREADSHEET_ID']:
-            if value := os.getenv(key): return value
-        raise ValueError("No spreadsheet ID provided.")
-        
-    async def run(self) -> int:
+        if self.args.sheet_id and str(self.args.sheet_id).strip():
+            return str(self.args.sheet_id).strip()
+
+        sid = (os.getenv("DEFAULT_SPREADSHEET_ID") or "").strip()
+        if sid:
+            return sid
+
+        sid = (getattr(settings, "default_spreadsheet_id", None) or "").strip() if settings else ""
+        if sid:
+            return sid
+
+        raise ValueError("No spreadsheet ID provided (use --sheet-id or DEFAULT_SPREADSHEET_ID env).")
+
+    def _backend_base_url(self) -> str:
+        env_url = (os.getenv("BACKEND_BASE_URL") or "").strip()
+        if env_url:
+            return env_url.rstrip("/")
+        cfg_url = (getattr(settings, "backend_base_url", None) or "").strip() if settings else ""
+        if cfg_url:
+            return cfg_url.rstrip("/")
+        return (os.getenv("TFB_BASE_URL") or "").strip().rstrip("/")
+
+    def _backend_token(self) -> str:
+        for k in ("TFB_TOKEN", "APP_TOKEN", "BACKEND_TOKEN", "X_APP_TOKEN"):
+            v = (os.getenv(k) or "").strip()
+            if v:
+                return v
+        return ""
+
+    def _horizons(self) -> List[HorizonType]:
+        out: List[HorizonType] = []
+        for raw in (self.args.horizons or ["1M", "3M"]):
+            out.append(_parse_enum_value(HorizonType, raw, HorizonType.MONTH_1))
+        # dedup preserve order
+        seen = set()
+        final = []
+        for h in out:
+            if h.value not in seen:
+                seen.add(h.value)
+                final.append(h)
+        return final
+
+    def _derive_target(self, row: Dict[str, Any], horizon: HorizonType, entry_price: float) -> Tuple[float, float]:
+        # returns (target_price, target_roi_pct)
+        suffix = "1m" if horizon.value == "1M" else "3m" if horizon.value == "3M" else "12m" if horizon.value == "1Y" else ""
+        fkey = f"forecast_price_{suffix}" if suffix else ""
+        rkey = f"expected_roi_{suffix}" if suffix else ""
+
+        tgt_price = _safe_float(row.get(fkey), default=0.0) if fkey else 0.0
+        tgt_roi = _safe_float(row.get(rkey), default=0.0) if rkey else 0.0
+
+        if tgt_price <= 0.0 and tgt_roi != 0.0 and entry_price > 0.0:
+            tgt_price = entry_price * (1.0 + (tgt_roi / 100.0))
+        if tgt_roi == 0.0 and tgt_price > 0.0 and entry_price > 0.0:
+            tgt_roi = (tgt_price / entry_price - 1.0) * 100.0
+
+        return tgt_price, tgt_roi
+
+    def _recommendation_from_row(self, row: Dict[str, Any]) -> RecommendationType:
+        s = _safe_str(row.get("recommendation")).upper()
+        if "STRONG" in s and "BUY" in s:
+            return RecommendationType.STRONG_BUY
+        if "BUY" in s:
+            return RecommendationType.BUY
+        if "STRONG" in s and "SELL" in s:
+            return RecommendationType.STRONG_SELL
+        if "SELL" in s:
+            return RecommendationType.SELL
+        if "HOLD" in s:
+            return RecommendationType.HOLD
+        return RecommendationType.HOLD
+
+    async def record_from_top10(self, existing: List[PerformanceRecord]) -> List[PerformanceRecord]:
+        if not self.backend.base_url:
+            return []
+
+        rows, meta = await self.backend.get_top10_rows(criteria_overrides=None)
+        if not rows:
+            return []
+
+        existing_keys = set(r.key for r in existing)
+        now = RiyadhTime.now()
+        horizons = self._horizons()
+
+        new_records: List[PerformanceRecord] = []
+        for row in rows:
+            sym = _safe_str(row.get("symbol")).upper()
+            if not sym:
+                continue
+            entry_price = _safe_float(row.get("current_price") or row.get("price"), default=0.0)
+            if entry_price <= 0.0:
+                continue
+
+            score = _safe_float(row.get("overall_score"), default=0.0)
+            risk_score = row.get("risk_score")
+            conf = row.get("forecast_confidence")
+            risk_bucket = _risk_bucket_from_score(_safe_float(risk_score, default=0.0) if risk_score is not None else None)
+            conf_bucket = _confidence_bucket(_safe_float(conf, default=0.0) if conf is not None else None)
+            rec = self._recommendation_from_row(row)
+            origin = _safe_str(row.get("source_page") or row.get("origin") or "Top_10_Investments") or "Top_10_Investments"
+
+            for h in horizons:
+                tgt_price, tgt_roi = self._derive_target(row, h, entry_price)
+                if tgt_price <= 0.0:
+                    # still track, but keep target at entry
+                    tgt_price = entry_price
+                    tgt_roi = 0.0
+
+                target_date = now + timedelta(days=h.days)
+                r = PerformanceRecord(
+                    record_id=str(uuid.uuid4()),
+                    symbol=sym,
+                    horizon=h,
+                    date_recorded=now,
+                    entry_price=entry_price,
+                    entry_recommendation=rec,
+                    entry_score=score,
+                    entry_risk_bucket=risk_bucket,
+                    entry_confidence=conf_bucket,
+                    origin_tab=origin,
+                    target_price=tgt_price,
+                    target_roi=tgt_roi,
+                    target_date=target_date,
+                    status=PerformanceStatus.ACTIVE,
+                    current_price=entry_price,
+                    unrealized_roi=0.0,
+                    last_updated=_utc_now(),
+                )
+                if r.key not in existing_keys:
+                    existing_keys.add(r.key)
+                    new_records.append(r)
+
+        return new_records
+
+    async def audit_active_records(self, records: List[PerformanceRecord]) -> List[PerformanceRecord]:
+        # Update current_price/unrealized; mature if target_date passed
+        active = [r for r in records if r.status == PerformanceStatus.ACTIVE and r.symbol]
+        if not active:
+            return records
+
+        syms = list(dict.fromkeys([r.symbol for r in active]))
+        price_map = await self.backend.fetch_prices(syms) if self.backend.base_url else {}
+        now_r = RiyadhTime.now()
+
+        for r in active:
+            px = float(price_map.get(r.symbol, 0.0))
+            if px > 0.0:
+                r.current_price = px
+                if r.entry_price > 0:
+                    r.unrealized_roi = (px / r.entry_price - 1.0) * 100.0
+
+            # maturity check
+            if r.target_date and now_r >= r.target_date:
+                r.status = PerformanceStatus.MATURED
+                r.maturity_date = now_r
+                r.realized_roi = float(r.unrealized_roi)
+                if (r.realized_roi or 0.0) > 0:
+                    r.outcome = "WIN"
+                elif (r.realized_roi or 0.0) < 0:
+                    r.outcome = "LOSS"
+                else:
+                    r.outcome = "BREAKEVEN"
+
+            r.last_updated = _utc_now()
+
+        return records
+
+    async def run_once(self) -> int:
+        # Load records (if store missing, we can still export analysis-only from backend)
+        loop = asyncio.get_running_loop()
+        records: List[PerformanceRecord] = []
+
+        if self.store.is_available():
+            records = await loop.run_in_executor(_CPU_EXECUTOR, self.store.load_records, int(self.args.max_records or 10000))
+        else:
+            records = []
+
+        if self.args.record:
+            new = await self.record_from_top10(records)
+            if new and self.store.is_available():
+                ok = await loop.run_in_executor(_CPU_EXECUTOR, self.store.append_records, new)
+                if ok:
+                    records.extend(new)
+
+        if self.args.audit:
+            records = await self.audit_active_records(records)
+            if self.store.is_available():
+                await loop.run_in_executor(_CPU_EXECUTOR, self.store.save_records, records)
+
+        summary = self.analyzer.analyze(records) if self.args.analyze or self.args.export else PerformanceSummary(total_records=len(records))
         try:
-            records = await asyncio.get_running_loop().run_in_executor(_CPU_EXECUTOR, self.store.load_records, self.args.max_records or 10000)
-            
-            if self.args.record:
-                # In a real implementation, you'd fetch candidates from SourceScanner here and record them
-                pass
-            
-            if self.args.audit:
-                # In a real implementation, you'd fetch current quotes and update ROI
-                pass
-                
-            if self.args.analyze:
-                await asyncio.get_running_loop().run_in_executor(_CPU_EXECUTOR, self._analyze_performance, records)
-                
-            if self.args.simulate:
-                await asyncio.get_running_loop().run_in_executor(_CPU_EXECUTOR, self._run_simulation, records)
-                
-            if self.args.export:
-                await asyncio.get_running_loop().run_in_executor(_CPU_EXECUTOR, self._export_report, records)
-                
-            return 0
-        except KeyboardInterrupt:
-            logger.info("Interrupted by user")
-            return 130
-        except Exception as e:
-            logger.exception(f"Fatal error: {e}")
-            return 1
+            perf_records_processed.inc(len(records))
+        except Exception:
+            pass
 
-    def _analyze_performance(self, records: List[PerformanceRecord]) -> None:
-        summary = self.analyzer.analyze_records(records)
-        self.store.update_summary(summary)
-        sys.stdout.write("\n" + "=" * 60 + "\n")
-        sys.stdout.write("📊 PERFORMANCE SUMMARY\n")
-        sys.stdout.write("=" * 60 + "\n")
-        sys.stdout.write(f"Total Records: {summary.total_records} | Win Rate: {summary.win_rate:.1f}%\n")
-        sys.stdout.write(f"Avg ROI: {summary.avg_roi:.2f}% | Sharpe Ratio: {summary.sharpe_ratio:.2f}\n")
+        if self.args.analyze:
+            if self.store.is_available():
+                await loop.run_in_executor(_CPU_EXECUTOR, self.store.update_summary, summary)
+            _out("=" * 66)
+            _out("📊 PERFORMANCE SUMMARY")
+            _out("=" * 66)
+            _out(f"Total: {summary.total_records} | Active: {summary.active_records} | Matured: {summary.matured_records}")
+            _out(f"Wins: {summary.wins} | Losses: {summary.losses} | WinRate: {summary.win_rate:.1f}%")
+            _out(f"Avg ROI: {summary.avg_roi:.2f}% | Sharpe: {summary.sharpe_ratio:.2f} | Sortino: {summary.sortino_ratio:.2f}")
 
-    def _run_simulation(self, records: List[PerformanceRecord]) -> None:
-        matured = [r for r in records if r.status == PerformanceStatus.MATURED]
-        if not matured: return
-        outcomes = [r.is_win for r in matured if r.is_win is not None]
-        if outcomes:
-            wr_sim = self.analyzer.simulator.simulate_win_rate(outcomes, iterations=self.args.iterations or 10000, confidence=self.args.confidence or 0.95)
-            sys.stdout.write(f"\nWin Rate Simulation: Mean {wr_sim['mean']*100:.1f}% | 95% CI: [{wr_sim['ci_lower']*100:.1f}%, {wr_sim['ci_upper']*100:.1f}%]\n")
+        if self.args.simulate:
+            matured = [r for r in records if r.status == PerformanceStatus.MATURED and r.realized_roi is not None]
+            outcomes = [(r.realized_roi or 0.0) > 0 for r in matured]
+            if outcomes:
+                ci = self.analyzer.sim.simulate_win_rate(outcomes, iterations=int(self.args.iterations or 10000), confidence=float(self.args.confidence or 0.95))
+                _out(f"Win-Rate Simulation (mean): {ci['mean']*100:.1f}% | CI: [{ci['ci_lower']*100:.1f}%, {ci['ci_upper']*100:.1f}%] | observed: {ci['observed']*100:.1f}%")
+            else:
+                _out("Simulation skipped: no matured outcomes.")
 
-    def _export_report(self, records: List[PerformanceRecord]) -> None:
-        summary = self.analyzer.analyze_records(records)
-        output_path = self.args.output or f"performance_report_{RiyadhTime.format('%Y%m%d_%H%M%S')}"
-        if self.args.format == 'json':
-            Path(f"{output_path}.json").write_text(self.report_gen.generate_json(records, summary), encoding='utf-8')
-        elif self.args.format == 'csv':
-            self.report_gen.generate_csv(records, f"{output_path}.csv")
-        elif self.args.format == 'html':
-            self.report_gen.generate_html(records, summary, f"{output_path}.html")
-        elif self.args.format == 'all':
-            Path(f"{output_path}.json").write_text(self.report_gen.generate_json(records, summary), encoding='utf-8')
-            self.report_gen.generate_csv(records, f"{output_path}.csv")
-            self.report_gen.generate_html(records, summary, f"{output_path}.html")
+        if self.args.export:
+            out_base = (self.args.output or f"performance_report_{RiyadhTime.format(fmt='%Y%m%d_%H%M%S')}").strip()
+            fmt = (self.args.format or "html").lower()
+            if fmt in {"json", "all"}:
+                Path(out_base + ".json").write_text(self.reporter.generate_json(records, summary), encoding="utf-8")
+            if fmt in {"csv", "all"}:
+                self.reporter.generate_csv(records, out_base + ".csv")
+            if fmt in {"html", "all"}:
+                self.reporter.generate_html(records, summary, out_base + ".html")
+            _out(f"Export complete: {out_base}.* ({fmt})")
 
+        return 0
+
+    async def run_daemon(self) -> int:
+        interval = max(30, int(self.args.interval or 3600))
+        _out(f"Daemon mode ON (interval={interval}s). Press Ctrl+C to stop.")
+        while not self.stop_event.is_set():
+            try:
+                try:
+                    perf_daemon_cycles.inc()
+                except Exception:
+                    pass
+                await self.run_once()
+            except Exception as e:
+                logger.exception("Daemon cycle failed: %s", e)
+            # sleep in small steps for fast stop
+            for _ in range(interval):
+                if self.stop_event.is_set():
+                    break
+                await asyncio.sleep(1.0)
+        return 0
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+# =============================================================================
+# CLI
+# =============================================================================
 def create_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=f"Tadawul Fast Bridge - Advanced Performance Tracker v{SCRIPT_VERSION}")
-    parser.add_argument("--sheet-id", help="Spreadsheet ID")
-    parser.add_argument("--sheet-name", default="Performance_Log", help="Sheet name")
-    parser.add_argument("--record", action="store_true", help="Record new recommendations")
-    parser.add_argument("--audit", action="store_true", help="Audit existing records")
-    parser.add_argument("--analyze", action="store_true", help="Analyze performance")
-    parser.add_argument("--simulate", action="store_true", help="Run Monte Carlo simulation")
-    parser.add_argument("--export", action="store_true", help="Export performance report")
-    parser.add_argument("--daemon", action="store_true", help="Run as daemon")
-    parser.add_argument("--source-tab", action="append", help="Source tab name")
-    parser.add_argument("--horizons", nargs="+", default=["1M", "3M"], help="Horizons to track")
-    parser.add_argument("--track-recos", nargs="+", help="Recommendations to track")
-    parser.add_argument("--limit", type=int, default=500, help="Max rows per source")
-    parser.add_argument("--refresh", type=int, default=1, help="Refresh quotes (0/1)")
-    parser.add_argument("--max-records", type=int, default=10000, help="Max records to load")
-    parser.add_argument("--confidence", type=float, default=0.95, help="Confidence level")
-    parser.add_argument("--iterations", type=int, default=10000, help="Monte Carlo iterations")
-    parser.add_argument("--periods", type=int, default=252, help="Simulation periods")
-    parser.add_argument("--format", choices=["json", "csv", "html", "all"], default="html", help="Export format")
-    parser.add_argument("--output", help="Output file path (without extension)")
-    parser.add_argument("--interval", type=int, default=3600, help="Daemon interval (seconds)")
-    parser.add_argument("--webhook", help="Webhook URL for notifications")
-    parser.add_argument("--verbose", "-v", action="store_true", help="Verbose output")
-    return parser
+    p = argparse.ArgumentParser(description=f"Tadawul Fast Bridge - Performance Tracker v{SCRIPT_VERSION}")
+    p.add_argument("--sheet-id", help="Spreadsheet ID (or DEFAULT_SPREADSHEET_ID env)")
+    p.add_argument("--sheet-name", default="Performance_Log", help="Performance log tab name")
+    p.add_argument("--record", action="store_true", help="Record new recommendations (best-effort from /v1/analysis/top10)")
+    p.add_argument("--audit", action="store_true", help="Audit/update active records (fetch current prices from backend if configured)")
+    p.add_argument("--analyze", action="store_true", help="Analyze performance + write summary block in sheet")
+    p.add_argument("--simulate", action="store_true", help="Run Monte Carlo win-rate simulation (needs numpy)")
+    p.add_argument("--export", action="store_true", help="Export performance report")
+    p.add_argument("--daemon", action="store_true", help="Run continuously (daemon)")
+    p.add_argument("--horizons", nargs="+", default=["1M", "3M"], help="Horizons to track (e.g., 1W 1M 3M 6M 1Y)")
+    p.add_argument("--max-records", type=int, default=10000, help="Max records to load from sheet")
+    p.add_argument("--confidence", type=float, default=0.95, help="Confidence level (simulation)")
+    p.add_argument("--iterations", type=int, default=10000, help="Monte Carlo iterations")
+    p.add_argument("--format", choices=["json", "csv", "html", "all"], default="html", help="Export format")
+    p.add_argument("--output", help="Output file base path (without extension)")
+    p.add_argument("--interval", type=int, default=3600, help="Daemon interval seconds")
+    p.add_argument("--verbose", "-v", action="store_true", help="Verbose logs")
+    return p
 
 async def async_main() -> int:
-    parser = create_parser()
-    args = parser.parse_args()
-    if args.verbose: logging.getLogger().setLevel(logging.DEBUG)
+    args = create_parser().parse_args()
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+
+    # If nothing selected, show help
     if not any([args.record, args.audit, args.analyze, args.simulate, args.export, args.daemon]):
-        sys.stdout.write(parser.format_help() + "\n")
+        _out(create_parser().format_help())
         return 0
+
+    app = PerformanceTrackerApp(args)
+
+    def _sig_handler(_signum, _frame):
+        app.stop()
+
     try:
-        app = PerformanceTrackerApp(args)
-        return await app.run()
+        signal.signal(signal.SIGINT, _sig_handler)
+        signal.signal(signal.SIGTERM, _sig_handler)
+    except Exception:
+        pass
+
+    try:
+        if args.daemon:
+            return await app.run_daemon()
+        return await app.run_once()
     finally:
-        _CPU_EXECUTOR.shutdown(wait=False)
+        try:
+            _CPU_EXECUTOR.shutdown(wait=False)
+        except Exception:
+            pass
 
 def main() -> int:
-    if sys.platform == 'win32': asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    return asyncio.run(async_main())
+    if sys.platform == "win32":
+        try:
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())  # type: ignore[attr-defined]
+        except Exception:
+            pass
+    try:
+        return asyncio.run(async_main())
+    except KeyboardInterrupt:
+        return 130
+    except Exception as e:
+        logger.exception("Fatal error: %s", e)
+        return 1
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
