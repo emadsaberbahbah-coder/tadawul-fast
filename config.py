@@ -2,28 +2,29 @@
 # core/config.py
 """
 ================================================================================
-Core Configuration Module — v6.0.1 (QUANTUM EDITION)
+Core Configuration Module — v6.1.0 (QUANTUM EDITION / RENDER-BLUEPRINT ALIGNED)
 ================================================================================
 TADAWUL FAST BRIDGE – Enterprise Configuration Management
 
 Design Goals
 - ✅ Never breaks startup (all optional dependencies are safe)
 - ✅ Central source of truth for env parsing + defaults
-- ✅ Deterministic behavior (no random failures; safe fallbacks)
+- ✅ Deterministic behavior (safe fallbacks; no import-time network connections)
+- ✅ Render Blueprint aligned env vars (APP_*, REQUIRE_AUTH, ENABLE_TRACING, REDIS_URL, etc.)
 - ✅ Compatible with integrations/google_sheets_service.py + setup_credentials.py
 
-Key Fixes vs your pasted draft
-- ✅ Added missing utilities: TraceContext, _dbg, deep_merge, load_file_content
-- ✅ Removed broken @TraceContext decorator usage (now works as context manager + decorator)
-- ✅ Fixed name conflicts: custom ValidationError renamed to ConfigValidationError
-- ✅ Fixed __all__ exporting undefined names (kept compatibility aliases)
-- ✅ Added Settings fields used by Google Sheets integrations:
-    - google_sheets_credentials_json
-    - google_credentials_dict
-    - default_spreadsheet_id
-
-Note
-This file intentionally does NOT force-connect to Consul/etcd/ZK unless env vars are present.
+Key Improvements vs v6.0.1 you pasted
+- ✅ Render YAML alignment:
+    - Reads ENABLE_TRACING + CORE_TRACING_ENABLED (not only TRACING_ENABLED)
+    - Uses REQUIRE_AUTH to derive open_mode
+    - Reads APP_NAME / APP_ENV / APP_VERSION / SERVICE_VERSION / TZ
+    - Reads AUTH_HEADER_NAME, RATE_LIMIT_ENABLED, MAX_REQUESTS_PER_MINUTE, CACHE_BACKEND, REDIS_URL
+    - Adds ARGAAM_API_KEY support (since render.yaml expects it)
+- ✅ TOML loader uses stdlib tomllib (no external `toml` dependency)
+- ✅ Distributed config sources are LAZY:
+    - No connect attempt at import-time (even if CONSUL_HOST/ETCD_HOST are set)
+    - Connection happens only when the source loader is invoked
+- ✅ Safer URL handling + masking utilities preserved
 """
 
 from __future__ import annotations
@@ -38,7 +39,6 @@ import re
 import threading
 import time
 import uuid
-import zlib
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
@@ -49,8 +49,8 @@ from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 from urllib.parse import urlparse
 
 # Version
-CONFIG_VERSION = "6.0.1"
-CONFIG_SCHEMA_VERSION = "2.2"
+CONFIG_VERSION = "6.1.0"
+CONFIG_SCHEMA_VERSION = "2.3"
 CONFIG_BUILD_TIMESTAMP = datetime.now(timezone.utc).isoformat()
 
 logger = logging.getLogger(__name__)
@@ -95,13 +95,13 @@ except Exception:
     yaml = None
     YAML_AVAILABLE = False
 
-# TOML support
+# TOML support (stdlib)
 try:
-    import toml  # type: ignore
+    import tomllib  # py3.11+
 
     TOML_AVAILABLE = True
 except Exception:
-    toml = None
+    tomllib = None  # type: ignore
     TOML_AVAILABLE = False
 
 # Pydantic support (optional)
@@ -166,13 +166,15 @@ except Exception:
 # Tracing Context (Sync + Decorator)
 # =============================================================================
 
-_TRACING_ENABLED = (os.getenv("TRACING_ENABLED", "") or os.getenv("CORE_TRACING_ENABLED", "")).strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "y",
-    "on",
-}
+def _env_truthy(name: str) -> bool:
+    return (os.getenv(name, "") or "").strip().lower() in {"1", "true", "yes", "y", "on", "t", "enabled", "active"}
+
+
+_TRACING_ENABLED = (
+    _env_truthy("ENABLE_TRACING")
+    or _env_truthy("TRACING_ENABLED")
+    or _env_truthy("CORE_TRACING_ENABLED")
+)
 
 
 class TraceContext:
@@ -324,7 +326,25 @@ def coerce_dict(v: Any, default: Optional[Dict[str, Any]] = None) -> Dict[str, A
 
 
 def is_valid_url(url: str) -> bool:
-    return bool(_URL_RE.match(strip_value(url)))
+    s = strip_value(url)
+    if not s:
+        return False
+    return bool(_URL_RE.match(s))
+
+
+def normalize_url(raw: str, default_scheme: str = "https") -> str:
+    """
+    Normalize a URL safely.
+    - If missing scheme, prepend default_scheme://
+    - Keeps deterministic output; never throws.
+    """
+    s = strip_value(raw)
+    if not s:
+        return ""
+    if _URL_RE.match(s):
+        return s
+    # allow host:port
+    return f"{default_scheme}://{s}"
 
 
 SENSITIVE_KEYS = {
@@ -371,21 +391,19 @@ def mask_secret_dict(d: Dict[str, Any], sensitive_keys: Optional[Set[str]] = Non
 
 
 def _dbg(message: str, level: str = "info", **kwargs) -> None:
-    """
-    Internal logging helper. Never throws.
-    """
+    """Internal logging helper. Never throws."""
     try:
         payload = {"message": message, **kwargs}
-        if level.lower() == "error":
+        lvl = level.lower()
+        if lvl == "error":
             logger.error(json_dumps(payload))
-        elif level.lower() in ("warn", "warning"):
+        elif lvl in ("warn", "warning"):
             logger.warning(json_dumps(payload))
-        elif level.lower() == "debug":
+        elif lvl == "debug":
             logger.debug(json_dumps(payload))
         else:
             logger.info(json_dumps(payload))
     except Exception:
-        # absolute last resort
         pass
 
 
@@ -411,9 +429,7 @@ def deep_merge(base: Dict[str, Any], override: Dict[str, Any], *, overwrite: boo
 
 
 def load_file_content(path: Path) -> Dict[str, Any]:
-    """
-    Load config from JSON/YAML/TOML. Never throws; returns {} on failure.
-    """
+    """Load config from JSON/YAML/TOML. Never throws; returns {} on failure."""
     try:
         if not path.exists() or not path.is_file():
             return {}
@@ -422,7 +438,7 @@ def load_file_content(path: Path) -> Dict[str, Any]:
             return {}
         suffix = path.suffix.lower()
 
-        if suffix in (".json",):
+        if suffix == ".json":
             obj = json_loads(raw)
             return obj if isinstance(obj, dict) else {}
 
@@ -430,8 +446,8 @@ def load_file_content(path: Path) -> Dict[str, Any]:
             obj = yaml.safe_load(raw)
             return obj if isinstance(obj, dict) else {}
 
-        if suffix in (".toml",) and TOML_AVAILABLE and toml is not None:
-            obj = toml.loads(raw)
+        if suffix == ".toml" and TOML_AVAILABLE and tomllib is not None:
+            obj = tomllib.loads(raw)
             return obj if isinstance(obj, dict) else {}
 
         # Fallback: try JSON
@@ -440,6 +456,34 @@ def load_file_content(path: Path) -> Dict[str, Any]:
     except Exception as e:
         _dbg(f"load_file_content failed: {e}", "warning", path=str(path))
         return {}
+
+
+def try_parse_json_obj(s: str) -> Optional[Union[Dict[str, Any], List[Any]]]:
+    ss = strip_value(s)
+    if not ss:
+        return None
+    if not ((ss.startswith("{") and ss.endswith("}")) or (ss.startswith("[") and ss.endswith("]"))):
+        return None
+    try:
+        return json_loads(ss)
+    except Exception:
+        return None
+
+
+def maybe_b64decode_json(s: str) -> Optional[Dict[str, Any]]:
+    """
+    Try to decode base64 JSON env vars.
+    Returns dict if decoded and parsed successfully.
+    """
+    ss = strip_value(s)
+    if not ss:
+        return None
+    try:
+        raw = base64.b64decode(ss.encode("utf-8"), validate=True)
+        obj = json_loads(raw)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
 
 
 # =============================================================================
@@ -497,12 +541,14 @@ class ProviderType(str, Enum):
     YAHOO_CHART = "yahoo_chart"
     YAHOO_FUNDAMENTALS = "yahoo_fundamentals"
     ARGAAM = "argaam"
+    TADAWUL = "tadawul"
     CUSTOM = "custom"
 
     @classmethod
     def requires_api_key(cls, provider: str) -> bool:
         p = strip_value(provider).lower()
-        return p not in {"yahoo", "yahoo_chart", "yahoo_fundamentals", "custom", "argaam"}
+        # Yahoo endpoints typically do not need a key. Argaam often does in practice.
+        return p not in {"yahoo", "yahoo_chart", "yahoo_fundamentals", "custom", "tadawul"}
 
 
 class CacheBackend(str, Enum):
@@ -579,6 +625,7 @@ class ConfigEncryptionAlgorithm(str, Enum):
 # =============================================================================
 # Exceptions
 # =============================================================================
+
 class ConfigurationError(Exception):
     pass
 
@@ -598,6 +645,7 @@ class ReloadError(ConfigurationError):
 # =============================================================================
 # Full Jitter Exponential Backoff
 # =============================================================================
+
 class FullJitterBackoff:
     """AWS-style Full Jitter backoff. Safe and deterministic bounds."""
     def __init__(self, max_retries: int = 3, base_delay: float = 1.0, max_delay: float = 10.0):
@@ -642,8 +690,7 @@ if PYDANTIC_AVAILABLE:
 
     class RateLimitConfig(SettingsBaseModel):
         enabled: bool = True
-        rate_per_sec: float = 10.0
-        burst_size: int = 20
+        max_requests_per_minute: int = 300
         retry_after: int = 60
 
     class CircuitBreakerConfig(SettingsBaseModel):
@@ -667,6 +714,7 @@ if PYDANTIC_AVAILABLE:
     class AuthConfig(SettingsBaseModel):
         type: AuthType = AuthType.NONE
         tokens: List[str] = Field(default_factory=list)
+        header_name: str = "X-APP-TOKEN"
 
     class MetricsConfig(SettingsBaseModel):
         enabled: bool = True
@@ -677,7 +725,6 @@ if PYDANTIC_AVAILABLE:
         level: LogLevel = LogLevel.INFO
         format: str = "json"
 else:
-    # Fallback placeholders
     RateLimitConfig = None  # type: ignore
     CircuitBreakerConfig = None  # type: ignore
     CacheConfig = None  # type: ignore
@@ -690,6 +737,7 @@ else:
 # =============================================================================
 # Distributed Configuration Sources (Optional)
 # =============================================================================
+
 class ConfigSourceManager:
     def __init__(self):
         self.sources: List[Tuple[ConfigSource, Callable[[], Optional[Dict[str, Any]]]]] = []
@@ -716,7 +764,13 @@ class ConfigSourceManager:
         if not loaded:
             return {}
         if priority is None:
-            priority = [ConfigSource.ENV_VAR, ConfigSource.CONSUL, ConfigSource.ETCD, ConfigSource.ZOOKEEPER, ConfigSource.DEFAULT]
+            priority = [
+                ConfigSource.ENV_VAR,
+                ConfigSource.CONSUL,
+                ConfigSource.ETCD,
+                ConfigSource.ZOOKEEPER,
+                ConfigSource.DEFAULT,
+            ]
         merged: Dict[str, Any] = {}
         for src in priority:
             if src in loaded:
@@ -728,28 +782,46 @@ _CONFIG_SOURCES = ConfigSourceManager()
 
 
 class ConsulConfigSource:
-    def __init__(self, host: str = "localhost", port: int = 8500, token: Optional[str] = None, prefix: str = "config/tadawul"):
+    """
+    LAZY consul source: does NOT connect at import-time or constructor time.
+    Connects only when load() is called.
+    """
+    def __init__(self, host: str = "localhost", port: int = 8500, token: Optional[str] = None,
+                 prefix: str = "config/tadawul"):
+        self.host = host
+        self.port = port
+        self.token = token
         self.prefix = prefix
         self.client = None
         self._connected = False
 
-        if CONSUL_AVAILABLE and consul is not None:
-            backoff = FullJitterBackoff(max_retries=2, base_delay=0.5, max_delay=2.0)
+    def _ensure_connected(self) -> bool:
+        if self._connected:
+            return True
+        if not (CONSUL_AVAILABLE and consul is not None):
+            return False
 
-            def _connect():
-                c = consul.Consul(host=host, port=port, token=token)
-                c.status.leader()
-                return c
+        backoff = FullJitterBackoff(max_retries=2, base_delay=0.5, max_delay=2.0)
 
-            try:
-                self.client = backoff.execute_sync(_connect)
-                self._connected = True
-                _dbg(f"Connected to Consul {host}:{port}", "info")
-            except Exception as e:
-                _dbg(f"Consul connect failed: {e}", "warning")
+        def _connect():
+            c = consul.Consul(host=self.host, port=self.port, token=self.token)
+            # touch a simple endpoint
+            c.status.leader()
+            return c
+
+        try:
+            self.client = backoff.execute_sync(_connect)
+            self._connected = True
+            _dbg(f"Connected to Consul {self.host}:{self.port}", "info")
+            return True
+        except Exception as e:
+            _dbg(f"Consul connect failed: {e}", "warning")
+            self._connected = False
+            self.client = None
+            return False
 
     def load(self) -> Optional[Dict[str, Any]]:
-        if not self._connected or not self.client:
+        if not self._ensure_connected() or not self.client:
             return None
         try:
             _, data = self.client.kv.get(self.prefix, recurse=True)
@@ -760,7 +832,7 @@ class ConsulConfigSource:
                 k = item.get("Key") or ""
                 if not k:
                     continue
-                rel = k[len(self.prefix) + 1 :] if k.startswith(self.prefix) else k
+                rel = k[len(self.prefix) + 1:] if k.startswith(self.prefix) else k
                 raw = item.get("Value")
                 if raw is None:
                     continue
@@ -784,37 +856,51 @@ class ConsulConfigSource:
 
 
 class EtcdConfigSource:
+    """
+    LAZY etcd source: connection only when load() is called.
+    """
     def __init__(self, host: str = "localhost", port: int = 2379, prefix: str = "/config/tadawul"):
+        self.host = host
+        self.port = port
         self.prefix = prefix
         self.client = None
         self._connected = False
 
-        if ETCD_AVAILABLE and etcd3 is not None:
-            backoff = FullJitterBackoff(max_retries=2, base_delay=0.5, max_delay=2.0)
+    def _ensure_connected(self) -> bool:
+        if self._connected:
+            return True
+        if not (ETCD_AVAILABLE and etcd3 is not None):
+            return False
 
-            def _connect():
-                c = etcd3.client(host=host, port=port)
-                try:
-                    c.status()
-                except Exception:
-                    pass
-                return c
+        backoff = FullJitterBackoff(max_retries=2, base_delay=0.5, max_delay=2.0)
 
+        def _connect():
+            c = etcd3.client(host=self.host, port=self.port)
             try:
-                self.client = backoff.execute_sync(_connect)
-                self._connected = True
-                _dbg(f"Connected to etcd {host}:{port}", "info")
-            except Exception as e:
-                _dbg(f"etcd connect failed: {e}", "warning")
+                c.status()
+            except Exception:
+                pass
+            return c
+
+        try:
+            self.client = backoff.execute_sync(_connect)
+            self._connected = True
+            _dbg(f"Connected to etcd {self.host}:{self.port}", "info")
+            return True
+        except Exception as e:
+            _dbg(f"etcd connect failed: {e}", "warning")
+            self._connected = False
+            self.client = None
+            return False
 
     def load(self) -> Optional[Dict[str, Any]]:
-        if not self._connected or not self.client:
+        if not self._ensure_connected() or not self.client:
             return None
         try:
             out: Dict[str, Any] = {}
             for value, meta in self.client.get_prefix(self.prefix):
                 key = (meta.key or b"").decode("utf-8", errors="replace")
-                rel = key[len(self.prefix) :].lstrip("/")
+                rel = key[len(self.prefix):].lstrip("/")
                 try:
                     val = json_loads(value.decode("utf-8", errors="replace"))
                 except Exception:
@@ -834,28 +920,41 @@ class EtcdConfigSource:
 
 
 class ZooKeeperConfigSource:
+    """
+    LAZY ZooKeeper source: connection only when load() is called.
+    """
     def __init__(self, hosts: str, prefix: str = "/config/tadawul"):
+        self.hosts = hosts
         self.prefix = prefix
         self.client = None
         self._connected = False
 
-        if ZOOKEEPER_AVAILABLE and KazooClient is not None:
-            backoff = FullJitterBackoff(max_retries=2, base_delay=0.5, max_delay=2.0)
+    def _ensure_connected(self) -> bool:
+        if self._connected:
+            return True
+        if not (ZOOKEEPER_AVAILABLE and KazooClient is not None):
+            return False
 
-            def _connect():
-                c = KazooClient(hosts=hosts)
-                c.start(timeout=5)
-                return c
+        backoff = FullJitterBackoff(max_retries=2, base_delay=0.5, max_delay=2.0)
 
-            try:
-                self.client = backoff.execute_sync(_connect)
-                self._connected = True
-                _dbg(f"Connected to ZooKeeper {hosts}", "info")
-            except Exception as e:
-                _dbg(f"ZooKeeper connect failed: {e}", "warning")
+        def _connect():
+            c = KazooClient(hosts=self.hosts)
+            c.start(timeout=5)
+            return c
+
+        try:
+            self.client = backoff.execute_sync(_connect)
+            self._connected = True
+            _dbg(f"Connected to ZooKeeper {self.hosts}", "info")
+            return True
+        except Exception as e:
+            _dbg(f"ZooKeeper connect failed: {e}", "warning")
+            self._connected = False
+            self.client = None
+            return False
 
     def load(self) -> Optional[Dict[str, Any]]:
-        if not self._connected or not self.client:
+        if not self._ensure_connected() or not self.client:
             return None
         try:
             out: Dict[str, Any] = {}
@@ -890,6 +989,7 @@ class ZooKeeperConfigSource:
 # =============================================================================
 # Main Settings (Dataclass)
 # =============================================================================
+
 @dataclass(frozen=True)
 class Settings:
     """Main application settings (core)."""
@@ -899,34 +999,48 @@ class Settings:
     schema_version: str = CONFIG_SCHEMA_VERSION
     build_timestamp: str = CONFIG_BUILD_TIMESTAMP
 
-    # App
+    # App (Render-aligned)
     environment: Environment = Environment.PRODUCTION
     app_version: str = "dev"
+    service_version: str = "dev"
     service_name: str = "Tadawul Fast Bridge"
     timezone: str = "Asia/Riyadh"
 
     # Logging
     log_level: LogLevel = LogLevel.INFO
-    log_format: str = "json"
+    log_format: str = "json"  # "json" | "plain"
+    log_json: bool = True
 
-    # Backend URLs
+    # Server (optional)
+    host: str = "0.0.0.0"
+    port: int = 8000
+    workers: int = 1
+    worker_class: str = "uvicorn_worker.UvicornWorker"
+
+    # URLs
     backend_base_url: str = "http://localhost:8000"
     internal_base_url: Optional[str] = None
     public_base_url: Optional[str] = None
 
-    # Auth
+    # Auth / Security
+    require_auth: bool = True
     auth_header_name: str = "X-APP-TOKEN"
     app_token: Optional[str] = None
-    open_mode: bool = False  # if True: endpoints may allow anonymous access
+    backup_app_token: Optional[str] = None
+    open_mode: bool = False  # derived: when require_auth is False
 
     # Feature flags
     ai_analysis_enabled: bool = True
     advisor_enabled: bool = True
+    advanced_analysis_enabled: bool = True
     rate_limit_enabled: bool = True
     cache_enabled: bool = True
     circuit_breaker_enabled: bool = True
     metrics_enabled: bool = True
     tracing_enabled: bool = False
+
+    # Rate limit (Render-aligned)
+    max_requests_per_minute: int = 300
 
     # Providers
     enabled_providers: List[str] = field(default_factory=lambda: ["eodhd", "finnhub"])
@@ -937,29 +1051,72 @@ class Settings:
     eodhd_api_key: Optional[str] = None
     finnhub_api_key: Optional[str] = None
     alphavantage_api_key: Optional[str] = None
+    argaam_api_key: Optional[str] = None
+
+    # Cache
+    cache_backend: CacheBackend = CacheBackend.MEMORY
+    cache_ttl_sec: int = 300
+    cache_max_size: int = 20000
+    redis_url: Optional[str] = None
 
     # Performance
     http_timeout_sec: float = 45.0
-    cache_ttl_sec: int = 20
     batch_concurrency: int = 5
     ai_batch_size: int = 20
     quote_batch_size: int = 50
 
-    # Google Sheets integration (used by integrations/google_sheets_service.py)
+    # Google Sheets integration
     default_spreadsheet_id: Optional[str] = None
     google_sheets_credentials_json: Optional[str] = None
     google_credentials_dict: Optional[Dict[str, Any]] = None
 
     @classmethod
     def from_env(cls, env_prefix: str = "TFB_") -> "Settings":
+        # App meta (Render)
         env_name = strip_value(os.getenv(f"{env_prefix}ENV") or os.getenv("APP_ENV") or "production")
+        app_name = strip_value(os.getenv("APP_NAME") or "Tadawul Fast Bridge")
+        app_version = strip_value(os.getenv("APP_VERSION") or "dev")
+        service_version = strip_value(os.getenv("SERVICE_VERSION") or app_version)
+        tz = strip_value(os.getenv("TZ") or "Asia/Riyadh")
 
-        token = strip_value(os.getenv(f"{env_prefix}APP_TOKEN") or os.getenv("APP_TOKEN") or os.getenv("BACKEND_TOKEN"))
-        is_open = coerce_bool(os.getenv("OPEN_MODE"), not bool(token))
+        # Server
+        host = strip_value(os.getenv("HOST") or "0.0.0.0")
+        port = coerce_int(os.getenv("PORT"), 8000, lo=1, hi=65535)
+        workers = coerce_int(os.getenv("WORKERS"), 1, lo=1, hi=64)
+        worker_class = strip_value(os.getenv("WORKER_CLASS") or "uvicorn_worker.UvicornWorker")
 
-        eodhd_key = strip_value(os.getenv("EODHD_API_TOKEN") or os.getenv("EODHD_API_KEY"))
-        finnhub_key = strip_value(os.getenv("FINNHUB_API_KEY"))
-        alpha_key = strip_value(os.getenv("ALPHAVANTAGE_API_KEY"))
+        # Logging
+        log_level_name = strip_value(os.getenv("LOG_LEVEL") or "INFO").upper()
+        log_level = LogLevel.INFO
+        for ll in LogLevel:
+            if ll.value == log_level_name:
+                log_level = ll
+                break
+        log_json = coerce_bool(os.getenv("LOG_JSON"), True)
+        log_format = "json" if log_json else "plain"
+
+        # Security / auth
+        require_auth = coerce_bool(os.getenv("REQUIRE_AUTH"), True)
+        auth_header_name = strip_value(os.getenv("AUTH_HEADER_NAME") or "X-APP-TOKEN")
+        token = strip_value(
+            os.getenv(f"{env_prefix}APP_TOKEN")
+            or os.getenv("APP_TOKEN")
+            or os.getenv("BACKEND_TOKEN")
+            or ""
+        )
+        backup_token = strip_value(os.getenv("BACKUP_APP_TOKEN") or "")
+
+        # Open mode derivation: if REQUIRE_AUTH is false => open
+        open_mode = not require_auth
+        # If user explicitly sets OPEN_MODE, allow override (but default is derived)
+        if strip_value(os.getenv("OPEN_MODE")):
+            open_mode = coerce_bool(os.getenv("OPEN_MODE"), open_mode)
+
+        # Providers and keys
+        eodhd_key = strip_value(os.getenv("EODHD_API_KEY") or os.getenv("EODHD_API_TOKEN") or "")
+        finnhub_key = strip_value(os.getenv("FINNHUB_API_KEY") or "")
+        alpha_key = strip_value(os.getenv("ALPHAVANTAGE_API_KEY") or "")
+        argaam_key = strip_value(os.getenv("ARGAAM_API_KEY") or "")
 
         providers_env = coerce_list(os.getenv("ENABLED_PROVIDERS") or os.getenv("PROVIDERS"))
         if not providers_env:
@@ -974,54 +1131,105 @@ class Settings:
         ksa_env = coerce_list(os.getenv("KSA_PROVIDERS") or "yahoo_chart,argaam")
         primary = strip_value(os.getenv("PRIMARY_PROVIDER") or "eodhd")
 
-        log_level_name = strip_value(os.getenv("LOG_LEVEL") or "INFO").upper()
-        log_level = LogLevel.INFO
-        for ll in LogLevel:
-            if ll.value == log_level_name:
-                log_level = ll
-                break
+        # URLs
+        backend_base_url = strip_value(
+            os.getenv("BACKEND_BASE_URL") or os.getenv("DEFAULT_BACKEND_URL") or "http://localhost:8000"
+        )
 
-        backend_base_url = strip_value(os.getenv("BACKEND_BASE_URL") or os.getenv("DEFAULT_BACKEND_URL") or "http://localhost:8000")
+        # Rate limit
+        rate_limit_enabled = coerce_bool(os.getenv("RATE_LIMIT_ENABLED"), True)
+        max_rpm = coerce_int(os.getenv("MAX_REQUESTS_PER_MINUTE"), 300, lo=1, hi=100000)
+
+        # Cache
+        cache_enabled = coerce_bool(os.getenv("CACHE_ENABLED"), True)
+        cache_backend_raw = strip_value(os.getenv("CACHE_BACKEND") or ("redis" if os.getenv("REDIS_URL") else "memory"))
+        try:
+            cache_backend = CacheBackend(cache_backend_raw.lower())
+        except Exception:
+            cache_backend = CacheBackend.MEMORY
+        cache_ttl = coerce_int(os.getenv("CACHE_TTL_SEC"), 300, lo=1, hi=86400)
+        cache_max = coerce_int(os.getenv("CACHE_MAX_SIZE"), 20000, lo=100, hi=5_000_000)
+        redis_url = strip_value(os.getenv("REDIS_URL") or "")
+
+        # Feature flags
+        ai_analysis_enabled = coerce_bool(os.getenv("AI_ANALYSIS_ENABLED"), True)
+        advisor_enabled = coerce_bool(os.getenv("ADVISOR_ENABLED"), True)
+        advanced_analysis_enabled = coerce_bool(os.getenv("ADVANCED_ANALYSIS_ENABLED"), True)
+        circuit_breaker_enabled = coerce_bool(os.getenv("CIRCUIT_BREAKER_ENABLED"), True)
+        metrics_enabled = coerce_bool(os.getenv("METRICS_ENABLED"), True)
+        tracing_enabled = (
+            coerce_bool(os.getenv("TRACING_ENABLED"), False)
+            or coerce_bool(os.getenv("ENABLE_TRACING"), False)
+            or coerce_bool(os.getenv("CORE_TRACING_ENABLED"), False)
+        )
+
+        # Performance
+        http_timeout_sec = coerce_float(os.getenv("HTTP_TIMEOUT_SEC"), 45.0, lo=5.0, hi=300.0)
+        batch_concurrency = coerce_int(os.getenv("BATCH_CONCURRENCY"), 5, lo=1, hi=200)
+        ai_batch_size = coerce_int(os.getenv("AI_BATCH_SIZE"), 20, lo=1, hi=500)
+        quote_batch_size = coerce_int(os.getenv("QUOTE_BATCH_SIZE"), 50, lo=1, hi=500)
+
+        # Sheets
         default_spreadsheet_id = strip_value(os.getenv("DEFAULT_SPREADSHEET_ID") or "")
-
-        # Allow storing credentials in settings (used by google_sheets_service CredentialsManager)
         gs_creds_json = strip_value(os.getenv("GOOGLE_SHEETS_CREDENTIALS") or os.getenv("GOOGLE_CREDENTIALS") or "")
-        gs_creds_dict = None
-        if gs_creds_json.startswith("{") and gs_creds_json.endswith("}"):
-            # keep raw JSON; google_sheets_service will parse as needed
-            pass
+        gs_creds_dict: Optional[Dict[str, Any]] = None
 
-        # A dict form can be injected via an env var as JSON too
+        # If creds JSON is actually base64 JSON, decode it
+        if gs_creds_json and not (gs_creds_json.startswith("{") and gs_creds_json.endswith("}")):
+            decoded = maybe_b64decode_json(gs_creds_json)
+            if decoded:
+                gs_creds_dict = decoded
+                gs_creds_json = json_dumps(decoded)
+
+        # Optional: dict form
         gs_creds_dict_env = strip_value(os.getenv("GOOGLE_CREDENTIALS_DICT") or "")
-        if gs_creds_dict_env.startswith("{") and gs_creds_dict_env.endswith("}"):
-            try:
-                parsed = json_loads(gs_creds_dict_env)
-                if isinstance(parsed, dict):
-                    gs_creds_dict = parsed
-            except Exception:
-                gs_creds_dict = None
+        parsed_obj = try_parse_json_obj(gs_creds_dict_env)
+        if isinstance(parsed_obj, dict):
+            gs_creds_dict = parsed_obj
 
         return cls(
             environment=Environment.from_string(env_name),
-            app_token=token or None,
-            open_mode=is_open,
+            service_name=app_name,
+            app_version=app_version or "dev",
+            service_version=service_version or (app_version or "dev"),
+            timezone=tz or "Asia/Riyadh",
+            host=host,
+            port=port,
+            workers=workers,
+            worker_class=worker_class,
+            log_level=log_level,
+            log_format=log_format,
+            log_json=log_json,
             backend_base_url=backend_base_url,
-            eodhd_api_key=eodhd_key or None,
-            finnhub_api_key=finnhub_key or None,
-            alphavantage_api_key=alpha_key or None,
+            require_auth=require_auth,
+            auth_header_name=auth_header_name,
+            app_token=token or None,
+            backup_app_token=backup_token or None,
+            open_mode=open_mode,
             enabled_providers=providers_env,
             ksa_providers=ksa_env,
             primary_provider=primary,
-            log_level=log_level,
-            http_timeout_sec=coerce_float(os.getenv("HTTP_TIMEOUT_SEC"), 45.0, lo=5.0, hi=300.0),
-            cache_ttl_sec=coerce_int(os.getenv("CACHE_TTL_SEC"), 20, lo=1, hi=3600),
-            batch_concurrency=coerce_int(os.getenv("BATCH_CONCURRENCY"), 5, lo=1, hi=50),
-            ai_batch_size=coerce_int(os.getenv("AI_BATCH_SIZE"), 20, lo=1, hi=500),
-            quote_batch_size=coerce_int(os.getenv("QUOTE_BATCH_SIZE"), 50, lo=1, hi=500),
-            metrics_enabled=coerce_bool(os.getenv("METRICS_ENABLED"), True),
-            tracing_enabled=coerce_bool(os.getenv("TRACING_ENABLED"), False),
-            ai_analysis_enabled=coerce_bool(os.getenv("AI_ANALYSIS_ENABLED"), True),
-            advisor_enabled=coerce_bool(os.getenv("ADVISOR_ENABLED"), True),
+            eodhd_api_key=eodhd_key or None,
+            finnhub_api_key=finnhub_key or None,
+            alphavantage_api_key=alpha_key or None,
+            argaam_api_key=argaam_key or None,
+            rate_limit_enabled=rate_limit_enabled,
+            max_requests_per_minute=max_rpm,
+            cache_enabled=cache_enabled,
+            cache_backend=cache_backend,
+            cache_ttl_sec=cache_ttl,
+            cache_max_size=cache_max,
+            redis_url=redis_url or None,
+            http_timeout_sec=http_timeout_sec,
+            batch_concurrency=batch_concurrency,
+            ai_batch_size=ai_batch_size,
+            quote_batch_size=quote_batch_size,
+            metrics_enabled=metrics_enabled,
+            tracing_enabled=tracing_enabled,
+            ai_analysis_enabled=ai_analysis_enabled,
+            advisor_enabled=advisor_enabled,
+            advanced_analysis_enabled=advanced_analysis_enabled,
+            circuit_breaker_enabled=circuit_breaker_enabled,
             default_spreadsheet_id=default_spreadsheet_id or None,
             google_sheets_credentials_json=gs_creds_json or None,
             google_credentials_dict=gs_creds_dict,
@@ -1030,25 +1238,42 @@ class Settings:
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
+    def public_dict(self) -> Dict[str, Any]:
+        d = self.to_dict()
+        return mask_secret_dict(d)
+
     def validate(self) -> Tuple[List[str], List[str]]:
         errors: List[str] = []
         warnings_list: List[str] = []
 
         # Auth sanity
-        if not self.open_mode and not self.app_token:
-            errors.append("Authentication required but no app_token configured (OPEN_MODE=false).")
+        if self.require_auth and not self.open_mode and not self.app_token:
+            errors.append("Authentication required but no APP_TOKEN configured (REQUIRE_AUTH=1).")
         if self.open_mode and self.app_token:
-            warnings_list.append("OPEN_MODE enabled while app_token exists. Endpoints may be publicly exposed.")
+            warnings_list.append("OPEN_MODE enabled while APP_TOKEN exists. Endpoints may be publicly exposed.")
 
         # Backend URL sanity
         if self.backend_base_url and not is_valid_url(self.backend_base_url):
             warnings_list.append(f"backend_base_url does not look like a URL: {self.backend_base_url!r}")
 
+        # Cache sanity
+        if self.cache_backend == CacheBackend.REDIS and not self.redis_url:
+            errors.append("CACHE_BACKEND=redis but REDIS_URL is missing.")
+        if self.cache_backend == CacheBackend.MEMCACHED:
+            warnings_list.append("CACHE_BACKEND=memcached selected; ensure your app has a valid memcached endpoint.")
+
         # Providers
-        if "eodhd" in [p.lower() for p in self.enabled_providers] and not self.eodhd_api_key:
-            errors.append("Provider 'eodhd' is enabled but no API key provided.")
-        if "finnhub" in [p.lower() for p in self.enabled_providers] and not self.finnhub_api_key:
-            errors.append("Provider 'finnhub' is enabled but no API key provided.")
+        enabled_lower = [p.lower() for p in (self.enabled_providers or [])]
+        if "eodhd" in enabled_lower and not self.eodhd_api_key:
+            errors.append("Provider 'eodhd' is enabled but no EODHD_API_KEY provided.")
+        if "finnhub" in enabled_lower and not self.finnhub_api_key:
+            errors.append("Provider 'finnhub' is enabled but no FINNHUB_API_KEY provided.")
+        if "argaam" in [p.lower() for p in (self.ksa_providers or [])] and not self.argaam_api_key:
+            warnings_list.append("KSA provider 'argaam' enabled but ARGAAM_API_KEY is missing (may be required).")
+
+        # Sheets
+        if self.google_sheets_credentials_json and not self.default_spreadsheet_id:
+            warnings_list.append("GOOGLE_SHEETS_CREDENTIALS is set but DEFAULT_SPREADSHEET_ID is missing.")
 
         return errors, warnings_list
 
@@ -1058,7 +1283,6 @@ class Settings:
         content = load_file_content(path)
         base = cls.from_env()
         merged = deep_merge(asdict(base), content, overwrite=True)
-        # Keep only known fields
         allowed = set(cls.__dataclass_fields__.keys())
         cleaned = {k: v for k, v in merged.items() if k in allowed}
         return cls(**cleaned)
@@ -1067,6 +1291,7 @@ class Settings:
 # =============================================================================
 # Settings Cache + Public API
 # =============================================================================
+
 class SettingsCache:
     def __init__(self, ttl_seconds: int = 30):
         self._cache: Dict[str, Tuple[Any, float]] = {}
@@ -1154,6 +1379,7 @@ def config_health_check() -> Dict[str, Any]:
         else:
             health["checks"]["settings_valid"] = True
         health["warnings"].extend(warnings_list)
+        health["checks"]["settings_public"] = settings.public_dict()
     except Exception as e:
         health["checks"]["settings_accessible"] = False
         health["errors"].append(f"Cannot access settings: {e}")
@@ -1168,10 +1394,11 @@ def config_health_check() -> Dict[str, Any]:
 # =============================================================================
 # Distributed config init (safe + optional)
 # =============================================================================
+
 def init_distributed_config() -> None:
     """
     Register distributed sources if corresponding env vars exist.
-    Does not force-connect unless enabled by environment.
+    ✅ Safe: no network calls here (sources connect lazily on load()).
     """
     with TraceContext("init_distributed_config"):
         if os.getenv("CONSUL_HOST"):
@@ -1203,6 +1430,7 @@ init_distributed_config()
 # =============================================================================
 # Module Exports
 # =============================================================================
+
 __all__ = [
     # meta
     "CONFIG_VERSION",
@@ -1245,6 +1473,7 @@ __all__ = [
     "coerce_list",
     "coerce_dict",
     "strip_value",
+    "normalize_url",
     "TraceContext",
     # distributed sources
     "ConsulConfigSource",
