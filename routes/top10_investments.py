@@ -2,299 +2,324 @@
 # routes/top10_investments.py
 """
 ================================================================================
-Top 10 Investments Router — v1.1.0 (PHASE 6)
+Top 10 Investments Router — v1.0.0 (PHASE 6)
 ================================================================================
-Endpoints:
-  - GET  /v1/analysis/top10
-  - POST /v1/analysis/top10   (criteria override)
+Endpoint:
+  GET  /v1/analysis/top10
+  POST /v1/analysis/top10   (criteria overrides)
 
-Returns schema-driven rows for Top_10_Investments sheet:
-- Uses Criteria from Insights_Analysis top block (via criteria_model when available),
-  with optional override from POST body.
-- Uses core/analysis/top10_selector.py to filter + rank candidates.
-- Normalizes output rows to Top_10_Investments schema (all keys exist, missing => null).
-- Never fails on page alias mismatch (clean 400 where needed).
+Returns rows to populate Top_10_Investments (schema-driven):
+- headers (from schema_registry)
+- keys (schema keys)
+- rows (list[dict] with all schema keys, missing => null)
+- rows_matrix (optional legacy list-of-lists)
 
-Startup-safe:
-- No network calls at import time
-- Engine is lazy (request.app.state.engine or core.data_engine_v2.get_engine)
+Auth:
+- Uses core.config.auth_ok / is_open_mode when available
+- Secure fallback if missing
 
-Notes:
-- This router is under /v1/analysis (same family as ai_analysis.py).
+Engine:
+- Lazy access via request.app.state.engine or core.data_engine_v2.get_engine()
+
 """
 
 from __future__ import annotations
 
 import logging
+import math
+import os
 import time
 import uuid
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, status
 
-# Schema / pages
-from core.sheets.schema_registry import get_sheet_spec
-from core.sheets.page_catalog import CANONICAL_PAGES, normalize_page_name
-
-# Selector
-from core.analysis.top10_selector import (
-    Criteria,
-    build_top10_output_rows,
-    load_criteria_best_effort,
-    merge_criteria_overrides,
-    select_top10,
-)
-
-# Best JSON response (orjson if available)
-try:
-    import orjson  # type: ignore
-    from fastapi.responses import ORJSONResponse as BestJSONResponse  # type: ignore
-
-    def _json_content(v: Any) -> Any:
-        return v
-
-    _HAS_ORJSON = True
-except Exception:
-    from fastapi.responses import JSONResponse as BestJSONResponse  # type: ignore
-
-    def _json_content(v: Any) -> Any:
-        return v
-
-    _HAS_ORJSON = False
-
-
-logger = logging.getLogger("routes.top10_investments")
-
-ROUTE_VERSION = "1.1.0"
-router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
-
-
 # -----------------------------------------------------------------------------
-# Helpers
+# JSON response (orjson if available)
 # -----------------------------------------------------------------------------
-def _safe_uuid(x: Optional[str]) -> str:
-    return (x or "").strip() or str(uuid.uuid4())[:18]
-
-
-async def _maybe_await(v: Any) -> Any:
-    if hasattr(v, "__await__"):
-        return await v
-    return v
-
-
-async def _get_engine(request: Request) -> Optional[Any]:
-    # Prefer app.state.engine
+def clean_nans(obj: Any) -> Any:
     try:
-        st = getattr(request.app, "state", None)
-        if st and getattr(st, "engine", None):
-            return st.engine
-    except Exception:
-        pass
-
-    # Fallback to core.data_engine_v2.get_engine
-    try:
-        from core.data_engine_v2 import get_engine  # type: ignore
-
-        eng = get_engine()
-        eng = await _maybe_await(eng)
-        try:
-            request.app.state.engine = eng
-        except Exception:
-            pass
-        return eng
-    except Exception:
-        return None
-
-
-def _clean_nans(obj: Any) -> Any:
-    # lightweight NaN/Inf cleaning without importing math at module top
-    try:
-        import math
+        import math as _m
 
         if isinstance(obj, dict):
-            return {k: _clean_nans(v) for k, v in obj.items()}
+            return {k: clean_nans(v) for k, v in obj.items()}
         if isinstance(obj, list):
-            return [_clean_nans(v) for v in obj]
-        if isinstance(obj, float) and (math.isnan(obj) or math.isinf(obj)):
+            return [clean_nans(v) for v in obj]
+        if isinstance(obj, float) and (_m.isnan(obj) or _m.isinf(obj)):
             return None
     except Exception:
         pass
     return obj
 
 
-def _normalize_to_schema(schema_keys: Sequence[str], raw: Dict[str, Any]) -> Dict[str, Any]:
+try:
+    import orjson
+    from fastapi.responses import Response as StarletteResponse
+
+    class BestJSONResponse(StarletteResponse):
+        media_type = "application/json"
+
+        def render(self, content: Any) -> bytes:
+            return orjson.dumps(clean_nans(content), default=str)
+
+    _HAS_ORJSON = True
+except Exception:
+    import json
+    from fastapi.responses import JSONResponse as _JSONResponse
+
+    class BestJSONResponse(_JSONResponse):
+        def render(self, content: Any) -> bytes:
+            return json.dumps(clean_nans(content), default=str, ensure_ascii=False).encode("utf-8")
+
+    _HAS_ORJSON = False
+
+
+logger = logging.getLogger("routes.top10_investments")
+
+ROUTER_VERSION = "1.0.0"
+router = APIRouter(prefix="/v1/analysis", tags=["AI & Analysis"])
+
+
+# -----------------------------------------------------------------------------
+# Auth (align to core.config)
+# -----------------------------------------------------------------------------
+_TRUTHY = {"1", "true", "yes", "y", "on", "t"}
+
+
+def _request_id(request: Request, x_request_id: Optional[str]) -> str:
+    try:
+        rid = getattr(request.state, "request_id", None)
+        if rid:
+            return str(rid)
+    except Exception:
+        pass
+    return x_request_id or str(uuid.uuid4())[:18]
+
+
+def _extract_auth_token(token_q: Optional[str], x_app_token: Optional[str], authorization: Optional[str]) -> str:
+    if authorization:
+        a = authorization.strip()
+        if a.lower().startswith("bearer "):
+            return a.split(" ", 1)[1].strip()
+        return a
+    if x_app_token and x_app_token.strip():
+        return x_app_token.strip()
+    if token_q and token_q.strip():
+        return token_q.strip()
+    return ""
+
+
+def _auth_ok(request: Request, *, token_q: Optional[str], x_app_token: Optional[str], authorization: Optional[str]) -> bool:
+    try:
+        from core.config import is_open_mode, auth_ok  # type: ignore
+
+        if callable(is_open_mode) and is_open_mode():
+            return True
+
+        tok = _extract_auth_token(token_q, x_app_token, authorization)
+        if callable(auth_ok):
+            return bool(auth_ok(token=tok, authorization=authorization, headers={"X-APP-TOKEN": x_app_token, "Authorization": authorization}))
+        return False
+    except Exception:
+        require = (os.getenv("REQUIRE_AUTH", "true") or "true").strip().lower() in _TRUTHY
+        if not require:
+            return True
+        tok = _extract_auth_token(token_q, x_app_token, authorization)
+        return bool(tok)
+
+
+# -----------------------------------------------------------------------------
+# Engine (lazy)
+# -----------------------------------------------------------------------------
+async def _maybe_await(v: Any) -> Any:
+    if hasattr(v, "__await__"):
+        return await v
+    return v
+
+
+_ENGINE_LOCK = None
+
+
+async def _get_engine(request: Request) -> Tuple[Optional[Any], str, Optional[str]]:
+    # 1) app.state.engine
+    try:
+        st = getattr(request.app, "state", None)
+        if st and getattr(st, "engine", None):
+            return st.engine, "app.state.engine", None
+    except Exception:
+        pass
+
+    # 2) core.data_engine_v2.get_engine
+    try:
+        from core.data_engine_v2 import get_engine  # type: ignore
+
+        eng = await _maybe_await(get_engine())
+        try:
+            request.app.state.engine = eng
+        except Exception:
+            pass
+        return eng, "core.data_engine_v2.get_engine", None
+    except Exception as e:
+        return None, "engine_init_failed", f"{type(e).__name__}: {e}"
+
+
+# -----------------------------------------------------------------------------
+# Schema normalization (Top_10_Investments)
+# -----------------------------------------------------------------------------
+def _get_sheet_spec(page: str):
+    from core.sheets.schema_registry import get_sheet_spec  # type: ignore
+
+    return get_sheet_spec(page)
+
+
+def _normalize_row_to_schema(schema_keys: Sequence[str], raw: Dict[str, Any], *, symbol_fallback: str = "") -> Dict[str, Any]:
     raw = raw or {}
     raw_lc = {str(k).lower(): v for k, v in raw.items()}
     out: Dict[str, Any] = {}
+
+    # simple aliasing for common keys
+    aliases: Dict[str, Tuple[str, ...]] = {
+        "symbol": ("symbol", "ticker"),
+        "rank": ("rank",),
+        "source_page": ("source_page", "origin", "page"),
+        "name": ("name", "company_name"),
+        "current_price": ("current_price", "price"),
+        "forecast_confidence": ("forecast_confidence", "confidence_score"),
+        "overall_score": ("overall_score",),
+        "risk_score": ("risk_score",),
+        "expected_roi_1m": ("expected_roi_1m",),
+        "expected_roi_3m": ("expected_roi_3m",),
+        "expected_roi_12m": ("expected_roi_12m",),
+        "forecast_price_1m": ("forecast_price_1m",),
+        "forecast_price_3m": ("forecast_price_3m",),
+        "forecast_price_12m": ("forecast_price_12m",),
+        "recommendation": ("recommendation",),
+        "last_updated_utc": ("last_updated_utc",),
+        "last_updated_riyadh": ("last_updated_riyadh",),
+    }
+
     for k in schema_keys:
+        v = None
         if k in raw:
-            out[k] = raw.get(k)
+            v = raw.get(k)
         elif k.lower() in raw_lc:
-            out[k] = raw_lc.get(k.lower())
+            v = raw_lc.get(k.lower())
         else:
-            out[k] = None
+            for a in aliases.get(k, ()):
+                if a in raw:
+                    v = raw.get(a)
+                    break
+                if a.lower() in raw_lc:
+                    v = raw_lc.get(a.lower())
+                    break
+        out[k] = v
+
+    if "symbol" in out and not out.get("symbol"):
+        out["symbol"] = symbol_fallback
+
     return out
 
 
-def _schema_for_top10() -> Tuple[List[str], List[str]]:
-    """
-    Uses schema_registry for Top_10_Investments (must exist in Phase 3 registry).
-    Falls back to a safe minimal schema if missing (still returns consistent shape).
-    """
-    try:
-        spec = get_sheet_spec("Top_10_Investments")
-        headers = [c.header for c in spec.columns]
-        keys = [c.key for c in spec.columns]
-        return headers, keys
-    except Exception:
-        # Minimal fallback (won't crash clients)
-        headers = [
-            "Rank",
-            "Source Page",
-            "Symbol",
-            "Name",
-            "Currency",
-            "Exchange",
-            "Current Price",
-            "Expected ROI (Horizon)",
-            "Forecast Price (Horizon)",
-            "Forecast Confidence",
-            "Overall Score",
-            "Risk Score",
-            "Recommendation",
-            "Last Updated (UTC)",
-            "Last Updated (Riyadh)",
-        ]
-        keys = [
-            "rank",
-            "source_page",
-            "symbol",
-            "name",
-            "currency",
-            "exchange",
-            "current_price",
-            "expected_roi",
-            "forecast_price",
-            "forecast_confidence",
-            "overall_score",
-            "risk_score",
-            "recommendation",
-            "last_updated_utc",
-            "last_updated_riyadh",
-        ]
-        return headers, keys
+# -----------------------------------------------------------------------------
+# Core selector
+# -----------------------------------------------------------------------------
+from core.analysis.top10_selector import (
+    Criteria,
+    load_criteria_best_effort,
+    merge_criteria_overrides,
+    select_top10,
+    build_top10_output_rows,
+)
 
 
-# -----------------------------------------------------------------------------
-# Request model (lightweight dict body; Pydantic optional)
-# -----------------------------------------------------------------------------
-def _parse_override_body(body: Any) -> Dict[str, Any]:
-    """
-    Accepts dict overrides; ignores extra keys.
-    """
-    if isinstance(body, dict):
-        return body
-    return {}
-
-
-# -----------------------------------------------------------------------------
-# Endpoints
-# -----------------------------------------------------------------------------
 @router.get("/top10")
 async def get_top10(
     request: Request,
-    include_matrix: bool = Query(True, description="Include rows_matrix (legacy compatibility)."),
-    enrich_final: Optional[bool] = Query(None, description="Override whether to enrich final Top-N via engine."),
-    top_n: Optional[int] = Query(None, ge=1, le=50, description="Override Top-N size."),
+    token: Optional[str] = Query(default=None, description="Auth token (query only if ALLOW_QUERY_TOKEN=true in server)"),
+    include_matrix: bool = Query(default=True, description="Include rows_matrix for legacy clients"),
+    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> BestJSONResponse:
-    """
-    Uses criteria from Insights_Analysis (embedded criteria block) and returns Top 10 investments.
-    """
     t0 = time.time()
-    request_id = _safe_uuid(x_request_id)
+    rid = _request_id(request, x_request_id)
 
-    engine = await _get_engine(request)
+    if not _auth_ok(request, token_q=token if (os.getenv("ALLOW_QUERY_TOKEN", "").strip().lower() in _TRUTHY) else None, x_app_token=x_app_token, authorization=authorization):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="unauthorized")
+
+    engine, src, err = await _get_engine(request)
     if not engine:
         return BestJSONResponse(
             status_code=503,
-            content=_clean_nans(
-                {
-                    "status": "error",
-                    "error": "Data engine unavailable",
-                    "version": ROUTE_VERSION,
-                    "request_id": request_id,
-                    "meta": {"duration_ms": (time.time() - t0) * 1000.0},
-                }
-            ),
+            content={
+                "status": "error",
+                "error": "Data engine unavailable",
+                "engine_source": src,
+                "engine_error": err,
+                "version": ROUTER_VERSION,
+                "request_id": rid,
+                "meta": {"duration_ms": (time.time() - t0) * 1000.0},
+            },
         )
 
-    # Load criteria
     criteria = load_criteria_best_effort(engine)
+    top, meta = await select_top10(engine=engine, criteria=criteria)
+    rows_raw = build_top10_output_rows(top, horizon=criteria.horizon())
 
-    # Apply query overrides
-    overrides: Dict[str, Any] = {}
-    if enrich_final is not None:
-        overrides["enrich_final"] = bool(enrich_final)
-    if top_n is not None:
-        overrides["top_n"] = int(top_n)
+    # Normalize to Top_10_Investments schema
+    try:
+        spec = _get_sheet_spec("Top_10_Investments")
+        headers = [c.header for c in spec.columns]
+        keys = [c.key for c in spec.columns]
+    except Exception as e:
+        # fallback: keys from raw rows
+        headers = []
+        keys = sorted({k for r in rows_raw for k in r.keys()})
 
-    if overrides:
-        criteria = merge_criteria_overrides(criteria, overrides)
+    normalized_rows = [_normalize_row_to_schema(keys, r, symbol_fallback=str(r.get("symbol") or "")) for r in rows_raw]
 
-    # Select
-    candidates, sel_meta = await select_top10(engine=engine, criteria=criteria)
-    horizon = criteria.horizon()
-    output_rows = build_top10_output_rows(candidates, horizon=horizon)
-
-    # Schema normalize to Top_10_Investments
-    headers, keys = _schema_for_top10()
-
-    # If schema doesn't include horizon-specific ROI keys, we keep your schema registry as truth.
-    # We still return the horizon in meta, and rows will include schema keys only.
-    normalized_rows: List[Dict[str, Any]] = []
-    for r in output_rows:
-        # If sheet schema expects expected_roi_1m/3m/12m etc., r already contains those keys.
-        normalized_rows.append(_normalize_to_schema(keys, r))
-
-    payload: Dict[str, Any] = {
+    payload = {
         "status": "success",
         "page": "Top_10_Investments",
         "headers": headers,
         "keys": keys,
         "rows": normalized_rows,
         "rows_matrix": [[row.get(k) for k in keys] for row in normalized_rows] if include_matrix else None,
-        "version": ROUTE_VERSION,
-        "request_id": request_id,
+        "criteria": {
+            "pages_selected": criteria.pages_selected,
+            "invest_period_days": criteria.invest_period_days,
+            "horizon": criteria.horizon(),
+            "min_expected_roi": criteria.min_expected_roi,
+            "max_risk_score": criteria.max_risk_score,
+            "min_confidence": criteria.min_confidence,
+            "enforce_risk_confidence": criteria.enforce_risk_confidence,
+            "top_n": criteria.top_n,
+            "enrich_final": criteria.enrich_final,
+        },
+        "version": ROUTER_VERSION,
+        "request_id": rid,
         "meta": {
+            **(meta or {}),
             "duration_ms": (time.time() - t0) * 1000.0,
-            "criteria": {
-                "pages_selected": list(criteria.pages_selected),
-                "invest_period_days": int(criteria.invest_period_days),
-                "horizon": horizon,
-                "min_expected_roi": criteria.min_expected_roi,
-                "max_risk_score": float(criteria.max_risk_score),
-                "min_confidence": float(criteria.min_confidence),
-                "enforce_risk_confidence": bool(criteria.enforce_risk_confidence),
-                "top_n": int(criteria.top_n),
-                "enrich_final": bool(criteria.enrich_final),
-            },
-            "selection": sel_meta,
+            "engine_source": src,
         },
     }
-
-    return BestJSONResponse(content=_clean_nans(payload))
+    return BestJSONResponse(content=clean_nans(payload))
 
 
 @router.post("/top10")
 async def post_top10(
     request: Request,
     body: Dict[str, Any] = Body(default_factory=dict),
-    include_matrix: bool = Query(True, description="Include rows_matrix (legacy compatibility)."),
+    token: Optional[str] = Query(default=None, description="Auth token (query only if ALLOW_QUERY_TOKEN=true in server)"),
+    include_matrix: bool = Query(default=True, description="Include rows_matrix for legacy clients"),
+    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> BestJSONResponse:
     """
-    POST override form:
+    POST lets you override criteria.
+    Example body:
       {
         "invest_period_days": 90,
         "pages_selected": ["Market_Leaders","Global_Markets"],
@@ -302,83 +327,73 @@ async def post_top10(
         "max_risk_score": 60,
         "min_confidence": 0.75,
         "top_n": 10,
-        "enrich_final": true,
-        "enforce_risk_confidence": true
+        "enrich_final": true
       }
     """
     t0 = time.time()
-    request_id = _safe_uuid(x_request_id)
+    rid = _request_id(request, x_request_id)
 
-    engine = await _get_engine(request)
+    if not _auth_ok(request, token_q=token if (os.getenv("ALLOW_QUERY_TOKEN", "").strip().lower() in _TRUTHY) else None, x_app_token=x_app_token, authorization=authorization):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="unauthorized")
+
+    engine, src, err = await _get_engine(request)
     if not engine:
         return BestJSONResponse(
             status_code=503,
-            content=_clean_nans(
-                {
-                    "status": "error",
-                    "error": "Data engine unavailable",
-                    "version": ROUTE_VERSION,
-                    "request_id": request_id,
-                    "meta": {"duration_ms": (time.time() - t0) * 1000.0},
-                }
-            ),
+            content={
+                "status": "error",
+                "error": "Data engine unavailable",
+                "engine_source": src,
+                "engine_error": err,
+                "version": ROUTER_VERSION,
+                "request_id": rid,
+                "meta": {"duration_ms": (time.time() - t0) * 1000.0},
+            },
         )
 
-    base_criteria = load_criteria_best_effort(engine)
-    overrides = _parse_override_body(body or {})
-    criteria = merge_criteria_overrides(base_criteria, overrides)
+    base = load_criteria_best_effort(engine)
+    criteria = merge_criteria_overrides(base, body or {})
 
-    candidates, sel_meta = await select_top10(engine=engine, criteria=criteria)
-    horizon = criteria.horizon()
-    output_rows = build_top10_output_rows(candidates, horizon=horizon)
+    top, meta = await select_top10(engine=engine, criteria=criteria)
+    rows_raw = build_top10_output_rows(top, horizon=criteria.horizon())
 
-    headers, keys = _schema_for_top10()
+    try:
+        spec = _get_sheet_spec("Top_10_Investments")
+        headers = [c.header for c in spec.columns]
+        keys = [c.key for c in spec.columns]
+    except Exception:
+        headers = []
+        keys = sorted({k for r in rows_raw for k in r.keys()})
 
-    normalized_rows: List[Dict[str, Any]] = []
-    for r in output_rows:
-        normalized_rows.append(_normalize_to_schema(keys, r))
+    normalized_rows = [_normalize_row_to_schema(keys, r, symbol_fallback=str(r.get("symbol") or "")) for r in rows_raw]
 
-    payload: Dict[str, Any] = {
+    payload = {
         "status": "success",
         "page": "Top_10_Investments",
         "headers": headers,
         "keys": keys,
         "rows": normalized_rows,
         "rows_matrix": [[row.get(k) for k in keys] for row in normalized_rows] if include_matrix else None,
-        "version": ROUTE_VERSION,
-        "request_id": request_id,
+        "criteria": {
+            "pages_selected": criteria.pages_selected,
+            "invest_period_days": criteria.invest_period_days,
+            "horizon": criteria.horizon(),
+            "min_expected_roi": criteria.min_expected_roi,
+            "max_risk_score": criteria.max_risk_score,
+            "min_confidence": criteria.min_confidence,
+            "enforce_risk_confidence": criteria.enforce_risk_confidence,
+            "top_n": criteria.top_n,
+            "enrich_final": criteria.enrich_final,
+        },
+        "version": ROUTER_VERSION,
+        "request_id": rid,
         "meta": {
+            **(meta or {}),
             "duration_ms": (time.time() - t0) * 1000.0,
-            "criteria": {
-                "pages_selected": list(criteria.pages_selected),
-                "invest_period_days": int(criteria.invest_period_days),
-                "horizon": horizon,
-                "min_expected_roi": criteria.min_expected_roi,
-                "max_risk_score": float(criteria.max_risk_score),
-                "min_confidence": float(criteria.min_confidence),
-                "enforce_risk_confidence": bool(criteria.enforce_risk_confidence),
-                "top_n": int(criteria.top_n),
-                "enrich_final": bool(criteria.enrich_final),
-            },
-            "selection": sel_meta,
+            "engine_source": src,
         },
     }
-
-    return BestJSONResponse(content=_clean_nans(payload))
-
-
-# -----------------------------------------------------------------------------
-# Dynamic loader hook (optional)
-# -----------------------------------------------------------------------------
-def get_router() -> APIRouter:
-    return router
+    return BestJSONResponse(content=clean_nans(payload))
 
 
-def mount(app: Any) -> None:
-    try:
-        app.include_router(router)
-    except Exception:
-        pass
-
-
-__all__ = ["router", "mount", "get_router", "ROUTE_VERSION"]
+__all__ = ["router"]
