@@ -2,7 +2,7 @@
 # core/sheets/data_dictionary.py
 """
 ================================================================================
-Data Dictionary Generator — v2.2.0 (SCHEMA-DRIVEN / STABLE / ROUTER-ALIGNED)
+Data Dictionary Generator — v2.2.1 (SCHEMA-DRIVEN / STABLE / ROUTER-ALIGNED)
 ================================================================================
 Tadawul Fast Bridge (TFB)
 
@@ -21,21 +21,21 @@ Why this revision (alignment + robustness):
     2) 2D values array for Google Sheets (including optional header row)
 - ✅ Import-safe: no I/O, no network
 
-Data_Dictionary columns (expected):
+Data_Dictionary columns (expected headers):
 Sheet, Group, Header, Key, DType, Format, Required, Source, Notes
 ================================================================================
 """
 
 from __future__ import annotations
 
+import os
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Schema Registry (authoritative)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 try:
-    from core.sheets.schema_registry import (
+    from core.sheets.schema_registry import (  # type: ignore
         SCHEMA_VERSION,
         SCHEMA_REGISTRY,
         get_sheet_spec,
@@ -43,7 +43,7 @@ try:
         list_sheets,
     )
 except Exception as e:  # pragma: no cover
-    raise ImportError(f"schema_registry import failed in data_dictionary.py: {e!r}")
+    raise ImportError(f"schema_registry import failed in data_dictionary.py: {e!r}") from e
 
 
 __all__ = [
@@ -57,12 +57,12 @@ __all__ = [
     "validate_data_dictionary_output",
 ]
 
-DATA_DICTIONARY_VERSION = "2.2.0"
+DATA_DICTIONARY_VERSION = "2.2.1"
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Helpers (safe string / attribute access)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _s(v: Any) -> str:
     try:
         return str(v).strip()
@@ -95,23 +95,32 @@ def _bool(v: Any) -> bool:
     return bool(v)
 
 
-# -----------------------------------------------------------------------------
+def _env_truthy(name: str, default: bool = False) -> bool:
+    try:
+        raw = (os.getenv(name, str(default)) or "").strip().lower()
+        return raw in {"1", "true", "yes", "y", "on", "t"}
+    except Exception:
+        return default
+
+
+# ---------------------------------------------------------------------------
 # Data_Dictionary spec introspection (authoritative contract)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def data_dictionary_headers() -> List[str]:
-    """
-    Returns Data_Dictionary headers EXACTLY as defined in schema_registry.
-    """
+    """Returns Data_Dictionary headers EXACTLY as defined in schema_registry."""
     return list(get_sheet_headers("Data_Dictionary"))
 
 
 def data_dictionary_keys() -> List[str]:
-    """
-    Returns Data_Dictionary keys EXACTLY as defined in schema_registry.
-    """
+    """Returns Data_Dictionary keys EXACTLY as defined in schema_registry."""
     spec = get_sheet_spec("Data_Dictionary")
     cols = getattr(spec, "columns", None) or []
-    return [str(getattr(c, "key")) for c in cols if getattr(c, "key", None)]
+    keys: List[str] = []
+    for c in cols:
+        k = _get_attr(c, "key", default=None)
+        if k:
+            keys.append(str(k))
+    return keys
 
 
 def _data_dictionary_spec() -> Tuple[List[str], List[str]]:
@@ -125,12 +134,12 @@ def _data_dictionary_spec() -> Tuple[List[str], List[str]]:
     return hdrs, keys
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Ordering
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _preferred_sheet_order() -> List[str]:
     """
-    Respect page_catalog canonical ordering when available, otherwise fall back safely.
+    Respect page_catalog ordering when available, otherwise fall back safely.
 
     IMPORTANT:
     - Only include sheets that exist in SCHEMA_REGISTRY.
@@ -143,6 +152,7 @@ def _preferred_sheet_order() -> List[str]:
         from core.sheets.page_catalog import CANONICAL_PAGES  # type: ignore
 
         ordered = [s for s in list(CANONICAL_PAGES) if s in reg]
+        # ensure we also include schema_registry sheets even if catalog ordering is partial
         for s in list_sheets():
             if s in reg and s not in ordered:
                 ordered.append(s)
@@ -171,12 +181,12 @@ def _preferred_sheet_order() -> List[str]:
 def _canonicalize_sheet_name(name: str) -> str:
     """
     Best-effort canonicalization. Avoids hard dependency on page_catalog.
+    Accepts aliases when page_catalog is available.
     """
     s = _s(name)
     if not s:
         return s
 
-    # page_catalog can map aliases to canonical names
     for fn_name in ("resolve_page", "canonicalize_page", "normalize_page_name"):
         try:
             mod = __import__("core.sheets.page_catalog", fromlist=[fn_name])
@@ -191,13 +201,12 @@ def _canonicalize_sheet_name(name: str) -> str:
         except Exception:
             continue
 
-    # minimal normalization
     return s.replace(" ", "_")
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Core row mapping
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def row_dict_from_column(sheet: str, col: Any) -> Dict[str, Any]:
     """
     Convert a ColumnSpec into a Data_Dictionary row dict.
@@ -206,8 +215,6 @@ def row_dict_from_column(sheet: str, col: Any) -> Dict[str, Any]:
     _, dd_keys = _data_dictionary_spec()
 
     # ColumnSpec variations (defensive):
-    # - dtype might be "dtype" or "type"
-    # - fmt might be "fmt" or "format"
     sheet_name = _s(sheet)
     group = _s(_get_attr(col, "group", default=""))
     header = _s(_get_attr(col, "header", default=""))
@@ -218,7 +225,7 @@ def row_dict_from_column(sheet: str, col: Any) -> Dict[str, Any]:
     source = _s(_get_attr(col, "source", default=""))
     notes = _s(_get_attr(col, "notes", "note", "description", default=""))
 
-    # Build a canonical internal record (snake-ish)
+    # canonical internal (snake-ish)
     base: Dict[str, Any] = {
         "sheet": sheet_name,
         "group": group,
@@ -231,43 +238,40 @@ def row_dict_from_column(sheet: str, col: Any) -> Dict[str, Any]:
         "notes": notes,
     }
 
-    # Project base into exact dd_keys (supports different key naming conventions if ever changed)
+    # Project into EXACT dd_keys (no extras)
     out: Dict[str, Any] = {}
     for dk in dd_keys:
         lk = dk.strip().lower().replace(" ", "_")
+
         if dk in base:
             out[dk] = base[dk]
-        elif lk in base:
+            continue
+        if lk in base:
             out[dk] = base[lk]
-        elif lk in {"format"}:
+            continue
+
+        # tolerate alternate key names if schema ever changes (future-proof)
+        if lk == "format":
             out[dk] = base["fmt"]
         elif lk in {"dtype", "type"}:
             out[dk] = base["dtype"]
+        elif lk in {"sheet", "page"}:
+            out[dk] = base["sheet"]
+        elif lk in {"column", "header"}:
+            out[dk] = base["header"]
+        elif lk in {"required", "is_required", "req"}:
+            out[dk] = base["required"]
+        elif lk in {"notes", "note", "description"}:
+            out[dk] = base["notes"]
         else:
-            # if schema keys are TitleCase like "Sheet", "Group" etc.
-            if lk == "sheet":
-                out[dk] = base["sheet"]
-            elif lk == "group":
-                out[dk] = base["group"]
-            elif lk in {"header", "column"}:
-                out[dk] = base["header"]
-            elif lk == "key":
-                out[dk] = base["key"]
-            elif lk in {"required", "is_required"}:
-                out[dk] = base["required"]
-            elif lk == "source":
-                out[dk] = base["source"]
-            elif lk in {"notes", "note", "description"}:
-                out[dk] = base["notes"]
-            else:
-                out[dk] = None
+            out[dk] = None
 
     return out
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Builders
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def build_data_dictionary_rows(
     *,
     sheets: Optional[Sequence[str]] = None,
@@ -278,7 +282,7 @@ def build_data_dictionary_rows(
 
     Args:
         sheets:
-          If provided, restrict to these sheets (aliases accepted; will be canonicalized).
+          If provided, restrict to these sheets (aliases accepted; canonicalized).
         include_meta_sheet:
           If False, excludes Data_Dictionary itself.
     """
@@ -297,7 +301,6 @@ def build_data_dictionary_rows(
 
         spec = SCHEMA_REGISTRY.get(sheet)
         if spec is None:
-            # should not happen if order validated; keep defensive
             continue
 
         cols = getattr(spec, "columns", None) or []
@@ -334,19 +337,24 @@ def build_data_dictionary_values(
     return values
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Validation / Quality Gates
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def validate_data_dictionary_output(
     rows: Sequence[Dict[str, Any]],
     *,
     enforce_unique_sheet_key: bool = True,
+    forbid_extra_keys: bool = False,
 ) -> None:
     """
     Sanity checks for generated output (fast, no I/O).
 
     enforce_unique_sheet_key:
       - True by default to prevent duplicates (sheet,key)
+
+    forbid_extra_keys:
+      - If True, rows must contain ONLY the Data_Dictionary spec keys
+        (useful for strict CI).
     """
     _, dd_keys = _data_dictionary_spec()
     required_keys = set(dd_keys)
@@ -355,11 +363,13 @@ def validate_data_dictionary_output(
         missing = required_keys - set(r.keys())
         if missing:
             raise ValueError(f"Row {i} missing keys: {sorted(missing)}")
+        if forbid_extra_keys:
+            extra = set(r.keys()) - required_keys
+            if extra:
+                raise ValueError(f"Row {i} has extra keys not in spec: {sorted(extra)}")
 
     if enforce_unique_sheet_key:
-        # use best-effort key names from dd spec
         lk = [k.strip().lower().replace(" ", "_") for k in dd_keys]
-        # find which keys correspond to sheet + key
         sheet_key = None
         col_key = None
         for k, kl in zip(dd_keys, lk):
@@ -379,11 +389,10 @@ def validate_data_dictionary_output(
             seen.add(pair)
 
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Optional self-check (fast) — enable in CI or strict deployments
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 def _self_check() -> None:
-    # Expect the human headers to match the canonical 9 columns (common contract).
     expected_headers = ["Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes"]
     headers = data_dictionary_headers()
     if headers != expected_headers:
@@ -393,16 +402,10 @@ def _self_check() -> None:
         )
 
     rows = build_data_dictionary_rows()
-    validate_data_dictionary_output(rows, enforce_unique_sheet_key=True)
+    validate_data_dictionary_output(rows, enforce_unique_sheet_key=True, forbid_extra_keys=True)
 
 
 # Default: do NOT hard-crash startup unless explicitly enabled.
 # Enable in CI: TFB_SCHEMA_SELFTEST=1
-try:
-    _do = (os.getenv("TFB_SCHEMA_SELFTEST", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}  # type: ignore
-except Exception:
-    _do = False
-
-if _do:
-    import os  # local import (only when needed)
+if _env_truthy("TFB_SCHEMA_SELFTEST", False):
     _self_check()
