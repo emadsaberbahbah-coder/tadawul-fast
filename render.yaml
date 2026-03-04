@@ -1,15 +1,7 @@
 # =============================================================================
 # render.yaml
 # =============================================================================
-# TADAWUL FAST BRIDGE – RENDER BLUEPRINT (v7.5.1) — BLUEPRINT-SPEC COMPLIANT
-# Last Updated: 2026-03-04
-#
-# Key fixes in v7.5.1:
-# - ✅ envVarGroups: removed sync:false + fromService references (Blueprint spec restriction)
-# - ✅ secrets moved to per-service envVars (sync:false prompts in dashboard per service)
-# - ✅ REDIS_URL moved to per-service envVars (fromService not allowed in env groups)
-# - ✅ buildCommand: installs only requirements.txt (no unpinned optional installs)
-# - ✅ uv PATH hardened (~/.local/bin + ~/.cargo/bin)
+# TADAWUL FAST BRIDGE – RENDER BLUEPRINT (v7.5.2) — HASH-PROOF + SPEC COMPLIANT
 # =============================================================================
 
 previews:
@@ -17,9 +9,6 @@ previews:
   expireAfterDays: 7
 
 services:
-  # -------------------------------------------------------------------------
-  # 1) Primary FastAPI Application (Web Service)
-  # -------------------------------------------------------------------------
   - type: web
     name: tadawul-fast-bridge
     runtime: python
@@ -44,6 +33,7 @@ services:
         - scripts/**
         - integrations/**
         - requirements.txt
+        - requirements.render.txt
         - runtime.txt
         - render.yaml
       ignoredPaths:
@@ -58,21 +48,26 @@ services:
     buildCommand: |
       set -euo pipefail
 
-      # 1) Install uv (Astral) for fast dependency resolution
       curl -LsSf https://astral.sh/uv/install.sh | sh
       export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
       command -v uv >/dev/null 2>&1 || { echo "uv not found on PATH"; exit 1; }
       uv --version
 
-      # 2) Install dependencies (single source of truth)
-      uv pip install --system --no-cache -r requirements.txt
+      echo "=== Preflight: ensure NO hash-locked requirements exist ==="
+      if grep -R --line-number --fixed-strings "--hash=sha256:" . ; then
+        echo "ERROR: Found --hash lines in repo. Remove them (pip require-hashes mode)."
+        exit 1
+      fi
+      if grep -R --line-number --fixed-strings "8df6da72963969ab2bf49a520c3e147b1e15cbeddd3aa0e3e039b3532c739339" . ; then
+        echo "ERROR: Found the failing expected hash in repo. Remove it."
+        exit 1
+      fi
 
-      # 3) Sanity check dependency graph
+      echo "=== Install (Render-safe file) ==="
+      uv pip install --system --no-cache -r requirements.render.txt
+
       uv pip check || true
-
-      # 4) Compile bytecode for faster cold start
       python -m compileall -q -f -x "(tests|examples|docs|venv|\.git|__pycache__)" .
-
       echo "✅ Build completed"
 
     startCommand: |
@@ -91,7 +86,6 @@ services:
       - api.tadawulfastbridge.com
 
     envVars:
-      # Groups (NON-secret, no fromService, no sync:false)
       - fromGroup: tfb-core
       - fromGroup: tfb-logging
       - fromGroup: tfb-server
@@ -102,34 +96,27 @@ services:
       - fromGroup: tfb-sheets
       - fromGroup: tfb-resources
 
-      # Service-level (allowed): fromService for Redis
       - key: REDIS_URL
         fromService:
           name: tadawul-redis
           type: keyvalue
           property: connectionString
 
-      # Service-level secrets (allowed): sync:false prompts
       - key: APP_TOKEN
         sync: false
       - key: BACKUP_APP_TOKEN
         sync: false
-
       - key: EODHD_API_KEY
         sync: false
       - key: FINNHUB_API_KEY
         sync: false
       - key: ARGAAM_API_KEY
         sync: false
-
       - key: GOOGLE_SHEETS_CREDENTIALS
         sync: false
       - key: DEFAULT_SPREADSHEET_ID
         sync: false
 
-  # -------------------------------------------------------------------------
-  # 2) Background Worker Service
-  # -------------------------------------------------------------------------
   - type: worker
     name: tadawul-worker
     runtime: python
@@ -147,6 +134,7 @@ services:
         - scripts/**
         - integrations/**
         - requirements.txt
+        - requirements.render.txt
         - runtime.txt
         - render.yaml
       ignoredPaths:
@@ -163,7 +151,7 @@ services:
       curl -LsSf https://astral.sh/uv/install.sh | sh
       export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
       uv --version
-      uv pip install --system --no-cache -r requirements.txt
+      uv pip install --system --no-cache -r requirements.render.txt
       uv pip check || true
       python -m compileall -q main.py core scripts
 
@@ -191,22 +179,17 @@ services:
         sync: false
       - key: BACKUP_APP_TOKEN
         sync: false
-
       - key: EODHD_API_KEY
         sync: false
       - key: FINNHUB_API_KEY
         sync: false
       - key: ARGAAM_API_KEY
         sync: false
-
       - key: GOOGLE_SHEETS_CREDENTIALS
         sync: false
       - key: DEFAULT_SPREADSHEET_ID
         sync: false
 
-  # -------------------------------------------------------------------------
-  # 3) Redis-Compatible Cache (Render Key Value)
-  # -------------------------------------------------------------------------
   - type: keyvalue
     name: tadawul-redis
     region: frankfurt
@@ -214,9 +197,6 @@ services:
     ipAllowList: []
     maxmemoryPolicy: allkeys-lru
 
-  # -------------------------------------------------------------------------
-  # 4) Documentation Static Site
-  # -------------------------------------------------------------------------
   - type: web
     name: tadawul-docs
     runtime: static
@@ -229,7 +209,7 @@ services:
       set -euo pipefail
       mkdir -p public
       cp -r docs/* public/ || true
-      echo "Tadawul Fast Bridge v7.5.1 Documentation" > public/index.html
+      echo "Tadawul Fast Bridge v7.5.2 Documentation" > public/index.html
 
     staticPublishPath: public
 
@@ -238,9 +218,6 @@ services:
         name: Cache-Control
         value: public, max-age=3600
 
-  # -------------------------------------------------------------------------
-  # 5) Cron Jobs
-  # -------------------------------------------------------------------------
   - type: cron
     name: cache-cleanup
     runtime: python
@@ -254,7 +231,7 @@ services:
       curl -LsSf https://astral.sh/uv/install.sh | sh
       export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
       uv --version
-      uv pip install --system --no-cache -r requirements.txt
+      uv pip install --system --no-cache -r requirements.render.txt
       uv pip check || true
 
     startCommand: python scripts/cleanup_cache.py
@@ -264,7 +241,6 @@ services:
       - fromGroup: tfb-logging
       - fromGroup: tfb-cache
       - fromGroup: tfb-resources
-
       - key: REDIS_URL
         fromService:
           name: tadawul-redis
@@ -284,7 +260,7 @@ services:
       curl -LsSf https://astral.sh/uv/install.sh | sh
       export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
       uv --version
-      uv pip install --system --no-cache -r requirements.txt
+      uv pip install --system --no-cache -r requirements.render.txt
       uv pip check || true
 
     startCommand: python scripts/drift_detection.py
@@ -296,15 +272,12 @@ services:
       - fromGroup: tfb-providers
       - fromGroup: tfb-sheets
       - fromGroup: tfb-resources
-
-      # provider + sheets secrets (if drift check uses them)
       - key: EODHD_API_KEY
         sync: false
       - key: FINNHUB_API_KEY
         sync: false
       - key: ARGAAM_API_KEY
         sync: false
-
       - key: GOOGLE_SHEETS_CREDENTIALS
         sync: false
       - key: DEFAULT_SPREADSHEET_ID
@@ -323,7 +296,7 @@ services:
       curl -LsSf https://astral.sh/uv/install.sh | sh
       export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
       uv --version
-      uv pip install --system --no-cache -r requirements.txt
+      uv pip install --system --no-cache -r requirements.render.txt
       uv pip check || true
 
     startCommand: python scripts/refresh_data.py
@@ -334,13 +307,11 @@ services:
       - fromGroup: tfb-providers
       - fromGroup: tfb-cache
       - fromGroup: tfb-resources
-
       - key: REDIS_URL
         fromService:
           name: tadawul-redis
           type: keyvalue
           property: connectionString
-
       - key: EODHD_API_KEY
         sync: false
       - key: FINNHUB_API_KEY
@@ -348,9 +319,6 @@ services:
       - key: ARGAAM_API_KEY
         sync: false
 
-# =============================================================================
-# ENVIRONMENT VARIABLE GROUPS (NO secrets, NO fromService, NO sync:false)
-# =============================================================================
 envVarGroups:
   - name: tfb-core
     envVars:
@@ -361,9 +329,9 @@ envVarGroups:
       - key: APP_ENV
         value: "production"
       - key: APP_VERSION
-        value: "7.5.1"
+        value: "7.5.2"
       - key: SERVICE_VERSION
-        value: "7.5.1"
+        value: "7.5.2"
       - key: PYTHONUNBUFFERED
         value: "1"
       - key: PYTHONDONTWRITEBYTECODE
@@ -395,7 +363,7 @@ envVarGroups:
       - key: WEB_CONCURRENCY_MAX
         value: "16"
       - key: WORKER_CLASS
-        value: "uvicorn_worker.UvicornWorker"
+        value: "uvicorn.workers.UvicornWorker"
       - key: WORKER_CONNECTIONS
         value: "2048"
       - key: WORKER_MAX_REQUESTS
