@@ -2,8 +2,8 @@ name: 🏦 Tadawul Dashboard Advanced Sync
 
 on:
   schedule:
-    # Runs at minute 0, 15, 30, 45 every hour (UTC) - more frequent during market hours
-    # Note: GitHub Actions schedules are strictly UTC. Riyadh is UTC+3.
+    # Runs at minute 0, 15, 30, 45 every hour (UTC)
+    # Riyadh is UTC+3.
     - cron: "0,15,30,45 * * * *"
   workflow_dispatch:
     inputs:
@@ -39,12 +39,11 @@ on:
         default: false
         type: boolean
 
-# Concurrency: Prevent overlapping runs and API rate limits
+# Concurrency: Prevent overlapping runs
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
-# Minimal permissions with future-proofing for OIDC (Workload Identity)
 permissions:
   contents: read
   id-token: write
@@ -114,6 +113,7 @@ jobs:
           cache-dependency-path: |
             requirements.render.txt
             requirements.txt
+            requirements.ml.txt
 
       - name: 📦 Install & Verify Dependencies (NO hashes)
         run: |
@@ -122,7 +122,6 @@ jobs:
           echo "::group::Pip Install Log"
           python -m pip install --upgrade pip setuptools wheel
 
-          # Prefer Render-safe minimal deps if present
           if [ -f "requirements.render.txt" ]; then
             echo "✅ Installing from requirements.render.txt (Render-safe minimal)"
             python -m pip install -r requirements.render.txt
@@ -212,7 +211,7 @@ jobs:
           echo "TARGET_URL=$URL" >> "$GITHUB_ENV"
           echo "✅ Backend URL: $URL"
 
-          # 2) Sheet ID
+          # 2) Spreadsheet ID
           SHEET="$(get_val "${INPUT_SHEET:-}" "${VAR_SHEET:-}" "19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw")"
           if [[ -z "${SHEET:-}" ]]; then
             echo "::error::Spreadsheet ID is empty."
@@ -225,8 +224,9 @@ jobs:
           MODE="${INPUT_MODE:-full_sync}"
           echo "RUN_MODE=$MODE" >> "$GITHUB_ENV"
 
-          if [[ "$MODE" == "single_key" && -n "${INPUT_KEY:-}" ]]; then
-            KEYS="$INPUT_KEY"
+          if [[ "$MODE" == "single_key" ]]; then
+            KEY="${INPUT_KEY:-MARKET_LEADERS}"
+            KEYS="$KEY"
           else
             DEFAULT_KEYS="MARKET_LEADERS GLOBAL_MARKETS KSA_TADAWUL MUTUAL_FUNDS COMMODITIES_FX MY_PORTFOLIO INSIGHTS_ANALYSIS"
             KEYS="$(get_val "${VAR_DEFAULT_KEYS:-}" "$DEFAULT_KEYS")"
@@ -320,17 +320,12 @@ jobs:
           set -euo pipefail
           echo "::group::📊 Sync Execution"
 
-          # ---- Map workflow config -> script arguments (matches your v6.1.0 runner) ----
+          # Map workflow config -> run_dashboard_sync.py v6.1.0 flags
           CMD=(python scripts/run_dashboard_sync.py)
-
-          # required inputs
           CMD+=(--backend "$TARGET_URL")
           CMD+=(--sheet-id "$TARGET_SHEET_ID")
-
-          # keys
           CMD+=(--keys $SYNC_KEYS)
 
-          # optional behaviors
           if [[ "${RUN_MODE:-full_sync}" == "health_only" ]]; then
             CMD+=(--dry-run)
           fi
