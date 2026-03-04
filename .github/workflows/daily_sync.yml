@@ -39,7 +39,6 @@ on:
         default: false
         type: boolean
 
-# Concurrency: Prevent overlapping runs
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
@@ -184,6 +183,7 @@ jobs:
           VAR_URL: ${{ vars.BACKEND_BASE_URL }}
           VAR_SHEET: ${{ vars.DEFAULT_SPREADSHEET_ID }}
           VAR_DEFAULT_KEYS: ${{ vars.DEFAULT_SYNC_KEYS }}
+
           SECRET_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
           SECRET_CREDS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
         run: |
@@ -211,7 +211,7 @@ jobs:
           echo "TARGET_URL=$URL" >> "$GITHUB_ENV"
           echo "✅ Backend URL: $URL"
 
-          # 2) Spreadsheet ID
+          # 2) Sheet ID
           SHEET="$(get_val "${INPUT_SHEET:-}" "${VAR_SHEET:-}" "19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw")"
           if [[ -z "${SHEET:-}" ]]; then
             echo "::error::Spreadsheet ID is empty."
@@ -244,9 +244,8 @@ jobs:
           DEBUG="${INPUT_DEBUG:-false}"
           echo "ENABLE_DEBUG=$DEBUG" >> "$GITHUB_ENV"
 
-          # 5) Credentials (secure)
+          # 5) Credentials
           RAW_CREDS="$(get_val "${INPUT_CREDS:-}" "${SECRET_CREDS:-}")"
-
           if [[ -z "${RAW_CREDS:-}" && -n "${SECRET_CREDS_B64:-}" ]]; then
             echo "🔓 Decoding Base64 credentials..."
             RAW_CREDS="$(echo "$SECRET_CREDS_B64" | base64 --decode 2>/dev/null || true)"
@@ -296,7 +295,6 @@ jobs:
               if [[ "$HTTP_CODE" =~ ^2[0-9][0-9]$ ]]; then
                 echo "✅ Healthy via $endpoint (HTTP $HTTP_CODE)"
                 VERSION="$(echo "$BODY" | jq -r '.version // .build // "unknown"' 2>/dev/null || echo "unknown")"
-
                 echo "health_status=healthy" >> "$GITHUB_OUTPUT"
                 echo "health_version=$VERSION" >> "$GITHUB_OUTPUT"
                 echo "::endgroup::"
@@ -320,7 +318,6 @@ jobs:
           set -euo pipefail
           echo "::group::📊 Sync Execution"
 
-          # Map workflow config -> run_dashboard_sync.py v6.1.0 flags
           CMD=(python scripts/run_dashboard_sync.py)
           CMD+=(--backend "$TARGET_URL")
           CMD+=(--sheet-id "$TARGET_SHEET_ID")
