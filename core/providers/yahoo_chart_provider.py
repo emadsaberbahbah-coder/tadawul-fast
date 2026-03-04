@@ -2,7 +2,7 @@
 # core/providers/yahoo_chart_provider.py
 """
 ================================================================================
-Yahoo Chart Provider (Global Market Data) — v6.5.0 (Loader-Compatible + Prod Safe)
+Yahoo Chart Provider (Global Market Data) — v6.6.1 (Schema-Aligned + Prometheus-Safe)
 ================================================================================
 
 What this provider guarantees
@@ -10,15 +10,20 @@ What this provider guarantees
 - ✅ Async-friendly: threadpool for yfinance (blocking)
 - ✅ Deterministic + safe fallbacks (no heavy ML required)
 - ✅ Canonical output keys aligned with your engine:
-    current_price, previous_close, day_high, day_low, week_52_high, week_52_low,
-    volume, market_cap, currency, name, exchange,
+    current_price, previous_close, open_price, day_high, day_low, week_52_high, week_52_low,
+    volume, market_cap, currency, name, exchange, asset_class,
     price_change, percent_change, week_52_position_pct,
     rsi_14, volatility_30d,
     forecast_price_1m/3m/12m, expected_roi_1m/3m/12m, forecast_confidence (0..1),
     last_updated_utc, last_updated_riyadh, history_last_utc
 
 - ✅ Keeps backward-compatible aliases:
-    price, prev_close, 52w_high, 52w_low, change, change_pct
+    price, prev_close, open, 52w_high, 52w_low, change, change_pct
+
+Prometheus safety (IMPORTANT)
+- ✅ Metrics are created lazily and duplicate-safe.
+  If the same metric name is already registered in-process, we reuse it (or fall back),
+  preventing duplicate-timeseries crashes.
 
 Loader compatibility (important)
 - Some loaders only accept a provider instance / factory / Provider class without awaiting:
@@ -71,32 +76,121 @@ except Exception:
     _HAS_YFINANCE = False
 
 # =============================================================================
-# Prometheus (optional) — SAFE dummy that supports .labels()
+# Prometheus (optional) — LAZY + DUPLICATE-SAFE
 # =============================================================================
 try:
-    from prometheus_client import Counter, Histogram, Gauge  # type: ignore
+    from prometheus_client import Counter, Gauge, Histogram, REGISTRY  # type: ignore
 
     _HAS_PROM = True
 except Exception:
+    Counter = Gauge = Histogram = None  # type: ignore
+    REGISTRY = None  # type: ignore
     _HAS_PROM = False
 
-    class _DummyMetric:
-        def __init__(self, *args, **kwargs):
-            pass
 
-        def labels(self, *args, **kwargs):
-            return self
+class _DummyMetric:
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
 
-        def inc(self, *args, **kwargs):
+    def labels(self, *args: Any, **kwargs: Any) -> "_DummyMetric":
+        return self
+
+    def inc(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    def observe(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    def set(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+
+def _prom_enabled() -> bool:
+    raw = (os.getenv("PROMETHEUS_ENABLED") or os.getenv("METRICS_ENABLED") or "").strip().lower()
+    if raw in {"0", "false", "no", "n", "off", "disabled"}:
+        return False
+    return bool(_HAS_PROM)
+
+
+def _safe_get_existing_collector(name: str) -> Optional[Any]:
+    """
+    Best-effort: reuse already-registered collectors to avoid duplicate-timeseries crashes.
+    Uses prometheus_client internal registry mapping if available.
+    """
+    try:
+        if REGISTRY is None:
             return None
+        m = getattr(REGISTRY, "_names_to_collectors", None)
+        if isinstance(m, dict):
+            return m.get(name)
+    except Exception:
+        return None
+    return None
 
-        def observe(self, *args, **kwargs):
-            return None
 
-        def set(self, *args, **kwargs):
-            return None
+def _safe_create_metric(ctor: Any, name: str, doc: str, labelnames: List[str]) -> Any:
+    if not _prom_enabled() or ctor is None:
+        return _DummyMetric()
+    try:
+        return ctor(name, doc, labelnames)  # type: ignore[misc]
+    except ValueError:
+        existing = _safe_get_existing_collector(name)
+        return existing if existing is not None else _DummyMetric()
+    except Exception:
+        return _DummyMetric()
 
-    Counter = Histogram = Gauge = _DummyMetric  # type: ignore
+
+@dataclass(slots=True)
+class _Metrics:
+    requests_total: Any
+    request_duration: Any
+    cache_hits_total: Any
+    cache_misses_total: Any
+    circuit_state: Any
+
+
+_METRICS: Optional[_Metrics] = None
+
+
+def metrics() -> _Metrics:
+    global _METRICS
+    if _METRICS is not None:
+        return _METRICS
+
+    _METRICS = _Metrics(
+        requests_total=_safe_create_metric(
+            Counter,
+            "yahoo_requests_total",
+            "Total Yahoo requests",
+            ["symbol", "op", "status"],
+        ),
+        request_duration=_safe_create_metric(
+            Histogram,
+            "yahoo_request_duration_seconds",
+            "Yahoo request duration",
+            ["symbol", "op"],
+        ),
+        cache_hits_total=_safe_create_metric(
+            Counter,
+            "yahoo_cache_hits_total",
+            "Yahoo cache hits",
+            ["symbol"],
+        ),
+        cache_misses_total=_safe_create_metric(
+            Counter,
+            "yahoo_cache_misses_total",
+            "Yahoo cache misses",
+            ["symbol"],
+        ),
+        circuit_state=_safe_create_metric(
+            Gauge,
+            "yahoo_circuit_state",
+            "Yahoo circuit breaker state",
+            ["state"],
+        ),
+    )
+    return _METRICS
+
 
 # =============================================================================
 # OpenTelemetry (optional) — SAFE
@@ -152,7 +246,7 @@ logger = logging.getLogger("core.providers.yahoo_chart_provider")
 logger.addHandler(logging.NullHandler())
 
 PROVIDER_NAME = "yahoo_chart"
-PROVIDER_VERSION = "6.5.0"
+PROVIDER_VERSION = "6.6.1"
 
 # =============================================================================
 # Env helpers (safe)
@@ -285,19 +379,24 @@ def safe_float(x: Any) -> Optional[float]:
     try:
         if x is None:
             return None
-        if isinstance(x, (int, float)):
+        if isinstance(x, (int, float)) and not isinstance(x, bool):
             f = float(x)
             if math.isnan(f) or math.isinf(f):
                 return None
             return f
+
         s = str(x).strip()
         if not s or s.lower() in {"-", "—", "n/a", "na", "null", "none", "nan"}:
             return None
+
         s = s.translate(_ARABIC_DIGITS)
-        s = s.replace(",", "").replace("%", "").replace("+", "").replace("$", "").replace("£", "").replace("€", "")
+        s = s.replace(",", "").replace("%", "").replace("+", "")
+        s = s.replace("$", "").replace("£", "").replace("€", "")
         s = s.replace("SAR", "").replace("USD", "").replace("EUR", "").strip()
+
         if s.startswith("(") and s.endswith(")"):
             s = "-" + s[1:-1].strip()
+
         m = re.match(r"^(-?\d+(\.\d+)?)([KMBT])$", s, re.IGNORECASE)
         mult = 1.0
         if m:
@@ -305,20 +404,11 @@ def safe_float(x: Any) -> Optional[float]:
             suf = m.group(3).upper()
             mult = {"K": 1_000, "M": 1_000_000, "B": 1_000_000_000, "T": 1_000_000_000_000}.get(suf, 1.0)
             s = num
+
         f = float(s) * mult
         if math.isnan(f) or math.isinf(f):
             return None
         return f
-    except Exception:
-        return None
-
-
-def safe_int(x: Any) -> Optional[int]:
-    f = safe_float(x)
-    if f is None:
-        return None
-    try:
-        return int(round(f))
     except Exception:
         return None
 
@@ -328,7 +418,6 @@ def normalize_symbol(symbol: str) -> str:
     if not s:
         return ""
     s = s.translate(_ARABIC_DIGITS).strip().upper()
-    # if numeric, treat as KSA
     if _KSA_CODE_RE.match(s):
         return f"{s}.SR"
     return s
@@ -359,16 +448,6 @@ def clean_dict(d: Dict[str, Any]) -> Dict[str, Any]:
         else:
             out[k] = v
     return out
-
-
-# =============================================================================
-# Metrics (safe even without Prometheus)
-# =============================================================================
-yahoo_requests_total = Counter("yahoo_requests_total", "Total Yahoo requests", ["symbol", "op", "status"])
-yahoo_request_duration = Histogram("yahoo_request_duration_seconds", "Yahoo request duration", ["symbol", "op"])
-yahoo_cache_hits_total = Counter("yahoo_cache_hits_total", "Yahoo cache hits", ["symbol"])
-yahoo_cache_misses_total = Counter("yahoo_cache_misses_total", "Yahoo cache misses", ["symbol"])
-yahoo_circuit_state = Gauge("yahoo_circuit_state", "Yahoo circuit breaker state", ["state"])
 
 
 # =============================================================================
@@ -417,20 +496,21 @@ class CircuitBreaker:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def allow(self) -> bool:
+        m = metrics()
         async with self.lock:
             if self.state == "closed":
-                yahoo_circuit_state.labels(state="closed").set(0.0)
+                m.circuit_state.labels(state="closed").set(0.0)
                 return True
             if self.state == "open":
                 now = time.monotonic()
                 if now - self.opened_at >= self.cooldown_sec:
                     self.state = "half_open"
                     self.successes = 0
-                    yahoo_circuit_state.labels(state="half_open").set(1.0)
+                    m.circuit_state.labels(state="half_open").set(1.0)
                     return True
-                yahoo_circuit_state.labels(state="open").set(2.0)
+                m.circuit_state.labels(state="open").set(2.0)
                 return False
-            yahoo_circuit_state.labels(state="half_open").set(1.0)
+            m.circuit_state.labels(state="half_open").set(1.0)
             return True
 
     async def record_success(self) -> None:
@@ -640,7 +720,13 @@ def _simple_forecast(closes: List[float], horizon_days: int) -> Tuple[Optional[f
         roi_pct = (forecast_price / last - 1.0) * 100.0
 
         vol = _volatility_30d(closes) or 0.25
-        conf = max(0.05, min(0.95, (max(0.0, min(1.0, r2)) * 0.8 + 0.2) * (1.0 / (1.0 + max(0.0, vol - 0.25)))))
+        conf = max(
+            0.05,
+            min(
+                0.95,
+                (max(0.0, min(1.0, r2)) * 0.8 + 0.2) * (1.0 / (1.0 + max(0.0, vol - 0.25))),
+            ),
+        )
         return forecast_price, roi_pct, conf
     except Exception:
         return None, None, 0.0
@@ -658,15 +744,27 @@ def _get_attr(obj: Any, *names: str) -> Any:
         try:
             if obj is None:
                 return None
-            # dict-like
             if isinstance(obj, dict):
                 if n in obj:
                     return obj.get(n)
-            # object-like
             if hasattr(obj, n):
                 return getattr(obj, n)
         except Exception:
             continue
+    return None
+
+
+def _detect_asset_class(info: Any, symbol: str) -> Optional[str]:
+    try:
+        if isinstance(info, dict):
+            qt = safe_str(info.get("quoteType") or info.get("quote_type") or info.get("type"))
+            if qt:
+                return qt
+    except Exception:
+        pass
+    # best-effort fallback
+    if symbol and symbol.endswith(".SR"):
+        return "EQUITY"
     return None
 
 
@@ -686,10 +784,10 @@ class YahooChartProvider:
     _rate: TokenBucket = field(default_factory=lambda: TokenBucket(_rate_limit_per_sec(), float(_rate_limit_burst())))
     _cb: CircuitBreaker = field(default_factory=lambda: CircuitBreaker(_cb_fail_threshold(), _cb_cooldown_sec(), _cb_success_threshold()))
 
-    # ----------------------------
-    # Core blocking fetch (yfinance)
-    # ----------------------------
     def _blocking_fetch(self, symbol: str) -> Dict[str, Any]:
+        """
+        Blocking call run inside a thread pool.
+        """
         if not _HAS_YFINANCE or yf is None:
             return {
                 "symbol": symbol,
@@ -706,13 +804,11 @@ class YahooChartProvider:
                 t0 = time.time()
                 ticker = yf.Ticker(symbol)
 
-                # fast_info (dict-like or object-like depending on yfinance version)
                 try:
                     fast_info = ticker.fast_info
                 except Exception:
                     fast_info = None
 
-                # info can be slow; tolerate failures
                 try:
                     info = ticker.info
                 except Exception:
@@ -728,11 +824,12 @@ class YahooChartProvider:
                 # Prices
                 price = safe_float(_get_attr(fast_info, "last_price", "lastPrice", "regularMarketPrice"))
                 prev_close = safe_float(_get_attr(fast_info, "previous_close", "previousClose", "regularMarketPreviousClose"))
+                open_price = safe_float(_get_attr(fast_info, "open", "open_price", "regularMarketOpen"))
 
-                if price is None and isinstance(info, dict):
-                    price = safe_float(info.get("regularMarketPrice"))
-                if prev_close is None and isinstance(info, dict):
-                    prev_close = safe_float(info.get("regularMarketPreviousClose"))
+                if isinstance(info, dict):
+                    price = price if price is not None else safe_float(info.get("regularMarketPrice"))
+                    prev_close = prev_close if prev_close is not None else safe_float(info.get("regularMarketPreviousClose"))
+                    open_price = open_price if open_price is not None else safe_float(info.get("regularMarketOpen"))
 
                 # Day range
                 day_high = safe_float(_get_attr(fast_info, "day_high", "dayHigh"))
@@ -758,12 +855,14 @@ class YahooChartProvider:
                 currency = None
                 name = None
                 exchange = None
+                asset_class = _detect_asset_class(info, symbol)
+
                 if isinstance(info, dict):
                     currency = safe_str(info.get("currency"))
                     name = safe_str(info.get("shortName") or info.get("longName"))
                     exchange = safe_str(info.get("exchange") or info.get("fullExchangeName"))
 
-                # History (for indicators + fallback price + fallback 52w + prev_close)
+                # History (for indicators + fallbacks)
                 closes: List[float] = []
                 hist_last_dt: Optional[datetime] = None
                 last_hist_row = None
@@ -794,15 +893,14 @@ class YahooChartProvider:
                         except Exception:
                             hist_last_dt = None
 
-                        # fallback price
-                        if price is None and closes:
-                            price = float(closes[-1])
+                        # fallback price/open/prev close
+                        if closes:
+                            if price is None:
+                                price = float(closes[-1])
+                            if prev_close is None and len(closes) >= 2:
+                                prev_close = float(closes[-2])
 
-                        # fallback prev close
-                        if prev_close is None and len(closes) >= 2:
-                            prev_close = float(closes[-2])
-
-                        # fallback 52w from history if missing
+                        # fallback 52w
                         if (w52_high is None or w52_low is None) and closes:
                             try:
                                 window = closes[-252:] if len(closes) > 252 else closes
@@ -811,15 +909,18 @@ class YahooChartProvider:
                             except Exception:
                                 pass
 
-                        # fallback day high/low from last row if missing
+                        # fallback open/high/low/volume from last row
                         if last_hist_row is not None:
                             try:
+                                getter = last_hist_row.get if hasattr(last_hist_row, "get") else None
+                                if open_price is None:
+                                    open_price = safe_float(getter("Open") if getter else last_hist_row["Open"])
                                 if day_high is None:
-                                    day_high = safe_float(last_hist_row.get("High") if hasattr(last_hist_row, "get") else last_hist_row["High"])
+                                    day_high = safe_float(getter("High") if getter else last_hist_row["High"])
                                 if day_low is None:
-                                    day_low = safe_float(last_hist_row.get("Low") if hasattr(last_hist_row, "get") else last_hist_row["Low"])
+                                    day_low = safe_float(getter("Low") if getter else last_hist_row["Low"])
                                 if volume is None:
-                                    volume = safe_float(last_hist_row.get("Volume") if hasattr(last_hist_row, "get") else last_hist_row["Volume"])
+                                    volume = safe_float(getter("Volume") if getter else last_hist_row["Volume"])
                             except Exception:
                                 pass
                 except Exception:
@@ -828,9 +929,10 @@ class YahooChartProvider:
                 if price is None:
                     raise ValueError("no_price_from_yahoo")
 
-                # Canonical keys
+                # Canonical keys (schema-aligned)
                 out["current_price"] = float(price)
                 out["previous_close"] = float(prev_close) if prev_close is not None else None
+                out["open_price"] = float(open_price) if open_price is not None else None
                 out["day_high"] = float(day_high) if day_high is not None else None
                 out["day_low"] = float(day_low) if day_low is not None else None
                 out["week_52_high"] = float(w52_high) if w52_high is not None else None
@@ -840,6 +942,7 @@ class YahooChartProvider:
                 out["currency"] = currency
                 out["name"] = name
                 out["exchange"] = exchange
+                out["asset_class"] = asset_class
 
                 # Derived canonical
                 if out.get("previous_close") not in (None, 0.0):
@@ -847,7 +950,11 @@ class YahooChartProvider:
                     out["price_change"] = float(chg)
                     out["percent_change"] = float((chg / float(out["previous_close"])) * 100.0)
 
-                if out.get("week_52_high") is not None and out.get("week_52_low") is not None and out["week_52_high"] != out["week_52_low"]:
+                if (
+                    out.get("week_52_high") is not None
+                    and out.get("week_52_low") is not None
+                    and out["week_52_high"] != out["week_52_low"]
+                ):
                     out["week_52_position_pct"] = float(
                         ((out["current_price"] - out["week_52_low"]) / (out["week_52_high"] - out["week_52_low"])) * 100.0
                     )
@@ -859,7 +966,7 @@ class YahooChartProvider:
                     if rsi is not None:
                         out["rsi_14"] = float(rsi)
                     if vol is not None:
-                        out["volatility_30d"] = float(vol)  # 0..1-ish (annualized)
+                        out["volatility_30d"] = float(vol)
 
                     f1, roi1, c1 = _simple_forecast(closes, horizon_days=30)
                     f3, roi3, c3 = _simple_forecast(closes, horizon_days=90)
@@ -875,8 +982,9 @@ class YahooChartProvider:
                         out["forecast_price_12m"] = float(f12)
                         out["expected_roi_12m"] = float(roi12) if roi12 is not None else None
 
-                    conf = max(0.0, min(1.0, min([x for x in [c1, c3, c12] if x is not None] or [0.0])))
-                    out["forecast_confidence"] = float(conf)  # 0..1
+                    conf_candidates = [x for x in [c1, c3, c12] if isinstance(x, (int, float))]
+                    conf = max(0.0, min(1.0, float(min(conf_candidates) if conf_candidates else 0.0)))
+                    out["forecast_confidence"] = float(conf)
 
                 # Timestamps
                 out["last_updated_utc"] = _utc_iso()
@@ -884,18 +992,19 @@ class YahooChartProvider:
                 if hist_last_dt is not None:
                     out["history_last_utc"] = _utc_iso(hist_last_dt)
 
-                # Data quality score (0..1)
+                # Data quality (simple 0..1 helper)
                 filled = 0
-                for k in ("current_price", "previous_close", "volume", "week_52_high", "week_52_low"):
+                for k in ("current_price", "previous_close", "open_price", "volume", "week_52_high", "week_52_low"):
                     if out.get(k) is not None:
                         filled += 1
-                out["data_quality_score"] = float(filled / 5.0)
+                out["data_quality_score"] = float(filled / 6.0)
 
                 out["_fetch_ms"] = int((time.time() - t0) * 1000)
 
                 # Backward-compatible aliases
                 out["price"] = out.get("current_price")
                 out["prev_close"] = out.get("previous_close")
+                out["open"] = out.get("open_price")
                 out["change"] = out.get("price_change")
                 out["change_pct"] = out.get("percent_change")
                 out["52w_high"] = out.get("week_52_high")
@@ -916,9 +1025,6 @@ class YahooChartProvider:
             "data_sources": [PROVIDER_NAME],
         }
 
-    # ----------------------------
-    # Public async API
-    # ----------------------------
     async def fetch_enriched_quote_patch(self, symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         if not _configured():
             return {
@@ -949,12 +1055,14 @@ class YahooChartProvider:
                 "data_sources": [PROVIDER_NAME],
             }
 
+        m = metrics()
+
         # Cache
         cached = await self.quote_cache.get(sym, kind="quote")
         if cached is not None:
-            yahoo_cache_hits_total.labels(symbol=sym).inc()
+            m.cache_hits_total.labels(symbol=sym).inc()
             return cached
-        yahoo_cache_misses_total.labels(symbol=sym).inc()
+        m.cache_misses_total.labels(symbol=sym).inc()
 
         async def _do_fetch() -> Dict[str, Any]:
             async with self._sem:
@@ -976,8 +1084,8 @@ class YahooChartProvider:
                         await self._cb.record_failure()
 
                     status = "success" if ok else "error"
-                    yahoo_requests_total.labels(symbol=sym, op="quote", status=status).inc()
-                    yahoo_request_duration.labels(symbol=sym, op="quote").observe(max(0.0, time.time() - t0))
+                    m.requests_total.labels(symbol=sym, op="quote", status=status).inc()
+                    m.request_duration.labels(symbol=sym, op="quote").observe(max(0.0, time.time() - t0))
 
                     if ok:
                         await self.quote_cache.set(sym, res, kind="quote", ttl_sec=_quote_ttl_sec())
@@ -985,8 +1093,8 @@ class YahooChartProvider:
 
                 except Exception as e:
                     await self._cb.record_failure()
-                    yahoo_requests_total.labels(symbol=sym, op="quote", status="exception").inc()
-                    yahoo_request_duration.labels(symbol=sym, op="quote").observe(max(0.0, time.time() - t0))
+                    m.requests_total.labels(symbol=sym, op="quote", status="exception").inc()
+                    m.request_duration.labels(symbol=sym, op="quote").observe(max(0.0, time.time() - t0))
                     return {
                         "symbol": sym,
                         "error": f"exception: {e}",
@@ -1027,6 +1135,7 @@ class YahooChartProvider:
             "version": self.version,
             "cache_size": await self.quote_cache.size(),
             "configured": _configured(),
+            "prometheus_enabled": _prom_enabled(),
             "has_numpy": _HAS_NUMPY,
             "has_pandas": _HAS_PANDAS,
             "has_orjson": _HAS_ORJSON,
