@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 # core/investment_advisor_engine.py
 """
 ================================================================================
-Investment Advisor Engine — MASTER ORCHESTRATOR — v4.0.0 (PHASE 4 ALIGNED)
+Investment Advisor Engine — MASTER ORCHESTRATOR — v4.1.0 (PHASE 4 ALIGNED)
 ================================================================================
-Purpose:
-- Provide a universal adapter layer so ANY engine implementation (v1/v2/v3) can be
-  consumed by core/investment_advisor.py (Phase 4 aligned).
+Purpose
+- Universal adapter layer so ANY engine implementation (v1/v2/v3) can be consumed
+  by core/investment_advisor.py (Phase 4 aligned).
 
-Phase 4 Alignments:
+Phase 4 Alignments
 - ✅ KSA_TADAWUL removed completely
 - ✅ No startup network I/O (capabilities discovery is introspection-only)
 - ✅ Snapshot adapter preserves schema-aware shapes:
     - dict rows (rows: List[Dict])
     - matrix rows + keys (rows_matrix + keys)
     - legacy headers + rows (headers + rows)
-- ✅ Safe sync/async bridging via _safe_call (timeouts, no deadlocks)
-- ✅ TraceContext fixed (no set_attributes misuse)
+- ✅ Safe sync/async bridging via _safe_call (timeouts, avoids event-loop deadlocks)
+- ✅ TraceContext fixed (correct OTel context manager usage)
+- ✅ LRU cache is O(1) (OrderedDict), thread-safe, TTL-aware
 
-Public entry:
+Public entry
 - run_investment_advisor(payload: dict, engine: Any=None, ...) -> dict
 - EngineSnapshotAdapter (get_cached_sheet_snapshot / get_cached_multi_sheet_snapshots)
 ================================================================================
@@ -33,14 +35,16 @@ import logging
 import os
 import threading
 import time
+import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-# ---------------------------------------------------------------------------
-# High-Performance JSON fallback
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# High-Performance JSON fallback (safe)
+# -----------------------------------------------------------------------------
 try:
     import orjson  # type: ignore
 
@@ -63,9 +67,9 @@ except Exception:
     def json_dumps(obj: Any) -> str:
         return json.dumps(obj, default=str, ensure_ascii=False)
 
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Monitoring & Tracing (safe)
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 try:
     from prometheus_client import Counter, Histogram  # type: ignore
 
@@ -110,12 +114,14 @@ except Exception:
 
 _TRACING_ENABLED = str(os.getenv("CORE_TRACING_ENABLED", "")).strip().lower() in {"1", "true", "yes", "y", "on"}
 
+
 class TraceContext:
     """
     Correct OTel usage:
-      tracer.start_as_current_span(...) returns a context manager
-      we enter it, set attributes one-by-one, exit closes span
+      tracer.start_as_current_span(...) returns a context manager.
+      We enter it, set attributes one-by-one, exit closes the span.
     """
+
     def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
         self.name = name
         self.attributes = attributes or {}
@@ -166,7 +172,7 @@ class TraceContext:
 # =============================================================================
 # Version
 # =============================================================================
-__version__ = "4.0.0"
+__version__ = "4.1.0"
 ENGINE_VERSION = __version__
 
 logger = logging.getLogger("core.investment_advisor_engine")
@@ -213,7 +219,7 @@ DEFAULT_HEADERS: List[str] = [
 
 # Cache TTL defaults (seconds)
 CACHE_TTL_DEFAULT = 300  # 5 minutes
-CACHE_TTL_SHEET = 600    # 10 minutes
+CACHE_TTL_SHEET = 600  # 10 minutes
 
 # Method priority groups for engine discovery/calls
 METHOD_GROUPS: Dict[str, List[str]] = {
@@ -264,10 +270,10 @@ METHOD_GROUPS: Dict[str, List[str]] = {
 # Enums and Data Classes
 # =============================================================================
 class AdapterMode(Enum):
-    NATIVE = "native"     # Engine already supports snapshot methods
-    WRAPPED = "wrapped"   # Engine wrapped with adapter
-    LEGACY = "legacy"     # Legacy engine methods only
-    STUB = "stub"         # No sheet capability
+    NATIVE = "native"
+    WRAPPED = "wrapped"
+    LEGACY = "legacy"
+    STUB = "stub"
 
 
 class CacheStrategy(Enum):
@@ -314,12 +320,13 @@ class EngineCapabilities:
 @dataclass(slots=True)
 class SnapshotEntry:
     """
-    Cached snapshot entry.
-    We store a normalized snapshot dict so we don't lose:
-      - keys
+    Cached snapshot entry. Snapshot is a normalized dict that preserves:
+      - keys (optional)
       - rows_matrix
-      - dict rows
+      - rows (list[dict] OR list[list])
+      - headers (optional)
     """
+
     sheet_name: str
     snapshot: Dict[str, Any]
     cached_at: datetime
@@ -357,7 +364,6 @@ class EngineMetrics:
         if not success:
             self.method_errors[method] = self.method_errors.get(method, 0) + 1
 
-        # incremental avg over total requests
         n = max(1, self.total_requests)
         self.avg_response_time_ms = ((self.avg_response_time_ms * (n - 1)) + float(duration_ms)) / n
         self.last_request_time = datetime.now(timezone.utc)
@@ -377,18 +383,18 @@ class EngineMetrics:
 
 
 # =============================================================================
-# Cache Implementation (thread-safe)
+# Cache Implementation (thread-safe, true LRU)
 # =============================================================================
 class SnapshotCache:
     """
-    Thread-safe in-memory cache with true LRU eviction.
+    Thread-safe in-memory cache with true LRU eviction (O(1) via OrderedDict).
     """
 
     def __init__(self, strategy: CacheStrategy = CacheStrategy.MEMORY, default_ttl: int = CACHE_TTL_DEFAULT, max_size: int = 500):
         self.strategy = strategy
         self.default_ttl = int(default_ttl)
         self.max_size = int(max_size)
-        self._cache: Dict[str, SnapshotEntry] = {}
+        self._cache: "OrderedDict[str, SnapshotEntry]" = OrderedDict()
         self._lock = threading.RLock()
         self._metrics = EngineMetrics()
 
@@ -396,48 +402,55 @@ class SnapshotCache:
         if self.strategy == CacheStrategy.NONE:
             return None
 
+        key = str(sheet_name)
         with self._lock:
-            ent = self._cache.get(sheet_name)
+            ent = self._cache.get(key)
             if ent is None:
                 self._metrics.cache_misses += 1
                 return None
             if ent.is_expired:
-                self._cache.pop(sheet_name, None)
+                self._cache.pop(key, None)
                 self._metrics.cache_misses += 1
                 return None
+
             ent.last_access = time.time()
+            self._cache.move_to_end(key, last=True)  # mark as most-recent
             self._metrics.cache_hits += 1
             return ent
 
     def set(self, sheet_name: str, snapshot: Dict[str, Any], source_method: str, ttl: Optional[int] = None) -> SnapshotEntry:
+        now = datetime.now(timezone.utc)
+
+        # NONE: return non-stored entry
         if self.strategy == CacheStrategy.NONE:
-            # still return a computed entry (not stored)
-            now = datetime.now(timezone.utc)
             return SnapshotEntry(
-                sheet_name=sheet_name,
+                sheet_name=str(sheet_name),
                 snapshot=snapshot,
                 cached_at=now,
                 expires_at=now,
                 source_method=source_method,
             )
 
-        with self._lock:
-            # LRU eviction
-            if len(self._cache) >= self.max_size and sheet_name not in self._cache:
-                oldest_key = min(self._cache.items(), key=lambda kv: kv[1].last_access)[0]
-                self._cache.pop(oldest_key, None)
+        ttl_seconds = int(ttl or self.default_ttl)
+        key = str(sheet_name)
 
-            now = datetime.now(timezone.utc)
-            ttl_seconds = int(ttl or self.default_ttl)
+        with self._lock:
+            # upsert & move to MRU
             ent = SnapshotEntry(
-                sheet_name=sheet_name,
+                sheet_name=key,
                 snapshot=snapshot,
                 cached_at=now,
                 expires_at=now + timedelta(seconds=ttl_seconds),
                 source_method=source_method,
                 last_access=time.time(),
             )
-            self._cache[sheet_name] = ent
+            self._cache[key] = ent
+            self._cache.move_to_end(key, last=True)
+
+            # evict LRU if needed
+            while len(self._cache) > self.max_size:
+                self._cache.popitem(last=False)
+
             return ent
 
     def clear(self) -> None:
@@ -446,7 +459,7 @@ class SnapshotCache:
 
     def remove(self, sheet_name: str) -> None:
         with self._lock:
-            self._cache.pop(sheet_name, None)
+            self._cache.pop(str(sheet_name), None)
 
     def get_metrics(self) -> Dict[str, Any]:
         with self._lock:
@@ -463,7 +476,7 @@ class SnapshotCache:
 
 
 # =============================================================================
-# Safe calling helpers
+# Safe calling helpers (sync/async bridging)
 # =============================================================================
 def _filter_kwargs_for_callable(fn: Callable, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     if not kwargs:
@@ -482,7 +495,7 @@ def _filter_kwargs_for_callable(fn: Callable, kwargs: Dict[str, Any]) -> Dict[st
 def _run_coro_in_thread(coro: Any, timeout: float) -> Tuple[Optional[Any], Optional[BaseException], bool]:
     """
     Run coroutine in a separate thread with its own loop.
-    Returns (result, error, timed_out)
+    Returns (result, error, timed_out).
     """
     box: Dict[str, Any] = {"result": None, "error": None}
 
@@ -512,6 +525,9 @@ def _safe_call(
     - sync functions
     - async functions
     - sync functions returning awaitables
+
+    If called inside an active event loop, we execute awaitables in a thread
+    to avoid blocking / deadlocks.
     """
     start = time.time()
 
@@ -528,7 +544,7 @@ def _safe_call(
         out = fn(*args, **kw)
 
         if inspect.isawaitable(out):
-            # if we're already in a running loop, run in thread to avoid deadlock
+            # Already inside a loop? don't block it; run in worker thread
             try:
                 loop = asyncio.get_running_loop()
                 in_loop = loop.is_running()
@@ -537,30 +553,30 @@ def _safe_call(
 
             if in_loop:
                 res, err, timed_out = _run_coro_in_thread(out, timeout)
-                dur = (time.time() - start) * 1000
+                dur = (time.time() - start) * 1000.0
                 if timed_out:
                     return None, MethodResult.TIMEOUT, dur, f"Timeout after {timeout}s"
                 if err is not None:
                     return None, MethodResult.EXCEPTION, dur, str(err)
                 return res, MethodResult.SUCCESS, dur, None
 
-            # no running loop: safe to run directly
+            # no running loop => safe to run directly
             try:
                 res = asyncio.run(asyncio.wait_for(out, timeout=timeout))
-                dur = (time.time() - start) * 1000
+                dur = (time.time() - start) * 1000.0
                 return res, MethodResult.SUCCESS, dur, None
             except asyncio.TimeoutError:
-                dur = (time.time() - start) * 1000
+                dur = (time.time() - start) * 1000.0
                 return None, MethodResult.TIMEOUT, dur, f"Timeout after {timeout}s"
 
-        dur = (time.time() - start) * 1000
+        dur = (time.time() - start) * 1000.0
         return out, MethodResult.SUCCESS, dur, None
 
     except asyncio.TimeoutError:
-        dur = (time.time() - start) * 1000
+        dur = (time.time() - start) * 1000.0
         return None, MethodResult.TIMEOUT, dur, f"Timeout after {timeout}s"
     except Exception as e:
-        dur = (time.time() - start) * 1000
+        dur = (time.time() - start) * 1000.0
         return None, MethodResult.EXCEPTION, dur, str(e)
 
 
@@ -589,7 +605,7 @@ def _discover_engine_capabilities(engine: Any) -> EngineCapabilities:
 
 
 # =============================================================================
-# Snapshot normalization
+# Snapshot normalization (preserve schema-aware shapes)
 # =============================================================================
 def _normalize_snapshot(sheet_name: str, result: Any, source_method: str) -> Optional[Dict[str, Any]]:
     """
@@ -605,12 +621,12 @@ def _normalize_snapshot(sheet_name: str, result: Any, source_method: str) -> Opt
     if isinstance(result, dict):
         snap = dict(result)
 
-        # common names normalization
-        if "rows_matrix" not in snap and isinstance(snap.get("rows"), list) and snap.get("rows") and isinstance(snap["rows"][0], (list, tuple)):
-            # rows is matrix
-            snap.setdefault("rows_matrix", snap.get("rows"))
+        # If rows is matrix, keep rows_matrix
+        if "rows_matrix" not in snap and isinstance(snap.get("rows"), list) and snap.get("rows"):
+            r0 = snap["rows"][0]
+            if isinstance(r0, (list, tuple)):
+                snap.setdefault("rows_matrix", snap.get("rows"))
 
-        # ensure basics exist
         snap.setdefault("sheet", sheet_name)
         snap.setdefault("source_method", source_method)
         return snap
@@ -629,7 +645,6 @@ def _normalize_snapshot(sheet_name: str, result: Any, source_method: str) -> Opt
                 "source_method": source_method,
             }
 
-    # Unknown: best effort
     return None
 
 
@@ -676,19 +691,24 @@ class EngineSnapshotAdapter:
     def __repr__(self) -> str:
         return f"<EngineSnapshotAdapter mode={self._mode.value} base={type(self._base).__name__}>"
 
+    def __getattr__(self, name: str) -> Any:
+        # Pass-through for anything we don't implement.
+        return getattr(self._base, name)
+
     # -------------------------
     # Snapshot getters
     # -------------------------
     def get_cached_sheet_snapshot(self, sheet_name: str) -> Optional[Dict[str, Any]]:
         start = time.time()
+        sname = str(sheet_name)
 
-        # cache first
-        ent = self._cache.get(sheet_name)
+        ent = self._cache.get(sname)
         if ent is not None:
             self._metrics.record_call("cache_hit", 0.0, True)
             snap = dict(ent.snapshot)
             snap.setdefault("cached_at_utc", ent.cached_at.isoformat())
             snap.setdefault("cached", True)
+            snap.setdefault("adapter_mode", self._mode.value)
             return snap
 
         self._metrics.cache_misses += 1
@@ -696,44 +716,45 @@ class EngineSnapshotAdapter:
         # native snapshot single
         if self._capabilities.has_snapshot_single:
             for method in METHOD_GROUPS["snapshot_single"]:
-                res, status, dur, err = _safe_call(self._base, method, sheet_name, timeout=2.5)
+                res, status, dur, err = _safe_call(self._base, method, sname, timeout=2.5)
                 self._metrics.record_call(method, dur, status == MethodResult.SUCCESS)
                 if status == MethodResult.SUCCESS:
-                    snap = _normalize_snapshot(sheet_name, res, source_method=method)
+                    snap = _normalize_snapshot(sname, res, source_method=method)
                     if snap is not None:
-                        self._cache.set(sheet_name, snap, method, ttl=CACHE_TTL_SHEET)
+                        ent2 = self._cache.set(sname, snap, method, ttl=CACHE_TTL_SHEET)
                         snap2 = dict(snap)
-                        snap2["cached_at_utc"] = datetime.now(timezone.utc).isoformat()
+                        snap2["cached_at_utc"] = ent2.cached_at.isoformat()
                         snap2["cached"] = False
                         snap2["adapter_mode"] = self._mode.value
                         return snap2
 
-        # legacy methods: try to produce headers+rows
+        # legacy methods
         if self._capabilities.has_legacy_methods:
             for method in METHOD_GROUPS["legacy_single"]:
-                res, status, dur, err = _safe_call(self._base, method, sheet_name, timeout=3.0)
+                res, status, dur, err = _safe_call(self._base, method, sname, timeout=3.0)
                 self._metrics.record_call(method, dur, status == MethodResult.SUCCESS)
                 if status == MethodResult.SUCCESS:
-                    snap = _normalize_snapshot(sheet_name, res, source_method=method)
+                    snap = _normalize_snapshot(sname, res, source_method=method)
                     if snap is not None:
-                        self._cache.set(sheet_name, snap, method, ttl=CACHE_TTL_SHEET)
+                        ent2 = self._cache.set(sname, snap, method, ttl=CACHE_TTL_SHEET)
                         snap2 = dict(snap)
-                        snap2["cached_at_utc"] = datetime.now(timezone.utc).isoformat()
+                        snap2["cached_at_utc"] = ent2.cached_at.isoformat()
                         snap2["cached"] = False
                         snap2["adapter_mode"] = "legacy"
                         return snap2
 
-        self._metrics.record_call("get_cached_sheet_snapshot", (time.time() - start) * 1000, False)
+        self._metrics.record_call("get_cached_sheet_snapshot", (time.time() - start) * 1000.0, False)
         return None
 
     def get_cached_multi_sheet_snapshots(self, sheet_names: List[str]) -> Dict[str, Dict[str, Any]]:
         start = time.time()
         out: Dict[str, Dict[str, Any]] = {}
+        names = [str(x) for x in (sheet_names or []) if str(x).strip()]
 
         # native multi
-        if self._capabilities.has_snapshot_multi:
+        if self._capabilities.has_snapshot_multi and names:
             for method in METHOD_GROUPS["snapshot_multi"]:
-                res, status, dur, err = _safe_call(self._base, method, sheet_names, timeout=4.0)
+                res, status, dur, err = _safe_call(self._base, method, names, timeout=4.0)
                 self._metrics.record_call(method, dur, status == MethodResult.SUCCESS)
                 if status == MethodResult.SUCCESS and isinstance(res, dict):
                     for sheet, snap_obj in res.items():
@@ -741,23 +762,23 @@ class EngineSnapshotAdapter:
                         snap = _normalize_snapshot(sname, snap_obj, source_method=method)
                         if snap is None:
                             continue
-                        self._cache.set(sname, snap, method, ttl=CACHE_TTL_SHEET)
+                        ent2 = self._cache.set(sname, snap, method, ttl=CACHE_TTL_SHEET)
                         snap2 = dict(snap)
-                        snap2["cached_at_utc"] = datetime.now(timezone.utc).isoformat()
+                        snap2["cached_at_utc"] = ent2.cached_at.isoformat()
                         snap2["cached"] = False
                         snap2["adapter_mode"] = self._mode.value
                         out[sname] = snap2
                     if out:
-                        self._metrics.record_call("get_cached_multi_sheet_snapshots", (time.time() - start) * 1000, True)
+                        self._metrics.record_call("get_cached_multi_sheet_snapshots", (time.time() - start) * 1000.0, True)
                         return out
 
         # fallback single
-        for s in sheet_names or []:
+        for s in names:
             snap = self.get_cached_sheet_snapshot(s)
             if snap is not None:
-                out[str(s)] = snap
+                out[s] = snap
 
-        self._metrics.record_call("get_cached_multi_sheet_snapshots", (time.time() - start) * 1000, bool(out))
+        self._metrics.record_call("get_cached_multi_sheet_snapshots", (time.time() - start) * 1000.0, bool(out))
         return out
 
     # -------------------------
@@ -802,22 +823,30 @@ class EngineSnapshotAdapter:
             res, status, dur, err = _safe_call(self._base, method, symbol, periods, timeout=2.5)
             self._metrics.record_call(method, dur, status == MethodResult.SUCCESS)
             if status == MethodResult.SUCCESS and isinstance(res, dict):
-                return {str(k): (float(v) if v is not None else None) for k, v in res.items()}
+                out: Dict[str, Optional[float]] = {}
+                for k, v in res.items():
+                    try:
+                        out[str(k)] = float(v) if v is not None else None
+                    except Exception:
+                        out[str(k)] = None
+                return out
         return {}
 
     # -------------------------
     # Manual snapshot set (optional)
     # -------------------------
     def set_cached_sheet_snapshot(self, sheet_name: str, headers: List[Any], rows: List[Any], meta: Dict[str, Any]) -> None:
-        snap = {
-            "sheet": sheet_name,
+        sname = str(sheet_name)
+        matrix = [list(r) if isinstance(r, (list, tuple)) else [r] for r in (rows or [])]
+        snap: Dict[str, Any] = {
+            "sheet": sname,
             "headers": [str(h) for h in (headers or [])],
-            "rows": [list(r) if isinstance(r, (list, tuple)) else [r] for r in (rows or [])],
-            "rows_matrix": [list(r) if isinstance(r, (list, tuple)) else [r] for r in (rows or [])],
+            "rows": matrix,
+            "rows_matrix": matrix,
             "keys": meta.get("keys") if isinstance(meta, dict) else None,
             "source_method": "manual_set",
         }
-        self._cache.set(sheet_name, snap, "manual_set", ttl=CACHE_TTL_SHEET)
+        self._cache.set(sname, snap, "manual_set", ttl=CACHE_TTL_SHEET)
 
     def clear_cache(self) -> None:
         self._cache.clear()
@@ -855,15 +884,18 @@ class EngineSnapshotAdapter:
         total_errors = sum(self._metrics.method_errors.values())
         status = "healthy"
         issues: List[str] = []
+
         if total_errors > 100:
             status = "degraded"
             issues.append(f"High method error count: {total_errors}")
+
         total_cache = self._metrics.cache_hits + self._metrics.cache_misses
         if total_cache > 20:
             hit_rate = self._metrics.cache_hits / max(1, total_cache)
             if hit_rate < 0.35:
                 status = "degraded"
                 issues.append(f"Low cache hit rate: {hit_rate:.0%}")
+
         return {
             "status": status,
             "issues": issues,
@@ -890,7 +922,9 @@ def run_investment_advisor(
     """
     with TraceContext("run_investment_advisor_engine", {"debug": bool(debug)}):
         start_time = time.time()
-        request_id = hashlib.md5(str(time.time()).encode("utf-8")).hexdigest()[:10]
+
+        # stable request_id format for logs/traces
+        request_id = uuid.uuid4().hex[:12]
 
         if debug:
             try:
@@ -933,12 +967,11 @@ def run_investment_advisor(
             else:
                 adapter_mode = "none"
 
-            # import core advisor
+            # import core advisor (no network I/O here)
             try:
                 from core.investment_advisor import run_investment_advisor as core_run  # type: ignore
                 from core.investment_advisor import ADVISOR_VERSION as CORE_VERSION  # type: ignore
             except Exception:
-                # relative fallback
                 from .investment_advisor import run_investment_advisor as core_run  # type: ignore
                 from .investment_advisor import ADVISOR_VERSION as CORE_VERSION  # type: ignore
 
@@ -961,6 +994,8 @@ def run_investment_advisor(
             if not isinstance(meta, dict):
                 meta = {}
 
+            runtime_ms = int((time.time() - start_time) * 1000)
+
             meta.update(
                 {
                     "ok": bool(meta.get("ok", True)),
@@ -970,7 +1005,8 @@ def run_investment_advisor(
                     "cache_strategy": strat.value,
                     "cache_ttl_sec": int(cache_ttl),
                     "request_id": request_id,
-                    "runtime_ms_engine_layer": int((time.time() - start_time) * 1000),
+                    "runtime_ms_engine_layer": runtime_ms,
+                    "runtime_ms": int(meta.get("runtime_ms") or runtime_ms),
                 }
             )
 
@@ -988,7 +1024,6 @@ def run_investment_advisor(
             return response
 
         except Exception as e:
-            # safe debug traceback without import-time dependency
             if debug:
                 try:
                     import traceback  # noqa
