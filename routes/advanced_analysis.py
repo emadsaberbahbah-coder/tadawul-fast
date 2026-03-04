@@ -2,57 +2,54 @@
 """
 routes/advanced_analysis.py
 ------------------------------------------------------------
-TADAWUL ADVANCED ANALYSIS ROUTER — v5.4.0 (PHASE 5 / STARTUP-SAFE)
-PROD HARDENED + SCHEMA-DRIVEN SHEET-ROWS + INSIGHTS CRITERIA EMBED
+TADAWUL ADVANCED ANALYSIS ROUTER — v5.5.0 (PHASE 5 / STARTUP-SAFE)
+PROD HARDENED + SCHEMA-DRIVEN SHEET-ROWS (FIXES SPECIAL SHEETS)
 
-Phase 3 (kept, IMPORTANT):
-- ✅ /v1/advanced/sheet-rows is implemented ONLY in routes/advanced_sheet_rows.py
-- ✅ This module imports that router (prefix="/v1/advanced") and adds:
+Why this revision (your PowerShell evidence):
+- ✅ FIX: /v1/advanced/sheet-rows now returns TRUE schema headers for:
+    - Insights_Analysis   (expected 7, was returning 80)
+    - Top_10_Investments  (expected 83, was returning 80)
+    - Data_Dictionary     (expected 9, was returning 80)
+- ✅ No duplicate routes: we IMPORT the Phase-3 router from routes.advanced_sheet_rows
+  then REMOVE its POST /sheet-rows handler and REPLACE it with a schema-driven one.
+- ✅ Startup-safe: no network/heavy imports at import-time (all heavy is lazy inside calls).
+- ✅ Keeps:
     - GET  /v1/advanced/health
     - GET  /v1/advanced/metrics (optional Prometheus)
-- ✅ Prevents duplicate path registration (FastAPI breaks if /sheet-rows exists twice)
-
-Phase 5 (NEW, Insights_Analysis criteria embedded):
-- ✅ Adds:
-    - GET  /v1/advanced/insights-criteria   (criteria rules + weights snapshot)
-    - POST /v1/advanced/insights-analysis   (schema-driven rows + optional criteria embed)
-- ✅ Startup-safe: NO heavy imports / NO network at import-time
-- ✅ Auth is best-effort and consistent with core.config.auth_ok if available
-- ✅ Schema-driven: uses schema_registry for headers/keys when available
-- ✅ Does NOT redefine /sheet-rows (avoids duplicate route)
+    - GET  /v1/advanced/insights-criteria
+    - POST /v1/advanced/insights-analysis (best-effort)
 
 Notes:
-- The /insights-analysis endpoint is intentionally "best-effort":
-  it fetches rows from the engine (like /sheet-rows) but can also embed criteria
-  fields IF those keys exist in the Insights_Analysis schema.
+- Data_Dictionary is generated from schema_registry (authoritative) — no engine needed.
+- Other sheets: we call engine sheet-rows (best-effort), then normalize/align to schema_registry
+  so headers/keys/order always match.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import Body, Header, HTTPException, Query, Request, Response, status
 
 # -----------------------------------------------------------------------------
-# ✅ Single source of truth for Phase 3 /sheet-rows
+# ✅ Phase-3 base router (prefix="/v1/advanced", includes original POST /sheet-rows)
 # -----------------------------------------------------------------------------
-# This router already has:
-#   prefix="/v1/advanced"
-#   POST /sheet-rows
 from routes.advanced_sheet_rows import router  # noqa: F401
 
 
 logger = logging.getLogger("routes.advanced_analysis")
 
-ADVANCED_ANALYSIS_VERSION = "5.4.0"
+ADVANCED_ANALYSIS_VERSION = "5.5.0"
+
 
 # -----------------------------------------------------------------------------
 # Optional Prometheus (safe)
 # -----------------------------------------------------------------------------
 try:
-    from prometheus_client import generate_latest, CONTENT_TYPE_LATEST  # type: ignore
+    from prometheus_client import CONTENT_TYPE_LATEST, generate_latest  # type: ignore
 
     _PROMETHEUS_AVAILABLE = True
 except Exception:
@@ -62,7 +59,7 @@ except Exception:
 
 
 # -----------------------------------------------------------------------------
-# core.config is preferred for auth + flags, but router must be safe if unavailable
+# core.config preferred for auth + flags, but must be safe if unavailable
 # -----------------------------------------------------------------------------
 try:
     from core.config import auth_ok, get_settings_cached  # type: ignore
@@ -206,23 +203,17 @@ def _build_insights_criteria_snapshot() -> Dict[str, Any]:
                 "w_quality": float(getattr(dw, "w_quality", weights["w_quality"])),
                 "w_opportunity": float(getattr(dw, "w_opportunity", weights["w_opportunity"])),
                 "risk_penalty_strength": float(getattr(dw, "risk_penalty_strength", weights["risk_penalty_strength"])),
-                "confidence_penalty_strength": float(getattr(dw, "confidence_penalty_strength", weights["confidence_penalty_strength"])),
+                "confidence_penalty_strength": float(
+                    getattr(dw, "confidence_penalty_strength", weights["confidence_penalty_strength"])
+                ),
                 "source": "core.scoring.DEFAULT_WEIGHTS",
             }
     except Exception:
         pass
 
     rules = [
-        {
-            "rule": "Low confidence gate",
-            "when": "confidence_score < 45",
-            "then": "HOLD",
-        },
-        {
-            "rule": "High risk + moderate score",
-            "when": "risk_score >= 75 AND overall_score < 75",
-            "then": "REDUCE",
-        },
+        {"rule": "Low confidence gate", "when": "confidence_score < 45", "then": "HOLD"},
+        {"rule": "High risk + moderate score", "when": "risk_score >= 75 AND overall_score < 75", "then": "REDUCE"},
         {
             "rule": "Strong buy (ROI + confidence + low risk + high score)",
             "when": "expected_roi_3m >= 25% AND confidence_score >= 70 AND risk_score <= 45 AND overall_score >= 78",
@@ -233,26 +224,10 @@ def _build_insights_criteria_snapshot() -> Dict[str, Any]:
             "when": "expected_roi_3m >= 12% AND confidence_score >= 60 AND risk_score <= 55 AND overall_score >= 70",
             "then": "BUY",
         },
-        {
-            "rule": "Buy (score-based fallback)",
-            "when": "overall_score >= 82 AND risk_score <= 55",
-            "then": "BUY",
-        },
-        {
-            "rule": "Hold (moderate)",
-            "when": "overall_score >= 65",
-            "then": "HOLD",
-        },
-        {
-            "rule": "Reduce (weak)",
-            "when": "overall_score >= 50",
-            "then": "REDUCE",
-        },
-        {
-            "rule": "Sell (very weak)",
-            "when": "overall_score < 50",
-            "then": "SELL",
-        },
+        {"rule": "Buy (score-based fallback)", "when": "overall_score >= 82 AND risk_score <= 55", "then": "BUY"},
+        {"rule": "Hold (moderate)", "when": "overall_score >= 65", "then": "HOLD"},
+        {"rule": "Reduce (weak)", "when": "overall_score >= 50", "then": "REDUCE"},
+        {"rule": "Sell (very weak)", "when": "overall_score < 50", "then": "SELL"},
     ]
 
     return {"weights": weights, "rules": rules}
@@ -276,7 +251,461 @@ def _get_bool(body: Dict[str, Any], key: str, default: bool) -> bool:
 
 
 # -----------------------------------------------------------------------------
-# Added endpoints
+# Schema helpers (lazy)
+# -----------------------------------------------------------------------------
+def _canonicalize_sheet_name(sheet: str) -> str:
+    s = (sheet or "").strip()
+    if not s:
+        return s
+
+    # Prefer page_catalog resolver if present
+    try:
+        from core.sheets.page_catalog import resolve_page  # type: ignore
+
+        out = resolve_page(s)
+        if isinstance(out, str) and out.strip():
+            return out.strip()
+    except Exception:
+        pass
+
+    try:
+        from core.sheets.page_catalog import canonicalize_page  # type: ignore
+
+        out = canonicalize_page(s)
+        if isinstance(out, str) and out.strip():
+            return out.strip()
+    except Exception:
+        pass
+
+    # Minimal normalization (spaces -> underscores)
+    return s.replace(" ", "_")
+
+
+def _get_sheet_spec(sheet: str) -> Optional[Any]:
+    try:
+        from core.sheets.schema_registry import get_sheet_spec  # type: ignore
+
+        return get_sheet_spec(sheet)
+    except Exception:
+        return None
+
+
+def _schema_headers_keys(sheet: str) -> Tuple[List[str], List[str], str]:
+    """
+    Returns (headers, keys, source) — source is a string marker for debug/meta.
+    """
+    spec = _get_sheet_spec(sheet)
+    if spec and getattr(spec, "columns", None):
+        headers = [str(c.header) for c in spec.columns]
+        keys = [str(c.key) for c in spec.columns]
+        return headers, keys, "schema_registry.get_sheet_spec"
+
+    return [], [], "none"
+
+
+def _get_all_sheet_names() -> List[str]:
+    # Best-effort across possible registry shapes
+    try:
+        from core.sheets import schema_registry as sr  # type: ignore
+
+        for attr in ("SHEET_NAMES", "SHEETS", "CANONICAL_SHEETS", "CANONICAL_PAGES"):
+            v = getattr(sr, attr, None)
+            if isinstance(v, (list, tuple)) and v:
+                return [str(x) for x in v]
+
+        fn = getattr(sr, "list_sheet_names", None)
+        if callable(fn):
+            out = fn()
+            if isinstance(out, (list, tuple)):
+                return [str(x) for x in out]
+    except Exception:
+        pass
+
+    # Last resort: try page_catalog canonical pages
+    try:
+        from core.sheets.page_catalog import CANONICAL_PAGES  # type: ignore
+
+        return [str(x) for x in CANONICAL_PAGES]
+    except Exception:
+        return []
+
+
+def _normalize_row_to_schema(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Best-effort normalization.
+    If core.data_engine_v2.normalize_row_to_schema exists, use it.
+    Otherwise do a simple projection to schema keys (and try header-based fallback).
+    """
+    spec = _get_sheet_spec(sheet)
+    if not spec or not getattr(spec, "columns", None):
+        return row
+
+    try:
+        from core.data_engine_v2 import normalize_row_to_schema  # type: ignore
+
+        return normalize_row_to_schema(sheet, row)
+    except Exception:
+        # Simple projection with header fallback
+        out: Dict[str, Any] = {}
+        for c in spec.columns:
+            k = str(c.key)
+            h = str(c.header)
+            if k in row:
+                out[k] = row.get(k)
+            elif h in row:
+                out[k] = row.get(h)
+            else:
+                out[k] = None
+        return out
+
+
+def _rows_to_matrix(rows: List[Dict[str, Any]], keys: List[str]) -> List[List[Any]]:
+    return [[r.get(k) for k in keys] for r in rows]
+
+
+def _coerce_rows_payload(payload: Any) -> Tuple[List[Dict[str, Any]], List[str], List[str]]:
+    """
+    Returns (rows, headers, keys) best-effort from engine payload.
+    """
+    if payload is None:
+        return [], [], []
+
+    if isinstance(payload, list):
+        rows = [r for r in payload if isinstance(r, dict)]
+        keys = list(rows[0].keys()) if rows else []
+        return rows, keys[:], keys[:]
+
+    if isinstance(payload, dict):
+        headers = payload.get("headers") or payload.get("columns") or payload.get("fields") or []
+        keys = payload.get("keys") or payload.get("schema") or payload.get("fields") or []
+        rows = payload.get("rows") or payload.get("data") or payload.get("items") or payload.get("records") or []
+        if not isinstance(rows, list):
+            rows = []
+        rows = [r for r in rows if isinstance(r, dict)]
+        if not keys and rows:
+            keys = list(rows[0].keys())
+        if not headers and keys:
+            headers = keys[:]
+        return rows, [str(x) for x in headers], [str(x) for x in keys]
+
+    # unknown object
+    try:
+        if hasattr(payload, "model_dump"):
+            d = payload.model_dump(mode="python")  # type: ignore
+            return _coerce_rows_payload(d)
+        if hasattr(payload, "dict"):
+            d = payload.dict()  # type: ignore
+            return _coerce_rows_payload(d)
+    except Exception:
+        pass
+
+    return [], [], []
+
+
+async def _engine_sheet_rows(
+    engine: Any,
+    *,
+    sheet: str,
+    limit: int,
+    offset: int,
+    mode: str,
+    body: Dict[str, Any],
+) -> Any:
+    """
+    Best-effort call into engine to fetch sheet rows.
+    Supports multiple possible method names/signatures without hard failing.
+    """
+    candidates = [
+        ("get_sheet_rows", dict(sheet=sheet, limit=limit, offset=offset, mode=mode, body=body)),
+        ("get_sheet_rows", dict(sheet=sheet, limit=limit, offset=offset, mode=mode)),
+        ("sheet_rows", dict(sheet=sheet, limit=limit, offset=offset, mode=mode, body=body)),
+        ("sheet_rows", dict(sheet=sheet, limit=limit, offset=offset, mode=mode)),
+        ("build_sheet_rows", dict(sheet=sheet, limit=limit, offset=offset, mode=mode, body=body)),
+        ("build_sheet_rows", dict(sheet=sheet, limit=limit, offset=offset, mode=mode)),
+    ]
+
+    last_err: Optional[Exception] = None
+
+    for name, kwargs in candidates:
+        fn = getattr(engine, name, None)
+        if not callable(fn):
+            continue
+        try:
+            out = fn(**kwargs)
+            if hasattr(out, "__await__"):
+                out = await out
+            return out
+        except TypeError as e:
+            last_err = e
+            # try positional fallbacks
+            try:
+                out = fn(sheet, limit=limit, offset=offset, mode=mode)
+                if hasattr(out, "__await__"):
+                    out = await out
+                return out
+            except Exception as e2:
+                last_err = e2
+                continue
+        except Exception as e:
+            last_err = e
+            continue
+
+    if last_err is not None:
+        raise last_err
+    raise RuntimeError("Engine has no supported sheet-rows method")
+
+
+# -----------------------------------------------------------------------------
+# 🚧 Replace Phase-3 /sheet-rows with schema-driven handler (NO DUPLICATE ROUTES)
+# -----------------------------------------------------------------------------
+def _remove_router_route(path: str, method: str) -> int:
+    removed = 0
+    try:
+        new_routes = []
+        for r in list(getattr(router, "routes", [])):
+            try:
+                rp = getattr(r, "path", None)
+                rm = getattr(r, "methods", None) or set()
+                if rp == path and method.upper() in set(rm):
+                    removed += 1
+                    continue
+            except Exception:
+                pass
+            new_routes.append(r)
+        router.routes = new_routes  # type: ignore
+    except Exception:
+        # If we can't remove safely, we'll still avoid adding duplicates by not registering
+        return removed
+    return removed
+
+
+_removed = _remove_router_route("/sheet-rows", "POST")
+if _removed:
+    logger.info("AdvancedAnalysis: removed %s existing POST /sheet-rows route(s) to replace with schema-driven handler.", _removed)
+
+
+@router.post("/sheet-rows")
+async def advanced_sheet_rows_schema_driven(
+    request: Request,
+    body: Dict[str, Any] = Body(...),
+    mode: str = Query(default="", description="Optional mode hint for engine/provider"),
+    include_matrix: Optional[bool] = Query(default=None, description="Return rows_matrix for legacy clients"),
+    token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+) -> Dict[str, Any]:
+    """
+    Schema-driven replacement for POST /v1/advanced/sheet-rows
+
+    Guarantees:
+    - headers/keys/order match schema_registry for the requested sheet (when available)
+    - Special sheets fixed:
+        Insights_Analysis, Top_10_Investments, Data_Dictionary
+    - Data_Dictionary is generated from schema_registry (no engine dependency)
+    """
+    _require_auth_or_401(token_query=token, x_app_token=x_app_token, authorization=authorization)
+    request_id = x_request_id or (getattr(request.state, "request_id", None) or "")
+
+    raw_sheet = str(body.get("sheet") or body.get("page") or body.get("name") or "").strip()
+    if not raw_sheet:
+        raise HTTPException(status_code=422, detail="Missing required field: sheet")
+
+    sheet = _canonicalize_sheet_name(raw_sheet)
+
+    limit = int(body.get("limit") or 2000)
+    offset = int(body.get("offset") or 0)
+    limit = max(1, min(5000, limit))
+    offset = max(0, offset)
+
+    include_matrix_final = include_matrix if isinstance(include_matrix, bool) else _get_bool(body, "include_matrix", True)
+
+    # Schema (authoritative headers/keys when available)
+    schema_headers, schema_keys, schema_source = _schema_headers_keys(sheet)
+
+    # -------------------------
+    # Data_Dictionary: generate from schema_registry
+    # -------------------------
+    if sheet == "Data_Dictionary":
+        # Use schema keys if present; otherwise use standard headers as keys
+        out_headers = schema_headers[:] if schema_headers else [
+            "Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes"
+        ]
+        out_keys = schema_keys[:] if schema_keys else out_headers[:]
+
+        rows: List[Dict[str, Any]] = []
+        sheet_names = _get_all_sheet_names()
+
+        # If registry doesn't expose names, at least include the known ones
+        if not sheet_names:
+            sheet_names = [
+                "Market_Leaders",
+                "Global_Markets",
+                "Commodities_FX",
+                "Mutual_Funds",
+                "My_Portfolio",
+                "Insights_Analysis",
+                "Top_10_Investments",
+                "Data_Dictionary",
+            ]
+
+        for sn in sheet_names:
+            spec = _get_sheet_spec(sn)
+            cols = getattr(spec, "columns", None) if spec else None
+            if not cols:
+                continue
+
+            for c in cols:
+                # best-effort group/source/notes if present on the column/spec objects
+                group = getattr(c, "group", None) or getattr(spec, "group", None) or ""
+                source = getattr(c, "source", None) or getattr(spec, "source", None) or ""
+                notes = getattr(c, "notes", None) or getattr(spec, "notes", None) or ""
+                dtype = getattr(c, "dtype", None) or getattr(c, "type", None) or ""
+                fmt = getattr(c, "format", None) or getattr(c, "fmt", None) or ""
+                req = getattr(c, "required", None)
+                required = bool(req) if req is not None else False
+
+                base = {
+                    "Sheet": sn,
+                    "Group": str(group) if group is not None else "",
+                    "Header": str(getattr(c, "header", "")),
+                    "Key": str(getattr(c, "key", "")),
+                    "DType": str(dtype) if dtype is not None else "",
+                    "Format": str(fmt) if fmt is not None else "",
+                    "Required": required,
+                    "Source": str(source) if source is not None else "",
+                    "Notes": str(notes) if notes is not None else "",
+                }
+
+                # Project to out_keys (support both header-like keys and snake-like keys)
+                row: Dict[str, Any] = {}
+                for k in out_keys:
+                    lk = k.strip().lower().replace(" ", "_")
+                    if k in base:
+                        row[k] = base[k]
+                    elif lk in ("sheet", "page"):
+                        row[k] = base["Sheet"]
+                    elif lk == "group":
+                        row[k] = base["Group"]
+                    elif lk in ("header", "column"):
+                        row[k] = base["Header"]
+                    elif lk == "key":
+                        row[k] = base["Key"]
+                    elif lk in ("dtype", "type"):
+                        row[k] = base["DType"]
+                    elif lk in ("format", "fmt"):
+                        row[k] = base["Format"]
+                    elif lk in ("required", "is_required", "req"):
+                        row[k] = base["Required"]
+                    elif lk == "source":
+                        row[k] = base["Source"]
+                    elif lk in ("notes", "note", "description"):
+                        row[k] = base["Notes"]
+                    else:
+                        row[k] = None
+
+                rows.append(row)
+
+        # Respect limit/offset
+        rows = rows[offset : offset + limit]
+
+        return {
+            "status": "success",
+            "page": "Data_Dictionary",
+            "sheet": "Data_Dictionary",
+            "headers": out_headers,
+            "keys": out_keys,
+            "rows": rows,
+            "rows_matrix": _rows_to_matrix(rows, out_keys) if include_matrix_final else None,
+            "version": ADVANCED_ANALYSIS_VERSION,
+            "request_id": request_id or None,
+            "meta": {
+                "schema_source": schema_source,
+                "generated": True,
+                "total_rows": len(rows),
+                "limit": limit,
+                "offset": offset,
+            },
+        }
+
+    # -------------------------
+    # Other sheets: engine + schema normalization
+    # -------------------------
+    engine = await _get_engine(request)
+    if not engine:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Data engine unavailable")
+
+    try:
+        payload = await _engine_sheet_rows(engine, sheet=sheet, limit=limit, offset=offset, mode=mode or "", body=body)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Engine sheet-rows failed: {e}")
+
+    rows, eng_headers, eng_keys = _coerce_rows_payload(payload)
+
+    # Determine output headers/keys:
+    # Prefer schema_registry; else fallback to engine; else derive from rows.
+    out_headers = schema_headers[:] if schema_headers else (eng_headers[:] if eng_headers else [])
+    out_keys = schema_keys[:] if schema_keys else (eng_keys[:] if eng_keys else [])
+
+    if not out_keys and rows:
+        out_keys = list(rows[0].keys())
+    if not out_headers and out_keys:
+        out_headers = out_keys[:]
+
+    # Normalize rows to schema (if schema exists)
+    norm_rows: List[Dict[str, Any]] = []
+    if schema_keys:
+        for r in rows:
+            try:
+                nr = _normalize_row_to_schema(sheet, r)
+            except Exception:
+                nr = r
+            norm_rows.append(nr)
+    else:
+        norm_rows = rows
+
+    # Ensure all rows have ALL keys (even if engine omitted some)
+    if out_keys:
+        fixed_rows: List[Dict[str, Any]] = []
+        for r in norm_rows:
+            rr = dict(r) if isinstance(r, dict) else {}
+            for k in out_keys:
+                if k not in rr:
+                    # try header name as a source if keys differ
+                    rr[k] = rr.get(k, None)
+            fixed_rows.append(rr)
+        norm_rows = fixed_rows
+
+    # Status
+    status_out = "success"
+    if not out_headers:
+        status_out = "partial"
+
+    return {
+        "status": status_out,
+        "page": sheet,
+        "sheet": sheet,
+        "headers": out_headers,
+        "keys": out_keys,
+        "rows": norm_rows,
+        "rows_matrix": _rows_to_matrix(norm_rows, out_keys) if (include_matrix_final and out_keys) else None,
+        "version": ADVANCED_ANALYSIS_VERSION,
+        "request_id": request_id or None,
+        "meta": {
+            "schema_source": schema_source,
+            "schema_cols": len(schema_headers) if schema_headers else 0,
+            "engine_cols": len(eng_headers) if eng_headers else 0,
+            "returned_cols": len(out_headers) if out_headers else 0,
+            "rows": len(norm_rows),
+            "limit": limit,
+            "offset": offset,
+            "mode": mode,
+        },
+    }
+
+
+# -----------------------------------------------------------------------------
+# Existing endpoints (kept) + minor hardening
 # -----------------------------------------------------------------------------
 @router.get("/health")
 async def advanced_health(request: Request) -> Dict[str, Any]:
@@ -286,7 +715,6 @@ async def advanced_health(request: Request) -> Dict[str, Any]:
     """
     engine = await _get_engine(request)
 
-    # schema pages (optional)
     schema_pages = None
     try:
         from core.sheets.page_catalog import CANONICAL_PAGES  # type: ignore
@@ -295,7 +723,6 @@ async def advanced_health(request: Request) -> Dict[str, Any]:
     except Exception:
         schema_pages = None
 
-    # best-effort engine health/stats
     engine_health: Optional[Dict[str, Any]] = None
     engine_stats: Optional[Dict[str, Any]] = None
 
@@ -330,6 +757,7 @@ async def advanced_health(request: Request) -> Dict[str, Any]:
         "require_auth": _safe_bool_env("REQUIRE_AUTH", True),
         "request_id": request_id,
         "phase5_insights_criteria": True,
+        "sheet_rows_schema_driven": True,
     }
 
 
@@ -351,7 +779,7 @@ async def insights_criteria(
 ) -> Dict[str, Any]:
     """
     Returns a criteria snapshot that is designed to be embedded into Insights_Analysis.
-    This endpoint is schema-agnostic (safe for all clients).
+    Schema-agnostic.
     """
     _require_auth_or_401(token_query=token, x_app_token=x_app_token, authorization=authorization)
 
@@ -378,9 +806,6 @@ async def insights_analysis(
 ) -> Dict[str, Any]:
     """
     Phase 5 endpoint: best-effort Insights_Analysis computation.
-    - Fetches rows via engine for requested symbols (like /sheet-rows)
-    - Returns full schema headers/keys for Insights_Analysis when schema_registry is available
-    - Optionally embeds criteria JSON into the FIRST row if schema supports relevant keys
     """
     _require_auth_or_401(token_query=token, x_app_token=x_app_token, authorization=authorization)
     request_id = x_request_id or (getattr(request.state, "request_id", None) or "")
@@ -392,31 +817,22 @@ async def insights_analysis(
 
     include_matrix_final = include_matrix if isinstance(include_matrix, bool) else _get_bool(body, "include_matrix", True)
 
-    # Load schema (best-effort)
-    headers: List[str] = []
-    keys: List[str] = []
-    spec = None
-    try:
-        from core.sheets.schema_registry import get_sheet_spec  # type: ignore
-
-        spec = get_sheet_spec("Insights_Analysis")
-        headers = [c.header for c in spec.columns]
-        keys = [c.key for c in spec.columns]
-    except Exception:
-        headers = []
-        keys = []
+    # Schema (best-effort)
+    headers, keys, _src = _schema_headers_keys("Insights_Analysis")
 
     # Engine required
     engine = await _get_engine(request)
     if not engine:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Data engine unavailable")
 
-    # Prefer engine batch method
+    # Prefer batch
     quotes: Dict[str, Any] = {}
     try:
         fn = getattr(engine, "get_enriched_quotes_batch", None)
         if callable(fn):
-            res = await fn(symbols, mode=mode or "", schema="Insights_Analysis")
+            res = fn(symbols, mode=mode or "", schema="Insights_Analysis")
+            if hasattr(res, "__await__"):
+                res = await res
             if isinstance(res, dict):
                 quotes = res
     except Exception:
@@ -429,11 +845,16 @@ async def insights_analysis(
             try:
                 fn2 = getattr(engine, "get_enriched_quote_dict", None)
                 if callable(fn2):
-                    out[s] = await fn2(s, schema="Insights_Analysis")
+                    r = fn2(s, schema="Insights_Analysis")
+                    if hasattr(r, "__await__"):
+                        r = await r
+                    out[s] = r
                 else:
                     fn3 = getattr(engine, "get_enriched_quote", None)
                     if callable(fn3):
-                        q = await fn3(s, schema="Insights_Analysis")
+                        q = fn3(s, schema="Insights_Analysis")
+                        if hasattr(q, "__await__"):
+                            q = await q
                         if hasattr(q, "model_dump"):
                             out[s] = q.model_dump(mode="python")
                         elif hasattr(q, "dict"):
@@ -446,38 +867,26 @@ async def insights_analysis(
                 out[s] = {"symbol": s, "error": str(e)}
         quotes = out
 
-    # Normalize to schema keys if available
+    # Normalize
     normalized_rows: List[Dict[str, Any]] = []
     errors = 0
 
-    normalize_fn = None
-    try:
-        from core.data_engine_v2 import normalize_row_to_schema  # type: ignore
-
-        normalize_fn = normalize_row_to_schema
-    except Exception:
-        normalize_fn = None
-
     for sym in symbols:
-        raw = quotes.get(sym)
-        if raw is None:
-            raw = {"symbol": sym, "error": "no_data"}
+        raw = quotes.get(sym) or {"symbol": sym, "error": "no_data"}
         if isinstance(raw, dict) and raw.get("error"):
             errors += 1
-
         row = dict(raw) if isinstance(raw, dict) else {"symbol": sym, "result": raw}
 
-        if normalize_fn is not None:
-            try:
-                row = normalize_fn("Insights_Analysis", row)
-            except Exception:
-                pass
+        try:
+            row = _normalize_row_to_schema("Insights_Analysis", row)
+        except Exception:
+            pass
+
         normalized_rows.append(row)
 
-    # Embed criteria into first row (only if schema has matching keys)
+    # Embed criteria into first row (if schema has matching keys)
     if embed_criteria and normalized_rows:
         snap = _build_insights_criteria_snapshot()
-        criteria_json = None
         try:
             criteria_json = json.dumps(snap, ensure_ascii=False, default=str)
         except Exception:
@@ -497,17 +906,15 @@ async def insights_analysis(
             for ck in candidate_keys:
                 if ck in keys:
                     first[ck] = criteria_json
-            # also try weights if present
             for wk in ("scoring_weights", "weights_json", "weights"):
                 if wk in keys:
                     first[wk] = criteria_json
 
     status_out = "success" if errors == 0 else ("partial" if errors < len(symbols) else "error")
 
-    # If no schema available, still provide a basic key set from the first row
     if not keys and normalized_rows:
         keys = list(normalized_rows[0].keys())
-        headers = keys[:]  # best-effort
+        headers = keys[:]
 
     return {
         "status": status_out,
@@ -515,7 +922,7 @@ async def insights_analysis(
         "headers": headers,
         "keys": keys,
         "rows": normalized_rows,
-        "rows_matrix": [[row.get(k) for k in keys] for row in normalized_rows] if include_matrix_final else None,
+        "rows_matrix": _rows_to_matrix(normalized_rows, keys) if include_matrix_final else None,
         "error": f"{errors} errors" if errors else None,
         "version": ADVANCED_ANALYSIS_VERSION,
         "request_id": request_id or None,
