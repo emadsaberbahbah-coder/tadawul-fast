@@ -1,7 +1,7 @@
 # =============================================================================
 # render.yaml
 # =============================================================================
-# TADAWUL FAST BRIDGE – RENDER BLUEPRINT (v7.5.2) — HASH-PROOF + SPEC COMPLIANT
+# TADAWUL FAST BRIDGE – RENDER BLUEPRINT (v7.5.3) — CLEAN / SPEC-COMPLIANT
 # =============================================================================
 
 previews:
@@ -19,21 +19,14 @@ services:
     healthCheckPath: /readyz
     autoDeployTrigger: commit
 
-    previews:
-      generation: automatic
-      plan: starter
-      numInstances: 1
-
     buildFilter:
       paths:
         - main.py
         - core/**
         - routes/**
-        - schemas/**
         - scripts/**
         - integrations/**
         - requirements.txt
-        - requirements.render.txt
         - runtime.txt
         - render.yaml
       ignoredPaths:
@@ -42,33 +35,15 @@ services:
         - examples/**
         - .github/**
         - .vscode/**
-        - .gitignore
         - README.md
 
+    # Keep buildCommand simple; dashboard Build Command can override if you want
     buildCommand: |
       set -euo pipefail
-
-      curl -LsSf https://astral.sh/uv/install.sh | sh
-      export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-      command -v uv >/dev/null 2>&1 || { echo "uv not found on PATH"; exit 1; }
-      uv --version
-
-      echo "=== Preflight: ensure NO hash-locked requirements exist ==="
-      if grep -R --line-number --fixed-strings "--hash=sha256:" . ; then
-        echo "ERROR: Found --hash lines in repo. Remove them (pip require-hashes mode)."
-        exit 1
-      fi
-      if grep -R --line-number --fixed-strings "8df6da72963969ab2bf49a520c3e147b1e15cbeddd3aa0e3e039b3532c739339" . ; then
-        echo "ERROR: Found the failing expected hash in repo. Remove it."
-        exit 1
-      fi
-
-      echo "=== Install (Render-safe file) ==="
-      uv pip install --system --no-cache -r requirements.render.txt
-
-      uv pip check || true
-      python -m compileall -q -f -x "(tests|examples|docs|venv|\.git|__pycache__)" .
-      echo "✅ Build completed"
+      python -m pip install -U pip
+      python -m pip install --no-cache-dir -r requirements.txt
+      python -m pip check || true
+      python -m compileall -q -f .
 
     startCommand: |
       set -euo pipefail
@@ -117,207 +92,12 @@ services:
       - key: DEFAULT_SPREADSHEET_ID
         sync: false
 
-  - type: worker
-    name: tadawul-worker
-    runtime: python
-    region: frankfurt
-    plan: starter
-    branch: main
-    autoDeployTrigger: commit
-
-    buildFilter:
-      paths:
-        - main.py
-        - core/**
-        - routes/**
-        - schemas/**
-        - scripts/**
-        - integrations/**
-        - requirements.txt
-        - requirements.render.txt
-        - runtime.txt
-        - render.yaml
-      ignoredPaths:
-        - tests/**
-        - docs/**
-        - examples/**
-        - .github/**
-        - .vscode/**
-        - .gitignore
-        - README.md
-
-    buildCommand: |
-      set -euo pipefail
-      curl -LsSf https://astral.sh/uv/install.sh | sh
-      export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-      uv --version
-      uv pip install --system --no-cache -r requirements.render.txt
-      uv pip check || true
-      python -m compileall -q main.py core scripts
-
-    startCommand: |
-      set -euo pipefail
-      python scripts/worker.py
-
-    envVars:
-      - fromGroup: tfb-core
-      - fromGroup: tfb-logging
-      - fromGroup: tfb-security
-      - fromGroup: tfb-features
-      - fromGroup: tfb-providers
-      - fromGroup: tfb-cache
-      - fromGroup: tfb-sheets
-      - fromGroup: tfb-resources
-
-      - key: REDIS_URL
-        fromService:
-          name: tadawul-redis
-          type: keyvalue
-          property: connectionString
-
-      - key: APP_TOKEN
-        sync: false
-      - key: BACKUP_APP_TOKEN
-        sync: false
-      - key: EODHD_API_KEY
-        sync: false
-      - key: FINNHUB_API_KEY
-        sync: false
-      - key: ARGAAM_API_KEY
-        sync: false
-      - key: GOOGLE_SHEETS_CREDENTIALS
-        sync: false
-      - key: DEFAULT_SPREADSHEET_ID
-        sync: false
-
   - type: keyvalue
     name: tadawul-redis
     region: frankfurt
     plan: starter
     ipAllowList: []
     maxmemoryPolicy: allkeys-lru
-
-  - type: web
-    name: tadawul-docs
-    runtime: static
-    region: frankfurt
-    plan: free
-    branch: main
-    autoDeployTrigger: commit
-
-    buildCommand: |
-      set -euo pipefail
-      mkdir -p public
-      cp -r docs/* public/ || true
-      echo "Tadawul Fast Bridge v7.5.2 Documentation" > public/index.html
-
-    staticPublishPath: public
-
-    headers:
-      - path: /*
-        name: Cache-Control
-        value: public, max-age=3600
-
-  - type: cron
-    name: cache-cleanup
-    runtime: python
-    region: frankfurt
-    plan: starter
-    branch: main
-    schedule: "0 3 * * *"
-
-    buildCommand: |
-      set -euo pipefail
-      curl -LsSf https://astral.sh/uv/install.sh | sh
-      export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-      uv --version
-      uv pip install --system --no-cache -r requirements.render.txt
-      uv pip check || true
-
-    startCommand: python scripts/cleanup_cache.py
-
-    envVars:
-      - fromGroup: tfb-core
-      - fromGroup: tfb-logging
-      - fromGroup: tfb-cache
-      - fromGroup: tfb-resources
-      - key: REDIS_URL
-        fromService:
-          name: tadawul-redis
-          type: keyvalue
-          property: connectionString
-
-  - type: cron
-    name: model-drift-check
-    runtime: python
-    region: frankfurt
-    plan: starter
-    branch: main
-    schedule: "0 4 * * 0"
-
-    buildCommand: |
-      set -euo pipefail
-      curl -LsSf https://astral.sh/uv/install.sh | sh
-      export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-      uv --version
-      uv pip install --system --no-cache -r requirements.render.txt
-      uv pip check || true
-
-    startCommand: python scripts/drift_detection.py
-
-    envVars:
-      - fromGroup: tfb-core
-      - fromGroup: tfb-logging
-      - fromGroup: tfb-features
-      - fromGroup: tfb-providers
-      - fromGroup: tfb-sheets
-      - fromGroup: tfb-resources
-      - key: EODHD_API_KEY
-        sync: false
-      - key: FINNHUB_API_KEY
-        sync: false
-      - key: ARGAAM_API_KEY
-        sync: false
-      - key: GOOGLE_SHEETS_CREDENTIALS
-        sync: false
-      - key: DEFAULT_SPREADSHEET_ID
-        sync: false
-
-  - type: cron
-    name: refresh-provider-data
-    runtime: python
-    region: frankfurt
-    plan: starter
-    branch: main
-    schedule: "*/30 * * * *"
-
-    buildCommand: |
-      set -euo pipefail
-      curl -LsSf https://astral.sh/uv/install.sh | sh
-      export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
-      uv --version
-      uv pip install --system --no-cache -r requirements.render.txt
-      uv pip check || true
-
-    startCommand: python scripts/refresh_data.py
-
-    envVars:
-      - fromGroup: tfb-core
-      - fromGroup: tfb-logging
-      - fromGroup: tfb-providers
-      - fromGroup: tfb-cache
-      - fromGroup: tfb-resources
-      - key: REDIS_URL
-        fromService:
-          name: tadawul-redis
-          type: keyvalue
-          property: connectionString
-      - key: EODHD_API_KEY
-        sync: false
-      - key: FINNHUB_API_KEY
-        sync: false
-      - key: ARGAAM_API_KEY
-        sync: false
 
 envVarGroups:
   - name: tfb-core
@@ -329,15 +109,13 @@ envVarGroups:
       - key: APP_ENV
         value: "production"
       - key: APP_VERSION
-        value: "7.5.2"
+        value: "7.5.3"
       - key: SERVICE_VERSION
-        value: "7.5.2"
+        value: "7.5.3"
       - key: PYTHONUNBUFFERED
         value: "1"
       - key: PYTHONDONTWRITEBYTECODE
         value: "1"
-      - key: PYTHONHASHSEED
-        value: "random"
 
   - name: tfb-logging
     envVars:
@@ -351,8 +129,6 @@ envVarGroups:
         value: "1"
       - key: CORE_TRACING_ENABLED
         value: "1"
-      - key: DATA_ENGINE_PERF_MONITORING
-        value: "1"
 
   - name: tfb-server
     envVars:
@@ -360,20 +136,6 @@ envVarGroups:
         value: "0.0.0.0"
       - key: WORKERS
         value: "4"
-      - key: WEB_CONCURRENCY_MAX
-        value: "16"
-      - key: WORKER_CLASS
-        value: "uvicorn.workers.UvicornWorker"
-      - key: WORKER_CONNECTIONS
-        value: "2048"
-      - key: WORKER_MAX_REQUESTS
-        value: "10000"
-      - key: TIMEOUT_KEEP_ALIVE
-        value: "65"
-      - key: TIMEOUT_GRACEFUL
-        value: "30"
-      - key: BACKLOG
-        value: "4096"
 
   - name: tfb-security
     envVars:
@@ -385,38 +147,16 @@ envVarGroups:
         value: "1"
       - key: MAX_REQUESTS_PER_MINUTE
         value: "300"
-      - key: RATE_LIMIT_BACKEND
-        value: "redis"
-      - key: CORS_ORIGINS
-        value: "https://app.tadawulfb.com,https://tadawulfb.com"
-      - key: ALLOWED_HOSTS
-        value: "api.tadawulfb.com,api.tadawulfastbridge.com,localhost"
 
   - name: tfb-features
     envVars:
-      - key: ADVISOR_ENABLED
-        value: "1"
-      - key: AI_ANALYSIS_ENABLED
-        value: "1"
-      - key: ADVANCED_ANALYSIS_ENABLED
-        value: "1"
-      - key: ADVANCED_ADAPTIVE_CONCURRENCY
-        value: "1"
       - key: CACHE_ENABLED
-        value: "1"
-      - key: CACHE_COMPRESSION
-        value: "1"
-      - key: CACHE_COMPRESSION_LEVEL
-        value: "6"
-      - key: CIRCUIT_BREAKER_ENABLED
         value: "1"
 
   - name: tfb-providers
     envVars:
       - key: ENABLED_PROVIDERS
         value: "eodhd,finnhub,yahoo_chart,yahoo_fundamentals"
-      - key: KSA_PROVIDERS
-        value: "yahoo_chart,argaam,tadawul"
       - key: PRIMARY_PROVIDER
         value: "eodhd"
 
@@ -440,9 +180,3 @@ envVarGroups:
     envVars:
       - key: GC_PRESSURE_MB
         value: "512"
-      - key: DEGRADED_ENTER_LAG_MS
-        value: "500"
-      - key: DEGRADED_SHED_ENABLED
-        value: "1"
-      - key: MAX_FD_LIMIT
-        value: "65536"
