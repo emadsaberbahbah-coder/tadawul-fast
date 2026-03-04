@@ -2,11 +2,11 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.3.0 (PHASE 4 SCHEMA-ALIGNED)
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.4.0 (PHASE 4 SCHEMA-ALIGNED)
 ================================================================================
 
-PHASE 4 GOALS (DONE)
-- ✅ Standardized row object (dict) for each instrument:
+PHASE 4 GOALS
+- ✅ Standardized row dict for each instrument:
     - Identity + provenance
     - Price / liquidity
     - Fundamentals / technicals (when enabled)
@@ -30,8 +30,8 @@ KEY ALIGNMENT (IMPORTANT)
 
 STARTUP SAFE
 - No network I/O at import time
-- Providers are imported lazily
-- Optional modules (scoring/forecasting) are best-effort and never crash startup
+- Providers imported lazily
+- Scoring/forecasting modules imported lazily (best-effort; never crash startup)
 
 ================================================================================
 """
@@ -62,9 +62,10 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.3.0"
+__version__ = "5.4.0"
 
 logger = logging.getLogger("core.data_engine_v2")
+logger.addHandler(logging.NullHandler())
 
 # ---------------------------------------------------------------------------
 # Fast JSON (orjson optional)
@@ -107,38 +108,88 @@ except Exception:
         raise KeyError("schema_registry not available")
 
 
+# ---------------------------------------------------------------------------
+# Canonical engine keys (fallback union, even if schema isn't importable yet)
+# ---------------------------------------------------------------------------
+DEFAULT_ENGINE_KEYS: List[str] = [
+    # identity
+    "symbol",
+    "symbol_normalized",
+    "requested_symbol",
+    "name",
+    "exchange",
+    "currency",
+    "asset_class",
+    # prices / liquidity
+    "current_price",
+    "price",  # alias
+    "previous_close",
+    "open_price",
+    "day_high",
+    "day_low",
+    "week_52_high",
+    "week_52_low",
+    "volume",
+    "market_cap",
+    "price_change",
+    "percent_change",
+    "change",  # alias
+    "change_pct",  # alias
+    # fundamentals / technicals
+    "pe_ttm",
+    "dividend_yield",
+    "rsi_14",
+    "volatility_30d",
+    # forecast / roi
+    "forecast_price_1m",
+    "forecast_price_3m",
+    "forecast_price_12m",
+    "expected_roi_1m",
+    "expected_roi_3m",
+    "expected_roi_12m",
+    "forecast_confidence",
+    # scores
+    "risk_score",
+    "overall_score",
+    "valuation_score",
+    "momentum_score",
+    "confidence_score",
+    "recommendation",
+    "recommendation_reason",
+    # meta / provenance
+    "data_quality",
+    "error",
+    "warning",
+    "info",
+    "data_sources",
+    "provider_latency",
+    "last_updated_utc",
+    "last_updated_riyadh",
+]
+
+
 def _build_union_schema_keys() -> List[str]:
     """
     Union of keys across all sheets in SCHEMA_REGISTRY, preserving stable order.
+    Also appends DEFAULT_ENGINE_KEYS as a safety net.
     """
     keys: List[str] = []
     seen = set()
-    if isinstance(SCHEMA_REGISTRY, dict):
+
+    if isinstance(SCHEMA_REGISTRY, dict) and SCHEMA_REGISTRY:
         for _, spec in SCHEMA_REGISTRY.items():
             cols = getattr(spec, "columns", None) or []
             for c in cols:
                 k = getattr(c, "key", None)
                 if not k:
                     continue
-                if k not in seen:
+                k = str(k)
+                if k and k not in seen:
                     seen.add(k)
                     keys.append(k)
 
-    # Ensure engine meta keys always exist even if not in schema yet
-    must_have = [
-        "symbol",
-        "symbol_normalized",
-        "requested_symbol",
-        "data_quality",
-        "error",
-        "warning",
-        "info",
-        "data_sources",
-        "provider_latency",
-        "last_updated_utc",
-        "last_updated_riyadh",
-    ]
-    for k in must_have:
+    # Ensure engine keys always exist even if schema isn't loaded
+    for k in DEFAULT_ENGINE_KEYS:
         if k not in seen:
             seen.add(k)
             keys.append(k)
@@ -149,7 +200,7 @@ def _build_union_schema_keys() -> List[str]:
 _SCHEMA_UNION_KEYS: List[str] = _build_union_schema_keys()
 
 
-def normalize_row_to_schema(schema: Any, rowdict: Dict[str, Any]) -> Dict[str, Any]:
+def normalize_row_to_schema(schema: Any, rowdict: Dict[str, Any], *, keep_extras: bool = True) -> Dict[str, Any]:
     """
     PHASE 4 REQUIRED API
 
@@ -158,7 +209,7 @@ def normalize_row_to_schema(schema: Any, rowdict: Dict[str, Any]) -> Dict[str, A
       - a sheet name (str) -> uses schema_registry
       - a sheet spec object (has .columns with .key)
       - a list/tuple of keys
-      - None -> uses union schema across all sheets
+      - None -> uses union schema across all sheets (+ DEFAULT_ENGINE_KEYS)
 
     Returns: dict with ALL schema keys, missing => None.
     """
@@ -166,36 +217,39 @@ def normalize_row_to_schema(schema: Any, rowdict: Dict[str, Any]) -> Dict[str, A
 
     if schema is None:
         keys = list(_SCHEMA_UNION_KEYS)
+
     elif isinstance(schema, str):
         try:
             spec = get_sheet_spec(schema)
-            keys = [c.key for c in spec.columns]
+            keys = [str(getattr(c, "key", "")) for c in (getattr(spec, "columns", None) or [])]
+            keys = [k for k in keys if k]
         except Exception:
             keys = list(_SCHEMA_UNION_KEYS)
+
     elif isinstance(schema, (list, tuple)):
-        keys = [str(k) for k in schema if str(k)]
+        keys = [str(k) for k in schema if str(k).strip()]
+
     else:
         cols = getattr(schema, "columns", None)
         if cols:
             keys = [getattr(c, "key", None) for c in cols]
-            keys = [k for k in keys if k]
+            keys = [str(k) for k in keys if k]
         else:
             keys = list(_SCHEMA_UNION_KEYS)
 
     raw = rowdict or {}
-    out: Dict[str, Any] = {}
-    for k in keys:
-        out[k] = raw.get(k, None)
-    # preserve extra keys (optional): keep rowdict extras too
-    # but do not overwrite schema keys
-    for k, v in raw.items():
-        if k not in out:
-            out[k] = v
+    out: Dict[str, Any] = {k: raw.get(k, None) for k in keys}
+
+    if keep_extras:
+        for k, v in raw.items():
+            if k not in out:
+                out[k] = v
+
     return out
 
 
 # ---------------------------------------------------------------------------
-# Pydantic safe detection
+# Pydantic / dataclass safe detection
 # ---------------------------------------------------------------------------
 def _model_to_dict(obj: Any) -> Dict[str, Any]:
     if obj is None:
@@ -217,7 +271,7 @@ def _model_to_dict(obj: Any) -> Dict[str, Any]:
             return obj.dict()
         except Exception:
             return {}
-    # dataclass-like / plain object
+    # plain object
     if hasattr(obj, "__dict__"):
         try:
             return dict(obj.__dict__)
@@ -266,8 +320,8 @@ except Exception:
         market_cap: Optional[float] = None
         price_change: Optional[float] = None
         percent_change: Optional[float] = None
-        change: Optional[float] = None          # alias
-        change_pct: Optional[float] = None      # alias
+        change: Optional[float] = None  # alias
+        change_pct: Optional[float] = None  # alias
 
         # fundamentals/technicals
         pe_ttm: Optional[float] = None
@@ -290,6 +344,8 @@ except Exception:
         valuation_score: Optional[float] = None
         momentum_score: Optional[float] = None
         confidence_score: Optional[float] = None
+        recommendation: Optional[str] = None
+        recommendation_reason: Optional[str] = None
 
         # meta
         data_quality: str = "MISSING"
@@ -398,6 +454,7 @@ def get_symbol_info(symbol: str) -> Dict[str, Any]:
 def _try_get_settings() -> Any:
     try:
         from core.config import get_settings_cached  # type: ignore
+
         return get_settings_cached()
     except Exception:
         return None
@@ -497,13 +554,11 @@ _PATCH_ALIASES: Dict[str, str] = {
     "open": "open_price",
     "high": "day_high",
     "low": "day_low",
-
     # 52w
     "52w_high": "week_52_high",
     "high_52w": "week_52_high",
     "52w_low": "week_52_low",
     "low_52w": "week_52_low",
-
     # change
     "change": "price_change",
     "price_diff": "price_change",
@@ -523,20 +578,21 @@ def _normalize_patch_keys(patch: Dict[str, Any]) -> Dict[str, Any]:
         return {}
     out = dict(patch)
 
+    # map provider keys -> canonical
     for src, dst in _PATCH_ALIASES.items():
-        if src in out and (dst not in out or out.get(dst) in (None, "", 0)):
+        if src in out and (dst not in out or out.get(dst) in (None, "")):
             out[dst] = out.get(src)
 
-    # ensure both current_price and price exist
-    if "current_price" in out and ("price" not in out or out.get("price") in (None, "", 0)):
+    # ensure both current_price and price exist (alias)
+    if "current_price" in out and ("price" not in out or out.get("price") in (None, "")):
         out["price"] = out.get("current_price")
-    if "price" in out and ("current_price" not in out or out.get("current_price") in (None, "", 0)):
+    if "price" in out and ("current_price" not in out or out.get("current_price") in (None, "")):
         out["current_price"] = out.get("price")
 
     # backward compat: change / change_pct
-    if "price_change" in out and ("change" not in out or out.get("change") in (None, "", 0)):
+    if "price_change" in out and ("change" not in out or out.get("change") in (None, "")):
         out["change"] = out.get("price_change")
-    if "percent_change" in out and ("change_pct" not in out or out.get("change_pct") in (None, "", 0)):
+    if "percent_change" in out and ("change_pct" not in out or out.get("change_pct") in (None, "")):
         out["change_pct"] = out.get("percent_change")
 
     return out
@@ -553,9 +609,9 @@ def _is_useful_patch(p: Dict[str, Any]) -> bool:
         return True
     if _safe_float(p.get("price")) is not None:
         return True
-    if (p.get("name") or "").strip():
+    if (str(p.get("name") or "")).strip():
         return True
-    if (p.get("currency") or "").strip():
+    if (str(p.get("currency") or "")).strip():
         return True
     return False
 
@@ -653,7 +709,7 @@ class ProviderStats:
 
     def record_success(self, latency_ms: float) -> None:
         self.success_count += 1
-        self.total_latency_ms += latency_ms
+        self.total_latency_ms += float(latency_ms or 0.0)
         self.consecutive_failures = 0
         self.circuit_open_until = None
         self.last_error = None
@@ -767,8 +823,9 @@ class MultiLevelCache:
         now = time.time()
 
         async with self._lock:
-            if key in self._l1:
-                val, exp = self._l1[key]
+            item = self._l1.get(key)
+            if item:
+                val, exp = item
                 if now < exp:
                     self._l1_access[key] = now
                     return val
@@ -850,8 +907,13 @@ class SingleFlight:
 
 
 # ============================================================================
-# Optional Scoring / Forecasting adapters (best-effort)
+# Optional Scoring / Forecasting adapters (LAZY import; best-effort)
 # ============================================================================
+_SCORING_MOD: Optional[Any] = None
+_FORECAST_MOD: Optional[Any] = None
+_ANALYTICS_IMPORT_LOCK = asyncio.Lock()
+
+
 def _try_import_any(paths: Sequence[str]) -> Optional[Any]:
     for p in paths:
         try:
@@ -861,22 +923,51 @@ def _try_import_any(paths: Sequence[str]) -> Optional[Any]:
     return None
 
 
-_SCORING_MOD = _try_import_any(["core.scoring", "core.analysis.scoring"])
-_FORECAST_MOD = _try_import_any(["core.forecasting", "core.analysis.forecasting"])
+async def _get_scoring_module() -> Optional[Any]:
+    global _SCORING_MOD
+    if _SCORING_MOD is not None:
+        return _SCORING_MOD
+    async with _ANALYTICS_IMPORT_LOCK:
+        if _SCORING_MOD is None:
+            _SCORING_MOD = _try_import_any(["core.scoring", "core.analysis.scoring"])
+    return _SCORING_MOD
+
+
+async def _get_forecast_module() -> Optional[Any]:
+    global _FORECAST_MOD
+    if _FORECAST_MOD is not None:
+        return _FORECAST_MOD
+    async with _ANALYTICS_IMPORT_LOCK:
+        if _FORECAST_MOD is None:
+            _FORECAST_MOD = _try_import_any(["core.forecasting", "core.analysis.forecasting"])
+    return _FORECAST_MOD
+
+
+def _fn_accepts_settings(fn: Callable) -> bool:
+    try:
+        co = getattr(fn, "__code__", None)
+        varnames = getattr(co, "co_varnames", ()) if co is not None else ()
+        return "settings" in set(varnames or ())
+    except Exception:
+        return False
 
 
 async def _maybe_apply_scoring(row: Dict[str, Any], settings: Any) -> Dict[str, Any]:
-    if _SCORING_MOD is None:
+    mod = await _get_scoring_module()
+    if mod is None:
         return row
+
     for fn_name in ("compute_scores", "score_row", "score_quote"):
-        fn = getattr(_SCORING_MOD, fn_name, None)
+        fn = getattr(mod, fn_name, None)
         if callable(fn):
             try:
-                r = fn(row, settings=settings) if "settings" in getattr(fn, "__code__", {}).co_varnames else fn(row)
+                r = fn(row, settings=settings) if _fn_accepts_settings(fn) else fn(row)
                 if asyncio.iscoroutine(r) or asyncio.isfuture(r):
                     r = await r
                 if isinstance(r, dict):
-                    row.update({k: v for k, v in r.items() if v is not None})
+                    for k, v in r.items():
+                        if v is not None:
+                            row[k] = v
             except Exception:
                 pass
             break
@@ -884,17 +975,21 @@ async def _maybe_apply_scoring(row: Dict[str, Any], settings: Any) -> Dict[str, 
 
 
 async def _maybe_apply_forecast(row: Dict[str, Any], settings: Any) -> Dict[str, Any]:
-    if _FORECAST_MOD is None:
+    mod = await _get_forecast_module()
+    if mod is None:
         return row
+
     for fn_name in ("compute_forecast", "forecast_row", "forecast_quote"):
-        fn = getattr(_FORECAST_MOD, fn_name, None)
+        fn = getattr(mod, fn_name, None)
         if callable(fn):
             try:
-                r = fn(row, settings=settings) if "settings" in getattr(fn, "__code__", {}).co_varnames else fn(row)
+                r = fn(row, settings=settings) if _fn_accepts_settings(fn) else fn(row)
                 if asyncio.iscoroutine(r) or asyncio.isfuture(r):
                     r = await r
                 if isinstance(r, dict):
-                    row.update({k: v for k, v in r.items() if v is not None})
+                    for k, v in r.items():
+                        if v is not None:
+                            row[k] = v
             except Exception:
                 pass
             break
@@ -902,7 +997,7 @@ async def _maybe_apply_forecast(row: Dict[str, Any], settings: Any) -> Dict[str,
 
 
 # ============================================================================
-# DataEngine V5 (v5.3.0)
+# DataEngine V5 (v5.4.0)
 # ============================================================================
 class DataEngineV5:
     def __init__(self, settings: Any = None):
@@ -952,13 +1047,14 @@ class DataEngineV5:
         )
 
         logger.info(
-            "DataEngineV5 v%s initialized | primary=%s | enabled=%s | ksa=%s | global=%s | flags=%s",
+            "DataEngineV5 v%s initialized | primary=%s | enabled=%s | ksa=%s | global=%s | flags=%s | schema=%s",
             self.version,
             self.primary_provider,
             len(self.enabled_providers),
             len(self.ksa_providers),
             len(self.global_providers),
             self.flags,
+            "available" if _SCHEMA_AVAILABLE else "missing",
         )
 
     async def aclose(self) -> None:
@@ -977,14 +1073,20 @@ class DataEngineV5:
         if is_ksa_sym and self.ksa_disallow_eodhd:
             providers = [p for p in providers if p != "eodhd"]
 
+        # ensure primary first (if allowed)
         if self.primary_provider and (self.primary_provider in self.enabled_providers):
             if self.primary_provider in providers:
-                providers.remove(self.primary_provider)
+                providers = [p for p in providers if p != self.primary_provider]
                 providers.insert(0, self.primary_provider)
             else:
                 if (not is_ksa_sym) or (self.primary_provider != "eodhd") or (not self.ksa_disallow_eodhd):
                     providers.insert(0, self.primary_provider)
 
+        # de-dupe while preserving order
+        seen: set = set()
+        providers = [p for p in providers if not (p in seen or seen.add(p))]
+
+        # stable priority on tail
         def pr(p: str) -> int:
             return PROVIDER_PRIORITIES.get(p, 999)
 
@@ -1003,9 +1105,7 @@ class DataEngineV5:
                 return symbol
         return symbol
 
-    async def _fetch_patch(
-        self, provider: str, symbol: str
-    ) -> Tuple[str, Optional[Dict[str, Any]], float, Optional[str]]:
+    async def _fetch_patch(self, provider: str, symbol: str) -> Tuple[str, Optional[Dict[str, Any]], float, Optional[str]]:
         start = time.time()
 
         async with self._sem:
@@ -1028,11 +1128,9 @@ class DataEngineV5:
             provider_symbol = self._provider_symbol(provider, symbol)
 
             try:
-                try:
-                    async with asyncio.timeout(self.request_timeout):
-                        res = await _call_maybe_async(fn, provider_symbol)
-                except AttributeError:
-                    res = await asyncio.wait_for(_call_maybe_async(fn, provider_symbol), timeout=self.request_timeout)
+                # python 3.11 timeout
+                async with asyncio.timeout(self.request_timeout):
+                    res = await _call_maybe_async(fn, provider_symbol)
 
                 latency = (time.time() - start) * 1000
 
@@ -1050,6 +1148,12 @@ class DataEngineV5:
                 await self._registry.record_failure(provider, err)
                 return provider, None, latency, err
 
+            except TimeoutError:
+                latency = (time.time() - start) * 1000
+                err = "timeout"
+                await self._registry.record_failure(provider, err)
+                return provider, None, latency, err
+
             except Exception as e:
                 latency = (time.time() - start) * 1000
                 await self._registry.record_failure(provider, repr(e))
@@ -1058,9 +1162,7 @@ class DataEngineV5:
     # -----------------------------
     # Merge patches -> standardized row dict
     # -----------------------------
-    def _merge(
-        self, requested_symbol: str, norm: str, patches: List[Tuple[str, Dict[str, Any], float]]
-    ) -> Dict[str, Any]:
+    def _merge(self, requested_symbol: str, norm: str, patches: List[Tuple[str, Dict[str, Any], float]]) -> Dict[str, Any]:
         merged: Dict[str, Any] = {
             "symbol": norm,
             "symbol_normalized": norm,
@@ -1075,17 +1177,18 @@ class DataEngineV5:
 
         for prov, patch, latency in patches:
             merged["data_sources"].append(prov)
-            merged["provider_latency"][prov] = round(latency, 2)
+            merged["provider_latency"][prov] = round(float(latency or 0.0), 2)
 
             for k, v in patch.items():
                 if k in protected:
                     continue
                 if v is None:
                     continue
-                if k not in merged or merged.get(k) in (None, "", 0, []):
+                # only fill if empty in merged
+                if k not in merged or merged.get(k) in (None, "", []):
                     merged[k] = v
 
-        # canonical + aliases sync
+        # canonical + aliases sync (always)
         if merged.get("current_price") is None and merged.get("price") is not None:
             merged["current_price"] = merged.get("price")
         if merged.get("price") is None and merged.get("current_price") is not None:
@@ -1114,7 +1217,8 @@ class DataEngineV5:
     # -----------------------------
     async def get_enriched_quote(self, symbol: str, use_cache: bool = True, *, schema: Any = None) -> UnifiedQuote:
         """
-        Returns UnifiedQuote (model). Row is normalized to union schema if schema provided or schema_registry exists.
+        Returns UnifiedQuote model.
+        Row is normalized to union schema (or provided schema) before model construction.
         """
         return await self._singleflight.execute(
             f"quote:{symbol}",
@@ -1171,7 +1275,7 @@ class DataEngineV5:
             return UnifiedQuote(**row)  # type: ignore
 
         top_n = _get_env_int("PROVIDER_TOP_N", 3)
-        top = providers[: max(1, top_n)]
+        top = providers[: max(1, int(top_n))]
 
         gathered = await asyncio.gather(*[self._fetch_patch(p, norm) for p in top], return_exceptions=True)
 
@@ -1240,7 +1344,7 @@ class DataEngineV5:
                 batch = int(getattr(self.settings, "quote_batch_size"))
         except Exception:
             pass
-        batch = max(1, min(500, batch))
+        batch = max(1, min(500, int(batch)))
 
         out: List[UnifiedQuote] = []
         for i in range(0, len(symbols), batch):
@@ -1256,17 +1360,19 @@ class DataEngineV5:
         out: Dict[str, Dict[str, Any]] = {}
         if not symbols:
             return out
-        # ignore mode here; providers already incorporate symbol formatting; routes pass mode but engine doesn't need it yet
+
+        # mode is accepted for interface compatibility; providers already handle symbol formatting.
         quotes = await asyncio.gather(*[self.get_enriched_quote_dict(s, schema=schema) for s in symbols])
         for s, qd in zip(symbols, quotes):
             out[s] = qd
         return out
 
-    # Backwards-compatible aliases
+    # Backwards-compatible aliases (common names in routers/services)
     get_quote = get_enriched_quote
     get_quotes = get_enriched_quotes
     fetch_quote = get_enriched_quote
     fetch_quotes = get_enriched_quotes
+    get_quotes_batch = get_enriched_quotes_batch  # important for older routers
 
     async def get_stats(self) -> Dict[str, Any]:
         return {
@@ -1278,6 +1384,7 @@ class DataEngineV5:
             "ksa_disallow_eodhd": self.ksa_disallow_eodhd,
             "flags": dict(self.flags),
             "provider_stats": await self._registry.get_stats(),
+            "schema_available": bool(_SCHEMA_AVAILABLE),
         }
 
 
