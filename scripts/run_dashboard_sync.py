@@ -1,3 +1,7 @@
+Phase 7 — Sync pipeline
+
+REVISE — scripts/run_dashboard_sync.py (your sync runner)
+
 #!/usr/bin/env python3
 """
 run_dashboard_sync.py
@@ -1323,4 +1327,7 @@ def main() -> int:
         return 1
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main())       Phase 7 — Sync pipeline
+
+REVISE — scripts/run_dashboard_sync.py (your sync runner)
+      give me full revised script
