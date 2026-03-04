@@ -1,7 +1,13 @@
 # =============================================================================
 # render.yaml
 # =============================================================================
-# TADAWUL FAST BRIDGE – RENDER BLUEPRINT (v7.5.3) — CLEAN / SPEC-COMPLIANT
+# TADAWUL FAST BRIDGE – RENDER BLUEPRINT (v7.5.4) — CLEAN / SPEC-COMPLIANT
+# =============================================================================
+# Goals
+# - Render-safe: installs deps into Render venv (python -m pip ...)
+# - Uses requirements.render.txt when present (recommended), falls back to requirements.txt
+# - Keeps start command simple and PORT-safe (scripts/start_web.sh)
+# - No debug/hash scanning text in buildCommand
 # =============================================================================
 
 previews:
@@ -9,6 +15,9 @@ previews:
   expireAfterDays: 7
 
 services:
+  # -------------------------------------------------------------------------
+  # 1) Primary FastAPI Web Service
+  # -------------------------------------------------------------------------
   - type: web
     name: tadawul-fast-bridge
     runtime: python
@@ -27,6 +36,7 @@ services:
         - scripts/**
         - integrations/**
         - requirements.txt
+        - requirements.render.txt
         - runtime.txt
         - render.yaml
       ignoredPaths:
@@ -37,13 +47,23 @@ services:
         - .vscode/**
         - README.md
 
-    # Keep buildCommand simple; dashboard Build Command can override if you want
     buildCommand: |
       set -euo pipefail
-      python -m pip install -U pip
-      python -m pip install --no-cache-dir -r requirements.txt
+      python -m pip install -U pip setuptools wheel
+
+      # Prefer Render-safe dependency set if present
+      if [ -f requirements.render.txt ]; then
+        echo "Installing requirements.render.txt"
+        python -m pip install --no-cache-dir -r requirements.render.txt
+      else
+        echo "Installing requirements.txt"
+        python -m pip install --no-cache-dir -r requirements.txt
+      fi
+
       python -m pip check || true
       python -m compileall -q -f .
+
+      echo "✅ Build completed"
 
     startCommand: |
       set -euo pipefail
@@ -71,12 +91,14 @@ services:
       - fromGroup: tfb-sheets
       - fromGroup: tfb-resources
 
+      # Redis connection string from Key Value service
       - key: REDIS_URL
         fromService:
           name: tadawul-redis
           type: keyvalue
           property: connectionString
 
+      # Secrets (kept here so the service can be deployed even if groups are edited)
       - key: APP_TOKEN
         sync: false
       - key: BACKUP_APP_TOKEN
@@ -92,6 +114,9 @@ services:
       - key: DEFAULT_SPREADSHEET_ID
         sync: false
 
+  # -------------------------------------------------------------------------
+  # 2) Redis-Compatible Cache (Render Key Value)
+  # -------------------------------------------------------------------------
   - type: keyvalue
     name: tadawul-redis
     region: frankfurt
@@ -99,7 +124,14 @@ services:
     ipAllowList: []
     maxmemoryPolicy: allkeys-lru
 
+
+# =============================================================================
+# ENVIRONMENT VARIABLE GROUPS
+# =============================================================================
 envVarGroups:
+  # -------------------------------------------------------------------------
+  # CORE
+  # -------------------------------------------------------------------------
   - name: tfb-core
     envVars:
       - key: TZ
@@ -109,14 +141,17 @@ envVarGroups:
       - key: APP_ENV
         value: "production"
       - key: APP_VERSION
-        value: "7.5.3"
+        value: "7.5.4"
       - key: SERVICE_VERSION
-        value: "7.5.3"
+        value: "7.5.4"
       - key: PYTHONUNBUFFERED
         value: "1"
       - key: PYTHONDONTWRITEBYTECODE
         value: "1"
 
+  # -------------------------------------------------------------------------
+  # LOGGING / OBSERVABILITY
+  # -------------------------------------------------------------------------
   - name: tfb-logging
     envVars:
       - key: LOG_LEVEL
@@ -130,13 +165,29 @@ envVarGroups:
       - key: CORE_TRACING_ENABLED
         value: "1"
 
+  # -------------------------------------------------------------------------
+  # SERVER (keep minimal; scripts/start_web.sh honors PORT automatically)
+  # -------------------------------------------------------------------------
   - name: tfb-server
     envVars:
       - key: HOST
         value: "0.0.0.0"
-      - key: WORKERS
+      # Use Render-safe naming: WEB_CONCURRENCY is what most launchers expect
+      - key: WEB_CONCURRENCY
+        value: "1"
+      # Hard clamp in launcher (if you keep it) with WORKERS_MAX
+      - key: WORKERS_MAX
         value: "4"
+      - key: UVICORN_KEEPALIVE
+        value: "75"
+      - key: UVICORN_GRACEFUL_TIMEOUT
+        value: "30"
+      - key: UVICORN_BACKLOG
+        value: "2048"
 
+  # -------------------------------------------------------------------------
+  # SECURITY
+  # -------------------------------------------------------------------------
   - name: tfb-security
     envVars:
       - key: REQUIRE_AUTH
@@ -148,11 +199,17 @@ envVarGroups:
       - key: MAX_REQUESTS_PER_MINUTE
         value: "300"
 
+  # -------------------------------------------------------------------------
+  # FEATURES
+  # -------------------------------------------------------------------------
   - name: tfb-features
     envVars:
       - key: CACHE_ENABLED
         value: "1"
 
+  # -------------------------------------------------------------------------
+  # PROVIDERS
+  # -------------------------------------------------------------------------
   - name: tfb-providers
     envVars:
       - key: ENABLED_PROVIDERS
@@ -160,6 +217,9 @@ envVarGroups:
       - key: PRIMARY_PROVIDER
         value: "eodhd"
 
+  # -------------------------------------------------------------------------
+  # CACHE
+  # -------------------------------------------------------------------------
   - name: tfb-cache
     envVars:
       - key: CACHE_BACKEND
@@ -169,6 +229,9 @@ envVarGroups:
       - key: CACHE_MAX_SIZE
         value: "20000"
 
+  # -------------------------------------------------------------------------
+  # SHEETS
+  # -------------------------------------------------------------------------
   - name: tfb-sheets
     envVars:
       - key: SHEETS_SAFE_MODE
@@ -176,6 +239,9 @@ envVarGroups:
       - key: SHEETS_USE_BATCH_UPDATE
         value: "true"
 
+  # -------------------------------------------------------------------------
+  # RESOURCES
+  # -------------------------------------------------------------------------
   - name: tfb-resources
     envVars:
       - key: GC_PRESSURE_MB
