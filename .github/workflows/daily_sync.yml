@@ -69,16 +69,18 @@ jobs:
       - name: ✅ Validate Runner Environment
         id: validate
         run: |
+          set -euo pipefail
+
           echo "::group::System Information"
           echo "OS: $(uname -a)"
           df -h /
-          free -h
+          free -h || true
           echo "::endgroup::"
 
           MISSING_TOOLS=()
-          for tool in curl jq python3 pip3 shred; do
-            if ! command -v $tool &> /dev/null; then
-              MISSING_TOOLS+=($tool)
+          for tool in curl jq python3 pip3; do
+            if ! command -v "$tool" >/dev/null 2>&1; then
+              MISSING_TOOLS+=("$tool")
             fi
           done
 
@@ -112,43 +114,47 @@ jobs:
           cache-dependency-path: |
             requirements.render.txt
             requirements.txt
-            requirements*.txt
 
-      - name: 📦 Install & Verify Dependencies (NO require-hashes)
+      - name: 📦 Install & Verify Dependencies (NO hashes)
         run: |
+          set -euo pipefail
+
           echo "::group::Pip Install Log"
           python -m pip install --upgrade pip setuptools wheel
 
           # Prefer Render-safe minimal deps if present
           if [ -f "requirements.render.txt" ]; then
             echo "✅ Installing from requirements.render.txt (Render-safe minimal)"
-            pip install -r requirements.render.txt
+            python -m pip install -r requirements.render.txt
           elif [ -f "requirements.txt" ]; then
             echo "✅ Installing from requirements.txt"
-            pip install -r requirements.txt
+            python -m pip install -r requirements.txt
           else
             echo "::warning::No requirements file found, skipping dependency installation."
           fi
           echo "::endgroup::"
 
           echo "::group::Package Verification"
-          python -c "
-          critical = ['pandas', 'numpy', 'gspread', 'requests']
+          python - << 'PY'
+          critical = ['pandas', 'numpy', 'gspread', 'requests', 'httpx']
           missing = []
           for pkg in critical:
-              try: __import__(pkg)
-              except ImportError: missing.append(pkg)
+              try:
+                  __import__(pkg)
+              except Exception:
+                  missing.append(pkg)
           if missing:
               print(f'⚠️ Warning: Missing expected packages: {missing}')
           else:
               print('✅ Critical packages loaded successfully')
-          "
+          PY
           echo "::endgroup::"
 
       - name: 🧪 Run Scoring Engine Contract Tests
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
+          set -euo pipefail
           echo "::group::Contract Tests"
 
           python -c "import pytest" 2>/dev/null || python -m pip install -q pytest
@@ -182,19 +188,23 @@ jobs:
           SECRET_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
           SECRET_CREDS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
         run: |
+          set -euo pipefail
+
           get_val() {
             for v in "$@"; do
-              if [[ -n "$v" && "$v" != "null" && "$v" != "undefined" ]]; then
+              if [[ -n "${v:-}" && "$v" != "null" && "$v" != "undefined" ]]; then
                 echo "$v"
-                return
+                return 0
               fi
             done
+            return 0
           }
 
           echo "::group::🔧 Configuration Resolution"
 
-          URL=$(get_val "$INPUT_URL" "$VAR_URL" "https://tadawul-fast-bridge.onrender.com")
-          URL=${URL%/}
+          # 1) URL
+          URL="$(get_val "${INPUT_URL:-}" "${VAR_URL:-}" "https://tadawul-fast-bridge.onrender.com")"
+          URL="${URL%/}"
           if [[ ! "$URL" =~ ^https?:// ]]; then
             echo "::error::Invalid URL format: $URL"
             exit 1
@@ -202,44 +212,56 @@ jobs:
           echo "TARGET_URL=$URL" >> "$GITHUB_ENV"
           echo "✅ Backend URL: $URL"
 
-          SHEET=$(get_val "$INPUT_SHEET" "$VAR_SHEET" "19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw")
+          # 2) Sheet ID
+          SHEET="$(get_val "${INPUT_SHEET:-}" "${VAR_SHEET:-}" "19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw")"
+          if [[ -z "${SHEET:-}" ]]; then
+            echo "::error::Spreadsheet ID is empty."
+            exit 1
+          fi
           echo "TARGET_SHEET_ID=$SHEET" >> "$GITHUB_ENV"
           echo "✅ Sheet ID: $SHEET"
 
+          # 3) Mode & Keys
           MODE="${INPUT_MODE:-full_sync}"
           echo "RUN_MODE=$MODE" >> "$GITHUB_ENV"
 
-          if [[ "$MODE" == "single_key" && -n "$INPUT_KEY" ]]; then
+          if [[ "$MODE" == "single_key" && -n "${INPUT_KEY:-}" ]]; then
             KEYS="$INPUT_KEY"
           else
             DEFAULT_KEYS="MARKET_LEADERS GLOBAL_MARKETS KSA_TADAWUL MUTUAL_FUNDS COMMODITIES_FX MY_PORTFOLIO INSIGHTS_ANALYSIS"
-            KEYS=$(get_val "$VAR_DEFAULT_KEYS" "$DEFAULT_KEYS")
+            KEYS="$(get_val "${VAR_DEFAULT_KEYS:-}" "$DEFAULT_KEYS")"
           fi
 
-          KEYS=$(echo "$KEYS" | tr -s ' ' | xargs)
+          KEYS="$(echo "$KEYS" | tr -s ' ' | xargs)"
+          if [[ -z "${KEYS:-}" ]]; then
+            echo "::error::SYNC_KEYS resolved to empty."
+            exit 1
+          fi
           echo "SYNC_KEYS=$KEYS" >> "$GITHUB_ENV"
           echo "📋 Mode: $MODE | Keys: $KEYS"
 
+          # 4) Debug
           DEBUG="${INPUT_DEBUG:-false}"
           echo "ENABLE_DEBUG=$DEBUG" >> "$GITHUB_ENV"
 
-          RAW_CREDS=$(get_val "$INPUT_CREDS" "$SECRET_CREDS")
+          # 5) Credentials (secure)
+          RAW_CREDS="$(get_val "${INPUT_CREDS:-}" "${SECRET_CREDS:-}")"
 
-          if [[ -z "$RAW_CREDS" && -n "$SECRET_CREDS_B64" ]]; then
+          if [[ -z "${RAW_CREDS:-}" && -n "${SECRET_CREDS_B64:-}" ]]; then
             echo "🔓 Decoding Base64 credentials..."
-            RAW_CREDS=$(echo "$SECRET_CREDS_B64" | base64 --decode 2>/dev/null || echo "")
+            RAW_CREDS="$(echo "$SECRET_CREDS_B64" | base64 --decode 2>/dev/null || true)"
           fi
 
-          if [[ -n "$RAW_CREDS" ]]; then
+          if [[ -n "${RAW_CREDS:-}" ]]; then
             echo "::add-mask::$RAW_CREDS"
 
-            if echo "$RAW_CREDS" | jq empty 2>/dev/null; then
+            if echo "$RAW_CREDS" | jq empty >/dev/null 2>&1; then
               CREDS_PATH="$RUNNER_TEMP/google_credentials.json"
               echo "$RAW_CREDS" > "$CREDS_PATH"
               chmod 600 "$CREDS_PATH"
               echo "GOOGLE_APPLICATION_CREDENTIALS=$CREDS_PATH" >> "$GITHUB_ENV"
 
-              SA_EMAIL=$(echo "$RAW_CREDS" | jq -r '.client_email // "Unknown"')
+              SA_EMAIL="$(echo "$RAW_CREDS" | jq -r '.client_email // "Unknown"')"
               echo "🤖 Service Account Configured: $SA_EMAIL"
             else
               echo "::error::Invalid JSON structure in credentials."
@@ -255,6 +277,7 @@ jobs:
       - name: 💓 Intelligent Health Check
         id: health_check
         run: |
+          set -euo pipefail
           echo "::group::🏥 Backend Health Check"
 
           HEALTH_ENDPOINTS=("/readyz" "/health" "/livez")
@@ -263,16 +286,16 @@ jobs:
           for endpoint in "${HEALTH_ENDPOINTS[@]}"; do
             echo "▶️ Probing $TARGET_URL$endpoint..."
 
-            for attempt in $(seq 1 $MAX_RETRIES); do
+            for attempt in $(seq 1 "$MAX_RETRIES"); do
               BACKOFF=$(( 2 ** attempt ))
 
-              RESPONSE=$(curl -s -w "\n%{http_code}" --max-time 10 "$TARGET_URL$endpoint" 2>&1 || echo -e "\n000")
-              HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
-              BODY=$(echo "$RESPONSE" | sed '$d')
+              RESPONSE="$(curl -s -w "\n%{http_code}" --max-time 10 "$TARGET_URL$endpoint" 2>&1 || echo -e "\n000")"
+              HTTP_CODE="$(echo "$RESPONSE" | tail -n1)"
+              BODY="$(echo "$RESPONSE" | sed '$d')"
 
               if [[ "$HTTP_CODE" =~ ^2[0-9][0-9]$ ]]; then
                 echo "✅ Healthy via $endpoint (HTTP $HTTP_CODE)"
-                VERSION=$(echo "$BODY" | jq -r '.version // .build // "unknown"' 2>/dev/null || echo "unknown")
+                VERSION="$(echo "$BODY" | jq -r '.version // .build // "unknown"' 2>/dev/null || echo "unknown")"
 
                 echo "health_status=healthy" >> "$GITHUB_OUTPUT"
                 echo "health_version=$VERSION" >> "$GITHUB_OUTPUT"
@@ -281,7 +304,7 @@ jobs:
               fi
 
               echo "⏳ Attempt $attempt/$MAX_RETRIES: HTTP $HTTP_CODE, retrying in ${BACKOFF}s..."
-              sleep $BACKOFF
+              sleep "$BACKOFF"
             done
           done
 
@@ -292,54 +315,53 @@ jobs:
       - name: 🚀 Execute Dashboard Sync
         id: execute_sync
         env:
-          BACKEND_URL: ${{ env.TARGET_URL }}
-          SPREADSHEET_ID: ${{ env.TARGET_SHEET_ID }}
-          SYNC_MODE: ${{ env.RUN_MODE }}
-          DEBUG_MODE: ${{ env.ENABLE_DEBUG }}
           PYTHONPATH: ${{ github.workspace }}
         run: |
+          set -euo pipefail
           echo "::group::📊 Sync Execution"
 
-          # Base command (your script supports these flags in your earlier version)
-          CMD="python scripts/run_dashboard_sync.py --health-check"
+          # ---- Map workflow config -> script arguments (matches your v6.1.0 runner) ----
+          CMD=(python scripts/run_dashboard_sync.py)
 
-          if [[ "$RUN_MODE" == "health_only" ]]; then
-            CMD="$CMD --dry-run --health-only"
-          elif [[ "$RUN_MODE" == "single_key" ]]; then
-            CMD="$CMD --single-key"
+          # required inputs
+          CMD+=(--backend "$TARGET_URL")
+          CMD+=(--sheet-id "$TARGET_SHEET_ID")
+
+          # keys
+          CMD+=(--keys $SYNC_KEYS)
+
+          # optional behaviors
+          if [[ "${RUN_MODE:-full_sync}" == "health_only" ]]; then
+            CMD+=(--dry-run)
           fi
 
-          CMD="$CMD --keys $SYNC_KEYS"
-
-          if [[ "$ENABLE_DEBUG" == "true" ]]; then
-            CMD="$CMD --debug --verbose"
-            echo "🔍 Debug mode active."
+          if [[ "${ENABLE_DEBUG:-false}" == "true" ]]; then
+            export LOG_LEVEL=DEBUG
+            echo "🔍 Debug mode active (LOG_LEVEL=DEBUG)."
           fi
 
           echo "⏱️ Start Time: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-          echo "📋 Command: $CMD"
+          echo "📋 Command: ${CMD[*]}"
 
           set -o pipefail
-          TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+          TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
           LOG_FILE="sync_${TIMESTAMP}.log"
 
-          START_TIME=$(date +%s)
-
-          $CMD 2>&1 | tee "$LOG_FILE"
+          START_TIME="$(date +%s)"
+          "${CMD[@]}" 2>&1 | tee "$LOG_FILE"
           EXIT_CODE=$?
-
-          END_TIME=$(date +%s)
+          END_TIME="$(date +%s)"
           DURATION=$((END_TIME - START_TIME))
 
           echo "✅ Execution finished in ${DURATION}s (Exit Code: $EXIT_CODE)"
 
-          if grep -qiE "RateLimitError|Quota exceeded|429 Too Many Requests" "$LOG_FILE"; then
-            echo "::warning::Google APIs Rate limits / Quotas may have been exhausted."
+          if grep -qiE "RateLimitError|Quota exceeded|429 Too Many Requests|HTTP 429" "$LOG_FILE"; then
+            echo "::warning::Rate limiting detected in logs."
             echo "rate_limited=true" >> "$GITHUB_OUTPUT"
           fi
 
-          if grep -qiE "AuthenticationError|InvalidGrant|401 Unauthorized" "$LOG_FILE"; then
-            echo "::error::Google Sheets authentication failed. Check credentials."
+          if grep -qiE "AuthenticationError|InvalidGrant|401 Unauthorized|403 Forbidden" "$LOG_FILE"; then
+            echo "::error::Google Sheets authentication/permission issue detected."
             EXIT_CODE=1
           fi
 
@@ -355,8 +377,9 @@ jobs:
       - name: 📝 Generate Comprehensive Summary
         if: always()
         run: |
-          RIYADH_TIME=$(TZ=Asia/Riyadh date '+%Y-%m-%d %H:%M:%S %Z')
-          STATUS_ICON=$([[ "${{ job.status }}" == "success" ]] && echo "✅ **SUCCESS**" || echo "❌ **FAILED**")
+          set -euo pipefail
+          RIYADH_TIME="$(TZ=Asia/Riyadh date '+%Y-%m-%d %H:%M:%S %Z')"
+          STATUS_ICON="$([[ "${{ job.status }}" == "success" ]] && echo "✅ **SUCCESS**" || echo "❌ **FAILED**")"
 
           cat >> "$GITHUB_STEP_SUMMARY" << EOF
           # 🏦 Tadawul Dashboard Sync Report
@@ -400,17 +423,18 @@ jobs:
         env:
           WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
         run: |
-          if [[ -z "$WEBHOOK_URL" ]]; then
+          set -euo pipefail
+          if [[ -z "${WEBHOOK_URL:-}" ]]; then
             echo "::notice::No WEBHOOK_URL secret defined. Skipping failure notification."
             exit 0
           fi
 
           echo "::group::📧 Sending Alert"
-          PAYLOAD=$(jq -n \
+          PAYLOAD="$(jq -n \
             --arg title "❌ Tadawul Sync Failed" \
             --arg run "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --arg mode "${{ env.RUN_MODE }}" \
-            '{text: ($title + "\n\n*Run:* " + $run + "\n*Mode:* " + $mode)}')
+            '{text: ($title + "\n\n*Run:* " + $run + "\n*Mode:* " + $mode)}')"
 
           curl -s -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$WEBHOOK_URL" || true
           echo "::endgroup::"
@@ -418,9 +442,16 @@ jobs:
       - name: 🧹 Secure Cleanup
         if: always()
         run: |
+          set -euo pipefail
           echo "::group::Cleanup"
-          if [[ -n "$GOOGLE_APPLICATION_CREDENTIALS" && -f "$GOOGLE_APPLICATION_CREDENTIALS" ]]; then
-            shred -u -z "$GOOGLE_APPLICATION_CREDENTIALS" 2>/dev/null || rm -f "$GOOGLE_APPLICATION_CREDENTIALS"
-            echo "✅ Google Credentials securely shredded from runner."
+
+          if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" && -f "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
+            if command -v shred >/dev/null 2>&1; then
+              shred -u -z "$GOOGLE_APPLICATION_CREDENTIALS" 2>/dev/null || rm -f "$GOOGLE_APPLICATION_CREDENTIALS"
+            else
+              rm -f "$GOOGLE_APPLICATION_CREDENTIALS"
+            fi
+            echo "✅ Google Credentials removed from runner."
           fi
+
           echo "::endgroup::"
