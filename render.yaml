@@ -1,16 +1,17 @@
 # =============================================================================
 # render.yaml
 # =============================================================================
-# TADAWUL FAST BRIDGE – RENDER BLUEPRINT (v7.5.0) — VALIDATED STRUCTURE
-# Notes:
-# - Uses Render Blueprint spec fields only (root + services + envVarGroups)
-# - Cron jobs are defined as services with type: cron (no root-level cronJobs)
-# - Key Value (Redis-compatible) uses type: keyvalue and ipAllowList: [] (internal-only)
-# - Autoscaling uses supported fields only (min/max + targetCPU/Memory)
-# - Security headers should be set in FastAPI middleware (Blueprint headers apply to static sites)
+# TADAWUL FAST BRIDGE – RENDER BLUEPRINT (v7.5.1) — BLUEPRINT-SPEC COMPLIANT
+# Last Updated: 2026-03-04
+#
+# Key fixes in v7.5.1:
+# - ✅ envVarGroups: removed sync:false + fromService references (Blueprint spec restriction)
+# - ✅ secrets moved to per-service envVars (sync:false prompts in dashboard per service)
+# - ✅ REDIS_URL moved to per-service envVars (fromService not allowed in env groups)
+# - ✅ buildCommand: installs only requirements.txt (no unpinned optional installs)
+# - ✅ uv PATH hardened (~/.local/bin + ~/.cargo/bin)
 # =============================================================================
 
-# Preview environments (multi-service). Optional.
 previews:
   generation: automatic
   expireAfterDays: 7
@@ -26,13 +27,9 @@ services:
     plan: pro
     branch: main
 
-    # Zero-downtime health check endpoint
     healthCheckPath: /readyz
-
-    # Auto deploys (replaces deprecated autoDeploy: true)
     autoDeployTrigger: commit
 
-    # Pull request previews for this service (replaces pullRequestPreviewsEnabled)
     previews:
       generation: automatic
       plan: starter
@@ -63,15 +60,17 @@ services:
 
       # 1) Install uv (Astral) for fast dependency resolution
       curl -LsSf https://astral.sh/uv/install.sh | sh
-      export PATH="$HOME/.cargo/bin:$PATH"
+      export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+      command -v uv >/dev/null 2>&1 || { echo "uv not found on PATH"; exit 1; }
+      uv --version
 
-      # 2) Install dependencies
+      # 2) Install dependencies (single source of truth)
       uv pip install --system --no-cache -r requirements.txt
 
-      # 3) Optional performance/observability packages (safe if already pinned)
-      uv pip install --system --no-cache uvloop httptools orjson opentelemetry-api opentelemetry-sdk prometheus-client
+      # 3) Sanity check dependency graph
+      uv pip check || true
 
-      # 4) Compile Python bytecode for faster cold start
+      # 4) Compile bytecode for faster cold start
       python -m compileall -q -f -x "(tests|examples|docs|venv|\.git|__pycache__)" .
 
       echo "✅ Build completed"
@@ -81,20 +80,18 @@ services:
       chmod +x scripts/start_web.sh
       exec scripts/start_web.sh
 
-    # Autoscaling (supported fields only)
     scaling:
       minInstances: 2
       maxInstances: 10
       targetMemoryPercent: 80
       targetCPUPercent: 75
 
-    # Custom domains
     domains:
       - api.tadawulfb.com
       - api.tadawulfastbridge.com
 
-    # Environment groups applied to this service
     envVars:
+      # Groups (NON-secret, no fromService, no sync:false)
       - fromGroup: tfb-core
       - fromGroup: tfb-logging
       - fromGroup: tfb-server
@@ -104,6 +101,31 @@ services:
       - fromGroup: tfb-cache
       - fromGroup: tfb-sheets
       - fromGroup: tfb-resources
+
+      # Service-level (allowed): fromService for Redis
+      - key: REDIS_URL
+        fromService:
+          name: tadawul-redis
+          type: keyvalue
+          property: connectionString
+
+      # Service-level secrets (allowed): sync:false prompts
+      - key: APP_TOKEN
+        sync: false
+      - key: BACKUP_APP_TOKEN
+        sync: false
+
+      - key: EODHD_API_KEY
+        sync: false
+      - key: FINNHUB_API_KEY
+        sync: false
+      - key: ARGAAM_API_KEY
+        sync: false
+
+      - key: GOOGLE_SHEETS_CREDENTIALS
+        sync: false
+      - key: DEFAULT_SPREADSHEET_ID
+        sync: false
 
   # -------------------------------------------------------------------------
   # 2) Background Worker Service
@@ -139,8 +161,10 @@ services:
     buildCommand: |
       set -euo pipefail
       curl -LsSf https://astral.sh/uv/install.sh | sh
-      export PATH="$HOME/.cargo/bin:$PATH"
+      export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+      uv --version
       uv pip install --system --no-cache -r requirements.txt
+      uv pip check || true
       python -m compileall -q main.py core scripts
 
     startCommand: |
@@ -154,7 +178,31 @@ services:
       - fromGroup: tfb-features
       - fromGroup: tfb-providers
       - fromGroup: tfb-cache
+      - fromGroup: tfb-sheets
       - fromGroup: tfb-resources
+
+      - key: REDIS_URL
+        fromService:
+          name: tadawul-redis
+          type: keyvalue
+          property: connectionString
+
+      - key: APP_TOKEN
+        sync: false
+      - key: BACKUP_APP_TOKEN
+        sync: false
+
+      - key: EODHD_API_KEY
+        sync: false
+      - key: FINNHUB_API_KEY
+        sync: false
+      - key: ARGAAM_API_KEY
+        sync: false
+
+      - key: GOOGLE_SHEETS_CREDENTIALS
+        sync: false
+      - key: DEFAULT_SPREADSHEET_ID
+        sync: false
 
   # -------------------------------------------------------------------------
   # 3) Redis-Compatible Cache (Render Key Value)
@@ -163,10 +211,7 @@ services:
     name: tadawul-redis
     region: frankfurt
     plan: starter
-
-    # Required for Key Value. Empty list => internal-only (no public internet access)
     ipAllowList: []
-
     maxmemoryPolicy: allkeys-lru
 
   # -------------------------------------------------------------------------
@@ -184,7 +229,7 @@ services:
       set -euo pipefail
       mkdir -p public
       cp -r docs/* public/ || true
-      echo "Tadawul Fast Bridge v7.5.0 Documentation" > public/index.html
+      echo "Tadawul Fast Bridge v7.5.1 Documentation" > public/index.html
 
     staticPublishPath: public
 
@@ -194,7 +239,7 @@ services:
         value: public, max-age=3600
 
   # -------------------------------------------------------------------------
-  # 5) Cron Jobs (defined as services with type: cron)
+  # 5) Cron Jobs
   # -------------------------------------------------------------------------
   - type: cron
     name: cache-cleanup
@@ -207,8 +252,10 @@ services:
     buildCommand: |
       set -euo pipefail
       curl -LsSf https://astral.sh/uv/install.sh | sh
-      export PATH="$HOME/.cargo/bin:$PATH"
+      export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+      uv --version
       uv pip install --system --no-cache -r requirements.txt
+      uv pip check || true
 
     startCommand: python scripts/cleanup_cache.py
 
@@ -217,6 +264,12 @@ services:
       - fromGroup: tfb-logging
       - fromGroup: tfb-cache
       - fromGroup: tfb-resources
+
+      - key: REDIS_URL
+        fromService:
+          name: tadawul-redis
+          type: keyvalue
+          property: connectionString
 
   - type: cron
     name: model-drift-check
@@ -229,8 +282,10 @@ services:
     buildCommand: |
       set -euo pipefail
       curl -LsSf https://astral.sh/uv/install.sh | sh
-      export PATH="$HOME/.cargo/bin:$PATH"
+      export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+      uv --version
       uv pip install --system --no-cache -r requirements.txt
+      uv pip check || true
 
     startCommand: python scripts/drift_detection.py
 
@@ -238,7 +293,22 @@ services:
       - fromGroup: tfb-core
       - fromGroup: tfb-logging
       - fromGroup: tfb-features
+      - fromGroup: tfb-providers
+      - fromGroup: tfb-sheets
       - fromGroup: tfb-resources
+
+      # provider + sheets secrets (if drift check uses them)
+      - key: EODHD_API_KEY
+        sync: false
+      - key: FINNHUB_API_KEY
+        sync: false
+      - key: ARGAAM_API_KEY
+        sync: false
+
+      - key: GOOGLE_SHEETS_CREDENTIALS
+        sync: false
+      - key: DEFAULT_SPREADSHEET_ID
+        sync: false
 
   - type: cron
     name: refresh-provider-data
@@ -251,8 +321,10 @@ services:
     buildCommand: |
       set -euo pipefail
       curl -LsSf https://astral.sh/uv/install.sh | sh
-      export PATH="$HOME/.cargo/bin:$PATH"
+      export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+      uv --version
       uv pip install --system --no-cache -r requirements.txt
+      uv pip check || true
 
     startCommand: python scripts/refresh_data.py
 
@@ -263,13 +335,23 @@ services:
       - fromGroup: tfb-cache
       - fromGroup: tfb-resources
 
+      - key: REDIS_URL
+        fromService:
+          name: tadawul-redis
+          type: keyvalue
+          property: connectionString
+
+      - key: EODHD_API_KEY
+        sync: false
+      - key: FINNHUB_API_KEY
+        sync: false
+      - key: ARGAAM_API_KEY
+        sync: false
+
 # =============================================================================
-# ENVIRONMENT VARIABLE GROUPS
+# ENVIRONMENT VARIABLE GROUPS (NO secrets, NO fromService, NO sync:false)
 # =============================================================================
 envVarGroups:
-  # =======================================================================
-  # CORE RUNTIME CONFIGURATION
-  # =======================================================================
   - name: tfb-core
     envVars:
       - key: TZ
@@ -279,9 +361,9 @@ envVarGroups:
       - key: APP_ENV
         value: "production"
       - key: APP_VERSION
-        value: "7.5.0"
+        value: "7.5.1"
       - key: SERVICE_VERSION
-        value: "7.5.0"
+        value: "7.5.1"
       - key: PYTHONUNBUFFERED
         value: "1"
       - key: PYTHONDONTWRITEBYTECODE
@@ -289,9 +371,6 @@ envVarGroups:
       - key: PYTHONHASHSEED
         value: "random"
 
-  # =======================================================================
-  # LOGGING & OBSERVABILITY
-  # =======================================================================
   - name: tfb-logging
     envVars:
       - key: LOG_LEVEL
@@ -307,9 +386,6 @@ envVarGroups:
       - key: DATA_ENGINE_PERF_MONITORING
         value: "1"
 
-  # =======================================================================
-  # WEB SERVER CONFIGURATION (app reads these; Render provides PORT automatically)
-  # =======================================================================
   - name: tfb-server
     envVars:
       - key: HOST
@@ -319,7 +395,7 @@ envVarGroups:
       - key: WEB_CONCURRENCY_MAX
         value: "16"
       - key: WORKER_CLASS
-        value: "uvicorn.workers.UvicornWorker"
+        value: "uvicorn_worker.UvicornWorker"
       - key: WORKER_CONNECTIONS
         value: "2048"
       - key: WORKER_MAX_REQUESTS
@@ -331,9 +407,6 @@ envVarGroups:
       - key: BACKLOG
         value: "4096"
 
-  # =======================================================================
-  # SECURITY & AUTHENTICATION
-  # =======================================================================
   - name: tfb-security
     envVars:
       - key: REQUIRE_AUTH
@@ -350,14 +423,7 @@ envVarGroups:
         value: "https://app.tadawulfb.com,https://tadawulfb.com"
       - key: ALLOWED_HOSTS
         value: "api.tadawulfb.com,api.tadawulfastbridge.com,localhost"
-      - key: APP_TOKEN
-        sync: false
-      - key: BACKUP_APP_TOKEN
-        sync: false
 
-  # =======================================================================
-  # FEATURE FLAGS & MACHINE LEARNING
-  # =======================================================================
   - name: tfb-features
     envVars:
       - key: ADVISOR_ENABLED
@@ -377,9 +443,6 @@ envVarGroups:
       - key: CIRCUIT_BREAKER_ENABLED
         value: "1"
 
-  # =======================================================================
-  # DATA PROVIDERS
-  # =======================================================================
   - name: tfb-providers
     envVars:
       - key: ENABLED_PROVIDERS
@@ -388,16 +451,7 @@ envVarGroups:
         value: "yahoo_chart,argaam,tadawul"
       - key: PRIMARY_PROVIDER
         value: "eodhd"
-      - key: EODHD_API_KEY
-        sync: false
-      - key: FINNHUB_API_KEY
-        sync: false
-      - key: ARGAAM_API_KEY
-        sync: false
 
-  # =======================================================================
-  # CACHE CONFIGURATION
-  # =======================================================================
   - name: tfb-cache
     envVars:
       - key: CACHE_BACKEND
@@ -406,29 +460,14 @@ envVarGroups:
         value: "300"
       - key: CACHE_MAX_SIZE
         value: "20000"
-      - key: REDIS_URL
-        fromService:
-          name: tadawul-redis
-          type: keyvalue
-          property: connectionString
 
-  # =======================================================================
-  # GOOGLE SHEETS INTEGRATION
-  # =======================================================================
   - name: tfb-sheets
     envVars:
-      - key: GOOGLE_SHEETS_CREDENTIALS
-        sync: false
-      - key: DEFAULT_SPREADSHEET_ID
-        sync: false
       - key: SHEETS_SAFE_MODE
         value: "strict"
       - key: SHEETS_USE_BATCH_UPDATE
         value: "true"
 
-  # =======================================================================
-  # RESOURCE MANAGEMENT (System Guardian)
-  # =======================================================================
   - name: tfb-resources
     envVars:
       - key: GC_PRESSURE_MB
