@@ -2,13 +2,13 @@
 # routes/advanced_sheet_rows.py
 """
 ================================================================================
-Advanced Sheet-Rows Router — v1.1.0 (PHASE 3 / SCHEMA-DRIVEN / FULL COLUMNS)
+Advanced Sheet-Rows Router — v1.2.0 (PHASE 3/5 / SCHEMA-DRIVEN / FULL COLUMNS)
 ================================================================================
 
 Endpoint:
   POST /v1/advanced/sheet-rows
 
-Contract (Phase 3):
+Contract:
 - Accept page aliases via page_catalog.normalize_page_name()
 - Reject forbidden/removed pages (e.g., KSA_Tadawul, Advisor_Criteria)
 - Return FULL schema headers + keys from schema_registry for the requested page
@@ -20,11 +20,17 @@ Contract (Phase 3):
 
 Special:
 - Data_Dictionary is computed locally from schema_registry (no engine call)
+
+Startup-safe:
+- No network I/O at import-time
+- All heavy work is inside the request handler / engine calls
+================================================================================
 """
 
 from __future__ import annotations
 
 import inspect
+import os
 import time
 import uuid
 from dataclasses import is_dataclass
@@ -32,28 +38,46 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, status
 
-from core.sheets.schema_registry import get_sheet_spec
-from core.sheets.page_catalog import CANONICAL_PAGES, normalize_page_name
+# Schema + pages
+try:
+    from core.sheets.schema_registry import get_sheet_spec  # type: ignore
+except Exception as e:  # pragma: no cover
+    get_sheet_spec = None  # type: ignore
+    _SCHEMA_IMPORT_ERROR = repr(e)
+else:
+    _SCHEMA_IMPORT_ERROR = None
 
-# Optional (if present in your page_catalog)
+try:
+    from core.sheets.page_catalog import CANONICAL_PAGES, normalize_page_name  # type: ignore
+except Exception:  # pragma: no cover
+    CANONICAL_PAGES = set()  # type: ignore
+
+    def normalize_page_name(name: str, allow_output_pages: bool = True) -> str:  # type: ignore
+        return (name or "").strip()
+
+# Forbidden pages (optional, but we enforce a safe default)
 try:
     from core.sheets.page_catalog import FORBIDDEN_PAGES  # type: ignore
 except Exception:
     FORBIDDEN_PAGES = {"KSA_Tadawul", "Advisor_Criteria"}  # type: ignore
 
-from core.sheets.data_dictionary import build_data_dictionary_rows
+# Data Dictionary builder
+try:
+    from core.sheets.data_dictionary import build_data_dictionary_rows  # type: ignore
+except Exception:  # pragma: no cover
+    build_data_dictionary_rows = None  # type: ignore
 
 # core.config is preferred for auth + flags, but router must be safe if unavailable
 try:
     from core.config import auth_ok, get_settings_cached  # type: ignore
-except Exception:
+except Exception:  # pragma: no cover
     auth_ok = None  # type: ignore
 
     def get_settings_cached(*args, **kwargs):  # type: ignore
         return None
 
 
-ADVANCED_SHEET_ROWS_VERSION = "1.1.0"
+ADVANCED_SHEET_ROWS_VERSION = "1.2.0"
 router = APIRouter(prefix="/v1/advanced", tags=["Advanced Sheet Rows"])
 
 
@@ -73,16 +97,24 @@ def _to_plain_dict(obj: Any) -> Dict[str, Any]:
     if isinstance(obj, dict):
         return obj
     try:
-        if hasattr(obj, "model_dump"):
-            return obj.model_dump(mode="python")
-        if hasattr(obj, "dict"):
-            return obj.dict()
+        # pydantic v2
+        if hasattr(obj, "model_dump") and callable(getattr(obj, "model_dump")):
+            return obj.model_dump(mode="python")  # type: ignore
+        # pydantic v1
+        if hasattr(obj, "dict") and callable(getattr(obj, "dict")):
+            return obj.dict()  # type: ignore
+        # dataclass
         if is_dataclass(obj):
-            # dataclass: best-effort
             try:
                 return {k: getattr(obj, k) for k in obj.__dict__.keys() if not str(k).startswith("_")}
             except Exception:
-                pass
+                return {}
+        # plain object
+        if hasattr(obj, "__dict__"):
+            try:
+                return dict(obj.__dict__)
+            except Exception:
+                return {}
     except Exception:
         return {}
     return {}
@@ -130,10 +162,55 @@ def _get_bool(body: Dict[str, Any], key: str, default: bool) -> bool:
     if isinstance(v, bool):
         return v
     if isinstance(v, (int, float)):
-        return bool(int(v))
+        try:
+            return bool(int(v))
+        except Exception:
+            return default
     if isinstance(v, str):
         return v.strip().lower() in {"1", "true", "yes", "y", "on"}
     return default
+
+
+def _allow_query_token(settings: Any, request: Request) -> bool:
+    # Settings-first
+    try:
+        if settings is not None:
+            return bool(getattr(settings, "allow_query_token", False))
+    except Exception:
+        pass
+    # Env fallback
+    v = (os.getenv("ALLOW_QUERY_TOKEN", "") or "").strip().lower()
+    if v in {"1", "true", "yes", "y", "on"}:
+        return True
+    # Header override (optional; kept for debugging only)
+    try:
+        hv = _strip(request.headers.get("X-Allow-Query-Token"))
+        if hv.lower() in {"1", "true", "yes"}:
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def _extract_auth_token(
+    *,
+    token_query: Optional[str],
+    x_app_token: Optional[str],
+    authorization: Optional[str],
+    settings: Any,
+    request: Request,
+) -> str:
+    # Header token
+    auth_token = _strip(x_app_token)
+    # Bearer token
+    if authorization and authorization.strip().lower().startswith("bearer "):
+        auth_token = authorization.strip().split(" ", 1)[1].strip()
+
+    # Query token only if allowed
+    if token_query and not auth_token and _allow_query_token(settings, request):
+        auth_token = _strip(token_query)
+
+    return auth_token
 
 
 # -----------------------------------------------------------------------------
@@ -142,27 +219,31 @@ def _get_bool(body: Dict[str, Any], key: str, default: bool) -> bool:
 _CANONICAL_ALIASES: Dict[str, Tuple[str, ...]] = {
     # identity
     "symbol": ("symbol", "ticker", "requested_symbol", "requestedsymbol"),
-    "name": ("name", "company_name", "company", "short_name"),
-    "asset_class": ("asset_class", "type", "instrument_type"),
-    "exchange": ("exchange",),
+    "name": ("name", "company_name", "company", "short_name", "shortname", "longname"),
+    "asset_class": ("asset_class", "type", "instrument_type", "assettype"),
+    "exchange": ("exchange", "full_exchange", "fullExchangeName"),
     "currency": ("currency",),
+
     # prices
-    "current_price": ("current_price", "price", "last_price", "last"),
-    "previous_close": ("previous_close", "prev_close"),
-    "open_price": ("open_price", "open"),
-    "day_high": ("day_high", "high"),
-    "day_low": ("day_low", "low"),
-    "week_52_high": ("week_52_high", "52w_high", "high_52w", "high52w"),
-    "week_52_low": ("week_52_low", "52w_low", "low_52w", "low52w"),
+    "current_price": ("current_price", "price", "last_price", "last", "regularMarketPrice"),
+    "previous_close": ("previous_close", "prev_close", "regularMarketPreviousClose"),
+    "open_price": ("open_price", "open", "regularMarketOpen"),
+    "day_high": ("day_high", "high", "dayHigh"),
+    "day_low": ("day_low", "low", "dayLow"),
+    "week_52_high": ("week_52_high", "52w_high", "high_52w", "high52w", "fiftyTwoWeekHigh"),
+    "week_52_low": ("week_52_low", "52w_low", "low_52w", "low52w", "fiftyTwoWeekLow"),
     "price_change": ("price_change", "change"),
     "percent_change": ("percent_change", "change_pct", "change_percent"),
-    # volume
-    "volume": ("volume",),
-    "market_cap": ("market_cap", "marketcap"),
+
+    # volume / cap
+    "volume": ("volume", "regularMarketVolume"),
+    "market_cap": ("market_cap", "marketcap", "marketCap"),
+
     # technicals / risk
     "rsi_14": ("rsi_14", "rsi14", "rsi_14d", "rsi"),
     "volatility_30d": ("volatility_30d", "vol_30d", "volatility"),
     "risk_score": ("risk_score",),
+
     # forecasts / ROI
     "forecast_price_1m": ("forecast_price_1m",),
     "forecast_price_3m": ("forecast_price_3m",),
@@ -171,16 +252,18 @@ _CANONICAL_ALIASES: Dict[str, Tuple[str, ...]] = {
     "expected_roi_3m": ("expected_roi_3m", "expected_return_3m"),
     "expected_roi_12m": ("expected_roi_12m", "expected_return_12m"),
     "forecast_confidence": ("forecast_confidence", "ai_confidence"),
+
     # scoring
     "overall_score": ("overall_score",),
     "confidence_score": ("confidence_score",),
     "recommendation": ("recommendation", "rec"),
     "recommendation_reason": ("recommendation_reason", "reason"),
+
     # meta
     "last_updated_utc": ("last_updated_utc",),
     "last_updated_riyadh": ("last_updated_riyadh",),
-    "warnings": ("warnings",),
-    "data_provider": ("data_provider", "provider"),
+    "warnings": ("warnings", "warning", "warning_message"),
+    "data_provider": ("data_provider", "provider", "data_source"),
     "error": ("error", "error_message", "errormessage"),
 }
 
@@ -192,6 +275,7 @@ def normalize_row_to_schema(schema_keys: Sequence[str], raw: Dict[str, Any], *, 
     out: Dict[str, Any] = {}
     for k in schema_keys:
         v = None
+
         if k in raw:
             v = raw.get(k)
         elif k.lower() in raw_lc:
@@ -202,14 +286,17 @@ def normalize_row_to_schema(schema_keys: Sequence[str], raw: Dict[str, Any], *, 
                 if a in raw:
                     v = raw.get(a)
                     break
-                if a.lower() in raw_lc:
-                    v = raw_lc.get(a.lower())
+                al = a.lower()
+                if al in raw_lc:
+                    v = raw_lc.get(al)
                     break
+
         out[k] = v
 
     # Guarantee symbol
     if "symbol" in out and not out.get("symbol"):
         out["symbol"] = symbol_fallback
+
     return out
 
 
@@ -217,7 +304,7 @@ def normalize_row_to_schema(schema_keys: Sequence[str], raw: Dict[str, Any], *, 
 # Engine accessor (lazy)
 # -----------------------------------------------------------------------------
 async def _get_engine(request: Request) -> Optional[Any]:
-    # prefer app.state.engine
+    # Prefer app.state.engine
     try:
         st = getattr(request.app, "state", None)
         if st and getattr(st, "engine", None):
@@ -225,7 +312,7 @@ async def _get_engine(request: Request) -> Optional[Any]:
     except Exception:
         pass
 
-    # fallback to core.data_engine_v2.get_engine()
+    # Fallback to core.data_engine_v2.get_engine()
     try:
         from core.data_engine_v2 import get_engine  # type: ignore
 
@@ -237,44 +324,71 @@ async def _get_engine(request: Request) -> Optional[Any]:
 
 
 async def _call_engine(fn: Any, *args: Any, **kwargs: Any) -> Any:
-    try:
-        res = fn(*args, **kwargs)
-        return await _maybe_await(res)
-    except Exception:
-        raise
+    res = fn(*args, **kwargs)
+    return await _maybe_await(res)
+
+
+def _dict_is_symbol_map(d: Dict[str, Any], symbols: List[str]) -> bool:
+    """
+    Detect whether a dict is probably {symbol: row} rather than an envelope like:
+      {"status": "...", "headers": [...], "rows": [...]}
+    """
+    if not isinstance(d, dict) or not symbols:
+        return False
+
+    # If it looks like an envelope, it's not a symbol map.
+    envelope_keys = {"status", "headers", "keys", "rows", "data", "items", "meta", "error", "request_id"}
+    if any(k in d for k in envelope_keys):
+        # It can still be a symbol map, but only if it strongly matches symbols.
+        pass
+
+    symset = set(symbols)
+    keys = [k for k in d.keys() if isinstance(k, str)]
+    if not keys:
+        return False
+
+    hit = sum(1 for k in keys if k in symset)
+    if hit == len(symset) and len(symset) > 0:
+        return True
+
+    # Heuristic: enough symbol hits and not mainly envelope keys
+    if hit >= max(1, min(3, len(symset) // 3)):
+        return True
+
+    return False
 
 
 async def _fetch_quotes(engine: Any, symbols: List[str], mode: str = "") -> Dict[str, Any]:
     """
     Best-effort enriched quote fetcher.
-    Returns: {symbol: row_obj_or_dict}
+    Returns: {requested_symbol: row_obj_or_dict}
     """
     if not symbols:
         return {}
 
-    # batch methods first (async or sync)
-    candidates = (
-        "get_enriched_quotes_batch",
-        "get_enriched_quotes",
-        "get_quotes_batch",
-        "quotes_batch",
-    )
+    # Best batch candidate (DataEngineV5)
+    for method in ("get_enriched_quotes_batch",):
+        fn = getattr(engine, method, None)
+        if callable(fn):
+            try:
+                res = await _call_engine(fn, symbols, mode=mode) if mode else await _call_engine(fn, symbols)
+                if isinstance(res, dict) and _dict_is_symbol_map(res, symbols):
+                    return res
+            except Exception:
+                pass
+
+    # Other batch candidates
+    candidates = ("get_enriched_quotes", "get_quotes_batch", "quotes_batch")
     for method in candidates:
         fn = getattr(engine, method, None)
         if callable(fn):
             try:
-                if mode:
-                    res = await _call_engine(fn, symbols, mode=mode)
-                else:
-                    res = await _call_engine(fn, symbols)
-
-                # common shapes
+                res = await _call_engine(fn, symbols, mode=mode) if mode else await _call_engine(fn, symbols)
                 if isinstance(res, dict):
-                    # could be {symbol: row} OR {"rows": ..., "data": ...}
-                    if all(isinstance(k, str) for k in res.keys()):
+                    if _dict_is_symbol_map(res, symbols):
                         return res
                     data = res.get("data") or res.get("rows") or res.get("items")
-                    if isinstance(data, dict):
+                    if isinstance(data, dict) and _dict_is_symbol_map(data, symbols):
                         return data
                     if isinstance(data, list):
                         return {s: r for s, r in zip(symbols, data)}
@@ -283,21 +397,24 @@ async def _fetch_quotes(engine: Any, symbols: List[str], mode: str = "") -> Dict
             except Exception:
                 pass
 
-    # per-symbol fallback
+    # Per-symbol fallback (prefer dict-returning method if available)
     out: Dict[str, Any] = {}
+    per_dict_fn = getattr(engine, "get_enriched_quote_dict", None)
     per_fn = getattr(engine, "get_enriched_quote", None) or getattr(engine, "get_quote", None)
+
     for s in symbols:
-        if callable(per_fn):
-            try:
-                if mode:
-                    r = await _call_engine(per_fn, s, mode=mode)
-                else:
-                    r = await _call_engine(per_fn, s)
+        try:
+            if callable(per_dict_fn):
+                r = await _call_engine(per_dict_fn, s, mode=mode) if mode else await _call_engine(per_dict_fn, s)
                 out[s] = r
-            except Exception as e:
-                out[s] = {"symbol": s, "error": str(e)}
-        else:
-            out[s] = {"symbol": s, "error": "engine_missing_get_enriched_quote"}
+            elif callable(per_fn):
+                r = await _call_engine(per_fn, s, mode=mode) if mode else await _call_engine(per_fn, s)
+                out[s] = r
+            else:
+                out[s] = {"symbol": s, "error": "engine_missing_get_enriched_quote"}
+        except Exception as e:
+            out[s] = {"symbol": s, "error": str(e)}
+
     return out
 
 
@@ -317,26 +434,32 @@ async def advanced_sheet_rows(
     start = time.time()
     request_id = x_request_id or str(uuid.uuid4())
 
-    # --- auth ---
-    auth_token = _strip(x_app_token)
-    if authorization and authorization.strip().lower().startswith("bearer "):
-        auth_token = authorization.strip().split(" ", 1)[1].strip()
+    # --- schema registry availability ---
+    if get_sheet_spec is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={
+                "error": "Schema registry unavailable",
+                "module": "routes.advanced_sheet_rows",
+                "schema_import_error": _SCHEMA_IMPORT_ERROR,
+            },
+        )
 
-    # query token only if explicitly allowed (settings or env)
-    if token and not auth_token:
-        allow_query = False
-        try:
-            settings = get_settings_cached()
-            allow_query = bool(getattr(settings, "allow_query_token", False))
-        except Exception:
-            allow_query = False
-        if not allow_query:
-            # env fallback
-            allow_query = (_strip(request.headers.get("X-Allow-Query-Token")) or "").lower() in {"1", "true", "yes"} or (
-                (_strip(__import__("os").getenv("ALLOW_QUERY_TOKEN", "")) or "").lower() in {"1", "true", "yes"}
-            )
-        if allow_query:
-            auth_token = _strip(token)
+    # --- settings (optional) ---
+    settings = None
+    try:
+        settings = get_settings_cached()
+    except Exception:
+        settings = None
+
+    # --- auth ---
+    auth_token = _extract_auth_token(
+        token_query=token,
+        x_app_token=x_app_token,
+        authorization=authorization,
+        settings=settings,
+        request=request,
+    )
 
     if auth_ok is not None:
         if not auth_ok(
@@ -353,25 +476,42 @@ async def advanced_sheet_rows(
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"error": f"Invalid page: {str(e)}", "allowed_pages": list(CANONICAL_PAGES)},
+            detail={"error": f"Invalid page: {str(e)}", "allowed_pages": list(CANONICAL_PAGES) if CANONICAL_PAGES else None},
         )
 
-    if page in set(FORBIDDEN_PAGES or set()):
+    forbidden = set(FORBIDDEN_PAGES or set())
+    if page in forbidden:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"error": f"Forbidden/removed page: {page}", "forbidden_pages": list(FORBIDDEN_PAGES)},
+            detail={"error": f"Forbidden/removed page: {page}", "forbidden_pages": sorted(list(forbidden))},
         )
 
     symbols = _get_list(body, "symbols", "tickers")
-    top_n = _get_int(body, "top_n", 50)
-    top_n = max(1, min(2000, int(top_n)))
+    top_n = max(1, min(2000, int(_get_int(body, "top_n", 50))))
     symbols = symbols[:top_n]
     include_matrix = _get_bool(body, "include_matrix", True)
 
     # --- schema ---
-    spec = get_sheet_spec("Data_Dictionary" if page == "Data_Dictionary" else page)
-    headers = [c.header for c in spec.columns]
-    keys = [c.key for c in spec.columns]
+    try:
+        spec = get_sheet_spec("Data_Dictionary" if page == "Data_Dictionary" else page)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "error": f"Unknown page schema: {page}",
+                "detail": str(e),
+                "allowed_pages": list(CANONICAL_PAGES) if CANONICAL_PAGES else None,
+            },
+        )
+
+    headers = [c.header for c in getattr(spec, "columns", [])]
+    keys = [c.key for c in getattr(spec, "columns", [])]
+
+    if not headers or not keys:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail={"error": f"Schema for page '{page}' is empty", "page": page},
+        )
 
     # Always return FULL schema headers/keys even if no symbols
     if page != "Data_Dictionary" and not symbols:
@@ -385,7 +525,7 @@ async def advanced_sheet_rows(
             "version": ADVANCED_SHEET_ROWS_VERSION,
             "request_id": request_id,
             "meta": {
-                "duration_ms": (time.time() - start) * 1000,
+                "duration_ms": (time.time() - start) * 1000.0,
                 "requested": 0,
                 "errors": 0,
                 "mode": mode,
@@ -394,8 +534,15 @@ async def advanced_sheet_rows(
 
     # --- Data_Dictionary is computed locally ---
     if page == "Data_Dictionary":
+        if build_data_dictionary_rows is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"error": "Data_Dictionary builder unavailable"},
+            )
+
         rows_dict = build_data_dictionary_rows(include_meta_sheet=True)
         rows_norm = [normalize_row_to_schema(keys, r, symbol_fallback="") for r in (rows_dict or [])]
+
         return {
             "status": "success",
             "page": page,
@@ -406,7 +553,7 @@ async def advanced_sheet_rows(
             "version": ADVANCED_SHEET_ROWS_VERSION,
             "request_id": request_id,
             "meta": {
-                "duration_ms": (time.time() - start) * 1000,
+                "duration_ms": (time.time() - start) * 1000.0,
                 "count": len(rows_norm),
                 "schema_mode": "data_dictionary",
             },
@@ -442,7 +589,7 @@ async def advanced_sheet_rows(
         "version": ADVANCED_SHEET_ROWS_VERSION,
         "request_id": request_id,
         "meta": {
-            "duration_ms": (time.time() - start) * 1000,
+            "duration_ms": (time.time() - start) * 1000.0,
             "requested": len(symbols),
             "errors": errors,
             "mode": mode,
@@ -450,4 +597,4 @@ async def advanced_sheet_rows(
     }
 
 
-__all__ = ["router"]
+__all__ = ["router", "ADVANCED_SHEET_ROWS_VERSION"]
