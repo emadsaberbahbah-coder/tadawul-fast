@@ -2,35 +2,33 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.7.0 (PHASE 5 SCHEMA-ALIGNED+)
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.8.0 (PHASE D — ADVANCED FIELDS)
 ================================================================================
 
-WHY v5.7.0 (alignment + hardening)
-- ✅ FIX (CRITICAL): Engine sheet-rows now has an explicit SPECIAL DISPATCH map so
-  Insights_Analysis / Top_10_Investments / Data_Dictionary NEVER fall back to the
-  DEFAULT 80-col instrument schema.
-- ✅ Schema-first contract is enforced:
-    - headers == schema headers (correct count + correct order)
-    - keys    == schema keys    (correct count + correct order)
-    - rows    are normalized + projected to schema keys (missing=None)
-- ✅ Special sheets:
-    - Data_Dictionary:
-        - prefers core.sheets.data_dictionary.build_data_dictionary_rows(include_meta_sheet=True)
-        - otherwise falls back to internal schema-derived generator (deterministic)
-    - Insights_Analysis:
-        - prefers core.analysis.insights_builder.* builder functions (best-effort signatures)
-        - normalizes output (keys OR headers) to schema keys
-    - Top_10_Investments:
-        - prefers core.analysis.top10_builder (and common variants)
-        - normalizes output (keys OR headers) to schema keys
-        - if missing, falls back to delegated builder module; else schema-only empty rows
-- ✅ Startup-safe: no network IO at import-time; all heavy imports are lazy inside calls.
-- ✅ Keeps your existing provider orchestration, caching, scoring, forecasting logic.
+WHY v5.8.0 (Phase D: eliminate missing advanced fields across Global + KSA)
 
-STRICTNESS (prevents silent fallback)
-- Env: SCHEMA_STRICT_SHEET_ROWS (default true)
-  If true and a requested sheet is not in schema_registry, we return a structured error
-  (instead of silently using the union/DEFAULT schema).
+This revision makes the engine the *actual* source of truth for advanced fields:
+- ✅ Risk stats computed from history (when not provided):
+    volatility_90d, max_drawdown_1y, var_95_1d, sharpe_1y
+- ✅ Valuation fields mapped + (best-effort) computed:
+    pb_ratio, ps_ratio, peg_ratio, intrinsic_value, valuation_score
+- ✅ Score fields + buckets ensured (even if upstream providers are partial):
+    value_score, quality_score, momentum_score, growth_score,
+    overall_score, opportunity_score, rank_overall,
+    confidence_bucket, risk_bucket
+- ✅ KSA classification guaranteed baseline:
+    country, sector, industry (country forced to SAU for KSA symbols)
+
+Provider routing constraint (your rule):
+- ✅ GLOBAL: EODHD is primary (subscription) + Yahoo/Finnhub as fallback
+- ✅ KSA: Tadawul (price) + Argaam (classification/profile enrichment) + Yahoo chart (history/risk)
+
+Other hardening kept:
+- ✅ SPECIAL DISPATCH map in sheet-rows so Insights_Analysis / Top_10_Investments / Data_Dictionary
+  never fall back to the 80-col instrument schema.
+- ✅ Schema-first enforcement for headers/keys/rows.
+- ✅ Startup-safe: no network IO at import time; heavy imports are lazy inside calls.
+- ✅ JSON-safe + best-effort compatibility with multiple repo variants.
 
 ================================================================================
 """
@@ -43,6 +41,7 @@ import logging
 import math
 import os
 import pickle
+import re
 import sys
 import time
 import zlib
@@ -61,7 +60,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.7.0"
+__version__ = "5.8.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -119,6 +118,9 @@ DEFAULT_ENGINE_KEYS: List[str] = [
     "exchange",
     "currency",
     "asset_class",
+    "country",
+    "sector",
+    "industry",
     # prices / liquidity
     "current_price",
     "price",  # alias
@@ -129,16 +131,45 @@ DEFAULT_ENGINE_KEYS: List[str] = [
     "week_52_high",
     "week_52_low",
     "volume",
+    "avg_volume_10d",
+    "avg_volume_30d",
     "market_cap",
+    "float_shares",
+    "beta_5y",
     "price_change",
     "percent_change",
-    "change",  # alias
+    "week_52_position_pct",
+    "change",      # alias
     "change_pct",  # alias
-    # fundamentals / technicals
+    # fundamentals
     "pe_ttm",
+    "pe_forward",
+    "eps_ttm",
     "dividend_yield",
+    "payout_ratio",
+    "revenue_ttm",
+    "revenue_growth_yoy",
+    "gross_margin",
+    "operating_margin",
+    "profit_margin",
+    "debt_to_equity",
+    "free_cash_flow_ttm",
+    # risk stats
     "rsi_14",
     "volatility_30d",
+    "volatility_90d",
+    "max_drawdown_1y",
+    "var_95_1d",
+    "sharpe_1y",
+    "risk_score",
+    "risk_bucket",
+    # valuation
+    "pb_ratio",
+    "ps_ratio",
+    "ev_ebitda",
+    "peg_ratio",
+    "intrinsic_value",
+    "valuation_score",
     # forecast / roi
     "forecast_price_1m",
     "forecast_price_3m",
@@ -147,18 +178,34 @@ DEFAULT_ENGINE_KEYS: List[str] = [
     "expected_roi_3m",
     "expected_roi_12m",
     "forecast_confidence",
-    # scores
-    "risk_score",
-    "overall_score",
-    "valuation_score",
-    "momentum_score",
     "confidence_score",
+    "confidence_bucket",
+    # scores
+    "value_score",
+    "quality_score",
+    "momentum_score",
+    "growth_score",
+    "overall_score",
+    "opportunity_score",
+    "rank_overall",
+    # recommendation
     "recommendation",
     "recommendation_reason",
+    "horizon_days",
+    "invest_period_label",
+    # portfolio
+    "position_qty",
+    "avg_cost",
+    "position_cost",
+    "position_value",
+    "unrealized_pl",
+    "unrealized_pl_pct",
     # meta / provenance
+    "data_provider",
     "data_quality",
     "error",
     "warning",
+    "warnings",
     "info",
     "data_sources",
     "provider_latency",
@@ -173,7 +220,6 @@ def _build_union_schema_keys() -> List[str]:
     Also appends DEFAULT_ENGINE_KEYS as a safety net.
 
     NOTE: This is ONLY a fallback for non-schema scenarios.
-    Sheet-rows MUST NOT silently collapse to this when schema exists.
     """
     keys: List[str] = []
     seen = set()
@@ -185,7 +231,7 @@ def _build_union_schema_keys() -> List[str]:
                 k = getattr(c, "key", None)
                 if not k:
                     continue
-                k = str(k)
+                k = str(k).strip()
                 if k and k not in seen:
                     seen.add(k)
                     keys.append(k)
@@ -221,19 +267,18 @@ def normalize_row_to_schema(schema: Any, rowdict: Dict[str, Any], *, keep_extras
     elif isinstance(schema, str):
         try:
             spec = get_sheet_spec(schema)
-            keys = [str(getattr(c, "key", "")) for c in (getattr(spec, "columns", None) or [])]
+            keys = [str(getattr(c, "key", "")).strip() for c in (getattr(spec, "columns", None) or [])]
             keys = [k for k in keys if k]
         except Exception:
             keys = list(_SCHEMA_UNION_KEYS)
 
     elif isinstance(schema, (list, tuple)):
-        keys = [str(k) for k in schema if str(k).strip()]
+        keys = [str(k).strip() for k in schema if str(k).strip()]
 
     else:
         cols = getattr(schema, "columns", None)
         if cols:
-            keys = [getattr(c, "key", None) for c in cols]
-            keys = [str(k) for k in keys if k]
+            keys = [str(getattr(c, "key", "")).strip() for c in cols if str(getattr(c, "key", "")).strip()]
         else:
             keys = list(_SCHEMA_UNION_KEYS)
 
@@ -278,7 +323,7 @@ def _model_to_dict(obj: Any) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# UnifiedQuote import (fallback is expanded for Phase 4 keys)
+# UnifiedQuote import (fallback includes Phase D fields)
 # ---------------------------------------------------------------------------
 try:
     from core.schemas import UnifiedQuote  # type: ignore
@@ -303,6 +348,9 @@ except Exception:
         exchange: Optional[str] = None
         currency: Optional[str] = None
         asset_class: Optional[str] = None
+        country: Optional[str] = None
+        sector: Optional[str] = None
+        industry: Optional[str] = None
 
         # price/liquidity
         current_price: Optional[float] = None
@@ -314,17 +362,48 @@ except Exception:
         week_52_high: Optional[float] = None
         week_52_low: Optional[float] = None
         volume: Optional[float] = None
+        avg_volume_10d: Optional[float] = None
+        avg_volume_30d: Optional[float] = None
         market_cap: Optional[float] = None
+        float_shares: Optional[float] = None
+        beta_5y: Optional[float] = None
         price_change: Optional[float] = None
         percent_change: Optional[float] = None
+        week_52_position_pct: Optional[float] = None
         change: Optional[float] = None
         change_pct: Optional[float] = None
 
-        # fundamentals/technicals
+        # fundamentals
         pe_ttm: Optional[float] = None
+        pe_forward: Optional[float] = None
+        eps_ttm: Optional[float] = None
         dividend_yield: Optional[float] = None
+        payout_ratio: Optional[float] = None
+        revenue_ttm: Optional[float] = None
+        revenue_growth_yoy: Optional[float] = None
+        gross_margin: Optional[float] = None
+        operating_margin: Optional[float] = None
+        profit_margin: Optional[float] = None
+        debt_to_equity: Optional[float] = None
+        free_cash_flow_ttm: Optional[float] = None
+
+        # risk stats
         rsi_14: Optional[float] = None
         volatility_30d: Optional[float] = None
+        volatility_90d: Optional[float] = None
+        max_drawdown_1y: Optional[float] = None
+        var_95_1d: Optional[float] = None
+        sharpe_1y: Optional[float] = None
+        risk_score: Optional[float] = None
+        risk_bucket: Optional[str] = None
+
+        # valuation
+        pb_ratio: Optional[float] = None
+        ps_ratio: Optional[float] = None
+        ev_ebitda: Optional[float] = None
+        peg_ratio: Optional[float] = None
+        intrinsic_value: Optional[float] = None
+        valuation_score: Optional[float] = None
 
         # forecast/roi
         forecast_price_1m: Optional[float] = None
@@ -334,22 +413,39 @@ except Exception:
         expected_roi_3m: Optional[float] = None
         expected_roi_12m: Optional[float] = None
         forecast_confidence: Optional[float] = None
+        confidence_score: Optional[float] = None
+        confidence_bucket: Optional[str] = None
 
         # scores
-        risk_score: Optional[float] = None
-        overall_score: Optional[float] = None
-        valuation_score: Optional[float] = None
+        value_score: Optional[float] = None
+        quality_score: Optional[float] = None
         momentum_score: Optional[float] = None
-        confidence_score: Optional[float] = None
+        growth_score: Optional[float] = None
+        overall_score: Optional[float] = None
+        opportunity_score: Optional[float] = None
+        rank_overall: Optional[int] = None
+
+        # recommendation
         recommendation: Optional[str] = None
         recommendation_reason: Optional[str] = None
+        horizon_days: Optional[int] = None
+        invest_period_label: Optional[str] = None
+
+        # portfolio
+        position_qty: Optional[float] = None
+        avg_cost: Optional[float] = None
+        position_cost: Optional[float] = None
+        position_value: Optional[float] = None
+        unrealized_pl: Optional[float] = None
+        unrealized_pl_pct: Optional[float] = None
 
         # meta
+        data_provider: Optional[str] = None
         data_quality: str = "MISSING"
         error: Optional[str] = None
         warning: Optional[str] = None
+        warnings: Optional[str] = None
         info: Optional[Any] = None
-        latency_ms: Optional[float] = None
         data_sources: Optional[List[str]] = None
         provider_latency: Optional[Dict[str, float]] = None
         last_updated_utc: Optional[str] = None
@@ -499,12 +595,15 @@ def _feature_flags(settings: Any) -> Dict[str, bool]:
                 return default
         return _get_env_bool(env, default)
 
+    # Phase D: risk stats + scoring must be on by default
     return {
         "computations_enabled": _get("computations_enabled", "COMPUTATIONS_ENABLED", True),
         "fundamentals_enabled": _get("fundamentals_enabled", "FUNDAMENTALS_ENABLED", True),
         "technicals_enabled": _get("technicals_enabled", "TECHNICALS_ENABLED", True),
         "forecasting_enabled": _get("forecasting_enabled", "FORECASTING_ENABLED", True),
         "scoring_enabled": _get("scoring_enabled", "SCORING_ENABLED", True),
+        "risk_stats_enabled": _get("risk_stats_enabled", "RISK_STATS_ENABLED", True),
+        "valuation_enabled": _get("valuation_enabled", "VALUATION_ENABLED", True),
     }
 
 
@@ -520,9 +619,9 @@ def _now_riyadh_iso() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Patch helpers
+# Numeric helpers for pct fields (store as fraction whenever possible)
 # ---------------------------------------------------------------------------
-def _safe_float(x: Any) -> Optional[float]:
+def _as_float(x: Any) -> Optional[float]:
     if x is None:
         return None
     try:
@@ -534,12 +633,51 @@ def _safe_float(x: Any) -> Optional[float]:
         return None
 
 
+def _as_pct_fraction(x: Any) -> Optional[float]:
+    """
+    Normalize percent-like inputs to FRACTION (0.12 == 12%).
+    Accepts:
+      12.0    -> 0.12
+      "12%"   -> 0.12
+      0.12    -> 0.12
+      "0.12"  -> 0.12
+    """
+    if x is None:
+        return None
+    if isinstance(x, str):
+        s = x.strip()
+        if not s:
+            return None
+        if s.endswith("%"):
+            v = _as_float(s[:-1].strip())
+            return (v / 100.0) if v is not None else None
+        v = _as_float(s.replace(",", ""))
+        if v is None:
+            return None
+        # heuristic: values > 1.5 are likely percent
+        return (v / 100.0) if abs(v) > 1.5 else v
+
+    v = _as_float(x)
+    if v is None:
+        return None
+    return (v / 100.0) if abs(v) > 1.5 else v
+
+
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, x))
+
+
+# ---------------------------------------------------------------------------
+# Patch helpers + key aliasing (Phase D extended)
+# ---------------------------------------------------------------------------
 def _clean_patch(patch: Dict[str, Any]) -> Dict[str, Any]:
     return {k: v for k, v in (patch or {}).items() if v is not None and v != ""}
 
 
 _PATCH_ALIASES: Dict[str, str] = {
+    # price
     "last_price": "current_price",
+    "last": "current_price",
     "price": "current_price",
     "prev_close": "previous_close",
     "close": "previous_close",
@@ -556,6 +694,60 @@ _PATCH_ALIASES: Dict[str, str] = {
     "percent_change": "percent_change",
     "change_percent": "percent_change",
     "change_pct": "percent_change",
+
+    # identity/classification
+    "company_name": "name",
+    "long_name": "name",
+    "instrument_name": "name",
+    "mic": "exchange",
+    "market": "exchange",
+    "ccy": "currency",
+    "country_name": "country",
+    "sector_name": "sector",
+    "industry_name": "industry",
+    "gics_sector": "sector",
+    "gics_industry": "industry",
+
+    # valuation ratios
+    "pb": "pb_ratio",
+    "p_b": "pb_ratio",
+    "price_to_book": "pb_ratio",
+    "price_to_book_ratio": "pb_ratio",
+    "ps": "ps_ratio",
+    "p_s": "ps_ratio",
+    "price_to_sales": "ps_ratio",
+    "price_to_sales_ratio": "ps_ratio",
+    "peg": "peg_ratio",
+    "peg": "peg_ratio",
+    "peg_ratio": "peg_ratio",
+    "intrinsic": "intrinsic_value",
+    "intrinsic_val": "intrinsic_value",
+    "intrinsic_price": "intrinsic_value",
+    "ev_to_ebitda": "ev_ebitda",
+
+    # margins/growth
+    "rev_ttm": "revenue_ttm",
+    "revenue": "revenue_ttm",
+    "revenue_growth": "revenue_growth_yoy",
+    "revenue_growth_pct": "revenue_growth_yoy",
+    "gross_margin_pct": "gross_margin",
+    "operating_margin_pct": "operating_margin",
+    "profit_margin_pct": "profit_margin",
+
+    # risk fields
+    "volatility90d": "volatility_90d",
+    "volatility_90": "volatility_90d",
+    "max_drawdown": "max_drawdown_1y",
+    "drawdown_1y": "max_drawdown_1y",
+    "var95_1d": "var_95_1d",
+    "sharpe": "sharpe_1y",
+    "sharpe_ratio": "sharpe_1y",
+
+    # scores/buckets
+    "conf_score": "confidence_score",
+    "confidence": "forecast_confidence",
+    "confidence_bucket": "confidence_bucket",
+    "risk_bucket": "risk_bucket",
 }
 
 
@@ -568,6 +760,7 @@ def _normalize_patch_keys(patch: Dict[str, Any]) -> Dict[str, Any]:
         if src in out and (dst not in out or out.get(dst) in (None, "")):
             out[dst] = out.get(src)
 
+    # ensure main aliases are present
     if "current_price" in out and ("price" not in out or out.get("price") in (None, "")):
         out["price"] = out.get("current_price")
     if "price" in out and ("current_price" not in out or out.get("current_price") in (None, "")):
@@ -578,37 +771,66 @@ def _normalize_patch_keys(patch: Dict[str, Any]) -> Dict[str, Any]:
     if "percent_change" in out and ("change_pct" not in out or out.get("change_pct") in (None, "")):
         out["change_pct"] = out.get("percent_change")
 
+    # normalize pct-like fields to fraction where reasonable
+    for k in (
+        "percent_change",
+        "change_pct",
+        "dividend_yield",
+        "payout_ratio",
+        "revenue_growth_yoy",
+        "gross_margin",
+        "operating_margin",
+        "profit_margin",
+        "volatility_30d",
+        "volatility_90d",
+        "max_drawdown_1y",
+        "var_95_1d",
+        "expected_roi_1m",
+        "expected_roi_3m",
+        "expected_roi_12m",
+    ):
+        if k in out and out.get(k) is not None:
+            pv = _as_pct_fraction(out.get(k))
+            if pv is not None:
+                out[k] = pv
+
+    # confidence normalization
+    for k in ("forecast_confidence", "confidence_score"):
+        if k in out and out.get(k) is not None:
+            v = _as_float(out.get(k))
+            if v is not None:
+                out[k] = (v / 100.0) if v > 1.5 else v
+
     return out
 
 
 def _is_useful_patch(p: Dict[str, Any]) -> bool:
     if not isinstance(p, dict) or not p:
         return False
-    if _safe_float(p.get("current_price")) is not None:
-        return True
-    if _safe_float(p.get("price")) is not None:
+    if _as_float(p.get("current_price")) is not None:
         return True
     if (str(p.get("name") or "")).strip():
         return True
-    if (str(p.get("currency") or "")).strip():
+    # classification can also be useful for KSA completeness
+    if (str(p.get("sector") or "")).strip() or (str(p.get("industry") or "")).strip():
         return True
     return False
 
 
 # ============================================================================
-# Provider configuration
+# Provider configuration (GLOBAL-first + KSA constraints)
 # ============================================================================
 DEFAULT_PROVIDERS = "tadawul,argaam,yahoo_chart,yahoo_fundamentals,finnhub,eodhd"
-DEFAULT_KSA_PROVIDERS = "tadawul,argaam,yahoo_chart"
-DEFAULT_GLOBAL_PROVIDERS = "eodhd,yahoo_chart,yahoo_fundamentals,finnhub"  # GLOBAL-FIRST
+DEFAULT_KSA_PROVIDERS = "tadawul,argaam,yahoo_chart"  # KSA: Tadawul + Argaam + Yahoo history
+DEFAULT_GLOBAL_PROVIDERS = "eodhd,yahoo_fundamentals,yahoo_chart,finnhub"  # GLOBAL: EODHD primary
 
 PROVIDER_PRIORITIES = {
-    "tadawul": 10,
-    "argaam": 20,
-    "yahoo_chart": 30,
-    "yahoo_fundamentals": 35,
-    "finnhub": 50,
-    "eodhd": 60,
+    "eodhd": 10,
+    "tadawul": 20,
+    "argaam": 30,
+    "yahoo_fundamentals": 40,
+    "yahoo_chart": 50,
+    "finnhub": 60,
 }
 
 PROVIDER_MODULE_CANDIDATES: Dict[str, List[str]] = {
@@ -627,6 +849,15 @@ PROVIDER_FUNCTIONS: Dict[str, List[str]] = {
     "yahoo_fundamentals": ["fetch_fundamentals_patch", "fetch_enriched_quote_patch", "fetch_patch"],
     "finnhub": ["fetch_enriched_quote_patch", "fetch_quote_patch", "fetch_patch"],
     "eodhd": ["fetch_enriched_quote_patch", "fetch_quote_patch", "fetch_patch"],
+}
+
+# For risk stats (history). We do best-effort function probing.
+HISTORY_FUNCTIONS: Dict[str, List[str]] = {
+    "eodhd": ["fetch_history", "fetch_price_history", "fetch_daily_history", "fetch_chart_history", "get_history"],
+    "yahoo_chart": ["fetch_history", "fetch_price_history", "fetch_chart_history", "get_history", "fetch_chart"],
+    "tadawul": ["fetch_history", "fetch_price_history", "fetch_chart_history", "get_history"],
+    "argaam": ["fetch_history", "fetch_price_history", "fetch_chart_history", "get_history"],
+    "finnhub": ["fetch_history", "fetch_price_history", "fetch_daily_history", "get_history"],
 }
 
 
@@ -650,7 +881,7 @@ def _pick_provider_callable(module: Any, provider_name: str) -> Optional[Callabl
 
 async def _call_maybe_async(fn: Callable, *args, **kwargs) -> Any:
     out = fn(*args, **kwargs)
-    if asyncio.iscoroutine(out) or asyncio.isfuture(out):
+    if asyncio.iscoroutine(out) or asyncio.isfuture(out) or hasattr(out, "__await__"):
         return await out
     return out
 
@@ -924,7 +1155,7 @@ def _fn_accepts_settings(fn: Callable) -> bool:
         return False
 
 
-async def _maybe_apply_scoring(row: Dict[str, Any], settings: Any) -> Dict[str, Any]:
+async def _maybe_apply_scoring_module(row: Dict[str, Any], settings: Any) -> Dict[str, Any]:
     mod = await _get_scoring_module()
     if mod is None:
         return row
@@ -934,7 +1165,7 @@ async def _maybe_apply_scoring(row: Dict[str, Any], settings: Any) -> Dict[str, 
         if callable(fn):
             try:
                 r = fn(row, settings=settings) if _fn_accepts_settings(fn) else fn(row)
-                if asyncio.iscoroutine(r) or asyncio.isfuture(r):
+                if asyncio.iscoroutine(r) or asyncio.isfuture(r) or hasattr(r, "__await__"):
                     r = await r
                 if isinstance(r, dict):
                     for k, v in r.items():
@@ -956,7 +1187,7 @@ async def _maybe_apply_forecast(row: Dict[str, Any], settings: Any) -> Dict[str,
         if callable(fn):
             try:
                 r = fn(row, settings=settings) if _fn_accepts_settings(fn) else fn(row)
-                if asyncio.iscoroutine(r) or asyncio.isfuture(r):
+                if asyncio.iscoroutine(r) or asyncio.isfuture(r) or hasattr(r, "__await__"):
                     r = await r
                 if isinstance(r, dict):
                     for k, v in r.items():
@@ -969,18 +1200,526 @@ async def _maybe_apply_forecast(row: Dict[str, Any], settings: Any) -> Dict[str,
 
 
 # ============================================================================
+# Phase D computations (risk stats / valuation / scoring / buckets / recos)
+# ============================================================================
+def _compute_price_derivatives(row: Dict[str, Any]) -> None:
+    cp = _as_float(row.get("current_price"))
+    pc = _as_float(row.get("previous_close"))
+    if cp is not None and pc is not None:
+        if row.get("price_change") is None:
+            row["price_change"] = cp - pc
+        if row.get("percent_change") is None and pc != 0:
+            row["percent_change"] = (cp - pc) / pc
+    # week_52_position_pct
+    hi = _as_float(row.get("week_52_high"))
+    lo = _as_float(row.get("week_52_low"))
+    if cp is not None and hi is not None and lo is not None and hi != lo and row.get("week_52_position_pct") is None:
+        row["week_52_position_pct"] = _clamp((cp - lo) / (hi - lo), 0.0, 1.0)
+
+    # keep aliases
+    if row.get("price") is None and cp is not None:
+        row["price"] = cp
+    if row.get("current_price") is None and row.get("price") is not None:
+        row["current_price"] = row.get("price")
+    if row.get("change") is None and row.get("price_change") is not None:
+        row["change"] = row.get("price_change")
+    if row.get("change_pct") is None and row.get("percent_change") is not None:
+        row["change_pct"] = row.get("percent_change")
+
+
+def _compute_portfolio_derivatives(row: Dict[str, Any]) -> None:
+    qty = _as_float(row.get("position_qty"))
+    avg_cost = _as_float(row.get("avg_cost"))
+    cp = _as_float(row.get("current_price"))
+    if qty is None or avg_cost is None:
+        return
+    cost = qty * avg_cost
+    if row.get("position_cost") is None:
+        row["position_cost"] = cost
+    if cp is not None:
+        val = qty * cp
+        if row.get("position_value") is None:
+            row["position_value"] = val
+        pl = val - cost
+        if row.get("unrealized_pl") is None:
+            row["unrealized_pl"] = pl
+        if row.get("unrealized_pl_pct") is None and cost != 0:
+            row["unrealized_pl_pct"] = pl / cost
+
+
+def _extract_prices_from_history(history: Any) -> List[float]:
+    """
+    Accepts history formats:
+      - list of dicts with close/adj_close/price
+      - list of (date, close) tuples
+      - list of floats
+    Returns list of close prices in chronological order.
+    """
+    if not history or not isinstance(history, list):
+        return []
+    out: List[float] = []
+    for item in history:
+        if isinstance(item, (int, float)) and not isinstance(item, bool):
+            f = _as_float(item)
+            if f is not None:
+                out.append(f)
+            continue
+        if isinstance(item, (list, tuple)) and len(item) >= 2:
+            f = _as_float(item[1])
+            if f is not None:
+                out.append(f)
+            continue
+        if isinstance(item, dict):
+            for k in ("adj_close", "close", "price", "c"):
+                if k in item:
+                    f = _as_float(item.get(k))
+                    if f is not None:
+                        out.append(f)
+                        break
+    return out
+
+
+def _pct_std(xs: List[float]) -> Optional[float]:
+    if len(xs) < 2:
+        return None
+    m = sum(xs) / float(len(xs))
+    var = sum((x - m) ** 2 for x in xs) / float(len(xs) - 1)
+    if var < 0:
+        return None
+    return math.sqrt(var)
+
+
+def _compute_rsi_from_prices(prices: List[float], period: int = 14) -> Optional[float]:
+    if len(prices) < period + 1:
+        return None
+    gains = 0.0
+    losses = 0.0
+    for i in range(1, period + 1):
+        ch = prices[-i] - prices[-i - 1]
+        if ch >= 0:
+            gains += ch
+        else:
+            losses += abs(ch)
+    if losses == 0:
+        return 100.0
+    rs = (gains / period) / (losses / period)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return float(_clamp(rsi, 0.0, 100.0))
+
+
+def _compute_risk_stats_from_prices(prices: List[float]) -> Dict[str, Any]:
+    """
+    Computes:
+      - volatility_30d, volatility_90d (annualized, as fraction)
+      - max_drawdown_1y (fraction, negative or positive? we store as positive drawdown magnitude)
+      - var_95_1d (fraction loss magnitude)
+      - sharpe_1y (float)
+    """
+    if len(prices) < 20:
+        return {}
+
+    # returns (simple)
+    rets: List[float] = []
+    for i in range(1, len(prices)):
+        p0 = prices[i - 1]
+        p1 = prices[i]
+        if p0 and p0 > 0:
+            rets.append((p1 / p0) - 1.0)
+
+    out: Dict[str, Any] = {}
+    if len(rets) >= 30:
+        std30 = _pct_std(rets[-30:])
+        if std30 is not None:
+            out["volatility_30d"] = std30 * math.sqrt(252.0)
+    if len(rets) >= 90:
+        std90 = _pct_std(rets[-90:])
+        if std90 is not None:
+            out["volatility_90d"] = std90 * math.sqrt(252.0)
+
+    # max drawdown over last ~252 trading days
+    window = prices[-252:] if len(prices) >= 252 else prices[:]
+    peak = None
+    max_dd = 0.0
+    for p in window:
+        if peak is None or p > peak:
+            peak = p
+        if peak and peak > 0:
+            dd = (p / peak) - 1.0
+            if dd < max_dd:
+                max_dd = dd
+    # store magnitude as positive fraction (e.g., 0.25 == -25% drawdown)
+    out["max_drawdown_1y"] = abs(max_dd) if max_dd < 0 else 0.0
+
+    # VaR 95% 1D based on historical returns (5th percentile loss magnitude)
+    if len(rets) >= 30:
+        sorted_rets = sorted(rets)
+        idx = max(0, int(0.05 * (len(sorted_rets) - 1)))
+        q05 = sorted_rets[idx]
+        out["var_95_1d"] = abs(q05) if q05 < 0 else 0.0
+
+    # Sharpe 1Y (risk-free ~0)
+    if len(rets) >= 60:
+        m = sum(rets[-252:]) / float(len(rets[-252:])) if len(rets) >= 252 else (sum(rets) / float(len(rets)))
+        s = _pct_std(rets[-252:]) if len(rets) >= 252 else _pct_std(rets)
+        if s is not None and s > 0:
+            out["sharpe_1y"] = (m * 252.0) / (s * math.sqrt(252.0))
+
+    return out
+
+
+def _score_from_risk_stats(row: Dict[str, Any]) -> Optional[float]:
+    """
+    Risk score (0-100): higher means riskier.
+    Uses volatility_90d + max_drawdown_1y + var_95_1d (best-effort).
+    """
+    vol = _as_pct_fraction(row.get("volatility_90d"))
+    dd = _as_pct_fraction(row.get("max_drawdown_1y"))
+    var = _as_pct_fraction(row.get("var_95_1d"))
+
+    # if provider stored as fraction, ok; if stored as percent, normalized above
+    if vol is None and dd is None and var is None:
+        return None
+
+    # normalize each component into 0..100 contribution
+    def to100(x: Optional[float], scale: float) -> float:
+        if x is None:
+            return 0.0
+        return _clamp((x / scale) * 100.0, 0.0, 100.0)
+
+    # vol scale: 60% annualized is "high"
+    a = to100(vol, 0.60)
+    # drawdown scale: 50% is "very high"
+    b = to100(dd, 0.50)
+    # var scale: 6% daily loss is "high"
+    c = to100(var, 0.06)
+
+    # weighted
+    score = 0.45 * a + 0.35 * b + 0.20 * c
+    return float(_clamp(score, 0.0, 100.0))
+
+
+def _bucket_risk(score: Optional[float]) -> Optional[str]:
+    if score is None:
+        return None
+    s = float(score)
+    if s <= 35:
+        return "Low"
+    if s <= 65:
+        return "Moderate"
+    return "High"
+
+
+def _bucket_confidence(score01: Optional[float]) -> Optional[str]:
+    if score01 is None:
+        return None
+    s = float(score01)
+    if s >= 0.75:
+        return "High"
+    if s >= 0.50:
+        return "Medium"
+    return "Low"
+
+
+def _compute_valuation_score(row: Dict[str, Any]) -> Optional[float]:
+    """
+    Valuation score (0-100): higher means more attractive valuation.
+    Uses pe_ttm, pb_ratio, ps_ratio, peg_ratio (best-effort).
+    Lower multiples => higher score.
+    """
+    # helpers: invert ratio into 0..100 with a soft cap
+    def inv_score(x: Optional[float], cap: float) -> Optional[float]:
+        if x is None:
+            return None
+        if x <= 0:
+            return None
+        # 1/x scaled, cap at cap
+        s = (cap / x) * 100.0
+        return float(_clamp(s, 0.0, 100.0))
+
+    pe = _as_float(row.get("pe_ttm"))
+    pb = _as_float(row.get("pb_ratio"))
+    ps = _as_float(row.get("ps_ratio"))
+    peg = _as_float(row.get("peg_ratio"))
+
+    parts: List[float] = []
+    w: List[float] = []
+
+    s1 = inv_score(pe, cap=25.0)
+    if s1 is not None:
+        parts.append(s1)
+        w.append(0.35)
+
+    s2 = inv_score(pb, cap=3.5)
+    if s2 is not None:
+        parts.append(s2)
+        w.append(0.25)
+
+    s3 = inv_score(ps, cap=6.0)
+    if s3 is not None:
+        parts.append(s3)
+        w.append(0.20)
+
+    s4 = inv_score(peg, cap=2.0)
+    if s4 is not None:
+        parts.append(s4)
+        w.append(0.20)
+
+    if not parts:
+        return None
+
+    ww = sum(w) if w else 1.0
+    return float(_clamp(sum(p * wi for p, wi in zip(parts, w)) / ww, 0.0, 100.0))
+
+
+def _compute_scores_fallback(row: Dict[str, Any]) -> None:
+    """
+    Ensure all score fields exist (0..100 where applicable), even if core.scoring didn’t fill them.
+    This prevents "blank score columns" across pages.
+
+    - value_score: from valuation_score or valuation ratios
+    - growth_score: from revenue_growth_yoy
+    - momentum_score: from percent_change + rsi_14 + week_52_position_pct
+    - quality_score: from margins + debt_to_equity
+    - overall_score: weighted average of above, penalized by risk_score
+    - opportunity_score: overall * confidence * (1 - risk)
+    """
+    # confidence_score: normalize to 0..100 if possible
+    conf01 = _as_float(row.get("forecast_confidence"))
+    if conf01 is None:
+        conf01 = _as_float(row.get("confidence_score"))
+    if conf01 is not None:
+        conf01 = (conf01 / 100.0) if conf01 > 1.5 else conf01
+        conf01 = _clamp(conf01, 0.0, 1.0)
+    if row.get("confidence_score") is None and conf01 is not None:
+        row["confidence_score"] = conf01  # keep 0..1 internally; schema can format
+    if row.get("confidence_bucket") is None and conf01 is not None:
+        row["confidence_bucket"] = _bucket_confidence(conf01)
+
+    # risk_score
+    if row.get("risk_score") is None:
+        rs = _score_from_risk_stats(row)
+        if rs is not None:
+            row["risk_score"] = rs
+    if row.get("risk_bucket") is None and row.get("risk_score") is not None:
+        row["risk_bucket"] = _bucket_risk(_as_float(row.get("risk_score")))
+
+    # valuation_score
+    if row.get("valuation_score") is None:
+        vs = _compute_valuation_score(row)
+        if vs is not None:
+            row["valuation_score"] = vs
+
+    # value_score
+    if row.get("value_score") is None:
+        if row.get("valuation_score") is not None:
+            row["value_score"] = _clamp(float(row["valuation_score"]), 0.0, 100.0)
+
+    # growth_score
+    if row.get("growth_score") is None:
+        g = _as_pct_fraction(row.get("revenue_growth_yoy"))
+        if g is not None:
+            # map -30%..+30% into 0..100
+            row["growth_score"] = _clamp(((g + 0.30) / 0.60) * 100.0, 0.0, 100.0)
+
+    # momentum_score
+    if row.get("momentum_score") is None:
+        pc = _as_pct_fraction(row.get("percent_change"))
+        rsi = _as_float(row.get("rsi_14"))
+        pos = _as_pct_fraction(row.get("week_52_position_pct"))
+        parts = []
+        weights = []
+        if pc is not None:
+            # -10%..+10% -> 0..100
+            parts.append(_clamp(((pc + 0.10) / 0.20) * 100.0, 0.0, 100.0))
+            weights.append(0.40)
+        if rsi is not None:
+            parts.append(_clamp(rsi, 0.0, 100.0))
+            weights.append(0.35)
+        if pos is not None:
+            parts.append(_clamp(pos * 100.0, 0.0, 100.0))
+            weights.append(0.25)
+        if parts:
+            wsum = sum(weights) if weights else 1.0
+            row["momentum_score"] = sum(p * w for p, w in zip(parts, weights)) / wsum
+
+    # quality_score
+    if row.get("quality_score") is None:
+        gm = _as_pct_fraction(row.get("gross_margin"))
+        om = _as_pct_fraction(row.get("operating_margin"))
+        pm = _as_pct_fraction(row.get("profit_margin"))
+        de = _as_float(row.get("debt_to_equity"))
+        parts = []
+        weights = []
+        if gm is not None:
+            parts.append(_clamp((gm / 0.60) * 100.0, 0.0, 100.0))
+            weights.append(0.25)
+        if om is not None:
+            parts.append(_clamp((om / 0.35) * 100.0, 0.0, 100.0))
+            weights.append(0.30)
+        if pm is not None:
+            parts.append(_clamp((pm / 0.30) * 100.0, 0.0, 100.0))
+            weights.append(0.25)
+        if de is not None and de >= 0:
+            # lower D/E is better. cap at 3.0
+            parts.append(_clamp((1.0 - min(de, 3.0) / 3.0) * 100.0, 0.0, 100.0))
+            weights.append(0.20)
+        if parts:
+            wsum = sum(weights) if weights else 1.0
+            row["quality_score"] = sum(p * w for p, w in zip(parts, weights)) / wsum
+
+    # overall_score
+    if row.get("overall_score") is None:
+        vals = []
+        w = []
+        for k, ww in (("value_score", 0.30), ("quality_score", 0.25), ("momentum_score", 0.25), ("growth_score", 0.20)):
+            v = _as_float(row.get(k))
+            if v is not None:
+                vals.append(_clamp(v, 0.0, 100.0))
+                w.append(ww)
+        if vals:
+            base = sum(v * ww for v, ww in zip(vals, w)) / (sum(w) if w else 1.0)
+            # penalize by risk
+            risk = _as_float(row.get("risk_score"))
+            if risk is not None:
+                base = base * (1.0 - _clamp(risk / 100.0, 0.0, 0.65))
+            row["overall_score"] = _clamp(base, 0.0, 100.0)
+
+    # opportunity_score
+    if row.get("opportunity_score") is None:
+        ov = _as_float(row.get("overall_score"))
+        risk = _as_float(row.get("risk_score"))
+        conf = conf01
+        if ov is not None:
+            rr = _clamp((risk / 100.0), 0.0, 1.0) if risk is not None else 0.5
+            cc = _clamp(conf, 0.0, 1.0) if conf is not None else 0.5
+            row["opportunity_score"] = _clamp(ov * cc * (1.0 - rr), 0.0, 100.0)
+
+
+def _compute_recommendation(row: Dict[str, Any]) -> None:
+    """
+    Light deterministic recommendation (to avoid blank column).
+    If you have a dedicated advisor engine, it can overwrite later.
+    """
+    if row.get("recommendation"):
+        return
+
+    ov = _as_float(row.get("overall_score"))
+    risk = _as_float(row.get("risk_score"))
+    conf = _as_float(row.get("forecast_confidence"))
+    if conf is None:
+        conf = _as_float(row.get("confidence_score"))
+    if conf is not None:
+        conf = (conf / 100.0) if conf > 1.5 else conf
+        conf = _clamp(conf, 0.0, 1.0)
+
+    if ov is None:
+        row["recommendation"] = "HOLD"
+        row["recommendation_reason"] = "Insufficient score data"
+        return
+
+    risk_v = risk if risk is not None else 60.0
+    conf_v = conf if conf is not None else 0.55
+
+    if ov >= 78 and conf_v >= 0.70 and risk_v <= 55:
+        row["recommendation"] = "BUY"
+        row["recommendation_reason"] = "High score + strong confidence + controlled risk"
+    elif ov >= 65 and risk_v <= 70:
+        row["recommendation"] = "HOLD"
+        row["recommendation_reason"] = "Moderate score / acceptable risk"
+    elif ov >= 50:
+        row["recommendation"] = "REDUCE"
+        row["recommendation_reason"] = "Weak score or elevated risk"
+    else:
+        row["recommendation"] = "SELL"
+        row["recommendation_reason"] = "Very weak score"
+
+
+def _ensure_ksa_classification(row: Dict[str, Any], is_ksa_sym: bool) -> None:
+    if not is_ksa_sym:
+        return
+    if not row.get("country"):
+        row["country"] = "SAU"
+    # don’t overwrite sector/industry if already present (providers fill)
+    # but if they exist as blanks, normalize to None
+    for k in ("sector", "industry"):
+        v = row.get(k)
+        if isinstance(v, str) and not v.strip():
+            row[k] = None
+
+
+def _compute_intrinsic_value_fallback(row: Dict[str, Any]) -> None:
+    """
+    Best-effort intrinsic value to reduce blanks WITHOUT inventing data.
+    Only computes when inputs exist.
+    """
+    if row.get("intrinsic_value") is not None:
+        return
+    # If we have eps and a reasonable forward PE, approximate intrinsic as eps * pe_forward
+    eps = _as_float(row.get("eps_ttm"))
+    pef = _as_float(row.get("pe_forward"))
+    if eps is not None and pef is not None and eps > 0 and 0 < pef < 60:
+        row["intrinsic_value"] = eps * pef
+
+
+def _ensure_required_advanced_fields(row: Dict[str, Any]) -> None:
+    """
+    Ensure *presence* (not necessarily non-null) of required advanced fields,
+    so schema projection doesn’t look like “missing columns”.
+    """
+    required_keys = [
+        # valuation
+        "pb_ratio", "ps_ratio", "peg_ratio", "intrinsic_value", "valuation_score",
+        # risk stats
+        "var_95_1d", "sharpe_1y", "max_drawdown_1y", "volatility_90d",
+        # scores
+        "value_score", "quality_score", "momentum_score", "growth_score",
+        "overall_score", "opportunity_score", "rank_overall",
+        # buckets
+        "confidence_bucket", "risk_bucket",
+        # classification
+        "country", "sector", "industry",
+    ]
+    for k in required_keys:
+        if k not in row:
+            row[k] = None
+
+
+# ============================================================================
+# History fetching for risk stats (best-effort; provider-dependent)
+# ============================================================================
+async def _fetch_history_from_provider(registry: ProviderRegistry, provider: str, symbol: str, timeout_s: float) -> Optional[Any]:
+    module, stats = await registry.get_provider(provider)
+    if stats.is_circuit_open:
+        return None
+    if module is None:
+        return None
+
+    # choose history function
+    fn = None
+    for nm in HISTORY_FUNCTIONS.get(provider, []):
+        cand = getattr(module, nm, None)
+        if callable(cand):
+            fn = cand
+            break
+    if fn is None:
+        return None
+
+    try:
+        async with asyncio.timeout(timeout_s):
+            out = await _call_maybe_async(fn, symbol)
+        return out
+    except Exception:
+        return None
+
+
+# ============================================================================
 # Sheet schema helpers (CRITICAL for correctness)
 # ============================================================================
-_ROWS_BUILDER_MOD: Optional[Any] = None
-_ROWS_BUILDER_LOCK = asyncio.Lock()
-
-
 def _canonicalize_sheet_name(sheet: str) -> str:
     s = (sheet or "").strip()
     if not s:
         return s
 
-    # Prefer page_catalog resolve/canonicalize if available
     try:
         from core.sheets.page_catalog import resolve_page  # type: ignore
 
@@ -1011,8 +1750,9 @@ def _schema_for_sheet(sheet: str) -> Tuple[Optional[Any], List[str], List[str], 
     try:
         spec = get_sheet_spec(sheet)
         cols = getattr(spec, "columns", None) or []
-        headers = [str(getattr(c, "header", "")) for c in cols]
-        keys = [str(getattr(c, "key", "")) for c in cols]
+        headers = [str(getattr(c, "header", "")).strip() for c in cols]
+        keys = [str(getattr(c, "key", "")).strip() for c in cols]
+        # drop blank
         headers = [h for h in headers if h]
         keys = [k for k in keys if k]
         if headers and keys and len(headers) == len(keys):
@@ -1035,7 +1775,6 @@ def _normalize_to_schema_keys(schema_keys: Sequence[str], schema_headers: Sequen
     Normalizes a raw row dict to schema KEYS.
     Supports raw using either schema keys OR schema headers.
     Missing -> None
-    Extras are ignored by callers via _strict_project_row.
     """
     raw = raw or {}
     raw_ci = {str(k).strip().lower(): v for k, v in raw.items()}
@@ -1067,245 +1806,6 @@ def _normalize_to_schema_keys(schema_keys: Sequence[str], schema_headers: Sequen
     return out
 
 
-async def _try_load_rows_builder() -> Optional[Any]:
-    """
-    Best-effort import of an existing repo rows builder module (if your repo has one).
-    We use it to preserve your current “how to build rows” logic, but we ALWAYS enforce schema on output.
-    """
-    global _ROWS_BUILDER_MOD
-    if _ROWS_BUILDER_MOD is not None:
-        return _ROWS_BUILDER_MOD
-
-    async with _ROWS_BUILDER_LOCK:
-        if _ROWS_BUILDER_MOD is not None:
-            return _ROWS_BUILDER_MOD
-
-        candidates = [
-            "core.sheets.sheet_rows",
-            "core.sheets.rows_builder",
-            "core.sheets.service",
-            "core.sheets.sheet_rows_builder",
-            "core.sheet_rows",
-            "core.rows_builder",
-        ]
-        for modpath in candidates:
-            try:
-                _ROWS_BUILDER_MOD = import_module(modpath)
-                return _ROWS_BUILDER_MOD
-            except Exception:
-                continue
-
-        _ROWS_BUILDER_MOD = None
-        return None
-
-
-async def _delegate_build_rows(
-    sheet: str,
-    *,
-    limit: int,
-    offset: int,
-    mode: str,
-    body: Dict[str, Any],
-) -> Tuple[List[Dict[str, Any]], Optional[str]]:
-    """
-    Try to call an existing build_sheet_rows / sheet_rows function if present in repo.
-    Returns (rows, note). Never raises.
-    """
-    mod = await _try_load_rows_builder()
-    if mod is None:
-        return [], "no_builder_module"
-
-    fn_candidates = [
-        "build_sheet_rows",
-        "sheet_rows",
-        "get_sheet_rows",
-        "build_rows",
-        "get_rows",
-    ]
-
-    for fn_name in fn_candidates:
-        fn = getattr(mod, fn_name, None)
-        if not callable(fn):
-            continue
-        try:
-            out = fn(sheet=sheet, limit=limit, offset=offset, mode=mode, body=body)
-            if hasattr(out, "__await__"):
-                out = await out
-            if isinstance(out, dict):
-                rows = out.get("rows") or out.get("data") or out.get("items") or []
-                if isinstance(rows, list):
-                    rows = [r for r in rows if isinstance(r, dict)]
-                    return rows, f"delegated:{fn_name}"
-                return [], f"delegated:{fn_name}:no_rows"
-            if isinstance(out, list):
-                rows = [r for r in out if isinstance(r, dict)]
-                return rows, f"delegated:{fn_name}"
-        except Exception as e:
-            return [], f"delegated:{fn_name}:error:{e!s}"
-
-    return [], "builder_no_callable"
-
-
-def _list_sheet_names_best_effort() -> List[str]:
-    if isinstance(SCHEMA_REGISTRY, dict) and SCHEMA_REGISTRY:
-        try:
-            return [str(k) for k in SCHEMA_REGISTRY.keys()]
-        except Exception:
-            pass
-    try:
-        from core.sheets.page_catalog import CANONICAL_PAGES  # type: ignore
-
-        return [str(x) for x in CANONICAL_PAGES]
-    except Exception:
-        return []
-
-
-def _data_dictionary_rows(
-    headers: List[str],
-    keys: List[str],
-    *,
-    limit: int,
-    offset: int,
-) -> List[Dict[str, Any]]:
-    sheet_names = _list_sheet_names_best_effort() or [
-        "Market_Leaders",
-        "Global_Markets",
-        "Commodities_FX",
-        "Mutual_Funds",
-        "My_Portfolio",
-        "Insights_Analysis",
-        "Top_10_Investments",
-        "Data_Dictionary",
-    ]
-
-    rows: List[Dict[str, Any]] = []
-    for sn in sheet_names:
-        spec, _, _, _src = _schema_for_sheet(sn)
-        cols = getattr(spec, "columns", None) if spec else None
-        if not cols:
-            continue
-
-        for c in cols:
-            group = getattr(c, "group", None) or getattr(spec, "group", None) or ""
-            source = getattr(c, "source", None) or getattr(spec, "source", None) or ""
-            notes = getattr(c, "notes", None) or getattr(spec, "notes", None) or ""
-            dtype = getattr(c, "dtype", None) or getattr(c, "type", None) or ""
-            fmt = getattr(c, "format", None) or getattr(c, "fmt", None) or ""
-            req = getattr(c, "required", None)
-            required = bool(req) if req is not None else False
-
-            base = {
-                "Sheet": sn,
-                "Group": str(group) if group is not None else "",
-                "Header": str(getattr(c, "header", "")),
-                "Key": str(getattr(c, "key", "")),
-                "DType": str(dtype) if dtype is not None else "",
-                "Format": str(fmt) if fmt is not None else "",
-                "Required": required,
-                "Source": str(source) if source is not None else "",
-                "Notes": str(notes) if notes is not None else "",
-            }
-
-            row: Dict[str, Any] = {}
-            for k in keys:
-                lk = k.strip().lower().replace(" ", "_")
-                if k in base:
-                    row[k] = base[k]
-                elif lk in ("sheet", "page"):
-                    row[k] = base["Sheet"]
-                elif lk == "group":
-                    row[k] = base["Group"]
-                elif lk in ("header", "column"):
-                    row[k] = base["Header"]
-                elif lk == "key":
-                    row[k] = base["Key"]
-                elif lk in ("dtype", "type"):
-                    row[k] = base["DType"]
-                elif lk in ("format", "fmt"):
-                    row[k] = base["Format"]
-                elif lk in ("required", "is_required", "req"):
-                    row[k] = base["Required"]
-                elif lk == "source":
-                    row[k] = base["Source"]
-                elif lk in ("notes", "note", "description"):
-                    row[k] = base["Notes"]
-                else:
-                    row[k] = None
-
-            rows.append(row)
-
-    return rows[offset : offset + limit]
-
-
-async def _call_builder_best_effort(
-    module_names: Sequence[str],
-    function_names: Sequence[str],
-    *,
-    sheet: str,
-    limit: int,
-    offset: int,
-    mode: str,
-    body: Dict[str, Any],
-    settings: Any,
-) -> Tuple[Optional[Any], Optional[str]]:
-    """
-    Import first available module, pick first callable function, call with best-effort signatures.
-    Returns (result, note) where result is builder output (any), and note indicates which function used.
-    Never raises (returns None, error-note).
-    """
-    last_err: Optional[str] = None
-    mod = None
-    for mn in module_names:
-        try:
-            mod = import_module(mn)
-            break
-        except Exception as e:
-            last_err = f"{mn}: {e!s}"
-            continue
-    if mod is None:
-        return None, f"import_failed:{last_err or 'no_modules'}"
-
-    fn = None
-    used_name = None
-    for name in function_names:
-        cand = getattr(mod, name, None)
-        if callable(cand):
-            fn = cand
-            used_name = name
-            break
-    if fn is None:
-        return None, "no_callable"
-
-    candidates: List[Tuple[Tuple[Any, ...], Dict[str, Any]]] = [
-        ((), {"request": None, "settings": settings, "mode": mode, "body": body, "sheet": sheet, "limit": limit, "offset": offset}),
-        ((), {"settings": settings, "mode": mode, "body": body, "sheet": sheet, "limit": limit, "offset": offset}),
-        ((), {"settings": settings, "mode": mode, "body": body}),
-        ((), {"settings": settings, "mode": mode}),
-        ((), {"mode": mode, "body": body}),
-        ((), {"mode": mode}),
-        ((), {"body": body}),
-        ((sheet,), {"limit": limit, "offset": offset, "mode": mode, "body": body, "settings": settings}),
-        ((sheet,), {"limit": limit, "offset": offset, "mode": mode, "body": body}),
-        ((sheet,), {"limit": limit, "offset": offset, "mode": mode}),
-        ((sheet,), {"limit": limit, "offset": offset}),
-        ((sheet,), {}),
-        ((), {}),
-    ]
-
-    for args, kwargs in candidates:
-        try:
-            out = fn(*args, **kwargs)
-            if asyncio.iscoroutine(out) or asyncio.isfuture(out) or hasattr(out, "__await__"):
-                out = await out
-            return out, f"builder:{used_name}"
-        except TypeError:
-            continue
-        except Exception as e:
-            return None, f"builder_error:{used_name}:{e!s}"
-
-    return None, f"builder_signature_mismatch:{used_name or 'unknown'}"
-
-
 def _coerce_rows_list(out: Any) -> List[Dict[str, Any]]:
     """
     Coerce builder output to list[dict].
@@ -1326,8 +1826,42 @@ def _coerce_rows_list(out: Any) -> List[Dict[str, Any]]:
     return []
 
 
+def _list_sheet_names_best_effort() -> List[str]:
+    if isinstance(SCHEMA_REGISTRY, dict) and SCHEMA_REGISTRY:
+        try:
+            return [str(k) for k in SCHEMA_REGISTRY.keys()]
+        except Exception:
+            pass
+    try:
+        from core.sheets.page_catalog import CANONICAL_PAGES  # type: ignore
+
+        return [str(x) for x in CANONICAL_PAGES]
+    except Exception:
+        return []
+
+
+def _apply_rank_overall(rows: List[Dict[str, Any]]) -> None:
+    """
+    Compute rank_overall within the returned rowset (sheet-level).
+    Uses overall_score then opportunity_score.
+    """
+    scored: List[Tuple[int, float]] = []
+    for i, r in enumerate(rows):
+        ov = _as_float(r.get("overall_score"))
+        if ov is None:
+            ov = _as_float(r.get("opportunity_score"))
+        if ov is None:
+            continue
+        scored.append((i, ov))
+    scored.sort(key=lambda t: t[1], reverse=True)
+    rank = 1
+    for idx, _ in scored:
+        rows[idx]["rank_overall"] = rank
+        rank += 1
+
+
 # ============================================================================
-# DataEngine V5 (v5.7.0)
+# DataEngine V5 (v5.8.0)
 # ============================================================================
 class DataEngineV5:
     def __init__(self, settings: Any = None):
@@ -1361,9 +1895,10 @@ class DataEngineV5:
         self.max_concurrency = _get_env_int("DATA_ENGINE_MAX_CONCURRENCY", 25)
         self.request_timeout = _get_env_float("DATA_ENGINE_TIMEOUT_SECONDS", 20.0)
 
-        self.ksa_disallow_eodhd = _get_env_bool("KSA_DISALLOW_EODHD", False)
+        # IMPORTANT: EODHD not usable for KSA (your constraint) => default TRUE
+        self.ksa_disallow_eodhd = _get_env_bool("KSA_DISALLOW_EODHD", True)
 
-        # IMPORTANT: strict sheet-rows prevents silent “default schema” collapses
+        # strict sheet-rows prevents silent “default schema” collapses
         self.schema_strict_sheet_rows = _get_env_bool("SCHEMA_STRICT_SHEET_ROWS", True)
 
         self._sem = asyncio.Semaphore(max(1, self.max_concurrency))
@@ -1377,7 +1912,7 @@ class DataEngineV5:
         )
 
         logger.info(
-            "DataEngineV5 v%s initialized | primary=%s | enabled=%s | ksa=%s | global=%s | flags=%s | schema=%s | strict_sheet_rows=%s",
+            "DataEngineV5 v%s initialized | primary=%s | enabled=%s | ksa=%s | global=%s | flags=%s | schema=%s | strict_sheet_rows=%s | ksa_disallow_eodhd=%s",
             self.version,
             self.primary_provider,
             len(self.enabled_providers),
@@ -1386,6 +1921,7 @@ class DataEngineV5:
             self.flags,
             "available" if _SCHEMA_AVAILABLE else "missing",
             self.schema_strict_sheet_rows,
+            self.ksa_disallow_eodhd,
         )
 
     async def aclose(self) -> None:
@@ -1404,17 +1940,21 @@ class DataEngineV5:
         if is_ksa_sym and self.ksa_disallow_eodhd:
             providers = [p for p in providers if p != "eodhd"]
 
+        # ensure primary is head when allowed
         if self.primary_provider and (self.primary_provider in self.enabled_providers):
             if self.primary_provider in providers:
                 providers = [p for p in providers if p != self.primary_provider]
                 providers.insert(0, self.primary_provider)
             else:
+                # only inject primary if it is allowed for this market
                 if (not is_ksa_sym) or (self.primary_provider != "eodhd") or (not self.ksa_disallow_eodhd):
                     providers.insert(0, self.primary_provider)
 
+        # de-dupe
         seen: set = set()
         providers = [p for p in providers if not (p in seen or seen.add(p))]
 
+        # stable sort tail by priority
         def pr(p: str) -> int:
             return PROVIDER_PRIORITIES.get(p, 999)
 
@@ -1506,9 +2046,11 @@ class DataEngineV5:
             for k, v in patch.items():
                 if k in protected or v is None:
                     continue
+                # fill-if-missing policy (enrichment-friendly)
                 if k not in merged or merged.get(k) in (None, "", []):
                     merged[k] = v
 
+        # keep aliases consistent
         if merged.get("current_price") is None and merged.get("price") is not None:
             merged["current_price"] = merged.get("price")
         if merged.get("price") is None and merged.get("current_price") is not None:
@@ -1528,9 +2070,66 @@ class DataEngineV5:
 
     def _data_quality(self, row: Dict[str, Any]) -> str:
         cp = row.get("current_price")
-        if _safe_float(cp) is None:
+        if _as_float(cp) is None:
             return QuoteQuality.MISSING.value
-        return QuoteQuality.GOOD.value
+        # if we have key advanced signals, upgrade quality
+        if any(row.get(k) is not None for k in ("overall_score", "forecast_price_3m", "pb_ratio", "volatility_90d")):
+            return QuoteQuality.GOOD.value
+        return QuoteQuality.FAIR.value
+
+    async def _maybe_compute_risk_stats(self, row: Dict[str, Any], symbol_norm: str, is_ksa_sym: bool, providers_used: List[str]) -> None:
+        """
+        Compute missing risk stats using history, best-effort.
+        Preference:
+          - GLOBAL: eodhd history, fallback yahoo_chart
+          - KSA: yahoo_chart history (since EODHD disallowed), fallback others
+        """
+        if not self.flags.get("risk_stats_enabled", True):
+            return
+
+        need = any(row.get(k) is None for k in ("volatility_90d", "max_drawdown_1y", "var_95_1d", "sharpe_1y"))
+        if not need:
+            # still compute RSI if missing and we have prices below
+            return
+
+        # pick provider order for history
+        if is_ksa_sym:
+            history_providers = ["yahoo_chart", "tadawul", "argaam"]
+            history_providers = [p for p in history_providers if p in self.enabled_providers]
+        else:
+            history_providers = ["eodhd", "yahoo_chart", "finnhub"]
+            history_providers = [p for p in history_providers if p in self.enabled_providers]
+
+        # try providers; convert symbol per provider when needed
+        hist_obj = None
+        for p in history_providers:
+            sym_p = self._provider_symbol(p, symbol_norm)
+            hist_obj = await _fetch_history_from_provider(self._registry, p, sym_p, timeout_s=self.request_timeout)
+            if hist_obj:
+                break
+
+        # some providers may embed history already
+        if not hist_obj:
+            hist_obj = row.get("history") or row.get("prices") or row.get("price_history")
+
+        prices = _extract_prices_from_history(hist_obj)
+        if len(prices) < 30:
+            return
+
+        stats = _compute_risk_stats_from_prices(prices)
+        for k, v in stats.items():
+            if row.get(k) is None and v is not None:
+                # pct-like values stored as fraction
+                if k in ("volatility_30d", "volatility_90d", "max_drawdown_1y", "var_95_1d"):
+                    row[k] = _clamp(float(v), 0.0, 5.0)
+                else:
+                    row[k] = v
+
+        # RSI if missing
+        if row.get("rsi_14") is None:
+            rsi = _compute_rsi_from_prices(prices, period=14)
+            if rsi is not None:
+                row["rsi_14"] = rsi
 
     # -----------------------------
     # Public Quote API
@@ -1546,7 +2145,10 @@ class DataEngineV5:
         return _model_to_dict(q)
 
     async def _get_enriched_quote_impl(self, symbol: str, use_cache: bool = True, *, schema: Any = None) -> UnifiedQuote:
-        norm = normalize_symbol(symbol) if callable(normalize_symbol) else _fallback_normalize_symbol(symbol)
+        info = get_symbol_info(symbol)
+        norm = info.get("normalized") or ""
+        is_ksa_sym = bool(info.get("is_ksa"))
+
         if not norm:
             row = {
                 "symbol": symbol,
@@ -1557,6 +2159,7 @@ class DataEngineV5:
                 "last_updated_utc": _now_utc_iso(),
                 "last_updated_riyadh": _now_riyadh_iso(),
             }
+            _ensure_required_advanced_fields(row)
             row = normalize_row_to_schema(schema, row) if schema is not None else normalize_row_to_schema(None, row)
             return UnifiedQuote(**row)  # type: ignore
 
@@ -1584,10 +2187,11 @@ class DataEngineV5:
                 "last_updated_utc": _now_utc_iso(),
                 "last_updated_riyadh": _now_riyadh_iso(),
             }
+            _ensure_required_advanced_fields(row)
             row = normalize_row_to_schema(schema, row) if schema is not None else normalize_row_to_schema(None, row)
             return UnifiedQuote(**row)  # type: ignore
 
-        top_n = _get_env_int("PROVIDER_TOP_N", 3)
+        top_n = _get_env_int("PROVIDER_TOP_N", 4)
         top = providers[: max(1, int(top_n))]
 
         gathered = await asyncio.gather(*[self._fetch_patch(p, norm) for p in top], return_exceptions=True)
@@ -1620,6 +2224,7 @@ class DataEngineV5:
                 "last_updated_utc": _now_utc_iso(),
                 "last_updated_riyadh": _now_riyadh_iso(),
             }
+            _ensure_required_advanced_fields(row)
             row = normalize_row_to_schema(schema, row) if schema is not None else normalize_row_to_schema(None, row)
             q = UnifiedQuote(**row)  # type: ignore
             if use_cache:
@@ -1628,13 +2233,42 @@ class DataEngineV5:
 
         row = self._merge(symbol, norm, patches_ok)
 
+        # Phase D: always compute basic derivatives + KSA classification baseline
+        _compute_price_derivatives(row)
+        _compute_portfolio_derivatives(row)
+        _ensure_ksa_classification(row, is_ksa_sym)
+
+        # Phase D: valuation mapping + intrinsic fallback
+        if self.flags.get("valuation_enabled", True):
+            _compute_intrinsic_value_fallback(row)
+            if row.get("valuation_score") is None:
+                vs = _compute_valuation_score(row)
+                if vs is not None:
+                    row["valuation_score"] = vs
+
+        # Phase D: risk stats (history) if missing
+        await self._maybe_compute_risk_stats(row, norm, is_ksa_sym, providers_used=[p for p, _, _ in patches_ok])
+
+        # Phase D: forecasting/scoring modules (if available)
         if self.flags.get("computations_enabled", True):
             if self.flags.get("forecasting_enabled", True):
                 row = await _maybe_apply_forecast(row, self.settings)
+
+            # scoring module first (if exists)
             if self.flags.get("scoring_enabled", True):
-                row = await _maybe_apply_scoring(row, self.settings)
+                row = await _maybe_apply_scoring_module(row, self.settings)
+
+        # Phase D: ensure scores/buckets exist (fallback)
+        _compute_scores_fallback(row)
+        _compute_recommendation(row)
+
+        # Ensure all required advanced fields exist (even if None)
+        _ensure_required_advanced_fields(row)
 
         row["data_quality"] = self._data_quality(row)
+        row["data_provider"] = (row.get("data_provider") or (row.get("data_sources")[0] if isinstance(row.get("data_sources"), list) and row["data_sources"] else "") or "")
+
+        # Normalize to schema
         row = normalize_row_to_schema(schema, row) if schema is not None else normalize_row_to_schema(None, row)
 
         q = UnifiedQuote(**row)  # type: ignore
@@ -1675,7 +2309,7 @@ class DataEngineV5:
     get_quotes_batch = get_enriched_quotes_batch
 
     # -----------------------------
-    # ✅ PHASE 5: Schema-correct Sheet Rows API (SPECIAL DISPATCH + STRICT)
+    # ✅ Schema-correct Sheet Rows API (SPECIAL DISPATCH + STRICT)
     # -----------------------------
     async def get_sheet_rows(
         self,
@@ -1687,11 +2321,8 @@ class DataEngineV5:
         body: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
-        Engine-native sheet rows builder that NEVER silently falls back to the DEFAULT 80-column schema
+        Engine-native sheet rows builder that NEVER silently falls back to DEFAULT schema
         when schema_registry knows the requested sheet.
-
-        Returns (schema-correct):
-            { status, sheet/page, headers, keys, rows, rows_matrix?, meta, version }
         """
         body = body or {}
         limit = max(1, min(5000, int(limit or 2000)))
@@ -1714,33 +2345,26 @@ class DataEngineV5:
 
         spec, headers, keys, schema_src = _schema_for_sheet(sheet2)
 
-        # STRICTNESS: if schema exists in your project, unknown sheets should NOT collapse to union/default.
-        if (not headers or not keys) and self.schema_strict_sheet_rows:
-            if _SCHEMA_AVAILABLE:
-                return {
-                    "status": "error",
-                    "sheet": sheet2,
-                    "page": sheet2,
-                    "headers": [],
-                    "keys": [],
-                    "rows": [],
-                    "rows_matrix": [] if include_matrix else None,
-                    "error": f"Unknown sheet or schema missing for '{sheet2}'",
-                    "meta": {
-                        "schema_source": schema_src,
-                        "strict": True,
-                        "known_sheets": _list_sheet_names_best_effort(),
-                    },
-                    "version": self.version,
-                }
+        if (not headers or not keys) and self.schema_strict_sheet_rows and _SCHEMA_AVAILABLE:
+            return {
+                "status": "error",
+                "sheet": sheet2,
+                "page": sheet2,
+                "headers": [],
+                "keys": [],
+                "rows": [],
+                "rows_matrix": [] if include_matrix else None,
+                "error": f"Unknown sheet or schema missing for '{sheet2}'",
+                "meta": {"schema_source": schema_src, "strict": True, "known_sheets": _list_sheet_names_best_effort()},
+                "version": self.version,
+            }
 
         # -----------------------------
         # ✅ SPECIAL DISPATCH (explicit)
         # -----------------------------
         if sheet2 == "Data_Dictionary":
-            # Prefer canonical generator if present (aligned with routers)
-            dd_note = None
             rows: List[Dict[str, Any]] = []
+            dd_note = None
             try:
                 from core.sheets.data_dictionary import build_data_dictionary_rows as _dd  # type: ignore
 
@@ -1748,58 +2372,76 @@ class DataEngineV5:
                 rows = [_normalize_to_schema_keys(keys, headers, r) for r in _coerce_rows_list(raw_rows)]
                 dd_note = "core.sheets.data_dictionary.build_data_dictionary_rows"
             except Exception:
-                # Fallback to internal generator (deterministic)
                 if not headers or not keys:
                     headers = ["Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes"]
                     keys = headers[:]
                     schema_src = "fallback:standard_data_dictionary"
-                rows = _data_dictionary_rows(headers, keys, limit=limit, offset=offset)
-                dd_note = "fallback:_data_dictionary_rows"
+                # simple deterministic fallback
+                rows = []
+                for sn in _list_sheet_names_best_effort():
+                    sp, _, _, _ = _schema_for_sheet(sn)
+                    cols = getattr(sp, "columns", None) if sp else None
+                    if not cols:
+                        continue
+                    for c in cols:
+                        rr = {
+                            "sheet": sn,
+                            "group": str(getattr(c, "group", "")),
+                            "header": str(getattr(c, "header", "")),
+                            "key": str(getattr(c, "key", "")),
+                            "dtype": str(getattr(c, "dtype", "")),
+                            "fmt": str(getattr(c, "fmt", "")),
+                            "required": bool(getattr(c, "required", False)),
+                            "source": str(getattr(c, "source", "")),
+                            "notes": str(getattr(c, "notes", "")),
+                        }
+                        rows.append(_normalize_to_schema_keys(keys, headers, rr))
+                dd_note = "fallback:internal"
 
-            # paginate if canonical generator returned all rows
-            if dd_note and dd_note.startswith("core."):
-                rows = rows[offset : offset + limit]
-
-            payload = {
+            rows = rows[offset : offset + limit]
+            proj = [_strict_project_row(keys, r) for r in rows]
+            return {
                 "status": "success",
                 "sheet": "Data_Dictionary",
                 "page": "Data_Dictionary",
                 "headers": headers,
                 "keys": keys,
-                "rows": [_strict_project_row(keys, r) for r in rows],
-                "rows_matrix": _rows_matrix([_strict_project_row(keys, r) for r in rows], keys) if include_matrix else None,
-                "meta": {
-                    "schema_source": schema_src,
-                    "builder": dd_note,
-                    "rows": len(rows),
-                    "limit": limit,
-                    "offset": offset,
-                },
+                "rows": proj,
+                "rows_matrix": _rows_matrix(proj, keys) if include_matrix else None,
+                "meta": {"schema_source": schema_src, "builder": dd_note, "rows": len(proj), "limit": limit, "offset": offset},
                 "version": self.version,
             }
-            return payload
 
         if sheet2 == "Insights_Analysis":
-            out, note = await _call_builder_best_effort(
-                module_names=("core.analysis.insights_builder",),
-                function_names=(
-                    "build_insights_analysis_rows",
-                    "build_insights_rows",
-                    "build_insights_analysis",
-                    "get_insights_rows",
-                    "build_rows",
-                ),
-                sheet=sheet2,
-                limit=limit,
-                offset=offset,
-                mode=mode,
-                body=body,
-                settings=self.settings,
-            )
-            rows0 = _coerce_rows_list(out)
+            # Phase B: always use real builder
+            try:
+                from core.analysis.insights_builder import build_insights_analysis_rows  # type: ignore
+
+                crit = body.get("criteria") if isinstance(body.get("criteria"), dict) else None
+                universes = body.get("universes") if isinstance(body.get("universes"), dict) else None
+                symbols = body.get("symbols") if isinstance(body.get("symbols"), list) else None
+
+                payload = await build_insights_analysis_rows(
+                    engine=self,
+                    criteria=crit,
+                    universes=universes,
+                    symbols=symbols,
+                    mode=mode or "",
+                )
+                rows0 = _coerce_rows_list(payload)
+            except Exception as e:
+                rows0 = [{
+                    "section": "System",
+                    "item": "Insights Builder Error",
+                    "symbol": "",
+                    "metric": "error",
+                    "value": type(e).__name__,
+                    "notes": str(e),
+                    "last_updated_riyadh": _now_riyadh_iso(),
+                }]
+
             rows_norm = [_strict_project_row(keys, _normalize_to_schema_keys(keys, headers, r)) for r in rows0]
             rows_norm = rows_norm[offset : offset + limit]
-
             return {
                 "status": "success",
                 "sheet": sheet2,
@@ -1808,116 +2450,84 @@ class DataEngineV5:
                 "keys": keys,
                 "rows": rows_norm,
                 "rows_matrix": _rows_matrix(rows_norm, keys) if include_matrix else None,
-                "meta": {
-                    "schema_source": schema_src,
-                    "builder": note or "insights_builder",
-                    "rows": len(rows_norm),
-                    "limit": limit,
-                    "offset": offset,
-                    "mode": mode,
-                },
+                "meta": {"schema_source": schema_src, "builder": "core.analysis.insights_builder", "rows": len(rows_norm), "limit": limit, "offset": offset, "mode": mode},
                 "version": self.version,
             }
 
         if sheet2 == "Top_10_Investments":
-            out, note = await _call_builder_best_effort(
-                module_names=(
-                    "core.analysis.top10_builder",
-                    "core.analysis.top_10_builder",
-                    "core.analysis.top_10_investments_builder",
-                    "core.analysis.top10_investments_builder",
-                ),
-                function_names=(
-                    "build_top_10_investments_rows",
-                    "build_top10_investments_rows",
-                    "build_top_10_rows",
-                    "build_top10_rows",
-                    "get_top10_rows",
-                    "build_rows",
-                ),
-                sheet=sheet2,
-                limit=limit,
-                offset=offset,
-                mode=mode,
-                body=body,
-                settings=self.settings,
-            )
+            # Phase C: one source of truth -> core.analysis.top10_selector
+            try:
+                from core.analysis.top10_selector import build_top10_rows  # type: ignore
 
-            rows0 = _coerce_rows_list(out)
-            if rows0:
-                rows_norm = [_strict_project_row(keys, _normalize_to_schema_keys(keys, headers, r)) for r in rows0]
-                rows_norm = rows_norm[offset : offset + limit]
-                return {
-                    "status": "success",
-                    "sheet": sheet2,
-                    "page": sheet2,
-                    "headers": headers,
-                    "keys": keys,
-                    "rows": rows_norm,
-                    "rows_matrix": _rows_matrix(rows_norm, keys) if include_matrix else None,
-                    "meta": {
-                        "schema_source": schema_src,
-                        "builder": note or "top10_builder",
-                        "rows": len(rows_norm),
-                        "limit": limit,
-                        "offset": offset,
-                        "mode": mode,
-                    },
-                    "version": self.version,
-                }
-            # If builder missing, we fall through to delegated builder below (then schema-only)
+                criteria = body.get("criteria") if isinstance(body.get("criteria"), dict) else dict(body or {})
+                payload = await build_top10_rows(engine=self, criteria=criteria, limit=int(body.get("limit") or body.get("top_n") or 10), mode=mode or "")
+                rows0 = payload.get("rows") if isinstance(payload, dict) else payload
+                rows0 = _coerce_rows_list(rows0)
+            except Exception as e:
+                rows0 = [{
+                    "symbol": "",
+                    "name": "",
+                    "top10_rank": None,
+                    "selection_reason": "",
+                    "criteria_snapshot": "",
+                    "warnings": f"Top10 builder error: {type(e).__name__}: {e}",
+                    "last_updated_riyadh": _now_riyadh_iso(),
+                }]
+
+            rows_norm = [_strict_project_row(keys, _normalize_to_schema_keys(keys, headers, r)) for r in rows0]
+            rows_norm = rows_norm[offset : offset + limit]
+            return {
+                "status": "success",
+                "sheet": sheet2,
+                "page": sheet2,
+                "headers": headers,
+                "keys": keys,
+                "rows": rows_norm,
+                "rows_matrix": _rows_matrix(rows_norm, keys) if include_matrix else None,
+                "meta": {"schema_source": schema_src, "builder": "core.analysis.top10_selector", "rows": len(rows_norm), "limit": limit, "offset": offset, "mode": mode},
+                "version": self.version,
+            }
 
         # -----------------------------
-        # Delegate to existing repo builder (if any), then FORCE schema projection
+        # Instrument tables: build rows from provided symbols (live quotes),
+        # ensuring advanced fields are present and rank_overall is computed.
         # -----------------------------
-        delegated_rows: List[Dict[str, Any]] = []
-        delegate_note: Optional[str] = None
-        try:
-            delegated_rows, delegate_note = await _delegate_build_rows(sheet2, limit=limit, offset=offset, mode=mode, body=body)
-        except Exception as e:
-            delegated_rows, delegate_note = [], f"delegate_error:{e!s}"
+        symbols = body.get("symbols") or body.get("tickers") or []
+        if isinstance(symbols, str):
+            symbols = [s.strip() for s in symbols.replace(",", " ").split() if s.strip()]
+        if not isinstance(symbols, list):
+            symbols = []
+        symbols = [str(s).strip() for s in symbols if str(s).strip()]
 
         rows: List[Dict[str, Any]] = []
-        if delegated_rows and keys:
-            for r in delegated_rows:
-                rr = _normalize_to_schema_keys(keys, headers, dict(r))
-                rows.append(_strict_project_row(keys, rr))
-        elif delegated_rows:
-            rows = [dict(r) for r in delegated_rows]
-        else:
-            rows = []
+        if symbols:
+            quotes = await self.get_enriched_quotes(symbols, schema=sheet2 if sheet2 else None)
+            for q in quotes:
+                d = _model_to_dict(q)
+                d = _normalize_to_schema_keys(keys, headers, d) if keys else d
+                rows.append(_strict_project_row(keys, d) if keys else d)
 
+        # Apply rank_overall per sheet result
+        if rows and ("rank_overall" in (keys or [])):
+            _apply_rank_overall(rows)
+
+        rows = rows[offset : offset + limit] if rows else rows
         out_headers = headers[:] if headers else (keys[:] if keys else [])
         out_keys = keys[:] if keys else (headers[:] if headers else [])
 
-        if not out_keys and rows:
-            out_keys = list(rows[0].keys())
-        if not out_headers and out_keys:
-            out_headers = out_keys[:]
-
-        rows = rows[offset : offset + limit] if rows else rows
-
         return {
-            "status": "success" if out_headers else "partial",
+            "status": "success",
             "sheet": sheet2,
             "page": sheet2,
             "headers": out_headers,
             "keys": out_keys,
             "rows": rows,
             "rows_matrix": _rows_matrix(rows, out_keys) if (include_matrix and out_keys) else None,
-            "meta": {
-                "schema_source": schema_src,
-                "strict": self.schema_strict_sheet_rows,
-                "delegate": delegate_note or "none",
-                "rows": len(rows),
-                "limit": limit,
-                "offset": offset,
-                "mode": mode,
-            },
+            "meta": {"schema_source": schema_src, "rows": len(rows), "limit": limit, "offset": offset, "mode": mode, "built_from": "live_quotes" if symbols else "empty"},
             "version": self.version,
         }
 
-    # Common aliases used by routers in your repo
+    # Common aliases used by routers
     async def sheet_rows(self, *args, **kwargs) -> Dict[str, Any]:
         return await self.get_sheet_rows(*args, **kwargs)
 
