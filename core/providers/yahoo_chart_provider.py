@@ -2,33 +2,36 @@
 # core/providers/yahoo_chart_provider.py
 """
 ================================================================================
-Yahoo Chart Provider (Global Market Data) — v6.6.1 (Schema-Aligned + Prometheus-Safe)
+Yahoo Chart Provider (Global + KSA History) — v6.7.0 (PHASE D: RISK STATS FILLED)
 ================================================================================
 
+Why this revision (Phase D)
+- ✅ FIX: Risk/statistical fields were blank across pages.
+  This provider now computes and returns (schema keys):
+    volatility_90d, max_drawdown_1y, var_95_1d, sharpe_1y
+  computed directly from Yahoo historical prices (best-effort).
+
 What this provider guarantees
-- ✅ No startup crashes (all optional deps safe)
-- ✅ Async-friendly: threadpool for yfinance (blocking)
+- ✅ Startup-safe: no network calls at import-time
+- ✅ Async-friendly: yfinance is blocking → executed in threadpool
 - ✅ Deterministic + safe fallbacks (no heavy ML required)
-- ✅ Canonical output keys aligned with your engine:
+- ✅ Canonical schema-aligned keys (engine-friendly):
     current_price, previous_close, open_price, day_high, day_low, week_52_high, week_52_low,
     volume, market_cap, currency, name, exchange, asset_class,
     price_change, percent_change, week_52_position_pct,
-    rsi_14, volatility_30d,
+    rsi_14, volatility_30d, volatility_90d, max_drawdown_1y, var_95_1d, sharpe_1y,
     forecast_price_1m/3m/12m, expected_roi_1m/3m/12m, forecast_confidence (0..1),
     last_updated_utc, last_updated_riyadh, history_last_utc
 
-- ✅ Keeps backward-compatible aliases:
+Backwards-compatible aliases preserved:
     price, prev_close, open, 52w_high, 52w_low, change, change_pct
 
-Prometheus safety (IMPORTANT)
-- ✅ Metrics are created lazily and duplicate-safe.
-  If the same metric name is already registered in-process, we reuse it (or fall back),
-  preventing duplicate-timeseries crashes.
+History API (for engine risk-stats fallback)
+- ✅ Exposes: fetch_history(symbol, period?, interval?) returning list[dict] with {date, close}
+  (also get_history alias)
 
-Loader compatibility (important)
-- Some loaders only accept a provider instance / factory / Provider class without awaiting:
-  This module exports:
-    provider, PROVIDER, Provider, get_provider(), build_provider(), create_provider(), provider_factory()
+Prometheus safety
+- ✅ Metrics are created lazily and duplicate-safe (reuse collector if already registered).
 
 ================================================================================
 """
@@ -43,6 +46,7 @@ import math
 import os
 import random
 import re
+import statistics
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -113,10 +117,6 @@ def _prom_enabled() -> bool:
 
 
 def _safe_get_existing_collector(name: str) -> Optional[Any]:
-    """
-    Best-effort: reuse already-registered collectors to avoid duplicate-timeseries crashes.
-    Uses prometheus_client internal registry mapping if available.
-    """
     try:
         if REGISTRY is None:
             return None
@@ -239,6 +239,7 @@ except Exception:
 
     _HAS_ORJSON = False
 
+
 # =============================================================================
 # Logging
 # =============================================================================
@@ -246,7 +247,7 @@ logger = logging.getLogger("core.providers.yahoo_chart_provider")
 logger.addHandler(logging.NullHandler())
 
 PROVIDER_NAME = "yahoo_chart"
-PROVIDER_VERSION = "6.6.1"
+PROVIDER_VERSION = "6.7.0"
 
 # =============================================================================
 # Env helpers (safe)
@@ -275,7 +276,7 @@ def _env_int(name: str, default: int) -> int:
 
 def _env_float(name: str, default: float) -> float:
     try:
-        return float(str(os.getenv(name, str(default))).strip())
+        return float(str(os.getenv(name, str(default))).strip()))
     except Exception:
         return default
 
@@ -303,6 +304,10 @@ def _timeout_sec() -> float:
 
 def _quote_ttl_sec() -> float:
     return max(5.0, _env_float("YAHOO_QUOTE_TTL_SEC", 15.0))
+
+
+def _history_ttl_sec() -> float:
+    return max(30.0, _env_float("YAHOO_HISTORY_TTL_SEC", 300.0))
 
 
 def _history_period() -> str:
@@ -615,6 +620,110 @@ class AdvancedCache:
 
 
 # =============================================================================
+# Risk / Stats helpers (PHASE D)
+# =============================================================================
+def _simple_returns(closes: List[float]) -> List[float]:
+    out: List[float] = []
+    for i in range(1, len(closes)):
+        p0 = closes[i - 1]
+        p1 = closes[i]
+        if p0 and p0 > 0:
+            out.append((p1 / p0) - 1.0)
+    return out
+
+
+def _log_returns(closes: List[float]) -> List[float]:
+    out: List[float] = []
+    for i in range(1, len(closes)):
+        p0 = closes[i - 1]
+        p1 = closes[i]
+        if p0 and p0 > 0 and p1 and p1 > 0:
+            out.append(math.log(p1 / p0))
+    return out
+
+
+def _annualized_vol_from_logrets(logrets: List[float]) -> Optional[float]:
+    if len(logrets) < 2:
+        return None
+    try:
+        if _HAS_NUMPY and np is not None:
+            v = float(np.std(np.asarray(logrets, dtype=float), ddof=1) * math.sqrt(252.0))
+            if math.isnan(v) or math.isinf(v):
+                return None
+            return v
+        std = statistics.stdev(logrets)
+        return float(std * math.sqrt(252.0))
+    except Exception:
+        return None
+
+
+def _volatility_nd(closes: List[float], days: int) -> Optional[float]:
+    if len(closes) < days + 1:
+        return None
+    window = closes[-(days + 1) :]
+    return _annualized_vol_from_logrets(_log_returns(window))
+
+
+def _max_drawdown_1y(closes: List[float]) -> Optional[float]:
+    if len(closes) < 20:
+        return None
+    window = closes[-252:] if len(closes) >= 252 else closes[:]
+    peak = None
+    max_dd = 0.0
+    for p in window:
+        if p is None or p <= 0:
+            continue
+        if peak is None or p > peak:
+            peak = p
+        if peak and peak > 0:
+            dd = (p / peak) - 1.0
+            if dd < max_dd:
+                max_dd = dd
+    return float(abs(max_dd)) if max_dd < 0 else 0.0
+
+
+def _var_95_1d(closes: List[float]) -> Optional[float]:
+    rets = _simple_returns(closes)
+    if len(rets) < 30:
+        return None
+    try:
+        # 5th percentile
+        if _HAS_NUMPY and np is not None:
+            q = float(np.quantile(np.asarray(rets, dtype=float), 0.05))
+        else:
+            s = sorted(rets)
+            idx = max(0, int(0.05 * (len(s) - 1)))
+            q = float(s[idx])
+        return float(abs(q)) if q < 0 else 0.0
+    except Exception:
+        return None
+
+
+def _sharpe_1y(closes: List[float]) -> Optional[float]:
+    rets = _simple_returns(closes)
+    if len(rets) < 60:
+        return None
+    # use last 252 if possible
+    w = rets[-252:] if len(rets) >= 252 else rets[:]
+    if len(w) < 30:
+        return None
+    try:
+        if _HAS_NUMPY and np is not None:
+            arr = np.asarray(w, dtype=float)
+            mu = float(np.mean(arr))
+            sd = float(np.std(arr, ddof=1))
+        else:
+            mu = float(sum(w) / len(w))
+            sd = float(statistics.stdev(w))
+        if sd <= 0 or math.isnan(sd) or math.isinf(sd):
+            return None
+        # annualized Sharpe, rf ~ 0
+        return float((mu * 252.0) / (sd * math.sqrt(252.0)))
+    except Exception:
+        return None
+
+
+# =============================================================================
 # Indicators
 # =============================================================================
 def _rsi_14(closes: List[float]) -> Optional[float]:
@@ -637,7 +746,6 @@ def _rsi_14(closes: List[float]) -> Optional[float]:
             rs = avg_gain / avg_loss
             return float(100.0 - (100.0 / (1.0 + rs)))
 
-        # pure python fallback
         n = 14
         diffs = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
         gains = [d if d > 0 else 0.0 for d in diffs]
@@ -651,35 +759,6 @@ def _rsi_14(closes: List[float]) -> Optional[float]:
             return 100.0
         rs = avg_gain / avg_loss
         return 100.0 - (100.0 / (1.0 + rs))
-    except Exception:
-        return None
-
-
-def _volatility_30d(closes: List[float]) -> Optional[float]:
-    # annualized volatility based on last 30 trading days log returns
-    if len(closes) < 31:
-        return None
-    try:
-        window = closes[-31:]
-        if _HAS_NUMPY and np is not None:
-            arr = np.asarray(window, dtype=float)
-            rets = np.diff(np.log(arr))
-            if len(rets) < 2:
-                return None
-            vol = float(np.std(rets, ddof=1) * math.sqrt(252))
-            if math.isnan(vol) or math.isinf(vol):
-                return None
-            return vol
-
-        rets = []
-        for i in range(1, len(window)):
-            if window[i - 1] > 0 and window[i] > 0:
-                rets.append(math.log(window[i] / window[i - 1]))
-        if len(rets) < 2:
-            return None
-        mean = sum(rets) / len(rets)
-        var = sum((r - mean) ** 2 for r in rets) / (len(rets) - 1)
-        return math.sqrt(var) * math.sqrt(252)
     except Exception:
         return None
 
@@ -719,12 +798,12 @@ def _simple_forecast(closes: List[float], horizon_days: int) -> Tuple[Optional[f
         last = float(closes[-1])
         roi_pct = (forecast_price / last - 1.0) * 100.0
 
-        vol = _volatility_30d(closes) or 0.25
+        vol30 = _volatility_nd(closes, 30) or 0.25
         conf = max(
             0.05,
             min(
                 0.95,
-                (max(0.0, min(1.0, r2)) * 0.8 + 0.2) * (1.0 / (1.0 + max(0.0, vol - 0.25))),
+                (max(0.0, min(1.0, r2)) * 0.8 + 0.2) * (1.0 / (1.0 + max(0.0, vol30 - 0.25))),
             ),
         )
         return forecast_price, roi_pct, conf
@@ -762,10 +841,83 @@ def _detect_asset_class(info: Any, symbol: str) -> Optional[str]:
                 return qt
     except Exception:
         pass
-    # best-effort fallback
     if symbol and symbol.endswith(".SR"):
         return "EQUITY"
     return None
+
+
+def _history_df_to_series(hist: Any) -> Tuple[List[float], Optional[datetime], Optional[Any]]:
+    closes: List[float] = []
+    hist_last_dt: Optional[datetime] = None
+    last_row = None
+    if hist is None:
+        return closes, hist_last_dt, last_row
+
+    try:
+        empty = getattr(hist, "empty", None)
+        if empty is True:
+            return closes, hist_last_dt, last_row
+    except Exception:
+        pass
+
+    try:
+        # last row / last timestamp
+        try:
+            last_row = hist.iloc[-1] if hasattr(hist, "iloc") else None
+        except Exception:
+            last_row = None
+
+        try:
+            idx = hist.index[-1]
+            hist_last_dt = idx.to_pydatetime() if hasattr(idx, "to_pydatetime") else idx
+        except Exception:
+            hist_last_dt = None
+
+        # closes list
+        try:
+            if _HAS_PANDAS and pd is not None:
+                c = hist["Close"].dropna().astype(float).tolist()
+            else:
+                c = [safe_float(x) for x in list(hist["Close"])]
+                c = [x for x in c if x is not None]
+            closes = [float(x) for x in c if x is not None and x > 0]
+        except Exception:
+            closes = []
+    except Exception:
+        return [], None, None
+
+    return closes, hist_last_dt, last_row
+
+
+def _history_df_to_list(hist: Any) -> List[Dict[str, Any]]:
+    """
+    Convert a yfinance history DF to list[{date, close}].
+    """
+    if hist is None:
+        return []
+    try:
+        empty = getattr(hist, "empty", None)
+        if empty is True:
+            return []
+    except Exception:
+        pass
+
+    out: List[Dict[str, Any]] = []
+    try:
+        idx = list(hist.index)
+        closes = list(hist["Close"])
+        for i in range(min(len(idx), len(closes))):
+            dt = idx[i]
+            c = safe_float(closes[i])
+            if c is None:
+                continue
+            if hasattr(dt, "to_pydatetime"):
+                dt = dt.to_pydatetime()
+            sdt = dt.isoformat() if hasattr(dt, "isoformat") else str(dt)
+            out.append({"date": sdt, "close": float(c)})
+    except Exception:
+        return []
+    return out
 
 
 @dataclass(slots=True)
@@ -778,16 +930,55 @@ class YahooChartProvider:
     max_concurrency: int = field(default_factory=_max_concurrency)
 
     quote_cache: AdvancedCache = field(default_factory=lambda: AdvancedCache("yahoo", _quote_ttl_sec()))
+    history_cache: AdvancedCache = field(default_factory=lambda: AdvancedCache("yahoo", _history_ttl_sec()))
     singleflight: SingleFlight = field(default_factory=SingleFlight)
 
     _sem: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(_max_concurrency()))
     _rate: TokenBucket = field(default_factory=lambda: TokenBucket(_rate_limit_per_sec(), float(_rate_limit_burst())))
     _cb: CircuitBreaker = field(default_factory=lambda: CircuitBreaker(_cb_fail_threshold(), _cb_cooldown_sec(), _cb_success_threshold()))
 
+    # -------------------------------------------------------------------------
+    # Blocking: history
+    # -------------------------------------------------------------------------
+    def _blocking_fetch_history(self, symbol: str, period: str, interval: str) -> Dict[str, Any]:
+        if not _HAS_YFINANCE or yf is None:
+            return {"symbol": symbol, "error": "yfinance_not_installed", "provider": PROVIDER_NAME}
+
+        last_err: Optional[Exception] = None
+        for attempt in range(max(1, int(self.retry_attempts))):
+            try:
+                t0 = time.time()
+                ticker = yf.Ticker(symbol)
+                hist = ticker.history(period=period, interval=interval, auto_adjust=False)
+                rows = _history_df_to_list(hist)
+                last_dt = None
+                try:
+                    if hist is not None and not getattr(hist, "empty", True):
+                        idx = hist.index[-1]
+                        last_dt = idx.to_pydatetime() if hasattr(idx, "to_pydatetime") else idx
+                except Exception:
+                    last_dt = None
+
+                return clean_dict(
+                    {
+                        "symbol": symbol,
+                        "provider": PROVIDER_NAME,
+                        "provider_version": PROVIDER_VERSION,
+                        "history": rows,
+                        "history_last_utc": _utc_iso(last_dt) if last_dt else None,
+                        "_fetch_ms": int((time.time() - t0) * 1000),
+                    }
+                )
+            except Exception as e:
+                last_err = e
+                base = min(5.0, 0.5 * (2 ** attempt))
+                time.sleep(random.uniform(0.0, base))
+        return {"symbol": symbol, "error": f"history_fetch_failed: {last_err}", "provider": PROVIDER_NAME}
+
+    # -------------------------------------------------------------------------
+    # Blocking: quote + computed stats
+    # -------------------------------------------------------------------------
     def _blocking_fetch(self, symbol: str) -> Dict[str, Any]:
-        """
-        Blocking call run inside a thread pool.
-        """
         if not _HAS_YFINANCE or yf is None:
             return {
                 "symbol": symbol,
@@ -862,67 +1053,42 @@ class YahooChartProvider:
                     name = safe_str(info.get("shortName") or info.get("longName"))
                     exchange = safe_str(info.get("exchange") or info.get("fullExchangeName"))
 
-                # History (for indicators + fallbacks)
+                # History (for indicators + risk stats)
                 closes: List[float] = []
                 hist_last_dt: Optional[datetime] = None
                 last_hist_row = None
 
                 try:
                     hist = ticker.history(period=_history_period(), interval=_history_interval(), auto_adjust=False)
-                    if hist is not None and not getattr(hist, "empty", True):
+                    closes, hist_last_dt, last_hist_row = _history_df_to_series(hist)
+
+                    # fallback price/prev close
+                    if closes:
+                        if price is None:
+                            price = float(closes[-1])
+                        if prev_close is None and len(closes) >= 2:
+                            prev_close = float(closes[-2])
+
+                    # fallback 52w from last 252 closes
+                    if (w52_high is None or w52_low is None) and closes:
+                        window = closes[-252:] if len(closes) > 252 else closes
+                        w52_high = w52_high or max(window)
+                        w52_low = w52_low or min(window)
+
+                    # fallback open/high/low/volume from last row
+                    if last_hist_row is not None:
                         try:
-                            last_hist_row = hist.iloc[-1] if hasattr(hist, "iloc") else None
+                            getter = last_hist_row.get if hasattr(last_hist_row, "get") else None
+                            if open_price is None:
+                                open_price = safe_float(getter("Open") if getter else last_hist_row["Open"])
+                            if day_high is None:
+                                day_high = safe_float(getter("High") if getter else last_hist_row["High"])
+                            if day_low is None:
+                                day_low = safe_float(getter("Low") if getter else last_hist_row["Low"])
+                            if volume is None:
+                                volume = safe_float(getter("Volume") if getter else last_hist_row["Volume"])
                         except Exception:
-                            last_hist_row = None
-
-                        # closes
-                        try:
-                            if _HAS_PANDAS and pd is not None:
-                                c = hist["Close"].dropna().astype(float).tolist()
-                            else:
-                                c = [safe_float(x) for x in list(hist["Close"])]
-                                c = [x for x in c if x is not None]
-                            closes = [float(x) for x in c if x is not None]
-                        except Exception:
-                            closes = []
-
-                        # last timestamp
-                        try:
-                            idx = hist.index[-1]
-                            hist_last_dt = idx.to_pydatetime() if hasattr(idx, "to_pydatetime") else idx
-                        except Exception:
-                            hist_last_dt = None
-
-                        # fallback price/open/prev close
-                        if closes:
-                            if price is None:
-                                price = float(closes[-1])
-                            if prev_close is None and len(closes) >= 2:
-                                prev_close = float(closes[-2])
-
-                        # fallback 52w
-                        if (w52_high is None or w52_low is None) and closes:
-                            try:
-                                window = closes[-252:] if len(closes) > 252 else closes
-                                w52_high = w52_high or max(window)
-                                w52_low = w52_low or min(window)
-                            except Exception:
-                                pass
-
-                        # fallback open/high/low/volume from last row
-                        if last_hist_row is not None:
-                            try:
-                                getter = last_hist_row.get if hasattr(last_hist_row, "get") else None
-                                if open_price is None:
-                                    open_price = safe_float(getter("Open") if getter else last_hist_row["Open"])
-                                if day_high is None:
-                                    day_high = safe_float(getter("High") if getter else last_hist_row["High"])
-                                if day_low is None:
-                                    day_low = safe_float(getter("Low") if getter else last_hist_row["Low"])
-                                if volume is None:
-                                    volume = safe_float(getter("Volume") if getter else last_hist_row["Volume"])
-                            except Exception:
-                                pass
+                            pass
                 except Exception:
                     closes = []
 
@@ -944,7 +1110,8 @@ class YahooChartProvider:
                 out["exchange"] = exchange
                 out["asset_class"] = asset_class
 
-                # Derived canonical
+                # Derived canonical (note: percent_change here is percent-points for backward-compat;
+                # engine normalization converts to fraction when needed)
                 if out.get("previous_close") not in (None, 0.0):
                     chg = out["current_price"] - float(out["previous_close"])
                     out["price_change"] = float(chg)
@@ -959,22 +1126,40 @@ class YahooChartProvider:
                         ((out["current_price"] - out["week_52_low"]) / (out["week_52_high"] - out["week_52_low"])) * 100.0
                     )
 
-                # Indicators + Forecasts
+                # Indicators + Forecasts + Risk Stats (PHASE D)
                 if closes:
+                    # RSI
                     rsi = _rsi_14(closes)
-                    vol = _volatility_30d(closes)
                     if rsi is not None:
                         out["rsi_14"] = float(rsi)
-                    if vol is not None:
-                        out["volatility_30d"] = float(vol)
 
+                    # Vols
+                    vol30 = _volatility_nd(closes, 30)
+                    vol90 = _volatility_nd(closes, 90)
+                    if vol30 is not None:
+                        out["volatility_30d"] = float(vol30)  # fraction (e.g., 0.25 == 25% ann.)
+                    if vol90 is not None:
+                        out["volatility_90d"] = float(vol90)
+
+                    # Drawdown / VaR / Sharpe
+                    dd1y = _max_drawdown_1y(closes)
+                    v95 = _var_95_1d(closes)
+                    sh = _sharpe_1y(closes)
+                    if dd1y is not None:
+                        out["max_drawdown_1y"] = float(dd1y)  # fraction magnitude (0.20 == 20%)
+                    if v95 is not None:
+                        out["var_95_1d"] = float(v95)         # fraction magnitude
+                    if sh is not None:
+                        out["sharpe_1y"] = float(sh)
+
+                    # Forecasts
                     f1, roi1, c1 = _simple_forecast(closes, horizon_days=30)
                     f3, roi3, c3 = _simple_forecast(closes, horizon_days=90)
                     f12, roi12, c12 = _simple_forecast(closes, horizon_days=365)
 
                     if f1 is not None:
                         out["forecast_price_1m"] = float(f1)
-                        out["expected_roi_1m"] = float(roi1) if roi1 is not None else None
+                        out["expected_roi_1m"] = float(roi1) if roi1 is not None else None  # percent-points
                     if f3 is not None:
                         out["forecast_price_3m"] = float(f3)
                         out["expected_roi_3m"] = float(roi3) if roi3 is not None else None
@@ -982,6 +1167,7 @@ class YahooChartProvider:
                         out["forecast_price_12m"] = float(f12)
                         out["expected_roi_12m"] = float(roi12) if roi12 is not None else None
 
+                    # confidence 0..1
                     conf_candidates = [x for x in [c1, c3, c12] if isinstance(x, (int, float))]
                     conf = max(0.0, min(1.0, float(min(conf_candidates) if conf_candidates else 0.0)))
                     out["forecast_confidence"] = float(conf)
@@ -1025,6 +1211,9 @@ class YahooChartProvider:
             "data_sources": [PROVIDER_NAME],
         }
 
+    # -------------------------------------------------------------------------
+    # Async public APIs
+    # -------------------------------------------------------------------------
     async def fetch_enriched_quote_patch(self, symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         if not _configured():
             return {
@@ -1045,7 +1234,6 @@ class YahooChartProvider:
                 "data_sources": [PROVIDER_NAME],
             }
 
-        # Circuit breaker
         if not await self._cb.allow():
             return {
                 "symbol": sym,
@@ -1057,7 +1245,6 @@ class YahooChartProvider:
 
         m = metrics()
 
-        # Cache
         cached = await self.quote_cache.get(sym, kind="quote")
         if cached is not None:
             m.cache_hits_total.labels(symbol=sym).inc()
@@ -1103,7 +1290,44 @@ class YahooChartProvider:
                         "data_sources": [PROVIDER_NAME],
                     }
 
-        return await self.singleflight.run(f"yahoo:{sym}", _do_fetch)
+        return await self.singleflight.run(f"yahoo:quote:{sym}", _do_fetch)
+
+    async def fetch_history(self, symbol: str, period: Optional[str] = None, interval: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Engine-friendly history endpoint:
+          returns list of dicts: {date, close}
+        """
+        if not _configured():
+            return []
+
+        sym = normalize_symbol(symbol)
+        if not sym:
+            return []
+
+        per = (period or _history_period()).strip() or _history_period()
+        itv = (interval or _history_interval()).strip() or _history_interval()
+
+        # cache
+        cached = await self.history_cache.get(sym, kind=f"history:{per}:{itv}")
+        if isinstance(cached, list):
+            return cached
+
+        async def _do_fetch() -> List[Dict[str, Any]]:
+            async with self._sem:
+                await self._rate.acquire(1.0)
+                loop = asyncio.get_running_loop()
+                payload = await loop.run_in_executor(_CPU_EXECUTOR, self._blocking_fetch_history, sym, per, itv)
+                if isinstance(payload, dict) and isinstance(payload.get("history"), list):
+                    rows = [r for r in payload["history"] if isinstance(r, dict) and r.get("close") is not None]
+                    await self.history_cache.set(sym, rows, kind=f"history:{per}:{itv}", ttl_sec=_history_ttl_sec())
+                    return rows
+                return []
+
+        return await self.singleflight.run(f"yahoo:history:{sym}:{per}:{itv}", _do_fetch)
+
+    # aliases
+    async def get_history(self, symbol: str, period: Optional[str] = None, interval: Optional[str] = None) -> List[Dict[str, Any]]:
+        return await self.fetch_history(symbol, period=period, interval=interval)
 
     async def fetch_batch(self, symbols: List[str], debug: bool = False) -> Dict[str, Dict[str, Any]]:
         syms = [normalize_symbol(s) for s in (symbols or [])]
@@ -1128,12 +1352,14 @@ class YahooChartProvider:
 
     async def clear_caches(self) -> None:
         await self.quote_cache.clear()
+        await self.history_cache.clear()
 
     async def get_metrics(self) -> Dict[str, Any]:
         return {
             "provider": self.name,
             "version": self.version,
-            "cache_size": await self.quote_cache.size(),
+            "quote_cache_size": await self.quote_cache.size(),
+            "history_cache_size": await self.history_cache.size(),
             "configured": _configured(),
             "prometheus_enabled": _prom_enabled(),
             "has_numpy": _HAS_NUMPY,
@@ -1182,6 +1408,14 @@ async def fetch_batch_patch(symbols: List[str], debug: bool = False) -> Dict[str
     return await (await aget_provider()).fetch_batch(symbols, debug=debug)
 
 
+async def fetch_history(symbol: str, period: Optional[str] = None, interval: Optional[str] = None) -> List[Dict[str, Any]]:
+    return await (await aget_provider()).fetch_history(symbol, period=period, interval=interval)
+
+
+async def get_history(symbol: str, period: Optional[str] = None, interval: Optional[str] = None) -> List[Dict[str, Any]]:
+    return await (await aget_provider()).get_history(symbol, period=period, interval=interval)
+
+
 async def get_client_metrics() -> Dict[str, Any]:
     return await (await aget_provider()).get_metrics()
 
@@ -1211,6 +1445,9 @@ class YahooProviderAdapter:
 
     async def fetch_quote(self, symbol: str) -> Dict[str, Any]:
         return await fetch_enriched_quote_patch(symbol)
+
+    async def history(self, symbol: str, period: Optional[str] = None, interval: Optional[str] = None) -> List[Dict[str, Any]]:
+        return await fetch_history(symbol, period=period, interval=interval)
 
     async def close(self) -> None:
         await aclose_yahoo_client()
@@ -1250,6 +1487,8 @@ if __name__ == "__main__":
         r = await fetch_enriched_quote_patch("AAPL")
         sys.stdout.write(json_dumps(r) + "\n")
         sys.stdout.write("=" * 70 + "\n")
+        h = await fetch_history("AAPL", period="6mo", interval="1d")
+        sys.stdout.write(f"history_rows={len(h)}\n")
 
     asyncio.run(_test())
 
@@ -1262,6 +1501,8 @@ __all__ = [
     "fetch_enriched_quote_patch",
     "fetch_quote_patch",
     "fetch_batch_patch",
+    "fetch_history",
+    "get_history",
     "get_client_metrics",
     "health_check",
     "clear_caches",
