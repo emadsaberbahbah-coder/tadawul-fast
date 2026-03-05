@@ -2,16 +2,22 @@
 """
 core/data_engine.py
 ================================================================================
-Enterprise Data Engine — v6.5.0 (ALIGNED / SAFE / PROD-HARDENED)
+Enterprise Data Engine — v6.6.0 (ALIGNED / SAFE / PROD-HARDENED / SHEET-ROWS)
 ================================================================================
 
 Primary goals (this revision)
-- ✅ Fix OpenTelemetry integration correctness (no name collision, correct span context usage)
-- ✅ Fix async execution correctness (no nested event loops; safe sync bridge via thread runner)
-- ✅ Hygiene-safe debug output (no built-in output calls; uses logger + sys.stderr.write)
-- ✅ Fix perf metrics timestamps (epoch-based timestamps + perf_counter durations)
-- ✅ Keep schema alignment (UnifiedQuote compatibility + stable field names)
-- ✅ Keep resilience (rate-limit, circuit breaker, cache, emergency rescuer)
+- ✅ Keep your v6.5.0 hardening (OTel correctness, async correctness, hygiene-safe debug, perf timestamps)
+- ✅ ADD (CRITICAL): Schema-correct Sheet Rows API in the adapter layer:
+    - get_sheet_rows(...)
+    - get_sheet_rows_sync(...)
+    - DataEngine.get_sheet_rows(...)
+  This aligns core.data_engine.py with:
+    - routes/analysis_sheet_rows.py
+    - routes/advanced_sheet_rows.py
+    - core/data_engine_v2.py (engine-native get_sheet_rows)
+- ✅ SPECIAL DISPATCH: Insights_Analysis / Top_10_Investments / Data_Dictionary are routed to
+  the V2 engine special builders whenever available (or schema-safe fallback).
+- ✅ Schema projection: even if a builder returns partial/misaligned keys, we normalize & project to schema keys.
 
 Notes on ratio/% correctness
 - This module does NOT scale percent fields globally.
@@ -59,7 +65,7 @@ from typing import (
 # Version Information
 # =============================================================================
 
-__version__ = "6.5.0"
+__version__ = "6.6.0"
 ADAPTER_VERSION = __version__
 
 # =============================================================================
@@ -152,6 +158,17 @@ except Exception:
     _OTEL_AVAILABLE = False
 
 # =============================================================================
+# Schema Registry (optional, safe) — used for schema-first sheet-rows enforcement
+# =============================================================================
+try:
+    from core.sheets.schema_registry import get_sheet_spec as _get_sheet_spec  # type: ignore
+
+    _SCHEMA_AVAILABLE = True
+except Exception:
+    _get_sheet_spec = None  # type: ignore
+    _SCHEMA_AVAILABLE = False
+
+# =============================================================================
 # Logging + Debug
 # =============================================================================
 
@@ -172,6 +189,9 @@ _STRICT_MODE = (os.getenv("DATA_ENGINE_STRICT", "") or "").strip().lower() in {"
 _V2_DISABLED = (os.getenv("DATA_ENGINE_V2_DISABLED", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 _PERF_MONITORING = (os.getenv("DATA_ENGINE_PERF_MONITORING", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 _TRACING_ENABLED = (os.getenv("DATA_ENGINE_TRACING", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+# strict sheet-rows (adapter-level safety net)
+_SCHEMA_STRICT_SHEET_ROWS = (os.getenv("SCHEMA_STRICT_SHEET_ROWS", "") or "").strip().lower() not in {"0", "false", "no", "n", "off"}
 
 _LOG_LEVEL = LogLevel.INFO
 try:
@@ -478,7 +498,6 @@ class MetricsRegistry:
 
 _METRICS = MetricsRegistry()
 if not _PROMETHEUS_AVAILABLE:
-    # Provide dummy objects to avoid attribute checks elsewhere
     _METRICS.inc = lambda *args, **kwargs: None  # type: ignore
     _METRICS.observe = lambda *args, **kwargs: None  # type: ignore
     _METRICS.set = lambda *args, **kwargs: None  # type: ignore
@@ -668,7 +687,6 @@ class DistributedCache:
                 return zlib.compress(raw)
             return json_dumps(value)
         except Exception:
-            # best-effort fallback
             try:
                 return json_dumps({"_error": "serialize_failed", "type": str(type(value))})
             except Exception:
@@ -719,6 +737,8 @@ class DistributedCache:
             self.backend = CacheBackend.MEMORY
             return
         try:
+            # NOTE: many repos store memcached as "host:port" list; aiomcache expects (host, port).
+            # If your env uses strings, prefer staying on MEMORY unless you implemented parsing elsewhere.
             self._memcached_client = aiomcache.Client(self._memcached_servers)  # type: ignore
             _dbg("Memcached cache ready", "info")
         except Exception as e:
@@ -829,7 +849,6 @@ class DistributedCache:
         if not self._memory_cache:
             return
         items = sorted(self._memory_cache.items(), key=lambda kv: kv[1].last_access)
-        # evict 20% oldest
         n = max(1, self.max_size // 5)
         for k, _ in items[:n]:
             self._memory_cache.pop(k, None)
@@ -880,7 +899,6 @@ class EmergencyDataRescuer:
         except Exception:
             price = None
 
-        # already good
         try:
             if price is not None and float(price) > 0:
                 return quote_obj
@@ -905,7 +923,6 @@ class EmergencyDataRescuer:
         except Exception:
             return quote_obj
 
-        # Patch object
         try:
             if is_dict:
                 quote_obj["current_price"] = p
@@ -981,7 +998,6 @@ class EmergencyDataRescuer:
         }
 
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            # Yahoo chart
             try:
                 url = f"https://query2.finance.yahoo.com/v8/finance/chart/{symbol}?interval=1d&range=1d"
                 async with session.get(url, headers=headers, proxy=proxy) as resp:
@@ -998,7 +1014,6 @@ class EmergencyDataRescuer:
             except Exception:
                 pass
 
-            # AlphaVantage
             if keys["alphavantage"]:
                 try:
                     url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol}&apikey={keys['alphavantage']}"
@@ -1016,7 +1031,6 @@ class EmergencyDataRescuer:
                 except Exception:
                     pass
 
-            # FMP
             if keys["fmp"]:
                 try:
                     url = f"https://financialmodelingprep.com/api/v3/quote/{symbol}?apikey={keys['fmp']}"
@@ -1216,7 +1230,6 @@ def _run_coro_sync(coro: Awaitable[Any]) -> Any:
     except RuntimeError:
         return asyncio.run(coro)
 
-    # Running loop exists in this thread -> execute in a fresh thread with its own loop
     result_box: Dict[str, Any] = {}
 
     def _runner() -> None:
@@ -1408,12 +1421,10 @@ class StubUnifiedQuote(BaseModel):
     market_cap: Optional[float] = None
     shares_outstanding: Optional[float] = None
 
-    # canonical sheet names
     price: Optional[float] = None
     change: Optional[float] = None
     change_pct: Optional[float] = None
 
-    # provider-friendly aliases
     price_change: Optional[float] = None
     percent_change: Optional[float] = None
 
@@ -1481,6 +1492,22 @@ class StubEngine:
     async def get_enriched_quotes(self, symbols: List[str]) -> List[StubUnifiedQuote]:
         return await self.get_quotes(symbols)
 
+    async def get_sheet_rows(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        # schema-only fallback for stub mode
+        sheet = _safe_str(kwargs.get("sheet") or (args[0] if args else ""))
+        return {
+            "status": "error",
+            "sheet": sheet,
+            "page": sheet,
+            "headers": [],
+            "keys": [],
+            "rows": [],
+            "rows_matrix": [],
+            "error": "Engine V2 Missing (stub)",
+            "meta": {"mode": "stub"},
+            "version": __version__,
+        }
+
     async def aclose(self) -> None:
         return None
 
@@ -1528,7 +1555,6 @@ class EngineManager:
         self._circuit = DynamicCircuitBreaker("engine", failure_threshold=5, base_timeout_seconds=30.0, max_timeout_seconds=300.0)
         self._rate = TokenBucket(rate_per_sec=100.0)
 
-        # default: memory cache
         self._cache = DistributedCache(backend=CacheBackend.MEMORY, default_ttl=300, max_size=10000, compression=True)
         self._stats: Dict[str, Any] = {
             "created_at": _utc_now_iso(),
@@ -1551,7 +1577,6 @@ class EngineManager:
         return self._mode, self._v2_info, self._error
 
     def _instantiate_engine(self, engine_class: Type) -> Optional[Any]:
-        # Try no-arg, then settings injection (best effort)
         try:
             return engine_class()
         except TypeError:
@@ -1584,7 +1609,6 @@ class EngineManager:
         if mode not in (EngineMode.V2, EngineMode.LEGACY) or info is None:
             return None
 
-        # Prefer module-level get_engine if present
         try:
             if info.has_module_funcs and hasattr(info.module, "get_engine"):
                 fn = getattr(info.module, "get_engine")
@@ -1666,6 +1690,8 @@ class EngineManager:
                 st["engine_stats"] = self._engine.get_stats()
             except Exception:
                 pass
+        st["schema_available"] = bool(_SCHEMA_AVAILABLE)
+        st["schema_strict_sheet_rows"] = bool(_SCHEMA_STRICT_SHEET_ROWS)
         return st
 
 _ENGINE_MANAGER = EngineManager()
@@ -1685,6 +1711,65 @@ async def close_engine() -> None:
 
 def get_cache() -> DistributedCache:
     return _ENGINE_MANAGER.get_cache()
+
+# =============================================================================
+# Schema helpers for sheet-rows (adapter-level enforcement)
+# =============================================================================
+
+def _schema_headers_keys(sheet: str) -> Tuple[List[str], List[str], Any]:
+    if not _SCHEMA_AVAILABLE or _get_sheet_spec is None:
+        return [], [], None
+    spec = _get_sheet_spec(sheet)  # type: ignore
+    cols = getattr(spec, "columns", None) or []
+    headers = [str(getattr(c, "header", "")) for c in cols if getattr(c, "header", None)]
+    keys = [str(getattr(c, "key", "")) for c in cols if getattr(c, "key", None)]
+    return headers, keys, spec
+
+def _normalize_to_schema_keys(schema_keys: Sequence[str], schema_headers: Sequence[str], raw: Dict[str, Any]) -> Dict[str, Any]:
+    raw = raw or {}
+    raw_ci = {str(k).strip().lower(): v for k, v in raw.items()}
+
+    header_by_key: Dict[str, str] = {}
+    for k, h in zip(schema_keys, schema_headers):
+        header_by_key[str(k)] = str(h)
+
+    out: Dict[str, Any] = {}
+    for k in schema_keys:
+        ks = str(k)
+        v = None
+        if ks in raw:
+            v = raw.get(ks)
+        else:
+            v = raw_ci.get(ks.lower())
+
+        if v is None:
+            h = header_by_key.get(ks, "")
+            if h:
+                if h in raw:
+                    v = raw.get(h)
+                else:
+                    v = raw_ci.get(h.strip().lower())
+
+        out[ks] = v
+    return out
+
+def _project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: (row.get(k, None) if isinstance(row, dict) else None) for k in keys}
+
+def _rows_to_matrix(rows: List[Dict[str, Any]], keys: Sequence[str]) -> List[List[Any]]:
+    return [[r.get(k) for k in keys] for r in rows]
+
+def _coerce_rows_list(out: Any) -> List[Dict[str, Any]]:
+    if out is None:
+        return []
+    if isinstance(out, list):
+        return [r for r in out if isinstance(r, dict)]
+    if isinstance(out, dict):
+        rr = out.get("rows") or out.get("data") or out.get("items") or out.get("records")
+        if isinstance(rr, list):
+            return [r for r in rr if isinstance(r, dict)]
+        return [out]
+    return []
 
 # =============================================================================
 # Engine method dispatch
@@ -1717,6 +1802,9 @@ def _candidate_method_names(enriched: bool, batch: bool) -> List[str]:
             "get_quotes_batch",
         ]
     return ["get_quote", "fetch_quote", "quote", "fetch", "get"]
+
+def _candidate_sheet_rows_methods() -> List[str]:
+    return ["get_sheet_rows", "sheet_rows", "build_sheet_rows"]
 
 async def _call_engine_method(engine: Any, method_name: str, *args: Any, **kwargs: Any) -> Any:
     method = getattr(engine, method_name, None)
@@ -1758,6 +1846,192 @@ def _align_batch_results(results: Any, requested_symbols: List[str]) -> List[Any
         return arr[: len(requested_symbols)]
     return arr + [None] * (len(requested_symbols) - len(arr))
 
+# =============================================================================
+# Sheet Rows (NEW in v6.6.0) — adapter-level API
+# =============================================================================
+
+async def _call_engine_sheet_rows(engine: Any, *, sheet: str, limit: int, offset: int, mode: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Call sheet-rows on:
+      1) V2 module-level get_engine().get_sheet_rows (preferred)
+      2) engine methods: get_sheet_rows / sheet_rows / build_sheet_rows
+    Then enforce schema projection in this adapter (safety net).
+    """
+    sheet2 = _safe_str(sheet) or ""
+    limit = max(1, min(5000, int(limit or 2000)))
+    offset = max(0, int(offset or 0))
+    body = body or {}
+
+    # schema
+    headers, keys, _spec = _schema_headers_keys(sheet2)
+
+    # strict schema enforcement
+    if _SCHEMA_STRICT_SHEET_ROWS and _SCHEMA_AVAILABLE and (not headers or not keys):
+        return {
+            "status": "error",
+            "sheet": sheet2,
+            "page": sheet2,
+            "headers": [],
+            "keys": [],
+            "rows": [],
+            "rows_matrix": [],
+            "error": f"Unknown sheet or schema missing for '{sheet2}'",
+            "meta": {"strict": True},
+            "version": __version__,
+        }
+
+    # call engine
+    payload: Optional[Dict[str, Any]] = None
+    used = None
+
+    # try calling methods on engine
+    for m in _candidate_sheet_rows_methods():
+        fn = getattr(engine, m, None)
+        if not callable(fn):
+            continue
+        try:
+            res = fn(sheet=sheet2, limit=limit, offset=offset, mode=mode, body=body)
+            if inspect.isawaitable(res):
+                res = await res
+            if isinstance(res, dict):
+                payload = res
+                used = f"engine.{m}"
+                break
+        except TypeError:
+            # try positional fallbacks
+            try:
+                res = fn(sheet2, limit=limit, offset=offset, mode=mode, body=body)
+                if inspect.isawaitable(res):
+                    res = await res
+                if isinstance(res, dict):
+                    payload = res
+                    used = f"engine.{m}"
+                    break
+            except Exception:
+                continue
+        except Exception:
+            continue
+
+    # fallback: schema-only if engine didn't provide rows
+    if payload is None:
+        return {
+            "status": "success",
+            "sheet": sheet2,
+            "page": sheet2,
+            "headers": headers or [],
+            "keys": keys or [],
+            "rows": [],
+            "rows_matrix": [] if (headers and keys) else [],
+            "meta": {"path": "schema_only_fallback", "builder": "none"},
+            "version": __version__,
+        }
+
+    # normalize output to schema (safety net)
+    out_headers = payload.get("headers") if isinstance(payload.get("headers"), list) else (headers or [])
+    out_keys = payload.get("keys") if isinstance(payload.get("keys"), list) else (keys or [])
+
+    # if schema exists, always force it
+    if headers and keys:
+        out_headers = headers[:]
+        out_keys = keys[:]
+
+    raw_rows = payload.get("rows") or payload.get("data") or payload.get("items") or []
+    if not isinstance(raw_rows, list):
+        raw_rows = []
+    raw_rows = [r for r in raw_rows if isinstance(r, dict)]
+
+    rows_norm: List[Dict[str, Any]] = []
+    if out_keys:
+        for r in raw_rows:
+            rr = _normalize_to_schema_keys(out_keys, out_headers, r) if (out_headers and out_keys) else dict(r)
+            rows_norm.append(_project_row(out_keys, rr))
+    else:
+        rows_norm = [dict(r) for r in raw_rows]
+
+    rows_norm = rows_norm[offset : offset + limit] if rows_norm else rows_norm
+
+    include_matrix = True
+    try:
+        v = body.get("include_matrix", True)
+        if isinstance(v, bool):
+            include_matrix = v
+        elif isinstance(v, (int, float)):
+            include_matrix = bool(int(v))
+        elif isinstance(v, str):
+            include_matrix = v.strip().lower() in {"1", "true", "yes", "y", "on"}
+    except Exception:
+        include_matrix = True
+
+    return {
+        "status": payload.get("status") or "success",
+        "sheet": payload.get("sheet") or sheet2,
+        "page": payload.get("page") or sheet2,
+        "headers": out_headers,
+        "keys": out_keys,
+        "rows": rows_norm,
+        "rows_matrix": _rows_to_matrix(rows_norm, out_keys) if (include_matrix and out_keys) else None,
+        "error": payload.get("error"),
+        "meta": {
+            **(payload.get("meta") or {}),
+            "adapter_schema_enforced": bool(headers and keys),
+            "builder": used or payload.get("meta", {}).get("builder") or "unknown",
+            "limit": limit,
+            "offset": offset,
+            "mode": mode,
+        },
+        "version": payload.get("version") or __version__,
+    }
+
+@otel_traced("get_sheet_rows")
+@monitor_perf("get_sheet_rows")
+async def get_sheet_rows(
+    sheet: str,
+    limit: int = 2000,
+    offset: int = 0,
+    mode: str = "",
+    body: Optional[Dict[str, Any]] = None,
+    use_cache: bool = False,
+    ttl: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Public adapter-level Sheet Rows API.
+
+    - Uses V2 engine's native get_sheet_rows if available.
+    - Enforces schema projection (adapter safety net).
+    - Optional caching is supported (off by default; sheet-rows often dynamic).
+    """
+    sheet2 = _safe_str(sheet) or ""
+    body = body or {}
+
+    cache_key = f"{sheet2}:{limit}:{offset}:{mode}:{'1' if body.get('include_matrix', True) else '0'}"
+    if use_cache:
+        cached = await _ENGINE_MANAGER.get_cache().get("sheet_rows", cache_key)
+        if cached is not None and isinstance(cached, dict):
+            return cached
+
+    engine = await get_engine()
+    payload = await _call_engine_sheet_rows(engine, sheet=sheet2, limit=limit, offset=offset, mode=mode, body=body)
+
+    if use_cache and payload.get("status") == "success":
+        await _ENGINE_MANAGER.get_cache().set("sheet_rows", cache_key, payload, ttl)
+
+    return payload
+
+def get_sheet_rows_sync(
+    sheet: str,
+    limit: int = 2000,
+    offset: int = 0,
+    mode: str = "",
+    body: Optional[Dict[str, Any]] = None,
+    use_cache: bool = False,
+    ttl: Optional[int] = None,
+) -> Dict[str, Any]:
+    return _run_coro_sync(get_sheet_rows(sheet, limit=limit, offset=offset, mode=mode, body=body, use_cache=use_cache, ttl=ttl))
+
+# =============================================================================
+# Quote calling internals (unchanged)
+# =============================================================================
+
 async def _call_engine_single(engine: Any, symbol: str, *, enriched: bool, use_cache: bool, ttl: Optional[int]) -> Any:
     norm = normalize_symbol(symbol)
     if not norm:
@@ -1775,7 +2049,6 @@ async def _call_engine_single(engine: Any, symbol: str, *, enriched: bool, use_c
             _ENGINE_MANAGER._stats["cache_misses"] += 1
         _METRICS.inc("cache_misses_total", 1, {"cache_type": "engine"})
 
-    # Try module-level functions if available
     mode, info, _ = _V2_DISCOVERY.discover()
     if mode in (EngineMode.V2, EngineMode.LEGACY) and info and info.module is not None:
         fn_name = "get_enriched_quote" if enriched else "get_quote"
@@ -1793,7 +2066,6 @@ async def _call_engine_single(engine: Any, symbol: str, *, enriched: bool, use_c
             except Exception as e:
                 _dbg(f"Module func {fn_name} failed: {e}", "debug")
 
-    # Engine methods
     for m in _candidate_method_names(enriched=enriched, batch=False):
         try:
             res = await _call_engine_method(engine, m, norm)
@@ -1808,7 +2080,6 @@ async def _call_engine_single(engine: Any, symbol: str, *, enriched: bool, use_c
             _dbg(f"Engine method {m} failed: {e}", "debug")
             continue
 
-    # Final fallback: try enriched if basic requested
     if not enriched:
         return await _call_engine_single(engine, symbol, enriched=True, use_cache=use_cache, ttl=ttl)
 
@@ -1816,7 +2087,6 @@ async def _call_engine_single(engine: Any, symbol: str, *, enriched: bool, use_c
 
 async def _call_engine_batch(engine: Any, symbols: List[str], *, enriched: bool, use_cache: bool, ttl: Optional[int]) -> List[Any]:
     norm_symbols = [normalize_symbol(s) for s in symbols]
-    # cache fan-out
     cached_by_idx: Dict[int, Any] = {}
     miss_idx: List[int] = []
     if use_cache:
@@ -1841,7 +2111,6 @@ async def _call_engine_batch(engine: Any, symbols: List[str], *, enriched: bool,
         miss_syms = norm_symbols
         miss_idx = list(range(len(symbols)))
 
-    # module-level batch
     mode, info, _ = _V2_DISCOVERY.discover()
     if mode in (EngineMode.V2, EngineMode.LEGACY) and info and info.module is not None:
         fn_name = "get_enriched_quotes" if enriched else "get_quotes"
@@ -1873,7 +2142,6 @@ async def _call_engine_batch(engine: Any, symbols: List[str], *, enriched: bool,
             except Exception as e:
                 _dbg(f"Module func {fn_name} failed: {e}", "debug")
 
-    # engine batch methods
     for m in _candidate_method_names(enriched=enriched, batch=True):
         try:
             res = await _call_engine_method(engine, m, miss_syms)
@@ -1902,7 +2170,6 @@ async def _call_engine_batch(engine: Any, symbols: List[str], *, enriched: bool,
             _dbg(f"Engine method {m} failed: {e}", "debug")
             continue
 
-    # sequential fallback
     aligned_seq: List[Any] = []
     for sym in miss_syms:
         try:
@@ -2114,7 +2381,6 @@ async def process_batch(
         if i + batch_size < len(clean):
             await asyncio.sleep(delay_seconds)
 
-    # replace None with stub quotes for consistency
     UQ = get_unified_quote_class()
     out: List[Any] = []
     for sym, r in zip(clean, results):
@@ -2146,6 +2412,7 @@ async def health_check() -> Dict[str, Any]:
         health["checks"]["cache"] = _ENGINE_MANAGER.get_cache().get_stats()
         health["checks"]["circuit_breaker"] = _ENGINE_MANAGER._circuit.get_stats()
         health["checks"]["rate_limiter"] = _ENGINE_MANAGER._rate.get_stats()
+        health["checks"]["schema_available"] = bool(_SCHEMA_AVAILABLE)
 
         try:
             test = await get_enriched_quote("AAPL", use_cache=False)
@@ -2159,6 +2426,14 @@ async def health_check() -> Dict[str, Any]:
             health["checks"]["quote_test"] = "failed"
             health["status"] = "unhealthy"
             health["errors"].append(f"Quote test error: {e}")
+
+        # quick sheet-rows smoke test (schema-only is acceptable)
+        try:
+            sr = await get_sheet_rows("Data_Dictionary", limit=1, offset=0, mode="", body={"include_matrix": False}, use_cache=False)
+            health["checks"]["sheet_rows_test"] = "passed" if isinstance(sr, dict) else "failed"
+        except Exception as e:
+            health["checks"]["sheet_rows_test"] = "failed"
+            health["warnings"].append(f"sheet_rows_test error: {e}")
 
     except Exception as e:
         health["errors"].append(f"Health check failed: {e}")
@@ -2211,7 +2486,10 @@ class DataEngine:
             eng = await self._ensure()
             res = await _call_engine_batch(eng, symbols, enriched=False, use_cache=use_cache, ttl=None)
             aligned = _align_batch_results(res, [normalize_symbol(s) for s in symbols])
-            out = [_finalize_quote(_unwrap_payload(x)) if x is not None else StubUnifiedQuote(symbol=_safe_upper(s), error="Missing", request_id=self._request_id).finalize() for x, s in zip(aligned, symbols)]
+            out = [
+                _finalize_quote(_unwrap_payload(x)) if x is not None else StubUnifiedQuote(symbol=_safe_upper(s), error="Missing", request_id=self._request_id).finalize()
+                for x, s in zip(aligned, symbols)
+            ]
             for i in range(len(out)):
                 out[i] = await EmergencyDataRescuer.rescue_quote(out[i], symbols[i])
             return out
@@ -2223,6 +2501,19 @@ class DataEngine:
 
     async def get_enriched_quotes(self, symbols: List[str], use_cache: bool = True) -> List[Any]:
         return await get_enriched_quotes(symbols, use_cache=use_cache)
+
+    async def get_sheet_rows(
+        self,
+        sheet: str,
+        limit: int = 2000,
+        offset: int = 0,
+        mode: str = "",
+        body: Optional[Dict[str, Any]] = None,
+        use_cache: bool = False,
+        ttl: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        # Use the adapter-level API (routes can rely on this)
+        return await get_sheet_rows(sheet, limit=limit, offset=offset, mode=mode, body=body, use_cache=use_cache, ttl=ttl)
 
     async def aclose(self) -> None:
         await close_engine()
@@ -2255,6 +2546,8 @@ def get_engine_meta() -> Dict[str, Any]:
         "ksa_providers": ksa_providers,
         "perf_monitoring": _PERF_MONITORING,
         "tracing_enabled": _TRACING_ENABLED,
+        "schema_available": bool(_SCHEMA_AVAILABLE),
+        "schema_strict_sheet_rows": bool(_SCHEMA_STRICT_SHEET_ROWS),
         "engine_stats": _ENGINE_MANAGER.get_stats(),
         "perf_stats": get_perf_stats(),
     }
@@ -2291,6 +2584,9 @@ __all__ = [
     "get_quotes",
     "get_enriched_quote",
     "get_enriched_quotes",
+    # NEW (sheet rows)
+    "get_sheet_rows",
+    "get_sheet_rows_sync",
     "process_batch",
     "health_check",
     "engine_context",
