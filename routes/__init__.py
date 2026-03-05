@@ -2,20 +2,21 @@
 """
 routes/__init__.py
 ------------------------------------------------------------
-Routes package initialization (PROD SAFE) — v3.1.0 (PHASE-8 SCHEMA-FIRST, NO NOISY MISSING)
+Routes package initialization (PROD SAFE) — v3.2.0 (PHASE-8 SCHEMA-FIRST, JSON-SAFE REPORTS)
 
-What this revision fixes (your “red X / noisy missing” symptom)
+Fixes (your “red X / report issue” symptom)
+- ✅ Reports are ALWAYS JSON-serializable:
+    - ModuleInfo dataclasses -> dict
+    - Enums -> .value
+    - No raw dataclass objects stored in report["missing"]/["failed"]
 - ✅ Default mount plan only includes modules that actually exist -> missing=0 in normal mode
-- ✅ Removed legacy expected modules that were producing noisy warnings:
-    routes.sheet_rows, routes.sheets, routes.sheet_data, routes.sheet_rows_v2, routes.insights_analysis
-- ✅ Keeps preference families (one winner per family) to avoid duplicate /sheet-rows endpoints:
+- ✅ Filters legacy/removed routers even if someone mistakenly sets ROUTES_EXPECTED / ROUTES_REQUIRED with old names
+- ✅ Preference families (one winner per family) to prevent duplicate /sheet-rows endpoints:
     - Analysis:   ai_analysis > analysis_sheet_rows
     - Advanced:  advanced_analysis > advanced_sheet_rows
     - Advisor:   investment_advisor > advisor
-- ✅ Schema-first preflight is done at mount-time (not import-time):
-    - schema_registry validate_schema_registry()
-    - page_catalog validate_page_catalog() (if available)
-- ✅ Import-time is safe: no network calls, no heavy init
+- ✅ Schema-first preflight is done at mount-time (not import-time)
+- ✅ Import-time remains safe: no network calls, no heavy init
 
 Environment overrides (optional)
 - ROUTES_EXPECTED="routes.config,routes.enriched_quote,..."
@@ -38,19 +39,28 @@ import pkgutil
 import sys
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from functools import lru_cache, wraps
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
-ROUTES_PACKAGE_VERSION = "3.1.0"
+ROUTES_PACKAGE_VERSION = "3.2.0"
 
 # =============================================================================
 # Small env helpers (no deps)
 # =============================================================================
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
+
+# Legacy modules we never want to warn about (or mount) in Phase-8
+_LEGACY_REMOVED: Set[str] = {
+    "routes.sheet_rows",
+    "routes.sheets",
+    "routes.sheet_data",
+    "routes.sheet_rows_v2",
+    "routes.insights_analysis",
+}
 
 
 def coerce_bool(val: Any, default: bool = False) -> bool:
@@ -146,6 +156,41 @@ class RouterSpec:
     module: str
     group: ModuleGroup
     required: bool = False
+
+
+# =============================================================================
+# JSON-safe conversions (prevents “red X / report serialization” issues)
+# =============================================================================
+def _enum_to_value(x: Any) -> Any:
+    if isinstance(x, Enum):
+        return x.value
+    return x
+
+
+def _to_jsonable(obj: Any) -> Any:
+    """
+    Convert common internal objects to JSON-serializable forms.
+    Keep it lightweight and dependency-free.
+    """
+    if obj is None:
+        return None
+    if isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, Enum):
+        return obj.value
+    if is_dataclass(obj):
+        d = asdict(obj)
+        return {k: _to_jsonable(v) for k, v in d.items()}
+    if isinstance(obj, dict):
+        return {str(k): _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_to_jsonable(v) for v in obj]
+    # last resort
+    return str(obj)
+
+
+def module_info_to_dict(info: ModuleInfo) -> Dict[str, Any]:
+    return _to_jsonable(info)  # type: ignore[return-value]
 
 
 # =============================================================================
@@ -310,6 +355,22 @@ def _normalize_module_name(module_path: str) -> str:
     return s.strip(".")
 
 
+def _filter_legacy(mods: Sequence[str]) -> List[str]:
+    """
+    Drop legacy/removed modules to prevent noisy missing/failed reports if
+    someone incorrectly sets ROUTES_EXPECTED/ROUTES_REQUIRED with old values.
+    """
+    out: List[str] = []
+    for m in mods:
+        mn = _normalize_module_name(m)
+        if not mn:
+            continue
+        if mn in _LEGACY_REMOVED:
+            continue
+        out.append(mn)
+    return out
+
+
 @lru_cache(maxsize=4096)
 def _find_spec_cached(module_name: str) -> Tuple[bool, Optional[str]]:
     mn = _normalize_module_name(module_name)
@@ -399,35 +460,32 @@ def get_expected_router_modules() -> List[str]:
     """
     Default expected router modules.
     Override via ROUTES_EXPECTED.
-
-    IMPORTANT:
-    - We intentionally do NOT include removed legacy modules:
-        routes.sheet_rows, routes.sheets, routes.sheet_data, routes.sheet_rows_v2, routes.insights_analysis
     """
     override = _parse_env_list("ROUTES_EXPECTED")
     if override:
-        return [_normalize_module_name(x) for x in override if _normalize_module_name(x)]
+        return _filter_legacy(override)
 
     # Keep wrappers first to avoid duplicates:
-    # - ai_analysis wraps analysis_sheet_rows
-    # - advanced_analysis wraps advanced_sheet_rows
     candidates = [
         "routes.config",
         "routes.enriched_quote",
-        "routes.routes_argaam",       # optional, mounted only if exists
-        "routes.data_dictionary",     # optional, mounted only if exists
+        "routes.routes_argaam",       # optional
+        "routes.data_dictionary",     # optional
+
         # Analysis family (winner chosen below)
         "routes.ai_analysis",
         "routes.analysis_sheet_rows",
+
         # Advanced family (winner chosen below)
         "routes.advanced_analysis",
         "routes.advanced_sheet_rows",
+
         # Top10 + Advisor (optional)
         "routes.top10_investments",
         "routes.investment_advisor",
         "routes.advisor",
     ]
-    return [_normalize_module_name(x) for x in candidates if _normalize_module_name(x)]
+    return _filter_legacy(candidates)
 
 
 def _auto_discover_router_modules() -> List[str]:
@@ -449,7 +507,7 @@ def _auto_discover_router_modules() -> List[str]:
             if name.split(".")[-1].startswith("_"):
                 continue
             discovered.append(name)
-        return sorted(set(discovered))
+        return sorted(set(_filter_legacy(discovered)))
     except Exception:
         _metrics.record_error(ErrorCategory.UNKNOWN)
         return []
@@ -468,7 +526,7 @@ def _apply_preference_families(mods: List[str]) -> List[str]:
     Keeps only the first module in each preference family.
     Assumes mods are already ordered by preference.
     """
-    s = [_normalize_module_name(x) for x in mods if _normalize_module_name(x)]
+    s = _filter_legacy(mods)
     out: List[str] = []
     seen: Set[str] = set()
 
@@ -509,7 +567,7 @@ def _apply_preference_families(mods: List[str]) -> List[str]:
 def get_router_discovery(expected: Optional[Sequence[str]] = None) -> Dict[str, bool]:
     exp = list(expected) if expected is not None else get_expected_router_modules()
     auto = _auto_discover_router_modules()
-    merged = list(dict.fromkeys([_normalize_module_name(x) for x in (exp + auto) if _normalize_module_name(x)]))
+    merged = list(dict.fromkeys(_filter_legacy(exp + auto)))
     merged = _apply_preference_families(merged)
     return {m: module_exists(m) for m in merged}
 
@@ -529,7 +587,7 @@ def get_mount_plan(expected: Optional[Sequence[str]] = None) -> List[str]:
     exp = list(expected) if expected is not None else get_expected_router_modules()
     auto = _auto_discover_router_modules()
 
-    merged = list(dict.fromkeys([_normalize_module_name(x) for x in (exp + auto) if _normalize_module_name(x)]))
+    merged = list(dict.fromkeys(_filter_legacy(exp + auto)))
     merged = _apply_preference_families(merged)
 
     existing = [m for m in merged if module_exists(m)]
@@ -540,8 +598,9 @@ def get_mount_plan(expected: Optional[Sequence[str]] = None) -> List[str]:
 
 
 def _required_set_from_env() -> Set[str]:
-    req = set(_parse_env_list("ROUTES_REQUIRED"))
-    return {_normalize_module_name(x) for x in req if _normalize_module_name(x)}
+    req = _parse_env_list("ROUTES_REQUIRED")
+    req = _filter_legacy(req)
+    return set(req)
 
 
 def build_router_specs(expected: Optional[Sequence[str]] = None) -> List[RouterSpec]:
@@ -552,9 +611,7 @@ def build_router_specs(expected: Optional[Sequence[str]] = None) -> List[RouterS
     required = _required_set_from_env()
     plan = get_mount_plan(expected)
 
-    # also try required modules even if they don't exist (to surface error clearly in strict mode)
     merged = list(dict.fromkeys(plan + sorted(required)))
-
     specs = [RouterSpec(module=m, group=_group_of(m), required=(m in required)) for m in merged]
     specs.sort(key=lambda x: (x.group.priority, x.module))
     return specs
@@ -694,7 +751,10 @@ def _router_keys(router: Any) -> Set[Tuple[str, str]]:
     for r in routes:
         path = getattr(r, "path", "") or ""
         methods = getattr(r, "methods", None) or set()
-        full = f"{prefix}{path}"
+        # FastAPI usually already bakes prefix into r.path; guard against double prefix
+        full = str(path)
+        if prefix and not full.startswith(prefix):
+            full = f"{prefix}{full}"
         for m in methods:
             keys.add((str(m).upper(), str(full)))
     return keys
@@ -722,7 +782,6 @@ def _schema_preflight() -> Dict[str, Any]:
         if callable(validate):
             validate()
 
-        # Optional: validate page catalog too (prevents alias routing drift)
         try:
             from core.sheets import page_catalog as pc  # type: ignore
 
@@ -758,9 +817,9 @@ def mount_routers(app: Any, *, expected: Optional[Sequence[str]] = None, strict:
         "timestamp_utc": _utc_iso(),
         "schema": _schema_preflight(),
         "preference_families": {
-            "analysis_family": _ANALYSIS_FAMILY,
-            "advanced_family": _ADVANCED_FAMILY,
-            "advisor_family": _ADVISOR_FAMILY,
+            "analysis_family": list(_ANALYSIS_FAMILY),
+            "advanced_family": list(_ADVANCED_FAMILY),
+            "advisor_family": list(_ADVISOR_FAMILY),
         },
     }
 
@@ -770,26 +829,22 @@ def mount_routers(app: Any, *, expected: Optional[Sequence[str]] = None, strict:
         router, mount_fn, info = load_mount_target(spec.module)
 
         if router is None and mount_fn is None:
-            # Missing modules only appear here if they are explicitly required (or user forced them)
             if info.status == ModuleStatus.MISSING:
-                report["missing"].append(info)
+                report["missing"].append(module_info_to_dict(info))
                 if strict_mode and (spec.required or spec.module in required):
                     raise RuntimeError(f"Required router missing: {spec.module} ({info.error})")
             else:
-                report["failed"].append(info)
+                report["failed"].append(module_info_to_dict(info))
                 if strict_mode and (spec.required or spec.module in required):
                     raise RuntimeError(f"Required router failed: {spec.module} ({info.error})")
             continue
 
-        # Duplicate guard if router object exists
+        # Duplicate guard
         if router is not None and skip_dups:
             try:
                 keys = _router_keys(router)
                 dups = sorted([f"{m} {p}" for (m, p) in (keys & existing_keys)])
                 if dups:
-                    info.status = ModuleStatus.FAILED
-                    info.error = "duplicate routes"
-                    info.error_category = ErrorCategory.DUPLICATE
                     report["skipped_duplicates"][spec.module] = dups
                     _metrics.record_error(ErrorCategory.DUPLICATE)
                     if strict_mode and (spec.required or spec.module in required):
@@ -818,7 +873,7 @@ def mount_routers(app: Any, *, expected: Optional[Sequence[str]] = None, strict:
             info.status = ModuleStatus.FAILED
             info.error = "no usable mount target"
             info.error_category = ErrorCategory.ROUTER_MISSING
-            report["failed"].append(info)
+            report["failed"].append(module_info_to_dict(info))
             if strict_mode and (spec.required or spec.module in required):
                 raise RuntimeError(f"Required router has no mount target: {spec.module}")
 
@@ -826,12 +881,19 @@ def mount_routers(app: Any, *, expected: Optional[Sequence[str]] = None, strict:
             info.status = ModuleStatus.FAILED
             info.error = _err_str(e)
             info.error_category = ErrorCategory.UNKNOWN
-            report["failed"].append(info)
+            report["failed"].append(module_info_to_dict(info))
             _metrics.record_error(ErrorCategory.UNKNOWN)
             if strict_mode and (spec.required or spec.module in required):
                 raise
 
-    return report
+    # Helpful summary (always JSON safe)
+    report["summary"] = {
+        "mounted": len(report.get("mounted", [])),
+        "missing": len(report.get("missing", [])),
+        "failed": len(report.get("failed", [])),
+        "skipped_duplicates": len(report.get("skipped_duplicates", {})),
+    }
+    return _to_jsonable(report)  # enforce JSON-safe output
 
 
 # =============================================================================
@@ -840,7 +902,7 @@ def mount_routers(app: Any, *, expected: Optional[Sequence[str]] = None, strict:
 def get_dependency_audit(expected: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     exp = list(expected) if expected is not None else get_expected_router_modules()
     auto = _auto_discover_router_modules()
-    merged = list(dict.fromkeys([_normalize_module_name(x) for x in (exp + auto) if _normalize_module_name(x)]))
+    merged = list(dict.fromkeys(_filter_legacy(exp + auto)))
     merged = _apply_preference_families(merged)
 
     discovery = {m: module_exists(m) for m in merged}
@@ -857,6 +919,7 @@ def get_dependency_audit(expected: Optional[Sequence[str]] = None) -> Dict[str, 
         "missing_modules": sorted(missing),
         "package_version": ROUTES_PACKAGE_VERSION,
         "auto_discover_enabled": coerce_bool(os.getenv("ROUTES_AUTO_DISCOVER", ""), False),
+        "legacy_filtered": sorted(_LEGACY_REMOVED),
     }
 
 
@@ -877,32 +940,36 @@ def get_cache_info() -> Dict[str, Any]:
 
 
 def get_routes_debug_snapshot() -> Dict[str, Any]:
-    return {
+    return _to_jsonable(
+        {
+            "version": ROUTES_PACKAGE_VERSION,
+            "timestamp_utc": _utc_iso(),
+            "expected": get_expected_router_modules(),
+            "mount_plan": get_mount_plan(),
+            "audit": get_dependency_audit(),
+        }
+    )
+
+
+def get_routes_debug_snapshot_enhanced() -> Dict[str, Any]:
+    base = {
         "version": ROUTES_PACKAGE_VERSION,
         "timestamp_utc": _utc_iso(),
         "expected": get_expected_router_modules(),
         "mount_plan": get_mount_plan(),
         "audit": get_dependency_audit(),
+        "schema": _schema_preflight(),
+        "metrics": get_metrics().get_stats(),
+        "cache_info": get_cache_info(),
+        "circuit_breaker": _circuit_breaker.snapshot(),
+        "python": {"version": sys.version, "platform": sys.platform},
+        "preference_families": {
+            "analysis_family": list(_ANALYSIS_FAMILY),
+            "advanced_family": list(_ADVANCED_FAMILY),
+            "advisor_family": list(_ADVISOR_FAMILY),
+        },
     }
-
-
-def get_routes_debug_snapshot_enhanced() -> Dict[str, Any]:
-    base = get_routes_debug_snapshot()
-    base.update(
-        {
-            "schema": _schema_preflight(),
-            "metrics": get_metrics().get_stats(),
-            "cache_info": get_cache_info(),
-            "circuit_breaker": _circuit_breaker.snapshot(),
-            "python": {"version": sys.version, "platform": sys.platform},
-            "preference_families": {
-                "analysis_family": _ANALYSIS_FAMILY,
-                "advanced_family": _ADVANCED_FAMILY,
-                "advisor_family": _ADVISOR_FAMILY,
-            },
-        }
-    )
-    return base
+    return _to_jsonable(base)
 
 
 __all__ = [
@@ -930,4 +997,5 @@ __all__ = [
     "get_cache_info",
     "get_metrics",
     "CircuitBreaker",
+    "module_info_to_dict",
 ]
