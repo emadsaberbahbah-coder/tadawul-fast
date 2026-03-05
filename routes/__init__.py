@@ -2,19 +2,19 @@
 """
 routes/__init__.py
 ------------------------------------------------------------
-Routes package initialization (PROD SAFE) — v2.8.0 (PHASE-8 ALIGNED)
+Routes package initialization (PROD SAFE) — v2.9.0 (PHASE-8+ SCHEMA-FIRST)
 
-Design goals
-- ✅ Render/Prod-safe: zero network, zero heavy imports at module import-time
-- ✅ Deterministic mount order (Phase-8 wiring, schema-first)
-- ✅ Fast existence checks (find_spec) with LRU caching + async helpers
-- ✅ Circuit breaker for IMPORT failures (not for mere "missing spec")
-- ✅ Preference families (mount ONLY one router per family):
-    - Analysis sheet-rows: ai_analysis > insights_analysis > analysis_sheet_rows
+Why this revision (your wiring concern):
+- ✅ Ensures "schema-first" initialization happens at MOUNT time (not import time):
+    - best-effort import core.sheets.schema_registry + validate_schema_registry()
+    - records schema status in mount report + debug snapshot
+- ✅ Adds an ADVANCED preference family to prevent duplicate /v1/advanced/sheet-rows:
+    - Advanced: advanced_analysis > advanced_sheet_rows
+- ✅ Keeps ANALYSIS preference family (single winner):
+    - Analysis: ai_analysis > insights_analysis > analysis_sheet_rows
+- ✅ Keeps ADVISOR preference family:
     - Advisor: investment_advisor > advisor
-- ✅ Graceful degradation: missing/broken routers don't crash unless strict enabled
-- ✅ Optional duplicate-route guard (prevents FastAPI crash on duplicate path+method)
-- ✅ Rich debug snapshot for main.py /_debug/routes
+- ✅ Keeps all prior design goals: no network calls, circuit breaker, optional duplicate guard
 
 Environment overrides (optional)
 - ROUTES_EXPECTED="routes.config,routes.enriched_quote,..."
@@ -44,7 +44,7 @@ from enum import Enum
 from functools import lru_cache, wraps
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
-ROUTES_PACKAGE_VERSION = "2.8.0"
+ROUTES_PACKAGE_VERSION = "2.9.0"
 
 # =============================================================================
 # Small env helpers (no deps)
@@ -83,11 +83,11 @@ def _utc_iso() -> str:
 # Enums and Types
 # =============================================================================
 class ModuleStatus(Enum):
-    AVAILABLE = "available"  # spec exists (importable in principle)
-    MISSING = "missing"  # spec not found
-    ERROR = "error"  # unexpected error during check
-    LOADED = "loaded"  # imported + router/mount extracted
-    FAILED = "failed"  # import failed or router/mount missing
+    AVAILABLE = "available"
+    MISSING = "missing"
+    ERROR = "error"
+    LOADED = "loaded"
+    FAILED = "failed"
 
 
 class ErrorCategory(Enum):
@@ -135,33 +135,16 @@ class ModuleInfo:
     load_time_ms: Optional[float] = None
     last_checked_utc: Optional[str] = None
 
-    # extraction
     router_attr: str = "router"
     mount_attr: str = "mount"
     router_found: bool = False
     mount_found: bool = False
 
-    # optional info
     metrics: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
-class DiscoveryResult:
-    module: str
-    found: bool
-    candidates_tried: List[str]
-    time_taken_ms: float
-    error: Optional[str] = None
-    error_category: Optional[ErrorCategory] = None
-
-
-@dataclass(slots=True)
 class RouterSpec:
-    """
-    Minimal contract for mounting.
-    - module: python module path
-    - required: if strict mode enabled, failures raise for required only
-    """
     module: str
     group: ModuleGroup
     required: bool = False
@@ -399,7 +382,7 @@ def _group_of(module_name: str) -> ModuleGroup:
     if any(k in ml for k in ("data_dictionary", "schema", "registry", "dictionary")):
         return ModuleGroup.SCHEMA
 
-    if any(k in ml for k in ("advanced_analysis", "ai_analysis", "insights", "analysis_sheet_rows", "analysis")):
+    if any(k in ml for k in ("advanced_analysis", "advanced_sheet_rows", "ai_analysis", "insights", "analysis_sheet_rows", "analysis")):
         return ModuleGroup.ANALYSIS
 
     if any(k in ml for k in ("investment_advisor", "advisor")):
@@ -415,7 +398,7 @@ def _group_of(module_name: str) -> ModuleGroup:
 
 
 # =============================================================================
-# Defaults: Phase-8 expected routers (single-view)
+# Defaults: expected routers (schema-first)
 # =============================================================================
 def get_routes_version() -> str:
     return ROUTES_PACKAGE_VERSION
@@ -423,31 +406,30 @@ def get_routes_version() -> str:
 
 def get_expected_router_modules() -> List[str]:
     """
-    Default expected router modules (Phase-8 wiring).
+    Default expected router modules.
     Override via ROUTES_EXPECTED.
     """
     override = _parse_env_list("ROUTES_EXPECTED")
     if override:
         return [_normalize_module_name(x) for x in override if _normalize_module_name(x)]
 
-    # Phase-8 single-view plan (ordered)
+    # Keep wrappers first to avoid duplicates:
+    # - ai_analysis wraps analysis_sheet_rows
+    # - advanced_analysis wraps advanced_sheet_rows
     return [
-        # Core/config
         "routes.config",
-        # Data sources
         "routes.enriched_quote",
         "routes.routes_argaam",
-        # Schema-driven
         "routes.data_dictionary",
-        # Analysis (preference family below will keep only one, but we keep all as candidates)
+        # Analysis family (winner chosen below)
         "routes.ai_analysis",
         "routes.insights_analysis",
         "routes.analysis_sheet_rows",
-        # Advanced
+        # Advanced family (winner chosen below)
         "routes.advanced_analysis",
-        # Top10
+        "routes.advanced_sheet_rows",
+        # Top10 + Advisor
         "routes.top10_investments",
-        # Advisor (prefer investment_advisor to avoid /v1/advisor duplicates)
         "routes.investment_advisor",
         "routes.advisor",
     ]
@@ -482,6 +464,7 @@ def _auto_discover_router_modules() -> List[str]:
 # Preference families (avoid duplicates)
 # =============================================================================
 _ANALYSIS_FAMILY = ["routes.ai_analysis", "routes.insights_analysis", "routes.analysis_sheet_rows"]
+_ADVANCED_FAMILY = ["routes.advanced_analysis", "routes.advanced_sheet_rows"]
 _ADVISOR_FAMILY = ["routes.investment_advisor", "routes.advisor"]
 
 
@@ -494,33 +477,32 @@ def _apply_preference_families(mods: List[str]) -> List[str]:
     out: List[str] = []
     seen: Set[str] = set()
 
-    def is_in_family(m: str, fam: List[str]) -> bool:
-        return m in fam
+    families = (_ANALYSIS_FAMILY, _ADVANCED_FAMILY, _ADVISOR_FAMILY)
 
     # choose winners by first appearance
-    family_winner: Dict[str, str] = {}
-    for fam in (_ANALYSIS_FAMILY, _ADVISOR_FAMILY):
+    winners: Dict[str, str] = {}
+    for fam in families:
         winner = None
         for m in s:
             if m in fam and m not in seen:
                 winner = m
                 break
         if winner:
-            family_winner["|".join(fam)] = winner
+            winners["|".join(fam)] = winner
+
+    def fam_key(fam: List[str]) -> str:
+        return "|".join(fam)
 
     for m in s:
         if m in seen:
             continue
 
-        # analysis family
-        if is_in_family(m, _ANALYSIS_FAMILY):
-            if m != family_winner.get("|".join(_ANALYSIS_FAMILY)):
-                continue
-
-        # advisor family
-        if is_in_family(m, _ADVISOR_FAMILY):
-            if m != family_winner.get("|".join(_ADVISOR_FAMILY)):
-                continue
+        if m in _ANALYSIS_FAMILY and m != winners.get(fam_key(_ANALYSIS_FAMILY)):
+            continue
+        if m in _ADVANCED_FAMILY and m != winners.get(fam_key(_ADVANCED_FAMILY)):
+            continue
+        if m in _ADVISOR_FAMILY and m != winners.get(fam_key(_ADVISOR_FAMILY)):
+            continue
 
         out.append(m)
         seen.add(m)
@@ -548,61 +530,22 @@ def get_available_router_modules(expected: Optional[Sequence[str]] = None) -> Li
 
 @timed
 def get_mount_plan(expected: Optional[Sequence[str]] = None) -> List[str]:
-    """
-    Returns modules that exist, ordered and preference-filtered.
-    """
     exp = list(expected) if expected is not None else get_expected_router_modules()
     auto = _auto_discover_router_modules()
 
     merged = list(dict.fromkeys([_normalize_module_name(x) for x in (exp + auto) if _normalize_module_name(x)]))
     merged = _apply_preference_families(merged)
 
-    # keep only existing
     existing = [m for m in merged if module_exists(m)]
 
-    # stable ordering by group priority but preserve within-group order of "merged"
-    # (important for Phase-8 wiring)
     idx = {m: i for i, m in enumerate(merged)}
     existing.sort(key=lambda m: (_group_of(m).priority, idx.get(m, 10_000), m))
     return existing
 
 
-@timed
-def get_expected_router_groups() -> Dict[str, List[str]]:
-    groups = defaultdict(list)
-    for mod in get_expected_router_modules():
-        groups[_group_of(mod).value].append(mod)
-    return {k: v[:] for k, v in groups.items()}
-
-
 def _required_set_from_env() -> Set[str]:
     req = set(_parse_env_list("ROUTES_REQUIRED"))
     return {_normalize_module_name(x) for x in req if _normalize_module_name(x)}
-
-
-@timed
-def get_mount_plan_detailed(expected: Optional[Sequence[str]] = None) -> List[ModuleInfo]:
-    exp = list(expected) if expected is not None else get_expected_router_modules()
-    plan = get_mount_plan(exp)
-    required = _required_set_from_env()
-
-    out: List[ModuleInfo] = []
-    now = _utc_iso()
-
-    for m in plan:
-        ok, err = _find_spec_cached(m)
-        info = ModuleInfo(
-            name=m,
-            group=_group_of(m),
-            status=ModuleStatus.AVAILABLE if ok else ModuleStatus.MISSING,
-            error=None if ok else err,
-            error_category=None if ok else ErrorCategory.NOT_FOUND,
-            last_checked_utc=now,
-            metrics={"required": bool(m in required)},
-        )
-        out.append(info)
-
-    return out
 
 
 def build_router_specs(expected: Optional[Sequence[str]] = None) -> List[RouterSpec]:
@@ -632,13 +575,12 @@ def _err_str(e: BaseException, limit: int = 900) -> str:
     return s if len(s) <= limit else (s[:limit] + "...(truncated)")
 
 
-def load_mount_target(module: str, *, router_attr: str = "router", mount_attr: str = "mount") -> Tuple[Optional[Any], Optional[Callable[[Any], None]], ModuleInfo]:
-    """
-    Imports module and extracts either:
-      - router object (preferred) OR
-      - mount(app) callable
-    Returns: (router, mount_fn, info)
-    """
+def load_mount_target(
+    module: str,
+    *,
+    router_attr: str = "router",
+    mount_attr: str = "mount",
+) -> Tuple[Optional[Any], Optional[Callable[[Any], None]], ModuleInfo]:
     m = _normalize_module_name(module)
     info = ModuleInfo(name=m, group=_group_of(m), status=ModuleStatus.MISSING, router_attr=router_attr, mount_attr=mount_attr)
     info.last_checked_utc = _utc_iso()
@@ -755,21 +697,40 @@ def _router_keys(router: Any) -> Set[Tuple[str, str]]:
 
 
 # =============================================================================
-# Mount orchestrator (optional usage)
+# Schema-first preflight (mount-time only)
+# =============================================================================
+def _schema_preflight() -> Dict[str, Any]:
+    """
+    Best-effort import+validate schema registry at mount time.
+    Never raises (unless ROUTES_STRICT and caller decides).
+    """
+    out: Dict[str, Any] = {
+        "ok": False,
+        "schema_version": None,
+        "sheets_count": None,
+        "error": None,
+    }
+    try:
+        from core.sheets import schema_registry as sr  # type: ignore
+
+        out["schema_version"] = getattr(sr, "SCHEMA_VERSION", None)
+        reg = getattr(sr, "SCHEMA_REGISTRY", None)
+        out["sheets_count"] = len(reg) if isinstance(reg, dict) else None
+
+        validate = getattr(sr, "validate_schema_registry", None)
+        if callable(validate):
+            validate()
+        out["ok"] = True
+        return out
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+        return out
+
+
+# =============================================================================
+# Mount orchestrator
 # =============================================================================
 def mount_routers(app: Any, *, expected: Optional[Sequence[str]] = None, strict: Optional[bool] = None) -> Dict[str, Any]:
-    """
-    Mount routers into a FastAPI app (or compatible include_router()).
-
-    Returns:
-      {
-        mounted: [module,...],
-        skipped_duplicates: {module:[...],...},
-        missing: [ModuleInfo,...],
-        failed: [ModuleInfo,...],
-        strict: bool
-      }
-    """
     strict_mode = coerce_bool(os.getenv("ROUTES_STRICT", ""), False) if strict is None else bool(strict)
     skip_dups = coerce_bool(os.getenv("ROUTES_SKIP_DUPLICATES", "1"), True)
     required = _required_set_from_env()
@@ -782,6 +743,12 @@ def mount_routers(app: Any, *, expected: Optional[Sequence[str]] = None, strict:
         "strict": strict_mode,
         "version": ROUTES_PACKAGE_VERSION,
         "timestamp_utc": _utc_iso(),
+        "schema": _schema_preflight(),
+        "preference_families": {
+            "analysis_family": _ANALYSIS_FAMILY,
+            "advanced_family": _ADVANCED_FAMILY,
+            "advisor_family": _ADVISOR_FAMILY,
+        },
     }
 
     existing_keys = _collect_route_keys(app)
@@ -815,13 +782,12 @@ def mount_routers(app: Any, *, expected: Optional[Sequence[str]] = None, strict:
                         raise RuntimeError(f"Duplicate routes for required module: {spec.module} ({dups[:5]})")
                     continue
             except Exception:
-                # if we can't compute keys, proceed (best-effort)
                 pass
 
         try:
             if router is not None and hasattr(app, "include_router"):
                 app.include_router(router)
-                if router is not None and skip_dups:
+                if skip_dups:
                     try:
                         existing_keys |= _router_keys(router)
                     except Exception:
@@ -910,12 +876,14 @@ def get_routes_debug_snapshot_enhanced() -> Dict[str, Any]:
     base = get_routes_debug_snapshot()
     base.update(
         {
+            "schema": _schema_preflight(),
             "metrics": get_metrics().get_stats(),
             "cache_info": get_cache_info(),
             "circuit_breaker": _circuit_breaker.snapshot(),
             "python": {"version": sys.version, "platform": sys.platform},
             "preference_families": {
                 "analysis_family": _ANALYSIS_FAMILY,
+                "advanced_family": _ADVANCED_FAMILY,
                 "advisor_family": _ADVISOR_FAMILY,
             },
         }
@@ -933,24 +901,17 @@ __all__ = [
     "ErrorCategory",
     "ModuleGroup",
     "ModuleInfo",
-    "DiscoveryResult",
     "RouterSpec",
-    # existence checks
     "module_exists",
     "module_exists_async",
-    # discovery / mount plan
     "get_expected_router_modules",
-    "get_expected_router_groups",
     "get_available_router_modules",
     "get_router_discovery",
     "get_mount_plan",
-    "get_mount_plan_detailed",
     "build_router_specs",
-    # import/mount
     "load_mount_target",
     "load_mount_target_async",
     "mount_routers",
-    # audit/debug
     "get_dependency_audit",
     "get_routes_debug_snapshot",
     "get_routes_debug_snapshot_enhanced",
