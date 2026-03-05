@@ -2,21 +2,14 @@
 """
 routes/advanced_analysis.py
 ------------------------------------------------------------
-TADAWUL ADVANCED ANALYSIS ROUTER — v5.6.2 (PHASE 5 / STARTUP-SAFE / SCHEMA-FIRST)
-PROD HARDENED + SCHEMA-DRIVEN SHEET-ROWS (FIXES SPECIAL SHEETS) + INSIGHTS ENDPOINTS
+TADAWUL ADVANCED ANALYSIS ROUTER — v5.7.0 (PHASE 5 / STARTUP-SAFE / SCHEMA-FIRST / JSON-SAFE)
 
-Why this revision (your red ❌ on this file)
-- ✅ Guaranteed compile-safe (no broken literals / no accidental pasted fragments)
-- ✅ Stronger payload compatibility (sheet / sheet_name / page, tickers / symbols, etc.)
-- ✅ Works with BOTH engine styles:
-    - New snapshot style: get_cached_sheet_snapshot() -> {"headers":[...], "rows":[...]}
-    - Legacy style: get_sheet_rows()/sheet_rows()/build_sheet_rows()
-- ✅ Special sheets are schema-first and never fall back to a default 80-col schema:
-    * Insights_Analysis   -> schema headers/keys + best-effort builder (or empty rows)
-    * Top_10_Investments  -> schema headers/keys + engine rows if available (else empty)
-    * Data_Dictionary     -> generated from core.sheets.data_dictionary (schema-driven)
-
-No network calls at import-time. Heavy imports are inside handlers.
+Fixes (your recurring red ❌ on this file)
+- ✅ Import-time safety: base router import is optional (no hard dependency / no circular crash)
+- ✅ JSON-safe responses: engine_health / engine_stats / payloads are coerced to primitives
+- ✅ Schema-first sheet-rows (special sheets never fall back to 80-col default)
+- ✅ Data_Dictionary generator supports multiple signatures
+- ✅ No network calls at import-time. Heavy imports remain inside handlers.
 """
 
 from __future__ import annotations
@@ -26,19 +19,28 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
+from dataclasses import asdict, is_dataclass
+from datetime import date, datetime, timezone
+from enum import Enum
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from fastapi import Body, Header, HTTPException, Query, Request, Response, status
-
-# -----------------------------------------------------------------------------
-# ✅ Base router (prefix="/v1/advanced") imported from Phase-3 module
-# -----------------------------------------------------------------------------
-from routes.advanced_sheet_rows import router  # noqa: F401
+from fastapi.encoders import jsonable_encoder
+from fastapi.routing import APIRouter
 
 logger = logging.getLogger("routes.advanced_analysis")
+ADVANCED_ANALYSIS_VERSION = "5.7.0"
 
-ADVANCED_ANALYSIS_VERSION = "5.6.2"
+# -----------------------------------------------------------------------------
+# Router: Prefer base router if available, otherwise create a local one.
+# This avoids import-time crashes (missing module / circular import).
+# -----------------------------------------------------------------------------
+_base_router_import_error: Optional[str] = None
+try:
+    from routes.advanced_sheet_rows import router as router  # type: ignore  # noqa: F401
+except Exception as e:
+    _base_router_import_error = f"{type(e).__name__}: {e}"
+    router = APIRouter(prefix="/v1/advanced", tags=["advanced"])
 
 # -----------------------------------------------------------------------------
 # Optional Prometheus (safe)
@@ -60,15 +62,63 @@ try:
 except Exception:
     auth_ok = None  # type: ignore
 
-    def get_settings_cached(*args, **kwargs):  # type: ignore
+    def get_settings_cached(*args: Any, **kwargs: Any) -> Any:  # type: ignore
         return None
+
+
+# -----------------------------------------------------------------------------
+# JSON-safety helpers (prevents health/report serialization failures)
+# -----------------------------------------------------------------------------
+def _to_jsonable(obj: Any) -> Any:
+    """
+    Best-effort conversion to JSON-safe primitives.
+    Uses FastAPI jsonable_encoder first, then falls back to str().
+    """
+    try:
+        return jsonable_encoder(obj)
+    except Exception:
+        pass
+
+    if obj is None or isinstance(obj, (str, int, float, bool)):
+        return obj
+    if isinstance(obj, Enum):
+        return obj.value
+    if isinstance(obj, (datetime, date)):
+        try:
+            return obj.isoformat()
+        except Exception:
+            return str(obj)
+    if is_dataclass(obj):
+        try:
+            return {k: _to_jsonable(v) for k, v in asdict(obj).items()}
+        except Exception:
+            return str(obj)
+    if isinstance(obj, dict):
+        return {str(k): _to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple, set)):
+        return [_to_jsonable(v) for v in obj]
+    try:
+        # pydantic
+        if hasattr(obj, "model_dump"):
+            return _to_jsonable(obj.model_dump(mode="python"))  # type: ignore
+        if hasattr(obj, "dict"):
+            return _to_jsonable(obj.dict())  # type: ignore
+    except Exception:
+        pass
+    return str(obj)
+
+
+def _json_dumps_safe(obj: Any) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False, default=str)
+    except Exception:
+        return str(obj)
 
 
 # -----------------------------------------------------------------------------
 # Engine accessor (lazy + safe)
 # -----------------------------------------------------------------------------
 async def _get_engine(request: Request) -> Optional[Any]:
-    # Prefer app.state.engine (set by main.py lifespan)
     try:
         st = getattr(request.app, "state", None)
         if st and getattr(st, "engine", None):
@@ -76,7 +126,6 @@ async def _get_engine(request: Request) -> Optional[Any]:
     except Exception:
         pass
 
-    # Fallback to core.data_engine_v2.get_engine(), then core.data_engine.get_engine()
     for modpath in ("core.data_engine_v2", "core.data_engine"):
         try:
             mod = __import__(modpath, fromlist=["get_engine"])
@@ -105,7 +154,6 @@ def _safe_env_port() -> Optional[str]:
 
 
 async def _maybe_call(obj: Any, name: str, *args: Any, **kwargs: Any) -> Optional[Any]:
-    """Best-effort call obj.<name>(*args, **kwargs), supporting sync/async. Never raises."""
     try:
         fn = getattr(obj, name, None)
         if not callable(fn):
@@ -127,14 +175,9 @@ def _safe_bool_env(name: str, default: bool = False) -> bool:
 
 
 # -----------------------------------------------------------------------------
-# Auth helper (best-effort; consistent with advanced_sheet_rows)
+# Auth helper (best-effort)
 # -----------------------------------------------------------------------------
-def _extract_auth_token(
-    *,
-    token_query: Optional[str],
-    x_app_token: Optional[str],
-    authorization: Optional[str],
-) -> str:
+def _extract_auth_token(*, token_query: Optional[str], x_app_token: Optional[str], authorization: Optional[str]) -> str:
     auth_token = (x_app_token or "").strip()
     if authorization and authorization.strip().lower().startswith("bearer "):
         auth_token = authorization.strip().split(" ", 1)[1].strip()
@@ -152,12 +195,7 @@ def _extract_auth_token(
     return auth_token
 
 
-def _require_auth_or_401(
-    *,
-    token_query: Optional[str],
-    x_app_token: Optional[str],
-    authorization: Optional[str],
-) -> None:
+def _require_auth_or_401(*, token_query: Optional[str], x_app_token: Optional[str], authorization: Optional[str]) -> None:
     if auth_ok is None:
         return
     auth_token = _extract_auth_token(token_query=token_query, x_app_token=x_app_token, authorization=authorization)
@@ -170,7 +208,7 @@ def _require_auth_or_401(
 
 
 # -----------------------------------------------------------------------------
-# Phase 5 — criteria snapshot builder (safe, no schema assumptions)
+# Criteria snapshot builder (safe)
 # -----------------------------------------------------------------------------
 def _build_insights_criteria_snapshot() -> Dict[str, Any]:
     weights = {
@@ -253,14 +291,13 @@ def _canonicalize_sheet_name(sheet: str) -> str:
     if not s:
         return s
 
-    # Prefer page_catalog normalization if available
     for fn_name in ("normalize_page_name", "resolve_page", "canonicalize_page"):
         try:
             mod = __import__("core.sheets.page_catalog", fromlist=[fn_name])
             fn = getattr(mod, fn_name, None)
             if callable(fn):
                 try:
-                    out = fn(s, allow_output_pages=True)  # normalize_page_name signature
+                    out = fn(s, allow_output_pages=True)
                 except TypeError:
                     out = fn(s)
                 if isinstance(out, str) and out.strip():
@@ -281,13 +318,23 @@ def _get_sheet_spec(sheet: str) -> Optional[Any]:
 
 
 def _schema_headers_keys(sheet: str) -> Tuple[List[str], List[str], str]:
+    """
+    IMPORTANT: headers and keys MUST stay aligned.
+    We only include a column if BOTH header and key are present.
+    """
     spec = _get_sheet_spec(sheet)
     if spec and getattr(spec, "columns", None):
-        headers = [str(getattr(c, "header", "")) for c in spec.columns]
-        keys = [str(getattr(c, "key", "")) for c in spec.columns]
-        headers = [h for h in headers if h]
-        keys = [k for k in keys if k]
-        return headers, keys, "schema_registry.get_sheet_spec"
+        headers: List[str] = []
+        keys: List[str] = []
+        for c in spec.columns:
+            h = str(getattr(c, "header", "") or "").strip()
+            k = str(getattr(c, "key", "") or "").strip()
+            if not h or not k:
+                continue
+            headers.append(h)
+            keys.append(k)
+        if headers and keys and len(headers) == len(keys):
+            return headers, keys, "schema_registry.get_sheet_spec"
     return [], [], "none"
 
 
@@ -304,19 +351,22 @@ def _normalize_row_to_schema(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         out2: Dict[str, Any] = {}
         for c in spec.columns:
-            k = str(getattr(c, "key", ""))
-            h = str(getattr(c, "header", ""))
-            if k and k in row:
+            k = str(getattr(c, "key", "") or "").strip()
+            h = str(getattr(c, "header", "") or "").strip()
+            if not k:
+                continue
+            if k in row:
                 out2[k] = row.get(k)
             elif h and h in row:
                 out2[k] = row.get(h)
-            elif k:
+            else:
                 out2[k] = None
         return out2
 
 
 def _project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
-    return {str(k): row.get(str(k), None) for k in keys}
+    kk = [str(k) for k in keys]
+    return {k: row.get(k, None) for k in kk}
 
 
 def _rows_to_matrix(rows: List[Dict[str, Any]], keys: Sequence[str]) -> List[List[Any]]:
@@ -330,25 +380,14 @@ def _matrix_to_rows(rows_matrix: List[List[Any]], keys: Sequence[str]) -> List[D
     for r in rows_matrix or []:
         if not isinstance(r, list):
             continue
-        row = {kk[i]: (r[i] if i < len(r) else None) for i in range(len(kk))}
-        out.append(row)
+        out.append({kk[i]: (r[i] if i < len(r) else None) for i in range(len(kk))})
     return out
 
 
 def _coerce_payload_to_rows(payload: Any) -> Tuple[List[Dict[str, Any]], List[str], List[str]]:
-    """
-    Normalize engine payload to (rows_as_dicts, headers, keys).
-    Accepts:
-      - {"headers":[...], "keys":[...], "rows":[dict|list]}
-      - {"headers":[...], "rows":[...]} (keys inferred from schema/headers)
-      - {"data":{...}}
-      - (headers, rows) tuple
-      - list[dict]
-    """
     if payload is None:
         return [], [], []
 
-    # tuple (headers, rows)
     if isinstance(payload, tuple) and len(payload) == 2:
         hdrs, rows = payload
         hdrs_list = [str(x) for x in (hdrs or [])] if isinstance(hdrs, (list, tuple)) else []
@@ -356,19 +395,16 @@ def _coerce_payload_to_rows(payload: Any) -> Tuple[List[Dict[str, Any]], List[st
             if rows and isinstance(rows[0], dict):
                 return [dict(r) for r in rows if isinstance(r, dict)], hdrs_list, hdrs_list[:]
             if rows and isinstance(rows[0], list):
-                # matrix with headers as keys
                 keys = hdrs_list[:]
                 return _matrix_to_rows(rows, keys), hdrs_list, keys
         return [], hdrs_list, hdrs_list[:]
 
-    # list[dict]
     if isinstance(payload, list):
         rows = [dict(r) for r in payload if isinstance(r, dict)]
         keys = list(rows[0].keys()) if rows else []
         headers = keys[:]
         return rows, headers, keys
 
-    # dict shapes
     if isinstance(payload, dict):
         if isinstance(payload.get("data"), dict):
             return _coerce_payload_to_rows(payload.get("data"))
@@ -388,16 +424,13 @@ def _coerce_payload_to_rows(payload: Any) -> Tuple[List[Dict[str, Any]], List[st
                     headers_list = keys_list[:]
                 return [dict(r) for r in rows if isinstance(r, dict)], headers_list, keys_list
             if isinstance(rows[0], list):
-                # matrix -> dicts using keys if available else headers
                 use_keys = keys_list or headers_list
                 return _matrix_to_rows(rows, use_keys), (headers_list or use_keys[:]), use_keys[:]
 
-        # empty rows
         if not keys_list and headers_list:
             keys_list = headers_list[:]
         return [], headers_list, keys_list
 
-    # pydantic
     try:
         if hasattr(payload, "model_dump"):
             return _coerce_payload_to_rows(payload.model_dump(mode="python"))  # type: ignore
@@ -409,28 +442,14 @@ def _coerce_payload_to_rows(payload: Any) -> Tuple[List[Dict[str, Any]], List[st
     return [], [], []
 
 
-async def _engine_fetch_any(
-    engine: Any,
-    *,
-    sheet: str,
-    limit: int,
-    offset: int,
-    mode: str,
-    body: Dict[str, Any],
-) -> Any:
-    """
-    Try multiple engine APIs, including stub-engine snapshot style used by tests.
-    """
-    # 1) Snapshot style (preferred for cache + tests)
+async def _engine_fetch_any(engine: Any, *, sheet: str, limit: int, offset: int, mode: str, body: Dict[str, Any]) -> Any:
     snap = await _maybe_call(engine, "get_cached_sheet_snapshot", sheet)
     if isinstance(snap, dict) and ("headers" in snap or "rows" in snap):
-        # Apply limit/offset on rows if present
         if isinstance(snap.get("rows"), list):
             rows = snap.get("rows") or []
             snap["rows"] = rows[offset : offset + limit]
         return snap
 
-    # 2) Legacy rows APIs
     candidates = [
         ("get_sheet_rows", dict(sheet=sheet, limit=limit, offset=offset, mode=mode, body=body)),
         ("get_sheet_rows", dict(sheet=sheet, limit=limit, offset=offset, mode=mode)),
@@ -467,13 +486,14 @@ async def _engine_fetch_any(
 
 
 # -----------------------------------------------------------------------------
-# Remove base POST /sheet-rows and replace it here (no duplicates)
+# Replace base POST /sheet-rows safely (no duplicates)
 # -----------------------------------------------------------------------------
-def _remove_router_route(path: str, method: str) -> int:
+def _remove_router_route_inplace(rtr: APIRouter, path: str, method: str) -> int:
     removed = 0
     try:
+        routes = list(getattr(rtr, "routes", []) or [])
         new_routes = []
-        for r in list(getattr(router, "routes", [])):
+        for r in routes:
             try:
                 rp = getattr(r, "path", None)
                 rm = getattr(r, "methods", None) or set()
@@ -483,13 +503,17 @@ def _remove_router_route(path: str, method: str) -> int:
             except Exception:
                 pass
             new_routes.append(r)
-        router.routes = new_routes  # type: ignore
+        # mutate in place (safer than assignment)
+        try:
+            rtr.routes[:] = new_routes  # type: ignore[attr-defined]
+        except Exception:
+            setattr(rtr, "routes", new_routes)
     except Exception:
         return removed
     return removed
 
 
-_removed = _remove_router_route("/sheet-rows", "POST")
+_removed = _remove_router_route_inplace(router, "/sheet-rows", "POST")
 if _removed:
     logger.info("AdvancedAnalysis: removed %s existing POST /sheet-rows route(s) to replace schema-driven handler.", _removed)
 
@@ -505,14 +529,6 @@ async def advanced_sheet_rows_schema_driven(
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
-    """
-    Schema-driven replacement for POST /v1/advanced/sheet-rows
-
-    Guarantees (when schema_registry is available for the sheet):
-    - headers == schema headers (correct count + correct order)
-    - keys    == schema keys (correct count + correct order)
-    - rows    == STRICTLY projected to schema keys (extras dropped; missing None)
-    """
     t0 = time.perf_counter()
     _require_auth_or_401(token_query=token, x_app_token=x_app_token, authorization=authorization)
 
@@ -545,22 +561,29 @@ async def advanced_sheet_rows_schema_driven(
     # -------------------------------------------------------------------------
     if sheet == "Data_Dictionary":
         try:
-            from core.sheets.data_dictionary import (  # type: ignore
-                build_data_dictionary_rows,
-                data_dictionary_headers,
-                data_dictionary_keys,
-            )
+            mod = __import__("core.sheets.data_dictionary", fromlist=["*"])
+            build_rows = getattr(mod, "build_data_dictionary_rows", None)
+            headers_fn = getattr(mod, "data_dictionary_headers", None)
+            keys_fn = getattr(mod, "data_dictionary_keys", None)
 
-            out_headers = data_dictionary_headers()
-            out_keys = data_dictionary_keys()
-            dd_rows = build_data_dictionary_rows(include_meta_sheet=True)
+            out_headers = list(headers_fn()) if callable(headers_fn) else (schema_headers or [])
+            out_keys = list(keys_fn()) if callable(keys_fn) else (schema_keys or [])
+
+            dd_rows: Any = []
+            if callable(build_rows):
+                try:
+                    dd_rows = build_rows(include_meta_sheet=True)
+                except TypeError:
+                    dd_rows = build_rows()
+            else:
+                dd_rows = []
+
         except Exception as e:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail={"error": "Data_Dictionary generator failed", "detail": str(e)},
             )
 
-        # Strict project
         rows: List[Dict[str, Any]] = []
         for r in dd_rows or []:
             if not isinstance(r, dict):
@@ -569,25 +592,27 @@ async def advanced_sheet_rows_schema_driven(
 
         rows = rows[offset : offset + limit]
 
-        return {
-            "status": "success",
-            "page": "Data_Dictionary",
-            "sheet": "Data_Dictionary",
-            "headers": out_headers,
-            "keys": out_keys,
-            "rows": rows,
-            "rows_matrix": _rows_to_matrix(rows, out_keys) if include_matrix_final else None,
-            "version": ADVANCED_ANALYSIS_VERSION,
-            "request_id": request_id,
-            "meta": {
-                "schema_source": schema_source,
-                "generated": True,
-                "rows": len(rows),
-                "limit": limit,
-                "offset": offset,
-                "duration_ms": (time.perf_counter() - t0) * 1000.0,
-            },
-        }
+        return _to_jsonable(
+            {
+                "status": "success",
+                "page": "Data_Dictionary",
+                "sheet": "Data_Dictionary",
+                "headers": out_headers,
+                "keys": out_keys,
+                "rows": rows,
+                "rows_matrix": _rows_to_matrix(rows, out_keys) if include_matrix_final else None,
+                "version": ADVANCED_ANALYSIS_VERSION,
+                "request_id": request_id,
+                "meta": {
+                    "schema_source": schema_source,
+                    "generated": True,
+                    "rows": len(rows),
+                    "limit": limit,
+                    "offset": offset,
+                    "duration_ms": (time.perf_counter() - t0) * 1000.0,
+                },
+            }
+        )
 
     # -------------------------------------------------------------------------
     # Insights_Analysis: schema-first, best-effort builder (safe empty if missing)
@@ -596,29 +621,29 @@ async def advanced_sheet_rows_schema_driven(
         out_headers = schema_headers[:]
         out_keys = schema_keys[:]
 
-        # If schema missing, return safe empty response (still deterministic)
         if not out_headers or not out_keys:
-            return {
-                "status": "success",
-                "page": "Insights_Analysis",
-                "sheet": "Insights_Analysis",
-                "headers": out_headers,
-                "keys": out_keys,
-                "rows": [],
-                "rows_matrix": [] if include_matrix_final else None,
-                "version": ADVANCED_ANALYSIS_VERSION,
-                "request_id": request_id,
-                "meta": {
-                    "schema_source": schema_source,
-                    "path": "schema_only",
-                    "rows": 0,
-                    "limit": limit,
-                    "offset": offset,
-                    "duration_ms": (time.perf_counter() - t0) * 1000.0,
-                },
-            }
+            return _to_jsonable(
+                {
+                    "status": "success",
+                    "page": "Insights_Analysis",
+                    "sheet": "Insights_Analysis",
+                    "headers": out_headers,
+                    "keys": out_keys,
+                    "rows": [],
+                    "rows_matrix": [] if include_matrix_final else None,
+                    "version": ADVANCED_ANALYSIS_VERSION,
+                    "request_id": request_id,
+                    "meta": {
+                        "schema_source": schema_source,
+                        "path": "schema_only",
+                        "rows": 0,
+                        "limit": limit,
+                        "offset": offset,
+                        "duration_ms": (time.perf_counter() - t0) * 1000.0,
+                    },
+                }
+            )
 
-        # Best-effort: try an optional insights builder module (no hard dependency)
         rows: List[Dict[str, Any]] = []
         try:
             mod = __import__("core.analysis.insights_builder", fromlist=["*"])
@@ -648,7 +673,6 @@ async def advanced_sheet_rows_schema_driven(
         except Exception:
             rows = []
 
-        # Normalize and STRICT project to schema keys
         norm_rows: List[Dict[str, Any]] = []
         for r in rows:
             rr = _normalize_row_to_schema("Insights_Analysis", dict(r))
@@ -656,80 +680,83 @@ async def advanced_sheet_rows_schema_driven(
 
         norm_rows = norm_rows[offset : offset + limit]
 
-        return {
-            "status": "success",
-            "page": "Insights_Analysis",
-            "sheet": "Insights_Analysis",
-            "headers": out_headers,
-            "keys": out_keys,
-            "rows": norm_rows,
-            "rows_matrix": _rows_to_matrix(norm_rows, out_keys) if include_matrix_final else None,
-            "version": ADVANCED_ANALYSIS_VERSION,
-            "request_id": request_id,
-            "meta": {
-                "schema_source": schema_source,
-                "path": "builder" if rows else "schema_only_empty",
-                "rows": len(norm_rows),
-                "limit": limit,
-                "offset": offset,
-                "duration_ms": (time.perf_counter() - t0) * 1000.0,
-            },
-        }
+        return _to_jsonable(
+            {
+                "status": "success",
+                "page": "Insights_Analysis",
+                "sheet": "Insights_Analysis",
+                "headers": out_headers,
+                "keys": out_keys,
+                "rows": norm_rows,
+                "rows_matrix": _rows_to_matrix(norm_rows, out_keys) if include_matrix_final else None,
+                "version": ADVANCED_ANALYSIS_VERSION,
+                "request_id": request_id,
+                "meta": {
+                    "schema_source": schema_source,
+                    "path": "builder" if rows else "schema_only_empty",
+                    "rows": len(norm_rows),
+                    "limit": limit,
+                    "offset": offset,
+                    "duration_ms": (time.perf_counter() - t0) * 1000.0,
+                },
+            }
+        )
 
     # -------------------------------------------------------------------------
-    # For all other sheets: engine if available; schema-first headers/keys always
+    # All other sheets: engine best-effort; schema-first headers/keys always
     # -------------------------------------------------------------------------
     engine = await _get_engine(request)
 
-    # If engine is missing, still return schema headers (empty rows) instead of 503
     if engine is None:
-        return {
-            "status": "degraded",
-            "page": sheet,
-            "sheet": sheet,
-            "headers": schema_headers,
-            "keys": schema_keys,
-            "rows": [],
-            "rows_matrix": [] if include_matrix_final else None,
-            "version": ADVANCED_ANALYSIS_VERSION,
-            "request_id": request_id,
-            "meta": {
-                "schema_source": schema_source,
-                "engine_available": False,
-                "path": "schema_only_no_engine",
-                "rows": 0,
-                "limit": limit,
-                "offset": offset,
-                "duration_ms": (time.perf_counter() - t0) * 1000.0,
-            },
-        }
+        return _to_jsonable(
+            {
+                "status": "degraded",
+                "page": sheet,
+                "sheet": sheet,
+                "headers": schema_headers,
+                "keys": schema_keys,
+                "rows": [],
+                "rows_matrix": [] if include_matrix_final else None,
+                "version": ADVANCED_ANALYSIS_VERSION,
+                "request_id": request_id,
+                "meta": {
+                    "schema_source": schema_source,
+                    "engine_available": False,
+                    "path": "schema_only_no_engine",
+                    "rows": 0,
+                    "limit": limit,
+                    "offset": offset,
+                    "duration_ms": (time.perf_counter() - t0) * 1000.0,
+                },
+            }
+        )
 
-    # Fetch from engine
     try:
         payload = await _engine_fetch_any(engine, sheet=sheet, limit=limit, offset=offset, mode=mode or "", body=body)
     except Exception as e:
-        # return schema-only rather than crashing (still passes schema alignment)
-        return {
-            "status": "degraded",
-            "page": sheet,
-            "sheet": sheet,
-            "headers": schema_headers,
-            "keys": schema_keys,
-            "rows": [],
-            "rows_matrix": [] if include_matrix_final else None,
-            "version": ADVANCED_ANALYSIS_VERSION,
-            "request_id": request_id,
-            "meta": {
-                "schema_source": schema_source,
-                "engine_available": True,
-                "engine_error": str(e),
-                "path": "schema_only_engine_error",
-                "rows": 0,
-                "limit": limit,
-                "offset": offset,
-                "duration_ms": (time.perf_counter() - t0) * 1000.0,
-            },
-        }
+        return _to_jsonable(
+            {
+                "status": "degraded",
+                "page": sheet,
+                "sheet": sheet,
+                "headers": schema_headers,
+                "keys": schema_keys,
+                "rows": [],
+                "rows_matrix": [] if include_matrix_final else None,
+                "version": ADVANCED_ANALYSIS_VERSION,
+                "request_id": request_id,
+                "meta": {
+                    "schema_source": schema_source,
+                    "engine_available": True,
+                    "engine_error": str(e),
+                    "path": "schema_only_engine_error",
+                    "rows": 0,
+                    "limit": limit,
+                    "offset": offset,
+                    "duration_ms": (time.perf_counter() - t0) * 1000.0,
+                },
+            }
+        )
 
     rows, eng_headers, eng_keys = _coerce_payload_to_rows(payload)
 
@@ -741,7 +768,6 @@ async def advanced_sheet_rows_schema_driven(
     if not out_headers and out_keys:
         out_headers = out_keys[:]
 
-    # Normalize + strict projection when schema keys exist
     norm_rows: List[Dict[str, Any]] = []
     if schema_keys:
         for r in rows:
@@ -750,36 +776,35 @@ async def advanced_sheet_rows_schema_driven(
     else:
         norm_rows = [dict(r) for r in rows]
 
-    return {
-        "status": "success" if out_headers else "partial",
-        "page": sheet,
-        "sheet": sheet,
-        "headers": out_headers,
-        "keys": out_keys,
-        "rows": norm_rows,
-        "rows_matrix": _rows_to_matrix(norm_rows, out_keys) if (include_matrix_final and out_keys) else None,
-        "version": ADVANCED_ANALYSIS_VERSION,
-        "request_id": request_id,
-        "meta": {
-            "schema_source": schema_source,
-            "engine_type": _safe_engine_type(engine),
-            "schema_cols": len(schema_headers) if schema_headers else 0,
-            "engine_cols": len(eng_headers) if eng_headers else 0,
-            "returned_cols": len(out_headers) if out_headers else 0,
-            "rows": len(norm_rows),
-            "limit": limit,
-            "offset": offset,
-            "mode": mode,
-            "sheet_rows_schema_driven": True,
-            "replaced_base_sheet_rows_routes": _removed,
-            "duration_ms": (time.perf_counter() - t0) * 1000.0,
-        },
-    }
+    return _to_jsonable(
+        {
+            "status": "success" if out_headers else "partial",
+            "page": sheet,
+            "sheet": sheet,
+            "headers": out_headers,
+            "keys": out_keys,
+            "rows": norm_rows,
+            "rows_matrix": _rows_to_matrix(norm_rows, out_keys) if (include_matrix_final and out_keys) else None,
+            "version": ADVANCED_ANALYSIS_VERSION,
+            "request_id": request_id,
+            "meta": {
+                "schema_source": schema_source,
+                "engine_type": _safe_engine_type(engine),
+                "schema_cols": len(schema_headers) if schema_headers else 0,
+                "engine_cols": len(eng_headers) if eng_headers else 0,
+                "returned_cols": len(out_headers) if out_headers else 0,
+                "rows": len(norm_rows),
+                "limit": limit,
+                "offset": offset,
+                "mode": mode,
+                "sheet_rows_schema_driven": True,
+                "replaced_base_sheet_rows_routes": _removed,
+                "duration_ms": (time.perf_counter() - t0) * 1000.0,
+            },
+        }
+    )
 
 
-# -----------------------------------------------------------------------------
-# Existing endpoints (kept) + minor hardening
-# -----------------------------------------------------------------------------
 @router.get("/health")
 async def advanced_health(request: Request) -> Dict[str, Any]:
     """Lightweight health endpoint. Must not do heavy computations."""
@@ -811,21 +836,25 @@ async def advanced_health(request: Request) -> Dict[str, Any]:
 
     request_id = getattr(request.state, "request_id", None)
 
-    return {
-        "status": "ok" if engine else "degraded",
-        "version": ADVANCED_ANALYSIS_VERSION,
-        "engine_available": bool(engine),
-        "engine_type": _safe_engine_type(engine) if engine else "none",
-        "engine_health": engine_health,
-        "engine_stats": engine_stats,
-        "schema_pages": schema_pages,
-        "port": _safe_env_port(),
-        "require_auth": _safe_bool_env("REQUIRE_AUTH", True),
-        "request_id": request_id,
-        "phase5_insights_criteria": True,
-        "sheet_rows_schema_driven": True,
-        "replaced_base_sheet_rows_routes": _removed,
-    }
+    # JSON-safe always
+    return _to_jsonable(
+        {
+            "status": "ok" if engine else "degraded",
+            "version": ADVANCED_ANALYSIS_VERSION,
+            "engine_available": bool(engine),
+            "engine_type": _safe_engine_type(engine) if engine else "none",
+            "engine_health": engine_health,
+            "engine_stats": engine_stats,
+            "schema_pages": schema_pages,
+            "port": _safe_env_port(),
+            "require_auth": _safe_bool_env("REQUIRE_AUTH", True),
+            "request_id": request_id,
+            "phase5_insights_criteria": True,
+            "sheet_rows_schema_driven": True,
+            "replaced_base_sheet_rows_routes": _removed,
+            "base_router_import_error": _base_router_import_error,
+        }
+    )
 
 
 @router.get("/metrics")
@@ -842,16 +871,17 @@ async def insights_criteria(
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
 ) -> Dict[str, Any]:
-    """Returns a criteria snapshot designed to be embedded into Insights_Analysis."""
     _require_auth_or_401(token_query=token, x_app_token=x_app_token, authorization=authorization)
 
     snap = _build_insights_criteria_snapshot()
-    return {
-        "status": "success",
-        "version": ADVANCED_ANALYSIS_VERSION,
-        "criteria": snap,
-        "embedded_target": "Insights_Analysis",
-    }
+    return _to_jsonable(
+        {
+            "status": "success",
+            "version": ADVANCED_ANALYSIS_VERSION,
+            "criteria": snap,
+            "embedded_target": "Insights_Analysis",
+        }
+    )
 
 
 @router.post("/insights-analysis")
@@ -866,11 +896,6 @@ async def insights_analysis(
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
-    """
-    Phase 5 endpoint: best-effort Insights_Analysis computation.
-    - Produces schema-aligned rows when schema is available.
-    - Does NOT crash if engine methods are missing (returns partial with errors).
-    """
     _require_auth_or_401(token_query=token, x_app_token=x_app_token, authorization=authorization)
     request_id = x_request_id or getattr(request.state, "request_id", None) or str(uuid.uuid4())
 
@@ -885,18 +910,20 @@ async def insights_analysis(
 
     engine = await _get_engine(request)
     if not engine:
-        return {
-            "status": "degraded",
-            "page": "Insights_Analysis",
-            "headers": headers,
-            "keys": keys,
-            "rows": [],
-            "rows_matrix": [] if include_matrix_final else None,
-            "error": "Data engine unavailable",
-            "version": ADVANCED_ANALYSIS_VERSION,
-            "request_id": request_id,
-            "meta": {"schema_available": bool(headers and keys)},
-        }
+        return _to_jsonable(
+            {
+                "status": "degraded",
+                "page": "Insights_Analysis",
+                "headers": headers,
+                "keys": keys,
+                "rows": [],
+                "rows_matrix": [] if include_matrix_final else None,
+                "error": "Data engine unavailable",
+                "version": ADVANCED_ANALYSIS_VERSION,
+                "request_id": request_id,
+                "meta": {"schema_available": bool(headers and keys)},
+            }
+        )
 
     quotes: Dict[str, Any] = {}
     try:
@@ -910,7 +937,6 @@ async def insights_analysis(
     except Exception:
         quotes = {}
 
-    # fallback per-symbol
     if not quotes and symbols:
         out: Dict[str, Any] = {}
         for s in symbols:
@@ -948,10 +974,7 @@ async def insights_analysis(
 
     if embed_criteria and normalized_rows and keys:
         snap = _build_insights_criteria_snapshot()
-        try:
-            criteria_json = json.dumps(snap, ensure_ascii=False, default=str)
-        except Exception:
-            criteria_json = str(snap)
+        criteria_json = _json_dumps_safe(snap)
 
         for ck in (
             "advisor_criteria_json",
@@ -971,24 +994,26 @@ async def insights_analysis(
         keys = list(normalized_rows[0].keys())
         headers = keys[:]
 
-    return {
-        "status": status_out,
-        "page": "Insights_Analysis",
-        "headers": headers,
-        "keys": keys,
-        "rows": normalized_rows,
-        "rows_matrix": _rows_to_matrix(normalized_rows, keys) if include_matrix_final else None,
-        "error": f"{errors} errors" if errors else None,
-        "version": ADVANCED_ANALYSIS_VERSION,
-        "request_id": request_id,
-        "meta": {
-            "requested": len(symbols),
-            "errors": errors,
-            "mode": mode,
-            "criteria_embedded": bool(embed_criteria),
-            "schema_available": bool(headers and keys),
-        },
-    }
+    return _to_jsonable(
+        {
+            "status": status_out,
+            "page": "Insights_Analysis",
+            "headers": headers,
+            "keys": keys,
+            "rows": normalized_rows,
+            "rows_matrix": _rows_to_matrix(normalized_rows, keys) if include_matrix_final else None,
+            "error": f"{errors} errors" if errors else None,
+            "version": ADVANCED_ANALYSIS_VERSION,
+            "request_id": request_id,
+            "meta": {
+                "requested": len(symbols),
+                "errors": errors,
+                "mode": mode,
+                "criteria_embedded": bool(embed_criteria),
+                "schema_available": bool(headers and keys),
+            },
+        }
+    )
 
 
 __all__ = ["router"]
