@@ -2,24 +2,39 @@
 # core/analysis/top10_selector.py
 """
 ================================================================================
-Top 10 Selector — v1.1.0 (PHASE 6)
+Top 10 Selector — v2.0.0 (LIVE-QUOTES / ONE SOURCE OF TRUTH / SCHEMA-ALIGNED)
 ================================================================================
-Must:
-- read criteria (from criteria_model or Insights_Analysis sheet top-block)
-- map period (days) -> ROI column (1M/3M/12M)
-- filter across all eligible pages
-- enforce: moderate/low risk + high confidence
-- rank by expected ROI (tie-break by confidence / overall_score)
+Tadawul Fast Bridge (TFB)
 
-Startup-safe:
-- No network I/O at import time
-- Uses engine snapshots (cached) best-effort
+Why this revision (Phase C / Script #4):
+- Advisor-based Top10 was failing due to snapshot dependency.
+- Your working Top10 today comes from /quotes (live), not cached snapshots.
+- We need ONE algorithm that works across phases and avoids missing/blank outputs.
+
+This module is now the SINGLE source of truth for Top10:
+- ✅ Universe → fetch rows via engine LIVE quotes (NOT snapshot-only)
+- ✅ Rank using expected ROI + confidence + optional liquidity
+- ✅ Output rows aligned to Top_10_Investments schema (80 canonical + 3 extras)
+- ✅ Startup-safe: no network I/O at import time
+
+Primary public APIs:
+- select_top10_symbols(engine, criteria, limit=10) -> List[str]
+- build_top10_rows(engine, criteria, limit=10) -> Dict payload {headers, keys, rows, meta}
+- select_top10(engine, criteria) -> (candidates, meta)   (internal use ok)
+
+Notes:
+- We respect your spec: Investment period is always in DAYS, mapped to 1M/3M/12M.
+- We do best-effort parsing: works with multiple engine method names/signatures.
+- No raising due to missing fields: safe defaults + warnings in output.
+
+================================================================================
 """
 
 from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import math
 import os
@@ -27,10 +42,12 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 logger = logging.getLogger("core.analysis.top10_selector")
+logger.addHandler(logging.NullHandler())
 
+TOP10_SELECTOR_VERSION = "2.0.0"
 RIYADH_TZ = timezone(timedelta(hours=3))
 
 
@@ -123,8 +140,24 @@ def _to_payload(obj: Any) -> Dict[str, Any]:
         return {}
 
 
+def _json_dumps_safe(obj: Any) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False, default=str)
+    except Exception:
+        return str(obj)
+
+
+async def _maybe_await(v: Any) -> Any:
+    try:
+        if hasattr(v, "__await__"):
+            return await v  # type: ignore[misc]
+    except Exception:
+        pass
+    return v
+
+
 # -----------------------------------------------------------------------------
-# Period mapping (days -> horizon)
+# Period mapping (days -> horizon)  [spec: DAYS are truth]
 # -----------------------------------------------------------------------------
 def map_period_days_to_horizon(days: int) -> str:
     """
@@ -160,7 +193,7 @@ def horizon_to_forecast_price_key(h: str) -> str:
 
 
 # -----------------------------------------------------------------------------
-# Criteria (prefers core.analysis.criteria_model when available)
+# Criteria (schema-driven best-effort)
 # -----------------------------------------------------------------------------
 @dataclass(slots=True)
 class Criteria:
@@ -173,6 +206,10 @@ class Criteria:
     min_confidence: float = 0.70
     enforce_risk_confidence: bool = True
 
+    # optional filters / rank tuning
+    min_volume: Optional[float] = None
+    use_liquidity_tiebreak: bool = True
+
     # output
     top_n: int = 10
     enrich_final: bool = True
@@ -184,18 +221,28 @@ class Criteria:
 def _criteria_from_dict(d: Dict[str, Any]) -> Criteria:
     pages = d.get("pages_selected") or d.get("pages") or d.get("selected_pages") or []
     if isinstance(pages, str):
-        pages = [p.strip() for p in pages.replace(",", " ").split() if p.strip()]
+        pages = [p.strip() for p in pages.replace(";", ",").replace("|", ",").replace(",", " ").split() if p.strip()]
     if not isinstance(pages, list) or not pages:
         pages = ["Market_Leaders", "Global_Markets", "Mutual_Funds", "Commodities_FX", "My_Portfolio"]
 
-    invest_days = int(_safe_float(d.get("invest_period_days") or d.get("investment_period_days") or d.get("period_days") or 90, 90) or 90)
+    invest_days = int(
+        _safe_float(
+            d.get("invest_period_days") or d.get("investment_period_days") or d.get("period_days") or 90,
+            90,
+        )
+        or 90
+    )
     invest_days = max(1, invest_days)
 
     min_roi = _as_fraction(d.get("min_expected_roi") or d.get("min_roi") or d.get("required_return") or d.get("required_roi"))
+
     max_risk = float(_safe_float(d.get("max_risk_score") or d.get("max_risk") or 60.0, 60.0) or 60.0)
     max_risk = _clamp(max_risk, 0.0, 100.0)
 
-    min_conf = _safe_float(d.get("min_confidence") or d.get("min_ai_confidence") or d.get("min_confidence_score") or 0.70, 0.70)
+    min_conf = _safe_float(
+        d.get("min_confidence") or d.get("min_ai_confidence") or d.get("min_confidence_score") or 0.70,
+        0.70,
+    )
     if min_conf is None:
         min_conf = 0.70
     min_conf = float(min_conf / 100.0) if min_conf > 1.5 else float(min_conf)
@@ -203,10 +250,13 @@ def _criteria_from_dict(d: Dict[str, Any]) -> Criteria:
 
     enforce = bool(d.get("enforce_risk_confidence", True))
 
-    top_n = int(_safe_float(d.get("top_n") or 10, 10) or 10)
+    top_n = int(_safe_float(d.get("top_n") or d.get("limit") or 10, 10) or 10)
     top_n = max(1, min(50, top_n))
 
     enrich_final = bool(d.get("enrich_final", True))
+
+    min_vol = _safe_float(d.get("min_volume") or d.get("min_liquidity") or d.get("min_vol"), None)
+    use_liq = bool(d.get("use_liquidity_tiebreak", True))
 
     return Criteria(
         pages_selected=[str(p).strip() for p in pages if str(p).strip()],
@@ -215,6 +265,8 @@ def _criteria_from_dict(d: Dict[str, Any]) -> Criteria:
         max_risk_score=max_risk,
         min_confidence=min_conf,
         enforce_risk_confidence=enforce,
+        min_volume=min_vol,
+        use_liquidity_tiebreak=use_liq,
         top_n=top_n,
         enrich_final=enrich_final,
     )
@@ -228,6 +280,8 @@ def merge_criteria_overrides(base: Criteria, overrides: Dict[str, Any]) -> Crite
         "max_risk_score": base.max_risk_score,
         "min_confidence": base.min_confidence,
         "enforce_risk_confidence": base.enforce_risk_confidence,
+        "min_volume": base.min_volume,
+        "use_liquidity_tiebreak": base.use_liquidity_tiebreak,
         "top_n": base.top_n,
         "enrich_final": base.enrich_final,
     }
@@ -252,7 +306,7 @@ def load_criteria_best_effort(engine: Any) -> Criteria:
     except Exception:
         pass
 
-    # 2) heuristic parse from snapshot
+    # 2) heuristic parse from snapshot (best-effort; no longer required)
     try:
         snap = _get_snapshot(engine, "Insights_Analysis")
         d2 = _parse_insights_top_block(snap)
@@ -269,13 +323,64 @@ def load_criteria_best_effort(engine: Any) -> Criteria:
         max_risk_score=60.0,
         min_confidence=0.70,
         enforce_risk_confidence=True,
+        min_volume=None,
+        use_liquidity_tiebreak=True,
         top_n=10,
         enrich_final=True,
     )
 
 
 # -----------------------------------------------------------------------------
-# Engine snapshots (best effort)
+# Page selection / normalization
+# -----------------------------------------------------------------------------
+def _normalize_symbol(sym: str) -> str:
+    s = _safe_str(sym).upper().replace(" ", "")
+    if not s:
+        return ""
+    if s.startswith("TADAWUL:"):
+        s = s.split(":", 1)[1].strip()
+    if s.endswith(".SA"):
+        s = s[:-3] + ".SR"
+    # if numeric KSA code, force .SR
+    if s.isdigit() and 3 <= len(s) <= 6:
+        return f"{s}.SR"
+    return s
+
+
+def _eligible_pages(criteria: Criteria) -> List[str]:
+    pages_in = [p for p in (criteria.pages_selected or []) if _safe_str(p)]
+    if not pages_in:
+        pages_in = ["Market_Leaders", "Global_Markets", "Mutual_Funds", "Commodities_FX", "My_Portfolio"]
+
+    # normalize via page_catalog if available
+    try:
+        from core.sheets.page_catalog import normalize_page_name  # type: ignore
+
+        tmp: List[str] = []
+        for p in pages_in:
+            try:
+                tmp.append(normalize_page_name(p, allow_output_pages=True))
+            except Exception:
+                tmp.append(str(p).strip())
+        pages_in = tmp
+    except Exception:
+        pages_in = [str(p).strip() for p in pages_in]
+
+    blocked = {"Insights_Analysis", "Data_Dictionary", "Top_10_Investments", "Top10_Investments"}
+    pages_in = [p for p in pages_in if p and p not in blocked]
+
+    # de-dupe preserve order
+    seen: Set[str] = set()
+    out: List[str] = []
+    for p in pages_in:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+# -----------------------------------------------------------------------------
+# Engine access helpers (LIVE preferred; snapshots fallback only)
 # -----------------------------------------------------------------------------
 def _get_snapshot(engine: Any, page: str) -> Optional[Dict[str, Any]]:
     if engine is None:
@@ -290,26 +395,117 @@ def _get_snapshot(engine: Any, page: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def _get_multi_snapshots(engine: Any, pages: List[str]) -> Dict[str, Dict[str, Any]]:
+async def _get_universe_symbols_live(engine: Any, page: str, *, limit: int = 5000) -> List[str]:
+    """
+    Preferred: ask engine for symbols from sheet configuration (no snapshots).
+    Supports multiple method names/signatures across phases.
+    """
     if engine is None:
-        return {}
-    fn = getattr(engine, "get_cached_multi_sheet_snapshots", None)
-    if callable(fn):
+        return []
+
+    candidates = [
+        ("get_page_symbols", dict(page=page, limit=limit)),
+        ("get_page_symbols", dict(sheet=page, limit=limit)),
+        ("get_sheet_symbols", dict(sheet=page, limit=limit)),
+        ("list_symbols_for_page", dict(page=page, limit=limit)),
+        ("list_symbols", dict(sheet=page, limit=limit)),
+        ("get_symbols", dict(sheet=page, limit=limit)),
+    ]
+
+    for name, kwargs in candidates:
+        fn = getattr(engine, name, None)
+        if not callable(fn):
+            continue
         try:
-            out = fn(pages)
-            if isinstance(out, dict):
-                return {str(k): v for k, v in out.items() if isinstance(v, dict)}
+            out = fn(**kwargs)
+            out = await _maybe_await(out)
+        except TypeError:
+            try:
+                out = fn(page)  # type: ignore
+                out = await _maybe_await(out)
+            except Exception:
+                continue
+        except Exception:
+            continue
+
+        if isinstance(out, (list, tuple)):
+            syms = [_normalize_symbol(_safe_str(x)) for x in out]
+            return [s for s in syms if s]
+        if isinstance(out, dict) and isinstance(out.get("symbols"), (list, tuple)):
+            syms = [_normalize_symbol(_safe_str(x)) for x in out["symbols"]]
+            return [s for s in syms if s]
+
+    # fallback: if engine exposes a sheet reader
+    fn2 = getattr(engine, "symbols_reader", None)
+    if fn2 is not None and hasattr(fn2, "get_symbols_for_sheet"):
+        try:
+            out = fn2.get_symbols_for_sheet(page)  # type: ignore
+            out = await _maybe_await(out)
+            if isinstance(out, (list, tuple)):
+                syms = [_normalize_symbol(_safe_str(x)) for x in out]
+                return [s for s in syms if s]
         except Exception:
             pass
 
-    res: Dict[str, Dict[str, Any]] = {}
-    for p in pages:
-        snap = _get_snapshot(engine, p)
-        if snap:
-            res[p] = snap
-    return res
+    return []
 
 
+async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "") -> Dict[str, Dict[str, Any]]:
+    """
+    LIVE quotes fetch (best-effort):
+      returns {symbol: rowdict}
+    """
+    if not engine or not symbols:
+        return {}
+
+    # best: batch
+    fn = getattr(engine, "get_enriched_quotes_batch", None)
+    if callable(fn):
+        try:
+            res = fn(symbols, mode=mode or "")
+            res = await _maybe_await(res)
+            if isinstance(res, dict):
+                out: Dict[str, Dict[str, Any]] = {}
+                for s in symbols:
+                    out[s] = _to_payload(res.get(s))
+                return out
+        except Exception:
+            pass
+
+    # next: list batch
+    fn2 = getattr(engine, "get_enriched_quotes", None)
+    if callable(fn2):
+        try:
+            res = fn2(symbols)
+            res = await _maybe_await(res)
+            if isinstance(res, list):
+                out2: Dict[str, Dict[str, Any]] = {}
+                for s, v in zip(symbols, res):
+                    out2[s] = _to_payload(v)
+                return out2
+        except Exception:
+            pass
+
+    # per symbol
+    out3: Dict[str, Dict[str, Any]] = {}
+    fn3 = getattr(engine, "get_enriched_quote_dict", None)
+    fn4 = getattr(engine, "get_enriched_quote", None) or getattr(engine, "get_quote", None)
+    for s in symbols:
+        try:
+            if callable(fn3):
+                out3[s] = _to_payload(await _maybe_await(fn3(s)))
+            elif callable(fn4):
+                out3[s] = _to_payload(await _maybe_await(fn4(s)))
+            else:
+                out3[s] = {"symbol": s, "warnings": "engine_missing_quote_methods"}
+        except Exception as e:
+            out3[s] = {"symbol": s, "warnings": f"quote_error: {e}"}
+    return out3
+
+
+# -----------------------------------------------------------------------------
+# Snapshot parsing (fallback only)
+# -----------------------------------------------------------------------------
 def _parse_insights_top_block(snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Heuristic: the top block is often key/value pairs in col A/B.
@@ -348,7 +544,7 @@ def _parse_insights_top_block(snapshot: Optional[Dict[str, Any]]) -> Dict[str, A
 
 
 # -----------------------------------------------------------------------------
-# Candidate extraction & ranking
+# Candidate model + extraction (row dicts from LIVE quotes)
 # -----------------------------------------------------------------------------
 @dataclass(slots=True)
 class Candidate:
@@ -358,80 +554,8 @@ class Candidate:
     confidence: float
     overall_score: float
     risk_score: float
+    volume: float
     row: Dict[str, Any]
-
-
-def _normalize_symbol(sym: str) -> str:
-    s = _safe_str(sym).upper().replace(" ", "")
-    if not s:
-        return ""
-    if s.startswith("TADAWUL:"):
-        s = s.split(":", 1)[1].strip()
-    if s.endswith(".SA"):
-        s = s[:-3] + ".SR"
-    # if numeric KSA code, force .SR
-    if s.isdigit() and 3 <= len(s) <= 6:
-        return f"{s}.SR"
-    return s
-
-
-def _eligible_pages(criteria: Criteria) -> List[str]:
-    pages_in = [p for p in (criteria.pages_selected or []) if _safe_str(p)]
-    if not pages_in:
-        pages_in = ["Market_Leaders", "Global_Markets", "Mutual_Funds", "Commodities_FX", "My_Portfolio"]
-
-    # normalize via page_catalog if available
-    try:
-        from core.sheets.page_catalog import normalize_page_name  # type: ignore
-
-        tmp: List[str] = []
-        for p in pages_in:
-            try:
-                tmp.append(normalize_page_name(p, allow_output_pages=True))
-            except Exception:
-                tmp.append(str(p).strip())
-        pages_in = tmp
-    except Exception:
-        pages_in = [str(p).strip() for p in pages_in]
-
-    blocked = {"Insights_Analysis", "Data_Dictionary", "Top_10_Investments"}
-    pages_in = [p for p in pages_in if p and p not in blocked]
-
-    # dedup preserve order
-    seen: Set[str] = set()
-    out: List[str] = []
-    for p in pages_in:
-        if p not in seen:
-            seen.add(p)
-            out.append(p)
-    return out
-
-
-def _idx_map(headers: List[Any]) -> Dict[str, int]:
-    m: Dict[str, int] = {}
-    for i, h in enumerate(headers or []):
-        k = _norm_key(h)
-        if k and k not in m:
-            m[k] = i
-    return m
-
-
-def _pick_idx(m: Dict[str, int], variants: Sequence[str]) -> Optional[int]:
-    for v in variants:
-        if not v:
-            continue
-        nk = _norm_key(v)
-        if nk in m:
-            return m[nk]
-    return None
-
-
-def _cell(row: Any, idx: Optional[int]) -> Any:
-    if idx is None:
-        return None
-    if not isinstance(row, (list, tuple)):
-        return None
-    return row[idx] if idx < len(row) else None
 
 
 def _risk_from_bucket(bucket: str) -> float:
@@ -449,97 +573,108 @@ def _risk_from_bucket(bucket: str) -> float:
     return 60.0
 
 
-def _extract_candidate_from_row(
-    *,
-    row: List[Any],
-    idx: Dict[str, int],
-    page: str,
-    horizon: str,
-) -> Optional[Tuple[str, float, float, float, float, Dict[str, Any]]]:
-    # symbol
-    sym = _cell(row, _pick_idx(idx, ["symbol", "ticker", "code", "fund symbol", "fund code"]))
-    sym = _normalize_symbol(_safe_str(sym))
-    if not sym:
-        return None
+def _get_confidence(d: Dict[str, Any]) -> float:
+    # prefer forecast_confidence, fallback to confidence_score
+    v = d.get("forecast_confidence", None)
+    if v is None:
+        v = d.get("confidence_score", None)
+    f = _safe_float(v, 0.0) or 0.0
+    f = float(f / 100.0) if f > 1.5 else float(f)
+    return _clamp(f, 0.0, 1.0)
 
-    # ROI
+
+def _get_overall_score(d: Dict[str, Any]) -> float:
+    v = d.get("overall_score", None)
+    if v is None:
+        # fallback: opportunity_score if present
+        v = d.get("opportunity_score", None)
+    f = _safe_float(v, 0.0) or 0.0
+    f = float(f * 100.0) if 0.0 < f <= 1.5 else float(f)
+    return _clamp(f, 0.0, 100.0)
+
+
+def _get_risk_score(d: Dict[str, Any]) -> float:
+    v = d.get("risk_score", None)
+    f = _safe_float(v, None)
+    if f is None:
+        return _risk_from_bucket(_safe_str(d.get("risk_bucket", "")))
+    f = float(f * 100.0) if 0.0 < f <= 1.5 else float(f)
+    return _clamp(f, 0.0, 100.0)
+
+
+def _get_volume(d: Dict[str, Any]) -> float:
+    v = d.get("volume", None)
+    f = _safe_float(v, 0.0) or 0.0
+    return max(0.0, float(f))
+
+
+def _extract_candidate_from_quote(
+    *,
+    sym: str,
+    page: str,
+    quote: Dict[str, Any],
+    horizon: str,
+) -> Optional[Candidate]:
     roi_key = horizon_to_roi_key(horizon)
-    roi_val = _cell(row, _pick_idx(idx, [
-        roi_key,
-        f"expected roi % ({horizon.upper()})",
-        f"expected roi ({horizon.upper()})",
-        "expected roi % (1m)" if horizon == "1m" else "",
-        "expected roi % (3m)" if horizon == "3m" else "",
-        "expected roi % (12m)" if horizon == "12m" else "",
-        "expected roi 1m" if horizon == "1m" else "",
-        "expected roi 3m" if horizon == "3m" else "",
-        "expected roi 12m" if horizon == "12m" else "",
-    ]))
-    roi = _as_fraction(roi_val)
+    roi = _as_fraction(quote.get(roi_key))
+    if roi is None:
+        # sometimes engines return ROI in percent (e.g. 12.3 instead of 0.123)
+        roi = _as_fraction(quote.get(roi_key.replace("_", " ")))
     if roi is None:
         return None
 
-    # confidence
-    conf_val = _cell(row, _pick_idx(idx, ["forecast_confidence", "forecast confidence", "confidence_score", "confidence score", "ai confidence", "confidence"]))
-    conf = _safe_float(conf_val, 0.0) or 0.0
-    conf = float(conf / 100.0) if conf > 1.5 else float(conf)
-    conf = _clamp(conf, 0.0, 1.0)
+    conf = _get_confidence(quote)
+    overall = _get_overall_score(quote)
+    risk = _get_risk_score(quote)
+    vol = _get_volume(quote)
 
-    # overall_score
-    os_val = _cell(row, _pick_idx(idx, ["overall_score", "overall score", "opportunity score", "score"]))
-    overall = _safe_float(os_val, 0.0) or 0.0
-    overall = float(overall * 100.0) if 0.0 < overall <= 1.5 else float(overall)
-    overall = _clamp(overall, 0.0, 100.0)
+    # keep quote dict minimal but include canonical keys if present
+    row = dict(quote)
+    row["symbol"] = sym
+    row["source_page"] = page
 
-    # risk_score
-    rs_val = _cell(row, _pick_idx(idx, ["risk_score", "risk score"]))
-    risk = _safe_float(rs_val, None)
-    if risk is None:
-        bucket = _cell(row, _pick_idx(idx, ["risk_bucket", "risk bucket", "risk"]))
-        risk = _risk_from_bucket(_safe_str(bucket))
-    else:
-        risk = float(risk * 100.0) if 0.0 < risk <= 1.5 else float(risk)
-        risk = _clamp(risk, 0.0, 100.0)
-
-    # minimal raw row dict (canonical-ish keys)
-    name = _cell(row, _pick_idx(idx, ["name", "company name", "fund name", "long name", "instrument"]))
-    currency = _cell(row, _pick_idx(idx, ["currency", "ccy"]))
-    exchange = _cell(row, _pick_idx(idx, ["exchange", "market", "region"]))
-    price = _cell(row, _pick_idx(idx, ["current_price", "current price", "price", "last price", "last", "close", "nav", "nav per share"]))
-    rec = _cell(row, _pick_idx(idx, ["recommendation", "action"]))
-
-    fp_key = horizon_to_forecast_price_key(horizon)
-    fp = _cell(row, _pick_idx(idx, [
-        fp_key,
-        f"forecast price ({horizon.upper()})",
-        f"forecast {horizon.upper()}",
-    ]))
-
-    raw: Dict[str, Any] = {
-        "symbol": sym,
-        "name": name,
-        "currency": currency,
-        "exchange": exchange,
-        "current_price": price,
-        "recommendation": rec,
-        roi_key: roi,
-        fp_key: fp,
-        "forecast_confidence": conf,
-        "overall_score": overall,
-        "risk_score": risk,
-        "source_page": page,
-    }
-    return sym, float(roi), conf, overall, float(risk), raw
+    return Candidate(
+        symbol=sym,
+        source_page=page,
+        roi=float(roi),
+        confidence=float(conf),
+        overall_score=float(overall),
+        risk_score=float(risk),
+        volume=float(vol),
+        row=row,
+    )
 
 
-async def _enrich_top(engine: Any, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+# -----------------------------------------------------------------------------
+# Ranking logic (ROI primary; tie-break confidence; optional liquidity; then score)
+# -----------------------------------------------------------------------------
+def _rank_key(c: Candidate, *, use_liquidity: bool) -> Tuple[float, float, float, float]:
+    # ROI biggest, then confidence, then liquidity (volume), then overall_score
+    # volume is only applied if enabled; else 0
+    vol = c.volume if use_liquidity else 0.0
+    return (c.roi, c.confidence, vol, c.overall_score)
+
+
+# -----------------------------------------------------------------------------
+# Optional enrichment for final Top-N (fill missing keys)
+# -----------------------------------------------------------------------------
+async def _enrich_top(engine: Any, symbols: List[str], *, mode: str = "") -> Dict[str, Dict[str, Any]]:
     """
-    Optional enrichment for final Top-N to fill missing keys.
-    Uses engine.get_enriched_quote if available.
+    Enrich final Top-N to maximize completeness (best-effort).
+    We try batch first; then per-symbol.
     """
-    out: Dict[str, Dict[str, Any]] = {}
     if engine is None or not symbols:
-        return out
+        return {}
+
+    # batch again (cheap + consistent)
+    try:
+        res = await _fetch_quotes_map(engine, symbols, mode=mode or "")
+        if isinstance(res, dict) and res:
+            return {s: _to_payload(res.get(s)) for s in symbols}
+    except Exception:
+        pass
+
+    out: Dict[str, Dict[str, Any]] = {}
     fn = getattr(engine, "get_enriched_quote", None)
     if not callable(fn):
         return out
@@ -559,86 +694,138 @@ async def _enrich_top(engine: Any, symbols: List[str]) -> Dict[str, Dict[str, An
                     r = await r
                 out[sym] = _to_payload(r)
             except Exception:
-                out[sym] = {"symbol": sym, "error": "enrich_failed"}
+                out[sym] = {"symbol": sym, "warnings": "enrich_failed"}
 
     await asyncio.gather(*(one(s) for s in symbols), return_exceptions=False)
     return out
 
 
-async def select_top10(*, engine: Any, criteria: Criteria) -> Tuple[List[Candidate], Dict[str, Any]]:
+# -----------------------------------------------------------------------------
+# Core selection (LIVE quotes is primary; snapshots only as last resort)
+# -----------------------------------------------------------------------------
+async def select_top10(*, engine: Any, criteria: Criteria, mode: str = "") -> Tuple[List[Candidate], Dict[str, Any]]:
     """
-    Returns (candidates, meta).
+    Returns (top_candidates, meta).
     """
     t0 = time.time()
     horizon = criteria.horizon()
-    pages = _eligible_pages(criteria)
-    snaps = _get_multi_snapshots(engine, pages)
+    roi_key = horizon_to_roi_key(horizon)
 
-    total_rows = 0
-    scanned_pages = 0
-    candidates: List[Candidate] = []
+    pages = _eligible_pages(criteria)
+    per_page_limit = max(50, int(os.getenv("TOP10_UNIVERSE_LIMIT_PER_PAGE", "500") or "500"))
+    per_page_limit = max(50, min(5000, per_page_limit))
+
+    # Build universe symbols (LIVE)
+    universe: List[Tuple[str, str]] = []  # (symbol, source_page)
+    warnings: List[str] = []
 
     for page in pages:
-        snap = snaps.get(page)
-        if not snap:
+        syms = await _get_universe_symbols_live(engine, page, limit=per_page_limit)
+        if not syms:
+            # fallback: snapshots (last resort)
+            snap = _get_snapshot(engine, page)
+            if isinstance(snap, dict) and isinstance(snap.get("rows"), list):
+                # try to find symbol column
+                hdrs = snap.get("headers") or []
+                rows = snap.get("rows") or []
+                if isinstance(hdrs, list) and hdrs:
+                    idx_map = {_norm_key(h): i for i, h in enumerate(hdrs) if _norm_key(h)}
+                    sym_idx = None
+                    for k in ("symbol", "ticker", "code"):
+                        if k in idx_map:
+                            sym_idx = idx_map[k]
+                            break
+                    if sym_idx is not None:
+                        for r in rows[:per_page_limit]:
+                            if isinstance(r, (list, tuple)) and sym_idx < len(r):
+                                s = _normalize_symbol(_safe_str(r[sym_idx]))
+                                if s:
+                                    universe.append((s, page))
+                if not any(p == page for _, p in universe):
+                    warnings.append(f"universe_empty:{page}")
+            else:
+                warnings.append(f"universe_empty:{page}")
             continue
-        headers = snap.get("headers") or []
-        rows = snap.get("rows") or []
-        if not isinstance(headers, list) or not isinstance(rows, list) or not headers:
+
+        for s in syms:
+            universe.append((s, page))
+
+    # Dedup universe by symbol preserving first source_page
+    seen_u: Set[str] = set()
+    universe_dedup: List[Tuple[str, str]] = []
+    for s, p in universe:
+        if s and s not in seen_u:
+            seen_u.add(s)
+            universe_dedup.append((s, p))
+
+    symbols = [s for s, _ in universe_dedup]
+    source_map = {s: p for s, p in universe_dedup}
+
+    # Safety: if universe is empty, return clean result
+    if not symbols:
+        meta = {
+            "version": TOP10_SELECTOR_VERSION,
+            "mode": mode,
+            "horizon": horizon,
+            "roi_key": roi_key,
+            "pages_selected": pages,
+            "universe_symbols": 0,
+            "candidates": 0,
+            "returned": 0,
+            "warnings": warnings or ["universe_empty_all_pages"],
+            "timestamp_utc": _now_utc_iso(),
+            "timestamp_riyadh": _now_riyadh_iso(),
+            "duration_ms": round((time.time() - t0) * 1000.0, 3),
+        }
+        return [], meta
+
+    # Fetch LIVE quotes for universe (batch)
+    qmap = await _fetch_quotes_map(engine, symbols, mode=mode or "")
+
+    candidates: List[Candidate] = []
+    for sym in symbols:
+        q = qmap.get(sym) or {}
+        if not isinstance(q, dict) or not q:
+            continue
+        cand = _extract_candidate_from_quote(sym=sym, page=source_map.get(sym, ""), quote=q, horizon=horizon)
+        if cand is None:
             continue
 
-        scanned_pages += 1
-        total_rows += len(rows)
+        # filters
+        if criteria.min_expected_roi is not None and cand.roi < float(criteria.min_expected_roi):
+            continue
 
-        idx = _idx_map(headers)
-
-        for r in rows:
-            if not isinstance(r, (list, tuple)):
+        if criteria.enforce_risk_confidence:
+            if cand.risk_score > float(criteria.max_risk_score):
                 continue
-            extracted = _extract_candidate_from_row(row=list(r), idx=idx, page=page, horizon=horizon)
-            if not extracted:
-                continue
-            sym, roi, conf, overall, risk, raw = extracted
-
-            # hard filters
-            if criteria.min_expected_roi is not None and roi < float(criteria.min_expected_roi):
+            if cand.confidence < float(criteria.min_confidence):
                 continue
 
-            if criteria.enforce_risk_confidence:
-                if risk > float(criteria.max_risk_score):
-                    continue
-                if conf < float(criteria.min_confidence):
-                    continue
+        if criteria.min_volume is not None and cand.volume < float(criteria.min_volume):
+            continue
 
-            candidates.append(
-                Candidate(
-                    symbol=sym,
-                    source_page=page,
-                    roi=roi,
-                    confidence=conf,
-                    overall_score=overall,
-                    risk_score=risk,
-                    row=raw,
-                )
-            )
+        candidates.append(cand)
 
-    # Deduplicate by symbol (keep best by ROI, then confidence, then overall_score)
+    # Deduplicate by symbol (keep best by rank key)
     best: Dict[str, Candidate] = {}
     for c in candidates:
         prev = best.get(c.symbol)
-        if prev is None or (c.roi, c.confidence, c.overall_score) > (prev.roi, prev.confidence, prev.overall_score):
+        if prev is None or _rank_key(c, use_liquidity=criteria.use_liquidity_tiebreak) > _rank_key(
+            prev, use_liquidity=criteria.use_liquidity_tiebreak
+        ):
             best[c.symbol] = c
 
     deduped = list(best.values())
-    deduped.sort(key=lambda c: (c.roi, c.confidence, c.overall_score), reverse=True)
+    deduped.sort(key=lambda c: _rank_key(c, use_liquidity=criteria.use_liquidity_tiebreak), reverse=True)
 
-    top = deduped[: max(1, int(criteria.top_n or 10))]
+    top_n = max(1, int(criteria.top_n or 10))
+    top = deduped[:top_n]
 
-    # optional enrich top
+    # Optional enrich top to fill missing keys (live again)
     enrich_map: Dict[str, Dict[str, Any]] = {}
     if criteria.enrich_final and top:
         try:
-            enrich_map = await _enrich_top(engine, [c.symbol for c in top])
+            enrich_map = await _enrich_top(engine, [c.symbol for c in top], mode=mode or "")
         except Exception:
             enrich_map = {}
 
@@ -647,57 +834,181 @@ async def select_top10(*, engine: Any, criteria: Criteria) -> Tuple[List[Candida
         if isinstance(e, dict) and e:
             merged = dict(c.row)
             merged.update(e)  # enrichment wins
-            c.row = merged  # ok with slots (same attribute)
+            merged["symbol"] = c.symbol
+            merged["source_page"] = c.source_page
+            c.row = merged
 
     meta = {
+        "version": TOP10_SELECTOR_VERSION,
+        "mode": mode,
         "horizon": horizon,
-        "roi_key": horizon_to_roi_key(horizon),
-        "pages_scanned": pages,
-        "snapshots_found": sorted([p for p in pages if p in snaps]),
-        "scanned_pages": scanned_pages,
-        "rows_scanned": total_rows,
+        "roi_key": roi_key,
+        "pages_selected": pages,
+        "universe_symbols": len(symbols),
+        "quotes_returned": len(qmap),
         "candidates": len(candidates),
         "deduped": len(deduped),
         "returned": len(top),
-        "duration_ms": round((time.time() - t0) * 1000.0, 3),
+        "filters": {
+            "min_expected_roi": criteria.min_expected_roi,
+            "max_risk_score": criteria.max_risk_score,
+            "min_confidence": criteria.min_confidence,
+            "min_volume": criteria.min_volume,
+            "use_liquidity_tiebreak": criteria.use_liquidity_tiebreak,
+            "enforce_risk_confidence": criteria.enforce_risk_confidence,
+        },
+        "warnings": warnings,
         "timestamp_utc": _now_utc_iso(),
         "timestamp_riyadh": _now_riyadh_iso(),
+        "duration_ms": round((time.time() - t0) * 1000.0, 3),
     }
     return top, meta
 
 
 # -----------------------------------------------------------------------------
-# Output rows for Top_10_Investments (route will normalize to schema)
+# Schema-aligned output for Top_10_Investments (83 columns)
 # -----------------------------------------------------------------------------
-def build_top10_output_rows(candidates: List[Candidate], *, horizon: str) -> List[Dict[str, Any]]:
+def _get_top10_schema() -> Tuple[List[str], List[str], str]:
+    """
+    Returns (headers, keys, schema_source) for Top_10_Investments.
+    If schema_registry missing, returns safe fallback keys.
+    """
+    try:
+        from core.sheets.schema_registry import get_sheet_spec  # type: ignore
+
+        spec = get_sheet_spec("Top_10_Investments")
+        cols = getattr(spec, "columns", None) or []
+        headers = [str(getattr(c, "header")) for c in cols if str(getattr(c, "header", "")).strip() and str(getattr(c, "key", "")).strip()]
+        keys = [str(getattr(c, "key")) for c in cols if str(getattr(c, "header", "")).strip() and str(getattr(c, "key", "")).strip()]
+        if headers and keys and len(headers) == len(keys):
+            return headers, keys, "schema_registry.get_sheet_spec"
+    except Exception:
+        pass
+
+    # fallback: minimal canonical + extras (still 83? no — but route should prefer registry)
+    # We keep it stable enough to not crash. Best practice is schema_registry present.
+    keys = ["symbol", "name", "current_price", "expected_roi_3m", "forecast_confidence", "risk_score", "overall_score", "top10_rank", "selection_reason", "criteria_snapshot"]
+    headers = ["Symbol", "Name", "Current Price", "Expected ROI 3M", "Forecast Confidence", "Risk Score", "Overall Score", "Top10 Rank", "Selection Reason", "Criteria Snapshot"]
+    return headers, keys, "fallback_minimal"
+
+
+def _project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: row.get(k, None) for k in keys}
+
+
+def build_top10_output_rows(
+    candidates: List[Candidate],
+    *,
+    criteria: Criteria,
+    mode: str = "",
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Builds Top_10_Investments rows aligned to schema_registry keys.
+    Returns (rows, meta).
+    """
+    headers, keys, schema_source = _get_top10_schema()
+    horizon = criteria.horizon()
     roi_key = horizon_to_roi_key(horizon)
-    fp_key = horizon_to_forecast_price_key(horizon)
+
+    crit_snapshot = {
+        "invest_period_days": criteria.invest_period_days,
+        "horizon": horizon,
+        "pages_selected": criteria.pages_selected,
+        "min_expected_roi": criteria.min_expected_roi,
+        "max_risk_score": criteria.max_risk_score,
+        "min_confidence": criteria.min_confidence,
+        "min_volume": criteria.min_volume,
+        "use_liquidity_tiebreak": criteria.use_liquidity_tiebreak,
+        "enforce_risk_confidence": criteria.enforce_risk_confidence,
+        "mode": mode,
+        "selector_version": TOP10_SELECTOR_VERSION,
+        "generated_at_utc": _now_utc_iso(),
+        "generated_at_riyadh": _now_riyadh_iso(),
+    }
+    crit_json = _json_dumps_safe(crit_snapshot)
 
     out: List[Dict[str, Any]] = []
     for i, c in enumerate(candidates, start=1):
-        raw = c.row or {}
-        row = {
-            "rank": i,
-            "source_page": c.source_page,
-            "symbol": c.symbol,
-            "name": raw.get("name") or raw.get("company_name"),
-            "currency": raw.get("currency"),
-            "exchange": raw.get("exchange"),
-            "current_price": raw.get("current_price") or raw.get("price"),
-            "risk_score": raw.get("risk_score") if raw.get("risk_score") is not None else c.risk_score,
-            "overall_score": raw.get("overall_score") if raw.get("overall_score") is not None else c.overall_score,
-            "forecast_confidence": raw.get("forecast_confidence") if raw.get("forecast_confidence") is not None else c.confidence,
-            roi_key: raw.get(roi_key) if raw.get(roi_key) is not None else c.roi,
-            fp_key: raw.get(fp_key),
-            "recommendation": raw.get("recommendation"),
-            "last_updated_utc": raw.get("last_updated_utc") or _now_utc_iso(),
-            "last_updated_riyadh": raw.get("last_updated_riyadh") or _now_riyadh_iso(),
-        }
-        out.append(row)
-    return out
+        raw = dict(c.row or {})
+
+        # ensure canonical basics exist
+        raw["symbol"] = c.symbol
+        raw.setdefault("name", raw.get("company_name") or raw.get("long_name") or raw.get("instrument_name"))
+        raw.setdefault("current_price", raw.get("price") or raw.get("last") or raw.get("close"))
+        raw.setdefault("risk_score", c.risk_score)
+        raw.setdefault("overall_score", c.overall_score)
+        raw.setdefault("forecast_confidence", c.confidence)
+        raw.setdefault(roi_key, c.roi)
+
+        # Top10 extras (schema_registry v2.1.1 expects these keys)
+        raw["top10_rank"] = i
+        raw["selection_reason"] = (
+            f"Ranked by {roi_key} then confidence"
+            + (" then liquidity(volume)" if criteria.use_liquidity_tiebreak else "")
+            + " then overall_score"
+        )
+        raw["criteria_snapshot"] = crit_json
+
+        # Provenance fields
+        raw.setdefault("data_provider", raw.get("data_provider") or raw.get("provider") or "")
+        raw.setdefault("last_updated_utc", raw.get("last_updated_utc") or _now_utc_iso())
+        raw.setdefault("last_updated_riyadh", raw.get("last_updated_riyadh") or _now_riyadh_iso())
+
+        out.append(_project_row(keys, raw))
+
+    meta = {
+        "schema_source": schema_source,
+        "headers_len": len(headers),
+        "keys_len": len(keys),
+        "horizon": horizon,
+        "roi_key": roi_key,
+        "rows": len(out),
+        "selector_version": TOP10_SELECTOR_VERSION,
+    }
+    return out, meta
+
+
+# -----------------------------------------------------------------------------
+# Convenience public APIs (used by routes / insights_builder)
+# -----------------------------------------------------------------------------
+async def select_top10_symbols(*, engine: Any, criteria: Optional[Dict[str, Any]] = None, limit: int = 10, mode: str = "") -> List[str]:
+    """
+    Convenience: returns Top10 symbols only.
+    Used by Insights Builder (auto universe) and routes/top10_investments.py.
+    """
+    crit = _criteria_from_dict(criteria or {})
+    crit.top_n = max(1, min(50, int(limit or crit.top_n or 10)))
+    top, _meta = await select_top10(engine=engine, criteria=crit, mode=mode or "")
+    return [c.symbol for c in top]
+
+
+async def build_top10_rows(*, engine: Any, criteria: Optional[Dict[str, Any]] = None, limit: int = 10, mode: str = "") -> Dict[str, Any]:
+    """
+    Builds full schema-aligned payload for Top_10_Investments:
+      {status, page, headers, keys, rows, meta}
+    """
+    crit = _criteria_from_dict(criteria or {})
+    crit.top_n = max(1, min(50, int(limit or crit.top_n or 10)))
+
+    top, meta_sel = await select_top10(engine=engine, criteria=crit, mode=mode or "")
+    rows, meta_rows = build_top10_output_rows(top, criteria=crit, mode=mode or "")
+    headers, keys, _schema_source = _get_top10_schema()
+
+    return {
+        "status": "success",
+        "page": "Top_10_Investments",
+        "headers": headers,
+        "keys": keys,
+        "rows": rows,
+        "meta": {
+            **(meta_sel or {}),
+            **(meta_rows or {}),
+        },
+    }
 
 
 __all__ = [
+    "TOP10_SELECTOR_VERSION",
     "Criteria",
     "Candidate",
     "load_criteria_best_effort",
@@ -706,5 +1017,7 @@ __all__ = [
     "horizon_to_roi_key",
     "horizon_to_forecast_price_key",
     "select_top10",
+    "select_top10_symbols",
+    "build_top10_rows",
     "build_top10_output_rows",
 ]
