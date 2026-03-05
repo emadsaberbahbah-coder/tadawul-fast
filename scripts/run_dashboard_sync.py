@@ -3,19 +3,16 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.2.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.2.1)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
-Core fixes in v6.2.0 (aligned with your March 2026 schema changes)
-- ✅ Removed legacy KSA_TADAWUL and Advisor_Criteria completely (never runs by default).
-- ✅ Added TOP_10_INVESTMENTS + DATA_DICTIONARY tasks.
-- ✅ No longer requires symbols to run a task:
-    - special/meta pages (Insights_Analysis, Top_10_Investments, Data_Dictionary) work with empty tickers
-    - instrument pages still try to read symbols, but will fall back to schema-only headers if empty
-- ✅ Sends BOTH "sheet" and "sheet_name" (and "page") to maximize route compatibility.
-- ✅ Adds auth headers support (TFB_TOKEN / X_APP_TOKEN / BACKEND_TOKEN) for protected endpoints.
-- ✅ Endpoint fallback chain is more robust (enriched → analysis → advanced).
+v6.2.1 improvements (fixes common ❌ causes + improves compatibility)
+- ✅ Always converts backend rows to a 2D matrix for Google Sheets (even if backend returns rows as dicts).
+- ✅ Safer “schema-only” requests when tickers are empty (limit never sent as 0; avoid validators).
+- ✅ Stronger payload compatibility: sends sheet / sheet_name / page / name / tab + tickers/symbols.
+- ✅ Robust response parsing: supports headers+rows, headers+rows_matrix, nested data payloads.
+- ✅ Never runs legacy forbidden keys (KSA_TADAWUL / ADVISOR_CRITERIA).
 
 Design rules
 - No network calls at import-time.
@@ -32,7 +29,6 @@ import logging
 import os
 import random
 import re
-import sys
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -40,10 +36,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.2.0"
+SCRIPT_VERSION = "6.2.1"
+
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -55,6 +53,7 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("DashboardSync")
+
 
 # -----------------------------------------------------------------------------
 # Helpers (safe)
@@ -138,9 +137,8 @@ def _canon_key(user_key: str) -> str:
         "TOP10": "TOP_10_INVESTMENTS",
         "TOP_10": "TOP_10_INVESTMENTS",
         "TOP10_INVESTMENTS": "TOP_10_INVESTMENTS",
-        "DATA_DICTIONARY": "DATA_DICTIONARY",
-        "DICTIONARY": "DATA_DICTIONARY",
         "DATA_DICTIONARY_SHEET": "DATA_DICTIONARY",
+        "DICTIONARY": "DATA_DICTIONARY",
     }
     return aliases.get(k, k)
 
@@ -148,6 +146,10 @@ def _canon_key(user_key: str) -> str:
 def _is_forbidden_key(k: str) -> bool:
     kk = _canon_key(k)
     return kk in {"KSA_TADAWUL", "ADVISOR_CRITERIA"}
+
+
+def _is_meta_sheet_name(sheet_name: str) -> bool:
+    return (sheet_name or "").strip() in {"Insights_Analysis", "Top_10_Investments", "Data_Dictionary"}
 
 
 def _default_backend_url() -> str:
@@ -182,11 +184,11 @@ def _env_token() -> str:
 @dataclass(slots=True)
 class TaskSpec:
     key: str
-    sheet_name: str                  # Google Sheet tab name + backend canonical page
-    gateway: str                     # enriched | analysis | advanced | argaam
+    sheet_name: str                   # Google Sheet tab name + backend canonical page
+    gateway: str                      # enriched | analysis | advanced | argaam
     priority: int = 5
     max_symbols: int = 500
-    allow_empty_symbols: bool = True # allow schema-only write when symbols list is empty
+    allow_empty_symbols: bool = True  # allow schema-only write when symbols list is empty
 
 
 @dataclass(slots=True)
@@ -269,7 +271,6 @@ class BackendClient:
     def _headers(self) -> Dict[str, str]:
         h = {"Accept": "application/json"}
         if self.token:
-            # Support both styles; backend may read either
             h["Authorization"] = f"Bearer {self.token}"
             h["X-APP-TOKEN"] = self.token
         return h
@@ -307,14 +308,12 @@ class BackendClient:
     async def post_json(self, path: str, payload: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
         url = f"{self.base_url}{path}"
         max_retries = 3
-
         for attempt in range(max_retries):
             try:
                 client = await self._get_client()
                 r = await client.post(url, json=payload)
                 code = int(r.status_code)
 
-                # retry on rate limit / transient 5xx
                 if code in (429,) or (500 <= code < 600):
                     if attempt == max_retries - 1:
                         return None, f"HTTP {code}: {r.text[:200]}", code
@@ -325,12 +324,10 @@ class BackendClient:
                     return None, f"HTTP {code}: {r.text[:200]}", code
 
                 return r.json(), None, code
-
             except Exception as e:
                 if attempt == max_retries - 1:
                     return None, str(e), 0
                 await asyncio.sleep(min(10.0, (2**attempt) + random.uniform(0, 1.0)))
-
         return None, "Unknown error", 0
 
 
@@ -364,7 +361,7 @@ class RedisLock:
     async def acquire(self) -> bool:
         r = await self._get_redis()
         if r is None:
-            self.acquired = True  # no redis => allow run
+            self.acquired = True
             return True
         try:
             ok = await r.set(self.lock_name, self.value, nx=True, ex=self.ttl_sec)
@@ -421,7 +418,6 @@ class SheetsWriter:
                     return None
             return None
 
-        # raw can be JSON or base64(JSON)
         try:
             if raw.startswith("{") and raw.endswith("}"):
                 d = json.loads(raw)
@@ -453,7 +449,6 @@ class SheetsWriter:
 
     def _safe_sheet_a1(self, sheet_name: str) -> str:
         name = sheet_name.replace("'", "''")
-        # quote always if any non-alnum/underscore
         if re.search(r"[^A-Za-z0-9_]", sheet_name):
             return f"'{name}'"
         return sheet_name
@@ -504,11 +499,6 @@ class SheetsWriter:
 # Symbols reading (uses repo module if present)
 # -----------------------------------------------------------------------------
 def _read_symbols(task_key: str, spreadsheet_id: str, max_symbols: int) -> List[str]:
-    """
-    Uses your repo's symbols_reader if available.
-    - supports get_page_symbols(key, spreadsheet_id=?)
-    - returns uppercase unique symbols
-    """
     try:
         import importlib
 
@@ -548,7 +538,6 @@ def _read_symbols(task_key: str, spreadsheet_id: str, max_symbols: int) -> List[
 # Task definitions (aligned with your dashboard tabs + canonical schema)
 # -----------------------------------------------------------------------------
 def _default_tasks() -> List[TaskSpec]:
-    # IMPORTANT: no KSA_TADAWUL here (removed permanently)
     return [
         TaskSpec(key="MY_PORTFOLIO", sheet_name="My_Portfolio", gateway="enriched", priority=1, max_symbols=800, allow_empty_symbols=True),
         TaskSpec(key="MARKET_LEADERS", sheet_name="Market_Leaders", gateway="enriched", priority=2, max_symbols=800, allow_empty_symbols=True),
@@ -563,12 +552,8 @@ def _default_tasks() -> List[TaskSpec]:
 
 
 def _endpoint_candidates_for_gateway(gw: str) -> List[str]:
-    """
-    Endpoint candidates (first is preferred). We try /v1/... then fallback.
-    """
     gw = (gw or "enriched").strip().lower()
-
-    if gw == "analysis" or gw == "ai":
+    if gw in {"analysis", "ai"}:
         return [
             "/v1/analysis/sheet-rows",
             "/analysis/sheet-rows",
@@ -577,7 +562,6 @@ def _endpoint_candidates_for_gateway(gw: str) -> List[str]:
             "/v1/enriched/sheet-rows",
             "/enriched/sheet-rows",
         ]
-
     if gw == "advanced":
         return [
             "/v1/advanced/sheet-rows",
@@ -585,11 +569,8 @@ def _endpoint_candidates_for_gateway(gw: str) -> List[str]:
             "/v1/analysis/sheet-rows",
             "/analysis/sheet-rows",
         ]
-
     if gw == "argaam":
         return ["/v1/argaam/sheet-rows", "/argaam/sheet-rows"]
-
-    # enriched default
     return [
         "/v1/enriched/sheet-rows",
         "/enriched/sheet-rows",
@@ -602,32 +583,57 @@ def _endpoint_candidates_for_gateway(gw: str) -> List[str]:
 
 def _extract_table_payload(resp: Dict[str, Any]) -> Tuple[List[Any], List[List[Any]]]:
     """
-    Accepts multiple shapes:
-    - {"headers":[...],"rows":[...]}
-    - {"data":{"headers":[...],"rows":[...]}}
-    - {"headers":[...], "rows_matrix":[...]}  (legacy)
+    Returns (headers, rows_matrix) ALWAYS as list[list] for Sheets writing.
+    Supports:
+      - {"headers":[...], "rows":[list|dict]}
+      - {"headers":[...], "rows_matrix":[...]}
+      - {"keys":[...]} for dict->matrix conversion
+      - {"data": {...}} nested
     """
     if not isinstance(resp, dict):
         return [], []
 
+    if isinstance(resp.get("data"), dict):
+        return _extract_table_payload(resp["data"])  # type: ignore[index]
+
     headers = resp.get("headers")
+    keys = resp.get("keys")
     rows = resp.get("rows")
-    if isinstance(headers, list) and isinstance(rows, list):
-        # if rows are dicts, attempt to convert to matrix using keys
-        if rows and isinstance(rows[0], dict):
-            keys = resp.get("keys") if isinstance(resp.get("keys"), list) else []
-            if keys:
-                matrix = [[r.get(k) for k in keys] for r in rows]  # type: ignore
-                return headers, matrix
-        return headers, rows
+    rows_matrix = resp.get("rows_matrix")
 
-    # legacy matrix
-    if isinstance(headers, list) and isinstance(resp.get("rows_matrix"), list):
-        return headers, resp.get("rows_matrix") or []
+    headers_list = list(headers) if isinstance(headers, list) else []
+    keys_list = list(keys) if isinstance(keys, list) else []
 
-    data = resp.get("data")
-    if isinstance(data, dict) and isinstance(data.get("headers"), list) and isinstance(data.get("rows"), list):
-        return data.get("headers") or [], data.get("rows") or []
+    # Prefer explicit matrix if present
+    if isinstance(headers_list, list) and isinstance(rows_matrix, list):
+        return headers_list, [list(r) for r in rows_matrix if isinstance(r, list)]
+
+    if not isinstance(rows, list):
+        rows = []
+
+    # rows are list[list]
+    if rows and isinstance(rows[0], list):
+        if not headers_list and keys_list:
+            headers_list = keys_list[:]
+        return headers_list, [list(r) for r in rows if isinstance(r, list)]
+
+    # rows are list[dict] -> convert to matrix using keys or headers or first-row keys
+    if rows and isinstance(rows[0], dict):
+        dict_rows: List[Dict[str, Any]] = [r for r in rows if isinstance(r, dict)]  # type: ignore[assignment]
+        if not keys_list:
+            if headers_list:
+                keys_list = [str(h) for h in headers_list]
+            else:
+                keys_list = [str(k) for k in dict_rows[0].keys()]
+                headers_list = keys_list[:]
+        if not headers_list:
+            headers_list = keys_list[:]
+        matrix = [[r.get(k) for k in keys_list] for r in dict_rows]
+        return headers_list, matrix
+
+    # empty rows, but headers exist
+    if headers_list:
+        return headers_list, []
 
     return [], []
 
@@ -646,12 +652,7 @@ async def _run_one_task(
     sheets: Optional[SheetsWriter],
 ) -> TaskResult:
     t0 = time.perf_counter()
-    res = TaskResult(
-        key=task.key,
-        sheet_name=task.sheet_name,
-        status="pending",
-        start_utc=_utc_now().isoformat(),
-    )
+    res = TaskResult(key=task.key, sheet_name=task.sheet_name, status="pending", start_utc=_utc_now().isoformat())
 
     try:
         if _is_forbidden_key(task.key):
@@ -662,7 +663,6 @@ async def _run_one_task(
         max_syms = max_symbols_override if max_symbols_override >= 0 else task.max_symbols
         canon_task_key = _canon_key(task.key)
 
-        # Read symbols (best effort)
         symbols: List[str] = []
         if max_syms != 0:
             symbols = _read_symbols(canon_task_key, spreadsheet_id, max_syms)
@@ -682,22 +682,29 @@ async def _run_one_task(
         if not symbols:
             res.warnings.append("No symbols found; requesting schema-only payload (headers + empty rows).")
 
-        # Payload: send multiple keys to satisfy different handlers
+        # IMPORTANT: Some handlers clamp limit >= 1, so never send 0
+        safe_limit = 1 if not symbols else min(5000, max(1, len(symbols)))
+
         payload: Dict[str, Any] = {
+            # identifiers (compat)
             "sheet": task.sheet_name,
             "sheet_name": task.sheet_name,
             "page": task.sheet_name,
+            "name": task.sheet_name,
+            "tab": task.sheet_name,
+            # symbols
             "tickers": symbols,
             "symbols": symbols,
+            # behavior
             "refresh": True,
             "include_meta": True,
             "include_matrix": True,
-            "limit": 0 if not symbols else min(5000, max(1, len(symbols))),
+            "limit": safe_limit,
         }
 
         last_err: Optional[str] = None
         headers: List[Any] = []
-        rows: List[List[Any]] = []
+        rows_matrix: List[List[Any]] = []
         used_endpoint: Optional[str] = None
 
         for ep in _endpoint_candidates_for_gateway(task.gateway):
@@ -709,12 +716,11 @@ async def _run_one_task(
                 last_err = f"{ep} -> Non-dict response"
                 continue
 
-            headers, rows = _extract_table_payload(data)
-            if not isinstance(headers, list) or not headers:
+            headers, rows_matrix = _extract_table_payload(data)
+            if not headers:
                 last_err = f"{ep} -> Missing headers"
                 continue
-            if not isinstance(rows, list):
-                rows = []
+
             used_endpoint = ep
             break
 
@@ -731,7 +737,7 @@ async def _run_one_task(
             res.status = "partial"
             res.warnings.append("No Google Sheets credentials. Backend data fetched but not written.")
             res.rows_written = 0
-            res.rows_failed = len(rows or [])
+            res.rows_failed = len(rows_matrix or [])
             return res
 
         if clear_before_write:
@@ -741,14 +747,15 @@ async def _run_one_task(
                 res.warnings.append(f"Clear failed: {e}")
 
         try:
-            written = sheets.write_table(spreadsheet_id, task.sheet_name, start_cell, headers, rows)
+            written = sheets.write_table(spreadsheet_id, task.sheet_name, start_cell, headers, rows_matrix)
             res.rows_written = int(written)
-            # if schema-only (0 rows), that's still success
-            if not rows:
+
+            # schema-only (0 rows) => success
+            if not rows_matrix:
                 res.rows_failed = 0
                 res.status = "success"
             else:
-                res.rows_failed = max(0, len(rows) - res.rows_written)
+                res.rows_failed = max(0, len(rows_matrix) - res.rows_written)
                 res.status = "success" if res.rows_failed == 0 else ("partial" if res.rows_written > 0 else "failed")
         except Exception as e:
             res.status = "failed"
@@ -797,14 +804,14 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
     if not token:
         logger.warning("No backend token found (TFB_TOKEN/X_APP_TOKEN/APP_TOKEN/BACKEND_TOKEN). Requests may 401 if protected.")
 
-    # Select tasks
     tasks = _default_tasks()
+
     wanted_raw = [str(k) for k in (args.keys or []) if str(k).strip()]
-    wanted = {_canon_key(k) for k in wanted_raw if not _is_forbidden_key(k)}
     forbidden_requested = [k for k in wanted_raw if _is_forbidden_key(k)]
     if forbidden_requested:
         logger.warning("Forbidden keys requested and will be ignored: %s", ", ".join(forbidden_requested))
 
+    wanted = {_canon_key(k) for k in wanted_raw if not _is_forbidden_key(k)}
     if wanted:
         tasks = [t for t in tasks if _canon_key(t.key) in wanted]
 
@@ -824,7 +831,7 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
     lock = RedisLock(lock_name, ttl_sec=600)
 
     try:
-        # Preflight (backend)
+        # Preflight
         ready, err, _code = await backend.get_json("/readyz")
         if err:
             logger.warning("Backend /readyz not OK: %s", err)
@@ -874,7 +881,6 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
             else:
                 results.append(r)
 
-        # Summarize
         for r in results:
             if r.status == "success":
                 summary.success += 1
@@ -900,6 +906,7 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
             summary.total_rows_written,
             summary.duration_ms,
         )
+
         for r in results:
             if r.status == "success":
                 logger.info("✅ %s -> %s | rows=%d | %.1fms", r.key, r.sheet_name, r.rows_written, r.duration_ms)
@@ -918,13 +925,11 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
             else:
                 logger.info("⏭️  %s -> %s | %s", r.key, r.sheet_name, "; ".join(r.warnings[:2]) if r.warnings else "skipped")
 
-        # Optional JSON report
         if args.json_out:
             report = {"summary": summary.to_dict(), "results": [x.to_dict() for x in results]}
             Path(args.json_out).write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
             logger.info("Report saved: %s", args.json_out)
 
-        # Exit code policy
         if summary.failed > 0:
             return 2
         if summary.partial > 0:
