@@ -4,14 +4,10 @@ on:
   # ✅ CI quality gate (blocks PR merges when configured as required check)
   pull_request:
   push:
-    branches:
-      - main
-      - master
+    branches: [main, master]
 
   # ✅ Production scheduler
   schedule:
-    # Runs at minute 0, 15, 30, 45 every hour (UTC)
-    # Riyadh is UTC+3.
     - cron: "0,15,30,45 * * * *"
 
   # ✅ Manual run
@@ -30,10 +26,7 @@ on:
         required: true
         default: "full_sync"
         type: choice
-        options:
-          - full_sync
-          - health_only
-          - single_key
+        options: [full_sync, health_only, single_key]
       single_key:
         description: "🔑 Specific Key (if single_key mode)"
         required: false
@@ -67,9 +60,12 @@ env:
   PYTHONUNBUFFERED: 1
   TZ: Asia/Riyadh
 
+# =============================================================================
+# JOBS
+# =============================================================================
 jobs:
   # =============================================================================
-  # ✅ CI TESTS — runs on push/PR and is the quality gate for schema regressions
+  # ✅ CI TESTS — runs on push/PR (merge blocker)
   # =============================================================================
   ci-tests:
     name: 🧪 CI Tests (Schema Alignment + Contracts)
@@ -100,35 +96,40 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip setuptools wheel
+
           if [ -f "requirements.render.txt" ]; then
             python -m pip install -r requirements.render.txt
           elif [ -f "requirements.txt" ]; then
             python -m pip install -r requirements.txt
           fi
+
           python -m pip install -q pytest
 
-      - name: 🧪 Run Pytest (schema must not drift)
+      - name: 🧪 Run Tests (hard fail on missing gates)
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           set -euo pipefail
-          echo "::group::Pytest"
-          # Run the whole suite if present, otherwise target the critical tests
-          if [ -d "tests" ]; then
-            python -m pytest -q
-          else
-            # fallback: run key tests if repo doesn't use /tests
-            if [ -f "tests/test_schema_alignment.py" ]; then
-              python -m pytest -q tests/test_schema_alignment.py
-            fi
-            if [ -f "test_scoring_engine_contract.py" ]; then
-              python -m pytest -q test_scoring_engine_contract.py
-            elif [ -f "core/test_scoring_engine_contract.py" ]; then
-              python -m pytest -q core/test_scoring_engine_contract.py
-            elif [ -f "tests/test_scoring_engine_contract.py" ]; then
-              python -m pytest -q tests/test_scoring_engine_contract.py
-            fi
+          echo "::group::CI Tests"
+
+          if [ ! -f "tests/test_schema_alignment.py" ]; then
+            echo "::error::Missing required gate: tests/test_schema_alignment.py"
+            exit 1
           fi
+
+          # scoring contract test must exist somewhere
+          if [ -f "test_scoring_engine_contract.py" ]; then
+            SCORE_TEST="test_scoring_engine_contract.py"
+          elif [ -f "core/test_scoring_engine_contract.py" ]; then
+            SCORE_TEST="core/test_scoring_engine_contract.py"
+          elif [ -f "tests/test_scoring_engine_contract.py" ]; then
+            SCORE_TEST="tests/test_scoring_engine_contract.py"
+          else
+            echo "::error::test_scoring_engine_contract.py not found (root/core/tests)."
+            exit 1
+          fi
+
+          python -m pytest -q "$SCORE_TEST" tests/test_schema_alignment.py
           echo "::endgroup::"
 
   # =============================================================================
@@ -137,7 +138,6 @@ jobs:
   preflight-validation:
     name: 🛡️ Pre-flight Validation
     runs-on: ubuntu-latest
-    # Run for schedule + manual (keep CI lean)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     outputs:
       validated: ${{ steps.validate.outputs.validated }}
@@ -146,7 +146,6 @@ jobs:
         id: validate
         run: |
           set -euo pipefail
-
           echo "::group::System Information"
           echo "OS: $(uname -a)"
           df -h /
@@ -195,7 +194,6 @@ jobs:
       - name: 📦 Install & Verify Dependencies (NO hashes)
         run: |
           set -euo pipefail
-
           echo "::group::Pip Install Log"
           python -m pip install --upgrade pip setuptools wheel
 
@@ -226,16 +224,15 @@ jobs:
           PY
           echo "::endgroup::"
 
-      - name: 🧪 Run Contract + Schema Alignment Tests (blocks drift)
+      - name: 🧪 Run Contract + Schema Alignment Tests (sync guard)
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           set -euo pipefail
           echo "::group::Tests"
-
           python -c "import pytest" 2>/dev/null || python -m pip install -q pytest
 
-          # 1) Existing scoring contract test (required)
+          # scoring contract test (required)
           if [ -f "test_scoring_engine_contract.py" ]; then
             python -m pytest -q test_scoring_engine_contract.py
           elif [ -f "core/test_scoring_engine_contract.py" ]; then
@@ -247,13 +244,12 @@ jobs:
             exit 1
           fi
 
-          # 2) NEW: schema alignment gate (recommended)
+          # schema drift gate (recommended; warning only for scheduler)
           if [ -f "tests/test_schema_alignment.py" ]; then
             python -m pytest -q tests/test_schema_alignment.py
           else
-            echo "::warning::tests/test_schema_alignment.py not found; schema drift gate not running."
+            echo "::warning::tests/test_schema_alignment.py not found; schema drift gate not running in scheduler."
           fi
-
           echo "::endgroup::"
 
       - name: ⚙️ Smart Configuration Resolution
@@ -285,6 +281,21 @@ jobs:
             return 0
           }
 
+          sanitize_keys() {
+            # normalize spaces + remove forbidden keys + normalize known aliases
+            local raw="$1"
+            raw="$(echo "$raw" | tr -s ' ' | xargs)"
+
+            # remove forbidden legacy keys
+            raw="$(echo "$raw" | tr ' ' '\n' | grep -v -E '^(KSA_TADAWUL|ADVISOR_CRITERIA)$' | tr '\n' ' ' | xargs)"
+
+            # normalize common aliases
+            raw="$(echo "$raw" | sed 's/\bTOP10_INVESTMENTS\b/TOP_10_INVESTMENTS/g')"
+            raw="$(echo "$raw" | sed 's/\bDATA-DICTIONARY\b/DATA_DICTIONARY/g')"
+
+            echo "$raw"
+          }
+
           echo "::group::🔧 Configuration Resolution"
 
           # 1) URL
@@ -306,7 +317,7 @@ jobs:
           echo "TARGET_SHEET_ID=$SHEET" >> "$GITHUB_ENV"
           echo "✅ Sheet ID: $SHEET"
 
-          # 3) Mode & Keys (✅ removed KSA_TADAWUL permanently)
+          # 3) Mode & Keys (✅ NO KSA_TADAWUL)
           MODE="${INPUT_MODE:-full_sync}"
           echo "RUN_MODE=$MODE" >> "$GITHUB_ENV"
 
@@ -314,16 +325,23 @@ jobs:
             KEY="${INPUT_KEY:-MARKET_LEADERS}"
             KEYS="$KEY"
           else
-            # Canonical sync keys (no KSA_TADAWUL)
-            DEFAULT_KEYS="MARKET_LEADERS GLOBAL_MARKETS MUTUAL_FUNDS COMMODITIES_FX MY_PORTFOLIO INSIGHTS_ANALYSIS TOP_10_INVESTMENTS DATA_DICTIONARY"
-            KEYS="$(get_val "${VAR_DEFAULT_KEYS:-}" "$DEFAULT_KEYS")"
+            # Canonical sync keys (uppercase SYNC_KEYS that your sync runner maps)
+            DEFAULT_KEYS_CANONICAL="MARKET_LEADERS GLOBAL_MARKETS MUTUAL_FUNDS COMMODITIES_FX MY_PORTFOLIO INSIGHTS_ANALYSIS TOP_10_INVESTMENTS DATA_DICTIONARY"
+            KEYS="$(get_val "${VAR_DEFAULT_KEYS:-}" "$DEFAULT_KEYS_CANONICAL")"
           fi
 
-          KEYS="$(echo "$KEYS" | tr -s ' ' | xargs)"
+          KEYS="$(sanitize_keys "$KEYS")"
           if [[ -z "${KEYS:-}" ]]; then
-            echo "::error::SYNC_KEYS resolved to empty."
+            echo "::error::SYNC_KEYS resolved to empty (after sanitization)."
             exit 1
           fi
+
+          # hard fail if forbidden key slipped in
+          if echo "$KEYS" | tr ' ' '\n' | grep -q -E '^(KSA_TADAWUL|ADVISOR_CRITERIA)$'; then
+            echo "::error::Forbidden key present in SYNC_KEYS after sanitization."
+            exit 1
+          fi
+
           echo "SYNC_KEYS=$KEYS" >> "$GITHUB_ENV"
           echo "📋 Mode: $MODE | Keys: $KEYS"
 
@@ -404,6 +422,11 @@ jobs:
         run: |
           set -euo pipefail
           echo "::group::📊 Sync Execution"
+
+          if [ ! -f "scripts/run_dashboard_sync.py" ]; then
+            echo "::error::Missing scripts/run_dashboard_sync.py"
+            exit 1
+          fi
 
           CMD=(python scripts/run_dashboard_sync.py)
           CMD+=(--backend "$TARGET_URL")
@@ -523,7 +546,6 @@ jobs:
         run: |
           set -euo pipefail
           echo "::group::Cleanup"
-
           if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" && -f "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
             if command -v shred >/dev/null 2>&1; then
               shred -u -z "$GOOGLE_APPLICATION_CREDENTIALS" 2>/dev/null || rm -f "$GOOGLE_APPLICATION_CREDENTIALS"
@@ -532,5 +554,4 @@ jobs:
             fi
             echo "✅ Google Credentials removed from runner."
           fi
-
           echo "::endgroup::"
