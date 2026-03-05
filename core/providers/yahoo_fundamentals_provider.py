@@ -2,28 +2,31 @@
 # core/providers/yahoo_fundamentals_provider.py
 """
 ================================================================================
-Yahoo Finance Fundamentals Provider — v5.2.1 (PROD-HARDENED, ALIGNED)
+Yahoo Finance Fundamentals Provider — v5.3.0 (PHASE D / VALUATION FILLED / SAFE)
 ================================================================================
-(Emad Bahbah – Enterprise Integration Architecture)
 
-v5.2.1 FIXES (vs v5.2.0)
-- ✅ Fix metrics serialization: CacheStats is slots=True so __dict__ is not available
-- ✅ Cache hit correctness: treat cached {} as a valid cached value (is not None)
-- ✅ Lint/runtime clean-up: make LRU eviction sync (no async-without-await)
-
-Key upgrades from earlier versions
-- ✅ Alignment: outputs data_quality as UPPERCASE (EXCELLENT/HIGH/MEDIUM/LOW/ERROR/MISSING/STALE)
-- ✅ Optional deps: removed hard numpy import (no startup crash); yfinance/pandas remain optional
-- ✅ Stronger symbol normalization (Arabic digits + KSA codes -> .SR)
-- ✅ Better patch shape: adds common aliases (pb/ps, dividend_yield_percent, etc.) for downstream scorers
-- ✅ Safer SingleFlight (clean owner logic; no awaiting under lock)
-- ✅ Correct OpenTelemetry usage (start_as_current_span CM, set_attribute per key; safe fallbacks)
-- ✅ Better cache + CB behavior (monotonic time, progressive cooldown scaling on 401/403/429)
-- ✅ Engine-compatible public API preserved:
+Why this revision (Phase D)
+- ✅ FIX: Fundamentals/valuation fields were missing/blank on equity pages.
+  This provider now fills schema-aligned keys (best-effort from Yahoo):
+    pb_ratio, ps_ratio, peg_ratio, ev_ebitda,
+    gross_margin, operating_margin, profit_margin,
+    free_cash_flow_ttm, revenue_ttm, revenue_growth_yoy,
+    payout_ratio, dividend_yield,
+    pe_ttm, pe_forward, eps_ttm,
+    debt_to_equity, beta_5y, float_shares,
+    avg_volume_10d, avg_volume_30d
+- ✅ Keeps backward-compatible aliases (pb/ps/peg, forward_pe, net_margin, free_cashflow, etc.)
+- ✅ Startup-safe: no network I/O at import time (yfinance only runs inside to_thread)
+- ✅ Engine-compatible exports preserved:
       - fetch_fundamentals_patch()
       - fetch_enriched_quote_patch()
       - get_client_metrics()
       - aclose_yahoo_fundamentals_client()
+
+Important note about EODHD preference
+- Your engine should keep EODHD as PRIMARY for Global markets.
+- This module is a *fallback* fundamentals source; it focuses on filling the gaps when Yahoo is used.
+
 ================================================================================
 """
 
@@ -47,9 +50,10 @@ from enum import Enum
 from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 logger = logging.getLogger("core.providers.yahoo_fundamentals_provider")
+logger.addHandler(logging.NullHandler())
 
 PROVIDER_NAME = "yahoo_fundamentals"
-PROVIDER_VERSION = "5.2.1"
+PROVIDER_VERSION = "5.3.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
@@ -73,6 +77,7 @@ except Exception:
 
     def json_dumps(obj: Any) -> str:
         return json.dumps(obj, default=str, ensure_ascii=False)
+
 
 # ---------------------------------------------------------------------------
 # Optional stacks
@@ -105,12 +110,12 @@ except Exception:
 
 try:
     import yfinance as yf  # type: ignore
-    import pandas as pd  # type: ignore  # noqa: F401
 
     _HAS_YFINANCE = True
 except Exception:
     yf = None  # type: ignore
     _HAS_YFINANCE = False
+
 
 # ---------------------------------------------------------------------------
 # Metrics (safe)
@@ -124,7 +129,7 @@ if _PROMETHEUS_AVAILABLE and Counter and Gauge and Histogram:
     yf_fund_request_duration = Histogram(
         "yf_fund_request_duration_seconds",
         "Yahoo fundamentals provider request duration (seconds)",
-        buckets=[0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0],
+        buckets=[0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0],
     )
     yf_fund_circuit_breaker_state = Gauge(
         "yf_fund_circuit_breaker_state",
@@ -148,6 +153,7 @@ else:
     yf_fund_requests_total = _DummyMetric()
     yf_fund_request_duration = _DummyMetric()
     yf_fund_circuit_breaker_state = _DummyMetric()
+
 
 # ---------------------------------------------------------------------------
 # Tracing helpers (safe + correct)
@@ -228,7 +234,7 @@ def _env_str(name: str, default: str = "") -> str:
 def _env_int(name: str, default: int) -> int:
     try:
         v = os.getenv(name)
-        return int(str(v).strip()) if v is not None else default
+        return int(float(str(v).strip())) if v is not None else default
     except Exception:
         return default
 
@@ -271,7 +277,7 @@ def _fund_ttl_sec() -> float:
 
 
 def _err_ttl_sec() -> float:
-    return max(5.0, _env_float("YF_ERROR_TTL_SEC", 15.0))
+    return max(5.0, _env_float("YF_ERROR_TTL_SEC", 20.0))
 
 
 def _max_concurrency() -> int:
@@ -346,8 +352,10 @@ def safe_float(x: Any) -> Optional[float]:
             return None
 
         s = s.translate(_ARABIC_DIGITS)
-        s = s.replace(",", "").replace("%", "").replace("$", "").replace("£", "").replace("€", "")
-        s = s.replace("SAR", "").replace("ريال", "").strip()
+        s = s.replace(",", "").strip()
+
+        if s.endswith("%"):
+            s = s[:-1].strip()
 
         if s.startswith("(") and s.endswith(")"):
             s = "-" + s[1:-1].strip()
@@ -372,15 +380,19 @@ def safe_int(x: Any) -> Optional[int]:
     return int(round(f)) if f is not None else None
 
 
-def as_percent(x: Any) -> Optional[float]:
+def _as_fraction(x: Any) -> Optional[float]:
     """
-    If x is a ratio 0.12 -> 12.0.
-    If x already looks like percent 12 -> keep as 12.
+    Convert percent-like values to fraction:
+      "12%" -> 0.12
+      12    -> 0.12 (assume percent points if abs > 1.5)
+      0.12  -> 0.12
     """
     v = safe_float(x)
     if v is None:
         return None
-    return v * 100.0 if abs(v) <= 2.0 else v
+    if abs(v) > 1.5:
+        return v / 100.0
+    return v
 
 
 def clean_patch(p: Dict[str, Any]) -> Dict[str, Any]:
@@ -412,6 +424,14 @@ def normalize_symbol(symbol: str) -> str:
         return s
 
     return s
+
+
+def _is_ksa_symbol(norm_symbol: str) -> bool:
+    u = (norm_symbol or "").strip().upper()
+    if u.endswith(".SR"):
+        code = u[:-3]
+        return bool(_KSA_CODE_RE.match(code))
+    return False
 
 
 def map_recommendation(rec: Optional[str]) -> str:
@@ -447,22 +467,21 @@ class DataQuality(str, Enum):
 def data_quality_score(patch: Dict[str, Any]) -> Tuple[DataQuality, float]:
     """
     Score 0..100 based on presence/validity of key fundamentals.
-    Maps to aligned DataQuality tiers.
     """
     score = 0.0
 
     if safe_str(patch.get("symbol")):
-        score += 10
+        score += 8
     if safe_str(patch.get("name")):
-        score += 5
+        score += 6
     if safe_str(patch.get("currency")):
         score += 3
 
     cp = safe_float(patch.get("current_price"))
     if cp is not None and cp > 0:
-        score += 12
+        score += 10
     else:
-        score -= 10
+        score -= 8
 
     if safe_float(patch.get("market_cap")) is not None:
         score += 10
@@ -470,28 +489,38 @@ def data_quality_score(patch: Dict[str, Any]) -> Tuple[DataQuality, float]:
     # valuation
     if safe_float(patch.get("pe_ttm")) is not None:
         score += 7
-    if safe_float(patch.get("pb")) is not None:
-        score += 6
-    if safe_float(patch.get("ps")) is not None:
-        score += 6
+    if safe_float(patch.get("pb_ratio") or patch.get("pb")) is not None:
+        score += 7
+    if safe_float(patch.get("ps_ratio") or patch.get("ps")) is not None:
+        score += 7
+    if safe_float(patch.get("peg_ratio") or patch.get("peg")) is not None:
+        score += 4
 
-    # profitability
-    if safe_float(patch.get("net_margin")) is not None:
-        score += 8
-    if safe_float(patch.get("roe")) is not None:
-        score += 8
+    # profitability / returns
+    if _as_fraction(patch.get("profit_margin") or patch.get("net_margin")) is not None:
+        score += 7
+    if _as_fraction(patch.get("gross_margin")) is not None:
+        score += 5
+    if _as_fraction(patch.get("operating_margin")) is not None:
+        score += 5
+    if _as_fraction(patch.get("roe")) is not None:
+        score += 6
 
     # growth
-    if safe_float(patch.get("revenue_growth")) is not None:
+    if _as_fraction(patch.get("revenue_growth_yoy") or patch.get("revenue_growth")) is not None:
         score += 7
-    if safe_float(patch.get("earnings_growth")) is not None:
+    if safe_float(patch.get("revenue_ttm")) is not None:
+        score += 6
+
+    # cash flow
+    if safe_float(patch.get("free_cash_flow_ttm") or patch.get("free_cashflow")) is not None:
         score += 6
 
     # analyst target
     if safe_float(patch.get("target_mean_price")) is not None:
         score += 6
     if safe_int(patch.get("analyst_count")) is not None:
-        score += 6
+        score += 4
 
     score = max(0.0, min(100.0, score))
 
@@ -580,8 +609,9 @@ class AdvancedCache:
         if self.use_redis and self._redis:
             try:
                 blob = await self._redis.get(k)
-                if blob:
-                    val = pickle.loads(zlib.decompress(blob))
+                if blob is not None:
+                    # cached empty dict {} is valid
+                    val = pickle.loads(zlib.decompress(blob)) if blob else {}
                     async with self._lock:
                         if len(self._mem) >= self.maxsize:
                             self._evict_lru()
@@ -836,11 +866,10 @@ class YahooFundamentalsProvider:
             _cb_cooldown_sec(),
         )
 
-    def _blocking_fetch(self, symbol: str) -> Dict[str, Any]:
-        """
-        Blocking fetch with full-jitter retry. Runs in asyncio.to_thread().
-        NOTE: yfinance internally may be slow; we keep retries small and bounded.
-        """
+    # -----------------------------------------------------------------------
+    # Blocking fetch (runs in asyncio.to_thread)
+    # -----------------------------------------------------------------------
+    def _blocking_fetch(self, norm_symbol: str) -> Dict[str, Any]:
         if not _HAS_YFINANCE or yf is None:
             return {"error": "yfinance_not_installed"}
 
@@ -848,15 +877,16 @@ class YahooFundamentalsProvider:
 
         for attempt in range(4):
             try:
-                t = yf.Ticker(symbol)
+                t0 = time.time()
+                t = yf.Ticker(norm_symbol)
 
-                info = {}
+                info: Dict[str, Any] = {}
                 try:
                     info = t.info or {}
                 except Exception:
                     info = {}
 
-                # Fast info for price (optional)
+                # Fast price (optional)
                 fast_price = None
                 try:
                     fi = getattr(t, "fast_info", None)
@@ -867,116 +897,163 @@ class YahooFundamentalsProvider:
                 except Exception:
                     pass
 
+                now_utc = _utc_iso()
+                now_riy = _riyadh_iso()
+
+                # Prices / liquidity (best-effort from info)
                 current_price = (
                     safe_float(info.get("currentPrice"))
                     or safe_float(info.get("regularMarketPrice"))
                     or safe_float(fast_price)
                 )
 
-                # Yahoo fields
-                trailing_pe = safe_float(info.get("trailingPE"))
-                forward_pe = safe_float(info.get("forwardPE"))
-                pb = safe_float(info.get("priceToBook"))
-                ps = safe_float(info.get("priceToSalesTrailing12Months"))
+                # Valuation ratios
+                pe_ttm = safe_float(info.get("trailingPE"))
+                pe_forward = safe_float(info.get("forwardPE"))
+                pb_ratio = safe_float(info.get("priceToBook"))
+                ps_ratio = safe_float(info.get("priceToSalesTrailing12Months"))
+                peg_ratio = safe_float(info.get("pegRatio")) or safe_float(info.get("trailingPegRatio"))
+                ev_ebitda = safe_float(info.get("enterpriseToEbitda"))
 
-                # Build patch (aligned keys + a few compatibility aliases)
-                now_utc = _utc_iso()
-                now_riy = _riyadh_iso()
+                # Margins/returns (Yahoo gives fractions)
+                gross_margin = _as_fraction(info.get("grossMargins"))
+                operating_margin = _as_fraction(info.get("operatingMargins"))
+                profit_margin = _as_fraction(info.get("profitMargins"))
+                roe = _as_fraction(info.get("returnOnEquity"))
+                roa = _as_fraction(info.get("returnOnAssets"))
 
+                # Growth (fractions)
+                revenue_growth_yoy = _as_fraction(info.get("revenueGrowth"))
+                earnings_growth_yoy = _as_fraction(info.get("earningsGrowth"))
+
+                # Revenue / cash flow
+                revenue_ttm = safe_float(info.get("totalRevenue"))
+                free_cash_flow_ttm = safe_float(info.get("freeCashflow"))
+                operating_cash_flow = safe_float(info.get("operatingCashflow"))
+
+                # Dividend / payout (fractions)
+                dividend_yield = _as_fraction(info.get("dividendYield"))
+                payout_ratio = _as_fraction(info.get("payoutRatio"))
+
+                # Other fundamentals
+                eps_ttm = safe_float(info.get("trailingEps"))
+                debt_to_equity = safe_float(info.get("debtToEquity"))
+                beta_5y = safe_float(info.get("beta"))
+                float_shares = safe_float(info.get("floatShares"))
+                avg_volume_10d = safe_float(info.get("averageVolume10days"))
+                avg_volume_30d = safe_float(info.get("averageVolume"))
+
+                # Analyst targets (useful as intrinsic proxy)
+                target_mean_price = safe_float(info.get("targetMeanPrice"))
+                target_high_price = safe_float(info.get("targetHighPrice"))
+                target_low_price = safe_float(info.get("targetLowPrice"))
+                analyst_count = safe_int(info.get("numberOfAnalystOpinions"))
+
+                # Build schema-aligned patch (canonical keys)
                 out: Dict[str, Any] = {
-                    "requested_symbol": symbol,
-                    "symbol": symbol,
-                    "provider_symbol": symbol,
+                    "requested_symbol": norm_symbol,
+                    "symbol": norm_symbol,
+                    "provider_symbol": norm_symbol,
                     "provider": PROVIDER_NAME,
                     "data_source": PROVIDER_NAME,
                     "provider_version": PROVIDER_VERSION,
                     "last_updated_utc": now_utc,
                     "last_updated_riyadh": now_riy,
-                    # identity
-                    "currency": safe_str(info.get("currency") or info.get("financialCurrency") or "USD"),
+
+                    # Identity/classification (Yahoo may have these)
+                    "currency": safe_str(info.get("currency") or info.get("financialCurrency")),
                     "name": safe_str(info.get("longName") or info.get("shortName")),
                     "sector": safe_str(info.get("sector")),
                     "industry": safe_str(info.get("industry")),
-                    "sub_sector": safe_str(info.get("industry")),
-                    # market
+
+                    # Price/liquidity (best-effort)
                     "current_price": current_price,
-                    "price": current_price,  # alias used in some modules
                     "market_cap": safe_float(info.get("marketCap")),
-                    "enterprise_value": safe_float(info.get("enterpriseValue")),
-                    "shares_outstanding": safe_float(info.get("sharesOutstanding")),
-                    "beta": safe_float(info.get("beta")),
-                    # valuation
-                    "pe_ttm": trailing_pe,
-                    "forward_pe": forward_pe,
-                    "pb": pb,
-                    "ps": ps,
-                    "pb_ttm": pb,  # legacy alias
-                    "ps_ttm": ps,  # legacy alias
-                    "peg": safe_float(info.get("pegRatio")) or safe_float(info.get("trailingPegRatio")),
-                    # margins / returns (percent)
-                    "gross_margin": as_percent(info.get("grossMargins")),
-                    "operating_margin": as_percent(info.get("operatingMargins")),
-                    "net_margin": as_percent(info.get("profitMargins")),
-                    "roe": as_percent(info.get("returnOnEquity")),
-                    "roa": as_percent(info.get("returnOnAssets")),
-                    # growth (percent)
-                    "revenue_growth": as_percent(info.get("revenueGrowth")),
-                    "earnings_growth": as_percent(info.get("earningsGrowth")),
-                    "eps_growth_yoy": as_percent(info.get("earningsGrowth")),  # compatibility hint
-                    # earnings / book
-                    "eps_ttm": safe_float(info.get("trailingEps")),
-                    "eps_forward": safe_float(info.get("forwardEps")),
-                    "book_value": safe_float(info.get("bookValue")),
-                    # dividends (percent)
-                    "dividend_yield": as_percent(info.get("dividendYield")),
-                    "dividend_yield_percent": as_percent(info.get("dividendYield")),  # alias
-                    "dividend_rate": safe_float(info.get("dividendRate")),
-                    "payout_ratio": as_percent(info.get("payoutRatio")),
-                    # analyst targets
-                    "target_mean_price": safe_float(info.get("targetMeanPrice")),
-                    "target_high_price": safe_float(info.get("targetHighPrice")),
-                    "target_low_price": safe_float(info.get("targetLowPrice")),
+                    "float_shares": float_shares,
+                    "avg_volume_10d": avg_volume_10d,
+                    "avg_volume_30d": avg_volume_30d,
+                    "beta_5y": beta_5y,
+
+                    # Fundamentals
+                    "pe_ttm": pe_ttm,
+                    "pe_forward": pe_forward,
+                    "eps_ttm": eps_ttm,
+                    "dividend_yield": dividend_yield,
+                    "payout_ratio": payout_ratio,
+                    "revenue_ttm": revenue_ttm,
+                    "revenue_growth_yoy": revenue_growth_yoy,
+                    "gross_margin": gross_margin,
+                    "operating_margin": operating_margin,
+                    "profit_margin": profit_margin,
+                    "debt_to_equity": debt_to_equity,
+                    "free_cash_flow_ttm": free_cash_flow_ttm,
+
+                    # Valuation
+                    "pb_ratio": pb_ratio,
+                    "ps_ratio": ps_ratio,
+                    "peg_ratio": peg_ratio,
+                    "ev_ebitda": ev_ebitda,
+
+                    # Optional “intrinsic” proxy (analyst consensus)
+                    "intrinsic_value": target_mean_price,
+
+                    # Analyst / recos
+                    "target_mean_price": target_mean_price,
+                    "target_high_price": target_high_price,
+                    "target_low_price": target_low_price,
+                    "analyst_count": analyst_count,
                     "recommendation": map_recommendation(info.get("recommendationKey")),
-                    "analyst_count": safe_int(info.get("numberOfAnalystOpinions")),
-                    # balance/liquidity
-                    "current_ratio": safe_float(info.get("currentRatio")),
-                    "quick_ratio": safe_float(info.get("quickRatio")),
-                    "debt_to_equity": safe_float(info.get("debtToEquity")),
-                    # cashflow (might be absent)
-                    "operating_cashflow": safe_float(info.get("operatingCashflow")),
-                    "free_cashflow": safe_float(info.get("freeCashflow")),
-                    "short_ratio": safe_float(info.get("shortRatio")),
-                    "short_percent": as_percent(info.get("shortPercentOfFloat")),
                 }
 
-                # Derived upside + forecast (aligned with scoring_engine usage)
+                # Add some useful extras (kept for backward compatibility / other modules)
+                out.update(
+                    {
+                        "enterprise_value": safe_float(info.get("enterpriseValue")),
+                        "shares_outstanding": safe_float(info.get("sharesOutstanding")),
+                        "book_value": safe_float(info.get("bookValue")),
+                        "eps_forward": safe_float(info.get("forwardEps")),
+                        "roe": roe,
+                        "roa": roa,
+                        "earnings_growth_yoy": earnings_growth_yoy,
+                        "operating_cashflow": operating_cash_flow,
+                        "free_cashflow": free_cash_flow_ttm,  # alias
+                        "current_ratio": safe_float(info.get("currentRatio")),
+                        "quick_ratio": safe_float(info.get("quickRatio")),
+                        "short_ratio": safe_float(info.get("shortRatio")),
+                        "short_percent": _as_fraction(info.get("shortPercentOfFloat")),
+                    }
+                )
+
+                # Backward-compatible aliases for older scorers/pipelines
+                out["price"] = out.get("current_price")
+                out["forward_pe"] = out.get("pe_forward")
+                out["pb"] = out.get("pb_ratio")
+                out["ps"] = out.get("ps_ratio")
+                out["peg"] = out.get("peg_ratio")
+                out["net_margin"] = out.get("profit_margin")
+                out["revenue_growth"] = out.get("revenue_growth_yoy")
+                out["dividend_yield_percent"] = out.get("dividend_yield")  # legacy name (still fraction)
+
+                # If target exists and price exists, derive 12m ROI (fraction)
                 cp = safe_float(out.get("current_price"))
                 tm = safe_float(out.get("target_mean_price"))
                 if cp is not None and cp > 0 and tm is not None and tm > 0:
-                    upside = ((tm / cp) - 1.0) * 100.0
-                    out["upside_percent"] = float(upside)
-                    out["upside"] = float(upside)  # alias
-                    out["forecast_price_12m"] = float(tm)
-                    out["expected_roi_12m"] = float(upside)
+                    roi12 = (tm / cp) - 1.0
+                    out["forecast_price_12m"] = tm
+                    out["expected_roi_12m"] = roi12  # fraction (schema pct)
                     out["forecast_method"] = "analyst_consensus"
-                    out["forecast_updated_utc"] = now_utc
-                    out["forecast_updated_riyadh"] = now_riy
-
-                    ac = safe_int(out.get("analyst_count"))
-                    if ac and ac > 0:
-                        conf = 0.55 + (math.log(ac + 1) * 0.06)
-                        conf = float(min(0.95, max(0.35, conf)))
-                    else:
-                        conf = 0.50
+                    # confidence 0..1 (simple function of analyst count)
+                    ac = analyst_count or 0
+                    conf = 0.50 + (math.log(ac + 1) * 0.07 if ac > 0 else 0.0)
+                    conf = float(min(0.95, max(0.35, conf)))
                     out["forecast_confidence"] = conf
                     out["confidence_score"] = float(conf * 100.0)
 
                 dq, dq_score = data_quality_score(out)
                 out["data_quality"] = dq.value
-                out["data_quality_score"] = dq_score
-
-                # For engines expecting status (optional, harmless)
+                out["data_quality_score"] = float(dq_score)
                 out["status"] = "ok"
+                out["_fetch_ms"] = int((time.time() - t0) * 1000)
 
                 return clean_patch(out)
 
@@ -987,6 +1064,9 @@ class YahooFundamentalsProvider:
 
         return {"error": f"fetch_failed: {type(last_err).__name__ if last_err else 'Unknown'}: {last_err}"}
 
+    # -----------------------------------------------------------------------
+    # Async API
+    # -----------------------------------------------------------------------
     @_trace("yf_fund_fetch")
     async def fetch_fundamentals_patch(self, symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         if not _configured():
@@ -1043,6 +1123,7 @@ class YahooFundamentalsProvider:
                         "provider": PROVIDER_NAME,
                         "provider_version": PROVIDER_VERSION,
                         "norm_symbol": norm,
+                        "is_ksa": _is_ksa_symbol(norm),
                         "elapsed_ms": int((time.time() - t0) * 1000),
                         "cache_key": cache_key,
                     }
