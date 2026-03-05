@@ -2,7 +2,7 @@
 # routes/advanced_sheet_rows.py
 """
 ================================================================================
-Advanced Sheet-Rows Router — v1.3.0 (PHASE 3/5 / SCHEMA-DRIVEN / SPECIAL-SAFE)
+Advanced Sheet-Rows Router — v1.4.0 (PHASE 3/5 / SCHEMA-DRIVEN / SPECIAL-SAFE)
 ================================================================================
 
 Endpoint:
@@ -18,10 +18,10 @@ Contract:
     - rows follow request symbols order (instrument pages)
 - Optional rows_matrix for legacy clients (default true)
 
-Special (FIXES your PowerShell evidence):
-- ✅ Data_Dictionary is computed locally from schema_registry (no engine call)
-- ✅ Insights_Analysis is computed via core.analysis.insights_builder (7 columns)
-    (prevents accidental fallback to the 80-col instrument schema)
+Special (FIXES your PowerShell evidence + schema fallback bug):
+- ✅ Data_Dictionary computed locally from schema_registry (no engine call)
+- ✅ Insights_Analysis computed via core.analysis.insights_builder (prevents 80-col fallback)
+- ✅ Top_10_Investments computed via core.analysis.top10_builder (prevents 80-col fallback)
 
 Startup-safe:
 - No network I/O at import-time
@@ -35,6 +35,7 @@ import inspect
 import os
 import time
 import uuid
+import importlib
 from dataclasses import is_dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -81,7 +82,7 @@ except Exception:  # pragma: no cover
         return None
 
 
-ADVANCED_SHEET_ROWS_VERSION = "1.3.0"
+ADVANCED_SHEET_ROWS_VERSION = "1.4.0"
 router = APIRouter(prefix="/v1/advanced", tags=["Advanced Sheet Rows"])
 
 
@@ -249,7 +250,7 @@ def _rows_matrix(rows: List[Dict[str, Any]], keys: Sequence[str]) -> List[List[A
 
 
 # -----------------------------------------------------------------------------
-# Row normalization for Insights_Analysis (supports builder returning keys OR headers)
+# Row normalization (supports builder returning keys OR headers)
 # -----------------------------------------------------------------------------
 def _normalize_to_schema_keys(
     *,
@@ -403,41 +404,52 @@ async def _fetch_quotes(engine: Any, symbols: List[str], mode: str = "") -> Dict
 
 
 # -----------------------------------------------------------------------------
-# Insights_Analysis builder adapter (lazy, best-effort)
+# Safe module import helper (lazy)
 # -----------------------------------------------------------------------------
-async def _build_insights_analysis_rows(
+def _import_first_available(mod_names: Sequence[str]):
+    last_err: Optional[Exception] = None
+    for mn in mod_names:
+        try:
+            return importlib.import_module(mn)
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(str(last_err) if last_err else "import failed")
+
+
+# -----------------------------------------------------------------------------
+# Output builders adapters (Insights_Analysis + Top_10_Investments)
+# -----------------------------------------------------------------------------
+async def _build_output_rows_via_module(
     *,
+    module_names: Sequence[str],
+    function_names: Sequence[str],
     request: Request,
     settings: Any,
     mode: str,
     body: Dict[str, Any],
     schema_keys: Sequence[str],
     schema_headers: Sequence[str],
+    friendly_name: str,
 ) -> List[Dict[str, Any]]:
     """
-    Calls core.analysis.insights_builder to produce the Insights_Analysis rows.
-
-    We support multiple possible builder names/signatures to avoid tight coupling.
-    Expected output: list[dict] (keys should align to schema keys, but we normalize either way).
+    Generic adapter:
+    - Imports first available module name
+    - Finds first callable function name
+    - Calls with best-effort signature permutations
+    - Coerces output to rows list[dict]
+    - Normalizes to schema keys (supports builders returning headers)
     """
-    # Import inside call (startup-safe)
     try:
-        mod = __import__("core.analysis.insights_builder", fromlist=["*"])
+        mod = _import_first_available(module_names)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={"error": "Insights builder import failed", "detail": str(e)},
+            detail={"error": f"{friendly_name} builder import failed", "detail": str(e)},
         )
 
-    # Candidate function names (support future evolution)
     fn = None
-    for name in (
-        "build_insights_analysis_rows",
-        "build_insights_rows",
-        "build_insights_analysis",
-        "get_insights_rows",
-        "build_rows",
-    ):
+    for name in function_names:
         cand = getattr(mod, name, None)
         if callable(cand):
             fn = cand
@@ -446,10 +458,9 @@ async def _build_insights_analysis_rows(
     if fn is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={"error": "Insights builder has no callable builder function"},
+            detail={"error": f"{friendly_name} builder has no callable builder function"},
         )
 
-    # Try calling with progressively simpler signatures
     last_err: Optional[Exception] = None
     candidates: List[Tuple[Tuple[Any, ...], Dict[str, Any]]] = [
         ((), {"request": request, "settings": settings, "mode": mode, "body": body}),
@@ -478,30 +489,89 @@ async def _build_insights_analysis_rows(
     if out is None:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={"error": "Insights builder call failed", "detail": str(last_err) if last_err else "unknown"},
+            detail={"error": f"{friendly_name} builder call failed", "detail": str(last_err) if last_err else "unknown"},
         )
 
-    # Coerce to rows list
     rows: List[Dict[str, Any]] = []
     if isinstance(out, list):
         rows = [r for r in out if isinstance(r, dict)]
     elif isinstance(out, dict):
-        # allow envelope: {"rows": [...]}
         r2 = out.get("rows") or out.get("data") or out.get("items") or out.get("records")
         if isinstance(r2, list):
             rows = [r for r in r2 if isinstance(r, dict)]
         else:
-            # single dict row
             rows = [out]
     else:
         rows = []
 
-    # Normalize to schema keys (supports builder using headers instead of keys)
     norm: List[Dict[str, Any]] = []
     for r in rows:
-        norm.append(_normalize_to_schema_keys(schema_keys=schema_keys, schema_headers=schema_headers, raw=r))
+        norm.append(_normalize_to_schema_keys(schema_keys=schema_keys, schema_headers=schema_headers, raw=r or {}))
 
     return norm
+
+
+async def _build_insights_analysis_rows(
+    *,
+    request: Request,
+    settings: Any,
+    mode: str,
+    body: Dict[str, Any],
+    schema_keys: Sequence[str],
+    schema_headers: Sequence[str],
+) -> List[Dict[str, Any]]:
+    return await _build_output_rows_via_module(
+        module_names=("core.analysis.insights_builder",),
+        function_names=(
+            "build_insights_analysis_rows",
+            "build_insights_rows",
+            "build_insights_analysis",
+            "get_insights_rows",
+            "build_rows",
+        ),
+        request=request,
+        settings=settings,
+        mode=mode,
+        body=body,
+        schema_keys=schema_keys,
+        schema_headers=schema_headers,
+        friendly_name="Insights_Analysis",
+    )
+
+
+async def _build_top_10_investments_rows(
+    *,
+    request: Request,
+    settings: Any,
+    mode: str,
+    body: Dict[str, Any],
+    schema_keys: Sequence[str],
+    schema_headers: Sequence[str],
+) -> List[Dict[str, Any]]:
+    # We try multiple common module names to be resilient
+    return await _build_output_rows_via_module(
+        module_names=(
+            "core.analysis.top10_builder",
+            "core.analysis.top_10_builder",
+            "core.analysis.top_10_investments_builder",
+            "core.analysis.top10_investments_builder",
+        ),
+        function_names=(
+            "build_top_10_investments_rows",
+            "build_top10_investments_rows",
+            "build_top_10_rows",
+            "build_top10_rows",
+            "get_top10_rows",
+            "build_rows",
+        ),
+        request=request,
+        settings=settings,
+        mode=mode,
+        body=body,
+        schema_keys=schema_keys,
+        schema_headers=schema_headers,
+        friendly_name="Top_10_Investments",
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -582,7 +652,7 @@ async def advanced_sheet_rows(
 
     # --- schema ---
     try:
-        spec = get_sheet_spec("Data_Dictionary" if page == "Data_Dictionary" else page)
+        spec = get_sheet_spec(page)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -603,8 +673,9 @@ async def advanced_sheet_rows(
         )
 
     # -----------------------------------------------------------------------------
-    # ✅ SPECIAL: Insights_Analysis (7-col builder)
+    # ✅ EXPLICIT DISPATCH MAP (prevents accidental fallback to 80-col standard schema)
     # -----------------------------------------------------------------------------
+    # NOTE: This is intentionally inside the handler to keep import-time startup safe.
     if page == "Insights_Analysis":
         rows = await _build_insights_analysis_rows(
             request=request,
@@ -635,9 +706,36 @@ async def advanced_sheet_rows(
             },
         }
 
-    # -----------------------------------------------------------------------------
-    # ✅ SPECIAL: Data_Dictionary (local compute)
-    # -----------------------------------------------------------------------------
+    if page == "Top_10_Investments":
+        rows = await _build_top_10_investments_rows(
+            request=request,
+            settings=settings,
+            mode=mode or "",
+            body=body,
+            schema_keys=keys,
+            schema_headers=headers,
+        )
+        rows = _slice(rows, limit=limit, offset=offset)
+
+        return {
+            "status": "success",
+            "page": page,
+            "headers": headers,
+            "keys": keys,
+            "rows": rows,
+            "rows_matrix": _rows_matrix(rows, keys) if include_matrix else None,
+            "version": ADVANCED_SHEET_ROWS_VERSION,
+            "request_id": request_id,
+            "meta": {
+                "duration_ms": (time.time() - start) * 1000.0,
+                "schema_mode": "top_10_builder",
+                "mode": mode,
+                "limit": limit,
+                "offset": offset,
+                "count": len(rows),
+            },
+        }
+
     if page == "Data_Dictionary":
         if build_data_dictionary_rows is None:
             raise HTTPException(
@@ -646,9 +744,10 @@ async def advanced_sheet_rows(
             )
 
         rows_dict = build_data_dictionary_rows(include_meta_sheet=True)
-        # rows_dict should already be aligned to schema keys (from your v2.2.0 generator),
-        # but we still normalize defensively.
-        rows_norm = [_normalize_to_schema_keys(schema_keys=keys, schema_headers=headers, raw=(r or {})) for r in (rows_dict or [])]
+        rows_norm = [
+            _normalize_to_schema_keys(schema_keys=keys, schema_headers=headers, raw=(r or {}))
+            for r in (rows_dict or [])
+        ]
         rows_norm = _slice(rows_norm, limit=limit, offset=offset)
 
         return {
