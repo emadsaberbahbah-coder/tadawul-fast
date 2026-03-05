@@ -2,15 +2,21 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v7.0.2)
+TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v7.1.0)
 ================================================================================
 Aligned • Deployment-safe • Minimal import chain • Dynamic router mounting
 
-v7.0.2 fixes
-- ✅ FIX: Explicit HEAD handlers for Render port scanner (HEAD / no longer 405)
-- ✅ IMPROVE: Router mounting moved to startup (avoids import-time “block” / heavy imports)
-- ✅ IMPROVE: Add /readyz and /livez (common health probes)
-- ✅ Harden: Avoid double-mount; store routes snapshot in app.state
+Why v7.1.0 (fixes your current prod symptom: openapi paths = 0, /quotes = 404)
+- ✅ Guarantees router mounting happens in FastAPI lifespan (startup), not at import-time
+- ✅ Adds a small schema-visible /meta route so OpenAPI is never "empty" even if routers fail
+- ✅ Emits stronger mount diagnostics + exposes mount counts in /livez and /readyz
+- ✅ Tries routes package native mounter first (mount_all_routers / mount_all / mount_routers),
+  then falls back to module-plan mounting
+- ✅ Keeps Render HEAD probes stable (HEAD /, /livez, /readyz)
+
+Notes
+- No network calls at import-time.
+- Startup never crashes unless ROUTES_STRICT_IMPORT=1 (or INIT_ENGINE_STRICT=1).
 """
 
 from __future__ import annotations
@@ -20,6 +26,7 @@ import json
 import logging
 import os
 import sys
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -32,7 +39,7 @@ from starlette.middleware.gzip import GZipMiddleware
 # --------------------------------------------------------------------------------------
 # Version
 # --------------------------------------------------------------------------------------
-APP_ENTRY_VERSION = "7.0.2"
+APP_ENTRY_VERSION = "7.1.0"
 
 # --------------------------------------------------------------------------------------
 # Safe env helpers
@@ -133,7 +140,6 @@ class _SettingsView:
     DEBUG: bool = False
     ENABLE_SWAGGER: bool = True
     ENABLE_REDOC: bool = True
-    DEFER_ROUTER_MOUNT: bool = False  # retained for compatibility (mount ordering), but mounting is startup-safe now
     INIT_ENGINE_ON_BOOT: bool = True
 
     REQUIRE_AUTH: bool = True
@@ -166,7 +172,6 @@ def _load_settings() -> _SettingsView:
                 DEBUG=bool(getattr(s, "DEBUG", _env_bool("DEBUG", False))),
                 ENABLE_SWAGGER=bool(getattr(s, "ENABLE_SWAGGER", _env_bool("ENABLE_SWAGGER", True))),
                 ENABLE_REDOC=bool(getattr(s, "ENABLE_REDOC", _env_bool("ENABLE_REDOC", True))),
-                DEFER_ROUTER_MOUNT=bool(getattr(s, "DEFER_ROUTER_MOUNT", _env_bool("DEFER_ROUTER_MOUNT", False))),
                 INIT_ENGINE_ON_BOOT=bool(getattr(s, "INIT_ENGINE_ON_BOOT", _env_bool("INIT_ENGINE_ON_BOOT", True))),
                 REQUIRE_AUTH=bool(getattr(s, "REQUIRE_AUTH", _env_bool("REQUIRE_AUTH", True))),
                 OPEN_MODE=bool(getattr(s, "OPEN_MODE", _env_bool("OPEN_MODE", False))),
@@ -194,7 +199,6 @@ def _load_settings() -> _SettingsView:
                 DEBUG=_env_bool("DEBUG", False),
                 ENABLE_SWAGGER=_env_bool("ENABLE_SWAGGER", True),
                 ENABLE_REDOC=_env_bool("ENABLE_REDOC", True),
-                DEFER_ROUTER_MOUNT=_env_bool("DEFER_ROUTER_MOUNT", False),
                 INIT_ENGINE_ON_BOOT=_env_bool("INIT_ENGINE_ON_BOOT", True),
                 REQUIRE_AUTH=bool(getattr(s, "require_auth", _env_bool("REQUIRE_AUTH", True))),
                 OPEN_MODE=bool(getattr(s, "open_mode", _env_bool("OPEN_MODE", False))),
@@ -217,7 +221,6 @@ def _load_settings() -> _SettingsView:
         DEBUG=_env_bool("DEBUG", False),
         ENABLE_SWAGGER=_env_bool("ENABLE_SWAGGER", True),
         ENABLE_REDOC=_env_bool("ENABLE_REDOC", True),
-        DEFER_ROUTER_MOUNT=_env_bool("DEFER_ROUTER_MOUNT", False),
         INIT_ENGINE_ON_BOOT=_env_bool("INIT_ENGINE_ON_BOOT", True),
         REQUIRE_AUTH=_env_bool("REQUIRE_AUTH", True),
         OPEN_MODE=_env_bool("OPEN_MODE", False),
@@ -289,6 +292,7 @@ class _RoutesSnapshot:
     mount_errors: Dict[str, str]  # include_router/mount(app) crashed
     no_router: Dict[str, str]     # module imported but has no router/mount
     strict: bool
+    used_strategy: str
 
 
 def _import_router_module(module_name: str) -> Tuple[Optional[Any], Optional[BaseException]]:
@@ -299,7 +303,7 @@ def _import_router_module(module_name: str) -> Tuple[Optional[Any], Optional[Bas
         return None, e
 
 
-def _err_to_str(e: BaseException, limit: int = 500) -> str:
+def _err_to_str(e: BaseException, limit: int = 700) -> str:
     try:
         s = f"{type(e).__name__}: {e}"
     except Exception:
@@ -307,43 +311,12 @@ def _err_to_str(e: BaseException, limit: int = 500) -> str:
     return s if len(s) <= limit else (s[:limit] + "...(truncated)")
 
 
-def _mount_routes(app: FastAPI) -> Dict[str, Any]:
-    """
-    Discover and mount routers from `routes` package (best-effort).
-    Does not fail startup unless ROUTES_STRICT_IMPORT=1.
-    """
-    strict = _env_bool("ROUTES_STRICT_IMPORT", False)
-
+def _mount_routes_via_plan(app: FastAPI, plan: List[str], strict: bool) -> _RoutesSnapshot:
     mounted: List[str] = []
     missing: List[str] = []
     import_errors: Dict[str, str] = {}
     mount_errors: Dict[str, str] = {}
     no_router: Dict[str, str] = {}
-
-    expected: List[str] = []
-    plan: List[str] = []
-
-    # Prefer routes/__init__.py plan
-    try:
-        routes_pkg = importlib.import_module("routes")
-        expected_fn = getattr(routes_pkg, "get_expected_router_modules", None)
-        plan_fn = getattr(routes_pkg, "get_mount_plan", None)
-        if callable(expected_fn):
-            expected = list(expected_fn())
-        if callable(plan_fn):
-            plan = list(plan_fn())
-    except Exception:
-        pass
-
-    if not expected:
-        expected = [
-            "routes.config",
-            "routes.enriched_quote",
-            "routes.investment_advisor",
-        ]
-
-    if not plan:
-        plan = expected[:]
 
     for mod_name in plan:
         mod, exc = _import_router_module(mod_name)
@@ -374,17 +347,105 @@ def _mount_routes(app: FastAPI) -> Dict[str, Any]:
             if strict:
                 raise
 
-    snap = _RoutesSnapshot(
+    return _RoutesSnapshot(
         mounted=mounted,
         missing=missing,
         import_errors=import_errors,
         mount_errors=mount_errors,
         no_router=no_router,
         strict=strict,
+        used_strategy="plan",
     )
 
+
+def _mount_routes(app: FastAPI) -> Dict[str, Any]:
+    """
+    Discover and mount routers from `routes` package (best-effort).
+    Does not fail startup unless ROUTES_STRICT_IMPORT=1.
+    """
+    strict = _env_bool("ROUTES_STRICT_IMPORT", False)
+    used_strategy = "none"
+
+    # 1) Prefer routes package native mounter if available
+    try:
+        routes_pkg = importlib.import_module("routes")
+
+        for fn_name in ("mount_all_routers", "mount_all", "mount_routers", "mount_routes"):
+            fn = getattr(routes_pkg, fn_name, None)
+            if callable(fn):
+                used_strategy = f"routes.{fn_name}"
+                try:
+                    ret = fn(app)  # type: ignore[misc]
+                    # If it returns a snapshot/dict, keep it as extra
+                    extra = {}
+                    if isinstance(ret, dict):
+                        extra = {"routes_pkg_return": ret}
+                    logger.info("Mounted routers using %s", used_strategy)
+                    snap = _RoutesSnapshot(
+                        mounted=list(extra.get("mounted", [])) if isinstance(extra.get("mounted", []), list) else [],
+                        missing=list(extra.get("missing", [])) if isinstance(extra.get("missing", []), list) else [],
+                        import_errors=dict(extra.get("import_errors", {})) if isinstance(extra.get("import_errors", {}), dict) else {},
+                        mount_errors=dict(extra.get("mount_errors", {})) if isinstance(extra.get("mount_errors", {}), dict) else {},
+                        no_router=dict(extra.get("no_router", {})) if isinstance(extra.get("no_router", {}), dict) else {},
+                        strict=strict,
+                        used_strategy=used_strategy,
+                    )
+                    # If routes package didn't provide details, still compute something stable:
+                    if not (snap.mounted or snap.missing or snap.import_errors or snap.mount_errors or snap.no_router):
+                        snap.used_strategy = used_strategy + ":no-details"
+                    failed_count = len(snap.import_errors) + len(snap.mount_errors) + len(snap.no_router)
+                    logger.info("Routes mount summary: mounted=%s missing=%s failed=%s strategy=%s", len(snap.mounted), len(snap.missing), failed_count, snap.used_strategy)
+                    return {
+                        "mounted": snap.mounted,
+                        "missing": snap.missing,
+                        "import_errors": snap.import_errors,
+                        "mount_errors": snap.mount_errors,
+                        "no_router": snap.no_router,
+                        "strict": snap.strict,
+                        "strategy": snap.used_strategy,
+                    }
+                except Exception as e:
+                    # Fall back to plan mounting
+                    logger.warning("routes.%s(app) failed; falling back to plan mount. err=%s", fn_name, _err_to_str(e))
+                    if strict:
+                        raise
+                break
+    except Exception:
+        pass
+
+    # 2) Plan-based mounting from routes/__init__.py helpers
+    expected: List[str] = []
+    plan: List[str] = []
+    try:
+        routes_pkg = importlib.import_module("routes")
+        expected_fn = getattr(routes_pkg, "get_expected_router_modules", None)
+        plan_fn = getattr(routes_pkg, "get_mount_plan", None)
+        if callable(expected_fn):
+            expected = list(expected_fn())
+        if callable(plan_fn):
+            plan = list(plan_fn())
+    except Exception:
+        pass
+
+    # 3) Conservative fallback if no plan
+    if not expected:
+        expected = [
+            "routes.config",
+            "routes.enriched_quote",
+            "routes.advanced_analysis",
+            "routes.ai_analysis",
+            "routes.advisor",
+            "routes.investment_advisor",
+            "routes.sheets",
+        ]
+    if not plan:
+        plan = expected[:]
+
+    snap = _mount_routes_via_plan(app, plan=plan, strict=strict)
+    snap.used_strategy = "plan" if used_strategy == "none" else (used_strategy + "->plan")
+
     failed_count = len(snap.import_errors) + len(snap.mount_errors) + len(snap.no_router)
-    logger.info("Routes mount summary: mounted=%s missing=%s failed=%s", len(snap.mounted), len(snap.missing), failed_count)
+    logger.info("Routes mount summary: mounted=%s missing=%s failed=%s strategy=%s", len(snap.mounted), len(snap.missing), failed_count, snap.used_strategy)
 
     if snap.missing:
         logger.warning("Routes missing modules: %s", ", ".join(snap.missing))
@@ -402,13 +463,32 @@ def _mount_routes(app: FastAPI) -> Dict[str, Any]:
         "mount_errors": snap.mount_errors,
         "no_router": snap.no_router,
         "strict": snap.strict,
+        "strategy": snap.used_strategy,
     }
 
 
 # --------------------------------------------------------------------------------------
 # Minimal safe built-in endpoints (always present)
 # --------------------------------------------------------------------------------------
-def _runtime_meta() -> Dict[str, Any]:
+def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
+    snap = None
+    try:
+        if app is not None:
+            snap = getattr(app.state, "routes_snapshot", None)
+    except Exception:
+        snap = None
+
+    mounted_count = 0
+    failed_count = 0
+    strategy = ""
+    try:
+        if isinstance(snap, dict):
+            mounted_count = len(snap.get("mounted", []) or [])
+            failed_count = len(snap.get("import_errors", {}) or {}) + len(snap.get("mount_errors", {}) or {}) + len(snap.get("no_router", {}) or {})
+            strategy = str(snap.get("strategy", "") or "")
+    except Exception:
+        pass
+
     return {
         "service": _SETTINGS.APP_NAME,
         "app_version": _SETTINGS.APP_VERSION,
@@ -416,46 +496,54 @@ def _runtime_meta() -> Dict[str, Any]:
         "env": _SETTINGS.APP_ENV,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "python": sys.version.split()[0],
+        "routes_mounted_count": mounted_count,
+        "routes_failed_count": failed_count,
+        "routes_strategy": strategy,
     }
 
 
 def _install_builtin_routes(app: FastAPI) -> None:
+    # ✅ Schema-visible meta endpoint so OpenAPI is never empty
+    @app.get("/meta", tags=["meta"])
+    async def meta():
+        return {"status": "ok", **_runtime_meta(app)}
+
     # ✅ Explicit HEAD support (Render port scanner)
     @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
     async def root(request: Request):
         if request.method == "HEAD":
             return Response(status_code=200)
-        return {"status": "ok", **_runtime_meta()}
+        return {"status": "ok", **_runtime_meta(app)}
 
     @app.api_route("/health", methods=["GET", "HEAD"], include_in_schema=False)
     async def health(request: Request):
         if request.method == "HEAD":
             return Response(status_code=200)
-        return {"status": "healthy", **_runtime_meta()}
+        return {"status": "healthy", **_runtime_meta(app)}
 
     # common probes used by your workflow
     @app.api_route("/readyz", methods=["GET", "HEAD"], include_in_schema=False)
     async def readyz(request: Request):
         if request.method == "HEAD":
             return Response(status_code=200)
-        return {"status": "ready", **_runtime_meta()}
+        return {"status": "ready", **_runtime_meta(app)}
 
     @app.api_route("/livez", methods=["GET", "HEAD"], include_in_schema=False)
     async def livez(request: Request):
         if request.method == "HEAD":
             return Response(status_code=200)
-        return {"status": "live", **_runtime_meta()}
+        return {"status": "live", **_runtime_meta(app)}
 
     # keep legacy
     @app.api_route("/ready", methods=["GET", "HEAD"], include_in_schema=False)
     async def ready(request: Request):
         if request.method == "HEAD":
             return Response(status_code=200)
-        return {"status": "ready", **_runtime_meta()}
+        return {"status": "ready", **_runtime_meta(app)}
 
     @app.get("/ping", include_in_schema=False)
     async def ping():
-        return {"pong": True, **_runtime_meta()}
+        return {"pong": True, **_runtime_meta(app)}
 
 
 # --------------------------------------------------------------------------------------
@@ -465,11 +553,12 @@ async def _maybe_init_engine() -> Optional[str]:
     """
     Optional: pre-warm the engine.
     Never raises; returns error string on failure.
-    Tries core.data_engine_v2 first (your logs show DataEngineV5).
+    Tries core.data_engine_v2 first; then core.data_engine.
     """
     if not bool(_SETTINGS.INIT_ENGINE_ON_BOOT):
         return None
 
+    err_v2 = ""
     try:
         de2 = importlib.import_module("core.data_engine_v2")
         init_fn = getattr(de2, "init_engine", None) or getattr(de2, "get_engine", None)
@@ -481,6 +570,7 @@ async def _maybe_init_engine() -> Optional[str]:
     except Exception as e:
         err_v2 = _err_to_str(e)
 
+    err_v1 = ""
     try:
         de1 = importlib.import_module("core.data_engine")
         init_fn = getattr(de1, "init_engine", None) or getattr(de1, "get_engine", None)
@@ -503,12 +593,65 @@ def create_app() -> FastAPI:
     redoc_url = "/redoc" if bool(_SETTINGS.ENABLE_REDOC) else None
     openapi_url = "/openapi.json" if (docs_url or redoc_url) else None
 
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # state holders (avoid import-time heavy work)
+        if not hasattr(app, "state"):
+            # extremely defensive; FastAPI always has state
+            pass
+        app.state.routes_snapshot = {
+            "mounted": [],
+            "missing": [],
+            "import_errors": {},
+            "mount_errors": {},
+            "no_router": {},
+            "strict": False,
+            "strategy": "",
+        }
+        app.state.routes_mounted = False
+
+        # ✅ Mount routers at startup (NOT import-time)
+        try:
+            snap = _mount_routes(app)
+            app.state.routes_snapshot = snap
+            app.state.routes_mounted = True
+        except Exception as e:
+            logger.error("Route mounting crashed: %s", e, exc_info=True)
+            if _env_bool("ROUTES_STRICT_IMPORT", False):
+                raise
+
+        # ✅ Optional engine warm-up (non-fatal unless strict)
+        err = await _maybe_init_engine()
+        if err:
+            strict = _env_bool("INIT_ENGINE_STRICT", False)
+            if strict:
+                logger.error("Engine init failed (strict): %s", err)
+                raise RuntimeError(f"Engine init failed: {err}")
+            logger.warning("Engine init failed (non-fatal): %s", err)
+
+        logger.info("Startup complete: %s", _runtime_meta(app))
+        try:
+            yield
+        finally:
+            # Shutdown: close optional clients if available
+            try:
+                m = importlib.import_module("integrations.google_sheets_service")
+                fn = getattr(m, "close", None)
+                if callable(fn):
+                    maybe = fn()
+                    if hasattr(maybe, "__await__"):
+                        await maybe
+            except Exception:
+                pass
+            logger.info("Shutdown complete.")
+
     app = FastAPI(
         title=_SETTINGS.APP_NAME,
         version=_SETTINGS.APP_VERSION,
         docs_url=docs_url,
         redoc_url=redoc_url,
         openapi_url=openapi_url,
+        lifespan=lifespan,
     )
 
     # Middlewares
@@ -542,84 +685,23 @@ def create_app() -> FastAPI:
 
     _install_builtin_routes(app)
 
-    # state holders (avoid import-time heavy work)
-    app.state.routes_snapshot = {"mounted": [], "missing": [], "import_errors": {}, "mount_errors": {}, "no_router": {}, "strict": False}
-    app.state.routes_mounted = False
-
-    @app.get("/_debug/routes", include_in_schema=bool(_SETTINGS.DEBUG))
+    # Debug endpoints (auth-guarded in production)
+    @app.get("/_debug/routes", include_in_schema=False)
     async def debug_routes(request: Request):
         if _SETTINGS.APP_ENV == "production" and not _auth_ok(request):
             return JSONResponse(status_code=401, content={"status": "error", "error": "unauthorized"})
-        return {"status": "ok", "routes": getattr(request.app.state, "routes_snapshot", {}), **_runtime_meta()}
+        return {"status": "ok", "routes": getattr(request.app.state, "routes_snapshot", {}), **_runtime_meta(app)}
 
-    @app.get("/_debug/settings", include_in_schema=bool(_SETTINGS.DEBUG))
-    async def debug_settings(request: Request):
+    @app.get("/_debug/openapi_paths", include_in_schema=False)
+    async def debug_openapi_paths(request: Request):
         if _SETTINGS.APP_ENV == "production" and not _auth_ok(request):
             return JSONResponse(status_code=401, content={"status": "error", "error": "unauthorized"})
-        return {
-            "status": "ok",
-            "settings": {
-                "APP_NAME": _SETTINGS.APP_NAME,
-                "APP_VERSION": _SETTINGS.APP_VERSION,
-                "APP_ENV": _SETTINGS.APP_ENV,
-                "DEBUG": _SETTINGS.DEBUG,
-                "ENABLE_SWAGGER": _SETTINGS.ENABLE_SWAGGER,
-                "ENABLE_REDOC": _SETTINGS.ENABLE_REDOC,
-                "DEFER_ROUTER_MOUNT": _SETTINGS.DEFER_ROUTER_MOUNT,
-                "INIT_ENGINE_ON_BOOT": _SETTINGS.INIT_ENGINE_ON_BOOT,
-                "REQUIRE_AUTH": _SETTINGS.REQUIRE_AUTH,
-                "OPEN_MODE": _SETTINGS.OPEN_MODE,
-                "AUTH_HEADER_NAME": _SETTINGS.AUTH_HEADER_NAME,
-                "ENABLE_CORS_ALL_ORIGINS": _SETTINGS.ENABLE_CORS_ALL_ORIGINS,
-                "CORS_ORIGINS": _SETTINGS.CORS_ORIGINS,
-                "BACKEND_BASE_URL": _SETTINGS.BACKEND_BASE_URL,
-                "ENGINE_CACHE_TTL_SEC": _SETTINGS.ENGINE_CACHE_TTL_SEC,
-                "MAX_REQUESTS_PER_MINUTE": _SETTINGS.MAX_REQUESTS_PER_MINUTE,
-            },
-            **_runtime_meta(),
-        }
-
-    @app.on_event("startup")
-    async def on_startup():
-        # ✅ Mount routers at startup (NOT import-time) to avoid deployment blocks
         try:
-            if not getattr(app.state, "routes_mounted", False):
-                # optional ordering flag retained; both happen at startup now
-                if bool(_SETTINGS.DEFER_ROUTER_MOUNT):
-                    # defer a tiny bit to let core init first (still within startup)
-                    pass
-                snap = _mount_routes(app)
-                app.state.routes_snapshot = snap
-                app.state.routes_mounted = True
+            schema = request.app.openapi()
+            paths = sorted(list((schema.get("paths") or {}).keys()))
+            return {"status": "ok", "paths_count": len(paths), "paths": paths[:200], **_runtime_meta(app)}
         except Exception as e:
-            logger.error("Route mounting crashed: %s", e, exc_info=True)
-            if _env_bool("ROUTES_STRICT_IMPORT", False):
-                raise
-
-        err = await _maybe_init_engine()
-        if err:
-            strict = _env_bool("INIT_ENGINE_STRICT", False)
-            if strict:
-                logger.error("Engine init failed (strict): %s", err)
-                raise RuntimeError(f"Engine init failed: {err}")
-            logger.warning("Engine init failed (non-fatal): %s", err)
-
-        logger.info("Startup complete: %s", _runtime_meta())
-
-    @app.on_event("shutdown")
-    async def on_shutdown():
-        # Close optional clients if available
-        try:
-            m = importlib.import_module("integrations.google_sheets_service")
-            fn = getattr(m, "close", None)
-            if callable(fn):
-                maybe = fn()
-                if hasattr(maybe, "__await__"):
-                    await maybe
-        except Exception:
-            pass
-
-        logger.info("Shutdown complete.")
+            return JSONResponse(status_code=500, content={"status": "error", "error": _err_to_str(e), **_runtime_meta(app)})
 
     return app
 
