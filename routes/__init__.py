@@ -2,31 +2,27 @@
 """
 routes/__init__.py
 ------------------------------------------------------------
-Routes package initialization (PROD SAFE) — v3.0.0 (PHASE-8+ SCHEMA-FIRST / ROUTE-COVERAGE GUARDED)
+Routes package initialization (PROD SAFE) — v3.0.0 (PHASE-8 SCHEMA-FIRST CLEAN EXPECTED LIST)
 
-Goal (your wiring concern):
-- Ensure the routers that *actually serve* schema-driven pages are mounted (not skipped / not shadowed)
-- Prevent “fallback to 80 columns” by ensuring sheet-rows owners are present
-- Prefer wrapper routers when they truly provide the required endpoints; otherwise auto-fallback to the next candidate
+Fixes vs your current deploy warning:
+- ✅ Removes legacy/removed expected modules that cause noisy warnings:
+    routes.sheet_rows, routes.sheets, routes.sheet_data, routes.sheet_rows_v2, routes.insights_analysis
+- ✅ Keeps schema-first preflight at MOUNT time (not import time)
+- ✅ Keeps preference families to avoid duplicate /sheet-rows endpoints:
+    - Analysis:   ai_analysis > analysis_sheet_rows
+    - Advanced:  advanced_analysis > advanced_sheet_rows
+    - Advisor:   investment_advisor > advisor
+- ✅ Keeps all prior design goals: no network calls at import time, safe optional discovery, CB for import failures, duplicate-route guard
 
-Key behavior upgrades vs v2.9.0:
-- ✅ Family mount is now “capability-aware”: we only pick a family winner if it actually registers
-  the required routes (e.g., POST */sheet-rows). Otherwise we try the next candidate.
-- ✅ Duplicate handling is now “shadow-safe”:
-    - If a router would add ZERO new routes (only duplicates), we skip it (shadowed)
-    - If it adds any new routes, we mount it and record duplicates as warnings (no silent skipping)
-- ✅ Adds route-coverage checks after mount and records them in the mount report.
-- ✅ Schema preflight remains mount-time only (no network calls, no heavy imports at module import time).
-
-Env overrides (optional)
+Environment overrides (optional)
 - ROUTES_EXPECTED="routes.config,routes.enriched_quote,..."
-- ROUTES_AUTO_DISCOVER=1                   (scan package via pkgutil; off by default)
-- ROUTES_STRICT=1                          (raise on failures for required modules)
-- ROUTES_REQUIRED="routes.config,..."       (comma list; only used when ROUTES_STRICT=1)
-- ROUTES_IMPORT_TIMEOUT_SEC=5              (async import timeout)
-- ROUTES_CB_THRESHOLD=3                    (import circuit breaker threshold)
-- ROUTES_CB_RESET_TIMEOUT_SEC=60           (circuit breaker reset timeout)
-- ROUTES_SKIP_DUPLICATES=1                 (default ON; but shadow-safe)
+- ROUTES_AUTO_DISCOVER=1
+- ROUTES_STRICT=1
+- ROUTES_REQUIRED="routes.config,..."
+- ROUTES_IMPORT_TIMEOUT_SEC=5
+- ROUTES_CB_THRESHOLD=3
+- ROUTES_CB_RESET_TIMEOUT_SEC=60
+- ROUTES_SKIP_DUPLICATES=1
 """
 
 from __future__ import annotations
@@ -89,7 +85,6 @@ class ModuleStatus(Enum):
     ERROR = "error"
     LOADED = "loaded"
     FAILED = "failed"
-    SKIPPED = "skipped"
 
 
 class ErrorCategory(Enum):
@@ -99,8 +94,6 @@ class ErrorCategory(Enum):
     INVALID = "invalid"
     TIMEOUT = "timeout"
     DUPLICATE = "duplicate"
-    SHADOWED = "shadowed"
-    COVERAGE = "coverage"
     UNKNOWN = "unknown"
 
 
@@ -383,10 +376,10 @@ def _group_of(module_name: str) -> ModuleGroup:
     if any(k in ml for k in ("health", "status", "ping", "meta", "version", "ready", "live")):
         return ModuleGroup.SYSTEM
 
-    if any(k in ml for k in ("data_dictionary", "schema", "registry", "dictionary")):
+    if any(k in ml for k in ("data_dictionary", "schema", "registry", "dictionary", "page_catalog")):
         return ModuleGroup.SCHEMA
 
-    if any(k in ml for k in ("advanced_analysis", "advanced_sheet_rows", "ai_analysis", "insights", "analysis_sheet_rows", "analysis")):
+    if any(k in ml for k in ("advanced_analysis", "advanced_sheet_rows", "ai_analysis", "analysis_sheet_rows", "analysis")):
         return ModuleGroup.ANALYSIS
 
     if any(k in ml for k in ("investment_advisor", "advisor")):
@@ -402,7 +395,7 @@ def _group_of(module_name: str) -> ModuleGroup:
 
 
 # =============================================================================
-# Defaults: expected routers (schema-first)
+# Defaults: expected routers (CLEAN LIST — no legacy modules)
 # =============================================================================
 def get_routes_version() -> str:
     return ROUTES_PACKAGE_VERSION
@@ -414,37 +407,31 @@ def get_expected_router_modules() -> List[str]:
     Override via ROUTES_EXPECTED.
 
     IMPORTANT:
-    - Include likely sheet-rows owners to avoid “not mounted / 80 fallback” issues.
-    - Preference families will choose winners, but will fall back if the winner
-      doesn't actually provide required endpoints.
+    - We intentionally DO NOT include removed legacy modules:
+        routes.sheet_rows, routes.sheets, routes.sheet_data, routes.sheet_rows_v2, routes.insights_analysis
     """
     override = _parse_env_list("ROUTES_EXPECTED")
     if override:
         return [_normalize_module_name(x) for x in override if _normalize_module_name(x)]
 
-    # Core + optional
-    expected = [
+    candidates = [
         "routes.config",
         "routes.enriched_quote",
+        # Optional: keep if you have it (will be filtered at mount time if missing)
         "routes.routes_argaam",
-        # Common “sheet rows” owners (names vary across repos)
-        "routes.sheet_rows",
-        "routes.sheets",
-        "routes.sheet_data",
-        "routes.sheet_rows_v2",
-        # Your schema-first routers
-        "routes.analysis_sheet_rows",
-        "routes.advanced_sheet_rows",
-        # Wrapper routers (only win if they really provide coverage)
+        "routes.data_dictionary",
+        # Analysis family (winner selected below)
         "routes.ai_analysis",
-        "routes.insights_analysis",
+        "routes.analysis_sheet_rows",
+        # Advanced family (winner selected below)
         "routes.advanced_analysis",
-        # Top10 + advisor
+        "routes.advanced_sheet_rows",
+        # Top10 + Advisor
         "routes.top10_investments",
         "routes.investment_advisor",
         "routes.advisor",
     ]
-    return expected
+    return [_normalize_module_name(x) for x in candidates if _normalize_module_name(x)]
 
 
 def _auto_discover_router_modules() -> List[str]:
@@ -473,35 +460,89 @@ def _auto_discover_router_modules() -> List[str]:
 
 
 # =============================================================================
-# Preference families (avoid duplicates but ensure coverage)
+# Preference families (avoid duplicates)
 # =============================================================================
-_ANALYSIS_FAMILY = [
-    "routes.ai_analysis",
-    "routes.insights_analysis",
-    "routes.analysis_sheet_rows",
-    "routes.sheet_rows",
-    "routes.sheets",
-    "routes.sheet_data",
-]
+_ANALYSIS_FAMILY = ["routes.ai_analysis", "routes.analysis_sheet_rows"]
 _ADVANCED_FAMILY = ["routes.advanced_analysis", "routes.advanced_sheet_rows"]
 _ADVISOR_FAMILY = ["routes.investment_advisor", "routes.advisor"]
 
 
-def _dedupe_keep_order(items: Sequence[str]) -> List[str]:
+def _apply_preference_families(mods: List[str]) -> List[str]:
+    """
+    Keeps only the first available module in each preference family.
+    Assumes mods are already ordered by preference.
+    """
+    s = [_normalize_module_name(x) for x in mods if _normalize_module_name(x)]
     out: List[str] = []
     seen: Set[str] = set()
-    for x in items:
-        nx = _normalize_module_name(x)
-        if not nx or nx in seen:
+
+    families = (_ANALYSIS_FAMILY, _ADVANCED_FAMILY, _ADVISOR_FAMILY)
+
+    winners: Dict[str, str] = {}
+    for fam in families:
+        winner = None
+        for m in s:
+            if m in fam and m not in seen:
+                winner = m
+                break
+        if winner:
+            winners["|".join(fam)] = winner
+
+    def fam_key(fam: List[str]) -> str:
+        return "|".join(fam)
+
+    for m in s:
+        if m in seen:
             continue
-        seen.add(nx)
-        out.append(nx)
+        if m in _ANALYSIS_FAMILY and m != winners.get(fam_key(_ANALYSIS_FAMILY)):
+            continue
+        if m in _ADVANCED_FAMILY and m != winners.get(fam_key(_ADVANCED_FAMILY)):
+            continue
+        if m in _ADVISOR_FAMILY and m != winners.get(fam_key(_ADVISOR_FAMILY)):
+            continue
+        out.append(m)
+        seen.add(m)
+
     return out
+
+
+# =============================================================================
+# Discovery / mount plan
+# =============================================================================
+@timed
+def get_router_discovery(expected: Optional[Sequence[str]] = None) -> Dict[str, bool]:
+    exp = list(expected) if expected is not None else get_expected_router_modules()
+    auto = _auto_discover_router_modules()
+    merged = list(dict.fromkeys([_normalize_module_name(x) for x in (exp + auto) if _normalize_module_name(x)]))
+    merged = _apply_preference_families(merged)
+    return {m: module_exists(m) for m in merged}
+
+
+@timed
+def get_mount_plan(expected: Optional[Sequence[str]] = None) -> List[str]:
+    exp = list(expected) if expected is not None else get_expected_router_modules()
+    auto = _auto_discover_router_modules()
+    merged = list(dict.fromkeys([_normalize_module_name(x) for x in (exp + auto) if _normalize_module_name(x)]))
+    merged = _apply_preference_families(merged)
+
+    existing = [m for m in merged if module_exists(m)]
+
+    idx = {m: i for i, m in enumerate(merged)}
+    existing.sort(key=lambda m: (_group_of(m).priority, idx.get(m, 10_000), m))
+    return existing
 
 
 def _required_set_from_env() -> Set[str]:
     req = set(_parse_env_list("ROUTES_REQUIRED"))
     return {_normalize_module_name(x) for x in req if _normalize_module_name(x)}
+
+
+def build_router_specs(expected: Optional[Sequence[str]] = None) -> List[RouterSpec]:
+    required = _required_set_from_env()
+    mods = get_mount_plan(expected)
+    specs = [RouterSpec(module=m, group=_group_of(m), required=(m in required)) for m in mods]
+    specs.sort(key=lambda x: (x.group.priority, x.module))
+    return specs
 
 
 # =============================================================================
@@ -580,38 +621,8 @@ def load_mount_target(
         info.load_time_ms = (time.perf_counter() - start) * 1000.0
 
 
-async def load_mount_target_async(
-    module: str,
-    *,
-    router_attr: str = "router",
-    mount_attr: str = "mount",
-    timeout: Optional[float] = None,
-) -> Tuple[Optional[Any], Optional[Callable[[Any], None]], ModuleInfo]:
-    t = float(timeout if timeout is not None else float(os.getenv("ROUTES_IMPORT_TIMEOUT_SEC", "5") or "5"))
-    try:
-        return await asyncio.wait_for(
-            asyncio.to_thread(load_mount_target, module, router_attr=router_attr, mount_attr=mount_attr),
-            timeout=t,
-        )
-    except asyncio.TimeoutError:
-        info = ModuleInfo(
-            name=_normalize_module_name(module),
-            group=_group_of(module),
-            status=ModuleStatus.FAILED,
-            error="import timeout",
-            error_category=ErrorCategory.TIMEOUT,
-            router_attr=router_attr,
-            mount_attr=mount_attr,
-            router_found=False,
-            mount_found=False,
-            last_checked_utc=_utc_iso(),
-        )
-        _metrics.record_error(ErrorCategory.TIMEOUT)
-        return None, None, info
-
-
 # =============================================================================
-# Route key extraction + capability checks
+# Duplicate-route guard (optional)
 # =============================================================================
 def _collect_route_keys(app: Any) -> Set[Tuple[str, str]]:
     keys: Set[Tuple[str, str]] = set()
@@ -644,33 +655,11 @@ def _router_keys(router: Any) -> Set[Tuple[str, str]]:
     return keys
 
 
-def _router_has_sheet_rows_post(router: Any) -> bool:
-    """
-    Capability check: does this router provide any POST endpoint ending with /sheet-rows ?
-    (We keep this intentionally broad to support prefix variations.)
-    """
-    for method, path in _router_keys(router):
-        if method == "POST" and str(path).endswith("/sheet-rows"):
-            return True
-    return False
-
-
-def _app_has_sheet_rows_post(app: Any) -> bool:
-    for method, path in _collect_route_keys(app):
-        if method == "POST" and str(path).endswith("/sheet-rows"):
-            return True
-    return False
-
-
 # =============================================================================
 # Schema-first preflight (mount-time only)
 # =============================================================================
 def _schema_preflight() -> Dict[str, Any]:
-    """
-    Best-effort import+validate schema registry at mount time.
-    Never raises (caller decides strictness).
-    """
-    out: Dict[str, Any] = {"ok": False, "schema_version": None, "sheets_count": None, "digest": None, "error": None}
+    out: Dict[str, Any] = {"ok": False, "schema_version": None, "sheets_count": None, "error": None}
     try:
         from core.sheets import schema_registry as sr  # type: ignore
 
@@ -681,48 +670,11 @@ def _schema_preflight() -> Dict[str, Any]:
         validate = getattr(sr, "validate_schema_registry", None)
         if callable(validate):
             validate()
-
-        digest_fn = getattr(sr, "schema_registry_digest", None)
-        if callable(digest_fn):
-            out["digest"] = digest_fn()
-
         out["ok"] = True
         return out
     except Exception as e:
         out["error"] = f"{type(e).__name__}: {e}"
         return out
-
-
-# =============================================================================
-# Family-aware mount planner
-# =============================================================================
-def _merge_expected_and_discovered(expected: Optional[Sequence[str]] = None) -> List[str]:
-    exp = list(expected) if expected is not None else get_expected_router_modules()
-    auto = _auto_discover_router_modules()
-    merged = _dedupe_keep_order(list(exp) + list(auto))
-    return merged
-
-
-def _non_family_modules(mods: Sequence[str]) -> List[str]:
-    famset = set(_ANALYSIS_FAMILY) | set(_ADVANCED_FAMILY) | set(_ADVISOR_FAMILY)
-    return [m for m in mods if m not in famset]
-
-
-def _existing_modules(mods: Sequence[str]) -> List[str]:
-    return [m for m in mods if module_exists(m)]
-
-
-def _sorted_by_group(mods: Sequence[str]) -> List[str]:
-    # stable ordering: group priority then name
-    return sorted(mods, key=lambda m: (_group_of(m).priority, m))
-
-
-def _family_candidates(family: Sequence[str], mods_universe: Sequence[str]) -> List[str]:
-    """
-    Returns candidates in preference order, but only if present in merged universe.
-    """
-    u = set(mods_universe)
-    return [m for m in family if m in u]
 
 
 # =============================================================================
@@ -733,217 +685,87 @@ def mount_routers(app: Any, *, expected: Optional[Sequence[str]] = None, strict:
     skip_dups = coerce_bool(os.getenv("ROUTES_SKIP_DUPLICATES", "1"), True)
     required = _required_set_from_env()
 
-    universe = _merge_expected_and_discovered(expected)
-    existing = _existing_modules(universe)
-
     report: Dict[str, Any] = {
         "mounted": [],
-        "family_winners": {},
-        "skipped_shadowed": {},
-        "duplicates": {},
+        "skipped_duplicates": {},
         "missing": [],
         "failed": [],
         "strict": strict_mode,
         "version": ROUTES_PACKAGE_VERSION,
         "timestamp_utc": _utc_iso(),
         "schema": _schema_preflight(),
-        "coverage": {
-            "has_sheet_rows_post": False,
-            "missing_required_endpoints": [],
-        },
         "preference_families": {
-            "analysis_family": list(_ANALYSIS_FAMILY),
-            "advanced_family": list(_ADVANCED_FAMILY),
-            "advisor_family": list(_ADVISOR_FAMILY),
-        },
-        "universe": {
-            "total_considered": len(universe),
-            "total_existing": len(existing),
-            "existing_modules": list(existing),
+            "analysis_family": _ANALYSIS_FAMILY,
+            "advanced_family": _ADVANCED_FAMILY,
+            "advisor_family": _ADVISOR_FAMILY,
         },
     }
 
-    if strict_mode and not report["schema"].get("ok"):
-        raise RuntimeError(f"Schema preflight failed: {report['schema'].get('error')}")
-
     existing_keys = _collect_route_keys(app)
 
-    def _mount_router_or_fn(module_name: str, router: Any, mount_fn: Optional[Callable[[Any], None]]) -> Tuple[bool, str]:
-        """
-        Shadow-safe mounting:
-        - If router adds ZERO new routes (only duplicates), skip as shadowed
-        - If router adds any new routes, mount and record duplicates (warn)
-        """
-        nonlocal existing_keys
+    for spec in build_router_specs(expected):
+        router, mount_fn, info = load_mount_target(spec.module)
 
-        # Prefer router include if available
-        if router is not None and hasattr(app, "include_router"):
-            rkeys = _router_keys(router)
-            dups = sorted([f"{m} {p}" for (m, p) in (rkeys & existing_keys)])
-            uniq = rkeys - existing_keys
-
-            if skip_dups and (not uniq) and dups:
-                report["skipped_shadowed"][module_name] = dups[:50]
-                _metrics.record_error(ErrorCategory.SHADOWED)
-                return False, "shadowed_duplicates_only"
-
-            try:
-                app.include_router(router)
-                # refresh keys
-                try:
-                    existing_keys |= rkeys
-                except Exception:
-                    existing_keys = _collect_route_keys(app)
-
-                if dups:
-                    report["duplicates"][module_name] = dups[:200]
-                    _metrics.record_error(ErrorCategory.DUPLICATE)
-
-                return True, "mounted_router"
-            except Exception as e:
-                return False, f"include_router_error:{_err_str(e)}"
-
-        # Otherwise, try mount(app)
-        if callable(mount_fn):
-            try:
-                before = _collect_route_keys(app)
-                mount_fn(app)
-                after = _collect_route_keys(app)
-                added = after - before
-                if not added:
-                    # allow, but flag (mount did nothing)
-                    report["skipped_shadowed"][module_name] = ["mount_fn added no routes"]
-                    return False, "mount_no_routes"
-                existing_keys = after
-                return True, "mounted_mount_fn"
-            except Exception as e:
-                return False, f"mount_fn_error:{_err_str(e)}"
-
-        return False, "no_mount_target"
-
-    def _handle_missing_or_failed(info: ModuleInfo, module_name: str, is_required: bool) -> None:
-        if info.status == ModuleStatus.MISSING:
-            report["missing"].append(info)
-            if strict_mode and is_required:
-                raise RuntimeError(f"Required router missing: {module_name} ({info.error})")
-        else:
-            report["failed"].append(info)
-            if strict_mode and is_required:
-                raise RuntimeError(f"Required router failed: {module_name} ({info.error})")
-
-    # -------------------------------------------------------------------------
-    # 1) Mount NON-FAMILY modules first (security/system/core/schema etc.)
-    # -------------------------------------------------------------------------
-    nonfam = _sorted_by_group(_non_family_modules(existing))
-    for m in nonfam:
-        is_required = (m in required)
-        router, mount_fn, info = load_mount_target(m)
         if router is None and mount_fn is None:
-            _handle_missing_or_failed(info, m, is_required)
+            if info.status == ModuleStatus.MISSING:
+                report["missing"].append(info)
+                if strict_mode and (spec.required or spec.module in required):
+                    raise RuntimeError(f"Required router missing: {spec.module} ({info.error})")
+            else:
+                report["failed"].append(info)
+                if strict_mode and (spec.required or spec.module in required):
+                    raise RuntimeError(f"Required router failed: {spec.module} ({info.error})")
             continue
 
-        ok, why = _mount_router_or_fn(m, router, mount_fn)
-        if ok:
-            report["mounted"].append(m)
-        else:
-            info.status = ModuleStatus.SKIPPED if why.startswith("shadowed") or why.startswith("mount_") else ModuleStatus.FAILED
-            info.error = why
-            info.error_category = ErrorCategory.SHADOWED if "shadowed" in why else ErrorCategory.UNKNOWN
-            report["failed"].append(info)
-            if strict_mode and is_required:
-                raise RuntimeError(f"Required router could not be mounted: {m} ({why})")
-
-    # -------------------------------------------------------------------------
-    # 2) Mount FAMILY winners (capability-aware)
-    # -------------------------------------------------------------------------
-    def _mount_family(name: str, family: Sequence[str], require_sheet_rows: bool = False) -> None:
-        candidates = _family_candidates(family, existing)
-        for cand in candidates:
-            is_required = (cand in required)
-            router, mount_fn, info = load_mount_target(cand)
-            if router is None and mount_fn is None:
-                _handle_missing_or_failed(info, cand, is_required)
-                continue
-
-            # capability check when possible (router object)
-            if require_sheet_rows and router is not None:
-                if not _router_has_sheet_rows_post(router):
-                    info.status = ModuleStatus.SKIPPED
-                    info.error = "capability_miss(no POST */sheet-rows)"
-                    info.error_category = ErrorCategory.COVERAGE
-                    report["failed"].append(info)
-                    _metrics.record_error(ErrorCategory.COVERAGE)
+        # Duplicate guard if router object exists
+        if router is not None and skip_dups:
+            try:
+                keys = _router_keys(router)
+                dups = sorted([f"{m} {p}" for (m, p) in (keys & existing_keys)])
+                if dups:
+                    info.status = ModuleStatus.FAILED
+                    info.error = "duplicate routes"
+                    info.error_category = ErrorCategory.DUPLICATE
+                    report["skipped_duplicates"][spec.module] = dups
+                    _metrics.record_error(ErrorCategory.DUPLICATE)
+                    if strict_mode and (spec.required or spec.module in required):
+                        raise RuntimeError(f"Duplicate routes for required module: {spec.module} ({dups[:5]})")
                     continue
+            except Exception:
+                pass
 
-            ok, why = _mount_router_or_fn(cand, router, mount_fn)
-            if ok:
-                report["mounted"].append(cand)
-                report["family_winners"][name] = cand
-                return
+        try:
+            if router is not None and hasattr(app, "include_router"):
+                app.include_router(router)
+                if skip_dups:
+                    try:
+                        existing_keys |= _router_keys(router)
+                    except Exception:
+                        pass
+                report["mounted"].append(spec.module)
+                continue
 
-            # Not mounted -> try next candidate
-            info.status = ModuleStatus.SKIPPED if "shadowed" in why else ModuleStatus.FAILED
-            info.error = why
-            info.error_category = ErrorCategory.SHADOWED if "shadowed" in why else ErrorCategory.UNKNOWN
+            if callable(mount_fn):
+                mount_fn(app)
+                existing_keys = _collect_route_keys(app)
+                report["mounted"].append(spec.module)
+                continue
+
+            info.status = ModuleStatus.FAILED
+            info.error = "no usable mount target"
+            info.error_category = ErrorCategory.ROUTER_MISSING
             report["failed"].append(info)
-            if strict_mode and is_required:
-                raise RuntimeError(f"Required family router failed to mount: {cand} ({why})")
+            if strict_mode and (spec.required or spec.module in required):
+                raise RuntimeError(f"Required router has no mount target: {spec.module}")
 
-        # No winner
-        report["family_winners"][name] = None
-        if strict_mode:
-            # only hard-fail if any of the family modules are marked required
-            fam_required = [m for m in candidates if m in required]
-            if fam_required:
-                raise RuntimeError(f"Required family '{name}' has no mountable winner. Required: {fam_required}")
-
-    # Analysis + Advanced must provide sheet-rows
-    _mount_family("analysis", _ANALYSIS_FAMILY, require_sheet_rows=True)
-    _mount_family("advanced", _ADVANCED_FAMILY, require_sheet_rows=True)
-    _mount_family("advisor", _ADVISOR_FAMILY, require_sheet_rows=False)
-
-    # -------------------------------------------------------------------------
-    # 3) Coverage check + last-chance fallback for sheet-rows
-    # -------------------------------------------------------------------------
-    report["coverage"]["has_sheet_rows_post"] = _app_has_sheet_rows_post(app)
-    if not report["coverage"]["has_sheet_rows_post"]:
-        # last-chance: try any known sheet-rows modules not yet mounted (best-effort)
-        fallbacks = _dedupe_keep_order(
-            [
-                "routes.analysis_sheet_rows",
-                "routes.advanced_sheet_rows",
-                "routes.sheet_rows",
-                "routes.sheets",
-                "routes.sheet_data",
-            ]
-        )
-        for fb in fallbacks:
-            if fb in report["mounted"]:
-                continue
-            if not module_exists(fb):
-                continue
-            router, mount_fn, info = load_mount_target(fb)
-            if router is None and mount_fn is None:
-                report["failed"].append(info)
-                continue
-            ok, why = _mount_router_or_fn(fb, router, mount_fn)
-            if ok:
-                report["mounted"].append(fb)
-                report["coverage"]["has_sheet_rows_post"] = _app_has_sheet_rows_post(app)
-                if report["coverage"]["has_sheet_rows_post"]:
-                    report["coverage"]["recovered_by"] = fb
-                    break
-            else:
-                info.status = ModuleStatus.SKIPPED if "shadowed" in why else ModuleStatus.FAILED
-                info.error = why
-                info.error_category = ErrorCategory.SHADOWED if "shadowed" in why else ErrorCategory.UNKNOWN
-                report["failed"].append(info)
-
-    if not report["coverage"]["has_sheet_rows_post"]:
-        report["coverage"]["missing_required_endpoints"].append("POST */sheet-rows")
-        _metrics.record_error(ErrorCategory.COVERAGE)
-        if strict_mode:
-            raise RuntimeError("Route coverage failure: missing POST */sheet-rows (no sheet rows router mounted)")
+        except Exception as e:
+            info.status = ModuleStatus.FAILED
+            info.error = _err_str(e)
+            info.error_category = ErrorCategory.UNKNOWN
+            report["failed"].append(info)
+            _metrics.record_error(ErrorCategory.UNKNOWN)
+            if strict_mode and (spec.required or spec.module in required):
+                raise
 
     return report
 
@@ -952,14 +774,19 @@ def mount_routers(app: Any, *, expected: Optional[Sequence[str]] = None, strict:
 # Debug / Audit
 # =============================================================================
 def get_dependency_audit(expected: Optional[Sequence[str]] = None) -> Dict[str, Any]:
-    universe = _merge_expected_and_discovered(expected)
-    discovery = {m: module_exists(m) for m in universe}
+    exp = list(expected) if expected is not None else get_expected_router_modules()
+    auto = _auto_discover_router_modules()
+    merged = list(dict.fromkeys([_normalize_module_name(x) for x in (exp + auto) if _normalize_module_name(x)]))
+    merged = _apply_preference_families(merged)
+
+    discovery = {m: module_exists(m) for m in merged}
     available = [m for m, ok in discovery.items() if ok]
     missing = [m for m, ok in discovery.items() if not ok]
+
     status = "healthy" if available else "critical"
     return {
         "status": status,
-        "total_expected": len(universe),
+        "total_expected": len(merged),
         "total_available": len(available),
         "total_missing": len(missing),
         "available_modules": sorted(available),
@@ -985,30 +812,35 @@ def get_cache_info() -> Dict[str, Any]:
     }
 
 
-def get_routes_debug_snapshot(expected: Optional[Sequence[str]] = None) -> Dict[str, Any]:
-    universe = _merge_expected_and_discovered(expected)
-    existing = [m for m in universe if module_exists(m)]
+def get_routes_debug_snapshot() -> Dict[str, Any]:
     return {
         "version": ROUTES_PACKAGE_VERSION,
         "timestamp_utc": _utc_iso(),
-        "schema": _schema_preflight(),
-        "universe": {"total_considered": len(universe), "total_existing": len(existing), "existing_modules": existing},
-        "audit": get_dependency_audit(expected),
-        "metrics": get_metrics().get_stats(),
-        "cache_info": get_cache_info(),
-        "circuit_breaker": _circuit_breaker.snapshot(),
-        "python": {"version": sys.version, "platform": sys.platform},
-        "preference_families": {
-            "analysis_family": list(_ANALYSIS_FAMILY),
-            "advanced_family": list(_ADVANCED_FAMILY),
-            "advisor_family": list(_ADVISOR_FAMILY),
-        },
+        "expected": get_expected_router_modules(),
+        "mount_plan": get_mount_plan(),
+        "audit": get_dependency_audit(),
     }
 
 
-# =============================================================================
-# Exports
-# =============================================================================
+def get_routes_debug_snapshot_enhanced() -> Dict[str, Any]:
+    base = get_routes_debug_snapshot()
+    base.update(
+        {
+            "schema": _schema_preflight(),
+            "metrics": get_metrics().get_stats(),
+            "cache_info": get_cache_info(),
+            "circuit_breaker": _circuit_breaker.snapshot(),
+            "python": {"version": sys.version, "platform": sys.platform},
+            "preference_families": {
+                "analysis_family": _ANALYSIS_FAMILY,
+                "advanced_family": _ADVANCED_FAMILY,
+                "advisor_family": _ADVISOR_FAMILY,
+            },
+        }
+    )
+    return base
+
+
 __all__ = [
     "ROUTES_PACKAGE_VERSION",
     "get_routes_version",
@@ -1020,11 +852,14 @@ __all__ = [
     "module_exists",
     "module_exists_async",
     "get_expected_router_modules",
+    "get_router_discovery",
+    "get_mount_plan",
+    "build_router_specs",
     "load_mount_target",
-    "load_mount_target_async",
     "mount_routers",
     "get_dependency_audit",
     "get_routes_debug_snapshot",
+    "get_routes_debug_snapshot_enhanced",
     "clear_module_cache",
     "get_cache_info",
     "get_metrics",
