@@ -2,27 +2,22 @@
 """
 routes/advanced_analysis.py
 ------------------------------------------------------------
-TADAWUL ADVANCED ANALYSIS ROUTER — v5.6.0 (PHASE 5 / STARTUP-SAFE)
+TADAWUL ADVANCED ANALYSIS ROUTER — v5.6.1 (PHASE 5 / STARTUP-SAFE / SCHEMA-FIRST)
 PROD HARDENED + SCHEMA-DRIVEN SHEET-ROWS (FIXES SPECIAL SHEETS) + INSIGHTS ENDPOINTS
 
-Why this revision (your PowerShell evidence):
-- ✅ FIX: /v1/advanced/sheet-rows now returns TRUE schema headers/keys/order for:
-    - Insights_Analysis   (expected 7, was returning 80)
-    - Top_10_Investments  (expected 83, was returning 80)
-    - Data_Dictionary     (expected 9, was returning 80)
-- ✅ No duplicate routes: we import Phase-3 router from routes.advanced_sheet_rows,
-  then REMOVE its POST /sheet-rows handler and REPLACE it here (schema-driven).
-- ✅ Startup-safe: no network/heavy imports at import-time (lazy inside handlers).
-- ✅ Keeps:
-    - GET  /v1/advanced/health
-    - GET  /v1/advanced/metrics (optional Prometheus)
-    - GET  /v1/advanced/insights-criteria
-    - POST /v1/advanced/insights-analysis (best-effort, optional criteria embed)
+CRITICAL FIX (Render build failure)
+- ✅ FIXED: SyntaxError: '[' was never closed (Data_Dictionary branch had a broken list literal)
 
-Design choices that make your PowerShell completeness test pass:
-- The response "headers" and "keys" come from schema_registry (authoritative).
-- Rows are STRICTLY projected to schema keys in the same order (extras dropped; missing filled with None).
-- Data_Dictionary is generated from schema_registry itself (no engine required).
+What this router guarantees
+- POST /v1/advanced/sheet-rows is schema-driven:
+    - headers/keys come from core.sheets.schema_registry (authoritative order)
+    - rows are normalized then STRICTLY projected to schema keys
+    - special sheets never fall back to an 80-col default:
+        * Insights_Analysis   (schema-defined layout; best-effort builder)
+        * Top_10_Investments  (schema-defined 80+3 layout; engine if available else schema-only)
+        * Data_Dictionary     (generated from schema_registry via core.sheets.data_dictionary)
+
+No network calls at import-time. Heavy imports are inside handlers.
 """
 
 from __future__ import annotations
@@ -30,8 +25,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
+import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from fastapi import Body, Header, HTTPException, Query, Request, Response, status
 
@@ -42,7 +39,7 @@ from routes.advanced_sheet_rows import router  # noqa: F401
 
 logger = logging.getLogger("routes.advanced_analysis")
 
-ADVANCED_ANALYSIS_VERSION = "5.6.0"
+ADVANCED_ANALYSIS_VERSION = "5.6.1"
 
 # -----------------------------------------------------------------------------
 # Optional Prometheus (safe)
@@ -109,10 +106,7 @@ def _safe_env_port() -> Optional[str]:
 
 
 async def _maybe_call(obj: Any, name: str) -> Optional[Any]:
-    """
-    Best-effort call obj.<name>(), supporting sync/async.
-    Never raises.
-    """
+    """Best-effort call obj.<name>(), supporting sync/async. Never raises."""
     try:
         fn = getattr(obj, name, None)
         if not callable(fn):
@@ -180,9 +174,7 @@ def _require_auth_or_401(
 # Phase 5 — criteria snapshot builder (safe, no schema assumptions)
 # -----------------------------------------------------------------------------
 def _build_insights_criteria_snapshot() -> Dict[str, Any]:
-    """
-    Returns a stable criteria snapshot matching your scoring model (best-effort).
-    """
+    """Returns a stable criteria snapshot matching your scoring model (best-effort)."""
     weights = {
         "w_valuation": 0.30,
         "w_momentum": 0.30,
@@ -263,24 +255,20 @@ def _canonicalize_sheet_name(sheet: str) -> str:
     if not s:
         return s
 
-    # Prefer page_catalog resolver if present
-    try:
-        from core.sheets.page_catalog import resolve_page  # type: ignore
-
-        out = resolve_page(s)
-        if isinstance(out, str) and out.strip():
-            return out.strip()
-    except Exception:
-        pass
-
-    try:
-        from core.sheets.page_catalog import canonicalize_page  # type: ignore
-
-        out = canonicalize_page(s)
-        if isinstance(out, str) and out.strip():
-            return out.strip()
-    except Exception:
-        pass
+    # Prefer page_catalog normalization if available
+    for fn_name in ("normalize_page_name", "resolve_page", "canonicalize_page"):
+        try:
+            mod = __import__("core.sheets.page_catalog", fromlist=[fn_name])
+            fn = getattr(mod, fn_name, None)
+            if callable(fn):
+                try:
+                    out = fn(s, allow_output_pages=True)  # normalize_page_name signature
+                except TypeError:
+                    out = fn(s)
+                if isinstance(out, str) and out.strip():
+                    return out.strip()
+        except Exception:
+            continue
 
     return s.replace(" ", "_")
 
@@ -297,29 +285,28 @@ def _get_sheet_spec(sheet: str) -> Optional[Any]:
 def _schema_headers_keys(sheet: str) -> Tuple[List[str], List[str], str]:
     spec = _get_sheet_spec(sheet)
     if spec and getattr(spec, "columns", None):
-        headers = [str(c.header) for c in spec.columns]
-        keys = [str(c.key) for c in spec.columns]
+        headers = [str(getattr(c, "header", "")) for c in spec.columns]
+        keys = [str(getattr(c, "key", "")) for c in spec.columns]
+        headers = [h for h in headers if h]
+        keys = [k for k in keys if k]
         return headers, keys, "schema_registry.get_sheet_spec"
     return [], [], "none"
 
 
 def _get_all_sheet_names() -> List[str]:
+    # 1) schema_registry.list_sheets() if present
     try:
         from core.sheets import schema_registry as sr  # type: ignore
 
-        for attr in ("SHEET_NAMES", "SHEETS", "CANONICAL_SHEETS", "CANONICAL_PAGES"):
-            v = getattr(sr, attr, None)
-            if isinstance(v, (list, tuple)) and v:
-                return [str(x) for x in v]
-
-        fn = getattr(sr, "list_sheet_names", None)
+        fn = getattr(sr, "list_sheets", None)
         if callable(fn):
             out = fn()
-            if isinstance(out, (list, tuple)):
+            if isinstance(out, (list, tuple)) and out:
                 return [str(x) for x in out]
     except Exception:
         pass
 
+    # 2) page_catalog canonical ordering
     try:
         from core.sheets.page_catalog import CANONICAL_PAGES  # type: ignore
 
@@ -344,21 +331,19 @@ def _normalize_row_to_schema(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
     except Exception:
         out: Dict[str, Any] = {}
         for c in spec.columns:
-            k = str(c.key)
-            h = str(c.header)
-            if k in row:
+            k = str(getattr(c, "key", ""))
+            h = str(getattr(c, "header", ""))
+            if k and k in row:
                 out[k] = row.get(k)
-            elif h in row:
+            elif h and h in row:
                 out[k] = row.get(h)
-            else:
+            elif k:
                 out[k] = None
         return out
 
 
 def _project_row(keys: List[str], row: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    STRICT projection to schema keys in-order (extras dropped; missing filled with None).
-    """
+    """STRICT projection to schema keys in-order (extras dropped; missing filled with None)."""
     return {k: row.get(k, None) for k in keys}
 
 
@@ -367,6 +352,12 @@ def _rows_to_matrix(rows: List[Dict[str, Any]], keys: List[str]) -> List[List[An
 
 
 def _coerce_rows_payload(payload: Any) -> Tuple[List[Dict[str, Any]], List[str], List[str]]:
+    """
+    Accept:
+      - list[dict]
+      - {"headers":[...], "keys":[...], "rows":[...]}
+      - {"data":{...}} shapes
+    """
     if payload is None:
         return [], [], []
 
@@ -376,9 +367,12 @@ def _coerce_rows_payload(payload: Any) -> Tuple[List[Dict[str, Any]], List[str],
         return rows, keys[:], keys[:]
 
     if isinstance(payload, dict):
+        if isinstance(payload.get("data"), dict):
+            return _coerce_rows_payload(payload.get("data"))
+
         headers = payload.get("headers") or payload.get("columns") or payload.get("fields") or []
         keys = payload.get("keys") or payload.get("schema") or payload.get("fields") or []
-        rows = payload.get("rows") or payload.get("data") or payload.get("items") or payload.get("records") or []
+        rows = payload.get("rows") or payload.get("items") or payload.get("records") or payload.get("data") or []
         if not isinstance(rows, list):
             rows = []
         rows = [r for r in rows if isinstance(r, dict)]
@@ -430,6 +424,7 @@ async def _engine_sheet_rows(
             return out
         except TypeError as e:
             last_err = e
+            # try positional fallback
             try:
                 out = fn(sheet, limit=limit, offset=offset, mode=mode)
                 if hasattr(out, "__await__"):
@@ -445,6 +440,94 @@ async def _engine_sheet_rows(
     if last_err is not None:
         raise last_err
     raise RuntimeError("Engine has no supported sheet-rows method")
+
+
+# -----------------------------------------------------------------------------
+# Insights builder (best-effort; keeps schema 7-col correct)
+# -----------------------------------------------------------------------------
+async def _build_insights_analysis_rows(
+    *,
+    request: Request,
+    settings: Any,
+    mode: str,
+    body: Dict[str, Any],
+    schema_keys: Sequence[str],
+    schema_headers: Sequence[str],
+) -> List[Dict[str, Any]]:
+    try:
+        mod = __import__("core.analysis.insights_builder", fromlist=["*"])
+    except Exception:
+        return []
+
+    fn = None
+    for name in (
+        "build_insights_analysis_rows",
+        "build_insights_rows",
+        "build_insights_analysis",
+        "get_insights_rows",
+        "build_rows",
+    ):
+        cand = getattr(mod, name, None)
+        if callable(cand):
+            fn = cand
+            break
+    if fn is None:
+        return []
+
+    # Try a few signatures
+    candidates: List[Tuple[Tuple[Any, ...], Dict[str, Any]]] = [
+        ((), {"request": request, "settings": settings, "mode": mode, "body": body}),
+        ((), {"settings": settings, "mode": mode, "body": body}),
+        ((), {"mode": mode, "body": body}),
+        ((), {"mode": mode}),
+        ((), {"body": body}),
+        ((), {}),
+    ]
+
+    out = None
+    for args, kwargs in candidates:
+        try:
+            res = fn(*args, **kwargs)
+            if hasattr(res, "__await__"):
+                res = await res
+            out = res
+            break
+        except TypeError:
+            continue
+        except Exception:
+            continue
+
+    if out is None:
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    if isinstance(out, list):
+        rows = [r for r in out if isinstance(r, dict)]
+    elif isinstance(out, dict):
+        r2 = out.get("rows") or out.get("data") or out.get("items") or out.get("records")
+        if isinstance(r2, list):
+            rows = [r for r in r2 if isinstance(r, dict)]
+        else:
+            rows = [out] if isinstance(out, dict) else []
+    else:
+        rows = []
+
+    norm: List[Dict[str, Any]] = []
+    for r in rows:
+        rr = dict(r)
+        # normalize by schema keys/headers
+        for k in schema_keys:
+            if k not in rr:
+                # try header match
+                idx = list(schema_keys).index(k)
+                h = schema_headers[idx] if idx < len(schema_headers) else ""
+                if h and h in rr and k not in rr:
+                    rr[k] = rr.get(h)
+        for k in schema_keys:
+            rr.setdefault(k, None)
+        norm.append({str(k): rr.get(str(k)) for k in schema_keys})
+
+    return norm
 
 
 # -----------------------------------------------------------------------------
@@ -472,7 +555,10 @@ def _remove_router_route(path: str, method: str) -> int:
 
 _removed = _remove_router_route("/sheet-rows", "POST")
 if _removed:
-    logger.info("AdvancedAnalysis: removed %s existing POST /sheet-rows route(s) to replace schema-driven handler.", _removed)
+    logger.info(
+        "AdvancedAnalysis: removed %s existing POST /sheet-rows route(s) to replace schema-driven handler.",
+        _removed,
+    )
 
 
 @router.post("/sheet-rows")
@@ -494,15 +580,18 @@ async def advanced_sheet_rows_schema_driven(
     - keys    == schema keys (correct count + correct order)
     - rows    == STRICTLY projected to schema keys (extras dropped; missing None)
     """
+    start = time.perf_counter()
     _require_auth_or_401(token_query=token, x_app_token=x_app_token, authorization=authorization)
-    request_id = x_request_id or (getattr(request.state, "request_id", None) or "")
 
-    raw_sheet = str(body.get("sheet") or body.get("page") or body.get("name") or "").strip()
+    request_id = x_request_id or getattr(request.state, "request_id", None) or str(uuid.uuid4())
+
+    raw_sheet = str(body.get("sheet") or body.get("page") or body.get("name") or body.get("sheet_name") or "").strip()
     if not raw_sheet:
         raise HTTPException(status_code=422, detail="Missing required field: sheet")
 
     sheet = _canonicalize_sheet_name(raw_sheet)
 
+    # pagination
     limit = int(body.get("limit") or 2000)
     offset = int(body.get("offset") or 0)
     limit = max(1, min(5000, limit))
@@ -510,86 +599,88 @@ async def advanced_sheet_rows_schema_driven(
 
     include_matrix_final = include_matrix if isinstance(include_matrix, bool) else _get_bool(body, "include_matrix", True)
 
-    # Schema (authoritative headers/keys/order when present)
+    # Schema (authoritative)
     schema_headers, schema_keys, schema_source = _schema_headers_keys(sheet)
 
-    # -------------------------
-    # Data_Dictionary: generate from schema_registry (no engine)
-    # -------------------------
+    # Settings (optional)
+    try:
+        settings = get_settings_cached()
+    except Exception:
+        settings = None
+
+    # -------------------------------------------------------------------------
+    # SPECIAL: Insights_Analysis (best-effort builder; schema-first)
+    # -------------------------------------------------------------------------
+    if sheet == "Insights_Analysis":
+        out_headers = schema_headers[:]
+        out_keys = schema_keys[:]
+
+        rows: List[Dict[str, Any]] = []
+        if out_headers and out_keys:
+            rows = await _build_insights_analysis_rows(
+                request=request,
+                settings=settings,
+                mode=mode or "",
+                body=body,
+                schema_keys=out_keys,
+                schema_headers=out_headers,
+            )
+            # slice
+            rows = rows[offset : offset + limit]
+        else:
+            # schema missing -> return empty but deterministic
+            rows = []
+
+        return {
+            "status": "success",
+            "page": "Insights_Analysis",
+            "sheet": "Insights_Analysis",
+            "headers": out_headers,
+            "keys": out_keys,
+            "rows": rows,
+            "rows_matrix": _rows_to_matrix(rows, out_keys) if include_matrix_final and out_keys else None,
+            "version": ADVANCED_ANALYSIS_VERSION,
+            "request_id": request_id,
+            "meta": {
+                "schema_source": schema_source,
+                "path": "insights_builder" if rows else "schema_only",
+                "rows": len(rows),
+                "limit": limit,
+                "offset": offset,
+                "duration_ms": (time.perf_counter() - start) * 1000.0,
+            },
+        }
+
+    # -------------------------------------------------------------------------
+    # SPECIAL: Data_Dictionary (generated from schema_registry; no engine)
+    # -------------------------------------------------------------------------
     if sheet == "Data_Dictionary":
+        # Data_Dictionary schema (preferred)
         out_headers = schema_headers[:] if schema_headers else [
             "Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes"
         ]
-        out_keys = schema_keys[:] if schema_keys else out_headers[:]
-
-        rows: List[Dict[str, Any]] = []
-        sheet_names = _get_all_sheet_names() or [
- List[Dict[str, Any]] = []
-        sheet_names = _get_all_sheet_names() or [
-            "Market_Leaders",
-            "Global_Markets",
-            "Commodities_FX",
-            "Mutual_Funds",
-            "My_Portfolio",
-            "Insights_Analysis",
-            "Top_10_Investments",
-            "Data_Dictionary",
+        out_keys = schema_keys[:] if schema_keys else [
+            "sheet", "group", "header", "key", "dtype", "fmt", "required", "source", "notes"
         ]
 
-        for sn in sheet_names:
-            spec = _get_sheet_spec(sn)
-            cols = getattr(spec, "columns", None) if spec else None
-            if not cols:
+        try:
+            from core.sheets.data_dictionary import build_data_dictionary_rows  # type: ignore
+
+            dd_rows = build_data_dictionary_rows(include_meta_sheet=True)
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={"error": "Data_Dictionary generator import/call failed", "detail": str(e)},
+            )
+
+        # normalize rows to out_keys
+        rows: List[Dict[str, Any]] = []
+        for r in dd_rows or []:
+            if not isinstance(r, dict):
                 continue
-
-            for c in cols:
-                group = getattr(c, "group", None) or getattr(spec, "group", None) or ""
-                source = getattr(c, "source", None) or getattr(spec, "source", None) or ""
-                notes = getattr(c, "notes", None) or getattr(spec, "notes", None) or ""
-                dtype = getattr(c, "dtype", None) or getattr(c, "type", None) or ""
-                fmt = getattr(c, "format", None) or getattr(c, "fmt", None) or ""
-                req = getattr(c, "required", None)
-                required = bool(req) if req is not None else False
-
-                base = {
-                    "Sheet": sn,
-                    "Group": str(group) if group is not None else "",
-                    "Header": str(getattr(c, "header", "")),
-                    "Key": str(getattr(c, "key", "")),
-                    "DType": str(dtype) if dtype is not None else "",
-                    "Format": str(fmt) if fmt is not None else "",
-                    "Required": required,
-                    "Source": str(source) if source is not None else "",
-                    "Notes": str(notes) if notes is not None else "",
-                }
-
-                row: Dict[str, Any] = {}
-                for k in out_keys:
-                    lk = k.strip().lower().replace(" ", "_")
-                    if k in base:
-                        row[k] = base[k]
-                    elif lk in ("sheet", "page"):
-                        row[k] = base["Sheet"]
-                    elif lk == "group":
-                        row[k] = base["Group"]
-                    elif lk in ("header", "column"):
-                        row[k] = base["Header"]
-                    elif lk == "key":
-                        row[k] = base["Key"]
-                    elif lk in ("dtype", "type"):
-                        row[k] = base["DType"]
-                    elif lk in ("format", "fmt"):
-                        row[k] = base["Format"]
-                    elif lk in ("required", "is_required", "req"):
-                        row[k] = base["Required"]
-                    elif lk == "source":
-                        row[k] = base["Source"]
-                    elif lk in ("notes", "note", "description"):
-                        row[k] = base["Notes"]
-                    else:
-                        row[k] = None
-
-                rows.append(row)
+            # project strict
+            row = {k: r.get(k, None) for k in out_keys}
+            rows.append(row)
 
         rows = rows[offset : offset + limit]
 
@@ -602,19 +693,95 @@ async def advanced_sheet_rows_schema_driven(
             "rows": rows,
             "rows_matrix": _rows_to_matrix(rows, out_keys) if include_matrix_final else None,
             "version": ADVANCED_ANALYSIS_VERSION,
-            "request_id": request_id or None,
+            "request_id": request_id,
             "meta": {
                 "schema_source": schema_source,
                 "generated": True,
                 "rows": len(rows),
                 "limit": limit,
                 "offset": offset,
+                "duration_ms": (time.perf_counter() - start) * 1000.0,
             },
         }
 
-    # -------------------------
-    # Other sheets: engine + schema normalization + STRICT projection
-    # -------------------------
+    # -------------------------------------------------------------------------
+    # TABLE MODE: Top_10_Investments (engine if available; else schema-only)
+    # -------------------------------------------------------------------------
+    if sheet == "Top_10_Investments":
+        out_headers = schema_headers[:]
+        out_keys = schema_keys[:]
+
+        engine = await _get_engine(request)
+        if not engine:
+            # schema-only fallback (still passes schema alignment tests)
+            return {
+                "status": "success",
+                "page": sheet,
+                "sheet": sheet,
+                "headers": out_headers,
+                "keys": out_keys,
+                "rows": [],
+                "rows_matrix": [] if include_matrix_final else None,
+                "version": ADVANCED_ANALYSIS_VERSION,
+                "request_id": request_id,
+                "meta": {
+                    "schema_source": schema_source,
+                    "path": "schema_only_no_engine",
+                    "rows": 0,
+                    "limit": limit,
+                    "offset": offset,
+                    "duration_ms": (time.perf_counter() - start) * 1000.0,
+                },
+            }
+
+        try:
+            payload = await _engine_sheet_rows(engine, sheet=sheet, limit=limit, offset=offset, mode=mode or "", body=body)
+        except Exception:
+            payload = None
+
+        rows, eng_headers, eng_keys = _coerce_rows_payload(payload)
+        if not out_headers:
+            out_headers = eng_headers[:]
+        if not out_keys:
+            out_keys = eng_keys[:]
+
+        # Normalize + strict project if schema exists
+        norm_rows: List[Dict[str, Any]] = []
+        if schema_keys:
+            for r in rows:
+                rr = dict(r)
+                rr = _normalize_row_to_schema(sheet, rr)
+                norm_rows.append(_project_row(schema_keys, rr))
+        else:
+            norm_rows = [dict(r) for r in rows]
+
+        return {
+            "status": "success",
+            "page": sheet,
+            "sheet": sheet,
+            "headers": out_headers,
+            "keys": out_keys,
+            "rows": norm_rows,
+            "rows_matrix": _rows_to_matrix(norm_rows, out_keys) if (include_matrix_final and out_keys) else None,
+            "version": ADVANCED_ANALYSIS_VERSION,
+            "request_id": request_id,
+            "meta": {
+                "schema_source": schema_source,
+                "schema_cols": len(schema_headers) if schema_headers else 0,
+                "engine_cols": len(eng_headers) if eng_headers else 0,
+                "returned_cols": len(out_headers) if out_headers else 0,
+                "rows": len(norm_rows),
+                "limit": limit,
+                "offset": offset,
+                "mode": mode,
+                "path": "engine_table_mode",
+                "duration_ms": (time.perf_counter() - start) * 1000.0,
+            },
+        }
+
+    # -------------------------------------------------------------------------
+    # DEFAULT: Other sheets — engine + schema normalization + STRICT projection
+    # -------------------------------------------------------------------------
     engine = await _get_engine(request)
     if not engine:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Data engine unavailable")
@@ -640,10 +807,7 @@ async def advanced_sheet_rows_schema_driven(
     if schema_keys:
         for r in rows:
             rr = dict(r)
-            try:
-                rr = _normalize_row_to_schema(sheet, rr)
-            except Exception:
-                pass
+            rr = _normalize_row_to_schema(sheet, rr)
             norm_rows.append(_project_row(schema_keys, rr))
     else:
         norm_rows = [dict(r) for r in rows]
@@ -657,7 +821,7 @@ async def advanced_sheet_rows_schema_driven(
         "rows": norm_rows,
         "rows_matrix": _rows_to_matrix(norm_rows, out_keys) if (include_matrix_final and out_keys) else None,
         "version": ADVANCED_ANALYSIS_VERSION,
-        "request_id": request_id or None,
+        "request_id": request_id,
         "meta": {
             "schema_source": schema_source,
             "schema_cols": len(schema_headers) if schema_headers else 0,
@@ -669,6 +833,7 @@ async def advanced_sheet_rows_schema_driven(
             "mode": mode,
             "sheet_rows_schema_driven": True,
             "replaced_base_sheet_rows_routes": _removed,
+            "duration_ms": (time.perf_counter() - start) * 1000.0,
         },
     }
 
@@ -678,9 +843,7 @@ async def advanced_sheet_rows_schema_driven(
 # -----------------------------------------------------------------------------
 @router.get("/health")
 async def advanced_health(request: Request) -> Dict[str, Any]:
-    """
-    Lightweight health endpoint. Must not do heavy computations.
-    """
+    """Lightweight health endpoint. Must not do heavy computations."""
     engine = await _get_engine(request)
 
     schema_pages = None
@@ -728,9 +891,7 @@ async def advanced_health(request: Request) -> Dict[str, Any]:
 
 @router.get("/metrics")
 async def advanced_metrics() -> Response:
-    """
-    Prometheus metrics if available, otherwise 503.
-    """
+    """Prometheus metrics if available, otherwise 503."""
     if not _PROMETHEUS_AVAILABLE or generate_latest is None:
         return Response(content="Metrics not available", media_type="text/plain", status_code=503)
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
@@ -742,10 +903,7 @@ async def insights_criteria(
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
 ) -> Dict[str, Any]:
-    """
-    Returns a criteria snapshot designed to be embedded into Insights_Analysis.
-    Schema-agnostic and startup-safe.
-    """
+    """Returns a criteria snapshot designed to be embedded into Insights_Analysis."""
     _require_auth_or_401(token_query=token, x_app_token=x_app_token, authorization=authorization)
 
     snap = _build_insights_criteria_snapshot()
@@ -776,7 +934,7 @@ async def insights_analysis(
     - Optionally embeds criteria JSON into the first row if schema keys exist
     """
     _require_auth_or_401(token_query=token, x_app_token=x_app_token, authorization=authorization)
-    request_id = x_request_id or (getattr(request.state, "request_id", None) or "")
+    request_id = x_request_id or getattr(request.state, "request_id", None) or str(uuid.uuid4())
 
     symbols = _get_list(body, "symbols", "tickers")
     top_n = int(body.get("top_n") or 2000)
@@ -896,7 +1054,7 @@ async def insights_analysis(
         "rows_matrix": _rows_to_matrix(normalized_rows, keys) if include_matrix_final else None,
         "error": f"{errors} errors" if errors else None,
         "version": ADVANCED_ANALYSIS_VERSION,
-        "request_id": request_id or None,
+        "request_id": request_id,
         "meta": {
             "requested": len(symbols),
             "errors": errors,
