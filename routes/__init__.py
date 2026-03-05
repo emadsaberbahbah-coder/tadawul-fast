@@ -2,23 +2,26 @@
 """
 routes/__init__.py
 ------------------------------------------------------------
-Routes package initialization (PROD SAFE) — v3.0.0 (PHASE-8 SCHEMA-FIRST CLEAN EXPECTED LIST)
+Routes package initialization (PROD SAFE) — v3.1.0 (PHASE-8 SCHEMA-FIRST, NO NOISY MISSING)
 
-Fixes vs your current deploy warning:
-- ✅ Removes legacy/removed expected modules that cause noisy warnings:
+What this revision fixes (your “red X / noisy missing” symptom)
+- ✅ Default mount plan only includes modules that actually exist -> missing=0 in normal mode
+- ✅ Removed legacy expected modules that were producing noisy warnings:
     routes.sheet_rows, routes.sheets, routes.sheet_data, routes.sheet_rows_v2, routes.insights_analysis
-- ✅ Keeps schema-first preflight at MOUNT time (not import time)
-- ✅ Keeps preference families to avoid duplicate /sheet-rows endpoints:
+- ✅ Keeps preference families (one winner per family) to avoid duplicate /sheet-rows endpoints:
     - Analysis:   ai_analysis > analysis_sheet_rows
     - Advanced:  advanced_analysis > advanced_sheet_rows
     - Advisor:   investment_advisor > advisor
-- ✅ Keeps all prior design goals: no network calls at import time, safe optional discovery, CB for import failures, duplicate-route guard
+- ✅ Schema-first preflight is done at mount-time (not import-time):
+    - schema_registry validate_schema_registry()
+    - page_catalog validate_page_catalog() (if available)
+- ✅ Import-time is safe: no network calls, no heavy init
 
 Environment overrides (optional)
 - ROUTES_EXPECTED="routes.config,routes.enriched_quote,..."
 - ROUTES_AUTO_DISCOVER=1
 - ROUTES_STRICT=1
-- ROUTES_REQUIRED="routes.config,..."
+- ROUTES_REQUIRED="routes.config,..."     (only used when ROUTES_STRICT=1 OR as “must try” list)
 - ROUTES_IMPORT_TIMEOUT_SEC=5
 - ROUTES_CB_THRESHOLD=3
 - ROUTES_CB_RESET_TIMEOUT_SEC=60
@@ -41,7 +44,7 @@ from enum import Enum
 from functools import lru_cache, wraps
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
-ROUTES_PACKAGE_VERSION = "3.0.0"
+ROUTES_PACKAGE_VERSION = "3.1.0"
 
 # =============================================================================
 # Small env helpers (no deps)
@@ -80,9 +83,7 @@ def _utc_iso() -> str:
 # Enums and Types
 # =============================================================================
 class ModuleStatus(Enum):
-    AVAILABLE = "available"
     MISSING = "missing"
-    ERROR = "error"
     LOADED = "loaded"
     FAILED = "failed"
 
@@ -372,25 +373,18 @@ def _group_of(module_name: str) -> ModuleGroup:
 
     if any(k in ml for k in ("auth", "security", "middleware", "rate", "jwt", "token", "cors")):
         return ModuleGroup.SECURITY
-
     if any(k in ml for k in ("health", "status", "ping", "meta", "version", "ready", "live")):
         return ModuleGroup.SYSTEM
-
     if any(k in ml for k in ("data_dictionary", "schema", "registry", "dictionary", "page_catalog")):
         return ModuleGroup.SCHEMA
-
     if any(k in ml for k in ("advanced_analysis", "advanced_sheet_rows", "ai_analysis", "analysis_sheet_rows", "analysis")):
         return ModuleGroup.ANALYSIS
-
     if any(k in ml for k in ("investment_advisor", "advisor")):
         return ModuleGroup.ADVISOR
-
     if any(k in ml for k in ("argaam", "tadawul", "routes_argaam", "ksa", "saudi")):
         return ModuleGroup.KSA
-
     if any(k in ml for k in ("enriched", "quote", "quotes", "market", "engine")):
         return ModuleGroup.CORE
-
     return ModuleGroup.OTHER
 
 
@@ -407,26 +401,28 @@ def get_expected_router_modules() -> List[str]:
     Override via ROUTES_EXPECTED.
 
     IMPORTANT:
-    - We intentionally DO NOT include removed legacy modules:
+    - We intentionally do NOT include removed legacy modules:
         routes.sheet_rows, routes.sheets, routes.sheet_data, routes.sheet_rows_v2, routes.insights_analysis
     """
     override = _parse_env_list("ROUTES_EXPECTED")
     if override:
         return [_normalize_module_name(x) for x in override if _normalize_module_name(x)]
 
+    # Keep wrappers first to avoid duplicates:
+    # - ai_analysis wraps analysis_sheet_rows
+    # - advanced_analysis wraps advanced_sheet_rows
     candidates = [
         "routes.config",
         "routes.enriched_quote",
-        # Optional: keep if you have it (will be filtered at mount time if missing)
-        "routes.routes_argaam",
-        "routes.data_dictionary",
-        # Analysis family (winner selected below)
+        "routes.routes_argaam",       # optional, mounted only if exists
+        "routes.data_dictionary",     # optional, mounted only if exists
+        # Analysis family (winner chosen below)
         "routes.ai_analysis",
         "routes.analysis_sheet_rows",
-        # Advanced family (winner selected below)
+        # Advanced family (winner chosen below)
         "routes.advanced_analysis",
         "routes.advanced_sheet_rows",
-        # Top10 + Advisor
+        # Top10 + Advisor (optional)
         "routes.top10_investments",
         "routes.investment_advisor",
         "routes.advisor",
@@ -469,7 +465,7 @@ _ADVISOR_FAMILY = ["routes.investment_advisor", "routes.advisor"]
 
 def _apply_preference_families(mods: List[str]) -> List[str]:
     """
-    Keeps only the first available module in each preference family.
+    Keeps only the first module in each preference family.
     Assumes mods are already ordered by preference.
     """
     s = [_normalize_module_name(x) for x in mods if _normalize_module_name(x)]
@@ -482,7 +478,7 @@ def _apply_preference_families(mods: List[str]) -> List[str]:
     for fam in families:
         winner = None
         for m in s:
-            if m in fam and m not in seen:
+            if m in fam:
                 winner = m
                 break
         if winner:
@@ -519,9 +515,20 @@ def get_router_discovery(expected: Optional[Sequence[str]] = None) -> Dict[str, 
 
 
 @timed
+def get_available_router_modules(expected: Optional[Sequence[str]] = None) -> List[str]:
+    disc = get_router_discovery(expected)
+    return [m for m, ok in disc.items() if ok]
+
+
+@timed
 def get_mount_plan(expected: Optional[Sequence[str]] = None) -> List[str]:
+    """
+    The mount plan is the *existing* modules only.
+    This is the key change that eliminates noisy “missing modules” by default.
+    """
     exp = list(expected) if expected is not None else get_expected_router_modules()
     auto = _auto_discover_router_modules()
+
     merged = list(dict.fromkeys([_normalize_module_name(x) for x in (exp + auto) if _normalize_module_name(x)]))
     merged = _apply_preference_families(merged)
 
@@ -538,9 +545,17 @@ def _required_set_from_env() -> Set[str]:
 
 
 def build_router_specs(expected: Optional[Sequence[str]] = None) -> List[RouterSpec]:
+    """
+    Build RouterSpec list from mount plan + any required modules.
+    - If a required module does NOT exist, we keep it so strict mode can fail early.
+    """
     required = _required_set_from_env()
-    mods = get_mount_plan(expected)
-    specs = [RouterSpec(module=m, group=_group_of(m), required=(m in required)) for m in mods]
+    plan = get_mount_plan(expected)
+
+    # also try required modules even if they don't exist (to surface error clearly in strict mode)
+    merged = list(dict.fromkeys(plan + sorted(required)))
+
+    specs = [RouterSpec(module=m, group=_group_of(m), required=(m in required)) for m in merged]
     specs.sort(key=lambda x: (x.group.priority, x.module))
     return specs
 
@@ -621,6 +636,36 @@ def load_mount_target(
         info.load_time_ms = (time.perf_counter() - start) * 1000.0
 
 
+async def load_mount_target_async(
+    module: str,
+    *,
+    router_attr: str = "router",
+    mount_attr: str = "mount",
+    timeout: Optional[float] = None,
+) -> Tuple[Optional[Any], Optional[Callable[[Any], None]], ModuleInfo]:
+    t = float(timeout if timeout is not None else float(os.getenv("ROUTES_IMPORT_TIMEOUT_SEC", "5") or "5"))
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(load_mount_target, module, router_attr=router_attr, mount_attr=mount_attr),
+            timeout=t,
+        )
+    except asyncio.TimeoutError:
+        info = ModuleInfo(
+            name=_normalize_module_name(module),
+            group=_group_of(module),
+            status=ModuleStatus.FAILED,
+            error="import timeout",
+            error_category=ErrorCategory.TIMEOUT,
+            router_attr=router_attr,
+            mount_attr=mount_attr,
+            router_found=False,
+            mount_found=False,
+            last_checked_utc=_utc_iso(),
+        )
+        _metrics.record_error(ErrorCategory.TIMEOUT)
+        return None, None, info
+
+
 # =============================================================================
 # Duplicate-route guard (optional)
 # =============================================================================
@@ -659,7 +704,13 @@ def _router_keys(router: Any) -> Set[Tuple[str, str]]:
 # Schema-first preflight (mount-time only)
 # =============================================================================
 def _schema_preflight() -> Dict[str, Any]:
-    out: Dict[str, Any] = {"ok": False, "schema_version": None, "sheets_count": None, "error": None}
+    out: Dict[str, Any] = {
+        "ok": False,
+        "schema_version": None,
+        "sheets_count": None,
+        "page_catalog_ok": None,
+        "error": None,
+    }
     try:
         from core.sheets import schema_registry as sr  # type: ignore
 
@@ -670,6 +721,18 @@ def _schema_preflight() -> Dict[str, Any]:
         validate = getattr(sr, "validate_schema_registry", None)
         if callable(validate):
             validate()
+
+        # Optional: validate page catalog too (prevents alias routing drift)
+        try:
+            from core.sheets import page_catalog as pc  # type: ignore
+
+            vpc = getattr(pc, "validate_page_catalog", None)
+            if callable(vpc):
+                vpc()
+            out["page_catalog_ok"] = True
+        except Exception:
+            out["page_catalog_ok"] = False
+
         out["ok"] = True
         return out
     except Exception as e:
@@ -707,6 +770,7 @@ def mount_routers(app: Any, *, expected: Optional[Sequence[str]] = None, strict:
         router, mount_fn, info = load_mount_target(spec.module)
 
         if router is None and mount_fn is None:
+            # Missing modules only appear here if they are explicitly required (or user forced them)
             if info.status == ModuleStatus.MISSING:
                 report["missing"].append(info)
                 if strict_mode and (spec.required or spec.module in required):
@@ -853,9 +917,11 @@ __all__ = [
     "module_exists_async",
     "get_expected_router_modules",
     "get_router_discovery",
+    "get_available_router_modules",
     "get_mount_plan",
     "build_router_specs",
     "load_mount_target",
+    "load_mount_target_async",
     "mount_routers",
     "get_dependency_audit",
     "get_routes_debug_snapshot",
