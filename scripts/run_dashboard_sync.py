@@ -3,20 +3,26 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.2.1)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.3.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
-v6.2.1 improvements (fixes common ❌ causes + improves compatibility)
-- ✅ Always converts backend rows to a 2D matrix for Google Sheets (even if backend returns rows as dicts).
-- ✅ Safer “schema-only” requests when tickers are empty (limit never sent as 0; avoid validators).
-- ✅ Stronger payload compatibility: sends sheet / sheet_name / page / name / tab + tickers/symbols.
-- ✅ Robust response parsing: supports headers+rows, headers+rows_matrix, nested data payloads.
-- ✅ Never runs legacy forbidden keys (KSA_TADAWUL / ADVISOR_CRITERIA).
+v6.3.0 fixes (targets your recurring ❌ causes)
+- ✅ Sheets-safe ALWAYS: backend rows (dicts or lists) -> strict 2D matrix (pads/truncates to header length)
+- ✅ JSON-safe value coercion for Google API (datetime/Enum/set/etc -> primitives)
+- ✅ Key parsing is robust: --keys supports space, comma, semicolon, JSON array-like tokens
+- ✅ Stronger backend compatibility: sends sheet/sheet_name/page/name/tab + tickers/symbols + request_id
+- ✅ Health preflight probes /readyz + /health + /livez (best-effort)
+- ✅ Credentials loader hardened: supports GOOGLE_APPLICATION_CREDENTIALS file + env JSON + env base64; fixes "\\n" private_key
+- ✅ Never runs forbidden legacy keys (KSA_TADAWUL / ADVISOR_CRITERIA)
+- ✅ Deterministic exit codes:
+    0 = all success
+    1 = partial (some partial/skipped) but no hard failures
+    2 = one or more failed
 
 Design rules
 - No network calls at import-time.
-- Conservative: skips optional modules safely, reports warnings instead of crashing deployment.
+- Conservative: warnings instead of crashes.
 """
 
 from __future__ import annotations
@@ -32,16 +38,15 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-
 
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.2.1"
-
+SCRIPT_VERSION = "6.3.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -54,13 +59,25 @@ logging.basicConfig(
 )
 logger = logging.getLogger("DashboardSync")
 
-
 # -----------------------------------------------------------------------------
 # Helpers (safe)
 # -----------------------------------------------------------------------------
 _A1_CELL_RE = re.compile(r"^\$?[A-Za-z]+\$?\d+$")
+_SHEET_SAFE_RE = re.compile(r"^[A-Za-z0-9_]+$")
 _TRUTHY = {"1", "true", "yes", "y", "on"}
 _FALSY = {"0", "false", "no", "n", "off"}
+
+_ALLOWED_KEYS = {
+    "MARKET_LEADERS",
+    "GLOBAL_MARKETS",
+    "COMMODITIES_FX",
+    "MUTUAL_FUNDS",
+    "MY_PORTFOLIO",
+    "INSIGHTS_ANALYSIS",
+    "TOP_10_INVESTMENTS",
+    "DATA_DICTIONARY",
+}
+_FORBIDDEN_KEYS = {"KSA_TADAWUL", "ADVISOR_CRITERIA"}
 
 
 def _utc_now() -> datetime:
@@ -103,23 +120,13 @@ def _validate_a1_cell(a1: str) -> str:
     return s
 
 
-def _project_root() -> Path:
-    return Path(__file__).resolve().parent.parent
-
-
 def _canon_key(user_key: str) -> str:
     """
     Normalizes SYNC_KEYS tokens to canonical runner keys.
 
     Canonical runner keys (March 2026):
-      MARKET_LEADERS
-      GLOBAL_MARKETS
-      COMMODITIES_FX
-      MUTUAL_FUNDS
-      MY_PORTFOLIO
-      INSIGHTS_ANALYSIS
-      TOP_10_INVESTMENTS
-      DATA_DICTIONARY
+      MARKET_LEADERS, GLOBAL_MARKETS, COMMODITIES_FX, MUTUAL_FUNDS,
+      MY_PORTFOLIO, INSIGHTS_ANALYSIS, TOP_10_INVESTMENTS, DATA_DICTIONARY
     """
     k = (user_key or "").strip().upper().replace("-", "_").replace(" ", "_")
     aliases = {
@@ -137,6 +144,7 @@ def _canon_key(user_key: str) -> str:
         "TOP10": "TOP_10_INVESTMENTS",
         "TOP_10": "TOP_10_INVESTMENTS",
         "TOP10_INVESTMENTS": "TOP_10_INVESTMENTS",
+        "TOP_10_INVESTMENTS": "TOP_10_INVESTMENTS",
         "DATA_DICTIONARY_SHEET": "DATA_DICTIONARY",
         "DICTIONARY": "DATA_DICTIONARY",
     }
@@ -144,12 +152,7 @@ def _canon_key(user_key: str) -> str:
 
 
 def _is_forbidden_key(k: str) -> bool:
-    kk = _canon_key(k)
-    return kk in {"KSA_TADAWUL", "ADVISOR_CRITERIA"}
-
-
-def _is_meta_sheet_name(sheet_name: str) -> bool:
-    return (sheet_name or "").strip() in {"Insights_Analysis", "Top_10_Investments", "Data_Dictionary"}
+    return _canon_key(k) in _FORBIDDEN_KEYS
 
 
 def _default_backend_url() -> str:
@@ -176,6 +179,77 @@ def _env_token() -> str:
         if v:
             return v
     return ""
+
+
+def _coerce_jsonable(v: Any) -> Any:
+    """Make values safe for JSON/Google Sheets payloads."""
+    if v is None:
+        return None
+    if isinstance(v, (str, int, float, bool)):
+        return v
+    if isinstance(v, Enum):
+        return v.value
+    if isinstance(v, (datetime, date)):
+        try:
+            return v.isoformat()
+        except Exception:
+            return str(v)
+    if isinstance(v, dict):
+        return {str(k): _coerce_jsonable(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple, set)):
+        return [_coerce_jsonable(x) for x in v]
+    # pydantic-ish
+    try:
+        if hasattr(v, "model_dump"):
+            return _coerce_jsonable(v.model_dump(mode="python"))  # type: ignore
+        if hasattr(v, "dict"):
+            return _coerce_jsonable(v.dict())  # type: ignore
+    except Exception:
+        pass
+    return str(v)
+
+
+def _parse_keys_tokens(raw_tokens: Sequence[str]) -> List[str]:
+    """
+    Accepts:
+      --keys A B C
+      --keys "A,B,C"
+      --keys "A;B;C"
+      --keys '["A","B"]'
+    """
+    flat: List[str] = []
+    for t in raw_tokens or []:
+        s = str(t or "").strip()
+        if not s:
+            continue
+        # JSON array
+        if s.startswith("[") and s.endswith("]"):
+            try:
+                arr = json.loads(s)
+                if isinstance(arr, list):
+                    for x in arr:
+                        xs = str(x or "").strip()
+                        if xs:
+                            flat.append(xs)
+                    continue
+            except Exception:
+                pass
+        # split by common separators
+        parts = re.split(r"[,\s;|]+", s)
+        for p in parts:
+            pp = (p or "").strip()
+            if pp:
+                flat.append(pp)
+    # canonicalize + de-dup
+    out: List[str] = []
+    seen: set[str] = set()
+    for k in flat:
+        ck = _canon_key(k)
+        if not ck or ck in seen:
+            continue
+        seen.add(ck)
+        out.append(ck)
+    return out
 
 
 # -----------------------------------------------------------------------------
@@ -301,7 +375,10 @@ class BackendClient:
             code = int(r.status_code)
             if code != 200:
                 return None, f"HTTP {code}: {r.text[:200]}", code
-            return r.json(), None, code
+            try:
+                return r.json(), None, code
+            except Exception as e:
+                return None, f"JSON parse error: {e}", code
         except Exception as e:
             return None, str(e), 0
 
@@ -323,11 +400,16 @@ class BackendClient:
                 if code != 200:
                     return None, f"HTTP {code}: {r.text[:200]}", code
 
-                return r.json(), None, code
+                try:
+                    return r.json(), None, code
+                except Exception as e:
+                    return None, f"JSON parse error: {e}", code
+
             except Exception as e:
                 if attempt == max_retries - 1:
                     return None, str(e), 0
                 await asyncio.sleep(min(10.0, (2**attempt) + random.uniform(0, 1.0)))
+
         return None, "Unknown error", 0
 
 
@@ -407,15 +489,28 @@ class SheetsWriter:
     def __init__(self):
         self._service = None  # lazy
 
+    def _fix_private_key(self, d: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            pk = d.get("private_key")
+            if isinstance(pk, str) and "\\n" in pk:
+                d["private_key"] = pk.replace("\\n", "\n")
+        except Exception:
+            pass
+        return d
+
     def _load_credentials_dict(self) -> Optional[Dict[str, Any]]:
         raw = (os.getenv("GOOGLE_SHEETS_CREDENTIALS") or os.getenv("GOOGLE_CREDENTIALS") or "").strip()
+
+        # Prefer GOOGLE_APPLICATION_CREDENTIALS file path (GitHub Actions pattern)
+        path = (os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
+        if path and os.path.exists(path):
+            try:
+                d = json.loads(Path(path).read_text(encoding="utf-8"))
+                return self._fix_private_key(d) if isinstance(d, dict) else None
+            except Exception:
+                return None
+
         if not raw:
-            path = (os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
-            if path and os.path.exists(path):
-                try:
-                    return json.loads(Path(path).read_text(encoding="utf-8"))
-                except Exception:
-                    return None
             return None
 
         try:
@@ -423,9 +518,7 @@ class SheetsWriter:
                 d = json.loads(raw)
             else:
                 d = json.loads(base64.b64decode(raw).decode("utf-8"))
-            if isinstance(d, dict) and "private_key" in d and isinstance(d["private_key"], str):
-                d["private_key"] = d["private_key"].replace("\\n", "\n")
-            return d if isinstance(d, dict) else None
+            return self._fix_private_key(d) if isinstance(d, dict) else None
         except Exception:
             return None
 
@@ -448,10 +541,11 @@ class SheetsWriter:
         return self._service
 
     def _safe_sheet_a1(self, sheet_name: str) -> str:
-        name = sheet_name.replace("'", "''")
-        if re.search(r"[^A-Za-z0-9_]", sheet_name):
-            return f"'{name}'"
-        return sheet_name
+        # Always quote if not safe
+        if _SHEET_SAFE_RE.match(sheet_name or ""):
+            return sheet_name
+        name = (sheet_name or "").replace("'", "''")
+        return f"'{name}'"
 
     def clear_from(self, spreadsheet_id: str, sheet_name: str, start_a1: str) -> None:
         svc = self._get_service()
@@ -477,11 +571,24 @@ class SheetsWriter:
         if not svc:
             return 0
 
-        values: List[List[Any]] = []
-        if headers:
-            values.append([str(h) for h in headers])
+        # Ensure rectangular rows matching header length (Sheets-friendly)
+        hdr = [str(h) for h in (headers or [])]
+        width = len(hdr)
+
+        matrix: List[List[Any]] = []
         for r in rows or []:
-            values.append(list(r))
+            rr = list(r) if isinstance(r, list) else [r]
+            if width > 0:
+                if len(rr) < width:
+                    rr = rr + [None] * (width - len(rr))
+                elif len(rr) > width:
+                    rr = rr[:width]
+            matrix.append([_coerce_jsonable(x) for x in rr])
+
+        values: List[List[Any]] = []
+        if hdr:
+            values.append(hdr)
+        values.extend(matrix)
 
         rng = f"{self._safe_sheet_a1(sheet_name)}!{start_a1}"
         body = {"majorDimension": "ROWS", "values": values}
@@ -492,7 +599,7 @@ class SheetsWriter:
             body=body,
         ).execute()
 
-        return max(0, len(values) - (1 if headers else 0))
+        return max(0, len(values) - (1 if hdr else 0))
 
 
 # -----------------------------------------------------------------------------
@@ -553,10 +660,13 @@ def _default_tasks() -> List[TaskSpec]:
 
 def _endpoint_candidates_for_gateway(gw: str) -> List[str]:
     gw = (gw or "enriched").strip().lower()
+    # include ai aliases because route naming can vary
     if gw in {"analysis", "ai"}:
         return [
             "/v1/analysis/sheet-rows",
             "/analysis/sheet-rows",
+            "/v1/ai/sheet-rows",
+            "/ai/sheet-rows",
             "/v1/advanced/sheet-rows",
             "/advanced/sheet-rows",
             "/v1/enriched/sheet-rows",
@@ -568,6 +678,8 @@ def _endpoint_candidates_for_gateway(gw: str) -> List[str]:
             "/advanced/sheet-rows",
             "/v1/analysis/sheet-rows",
             "/analysis/sheet-rows",
+            "/v1/enriched/sheet-rows",
+            "/enriched/sheet-rows",
         ]
     if gw == "argaam":
         return ["/v1/argaam/sheet-rows", "/argaam/sheet-rows"]
@@ -578,12 +690,15 @@ def _endpoint_candidates_for_gateway(gw: str) -> List[str]:
         "/analysis/sheet-rows",
         "/v1/advanced/sheet-rows",
         "/advanced/sheet-rows",
+        "/v1/ai/sheet-rows",
+        "/ai/sheet-rows",
     ]
 
 
 def _extract_table_payload(resp: Dict[str, Any]) -> Tuple[List[Any], List[List[Any]]]:
     """
     Returns (headers, rows_matrix) ALWAYS as list[list] for Sheets writing.
+
     Supports:
       - {"headers":[...], "rows":[list|dict]}
       - {"headers":[...], "rows_matrix":[...]}
@@ -604,9 +719,10 @@ def _extract_table_payload(resp: Dict[str, Any]) -> Tuple[List[Any], List[List[A
     headers_list = list(headers) if isinstance(headers, list) else []
     keys_list = list(keys) if isinstance(keys, list) else []
 
-    # Prefer explicit matrix if present
+    # Prefer explicit matrix
     if isinstance(headers_list, list) and isinstance(rows_matrix, list):
-        return headers_list, [list(r) for r in rows_matrix if isinstance(r, list)]
+        mm = [list(r) for r in rows_matrix if isinstance(r, list)]
+        return headers_list, mm
 
     if not isinstance(rows, list):
         rows = []
@@ -617,7 +733,7 @@ def _extract_table_payload(resp: Dict[str, Any]) -> Tuple[List[Any], List[List[A
             headers_list = keys_list[:]
         return headers_list, [list(r) for r in rows if isinstance(r, list)]
 
-    # rows are list[dict] -> convert to matrix using keys or headers or first-row keys
+    # rows are list[dict] -> convert to matrix using keys/headers
     if rows and isinstance(rows[0], dict):
         dict_rows: List[Dict[str, Any]] = [r for r in rows if isinstance(r, dict)]  # type: ignore[assignment]
         if not keys_list:
@@ -628,7 +744,7 @@ def _extract_table_payload(resp: Dict[str, Any]) -> Tuple[List[Any], List[List[A
                 headers_list = keys_list[:]
         if not headers_list:
             headers_list = keys_list[:]
-        matrix = [[r.get(k) for k in keys_list] for r in dict_rows]
+        matrix = [[_coerce_jsonable(r.get(k)) for k in keys_list] for r in dict_rows]
         return headers_list, matrix
 
     # empty rows, but headers exist
@@ -636,6 +752,24 @@ def _extract_table_payload(resp: Dict[str, Any]) -> Tuple[List[Any], List[List[A
         return headers_list, []
 
     return [], []
+
+
+def _rectify_matrix(headers: List[Any], matrix: List[List[Any]]) -> List[List[Any]]:
+    """Pad/truncate each row to match header length."""
+    width = len(headers or [])
+    if width <= 0:
+        return [list(r) for r in (matrix or []) if isinstance(r, list)]
+    out: List[List[Any]] = []
+    for r in matrix or []:
+        if not isinstance(r, list):
+            continue
+        rr = list(r)
+        if len(rr) < width:
+            rr = rr + [None] * (width - len(rr))
+        elif len(rr) > width:
+            rr = rr[:width]
+        out.append(rr)
+    return out
 
 
 # -----------------------------------------------------------------------------
@@ -655,13 +789,19 @@ async def _run_one_task(
     res = TaskResult(key=task.key, sheet_name=task.sheet_name, status="pending", start_utc=_utc_now().isoformat())
 
     try:
-        if _is_forbidden_key(task.key):
+        canon_task_key = _canon_key(task.key)
+
+        # Hard filters
+        if _is_forbidden_key(canon_task_key):
             res.status = "skipped"
             res.warnings.append("Forbidden legacy key; skipped.")
             return res
+        if canon_task_key not in _ALLOWED_KEYS:
+            res.status = "skipped"
+            res.warnings.append(f"Unknown key {canon_task_key}; skipped.")
+            return res
 
         max_syms = max_symbols_override if max_symbols_override >= 0 else task.max_symbols
-        canon_task_key = _canon_key(task.key)
 
         symbols: List[str] = []
         if max_syms != 0:
@@ -669,6 +809,7 @@ async def _run_one_task(
 
         res.symbols_requested = len(symbols)
 
+        # Dry run: still success-ish but no backend call and no write
         if dry_run:
             res.status = "skipped"
             res.warnings.append("Dry run: no backend call, no sheet write.")
@@ -682,7 +823,7 @@ async def _run_one_task(
         if not symbols:
             res.warnings.append("No symbols found; requesting schema-only payload (headers + empty rows).")
 
-        # IMPORTANT: Some handlers clamp limit >= 1, so never send 0
+        # Some handlers clamp limit >= 1, so never send 0
         safe_limit = 1 if not symbols else min(5000, max(1, len(symbols)))
 
         payload: Dict[str, Any] = {
@@ -700,6 +841,8 @@ async def _run_one_task(
             "include_meta": True,
             "include_matrix": True,
             "limit": safe_limit,
+            # tracing
+            "request_id": res.request_id,
         }
 
         last_err: Optional[str] = None
@@ -721,6 +864,7 @@ async def _run_one_task(
                 last_err = f"{ep} -> Missing headers"
                 continue
 
+            rows_matrix = _rectify_matrix(headers, rows_matrix)
             used_endpoint = ep
             break
 
@@ -732,7 +876,7 @@ async def _run_one_task(
         res.gateway_used = f"{task.gateway}:{used_endpoint}" if used_endpoint else task.gateway
         res.symbols_processed = len(symbols)
 
-        # If no sheet creds => treat as partial (data fetched but not written)
+        # No creds => partial (data fetched but not written)
         if sheets is None or sheets._get_service() is None:
             res.status = "partial"
             res.warnings.append("No Google Sheets credentials. Backend data fetched but not written.")
@@ -780,7 +924,7 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description=f"TFB Dashboard Sync Runner v{SCRIPT_VERSION}")
     parser.add_argument("--sheet-id", default="", help="Spreadsheet ID override")
     parser.add_argument("--backend", default="", help="Backend base URL override (e.g. https://... )")
-    parser.add_argument("--keys", nargs="*", default=[], help="Specific keys to run (e.g. MARKET_LEADERS GLOBAL_MARKETS)")
+    parser.add_argument("--keys", nargs="*", default=[], help="Specific keys (space/comma/semicolon/JSON-array supported)")
     parser.add_argument("--start-cell", default="A5", help="Top-left A1 cell where headers will be written (e.g. A5)")
     parser.add_argument("--max-symbols", default="-1", help="Override max symbols for all tasks (-1 = per task default)")
     parser.add_argument("--workers", default="4", help="Parallel workers")
@@ -788,17 +932,19 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="Do not call backend or write sheets")
     parser.add_argument("--no-lock", action="store_true", help="Disable Redis lock even if REDIS_URL exists")
     parser.add_argument("--json-out", default="", help="Write JSON report to this file path")
+    parser.add_argument("--timeout", default="30", help="Backend timeout seconds")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     spreadsheet_id = _default_spreadsheet_id(args.sheet_id)
     if not spreadsheet_id:
         logger.error("DEFAULT_SPREADSHEET_ID is missing and --sheet-id not provided.")
-        return 1
+        return 2
 
     backend_url = (args.backend or _default_backend_url()).rstrip("/")
     start_cell = _validate_a1_cell(args.start_cell)
     max_symbols = _safe_int(args.max_symbols, -1, lo=-1, hi=5000)
     workers = _safe_int(args.workers, 4, lo=1, hi=32)
+    timeout_sec = float(_safe_int(args.timeout, 30, lo=5, hi=180))
 
     token = _env_token()
     if not token:
@@ -806,44 +952,47 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
 
     tasks = _default_tasks()
 
-    wanted_raw = [str(k) for k in (args.keys or []) if str(k).strip()]
-    forbidden_requested = [k for k in wanted_raw if _is_forbidden_key(k)]
+    wanted = _parse_keys_tokens(args.keys or [])
+    forbidden_requested = [k for k in wanted if _is_forbidden_key(k)]
     if forbidden_requested:
         logger.warning("Forbidden keys requested and will be ignored: %s", ", ".join(forbidden_requested))
 
-    wanted = {_canon_key(k) for k in wanted_raw if not _is_forbidden_key(k)}
-    if wanted:
-        tasks = [t for t in tasks if _canon_key(t.key) in wanted]
+    wanted_ok = [k for k in wanted if (k in _ALLOWED_KEYS and not _is_forbidden_key(k))]
+    if wanted_ok:
+        tasks = [t for t in tasks if _canon_key(t.key) in set(wanted_ok)]
 
     tasks.sort(key=lambda t: (t.priority, t.key))
     if not tasks:
         logger.warning("No tasks selected.")
         return 0
 
+    # clamp workers to tasks count
+    workers = max(1, min(workers, len(tasks)))
+
     summary = RunSummary()
     summary.total_tasks = len(tasks)
     t0 = time.perf_counter()
 
-    backend = BackendClient(backend_url, timeout_sec=30.0, token=token)
+    backend = BackendClient(backend_url, timeout_sec=timeout_sec, token=token)
     sheets = SheetsWriter()
 
-    lock_name = f"{spreadsheet_id}:{','.join([t.key for t in tasks])}"
+    lock_name = f"{spreadsheet_id}:{','.join([_canon_key(t.key) for t in tasks])}"
     lock = RedisLock(lock_name, ttl_sec=600)
 
+    results: List[TaskResult] = []
     try:
-        # Preflight
-        ready, err, _code = await backend.get_json("/readyz")
-        if err:
-            logger.warning("Backend /readyz not OK: %s", err)
-        else:
-            logger.info("Backend ready: %s", str((ready or {}).get("status") or "ok"))
+        # Preflight health (best-effort)
+        for hp in ("/readyz", "/health", "/livez"):
+            data, err, _code = await backend.get_json(hp)
+            if err:
+                logger.info("Backend preflight %s -> %s", hp, err)
+                continue
+            status_val = (data or {}).get("status") if isinstance(data, dict) else None
+            logger.info("Backend preflight %s -> %s", hp, status_val or "ok")
+            break
 
         # Acquire lock
-        if args.no_lock:
-            acquired = True
-        else:
-            acquired = await lock.acquire()
-
+        acquired = True if args.no_lock else await lock.acquire()
         if not acquired:
             logger.error("Could not acquire Redis lock. Use --no-lock to bypass.")
             return 2
@@ -863,7 +1012,6 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
                     sheets=sheets,
                 )
 
-        results: List[TaskResult] = []
         out = await asyncio.gather(*[_guarded(t) for t in tasks], return_exceptions=True)
 
         for i, r in enumerate(out):
@@ -909,11 +1057,11 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
 
         for r in results:
             if r.status == "success":
-                logger.info("✅ %s -> %s | rows=%d | %.1fms", r.key, r.sheet_name, r.rows_written, r.duration_ms)
+                logger.info("✅ %s -> %s | rows=%d | %.1fms", _canon_key(r.key), r.sheet_name, r.rows_written, r.duration_ms)
             elif r.status == "partial":
                 logger.info(
                     "⚠️  %s -> %s | rows=%d failed=%d | %.1fms | %s",
-                    r.key,
+                    _canon_key(r.key),
                     r.sheet_name,
                     r.rows_written,
                     r.rows_failed,
@@ -921,15 +1069,16 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
                     "; ".join(r.warnings[:2]),
                 )
             elif r.status == "failed":
-                logger.info("❌ %s -> %s | %s", r.key, r.sheet_name, r.error or "failed")
+                logger.info("❌ %s -> %s | %s", _canon_key(r.key), r.sheet_name, r.error or "failed")
             else:
-                logger.info("⏭️  %s -> %s | %s", r.key, r.sheet_name, "; ".join(r.warnings[:2]) if r.warnings else "skipped")
+                logger.info("⏭️  %s -> %s | %s", _canon_key(r.key), r.sheet_name, "; ".join(r.warnings[:2]) if r.warnings else "skipped")
 
         if args.json_out:
             report = {"summary": summary.to_dict(), "results": [x.to_dict() for x in results]}
-            Path(args.json_out).write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+            Path(args.json_out).write_text(json.dumps(_coerce_jsonable(report), indent=2, ensure_ascii=False), encoding="utf-8")
             logger.info("Report saved: %s", args.json_out)
 
+        # Exit codes
         if summary.failed > 0:
             return 2
         if summary.partial > 0:
@@ -953,7 +1102,7 @@ def main() -> int:
         return 130
     except Exception as e:
         logger.exception("Unhandled error: %s", e)
-        return 1
+        return 2
 
 
 if __name__ == "__main__":
