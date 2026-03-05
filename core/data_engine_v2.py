@@ -2,28 +2,32 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.6.0 (PHASE 5 SCHEMA-CORRECT)
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.7.0 (PHASE 5 SCHEMA-ALIGNED+)
 ================================================================================
 
-WHY v5.6.0 (your PowerShell evidence)
-- ✅ FIX (CRITICAL): Sheet-rows builder no longer collapses “special sheets” to DEFAULT 80 columns.
-  Specifically, when a sheet exists in schema_registry, we ALWAYS return:
+WHY v5.7.0 (alignment + hardening)
+- ✅ FIX (CRITICAL): Engine sheet-rows now has an explicit SPECIAL DISPATCH map so
+  Insights_Analysis / Top_10_Investments / Data_Dictionary NEVER fall back to the
+  DEFAULT 80-col instrument schema.
+- ✅ Schema-first contract is enforced:
     - headers == schema headers (correct count + correct order)
     - keys    == schema keys    (correct count + correct order)
-    - rows    strictly projected to schema keys (extras dropped, missing = None)
-- ✅ Adds a FIRST-CLASS sheet rows API on the engine:
-    - get_sheet_rows(...)
-    - sheet_rows(...)
-    - build_sheet_rows(...)
-  Routers can call any of these; they all return schema-correct payloads.
-- ✅ Data_Dictionary is generated from schema_registry (authoritative) with pagination.
-- ✅ Top_10_Investments / Insights_Analysis are handled safely:
-    - if a delegated builder exists, we use it then enforce schema projection
-    - otherwise we return schema-correct headers/keys with empty rows (still passes completeness)
+    - rows    are normalized + projected to schema keys (missing=None)
+- ✅ Special sheets:
+    - Data_Dictionary:
+        - prefers core.sheets.data_dictionary.build_data_dictionary_rows(include_meta_sheet=True)
+        - otherwise falls back to internal schema-derived generator (deterministic)
+    - Insights_Analysis:
+        - prefers core.analysis.insights_builder.* builder functions (best-effort signatures)
+        - normalizes output (keys OR headers) to schema keys
+    - Top_10_Investments:
+        - prefers core.analysis.top10_builder (and common variants)
+        - normalizes output (keys OR headers) to schema keys
+        - if missing, falls back to delegated builder module; else schema-only empty rows
 - ✅ Startup-safe: no network IO at import-time; all heavy imports are lazy inside calls.
 - ✅ Keeps your existing provider orchestration, caching, scoring, forecasting logic.
 
-STRICTNESS (prevents silent “fallback to 80 columns”)
+STRICTNESS (prevents silent fallback)
 - Env: SCHEMA_STRICT_SHEET_ROWS (default true)
   If true and a requested sheet is not in schema_registry, we return a structured error
   (instead of silently using the union/DEFAULT schema).
@@ -57,7 +61,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.6.0"
+__version__ = "5.7.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -976,7 +980,7 @@ def _canonicalize_sheet_name(sheet: str) -> str:
     if not s:
         return s
 
-    # Prefer page_catalog resolve if available
+    # Prefer page_catalog resolve/canonicalize if available
     try:
         from core.sheets.page_catalog import resolve_page  # type: ignore
 
@@ -1024,6 +1028,43 @@ def _strict_project_row(keys: List[str], row: Dict[str, Any]) -> Dict[str, Any]:
 
 def _rows_matrix(rows: List[Dict[str, Any]], keys: List[str]) -> List[List[Any]]:
     return [[r.get(k) for k in keys] for r in rows]
+
+
+def _normalize_to_schema_keys(schema_keys: Sequence[str], schema_headers: Sequence[str], raw: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalizes a raw row dict to schema KEYS.
+    Supports raw using either schema keys OR schema headers.
+    Missing -> None
+    Extras are ignored by callers via _strict_project_row.
+    """
+    raw = raw or {}
+    raw_ci = {str(k).strip().lower(): v for k, v in raw.items()}
+
+    header_by_key: Dict[str, str] = {}
+    for k, h in zip(schema_keys, schema_headers):
+        header_by_key[str(k)] = str(h)
+
+    out: Dict[str, Any] = {}
+    for k in schema_keys:
+        ks = str(k)
+        v = None
+
+        if ks in raw:
+            v = raw.get(ks)
+        else:
+            v = raw_ci.get(ks.lower())
+
+        if v is None:
+            h = header_by_key.get(ks, "")
+            if h:
+                if h in raw:
+                    v = raw.get(h)
+                else:
+                    v = raw_ci.get(h.strip().lower())
+
+        out[ks] = v
+
+    return out
 
 
 async def _try_load_rows_builder() -> Optional[Any]:
@@ -1090,7 +1131,6 @@ async def _delegate_build_rows(
             out = fn(sheet=sheet, limit=limit, offset=offset, mode=mode, body=body)
             if hasattr(out, "__await__"):
                 out = await out
-            # normalize output to list[dict]
             if isinstance(out, dict):
                 rows = out.get("rows") or out.get("data") or out.get("items") or []
                 if isinstance(rows, list):
@@ -1197,8 +1237,97 @@ def _data_dictionary_rows(
     return rows[offset : offset + limit]
 
 
+async def _call_builder_best_effort(
+    module_names: Sequence[str],
+    function_names: Sequence[str],
+    *,
+    sheet: str,
+    limit: int,
+    offset: int,
+    mode: str,
+    body: Dict[str, Any],
+    settings: Any,
+) -> Tuple[Optional[Any], Optional[str]]:
+    """
+    Import first available module, pick first callable function, call with best-effort signatures.
+    Returns (result, note) where result is builder output (any), and note indicates which function used.
+    Never raises (returns None, error-note).
+    """
+    last_err: Optional[str] = None
+    mod = None
+    for mn in module_names:
+        try:
+            mod = import_module(mn)
+            break
+        except Exception as e:
+            last_err = f"{mn}: {e!s}"
+            continue
+    if mod is None:
+        return None, f"import_failed:{last_err or 'no_modules'}"
+
+    fn = None
+    used_name = None
+    for name in function_names:
+        cand = getattr(mod, name, None)
+        if callable(cand):
+            fn = cand
+            used_name = name
+            break
+    if fn is None:
+        return None, "no_callable"
+
+    candidates: List[Tuple[Tuple[Any, ...], Dict[str, Any]]] = [
+        ((), {"request": None, "settings": settings, "mode": mode, "body": body, "sheet": sheet, "limit": limit, "offset": offset}),
+        ((), {"settings": settings, "mode": mode, "body": body, "sheet": sheet, "limit": limit, "offset": offset}),
+        ((), {"settings": settings, "mode": mode, "body": body}),
+        ((), {"settings": settings, "mode": mode}),
+        ((), {"mode": mode, "body": body}),
+        ((), {"mode": mode}),
+        ((), {"body": body}),
+        ((sheet,), {"limit": limit, "offset": offset, "mode": mode, "body": body, "settings": settings}),
+        ((sheet,), {"limit": limit, "offset": offset, "mode": mode, "body": body}),
+        ((sheet,), {"limit": limit, "offset": offset, "mode": mode}),
+        ((sheet,), {"limit": limit, "offset": offset}),
+        ((sheet,), {}),
+        ((), {}),
+    ]
+
+    for args, kwargs in candidates:
+        try:
+            out = fn(*args, **kwargs)
+            if asyncio.iscoroutine(out) or asyncio.isfuture(out) or hasattr(out, "__await__"):
+                out = await out
+            return out, f"builder:{used_name}"
+        except TypeError:
+            continue
+        except Exception as e:
+            return None, f"builder_error:{used_name}:{e!s}"
+
+    return None, f"builder_signature_mismatch:{used_name or 'unknown'}"
+
+
+def _coerce_rows_list(out: Any) -> List[Dict[str, Any]]:
+    """
+    Coerce builder output to list[dict].
+    Accepts:
+      - list[dict]
+      - dict envelope: rows/data/items/records
+      - single dict row
+    """
+    if out is None:
+        return []
+    if isinstance(out, list):
+        return [r for r in out if isinstance(r, dict)]
+    if isinstance(out, dict):
+        r2 = out.get("rows") or out.get("data") or out.get("items") or out.get("records")
+        if isinstance(r2, list):
+            return [r for r in r2 if isinstance(r, dict)]
+        return [out]
+    return []
+
+
 # ============================================================================
-# DataEngine V5 (v5.6.0)
+# DataEngine V5 (v5.7.0)
 # ============================================================================
 class DataEngineV5:
     def __init__(self, settings: Any = None):
@@ -1546,7 +1675,7 @@ class DataEngineV5:
     get_quotes_batch = get_enriched_quotes_batch
 
     # -----------------------------
-    # ✅ PHASE 5: Schema-correct Sheet Rows API (CRITICAL FIX)
+    # ✅ PHASE 5: Schema-correct Sheet Rows API (SPECIAL DISPATCH + STRICT)
     # -----------------------------
     async def get_sheet_rows(
         self,
@@ -1562,11 +1691,23 @@ class DataEngineV5:
         when schema_registry knows the requested sheet.
 
         Returns (schema-correct):
-            { status, sheet/page, headers, keys, rows, rows_matrix, meta }
+            { status, sheet/page, headers, keys, rows, rows_matrix?, meta, version }
         """
         body = body or {}
         limit = max(1, min(5000, int(limit or 2000)))
         offset = max(0, int(offset or 0))
+
+        include_matrix = True
+        try:
+            v = body.get("include_matrix")
+            if isinstance(v, bool):
+                include_matrix = v
+            elif isinstance(v, (int, float)):
+                include_matrix = bool(int(v))
+            elif isinstance(v, str):
+                include_matrix = v.strip().lower() in {"1", "true", "yes", "y", "on"}
+        except Exception:
+            include_matrix = True
 
         raw_sheet = (sheet or "").strip()
         sheet2 = _canonicalize_sheet_name(raw_sheet)
@@ -1575,7 +1716,6 @@ class DataEngineV5:
 
         # STRICTNESS: if schema exists in your project, unknown sheets should NOT collapse to union/default.
         if (not headers or not keys) and self.schema_strict_sheet_rows:
-            # If schema_registry is missing entirely, we cannot be strict.
             if _SCHEMA_AVAILABLE:
                 return {
                     "status": "error",
@@ -1584,7 +1724,7 @@ class DataEngineV5:
                     "headers": [],
                     "keys": [],
                     "rows": [],
-                    "rows_matrix": [],
+                    "rows_matrix": [] if include_matrix else None,
                     "error": f"Unknown sheet or schema missing for '{sheet2}'",
                     "meta": {
                         "schema_source": schema_src,
@@ -1594,35 +1734,142 @@ class DataEngineV5:
                     "version": self.version,
                 }
 
-        # Data_Dictionary is authoritative from schema_registry
+        # -----------------------------
+        # ✅ SPECIAL DISPATCH (explicit)
+        # -----------------------------
         if sheet2 == "Data_Dictionary":
-            # If Data_Dictionary schema missing, fall back to standard 9 columns (still deterministic).
-            if not headers or not keys:
-                headers = ["Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes"]
-                keys = headers[:]
-                schema_src = "fallback:standard_data_dictionary"
+            # Prefer canonical generator if present (aligned with routers)
+            dd_note = None
+            rows: List[Dict[str, Any]] = []
+            try:
+                from core.sheets.data_dictionary import build_data_dictionary_rows as _dd  # type: ignore
 
-            rows = _data_dictionary_rows(headers, keys, limit=limit, offset=offset)
-            return {
+                raw_rows = _dd(include_meta_sheet=True)
+                rows = [_normalize_to_schema_keys(keys, headers, r) for r in _coerce_rows_list(raw_rows)]
+                dd_note = "core.sheets.data_dictionary.build_data_dictionary_rows"
+            except Exception:
+                # Fallback to internal generator (deterministic)
+                if not headers or not keys:
+                    headers = ["Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes"]
+                    keys = headers[:]
+                    schema_src = "fallback:standard_data_dictionary"
+                rows = _data_dictionary_rows(headers, keys, limit=limit, offset=offset)
+                dd_note = "fallback:_data_dictionary_rows"
+
+            # paginate if canonical generator returned all rows
+            if dd_note and dd_note.startswith("core."):
+                rows = rows[offset : offset + limit]
+
+            payload = {
                 "status": "success",
                 "sheet": "Data_Dictionary",
                 "page": "Data_Dictionary",
                 "headers": headers,
                 "keys": keys,
-                "rows": rows,
-                "rows_matrix": _rows_matrix(rows, keys),
+                "rows": [_strict_project_row(keys, r) for r in rows],
+                "rows_matrix": _rows_matrix([_strict_project_row(keys, r) for r in rows], keys) if include_matrix else None,
                 "meta": {
                     "schema_source": schema_src,
-                    "generated": True,
+                    "builder": dd_note,
                     "rows": len(rows),
                     "limit": limit,
                     "offset": offset,
                 },
                 "version": self.version,
             }
+            return payload
 
-        # Delegate to an existing rows builder if available (preserves your current logic),
-        # then FORCE schema projection to prevent mismatched headers.
+        if sheet2 == "Insights_Analysis":
+            out, note = await _call_builder_best_effort(
+                module_names=("core.analysis.insights_builder",),
+                function_names=(
+                    "build_insights_analysis_rows",
+                    "build_insights_rows",
+                    "build_insights_analysis",
+                    "get_insights_rows",
+                    "build_rows",
+                ),
+                sheet=sheet2,
+                limit=limit,
+                offset=offset,
+                mode=mode,
+                body=body,
+                settings=self.settings,
+            )
+            rows0 = _coerce_rows_list(out)
+            rows_norm = [_strict_project_row(keys, _normalize_to_schema_keys(keys, headers, r)) for r in rows0]
+            rows_norm = rows_norm[offset : offset + limit]
+
+            return {
+                "status": "success",
+                "sheet": sheet2,
+                "page": sheet2,
+                "headers": headers,
+                "keys": keys,
+                "rows": rows_norm,
+                "rows_matrix": _rows_matrix(rows_norm, keys) if include_matrix else None,
+                "meta": {
+                    "schema_source": schema_src,
+                    "builder": note or "insights_builder",
+                    "rows": len(rows_norm),
+                    "limit": limit,
+                    "offset": offset,
+                    "mode": mode,
+                },
+                "version": self.version,
+            }
+
+        if sheet2 == "Top_10_Investments":
+            out, note = await _call_builder_best_effort(
+                module_names=(
+                    "core.analysis.top10_builder",
+                    "core.analysis.top_10_builder",
+                    "core.analysis.top_10_investments_builder",
+                    "core.analysis.top10_investments_builder",
+                ),
+                function_names=(
+                    "build_top_10_investments_rows",
+                    "build_top10_investments_rows",
+                    "build_top_10_rows",
+                    "build_top10_rows",
+                    "get_top10_rows",
+                    "build_rows",
+                ),
+                sheet=sheet2,
+                limit=limit,
+                offset=offset,
+                mode=mode,
+                body=body,
+                settings=self.settings,
+            )
+
+            rows0 = _coerce_rows_list(out)
+            if rows0:
+                rows_norm = [_strict_project_row(keys, _normalize_to_schema_keys(keys, headers, r)) for r in rows0]
+                rows_norm = rows_norm[offset : offset + limit]
+                return {
+                    "status": "success",
+                    "sheet": sheet2,
+                    "page": sheet2,
+                    "headers": headers,
+                    "keys": keys,
+                    "rows": rows_norm,
+                    "rows_matrix": _rows_matrix(rows_norm, keys) if include_matrix else None,
+                    "meta": {
+                        "schema_source": schema_src,
+                        "builder": note or "top10_builder",
+                        "rows": len(rows_norm),
+                        "limit": limit,
+                        "offset": offset,
+                        "mode": mode,
+                    },
+                    "version": self.version,
+                }
+            # If builder missing, we fall through to delegated builder below (then schema-only)
+
+        # -----------------------------
+        # Delegate to existing repo builder (if any), then FORCE schema projection
+        # -----------------------------
         delegated_rows: List[Dict[str, Any]] = []
         delegate_note: Optional[str] = None
         try:
@@ -1631,35 +1878,24 @@ class DataEngineV5:
             delegated_rows, delegate_note = [], f"delegate_error:{e!s}"
 
         rows: List[Dict[str, Any]] = []
-
-        if delegated_rows:
-            # Normalize + strict project to schema keys
-            if keys:
-                for r in delegated_rows:
-                    rr = dict(r)
-                    try:
-                        rr = normalize_row_to_schema(sheet2, rr, keep_extras=False)
-                    except Exception:
-                        # if schema_registry missing for this sheet, keep minimal
-                        pass
-                    rows.append(_strict_project_row(keys, rr))
-            else:
-                rows = [dict(r) for r in delegated_rows]
-
+        if delegated_rows and keys:
+            for r in delegated_rows:
+                rr = _normalize_to_schema_keys(keys, headers, dict(r))
+                rows.append(_strict_project_row(keys, rr))
+        elif delegated_rows:
+            rows = [dict(r) for r in delegated_rows]
         else:
-            # No delegated builder output: return schema-correct headers/keys with empty rows.
-            # (This is enough to pass completeness tests and avoids silent 80-col fallback.)
             rows = []
 
-        # Ensure schema-correct headers/keys always returned when schema exists
         out_headers = headers[:] if headers else (keys[:] if keys else [])
         out_keys = keys[:] if keys else (headers[:] if headers else [])
 
-        # If schema missing and not strict, best-effort infer keys from first row
         if not out_keys and rows:
             out_keys = list(rows[0].keys())
         if not out_headers and out_keys:
             out_headers = out_keys[:]
+
+        rows = rows[offset : offset + limit] if rows else rows
 
         return {
             "status": "success" if out_headers else "partial",
@@ -1668,7 +1904,7 @@ class DataEngineV5:
             "headers": out_headers,
             "keys": out_keys,
             "rows": rows,
-            "rows_matrix": _rows_matrix(rows, out_keys) if out_keys else [],
+            "rows_matrix": _rows_matrix(rows, out_keys) if (include_matrix and out_keys) else None,
             "meta": {
                 "schema_source": schema_src,
                 "strict": self.schema_strict_sheet_rows,
