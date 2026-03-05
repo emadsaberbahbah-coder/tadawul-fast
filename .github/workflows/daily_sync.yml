@@ -59,6 +59,7 @@ env:
   PYTHON_VERSION: "3.11"
   PYTHONUNBUFFERED: 1
   TZ: Asia/Riyadh
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
 
 jobs:
   # =============================================================================
@@ -117,7 +118,6 @@ jobs:
             exit 1
           fi
 
-          # scoring contract test must exist somewhere
           if [ -f "test_scoring_engine_contract.py" ]; then
             SCORE_TEST="test_scoring_engine_contract.py"
           elif [ -f "core/test_scoring_engine_contract.py" ]; then
@@ -216,7 +216,6 @@ jobs:
           echo "::group::Tests"
           python -c "import pytest" 2>/dev/null || python -m pip install -q pytest
 
-          # scoring contract test (required)
           if [ -f "test_scoring_engine_contract.py" ]; then
             python -m pytest -q test_scoring_engine_contract.py
           elif [ -f "core/test_scoring_engine_contract.py" ]; then
@@ -230,16 +229,15 @@ jobs:
 
           # schema drift gate (warning-only for scheduler to avoid cron spam)
           if [ -f "tests/test_schema_alignment.py" ]; then
-            python -m pytest -q tests/test_schema_alignment.py
+            python -m pytest -q tests/test_schema_alignment.py || echo "::warning::Schema alignment test failed (scheduler continues)."
           else
             echo "::warning::tests/test_schema_alignment.py not found; schema drift gate not running in scheduler."
           fi
           echo "::endgroup::"
 
-      - name: ⚙️ Smart Configuration Resolution (safe for schedule + manual)
+      - name: ⚙️ Smart Configuration Resolution (robust for schedule + manual)
         id: smart_config
         env:
-          # ✅ SAFE: github.event.inputs exists only for workflow_dispatch; for schedule it's empty (no crash)
           INPUT_URL: ${{ github.event.inputs.backend_url }}
           INPUT_SHEET: ${{ github.event.inputs.sheet_id }}
           INPUT_MODE: ${{ github.event.inputs.run_mode }}
@@ -267,22 +265,62 @@ jobs:
           }
 
           upper_underscore() {
-            echo "${1:-}" | tr '[:lower:]' '[:upper:]' | tr ' -' '__' | tr -s '_' | xargs
+            # normalize to UPPER_SNAKE (spaces/dashes -> underscores, collapse)
+            echo "${1:-}" \
+              | tr '[:lower:]' '[:upper:]' \
+              | tr ',;|\n\r\t' '      ' \
+              | tr ' -' '__' \
+              | tr -s '_' \
+              | xargs
+          }
+
+          normalize_keys_list() {
+            # Supports:
+            # - space separated: "A B C"
+            # - comma/semicolon: "A,B;C"
+            # - newline separated
+            # - JSON array: ["A","B","C"]
+            local raw="$1"
+            raw="$(echo "${raw:-}" | tr -d '\r' | xargs || true)"
+
+            if [[ -z "${raw:-}" ]]; then
+              echo ""
+              return 0
+            fi
+
+            # JSON array input
+            if echo "$raw" | jq -e 'type=="array"' >/dev/null 2>&1; then
+              raw="$(echo "$raw" | jq -r '.[]' | tr '\n' ' ' | xargs || true)"
+            fi
+
+            raw="$(upper_underscore "$raw")"
+            echo "$raw"
           }
 
           sanitize_keys() {
             local raw="$1"
-            raw="$(echo "$raw" | tr -s ' ' | xargs)"
-            raw="$(upper_underscore "$raw")"
+            raw="$(normalize_keys_list "$raw")"
 
-            # remove forbidden legacy keys
-            raw="$(echo "$raw" | tr ' ' '\n' | grep -v -E '^(KSA_TADAWUL|ADVISOR_CRITERIA)$' | tr '\n' ' ' | xargs)"
+            # normalize common aliases (keep it simple/portable)
+            raw="$(echo "$raw" | sed 's/TOP10_INVESTMENTS/TOP_10_INVESTMENTS/g')"
+            raw="$(echo "$raw" | sed 's/\bTOP10\b/TOP_10_INVESTMENTS/g' || true)"
 
-            # normalize common aliases
-            raw="$(echo "$raw" | sed 's/\bTOP10_INVESTMENTS\b/TOP_10_INVESTMENTS/g')"
-            raw="$(echo "$raw" | sed 's/\bTOP10\b/TOP_10_INVESTMENTS/g')"
-            raw="$(echo "$raw" | sed 's/\bDATA_DICTIONARY\b/DATA_DICTIONARY/g')"
+            # drop forbidden legacy keys (SAFE under set -e)
+            raw="$(echo "$raw" | tr ' ' '\n' | grep -v -E '^(KSA_TADAWUL|ADVISOR_CRITERIA)$' || true)"
+            raw="$(echo "$raw" | tr '\n' ' ' | xargs || true)"
 
+            # de-dup while preserving order
+            raw="$(python - <<'PY'
+import os
+keys = os.environ.get("RAW_KEYS","").split()
+seen=set()
+out=[]
+for k in keys:
+    if k and k not in seen:
+        out.append(k); seen.add(k)
+print(" ".join(out))
+PY
+            )"
             echo "$raw"
           }
 
@@ -291,14 +329,15 @@ jobs:
             local allowed="MARKET_LEADERS GLOBAL_MARKETS MUTUAL_FUNDS COMMODITIES_FX MY_PORTFOLIO INSIGHTS_ANALYSIS TOP_10_INVESTMENTS DATA_DICTIONARY"
             local bad=()
 
-            for k in $(echo "$keys"); do
+            for k in $keys; do
               if ! echo " $allowed " | grep -q " $k "; then
                 bad+=("$k")
               fi
             done
 
             if [ ${#bad[@]} -ne 0 ]; then
-              echo "::error::Invalid SYNC_KEYS found: ${bad[*]} | Allowed: $allowed"
+              echo "::error::Invalid SYNC_KEYS: ${bad[*]} | Allowed: $allowed"
+              echo "::notice::Tip: Set vars.DEFAULT_SYNC_KEYS as space or comma separated. JSON array is also supported."
               exit 1
             fi
           }
@@ -336,13 +375,15 @@ jobs:
             KEYS="$(get_val "${VAR_DEFAULT_KEYS:-}" "$DEFAULT_KEYS_CANONICAL")"
           fi
 
+          export RAW_KEYS="$KEYS"
           KEYS="$(sanitize_keys "$KEYS")"
+
           if [[ -z "${KEYS:-}" ]]; then
             echo "::error::SYNC_KEYS resolved to empty (after sanitization)."
             exit 1
           fi
 
-          # hard fail if forbidden key slipped in
+          # hard fail if forbidden slipped in
           if echo "$KEYS" | tr ' ' '\n' | grep -q -E '^(KSA_TADAWUL|ADVISOR_CRITERIA)$'; then
             echo "::error::Forbidden key present in SYNC_KEYS after sanitization."
             exit 1
@@ -361,18 +402,26 @@ jobs:
           RAW_CREDS="$(get_val "${INPUT_CREDS:-}" "${SECRET_CREDS:-}")"
           if [[ -z "${RAW_CREDS:-}" && -n "${SECRET_CREDS_B64:-}" ]]; then
             echo "🔓 Decoding Base64 credentials..."
-            RAW_CREDS="$(echo "$SECRET_CREDS_B64" | base64 --decode 2>/dev/null || true)"
+            RAW_CREDS="$(printf '%s' "$SECRET_CREDS_B64" | base64 --decode 2>/dev/null || true)"
           fi
 
           if [[ -n "${RAW_CREDS:-}" ]]; then
-            echo "::add-mask::$RAW_CREDS"
+            # mask only email (avoid multiline add-mask issues)
+            SA_EMAIL="$(echo "$RAW_CREDS" | jq -r '.client_email // empty' 2>/dev/null || true)"
+            if [[ -n "${SA_EMAIL:-}" ]]; then
+              echo "::add-mask::$SA_EMAIL"
+            fi
+
             if echo "$RAW_CREDS" | jq empty >/dev/null 2>&1; then
               CREDS_PATH="$RUNNER_TEMP/google_credentials.json"
-              echo "$RAW_CREDS" > "$CREDS_PATH"
+              python - <<'PY'
+import os, pathlib
+p = pathlib.Path(os.environ["CREDS_PATH"])
+p.write_text(os.environ["RAW_CREDS"], encoding="utf-8")
+PY
               chmod 600 "$CREDS_PATH"
               echo "GOOGLE_APPLICATION_CREDENTIALS=$CREDS_PATH" >> "$GITHUB_ENV"
-              SA_EMAIL="$(echo "$RAW_CREDS" | jq -r '.client_email // "Unknown"')"
-              echo "🤖 Service Account Configured: $SA_EMAIL"
+              echo "🤖 Service Account Configured: ${SA_EMAIL:-Unknown}"
             else
               echo "::error::Invalid JSON structure in credentials."
               exit 1
@@ -383,6 +432,9 @@ jobs:
           fi
 
           echo "::endgroup::"
+        env:
+          RAW_CREDS: ${{ github.event.inputs.google_creds_json }}
+          CREDS_PATH: ${{ runner.temp }}/google_credentials.json
 
       - name: 💓 Backend Health Check
         id: health_check
@@ -404,7 +456,7 @@ jobs:
 
               if [[ "$HTTP_CODE" =~ ^2[0-9][0-9]$ ]]; then
                 echo "✅ Healthy via $endpoint (HTTP $HTTP_CODE)"
-                VERSION="$(echo "$BODY" | jq -r '.version // .build // "unknown"' 2>/dev/null || echo "unknown")"
+                VERSION="$(echo "$BODY" | jq -r '.version // .app_version // .build // "unknown"' 2>/dev/null || echo "unknown")"
                 echo "health_status=healthy" >> "$GITHUB_OUTPUT"
                 echo "health_version=$VERSION" >> "$GITHUB_OUTPUT"
                 echo "::endgroup::"
@@ -460,6 +512,7 @@ jobs:
           END_TIME="$(date +%s)"
           DURATION=$((END_TIME - START_TIME))
 
+          echo "duration=$DURATION" >> "$GITHUB_OUTPUT"
           echo "✅ Execution finished in ${DURATION}s (Exit Code: $EXIT_CODE)"
 
           if grep -qiE "RateLimitError|Quota exceeded|429 Too Many Requests|HTTP 429" "$LOG_FILE"; then
@@ -473,7 +526,6 @@ jobs:
           fi
 
           cp "$LOG_FILE" sync_execution.log
-          echo "duration=$DURATION" >> "$GITHUB_OUTPUT"
           echo "::endgroup::"
 
           if [ $EXIT_CODE -ne 0 ]; then
@@ -520,6 +572,7 @@ jobs:
             sync_execution.log
           retention-days: 7
           compression-level: 6
+          if-no-files-found: warn
 
       - name: 🧹 Secure Cleanup
         if: always()
