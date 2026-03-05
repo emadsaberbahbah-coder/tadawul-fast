@@ -1,12 +1,12 @@
 name: 🏦 Tadawul Dashboard Advanced Sync
 
 on:
-  # ✅ CI quality gate (blocks PR merges when configured as required check)
+  # ✅ CI quality gate
   pull_request:
   push:
     branches: [main, master]
 
-  # ✅ Production scheduler
+  # ✅ Production scheduler (UTC; Riyadh UTC+3)
   schedule:
     - cron: "0,15,30,45 * * * *"
 
@@ -60,9 +60,6 @@ env:
   PYTHONUNBUFFERED: 1
   TZ: Asia/Riyadh
 
-# =============================================================================
-# JOBS
-# =============================================================================
 jobs:
   # =============================================================================
   # ✅ CI TESTS — runs on push/PR (merge blocker)
@@ -70,7 +67,7 @@ jobs:
   ci-tests:
     name: 🧪 CI Tests (Schema Alignment + Contracts)
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    if: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
     timeout-minutes: 15
 
     steps:
@@ -90,7 +87,7 @@ jobs:
             requirements.txt
             requirements.ml.txt
 
-      - name: 📦 Install Dependencies (tests)
+      - name: 📦 Install Dependencies (CI tests)
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
@@ -101,6 +98,9 @@ jobs:
             python -m pip install -r requirements.render.txt
           elif [ -f "requirements.txt" ]; then
             python -m pip install -r requirements.txt
+          else
+            echo "::error::No requirements file found (requirements.render.txt or requirements.txt)."
+            exit 1
           fi
 
           python -m pip install -q pytest
@@ -138,9 +138,10 @@ jobs:
   preflight-validation:
     name: 🛡️ Pre-flight Validation
     runs-on: ubuntu-latest
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     outputs:
       validated: ${{ steps.validate.outputs.validated }}
+
     steps:
       - name: ✅ Validate Runner Environment
         id: validate
@@ -172,7 +173,7 @@ jobs:
     environment: production
     timeout-minutes: 25
     needs: preflight-validation
-    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.preflight-validation.outputs.validated == 'true'
+    if: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.preflight-validation.outputs.validated == 'true' }}
 
     steps:
       - name: 📥 Secure Checkout
@@ -191,37 +192,20 @@ jobs:
             requirements.txt
             requirements.ml.txt
 
-      - name: 📦 Install & Verify Dependencies (NO hashes)
+      - name: 📦 Install Dependencies
         run: |
           set -euo pipefail
           echo "::group::Pip Install Log"
           python -m pip install --upgrade pip setuptools wheel
 
           if [ -f "requirements.render.txt" ]; then
-            echo "✅ Installing from requirements.render.txt (Render-safe minimal)"
             python -m pip install -r requirements.render.txt
           elif [ -f "requirements.txt" ]; then
-            echo "✅ Installing from requirements.txt"
             python -m pip install -r requirements.txt
           else
-            echo "::warning::No requirements file found, skipping dependency installation."
+            echo "::error::No requirements file found (requirements.render.txt or requirements.txt)."
+            exit 1
           fi
-          echo "::endgroup::"
-
-          echo "::group::Package Verification"
-          python - << 'PY'
-          critical = ['pandas', 'numpy', 'gspread', 'requests', 'httpx']
-          missing = []
-          for pkg in critical:
-              try:
-                  __import__(pkg)
-              except Exception:
-                  missing.append(pkg)
-          if missing:
-              print(f'⚠️ Warning: Missing expected packages: {missing}')
-          else:
-              print('✅ Critical packages loaded successfully')
-          PY
           echo "::endgroup::"
 
       - name: 🧪 Run Contract + Schema Alignment Tests (sync guard)
@@ -244,7 +228,7 @@ jobs:
             exit 1
           fi
 
-          # schema drift gate (recommended; warning only for scheduler)
+          # schema drift gate (warning-only for scheduler to avoid cron spam)
           if [ -f "tests/test_schema_alignment.py" ]; then
             python -m pytest -q tests/test_schema_alignment.py
           else
@@ -252,15 +236,16 @@ jobs:
           fi
           echo "::endgroup::"
 
-      - name: ⚙️ Smart Configuration Resolution
+      - name: ⚙️ Smart Configuration Resolution (safe for schedule + manual)
         id: smart_config
         env:
-          INPUT_URL: ${{ inputs.backend_url }}
-          INPUT_SHEET: ${{ inputs.sheet_id }}
-          INPUT_MODE: ${{ inputs.run_mode }}
-          INPUT_KEY: ${{ inputs.single_key }}
-          INPUT_DEBUG: ${{ inputs.enable_debug }}
-          INPUT_CREDS: ${{ inputs.google_creds_json }}
+          # ✅ SAFE: github.event.inputs exists only for workflow_dispatch; for schedule it's empty (no crash)
+          INPUT_URL: ${{ github.event.inputs.backend_url }}
+          INPUT_SHEET: ${{ github.event.inputs.sheet_id }}
+          INPUT_MODE: ${{ github.event.inputs.run_mode }}
+          INPUT_KEY: ${{ github.event.inputs.single_key }}
+          INPUT_DEBUG: ${{ github.event.inputs.enable_debug }}
+          INPUT_CREDS: ${{ github.event.inputs.google_creds_json }}
 
           VAR_URL: ${{ vars.BACKEND_BASE_URL }}
           VAR_SHEET: ${{ vars.DEFAULT_SPREADSHEET_ID }}
@@ -281,19 +266,41 @@ jobs:
             return 0
           }
 
+          upper_underscore() {
+            echo "${1:-}" | tr '[:lower:]' '[:upper:]' | tr ' -' '__' | tr -s '_' | xargs
+          }
+
           sanitize_keys() {
-            # normalize spaces + remove forbidden keys + normalize known aliases
             local raw="$1"
             raw="$(echo "$raw" | tr -s ' ' | xargs)"
+            raw="$(upper_underscore "$raw")"
 
             # remove forbidden legacy keys
             raw="$(echo "$raw" | tr ' ' '\n' | grep -v -E '^(KSA_TADAWUL|ADVISOR_CRITERIA)$' | tr '\n' ' ' | xargs)"
 
             # normalize common aliases
             raw="$(echo "$raw" | sed 's/\bTOP10_INVESTMENTS\b/TOP_10_INVESTMENTS/g')"
-            raw="$(echo "$raw" | sed 's/\bDATA-DICTIONARY\b/DATA_DICTIONARY/g')"
+            raw="$(echo "$raw" | sed 's/\bTOP10\b/TOP_10_INVESTMENTS/g')"
+            raw="$(echo "$raw" | sed 's/\bDATA_DICTIONARY\b/DATA_DICTIONARY/g')"
 
             echo "$raw"
+          }
+
+          validate_keys_allowed() {
+            local keys="$1"
+            local allowed="MARKET_LEADERS GLOBAL_MARKETS MUTUAL_FUNDS COMMODITIES_FX MY_PORTFOLIO INSIGHTS_ANALYSIS TOP_10_INVESTMENTS DATA_DICTIONARY"
+            local bad=()
+
+            for k in $(echo "$keys"); do
+              if ! echo " $allowed " | grep -q " $k "; then
+                bad+=("$k")
+              fi
+            done
+
+            if [ ${#bad[@]} -ne 0 ]; then
+              echo "::error::Invalid SYNC_KEYS found: ${bad[*]} | Allowed: $allowed"
+              exit 1
+            fi
           }
 
           echo "::group::🔧 Configuration Resolution"
@@ -309,23 +316,22 @@ jobs:
           echo "✅ Backend URL: $URL"
 
           # 2) Sheet ID
-          SHEET="$(get_val "${INPUT_SHEET:-}" "${VAR_SHEET:-}" "19oloY3fehdFnSRMysqd-EZ2l7FL-GRAd8GJhYUt8tmw")"
+          SHEET="$(get_val "${INPUT_SHEET:-}" "${VAR_SHEET:-}")"
           if [[ -z "${SHEET:-}" ]]; then
-            echo "::error::Spreadsheet ID is empty."
+            echo "::error::Spreadsheet ID is empty. Set vars.DEFAULT_SPREADSHEET_ID or pass workflow input sheet_id."
             exit 1
           fi
           echo "TARGET_SHEET_ID=$SHEET" >> "$GITHUB_ENV"
           echo "✅ Sheet ID: $SHEET"
 
-          # 3) Mode & Keys (✅ NO KSA_TADAWUL)
-          MODE="${INPUT_MODE:-full_sync}"
+          # 3) Mode & Keys
+          MODE="$(get_val "${INPUT_MODE:-}" "full_sync")"
           echo "RUN_MODE=$MODE" >> "$GITHUB_ENV"
 
           if [[ "$MODE" == "single_key" ]]; then
-            KEY="${INPUT_KEY:-MARKET_LEADERS}"
+            KEY="$(get_val "${INPUT_KEY:-}" "MARKET_LEADERS")"
             KEYS="$KEY"
           else
-            # Canonical sync keys (uppercase SYNC_KEYS that your sync runner maps)
             DEFAULT_KEYS_CANONICAL="MARKET_LEADERS GLOBAL_MARKETS MUTUAL_FUNDS COMMODITIES_FX MY_PORTFOLIO INSIGHTS_ANALYSIS TOP_10_INVESTMENTS DATA_DICTIONARY"
             KEYS="$(get_val "${VAR_DEFAULT_KEYS:-}" "$DEFAULT_KEYS_CANONICAL")"
           fi
@@ -342,11 +348,13 @@ jobs:
             exit 1
           fi
 
+          validate_keys_allowed "$KEYS"
+
           echo "SYNC_KEYS=$KEYS" >> "$GITHUB_ENV"
           echo "📋 Mode: $MODE | Keys: $KEYS"
 
           # 4) Debug
-          DEBUG="${INPUT_DEBUG:-false}"
+          DEBUG="$(get_val "${INPUT_DEBUG:-}" "false")"
           echo "ENABLE_DEBUG=$DEBUG" >> "$GITHUB_ENV"
 
           # 5) Credentials
@@ -358,13 +366,11 @@ jobs:
 
           if [[ -n "${RAW_CREDS:-}" ]]; then
             echo "::add-mask::$RAW_CREDS"
-
             if echo "$RAW_CREDS" | jq empty >/dev/null 2>&1; then
               CREDS_PATH="$RUNNER_TEMP/google_credentials.json"
               echo "$RAW_CREDS" > "$CREDS_PATH"
               chmod 600 "$CREDS_PATH"
               echo "GOOGLE_APPLICATION_CREDENTIALS=$CREDS_PATH" >> "$GITHUB_ENV"
-
               SA_EMAIL="$(echo "$RAW_CREDS" | jq -r '.client_email // "Unknown"')"
               echo "🤖 Service Account Configured: $SA_EMAIL"
             else
@@ -378,7 +384,7 @@ jobs:
 
           echo "::endgroup::"
 
-      - name: 💓 Intelligent Health Check
+      - name: 💓 Backend Health Check
         id: health_check
         run: |
           set -euo pipefail
@@ -389,7 +395,6 @@ jobs:
 
           for endpoint in "${HEALTH_ENDPOINTS[@]}"; do
             echo "▶️ Probing $TARGET_URL$endpoint..."
-
             for attempt in $(seq 1 "$MAX_RETRIES"); do
               BACKOFF=$(( 2 ** attempt ))
 
@@ -476,7 +481,7 @@ jobs:
             exit $EXIT_CODE
           fi
 
-      - name: 📝 Generate Comprehensive Summary
+      - name: 📝 Generate Summary
         if: always()
         run: |
           set -euo pipefail
@@ -491,25 +496,21 @@ jobs:
           | :--- | :--- |
           | **Status** | $STATUS_ICON |
           | **Trigger** | \`${{ github.event_name }}\` |
-          | **Time (Local)** | \`$RIYADH_TIME\` |
+          | **Time (Riyadh)** | \`$RIYADH_TIME\` |
           | **Run Mode** | \`${{ env.RUN_MODE }}\` |
           | **Duration** | \`${{ steps.execute_sync.outputs.duration || '0' }} seconds\` |
 
-          ## 🎯 Target Information
+          ## 🎯 Target
           * **Sheet ID:** \`${{ env.TARGET_SHEET_ID }}\`
-          * **Backend:** \`${{ env.TARGET_URL }}\` *(Status: ${{ steps.health_check.outputs.health_status || 'Unknown' }})*
+          * **Backend:** \`${{ env.TARGET_URL }}\` *(Health: ${{ steps.health_check.outputs.health_status || 'Unknown' }})*
 
-          ## 🔑 Synced Keys
+          ## 🔑 SYNC_KEYS
           \`\`\`text
           ${{ env.SYNC_KEYS }}
           \`\`\`
           EOF
 
-          if [[ "${{ steps.execute_sync.outputs.rate_limited }}" == "true" ]]; then
-            echo -e "\n> ⚠️ **Notice:** Rate limiting was detected in the logs. Consider spacing out cron jobs." >> "$GITHUB_STEP_SUMMARY"
-          fi
-
-      - name: 📤 Upload Execution Artifacts
+      - name: 📤 Upload Logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -519,27 +520,6 @@ jobs:
             sync_execution.log
           retention-days: 7
           compression-level: 6
-
-      - name: 🔔 Webhook Failure Notification
-        if: failure() && github.event_name == 'schedule'
-        env:
-          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
-        run: |
-          set -euo pipefail
-          if [[ -z "${WEBHOOK_URL:-}" ]]; then
-            echo "::notice::No WEBHOOK_URL secret defined. Skipping failure notification."
-            exit 0
-          fi
-
-          echo "::group::📧 Sending Alert"
-          PAYLOAD="$(jq -n \
-            --arg title "❌ Tadawul Sync Failed" \
-            --arg run "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            --arg mode "${{ env.RUN_MODE }}" \
-            '{text: ($title + "\n\n*Run:* " + $run + "\n*Mode:* " + $mode)}')"
-
-          curl -s -X POST -H 'Content-type: application/json' --data "$PAYLOAD" "$WEBHOOK_URL" || true
-          echo "::endgroup::"
 
       - name: 🧹 Secure Cleanup
         if: always()
