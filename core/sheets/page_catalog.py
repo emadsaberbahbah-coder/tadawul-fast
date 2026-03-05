@@ -2,28 +2,16 @@
 # core/sheets/page_catalog.py
 """
 ================================================================================
-Page Catalog — v2.1.0 (CANONICAL PAGES + STRONG NORMALIZATION + NO 80-FALLBACK)
+Page Catalog — v2.2.1 (SCHEMA-DRIVEN + MAX-TOLERANCE NORMALIZATION)
 ================================================================================
-Tadawul Fast Bridge (TFB)
-
-Purpose:
-- Define the ONLY valid sheet/page names the backend will accept.
-- Provide robust alias normalization (case/space/dash/slash/dots) so the request
-  never "misses" and falls into a default-schema path.
-- Explicitly forbid legacy/removed pages like KSA_Tadawul and Advisor_Criteria.
-- Define which pages can feed Top_10_Investments selection.
-
-Key fix for your issue:
-- "Top_10_Investments", "Insights_Analysis", "Data_Dictionary" MUST ALWAYS
-  normalize correctly even if written as:
-    "Top 10 Investments", "top10", "Top10_Investments", "TOP_10_INVESTMENTS",
-    "Insights Analysis", "Insights-Analysis", "data dictionary", etc.
-- We also expose helper aliases `resolve_page()` and `canonicalize_page()` because
-  several routers/services try different function names.
+Priority 3 alignment:
+- normalize names/aliases so “Top 10 Investments” ALWAYS maps to Top_10_Investments
+- prevent routing mismatches that cause fallback to the default/80-col builder
 
 Hard rules:
 - No network calls. Import-safe.
 - Unknown page raises ValueError with allowed pages.
+- Canonical pages derived from schema_registry (single source of truth).
 ================================================================================
 """
 
@@ -31,9 +19,21 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 
-from core.sheets.schema_registry import SCHEMA_REGISTRY
+# ---------------------------------------------------------------------------
+# Schema Registry (authoritative)
+# ---------------------------------------------------------------------------
+try:
+    from core.sheets.schema_registry import (  # type: ignore
+        SCHEMA_REGISTRY,
+        CANONICAL_SHEETS,
+        list_sheets,
+        get_sheet_spec,
+    )
+except Exception as e:  # pragma: no cover
+    raise ImportError(f"page_catalog failed to import schema_registry: {e!r}") from e
+
 
 __all__ = [
     "PAGE_CATALOG_VERSION",
@@ -42,6 +42,8 @@ __all__ = [
     "FORBIDDEN_PAGES",
     "ALIAS_TO_CANONICAL",
     "TOP10_FEED_PAGES_DEFAULT",
+    "OUTPUT_PAGES",
+    "SPECIAL_PAGES",
     "is_canonical_page",
     "is_forbidden_page",
     "normalize_page_name",
@@ -49,18 +51,32 @@ __all__ = [
     "canonicalize_page",
     "allowed_pages",
     "get_top10_feed_pages",
+    "page_info",
     "validate_page_catalog",
 ]
 
-PAGE_CATALOG_VERSION = "2.1.0"
+PAGE_CATALOG_VERSION = "2.2.1"
 
 
 @dataclass(frozen=True)
 class PageInfo:
     canonical: str
     description: str = ""
-    is_data_page: bool = True          # row-per-instrument pages
-    eligible_for_top10: bool = False   # included in Top 10 selection universe
+    is_data_page: bool = True
+    eligible_for_top10: bool = False
+    kind: str = ""  # mirrors schema_registry SheetSpec.kind (if available)
+
+
+# -----------------------------
+# Forbidden / Removed pages
+# -----------------------------
+FORBIDDEN_PAGES: Set[str] = {"KSA_Tadawul", "Advisor_Criteria"}
+
+# Output/meta pages: readable, but not valid as *input universes* for some operations
+OUTPUT_PAGES: Set[str] = {"Top_10_Investments", "Data_Dictionary"}
+
+# Special pages that must never hit instrument builder fallback
+SPECIAL_PAGES: Set[str] = {"Insights_Analysis", "Top_10_Investments", "Data_Dictionary"}
 
 
 # -----------------------------
@@ -68,65 +84,58 @@ class PageInfo:
 # -----------------------------
 _CANONICAL_FROM_SCHEMA: Set[str] = set(SCHEMA_REGISTRY.keys())
 
-# Explicitly forbid any legacy or removed pages (even if user passes them).
-FORBIDDEN_PAGES: Set[str] = {"KSA_Tadawul", "Advisor_Criteria"}  # Advisor_Criteria moved into Insights_Analysis
+def _canonical_pages_from_schema() -> List[str]:
+    try:
+        if CANONICAL_SHEETS and all(s in _CANONICAL_FROM_SCHEMA for s in CANONICAL_SHEETS):
+            return list(CANONICAL_SHEETS)
+    except Exception:
+        pass
+    try:
+        ss = list_sheets()
+        if ss:
+            return [s for s in ss if s in _CANONICAL_FROM_SCHEMA]
+    except Exception:
+        pass
+    return sorted(_CANONICAL_FROM_SCHEMA)
+
+CANONICAL_PAGES: List[str] = _canonical_pages_from_schema()
 
 
-# Define PageInfo (meaning / eligibility)
-PAGE_INFO: Dict[str, PageInfo] = {
-    "Market_Leaders": PageInfo(
-        canonical="Market_Leaders",
-        description="Primary leaders/watchlist universe.",
-        is_data_page=True,
-        eligible_for_top10=True,
-    ),
-    "Global_Markets": PageInfo(
-        canonical="Global_Markets",
-        description="Global indices/shares universe.",
-        is_data_page=True,
-        eligible_for_top10=True,
-    ),
-    "Commodities_FX": PageInfo(
-        canonical="Commodities_FX",
-        description="Commodities and FX tickers.",
-        is_data_page=True,
-        eligible_for_top10=True,
-    ),
-    "Mutual_Funds": PageInfo(
-        canonical="Mutual_Funds",
-        description="Mutual funds / ETFs universe.",
-        is_data_page=True,
-        eligible_for_top10=True,
-    ),
-    "My_Portfolio": PageInfo(
-        canonical="My_Portfolio",
-        description="User portfolio positions.",
-        is_data_page=True,
-        eligible_for_top10=True,
-    ),
-    "Insights_Analysis": PageInfo(
-        canonical="Insights_Analysis",
-        description="Criteria fields + insights table (not an instrument table).",
-        is_data_page=False,
-        eligible_for_top10=False,
-    ),
-    "Top_10_Investments": PageInfo(
-        canonical="Top_10_Investments",
-        description="Output sheet populated by Top10 selector.",
-        is_data_page=False,
-        eligible_for_top10=False,
-    ),
-    "Data_Dictionary": PageInfo(
-        canonical="Data_Dictionary",
-        description="Auto-built from schema_registry; documentation sheet.",
-        is_data_page=False,
-        eligible_for_top10=False,
-    ),
+# -----------------------------
+# PageInfo (derived from schema_registry to stop drift)
+# -----------------------------
+_DESC_OVERRIDES: Dict[str, str] = {
+    "Market_Leaders": "Primary leaders/watchlist universe.",
+    "Global_Markets": "Global indices/shares universe.",
+    "Commodities_FX": "Commodities and FX tickers.",
+    "Mutual_Funds": "Mutual funds / ETFs universe.",
+    "My_Portfolio": "User portfolio positions.",
+    "Insights_Analysis": "Criteria fields + insights table (not an instrument table).",
+    "Top_10_Investments": "Output sheet populated by Top10 selector.",
+    "Data_Dictionary": "Auto-built from schema_registry; documentation sheet.",
 }
 
-# Stable UX order:
-# Prefer schema ordering if any upstream uses it; else sorted.
-CANONICAL_PAGES: List[str] = sorted(PAGE_INFO.keys())
+def _derive_page_info(canonical: str) -> PageInfo:
+    try:
+        spec = get_sheet_spec(canonical)
+        kind = str(getattr(spec, "kind", "") or "")
+    except Exception:
+        kind = ""
+    is_data = (kind == "instrument_table")
+    eligible = bool(is_data and canonical not in OUTPUT_PAGES)
+    return PageInfo(
+        canonical=canonical,
+        description=_DESC_OVERRIDES.get(canonical, ""),
+        is_data_page=is_data,
+        eligible_for_top10=eligible,
+        kind=kind,
+    )
+
+PAGE_INFO: Dict[str, PageInfo] = {c: _derive_page_info(c) for c in CANONICAL_PAGES}
+
+def page_info(page: str) -> PageInfo:
+    p = normalize_page_name(page, allow_output_pages=True)
+    return PAGE_INFO[p]
 
 
 # -----------------------------
@@ -136,22 +145,18 @@ _SEP_RE = re.compile(r"[\s\-/\\\.\|]+", re.UNICODE)
 _NON_ALNUM_RE = re.compile(r"[^a-z0-9_]+", re.UNICODE)
 
 def _normalize_token(s: str) -> str:
-    """
-    Normalize user input for alias matching.
-
-    Goals:
-    - Accept "Top 10", "Top-10", "top10", "TOP10", "Top_10", "Top.10"
-    - Accept "Insights Analysis", "Insights-Analysis", "insights_analysis"
-    - Accept "Data Dictionary", "data-dictionary", "data_dictionary"
-    """
     s = (s or "").strip()
     if not s:
         return ""
     s = s.casefold()
-    s = _SEP_RE.sub("_", s)              # unify separators to underscore
-    s = _NON_ALNUM_RE.sub("", s)         # drop any remaining symbols
-    s = re.sub(r"_+", "_", s)            # collapse repeated underscores
-    s = s.strip("_")
+    s = _SEP_RE.sub("_", s)
+    s = _NON_ALNUM_RE.sub("", s)
+    s = re.sub(r"_+", "_", s).strip("_")
+
+    # common normalization patterns
+    s = s.replace("topten", "top10")   # TopTen -> Top10
+    s = s.replace("top_10", "top10")   # unify token style
+    s = s.replace("top10_", "top10")   # collapse weird separators
     return s
 
 
@@ -166,19 +171,18 @@ ALIAS_TO_CANONICAL: Dict[str, str] = {}
 
 def _add_alias(alias: str, canonical: str) -> None:
     tok = _normalize_token(alias)
-    if not tok:
-        return
-    ALIAS_TO_CANONICAL[tok] = canonical
+    if tok:
+        ALIAS_TO_CANONICAL[tok] = canonical
 
-
-# Build tokens for canonicals themselves (so exact canonical always matches, any case)
-for c in PAGE_INFO.keys():
+# Canonical tokens for themselves
+for c in CANONICAL_PAGES:
     _add_alias(c, c)
     _add_alias(c.lower(), c)
     _add_alias(c.replace("_", " "), c)
     _add_alias(c.replace("_", "-"), c)
+    _add_alias(c.replace("_", "/"), c)
 
-# Human-friendly / short forms
+# Friendly / short forms
 _add_alias("Market Leaders", "Market_Leaders")
 _add_alias("Leaders", "Market_Leaders")
 _add_alias("Market", "Market_Leaders")
@@ -190,6 +194,7 @@ _add_alias("Commodities & FX", "Commodities_FX")
 _add_alias("Commodities and FX", "Commodities_FX")
 _add_alias("Commodities", "Commodities_FX")
 _add_alias("FX", "Commodities_FX")
+_add_alias("Forex", "Commodities_FX")
 
 _add_alias("Mutual Funds", "Mutual_Funds")
 _add_alias("Funds", "Mutual_Funds")
@@ -198,26 +203,38 @@ _add_alias("ETFs", "Mutual_Funds")
 
 _add_alias("My Portfolio", "My_Portfolio")
 _add_alias("Portfolio", "My_Portfolio")
+_add_alias("Holdings", "My_Portfolio")
 
 _add_alias("Insights", "Insights_Analysis")
 _add_alias("Insights Analysis", "Insights_Analysis")
 _add_alias("Insights-Analysis", "Insights_Analysis")
+_add_alias("Analysis", "Insights_Analysis")
 
-# Top10: make this *very* tolerant
-_add_alias("Top 10", "Top_10_Investments")
-_add_alias("Top10", "Top_10_Investments")
-_add_alias("Top 10 Investments", "Top_10_Investments")
-_add_alias("Top10 Investments", "Top_10_Investments")
-_add_alias("Top_10", "Top_10_Investments")
-_add_alias("Top10_Investments", "Top_10_Investments")
-_add_alias("Top_10_Investment", "Top_10_Investments")  # common typo
-_add_alias("Top10Investment", "Top_10_Investments")    # common typo
+# Top10: maximum tolerance + common typos
+for a in (
+    "Top 10",
+    "Top10",
+    "Top Ten",
+    "Top 10 Investments",
+    "Top10 Investments",
+    "Top Ten Investments",
+    "Top_10",
+    "Top10_Investments",
+    "Top_10_Investment",
+    "Top10Investment",
+    "Top10Investments",
+    "Top 10 Investements",   # common misspelling
+    "Top10 Investements",
+    "Top 10 Investmant",     # common typo
+    "Top10 Investmant",
+):
+    _add_alias(a, "Top_10_Investments")
 
-_add_alias("Data Dictionary", "Data_Dictionary")
-_add_alias("Dictionary", "Data_Dictionary")
-_add_alias("Data-Dictionary", "Data_Dictionary")
+# Data Dictionary tolerance
+for a in ("Data Dictionary", "Dictionary", "Data-Dictionary", "DataDict", "Data Dic"):
+    _add_alias(a, "Data_Dictionary")
 
-# Forbidden aliases (normalize to these tokens)
+# Forbidden aliases
 FORBIDDEN_ALIASES: Set[str] = {_normalize_token("KSA_Tadawul"), _normalize_token("Advisor_Criteria")}
 
 
@@ -245,35 +262,31 @@ def is_canonical_page(page: str) -> bool:
 
 
 def is_forbidden_page(page: str) -> bool:
-    if page in FORBIDDEN_PAGES:
+    raw = (page or "").strip()
+    if not raw:
+        return False
+    if raw in FORBIDDEN_PAGES:
         return True
-    tok = _normalize_token(page)
-    return tok in FORBIDDEN_ALIASES
+    return _normalize_token(raw) in FORBIDDEN_ALIASES
 
 
 def normalize_page_name(page: str, *, allow_output_pages: bool = True) -> str:
-    """
-    Convert any alias into a canonical page name.
-
-    - Raises ValueError if page is forbidden or unknown.
-    - If allow_output_pages=False, forbids Top_10_Investments / Data_Dictionary as inputs.
-    """
     raw = (page or "").strip()
     if not raw:
         raise ValueError("Page name is empty. Provide a valid page name.")
 
     if is_forbidden_page(raw):
         raise ValueError(
-            f"Page '{page}' is forbidden/removed. "
-            f"Allowed pages: {', '.join(CANONICAL_PAGES)}"
+            f"Page '{page}' is forbidden/removed. Allowed pages: {', '.join(CANONICAL_PAGES)}"
         )
 
     tok = _normalize_token(raw)
 
     canonical = ALIAS_TO_CANONICAL.get(tok)
+
+    # Extra safety: if token equals a canonical token (even if alias map missed)
     if not canonical:
-        # Extra safety: if token equals a canonical token (even if ALIAS map missed)
-        for c in PAGE_INFO.keys():
+        for c in CANONICAL_PAGES:
             if tok == _canonical_token_for_page(c):
                 canonical = c
                 break
@@ -287,13 +300,12 @@ def normalize_page_name(page: str, *, allow_output_pages: bool = True) -> str:
             f"Allowed pages: {', '.join(CANONICAL_PAGES)}"
         )
 
-    if not allow_output_pages and canonical in {"Top_10_Investments", "Data_Dictionary"}:
+    if not allow_output_pages and canonical in OUTPUT_PAGES:
         raise ValueError(f"Page '{canonical}' is an output/meta sheet and not allowed for this operation.")
 
     return canonical
 
 
-# Common alternative names used across the repo (so other modules don't "miss")
 def resolve_page(page: str) -> str:
     return normalize_page_name(page, allow_output_pages=True)
 
@@ -303,10 +315,6 @@ def canonicalize_page(page: str) -> str:
 
 
 def get_top10_feed_pages(pages_override: Optional[List[str]] = None) -> List[str]:
-    """
-    Returns canonical pages eligible for Top10 selection.
-    If pages_override is provided, it will normalize & filter it.
-    """
     pages = pages_override or TOP10_FEED_PAGES_DEFAULT
     normalized: List[str] = []
 
@@ -316,7 +324,6 @@ def get_top10_feed_pages(pages_override: Optional[List[str]] = None) -> List[str
         if info and info.eligible_for_top10 and info.is_data_page:
             normalized.append(cp)
 
-    # de-duplicate while preserving order
     seen: Set[str] = set()
     out: List[str] = []
     for p in normalized:
@@ -335,36 +342,27 @@ def validate_page_catalog() -> None:
         if fp in _CANONICAL_FROM_SCHEMA:
             raise ValueError(f"Forbidden page '{fp}' exists in schema_registry. Remove it.")
 
-    # Catalog pages must exist in schema registry
-    for canonical in PAGE_INFO.keys():
+    # Catalog pages must exist in schema registry (derived, but assert)
+    for canonical in CANONICAL_PAGES:
         if canonical not in _CANONICAL_FROM_SCHEMA:
             raise ValueError(f"Page '{canonical}' exists in page_catalog but not in schema_registry.")
 
-    # Schema registry pages must be known in the catalog (strict)
-    for sheet in _CANONICAL_FROM_SCHEMA:
-        if sheet not in PAGE_INFO:
-            raise ValueError(f"Sheet '{sheet}' exists in schema_registry but not in page_catalog. Add PageInfo.")
-
-    # Critical pages must normalize correctly (prevents your 80-column fallback)
-    must_resolve = [
-        "Top_10_Investments",
-        "Top10",
-        "Top 10 Investments",
-        "Insights_Analysis",
-        "Insights Analysis",
-        "Data_Dictionary",
-        "Data Dictionary",
+    # Critical pages must normalize correctly (prevents 80-column fallback)
+    must_resolve: List[Tuple[str, str]] = [
+        ("Top 10 Investments", "Top_10_Investments"),
+        ("Top10", "Top_10_Investments"),
+        ("Top Ten Investments", "Top_10_Investments"),
+        ("Insights Analysis", "Insights_Analysis"),
+        ("Insights-Analysis", "Insights_Analysis"),
+        ("Data Dictionary", "Data_Dictionary"),
+        ("Data-Dictionary", "Data_Dictionary"),
     ]
-    for s in must_resolve:
-        r = normalize_page_name(s, allow_output_pages=True)
-        if s.lower().startswith("top") and r != "Top_10_Investments":
-            raise ValueError(f"Normalization failed for '{s}' -> '{r}' (expected Top_10_Investments)")
-        if s.lower().startswith("ins") and r != "Insights_Analysis":
-            raise ValueError(f"Normalization failed for '{s}' -> '{r}' (expected Insights_Analysis)")
-        if s.lower().startswith("data") and r != "Data_Dictionary":
-            raise ValueError(f"Normalization failed for '{s}' -> '{r}' (expected Data_Dictionary)")
+    for inp, expected in must_resolve:
+        r = normalize_page_name(inp, allow_output_pages=True)
+        if r != expected:
+            raise ValueError(f"Normalization failed for '{inp}' -> '{r}' (expected {expected})")
 
-    # Aliases must resolve to known pages and must not map to forbidden pages
+    # Aliases must map only to valid pages (never forbidden)
     for alias_token, canonical in ALIAS_TO_CANONICAL.items():
         if canonical in FORBIDDEN_PAGES:
             raise ValueError(f"Alias token '{alias_token}' maps to forbidden page '{canonical}'.")
@@ -380,6 +378,11 @@ def validate_page_catalog() -> None:
             raise ValueError(f"TOP10_FEED_PAGES_DEFAULT includes non-data page '{p}'.")
         if not info.eligible_for_top10:
             raise ValueError(f"TOP10_FEED_PAGES_DEFAULT includes ineligible page '{p}'.")
+
+    # Special pages sanity
+    for sp in SPECIAL_PAGES:
+        if sp not in PAGE_INFO:
+            raise ValueError(f"Special page '{sp}' is not registered in PAGE_INFO.")
 
 
 # Validate immediately (fast, no I/O)
