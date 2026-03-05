@@ -2,26 +2,27 @@
 # core/sheets/data_dictionary.py
 """
 ================================================================================
-Data Dictionary Generator — v2.2.1 (SCHEMA-DRIVEN / STABLE / ROUTER-ALIGNED)
+Data Dictionary Generator — v2.3.0 (SCHEMA-DRIVEN / DRIFT-PROOF / CI-FRIENDLY)
 ================================================================================
 Tadawul Fast Bridge (TFB)
 
 Generates Data_Dictionary rows directly from core/sheets/schema_registry.py
 
-Why this revision (alignment + robustness):
-- ✅ Uses Data_Dictionary *spec* (headers + keys) from schema_registry as the contract
-  (no hard-coded header->key mapping that can drift)
+Why this revision (Priority-2 alignment):
+- ✅ STRICTLY derives Data_Dictionary schema (headers + keys) from schema_registry
+  (no hard-coded lists used for output layout)
 - ✅ Stable ordering:
-    - prefers page_catalog canonical order when available
-    - otherwise falls back to schema_registry ordering or sorted keys
-- ✅ Defensive to schema_registry variations:
-    - supports slightly different ColumnSpec attribute names (fmt/format, dtype/type, etc.)
+    - uses schema_registry.CANONICAL_SHEETS when available
+    - otherwise uses page_catalog.CANONICAL_PAGES
+    - otherwise uses schema_registry.list_sheets()
+- ✅ Defensive to ColumnSpec variations (fmt/format, dtype/type, etc.)
 - ✅ Output formats:
     1) list[dict] rows (dict keys match Data_Dictionary schema keys)
-    2) 2D values array for Google Sheets (including optional header row)
+    2) 2D values array for Google Sheets (optional header row)
 - ✅ Import-safe: no I/O, no network
+- ✅ Optional strict self-test for CI: TFB_SCHEMA_SELFTEST=1
 
-Data_Dictionary columns (expected headers):
+Data_Dictionary expected columns (by header):
 Sheet, Group, Header, Key, DType, Format, Required, Source, Notes
 ================================================================================
 """
@@ -38,6 +39,7 @@ try:
     from core.sheets.schema_registry import (  # type: ignore
         SCHEMA_VERSION,
         SCHEMA_REGISTRY,
+        CANONICAL_SHEETS,
         get_sheet_spec,
         get_sheet_headers,
         list_sheets,
@@ -55,9 +57,10 @@ __all__ = [
     "data_dictionary_keys",
     "row_dict_from_column",
     "validate_data_dictionary_output",
+    "preferred_sheet_order",
 ]
 
-DATA_DICTIONARY_VERSION = "2.2.1"
+DATA_DICTIONARY_VERSION = "2.3.0"
 
 
 # ---------------------------------------------------------------------------
@@ -135,46 +138,62 @@ def _data_dictionary_spec() -> Tuple[List[str], List[str]]:
 
 
 # ---------------------------------------------------------------------------
-# Ordering
+# Ordering (stable + schema-first)
 # ---------------------------------------------------------------------------
-def _preferred_sheet_order() -> List[str]:
+def preferred_sheet_order() -> List[str]:
     """
-    Respect page_catalog ordering when available, otherwise fall back safely.
+    Stable ordering for dictionary generation.
 
-    IMPORTANT:
-    - Only include sheets that exist in SCHEMA_REGISTRY.
-    - Append any registry-only sheets at the end (stable).
+    Priority:
+      1) schema_registry.CANONICAL_SHEETS (best, single canonical view)
+      2) page_catalog.CANONICAL_PAGES (if available)
+      3) schema_registry.list_sheets()
+      4) sorted(schema_registry keys)
+
+    Only returns sheets that exist in SCHEMA_REGISTRY.
     """
     reg = set(SCHEMA_REGISTRY.keys())
 
-    # 1) Try page_catalog ordering
+    # 1) canonical sheets from schema_registry
+    try:
+        ordered = [s for s in list(CANONICAL_SHEETS) if s in reg]
+        if ordered:
+            for s in list_sheets():
+                if s in reg and s not in ordered:
+                    ordered.append(s)
+            for s in sorted(reg):
+                if s not in ordered:
+                    ordered.append(s)
+            return ordered
+    except Exception:
+        pass
+
+    # 2) page_catalog
     try:
         from core.sheets.page_catalog import CANONICAL_PAGES  # type: ignore
 
-        ordered = [s for s in list(CANONICAL_PAGES) if s in reg]
-        # ensure we also include schema_registry sheets even if catalog ordering is partial
+        ordered2 = [s for s in list(CANONICAL_PAGES) if s in reg]
         for s in list_sheets():
-            if s in reg and s not in ordered:
-                ordered.append(s)
+            if s in reg and s not in ordered2:
+                ordered2.append(s)
         for s in sorted(reg):
-            if s not in ordered:
-                ordered.append(s)
-        return ordered
+            if s not in ordered2:
+                ordered2.append(s)
+        return ordered2
     except Exception:
         pass
 
-    # 2) Try list_sheets() (if it reflects desired ordering)
+    # 3) list_sheets
     try:
-        ordered2 = [s for s in list_sheets() if s in reg]
-        if ordered2:
+        ordered3 = [s for s in list_sheets() if s in reg]
+        if ordered3:
             for s in sorted(reg):
-                if s not in ordered2:
-                    ordered2.append(s)
-            return ordered2
+                if s not in ordered3:
+                    ordered3.append(s)
+            return ordered3
     except Exception:
         pass
 
-    # 3) Fallback: sorted registry keys
     return sorted(reg)
 
 
@@ -214,7 +233,7 @@ def row_dict_from_column(sheet: str, col: Any) -> Dict[str, Any]:
     """
     _, dd_keys = _data_dictionary_spec()
 
-    # ColumnSpec variations (defensive):
+    # ColumnSpec variations (defensive)
     sheet_name = _s(sheet)
     group = _s(_get_attr(col, "group", default=""))
     header = _s(_get_attr(col, "header", default=""))
@@ -225,7 +244,7 @@ def row_dict_from_column(sheet: str, col: Any) -> Dict[str, Any]:
     source = _s(_get_attr(col, "source", default=""))
     notes = _s(_get_attr(col, "notes", "note", "description", default=""))
 
-    # canonical internal (snake-ish)
+    # canonical internal map
     base: Dict[str, Any] = {
         "sheet": sheet_name,
         "group": group,
@@ -250,7 +269,7 @@ def row_dict_from_column(sheet: str, col: Any) -> Dict[str, Any]:
             out[dk] = base[lk]
             continue
 
-        # tolerate alternate key names if schema ever changes (future-proof)
+        # tolerate alternate names if schema ever changes (future-proof)
         if lk == "format":
             out[dk] = base["fmt"]
         elif lk in {"dtype", "type"}:
@@ -287,7 +306,7 @@ def build_data_dictionary_rows(
           If False, excludes Data_Dictionary itself.
     """
     if sheets is None:
-        ordered_sheets = _preferred_sheet_order()
+        ordered_sheets = preferred_sheet_order()
     else:
         ordered_sheets = [_canonicalize_sheet_name(s) for s in list(sheets)]
         missing = [s for s in ordered_sheets if s not in SCHEMA_REGISTRY]
@@ -353,8 +372,7 @@ def validate_data_dictionary_output(
       - True by default to prevent duplicates (sheet,key)
 
     forbid_extra_keys:
-      - If True, rows must contain ONLY the Data_Dictionary spec keys
-        (useful for strict CI).
+      - If True, rows must contain ONLY the Data_Dictionary spec keys (strict CI).
     """
     _, dd_keys = _data_dictionary_spec()
     required_keys = set(dd_keys)
@@ -393,6 +411,7 @@ def validate_data_dictionary_output(
 # Optional self-check (fast) — enable in CI or strict deployments
 # ---------------------------------------------------------------------------
 def _self_check() -> None:
+    # DO NOT hardcode for output; only for sanity expectation.
     expected_headers = ["Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes"]
     headers = data_dictionary_headers()
     if headers != expected_headers:
