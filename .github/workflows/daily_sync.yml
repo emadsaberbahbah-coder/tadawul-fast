@@ -1,10 +1,20 @@
 name: 🏦 Tadawul Dashboard Advanced Sync
 
 on:
+  # ✅ CI quality gate (blocks PR merges when configured as required check)
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+  # ✅ Production scheduler
   schedule:
     # Runs at minute 0, 15, 30, 45 every hour (UTC)
     # Riyadh is UTC+3.
     - cron: "0,15,30,45 * * * *"
+
+  # ✅ Manual run
   workflow_dispatch:
     inputs:
       backend_url:
@@ -58,9 +68,77 @@ env:
   TZ: Asia/Riyadh
 
 jobs:
+  # =============================================================================
+  # ✅ CI TESTS — runs on push/PR and is the quality gate for schema regressions
+  # =============================================================================
+  ci-tests:
+    name: 🧪 CI Tests (Schema Alignment + Contracts)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    timeout-minutes: 15
+
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: 🐍 Setup Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: "pip"
+          cache-dependency-path: |
+            requirements.render.txt
+            requirements.txt
+            requirements.ml.txt
+
+      - name: 📦 Install Dependencies (tests)
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip setuptools wheel
+          if [ -f "requirements.render.txt" ]; then
+            python -m pip install -r requirements.render.txt
+          elif [ -f "requirements.txt" ]; then
+            python -m pip install -r requirements.txt
+          fi
+          python -m pip install -q pytest
+
+      - name: 🧪 Run Pytest (schema must not drift)
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          echo "::group::Pytest"
+          # Run the whole suite if present, otherwise target the critical tests
+          if [ -d "tests" ]; then
+            python -m pytest -q
+          else
+            # fallback: run key tests if repo doesn't use /tests
+            if [ -f "tests/test_schema_alignment.py" ]; then
+              python -m pytest -q tests/test_schema_alignment.py
+            fi
+            if [ -f "test_scoring_engine_contract.py" ]; then
+              python -m pytest -q test_scoring_engine_contract.py
+            elif [ -f "core/test_scoring_engine_contract.py" ]; then
+              python -m pytest -q core/test_scoring_engine_contract.py
+            elif [ -f "tests/test_scoring_engine_contract.py" ]; then
+              python -m pytest -q tests/test_scoring_engine_contract.py
+            fi
+          fi
+          echo "::endgroup::"
+
+  # =============================================================================
+  # Scheduled/Manual SYNC workflow (production automation)
+  # =============================================================================
   preflight-validation:
     name: 🛡️ Pre-flight Validation
     runs-on: ubuntu-latest
+    # Run for schedule + manual (keep CI lean)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     outputs:
       validated: ${{ steps.validate.outputs.validated }}
     steps:
@@ -95,7 +173,7 @@ jobs:
     environment: production
     timeout-minutes: 25
     needs: preflight-validation
-    if: success()
+    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && needs.preflight-validation.outputs.validated == 'true'
 
     steps:
       - name: 📥 Secure Checkout
@@ -148,15 +226,16 @@ jobs:
           PY
           echo "::endgroup::"
 
-      - name: 🧪 Run Scoring Engine Contract Tests
+      - name: 🧪 Run Contract + Schema Alignment Tests (blocks drift)
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           set -euo pipefail
-          echo "::group::Contract Tests"
+          echo "::group::Tests"
 
           python -c "import pytest" 2>/dev/null || python -m pip install -q pytest
 
+          # 1) Existing scoring contract test (required)
           if [ -f "test_scoring_engine_contract.py" ]; then
             python -m pytest -q test_scoring_engine_contract.py
           elif [ -f "core/test_scoring_engine_contract.py" ]; then
@@ -166,6 +245,13 @@ jobs:
           else
             echo "::error::test_scoring_engine_contract.py not found (root/core/tests)."
             exit 1
+          fi
+
+          # 2) NEW: schema alignment gate (recommended)
+          if [ -f "tests/test_schema_alignment.py" ]; then
+            python -m pytest -q tests/test_schema_alignment.py
+          else
+            echo "::warning::tests/test_schema_alignment.py not found; schema drift gate not running."
           fi
 
           echo "::endgroup::"
@@ -220,7 +306,7 @@ jobs:
           echo "TARGET_SHEET_ID=$SHEET" >> "$GITHUB_ENV"
           echo "✅ Sheet ID: $SHEET"
 
-          # 3) Mode & Keys
+          # 3) Mode & Keys (✅ removed KSA_TADAWUL permanently)
           MODE="${INPUT_MODE:-full_sync}"
           echo "RUN_MODE=$MODE" >> "$GITHUB_ENV"
 
@@ -228,7 +314,8 @@ jobs:
             KEY="${INPUT_KEY:-MARKET_LEADERS}"
             KEYS="$KEY"
           else
-            DEFAULT_KEYS="MARKET_LEADERS GLOBAL_MARKETS KSA_TADAWUL MUTUAL_FUNDS COMMODITIES_FX MY_PORTFOLIO INSIGHTS_ANALYSIS"
+            # Canonical sync keys (no KSA_TADAWUL)
+            DEFAULT_KEYS="MARKET_LEADERS GLOBAL_MARKETS MUTUAL_FUNDS COMMODITIES_FX MY_PORTFOLIO INSIGHTS_ANALYSIS TOP_10_INVESTMENTS DATA_DICTIONARY"
             KEYS="$(get_val "${VAR_DEFAULT_KEYS:-}" "$DEFAULT_KEYS")"
           fi
 
