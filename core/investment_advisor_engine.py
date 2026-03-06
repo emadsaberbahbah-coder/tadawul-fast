@@ -1,201 +1,88 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# core/investment_advisor_engine.py
 """
+core/investment_advisor_engine.py
 ================================================================================
-Investment Advisor Engine — MASTER ORCHESTRATOR — v4.2.0 (LIVE MODE FIX)
+Investment Advisor Engine — v5.0.0
 ================================================================================
+CANONICAL | CONTEXT-PROPAGATION | HORIZON-AWARE | IMPORT-SAFE
 
-Fixes "No cached sheet snapshots found" + adds LIVE MODE.
+Why this revision
+- Fix missing advisory-context propagation into final canonical output.
+- Ensure these fields are always populated whenever possible:
+    - recommendation_reason
+    - horizon_days
+    - invest_period_label
+- Normalize criteria / request payload into a stable internal contract.
+- Provide a safe engine layer between routes and core/investment_advisor.py
+- Stay tolerant to repo differences (different engine/data providers).
 
-Root cause (your current production error)
-- Your DataEngineV2/V5 get_sheet_rows signature is keyword-only:
-    get_sheet_rows(*, sheet="Market_Leaders", limit=..., ...)
-  But the old adapter called legacy methods positionally:
-    engine.get_sheet_rows("Market_Leaders")  -> TypeError -> no snapshots -> advisor empty
+Design principles
+- No network calls at import-time
+- Best-effort compatibility with multiple backend engine styles
+- Sync/async safe helper methods
+- Canonical output enrichment
+- Never crash because a provider method is absent
 
-What v4.2.0 adds
-1) ✅ Robust calling: tries keyword-only and positional signatures safely.
-2) ✅ Live mode (AUTO by default):
-   - If cached snapshots are missing/empty, it will fetch *live sheet rows* via engine.get_sheet_rows
-   - Optionally enrich those sheet rows with engine quotes (engine.get_enriched_quotes_batch / get_quotes_batch)
-     to avoid snapshot dependency and ensure Advisor has real data.
-3) ✅ Snapshot shapes preserved:
-   - rows: List[Dict] (preferred)
-   - rows_matrix + keys (matrix support)
-   - headers + rows (legacy support)
-4) ✅ Startup-safe: no network I/O at import time; all engine calls happen at request time only.
-5) ✅ Keeps compatibility exports:
-   - run_investment_advisor(payload, engine=...)
-   - EngineSnapshotAdapter (now supports live modes)
+Expected usage
+- from core.investment_advisor_engine import InvestmentAdvisorEngine
+- engine = InvestmentAdvisorEngine(data_engine=..., quote_engine=...)
+- result = engine.run(payload)
 
-Advisor data modes
-- "snapshot"      : ONLY use engine cached snapshots (old behavior)
-- "live_sheet"    : build snapshots from engine.get_sheet_rows
-- "live_quotes"   : live_sheet + enrich rows with engine quotes (recommended)
-- "auto"          : try snapshot; if empty -> live_quotes; if that fails -> live_sheet
-
-Controls
-- payload["data_mode"] or payload["advisor_data_mode"] or payload["mode"] can set it.
-- env ADVISOR_DATA_MODE can set global default ("auto" by default).
-
+Primary public methods
+- run(payload)
+- get_sheet_rows(...)
+- get_cached_sheet_snapshot(...)
+- get_cached_multi_sheet_snapshots(...)
+- get_enriched_quotes_batch(...)
 ================================================================================
 """
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import inspect
+import json
 import logging
+import math
 import os
 import threading
-import time
-import uuid
-from collections import OrderedDict
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
-from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+import traceback
+from dataclasses import dataclass, field, asdict
+from datetime import datetime, timezone, timedelta
+from typing import Any, Dict, List, Optional, Tuple, Union
 
-# ---------------------------------------------------------------------------
-# High-Performance JSON fallback (safe)
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Optional high-performance JSON
+# -----------------------------------------------------------------------------
 try:
     import orjson  # type: ignore
+
+    def json_dumps(obj: Any) -> str:
+        return orjson.dumps(obj, default=str).decode("utf-8")
 
     def json_loads(data: Union[str, bytes]) -> Any:
         if isinstance(data, str):
             data = data.encode("utf-8")
         return orjson.loads(data)
 
-    def json_dumps(obj: Any) -> str:
-        return orjson.dumps(obj, default=str).decode("utf-8")
-
 except Exception:
-    import json  # type: ignore
+
+    def json_dumps(obj: Any) -> str:
+        return json.dumps(obj, ensure_ascii=False, default=str)
 
     def json_loads(data: Union[str, bytes]) -> Any:
         if isinstance(data, (bytes, bytearray)):
             data = data.decode("utf-8", errors="replace")
         return json.loads(data)
 
-    def json_dumps(obj: Any) -> str:
-        return json.dumps(obj, default=str, ensure_ascii=False)
-
-# ---------------------------------------------------------------------------
-# Monitoring & Tracing (safe)
-# ---------------------------------------------------------------------------
-try:
-    from prometheus_client import Counter, Histogram  # type: ignore
-
-    _PROMETHEUS_AVAILABLE = True
-    advisor_engine_requests = Counter(
-        "advisor_engine_requests_total",
-        "Total requests to advisor engine adapter",
-        ["status"],
-    )
-    advisor_engine_duration = Histogram(
-        "advisor_engine_duration_seconds",
-        "Time spent in advisor engine adapter",
-        buckets=[0.1, 0.5, 1.0, 2.5, 5.0, 10.0],
-    )
-except Exception:
-    _PROMETHEUS_AVAILABLE = False
-
-    class _DummyMetric:
-        def labels(self, *args, **kwargs):  # noqa
-            return self
-
-        def inc(self, *args, **kwargs):  # noqa
-            return None
-
-        def observe(self, *args, **kwargs):  # noqa
-            return None
-
-    advisor_engine_requests = _DummyMetric()
-    advisor_engine_duration = _DummyMetric()
-
-try:
-    from opentelemetry import trace  # type: ignore
-    from opentelemetry.trace import Status, StatusCode  # type: ignore
-
-    _OTEL_AVAILABLE = True
-    _TRACER = trace.get_tracer(__name__)
-except Exception:
-    _OTEL_AVAILABLE = False
-    Status = None  # type: ignore
-    StatusCode = None  # type: ignore
-    _TRACER = None  # type: ignore
-
-_TRACING_ENABLED = str(os.getenv("CORE_TRACING_ENABLED", "")).strip().lower() in {"1", "true", "yes", "y", "on"}
-
-
-class TraceContext:
-    """
-    Correct OTel usage:
-      tracer.start_as_current_span(...) returns a context manager.
-    """
-
-    def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
-        self.name = name
-        self.attributes = attributes or {}
-        self._cm = None
-        self._span = None
-        self._enabled = bool(_OTEL_AVAILABLE and _TRACING_ENABLED and _TRACER is not None)
-
-    def __enter__(self):
-        if not self._enabled:
-            return self
-        try:
-            self._cm = _TRACER.start_as_current_span(self.name)  # type: ignore
-            self._span = self._cm.__enter__()
-            for k, v in (self.attributes or {}).items():
-                try:
-                    if self._span is not None and hasattr(self._span, "set_attribute"):
-                        self._span.set_attribute(str(k), v)
-                except Exception:
-                    pass
-        except Exception:
-            self._cm = None
-            self._span = None
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if not self._cm:
-            return False
-        try:
-            if exc_val and self._span is not None and _OTEL_AVAILABLE and Status is not None and StatusCode is not None:
-                try:
-                    if hasattr(self._span, "record_exception"):
-                        self._span.record_exception(exc_val)
-                except Exception:
-                    pass
-                try:
-                    if hasattr(self._span, "set_status"):
-                        self._span.set_status(Status(StatusCode.ERROR, str(exc_val)))
-                except Exception:
-                    pass
-        finally:
-            try:
-                self._cm.__exit__(exc_type, exc_val, exc_tb)
-            except Exception:
-                pass
-        return False
-
-
-# =============================================================================
-# Version
-# =============================================================================
-__version__ = "4.2.0"
-ENGINE_VERSION = __version__
 
 logger = logging.getLogger("core.investment_advisor_engine")
 
-# =============================================================================
-# Defaults (PHASE aligned)
-# =============================================================================
-DEFAULT_SOURCES = [
+RIYADH_TZ = timezone(timedelta(hours=3))
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "ok", "enabled", "active"}
+
+DEFAULT_SOURCE_PAGES = [
     "Market_Leaders",
     "Global_Markets",
     "Mutual_Funds",
@@ -203,303 +90,206 @@ DEFAULT_SOURCES = [
     "My_Portfolio",
 ]
 
-DEFAULT_HEADERS: List[str] = [
-    "Rank",
-    "Symbol",
-    "Origin",
-    "Name",
-    "Market",
-    "Sector",
-    "Currency",
-    "Price",
-    "Advisor Score",
-    "Recommendation",
-    "Allocation %",
-    "Allocation Amount",
-    "Forecast Price (1M)",
-    "Expected ROI % (1M)",
-    "Forecast Price (3M)",
-    "Expected ROI % (3M)",
-    "Forecast Price (12M)",
-    "Expected ROI % (12M)",
-    "Risk Bucket",
-    "Confidence Bucket",
-    "Liquidity Score",
-    "Data Quality",
-    "Reason",
-    "Last Updated (UTC)",
-    "Last Updated (Riyadh)",
-]
+# -----------------------------------------------------------------------------
+# Optional imports
+# -----------------------------------------------------------------------------
+try:
+    from core.investment_advisor import run_investment_advisor  # type: ignore
 
-CACHE_TTL_DEFAULT = 300  # 5 minutes
-CACHE_TTL_SHEET = 600  # 10 minutes
+    _HAS_CORE_ADVISOR = True
+except Exception:
+    run_investment_advisor = None  # type: ignore
+    _HAS_CORE_ADVISOR = False
 
-# Engine discovery
-METHOD_GROUPS: Dict[str, List[str]] = {
-    "snapshot_multi": [
-        "get_cached_multi_sheet_snapshots",
-        "get_multi_sheet_snapshots",
-        "get_sheet_snapshots_batch",
-        "fetch_multi_sheet_snapshots",
-    ],
-    "snapshot_single": [
-        "get_cached_sheet_snapshot",
-        "get_sheet_snapshot",
-        "get_cached_sheet",
-        "get_sheet_cached",
-    ],
-    # NOTE: get_sheet_rows is typically keyword-only in your DataEngine
-    "sheet_rows": [
-        "get_sheet_rows",
-        "sheet_rows",
-        "build_sheet_rows",
-        "get_rows",
-        "get_sheet",
-        "fetch_sheet",
-    ],
-    "quotes_batch": [
-        "get_enriched_quotes_batch",
-        "get_quotes_batch",
-        "fetch_quotes_batch",
-    ],
-    "quote_single": [
-        "get_enriched_quote_dict",
-        "get_quote_dict",
-        "get_enriched_quote",
-        "get_quote",
-        "fetch_quote",
-    ],
-    "news": [
-        "get_news_score",
-        "get_cached_news_score",
-        "news_get_score",
-        "fetch_news_score",
-        "get_news_sentiment",
-    ],
-    "technical": [
-        "get_technical_signals",
-        "get_cached_technical_signals",
-        "fetch_technical_signals",
-        "get_technicals",
-    ],
-    "historical": [
-        "get_historical_returns",
-        "get_cached_historical_returns",
-        "fetch_historical_returns",
-        "get_returns",
-    ],
-}
+try:
+    from core.sheets.page_catalog import normalize_page_name as _normalize_page_name  # type: ignore
+
+    _HAS_PAGE_CATALOG = True
+except Exception:
+    _HAS_PAGE_CATALOG = False
+
+    def _normalize_page_name(name: str, allow_output_pages: bool = True) -> str:  # type: ignore
+        return str(name or "").strip()
+
+try:
+    from core.sheets.schema_registry import get_sheet_spec as _get_sheet_spec  # type: ignore
+
+    _HAS_SCHEMA = True
+except Exception:
+    _HAS_SCHEMA = False
+
+    def _get_sheet_spec(sheet_name: str) -> Any:  # type: ignore
+        raise KeyError("schema_registry unavailable")
 
 
-# =============================================================================
-# Enums and Data Classes
-# =============================================================================
-class AdapterMode(Enum):
-    NATIVE = "native"
-    WRAPPED = "wrapped"
-    LEGACY = "legacy"
-    STUB = "stub"
+# -----------------------------------------------------------------------------
+# Utilities
+# -----------------------------------------------------------------------------
+def _truthy(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    return str(v).strip().lower() in _TRUTHY
 
 
-class CacheStrategy(Enum):
-    NONE = "none"
-    MEMORY = "memory"
-    ENGINE = "engine"  # reserved
-
-
-class MethodResult(Enum):
-    SUCCESS = "success"
-    FAILED = "failed"
-    NOT_FOUND = "not_found"
-    TIMEOUT = "timeout"
-    EXCEPTION = "exception"
-
-
-class AdvisorDataMode(Enum):
-    SNAPSHOT = "snapshot"
-    LIVE_SHEET = "live_sheet"
-    LIVE_QUOTES = "live_quotes"
-    AUTO = "auto"
-
-
-@dataclass(slots=True)
-class MethodCall:
-    method_name: str
-    result: MethodResult
-    duration_ms: float
-    error: Optional[str] = None
-    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-
-
-@dataclass(slots=True)
-class EngineCapabilities:
-    has_snapshot_multi: bool = False
-    has_snapshot_single: bool = False
-    has_sheet_rows: bool = False
-    has_quotes_batch: bool = False
-    has_quote_single: bool = False
-    has_news: bool = False
-    has_technical: bool = False
-    has_historical: bool = False
-    method_calls: List[MethodCall] = field(default_factory=list)
-
-    def add_call(self, method: str, result: MethodResult, duration_ms: float, error: Optional[str] = None) -> None:
-        self.method_calls.append(MethodCall(method_name=method, result=result, duration_ms=duration_ms, error=error))
-
-    @property
-    def can_fetch_sheets(self) -> bool:
-        return self.has_snapshot_multi or self.has_snapshot_single or self.has_sheet_rows
-
-
-@dataclass(slots=True)
-class SnapshotEntry:
-    sheet_name: str
-    snapshot: Dict[str, Any]
-    cached_at: datetime
-    expires_at: datetime
-    source_method: str
-    last_access: float = field(default_factory=time.time)
-
-    @property
-    def is_expired(self) -> bool:
-        return datetime.now(timezone.utc) > self.expires_at
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "sheet_name": self.sheet_name,
-            "cached_at_utc": self.cached_at.isoformat(),
-            "expires_at_utc": self.expires_at.isoformat(),
-            "source_method": self.source_method,
-        }
-
-
-@dataclass(slots=True)
-class EngineMetrics:
-    total_requests: int = 0
-    cache_hits: int = 0
-    cache_misses: int = 0
-    method_calls: Dict[str, int] = field(default_factory=dict)
-    method_errors: Dict[str, int] = field(default_factory=dict)
-    avg_response_time_ms: float = 0.0
-    start_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    last_request_time: Optional[datetime] = None
-
-    def record_call(self, method: str, duration_ms: float, success: bool = True) -> None:
-        self.total_requests += 1
-        self.method_calls[method] = self.method_calls.get(method, 0) + 1
-        if not success:
-            self.method_errors[method] = self.method_errors.get(method, 0) + 1
-        n = max(1, self.total_requests)
-        self.avg_response_time_ms = ((self.avg_response_time_ms * (n - 1)) + float(duration_ms)) / n
-        self.last_request_time = datetime.now(timezone.utc)
-
-    def to_dict(self) -> Dict[str, Any]:
-        uptime = (datetime.now(timezone.utc) - self.start_time).total_seconds()
-        return {
-            "total_requests": self.total_requests,
-            "cache_hits": self.cache_hits,
-            "cache_misses": self.cache_misses,
-            "method_calls": dict(self.method_calls),
-            "method_errors": dict(self.method_errors),
-            "avg_response_time_ms": round(self.avg_response_time_ms, 2),
-            "uptime_seconds": round(uptime, 2),
-            "last_request_utc": self.last_request_time.isoformat() if self.last_request_time else None,
-        }
-
-
-# =============================================================================
-# Cache Implementation (thread-safe, true LRU)
-# =============================================================================
-class SnapshotCache:
-    def __init__(self, strategy: CacheStrategy = CacheStrategy.MEMORY, default_ttl: int = CACHE_TTL_DEFAULT, max_size: int = 500):
-        self.strategy = strategy
-        self.default_ttl = int(default_ttl)
-        self.max_size = int(max_size)
-        self._cache: "OrderedDict[str, SnapshotEntry]" = OrderedDict()
-        self._lock = threading.RLock()
-        self._metrics = EngineMetrics()
-
-    def get(self, sheet_name: str) -> Optional[SnapshotEntry]:
-        if self.strategy == CacheStrategy.NONE:
-            return None
-        key = str(sheet_name)
-        with self._lock:
-            ent = self._cache.get(key)
-            if ent is None:
-                self._metrics.cache_misses += 1
-                return None
-            if ent.is_expired:
-                self._cache.pop(key, None)
-                self._metrics.cache_misses += 1
-                return None
-            ent.last_access = time.time()
-            self._cache.move_to_end(key, last=True)
-            self._metrics.cache_hits += 1
-            return ent
-
-    def set(self, sheet_name: str, snapshot: Dict[str, Any], source_method: str, ttl: Optional[int] = None) -> SnapshotEntry:
-        now = datetime.now(timezone.utc)
-        if self.strategy == CacheStrategy.NONE:
-            return SnapshotEntry(
-                sheet_name=str(sheet_name),
-                snapshot=snapshot,
-                cached_at=now,
-                expires_at=now,
-                source_method=source_method,
-            )
-        ttl_seconds = int(ttl or self.default_ttl)
-        key = str(sheet_name)
-        with self._lock:
-            ent = SnapshotEntry(
-                sheet_name=key,
-                snapshot=snapshot,
-                cached_at=now,
-                expires_at=now + timedelta(seconds=ttl_seconds),
-                source_method=source_method,
-                last_access=time.time(),
-            )
-            self._cache[key] = ent
-            self._cache.move_to_end(key, last=True)
-            while len(self._cache) > self.max_size:
-                self._cache.popitem(last=False)
-            return ent
-
-    def clear(self) -> None:
-        with self._lock:
-            self._cache.clear()
-
-    def get_metrics(self) -> Dict[str, Any]:
-        with self._lock:
-            m = self._metrics.to_dict()
-            m.update(
-                {
-                    "cache_size": len(self._cache),
-                    "cache_strategy": self.strategy.value,
-                    "cache_ttl_sec": self.default_ttl,
-                    "cache_max_size": self.max_size,
-                }
-            )
-            return m
-
-
-# =============================================================================
-# Safe calling helpers (sync/async bridging) + signature variants
-# =============================================================================
-def _filter_kwargs_for_callable(fn: Callable, kwargs: Dict[str, Any]) -> Dict[str, Any]:
-    if not kwargs:
-        return {}
+def _safe_str(v: Any, default: str = "") -> str:
     try:
-        sig = inspect.signature(fn)
-        params = sig.parameters
-        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
-            return kwargs
-        allowed = set(params.keys())
-        return {k: v for k, v in kwargs.items() if k in allowed}
+        return str(v).strip() if v is not None else default
     except Exception:
-        return {}
+        return default
 
 
-def _run_coro_in_thread(coro: Any, timeout: float) -> Tuple[Optional[Any], Optional[BaseException], bool]:
+def _to_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            f = float(v)
+        else:
+            s = str(v).strip().replace(",", "")
+            if not s or s.lower() in {"na", "n/a", "none", "null"}:
+                return None
+            if s.endswith("%"):
+                f = float(s[:-1].strip()) / 100.0
+            else:
+                f = float(s)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return f
+    except Exception:
+        return None
+
+
+def _to_int(v: Any) -> Optional[int]:
+    f = _to_float(v)
+    return int(f) if f is not None else None
+
+
+def _as_ratio(v: Any) -> Optional[float]:
+    f = _to_float(v)
+    if f is None:
+        return None
+    if abs(f) > 1.5:
+        return f / 100.0
+    return f
+
+
+def _norm_key(s: Any) -> str:
+    return " ".join(_safe_str(s).lower().split())
+
+
+def _snake_like(header: str) -> str:
+    s = _safe_str(header)
+    s = s.strip().replace("%", " pct").replace("/", " ")
+    out = []
+    prev_us = False
+    for ch in s:
+        if ch.isalnum():
+            out.append(ch.lower())
+            prev_us = False
+        else:
+            if not prev_us:
+                out.append("_")
+                prev_us = True
+    res = "".join(out).strip("_")
+    while "__" in res:
+        res = res.replace("__", "_")
+    return res
+
+
+def _iso_utc(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+def _iso_riyadh(dt: datetime) -> str:
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(RIYADH_TZ).isoformat()
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_iso_dt(v: Any) -> Optional[datetime]:
+    s = _safe_str(v)
+    if not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _clean_reason_text(v: Any) -> str:
+    s = _safe_str(v)
+    if not s:
+        return ""
+    s = " ".join(s.split())
+    return s.strip(" ;,.-")
+
+
+def _pick(d: Dict[str, Any], *keys: str) -> Any:
+    if not isinstance(d, dict):
+        return None
+    for k in keys:
+        if k in d:
+            return d.get(k)
+    nmap = d.get("_nmap")
+    if not isinstance(nmap, dict):
+        nmap = {_norm_key(k): k for k in d.keys() if k != "_nmap"}
+        d["_nmap"] = nmap
+    for k in keys:
+        nk = _norm_key(k)
+        if nk in nmap:
+            return d.get(nmap[nk])
+    return None
+
+
+def _normalize_symbol(symbol: Any) -> str:
+    s = _safe_str(symbol).upper().replace(" ", "")
+    if s.startswith("TADAWUL:"):
+        s = s.split(":", 1)[1]
+    if s.endswith(".SA"):
+        s = s[:-3] + ".SR"
+    return s
+
+
+def _canonical_symbol(symbol: Any) -> str:
+    s = _normalize_symbol(symbol)
+    if not s:
+        return ""
+    if s.endswith(".SR") and s[:-3].isdigit():
+        return f"KSA:{s[:-3]}"
+    if s.isdigit():
+        return f"KSA:{s}"
+    if "." in s:
+        return f"GLOBAL:{s.split('.', 1)[0]}"
+    if s.startswith("^"):
+        return f"IDX:{s}"
+    return f"GLOBAL:{s}"
+
+
+# -----------------------------------------------------------------------------
+# Sync/async bridge
+# -----------------------------------------------------------------------------
+def _in_running_loop() -> bool:
+    try:
+        loop = asyncio.get_running_loop()
+        return bool(loop.is_running())
+    except Exception:
+        return False
+
+
+def _run_coro_in_thread(coro: Any, timeout: float = 20.0) -> Tuple[Optional[Any], Optional[BaseException], bool]:
     box: Dict[str, Any] = {"result": None, "error": None}
 
     def _worker():
@@ -516,914 +306,697 @@ def _run_coro_in_thread(coro: Any, timeout: float) -> Tuple[Optional[Any], Optio
     return box["result"], box["error"], False
 
 
-def _safe_call(
-    engine: Any,
-    method_name: str,
-    *args: Any,
-    timeout: float = 2.0,
-    **kwargs: Any,
-) -> Tuple[Optional[Any], MethodResult, float, Optional[str]]:
-    start = time.time()
-
-    if engine is None:
-        return None, MethodResult.NOT_FOUND, 0.0, "Engine is None"
-
-    fn = getattr(engine, method_name, None)
+def _safe_call(obj: Any, method_name: str, *args: Any, timeout: float = 20.0, **kwargs: Any) -> Tuple[Optional[Any], Optional[str]]:
+    if obj is None:
+        return None, "target_none"
+    fn = getattr(obj, method_name, None)
     if not callable(fn):
-        return None, MethodResult.NOT_FOUND, 0.0, f"Method {method_name} not found"
-
-    kw = _filter_kwargs_for_callable(fn, kwargs)
+        return None, "method_not_found"
 
     try:
-        out = fn(*args, **kw)
-
+        out = fn(*args, **kwargs)
         if inspect.isawaitable(out):
-            try:
-                loop = asyncio.get_running_loop()
-                in_loop = loop.is_running()
-            except RuntimeError:
-                in_loop = False
-
-            if in_loop:
-                res, err, timed_out = _run_coro_in_thread(out, timeout)
-                dur = (time.time() - start) * 1000.0
-                if timed_out:
-                    return None, MethodResult.TIMEOUT, dur, f"Timeout after {timeout}s"
+            if _in_running_loop():
+                res, err, to = _run_coro_in_thread(out, timeout=timeout)
+                if to:
+                    return None, f"timeout:{timeout}s"
                 if err is not None:
-                    return None, MethodResult.EXCEPTION, dur, str(err)
-                return res, MethodResult.SUCCESS, dur, None
-
+                    return None, f"exception:{type(err).__name__}:{err}"
+                return res, None
             try:
-                res = asyncio.run(asyncio.wait_for(out, timeout=timeout))
-                dur = (time.time() - start) * 1000.0
-                return res, MethodResult.SUCCESS, dur, None
+                return asyncio.run(asyncio.wait_for(out, timeout=timeout)), None
             except asyncio.TimeoutError:
-                dur = (time.time() - start) * 1000.0
-                return None, MethodResult.TIMEOUT, dur, f"Timeout after {timeout}s"
-
-        dur = (time.time() - start) * 1000.0
-        return out, MethodResult.SUCCESS, dur, None
-
-    except asyncio.TimeoutError:
-        dur = (time.time() - start) * 1000.0
-        return None, MethodResult.TIMEOUT, dur, f"Timeout after {timeout}s"
+                return None, f"timeout:{timeout}s"
+        return out, None
     except Exception as e:
-        dur = (time.time() - start) * 1000.0
-        return None, MethodResult.EXCEPTION, dur, str(e)
+        return None, f"exception:{type(e).__name__}:{e}"
 
 
-def _safe_call_variants(
-    engine: Any,
-    method_name: str,
-    variants: List[Tuple[Tuple[Any, ...], Dict[str, Any]]],
-    *,
-    timeout: float,
-) -> Tuple[Optional[Any], MethodResult, float, Optional[str], int]:
-    """
-    Try multiple signatures; return first SUCCESS.
-    """
-    last_err: Optional[str] = None
-    last_status: MethodResult = MethodResult.FAILED
-    last_dur: float = 0.0
+# -----------------------------------------------------------------------------
+# Criteria model
+# -----------------------------------------------------------------------------
+@dataclass(slots=True)
+class AdvisorCriteria:
+    sources: List[str] = field(default_factory=lambda: ["ALL"])
+    tickers: Optional[List[str]] = None
 
-    for i, (args, kwargs) in enumerate(variants):
-        res, status, dur, err = _safe_call(engine, method_name, *args, timeout=timeout, **kwargs)
-        if status == MethodResult.SUCCESS:
-            return res, status, dur, None, i
-        last_err = err
-        last_status = status
-        last_dur = dur
+    risk_profile: str = "moderate"
+    risk_bucket: str = ""
+    confidence_bucket: str = ""
 
-    return None, last_status, last_dur, last_err or "no_variants_succeeded", -1
+    invest_amount: float = 0.0
+    currency: str = "SAR"
+    top_n: int = 20
+    allocation_strategy: str = "maximum_sharpe"
 
+    invest_period_days: Optional[int] = None
+    invest_period_label: str = ""
+    horizon_days: Optional[int] = None
 
-# =============================================================================
-# Capability discovery (INTROSPECTION ONLY — no calls)
-# =============================================================================
-def _has_any(engine: Any, names: List[str]) -> bool:
-    for n in names:
-        if callable(getattr(engine, n, None)):
-            return True
-    return False
+    required_roi_1m: Optional[float] = None
+    required_roi_3m: Optional[float] = None
+    required_roi_12m: Optional[float] = None
 
+    min_price: Optional[float] = None
+    max_price: Optional[float] = None
+    min_liquidity_score: float = 25.0
+    min_advisor_score: Optional[float] = None
 
-def _discover_engine_capabilities(engine: Any) -> EngineCapabilities:
-    caps = EngineCapabilities()
-    if engine is None:
-        return caps
+    exclude_sectors: Optional[List[str]] = None
+    allowed_markets: Optional[List[str]] = None
 
-    caps.has_snapshot_multi = _has_any(engine, METHOD_GROUPS["snapshot_multi"])
-    caps.has_snapshot_single = _has_any(engine, METHOD_GROUPS["snapshot_single"])
-    caps.has_sheet_rows = _has_any(engine, METHOD_GROUPS["sheet_rows"])
-    caps.has_quotes_batch = _has_any(engine, METHOD_GROUPS["quotes_batch"])
-    caps.has_quote_single = _has_any(engine, METHOD_GROUPS["quote_single"])
-    caps.has_news = _has_any(engine, METHOD_GROUPS["news"])
-    caps.has_technical = _has_any(engine, METHOD_GROUPS["technical"])
-    caps.has_historical = _has_any(engine, METHOD_GROUPS["historical"])
-    return caps
+    use_row_updated_at: bool = True
+    debug: bool = False
 
+    raw: Dict[str, Any] = field(default_factory=dict)
 
-# =============================================================================
-# Snapshot normalization (schema-aware)
-# =============================================================================
-def _rows_dicts_from_matrix(keys: List[str], rows_matrix: List[List[Any]]) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    if not keys or not isinstance(rows_matrix, list):
+    def to_payload(self) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
+            "sources": self.sources,
+            "tickers": self.tickers,
+            "risk_profile": self.risk_profile,
+            "risk_bucket": self.risk_bucket,
+            "confidence_bucket": self.confidence_bucket,
+            "invest_amount": self.invest_amount,
+            "currency": self.currency,
+            "top_n": self.top_n,
+            "allocation_strategy": self.allocation_strategy,
+            "required_roi_1m": self.required_roi_1m,
+            "required_roi_3m": self.required_roi_3m,
+            "required_roi_12m": self.required_roi_12m,
+            "min_price": self.min_price,
+            "max_price": self.max_price,
+            "min_liquidity_score": self.min_liquidity_score,
+            "min_advisor_score": self.min_advisor_score,
+            "exclude_sectors": self.exclude_sectors,
+            "allowed_markets": self.allowed_markets,
+            "use_row_updated_at": self.use_row_updated_at,
+            "debug": self.debug,
+            "horizon_days": self.horizon_days,
+            "invest_period_days": self.invest_period_days,
+            "invest_period_label": self.invest_period_label,
+        }
+        out.update(self.raw or {})
         return out
-    for r in rows_matrix:
-        if not isinstance(r, (list, tuple)):
+
+
+# -----------------------------------------------------------------------------
+# Horizon helpers
+# -----------------------------------------------------------------------------
+def _normalize_sources(raw_sources: Any) -> List[str]:
+    if isinstance(raw_sources, str):
+        raw_list = [raw_sources]
+    elif isinstance(raw_sources, list):
+        raw_list = [str(x) for x in raw_sources if x]
+    else:
+        raw_list = ["ALL"]
+
+    out: List[str] = []
+    seen = set()
+
+    for s in raw_list:
+        txt = _safe_str(s)
+        if not txt:
             continue
-        d = {k: (r[i] if i < len(r) else None) for i, k in enumerate(keys)}
-        out.append(d)
-    return out
+        if txt.upper() == "ALL":
+            for page in DEFAULT_SOURCE_PAGES:
+                if page not in seen:
+                    out.append(page)
+                    seen.add(page)
+            continue
+        try:
+            page = _normalize_page_name(txt, allow_output_pages=False) if _HAS_PAGE_CATALOG else txt
+        except Exception:
+            page = txt
+        if page and page not in seen:
+            out.append(page)
+            seen.add(page)
+
+    return out or list(DEFAULT_SOURCE_PAGES)
 
 
-def _normalize_sheet_rows_payload(sheet_name: str, payload: Dict[str, Any], source_method: str) -> Optional[Dict[str, Any]]:
-    """
-    Normalize engine.get_sheet_rows output to a snapshot dict.
-    Accepts envelopes like:
-      {headers, keys, rows, rows_matrix, meta, ...}
-    """
-    if not isinstance(payload, dict):
+def _normalize_tickers(raw: Any) -> Optional[List[str]]:
+    if raw is None:
         return None
-
-    headers = payload.get("headers") or []
-    keys = payload.get("keys") or []
-    rows = payload.get("rows") or []
-    rows_matrix = payload.get("rows_matrix")
-
-    # Sometimes engines return rows as matrix but don't use rows_matrix
-    if rows_matrix is None and isinstance(rows, list) and rows and isinstance(rows[0], (list, tuple)):
-        rows_matrix = rows
-
-    # Ensure keys list
-    if not isinstance(keys, list):
-        keys = []
-    keys = [str(k) for k in keys if str(k).strip()]
-
-    # Ensure headers list
-    if not isinstance(headers, list):
-        headers = []
-    headers = [str(h) for h in headers if str(h).strip()]
-
-    # Prefer dict rows
-    rows_dicts: List[Dict[str, Any]] = []
-    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
-        rows_dicts = [r for r in rows if isinstance(r, dict)]
-    elif rows_matrix is not None and isinstance(rows_matrix, list) and keys:
-        rows_dicts = _rows_dicts_from_matrix(keys, rows_matrix)  # build dict rows
-
-    snap: Dict[str, Any] = {
-        "sheet": sheet_name,
-        "source_method": source_method,
-    }
-    if headers:
-        snap["headers"] = headers
-    if keys:
-        snap["keys"] = keys
-    if rows_dicts:
-        snap["rows"] = rows_dicts
-    elif isinstance(rows_matrix, list):
-        snap["rows_matrix"] = rows_matrix
-        snap["rows"] = rows_matrix  # keep legacy consumers alive
-
-    # Preserve useful meta
-    meta = payload.get("meta")
-    if isinstance(meta, dict) and meta:
-        snap["meta"] = meta
-
-    # If still empty, return None
-    if not snap.get("rows") and not snap.get("rows_matrix"):
-        return None
-    return snap
-
-
-def _normalize_snapshot(sheet_name: str, result: Any, source_method: str) -> Optional[Dict[str, Any]]:
-    if result is None:
-        return None
-
-    if isinstance(result, dict):
-        # If it's a sheet_rows payload, normalize it properly
-        if "rows" in result or "rows_matrix" in result or "keys" in result or "headers" in result:
-            snap2 = _normalize_sheet_rows_payload(sheet_name, result, source_method)
-            if snap2 is not None:
-                return snap2
-
-        snap = dict(result)
-        snap.setdefault("sheet", sheet_name)
-        snap.setdefault("source_method", source_method)
-        return snap
-
-    # Tuple/list (headers, rows)
-    if isinstance(result, (tuple, list)) and len(result) == 2:
-        h, r = result[0], result[1]
-        if isinstance(h, (list, tuple)) and isinstance(r, (list, tuple)):
-            headers = [str(x) for x in h]
-            rows = [list(x) if isinstance(x, (list, tuple)) else [x] for x in r]
-            return {
-                "sheet": sheet_name,
-                "headers": headers,
-                "rows": rows,
-                "rows_matrix": rows,
-                "source_method": source_method,
-            }
-
+    if isinstance(raw, str):
+        vals = [x for x in raw.replace(",", " ").split() if x.strip()]
+        return vals or None
+    if isinstance(raw, list):
+        vals = [_safe_str(x) for x in raw if _safe_str(x)]
+        return vals or None
     return None
 
 
-# =============================================================================
-# Live enrichment (quotes) helpers
-# =============================================================================
-def _safe_str(x: Any) -> str:
-    try:
-        s = str(x).strip()
-        return s
-    except Exception:
+def _period_label_from_days(days: Optional[int]) -> str:
+    if days is None:
         return ""
+    d = int(days)
+    if d <= 0:
+        return ""
+    if d <= 31:
+        return "1M"
+    if d <= 92:
+        return "3M"
+    if d <= 183:
+        return "6M"
+    if d <= 366:
+        return "12M"
+    return f"{d}D"
 
 
-def _extract_symbols_from_snapshot(snapshot: Dict[str, Any]) -> List[str]:
+def _infer_horizon_days(payload: Dict[str, Any]) -> Tuple[Optional[int], str]:
     """
-    Extract symbols from:
-      - rows: List[Dict]  (symbol/ticker/code)
-      - rows_matrix + keys
+    Priority:
+    1) explicit horizon_days
+    2) explicit invest_period_days / investment_period_days / period_days
+    3) invest_period_label
+    4) if ROI target fields supplied -> infer nearest canonical horizon
+    default -> 90 days / 3M
     """
-    out: List[str] = []
-    if not isinstance(snapshot, dict):
-        return out
+    explicit = (
+        _to_int(payload.get("horizon_days"))
+        or _to_int(payload.get("invest_period_days"))
+        or _to_int(payload.get("investment_period_days"))
+        or _to_int(payload.get("period_days"))
+        or _to_int(payload.get("days"))
+    )
+    if explicit and explicit > 0:
+        return explicit, _period_label_from_days(explicit)
 
-    # dict rows
-    rows = snapshot.get("rows")
-    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+    label = _safe_str(
+        payload.get("invest_period_label")
+        or payload.get("investment_period_label")
+        or payload.get("period_label")
+        or payload.get("horizon_label")
+    ).upper()
+
+    label_map = {
+        "1M": 30,
+        "30D": 30,
+        "30": 30,
+        "3M": 90,
+        "90D": 90,
+        "90": 90,
+        "6M": 180,
+        "180D": 180,
+        "180": 180,
+        "12M": 365,
+        "1Y": 365,
+        "365D": 365,
+        "365": 365,
+    }
+    if label in label_map:
+        return label_map[label], _period_label_from_days(label_map[label])
+
+    if payload.get("required_roi_1m") is not None:
+        return 30, "1M"
+    if payload.get("required_roi_3m") is not None:
+        return 90, "3M"
+    if payload.get("required_roi_12m") is not None:
+        return 365, "12M"
+
+    return 90, "3M"
+
+
+def _build_criteria(payload: Dict[str, Any]) -> AdvisorCriteria:
+    horizon_days, invest_period_label = _infer_horizon_days(payload or {})
+    return AdvisorCriteria(
+        sources=_normalize_sources((payload or {}).get("sources")),
+        tickers=_normalize_tickers((payload or {}).get("tickers") or (payload or {}).get("symbols")),
+        risk_profile=_safe_str((payload or {}).get("risk_profile") or "moderate").lower() or "moderate",
+        risk_bucket=_safe_str((payload or {}).get("risk_bucket") or (payload or {}).get("risk")),
+        confidence_bucket=_safe_str((payload or {}).get("confidence_bucket") or (payload or {}).get("confidence")),
+        invest_amount=_to_float((payload or {}).get("invest_amount")) or 0.0,
+        currency=_safe_str((payload or {}).get("currency") or "SAR").upper() or "SAR",
+        top_n=max(1, min(200, _to_int((payload or {}).get("top_n")) or 20)),
+        allocation_strategy=_safe_str((payload or {}).get("allocation_strategy") or "maximum_sharpe").lower(),
+        invest_period_days=horizon_days,
+        invest_period_label=invest_period_label,
+        horizon_days=horizon_days,
+        required_roi_1m=_as_ratio((payload or {}).get("required_roi_1m")),
+        required_roi_3m=_as_ratio((payload or {}).get("required_roi_3m")),
+        required_roi_12m=_as_ratio((payload or {}).get("required_roi_12m")),
+        min_price=_to_float((payload or {}).get("min_price")),
+        max_price=_to_float((payload or {}).get("max_price")),
+        min_liquidity_score=_to_float((payload or {}).get("min_liquidity_score")) or 25.0,
+        min_advisor_score=_to_float((payload or {}).get("min_advisor_score")),
+        exclude_sectors=(payload or {}).get("exclude_sectors"),
+        allowed_markets=(payload or {}).get("allowed_markets"),
+        use_row_updated_at=_truthy((payload or {}).get("use_row_updated_at", True)),
+        debug=_truthy((payload or {}).get("debug", False)),
+        raw=dict(payload or {}),
+    )
+
+
+# -----------------------------------------------------------------------------
+# Reason synthesis
+# -----------------------------------------------------------------------------
+def _fmt_pct(r: Optional[float], digits: int = 1) -> Optional[str]:
+    if r is None:
+        return None
+    try:
+        return f"{float(r) * 100:.{digits}f}%"
+    except Exception:
+        return None
+
+
+def _fmt_num(v: Optional[float], digits: int = 1) -> Optional[str]:
+    if v is None:
+        return None
+    try:
+        return f"{float(v):.{digits}f}"
+    except Exception:
+        return None
+
+
+def _build_fallback_recommendation_reason(item: Dict[str, Any], criteria: AdvisorCriteria) -> str:
+    rec = _safe_str(item.get("recommendation") or "HOLD").upper()
+    current_price = _to_float(item.get("current_price") or item.get("price"))
+    fp1 = _to_float(item.get("forecast_price_1m"))
+    fp3 = _to_float(item.get("forecast_price_3m"))
+    fp12 = _to_float(item.get("forecast_price_12m"))
+    roi1 = _as_ratio(item.get("expected_roi_1m"))
+    roi3 = _as_ratio(item.get("expected_roi_3m"))
+    roi12 = _as_ratio(item.get("expected_roi_12m"))
+    overall = _to_float(item.get("overall_score"))
+    confidence = _to_float(item.get("confidence_score"))
+    risk = _to_float(item.get("risk_score"))
+    valuation = _to_float(item.get("valuation_score"))
+    momentum = _to_float(item.get("momentum_score"))
+    quality = _to_float(item.get("quality_score"))
+    opportunity = _to_float(item.get("opportunity_score"))
+    liquidity = _to_float(item.get("liquidity_score"))
+
+    horizon = criteria.horizon_days or 90
+    if horizon <= 31:
+        horizon_label = "1M"
+        chosen_roi = roi1 if roi1 is not None else roi3
+        chosen_fp = fp1 if fp1 is not None else fp3
+    elif horizon <= 92:
+        horizon_label = "3M"
+        chosen_roi = roi3 if roi3 is not None else roi12
+        chosen_fp = fp3 if fp3 is not None else fp12
+    else:
+        horizon_label = criteria.invest_period_label or _period_label_from_days(horizon) or "12M"
+        chosen_roi = roi12 if roi12 is not None else roi3
+        chosen_fp = fp12 if fp12 is not None else fp3
+
+    parts: List[str] = []
+
+    if rec == "BUY":
+        if chosen_roi is not None and chosen_roi > 0:
+            parts.append(f"expected {horizon_label} upside is {_fmt_pct(chosen_roi)}")
+        if chosen_fp is not None and current_price is not None and chosen_fp > current_price:
+            parts.append(f"forecast price {_fmt_num(chosen_fp, 2)} is above current price {_fmt_num(current_price, 2)}")
+        if confidence is not None and confidence >= 70:
+            parts.append(f"confidence is high at {_fmt_num(confidence, 0)}/100")
+        if overall is not None and overall >= 65:
+            parts.append(f"overall score is strong at {_fmt_num(overall, 0)}/100")
+        if valuation is not None and valuation >= 60:
+            parts.append(f"valuation is supportive at {_fmt_num(valuation, 0)}/100")
+        if quality is not None and quality >= 60:
+            parts.append(f"quality is supportive at {_fmt_num(quality, 0)}/100")
+        if momentum is not None and momentum >= 60:
+            parts.append(f"momentum is positive at {_fmt_num(momentum, 0)}/100")
+        if opportunity is not None and opportunity >= 60:
+            parts.append(f"opportunity score is favorable at {_fmt_num(opportunity, 0)}/100")
+        if risk is not None and risk <= 45:
+            parts.append(f"risk remains contained at {_fmt_num(risk, 0)}/100")
+
+    elif rec == "SELL":
+        if chosen_roi is not None and chosen_roi < 0:
+            parts.append(f"expected {horizon_label} return is negative at {_fmt_pct(chosen_roi)}")
+        if chosen_fp is not None and current_price is not None and chosen_fp < current_price:
+            parts.append(f"forecast price {_fmt_num(chosen_fp, 2)} is below current price {_fmt_num(current_price, 2)}")
+        if risk is not None and risk >= 65:
+            parts.append(f"risk is elevated at {_fmt_num(risk, 0)}/100")
+        if overall is not None and overall <= 40:
+            parts.append(f"overall score is weak at {_fmt_num(overall, 0)}/100")
+        if momentum is not None and momentum <= 40:
+            parts.append(f"momentum is weak at {_fmt_num(momentum, 0)}/100")
+        if confidence is not None and confidence <= 40:
+            parts.append(f"confidence is low at {_fmt_num(confidence, 0)}/100")
+
+    else:
+        if chosen_roi is not None:
+            if abs(chosen_roi) <= 0.03:
+                parts.append(f"expected {horizon_label} move is limited at {_fmt_pct(chosen_roi)}")
+            elif chosen_roi > 0:
+                parts.append(f"upside exists but remains moderate at {_fmt_pct(chosen_roi)}")
+            else:
+                parts.append(f"downside exists but remains moderate at {_fmt_pct(chosen_roi)}")
+        if overall is not None:
+            parts.append(f"overall score is balanced at {_fmt_num(overall, 0)}/100")
+        if risk is not None and 40 <= risk <= 60:
+            parts.append(f"risk is moderate at {_fmt_num(risk, 0)}/100")
+        if confidence is not None and 45 <= confidence <= 69:
+            parts.append(f"confidence is moderate at {_fmt_num(confidence, 0)}/100")
+
+    if liquidity is not None:
+        if liquidity >= 65:
+            parts.append(f"liquidity is healthy at {_fmt_num(liquidity, 0)}/100")
+        elif liquidity <= 25:
+            parts.append(f"liquidity is weak at {_fmt_num(liquidity, 0)}/100")
+
+    if not parts:
+        if rec == "BUY":
+            return f"BUY because the {horizon_label} risk-return profile is favorable."
+        if rec == "SELL":
+            return f"SELL because the {horizon_label} risk-return profile is unfavorable."
+        return f"HOLD because the {horizon_label} risk-return profile is balanced."
+
+    return f"{rec} because " + ", ".join(parts[:4]) + "."
+
+
+# -----------------------------------------------------------------------------
+# Canonical output enrichment
+# -----------------------------------------------------------------------------
+def _ensure_items_shape(result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    items = result.get("items")
+    if isinstance(items, list) and all(isinstance(x, dict) for x in items):
+        return items
+
+    headers = result.get("headers") or []
+    rows = result.get("rows") or []
+    if isinstance(headers, list) and isinstance(rows, list):
+        out: List[Dict[str, Any]] = []
         for r in rows:
-            if not isinstance(r, dict):
-                continue
-            s = r.get("symbol") or r.get("ticker") or r.get("code") or r.get("Symbol") or r.get("Ticker") or r.get("Code")
-            s = _safe_str(s)
-            if s:
-                out.append(s)
+            if isinstance(r, (list, tuple)):
+                d: Dict[str, Any] = {}
+                for i, h in enumerate(headers):
+                    key = _snake_like(_safe_str(h))
+                    d[key] = r[i] if i < len(r) else None
+                out.append(d)
         return out
+    return []
 
-    # matrix rows
-    keys = snapshot.get("keys") or []
-    rows_matrix = snapshot.get("rows_matrix") or snapshot.get("rows")
-    if isinstance(keys, list) and isinstance(rows_matrix, list) and keys:
-        idx = None
-        for i, k in enumerate(keys):
-            lk = _safe_str(k).lower().strip()
-            if lk in {"symbol", "ticker", "code"}:
-                idx = i
-                break
-        if idx is not None:
-            for r in rows_matrix:
-                if isinstance(r, (list, tuple)) and idx < len(r):
-                    s = _safe_str(r[idx])
-                    if s:
-                        out.append(s)
+
+def _enrich_item_with_context(item: Dict[str, Any], criteria: AdvisorCriteria, meta: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(item or {})
+
+    out["symbol"] = _normalize_symbol(out.get("symbol") or out.get("ticker") or out.get("code"))
+    out["canonical"] = out.get("canonical") or _canonical_symbol(out.get("symbol"))
+    out["invest_period_label"] = _safe_str(out.get("invest_period_label")) or criteria.invest_period_label
+    out["horizon_days"] = _to_int(out.get("horizon_days")) or criteria.horizon_days
+    out["invest_period_days"] = _to_int(out.get("invest_period_days")) or criteria.invest_period_days or criteria.horizon_days
+
+    if not out.get("last_updated_utc"):
+        now_dt = _now_utc()
+        out["last_updated_utc"] = _iso_utc(now_dt)
+        out["last_updated_riyadh"] = _iso_riyadh(now_dt)
+    elif not out.get("last_updated_riyadh"):
+        parsed = _parse_iso_dt(out.get("last_updated_utc")) or _now_utc()
+        out["last_updated_riyadh"] = _iso_riyadh(parsed)
+
+    reason = _clean_reason_text(out.get("recommendation_reason"))
+    if not reason:
+        reason = _build_fallback_recommendation_reason(out, criteria)
+    out["recommendation_reason"] = reason
+
+    out["advisor_context"] = {
+        "horizon_days": out.get("horizon_days"),
+        "invest_period_label": out.get("invest_period_label"),
+        "risk_profile": criteria.risk_profile,
+        "risk_bucket": criteria.risk_bucket,
+        "confidence_bucket": criteria.confidence_bucket,
+        "allocation_strategy": criteria.allocation_strategy,
+    }
+
     return out
 
 
-async def _enrich_symbols_best_effort(engine: Any, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
-    """
-    Fetch live quotes via engine methods (preferred: batch).
-    Returns map symbol -> quote dict
-    """
-    symbols = [s for s in (_safe_str(x) for x in (symbols or [])) if s]
-    if not symbols or engine is None:
-        return {}
+def _enrich_result(result: Dict[str, Any], criteria: AdvisorCriteria) -> Dict[str, Any]:
+    out = dict(result or {})
+    items = _ensure_items_shape(out)
+    meta = dict(out.get("meta") or {})
 
-    # Batch methods first
-    for m in METHOD_GROUPS["quotes_batch"]:
-        fn = getattr(engine, m, None)
-        if not callable(fn):
-            continue
-        # Try common variants
-        variants = [
-            ((), {"symbols": symbols}),
-            ((symbols,), {}),
-            ((), {"tickers": symbols}),
-        ]
-        res, status, dur, err, _ = _safe_call_variants(engine, m, variants, timeout=10.0)
-        if status == MethodResult.SUCCESS and isinstance(res, dict):
-            # expected: {symbol: dict}
-            out: Dict[str, Dict[str, Any]] = {}
-            for k, v in res.items():
-                if isinstance(v, dict):
-                    out[_safe_str(k)] = dict(v)
-            if out:
-                return out
+    enriched_items = [_enrich_item_with_context(x, criteria, meta) for x in items]
+    out["items"] = enriched_items
 
-    # Fallback: per-symbol
-    for m in METHOD_GROUPS["quote_single"]:
-        fn = getattr(engine, m, None)
-        if not callable(fn):
-            continue
+    headers = out.get("headers")
+    rows = out.get("rows")
 
-        async def one(sym: str) -> Tuple[str, Dict[str, Any]]:
-            variants = [
-                ((sym,), {}),
-                ((), {"symbol": sym}),
-                ((), {"ticker": sym}),
-            ]
-            r, st, _dur, _err, _ = _safe_call_variants(engine, m, variants, timeout=6.0)
-            if st == MethodResult.SUCCESS:
-                if isinstance(r, dict):
-                    return sym, dict(r)
-                # if model object, try dict-like
-                try:
-                    md = getattr(r, "model_dump", None)
-                    if callable(md):
-                        return sym, md(mode="python")  # type: ignore
-                except Exception:
-                    pass
-                try:
-                    return sym, dict(getattr(r, "__dict__", {}) or {})
-                except Exception:
-                    return sym, {}
-            return sym, {}
+    if isinstance(headers, list) and isinstance(rows, list):
+        hdr_index = {str(h): i for i, h in enumerate(headers)}
+        need_new_headers = []
+        for h in ["Recommendation Reason", "Horizon Days", "Invest Period Label"]:
+            if h not in hdr_index:
+                need_new_headers.append(h)
 
-        # Run concurrently (but bounded)
-        sem = asyncio.Semaphore(12)
+        if need_new_headers:
+            headers = list(headers) + need_new_headers
+            hdr_index = {str(h): i for i, h in enumerate(headers)}
+            new_rows: List[List[Any]] = []
+            for idx, r in enumerate(rows):
+                rr = list(r) if isinstance(r, (list, tuple)) else []
+                while len(rr) < len(headers):
+                    rr.append(None)
+                item = enriched_items[idx] if idx < len(enriched_items) else {}
+                rr[hdr_index["Recommendation Reason"]] = item.get("recommendation_reason")
+                rr[hdr_index["Horizon Days"]] = item.get("horizon_days")
+                rr[hdr_index["Invest Period Label"]] = item.get("invest_period_label")
+                new_rows.append(rr)
+            out["headers"] = headers
+            out["rows"] = new_rows
 
-        async def guarded(sym: str):
-            async with sem:
-                return await one(sym)
-
-        pairs = await asyncio.gather(*(guarded(s) for s in symbols), return_exceptions=True)
-        out2: Dict[str, Dict[str, Any]] = {}
-        for p in pairs:
-            if isinstance(p, tuple) and len(p) == 2 and isinstance(p[1], dict):
-                out2[p[0]] = p[1]
-        if out2:
-            return out2
-
-    return {}
-
-
-def _merge_quote_into_row(row: Dict[str, Any], quote: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Enrichment wins only for missing/blank values (non-destructive by default).
-    """
-    out = dict(row or {})
-    q = quote or {}
-    for k, v in q.items():
-        if v is None:
-            continue
-        if k not in out or out.get(k) in (None, "", [], {}):
-            out[k] = v
+    meta["engine_version"] = "5.0.0"
+    meta["core_advisor_available"] = bool(_HAS_CORE_ADVISOR)
+    meta["criteria"] = {
+        "sources": criteria.sources,
+        "tickers": criteria.tickers,
+        "risk_profile": criteria.risk_profile,
+        "risk_bucket": criteria.risk_bucket,
+        "confidence_bucket": criteria.confidence_bucket,
+        "invest_amount": criteria.invest_amount,
+        "currency": criteria.currency,
+        "top_n": criteria.top_n,
+        "allocation_strategy": criteria.allocation_strategy,
+        "horizon_days": criteria.horizon_days,
+        "invest_period_days": criteria.invest_period_days,
+        "invest_period_label": criteria.invest_period_label,
+        "required_roi_1m": criteria.required_roi_1m,
+        "required_roi_3m": criteria.required_roi_3m,
+        "required_roi_12m": criteria.required_roi_12m,
+    }
+    meta["context_propagation"] = {
+        "recommendation_reason": True,
+        "horizon_days": True,
+        "invest_period_label": True,
+    }
+    out["meta"] = meta
     return out
 
 
-# =============================================================================
-# Engine Advisor Adapter (snapshots + live modes)
-# =============================================================================
-class EngineSnapshotAdapter:
+# -----------------------------------------------------------------------------
+# Engine class
+# -----------------------------------------------------------------------------
+class InvestmentAdvisorEngine:
     """
-    Universal adapter that makes any engine compatible with core/investment_advisor.py.
-
-    NEW in v4.2.0:
-    - supports live modes (auto/live_sheet/live_quotes)
-    - robust signature calling for keyword-only engines (DataEngineV2/V5)
+    Thin but intelligent engine layer:
+    - normalizes advisory request/criteria
+    - delegates to data_engine / quote_engine where available
+    - calls core.investment_advisor.run_investment_advisor(...)
+    - enriches final canonical output with advisory context
     """
 
     def __init__(
         self,
-        base_engine: Any,
         *,
-        cache_strategy: CacheStrategy = CacheStrategy.MEMORY,
-        cache_ttl: int = CACHE_TTL_DEFAULT,
-        discover: bool = True,
-        data_mode: AdvisorDataMode = AdvisorDataMode.AUTO,
-    ):
-        self._base = base_engine
-        self._cache = SnapshotCache(strategy=cache_strategy, default_ttl=int(cache_ttl))
-        self._capabilities = _discover_engine_capabilities(base_engine) if discover else EngineCapabilities()
-        self._created_at = datetime.now(timezone.utc)
-        self._metrics = EngineMetrics()
-        self._data_mode = data_mode
+        data_engine: Any = None,
+        quote_engine: Any = None,
+        cache_engine: Any = None,
+        settings: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        self.data_engine = data_engine
+        self.quote_engine = quote_engine or data_engine
+        self.cache_engine = cache_engine or data_engine
+        self.settings = dict(settings or {})
 
-        if self._capabilities.has_snapshot_multi or self._capabilities.has_snapshot_single:
-            self._mode = AdapterMode.NATIVE
-        elif self._capabilities.has_sheet_rows:
-            self._mode = AdapterMode.LEGACY
-        else:
-            self._mode = AdapterMode.STUB
-
-        logger.info(
-            "EngineSnapshotAdapter init | mode=%s | data_mode=%s | multi=%s | single=%s | sheet_rows=%s | quotes_batch=%s",
-            self._mode.value,
-            self._data_mode.value,
-            self._capabilities.has_snapshot_multi,
-            self._capabilities.has_snapshot_single,
-            self._capabilities.has_sheet_rows,
-            self._capabilities.has_quotes_batch,
-        )
-
-    def __repr__(self) -> str:
-        return f"<EngineSnapshotAdapter mode={self._mode.value} data_mode={self._data_mode.value} base={type(self._base).__name__}>"
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._base, name)
-
-    def set_data_mode(self, mode: AdvisorDataMode) -> None:
-        self._data_mode = mode
-
-    # -------------------------
-    # Internal: build snapshot from live sheet rows
-    # -------------------------
-    def _build_snapshot_from_sheet_rows(self, sheet_name: str) -> Optional[Dict[str, Any]]:
-        if not self._capabilities.has_sheet_rows:
-            return None
-
-        sname = str(sheet_name)
-
-        # Most important: keyword-only signature for your engine
-        body = {"include_matrix": True, "mode": "advisor"}
-
-        variants = [
-            ((), {"sheet": sname, "limit": 5000, "offset": 0, "mode": "advisor", "body": body}),
-            ((), {"sheet": sname, "limit": 5000, "offset": 0, "body": body}),
-            ((), {"sheet": sname}),
-            ((), {"page": sname, "limit": 5000, "offset": 0, "mode": "advisor", "body": body}),
-            ((sname,), {}),  # legacy positional fallback
-        ]
-
-        for method in METHOD_GROUPS["sheet_rows"]:
-            res, status, dur, err, _ = _safe_call_variants(self._base, method, variants, timeout=6.0)
-            self._metrics.record_call(method, dur, status == MethodResult.SUCCESS)
-            if status == MethodResult.SUCCESS:
-                snap = _normalize_snapshot(sname, res, source_method=method)
-                if snap is not None:
-                    return snap
-
-        return None
-
-    # -------------------------
-    # Internal: apply live quote enrichment
-    # -------------------------
-    def _enrich_snapshot_live_quotes(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Enrich rows with quotes so Advisor doesn't depend on cached snapshots content.
-        This function is SYNC wrapper that safely runs async enrichment.
-        """
-        if not isinstance(snapshot, dict):
-            return snapshot
-
-        rows = snapshot.get("rows")
-        if not (isinstance(rows, list) and rows and isinstance(rows[0], dict)):
-            # Only enrich dict rows; if matrix only, keep as-is.
-            return snapshot
-
-        symbols = _extract_symbols_from_snapshot(snapshot)
-        if not symbols:
-            return snapshot
-
-        # run async enrichment safely even if we are inside an event loop
-        async def _do() -> Dict[str, Any]:
-            quotes = await _enrich_symbols_best_effort(self._base, symbols)
-            if not quotes:
-                return snapshot
-
-            new_rows: List[Dict[str, Any]] = []
-            for r in rows:
-                if not isinstance(r, dict):
-                    continue
-                sym = _safe_str(r.get("symbol") or r.get("ticker") or r.get("code") or "")
-                q = quotes.get(sym) or quotes.get(_safe_str(r.get("symbol_normalized") or "")) or {}
-                new_rows.append(_merge_quote_into_row(r, q if isinstance(q, dict) else {}))
-
-            snap2 = dict(snapshot)
-            snap2["rows"] = new_rows
-            snap2.setdefault("meta", {})
-            if isinstance(snap2["meta"], dict):
-                snap2["meta"]["live_quotes_enriched"] = True
-                snap2["meta"]["live_quotes_count"] = len(quotes)
-            return snap2
-
-        # execute
-        try:
-            loop = asyncio.get_running_loop()
-            in_loop = loop.is_running()
-        except RuntimeError:
-            in_loop = False
-
-        if in_loop:
-            res, err, timed_out = _run_coro_in_thread(_do(), timeout=12.0)
-            if timed_out or err is not None or not isinstance(res, dict):
-                return snapshot
-            return res
-
-        try:
-            return asyncio.run(asyncio.wait_for(_do(), timeout=12.0))
-        except Exception:
-            return snapshot
-
-    # -------------------------
-    # Public: snapshot getters used by core/investment_advisor.py
-    # -------------------------
-    def get_cached_sheet_snapshot(self, sheet_name: str) -> Optional[Dict[str, Any]]:
-        sname = str(sheet_name)
-
-        # 1) cache
-        ent = self._cache.get(sname)
-        if ent is not None:
-            snap = dict(ent.snapshot)
-            snap.setdefault("cached_at_utc", ent.cached_at.isoformat())
-            snap.setdefault("cached", True)
-            snap.setdefault("adapter_mode", self._mode.value)
-            snap.setdefault("advisor_data_mode", self._data_mode.value)
-            return snap
-
-        self._metrics.cache_misses += 1
-
-        # Helper to store & return
-        def _store_and_return(snap: Dict[str, Any], source: str) -> Dict[str, Any]:
-            ent2 = self._cache.set(sname, snap, source, ttl=CACHE_TTL_SHEET)
-            out = dict(snap)
-            out["cached_at_utc"] = ent2.cached_at.isoformat()
-            out["cached"] = False
-            out["adapter_mode"] = self._mode.value
-            out["advisor_data_mode"] = self._data_mode.value
-            return out
-
-        # Mode decision
-        mode = self._data_mode
-
-        # 2) snapshot-only
-        if mode in (AdvisorDataMode.SNAPSHOT, AdvisorDataMode.AUTO) and self._capabilities.has_snapshot_single:
-            for method in METHOD_GROUPS["snapshot_single"]:
-                variants = [
-                    ((sname,), {}),
-                    ((), {"sheet": sname}),
-                    ((), {"page": sname}),
-                    ((), {"sheet_name": sname}),
-                ]
-                res, status, dur, err, _ = _safe_call_variants(self._base, method, variants, timeout=3.5)
-                self._metrics.record_call(method, dur, status == MethodResult.SUCCESS)
-                if status == MethodResult.SUCCESS:
-                    snap = _normalize_snapshot(sname, res, source_method=method)
-                    if snap is not None:
-                        if mode == AdvisorDataMode.AUTO:
-                            # If snapshot is empty, fall through to live
-                            if not snap.get("rows") and not snap.get("rows_matrix"):
-                                break
-                        return _store_and_return(snap, method)
-
-        # 3) live_sheet / live_quotes / auto fallback
-        if mode in (AdvisorDataMode.LIVE_SHEET, AdvisorDataMode.LIVE_QUOTES, AdvisorDataMode.AUTO):
-            snap_live = self._build_snapshot_from_sheet_rows(sname)
-            if snap_live is not None:
-                if mode in (AdvisorDataMode.LIVE_QUOTES, AdvisorDataMode.AUTO):
-                    snap_live = self._enrich_snapshot_live_quotes(snap_live)
-                return _store_and_return(snap_live, snap_live.get("source_method") or "sheet_rows")
-
-        return None
-
+    # ------------------------------------------------------------------
+    # engine compatibility methods used by core/investment_advisor.py
+    # ------------------------------------------------------------------
     def get_cached_multi_sheet_snapshots(self, sheet_names: List[str]) -> Dict[str, Dict[str, Any]]:
-        names = [str(x) for x in (sheet_names or []) if str(x).strip()]
+        sheet_names = [str(x) for x in (sheet_names or []) if str(x).strip()]
         out: Dict[str, Dict[str, Any]] = {}
-        if not names:
-            return out
 
-        # Try native multi snapshots if allowed
-        if self._data_mode in (AdvisorDataMode.SNAPSHOT, AdvisorDataMode.AUTO) and self._capabilities.has_snapshot_multi:
-            for method in METHOD_GROUPS["snapshot_multi"]:
-                variants = [
-                    ((names,), {}),
-                    ((), {"sheets": names}),
-                    ((), {"pages": names}),
-                    ((), {"sheet_names": names}),
-                ]
-                res, status, dur, err, _ = _safe_call_variants(self._base, method, variants, timeout=6.0)
-                self._metrics.record_call(method, dur, status == MethodResult.SUCCESS)
-                if status == MethodResult.SUCCESS and isinstance(res, dict):
-                    for sheet, snap_obj in res.items():
-                        sname = str(sheet)
-                        snap = _normalize_snapshot(sname, snap_obj, source_method=method)
-                        if snap is None:
-                            continue
-                        ent2 = self._cache.set(sname, snap, method, ttl=CACHE_TTL_SHEET)
-                        snap2 = dict(snap)
-                        snap2["cached_at_utc"] = ent2.cached_at.isoformat()
-                        snap2["cached"] = False
-                        snap2["adapter_mode"] = self._mode.value
-                        snap2["advisor_data_mode"] = self._data_mode.value
-                        out[sname] = snap2
+        targets = [self.cache_engine, self.data_engine]
+        for target in targets:
+            if target is None:
+                continue
 
-                    # In AUTO mode: if we got some snapshots but not all, we'll fill the rest live.
-                    if out and self._data_mode != AdvisorDataMode.AUTO:
+            for method in ["get_cached_multi_sheet_snapshots", "get_multi_sheet_snapshots"]:
+                res, err = _safe_call(target, method, sheet_names)
+                if err is None and isinstance(res, dict):
+                    for k, v in res.items():
+                        if isinstance(v, dict):
+                            out[str(k)] = v
+                    if out:
                         return out
 
-        # Fallback: per-sheet getter (handles live modes)
-        for s in names:
-            snap = self.get_cached_sheet_snapshot(s)
-            if snap is not None:
-                out[s] = snap
-
+        for s in sheet_names:
+            one = self.get_cached_sheet_snapshot(s)
+            if isinstance(one, dict):
+                out[s] = one
         return out
 
-    # Pass-through helper methods (optional)
-    def get_news_score(self, symbol: str) -> Optional[float]:
-        if not self._capabilities.has_news:
-            return None
-        for method in METHOD_GROUPS["news"]:
-            res, status, dur, err = _safe_call(self._base, method, symbol, timeout=1.8)
-            self._metrics.record_call(method, dur, status == MethodResult.SUCCESS)
-            if status == MethodResult.SUCCESS:
-                try:
-                    return float(res)
-                except Exception:
-                    return None
+    def get_cached_sheet_snapshot(self, sheet_name: str) -> Optional[Dict[str, Any]]:
+        targets = [self.cache_engine, self.data_engine]
+        for target in targets:
+            if target is None:
+                continue
+            for method in ["get_cached_sheet_snapshot", "get_sheet_snapshot", "read_cached_sheet_snapshot"]:
+                res, err = _safe_call(target, method, sheet_name)
+                if err is None and isinstance(res, dict):
+                    return res
         return None
 
-    def get_technical_signals(self, symbol: str) -> Dict[str, Any]:
-        if not self._capabilities.has_technical:
+    def get_sheet_rows(
+        self,
+        sheet: Optional[str] = None,
+        limit: int = 5000,
+        offset: int = 0,
+        mode: Optional[str] = None,
+        body: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        page = sheet or kwargs.get("sheet_name") or kwargs.get("page") or kwargs.get("name") or ""
+        page = _normalize_page_name(page, allow_output_pages=True) if page else page
+
+        targets = [self.data_engine]
+        method_candidates = [
+            "get_sheet_rows",
+            "sheet_rows",
+            "build_sheet_rows",
+            "get_sheet",
+            "fetch_sheet",
+            "get_rows",
+        ]
+
+        for target in targets:
+            if target is None:
+                continue
+            for method in method_candidates:
+                variants = [
+                    ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode, "body": body or {}}),
+                    ((), {"sheet": page, "limit": limit, "offset": offset}),
+                    ((), {"page": page, "limit": limit, "offset": offset}),
+                    ((page,), {}),
+                ]
+                for args, kw in variants:
+                    res, err = _safe_call(target, method, *args, **{k: v for k, v in kw.items() if v is not None})
+                    if err is None and isinstance(res, dict):
+                        return res
+
+        return {"headers": [], "rows": [], "rows_matrix": [], "meta": {"ok": False, "sheet": page, "error": "sheet rows unavailable"}}
+
+    def get_enriched_quotes_batch(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+        syms = [_normalize_symbol(x) for x in (symbols or []) if _normalize_symbol(x)]
+        if not syms:
             return {}
-        for method in METHOD_GROUPS["technical"]:
-            res, status, dur, err = _safe_call(self._base, method, symbol, timeout=2.0)
-            self._metrics.record_call(method, dur, status == MethodResult.SUCCESS)
-            if status == MethodResult.SUCCESS and isinstance(res, dict):
-                return res
+
+        targets = [self.quote_engine, self.data_engine]
+        methods = [
+            "get_enriched_quotes_batch",
+            "get_quotes_batch",
+            "fetch_quotes_batch",
+            "batch_quotes",
+        ]
+        for target in targets:
+            if target is None:
+                continue
+            for method in methods:
+                for args, kwargs in [
+                    ((), {"symbols": syms}),
+                    ((syms,), {}),
+                    ((), {"tickers": syms}),
+                ]:
+                    res, err = _safe_call(target, method, *args, **kwargs)
+                    if err is None and isinstance(res, dict):
+                        out: Dict[str, Dict[str, Any]] = {}
+                        for k, v in res.items():
+                            if isinstance(v, dict):
+                                out[_normalize_symbol(k)] = dict(v)
+                        if out:
+                            return out
         return {}
 
-    def get_historical_returns(self, symbol: str, periods: List[str]) -> Dict[str, Optional[float]]:
-        if not self._capabilities.has_historical:
-            return {}
-        for method in METHOD_GROUPS["historical"]:
-            res, status, dur, err = _safe_call(self._base, method, symbol, periods, timeout=3.0)
-            self._metrics.record_call(method, dur, status == MethodResult.SUCCESS)
-            if status == MethodResult.SUCCESS and isinstance(res, dict):
-                out: Dict[str, Optional[float]] = {}
-                for k, v in res.items():
-                    try:
-                        out[str(k)] = float(v) if v is not None else None
-                    except Exception:
-                        out[str(k)] = None
-                return out
-        return {}
+    # ------------------------------------------------------------------
+    # primary runner
+    # ------------------------------------------------------------------
+    def run(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        payload = dict(payload or {})
+        criteria = _build_criteria(payload)
 
-    def clear_cache(self) -> None:
-        self._cache.clear()
+        forwarded_payload = criteria.to_payload()
+        forwarded_payload.setdefault("advisor_data_mode", payload.get("advisor_data_mode") or payload.get("data_mode") or "live_quotes")
 
-    def warm_cache(self, sheet_names: List[str]) -> Dict[str, bool]:
-        results: Dict[str, bool] = {}
-        for s in sheet_names or []:
-            try:
-                results[str(s)] = self.get_cached_sheet_snapshot(str(s)) is not None
-            except Exception:
-                results[str(s)] = False
-        return results
-
-    def get_metrics(self) -> Dict[str, Any]:
-        return {
-            "adapter": {
-                "mode": self._mode.value,
-                "advisor_data_mode": self._data_mode.value,
-                "created_at_utc": self._created_at.isoformat(),
-                "uptime_seconds": round((datetime.now(timezone.utc) - self._created_at).total_seconds(), 2),
-            },
-            "capabilities": {
-                "snapshot_multi": self._capabilities.has_snapshot_multi,
-                "snapshot_single": self._capabilities.has_snapshot_single,
-                "sheet_rows": self._capabilities.has_sheet_rows,
-                "quotes_batch": self._capabilities.has_quotes_batch,
-                "quote_single": self._capabilities.has_quote_single,
-                "news": self._capabilities.has_news,
-                "technical": self._capabilities.has_technical,
-                "historical": self._capabilities.has_historical,
-            },
-            "metrics": self._metrics.to_dict(),
-            "cache": self._cache.get_metrics(),
-        }
-
-    def health_check(self) -> Dict[str, Any]:
-        total_errors = sum(self._metrics.method_errors.values())
-        status = "healthy"
-        issues: List[str] = []
-
-        if self._mode == AdapterMode.STUB:
-            status = "unhealthy"
-            issues.append("No usable engine methods detected (no snapshots and no sheet_rows).")
-
-        if total_errors > 50:
-            status = "degraded"
-            issues.append(f"High method error count: {total_errors}")
-
-        return {
-            "status": status,
-            "issues": issues,
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-            "metrics": self.get_metrics(),
-        }
-
-
-# =============================================================================
-# Main Entry Point
-# =============================================================================
-def _parse_data_mode(payload: Dict[str, Any]) -> AdvisorDataMode:
-    # payload override
-    raw = (
-        (payload or {}).get("data_mode")
-        or (payload or {}).get("advisor_data_mode")
-        or (payload or {}).get("mode")
-        or ""
-    )
-    raw = str(raw).strip().lower()
-
-    # env default
-    if not raw:
-        raw = str(os.getenv("ADVISOR_DATA_MODE", "auto") or "auto").strip().lower()
-
-    mapping = {
-        "snapshot": AdvisorDataMode.SNAPSHOT,
-        "snapshots": AdvisorDataMode.SNAPSHOT,
-        "live": AdvisorDataMode.LIVE_QUOTES,
-        "live_quotes": AdvisorDataMode.LIVE_QUOTES,
-        "quotes": AdvisorDataMode.LIVE_QUOTES,
-        "live_sheet": AdvisorDataMode.LIVE_SHEET,
-        "sheet": AdvisorDataMode.LIVE_SHEET,
-        "auto": AdvisorDataMode.AUTO,
-    }
-    return mapping.get(raw, AdvisorDataMode.AUTO)
-
-
-def run_investment_advisor(
-    payload: Dict[str, Any],
-    *,
-    engine: Any = None,
-    cache_strategy: str = "memory",
-    cache_ttl: int = CACHE_TTL_DEFAULT,
-    debug: bool = False,
-) -> Dict[str, Any]:
-    """
-    Engine-level entry that ALWAYS passes an advisor-compatible engine object to core advisor.
-
-    Key change vs v4.1.0:
-    - We wrap the engine with EngineSnapshotAdapter even if it has some snapshot methods,
-      because AUTO live fallback is required to prevent empty advisor results.
-    """
-    with TraceContext("run_investment_advisor_engine", {"debug": bool(debug)}):
-        start_time = time.time()
-        request_id = uuid.uuid4().hex[:12]
-
-        if debug:
-            try:
-                logger.setLevel(logging.DEBUG)
-            except Exception:
-                pass
-
-        response: Dict[str, Any] = {
-            "headers": DEFAULT_HEADERS.copy(),
-            "rows": [],
-            "items": [],
-            "meta": {
-                "ok": False,
-                "engine_version": ENGINE_VERSION,
-                "request_id": request_id,
-                "error": None,
-                "runtime_ms": 0,
-            },
-        }
-
-        try:
-            # cache strategy
-            try:
-                strat = CacheStrategy(str(cache_strategy or "memory").lower())
-            except Exception:
-                strat = CacheStrategy.MEMORY
-
-            data_mode = _parse_data_mode(payload or {})
-
-            eng_obj = engine
-            adapter_mode = "none"
-
-            if engine is not None:
-                # Always wrap to ensure live fallback works and keyword-only calls are handled.
-                eng_obj = EngineSnapshotAdapter(
-                    engine,
-                    cache_strategy=strat,
-                    cache_ttl=int(cache_ttl),
-                    discover=True,
-                    data_mode=data_mode,
-                )
-                adapter_mode = "wrapped"
-            else:
-                adapter_mode = "none"
-
-            # import core advisor
-            try:
-                from core.investment_advisor import run_investment_advisor as core_run  # type: ignore
-                from core.investment_advisor import ADVISOR_VERSION as CORE_VERSION  # type: ignore
-            except Exception:
-                from .investment_advisor import run_investment_advisor as core_run  # type: ignore
-                from .investment_advisor import ADVISOR_VERSION as CORE_VERSION  # type: ignore
-
-            core_result = core_run(payload or {}, engine=eng_obj)
-
-            if not isinstance(core_result, dict):
-                raise ValueError(f"Core advisor returned non-dict: {type(core_result)}")
-
-            headers = core_result.get("headers")
-            rows = core_result.get("rows")
-            items = core_result.get("items")
-            meta = core_result.get("meta")
-
-            if not isinstance(headers, list) or not headers:
-                headers = DEFAULT_HEADERS.copy()
-            if not isinstance(rows, list):
-                rows = []
-            if not isinstance(items, list):
-                items = []
-            if not isinstance(meta, dict):
-                meta = {}
-
-            runtime_ms = int((time.time() - start_time) * 1000)
-
-            meta.update(
-                {
-                    "ok": bool(meta.get("ok", True)),
-                    "engine_version": ENGINE_VERSION,
-                    "core_version": meta.get("core_version") or CORE_VERSION,
-                    "adapter_mode": adapter_mode,
-                    "advisor_data_mode": data_mode.value,
-                    "cache_strategy": strat.value,
-                    "cache_ttl_sec": int(cache_ttl),
-                    "request_id": request_id,
-                    "runtime_ms_engine_layer": runtime_ms,
-                    "runtime_ms": int(meta.get("runtime_ms") or runtime_ms),
-                }
-            )
-
-            # Helpful diagnostics when empty
-            if adapter_mode == "wrapped" and hasattr(eng_obj, "get_metrics"):
-                try:
-                    meta["adapter_metrics"] = eng_obj.get_metrics()  # type: ignore[attr-defined]
-                except Exception:
-                    pass
-
-            response.update({"headers": headers, "rows": rows, "items": items, "meta": meta})
-
-            advisor_engine_requests.labels(status="success").inc()
-            advisor_engine_duration.observe(time.time() - start_time)
-
-            return response
-
-        except Exception as e:
-            if debug:
-                try:
-                    import traceback  # noqa
-
-                    response["meta"]["traceback"] = traceback.format_exc()
-                except Exception:
-                    pass
-
-            response["meta"].update(
-                {
+        if not _HAS_CORE_ADVISOR or run_investment_advisor is None:
+            return {
+                "headers": [],
+                "rows": [],
+                "items": [],
+                "meta": {
                     "ok": False,
-                    "error": str(e),
-                    "runtime_ms": int((time.time() - start_time) * 1000),
-                }
-            )
+                    "engine_version": "5.0.0",
+                    "error": "core.investment_advisor.run_investment_advisor unavailable",
+                    "criteria": asdict(criteria),
+                },
+            }
 
-            advisor_engine_requests.labels(status="error").inc()
-            advisor_engine_duration.observe(time.time() - start_time)
-            return response
+        result = run_investment_advisor(forwarded_payload, engine=self)
+        if not isinstance(result, dict):
+            return {
+                "headers": [],
+                "rows": [],
+                "items": [],
+                "meta": {
+                    "ok": False,
+                    "engine_version": "5.0.0",
+                    "error": "advisor returned invalid response type",
+                    "criteria": asdict(criteria),
+                },
+            }
+
+        enriched = _enrich_result(result, criteria)
+        return enriched
+
+    # ------------------------------------------------------------------
+    # optional async wrapper
+    # ------------------------------------------------------------------
+    async def run_async(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        return self.run(payload)
+
+    # ------------------------------------------------------------------
+    # convenience health/debug snapshot
+    # ------------------------------------------------------------------
+    def health_snapshot(self) -> Dict[str, Any]:
+        return {
+            "ok": True,
+            "engine_version": "5.0.0",
+            "core_advisor_available": bool(_HAS_CORE_ADVISOR),
+            "page_catalog": bool(_HAS_PAGE_CATALOG),
+            "schema_registry": bool(_HAS_SCHEMA),
+            "data_engine": type(self.data_engine).__name__ if self.data_engine is not None else None,
+            "quote_engine": type(self.quote_engine).__name__ if self.quote_engine is not None else None,
+            "cache_engine": type(self.cache_engine).__name__ if self.cache_engine is not None else None,
+            "timestamp_utc": _iso_utc(_now_utc()),
+        }
 
 
-# =============================================================================
-# Compatibility aliases
-# =============================================================================
-def run_investment_advisor_engine(payload: Dict[str, Any], *, engine: Any = None) -> Dict[str, Any]:
-    return run_investment_advisor(payload, engine=engine)
+# -----------------------------------------------------------------------------
+# module-level convenience function
+# -----------------------------------------------------------------------------
+def run_investment_advisor_engine(payload: Optional[Dict[str, Any]] = None, *, data_engine: Any = None, quote_engine: Any = None, cache_engine: Any = None) -> Dict[str, Any]:
+    engine = InvestmentAdvisorEngine(
+        data_engine=data_engine,
+        quote_engine=quote_engine,
+        cache_engine=cache_engine,
+    )
+    return engine.run(payload or {})
 
 
-def create_engine_adapter(
-    engine: Any,
-    cache_strategy: str = "memory",
-    cache_ttl: int = CACHE_TTL_DEFAULT,
-    data_mode: str = "auto",
-) -> EngineSnapshotAdapter:
-    try:
-        strat = CacheStrategy(str(cache_strategy or "memory").lower())
-    except Exception:
-        strat = CacheStrategy.MEMORY
-    mode = _parse_data_mode({"data_mode": data_mode})
-    return EngineSnapshotAdapter(engine, cache_strategy=strat, cache_ttl=int(cache_ttl), data_mode=mode)
-
-
-# =============================================================================
-# Module exports
-# =============================================================================
 __all__ = [
-    "run_investment_advisor",
+    "InvestmentAdvisorEngine",
+    "AdvisorCriteria",
     "run_investment_advisor_engine",
-    "create_engine_adapter",
-    "EngineSnapshotAdapter",
-    "ENGINE_VERSION",
-    "DEFAULT_HEADERS",
-    "DEFAULT_SOURCES",
-    "CacheStrategy",
-    "AdapterMode",
-    "AdvisorDataMode",
-    "SnapshotEntry",
 ]
