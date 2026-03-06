@@ -2,9 +2,10 @@
 # core/analysis/top10_selector.py
 """
 ================================================================================
-Top 10 Selector — v3.1.0
+Top 10 Selector — v3.2.0
 ================================================================================
 LIVE • SCHEMA-FIRST • TOP10-METADATA COMPLETE • ROUTE-COMPATIBLE • SHEET-FRIENDLY
+FAIL-SAFE • BODY-AWARE • CRITERIA-AWARE • FALLBACK-ENHANCED
 
 Purpose
 -------
@@ -26,6 +27,22 @@ Primary guarantees
 - Uses live quotes when available, snapshot fallback only when necessary
 - Does not fail only because some optional fields are missing
 - No network I/O at import-time
+
+New in v3.2.0
+-------------
+- ✅ FIX: Stronger route/body compatibility:
+    - accepts body.criteria
+    - accepts body.filters
+    - accepts body.criteria_snapshot
+    - accepts body.symbols / body.tickers as direct Top10 input
+- ✅ FIX: If explicit symbols are provided by route/body, selector uses them directly
+- ✅ FIX: Better fallback row candidate extraction from page rows / snapshots
+- ✅ FIX: More tolerant ROI extraction from multiple possible field names
+- ✅ FIX: More tolerant confidence / score / risk / provider inference
+- ✅ FIX: Better quote merge behavior for final Top-N enrichment
+- ✅ FIX: Returns richer meta and warning trail for root-cause diagnosis
+- ✅ FIX: build_rows / alias builders now route through the same canonical logic
+- ✅ SAFE: Does not crash if engine methods differ across versions
 
 Public APIs
 -----------
@@ -59,12 +76,12 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 logger = logging.getLogger("core.analysis.top10_selector")
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "3.1.0"
+TOP10_SELECTOR_VERSION = "3.2.0"
 TOP10_PAGE_NAME = "Top_10_Investments"
 RIYADH_TZ = timezone(timedelta(hours=3))
 
@@ -154,29 +171,36 @@ def _to_payload(obj: Any) -> Dict[str, Any]:
     if obj is None:
         return {}
     if isinstance(obj, dict):
-        return obj
+        return dict(obj)
 
     md = getattr(obj, "model_dump", None)
     if callable(md):
         try:
-            return md(mode="python")
+            out = md(mode="python")
+            return out if isinstance(out, dict) else {}
         except Exception:
             try:
-                return md()  # type: ignore
+                out = md()  # type: ignore
+                return out if isinstance(out, dict) else {}
             except Exception:
                 return {}
 
     d = getattr(obj, "dict", None)
     if callable(d):
         try:
-            return d()
+            out = d()
+            return out if isinstance(out, dict) else {}
         except Exception:
             return {}
 
     try:
-        return dict(getattr(obj, "__dict__", {})) or {}
+        dd = getattr(obj, "__dict__", None)
+        if isinstance(dd, dict):
+            return dict(dd)
     except Exception:
-        return {}
+        pass
+
+    return {}
 
 
 def _json_dumps_safe(obj: Any) -> str:
@@ -226,6 +250,31 @@ def _dict_get_ci(d: Mapping[str, Any], *keys: str) -> Any:
         if nk in norm:
             return norm[nk]
     return None
+
+
+def _coerce_to_list(v: Any) -> List[Any]:
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return v
+    if isinstance(v, tuple):
+        return list(v)
+    if isinstance(v, set):
+        return list(v)
+    if isinstance(v, str):
+        s = v.strip()
+        if not s:
+            return []
+        return [p.strip() for p in re.split(r"[,\;\|\n]+", s) if p.strip()]
+    return [v]
+
+
+def _merge_dicts(*dicts: Any) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for d in dicts:
+        if isinstance(d, dict):
+            out.update({k: v for k, v in d.items()})
+    return out
 
 
 # =============================================================================
@@ -430,13 +479,29 @@ def _resolve_engine_from_request(request: Any) -> Any:
     return None
 
 
+def _extract_body_criteria(body: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    if not isinstance(body, dict):
+        return {}
+
+    merged: Dict[str, Any] = {}
+    merged.update(body)
+
+    for nested_key in ("criteria", "filters", "criteria_snapshot"):
+        nested = body.get(nested_key)
+        if isinstance(nested, dict):
+            merged.update(nested)
+
+    return merged
+
+
 def _resolve_limit(limit: Any, criteria: Optional[Dict[str, Any]], body: Optional[Dict[str, Any]]) -> int:
+    body_criteria = _extract_body_criteria(body)
     v = _first_non_none(
         limit,
         (criteria or {}).get("top_n") if isinstance(criteria, dict) else None,
         (criteria or {}).get("limit") if isinstance(criteria, dict) else None,
-        (body or {}).get("top_n") if isinstance(body, dict) else None,
-        (body or {}).get("limit") if isinstance(body, dict) else None,
+        body_criteria.get("top_n"),
+        body_criteria.get("limit"),
         10,
     )
     n = int(_safe_float(v, 10) or 10)
@@ -452,9 +517,7 @@ def _merge_criteria_sources(
 ) -> Criteria:
     base = load_criteria_best_effort(engine)
 
-    merged: Dict[str, Any] = {}
-    if isinstance(body, dict):
-        merged.update(body)
+    merged = _extract_body_criteria(body)
     if isinstance(criteria, dict):
         merged.update(criteria)
 
@@ -470,6 +533,20 @@ def _extract_route_mode(mode: Any, body: Optional[Dict[str, Any]]) -> str:
     if isinstance(body, dict):
         return _safe_str(body.get("mode"))
     return ""
+
+
+def _extract_direct_symbols(body: Optional[Dict[str, Any]]) -> List[str]:
+    if not isinstance(body, dict):
+        return []
+
+    out: List[str] = []
+    for key in ("symbols", "tickers", "tickers_list", "symbol_list", "selected_symbols"):
+        vals = _coerce_to_list(body.get(key))
+        for v in vals:
+            sym = _normalize_symbol(_safe_str(v))
+            if sym:
+                out.append(sym)
+    return _dedupe_keep_order(out)
 
 
 # =============================================================================
@@ -527,11 +604,15 @@ def _get_snapshot(engine: Any, page: str) -> Optional[Dict[str, Any]]:
         if callable(fn):
             try:
                 snap = fn(**kwargs)
+                if inspect.isawaitable(snap):
+                    return None
                 if isinstance(snap, dict):
                     return snap
             except TypeError:
                 try:
                     snap = fn(page)
+                    if inspect.isawaitable(snap):
+                        return None
                     if isinstance(snap, dict):
                         return snap
                 except Exception:
@@ -747,7 +828,7 @@ async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "") 
             else:
                 out[s] = {"symbol": s, "warnings": "engine_missing_quote_methods"}
         except Exception as e:
-            out[s] = {"symbol": s, "warnings": f"quote_error: {e}"}
+            out[s] = {"symbol": s, "warnings": f"quote_error:{e}"}
 
     return out
 
@@ -819,34 +900,50 @@ def _risk_from_bucket(bucket: str) -> float:
 
 
 def _get_confidence(d: Dict[str, Any]) -> float:
-    v = d.get("forecast_confidence", None)
-    if v is None:
-        v = d.get("confidence_score", None)
+    v = _first_non_none(
+        d.get("forecast_confidence"),
+        d.get("confidence_score"),
+        d.get("confidence"),
+        _dict_get_ci(d, "Forecast Confidence", "Confidence Score", "Confidence"),
+    )
     f = _safe_float(v, 0.0) or 0.0
     f = float(f / 100.0) if f > 1.5 else float(f)
     return _clamp(f, 0.0, 1.0)
 
 
 def _get_overall_score(d: Dict[str, Any]) -> float:
-    v = d.get("overall_score", None)
-    if v is None:
-        v = d.get("opportunity_score", None)
+    v = _first_non_none(
+        d.get("overall_score"),
+        d.get("opportunity_score"),
+        d.get("score"),
+        _dict_get_ci(d, "Overall Score", "Opportunity Score", "Score"),
+    )
     f = _safe_float(v, 0.0) or 0.0
     f = float(f * 100.0) if 0.0 < f <= 1.5 else float(f)
     return _clamp(f, 0.0, 100.0)
 
 
 def _get_risk_score(d: Dict[str, Any]) -> float:
-    v = d.get("risk_score", None)
+    v = _first_non_none(
+        d.get("risk_score"),
+        d.get("risk"),
+        _dict_get_ci(d, "Risk Score", "Risk"),
+    )
     f = _safe_float(v, None)
     if f is None:
-        return _risk_from_bucket(_safe_str(d.get("risk_bucket", "")))
+        bucket = _first_non_none(d.get("risk_bucket"), _dict_get_ci(d, "Risk Bucket"))
+        return _risk_from_bucket(_safe_str(bucket))
     f = float(f * 100.0) if 0.0 < f <= 1.5 else float(f)
     return _clamp(f, 0.0, 100.0)
 
 
 def _get_volume(d: Dict[str, Any]) -> float:
-    v = d.get("volume", None)
+    v = _first_non_none(
+        d.get("volume"),
+        d.get("avg_volume_10d"),
+        d.get("avg_volume_30d"),
+        _dict_get_ci(d, "Volume", "Avg Volume 10D", "Avg Volume 30D"),
+    )
     f = _safe_float(v, 0.0) or 0.0
     return max(0.0, float(f))
 
@@ -863,9 +960,37 @@ def _extract_symbol_from_row(row: Dict[str, Any]) -> str:
     return _normalize_symbol(_safe_str(sym))
 
 
-def _extract_candidate_from_quote(*, sym: str, page: str, quote: Dict[str, Any], horizon: str) -> Optional[Candidate]:
+def _extract_roi_from_any(d: Dict[str, Any], horizon: str) -> Optional[float]:
     roi_key = horizon_to_roi_key(horizon)
-    roi = _as_fraction(quote.get(roi_key))
+    candidates = [
+        d.get(roi_key),
+        d.get("expected_roi_3m"),
+        d.get("expected_roi_1m"),
+        d.get("expected_roi_12m"),
+        d.get("upside_pct"),
+        d.get("target_return"),
+        d.get("expected_return"),
+        d.get("return_pct"),
+        _dict_get_ci(
+            d,
+            roi_key,
+            "Expected ROI 3M",
+            "Expected ROI 1M",
+            "Expected ROI 12M",
+            "Upside %",
+            "Target Return",
+            "Expected Return",
+        ),
+    ]
+    for v in candidates:
+        roi = _as_fraction(v)
+        if roi is not None:
+            return roi
+    return None
+
+
+def _extract_candidate_from_quote(*, sym: str, page: str, quote: Dict[str, Any], horizon: str) -> Optional[Candidate]:
+    roi = _extract_roi_from_any(quote, horizon)
     if roi is None:
         return None
 
@@ -898,8 +1023,7 @@ def _extract_candidate_from_row(*, page: str, row: Dict[str, Any], horizon: str)
     if not sym:
         return None
 
-    roi_key = horizon_to_roi_key(horizon)
-    roi = _as_fraction(_first_non_none(row.get(roi_key), row.get("upside_pct"), row.get("target_return")))
+    roi = _extract_roi_from_any(row, horizon)
     if roi is None:
         return None
 
@@ -971,7 +1095,13 @@ async def _enrich_top(engine: Any, symbols: List[str], *, mode: str = "") -> Dic
 # =============================================================================
 # Core selection
 # =============================================================================
-async def select_top10(*, engine: Any, criteria: Criteria, mode: str = "") -> Tuple[List[Candidate], Dict[str, Any]]:
+async def select_top10(
+    *,
+    engine: Any,
+    criteria: Criteria,
+    mode: str = "",
+    direct_symbols: Optional[List[str]] = None,
+) -> Tuple[List[Candidate], Dict[str, Any]]:
     t0 = time.time()
     horizon = criteria.horizon()
     roi_key = horizon_to_roi_key(horizon)
@@ -986,22 +1116,30 @@ async def select_top10(*, engine: Any, criteria: Criteria, mode: str = "") -> Tu
     universe: List[Tuple[str, str]] = []
     warnings: List[str] = []
 
-    for page in pages:
-        page_symbols = await _get_universe_symbols_live(engine, page, limit=per_page_limit)
-        page_rows = await _get_page_rows_live(engine, page, limit=per_page_limit)
+    # Direct symbol path from body/route
+    direct_symbols = [_normalize_symbol(s) for s in (direct_symbols or []) if _normalize_symbol(s)]
+    if direct_symbols:
+        default_page = pages[0] if pages else "Market_Leaders"
+        for s in _dedupe_keep_order(direct_symbols):
+            universe.append((s, default_page))
+        warnings.append(f"used_direct_symbols:{len(direct_symbols)}")
 
-        if page_symbols:
-            for s in page_symbols:
-                universe.append((s, page))
-        else:
-            warnings.append(f"universe_empty:{page}")
+    # Normal universe discovery if direct symbols are not enough
+    if not universe:
+        for page in pages:
+            page_symbols = await _get_universe_symbols_live(engine, page, limit=per_page_limit)
+            page_rows = await _get_page_rows_live(engine, page, limit=per_page_limit)
 
-        # Additional fallback: if rows contain directly scoreable candidates, use them later
-        # through row-candidate extraction even when symbol listing is weak.
-        if not page_symbols and not page_rows:
-            snap = _get_snapshot(engine, page)
-            if isinstance(snap, dict) and isinstance(snap.get("rows"), list):
-                warnings.append(f"snapshot_present_but_no_symbols:{page}")
+            if page_symbols:
+                for s in page_symbols:
+                    universe.append((s, page))
+            else:
+                warnings.append(f"universe_empty:{page}")
+
+            if not page_symbols and not page_rows:
+                snap = _get_snapshot(engine, page)
+                if isinstance(snap, dict) and isinstance(snap.get("rows"), list):
+                    warnings.append(f"snapshot_present_but_no_symbols:{page}")
 
     seen_u: Set[str] = set()
     universe_dedup: List[Tuple[str, str]] = []
@@ -1102,6 +1240,7 @@ async def select_top10(*, engine: Any, criteria: Criteria, mode: str = "") -> Tu
         "horizon": horizon,
         "roi_key": roi_key,
         "pages_selected": pages,
+        "direct_symbols_count": len(direct_symbols or []),
         "universe_symbols": len(symbols),
         "quotes_returned": len(qmap),
         "candidates": len(candidates),
@@ -1350,12 +1489,20 @@ def _ensure_required_top10_fields(raw: Dict[str, Any], *, rank: int, criteria: C
     roi_key = horizon_to_roi_key(horizon)
     forecast_price_key = horizon_to_forecast_price_key(horizon)
 
-    raw.setdefault("name", raw.get("company_name") or raw.get("long_name") or raw.get("instrument_name") or "")
-    raw.setdefault("current_price", raw.get("price") or raw.get("last") or raw.get("close"))
+    raw.setdefault("name", raw.get("company_name") or raw.get("long_name") or raw.get("instrument_name") or raw.get("Name") or "")
+    raw.setdefault("current_price", raw.get("price") or raw.get("last") or raw.get("close") or raw.get("Current Price"))
     raw.setdefault("forecast_confidence", raw.get("confidence_score") if raw.get("forecast_confidence") is None else raw.get("forecast_confidence"))
 
     if raw.get(roi_key) is None:
-        for alt in ("expected_roi_3m", "expected_roi_1m", "expected_roi_12m", "upside_pct", "target_return"):
+        for alt in (
+            "expected_roi_3m",
+            "expected_roi_1m",
+            "expected_roi_12m",
+            "upside_pct",
+            "target_return",
+            "expected_return",
+            "return_pct",
+        ):
             if raw.get(alt) is not None:
                 raw[roi_key] = raw.get(alt)
                 break
@@ -1376,7 +1523,7 @@ def _ensure_required_top10_fields(raw: Dict[str, Any], *, rank: int, criteria: C
         if cp is not None and roi is not None:
             raw[forecast_price_key] = float(cp) * (1.0 + float(roi))
 
-    raw.setdefault("data_provider", raw.get("data_provider") or raw.get("provider") or "")
+    raw.setdefault("data_provider", raw.get("data_provider") or raw.get("provider") or raw.get("source") or "")
 
 
 def _schema_contains(keys: Sequence[str], needle: str) -> bool:
@@ -1463,7 +1610,8 @@ async def select_top10_symbols(
     engine = engine or _resolve_engine_from_request(request)
     crit = _merge_criteria_sources(engine=engine, criteria=criteria, body=body, limit=limit)
     mode2 = _extract_route_mode(mode, body)
-    top, _meta = await select_top10(engine=engine, criteria=crit, mode=mode2)
+    direct_symbols = _extract_direct_symbols(body)
+    top, _meta = await select_top10(engine=engine, criteria=crit, mode=mode2, direct_symbols=direct_symbols)
     return [c.symbol for c in top]
 
 
@@ -1480,8 +1628,14 @@ async def build_top10_rows(
     engine = engine or _resolve_engine_from_request(request)
     crit = _merge_criteria_sources(engine=engine, criteria=criteria, body=body, limit=limit)
     mode2 = _extract_route_mode(mode, body)
+    direct_symbols = _extract_direct_symbols(body)
 
-    top, meta_sel = await select_top10(engine=engine, criteria=crit, mode=mode2)
+    top, meta_sel = await select_top10(
+        engine=engine,
+        criteria=crit,
+        mode=mode2,
+        direct_symbols=direct_symbols,
+    )
     rows, meta_rows = build_top10_output_rows(top, criteria=crit, mode=mode2)
     headers, keys, _pct_keys, _schema_source = _get_top10_schema()
 
@@ -1511,6 +1665,7 @@ async def build_top10_rows(
                 "use_liquidity_tiebreak": crit.use_liquidity_tiebreak,
                 "enforce_risk_confidence": crit.enforce_risk_confidence,
             },
+            "direct_symbols": direct_symbols,
             "warnings": warnings,
             "engine_present": engine is not None,
             "request_present": request is not None,
