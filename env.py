@@ -2,36 +2,27 @@
 """
 env.py
 ================================================================================
-TADAWUL FAST BRIDGE – ENTERPRISE ENVIRONMENT MANAGER (v7.6.0)
+TADAWUL FAST BRIDGE – ENTERPRISE ENVIRONMENT MANAGER (v7.7.0)
 ================================================================================
-RENDER-SAFE | STARTUP-SAFE | GLOBAL-FIRST | HOT-RELOAD | SECRETS-SAFE
+RENDER-SAFE | STARTUP-SAFE | GLOBAL-FIRST | HOT-RELOAD | SECRETS-SAFE | ROUTE-AUTH-AWARE
 
-Why this revision (vs v7.5.3 you pasted)?
-- ✅ DEPLOY-SAFE AUTH DEFAULTS (prevents “boot_errors” causing app exit before port bind)
-    - If no tokens are configured, REQUIRE_AUTH defaults to False and OPEN_MODE defaults to True
-    - If tokens exist, REQUIRE_AUTH defaults to True and OPEN_MODE defaults to False
-    - Explicit env vars (OPEN_MODE / REQUIRE_AUTH) always win
-- ✅ Google credentials normalization expanded:
-    - GOOGLE_SHEETS_CREDENTIALS / GOOGLE_CREDENTIALS (JSON)
-    - GOOGLE_*_B64 (base64 JSON)
-    - GOOGLE_APPLICATION_CREDENTIALS / GOOGLE_*_FILE (file path)
-    - Repairs private_key newlines safely
-- ✅ Adds GLOBAL EODHD defaults:
-    - EODHD_DEFAULT_EXCHANGE / EODHD_APPEND_EXCHANGE_SUFFIX
-- ✅ Makes JSON fallback robust for bytes input
-- ✅ Normalizes providers lists (lowercase + dedupe) deterministically
-- ✅ Keeps backward-compatible exports (get_first_env_bool/int/float/list + constants)
-
-IMPORTANT:
-This module must NEVER do network I/O at import time.
-It must NEVER raise due to missing optional deps.
-It must NEVER force-exit unless Python is truly unsupported.
+Why this revision
+- ✅ Aligned with core/config.py route-aware auth model
+- ✅ Added PUBLIC_EXACT_PATHS / PUBLIC_PATH_PREFIXES / PROTECTED_EXACT_PATHS / PROTECTED_PATH_PREFIXES
+- ✅ Added path-aware helpers:
+    - normalize_request_path()
+    - is_public_path()
+    - auth_required_for_path()
+- ✅ Keeps deploy-safe auth defaults
+- ✅ Keeps backward-compatible exports and helper functions
+- ✅ Expanded masking / diagnostics
+- ✅ Never performs network I/O at import-time
 """
 
 from __future__ import annotations
 
 import base64
-import json  # ALWAYS available
+import json
 import logging
 import os
 import re
@@ -43,8 +34,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 # ---------------------------------------------------------------------------
 # High-Performance JSON fallback
@@ -65,7 +55,6 @@ try:
 except Exception:
 
     def json_loads(data: Union[str, bytes]) -> Any:
-        # FIX: tolerate bytes safely
         if isinstance(data, (bytes, bytearray)):
             data = data.decode("utf-8", errors="replace")
         return json.loads(data)
@@ -75,24 +64,19 @@ except Exception:
 
     _HAS_ORJSON = False
 
-
 # =============================================================================
 # Version & Core Configuration
 # =============================================================================
-ENV_VERSION = "7.6.0"
-ENV_SCHEMA_VERSION = "2.2"
+ENV_VERSION = "7.7.0"
+ENV_SCHEMA_VERSION = "2.3"
 MIN_PYTHON = (3, 8)
 
 if sys.version_info < MIN_PYTHON:
-    # Hard stop only if Python is truly unsupported.
     sys.exit(f"❌ Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ required")
-
 
 # =============================================================================
 # Optional Dependencies with Graceful Degradation
 # =============================================================================
-
-# YAML support
 try:
     import yaml  # type: ignore
 
@@ -101,7 +85,6 @@ except Exception:
     yaml = None  # type: ignore
     YAML_AVAILABLE = False
 
-# Monitoring
 try:
     from prometheus_client import Counter, Histogram  # type: ignore
 
@@ -110,7 +93,6 @@ except Exception:
     PROMETHEUS_AVAILABLE = False
     Counter = Histogram = None  # type: ignore
 
-# Tracing
 _TRACING_ENABLED = os.getenv("CORE_TRACING_ENABLED", "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 try:
@@ -124,18 +106,17 @@ except Exception:
     Status = StatusCode = None  # type: ignore
 
     class _DummyCM:
-        def __enter__(self):  # noqa
+        def __enter__(self):
             return None
 
-        def __exit__(self, *args, **kwargs):  # noqa
+        def __exit__(self, *args, **kwargs):
             return False
 
     class _DummyTracer:
-        def start_as_current_span(self, *args, **kwargs):  # noqa
+        def start_as_current_span(self, *args, **kwargs):
             return _DummyCM()
 
     _TRACER = _DummyTracer()  # type: ignore
-
 
 # =============================================================================
 # Metrics (safe)
@@ -151,19 +132,18 @@ if PROMETHEUS_AVAILABLE:
 else:
 
     class _DummyMetric:
-        def labels(self, *args, **kwargs):  # noqa
+        def labels(self, *args, **kwargs):
             return self
 
-        def inc(self, *args, **kwargs):  # noqa
+        def inc(self, *args, **kwargs):
             return None
 
-        def observe(self, *args, **kwargs):  # noqa
+        def observe(self, *args, **kwargs):
             return None
 
     env_config_loads_total = _DummyMetric()
     env_config_errors_total = _DummyMetric()
     env_config_reload_duration = _DummyMetric()
-
 
 # =============================================================================
 # Logging Configuration
@@ -173,17 +153,10 @@ DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=DATE_FORMAT)
 logger = logging.getLogger("env")
 
-
 # =============================================================================
-# Tracing (fixed)
+# Tracing
 # =============================================================================
 class TraceContext:
-    """
-    Correct OTEL usage:
-    - start_as_current_span() returns a context manager
-    - __enter__ returns the span (or None)
-    """
-
     def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
         self.name = name
         self.attributes = attributes or {}
@@ -212,7 +185,6 @@ class TraceContext:
         if self._cm:
             return self._cm.__exit__(exc_type, exc_val, exc_tb)
         return False
-
 
 # =============================================================================
 # Enums & Types
@@ -272,13 +244,37 @@ class AuthMethod(str, Enum):
     OAUTH2 = "oauth2"
     NONE = "none"
 
-
 # =============================================================================
 # Utility Functions
 # =============================================================================
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled", "ok", "active", "prod"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled", "inactive", "dev"}
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
+
+_DEFAULT_PUBLIC_EXACT_PATHS = [
+    "/",
+    "/health",
+    "/readyz",
+    "/livez",
+    "/openapi.json",
+    "/docs",
+    "/redoc",
+    "/favicon.ico",
+    "/v1/advanced/health",
+    "/v1/advisor/health",
+]
+_DEFAULT_PUBLIC_PATH_PREFIXES = [
+    "/docs",
+    "/redoc",
+    "/static",
+]
+_DEFAULT_PROTECTED_EXACT_PATHS: List[str] = []
+_DEFAULT_PROTECTED_PATH_PREFIXES = [
+    "/v1/analysis",
+    "/v1/schema",
+    "/v1/advanced/sheet-rows",
+    "/v1/enriched/sheet-rows",
+]
 
 
 def strip_value(v: Any) -> str:
@@ -337,10 +333,11 @@ def coerce_list(v: Any, default: Optional[List[str]] = None) -> List[str]:
         return default or []
     if isinstance(v, list):
         return [strip_value(x) for x in v if strip_value(x)]
+    if isinstance(v, tuple):
+        return [strip_value(x) for x in v if strip_value(x)]
     s = strip_value(v)
     if not s:
         return default or []
-    # JSON-like lists
     if s.startswith(("[", "(")):
         try:
             parsed = json_loads(s.replace("'", '"'))
@@ -441,15 +438,10 @@ def _read_text_file_if_exists(path: str) -> Optional[str]:
 
 
 def repair_json_creds(raw: str) -> Optional[Dict[str, Any]]:
-    """
-    Accepts JSON or base64 JSON.
-    Returns dict or None. Never throws.
-    """
     t = strip_wrapping_quotes(raw or "")
     if not t:
         return None
 
-    # base64 attempt
     if not t.startswith("{") and len(t) > 50:
         try:
             decoded = base64.b64decode(t, validate=False).decode("utf-8", errors="replace").strip()
@@ -471,33 +463,20 @@ def repair_json_creds(raw: str) -> Optional[Dict[str, Any]]:
 
 
 def resolve_google_credentials() -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
-    """
-    Expanded credential resolution (Render-safe).
-    Returns (json_string, dict) or (None, None).
-    Priority:
-      1) GOOGLE_CREDENTIALS_DICT (JSON dict string)
-      2) GOOGLE_SHEETS_CREDENTIALS / GOOGLE_CREDENTIALS (JSON or base64 JSON)
-      3) GOOGLE_*_B64 (base64 JSON)
-      4) GOOGLE_APPLICATION_CREDENTIALS / GOOGLE_*_FILE (file path)
-    """
-    # 1) explicit dict
     d_raw = get_first_env("GOOGLE_CREDENTIALS_DICT") or ""
     if d_raw.startswith("{") and d_raw.endswith("}"):
         d = repair_json_creds(d_raw)
         if d:
             return (json_dumps(d), d)
 
-    # 2) raw JSON or base64 JSON
     raw = get_first_env("GOOGLE_SHEETS_CREDENTIALS", "GOOGLE_CREDENTIALS") or ""
     if raw:
         d = repair_json_creds(raw)
         if d:
             return (json_dumps(d), d)
 
-    # 3) base64 variants
     b64 = get_first_env("GOOGLE_SHEETS_CREDENTIALS_B64", "GOOGLE_CREDENTIALS_B64") or ""
     if b64:
-        # support "b64:..."
         b = strip_value(b64)
         if b.lower().startswith("b64:"):
             b = b.split(":", 1)[1].strip()
@@ -509,7 +488,6 @@ def resolve_google_credentials() -> Tuple[Optional[str], Optional[Dict[str, Any]
         except Exception:
             pass
 
-    # 4) file paths
     fp = get_first_env(
         "GOOGLE_APPLICATION_CREDENTIALS",
         "GOOGLE_SHEETS_CREDENTIALS_FILE",
@@ -526,9 +504,8 @@ def resolve_google_credentials() -> Tuple[Optional[str], Optional[Dict[str, Any]
 
 
 def normalize_providers(items: List[str]) -> List[str]:
-    """Lowercase + dedupe while preserving order."""
     out: List[str] = []
-    seen: set = set()
+    seen: Set[str] = set()
     for x in items or []:
         s = strip_value(x).lower()
         if not s or s in seen:
@@ -539,14 +516,9 @@ def normalize_providers(items: List[str]) -> List[str]:
 
 
 def get_allowed_tokens() -> List[str]:
-    """
-    Collect allowed tokens from:
-    - ALLOWED_TOKENS / TFB_ALLOWED_TOKENS / APP_TOKENS (comma/list)
-    - APP_TOKEN / BACKUP_APP_TOKEN
-    """
     toks = get_first_env_list("ALLOWED_TOKENS", "TFB_ALLOWED_TOKENS", "APP_TOKENS", default=[])
     toks = [strip_value(t) for t in toks if strip_value(t)]
-    t1 = get_first_env("APP_TOKEN", "TFB_APP_TOKEN") or ""
+    t1 = get_first_env("APP_TOKEN", "TFB_APP_TOKEN", "BACKEND_TOKEN") or ""
     t2 = get_first_env("BACKUP_APP_TOKEN") or ""
     if t1 and t1 not in toks:
         toks.append(t1)
@@ -561,27 +533,92 @@ def derive_auth_flags(
     open_mode_env: Optional[str],
     tokens_exist: bool,
 ) -> Tuple[bool, bool]:
-    """
-    Compute (REQUIRE_AUTH, OPEN_MODE) in a deploy-safe way.
-    - Explicit env vars always win.
-    - If no tokens configured:
-        REQUIRE_AUTH defaults False, OPEN_MODE defaults True
-    - If tokens configured:
-        REQUIRE_AUTH defaults True, OPEN_MODE defaults False
-    """
-    # require_auth
     if require_auth_env is not None:
         require_auth = coerce_bool(require_auth_env, False)
     else:
         require_auth = bool(tokens_exist)
 
-    # open_mode
     if open_mode_env is not None:
         open_mode = coerce_bool(open_mode_env, False)
     else:
         open_mode = (not require_auth) and (not tokens_exist)
 
     return bool(require_auth), bool(open_mode)
+
+
+def _clean_paths(values: Sequence[str]) -> List[str]:
+    out: List[str] = []
+    seen: Set[str] = set()
+    for v in values:
+        p = strip_value(v)
+        if not p:
+            continue
+        if not p.startswith("/"):
+            p = "/" + p
+        p = re.sub(r"/{2,}", "/", p).rstrip("/") or "/"
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def normalize_request_path(path: Optional[str]) -> str:
+    p = strip_value(path)
+    if not p:
+        return ""
+    p = p.split("?", 1)[0].strip()
+    if not p.startswith("/"):
+        p = "/" + p
+    return re.sub(r"/{2,}", "/", p).rstrip("/") or "/"
+
+
+def get_public_exact_paths() -> List[str]:
+    return _clean_paths(get_first_env_list("PUBLIC_EXACT_PATHS", default=list(_DEFAULT_PUBLIC_EXACT_PATHS)))
+
+
+def get_public_path_prefixes() -> List[str]:
+    return _clean_paths(get_first_env_list("PUBLIC_PATH_PREFIXES", default=list(_DEFAULT_PUBLIC_PATH_PREFIXES)))
+
+
+def get_protected_exact_paths() -> List[str]:
+    return _clean_paths(get_first_env_list("PROTECTED_EXACT_PATHS", default=list(_DEFAULT_PROTECTED_EXACT_PATHS)))
+
+
+def get_protected_path_prefixes() -> List[str]:
+    return _clean_paths(get_first_env_list("PROTECTED_PATH_PREFIXES", default=list(_DEFAULT_PROTECTED_PATH_PREFIXES)))
+
+
+def is_public_path(path: Optional[str]) -> bool:
+    p = normalize_request_path(path)
+    if not p:
+        return False
+
+    protected_exact = set(get_protected_exact_paths())
+    if p in protected_exact:
+        return False
+
+    for prefix in get_protected_path_prefixes():
+        if prefix != "/" and p.startswith(prefix):
+            return False
+
+    if p in set(get_public_exact_paths()):
+        return True
+
+    for prefix in get_public_path_prefixes():
+        if prefix == "/" or p.startswith(prefix):
+            return True
+
+    return False
+
+
+def auth_required_for_path(path: Optional[str], *, require_auth: bool, open_mode: bool) -> bool:
+    if open_mode:
+        return False
+    if not require_auth:
+        return False
+    if is_public_path(path):
+        return False
+    return True
 
 
 def get_system_info() -> Dict[str, Any]:
@@ -598,7 +635,6 @@ def get_system_info() -> Dict[str, Any]:
     except Exception:
         info["cpu_cores"] = 1
     return info
-
 
 # =============================================================================
 # Configuration Sources
@@ -634,7 +670,6 @@ class ConfigSourceLoader:
             return {}
         return json_loads(p.read_text(encoding="utf-8", errors="replace")) or {}
 
-
 # =============================================================================
 # Settings
 # =============================================================================
@@ -653,14 +688,12 @@ class Settings:
 
     TIMEZONE_DEFAULT: str = "Asia/Riyadh"
 
-    # Common runtime flags (Render)
     DEBUG: bool = False
     DEFER_ROUTER_MOUNT: bool = False
     INIT_ENGINE_ON_BOOT: bool = True
     ENABLE_SWAGGER: bool = True
     ENABLE_REDOC: bool = True
 
-    # Auth
     AUTH_HEADER_NAME: str = "X-APP-TOKEN"
     APP_TOKEN: Optional[str] = None
     BACKUP_APP_TOKEN: Optional[str] = None
@@ -668,18 +701,20 @@ class Settings:
     ALLOW_QUERY_TOKEN: bool = False
     OPEN_MODE: bool = False
 
-    # Features
+    PUBLIC_EXACT_PATHS: List[str] = field(default_factory=lambda: list(_DEFAULT_PUBLIC_EXACT_PATHS))
+    PUBLIC_PATH_PREFIXES: List[str] = field(default_factory=lambda: list(_DEFAULT_PUBLIC_PATH_PREFIXES))
+    PROTECTED_EXACT_PATHS: List[str] = field(default_factory=lambda: list(_DEFAULT_PROTECTED_EXACT_PATHS))
+    PROTECTED_PATH_PREFIXES: List[str] = field(default_factory=lambda: list(_DEFAULT_PROTECTED_PATH_PREFIXES))
+
     AI_ANALYSIS_ENABLED: bool = True
     ADVANCED_ANALYSIS_ENABLED: bool = True
     ADVISOR_ENABLED: bool = True
     RATE_LIMIT_ENABLED: bool = True
 
-    # Rate limits
     MAX_REQUESTS_PER_MINUTE: int = 240
     MAX_RETRIES: int = 2
     RETRY_DELAY: float = 0.6
 
-    # Backend / cache
     BACKEND_BASE_URL: str = "http://127.0.0.1:8000"
     ENGINE_CACHE_TTL_SEC: int = 20
     CACHE_MAX_SIZE: int = 5000
@@ -688,17 +723,14 @@ class Settings:
 
     HTTP_TIMEOUT_SEC: float = 45.0
 
-    # Sheets layout
     TFB_SYMBOL_HEADER_ROW: int = 5
     TFB_SYMBOL_START_ROW: int = 6
 
-    # Google integration
     DEFAULT_SPREADSHEET_ID: Optional[str] = None
-    GOOGLE_SHEETS_CREDENTIALS: Optional[str] = None  # normalized JSON string
+    GOOGLE_SHEETS_CREDENTIALS: Optional[str] = None
     GOOGLE_APPS_SCRIPT_URL: Optional[str] = None
     GOOGLE_APPS_SCRIPT_BACKUP_URL: Optional[str] = None
 
-    # Provider keys
     EODHD_API_KEY: Optional[str] = None
     EODHD_BASE_URL: Optional[str] = None
     FINNHUB_API_KEY: Optional[str] = None
@@ -708,11 +740,9 @@ class Settings:
     TWELVEDATA_API_KEY: Optional[str] = None
     MARKETSTACK_API_KEY: Optional[str] = None
 
-    # GLOBAL EODHD defaults (align with core/config.py)
     EODHD_DEFAULT_EXCHANGE: str = "US"
     EODHD_APPEND_EXCHANGE_SUFFIX: bool = True
 
-    # KSA providers
     ARGAAM_QUOTE_URL: Optional[str] = None
     ARGAAM_API_KEY: Optional[str] = None
     TADAWUL_QUOTE_URL: Optional[str] = None
@@ -721,27 +751,22 @@ class Settings:
     TADAWUL_REFRESH_INTERVAL: int = 60
     KSA_DISALLOW_EODHD: bool = True
 
-    # Provider lists
     ENABLED_PROVIDERS: List[str] = field(default_factory=lambda: ["eodhd", "finnhub"])
     KSA_PROVIDERS: List[str] = field(default_factory=lambda: ["yahoo_chart", "argaam"])
     PRIMARY_PROVIDER: str = "eodhd"
 
-    # Batching
     AI_BATCH_SIZE: int = 20
     AI_MAX_TICKERS: int = 500
     ADV_BATCH_SIZE: int = 25
     BATCH_CONCURRENCY: int = 5
 
-    # Render
     RENDER_API_KEY: Optional[str] = None
     RENDER_SERVICE_ID: Optional[str] = None
     RENDER_SERVICE_NAME: Optional[str] = None
 
-    # CORS
     ENABLE_CORS_ALL_ORIGINS: bool = False
     CORS_ORIGINS: str = ""
 
-    # Diagnostics
     boot_errors: Tuple[str, ...] = field(default_factory=tuple)
     boot_warnings: Tuple[str, ...] = field(default_factory=tuple)
     config_sources: Dict[str, ConfigSource] = field(default_factory=dict)
@@ -750,7 +775,6 @@ class Settings:
     def from_env(cls) -> "Settings":
         env_name = strip_value(get_first_env("APP_ENV", "ENVIRONMENT") or "production").lower()
 
-        # Auto providers
         auto_global: List[str] = []
         if get_first_env("EODHD_API_KEY", "EODHD_API_TOKEN", "EODHD_TOKEN"):
             auto_global.append("eodhd")
@@ -777,12 +801,10 @@ class Settings:
         if not auto_ksa:
             auto_ksa = ["yahoo_chart", "argaam"]
 
-        # Google creds (expanded)
         gs_json, gs_dict = resolve_google_credentials()
         google_creds_str = gs_json if (gs_json and gs_dict) else (gs_json or None)
 
-        # Tokens + safe auth defaults
-        app_token = get_first_env("APP_TOKEN", "TFB_APP_TOKEN")
+        app_token = get_first_env("APP_TOKEN", "TFB_APP_TOKEN", "BACKEND_TOKEN")
         backup_token = get_first_env("BACKUP_APP_TOKEN")
         tokens_exist = bool(get_allowed_tokens())
 
@@ -799,11 +821,17 @@ class Settings:
         )
         ksa_providers = normalize_providers(get_first_env_list("KSA_PROVIDERS", default=auto_ksa))
 
-        primary_provider = strip_value(get_first_env("PRIMARY_PROVIDER") or (enabled_providers[0] if enabled_providers else "eodhd")).lower()
+        primary_provider = strip_value(
+            get_first_env("PRIMARY_PROVIDER") or (enabled_providers[0] if enabled_providers else "eodhd")
+        ).lower()
 
-        # Ensure primary is in enabled (non-fatal; just warning)
         if primary_provider and primary_provider not in enabled_providers:
             enabled_providers = [primary_provider] + [p for p in enabled_providers if p != primary_provider]
+
+        public_exact_paths = get_public_exact_paths()
+        public_path_prefixes = get_public_path_prefixes()
+        protected_exact_paths = get_protected_exact_paths()
+        protected_path_prefixes = get_protected_path_prefixes()
 
         s = cls(
             APP_NAME=get_first_env("APP_NAME", "SERVICE_NAME", "APP_TITLE") or "Tadawul Fast Bridge",
@@ -824,6 +852,10 @@ class Settings:
             REQUIRE_AUTH=require_auth,
             ALLOW_QUERY_TOKEN=coerce_bool(get_first_env("ALLOW_QUERY_TOKEN"), False),
             OPEN_MODE=open_mode,
+            PUBLIC_EXACT_PATHS=public_exact_paths,
+            PUBLIC_PATH_PREFIXES=public_path_prefixes,
+            PROTECTED_EXACT_PATHS=protected_exact_paths,
+            PROTECTED_PATH_PREFIXES=protected_path_prefixes,
             AI_ANALYSIS_ENABLED=coerce_bool(get_first_env("AI_ANALYSIS_ENABLED"), True),
             ADVANCED_ANALYSIS_ENABLED=coerce_bool(get_first_env("ADVANCED_ANALYSIS_ENABLED", "ADVANCED_ENABLED"), True),
             ADVISOR_ENABLED=coerce_bool(get_first_env("ADVISOR_ENABLED"), True),
@@ -851,10 +883,8 @@ class Settings:
             ALPHA_VANTAGE_API_KEY=get_first_env("ALPHA_VANTAGE_API_KEY"),
             TWELVEDATA_API_KEY=get_first_env("TWELVEDATA_API_KEY"),
             MARKETSTACK_API_KEY=get_first_env("MARKETSTACK_API_KEY"),
-            # EODHD defaults
             EODHD_DEFAULT_EXCHANGE=strip_value(get_first_env("EODHD_DEFAULT_EXCHANGE", "EODHD_SYMBOL_SUFFIX_DEFAULT") or "US").upper(),
             EODHD_APPEND_EXCHANGE_SUFFIX=coerce_bool(get_first_env("EODHD_APPEND_EXCHANGE_SUFFIX"), True),
-            # KSA
             ARGAAM_QUOTE_URL=get_first_env("ARGAAM_QUOTE_URL"),
             ARGAAM_API_KEY=get_first_env("ARGAAM_API_KEY"),
             TADAWUL_QUOTE_URL=get_first_env("TADAWUL_QUOTE_URL"),
@@ -862,20 +892,16 @@ class Settings:
             TADAWUL_MAX_SYMBOLS=get_first_env_int("TADAWUL_MAX_SYMBOLS", default=1500, lo=10, hi=50000),
             TADAWUL_REFRESH_INTERVAL=get_first_env_int("TADAWUL_REFRESH_INTERVAL", default=60, lo=5, hi=3600),
             KSA_DISALLOW_EODHD=coerce_bool(get_first_env("KSA_DISALLOW_EODHD"), True),
-            # Provider lists
             ENABLED_PROVIDERS=enabled_providers,
             KSA_PROVIDERS=ksa_providers,
             PRIMARY_PROVIDER=primary_provider or "eodhd",
-            # Batching
             AI_BATCH_SIZE=get_first_env_int("AI_BATCH_SIZE", default=20, lo=1, hi=200),
             AI_MAX_TICKERS=get_first_env_int("AI_MAX_TICKERS", default=500, lo=1, hi=20000),
             ADV_BATCH_SIZE=get_first_env_int("ADV_BATCH_SIZE", default=25, lo=1, hi=500),
             BATCH_CONCURRENCY=get_first_env_int("BATCH_CONCURRENCY", default=5, lo=1, hi=50),
-            # Render
             RENDER_API_KEY=get_first_env("RENDER_API_KEY"),
             RENDER_SERVICE_ID=get_first_env("RENDER_SERVICE_ID"),
             RENDER_SERVICE_NAME=get_first_env("RENDER_SERVICE_NAME"),
-            # CORS
             ENABLE_CORS_ALL_ORIGINS=coerce_bool(get_first_env("ENABLE_CORS_ALL_ORIGINS", "CORS_ALL_ORIGINS"), False),
             CORS_ORIGINS=get_first_env("CORS_ORIGINS") or "",
             config_sources={"env": ConfigSource.ENV_VAR},
@@ -885,30 +911,26 @@ class Settings:
         return replace(s, boot_errors=tuple(errors), boot_warnings=tuple(warns))
 
     def validate(self) -> Tuple[List[str], List[str]]:
-        """
-        Deploy-safe validation:
-        - DO NOT create fatal errors unless something is truly inconsistent
-          (e.g., REQUIRE_AUTH=true while OPEN_MODE=false and no tokens exist).
-        """
         errors: List[str] = []
         warns: List[str] = []
 
-        # Auth consistency (safe)
         if self.REQUIRE_AUTH and not self.OPEN_MODE:
             if not get_allowed_tokens():
                 errors.append("REQUIRE_AUTH=true but no tokens configured (APP_TOKEN/BACKUP_APP_TOKEN/ALLOWED_TOKENS).")
         if self.OPEN_MODE and get_allowed_tokens():
             warns.append("OPEN_MODE=true while tokens exist. Service may be publicly exposed unintentionally.")
 
-        # Provider keys as warnings (not fatal to start)
         if "eodhd" in (self.ENABLED_PROVIDERS or []) and not self.EODHD_API_KEY:
             warns.append("Provider 'eodhd' enabled but EODHD_API_KEY missing.")
         if "finnhub" in (self.ENABLED_PROVIDERS or []) and not self.FINNHUB_API_KEY:
             warns.append("Provider 'finnhub' enabled but FINNHUB_API_KEY missing.")
 
-        # URL sanity
         if self.BACKEND_BASE_URL and not is_valid_url(self.BACKEND_BASE_URL):
             warns.append(f"BACKEND_BASE_URL does not look like a URL: {self.BACKEND_BASE_URL!r}")
+
+        overlap = set(self.PUBLIC_EXACT_PATHS or []) & set(self.PROTECTED_EXACT_PATHS or [])
+        if overlap:
+            warns.append(f"Paths overlap between PUBLIC_EXACT_PATHS and PROTECTED_EXACT_PATHS: {sorted(overlap)}")
 
         return errors, warns
 
@@ -934,6 +956,8 @@ class Settings:
                 "rate_limiting": self.RATE_LIMIT_ENABLED,
                 "tokens_masked": {"app_token": mask_secret(self.APP_TOKEN)},
                 "allowed_tokens_count": len(get_allowed_tokens()),
+                "public_exact_paths": list(self.PUBLIC_EXACT_PATHS or []),
+                "public_path_prefixes": list(self.PUBLIC_PATH_PREFIXES or []),
             },
             "validation": {"errors": errors, "warnings": warns, "is_valid": len(errors) == 0},
         }
@@ -947,7 +971,6 @@ class Settings:
             "open_mode": self.OPEN_MODE,
         }
         return bool(flags.get(feature, False))
-
 
 # =============================================================================
 # Dynamic Configuration Manager
@@ -991,7 +1014,6 @@ class DynamicConfig:
                 env_config_errors_total.labels(type=type(e).__name__).inc()
                 logger.error("Configuration reload failed: %s", e)
                 return False
-
 
 # =============================================================================
 # Singleton Instance
@@ -1064,6 +1086,11 @@ APP_TOKEN = settings.APP_TOKEN
 BACKUP_APP_TOKEN = settings.BACKUP_APP_TOKEN
 REQUIRE_AUTH = settings.REQUIRE_AUTH
 ALLOW_QUERY_TOKEN = settings.ALLOW_QUERY_TOKEN
+OPEN_MODE = settings.OPEN_MODE
+PUBLIC_EXACT_PATHS = settings.PUBLIC_EXACT_PATHS
+PUBLIC_PATH_PREFIXES = settings.PUBLIC_PATH_PREFIXES
+PROTECTED_EXACT_PATHS = settings.PROTECTED_EXACT_PATHS
+PROTECTED_PATH_PREFIXES = settings.PROTECTED_PATH_PREFIXES
 BACKEND_BASE_URL = settings.BACKEND_BASE_URL
 HTTP_TIMEOUT_SEC = settings.HTTP_TIMEOUT_SEC
 ENGINE_CACHE_TTL_SEC = settings.ENGINE_CACHE_TTL_SEC
@@ -1095,7 +1122,6 @@ __all__ = [
     "compliance_report",
     "feature_enabled",
     "settings",
-    # helpers
     "strip_value",
     "strip_wrapping_quotes",
     "coerce_bool",
@@ -1115,8 +1141,14 @@ __all__ = [
     "resolve_google_credentials",
     "get_allowed_tokens",
     "derive_auth_flags",
+    "normalize_request_path",
+    "get_public_exact_paths",
+    "get_public_path_prefixes",
+    "get_protected_exact_paths",
+    "get_protected_path_prefixes",
+    "is_public_path",
+    "auth_required_for_path",
     "get_system_info",
-    # exported constants
     "DEBUG",
     "DEFER_ROUTER_MOUNT",
     "INIT_ENGINE_ON_BOOT",
@@ -1134,6 +1166,11 @@ __all__ = [
     "BACKUP_APP_TOKEN",
     "REQUIRE_AUTH",
     "ALLOW_QUERY_TOKEN",
+    "OPEN_MODE",
+    "PUBLIC_EXACT_PATHS",
+    "PUBLIC_PATH_PREFIXES",
+    "PROTECTED_EXACT_PATHS",
+    "PROTECTED_PATH_PREFIXES",
     "BACKEND_BASE_URL",
     "HTTP_TIMEOUT_SEC",
     "ENGINE_CACHE_TTL_SEC",
