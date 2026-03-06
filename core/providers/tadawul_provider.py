@@ -2,28 +2,46 @@
 # core/providers/tadawul_provider.py
 """
 ================================================================================
-Tadawul Provider (KSA Market Data) — v4.2.0 (Production Reliability + Canonical Keys)
+Tadawul Provider (KSA Market Data) — v4.3.0 (KSA CLASSIFICATION FIX + SCHEMA KEYS)
 ================================================================================
 
-What this provider guarantees (project-aligned):
-- ✅ Production-safe imports (optional deps never crash startup)
-- ✅ Async-first, rate-limited, circuit-breaker protected HTTP client
-- ✅ Priority queue + singleflight to prevent stampedes
-- ✅ Returns canonical engine keys (current_price, previous_close, week_52_high/low, etc.)
-- ✅ Keeps backward-compatible aliases (price, prev_close) for legacy consumers
-- ✅ Deterministic fallbacks when numpy/scipy/sklearn/statsmodels are missing
-- ✅ Safe metrics (no undefined attributes / no crash risk)
+Phase E — KSA completeness fix (your key constraint)
+----------------------------------------------------
+KSA Market_Leaders was missing: country / sector / industry + inconsistent identity fields.
 
-Primary exported functions (engine-compatible):
+This revision guarantees (even when Tadawul payloads are sparse):
+- ✅ country is ALWAYS set for KSA: country="SAU"
+- ✅ currency ALWAYS set: currency="SAR"
+- ✅ exchange ALWAYS set: exchange="Tadawul"
+- ✅ name best-effort from Tadawul payloads, else fallback to symbol
+- ✅ sector/industry best-effort extraction from ALL Tadawul payload shapes (quote/fundamentals/profile)
+- ✅ canonical schema keys emitted whenever possible:
+    country, sector, industry, name, exchange, currency, asset_class,
+    current_price, previous_close, open_price, day_high, day_low,
+    week_52_high, week_52_low, volume, market_cap,
+    price_change, percent_change, week_52_position_pct,
+    rsi_14, volatility_30d,
+    forecast_price_1m/3m/12m, expected_roi_1m/3m/12m, forecast_confidence,
+    last_updated_utc, last_updated_riyadh
+
+Notes
+- This provider is KSA-only. EODHD is not used for KSA.
+- Sector/industry may still be missing if Tadawul does not provide classification for a symbol;
+  Argaam provider (next phase) should enrich missing classification/profile fields.
+
+Exported (engine-compatible)
 - fetch_enriched_quote_patch(symbol)
 - fetch_quote_patch(symbol)
 - fetch_fundamentals_patch(symbol)
 - fetch_history_patch(symbol)
 
-Provider adapter exports (router/health-friendly):
-- provider
-- get_provider()
-- build_provider()
+Adapter exports (router/health-friendly)
+- provider, get_provider(), build_provider()
+
+Startup safety
+- No network I/O at import-time.
+- Optional deps never crash startup.
+
 ================================================================================
 """
 
@@ -69,6 +87,8 @@ try:
 except Exception:
 
     def json_loads(data: Union[str, bytes]) -> Any:
+        if isinstance(data, (bytes, bytearray)):
+            data = data.decode("utf-8", errors="replace")
         return json.loads(data)
 
 # ---------------------------------------------------------------------------
@@ -76,6 +96,7 @@ except Exception:
 # ---------------------------------------------------------------------------
 try:
     from scipy import stats  # type: ignore
+
     SCIPY_AVAILABLE = True
 except Exception:
     stats = None  # type: ignore
@@ -83,6 +104,7 @@ except Exception:
 
 try:
     from sklearn.ensemble import RandomForestRegressor  # type: ignore
+
     SKLEARN_AVAILABLE = True
 except Exception:
     RandomForestRegressor = None  # type: ignore
@@ -90,6 +112,7 @@ except Exception:
 
 try:
     import xgboost as xgb  # type: ignore
+
     XGB_AVAILABLE = True
 except Exception:
     xgb = None  # type: ignore
@@ -133,7 +156,7 @@ logger = logging.getLogger("core.providers.tadawul_provider")
 logger.addHandler(logging.NullHandler())
 
 PROVIDER_NAME = "tadawul"
-PROVIDER_VERSION = "4.2.0"
+PROVIDER_VERSION = "4.3.0"
 
 USER_AGENT_DEFAULT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -157,6 +180,14 @@ _KSA_CODE_RE = re.compile(r"^\d{3,6}$", re.IGNORECASE)
 
 _TRACING_ENABLED = os.getenv("TADAWUL_TRACING_ENABLED", "").strip().lower() in _TRUTHY
 _METRICS_ENABLED = os.getenv("TADAWUL_METRICS_ENABLED", "").strip().lower() in _TRUTHY
+
+# =============================================================================
+# Phase E defaults (KSA identity)
+# =============================================================================
+KSA_COUNTRY_CODE = "SAU"
+KSA_COUNTRY_NAME = "Saudi Arabia"
+KSA_EXCHANGE_NAME = "Tadawul"
+KSA_CURRENCY = "SAR"
 
 
 # =============================================================================
@@ -271,6 +302,7 @@ def _safe_str(x: Any) -> Optional[str]:
 def _configured() -> bool:
     if not _env_bool("TADAWUL_ENABLED", True):
         return False
+    # At minimum quote URL must exist
     return bool(_safe_str(_env_str("TADAWUL_QUOTE_URL", "")))
 
 
@@ -284,6 +316,11 @@ def _enable_fundamentals() -> bool:
 
 def _enable_history() -> bool:
     return _env_bool("TADAWUL_ENABLE_HISTORY", True)
+
+
+def _enable_profile() -> bool:
+    # New optional enrichment endpoint (safe): if not configured, no effect.
+    return _env_bool("TADAWUL_ENABLE_PROFILE", True)
 
 
 def _enable_forecast() -> bool:
@@ -332,6 +369,10 @@ def _fund_ttl_sec() -> float:
 
 def _hist_ttl_sec() -> float:
     return max(300.0, _env_float("TADAWUL_HISTORY_TTL_SEC", 1800.0))
+
+
+def _profile_ttl_sec() -> float:
+    return max(3600.0, _env_float("TADAWUL_PROFILE_TTL_SEC", 43200.0))  # 12h default
 
 
 def _err_ttl_sec() -> float:
@@ -467,11 +508,11 @@ def safe_float(val: Any) -> Optional[float]:
     if val is None:
         return None
     try:
-        if isinstance(val, (int, float)):
+        if isinstance(val, (int, float)) and not isinstance(val, bool):
             f = float(val)
             return f if not math.isnan(f) and not math.isinf(f) else None
         s = str(val).strip()
-        if not s or s in {"-", "—", "N/A", "NA", "null", "None", ""}:
+        if not s or s.lower() in {"-", "—", "n/a", "na", "null", "none", ""}:
             return None
         s = (
             s.translate(_ARABIC_DIGITS)
@@ -507,9 +548,9 @@ def safe_str(val: Any) -> Optional[str]:
 
 def unwrap_common_envelopes(js: Union[dict, list]) -> Union[dict, list]:
     current = js
-    for _ in range(3):
+    for _ in range(4):
         if isinstance(current, dict):
-            for key in ("data", "result", "payload", "quote", "profile", "response"):
+            for key in ("data", "result", "payload", "quote", "profile", "response", "content"):
                 if key in current and isinstance(current[key], (dict, list)):
                     current = current[key]
                     break
@@ -531,8 +572,8 @@ def coerce_dict(data: Union[dict, list]) -> dict:
 def find_first_value(
     obj: Any,
     keys: Sequence[str],
-    max_depth: int = 7,
-    max_nodes: int = 3000,
+    max_depth: int = 8,
+    max_nodes: int = 5000,
 ) -> Any:
     if obj is None:
         return None
@@ -579,7 +620,10 @@ def pick_str(obj: Any, *keys: str) -> Optional[str]:
 
 def pick_pct(obj: Any, *keys: str) -> Optional[float]:
     v = safe_float(find_first_value(obj, keys))
-    return v * 100.0 if v is not None and abs(v) <= 1.0 else v
+    if v is None:
+        return None
+    # If it's likely fraction (<= 1), convert to percent-points
+    return v * 100.0 if abs(v) <= 1.0 else v
 
 
 def clean_patch(p: Dict[str, Any]) -> Dict[str, Any]:
@@ -604,12 +648,21 @@ def merge_into(dst: Dict[str, Any], src: Dict[str, Any], *, force_keys: Sequence
             dst[k] = v
 
 
+def _ensure_ksa_identity(patch: Dict[str, Any], *, symbol: str) -> None:
+    # Phase E guarantees
+    patch["country"] = KSA_COUNTRY_CODE
+    patch["currency"] = patch.get("currency") or KSA_CURRENCY
+    patch["exchange"] = patch.get("exchange") or KSA_EXCHANGE_NAME
+    patch["asset_class"] = patch.get("asset_class") or "EQUITY"
+    if not patch.get("name"):
+        # fallback (safe)
+        patch["name"] = symbol
+
+
 def fill_derived_quote_fields(patch: Dict[str, Any]) -> None:
     cur = safe_float(patch.get("current_price"))
     prev = safe_float(patch.get("previous_close"))
     vol = safe_float(patch.get("volume"))
-    high = safe_float(patch.get("day_high"))
-    low = safe_float(patch.get("day_low"))
     w52h = safe_float(patch.get("week_52_high"))
     w52l = safe_float(patch.get("week_52_low"))
 
@@ -622,23 +675,24 @@ def fill_derived_quote_fields(patch: Dict[str, Any]) -> None:
         except Exception:
             pass
 
-    if patch.get("value_traded") is None and cur is not None and vol is not None:
-        patch["value_traded"] = cur * vol
-
-    if cur is not None and high is not None and low is not None and cur != 0:
-        patch["day_range_pct"] = ((high - low) / cur) * 100.0
-
-    if cur is not None and w52h is not None and w52l is not None and w52h != w52l:
+    if (
+        patch.get("week_52_position_pct") is None
+        and cur is not None
+        and w52h is not None
+        and w52l is not None
+        and w52h != w52l
+    ):
         patch["week_52_position_pct"] = ((cur - w52l) / (w52h - w52l)) * 100.0
 
-    if patch.get("currency") is None:
-        patch["currency"] = "SAR"
-
-    # Backward-compatible aliases
+    # legacy aliases (harmless; engine may ignore)
     if patch.get("price") is None and patch.get("current_price") is not None:
         patch["price"] = patch["current_price"]
     if patch.get("prev_close") is None and patch.get("previous_close") is not None:
         patch["prev_close"] = patch["previous_close"]
+    if patch.get("change") is None and patch.get("price_change") is not None:
+        patch["change"] = patch["price_change"]
+    if patch.get("change_pct") is None and patch.get("percent_change") is not None:
+        patch["change_pct"] = patch["percent_change"]
 
 
 def data_quality_score(patch: Dict[str, Any]) -> Tuple[DataQuality, float]:
@@ -646,28 +700,27 @@ def data_quality_score(patch: Dict[str, Any]) -> Tuple[DataQuality, float]:
     if safe_float(patch.get("current_price")) is None:
         score -= 30
     if safe_float(patch.get("previous_close")) is None:
-        score -= 15
+        score -= 12
     if safe_float(patch.get("volume")) is None:
-        score -= 10
-    if safe_float(patch.get("market_cap")) is None:
-        score -= 10
+        score -= 8
     if safe_str(patch.get("name")) is None:
         score -= 10
-    if safe_int(patch.get("history_points", 0)) < 50:
-        score -= 20
-
+    if safe_str(patch.get("sector")) is None:
+        score -= 8
+    if safe_str(patch.get("industry")) is None:
+        score -= 8
+    if safe_str(patch.get("country")) is None:
+        score -= 8
     score = max(0.0, min(100.0, score))
     if score >= 80:
-        cat = DataQuality.EXCELLENT
-    elif score >= 60:
-        cat = DataQuality.GOOD
-    elif score >= 40:
-        cat = DataQuality.FAIR
-    elif score >= 20:
-        cat = DataQuality.POOR
-    else:
-        cat = DataQuality.BAD
-    return cat, score
+        return DataQuality.EXCELLENT, score
+    if score >= 60:
+        return DataQuality.GOOD, score
+    if score >= 40:
+        return DataQuality.FAIR, score
+    if score >= 20:
+        return DataQuality.POOR, score
+    return DataQuality.BAD, score
 
 
 # =============================================================================
@@ -678,16 +731,27 @@ class TraceContext:
         self.name = name
         self.attributes = attributes or {}
         self.tracer = trace.get_tracer(__name__) if _OTEL_AVAILABLE and _TRACING_ENABLED else None  # type: ignore
+        self._span_cm = None
         self.span = None
 
     async def __aenter__(self):
+        # Prefer proper CM start_as_current_span if available
         if self.tracer:
-            # keep this safe even if SDK changes
             try:
-                self.span = self.tracer.start_span(self.name)  # type: ignore
-                if self.attributes:
-                    self.span.set_attributes(self.attributes)  # type: ignore
+                start_as_current = getattr(self.tracer, "start_as_current_span", None)
+                if callable(start_as_current):
+                    self._span_cm = start_as_current(self.name)
+                    self.span = self._span_cm.__enter__()
+                else:
+                    self.span = self.tracer.start_span(self.name)  # type: ignore
+                if self.span and self.attributes:
+                    for k, v in self.attributes.items():
+                        try:
+                            self.span.set_attribute(str(k), v)  # type: ignore
+                        except Exception:
+                            pass
             except Exception:
+                self._span_cm = None
                 self.span = None
         return self
 
@@ -695,11 +759,23 @@ class TraceContext:
         if self.span and _OTEL_AVAILABLE:
             try:
                 if exc_val and Status and StatusCode:
-                    self.span.record_exception(exc_val)  # type: ignore
-                    self.span.set_status(Status(StatusCode.ERROR, str(exc_val)))  # type: ignore
-                self.span.end()  # type: ignore
+                    if hasattr(self.span, "record_exception"):
+                        self.span.record_exception(exc_val)  # type: ignore
+                    if hasattr(self.span, "set_status"):
+                        self.span.set_status(Status(StatusCode.ERROR, str(exc_val)))  # type: ignore
             except Exception:
                 pass
+        if self._span_cm:
+            try:
+                self._span_cm.__exit__(exc_type, exc_val, exc_tb)
+            except Exception:
+                pass
+        else:
+            if self.span:
+                try:
+                    self.span.end()  # type: ignore
+                except Exception:
+                    pass
 
 
 def _trace(name: Optional[str] = None):
@@ -788,7 +864,9 @@ class SmartCache:
                 if now < self._expires.get(key, 0):
                     self._access_times[key] = now
                     return self._cache[key]
-                await self._delete(key)
+                self._cache.pop(key, None)
+                self._expires.pop(key, None)
+                self._access_times.pop(key, None)
             return None
 
     async def set(self, key: str, value: Any, ttl: Optional[float] = None) -> None:
@@ -799,16 +877,13 @@ class SmartCache:
             self._expires[key] = time.monotonic() + (ttl or self.ttl)
             self._access_times[key] = time.monotonic()
 
-    async def _delete(self, key: str) -> None:
-        self._cache.pop(key, None)
-        self._expires.pop(key, None)
-        self._access_times.pop(key, None)
-
     async def _evict_lru(self) -> None:
         if not self._access_times:
             return
         oldest_key = min(self._access_times.items(), key=lambda x: x[1])[0]
-        await self._delete(oldest_key)
+        self._cache.pop(oldest_key, None)
+        self._expires.pop(oldest_key, None)
+        self._access_times.pop(oldest_key, None)
 
     async def size(self) -> int:
         async with self._lock:
@@ -884,7 +959,6 @@ class DynamicCircuitBreaker:
                 self.stats.current_cooldown = self.base_cooldown
                 _METRICS.set("circuit_breaker_state", 1)
             else:
-                # decay failures on success in closed state
                 self.stats.failures = max(0, self.stats.failures - 1)
 
     async def on_failure(self, status_code: int = 500) -> None:
@@ -976,434 +1050,94 @@ class SingleFlight:
 
 
 # =============================================================================
-# Technical Indicators (numpy optional)
+# Technical Indicators (minimal)
 # =============================================================================
-class TechnicalIndicators:
-    @staticmethod
-    def sma(prices: List[float], window: int) -> List[Optional[float]]:
-        if len(prices) < window:
-            return [None] * len(prices)
-        out: List[Optional[float]] = [None] * (window - 1)
-        s = sum(prices[:window])
-        out.append(s / window)
-        for i in range(window, len(prices)):
-            s += prices[i] - prices[i - window]
-            out.append(s / window)
-        return out
-
-    @staticmethod
-    def ema(prices: List[float], window: int) -> List[Optional[float]]:
-        if len(prices) < window:
-            return [None] * len(prices)
-        out: List[Optional[float]] = [None] * (window - 1)
-        multiplier = 2.0 / (window + 1)
-        ema_val = sum(prices[:window]) / window
-        out.append(ema_val)
-        for price in prices[window:]:
-            ema_val = (price - ema_val) * multiplier + ema_val
-            out.append(ema_val)
-        return out
-
-    @staticmethod
-    def macd(prices: List[float], fast: int = 12, slow: int = 26, signal: int = 9) -> Dict[str, List[Optional[float]]]:
-        if len(prices) < slow:
-            n = len(prices)
-            return {"macd": [None] * n, "signal": [None] * n, "histogram": [None] * n}
-        ema_f = TechnicalIndicators.ema(prices, fast)
-        ema_s = TechnicalIndicators.ema(prices, slow)
-        macd_line: List[Optional[float]] = [
-            (f - s) if f is not None and s is not None else None
-            for f, s in zip(ema_f, ema_s)
-        ]
-        valid_macd = [x for x in macd_line if x is not None]
-        sig_line = TechnicalIndicators.ema(valid_macd, signal) if valid_macd else []
-        padded_sig = [None] * (len(prices) - len(sig_line)) + sig_line
-        hist = [
-            (m - s) if m is not None and s is not None else None
-            for m, s in zip(macd_line, padded_sig)
-        ]
-        return {"macd": macd_line, "signal": padded_sig, "histogram": hist}
-
-    @staticmethod
-    def rsi(prices: List[float], window: int = 14) -> List[Optional[float]]:
-        if len(prices) < window + 1:
-            return [None] * len(prices)
-
-        deltas = _diff(prices)
-        out: List[Optional[float]] = [None] * window
-
-        window_deltas = deltas[:window]
-        avg_gain = sum(d for d in window_deltas if d > 0) / window
-        avg_loss = sum(-d for d in window_deltas if d < 0) / window
-
+def _rsi_14(closes: List[float]) -> Optional[float]:
+    if len(closes) < 15:
+        return None
+    try:
+        diffs = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+        gains = [d if d > 0 else 0.0 for d in diffs]
+        losses = [-d if d < 0 else 0.0 for d in diffs]
+        n = 14
+        avg_gain = sum(gains[:n]) / n
+        avg_loss = sum(losses[:n]) / n
+        for i in range(n, len(gains)):
+            avg_gain = (avg_gain * (n - 1) + gains[i]) / n
+            avg_loss = (avg_loss * (n - 1) + losses[i]) / n
         if avg_loss == 0:
-            out.append(100.0)
-        else:
-            rs = avg_gain / avg_loss
-            out.append(100.0 - (100.0 / (1.0 + rs)))
-
-        for d in deltas[window:]:
-            gain = d if d > 0 else 0.0
-            loss = -d if d < 0 else 0.0
-            avg_gain = (avg_gain * (window - 1) + gain) / window
-            avg_loss = (avg_loss * (window - 1) + loss) / window
-            if avg_loss == 0:
-                out.append(100.0)
-            else:
-                rs = avg_gain / avg_loss
-                out.append(100.0 - (100.0 / (1.0 + rs)))
-        return out
+            return 100.0
+        rs = avg_gain / avg_loss
+        return float(100.0 - (100.0 / (1.0 + rs)))
+    except Exception:
+        return None
 
 
-# =============================================================================
-# Market Regime Detection (numpy optional)
-# =============================================================================
-class MarketRegimeDetector:
-    def __init__(self, prices: List[float], window: int = 60):
-        self.prices = prices
-        self.window = min(window, max(20, len(prices) // 3)) if len(prices) > 60 else 20
-
-    def detect(self) -> Tuple[MarketRegime, float]:
-        if len(self.prices) < 30:
-            return MarketRegime.UNKNOWN, 0.0
-
-        # returns
-        rets: List[float] = []
-        for i in range(1, len(self.prices)):
-            p0 = self.prices[i - 1]
-            p1 = self.prices[i]
-            if p0 and p0 > 0:
-                rets.append((p1 / p0) - 1.0)
-
-        recent_returns = rets[-min(len(rets), 30):]
-        vol = float(_np_or_py_std(recent_returns)) if recent_returns else 0.0
-
-        # trend
-        if len(self.prices) >= self.window and SCIPY_AVAILABLE and stats is not None:
-            x = list(range(self.window))
-            y = self.prices[-self.window:]
-            slope, _, r_value, p_value, _ = stats.linregress(x, y)  # type: ignore
-            trend_strength = abs(float(r_value))
-            trend_direction = float(slope)
-            trend_pvalue = float(p_value)
-        else:
-            x = list(range(min(30, len(self.prices))))
-            y = self.prices[-len(x):]
-            if len(x) > 1:
-                x_mean = sum(x) / len(x)
-                y_mean = sum(y) / len(y)
-                num = sum((xi - x_mean) * (yi - y_mean) for xi, yi in zip(x, y))
-                den = sum((xi - x_mean) ** 2 for xi in x)
-                trend_direction = num / den if den != 0 else 0.0
-                trend_strength = 0.5
-                trend_pvalue = 0.1
-            else:
-                trend_direction, trend_strength, trend_pvalue = 0.0, 0.0, 1.0
-
-        # momentum
-        lookback = min(21, len(self.prices))
-        momentum_1m = (self.prices[-1] / self.prices[-lookback] - 1.0) if lookback >= 2 and self.prices[-lookback] else 0.0
-
-        confidence = 0.7
-        if vol > 0.03:
-            regime = MarketRegime.VOLATILE
-            confidence = min(0.9, 0.7 + vol * 5)
-        elif trend_strength > 0.7 and trend_pvalue < 0.05:
-            regime = MarketRegime.BULL if trend_direction > 0 else MarketRegime.BEAR
-            confidence = min(0.95, 0.7 + trend_strength * 0.3 + abs(momentum_1m) * 2)
-        elif abs(momentum_1m) < 0.03 and vol < 0.015:
-            regime = MarketRegime.SIDEWAYS
-            confidence = 0.8
-        elif momentum_1m > 0.05:
-            regime = MarketRegime.BULL
-            confidence = 0.7 + abs(momentum_1m) * 2
-        elif momentum_1m < -0.05:
-            regime = MarketRegime.BEAR
-            confidence = 0.7 + abs(momentum_1m) * 2
-        else:
-            regime = MarketRegime.UNKNOWN
-            confidence = 0.3
-
-        return regime, min(1.0, confidence)
-
-
-# =============================================================================
-# Ensemble Forecaster (safe fallbacks)
-# =============================================================================
-class EnsembleForecaster:
-    def __init__(self, prices: List[float], enable_ml: bool = True):
-        self.prices = prices
-        self.enable_ml = enable_ml and (SKLEARN_AVAILABLE or XGB_AVAILABLE)
-
-    def forecast(self, horizon_days: int = 252) -> Dict[str, Any]:
-        if len(self.prices) < 60 or horizon_days <= 0:
-            return {"forecast_available": False, "reason": "insufficient_history", "horizon_days": horizon_days}
-
-        forecasts: List[float] = []
-        weights: List[float] = []
-        used: List[str] = []
-
-        t = self._forecast_trend(horizon_days)
-        if t is not None:
-            forecasts.append(t)
-            weights.append(0.20)
-            used.append("trend")
-
-        a = self._forecast_arima(horizon_days)
-        if a is not None:
-            forecasts.append(a)
-            weights.append(0.35)
-            used.append("arima_or_rw")
-
-        m = self._forecast_ml(horizon_days) if self.enable_ml else None
-        if m is not None:
-            forecasts.append(m)
-            weights.append(0.45)
-            used.append("ml_tree")
-
-        if not forecasts:
-            return {"forecast_available": False, "reason": "no_models", "horizon_days": horizon_days}
-
-        # weighted average (numpy optional)
-        if _HAS_NUMPY and _np is not None:
-            try:
-                ensemble_price = float(_np.average(_np.asarray(forecasts, dtype=float), weights=_np.asarray(weights, dtype=float)))
-                ensemble_std = float(_np.std(_np.asarray(forecasts, dtype=float))) if len(forecasts) > 1 else float(ensemble_price * 0.05)
-            except Exception:
-                ensemble_price = sum(f * w for f, w in zip(forecasts, weights)) / max(1e-9, sum(weights))
-                ensemble_std = _std(forecasts) if len(forecasts) > 1 else ensemble_price * 0.05
-        else:
-            ensemble_price = sum(f * w for f, w in zip(forecasts, weights)) / max(1e-9, sum(weights))
-            ensemble_std = _std(forecasts) if len(forecasts) > 1 else ensemble_price * 0.05
-
-        last = float(self.prices[-1])
-        roi = (ensemble_price / last - 1.0) * 100.0
-
-        # confidence: penalize dispersion + high recent vol
-        disp = (ensemble_std / max(1e-9, abs(ensemble_price)))
-        recent = self.prices[-31:] if len(self.prices) >= 31 else self.prices[:]
-        vol = self._vol_30d(recent)
-        conf = max(0.05, min(0.95, (1.0 - min(1.0, disp * 6.0)) * (1.0 / (1.0 + max(0.0, vol - 0.25)))))
-
-        return {
-            "forecast_available": True,
-            "horizon_days": horizon_days,
-            "models_used": used,
-            "ensemble": {
-                "price": ensemble_price,
-                "roi_pct": roi,
-                "std_dev": ensemble_std,
-                "price_range_low": ensemble_price - 1.96 * ensemble_std,
-                "price_range_high": ensemble_price + 1.96 * ensemble_std,
-            },
-            "confidence": conf * 100.0,
-            "confidence_level": "high" if conf >= 0.8 else "medium" if conf >= 0.6 else "low" if conf >= 0.4 else "very_low",
-        }
-
-    def _forecast_trend(self, horizon: int) -> Optional[float]:
-        try:
-            n = min(len(self.prices), 252)
-            y = self.prices[-n:]
-            if any(p <= 0 for p in y):
-                return None
-
-            # log-linear regression (numpy optional)
-            xs = list(range(n))
-            logs = [math.log(p) for p in y]
-
-            x_mean = sum(xs) / n
-            y_mean = sum(logs) / n
-            num = sum((x - x_mean) * (ly - y_mean) for x, ly in zip(xs, logs))
-            den = sum((x - x_mean) ** 2 for x in xs)
-            if den == 0:
-                return None
-            slope = num / den
-            intercept = y_mean - slope * x_mean
-
-            future_x = (n - 1) + horizon
-            return float(math.exp(intercept + slope * future_x))
-        except Exception:
-            return None
-
-    def _forecast_arima(self, horizon: int) -> Optional[float]:
-        # Try statsmodels ARIMA; fallback to random walk with drift
-        if STATSMODELS_AVAILABLE and StatsARIMA is not None and len(self.prices) >= 120:
-            try:
-                model = StatsARIMA(self.prices[-252:], order=(5, 1, 0))  # type: ignore
-                fitted = model.fit()
-                fc = fitted.forecast(steps=horizon)
-                last_val = float(fc.iloc[-1]) if hasattr(fc, "iloc") else float(list(fc)[-1])
-                if math.isnan(last_val) or math.isinf(last_val) or last_val <= 0:
-                    return None
-                return last_val
-            except Exception:
-                pass
-
-        try:
-            recent = self.prices[-min(60, len(self.prices)) :]
-            rets: List[float] = []
-            for i in range(1, len(recent)):
-                if recent[i - 1] > 0:
-                    rets.append((recent[i] / recent[i - 1]) - 1.0)
-            drift = _mean(rets) if rets else 0.0
-            return float(self.prices[-1] * ((1.0 + drift) ** horizon))
-        except Exception:
-            return None
-
-    def _forecast_ml(self, horizon: int) -> Optional[float]:
-        if not SKLEARN_AVAILABLE or RandomForestRegressor is None or len(self.prices) < 150:
-            return None
-
-        try:
-            prices = self.prices
-            X: List[List[float]] = []
-            y: List[float] = []
-
-            # features: short momentum + volatility
-            for i in range(60, len(prices) - 5):
-                if prices[i - 20] <= 0 or prices[i - 10] <= 0 or prices[i - 5] <= 0 or prices[i] <= 0:
-                    continue
-                feats = [
-                    (prices[i] / prices[i - 5]) - 1.0,
-                    (prices[i] / prices[i - 10]) - 1.0,
-                    (prices[i] / prices[i - 20]) - 1.0,
-                ]
-                # vol last 20
-                rets20 = []
-                for j in range(i - 20 + 1, i + 1):
-                    if prices[j - 1] > 0:
-                        rets20.append((prices[j] / prices[j - 1]) - 1.0)
-                feats.append(_std(rets20))
-                X.append(feats)
-                y.append((prices[i + 5] / prices[i]) - 1.0)
-
-            if len(X) < 30:
-                return None
-
-            if XGB_AVAILABLE and xgb is not None:
-                # Keep it light (avoid huge models)
-                model = xgb.XGBRegressor(  # type: ignore
-                    n_estimators=80,
-                    max_depth=3,
-                    learning_rate=0.05,
-                    subsample=0.9,
-                    colsample_bytree=0.9,
-                    n_jobs=1,
-                    random_state=42,
-                )
-            else:
-                model = RandomForestRegressor(  # type: ignore
-                    n_estimators=120,
-                    max_depth=5,
-                    random_state=42,
-                )
-
-            model.fit(X, y)
-
-            # current feats
-            if prices[-20] <= 0 or prices[-10] <= 0 or prices[-5] <= 0 or prices[-1] <= 0:
-                return None
-            curr = [
-                (prices[-1] / prices[-5]) - 1.0,
-                (prices[-1] / prices[-10]) - 1.0,
-                (prices[-1] / prices[-20]) - 1.0,
-            ]
-            rets20 = []
-            for j in range(len(prices) - 20 + 1, len(prices)):
-                if prices[j - 1] > 0:
-                    rets20.append((prices[j] / prices[j - 1]) - 1.0)
-            curr.append(_std(rets20))
-
-            pred = float(model.predict([curr])[0])
-            # convert 5-day prediction to horizon
-            steps = max(1.0, horizon / 5.0)
-            return float(prices[-1] * ((1.0 + pred) ** steps))
-        except Exception:
-            return None
-
-    def _vol_30d(self, closes: List[float]) -> float:
-        if len(closes) < 31:
-            return 0.25
-        rets: List[float] = []
-        for i in range(1, len(closes)):
-            if closes[i - 1] > 0 and closes[i] > 0:
-                rets.append(math.log(closes[i] / closes[i - 1]))
-        if len(rets) < 2:
-            return 0.25
-        return float(_std(rets) * math.sqrt(252))
-
-
-# =============================================================================
-# History Analytics
-# =============================================================================
-def compute_history_analytics(
-    closes: List[float],
-    highs: Optional[List[float]] = None,
-    lows: Optional[List[float]] = None,
-    volumes: Optional[List[float]] = None,
-) -> Dict[str, Any]:
-    if not closes or len(closes) < 10:
-        return {}
-    out: Dict[str, Any] = {}
-    last = closes[-1]
-
-    # returns
-    for name, days in {
-        "returns_1w": 5,
-        "returns_1m": 21,
-        "returns_3m": 63,
-        "returns_12m": 252,
-    }.items():
-        if len(closes) > days and closes[-(days + 1)]:
-            out[name] = float((last / closes[-(days + 1)] - 1.0) * 100.0)
-
-    # moving avgs
-    for period in (20, 50, 200):
-        if len(closes) >= period:
-            ma = sum(closes[-period:]) / period
-            out[f"sma_{period}"] = float(ma)
-            out[f"price_to_sma_{period}"] = float((last / ma - 1.0) * 100.0) if ma else None
-
-    # vol 30d
-    if len(closes) >= 31:
+def _volatility_30d(closes: List[float]) -> Optional[float]:
+    if len(closes) < 31:
+        return None
+    try:
         window = closes[-31:]
-        rets = []
+        rets: List[float] = []
         for i in range(1, len(window)):
             if window[i - 1] > 0 and window[i] > 0:
-                rets.append((window[i] / window[i - 1]) - 1.0)
-        out["volatility_30d"] = float(_std(rets) * math.sqrt(252) * 100.0) if len(rets) >= 2 else None
+                rets.append(math.log(window[i] / window[i - 1]))
+        if len(rets) < 2:
+            return None
+        return float(_std(rets) * math.sqrt(252) * 100.0)  # percent points
+    except Exception:
+        return None
 
-    ti = TechnicalIndicators()
-    rsi_vals = ti.rsi(closes, 14)
-    if rsi_vals and rsi_vals[-1] is not None:
-        out["rsi_14"] = float(rsi_vals[-1])
 
-    # regime
-    regime, confidence = MarketRegimeDetector(closes).detect()
-    out["market_regime"] = regime.value
-    out["market_regime_confidence"] = float(confidence)
+# =============================================================================
+# History Analytics (light + schema aligned)
+# =============================================================================
+def compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
+    if not closes or len(closes) < 20:
+        return {}
+    out: Dict[str, Any] = {}
+    rsi = _rsi_14(closes)
+    if rsi is not None:
+        out["rsi_14"] = float(rsi)
+    vol30 = _volatility_30d(closes)
+    if vol30 is not None:
+        out["volatility_30d"] = float(vol30)
 
-    # forecasts
-    if _enable_forecast() and len(closes) >= 60:
-        forecaster = EnsembleForecaster(closes, enable_ml=_enable_ml())
-        for horizon, period in ((21, "1m"), (63, "3m"), (252, "12m")):
-            fc = forecaster.forecast(horizon)
-            if fc.get("forecast_available") and fc.get("ensemble"):
-                out[f"expected_roi_{period}"] = fc["ensemble"].get("roi_pct")
-                out[f"forecast_price_{period}"] = fc["ensemble"].get("price")
-                out[f"target_price_{period}"] = fc["ensemble"].get("price")
-                out[f"forecast_range_low_{period}"] = fc["ensemble"].get("price_range_low")
-                out[f"forecast_range_high_{period}"] = fc["ensemble"].get("price_range_high")
-                if period == "12m":
-                    # 0..1 scale + 0..100 for convenience
-                    conf_pct = float(fc.get("confidence") or 0.0)
-                    out["forecast_confidence"] = conf_pct / 100.0
-                    out["forecast_confidence_pct"] = conf_pct
-                    out["forecast_confidence_level"] = fc.get("confidence_level")
-                    out["forecast_models"] = fc.get("models_used")
+    # simple forecasts (best-effort): do not overfit; keep stable
+    if _enable_forecast() and len(closes) >= 90:
+        last = float(closes[-1])
+        def _forecast(h: int) -> Tuple[Optional[float], Optional[float]]:
+            if len(closes) < 60 or last <= 0:
+                return None, None
+            # drift based on last 60 trading days
+            w = closes[-61:]
+            rets = []
+            for i in range(1, len(w)):
+                if w[i - 1] > 0:
+                    rets.append((w[i] / w[i - 1]) - 1.0)
+            mu = _mean(rets) if rets else 0.0
+            price = last * ((1.0 + mu) ** h)
+            roi = (price / last - 1.0) * 100.0
+            return float(price), float(roi)
 
-        out["forecast_method"] = "ensemble_v5"
-        out["forecast_source"] = "tadawul_provider"
+        p1, r1 = _forecast(21)
+        p3, r3 = _forecast(63)
+        p12, r12 = _forecast(252)
+
+        if p1 is not None:
+            out["forecast_price_1m"] = p1
+            out["expected_roi_1m"] = r1
+        if p3 is not None:
+            out["forecast_price_3m"] = p3
+            out["expected_roi_3m"] = r3
+        if p12 is not None:
+            out["forecast_price_12m"] = p12
+            out["expected_roi_12m"] = r12
+
+        # confidence 0..1 (simple function of vol)
+        vol = vol30 / 100.0 if vol30 is not None else 0.35
+        conf = max(0.20, min(0.85, 0.70 * (1.0 / (1.0 + max(0.0, vol - 0.30)))))
+        out["forecast_confidence"] = float(conf)
 
     return out
 
@@ -1420,9 +1154,8 @@ class TadawulClient:
 
         self.quote_url = _safe_str(_env_str("TADAWUL_QUOTE_URL", ""))
         self.fundamentals_url = _safe_str(_env_str("TADAWUL_FUNDAMENTALS_URL", ""))
-        self.history_url = _safe_str(_env_str("TADAWUL_HISTORY_URL", "")) or _safe_str(
-            _env_str("TADAWUL_CANDLES_URL", "")
-        )
+        self.history_url = _safe_str(_env_str("TADAWUL_HISTORY_URL", "")) or _safe_str(_env_str("TADAWUL_CANDLES_URL", ""))
+        self.profile_url = _safe_str(_env_str("TADAWUL_PROFILE_URL", ""))
 
         headers = {
             "User-Agent": _env_str("TADAWUL_USER_AGENT", USER_AGENT_DEFAULT),
@@ -1442,6 +1175,7 @@ class TadawulClient:
         self.quote_cache = SmartCache(maxsize=7000, ttl=_quote_ttl_sec())
         self.fund_cache = SmartCache(maxsize=4000, ttl=_fund_ttl_sec())
         self.history_cache = SmartCache(maxsize=2500, ttl=_hist_ttl_sec())
+        self.profile_cache = SmartCache(maxsize=4000, ttl=_profile_ttl_sec())
         self.error_cache = SmartCache(maxsize=4000, ttl=_err_ttl_sec())
 
         self.semaphore = asyncio.Semaphore(_max_concurrency())
@@ -1454,17 +1188,17 @@ class TadawulClient:
         self.request_queue = RequestQueue(max_size=_queue_size())
         self.singleflight = SingleFlight()
 
-        # queue worker is started lazily (safer across runtime contexts)
         self._queue_task: Optional[asyncio.Task] = None
         self._closing = False
 
         logger.info(
-            "TadawulClient v%s initialized | configured=%s | rate=%s/s | cb=%s/%ss",
+            "TadawulClient v%s initialized | configured=%s | rate=%s/s | cb=%s/%ss | has_profile=%s",
             PROVIDER_VERSION,
             _configured(),
             _rate_limit(),
             _circuit_breaker_threshold(),
             _circuit_breaker_timeout(),
+            bool(self.profile_url),
         )
 
     async def _ensure_queue_task(self) -> None:
@@ -1540,8 +1274,7 @@ class TadawulClient:
                     if 500 <= status < 600:
                         await self.circuit_breaker.on_failure(status)
                         base_wait = 2 ** attempt
-                        jitter = random.uniform(0, base_wait)
-                        await asyncio.sleep(min(10.0, base_wait + jitter))
+                        await asyncio.sleep(min(10.0, base_wait + random.uniform(0, base_wait)))
                         continue
 
                     if status >= 400 and status != 404:
@@ -1572,15 +1305,72 @@ class TadawulClient:
         _METRICS.inc("requests_total", 1, {"status": "error"})
         return None, last_err or "max_retries_exceeded"
 
+    # -------------------------------------------------------------------------
+    # Mapping helpers (Phase E: classification + identity)
+    # -------------------------------------------------------------------------
+    def _map_identity_from_any(self, root: Any) -> Dict[str, Any]:
+        """
+        Extracts name/sector/industry/exchange/currency from any Tadawul payload shape.
+        Best-effort: if missing, caller will fill defaults.
+        """
+        patch: Dict[str, Any] = {}
+        patch["name"] = pick_str(
+            root,
+            "name",
+            "company_name",
+            "companyName",
+            "securityName",
+            "securityNameEn",
+            "securityNameAr",
+            "instrumentName",
+            "symbolName",
+            "shortName",
+            "longName",
+        )
+        patch["sector"] = pick_str(
+            root,
+            "sector",
+            "sectorName",
+            "sector_name",
+            "sectorEn",
+            "sectorAr",
+            "gicsSector",
+            "sector_description",
+        )
+        patch["industry"] = pick_str(
+            root,
+            "industry",
+            "industryName",
+            "industry_name",
+            "industryEn",
+            "industryAr",
+            "gicsIndustry",
+            "industry_description",
+            "subSectorName",
+            "sub_sector",
+            "subSector",
+        )
+
+        # Some APIs return exchange fields
+        patch["exchange"] = pick_str(root, "exchange", "exchangeName", "market", "marketName", "mic")
+        patch["currency"] = pick_str(root, "currency", "ccy", "tradingCurrency")
+
+        return clean_patch(patch)
+
     def _map_quote(self, root: Any) -> Dict[str, Any]:
         patch: Dict[str, Any] = {}
+
+        # Identity/classification (in case quote provides it)
+        merge_into(patch, self._map_identity_from_any(root))
+
+        # Canonical price fields
         patch["current_price"] = pick_num(root, "last", "last_price", "price", "close", "c", "tradingPrice", "regularMarketPrice")
-        patch["previous_close"] = pick_num(root, "previous_close", "prev_close", "pc", "PreviousClose", "prevClose")
-        patch["open"] = pick_num(root, "open", "o", "Open", "openPrice")
+        patch["previous_close"] = pick_num(root, "previous_close", "prev_close", "pc", "PreviousClose", "prevClose", "regularMarketPreviousClose")
+        patch["open_price"] = pick_num(root, "open", "open_price", "regularMarketOpen", "o", "Open", "openPrice")
         patch["day_high"] = pick_num(root, "high", "day_high", "h", "High", "dayHigh", "sessionHigh")
         patch["day_low"] = pick_num(root, "low", "day_low", "l", "Low", "dayLow", "sessionLow")
         patch["volume"] = pick_num(root, "volume", "v", "Volume", "tradedVolume", "qty", "quantity")
-        patch["value_traded"] = pick_num(root, "value_traded", "tradedValue", "turnover", "value", "tradeValue")
+        patch["market_cap"] = pick_num(root, "market_cap", "marketCap", "marketCapitalization", "MarketCap")
         patch["week_52_high"] = pick_num(root, "week_52_high", "fiftyTwoWeekHigh", "52w_high", "yearHigh", "week52High")
         patch["week_52_low"] = pick_num(root, "week_52_low", "fiftyTwoWeekLow", "52w_low", "yearLow", "week52Low")
         patch["price_change"] = pick_num(root, "change", "d", "price_change", "Change", "diff", "delta")
@@ -1591,43 +1381,44 @@ class TadawulClient:
 
     def _map_fundamentals(self, root: Any) -> Dict[str, Any]:
         patch: Dict[str, Any] = {}
-        patch["name"] = pick_str(root, "name", "company", "company_name", "CompanyName", "shortName", "longName")
-        patch["sector"] = pick_str(root, "sector", "Sector", "sectorName")
-        patch["industry"] = pick_str(root, "industry", "Industry", "industryName")
-        patch["sub_sector"] = pick_str(root, "sub_sector", "subSector", "SubSector", "subSectorName", "subIndustry")
+
+        # Identity/classification (fundamentals often better for sector/industry)
+        merge_into(patch, self._map_identity_from_any(root), force_keys=("sector", "industry", "name"))
+
         patch["market_cap"] = pick_num(root, "market_cap", "marketCap", "marketCapitalization", "MarketCap")
+        patch["float_shares"] = pick_num(root, "floatShares", "float_shares", "freeFloatShares")
         patch["shares_outstanding"] = pick_num(root, "shares", "shares_outstanding", "shareOutstanding", "SharesOutstanding")
+
         patch["pe_ttm"] = pick_num(root, "pe", "pe_ttm", "trailingPE", "PE", "priceEarnings")
-        patch["pb"] = pick_num(root, "pb", "priceToBook", "PBR", "price_book")
+        patch["pb_ratio"] = pick_num(root, "pb", "pb_ratio", "priceToBook", "PBR", "price_book")
         patch["eps_ttm"] = pick_num(root, "eps", "eps_ttm", "trailingEps", "EPS")
         patch["dividend_yield"] = pick_pct(root, "dividend_yield", "divYield", "yield", "DividendYield")
-        patch["beta"] = pick_num(root, "beta", "Beta")
-        if patch.get("currency") is None:
-            patch["currency"] = "SAR"
+
         return clean_patch(patch)
 
-    def _parse_candles(self, js: Any) -> Tuple[List[float], List[float], List[float], List[float], Optional[datetime]]:
+    def _map_profile(self, root: Any) -> Dict[str, Any]:
+        """
+        Optional profile endpoint mapping (if configured).
+        Intended mainly for sector/industry/name (Phase E).
+        """
+        patch = self._map_identity_from_any(root)
+        # Some profile endpoints contain standardized fields
+        if "sector" not in patch:
+            patch["sector"] = pick_str(root, "sectorClassification", "classificationSector", "sectorDesc")
+        if "industry" not in patch:
+            patch["industry"] = pick_str(root, "industryClassification", "classificationIndustry", "industryDesc")
+        return clean_patch(patch)
+
+    def _parse_candles(self, js: Any) -> Tuple[List[float], Optional[datetime]]:
         closes: List[float] = []
-        highs: List[float] = []
-        lows: List[float] = []
-        volumes: List[float] = []
         last_dt: Optional[datetime] = None
 
         if isinstance(js, dict):
             c_raw = js.get("c") or js.get("close")
-            h_raw = js.get("h") or js.get("high")
-            l_raw = js.get("l") or js.get("low")
-            v_raw = js.get("v") or js.get("volume")
             t_raw = js.get("t") or js.get("time") or js.get("timestamp")
 
             if isinstance(c_raw, list):
                 closes = [f for f in (safe_float(x) for x in c_raw) if f is not None]
-            if isinstance(h_raw, list):
-                highs = [f for f in (safe_float(x) for x in h_raw) if f is not None]
-            if isinstance(l_raw, list):
-                lows = [f for f in (safe_float(x) for x in l_raw) if f is not None]
-            if isinstance(v_raw, list):
-                volumes = [f for f in (safe_float(x) for x in v_raw) if f is not None]
 
             if isinstance(t_raw, list) and t_raw:
                 try:
@@ -1640,19 +1431,10 @@ class TadawulClient:
                 if isinstance(candles, list) and candles and isinstance(candles[0], dict):
                     for item in candles:
                         c = safe_float(item.get("c") or item.get("close"))
-                        h = safe_float(item.get("h") or item.get("high"))
-                        l = safe_float(item.get("l") or item.get("low"))
-                        v = safe_float(item.get("v") or item.get("volume"))
                         if c is not None:
                             closes.append(c)
-                        if h is not None:
-                            highs.append(h)
-                        if l is not None:
-                            lows.append(l)
-                        if v is not None:
-                            volumes.append(v)
                         t = item.get("t") or item.get("time") or item.get("date")
-                        if last_dt is None and t is not None:
+                        if t is not None:
                             try:
                                 if isinstance(t, (int, float)):
                                     last_dt = datetime.fromtimestamp(float(t), tz=timezone.utc)
@@ -1662,8 +1444,11 @@ class TadawulClient:
                                 pass
 
         maxp = _history_points_max()
-        return closes[-maxp:], highs[-maxp:] if highs else [], lows[-maxp:] if lows else [], volumes[-maxp:] if volumes else [], last_dt
+        return closes[-maxp:], last_dt
 
+    # -------------------------------------------------------------------------
+    # Public fetchers
+    # -------------------------------------------------------------------------
     async def fetch_quote_patch(self, symbol: str) -> Dict[str, Any]:
         if not _configured():
             return {}
@@ -1685,6 +1470,9 @@ class TadawulClient:
             if safe_float(mapped.get("current_price")) is None:
                 await self.error_cache.set(cache_key, True)
                 return {}
+
+            # Phase E: always inject KSA identity defaults
+            _ensure_ksa_identity(mapped, symbol=sym)
 
             result = {
                 "requested_symbol": symbol,
@@ -1723,6 +1511,9 @@ class TadawulClient:
             if not mapped:
                 await self.error_cache.set(cache_key, True)
                 return {}
+
+            _ensure_ksa_identity(mapped, symbol=sym)
+
             result = {
                 "provider": PROVIDER_NAME,
                 "data_source": PROVIDER_NAME,
@@ -1734,6 +1525,41 @@ class TadawulClient:
 
         cached = await self.fund_cache.get(cache_key)
         return dict(cached) if cached else await self.singleflight.run(cache_key, _fetch)
+
+    async def fetch_profile_patch(self, symbol: str) -> Dict[str, Any]:
+        """
+        Optional: profile endpoint mainly to improve name/sector/industry (Phase E).
+        If TADAWUL_PROFILE_URL is not set, this returns {}.
+        """
+        if not (_configured() and _enable_profile()):
+            return {}
+        sym = normalize_ksa_symbol(symbol)
+        if not sym or not self.profile_url:
+            return {}
+
+        cache_key = f"profile:{sym}"
+        cached = await self.profile_cache.get(cache_key)
+        if cached is not None:
+            return dict(cached) if isinstance(cached, dict) else {}
+
+        async def _fetch():
+            js, err = await self._request(format_url(self.profile_url or "", sym), priority=RequestPriority.NORMAL)
+            if js is None:
+                return {}
+            mapped = self._map_profile(coerce_dict(js))
+            if not mapped:
+                return {}
+            _ensure_ksa_identity(mapped, symbol=sym)
+            out = {
+                "provider": PROVIDER_NAME,
+                "data_source": PROVIDER_NAME,
+                "provider_version": PROVIDER_VERSION,
+                **mapped,
+            }
+            await self.profile_cache.set(cache_key, out)
+            return out
+
+        return await self.singleflight.run(cache_key, _fetch)
 
     async def fetch_history_patch(self, symbol: str) -> Dict[str, Any]:
         if not (_configured() and _enable_history()):
@@ -1752,13 +1578,13 @@ class TadawulClient:
             if js is None:
                 await self.error_cache.set(cache_key, True)
                 return {}
-            closes, highs, lows, volumes, last_dt = self._parse_candles(js)
-            if not closes or len(closes) < 10:
+            closes, last_dt = self._parse_candles(js)
+            if not closes or len(closes) < 20:
                 await self.error_cache.set(cache_key, True)
                 return {}
 
-            analytics = compute_history_analytics(closes, highs, lows, volumes)
-            result = {
+            analytics = compute_history_analytics(closes)
+            out = {
                 "requested_symbol": symbol,
                 "normalized_symbol": sym,
                 "history_points": len(closes),
@@ -1769,32 +1595,35 @@ class TadawulClient:
                 "provider_version": PROVIDER_VERSION,
                 **analytics,
             }
-            if "forecast_method" in analytics:
-                result["forecast_updated_utc"] = _utc_iso(last_dt)
-                result["forecast_updated_riyadh"] = _to_riyadh_iso(last_dt)
-            await self.history_cache.set(cache_key, result)
-            return result
+            await self.history_cache.set(cache_key, out)
+            return out
 
         cached = await self.history_cache.get(cache_key)
         return dict(cached) if cached else await self.singleflight.run(cache_key, _fetch)
 
     async def fetch_enriched_quote_patch(self, symbol: str) -> Dict[str, Any]:
+        """
+        Enriched KSA quote: quote + fundamentals + history + optional profile
+        and Phase E identity defaults (country/currency/exchange always).
+        """
         if not _configured():
             return {}
         sym = normalize_ksa_symbol(symbol)
         if not sym:
             return {} if not _emit_warnings() else {"_warn": "invalid_ksa_symbol"}
 
-        quote_data, fund_data, hist_data = await asyncio.gather(
+        quote_data, fund_data, hist_data, prof_data = await asyncio.gather(
             self.fetch_quote_patch(symbol),
             self.fetch_fundamentals_patch(symbol),
             self.fetch_history_patch(symbol),
+            self.fetch_profile_patch(symbol),
             return_exceptions=True,
         )
 
         quote_data = quote_data if isinstance(quote_data, dict) else {}
         fund_data = fund_data if isinstance(fund_data, dict) else {}
         hist_data = hist_data if isinstance(hist_data, dict) else {}
+        prof_data = prof_data if isinstance(prof_data, dict) else {}
 
         result: Dict[str, Any] = dict(quote_data) if quote_data else {
             "requested_symbol": symbol,
@@ -1807,19 +1636,22 @@ class TadawulClient:
             "last_updated_riyadh": _riyadh_iso(),
         }
 
+        # Merge order: profile (classification) -> fundamentals -> history -> quote already in base
+        if prof_data:
+            merge_into(result, prof_data, force_keys=("name", "sector", "industry", "exchange", "currency", "country"))
         if fund_data:
+            merge_into(result, fund_data, force_keys=("market_cap", "pe_ttm", "eps_ttm", "name", "sector", "industry"))
+        if hist_data:
             merge_into(
                 result,
-                fund_data,
-                force_keys=("market_cap", "pe_ttm", "eps_ttm", "shares_outstanding", "name", "sector", "industry"),
+                {k: v for k, v in hist_data.items() if v is not None},
+                force_keys=("rsi_14", "volatility_30d", "forecast_confidence", "forecast_price_1m", "forecast_price_3m", "forecast_price_12m"),
             )
 
-        if hist_data:
-            for k, v in hist_data.items():
-                if k not in result and v is not None:
-                    result[k] = v
+        # Always enforce KSA identity defaults
+        _ensure_ksa_identity(result, symbol=sym)
 
-        # ensure derived + aliases
+        # Derived + aliases
         fill_derived_quote_fields(result)
 
         cat, score = data_quality_score(result)
@@ -1828,7 +1660,7 @@ class TadawulClient:
 
         if _emit_warnings():
             warns = []
-            for src in (quote_data, fund_data, hist_data):
+            for src in (quote_data, fund_data, hist_data, prof_data):
                 if isinstance(src, dict) and "_warn" in src:
                     warns.append(str(src["_warn"]))
             if warns:
@@ -1837,7 +1669,6 @@ class TadawulClient:
         return clean_patch(result)
 
     async def get_metrics(self) -> Dict[str, Any]:
-        # SAFE: no undefined locks/attrs
         return {
             "provider": PROVIDER_NAME,
             "version": PROVIDER_VERSION,
@@ -1846,12 +1677,14 @@ class TadawulClient:
                 "quote": bool(self.quote_url),
                 "fundamentals": bool(self.fundamentals_url),
                 "history": bool(self.history_url),
+                "profile": bool(self.profile_url),
             },
             "circuit_breaker": self.circuit_breaker.get_stats(),
             "cache_sizes": {
                 "quote": await self.quote_cache.size(),
                 "fund": await self.fund_cache.size(),
                 "history": await self.history_cache.size(),
+                "profile": await self.profile_cache.size(),
                 "error": await self.error_cache.size(),
             },
             "runtime": {
@@ -1861,6 +1694,7 @@ class TadawulClient:
                 "has_xgboost": XGB_AVAILABLE,
                 "has_statsmodels": STATSMODELS_AVAILABLE,
             },
+            "ksa_defaults": {"country": KSA_COUNTRY_CODE, "currency": KSA_CURRENCY, "exchange": KSA_EXCHANGE_NAME},
         }
 
     async def close(self) -> None:
@@ -1913,10 +1747,15 @@ async def fetch_history_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[st
     return await (await get_client()).fetch_history_patch(symbol)
 
 
+async def fetch_profile_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    return await (await get_client()).fetch_profile_patch(symbol)
+
+
 async def fetch_quote_and_fundamentals_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     client = await get_client()
     result = dict(await client.fetch_quote_patch(symbol))
     merge_into(result, await client.fetch_fundamentals_patch(symbol))
+    _ensure_ksa_identity(result, symbol=normalize_ksa_symbol(symbol) or symbol)
     fill_derived_quote_fields(result)
     return clean_patch(result)
 
@@ -1925,6 +1764,7 @@ async def fetch_quote_and_history_patch(symbol: str, *args: Any, **kwargs: Any) 
     client = await get_client()
     result = dict(await client.fetch_quote_patch(symbol))
     merge_into(result, await client.fetch_history_patch(symbol))
+    _ensure_ksa_identity(result, symbol=normalize_ksa_symbol(symbol) or symbol)
     fill_derived_quote_fields(result)
     return clean_patch(result)
 
@@ -1970,6 +1810,7 @@ __all__ = [
     "fetch_quote_patch",
     "fetch_fundamentals_patch",
     "fetch_history_patch",
+    "fetch_profile_patch",
     "fetch_quote_and_fundamentals_patch",
     "fetch_quote_and_history_patch",
     "get_client_metrics",
