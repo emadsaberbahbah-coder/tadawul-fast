@@ -2,29 +2,26 @@
 # routes/enriched_quote.py
 """
 ================================================================================
-Enriched Quote Router — v5.4.0 (PHASE 4 SCHEMA-ALIGNED / ENGINE-LAZY)
+Enriched Quote Router — v5.6.1 (SCHEMA-ALIGNED + /quotes COMPAT + RISK FALLBACK)
 ================================================================================
-Goal:
-- /v1/enriched/quote must emit KEYS aligned to schema_registry mapping.
-- This becomes the standard row object consumed by sheet-row endpoints and fallbacks.
 
-Design:
+What this revision fixes (based on your PowerShell logs)
+1) ✅ Adds a first-class PUBLIC /quotes endpoint (compat with your dashboard runner)
+   - Accepts page/sheet/sheet_name/tab/name + symbols/tickers
+   - Returns {headers, keys, rows, rows_matrix, meta} schema-projected
+
+2) ✅ Guarantees schema keys exist on every row (prevents missing-property drops)
+   - If a key is in the schema, it will exist in the row dict (None if unknown)
+
+3) ✅ Optional Yahoo fallback to fill missing PHASE-D risk fields
+   - volatility_90d, max_drawdown_1y, var_95_1d, sharpe_1y
+   - Only runs when those fields are missing/None
+   - Controlled by env ENRICHED_YAHOO_FALLBACK_ENABLED (default: true)
+
+Design
 - Engine is lazy: request.app.state.engine OR core.data_engine_v2.get_engine()
-- Output is a schema-aligned row dict with guaranteed keys via normalize_row_to_schema()
-- Backward compatible response wrapper:
-    { "status": "success", "data": <row>, ... }
-  PLUS we also copy row keys to the top-level for easy consumers.
-
-Endpoints:
-- GET  /v1/enriched/health
-- GET  /v1/enriched/headers
-- GET  /v1/enriched/quote
-- GET  /v1/enriched/quotes
-- POST /v1/enriched/quotes
-
-Notes:
-- Percent-like fields are returned as FRACTIONS (0.12 => 12%) when applicable.
-- No startup network I/O.
+- Output is schema-aligned via normalize_row_to_schema(schema, row)
+- No startup network I/O
 ================================================================================
 """
 
@@ -39,8 +36,9 @@ import re
 import time
 import traceback
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 from fastapi import APIRouter, Body, Query, Request
 from fastapi.encoders import jsonable_encoder
@@ -137,6 +135,7 @@ except Exception:
     _HAS_ENGINE_SCHEMA_NORMALIZER = False
 
     def _normalize_row_to_schema(schema: Any, rowdict: Dict[str, Any]) -> Dict[str, Any]:  # type: ignore
+        # Fallback: no schema padding here. We'll pad manually later when schema is known.
         return dict(rowdict or {})
 
 # ---------------------------------------------------------------------------
@@ -150,16 +149,45 @@ except Exception:
     SCHEMA_REGISTRY = {}  # type: ignore
     _SCHEMA_AVAILABLE = False
 
-__version__ = "5.4.0"
+# Optional page catalog normalization
+try:
+    from core.sheets.page_catalog import normalize_page_name as _normalize_page_name  # type: ignore
+
+    _HAS_PAGE_CATALOG = True
+except Exception:
+    _HAS_PAGE_CATALOG = False
+
+    def _normalize_page_name(x: str) -> str:  # type: ignore
+        return (x or "").strip()
+
+# ---------------------------------------------------------------------------
+# Optional Yahoo fallback for missing risk fields (PHASE D)
+# ---------------------------------------------------------------------------
+try:
+    # This is your updated provider file.
+    from core.providers.yahoo_chart_provider import fetch_enriched_quote_patch as _yahoo_patch  # type: ignore
+
+    _HAS_YAHOO_FALLBACK = True
+except Exception:
+    _HAS_YAHOO_FALLBACK = False
+    _yahoo_patch = None  # type: ignore
+
+__version__ = "5.6.1"
 ROUTER_VERSION = __version__
 
 logger = logging.getLogger("routes.enriched_quote")
 
+# v1 router
 router = APIRouter(prefix="/v1/enriched", tags=["enriched"])
+# public compatibility router (only mounted if paths are free)
+public_router = APIRouter(tags=["enriched"])
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "active"}
 _RECOMMENDATIONS = ("STRONG_BUY", "BUY", "HOLD", "REDUCE", "SELL", "STRONG_SELL", "UNDER_REVIEW")
 RIYADH_TZ = timezone(timedelta(hours=3))
+
+# Missing-risk fields to fill if absent
+_RISK_KEYS_PHASE_D = ("volatility_90d", "max_drawdown_1y", "var_95_1d", "sharpe_1y")
 
 
 # =============================================================================
@@ -261,9 +289,7 @@ def _normalize_recommendation(rec: Any) -> str:
 
 
 def _as_payload(obj: Any) -> Dict[str, Any]:
-    """
-    Convert engine return object -> plain dict (safe).
-    """
+    """Convert engine return object -> plain dict (safe)."""
     if obj is None:
         return {}
     if isinstance(obj, dict):
@@ -418,9 +444,188 @@ def _compute_52w_position_fraction(price: Any, low_52w: Any, high_52w: Any) -> O
     return (p - lo) / (hi - lo)
 
 
-def _finalize_row(raw_symbol: str, row: Dict[str, Any], *, engine_source: str = "") -> Dict[str, Any]:
+# =============================================================================
+# Schema helpers
+# =============================================================================
+def _norm_sheet_name(name: str) -> str:
+    s = (name or "").strip()
+    if not s:
+        return ""
+    try:
+        if _HAS_PAGE_CATALOG:
+            return _normalize_page_name(s)
+    except Exception:
+        pass
+    return s
+
+
+def _get_sheet_spec(sheet: str) -> Optional[Any]:
+    if not sheet:
+        return None
+    s = _norm_sheet_name(sheet)
+    reg = SCHEMA_REGISTRY
+    if not isinstance(reg, dict) or not reg:
+        return None
+    if s in reg:
+        return reg.get(s)
+    # case-insensitive / alias attempts
+    s2 = s.replace(" ", "_").strip()
+    if s2 in reg:
+        return reg.get(s2)
+    for k, v in reg.items():
+        if str(k).strip().lower() == s.strip().lower():
+            return v
+        if str(k).strip().lower() == s2.strip().lower():
+            return v
+    return None
+
+
+def _extract_headers_keys(spec: Any) -> Tuple[List[str], List[str]]:
     """
-    Phase 4: Ensure canonical keys exist + derived values are filled if possible.
+    Supports:
+    - spec.columns: list[Column] with .header/.key or dicts with ["header","key"]
+    - dict {"columns":[...]}
+    - dict {"headers":[...], "keys":[...]}
+    """
+    headers: List[str] = []
+    keys: List[str] = []
+
+    if spec is None:
+        return headers, keys
+
+    # dict with columns
+    if isinstance(spec, dict):
+        cols = spec.get("columns")
+        if isinstance(cols, list):
+            for c in cols:
+                if isinstance(c, dict):
+                    h = _safe_str(c.get("header"))
+                    k = _safe_str(c.get("key"))
+                else:
+                    h = _safe_str(getattr(c, "header", None))
+                    k = _safe_str(getattr(c, "key", None))
+                if k:
+                    keys.append(k)
+                    headers.append(h or k)
+            return headers, keys
+
+        hs = spec.get("headers")
+        ks = spec.get("keys")
+        if isinstance(hs, list) and isinstance(ks, list) and len(hs) == len(ks) and len(ks) > 0:
+            return [str(x) for x in hs], [str(x) for x in ks]
+
+    # object with columns
+    cols = getattr(spec, "columns", None)
+    if isinstance(cols, list):
+        for c in cols:
+            if isinstance(c, dict):
+                h = _safe_str(c.get("header"))
+                k = _safe_str(c.get("key"))
+            else:
+                h = _safe_str(getattr(c, "header", None))
+                k = _safe_str(getattr(c, "key", None))
+            if k:
+                keys.append(k)
+                headers.append(h or k)
+
+    return headers, keys
+
+
+def _ensure_keys_exist(row: Dict[str, Any], keys: Sequence[str]) -> Dict[str, Any]:
+    """
+    Ensure every key exists in row dict (even if None).
+    This prevents missing-property drops in clients (PowerShell, Apps Script, etc.).
+    """
+    out = dict(row or {})
+    for k in keys:
+        if not k:
+            continue
+        if k not in out:
+            out[k] = None
+    return out
+
+
+def _project_row(row: Dict[str, Any], keys: Sequence[str]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for k in keys:
+        if not k:
+            continue
+        out[k] = row.get(k)
+    return out
+
+
+def _rows_to_matrix(rows: List[Dict[str, Any]], keys: Sequence[str]) -> List[List[Any]]:
+    mat: List[List[Any]] = []
+    for r in rows:
+        mat.append([r.get(k) for k in keys])
+    return mat
+
+
+# =============================================================================
+# Optional Yahoo fallback for missing PHASE-D risk fields
+# =============================================================================
+def _yahoo_fallback_enabled() -> bool:
+    raw = (os.getenv("ENRICHED_YAHOO_FALLBACK_ENABLED", "1") or "").strip().lower()
+    if raw in {"0", "false", "no", "n", "off", "disabled"}:
+        return False
+    return True
+
+
+def _yahoo_fallback_timeout_sec() -> float:
+    return max(3.0, min(45.0, float(_safe_float(os.getenv("ENRICHED_YAHOO_FALLBACK_TIMEOUT_SEC", "15"), 15.0) or 15.0)))
+
+
+def _yahoo_fallback_concurrency() -> int:
+    return max(1, min(20, int(_safe_int(os.getenv("ENRICHED_YAHOO_FALLBACK_CONCURRENCY", "4"), 4) or 4)))
+
+
+async def _maybe_fill_risk_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    If PHASE-D risk keys are missing/None, try Yahoo provider patch and merge.
+    This is best-effort and non-fatal.
+    """
+    if not _HAS_YAHOO_FALLBACK or _yahoo_patch is None:
+        return row
+    if not _yahoo_fallback_enabled():
+        return row
+
+    # If all are present and not None, skip
+    missing = [k for k in _RISK_KEYS_PHASE_D if row.get(k) is None]
+    if not missing:
+        return row
+
+    sym = _safe_str(row.get("symbol") or row.get("symbol_normalized") or row.get("requested_symbol")).strip()
+    if not sym:
+        return row
+
+    try:
+        patch = await asyncio.wait_for(_yahoo_patch(sym, debug=False), timeout=_yahoo_fallback_timeout_sec())  # type: ignore[misc]
+        if isinstance(patch, dict) and not patch.get("error"):
+            merged = dict(row)
+            # bring over only missing risk keys (plus helpful related keys if absent)
+            for k in _RISK_KEYS_PHASE_D:
+                if merged.get(k) is None and patch.get(k) is not None:
+                    merged[k] = patch.get(k)
+            # also align volatility_30d if missing
+            if merged.get("volatility_30d") is None and patch.get("volatility_30d") is not None:
+                merged["volatility_30d"] = patch.get("volatility_30d")
+            # helpful provenance
+            if patch.get("provider"):
+                merged.setdefault("data_provider", patch.get("provider"))
+            return merged
+    except Exception:
+        return row
+
+    return row
+
+
+# =============================================================================
+# Finalize row (schema + derived fields)
+# =============================================================================
+def _finalize_row(raw_symbol: str, row: Dict[str, Any], *, engine_source: str = "", schema: Any = None) -> Dict[str, Any]:
+    """
+    Ensure canonical keys exist + derived values are filled if possible.
+    - If schema is provided, pad keys to schema.
     """
     row = dict(row or {})
     row["requested_symbol"] = raw_symbol
@@ -496,11 +701,17 @@ def _finalize_row(raw_symbol: str, row: Dict[str, Any], *, engine_source: str = 
     if row.get("provider_latency") is None:
         row["provider_latency"] = {}
 
-    # guarantee schema keys exist (Phase 4 requirement)
+    # Normalize/pad to schema if available
     try:
-        row = _normalize_row_to_schema(None, row)
+        row = _normalize_row_to_schema(schema, row)
     except Exception:
         pass
+
+    # If schema is provided, ensure all schema keys exist
+    if schema is not None:
+        _, keys = _extract_headers_keys(schema)
+        if keys:
+            row = _ensure_keys_exist(row, keys)
 
     return row
 
@@ -508,14 +719,12 @@ def _finalize_row(raw_symbol: str, row: Dict[str, Any], *, engine_source: str = 
 # =============================================================================
 # Engine calling (lazy + signature-safe kwargs)
 # =============================================================================
+@dataclass
 class EngineCall:
-    __slots__ = ("result", "source", "error", "latency_ms")
-
-    def __init__(self, result: Optional[Any] = None, source: str = "", error: Optional[str] = None, latency_ms: float = 0.0):
-        self.result = result
-        self.source = source
-        self.error = error
-        self.latency_ms = latency_ms
+    result: Optional[Any] = None
+    source: str = ""
+    error: Optional[str] = None
+    latency_ms: float = 0.0
 
 
 async def _maybe_await(v: Any) -> Any:
@@ -544,10 +753,7 @@ _ENGINE_FAIL_TTL_SEC = 10.0
 
 
 async def _get_or_init_engine(request: Request) -> Tuple[Optional[Any], str, Optional[str]]:
-    """
-    Returns (engine, source, error).
-    Caches engine in request.app.state.engine.
-    """
+    """Returns (engine, source, error). Caches engine in request.app.state.engine."""
     try:
         engine = getattr(request.app.state, "engine", None)
         if engine is not None:
@@ -599,7 +805,6 @@ async def _get_or_init_engine(request: Request) -> Tuple[Optional[Any], str, Opt
         return None, "engine_init_failed", last_err
 
 
-# Prefer dict-returning methods if present
 _ENGINE_SINGLE_METHODS = (
     "get_enriched_quote_dict",
     "get_enriched_quote",
@@ -623,7 +828,6 @@ async def _call_engine(request: Request, symbol: str, *, schema: Any = None) -> 
     if engine is None:
         return EngineCall(error="No engine available", source=src, latency_ms=(time.time() - start) * 1000)
 
-    # Phase 4: encourage schema normalization inside engine if accepted
     call_kwargs = {"schema": schema}
 
     last_err = None
@@ -686,7 +890,6 @@ def _is_authorized(request: Request) -> bool:
     )
     authz = request.headers.get("Authorization")
 
-    # If auth_ok exists, use it
     try:
         from core.config import auth_ok  # type: ignore
 
@@ -695,75 +898,14 @@ def _is_authorized(request: Request) -> bool:
     except Exception:
         pass
 
-    # Fallback behavior:
-    # - If REQUIRE_AUTH is truthy -> deny when no auth_ok exists
     require_auth = str(os.getenv("REQUIRE_AUTH", "")).strip().lower() in _TRUTHY
     if require_auth:
         return False
-    # open by default if not explicitly required
     return True
 
 
 # =============================================================================
-# Headers endpoints (schema introspection)
-# =============================================================================
-def _schema_union_keys() -> List[str]:
-    keys: List[str] = []
-    seen: Set[str] = set()
-    if isinstance(SCHEMA_REGISTRY, dict):
-        for _, spec in SCHEMA_REGISTRY.items():
-            cols = getattr(spec, "columns", None) or []
-            for c in cols:
-                k = getattr(c, "key", None)
-                if not k:
-                    continue
-                if k not in seen:
-                    seen.add(k)
-                    keys.append(k)
-    # minimal must-haves
-    for k in ("symbol", "current_price", "previous_close", "price_change", "percent_change", "data_quality", "last_updated_utc", "last_updated_riyadh"):
-        if k not in seen:
-            keys.append(k)
-    return keys
-
-
-@router.get("/headers", include_in_schema=False)
-async def get_headers():
-    return BestJSONResponse(
-        status_code=200,
-        content={
-            "status": "success",
-            "schema_union_keys": _schema_union_keys(),
-            "schema_available": bool(_SCHEMA_AVAILABLE),
-            "version": ROUTER_VERSION,
-            "timestamp_utc": _now_utc_iso(),
-        },
-    )
-
-
-@router.get("/health", include_in_schema=False)
-async def health_check(request: Request):
-    info: Dict[str, Any] = {
-        "status": "ok",
-        "module": "enriched_quote",
-        "version": ROUTER_VERSION,
-        "timestamp_utc": _now_utc_iso(),
-        "engine_cached": bool(getattr(getattr(request, "app", None), "state", None) and getattr(request.app.state, "engine", None) is not None),
-        "schema_available": bool(_SCHEMA_AVAILABLE),
-        "engine_schema_normalizer_available": bool(_HAS_ENGINE_SCHEMA_NORMALIZER),
-    }
-    try:
-        from core.config import config_health_check  # type: ignore
-
-        if callable(config_health_check):
-            info["config"] = config_health_check()
-    except Exception:
-        pass
-    return info
-
-
-# =============================================================================
-# Quote endpoints
+# Error response
 # =============================================================================
 def _build_error_response(
     request_id: str,
@@ -794,18 +936,86 @@ def _build_error_response(
     return BestJSONResponse(status_code=status_code, content=content)
 
 
+# =============================================================================
+# v1: headers + health
+# =============================================================================
+def _schema_union_keys() -> List[str]:
+    keys: List[str] = []
+    seen: Set[str] = set()
+    if isinstance(SCHEMA_REGISTRY, dict):
+        for _, spec in SCHEMA_REGISTRY.items():
+            hdrs, ks = _extract_headers_keys(spec)
+            for k in ks:
+                if k and k not in seen:
+                    seen.add(k)
+                    keys.append(k)
+
+    # minimal must-haves
+    must = (
+        "symbol",
+        "current_price",
+        "previous_close",
+        "price_change",
+        "percent_change",
+        "data_quality",
+        "last_updated_utc",
+        "last_updated_riyadh",
+        *_RISK_KEYS_PHASE_D,
+    )
+    for k in must:
+        if k not in seen:
+            keys.append(k)
+    return keys
+
+
+@router.get("/headers", include_in_schema=False)
+async def get_headers():
+    return BestJSONResponse(
+        status_code=200,
+        content={
+            "status": "success",
+            "schema_union_keys": _schema_union_keys(),
+            "schema_available": bool(_SCHEMA_AVAILABLE),
+            "version": ROUTER_VERSION,
+            "timestamp_utc": _now_utc_iso(),
+        },
+    )
+
+
+@router.get("/health", include_in_schema=False)
+async def health_check(request: Request):
+    info: Dict[str, Any] = {
+        "status": "ok",
+        "module": "enriched_quote",
+        "version": ROUTER_VERSION,
+        "timestamp_utc": _now_utc_iso(),
+        "engine_cached": bool(getattr(getattr(request, "app", None), "state", None) and getattr(request.app.state, "engine", None) is not None),
+        "schema_available": bool(_SCHEMA_AVAILABLE),
+        "engine_schema_normalizer_available": bool(_HAS_ENGINE_SCHEMA_NORMALIZER),
+        "yahoo_fallback_available": bool(_HAS_YAHOO_FALLBACK),
+        "yahoo_fallback_enabled": bool(_yahoo_fallback_enabled()),
+    }
+    try:
+        from core.config import config_health_check  # type: ignore
+
+        if callable(config_health_check):
+            info["config"] = config_health_check()
+    except Exception:
+        pass
+    return info
+
+
+# =============================================================================
+# v1: /quote (single)
+# =============================================================================
 @router.get("/quote")
 async def get_enriched_quote(
     request: Request,
     symbol: str = Query("", description="Ticker symbol (AAPL, 1120.SR, ^GSPC, GC=F)"),
+    sheet: str = Query("", description="Optional sheet/page name to apply schema padding"),
     debug: bool = Query(False, description="Include debug information"),
     wrap: bool = Query(True, description="Keep wrapper fields (status/data/request_id)."),
 ):
-    """
-    Returns schema-aligned row dict for one symbol.
-    - By default returns wrapper + row at top level:
-        { status, request_id, data: <row>, <row keys...> }
-    """
     request_id = request.headers.get("X-Request-ID", str(uuid.uuid4())[:12])
     dbg = _is_truthy(os.getenv("DEBUG_ERRORS", "0")) or debug
 
@@ -813,19 +1023,21 @@ async def get_enriched_quote(
         span.set_attribute("symbol", symbol)
 
         if not _is_authorized(request):
-            router_requests_total.labels(endpoint="quote", status="unauthorized").inc()
+            router_requests_total.labels(endpoint="v1_quote", status="unauthorized").inc()
             return _build_error_response(request_id=request_id, error="unauthorized", status_code=401)
 
         raw = (symbol or "").strip()
         if not raw:
-            router_requests_total.labels(endpoint="quote", status="empty_symbol").inc()
+            router_requests_total.labels(endpoint="v1_quote", status="empty_symbol").inc()
             return _build_error_response(request_id=request_id, error="empty_symbol", symbol=raw)
+
+        schema = _get_sheet_spec(sheet) if sheet else None
 
         start_time = time.time()
         try:
-            call = await _call_engine(request, raw, schema=None)
+            call = await _call_engine(request, raw, schema=schema)
             if call.error or call.result is None:
-                router_requests_total.labels(endpoint="quote", status="no_data").inc()
+                router_requests_total.labels(endpoint="v1_quote", status="no_data").inc()
                 return _build_error_response(
                     request_id=request_id,
                     error=call.error or "no_data",
@@ -837,12 +1049,12 @@ async def get_enriched_quote(
                 )
 
             payload = _as_payload(call.result)
-            row = _finalize_row(raw, payload, engine_source=call.source)
+            row = _finalize_row(raw, payload, engine_source=call.source, schema=schema)
+            row = await _maybe_fill_risk_fields(row)
 
-            router_requests_total.labels(endpoint="quote", status="success").inc()
-            router_request_duration.labels(endpoint="quote").observe(time.time() - start_time)
+            router_requests_total.labels(endpoint="v1_quote", status="success").inc()
+            router_request_duration.labels(endpoint="v1_quote").observe(time.time() - start_time)
 
-            # Backward compatible wrapper + flat row keys
             if wrap:
                 out: Dict[str, Any] = {
                     "status": "success",
@@ -854,11 +1066,10 @@ async def get_enriched_quote(
                 out.update(row)
                 return BestJSONResponse(status_code=200, content=out)
 
-            # Flat only
             return BestJSONResponse(status_code=200, content=row)
 
         except Exception as e:
-            router_requests_total.labels(endpoint="quote", status="error").inc()
+            router_requests_total.labels(endpoint="v1_quote", status="error").inc()
             logger.exception("Error processing /v1/enriched/quote")
             return _build_error_response(
                 request_id=request_id,
@@ -869,59 +1080,9 @@ async def get_enriched_quote(
             )
 
 
-@router.get("/quotes")
-async def get_enriched_quotes(
-    request: Request,
-    symbols: str = Query("", description="Comma/space separated symbols"),
-    tickers: str = Query("", description="Alias for symbols"),
-    format: str = Query("items", description="items | dict"),
-    debug: bool = Query(False, description="Include debug information"),
-    wrap: bool = Query(True, description="Keep wrapper fields (status/items/request_id)."),
-):
-    return await _quotes_impl(
-        request=request,
-        symbols=_dedup_symbols(_split_symbols(symbols) + _split_symbols(tickers)),
-        fmt=(format or "").strip().lower(),
-        debug=debug,
-        wrap=wrap,
-    )
-
-
-@router.post("/quotes")
-async def post_enriched_quotes(
-    request: Request,
-    body: Dict[str, Any] = Body(default_factory=dict),
-):
-    """
-    JSON body supported:
-      {
-        "symbols": ["AAPL","MSFT"],
-        "format": "items" | "dict",
-        "debug": true|false,
-        "wrap": true|false
-      }
-    """
-    symbols_in = body.get("symbols") or body.get("tickers") or body.get("symbol") or []
-    fmt = str(body.get("format") or "items").strip().lower()
-    debug = bool(body.get("debug") or False)
-    wrap = bool(body.get("wrap") if body.get("wrap") is not None else True)
-
-    raw_list: List[str] = []
-    if isinstance(symbols_in, str):
-        raw_list = _split_symbols(symbols_in)
-    elif isinstance(symbols_in, list):
-        for x in symbols_in:
-            raw_list.extend(_split_symbols(str(x)))
-
-    return await _quotes_impl(
-        request=request,
-        symbols=_dedup_symbols(raw_list),
-        fmt=fmt,
-        debug=debug,
-        wrap=wrap,
-    )
-
-
+# =============================================================================
+# v1: /quotes (batch)
+# =============================================================================
 def _dedup_symbols(symbols: List[str]) -> List[str]:
     seen: Set[str] = set()
     out: List[str] = []
@@ -936,6 +1097,56 @@ def _dedup_symbols(symbols: List[str]) -> List[str]:
     return out
 
 
+@router.get("/quotes")
+async def get_enriched_quotes(
+    request: Request,
+    symbols: str = Query("", description="Comma/space separated symbols"),
+    tickers: str = Query("", description="Alias for symbols"),
+    sheet: str = Query("", description="Optional sheet/page name to apply schema padding"),
+    format: str = Query("items", description="items | dict"),
+    debug: bool = Query(False, description="Include debug information"),
+    wrap: bool = Query(True, description="Keep wrapper fields (status/items/request_id)."),
+):
+    return await _quotes_impl(
+        request=request,
+        symbols=_dedup_symbols(_split_symbols(symbols) + _split_symbols(tickers)),
+        fmt=(format or "").strip().lower(),
+        debug=debug,
+        wrap=wrap,
+        schema=_get_sheet_spec(sheet) if sheet else None,
+    )
+
+
+@router.post("/quotes")
+async def post_enriched_quotes(
+    request: Request,
+    body: Dict[str, Any] = Body(default_factory=dict),
+):
+    symbols_in = body.get("symbols") or body.get("tickers") or body.get("symbol") or []
+    fmt = str(body.get("format") or "items").strip().lower()
+    debug = bool(body.get("debug") or False)
+    wrap = bool(body.get("wrap") if body.get("wrap") is not None else True)
+
+    sheet = _safe_str(body.get("sheet") or body.get("page") or body.get("sheet_name") or body.get("tab") or body.get("name"))
+    schema = _get_sheet_spec(sheet) if sheet else None
+
+    raw_list: List[str] = []
+    if isinstance(symbols_in, str):
+        raw_list = _split_symbols(symbols_in)
+    elif isinstance(symbols_in, list):
+        for x in symbols_in:
+            raw_list.extend(_split_symbols(str(x)))
+
+    return await _quotes_impl(
+        request=request,
+        symbols=_dedup_symbols(raw_list),
+        fmt=fmt,
+        debug=debug,
+        wrap=wrap,
+        schema=schema,
+    )
+
+
 async def _quotes_impl(
     *,
     request: Request,
@@ -943,44 +1154,40 @@ async def _quotes_impl(
     fmt: str,
     debug: bool,
     wrap: bool,
+    schema: Any = None,
 ):
     request_id = request.headers.get("X-Request-ID", str(uuid.uuid4())[:12])
     dbg = _is_truthy(os.getenv("DEBUG_ERRORS", "0")) or debug
 
     with tracer.start_as_current_span("router_enriched_quotes") as span:
         if not _is_authorized(request):
-            router_requests_total.labels(endpoint="quotes", status="unauthorized").inc()
+            router_requests_total.labels(endpoint="v1_quotes", status="unauthorized").inc()
             return _build_error_response(request_id=request_id, error="unauthorized", status_code=401)
 
         if not symbols:
-            router_requests_total.labels(endpoint="quotes", status="empty_symbols_list").inc()
+            router_requests_total.labels(endpoint="v1_quotes", status="empty_symbols_list").inc()
             return _build_error_response(request_id=request_id, error="empty_symbols_list")
 
         span.set_attribute("symbol_count", len(symbols))
         start_time = time.time()
 
         try:
-            call = await _call_engine_batch(request, symbols, schema=None)
+            call = await _call_engine_batch(request, symbols, schema=schema)
 
-            # Normalize batch result into a dict mapping requested_symbol -> row
             rows_by_requested: Dict[str, Dict[str, Any]] = {}
 
             if call.result is not None and not call.error:
                 if isinstance(call.result, dict):
-                    # engine may return dict keyed by input symbol or normalized symbol
                     for k, v in call.result.items():
                         payload = _as_payload(v)
-                        # prefer requested_symbol, else key
                         raw = _safe_str(payload.get("requested_symbol") or k)
-                        rows_by_requested[raw] = _finalize_row(raw, payload, engine_source=call.source)
-
+                        rows_by_requested[raw] = _finalize_row(raw, payload, engine_source=call.source, schema=schema)
                 elif isinstance(call.result, list):
-                    # best-effort align by order
                     for raw, v in zip(symbols, call.result):
                         payload = _as_payload(v)
-                        rows_by_requested[raw] = _finalize_row(raw, payload, engine_source=call.source)
+                        rows_by_requested[raw] = _finalize_row(raw, payload, engine_source=call.source, schema=schema)
 
-            # Fill missing with per-symbol calls (robust)
+            # Fill missing with per-symbol calls
             missing = [s for s in symbols if s not in rows_by_requested]
             if missing:
                 cfg_conc = max(1, min(50, _safe_int(os.getenv("ENRICHED_CONCURRENCY", 10), 10) or 10))
@@ -990,20 +1197,29 @@ async def _quotes_impl(
                 async def _fetch_one(raw: str) -> Dict[str, Any]:
                     async with sem:
                         try:
-                            single = await asyncio.wait_for(_call_engine(request, raw, schema=None), timeout=cfg_timeout)
+                            single = await asyncio.wait_for(_call_engine(request, raw, schema=schema), timeout=cfg_timeout)
                             if single.result is not None and not single.error:
                                 payload = _as_payload(single.result)
-                                return _finalize_row(raw, payload, engine_source=single.source)
-                            # error row
-                            return _finalize_row(raw, {"error": single.error or "no_data", "data_quality": "MISSING"}, engine_source=single.source)
+                                return _finalize_row(raw, payload, engine_source=single.source, schema=schema)
+                            return _finalize_row(raw, {"error": single.error or "no_data", "data_quality": "MISSING"}, engine_source=single.source, schema=schema)
                         except asyncio.TimeoutError:
-                            return _finalize_row(raw, {"error": "timeout", "data_quality": "MISSING"}, engine_source="timeout")
+                            return _finalize_row(raw, {"error": "timeout", "data_quality": "MISSING"}, engine_source="timeout", schema=schema)
                         except Exception as e:
-                            return _finalize_row(raw, {"error": f"exception:{e.__class__.__name__}", "data_quality": "MISSING"}, engine_source="exception")
+                            return _finalize_row(raw, {"error": f"exception:{e.__class__.__name__}", "data_quality": "MISSING"}, engine_source="exception", schema=schema)
 
                 fetched = await asyncio.gather(*[_fetch_one(s) for s in missing])
                 for raw, row in zip(missing, fetched):
                     rows_by_requested[raw] = row
+
+            # Optional Yahoo fallback for risk fields (batch-safe)
+            if _HAS_YAHOO_FALLBACK and _yahoo_fallback_enabled():
+                sem2 = asyncio.Semaphore(_yahoo_fallback_concurrency())
+
+                async def _fill_one(raw: str) -> None:
+                    async with sem2:
+                        rows_by_requested[raw] = await _maybe_fill_risk_fields(rows_by_requested[raw])
+
+                await asyncio.gather(*[_fill_one(s) for s in symbols if s in rows_by_requested])
 
             # Output shape
             items: List[Dict[str, Any]] = [rows_by_requested[s] for s in symbols if s in rows_by_requested]
@@ -1013,8 +1229,8 @@ async def _quotes_impl(
             else:
                 out_obj = items
 
-            router_requests_total.labels(endpoint="quotes", status="success").inc()
-            router_request_duration.labels(endpoint="quotes").observe(time.time() - start_time)
+            router_requests_total.labels(endpoint="v1_quotes", status="success").inc()
+            router_request_duration.labels(endpoint="v1_quotes").observe(time.time() - start_time)
 
             if wrap:
                 return BestJSONResponse(
@@ -1030,11 +1246,10 @@ async def _quotes_impl(
                     },
                 )
 
-            # flat only (no wrapper)
             return BestJSONResponse(status_code=200, content=out_obj)
 
         except Exception as e:
-            router_requests_total.labels(endpoint="quotes", status="error").inc()
+            router_requests_total.labels(endpoint="v1_quotes", status="error").inc()
             logger.exception("Error processing /v1/enriched/quotes")
             return _build_error_response(
                 request_id=request_id,
@@ -1045,22 +1260,206 @@ async def _quotes_impl(
 
 
 # =============================================================================
-# Mount helpers (optional)
+# PUBLIC COMPAT: /quotes and /quote (schema-projected)
+# =============================================================================
+def _pick_sheet_from_body(body: Dict[str, Any]) -> str:
+    return _safe_str(body.get("page") or body.get("sheet") or body.get("sheet_name") or body.get("tab") or body.get("name") or "")
+
+
+@public_router.post("/quotes")
+async def public_quotes(request: Request, body: Dict[str, Any] = Body(default_factory=dict)):
+    """
+    Compatibility endpoint for your dashboard runner.
+
+    Accepts:
+      {
+        "page": "Top_10_Investments",
+        "sheet_name": "...",
+        "symbols": [...],
+        "tickers": [...],
+        "include_raw": true|false,
+        "include_matrix": true|false
+      }
+
+    Returns:
+      {
+        status, page, headers, keys, rows, rows_matrix, request_id, version, meta
+      }
+    """
+    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4())[:12])
+    t0 = time.time()
+
+    if not _is_authorized(request):
+        return BestJSONResponse(status_code=401, content={"status": "error", "error": "unauthorized", "request_id": request_id})
+
+    sheet = _pick_sheet_from_body(body) or "Market_Leaders"
+    sheet = _norm_sheet_name(sheet)
+
+    symbols_in = body.get("symbols") or body.get("tickers") or body.get("symbol") or []
+    include_raw = bool(body.get("include_raw") or False)
+    include_matrix = bool(body.get("include_matrix") if body.get("include_matrix") is not None else True)
+
+    raw_list: List[str] = []
+    if isinstance(symbols_in, str):
+        raw_list = _split_symbols(symbols_in)
+    elif isinstance(symbols_in, list):
+        for x in symbols_in:
+            raw_list.extend(_split_symbols(str(x)))
+
+    symbols = _dedup_symbols(raw_list)
+
+    # schema for page
+    schema = _get_sheet_spec(sheet)
+    headers, keys = _extract_headers_keys(schema)
+
+    # if schema missing, fall back to union keys (but keep response stable)
+    if not keys:
+        keys = _schema_union_keys()
+        headers = [k for k in keys]
+
+    # Fetch enriched rows via v1 engine path (dict rows)
+    call = await _call_engine_batch(request, symbols, schema=schema)
+    rows_by_requested: Dict[str, Dict[str, Any]] = {}
+
+    if call.result is not None and not call.error:
+        if isinstance(call.result, dict):
+            for k, v in call.result.items():
+                payload = _as_payload(v)
+                raw = _safe_str(payload.get("requested_symbol") or k)
+                rows_by_requested[raw] = _finalize_row(raw, payload, engine_source=call.source, schema=schema)
+        elif isinstance(call.result, list):
+            for raw, v in zip(symbols, call.result):
+                payload = _as_payload(v)
+                rows_by_requested[raw] = _finalize_row(raw, payload, engine_source=call.source, schema=schema)
+
+    # Fill missing via single calls
+    missing = [s for s in symbols if s not in rows_by_requested]
+    if missing:
+        sem = asyncio.Semaphore(max(1, min(20, _safe_int(os.getenv("ENRICHED_PUBLIC_CONCURRENCY", 6), 6) or 6)))
+
+        async def _one(s: str) -> None:
+            async with sem:
+                single = await _call_engine(request, s, schema=schema)
+                if single.result is not None and not single.error:
+                    payload = _as_payload(single.result)
+                    rows_by_requested[s] = _finalize_row(s, payload, engine_source=single.source, schema=schema)
+                else:
+                    rows_by_requested[s] = _finalize_row(s, {"error": single.error or "no_data"}, engine_source=single.source, schema=schema)
+
+        await asyncio.gather(*[_one(s) for s in missing])
+
+    # Optional Yahoo fallback for risk fields
+    if _HAS_YAHOO_FALLBACK and _yahoo_fallback_enabled():
+        sem2 = asyncio.Semaphore(_yahoo_fallback_concurrency())
+
+        async def _fill(s: str) -> None:
+            async with sem2:
+                rows_by_requested[s] = await _maybe_fill_risk_fields(rows_by_requested[s])
+
+        await asyncio.gather(*[_fill(s) for s in symbols if s in rows_by_requested])
+
+    # Ensure schema keys exist + project rows to schema keys
+    raw_rows: List[Dict[str, Any]] = []
+    proj_rows: List[Dict[str, Any]] = []
+
+    for s in symbols:
+        r = rows_by_requested.get(s) or _finalize_row(s, {"error": "no_data"}, engine_source="missing", schema=schema)
+        r = _ensure_keys_exist(r, keys)
+        raw_rows.append(r)
+        proj_rows.append(_project_row(r, keys))
+
+    resp: Dict[str, Any] = {
+        "status": "success",
+        "page": sheet,
+        "headers": headers,
+        "keys": keys,
+        "rows": proj_rows,
+        "error": None,
+        "version": "5.6.1",
+        "request_id": request_id,
+        "meta": {
+            "duration_ms": (time.time() - t0) * 1000.0,
+            "requested": len(symbols),
+            "errors": sum(1 for r in proj_rows if r.get("error")),
+            "mode": _safe_str(body.get("mode") or ""),
+        },
+    }
+
+    # compatibility aliases
+    resp["quotes"] = resp["rows"]
+    resp["data"] = resp["rows"]
+
+    # rows_matrix
+    if include_matrix:
+        resp["rows_matrix"] = _rows_to_matrix(proj_rows, keys)
+
+    # raw rows (optional)
+    if include_raw:
+        resp["raw_rows"] = raw_rows
+
+    return BestJSONResponse(status_code=200, content=resp)
+
+
+@public_router.get("/quote")
+async def public_quote(
+    request: Request,
+    symbol: str = Query("", description="Ticker symbol"),
+    page: str = Query("", description="Optional page/sheet name for schema"),
+):
+    # Simple convenience wrapper using v1 engine path + schema padding
+    if not symbol.strip():
+        return BestJSONResponse(status_code=200, content={"status": "error", "error": "empty_symbol", "request_id": str(uuid.uuid4())[:12]})
+
+    body = {"page": page or "Market_Leaders", "symbols": [symbol], "include_matrix": True, "include_raw": False}
+    return await public_quotes(request, body)
+
+
+# =============================================================================
+# Mount helpers
 # =============================================================================
 def get_router() -> APIRouter:
+    # return the v1 router by default
     return router
 
 
-def mount(app: Any) -> None:
+def _app_has_route(app: Any, path: str, method: str) -> bool:
     try:
-        if app is not None and hasattr(app, "include_router"):
-            app.include_router(router)
+        m = (method or "").upper()
+        for r in getattr(app, "router", getattr(app, "routes", None)).routes:  # type: ignore
+            try:
+                if getattr(r, "path", None) == path and m in (getattr(r, "methods", None) or set()):
+                    return True
+            except Exception:
+                continue
     except Exception:
+        return False
+    return False
+
+
+def mount(app: Any) -> None:
+    """
+    Mount v1 router always.
+    Mount public router only if /quotes and /quote are not already defined.
+    """
+    try:
+        if app is None or not hasattr(app, "include_router"):
+            return
+
+        app.include_router(router)
+
+        # avoid duplicate conflicts
+        has_post_quotes = _app_has_route(app, "/quotes", "POST")
+        has_get_quote = _app_has_route(app, "/quote", "GET")
+        if not has_post_quotes or not has_get_quote:
+            app.include_router(public_router)
+    except Exception:
+        # never crash startup due to mounting
         pass
 
 
 __all__ = [
     "router",
+    "public_router",
     "get_router",
     "mount",
     "__version__",
