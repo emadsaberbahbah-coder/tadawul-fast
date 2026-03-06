@@ -2,26 +2,26 @@
 """
 routes/investment_advisor.py
 ================================================================================
-TFB Investment Advisor Routes — v5.6.1 (PROMETHEUS-SAFE / ENGINE-LAZY / CORE-CONFIG-BRIDGE)
+TFB Investment Advisor Routes — v5.7.0
+(PROMETHEUS-SAFE / ENGINE-LAZY / CORE-CONFIG-BRIDGE / REASON-AWARE)
 ================================================================================
 
-Why this revision (v5.6.1):
-- ✅ Still **NO prometheus_client metric creation** in this module (prevents duplicate-timeseries crash)
-- ✅ Fix health auth/open-mode reporting (previous logic could mis-evaluate / be invalid)
-- ✅ Uses core.config as auth/open-mode source of truth (best-effort fallback if missing)
-- ✅ Engine-lazy: no heavy imports / no network calls at import-time
-- ✅ Uses core/investment_advisor_engine.py as the canonical executor (stable interface)
-- ✅ Signature-safe and thread-safe: runs core advisor in a thread to avoid blocking the event loop
-- ✅ Backward compatible endpoints:
-    /v1/advisor/health
-    /v1/advisor/metrics
-    /v1/advisor/recommendations   (GET)
-    /v1/advisor/run               (POST)
+What this revision fixes
+- ✅ Keeps NO prometheus_client metric creation in this module
+- ✅ Keeps engine-lazy behavior (no heavy imports / no network at import time)
+- ✅ Uses core.config as auth/open-mode source of truth when available
+- ✅ Delegates execution to core/investment_advisor_engine.py as canonical executor
+- ✅ FIX: post-processes advisor result rows to ensure recommendation_reason is filled
+      when recommendation exists but reason is blank
+- ✅ FIX: fills horizon_days / invest_period_label when payload provides enough context
+- ✅ FIX: keeps response envelope backward-compatible
+- ✅ FIX: thread-safe execution of core advisor in worker thread
 
-Notes:
-- This router delegates the actual strategy/scoring/allocation to:
-    core.investment_advisor_engine.run_investment_advisor(payload, engine=engine)
-- It only handles: auth, request parsing, engine discovery, response envelope, and lightweight metrics.
+Endpoints
+- /v1/advisor/health
+- /v1/advisor/metrics
+- /v1/advisor/recommendations   (GET)
+- /v1/advisor/run               (POST)
 """
 
 from __future__ import annotations
@@ -69,7 +69,6 @@ try:
     def _json_dumps(v: Any) -> str:
         return orjson.dumps(_clean_nans(v), default=str).decode("utf-8")
 
-    _HAS_ORJSON = True
 except Exception:
     import json
     from fastapi.responses import JSONResponse as BestJSONResponse  # type: ignore
@@ -77,19 +76,17 @@ except Exception:
     def _json_dumps(v: Any) -> str:
         return json.dumps(_clean_nans(v), default=str, ensure_ascii=False)
 
-    _HAS_ORJSON = False
-
 
 logger = logging.getLogger("routes.investment_advisor")
 
-ROUTER_VERSION = "5.6.1"
+ROUTER_VERSION = "5.7.0"
 router = APIRouter(prefix="/v1/advisor", tags=["advisor"])
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "active"}
 
 
 # -----------------------------------------------------------------------------
-# Small in-module metrics (NO prometheus) to keep /metrics endpoint alive
+# Small in-module metrics (NO prometheus)
 # -----------------------------------------------------------------------------
 @dataclass(slots=True)
 class _AdvisorMetrics:
@@ -123,7 +120,6 @@ def _now_utc() -> str:
 
 
 def _request_id(request: Request) -> str:
-    # Prefer middleware request_id if present
     try:
         rid = getattr(request.state, "request_id", None)
         if rid:
@@ -166,7 +162,6 @@ def _safe_is_open_mode() -> Optional[bool]:
 
 
 def _safe_allow_query_token() -> Optional[bool]:
-    # settings -> env fallback
     try:
         from core.config import get_settings_cached  # type: ignore
 
@@ -182,10 +177,6 @@ def _safe_allow_query_token() -> Optional[bool]:
 
 
 def _extract_token(request: Request) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Returns (token, authorization_header).
-    token is preferred from X-APP-TOKEN/X-API-KEY or Bearer token, then query token when allowed.
-    """
     authz = request.headers.get("Authorization")
     token = (
         request.headers.get("X-APP-TOKEN")
@@ -194,14 +185,12 @@ def _extract_token(request: Request) -> Tuple[Optional[str], Optional[str]]:
         or request.headers.get("X-Api-Key")
     )
 
-    # If Bearer token exists, treat it as token too (helps core.config implementations that prefer token field)
     if (not token) and authz and authz.strip().lower().startswith("bearer "):
         try:
             token = authz.strip().split(" ", 1)[1].strip()
         except Exception:
             token = token
 
-    # Query token is allowed only if core.config/settings says so (best-effort)
     allow_q = False
     try:
         from core.config import get_settings_cached  # type: ignore
@@ -221,13 +210,6 @@ def _extract_token(request: Request) -> Tuple[Optional[str], Optional[str]]:
 
 
 def _auth_ok(request: Request) -> bool:
-    """
-    Uses core.config auth (single source of truth).
-    Accepts:
-      - X-APP-TOKEN / X-API-KEY
-      - Authorization: Bearer <token>
-      - ?token= (only when ALLOW_QUERY_TOKEN / settings.allow_query_token enabled)
-    """
     try:
         from core.config import is_open_mode, auth_ok  # type: ignore
 
@@ -240,7 +222,6 @@ def _auth_ok(request: Request) -> bool:
             return bool(auth_ok(token=token, authorization=authz, headers=dict(request.headers)))
         return False
     except Exception:
-        # Secure fallback: require auth unless explicitly disabled
         if _env_bool("REQUIRE_AUTH", True):
             return False
         return True
@@ -254,11 +235,6 @@ _ENGINE_INIT_LOCK = asyncio.Lock()
 
 
 async def _get_engine(request: Request) -> Tuple[Optional[Any], str, Optional[str]]:
-    """
-    Returns (engine, source, error).
-    Caches engine in request.app.state.engine when possible.
-    """
-    # 1) app.state.engine
     try:
         eng = getattr(request.app.state, "engine", None)
         if eng is not None:
@@ -267,7 +243,6 @@ async def _get_engine(request: Request) -> Tuple[Optional[Any], str, Optional[st
         pass
 
     async with _ENGINE_INIT_LOCK:
-        # re-check after lock
         try:
             eng = getattr(request.app.state, "engine", None)
             if eng is not None:
@@ -277,7 +252,6 @@ async def _get_engine(request: Request) -> Tuple[Optional[Any], str, Optional[st
 
         last_err = None
 
-        # 2) core.data_engine_v2.get_engine
         try:
             from core.data_engine_v2 import get_engine  # type: ignore
 
@@ -291,7 +265,6 @@ async def _get_engine(request: Request) -> Tuple[Optional[Any], str, Optional[st
         except Exception as e:
             last_err = f"core.data_engine_v2.get_engine: {type(e).__name__}: {e}"
 
-        # 3) fallback core.data_engine.get_engine
         try:
             from core.data_engine import get_engine as get_engine_legacy  # type: ignore
 
@@ -335,9 +308,6 @@ def _error(status_code: int, request_id: str, message: str, *, extra: Optional[D
 
 
 async def _run_core_advisor(payload: Dict[str, Any], *, engine: Any, timeout_sec: float) -> Dict[str, Any]:
-    """
-    Runs core advisor in a worker thread (keeps event loop responsive).
-    """
     def _call() -> Dict[str, Any]:
         from core.investment_advisor_engine import run_investment_advisor as run_engine  # type: ignore
 
@@ -370,13 +340,12 @@ def _payload_from_query(
     if tickers:
         sym_list.extend(_split_symbols(tickers))
 
-    # de-dupe preserve order
     seen = set()
     sym_list = [s for s in sym_list if not (s in seen or seen.add(s))]
 
     payload: Dict[str, Any] = {
         "symbols": sym_list,
-        "tickers": sym_list,  # keep both for compatibility
+        "tickers": sym_list,
         "top_n": top_n,
         "invest_amount": invest_amount,
         "allocation_strategy": allocation_strategy,
@@ -395,222 +364,108 @@ def _timeout_sec() -> float:
 
 
 # -----------------------------------------------------------------------------
-# Endpoints
+# Recommendation-reason post-processing
 # -----------------------------------------------------------------------------
-@router.get("/health", include_in_schema=False)
-async def advisor_health(request: Request) -> Any:
-    rid = _request_id(request)
-    engine, src, err = await _get_engine(request)
-
-    core_version = None
+def _safe_float(v: Any) -> Optional[float]:
     try:
-        from core.investment_advisor_engine import ENGINE_VERSION  # type: ignore
-
-        core_version = ENGINE_VERSION
+        if v is None:
+            return None
+        f = float(v)
+        if f != f:
+            return None
+        return f
     except Exception:
-        core_version = None
-
-    open_mode = _safe_is_open_mode()
-    allow_query = _safe_allow_query_token()
-
-    return BestJSONResponse(
-        status_code=200,
-        content=_clean_nans(
-            {
-                "status": "ok",
-                "module": "routes.investment_advisor",
-                "version": ROUTER_VERSION,
-                "timestamp_utc": _now_utc(),
-                "engine": {
-                    "available": bool(engine),
-                    "type": (type(engine).__name__ if engine is not None else "none"),
-                    "source": src,
-                    "error": err,
-                },
-                "core_engine_version": core_version,
-                "auth": {
-                    "open_mode": open_mode,
-                    "require_auth_env": _env_bool("REQUIRE_AUTH", True),
-                    "allow_query_token": allow_query,
-                },
-                "request_id": rid,
-            }
-        ),
-    )
+        return None
 
 
-@router.get("/metrics", include_in_schema=False)
-async def advisor_metrics() -> Any:
-    async with _METRICS_LOCK:
-        m = _METRICS.to_dict()
-    return BestJSONResponse(
-        status_code=200,
-        content=_clean_nans(
-            {
-                "status": "ok",
-                "module": "routes.investment_advisor",
-                "version": ROUTER_VERSION,
-                "timestamp_utc": _now_utc(),
-                "metrics": m,
-            }
-        ),
-    )
+def _as_fraction(v: Any) -> Optional[float]:
+    f = _safe_float(v)
+    if f is None:
+        return None
+    if abs(f) > 1.5:
+        return f / 100.0
+    return f
 
 
-@router.get("/recommendations")
-async def get_recommendations(
-    request: Request,
-    symbols: str = Query("", description="Comma/space separated symbols"),
-    tickers: str = Query("", description="Alias for symbols"),
-    top_n: Optional[int] = Query(None, description="Top N recommendations"),
-    invest_amount: Optional[float] = Query(None, description="Investment amount (optional)"),
-    allocation_strategy: Optional[str] = Query(None, description="Allocation strategy (optional)"),
-    risk_profile: Optional[str] = Query(None, description="Risk profile (optional)"),
-    debug: bool = Query(False, description="Include debug information on failures"),
-) -> BestJSONResponse:
-    rid = _request_id(request)
-    t0 = time.perf_counter()
-
-    if not _auth_ok(request):
-        await _record_metrics(ok=False, unauthorized=True, latency_ms=(time.perf_counter() - t0) * 1000.0, err="unauthorized")
-        return _error(401, rid, "unauthorized")
-
-    payload = _payload_from_query(
-        symbols,
-        tickers,
-        top_n=top_n,
-        invest_amount=invest_amount,
-        allocation_strategy=allocation_strategy,
-        risk_profile=risk_profile,
-        debug=debug,
-    )
-
-    sym_list = payload.get("symbols") or []
-    if not sym_list:
-        await _record_metrics(ok=False, unauthorized=False, latency_ms=(time.perf_counter() - t0) * 1000.0, err="empty_symbols_list")
-        # keep HTTP 200 for backward compatibility
-        return _error(200, rid, "empty_symbols_list")
-
-    engine, src, err = await _get_engine(request)
-    if engine is None:
-        await _record_metrics(ok=False, unauthorized=False, latency_ms=(time.perf_counter() - t0) * 1000.0, err=err or "no_engine")
-        return _error(503, rid, err or "No engine available")
-
-    timeout_sec = _timeout_sec()
-
-    result = await _run_core_advisor(payload, engine=engine, timeout_sec=timeout_sec)
-    ok = bool((result.get("meta") or {}).get("ok", True)) if isinstance(result, dict) else True
-
-    await _record_metrics(
-        ok=ok,
-        unauthorized=False,
-        latency_ms=(time.perf_counter() - t0) * 1000.0,
-        err=str((result.get("meta") or {}).get("error") or "") if isinstance(result, dict) else "",
-    )
-
-    return BestJSONResponse(
-        status_code=200,
-        content=_clean_nans(
-            {
-                "status": "ok" if ok else "error",
-                "source": src,
-                "request_id": rid,
-                "timestamp_utc": _now_utc(),
-                "version": ROUTER_VERSION,
-                "result": result,
-            }
-        ),
-    )
+def _format_pct(v: Any) -> str:
+    f = _as_fraction(v)
+    if f is None:
+        return ""
+    return f"{round(f * 100.0, 2)}%"
 
 
-@router.post("/run")
-async def run_advisor(
-    request: Request,
-    payload: Dict[str, Any] = Body(default={}),
-    debug: bool = Query(False, description="Include debug info on failures"),
-) -> BestJSONResponse:
-    """
-    Canonical run endpoint (preferred by Apps Script).
-
-    Body examples:
-      {"symbols":["AAPL","MSFT"], "top_n":20, "invest_amount":50000, "allocation_strategy":"maximum_sharpe"}
-      {"symbols":"AAPL,MSFT", "risk_profile":"moderate"}
-    """
-    rid = _request_id(request)
-    t0 = time.perf_counter()
-
-    if not _auth_ok(request):
-        await _record_metrics(ok=False, unauthorized=True, latency_ms=(time.perf_counter() - t0) * 1000.0, err="unauthorized")
-        return _error(401, rid, "unauthorized")
-
-    p = dict(payload or {})
-
-    # normalize symbols field to list (core supports both, but we keep consistent)
-    raw_syms = p.get("symbols") or p.get("tickers") or p.get("symbol") or ""
-    sym_list: List[str] = []
-    if isinstance(raw_syms, list):
-        sym_list = [str(x).strip().upper() for x in raw_syms if str(x).strip()]
-    elif isinstance(raw_syms, str):
-        sym_list = _split_symbols(raw_syms)
-
-    # dedup preserve order
-    seen = set()
-    sym_list = [s for s in sym_list if not (s in seen or seen.add(s))]
-
-    if not sym_list:
-        await _record_metrics(ok=False, unauthorized=False, latency_ms=(time.perf_counter() - t0) * 1000.0, err="empty_symbols_list")
-        # keep HTTP 200 for backward compatibility
-        return _error(200, rid, "empty_symbols_list")
-
-    p["symbols"] = sym_list
-    p["tickers"] = sym_list  # compatibility
-    p["debug"] = bool(p.get("debug", False) or debug)
-
-    engine, src, err = await _get_engine(request)
-    if engine is None:
-        await _record_metrics(ok=False, unauthorized=False, latency_ms=(time.perf_counter() - t0) * 1000.0, err=err or "no_engine")
-        return _error(503, rid, err or "No engine available")
-
-    timeout_sec = _timeout_sec()
-
-    result = await _run_core_advisor(p, engine=engine, timeout_sec=timeout_sec)
-    ok = bool((result.get("meta") or {}).get("ok", True)) if isinstance(result, dict) else True
-
-    await _record_metrics(
-        ok=ok,
-        unauthorized=False,
-        latency_ms=(time.perf_counter() - t0) * 1000.0,
-        err=str((result.get("meta") or {}).get("error") or "") if isinstance(result, dict) else "",
-    )
-
-    return BestJSONResponse(
-        status_code=200,
-        content=_clean_nans(
-            {
-                "status": "ok" if ok else "error",
-                "source": src,
-                "request_id": rid,
-                "timestamp_utc": _now_utc(),
-                "version": ROUTER_VERSION,
-                "result": result,
-            }
-        ),
-    )
+def _horizon_label(days: Optional[int]) -> Optional[str]:
+    if days is None:
+        return None
+    if days <= 45:
+        return "1M"
+    if days <= 135:
+        return "3M"
+    return "12M"
 
 
-# -----------------------------------------------------------------------------
-# Dynamic loader hooks
-# -----------------------------------------------------------------------------
-def mount(app: Any) -> None:
+def _build_recommendation_reason(row: Dict[str, Any], payload: Dict[str, Any]) -> Optional[str]:
+    rec = str(row.get("recommendation") or "").strip()
+    if not rec:
+        return None
+
+    parts: List[str] = [f"Recommendation={rec}"]
+
+    roi = row.get("expected_roi_3m")
+    if roi is None:
+        roi = row.get("expected_roi_1m")
+    if roi is None:
+        roi = row.get("expected_roi_12m")
+    roi_txt = _format_pct(roi)
+    if roi_txt:
+        parts.append(f"Expected ROI={roi_txt}")
+
+    conf = row.get("forecast_confidence")
+    conf_txt = _format_pct(conf)
+    if conf_txt:
+        parts.append(f"Confidence={conf_txt}")
+
+    risk_bucket = str(row.get("risk_bucket") or "").strip()
+    if risk_bucket:
+        parts.append(f"Risk={risk_bucket}")
+
+    overall = _safe_float(row.get("overall_score"))
+    if overall is not None:
+        parts.append(f"Overall={round(overall, 2)}")
+
+    horizon_days = row.get("horizon_days")
+    if horizon_days is None:
+        horizon_days = payload.get("invest_period_days")
     try:
-        if app is not None and hasattr(app, "include_router"):
-            app.include_router(router)
+        horizon_days_int = int(float(horizon_days)) if horizon_days is not None else None
     except Exception:
-        pass
+        horizon_days_int = None
+
+    label = row.get("invest_period_label") or _horizon_label(horizon_days_int)
+    if label:
+        parts.append(f"Horizon={label}")
+
+    return " | ".join(parts)
 
 
-def get_router() -> APIRouter:
-    return router
+def _normalize_result_rows(result: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(result, dict):
+        return result
 
+    rows = result.get("rows")
+    changed_rows = False
 
-__all__ = ["router", "mount", "get_router", "ROUTER_VERSION"]
+    if isinstance(rows, list):
+        new_rows: List[Any] = []
+        for item in rows:
+            if isinstance(item, dict):
+                row = dict(item)
+
+                if row.get("recommendation") and not row.get("recommendation_reason"):
+                    row["recommendation_reason"] = _build_recommendation_reason(row, payload)
+
+                if row.get("horizon_days") is None and payload.get("invest_period_days") is not None:
+                    row["horizon_days"] = payload.get("invest_period_days")
+
+                if not row.get("invest_period_label"):
+                    try:
