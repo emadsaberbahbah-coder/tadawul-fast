@@ -2,12 +2,14 @@
 # routes/analysis_sheet_rows.py
 """
 ================================================================================
-Analysis Sheet-Rows Router — v2.0.0
+Analysis Sheet-Rows Router — v2.1.0
 ================================================================================
 SCHEMA-FIRST • CANONICAL PAGE DISPATCH • SPECIAL-PAGE SAFE • ROUTE-CANONICAL
+PATH-AWARE AUTH • STABLE RESPONSE SHAPE • POWERSHELL/LIVE-TEST FRIENDLY
 
-Endpoint
---------
+Endpoints
+---------
+GET  /v1/analysis/health
 POST /v1/analysis/sheet-rows
 
 Main purpose
@@ -21,49 +23,20 @@ This route is intended to be the canonical / strongest sheet-rows behavior for:
 
 What this revision improves
 ---------------------------
-- ✅ FIX: Tightened canonical page handling through page_catalog helpers
-- ✅ FIX: Explicit route-family dispatch:
-    - Insights_Analysis  -> insights builder
-    - Top_10_Investments -> top10 builder/selector
-    - Data_Dictionary    -> data dictionary builder
-    - instrument pages   -> engine-backed analysis/enriched rows
-- ✅ FIX: Schema is always resolved first from schema_registry
-- ✅ FIX: Stable response shape for all pages
-- ✅ FIX: Instrument/table/special logic is clearer and more deterministic
-- ✅ FIX: Better fallback handling without corrupting schema alignment
-- ✅ FIX: Safer normalization from dict/object/list row shapes
+- ✅ FIX: Passes request/path/settings into core.config.auth_ok (path-aware auth)
+- ✅ FIX: Honors public-path config without forcing OPEN_MODE=true
+- ✅ FIX: Adds lightweight /health endpoint for live checks
+- ✅ FIX: More tolerant payload parsing from shared helpers:
+    - rows
+    - rows_matrix
+    - data
+    - items
+    - records
+- ✅ FIX: Better header/key fallback normalization
+- ✅ FIX: Stable response shape for all page families
+- ✅ FIX: Explicit include_matrix query/body handling
 - ✅ SAFE: No network I/O at import time
 - ✅ SAFE: Optional auth only if core.config.auth_ok exists
-
-Request body (accepted names)
------------------------------
-Page:
-- sheet / page / sheet_name / sheetName / name / tab
-
-Symbols:
-- symbols / tickers / tickers_list
-
-Optional:
-- limit
-- offset
-- include_matrix
-- top_n
-
-Response
---------
-{
-  status,
-  page,
-  route_family,
-  headers,
-  keys,
-  rows,
-  rows_matrix?,
-  error?,
-  version,
-  request_id,
-  meta
-}
 ================================================================================
 """
 
@@ -125,12 +98,13 @@ except Exception:  # pragma: no cover
         return get_route_family(name) == "instrument"
 
 # -----------------------------------------------------------------------------
-# Optional auth
+# Optional auth/config
 # -----------------------------------------------------------------------------
 try:
-    from core.config import auth_ok, get_settings_cached  # type: ignore
+    from core.config import auth_ok, get_settings_cached, mask_settings  # type: ignore
 except Exception:  # pragma: no cover
     auth_ok = None  # type: ignore
+    mask_settings = None  # type: ignore
 
     def get_settings_cached(*args, **kwargs):  # type: ignore
         return None
@@ -143,7 +117,7 @@ try:
 except Exception:  # pragma: no cover
     core_get_sheet_rows = None  # type: ignore
 
-ANALYSIS_SHEET_ROWS_VERSION = "2.0.0"
+ANALYSIS_SHEET_ROWS_VERSION = "2.1.0"
 router = APIRouter(prefix="/v1/analysis", tags=["Analysis Sheet Rows"])
 
 
@@ -280,7 +254,10 @@ async def _maybe_await(x: Any) -> Any:
 def _allow_query_token(settings: Any, request: Request) -> bool:
     try:
         if settings is not None:
-            return bool(getattr(settings, "allow_query_token", False))
+            return bool(
+                getattr(settings, "ALLOW_QUERY_TOKEN", False)
+                or getattr(settings, "allow_query_token", False)
+            )
     except Exception:
         pass
 
@@ -368,13 +345,6 @@ def _normalize_to_schema_keys(
     schema_headers: Sequence[str],
     raw: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    """
-    Normalize raw dict to schema keys.
-    Accepts:
-    - schema keys directly
-    - schema headers directly
-    - case-insensitive variants
-    """
     raw = dict(raw or {})
     raw_ci = {str(k).strip().lower(): v for k, v in raw.items()}
 
@@ -403,6 +373,41 @@ def _normalize_to_schema_keys(
         out[ks] = v
 
     return out
+
+
+def _extract_rows_like(payload: Any) -> List[Dict[str, Any]]:
+    if payload is None:
+        return []
+
+    if isinstance(payload, list):
+        return [_to_plain_dict(r) for r in payload]
+
+    if isinstance(payload, dict):
+        for name in ("rows", "data", "items", "records"):
+            value = payload.get(name)
+            if isinstance(value, list):
+                return [_to_plain_dict(r) for r in value]
+
+    return []
+
+
+def _extract_matrix_like(payload: Any) -> Optional[List[List[Any]]]:
+    if isinstance(payload, dict):
+        value = payload.get("rows_matrix")
+        if isinstance(value, list):
+            return [list(r) if isinstance(r, (list, tuple)) else [r] for r in value]
+    return None
+
+
+def _matrix_to_rows(matrix: Sequence[Sequence[Any]], keys: Sequence[str]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for row in matrix:
+        vals = list(row) if isinstance(row, (list, tuple)) else [row]
+        item: Dict[str, Any] = {}
+        for idx, k in enumerate(keys):
+            item[k] = vals[idx] if idx < len(vals) else None
+        rows.append(item)
+    return rows
 
 
 # =============================================================================
@@ -631,18 +636,10 @@ async def _call_builder_best_effort(
             detail={"error": f"{friendly_name} builder call failed", "detail": str(last_err) if last_err else "unknown"},
         )
 
-    rows: List[Dict[str, Any]] = []
-
-    if isinstance(out, list):
-        rows = [_to_plain_dict(r) for r in out]
-    elif isinstance(out, dict):
-        r2 = out.get("rows") or out.get("data") or out.get("items") or out.get("records")
-        if isinstance(r2, list):
-            rows = [_to_plain_dict(r) for r in r2]
-        else:
-            rows = [_to_plain_dict(out)]
-    else:
-        rows = []
+    rows = _extract_rows_like(out)
+    matrix = _extract_matrix_like(out)
+    if not rows and matrix:
+        rows = _matrix_to_rows(matrix, schema_keys)
 
     return [
         _normalize_to_schema_keys(schema_keys=schema_keys, schema_headers=schema_headers, raw=(r or {}))
@@ -720,6 +717,39 @@ async def _call_core_sheet_rows_best_effort(
 
 
 # =============================================================================
+# Health
+# =============================================================================
+@router.get("/health")
+async def analysis_sheet_rows_health(request: Request) -> Dict[str, Any]:
+    settings = None
+    try:
+        settings = get_settings_cached()
+    except Exception:
+        settings = None
+
+    auth_summary = None
+    try:
+        if callable(mask_settings) and settings is not None:
+            masked = mask_settings(settings)
+            auth_summary = {
+                "open_mode_effective": masked.get("open_mode_effective"),
+                "token_count": masked.get("token_count"),
+            }
+    except Exception:
+        auth_summary = None
+
+    return {
+        "status": "ok",
+        "service": "analysis_sheet_rows",
+        "version": ANALYSIS_SHEET_ROWS_VERSION,
+        "schema_available": bool(get_sheet_spec is not None),
+        "allowed_pages_count": len(allowed_pages()) if callable(allowed_pages) else len(CANONICAL_PAGES),
+        "auth": auth_summary,
+        "path": str(getattr(getattr(request, "url", None), "path", "")),
+    }
+
+
+# =============================================================================
 # Route
 # =============================================================================
 @router.post("/sheet-rows")
@@ -727,6 +757,7 @@ async def analysis_sheet_rows(
     request: Request,
     body: Dict[str, Any] = Body(...),
     mode: str = Query(default="", description="Optional mode hint for engine/provider"),
+    include_matrix_q: Optional[bool] = Query(default=None, alias="include_matrix"),
     token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
@@ -765,7 +796,10 @@ async def analysis_sheet_rows(
         if not auth_ok(
             token=auth_token,
             authorization=authorization,
-            headers={"X-APP-TOKEN": x_app_token, "Authorization": authorization},
+            headers=request.headers,
+            path=str(getattr(getattr(request, "url", None), "path", "")),
+            request=request,
+            settings=settings,
         ):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
@@ -787,7 +821,7 @@ async def analysis_sheet_rows(
     _ensure_page_allowed(page)
     route_family = str(get_route_family(page))
 
-    include_matrix = _maybe_bool(body.get("include_matrix"), True)
+    include_matrix = _maybe_bool(body.get("include_matrix"), include_matrix_q if include_matrix_q is not None else True)
     limit = max(1, min(5000, _maybe_int(body.get("limit"), 2000)))
     offset = max(0, _maybe_int(body.get("offset"), 0))
 
@@ -905,7 +939,6 @@ async def analysis_sheet_rows(
                 },
             }
         except HTTPException:
-            # fall through to shared table-mode helper if available
             pass
 
     if route_family == "dictionary":
@@ -964,8 +997,11 @@ async def analysis_sheet_rows(
                 },
             }
 
-        raw_rows = payload.get("rows") or payload.get("data") or payload.get("items") or []
-        raw_rows = [_to_plain_dict(r) for r in _as_list(raw_rows)]
+        raw_rows = _extract_rows_like(payload)
+        matrix_rows = _extract_matrix_like(payload)
+        if not raw_rows and matrix_rows:
+            raw_rows = _matrix_to_rows(matrix_rows, keys)
+
         rows = [_normalize_to_schema_keys(schema_keys=keys, schema_headers=headers, raw=r) for r in raw_rows]
         rows = _slice(rows, limit=limit, offset=offset)
 
