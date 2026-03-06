@@ -2,42 +2,39 @@
 # core/analysis/top10_selector.py
 """
 ================================================================================
-Top 10 Selector — v2.2.0
-(LIVE / SCHEMA-FIRST / TOP10-METADATA COMPLETE / SHEET-FRIENDLY)
+Top 10 Selector — v3.0.0
 ================================================================================
-Tadawul Fast Bridge (TFB)
+LIVE • SCHEMA-FIRST • TOP10-METADATA COMPLETE • ROUTE-INDEPENDENT • SHEET-FRIENDLY
 
-What this revision fixes
-- ✅ FIX: Always fills Top10-only fields when possible:
+Purpose
+-------
+Produce fully populated, schema-aligned Top_10_Investments rows with stable
+selection logic and guaranteed Top10-only fields.
+
+Primary guarantees
+------------------
+- Always returns Top_10_Investments rows projected to the canonical schema
+- Always attempts to populate the Top10-only fields:
     - top10_rank
     - selection_reason
     - criteria_snapshot
-- ✅ FIX: Keeps Top_10_Investments output schema-aligned (83 columns)
-- ✅ FIX: Normalizes pct-typed fields to FRACTIONS based on schema dtype="pct"
-- ✅ FIX: Backfills important business fields when missing:
-    - current_price
-    - expected_roi_* 
-    - forecast_confidence
-    - recommendation
-    - last_updated_riyadh / last_updated_utc
-    - rank_overall
-    - recommendation_reason
-    - horizon_days
-    - invest_period_label
-- ✅ FIX: Better selection_reason text using ROI / confidence / risk / score context
-- ✅ SAFE: live quotes remain the primary source
-- ✅ SAFE: no import-time network I/O
-- ✅ SAFE: never raises only because some optional fields are missing
+- Keeps output independent from route family
+- Uses live quotes when available, snapshot fallback only when necessary
+- Does not fail only because some optional fields are missing
+- No network I/O at import-time
 
-Primary public APIs
-- select_top10_symbols(engine, criteria, limit=10) -> List[str]
-- build_top10_rows(engine, criteria, limit=10) -> Dict payload
-- select_top10(engine, criteria) -> (candidates, meta)
+Public APIs
+-----------
+- select_top10_symbols(engine, criteria, limit=10, mode="") -> List[str]
+- build_top10_rows(engine, criteria, limit=10, mode="") -> Dict payload
+- select_top10(engine, criteria, mode="") -> (candidates, meta)
+- build_top10_output_rows(candidates, criteria, mode="") -> (rows, meta)
 
 Notes
-- Investment period is always in DAYS and mapped to 1M / 3M / 12M
-- Best-effort engine method discovery
-- Snapshot parsing remains fallback only
+-----
+- Investment period is always in DAYS and mapped internally to 1M / 3M / 12M
+- Live universe + live quote execution path is primary
+- Snapshot parsing is fallback only
 ================================================================================
 """
 
@@ -58,13 +55,14 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 logger = logging.getLogger("core.analysis.top10_selector")
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "2.2.0"
+TOP10_SELECTOR_VERSION = "3.0.0"
+TOP10_PAGE_NAME = "Top_10_Investments"
 RIYADH_TZ = timezone(timedelta(hours=3))
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Safe helpers
-# -----------------------------------------------------------------------------
+# =============================================================================
 def _safe_str(x: Any, default: str = "") -> str:
     try:
         s = str(x).strip()
@@ -94,6 +92,15 @@ def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
         return default
 
 
+def _safe_int(x: Any, default: Optional[int] = None) -> Optional[int]:
+    if x is None:
+        return default
+    try:
+        return int(float(x))
+    except Exception:
+        return default
+
+
 def _as_fraction(x: Any) -> Optional[float]:
     """
     Accepts:
@@ -106,6 +113,15 @@ def _as_fraction(x: Any) -> Optional[float]:
         return None
     if abs(f) > 1.5:
         return f / 100.0
+    return f
+
+
+def _as_pct_points(x: Any) -> Optional[float]:
+    f = _safe_float(x, None)
+    if f is None:
+        return None
+    if abs(f) <= 1.5:
+        return f * 100.0
     return f
 
 
@@ -130,6 +146,7 @@ def _to_payload(obj: Any) -> Dict[str, Any]:
         return {}
     if isinstance(obj, dict):
         return obj
+
     md = getattr(obj, "model_dump", None)
     if callable(md):
         try:
@@ -139,12 +156,14 @@ def _to_payload(obj: Any) -> Dict[str, Any]:
                 return md()  # type: ignore
             except Exception:
                 return {}
+
     d = getattr(obj, "dict", None)
     if callable(d):
         try:
             return d()
         except Exception:
             return {}
+
     try:
         return dict(getattr(obj, "__dict__", {})) or {}
     except Exception:
@@ -153,7 +172,7 @@ def _to_payload(obj: Any) -> Dict[str, Any]:
 
 def _json_dumps_safe(obj: Any) -> str:
     try:
-        return json.dumps(obj, ensure_ascii=False, default=str)
+        return json.dumps(obj, ensure_ascii=False, default=str, separators=(",", ":"))
     except Exception:
         return str(obj)
 
@@ -164,9 +183,20 @@ async def _maybe_await(v: Any) -> Any:
     return v
 
 
-# -----------------------------------------------------------------------------
-# Period mapping (days -> horizon)
-# -----------------------------------------------------------------------------
+def _dedupe_keep_order(items: Sequence[str]) -> List[str]:
+    seen: Set[str] = set()
+    out: List[str] = []
+    for item in items:
+        s = _safe_str(item)
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+# =============================================================================
+# Period mapping
+# =============================================================================
 def map_period_days_to_horizon(days: int) -> str:
     d = int(days or 0)
     if d <= 45:
@@ -194,9 +224,18 @@ def horizon_to_forecast_price_key(h: str) -> str:
     return "forecast_price_12m"
 
 
-# -----------------------------------------------------------------------------
+def _horizon_label(horizon: str) -> str:
+    h = (horizon or "").lower()
+    if h == "1m":
+        return "1M"
+    if h == "3m":
+        return "3M"
+    return "12M"
+
+
+# =============================================================================
 # Criteria
-# -----------------------------------------------------------------------------
+# =============================================================================
 @dataclass(slots=True)
 class Criteria:
     pages_selected: List[str]
@@ -220,26 +259,40 @@ class Criteria:
 def _criteria_from_dict(d: Dict[str, Any]) -> Criteria:
     pages = d.get("pages_selected") or d.get("pages") or d.get("selected_pages") or []
     if isinstance(pages, str):
-        pages = [p.strip() for p in pages.replace(";", ",").replace("|", ",").replace(",", " ").split() if p.strip()]
+        parts = re.split(r"[,\;\|\n]+", pages)
+        pages = [p.strip() for p in parts if p.strip()]
     if not isinstance(pages, list) or not pages:
         pages = ["Market_Leaders", "Global_Markets", "Mutual_Funds", "Commodities_FX", "My_Portfolio"]
 
     invest_days = int(
         _safe_float(
-            d.get("invest_period_days") or d.get("investment_period_days") or d.get("period_days") or 90,
+            d.get("invest_period_days")
+            or d.get("investment_period_days")
+            or d.get("period_days")
+            or d.get("horizon_days")
+            or 90,
             90,
         )
         or 90
     )
     invest_days = max(1, invest_days)
 
-    min_roi = _as_fraction(d.get("min_expected_roi") or d.get("min_roi") or d.get("required_return") or d.get("required_roi"))
+    min_roi = _as_fraction(
+        d.get("min_expected_roi")
+        or d.get("min_roi")
+        or d.get("required_return")
+        or d.get("required_roi")
+        or d.get("required_return_pct")
+    )
 
     max_risk = float(_safe_float(d.get("max_risk_score") or d.get("max_risk") or 60.0, 60.0) or 60.0)
     max_risk = _clamp(max_risk, 0.0, 100.0)
 
     min_conf = _safe_float(
-        d.get("min_confidence") or d.get("min_ai_confidence") or d.get("min_confidence_score") or 0.70,
+        d.get("min_confidence")
+        or d.get("min_ai_confidence")
+        or d.get("min_confidence_score")
+        or 0.70,
         0.70,
     )
     if min_conf is None:
@@ -320,9 +373,9 @@ def load_criteria_best_effort(engine: Any) -> Criteria:
     )
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Page selection / normalization
-# -----------------------------------------------------------------------------
+# =============================================================================
 def _normalize_symbol(sym: str) -> str:
     s = _safe_str(sym).upper().replace(" ", "")
     if not s:
@@ -356,19 +409,12 @@ def _eligible_pages(criteria: Criteria) -> List[str]:
 
     blocked = {"Insights_Analysis", "Data_Dictionary", "Top_10_Investments", "Top10_Investments"}
     pages_in = [p for p in pages_in if p and p not in blocked]
-
-    seen: Set[str] = set()
-    out: List[str] = []
-    for p in pages_in:
-        if p not in seen:
-            seen.add(p)
-            out.append(p)
-    return out
+    return _dedupe_keep_order(pages_in)
 
 
-# -----------------------------------------------------------------------------
-# Engine access helpers
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Engine / snapshot access
+# =============================================================================
 def _get_snapshot(engine: Any, page: str) -> Optional[Dict[str, Any]]:
     if engine is None:
         return None
@@ -432,61 +478,85 @@ async def _get_universe_symbols_live(engine: Any, page: str, *, limit: int = 500
     return []
 
 
+def _dict_is_symbol_map(d: Dict[str, Any], symbols: List[str]) -> bool:
+    if not isinstance(d, dict) or not symbols:
+        return False
+    symset = set(symbols)
+    keys = [k for k in d.keys() if isinstance(k, str)]
+    if not keys:
+        return False
+    hit = sum(1 for k in keys if k in symset)
+    return hit >= max(1, min(3, len(symset)))
+
+
 async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "") -> Dict[str, Dict[str, Any]]:
     if not engine or not symbols:
         return {}
 
-    fn = getattr(engine, "get_enriched_quotes_batch", None)
-    if callable(fn):
+    batch_candidates = [
+        "get_enriched_quotes_batch",
+        "get_analysis_quotes_batch",
+        "get_quotes_batch",
+        "get_enriched_quotes",
+        "quotes_batch",
+    ]
+
+    for name in batch_candidates:
+        fn = getattr(engine, name, None)
+        if not callable(fn):
+            continue
+
         try:
             try:
                 res = fn(symbols, mode=mode or "")
             except TypeError:
                 res = fn(symbols)
             res = await _maybe_await(res)
+
             if isinstance(res, dict):
-                out: Dict[str, Dict[str, Any]] = {}
-                for s in symbols:
-                    out[s] = _to_payload(res.get(s))
-                return out
+                if _dict_is_symbol_map(res, symbols):
+                    return {s: _to_payload(res.get(s)) for s in symbols}
+                nested = res.get("data") or res.get("rows") or res.get("items")
+                if isinstance(nested, dict) and _dict_is_symbol_map(nested, symbols):
+                    return {s: _to_payload(nested.get(s)) for s in symbols}
+                if isinstance(nested, list):
+                    return {s: _to_payload(v) for s, v in zip(symbols, nested)}
+            elif isinstance(res, list):
+                return {s: _to_payload(v) for s, v in zip(symbols, res)}
         except Exception:
-            pass
+            continue
 
-    fn2 = getattr(engine, "get_enriched_quotes", None)
-    if callable(fn2):
-        try:
-            res = fn2(symbols)
-            res = await _maybe_await(res)
-            if isinstance(res, list):
-                out2: Dict[str, Dict[str, Any]] = {}
-                for s, v in zip(symbols, res):
-                    out2[s] = _to_payload(v)
-                return out2
-        except Exception:
-            pass
+    out: Dict[str, Dict[str, Any]] = {}
+    per_dict_fn = getattr(engine, "get_enriched_quote_dict", None)
+    per_fn = getattr(engine, "get_enriched_quote", None) or getattr(engine, "get_quote", None)
 
-    out3: Dict[str, Dict[str, Any]] = {}
-    fn3 = getattr(engine, "get_enriched_quote_dict", None)
-    fn4 = getattr(engine, "get_enriched_quote", None) or getattr(engine, "get_quote", None)
     for s in symbols:
         try:
-            if callable(fn3):
-                out3[s] = _to_payload(await _maybe_await(fn3(s)))
-            elif callable(fn4):
-                out3[s] = _to_payload(await _maybe_await(fn4(s)))
+            if callable(per_dict_fn):
+                try:
+                    out[s] = _to_payload(await _maybe_await(per_dict_fn(s, mode=mode or "")))
+                except TypeError:
+                    out[s] = _to_payload(await _maybe_await(per_dict_fn(s)))
+            elif callable(per_fn):
+                try:
+                    out[s] = _to_payload(await _maybe_await(per_fn(s, mode=mode or "")))
+                except TypeError:
+                    out[s] = _to_payload(await _maybe_await(per_fn(s)))
             else:
-                out3[s] = {"symbol": s, "warnings": "engine_missing_quote_methods"}
+                out[s] = {"symbol": s, "warnings": "engine_missing_quote_methods"}
         except Exception as e:
-            out3[s] = {"symbol": s, "warnings": f"quote_error: {e}"}
-    return out3
+            out[s] = {"symbol": s, "warnings": f"quote_error: {e}"}
+
+    return out
 
 
-# -----------------------------------------------------------------------------
-# Snapshot parsing (fallback only)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Snapshot parsing fallback
+# =============================================================================
 def _parse_insights_top_block(snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not snapshot or not isinstance(snapshot, dict):
         return {}
+
     rows = snapshot.get("rows")
     if not isinstance(rows, list) or not rows:
         return {}
@@ -516,9 +586,9 @@ def _parse_insights_top_block(snapshot: Optional[Dict[str, Any]]) -> Dict[str, A
     return out
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Candidate model + extraction
-# -----------------------------------------------------------------------------
+# =============================================================================
 @dataclass(slots=True)
 class Candidate:
     symbol: str
@@ -606,17 +676,14 @@ def _extract_candidate_from_quote(*, sym: str, page: str, quote: Dict[str, Any],
     )
 
 
-# -----------------------------------------------------------------------------
-# Ranking logic
-# -----------------------------------------------------------------------------
 def _rank_key(c: Candidate, *, use_liquidity: bool) -> Tuple[float, float, float, float]:
     vol = c.volume if use_liquidity else 0.0
     return (c.roi, c.confidence, vol, c.overall_score)
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Optional enrichment for final Top-N
-# -----------------------------------------------------------------------------
+# =============================================================================
 async def _enrich_top(engine: Any, symbols: List[str], *, mode: str = "") -> Dict[str, Dict[str, Any]]:
     if engine is None or not symbols:
         return {}
@@ -633,11 +700,11 @@ async def _enrich_top(engine: Any, symbols: List[str], *, mode: str = "") -> Dic
     if not callable(fn):
         return out
 
-    conc = 8
     try:
         conc = int(os.getenv("TOP10_ENRICH_CONCURRENCY", "8") or "8")
     except Exception:
         conc = 8
+
     sem = asyncio.Semaphore(max(3, min(20, conc)))
 
     async def one(sym: str) -> None:
@@ -653,16 +720,19 @@ async def _enrich_top(engine: Any, symbols: List[str], *, mode: str = "") -> Dic
     return out
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Core selection
-# -----------------------------------------------------------------------------
+# =============================================================================
 async def select_top10(*, engine: Any, criteria: Criteria, mode: str = "") -> Tuple[List[Candidate], Dict[str, Any]]:
     t0 = time.time()
     horizon = criteria.horizon()
     roi_key = horizon_to_roi_key(horizon)
 
     pages = _eligible_pages(criteria)
-    per_page_limit = max(50, int(os.getenv("TOP10_UNIVERSE_LIMIT_PER_PAGE", "500") or "500"))
+    try:
+        per_page_limit = int(os.getenv("TOP10_UNIVERSE_LIMIT_PER_PAGE", "500") or "500")
+    except Exception:
+        per_page_limit = 500
     per_page_limit = max(50, min(5000, per_page_limit))
 
     universe: List[Tuple[str, str]] = []
@@ -732,6 +802,7 @@ async def select_top10(*, engine: Any, criteria: Criteria, mode: str = "") -> Tu
         q = qmap.get(sym) or {}
         if not isinstance(q, dict) or not q:
             continue
+
         cand = _extract_candidate_from_quote(sym=sym, page=source_map.get(sym, ""), quote=q, horizon=horizon)
         if cand is None:
             continue
@@ -806,14 +877,14 @@ async def select_top10(*, engine: Any, criteria: Criteria, mode: str = "") -> Tu
     return top, meta
 
 
-# -----------------------------------------------------------------------------
-# Schema-aligned output for Top_10_Investments
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Schema helpers for Top_10_Investments
+# =============================================================================
 def _get_top10_schema() -> Tuple[List[str], List[str], Set[str], str]:
     try:
         from core.sheets.schema_registry import get_sheet_spec  # type: ignore
 
-        spec = get_sheet_spec("Top_10_Investments")
+        spec = get_sheet_spec(TOP10_PAGE_NAME)
         cols = getattr(spec, "columns", None) or []
 
         headers: List[str] = []
@@ -865,7 +936,7 @@ def _get_top10_schema() -> Tuple[List[str], List[str], Set[str], str]:
         "Selection Reason",
         "Criteria Snapshot",
     ]
-    pct_keys = {"expected_roi_1m", "expected_roi_3m", "expected_roi_12m"}
+    pct_keys = {"expected_roi_1m", "expected_roi_3m", "expected_roi_12m", "forecast_confidence"}
     return headers, keys, pct_keys, "fallback_minimal"
 
 
@@ -883,15 +954,6 @@ def _normalize_pct_fields_inplace(raw: Dict[str, Any], pct_keys: Set[str]) -> No
         f = _as_fraction(v)
         if f is not None:
             raw[k] = float(f)
-
-
-def _horizon_label(horizon: str) -> str:
-    h = (horizon or "").lower()
-    if h == "1m":
-        return "1M"
-    if h == "3m":
-        return "3M"
-    return "12M"
 
 
 def _score_text(label: str, value: Any) -> Optional[str]:
@@ -975,8 +1037,28 @@ def _ensure_period_fields(raw: Dict[str, Any], criteria: Criteria, horizon: str)
 
 
 def _ensure_timestamps(raw: Dict[str, Any]) -> None:
-    raw.setdefault("last_updated_utc", raw.get("last_updated_utc") or _now_utc_iso())
-    raw.setdefault("last_updated_riyadh", raw.get("last_updated_riyadh") or _now_riyadh_iso())
+    if not raw.get("last_updated_utc"):
+        raw["last_updated_utc"] = _now_utc_iso()
+    if not raw.get("last_updated_riyadh"):
+        raw["last_updated_riyadh"] = _now_riyadh_iso()
+
+
+def _build_criteria_snapshot(criteria: Criteria, *, mode: str) -> Dict[str, Any]:
+    return {
+        "invest_period_days": criteria.invest_period_days,
+        "horizon": criteria.horizon(),
+        "pages_selected": criteria.pages_selected,
+        "min_expected_roi": criteria.min_expected_roi,
+        "max_risk_score": criteria.max_risk_score,
+        "min_confidence": criteria.min_confidence,
+        "min_volume": criteria.min_volume,
+        "use_liquidity_tiebreak": criteria.use_liquidity_tiebreak,
+        "enforce_risk_confidence": criteria.enforce_risk_confidence,
+        "mode": mode,
+        "selector_version": TOP10_SELECTOR_VERSION,
+        "generated_at_utc": _now_utc_iso(),
+        "generated_at_riyadh": _now_riyadh_iso(),
+    }
 
 
 def _build_selection_reason(raw: Dict[str, Any], *, roi_key: str, criteria: Criteria) -> str:
@@ -1017,66 +1099,71 @@ def _build_selection_reason(raw: Dict[str, Any], *, roi_key: str, criteria: Crit
     return " | ".join(parts)
 
 
+def _ensure_required_top10_fields(raw: Dict[str, Any], *, rank: int, criteria: Criteria, horizon: str, mode: str) -> None:
+    roi_key = horizon_to_roi_key(horizon)
+    forecast_price_key = horizon_to_forecast_price_key(horizon)
+
+    raw.setdefault("name", raw.get("company_name") or raw.get("long_name") or raw.get("instrument_name") or "")
+    raw.setdefault("current_price", raw.get("price") or raw.get("last") or raw.get("close"))
+    raw.setdefault("forecast_confidence", raw.get("confidence_score") if raw.get("forecast_confidence") is None else raw.get("forecast_confidence"))
+
+    if raw.get(roi_key) is None:
+        for alt in ("expected_roi_3m", "expected_roi_1m", "expected_roi_12m", "upside_pct", "target_return"):
+            if raw.get(alt) is not None:
+                raw[roi_key] = raw.get(alt)
+                break
+
+    raw["top10_rank"] = rank
+    raw["criteria_snapshot"] = _json_dumps_safe(_build_criteria_snapshot(criteria, mode=mode))
+    raw["selection_reason"] = _build_selection_reason(raw, roi_key=roi_key, criteria=criteria)
+
+    _ensure_timestamps(raw)
+    _ensure_recommendation(raw, roi_key)
+    _ensure_recommendation_reason(raw, roi_key)
+    _ensure_rank_overall(raw, rank)
+    _ensure_period_fields(raw, criteria, horizon)
+
+    if raw.get(forecast_price_key) is None and raw.get("current_price") is not None and raw.get(roi_key) is not None:
+        cp = _safe_float(raw.get("current_price"), None)
+        roi = _as_fraction(raw.get(roi_key))
+        if cp is not None and roi is not None:
+            raw[forecast_price_key] = float(cp) * (1.0 + float(roi))
+
+    raw.setdefault("data_provider", raw.get("data_provider") or raw.get("provider") or "")
+
+
+def _schema_contains(keys: Sequence[str], needle: str) -> bool:
+    return any(str(k) == needle for k in keys)
+
+
+# =============================================================================
+# Top10 output builder
+# =============================================================================
 def build_top10_output_rows(candidates: List[Candidate], *, criteria: Criteria, mode: str = "") -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     headers, keys, pct_keys, schema_source = _get_top10_schema()
     horizon = criteria.horizon()
     roi_key = horizon_to_roi_key(horizon)
     forecast_price_key = horizon_to_forecast_price_key(horizon)
 
-    crit_snapshot = {
-        "invest_period_days": criteria.invest_period_days,
-        "horizon": horizon,
-        "pages_selected": criteria.pages_selected,
-        "min_expected_roi": criteria.min_expected_roi,
-        "max_risk_score": criteria.max_risk_score,
-        "min_confidence": criteria.min_confidence,
-        "min_volume": criteria.min_volume,
-        "use_liquidity_tiebreak": criteria.use_liquidity_tiebreak,
-        "enforce_risk_confidence": criteria.enforce_risk_confidence,
-        "mode": mode,
-        "selector_version": TOP10_SELECTOR_VERSION,
-        "generated_at_utc": _now_utc_iso(),
-        "generated_at_riyadh": _now_riyadh_iso(),
-    }
-    crit_json = _json_dumps_safe(crit_snapshot)
-
     warnings: List[str] = []
-    out: List[Dict[str, Any]] = []
+    rows_out: List[Dict[str, Any]] = []
+
+    required_top10_fields = ["top10_rank", "selection_reason", "criteria_snapshot"]
+    missing_required_fields = [f for f in required_top10_fields if not _schema_contains(keys, f)]
 
     for i, c in enumerate(candidates, start=1):
         raw = dict(c.row or {})
 
         raw["symbol"] = c.symbol
         raw.setdefault("source_page", c.source_page)
-
-        raw.setdefault("name", raw.get("company_name") or raw.get("long_name") or raw.get("instrument_name") or "")
-        raw.setdefault("current_price", raw.get("price") or raw.get("last") or raw.get("close"))
         raw.setdefault("risk_score", c.risk_score)
         raw.setdefault("overall_score", c.overall_score)
         raw.setdefault("forecast_confidence", c.confidence)
 
-        raw[roi_key] = _as_fraction(raw.get(roi_key)) if raw.get(roi_key) is not None else c.roi
         if raw.get(roi_key) is None:
             raw[roi_key] = c.roi
 
-        if raw.get(forecast_price_key) is None and raw.get("current_price") is not None and raw.get(roi_key) is not None:
-            cp = _safe_float(raw.get("current_price"), None)
-            roi = _as_fraction(raw.get(roi_key))
-            if cp is not None and roi is not None:
-                raw[forecast_price_key] = float(cp) * (1.0 + float(roi))
-
-        raw["top10_rank"] = i
-        raw["selection_reason"] = _build_selection_reason(raw, roi_key=roi_key, criteria=criteria)
-        raw["criteria_snapshot"] = crit_json
-
-        _ensure_timestamps(raw)
-        _ensure_recommendation(raw, roi_key)
-        _ensure_recommendation_reason(raw, roi_key)
-        _ensure_rank_overall(raw, i)
-        _ensure_period_fields(raw, criteria, horizon)
-
-        raw.setdefault("data_provider", raw.get("data_provider") or raw.get("provider") or "")
-
+        _ensure_required_top10_fields(raw, rank=i, criteria=criteria, horizon=horizon, mode=mode)
         _normalize_pct_fields_inplace(raw, pct_keys)
 
         if raw.get("current_price") is None:
@@ -1087,8 +1174,14 @@ def build_top10_output_rows(candidates: List[Candidate], *, criteria: Criteria, 
             warnings.append(f"missing_confidence:{c.symbol}")
         if not _safe_str(raw.get("recommendation")):
             warnings.append(f"missing_recommendation:{c.symbol}")
+        if not _safe_str(raw.get("selection_reason")):
+            warnings.append(f"missing_selection_reason:{c.symbol}")
+        if not _safe_str(raw.get("criteria_snapshot")):
+            warnings.append(f"missing_criteria_snapshot:{c.symbol}")
+        if raw.get("top10_rank") is None:
+            warnings.append(f"missing_top10_rank:{c.symbol}")
 
-        out.append(_project_row(keys, raw))
+        rows_out.append(_project_row(keys, raw))
 
     meta = {
         "schema_source": schema_source,
@@ -1098,16 +1191,18 @@ def build_top10_output_rows(candidates: List[Candidate], *, criteria: Criteria, 
         "horizon": horizon,
         "roi_key": roi_key,
         "forecast_price_key": forecast_price_key,
-        "rows": len(out),
+        "rows": len(rows_out),
         "selector_version": TOP10_SELECTOR_VERSION,
         "warnings": warnings,
+        "missing_required_schema_fields": missing_required_fields,
+        "required_top10_fields_present_in_schema": len(missing_required_fields) == 0,
     }
-    return out, meta
+    return rows_out, meta
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Convenience public APIs
-# -----------------------------------------------------------------------------
+# =============================================================================
 async def select_top10_symbols(*, engine: Any, criteria: Optional[Dict[str, Any]] = None, limit: int = 10, mode: str = "") -> List[str]:
     crit = _criteria_from_dict(criteria or {})
     crit.top_n = max(1, min(50, int(limit or crit.top_n or 10)))
@@ -1125,7 +1220,7 @@ async def build_top10_rows(*, engine: Any, criteria: Optional[Dict[str, Any]] = 
 
     return {
         "status": "success",
-        "page": "Top_10_Investments",
+        "page": TOP10_PAGE_NAME,
         "headers": headers,
         "keys": keys,
         "rows": rows,
@@ -1134,6 +1229,31 @@ async def build_top10_rows(*, engine: Any, criteria: Optional[Dict[str, Any]] = 
             **(meta_rows or {}),
         },
     }
+
+
+# Backward-compatible aliases some routes/builders may try
+async def build_top_10_investments_rows(*, engine: Any, criteria: Optional[Dict[str, Any]] = None, limit: int = 10, mode: str = "") -> List[Dict[str, Any]]:
+    payload = await build_top10_rows(engine=engine, criteria=criteria, limit=limit, mode=mode)
+    rows = payload.get("rows")
+    return rows if isinstance(rows, list) else []
+
+
+async def build_top10_investments_rows(*, engine: Any, criteria: Optional[Dict[str, Any]] = None, limit: int = 10, mode: str = "") -> List[Dict[str, Any]]:
+    payload = await build_top10_rows(engine=engine, criteria=criteria, limit=limit, mode=mode)
+    rows = payload.get("rows")
+    return rows if isinstance(rows, list) else []
+
+
+async def build_top_10_rows(*, engine: Any, criteria: Optional[Dict[str, Any]] = None, limit: int = 10, mode: str = "") -> List[Dict[str, Any]]:
+    payload = await build_top10_rows(engine=engine, criteria=criteria, limit=limit, mode=mode)
+    rows = payload.get("rows")
+    return rows if isinstance(rows, list) else []
+
+
+async def get_top10_rows(*, engine: Any, criteria: Optional[Dict[str, Any]] = None, limit: int = 10, mode: str = "") -> List[Dict[str, Any]]:
+    payload = await build_top10_rows(engine=engine, criteria=criteria, limit=limit, mode=mode)
+    rows = payload.get("rows")
+    return rows if isinstance(rows, list) else []
 
 
 __all__ = [
@@ -1149,4 +1269,8 @@ __all__ = [
     "select_top10_symbols",
     "build_top10_rows",
     "build_top10_output_rows",
+    "build_top_10_investments_rows",
+    "build_top10_investments_rows",
+    "build_top_10_rows",
+    "get_top10_rows",
 ]
