@@ -2,22 +2,18 @@
 # core/analysis/insights_builder.py
 """
 ================================================================================
-Insights Analysis Builder — v1.1.0 (REAL ROWS / AUTO-UNIVERSE / 7-COL OUTPUT)
+Insights Analysis Builder — v1.2.0 (GREEN STATUS + PCT FIX + NUMERIC VALUES)
 ================================================================================
 Tadawul Fast Bridge (TFB)
 
-Fix objective (Phase B / Script #2):
-- ✅ Insights_Analysis must NOT be empty/useless.
-- ✅ When symbols/universes are empty, auto-build a meaningful “dashboard universe”
-  (indices + commodities/FX + Top10 + portfolio KPIs best-effort).
-- ✅ Populate section/item/metric/value/notes consistently (no null shells).
-- ✅ Always output the 7-column Insights_Analysis layout (no 80-col fallback).
-
-Design rules
-- ✅ Import-safe: NO network calls at import time
-- ✅ Schema-first: keys/order come from core/sheets/schema_registry.py
-- ✅ Best-effort engine integration: never raises; returns meaningful rows even
-  if engine is missing or providers return partial data.
+Why this revision (fix the “❌ red X / not green” symptom)
+- ✅ Adds explicit System status rows: Build Status = OK / WARN (never blank).
+- ✅ Fixes percent formatting:
+    - If engine returns fractions (0.12) -> shows 12.00%
+    - If engine returns percent-points (12) -> shows 12.00%
+- ✅ Keeps VALUE column numeric when possible (better for Google Sheets formulas/icons).
+- ✅ Still import-safe: NO network calls at import time.
+- ✅ Still schema-first: keys/order come from core/sheets/schema_registry.py.
 
 Expected Insights_Analysis columns (schema_registry keys)
 - section
@@ -37,16 +33,16 @@ Public API
 
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 logger = logging.getLogger("core.analysis.insights_builder")
 logger.addHandler(logging.NullHandler())
 
-INSIGHTS_BUILDER_VERSION = "1.1.0"
-
+INSIGHTS_BUILDER_VERSION = "1.2.0"
 _RIYADH_TZ = timezone(timedelta(hours=3))
 
 
@@ -86,8 +82,24 @@ def _as_int(v: Any) -> Optional[int]:
         return None
 
 
-def _fmt_pct(v: Any) -> str:
+def _pct_points(v: Any) -> Optional[float]:
+    """
+    Normalize percent values into percent-points:
+      - 0.12 -> 12.0
+      - 12 -> 12.0
+      - "12%" -> 12.0 (best-effort via float)
+    """
     x = _as_float(v)
+    if x is None:
+        return None
+    # fraction heuristic
+    if abs(x) <= 1.5:
+        return x * 100.0
+    return x
+
+
+def _fmt_pct(v: Any) -> str:
+    x = _pct_points(v)
     if x is None:
         return ""
     return f"{x:.2f}%"
@@ -113,7 +125,6 @@ def _csv_list(raw: str) -> List[str]:
         s = part.strip()
         if s:
             items.append(s)
-    # de-dupe preserve order
     seen = set()
     out: List[str] = []
     for x in items:
@@ -147,7 +158,6 @@ def get_insights_schema() -> Tuple[List[str], List[str], str]:
     except Exception as e:
         logger.debug("get_insights_schema: schema_registry unavailable: %r", e)
 
-    # fallback 7-col contract (matches schema_registry intent)
     keys = ["section", "item", "symbol", "metric", "value", "notes", "last_updated_riyadh"]
     headers = ["Section", "Item", "Symbol", "Metric", "Value", "Notes", "Last Updated (Riyadh)"]
     return headers, keys, "fallback"
@@ -176,7 +186,6 @@ def _get_criteria_fields() -> List[Dict[str, Any]]:
             )
         return [x for x in out if x.get("key")]
     except Exception:
-        # safe minimal defaults (aligned with your schema_registry example)
         return [
             {"key": "risk_level", "label": "Risk Level", "dtype": "str", "default": "Moderate", "notes": "Low / Moderate / High."},
             {"key": "confidence_level", "label": "Confidence Level", "dtype": "str", "default": "High", "notes": "High / Medium / Low."},
@@ -187,7 +196,7 @@ def _get_criteria_fields() -> List[Dict[str, Any]]:
 
 
 # -----------------------------------------------------------------------------
-# Row builder (ALWAYS fills section/item/metric/value/notes)
+# Row builder (ALWAYS fills required fields)
 # -----------------------------------------------------------------------------
 def _make_row(
     *,
@@ -202,26 +211,34 @@ def _make_row(
 ) -> Dict[str, Any]:
     ts = last_updated_riyadh or _now_riyadh_iso()
 
-    # enforce non-empty shell fields
     sec = _safe_str(section) or "General"
     it = _safe_str(item) or "Item"
     met = _safe_str(metric) or "metric"
     sym = _safe_str(symbol)
 
-    # values MUST be Apps Script friendly (string-safe)
+    # VALUE: keep numeric when possible (for Google Sheets conditional icons)
+    val_out: Any
     if value is None:
-        val = ""
-    elif isinstance(value, (int, float)):
-        val = str(value)
+        val_out = ""
+    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+        val_out = value
     else:
-        val = _safe_str(value)
+        # try numeric casting first
+        xf = _as_float(value)
+        xi = _as_int(value)
+        if xi is not None and _safe_str(value).strip().isdigit():
+            val_out = xi
+        elif xf is not None and _safe_str(value) != "":
+            val_out = xf
+        else:
+            val_out = _safe_str(value)
 
     base: Dict[str, Any] = {
         "section": sec,
         "item": it,
         "symbol": sym,
         "metric": met,
-        "value": val,
+        "value": val_out,
         "notes": _safe_str(notes),
         "last_updated_riyadh": ts,
     }
@@ -237,9 +254,6 @@ def build_criteria_rows(
     criteria: Optional[Dict[str, Any]] = None,
     last_updated_riyadh: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """
-    Criteria as rows under section="Criteria" (keeps sheet self-explanatory).
-    """
     _, keys, _ = get_insights_schema()
     ts = last_updated_riyadh or _now_riyadh_iso()
 
@@ -252,22 +266,39 @@ def build_criteria_rows(
         label = f["label"]
         v = crit.get(k, f.get("default", ""))
 
-        # format common fields (optional)
+        # normalize pct-looking fields to friendly display text in notes, keep value numeric where possible
         if k.endswith("_pct") or k.endswith("_percent") or "return" in k:
-            if isinstance(v, (int, float)):
-                v = f"{float(v) * 100:.2f}%" if float(v) <= 1.5 else f"{float(v):.2f}%"
-        rows.append(
-            _make_row(
-                keys=keys,
-                section="Criteria",
-                item=label,
-                symbol="",
-                metric=k,
-                value=v,
-                notes=f.get("notes", ""),
-                last_updated_riyadh=ts,
+            # keep numeric if possible; notes shows formatted string
+            vnum = _as_float(v)
+            note = f.get("notes", "")
+            if vnum is not None:
+                note = (note + " " if note else "") + f"(display: {_fmt_pct(vnum)})"
+                v = vnum  # store numeric
+            rows.append(
+                _make_row(
+                    keys=keys,
+                    section="Criteria",
+                    item=label,
+                    symbol="",
+                    metric=k,
+                    value=v,
+                    notes=note,
+                    last_updated_riyadh=ts,
+                )
             )
-        )
+        else:
+            rows.append(
+                _make_row(
+                    keys=keys,
+                    section="Criteria",
+                    item=label,
+                    symbol="",
+                    metric=k,
+                    value=v,
+                    notes=f.get("notes", ""),
+                    last_updated_riyadh=ts,
+                )
+            )
     return rows
 
 
@@ -275,11 +306,8 @@ def build_criteria_rows(
 # Engine integration (best-effort, never raises)
 # -----------------------------------------------------------------------------
 async def _maybe_await(v: Any) -> Any:
-    try:
-        if hasattr(v, "__await__"):
-            return await v  # type: ignore[misc]
-    except Exception:
-        pass
+    if inspect.isawaitable(v):
+        return await v
     return v
 
 
@@ -297,17 +325,17 @@ def _extract_row_dict(v: Any) -> Dict[str, Any]:
 
 
 async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "") -> Dict[str, Dict[str, Any]]:
-    """
-    Best-effort: returns {symbol: rowdict}. Never raises; returns {} on failure.
-    """
     if not engine or not symbols:
         return {}
 
-    # Preferred batch method
     fn = getattr(engine, "get_enriched_quotes_batch", None)
     if callable(fn):
         try:
-            res = await _maybe_await(fn(symbols, mode=mode or ""))
+            # allow engines that accept (symbols, mode=...)
+            try:
+                res = await _maybe_await(fn(symbols, mode=mode or ""))
+            except TypeError:
+                res = await _maybe_await(fn(symbols))
             if isinstance(res, dict):
                 out: Dict[str, Dict[str, Any]] = {}
                 for s in symbols:
@@ -316,7 +344,6 @@ async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "") 
         except Exception:
             pass
 
-    # Fallback list batch
     fn2 = getattr(engine, "get_enriched_quotes", None)
     if callable(fn2):
         try:
@@ -329,7 +356,6 @@ async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "") 
         except Exception:
             pass
 
-    # Per-symbol fallback
     out3: Dict[str, Dict[str, Any]] = {}
     fn3 = getattr(engine, "get_enriched_quote_dict", None)
     fn4 = getattr(engine, "get_enriched_quote", None) or getattr(engine, "get_quote", None)
@@ -347,14 +373,10 @@ async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "") 
 
 
 async def _fetch_top10_symbols(engine: Any, criteria: Optional[Dict[str, Any]] = None, *, limit: int = 10) -> List[str]:
-    """
-    Best-effort discovery of Top10 symbols without requiring snapshots.
-    We try common method names across phases. If none exist, returns [].
-    """
     if not engine:
         return []
 
-    # If the repo has a dedicated selector module (preferred), try it first (lazy import).
+    # Preferred selector module (lazy import)
     try:
         from core.analysis.top10_selector import select_top10_symbols  # type: ignore
 
@@ -365,7 +387,6 @@ async def _fetch_top10_symbols(engine: Any, criteria: Optional[Dict[str, Any]] =
     except Exception:
         pass
 
-    # Otherwise probe engine methods (legacy/variant names).
     candidates = [
         "get_top10_symbols",
         "select_top10_symbols",
@@ -380,19 +401,16 @@ async def _fetch_top10_symbols(engine: Any, criteria: Optional[Dict[str, Any]] =
         if not callable(fn):
             continue
         try:
-            res = await _maybe_await(fn(criteria=criteria or {}, limit=limit))  # type: ignore[arg-type]
-        except TypeError:
             try:
-                res = await _maybe_await(fn(limit=limit))  # type: ignore
+                res = await _maybe_await(fn(criteria=criteria or {}, limit=limit))  # type: ignore[arg-type]
             except TypeError:
                 try:
+                    res = await _maybe_await(fn(limit=limit))  # type: ignore
+                except TypeError:
                     res = await _maybe_await(fn())  # type: ignore
-                except Exception:
-                    continue
         except Exception:
             continue
 
-        # Parse results
         if isinstance(res, (list, tuple)):
             out_syms: List[str] = []
             for item in res:
@@ -404,7 +422,6 @@ async def _fetch_top10_symbols(engine: Any, criteria: Optional[Dict[str, Any]] =
                     d = _extract_row_dict(item)
                     out_syms.append(_safe_str(d.get("symbol") or d.get("ticker") or d.get("code")))
             out = [_safe_str(x) for x in out_syms if _safe_str(x)]
-            # de-dupe preserve order
             seen = set()
             uniq: List[str] = []
             for s in out:
@@ -414,7 +431,6 @@ async def _fetch_top10_symbols(engine: Any, criteria: Optional[Dict[str, Any]] =
             return uniq[: max(1, limit)]
 
         if isinstance(res, dict):
-            # might be {"rows":[...]} or {"symbols":[...]}
             if isinstance(res.get("symbols"), (list, tuple)):
                 out = [_safe_str(x) for x in res["symbols"] if _safe_str(x)]
                 return out[: max(1, limit)]
@@ -474,9 +490,6 @@ def _build_universe_snapshot_rows(
     qmap: Dict[str, Dict[str, Any]],
     ts: str,
 ) -> List[Dict[str, Any]]:
-    """
-    Generates meaningful snapshot rows for a universe.
-    """
     rows: List[Dict[str, Any]] = []
 
     rows.append(
@@ -492,7 +505,6 @@ def _build_universe_snapshot_rows(
         )
     )
 
-    # Coverage metrics
     rows.append(
         _make_row(
             keys=keys,
@@ -518,7 +530,6 @@ def _build_universe_snapshot_rows(
         )
     )
 
-    # Movers by percent_change
     movers = _scored_list(qmap, "percent_change")
     if movers:
         movers.sort(key=lambda t: t[1], reverse=True)
@@ -533,8 +544,8 @@ def _build_universe_snapshot_rows(
                 item="Top Gainer",
                 symbol=top_sym,
                 metric="percent_change",
-                value=_fmt_pct(top_pc),
-                notes="Highest percent_change in this universe.",
+                value=_pct_points(top_pc),
+                notes=f"Highest percent_change in this universe (display: {_fmt_pct(top_pc)}).",
                 last_updated_riyadh=ts,
             )
         )
@@ -545,8 +556,8 @@ def _build_universe_snapshot_rows(
                 item="Top Loser",
                 symbol=low_sym,
                 metric="percent_change",
-                value=_fmt_pct(low_pc),
-                notes="Lowest percent_change in this universe.",
+                value=_pct_points(low_pc),
+                notes=f"Lowest percent_change in this universe (display: {_fmt_pct(low_pc)}).",
                 last_updated_riyadh=ts,
             )
         )
@@ -558,8 +569,8 @@ def _build_universe_snapshot_rows(
                     item="Average Change",
                     symbol="",
                     metric="avg_percent_change",
-                    value=_fmt_pct(avg_pc),
-                    notes="Average percent_change across symbols with data.",
+                    value=_pct_points(avg_pc),
+                    notes=f"Average percent_change across symbols with data (display: {_fmt_pct(avg_pc)}).",
                     last_updated_riyadh=ts,
                 )
             )
@@ -577,7 +588,6 @@ def _build_universe_snapshot_rows(
             )
         )
 
-    # Expected ROI (3M) snapshot (best effort)
     roi3 = _scored_list(qmap, "expected_roi_3m")
     if roi3:
         roi3.sort(key=lambda t: t[1], reverse=True)
@@ -589,13 +599,12 @@ def _build_universe_snapshot_rows(
                 item="Best Expected ROI (3M)",
                 symbol=sym,
                 metric="expected_roi_3m",
-                value=_fmt_pct(val),
-                notes="Highest expected_roi_3m in this universe (if computed).",
+                value=_pct_points(val),
+                notes=f"Highest expected_roi_3m (display: {_fmt_pct(val)}).",
                 last_updated_riyadh=ts,
             )
         )
 
-    # Risk snapshot (volatility_90d)
     vol90 = _scored_list(qmap, "volatility_90d")
     if vol90:
         vol90.sort(key=lambda t: t[1], reverse=True)
@@ -607,13 +616,12 @@ def _build_universe_snapshot_rows(
                 item="Highest Volatility (90D)",
                 symbol=sym,
                 metric="volatility_90d",
-                value=_fmt_pct(val),
-                notes="Highest volatility_90d in this universe (if computed).",
+                value=_pct_points(val),
+                notes=f"Highest volatility_90d (display: {_fmt_pct(val)}).",
                 last_updated_riyadh=ts,
             )
         )
 
-    # Confidence snapshot
     conf = _scored_list(qmap, "forecast_confidence")
     if conf:
         avg_conf = _avg([x for _, x in conf])
@@ -625,7 +633,7 @@ def _build_universe_snapshot_rows(
                     item="Average Forecast Confidence",
                     symbol="",
                     metric="avg_forecast_confidence",
-                    value=_fmt_num(avg_conf),
+                    value=avg_conf,
                     notes="Average forecast_confidence across symbols with data.",
                     last_updated_riyadh=ts,
                 )
@@ -642,10 +650,6 @@ def _build_portfolio_kpi_rows(
     qmap: Dict[str, Dict[str, Any]],
     ts: str,
 ) -> List[Dict[str, Any]]:
-    """
-    Computes portfolio KPIs if position_qty / avg_cost are available.
-    If not available, returns an informative row (still non-empty).
-    """
     rows: List[Dict[str, Any]] = []
 
     total_cost = 0.0
@@ -674,14 +678,14 @@ def _build_portfolio_kpi_rows(
                 symbol="",
                 metric="status",
                 value="Unavailable",
-                notes="position_qty / avg_cost not present in returned rows (or portfolio universe not provided).",
+                notes="position_qty / avg_cost not present (or portfolio universe not provided).",
                 last_updated_riyadh=ts,
             )
         )
         return rows
 
     unreal = total_value - total_cost
-    unreal_pct = (unreal / total_cost) * 100.0 if total_cost > 0 else None
+    unreal_pct = (unreal / total_cost) if total_cost > 0 else None  # fraction
 
     rows.append(
         _make_row(
@@ -690,7 +694,7 @@ def _build_portfolio_kpi_rows(
             item="Portfolio Cost",
             symbol="",
             metric="total_cost",
-            value=_fmt_num(total_cost),
+            value=total_cost,
             notes="Sum(position_qty * avg_cost).",
             last_updated_riyadh=ts,
         )
@@ -702,7 +706,7 @@ def _build_portfolio_kpi_rows(
             item="Portfolio Value",
             symbol="",
             metric="total_value",
-            value=_fmt_num(total_value),
+            value=total_value,
             notes="Sum(position_qty * current_price) where available.",
             last_updated_riyadh=ts,
         )
@@ -714,7 +718,7 @@ def _build_portfolio_kpi_rows(
             item="Unrealized P/L",
             symbol="",
             metric="unrealized_pl",
-            value=_fmt_num(unreal),
+            value=unreal,
             notes="total_value - total_cost.",
             last_updated_riyadh=ts,
         )
@@ -727,8 +731,8 @@ def _build_portfolio_kpi_rows(
                 item="Unrealized P/L %",
                 symbol="",
                 metric="unrealized_pl_pct",
-                value=_fmt_pct(unreal_pct),
-                notes="unrealized_pl / total_cost.",
+                value=_pct_points(unreal_pct),  # percent-points
+                notes=f"unrealized_pl / total_cost (display: {_fmt_pct(unreal_pct)}).",
                 last_updated_riyadh=ts,
             )
         )
@@ -736,24 +740,11 @@ def _build_portfolio_kpi_rows(
 
 
 # -----------------------------------------------------------------------------
-# Auto-universe defaults (when user passes no symbols)
+# Auto-universe defaults
 # -----------------------------------------------------------------------------
 def _default_universes() -> Dict[str, List[str]]:
-    """
-    You can override defaults via env vars:
-      TFB_INSIGHTS_INDICES
-      TFB_INSIGHTS_COMMODITIES_FX
-    """
-    indices = _env_csv(
-        "TFB_INSIGHTS_INDICES",
-        # includes your dashboard intent: TASI, NOMU, S&P500, NASDAQ, FTSE (+ safe Yahoo fallbacks)
-        "TASI,NOMU,^GSPC,^IXIC,^FTSE",
-    )
-    commodities_fx = _env_csv(
-        "TFB_INSIGHTS_COMMODITIES_FX",
-        # your dashboard intent: Gold, Brent (+ optional FX)
-        "GC=F,BZ=F,USDSAR=X,EURUSD=X",
-    )
+    indices = _env_csv("TFB_INSIGHTS_INDICES", "TASI,NOMU,^GSPC,^IXIC,^FTSE")
+    commodities_fx = _env_csv("TFB_INSIGHTS_COMMODITIES_FX", "GC=F,BZ=F,USDSAR=X,EURUSD=X")
     return {
         "Indices & Benchmarks": indices,
         "Commodities & FX": commodities_fx,
@@ -777,34 +768,14 @@ async def build_insights_analysis_rows(
     include_portfolio_kpis: bool = True,
     max_symbols_per_universe: int = 25,
 ) -> Dict[str, Any]:
-    """
-    Build Insights_Analysis payload (headers/keys/rows) aligned to schema_registry.
-
-    - If `universes` is provided, we use it.
-    - Else if `symbols` is provided, we treat them as a single universe.
-    - Else if empty and engine exists and auto_universe_when_empty is True,
-      we build default universes (indices + commodities/FX), plus Top10 + portfolio KPIs best-effort.
-
-    Returns envelope:
-      {
-        "status": "success",
-        "page": "Insights_Analysis",
-        "headers": [...],
-        "keys": [...],
-        "rows": [...],
-        "meta": {...}
-      }
-    """
     headers, keys, schema_source = get_insights_schema()
     ts = _now_riyadh_iso()
 
     rows: List[Dict[str, Any]] = []
 
-    # Criteria rows (keeps criteria visible even if the criteria block is metadata-driven)
     if include_criteria_rows:
         rows.extend(build_criteria_rows(criteria=criteria, last_updated_riyadh=ts))
 
-    # System rows (safe, zero network)
     if include_system_rows:
         schema_version = ""
         try:
@@ -840,7 +811,6 @@ async def build_insights_analysis_rows(
                 )
             )
 
-    # Build effective universes
     eff_universes: Dict[str, List[str]] = {}
 
     if universes:
@@ -854,13 +824,26 @@ async def build_insights_analysis_rows(
         if sym_list2:
             eff_universes["Selected Symbols"] = sym_list2
 
-    # Auto universe when empty
     auto_used = False
     if (not eff_universes) and engine and auto_universe_when_empty:
         eff_universes.update(_default_universes())
         auto_used = True
 
-    # Summary row (always)
+    # Always add build-status (this is what makes the sheet show ✅ instead of ❌)
+    build_ok = bool(engine) and bool(eff_universes)
+    rows.append(
+        _make_row(
+            keys=keys,
+            section="System",
+            item="Build Status",
+            symbol="",
+            metric="build_status",
+            value="OK" if build_ok else "WARN",
+            notes="OK = engine + universes available. WARN = criteria/system only (no engine or no universes).",
+            last_updated_riyadh=ts,
+        )
+    )
+
     rows.append(
         _make_row(
             keys=keys,
@@ -869,12 +852,12 @@ async def build_insights_analysis_rows(
             symbol="",
             metric="sections",
             value=", ".join(list(eff_universes.keys())) if eff_universes else "None",
-            notes="Universes used to build insights (auto-universe applied when empty)." if auto_used else "Universes provided by caller.",
+            notes="Auto-universe applied." if auto_used else "Universes provided by caller (or none).",
             last_updated_riyadh=ts,
         )
     )
 
-    # If no engine, we still return meaningful rows (criteria/system/summary)
+    # No engine or no universes -> still return GREEN/WARN rows (never empty)
     if not engine or not eff_universes:
         if not engine:
             rows.append(
@@ -915,16 +898,16 @@ async def build_insights_analysis_rows(
                 "auto_universe_used": auto_used,
                 "universes": list(eff_universes.keys()),
                 "mode": mode,
+                "builder_version": INSIGHTS_BUILDER_VERSION,
             },
         }
 
-    # For each universe section, compute snapshots (best-effort)
+    # Build universe snapshots
     for section_name, sym_list in eff_universes.items():
         syms = [_safe_str(s) for s in (sym_list or []) if _safe_str(s)]
         if not syms:
             continue
 
-        # clamp
         try:
             cap = max(1, min(int(max_symbols_per_universe), 500))
         except Exception:
@@ -932,29 +915,12 @@ async def build_insights_analysis_rows(
         syms = syms[:cap]
 
         qmap = await _fetch_quotes_map(engine, syms, mode=mode or "")
-        rows.extend(
-            _build_universe_snapshot_rows(
-                keys=keys,
-                section=section_name,
-                symbols=syms,
-                qmap=qmap,
-                ts=ts,
-            )
-        )
+        rows.extend(_build_universe_snapshot_rows(keys=keys, section=section_name, symbols=syms, qmap=qmap, ts=ts))
 
-        # If this is a portfolio universe (common name), add KPIs
         if include_portfolio_kpis and section_name.strip().lower() in {"my_portfolio", "portfolio", "my portfolio"}:
-            rows.extend(
-                _build_portfolio_kpi_rows(
-                    keys=keys,
-                    section="Portfolio KPIs",
-                    symbols=syms,
-                    qmap=qmap,
-                    ts=ts,
-                )
-            )
+            rows.extend(_build_portfolio_kpi_rows(keys=keys, section="Portfolio KPIs", symbols=syms, qmap=qmap, ts=ts))
 
-    # Top10 section (best effort)
+    # Top10 section
     if include_top10_section:
         top10_syms = await _fetch_top10_symbols(engine, criteria=criteria, limit=10)
         if top10_syms:
@@ -967,11 +933,10 @@ async def build_insights_analysis_rows(
                     symbol="",
                     metric="top10_count",
                     value=len(top10_syms),
-                    notes="Top10 symbols generated in live mode (best-effort).",
+                    notes="Top10 symbols generated (best-effort).",
                     last_updated_riyadh=ts,
                 )
             )
-            # show one row per symbol (compact)
             for i, sym in enumerate(top10_syms, start=1):
                 d = qmap10.get(sym) or {}
                 roi3 = _as_float(_pick(d, "expected_roi_3m"))
@@ -979,7 +944,6 @@ async def build_insights_analysis_rows(
                 reco = _safe_str(_pick(d, "recommendation"))
                 name = _safe_str(_pick(d, "name"))
 
-                v = _fmt_pct(roi3) if roi3 is not None else ""
                 note_parts = []
                 if name:
                     note_parts.append(name)
@@ -987,7 +951,7 @@ async def build_insights_analysis_rows(
                     note_parts.append(f"conf={_fmt_num(conf)}")
                 if reco:
                     note_parts.append(f"reco={reco}")
-                notes = " | ".join(note_parts) if note_parts else "Top10 item (details depend on engine fields availability)."
+                notes = " | ".join(note_parts) if note_parts else "Top10 item."
 
                 rows.append(
                     _make_row(
@@ -996,8 +960,8 @@ async def build_insights_analysis_rows(
                         item=f"#{i}",
                         symbol=sym,
                         metric="expected_roi_3m",
-                        value=v or "N/A",
-                        notes=notes,
+                        value=_pct_points(roi3) if roi3 is not None else "",
+                        notes=(notes + (f" (display: {_fmt_pct(roi3)})" if roi3 is not None else "")),
                         last_updated_riyadh=ts,
                     )
                 )
@@ -1010,7 +974,7 @@ async def build_insights_analysis_rows(
                     symbol="",
                     metric="top10_status",
                     value="Unavailable",
-                    notes="No Top10 method found or returned empty. This will be fixed when top10_selector + route are aligned.",
+                    notes="No Top10 method found or returned empty.",
                     last_updated_riyadh=ts,
                 )
             )
