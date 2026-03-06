@@ -2,9 +2,9 @@
 # core/analysis/top10_selector.py
 """
 ================================================================================
-Top 10 Selector — v3.0.0
+Top 10 Selector — v3.1.0
 ================================================================================
-LIVE • SCHEMA-FIRST • TOP10-METADATA COMPLETE • ROUTE-INDEPENDENT • SHEET-FRIENDLY
+LIVE • SCHEMA-FIRST • TOP10-METADATA COMPLETE • ROUTE-COMPATIBLE • SHEET-FRIENDLY
 
 Purpose
 -------
@@ -18,17 +18,26 @@ Primary guarantees
     - top10_rank
     - selection_reason
     - criteria_snapshot
-- Keeps output independent from route family
+- Compatible with flexible route-builder calls:
+    - engine=...
+    - request=..., settings=..., body=...
+    - mode=...
+    - limit=...
 - Uses live quotes when available, snapshot fallback only when necessary
 - Does not fail only because some optional fields are missing
 - No network I/O at import-time
 
 Public APIs
 -----------
-- select_top10_symbols(engine, criteria, limit=10, mode="") -> List[str]
-- build_top10_rows(engine, criteria, limit=10, mode="") -> Dict payload
-- select_top10(engine, criteria, mode="") -> (candidates, meta)
-- build_top10_output_rows(candidates, criteria, mode="") -> (rows, meta)
+- select_top10_symbols(...)
+- build_top10_rows(...)
+- select_top10(...)
+- build_top10_output_rows(...)
+- build_rows(...)                        # route-friendly canonical builder
+- build_top_10_investments_rows(...)
+- build_top10_investments_rows(...)
+- build_top_10_rows(...)
+- get_top10_rows(...)
 
 Notes
 -----
@@ -50,12 +59,12 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 logger = logging.getLogger("core.analysis.top10_selector")
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "3.0.0"
+TOP10_SELECTOR_VERSION = "3.1.0"
 TOP10_PAGE_NAME = "Top_10_Investments"
 RIYADH_TZ = timezone(timedelta(hours=3))
 
@@ -194,6 +203,31 @@ def _dedupe_keep_order(items: Sequence[str]) -> List[str]:
     return out
 
 
+def _is_truthy(v: Any) -> bool:
+    if isinstance(v, bool):
+        return v
+    s = _safe_str(v).lower()
+    return s in {"1", "true", "yes", "y", "on"}
+
+
+def _first_non_none(*vals: Any) -> Any:
+    for v in vals:
+        if v is not None:
+            return v
+    return None
+
+
+def _dict_get_ci(d: Mapping[str, Any], *keys: str) -> Any:
+    if not isinstance(d, Mapping):
+        return None
+    norm = {_norm_key(k): v for k, v in d.items()}
+    for k in keys:
+        nk = _norm_key(k)
+        if nk in norm:
+            return norm[nk]
+    return None
+
+
 # =============================================================================
 # Period mapping
 # =============================================================================
@@ -257,7 +291,14 @@ class Criteria:
 
 
 def _criteria_from_dict(d: Dict[str, Any]) -> Criteria:
-    pages = d.get("pages_selected") or d.get("pages") or d.get("selected_pages") or []
+    pages = (
+        d.get("pages_selected")
+        or d.get("pages")
+        or d.get("selected_pages")
+        or d.get("pagesSelected")
+        or d.get("page_selection")
+        or []
+    )
     if isinstance(pages, str):
         parts = re.split(r"[,\;\|\n]+", pages)
         pages = [p.strip() for p in parts if p.strip()]
@@ -270,6 +311,7 @@ def _criteria_from_dict(d: Dict[str, Any]) -> Criteria:
             or d.get("investment_period_days")
             or d.get("period_days")
             or d.get("horizon_days")
+            or d.get("investment_period")
             or 90,
             90,
         )
@@ -374,6 +416,63 @@ def load_criteria_best_effort(engine: Any) -> Criteria:
 
 
 # =============================================================================
+# Request / route compatibility helpers
+# =============================================================================
+def _resolve_engine_from_request(request: Any) -> Any:
+    try:
+        app = getattr(request, "app", None)
+        state = getattr(app, "state", None)
+        eng = getattr(state, "engine", None)
+        if eng is not None:
+            return eng
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_limit(limit: Any, criteria: Optional[Dict[str, Any]], body: Optional[Dict[str, Any]]) -> int:
+    v = _first_non_none(
+        limit,
+        (criteria or {}).get("top_n") if isinstance(criteria, dict) else None,
+        (criteria or {}).get("limit") if isinstance(criteria, dict) else None,
+        (body or {}).get("top_n") if isinstance(body, dict) else None,
+        (body or {}).get("limit") if isinstance(body, dict) else None,
+        10,
+    )
+    n = int(_safe_float(v, 10) or 10)
+    return max(1, min(50, n))
+
+
+def _merge_criteria_sources(
+    *,
+    engine: Any,
+    criteria: Optional[Dict[str, Any]],
+    body: Optional[Dict[str, Any]],
+    limit: Optional[int],
+) -> Criteria:
+    base = load_criteria_best_effort(engine)
+
+    merged: Dict[str, Any] = {}
+    if isinstance(body, dict):
+        merged.update(body)
+    if isinstance(criteria, dict):
+        merged.update(criteria)
+
+    crit = merge_criteria_overrides(base, merged)
+    crit.top_n = _resolve_limit(limit, criteria, body)
+    return crit
+
+
+def _extract_route_mode(mode: Any, body: Optional[Dict[str, Any]]) -> str:
+    m = _safe_str(mode)
+    if m:
+        return m
+    if isinstance(body, dict):
+        return _safe_str(body.get("mode"))
+    return ""
+
+
+# =============================================================================
 # Page selection / normalization
 # =============================================================================
 def _normalize_symbol(sym: str) -> str:
@@ -413,19 +512,108 @@ def _eligible_pages(criteria: Criteria) -> List[str]:
 
 
 # =============================================================================
-# Engine / snapshot access
+# Engine / snapshot / row access
 # =============================================================================
 def _get_snapshot(engine: Any, page: str) -> Optional[Dict[str, Any]]:
     if engine is None:
         return None
-    fn = getattr(engine, "get_cached_sheet_snapshot", None)
-    if callable(fn):
-        try:
-            snap = fn(page)
-            return snap if isinstance(snap, dict) else None
-        except Exception:
-            return None
+    for fn_name, kwargs in [
+        ("get_cached_sheet_snapshot", {"page": page}),
+        ("get_cached_sheet_snapshot", {"sheet": page}),
+        ("get_sheet_snapshot", {"page": page}),
+        ("get_sheet_snapshot", {"sheet": page}),
+    ]:
+        fn = getattr(engine, fn_name, None)
+        if callable(fn):
+            try:
+                snap = fn(**kwargs)
+                if isinstance(snap, dict):
+                    return snap
+            except TypeError:
+                try:
+                    snap = fn(page)
+                    if isinstance(snap, dict):
+                        return snap
+                except Exception:
+                    pass
+            except Exception:
+                pass
     return None
+
+
+def _row_list_from_snapshot(snapshot: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not isinstance(snapshot, dict):
+        return []
+
+    rows = snapshot.get("rows") or snapshot.get("data") or snapshot.get("items") or []
+    keys = snapshot.get("keys") or []
+    headers = snapshot.get("headers") or []
+
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        return [dict(r) for r in rows if isinstance(r, dict)]
+
+    if isinstance(rows, list) and rows and isinstance(rows[0], (list, tuple)):
+        cols = keys if isinstance(keys, list) and keys else headers
+        if not isinstance(cols, list) or not cols:
+            return []
+        out: List[Dict[str, Any]] = []
+        for row in rows:
+            if not isinstance(row, (list, tuple)):
+                continue
+            obj: Dict[str, Any] = {}
+            for i, col in enumerate(cols):
+                obj[_safe_str(col)] = row[i] if i < len(row) else None
+            out.append(obj)
+        return out
+
+    return []
+
+
+async def _get_page_rows_live(engine: Any, page: str, *, limit: int = 5000) -> List[Dict[str, Any]]:
+    """
+    Best-effort access to engine sheet/page rows for candidate extraction.
+    """
+    if engine is None:
+        return []
+
+    candidates = [
+        ("get_sheet_rows", {"sheet": page, "limit": limit}),
+        ("get_sheet_rows", {"page": page, "limit": limit}),
+        ("get_page_rows", {"page": page, "limit": limit}),
+        ("get_page_rows", {"sheet": page, "limit": limit}),
+        ("sheet_rows", {"sheet": page, "limit": limit}),
+        ("sheet_rows", {"page": page, "limit": limit}),
+    ]
+
+    for name, kwargs in candidates:
+        fn = getattr(engine, name, None)
+        if not callable(fn):
+            continue
+        try:
+            out = fn(**kwargs)
+            out = await _maybe_await(out)
+        except TypeError:
+            try:
+                out = fn(page)
+                out = await _maybe_await(out)
+            except Exception:
+                continue
+        except Exception:
+            continue
+
+        if isinstance(out, dict):
+            rows = out.get("rows") or out.get("data") or out.get("items") or []
+            if isinstance(rows, list):
+                normalized = [_to_payload(r) for r in rows]
+                if normalized:
+                    return normalized
+        elif isinstance(out, list):
+            normalized = [_to_payload(r) for r in out]
+            if normalized:
+                return normalized
+
+    snap = _get_snapshot(engine, page)
+    return _row_list_from_snapshot(snap)
 
 
 async def _get_universe_symbols_live(engine: Any, page: str, *, limit: int = 5000) -> List[str]:
@@ -459,10 +647,15 @@ async def _get_universe_symbols_live(engine: Any, page: str, *, limit: int = 500
 
         if isinstance(out, (list, tuple)):
             syms = [_normalize_symbol(_safe_str(x)) for x in out]
-            return [s for s in syms if s]
+            syms = [s for s in syms if s]
+            if syms:
+                return syms
+
         if isinstance(out, dict) and isinstance(out.get("symbols"), (list, tuple)):
             syms = [_normalize_symbol(_safe_str(x)) for x in out["symbols"]]
-            return [s for s in syms if s]
+            syms = [s for s in syms if s]
+            if syms:
+                return syms
 
     fn2 = getattr(engine, "symbols_reader", None)
     if fn2 is not None and hasattr(fn2, "get_symbols_for_sheet"):
@@ -471,11 +664,20 @@ async def _get_universe_symbols_live(engine: Any, page: str, *, limit: int = 500
             out = await _maybe_await(out)
             if isinstance(out, (list, tuple)):
                 syms = [_normalize_symbol(_safe_str(x)) for x in out]
-                return [s for s in syms if s]
+                syms = [s for s in syms if s]
+                if syms:
+                    return syms
         except Exception:
             pass
 
-    return []
+    # fallback from page rows / snapshot rows
+    rows = await _get_page_rows_live(engine, page, limit=limit)
+    syms2: List[str] = []
+    for r in rows:
+        sym = _extract_symbol_from_row(r)
+        if sym:
+            syms2.append(sym)
+    return _dedupe_keep_order(syms2)
 
 
 def _dict_is_symbol_map(d: Dict[str, Any], symbols: List[str]) -> bool:
@@ -649,6 +851,18 @@ def _get_volume(d: Dict[str, Any]) -> float:
     return max(0.0, float(f))
 
 
+def _extract_symbol_from_row(row: Dict[str, Any]) -> str:
+    sym = _first_non_none(
+        row.get("symbol"),
+        row.get("ticker"),
+        row.get("code"),
+        row.get("Symbol"),
+        row.get("Ticker"),
+        row.get("Code"),
+    )
+    return _normalize_symbol(_safe_str(sym))
+
+
 def _extract_candidate_from_quote(*, sym: str, page: str, quote: Dict[str, Any], horizon: str) -> Optional[Candidate]:
     roi_key = horizon_to_roi_key(horizon)
     roi = _as_fraction(quote.get(roi_key))
@@ -673,6 +887,40 @@ def _extract_candidate_from_quote(*, sym: str, page: str, quote: Dict[str, Any],
         risk_score=float(risk),
         volume=float(vol),
         row=row,
+    )
+
+
+def _extract_candidate_from_row(*, page: str, row: Dict[str, Any], horizon: str) -> Optional[Candidate]:
+    if not isinstance(row, dict):
+        return None
+
+    sym = _extract_symbol_from_row(row)
+    if not sym:
+        return None
+
+    roi_key = horizon_to_roi_key(horizon)
+    roi = _as_fraction(_first_non_none(row.get(roi_key), row.get("upside_pct"), row.get("target_return")))
+    if roi is None:
+        return None
+
+    conf = _get_confidence(row)
+    overall = _get_overall_score(row)
+    risk = _get_risk_score(row)
+    vol = _get_volume(row)
+
+    rr = dict(row)
+    rr["symbol"] = sym
+    rr["source_page"] = page
+
+    return Candidate(
+        symbol=sym,
+        source_page=page,
+        roi=float(roi),
+        confidence=float(conf),
+        overall_score=float(overall),
+        risk_score=float(risk),
+        volume=float(vol),
+        row=rr,
     )
 
 
@@ -739,33 +987,21 @@ async def select_top10(*, engine: Any, criteria: Criteria, mode: str = "") -> Tu
     warnings: List[str] = []
 
     for page in pages:
-        syms = await _get_universe_symbols_live(engine, page, limit=per_page_limit)
-        if not syms:
+        page_symbols = await _get_universe_symbols_live(engine, page, limit=per_page_limit)
+        page_rows = await _get_page_rows_live(engine, page, limit=per_page_limit)
+
+        if page_symbols:
+            for s in page_symbols:
+                universe.append((s, page))
+        else:
+            warnings.append(f"universe_empty:{page}")
+
+        # Additional fallback: if rows contain directly scoreable candidates, use them later
+        # through row-candidate extraction even when symbol listing is weak.
+        if not page_symbols and not page_rows:
             snap = _get_snapshot(engine, page)
             if isinstance(snap, dict) and isinstance(snap.get("rows"), list):
-                hdrs = snap.get("headers") or []
-                rows = snap.get("rows") or []
-                if isinstance(hdrs, list) and hdrs:
-                    idx_map = {_norm_key(h): i for i, h in enumerate(hdrs) if _norm_key(h)}
-                    sym_idx = None
-                    for k in ("symbol", "ticker", "code"):
-                        if k in idx_map:
-                            sym_idx = idx_map[k]
-                            break
-                    if sym_idx is not None:
-                        for r in rows[:per_page_limit]:
-                            if isinstance(r, (list, tuple)) and sym_idx < len(r):
-                                s = _normalize_symbol(_safe_str(r[sym_idx]))
-                                if s:
-                                    universe.append((s, page))
-                if not any(p == page for _, p in universe):
-                    warnings.append(f"universe_empty:{page}")
-            else:
-                warnings.append(f"universe_empty:{page}")
-            continue
-
-        for s in syms:
-            universe.append((s, page))
+                warnings.append(f"snapshot_present_but_no_symbols:{page}")
 
     seen_u: Set[str] = set()
     universe_dedup: List[Tuple[str, str]] = []
@@ -777,27 +1013,13 @@ async def select_top10(*, engine: Any, criteria: Criteria, mode: str = "") -> Tu
     symbols = [s for s, _ in universe_dedup]
     source_map = {s: p for s, p in universe_dedup}
 
-    if not symbols:
-        meta = {
-            "version": TOP10_SELECTOR_VERSION,
-            "mode": mode,
-            "horizon": horizon,
-            "roi_key": roi_key,
-            "pages_selected": pages,
-            "universe_symbols": 0,
-            "candidates": 0,
-            "returned": 0,
-            "build_status": "WARN",
-            "warnings": warnings or ["universe_empty_all_pages"],
-            "timestamp_utc": _now_utc_iso(),
-            "timestamp_riyadh": _now_riyadh_iso(),
-            "duration_ms": round((time.time() - t0) * 1000.0, 3),
-        }
-        return [], meta
-
-    qmap = await _fetch_quotes_map(engine, symbols, mode=mode or "")
+    qmap: Dict[str, Dict[str, Any]] = {}
+    if symbols:
+        qmap = await _fetch_quotes_map(engine, symbols, mode=mode or "")
 
     candidates: List[Candidate] = []
+
+    # Primary: candidates from live quotes
     for sym in symbols:
         q = qmap.get(sym) or {}
         if not isinstance(q, dict) or not q:
@@ -809,17 +1031,41 @@ async def select_top10(*, engine: Any, criteria: Criteria, mode: str = "") -> Tu
 
         if criteria.min_expected_roi is not None and cand.roi < float(criteria.min_expected_roi):
             continue
-
         if criteria.enforce_risk_confidence:
             if cand.risk_score > float(criteria.max_risk_score):
                 continue
             if cand.confidence < float(criteria.min_confidence):
                 continue
-
         if criteria.min_volume is not None and cand.volume < float(criteria.min_volume):
             continue
 
         candidates.append(cand)
+
+    # Secondary fallback: direct candidates from page rows/snapshots
+    if not candidates:
+        row_based_count = 0
+        for page in pages:
+            rows = await _get_page_rows_live(engine, page, limit=per_page_limit)
+            for row in rows:
+                cand = _extract_candidate_from_row(page=page, row=row, horizon=horizon)
+                if cand is None:
+                    continue
+
+                if criteria.min_expected_roi is not None and cand.roi < float(criteria.min_expected_roi):
+                    continue
+                if criteria.enforce_risk_confidence:
+                    if cand.risk_score > float(criteria.max_risk_score):
+                        continue
+                    if cand.confidence < float(criteria.min_confidence):
+                        continue
+                if criteria.min_volume is not None and cand.volume < float(criteria.min_volume):
+                    continue
+
+                candidates.append(cand)
+                row_based_count += 1
+
+        if row_based_count > 0:
+            warnings.append(f"used_row_based_fallback:{row_based_count}")
 
     best: Dict[str, Candidate] = {}
     for c in candidates:
@@ -837,7 +1083,8 @@ async def select_top10(*, engine: Any, criteria: Criteria, mode: str = "") -> Tu
     if criteria.enrich_final and top:
         try:
             enrich_map = await _enrich_top(engine, [c.symbol for c in top], mode=mode or "")
-        except Exception:
+        except Exception as e:
+            warnings.append(f"enrich_failed:{e}")
             enrich_map = {}
 
     for c in top:
@@ -1201,25 +1448,50 @@ def build_top10_output_rows(candidates: List[Candidate], *, criteria: Criteria, 
 
 
 # =============================================================================
-# Convenience public APIs
+# Canonical route-friendly public builders
 # =============================================================================
-async def select_top10_symbols(*, engine: Any, criteria: Optional[Dict[str, Any]] = None, limit: int = 10, mode: str = "") -> List[str]:
-    crit = _criteria_from_dict(criteria or {})
-    crit.top_n = max(1, min(50, int(limit or crit.top_n or 10)))
-    top, _meta = await select_top10(engine=engine, criteria=crit, mode=mode or "")
+async def select_top10_symbols(
+    *,
+    engine: Any = None,
+    request: Any = None,
+    settings: Any = None,
+    criteria: Optional[Dict[str, Any]] = None,
+    body: Optional[Dict[str, Any]] = None,
+    limit: int = 10,
+    mode: str = "",
+) -> List[str]:
+    engine = engine or _resolve_engine_from_request(request)
+    crit = _merge_criteria_sources(engine=engine, criteria=criteria, body=body, limit=limit)
+    mode2 = _extract_route_mode(mode, body)
+    top, _meta = await select_top10(engine=engine, criteria=crit, mode=mode2)
     return [c.symbol for c in top]
 
 
-async def build_top10_rows(*, engine: Any, criteria: Optional[Dict[str, Any]] = None, limit: int = 10, mode: str = "") -> Dict[str, Any]:
-    crit = _criteria_from_dict(criteria or {})
-    crit.top_n = max(1, min(50, int(limit or crit.top_n or 10)))
+async def build_top10_rows(
+    *,
+    engine: Any = None,
+    request: Any = None,
+    settings: Any = None,
+    criteria: Optional[Dict[str, Any]] = None,
+    body: Optional[Dict[str, Any]] = None,
+    limit: int = 10,
+    mode: str = "",
+) -> Dict[str, Any]:
+    engine = engine or _resolve_engine_from_request(request)
+    crit = _merge_criteria_sources(engine=engine, criteria=criteria, body=body, limit=limit)
+    mode2 = _extract_route_mode(mode, body)
 
-    top, meta_sel = await select_top10(engine=engine, criteria=crit, mode=mode or "")
-    rows, meta_rows = build_top10_output_rows(top, criteria=crit, mode=mode or "")
+    top, meta_sel = await select_top10(engine=engine, criteria=crit, mode=mode2)
+    rows, meta_rows = build_top10_output_rows(top, criteria=crit, mode=mode2)
     headers, keys, _pct_keys, _schema_source = _get_top10_schema()
 
+    status_out = "success" if rows else "warn"
+    warnings = list((meta_sel or {}).get("warnings") or [])
+    if not rows:
+        warnings.append("top10_empty_after_selection")
+
     return {
-        "status": "success",
+        "status": status_out,
         "page": TOP10_PAGE_NAME,
         "headers": headers,
         "keys": keys,
@@ -1227,31 +1499,141 @@ async def build_top10_rows(*, engine: Any, criteria: Optional[Dict[str, Any]] = 
         "meta": {
             **(meta_sel or {}),
             **(meta_rows or {}),
+            "criteria": {
+                "pages_selected": crit.pages_selected,
+                "invest_period_days": crit.invest_period_days,
+                "horizon": crit.horizon(),
+                "top_n": crit.top_n,
+                "min_expected_roi": crit.min_expected_roi,
+                "max_risk_score": crit.max_risk_score,
+                "min_confidence": crit.min_confidence,
+                "min_volume": crit.min_volume,
+                "use_liquidity_tiebreak": crit.use_liquidity_tiebreak,
+                "enforce_risk_confidence": crit.enforce_risk_confidence,
+            },
+            "warnings": warnings,
+            "engine_present": engine is not None,
+            "request_present": request is not None,
         },
     }
 
 
+async def build_rows(
+    *,
+    engine: Any = None,
+    request: Any = None,
+    settings: Any = None,
+    body: Optional[Dict[str, Any]] = None,
+    criteria: Optional[Dict[str, Any]] = None,
+    limit: Optional[int] = None,
+    mode: str = "",
+) -> List[Dict[str, Any]]:
+    """
+    Canonical route-friendly builder.
+    This is the safest export for routes that call generic builders.
+    """
+    payload = await build_top10_rows(
+        engine=engine,
+        request=request,
+        settings=settings,
+        body=body,
+        criteria=criteria,
+        limit=_resolve_limit(limit, criteria, body),
+        mode=mode,
+    )
+    rows = payload.get("rows")
+    return rows if isinstance(rows, list) else []
+
+
 # Backward-compatible aliases some routes/builders may try
-async def build_top_10_investments_rows(*, engine: Any, criteria: Optional[Dict[str, Any]] = None, limit: int = 10, mode: str = "") -> List[Dict[str, Any]]:
-    payload = await build_top10_rows(engine=engine, criteria=criteria, limit=limit, mode=mode)
+async def build_top_10_investments_rows(
+    *,
+    engine: Any = None,
+    request: Any = None,
+    settings: Any = None,
+    criteria: Optional[Dict[str, Any]] = None,
+    body: Optional[Dict[str, Any]] = None,
+    limit: int = 10,
+    mode: str = "",
+) -> List[Dict[str, Any]]:
+    payload = await build_top10_rows(
+        engine=engine,
+        request=request,
+        settings=settings,
+        criteria=criteria,
+        body=body,
+        limit=limit,
+        mode=mode,
+    )
     rows = payload.get("rows")
     return rows if isinstance(rows, list) else []
 
 
-async def build_top10_investments_rows(*, engine: Any, criteria: Optional[Dict[str, Any]] = None, limit: int = 10, mode: str = "") -> List[Dict[str, Any]]:
-    payload = await build_top10_rows(engine=engine, criteria=criteria, limit=limit, mode=mode)
+async def build_top10_investments_rows(
+    *,
+    engine: Any = None,
+    request: Any = None,
+    settings: Any = None,
+    criteria: Optional[Dict[str, Any]] = None,
+    body: Optional[Dict[str, Any]] = None,
+    limit: int = 10,
+    mode: str = "",
+) -> List[Dict[str, Any]]:
+    payload = await build_top10_rows(
+        engine=engine,
+        request=request,
+        settings=settings,
+        criteria=criteria,
+        body=body,
+        limit=limit,
+        mode=mode,
+    )
     rows = payload.get("rows")
     return rows if isinstance(rows, list) else []
 
 
-async def build_top_10_rows(*, engine: Any, criteria: Optional[Dict[str, Any]] = None, limit: int = 10, mode: str = "") -> List[Dict[str, Any]]:
-    payload = await build_top10_rows(engine=engine, criteria=criteria, limit=limit, mode=mode)
+async def build_top_10_rows(
+    *,
+    engine: Any = None,
+    request: Any = None,
+    settings: Any = None,
+    criteria: Optional[Dict[str, Any]] = None,
+    body: Optional[Dict[str, Any]] = None,
+    limit: int = 10,
+    mode: str = "",
+) -> List[Dict[str, Any]]:
+    payload = await build_top10_rows(
+        engine=engine,
+        request=request,
+        settings=settings,
+        criteria=criteria,
+        body=body,
+        limit=limit,
+        mode=mode,
+    )
     rows = payload.get("rows")
     return rows if isinstance(rows, list) else []
 
 
-async def get_top10_rows(*, engine: Any, criteria: Optional[Dict[str, Any]] = None, limit: int = 10, mode: str = "") -> List[Dict[str, Any]]:
-    payload = await build_top10_rows(engine=engine, criteria=criteria, limit=limit, mode=mode)
+async def get_top10_rows(
+    *,
+    engine: Any = None,
+    request: Any = None,
+    settings: Any = None,
+    criteria: Optional[Dict[str, Any]] = None,
+    body: Optional[Dict[str, Any]] = None,
+    limit: int = 10,
+    mode: str = "",
+) -> List[Dict[str, Any]]:
+    payload = await build_top10_rows(
+        engine=engine,
+        request=request,
+        settings=settings,
+        criteria=criteria,
+        body=body,
+        limit=limit,
+        mode=mode,
+    )
     rows = payload.get("rows")
     return rows if isinstance(rows, list) else []
 
@@ -1269,6 +1651,7 @@ __all__ = [
     "select_top10_symbols",
     "build_top10_rows",
     "build_top10_output_rows",
+    "build_rows",
     "build_top_10_investments_rows",
     "build_top10_investments_rows",
     "build_top_10_rows",
