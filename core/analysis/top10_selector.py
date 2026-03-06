@@ -2,30 +2,28 @@
 # core/analysis/top10_selector.py
 """
 ================================================================================
-Top 10 Selector — v2.0.0 (LIVE-QUOTES / ONE SOURCE OF TRUTH / SCHEMA-ALIGNED)
+Top 10 Selector — v2.1.0 (GREEN OUTPUT + PCT-FRACTION NORMALIZATION)
 ================================================================================
 Tadawul Fast Bridge (TFB)
 
-Why this revision (Phase C / Script #4):
-- Advisor-based Top10 was failing due to snapshot dependency.
-- Your working Top10 today comes from /quotes (live), not cached snapshots.
-- We need ONE algorithm that works across phases and avoids missing/blank outputs.
-
-This module is now the SINGLE source of truth for Top10:
-- ✅ Universe → fetch rows via engine LIVE quotes (NOT snapshot-only)
-- ✅ Rank using expected ROI + confidence + optional liquidity
-- ✅ Output rows aligned to Top_10_Investments schema (80 canonical + 3 extras)
-- ✅ Startup-safe: no network I/O at import time
+Why this revision (fix “❌ red X / not green” symptom)
+- ✅ Ensures Top_10_Investments rows are “sheet-friendly”:
+    - Always fills key decision fields when possible:
+        current_price, expected_roi_* , forecast_confidence, recommendation, last_updated_riyadh
+    - Normalizes ALL pct-typed fields to FRACTIONS (0.25 == 25%) based on schema dtype="pct"
+      (prevents wrong formats / downstream completeness checks).
+- ✅ Keeps LIVE quotes as the primary data source (no snapshot dependency).
+- ✅ Never raises due to missing fields: safe defaults + warnings in meta.
 
 Primary public APIs:
 - select_top10_symbols(engine, criteria, limit=10) -> List[str]
 - build_top10_rows(engine, criteria, limit=10) -> Dict payload {headers, keys, rows, meta}
-- select_top10(engine, criteria) -> (candidates, meta)   (internal use ok)
+- select_top10(engine, criteria) -> (candidates, meta)
 
 Notes:
-- We respect your spec: Investment period is always in DAYS, mapped to 1M/3M/12M.
-- We do best-effort parsing: works with multiple engine method names/signatures.
-- No raising due to missing fields: safe defaults + warnings in output.
+- Investment period is always in DAYS, mapped to 1M/3M/12M.
+- Best-effort parsing: works with multiple engine method names/signatures.
+- No network I/O at import time.
 
 ================================================================================
 """
@@ -42,12 +40,12 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 logger = logging.getLogger("core.analysis.top10_selector")
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "2.0.0"
+TOP10_SELECTOR_VERSION = "2.1.0"
 RIYADH_TZ = timezone(timedelta(hours=3))
 
 
@@ -148,11 +146,8 @@ def _json_dumps_safe(obj: Any) -> str:
 
 
 async def _maybe_await(v: Any) -> Any:
-    try:
-        if hasattr(v, "__await__"):
-            return await v  # type: ignore[misc]
-    except Exception:
-        pass
+    if inspect.isawaitable(v):
+        return await v
     return v
 
 
@@ -296,7 +291,6 @@ def load_criteria_best_effort(engine: Any) -> Criteria:
       2) parse from Insights_Analysis snapshot top-block (heuristic)
       3) defaults
     """
-    # 1) criteria_model helper
     try:
         from core.analysis.criteria_model import read_criteria_from_insights  # type: ignore
 
@@ -306,7 +300,6 @@ def load_criteria_best_effort(engine: Any) -> Criteria:
     except Exception:
         pass
 
-    # 2) heuristic parse from snapshot (best-effort; no longer required)
     try:
         snap = _get_snapshot(engine, "Insights_Analysis")
         d2 = _parse_insights_top_block(snap)
@@ -315,7 +308,6 @@ def load_criteria_best_effort(engine: Any) -> Criteria:
     except Exception:
         pass
 
-    # 3) defaults
     return Criteria(
         pages_selected=["Market_Leaders", "Global_Markets", "Mutual_Funds", "Commodities_FX", "My_Portfolio"],
         invest_period_days=90,
@@ -341,7 +333,6 @@ def _normalize_symbol(sym: str) -> str:
         s = s.split(":", 1)[1].strip()
     if s.endswith(".SA"):
         s = s[:-3] + ".SR"
-    # if numeric KSA code, force .SR
     if s.isdigit() and 3 <= len(s) <= 6:
         return f"{s}.SR"
     return s
@@ -352,7 +343,6 @@ def _eligible_pages(criteria: Criteria) -> List[str]:
     if not pages_in:
         pages_in = ["Market_Leaders", "Global_Markets", "Mutual_Funds", "Commodities_FX", "My_Portfolio"]
 
-    # normalize via page_catalog if available
     try:
         from core.sheets.page_catalog import normalize_page_name  # type: ignore
 
@@ -369,7 +359,6 @@ def _eligible_pages(criteria: Criteria) -> List[str]:
     blocked = {"Insights_Analysis", "Data_Dictionary", "Top_10_Investments", "Top10_Investments"}
     pages_in = [p for p in pages_in if p and p not in blocked]
 
-    # de-dupe preserve order
     seen: Set[str] = set()
     out: List[str] = []
     for p in pages_in:
@@ -396,10 +385,6 @@ def _get_snapshot(engine: Any, page: str) -> Optional[Dict[str, Any]]:
 
 
 async def _get_universe_symbols_live(engine: Any, page: str, *, limit: int = 5000) -> List[str]:
-    """
-    Preferred: ask engine for symbols from sheet configuration (no snapshots).
-    Supports multiple method names/signatures across phases.
-    """
     if engine is None:
         return []
 
@@ -435,7 +420,6 @@ async def _get_universe_symbols_live(engine: Any, page: str, *, limit: int = 500
             syms = [_normalize_symbol(_safe_str(x)) for x in out["symbols"]]
             return [s for s in syms if s]
 
-    # fallback: if engine exposes a sheet reader
     fn2 = getattr(engine, "symbols_reader", None)
     if fn2 is not None and hasattr(fn2, "get_symbols_for_sheet"):
         try:
@@ -451,18 +435,16 @@ async def _get_universe_symbols_live(engine: Any, page: str, *, limit: int = 500
 
 
 async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "") -> Dict[str, Dict[str, Any]]:
-    """
-    LIVE quotes fetch (best-effort):
-      returns {symbol: rowdict}
-    """
     if not engine or not symbols:
         return {}
 
-    # best: batch
     fn = getattr(engine, "get_enriched_quotes_batch", None)
     if callable(fn):
         try:
-            res = fn(symbols, mode=mode or "")
+            try:
+                res = fn(symbols, mode=mode or "")
+            except TypeError:
+                res = fn(symbols)
             res = await _maybe_await(res)
             if isinstance(res, dict):
                 out: Dict[str, Dict[str, Any]] = {}
@@ -472,7 +454,6 @@ async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "") 
         except Exception:
             pass
 
-    # next: list batch
     fn2 = getattr(engine, "get_enriched_quotes", None)
     if callable(fn2):
         try:
@@ -486,7 +467,6 @@ async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "") 
         except Exception:
             pass
 
-    # per symbol
     out3: Dict[str, Dict[str, Any]] = {}
     fn3 = getattr(engine, "get_enriched_quote_dict", None)
     fn4 = getattr(engine, "get_enriched_quote", None) or getattr(engine, "get_quote", None)
@@ -507,10 +487,6 @@ async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "") 
 # Snapshot parsing (fallback only)
 # -----------------------------------------------------------------------------
 def _parse_insights_top_block(snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Heuristic: the top block is often key/value pairs in col A/B.
-    We scan first ~50 rows.
-    """
     if not snapshot or not isinstance(snapshot, dict):
         return {}
     rows = snapshot.get("rows")
@@ -518,7 +494,6 @@ def _parse_insights_top_block(snapshot: Optional[Dict[str, Any]]) -> Dict[str, A
         return {}
 
     out: Dict[str, Any] = {}
-
     for r in rows[:50]:
         if not isinstance(r, (list, tuple)) or len(r) < 2:
             continue
@@ -550,10 +525,10 @@ def _parse_insights_top_block(snapshot: Optional[Dict[str, Any]]) -> Dict[str, A
 class Candidate:
     symbol: str
     source_page: str
-    roi: float
-    confidence: float
-    overall_score: float
-    risk_score: float
+    roi: float  # FRACTION
+    confidence: float  # 0..1
+    overall_score: float  # 0..100
+    risk_score: float  # 0..100
     volume: float
     row: Dict[str, Any]
 
@@ -574,7 +549,6 @@ def _risk_from_bucket(bucket: str) -> float:
 
 
 def _get_confidence(d: Dict[str, Any]) -> float:
-    # prefer forecast_confidence, fallback to confidence_score
     v = d.get("forecast_confidence", None)
     if v is None:
         v = d.get("confidence_score", None)
@@ -586,7 +560,6 @@ def _get_confidence(d: Dict[str, Any]) -> float:
 def _get_overall_score(d: Dict[str, Any]) -> float:
     v = d.get("overall_score", None)
     if v is None:
-        # fallback: opportunity_score if present
         v = d.get("opportunity_score", None)
     f = _safe_float(v, 0.0) or 0.0
     f = float(f * 100.0) if 0.0 < f <= 1.5 else float(f)
@@ -608,18 +581,11 @@ def _get_volume(d: Dict[str, Any]) -> float:
     return max(0.0, float(f))
 
 
-def _extract_candidate_from_quote(
-    *,
-    sym: str,
-    page: str,
-    quote: Dict[str, Any],
-    horizon: str,
-) -> Optional[Candidate]:
+def _extract_candidate_from_quote(*, sym: str, page: str, quote: Dict[str, Any], horizon: str) -> Optional[Candidate]:
     roi_key = horizon_to_roi_key(horizon)
+
+    # ROI must exist. Normalize to FRACTION.
     roi = _as_fraction(quote.get(roi_key))
-    if roi is None:
-        # sometimes engines return ROI in percent (e.g. 12.3 instead of 0.123)
-        roi = _as_fraction(quote.get(roi_key.replace("_", " ")))
     if roi is None:
         return None
 
@@ -628,7 +594,6 @@ def _extract_candidate_from_quote(
     risk = _get_risk_score(quote)
     vol = _get_volume(quote)
 
-    # keep quote dict minimal but include canonical keys if present
     row = dict(quote)
     row["symbol"] = sym
     row["source_page"] = page
@@ -649,8 +614,6 @@ def _extract_candidate_from_quote(
 # Ranking logic (ROI primary; tie-break confidence; optional liquidity; then score)
 # -----------------------------------------------------------------------------
 def _rank_key(c: Candidate, *, use_liquidity: bool) -> Tuple[float, float, float, float]:
-    # ROI biggest, then confidence, then liquidity (volume), then overall_score
-    # volume is only applied if enabled; else 0
     vol = c.volume if use_liquidity else 0.0
     return (c.roi, c.confidence, vol, c.overall_score)
 
@@ -659,14 +622,9 @@ def _rank_key(c: Candidate, *, use_liquidity: bool) -> Tuple[float, float, float
 # Optional enrichment for final Top-N (fill missing keys)
 # -----------------------------------------------------------------------------
 async def _enrich_top(engine: Any, symbols: List[str], *, mode: str = "") -> Dict[str, Dict[str, Any]]:
-    """
-    Enrich final Top-N to maximize completeness (best-effort).
-    We try batch first; then per-symbol.
-    """
     if engine is None or not symbols:
         return {}
 
-    # batch again (cheap + consistent)
     try:
         res = await _fetch_quotes_map(engine, symbols, mode=mode or "")
         if isinstance(res, dict) and res:
@@ -690,8 +648,7 @@ async def _enrich_top(engine: Any, symbols: List[str], *, mode: str = "") -> Dic
         async with sem:
             try:
                 r = fn(sym)
-                if inspect.isawaitable(r):
-                    r = await r
+                r = await _maybe_await(r)
                 out[sym] = _to_payload(r)
             except Exception:
                 out[sym] = {"symbol": sym, "warnings": "enrich_failed"}
@@ -701,12 +658,9 @@ async def _enrich_top(engine: Any, symbols: List[str], *, mode: str = "") -> Dic
 
 
 # -----------------------------------------------------------------------------
-# Core selection (LIVE quotes is primary; snapshots only as last resort)
+# Core selection (LIVE quotes primary; snapshots only as last resort)
 # -----------------------------------------------------------------------------
 async def select_top10(*, engine: Any, criteria: Criteria, mode: str = "") -> Tuple[List[Candidate], Dict[str, Any]]:
-    """
-    Returns (top_candidates, meta).
-    """
     t0 = time.time()
     horizon = criteria.horizon()
     roi_key = horizon_to_roi_key(horizon)
@@ -715,17 +669,14 @@ async def select_top10(*, engine: Any, criteria: Criteria, mode: str = "") -> Tu
     per_page_limit = max(50, int(os.getenv("TOP10_UNIVERSE_LIMIT_PER_PAGE", "500") or "500"))
     per_page_limit = max(50, min(5000, per_page_limit))
 
-    # Build universe symbols (LIVE)
-    universe: List[Tuple[str, str]] = []  # (symbol, source_page)
+    universe: List[Tuple[str, str]] = []
     warnings: List[str] = []
 
     for page in pages:
         syms = await _get_universe_symbols_live(engine, page, limit=per_page_limit)
         if not syms:
-            # fallback: snapshots (last resort)
             snap = _get_snapshot(engine, page)
             if isinstance(snap, dict) and isinstance(snap.get("rows"), list):
-                # try to find symbol column
                 hdrs = snap.get("headers") or []
                 rows = snap.get("rows") or []
                 if isinstance(hdrs, list) and hdrs:
@@ -750,7 +701,6 @@ async def select_top10(*, engine: Any, criteria: Criteria, mode: str = "") -> Tu
         for s in syms:
             universe.append((s, page))
 
-    # Dedup universe by symbol preserving first source_page
     seen_u: Set[str] = set()
     universe_dedup: List[Tuple[str, str]] = []
     for s, p in universe:
@@ -761,7 +711,6 @@ async def select_top10(*, engine: Any, criteria: Criteria, mode: str = "") -> Tu
     symbols = [s for s, _ in universe_dedup]
     source_map = {s: p for s, p in universe_dedup}
 
-    # Safety: if universe is empty, return clean result
     if not symbols:
         meta = {
             "version": TOP10_SELECTOR_VERSION,
@@ -772,6 +721,7 @@ async def select_top10(*, engine: Any, criteria: Criteria, mode: str = "") -> Tu
             "universe_symbols": 0,
             "candidates": 0,
             "returned": 0,
+            "build_status": "WARN",
             "warnings": warnings or ["universe_empty_all_pages"],
             "timestamp_utc": _now_utc_iso(),
             "timestamp_riyadh": _now_riyadh_iso(),
@@ -779,7 +729,6 @@ async def select_top10(*, engine: Any, criteria: Criteria, mode: str = "") -> Tu
         }
         return [], meta
 
-    # Fetch LIVE quotes for universe (batch)
     qmap = await _fetch_quotes_map(engine, symbols, mode=mode or "")
 
     candidates: List[Candidate] = []
@@ -791,7 +740,6 @@ async def select_top10(*, engine: Any, criteria: Criteria, mode: str = "") -> Tu
         if cand is None:
             continue
 
-        # filters
         if criteria.min_expected_roi is not None and cand.roi < float(criteria.min_expected_roi):
             continue
 
@@ -806,13 +754,10 @@ async def select_top10(*, engine: Any, criteria: Criteria, mode: str = "") -> Tu
 
         candidates.append(cand)
 
-    # Deduplicate by symbol (keep best by rank key)
     best: Dict[str, Candidate] = {}
     for c in candidates:
         prev = best.get(c.symbol)
-        if prev is None or _rank_key(c, use_liquidity=criteria.use_liquidity_tiebreak) > _rank_key(
-            prev, use_liquidity=criteria.use_liquidity_tiebreak
-        ):
+        if prev is None or _rank_key(c, use_liquidity=criteria.use_liquidity_tiebreak) > _rank_key(prev, use_liquidity=criteria.use_liquidity_tiebreak):
             best[c.symbol] = c
 
     deduped = list(best.values())
@@ -821,7 +766,6 @@ async def select_top10(*, engine: Any, criteria: Criteria, mode: str = "") -> Tu
     top_n = max(1, int(criteria.top_n or 10))
     top = deduped[:top_n]
 
-    # Optional enrich top to fill missing keys (live again)
     enrich_map: Dict[str, Dict[str, Any]] = {}
     if criteria.enrich_final and top:
         try:
@@ -833,7 +777,7 @@ async def select_top10(*, engine: Any, criteria: Criteria, mode: str = "") -> Tu
         e = enrich_map.get(c.symbol)
         if isinstance(e, dict) and e:
             merged = dict(c.row)
-            merged.update(e)  # enrichment wins
+            merged.update(e)
             merged["symbol"] = c.symbol
             merged["source_page"] = c.source_page
             c.row = merged
@@ -849,6 +793,7 @@ async def select_top10(*, engine: Any, criteria: Criteria, mode: str = "") -> Tu
         "candidates": len(candidates),
         "deduped": len(deduped),
         "returned": len(top),
+        "build_status": "OK" if len(top) > 0 else "WARN",
         "filters": {
             "min_expected_roi": criteria.min_expected_roi,
             "max_risk_score": criteria.max_risk_score,
@@ -868,45 +813,120 @@ async def select_top10(*, engine: Any, criteria: Criteria, mode: str = "") -> Tu
 # -----------------------------------------------------------------------------
 # Schema-aligned output for Top_10_Investments (83 columns)
 # -----------------------------------------------------------------------------
-def _get_top10_schema() -> Tuple[List[str], List[str], str]:
+def _get_top10_schema() -> Tuple[List[str], List[str], Set[str], str]:
     """
-    Returns (headers, keys, schema_source) for Top_10_Investments.
-    If schema_registry missing, returns safe fallback keys.
+    Returns (headers, keys, pct_keys, schema_source) for Top_10_Investments.
+    pct_keys are derived from schema dtype='pct' (best-effort).
     """
     try:
         from core.sheets.schema_registry import get_sheet_spec  # type: ignore
 
         spec = get_sheet_spec("Top_10_Investments")
         cols = getattr(spec, "columns", None) or []
-        headers = [str(getattr(c, "header")) for c in cols if str(getattr(c, "header", "")).strip() and str(getattr(c, "key", "")).strip()]
-        keys = [str(getattr(c, "key")) for c in cols if str(getattr(c, "header", "")).strip() and str(getattr(c, "key", "")).strip()]
+
+        headers: List[str] = []
+        keys: List[str] = []
+        pct_keys: Set[str] = set()
+
+        for c in cols:
+            h = _safe_str(getattr(c, "header", ""))
+            k = _safe_str(getattr(c, "key", ""))
+            if not h or not k:
+                continue
+            headers.append(h)
+            keys.append(k)
+
+            dt = _safe_str(getattr(c, "dtype", "")).lower()
+            if dt in {"pct", "percent", "percentage"}:
+                pct_keys.add(k)
+
         if headers and keys and len(headers) == len(keys):
-            return headers, keys, "schema_registry.get_sheet_spec"
+            return headers, keys, pct_keys, "schema_registry.get_sheet_spec"
     except Exception:
         pass
 
-    # fallback: minimal canonical + extras (still 83? no — but route should prefer registry)
-    # We keep it stable enough to not crash. Best practice is schema_registry present.
-    keys = ["symbol", "name", "current_price", "expected_roi_3m", "forecast_confidence", "risk_score", "overall_score", "top10_rank", "selection_reason", "criteria_snapshot"]
-    headers = ["Symbol", "Name", "Current Price", "Expected ROI 3M", "Forecast Confidence", "Risk Score", "Overall Score", "Top10 Rank", "Selection Reason", "Criteria Snapshot"]
-    return headers, keys, "fallback_minimal"
+    keys = [
+        "symbol",
+        "name",
+        "current_price",
+        "expected_roi_3m",
+        "forecast_confidence",
+        "risk_score",
+        "overall_score",
+        "recommendation",
+        "last_updated_riyadh",
+        "top10_rank",
+        "selection_reason",
+        "criteria_snapshot",
+    ]
+    headers = [
+        "Symbol",
+        "Name",
+        "Current Price",
+        "Expected ROI 3M",
+        "Forecast Confidence",
+        "Risk Score",
+        "Overall Score",
+        "Recommendation",
+        "Last Updated (Riyadh)",
+        "Top10 Rank",
+        "Selection Reason",
+        "Criteria Snapshot",
+    ]
+    pct_keys = {"expected_roi_1m", "expected_roi_3m", "expected_roi_12m"}
+    return headers, keys, pct_keys, "fallback_minimal"
 
 
 def _project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
     return {k: row.get(k, None) for k in keys}
 
 
-def build_top10_output_rows(
-    candidates: List[Candidate],
-    *,
-    criteria: Criteria,
-    mode: str = "",
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def _normalize_pct_fields_inplace(raw: Dict[str, Any], pct_keys: Set[str]) -> None:
     """
-    Builds Top_10_Investments rows aligned to schema_registry keys.
-    Returns (rows, meta).
+    For schema pct keys, enforce FRACTION values (0.25 == 25%).
+    Only converts when value is present.
     """
-    headers, keys, schema_source = _get_top10_schema()
+    for k in pct_keys or set():
+        if k not in raw:
+            continue
+        v = raw.get(k)
+        if v is None:
+            continue
+        f = _as_fraction(v)
+        if f is not None:
+            raw[k] = float(f)
+
+
+def _ensure_recommendation(raw: Dict[str, Any], roi_key: str) -> None:
+    """
+    Fill recommendation if missing (prevents blank => red X in some sheet rules).
+    """
+    if _safe_str(raw.get("recommendation", "")).strip():
+        return
+
+    roi = _as_fraction(raw.get(roi_key))
+    conf = _safe_float(raw.get("forecast_confidence"), None)
+    if conf is not None:
+        conf = float(conf / 100.0) if conf > 1.5 else float(conf)
+        conf = _clamp(conf, 0.0, 1.0)
+
+    # Very simple heuristic (non-binding)
+    if roi is None:
+        raw["recommendation"] = "HOLD"
+        return
+
+    if conf is not None and conf >= 0.75 and roi >= 0.25:
+        raw["recommendation"] = "STRONG_BUY"
+    elif roi >= 0.15:
+        raw["recommendation"] = "BUY"
+    elif roi >= 0.05:
+        raw["recommendation"] = "HOLD"
+    else:
+        raw["recommendation"] = "HOLD"
+
+
+def build_top10_output_rows(candidates: List[Candidate], *, criteria: Criteria, mode: str = "") -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    headers, keys, pct_keys, schema_source = _get_top10_schema()
     horizon = criteria.horizon()
     roi_key = horizon_to_roi_key(horizon)
 
@@ -931,16 +951,20 @@ def build_top10_output_rows(
     for i, c in enumerate(candidates, start=1):
         raw = dict(c.row or {})
 
-        # ensure canonical basics exist
+        # Canonical basics
         raw["symbol"] = c.symbol
-        raw.setdefault("name", raw.get("company_name") or raw.get("long_name") or raw.get("instrument_name"))
+        raw.setdefault("name", raw.get("company_name") or raw.get("long_name") or raw.get("instrument_name") or "")
         raw.setdefault("current_price", raw.get("price") or raw.get("last") or raw.get("close"))
         raw.setdefault("risk_score", c.risk_score)
         raw.setdefault("overall_score", c.overall_score)
         raw.setdefault("forecast_confidence", c.confidence)
-        raw.setdefault(roi_key, c.roi)
 
-        # Top10 extras (schema_registry v2.1.1 expects these keys)
+        # ROI: enforce as FRACTION
+        raw[roi_key] = _as_fraction(raw.get(roi_key)) if raw.get(roi_key) is not None else c.roi
+        if raw.get(roi_key) is None:
+            raw[roi_key] = c.roi
+
+        # Top10 extras
         raw["top10_rank"] = i
         raw["selection_reason"] = (
             f"Ranked by {roi_key} then confidence"
@@ -954,12 +978,19 @@ def build_top10_output_rows(
         raw.setdefault("last_updated_utc", raw.get("last_updated_utc") or _now_utc_iso())
         raw.setdefault("last_updated_riyadh", raw.get("last_updated_riyadh") or _now_riyadh_iso())
 
+        # Ensure recommendation is not blank
+        _ensure_recommendation(raw, roi_key)
+
+        # Normalize pct dtype keys to FRACTION
+        _normalize_pct_fields_inplace(raw, pct_keys)
+
         out.append(_project_row(keys, raw))
 
     meta = {
         "schema_source": schema_source,
         "headers_len": len(headers),
         "keys_len": len(keys),
+        "pct_keys_len": len(pct_keys),
         "horizon": horizon,
         "roi_key": roi_key,
         "rows": len(out),
@@ -972,10 +1003,6 @@ def build_top10_output_rows(
 # Convenience public APIs (used by routes / insights_builder)
 # -----------------------------------------------------------------------------
 async def select_top10_symbols(*, engine: Any, criteria: Optional[Dict[str, Any]] = None, limit: int = 10, mode: str = "") -> List[str]:
-    """
-    Convenience: returns Top10 symbols only.
-    Used by Insights Builder (auto universe) and routes/top10_investments.py.
-    """
     crit = _criteria_from_dict(criteria or {})
     crit.top_n = max(1, min(50, int(limit or crit.top_n or 10)))
     top, _meta = await select_top10(engine=engine, criteria=crit, mode=mode or "")
@@ -983,16 +1010,12 @@ async def select_top10_symbols(*, engine: Any, criteria: Optional[Dict[str, Any]
 
 
 async def build_top10_rows(*, engine: Any, criteria: Optional[Dict[str, Any]] = None, limit: int = 10, mode: str = "") -> Dict[str, Any]:
-    """
-    Builds full schema-aligned payload for Top_10_Investments:
-      {status, page, headers, keys, rows, meta}
-    """
     crit = _criteria_from_dict(criteria or {})
     crit.top_n = max(1, min(50, int(limit or crit.top_n or 10)))
 
     top, meta_sel = await select_top10(engine=engine, criteria=crit, mode=mode or "")
     rows, meta_rows = build_top10_output_rows(top, criteria=crit, mode=mode or "")
-    headers, keys, _schema_source = _get_top10_schema()
+    headers, keys, _pct_keys, _schema_source = _get_top10_schema()
 
     return {
         "status": "success",
