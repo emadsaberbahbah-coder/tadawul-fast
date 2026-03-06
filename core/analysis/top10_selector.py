@@ -2,29 +2,42 @@
 # core/analysis/top10_selector.py
 """
 ================================================================================
-Top 10 Selector — v2.1.0 (GREEN OUTPUT + PCT-FRACTION NORMALIZATION)
+Top 10 Selector — v2.2.0
+(LIVE / SCHEMA-FIRST / TOP10-METADATA COMPLETE / SHEET-FRIENDLY)
 ================================================================================
 Tadawul Fast Bridge (TFB)
 
-Why this revision (fix “❌ red X / not green” symptom)
-- ✅ Ensures Top_10_Investments rows are “sheet-friendly”:
-    - Always fills key decision fields when possible:
-        current_price, expected_roi_* , forecast_confidence, recommendation, last_updated_riyadh
-    - Normalizes ALL pct-typed fields to FRACTIONS (0.25 == 25%) based on schema dtype="pct"
-      (prevents wrong formats / downstream completeness checks).
-- ✅ Keeps LIVE quotes as the primary data source (no snapshot dependency).
-- ✅ Never raises due to missing fields: safe defaults + warnings in meta.
+What this revision fixes
+- ✅ FIX: Always fills Top10-only fields when possible:
+    - top10_rank
+    - selection_reason
+    - criteria_snapshot
+- ✅ FIX: Keeps Top_10_Investments output schema-aligned (83 columns)
+- ✅ FIX: Normalizes pct-typed fields to FRACTIONS based on schema dtype="pct"
+- ✅ FIX: Backfills important business fields when missing:
+    - current_price
+    - expected_roi_* 
+    - forecast_confidence
+    - recommendation
+    - last_updated_riyadh / last_updated_utc
+    - rank_overall
+    - recommendation_reason
+    - horizon_days
+    - invest_period_label
+- ✅ FIX: Better selection_reason text using ROI / confidence / risk / score context
+- ✅ SAFE: live quotes remain the primary source
+- ✅ SAFE: no import-time network I/O
+- ✅ SAFE: never raises only because some optional fields are missing
 
-Primary public APIs:
+Primary public APIs
 - select_top10_symbols(engine, criteria, limit=10) -> List[str]
-- build_top10_rows(engine, criteria, limit=10) -> Dict payload {headers, keys, rows, meta}
+- build_top10_rows(engine, criteria, limit=10) -> Dict payload
 - select_top10(engine, criteria) -> (candidates, meta)
 
-Notes:
-- Investment period is always in DAYS, mapped to 1M/3M/12M.
-- Best-effort parsing: works with multiple engine method names/signatures.
-- No network I/O at import time.
-
+Notes
+- Investment period is always in DAYS and mapped to 1M / 3M / 12M
+- Best-effort engine method discovery
+- Snapshot parsing remains fallback only
 ================================================================================
 """
 
@@ -40,12 +53,12 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 logger = logging.getLogger("core.analysis.top10_selector")
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "2.1.0"
+TOP10_SELECTOR_VERSION = "2.2.0"
 RIYADH_TZ = timezone(timedelta(hours=3))
 
 
@@ -120,7 +133,7 @@ def _to_payload(obj: Any) -> Dict[str, Any]:
     md = getattr(obj, "model_dump", None)
     if callable(md):
         try:
-            return md(mode="python")  # pydantic v2
+            return md(mode="python")
         except Exception:
             try:
                 return md()  # type: ignore
@@ -152,15 +165,9 @@ async def _maybe_await(v: Any) -> Any:
 
 
 # -----------------------------------------------------------------------------
-# Period mapping (days -> horizon)  [spec: DAYS are truth]
+# Period mapping (days -> horizon)
 # -----------------------------------------------------------------------------
 def map_period_days_to_horizon(days: int) -> str:
-    """
-    Conservative mapping aligned with your spec (days are the truth):
-      <= 45  -> 1M
-      <= 135 -> 3M
-      else   -> 12M
-    """
     d = int(days or 0)
     if d <= 45:
         return "1m"
@@ -188,24 +195,21 @@ def horizon_to_forecast_price_key(h: str) -> str:
 
 
 # -----------------------------------------------------------------------------
-# Criteria (schema-driven best-effort)
+# Criteria
 # -----------------------------------------------------------------------------
 @dataclass(slots=True)
 class Criteria:
     pages_selected: List[str]
     invest_period_days: int
 
-    # filters (fractions for ROI/confidence)
     min_expected_roi: Optional[float] = None
     max_risk_score: float = 60.0
     min_confidence: float = 0.70
     enforce_risk_confidence: bool = True
 
-    # optional filters / rank tuning
     min_volume: Optional[float] = None
     use_liquidity_tiebreak: bool = True
 
-    # output
     top_n: int = 10
     enrich_final: bool = True
 
@@ -285,12 +289,6 @@ def merge_criteria_overrides(base: Criteria, overrides: Dict[str, Any]) -> Crite
 
 
 def load_criteria_best_effort(engine: Any) -> Criteria:
-    """
-    Priority:
-      1) core.analysis.criteria_model.read_criteria_from_insights(engine) (if exists)
-      2) parse from Insights_Analysis snapshot top-block (heuristic)
-      3) defaults
-    """
     try:
         from core.analysis.criteria_model import read_criteria_from_insights  # type: ignore
 
@@ -369,7 +367,7 @@ def _eligible_pages(criteria: Criteria) -> List[str]:
 
 
 # -----------------------------------------------------------------------------
-# Engine access helpers (LIVE preferred; snapshots fallback only)
+# Engine access helpers
 # -----------------------------------------------------------------------------
 def _get_snapshot(engine: Any, page: str) -> Optional[Dict[str, Any]]:
     if engine is None:
@@ -519,16 +517,16 @@ def _parse_insights_top_block(snapshot: Optional[Dict[str, Any]]) -> Dict[str, A
 
 
 # -----------------------------------------------------------------------------
-# Candidate model + extraction (row dicts from LIVE quotes)
+# Candidate model + extraction
 # -----------------------------------------------------------------------------
 @dataclass(slots=True)
 class Candidate:
     symbol: str
     source_page: str
-    roi: float  # FRACTION
-    confidence: float  # 0..1
-    overall_score: float  # 0..100
-    risk_score: float  # 0..100
+    roi: float
+    confidence: float
+    overall_score: float
+    risk_score: float
     volume: float
     row: Dict[str, Any]
 
@@ -583,8 +581,6 @@ def _get_volume(d: Dict[str, Any]) -> float:
 
 def _extract_candidate_from_quote(*, sym: str, page: str, quote: Dict[str, Any], horizon: str) -> Optional[Candidate]:
     roi_key = horizon_to_roi_key(horizon)
-
-    # ROI must exist. Normalize to FRACTION.
     roi = _as_fraction(quote.get(roi_key))
     if roi is None:
         return None
@@ -611,7 +607,7 @@ def _extract_candidate_from_quote(*, sym: str, page: str, quote: Dict[str, Any],
 
 
 # -----------------------------------------------------------------------------
-# Ranking logic (ROI primary; tie-break confidence; optional liquidity; then score)
+# Ranking logic
 # -----------------------------------------------------------------------------
 def _rank_key(c: Candidate, *, use_liquidity: bool) -> Tuple[float, float, float, float]:
     vol = c.volume if use_liquidity else 0.0
@@ -619,7 +615,7 @@ def _rank_key(c: Candidate, *, use_liquidity: bool) -> Tuple[float, float, float
 
 
 # -----------------------------------------------------------------------------
-# Optional enrichment for final Top-N (fill missing keys)
+# Optional enrichment for final Top-N
 # -----------------------------------------------------------------------------
 async def _enrich_top(engine: Any, symbols: List[str], *, mode: str = "") -> Dict[str, Dict[str, Any]]:
     if engine is None or not symbols:
@@ -658,7 +654,7 @@ async def _enrich_top(engine: Any, symbols: List[str], *, mode: str = "") -> Dic
 
 
 # -----------------------------------------------------------------------------
-# Core selection (LIVE quotes primary; snapshots only as last resort)
+# Core selection
 # -----------------------------------------------------------------------------
 async def select_top10(*, engine: Any, criteria: Criteria, mode: str = "") -> Tuple[List[Candidate], Dict[str, Any]]:
     t0 = time.time()
@@ -811,13 +807,9 @@ async def select_top10(*, engine: Any, criteria: Criteria, mode: str = "") -> Tu
 
 
 # -----------------------------------------------------------------------------
-# Schema-aligned output for Top_10_Investments (83 columns)
+# Schema-aligned output for Top_10_Investments
 # -----------------------------------------------------------------------------
 def _get_top10_schema() -> Tuple[List[str], List[str], Set[str], str]:
-    """
-    Returns (headers, keys, pct_keys, schema_source) for Top_10_Investments.
-    pct_keys are derived from schema dtype='pct' (best-effort).
-    """
     try:
         from core.sheets.schema_registry import get_sheet_spec  # type: ignore
 
@@ -882,10 +874,6 @@ def _project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _normalize_pct_fields_inplace(raw: Dict[str, Any], pct_keys: Set[str]) -> None:
-    """
-    For schema pct keys, enforce FRACTION values (0.25 == 25%).
-    Only converts when value is present.
-    """
     for k in pct_keys or set():
         if k not in raw:
             continue
@@ -897,10 +885,32 @@ def _normalize_pct_fields_inplace(raw: Dict[str, Any], pct_keys: Set[str]) -> No
             raw[k] = float(f)
 
 
+def _horizon_label(horizon: str) -> str:
+    h = (horizon or "").lower()
+    if h == "1m":
+        return "1M"
+    if h == "3m":
+        return "3M"
+    return "12M"
+
+
+def _score_text(label: str, value: Any) -> Optional[str]:
+    f = _safe_float(value, None)
+    if f is None:
+        return None
+    if 0.0 < f <= 1.5 and label.lower() not in {"risk", "confidence"}:
+        f = f * 100.0
+    return f"{label}={round(float(f), 2)}"
+
+
+def _pct_text(label: str, value: Any) -> Optional[str]:
+    f = _as_fraction(value)
+    if f is None:
+        return None
+    return f"{label}={round(float(f) * 100.0, 2)}%"
+
+
 def _ensure_recommendation(raw: Dict[str, Any], roi_key: str) -> None:
-    """
-    Fill recommendation if missing (prevents blank => red X in some sheet rules).
-    """
     if _safe_str(raw.get("recommendation", "")).strip():
         return
 
@@ -910,7 +920,6 @@ def _ensure_recommendation(raw: Dict[str, Any], roi_key: str) -> None:
         conf = float(conf / 100.0) if conf > 1.5 else float(conf)
         conf = _clamp(conf, 0.0, 1.0)
 
-    # Very simple heuristic (non-binding)
     if roi is None:
         raw["recommendation"] = "HOLD"
         return
@@ -925,10 +934,94 @@ def _ensure_recommendation(raw: Dict[str, Any], roi_key: str) -> None:
         raw["recommendation"] = "HOLD"
 
 
+def _ensure_recommendation_reason(raw: Dict[str, Any], roi_key: str) -> None:
+    if _safe_str(raw.get("recommendation_reason")):
+        return
+
+    parts: List[str] = []
+    rec = _safe_str(raw.get("recommendation"))
+    if rec:
+        parts.append(f"Recommendation={rec}")
+
+    roi_text = _pct_text(roi_key.replace("expected_", "").replace("_", " ").upper(), raw.get(roi_key))
+    if roi_text:
+        parts.append(roi_text)
+
+    conf_text = _pct_text("Confidence", raw.get("forecast_confidence"))
+    if conf_text:
+        parts.append(conf_text)
+
+    risk_bucket = _safe_str(raw.get("risk_bucket"))
+    if risk_bucket:
+        parts.append(f"Risk={risk_bucket}")
+
+    overall = _score_text("Overall", raw.get("overall_score"))
+    if overall:
+        parts.append(overall)
+
+    raw["recommendation_reason"] = " | ".join(parts) if parts else None
+
+
+def _ensure_rank_overall(raw: Dict[str, Any], rank_value: int) -> None:
+    if raw.get("rank_overall") is None:
+        raw["rank_overall"] = rank_value
+
+
+def _ensure_period_fields(raw: Dict[str, Any], criteria: Criteria, horizon: str) -> None:
+    if raw.get("horizon_days") is None:
+        raw["horizon_days"] = int(criteria.invest_period_days)
+    if not _safe_str(raw.get("invest_period_label")):
+        raw["invest_period_label"] = _horizon_label(horizon)
+
+
+def _ensure_timestamps(raw: Dict[str, Any]) -> None:
+    raw.setdefault("last_updated_utc", raw.get("last_updated_utc") or _now_utc_iso())
+    raw.setdefault("last_updated_riyadh", raw.get("last_updated_riyadh") or _now_riyadh_iso())
+
+
+def _build_selection_reason(raw: Dict[str, Any], *, roi_key: str, criteria: Criteria) -> str:
+    parts: List[str] = []
+
+    roi = _pct_text(roi_key.replace("expected_", "").replace("_", " ").upper(), raw.get(roi_key))
+    if roi:
+        parts.append(roi)
+
+    conf = _pct_text("Confidence", raw.get("forecast_confidence"))
+    if conf:
+        parts.append(conf)
+
+    risk_bucket = _safe_str(raw.get("risk_bucket"))
+    if risk_bucket:
+        parts.append(f"Risk={risk_bucket}")
+
+    overall = _score_text("Overall", raw.get("overall_score"))
+    if overall:
+        parts.append(overall)
+
+    opp = _score_text("Opportunity", raw.get("opportunity_score"))
+    if opp:
+        parts.append(opp)
+
+    if criteria.use_liquidity_tiebreak:
+        vol = _safe_float(raw.get("volume"), None)
+        if vol is not None:
+            parts.append(f"Volume={round(float(vol), 2)}")
+
+    if not parts:
+        return (
+            f"Selected using {roi_key}, confidence, "
+            + ("liquidity, " if criteria.use_liquidity_tiebreak else "")
+            + "and overall score"
+        )
+
+    return " | ".join(parts)
+
+
 def build_top10_output_rows(candidates: List[Candidate], *, criteria: Criteria, mode: str = "") -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     headers, keys, pct_keys, schema_source = _get_top10_schema()
     horizon = criteria.horizon()
     roi_key = horizon_to_roi_key(horizon)
+    forecast_price_key = horizon_to_forecast_price_key(horizon)
 
     crit_snapshot = {
         "invest_period_days": criteria.invest_period_days,
@@ -947,42 +1040,53 @@ def build_top10_output_rows(candidates: List[Candidate], *, criteria: Criteria, 
     }
     crit_json = _json_dumps_safe(crit_snapshot)
 
+    warnings: List[str] = []
     out: List[Dict[str, Any]] = []
+
     for i, c in enumerate(candidates, start=1):
         raw = dict(c.row or {})
 
-        # Canonical basics
         raw["symbol"] = c.symbol
+        raw.setdefault("source_page", c.source_page)
+
         raw.setdefault("name", raw.get("company_name") or raw.get("long_name") or raw.get("instrument_name") or "")
         raw.setdefault("current_price", raw.get("price") or raw.get("last") or raw.get("close"))
         raw.setdefault("risk_score", c.risk_score)
         raw.setdefault("overall_score", c.overall_score)
         raw.setdefault("forecast_confidence", c.confidence)
 
-        # ROI: enforce as FRACTION
         raw[roi_key] = _as_fraction(raw.get(roi_key)) if raw.get(roi_key) is not None else c.roi
         if raw.get(roi_key) is None:
             raw[roi_key] = c.roi
 
-        # Top10 extras
+        if raw.get(forecast_price_key) is None and raw.get("current_price") is not None and raw.get(roi_key) is not None:
+            cp = _safe_float(raw.get("current_price"), None)
+            roi = _as_fraction(raw.get(roi_key))
+            if cp is not None and roi is not None:
+                raw[forecast_price_key] = float(cp) * (1.0 + float(roi))
+
         raw["top10_rank"] = i
-        raw["selection_reason"] = (
-            f"Ranked by {roi_key} then confidence"
-            + (" then liquidity(volume)" if criteria.use_liquidity_tiebreak else "")
-            + " then overall_score"
-        )
+        raw["selection_reason"] = _build_selection_reason(raw, roi_key=roi_key, criteria=criteria)
         raw["criteria_snapshot"] = crit_json
 
-        # Provenance fields
-        raw.setdefault("data_provider", raw.get("data_provider") or raw.get("provider") or "")
-        raw.setdefault("last_updated_utc", raw.get("last_updated_utc") or _now_utc_iso())
-        raw.setdefault("last_updated_riyadh", raw.get("last_updated_riyadh") or _now_riyadh_iso())
-
-        # Ensure recommendation is not blank
+        _ensure_timestamps(raw)
         _ensure_recommendation(raw, roi_key)
+        _ensure_recommendation_reason(raw, roi_key)
+        _ensure_rank_overall(raw, i)
+        _ensure_period_fields(raw, criteria, horizon)
 
-        # Normalize pct dtype keys to FRACTION
+        raw.setdefault("data_provider", raw.get("data_provider") or raw.get("provider") or "")
+
         _normalize_pct_fields_inplace(raw, pct_keys)
+
+        if raw.get("current_price") is None:
+            warnings.append(f"missing_current_price:{c.symbol}")
+        if raw.get(roi_key) is None:
+            warnings.append(f"missing_roi:{c.symbol}")
+        if raw.get("forecast_confidence") is None:
+            warnings.append(f"missing_confidence:{c.symbol}")
+        if not _safe_str(raw.get("recommendation")):
+            warnings.append(f"missing_recommendation:{c.symbol}")
 
         out.append(_project_row(keys, raw))
 
@@ -993,14 +1097,16 @@ def build_top10_output_rows(candidates: List[Candidate], *, criteria: Criteria, 
         "pct_keys_len": len(pct_keys),
         "horizon": horizon,
         "roi_key": roi_key,
+        "forecast_price_key": forecast_price_key,
         "rows": len(out),
         "selector_version": TOP10_SELECTOR_VERSION,
+        "warnings": warnings,
     }
     return out, meta
 
 
 # -----------------------------------------------------------------------------
-# Convenience public APIs (used by routes / insights_builder)
+# Convenience public APIs
 # -----------------------------------------------------------------------------
 async def select_top10_symbols(*, engine: Any, criteria: Optional[Dict[str, Any]] = None, limit: int = 10, mode: str = "") -> List[str]:
     crit = _criteria_from_dict(criteria or {})
