@@ -2,27 +2,42 @@
 # core/providers/eodhd_provider.py
 """
 ================================================================================
-EODHD Provider — v4.3.0 (GLOBAL-STABLE / RENDER-SAFE / RATIO-SAFE / PRIMARY)
+EODHD Provider — v4.4.0 (GLOBAL PRIMARY / HISTORY+FUNDAMENTALS / SCHEMA-ALIGNED)
 ================================================================================
 
-v4.3.0 upgrades (aligned with core.symbols.normalize v5.2.0)
-- ✅ FIX: Share-class tickers are no longer mis-detected as “already qualified”
-     BRK.B  -> BRK.B.US   (when EODHD_APPEND_EXCHANGE_SUFFIX=true)
-- ✅ Provider-first normalization:
-     - Uses core.symbols.normalize.to_eodhd_symbol(default_exchange=...)
-     - Falls back safely without breaking KSA (.SR) or special symbols (FX/Index/Futures)
-- ✅ Better error reporting:
-     - Distinguishes missing API key vs HTTP errors vs invalid JSON vs not found
-     - Returns error_detail with actionable info (helps DataEngine diagnose)
-- ✅ More schema-aligned patch keys + aliases:
-     current_price, previous_close, day_high, day_low, volume, currency
-     price_change, percent_change, change, change_pct
-     week_52_high/week_52_low/week_52_position_pct
-- ✅ Render-safe: no hard deps on numpy/pandas/scipy/sklearn/etc.
-- ✅ Production-grade HTTP behavior:
-     bounded concurrency + token bucket + full-jitter retries + 429 Retry-After
+Goal (Phase D + EODHD Global Primary)
+- Global pages should use EODHD for: price + history + fundamentals (where available).
+- Only fall back to Yahoo providers when EODHD doesn't have a field.
+- International symbols should be supported across all pages (Global_Markets, Market_Leaders, My_Portfolio, etc.)
 
-Env vars:
+What this provider guarantees
+- ✅ Render-safe (no numpy/pandas/scipy; httpx only)
+- ✅ Async: bounded concurrency + token bucket + jitter retries + 429 Retry-After
+- ✅ Provider-first normalization using core.symbols.normalize.to_eodhd_symbol when available
+- ✅ NEVER returns {} on failure (returns {"error": "..."} patch)
+- ✅ Schema-aligned patch keys (fractions for ratio fields where appropriate):
+  Identity/Profile:
+    name, exchange, currency, country, sector, industry, asset_class
+  Prices/Liquidity:
+    current_price, previous_close, day_high, day_low, volume, market_cap
+    price_change, percent_change (FRACTION), change, change_pct (aliases)
+  52W:
+    week_52_high, week_52_low, week_52_position_pct (FRACTION)
+  Fundamentals/Valuation (best effort):
+    pe_ttm, pb_ratio, ps_ratio, peg_ratio, ev_ebitda, enterprise_value
+    dividend_yield (FRACTION), payout_ratio (FRACTION), roe/roa/net_margin (FRACTION)
+    revenue_growth, earnings_growth (FRACTION where possible)
+  Risk/Stats (computed from EODHD history, if enabled):
+    volatility_90d (FRACTION annualized), max_drawdown_1y (FRACTION),
+    var_95_1d (FRACTION), sharpe_1y (unitless)
+    plus: volatility_30d (FRACTION), volatility_365d (FRACTION)
+
+Endpoints used (EODHD API)
+- real-time/{SYMBOL}
+- fundamentals/{SYMBOL}
+- eod/{SYMBOL}?from=YYYY-MM-DD
+
+Env vars
 - EODHD_API_KEY (or EODHD_API_TOKEN / EODHD_KEY)
 - EODHD_BASE_URL (default: https://eodhistoricaldata.com/api)
 - EODHD_DEFAULT_EXCHANGE (default: US)
@@ -33,12 +48,23 @@ Env vars:
 - EODHD_RETRY_ATTEMPTS (default: 4)
 - EODHD_RETRY_BASE_DELAY (default: 0.6)
 - EODHD_MAX_CONCURRENCY (default: 20)
+
+Feature flags
 - EODHD_ENABLE_FUNDAMENTALS (default: true)
 - EODHD_ENABLE_HISTORY (default: true)
+
+History windows
 - EODHD_HISTORY_DAYS (default: 420)
 - EODHD_HISTORY_WINDOW_52W (default: 252)
+- EODHD_STATS_WINDOW_VAR_DAYS (default: 252)
+- EODHD_STATS_WINDOW_VOL_DAYS (default: 90)
+- EODHD_RISK_FREE_RATE (default: 0.03)   # annual
+
+KSA protection (keep your constraint)
 - KSA_DISALLOW_EODHD (default: false)
-- ALLOW_EODHD_KSA / EODHD_ALLOW_KSA (override)
+- ALLOW_EODHD_KSA / EODHD_ALLOW_KSA overrides (default: false)
+
+================================================================================
 """
 
 from __future__ import annotations
@@ -57,12 +83,13 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 import httpx
 
 logger = logging.getLogger("core.providers.eodhd_provider")
+logger.addHandler(logging.NullHandler())
 
 PROVIDER_NAME = "eodhd"
-PROVIDER_VERSION = "4.3.0"
+PROVIDER_VERSION = "4.4.0"
 
 DEFAULT_BASE_URL = "https://eodhistoricaldata.com/api"
-UA_DEFAULT = "TFB-EODHD/4.3.0 (Render)"
+UA_DEFAULT = "TFB-EODHD/4.4.0 (Render)"
 
 # -----------------------------
 # Optional JSON perf (orjson)
@@ -89,8 +116,8 @@ except Exception:
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
 
-# Accept plain US tickers and dash-share-class (BRK-B). Dot-share-class (BRK.B) is handled by to_eodhd_symbol.
-_US_LIKE_RE = re.compile(r"^[A-Z0-9][A-Z0-9\-_]{0,11}$")
+# Accept plain US tickers and dash-share-class (BRK-B).
+_US_LIKE_RE = re.compile(r"^[A-Z0-9][A-Z0-9\-_]{0,16}$")
 _KSA_RE = re.compile(r"^\d{3,6}\.SR$", re.IGNORECASE)
 
 
@@ -212,7 +239,7 @@ def safe_str(v: Any) -> Optional[str]:
 
 
 def _clean_patch(p: Dict[str, Any]) -> Dict[str, Any]:
-    return {k: v for k, v in (p or {}).items() if v is not None}
+    return {k: v for k, v in (p or {}).items() if v is not None and v != ""}
 
 
 def _frac_from_percentish(v: Any) -> Optional[float]:
@@ -230,8 +257,19 @@ def _frac_from_percentish(v: Any) -> Optional[float]:
     return f
 
 
+def _as_pct_points_from_frac(v: Any) -> Optional[float]:
+    """
+    For sources that might return fractions, convert to percent-points if small.
+    (We generally prefer FRACTIONS in canonical fields; this is for compatibility only.)
+    """
+    f = safe_float(v)
+    if f is None:
+        return None
+    return f * 100.0 if abs(f) <= 1.0 else f
+
+
 # =============================================================================
-# Symbol normalization (GLOBAL fix, aligned with normalize.py v5.2.0)
+# Symbol normalization (GLOBAL, incl. international)
 # =============================================================================
 def normalize_eodhd_symbol(symbol: str) -> str:
     """
@@ -239,18 +277,20 @@ def normalize_eodhd_symbol(symbol: str) -> str:
 
     Preferred:
       - core.symbols.normalize.to_eodhd_symbol(symbol, default_exchange=...)
-        (v5.2.0 correctly handles share-class tickers BRK.B -> BRK.B.US)
+        (handles share-class: BRK.B -> BRK.B.US; international tickers if your normalizer supports them)
     Fallback:
-      - keep KSA (.SR) and already-qualified known formats
-      - for plain US-like tickers: AAPL -> AAPL.US (if append suffix enabled)
-      - do not modify special notations (FX/Index/Futures)
+      - keep KSA (.SR) as-is (blocked by default anyway)
+      - keep already-qualified symbols with suffix >=2 (e.g., AAPL.US, BMW.XETRA)
+      - treat dot-share-class (BRK.B) as unqualified -> append default exchange when enabled
+      - for plain US-like tickers -> append .{default_exchange} when enabled
+      - do not touch special notations (FX/Index/Futures): contains '=', '^', '/'
     """
     s = (symbol or "").strip()
     if not s:
         return ""
     s_up = s.upper()
 
-    # Best: project normalizer (pure python, safe)
+    # Best: project normalizer (safe if exists)
     try:
         from core.symbols.normalize import to_eodhd_symbol as _to_eodhd_symbol  # type: ignore
 
@@ -265,17 +305,16 @@ def normalize_eodhd_symbol(symbol: str) -> str:
     if "=" in s_up or "^" in s_up or "/" in s_up:
         return s_up
 
-    # KSA canonical (basic safety)
+    # KSA canonical
     if s_up.endswith(".SR") and _KSA_RE.match(s_up):
         return s_up
 
-    # If it already looks qualified (has a dot + suffix length >=2)
-    # IMPORTANT: BRK.B is share-class, not qualified.
+    # Already qualified? (has dot + suffix len>=2)
     if "." in s_up:
         base, suf = s_up.rsplit(".", 1)
-        if len(suf) >= 2:  # likely exchange suffix
+        if len(suf) >= 2:
             return s_up
-        # len == 1: treat as share class -> needs exchange suffix if enabled
+        # len == 1: share-class (e.g. BRK.B) -> append exchange suffix if enabled
         if not _append_exchange_suffix():
             return s_up
         return f"{s_up}.{_default_exchange()}"
@@ -384,6 +423,75 @@ class _TokenBucket:
 
 
 # =============================================================================
+# Stats calculations from close series (no numpy)
+# =============================================================================
+def _daily_returns(closes: List[float]) -> List[float]:
+    rets: List[float] = []
+    for i in range(1, len(closes)):
+        p0 = closes[i - 1]
+        p1 = closes[i]
+        if p0 and p0 > 0 and p1 and p1 > 0:
+            rets.append((p1 / p0) - 1.0)
+    return rets
+
+
+def _stdev(x: List[float]) -> Optional[float]:
+    if len(x) < 2:
+        return None
+    m = sum(x) / len(x)
+    var = sum((v - m) ** 2 for v in x) / max(1, len(x) - 1)
+    return math.sqrt(max(0.0, var))
+
+
+def _max_drawdown(closes: List[float]) -> Optional[float]:
+    if len(closes) < 2:
+        return None
+    peak = closes[0]
+    mdd = 0.0
+    for p in closes:
+        if p > peak:
+            peak = p
+        if peak > 0:
+            dd = (p / peak) - 1.0
+            if dd < mdd:
+                mdd = dd
+    return mdd  # negative fraction
+
+
+def _var_95_1d(returns: List[float]) -> Optional[float]:
+    """
+    Historical VaR at 95% for 1-day returns (fraction, positive number for loss threshold).
+    We return abs(5th percentile) if negative.
+    """
+    if len(returns) < 20:
+        return None
+    xs = sorted(returns)
+    idx = int(round(0.05 * (len(xs) - 1)))
+    q = xs[max(0, min(len(xs) - 1, idx))]
+    # VaR is a loss metric; if q is -0.02 => var=0.02
+    return abs(q) if q < 0 else 0.0
+
+
+def _sharpe_1y(returns: List[float], rf_annual: float) -> Optional[float]:
+    if len(returns) < 60:
+        return None
+    mu = sum(returns) / len(returns)
+    sd = _stdev(returns)
+    if sd is None or sd == 0:
+        return None
+    rf_daily = float(rf_annual) / 252.0
+    ex = mu - rf_daily
+    return (ex / sd) * math.sqrt(252.0)
+
+
+def _annualized_vol(returns: List[float]) -> Optional[float]:
+    sd = _stdev(returns)
+    if sd is None:
+        return None
+    return sd * math.sqrt(252.0)
+
+
+# =============================================================================
 # EODHD Client
 # =============================================================================
 class EODHDClient:
@@ -439,7 +547,6 @@ class EODHDClient:
                     r = await self._client.get(url, params=p)
                     sc = int(r.status_code)
 
-                    # 429 rate limit
                     if sc == 429:
                         ra = r.headers.get("Retry-After")
                         wait = float(ra) if ra and ra.replace(".", "", 1).isdigit() else min(15.0, 1.0 + attempt)
@@ -447,9 +554,7 @@ class EODHDClient:
                         await asyncio.sleep(wait)
                         continue
 
-                    # auth errors
                     if sc in (401, 403):
-                        # EODHD sometimes returns JSON error text; keep it short
                         body_hint = ""
                         try:
                             body_hint = (r.text or "")[:160]
@@ -457,7 +562,6 @@ class EODHDClient:
                             body_hint = ""
                         return None, f"HTTP {sc} auth_error {body_hint}".strip()
 
-                    # transient server errors
                     if 500 <= sc < 600:
                         last_err = f"HTTP {sc}"
                         base = self.retry_base_delay * (2 ** (attempt - 1))
@@ -512,14 +616,13 @@ class EODHDClient:
             prev = safe_float(data.get("previousClose"))
             chg = safe_float(data.get("change"))
 
-            # ratio-safe: compute change_pct as FRACTION from close/prev when possible
-            change_pct = None
+            # percent_change as FRACTION
+            change_frac = None
             if close is not None and prev not in (None, 0.0):
-                change_pct = (close / prev) - 1.0
+                change_frac = (close / prev) - 1.0
             else:
-                change_pct = _frac_from_percentish(data.get("change_p"))
+                change_frac = _frac_from_percentish(data.get("change_p"))
 
-            # map schema-aligned aliases
             patch = _clean_patch(
                 {
                     "symbol": sym_raw,
@@ -531,11 +634,11 @@ class EODHDClient:
                     "previous_close": prev,
 
                     "price_change": chg if chg is not None else (close - prev if close is not None and prev is not None else None),
-                    "percent_change": change_pct,
+                    "percent_change": change_frac,  # FRACTION
 
-                    # legacy aliases used by older paths
+                    # legacy aliases
                     "change": chg if chg is not None else (close - prev if close is not None and prev is not None else None),
-                    "change_pct": change_pct,
+                    "change_pct": change_frac,  # FRACTION
 
                     "day_open": safe_float(data.get("open")),
                     "day_high": safe_float(data.get("high")),
@@ -554,7 +657,7 @@ class EODHDClient:
         return await self._sf.do(ck, _do)
 
     # ---------------------------------------------------------------------
-    # Fundamentals
+    # Fundamentals (and classification)
     # ---------------------------------------------------------------------
     async def fetch_fundamentals(self, symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
         sym_raw = (symbol or "").strip().upper()
@@ -579,8 +682,16 @@ class EODHDClient:
             highlights = data.get("Highlights") or {}
             valuation = data.get("Valuation") or {}
             shares = data.get("SharesStats") or {}
+            tech = data.get("Technicals") or {}
 
-            currency = safe_str(general.get("CurrencyCode")) or safe_str(general.get("Currency")) or None
+            currency = safe_str(general.get("CurrencyCode")) or safe_str(general.get("Currency")) or safe_str(highlights.get("Currency")) or None
+
+            # EODHD sometimes returns "CountryName" and "CountryISO"
+            country = safe_str(general.get("CountryISO")) or safe_str(general.get("CountryName")) or None
+            # Some symbols may not have an ISO; keep name if only that exists
+            if country and len(country) > 3:
+                # attempt to keep name as-is; engine can normalize if desired
+                pass
 
             patch = _clean_patch(
                 {
@@ -589,32 +700,46 @@ class EODHDClient:
                     "provider": PROVIDER_NAME,
                     "data_source": PROVIDER_NAME,
 
-                    # identity
-                    "name": safe_str(general.get("Name")),
-                    "exchange": safe_str(general.get("Exchange")),
-                    "country": safe_str(general.get("CountryName")) or safe_str(general.get("CountryISO")),
+                    # identity/classification
+                    "name": safe_str(general.get("Name")) or safe_str(general.get("ShortName")) or safe_str(general.get("LongName")),
+                    "exchange": safe_str(general.get("Exchange")) or safe_str(general.get("PrimaryExchange")),
                     "currency": currency,
+                    "country": country,
                     "sector": safe_str(general.get("Sector")),
-                    "sub_sector": safe_str(general.get("Industry")),
+                    "industry": safe_str(general.get("Industry")),
 
-                    # cap / shares
+                    # profile & cap
                     "market_cap": safe_float(highlights.get("MarketCapitalization")) or safe_float(general.get("MarketCapitalization")),
+                    "enterprise_value": safe_float(highlights.get("EnterpriseValue")) or safe_float(valuation.get("EnterpriseValue")),
                     "shares_outstanding": safe_float(shares.get("SharesOutstanding")),
 
-                    # earnings / valuation
+                    # valuation/fundamentals (schema-aligned names)
                     "eps_ttm": safe_float(highlights.get("EarningsShare")) or safe_float(highlights.get("DilutedEpsTTM")),
                     "pe_ttm": safe_float(valuation.get("TrailingPE")) or safe_float(highlights.get("PERatio")),
                     "forward_pe": safe_float(valuation.get("ForwardPE")),
-                    "pb": safe_float(valuation.get("PriceBookMRQ")) or safe_float(valuation.get("PriceBook")),
-                    "ps": safe_float(valuation.get("PriceSalesTTM")) or safe_float(valuation.get("PriceSales")),
+                    "pb_ratio": safe_float(valuation.get("PriceBookMRQ")) or safe_float(valuation.get("PriceBook")),
+                    "ps_ratio": safe_float(valuation.get("PriceSalesTTM")) or safe_float(valuation.get("PriceSales")),
+                    "peg_ratio": safe_float(valuation.get("PEGRatio")) or safe_float(valuation.get("PegRatio")),
                     "ev_ebitda": safe_float(valuation.get("EnterpriseValueEbitda")) or safe_float(valuation.get("EnterpriseValueEBITDA")),
 
-                    # percent-like fields as FRACTIONS
+                    # keep legacy aliases used by some scorers
+                    "pb": safe_float(valuation.get("PriceBookMRQ")) or safe_float(valuation.get("PriceBook")),
+                    "ps": safe_float(valuation.get("PriceSalesTTM")) or safe_float(valuation.get("PriceSales")),
+                    "peg": safe_float(valuation.get("PEGRatio")) or safe_float(valuation.get("PegRatio")),
+
+                    # ratio fields as FRACTIONS
                     "dividend_yield": _frac_from_percentish(highlights.get("DividendYield")),
                     "payout_ratio": _frac_from_percentish(highlights.get("PayoutRatio")),
                     "roe": _frac_from_percentish(highlights.get("ROE")),
                     "roa": _frac_from_percentish(highlights.get("ROA")),
                     "net_margin": _frac_from_percentish(highlights.get("ProfitMargin")),
+
+                    # growth (often percent-points; normalize to fraction)
+                    "revenue_growth": _frac_from_percentish(highlights.get("RevenueGrowth")),
+                    "earnings_growth": _frac_from_percentish(highlights.get("EarningsGrowth")),
+
+                    # beta (if available)
+                    "beta": safe_float(tech.get("Beta")) or safe_float(highlights.get("Beta")),
 
                     "last_updated_utc": _utc_iso(),
                     "last_updated_riyadh": _riyadh_iso(),
@@ -626,7 +751,7 @@ class EODHDClient:
         return await self._sf.do(ck, _do)
 
     # ---------------------------------------------------------------------
-    # History stats (52W, avg vol, vol, MA, RSI, simple returns)
+    # History stats + risk fields (computed)
     # ---------------------------------------------------------------------
     async def fetch_history_stats(self, symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
         sym_raw = (symbol or "").strip().upper()
@@ -699,56 +824,23 @@ class EODHDClient:
             if len(vols) >= 30:
                 avg_vol_30 = sum(vols[-30:]) / 30.0
 
-            # volatility 30D: stdev of daily returns (FRACTION)
-            vol_30 = None
-            if n >= 31:
-                rets: List[float] = []
-                start = n - 30
-                for i in range(start, n):
-                    if i <= 0:
-                        continue
-                    prev = closes[i - 1]
-                    cur = closes[i]
-                    if prev:
-                        rets.append((cur / prev) - 1.0)
-                if len(rets) >= 5:
-                    m = sum(rets) / len(rets)
-                    vol_30 = math.sqrt(sum((x - m) ** 2 for x in rets) / max(1, (len(rets) - 1)))
+            # returns series for stats
+            rets_all = _daily_returns(closes)
+            rets_1y = rets_all[-min(len(rets_all), 252):] if rets_all else []
+            rets_90 = rets_all[-min(len(rets_all), 90):] if rets_all else []
+            rets_30 = rets_all[-min(len(rets_all), 30):] if rets_all else []
 
-            # moving averages
-            def _ma(k: int) -> Optional[float]:
-                if n < k:
-                    return None
-                return sum(closes[-k:]) / k
+            vol_30 = _annualized_vol(rets_30)  # FRACTION annualized
+            vol_90 = _annualized_vol(rets_90)  # FRACTION annualized
+            vol_1y = _annualized_vol(rets_1y)   # FRACTION annualized
 
-            ma20 = _ma(20)
-            ma50 = _ma(50)
-            ma200 = _ma(200)
+            mdd_1y = _max_drawdown(closes[-min(len(closes), 252):])  # negative fraction
+            var95 = _var_95_1d(rets_1y)
 
-            # RSI 14
-            def _rsi_14() -> Optional[float]:
-                if n < 15:
-                    return None
-                gains = 0.0
-                losses = 0.0
-                for i in range(n - 14, n):
-                    if i <= 0:
-                        continue
-                    d = closes[i] - closes[i - 1]
-                    if d > 0:
-                        gains += d
-                    else:
-                        losses += (-d)
-                avg_gain = gains / 14.0
-                avg_loss = losses / 14.0
-                if avg_loss == 0:
-                    return 100.0
-                rs = avg_gain / avg_loss
-                return 100.0 - (100.0 / (1.0 + rs))
+            rf = _env_float("EODHD_RISK_FREE_RATE", 0.03, lo=0.0, hi=0.20)
+            sharpe = _sharpe_1y(rets_1y, rf_annual=rf)
 
-            rsi14 = _rsi_14()
-
-            # simple returns (FRACTIONS)
+            # simple returns (fractions)
             def _ret(k: int) -> Optional[float]:
                 if n <= k:
                     return None
@@ -770,34 +862,30 @@ class EODHDClient:
                     "provider": PROVIDER_NAME,
                     "data_source": PROVIDER_NAME,
 
-                    # 52W (schema-aligned + aliases)
+                    # 52W
                     "week_52_low": low_52,
                     "week_52_high": high_52,
-                    "week_52_position_pct": pos_52_frac,      # FRACTION 0..1
-                    "low_52w": low_52,                        # alias
-                    "high_52w": high_52,                      # alias
-                    "position_52w_pct": pos_52_frac,          # alias
+                    "week_52_position_pct": pos_52_frac,  # FRACTION 0..1
 
-                    # liquidity / tech
+                    # liquidity/tech
                     "avg_vol_30d": avg_vol_30,
-                    "avg_volume_30d": avg_vol_30,             # alias
-                    "volatility_30d": vol_30,                 # FRACTION
-                    "rsi_14": rsi14,
-                    "ma20": ma20,
-                    "ma50": ma50,
-                    "ma200": ma200,
+                    "avg_volume_30d": avg_vol_30,  # alias
 
-                    # returns (fractions)
+                    # volatility/risk (fractions)
+                    "volatility_30d": vol_30,
+                    "volatility_90d": vol_90,
+                    "volatility_365d": vol_1y,
+
+                    "max_drawdown_1y": mdd_1y,   # negative fraction
+                    "var_95_1d": var95,          # positive fraction loss threshold
+                    "sharpe_1y": sharpe,
+
+                    # returns
                     "returns_1w": returns_1w,
                     "returns_1m": returns_1m,
                     "returns_3m": returns_3m,
                     "returns_6m": returns_6m,
                     "returns_12m": returns_12m,
-                    "return_1w": returns_1w,   # aliases
-                    "return_1m": returns_1m,
-                    "return_3m": returns_3m,
-                    "return_6m": returns_6m,
-                    "return_1y": returns_12m,
 
                     "history_points": n,
                     "history_source": PROVIDER_NAME,
@@ -806,6 +894,14 @@ class EODHDClient:
                     "last_updated_riyadh": _riyadh_iso(),
                 }
             )
+
+            # legacy aliases (optional)
+            if "week_52_high" in patch:
+                patch["52w_high"] = patch.get("week_52_high")
+            if "week_52_low" in patch:
+                patch["52w_low"] = patch.get("week_52_low")
+            if "week_52_position_pct" in patch:
+                patch["position_52w_pct"] = patch.get("week_52_position_pct")
 
             await self.hist_cache.set(ck, patch)
             return patch, None
@@ -818,7 +914,7 @@ class EODHDClient:
     async def fetch_enriched_quote_patch(self, symbol: str) -> Dict[str, Any]:
         """
         Returns a dict patch to merge into the unified enriched quote model.
-        Never throws.
+        Never throws; never returns {}.
         """
         now_utc = _utc_iso()
         now_riy = _riyadh_iso()
@@ -842,7 +938,6 @@ class EODHDClient:
             )
 
         if not self.api_key:
-            # This is the #1 cause of “provider loaded but no compatible quote method succeeded”
             return _clean_patch(
                 {
                     "symbol": sym_raw,
@@ -889,6 +984,7 @@ class EODHDClient:
             "symbol_normalized": sym_norm,
             "provider": PROVIDER_NAME,
             "data_source": PROVIDER_NAME,
+            "data_sources": [PROVIDER_NAME],
             "last_updated_utc": now_utc,
             "last_updated_riyadh": now_riy,
         }
@@ -899,16 +995,32 @@ class EODHDClient:
             if isinstance(r, Exception):
                 errors.append(f"exception:{r.__class__.__name__}")
                 continue
+            try:
+                patch, err = r  # type: ignore[misc]
+            except Exception:
+                errors.append("bad_task_result")
+                continue
 
-            patch, err = r  # type: ignore[misc]
             if err:
                 errors.append(str(err))
+
             if isinstance(patch, dict) and patch:
                 for k, v in patch.items():
                     if v is None:
                         continue
                     if k not in merged or merged.get(k) in (None, "", [], {}):
                         merged[k] = v
+
+        # Ensure core coherency
+        if merged.get("current_price") is None and merged.get("price") is not None:
+            merged["current_price"] = merged.get("price")
+        if merged.get("price") is None and merged.get("current_price") is not None:
+            merged["price"] = merged.get("current_price")
+
+        if merged.get("previous_close") is None and merged.get("prev_close") is not None:
+            merged["previous_close"] = merged.get("prev_close")
+        if merged.get("prev_close") is None and merged.get("previous_close") is not None:
+            merged["prev_close"] = merged.get("previous_close")
 
         # Determine quality
         if merged.get("current_price") is None:
@@ -917,20 +1029,15 @@ class EODHDClient:
             merged["error_detail"] = ",".join(sorted(set(errors))) if errors else "no_data"
         else:
             merged["data_quality"] = "OK"
+            if errors:
+                merged["warning"] = "partial_sources"
+                merged["info"] = {"warnings": sorted(set(errors))[:6]}
 
-        # Ensure canonical fields
-        merged["symbol"] = sym_raw
-        merged["symbol_normalized"] = sym_norm
-
-        # Backward-compatible aliases (for older routers/clients)
-        if "current_price" in merged and "price" not in merged:
-            merged["price"] = merged.get("current_price")
-        if "previous_close" in merged and "prev_close" not in merged:
-            merged["prev_close"] = merged.get("previous_close")
-        if "week_52_high" in merged and "52w_high" not in merged:
-            merged["52w_high"] = merged.get("week_52_high")
-        if "week_52_low" in merged and "52w_low" not in merged:
-            merged["52w_low"] = merged.get("week_52_low")
+        # Backward-compatible aliases
+        merged["change"] = merged.get("price_change")
+        merged["change_pct"] = merged.get("percent_change")
+        merged["52w_high"] = merged.get("week_52_high")
+        merged["52w_low"] = merged.get("week_52_low")
 
         return _clean_patch(merged)
 
@@ -942,7 +1049,7 @@ class EODHDClient:
 
 
 # =============================================================================
-# Singleton + public API
+# Singleton + public API + compatibility wrappers
 # =============================================================================
 _INSTANCE: Optional[EODHDClient] = None
 _INSTANCE_LOCK = asyncio.Lock()
@@ -957,62 +1064,52 @@ async def get_client() -> EODHDClient:
     return _INSTANCE
 
 
-async def fetch_enriched_quote_patch(symbol: str, *args, **kwargs) -> Dict[str, Any]:
+async def fetch_enriched_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     client = await get_client()
     return await client.fetch_enriched_quote_patch(symbol)
 
 
-__all__ = [
-    "fetch_enriched_quote_patch",
-    "PROVIDER_NAME",
-    "PROVIDER_VERSION",
-    "EODHDClient",
-    "get_client",
-    "normalize_eodhd_symbol",
-]
-# =============================================================================
-# Compatibility wrappers (DataEngine method discovery)
-# =============================================================================
-# Many engines discover provider capabilities by searching for common function names.
-# These wrappers ensure the module ALWAYS exposes a compatible quote method.
-
-async def quote(symbol: str, *args, **kwargs) -> Dict[str, Any]:
-    """
-    Common interface: return a quote dict for ONE symbol.
-    Raise on failure so the engine sets last_err (instead of last_err=None).
-    """
+# Many engines discover provider capabilities by searching common method names.
+async def quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     client = await get_client()
     patch, err = await client.fetch_quote(symbol)
     if err:
         raise RuntimeError(err)
     return patch
 
-async def get_quote(symbol: str, *args, **kwargs) -> Dict[str, Any]:
+
+async def get_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     return await quote(symbol, *args, **kwargs)
 
-async def fetch_quote(symbol: str, *args, **kwargs) -> Dict[str, Any]:
+
+async def fetch_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     return await quote(symbol, *args, **kwargs)
 
-async def enriched_quote(symbol: str, *args, **kwargs) -> Dict[str, Any]:
-    """
-    Some pipelines expect an "enriched quote" function.
-    """
+
+async def enriched_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     return await fetch_enriched_quote_patch(symbol)
 
-async def fetch_quotes(symbols: List[str], *args, **kwargs) -> List[Dict[str, Any]]:
-    """
-    Batch helper (optional). Returns list of quote dicts (only successful ones).
-    """
+
+async def fetch_quotes(symbols: List[str], *args: Any, **kwargs: Any) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for s in symbols or []:
         try:
             out.append(await quote(s))
         except Exception:
-            # keep batch best-effort
             continue
     return out
 
-# Make sure exports include these
-__all__ = list(set(__all__ + [
-    "quote", "get_quote", "fetch_quote", "enriched_quote", "fetch_quotes"
-]))
+
+__all__ = [
+    "fetch_enriched_quote_patch",
+    "quote",
+    "get_quote",
+    "fetch_quote",
+    "enriched_quote",
+    "fetch_quotes",
+    "PROVIDER_NAME",
+    "PROVIDER_VERSION",
+    "EODHDClient",
+    "get_client",
+    "normalize_eodhd_symbol",
+]
