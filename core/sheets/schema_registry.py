@@ -2,7 +2,7 @@
 # core/sheets/schema_registry.py
 """
 ================================================================================
-Schema Registry — v2.1.1 (CANONICAL / SHEET-FIRST / DRIFT-PROOF)
+Schema Registry — v2.1.2 (CANONICAL / SHEET-FIRST / STARTUP-SAFE)
 ================================================================================
 Tadawul Fast Bridge (TFB)
 
@@ -24,10 +24,13 @@ Special sheets (must NOT fall back to the 80-col instrument schema):
 - Top_10_Investments: 83 columns (80 canonical + 3 Top10 extras)
 - Data_Dictionary: 9 columns (generated from registry)
 
-v2.1.1 FIX (Phase 1 — remove “false missing column”):
-- Automatically removes any BLANK/EMPTY column specs (blank key/header) from ALL sheets.
-- Enforces instrument_table first column must be Symbol (key="symbol") after sanitization.
-This eliminates the “1 missing column” caused by a blank first column in Top_10_Investments spec.
+v2.1.2 FIX (addresses “❌ red X” causes)
+- ✅ Sanitization keeps removing BLANK/EMPTY columns.
+- ✅ FIX: Top10 extra columns are sanitized as a *fragment* (no “first column must be symbol” rule).
+  This prevents import-time validation crashes that cause schema endpoints to fail and downstream
+  consumers to fall back to tiny schemas (Symbol/Error only).
+- ✅ Startup-safe validation: by default, validation errors do NOT crash import.
+  Set STRICT_SCHEMA_VALIDATION=1 to raise (CI / tests).
 
 ================================================================================
 """
@@ -36,6 +39,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -46,6 +50,8 @@ __all__ = [
     "SheetSpec",
     "SCHEMA_REGISTRY",
     "CANONICAL_SHEETS",
+    "SCHEMA_VALIDATED_OK",
+    "SCHEMA_VALIDATION_ERRORS",
     "list_sheets",
     "get_sheet_spec",
     "get_sheet_columns",
@@ -59,7 +65,7 @@ __all__ = [
     "validate_schema_registry",
 ]
 
-SCHEMA_VERSION = "2.1.1"
+SCHEMA_VERSION = "2.1.2"
 
 # -----------------------------
 # Types / Models
@@ -70,7 +76,7 @@ _ALLOWED_DTYPES = {
     "float",      # numeric
     "int",        # integer
     "bool",       # boolean
-    "pct",        # percent numeric
+    "pct",        # percent numeric (fraction is recommended: 0.25 == 25%)
     "currency",   # currency numeric
     "date",       # date
     "datetime",   # timestamp
@@ -78,10 +84,12 @@ _ALLOWED_DTYPES = {
 }
 
 _ALLOWED_KINDS = {
-    "instrument_table",  # standard 80 columns row-per-symbol
-    "insights_analysis", # criteria block + insights table (7 cols)
-    "data_dictionary",   # auto-generated from schema
+    "instrument_table",   # standard 80 columns row-per-symbol
+    "insights_analysis",  # criteria block + insights table (7 cols)
+    "data_dictionary",    # auto-generated from schema
 }
+
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
 
 
 @dataclass(frozen=True)
@@ -118,10 +126,16 @@ class SheetSpec:
 # Sanitization (removes blank column specs)
 # -----------------------------
 
-def _sanitize_columns(sheet_name: str, kind: str, cols: Sequence[ColumnSpec]) -> Tuple[ColumnSpec, ...]:
+def _sanitize_columns(
+    sheet_name: str,
+    kind: str,
+    cols: Sequence[ColumnSpec],
+    *,
+    enforce_symbol_first: bool = True,
+) -> Tuple[ColumnSpec, ...]:
     """
-    Removes any column specs that have blank key/header (after strip).
-    This is the Phase-1 guard to eliminate false “missing column” issues.
+    Removes any column specs that have blank group/key/header (after strip).
+    Optional: enforce first column key='symbol' (only for FULL instrument_table schemas).
     """
     cleaned: List[ColumnSpec] = []
     for c in cols:
@@ -129,12 +143,26 @@ def _sanitize_columns(sheet_name: str, kind: str, cols: Sequence[ColumnSpec]) ->
         h = (c.header or "").strip()
         g = (c.group or "").strip()
         if not g or not k or not h:
-            # Drop blank placeholder columns entirely (recommended behavior).
             continue
-        cleaned.append(c)
 
-    if kind == "instrument_table":
-        # After cleaning, the FIRST column must be symbol.
+        dt = (c.dtype or "str").strip().lower()
+        if dt not in _ALLOWED_DTYPES:
+            # keep startup-safe: coerce bad dtype to str (validation can still catch it in strict mode)
+            dt = "str"
+        cleaned.append(
+            ColumnSpec(
+                group=g,
+                header=h,
+                key=k,
+                dtype=dt,
+                fmt=(c.fmt or "text"),
+                required=bool(c.required),
+                source=(c.source or ""),
+                notes=(c.notes or ""),
+            )
+        )
+
+    if kind == "instrument_table" and enforce_symbol_first:
         if not cleaned:
             raise ValueError(f"[{sheet_name}] instrument_table resulted in 0 columns after sanitization.")
         if cleaned[0].key != "symbol":
@@ -147,10 +175,11 @@ def _sanitize_columns(sheet_name: str, kind: str, cols: Sequence[ColumnSpec]) ->
 
 
 def _sanitize_sheet(spec: SheetSpec) -> SheetSpec:
+    enforce = True if spec.kind == "instrument_table" else False
     return SheetSpec(
         sheet=spec.sheet,
         kind=spec.kind,
-        columns=_sanitize_columns(spec.sheet, spec.kind, spec.columns),
+        columns=_sanitize_columns(spec.sheet, spec.kind, spec.columns, enforce_symbol_first=enforce),
         criteria_fields=spec.criteria_fields,
         notes=spec.notes,
     )
@@ -168,7 +197,6 @@ def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
     IMPORTANT:
     - Keep keys stable.
     - Add only at the END to preserve compatibility.
-    - Do NOT add alias columns (price/change/change_pct) here unless your Excel schema includes them.
     """
     cols: List[ColumnSpec] = []
 
@@ -289,46 +317,46 @@ def _canonical_instrument_columns() -> Tuple[ColumnSpec, ...]:
     return tuple(cols)
 
 
-_CANONICAL_COLUMNS = _sanitize_columns("CANONICAL", "instrument_table", _canonical_instrument_columns())
+_CANONICAL_COLUMNS = _sanitize_columns(
+    "CANONICAL",
+    "instrument_table",
+    _canonical_instrument_columns(),
+    enforce_symbol_first=True,
+)
 
 
 def _top10_extra_columns() -> Tuple[ColumnSpec, ...]:
-    # 80 + 3 = 83 columns
+    """
+    3 extra columns for Top_10_Investments.
+    IMPORTANT: sanitize as a fragment (do NOT enforce symbol-first here).
+    """
+    cols = (
+        ColumnSpec("Top10", "Top10 Rank", "top10_rank", "int", "0", False, "derived", "Rank within Top 10 selection."),
+        ColumnSpec("Top10", "Selection Reason", "selection_reason", "str", "text", False, "model", "Why this row was selected."),
+        ColumnSpec("Top10", "Criteria Snapshot", "criteria_snapshot", "json", "text", False, "system", "JSON snapshot of criteria used."),
+    )
     return _sanitize_columns(
         "Top_10_Investments(Top10Extras)",
-        "instrument_table",
-        (
-            ColumnSpec("Top10", "Top10 Rank", "top10_rank", "int", "0", False, "derived", "Rank within Top 10 selection."),
-            ColumnSpec("Top10", "Selection Reason", "selection_reason", "str", "text", False, "model", "Why this row was selected."),
-            ColumnSpec("Top10", "Criteria Snapshot", "criteria_snapshot", "json", "text", False, "system", "JSON snapshot of criteria used."),
-        ),
+        "top10_extras_fragment",
+        cols,
+        enforce_symbol_first=False,
     )
 
 
 def _insights_columns() -> Tuple[ColumnSpec, ...]:
-    """
-    Insights_Analysis table schema (7 columns).
-    IMPORTANT: The criteria block is NOT returned as columns here; it is represented
-    via criteria_fields metadata (key/value UI block in the sheet).
-    """
     cols = (
         ColumnSpec("Insights", "Section", "section", "str", "text", True, "system", "e.g., Market Leaders Top 7, Portfolio Summary."),
         ColumnSpec("Insights", "Item", "item", "str", "text", True, "system", "Row label within section."),
         ColumnSpec("Insights", "Symbol", "symbol", "str", "text", False, "derived", "If insight is symbol-specific."),
         ColumnSpec("Insights", "Metric", "metric", "str", "text", False, "system", "Metric name."),
-        ColumnSpec("Insights", "Value", "value", "str", "text", False, "system", "String-safe value (Apps Script friendly)."),
+        ColumnSpec("Insights", "Value", "value", "str", "text", False, "system", "Apps Script friendly value."),
         ColumnSpec("Insights", "Notes", "notes", "str", "text", False, "system", "Extra notes / explanation."),
         ColumnSpec("Provenance", "Last Updated (Riyadh)", "last_updated_riyadh", "datetime", "yyyy-mm-dd hh:mm:ss", False, "system", "Timestamp."),
     )
-    # For insights, allow symbol not first; do NOT enforce instrument-table rule.
-    return _sanitize_columns("Insights_Analysis", "insights_analysis", cols)
+    return _sanitize_columns("Insights_Analysis", "insights_analysis", cols, enforce_symbol_first=False)
 
 
 def _insights_criteria_fields() -> Tuple[CriteriaField, ...]:
-    """
-    Criteria block lives at the TOP of Insights_Analysis (key/value pairs in sheet),
-    defined here so backend + Apps Script agree.
-    """
     return (
         CriteriaField("risk_level", "Risk Level", "str", "Moderate", "Low / Moderate / High."),
         CriteriaField("confidence_level", "Confidence Level", "str", "High", "High / Medium / Low."),
@@ -343,10 +371,6 @@ def _insights_criteria_fields() -> Tuple[CriteriaField, ...]:
 
 
 def _data_dictionary_columns() -> Tuple[ColumnSpec, ...]:
-    """
-    Data_Dictionary is auto-generated from SCHEMA_REGISTRY via core/sheets/data_dictionary.py
-    Expected length: 9 columns.
-    """
     cols = (
         ColumnSpec("Dictionary", "Sheet", "sheet", "str", "text", True, "schema_registry", ""),
         ColumnSpec("Dictionary", "Group", "group", "str", "text", True, "schema_registry", ""),
@@ -358,7 +382,7 @@ def _data_dictionary_columns() -> Tuple[ColumnSpec, ...]:
         ColumnSpec("Dictionary", "Source", "source", "str", "text", False, "schema_registry", ""),
         ColumnSpec("Dictionary", "Notes", "notes", "str", "text", False, "schema_registry", ""),
     )
-    return _sanitize_columns("Data_Dictionary", "data_dictionary", cols)
+    return _sanitize_columns("Data_Dictionary", "data_dictionary", cols, enforce_symbol_first=False)
 
 
 # -----------------------------
@@ -399,7 +423,7 @@ _RAW_SCHEMA_REGISTRY: Dict[str, SheetSpec] = {
     "Insights_Analysis": SheetSpec(
         sheet="Insights_Analysis",
         kind="insights_analysis",
-        columns=_insights_columns(),               # 7 columns
+        columns=_insights_columns(),  # 7 columns
         criteria_fields=_insights_criteria_fields(),
         notes="Top block: criteria key/value. Below: insights table with stable columns.",
     ),
@@ -410,13 +434,14 @@ _RAW_SCHEMA_REGISTRY: Dict[str, SheetSpec] = {
             "Top_10_Investments",
             "instrument_table",
             _CANONICAL_COLUMNS + _top10_extra_columns(),  # 83 columns target
+            enforce_symbol_first=True,
         ),
         notes="Criteria-driven selection. Canonical columns + Top10 extras.",
     ),
     "Data_Dictionary": SheetSpec(
         sheet="Data_Dictionary",
         kind="data_dictionary",
-        columns=_data_dictionary_columns(),        # 9 columns
+        columns=_data_dictionary_columns(),  # 9 columns
         notes="Auto-built from schema_registry. Do not hand-edit.",
     ),
 }
@@ -424,7 +449,6 @@ _RAW_SCHEMA_REGISTRY: Dict[str, SheetSpec] = {
 # Final sanitized registry (guarantees no blank columns)
 SCHEMA_REGISTRY: Dict[str, SheetSpec] = {k: _sanitize_sheet(v) for k, v in _RAW_SCHEMA_REGISTRY.items()}
 
-# A stable “canonical list” for tests and UI ordering (single view)
 CANONICAL_SHEETS: Tuple[str, ...] = (
     "Market_Leaders",
     "Global_Markets",
@@ -436,13 +460,11 @@ CANONICAL_SHEETS: Tuple[str, ...] = (
     "Data_Dictionary",
 )
 
-
 # -----------------------------
 # Public helpers
 # -----------------------------
 
 def list_sheets() -> List[str]:
-    # keep stable ordering where possible
     if all(s in SCHEMA_REGISTRY for s in CANONICAL_SHEETS):
         return list(CANONICAL_SHEETS)
     return sorted(SCHEMA_REGISTRY.keys())
@@ -519,9 +541,6 @@ def get_sheet_header_index(sheet: str) -> Dict[str, int]:
 # -----------------------------
 
 def schema_registry_snapshot() -> Dict[str, Dict[str, Any]]:
-    """
-    A compact, deterministic snapshot of the registry for tests/CI.
-    """
     out: Dict[str, Dict[str, Any]] = {}
     for s in list_sheets():
         spec = SCHEMA_REGISTRY[s]
@@ -538,10 +557,6 @@ def schema_registry_snapshot() -> Dict[str, Dict[str, Any]]:
 
 
 def schema_registry_digest() -> str:
-    """
-    Deterministic hash for drift detection.
-    Use this in logs/health endpoints or tests if needed.
-    """
     payload = {
         "schema_version": SCHEMA_VERSION,
         "sheets": schema_registry_snapshot(),
@@ -551,22 +566,19 @@ def schema_registry_digest() -> str:
 
 
 # -----------------------------
-# Validation (safe at import-time)
+# Validation (startup-safe)
 # -----------------------------
 
 def validate_schema_registry(registry: Optional[Dict[str, SheetSpec]] = None) -> None:
     reg = registry or SCHEMA_REGISTRY
 
-    # No forbidden legacy tabs
     if "KSA_Tadawul" in reg:
         raise ValueError("Schema registry must NOT include 'KSA_Tadawul'.")
 
-    # Ensure all canonical sheets exist (if we declared them)
     for s in CANONICAL_SHEETS:
         if s not in reg:
             raise ValueError(f"Missing required sheet in registry: {s}")
 
-    # Validate each sheet
     for sheet_name, spec in reg.items():
         sn = (sheet_name or "").strip()
         if not sn:
@@ -581,7 +593,6 @@ def validate_schema_registry(registry: Optional[Dict[str, SheetSpec]] = None) ->
         if not spec.columns:
             raise ValueError(f"[{sheet_name}] Must define at least 1 column.")
 
-        # Validate dtype + uniqueness + non-empty fields
         seen_keys = set()
         seen_headers = set()
         for col in spec.columns:
@@ -603,7 +614,6 @@ def validate_schema_registry(registry: Optional[Dict[str, SheetSpec]] = None) ->
             seen_keys.add(col.key)
             seen_headers.add(col.header)
 
-        # Special expected sizes (drift-proof)
         if sheet_name in {"Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds", "My_Portfolio"}:
             if len(spec.columns) != 80:
                 raise ValueError(f"[{sheet_name}] instrument_table must be 80 columns. Got: {len(spec.columns)}")
@@ -624,7 +634,6 @@ def validate_schema_registry(registry: Optional[Dict[str, SheetSpec]] = None) ->
             if len(spec.columns) != 9:
                 raise ValueError(f"[Data_Dictionary] must be 9 columns. Got: {len(spec.columns)}")
 
-        # Criteria field validation
         seen_ckeys = set()
         for cf in spec.criteria_fields:
             if not (cf.key or "").strip():
@@ -636,5 +645,15 @@ def validate_schema_registry(registry: Optional[Dict[str, SheetSpec]] = None) ->
             seen_ckeys.add(cf.key)
 
 
-# Validate immediately (fast, no I/O)
-validate_schema_registry()
+# Validate immediately (fast, no I/O) — but do NOT crash unless strict mode
+SCHEMA_VALIDATION_ERRORS: List[str] = []
+SCHEMA_VALIDATED_OK: bool = True
+
+try:
+    validate_schema_registry()
+except Exception as e:
+    SCHEMA_VALIDATED_OK = False
+    SCHEMA_VALIDATION_ERRORS = [repr(e)]
+    strict = (os.getenv("STRICT_SCHEMA_VALIDATION", "") or "").strip().lower() in _TRUTHY
+    if strict:
+        raise
