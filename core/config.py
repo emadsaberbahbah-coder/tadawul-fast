@@ -2,7 +2,8 @@
 # core/config.py
 """
 ================================================================================
-Core Configuration Module — v5.6.0 (RENDER-SAFE / STARTUP-SAFE / SCHEMA-AWARE)
+Core Configuration Module — v5.7.0
+(RENDER-SAFE / STARTUP-SAFE / SCHEMA-AWARE / ROUTE-AUTH-CONTROLLED)
 ================================================================================
 TADAWUL FAST BRIDGE – Enterprise Configuration Management
 
@@ -11,13 +12,13 @@ Primary goals:
 - ✅ Defensive env parsing + safe optional dependencies
 - ✅ Google credentials normalization (JSON / base64 / file path)
 - ✅ Distributed config sources are LAZY and opt-in (won’t block Render port binding)
-- ✅ Phase 1 alignment:
-     - Allowed pages come from core/sheets/page_catalog.py (aliases + KSA_Tadawul removed)
-     - Schema awareness via core/sheets/schema_registry.py (sheet headers are canonical)
-     - CRITICAL RULE:
-         Headers/columns MUST ALWAYS exist even if computations are disabled.
-         Values can be empty/null, but columns must exist.
-       (This module exposes flags/helpers to enforce this across endpoints and sheet writers.)
+- ✅ Schema/page alignment via core.sheets.page_catalog + core.sheets.schema_registry
+- ✅ CRITICAL: headers/columns MUST ALWAYS exist even if computations are disabled
+- ✅ Granular route auth controls:
+     - Keep service protected by default
+     - Allow explicit PUBLIC_EXACT_PATHS / PUBLIC_PATH_PREFIXES
+     - Support protected overrides
+     - Make auth decisions path-aware without forcing OPEN_MODE=true
 
 Safe-by-default philosophy:
 - Importing this module must NEVER crash, NEVER hang, NEVER do network I/O.
@@ -44,7 +45,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Un
 # =============================================================================
 # Version
 # =============================================================================
-__version__ = "5.6.0"
+__version__ = "5.7.0"
 CONFIG_VERSION = __version__
 CONFIG_BUILD_TIMESTAMP = datetime.now(timezone.utc).isoformat()
 
@@ -97,17 +98,14 @@ except Exception:
     toml = None  # type: ignore
     _HAS_TOML = False
 
-# Encryption (optional)
 try:
-    from cryptography.fernet import Fernet, InvalidToken  # type: ignore
+    from cryptography.fernet import Fernet  # type: ignore
 
     _HAS_CRYPTO = True
 except Exception:
     Fernet = None  # type: ignore
-    InvalidToken = Exception  # type: ignore
     _HAS_CRYPTO = False
 
-# OpenTelemetry (optional)
 try:
     from opentelemetry import trace  # type: ignore
     from opentelemetry.trace import Status, StatusCode  # type: ignore
@@ -119,7 +117,6 @@ except Exception:
     StatusCode = None  # type: ignore
     _OTEL_AVAILABLE = False
 
-# Distributed config libs (optional) — IMPORT ONLY, do not connect at import time
 try:
     import consul  # type: ignore
 
@@ -145,10 +142,11 @@ except Exception:
     _ZOOKEEPER_AVAILABLE = False
 
 # =============================================================================
-# Schema / Pages (Phase 1) — OPTIONAL IMPORTS (never crash)
+# Schema / Pages (OPTIONAL IMPORTS; never crash)
 # =============================================================================
 _HAS_SCHEMA = False
 _SCHEMA_VERSION: Optional[str] = None
+_SREG: Dict[str, Any] = {}
 
 _CANONICAL_PAGES_FALLBACK = [
     "Market_Leaders",
@@ -169,8 +167,38 @@ _TOP10_FEED_PAGES_FALLBACK = [
 ]
 _FORBIDDEN_PAGES_FALLBACK = {"KSA_Tadawul", "Advisor_Criteria"}
 
-# Schema registry object fallback (dict)
-_SREG: Dict[str, Any] = {}
+
+def _fallback_normalize_page_name(page: str, *, allow_output_pages: bool = True) -> str:
+    p = (page or "").strip()
+    if not p:
+        raise ValueError("Page name is empty.")
+    if p in _FORBIDDEN_PAGES_FALLBACK:
+        raise ValueError(f"Page '{p}' is forbidden/removed.")
+    if p not in _CANONICAL_PAGES_FALLBACK:
+        raise ValueError(f"Unknown page '{p}'. Allowed: {', '.join(sorted(_CANONICAL_PAGES_FALLBACK))}")
+    if (not allow_output_pages) and p in {"Top_10_Investments", "Data_Dictionary"}:
+        raise ValueError(f"Page '{p}' is output/meta and not allowed for this operation.")
+    return p
+
+
+def _fallback_get_top10_feed_pages(pages_override: Optional[List[str]] = None) -> List[str]:
+    base = pages_override or list(_TOP10_FEED_PAGES_FALLBACK)
+    out: List[str] = []
+    seen: Set[str] = set()
+    for p in base:
+        try:
+            cp = _fallback_normalize_page_name(p, allow_output_pages=False)
+        except Exception:
+            continue
+        if cp not in seen:
+            seen.add(cp)
+            out.append(cp)
+    return out
+
+
+_normalize_page_name: Callable[..., str] = _fallback_normalize_page_name
+_get_top10_feed_pages: Callable[..., List[str]] = _fallback_get_top10_feed_pages
+
 
 def _safe_import_schema() -> None:
     """
@@ -182,13 +210,16 @@ def _safe_import_schema() -> None:
     global _normalize_page_name, _get_top10_feed_pages
 
     try:
-        from core.sheets.schema_registry import SCHEMA_VERSION as _SRV, SCHEMA_REGISTRY as _SREG2  # type: ignore
+        from core.sheets.schema_registry import (  # type: ignore
+            SCHEMA_REGISTRY as _SREG2,
+            SCHEMA_VERSION as _SRV,
+        )
         from core.sheets.page_catalog import (  # type: ignore
             CANONICAL_PAGES as _CP,
-            TOP10_FEED_PAGES_DEFAULT as _T10,
             FORBIDDEN_PAGES as _FP,
-            normalize_page_name as _normalize_page_name2,
+            TOP10_FEED_PAGES_DEFAULT as _T10,
             get_top10_feed_pages as _get_top10_feed_pages2,
+            normalize_page_name as _normalize_page_name2,
         )
 
         _HAS_SCHEMA = True
@@ -199,52 +230,23 @@ def _safe_import_schema() -> None:
         _TOP10_FEED_PAGES_FALLBACK = list(_T10)
         _FORBIDDEN_PAGES_FALLBACK = set(_FP)
 
-        _normalize_page_name = _normalize_page_name2  # type: ignore
-        _get_top10_feed_pages = _get_top10_feed_pages2  # type: ignore
+        _normalize_page_name = _normalize_page_name2  # type: ignore[assignment]
+        _get_top10_feed_pages = _get_top10_feed_pages2  # type: ignore[assignment]
     except Exception:
         _HAS_SCHEMA = False
         if not isinstance(_SREG, dict):
             _SREG = {}
-        # keep fallbacks + minimal normalize functions below
+        _normalize_page_name = _fallback_normalize_page_name
+        _get_top10_feed_pages = _fallback_get_top10_feed_pages
 
 
 _safe_import_schema()
-
-# Minimal fallback functions (only used if schema imports fail)
-if " _normalize_page_name" not in globals():
-
-    def _normalize_page_name(page: str, *, allow_output_pages: bool = True) -> str:  # type: ignore
-        p = (page or "").strip()
-        if not p:
-            raise ValueError("Page name is empty.")
-        if p in _FORBIDDEN_PAGES_FALLBACK:
-            raise ValueError(f"Page '{p}' is forbidden/removed.")
-        if p in _CANONICAL_PAGES_FALLBACK:
-            if not allow_output_pages and p in {"Top_10_Investments", "Data_Dictionary"}:
-                raise ValueError(f"Page '{p}' is output/meta and not allowed for this operation.")
-            return p
-        raise ValueError(f"Unknown page '{p}'. Allowed: {', '.join(sorted(_CANONICAL_PAGES_FALLBACK))}")
-
-if " _get_top10_feed_pages" not in globals():
-
-    def _get_top10_feed_pages(pages_override: Optional[List[str]] = None) -> List[str]:  # type: ignore
-        base = pages_override or list(_TOP10_FEED_PAGES_FALLBACK)
-        out: List[str] = []
-        seen = set()
-        for p in base:
-            try:
-                cp = _normalize_page_name(p, allow_output_pages=False)
-            except Exception:
-                continue
-            if cp not in seen:
-                seen.add(cp)
-                out.append(cp)
-        return out
 
 # =============================================================================
 # Debug logging helper (never throws)
 # =============================================================================
 _DEBUG = (os.getenv("CORE_CONFIG_DEBUG", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
 
 def _dbg(message: str, level: str = "info", **kwargs: Any) -> None:
     if not _DEBUG:
@@ -264,6 +266,7 @@ def _dbg(message: str, level: str = "info", **kwargs: Any) -> None:
     except Exception:
         pass
 
+
 # =============================================================================
 # TraceContext (safe)
 # =============================================================================
@@ -275,12 +278,14 @@ _TRACING_ENABLED = (os.getenv("CORE_TRACING_ENABLED", "") or os.getenv("TRACING_
     "on",
 }
 
+
 class TraceContext:
     """
     Lightweight OpenTelemetry wrapper.
     - Use as context manager: with TraceContext("name"): ...
     - Use as decorator: @TraceContext("name")
     """
+
     def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
         self.name = name
         self.attributes = attributes or {}
@@ -294,7 +299,7 @@ class TraceContext:
                 self._cm = tracer.start_as_current_span(self.name)
                 self._span = self._cm.__enter__()
                 try:
-                    for k, v in (self.attributes or {}).items():
+                    for k, v in self.attributes.items():
                         self._span.set_attribute(k, v)
                 except Exception:
                     pass
@@ -326,9 +331,11 @@ class TraceContext:
         def wrapper(*args, **kwargs):
             with TraceContext(self.name, self.attributes):
                 return fn(*args, **kwargs)
+
         wrapper.__name__ = getattr(fn, "__name__", "wrapped")
         wrapper.__doc__ = getattr(fn, "__doc__", None)
         return wrapper
+
 
 # =============================================================================
 # Coercion helpers
@@ -337,6 +344,7 @@ _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "active"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "inactive"}
 _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
+
 def strip_value(v: Any) -> str:
     if v is None:
         return ""
@@ -344,6 +352,7 @@ def strip_value(v: Any) -> str:
         return str(v).strip()
     except Exception:
         return ""
+
 
 def coerce_bool(v: Any, default: bool) -> bool:
     s = strip_value(v).lower()
@@ -354,6 +363,7 @@ def coerce_bool(v: Any, default: bool) -> bool:
     if s in _FALSY:
         return False
     return default
+
 
 def coerce_int(v: Any, default: int, *, lo: Optional[int] = None, hi: Optional[int] = None) -> int:
     try:
@@ -366,6 +376,7 @@ def coerce_int(v: Any, default: int, *, lo: Optional[int] = None, hi: Optional[i
         x = hi
     return x
 
+
 def coerce_float(v: Any, default: float, *, lo: Optional[float] = None, hi: Optional[float] = None) -> float:
     try:
         x = float(v) if isinstance(v, (int, float)) else float(strip_value(v))
@@ -377,12 +388,15 @@ def coerce_float(v: Any, default: float, *, lo: Optional[float] = None, hi: Opti
         x = hi
     return x
 
+
 def coerce_list(v: Any, default: Optional[List[str]] = None) -> List[str]:
     if default is None:
         default = []
     if v is None:
         return default
     if isinstance(v, list):
+        return [strip_value(x) for x in v if strip_value(x)]
+    if isinstance(v, tuple):
         return [strip_value(x) for x in v if strip_value(x)]
     s = strip_value(v)
     if not s:
@@ -395,6 +409,7 @@ def coerce_list(v: Any, default: Optional[List[str]] = None) -> List[str]:
         except Exception:
             pass
     return [x.strip() for x in s.split(",") if x.strip()]
+
 
 def coerce_dict(v: Any, default: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     if default is None:
@@ -414,8 +429,10 @@ def coerce_dict(v: Any, default: Optional[Dict[str, Any]] = None) -> Dict[str, A
         pass
     return default
 
+
 def is_valid_url(url: str) -> bool:
     return bool(_URL_RE.match(strip_value(url)))
+
 
 # =============================================================================
 # Sensitive masking helpers
@@ -436,6 +453,7 @@ SENSITIVE_KEYS = {
     "encryption_key",
 }
 
+
 def mask_secret(s: Optional[str], reveal_first: int = 2, reveal_last: int = 4) -> Optional[str]:
     if not s:
         return None
@@ -443,6 +461,7 @@ def mask_secret(s: Optional[str], reveal_first: int = 2, reveal_last: int = 4) -
     if len(s) <= reveal_first + reveal_last + 3:
         return "***"
     return s[:reveal_first] + "..." + s[-reveal_last:]
+
 
 def mask_secret_dict(d: Dict[str, Any], sensitive_keys: Optional[Set[str]] = None) -> Dict[str, Any]:
     if sensitive_keys is None:
@@ -460,6 +479,7 @@ def mask_secret_dict(d: Dict[str, Any], sensitive_keys: Optional[Set[str]] = Non
             out[k] = v
     return out
 
+
 # =============================================================================
 # Deep merge + file loader (safe)
 # =============================================================================
@@ -476,6 +496,7 @@ def deep_merge(base: Dict[str, Any], override: Dict[str, Any], *, overwrite: boo
             if overwrite or k not in out:
                 out[k] = copy.deepcopy(v)
     return out
+
 
 def load_file_content(path: Path) -> Dict[str, Any]:
     """Load config from JSON/YAML/TOML. Never throws; returns {} on failure."""
@@ -505,6 +526,7 @@ def load_file_content(path: Path) -> Dict[str, Any]:
         _dbg("load_file_content failed", "warning", path=str(path), error=str(e))
         return {}
 
+
 # =============================================================================
 # Enums
 # =============================================================================
@@ -522,6 +544,7 @@ class Environment(str, Enum):
         except Exception:
             return cls.PRODUCTION
 
+
 class LogLevel(str, Enum):
     TRACE = "TRACE"
     DEBUG = "DEBUG"
@@ -529,6 +552,7 @@ class LogLevel(str, Enum):
     WARNING = "WARNING"
     ERROR = "ERROR"
     CRITICAL = "CRITICAL"
+
 
 class AuthType(str, Enum):
     NONE = "none"
@@ -540,11 +564,13 @@ class AuthType(str, Enum):
     BASIC = "basic"
     MULTI = "multi"
 
+
 class CacheStrategy(str, Enum):
     MEMORY = "memory"
     REDIS = "redis"
     MEMCACHED = "memcached"
     NONE = "none"
+
 
 class ConfigSource(str, Enum):
     ENV = "env"
@@ -555,16 +581,19 @@ class ConfigSource(str, Enum):
     DEFAULT = "default"
     RUNTIME = "runtime"
 
+
 class ConfigStatus(str, Enum):
     ACTIVE = "active"
     ROLLED_BACK = "rolled_back"
     ARCHIVED = "archived"
+
 
 class EncryptionMethod(str, Enum):
     NONE = "none"
     BASE64 = "base64"
     AES = "aes"
     FERNET = "fernet"
+
 
 # =============================================================================
 # Encryption helper (optional crypto)
@@ -608,8 +637,9 @@ class ConfigEncryption:
         except Exception:
             return value
 
+
 # =============================================================================
-# Versioning (minimal, safe)
+# Versioning
 # =============================================================================
 @dataclass(slots=True)
 class ConfigVersion:
@@ -632,6 +662,7 @@ class ConfigVersion:
             "status": self.status.value,
         }
 
+
 class ConfigVersionManager:
     def __init__(self, max_versions: int = 100):
         self.max_versions = max(10, int(max_versions))
@@ -648,10 +679,13 @@ class ConfigVersionManager:
         with self._lock:
             return list(reversed(self._versions[-max(1, int(limit)) :]))
 
+
 _VERSION_MANAGER = ConfigVersionManager(max_versions=100)
+
 
 def get_version_manager() -> ConfigVersionManager:
     return _VERSION_MANAGER
+
 
 def save_config_version(
     changes: Dict[str, Tuple[Any, Any]],
@@ -674,6 +708,7 @@ def save_config_version(
     except Exception:
         pass
 
+
 # =============================================================================
 # Google credentials normalization
 # =============================================================================
@@ -688,6 +723,7 @@ def _maybe_b64_decode(s: str) -> Optional[str]:
     except Exception:
         return None
 
+
 def _read_text_file_if_exists(p: str) -> Optional[str]:
     try:
         path = Path(strip_value(p))
@@ -696,6 +732,7 @@ def _read_text_file_if_exists(p: str) -> Optional[str]:
     except Exception:
         return None
     return None
+
 
 def normalize_google_credentials() -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
     """
@@ -757,18 +794,20 @@ def normalize_google_credentials() -> Tuple[Optional[str], Optional[Dict[str, An
 
     return (None, None)
 
+
 # =============================================================================
-# Page + Schema helpers (used by routes/sync; import-safe)
+# Page + Schema helpers
 # =============================================================================
 _OUTPUT_PAGES = {"Top_10_Investments", "Data_Dictionary"}
 
+
 def canonical_pages() -> List[str]:
-    """Canonical set of pages accepted by the backend."""
     return list(_CANONICAL_PAGES_FALLBACK)
 
+
 def forbidden_pages() -> Set[str]:
-    """Legacy/removed pages (must never be created/written)."""
     return set(_FORBIDDEN_PAGES_FALLBACK)
+
 
 def is_output_page(page: str) -> bool:
     try:
@@ -776,50 +815,49 @@ def is_output_page(page: str) -> bool:
     except Exception:
         return False
 
+
 def normalize_page(page: str, *, allow_output_pages: bool = True) -> str:
-    """Normalize any alias to canonical page name (KSA_Tadawul forbidden)."""
-    return _normalize_page_name(page, allow_output_pages=allow_output_pages)  # type: ignore
+    return _normalize_page_name(page, allow_output_pages=allow_output_pages)
+
 
 def top10_feed_pages_default() -> List[str]:
-    """Default eligible pages feeding Top_10_Investments selection universe."""
-    return _get_top10_feed_pages(None)  # type: ignore
+    return _get_top10_feed_pages(None)
+
 
 def schema_available() -> bool:
     return bool(_HAS_SCHEMA and isinstance(_SREG, dict) and _SREG)
 
+
 def schema_known(sheet: str) -> bool:
     try:
-        return strip_value(sheet) in _SREG  # type: ignore
+        return strip_value(sheet) in _SREG
     except Exception:
         return False
 
+
 def schema_headers(sheet: str) -> List[str]:
-    """Canonical headers for a sheet if schema_registry is available, else []."""
     try:
-        spec = _SREG.get(strip_value(sheet))  # type: ignore
+        spec = _SREG.get(strip_value(sheet))
         if not spec:
             return []
         return [c.header for c in spec.columns]
     except Exception:
         return []
 
+
 def schema_keys(sheet: str) -> List[str]:
-    """Canonical keys (dict fields) for a sheet in the exact schema order."""
     try:
-        spec = _SREG.get(strip_value(sheet))  # type: ignore
+        spec = _SREG.get(strip_value(sheet))
         if not spec:
             return []
         return [c.key for c in spec.columns]
     except Exception:
         return []
 
+
 def schema_columns(sheet: str) -> List[Dict[str, Any]]:
-    """
-    Full column metadata for a sheet. Useful for Data_Dictionary JSON endpoint, debugging, etc.
-    Returns [] if schema not available.
-    """
     try:
-        spec = _SREG.get(strip_value(sheet))  # type: ignore
+        spec = _SREG.get(strip_value(sheet))
         if not spec:
             return []
         out: List[Dict[str, Any]] = []
@@ -840,13 +878,13 @@ def schema_columns(sheet: str) -> List[Dict[str, Any]]:
     except Exception:
         return []
 
+
 def schema_row_template(sheet: str, *, fill_value: Any = None) -> Dict[str, Any]:
-    """Template dict containing all schema keys (in order) with the same fill_value."""
     try:
-        keys = schema_keys(sheet)
-        return {k: fill_value for k in keys}
+        return {k: fill_value for k in schema_keys(sheet)}
     except Exception:
         return {}
+
 
 def normalize_row_to_schema(
     sheet: str,
@@ -854,11 +892,6 @@ def normalize_row_to_schema(
     *,
     fill_missing_with_null: bool = True,
 ) -> Dict[str, Any]:
-    """
-    Guarantees all schema keys exist in returned dict, in schema order.
-    Extra keys from `row` are preserved at the end (stable) to avoid data loss in logs/debug,
-    but sheet writers / endpoints SHOULD primarily rely on schema keys.
-    """
     try:
         sheet = strip_value(sheet)
         row = row or {}
@@ -871,7 +904,6 @@ def normalize_row_to_schema(
         for k in keys:
             out[k] = row.get(k, fill)
 
-        # preserve non-schema keys (debug / forward-compat)
         for k, v in row.items():
             if k not in out:
                 out[k] = v
@@ -879,8 +911,67 @@ def normalize_row_to_schema(
     except Exception:
         return dict(row or {})
 
+
 # =============================================================================
-# Settings (core)
+# Public/protected route defaults
+# =============================================================================
+_DEFAULT_PUBLIC_EXACT_PATHS = [
+    "/",
+    "/health",
+    "/readyz",
+    "/livez",
+    "/openapi.json",
+    "/docs",
+    "/redoc",
+    "/favicon.ico",
+    "/v1/advanced/health",
+    "/v1/advisor/health",
+]
+
+_DEFAULT_PUBLIC_PATH_PREFIXES = [
+    "/docs",
+    "/redoc",
+    "/static",
+]
+
+_DEFAULT_PROTECTED_EXACT_PATHS: List[str] = []
+
+_DEFAULT_PROTECTED_PATH_PREFIXES = [
+    "/v1/analysis",
+    "/v1/schema",
+    "/v1/advanced/sheet-rows",
+    "/v1/enriched/sheet-rows",
+]
+
+
+def _clean_paths(values: Sequence[str]) -> List[str]:
+    out: List[str] = []
+    seen: Set[str] = set()
+    for v in values:
+        p = strip_value(v)
+        if not p:
+            continue
+        if not p.startswith("/"):
+            p = "/" + p
+        p = re.sub(r"/{2,}", "/", p).rstrip("/") or "/"
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def normalize_request_path(path: Optional[str]) -> str:
+    p = strip_value(path)
+    if not p:
+        return ""
+    p = p.split("?", 1)[0].strip()
+    if not p.startswith("/"):
+        p = "/" + p
+    return re.sub(r"/{2,}", "/", p).rstrip("/") or "/"
+
+
+# =============================================================================
+# Settings
 # =============================================================================
 @dataclass(frozen=True)
 class Settings:
@@ -891,9 +982,7 @@ class Settings:
     # Schema
     schema_enabled: bool = True
     schema_version: str = (_SCHEMA_VERSION or "unknown")
-    # CRITICAL: must be True for Phase 1+ (headers always exist)
     schema_headers_always: bool = True
-    # When normalizing output rows, missing keys become null (JSON) / "" (Sheets writer decides)
     schema_fill_missing_with_null: bool = True
 
     # Pages / Catalog
@@ -928,11 +1017,15 @@ class Settings:
     open_mode: bool = False
     app_token: Optional[str] = None
     backup_app_token: Optional[str] = None
+    public_exact_paths: List[str] = field(default_factory=lambda: list(_DEFAULT_PUBLIC_EXACT_PATHS))
+    public_path_prefixes: List[str] = field(default_factory=lambda: list(_DEFAULT_PUBLIC_PATH_PREFIXES))
+    protected_exact_paths: List[str] = field(default_factory=lambda: list(_DEFAULT_PROTECTED_EXACT_PATHS))
+    protected_path_prefixes: List[str] = field(default_factory=lambda: list(_DEFAULT_PROTECTED_PATH_PREFIXES))
 
-    # Backend (internal integrations)
+    # Backend
     backend_base_url: str = "http://localhost:8000"
 
-    # Providers (GLOBAL + KSA)
+    # Providers
     enabled_providers: List[str] = field(default_factory=lambda: ["eodhd"])
     ksa_providers: List[str] = field(default_factory=lambda: ["yahoo_chart", "argaam"])
     primary_provider: str = "eodhd"
@@ -951,13 +1044,13 @@ class Settings:
 
     # EODHD global defaults
     eodhd_symbol_suffix_default: str = "US"
-    eodhd_append_exchange_suffix: bool = True  # AAPL -> AAPL.US when needed
+    eodhd_append_exchange_suffix: bool = True
 
     # Market feature flags
     tadawul_market_enabled: bool = True
     ksa_disallow_eodhd: bool = False
 
-    # Computation feature flags (IMPORTANT: do NOT affect headers)
+    # Computation feature flags
     computations_enabled: bool = True
     fundamentals_enabled: bool = True
     technicals_enabled: bool = True
@@ -997,24 +1090,19 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         env_name = strip_value(os.getenv("APP_ENV") or os.getenv("TFB_ENV") or "production")
-
         app_name = strip_value(os.getenv("APP_NAME") or "TFB")
         app_version = strip_value(os.getenv("APP_VERSION") or __version__)
 
-        # --- auth ---
         token = strip_value(os.getenv("APP_TOKEN") or os.getenv("TFB_APP_TOKEN") or os.getenv("BACKEND_TOKEN") or "")
         backup_token = strip_value(os.getenv("BACKUP_APP_TOKEN") or "")
 
-        # require auth default: TRUE (production safe)
         require_auth = coerce_bool(os.getenv("REQUIRE_AUTH"), True)
 
-        # OPEN_MODE explicit wins; else open only when require_auth is false AND no tokens exist
         if os.getenv("OPEN_MODE") is not None:
             open_mode = coerce_bool(os.getenv("OPEN_MODE"), False)
         else:
             open_mode = (not require_auth) and (not bool(token or backup_token))
 
-        # --- provider keys / base urls ---
         eodhd_key = strip_value(
             os.getenv("EODHD_API_TOKEN") or os.getenv("EODHD_API_KEY") or os.getenv("EODHD_KEY") or ""
         )
@@ -1052,7 +1140,6 @@ class Settings:
         ksa_providers = [p.lower() for p in coerce_list(os.getenv("KSA_PROVIDERS") or "yahoo_chart,argaam")]
         primary_provider = strip_value(os.getenv("PRIMARY_PROVIDER") or "eodhd").lower()
 
-        # Logging
         ll = strip_value(os.getenv("LOG_LEVEL") or "INFO").upper()
         log_level = LogLevel.INFO
         for x in LogLevel:
@@ -1062,12 +1149,10 @@ class Settings:
         log_format = strip_value(os.getenv("LOG_FORMAT") or "json").lower()
         log_json = coerce_bool(os.getenv("LOG_JSON"), True)
 
-        # Backend base URL
         backend_base_url = strip_value(
             os.getenv("BACKEND_BASE_URL") or os.getenv("DEFAULT_BACKEND_URL") or "http://localhost:8000"
         )
 
-        # Feature flags (do NOT impact headers)
         advanced_analysis_enabled = coerce_bool(os.getenv("ADVANCED_ANALYSIS_ENABLED"), True)
         ai_analysis_enabled = coerce_bool(os.getenv("AI_ANALYSIS_ENABLED"), True)
         tadawul_market_enabled = coerce_bool(os.getenv("TADAWUL_MARKET_ENABLED"), True)
@@ -1079,12 +1164,10 @@ class Settings:
         forecasting_enabled = coerce_bool(os.getenv("FORECASTING_ENABLED"), True)
         scoring_enabled = coerce_bool(os.getenv("SCORING_ENABLED"), True)
 
-        # Schema flags (Phase 1)
         schema_enabled = coerce_bool(os.getenv("SCHEMA_ENABLED"), True)
         schema_headers_always = coerce_bool(os.getenv("SCHEMA_HEADERS_ALWAYS"), True)
         schema_fill_missing_with_null = coerce_bool(os.getenv("SCHEMA_FILL_MISSING_WITH_NULL"), True)
 
-        # Pages (Phase 1): allow env overrides but validate against catalog
         allowed_pages_env = coerce_list(os.getenv("ALLOWED_PAGES"))
         if allowed_pages_env:
             ap: List[str] = []
@@ -1124,11 +1207,10 @@ class Settings:
 
         top10_feed_pages_env = coerce_list(os.getenv("TOP10_FEED_PAGES"))
         if top10_feed_pages_env:
-            top10_feed_pages = _get_top10_feed_pages(top10_feed_pages_env)  # type: ignore
+            top10_feed_pages = _get_top10_feed_pages(top10_feed_pages_env)
         else:
             top10_feed_pages = top10_feed_pages_default()
 
-        # HTTP / Retry / Cache / Engine
         http_timeout_sec = coerce_float(os.getenv("HTTP_TIMEOUT_SEC"), 45.0, lo=5.0, hi=300.0)
         max_retries = coerce_int(os.getenv("MAX_RETRIES"), 2, lo=0, hi=20)
         retry_delay_sec = coerce_float(os.getenv("RETRY_DELAY") or os.getenv("RETRY_DELAY_SEC"), 1.0, lo=0.0, hi=30.0)
@@ -1144,7 +1226,19 @@ class Settings:
         init_engine_on_boot = coerce_bool(os.getenv("INIT_ENGINE_ON_BOOT"), True)
         defer_router_mount = coerce_bool(os.getenv("DEFER_ROUTER_MOUNT"), False)
 
-        # Sheets
+        public_exact_paths = _clean_paths(
+            coerce_list(os.getenv("PUBLIC_EXACT_PATHS"), list(_DEFAULT_PUBLIC_EXACT_PATHS))
+        )
+        public_path_prefixes = _clean_paths(
+            coerce_list(os.getenv("PUBLIC_PATH_PREFIXES"), list(_DEFAULT_PUBLIC_PATH_PREFIXES))
+        )
+        protected_exact_paths = _clean_paths(
+            coerce_list(os.getenv("PROTECTED_EXACT_PATHS"), list(_DEFAULT_PROTECTED_EXACT_PATHS))
+        )
+        protected_path_prefixes = _clean_paths(
+            coerce_list(os.getenv("PROTECTED_PATH_PREFIXES"), list(_DEFAULT_PROTECTED_PATH_PREFIXES))
+        )
+
         default_spreadsheet_id = strip_value(os.getenv("DEFAULT_SPREADSHEET_ID") or "") or None
         gs_json, gs_dict = normalize_google_credentials()
         google_apps_script_url = strip_value(os.getenv("GOOGLE_APPS_SCRIPT_URL") or "") or None
@@ -1153,7 +1247,6 @@ class Settings:
         tz = strip_value(os.getenv("TZ") or "Asia/Riyadh")
 
         return cls(
-            # schema + pages
             schema_enabled=schema_enabled,
             schema_version=(_SCHEMA_VERSION or "unknown"),
             schema_headers_always=schema_headers_always,
@@ -1162,25 +1255,24 @@ class Settings:
             forbidden_pages=sorted(list(forbidden_pages())),
             default_data_pages=default_data_pages,
             top10_feed_pages=top10_feed_pages,
-            # app
             environment=Environment.from_string(env_name),
             service_name=strip_value(os.getenv("SERVICE_NAME") or "Tadawul Fast Bridge"),
             timezone=tz,
             app_name=app_name,
             app_version=app_version,
-            # logging
             log_level=log_level,
             log_format=log_format,
             log_json=log_json,
-            # auth
             auth_header_name=strip_value(os.getenv("AUTH_HEADER_NAME") or "X-APP-TOKEN"),
             require_auth=require_auth,
             open_mode=open_mode,
             app_token=token or None,
             backup_app_token=backup_token or None,
-            # backend
+            public_exact_paths=public_exact_paths,
+            public_path_prefixes=public_path_prefixes,
+            protected_exact_paths=protected_exact_paths,
+            protected_path_prefixes=protected_path_prefixes,
             backend_base_url=backend_base_url,
-            # providers
             enabled_providers=enabled_providers,
             ksa_providers=ksa_providers,
             primary_provider=primary_provider,
@@ -1196,16 +1288,13 @@ class Settings:
             eodhd_append_exchange_suffix=eodhd_append_suffix,
             tadawul_market_enabled=tadawul_market_enabled,
             ksa_disallow_eodhd=ksa_disallow_eodhd,
-            # compute flags (headers still guaranteed by schema_headers_always)
             computations_enabled=computations_enabled,
             fundamentals_enabled=fundamentals_enabled,
             technicals_enabled=technicals_enabled,
             forecasting_enabled=forecasting_enabled,
             scoring_enabled=scoring_enabled,
-            # api flags
             advanced_analysis_enabled=advanced_analysis_enabled,
             ai_analysis_enabled=ai_analysis_enabled,
-            # http/cache/concurrency
             http_timeout_sec=http_timeout_sec,
             max_retries=max_retries,
             retry_delay_sec=retry_delay_sec,
@@ -1217,7 +1306,6 @@ class Settings:
             quote_batch_size=quote_batch_size,
             init_engine_on_boot=init_engine_on_boot,
             defer_router_mount=defer_router_mount,
-            # sheets
             default_spreadsheet_id=default_spreadsheet_id,
             google_sheets_credentials_json=gs_json,
             google_credentials_dict=gs_dict,
@@ -1226,24 +1314,18 @@ class Settings:
         )
 
     def validate(self) -> Tuple[List[str], List[str]]:
-        """
-        Validation is NON-FATAL by design.
-        Your app should decide how to treat errors (health endpoint may degrade).
-        """
         errors: List[str] = []
         warnings_list: List[str] = []
 
-        # Pages sanity
         for fp in self.forbidden_pages or []:
             if fp in (self.allowed_pages or []):
                 errors.append(f"Forbidden page '{fp}' appears in allowed_pages. Remove it.")
 
-        # Ensure defaults are allowed
-        for p in (self.default_data_pages or []):
+        for p in self.default_data_pages or []:
             if p not in (self.allowed_pages or []):
                 warnings_list.append(f"default_data_pages contains '{p}' which is not in allowed_pages.")
 
-        for p in (self.top10_feed_pages or []):
+        for p in self.top10_feed_pages or []:
             if p not in (self.allowed_pages or []):
                 warnings_list.append(f"top10_feed_pages contains '{p}' which is not in allowed_pages.")
 
@@ -1269,12 +1351,16 @@ class Settings:
         if self.open_mode and (self.app_token or self.backup_app_token):
             warnings_list.append("OPEN_MODE=true while tokens exist. Service may be publicly exposed unintentionally.")
 
-        # Schema expectations
         if self.schema_enabled and self.schema_headers_always is not True:
             warnings_list.append("SCHEMA_ENABLED=true but SCHEMA_HEADERS_ALWAYS is not true. This can break column guarantees.")
 
         if self.schema_enabled and not schema_available():
             warnings_list.append("Schema modules not available/importable yet. Falling back to static page list.")
+
+        if self.public_exact_paths and self.protected_exact_paths:
+            overlap = set(self.public_exact_paths) & set(self.protected_exact_paths)
+            if overlap:
+                warnings_list.append(f"Paths appear in both public_exact_paths and protected_exact_paths: {sorted(overlap)}")
 
         return errors, warnings_list
 
@@ -1290,6 +1376,7 @@ class Settings:
         allowed = set(cls.__dataclass_fields__.keys())
         cleaned = {k: v for k, v in merged.items() if k in allowed}
         return cls(**cleaned)
+
 
 # =============================================================================
 # Settings cache + API
@@ -1324,11 +1411,14 @@ class SettingsCache:
         with self._lock:
             return {"size": len(self._cache), "ttl": self._ttl}
 
+
 _SETTINGS_CACHE_TTL = coerce_int(os.getenv("CORE_SETTINGS_CACHE_TTL"), 30, lo=1, hi=3600)
 _SETTINGS_CACHE = SettingsCache(ttl_seconds=_SETTINGS_CACHE_TTL)
 
+
 def get_settings() -> Settings:
     return Settings.from_env()
+
 
 def get_settings_cached(force_reload: bool = False) -> Settings:
     with TraceContext("get_settings_cached"):
@@ -1340,6 +1430,7 @@ def get_settings_cached(force_reload: bool = False) -> Settings:
         s = get_settings()
         _SETTINGS_CACHE.set("settings", s)
         return s
+
 
 # =============================================================================
 # Distributed sources (optional, LAZY, safe, env-driven)
@@ -1365,17 +1456,19 @@ class ConfigSourceManager:
                     _dbg("distributed source load failed", "warning", source=src.value, error=str(e))
         return merged
 
+
 _CONFIG_SOURCES = ConfigSourceManager()
 _DISTRIBUTED_INIT_DONE = False
 _DISTRIBUTED_INIT_LOCK = RLock()
+
 
 def _distributed_enabled() -> bool:
     if os.getenv("DISTRIBUTED_CONFIG_ENABLED") is not None:
         return coerce_bool(os.getenv("DISTRIBUTED_CONFIG_ENABLED"), False)
     return bool(os.getenv("CONSUL_HOST") or os.getenv("ETCD_HOST") or os.getenv("ZOOKEEPER_HOSTS"))
 
+
 class ConsulConfigSource:
-    """LAZY: does NOT connect in __init__."""
     def __init__(self, host: str, port: int, token: Optional[str], prefix: str):
         self.host = host
         self.port = port
@@ -1421,8 +1514,8 @@ class ConsulConfigSource:
             _dbg("consul load failed", "warning", error=str(e))
             return None
 
+
 class EtcdConfigSource:
-    """LAZY: does NOT connect in __init__."""
     def __init__(self, host: str, port: int, prefix: str):
         self.host = host
         self.port = port
@@ -1460,8 +1553,8 @@ class EtcdConfigSource:
             _dbg("etcd load failed", "warning", error=str(e))
             return None
 
+
 class ZooKeeperConfigSource:
-    """LAZY: client is created inside load() with a small timeout."""
     def __init__(self, hosts: str, prefix: str, start_timeout_sec: int = 3):
         self.hosts = hosts
         self.prefix = prefix
@@ -1510,11 +1603,8 @@ class ZooKeeperConfigSource:
             except Exception:
                 pass
 
+
 def init_distributed_config() -> None:
-    """
-    Register distributed sources only if env vars exist and feature is enabled.
-    STARTUP-SAFE: registers loaders only; no connections here.
-    """
     global _DISTRIBUTED_INIT_DONE
     with _DISTRIBUTED_INIT_LOCK:
         if _DISTRIBUTED_INIT_DONE:
@@ -1547,12 +1637,8 @@ def init_distributed_config() -> None:
                 src = ZooKeeperConfigSource(hosts=hosts, prefix=prefix, start_timeout_sec=zkt)
                 _CONFIG_SOURCES.register_source(ConfigSource.ZOOKEEPER, src.load)
 
+
 def reload_settings() -> Settings:
-    """
-    Reload settings by merging distributed overrides into env-derived settings.
-    - distributed init is LAZY and safe
-    - overrides keys must match Settings dataclass fields
-    """
     with TraceContext("reload_settings"):
         init_distributed_config()
         _SETTINGS_CACHE.clear()
@@ -1567,6 +1653,7 @@ def reload_settings() -> Settings:
         new_settings = Settings(**cleaned)
         _SETTINGS_CACHE.set("settings", new_settings)
         return new_settings
+
 
 def config_health_check() -> Dict[str, Any]:
     health: Dict[str, Any] = {"status": "healthy", "checks": {}, "warnings": [], "errors": []}
@@ -1587,16 +1674,22 @@ def config_health_check() -> Dict[str, Any]:
         health["checks"]["settings_accessible"] = False
         health["errors"].append(str(e))
 
+    s = get_settings_cached()
     health["checks"]["cache"] = _SETTINGS_CACHE.stats()
     health["checks"]["distributed_sources"] = len(_CONFIG_SOURCES.sources)
     health["checks"]["has_orjson"] = bool(_HAS_ORJSON)
     health["checks"]["tracing_enabled"] = bool(_TRACING_ENABLED and _OTEL_AVAILABLE)
     health["checks"]["schema_available"] = bool(schema_available())
     health["checks"]["schema_version"] = _SCHEMA_VERSION or "unknown"
+    health["checks"]["open_mode_effective"] = bool(is_open_mode())
+    health["checks"]["token_count"] = len(allowed_tokens())
+    health["checks"]["public_exact_paths"] = list(s.public_exact_paths or [])
+    health["checks"]["public_path_prefixes"] = list(s.public_path_prefixes or [])
     return health
 
+
 # =============================================================================
-# Auth helpers (used by API)
+# Auth helpers
 # =============================================================================
 def allowed_tokens() -> List[str]:
     """
@@ -1611,7 +1704,8 @@ def allowed_tokens() -> List[str]:
     toks = [t for t in toks if t]
     if toks:
         return toks
-    t1 = strip_value(os.getenv("APP_TOKEN") or os.getenv("TFB_APP_TOKEN") or "")
+
+    t1 = strip_value(os.getenv("APP_TOKEN") or os.getenv("TFB_APP_TOKEN") or os.getenv("BACKEND_TOKEN") or "")
     t2 = strip_value(os.getenv("BACKUP_APP_TOKEN") or "")
     out: List[str] = []
     if t1:
@@ -1619,6 +1713,7 @@ def allowed_tokens() -> List[str]:
     if t2 and t2 not in out:
         out.append(t2)
     return out
+
 
 def is_open_mode() -> bool:
     """
@@ -1631,6 +1726,7 @@ def is_open_mode() -> bool:
 
     req = coerce_bool(os.getenv("REQUIRE_AUTH"), True)
     return (not req) and (len(allowed_tokens()) == 0)
+
 
 def _norm_headers(headers: Any) -> Dict[str, str]:
     out: Dict[str, str] = {}
@@ -1648,6 +1744,7 @@ def _norm_headers(headers: Any) -> Dict[str, str]:
         pass
     return out
 
+
 def _extract_bearer(authorization: Optional[str]) -> Optional[str]:
     a = strip_value(authorization)
     if not a:
@@ -1656,22 +1753,77 @@ def _extract_bearer(authorization: Optional[str]) -> Optional[str]:
         return strip_value(a.split(" ", 1)[1])
     return a
 
+
+def is_public_path(path: Optional[str], settings: Optional[Settings] = None) -> bool:
+    s = settings or get_settings_cached()
+    p = normalize_request_path(path)
+    if not p:
+        return False
+
+    protected_exact = set(_clean_paths(s.protected_exact_paths or []))
+    if p in protected_exact:
+        return False
+
+    for prefix in _clean_paths(s.protected_path_prefixes or []):
+        if prefix != "/" and p.startswith(prefix):
+            return False
+
+    public_exact = set(_clean_paths(s.public_exact_paths or []))
+    if p in public_exact:
+        return True
+
+    for prefix in _clean_paths(s.public_path_prefixes or []):
+        if prefix == "/" or p.startswith(prefix):
+            return True
+
+    return False
+
+
 def auth_ok(
     token: Optional[str] = None,
     authorization: Optional[str] = None,
     headers: Optional[Any] = None,
     api_key: Optional[str] = None,
+    path: Optional[str] = None,
+    request: Optional[Any] = None,
+    settings: Optional[Settings] = None,
     **_: Any,
 ) -> bool:
     """
     Standard auth check used by routes.
+
     Supports:
+      - OPEN_MODE / REQUIRE_AUTH semantics
+      - path-aware public exemptions
       - token param
       - Authorization: Bearer <token>
-      - X-APP-TOKEN header
+      - configured auth header name (default X-APP-TOKEN)
       - X-API-KEY header
     """
+    s = settings or get_settings_cached()
+
+    req_path = path
+    req_headers = headers
+
+    if request is not None:
+        try:
+            if not req_path:
+                req_path = getattr(getattr(request, "url", None), "path", None) or getattr(request, "scope", {}).get("path")
+        except Exception:
+            pass
+        try:
+            if req_headers is None:
+                req_headers = getattr(request, "headers", None)
+        except Exception:
+            pass
+
     if is_open_mode():
+        return True
+
+    if not s.require_auth:
+        return True
+
+    if is_public_path(req_path, settings=s):
         return True
 
     allowed = set(allowed_tokens())
@@ -1681,12 +1833,20 @@ def auth_ok(
     if token and token in allowed:
         return True
 
-    h = _norm_headers(headers)
+    h = _norm_headers(req_headers)
     bearer = _extract_bearer(authorization or h.get("authorization"))
     if bearer and bearer in allowed:
         return True
 
-    app_token = h.get("x-app-token") or h.get("x_app_token")
+    configured_header = strip_value(s.auth_header_name or "X-APP-TOKEN").lower().replace("_", "-")
+    configured_header_alt = configured_header.replace("-", "_")
+
+    app_token = (
+        h.get(configured_header)
+        or h.get(configured_header_alt)
+        or h.get("x-app-token")
+        or h.get("x_app_token")
+    )
     if app_token and app_token in allowed:
         return True
 
@@ -1699,6 +1859,7 @@ def auth_ok(
 
     return False
 
+
 def mask_settings(settings: Optional[Settings] = None) -> Dict[str, Any]:
     s = settings or get_settings_cached()
     d = s.to_dict()
@@ -1710,6 +1871,7 @@ def mask_settings(settings: Optional[Settings] = None) -> Dict[str, Any]:
     d["schema_version"] = _SCHEMA_VERSION or "unknown"
     return d
 
+
 # =============================================================================
 # Exports
 # =============================================================================
@@ -1717,7 +1879,6 @@ __all__ = [
     "__version__",
     "CONFIG_VERSION",
     "CONFIG_BUILD_TIMESTAMP",
-    # core types
     "Environment",
     "LogLevel",
     "AuthType",
@@ -1725,7 +1886,6 @@ __all__ = [
     "ConfigSource",
     "ConfigStatus",
     "EncryptionMethod",
-    # utilities
     "TraceContext",
     "_dbg",
     "strip_value",
@@ -1739,7 +1899,6 @@ __all__ = [
     "load_file_content",
     "mask_secret",
     "mask_secret_dict",
-    # schema/pages
     "canonical_pages",
     "forbidden_pages",
     "is_output_page",
@@ -1752,24 +1911,21 @@ __all__ = [
     "schema_columns",
     "schema_row_template",
     "normalize_row_to_schema",
-    # versioning
+    "normalize_request_path",
+    "is_public_path",
     "ConfigVersion",
     "ConfigVersionManager",
     "get_version_manager",
     "save_config_version",
-    # encryption
     "ConfigEncryption",
-    # settings
     "Settings",
     "get_settings",
     "get_settings_cached",
     "reload_settings",
     "config_health_check",
-    # auth
     "allowed_tokens",
     "is_open_mode",
     "auth_ok",
     "mask_settings",
-    # distributed init
     "init_distributed_config",
 ]
