@@ -2,36 +2,67 @@
 # routes/analysis_sheet_rows.py
 """
 ================================================================================
-Analysis Sheet-Rows Router — v1.5.0 (PHASE 3/5 / SCHEMA-FIRST / SPECIAL-SAFE+)
+Analysis Sheet-Rows Router — v2.0.0
 ================================================================================
+SCHEMA-FIRST • CANONICAL PAGE DISPATCH • SPECIAL-PAGE SAFE • ROUTE-CANONICAL
 
-Endpoint:
-  POST /v1/analysis/sheet-rows
+Endpoint
+--------
+POST /v1/analysis/sheet-rows
 
-Primary goal:
-- Always return FULL schema headers + keys from schema_registry (authoritative order)
-- Never let special/output pages fall back to the 80-col instrument schema
+Main purpose
+------------
+This route is intended to be the canonical / strongest sheet-rows behavior for:
+- consistent page normalization
+- correct special-page dispatch
+- full schema-aligned headers/keys
+- populated rows where builders/engine support them
+- no accidental fallback of special pages to the generic 80-column instrument schema
 
-Fixes / Enhancements (aligned with your Advanced router pattern):
-- ✅ Explicit dispatch map for special pages:
-    - Insights_Analysis       -> core.analysis.insights_builder  (schema-normalized)
-    - Top_10_Investments      -> core.analysis.top10_builder     (schema-normalized)
-    - Data_Dictionary         -> core.sheets.data_dictionary     (schema-normalized)
-- ✅ Schema is always loaded FIRST and returned even when rows are empty
-- ✅ Stable ordering:
-    - instrument pages: rows follow requested symbols order
-    - special/table pages: builder output then limit/offset
-- ✅ Startup-safe: no network I/O at import-time; heavy imports are inside handler
-- ✅ Backward compatible: keeps optional core.data_engine.get_sheet_rows table-mode fallback
+What this revision improves
+---------------------------
+- ✅ FIX: Tightened canonical page handling through page_catalog helpers
+- ✅ FIX: Explicit route-family dispatch:
+    - Insights_Analysis  -> insights builder
+    - Top_10_Investments -> top10 builder/selector
+    - Data_Dictionary    -> data dictionary builder
+    - instrument pages   -> engine-backed analysis/enriched rows
+- ✅ FIX: Schema is always resolved first from schema_registry
+- ✅ FIX: Stable response shape for all pages
+- ✅ FIX: Instrument/table/special logic is clearer and more deterministic
+- ✅ FIX: Better fallback handling without corrupting schema alignment
+- ✅ FIX: Safer normalization from dict/object/list row shapes
+- ✅ SAFE: No network I/O at import time
+- ✅ SAFE: Optional auth only if core.config.auth_ok exists
 
-Request body:
-- Accepts: sheet/page/sheet_name/sheetName/name
-- For instrument pages: symbols/tickers list
-- Optional: limit, offset, include_matrix, top_n
+Request body (accepted names)
+-----------------------------
+Page:
+- sheet / page / sheet_name / sheetName / name / tab
 
-Response:
+Symbols:
+- symbols / tickers / tickers_list
+
+Optional:
+- limit
+- offset
+- include_matrix
+- top_n
+
+Response
+--------
 {
-  status, page, headers, keys, rows, rows_matrix?, version, request_id, meta
+  status,
+  page,
+  route_family,
+  headers,
+  keys,
+  rows,
+  rows_matrix?,
+  error?,
+  version,
+  request_id,
+  meta
 }
 ================================================================================
 """
@@ -44,12 +75,12 @@ import os
 import time
 import uuid
 from dataclasses import is_dataclass
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, status
 
 # -----------------------------------------------------------------------------
-# Schema registry (safe import)
+# Schema registry (authoritative)
 # -----------------------------------------------------------------------------
 try:
     from core.sheets.schema_registry import get_sheet_spec  # type: ignore
@@ -60,19 +91,41 @@ else:
     _SCHEMA_IMPORT_ERROR = None
 
 # -----------------------------------------------------------------------------
-# Page catalog helpers (best-effort)
+# Page catalog helpers (authoritative normalization / dispatch)
 # -----------------------------------------------------------------------------
 try:
-    from core.sheets.page_catalog import CANONICAL_PAGES, FORBIDDEN_PAGES, normalize_page_name  # type: ignore
+    from core.sheets.page_catalog import (  # type: ignore
+        CANONICAL_PAGES,
+        FORBIDDEN_PAGES,
+        allowed_pages,
+        get_route_family,
+        is_instrument_page,
+        normalize_page_name,
+    )
 except Exception:  # pragma: no cover
-    CANONICAL_PAGES = set()  # type: ignore
+    CANONICAL_PAGES = []  # type: ignore
     FORBIDDEN_PAGES = {"KSA_Tadawul", "Advisor_Criteria"}  # type: ignore
+
+    def allowed_pages() -> List[str]:  # type: ignore
+        return list(CANONICAL_PAGES) if CANONICAL_PAGES else []
 
     def normalize_page_name(name: str, allow_output_pages: bool = True) -> str:  # type: ignore
         return (name or "").strip().replace(" ", "_")
 
+    def get_route_family(name: str) -> str:  # type: ignore
+        if name == "Insights_Analysis":
+            return "insights"
+        if name == "Top_10_Investments":
+            return "top10"
+        if name == "Data_Dictionary":
+            return "dictionary"
+        return "instrument"
+
+    def is_instrument_page(name: str) -> bool:  # type: ignore
+        return get_route_family(name) == "instrument"
+
 # -----------------------------------------------------------------------------
-# Auth (optional)
+# Optional auth
 # -----------------------------------------------------------------------------
 try:
     from core.config import auth_ok, get_settings_cached  # type: ignore
@@ -83,20 +136,20 @@ except Exception:  # pragma: no cover
         return None
 
 # -----------------------------------------------------------------------------
-# Optional shared table builder (if you implement it in core.data_engine)
+# Optional shared table-mode helper
 # -----------------------------------------------------------------------------
 try:
     from core.data_engine import get_sheet_rows as core_get_sheet_rows  # type: ignore
 except Exception:  # pragma: no cover
     core_get_sheet_rows = None  # type: ignore
 
-ANALYSIS_SHEET_ROWS_VERSION = "1.5.0"
+ANALYSIS_SHEET_ROWS_VERSION = "2.0.0"
 router = APIRouter(prefix="/v1/analysis", tags=["Analysis Sheet Rows"])
 
 
-# -----------------------------------------------------------------------------
-# Utilities
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Generic helpers
+# =============================================================================
 def _strip(v: Any) -> str:
     try:
         return str(v).strip()
@@ -104,8 +157,27 @@ def _strip(v: Any) -> str:
         return ""
 
 
-def _pick_page_from_body(body: Dict[str, Any]) -> str:
-    for k in ("sheet", "page", "sheet_name", "sheetName", "name"):
+def _as_list(v: Any) -> List[Any]:
+    if v is None:
+        return []
+    if isinstance(v, list):
+        return v
+    if isinstance(v, tuple):
+        return list(v)
+    if isinstance(v, set):
+        return list(v)
+    if isinstance(v, str):
+        return [v]
+    if isinstance(v, Iterable):
+        try:
+            return list(v)
+        except Exception:
+            return [v]
+    return [v]
+
+
+def _pick_page_from_body(body: Mapping[str, Any]) -> str:
+    for k in ("sheet", "page", "sheet_name", "sheetName", "name", "tab"):
         s = _strip(body.get(k))
         if s:
             return s
@@ -116,7 +188,9 @@ def _maybe_int(v: Any, default: int) -> int:
     try:
         if v is None or isinstance(v, bool):
             return default
-        if isinstance(v, (int, float)):
+        if isinstance(v, int):
+            return v
+        if isinstance(v, float):
             return int(v)
         s = _strip(v)
         if not s:
@@ -139,7 +213,7 @@ def _maybe_bool(v: Any, default: bool) -> bool:
     return default
 
 
-def _get_list(body: Dict[str, Any], *keys: str) -> List[str]:
+def _get_list(body: Mapping[str, Any], *keys: str) -> List[str]:
     for k in keys:
         v = body.get(k)
         if isinstance(v, list):
@@ -149,6 +223,10 @@ def _get_list(body: Dict[str, Any], *keys: str) -> List[str]:
                 if s:
                     out.append(s)
             return out
+        if isinstance(v, str) and v.strip():
+            parts = [p.strip() for p in v.split(",") if p.strip()]
+            if parts:
+                return parts
     return []
 
 
@@ -157,27 +235,36 @@ def _to_plain_dict(obj: Any) -> Dict[str, Any]:
         return {}
     if isinstance(obj, dict):
         return obj
+
     try:
-        # pydantic v2
         if hasattr(obj, "model_dump") and callable(getattr(obj, "model_dump")):
-            return obj.model_dump(mode="python")  # type: ignore
-        # pydantic v1
-        if hasattr(obj, "dict") and callable(getattr(obj, "dict")):
-            return obj.dict()  # type: ignore
-        # dataclass
-        if is_dataclass(obj):
-            try:
-                return {k: getattr(obj, k) for k in obj.__dict__.keys() if not str(k).startswith("_")}
-            except Exception:
-                return {}
-        # plain object
-        if hasattr(obj, "__dict__"):
-            try:
-                return dict(obj.__dict__)
-            except Exception:
-                return {}
+            d = obj.model_dump(mode="python")  # type: ignore
+            return d if isinstance(d, dict) else {}
     except Exception:
-        return {}
+        pass
+
+    try:
+        if hasattr(obj, "dict") and callable(getattr(obj, "dict")):
+            d = obj.dict()  # type: ignore
+            return d if isinstance(d, dict) else {}
+    except Exception:
+        pass
+
+    try:
+        if is_dataclass(obj):
+            dd = getattr(obj, "__dict__", None)
+            if isinstance(dd, dict):
+                return {k: v for k, v in dd.items() if not str(k).startswith("_")}
+    except Exception:
+        pass
+
+    try:
+        dd = getattr(obj, "__dict__", None)
+        if isinstance(dd, dict):
+            return dict(dd)
+    except Exception:
+        pass
+
     return {}
 
 
@@ -196,15 +283,18 @@ def _allow_query_token(settings: Any, request: Request) -> bool:
             return bool(getattr(settings, "allow_query_token", False))
     except Exception:
         pass
+
     v = (os.getenv("ALLOW_QUERY_TOKEN", "") or "").strip().lower()
     if v in {"1", "true", "yes", "y", "on"}:
         return True
+
     try:
         hv = _strip(request.headers.get("X-Allow-Query-Token"))
         if hv.lower() in {"1", "true", "yes"}:
             return True
     except Exception:
         pass
+
     return False
 
 
@@ -219,8 +309,10 @@ def _extract_auth_token(
     auth_token = _strip(x_app_token)
     if authorization and authorization.strip().lower().startswith("bearer "):
         auth_token = authorization.strip().split(" ", 1)[1].strip()
+
     if token_query and not auth_token and _allow_query_token(settings, request):
         auth_token = _strip(token_query)
+
     return auth_token
 
 
@@ -232,29 +324,29 @@ def _ensure_page_allowed(page: str) -> None:
             detail={"error": f"Forbidden/removed page: {page}", "forbidden_pages": sorted(list(forbidden))},
         )
 
-    # If catalog exists, enforce it (but keep explicit allowances for output/meta pages)
     try:
-        cp = list(CANONICAL_PAGES) if CANONICAL_PAGES else []
-        if cp and page not in set(cp):
-            if page not in {"Data_Dictionary", "Top_10_Investments", "Insights_Analysis"}:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail={"error": f"Unknown page: {page}", "allowed_pages": cp},
-                )
+        ap = allowed_pages()
+        if ap and page not in set(ap):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"error": f"Unknown page: {page}", "allowed_pages": ap},
+            )
     except HTTPException:
         raise
     except Exception:
-        # If catalog is unavailable or malformed, do not block
         return
 
 
 def _schema_headers_keys(page: str) -> Tuple[List[str], List[str], Any]:
     if get_sheet_spec is None:
         raise KeyError("schema_registry unavailable")
+
     spec = get_sheet_spec(page)
     cols = getattr(spec, "columns", None) or []
+
     headers = [str(getattr(c, "header", "")) for c in cols if getattr(c, "header", None)]
     keys = [str(getattr(c, "key", "")) for c in cols if getattr(c, "key", None)]
+
     return headers, keys, spec
 
 
@@ -266,7 +358,7 @@ def _slice(rows: List[Dict[str, Any]], *, limit: int, offset: int) -> List[Dict[
     return rows[start:end]
 
 
-def _rows_to_matrix(rows: List[Dict[str, Any]], keys: Sequence[str]) -> List[List[Any]]:
+def _rows_to_matrix(rows: Sequence[Mapping[str, Any]], keys: Sequence[str]) -> List[List[Any]]:
     return [[r.get(k) for k in keys] for r in rows]
 
 
@@ -274,13 +366,16 @@ def _normalize_to_schema_keys(
     *,
     schema_keys: Sequence[str],
     schema_headers: Sequence[str],
-    raw: Dict[str, Any],
+    raw: Mapping[str, Any],
 ) -> Dict[str, Any]:
     """
     Normalize raw dict to schema keys.
-    Supports raw containing either schema keys or schema headers.
+    Accepts:
+    - schema keys directly
+    - schema headers directly
+    - case-insensitive variants
     """
-    raw = raw or {}
+    raw = dict(raw or {})
     raw_ci = {str(k).strip().lower(): v for k, v in raw.items()}
 
     header_by_key: Dict[str, str] = {}
@@ -310,9 +405,9 @@ def _normalize_to_schema_keys(
     return out
 
 
-# -----------------------------------------------------------------------------
-# Engine accessor + analysis fetch (instrument sheets)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Engine access
+# =============================================================================
 async def _get_engine(request: Request) -> Optional[Any]:
     try:
         st = getattr(request.app, "state", None)
@@ -340,13 +435,15 @@ async def _call_engine(fn: Any, *args: Any, **kwargs: Any) -> Any:
     return await _maybe_await(res)
 
 
-def _dict_is_symbol_map(d: Dict[str, Any], symbols: List[str]) -> bool:
+def _dict_is_symbol_map(d: Dict[str, Any], symbols: Sequence[str]) -> bool:
     if not isinstance(d, dict) or not symbols:
         return False
+
     symset = set(symbols)
     keys = [k for k in d.keys() if isinstance(k, str)]
     if not keys:
         return False
+
     hit = sum(1 for k in keys if k in symset)
     if hit == len(symset) and len(symset) > 0:
         return True
@@ -373,7 +470,11 @@ async def _fetch_analysis_rows(
 
     preferred: List[str] = []
     if want_analysis:
-        preferred += ["get_analysis_rows_batch", "get_analysis_quotes_batch", "get_enriched_quotes_batch"]
+        preferred += [
+            "get_analysis_rows_batch",
+            "get_analysis_quotes_batch",
+            "get_enriched_quotes_batch",
+        ]
     else:
         preferred += ["get_enriched_quotes_batch"]
 
@@ -383,6 +484,7 @@ async def _fetch_analysis_rows(
         fn = getattr(engine, method, None)
         if not callable(fn):
             continue
+
         try:
             try:
                 res = await _call_engine(fn, symbols, mode=mode, schema=schema)
@@ -398,13 +500,16 @@ async def _fetch_analysis_rows(
             if isinstance(res, dict):
                 if _dict_is_symbol_map(res, symbols):
                     return res
+
                 data = res.get("data") or res.get("rows") or res.get("items")
                 if isinstance(data, dict) and _dict_is_symbol_map(data, symbols):
                     return data
                 if isinstance(data, list):
                     return {s: r for s, r in zip(symbols, data)}
+
             elif isinstance(res, list):
                 return {s: r for s, r in zip(symbols, res)}
+
         except Exception:
             continue
 
@@ -448,9 +553,9 @@ async def _fetch_analysis_rows(
     return out
 
 
-# -----------------------------------------------------------------------------
-# Special builders (lazy + resilient)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Lazy builder imports
+# =============================================================================
 def _import_first_available(mod_names: Sequence[str]):
     last_err: Optional[Exception] = None
     for mn in mod_names:
@@ -488,6 +593,7 @@ async def _call_builder_best_effort(
         if callable(cand):
             fn = cand
             break
+
     if fn is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -526,18 +632,22 @@ async def _call_builder_best_effort(
         )
 
     rows: List[Dict[str, Any]] = []
+
     if isinstance(out, list):
-        rows = [r for r in out if isinstance(r, dict)]
+        rows = [_to_plain_dict(r) for r in out]
     elif isinstance(out, dict):
         r2 = out.get("rows") or out.get("data") or out.get("items") or out.get("records")
         if isinstance(r2, list):
-            rows = [r for r in r2 if isinstance(r, dict)]
+            rows = [_to_plain_dict(r) for r in r2]
         else:
-            rows = [out]
+            rows = [_to_plain_dict(out)]
     else:
         rows = []
 
-    return [_normalize_to_schema_keys(schema_keys=schema_keys, schema_headers=schema_headers, raw=(r or {})) for r in rows]
+    return [
+        _normalize_to_schema_keys(schema_keys=schema_keys, schema_headers=schema_headers, raw=(r or {}))
+        for r in rows
+    ]
 
 
 def _build_data_dictionary_rows_to_schema(
@@ -561,11 +671,10 @@ def _build_data_dictionary_rows_to_schema(
             detail={"error": "Data_Dictionary generator failed", "detail": str(e)},
         )
 
-    raw_rows = raw_rows or []
     out: List[Dict[str, Any]] = []
-    for r in raw_rows:
-        if isinstance(r, dict):
-            out.append(_normalize_to_schema_keys(schema_keys=schema_keys, schema_headers=schema_headers, raw=r))
+    for r in _as_list(raw_rows):
+        rd = _to_plain_dict(r)
+        out.append(_normalize_to_schema_keys(schema_keys=schema_keys, schema_headers=schema_headers, raw=rd))
     return out
 
 
@@ -610,9 +719,9 @@ async def _call_core_sheet_rows_best_effort(
     return None
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Route
-# -----------------------------------------------------------------------------
+# =============================================================================
 @router.post("/sheet-rows")
 async def analysis_sheet_rows(
     request: Request,
@@ -626,7 +735,6 @@ async def analysis_sheet_rows(
     start = time.time()
     request_id = x_request_id or str(uuid.uuid4())
 
-    # Schema registry availability
     if get_sheet_spec is None:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -637,13 +745,14 @@ async def analysis_sheet_rows(
             },
         )
 
-    # Settings (optional)
     try:
         settings = get_settings_cached()
     except Exception:
         settings = None
 
+    # -------------------------------------------------------------------------
     # Auth
+    # -------------------------------------------------------------------------
     auth_token = _extract_auth_token(
         token_query=token,
         x_app_token=x_app_token,
@@ -651,6 +760,7 @@ async def analysis_sheet_rows(
         settings=settings,
         request=request,
     )
+
     if auth_ok is not None:
         if not auth_ok(
             token=auth_token,
@@ -659,7 +769,9 @@ async def analysis_sheet_rows(
         ):
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
-    # Page
+    # -------------------------------------------------------------------------
+    # Page resolution
+    # -------------------------------------------------------------------------
     page_raw = _pick_page_from_body(body) or "Market_Leaders"
     try:
         page = normalize_page_name(page_raw, allow_output_pages=True)
@@ -668,16 +780,17 @@ async def analysis_sheet_rows(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={
                 "error": f"Invalid page: {str(e)}",
-                "allowed_pages": list(CANONICAL_PAGES) if CANONICAL_PAGES else None,
+                "allowed_pages": allowed_pages() if callable(allowed_pages) else list(CANONICAL_PAGES),
             },
         )
+
     _ensure_page_allowed(page)
+    route_family = str(get_route_family(page))
 
     include_matrix = _maybe_bool(body.get("include_matrix"), True)
     limit = max(1, min(5000, _maybe_int(body.get("limit"), 2000)))
     offset = max(0, _maybe_int(body.get("offset"), 0))
 
-    # Schema headers/keys/spec (authoritative)
     try:
         headers, keys, spec = _schema_headers_keys(page)
     except Exception as e:
@@ -686,7 +799,7 @@ async def analysis_sheet_rows(
             detail={
                 "error": f"Unknown page schema: {page}",
                 "detail": str(e),
-                "allowed_pages": list(CANONICAL_PAGES) if CANONICAL_PAGES else None,
+                "allowed_pages": allowed_pages() if callable(allowed_pages) else list(CANONICAL_PAGES),
             },
         )
 
@@ -696,15 +809,14 @@ async def analysis_sheet_rows(
             detail={"error": f"Schema for page '{page}' is empty", "page": page},
         )
 
-    # Symbols (instrument mode)
-    symbols = _get_list(body, "symbols", "tickers")
+    symbols = _get_list(body, "symbols", "tickers", "tickers_list")
     top_n = max(1, min(5000, _maybe_int(body.get("top_n"), 2000)))
     symbols = symbols[:top_n]
 
-    # -----------------------------------------------------------------------------
-    # ✅ EXPLICIT SPECIAL DISPATCH (prevents accidental 80-col fallback)
-    # -----------------------------------------------------------------------------
-    if page == "Insights_Analysis":
+    # -------------------------------------------------------------------------
+    # Explicit special-page dispatch
+    # -------------------------------------------------------------------------
+    if route_family == "insights":
         rows = await _call_builder_best_effort(
             module_names=("core.analysis.insights_builder",),
             function_names=(
@@ -727,6 +839,7 @@ async def analysis_sheet_rows(
         return {
             "status": "success",
             "page": page,
+            "route_family": route_family,
             "headers": headers,
             "keys": keys,
             "rows": rows,
@@ -735,7 +848,7 @@ async def analysis_sheet_rows(
             "request_id": request_id,
             "meta": {
                 "duration_ms": (time.time() - start) * 1000.0,
-                "schema_mode": "insights_builder",
+                "dispatch": "insights_builder",
                 "mode": mode,
                 "limit": limit,
                 "offset": offset,
@@ -743,11 +856,11 @@ async def analysis_sheet_rows(
             },
         }
 
-    if page == "Top_10_Investments":
-        # Prefer dedicated Top-10 builder module(s)
+    if route_family == "top10":
         try:
             rows = await _call_builder_best_effort(
                 module_names=(
+                    "core.analysis.top10_selector",
                     "core.analysis.top10_builder",
                     "core.analysis.top_10_builder",
                     "core.analysis.top_10_investments_builder",
@@ -759,6 +872,7 @@ async def analysis_sheet_rows(
                     "build_top_10_rows",
                     "build_top10_rows",
                     "get_top10_rows",
+                    "select_top10_rows",
                     "build_rows",
                 ),
                 request=request,
@@ -774,6 +888,7 @@ async def analysis_sheet_rows(
             return {
                 "status": "success",
                 "page": page,
+                "route_family": route_family,
                 "headers": headers,
                 "keys": keys,
                 "rows": rows,
@@ -782,7 +897,7 @@ async def analysis_sheet_rows(
                 "request_id": request_id,
                 "meta": {
                     "duration_ms": (time.time() - start) * 1000.0,
-                    "schema_mode": "top_10_builder",
+                    "dispatch": "top10_builder",
                     "mode": mode,
                     "limit": limit,
                     "offset": offset,
@@ -790,16 +905,17 @@ async def analysis_sheet_rows(
                 },
             }
         except HTTPException:
-            # If the top10 builder is not available, fall through to table-mode fallback below.
+            # fall through to shared table-mode helper if available
             pass
 
-    if page == "Data_Dictionary":
+    if route_family == "dictionary":
         rows = _build_data_dictionary_rows_to_schema(schema_keys=keys, schema_headers=headers)
         rows = _slice(rows, limit=limit, offset=offset)
 
         return {
             "status": "success",
             "page": page,
+            "route_family": route_family,
             "headers": headers,
             "keys": keys,
             "rows": rows,
@@ -808,7 +924,7 @@ async def analysis_sheet_rows(
             "request_id": request_id,
             "meta": {
                 "duration_ms": (time.time() - start) * 1000.0,
-                "schema_mode": "data_dictionary",
+                "dispatch": "data_dictionary",
                 "mode": mode,
                 "limit": limit,
                 "offset": offset,
@@ -816,9 +932,9 @@ async def analysis_sheet_rows(
             },
         }
 
-    # -----------------------------------------------------------------------------
-    # TABLE MODE (no symbols): schema-first, optional shared builder if available
-    # -----------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Table mode for instrument pages (no symbols)
+    # -------------------------------------------------------------------------
     if not symbols:
         payload = await _call_core_sheet_rows_best_effort(
             page=page,
@@ -828,11 +944,11 @@ async def analysis_sheet_rows(
             body=body,
         )
 
-        # No builder available -> schema-only (still correct headers/keys)
         if payload is None:
             return {
                 "status": "success",
                 "page": page,
+                "route_family": route_family,
                 "headers": headers,
                 "keys": keys,
                 "rows": [],
@@ -844,15 +960,12 @@ async def analysis_sheet_rows(
                     "mode": mode,
                     "limit": limit,
                     "offset": offset,
-                    "path": "schema_only_table_mode",
+                    "dispatch": "schema_only_table_mode",
                 },
             }
 
         raw_rows = payload.get("rows") or payload.get("data") or payload.get("items") or []
-        if not isinstance(raw_rows, list):
-            raw_rows = []
-        raw_rows = [r for r in raw_rows if isinstance(r, dict)]
-
+        raw_rows = [_to_plain_dict(r) for r in _as_list(raw_rows)]
         rows = [_normalize_to_schema_keys(schema_keys=keys, schema_headers=headers, raw=r) for r in raw_rows]
         rows = _slice(rows, limit=limit, offset=offset)
 
@@ -862,6 +975,7 @@ async def analysis_sheet_rows(
         return {
             "status": status_out,
             "page": page,
+            "route_family": route_family,
             "headers": headers,
             "keys": keys,
             "rows": rows,
@@ -874,25 +988,29 @@ async def analysis_sheet_rows(
                 "mode": mode,
                 "limit": limit,
                 "offset": offset,
-                "path": "core_get_sheet_rows" if core_get_sheet_rows is not None else "table_mode_fallback",
+                "dispatch": "core_get_sheet_rows" if core_get_sheet_rows is not None else "table_mode_fallback",
                 **(payload.get("meta") or {}),
             },
         }
 
-    # -----------------------------------------------------------------------------
-    # INSTRUMENT MODE (symbols provided): fetch analysis/enriched rows, schema-normalize
-    # -----------------------------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Instrument mode (symbols provided)
+    # -------------------------------------------------------------------------
+    if not is_instrument_page(page):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": f"Page '{page}' is not an instrument page for symbol-based retrieval."},
+        )
+
     engine = await _get_engine(request)
     if not engine:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Data engine unavailable")
 
     data_map = await _fetch_analysis_rows(engine, symbols, mode=(mode or ""), settings=settings, schema=spec)
 
-    # Prefer engine schema normalizer if present
     normalize_fn = None
     try:
         from core.data_engine_v2 import normalize_row_to_schema as _n  # type: ignore
-
         normalize_fn = _n
     except Exception:
         normalize_fn = None
@@ -903,13 +1021,13 @@ async def analysis_sheet_rows(
     for sym in symbols:
         raw_obj = data_map.get(sym)
         raw = _to_plain_dict(raw_obj)
+
         if isinstance(raw, dict) and raw.get("error"):
             errors += 1
 
         if callable(normalize_fn):
             try:
                 row = normalize_fn(page, raw, keep_extras=True)
-                # guarantee all keys exist
                 for k in keys:
                     if k not in row:
                         row[k] = None
@@ -918,7 +1036,6 @@ async def analysis_sheet_rows(
         else:
             row = _normalize_to_schema_keys(schema_keys=keys, schema_headers=headers, raw=raw)
 
-        # Ensure symbol exists if schema expects it
         if "symbol" in keys and not row.get("symbol"):
             row["symbol"] = sym
 
@@ -929,6 +1046,7 @@ async def analysis_sheet_rows(
     return {
         "status": status_out,
         "page": page,
+        "route_family": route_family,
         "headers": headers,
         "keys": keys,
         "rows": normalized_rows,
@@ -945,7 +1063,7 @@ async def analysis_sheet_rows(
             "computations_enabled": bool(getattr(settings, "computations_enabled", True)) if settings else True,
             "forecasting_enabled": bool(getattr(settings, "forecasting_enabled", True)) if settings else True,
             "scoring_enabled": bool(getattr(settings, "scoring_enabled", True)) if settings else True,
-            "path": "instrument_mode",
+            "dispatch": "instrument_mode",
         },
     }
 
