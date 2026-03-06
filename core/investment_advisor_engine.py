@@ -3,26 +3,42 @@
 # core/investment_advisor_engine.py
 """
 ================================================================================
-Investment Advisor Engine — MASTER ORCHESTRATOR — v4.1.0 (PHASE 4 ALIGNED)
+Investment Advisor Engine — MASTER ORCHESTRATOR — v4.2.0 (LIVE MODE FIX)
 ================================================================================
-Purpose
-- Universal adapter layer so ANY engine implementation (v1/v2/v3) can be consumed
-  by core/investment_advisor.py (Phase 4 aligned).
 
-Phase 4 Alignments
-- ✅ KSA_TADAWUL removed completely
-- ✅ No startup network I/O (capabilities discovery is introspection-only)
-- ✅ Snapshot adapter preserves schema-aware shapes:
-    - dict rows (rows: List[Dict])
-    - matrix rows + keys (rows_matrix + keys)
-    - legacy headers + rows (headers + rows)
-- ✅ Safe sync/async bridging via _safe_call (timeouts, avoids event-loop deadlocks)
-- ✅ TraceContext fixed (correct OTel context manager usage)
-- ✅ LRU cache is O(1) (OrderedDict), thread-safe, TTL-aware
+Fixes "No cached sheet snapshots found" + adds LIVE MODE.
 
-Public entry
-- run_investment_advisor(payload: dict, engine: Any=None, ...) -> dict
-- EngineSnapshotAdapter (get_cached_sheet_snapshot / get_cached_multi_sheet_snapshots)
+Root cause (your current production error)
+- Your DataEngineV2/V5 get_sheet_rows signature is keyword-only:
+    get_sheet_rows(*, sheet="Market_Leaders", limit=..., ...)
+  But the old adapter called legacy methods positionally:
+    engine.get_sheet_rows("Market_Leaders")  -> TypeError -> no snapshots -> advisor empty
+
+What v4.2.0 adds
+1) ✅ Robust calling: tries keyword-only and positional signatures safely.
+2) ✅ Live mode (AUTO by default):
+   - If cached snapshots are missing/empty, it will fetch *live sheet rows* via engine.get_sheet_rows
+   - Optionally enrich those sheet rows with engine quotes (engine.get_enriched_quotes_batch / get_quotes_batch)
+     to avoid snapshot dependency and ensure Advisor has real data.
+3) ✅ Snapshot shapes preserved:
+   - rows: List[Dict] (preferred)
+   - rows_matrix + keys (matrix support)
+   - headers + rows (legacy support)
+4) ✅ Startup-safe: no network I/O at import time; all engine calls happen at request time only.
+5) ✅ Keeps compatibility exports:
+   - run_investment_advisor(payload, engine=...)
+   - EngineSnapshotAdapter (now supports live modes)
+
+Advisor data modes
+- "snapshot"      : ONLY use engine cached snapshots (old behavior)
+- "live_sheet"    : build snapshots from engine.get_sheet_rows
+- "live_quotes"   : live_sheet + enrich rows with engine quotes (recommended)
+- "auto"          : try snapshot; if empty -> live_quotes; if that fails -> live_sheet
+
+Controls
+- payload["data_mode"] or payload["advisor_data_mode"] or payload["mode"] can set it.
+- env ADVISOR_DATA_MODE can set global default ("auto" by default).
+
 ================================================================================
 """
 
@@ -42,9 +58,9 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # High-Performance JSON fallback (safe)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 try:
     import orjson  # type: ignore
 
@@ -67,9 +83,9 @@ except Exception:
     def json_dumps(obj: Any) -> str:
         return json.dumps(obj, default=str, ensure_ascii=False)
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Monitoring & Tracing (safe)
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 try:
     from prometheus_client import Counter, Histogram  # type: ignore
 
@@ -119,7 +135,6 @@ class TraceContext:
     """
     Correct OTel usage:
       tracer.start_as_current_span(...) returns a context manager.
-      We enter it, set attributes one-by-one, exit closes the span.
     """
 
     def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
@@ -172,13 +187,13 @@ class TraceContext:
 # =============================================================================
 # Version
 # =============================================================================
-__version__ = "4.1.0"
+__version__ = "4.2.0"
 ENGINE_VERSION = __version__
 
 logger = logging.getLogger("core.investment_advisor_engine")
 
 # =============================================================================
-# Defaults (PHASE 4 aligned)
+# Defaults (PHASE aligned)
 # =============================================================================
 DEFAULT_SOURCES = [
     "Market_Leaders",
@@ -188,7 +203,6 @@ DEFAULT_SOURCES = [
     "My_Portfolio",
 ]
 
-# Fallback headers (match core/investment_advisor.py v4 output)
 DEFAULT_HEADERS: List[str] = [
     "Rank",
     "Symbol",
@@ -217,11 +231,10 @@ DEFAULT_HEADERS: List[str] = [
     "Last Updated (Riyadh)",
 ]
 
-# Cache TTL defaults (seconds)
 CACHE_TTL_DEFAULT = 300  # 5 minutes
 CACHE_TTL_SHEET = 600  # 10 minutes
 
-# Method priority groups for engine discovery/calls
+# Engine discovery
 METHOD_GROUPS: Dict[str, List[str]] = {
     "snapshot_multi": [
         "get_cached_multi_sheet_snapshots",
@@ -235,14 +248,26 @@ METHOD_GROUPS: Dict[str, List[str]] = {
         "get_cached_sheet",
         "get_sheet_cached",
     ],
-    "legacy_single": [
-        "get_cached_sheet_rows",
-        "get_sheet_rows_cached",
+    # NOTE: get_sheet_rows is typically keyword-only in your DataEngine
+    "sheet_rows": [
         "get_sheet_rows",
-        "get_sheet",
         "sheet_rows",
-        "fetch_sheet",
+        "build_sheet_rows",
         "get_rows",
+        "get_sheet",
+        "fetch_sheet",
+    ],
+    "quotes_batch": [
+        "get_enriched_quotes_batch",
+        "get_quotes_batch",
+        "fetch_quotes_batch",
+    ],
+    "quote_single": [
+        "get_enriched_quote_dict",
+        "get_quote_dict",
+        "get_enriched_quote",
+        "get_quote",
+        "fetch_quote",
     ],
     "news": [
         "get_news_score",
@@ -279,7 +304,7 @@ class AdapterMode(Enum):
 class CacheStrategy(Enum):
     NONE = "none"
     MEMORY = "memory"
-    ENGINE = "engine"
+    ENGINE = "engine"  # reserved
 
 
 class MethodResult(Enum):
@@ -288,6 +313,13 @@ class MethodResult(Enum):
     NOT_FOUND = "not_found"
     TIMEOUT = "timeout"
     EXCEPTION = "exception"
+
+
+class AdvisorDataMode(Enum):
+    SNAPSHOT = "snapshot"
+    LIVE_SHEET = "live_sheet"
+    LIVE_QUOTES = "live_quotes"
+    AUTO = "auto"
 
 
 @dataclass(slots=True)
@@ -303,7 +335,9 @@ class MethodCall:
 class EngineCapabilities:
     has_snapshot_multi: bool = False
     has_snapshot_single: bool = False
-    has_legacy_methods: bool = False
+    has_sheet_rows: bool = False
+    has_quotes_batch: bool = False
+    has_quote_single: bool = False
     has_news: bool = False
     has_technical: bool = False
     has_historical: bool = False
@@ -314,19 +348,11 @@ class EngineCapabilities:
 
     @property
     def can_fetch_sheets(self) -> bool:
-        return self.has_snapshot_multi or self.has_snapshot_single or self.has_legacy_methods
+        return self.has_snapshot_multi or self.has_snapshot_single or self.has_sheet_rows
 
 
 @dataclass(slots=True)
 class SnapshotEntry:
-    """
-    Cached snapshot entry. Snapshot is a normalized dict that preserves:
-      - keys (optional)
-      - rows_matrix
-      - rows (list[dict] OR list[list])
-      - headers (optional)
-    """
-
     sheet_name: str
     snapshot: Dict[str, Any]
     cached_at: datetime
@@ -363,7 +389,6 @@ class EngineMetrics:
         self.method_calls[method] = self.method_calls.get(method, 0) + 1
         if not success:
             self.method_errors[method] = self.method_errors.get(method, 0) + 1
-
         n = max(1, self.total_requests)
         self.avg_response_time_ms = ((self.avg_response_time_ms * (n - 1)) + float(duration_ms)) / n
         self.last_request_time = datetime.now(timezone.utc)
@@ -386,10 +411,6 @@ class EngineMetrics:
 # Cache Implementation (thread-safe, true LRU)
 # =============================================================================
 class SnapshotCache:
-    """
-    Thread-safe in-memory cache with true LRU eviction (O(1) via OrderedDict).
-    """
-
     def __init__(self, strategy: CacheStrategy = CacheStrategy.MEMORY, default_ttl: int = CACHE_TTL_DEFAULT, max_size: int = 500):
         self.strategy = strategy
         self.default_ttl = int(default_ttl)
@@ -401,7 +422,6 @@ class SnapshotCache:
     def get(self, sheet_name: str) -> Optional[SnapshotEntry]:
         if self.strategy == CacheStrategy.NONE:
             return None
-
         key = str(sheet_name)
         with self._lock:
             ent = self._cache.get(key)
@@ -412,16 +432,13 @@ class SnapshotCache:
                 self._cache.pop(key, None)
                 self._metrics.cache_misses += 1
                 return None
-
             ent.last_access = time.time()
-            self._cache.move_to_end(key, last=True)  # mark as most-recent
+            self._cache.move_to_end(key, last=True)
             self._metrics.cache_hits += 1
             return ent
 
     def set(self, sheet_name: str, snapshot: Dict[str, Any], source_method: str, ttl: Optional[int] = None) -> SnapshotEntry:
         now = datetime.now(timezone.utc)
-
-        # NONE: return non-stored entry
         if self.strategy == CacheStrategy.NONE:
             return SnapshotEntry(
                 sheet_name=str(sheet_name),
@@ -430,12 +447,9 @@ class SnapshotCache:
                 expires_at=now,
                 source_method=source_method,
             )
-
         ttl_seconds = int(ttl or self.default_ttl)
         key = str(sheet_name)
-
         with self._lock:
-            # upsert & move to MRU
             ent = SnapshotEntry(
                 sheet_name=key,
                 snapshot=snapshot,
@@ -446,20 +460,13 @@ class SnapshotCache:
             )
             self._cache[key] = ent
             self._cache.move_to_end(key, last=True)
-
-            # evict LRU if needed
             while len(self._cache) > self.max_size:
                 self._cache.popitem(last=False)
-
             return ent
 
     def clear(self) -> None:
         with self._lock:
             self._cache.clear()
-
-    def remove(self, sheet_name: str) -> None:
-        with self._lock:
-            self._cache.pop(str(sheet_name), None)
 
     def get_metrics(self) -> Dict[str, Any]:
         with self._lock:
@@ -476,7 +483,7 @@ class SnapshotCache:
 
 
 # =============================================================================
-# Safe calling helpers (sync/async bridging)
+# Safe calling helpers (sync/async bridging) + signature variants
 # =============================================================================
 def _filter_kwargs_for_callable(fn: Callable, kwargs: Dict[str, Any]) -> Dict[str, Any]:
     if not kwargs:
@@ -493,10 +500,6 @@ def _filter_kwargs_for_callable(fn: Callable, kwargs: Dict[str, Any]) -> Dict[st
 
 
 def _run_coro_in_thread(coro: Any, timeout: float) -> Tuple[Optional[Any], Optional[BaseException], bool]:
-    """
-    Run coroutine in a separate thread with its own loop.
-    Returns (result, error, timed_out).
-    """
     box: Dict[str, Any] = {"result": None, "error": None}
 
     def _worker():
@@ -520,15 +523,6 @@ def _safe_call(
     timeout: float = 2.0,
     **kwargs: Any,
 ) -> Tuple[Optional[Any], MethodResult, float, Optional[str]]:
-    """
-    Synchronous safe-call that supports:
-    - sync functions
-    - async functions
-    - sync functions returning awaitables
-
-    If called inside an active event loop, we execute awaitables in a thread
-    to avoid blocking / deadlocks.
-    """
     start = time.time()
 
     if engine is None:
@@ -544,7 +538,6 @@ def _safe_call(
         out = fn(*args, **kw)
 
         if inspect.isawaitable(out):
-            # Already inside a loop? don't block it; run in worker thread
             try:
                 loop = asyncio.get_running_loop()
                 in_loop = loop.is_running()
@@ -560,7 +553,6 @@ def _safe_call(
                     return None, MethodResult.EXCEPTION, dur, str(err)
                 return res, MethodResult.SUCCESS, dur, None
 
-            # no running loop => safe to run directly
             try:
                 res = asyncio.run(asyncio.wait_for(out, timeout=timeout))
                 dur = (time.time() - start) * 1000.0
@@ -580,8 +572,33 @@ def _safe_call(
         return None, MethodResult.EXCEPTION, dur, str(e)
 
 
+def _safe_call_variants(
+    engine: Any,
+    method_name: str,
+    variants: List[Tuple[Tuple[Any, ...], Dict[str, Any]]],
+    *,
+    timeout: float,
+) -> Tuple[Optional[Any], MethodResult, float, Optional[str], int]:
+    """
+    Try multiple signatures; return first SUCCESS.
+    """
+    last_err: Optional[str] = None
+    last_status: MethodResult = MethodResult.FAILED
+    last_dur: float = 0.0
+
+    for i, (args, kwargs) in enumerate(variants):
+        res, status, dur, err = _safe_call(engine, method_name, *args, timeout=timeout, **kwargs)
+        if status == MethodResult.SUCCESS:
+            return res, status, dur, None, i
+        last_err = err
+        last_status = status
+        last_dur = dur
+
+    return None, last_status, last_dur, last_err or "no_variants_succeeded", -1
+
+
 # =============================================================================
-# Capability Discovery (INTROSPECTION ONLY — no calls)
+# Capability discovery (INTROSPECTION ONLY — no calls)
 # =============================================================================
 def _has_any(engine: Any, names: List[str]) -> bool:
     for n in names:
@@ -597,7 +614,9 @@ def _discover_engine_capabilities(engine: Any) -> EngineCapabilities:
 
     caps.has_snapshot_multi = _has_any(engine, METHOD_GROUPS["snapshot_multi"])
     caps.has_snapshot_single = _has_any(engine, METHOD_GROUPS["snapshot_single"])
-    caps.has_legacy_methods = _has_any(engine, METHOD_GROUPS["legacy_single"])
+    caps.has_sheet_rows = _has_any(engine, METHOD_GROUPS["sheet_rows"])
+    caps.has_quotes_batch = _has_any(engine, METHOD_GROUPS["quotes_batch"])
+    caps.has_quote_single = _has_any(engine, METHOD_GROUPS["quote_single"])
     caps.has_news = _has_any(engine, METHOD_GROUPS["news"])
     caps.has_technical = _has_any(engine, METHOD_GROUPS["technical"])
     caps.has_historical = _has_any(engine, METHOD_GROUPS["historical"])
@@ -605,28 +624,92 @@ def _discover_engine_capabilities(engine: Any) -> EngineCapabilities:
 
 
 # =============================================================================
-# Snapshot normalization (preserve schema-aware shapes)
+# Snapshot normalization (schema-aware)
 # =============================================================================
+def _rows_dicts_from_matrix(keys: List[str], rows_matrix: List[List[Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if not keys or not isinstance(rows_matrix, list):
+        return out
+    for r in rows_matrix:
+        if not isinstance(r, (list, tuple)):
+            continue
+        d = {k: (r[i] if i < len(r) else None) for i, k in enumerate(keys)}
+        out.append(d)
+    return out
+
+
+def _normalize_sheet_rows_payload(sheet_name: str, payload: Dict[str, Any], source_method: str) -> Optional[Dict[str, Any]]:
+    """
+    Normalize engine.get_sheet_rows output to a snapshot dict.
+    Accepts envelopes like:
+      {headers, keys, rows, rows_matrix, meta, ...}
+    """
+    if not isinstance(payload, dict):
+        return None
+
+    headers = payload.get("headers") or []
+    keys = payload.get("keys") or []
+    rows = payload.get("rows") or []
+    rows_matrix = payload.get("rows_matrix")
+
+    # Sometimes engines return rows as matrix but don't use rows_matrix
+    if rows_matrix is None and isinstance(rows, list) and rows and isinstance(rows[0], (list, tuple)):
+        rows_matrix = rows
+
+    # Ensure keys list
+    if not isinstance(keys, list):
+        keys = []
+    keys = [str(k) for k in keys if str(k).strip()]
+
+    # Ensure headers list
+    if not isinstance(headers, list):
+        headers = []
+    headers = [str(h) for h in headers if str(h).strip()]
+
+    # Prefer dict rows
+    rows_dicts: List[Dict[str, Any]] = []
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        rows_dicts = [r for r in rows if isinstance(r, dict)]
+    elif rows_matrix is not None and isinstance(rows_matrix, list) and keys:
+        rows_dicts = _rows_dicts_from_matrix(keys, rows_matrix)  # build dict rows
+
+    snap: Dict[str, Any] = {
+        "sheet": sheet_name,
+        "source_method": source_method,
+    }
+    if headers:
+        snap["headers"] = headers
+    if keys:
+        snap["keys"] = keys
+    if rows_dicts:
+        snap["rows"] = rows_dicts
+    elif isinstance(rows_matrix, list):
+        snap["rows_matrix"] = rows_matrix
+        snap["rows"] = rows_matrix  # keep legacy consumers alive
+
+    # Preserve useful meta
+    meta = payload.get("meta")
+    if isinstance(meta, dict) and meta:
+        snap["meta"] = meta
+
+    # If still empty, return None
+    if not snap.get("rows") and not snap.get("rows_matrix"):
+        return None
+    return snap
+
+
 def _normalize_snapshot(sheet_name: str, result: Any, source_method: str) -> Optional[Dict[str, Any]]:
-    """
-    Accept multiple shapes and output a snapshot dict that preserves schema-aware fields:
-      - headers + rows (legacy matrix)
-      - keys + rows_matrix
-      - rows as list[dict]
-    """
     if result is None:
         return None
 
-    # Already a snapshot dict
     if isinstance(result, dict):
+        # If it's a sheet_rows payload, normalize it properly
+        if "rows" in result or "rows_matrix" in result or "keys" in result or "headers" in result:
+            snap2 = _normalize_sheet_rows_payload(sheet_name, result, source_method)
+            if snap2 is not None:
+                return snap2
+
         snap = dict(result)
-
-        # If rows is matrix, keep rows_matrix
-        if "rows_matrix" not in snap and isinstance(snap.get("rows"), list) and snap.get("rows"):
-            r0 = snap["rows"][0]
-            if isinstance(r0, (list, tuple)):
-                snap.setdefault("rows_matrix", snap.get("rows"))
-
         snap.setdefault("sheet", sheet_name)
         snap.setdefault("source_method", source_method)
         return snap
@@ -649,112 +732,369 @@ def _normalize_snapshot(sheet_name: str, result: Any, source_method: str) -> Opt
 
 
 # =============================================================================
-# Engine Snapshot Adapter
+# Live enrichment (quotes) helpers
+# =============================================================================
+def _safe_str(x: Any) -> str:
+    try:
+        s = str(x).strip()
+        return s
+    except Exception:
+        return ""
+
+
+def _extract_symbols_from_snapshot(snapshot: Dict[str, Any]) -> List[str]:
+    """
+    Extract symbols from:
+      - rows: List[Dict]  (symbol/ticker/code)
+      - rows_matrix + keys
+    """
+    out: List[str] = []
+    if not isinstance(snapshot, dict):
+        return out
+
+    # dict rows
+    rows = snapshot.get("rows")
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            s = r.get("symbol") or r.get("ticker") or r.get("code") or r.get("Symbol") or r.get("Ticker") or r.get("Code")
+            s = _safe_str(s)
+            if s:
+                out.append(s)
+        return out
+
+    # matrix rows
+    keys = snapshot.get("keys") or []
+    rows_matrix = snapshot.get("rows_matrix") or snapshot.get("rows")
+    if isinstance(keys, list) and isinstance(rows_matrix, list) and keys:
+        idx = None
+        for i, k in enumerate(keys):
+            lk = _safe_str(k).lower().strip()
+            if lk in {"symbol", "ticker", "code"}:
+                idx = i
+                break
+        if idx is not None:
+            for r in rows_matrix:
+                if isinstance(r, (list, tuple)) and idx < len(r):
+                    s = _safe_str(r[idx])
+                    if s:
+                        out.append(s)
+    return out
+
+
+async def _enrich_symbols_best_effort(engine: Any, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+    """
+    Fetch live quotes via engine methods (preferred: batch).
+    Returns map symbol -> quote dict
+    """
+    symbols = [s for s in (_safe_str(x) for x in (symbols or [])) if s]
+    if not symbols or engine is None:
+        return {}
+
+    # Batch methods first
+    for m in METHOD_GROUPS["quotes_batch"]:
+        fn = getattr(engine, m, None)
+        if not callable(fn):
+            continue
+        # Try common variants
+        variants = [
+            ((), {"symbols": symbols}),
+            ((symbols,), {}),
+            ((), {"tickers": symbols}),
+        ]
+        res, status, dur, err, _ = _safe_call_variants(engine, m, variants, timeout=10.0)
+        if status == MethodResult.SUCCESS and isinstance(res, dict):
+            # expected: {symbol: dict}
+            out: Dict[str, Dict[str, Any]] = {}
+            for k, v in res.items():
+                if isinstance(v, dict):
+                    out[_safe_str(k)] = dict(v)
+            if out:
+                return out
+
+    # Fallback: per-symbol
+    for m in METHOD_GROUPS["quote_single"]:
+        fn = getattr(engine, m, None)
+        if not callable(fn):
+            continue
+
+        async def one(sym: str) -> Tuple[str, Dict[str, Any]]:
+            variants = [
+                ((sym,), {}),
+                ((), {"symbol": sym}),
+                ((), {"ticker": sym}),
+            ]
+            r, st, _dur, _err, _ = _safe_call_variants(engine, m, variants, timeout=6.0)
+            if st == MethodResult.SUCCESS:
+                if isinstance(r, dict):
+                    return sym, dict(r)
+                # if model object, try dict-like
+                try:
+                    md = getattr(r, "model_dump", None)
+                    if callable(md):
+                        return sym, md(mode="python")  # type: ignore
+                except Exception:
+                    pass
+                try:
+                    return sym, dict(getattr(r, "__dict__", {}) or {})
+                except Exception:
+                    return sym, {}
+            return sym, {}
+
+        # Run concurrently (but bounded)
+        sem = asyncio.Semaphore(12)
+
+        async def guarded(sym: str):
+            async with sem:
+                return await one(sym)
+
+        pairs = await asyncio.gather(*(guarded(s) for s in symbols), return_exceptions=True)
+        out2: Dict[str, Dict[str, Any]] = {}
+        for p in pairs:
+            if isinstance(p, tuple) and len(p) == 2 and isinstance(p[1], dict):
+                out2[p[0]] = p[1]
+        if out2:
+            return out2
+
+    return {}
+
+
+def _merge_quote_into_row(row: Dict[str, Any], quote: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Enrichment wins only for missing/blank values (non-destructive by default).
+    """
+    out = dict(row or {})
+    q = quote or {}
+    for k, v in q.items():
+        if v is None:
+            continue
+        if k not in out or out.get(k) in (None, "", [], {}):
+            out[k] = v
+    return out
+
+
+# =============================================================================
+# Engine Advisor Adapter (snapshots + live modes)
 # =============================================================================
 class EngineSnapshotAdapter:
     """
     Universal adapter that makes any engine compatible with core/investment_advisor.py.
 
-    Provides:
-      - get_cached_sheet_snapshot(sheet_name) -> dict snapshot
-      - get_cached_multi_sheet_snapshots(list) -> {sheet: snapshot}
+    NEW in v4.2.0:
+    - supports live modes (auto/live_sheet/live_quotes)
+    - robust signature calling for keyword-only engines (DataEngineV2/V5)
     """
 
     def __init__(
         self,
         base_engine: Any,
+        *,
         cache_strategy: CacheStrategy = CacheStrategy.MEMORY,
         cache_ttl: int = CACHE_TTL_DEFAULT,
         discover: bool = True,
+        data_mode: AdvisorDataMode = AdvisorDataMode.AUTO,
     ):
         self._base = base_engine
         self._cache = SnapshotCache(strategy=cache_strategy, default_ttl=int(cache_ttl))
         self._capabilities = _discover_engine_capabilities(base_engine) if discover else EngineCapabilities()
         self._created_at = datetime.now(timezone.utc)
         self._metrics = EngineMetrics()
+        self._data_mode = data_mode
 
         if self._capabilities.has_snapshot_multi or self._capabilities.has_snapshot_single:
             self._mode = AdapterMode.NATIVE
-        elif self._capabilities.has_legacy_methods:
+        elif self._capabilities.has_sheet_rows:
             self._mode = AdapterMode.LEGACY
         else:
             self._mode = AdapterMode.STUB
 
         logger.info(
-            "EngineSnapshotAdapter init | mode=%s | multi=%s | single=%s | legacy=%s",
+            "EngineSnapshotAdapter init | mode=%s | data_mode=%s | multi=%s | single=%s | sheet_rows=%s | quotes_batch=%s",
             self._mode.value,
+            self._data_mode.value,
             self._capabilities.has_snapshot_multi,
             self._capabilities.has_snapshot_single,
-            self._capabilities.has_legacy_methods,
+            self._capabilities.has_sheet_rows,
+            self._capabilities.has_quotes_batch,
         )
 
     def __repr__(self) -> str:
-        return f"<EngineSnapshotAdapter mode={self._mode.value} base={type(self._base).__name__}>"
+        return f"<EngineSnapshotAdapter mode={self._mode.value} data_mode={self._data_mode.value} base={type(self._base).__name__}>"
 
     def __getattr__(self, name: str) -> Any:
-        # Pass-through for anything we don't implement.
         return getattr(self._base, name)
 
+    def set_data_mode(self, mode: AdvisorDataMode) -> None:
+        self._data_mode = mode
+
     # -------------------------
-    # Snapshot getters
+    # Internal: build snapshot from live sheet rows
     # -------------------------
-    def get_cached_sheet_snapshot(self, sheet_name: str) -> Optional[Dict[str, Any]]:
-        start = time.time()
+    def _build_snapshot_from_sheet_rows(self, sheet_name: str) -> Optional[Dict[str, Any]]:
+        if not self._capabilities.has_sheet_rows:
+            return None
+
         sname = str(sheet_name)
 
+        # Most important: keyword-only signature for your engine
+        body = {"include_matrix": True, "mode": "advisor"}
+
+        variants = [
+            ((), {"sheet": sname, "limit": 5000, "offset": 0, "mode": "advisor", "body": body}),
+            ((), {"sheet": sname, "limit": 5000, "offset": 0, "body": body}),
+            ((), {"sheet": sname}),
+            ((), {"page": sname, "limit": 5000, "offset": 0, "mode": "advisor", "body": body}),
+            ((sname,), {}),  # legacy positional fallback
+        ]
+
+        for method in METHOD_GROUPS["sheet_rows"]:
+            res, status, dur, err, _ = _safe_call_variants(self._base, method, variants, timeout=6.0)
+            self._metrics.record_call(method, dur, status == MethodResult.SUCCESS)
+            if status == MethodResult.SUCCESS:
+                snap = _normalize_snapshot(sname, res, source_method=method)
+                if snap is not None:
+                    return snap
+
+        return None
+
+    # -------------------------
+    # Internal: apply live quote enrichment
+    # -------------------------
+    def _enrich_snapshot_live_quotes(self, snapshot: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Enrich rows with quotes so Advisor doesn't depend on cached snapshots content.
+        This function is SYNC wrapper that safely runs async enrichment.
+        """
+        if not isinstance(snapshot, dict):
+            return snapshot
+
+        rows = snapshot.get("rows")
+        if not (isinstance(rows, list) and rows and isinstance(rows[0], dict)):
+            # Only enrich dict rows; if matrix only, keep as-is.
+            return snapshot
+
+        symbols = _extract_symbols_from_snapshot(snapshot)
+        if not symbols:
+            return snapshot
+
+        # run async enrichment safely even if we are inside an event loop
+        async def _do() -> Dict[str, Any]:
+            quotes = await _enrich_symbols_best_effort(self._base, symbols)
+            if not quotes:
+                return snapshot
+
+            new_rows: List[Dict[str, Any]] = []
+            for r in rows:
+                if not isinstance(r, dict):
+                    continue
+                sym = _safe_str(r.get("symbol") or r.get("ticker") or r.get("code") or "")
+                q = quotes.get(sym) or quotes.get(_safe_str(r.get("symbol_normalized") or "")) or {}
+                new_rows.append(_merge_quote_into_row(r, q if isinstance(q, dict) else {}))
+
+            snap2 = dict(snapshot)
+            snap2["rows"] = new_rows
+            snap2.setdefault("meta", {})
+            if isinstance(snap2["meta"], dict):
+                snap2["meta"]["live_quotes_enriched"] = True
+                snap2["meta"]["live_quotes_count"] = len(quotes)
+            return snap2
+
+        # execute
+        try:
+            loop = asyncio.get_running_loop()
+            in_loop = loop.is_running()
+        except RuntimeError:
+            in_loop = False
+
+        if in_loop:
+            res, err, timed_out = _run_coro_in_thread(_do(), timeout=12.0)
+            if timed_out or err is not None or not isinstance(res, dict):
+                return snapshot
+            return res
+
+        try:
+            return asyncio.run(asyncio.wait_for(_do(), timeout=12.0))
+        except Exception:
+            return snapshot
+
+    # -------------------------
+    # Public: snapshot getters used by core/investment_advisor.py
+    # -------------------------
+    def get_cached_sheet_snapshot(self, sheet_name: str) -> Optional[Dict[str, Any]]:
+        sname = str(sheet_name)
+
+        # 1) cache
         ent = self._cache.get(sname)
         if ent is not None:
-            self._metrics.record_call("cache_hit", 0.0, True)
             snap = dict(ent.snapshot)
             snap.setdefault("cached_at_utc", ent.cached_at.isoformat())
             snap.setdefault("cached", True)
             snap.setdefault("adapter_mode", self._mode.value)
+            snap.setdefault("advisor_data_mode", self._data_mode.value)
             return snap
 
         self._metrics.cache_misses += 1
 
-        # native snapshot single
-        if self._capabilities.has_snapshot_single:
+        # Helper to store & return
+        def _store_and_return(snap: Dict[str, Any], source: str) -> Dict[str, Any]:
+            ent2 = self._cache.set(sname, snap, source, ttl=CACHE_TTL_SHEET)
+            out = dict(snap)
+            out["cached_at_utc"] = ent2.cached_at.isoformat()
+            out["cached"] = False
+            out["adapter_mode"] = self._mode.value
+            out["advisor_data_mode"] = self._data_mode.value
+            return out
+
+        # Mode decision
+        mode = self._data_mode
+
+        # 2) snapshot-only
+        if mode in (AdvisorDataMode.SNAPSHOT, AdvisorDataMode.AUTO) and self._capabilities.has_snapshot_single:
             for method in METHOD_GROUPS["snapshot_single"]:
-                res, status, dur, err = _safe_call(self._base, method, sname, timeout=2.5)
+                variants = [
+                    ((sname,), {}),
+                    ((), {"sheet": sname}),
+                    ((), {"page": sname}),
+                    ((), {"sheet_name": sname}),
+                ]
+                res, status, dur, err, _ = _safe_call_variants(self._base, method, variants, timeout=3.5)
                 self._metrics.record_call(method, dur, status == MethodResult.SUCCESS)
                 if status == MethodResult.SUCCESS:
                     snap = _normalize_snapshot(sname, res, source_method=method)
                     if snap is not None:
-                        ent2 = self._cache.set(sname, snap, method, ttl=CACHE_TTL_SHEET)
-                        snap2 = dict(snap)
-                        snap2["cached_at_utc"] = ent2.cached_at.isoformat()
-                        snap2["cached"] = False
-                        snap2["adapter_mode"] = self._mode.value
-                        return snap2
+                        if mode == AdvisorDataMode.AUTO:
+                            # If snapshot is empty, fall through to live
+                            if not snap.get("rows") and not snap.get("rows_matrix"):
+                                break
+                        return _store_and_return(snap, method)
 
-        # legacy methods
-        if self._capabilities.has_legacy_methods:
-            for method in METHOD_GROUPS["legacy_single"]:
-                res, status, dur, err = _safe_call(self._base, method, sname, timeout=3.0)
-                self._metrics.record_call(method, dur, status == MethodResult.SUCCESS)
-                if status == MethodResult.SUCCESS:
-                    snap = _normalize_snapshot(sname, res, source_method=method)
-                    if snap is not None:
-                        ent2 = self._cache.set(sname, snap, method, ttl=CACHE_TTL_SHEET)
-                        snap2 = dict(snap)
-                        snap2["cached_at_utc"] = ent2.cached_at.isoformat()
-                        snap2["cached"] = False
-                        snap2["adapter_mode"] = "legacy"
-                        return snap2
+        # 3) live_sheet / live_quotes / auto fallback
+        if mode in (AdvisorDataMode.LIVE_SHEET, AdvisorDataMode.LIVE_QUOTES, AdvisorDataMode.AUTO):
+            snap_live = self._build_snapshot_from_sheet_rows(sname)
+            if snap_live is not None:
+                if mode in (AdvisorDataMode.LIVE_QUOTES, AdvisorDataMode.AUTO):
+                    snap_live = self._enrich_snapshot_live_quotes(snap_live)
+                return _store_and_return(snap_live, snap_live.get("source_method") or "sheet_rows")
 
-        self._metrics.record_call("get_cached_sheet_snapshot", (time.time() - start) * 1000.0, False)
         return None
 
     def get_cached_multi_sheet_snapshots(self, sheet_names: List[str]) -> Dict[str, Dict[str, Any]]:
-        start = time.time()
-        out: Dict[str, Dict[str, Any]] = {}
         names = [str(x) for x in (sheet_names or []) if str(x).strip()]
+        out: Dict[str, Dict[str, Any]] = {}
+        if not names:
+            return out
 
-        # native multi
-        if self._capabilities.has_snapshot_multi and names:
+        # Try native multi snapshots if allowed
+        if self._data_mode in (AdvisorDataMode.SNAPSHOT, AdvisorDataMode.AUTO) and self._capabilities.has_snapshot_multi:
             for method in METHOD_GROUPS["snapshot_multi"]:
-                res, status, dur, err = _safe_call(self._base, method, names, timeout=4.0)
+                variants = [
+                    ((names,), {}),
+                    ((), {"sheets": names}),
+                    ((), {"pages": names}),
+                    ((), {"sheet_names": names}),
+                ]
+                res, status, dur, err, _ = _safe_call_variants(self._base, method, variants, timeout=6.0)
                 self._metrics.record_call(method, dur, status == MethodResult.SUCCESS)
                 if status == MethodResult.SUCCESS and isinstance(res, dict):
                     for sheet, snap_obj in res.items():
@@ -767,28 +1107,27 @@ class EngineSnapshotAdapter:
                         snap2["cached_at_utc"] = ent2.cached_at.isoformat()
                         snap2["cached"] = False
                         snap2["adapter_mode"] = self._mode.value
+                        snap2["advisor_data_mode"] = self._data_mode.value
                         out[sname] = snap2
-                    if out:
-                        self._metrics.record_call("get_cached_multi_sheet_snapshots", (time.time() - start) * 1000.0, True)
+
+                    # In AUTO mode: if we got some snapshots but not all, we'll fill the rest live.
+                    if out and self._data_mode != AdvisorDataMode.AUTO:
                         return out
 
-        # fallback single
+        # Fallback: per-sheet getter (handles live modes)
         for s in names:
             snap = self.get_cached_sheet_snapshot(s)
             if snap is not None:
                 out[s] = snap
 
-        self._metrics.record_call("get_cached_multi_sheet_snapshots", (time.time() - start) * 1000.0, bool(out))
         return out
 
-    # -------------------------
-    # Optional signals (pass-through)
-    # -------------------------
+    # Pass-through helper methods (optional)
     def get_news_score(self, symbol: str) -> Optional[float]:
         if not self._capabilities.has_news:
             return None
         for method in METHOD_GROUPS["news"]:
-            res, status, dur, err = _safe_call(self._base, method, symbol, timeout=1.5)
+            res, status, dur, err = _safe_call(self._base, method, symbol, timeout=1.8)
             self._metrics.record_call(method, dur, status == MethodResult.SUCCESS)
             if status == MethodResult.SUCCESS:
                 try:
@@ -797,30 +1136,21 @@ class EngineSnapshotAdapter:
                     return None
         return None
 
-    def get_cached_news_score(self, symbol: str) -> Optional[float]:
-        return self.get_news_score(symbol)
-
-    def news_get_score(self, symbol: str) -> Optional[float]:
-        return self.get_news_score(symbol)
-
     def get_technical_signals(self, symbol: str) -> Dict[str, Any]:
         if not self._capabilities.has_technical:
             return {}
         for method in METHOD_GROUPS["technical"]:
-            res, status, dur, err = _safe_call(self._base, method, symbol, timeout=1.5)
+            res, status, dur, err = _safe_call(self._base, method, symbol, timeout=2.0)
             self._metrics.record_call(method, dur, status == MethodResult.SUCCESS)
             if status == MethodResult.SUCCESS and isinstance(res, dict):
                 return res
         return {}
 
-    def get_cached_technical_signals(self, symbol: str) -> Dict[str, Any]:
-        return self.get_technical_signals(symbol)
-
     def get_historical_returns(self, symbol: str, periods: List[str]) -> Dict[str, Optional[float]]:
         if not self._capabilities.has_historical:
             return {}
         for method in METHOD_GROUPS["historical"]:
-            res, status, dur, err = _safe_call(self._base, method, symbol, periods, timeout=2.5)
+            res, status, dur, err = _safe_call(self._base, method, symbol, periods, timeout=3.0)
             self._metrics.record_call(method, dur, status == MethodResult.SUCCESS)
             if status == MethodResult.SUCCESS and isinstance(res, dict):
                 out: Dict[str, Optional[float]] = {}
@@ -831,22 +1161,6 @@ class EngineSnapshotAdapter:
                         out[str(k)] = None
                 return out
         return {}
-
-    # -------------------------
-    # Manual snapshot set (optional)
-    # -------------------------
-    def set_cached_sheet_snapshot(self, sheet_name: str, headers: List[Any], rows: List[Any], meta: Dict[str, Any]) -> None:
-        sname = str(sheet_name)
-        matrix = [list(r) if isinstance(r, (list, tuple)) else [r] for r in (rows or [])]
-        snap: Dict[str, Any] = {
-            "sheet": sname,
-            "headers": [str(h) for h in (headers or [])],
-            "rows": matrix,
-            "rows_matrix": matrix,
-            "keys": meta.get("keys") if isinstance(meta, dict) else None,
-            "source_method": "manual_set",
-        }
-        self._cache.set(sname, snap, "manual_set", ttl=CACHE_TTL_SHEET)
 
     def clear_cache(self) -> None:
         self._cache.clear()
@@ -864,13 +1178,16 @@ class EngineSnapshotAdapter:
         return {
             "adapter": {
                 "mode": self._mode.value,
+                "advisor_data_mode": self._data_mode.value,
                 "created_at_utc": self._created_at.isoformat(),
                 "uptime_seconds": round((datetime.now(timezone.utc) - self._created_at).total_seconds(), 2),
             },
             "capabilities": {
                 "snapshot_multi": self._capabilities.has_snapshot_multi,
                 "snapshot_single": self._capabilities.has_snapshot_single,
-                "legacy": self._capabilities.has_legacy_methods,
+                "sheet_rows": self._capabilities.has_sheet_rows,
+                "quotes_batch": self._capabilities.has_quotes_batch,
+                "quote_single": self._capabilities.has_quote_single,
                 "news": self._capabilities.has_news,
                 "technical": self._capabilities.has_technical,
                 "historical": self._capabilities.has_historical,
@@ -880,21 +1197,17 @@ class EngineSnapshotAdapter:
         }
 
     def health_check(self) -> Dict[str, Any]:
-        # must not trigger any engine calls
         total_errors = sum(self._metrics.method_errors.values())
         status = "healthy"
         issues: List[str] = []
 
-        if total_errors > 100:
+        if self._mode == AdapterMode.STUB:
+            status = "unhealthy"
+            issues.append("No usable engine methods detected (no snapshots and no sheet_rows).")
+
+        if total_errors > 50:
             status = "degraded"
             issues.append(f"High method error count: {total_errors}")
-
-        total_cache = self._metrics.cache_hits + self._metrics.cache_misses
-        if total_cache > 20:
-            hit_rate = self._metrics.cache_hits / max(1, total_cache)
-            if hit_rate < 0.35:
-                status = "degraded"
-                issues.append(f"Low cache hit rate: {hit_rate:.0%}")
 
         return {
             "status": status,
@@ -907,6 +1220,33 @@ class EngineSnapshotAdapter:
 # =============================================================================
 # Main Entry Point
 # =============================================================================
+def _parse_data_mode(payload: Dict[str, Any]) -> AdvisorDataMode:
+    # payload override
+    raw = (
+        (payload or {}).get("data_mode")
+        or (payload or {}).get("advisor_data_mode")
+        or (payload or {}).get("mode")
+        or ""
+    )
+    raw = str(raw).strip().lower()
+
+    # env default
+    if not raw:
+        raw = str(os.getenv("ADVISOR_DATA_MODE", "auto") or "auto").strip().lower()
+
+    mapping = {
+        "snapshot": AdvisorDataMode.SNAPSHOT,
+        "snapshots": AdvisorDataMode.SNAPSHOT,
+        "live": AdvisorDataMode.LIVE_QUOTES,
+        "live_quotes": AdvisorDataMode.LIVE_QUOTES,
+        "quotes": AdvisorDataMode.LIVE_QUOTES,
+        "live_sheet": AdvisorDataMode.LIVE_SHEET,
+        "sheet": AdvisorDataMode.LIVE_SHEET,
+        "auto": AdvisorDataMode.AUTO,
+    }
+    return mapping.get(raw, AdvisorDataMode.AUTO)
+
+
 def run_investment_advisor(
     payload: Dict[str, Any],
     *,
@@ -916,14 +1256,14 @@ def run_investment_advisor(
     debug: bool = False,
 ) -> Dict[str, Any]:
     """
-    Engine-level entry that:
-    - wraps engine if snapshot methods are missing
-    - delegates to core.investment_advisor.run_investment_advisor(payload, engine=...)
+    Engine-level entry that ALWAYS passes an advisor-compatible engine object to core advisor.
+
+    Key change vs v4.1.0:
+    - We wrap the engine with EngineSnapshotAdapter even if it has some snapshot methods,
+      because AUTO live fallback is required to prevent empty advisor results.
     """
     with TraceContext("run_investment_advisor_engine", {"debug": bool(debug)}):
         start_time = time.time()
-
-        # stable request_id format for logs/traces
         request_id = uuid.uuid4().hex[:12]
 
         if debug:
@@ -952,22 +1292,25 @@ def run_investment_advisor(
             except Exception:
                 strat = CacheStrategy.MEMORY
 
+            data_mode = _parse_data_mode(payload or {})
+
             eng_obj = engine
             adapter_mode = "none"
 
             if engine is not None:
-                has_native = callable(getattr(engine, "get_cached_sheet_snapshot", None)) or callable(
-                    getattr(engine, "get_cached_multi_sheet_snapshots", None)
+                # Always wrap to ensure live fallback works and keyword-only calls are handled.
+                eng_obj = EngineSnapshotAdapter(
+                    engine,
+                    cache_strategy=strat,
+                    cache_ttl=int(cache_ttl),
+                    discover=True,
+                    data_mode=data_mode,
                 )
-                if not has_native:
-                    eng_obj = EngineSnapshotAdapter(engine, cache_strategy=strat, cache_ttl=int(cache_ttl))
-                    adapter_mode = "wrapped"
-                else:
-                    adapter_mode = "native"
+                adapter_mode = "wrapped"
             else:
                 adapter_mode = "none"
 
-            # import core advisor (no network I/O here)
+            # import core advisor
             try:
                 from core.investment_advisor import run_investment_advisor as core_run  # type: ignore
                 from core.investment_advisor import ADVISOR_VERSION as CORE_VERSION  # type: ignore
@@ -1002,6 +1345,7 @@ def run_investment_advisor(
                     "engine_version": ENGINE_VERSION,
                     "core_version": meta.get("core_version") or CORE_VERSION,
                     "adapter_mode": adapter_mode,
+                    "advisor_data_mode": data_mode.value,
                     "cache_strategy": strat.value,
                     "cache_ttl_sec": int(cache_ttl),
                     "request_id": request_id,
@@ -1010,9 +1354,10 @@ def run_investment_advisor(
                 }
             )
 
+            # Helpful diagnostics when empty
             if adapter_mode == "wrapped" and hasattr(eng_obj, "get_metrics"):
                 try:
-                    meta["adapter_metrics"] = eng_obj.get_metrics()
+                    meta["adapter_metrics"] = eng_obj.get_metrics()  # type: ignore[attr-defined]
                 except Exception:
                     pass
 
@@ -1052,12 +1397,18 @@ def run_investment_advisor_engine(payload: Dict[str, Any], *, engine: Any = None
     return run_investment_advisor(payload, engine=engine)
 
 
-def create_engine_adapter(engine: Any, cache_strategy: str = "memory", cache_ttl: int = CACHE_TTL_DEFAULT) -> EngineSnapshotAdapter:
+def create_engine_adapter(
+    engine: Any,
+    cache_strategy: str = "memory",
+    cache_ttl: int = CACHE_TTL_DEFAULT,
+    data_mode: str = "auto",
+) -> EngineSnapshotAdapter:
     try:
         strat = CacheStrategy(str(cache_strategy or "memory").lower())
     except Exception:
         strat = CacheStrategy.MEMORY
-    return EngineSnapshotAdapter(engine, cache_strategy=strat, cache_ttl=int(cache_ttl))
+    mode = _parse_data_mode({"data_mode": data_mode})
+    return EngineSnapshotAdapter(engine, cache_strategy=strat, cache_ttl=int(cache_ttl), data_mode=mode)
 
 
 # =============================================================================
@@ -1073,5 +1424,6 @@ __all__ = [
     "DEFAULT_SOURCES",
     "CacheStrategy",
     "AdapterMode",
+    "AdvisorDataMode",
     "SnapshotEntry",
 ]
