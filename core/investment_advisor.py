@@ -2,30 +2,48 @@
 # core/investment_advisor.py
 """
 ================================================================================
-Investment Advisor Core — v4.0.0 (PHASE 4 ALIGNED / SCHEMA-AWARE / SAFE)
+Investment Advisor Core — v4.1.0 (LIVE-BY-DEFAULT / SNAPSHOT-FALLBACK / SAFE)
 ================================================================================
-Key Alignments:
-- ✅ KSA_TADAWUL removed completely
-- ✅ Uses page_catalog.normalize_page_name (aliases -> canonical) when available
-- ✅ Uses schema_registry to map sheet headers -> canonical schema keys when available
-- ✅ Consumes engine cached sheet snapshots safely (dict rows OR matrix rows)
-- ✅ Uses core.scoring.compute_scores() to produce:
-    risk_score, overall_score, valuation_score, momentum_score, confidence_score,
-    value_score, quality_score, opportunity_score, recommendation, recommendation_reason
-- ✅ Optimization methods are optional; safe fallbacks if numpy/scipy not present
+
+Why this revision (your advisor-empty issue)
+- Your advisor logic depended on cached sheet snapshots.
+- In your environment, cache is often empty, so advisor returned:
+    "No cached sheet snapshots found"
+
+What v4.1.0 changes
+1) ✅ LIVE MODE by default (unless explicitly set to snapshot):
+   - Builds “snapshots on demand” by calling engine.get_sheet_rows(...) per page.
+   - Optional enrichment via engine quote batch (best-effort) to fill missing fields.
+2) ✅ Snapshot still supported (and used if requested):
+   - If payload requests snapshot mode, we use cached snapshots only.
+3) ✅ AUTO mode supported:
+   - Try snapshot first; if empty → live mode.
+4) ✅ Safe sync/async bridging:
+   - Works if engine methods are async and this module is invoked inside an event loop.
+
+Inputs
+- payload["advisor_data_mode"] / payload["data_mode"] / payload["mode"]
+    snapshot | live_sheet | live_quotes | auto
+- env ADVISOR_DATA_MODE (same values)
+Default if not set: live_quotes   (force live by default)
 
 Entry:
 - run_investment_advisor(payload: dict, engine: Any=None) -> dict
+
 ================================================================================
 """
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 import json
 import logging
 import math
 import os
+import threading
 import time
+import traceback
 from collections import defaultdict
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timedelta, timezone
@@ -162,7 +180,6 @@ except Exception:
     _HAS_SCORING = False
 
     def _compute_scores(row: Dict[str, Any], *, settings: Any = None) -> Dict[str, Any]:  # type: ignore
-        # minimal fallback
         return {
             "risk_score": None,
             "overall_score": None,
@@ -179,12 +196,11 @@ except Exception:
 # ---------------------------------------------------------------------------
 # Version / constants
 # ---------------------------------------------------------------------------
-__version__ = "4.0.0"
+__version__ = "4.1.0"
 ADVISOR_VERSION = __version__
 
 logger = logging.getLogger("core.investment_advisor")
 
-# ✅ PHASE 4: KSA_TADAWUL removed
 DEFAULT_SOURCES = [
     "Market_Leaders",
     "Global_Markets",
@@ -215,6 +231,73 @@ class AllocationStrategy(Enum):
     MINIMUM_VARIANCE = "minimum_variance"
     MAXIMUM_SHARPE = "maximum_sharpe"
     BLACK_LITTERMAN = "black_litterman"
+
+
+class AdvisorDataMode(Enum):
+    SNAPSHOT = "snapshot"
+    LIVE_SHEET = "live_sheet"
+    LIVE_QUOTES = "live_quotes"
+    AUTO = "auto"
+
+
+# =============================================================================
+# Safe sync/async bridging (works inside FastAPI event loop)
+# =============================================================================
+def _in_running_loop() -> bool:
+    try:
+        loop = asyncio.get_running_loop()
+        return bool(loop.is_running())
+    except Exception:
+        return False
+
+
+def _run_coro_in_thread(coro: Any, timeout: float) -> Tuple[Optional[Any], Optional[BaseException], bool]:
+    box: Dict[str, Any] = {"result": None, "error": None}
+
+    def _worker():
+        try:
+            box["result"] = asyncio.run(asyncio.wait_for(coro, timeout=timeout))
+        except BaseException as e:  # noqa
+            box["error"] = e
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout + 0.25)
+    if t.is_alive():
+        return None, None, True
+    return box["result"], box["error"], False
+
+
+def _safe_call(engine: Any, method: str, *args: Any, timeout: float = 6.0, **kwargs: Any) -> Tuple[Optional[Any], Optional[str]]:
+    """
+    Calls sync/async engine methods safely from a sync context.
+    Returns (result, error_str_or_None)
+    """
+    if engine is None:
+        return None, "engine_none"
+    fn = getattr(engine, method, None)
+    if not callable(fn):
+        return None, "method_not_found"
+
+    try:
+        out = fn(*args, **kwargs)
+        if inspect.isawaitable(out):
+            if _in_running_loop():
+                res, err, timed_out = _run_coro_in_thread(out, timeout=timeout)
+                if timed_out:
+                    return None, f"timeout:{timeout}s"
+                if err is not None:
+                    return None, f"exception:{type(err).__name__}:{err}"
+                return res, None
+            # no loop => safe to run directly
+            try:
+                res = asyncio.run(asyncio.wait_for(out, timeout=timeout))
+                return res, None
+            except asyncio.TimeoutError:
+                return None, f"timeout:{timeout}s"
+        return out, None
+    except Exception as e:
+        return None, f"exception:{type(e).__name__}:{e}"
 
 
 # =============================================================================
@@ -263,10 +346,10 @@ def _to_int(x: Any) -> Optional[int]:
 
 def _as_ratio(x: Any) -> Optional[float]:
     """
-    Keep ratios as fractions.
-    0.12 => 12%
-    12   => 12% => 0.12
-    "12%" => 0.12
+    Keep ratios as fractions:
+      0.12 => 0.12
+      12   => 0.12
+      "12%" => 0.12
     """
     f = _to_float(x)
     if f is None:
@@ -312,9 +395,6 @@ def _norm_key(k: Any) -> str:
 
 
 def _snake_like(header: str) -> str:
-    """
-    Convert 'Market Cap' -> 'market_cap'
-    """
     s = _safe_str(header)
     s = s.strip().replace("%", " pct").replace("/", " ")
     out = []
@@ -334,9 +414,6 @@ def _snake_like(header: str) -> str:
 
 
 def _get_any(row: Dict[str, Any], *names: str) -> Any:
-    """
-    Case/space-insensitive get.
-    """
     if not row:
         return None
     for n in names:
@@ -395,13 +472,36 @@ def _symbol_variants(symbol: str) -> Set[str]:
 
 
 # =============================================================================
-# Schema-aware row building from snapshots
+# Mode selection (LIVE by default)
+# =============================================================================
+def _parse_advisor_data_mode(payload: Dict[str, Any]) -> AdvisorDataMode:
+    raw = (
+        (payload or {}).get("advisor_data_mode")
+        or (payload or {}).get("data_mode")
+        or (payload or {}).get("mode")
+        or ""
+    )
+    raw = str(raw).strip().lower()
+    if not raw:
+        raw = str(os.getenv("ADVISOR_DATA_MODE", "live_quotes") or "live_quotes").strip().lower()
+
+    mapping = {
+        "snapshot": AdvisorDataMode.SNAPSHOT,
+        "snapshots": AdvisorDataMode.SNAPSHOT,
+        "live_sheet": AdvisorDataMode.LIVE_SHEET,
+        "sheet": AdvisorDataMode.LIVE_SHEET,
+        "live_quotes": AdvisorDataMode.LIVE_QUOTES,
+        "quotes": AdvisorDataMode.LIVE_QUOTES,
+        "live": AdvisorDataMode.LIVE_QUOTES,
+        "auto": AdvisorDataMode.AUTO,
+    }
+    return mapping.get(raw, AdvisorDataMode.LIVE_QUOTES)
+
+
+# =============================================================================
+# Schema-aware row building from snapshots / sheet_rows
 # =============================================================================
 def _schema_header_to_key(sheet_name: str, header: str) -> str:
-    """
-    Use schema_registry (if available) to map header->key for a given sheet.
-    Otherwise fall back to snake-like conversion.
-    """
     if _HAS_SCHEMA:
         try:
             spec = _get_sheet_spec(sheet_name)
@@ -425,23 +525,19 @@ def _rows_matrix_to_keyed_dicts(
     keys: Optional[List[str]] = None,
     limit: int = 5000,
 ) -> List[Dict[str, Any]]:
-    """
-    Convert matrix rows to dict rows using:
-    1) keys list if provided
-    2) else schema_registry header->key mapping
-    3) else snake-like from header
-    """
     if not isinstance(rows, list) or not rows:
         return []
 
-    # determine columns
     if keys and isinstance(keys, list) and all(isinstance(k, str) for k in keys) and keys:
         col_keys = list(keys)
     else:
         hdrs = [str(x).strip() for x in (headers or [])]
         if not hdrs:
-            # if no headers, create generic
-            hdrs = [f"col_{i+1}" for i in range(max(len(r) for r in rows if isinstance(r, (list, tuple))) or 0)]
+            try:
+                max_len = max(len(r) for r in rows if isinstance(r, (list, tuple)))
+            except Exception:
+                max_len = 0
+            hdrs = [f"col_{i+1}" for i in range(max_len)]
         col_keys = [_schema_header_to_key(sheet_name, h) for h in hdrs]
 
     out: List[Dict[str, Any]] = []
@@ -459,11 +555,6 @@ def _rows_matrix_to_keyed_dicts(
 
 
 def _normalize_source_pages(sources: List[str]) -> List[str]:
-    """
-    - expand ALL
-    - normalize aliases via page_catalog if available
-    - remove disallowed pages (Data_Dictionary / Top_10_Investments / Insights_Analysis)
-    """
     raw: List[str] = []
     for s in sources or []:
         if not s:
@@ -484,7 +575,7 @@ def _normalize_source_pages(sources: List[str]) -> List[str]:
         except Exception:
             page = s
 
-        # hard excludes (project spec)
+        # hard excludes
         if page in {"KSA_TADAWUL", "Advisor_Criteria", "AI_Opportunity_Report"}:
             continue
         if page in {"Data_Dictionary", "Top_10_Investments", "Insights_Analysis"}:
@@ -498,110 +589,267 @@ def _normalize_source_pages(sources: List[str]) -> List[str]:
 
 
 # =============================================================================
-# Engine snapshot helpers
+# Engine snapshot + live sheet builders
 # =============================================================================
-def _engine_get_snapshot(engine: Any, sheet_name: str) -> Optional[Dict[str, Any]]:
-    if engine is None:
-        return None
-    fn = getattr(engine, "get_cached_sheet_snapshot", None)
-    if callable(fn):
-        try:
-            snap = fn(sheet_name)
-            return snap if isinstance(snap, dict) else None
-        except Exception:
-            return None
-    return None
-
-
 def _engine_get_multi_snapshots(engine: Any, sheet_names: List[str]) -> Dict[str, Dict[str, Any]]:
     if engine is None:
         return {}
     fn = getattr(engine, "get_cached_multi_sheet_snapshots", None)
     if callable(fn):
-        try:
-            out = fn(sheet_names)
-            if isinstance(out, dict):
-                return {str(k): v for k, v in out.items() if isinstance(v, dict)}
-        except Exception:
-            pass
-    out2: Dict[str, Dict[str, Any]] = {}
-    for s in sheet_names or []:
-        snap = _engine_get_snapshot(engine, s)
-        if snap:
-            out2[str(s)] = snap
-    return out2
+        res, err = _safe_call(engine, "get_cached_multi_sheet_snapshots", sheet_names, timeout=6.0)
+        if err is None and isinstance(res, dict):
+            return {str(k): v for k, v in res.items() if isinstance(v, dict)}
+    # fallback single
+    out: Dict[str, Dict[str, Any]] = {}
+    fn2 = getattr(engine, "get_cached_sheet_snapshot", None)
+    if callable(fn2):
+        for s in sheet_names or []:
+            r, e = _safe_call(engine, "get_cached_sheet_snapshot", str(s), timeout=4.0)
+            if e is None and isinstance(r, dict):
+                out[str(s)] = r
+    return out
 
 
+def _engine_get_sheet_rows_payload(engine: Any, sheet_name: str, limit: int = 5000) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Calls engine.get_sheet_rows (or equivalents) using keyword-only signatures first.
+    Expected (best effort) output shapes:
+      {headers, keys, rows, rows_matrix, meta, ...}
+    """
+    if engine is None:
+        return None, "engine_none"
+
+    # prefer canonical method names
+    candidates = ["get_sheet_rows", "sheet_rows", "build_sheet_rows", "get_sheet", "fetch_sheet", "get_rows"]
+    for m in candidates:
+        if not callable(getattr(engine, m, None)):
+            continue
+
+        body = {"include_matrix": True, "mode": "advisor"}
+        variants = [
+            ((), {"sheet": sheet_name, "limit": limit, "offset": 0, "mode": "advisor", "body": body}),
+            ((), {"sheet": sheet_name, "limit": limit, "offset": 0, "body": body}),
+            ((), {"sheet": sheet_name, "limit": limit}),
+            ((), {"sheet": sheet_name}),
+            ((), {"page": sheet_name, "limit": limit, "offset": 0, "mode": "advisor", "body": body}),
+            ((sheet_name,), {}),  # legacy positional
+        ]
+
+        last_err = None
+        for args, kwargs in variants:
+            res, err = _safe_call(engine, m, *args, timeout=8.0, **kwargs)
+            if err is None and isinstance(res, dict):
+                return res, None
+            last_err = err
+        # try next method
+        if last_err:
+            continue
+
+    return None, "sheet_rows_method_not_found_or_failed"
+
+
+def _engine_get_quotes_batch(engine: Any, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+    """
+    Best-effort batch quote fetch.
+    Returns {symbol: quote_dict}
+    """
+    if engine is None:
+        return {}
+    syms = [s for s in (_safe_str(x).strip() for x in (symbols or [])) if s]
+    if not syms:
+        return {}
+
+    methods = ["get_enriched_quotes_batch", "get_quotes_batch", "fetch_quotes_batch"]
+    for m in methods:
+        if not callable(getattr(engine, m, None)):
+            continue
+
+        variants = [
+            ((), {"symbols": syms}),
+            ((syms,), {}),
+            ((), {"tickers": syms}),
+        ]
+        for args, kwargs in variants:
+            res, err = _safe_call(engine, m, *args, timeout=12.0, **kwargs)
+            if err is None and isinstance(res, dict):
+                out: Dict[str, Dict[str, Any]] = {}
+                for k, v in res.items():
+                    if isinstance(v, dict):
+                        out[_safe_str(k)] = dict(v)
+                if out:
+                    return out
+    return {}
+
+
+def _merge_non_destructive(dst: Dict[str, Any], src: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(dst or {})
+    for k, v in (src or {}).items():
+        if v is None:
+            continue
+        if k not in out or out.get(k) in (None, "", [], {}):
+            out[k] = v
+    return out
+
+
+def _extract_symbols_from_rows(rows: List[Dict[str, Any]]) -> List[str]:
+    out: List[str] = []
+    for r in rows or []:
+        if not isinstance(r, dict):
+            continue
+        s = r.get("symbol") or r.get("ticker") or r.get("code") or r.get("Symbol") or r.get("Ticker")
+        s = _safe_str(s).strip()
+        if s:
+            out.append(_norm_symbol(s))
+    # unique preserve order
+    seen = set()
+    uniq = []
+    for s in out:
+        if s and s not in seen:
+            seen.add(s)
+            uniq.append(s)
+    return uniq
+
+
+# =============================================================================
+# Universe fetch (snapshot vs live)
+# =============================================================================
 def _fetch_universe(
     sources: List[str],
     *,
     engine: Any,
+    payload: Dict[str, Any],
     max_rows_per_source: int = 5000,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Optional[str]]:
+    mode = _parse_advisor_data_mode(payload or {})
+    sources_norm = _normalize_source_pages(sources)
+
     meta: Dict[str, Any] = {
-        "sources": sources,
+        "sources": sources_norm,
         "engine": type(engine).__name__ if engine is not None else None,
         "items": [],
-        "mode": "engine_snapshot",
+        "advisor_data_mode": mode.value,
+        "mode_used": None,
     }
+
     if engine is None:
         return [], meta, "Missing engine instance"
 
-    sources_norm = _normalize_source_pages(sources)
-    snaps = _engine_get_multi_snapshots(engine, sources_norm)
-    out_rows: List[Dict[str, Any]] = []
+    # ----------------------------
+    # 1) Snapshot path (if allowed)
+    # ----------------------------
+    if mode in (AdvisorDataMode.SNAPSHOT, AdvisorDataMode.AUTO):
+        snaps = _engine_get_multi_snapshots(engine, sources_norm)
+        out_rows: List[Dict[str, Any]] = []
 
+        for sheet in sources_norm:
+            snap = snaps.get(sheet)
+            if not isinstance(snap, dict):
+                meta["items"].append({"sheet": sheet, "cached": False})
+                continue
+
+            headers = snap.get("headers") or []
+            keys = snap.get("keys") or snap.get("schema_keys") or None
+            rows = snap.get("rows")
+            rows_matrix = snap.get("rows_matrix")
+
+            if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+                for d in rows[:max_rows_per_source]:
+                    if isinstance(d, dict):
+                        dd = dict(d)
+                        dd["_Sheet"] = sheet
+                        out_rows.append(dd)
+                meta["items"].append({"sheet": sheet, "cached": True, "rows": len(rows), "dict_rows": True})
+            else:
+                matrix = rows_matrix if isinstance(rows_matrix, list) else rows if isinstance(rows, list) else []
+                if isinstance(matrix, list) and matrix:
+                    dicts = _rows_matrix_to_keyed_dicts(
+                        sheet,
+                        headers=headers if isinstance(headers, list) else [],
+                        rows=matrix,
+                        keys=keys if isinstance(keys, list) else None,
+                        limit=max_rows_per_source,
+                    )
+                    out_rows.extend(dicts)
+                    meta["items"].append({"sheet": sheet, "cached": True, "rows": len(matrix), "dict_rows": False})
+                else:
+                    meta["items"].append({"sheet": sheet, "cached": True, "rows": 0})
+
+        if out_rows:
+            meta["mode_used"] = "snapshot"
+            return out_rows, meta, None
+
+        if mode == AdvisorDataMode.SNAPSHOT:
+            meta["mode_used"] = "snapshot"
+            return [], meta, "No cached sheet snapshots found (or snapshots empty)"
+
+    # ----------------------------
+    # 2) Live sheet rows (default)
+    # ----------------------------
+    live_rows: List[Dict[str, Any]] = []
+    live_items: List[Dict[str, Any]] = []
     for sheet in sources_norm:
-        snap = snaps.get(sheet) or _engine_get_snapshot(engine, sheet)
-        if not snap:
-            meta["items"].append({"sheet": sheet, "cached": False})
+        payload_rows, err = _engine_get_sheet_rows_payload(engine, sheet, limit=max_rows_per_source)
+        if err is not None or not isinstance(payload_rows, dict):
+            live_items.append({"sheet": sheet, "live": True, "ok": False, "error": err})
             continue
 
-        # Snapshot shapes supported:
-        # - rows: list[dict]
-        # - rows: matrix + keys
-        # - rows_matrix + keys
-        headers = snap.get("headers") or []
-        keys = snap.get("keys") or snap.get("schema_keys") or None
-        rows = snap.get("rows")
-        rows_matrix = snap.get("rows_matrix")
+        headers = payload_rows.get("headers") or []
+        keys = payload_rows.get("keys") or payload_rows.get("schema_keys") or None
+        rows = payload_rows.get("rows")
+        rows_matrix = payload_rows.get("rows_matrix")
 
-        count_rows = 0
-        dict_mode = False
-
+        # dict rows
         if isinstance(rows, list) and rows and isinstance(rows[0], dict):
-            # already dict rows
-            dict_mode = True
-            count_rows = len(rows)
             for d in rows[:max_rows_per_source]:
                 if isinstance(d, dict):
                     dd = dict(d)
                     dd["_Sheet"] = sheet
-                    out_rows.append(dd)
-
+                    live_rows.append(dd)
+            live_items.append({"sheet": sheet, "live": True, "ok": True, "rows": len(rows), "dict_rows": True})
         else:
-            # prefer rows_matrix if present; else rows as matrix
+            # matrix
             matrix = rows_matrix if isinstance(rows_matrix, list) else rows if isinstance(rows, list) else []
             if isinstance(matrix, list) and matrix:
-                dicts = _rows_matrix_to_keyed_dicts(sheet, headers=headers if isinstance(headers, list) else [], rows=matrix, keys=keys, limit=max_rows_per_source)
-                count_rows = len(matrix)
-                out_rows.extend(dicts)
+                dicts = _rows_matrix_to_keyed_dicts(
+                    sheet,
+                    headers=headers if isinstance(headers, list) else [],
+                    rows=matrix,
+                    keys=keys if isinstance(keys, list) else None,
+                    limit=max_rows_per_source,
+                )
+                live_rows.extend(dicts)
+                live_items.append({"sheet": sheet, "live": True, "ok": True, "rows": len(matrix), "dict_rows": False})
+            else:
+                live_items.append({"sheet": sheet, "live": True, "ok": True, "rows": 0})
 
-        meta["items"].append(
-            {
-                "sheet": sheet,
-                "cached": True,
-                "rows": count_rows,
-                "headers": len(headers) if isinstance(headers, list) else 0,
-                "keys": len(keys) if isinstance(keys, list) else 0,
-                "dict_rows": bool(dict_mode),
-                "cached_at_utc": snap.get("cached_at_utc") or snap.get("updated_at_utc"),
-            }
-        )
+    meta["items"] = live_items
+    if not live_rows:
+        meta["mode_used"] = "live_sheet"
+        return [], meta, "Live sheet fetch returned no rows"
 
-    if not out_rows:
-        return [], meta, "No cached sheet snapshots found (or snapshots empty)"
-    return out_rows, meta, None
+    # Optional: enrich with quotes (LIVE_QUOTES)
+    if mode in (AdvisorDataMode.LIVE_QUOTES, AdvisorDataMode.AUTO):
+        syms = _extract_symbols_from_rows(live_rows)
+        qmap = _engine_get_quotes_batch(engine, syms)
+        if qmap:
+            # merge non-destructive
+            enriched: List[Dict[str, Any]] = []
+            for r in live_rows:
+                sym = _norm_symbol(_safe_str(r.get("symbol") or r.get("ticker") or r.get("code") or ""))
+                q = qmap.get(sym) or {}
+                enriched.append(_merge_non_destructive(r, q if isinstance(q, dict) else {}))
+            live_rows = enriched
+            meta["live_quotes_enriched"] = True
+            meta["live_quotes_count"] = len(qmap)
+            meta["mode_used"] = "live_quotes"
+        else:
+            meta["live_quotes_enriched"] = False
+            meta["mode_used"] = "live_sheet"
+
+    else:
+        meta["mode_used"] = "live_sheet"
+
+    return live_rows, meta, None
 
 
 # =============================================================================
@@ -617,7 +865,6 @@ class Security:
     sector: str
     currency: str = "SAR"
 
-    # core metrics (schema-aligned keys preferred)
     current_price: Optional[float] = None
     previous_close: Optional[float] = None
     day_high: Optional[float] = None
@@ -662,7 +909,6 @@ class Security:
     expected_roi_12m: Optional[float] = None
     forecast_confidence: Optional[float] = None
 
-    # scores
     valuation_score: Optional[float] = None
     momentum_score: Optional[float] = None
     quality_score: Optional[float] = None
@@ -689,7 +935,6 @@ class Security:
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
-        # convert dt
         if self.last_updated_utc is not None:
             d["last_updated_utc"] = _iso_utc(self.last_updated_utc)
             d["last_updated_riyadh"] = _iso_riyadh(self.last_updated_utc)
@@ -812,13 +1057,8 @@ class AdvisorRequest:
 # Liquidity + buckets
 # =============================================================================
 def _compute_liquidity_score(row: Dict[str, Any]) -> Optional[float]:
-    """
-    Prefer value_traded if present; else volume; else market_cap.
-    Score 0..100.
-    """
     vt = _to_float(_get_any(row, "value_traded", "traded_value"))
     if vt is not None and vt > 0:
-        # log scale: 1e6 -> ~20, 1e11 -> ~95
         try:
             logv = math.log10(max(1.0, vt))
             score = ((logv - 6.0) / (11.0 - 6.0)) * 75.0 + 20.0
@@ -885,7 +1125,7 @@ def _extract_security(row: Dict[str, Any]) -> Optional[Security]:
 
     name = _safe_str(_get_any(row, "name", "company_name", "Name", "Company Name"))
     sheet = _safe_str(_get_any(row, "_Sheet", "origin", "sheet")) or ""
-    market = _safe_str(_get_any(row, "market", "exchange", "Market", "Exchange")) or ("KSA" if sym.endswith(".SR") or sym.isdigit() else "GLOBAL")
+    market = _safe_str(_get_any(row, "market", "Market")) or ("KSA" if sym.endswith(".SR") or sym.isdigit() else "GLOBAL")
     sector = _safe_str(_get_any(row, "sector", "Sector")) or ""
     currency = _safe_str(_get_any(row, "currency", "Currency")) or "SAR"
 
@@ -899,7 +1139,6 @@ def _extract_security(row: Dict[str, Any]) -> Optional[Security]:
         currency=currency,
     )
 
-    # Map schema keys
     s.current_price = _to_float(_get_any(row, "current_price", "price"))
     s.previous_close = _to_float(_get_any(row, "previous_close", "prev_close"))
     s.day_high = _to_float(_get_any(row, "day_high", "high"))
@@ -976,7 +1215,6 @@ def _passes_filters(s: Security, req: AdvisorRequest, liquidity_score: Optional[
     if liquidity_score is not None and liquidity_score < float(req.min_liquidity_score or 0.0):
         return False, "Liquidity too low"
 
-    # ROI gates (fractions)
     if req.required_roi_1m is not None and (s.expected_roi_1m is None or s.expected_roi_1m < req.required_roi_1m):
         return False, "ROI 1M below target"
     if req.required_roi_3m is not None and (s.expected_roi_3m is None or s.expected_roi_3m < req.required_roi_3m):
@@ -991,20 +1229,11 @@ def _passes_filters(s: Security, req: AdvisorRequest, liquidity_score: Optional[
 
 
 def _compute_advisor_score(s: Security, liq: Optional[float]) -> Tuple[float, str]:
-    """
-    Advisor score (0..100) combines:
-    - overall_score (from core.scoring)
-    - opportunity_score / expected_roi_3m
-    - confidence_score
-    - risk penalty
-    - liquidity small bonus
-    """
     reasons: List[str] = []
     base = s.overall_score if s.overall_score is not None else 50.0
     score = float(base)
     reasons.append(f"Overall:{score:.0f}")
 
-    # ROI emphasis
     roi3 = s.expected_roi_3m
     if roi3 is not None:
         bump = max(0.0, min(18.0, roi3 * 100.0 * 0.45))
@@ -1012,21 +1241,18 @@ def _compute_advisor_score(s: Security, liq: Optional[float]) -> Tuple[float, st
         if bump >= 3:
             reasons.append(f"ROI3M:+{bump:.0f}")
 
-    # confidence bonus
     conf = s.confidence_score if s.confidence_score is not None else 50.0
     cb = max(0.0, min(12.0, (conf - 50.0) * 0.18))
     score += cb
     if cb >= 2:
         reasons.append("Conf+")
 
-    # risk penalty (risk_score: 0 low, 100 high)
     risk = s.risk_score if s.risk_score is not None else 50.0
     rp = max(0.0, min(20.0, (risk - 45.0) * 0.35))
     score -= rp
     if rp >= 3:
         reasons.append("Risk-")
 
-    # liquidity small bonus
     if liq is not None:
         lb = max(-3.0, min(4.0, (liq - 50.0) * 0.06))
         score += lb
@@ -1076,7 +1302,6 @@ class PortfolioOptimizer:
         for s in securities:
             v = s.volatility_30d
             if v is None:
-                # fallback by risk bucket
                 rb = s.risk_bucket.lower()
                 v = 0.12 if "low" in rb else 0.18 if "moderate" in rb else 0.26
             out.append(float(v))
@@ -1170,7 +1395,6 @@ class PortfolioOptimizer:
             port_var = float(np.dot(w.T, np.dot(cov, w)))  # type: ignore
             if port_var <= 0:
                 return 1e6
-            # risk contributions
             mrc = (w * np.dot(cov, w)) / port_var  # type: ignore
             tgt = 1.0 / n
             return float(np.sum((mrc - tgt) ** 2))  # type: ignore
@@ -1179,11 +1403,9 @@ class PortfolioOptimizer:
         return res.x.tolist() if getattr(res, "success", False) else self.optimize_equal_weight(securities)
 
     def optimize_black_litterman(self, securities: List[Security]) -> List[float]:
-        # keep safe: if not available, fallback to maximum sharpe
         if not (HAS_NUMPY and HAS_SCIPY) or len(securities) < 2:
             return self.optimize_maximum_sharpe(securities)
 
-        # lightweight BL: use market-cap weights as prior, views from advisor_score
         n = len(securities)
         caps = np.array([float(s.market_cap or 1e9) for s in securities])  # type: ignore
         w_mkt = caps / float(np.sum(caps))  # type: ignore
@@ -1197,12 +1419,10 @@ class PortfolioOptimizer:
         delta = 2.5
         pi = delta * np.dot(cov, w_mkt)  # type: ignore
 
-        # views: higher advisor_score => higher expected return bump
         P = np.eye(n)  # type: ignore
         scores = np.array([float(s.advisor_score or 50.0) for s in securities])  # type: ignore
         Q = np.clip((scores - 50.0) / 100.0, 0.0, 0.25)  # type: ignore
 
-        # uncertainty: higher score => lower uncertainty
         omega_diag = np.array([(0.12 / (float(s.advisor_score or 50.0) + 1.0)) ** 2 for s in securities])  # type: ignore
         Omega = np.diag(omega_diag)  # type: ignore
 
@@ -1259,11 +1479,9 @@ def _apply_weight_constraints(weights: List[float], *, min_w: float, max_w: floa
 
 def _analyze_portfolio(securities: List[Security], weights: List[float], total_value: float) -> Portfolio:
     p = Portfolio(securities=securities, total_value=float(total_value or 0.0))
-
     if not securities or not weights or len(securities) != len(weights):
         return p
 
-    # exposures
     sec_exp: Dict[str, float] = defaultdict(float)
     ccy_exp: Dict[str, float] = defaultdict(float)
     for s, w in zip(securities, weights):
@@ -1275,7 +1493,6 @@ def _analyze_portfolio(securities: List[Security], weights: List[float], total_v
     p.currency_exposure = dict(ccy_exp)
     p.concentration_score = float(sum(float(w) * float(w) for w in weights))
 
-    # simple expected return/vol
     rets = []
     vols = []
     for s in securities:
@@ -1285,7 +1502,6 @@ def _analyze_portfolio(securities: List[Security], weights: List[float], total_v
         vols.append(float(v))
 
     p.expected_return = float(sum(r * w for r, w in zip(rets, weights)))
-    # naive vol (no covariance) if no numpy
     p.expected_volatility = float(math.sqrt(sum((v * w) ** 2 for v, w in zip(vols, weights))))
     if p.expected_volatility > 0:
         p.sharpe_ratio = (p.expected_return - 0.02) / p.expected_volatility
@@ -1299,12 +1515,7 @@ def _analyze_portfolio(securities: List[Security], weights: List[float], total_v
 def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Dict[str, Any]:
     """
     Returns:
-      {
-        "headers": [...],
-        "rows": [...],
-        "items": [...],
-        "meta": {...}
-      }
+      {"headers": [...], "rows": [...], "items": [...], "meta": {...}}
     """
     with tracer.start_as_current_span("run_investment_advisor") as span:
         start_time = time.time()
@@ -1339,8 +1550,11 @@ def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Di
 
         try:
             req = AdvisorRequest.from_dict(payload or {})
+            mode = _parse_advisor_data_mode(payload or {})
+
             span.set_attribute("top_n", req.top_n)
             span.set_attribute("strategy", req.allocation_strategy.value)
+            span.set_attribute("advisor_data_mode", mode.value)
 
             if engine is None:
                 return {
@@ -1351,14 +1565,18 @@ def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Di
                         "ok": False,
                         "version": ADVISOR_VERSION,
                         "error": "Missing engine instance",
+                        "advisor_data_mode": mode.value,
                         "runtime_ms": int((time.time() - start_time) * 1000),
                     },
                 }
 
-            # universe fetch
-            universe_rows, fetch_meta, fetch_err = _fetch_universe(req.sources, engine=engine, max_rows_per_source=5000)
+            universe_rows, fetch_meta, fetch_err = _fetch_universe(
+                req.sources,
+                engine=engine,
+                payload=payload or {},
+                max_rows_per_source=5000,
+            )
 
-            # ticker filtering setup
             ticker_variants: Set[str] = set()
             ticker_canon: Set[str] = set()
             if req.tickers:
@@ -1371,7 +1589,6 @@ def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Di
             securities: List[Security] = []
             dropped = {"no_symbol": 0, "invalid_data": 0, "filtered": 0, "ticker_not_requested": 0}
 
-            # build securities
             for r in universe_rows:
                 try:
                     s = _extract_security(r)
@@ -1382,7 +1599,6 @@ def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Di
                         dropped["ticker_not_requested"] += 1
                         continue
 
-                    # scoring: use Phase 4 scoring module on raw row dict for best fidelity
                     score_patch = _compute_scores(r, settings=None)
                     s.valuation_score = _to_float(score_patch.get("valuation_score"))
                     s.momentum_score = _to_float(score_patch.get("momentum_score"))
@@ -1395,16 +1611,12 @@ def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Di
                     s.recommendation = _safe_str(score_patch.get("recommendation") or "HOLD")
                     s.recommendation_reason = _safe_str(score_patch.get("recommendation_reason") or "")
 
-                    # buckets
                     s.risk_bucket = _risk_bucket_from_risk_score(s.risk_score)
                     s.confidence_bucket = _confidence_bucket_from_confidence_score(s.confidence_score)
 
-                    # liquidity
                     liq = _compute_liquidity_score(r)
-                    # advisor score
                     s.advisor_score, s.reason = _compute_advisor_score(s, liq)
 
-                    # filter
                     ok, _why = _passes_filters(s, req, liq)
                     if not ok:
                         dropped["filtered"] += 1
@@ -1426,6 +1638,7 @@ def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Di
                     "meta": {
                         "ok": False,
                         "version": ADVISOR_VERSION,
+                        "advisor_data_mode": mode.value,
                         "error": "No valid securities after filters",
                         "fetch": fetch_meta,
                         "warning": fetch_err,
@@ -1434,22 +1647,14 @@ def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Di
                     },
                 }
 
-            # dedupe
             securities, dedupe_removed = _deduplicate_securities(securities)
 
-            # rank: primary advisor_score, then roi_3m, then confidence
             securities.sort(
-                key=lambda x: (
-                    float(x.advisor_score or 0.0),
-                    float(x.expected_roi_3m or 0.0),
-                    float(x.confidence_score or 0.0),
-                ),
+                key=lambda x: (float(x.advisor_score or 0.0), float(x.expected_roi_3m or 0.0), float(x.confidence_score or 0.0)),
                 reverse=True,
             )
-
             top = securities[: req.top_n]
 
-            # optimization
             opt = PortfolioOptimizer()
             opt_start = time.time()
             weights = opt.optimize(top, req.allocation_strategy)
@@ -1458,12 +1663,10 @@ def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Di
             if not weights or len(weights) != len(top):
                 weights = opt.optimize_equal_weight(top)
 
-            # constraints
             weights = _apply_weight_constraints(weights, min_w=float(req.min_position_pct), max_w=float(req.max_position_pct))
             if not weights or len(weights) != len(top):
                 weights = opt.optimize_equal_weight(top)
 
-            # allocate
             total_amt = float(req.invest_amount or 0.0)
             for s, w in zip(top, weights):
                 s.allocation_weight = float(w)
@@ -1471,7 +1674,6 @@ def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Di
 
             portfolio = _analyze_portfolio(top, weights, total_amt)
 
-            # output rows/items
             rows: List[List[Any]] = []
             items: List[Dict[str, Any]] = []
 
@@ -1546,6 +1748,7 @@ def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Di
             meta: Dict[str, Any] = {
                 "ok": True,
                 "version": ADVISOR_VERSION,
+                "advisor_data_mode": mode.value,
                 "request": {
                     "sources": _normalize_source_pages(req.sources),
                     "tickers": req.tickers,
@@ -1582,11 +1785,12 @@ def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Di
             meta = {
                 "ok": False,
                 "version": ADVISOR_VERSION,
+                "advisor_data_mode": _parse_advisor_data_mode(payload or {}).value,
                 "error": str(e),
                 "runtime_ms": int((time.time() - start_time) * 1000),
             }
-            if _truthy(payload.get("debug", False)):
-                meta["traceback"] = traceback.format_exc()  # type: ignore
+            if _truthy((payload or {}).get("debug", False)):
+                meta["traceback"] = traceback.format_exc()
             return {"headers": headers, "rows": [], "items": [], "meta": meta}
 
 
@@ -1595,6 +1799,7 @@ __all__ = [
     "ADVISOR_VERSION",
     "RiskProfile",
     "AllocationStrategy",
+    "AdvisorDataMode",
     "Security",
     "Portfolio",
     "AdvisorRequest",
