@@ -2,30 +2,28 @@
 # core/investment_advisor.py
 """
 ================================================================================
-Investment Advisor Core — v4.1.0 (LIVE-BY-DEFAULT / SNAPSHOT-FALLBACK / SAFE)
+Investment Advisor Core — v4.2.0 (LIVE-BY-DEFAULT / SNAPSHOT-FALLBACK / SAFE)
 ================================================================================
 
-Why this revision (your advisor-empty issue)
-- Your advisor logic depended on cached sheet snapshots.
-- In your environment, cache is often empty, so advisor returned:
-    "No cached sheet snapshots found"
+Why this revision (recommendation_reason issue)
+- Your advisor output already produced recommendation labels such as BUY / HOLD / SELL.
+- But in some cases the scoring layer returned:
+    recommendation = "BUY"
+    recommendation_reason = null
+- This revision guarantees that recommendation_reason is always synthesized
+  when the upstream scoring module does not provide one.
 
-What v4.1.0 changes
-1) ✅ LIVE MODE by default (unless explicitly set to snapshot):
-   - Builds “snapshots on demand” by calling engine.get_sheet_rows(...) per page.
-   - Optional enrichment via engine quote batch (best-effort) to fill missing fields.
-2) ✅ Snapshot still supported (and used if requested):
-   - If payload requests snapshot mode, we use cached snapshots only.
-3) ✅ AUTO mode supported:
-   - Try snapshot first; if empty → live mode.
-4) ✅ Safe sync/async bridging:
-   - Works if engine methods are async and this module is invoked inside an event loop.
-
-Inputs
-- payload["advisor_data_mode"] / payload["data_mode"] / payload["mode"]
-    snapshot | live_sheet | live_quotes | auto
-- env ADVISOR_DATA_MODE (same values)
-Default if not set: live_quotes   (force live by default)
+What v4.2.0 changes
+1) ✅ Keeps current live/snapshot advisor flow unchanged.
+2) ✅ Adds synthesized recommendation_reason fallback when missing/blank.
+3) ✅ Builds explanation from available score and market context:
+   - overall score
+   - expected ROI
+   - confidence
+   - risk
+   - valuation / momentum / quality / opportunity
+   - liquidity
+4) ✅ Preserves upstream reason when the scoring module already provides one.
 
 Entry:
 - run_investment_advisor(payload: dict, engine: Any=None) -> dict
@@ -196,7 +194,7 @@ except Exception:
 # ---------------------------------------------------------------------------
 # Version / constants
 # ---------------------------------------------------------------------------
-__version__ = "4.1.0"
+__version__ = "4.2.0"
 ADVISOR_VERSION = __version__
 
 logger = logging.getLogger("core.investment_advisor")
@@ -289,7 +287,6 @@ def _safe_call(engine: Any, method: str, *args: Any, timeout: float = 6.0, **kwa
                 if err is not None:
                     return None, f"exception:{type(err).__name__}:{err}"
                 return res, None
-            # no loop => safe to run directly
             try:
                 res = asyncio.run(asyncio.wait_for(out, timeout=timeout))
                 return res, None
@@ -471,6 +468,33 @@ def _symbol_variants(symbol: str) -> Set[str]:
     return variants
 
 
+def _clean_reason_text(text: Any) -> str:
+    s = _safe_str(text)
+    if not s:
+        return ""
+    s = " ".join(s.split())
+    s = s.strip(" ;,.-")
+    return s
+
+
+def _fmt_pct_from_ratio(value: Optional[float], digits: int = 1) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        return f"{float(value) * 100:.{digits}f}%"
+    except Exception:
+        return None
+
+
+def _fmt_num(value: Optional[float], digits: int = 1) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        return f"{float(value):.{digits}f}"
+    except Exception:
+        return None
+
+
 # =============================================================================
 # Mode selection (LIVE by default)
 # =============================================================================
@@ -575,7 +599,6 @@ def _normalize_source_pages(sources: List[str]) -> List[str]:
         except Exception:
             page = s
 
-        # hard excludes
         if page in {"KSA_TADAWUL", "Advisor_Criteria", "AI_Opportunity_Report"}:
             continue
         if page in {"Data_Dictionary", "Top_10_Investments", "Insights_Analysis"}:
@@ -599,7 +622,6 @@ def _engine_get_multi_snapshots(engine: Any, sheet_names: List[str]) -> Dict[str
         res, err = _safe_call(engine, "get_cached_multi_sheet_snapshots", sheet_names, timeout=6.0)
         if err is None and isinstance(res, dict):
             return {str(k): v for k, v in res.items() if isinstance(v, dict)}
-    # fallback single
     out: Dict[str, Dict[str, Any]] = {}
     fn2 = getattr(engine, "get_cached_sheet_snapshot", None)
     if callable(fn2):
@@ -619,7 +641,6 @@ def _engine_get_sheet_rows_payload(engine: Any, sheet_name: str, limit: int = 50
     if engine is None:
         return None, "engine_none"
 
-    # prefer canonical method names
     candidates = ["get_sheet_rows", "sheet_rows", "build_sheet_rows", "get_sheet", "fetch_sheet", "get_rows"]
     for m in candidates:
         if not callable(getattr(engine, m, None)):
@@ -632,7 +653,7 @@ def _engine_get_sheet_rows_payload(engine: Any, sheet_name: str, limit: int = 50
             ((), {"sheet": sheet_name, "limit": limit}),
             ((), {"sheet": sheet_name}),
             ((), {"page": sheet_name, "limit": limit, "offset": 0, "mode": "advisor", "body": body}),
-            ((sheet_name,), {}),  # legacy positional
+            ((sheet_name,), {}),
         ]
 
         last_err = None
@@ -641,7 +662,6 @@ def _engine_get_sheet_rows_payload(engine: Any, sheet_name: str, limit: int = 50
             if err is None and isinstance(res, dict):
                 return res, None
             last_err = err
-        # try next method
         if last_err:
             continue
 
@@ -700,7 +720,6 @@ def _extract_symbols_from_rows(rows: List[Dict[str, Any]]) -> List[str]:
         s = _safe_str(s).strip()
         if s:
             out.append(_norm_symbol(s))
-    # unique preserve order
     seen = set()
     uniq = []
     for s in out:
@@ -734,9 +753,6 @@ def _fetch_universe(
     if engine is None:
         return [], meta, "Missing engine instance"
 
-    # ----------------------------
-    # 1) Snapshot path (if allowed)
-    # ----------------------------
     if mode in (AdvisorDataMode.SNAPSHOT, AdvisorDataMode.AUTO):
         snaps = _engine_get_multi_snapshots(engine, sources_norm)
         out_rows: List[Dict[str, Any]] = []
@@ -782,9 +798,6 @@ def _fetch_universe(
             meta["mode_used"] = "snapshot"
             return [], meta, "No cached sheet snapshots found (or snapshots empty)"
 
-    # ----------------------------
-    # 2) Live sheet rows (default)
-    # ----------------------------
     live_rows: List[Dict[str, Any]] = []
     live_items: List[Dict[str, Any]] = []
     for sheet in sources_norm:
@@ -798,7 +811,6 @@ def _fetch_universe(
         rows = payload_rows.get("rows")
         rows_matrix = payload_rows.get("rows_matrix")
 
-        # dict rows
         if isinstance(rows, list) and rows and isinstance(rows[0], dict):
             for d in rows[:max_rows_per_source]:
                 if isinstance(d, dict):
@@ -807,7 +819,6 @@ def _fetch_universe(
                     live_rows.append(dd)
             live_items.append({"sheet": sheet, "live": True, "ok": True, "rows": len(rows), "dict_rows": True})
         else:
-            # matrix
             matrix = rows_matrix if isinstance(rows_matrix, list) else rows if isinstance(rows, list) else []
             if isinstance(matrix, list) and matrix:
                 dicts = _rows_matrix_to_keyed_dicts(
@@ -827,12 +838,10 @@ def _fetch_universe(
         meta["mode_used"] = "live_sheet"
         return [], meta, "Live sheet fetch returned no rows"
 
-    # Optional: enrich with quotes (LIVE_QUOTES)
     if mode in (AdvisorDataMode.LIVE_QUOTES, AdvisorDataMode.AUTO):
         syms = _extract_symbols_from_rows(live_rows)
         qmap = _engine_get_quotes_batch(engine, syms)
         if qmap:
-            # merge non-destructive
             enriched: List[Dict[str, Any]] = []
             for r in live_rows:
                 sym = _norm_symbol(_safe_str(r.get("symbol") or r.get("ticker") or r.get("code") or ""))
@@ -845,7 +854,6 @@ def _fetch_universe(
         else:
             meta["live_quotes_enriched"] = False
             meta["mode_used"] = "live_sheet"
-
     else:
         meta["mode_used"] = "live_sheet"
 
@@ -1191,6 +1199,120 @@ def _extract_security(row: Dict[str, Any]) -> Optional[Security]:
     s.last_updated_utc = dt
 
     return s
+
+
+# =============================================================================
+# Recommendation explanation synthesis
+# =============================================================================
+def _build_recommendation_reason(
+    security: Security,
+    *,
+    recommendation: Optional[str] = None,
+    upstream_reason: Any = None,
+    liquidity_score: Optional[float] = None,
+) -> str:
+    upstream = _clean_reason_text(upstream_reason)
+    if upstream:
+        return upstream
+
+    rec = _safe_str(recommendation or security.recommendation or "HOLD").upper()
+    parts: List[str] = []
+
+    roi_3m = security.expected_roi_3m
+    roi_1m = security.expected_roi_1m
+    conf = security.confidence_score
+    risk = security.risk_score
+    overall = security.overall_score
+    value = security.value_score
+    quality = security.quality_score
+    valuation = security.valuation_score
+    momentum = security.momentum_score
+    opportunity = security.opportunity_score
+    price = security.current_price
+    fp3 = security.forecast_price_3m
+
+    if rec == "BUY":
+        if roi_3m is not None and roi_3m > 0:
+            parts.append(f"positive 3M upside ({_fmt_pct_from_ratio(roi_3m)})")
+        elif roi_1m is not None and roi_1m > 0:
+            parts.append(f"positive 1M upside ({_fmt_pct_from_ratio(roi_1m)})")
+
+        if conf is not None and conf >= 70:
+            parts.append(f"high confidence ({_fmt_num(conf, 0)}/100)")
+        if overall is not None and overall >= 65:
+            parts.append(f"strong overall score ({_fmt_num(overall, 0)}/100)")
+        if valuation is not None and valuation >= 60:
+            parts.append(f"supportive valuation ({_fmt_num(valuation, 0)}/100)")
+        if quality is not None and quality >= 60:
+            parts.append(f"good quality profile ({_fmt_num(quality, 0)}/100)")
+        if momentum is not None and momentum >= 60:
+            parts.append(f"positive momentum ({_fmt_num(momentum, 0)}/100)")
+        if opportunity is not None and opportunity >= 60:
+            parts.append(f"opportunity score is favorable ({_fmt_num(opportunity, 0)}/100)")
+        if risk is not None and risk <= 45:
+            parts.append(f"contained risk ({_fmt_num(risk, 0)}/100)")
+        if price is not None and fp3 is not None and fp3 > price:
+            parts.append(f"forecast price is above current price ({_fmt_num(fp3, 2)} vs {_fmt_num(price, 2)})")
+
+    elif rec == "SELL":
+        if roi_3m is not None and roi_3m < 0:
+            parts.append(f"negative 3M outlook ({_fmt_pct_from_ratio(roi_3m)})")
+        elif roi_1m is not None and roi_1m < 0:
+            parts.append(f"negative 1M outlook ({_fmt_pct_from_ratio(roi_1m)})")
+
+        if risk is not None and risk >= 65:
+            parts.append(f"elevated risk ({_fmt_num(risk, 0)}/100)")
+        if overall is not None and overall <= 40:
+            parts.append(f"weak overall score ({_fmt_num(overall, 0)}/100)")
+        if valuation is not None and valuation <= 40:
+            parts.append(f"valuation is not supportive ({_fmt_num(valuation, 0)}/100)")
+        if momentum is not None and momentum <= 40:
+            parts.append(f"weak momentum ({_fmt_num(momentum, 0)}/100)")
+        if confidence is not None and conf is not None and conf <= 40:
+            parts.append(f"low confidence ({_fmt_num(conf, 0)}/100)")
+        if price is not None and fp3 is not None and fp3 < price:
+            parts.append(f"forecast price is below current price ({_fmt_num(fp3, 2)} vs {_fmt_num(price, 2)})")
+
+    else:
+        if overall is not None:
+            if 45 <= overall <= 65:
+                parts.append(f"balanced overall score ({_fmt_num(overall, 0)}/100)")
+            elif overall > 65:
+                parts.append(f"good score but not strong enough for upgrade ({_fmt_num(overall, 0)}/100)")
+            elif overall < 45:
+                parts.append(f"weaker score but not enough for downgrade ({_fmt_num(overall, 0)}/100)")
+
+        if roi_3m is not None:
+            if abs(roi_3m) <= 0.03:
+                parts.append(f"limited expected 3M move ({_fmt_pct_from_ratio(roi_3m)})")
+            elif roi_3m > 0:
+                parts.append(f"upside exists but is moderate ({_fmt_pct_from_ratio(roi_3m)})")
+            else:
+                parts.append(f"downside exists but remains moderate ({_fmt_pct_from_ratio(roi_3m)})")
+
+        if conf is not None and 45 <= conf <= 69:
+            parts.append(f"moderate confidence ({_fmt_num(conf, 0)}/100)")
+        if risk is not None and 40 <= risk <= 60:
+            parts.append(f"risk is moderate ({_fmt_num(risk, 0)}/100)")
+
+    if liquidity_score is not None:
+        if liquidity_score >= 65:
+            parts.append(f"healthy liquidity ({_fmt_num(liquidity_score, 0)}/100)")
+        elif liquidity_score <= 25:
+            parts.append(f"liquidity is weak ({_fmt_num(liquidity_score, 0)}/100)")
+
+    if value is not None and value >= 65 and "supportive valuation" not in " | ".join(parts):
+        parts.append(f"value score is supportive ({_fmt_num(value, 0)}/100)")
+
+    if not parts:
+        if rec == "BUY":
+            return "BUY because the combined score profile is favorable versus current risk."
+        if rec == "SELL":
+            return "SELL because the combined score profile is unfavorable versus expected return."
+        return "HOLD because the current risk-return profile is balanced."
+
+    sentence = f"{rec} because " + ", ".join(parts[:4]) + "."
+    return sentence
 
 
 # =============================================================================
@@ -1608,13 +1730,20 @@ def run_investment_advisor(payload: Dict[str, Any], *, engine: Any = None) -> Di
                     s.confidence_score = _to_float(score_patch.get("confidence_score"))
                     s.risk_score = _to_float(score_patch.get("risk_score"))
                     s.overall_score = _to_float(score_patch.get("overall_score"))
-                    s.recommendation = _safe_str(score_patch.get("recommendation") or "HOLD")
-                    s.recommendation_reason = _safe_str(score_patch.get("recommendation_reason") or "")
+                    s.recommendation = _safe_str(score_patch.get("recommendation") or "HOLD").upper()
+
+                    liq = _compute_liquidity_score(r)
+
+                    s.recommendation_reason = _build_recommendation_reason(
+                        s,
+                        recommendation=s.recommendation,
+                        upstream_reason=score_patch.get("recommendation_reason"),
+                        liquidity_score=liq,
+                    )
 
                     s.risk_bucket = _risk_bucket_from_risk_score(s.risk_score)
                     s.confidence_bucket = _confidence_bucket_from_confidence_score(s.confidence_score)
 
-                    liq = _compute_liquidity_score(r)
                     s.advisor_score, s.reason = _compute_advisor_score(s, liq)
 
                     ok, _why = _passes_filters(s, req, liq)
