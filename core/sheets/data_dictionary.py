@@ -2,27 +2,23 @@
 # core/sheets/data_dictionary.py
 """
 ================================================================================
-Data Dictionary Generator — v2.3.0 (SCHEMA-DRIVEN / DRIFT-PROOF / CI-FRIENDLY)
+Data Dictionary Generator — v2.4.0 (SCHEMA-DRIVEN / SHAPE-SAFE / DRIFT-PROOF)
 ================================================================================
 Tadawul Fast Bridge (TFB)
 
 Generates Data_Dictionary rows directly from core/sheets/schema_registry.py
 
-Why this revision (Priority-2 alignment):
-- ✅ STRICTLY derives Data_Dictionary schema (headers + keys) from schema_registry
-  (no hard-coded lists used for output layout)
-- ✅ Stable ordering:
-    - uses schema_registry.CANONICAL_SHEETS when available
-    - otherwise uses page_catalog.CANONICAL_PAGES
-    - otherwise uses schema_registry.list_sheets()
-- ✅ Defensive to ColumnSpec variations (fmt/format, dtype/type, etc.)
-- ✅ Output formats:
-    1) list[dict] rows (dict keys match Data_Dictionary schema keys)
-    2) 2D values array for Google Sheets (optional header row)
-- ✅ Import-safe: no I/O, no network
-- ✅ Optional strict self-test for CI: TFB_SCHEMA_SELFTEST=1
+What this revision fixes
+- ✅ FIX: Enforces the 9-column Data_Dictionary contract from schema_registry
+- ✅ FIX: Supports object-style OR dict-style schema specs / columns
+- ✅ FIX: Normalizes row dicts so keys always match canonical Data_Dictionary keys
+- ✅ FIX: Normalizes values output to a strict 2D matrix in canonical key order
+- ✅ FIX: Better sheet ordering with schema-first fallback chain
+- ✅ FIX: Safer alias/canonicalization handling
+- ✅ SAFE: no I/O, no network, import-safe
+- ✅ SAFE: optional self-test only when TFB_SCHEMA_SELFTEST=1
 
-Data_Dictionary expected columns (by header):
+Expected Data_Dictionary headers:
 Sheet, Group, Header, Key, DType, Format, Required, Source, Notes
 ================================================================================
 """
@@ -30,20 +26,13 @@ Sheet, Group, Header, Key, DType, Format, Required, Source, Notes
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 # ---------------------------------------------------------------------------
 # Schema Registry (authoritative)
 # ---------------------------------------------------------------------------
 try:
-    from core.sheets.schema_registry import (  # type: ignore
-        SCHEMA_VERSION,
-        SCHEMA_REGISTRY,
-        CANONICAL_SHEETS,
-        get_sheet_spec,
-        get_sheet_headers,
-        list_sheets,
-    )
+    from core.sheets import schema_registry as _schema_registry  # type: ignore
 except Exception as e:  # pragma: no cover
     raise ImportError(f"schema_registry import failed in data_dictionary.py: {e!r}") from e
 
@@ -60,26 +49,39 @@ __all__ = [
     "preferred_sheet_order",
 ]
 
-DATA_DICTIONARY_VERSION = "2.3.0"
+DATA_DICTIONARY_VERSION = "2.4.0"
+SCHEMA_VERSION = getattr(_schema_registry, "SCHEMA_VERSION", "unknown")
 
 
 # ---------------------------------------------------------------------------
-# Helpers (safe string / attribute access)
+# Generic helpers
 # ---------------------------------------------------------------------------
 def _s(v: Any) -> str:
     try:
+        if v is None:
+            return ""
         return str(v).strip()
     except Exception:
         return ""
 
 
-def _get_attr(obj: Any, *names: str, default: Any = "") -> Any:
-    for n in names:
+def _obj_get(obj: Any, *names: str, default: Any = None) -> Any:
+    if obj is None:
+        return default
+
+    for name in names:
         try:
-            if hasattr(obj, n):
-                return getattr(obj, n)
+            if isinstance(obj, Mapping) and name in obj:
+                return obj.get(name, default)
         except Exception:
-            continue
+            pass
+
+        try:
+            if hasattr(obj, name):
+                return getattr(obj, name)
+        except Exception:
+            pass
+
     return default
 
 
@@ -94,8 +96,11 @@ def _bool(v: Any) -> bool:
         except Exception:
             return False
     if isinstance(v, str):
-        return v.strip().lower() in {"1", "true", "yes", "y", "on"}
-    return bool(v)
+        return v.strip().lower() in {"1", "true", "yes", "y", "on", "t"}
+    try:
+        return bool(v)
+    except Exception:
+        return False
 
 
 def _env_truthy(name: str, default: bool = False) -> bool:
@@ -106,35 +111,116 @@ def _env_truthy(name: str, default: bool = False) -> bool:
         return default
 
 
+def _as_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, set):
+        return list(value)
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, Iterable):
+        try:
+            return list(value)
+        except Exception:
+            return [value]
+    return [value]
+
+
 # ---------------------------------------------------------------------------
-# Data_Dictionary spec introspection (authoritative contract)
+# Registry compatibility helpers
+# ---------------------------------------------------------------------------
+def _schema_registry_map() -> Mapping[str, Any]:
+    for attr_name in ("SCHEMA_REGISTRY", "SHEET_SPECS", "REGISTRY", "SHEETS"):
+        value = getattr(_schema_registry, attr_name, None)
+        if isinstance(value, Mapping):
+            return value
+    return {}
+
+
+def _get_sheet_spec(sheet_name: str) -> Any:
+    fn = getattr(_schema_registry, "get_sheet_spec", None)
+    if callable(fn):
+        return fn(sheet_name)
+
+    reg = _schema_registry_map()
+    if sheet_name in reg:
+        return reg[sheet_name]
+
+    raise ValueError(f"Unknown sheet: {sheet_name}")
+
+
+def _get_sheet_headers(sheet_name: str) -> List[str]:
+    fn = getattr(_schema_registry, "get_sheet_headers", None)
+    if callable(fn):
+        headers = fn(sheet_name)
+        return [_s(x) for x in _as_list(headers)]
+
+    spec = _get_sheet_spec(sheet_name)
+    cols = _extract_spec_columns(spec)
+    return [_s(_obj_get(c, "header", default="")) for c in cols]
+
+
+def _list_sheets() -> List[str]:
+    fn = getattr(_schema_registry, "list_sheets", None)
+    if callable(fn):
+        return [_s(x) for x in _as_list(fn()) if _s(x)]
+
+    reg = _schema_registry_map()
+    return [_s(x) for x in reg.keys() if _s(x)]
+
+
+def _canonical_sheets() -> List[str]:
+    for attr_name in ("CANONICAL_SHEETS", "CANONICAL_PAGES"):
+        value = getattr(_schema_registry, attr_name, None)
+        if value is not None:
+            return [_s(x) for x in _as_list(value) if _s(x)]
+    return []
+
+
+def _extract_spec_columns(spec: Any) -> List[Any]:
+    cols = _obj_get(spec, "columns", default=None)
+    if cols is None and isinstance(spec, Mapping):
+        cols = spec.get("cols") or spec.get("headers")
+    return _as_list(cols)
+
+
+# ---------------------------------------------------------------------------
+# Data_Dictionary contract introspection
 # ---------------------------------------------------------------------------
 def data_dictionary_headers() -> List[str]:
     """Returns Data_Dictionary headers EXACTLY as defined in schema_registry."""
-    return list(get_sheet_headers("Data_Dictionary"))
+    return list(_get_sheet_headers("Data_Dictionary"))
 
 
 def data_dictionary_keys() -> List[str]:
     """Returns Data_Dictionary keys EXACTLY as defined in schema_registry."""
-    spec = get_sheet_spec("Data_Dictionary")
-    cols = getattr(spec, "columns", None) or []
+    spec = _get_sheet_spec("Data_Dictionary")
+    cols = _extract_spec_columns(spec)
     keys: List[str] = []
-    for c in cols:
-        k = _get_attr(c, "key", default=None)
-        if k:
-            keys.append(str(k))
+
+    for col in cols:
+        key = _s(_obj_get(col, "key", default=""))
+        if key:
+            keys.append(key)
+
     return keys
 
 
 def _data_dictionary_spec() -> Tuple[List[str], List[str]]:
-    hdrs = data_dictionary_headers()
+    headers = data_dictionary_headers()
     keys = data_dictionary_keys()
-    if not hdrs or not keys or len(hdrs) != len(keys):
+
+    if not headers or not keys or len(headers) != len(keys):
         raise ValueError(
             "Data_Dictionary spec invalid: headers/keys missing or mismatched "
-            f"(headers={len(hdrs)}, keys={len(keys)})"
+            f"(headers={len(headers)}, keys={len(keys)})"
         )
-    return hdrs, keys
+
+    return headers, keys
 
 
 # ---------------------------------------------------------------------------
@@ -145,82 +231,109 @@ def preferred_sheet_order() -> List[str]:
     Stable ordering for dictionary generation.
 
     Priority:
-      1) schema_registry.CANONICAL_SHEETS (best, single canonical view)
-      2) page_catalog.CANONICAL_PAGES (if available)
+      1) schema_registry.CANONICAL_SHEETS / CANONICAL_PAGES
+      2) core.sheets.page_catalog.CANONICAL_PAGES
       3) schema_registry.list_sheets()
-      4) sorted(schema_registry keys)
+      4) sorted(schema registry keys)
 
-    Only returns sheets that exist in SCHEMA_REGISTRY.
+    Only returns sheets present in the active schema registry map.
     """
-    reg = set(SCHEMA_REGISTRY.keys())
+    reg_keys = set(_schema_registry_map().keys())
+    if not reg_keys:
+        return []
 
-    # 1) canonical sheets from schema_registry
-    try:
-        ordered = [s for s in list(CANONICAL_SHEETS) if s in reg]
-        if ordered:
-            for s in list_sheets():
-                if s in reg and s not in ordered:
-                    ordered.append(s)
-            for s in sorted(reg):
-                if s not in ordered:
-                    ordered.append(s)
-            return ordered
-    except Exception:
-        pass
+    ordered: List[str] = []
 
-    # 2) page_catalog
+    # 1) registry canonical view
+    for sheet in _canonical_sheets():
+        if sheet in reg_keys and sheet not in ordered:
+            ordered.append(sheet)
+
+    if ordered:
+        for sheet in _list_sheets():
+            if sheet in reg_keys and sheet not in ordered:
+                ordered.append(sheet)
+        for sheet in sorted(reg_keys):
+            if sheet not in ordered:
+                ordered.append(sheet)
+        return ordered
+
+    # 2) page_catalog canonical pages
     try:
         from core.sheets.page_catalog import CANONICAL_PAGES  # type: ignore
 
-        ordered2 = [s for s in list(CANONICAL_PAGES) if s in reg]
-        for s in list_sheets():
-            if s in reg and s not in ordered2:
-                ordered2.append(s)
-        for s in sorted(reg):
-            if s not in ordered2:
-                ordered2.append(s)
-        return ordered2
+        for sheet in _as_list(CANONICAL_PAGES):
+            s = _s(sheet)
+            if s in reg_keys and s not in ordered:
+                ordered.append(s)
     except Exception:
         pass
+
+    if ordered:
+        for sheet in _list_sheets():
+            if sheet in reg_keys and sheet not in ordered:
+                ordered.append(sheet)
+        for sheet in sorted(reg_keys):
+            if sheet not in ordered:
+                ordered.append(sheet)
+        return ordered
 
     # 3) list_sheets
-    try:
-        ordered3 = [s for s in list_sheets() if s in reg]
-        if ordered3:
-            for s in sorted(reg):
-                if s not in ordered3:
-                    ordered3.append(s)
-            return ordered3
-    except Exception:
-        pass
+    listed = [s for s in _list_sheets() if s in reg_keys]
+    if listed:
+        for sheet in listed:
+            if sheet not in ordered:
+                ordered.append(sheet)
+        for sheet in sorted(reg_keys):
+            if sheet not in ordered:
+                ordered.append(sheet)
+        return ordered
 
-    return sorted(reg)
+    # 4) registry keys
+    return sorted(reg_keys)
 
 
 def _canonicalize_sheet_name(name: str) -> str:
     """
-    Best-effort canonicalization. Avoids hard dependency on page_catalog.
-    Accepts aliases when page_catalog is available.
+    Best-effort canonicalization. Avoids hard dependency on one exact
+    page_catalog API shape.
     """
-    s = _s(name)
-    if not s:
-        return s
+    raw = _s(name)
+    if not raw:
+        return raw
 
-    for fn_name in ("resolve_page", "canonicalize_page", "normalize_page_name"):
-        try:
-            mod = __import__("core.sheets.page_catalog", fromlist=[fn_name])
-            fn = getattr(mod, fn_name, None)
+    try:
+        import core.sheets.page_catalog as page_catalog  # type: ignore
+
+        for fn_name in ("normalize_page_name", "resolve_page", "canonicalize_page"):
+            fn = getattr(page_catalog, fn_name, None)
             if callable(fn):
+                for kwargs in (
+                    {"allow_output_pages": True},
+                    {"allow_special_pages": True},
+                    {},
+                ):
+                    try:
+                        out = fn(raw, **kwargs)
+                        out_s = _s(out)
+                        if out_s:
+                            return out_s
+                        break
+                    except TypeError:
+                        continue
+                    except Exception:
+                        break
                 try:
-                    out = fn(s, allow_output_pages=True)  # normalize_page_name signature
-                except TypeError:
-                    out = fn(s)
-                if isinstance(out, str) and out.strip():
-                    return out.strip()
-        except Exception:
-            continue
+                    out = fn(raw)
+                    out_s = _s(out)
+                    if out_s:
+                        return out_s
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
-    return s.replace(" ", "_")
+    return raw.replace(" ", "_")
 
 
 # ---------------------------------------------------------------------------
@@ -229,61 +342,53 @@ def _canonicalize_sheet_name(name: str) -> str:
 def row_dict_from_column(sheet: str, col: Any) -> Dict[str, Any]:
     """
     Convert a ColumnSpec into a Data_Dictionary row dict.
-    Dict keys MUST match Data_Dictionary schema keys exactly (derived from schema_registry).
+    Dict keys MUST match Data_Dictionary schema keys exactly.
     """
     _, dd_keys = _data_dictionary_spec()
 
-    # ColumnSpec variations (defensive)
-    sheet_name = _s(sheet)
-    group = _s(_get_attr(col, "group", default=""))
-    header = _s(_get_attr(col, "header", default=""))
-    key = _s(_get_attr(col, "key", default=""))
-    dtype = _s(_get_attr(col, "dtype", "type", default=""))
-    fmt = _s(_get_attr(col, "fmt", "format", default=""))
-    required = _bool(_get_attr(col, "required", default=False))
-    source = _s(_get_attr(col, "source", default=""))
-    notes = _s(_get_attr(col, "notes", "note", "description", default=""))
-
-    # canonical internal map
     base: Dict[str, Any] = {
-        "sheet": sheet_name,
-        "group": group,
-        "header": header,
-        "key": key,
-        "dtype": dtype,
-        "fmt": fmt,
-        "required": required,
-        "source": source,
-        "notes": notes,
+        "sheet": _s(sheet),
+        "group": _s(_obj_get(col, "group", default="")),
+        "header": _s(_obj_get(col, "header", default="")),
+        "key": _s(_obj_get(col, "key", default="")),
+        "dtype": _s(_obj_get(col, "dtype", "type", default="")),
+        "fmt": _s(_obj_get(col, "fmt", "format", default="")),
+        "required": _bool(_obj_get(col, "required", default=False)),
+        "source": _s(_obj_get(col, "source", default="")),
+        "notes": _s(_obj_get(col, "notes", "note", "description", default="")),
     }
 
-    # Project into EXACT dd_keys (no extras)
     out: Dict[str, Any] = {}
-    for dk in dd_keys:
-        lk = dk.strip().lower().replace(" ", "_")
+    for dd_key in dd_keys:
+        lk = dd_key.strip().lower().replace(" ", "_")
 
-        if dk in base:
-            out[dk] = base[dk]
+        if dd_key in base:
+            out[dd_key] = base[dd_key]
             continue
         if lk in base:
-            out[dk] = base[lk]
+            out[dd_key] = base[lk]
             continue
 
-        # tolerate alternate names if schema ever changes (future-proof)
-        if lk == "format":
-            out[dk] = base["fmt"]
+        if lk in {"sheet", "page"}:
+            out[dd_key] = base["sheet"]
+        elif lk == "group":
+            out[dd_key] = base["group"]
+        elif lk in {"header", "column"}:
+            out[dd_key] = base["header"]
+        elif lk == "key":
+            out[dd_key] = base["key"]
         elif lk in {"dtype", "type"}:
-            out[dk] = base["dtype"]
-        elif lk in {"sheet", "page"}:
-            out[dk] = base["sheet"]
-        elif lk in {"column", "header"}:
-            out[dk] = base["header"]
+            out[dd_key] = base["dtype"]
+        elif lk in {"format", "fmt"}:
+            out[dd_key] = base["fmt"]
         elif lk in {"required", "is_required", "req"}:
-            out[dk] = base["required"]
+            out[dd_key] = base["required"]
+        elif lk == "source":
+            out[dd_key] = base["source"]
         elif lk in {"notes", "note", "description"}:
-            out[dk] = base["notes"]
+            out[dd_key] = base["notes"]
         else:
-            out[dk] = None
+            out[dd_key] = None
 
     return out
 
@@ -297,19 +402,17 @@ def build_data_dictionary_rows(
     include_meta_sheet: bool = True,
 ) -> List[Dict[str, Any]]:
     """
-    Build Data_Dictionary as list[dict] rows.
-
-    Args:
-        sheets:
-          If provided, restrict to these sheets (aliases accepted; canonicalized).
-        include_meta_sheet:
-          If False, excludes Data_Dictionary itself.
+    Build Data_Dictionary as list[dict] rows with canonical 9-key shape.
     """
+    reg = _schema_registry_map()
+    if not reg:
+        return []
+
     if sheets is None:
         ordered_sheets = preferred_sheet_order()
     else:
         ordered_sheets = [_canonicalize_sheet_name(s) for s in list(sheets)]
-        missing = [s for s in ordered_sheets if s not in SCHEMA_REGISTRY]
+        missing = [s for s in ordered_sheets if s not in reg]
         if missing:
             raise ValueError(f"Unknown sheets in data_dictionary request: {missing}")
 
@@ -318,11 +421,11 @@ def build_data_dictionary_rows(
         if not include_meta_sheet and sheet == "Data_Dictionary":
             continue
 
-        spec = SCHEMA_REGISTRY.get(sheet)
+        spec = reg.get(sheet)
         if spec is None:
             continue
 
-        cols = getattr(spec, "columns", None) or []
+        cols = _extract_spec_columns(spec)
         for col in cols:
             rows.append(row_dict_from_column(sheet, col))
 
@@ -336,22 +439,28 @@ def build_data_dictionary_values(
     include_meta_sheet: bool = True,
 ) -> List[List[Any]]:
     """
-    Build a 2D array ready to write into Google Sheets:
-    [ [headers...],
-      [row1...],
-      [row2...], ... ]
+    Build a strict 2D array ready for Google Sheets:
+    [ [headers...], [row1...], [row2...], ... ]
 
-    Column order strictly follows Data_Dictionary schema (headers/keys from schema_registry).
+    Column order strictly follows Data_Dictionary schema keys.
     """
     headers, dd_keys = _data_dictionary_spec()
-    rows = build_data_dictionary_rows(sheets=sheets, include_meta_sheet=include_meta_sheet)
+    rows = build_data_dictionary_rows(
+        sheets=sheets,
+        include_meta_sheet=include_meta_sheet,
+    )
 
     values: List[List[Any]] = []
     if include_header_row:
         values.append(list(headers))
 
-    for r in rows:
-        values.append([r.get(k) for k in dd_keys])
+    for row in rows:
+        row_values = [row.get(key) for key in dd_keys]
+        if len(row_values) < len(dd_keys):
+            row_values = row_values + [None] * (len(dd_keys) - len(row_values))
+        elif len(row_values) > len(dd_keys):
+            row_values = row_values[: len(dd_keys)]
+        values.append(row_values)
 
     return values
 
@@ -366,52 +475,55 @@ def validate_data_dictionary_output(
     forbid_extra_keys: bool = False,
 ) -> None:
     """
-    Sanity checks for generated output (fast, no I/O).
+    Fast sanity checks for generated output.
 
     enforce_unique_sheet_key:
-      - True by default to prevent duplicates (sheet,key)
+      - prevent duplicate (sheet,key)
 
     forbid_extra_keys:
-      - If True, rows must contain ONLY the Data_Dictionary spec keys (strict CI).
+      - rows must contain ONLY Data_Dictionary spec keys
     """
     _, dd_keys = _data_dictionary_spec()
     required_keys = set(dd_keys)
 
-    for i, r in enumerate(rows):
-        missing = required_keys - set(r.keys())
+    normalized_rows = list(rows)
+
+    for i, row in enumerate(normalized_rows):
+        missing = required_keys - set(row.keys())
         if missing:
             raise ValueError(f"Row {i} missing keys: {sorted(missing)}")
+
         if forbid_extra_keys:
-            extra = set(r.keys()) - required_keys
+            extra = set(row.keys()) - required_keys
             if extra:
                 raise ValueError(f"Row {i} has extra keys not in spec: {sorted(extra)}")
 
     if enforce_unique_sheet_key:
-        lk = [k.strip().lower().replace(" ", "_") for k in dd_keys]
-        sheet_key = None
-        col_key = None
-        for k, kl in zip(dd_keys, lk):
-            if kl in {"sheet", "page"} and sheet_key is None:
-                sheet_key = k
-            if kl == "key" and col_key is None:
-                col_key = k
+        sheet_key: Optional[str] = None
+        col_key: Optional[str] = None
+
+        for original_key in dd_keys:
+            lk = original_key.strip().lower().replace(" ", "_")
+            if lk in {"sheet", "page"} and sheet_key is None:
+                sheet_key = original_key
+            if lk == "key" and col_key is None:
+                col_key = original_key
 
         if not sheet_key or not col_key:
-            raise ValueError("Cannot validate uniqueness: Data_Dictionary spec missing sheet/key columns.")
+            raise ValueError("Cannot validate uniqueness: Data_Dictionary spec missing sheet/key columns")
 
         seen = set()
-        for r in rows:
-            pair = (_s(r.get(sheet_key)), _s(r.get(col_key)))
+        for row in normalized_rows:
+            pair = (_s(row.get(sheet_key)), _s(row.get(col_key)))
             if pair in seen:
                 raise ValueError(f"Duplicate (sheet,key) found in data dictionary: {pair}")
             seen.add(pair)
 
 
 # ---------------------------------------------------------------------------
-# Optional self-check (fast) — enable in CI or strict deployments
+# Optional self-check (fast) — enable only in CI / strict mode
 # ---------------------------------------------------------------------------
 def _self_check() -> None:
-    # DO NOT hardcode for output; only for sanity expectation.
     expected_headers = ["Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes"]
     headers = data_dictionary_headers()
     if headers != expected_headers:
@@ -421,10 +533,25 @@ def _self_check() -> None:
         )
 
     rows = build_data_dictionary_rows()
-    validate_data_dictionary_output(rows, enforce_unique_sheet_key=True, forbid_extra_keys=True)
+    validate_data_dictionary_output(
+        rows,
+        enforce_unique_sheet_key=True,
+        forbid_extra_keys=True,
+    )
+
+    values = build_data_dictionary_values(include_header_row=True)
+    if not values:
+        raise ValueError("Data_Dictionary values output is empty")
+    if len(values[0]) != len(expected_headers):
+        raise ValueError(
+            f"Data_Dictionary values header width mismatch: expected {len(expected_headers)} got {len(values[0])}"
+        )
+    for idx, row in enumerate(values[1:], start=1):
+        if len(row) != len(expected_headers):
+            raise ValueError(
+                f"Data_Dictionary row width mismatch at index {idx}: expected {len(expected_headers)} got {len(row)}"
+            )
 
 
-# Default: do NOT hard-crash startup unless explicitly enabled.
-# Enable in CI: TFB_SCHEMA_SELFTEST=1
 if _env_truthy("TFB_SCHEMA_SELFTEST", False):
     _self_check()
