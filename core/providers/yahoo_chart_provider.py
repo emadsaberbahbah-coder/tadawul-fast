@@ -2,7 +2,7 @@
 # core/providers/yahoo_chart_provider.py
 """
 ================================================================================
-Yahoo Chart Provider (Global + KSA History) — v6.7.0 (PHASE D: RISK STATS FILLED)
+Yahoo Chart Provider (Global + KSA History) — v6.7.1 (PHASE D: RISK STATS FILLED)
 ================================================================================
 
 Why this revision (Phase D)
@@ -10,6 +10,9 @@ Why this revision (Phase D)
   This provider now computes and returns (schema keys):
     volatility_90d, max_drawdown_1y, var_95_1d, sharpe_1y
   computed directly from Yahoo historical prices (best-effort).
+
+v6.7.1 hotfix
+- ✅ FIX: SyntaxError unmatched ')' in _env_float().
 
 What this provider guarantees
 - ✅ Startup-safe: no network calls at import-time
@@ -247,7 +250,7 @@ logger = logging.getLogger("core.providers.yahoo_chart_provider")
 logger.addHandler(logging.NullHandler())
 
 PROVIDER_NAME = "yahoo_chart"
-PROVIDER_VERSION = "6.7.0"
+PROVIDER_VERSION = "6.7.1"
 
 # =============================================================================
 # Env helpers (safe)
@@ -275,8 +278,9 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _env_float(name: str, default: float) -> float:
+    # v6.7.1: fixed unmatched ')'
     try:
-        return float(str(os.getenv(name, str(default))).strip()))
+        return float(str(os.getenv(name, str(default))).strip())
     except Exception:
         return default
 
@@ -935,7 +939,9 @@ class YahooChartProvider:
 
     _sem: asyncio.Semaphore = field(default_factory=lambda: asyncio.Semaphore(_max_concurrency()))
     _rate: TokenBucket = field(default_factory=lambda: TokenBucket(_rate_limit_per_sec(), float(_rate_limit_burst())))
-    _cb: CircuitBreaker = field(default_factory=lambda: CircuitBreaker(_cb_fail_threshold(), _cb_cooldown_sec(), _cb_success_threshold()))
+    _cb: CircuitBreaker = field(
+        default_factory=lambda: CircuitBreaker(_cb_fail_threshold(), _cb_cooldown_sec(), _cb_success_threshold())
+    )
 
     # -------------------------------------------------------------------------
     # Blocking: history
@@ -971,7 +977,7 @@ class YahooChartProvider:
                 )
             except Exception as e:
                 last_err = e
-                base = min(5.0, 0.5 * (2 ** attempt))
+                base = min(5.0, 0.5 * (2**attempt))
                 time.sleep(random.uniform(0.0, base))
         return {"symbol": symbol, "error": f"history_fetch_failed: {last_err}", "provider": PROVIDER_NAME}
 
@@ -1110,8 +1116,7 @@ class YahooChartProvider:
                 out["exchange"] = exchange
                 out["asset_class"] = asset_class
 
-                # Derived canonical (note: percent_change here is percent-points for backward-compat;
-                # engine normalization converts to fraction when needed)
+                # Derived canonical
                 if out.get("previous_close") not in (None, 0.0):
                     chg = out["current_price"] - float(out["previous_close"])
                     out["price_change"] = float(chg)
@@ -1128,38 +1133,34 @@ class YahooChartProvider:
 
                 # Indicators + Forecasts + Risk Stats (PHASE D)
                 if closes:
-                    # RSI
                     rsi = _rsi_14(closes)
                     if rsi is not None:
                         out["rsi_14"] = float(rsi)
 
-                    # Vols
                     vol30 = _volatility_nd(closes, 30)
                     vol90 = _volatility_nd(closes, 90)
                     if vol30 is not None:
-                        out["volatility_30d"] = float(vol30)  # fraction (e.g., 0.25 == 25% ann.)
+                        out["volatility_30d"] = float(vol30)
                     if vol90 is not None:
                         out["volatility_90d"] = float(vol90)
 
-                    # Drawdown / VaR / Sharpe
                     dd1y = _max_drawdown_1y(closes)
                     v95 = _var_95_1d(closes)
                     sh = _sharpe_1y(closes)
                     if dd1y is not None:
-                        out["max_drawdown_1y"] = float(dd1y)  # fraction magnitude (0.20 == 20%)
+                        out["max_drawdown_1y"] = float(dd1y)
                     if v95 is not None:
-                        out["var_95_1d"] = float(v95)         # fraction magnitude
+                        out["var_95_1d"] = float(v95)
                     if sh is not None:
                         out["sharpe_1y"] = float(sh)
 
-                    # Forecasts
                     f1, roi1, c1 = _simple_forecast(closes, horizon_days=30)
                     f3, roi3, c3 = _simple_forecast(closes, horizon_days=90)
                     f12, roi12, c12 = _simple_forecast(closes, horizon_days=365)
 
                     if f1 is not None:
                         out["forecast_price_1m"] = float(f1)
-                        out["expected_roi_1m"] = float(roi1) if roi1 is not None else None  # percent-points
+                        out["expected_roi_1m"] = float(roi1) if roi1 is not None else None
                     if f3 is not None:
                         out["forecast_price_3m"] = float(f3)
                         out["expected_roi_3m"] = float(roi3) if roi3 is not None else None
@@ -1167,18 +1168,15 @@ class YahooChartProvider:
                         out["forecast_price_12m"] = float(f12)
                         out["expected_roi_12m"] = float(roi12) if roi12 is not None else None
 
-                    # confidence 0..1
                     conf_candidates = [x for x in [c1, c3, c12] if isinstance(x, (int, float))]
                     conf = max(0.0, min(1.0, float(min(conf_candidates) if conf_candidates else 0.0)))
                     out["forecast_confidence"] = float(conf)
 
-                # Timestamps
                 out["last_updated_utc"] = _utc_iso()
                 out["last_updated_riyadh"] = _riyadh_iso()
                 if hist_last_dt is not None:
                     out["history_last_utc"] = _utc_iso(hist_last_dt)
 
-                # Data quality (simple 0..1 helper)
                 filled = 0
                 for k in ("current_price", "previous_close", "open_price", "volume", "week_52_high", "week_52_low"):
                     if out.get(k) is not None:
@@ -1200,7 +1198,7 @@ class YahooChartProvider:
 
             except Exception as e:
                 last_err = e
-                base = min(5.0, 0.5 * (2 ** attempt))
+                base = min(5.0, 0.5 * (2**attempt))
                 time.sleep(random.uniform(0.0, base))
 
         return {
@@ -1307,7 +1305,6 @@ class YahooChartProvider:
         per = (period or _history_period()).strip() or _history_period()
         itv = (interval or _history_interval()).strip() or _history_interval()
 
-        # cache
         cached = await self.history_cache.get(sym, kind=f"history:{per}:{itv}")
         if isinstance(cached, list):
             return cached
