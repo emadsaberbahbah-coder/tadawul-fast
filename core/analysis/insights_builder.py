@@ -2,20 +2,23 @@
 # core/analysis/insights_builder.py
 """
 ================================================================================
-Insights Analysis Builder — v1.2.0 (GREEN STATUS + PCT FIX + NUMERIC VALUES)
+Insights Analysis Builder — v1.3.0
+(SCHEMA-FIRST / TOP10-CONTEXT-AWARE / NUMERIC-SAFE / GREEN-STATUS)
 ================================================================================
 Tadawul Fast Bridge (TFB)
 
-Why this revision (fix the “❌ red X / not green” symptom)
-- ✅ Adds explicit System status rows: Build Status = OK / WARN (never blank).
-- ✅ Fixes percent formatting:
-    - If engine returns fractions (0.12) -> shows 12.00%
-    - If engine returns percent-points (12) -> shows 12.00%
-- ✅ Keeps VALUE column numeric when possible (better for Google Sheets formulas/icons).
-- ✅ Still import-safe: NO network calls at import time.
-- ✅ Still schema-first: keys/order come from core/sheets/schema_registry.py.
+What this revision fixes
+- ✅ FIX: keeps Insights_Analysis schema-first and import-safe
+- ✅ FIX: adds richer Top10 contextual rows using selector output when available
+- ✅ FIX: carries criteria context consistently into Insights sections
+- ✅ FIX: improves criteria packaging for downstream Top10 / advisor flow
+- ✅ FIX: keeps VALUE numeric when possible for Sheets formulas / icons
+- ✅ FIX: percent handling remains normalized to percent-points for display rows
+- ✅ FIX: always returns Build Status rows (never blank)
+- ✅ SAFE: no network calls at import time
+- ✅ SAFE: best-effort engine access only
 
-Expected Insights_Analysis columns (schema_registry keys)
+Expected Insights_Analysis columns
 - section
 - item
 - symbol
@@ -34,6 +37,7 @@ Public API
 from __future__ import annotations
 
 import inspect
+import json
 import logging
 import os
 from datetime import datetime, timedelta, timezone
@@ -42,7 +46,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 logger = logging.getLogger("core.analysis.insights_builder")
 logger.addHandler(logging.NullHandler())
 
-INSIGHTS_BUILDER_VERSION = "1.2.0"
+INSIGHTS_BUILDER_VERSION = "1.3.0"
 _RIYADH_TZ = timezone(timedelta(hours=3))
 
 
@@ -65,12 +69,26 @@ def _as_float(v: Any) -> Optional[float]:
     if v is None:
         return None
     try:
-        x = float(v)
-        if x != x:  # NaN
+        if isinstance(v, bool):
+            return None
+        s = str(v).strip().replace(",", "")
+        if s.endswith("%"):
+            s = s[:-1].strip()
+        x = float(s)
+        if x != x:
             return None
         return x
     except Exception:
         return None
+
+
+def _as_fraction(v: Any) -> Optional[float]:
+    x = _as_float(v)
+    if x is None:
+        return None
+    if abs(x) > 1.5:
+        return x / 100.0
+    return x
 
 
 def _as_int(v: Any) -> Optional[int]:
@@ -87,12 +105,11 @@ def _pct_points(v: Any) -> Optional[float]:
     Normalize percent values into percent-points:
       - 0.12 -> 12.0
       - 12 -> 12.0
-      - "12%" -> 12.0 (best-effort via float)
+      - "12%" -> 12.0
     """
     x = _as_float(v)
     if x is None:
         return None
-    # fraction heuristic
     if abs(x) <= 1.5:
         return x * 100.0
     return x
@@ -138,8 +155,15 @@ def _env_csv(name: str, default_csv: str) -> List[str]:
     return _csv_list(os.getenv(name, default_csv))
 
 
+def _compact_json(obj: Any) -> str:
+    try:
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":"), default=str)
+    except Exception:
+        return _safe_str(obj)
+
+
 # -----------------------------------------------------------------------------
-# Schema helpers (schema_registry is authoritative)
+# Schema helpers
 # -----------------------------------------------------------------------------
 def get_insights_schema() -> Tuple[List[str], List[str], str]:
     """
@@ -196,7 +220,102 @@ def _get_criteria_fields() -> List[Dict[str, Any]]:
 
 
 # -----------------------------------------------------------------------------
-# Row builder (ALWAYS fills required fields)
+# Criteria normalization / context helpers
+# -----------------------------------------------------------------------------
+def _normalize_criteria_input(criteria: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    c = dict(criteria or {})
+
+    pages = c.get("pages_selected") or c.get("pages") or c.get("selected_pages") or []
+    if isinstance(pages, str):
+        pages = _csv_list(pages)
+    if not isinstance(pages, list):
+        pages = []
+    pages = [_safe_str(x) for x in pages if _safe_str(x)]
+
+    invest_days = _as_int(
+        c.get("invest_period_days")
+        or c.get("investment_period_days")
+        or c.get("period_days")
+        or 90
+    )
+    if invest_days is None or invest_days <= 0:
+        invest_days = 90
+
+    min_roi = c.get("min_expected_roi")
+    if min_roi is None:
+        min_roi = c.get("min_roi")
+    if min_roi is None:
+        min_roi = c.get("required_return_pct")
+    min_roi_frac = _as_fraction(min_roi)
+
+    max_risk = _as_float(c.get("max_risk_score") or c.get("max_risk") or 60.0)
+    if max_risk is None:
+        max_risk = 60.0
+
+    min_conf = _as_fraction(
+        c.get("min_confidence")
+        or c.get("min_ai_confidence")
+        or c.get("min_confidence_score")
+        or 0.70
+    )
+    if min_conf is None:
+        min_conf = 0.70
+
+    min_volume = _as_float(c.get("min_volume") or c.get("min_liquidity") or c.get("min_vol"))
+    top_n = _as_int(c.get("top_n") or c.get("limit") or 10)
+    if top_n is None or top_n <= 0:
+        top_n = 10
+
+    normalized = {
+        "pages_selected": pages or ["Market_Leaders", "Global_Markets", "Mutual_Funds", "Commodities_FX", "My_Portfolio"],
+        "invest_period_days": invest_days,
+        "min_expected_roi": min_roi_frac,
+        "max_risk_score": max_risk,
+        "min_confidence": min_conf,
+        "min_volume": min_volume,
+        "use_liquidity_tiebreak": bool(c.get("use_liquidity_tiebreak", True)),
+        "enforce_risk_confidence": bool(c.get("enforce_risk_confidence", True)),
+        "top_n": max(1, min(50, top_n)),
+        "enrich_final": bool(c.get("enrich_final", True)),
+    }
+
+    for k, v in c.items():
+        if k not in normalized and v is not None:
+            normalized[k] = v
+
+    return normalized
+
+
+def _days_to_horizon(days: int) -> str:
+    d = int(days or 0)
+    if d <= 45:
+        return "1M"
+    if d <= 135:
+        return "3M"
+    return "12M"
+
+
+def _criteria_snapshot_text(criteria: Optional[Dict[str, Any]]) -> str:
+    norm = _normalize_criteria_input(criteria)
+    return _compact_json(norm)
+
+
+def _criteria_summary_note(criteria: Optional[Dict[str, Any]]) -> str:
+    norm = _normalize_criteria_input(criteria)
+    roi = norm.get("min_expected_roi")
+    roi_txt = _fmt_pct(roi) if roi is not None else "N/A"
+    conf_txt = _fmt_pct(norm.get("min_confidence"))
+    return (
+        f"Horizon={_days_to_horizon(int(norm['invest_period_days']))} "
+        f"| Days={norm['invest_period_days']} "
+        f"| Min ROI={roi_txt} "
+        f"| Max Risk={_fmt_num(norm.get('max_risk_score'))} "
+        f"| Min Confidence={conf_txt}"
+    )
+
+
+# -----------------------------------------------------------------------------
+# Row builder
 # -----------------------------------------------------------------------------
 def _make_row(
     *,
@@ -216,22 +335,20 @@ def _make_row(
     met = _safe_str(metric) or "metric"
     sym = _safe_str(symbol)
 
-    # VALUE: keep numeric when possible (for Google Sheets conditional icons)
-    val_out: Any
     if value is None:
-        val_out = ""
+        val_out: Any = ""
     elif isinstance(value, (int, float)) and not isinstance(value, bool):
         val_out = value
     else:
-        # try numeric casting first
         xf = _as_float(value)
         xi = _as_int(value)
-        if xi is not None and _safe_str(value).strip().isdigit():
+        raw_s = _safe_str(value)
+        if xi is not None and raw_s.isdigit():
             val_out = xi
-        elif xf is not None and _safe_str(value) != "":
+        elif xf is not None and raw_s != "":
             val_out = xf
         else:
-            val_out = _safe_str(value)
+            val_out = raw_s
 
     base: Dict[str, Any] = {
         "section": sec,
@@ -258,7 +375,7 @@ def build_criteria_rows(
     ts = last_updated_riyadh or _now_riyadh_iso()
 
     fields = _get_criteria_fields()
-    crit = dict(criteria or {})
+    crit = _normalize_criteria_input(criteria)
 
     rows: List[Dict[str, Any]] = []
     for f in fields:
@@ -266,14 +383,12 @@ def build_criteria_rows(
         label = f["label"]
         v = crit.get(k, f.get("default", ""))
 
-        # normalize pct-looking fields to friendly display text in notes, keep value numeric where possible
-        if k.endswith("_pct") or k.endswith("_percent") or "return" in k:
-            # keep numeric if possible; notes shows formatted string
-            vnum = _as_float(v)
+        if k.endswith("_pct") or k.endswith("_percent") or "return" in k or "confidence" in k:
+            vnum = _as_fraction(v)
             note = f.get("notes", "")
             if vnum is not None:
                 note = (note + " " if note else "") + f"(display: {_fmt_pct(vnum)})"
-                v = vnum  # store numeric
+                v = vnum
             rows.append(
                 _make_row(
                     keys=keys,
@@ -299,11 +414,38 @@ def build_criteria_rows(
                     last_updated_riyadh=ts,
                 )
             )
+
+    rows.append(
+        _make_row(
+            keys=keys,
+            section="Criteria",
+            item="Criteria Snapshot",
+            symbol="",
+            metric="criteria_snapshot",
+            value=_criteria_snapshot_text(crit),
+            notes="Compact JSON snapshot used by Top10 / advisor contextual logic.",
+            last_updated_riyadh=ts,
+        )
+    )
+
+    rows.append(
+        _make_row(
+            keys=keys,
+            section="Criteria",
+            item="Criteria Summary",
+            symbol="",
+            metric="criteria_summary",
+            value=_days_to_horizon(int(crit["invest_period_days"])),
+            notes=_criteria_summary_note(crit),
+            last_updated_riyadh=ts,
+        )
+    )
+
     return rows
 
 
 # -----------------------------------------------------------------------------
-# Engine integration (best-effort, never raises)
+# Engine integration
 # -----------------------------------------------------------------------------
 async def _maybe_await(v: Any) -> Any:
     if inspect.isawaitable(v):
@@ -331,7 +473,6 @@ async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "") 
     fn = getattr(engine, "get_enriched_quotes_batch", None)
     if callable(fn):
         try:
-            # allow engines that accept (symbols, mode=...)
             try:
                 res = await _maybe_await(fn(symbols, mode=mode or ""))
             except TypeError:
@@ -372,11 +513,23 @@ async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "") 
     return out3
 
 
+async def _fetch_top10_payload(engine: Any, criteria: Optional[Dict[str, Any]] = None, *, limit: int = 10, mode: str = "") -> Dict[str, Any]:
+    if not engine:
+        return {}
+
+    try:
+        from core.analysis.top10_selector import build_top10_rows  # type: ignore
+
+        payload = await _maybe_await(build_top10_rows(engine=engine, criteria=criteria or {}, limit=limit, mode=mode or ""))
+        return payload if isinstance(payload, dict) else {}
+    except Exception:
+        return {}
+
+
 async def _fetch_top10_symbols(engine: Any, criteria: Optional[Dict[str, Any]] = None, *, limit: int = 10) -> List[str]:
     if not engine:
         return []
 
-    # Preferred selector module (lazy import)
     try:
         from core.analysis.top10_selector import select_top10_symbols  # type: ignore
 
@@ -685,7 +838,7 @@ def _build_portfolio_kpi_rows(
         return rows
 
     unreal = total_value - total_cost
-    unreal_pct = (unreal / total_cost) if total_cost > 0 else None  # fraction
+    unreal_pct = (unreal / total_cost) if total_cost > 0 else None
 
     rows.append(
         _make_row(
@@ -731,11 +884,147 @@ def _build_portfolio_kpi_rows(
                 item="Unrealized P/L %",
                 symbol="",
                 metric="unrealized_pl_pct",
-                value=_pct_points(unreal_pct),  # percent-points
+                value=_pct_points(unreal_pct),
                 notes=f"unrealized_pl / total_cost (display: {_fmt_pct(unreal_pct)}).",
                 last_updated_riyadh=ts,
             )
         )
+    return rows
+
+
+def _build_top10_context_rows(
+    *,
+    keys: Sequence[str],
+    top10_payload: Dict[str, Any],
+    criteria: Optional[Dict[str, Any]],
+    ts: str,
+) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    norm_criteria = _normalize_criteria_input(criteria)
+    top_rows = top10_payload.get("rows") if isinstance(top10_payload, dict) else None
+    if not isinstance(top_rows, list) or not top_rows:
+        rows.append(
+            _make_row(
+                keys=keys,
+                section="Top 10 Investments",
+                item="Status",
+                symbol="",
+                metric="top10_status",
+                value="Unavailable",
+                notes="Top10 payload is empty.",
+                last_updated_riyadh=ts,
+            )
+        )
+        return rows
+
+    rows.append(
+        _make_row(
+            keys=keys,
+            section="Top 10 Investments",
+            item="Status",
+            symbol="",
+            metric="top10_count",
+            value=len(top_rows),
+            notes="Top10 rows generated through core.analysis.top10_selector.",
+            last_updated_riyadh=ts,
+        )
+    )
+
+    rows.append(
+        _make_row(
+            keys=keys,
+            section="Top 10 Investments",
+            item="Criteria Snapshot",
+            symbol="",
+            metric="criteria_snapshot",
+            value=_criteria_snapshot_text(norm_criteria),
+            notes=_criteria_summary_note(norm_criteria),
+            last_updated_riyadh=ts,
+        )
+    )
+
+    for i, raw in enumerate(top_rows[:10], start=1):
+        if not isinstance(raw, dict):
+            continue
+
+        sym = _safe_str(raw.get("symbol"))
+        name = _safe_str(raw.get("name"))
+        rank = _as_int(raw.get("top10_rank"))
+        if rank is None:
+            rank = i
+
+        roi_horizon_key = "expected_roi_3m"
+        days = int(norm_criteria["invest_period_days"])
+        if days <= 45:
+            roi_horizon_key = "expected_roi_1m"
+        elif days <= 135:
+            roi_horizon_key = "expected_roi_3m"
+        else:
+            roi_horizon_key = "expected_roi_12m"
+
+        roi_val = raw.get(roi_horizon_key)
+        reco = _safe_str(raw.get("recommendation"))
+        sel_reason = _safe_str(raw.get("selection_reason"))
+        reco_reason = _safe_str(raw.get("recommendation_reason"))
+        conf = raw.get("forecast_confidence")
+        overall = raw.get("overall_score")
+        risk_bucket = _safe_str(raw.get("risk_bucket"))
+
+        note_parts: List[str] = []
+        if name:
+            note_parts.append(name)
+        if reco:
+            note_parts.append(f"reco={reco}")
+        if conf is not None:
+            note_parts.append(f"conf={_fmt_pct(conf)}")
+        if risk_bucket:
+            note_parts.append(f"risk={risk_bucket}")
+        if sel_reason:
+            note_parts.append(f"why={sel_reason}")
+        elif reco_reason:
+            note_parts.append(f"why={reco_reason}")
+
+        rows.append(
+            _make_row(
+                keys=keys,
+                section="Top 10 Investments",
+                item=f"#{rank}",
+                symbol=sym,
+                metric=roi_horizon_key,
+                value=_pct_points(roi_val) if roi_val is not None else "",
+                notes=" | ".join(note_parts) if note_parts else "Top10 ranked item.",
+                last_updated_riyadh=ts,
+            )
+        )
+
+        if overall is not None:
+            rows.append(
+                _make_row(
+                    keys=keys,
+                    section="Top 10 Context",
+                    item=f"#{rank} Overall Score",
+                    symbol=sym,
+                    metric="overall_score",
+                    value=overall,
+                    notes=f"Rank={rank}" + (f" | {name}" if name else ""),
+                    last_updated_riyadh=ts,
+                )
+            )
+
+        if sel_reason or reco_reason:
+            rows.append(
+                _make_row(
+                    keys=keys,
+                    section="Top 10 Context",
+                    item=f"#{rank} Selection Logic",
+                    symbol=sym,
+                    metric="selection_reason",
+                    value=rank,
+                    notes=sel_reason or reco_reason,
+                    last_updated_riyadh=ts,
+                )
+            )
+
     return rows
 
 
@@ -770,11 +1059,12 @@ async def build_insights_analysis_rows(
 ) -> Dict[str, Any]:
     headers, keys, schema_source = get_insights_schema()
     ts = _now_riyadh_iso()
+    norm_criteria = _normalize_criteria_input(criteria)
 
     rows: List[Dict[str, Any]] = []
 
     if include_criteria_rows:
-        rows.extend(build_criteria_rows(criteria=criteria, last_updated_riyadh=ts))
+        rows.extend(build_criteria_rows(criteria=norm_criteria, last_updated_riyadh=ts))
 
     if include_system_rows:
         schema_version = ""
@@ -829,7 +1119,6 @@ async def build_insights_analysis_rows(
         eff_universes.update(_default_universes())
         auto_used = True
 
-    # Always add build-status (this is what makes the sheet show ✅ instead of ❌)
     build_ok = bool(engine) and bool(eff_universes)
     rows.append(
         _make_row(
@@ -857,7 +1146,19 @@ async def build_insights_analysis_rows(
         )
     )
 
-    # No engine or no universes -> still return GREEN/WARN rows (never empty)
+    rows.append(
+        _make_row(
+            keys=keys,
+            section="Summary",
+            item="Criteria Summary",
+            symbol="",
+            metric="criteria_summary",
+            value=_days_to_horizon(int(norm_criteria["invest_period_days"])),
+            notes=_criteria_summary_note(norm_criteria),
+            last_updated_riyadh=ts,
+        )
+    )
+
     if not engine or not eff_universes:
         if not engine:
             rows.append(
@@ -899,10 +1200,10 @@ async def build_insights_analysis_rows(
                 "universes": list(eff_universes.keys()),
                 "mode": mode,
                 "builder_version": INSIGHTS_BUILDER_VERSION,
+                "criteria_snapshot": _criteria_snapshot_text(norm_criteria),
             },
         }
 
-    # Build universe snapshots
     for section_name, sym_list in eff_universes.items():
         syms = [_safe_str(s) for s in (sym_list or []) if _safe_str(s)]
         if not syms:
@@ -920,64 +1221,67 @@ async def build_insights_analysis_rows(
         if include_portfolio_kpis and section_name.strip().lower() in {"my_portfolio", "portfolio", "my portfolio"}:
             rows.extend(_build_portfolio_kpi_rows(keys=keys, section="Portfolio KPIs", symbols=syms, qmap=qmap, ts=ts))
 
-    # Top10 section
     if include_top10_section:
-        top10_syms = await _fetch_top10_symbols(engine, criteria=criteria, limit=10)
-        if top10_syms:
-            qmap10 = await _fetch_quotes_map(engine, top10_syms, mode=mode or "")
-            rows.append(
-                _make_row(
-                    keys=keys,
-                    section="Top 10 Investments",
-                    item="Status",
-                    symbol="",
-                    metric="top10_count",
-                    value=len(top10_syms),
-                    notes="Top10 symbols generated (best-effort).",
-                    last_updated_riyadh=ts,
-                )
-            )
-            for i, sym in enumerate(top10_syms, start=1):
-                d = qmap10.get(sym) or {}
-                roi3 = _as_float(_pick(d, "expected_roi_3m"))
-                conf = _as_float(_pick(d, "forecast_confidence"))
-                reco = _safe_str(_pick(d, "recommendation"))
-                name = _safe_str(_pick(d, "name"))
-
-                note_parts = []
-                if name:
-                    note_parts.append(name)
-                if conf is not None:
-                    note_parts.append(f"conf={_fmt_num(conf)}")
-                if reco:
-                    note_parts.append(f"reco={reco}")
-                notes = " | ".join(note_parts) if note_parts else "Top10 item."
-
+        top10_payload = await _fetch_top10_payload(engine, criteria=norm_criteria, limit=10, mode=mode or "")
+        if top10_payload:
+            rows.extend(_build_top10_context_rows(keys=keys, top10_payload=top10_payload, criteria=norm_criteria, ts=ts))
+        else:
+            top10_syms = await _fetch_top10_symbols(engine, criteria=norm_criteria, limit=10)
+            if top10_syms:
+                qmap10 = await _fetch_quotes_map(engine, top10_syms, mode=mode or "")
                 rows.append(
                     _make_row(
                         keys=keys,
                         section="Top 10 Investments",
-                        item=f"#{i}",
-                        symbol=sym,
-                        metric="expected_roi_3m",
-                        value=_pct_points(roi3) if roi3 is not None else "",
-                        notes=(notes + (f" (display: {_fmt_pct(roi3)})" if roi3 is not None else "")),
+                        item="Status",
+                        symbol="",
+                        metric="top10_count",
+                        value=len(top10_syms),
+                        notes="Top10 symbols generated (best-effort symbol-only fallback).",
                         last_updated_riyadh=ts,
                     )
                 )
-        else:
-            rows.append(
-                _make_row(
-                    keys=keys,
-                    section="Top 10 Investments",
-                    item="Status",
-                    symbol="",
-                    metric="top10_status",
-                    value="Unavailable",
-                    notes="No Top10 method found or returned empty.",
-                    last_updated_riyadh=ts,
+                for i, sym in enumerate(top10_syms, start=1):
+                    d = qmap10.get(sym) or {}
+                    roi3 = _as_float(_pick(d, "expected_roi_3m"))
+                    conf = _as_float(_pick(d, "forecast_confidence"))
+                    reco = _safe_str(_pick(d, "recommendation"))
+                    name = _safe_str(_pick(d, "name"))
+
+                    note_parts = []
+                    if name:
+                        note_parts.append(name)
+                    if conf is not None:
+                        note_parts.append(f"conf={_fmt_num(conf)}")
+                    if reco:
+                        note_parts.append(f"reco={reco}")
+                    notes = " | ".join(note_parts) if note_parts else "Top10 item."
+
+                    rows.append(
+                        _make_row(
+                            keys=keys,
+                            section="Top 10 Investments",
+                            item=f"#{i}",
+                            symbol=sym,
+                            metric="expected_roi_3m",
+                            value=_pct_points(roi3) if roi3 is not None else "",
+                            notes=(notes + (f" (display: {_fmt_pct(roi3)})" if roi3 is not None else "")),
+                            last_updated_riyadh=ts,
+                        )
+                    )
+            else:
+                rows.append(
+                    _make_row(
+                        keys=keys,
+                        section="Top 10 Investments",
+                        item="Status",
+                        symbol="",
+                        metric="top10_status",
+                        value="Unavailable",
+                        notes="No Top10 method found or returned empty.",
+                        last_updated_riyadh=ts,
+                    )
                 )
-            )
 
     return {
         "status": "success",
@@ -993,6 +1297,7 @@ async def build_insights_analysis_rows(
             "universes": list(eff_universes.keys()),
             "mode": mode,
             "builder_version": INSIGHTS_BUILDER_VERSION,
+            "criteria_snapshot": _criteria_snapshot_text(norm_criteria),
         },
     }
 
