@@ -2,25 +2,29 @@
 """
 core/symbols_reader.py
 ================================================================================
-TADAWUL FAST BRIDGE – ENTERPRISE SYMBOLS READER (v8.2.0)
+TADAWUL FAST BRIDGE – ENTERPRISE SYMBOLS READER (v8.3.0)
 ================================================================================
-RENDER-ALIGNED | SCHEMA-AWARE | ASYNC-SAFE | CACHE-SAFE | HYGIENE-SAFE
+RENDER-ALIGNED | ENGINE-COMPATIBLE | SCHEMA-AWARE | ASYNC-SAFE | CACHE-SAFE
 
-Why this revision (v8.2.0)
-- ✅ FIX: SCRIPT_VERSION was referenced but never defined.
-- ✅ FIX: TraceContext incorrectly used span.set_attributes() and span.__exit__().
-- ✅ FIX: Best-sheet selection bug compared len(symbols) to a float variable.
-- ✅ FIX: Extractor row numbering and column range handling were inconsistent.
-- ✅ ALIGN: Reads Render env vars:
-    - DEFAULT_SPREADSHEET_ID, GOOGLE_SHEETS_CREDENTIALS / GOOGLE_APPLICATION_CREDENTIALS
-    - REDIS_URL, CACHE_BACKEND, CACHE_TTL_SEC, CACHE_MAX_SIZE, CACHE_ENABLED
-    - LOG_JSON / JSON_LOGS, ENABLE_TRACING / CORE_TRACING_ENABLED
-- ✅ ALIGN: Page registry updated to your latest schema direction:
-    - Market_Leaders, Global_Markets, Commodities_FX, Mutual_Funds, My_Portfolio,
-      Insights_Analysis, Top_10_Investments
-  (keeps backward aliases like "KSA"/"TADAWUL" without requiring a KSA_Tadawul sheet)
-- ✅ HARDEN: No print() anywhere (CLI uses sys.stdout.write only).
-- ✅ HARDEN: Lazy imports & safe fallbacks (won’t crash if optional deps missing).
+Why this revision (v8.3.0)
+- ✅ FIX: Adds the exact public APIs expected by data_engine_v2:
+    - get_symbols_for_sheet(...)
+    - read_symbols_for_sheet(...)
+    - get_sheet_symbols(...)
+    - get_symbols_for_page(...)
+    - list_symbols_for_page(...)
+    - get_symbols(...)
+    - list_symbols(...)
+- ✅ FIX: Adds class/factory exports so lazy engine discovery can use:
+    - SymbolsReader
+    - get_reader()
+    - create_reader()
+    - build_reader()
+- ✅ FIX: Supports direct sheet-name lookup even when not passed as a canonical page key.
+- ✅ FIX: Better actual-tab matching (underscores/spaces/case differences).
+- ✅ FIX: Stronger fallback behavior for KSA/global sheet aliases.
+- ✅ HARDEN: Keeps no print(); CLI uses sys.stdout.write only.
+- ✅ HARDEN: Lazy imports & safe fallbacks.
 - ✅ PERF: SingleFlight + dual executors + O(1) LRU + optional Redis L2.
 
 Core Capabilities
@@ -46,7 +50,6 @@ import re
 import sys
 import threading
 import time
-import uuid
 import zlib
 from collections import defaultdict, OrderedDict
 from dataclasses import asdict, dataclass, field
@@ -70,7 +73,7 @@ from typing import (
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SCRIPT_VERSION = "8.2.0"
+SCRIPT_VERSION = "8.3.0"
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +174,9 @@ LOG_FORMAT = "%(asctime)s | %(levelname)8s | %(name)s | %(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 def _env_truthy(name: str) -> bool:
-    return (os.getenv(name, "") or "").strip().lower() in {"1", "true", "yes", "y", "on", "t", "enabled", "active"}
+    return (os.getenv(name, "") or "").strip().lower() in {
+        "1", "true", "yes", "y", "on", "t", "enabled", "active"
+    }
 
 LOG_JSON = _env_truthy("LOG_JSON") or _env_truthy("JSON_LOGS")
 
@@ -186,8 +191,11 @@ _CPU_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name
 # =============================================================================
 # Metrics & Tracing
 # =============================================================================
-
-_TRACING_ENABLED = _env_truthy("ENABLE_TRACING") or _env_truthy("CORE_TRACING_ENABLED") or _env_truthy("TRACING_ENABLED")
+_TRACING_ENABLED = (
+    _env_truthy("ENABLE_TRACING")
+    or _env_truthy("CORE_TRACING_ENABLED")
+    or _env_truthy("TRACING_ENABLED")
+)
 
 class TraceContext:
     """
@@ -250,11 +258,11 @@ if PROMETHEUS_AVAILABLE and Counter is not None and Histogram is not None:
     )
 else:
     class _DummyMetric:
-        def labels(self, *args, **kwargs):  # noqa
+        def labels(self, *args, **kwargs):
             return self
-        def inc(self, *args, **kwargs):  # noqa
+        def inc(self, *args, **kwargs):
             return None
-        def observe(self, *args, **kwargs):  # noqa
+        def observe(self, *args, **kwargs):
             return None
 
     reader_requests_total = _DummyMetric()
@@ -428,6 +436,9 @@ def split_cell(cell: Any) -> List[str]:
     parts = re.split(r"[\s,;|\t\n\r]+", raw)
     return [p.strip() for p in parts if p and p.strip()]
 
+def normalize_name_key(name: str) -> str:
+    return re.sub(r"[^A-Z0-9]+", "", strip_value(name).upper())
+
 
 # =============================================================================
 # Full Jitter Backoff & SingleFlight
@@ -442,7 +453,12 @@ class FullJitterBackoff:
 
     def _retryable_error(self, e: Exception) -> bool:
         s = str(e).lower()
-        return any(x in s for x in ("rate limit", "quota", "429", "500", "502", "503", "timeout", "deadline", "temporarily"))
+        return any(
+            x in s for x in (
+                "rate limit", "quota", "429", "500", "502", "503",
+                "timeout", "deadline", "temporarily"
+            )
+        )
 
     def execute_sync(self, func: Callable, *args, **kwargs) -> Any:
         last_err: Optional[Exception] = None
@@ -492,27 +508,40 @@ _SINGLE_FLIGHT = SingleFlight()
 # Configuration
 # =============================================================================
 class Config:
-    # Sheet defaults (schema uses header row 5, start row 6 typically)
     DEFAULT_HEADER_ROW = get_env_int("TFB_SYMBOL_HEADER_ROW", 5, lo=1, hi=200)
     DEFAULT_START_ROW = get_env_int("TFB_SYMBOL_START_ROW", 6, lo=1, hi=500)
     DEFAULT_MAX_ROWS = get_env_int("TFB_SYMBOL_MAX_ROWS", 5000, lo=1, hi=200000)
 
-    # Cache (prefer project-level, fallback to global)
-    CACHE_TTL_SEC = get_env_float("TFB_SYMBOLS_CACHE_TTL_SEC", get_env_float("CACHE_TTL_SEC", 300.0), lo=1.0, hi=86400.0)
-    CACHE_DISABLE = coerce_bool(os.getenv("TFB_SYMBOLS_CACHE_DISABLE"), False) or (not coerce_bool(os.getenv("CACHE_ENABLED"), True))
-    CACHE_BACKEND = get_env_str("TFB_SYMBOLS_CACHE_BACKEND", get_env_str("CACHE_BACKEND", "redis" if REDIS_AVAILABLE else "memory")).lower()
-    CACHE_MAX_SIZE = get_env_int("TFB_SYMBOLS_CACHE_MAX_SIZE", get_env_int("CACHE_MAX_SIZE", 20000), lo=100, hi=5_000_000)
-    CACHE_COMPRESSION = coerce_bool(os.getenv("TFB_SYMBOLS_CACHE_COMPRESSION"), coerce_bool(os.getenv("CACHE_COMPRESSION"), True))
+    CACHE_TTL_SEC = get_env_float(
+        "TFB_SYMBOLS_CACHE_TTL_SEC",
+        get_env_float("CACHE_TTL_SEC", 300.0),
+        lo=1.0,
+        hi=86400.0,
+    )
+    CACHE_DISABLE = coerce_bool(os.getenv("TFB_SYMBOLS_CACHE_DISABLE"), False) or (
+        not coerce_bool(os.getenv("CACHE_ENABLED"), True)
+    )
+    CACHE_BACKEND = get_env_str(
+        "TFB_SYMBOLS_CACHE_BACKEND",
+        get_env_str("CACHE_BACKEND", "redis" if REDIS_AVAILABLE else "memory"),
+    ).lower()
+    CACHE_MAX_SIZE = get_env_int(
+        "TFB_SYMBOLS_CACHE_MAX_SIZE",
+        get_env_int("CACHE_MAX_SIZE", 20000),
+        lo=100,
+        hi=5_000_000,
+    )
+    CACHE_COMPRESSION = coerce_bool(
+        os.getenv("TFB_SYMBOLS_CACHE_COMPRESSION"),
+        coerce_bool(os.getenv("CACHE_COMPRESSION"), True),
+    )
 
-    # Retry/timeout
     MAX_RETRIES = get_env_int("TFB_SYMBOLS_MAX_RETRIES", 4, lo=1, hi=20)
     REQUEST_TIMEOUT = get_env_float("TFB_SYMBOLS_TIMEOUT", 30.0, lo=3.0, hi=180.0)
 
-    # ML (optional)
     ML_DETECTION_ENABLED = coerce_bool(os.getenv("TFB_SYMBOLS_ML_DETECTION"), True) and ML_AVAILABLE
     ML_CONFIDENCE_THRESHOLD = get_env_float("TFB_SYMBOLS_ML_CONFIDENCE", 0.8, lo=0.0, hi=1.0)
 
-    # Logging
     LOG_DETECTION = coerce_bool(os.getenv("TFB_SYMBOLS_LOG_DETECTION"), True)
     LOG_PERFORMANCE = coerce_bool(os.getenv("TFB_SYMBOLS_LOG_PERFORMANCE"), True)
 
@@ -520,7 +549,7 @@ config = Config()
 
 
 # =============================================================================
-# Page Registry (schema-aligned + backward alias-friendly)
+# Page Registry
 # =============================================================================
 
 PAGE_REGISTRY: Dict[str, PageSpec] = {
@@ -577,7 +606,6 @@ PAGE_REGISTRY: Dict[str, PageSpec] = {
         description="Top 10 investments (new schema page).",
         required=False,
     ),
-    # Backward compatible virtual page: attempts to find KSA symbols from existing tabs
     "KSA": PageSpec(
         key="KSA",
         sheet_names=("Market_Leaders", "My_Portfolio", "Insights_Analysis"),
@@ -589,8 +617,20 @@ PAGE_REGISTRY: Dict[str, PageSpec] = {
     ),
 }
 
+_SHEETNAME_TO_PAGEKEY: Dict[str, str] = {}
+for _pk, _spec in PAGE_REGISTRY.items():
+    _SHEETNAME_TO_PAGEKEY[normalize_name_key(_pk)] = _pk
+    for _nm in _spec.sheet_names:
+        _SHEETNAME_TO_PAGEKEY[normalize_name_key(_nm)] = _pk
+
+
 def resolve_key(key: str) -> str:
-    k = strip_value(key).upper().replace("-", "_").replace(" ", "_")
+    raw = strip_value(key)
+    nk = normalize_name_key(raw)
+    if nk in _SHEETNAME_TO_PAGEKEY:
+        return _SHEETNAME_TO_PAGEKEY[nk]
+
+    k = raw.upper().replace("-", "_").replace(" ", "_")
     aliases = {
         "LEADERS": "MARKET_LEADERS",
         "MARKET": "MARKET_LEADERS",
@@ -614,7 +654,7 @@ def resolve_key(key: str) -> str:
 
 
 # =============================================================================
-# Google Sheets Authentication & Service (lazy, render-safe)
+# Google Sheets Authentication & Service
 # =============================================================================
 
 def _read_file_text(path: str) -> str:
@@ -637,14 +677,6 @@ def _repair_private_key(creds: Dict[str, Any]) -> Dict[str, Any]:
     return creds
 
 def _load_google_creds_dict_from_env() -> Optional[Dict[str, Any]]:
-    """
-    Supports:
-      - GOOGLE_SHEETS_CREDENTIALS (JSON or base64 JSON)
-      - GOOGLE_CREDENTIALS (JSON or base64 JSON)
-      - GOOGLE_SHEETS_CREDENTIALS_B64 / GOOGLE_CREDENTIALS_B64 (base64 JSON)
-      - GOOGLE_APPLICATION_CREDENTIALS (file path)
-      - GOOGLE_SHEETS_CREDENTIALS_FILE (file path)
-    """
     raw = (
         os.getenv("GOOGLE_SHEETS_CREDENTIALS")
         or os.getenv("GOOGLE_CREDENTIALS")
@@ -663,18 +695,15 @@ def _load_google_creds_dict_from_env() -> Optional[Dict[str, Any]]:
         or ""
     ).strip()
 
-    # 1) explicit file
     if file_path:
         raw = raw or _read_file_text(file_path)
 
-    # 2) explicit b64
     if b64 and not raw:
         raw = b64
 
     if not raw:
         return None
 
-    # JSON?
     if raw.startswith("{") and raw.endswith("}"):
         try:
             obj = json_loads(raw)
@@ -683,7 +712,6 @@ def _load_google_creds_dict_from_env() -> Optional[Dict[str, Any]]:
         except Exception:
             return None
 
-    # base64 JSON?
     try:
         decoded = base64.b64decode(raw.encode("utf-8"), validate=True)
         obj = json_loads(decoded)
@@ -700,7 +728,11 @@ class GoogleSheetsReader:
     def __init__(self):
         self._service = None
         self._lock = threading.Lock()
-        self.backoff = FullJitterBackoff(max_retries=config.MAX_RETRIES, base_delay=0.8, max_delay=20.0)
+        self.backoff = FullJitterBackoff(
+            max_retries=config.MAX_RETRIES,
+            base_delay=0.8,
+            max_delay=20.0,
+        )
 
     def _get_service(self):
         if self._service is not None:
@@ -731,7 +763,6 @@ class GoogleSheetsReader:
     @staticmethod
     def safe_sheet_name(name: str) -> str:
         n = strip_value(name) or "Sheet1"
-        # Always quote if contains special chars or starts with a digit+space patterns
         if any(c in n for c in ("'", " ", "-", "!", ":", "/", "\\", ".", ",")):
             return "'" + n.replace("'", "''") + "'"
         return n
@@ -752,7 +783,6 @@ class GoogleSheetsReader:
             return []
 
         def _execute():
-            # googleapiclient may throw HttpError; we let backoff decide retry based on message
             result = service.spreadsheets().values().get(  # type: ignore
                 spreadsheetId=spreadsheet_id,
                 range=range_a1,
@@ -802,14 +832,13 @@ sheets_reader = GoogleSheetsReader()
 
 
 # =============================================================================
-# Cache Manager (O(1) LRU + optional Redis)
+# Cache Manager
 # =============================================================================
 class AdvancedCache:
     """
     Multi-tier Cache:
-      - L1: memory LRU (OrderedDict)
+      - L1: memory LRU
       - L2: Redis (optional)
-    Serialization: pickle (internal) + optional zlib compression.
     """
     def __init__(self):
         self._memory_cache: OrderedDict[str, Tuple[float, bytes]] = OrderedDict()
@@ -862,7 +891,6 @@ class AdvancedCache:
         key = self._make_key(*key_parts)
         now = time.time()
 
-        # L1 memory
         async with self._memory_lock:
             if key in self._memory_cache:
                 expiry, data = self._memory_cache[key]
@@ -874,14 +902,12 @@ class AdvancedCache:
                     return await loop.run_in_executor(_CPU_EXECUTOR, self._decompress_obj, data)
                 del self._memory_cache[key]
 
-        # L2 redis
         if self._redis_client is not None:
             try:
                 data = await self._redis_client.get(key)  # type: ignore
                 if data:
                     self._stats["l2_hits"] += 1
                     reader_cache_hits.labels(level="L2").inc()
-                    # backfill L1
                     ttl = self._ttl_for(spec)
                     async with self._memory_lock:
                         if len(self._memory_cache) >= config.CACHE_MAX_SIZE:
@@ -945,7 +971,6 @@ class SymbolNormalizer:
         if not s:
             return "", SymbolType.UNKNOWN
 
-        # Use core normalizer if available
         if self._core_norm:
             try:
                 core_res = self._core_norm(raw)
@@ -954,30 +979,24 @@ class SymbolNormalizer:
             except Exception:
                 pass
 
-        # Strip common prefixes
         for p in ("$", "#", "NYSE:", "NASDAQ:", "TADAWUL:", "SR:", "SAUDI:"):
             if s.startswith(p):
                 s = s[len(p):]
 
-        # Keep .SR (important for KSA)
-        # Strip some global/provider suffixes
         for suf in (".NYSE", ".NASDAQ"):
             if s.endswith(suf):
                 s = s[:-len(suf)]
 
-        # Detect type
         sym_type = SymbolType.UNKNOWN
-
         raw_up = strip_value(raw).upper()
+
         if ".SR" in raw_up or "TADAWUL" in raw_up or "SAUDI" in raw_up:
             sym_type = SymbolType.KSA
         else:
-            # KSA patterns
             for pat in _TICKER_PATTERNS["ksa"]:
                 if pat.match(s) or pat.match(raw_up):
                     sym_type = SymbolType.KSA
                     break
-            # Other patterns
             if sym_type == SymbolType.UNKNOWN:
                 for cat, pats in _TICKER_PATTERNS.items():
                     if cat == "ksa":
@@ -992,7 +1011,6 @@ class SymbolNormalizer:
                     if sym_type != SymbolType.UNKNOWN:
                         break
 
-        # KSA canonical: 4 digits => 1234.SR
         if sym_type == SymbolType.KSA:
             if re.match(r"^\d{4}$", s):
                 s = f"{s}.SR"
@@ -1012,7 +1030,6 @@ class SymbolNormalizer:
             return False
         if sym in _BLOCKLIST_EXACT:
             return False
-        # refuse obvious header-like junk
         if len(sym) > 40:
             return False
         return True
@@ -1041,7 +1058,6 @@ class MLDetectionEngine:
                 labels = [1] * len(positive_samples) + [0] * len(negative_samples)
                 vec = TfidfVectorizer(analyzer="char", ngram_range=(2, 5), max_features=1200)
                 X = vec.fit_transform(texts)
-                # keep n_jobs conservative
                 mdl = RandomForestClassifier(n_estimators=120, n_jobs=2, random_state=42)
                 mdl.fit(X, labels)
                 self.vectorizer = vec
@@ -1077,25 +1093,19 @@ class ColumnDetectionEngine:
         sheet_name: str,
         spec: PageSpec,
     ) -> Tuple[Optional[str], DiscoveryStrategy, float, Dict[str, Any]]:
-        """
-        Returns: (column_letter, strategy, confidence, meta)
-        """
         with TraceContext("detect_symbol_column", {"sheet": sheet_name, "page": spec.key}):
             t0 = time.perf_counter()
 
-            # 1) Header
             col, conf, meta = await self._detect_by_header(spreadsheet_id, sheet_name, spec)
             if col and conf >= spec.confidence_threshold:
                 reader_discovery_duration.labels(strategy=DiscoveryStrategy.HEADER.value).observe(time.perf_counter() - t0)
                 return col, DiscoveryStrategy.HEADER, conf, meta
 
-            # 2) Data scan
             col, conf, meta = await self._detect_by_data(spreadsheet_id, sheet_name, spec)
             if col and conf >= spec.confidence_threshold:
                 reader_discovery_duration.labels(strategy=DiscoveryStrategy.DATA_SCAN.value).observe(time.perf_counter() - t0)
                 return col, DiscoveryStrategy.DATA_SCAN, conf, meta
 
-            # 3) Fallback
             reader_discovery_duration.labels(strategy=DiscoveryStrategy.DEFAULT.value).observe(time.perf_counter() - t0)
             return "B", DiscoveryStrategy.DEFAULT, 0.5, {"reason": "fallback_to_B"}
 
@@ -1105,7 +1115,6 @@ class ColumnDetectionEngine:
         sheet_name: str,
         spec: PageSpec,
     ) -> Tuple[Optional[str], float, Dict[str, Any]]:
-        # limit columns searched
         range_a1 = f"{GoogleSheetsReader.safe_sheet_name(sheet_name)}!A{spec.header_row}:ZZ{spec.header_row}"
         values = await sheets_reader.read_range_async(spreadsheet_id, range_a1)
         if not values or not values[0]:
@@ -1114,12 +1123,10 @@ class ColumnDetectionEngine:
         headers = [strip_value(h).upper() for h in values[0]]
         candidates = tuple(strip_value(c).upper() for c in spec.header_candidates)
 
-        # exact
         for idx, header in enumerate(headers, 1):
             if header in candidates:
                 return GoogleSheetsReader.col_to_letter(idx), 1.0, {"matched_header": header, "match": "exact"}
 
-        # partial similarity
         best_score, best_col, best_match = 0.0, None, ""
         for idx, header in enumerate(headers, 1):
             if not header:
@@ -1143,7 +1150,6 @@ class ColumnDetectionEngine:
         sheet_name: str,
         spec: PageSpec,
     ) -> Tuple[Optional[str], float, Dict[str, Any]]:
-        # sample some rows
         sample_rows = min(250, max(50, spec.max_rows // 20))
         end_row = spec.start_row + sample_rows - 1
         range_a1 = f"{GoogleSheetsReader.safe_sheet_name(sheet_name)}!A{spec.start_row}:ZZ{end_row}"
@@ -1157,9 +1163,8 @@ class ColumnDetectionEngine:
 
         col_stats: Dict[int, Dict[str, float]] = defaultdict(lambda: {"hits": 0.0, "total": 0.0, "cells": 0.0})
 
-        # score columns by "valid symbol tokens" rate and row coverage
         for row in values:
-            for col_idx in range(min(max_cols, 702)):  # A..ZZ is 702 cols max
+            for col_idx in range(min(max_cols, 702)):
                 if col_idx >= len(row):
                     continue
                 cell = row[col_idx]
@@ -1174,7 +1179,6 @@ class ColumnDetectionEngine:
                     norm, sym_type = normalizer.normalize(token)
                     if not normalizer.is_valid(norm):
                         continue
-                    # if page filters types, only count hits for those types
                     if spec.allowed_types and sym_type not in spec.allowed_types:
                         continue
                     col_stats[col_idx]["hits"] += 1.0
@@ -1265,7 +1269,7 @@ extractor = SymbolExtractor()
 
 
 # =============================================================================
-# Main Async API
+# Main discovery helpers
 # =============================================================================
 
 def _default_spreadsheet_id() -> str:
@@ -1275,20 +1279,76 @@ def _default_spreadsheet_id() -> str:
         or ""
     )
 
-async def _get_page_symbols_internal(
+def _build_adhoc_spec(sheet_name: str) -> PageSpec:
+    safe_name = strip_value(sheet_name) or "Sheet1"
+    return PageSpec(
+        key=resolve_key(safe_name),
+        sheet_names=(safe_name,),
+        header_row=config.DEFAULT_HEADER_ROW,
+        start_row=config.DEFAULT_START_ROW,
+        max_rows=config.DEFAULT_MAX_ROWS,
+        header_candidates=("SYMBOL", "TICKER", "CODE", "STOCK", "ASSET", "PAIR", "FUND"),
+        symbol_type=SymbolType.GLOBAL,
+        description="Ad-hoc direct sheet lookup.",
+        required=False,
+    )
+
+async def _list_tabs_cached(spreadsheet_id: str) -> List[str]:
+    cache_key = ("tabs", spreadsheet_id)
+    cached = await cache.get(*cache_key)
+    if isinstance(cached, list):
+        return [strip_value(x) for x in cached if strip_value(x)]
+    loop = asyncio.get_running_loop()
+    tabs = await loop.run_in_executor(_IO_EXECUTOR, sheets_reader.list_sheets, spreadsheet_id)
+    tabs = [strip_value(x) for x in tabs if strip_value(x)]
+    await cache.set(tabs, *cache_key)
+    return tabs
+
+async def _resolve_actual_sheet_names(spreadsheet_id: str, preferred_names: Sequence[str]) -> List[str]:
+    tabs = await _list_tabs_cached(spreadsheet_id)
+    if not tabs:
+        return [strip_value(x) for x in preferred_names if strip_value(x)]
+
+    by_norm: Dict[str, List[str]] = defaultdict(list)
+    for t in tabs:
+        by_norm[normalize_name_key(t)].append(t)
+
+    resolved: List[str] = []
+    seen: Set[str] = set()
+
+    for pref in preferred_names:
+        p = strip_value(pref)
+        if not p:
+            continue
+        np = normalize_name_key(p)
+        matches = by_norm.get(np, [])
+        if matches:
+            for m in matches:
+                if m not in seen:
+                    resolved.append(m)
+                    seen.add(m)
+        else:
+            if p not in seen:
+                resolved.append(p)
+                seen.add(p)
+
+    return resolved
+
+async def _discover_symbols_for_spec(
     spreadsheet_id: str,
     canonical_key: str,
     spec: PageSpec,
 ) -> Dict[str, Any]:
     start_time = time.perf_counter()
 
-    # Cache
     cache_key = ("page", spreadsheet_id, canonical_key, spec.header_row, spec.start_row, spec.max_rows)
     cached = await cache.get(*cache_key, spec=spec)
     if cached is not None and isinstance(cached, dict):
         cached = dict(cached)
         cached["cache_hit"] = True
         return cached
+
+    actual_sheet_names = await _resolve_actual_sheet_names(spreadsheet_id, spec.sheet_names)
 
     best_sheet: Optional[str] = None
     best_col: Optional[str] = None
@@ -1298,8 +1358,7 @@ async def _get_page_symbols_internal(
     best_symbols: List[SymbolMetadata] = []
     best_count: int = -1
 
-    # Try sheets in order
-    for sheet_name in spec.sheet_names:
+    for sheet_name in actual_sheet_names:
         col, strategy, confidence, detect_meta = await detector.detect(spreadsheet_id, sheet_name, spec)
         if not col:
             continue
@@ -1322,7 +1381,6 @@ async def _get_page_symbols_internal(
             allowed_types=spec.allowed_types,
         )
 
-        # prefer more symbols, tie-breaker by confidence
         cnt = len(symbols)
         if cnt > best_count or (cnt == best_count and confidence > best_confidence):
             best_count = cnt
@@ -1356,6 +1414,7 @@ async def _get_page_symbols_internal(
 
         result: Dict[str, Any] = {
             "all": all_syms,
+            "symbols": all_syms,
             "ksa": ksa_syms,
             "global": global_syms,
             "by_type": dict(by_type),
@@ -1367,6 +1426,7 @@ async def _get_page_symbols_internal(
                 "strategy": best_strategy.value,
                 "confidence": best_confidence,
                 "detection": best_detect_meta,
+                "candidate_sheets": actual_sheet_names,
             },
             "performance": {
                 "elapsed_ms": round(elapsed_ms, 2),
@@ -1385,12 +1445,15 @@ async def _get_page_symbols_internal(
 
     result = {
         "all": [],
+        "symbols": [],
         "ksa": [],
         "global": [],
         "by_type": {},
         "metadata": [],
         "origin": canonical_key,
-        "discovery": None,
+        "discovery": {
+            "candidate_sheets": actual_sheet_names,
+        },
         "performance": {
             "elapsed_ms": round(elapsed_ms, 2),
             "symbol_count": 0,
@@ -1410,15 +1473,19 @@ async def _get_page_symbols_internal(
 async def get_page_symbols_async(key: str, spreadsheet_id: Optional[str] = None) -> Dict[str, Any]:
     sid = strip_value(spreadsheet_id) or _default_spreadsheet_id()
     if not sid:
-        return {"all": [], "error": "No spreadsheet ID (DEFAULT_SPREADSHEET_ID missing)", "status": "error"}
+        return {"all": [], "symbols": [], "error": "No spreadsheet ID (DEFAULT_SPREADSHEET_ID missing)", "status": "error"}
 
     canonical_key = resolve_key(key)
     spec = PAGE_REGISTRY.get(canonical_key)
     if not spec:
-        return {"all": [], "error": f"Unknown page key: {key}", "status": "error"}
+        spec = _build_adhoc_spec(key)
+        canonical_key = spec.key
 
     flight_key = f"page:{sid}:{canonical_key}:{spec.header_row}:{spec.start_row}:{spec.max_rows}"
-    return await _SINGLE_FLIGHT.execute(flight_key, lambda: _get_page_symbols_internal(sid, canonical_key, spec))
+    return await _SINGLE_FLIGHT.execute(
+        flight_key,
+        lambda: _discover_symbols_for_spec(sid, canonical_key, spec),
+    )
 
 
 async def get_universe_async(keys: List[str], spreadsheet_id: Optional[str] = None) -> Dict[str, Any]:
@@ -1464,7 +1531,6 @@ async def get_universe_async(keys: List[str], spreadsheet_id: Optional[str] = No
                 all_symbols.append(s)
                 by_origin[req_key].append(s)
 
-        # by_type from metadata (dedup later)
         for m in metas:
             try:
                 t = strip_value(m.get("symbol_type"))
@@ -1474,9 +1540,8 @@ async def get_universe_async(keys: List[str], spreadsheet_id: Optional[str] = No
             except Exception:
                 continue
 
-    # dedup by_type lists
     by_type = {k: sorted(list(set(v))) for k, v in by_type.items()}
-    all_symbols = sorted(list(dict.fromkeys(all_symbols)))  # stable dedup + sort
+    all_symbols = sorted(list(dict.fromkeys(all_symbols)))
 
     elapsed_ms = (time.perf_counter() - start_time) * 1000.0
     return {
@@ -1498,12 +1563,112 @@ async def get_universe_async(keys: List[str], spreadsheet_id: Optional[str] = No
 
 
 # =============================================================================
-# Synchronous wrappers (safe when loop already running)
+# Engine-compatible wrappers
+# =============================================================================
+
+async def get_symbols_for_sheet_async(
+    sheet: Optional[str] = None,
+    spreadsheet_id: Optional[str] = None,
+    limit: int = 5000,
+    page: Optional[str] = None,
+    sheet_name: Optional[str] = None,
+    tab: Optional[str] = None,
+    name: Optional[str] = None,
+    worksheet: Optional[str] = None,
+    **kwargs: Any,
+) -> List[str]:
+    target = sheet or page or sheet_name or tab or name or worksheet or ""
+    result = await get_page_symbols_async(target, spreadsheet_id=spreadsheet_id)
+    syms = result.get("all") or result.get("symbols") or []
+    return list(syms)[: max(1, int(limit or 5000))]
+
+
+async def read_symbols_for_sheet_async(
+    sheet: Optional[str] = None,
+    spreadsheet_id: Optional[str] = None,
+    limit: int = 5000,
+    **kwargs: Any,
+) -> List[str]:
+    return await get_symbols_for_sheet_async(sheet=sheet, spreadsheet_id=spreadsheet_id, limit=limit, **kwargs)
+
+
+async def get_sheet_symbols_async(
+    sheet: Optional[str] = None,
+    spreadsheet_id: Optional[str] = None,
+    limit: int = 5000,
+    **kwargs: Any,
+) -> List[str]:
+    return await get_symbols_for_sheet_async(sheet=sheet, spreadsheet_id=spreadsheet_id, limit=limit, **kwargs)
+
+
+async def get_symbols_for_page_async(
+    page: Optional[str] = None,
+    spreadsheet_id: Optional[str] = None,
+    limit: int = 5000,
+    sheet: Optional[str] = None,
+    **kwargs: Any,
+) -> List[str]:
+    return await get_symbols_for_sheet_async(
+        sheet=page or sheet,
+        spreadsheet_id=spreadsheet_id,
+        limit=limit,
+        **kwargs,
+    )
+
+
+async def list_symbols_for_page_async(
+    page: Optional[str] = None,
+    spreadsheet_id: Optional[str] = None,
+    limit: int = 5000,
+    sheet: Optional[str] = None,
+    **kwargs: Any,
+) -> List[str]:
+    return await get_symbols_for_page_async(
+        page=page,
+        sheet=sheet,
+        spreadsheet_id=spreadsheet_id,
+        limit=limit,
+        **kwargs,
+    )
+
+
+async def get_symbols_async(
+    sheet: Optional[str] = None,
+    page: Optional[str] = None,
+    spreadsheet_id: Optional[str] = None,
+    limit: int = 5000,
+    **kwargs: Any,
+) -> List[str]:
+    return await get_symbols_for_sheet_async(
+        sheet=sheet or page,
+        spreadsheet_id=spreadsheet_id,
+        limit=limit,
+        **kwargs,
+    )
+
+
+async def list_symbols_async(
+    sheet: Optional[str] = None,
+    page: Optional[str] = None,
+    spreadsheet_id: Optional[str] = None,
+    limit: int = 5000,
+    **kwargs: Any,
+) -> List[str]:
+    return await get_symbols_async(
+        sheet=sheet,
+        page=page,
+        spreadsheet_id=spreadsheet_id,
+        limit=limit,
+        **kwargs,
+    )
+
+
+# =============================================================================
+# Synchronous wrappers
 # =============================================================================
 def _run_coro_sync(coro: Awaitable[Any]) -> Any:
     try:
         asyncio.get_running_loop()
-        # If we are in an event loop (e.g., FastAPI), run in a new thread + new loop
         box: Dict[str, Any] = {"value": None, "error": None}
 
         def _worker():
@@ -1523,7 +1688,6 @@ def _run_coro_sync(coro: Awaitable[Any]) -> Any:
             raise box["error"]
         return box["value"]
     except RuntimeError:
-        # no loop running
         return asyncio.run(coro)
 
 def get_page_symbols(key: str, spreadsheet_id: Optional[str] = None) -> Dict[str, Any]:
@@ -1531,6 +1695,64 @@ def get_page_symbols(key: str, spreadsheet_id: Optional[str] = None) -> Dict[str
 
 def get_universe(keys: List[str], spreadsheet_id: Optional[str] = None) -> Dict[str, Any]:
     return _run_coro_sync(get_universe_async(keys, spreadsheet_id))
+
+def get_symbols_for_sheet(
+    sheet: Optional[str] = None,
+    spreadsheet_id: Optional[str] = None,
+    limit: int = 5000,
+    **kwargs: Any,
+) -> List[str]:
+    return _run_coro_sync(get_symbols_for_sheet_async(sheet=sheet, spreadsheet_id=spreadsheet_id, limit=limit, **kwargs))
+
+def read_symbols_for_sheet(
+    sheet: Optional[str] = None,
+    spreadsheet_id: Optional[str] = None,
+    limit: int = 5000,
+    **kwargs: Any,
+) -> List[str]:
+    return _run_coro_sync(read_symbols_for_sheet_async(sheet=sheet, spreadsheet_id=spreadsheet_id, limit=limit, **kwargs))
+
+def get_sheet_symbols(
+    sheet: Optional[str] = None,
+    spreadsheet_id: Optional[str] = None,
+    limit: int = 5000,
+    **kwargs: Any,
+) -> List[str]:
+    return _run_coro_sync(get_sheet_symbols_async(sheet=sheet, spreadsheet_id=spreadsheet_id, limit=limit, **kwargs))
+
+def get_symbols_for_page(
+    page: Optional[str] = None,
+    spreadsheet_id: Optional[str] = None,
+    limit: int = 5000,
+    **kwargs: Any,
+) -> List[str]:
+    return _run_coro_sync(get_symbols_for_page_async(page=page, spreadsheet_id=spreadsheet_id, limit=limit, **kwargs))
+
+def list_symbols_for_page(
+    page: Optional[str] = None,
+    spreadsheet_id: Optional[str] = None,
+    limit: int = 5000,
+    **kwargs: Any,
+) -> List[str]:
+    return _run_coro_sync(list_symbols_for_page_async(page=page, spreadsheet_id=spreadsheet_id, limit=limit, **kwargs))
+
+def get_symbols(
+    sheet: Optional[str] = None,
+    page: Optional[str] = None,
+    spreadsheet_id: Optional[str] = None,
+    limit: int = 5000,
+    **kwargs: Any,
+) -> List[str]:
+    return _run_coro_sync(get_symbols_async(sheet=sheet, page=page, spreadsheet_id=spreadsheet_id, limit=limit, **kwargs))
+
+def list_symbols(
+    sheet: Optional[str] = None,
+    page: Optional[str] = None,
+    spreadsheet_id: Optional[str] = None,
+    limit: int = 5000,
+    **kwargs: Any,
+) -> List[str]:
+    return _run_coro_sync(list_symbols_async(sheet=sheet, page=page, spreadsheet_id=spreadsheet_id, limit=limit, **kwargs))
 
 def list_tabs(spreadsheet_id: Optional[str] = None) -> List[str]:
     sid = strip_value(spreadsheet_id) or _default_spreadsheet_id()
@@ -1543,14 +1765,49 @@ def supported_pages() -> List[str]:
 
 
 # =============================================================================
-# CLI Entry Point (no print; sys.stdout.write only)
+# Reader object + factories for engine lazy discovery
+# =============================================================================
+class SymbolsReader:
+    async def get_symbols_for_sheet(self, sheet: Optional[str] = None, limit: int = 5000, **kwargs: Any) -> List[str]:
+        return await get_symbols_for_sheet_async(sheet=sheet, limit=limit, **kwargs)
+
+    async def read_symbols_for_sheet(self, sheet: Optional[str] = None, limit: int = 5000, **kwargs: Any) -> List[str]:
+        return await read_symbols_for_sheet_async(sheet=sheet, limit=limit, **kwargs)
+
+    async def get_sheet_symbols(self, sheet: Optional[str] = None, limit: int = 5000, **kwargs: Any) -> List[str]:
+        return await get_sheet_symbols_async(sheet=sheet, limit=limit, **kwargs)
+
+    async def get_symbols_for_page(self, page: Optional[str] = None, limit: int = 5000, **kwargs: Any) -> List[str]:
+        return await get_symbols_for_page_async(page=page, limit=limit, **kwargs)
+
+    async def list_symbols_for_page(self, page: Optional[str] = None, limit: int = 5000, **kwargs: Any) -> List[str]:
+        return await list_symbols_for_page_async(page=page, limit=limit, **kwargs)
+
+    async def get_symbols(self, sheet: Optional[str] = None, page: Optional[str] = None, limit: int = 5000, **kwargs: Any) -> List[str]:
+        return await get_symbols_async(sheet=sheet, page=page, limit=limit, **kwargs)
+
+    async def list_symbols(self, sheet: Optional[str] = None, page: Optional[str] = None, limit: int = 5000, **kwargs: Any) -> List[str]:
+        return await list_symbols_async(sheet=sheet, page=page, limit=limit, **kwargs)
+
+def get_reader(*args: Any, **kwargs: Any) -> SymbolsReader:
+    return SymbolsReader()
+
+def create_reader(*args: Any, **kwargs: Any) -> SymbolsReader:
+    return SymbolsReader()
+
+def build_reader(*args: Any, **kwargs: Any) -> SymbolsReader:
+    return SymbolsReader()
+
+
+# =============================================================================
+# CLI Entry Point
 # =============================================================================
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description=f"TFB Symbols Reader v{SCRIPT_VERSION}")
     parser.add_argument("--sheet-id", help="Spreadsheet ID override")
-    parser.add_argument("--key", default="MARKET_LEADERS", help="Page key (e.g., MARKET_LEADERS, GLOBAL, KSA)")
+    parser.add_argument("--key", default="MARKET_LEADERS", help="Page key or sheet name")
     parser.add_argument("--keys", nargs="+", help="Multiple keys for universe")
     parser.add_argument("--list-tabs", action="store_true", help="List tabs and exit")
     parser.add_argument("--list-pages", action="store_true", help="List supported page keys and exit")
@@ -1612,13 +1869,31 @@ __all__ = [
     "ConfidenceLevel",
     "SymbolMetadata",
     "PageSpec",
+    "PAGE_REGISTRY",
+    "SymbolsReader",
+    "get_reader",
+    "create_reader",
+    "build_reader",
     "get_page_symbols",
     "get_page_symbols_async",
     "get_universe",
     "get_universe_async",
+    "get_symbols_for_sheet",
+    "get_symbols_for_sheet_async",
+    "read_symbols_for_sheet",
+    "read_symbols_for_sheet_async",
+    "get_sheet_symbols",
+    "get_sheet_symbols_async",
+    "get_symbols_for_page",
+    "get_symbols_for_page_async",
+    "list_symbols_for_page",
+    "list_symbols_for_page_async",
+    "get_symbols",
+    "get_symbols_async",
+    "list_symbols",
+    "list_symbols_async",
     "list_tabs",
     "supported_pages",
-    "PAGE_REGISTRY",
     "normalizer",
     "extractor",
     "detector",
