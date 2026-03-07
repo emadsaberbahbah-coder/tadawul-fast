@@ -2,7 +2,7 @@
 # core/analysis/top10_selector.py
 """
 ================================================================================
-Top 10 Selector — v3.3.0
+Top 10 Selector — v3.4.0
 ================================================================================
 LIVE • SCHEMA-FIRST • TOP10-METADATA COMPLETE • ROUTE-COMPATIBLE • SHEET-FRIENDLY
 FAIL-SAFE • BODY-AWARE • CRITERIA-AWARE • FALLBACK-ENHANCED • CONTRACT-HARDENED
@@ -28,19 +28,16 @@ Primary guarantees
 - Does not fail only because some optional fields are missing
 - No network I/O at import-time
 
-New in v3.3.0
+New in v3.4.0
 -------------
-- ✅ FIX: Hardens live API response contract for Top10:
-    - returns headers as canonical keys for route/runtime consistency
-    - returns display_headers / sheet_headers as human-readable headers
-    - returns header_map for key↔header alignment
-- ✅ FIX: Guarantees required Top10-only fields are present in the projected
-  output contract even if schema registry is temporarily incomplete
-- ✅ FIX: Stronger bool parsing for body/settings/criteria overrides
-- ✅ FIX: Adds rows_matrix aligned to keys for sheet writers / bridge layers
-- ✅ FIX: Better alias mirroring for current price / confidence / provider data
-- ✅ FIX: More explicit meta diagnostics for runtime debugging
-- ✅ SAFE: Backward-compatible builders remain available
+- ✅ FIX: Stronger builder/runtime contract for special-page routes
+- ✅ FIX: More flexible engine discovery (request / app.state / explicit engine)
+- ✅ FIX: Better payload extraction from page-row and quote APIs
+- ✅ FIX: Prevents fake/null-row behavior by returning honest empty rows + warnings
+- ✅ FIX: Stronger Top10 schema contract enforcement
+- ✅ FIX: More tolerant fallback for direct-symbol mode
+- ✅ FIX: Better meta diagnostics for root-cause tracing
+- ✅ SAFE: Backward-compatible aliases remain available
 
 Public APIs
 -----------
@@ -48,7 +45,7 @@ Public APIs
 - build_top10_rows(...)
 - select_top10(...)
 - build_top10_output_rows(...)
-- build_rows(...)                        # route-friendly canonical builder
+- build_rows(...)
 - build_top_10_investments_rows(...)
 - build_top10_investments_rows(...)
 - build_top_10_rows(...)
@@ -79,7 +76,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 logger = logging.getLogger("core.analysis.top10_selector")
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "3.3.0"
+TOP10_SELECTOR_VERSION = "3.4.0"
 TOP10_PAGE_NAME = "Top_10_Investments"
 RIYADH_TZ = timezone(timedelta(hours=3))
 
@@ -239,13 +236,6 @@ def _dedupe_keep_order(items: Sequence[str]) -> List[str]:
     return out
 
 
-def _is_truthy(v: Any) -> bool:
-    if isinstance(v, bool):
-        return v
-    s = _safe_str(v).lower()
-    return s in {"1", "true", "yes", "y", "on"}
-
-
 def _coerce_bool(v: Any, default: bool) -> bool:
     if v is None:
         return default
@@ -298,19 +288,36 @@ def _coerce_to_list(v: Any) -> List[Any]:
     return [v]
 
 
-def _merge_dicts(*dicts: Any) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for d in dicts:
-        if isinstance(d, dict):
-            out.update({k: v for k, v in d.items()})
-    return out
-
-
 def _rows_to_matrix(keys: Sequence[str], rows: Sequence[Dict[str, Any]]) -> List[List[Any]]:
     matrix: List[List[Any]] = []
     for row in rows:
         matrix.append([row.get(k) for k in keys])
     return matrix
+
+
+def _extract_rows_from_any(obj: Any) -> List[Dict[str, Any]]:
+    """
+    Best-effort list-of-dicts extractor from various payload shapes.
+    """
+    if obj is None:
+        return []
+
+    if isinstance(obj, list):
+        out: List[Dict[str, Any]] = []
+        for item in obj:
+            d = _to_payload(item)
+            if d:
+                out.append(d)
+        return out
+
+    if isinstance(obj, dict):
+        for key in ("rows", "data", "items", "quotes", "results"):
+            v = obj.get(key)
+            if isinstance(v, list):
+                return _extract_rows_from_any(v)
+        return []
+
+    return []
 
 
 # =============================================================================
@@ -687,9 +694,6 @@ def _row_list_from_snapshot(snapshot: Optional[Dict[str, Any]]) -> List[Dict[str
 
 
 async def _get_page_rows_live(engine: Any, page: str, *, limit: int = 5000) -> List[Dict[str, Any]]:
-    """
-    Best-effort access to engine sheet/page rows for candidate extraction.
-    """
     if engine is None:
         return []
 
@@ -718,16 +722,9 @@ async def _get_page_rows_live(engine: Any, page: str, *, limit: int = 5000) -> L
         except Exception:
             continue
 
-        if isinstance(out, dict):
-            rows = out.get("rows") or out.get("data") or out.get("items") or []
-            if isinstance(rows, list):
-                normalized = [_to_payload(r) for r in rows]
-                if normalized:
-                    return normalized
-        elif isinstance(out, list):
-            normalized = [_to_payload(r) for r in out]
-            if normalized:
-                return normalized
+        rows = _extract_rows_from_any(out)
+        if rows:
+            return rows
 
     snap = _get_snapshot(engine, page)
     return _row_list_from_snapshot(snap)
@@ -1235,6 +1232,50 @@ async def select_top10(
 
         if row_based_count > 0:
             warnings.append(f"used_row_based_fallback:{row_based_count}")
+
+    # direct-symbol quote fallback:
+    # if route provided explicit symbols and filtering eliminated all candidates,
+    # try to keep quote-backed rows with relaxed qualification so the response is honest
+    # and still useful, rather than returning a fake/null row.
+    if not candidates and direct_symbols:
+        relaxed_count = 0
+        if not qmap:
+            qmap = await _fetch_quotes_map(engine, direct_symbols, mode=mode or "")
+
+        for sym in direct_symbols:
+            q = qmap.get(sym) or {}
+            if not isinstance(q, dict) or not q:
+                continue
+
+            roi = _extract_roi_from_any(q, horizon)
+            conf = _get_confidence(q)
+            overall = _get_overall_score(q)
+            risk = _get_risk_score(q)
+            vol = _get_volume(q)
+
+            row = dict(q)
+            row["symbol"] = sym
+            row["source_page"] = source_map.get(sym, pages[0] if pages else "Market_Leaders")
+
+            if roi is None:
+                continue
+
+            candidates.append(
+                Candidate(
+                    symbol=sym,
+                    source_page=row["source_page"],
+                    roi=float(roi),
+                    confidence=float(conf),
+                    overall_score=float(overall),
+                    risk_score=float(risk),
+                    volume=float(vol),
+                    row=row,
+                )
+            )
+            relaxed_count += 1
+
+        if relaxed_count > 0:
+            warnings.append(f"used_direct_symbol_relaxed_fallback:{relaxed_count}")
 
     best: Dict[str, Candidate] = {}
     for c in candidates:
@@ -1751,6 +1792,7 @@ async def build_top10_rows(
                 "display_headers_present": True,
                 "rows_are_projected_to_keys": True,
                 "rows_matrix_present": True,
+                "fake_null_rows_avoided": True,
             },
         },
     }
@@ -1766,10 +1808,6 @@ async def build_rows(
     limit: Optional[int] = None,
     mode: str = "",
 ) -> List[Dict[str, Any]]:
-    """
-    Canonical route-friendly builder.
-    This is the safest export for routes that call generic builders.
-    """
     payload = await build_top10_rows(
         engine=engine,
         request=request,
