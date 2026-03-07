@@ -2,10 +2,10 @@
 # core/analysis/top10_selector.py
 """
 ================================================================================
-Top 10 Selector — v3.2.0
+Top 10 Selector — v3.3.0
 ================================================================================
 LIVE • SCHEMA-FIRST • TOP10-METADATA COMPLETE • ROUTE-COMPATIBLE • SHEET-FRIENDLY
-FAIL-SAFE • BODY-AWARE • CRITERIA-AWARE • FALLBACK-ENHANCED
+FAIL-SAFE • BODY-AWARE • CRITERIA-AWARE • FALLBACK-ENHANCED • CONTRACT-HARDENED
 
 Purpose
 -------
@@ -28,21 +28,19 @@ Primary guarantees
 - Does not fail only because some optional fields are missing
 - No network I/O at import-time
 
-New in v3.2.0
+New in v3.3.0
 -------------
-- ✅ FIX: Stronger route/body compatibility:
-    - accepts body.criteria
-    - accepts body.filters
-    - accepts body.criteria_snapshot
-    - accepts body.symbols / body.tickers as direct Top10 input
-- ✅ FIX: If explicit symbols are provided by route/body, selector uses them directly
-- ✅ FIX: Better fallback row candidate extraction from page rows / snapshots
-- ✅ FIX: More tolerant ROI extraction from multiple possible field names
-- ✅ FIX: More tolerant confidence / score / risk / provider inference
-- ✅ FIX: Better quote merge behavior for final Top-N enrichment
-- ✅ FIX: Returns richer meta and warning trail for root-cause diagnosis
-- ✅ FIX: build_rows / alias builders now route through the same canonical logic
-- ✅ SAFE: Does not crash if engine methods differ across versions
+- ✅ FIX: Hardens live API response contract for Top10:
+    - returns headers as canonical keys for route/runtime consistency
+    - returns display_headers / sheet_headers as human-readable headers
+    - returns header_map for key↔header alignment
+- ✅ FIX: Guarantees required Top10-only fields are present in the projected
+  output contract even if schema registry is temporarily incomplete
+- ✅ FIX: Stronger bool parsing for body/settings/criteria overrides
+- ✅ FIX: Adds rows_matrix aligned to keys for sheet writers / bridge layers
+- ✅ FIX: Better alias mirroring for current price / confidence / provider data
+- ✅ FIX: More explicit meta diagnostics for runtime debugging
+- ✅ SAFE: Backward-compatible builders remain available
 
 Public APIs
 -----------
@@ -81,9 +79,21 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 logger = logging.getLogger("core.analysis.top10_selector")
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "3.2.0"
+TOP10_SELECTOR_VERSION = "3.3.0"
 TOP10_PAGE_NAME = "Top_10_Investments"
 RIYADH_TZ = timezone(timedelta(hours=3))
+
+TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
+    "top10_rank",
+    "selection_reason",
+    "criteria_snapshot",
+)
+
+TOP10_REQUIRED_HEADERS: Dict[str, str] = {
+    "top10_rank": "Top10 Rank",
+    "selection_reason": "Selection Reason",
+    "criteria_snapshot": "Criteria Snapshot",
+}
 
 
 # =============================================================================
@@ -101,7 +111,9 @@ def _safe_float(x: Any, default: Optional[float] = None) -> Optional[float]:
     if x is None:
         return default
     try:
-        if isinstance(x, (int, float)) and not isinstance(x, bool):
+        if isinstance(x, bool):
+            return default
+        if isinstance(x, (int, float)):
             f = float(x)
         else:
             s = str(x).strip().replace(",", "")
@@ -180,7 +192,7 @@ def _to_payload(obj: Any) -> Dict[str, Any]:
             return out if isinstance(out, dict) else {}
         except Exception:
             try:
-                out = md()  # type: ignore
+                out = md()  # type: ignore[misc]
                 return out if isinstance(out, dict) else {}
             except Exception:
                 return {}
@@ -234,6 +246,23 @@ def _is_truthy(v: Any) -> bool:
     return s in {"1", "true", "yes", "y", "on"}
 
 
+def _coerce_bool(v: Any, default: bool) -> bool:
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return bool(v)
+    s = _safe_str(v).lower()
+    if not s:
+        return default
+    if s in {"1", "true", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
 def _first_non_none(*vals: Any) -> Any:
     for v in vals:
         if v is not None:
@@ -275,6 +304,13 @@ def _merge_dicts(*dicts: Any) -> Dict[str, Any]:
         if isinstance(d, dict):
             out.update({k: v for k, v in d.items()})
     return out
+
+
+def _rows_to_matrix(keys: Sequence[str], rows: Sequence[Dict[str, Any]]) -> List[List[Any]]:
+    matrix: List[List[Any]] = []
+    for row in rows:
+        matrix.append([row.get(k) for k in keys])
+    return matrix
 
 
 # =============================================================================
@@ -391,15 +427,15 @@ def _criteria_from_dict(d: Dict[str, Any]) -> Criteria:
     min_conf = float(min_conf / 100.0) if min_conf > 1.5 else float(min_conf)
     min_conf = _clamp(min_conf, 0.0, 1.0)
 
-    enforce = bool(d.get("enforce_risk_confidence", True))
+    enforce = _coerce_bool(d.get("enforce_risk_confidence", True), True)
 
     top_n = int(_safe_float(d.get("top_n") or d.get("limit") or 10, 10) or 10)
     top_n = max(1, min(50, top_n))
 
-    enrich_final = bool(d.get("enrich_final", True))
+    enrich_final = _coerce_bool(d.get("enrich_final", True), True)
 
     min_vol = _safe_float(d.get("min_volume") or d.get("min_liquidity") or d.get("min_vol"), None)
-    use_liq = bool(d.get("use_liquidity_tiebreak", True))
+    use_liq = _coerce_bool(d.get("use_liquidity_tiebreak", True), True)
 
     return Criteria(
         pages_selected=[str(p).strip() for p in pages if str(p).strip()],
@@ -719,7 +755,7 @@ async def _get_universe_symbols_live(engine: Any, page: str, *, limit: int = 500
             out = await _maybe_await(out)
         except TypeError:
             try:
-                out = fn(page)  # type: ignore
+                out = fn(page)  # type: ignore[misc]
                 out = await _maybe_await(out)
             except Exception:
                 continue
@@ -741,7 +777,7 @@ async def _get_universe_symbols_live(engine: Any, page: str, *, limit: int = 500
     fn2 = getattr(engine, "symbols_reader", None)
     if fn2 is not None and hasattr(fn2, "get_symbols_for_sheet"):
         try:
-            out = fn2.get_symbols_for_sheet(page)  # type: ignore
+            out = fn2.get_symbols_for_sheet(page)  # type: ignore[attr-defined]
             out = await _maybe_await(out)
             if isinstance(out, (list, tuple)):
                 syms = [_normalize_symbol(_safe_str(x)) for x in out]
@@ -751,7 +787,6 @@ async def _get_universe_symbols_live(engine: Any, page: str, *, limit: int = 500
         except Exception:
             pass
 
-    # fallback from page rows / snapshot rows
     rows = await _get_page_rows_live(engine, page, limit=limit)
     syms2: List[str] = []
     for r in rows:
@@ -1116,7 +1151,6 @@ async def select_top10(
     universe: List[Tuple[str, str]] = []
     warnings: List[str] = []
 
-    # Direct symbol path from body/route
     direct_symbols = [_normalize_symbol(s) for s in (direct_symbols or []) if _normalize_symbol(s)]
     if direct_symbols:
         default_page = pages[0] if pages else "Market_Leaders"
@@ -1124,7 +1158,6 @@ async def select_top10(
             universe.append((s, default_page))
         warnings.append(f"used_direct_symbols:{len(direct_symbols)}")
 
-    # Normal universe discovery if direct symbols are not enough
     if not universe:
         for page in pages:
             page_symbols = await _get_universe_symbols_live(engine, page, limit=per_page_limit)
@@ -1157,7 +1190,6 @@ async def select_top10(
 
     candidates: List[Candidate] = []
 
-    # Primary: candidates from live quotes
     for sym in symbols:
         q = qmap.get(sym) or {}
         if not isinstance(q, dict) or not q:
@@ -1179,7 +1211,6 @@ async def select_top10(
 
         candidates.append(cand)
 
-    # Secondary fallback: direct candidates from page rows/snapshots
     if not candidates:
         row_based_count = 0
         for page in pages:
@@ -1266,7 +1297,25 @@ async def select_top10(
 # =============================================================================
 # Schema helpers for Top_10_Investments
 # =============================================================================
-def _get_top10_schema() -> Tuple[List[str], List[str], Set[str], str]:
+def _ensure_schema_contract(
+    display_headers: Sequence[str],
+    keys: Sequence[str],
+    pct_keys: Set[str],
+) -> Tuple[List[str], List[str], Set[str], List[str]]:
+    hdrs = list(display_headers)
+    ks = list(keys)
+    missing: List[str] = []
+
+    for field in TOP10_REQUIRED_FIELDS:
+        if field not in ks:
+            ks.append(field)
+            hdrs.append(TOP10_REQUIRED_HEADERS.get(field, field))
+            missing.append(field)
+
+    return hdrs, ks, set(pct_keys or set()), missing
+
+
+def _get_top10_schema() -> Tuple[List[str], List[str], Set[str], str, List[str]]:
     try:
         from core.sheets.schema_registry import get_sheet_spec  # type: ignore
 
@@ -1290,7 +1339,8 @@ def _get_top10_schema() -> Tuple[List[str], List[str], Set[str], str]:
                 pct_keys.add(k)
 
         if headers and keys and len(headers) == len(keys):
-            return headers, keys, pct_keys, "schema_registry.get_sheet_spec"
+            hdrs2, keys2, pct2, injected = _ensure_schema_contract(headers, keys, pct_keys)
+            return hdrs2, keys2, pct2, "schema_registry.get_sheet_spec", injected
     except Exception:
         pass
 
@@ -1323,7 +1373,8 @@ def _get_top10_schema() -> Tuple[List[str], List[str], Set[str], str]:
         "Criteria Snapshot",
     ]
     pct_keys = {"expected_roi_1m", "expected_roi_3m", "expected_roi_12m", "forecast_confidence"}
-    return headers, keys, pct_keys, "fallback_minimal"
+    hdrs2, keys2, pct2, injected = _ensure_schema_contract(headers, keys, pct_keys)
+    return hdrs2, keys2, pct2, "fallback_minimal", injected
 
 
 def _project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
@@ -1485,6 +1536,21 @@ def _build_selection_reason(raw: Dict[str, Any], *, roi_key: str, criteria: Crit
     return " | ".join(parts)
 
 
+def _mirror_runtime_aliases(raw: Dict[str, Any], *, rank: int, criteria: Criteria, horizon: str, mode: str) -> None:
+    roi_key = horizon_to_roi_key(horizon)
+
+    raw.setdefault("top10_rank", rank)
+    raw.setdefault("selection_reason", _build_selection_reason(raw, roi_key=roi_key, criteria=criteria))
+    raw.setdefault("criteria_snapshot", _json_dumps_safe(_build_criteria_snapshot(criteria, mode=mode)))
+
+    if raw.get("Top10 Rank") is None:
+        raw["Top10 Rank"] = raw.get("top10_rank")
+    if raw.get("Selection Reason") is None:
+        raw["Selection Reason"] = raw.get("selection_reason")
+    if raw.get("Criteria Snapshot") is None:
+        raw["Criteria Snapshot"] = raw.get("criteria_snapshot")
+
+
 def _ensure_required_top10_fields(raw: Dict[str, Any], *, rank: int, criteria: Criteria, horizon: str, mode: str) -> None:
     roi_key = horizon_to_roi_key(horizon)
     forecast_price_key = horizon_to_forecast_price_key(horizon)
@@ -1524,6 +1590,9 @@ def _ensure_required_top10_fields(raw: Dict[str, Any], *, rank: int, criteria: C
             raw[forecast_price_key] = float(cp) * (1.0 + float(roi))
 
     raw.setdefault("data_provider", raw.get("data_provider") or raw.get("provider") or raw.get("source") or "")
+    raw.setdefault("provider", raw.get("data_provider") or raw.get("provider") or raw.get("source") or "")
+
+    _mirror_runtime_aliases(raw, rank=rank, criteria=criteria, horizon=horizon, mode=mode)
 
 
 def _schema_contains(keys: Sequence[str], needle: str) -> bool:
@@ -1534,7 +1603,7 @@ def _schema_contains(keys: Sequence[str], needle: str) -> bool:
 # Top10 output builder
 # =============================================================================
 def build_top10_output_rows(candidates: List[Candidate], *, criteria: Criteria, mode: str = "") -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    headers, keys, pct_keys, schema_source = _get_top10_schema()
+    display_headers, keys, pct_keys, schema_source, injected_fields = _get_top10_schema()
     horizon = criteria.horizon()
     roi_key = horizon_to_roi_key(horizon)
     forecast_price_key = horizon_to_forecast_price_key(horizon)
@@ -1542,8 +1611,7 @@ def build_top10_output_rows(candidates: List[Candidate], *, criteria: Criteria, 
     warnings: List[str] = []
     rows_out: List[Dict[str, Any]] = []
 
-    required_top10_fields = ["top10_rank", "selection_reason", "criteria_snapshot"]
-    missing_required_fields = [f for f in required_top10_fields if not _schema_contains(keys, f)]
+    missing_required_fields = [f for f in TOP10_REQUIRED_FIELDS if not _schema_contains(keys, f)]
 
     for i, c in enumerate(candidates, start=1):
         raw = dict(c.row or {})
@@ -1579,7 +1647,7 @@ def build_top10_output_rows(candidates: List[Candidate], *, criteria: Criteria, 
 
     meta = {
         "schema_source": schema_source,
-        "headers_len": len(headers),
+        "display_headers_len": len(display_headers),
         "keys_len": len(keys),
         "pct_keys_len": len(pct_keys),
         "horizon": horizon,
@@ -1589,7 +1657,9 @@ def build_top10_output_rows(candidates: List[Candidate], *, criteria: Criteria, 
         "selector_version": TOP10_SELECTOR_VERSION,
         "warnings": warnings,
         "missing_required_schema_fields": missing_required_fields,
+        "injected_required_schema_fields": injected_fields,
         "required_top10_fields_present_in_schema": len(missing_required_fields) == 0,
+        "header_map": [{"key": k, "header": h} for k, h in zip(keys, display_headers)],
     }
     return rows_out, meta
 
@@ -1637,19 +1707,26 @@ async def build_top10_rows(
         direct_symbols=direct_symbols,
     )
     rows, meta_rows = build_top10_output_rows(top, criteria=crit, mode=mode2)
-    headers, keys, _pct_keys, _schema_source = _get_top10_schema()
+    display_headers, keys, _pct_keys, _schema_source, _injected = _get_top10_schema()
 
     status_out = "success" if rows else "warn"
     warnings = list((meta_sel or {}).get("warnings") or [])
+    warnings.extend(list((meta_rows or {}).get("warnings") or []))
+    warnings = _dedupe_keep_order(warnings)
     if not rows:
         warnings.append("top10_empty_after_selection")
 
     return {
         "status": status_out,
         "page": TOP10_PAGE_NAME,
-        "headers": headers,
-        "keys": keys,
+        "headers": list(keys),
+        "keys": list(keys),
+        "display_headers": list(display_headers),
+        "sheet_headers": list(display_headers),
+        "column_headers": list(display_headers),
+        "header_map": [{"key": k, "header": h} for k, h in zip(keys, display_headers)],
         "rows": rows,
+        "rows_matrix": _rows_to_matrix(keys, rows),
         "meta": {
             **(meta_sel or {}),
             **(meta_rows or {}),
@@ -1669,6 +1746,12 @@ async def build_top10_rows(
             "warnings": warnings,
             "engine_present": engine is not None,
             "request_present": request is not None,
+            "response_contract": {
+                "headers_are_keys": True,
+                "display_headers_present": True,
+                "rows_are_projected_to_keys": True,
+                "rows_matrix_present": True,
+            },
         },
     }
 
@@ -1700,7 +1783,6 @@ async def build_rows(
     return rows if isinstance(rows, list) else []
 
 
-# Backward-compatible aliases some routes/builders may try
 async def build_top_10_investments_rows(
     *,
     engine: Any = None,
