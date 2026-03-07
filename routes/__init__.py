@@ -2,17 +2,25 @@
 # routes/__init__.py
 """
 ================================================================================
-TADAWUL FAST BRIDGE — ROUTER DISCOVERY & MOUNT LOGIC (v3.0.0)
+TADAWUL FAST BRIDGE — ROUTER DISCOVERY & MOUNT LOGIC (v3.1.0)
 ================================================================================
 PROD-SAFE • IMPORT-SAFE • RENDER-SAFE • DETERMINISTIC • DUPLICATE-AWARE
+MAIN-PY-COMPATIBLE • DIAGNOSTIC-RICH • REPO-ALIGNED
 
 Why this revision
 -----------------
-- ✅ FIX: Uses your REAL repo router module names
-- ✅ FIX: Deterministic mount order aligned to your current route structure
-- ✅ FIX: Avoids accidental duplicate router inclusion
-- ✅ FIX: Exposes richer diagnostics for mounted/missing/import/mount/duplicate cases
-- ✅ FIX: Supports main.py compatibility aliases:
+- ✅ FIX: Keeps your REAL repo router module names and preferred mount order
+- ✅ FIX: Supports include/exclude by logical key OR exact module name
+- ✅ FIX: Avoids duplicate inclusion by route-signature comparison
+- ✅ FIX: Supports module exports in any of these forms:
+      - router
+      - get_router()
+      - build_router()
+      - create_router()
+      - mount(app)
+- ✅ FIX: Exposes richer snapshot fields for debugging route exposure problems
+- ✅ FIX: Best-effort safe behavior with optional strict mode
+- ✅ COMPAT: Preserves aliases expected by main.py:
       - mount_all_routers(app)  [preferred]
       - mount_all(app)
       - mount_routers(app)
@@ -20,19 +28,11 @@ Why this revision
       - get_expected_router_modules()
       - get_mount_plan()
 
-Main design goals
------------------
-1) Mount each logical router once only
-2) Prefer actual repo files over guessed aliases
-3) Keep startup safe (no network / provider calls at import-time)
-4) Make debugging route exposure easy
-5) Avoid silent OpenAPI gaps caused by skipped imports or duplicate inclusion
-
 Optional env controls
 ---------------------
 - ROUTES_STRICT_IMPORT=1      -> raise on mount/import/required errors
-- ROUTES_INCLUDE="a,b,c"      -> only include these exact module names
-- ROUTES_EXCLUDE="a,b,c"      -> exclude these exact module names
+- ROUTES_INCLUDE="a,b,c"      -> include logical keys and/or module names only
+- ROUTES_EXCLUDE="a,b,c"      -> exclude logical keys and/or module names
 - ROUTES_LOG_PLAN=1           -> log resolved plan before mounting
 """
 
@@ -81,12 +81,16 @@ def _parse_csv(value: str) -> List[str]:
     return [x.strip() for x in s.split(",") if x.strip()]
 
 
-def _err_to_str(e: BaseException, limit: int = 1200) -> str:
+def _err_to_str(e: BaseException, limit: int = 2000) -> str:
     try:
         s = f"{type(e).__name__}: {e}"
     except Exception:
         s = "UnknownError"
     return s if len(s) <= limit else (s[:limit] + "...(truncated)")
+
+
+def _norm_name(value: str) -> str:
+    return str(value or "").strip().lower()
 
 
 # ======================================================================================
@@ -124,137 +128,116 @@ def _default_catalog() -> List[RouterSpec]:
     Real repo-aligned mount order.
 
     Order rationale:
-    1) config / simple shared routes
-    2) quote endpoints
-    3) analysis endpoints
-    4) advisor endpoints
-    5) sheet-row endpoints
-    6) schema/meta endpoints
-    7) special selectors / extras
+    1) config / simple routes
+    2) quote routes
+    3) advanced/AI analysis
+    4) advisor routes
+    5) sheet row helpers / metadata
+    6) special selectors / extras
     """
     return [
         RouterSpec(
             key="config",
-            candidates=(
-                "routes.config",
-            ),
+            candidates=("routes.config",),
             required=False,
         ),
         RouterSpec(
             key="enriched_quote",
-            candidates=(
-                "routes.enriched_quote",
-            ),
+            candidates=("routes.enriched_quote",),
             required=False,
         ),
         RouterSpec(
             key="advanced_analysis",
-            candidates=(
-                "routes.advanced_analysis",
-            ),
+            candidates=("routes.advanced_analysis",),
             required=False,
         ),
         RouterSpec(
             key="ai_analysis",
-            candidates=(
-                "routes.ai_analysis",
-            ),
+            candidates=("routes.ai_analysis",),
             required=False,
         ),
         RouterSpec(
             key="advisor",
-            candidates=(
-                "routes.advisor",
-            ),
+            candidates=("routes.advisor",),
             required=False,
         ),
         RouterSpec(
             key="investment_advisor",
-            candidates=(
-                "routes.investment_advisor",
-            ),
+            candidates=("routes.investment_advisor",),
             required=False,
         ),
         RouterSpec(
             key="analysis_sheet_rows",
-            candidates=(
-                "routes.analysis_sheet_rows",
-            ),
+            candidates=("routes.analysis_sheet_rows",),
             required=False,
         ),
         RouterSpec(
             key="advanced_sheet_rows",
-            candidates=(
-                "routes.advanced_sheet_rows",
-            ),
+            candidates=("routes.advanced_sheet_rows",),
             required=False,
         ),
         RouterSpec(
             key="data_dictionary",
-            candidates=(
-                "routes.data_dictionary",
-            ),
+            candidates=("routes.data_dictionary",),
             required=False,
         ),
         RouterSpec(
             key="top10_investments",
-            candidates=(
-                "routes.top10_investments",
-            ),
+            candidates=("routes.top10_investments",),
             required=False,
         ),
         RouterSpec(
             key="routes_argaam",
-            candidates=(
-                "routes.routes_argaam",
-            ),
+            candidates=("routes.routes_argaam",),
             required=False,
         ),
     ]
 
 
-def _resolve_catalog(catalog: Sequence[RouterSpec]) -> Tuple[List[str], Dict[str, str], List[str]]:
+def _resolve_catalog(
+    catalog: Sequence[RouterSpec],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
     """
     Returns:
-      - plan: resolved module names in order
-      - resolved_map: logical key -> chosen module
-      - missing_required_keys: required logical keys with no importable candidate
+      - resolved entries:
+          [
+            {
+              "key": logical_key,
+              "module": chosen_module_or_None,
+              "required": bool,
+              "all_candidates": [...],
+              "existing_candidates": [...],
+            }
+          ]
+      - missing_required_keys
     """
-    plan: List[str] = []
-    resolved_map: Dict[str, str] = {}
+    entries: List[Dict[str, Any]] = []
     missing_required: List[str] = []
 
     for spec in catalog:
-        chosen: Optional[str] = None
-        for mod_name in spec.candidates:
-            if _module_exists(mod_name):
-                chosen = mod_name
-                break
+        existing = [m for m in spec.candidates if _module_exists(m)]
+        chosen = existing[0] if existing else None
 
-        if chosen:
-            plan.append(chosen)
-            resolved_map[spec.key] = chosen
-        elif spec.required:
+        if spec.required and not chosen:
             missing_required.append(spec.key)
 
-    # de-duplicate preserve order
-    seen: Set[str] = set()
-    unique_plan: List[str] = []
-    for mod_name in plan:
-        if mod_name not in seen:
-            seen.add(mod_name)
-            unique_plan.append(mod_name)
+        entries.append(
+            {
+                "key": spec.key,
+                "module": chosen,
+                "required": spec.required,
+                "all_candidates": list(spec.candidates),
+                "existing_candidates": existing,
+            }
+        )
 
-    return unique_plan, resolved_map, missing_required
+    return entries, missing_required
 
 
 # ======================================================================================
 # Public plan helpers
 # ======================================================================================
 def get_expected_router_modules() -> List[str]:
-    """
-    Flat list of all candidate router modules in the catalog.
-    """
     modules: List[str] = []
     seen: Set[str] = set()
 
@@ -267,25 +250,47 @@ def get_expected_router_modules() -> List[str]:
     return modules
 
 
+def _filter_resolved_entries(entries: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    include_raw = _parse_csv(_env_str("ROUTES_INCLUDE", ""))
+    exclude_raw = _parse_csv(_env_str("ROUTES_EXCLUDE", ""))
+
+    include = {_norm_name(x) for x in include_raw}
+    exclude = {_norm_name(x) for x in exclude_raw}
+
+    filtered: List[Dict[str, Any]] = []
+    for entry in entries:
+        key = _norm_name(str(entry.get("key") or ""))
+        module = _norm_name(str(entry.get("module") or ""))
+
+        if include:
+            if key not in include and module not in include:
+                continue
+
+        if exclude:
+            if key in exclude or module in exclude:
+                continue
+
+        filtered.append(dict(entry))
+
+    return filtered
+
+
 def get_mount_plan() -> List[str]:
-    """
-    Resolved router plan after include/exclude filters.
-    """
-    plan, _, _ = _resolve_catalog(_default_catalog())
-
-    include = set(_parse_csv(_env_str("ROUTES_INCLUDE", "")))
-    exclude = set(_parse_csv(_env_str("ROUTES_EXCLUDE", "")))
-
-    if include:
-        plan = [m for m in plan if m in include]
-    if exclude:
-        plan = [m for m in plan if m not in exclude]
-
-    return plan
+    resolved, _missing_required = _resolve_catalog(_default_catalog())
+    resolved = _filter_resolved_entries(resolved)
+    plan = [str(x["module"]) for x in resolved if x.get("module")]
+    # de-duplicate preserve order
+    seen: Set[str] = set()
+    out: List[str] = []
+    for m in plan:
+        if m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
 
 
 # ======================================================================================
-# Import / mount helpers
+# Import / router extraction helpers
 # ======================================================================================
 def _import_module(module_name: str) -> Tuple[Optional[Any], Optional[BaseException]]:
     try:
@@ -294,10 +299,35 @@ def _import_module(module_name: str) -> Tuple[Optional[Any], Optional[BaseExcept
         return None, e
 
 
+def _get_router_from_module(mod: Any) -> Tuple[Optional[Any], str]:
+    """
+    Supported patterns:
+    - module.router
+    - module.get_router()
+    - module.build_router()
+    - module.create_router()
+    """
+    router = getattr(mod, "router", None)
+    if router is not None:
+        return router, "router_attr"
+
+    for fn_name in ("get_router", "build_router", "create_router"):
+        fn = getattr(mod, fn_name, None)
+        if callable(fn):
+            try:
+                out = fn()
+                if out is not None:
+                    return out, fn_name
+            except Exception:
+                continue
+
+    return None, "none"
+
+
 def _router_signature(router: Any) -> Tuple[str, Tuple[Tuple[str, str], ...]]:
     """
-    Produce a stable-ish signature for duplicate detection.
-    Uses prefix + (path, methods) tuples if available.
+    Stable-ish router fingerprint:
+    (prefix, ((path, methods_csv), ...))
     """
     prefix = str(getattr(router, "prefix", "") or "")
     routes = getattr(router, "routes", []) or []
@@ -315,9 +345,6 @@ def _router_signature(router: Any) -> Tuple[str, Tuple[Tuple[str, str], ...]]:
 
 
 def _app_route_signature_set(app: Any) -> Set[Tuple[str, str]]:
-    """
-    Existing app route signatures as (path, sorted_methods_csv)
-    """
     sigs: Set[Tuple[str, str]] = set()
     for r in getattr(app, "routes", []) or []:
         path = str(getattr(r, "path", "") or "")
@@ -329,44 +356,81 @@ def _app_route_signature_set(app: Any) -> Set[Tuple[str, str]]:
     return sigs
 
 
-def _router_would_duplicate_existing(app: Any, router: Any) -> bool:
-    """
-    Conservative duplicate check:
-    if every route signature in router already exists on app, treat as duplicate.
-    """
-    router_routes = getattr(router, "routes", []) or []
-    if not router_routes:
-        return False
-
-    app_sigs = _app_route_signature_set(app)
-    router_sigs: Set[Tuple[str, str]] = set()
-
-    for r in router_routes:
+def _router_route_signature_set(router: Any) -> Set[Tuple[str, str]]:
+    sigs: Set[Tuple[str, str]] = set()
+    for r in getattr(router, "routes", []) or []:
         path = str(getattr(r, "path", "") or "")
         methods = getattr(r, "methods", None) or set()
         if not isinstance(methods, (set, list, tuple)):
             methods = set()
         meth = ",".join(sorted(str(m) for m in methods))
-        router_sigs.add((path, meth))
+        sigs.add((path, meth))
+    return sigs
 
-    return bool(router_sigs) and router_sigs.issubset(app_sigs)
+
+def _router_would_duplicate_existing(app: Any, router: Any) -> bool:
+    router_sigs = _router_route_signature_set(router)
+    if not router_sigs:
+        return False
+    app_sigs = _app_route_signature_set(app)
+    return router_sigs.issubset(app_sigs)
 
 
-def _mount_one(app: Any, module_name: str) -> Tuple[bool, Optional[str], str]:
+def _get_or_init_snapshot_store(app: Any) -> Dict[str, Any]:
+    snap = {
+        "mounted_modules": [],
+        "duplicate_skips": [],
+        "missing_modules": [],
+        "import_errors": {},
+        "mount_errors": {},
+        "no_router": {},
+        "mount_modes": {},
+        "module_to_key": {},
+        "router_signatures": {},
+    }
+    try:
+        if hasattr(app, "state"):
+            existing = getattr(app.state, "routes_snapshot", None)
+            if isinstance(existing, dict):
+                for k, v in existing.items():
+                    snap[k] = v
+    except Exception:
+        pass
+    return snap
+
+
+# ======================================================================================
+# Mount helpers
+# ======================================================================================
+def _mount_one(
+    app: Any,
+    module_name: str,
+) -> Tuple[bool, Optional[str], str]:
     """
     Mount strategies:
     - module.router -> app.include_router(router)
-    - module.mount(app) -> custom mount
+    - module.get_router()/build_router()/create_router()
+    - module.mount(app)
 
     Returns:
       (success, error_message, mode)
-      mode in {"router", "mount_fn", "duplicate_skip", "no_router"}
+
+    mode in:
+      - "router_attr"
+      - "get_router"
+      - "build_router"
+      - "create_router"
+      - "mount_fn"
+      - "duplicate_skip"
+      - "import_error"
+      - "no_router"
+      - "mount_error"
     """
     mod, exc = _import_module(module_name)
     if mod is None:
         return False, _err_to_str(exc or Exception("import failed")), "import_error"
 
-    router = getattr(mod, "router", None)
+    router, source = _get_router_from_module(mod)
     mount_fn = getattr(mod, "mount", None)
 
     try:
@@ -374,15 +438,13 @@ def _mount_one(app: Any, module_name: str) -> Tuple[bool, Optional[str], str]:
             if _router_would_duplicate_existing(app, router):
                 return True, None, "duplicate_skip"
             app.include_router(router)
-            return True, None, "router"
+            return True, None, source
 
         if callable(mount_fn):
-            # We cannot cheaply pre-detect duplicates for custom mount functions,
-            # so just call it and trust the module.
             mount_fn(app)
             return True, None, "mount_fn"
 
-        return False, "No `router` attribute and no `mount(app)` function found", "no_router"
+        return False, "No router export and no mount(app) function found", "no_router"
 
     except Exception as e:
         return False, _err_to_str(e), "mount_error"
@@ -395,24 +457,24 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
     """
     Mount all routers on the provided FastAPI app and return a diagnostic snapshot.
 
-    Never raises unless ROUTES_STRICT_IMPORT=1.
+    Does not raise unless ROUTES_STRICT_IMPORT=1.
     """
     strict = _env_bool("ROUTES_STRICT_IMPORT", False)
     log_plan = _env_bool("ROUTES_LOG_PLAN", False)
 
     catalog = _default_catalog()
-    plan, resolved_map, missing_required = _resolve_catalog(catalog)
-
-    include = set(_parse_csv(_env_str("ROUTES_INCLUDE", "")))
-    exclude = set(_parse_csv(_env_str("ROUTES_EXCLUDE", "")))
-
-    if include:
-        plan = [m for m in plan if m in include]
-    if exclude:
-        plan = [m for m in plan if m not in exclude]
+    resolved_entries, missing_required = _resolve_catalog(catalog)
+    resolved_entries = _filter_resolved_entries(resolved_entries)
 
     if log_plan:
-        logger.info("Resolved router plan: %s", ", ".join(plan) if plan else "(empty)")
+        logger.info(
+            "Resolved router plan: %s",
+            ", ".join(
+                f"{x['key']}=>{x['module']}" for x in resolved_entries if x.get("module")
+            ) or "(empty)",
+        )
+
+    snap = _get_or_init_snapshot_store(app)
 
     mounted: List[str] = []
     duplicate_skips: List[str] = []
@@ -421,8 +483,41 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
     mount_errors: Dict[str, str] = {}
     no_router: Dict[str, str] = {}
     mount_modes: Dict[str, str] = {}
+    module_to_key: Dict[str, str] = {}
+    resolved_map: Dict[str, str] = {}
 
-    for module_name in plan:
+    plan_modules: List[str] = []
+
+    for entry in resolved_entries:
+        key = str(entry.get("key") or "")
+        module_name = entry.get("module")
+        if module_name:
+            resolved_map[key] = str(module_name)
+            plan_modules.append(str(module_name))
+
+    # de-duplicate modules preserve order
+    seen_plan: Set[str] = set()
+    plan_modules_unique: List[str] = []
+    for m in plan_modules:
+        if m not in seen_plan:
+            seen_plan.add(m)
+            plan_modules_unique.append(m)
+
+    for entry in resolved_entries:
+        key = str(entry.get("key") or "")
+        module_name = entry.get("module")
+
+        if not module_name:
+            all_candidates = entry.get("all_candidates") or []
+            existing_candidates = entry.get("existing_candidates") or []
+            if all_candidates and not existing_candidates:
+                # logical slot unresolved
+                continue
+            continue
+
+        module_name = str(module_name)
+        module_to_key[module_name] = key
+
         if not _module_exists(module_name):
             missing.append(module_name)
             continue
@@ -434,7 +529,22 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
                 duplicate_skips.append(module_name)
             else:
                 mounted.append(module_name)
+
             mount_modes[module_name] = mode
+
+            # record router signature for diagnostics when possible
+            try:
+                mod = importlib.import_module(module_name)
+                router, _source = _get_router_from_module(mod)
+                if router is not None:
+                    snap.setdefault("router_signatures", {})[module_name] = {
+                        "signature": _router_signature(router),
+                        "route_count": len(getattr(router, "routes", []) or []),
+                        "prefix": str(getattr(router, "prefix", "") or ""),
+                    }
+            except Exception:
+                pass
+
             continue
 
         if mode == "import_error" or (err and "modulenotfounderror" in err.lower()):
@@ -447,24 +557,33 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
         if strict:
             raise RuntimeError(f"Router mount failed for {module_name}: {err}")
 
-    snap = {
+    failed_count = len(import_errors) + len(mount_errors) + len(no_router)
+
+    snapshot = {
         "mounted": mounted,
+        "mounted_count": len(mounted),
         "duplicate_skips": duplicate_skips,
+        "duplicate_skips_count": len(duplicate_skips),
         "missing": missing,
+        "missing_count": len(missing),
         "import_errors": import_errors,
         "mount_errors": mount_errors,
         "no_router": no_router,
+        "failed_count": failed_count,
         "strict": strict,
         "strategy": "routes.mount_all_routers",
         "resolved_map": resolved_map,
+        "module_to_key": module_to_key,
         "missing_required_keys": missing_required,
-        "plan": plan,
+        "plan": plan_modules_unique,
+        "plan_count": len(plan_modules_unique),
         "mount_modes": mount_modes,
         "expected_router_modules": get_expected_router_modules(),
+        "expected_router_modules_count": len(get_expected_router_modules()),
+        "catalog_keys": [spec.key for spec in catalog],
+        "resolved_entries": resolved_entries,
         "openapi_route_count_after_mount": len(getattr(app, "routes", []) or []),
     }
-
-    failed_count = len(import_errors) + len(mount_errors) + len(no_router)
 
     logger.info(
         "Routes mount summary: mounted=%s duplicate_skips=%s missing=%s failed=%s strict=%s",
@@ -494,14 +613,15 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
     if duplicate_skips:
         logger.info("Duplicate router skips: %s", ", ".join(duplicate_skips))
 
-    # Best effort: expose snapshot on app.state if available
     try:
         if hasattr(app, "state"):
-            app.state.routes_snapshot = snap
+            app.state.routes_snapshot = snapshot
+            app.state.routes_mount_result = snapshot
+            app.state.routes_strategy = "routes.mount_all_routers"
     except Exception:
         pass
 
-    return snap
+    return snapshot
 
 
 # ======================================================================================
