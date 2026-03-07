@@ -2,10 +2,10 @@
 # core/analysis/top10_selector.py
 """
 ================================================================================
-Top 10 Selector — v3.4.0
+Top 10 Selector — v3.5.0
 ================================================================================
 LIVE • SCHEMA-FIRST • TOP10-METADATA COMPLETE • ROUTE-COMPATIBLE • SHEET-FRIENDLY
-FAIL-SAFE • BODY-AWARE • CRITERIA-AWARE • FALLBACK-ENHANCED • CONTRACT-HARDENED
+FAIL-SAFE • BODY-AWARE • SETTINGS-AWARE • CONTRACT-HARDENED • FALLBACK-ENHANCED
 
 Purpose
 -------
@@ -28,22 +28,22 @@ Primary guarantees
 - Does not fail only because some optional fields are missing
 - No network I/O at import-time
 
-New in v3.4.0
+New in v3.5.0
 -------------
-- ✅ FIX: Stronger builder/runtime contract for special-page routes
-- ✅ FIX: More flexible engine discovery (request / app.state / explicit engine)
-- ✅ FIX: Better payload extraction from page-row and quote APIs
-- ✅ FIX: Prevents fake/null-row behavior by returning honest empty rows + warnings
-- ✅ FIX: Stronger Top10 schema contract enforcement
-- ✅ FIX: More tolerant fallback for direct-symbol mode
-- ✅ FIX: Better meta diagnostics for root-cause tracing
-- ✅ SAFE: Backward-compatible aliases remain available
+- ✅ FIX: settings-aware criteria merge (important for route dispatch paths)
+- ✅ FIX: route-compatible public build_top10_output_rows(...)
+- ✅ FIX: stronger engine method compatibility for symbols / rows / quotes
+- ✅ FIX: rows_matrix payload parsing support
+- ✅ FIX: direct_symbols extraction now includes direct_symbols key
+- ✅ FIX: more resilient universe discovery from rows + snapshots + matrix payloads
+- ✅ FIX: relaxed candidate fallback if strict filters eliminate all candidates
+- ✅ FIX: honest placeholder fallback when real universe symbols exist but metrics are partial
+- ✅ IMPROVE: richer meta diagnostics and row-generation traceability
 
 Public APIs
 -----------
 - select_top10_symbols(...)
 - build_top10_rows(...)
-- select_top10(...)
 - build_top10_output_rows(...)
 - build_rows(...)
 - build_top_10_investments_rows(...)
@@ -76,7 +76,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 logger = logging.getLogger("core.analysis.top10_selector")
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "3.4.0"
+TOP10_SELECTOR_VERSION = "3.5.0"
 TOP10_PAGE_NAME = "Top_10_Investments"
 RIYADH_TZ = timezone(timedelta(hours=3))
 
@@ -295,9 +295,29 @@ def _rows_to_matrix(keys: Sequence[str], rows: Sequence[Dict[str, Any]]) -> List
     return matrix
 
 
+def _matrix_to_rows(matrix: Any, keys: Sequence[str]) -> List[Dict[str, Any]]:
+    if not isinstance(matrix, list) or not matrix or not keys:
+        return []
+    out: List[Dict[str, Any]] = []
+    kk = [str(k) for k in keys]
+    for row in matrix:
+        if not isinstance(row, (list, tuple)):
+            continue
+        obj: Dict[str, Any] = {}
+        for i, key in enumerate(kk):
+            obj[key] = row[i] if i < len(row) else None
+        out.append(obj)
+    return out
+
+
 def _extract_rows_from_any(obj: Any) -> List[Dict[str, Any]]:
     """
     Best-effort list-of-dicts extractor from various payload shapes.
+    Supports:
+      - rows: [dict]
+      - data/items/results/quotes: [dict]
+      - rows_matrix + keys/headers
+      - nested data dicts
     """
     if obj is None:
         return []
@@ -305,17 +325,41 @@ def _extract_rows_from_any(obj: Any) -> List[Dict[str, Any]]:
     if isinstance(obj, list):
         out: List[Dict[str, Any]] = []
         for item in obj:
-            d = _to_payload(item)
-            if d:
-                out.append(d)
+            if isinstance(item, dict):
+                out.append(dict(item))
+            else:
+                d = _to_payload(item)
+                if d:
+                    out.append(d)
         return out
 
     if isinstance(obj, dict):
-        for key in ("rows", "data", "items", "quotes", "results"):
+        if isinstance(obj.get("data"), dict):
+            nested_rows = _extract_rows_from_any(obj.get("data"))
+            if nested_rows:
+                return nested_rows
+
+        for key in ("rows", "data", "items", "quotes", "results", "records"):
             v = obj.get(key)
             if isinstance(v, list):
-                return _extract_rows_from_any(v)
+                if v and isinstance(v[0], dict):
+                    return [dict(r) for r in v if isinstance(r, dict)]
+                if v and isinstance(v[0], (list, tuple)):
+                    keys = obj.get("keys") or obj.get("headers") or obj.get("columns") or []
+                    if isinstance(keys, list) and keys:
+                        return _matrix_to_rows(v, [str(k) for k in keys])
+
+        rows_matrix = obj.get("rows_matrix") or obj.get("matrix")
+        if isinstance(rows_matrix, list) and rows_matrix:
+            keys = obj.get("keys") or obj.get("headers") or obj.get("columns") or []
+            if isinstance(keys, list) and keys:
+                return _matrix_to_rows(rows_matrix, [str(k) for k in keys])
+
         return []
+
+    d = _to_payload(obj)
+    if d:
+        return _extract_rows_from_any(d)
 
     return []
 
@@ -522,6 +566,30 @@ def _resolve_engine_from_request(request: Any) -> Any:
     return None
 
 
+def _request_to_payload(request: Any) -> Dict[str, Any]:
+    if request is None:
+        return {}
+    if isinstance(request, dict):
+        return dict(request)
+    return _to_payload(request)
+
+
+def _settings_to_payload(settings: Any) -> Dict[str, Any]:
+    if settings is None:
+        return {}
+    if isinstance(settings, dict):
+        out = dict(settings)
+    else:
+        out = _to_payload(settings)
+
+    nested = out.get("criteria")
+    if isinstance(nested, dict):
+        merged = dict(out)
+        merged.update(nested)
+        return merged
+    return out
+
+
 def _extract_body_criteria(body: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     if not isinstance(body, dict):
         return {}
@@ -529,22 +597,37 @@ def _extract_body_criteria(body: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     merged: Dict[str, Any] = {}
     merged.update(body)
 
-    for nested_key in ("criteria", "filters", "criteria_snapshot"):
+    for nested_key in ("criteria", "filters", "criteria_snapshot", "settings"):
         nested = body.get(nested_key)
         if isinstance(nested, dict):
             merged.update(nested)
+            if isinstance(nested.get("criteria"), dict):
+                merged.update(nested.get("criteria"))
 
     return merged
 
 
-def _resolve_limit(limit: Any, criteria: Optional[Dict[str, Any]], body: Optional[Dict[str, Any]]) -> int:
+def _resolve_limit(
+    limit: Any,
+    criteria: Optional[Dict[str, Any]],
+    body: Optional[Dict[str, Any]],
+    settings: Optional[Dict[str, Any]] = None,
+    request_payload: Optional[Dict[str, Any]] = None,
+) -> int:
     body_criteria = _extract_body_criteria(body)
+    settings_criteria = _extract_body_criteria(settings or {})
+    request_criteria = _extract_body_criteria(request_payload or {})
+
     v = _first_non_none(
         limit,
         (criteria or {}).get("top_n") if isinstance(criteria, dict) else None,
         (criteria or {}).get("limit") if isinstance(criteria, dict) else None,
+        settings_criteria.get("top_n"),
+        settings_criteria.get("limit"),
         body_criteria.get("top_n"),
         body_criteria.get("limit"),
+        request_criteria.get("top_n"),
+        request_criteria.get("limit"),
         10,
     )
     n = int(_safe_float(v, 10) or 10)
@@ -556,39 +639,55 @@ def _merge_criteria_sources(
     engine: Any,
     criteria: Optional[Dict[str, Any]],
     body: Optional[Dict[str, Any]],
+    settings: Optional[Dict[str, Any]],
+    request_payload: Optional[Dict[str, Any]],
     limit: Optional[int],
 ) -> Criteria:
     base = load_criteria_best_effort(engine)
 
-    merged = _extract_body_criteria(body)
+    merged: Dict[str, Any] = {}
+    merged.update(_extract_body_criteria(request_payload or {}))
+    merged.update(_extract_body_criteria(settings or {}))
+    merged.update(_extract_body_criteria(body or {}))
+
     if isinstance(criteria, dict):
         merged.update(criteria)
 
     crit = merge_criteria_overrides(base, merged)
-    crit.top_n = _resolve_limit(limit, criteria, body)
+    crit.top_n = _resolve_limit(limit, criteria, body, settings=settings, request_payload=request_payload)
     return crit
 
 
-def _extract_route_mode(mode: Any, body: Optional[Dict[str, Any]]) -> str:
+def _extract_route_mode(mode: Any, body: Optional[Dict[str, Any]], settings: Optional[Dict[str, Any]], request_payload: Optional[Dict[str, Any]]) -> str:
     m = _safe_str(mode)
     if m:
         return m
-    if isinstance(body, dict):
-        return _safe_str(body.get("mode"))
+    for src in (body, settings, request_payload):
+        if isinstance(src, dict):
+            mv = _safe_str(src.get("mode"))
+            if mv:
+                return mv
     return ""
 
 
-def _extract_direct_symbols(body: Optional[Dict[str, Any]]) -> List[str]:
-    if not isinstance(body, dict):
-        return []
-
+def _extract_direct_symbols_from_sources(*sources: Optional[Dict[str, Any]]) -> List[str]:
     out: List[str] = []
-    for key in ("symbols", "tickers", "tickers_list", "symbol_list", "selected_symbols"):
-        vals = _coerce_to_list(body.get(key))
-        for v in vals:
-            sym = _normalize_symbol(_safe_str(v))
-            if sym:
-                out.append(sym)
+    for src in sources:
+        if not isinstance(src, dict):
+            continue
+        for key in (
+            "symbols",
+            "tickers",
+            "tickers_list",
+            "symbol_list",
+            "selected_symbols",
+            "direct_symbols",
+        ):
+            vals = _coerce_to_list(src.get(key))
+            for v in vals:
+                sym = _normalize_symbol(_safe_str(v))
+                if sym:
+                    out.append(sym)
     return _dedupe_keep_order(out)
 
 
@@ -672,6 +771,7 @@ def _row_list_from_snapshot(snapshot: Optional[Dict[str, Any]]) -> List[Dict[str
     rows = snapshot.get("rows") or snapshot.get("data") or snapshot.get("items") or []
     keys = snapshot.get("keys") or []
     headers = snapshot.get("headers") or []
+    rows_matrix = snapshot.get("rows_matrix") or snapshot.get("matrix")
 
     if isinstance(rows, list) and rows and isinstance(rows[0], dict):
         return [dict(r) for r in rows if isinstance(r, dict)]
@@ -690,101 +790,130 @@ def _row_list_from_snapshot(snapshot: Optional[Dict[str, Any]]) -> List[Dict[str
             out.append(obj)
         return out
 
+    if isinstance(rows_matrix, list) and rows_matrix:
+        cols = keys if isinstance(keys, list) and keys else headers
+        if isinstance(cols, list) and cols:
+            return _matrix_to_rows(rows_matrix, [str(c) for c in cols])
+
     return []
 
 
-async def _get_page_rows_live(engine: Any, page: str, *, limit: int = 5000) -> List[Dict[str, Any]]:
+async def _call_engine_variants(engine: Any, method_names: Sequence[str], variants: Sequence[Dict[str, Any]], positional: Optional[List[Any]] = None) -> Any:
     if engine is None:
-        return []
-
-    candidates = [
-        ("get_sheet_rows", {"sheet": page, "limit": limit}),
-        ("get_sheet_rows", {"page": page, "limit": limit}),
-        ("get_page_rows", {"page": page, "limit": limit}),
-        ("get_page_rows", {"sheet": page, "limit": limit}),
-        ("sheet_rows", {"sheet": page, "limit": limit}),
-        ("sheet_rows", {"page": page, "limit": limit}),
-    ]
-
-    for name, kwargs in candidates:
+        return None
+    for name in method_names:
         fn = getattr(engine, name, None)
         if not callable(fn):
             continue
-        try:
-            out = fn(**kwargs)
-            out = await _maybe_await(out)
-        except TypeError:
+        for kwargs in variants:
             try:
-                out = fn(page)
-                out = await _maybe_await(out)
+                out = fn(**kwargs)
+                return await _maybe_await(out)
+            except TypeError:
+                pass
             except Exception:
                 continue
-        except Exception:
-            continue
+        if positional:
+            try:
+                out = fn(*positional)
+                return await _maybe_await(out)
+            except Exception:
+                continue
+    return None
 
-        rows = _extract_rows_from_any(out)
-        if rows:
-            return rows
+
+async def _get_page_rows_live(engine: Any, page: str, *, limit: int = 5000, mode: str = "", body: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+    if engine is None:
+        return []
+
+    body_obj = dict(body or {})
+    variants = [
+        {"sheet": page, "sheet_name": page, "page": page, "limit": limit, "mode": mode, "body": body_obj},
+        {"sheet": page, "page": page, "limit": limit, "mode": mode},
+        {"sheet_name": page, "limit": limit, "mode": mode, "body": body_obj},
+        {"page": page, "limit": limit, "mode": mode, "body": body_obj},
+        {"sheet": page, "limit": limit},
+        {"page": page, "limit": limit},
+        {"sheet_name": page, "limit": limit},
+    ]
+
+    out = await _call_engine_variants(
+        engine,
+        method_names=(
+            "get_sheet_rows",
+            "get_page_rows",
+            "sheet_rows",
+            "build_sheet_rows",
+            "get_sheet",
+        ),
+        variants=variants,
+        positional=[page],
+    )
+
+    rows = _extract_rows_from_any(out)
+    if rows:
+        return rows
 
     snap = _get_snapshot(engine, page)
     return _row_list_from_snapshot(snap)
 
 
-async def _get_universe_symbols_live(engine: Any, page: str, *, limit: int = 5000) -> List[str]:
+async def _get_universe_symbols_live(engine: Any, page: str, *, limit: int = 5000, mode: str = "", body: Optional[Dict[str, Any]] = None) -> List[str]:
     if engine is None:
         return []
 
-    candidates = [
-        ("get_page_symbols", dict(page=page, limit=limit)),
-        ("get_page_symbols", dict(sheet=page, limit=limit)),
-        ("get_sheet_symbols", dict(sheet=page, limit=limit)),
-        ("list_symbols_for_page", dict(page=page, limit=limit)),
-        ("list_symbols", dict(sheet=page, limit=limit)),
-        ("get_symbols", dict(sheet=page, limit=limit)),
+    body_obj = dict(body or {})
+    variants = [
+        {"page": page, "limit": limit, "mode": mode, "body": body_obj},
+        {"sheet": page, "limit": limit, "mode": mode, "body": body_obj},
+        {"sheet_name": page, "limit": limit, "mode": mode, "body": body_obj},
+        {"page": page, "limit": limit},
+        {"sheet": page, "limit": limit},
+        {"sheet_name": page, "limit": limit},
     ]
 
-    for name, kwargs in candidates:
-        fn = getattr(engine, name, None)
-        if not callable(fn):
-            continue
-        try:
-            out = fn(**kwargs)
-            out = await _maybe_await(out)
-        except TypeError:
-            try:
-                out = fn(page)  # type: ignore[misc]
-                out = await _maybe_await(out)
-            except Exception:
-                continue
-        except Exception:
-            continue
+    out = await _call_engine_variants(
+        engine,
+        method_names=(
+            "get_page_symbols",
+            "get_sheet_symbols",
+            "list_symbols_for_page",
+            "list_symbols",
+            "get_symbols",
+        ),
+        variants=variants,
+        positional=[page],
+    )
 
-        if isinstance(out, (list, tuple)):
-            syms = [_normalize_symbol(_safe_str(x)) for x in out]
-            syms = [s for s in syms if s]
-            if syms:
-                return syms
+    if isinstance(out, (list, tuple)):
+        syms = [_normalize_symbol(_safe_str(x)) for x in out]
+        syms = [s for s in syms if s]
+        if syms:
+            return _dedupe_keep_order(syms)
 
-        if isinstance(out, dict) and isinstance(out.get("symbols"), (list, tuple)):
-            syms = [_normalize_symbol(_safe_str(x)) for x in out["symbols"]]
-            syms = [s for s in syms if s]
-            if syms:
-                return syms
+    if isinstance(out, dict):
+        for key in ("symbols", "tickers", "items", "data"):
+            v = out.get(key)
+            if isinstance(v, (list, tuple)):
+                syms = [_normalize_symbol(_safe_str(x)) for x in v]
+                syms = [s for s in syms if s]
+                if syms:
+                    return _dedupe_keep_order(syms)
 
     fn2 = getattr(engine, "symbols_reader", None)
     if fn2 is not None and hasattr(fn2, "get_symbols_for_sheet"):
         try:
-            out = fn2.get_symbols_for_sheet(page)  # type: ignore[attr-defined]
-            out = await _maybe_await(out)
-            if isinstance(out, (list, tuple)):
-                syms = [_normalize_symbol(_safe_str(x)) for x in out]
+            out2 = fn2.get_symbols_for_sheet(page)  # type: ignore[attr-defined]
+            out2 = await _maybe_await(out2)
+            if isinstance(out2, (list, tuple)):
+                syms = [_normalize_symbol(_safe_str(x)) for x in out2]
                 syms = [s for s in syms if s]
                 if syms:
-                    return syms
+                    return _dedupe_keep_order(syms)
         except Exception:
             pass
 
-    rows = await _get_page_rows_live(engine, page, limit=limit)
+    rows = await _get_page_rows_live(engine, page, limit=limit, mode=mode, body=body)
     syms2: List[str] = []
     for r in rows:
         sym = _extract_symbol_from_row(r)
@@ -804,10 +933,26 @@ def _dict_is_symbol_map(d: Dict[str, Any], symbols: List[str]) -> bool:
     return hit >= max(1, min(3, len(symset)))
 
 
-async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "") -> Dict[str, Dict[str, Any]]:
+def _symbol_from_quote_like(d: Dict[str, Any]) -> str:
+    return _normalize_symbol(
+        _safe_str(
+            _first_non_none(
+                d.get("symbol"),
+                d.get("ticker"),
+                d.get("code"),
+                d.get("Symbol"),
+                d.get("Ticker"),
+                d.get("Code"),
+            )
+        )
+    )
+
+
+async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "", body: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
     if not engine or not symbols:
         return {}
 
+    body_obj = dict(body or {})
     batch_candidates = [
         "get_enriched_quotes_batch",
         "get_analysis_quotes_batch",
@@ -823,20 +968,44 @@ async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "") 
 
         try:
             try:
-                res = fn(symbols, mode=mode or "")
+                res = fn(symbols=symbols, mode=mode or "", body=body_obj)
             except TypeError:
-                res = fn(symbols)
+                try:
+                    res = fn(symbols=symbols, mode=mode or "")
+                except TypeError:
+                    try:
+                        res = fn(symbols)
+                    except TypeError:
+                        res = fn(symbols, mode=mode or "")
             res = await _maybe_await(res)
 
             if isinstance(res, dict):
                 if _dict_is_symbol_map(res, symbols):
                     return {s: _to_payload(res.get(s)) for s in symbols}
-                nested = res.get("data") or res.get("rows") or res.get("items")
+
+                nested = res.get("data") or res.get("rows") or res.get("items") or res.get("quotes") or res.get("results")
                 if isinstance(nested, dict) and _dict_is_symbol_map(nested, symbols):
                     return {s: _to_payload(nested.get(s)) for s in symbols}
-                if isinstance(nested, list):
-                    return {s: _to_payload(v) for s, v in zip(symbols, nested)}
+
+                rows = _extract_rows_from_any(res)
+                if rows:
+                    out_rows: Dict[str, Dict[str, Any]] = {}
+                    for item in rows:
+                        sym = _symbol_from_quote_like(item)
+                        if sym:
+                            out_rows[sym] = dict(item)
+                    if out_rows:
+                        return {s: out_rows.get(s, {}) for s in symbols}
+
             elif isinstance(res, list):
+                out_rows2: Dict[str, Dict[str, Any]] = {}
+                for item in res:
+                    d = _to_payload(item)
+                    sym = _symbol_from_quote_like(d)
+                    if sym:
+                        out_rows2[sym] = d
+                if out_rows2:
+                    return {s: out_rows2.get(s, {}) for s in symbols}
                 return {s: _to_payload(v) for s, v in zip(symbols, res)}
         except Exception:
             continue
@@ -849,14 +1018,20 @@ async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "") 
         try:
             if callable(per_dict_fn):
                 try:
-                    out[s] = _to_payload(await _maybe_await(per_dict_fn(s, mode=mode or "")))
+                    out[s] = _to_payload(await _maybe_await(per_dict_fn(s, mode=mode or "", body=body_obj)))
                 except TypeError:
-                    out[s] = _to_payload(await _maybe_await(per_dict_fn(s)))
+                    try:
+                        out[s] = _to_payload(await _maybe_await(per_dict_fn(s, mode=mode or "")))
+                    except TypeError:
+                        out[s] = _to_payload(await _maybe_await(per_dict_fn(s)))
             elif callable(per_fn):
                 try:
-                    out[s] = _to_payload(await _maybe_await(per_fn(s, mode=mode or "")))
+                    out[s] = _to_payload(await _maybe_await(per_fn(s, mode=mode or "", body=body_obj)))
                 except TypeError:
-                    out[s] = _to_payload(await _maybe_await(per_fn(s)))
+                    try:
+                        out[s] = _to_payload(await _maybe_await(per_fn(s, mode=mode or "")))
+                    except TypeError:
+                        out[s] = _to_payload(await _maybe_await(per_fn(s)))
             else:
                 out[s] = {"symbol": s, "warnings": "engine_missing_quote_methods"}
         except Exception as e:
@@ -1080,6 +1255,27 @@ def _extract_candidate_from_row(*, page: str, row: Dict[str, Any], horizon: str)
     )
 
 
+def _make_placeholder_candidate(sym: str, page: str, quote_like: Optional[Dict[str, Any]] = None) -> Candidate:
+    q = dict(quote_like or {})
+    q["symbol"] = sym
+    q["source_page"] = page
+    q.setdefault("warnings", "placeholder_candidate_no_roi")
+    q.setdefault("expected_roi_3m", 0.0)
+    q.setdefault("forecast_confidence", _get_confidence(q))
+    q.setdefault("overall_score", _get_overall_score(q))
+    q.setdefault("risk_score", _get_risk_score(q))
+    return Candidate(
+        symbol=sym,
+        source_page=page,
+        roi=0.0,
+        confidence=float(_get_confidence(q)),
+        overall_score=float(_get_overall_score(q)),
+        risk_score=float(_get_risk_score(q)),
+        volume=float(_get_volume(q)),
+        row=q,
+    )
+
+
 def _rank_key(c: Candidate, *, use_liquidity: bool) -> Tuple[float, float, float, float]:
     vol = c.volume if use_liquidity else 0.0
     return (c.roi, c.confidence, vol, c.overall_score)
@@ -1088,12 +1284,12 @@ def _rank_key(c: Candidate, *, use_liquidity: bool) -> Tuple[float, float, float
 # =============================================================================
 # Optional enrichment for final Top-N
 # =============================================================================
-async def _enrich_top(engine: Any, symbols: List[str], *, mode: str = "") -> Dict[str, Dict[str, Any]]:
+async def _enrich_top(engine: Any, symbols: List[str], *, mode: str = "", body: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
     if engine is None or not symbols:
         return {}
 
     try:
-        res = await _fetch_quotes_map(engine, symbols, mode=mode or "")
+        res = await _fetch_quotes_map(engine, symbols, mode=mode or "", body=body or {})
         if isinstance(res, dict) and res:
             return {s: _to_payload(res.get(s)) for s in symbols}
     except Exception:
@@ -1114,7 +1310,13 @@ async def _enrich_top(engine: Any, symbols: List[str], *, mode: str = "") -> Dic
     async def one(sym: str) -> None:
         async with sem:
             try:
-                r = fn(sym)
+                try:
+                    r = fn(sym, mode=mode or "", body=body or {})
+                except TypeError:
+                    try:
+                        r = fn(sym, mode=mode or "")
+                    except TypeError:
+                        r = fn(sym)
                 r = await _maybe_await(r)
                 out[sym] = _to_payload(r)
             except Exception:
@@ -1133,6 +1335,7 @@ async def select_top10(
     criteria: Criteria,
     mode: str = "",
     direct_symbols: Optional[List[str]] = None,
+    body: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Candidate], Dict[str, Any]]:
     t0 = time.time()
     horizon = criteria.horizon()
@@ -1147,6 +1350,7 @@ async def select_top10(
 
     universe: List[Tuple[str, str]] = []
     warnings: List[str] = []
+    fallback_trace: List[str] = []
 
     direct_symbols = [_normalize_symbol(s) for s in (direct_symbols or []) if _normalize_symbol(s)]
     if direct_symbols:
@@ -1157,8 +1361,8 @@ async def select_top10(
 
     if not universe:
         for page in pages:
-            page_symbols = await _get_universe_symbols_live(engine, page, limit=per_page_limit)
-            page_rows = await _get_page_rows_live(engine, page, limit=per_page_limit)
+            page_symbols = await _get_universe_symbols_live(engine, page, limit=per_page_limit, mode=mode, body=body)
+            page_rows = await _get_page_rows_live(engine, page, limit=per_page_limit, mode=mode, body=body)
 
             if page_symbols:
                 for s in page_symbols:
@@ -1166,9 +1370,14 @@ async def select_top10(
             else:
                 warnings.append(f"universe_empty:{page}")
 
+            if not page_symbols and page_rows:
+                fallback_trace.append(f"rows_only_universe:{page}:{len(page_rows)}")
+
             if not page_symbols and not page_rows:
                 snap = _get_snapshot(engine, page)
-                if isinstance(snap, dict) and isinstance(snap.get("rows"), list):
+                if isinstance(snap, dict) and (
+                    isinstance(snap.get("rows"), list) or isinstance(snap.get("rows_matrix"), list)
+                ):
                     warnings.append(f"snapshot_present_but_no_symbols:{page}")
 
     seen_u: Set[str] = set()
@@ -1183,9 +1392,10 @@ async def select_top10(
 
     qmap: Dict[str, Dict[str, Any]] = {}
     if symbols:
-        qmap = await _fetch_quotes_map(engine, symbols, mode=mode or "")
+        qmap = await _fetch_quotes_map(engine, symbols, mode=mode or "", body=body or {})
 
     candidates: List[Candidate] = []
+    quote_candidates_unfiltered: List[Candidate] = []
 
     for sym in symbols:
         q = qmap.get(sym) or {}
@@ -1195,6 +1405,8 @@ async def select_top10(
         cand = _extract_candidate_from_quote(sym=sym, page=source_map.get(sym, ""), quote=q, horizon=horizon)
         if cand is None:
             continue
+
+        quote_candidates_unfiltered.append(cand)
 
         if criteria.min_expected_roi is not None and cand.roi < float(criteria.min_expected_roi):
             continue
@@ -1208,14 +1420,17 @@ async def select_top10(
 
         candidates.append(cand)
 
+    row_candidates_unfiltered: List[Candidate] = []
     if not candidates:
         row_based_count = 0
         for page in pages:
-            rows = await _get_page_rows_live(engine, page, limit=per_page_limit)
+            rows = await _get_page_rows_live(engine, page, limit=per_page_limit, mode=mode, body=body)
             for row in rows:
                 cand = _extract_candidate_from_row(page=page, row=row, horizon=horizon)
                 if cand is None:
                     continue
+
+                row_candidates_unfiltered.append(cand)
 
                 if criteria.min_expected_roi is not None and cand.roi < float(criteria.min_expected_roi):
                     continue
@@ -1233,19 +1448,23 @@ async def select_top10(
         if row_based_count > 0:
             warnings.append(f"used_row_based_fallback:{row_based_count}")
 
-    # direct-symbol quote fallback:
-    # if route provided explicit symbols and filtering eliminated all candidates,
-    # try to keep quote-backed rows with relaxed qualification so the response is honest
-    # and still useful, rather than returning a fake/null row.
+    if not candidates and quote_candidates_unfiltered:
+        candidates = list(quote_candidates_unfiltered)
+        warnings.append(f"used_relaxed_quote_fallback:{len(candidates)}")
+
+    if not candidates and row_candidates_unfiltered:
+        candidates = list(row_candidates_unfiltered)
+        warnings.append(f"used_relaxed_row_fallback:{len(candidates)}")
+
     if not candidates and direct_symbols:
         relaxed_count = 0
         if not qmap:
-            qmap = await _fetch_quotes_map(engine, direct_symbols, mode=mode or "")
+            qmap = await _fetch_quotes_map(engine, direct_symbols, mode=mode or "", body=body or {})
 
         for sym in direct_symbols:
             q = qmap.get(sym) or {}
-            if not isinstance(q, dict) or not q:
-                continue
+            if not isinstance(q, dict):
+                q = {}
 
             roi = _extract_roi_from_any(q, horizon)
             conf = _get_confidence(q)
@@ -1258,7 +1477,8 @@ async def select_top10(
             row["source_page"] = source_map.get(sym, pages[0] if pages else "Market_Leaders")
 
             if roi is None:
-                continue
+                roi = 0.0
+                row.setdefault("warnings", "direct_symbol_relaxed_without_roi")
 
             candidates.append(
                 Candidate(
@@ -1277,6 +1497,14 @@ async def select_top10(
         if relaxed_count > 0:
             warnings.append(f"used_direct_symbol_relaxed_fallback:{relaxed_count}")
 
+    if not candidates and universe_dedup:
+        placeholder_count = 0
+        for sym, page in universe_dedup[: max(1, int(criteria.top_n or 10))]:
+            candidates.append(_make_placeholder_candidate(sym, page, qmap.get(sym)))
+            placeholder_count += 1
+        if placeholder_count > 0:
+            warnings.append(f"used_placeholder_symbol_fallback:{placeholder_count}")
+
     best: Dict[str, Candidate] = {}
     for c in candidates:
         prev = best.get(c.symbol)
@@ -1292,7 +1520,7 @@ async def select_top10(
     enrich_map: Dict[str, Dict[str, Any]] = {}
     if criteria.enrich_final and top:
         try:
-            enrich_map = await _enrich_top(engine, [c.symbol for c in top], mode=mode or "")
+            enrich_map = await _enrich_top(engine, [c.symbol for c in top], mode=mode or "", body=body or {})
         except Exception as e:
             warnings.append(f"enrich_failed:{e}")
             enrich_map = {}
@@ -1314,7 +1542,9 @@ async def select_top10(
         "pages_selected": pages,
         "direct_symbols_count": len(direct_symbols or []),
         "universe_symbols": len(symbols),
-        "quotes_returned": len(qmap),
+        "quotes_returned": len([s for s, q in qmap.items() if isinstance(q, dict) and q]),
+        "quote_candidates_unfiltered": len(quote_candidates_unfiltered),
+        "row_candidates_unfiltered": len(row_candidates_unfiltered),
         "candidates": len(candidates),
         "deduped": len(deduped),
         "returned": len(top),
@@ -1328,6 +1558,7 @@ async def select_top10(
             "enforce_risk_confidence": criteria.enforce_risk_confidence,
         },
         "warnings": warnings,
+        "fallback_trace": fallback_trace,
         "timestamp_utc": _now_utc_iso(),
         "timestamp_riyadh": _now_riyadh_iso(),
         "duration_ms": round((time.time() - t0) * 1000.0, 3),
@@ -1578,10 +1809,8 @@ def _build_selection_reason(raw: Dict[str, Any], *, roi_key: str, criteria: Crit
 
 
 def _mirror_runtime_aliases(raw: Dict[str, Any], *, rank: int, criteria: Criteria, horizon: str, mode: str) -> None:
-    roi_key = horizon_to_roi_key(horizon)
-
     raw.setdefault("top10_rank", rank)
-    raw.setdefault("selection_reason", _build_selection_reason(raw, roi_key=roi_key, criteria=criteria))
+    raw.setdefault("selection_reason", _build_selection_reason(raw, roi_key=horizon_to_roi_key(horizon), criteria=criteria))
     raw.setdefault("criteria_snapshot", _json_dumps_safe(_build_criteria_snapshot(criteria, mode=mode)))
 
     if raw.get("Top10 Rank") is None:
@@ -1641,9 +1870,14 @@ def _schema_contains(keys: Sequence[str], needle: str) -> bool:
 
 
 # =============================================================================
-# Top10 output builder
+# Top10 output builder (internal)
 # =============================================================================
-def build_top10_output_rows(candidates: List[Candidate], *, criteria: Criteria, mode: str = "") -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+def _build_top10_output_rows_internal(
+    candidates: List[Candidate],
+    *,
+    criteria: Criteria,
+    mode: str = "",
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     display_headers, keys, pct_keys, schema_source, injected_fields = _get_top10_schema()
     horizon = criteria.horizon()
     roi_key = horizon_to_roi_key(horizon)
@@ -1718,11 +1952,28 @@ async def select_top10_symbols(
     limit: int = 10,
     mode: str = "",
 ) -> List[str]:
+    request_payload = _request_to_payload(request)
+    settings_payload = _settings_to_payload(settings)
+
     engine = engine or _resolve_engine_from_request(request)
-    crit = _merge_criteria_sources(engine=engine, criteria=criteria, body=body, limit=limit)
-    mode2 = _extract_route_mode(mode, body)
-    direct_symbols = _extract_direct_symbols(body)
-    top, _meta = await select_top10(engine=engine, criteria=crit, mode=mode2, direct_symbols=direct_symbols)
+    crit = _merge_criteria_sources(
+        engine=engine,
+        criteria=criteria,
+        body=body,
+        settings=settings_payload,
+        request_payload=request_payload,
+        limit=limit,
+    )
+    mode2 = _extract_route_mode(mode, body, settings_payload, request_payload)
+    direct_symbols = _extract_direct_symbols_from_sources(body, settings_payload, request_payload)
+
+    top, _meta = await select_top10(
+        engine=engine,
+        criteria=crit,
+        mode=mode2,
+        direct_symbols=direct_symbols,
+        body=body or request_payload,
+    )
     return [c.symbol for c in top]
 
 
@@ -1736,18 +1987,29 @@ async def build_top10_rows(
     limit: int = 10,
     mode: str = "",
 ) -> Dict[str, Any]:
+    request_payload = _request_to_payload(request)
+    settings_payload = _settings_to_payload(settings)
+
     engine = engine or _resolve_engine_from_request(request)
-    crit = _merge_criteria_sources(engine=engine, criteria=criteria, body=body, limit=limit)
-    mode2 = _extract_route_mode(mode, body)
-    direct_symbols = _extract_direct_symbols(body)
+    crit = _merge_criteria_sources(
+        engine=engine,
+        criteria=criteria,
+        body=body,
+        settings=settings_payload,
+        request_payload=request_payload,
+        limit=limit,
+    )
+    mode2 = _extract_route_mode(mode, body, settings_payload, request_payload)
+    direct_symbols = _extract_direct_symbols_from_sources(body, settings_payload, request_payload)
 
     top, meta_sel = await select_top10(
         engine=engine,
         criteria=crit,
         mode=mode2,
         direct_symbols=direct_symbols,
+        body=body or request_payload,
     )
-    rows, meta_rows = build_top10_output_rows(top, criteria=crit, mode=mode2)
+    rows, meta_rows = _build_top10_output_rows_internal(top, criteria=crit, mode=mode2)
     display_headers, keys, _pct_keys, _schema_source, _injected = _get_top10_schema()
 
     status_out = "success" if rows else "warn"
@@ -1760,6 +2022,7 @@ async def build_top10_rows(
     return {
         "status": status_out,
         "page": TOP10_PAGE_NAME,
+        "sheet": TOP10_PAGE_NAME,
         "headers": list(keys),
         "keys": list(keys),
         "display_headers": list(display_headers),
@@ -1768,6 +2031,8 @@ async def build_top10_rows(
         "header_map": [{"key": k, "header": h} for k, h in zip(keys, display_headers)],
         "rows": rows,
         "rows_matrix": _rows_to_matrix(keys, rows),
+        "count": len(rows),
+        "dispatch": "top10_selector",
         "meta": {
             **(meta_sel or {}),
             **(meta_rows or {}),
@@ -1787,6 +2052,7 @@ async def build_top10_rows(
             "warnings": warnings,
             "engine_present": engine is not None,
             "request_present": request is not None,
+            "settings_present": settings is not None,
             "response_contract": {
                 "headers_are_keys": True,
                 "display_headers_present": True,
@@ -1796,6 +2062,32 @@ async def build_top10_rows(
             },
         },
     }
+
+
+async def build_top10_output_rows(
+    *,
+    engine: Any = None,
+    request: Any = None,
+    settings: Any = None,
+    criteria: Optional[Dict[str, Any]] = None,
+    body: Optional[Dict[str, Any]] = None,
+    limit: int = 10,
+    mode: str = "",
+) -> Dict[str, Any]:
+    """
+    Route-compatible public alias.
+    Historically this name appeared in dispatcher call chains, so it must accept
+    the same flexible keyword signature as build_top10_rows(...).
+    """
+    return await build_top10_rows(
+        engine=engine,
+        request=request,
+        settings=settings,
+        criteria=criteria,
+        body=body,
+        limit=limit,
+        mode=mode,
+    )
 
 
 async def build_rows(
@@ -1814,7 +2106,7 @@ async def build_rows(
         settings=settings,
         body=body,
         criteria=criteria,
-        limit=_resolve_limit(limit, criteria, body),
+        limit=_resolve_limit(limit, criteria, body, settings=_settings_to_payload(settings), request_payload=_request_to_payload(request)),
         mode=mode,
     )
     rows = payload.get("rows")
