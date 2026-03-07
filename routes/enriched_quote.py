@@ -2,19 +2,22 @@
 # routes/enriched_quote.py
 """
 ================================================================================
-TFB Enriched Quote Routes Wrapper — v6.0.0
+TFB Enriched Quote Routes Wrapper — v6.1.0
 ================================================================================
 RENDER-SAFE • SCHEMA-AWARE • PAGE-DISPATCH SAFE • HEADER/ROW BALANCED
+SPECIAL-BUILDER PRESERVING • ASYNC-SAFE • NULL-ROW AVOIDANCE
 
 Why this revision
 -----------------
-- ✅ FIX: Stops treating most pages as schema-only unless that is explicitly intended
-- ✅ FIX: Uses page_catalog route-family classification so special pages dispatch correctly
-- ✅ FIX: Returns populated rows for instrument pages when symbols exist
-- ✅ FIX: Delegates special pages to local builders instead of generic quote fallback
-- ✅ FIX: Keeps /quotes, /quote, /v1/enriched/quote, /v1/enriched/sheet-rows compatible
+- ✅ FIX: Properly awaits async special builders (Top10 / Insights)
+- ✅ FIX: Preserves payload-style builder output instead of collapsing it into
+  a schema-aligned null row
+- ✅ FIX: Prevents Top_10_Investments from returning a fake one-row null payload
+- ✅ FIX: Uses builder-supplied headers/keys/rows/rows_matrix when available
+- ✅ FIX: Keeps instrument pages engine-backed and schema-aligned
 - ✅ FIX: Keeps Data_Dictionary local and stable
-- ✅ FIX: Prevents Top_10_Investments / Insights_Analysis from silently hitting wrong fallback
+- ✅ FIX: More defensive argument calling for builder compatibility
+- ✅ FIX: Better runtime meta for debugging route dispatch
 - ✅ SAFE: No network I/O at import-time
 - ✅ SAFE: No Prometheus metric creation here
 
@@ -37,6 +40,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import logging
 import time
 import uuid
@@ -46,7 +50,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 
 logger = logging.getLogger("routes.enriched_quote")
 
-ROUTER_VERSION = "6.0.0"
+ROUTER_VERSION = "6.1.0"
 
 # Kept lazy for dynamic mount behavior
 router: Optional[APIRouter] = None
@@ -92,7 +96,6 @@ def _get_list(body: Mapping[str, Any], *keys: str) -> List[str]:
                     out.append(s)
             return out
         if isinstance(v, str) and v.strip():
-            # tolerate comma-separated strings
             parts = [p.strip() for p in v.split(",") if p.strip()]
             if parts:
                 return parts
@@ -104,7 +107,11 @@ def _get_bool(body: Mapping[str, Any], key: str, default: bool) -> bool:
     if isinstance(v, bool):
         return v
     if isinstance(v, str):
-        return v.strip().lower() in {"1", "true", "yes", "y", "on"}
+        s = v.strip().lower()
+        if s in {"1", "true", "yes", "y", "on"}:
+            return True
+        if s in {"0", "false", "no", "n", "off"}:
+            return False
     return default
 
 
@@ -148,7 +155,7 @@ def _model_to_dict(obj: Any) -> Dict[str, Any]:
     if obj is None:
         return {}
     if isinstance(obj, dict):
-        return obj
+        return dict(obj)
 
     try:
         if hasattr(obj, "model_dump"):
@@ -174,6 +181,12 @@ def _model_to_dict(obj: Any) -> Dict[str, Any]:
     return {}
 
 
+async def _maybe_await(v: Any) -> Any:
+    if inspect.isawaitable(v):
+        return await v
+    return v
+
+
 def _normalize_item_to_row(item: Any, keys: Sequence[str]) -> Dict[str, Any]:
     if isinstance(item, Mapping):
         return {k: item.get(k) for k in keys}
@@ -190,6 +203,17 @@ def _normalize_item_to_row(item: Any, keys: Sequence[str]) -> Dict[str, Any]:
     if keys:
         out[keys[0]] = item
     return out
+
+
+def _dict_or_empty(v: Any) -> Dict[str, Any]:
+    return v if isinstance(v, dict) else {}
+
+
+def _first_list(*vals: Any) -> List[Any]:
+    for v in vals:
+        if isinstance(v, list):
+            return v
+    return []
 
 
 # =============================================================================
@@ -363,67 +387,308 @@ class _Service:
         return out
 
     # -----------------------------------------------------------------
-    # Local builders for special pages
+    # Flexible builder calling
     # -----------------------------------------------------------------
-    def build_dictionary_page_rows(self, keys: Sequence[str]) -> List[Dict[str, Any]]:
-        if not callable(self.build_data_dictionary_rows):
-            return []
+    async def _call_builder_flexible(
+        self,
+        builder: Any,
+        *,
+        request: Request,
+        engine: Any,
+        body: Mapping[str, Any],
+        limit: int,
+        mode: str,
+    ) -> Any:
+        if not callable(builder):
+            return None
 
+        settings = None
         try:
-            rows_raw = self.build_data_dictionary_rows(include_meta_sheet=True)
-        except TypeError:
-            rows_raw = self.build_data_dictionary_rows()
+            settings = self._get_settings_cached()
         except Exception:
-            return []
+            settings = None
 
-        out: List[Dict[str, Any]] = []
-        for rr in _as_list(rows_raw):
-            row_map = rr if isinstance(rr, Mapping) else _model_to_dict(rr)
-            out.append(self.normalize_row(keys, row_map))
-        return out
+        criteria = body.get("criteria") if isinstance(body.get("criteria"), dict) else None
 
-    def build_insights_page_rows(self, keys: Sequence[str], body: Mapping[str, Any]) -> List[Dict[str, Any]]:
-        if not callable(self.build_insights_rows):
-            return []
+        attempts: List[Dict[str, Any]] = [
+            {
+                "engine": engine,
+                "request": request,
+                "settings": settings,
+                "body": dict(body),
+                "criteria": criteria,
+                "limit": limit,
+                "mode": mode,
+            },
+            {
+                "request": request,
+                "settings": settings,
+                "body": dict(body),
+                "criteria": criteria,
+                "limit": limit,
+                "mode": mode,
+            },
+            {
+                "engine": engine,
+                "body": dict(body),
+                "criteria": criteria,
+                "limit": limit,
+                "mode": mode,
+            },
+            {
+                "body": dict(body),
+                "criteria": criteria,
+                "limit": limit,
+                "mode": mode,
+            },
+            {
+                "payload": dict(body),
+                "limit": limit,
+                "mode": mode,
+            },
+            {
+                "data": dict(body),
+                "limit": limit,
+                "mode": mode,
+            },
+            {},
+        ]
 
-        try:
-            # flexible call style
+        last_exc: Optional[Exception] = None
+
+        for kwargs in attempts:
             try:
-                rows_raw = self.build_insights_rows(body=body)
-            except TypeError:
-                try:
-                    rows_raw = self.build_insights_rows(payload=body)
-                except TypeError:
-                    rows_raw = self.build_insights_rows()
-        except Exception:
-            return []
+                result = builder(**kwargs)
+                return await _maybe_await(result)
+            except TypeError as e:
+                last_exc = e
+                continue
+            except Exception as e:
+                last_exc = e
+                break
 
-        out: List[Dict[str, Any]] = []
+        if last_exc:
+            raise last_exc
+        return None
+
+    def _normalize_rows_from_any(self, rows_raw: Any, keys: Sequence[str]) -> List[Dict[str, Any]]:
+        rows_out: List[Dict[str, Any]] = []
         for item in _as_list(rows_raw):
             row_map = item if isinstance(item, Mapping) else _model_to_dict(item)
-            out.append(self.normalize_row(keys, row_map))
-        return out
+            if row_map:
+                rows_out.append(self.normalize_row(keys, row_map))
+            else:
+                rows_out.append(_normalize_item_to_row(item, keys))
+        return rows_out
 
-    def build_top10_page_rows(self, keys: Sequence[str], body: Mapping[str, Any]) -> List[Dict[str, Any]]:
-        if not callable(self.build_top10_rows):
-            return []
+    async def build_dictionary_page_payload(
+        self,
+        *,
+        page_norm: str,
+        headers: Sequence[str],
+        keys: Sequence[str],
+        include_headers: bool,
+        include_matrix: bool,
+        request_id: str,
+        started_at: float,
+        mode: str,
+    ) -> Dict[str, Any]:
+        rows_out: List[Dict[str, Any]] = []
+
+        if callable(self.build_data_dictionary_rows):
+            try:
+                try:
+                    rows_raw = self.build_data_dictionary_rows(include_meta_sheet=False)
+                except TypeError:
+                    rows_raw = self.build_data_dictionary_rows()
+                rows_out = self._normalize_rows_from_any(rows_raw, keys)
+            except Exception as e:
+                logger.warning("Data dictionary builder failed: %s", e)
+                rows_out = []
+
+        return {
+            "status": "success",
+            "page": page_norm,
+            "route_family": "dictionary",
+            "headers": list(headers) if include_headers else [],
+            "keys": list(keys),
+            "rows": rows_out,
+            "rows_matrix": _rows_matrix(rows_out, keys) if include_matrix else None,
+            "quotes": rows_out,
+            "data": rows_out,
+            "version": ROUTER_VERSION,
+            "request_id": request_id,
+            "meta": {
+                "duration_ms": (time.time() - started_at) * 1000.0,
+                "count": len(rows_out),
+                "dispatch": "data_dictionary",
+                "mode": mode,
+            },
+        }
+
+    async def build_special_builder_payload(
+        self,
+        *,
+        builder: Any,
+        dispatch_name: str,
+        route_family: str,
+        request: Request,
+        engine: Any,
+        page_norm: str,
+        headers: Sequence[str],
+        keys: Sequence[str],
+        body: Mapping[str, Any],
+        limit: int,
+        include_headers: bool,
+        include_matrix: bool,
+        request_id: str,
+        started_at: float,
+        mode: str,
+    ) -> Dict[str, Any]:
+        if not callable(builder):
+            return {
+                "status": "success",
+                "page": page_norm,
+                "route_family": route_family,
+                "headers": list(headers) if include_headers else [],
+                "keys": list(keys),
+                "rows": [],
+                "rows_matrix": [] if include_matrix else None,
+                "quotes": [],
+                "data": [],
+                "version": ROUTER_VERSION,
+                "request_id": request_id,
+                "meta": {
+                    "duration_ms": (time.time() - started_at) * 1000.0,
+                    "count": 0,
+                    "dispatch": dispatch_name,
+                    "mode": mode,
+                    "warning": f"{dispatch_name}_builder_unavailable",
+                },
+            }
 
         try:
-            try:
-                rows_raw = self.build_top10_rows(body=body)
-            except TypeError:
-                try:
-                    rows_raw = self.build_top10_rows(payload=body)
-                except TypeError:
-                    rows_raw = self.build_top10_rows()
-        except Exception:
-            return []
+            result = await self._call_builder_flexible(
+                builder,
+                request=request,
+                engine=engine,
+                body=body,
+                limit=limit,
+                mode=mode,
+            )
+        except Exception as e:
+            logger.warning("%s builder failed: %s", dispatch_name, e)
+            return {
+                "status": "partial",
+                "page": page_norm,
+                "route_family": route_family,
+                "headers": list(headers) if include_headers else [],
+                "keys": list(keys),
+                "rows": [],
+                "rows_matrix": [] if include_matrix else None,
+                "quotes": [],
+                "data": [],
+                "error": f"{type(e).__name__}: {e}",
+                "version": ROUTER_VERSION,
+                "request_id": request_id,
+                "meta": {
+                    "duration_ms": (time.time() - started_at) * 1000.0,
+                    "count": 0,
+                    "dispatch": dispatch_name,
+                    "mode": mode,
+                    "warning": f"{dispatch_name}_builder_failed",
+                },
+            }
 
-        out: List[Dict[str, Any]] = []
-        for item in _as_list(rows_raw):
-            row_map = item if isinstance(item, Mapping) else _model_to_dict(item)
-            out.append(self.normalize_row(keys, row_map))
-        return out
+        # ---------------- Payload-style result ----------------
+        if isinstance(result, dict):
+            result_headers = _first_list(
+                result.get("headers"),
+                result.get("display_headers"),
+                result.get("sheet_headers"),
+                result.get("column_headers"),
+            )
+            result_keys = _first_list(result.get("keys"))
+            keys_out = [str(k) for k in (result_keys or list(keys)) if _strip(k)]
+            headers_out = [str(h) for h in (result_headers or list(headers)) if _strip(h)]
+
+            if not keys_out:
+                keys_out = list(keys)
+
+            rows_raw = result.get("rows")
+            rows_matrix_raw = result.get("rows_matrix")
+
+            if rows_raw is None:
+                data_candidate = result.get("data")
+                if isinstance(data_candidate, list):
+                    rows_raw = data_candidate
+                elif isinstance(result.get("quotes"), list):
+                    rows_raw = result.get("quotes")
+                else:
+                    rows_raw = []
+
+            rows_out: List[Dict[str, Any]] = []
+
+            if isinstance(rows_raw, list) and rows_raw:
+                rows_out = self._normalize_rows_from_any(rows_raw, keys_out)
+            elif isinstance(rows_matrix_raw, list) and rows_matrix_raw:
+                for item in rows_matrix_raw:
+                    rows_out.append(_normalize_item_to_row(item, keys_out))
+
+            rows_matrix_out = rows_matrix_raw if (include_matrix and isinstance(rows_matrix_raw, list)) else None
+            if include_matrix and rows_matrix_out is None:
+                rows_matrix_out = _rows_matrix(rows_out, keys_out)
+
+            status_out = _strip(result.get("status")) or "success"
+            meta_in = _dict_or_empty(result.get("meta"))
+            error_out = result.get("error")
+
+            return {
+                "status": status_out,
+                "page": _strip(result.get("page")) or page_norm,
+                "route_family": _strip(result.get("route_family")) or route_family,
+                "headers": headers_out if include_headers else [],
+                "keys": keys_out,
+                "rows": rows_out,
+                "rows_matrix": rows_matrix_out if include_matrix else None,
+                "quotes": rows_out,
+                "data": rows_out,
+                "error": error_out,
+                "version": ROUTER_VERSION,
+                "request_id": request_id,
+                "meta": {
+                    **meta_in,
+                    "duration_ms": (time.time() - started_at) * 1000.0,
+                    "count": len(rows_out),
+                    "dispatch": dispatch_name,
+                    "mode": mode,
+                    "builder_payload_preserved": True,
+                },
+            }
+
+        # ---------------- List-style result ----------------
+        rows_out = self._normalize_rows_from_any(result, keys)
+
+        return {
+            "status": "success",
+            "page": page_norm,
+            "route_family": route_family,
+            "headers": list(headers) if include_headers else [],
+            "keys": list(keys),
+            "rows": rows_out,
+            "rows_matrix": _rows_matrix(rows_out, keys) if include_matrix else None,
+            "quotes": rows_out,
+            "data": rows_out,
+            "version": ROUTER_VERSION,
+            "request_id": request_id,
+            "meta": {
+                "duration_ms": (time.time() - started_at) * 1000.0,
+                "count": len(rows_out),
+                "dispatch": dispatch_name,
+                "mode": mode,
+                "builder_payload_preserved": False,
+            },
+        }
 
 
 # =============================================================================
@@ -491,7 +756,12 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             batch_fn = getattr(engine, "get_enriched_quotes_batch", None) or getattr(engine, "get_quotes_batch", None)
 
             if callable(batch_fn):
-                got = await batch_fn(symbols, mode=mode_q or "", schema=list(keys) if keys else None)
+                try:
+                    got = batch_fn(symbols, mode=mode_q or "", schema=list(keys) if keys else None)
+                    got = await _maybe_await(got)
+                except TypeError:
+                    got = batch_fn(symbols)
+                    got = await _maybe_await(got)
 
                 if isinstance(got, dict):
                     quotes_map = {
@@ -512,10 +782,18 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             else:
                 one_fn = getattr(engine, "get_enriched_quote_dict", None)
                 if callable(one_fn):
-                    results = await asyncio.gather(
-                        *[one_fn(s, schema=list(keys) if keys else None) for s in symbols],
-                        return_exceptions=True,
-                    )
+                    async def _one(sym: str) -> Any:
+                        try:
+                            try:
+                                res = one_fn(sym, schema=list(keys) if keys else None)
+                            except TypeError:
+                                res = one_fn(sym)
+                            return await _maybe_await(res)
+                        except Exception as e:
+                            return e
+
+                    results = await asyncio.gather(*[_one(s) for s in symbols], return_exceptions=False)
+
                     for s, item in zip(symbols, results):
                         if isinstance(item, dict):
                             quotes_map[s] = item
@@ -539,25 +817,6 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             rows_out.append(svc.normalize_row(keys, raw, symbol_fallback=s))
 
         return rows_out, errors
-
-    # -------------------------------------------------------------------------
-    # Special rows
-    # -------------------------------------------------------------------------
-    async def _build_special_rows(page_norm: str, keys: Sequence[str], body: Mapping[str, Any]) -> Tuple[List[Dict[str, Any]], str]:
-        family = svc.route_family(page_norm)
-
-        if family == "dictionary":
-            return svc.build_dictionary_page_rows(keys), "data_dictionary"
-
-        if family == "insights":
-            rows = svc.build_insights_page_rows(keys, body)
-            return rows, "insights_builder"
-
-        if family == "top10":
-            rows = svc.build_top10_page_rows(keys, body)
-            return rows, "top10_selector"
-
-        return [], "unknown"
 
     # -------------------------------------------------------------------------
     # Main handlers
@@ -592,9 +851,11 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         route_family = svc.route_family(page_norm)
 
         if route_family != "instrument":
-            # For special pages, single quote does not make business sense.
-            # Return schema-aware row with explicit warning instead of generic fallback.
-            row = svc.normalize_row(keys or ["symbol", "error"], {"symbol": symbol, "error": f"single_quote_not_supported_for_{route_family}_page"}, symbol_fallback=symbol)
+            row = svc.normalize_row(
+                keys or ["symbol", "error"],
+                {"symbol": symbol, "error": f"single_quote_not_supported_for_{route_family}_page"},
+                symbol_fallback=symbol,
+            )
             return {
                 "status": "partial",
                 "page": page_norm,
@@ -614,7 +875,11 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             }
 
         rows_out, errors = await _build_instrument_rows(page_norm, keys or ["symbol", "error"], [symbol], mode_q)
-        row = rows_out[0] if rows_out else svc.normalize_row(keys or ["symbol", "error"], {"symbol": symbol, "error": "missing_row"}, symbol_fallback=symbol)
+        row = rows_out[0] if rows_out else svc.normalize_row(
+            keys or ["symbol", "error"],
+            {"symbol": symbol, "error": "missing_row"},
+            symbol_fallback=symbol,
+        )
         status_out = "success" if errors == 0 and not row.get("error") else "partial"
 
         return {
@@ -679,29 +944,77 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
 
         # ---------- special pages ----------
         if route_family != "instrument":
-            rows_out, dispatch = await _build_special_rows(page_norm, schema_keys, body)
-            status_out = "success" if rows_out else "success"
+            engine = await svc.get_engine()
 
-            response: Dict[str, Any] = {
-                "status": status_out,
+            if route_family == "dictionary":
+                return await svc.build_dictionary_page_payload(
+                    page_norm=page_norm,
+                    headers=headers,
+                    keys=schema_keys,
+                    include_headers=include_headers,
+                    include_matrix=include_matrix,
+                    request_id=request_id,
+                    started_at=start,
+                    mode=mode_q,
+                )
+
+            if route_family == "insights":
+                return await svc.build_special_builder_payload(
+                    builder=svc.build_insights_rows,
+                    dispatch_name="insights_builder",
+                    route_family=route_family,
+                    request=request,
+                    engine=engine,
+                    page_norm=page_norm,
+                    headers=headers,
+                    keys=schema_keys,
+                    body=body,
+                    limit=top_n,
+                    include_headers=include_headers,
+                    include_matrix=include_matrix,
+                    request_id=request_id,
+                    started_at=start,
+                    mode=mode_q,
+                )
+
+            if route_family == "top10":
+                return await svc.build_special_builder_payload(
+                    builder=svc.build_top10_rows,
+                    dispatch_name="top10_selector",
+                    route_family=route_family,
+                    request=request,
+                    engine=engine,
+                    page_norm=page_norm,
+                    headers=headers,
+                    keys=schema_keys,
+                    body=body,
+                    limit=top_n,
+                    include_headers=include_headers,
+                    include_matrix=include_matrix,
+                    request_id=request_id,
+                    started_at=start,
+                    mode=mode_q,
+                )
+
+            return {
+                "status": "success",
                 "page": page_norm,
                 "route_family": route_family,
                 "headers": headers if include_headers else [],
                 "keys": schema_keys,
-                "rows": rows_out,
-                "rows_matrix": _rows_matrix(rows_out, schema_keys) if include_matrix else None,
-                "quotes": rows_out,
-                "data": rows_out,
+                "rows": [],
+                "rows_matrix": [] if include_matrix else None,
+                "quotes": [],
+                "data": [],
                 "version": ROUTER_VERSION,
                 "request_id": request_id,
                 "meta": {
                     "duration_ms": (time.time() - start) * 1000.0,
-                    "count": len(rows_out),
-                    "dispatch": dispatch,
+                    "count": 0,
+                    "dispatch": "special_unknown",
                     "mode": mode_q,
                 },
             }
-            return response
 
         # ---------- instrument pages ----------
         if not symbols:
