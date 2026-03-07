@@ -2,10 +2,10 @@
 # routes/advanced_sheet_rows.py
 """
 ================================================================================
-Advanced Sheet-Rows Router — v2.1.0
+Advanced Sheet-Rows Router — v2.2.0
 ================================================================================
 SCHEMA-FIRST • CANONICAL PAGE DISPATCH • ANALYSIS-ALIGNED • SPECIAL-PAGE SAFE
-PATH-AWARE AUTH • STABLE RESPONSE SHAPE • POWERHELL/LIVE-TEST FRIENDLY
+PATH-AWARE AUTH • PUBLIC-PATH AWARE • STABLE RESPONSE SHAPE • LIVE-TEST READY
 
 Endpoints
 ---------
@@ -14,27 +14,25 @@ POST /v1/advanced/sheet-rows
 
 Primary role
 ------------
-Advanced sheet-rows behavior aligned with routes/analysis_sheet_rows.py so that:
+Advanced sheet-rows behavior aligned with the rest of the TFB stack so that:
 - page normalization is identical
 - schema headers/keys are always authoritative
 - special pages never fall back to the generic 80-column instrument schema
-- instrument pages use engine-backed row retrieval when symbols are provided
+- instrument pages use engine-backed retrieval consistently
 - table/special page behavior stays deterministic and stable
 
 What this revision improves
 ---------------------------
-- ✅ FIX: Passes request/path/settings into core.config.auth_ok (path-aware auth)
-- ✅ FIX: Honors public-path config without forcing OPEN_MODE=true
-- ✅ FIX: Adds lightweight /health endpoint for live checks
-- ✅ FIX: More tolerant payload parsing from shared helpers:
-    - rows
-    - rows_matrix
-    - data
-    - items
-    - records
-- ✅ FIX: Better header/key fallback normalization
-- ✅ FIX: Stable response shape for all page families
-- ✅ FIX: Explicit include_matrix query/body handling
+- ✅ FIX: Path-aware auth with public-path bypass support
+- ✅ FIX: Accepts X-APP-TOKEN, X-API-Key, Bearer auth, optional query token
+- ✅ FIX: Stronger builder payload parsing:
+      rows / rows_matrix / data / items / records / nested data
+- ✅ FIX: Stronger engine sheet-rows fallback:
+      engine.get_sheet_rows / sheet_rows / build_sheet_rows first,
+      then optional core.data_engine.get_sheet_rows
+- ✅ FIX: Better top10 / insights builder handling when payload is dict-shaped
+- ✅ FIX: More stable metadata and response diagnostics
+- ✅ FIX: Better symbol parsing + dedupe + top_n enforcement
 - ✅ SAFE: No network I/O at import time
 - ✅ SAFE: Optional auth only if core.config.auth_ok exists
 
@@ -78,7 +76,7 @@ import os
 import time
 import uuid
 from dataclasses import is_dataclass
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, status
 
@@ -127,6 +125,7 @@ except Exception:  # pragma: no cover
     def is_instrument_page(name: str) -> bool:  # type: ignore
         return get_route_family(name) == "instrument"
 
+
 # -----------------------------------------------------------------------------
 # Optional auth/config
 # -----------------------------------------------------------------------------
@@ -139,15 +138,17 @@ except Exception:  # pragma: no cover
     def get_settings_cached(*args, **kwargs):  # type: ignore
         return None
 
+
 # -----------------------------------------------------------------------------
-# Optional shared table-mode helper
+# Optional legacy shared helper
 # -----------------------------------------------------------------------------
 try:
     from core.data_engine import get_sheet_rows as core_get_sheet_rows  # type: ignore
 except Exception:  # pragma: no cover
     core_get_sheet_rows = None  # type: ignore
 
-ADVANCED_SHEET_ROWS_VERSION = "2.1.0"
+
+ADVANCED_SHEET_ROWS_VERSION = "2.2.0"
 router = APIRouter(prefix="/v1/advanced", tags=["Advanced Sheet Rows"])
 
 
@@ -172,12 +173,25 @@ def _as_list(v: Any) -> List[Any]:
         return list(v)
     if isinstance(v, str):
         return [v]
+    if isinstance(v, dict):
+        return [v]
     if isinstance(v, Iterable):
         try:
             return list(v)
         except Exception:
             return [v]
     return [v]
+
+
+def _dedupe_keep_order(items: Sequence[str]) -> List[str]:
+    out: List[str] = []
+    seen: Set[str] = set()
+    for item in items:
+        s = _strip(item)
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
 
 
 def _pick_page_from_body(body: Mapping[str, Any]) -> str:
@@ -207,7 +221,7 @@ def _maybe_int(v: Any, default: int) -> int:
 def _maybe_bool(v: Any, default: bool) -> bool:
     if isinstance(v, bool):
         return v
-    if isinstance(v, (int, float)):
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
         try:
             return bool(int(v))
         except Exception:
@@ -226,9 +240,10 @@ def _get_list(body: Mapping[str, Any], *keys: str) -> List[str]:
                 s = _strip(item)
                 if s:
                     out.append(s)
-            return out
+            if out:
+                return out
         if isinstance(v, str) and v.strip():
-            parts = [p.strip() for p in v.split(",") if p.strip()]
+            parts = [p.strip() for p in v.replace(";", ",").replace("|", ",").split(",") if p.strip()]
             if parts:
                 return parts
     return []
@@ -281,83 +296,6 @@ async def _maybe_await(x: Any) -> Any:
     return x
 
 
-def _allow_query_token(settings: Any, request: Request) -> bool:
-    try:
-        if settings is not None:
-            return bool(
-                getattr(settings, "ALLOW_QUERY_TOKEN", False)
-                or getattr(settings, "allow_query_token", False)
-            )
-    except Exception:
-        pass
-
-    v = (os.getenv("ALLOW_QUERY_TOKEN", "") or "").strip().lower()
-    if v in {"1", "true", "yes", "y", "on"}:
-        return True
-
-    try:
-        hv = _strip(request.headers.get("X-Allow-Query-Token"))
-        if hv.lower() in {"1", "true", "yes"}:
-            return True
-    except Exception:
-        pass
-
-    return False
-
-
-def _extract_auth_token(
-    *,
-    token_query: Optional[str],
-    x_app_token: Optional[str],
-    authorization: Optional[str],
-    settings: Any,
-    request: Request,
-) -> str:
-    auth_token = _strip(x_app_token)
-
-    if authorization and authorization.strip().lower().startswith("bearer "):
-        auth_token = authorization.strip().split(" ", 1)[1].strip()
-
-    if token_query and not auth_token and _allow_query_token(settings, request):
-        auth_token = _strip(token_query)
-
-    return auth_token
-
-
-def _ensure_page_allowed(page: str) -> None:
-    forbidden = set(FORBIDDEN_PAGES or set())
-    if page in forbidden:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"error": f"Forbidden/removed page: {page}", "forbidden_pages": sorted(list(forbidden))},
-        )
-
-    try:
-        ap = allowed_pages()
-        if ap and page not in set(ap):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={"error": f"Unknown page: {page}", "allowed_pages": ap},
-            )
-    except HTTPException:
-        raise
-    except Exception:
-        return
-
-
-def _schema_headers_keys(page: str) -> Tuple[List[str], List[str], Any]:
-    if get_sheet_spec is None:
-        raise KeyError("schema_registry unavailable")
-
-    spec = get_sheet_spec(page)
-    cols = getattr(spec, "columns", None) or []
-
-    headers = [str(getattr(c, "header", "")) for c in cols if getattr(c, "header", None)]
-    keys = [str(getattr(c, "key", "")) for c in cols if getattr(c, "key", None)]
-
-    return headers, keys, spec
-
-
 def _slice(rows: List[Dict[str, Any]], *, limit: int, offset: int) -> List[Dict[str, Any]]:
     start = max(0, int(offset))
     if limit <= 0:
@@ -368,6 +306,26 @@ def _slice(rows: List[Dict[str, Any]], *, limit: int, offset: int) -> List[Dict[
 
 def _rows_to_matrix(rows: Sequence[Mapping[str, Any]], keys: Sequence[str]) -> List[List[Any]]:
     return [[r.get(k) for k in keys] for r in rows]
+
+
+def _schema_headers_keys(page: str) -> Tuple[List[str], List[str], Any]:
+    if get_sheet_spec is None:
+        raise KeyError("schema_registry unavailable")
+
+    spec = get_sheet_spec(page)
+    cols = getattr(spec, "columns", None) or []
+
+    headers: List[str] = []
+    keys: List[str] = []
+    for c in cols:
+        h = _strip(getattr(c, "header", None))
+        k = _strip(getattr(c, "key", None))
+        if not h or not k:
+            continue
+        headers.append(h)
+        keys.append(k)
+
+    return headers, keys, spec
 
 
 def _normalize_to_schema_keys(
@@ -420,7 +378,7 @@ def _extract_rows_like(payload: Any) -> List[Dict[str, Any]]:
     - {"data": [...]}
     - {"items": [...]}
     - {"records": [...]}
-    - {"rows_matrix": [[...], ...]}  -> ignored here (needs keys)
+    - {"data": {"rows": [...]}}
     - [...]
     """
     if payload is None:
@@ -434,6 +392,10 @@ def _extract_rows_like(payload: Any) -> List[Dict[str, Any]]:
             value = payload.get(name)
             if isinstance(value, list):
                 return [_to_plain_dict(r) for r in value]
+            if isinstance(value, dict):
+                nested = _extract_rows_like(value)
+                if nested:
+                    return nested
 
     return []
 
@@ -443,6 +405,12 @@ def _extract_matrix_like(payload: Any) -> Optional[List[List[Any]]]:
         value = payload.get("rows_matrix")
         if isinstance(value, list):
             return [list(r) if isinstance(r, (list, tuple)) else [r] for r in value]
+
+        nested = payload.get("data")
+        if isinstance(nested, dict):
+            value2 = nested.get("rows_matrix")
+            if isinstance(value2, list):
+                return [list(r) if isinstance(r, (list, tuple)) else [r] for r in value2]
     return None
 
 
@@ -455,6 +423,204 @@ def _matrix_to_rows(matrix: Sequence[Sequence[Any]], keys: Sequence[str]) -> Lis
             item[k] = vals[idx] if idx < len(vals) else None
         rows.append(item)
     return rows
+
+
+# =============================================================================
+# Auth helpers
+# =============================================================================
+def _settings_get_bool(settings: Any, *names: str, default: bool = False) -> bool:
+    for name in names:
+        try:
+            if settings is not None and hasattr(settings, name):
+                return bool(getattr(settings, name))
+        except Exception:
+            continue
+    return default
+
+
+def _settings_get_list(settings: Any, *names: str) -> List[str]:
+    for name in names:
+        try:
+            if settings is None or not hasattr(settings, name):
+                continue
+            v = getattr(settings, name)
+            if isinstance(v, (list, tuple, set)):
+                return [_strip(x) for x in v if _strip(x)]
+            if isinstance(v, str) and v.strip():
+                return [x.strip() for x in v.split(",") if x.strip()]
+        except Exception:
+            continue
+    return []
+
+
+def _path_is_public(path: str, settings: Any) -> bool:
+    p = _strip(path)
+    if not p:
+        return False
+
+    public_paths = _settings_get_list(
+        settings,
+        "PUBLIC_PATHS",
+        "public_paths",
+        "AUTH_PUBLIC_PATHS",
+        "auth_public_paths",
+        "public_routes",
+    )
+
+    public_prefixes = _settings_get_list(
+        settings,
+        "PUBLIC_PATH_PREFIXES",
+        "public_path_prefixes",
+        "AUTH_PUBLIC_PREFIXES",
+        "auth_public_prefixes",
+    )
+
+    defaults = {
+        "/",
+        "/health",
+        "/livez",
+        "/readyz",
+        "/ping",
+        "/meta",
+        "/docs",
+        "/redoc",
+        "/openapi.json",
+        "/v1/advanced/health",
+    }
+
+    if p in defaults:
+        return True
+    if p in set(public_paths):
+        return True
+
+    for pref in public_prefixes:
+        if pref and p.startswith(pref):
+            return True
+
+    return False
+
+
+def _allow_query_token(settings: Any, request: Request) -> bool:
+    try:
+        if settings is not None:
+            return bool(
+                getattr(settings, "ALLOW_QUERY_TOKEN", False)
+                or getattr(settings, "allow_query_token", False)
+            )
+    except Exception:
+        pass
+
+    v = (os.getenv("ALLOW_QUERY_TOKEN", "") or "").strip().lower()
+    if v in {"1", "true", "yes", "y", "on"}:
+        return True
+
+    try:
+        hv = _strip(request.headers.get("X-Allow-Query-Token"))
+        if hv.lower() in {"1", "true", "yes"}:
+            return True
+    except Exception:
+        pass
+
+    return False
+
+
+def _extract_auth_token(
+    *,
+    token_query: Optional[str],
+    x_app_token: Optional[str],
+    x_api_key: Optional[str],
+    authorization: Optional[str],
+    settings: Any,
+    request: Request,
+) -> str:
+    auth_token = _strip(x_app_token) or _strip(x_api_key)
+
+    if authorization and authorization.strip().lower().startswith("bearer "):
+        auth_token = authorization.strip().split(" ", 1)[1].strip()
+
+    if token_query and not auth_token and _allow_query_token(settings, request):
+        auth_token = _strip(token_query)
+
+    return auth_token
+
+
+def _ensure_authorized(
+    *,
+    request: Request,
+    settings: Any,
+    token_query: Optional[str],
+    x_app_token: Optional[str],
+    x_api_key: Optional[str],
+    authorization: Optional[str],
+) -> None:
+    path = str(getattr(getattr(request, "url", None), "path", "") or "")
+
+    if _settings_get_bool(settings, "OPEN_MODE", "open_mode", default=False):
+        return
+
+    if _path_is_public(path, settings):
+        return
+
+    if auth_ok is None:
+        return
+
+    auth_token = _extract_auth_token(
+        token_query=token_query,
+        x_app_token=x_app_token,
+        x_api_key=x_api_key,
+        authorization=authorization,
+        settings=settings,
+        request=request,
+    )
+
+    try:
+        ok = auth_ok(
+            token=auth_token,
+            authorization=authorization,
+            headers=request.headers,
+            path=path,
+            request=request,
+            settings=settings,
+        )
+    except TypeError:
+        try:
+            ok = auth_ok(
+                token=auth_token,
+                authorization=authorization,
+                headers=request.headers,
+                path=path,
+            )
+        except TypeError:
+            ok = auth_ok(token=auth_token, authorization=authorization, headers=request.headers)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail={"error": "Auth check failed", "detail": str(e)},
+        )
+
+    if not ok:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+
+def _ensure_page_allowed(page: str) -> None:
+    forbidden = set(FORBIDDEN_PAGES or set())
+    if page in forbidden:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": f"Forbidden/removed page: {page}", "forbidden_pages": sorted(list(forbidden))},
+        )
+
+    try:
+        ap = allowed_pages()
+        if ap and page not in set(ap):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={"error": f"Unknown page: {page}", "allowed_pages": ap},
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        return
 
 
 # =============================================================================
@@ -499,7 +665,7 @@ def _dict_is_symbol_map(d: Dict[str, Any], symbols: Sequence[str]) -> bool:
     hit = sum(1 for k in keys if k in symset)
     if hit == len(symset) and len(symset) > 0:
         return True
-    if hit >= max(1, min(3, len(symset) // 3)):
+    if hit >= max(1, min(3, len(symset) // 3 if len(symset) > 0 else 1)):
         return True
     return False
 
@@ -515,9 +681,9 @@ async def _fetch_advanced_rows(
     if not symbols:
         return {}
 
-    computations_enabled = bool(getattr(settings, "computations_enabled", True)) if settings is not None else True
-    forecasting_enabled = bool(getattr(settings, "forecasting_enabled", True)) if settings is not None else True
-    scoring_enabled = bool(getattr(settings, "scoring_enabled", True)) if settings is not None else True
+    computations_enabled = _settings_get_bool(settings, "computations_enabled", default=True)
+    forecasting_enabled = _settings_get_bool(settings, "forecasting_enabled", default=True)
+    scoring_enabled = _settings_get_bool(settings, "scoring_enabled", default=True)
     want_advanced = computations_enabled and (forecasting_enabled or scoring_enabled)
 
     preferred: List[str] = []
@@ -605,6 +771,49 @@ async def _fetch_advanced_rows(
     return out
 
 
+async def _call_engine_sheet_rows_best_effort(
+    *,
+    engine: Any,
+    page: str,
+    limit: int,
+    offset: int,
+    mode: str,
+    body: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    if engine is None:
+        return None
+
+    candidates = [
+        ("get_sheet_rows", {"sheet": page, "limit": limit, "offset": offset, "mode": mode, "body": body}),
+        ("get_sheet_rows", {"sheet": page, "limit": limit, "offset": offset, "mode": mode}),
+        ("get_sheet_rows", {"sheet": page, "limit": limit, "offset": offset}),
+        ("get_page_rows", {"page": page, "limit": limit, "offset": offset, "mode": mode, "body": body}),
+        ("get_page_rows", {"page": page, "limit": limit, "offset": offset, "mode": mode}),
+        ("sheet_rows", {"sheet": page, "limit": limit, "offset": offset, "mode": mode, "body": body}),
+        ("sheet_rows", {"sheet": page, "limit": limit, "offset": offset, "mode": mode}),
+        ("build_sheet_rows", {"sheet": page, "limit": limit, "offset": offset, "mode": mode, "body": body}),
+        ("build_sheet_rows", {"sheet": page, "limit": limit, "offset": offset, "mode": mode}),
+    ]
+
+    for method_name, kwargs in candidates:
+        fn = getattr(engine, method_name, None)
+        if not callable(fn):
+            continue
+
+        try:
+            res = await _call_engine(fn, **kwargs)
+            if isinstance(res, dict):
+                return res
+            if isinstance(res, list):
+                return {"rows": res}
+        except TypeError:
+            continue
+        except Exception:
+            continue
+
+    return None
+
+
 # =============================================================================
 # Lazy builder imports
 # =============================================================================
@@ -630,7 +839,7 @@ async def _call_builder_best_effort(
     schema_keys: Sequence[str],
     schema_headers: Sequence[str],
     friendly_name: str,
-) -> List[Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     try:
         mod = _import_first_available(module_names)
     except Exception as e:
@@ -640,10 +849,12 @@ async def _call_builder_best_effort(
         )
 
     fn = None
+    fn_name = ""
     for name in function_names:
         cand = getattr(mod, name, None)
         if callable(cand):
             fn = cand
+            fn_name = name
             break
 
     if fn is None:
@@ -688,10 +899,22 @@ async def _call_builder_best_effort(
     if not rows and matrix:
         rows = _matrix_to_rows(matrix, schema_keys)
 
-    return [
+    rows_norm = [
         _normalize_to_schema_keys(schema_keys=schema_keys, schema_headers=schema_headers, raw=(r or {}))
         for r in rows
     ]
+
+    meta: Dict[str, Any] = {
+        "builder_module": getattr(mod, "__name__", ""),
+        "builder_function": fn_name,
+        "builder_payload_preserved": isinstance(out, dict),
+    }
+    if isinstance(out, dict):
+        meta["builder_meta"] = out.get("meta")
+        meta["builder_status"] = out.get("status")
+        meta["builder_error"] = out.get("error")
+
+    return rows_norm, meta
 
 
 def _build_data_dictionary_rows_to_schema(
@@ -785,12 +1008,19 @@ async def advanced_sheet_rows_health(request: Request) -> Dict[str, Any]:
     except Exception:
         auth_summary = None
 
+    engine_present = False
+    try:
+        engine_present = bool(getattr(getattr(request.app, "state", None), "engine", None))
+    except Exception:
+        engine_present = False
+
     return {
         "status": "ok",
         "service": "advanced_sheet_rows",
         "version": ADVANCED_SHEET_ROWS_VERSION,
         "schema_available": bool(get_sheet_spec is not None),
         "allowed_pages_count": len(allowed_pages()) if callable(allowed_pages) else len(CANONICAL_PAGES),
+        "engine_present": engine_present,
         "auth": auth_summary,
         "path": str(getattr(getattr(request, "url", None), "path", "")),
     }
@@ -807,11 +1037,12 @@ async def advanced_sheet_rows(
     include_matrix_q: Optional[bool] = Query(default=None, alias="include_matrix"),
     token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
     start = time.time()
-    request_id = x_request_id or str(uuid.uuid4())
+    request_id = x_request_id or getattr(getattr(request, "state", None), "request_id", None) or str(uuid.uuid4())
 
     if get_sheet_spec is None:
         raise HTTPException(
@@ -831,24 +1062,14 @@ async def advanced_sheet_rows(
     # -------------------------------------------------------------------------
     # Auth
     # -------------------------------------------------------------------------
-    auth_token = _extract_auth_token(
+    _ensure_authorized(
+        request=request,
+        settings=settings,
         token_query=token,
         x_app_token=x_app_token,
+        x_api_key=x_api_key,
         authorization=authorization,
-        settings=settings,
-        request=request,
     )
-
-    if auth_ok is not None:
-        if not auth_ok(
-            token=auth_token,
-            authorization=authorization,
-            headers=request.headers,
-            path=str(getattr(getattr(request, "url", None), "path", "")),
-            request=request,
-            settings=settings,
-        ):
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
     # -------------------------------------------------------------------------
     # Page resolution
@@ -891,14 +1112,14 @@ async def advanced_sheet_rows(
         )
 
     symbols = _get_list(body, "symbols", "tickers", "tickers_list")
-    top_n = max(1, min(5000, _maybe_int(body.get("top_n"), 2000)))
-    symbols = symbols[:top_n]
+    top_n = max(1, min(5000, _maybe_int(body.get("top_n"), len(symbols) if symbols else limit)))
+    symbols = _dedupe_keep_order(symbols)[:top_n]
 
     # -------------------------------------------------------------------------
     # Explicit special-page dispatch
     # -------------------------------------------------------------------------
     if route_family == "insights":
-        rows = await _call_builder_best_effort(
+        rows, builder_meta = await _call_builder_best_effort(
             module_names=("core.analysis.insights_builder",),
             function_names=(
                 "build_insights_analysis_rows",
@@ -934,59 +1155,63 @@ async def advanced_sheet_rows(
                 "limit": limit,
                 "offset": offset,
                 "count": len(rows),
+                **builder_meta,
             },
         }
 
     if route_family == "top10":
-        try:
-            rows = await _call_builder_best_effort(
-                module_names=(
-                    "core.analysis.top10_selector",
-                    "core.analysis.top10_builder",
-                    "core.analysis.top_10_builder",
-                    "core.analysis.top_10_investments_builder",
-                    "core.analysis.top10_investments_builder",
-                ),
-                function_names=(
-                    "build_top_10_investments_rows",
-                    "build_top10_investments_rows",
-                    "build_top_10_rows",
-                    "build_top10_rows",
-                    "get_top10_rows",
-                    "select_top10_rows",
-                    "build_rows",
-                ),
-                request=request,
-                settings=settings,
-                mode=(mode or ""),
-                body=body,
-                schema_keys=keys,
-                schema_headers=headers,
-                friendly_name="Top_10_Investments",
-            )
-            rows = _slice(rows, limit=limit, offset=offset)
+        rows, builder_meta = await _call_builder_best_effort(
+            module_names=(
+                "core.analysis.top10_selector",
+                "core.analysis.top10_builder",
+                "core.analysis.top_10_builder",
+                "core.analysis.top_10_investments_builder",
+                "core.analysis.top10_investments_builder",
+            ),
+            function_names=(
+                "build_top10_rows",
+                "build_top_10_investments_rows",
+                "build_top10_investments_rows",
+                "build_top_10_rows",
+                "get_top10_rows",
+                "select_top10_rows",
+                "build_rows",
+            ),
+            request=request,
+            settings=settings,
+            mode=(mode or ""),
+            body=body,
+            schema_keys=keys,
+            schema_headers=headers,
+            friendly_name="Top_10_Investments",
+        )
+        rows = _slice(rows, limit=limit, offset=offset)
 
-            return {
-                "status": "success",
-                "page": page,
-                "route_family": route_family,
-                "headers": headers,
-                "keys": keys,
-                "rows": rows,
-                "rows_matrix": _rows_to_matrix(rows, keys) if include_matrix else None,
-                "version": ADVANCED_SHEET_ROWS_VERSION,
-                "request_id": request_id,
-                "meta": {
-                    "duration_ms": (time.time() - start) * 1000.0,
-                    "dispatch": "top10_builder",
-                    "mode": mode,
-                    "limit": limit,
-                    "offset": offset,
-                    "count": len(rows),
-                },
-            }
-        except HTTPException:
-            pass
+        status_out = "success" if rows else "warn"
+        builder_status = _strip((builder_meta.get("builder_status") if isinstance(builder_meta, dict) else None) or "")
+        if builder_status:
+            status_out = builder_status.lower() if builder_status.lower() in {"success", "warn", "partial", "error"} else status_out
+
+        return {
+            "status": status_out,
+            "page": page,
+            "route_family": route_family,
+            "headers": headers,
+            "keys": keys,
+            "rows": rows,
+            "rows_matrix": _rows_to_matrix(rows, keys) if include_matrix else None,
+            "version": ADVANCED_SHEET_ROWS_VERSION,
+            "request_id": request_id,
+            "meta": {
+                "duration_ms": (time.time() - start) * 1000.0,
+                "dispatch": "top10_builder",
+                "mode": mode,
+                "limit": limit,
+                "offset": offset,
+                "count": len(rows),
+                **builder_meta,
+            },
+        }
 
     if route_family == "dictionary":
         rows = _build_data_dictionary_rows_to_schema(schema_keys=keys, schema_headers=headers)
@@ -1013,16 +1238,29 @@ async def advanced_sheet_rows(
         }
 
     # -------------------------------------------------------------------------
-    # Table mode for instrument pages (no symbols)
+    # Instrument / table mode
     # -------------------------------------------------------------------------
+    engine = await _get_engine(request)
+
+    # Table mode when no symbols were supplied
     if not symbols:
-        payload = await _call_core_sheet_rows_best_effort(
+        payload = await _call_engine_sheet_rows_best_effort(
+            engine=engine,
             page=page,
             limit=limit,
             offset=offset,
             mode=(mode or ""),
             body=body,
         )
+
+        if payload is None:
+            payload = await _call_core_sheet_rows_best_effort(
+                page=page,
+                limit=limit,
+                offset=offset,
+                mode=(mode or ""),
+                body=body,
+            )
 
         if payload is None:
             return {
@@ -1041,6 +1279,7 @@ async def advanced_sheet_rows(
                     "limit": limit,
                     "offset": offset,
                     "dispatch": "schema_only_table_mode",
+                    "engine_present": bool(engine),
                 },
             }
 
@@ -1052,8 +1291,10 @@ async def advanced_sheet_rows(
         rows = [_normalize_to_schema_keys(schema_keys=keys, schema_headers=headers, raw=r) for r in raw_rows]
         rows = _slice(rows, limit=limit, offset=offset)
 
-        status_out = payload.get("status") or "success"
-        err_out = payload.get("error")
+        status_out = payload.get("status") if isinstance(payload, dict) else None
+        if not status_out:
+            status_out = "success"
+        err_out = payload.get("error") if isinstance(payload, dict) else None
 
         return {
             "status": status_out,
@@ -1071,13 +1312,14 @@ async def advanced_sheet_rows(
                 "mode": mode,
                 "limit": limit,
                 "offset": offset,
-                "dispatch": "core_get_sheet_rows" if core_get_sheet_rows is not None else "table_mode_fallback",
-                **(payload.get("meta") or {}),
+                "dispatch": "engine_sheet_rows" if engine is not None else "core_get_sheet_rows",
+                "engine_present": bool(engine),
+                **((payload.get("meta") or {}) if isinstance(payload, dict) else {}),
             },
         }
 
     # -------------------------------------------------------------------------
-    # Instrument mode (symbols provided)
+    # Symbol-based instrument mode
     # -------------------------------------------------------------------------
     if not is_instrument_page(page):
         raise HTTPException(
@@ -1085,7 +1327,6 @@ async def advanced_sheet_rows(
             detail={"error": f"Page '{page}' is not an instrument page for symbol-based retrieval."},
         )
 
-    engine = await _get_engine(request)
     if not engine:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Data engine unavailable")
 
@@ -1111,9 +1352,10 @@ async def advanced_sheet_rows(
         if callable(normalize_fn):
             try:
                 row = normalize_fn(page, raw, keep_extras=True)
-                for k in keys:
-                    if k not in row:
-                        row[k] = None
+                if not isinstance(row, dict):
+                    row = _normalize_to_schema_keys(schema_keys=keys, schema_headers=headers, raw=raw)
+                else:
+                    row = _normalize_to_schema_keys(schema_keys=keys, schema_headers=headers, raw=row)
             except Exception:
                 row = _normalize_to_schema_keys(schema_keys=keys, schema_headers=headers, raw=raw)
         else:
@@ -1143,10 +1385,11 @@ async def advanced_sheet_rows(
             "errors": errors,
             "mode": mode,
             "schema_headers_always": bool(getattr(settings, "schema_headers_always", True)) if settings else True,
-            "computations_enabled": bool(getattr(settings, "computations_enabled", True)) if settings else True,
-            "forecasting_enabled": bool(getattr(settings, "forecasting_enabled", True)) if settings else True,
-            "scoring_enabled": bool(getattr(settings, "scoring_enabled", True)) if settings else True,
+            "computations_enabled": _settings_get_bool(settings, "computations_enabled", default=True),
+            "forecasting_enabled": _settings_get_bool(settings, "forecasting_enabled", default=True),
+            "scoring_enabled": _settings_get_bool(settings, "scoring_enabled", default=True),
             "dispatch": "instrument_mode",
+            "engine_present": True,
         },
     }
 
