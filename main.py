@@ -2,18 +2,20 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v7.2.0)
+TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v7.3.0)
 ================================================================================
-ALIGNED • DEPLOYMENT-SAFE • LIFESPAN-BASED • ROUTER-SNAPSHOT-AWARE
+ALIGNED • DEPLOYMENT-SAFE • PRE-MOUNT + LIFESPAN-VERIFY • ROUTER-SNAPSHOT-AWARE
 ENGINE-STATE-AWARE • OPENAPI-SAFE • RENDER-HEALTH-PROBE-SAFE
 
-Why this revision (v7.2.0)
+Why this revision (v7.3.0)
 --------------------------
-- ✅ FIX: Normalizes the rich snapshot returned by routes.mount_all_routers(...)
+- ✅ FIX: Mounts routes once during app creation so OpenAPI sees them immediately
+- ✅ FIX: Lifespan re-checks / normalizes route snapshot without breaking duplicates
+- ✅ FIX: Invalidates OpenAPI cache after any route mount so new paths appear live
 - ✅ FIX: Preserves app.state.routes_snapshot if routes package already wrote it
-- ✅ FIX: Engine warm-up now stores engine on app.state.engine for request-time access
-- ✅ FIX: Fallback route mount plan aligned to your real repo modules
-- ✅ FIX: Runtime meta now reports mounted / duplicate / failed counts accurately
+- ✅ FIX: Engine warm-up stores engine on app.state.engine for request-time access
+- ✅ FIX: Fallback route plan aligned to current route modules
+- ✅ FIX: Runtime meta reports mounted / duplicate / failed counts accurately
 - ✅ FIX: Adds request-id middleware and X-Request-ID response header
 - ✅ HARDEN: Startup remains safe even if routes or engine imports partially fail
 - ✅ HARDEN: /meta remains schema-visible so OpenAPI is never empty
@@ -42,7 +44,7 @@ from starlette.middleware.gzip import GZipMiddleware
 # --------------------------------------------------------------------------------------
 # Version
 # --------------------------------------------------------------------------------------
-APP_ENTRY_VERSION = "7.2.0"
+APP_ENTRY_VERSION = "7.3.0"
 
 # --------------------------------------------------------------------------------------
 # Safe env helpers
@@ -166,7 +168,6 @@ class _SettingsView:
 
 
 def _load_settings() -> _SettingsView:
-    # 1) env.py
     try:
         env_mod = importlib.import_module("env")
         if hasattr(env_mod, "get_settings"):
@@ -193,7 +194,6 @@ def _load_settings() -> _SettingsView:
     except Exception:
         pass
 
-    # 2) core.config
     try:
         cfg = importlib.import_module("core.config")
         getter = getattr(cfg, "get_settings_cached", None) or getattr(cfg, "get_settings", None)
@@ -221,7 +221,6 @@ def _load_settings() -> _SettingsView:
     except Exception:
         pass
 
-    # 3) env vars
     return _SettingsView(
         APP_NAME=_env_str("APP_NAME", "Tadawul Fast Bridge"),
         APP_VERSION=_env_str("APP_VERSION", "dev"),
@@ -340,18 +339,19 @@ def _router_would_duplicate_existing(app: Any, router: Any) -> bool:
     return router_sigs.issubset(_app_route_signature_set(app))
 
 
+def _invalidate_openapi_cache(app: FastAPI) -> None:
+    try:
+        app.openapi_schema = None  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+
 def _normalize_routes_snapshot(
     ret: Any,
     *,
     used_strategy: str,
     app: Optional[FastAPI] = None,
 ) -> Dict[str, Any]:
-    """
-    Accept:
-    - dict returned by routes.mount_all_routers(...)
-    - dict already stored on app.state.routes_snapshot
-    - anything else -> minimal safe snapshot
-    """
     base_from_state: Dict[str, Any] = {}
     if app is not None:
         try:
@@ -411,6 +411,53 @@ def _normalize_routes_snapshot(
     }
 
 
+def _merge_snapshots(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]:
+    def _merge_list(a: Any, b: Any) -> List[Any]:
+        out: List[Any] = []
+        seen = set()
+        for item in list(a or []) + list(b or []):
+            key = str(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(item)
+        return out
+
+    def _merge_dict(a: Any, b: Any) -> Dict[str, Any]:
+        out = dict(a or {})
+        out.update(dict(b or {}))
+        return out
+
+    merged = {
+        "mounted": _merge_list(old.get("mounted"), new.get("mounted")),
+        "duplicate_skips": _merge_list(old.get("duplicate_skips"), new.get("duplicate_skips")),
+        "missing": _merge_list(old.get("missing"), new.get("missing")),
+        "import_errors": _merge_dict(old.get("import_errors"), new.get("import_errors")),
+        "mount_errors": _merge_dict(old.get("mount_errors"), new.get("mount_errors")),
+        "no_router": _merge_dict(old.get("no_router"), new.get("no_router")),
+        "strict": bool(new.get("strict", old.get("strict", False))),
+        "strategy": str(new.get("strategy") or old.get("strategy") or ""),
+        "missing_required_keys": _merge_list(old.get("missing_required_keys"), new.get("missing_required_keys")),
+        "resolved_map": _merge_dict(old.get("resolved_map"), new.get("resolved_map")),
+        "module_to_key": _merge_dict(old.get("module_to_key"), new.get("module_to_key")),
+        "mount_modes": _merge_dict(old.get("mount_modes"), new.get("mount_modes")),
+        "expected_router_modules": _merge_list(old.get("expected_router_modules"), new.get("expected_router_modules")),
+        "plan": _merge_list(old.get("plan"), new.get("plan")),
+        "resolved_entries": _merge_list(old.get("resolved_entries"), new.get("resolved_entries")),
+    }
+
+    merged["mounted_count"] = len(merged["mounted"])
+    merged["duplicate_skips_count"] = len(merged["duplicate_skips"])
+    merged["missing_count"] = len(merged["missing"])
+    merged["failed_count"] = (
+        len(merged["import_errors"]) + len(merged["mount_errors"]) + len(merged["no_router"])
+    )
+    merged["openapi_route_count_after_mount"] = int(
+        new.get("openapi_route_count_after_mount", old.get("openapi_route_count_after_mount", 0)) or 0
+    )
+    return merged
+
+
 def _import_router_module(module_name: str) -> Tuple[Optional[Any], Optional[BaseException]]:
     try:
         mod = importlib.import_module(module_name)
@@ -443,13 +490,13 @@ def _mount_routes_fallback(app: FastAPI) -> Dict[str, Any]:
     plan = [
         "routes.config",
         "routes.enriched_quote",
+        "routes.data_dictionary",
+        "routes.investment_advisor",
         "routes.advanced_analysis",
         "routes.ai_analysis",
         "routes.advisor",
-        "routes.investment_advisor",
         "routes.analysis_sheet_rows",
         "routes.advanced_sheet_rows",
-        "routes.data_dictionary",
         "routes.top10_investments",
         "routes.routes_argaam",
     ]
@@ -497,7 +544,7 @@ def _mount_routes_fallback(app: FastAPI) -> Dict[str, Any]:
             if strict:
                 raise
 
-    return {
+    snap = {
         "mounted": mounted,
         "duplicate_skips": duplicate_skips,
         "missing": missing,
@@ -510,13 +557,11 @@ def _mount_routes_fallback(app: FastAPI) -> Dict[str, Any]:
         "mount_modes": mount_modes,
         "openapi_route_count_after_mount": len(getattr(app, "routes", []) or []),
     }
+    _invalidate_openapi_cache(app)
+    return snap
 
 
 def _mount_routes(app: FastAPI) -> Dict[str, Any]:
-    """
-    Discover and mount routers from `routes` package (best-effort).
-    Does not fail startup unless ROUTES_STRICT_IMPORT=1.
-    """
     strict = _env_bool("ROUTES_STRICT_IMPORT", False)
 
     try:
@@ -528,6 +573,7 @@ def _mount_routes(app: FastAPI) -> Dict[str, Any]:
                 try:
                     ret = fn(app)  # type: ignore[misc]
                     snap = _normalize_routes_snapshot(ret, used_strategy=used_strategy, app=app)
+                    _invalidate_openapi_cache(app)
                     logger.info(
                         "Routes mount summary: mounted=%s duplicate_skips=%s missing=%s failed=%s strategy=%s",
                         snap["mounted_count"],
@@ -558,6 +604,42 @@ def _mount_routes(app: FastAPI) -> Dict[str, Any]:
     return snap
 
 
+def _mount_routes_once(app: FastAPI, phase: str) -> Dict[str, Any]:
+    current = {}
+    try:
+        current = dict(getattr(app.state, "routes_snapshot", {}) or {})
+    except Exception:
+        current = {}
+
+    last_phase = ""
+    try:
+        last_phase = str(getattr(app.state, "routes_mount_phase", "") or "")
+    except Exception:
+        last_phase = ""
+
+    if phase == "startup" and last_phase == "startup":
+        return current
+    if phase == "startup" and last_phase == "prestart":
+        snap = _normalize_routes_snapshot(current, used_strategy=str(current.get("strategy", "prestart")), app=app)
+        snap["openapi_route_count_after_mount"] = len(getattr(app, "routes", []) or [])
+        app.state.routes_snapshot = snap
+        app.state.routes_mounted = True
+        app.state.routes_mount_phase = "startup"
+        _invalidate_openapi_cache(app)
+        return snap
+
+    fresh = _mount_routes(app)
+    snap = _merge_snapshots(current, fresh) if current else fresh
+    snap = _normalize_routes_snapshot(snap, used_strategy=str(snap.get("strategy", "mount")), app=app)
+    snap["openapi_route_count_after_mount"] = len(getattr(app, "routes", []) or [])
+
+    app.state.routes_snapshot = snap
+    app.state.routes_mounted = True
+    app.state.routes_mount_phase = phase
+    _invalidate_openapi_cache(app)
+    return snap
+
+
 # --------------------------------------------------------------------------------------
 # Built-in endpoints
 # --------------------------------------------------------------------------------------
@@ -566,6 +648,7 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
     engine_obj: Any = None
     engine_source = ""
     routes_mounted = False
+    routes_mount_phase = ""
 
     try:
         if app is not None and hasattr(app, "state"):
@@ -575,6 +658,7 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
             engine_obj = getattr(app.state, "engine", None)
             engine_source = str(getattr(app.state, "engine_source", "") or "")
             routes_mounted = bool(getattr(app.state, "routes_mounted", False))
+            routes_mount_phase = str(getattr(app.state, "routes_mount_phase", "") or "")
     except Exception:
         pass
 
@@ -596,6 +680,7 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "python": sys.version.split()[0],
         "routes_mounted": routes_mounted,
+        "routes_mount_phase": routes_mount_phase,
         "routes_mounted_count": mounted_count,
         "routes_duplicate_skips_count": duplicate_skips_count,
         "routes_failed_count": failed_count,
@@ -646,7 +731,6 @@ async def _maybe_init_engine(app: FastAPI) -> Optional[str]:
     if not bool(_SETTINGS.INIT_ENGINE_ON_BOOT):
         return None
 
-    # Try V2 first
     try:
         de2 = importlib.import_module("core.data_engine_v2")
         init_fn = getattr(de2, "get_engine", None) or getattr(de2, "init_engine", None)
@@ -662,7 +746,6 @@ async def _maybe_init_engine(app: FastAPI) -> Optional[str]:
     else:
         err_v2 = ""
 
-    # Fallback V1
     try:
         de1 = importlib.import_module("core.data_engine")
         init_fn = getattr(de1, "get_engine", None) or getattr(de1, "init_engine", None)
@@ -704,32 +787,62 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        app.state.routes_snapshot = {
-            "mounted": [],
-            "mounted_count": 0,
-            "duplicate_skips": [],
-            "duplicate_skips_count": 0,
-            "missing": [],
-            "missing_count": 0,
-            "import_errors": {},
-            "mount_errors": {},
-            "no_router": {},
-            "failed_count": 0,
-            "strict": False,
-            "strategy": "",
-            "plan": [],
-            "mount_modes": {},
-        }
-        app.state.routes_mounted = False
-        app.state.engine = None
-        app.state.engine_source = ""
+        try:
+            app.state.routes_snapshot = getattr(app.state, "routes_snapshot", {}) or {
+                "mounted": [],
+                "mounted_count": 0,
+                "duplicate_skips": [],
+                "duplicate_skips_count": 0,
+                "missing": [],
+                "missing_count": 0,
+                "import_errors": {},
+                "mount_errors": {},
+                "no_router": {},
+                "failed_count": 0,
+                "strict": False,
+                "strategy": "",
+                "plan": [],
+                "mount_modes": {},
+            }
+        except Exception:
+            app.state.routes_snapshot = {
+                "mounted": [],
+                "mounted_count": 0,
+                "duplicate_skips": [],
+                "duplicate_skips_count": 0,
+                "missing": [],
+                "missing_count": 0,
+                "import_errors": {},
+                "mount_errors": {},
+                "no_router": {},
+                "failed_count": 0,
+                "strict": False,
+                "strategy": "",
+                "plan": [],
+                "mount_modes": {},
+            }
+
+        if not hasattr(app.state, "routes_mounted"):
+            app.state.routes_mounted = False
+        if not hasattr(app.state, "routes_mount_phase"):
+            app.state.routes_mount_phase = ""
+        if not hasattr(app.state, "engine"):
+            app.state.engine = None
+        if not hasattr(app.state, "engine_source"):
+            app.state.engine_source = ""
 
         try:
-            snap = _mount_routes(app)
-            app.state.routes_snapshot = snap
-            app.state.routes_mounted = True
+            snap = _mount_routes_once(app, phase="startup")
+            logger.info(
+                "Routes verified at startup: mounted=%s duplicate_skips=%s missing=%s failed=%s strategy=%s",
+                snap.get("mounted_count", 0),
+                snap.get("duplicate_skips_count", 0),
+                snap.get("missing_count", 0),
+                snap.get("failed_count", 0),
+                snap.get("strategy", ""),
+            )
         except Exception as e:
-            logger.error("Route mounting crashed: %s", e, exc_info=True)
+            logger.error("Route mounting crashed during startup: %s", e, exc_info=True)
             if _env_bool("ROUTES_STRICT_IMPORT", False):
                 raise
 
@@ -767,6 +880,28 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
+    # Initialize state early so prestart mount is safe
+    app.state.routes_snapshot = {
+        "mounted": [],
+        "mounted_count": 0,
+        "duplicate_skips": [],
+        "duplicate_skips_count": 0,
+        "missing": [],
+        "missing_count": 0,
+        "import_errors": {},
+        "mount_errors": {},
+        "no_router": {},
+        "failed_count": 0,
+        "strict": False,
+        "strategy": "",
+        "plan": [],
+        "mount_modes": {},
+    }
+    app.state.routes_mounted = False
+    app.state.routes_mount_phase = ""
+    app.state.engine = None
+    app.state.engine_source = ""
+
     app.add_middleware(RequestIDMiddleware)
     app.add_middleware(GZipMiddleware, minimum_size=1024)
 
@@ -798,6 +933,22 @@ def create_app() -> FastAPI:
         )
 
     _install_builtin_routes(app)
+
+    # Critical: mount routes before first OpenAPI generation
+    try:
+        snap = _mount_routes_once(app, phase="prestart")
+        logger.info(
+            "Routes mounted at app creation: mounted=%s duplicate_skips=%s missing=%s failed=%s strategy=%s",
+            snap.get("mounted_count", 0),
+            snap.get("duplicate_skips_count", 0),
+            snap.get("missing_count", 0),
+            snap.get("failed_count", 0),
+            snap.get("strategy", ""),
+        )
+    except Exception as e:
+        logger.error("Prestart route mounting failed: %s", e, exc_info=True)
+        if _env_bool("ROUTES_STRICT_IMPORT", False):
+            raise
 
     @app.get("/_debug/routes", include_in_schema=False)
     async def debug_routes(request: Request):
