@@ -2,15 +2,16 @@
 # routes/enriched_quote.py
 """
 ================================================================================
-TFB Enriched Quote Routes Wrapper — v6.2.0
+TFB Enriched Quote Routes Wrapper — v6.3.0
 ================================================================================
 RENDER-SAFE • SCHEMA-AWARE • PAGE-DISPATCH SAFE • HEADER/ROW BALANCED
 SPECIAL-BUILDER PRESERVING • ASYNC-SAFE • GET+POST COMPATIBLE
-QUERY/BODY MERGE • LEGACY ALIAS SAFE • NULL-ROW AVOIDANCE
+QUERY/BODY MERGE • LEGACY ALIAS SAFE • TABLE-MODE SAFE • CORE-WRAPPER SAFE
 
 Why this revision
 -----------------
-- ✅ FIX: Adds GET support for /sheet-rows (your live checker uses GET, not POST)
+- ✅ FIX: Wrapper routes are mounted BEFORE optional core router so wrapper paths win
+- ✅ FIX: Adds GET support for /sheet-rows and GET compatibility for /quote
 - ✅ FIX: Adds /v1/enriched_quote compatibility aliases alongside /v1/enriched
 - ✅ FIX: Accepts page/sheet/sheet_name/name/tab and tickers/symbols from query params
 - ✅ FIX: Preserves payload-style builder output instead of collapsing to null rows
@@ -18,7 +19,9 @@ Why this revision
         when schema/page helpers are partially unavailable
 - ✅ FIX: Adds stronger fallback route-family detection for special pages
 - ✅ FIX: Can derive schema from Data_Dictionary builder if schema registry is partial
+- ✅ FIX: Supports table mode through core.data_engine.get_sheet_rows and/or engine.get_sheet_rows
 - ✅ FIX: Keeps instrument pages engine-backed and schema-aligned
+- ✅ FIX: Keeps response envelope stable for PowerShell/live checks
 - ✅ SAFE: No network I/O at import-time
 - ✅ SAFE: No Prometheus metric creation here
 
@@ -32,16 +35,20 @@ Supported route families:
 
 Compatibility routes
 --------------------
+- GET  /quote
 - POST /quote
+- GET  /quotes
 - POST /quotes
 - GET  /sheet-rows
 - POST /sheet-rows
+- GET  /v1/enriched/quote
 - POST /v1/enriched/quote
-- POST /v1/enriched/sheet-rows
 - GET  /v1/enriched/sheet-rows
+- POST /v1/enriched/sheet-rows
+- GET  /v1/enriched_quote/quote
 - POST /v1/enriched_quote/quote
-- POST /v1/enriched_quote/sheet-rows
 - GET  /v1/enriched_quote/sheet-rows
+- POST /v1/enriched_quote/sheet-rows
 """
 
 from __future__ import annotations
@@ -50,6 +57,7 @@ import asyncio
 import importlib
 import inspect
 import logging
+import os
 import time
 import uuid
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -58,7 +66,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 
 logger = logging.getLogger("routes.enriched_quote")
 
-ROUTER_VERSION = "6.2.0"
+ROUTER_VERSION = "6.3.0"
 
 # Kept lazy for dynamic mount behavior
 router: Optional[APIRouter] = None
@@ -67,6 +75,26 @@ router: Optional[APIRouter] = None
 # =============================================================================
 # Pure helpers
 # =============================================================================
+_FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
+    "symbol": ["ticker", "code", "instrument", "security", "symbol_code"],
+    "ticker": ["symbol", "code", "instrument", "security"],
+    "current_price": [
+        "price",
+        "last_price",
+        "last",
+        "close",
+        "market_price",
+        "current",
+        "spot",
+        "nav",
+    ],
+    "recommendation_reason": ["reason", "reco_reason", "recommendation_notes"],
+    "top10_rank": ["rank", "top_rank"],
+    "selection_reason": ["selection_notes", "selector_reason"],
+    "criteria_snapshot": ["criteria", "criteria_json", "snapshot"],
+}
+
+
 def _strip(v: Any) -> str:
     try:
         return str(v).strip()
@@ -93,19 +121,33 @@ def _as_list(v: Any) -> List[Any]:
     return [v]
 
 
+def _split_symbols_string(v: str) -> List[str]:
+    raw = (v or "").replace(";", ",").replace("\n", ",").replace("\t", ",")
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    out: List[str] = []
+    seen = set()
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
 def _get_list(body: Mapping[str, Any], *keys: str) -> List[str]:
     for k in keys:
         v = body.get(k)
         if isinstance(v, list):
             out: List[str] = []
+            seen = set()
             for item in v:
                 s = _strip(item)
-                if s:
+                if s and s not in seen:
+                    seen.add(s)
                     out.append(s)
             if out:
                 return out
         if isinstance(v, str) and v.strip():
-            parts = [p.strip() for p in v.split(",") if p.strip()]
+            parts = _split_symbols_string(v)
             if parts:
                 return parts
     return []
@@ -121,6 +163,11 @@ def _get_bool(body: Mapping[str, Any], key: str, default: bool) -> bool:
             return True
         if s in {"0", "false", "no", "n", "off"}:
             return False
+    if isinstance(v, (int, float)):
+        try:
+            return bool(int(v))
+        except Exception:
+            return default
     return default
 
 
@@ -135,8 +182,8 @@ def _get_int(body: Mapping[str, Any], key: str, default: int) -> int:
             return int(v)
         if isinstance(v, str):
             s = v.strip()
-            if s and s.lstrip("+-").isdigit():
-                return int(s)
+            if s:
+                return int(float(s))
     except Exception:
         pass
     return int(default)
@@ -158,10 +205,7 @@ def _extract_token(
 
 
 def _rows_matrix(rows: Sequence[Mapping[str, Any]], keys: Sequence[str]) -> List[List[Any]]:
-    out: List[List[Any]] = []
-    for row in rows:
-        out.append([row.get(k) for k in keys])
-    return out
+    return [[row.get(k) for k in keys] for row in rows]
 
 
 def _model_to_dict(obj: Any) -> Dict[str, Any]:
@@ -229,15 +273,67 @@ def _first_list(*vals: Any) -> List[Any]:
     return []
 
 
-def _merge_non_empty(base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:
-    out = dict(base)
-    for k, v in extra.items():
-        if v is None:
-            continue
-        if isinstance(v, str) and not v.strip():
-            continue
-        out[k] = v
-    return out
+def _request_id(request: Request, x_request_id: Optional[str]) -> str:
+    if x_request_id and _strip(x_request_id):
+        return _strip(x_request_id)
+    try:
+        rid = _strip(getattr(request.state, "request_id", ""))
+        if rid:
+            return rid
+    except Exception:
+        pass
+    return uuid.uuid4().hex[:12]
+
+
+def _collect_query_body_for_sheet_rows(
+    *,
+    page: Optional[str],
+    sheet_name: Optional[str],
+    sheet: Optional[str],
+    name: Optional[str],
+    tab: Optional[str],
+    symbols: Optional[str],
+    tickers: Optional[str],
+    include_headers: Optional[str],
+    include_matrix: Optional[str],
+    limit: Optional[int],
+    offset: Optional[int],
+    top_n: Optional[int],
+) -> Dict[str, Any]:
+    body: Dict[str, Any] = {}
+    for k, v in {
+        "page": page,
+        "sheet_name": sheet_name,
+        "sheet": sheet,
+        "name": name,
+        "tab": tab,
+        "symbols": symbols,
+        "tickers": tickers,
+        "include_headers": include_headers,
+        "include_matrix": include_matrix,
+        "limit": limit,
+        "offset": offset,
+        "top_n": top_n,
+    }.items():
+        if v not in (None, ""):
+            body[k] = v
+    return body
+
+
+def _collect_query_body_for_quote(
+    *,
+    symbol: Optional[str],
+    ticker: Optional[str],
+    page: Optional[str],
+) -> Dict[str, Any]:
+    body: Dict[str, Any] = {}
+    if symbol not in (None, ""):
+        body["symbol"] = symbol
+    if ticker not in (None, ""):
+        body["ticker"] = ticker
+    if page not in (None, ""):
+        body["page"] = page
+    return body
 
 
 # =============================================================================
@@ -317,6 +413,12 @@ class _Service:
             build_top10_rows = None  # type: ignore
         self.build_top10_rows = build_top10_rows
 
+        try:
+            from core.data_engine import get_sheet_rows as core_get_sheet_rows  # type: ignore
+        except Exception:
+            core_get_sheet_rows = None  # type: ignore
+        self.core_get_sheet_rows = core_get_sheet_rows
+
     # -----------------------------------------------------------------
     # Auth
     # -----------------------------------------------------------------
@@ -340,24 +442,55 @@ class _Service:
         if token_query_used and not allow_query:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Query token not allowed")
 
-        ok = self._auth_ok(
-            token=auth_token,
-            authorization=authorization,
-            headers={
-                "X-APP-TOKEN": x_app_token,
-                "Authorization": authorization,
+        attempts = [
+            {
+                "token": auth_token,
+                "authorization": authorization,
+                "headers": {
+                    "X-APP-TOKEN": x_app_token,
+                    "Authorization": authorization,
+                },
             },
-        )
-        if not ok:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+            {"token": auth_token, "authorization": authorization},
+            {"token": auth_token},
+        ]
+
+        for kwargs in attempts:
+            try:
+                ok = bool(self._auth_ok(**kwargs))
+                if ok:
+                    return
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+            except TypeError:
+                continue
+            except HTTPException:
+                raise
+            except Exception:
+                raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
     # -----------------------------------------------------------------
     # Engine
     # -----------------------------------------------------------------
-    async def get_engine(self) -> Any:
+    async def get_engine(self, request: Optional[Request] = None) -> Any:
+        try:
+            if request is not None:
+                st = getattr(request.app, "state", None)
+                if st and getattr(st, "engine", None) is not None:
+                    return st.engine
+        except Exception:
+            pass
+
         try:
             from core.data_engine_v2 import get_engine  # type: ignore
-            return await get_engine()
+            return await _maybe_await(get_engine())
+        except Exception:
+            pass
+
+        try:
+            from core.data_engine import get_engine  # type: ignore
+            return await _maybe_await(get_engine())
         except Exception:
             return None
 
@@ -369,18 +502,27 @@ class _Service:
         if not s:
             return "Market_Leaders"
 
-        compact = s.replace("-", "_").replace(" ", "_").lower()
+        compact = (
+            s.replace("&", "_")
+            .replace("-", "_")
+            .replace("/", "_")
+            .replace(" ", "_")
+            .lower()
+        )
 
         mapping = {
             "market_leaders": "Market_Leaders",
             "global_markets": "Global_Markets",
             "commodities_fx": "Commodities_FX",
             "commodities___fx": "Commodities_FX",
+            "commodities_and_fx": "Commodities_FX",
             "mutual_funds": "Mutual_Funds",
             "my_portfolio": "My_Portfolio",
             "insights_analysis": "Insights_Analysis",
             "insights___analysis": "Insights_Analysis",
             "top_10_investments": "Top_10_Investments",
+            "top10_investments": "Top_10_Investments",
+            "top10": "Top_10_Investments",
             "data_dictionary": "Data_Dictionary",
         }
         return mapping.get(compact, s)
@@ -524,11 +666,52 @@ class _Service:
 
         return headers, keys
 
+    def _key_variants(self, key: str) -> List[str]:
+        k = _strip(key)
+        if not k:
+            return []
+
+        variants = [
+            k,
+            k.lower(),
+            k.upper(),
+            k.replace("_", " "),
+            k.replace("_", "").lower(),
+        ]
+        for alias in _FIELD_ALIAS_HINTS.get(k, []):
+            variants.extend([
+                alias,
+                alias.lower(),
+                alias.upper(),
+                alias.replace("_", " "),
+                alias.replace("_", "").lower(),
+            ])
+
+        seen = set()
+        out: List[str] = []
+        for v in variants:
+            if v and v not in seen:
+                seen.add(v)
+                out.append(v)
+        return out
+
+    def _extract_from_raw(self, raw: Dict[str, Any], candidates: Sequence[str]) -> Any:
+        raw_ci = {str(k).strip().lower(): v for k, v in raw.items()}
+
+        for candidate in candidates:
+            if candidate in raw:
+                return raw.get(candidate)
+            lc = candidate.lower()
+            if lc in raw_ci:
+                return raw_ci.get(lc)
+        return None
+
     def normalize_row(self, keys: Sequence[str], raw: Mapping[str, Any], *, symbol_fallback: str = "") -> Dict[str, Any]:
+        raw_dict = dict(raw or {})
         out: Dict[str, Any] = {}
-        raw = dict(raw or {})
+
         for k in keys:
-            out[k] = raw.get(k, None)
+            out[k] = self._extract_from_raw(raw_dict, self._key_variants(k))
 
         if symbol_fallback:
             if "symbol" in out and not out.get("symbol"):
@@ -537,7 +720,80 @@ class _Service:
                 out["Symbol"] = symbol_fallback
             if "ticker" in out and not out.get("ticker"):
                 out["ticker"] = symbol_fallback
+
         return out
+
+    # -----------------------------------------------------------------
+    # Payload parsers
+    # -----------------------------------------------------------------
+    def extract_rows_like(self, payload: Any) -> List[Dict[str, Any]]:
+        if payload is None:
+            return []
+
+        if isinstance(payload, list):
+            if payload and isinstance(payload[0], (list, tuple)):
+                return []
+            return [x if isinstance(x, Mapping) else _model_to_dict(x) for x in payload]
+
+        if isinstance(payload, dict):
+            for name in ("rows", "data", "items", "records", "quotes"):
+                value = payload.get(name)
+                if isinstance(value, list):
+                    if value and isinstance(value[0], (list, tuple)):
+                        continue
+                    return [x if isinstance(x, Mapping) else _model_to_dict(x) for x in value]
+
+                if isinstance(value, dict):
+                    for inner_name in ("rows", "data", "items", "records", "quotes"):
+                        inner = value.get(inner_name)
+                        if isinstance(inner, list):
+                            if inner and isinstance(inner[0], (list, tuple)):
+                                continue
+                            return [x if isinstance(x, Mapping) else _model_to_dict(x) for x in inner]
+
+            for name in ("payload", "result"):
+                nested = payload.get(name)
+                if isinstance(nested, dict):
+                    rows = self.extract_rows_like(nested)
+                    if rows:
+                        return rows
+
+        return []
+
+    def extract_matrix_like(self, payload: Any) -> Optional[List[List[Any]]]:
+        if isinstance(payload, dict):
+            value = payload.get("rows_matrix")
+            if isinstance(value, list):
+                return [list(r) if isinstance(r, (list, tuple)) else [r] for r in value]
+
+            rows_value = payload.get("rows")
+            if isinstance(rows_value, list) and rows_value and isinstance(rows_value[0], (list, tuple)):
+                return [list(r) if isinstance(r, (list, tuple)) else [r] for r in rows_value]
+
+            for name in ("data", "payload", "result"):
+                nested = payload.get(name)
+                if isinstance(nested, dict):
+                    mx = self.extract_matrix_like(nested)
+                    if mx is not None:
+                        return mx
+
+        return None
+
+    def extract_status_error_meta(self, payload: Any) -> Tuple[str, Optional[str], Dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return "success", None, {}
+
+        status_out = _strip(payload.get("status")) or "success"
+        error_out = payload.get("error")
+        meta_out = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+        return status_out, (str(error_out) if error_out is not None else None), meta_out
+
+    def matrix_to_rows(self, matrix: Sequence[Sequence[Any]], keys: Sequence[str]) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for row in matrix:
+            vals = list(row) if isinstance(row, (list, tuple)) else [row]
+            rows.append({k: (vals[i] if i < len(vals) else None) for i, k in enumerate(keys)})
+        return rows
 
     # -----------------------------------------------------------------
     # Flexible builder calling
@@ -634,6 +890,66 @@ class _Service:
                 rows_out.append(_normalize_item_to_row(item, keys))
         return rows_out
 
+    # -----------------------------------------------------------------
+    # Table mode
+    # -----------------------------------------------------------------
+    async def call_table_mode_best_effort(
+        self,
+        *,
+        engine: Any,
+        page: str,
+        limit: int,
+        offset: int,
+        mode: str,
+        body: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        candidates: List[Any] = []
+
+        if self.core_get_sheet_rows is not None:
+            candidates.append(self.core_get_sheet_rows)
+
+        if engine is not None:
+            for name in ("get_sheet_rows", "sheet_rows", "build_sheet_rows"):
+                fn = getattr(engine, name, None)
+                if callable(fn):
+                    candidates.append(fn)
+
+        for fn in candidates:
+            call_specs = [
+                ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode, "body": body}),
+                ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode}),
+                ((), {"sheet": page, "limit": limit, "offset": offset}),
+                ((page,), {"limit": limit, "offset": offset, "mode": mode, "body": body}),
+                ((page,), {"limit": limit, "offset": offset, "mode": mode}),
+                ((page,), {"limit": limit, "offset": offset}),
+                ((page,), {}),
+            ]
+
+            last_exc: Optional[Exception] = None
+            for args, kwargs in call_specs:
+                try:
+                    res = fn(*args, **kwargs)
+                    res = await _maybe_await(res)
+                    if isinstance(res, dict):
+                        return res
+                    if isinstance(res, list):
+                        return {"status": "success", "rows": res}
+                    return {"status": "success", "rows": []}
+                except TypeError as e:
+                    last_exc = e
+                    continue
+                except Exception as e:
+                    last_exc = e
+                    break
+
+            if last_exc:
+                continue
+
+        return None
+
+    # -----------------------------------------------------------------
+    # Specialized payload builders
+    # -----------------------------------------------------------------
     async def build_dictionary_page_payload(
         self,
         *,
@@ -771,13 +1087,7 @@ class _Service:
             rows_matrix_raw = result.get("rows_matrix")
 
             if rows_raw is None:
-                data_candidate = result.get("data")
-                if isinstance(data_candidate, list):
-                    rows_raw = data_candidate
-                elif isinstance(result.get("quotes"), list):
-                    rows_raw = result.get("quotes")
-                else:
-                    rows_raw = []
+                rows_raw = self.extract_rows_like(result)
 
             rows_out: List[Dict[str, Any]] = []
 
@@ -786,14 +1096,16 @@ class _Service:
             elif isinstance(rows_matrix_raw, list) and rows_matrix_raw:
                 for item in rows_matrix_raw:
                     rows_out.append(_normalize_item_to_row(item, keys_out))
+            else:
+                matrix_candidate = self.extract_matrix_like(result)
+                if matrix_candidate:
+                    rows_out = self.matrix_to_rows(matrix_candidate, keys_out)
 
             rows_matrix_out = rows_matrix_raw if (include_matrix and isinstance(rows_matrix_raw, list)) else None
             if include_matrix and rows_matrix_out is None:
                 rows_matrix_out = _rows_matrix(rows_out, keys_out)
 
-            status_out = _strip(result.get("status")) or "success"
-            meta_in = _dict_or_empty(result.get("meta"))
-            error_out = result.get("error")
+            status_out, error_out, meta_in = self.extract_status_error_meta(result)
 
             return {
                 "status": status_out,
@@ -849,12 +1161,6 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
     svc = _Service(reason=reason)
     root = APIRouter(tags=["tfb"])
 
-    if isinstance(core_router, APIRouter):
-        try:
-            root.include_router(core_router)
-        except Exception as e:
-            logger.warning("Including core enriched router failed: %s", e)
-
     enriched = APIRouter(prefix="/v1/enriched", tags=["enriched"])
     enriched_quote_alias = APIRouter(prefix="/v1/enriched_quote", tags=["enriched"])
     legacy = APIRouter(tags=["quotes"])
@@ -867,60 +1173,6 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             "reason": reason,
             "schema_available": bool(getattr(svc, "_HAS_SCHEMA", False)),
         }
-
-    def _sheet_rows_body_from_query(
-        *,
-        page: Optional[str],
-        sheet_name: Optional[str],
-        sheet: Optional[str],
-        name: Optional[str],
-        tab: Optional[str],
-        symbols: Optional[str],
-        tickers: Optional[str],
-        include_headers: Optional[str],
-        include_matrix: Optional[str],
-        limit: Optional[int],
-        top_n: Optional[int],
-    ) -> Dict[str, Any]:
-        body: Dict[str, Any] = {}
-        if page is not None:
-            body["page"] = page
-        if sheet_name is not None:
-            body["sheet_name"] = sheet_name
-        if sheet is not None:
-            body["sheet"] = sheet
-        if name is not None:
-            body["name"] = name
-        if tab is not None:
-            body["tab"] = tab
-        if symbols is not None:
-            body["symbols"] = symbols
-        if tickers is not None:
-            body["tickers"] = tickers
-        if include_headers is not None:
-            body["include_headers"] = include_headers
-        if include_matrix is not None:
-            body["include_matrix"] = include_matrix
-        if limit is not None:
-            body["limit"] = limit
-        if top_n is not None:
-            body["top_n"] = top_n
-        return body
-
-    def _quote_body_from_query(
-        *,
-        symbol: Optional[str],
-        ticker: Optional[str],
-        page: Optional[str],
-    ) -> Dict[str, Any]:
-        body: Dict[str, Any] = {}
-        if symbol is not None:
-            body["symbol"] = symbol
-        if ticker is not None:
-            body["ticker"] = ticker
-        if page is not None:
-            body["page"] = page
-        return body
 
     @enriched.get("/health", include_in_schema=False)
     async def enriched_health() -> Dict[str, Any]:
@@ -966,13 +1218,15 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         keys: Sequence[str],
         symbols: Sequence[str],
         mode_q: str,
+        request: Request,
     ) -> Tuple[List[Dict[str, Any]], int]:
         if not symbols:
             return [], 0
 
-        engine = await svc.get_engine()
+        engine = await svc.get_engine(request)
         if engine is None:
-            raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Data engine unavailable")
+            rows = [svc.normalize_row(keys, {"symbol": s, "ticker": s, "error": "Data engine unavailable"}, symbol_fallback=s) for s in symbols]
+            return rows, len(rows)
 
         quotes_map: Dict[str, Dict[str, Any]] = {}
 
@@ -1001,10 +1255,11 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
                             tmp[sym] = d
                     quotes_map = tmp
                 else:
-                    quotes_map = {s: {"symbol": s, "error": "batch_return_shape_unsupported"} for s in symbols}
+                    quotes_map = {s: {"symbol": s, "ticker": s, "error": "batch_return_shape_unsupported"} for s in symbols}
 
             else:
-                one_fn = getattr(engine, "get_enriched_quote_dict", None)
+                one_fn = getattr(engine, "get_enriched_quote_dict", None) or getattr(engine, "get_quote_dict", None)
+
                 if callable(one_fn):
                     async def _one(sym: str) -> Any:
                         try:
@@ -1022,20 +1277,20 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
                         if isinstance(item, dict):
                             quotes_map[s] = item
                         elif isinstance(item, Exception):
-                            quotes_map[s] = {"symbol": s, "error": f"{type(item).__name__}: {item}"}
+                            quotes_map[s] = {"symbol": s, "ticker": s, "error": f"{type(item).__name__}: {item}"}
                         else:
-                            quotes_map[s] = {"symbol": s, "error": "unknown_item"}
+                            quotes_map[s] = {"symbol": s, "ticker": s, "error": "unknown_item"}
                 else:
-                    quotes_map = {s: {"symbol": s, "error": "engine_missing_quote_methods"} for s in symbols}
+                    quotes_map = {s: {"symbol": s, "ticker": s, "error": "engine_missing_quote_methods"} for s in symbols}
 
         except Exception as e:
-            quotes_map = {s: {"symbol": s, "error": f"{type(e).__name__}: {e}"} for s in symbols}
+            quotes_map = {s: {"symbol": s, "ticker": s, "error": f"{type(e).__name__}: {e}"} for s in symbols}
 
         rows_out: List[Dict[str, Any]] = []
         errors = 0
 
         for s in symbols:
-            raw = quotes_map.get(s) or {"symbol": s, "error": "missing_row"}
+            raw = quotes_map.get(s) or {"symbol": s, "ticker": s, "error": "missing_row"}
             if raw.get("error"):
                 errors += 1
             rows_out.append(svc.normalize_row(keys, raw, symbol_fallback=s))
@@ -1056,7 +1311,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         x_request_id: Optional[str],
     ) -> Dict[str, Any]:
         start = time.time()
-        request_id = x_request_id or uuid.uuid4().hex[:12]
+        request_id = _request_id(request, x_request_id)
 
         token_query_used = bool(token_q and _strip(token_q))
         auth_token = _extract_token(x_app_token, authorization, token_q)
@@ -1077,7 +1332,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         if route_family != "instrument":
             row = svc.normalize_row(
                 keys or ["symbol", "error"],
-                {"symbol": symbol, "error": f"single_quote_not_supported_for_{route_family}_page"},
+                {"symbol": symbol, "ticker": symbol, "error": f"single_quote_not_supported_for_{route_family}_page"},
                 symbol_fallback=symbol,
             )
             return {
@@ -1098,10 +1353,10 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
                 },
             }
 
-        rows_out, errors = await _build_instrument_rows(page_norm, keys or ["symbol", "error"], [symbol], mode_q)
+        rows_out, errors = await _build_instrument_rows(page_norm, keys or ["symbol", "error"], [symbol], mode_q, request)
         row = rows_out[0] if rows_out else svc.normalize_row(
             keys or ["symbol", "error"],
-            {"symbol": symbol, "error": "missing_row"},
+            {"symbol": symbol, "ticker": symbol, "error": "missing_row"},
             symbol_fallback=symbol,
         )
         status_out = "success" if errors == 0 and not row.get("error") else "partial"
@@ -1134,7 +1389,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         x_request_id: Optional[str],
     ) -> Dict[str, Any]:
         start = time.time()
-        request_id = x_request_id or uuid.uuid4().hex[:12]
+        request_id = _request_id(request, x_request_id)
 
         token_query_used = bool(token_q and _strip(token_q))
         auth_token = _extract_token(x_app_token, authorization, token_q)
@@ -1158,6 +1413,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
 
         top_n = _get_int(body, "top_n", 200)
         limit = _get_int(body, "limit", 0)
+        offset = max(0, _get_int(body, "offset", 0))
         if limit > 0:
             top_n = limit
         top_n = max(1, min(5000, top_n))
@@ -1167,7 +1423,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         schema_keys = keys or ["symbol", "error"]
 
         if route_family != "instrument":
-            engine = await svc.get_engine()
+            engine = await svc.get_engine(request)
 
             if route_family == "dictionary":
                 return await svc.build_dictionary_page_payload(
@@ -1240,16 +1496,62 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             }
 
         if not symbols:
+            engine = await svc.get_engine(request)
+            payload = await svc.call_table_mode_best_effort(
+                engine=engine,
+                page=page_norm,
+                limit=max(1, limit) if limit > 0 else 2000,
+                offset=offset,
+                mode=mode_q or "",
+                body=body,
+            )
+
+            if payload is None:
+                return {
+                    "status": "success",
+                    "page": page_norm,
+                    "route_family": route_family,
+                    "headers": headers if include_headers else [],
+                    "keys": schema_keys,
+                    "rows": [],
+                    "rows_matrix": [] if include_matrix else None,
+                    "quotes": [],
+                    "data": [],
+                    "version": ROUTER_VERSION,
+                    "request_id": request_id,
+                    "meta": {
+                        "duration_ms": (time.time() - start) * 1000.0,
+                        "requested": 0,
+                        "errors": 0,
+                        "mode": mode_q,
+                        "dispatch": "schema_only_explicit",
+                    },
+                }
+
+            raw_rows = svc.extract_rows_like(payload)
+            matrix_rows = svc.extract_matrix_like(payload)
+            if not raw_rows and matrix_rows:
+                raw_rows = svc.matrix_to_rows(matrix_rows, schema_keys)
+
+            rows_out = [svc.normalize_row(schema_keys, r) for r in raw_rows]
+            if offset > 0:
+                rows_out = rows_out[offset:]
+            if limit > 0:
+                rows_out = rows_out[:limit]
+
+            status_out, error_out, meta_in = svc.extract_status_error_meta(payload)
+
             return {
-                "status": "success",
+                "status": status_out,
                 "page": page_norm,
                 "route_family": route_family,
                 "headers": headers if include_headers else [],
                 "keys": schema_keys,
-                "rows": [],
-                "rows_matrix": [] if include_matrix else None,
-                "quotes": [],
-                "data": [],
+                "rows": rows_out,
+                "rows_matrix": _rows_matrix(rows_out, schema_keys) if include_matrix else None,
+                "quotes": rows_out,
+                "data": rows_out,
+                "error": error_out,
                 "version": ROUTER_VERSION,
                 "request_id": request_id,
                 "meta": {
@@ -1257,11 +1559,12 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
                     "requested": 0,
                     "errors": 0,
                     "mode": mode_q,
-                    "dispatch": "schema_only_explicit",
+                    "dispatch": "table_mode",
+                    **meta_in,
                 },
             }
 
-        rows_out, errors = await _build_instrument_rows(page_norm, schema_keys, symbols, mode_q)
+        rows_out, errors = await _build_instrument_rows(page_norm, schema_keys, symbols, mode_q, request)
         status_out = "success" if errors == 0 else ("partial" if errors < len(symbols) else "error")
 
         return {
@@ -1316,7 +1619,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         return await _handle_single_quote(request, body, page, mode, token, x_app_token, authorization, x_request_id)
 
     # -------------------------------------------------------------------------
-    # Routes: GET quote (optional compatibility)
+    # Routes: GET quote
     # -------------------------------------------------------------------------
     @enriched.get("/quote", include_in_schema=False)
     async def enriched_quote_get(
@@ -1330,7 +1633,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         authorization: Optional[str] = Header(default=None, alias="Authorization"),
         x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
     ) -> Dict[str, Any]:
-        body = _quote_body_from_query(symbol=symbol, ticker=ticker, page=page)
+        body = _collect_query_body_for_quote(symbol=symbol, ticker=ticker, page=page)
         return await _handle_single_quote(request, body, page, mode, token, x_app_token, authorization, x_request_id)
 
     @enriched_quote_alias.get("/quote", include_in_schema=False)
@@ -1345,7 +1648,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         authorization: Optional[str] = Header(default=None, alias="Authorization"),
         x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
     ) -> Dict[str, Any]:
-        body = _quote_body_from_query(symbol=symbol, ticker=ticker, page=page)
+        body = _collect_query_body_for_quote(symbol=symbol, ticker=ticker, page=page)
         return await _handle_single_quote(request, body, page, mode, token, x_app_token, authorization, x_request_id)
 
     # -------------------------------------------------------------------------
@@ -1376,7 +1679,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
 
     # -------------------------------------------------------------------------
-    # Routes: GET sheet-rows (critical for your live checker)
+    # Routes: GET sheet-rows
     # -------------------------------------------------------------------------
     @enriched.get("/sheet-rows")
     async def enriched_sheet_rows_get(
@@ -1391,6 +1694,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         include_headers: Optional[str] = Query(default=None),
         include_matrix: Optional[str] = Query(default=None),
         limit: Optional[int] = Query(default=None),
+        offset: Optional[int] = Query(default=None),
         top_n: Optional[int] = Query(default=None),
         mode: str = Query(default="", description="Optional mode hint"),
         token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
@@ -1398,7 +1702,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         authorization: Optional[str] = Header(default=None, alias="Authorization"),
         x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
     ) -> Dict[str, Any]:
-        body = _sheet_rows_body_from_query(
+        body = _collect_query_body_for_sheet_rows(
             page=page,
             sheet_name=sheet_name,
             sheet=sheet,
@@ -1409,6 +1713,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             include_headers=include_headers,
             include_matrix=include_matrix,
             limit=limit,
+            offset=offset,
             top_n=top_n,
         )
         return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
@@ -1426,6 +1731,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         include_headers: Optional[str] = Query(default=None),
         include_matrix: Optional[str] = Query(default=None),
         limit: Optional[int] = Query(default=None),
+        offset: Optional[int] = Query(default=None),
         top_n: Optional[int] = Query(default=None),
         mode: str = Query(default="", description="Optional mode hint"),
         token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
@@ -1433,7 +1739,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         authorization: Optional[str] = Header(default=None, alias="Authorization"),
         x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
     ) -> Dict[str, Any]:
-        body = _sheet_rows_body_from_query(
+        body = _collect_query_body_for_sheet_rows(
             page=page,
             sheet_name=sheet_name,
             sheet=sheet,
@@ -1444,6 +1750,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             include_headers=include_headers,
             include_matrix=include_matrix,
             limit=limit,
+            offset=offset,
             top_n=top_n,
         )
         return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
@@ -1476,7 +1783,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         authorization: Optional[str] = Header(default=None, alias="Authorization"),
         x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
     ) -> Dict[str, Any]:
-        body = _quote_body_from_query(symbol=symbol, ticker=ticker, page=page)
+        body = _collect_query_body_for_quote(symbol=symbol, ticker=ticker, page=page)
         return await _handle_single_quote(request, body, page, mode, token, x_app_token, authorization, x_request_id)
 
     @legacy.post("/quotes")
@@ -1504,6 +1811,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         include_headers: Optional[str] = Query(default=None),
         include_matrix: Optional[str] = Query(default=None),
         limit: Optional[int] = Query(default=None),
+        offset: Optional[int] = Query(default=None),
         top_n: Optional[int] = Query(default=None),
         mode: str = Query(default="", description="Optional mode hint"),
         token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
@@ -1511,7 +1819,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         authorization: Optional[str] = Header(default=None, alias="Authorization"),
         x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
     ) -> Dict[str, Any]:
-        body = _sheet_rows_body_from_query(
+        body = _collect_query_body_for_sheet_rows(
             page=page,
             sheet_name=sheet_name,
             sheet=sheet,
@@ -1522,6 +1830,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             include_headers=include_headers,
             include_matrix=include_matrix,
             limit=limit,
+            offset=offset,
             top_n=top_n,
         )
         return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
@@ -1551,6 +1860,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         include_headers: Optional[str] = Query(default=None),
         include_matrix: Optional[str] = Query(default=None),
         limit: Optional[int] = Query(default=None),
+        offset: Optional[int] = Query(default=None),
         top_n: Optional[int] = Query(default=None),
         mode: str = Query(default="", description="Optional mode hint"),
         token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
@@ -1558,7 +1868,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         authorization: Optional[str] = Header(default=None, alias="Authorization"),
         x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
     ) -> Dict[str, Any]:
-        body = _sheet_rows_body_from_query(
+        body = _collect_query_body_for_sheet_rows(
             page=page,
             sheet_name=sheet_name,
             sheet=sheet,
@@ -1569,13 +1879,22 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             include_headers=include_headers,
             include_matrix=include_matrix,
             limit=limit,
+            offset=offset,
             top_n=top_n,
         )
         return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
 
+    # Important: wrapper routers first, optional core router last
     root.include_router(enriched)
     root.include_router(enriched_quote_alias)
     root.include_router(legacy)
+
+    if isinstance(core_router, APIRouter):
+        try:
+            root.include_router(core_router)
+        except Exception as e:
+            logger.warning("Including core enriched router failed: %s", e)
+
     return root
 
 
@@ -1585,7 +1904,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
 def get_router() -> APIRouter:
     """
     Lazily import and return the wrapper router.
-    If core.enriched_quote exists, include it; wrapper endpoints remain guaranteed.
+    If core.enriched_quote exists, include it AFTER wrapper routes so wrapper paths win.
     """
     global router
     if router is not None:
