@@ -2,7 +2,7 @@
 # core/sheets/page_catalog.py
 """
 ================================================================================
-Page Catalog — v3.0.0 (SCHEMA-FIRST / CANONICAL / ROUTE-DISPATCH SAFE)
+Page Catalog — v3.1.0 (SCHEMA-FIRST / CANONICAL / ROUTE-DISPATCH SAFE)
 ================================================================================
 
 Purpose
@@ -17,6 +17,15 @@ Why this revision
 - ✅ FIX: Adds explicit page classification helpers for routing decisions
 - ✅ FIX: Exposes stable helpers for sheet-rows, schema, top10, and meta pages
 - ✅ FIX: Keeps schema_registry as the single source of truth
+- ✅ FIX: Supports common route/query variants:
+      - sheet / sheet_name / page / name / tab
+- ✅ FIX: Adds safer fallback imports for schema_registry variants
+- ✅ FIX: Handles dict-style OR object-style sheet specs
+- ✅ FIX: Ensures Top_10_Investments and Data_Dictionary are always output/special pages
+- ✅ FIX: Adds stable exported aliases expected by route modules:
+      - PAGE_ALIASES
+      - SUPPORTED_PAGES
+      - PAGES
 
 Hard rules
 ----------
@@ -25,17 +34,6 @@ Hard rules
 - Unknown page raises ValueError with allowed pages
 - Forbidden pages are rejected explicitly
 - Canonical pages come from schema_registry only
-
-Canonical pages expected
-------------------------
-- Market_Leaders
-- Global_Markets
-- Commodities_FX
-- Mutual_Funds
-- My_Portfolio
-- Insights_Analysis
-- Top_10_Investments
-- Data_Dictionary
 """
 
 from __future__ import annotations
@@ -48,25 +46,38 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, 
 # Schema Registry (authoritative)
 # --------------------------------------------------------------------------------------
 try:
-    from core.sheets.schema_registry import (  # type: ignore
-        SCHEMA_REGISTRY,
-        CANONICAL_SHEETS,
-        list_sheets,
-        get_sheet_spec,
-    )
+    from core.sheets.schema_registry import SCHEMA_REGISTRY  # type: ignore
 except Exception as e:  # pragma: no cover
-    raise ImportError(f"page_catalog failed to import schema_registry: {e!r}") from e
+    raise ImportError(f"page_catalog failed to import SCHEMA_REGISTRY: {e!r}") from e
+
+try:
+    from core.sheets.schema_registry import CANONICAL_SHEETS  # type: ignore
+except Exception:  # pragma: no cover
+    CANONICAL_SHEETS = []
+
+try:
+    from core.sheets.schema_registry import list_sheets  # type: ignore
+except Exception:  # pragma: no cover
+    list_sheets = None  # type: ignore
+
+try:
+    from core.sheets.schema_registry import get_sheet_spec  # type: ignore
+except Exception as e:  # pragma: no cover
+    raise ImportError(f"page_catalog failed to import get_sheet_spec: {e!r}") from e
 
 
-PAGE_CATALOG_VERSION = "3.0.0"
+PAGE_CATALOG_VERSION = "3.1.0"
 
 __all__ = [
     "PAGE_CATALOG_VERSION",
     "PageInfo",
     "CANONICAL_PAGES",
+    "SUPPORTED_PAGES",
+    "PAGES",
     "FORBIDDEN_PAGES",
     "FORBIDDEN_ALIASES",
     "ALIAS_TO_CANONICAL",
+    "PAGE_ALIASES",
     "OUTPUT_PAGES",
     "SPECIAL_PAGES",
     "INSTRUMENT_PAGES",
@@ -112,7 +123,7 @@ FORBIDDEN_PAGES: Set[str] = {"KSA_Tadawul", "Advisor_Criteria"}
 # Output/meta pages: readable, but generally not input universes for scanners/selectors
 OUTPUT_PAGES: Set[str] = {"Top_10_Investments", "Data_Dictionary"}
 
-# Pages that must never be routed to the generic 80-col instrument fallback by mistake
+# Pages that must never be routed to the generic instrument fallback by mistake
 SPECIAL_PAGES: Set[str] = {"Insights_Analysis", "Top_10_Investments", "Data_Dictionary"}
 
 _DESC_OVERRIDES: Dict[str, str] = {
@@ -170,17 +181,60 @@ def _normalize_token(value: str) -> str:
     s = re.sub(r"_+", "_", s).strip("_")
 
     # Common typo / style harmonization
-    s = s.replace("topten", "top10")
-    s = s.replace("top_10", "top10")
-    s = s.replace("topen", "top10") if s == "topen" else s
-    s = s.replace("investements", "investments")
-    s = s.replace("investmant", "investments")
-    s = s.replace("portfolios", "portfolio")
+    replacements = {
+        "topten": "top10",
+        "top_10": "top10",
+        "top__10": "top10",
+        "investements": "investments",
+        "investement": "investment",
+        "investmant": "investments",
+        "portfolios": "portfolio",
+        "commoditiesandfx": "commodities_fx",
+        "commodities_fx_fx": "commodities_fx",
+        "mutualfund": "mutual_funds",
+        "mutualfunds": "mutual_funds",
+        "globalmarket": "global_markets",
+        "globalmarkets": "global_markets",
+        "marketleaders": "market_leaders",
+        "myportfolio": "my_portfolio",
+        "insightsanalysis": "insights_analysis",
+        "datadictionary": "data_dictionary",
+        "top10investments": "top10_investments",
+        "top10investment": "top10_investments",
+    }
+    s = replacements.get(s, s)
     return s
 
 
 def _canonical_token_for_page(canonical: str) -> str:
     return _normalize_token(canonical)
+
+
+def _spec_kind(spec: Any) -> str:
+    kind = str(_obj_get(spec, "kind", "") or "").strip()
+    if kind:
+        return kind
+
+    columns = _obj_get(spec, "columns")
+    if columns is None and isinstance(spec, Mapping):
+        columns = spec.get("columns")
+
+    cols = _as_list(columns)
+    col_count = len(cols)
+
+    if col_count == 0:
+        return ""
+
+    if col_count == 7:
+        return "insights_output"
+    if col_count == 9:
+        return "dictionary_output"
+    if col_count == 83:
+        return "top10_output"
+    if col_count >= 20:
+        return "instrument_table"
+
+    return ""
 
 
 # --------------------------------------------------------------------------------------
@@ -195,7 +249,6 @@ def _canonical_pages_from_schema() -> List[str]:
         if CANONICAL_SHEETS:
             ordered = [str(s) for s in CANONICAL_SHEETS if str(s) in _CANONICAL_FROM_SCHEMA]
             if ordered:
-                # append any schema pages not present in CANONICAL_SHEETS
                 extras = [s for s in sorted(_CANONICAL_FROM_SCHEMA) if s not in ordered]
                 return ordered + extras
     except Exception:
@@ -203,10 +256,11 @@ def _canonical_pages_from_schema() -> List[str]:
 
     # Prefer list_sheets() if available
     try:
-        sheets = [str(s) for s in list_sheets() if str(s) in _CANONICAL_FROM_SCHEMA]
-        if sheets:
-            extras = [s for s in sorted(_CANONICAL_FROM_SCHEMA) if s not in sheets]
-            return sheets + extras
+        if callable(list_sheets):
+            sheets = [str(s) for s in list_sheets() if str(s) in _CANONICAL_FROM_SCHEMA]
+            if sheets:
+                extras = [s for s in sorted(_CANONICAL_FROM_SCHEMA) if s not in sheets]
+                return sheets + extras
     except Exception:
         pass
 
@@ -214,6 +268,8 @@ def _canonical_pages_from_schema() -> List[str]:
 
 
 CANONICAL_PAGES: List[str] = _canonical_pages_from_schema()
+SUPPORTED_PAGES: List[str] = list(CANONICAL_PAGES)
+PAGES: List[str] = list(CANONICAL_PAGES)
 
 
 # --------------------------------------------------------------------------------------
@@ -223,9 +279,43 @@ def _derive_page_info(canonical: str) -> PageInfo:
     kind = ""
     try:
         spec = get_sheet_spec(canonical)
-        kind = str(_obj_get(spec, "kind", "") or "")
+        kind = _spec_kind(spec)
     except Exception:
         kind = ""
+
+    # Force special/output page behavior first
+    if canonical == "Insights_Analysis":
+        return PageInfo(
+            canonical=canonical,
+            description=_DESC_OVERRIDES.get(canonical, ""),
+            kind=kind or "insights_output",
+            is_data_page=False,
+            is_output_page=False,
+            is_special_page=True,
+            eligible_for_top10=False,
+        )
+
+    if canonical == "Top_10_Investments":
+        return PageInfo(
+            canonical=canonical,
+            description=_DESC_OVERRIDES.get(canonical, ""),
+            kind=kind or "top10_output",
+            is_data_page=False,
+            is_output_page=True,
+            is_special_page=True,
+            eligible_for_top10=False,
+        )
+
+    if canonical == "Data_Dictionary":
+        return PageInfo(
+            canonical=canonical,
+            description=_DESC_OVERRIDES.get(canonical, ""),
+            kind=kind or "dictionary_output",
+            is_data_page=False,
+            is_output_page=True,
+            is_special_page=True,
+            eligible_for_top10=False,
+        )
 
     # Treat instrument_table as the only true input universe type by default
     is_data_page = kind == "instrument_table"
@@ -246,7 +336,10 @@ def _derive_page_info(canonical: str) -> PageInfo:
 
 PAGE_INFO: Dict[str, PageInfo] = {c: _derive_page_info(c) for c in CANONICAL_PAGES}
 
-INSTRUMENT_PAGES: Set[str] = {p for p, info in PAGE_INFO.items() if info.is_data_page and not info.is_special_page}
+INSTRUMENT_PAGES: Set[str] = {
+    p for p, info in PAGE_INFO.items()
+    if info.is_data_page and not info.is_special_page
+}
 
 TOP10_FEED_PAGES_DEFAULT: List[str] = [
     p for p in ["Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds", "My_Portfolio"]
@@ -273,25 +366,30 @@ for c in CANONICAL_PAGES:
     _add_alias(c.replace("_", " "), c)
     _add_alias(c.replace("_", "-"), c)
     _add_alias(c.replace("_", "/"), c)
+    _add_alias(c.replace("_", ""), c)
 
-
+# Generic route parameter names should never map accidentally, but page values should.
 # Friendly aliases
 _add_alias("Market Leaders", "Market_Leaders")
 _add_alias("Leaders", "Market_Leaders")
 _add_alias("Leader", "Market_Leaders")
-_add_alias("Market", "Market_Leaders")
+_add_alias("Market Leaders Page", "Market_Leaders")
+_add_alias("MarketLeader", "Market_Leaders")
 
 _add_alias("Global Markets", "Global_Markets")
 _add_alias("Global Market", "Global_Markets")
 _add_alias("Global", "Global_Markets")
+_add_alias("GlobalMarkets", "Global_Markets")
 
 _add_alias("Commodities FX", "Commodities_FX")
 _add_alias("Commodities & FX", "Commodities_FX")
 _add_alias("Commodities and FX", "Commodities_FX")
 _add_alias("Commodity FX", "Commodities_FX")
 _add_alias("Commodities", "Commodities_FX")
+_add_alias("Commodity", "Commodities_FX")
 _add_alias("FX", "Commodities_FX")
 _add_alias("Forex", "Commodities_FX")
+_add_alias("CommoditiesFX", "Commodities_FX")
 
 _add_alias("Mutual Funds", "Mutual_Funds")
 _add_alias("Mutual Fund", "Mutual_Funds")
@@ -299,17 +397,20 @@ _add_alias("Funds", "Mutual_Funds")
 _add_alias("Fund", "Mutual_Funds")
 _add_alias("ETF", "Mutual_Funds")
 _add_alias("ETFs", "Mutual_Funds")
+_add_alias("MutualFunds", "Mutual_Funds")
 
 _add_alias("My Portfolio", "My_Portfolio")
 _add_alias("Portfolio", "My_Portfolio")
 _add_alias("My Holdings", "My_Portfolio")
 _add_alias("Holdings", "My_Portfolio")
+_add_alias("MyPortfolio", "My_Portfolio")
 
 _add_alias("Insights", "Insights_Analysis")
 _add_alias("Insight", "Insights_Analysis")
 _add_alias("Insights Analysis", "Insights_Analysis")
 _add_alias("Insights-Analysis", "Insights_Analysis")
 _add_alias("Insights & Analysis", "Insights_Analysis")
+_add_alias("InsightsAnalysis", "Insights_Analysis")
 
 for alias in (
     "Top 10",
@@ -340,6 +441,7 @@ for alias in (
 ):
     _add_alias(alias, "Data_Dictionary")
 
+PAGE_ALIASES: Dict[str, str] = dict(ALIAS_TO_CANONICAL)
 
 FORBIDDEN_ALIASES: Set[str] = {
     _normalize_token("KSA_Tadawul"),
@@ -449,7 +551,12 @@ def canonicalize_page(page: str) -> str:
     return normalize_page_name(page, allow_output_pages=True)
 
 
-def normalize_page_names(pages: Sequence[str], *, allow_output_pages: bool = True, dedupe: bool = True) -> List[str]:
+def normalize_page_names(
+    pages: Sequence[str],
+    *,
+    allow_output_pages: bool = True,
+    dedupe: bool = True,
+) -> List[str]:
     out: List[str] = []
     seen: Set[str] = set()
 
@@ -474,7 +581,6 @@ def get_top10_feed_pages(pages_override: Optional[Sequence[str]] = None) -> List
         if info and info.eligible_for_top10 and info.is_data_page and not info.is_special_page:
             normalized.append(canonical)
 
-    # de-duplicate preserve order
     out: List[str] = []
     seen: Set[str] = set()
     for p in normalized:
@@ -522,17 +628,25 @@ def validate_page_catalog() -> None:
     # Critical normalization checks
     must_resolve: List[Tuple[str, str]] = [
         ("Market Leaders", "Market_Leaders"),
+        ("MarketLeaders", "Market_Leaders"),
         ("Global Markets", "Global_Markets"),
+        ("GlobalMarkets", "Global_Markets"),
         ("Commodities & FX", "Commodities_FX"),
+        ("CommoditiesFX", "Commodities_FX"),
         ("Mutual Funds", "Mutual_Funds"),
+        ("MutualFunds", "Mutual_Funds"),
         ("My Portfolio", "My_Portfolio"),
+        ("MyPortfolio", "My_Portfolio"),
         ("Insights Analysis", "Insights_Analysis"),
         ("Insights-Analysis", "Insights_Analysis"),
+        ("InsightsAnalysis", "Insights_Analysis"),
         ("Top 10 Investments", "Top_10_Investments"),
         ("Top10", "Top_10_Investments"),
+        ("Top10Investments", "Top_10_Investments"),
         ("Top Ten Investments", "Top_10_Investments"),
         ("Data Dictionary", "Data_Dictionary"),
         ("Data-Dictionary", "Data_Dictionary"),
+        ("DataDict", "Data_Dictionary"),
     ]
     for raw, expected in must_resolve:
         resolved = normalize_page_name(raw, allow_output_pages=True)
@@ -550,8 +664,17 @@ def validate_page_catalog() -> None:
     for sp in SPECIAL_PAGES:
         if sp not in PAGE_INFO:
             raise ValueError(f"Special page '{sp}' is not registered in PAGE_INFO.")
-        if PAGE_INFO[sp].is_data_page and sp in {"Insights_Analysis", "Data_Dictionary"}:
+        if PAGE_INFO[sp].is_data_page:
             raise ValueError(f"Special page '{sp}' must not be treated as instrument_table.")
+
+    # Output pages must also be special pages
+    for op in OUTPUT_PAGES:
+        if op not in PAGE_INFO:
+            raise ValueError(f"Output page '{op}' is not registered in PAGE_INFO.")
+        if not PAGE_INFO[op].is_output_page:
+            raise ValueError(f"Output page '{op}' must be marked is_output_page=True.")
+        if not PAGE_INFO[op].is_special_page:
+            raise ValueError(f"Output page '{op}' must be marked is_special_page=True.")
 
     # Top10 default feeds must be valid input universes
     for p in TOP10_FEED_PAGES_DEFAULT:
@@ -577,6 +700,22 @@ def validate_page_catalog() -> None:
     missing_expected = expected_core.difference(set(CANONICAL_PAGES))
     if missing_expected:
         raise ValueError(f"Missing expected canonical pages: {sorted(missing_expected)}")
+
+    # Route family checks
+    expected_families = {
+        "Market_Leaders": "instrument",
+        "Global_Markets": "instrument",
+        "Commodities_FX": "instrument",
+        "Mutual_Funds": "instrument",
+        "My_Portfolio": "instrument",
+        "Insights_Analysis": "insights",
+        "Top_10_Investments": "top10",
+        "Data_Dictionary": "dictionary",
+    }
+    for page, family in expected_families.items():
+        got = get_route_family(page)
+        if got != family:
+            raise ValueError(f"Route family mismatch for '{page}': got '{got}', expected '{family}'")
 
 
 # Validate immediately (fast, no I/O)
