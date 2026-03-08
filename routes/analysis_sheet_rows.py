@@ -2,11 +2,12 @@
 # routes/analysis_sheet_rows.py
 """
 ================================================================================
-Analysis Sheet-Rows Router — v2.2.0
+Analysis Sheet-Rows Router — v2.3.0
 ================================================================================
 SCHEMA-FIRST • CANONICAL PAGE DISPATCH • SPECIAL-PAGE SAFE • ROUTE-CANONICAL
 PATH-AWARE AUTH • STABLE RESPONSE SHAPE • POWERSHELL/LIVE-TEST FRIENDLY
 GET+POST SAFE • BUILDER-FLEXIBLE • ENGINE-FLEXIBLE • HEADER/KEY STABLE
+REAL-WORLD PAYLOAD TOLERANT • DATA-ENGINE FALLBACK SAFE
 
 Endpoints
 ---------
@@ -14,37 +15,17 @@ GET  /v1/analysis/health
 GET  /v1/analysis/sheet-rows
 POST /v1/analysis/sheet-rows
 
-Main purpose
-------------
-This route is intended to be the canonical / strongest sheet-rows behavior for:
-- consistent page normalization
-- correct special-page dispatch
-- full schema-aligned headers/keys
-- populated rows where builders/engine support them
-- no accidental fallback of special pages to the generic instrument schema
-
-What this revision improves
----------------------------
-- ✅ FIX: Adds GET /sheet-rows for live browser / PowerShell probing
-- ✅ FIX: Better public-path / auth bypass behavior for health + sheet-rows when configured
-- ✅ FIX: Passes request/path/settings into core.config.auth_ok with multiple safe fallbacks
-- ✅ FIX: More tolerant payload parsing from shared helpers:
-    - rows
-    - rows_matrix
-    - data
-    - items
-    - records
-    - nested payload dictionaries
-- ✅ FIX: Better header/key fallback normalization
-- ✅ FIX: Stable response shape for all page families
-- ✅ FIX: Explicit include_matrix query/body handling
-- ✅ FIX: Special-page handlers return schema-aligned envelopes even on partial failures
-- ✅ FIX: Instrument pages return schema-aligned rows even when engine output is sparse
-- ✅ FIX: Table mode supports both core.data_engine.get_sheet_rows and engine.get_sheet_rows
-- ✅ FIX: Builder calling is more signature-flexible and engine-aware
-- ✅ SAFE: No network I/O at import time
-- ✅ SAFE: Optional auth only if core.config.auth_ok exists
-================================================================================
+Goals
+-----
+- Keep schema_registry as the authority for headers/keys
+- Normalize page names through page_catalog
+- Handle special pages explicitly:
+    - Insights_Analysis
+    - Top_10_Investments
+    - Data_Dictionary
+- Support GET and POST probing from browser / PowerShell / Apps Script
+- Keep response envelopes stable even when builders or engine are partial
+- Avoid import-time network I/O
 """
 
 from __future__ import annotations
@@ -127,13 +108,34 @@ try:
 except Exception:  # pragma: no cover
     core_get_sheet_rows = None  # type: ignore
 
-ANALYSIS_SHEET_ROWS_VERSION = "2.2.0"
+
+ANALYSIS_SHEET_ROWS_VERSION = "2.3.0"
 router = APIRouter(prefix="/v1/analysis", tags=["Analysis Sheet Rows"])
 
 
 # =============================================================================
 # Generic helpers
 # =============================================================================
+_FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
+    "symbol": ["ticker", "code", "instrument", "security", "symbol_code"],
+    "ticker": ["symbol", "code", "instrument", "security"],
+    "current_price": [
+        "price",
+        "last_price",
+        "last",
+        "close",
+        "market_price",
+        "current",
+        "spot",
+        "nav",
+    ],
+    "recommendation_reason": ["reason", "reco_reason", "recommendation_notes"],
+    "top10_rank": ["rank", "top_rank"],
+    "selection_reason": ["selection_notes", "selector_reason"],
+    "criteria_snapshot": ["criteria", "criteria_json", "snapshot"],
+}
+
+
 def _strip(v: Any) -> str:
     try:
         return str(v).strip()
@@ -201,21 +203,32 @@ def _maybe_bool(v: Any, default: bool) -> bool:
     return default
 
 
+def _split_symbols_string(v: str) -> List[str]:
+    raw = (v or "").replace(";", ",").replace("\n", ",").replace("\t", ",")
+    parts = [p.strip() for p in raw.split(",") if p.strip()]
+    out: List[str] = []
+    seen = set()
+    for p in parts:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
 def _get_list(body: Mapping[str, Any], *keys: str) -> List[str]:
     for k in keys:
         v = body.get(k)
         if isinstance(v, list):
             out: List[str] = []
+            seen = set()
             for item in v:
                 s = _strip(item)
-                if s:
+                if s and s not in seen:
+                    seen.add(s)
                     out.append(s)
             return out
         if isinstance(v, str) and v.strip():
-            raw = v.replace(";", ",").replace("\n", ",")
-            parts = [p.strip() for p in raw.split(",") if p.strip()]
-            if parts:
-                return parts
+            return _split_symbols_string(v)
     return []
 
 
@@ -223,7 +236,7 @@ def _to_plain_dict(obj: Any) -> Dict[str, Any]:
     if obj is None:
         return {}
     if isinstance(obj, dict):
-        return obj
+        return dict(obj)
 
     try:
         if hasattr(obj, "model_dump") and callable(getattr(obj, "model_dump")):
@@ -290,9 +303,8 @@ def _collect_get_body(request: Request) -> Dict[str, Any]:
     for key in ("symbols", "tickers", "tickers_list"):
         vals = qp.getlist(key)
         if vals:
-            if len(vals) == 1 and ("," in vals[0] or ";" in vals[0]):
-                split_vals = vals[0].replace(";", ",").split(",")
-                body[key] = [s.strip() for s in split_vals if s.strip()]
+            if len(vals) == 1:
+                body[key] = _split_symbols_string(vals[0])
             else:
                 body[key] = [s.strip() for s in vals if _strip(s)]
             break
@@ -322,7 +334,6 @@ def _is_public_path(settings: Any, path: str) -> bool:
     if p.endswith("/health"):
         return True
 
-    # environment fallback
     public_paths_env = os.getenv("PUBLIC_PATHS", "") or os.getenv("AUTH_PUBLIC_PATHS", "")
     env_paths = [x.strip() for x in public_paths_env.split(",") if x.strip()]
     for candidate in env_paths:
@@ -530,6 +541,15 @@ def _key_variants(key: str) -> List[str]:
         k.replace("_", " "),
         k.replace("_", "").lower(),
     ]
+    for alias in _FIELD_ALIAS_HINTS.get(k, []):
+        variants.extend([
+            alias,
+            alias.lower(),
+            alias.upper(),
+            alias.replace("_", " "),
+            alias.replace("_", "").lower(),
+        ])
+
     seen = set()
     out: List[str] = []
     for v in variants:
@@ -539,6 +559,18 @@ def _key_variants(key: str) -> List[str]:
     return out
 
 
+def _extract_from_raw(raw: Dict[str, Any], candidates: Sequence[str]) -> Any:
+    raw_ci = {str(k).strip().lower(): v for k, v in raw.items()}
+
+    for candidate in candidates:
+        if candidate in raw:
+            return raw.get(candidate)
+        lc = candidate.lower()
+        if lc in raw_ci:
+            return raw_ci.get(lc)
+    return None
+
+
 def _normalize_to_schema_keys(
     *,
     schema_keys: Sequence[str],
@@ -546,7 +578,6 @@ def _normalize_to_schema_keys(
     raw: Mapping[str, Any],
 ) -> Dict[str, Any]:
     raw = dict(raw or {})
-    raw_ci = {str(k).strip().lower(): v for k, v in raw.items()}
 
     header_by_key: Dict[str, str] = {}
     for k, h in zip(schema_keys, schema_headers):
@@ -555,28 +586,23 @@ def _normalize_to_schema_keys(
     out: Dict[str, Any] = {}
     for k in schema_keys:
         ks = str(k)
-        v = None
+        v = _extract_from_raw(raw, _key_variants(ks))
 
-        # direct key matches and light variants
-        for candidate in _key_variants(ks):
-            if candidate in raw:
-                v = raw.get(candidate)
-                break
-            lower_candidate = candidate.lower()
-            if lower_candidate in raw_ci:
-                v = raw_ci.get(lower_candidate)
-                break
-
-        # header matches
         if v is None:
             h = header_by_key.get(ks, "")
             if h:
-                if h in raw:
-                    v = raw.get(h)
-                else:
-                    v = raw_ci.get(h.strip().lower())
+                v = _extract_from_raw(raw, [h, h.lower(), h.upper()])
 
         out[ks] = v
+
+    # Light enrichment / field harmonization
+    if "symbol" in out and not out.get("symbol"):
+        out["symbol"] = _extract_from_raw(raw, _key_variants("symbol"))
+    if "ticker" in out and not out.get("ticker"):
+        out["ticker"] = _extract_from_raw(raw, _key_variants("ticker"))
+
+    if "current_price" in out and out.get("current_price") is None:
+        out["current_price"] = _extract_from_raw(raw, _key_variants("current_price"))
 
     return out
 
@@ -586,33 +612,54 @@ def _extract_rows_like(payload: Any) -> List[Dict[str, Any]]:
         return []
 
     if isinstance(payload, list):
+        if payload and isinstance(payload[0], (list, tuple)):
+            return []
         return [_to_plain_dict(r) for r in payload]
 
     if isinstance(payload, dict):
-        for name in ("rows", "data", "items", "records"):
+        for name in ("rows", "data", "items", "records", "quotes"):
             value = payload.get(name)
             if isinstance(value, list):
+                if value and isinstance(value[0], (list, tuple)):
+                    continue
                 return [_to_plain_dict(r) for r in value]
+
             if isinstance(value, dict):
-                for inner_name in ("rows", "data", "items", "records"):
+                for inner_name in ("rows", "data", "items", "records", "quotes"):
                     inner = value.get(inner_name)
                     if isinstance(inner, list):
+                        if inner and isinstance(inner[0], (list, tuple)):
+                            continue
                         return [_to_plain_dict(r) for r in inner]
+
+        for name in ("payload", "result"):
+            nested = payload.get(name)
+            if isinstance(nested, dict):
+                nested_rows = _extract_rows_like(nested)
+                if nested_rows:
+                    return nested_rows
 
     return []
 
 
 def _extract_matrix_like(payload: Any) -> Optional[List[List[Any]]]:
     if isinstance(payload, dict):
-        value = payload.get("rows_matrix")
-        if isinstance(value, list):
-            return [list(r) if isinstance(r, (list, tuple)) else [r] for r in value]
-
-        nested = payload.get("data")
-        if isinstance(nested, dict):
-            value = nested.get("rows_matrix")
+        for name in ("rows_matrix",):
+            value = payload.get(name)
             if isinstance(value, list):
                 return [list(r) if isinstance(r, (list, tuple)) else [r] for r in value]
+
+        rows_value = payload.get("rows")
+        if isinstance(rows_value, list) and rows_value and isinstance(rows_value[0], (list, tuple)):
+            return [list(r) if isinstance(r, (list, tuple)) else [r] for r in rows_value]
+
+        for name in ("data", "payload", "result"):
+            nested = payload.get(name)
+            if isinstance(nested, dict):
+                mx = _extract_matrix_like(nested)
+                if mx is not None:
+                    return mx
+
     return None
 
 
@@ -679,6 +726,8 @@ def _payload(
         "keys": list(keys),
         "rows": rows_list,
         "rows_matrix": _rows_to_matrix(rows_list, keys) if include_matrix else None,
+        "data": rows_list,
+        "quotes": rows_list,
         "error": error_out,
         "version": ANALYSIS_SHEET_ROWS_VERSION,
         "request_id": request_id,
@@ -831,9 +880,9 @@ async def _fetch_analysis_rows(
                         except TypeError:
                             out[s] = await _call_engine(per_fn, s)
             else:
-                out[s] = {"symbol": s, "error": "engine_missing_quote_method"}
+                out[s] = {"symbol": s, "ticker": s, "error": "engine_missing_quote_method"}
         except Exception as e:
-            out[s] = {"symbol": s, "error": str(e)}
+            out[s] = {"symbol": s, "ticker": s, "error": str(e)}
 
     return out
 
@@ -1163,10 +1212,6 @@ async def _analysis_sheet_rows_impl(
             friendly_name="Insights_Analysis",
         )
 
-        # Keep live tests moving even if builder is unavailable
-        if not rows:
-            rows = [_empty_schema_row(keys)]
-
         rows = _slice(rows, limit=limit, offset=offset)
 
         return _payload(
@@ -1322,7 +1367,7 @@ async def _analysis_sheet_rows_impl(
             meta_extra={
                 "limit": limit,
                 "offset": offset,
-                "dispatch": "core_get_sheet_rows" if payload is not None else "table_mode_fallback",
+                "dispatch": "core_or_engine_get_sheet_rows",
                 **meta_out,
             },
         )
@@ -1347,7 +1392,6 @@ async def _analysis_sheet_rows_impl(
         )
 
     if not engine:
-        # Still return schema-aligned rows so live completeness tests can inspect the endpoint
         fallback_rows = [_empty_schema_row(keys, symbol=s) for s in symbols]
         return _payload(
             page=page,
@@ -1450,6 +1494,7 @@ async def analysis_sheet_rows_get(
     tickers: str = Query(default="", description="comma-separated tickers"),
     limit: Optional[int] = Query(default=None),
     offset: Optional[int] = Query(default=None),
+    top_n: Optional[int] = Query(default=None),
     mode: str = Query(default="", description="Optional mode hint for engine/provider"),
     include_matrix_q: Optional[bool] = Query(default=None, alias="include_matrix"),
     token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
@@ -1468,6 +1513,7 @@ async def analysis_sheet_rows_get(
         "tickers": tickers,
         "limit": limit,
         "offset": offset,
+        "top_n": top_n,
     }.items():
         if v not in (None, ""):
             body[k] = v
