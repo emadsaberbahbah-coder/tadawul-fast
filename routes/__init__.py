@@ -2,14 +2,16 @@
 # routes/__init__.py
 """
 ================================================================================
-TADAWUL FAST BRIDGE — ROUTER DISCOVERY & MOUNT LOGIC (v3.1.0)
+TADAWUL FAST BRIDGE — ROUTER DISCOVERY & MOUNT LOGIC (v3.2.0)
 ================================================================================
 PROD-SAFE • IMPORT-SAFE • RENDER-SAFE • DETERMINISTIC • DUPLICATE-AWARE
-MAIN-PY-COMPATIBLE • DIAGNOSTIC-RICH • REPO-ALIGNED
+MAIN-PY-COMPATIBLE • DIAGNOSTIC-RICH • REPO-ALIGNED • PRIORITY-SAFE
 
 Why this revision
 -----------------
-- ✅ FIX: Keeps your REAL repo router module names and preferred mount order
+- ✅ FIX: Reorders mount priority so authoritative schema router loads BEFORE
+        generic sheet-row helpers and can win duplicate path ownership
+- ✅ FIX: Keeps your real repo router module names and preferred mount order
 - ✅ FIX: Supports include/exclude by logical key OR exact module name
 - ✅ FIX: Avoids duplicate inclusion by route-signature comparison
 - ✅ FIX: Supports module exports in any of these forms:
@@ -19,6 +21,7 @@ Why this revision
       - create_router()
       - mount(app)
 - ✅ FIX: Exposes richer snapshot fields for debugging route exposure problems
+- ✅ FIX: Adds duplicate-details and overlap path diagnostics
 - ✅ FIX: Best-effort safe behavior with optional strict mode
 - ✅ COMPAT: Preserves aliases expected by main.py:
       - mount_all_routers(app)  [preferred]
@@ -127,13 +130,11 @@ def _default_catalog() -> List[RouterSpec]:
     """
     Real repo-aligned mount order.
 
-    Order rationale:
-    1) config / simple routes
-    2) quote routes
-    3) advanced/AI analysis
-    4) advisor routes
-    5) sheet row helpers / metadata
-    6) special selectors / extras
+    IMPORTANT:
+    - data_dictionary MUST mount early so /v1/schema/* endpoints are owned by the
+      authoritative schema router before generic sheet/helper routers are loaded.
+    - enriched_quote should also mount early because it is a primary sheet-rows family.
+    - generic helper routers come later and should lose duplicates safely.
     """
     return [
         RouterSpec(
@@ -144,6 +145,16 @@ def _default_catalog() -> List[RouterSpec]:
         RouterSpec(
             key="enriched_quote",
             candidates=("routes.enriched_quote",),
+            required=False,
+        ),
+        RouterSpec(
+            key="data_dictionary",
+            candidates=("routes.data_dictionary",),
+            required=False,
+        ),
+        RouterSpec(
+            key="investment_advisor",
+            candidates=("routes.investment_advisor",),
             required=False,
         ),
         RouterSpec(
@@ -162,11 +173,6 @@ def _default_catalog() -> List[RouterSpec]:
             required=False,
         ),
         RouterSpec(
-            key="investment_advisor",
-            candidates=("routes.investment_advisor",),
-            required=False,
-        ),
-        RouterSpec(
             key="analysis_sheet_rows",
             candidates=("routes.analysis_sheet_rows",),
             required=False,
@@ -174,11 +180,6 @@ def _default_catalog() -> List[RouterSpec]:
         RouterSpec(
             key="advanced_sheet_rows",
             candidates=("routes.advanced_sheet_rows",),
-            required=False,
-        ),
-        RouterSpec(
-            key="data_dictionary",
-            candidates=("routes.data_dictionary",),
             required=False,
         ),
         RouterSpec(
@@ -279,7 +280,6 @@ def get_mount_plan() -> List[str]:
     resolved, _missing_required = _resolve_catalog(_default_catalog())
     resolved = _filter_resolved_entries(resolved)
     plan = [str(x["module"]) for x in resolved if x.get("module")]
-    # de-duplicate preserve order
     seen: Set[str] = set()
     out: List[str] = []
     for m in plan:
@@ -376,10 +376,20 @@ def _router_would_duplicate_existing(app: Any, router: Any) -> bool:
     return router_sigs.issubset(app_sigs)
 
 
+def _route_overlap_with_app(app: Any, router: Any) -> List[Tuple[str, str]]:
+    router_sigs = _router_route_signature_set(router)
+    if not router_sigs:
+        return []
+    app_sigs = _app_route_signature_set(app)
+    overlap = sorted(router_sigs.intersection(app_sigs))
+    return overlap
+
+
 def _get_or_init_snapshot_store(app: Any) -> Dict[str, Any]:
     snap = {
         "mounted_modules": [],
         "duplicate_skips": [],
+        "duplicate_details": {},
         "missing_modules": [],
         "import_errors": {},
         "mount_errors": {},
@@ -405,7 +415,7 @@ def _get_or_init_snapshot_store(app: Any) -> Dict[str, Any]:
 def _mount_one(
     app: Any,
     module_name: str,
-) -> Tuple[bool, Optional[str], str]:
+) -> Tuple[bool, Optional[str], str, Optional[Dict[str, Any]]]:
     """
     Mount strategies:
     - module.router -> app.include_router(router)
@@ -413,7 +423,7 @@ def _mount_one(
     - module.mount(app)
 
     Returns:
-      (success, error_message, mode)
+      (success, error_message, mode, details)
 
     mode in:
       - "router_attr"
@@ -428,7 +438,7 @@ def _mount_one(
     """
     mod, exc = _import_module(module_name)
     if mod is None:
-        return False, _err_to_str(exc or Exception("import failed")), "import_error"
+        return False, _err_to_str(exc or Exception("import failed")), "import_error", None
 
     router, source = _get_router_from_module(mod)
     mount_fn = getattr(mod, "mount", None)
@@ -436,18 +446,33 @@ def _mount_one(
     try:
         if router is not None:
             if _router_would_duplicate_existing(app, router):
-                return True, None, "duplicate_skip"
+                overlap = _route_overlap_with_app(app, router)
+                return True, None, "duplicate_skip", {
+                    "overlap_count": len(overlap),
+                    "overlap_paths": overlap[:50],
+                    "router_prefix": str(getattr(router, "prefix", "") or ""),
+                    "router_route_count": len(getattr(router, "routes", []) or []),
+                }
             app.include_router(router)
-            return True, None, source
+            return True, None, source, {
+                "router_prefix": str(getattr(router, "prefix", "") or ""),
+                "router_route_count": len(getattr(router, "routes", []) or []),
+            }
 
         if callable(mount_fn):
+            before = _app_route_signature_set(app)
             mount_fn(app)
-            return True, None, "mount_fn"
+            after = _app_route_signature_set(app)
+            added = sorted(after - before)
+            return True, None, "mount_fn", {
+                "added_count": len(added),
+                "added_paths": added[:50],
+            }
 
-        return False, "No router export and no mount(app) function found", "no_router"
+        return False, "No router export and no mount(app) function found", "no_router", None
 
     except Exception as e:
-        return False, _err_to_str(e), "mount_error"
+        return False, _err_to_str(e), "mount_error", None
 
 
 # ======================================================================================
@@ -478,6 +503,7 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
 
     mounted: List[str] = []
     duplicate_skips: List[str] = []
+    duplicate_details: Dict[str, Any] = {}
     missing: List[str] = []
     import_errors: Dict[str, str] = {}
     mount_errors: Dict[str, str] = {}
@@ -495,7 +521,6 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
             resolved_map[key] = str(module_name)
             plan_modules.append(str(module_name))
 
-    # de-duplicate modules preserve order
     seen_plan: Set[str] = set()
     plan_modules_unique: List[str] = []
     for m in plan_modules:
@@ -511,7 +536,6 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
             all_candidates = entry.get("all_candidates") or []
             existing_candidates = entry.get("existing_candidates") or []
             if all_candidates and not existing_candidates:
-                # logical slot unresolved
                 continue
             continue
 
@@ -522,17 +546,18 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
             missing.append(module_name)
             continue
 
-        ok, err, mode = _mount_one(app, module_name)
+        ok, err, mode, details = _mount_one(app, module_name)
 
         if ok:
             if mode == "duplicate_skip":
                 duplicate_skips.append(module_name)
+                if details:
+                    duplicate_details[module_name] = details
             else:
                 mounted.append(module_name)
 
             mount_modes[module_name] = mode
 
-            # record router signature for diagnostics when possible
             try:
                 mod = importlib.import_module(module_name)
                 router, _source = _get_router_from_module(mod)
@@ -564,6 +589,7 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
         "mounted_count": len(mounted),
         "duplicate_skips": duplicate_skips,
         "duplicate_skips_count": len(duplicate_skips),
+        "duplicate_details": duplicate_details,
         "missing": missing,
         "missing_count": len(missing),
         "import_errors": import_errors,
@@ -612,6 +638,10 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
         logger.warning("Routers with no router/mount: %s", json.dumps(no_router, ensure_ascii=False))
     if duplicate_skips:
         logger.info("Duplicate router skips: %s", ", ".join(duplicate_skips))
+        try:
+            logger.info("Duplicate router details: %s", json.dumps(duplicate_details, ensure_ascii=False, default=str))
+        except Exception:
+            pass
 
     try:
         if hasattr(app, "state"):
