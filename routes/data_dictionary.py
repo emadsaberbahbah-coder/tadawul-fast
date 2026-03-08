@@ -2,7 +2,7 @@
 # routes/data_dictionary.py
 """
 ================================================================================
-Schema Router — v2.1.0 (UNIFIED / REGISTRY-FIRST / DATA-DICTIONARY FALLBACK)
+Schema Router — v2.2.0 (UNIFIED / REGISTRY-FIRST / SHEET-SPEC HARDENED)
 ================================================================================
 
 Endpoints
@@ -10,29 +10,33 @@ Endpoints
 GET /v1/schema/data-dictionary
 GET /v1/schema/sheet-spec
 GET /v1/schema/pages
+GET /v1/schema/health
 
 Purpose
 -------
 Single schema router that exposes:
 - authoritative Data_Dictionary output
-- true sheet-spec output (grouped by sheet, not flattened dictionary rows)
-- supported pages list / aliases metadata
+- true sheet-spec output (grouped per sheet, not flattened by mistake)
+- supported pages and aliases metadata
 
 Why this revision
 -----------------
-- ✅ FIX: /v1/schema/sheet-spec is no longer dependent on one fragile import path
-- ✅ FIX: Falls back to Data_Dictionary builders if schema_registry helpers are partial
-- ✅ FIX: /v1/schema/pages always returns extractable pages/items/results arrays
-- ✅ FIX: Handles dict-style, object-style, and list-style schema definitions safely
-- ✅ FIX: Keeps Apps-Script friendly response shapes and consistent metadata
+- ✅ FIX: /v1/schema/sheet-spec is hardened against partial schema_registry exports
+- ✅ FIX: /v1/schema/pages always returns pages/items/results/sheets arrays
+- ✅ FIX: Supports registry-first resolution with graceful fallback to Data_Dictionary
+- ✅ FIX: Handles dict-style, object-style, list-style, headers/keys-style schema safely
+- ✅ FIX: Supports get_sheet_spec/get_sheet_headers/get_sheet_keys/list_sheets variants
+- ✅ FIX: Keeps Apps-Script and PowerShell friendly response shapes
+- ✅ FIX: Safer auth calling across multiple core.config.auth_ok signatures
 - ✅ SAFE: No quote engine / provider / network calls
-- ✅ SAFE: Optional auth only, open-mode aware
 - ✅ SAFE: Import-hardened for partial repo states
+================================================================================
 """
 
 from __future__ import annotations
 
 import importlib
+import os
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -45,15 +49,13 @@ except Exception:  # pragma: no cover
     BestJSONResponse = JSONResponse  # type: ignore
 
 
-SCHEMA_ROUTE_VERSION = "2.1.0"
-
+SCHEMA_ROUTE_VERSION = "2.2.0"
 router = APIRouter(prefix="/v1/schema", tags=["Schema"])
 
 
 # --------------------------------------------------------------------------------------
 # Canonical fallbacks
 # --------------------------------------------------------------------------------------
-
 _CANONICAL_PAGES_FALLBACK: List[str] = [
     "Market_Leaders",
     "Global_Markets",
@@ -79,11 +81,13 @@ _DATA_DICTIONARY_HEADERS: List[str] = [
 
 _DATA_DICTIONARY_KEYS: List[str] = list(_DATA_DICTIONARY_HEADERS)
 
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled"}
+_FALSY = {"0", "false", "no", "n", "off", "f", "disabled"}
+
 
 # --------------------------------------------------------------------------------------
 # Optional modules (kept defensive)
 # --------------------------------------------------------------------------------------
-
 def _safe_import(module_name: str) -> Any:
     try:
         return importlib.import_module(module_name)
@@ -121,20 +125,39 @@ _get_sheet_spec_callable = _resolve_attr(
     "get_schema_for_sheet",
     "get_sheet_schema",
 )
+_get_sheet_headers_callable = _resolve_attr(
+    _schema_registry_mod,
+    "get_sheet_headers",
+    "get_headers_for_sheet",
+)
+_get_sheet_keys_callable = _resolve_attr(
+    _schema_registry_mod,
+    "get_sheet_keys",
+    "get_keys_for_sheet",
+)
+_list_sheets_callable = _resolve_attr(
+    _schema_registry_mod,
+    "list_sheets",
+    "get_sheet_names",
+    "list_pages",
+)
 
 _normalize_page_name = _resolve_attr(_page_catalog_mod, "normalize_page_name")
-_PAGE_ALIASES = _resolve_attr(_page_catalog_mod, "PAGE_ALIASES")
+_get_page_aliases_callable = _resolve_attr(_page_catalog_mod, "get_page_aliases")
+_CANONICAL_PAGES = _resolve_attr(_page_catalog_mod, "CANONICAL_PAGES")
 _SUPPORTED_PAGES = _resolve_attr(_page_catalog_mod, "SUPPORTED_PAGES")
 _PAGES = _resolve_attr(_page_catalog_mod, "PAGES")
+_PAGE_ALIASES = _resolve_attr(_page_catalog_mod, "PAGE_ALIASES")
 
 auth_ok = _resolve_attr(_config_mod, "auth_ok")
 is_open_mode = _resolve_attr(_config_mod, "is_open_mode")
+get_settings_cached = _resolve_attr(_config_mod, "get_settings_cached")
+mask_settings = _resolve_attr(_config_mod, "mask_settings")
 
 
 # --------------------------------------------------------------------------------------
 # Small helpers
 # --------------------------------------------------------------------------------------
-
 def _now_utc() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -170,9 +193,9 @@ def _bool_q(v: Optional[str], default: bool) -> bool:
     if v is None:
         return default
     s = str(v).strip().lower()
-    if s in {"1", "true", "yes", "y", "on"}:
+    if s in _TRUTHY:
         return True
-    if s in {"0", "false", "no", "n", "off"}:
+    if s in _FALSY:
         return False
     return default
 
@@ -183,6 +206,9 @@ def _get_request_id(request: Optional[Request]) -> str:
             rid = request.headers.get("X-Request-ID")
             if rid:
                 return str(rid).strip()
+            state_rid = getattr(getattr(request, "state", None), "request_id", None)
+            if state_rid:
+                return str(state_rid).strip()
     except Exception:
         pass
     return "schema"
@@ -202,49 +228,6 @@ def _error(status_code: int, message: str, *, request_id: str) -> BestJSONRespon
     )
 
 
-def _auth_passed(
-    *,
-    token: Optional[str],
-    x_app_token: Optional[str],
-    authorization: Optional[str],
-) -> bool:
-    try:
-        if callable(is_open_mode) and bool(is_open_mode()):
-            return True
-    except Exception:
-        pass
-
-    if auth_ok is None:
-        return True
-
-    auth_token = (x_app_token or "").strip()
-    authz = (authorization or "").strip()
-
-    if authz.lower().startswith("bearer "):
-        auth_token = authz.split(" ", 1)[1].strip()
-    elif token and not auth_token:
-        auth_token = token.strip()
-
-    try:
-        return bool(
-            auth_ok(
-                token=auth_token or None,
-                authorization=authorization,
-                headers={
-                    "X-APP-TOKEN": x_app_token,
-                    "Authorization": authorization,
-                },
-            )
-        )
-    except TypeError:
-        try:
-            return bool(auth_ok(auth_token or None))
-        except Exception:
-            return False
-    except Exception:
-        return False
-
-
 def _dedupe_keep_order(values: Iterable[Any]) -> List[str]:
     out: List[str] = []
     seen = set()
@@ -260,12 +243,137 @@ def _dedupe_keep_order(values: Iterable[Any]) -> List[str]:
     return out
 
 
+def _empty_if_none(v: Any) -> str:
+    return "" if v is None else str(v).strip()
+
+
+# --------------------------------------------------------------------------------------
+# Auth helpers
+# --------------------------------------------------------------------------------------
+def _is_public_path(path: str) -> bool:
+    p = (path or "").strip()
+    if not p:
+        return False
+
+    if p in {
+        "/v1/schema/health",
+        "/v1/schema/pages",
+        "/v1/schema/sheet-spec",
+        "/v1/schema/data-dictionary",
+    }:
+        return True
+
+    env_paths = os.getenv("PUBLIC_PATHS", "") or os.getenv("AUTH_PUBLIC_PATHS", "")
+    for raw in env_paths.split(","):
+        candidate = raw.strip()
+        if not candidate:
+            continue
+        if candidate.endswith("*") and p.startswith(candidate[:-1]):
+            return True
+        if p == candidate:
+            return True
+
+    return False
+
+
+def _auth_passed(
+    *,
+    request: Request,
+    token: Optional[str],
+    x_app_token: Optional[str],
+    authorization: Optional[str],
+) -> bool:
+    try:
+        if callable(is_open_mode) and bool(is_open_mode()):
+            return True
+    except Exception:
+        pass
+
+    if _is_public_path(str(getattr(getattr(request, "url", None), "path", "") or "")):
+        return True
+
+    if auth_ok is None:
+        return True
+
+    auth_token = (x_app_token or "").strip()
+    authz = (authorization or "").strip()
+
+    if authz.lower().startswith("bearer "):
+        auth_token = authz.split(" ", 1)[1].strip()
+    elif token and not auth_token:
+        auth_token = token.strip()
+
+    headers_dict = dict(request.headers)
+    path = str(getattr(getattr(request, "url", None), "path", "") or "")
+
+    settings = None
+    try:
+        if callable(get_settings_cached):
+            settings = get_settings_cached()
+    except Exception:
+        settings = None
+
+    call_attempts = [
+        {
+            "token": auth_token or None,
+            "authorization": authorization,
+            "headers": headers_dict,
+            "path": path,
+            "request": request,
+            "settings": settings,
+        },
+        {
+            "token": auth_token or None,
+            "authorization": authorization,
+            "headers": headers_dict,
+            "path": path,
+            "request": request,
+        },
+        {
+            "token": auth_token or None,
+            "authorization": authorization,
+            "headers": headers_dict,
+            "path": path,
+        },
+        {
+            "token": auth_token or None,
+            "authorization": authorization,
+            "headers": headers_dict,
+        },
+        {
+            "token": auth_token or None,
+            "authorization": authorization,
+        },
+        {
+            "token": auth_token or None,
+        },
+    ]
+
+    for kwargs in call_attempts:
+        try:
+            return bool(auth_ok(**kwargs))
+        except TypeError:
+            continue
+        except Exception:
+            return False
+
+    return False
+
+
 # --------------------------------------------------------------------------------------
 # Page catalog helpers
 # --------------------------------------------------------------------------------------
-
 def _get_page_aliases() -> Dict[str, str]:
     aliases: Dict[str, str] = {}
+
+    if callable(_get_page_aliases_callable):
+        try:
+            raw_aliases = _get_page_aliases_callable()
+            if isinstance(raw_aliases, Mapping):
+                for k, v in raw_aliases.items():
+                    aliases[str(k).strip().lower()] = str(v).strip()
+        except Exception:
+            pass
 
     if isinstance(_PAGE_ALIASES, Mapping):
         for k, v in _PAGE_ALIASES.items():
@@ -287,6 +395,7 @@ def _get_page_aliases() -> Dict[str, str]:
     aliases.setdefault("insights analysis", "Insights_Analysis")
     aliases.setdefault("insights & analysis", "Insights_Analysis")
     aliases.setdefault("top 10 investments", "Top_10_Investments")
+    aliases.setdefault("top10", "Top_10_Investments")
     aliases.setdefault("data dictionary", "Data_Dictionary")
 
     return aliases
@@ -302,16 +411,21 @@ def _normalize_page_candidate(name: Optional[str]) -> Optional[str]:
 
     if callable(_normalize_page_name):
         try:
-            normalized = _normalize_page_name(raw)
+            normalized = _normalize_page_name(raw, allow_output_pages=True)
             if normalized:
                 return str(normalized)
+        except TypeError:
+            try:
+                normalized = _normalize_page_name(raw)
+                if normalized:
+                    return str(normalized)
+            except Exception:
+                pass
         except Exception:
             pass
 
     for page in _get_all_pages():
-        if raw == page:
-            return page
-        if raw.lower() == page.lower():
+        if raw == page or raw.lower() == page.lower():
             return page
 
     aliases = _get_page_aliases()
@@ -425,7 +539,13 @@ def _schema_registry_mapping() -> Dict[str, Any]:
 def _registry_pages() -> List[str]:
     pages: List[str] = []
 
-    for candidate in (_SUPPORTED_PAGES, _PAGES):
+    if callable(_list_sheets_callable):
+        try:
+            pages.extend(_extract_pages_from_object(_list_sheets_callable()))
+        except Exception:
+            pass
+
+    for candidate in (_CANONICAL_PAGES, _SUPPORTED_PAGES, _PAGES):
         pages.extend(_extract_pages_from_object(candidate))
 
     registry_map = _schema_registry_mapping()
@@ -446,7 +566,6 @@ def _get_all_pages() -> List[str]:
 # --------------------------------------------------------------------------------------
 # Schema normalization helpers
 # --------------------------------------------------------------------------------------
-
 def _normalize_column(col: Any) -> Dict[str, Any]:
     group = _obj_get(col, "group")
     header = _obj_get(col, "header")
@@ -470,7 +589,7 @@ def _normalize_column(col: Any) -> Dict[str, Any]:
     return {
         "group": group,
         "header": header,
-        "key": key,
+        "key": key or header,
         "dtype": dtype,
         "fmt": fmt,
         "required": required,
@@ -556,6 +675,27 @@ def _normalize_sheet_spec(sheet_name: str, spec: Any) -> Dict[str, Any]:
 
 
 def _find_spec_in_registry(sheet_name: str) -> Any:
+    if callable(_get_sheet_spec_callable):
+        try:
+            return _get_sheet_spec_callable(sheet_name)
+        except Exception:
+            pass
+
+    headers = []
+    keys = []
+    if callable(_get_sheet_headers_callable):
+        try:
+            headers = [str(x) for x in _as_list(_get_sheet_headers_callable(sheet_name))]
+        except Exception:
+            headers = []
+    if callable(_get_sheet_keys_callable):
+        try:
+            keys = [str(x) for x in _as_list(_get_sheet_keys_callable(sheet_name))]
+        except Exception:
+            keys = []
+    if headers or keys:
+        return {"headers": headers, "keys": keys or headers}
+
     registry_map = _schema_registry_mapping()
     if registry_map:
         for candidate in (
@@ -572,12 +712,6 @@ def _find_spec_in_registry(sheet_name: str) -> Any:
                     return v
             except Exception:
                 continue
-
-    if callable(_get_sheet_spec_callable):
-        try:
-            return _get_sheet_spec_callable(sheet_name)
-        except Exception:
-            pass
 
     return None
 
@@ -613,7 +747,6 @@ def _get_all_sheet_specs() -> Dict[str, Dict[str, Any]]:
 # --------------------------------------------------------------------------------------
 # Data dictionary helpers
 # --------------------------------------------------------------------------------------
-
 def _get_data_dictionary_headers_and_keys() -> Tuple[List[str], List[str]]:
     try:
         spec = _get_sheet_spec_safe("Data_Dictionary")
@@ -761,9 +894,44 @@ def _build_data_dictionary_values_safe(include_meta_sheet: bool) -> List[List[An
 
 
 # --------------------------------------------------------------------------------------
+# Health
+# --------------------------------------------------------------------------------------
+@router.get("/health")
+def get_schema_health(request: Request) -> BestJSONResponse:
+    request_id = _get_request_id(request)
+
+    settings_summary = None
+    try:
+        if callable(mask_settings) and callable(get_settings_cached):
+            settings = get_settings_cached()
+            masked = mask_settings(settings)
+            if isinstance(masked, Mapping):
+                settings_summary = {
+                    "open_mode_effective": masked.get("open_mode_effective"),
+                    "token_count": masked.get("token_count"),
+                }
+    except Exception:
+        settings_summary = None
+
+    payload = {
+        "status": "ok",
+        "endpoint": "health",
+        "version": SCHEMA_ROUTE_VERSION,
+        "schema_version": SCHEMA_VERSION,
+        "generated_at_utc": _now_utc(),
+        "request_id": request_id,
+        "schema_registry_available": _schema_registry_mod is not None,
+        "data_dictionary_module_available": _data_dictionary_mod is not None,
+        "page_catalog_available": _page_catalog_mod is not None,
+        "pages_count": len(_get_all_pages()),
+        "settings": settings_summary,
+    }
+    return BestJSONResponse(status_code=200, content=payload)
+
+
+# --------------------------------------------------------------------------------------
 # Routes
 # --------------------------------------------------------------------------------------
-
 @router.get("/data-dictionary")
 def get_data_dictionary(
     request: Request,
@@ -781,7 +949,7 @@ def get_data_dictionary(
 ) -> BestJSONResponse:
     request_id = _get_request_id(request)
 
-    if not _auth_passed(token=token, x_app_token=x_app_token, authorization=authorization):
+    if not _auth_passed(request=request, token=token, x_app_token=x_app_token, authorization=authorization):
         return _error(401, "Invalid token", request_id=request_id)
 
     include_meta = _bool_q(include_meta_sheet, True)
@@ -805,6 +973,7 @@ def get_data_dictionary(
                     "headers": headers,
                     "keys": keys,
                     "values": values,
+                    "rows_matrix": values[1:] if len(values) > 1 else [],
                     "version": SCHEMA_ROUTE_VERSION,
                     "schema_version": SCHEMA_VERSION,
                     "generated_at_utc": generated_at_utc,
@@ -859,7 +1028,7 @@ def get_sheet_spec_route(
 ) -> BestJSONResponse:
     request_id = _get_request_id(request)
 
-    if not _auth_passed(token=token, x_app_token=x_app_token, authorization=authorization):
+    if not _auth_passed(request=request, token=token, x_app_token=x_app_token, authorization=authorization):
         return _error(401, "Invalid token", request_id=request_id)
 
     fmt = (format or "grouped").strip().lower()
@@ -919,6 +1088,7 @@ def get_sheet_spec_route(
             "pages": list(specs.keys()),
             "items": list(specs.keys()),
             "results": list(specs.keys()),
+            "sheets": list(specs.keys()),
             "aliases": page_aliases,
             "data": payload,
             "version": SCHEMA_ROUTE_VERSION,
@@ -956,7 +1126,7 @@ def get_schema_pages(
 ) -> BestJSONResponse:
     request_id = _get_request_id(request)
 
-    if not _auth_passed(token=token, x_app_token=x_app_token, authorization=authorization):
+    if not _auth_passed(request=request, token=token, x_app_token=x_app_token, authorization=authorization):
         return _error(401, "Invalid token", request_id=request_id)
 
     try:
@@ -970,6 +1140,7 @@ def get_schema_pages(
             "pages": pages,
             "items": pages,
             "results": pages,
+            "sheets": pages,
             "count": len(pages),
             "version": SCHEMA_ROUTE_VERSION,
             "schema_version": SCHEMA_VERSION,
