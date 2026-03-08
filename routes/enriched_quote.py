@@ -2,38 +2,46 @@
 # routes/enriched_quote.py
 """
 ================================================================================
-TFB Enriched Quote Routes Wrapper — v6.1.0
+TFB Enriched Quote Routes Wrapper — v6.2.0
 ================================================================================
 RENDER-SAFE • SCHEMA-AWARE • PAGE-DISPATCH SAFE • HEADER/ROW BALANCED
-SPECIAL-BUILDER PRESERVING • ASYNC-SAFE • NULL-ROW AVOIDANCE
+SPECIAL-BUILDER PRESERVING • ASYNC-SAFE • GET+POST COMPATIBLE
+QUERY/BODY MERGE • LEGACY ALIAS SAFE • NULL-ROW AVOIDANCE
 
 Why this revision
 -----------------
-- ✅ FIX: Properly awaits async special builders (Top10 / Insights)
-- ✅ FIX: Preserves payload-style builder output instead of collapsing it into
-  a schema-aligned null row
-- ✅ FIX: Prevents Top_10_Investments from returning a fake one-row null payload
-- ✅ FIX: Uses builder-supplied headers/keys/rows/rows_matrix when available
+- ✅ FIX: Adds GET support for /sheet-rows (your live checker uses GET, not POST)
+- ✅ FIX: Adds /v1/enriched_quote compatibility aliases alongside /v1/enriched
+- ✅ FIX: Accepts page/sheet/sheet_name/name/tab and tickers/symbols from query params
+- ✅ FIX: Preserves payload-style builder output instead of collapsing to null rows
+- ✅ FIX: Keeps Top_10_Investments / Insights / Data_Dictionary dispatch working even
+        when schema/page helpers are partially unavailable
+- ✅ FIX: Adds stronger fallback route-family detection for special pages
+- ✅ FIX: Can derive schema from Data_Dictionary builder if schema registry is partial
 - ✅ FIX: Keeps instrument pages engine-backed and schema-aligned
-- ✅ FIX: Keeps Data_Dictionary local and stable
-- ✅ FIX: More defensive argument calling for builder compatibility
-- ✅ FIX: Better runtime meta for debugging route dispatch
 - ✅ SAFE: No network I/O at import-time
 - ✅ SAFE: No Prometheus metric creation here
 
 Behavior
 --------
-- POST /quotes
-- POST /quote
-- POST /v1/enriched/quote
-- POST /v1/enriched/sheet-rows
-
-Dispatch model
---------------
+Supported route families:
 - instrument pages      -> engine-backed quote rows
 - insights page         -> local insights builder if available
 - top10 page            -> local top10 builder if available
 - data_dictionary page  -> local data dictionary builder
+
+Compatibility routes
+--------------------
+- POST /quote
+- POST /quotes
+- GET  /sheet-rows
+- POST /sheet-rows
+- POST /v1/enriched/quote
+- POST /v1/enriched/sheet-rows
+- GET  /v1/enriched/sheet-rows
+- POST /v1/enriched_quote/quote
+- POST /v1/enriched_quote/sheet-rows
+- GET  /v1/enriched_quote/sheet-rows
 """
 
 from __future__ import annotations
@@ -50,7 +58,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 
 logger = logging.getLogger("routes.enriched_quote")
 
-ROUTER_VERSION = "6.1.0"
+ROUTER_VERSION = "6.2.0"
 
 # Kept lazy for dynamic mount behavior
 router: Optional[APIRouter] = None
@@ -94,7 +102,8 @@ def _get_list(body: Mapping[str, Any], *keys: str) -> List[str]:
                 s = _strip(item)
                 if s:
                     out.append(s)
-            return out
+            if out:
+                return out
         if isinstance(v, str) and v.strip():
             parts = [p.strip() for p in v.split(",") if p.strip()]
             if parts:
@@ -133,7 +142,11 @@ def _get_int(body: Mapping[str, Any], key: str, default: int) -> int:
     return int(default)
 
 
-def _extract_token(x_app_token: Optional[str], authorization: Optional[str], token_query: Optional[str]) -> str:
+def _extract_token(
+    x_app_token: Optional[str],
+    authorization: Optional[str],
+    token_query: Optional[str],
+) -> str:
     tok = _strip(x_app_token)
     auth = _strip(authorization)
 
@@ -214,6 +227,17 @@ def _first_list(*vals: Any) -> List[Any]:
         if isinstance(v, list):
             return v
     return []
+
+
+def _merge_non_empty(base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(base)
+    for k, v in extra.items():
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
+        out[k] = v
+    return out
 
 
 # =============================================================================
@@ -338,38 +362,165 @@ class _Service:
             return None
 
     # -----------------------------------------------------------------
-    # Schema
+    # Page normalization / routing
     # -----------------------------------------------------------------
+    def _fallback_normalize_page(self, raw: str) -> str:
+        s = _strip(raw)
+        if not s:
+            return "Market_Leaders"
+
+        compact = s.replace("-", "_").replace(" ", "_").lower()
+
+        mapping = {
+            "market_leaders": "Market_Leaders",
+            "global_markets": "Global_Markets",
+            "commodities_fx": "Commodities_FX",
+            "commodities___fx": "Commodities_FX",
+            "mutual_funds": "Mutual_Funds",
+            "my_portfolio": "My_Portfolio",
+            "insights_analysis": "Insights_Analysis",
+            "insights___analysis": "Insights_Analysis",
+            "top_10_investments": "Top_10_Investments",
+            "data_dictionary": "Data_Dictionary",
+        }
+        return mapping.get(compact, s)
+
     def normalize_page(self, raw: str) -> str:
         page = _strip(raw) or "Market_Leaders"
         try:
-            return self.normalize_page_name(page, allow_output_pages=True)
+            out = self.normalize_page_name(page, allow_output_pages=True)
+            if _strip(out):
+                return str(out)
         except Exception:
-            return page
+            pass
+        return self._fallback_normalize_page(page)
+
+    def _fallback_route_family(self, page: str) -> str:
+        p = self._fallback_normalize_page(page)
+        if p == "Insights_Analysis":
+            return "insights"
+        if p == "Top_10_Investments":
+            return "top10"
+        if p == "Data_Dictionary":
+            return "dictionary"
+        return "instrument"
 
     def route_family(self, page: str) -> str:
         try:
-            return str(self.get_route_family(page))
+            fam = str(self.get_route_family(page))
+            if _strip(fam):
+                return fam
         except Exception:
-            return "instrument"
+            pass
+        return self._fallback_route_family(page)
 
-    def schema_for_page(self, page: str) -> Tuple[List[str], List[str]]:
-        if not self._HAS_SCHEMA:
-            return (["Symbol", "Error"], ["symbol", "error"])
-
-        spec = self.get_sheet_spec(page)
-        cols = list(getattr(spec, "columns", None) or [])
+    # -----------------------------------------------------------------
+    # Schema
+    # -----------------------------------------------------------------
+    def _schema_from_data_dictionary(self, page: str) -> Tuple[List[str], List[str]]:
+        if not callable(self.build_data_dictionary_rows):
+            return [], []
 
         headers: List[str] = []
         keys: List[str] = []
 
-        for c in cols:
-            h = _strip(getattr(c, "header", None))
-            k = _strip(getattr(c, "key", None))
-            if h:
-                headers.append(h)
-            if k:
-                keys.append(k)
+        try:
+            try:
+                rows = self.build_data_dictionary_rows(include_meta_sheet=True)
+            except TypeError:
+                rows = self.build_data_dictionary_rows()
+
+            page_norm = self.normalize_page(page)
+
+            for row in _as_list(rows):
+                if isinstance(row, Mapping):
+                    sheet_name = _strip(row.get("sheet") or row.get("Sheet") or row.get("page") or "")
+                    if sheet_name != page_norm:
+                        continue
+                    h = _strip(row.get("header") or row.get("Header"))
+                    k = _strip(row.get("key") or row.get("Key"))
+                else:
+                    d = _model_to_dict(row)
+                    sheet_name = _strip(d.get("sheet") or d.get("Sheet") or d.get("page") or "")
+                    if sheet_name != page_norm:
+                        continue
+                    h = _strip(d.get("header") or d.get("Header"))
+                    k = _strip(d.get("key") or d.get("Key"))
+
+                if h:
+                    headers.append(h)
+                if k:
+                    keys.append(k)
+
+        except Exception:
+            return [], []
+
+        return headers, keys
+
+    def schema_for_page(self, page: str) -> Tuple[List[str], List[str]]:
+        headers: List[str] = []
+        keys: List[str] = []
+
+        if self._HAS_SCHEMA:
+            try:
+                spec = self.get_sheet_spec(page)
+                cols = list(getattr(spec, "columns", None) or [])
+
+                if not cols and isinstance(spec, Mapping):
+                    cols = list(spec.get("columns") or [])
+                    if not cols and (spec.get("headers") or spec.get("keys")):
+                        hs = list(spec.get("headers") or [])
+                        ks = list(spec.get("keys") or [])
+                        if hs:
+                            headers = [_strip(h) for h in hs if _strip(h)]
+                        if ks:
+                            keys = [_strip(k) for k in ks if _strip(k)]
+
+                if cols:
+                    for c in cols:
+                        if isinstance(c, Mapping):
+                            h = _strip(c.get("header"))
+                            k = _strip(c.get("key"))
+                        else:
+                            h = _strip(getattr(c, "header", None))
+                            k = _strip(getattr(c, "key", None))
+                        if h:
+                            headers.append(h)
+                        if k:
+                            keys.append(k)
+            except Exception:
+                headers, keys = [], []
+
+        if not headers or not keys:
+            dd_headers, dd_keys = self._schema_from_data_dictionary(page)
+            if dd_headers:
+                headers = dd_headers
+            if dd_keys:
+                keys = dd_keys
+
+        page_norm = self.normalize_page(page)
+
+        if page_norm == "Data_Dictionary" and (not headers or not keys):
+            headers = [
+                "sheet",
+                "group",
+                "header",
+                "key",
+                "dtype",
+                "fmt",
+                "required",
+                "source",
+                "notes",
+            ]
+            keys = list(headers)
+
+        if not headers and keys:
+            headers = list(keys)
+        if not keys and headers:
+            keys = [h.lower().replace(" ", "_") for h in headers]
+
+        if not headers or not keys:
+            return (["Symbol", "Error"], ["symbol", "error"])
 
         return headers, keys
 
@@ -384,6 +535,8 @@ class _Service:
                 out["symbol"] = symbol_fallback
             if "Symbol" in out and not out.get("Symbol"):
                 out["Symbol"] = symbol_fallback
+            if "ticker" in out and not out.get("ticker"):
+                out["ticker"] = symbol_fallback
         return out
 
     # -----------------------------------------------------------------
@@ -600,7 +753,6 @@ class _Service:
                 },
             }
 
-        # ---------------- Payload-style result ----------------
         if isinstance(result, dict):
             result_headers = _first_list(
                 result.get("headers"),
@@ -666,7 +818,6 @@ class _Service:
                 },
             }
 
-        # ---------------- List-style result ----------------
         rows_out = self._normalize_rows_from_any(result, keys)
 
         return {
@@ -705,6 +856,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             logger.warning("Including core enriched router failed: %s", e)
 
     enriched = APIRouter(prefix="/v1/enriched", tags=["enriched"])
+    enriched_quote_alias = APIRouter(prefix="/v1/enriched_quote", tags=["enriched"])
     legacy = APIRouter(tags=["quotes"])
 
     async def _health_payload() -> Dict[str, Any]:
@@ -716,12 +868,84 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             "schema_available": bool(getattr(svc, "_HAS_SCHEMA", False)),
         }
 
+    def _sheet_rows_body_from_query(
+        *,
+        page: Optional[str],
+        sheet_name: Optional[str],
+        sheet: Optional[str],
+        name: Optional[str],
+        tab: Optional[str],
+        symbols: Optional[str],
+        tickers: Optional[str],
+        include_headers: Optional[str],
+        include_matrix: Optional[str],
+        limit: Optional[int],
+        top_n: Optional[int],
+    ) -> Dict[str, Any]:
+        body: Dict[str, Any] = {}
+        if page is not None:
+            body["page"] = page
+        if sheet_name is not None:
+            body["sheet_name"] = sheet_name
+        if sheet is not None:
+            body["sheet"] = sheet
+        if name is not None:
+            body["name"] = name
+        if tab is not None:
+            body["tab"] = tab
+        if symbols is not None:
+            body["symbols"] = symbols
+        if tickers is not None:
+            body["tickers"] = tickers
+        if include_headers is not None:
+            body["include_headers"] = include_headers
+        if include_matrix is not None:
+            body["include_matrix"] = include_matrix
+        if limit is not None:
+            body["limit"] = limit
+        if top_n is not None:
+            body["top_n"] = top_n
+        return body
+
+    def _quote_body_from_query(
+        *,
+        symbol: Optional[str],
+        ticker: Optional[str],
+        page: Optional[str],
+    ) -> Dict[str, Any]:
+        body: Dict[str, Any] = {}
+        if symbol is not None:
+            body["symbol"] = symbol
+        if ticker is not None:
+            body["ticker"] = ticker
+        if page is not None:
+            body["page"] = page
+        return body
+
     @enriched.get("/health", include_in_schema=False)
     async def enriched_health() -> Dict[str, Any]:
         return await _health_payload()
 
+    @enriched_quote_alias.get("/health", include_in_schema=False)
+    async def enriched_quote_alias_health() -> Dict[str, Any]:
+        return await _health_payload()
+
     @enriched.get("/headers", include_in_schema=False)
     async def enriched_headers(page: str = Query(default="Market_Leaders")) -> Dict[str, Any]:
+        page_norm = svc.normalize_page(page)
+        headers, keys = svc.schema_for_page(page_norm)
+        return {
+            "status": "success" if headers else "degraded",
+            "page": page_norm,
+            "headers": headers,
+            "keys": keys,
+            "router_version": ROUTER_VERSION,
+            "reason": None if headers else reason,
+            "route_family": svc.route_family(page_norm),
+        }
+
+    @enriched_quote_alias.get("/headers", include_in_schema=False)
+    async def enriched_quote_alias_headers(page: str = Query(default="Market_Leaders")) -> Dict[str, Any]:
         page_norm = svc.normalize_page(page)
         headers, keys = svc.schema_for_page(page_norm)
         return {
@@ -942,7 +1166,6 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         headers, keys = svc.schema_for_page(page_norm)
         schema_keys = keys or ["symbol", "error"]
 
-        # ---------- special pages ----------
         if route_family != "instrument":
             engine = await svc.get_engine()
 
@@ -1016,7 +1239,6 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
                 },
             }
 
-        # ---------- instrument pages ----------
         if not symbols:
             return {
                 "status": "success",
@@ -1065,10 +1287,10 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         }
 
     # -------------------------------------------------------------------------
-    # Routes
+    # Routes: POST quote
     # -------------------------------------------------------------------------
     @enriched.post("/quote")
-    async def enriched_quote(
+    async def enriched_quote_post(
         request: Request,
         body: Dict[str, Any] = Body(default_factory=dict),
         page: str = Query(default="", description="Optional page name for schema selection"),
@@ -1080,8 +1302,57 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
     ) -> Dict[str, Any]:
         return await _handle_single_quote(request, body, page, mode, token, x_app_token, authorization, x_request_id)
 
+    @enriched_quote_alias.post("/quote")
+    async def enriched_quote_alias_post(
+        request: Request,
+        body: Dict[str, Any] = Body(default_factory=dict),
+        page: str = Query(default="", description="Optional page name for schema selection"),
+        mode: str = Query(default="", description="Optional mode hint"),
+        token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+        x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+        authorization: Optional[str] = Header(default=None, alias="Authorization"),
+        x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+    ) -> Dict[str, Any]:
+        return await _handle_single_quote(request, body, page, mode, token, x_app_token, authorization, x_request_id)
+
+    # -------------------------------------------------------------------------
+    # Routes: GET quote (optional compatibility)
+    # -------------------------------------------------------------------------
+    @enriched.get("/quote", include_in_schema=False)
+    async def enriched_quote_get(
+        request: Request,
+        symbol: Optional[str] = Query(default=None),
+        ticker: Optional[str] = Query(default=None),
+        page: str = Query(default="", description="Optional page name for schema selection"),
+        mode: str = Query(default="", description="Optional mode hint"),
+        token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+        x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+        authorization: Optional[str] = Header(default=None, alias="Authorization"),
+        x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+    ) -> Dict[str, Any]:
+        body = _quote_body_from_query(symbol=symbol, ticker=ticker, page=page)
+        return await _handle_single_quote(request, body, page, mode, token, x_app_token, authorization, x_request_id)
+
+    @enriched_quote_alias.get("/quote", include_in_schema=False)
+    async def enriched_quote_alias_get(
+        request: Request,
+        symbol: Optional[str] = Query(default=None),
+        ticker: Optional[str] = Query(default=None),
+        page: str = Query(default="", description="Optional page name for schema selection"),
+        mode: str = Query(default="", description="Optional mode hint"),
+        token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+        x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+        authorization: Optional[str] = Header(default=None, alias="Authorization"),
+        x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+    ) -> Dict[str, Any]:
+        body = _quote_body_from_query(symbol=symbol, ticker=ticker, page=page)
+        return await _handle_single_quote(request, body, page, mode, token, x_app_token, authorization, x_request_id)
+
+    # -------------------------------------------------------------------------
+    # Routes: POST sheet-rows
+    # -------------------------------------------------------------------------
     @enriched.post("/sheet-rows")
-    async def enriched_sheet_rows(
+    async def enriched_sheet_rows_post(
         request: Request,
         body: Dict[str, Any] = Body(default_factory=dict),
         mode: str = Query(default="", description="Optional mode hint"),
@@ -1092,8 +1363,96 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
     ) -> Dict[str, Any]:
         return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
 
+    @enriched_quote_alias.post("/sheet-rows")
+    async def enriched_quote_alias_sheet_rows_post(
+        request: Request,
+        body: Dict[str, Any] = Body(default_factory=dict),
+        mode: str = Query(default="", description="Optional mode hint"),
+        token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+        x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+        authorization: Optional[str] = Header(default=None, alias="Authorization"),
+        x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+    ) -> Dict[str, Any]:
+        return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
+
+    # -------------------------------------------------------------------------
+    # Routes: GET sheet-rows (critical for your live checker)
+    # -------------------------------------------------------------------------
+    @enriched.get("/sheet-rows")
+    async def enriched_sheet_rows_get(
+        request: Request,
+        page: Optional[str] = Query(default=None),
+        sheet_name: Optional[str] = Query(default=None),
+        sheet: Optional[str] = Query(default=None),
+        name: Optional[str] = Query(default=None),
+        tab: Optional[str] = Query(default=None),
+        symbols: Optional[str] = Query(default=None),
+        tickers: Optional[str] = Query(default=None),
+        include_headers: Optional[str] = Query(default=None),
+        include_matrix: Optional[str] = Query(default=None),
+        limit: Optional[int] = Query(default=None),
+        top_n: Optional[int] = Query(default=None),
+        mode: str = Query(default="", description="Optional mode hint"),
+        token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+        x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+        authorization: Optional[str] = Header(default=None, alias="Authorization"),
+        x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+    ) -> Dict[str, Any]:
+        body = _sheet_rows_body_from_query(
+            page=page,
+            sheet_name=sheet_name,
+            sheet=sheet,
+            name=name,
+            tab=tab,
+            symbols=symbols,
+            tickers=tickers,
+            include_headers=include_headers,
+            include_matrix=include_matrix,
+            limit=limit,
+            top_n=top_n,
+        )
+        return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
+
+    @enriched_quote_alias.get("/sheet-rows")
+    async def enriched_quote_alias_sheet_rows_get(
+        request: Request,
+        page: Optional[str] = Query(default=None),
+        sheet_name: Optional[str] = Query(default=None),
+        sheet: Optional[str] = Query(default=None),
+        name: Optional[str] = Query(default=None),
+        tab: Optional[str] = Query(default=None),
+        symbols: Optional[str] = Query(default=None),
+        tickers: Optional[str] = Query(default=None),
+        include_headers: Optional[str] = Query(default=None),
+        include_matrix: Optional[str] = Query(default=None),
+        limit: Optional[int] = Query(default=None),
+        top_n: Optional[int] = Query(default=None),
+        mode: str = Query(default="", description="Optional mode hint"),
+        token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+        x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+        authorization: Optional[str] = Header(default=None, alias="Authorization"),
+        x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+    ) -> Dict[str, Any]:
+        body = _sheet_rows_body_from_query(
+            page=page,
+            sheet_name=sheet_name,
+            sheet=sheet,
+            name=name,
+            tab=tab,
+            symbols=symbols,
+            tickers=tickers,
+            include_headers=include_headers,
+            include_matrix=include_matrix,
+            limit=limit,
+            top_n=top_n,
+        )
+        return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
+
+    # -------------------------------------------------------------------------
+    # Legacy aliases
+    # -------------------------------------------------------------------------
     @legacy.post("/quote")
-    async def quote_alias(
+    async def quote_alias_post(
         request: Request,
         body: Dict[str, Any] = Body(default_factory=dict),
         page: str = Query(default="", description="Optional page name for schema selection"),
@@ -1103,10 +1462,25 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         authorization: Optional[str] = Header(default=None, alias="Authorization"),
         x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
     ) -> Dict[str, Any]:
+        return await _handle_single_quote(request, body, page, mode, token, x_app_token, authorization, x_request_id)
+
+    @legacy.get("/quote", include_in_schema=False)
+    async def quote_alias_get(
+        request: Request,
+        symbol: Optional[str] = Query(default=None),
+        ticker: Optional[str] = Query(default=None),
+        page: str = Query(default="", description="Optional page name for schema selection"),
+        mode: str = Query(default="", description="Optional mode hint"),
+        token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+        x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+        authorization: Optional[str] = Header(default=None, alias="Authorization"),
+        x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+    ) -> Dict[str, Any]:
+        body = _quote_body_from_query(symbol=symbol, ticker=ticker, page=page)
         return await _handle_single_quote(request, body, page, mode, token, x_app_token, authorization, x_request_id)
 
     @legacy.post("/quotes")
-    async def quotes_primary(
+    async def quotes_primary_post(
         request: Request,
         body: Dict[str, Any] = Body(default_factory=dict),
         mode: str = Query(default="", description="Optional mode hint"),
@@ -1115,10 +1489,45 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         authorization: Optional[str] = Header(default=None, alias="Authorization"),
         x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
     ) -> Dict[str, Any]:
+        return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
+
+    @legacy.get("/quotes", include_in_schema=False)
+    async def quotes_primary_get(
+        request: Request,
+        page: Optional[str] = Query(default=None),
+        sheet_name: Optional[str] = Query(default=None),
+        sheet: Optional[str] = Query(default=None),
+        name: Optional[str] = Query(default=None),
+        tab: Optional[str] = Query(default=None),
+        symbols: Optional[str] = Query(default=None),
+        tickers: Optional[str] = Query(default=None),
+        include_headers: Optional[str] = Query(default=None),
+        include_matrix: Optional[str] = Query(default=None),
+        limit: Optional[int] = Query(default=None),
+        top_n: Optional[int] = Query(default=None),
+        mode: str = Query(default="", description="Optional mode hint"),
+        token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+        x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+        authorization: Optional[str] = Header(default=None, alias="Authorization"),
+        x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+    ) -> Dict[str, Any]:
+        body = _sheet_rows_body_from_query(
+            page=page,
+            sheet_name=sheet_name,
+            sheet=sheet,
+            name=name,
+            tab=tab,
+            symbols=symbols,
+            tickers=tickers,
+            include_headers=include_headers,
+            include_matrix=include_matrix,
+            limit=limit,
+            top_n=top_n,
+        )
         return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
 
     @legacy.post("/sheet-rows", include_in_schema=False)
-    async def sheet_rows_alias(
+    async def sheet_rows_alias_post(
         request: Request,
         body: Dict[str, Any] = Body(default_factory=dict),
         mode: str = Query(default="", description="Optional mode hint"),
@@ -1129,7 +1538,43 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
     ) -> Dict[str, Any]:
         return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
 
+    @legacy.get("/sheet-rows", include_in_schema=False)
+    async def sheet_rows_alias_get(
+        request: Request,
+        page: Optional[str] = Query(default=None),
+        sheet_name: Optional[str] = Query(default=None),
+        sheet: Optional[str] = Query(default=None),
+        name: Optional[str] = Query(default=None),
+        tab: Optional[str] = Query(default=None),
+        symbols: Optional[str] = Query(default=None),
+        tickers: Optional[str] = Query(default=None),
+        include_headers: Optional[str] = Query(default=None),
+        include_matrix: Optional[str] = Query(default=None),
+        limit: Optional[int] = Query(default=None),
+        top_n: Optional[int] = Query(default=None),
+        mode: str = Query(default="", description="Optional mode hint"),
+        token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+        x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+        authorization: Optional[str] = Header(default=None, alias="Authorization"),
+        x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+    ) -> Dict[str, Any]:
+        body = _sheet_rows_body_from_query(
+            page=page,
+            sheet_name=sheet_name,
+            sheet=sheet,
+            name=name,
+            tab=tab,
+            symbols=symbols,
+            tickers=tickers,
+            include_headers=include_headers,
+            include_matrix=include_matrix,
+            limit=limit,
+            top_n=top_n,
+        )
+        return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
+
     root.include_router(enriched)
+    root.include_router(enriched_quote_alias)
     root.include_router(legacy)
     return root
 
