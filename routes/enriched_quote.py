@@ -2,26 +2,27 @@
 # routes/enriched_quote.py
 """
 ================================================================================
-TFB Enriched Quote Routes Wrapper — v6.3.0
+TFB Enriched Quote Routes Wrapper — v6.4.0
 ================================================================================
 RENDER-SAFE • SCHEMA-AWARE • PAGE-DISPATCH SAFE • HEADER/ROW BALANCED
 SPECIAL-BUILDER PRESERVING • ASYNC-SAFE • GET+POST COMPATIBLE
 QUERY/BODY MERGE • LEGACY ALIAS SAFE • TABLE-MODE SAFE • CORE-WRAPPER SAFE
+TOP10-SPECIAL SAFE • SCHEMA-ONLY SAFE • TIMEOUT-GUARDED • NULL-SAFE
 
 Why this revision
 -----------------
-- ✅ FIX: Wrapper routes are mounted BEFORE optional core router so wrapper paths win
-- ✅ FIX: Adds GET support for /sheet-rows and GET compatibility for /quote
-- ✅ FIX: Adds /v1/enriched_quote compatibility aliases alongside /v1/enriched
-- ✅ FIX: Accepts page/sheet/sheet_name/name/tab and tickers/symbols from query params
-- ✅ FIX: Preserves payload-style builder output instead of collapsing to null rows
-- ✅ FIX: Keeps Top_10_Investments / Insights / Data_Dictionary dispatch working even
-        when schema/page helpers are partially unavailable
-- ✅ FIX: Adds stronger fallback route-family detection for special pages
-- ✅ FIX: Can derive schema from Data_Dictionary builder if schema registry is partial
-- ✅ FIX: Supports table mode through core.data_engine.get_sheet_rows and/or engine.get_sheet_rows
-- ✅ FIX: Keeps instrument pages engine-backed and schema-aligned
-- ✅ FIX: Keeps response envelope stable for PowerShell/live checks
+- ✅ FIX: `_strip(None)` no longer leaks the literal string "None" into route_family,
+        build_status, page, tokens, or other fields
+- ✅ FIX: Explicit schema-only handling for special pages (Top_10_Investments,
+        Insights_Analysis, Data_Dictionary) without invoking heavy builders
+- ✅ FIX: Top10 special-page dispatch is now explicit and guarded
+- ✅ FIX: Special builders are wrapped with a timeout to avoid 502/503 escalation
+- ✅ FIX: Special builder header preference now uses display headers first
+        (display_headers / sheet_headers / column_headers) before keys-like headers
+- ✅ FIX: Better normalization of nested criteria/settings/filters into builder payload
+- ✅ FIX: Better preservation of special builder output while keeping response envelope stable
+- ✅ FIX: More defensive exception handling around special-page dispatch
+- ✅ FIX: Stronger route_family fallback and safer payload/meta normalization
 - ✅ SAFE: No network I/O at import-time
 - ✅ SAFE: No Prometheus metric creation here
 
@@ -66,7 +67,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 
 logger = logging.getLogger("routes.enriched_quote")
 
-ROUTER_VERSION = "6.3.0"
+ROUTER_VERSION = "6.4.0"
 
 # Kept lazy for dynamic mount behavior
 router: Optional[APIRouter] = None
@@ -96,8 +97,11 @@ _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
 
 
 def _strip(v: Any) -> str:
+    if v is None:
+        return ""
     try:
-        return str(v).strip()
+        s = str(v).strip()
+        return s if s and s.lower() != "none" else ""
     except Exception:
         return ""
 
@@ -187,6 +191,16 @@ def _get_int(body: Mapping[str, Any], key: str, default: int) -> int:
     except Exception:
         pass
     return int(default)
+
+
+def _get_float_env(name: str, default: float) -> float:
+    try:
+        raw = os.getenv(name, "").strip()
+        if not raw:
+            return float(default)
+        return float(raw)
+    except Exception:
+        return float(default)
 
 
 def _extract_token(
@@ -336,12 +350,84 @@ def _collect_query_body_for_quote(
     return body
 
 
+def _merged_special_body(body: Mapping[str, Any]) -> Dict[str, Any]:
+    out = dict(body or {})
+    criteria_merged: Dict[str, Any] = {}
+
+    def _merge_from_mapping(m: Any) -> None:
+        if isinstance(m, Mapping):
+            for k, v in m.items():
+                if v is not None:
+                    criteria_merged[k] = v
+
+    _merge_from_mapping(body.get("criteria"))
+    _merge_from_mapping(body.get("filters"))
+
+    settings = body.get("settings")
+    if isinstance(settings, Mapping):
+        _merge_from_mapping(settings)
+        _merge_from_mapping(settings.get("criteria"))
+
+    payload = body.get("payload")
+    if isinstance(payload, Mapping):
+        _merge_from_mapping(payload.get("criteria"))
+
+    if criteria_merged:
+        out["criteria"] = criteria_merged
+        for promoted_key in (
+            "pages_selected",
+            "pages",
+            "selected_pages",
+            "direct_symbols",
+            "invest_period_days",
+            "investment_period_days",
+            "period_days",
+            "horizon_days",
+            "top_n",
+            "min_expected_roi",
+            "max_risk_score",
+            "min_confidence",
+            "min_volume",
+            "use_liquidity_tiebreak",
+            "enforce_risk_confidence",
+        ):
+            if out.get(promoted_key) in (None, "", [], {}):
+                if promoted_key in criteria_merged:
+                    out[promoted_key] = criteria_merged[promoted_key]
+
+    top_level_direct = _get_list(out, "direct_symbols", "symbols", "tickers", "tickers_list")
+    nested_direct = _get_list(criteria_merged, "direct_symbols", "symbols", "tickers")
+    if not top_level_direct and nested_direct:
+        out["direct_symbols"] = nested_direct
+
+    top_level_pages = _get_list(out, "pages_selected", "pages", "selected_pages")
+    nested_pages = _get_list(criteria_merged, "pages_selected", "pages", "selected_pages")
+    if not top_level_pages and nested_pages:
+        out["pages_selected"] = nested_pages
+
+    return out
+
+
+def _special_schema_only_requested(body: Mapping[str, Any]) -> bool:
+    if _get_bool(body, "schema_only", False):
+        return True
+    if _get_bool(body, "headers_only", False):
+        return True
+    if _get_bool(body, "keys_only", False):
+        return True
+    return False
+
+
 # =============================================================================
 # Shared lazy service layer
 # =============================================================================
 class _Service:
     def __init__(self, reason: str):
         self.reason = reason
+        self.special_builder_timeout_sec = max(
+            0.0,
+            _get_float_env("TFB_SPECIAL_BUILDER_TIMEOUT_SEC", 45.0),
+        )
 
         # ---------------- Auth helpers (optional) ----------------
         try:
@@ -549,8 +635,8 @@ class _Service:
 
     def route_family(self, page: str) -> str:
         try:
-            fam = str(self.get_route_family(page))
-            if _strip(fam):
+            fam = _strip(self.get_route_family(page))
+            if fam:
                 return fam
         except Exception:
             pass
@@ -817,14 +903,15 @@ class _Service:
         except Exception:
             settings = None
 
-        criteria = body.get("criteria") if isinstance(body.get("criteria"), dict) else None
+        prepared_body = _merged_special_body(body)
+        criteria = prepared_body.get("criteria") if isinstance(prepared_body.get("criteria"), dict) else None
 
         attempts: List[Dict[str, Any]] = [
             {
                 "engine": engine,
                 "request": request,
                 "settings": settings,
-                "body": dict(body),
+                "body": prepared_body,
                 "criteria": criteria,
                 "limit": limit,
                 "mode": mode,
@@ -832,31 +919,31 @@ class _Service:
             {
                 "request": request,
                 "settings": settings,
-                "body": dict(body),
+                "body": prepared_body,
                 "criteria": criteria,
                 "limit": limit,
                 "mode": mode,
             },
             {
                 "engine": engine,
-                "body": dict(body),
+                "body": prepared_body,
                 "criteria": criteria,
                 "limit": limit,
                 "mode": mode,
             },
             {
-                "body": dict(body),
+                "body": prepared_body,
                 "criteria": criteria,
                 "limit": limit,
                 "mode": mode,
             },
             {
-                "payload": dict(body),
+                "payload": prepared_body,
                 "limit": limit,
                 "mode": mode,
             },
             {
-                "data": dict(body),
+                "data": prepared_body,
                 "limit": limit,
                 "mode": mode,
             },
@@ -948,6 +1035,47 @@ class _Service:
         return None
 
     # -----------------------------------------------------------------
+    # Schema-only payloads
+    # -----------------------------------------------------------------
+    def build_schema_only_payload(
+        self,
+        *,
+        page_norm: str,
+        route_family: str,
+        headers: Sequence[str],
+        keys: Sequence[str],
+        include_headers: bool,
+        include_matrix: bool,
+        request_id: str,
+        started_at: float,
+        mode: str,
+        dispatch_name: str,
+        extra_meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        extra_meta = extra_meta or {}
+        return {
+            "status": "success",
+            "page": page_norm,
+            "route_family": route_family,
+            "headers": list(headers) if include_headers else [],
+            "keys": list(keys),
+            "rows": [],
+            "rows_matrix": [] if include_matrix else None,
+            "quotes": [],
+            "data": [],
+            "version": ROUTER_VERSION,
+            "request_id": request_id,
+            "meta": {
+                "duration_ms": (time.time() - started_at) * 1000.0,
+                "count": 0,
+                "dispatch": dispatch_name,
+                "mode": mode,
+                "schema_only": True,
+                **extra_meta,
+            },
+        }
+
+    # -----------------------------------------------------------------
     # Specialized payload builders
     # -----------------------------------------------------------------
     async def build_dictionary_page_payload(
@@ -1015,35 +1143,64 @@ class _Service:
         mode: str,
     ) -> Dict[str, Any]:
         if not callable(builder):
-            return {
-                "status": "success",
-                "page": page_norm,
-                "route_family": route_family,
-                "headers": list(headers) if include_headers else [],
-                "keys": list(keys),
-                "rows": [],
-                "rows_matrix": [] if include_matrix else None,
-                "quotes": [],
-                "data": [],
-                "version": ROUTER_VERSION,
-                "request_id": request_id,
-                "meta": {
-                    "duration_ms": (time.time() - started_at) * 1000.0,
-                    "count": 0,
-                    "dispatch": dispatch_name,
-                    "mode": mode,
-                    "warning": f"{dispatch_name}_builder_unavailable",
-                },
-            }
+            return self.build_schema_only_payload(
+                page_norm=page_norm,
+                route_family=route_family,
+                headers=headers,
+                keys=keys,
+                include_headers=include_headers,
+                include_matrix=include_matrix,
+                request_id=request_id,
+                started_at=started_at,
+                mode=mode,
+                dispatch_name=dispatch_name,
+                extra_meta={"warning": f"{dispatch_name}_builder_unavailable"},
+            )
 
         try:
-            result = await self._call_builder_flexible(
-                builder,
-                request=request,
-                engine=engine,
-                body=body,
-                limit=limit,
+            if self.special_builder_timeout_sec > 0:
+                result = await asyncio.wait_for(
+                    self._call_builder_flexible(
+                        builder,
+                        request=request,
+                        engine=engine,
+                        body=body,
+                        limit=limit,
+                        mode=mode,
+                    ),
+                    timeout=self.special_builder_timeout_sec,
+                )
+            else:
+                result = await self._call_builder_flexible(
+                    builder,
+                    request=request,
+                    engine=engine,
+                    body=body,
+                    limit=limit,
+                    mode=mode,
+                )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "%s builder timed out after %.2fs for page=%s",
+                dispatch_name,
+                self.special_builder_timeout_sec,
+                page_norm,
+            )
+            return self.build_schema_only_payload(
+                page_norm=page_norm,
+                route_family=route_family,
+                headers=headers,
+                keys=keys,
+                include_headers=include_headers,
+                include_matrix=include_matrix,
+                request_id=request_id,
+                started_at=started_at,
                 mode=mode,
+                dispatch_name=dispatch_name,
+                extra_meta={
+                    "warning": f"{dispatch_name}_builder_timeout",
+                    "builder_timeout_sec": self.special_builder_timeout_sec,
+                },
             )
         except Exception as e:
             logger.warning("%s builder failed: %s", dispatch_name, e)
@@ -1071,17 +1228,20 @@ class _Service:
 
         if isinstance(result, dict):
             result_headers = _first_list(
-                result.get("headers"),
                 result.get("display_headers"),
                 result.get("sheet_headers"),
                 result.get("column_headers"),
+                result.get("headers"),
             )
             result_keys = _first_list(result.get("keys"))
+
             keys_out = [str(k) for k in (result_keys or list(keys)) if _strip(k)]
             headers_out = [str(h) for h in (result_headers or list(headers)) if _strip(h)]
 
             if not keys_out:
                 keys_out = list(keys)
+            if not headers_out:
+                headers_out = list(headers)
 
             rows_raw = result.get("rows")
             rows_matrix_raw = result.get("rows_matrix")
@@ -1106,11 +1266,13 @@ class _Service:
                 rows_matrix_out = _rows_matrix(rows_out, keys_out)
 
             status_out, error_out, meta_in = self.extract_status_error_meta(result)
+            page_out = _strip(result.get("page")) or page_norm
+            route_family_out = _strip(result.get("route_family")) or route_family
 
             return {
                 "status": status_out,
-                "page": _strip(result.get("page")) or page_norm,
-                "route_family": _strip(result.get("route_family")) or route_family,
+                "page": page_out,
+                "route_family": route_family_out,
                 "headers": headers_out if include_headers else [],
                 "keys": keys_out,
                 "rows": rows_out,
@@ -1225,7 +1387,14 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
 
         engine = await svc.get_engine(request)
         if engine is None:
-            rows = [svc.normalize_row(keys, {"symbol": s, "ticker": s, "error": "Data engine unavailable"}, symbol_fallback=s) for s in symbols]
+            rows = [
+                svc.normalize_row(
+                    keys,
+                    {"symbol": s, "ticker": s, "error": "Data engine unavailable"},
+                    symbol_fallback=s,
+                )
+                for s in symbols
+            ]
             return rows, len(rows)
 
         quotes_map: Dict[str, Dict[str, Any]] = {}
@@ -1395,25 +1564,27 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         auth_token = _extract_token(x_app_token, authorization, token_q)
         svc.auth_guard(auth_token, authorization, x_app_token, token_query_used)
 
+        body_prepared = _merged_special_body(body or {})
+
         page_raw = _strip(
-            body.get("page")
-            or body.get("sheet_name")
-            or body.get("sheetName")
-            or body.get("sheet")
-            or body.get("name")
-            or body.get("tab")
+            body_prepared.get("page")
+            or body_prepared.get("sheet_name")
+            or body_prepared.get("sheetName")
+            or body_prepared.get("sheet")
+            or body_prepared.get("name")
+            or body_prepared.get("tab")
             or "Market_Leaders"
         )
         page_norm = svc.normalize_page(page_raw)
         route_family = svc.route_family(page_norm)
 
-        symbols = _get_list(body, "symbols", "tickers", "tickers_list")
-        include_matrix = _get_bool(body, "include_matrix", True)
-        include_headers = _get_bool(body, "include_headers", True)
+        symbols = _get_list(body_prepared, "symbols", "tickers", "tickers_list")
+        include_matrix = _get_bool(body_prepared, "include_matrix", True)
+        include_headers = _get_bool(body_prepared, "include_headers", True)
 
-        top_n = _get_int(body, "top_n", 200)
-        limit = _get_int(body, "limit", 0)
-        offset = max(0, _get_int(body, "offset", 0))
+        top_n = _get_int(body_prepared, "top_n", 200)
+        limit = _get_int(body_prepared, "limit", 0)
+        offset = max(0, _get_int(body_prepared, "offset", 0))
         if limit > 0:
             top_n = limit
         top_n = max(1, min(5000, top_n))
@@ -1424,6 +1595,20 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
 
         if route_family != "instrument":
             engine = await svc.get_engine(request)
+
+            if _special_schema_only_requested(body_prepared):
+                return svc.build_schema_only_payload(
+                    page_norm=page_norm,
+                    route_family=route_family,
+                    headers=headers,
+                    keys=schema_keys,
+                    include_headers=include_headers,
+                    include_matrix=include_matrix,
+                    request_id=request_id,
+                    started_at=start,
+                    mode=mode_q,
+                    dispatch_name=f"{route_family}_schema_only",
+                )
 
             if route_family == "dictionary":
                 return await svc.build_dictionary_page_payload(
@@ -1447,7 +1632,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
                     page_norm=page_norm,
                     headers=headers,
                     keys=schema_keys,
-                    body=body,
+                    body=body_prepared,
                     limit=top_n,
                     include_headers=include_headers,
                     include_matrix=include_matrix,
@@ -1466,7 +1651,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
                     page_norm=page_norm,
                     headers=headers,
                     keys=schema_keys,
-                    body=body,
+                    body=body_prepared,
                     limit=top_n,
                     include_headers=include_headers,
                     include_matrix=include_matrix,
@@ -1503,7 +1688,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
                 limit=max(1, limit) if limit > 0 else 2000,
                 offset=offset,
                 mode=mode_q or "",
-                body=body,
+                body=body_prepared,
             )
 
             if payload is None:
