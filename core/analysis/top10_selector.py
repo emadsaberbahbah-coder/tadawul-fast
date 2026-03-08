@@ -2,10 +2,11 @@
 # core/analysis/top10_selector.py
 """
 ================================================================================
-Top 10 Selector — v3.5.0
+Top 10 Selector — v3.6.0
 ================================================================================
 LIVE • SCHEMA-FIRST • TOP10-METADATA COMPLETE • ROUTE-COMPATIBLE • SHEET-FRIENDLY
 FAIL-SAFE • BODY-AWARE • SETTINGS-AWARE • CONTRACT-HARDENED • FALLBACK-ENHANCED
+PERFORMANCE-GUARDED • CONCURRENCY-AWARE • UNIVERSE-CAPPED
 
 Purpose
 -------
@@ -28,17 +29,16 @@ Primary guarantees
 - Does not fail only because some optional fields are missing
 - No network I/O at import-time
 
-New in v3.5.0
+New in v3.6.0
 -------------
-- ✅ FIX: settings-aware criteria merge (important for route dispatch paths)
-- ✅ FIX: route-compatible public build_top10_output_rows(...)
-- ✅ FIX: stronger engine method compatibility for symbols / rows / quotes
-- ✅ FIX: rows_matrix payload parsing support
-- ✅ FIX: direct_symbols extraction now includes direct_symbols key
-- ✅ FIX: more resilient universe discovery from rows + snapshots + matrix payloads
-- ✅ FIX: relaxed candidate fallback if strict filters eliminate all candidates
-- ✅ FIX: honest placeholder fallback when real universe symbols exist but metrics are partial
-- ✅ IMPROVE: richer meta diagnostics and row-generation traceability
+- ✅ FIX: unconstrained Top10 requests are now narrowed to a fast default page set
+- ✅ FIX: universe discovery is concurrent across pages
+- ✅ FIX: no eager page-row fetch when symbols are already available
+- ✅ FIX: direct_symbols extraction now reads nested criteria/body/settings/request
+- ✅ FIX: total universe is hard-capped before expensive quote collection
+- ✅ FIX: row fallback is lazy and guarded for broad/unconstrained requests
+- ✅ IMPROVE: richer stage timing diagnostics in meta
+- ✅ IMPROVE: more predictable performance for limit-only / broad default requests
 
 Public APIs
 -----------
@@ -76,7 +76,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 logger = logging.getLogger("core.analysis.top10_selector")
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "3.5.0"
+TOP10_SELECTOR_VERSION = "3.6.0"
 TOP10_PAGE_NAME = "Top_10_Investments"
 RIYADH_TZ = timezone(timedelta(hours=3))
 
@@ -364,6 +364,25 @@ def _extract_rows_from_any(obj: Any) -> List[Dict[str, Any]]:
     return []
 
 
+def _env_int(name: str, default: int, *, lo: Optional[int] = None, hi: Optional[int] = None) -> int:
+    try:
+        val = int(str(os.getenv(name, default)).strip())
+    except Exception:
+        val = int(default)
+    if lo is not None:
+        val = max(lo, val)
+    if hi is not None:
+        val = min(hi, val)
+    return val
+
+
+def _env_csv(name: str) -> List[str]:
+    raw = _safe_str(os.getenv(name, ""))
+    if not raw:
+        return []
+    return _dedupe_keep_order([p.strip() for p in re.split(r"[,\;\|\n]+", raw) if p.strip()])
+
+
 # =============================================================================
 # Period mapping
 # =============================================================================
@@ -422,11 +441,23 @@ class Criteria:
     top_n: int = 10
     enrich_final: bool = True
 
+    # New in v3.6.0
+    pages_explicit: bool = False
+
     def horizon(self) -> str:
         return map_period_days_to_horizon(self.invest_period_days)
 
 
 def _criteria_from_dict(d: Dict[str, Any]) -> Criteria:
+    page_keys = (
+        "pages_selected",
+        "pages",
+        "selected_pages",
+        "pagesSelected",
+        "page_selection",
+    )
+    explicit_pages = any(k in d and d.get(k) not in (None, "", [], (), {}) for k in page_keys)
+
     pages = (
         d.get("pages_selected")
         or d.get("pages")
@@ -499,6 +530,7 @@ def _criteria_from_dict(d: Dict[str, Any]) -> Criteria:
         use_liquidity_tiebreak=use_liq,
         top_n=top_n,
         enrich_final=enrich_final,
+        pages_explicit=explicit_pages,
     )
 
 
@@ -516,7 +548,10 @@ def merge_criteria_overrides(base: Criteria, overrides: Dict[str, Any]) -> Crite
         "enrich_final": base.enrich_final,
     }
     d.update({k: v for k, v in (overrides or {}).items() if v is not None})
-    return _criteria_from_dict(d)
+    crit = _criteria_from_dict(d)
+    if not crit.pages_explicit:
+        crit.pages_explicit = bool(getattr(base, "pages_explicit", False))
+    return crit
 
 
 def load_criteria_best_effort(engine: Any) -> Criteria:
@@ -548,6 +583,7 @@ def load_criteria_best_effort(engine: Any) -> Criteria:
         use_liquidity_tiebreak=True,
         top_n=10,
         enrich_final=True,
+        pages_explicit=False,
     )
 
 
@@ -655,6 +691,14 @@ def _merge_criteria_sources(
 
     crit = merge_criteria_overrides(base, merged)
     crit.top_n = _resolve_limit(limit, criteria, body, settings=settings, request_payload=request_payload)
+
+    explicit_pages = any(
+        k in merged and merged.get(k) not in (None, "", [], (), {})
+        for k in ("pages_selected", "pages", "selected_pages", "pagesSelected", "page_selection")
+    )
+    if explicit_pages:
+        crit.pages_explicit = True
+
     return crit
 
 
@@ -673,8 +717,7 @@ def _extract_route_mode(mode: Any, body: Optional[Dict[str, Any]], settings: Opt
 def _extract_direct_symbols_from_sources(*sources: Optional[Dict[str, Any]]) -> List[str]:
     out: List[str] = []
     for src in sources:
-        if not isinstance(src, dict):
-            continue
+        payload = _extract_body_criteria(src if isinstance(src, dict) else {})
         for key in (
             "symbols",
             "tickers",
@@ -683,7 +726,7 @@ def _extract_direct_symbols_from_sources(*sources: Optional[Dict[str, Any]]) -> 
             "selected_symbols",
             "direct_symbols",
         ):
-            vals = _coerce_to_list(src.get(key))
+            vals = _coerce_to_list(payload.get(key))
             for v in vals:
                 sym = _normalize_symbol(_safe_str(v))
                 if sym:
@@ -728,6 +771,73 @@ def _eligible_pages(criteria: Criteria) -> List[str]:
     blocked = {"Insights_Analysis", "Data_Dictionary", "Top_10_Investments", "Top10_Investments"}
     pages_in = [p for p in pages_in if p and p not in blocked]
     return _dedupe_keep_order(pages_in)
+
+
+def _default_pages_for_unconstrained(pages: List[str]) -> List[str]:
+    env_pages = _env_csv("TOP10_UNCONSTRAINED_DEFAULT_PAGES")
+    if env_pages:
+        return _dedupe_keep_order(env_pages)
+
+    preferred_order = ["Market_Leaders", "Global_Markets", "My_Portfolio", "Mutual_Funds", "Commodities_FX"]
+    preferred = [p for p in preferred_order if p in pages]
+    if preferred:
+        return preferred[:2]
+    return pages[:2] if pages else ["Market_Leaders", "Global_Markets"]
+
+
+def _compute_dynamic_limits(criteria: Criteria, pages: List[str], direct_symbols: List[str], unconstrained: bool) -> Tuple[int, int, int]:
+    """
+    Returns:
+      per_page_limit
+      max_universe_symbols
+      row_fallback_limit
+    """
+    base_per_page = _env_int("TOP10_UNIVERSE_LIMIT_PER_PAGE", 250, lo=25, hi=5000)
+    base_total = _env_int("TOP10_MAX_UNIVERSE_SYMBOLS", 250, lo=25, hi=5000)
+    top_n = max(1, int(criteria.top_n or 10))
+
+    if direct_symbols:
+        wanted = max(len(direct_symbols), top_n * 4)
+        return (
+            min(base_per_page, max(10, wanted)),
+            min(base_total, max(10, wanted)),
+            min(base_per_page, max(10, wanted)),
+        )
+
+    if unconstrained:
+        per_page = min(base_per_page, max(25, top_n * 8))
+        total = min(base_total, max(40, top_n * 20))
+        row_limit = min(per_page, max(20, top_n * 5))
+        return per_page, total, row_limit
+
+    if len(pages) >= 4:
+        per_page = min(base_per_page, max(40, top_n * 15))
+        total = min(base_total, max(80, top_n * 35))
+        row_limit = min(per_page, max(30, top_n * 8))
+        return per_page, total, row_limit
+
+    per_page = min(base_per_page, max(50, top_n * 20))
+    total = min(base_total, max(100, top_n * 50))
+    row_limit = min(per_page, max(40, top_n * 10))
+    return per_page, total, row_limit
+
+
+def _allow_row_fallback(criteria: Criteria, direct_symbols: List[str], pages: List[str]) -> bool:
+    if direct_symbols:
+        return True
+
+    env_force = os.getenv("TOP10_ENABLE_ROW_FALLBACK")
+    if env_force is not None:
+        return _coerce_bool(env_force, True)
+
+    # Broad or unconstrained requests should avoid very expensive row fallback scans.
+    if not criteria.pages_explicit and len(pages) > 2:
+        return False
+
+    if criteria.pages_explicit and len(pages) <= 2:
+        return True
+
+    return len(pages) <= 2
 
 
 # =============================================================================
@@ -858,7 +968,15 @@ async def _get_page_rows_live(engine: Any, page: str, *, limit: int = 5000, mode
     return _row_list_from_snapshot(snap)
 
 
-async def _get_universe_symbols_live(engine: Any, page: str, *, limit: int = 5000, mode: str = "", body: Optional[Dict[str, Any]] = None) -> List[str]:
+async def _get_universe_symbols_live(
+    engine: Any,
+    page: str,
+    *,
+    limit: int = 5000,
+    mode: str = "",
+    body: Optional[Dict[str, Any]] = None,
+    allow_rows_fallback: bool = True,
+) -> List[str]:
     if engine is None:
         return []
 
@@ -912,6 +1030,9 @@ async def _get_universe_symbols_live(engine: Any, page: str, *, limit: int = 500
                     return _dedupe_keep_order(syms)
         except Exception:
             pass
+
+    if not allow_rows_fallback:
+        return []
 
     rows = await _get_page_rows_live(engine, page, limit=limit, mode=mode, body=body)
     syms2: List[str] = []
@@ -1300,12 +1421,8 @@ async def _enrich_top(engine: Any, symbols: List[str], *, mode: str = "", body: 
     if not callable(fn):
         return out
 
-    try:
-        conc = int(os.getenv("TOP10_ENRICH_CONCURRENCY", "8") or "8")
-    except Exception:
-        conc = 8
-
-    sem = asyncio.Semaphore(max(3, min(20, conc)))
+    conc = _env_int("TOP10_ENRICH_CONCURRENCY", 8, lo=3, hi=20)
+    sem = asyncio.Semaphore(conc)
 
     async def one(sym: str) -> None:
         async with sem:
@@ -1329,6 +1446,55 @@ async def _enrich_top(engine: Any, symbols: List[str], *, mode: str = "", body: 
 # =============================================================================
 # Core selection
 # =============================================================================
+async def _fetch_page_symbols_concurrent(
+    engine: Any,
+    pages: List[str],
+    *,
+    per_page_limit: int,
+    mode: str,
+    body: Optional[Dict[str, Any]],
+) -> Dict[str, List[str]]:
+    concurrency = _env_int("TOP10_PAGE_FETCH_CONCURRENCY", 6, lo=1, hi=20)
+    sem = asyncio.Semaphore(concurrency)
+    out: Dict[str, List[str]] = {}
+
+    async def one(page: str) -> None:
+        async with sem:
+            syms = await _get_universe_symbols_live(
+                engine,
+                page,
+                limit=per_page_limit,
+                mode=mode,
+                body=body,
+                allow_rows_fallback=False,
+            )
+            out[page] = syms
+
+    await asyncio.gather(*(one(p) for p in pages), return_exceptions=False)
+    return out
+
+
+async def _fetch_page_rows_concurrent(
+    engine: Any,
+    pages: List[str],
+    *,
+    row_limit: int,
+    mode: str,
+    body: Optional[Dict[str, Any]],
+) -> Dict[str, List[Dict[str, Any]]]:
+    concurrency = _env_int("TOP10_PAGE_ROW_FETCH_CONCURRENCY", 4, lo=1, hi=12)
+    sem = asyncio.Semaphore(concurrency)
+    out: Dict[str, List[Dict[str, Any]]] = {}
+
+    async def one(page: str) -> None:
+        async with sem:
+            rows = await _get_page_rows_live(engine, page, limit=row_limit, mode=mode, body=body)
+            out[page] = rows
+
+    await asyncio.gather(*(one(p) for p in pages), return_exceptions=False)
+    return out
+
+
 async def select_top10(
     *,
     engine: Any,
@@ -1338,48 +1504,96 @@ async def select_top10(
     body: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Candidate], Dict[str, Any]]:
     t0 = time.time()
+    stage_started = time.time()
+
     horizon = criteria.horizon()
     roi_key = horizon_to_roi_key(horizon)
 
     pages = _eligible_pages(criteria)
-    try:
-        per_page_limit = int(os.getenv("TOP10_UNIVERSE_LIMIT_PER_PAGE", "500") or "500")
-    except Exception:
-        per_page_limit = 500
-    per_page_limit = max(50, min(5000, per_page_limit))
-
-    universe: List[Tuple[str, str]] = []
     warnings: List[str] = []
     fallback_trace: List[str] = []
+    stage_ms: Dict[str, float] = {}
 
     direct_symbols = [_normalize_symbol(s) for s in (direct_symbols or []) if _normalize_symbol(s)]
+    direct_symbols = _dedupe_keep_order(direct_symbols)
+
+    unconstrained = (not direct_symbols) and (not bool(getattr(criteria, "pages_explicit", False)))
+    if unconstrained:
+        narrowed = _default_pages_for_unconstrained(pages)
+        if narrowed != pages:
+            warnings.append(f"unconstrained_request_pages_narrowed:{','.join(narrowed)}")
+        pages = narrowed
+
+    per_page_limit, max_universe_symbols, row_fallback_limit = _compute_dynamic_limits(criteria, pages, direct_symbols, unconstrained)
+    allow_row_fallback = _allow_row_fallback(criteria, direct_symbols, pages)
+
+    universe: List[Tuple[str, str]] = []
+
     if direct_symbols:
         default_page = pages[0] if pages else "Market_Leaders"
-        for s in _dedupe_keep_order(direct_symbols):
+        for s in direct_symbols:
             universe.append((s, default_page))
         warnings.append(f"used_direct_symbols:{len(direct_symbols)}")
 
-    if not universe:
-        for page in pages:
-            page_symbols = await _get_universe_symbols_live(engine, page, limit=per_page_limit, mode=mode, body=body)
-            page_rows = await _get_page_rows_live(engine, page, limit=per_page_limit, mode=mode, body=body)
+    # -------------------------------------------------------------------------
+    # Stage 1: symbol universe discovery (symbols only, concurrent)
+    # -------------------------------------------------------------------------
+    page_symbol_map: Dict[str, List[str]] = {}
+    if not universe and pages:
+        try:
+            page_symbol_map = await _fetch_page_symbols_concurrent(
+                engine,
+                pages,
+                per_page_limit=per_page_limit,
+                mode=mode,
+                body=body,
+            )
+        except Exception as e:
+            warnings.append(f"page_symbol_fetch_error:{e}")
+            page_symbol_map = {}
 
+        for page in pages:
+            page_symbols = page_symbol_map.get(page) or []
             if page_symbols:
                 for s in page_symbols:
                     universe.append((s, page))
             else:
                 warnings.append(f"universe_empty:{page}")
 
-            if not page_symbols and page_rows:
-                fallback_trace.append(f"rows_only_universe:{page}:{len(page_rows)}")
+    stage_ms["universe_symbols_ms"] = round((time.time() - stage_started) * 1000.0, 3)
 
-            if not page_symbols and not page_rows:
-                snap = _get_snapshot(engine, page)
-                if isinstance(snap, dict) and (
-                    isinstance(snap.get("rows"), list) or isinstance(snap.get("rows_matrix"), list)
-                ):
-                    warnings.append(f"snapshot_present_but_no_symbols:{page}")
+    # Lazy row-only universe fallback if symbols are totally empty and request is not broad/unconstrained
+    if not universe and pages and allow_row_fallback:
+        stage_started = time.time()
+        try:
+            page_rows_map = await _fetch_page_rows_concurrent(
+                engine,
+                pages,
+                row_limit=row_fallback_limit,
+                mode=mode,
+                body=body,
+            )
+        except Exception as e:
+            warnings.append(f"page_row_discovery_error:{e}")
+            page_rows_map = {}
 
+        for page in pages:
+            rows = page_rows_map.get(page) or []
+            if rows:
+                discovered = 0
+                for row in rows:
+                    sym = _extract_symbol_from_row(row)
+                    if sym:
+                        universe.append((sym, page))
+                        discovered += 1
+                if discovered:
+                    fallback_trace.append(f"rows_only_universe:{page}:{discovered}")
+
+        stage_ms["row_universe_fallback_ms"] = round((time.time() - stage_started) * 1000.0, 3)
+    elif not universe and pages and not allow_row_fallback:
+        warnings.append("skipped_row_universe_fallback_for_broad_or_unconstrained_request")
+
+    # Deduplicate and cap universe BEFORE quote collection
     seen_u: Set[str] = set()
     universe_dedup: List[Tuple[str, str]] = []
     for s, p in universe:
@@ -1387,13 +1601,26 @@ async def select_top10(
             seen_u.add(s)
             universe_dedup.append((s, p))
 
+    if len(universe_dedup) > max_universe_symbols:
+        warnings.append(f"universe_capped:{len(universe_dedup)}->{max_universe_symbols}")
+        universe_dedup = universe_dedup[:max_universe_symbols]
+
     symbols = [s for s, _ in universe_dedup]
     source_map = {s: p for s, p in universe_dedup}
 
+    # -------------------------------------------------------------------------
+    # Stage 2: quote collection
+    # -------------------------------------------------------------------------
+    stage_started = time.time()
     qmap: Dict[str, Dict[str, Any]] = {}
     if symbols:
         qmap = await _fetch_quotes_map(engine, symbols, mode=mode or "", body=body or {})
+    stage_ms["quote_fetch_ms"] = round((time.time() - stage_started) * 1000.0, 3)
 
+    # -------------------------------------------------------------------------
+    # Stage 3: primary candidate extraction from quotes
+    # -------------------------------------------------------------------------
+    stage_started = time.time()
     candidates: List[Candidate] = []
     quote_candidates_unfiltered: List[Candidate] = []
 
@@ -1420,11 +1647,29 @@ async def select_top10(
 
         candidates.append(cand)
 
+    stage_ms["quote_candidate_filter_ms"] = round((time.time() - stage_started) * 1000.0, 3)
+
+    # -------------------------------------------------------------------------
+    # Stage 4: lazy row fallback only if still empty and allowed
+    # -------------------------------------------------------------------------
     row_candidates_unfiltered: List[Candidate] = []
-    if not candidates:
+    if not candidates and pages and allow_row_fallback:
+        stage_started = time.time()
         row_based_count = 0
+        try:
+            page_rows_map2 = await _fetch_page_rows_concurrent(
+                engine,
+                pages,
+                row_limit=row_fallback_limit,
+                mode=mode,
+                body=body,
+            )
+        except Exception as e:
+            warnings.append(f"row_candidate_fetch_error:{e}")
+            page_rows_map2 = {}
+
         for page in pages:
-            rows = await _get_page_rows_live(engine, page, limit=per_page_limit, mode=mode, body=body)
+            rows = page_rows_map2.get(page) or []
             for row in rows:
                 cand = _extract_candidate_from_row(page=page, row=row, horizon=horizon)
                 if cand is None:
@@ -1447,7 +1692,13 @@ async def select_top10(
 
         if row_based_count > 0:
             warnings.append(f"used_row_based_fallback:{row_based_count}")
+        stage_ms["row_candidate_fallback_ms"] = round((time.time() - stage_started) * 1000.0, 3)
+    elif not candidates and pages and not allow_row_fallback:
+        warnings.append("skipped_row_candidate_fallback_for_broad_or_unconstrained_request")
 
+    # -------------------------------------------------------------------------
+    # Stage 5: relaxed fallbacks
+    # -------------------------------------------------------------------------
     if not candidates and quote_candidates_unfiltered:
         candidates = list(quote_candidates_unfiltered)
         warnings.append(f"used_relaxed_quote_fallback:{len(candidates)}")
@@ -1505,6 +1756,10 @@ async def select_top10(
         if placeholder_count > 0:
             warnings.append(f"used_placeholder_symbol_fallback:{placeholder_count}")
 
+    # -------------------------------------------------------------------------
+    # Stage 6: dedupe + rank + final top
+    # -------------------------------------------------------------------------
+    stage_started = time.time()
     best: Dict[str, Candidate] = {}
     for c in candidates:
         prev = best.get(c.symbol)
@@ -1516,7 +1771,12 @@ async def select_top10(
 
     top_n = max(1, int(criteria.top_n or 10))
     top = deduped[:top_n]
+    stage_ms["rank_and_slice_ms"] = round((time.time() - stage_started) * 1000.0, 3)
 
+    # -------------------------------------------------------------------------
+    # Stage 7: enrich final Top-N only
+    # -------------------------------------------------------------------------
+    stage_started = time.time()
     enrich_map: Dict[str, Dict[str, Any]] = {}
     if criteria.enrich_final and top:
         try:
@@ -1524,6 +1784,7 @@ async def select_top10(
         except Exception as e:
             warnings.append(f"enrich_failed:{e}")
             enrich_map = {}
+    stage_ms["final_enrich_ms"] = round((time.time() - stage_started) * 1000.0, 3)
 
     for c in top:
         e = enrich_map.get(c.symbol)
@@ -1534,13 +1795,21 @@ async def select_top10(
             merged["source_page"] = c.source_page
             c.row = merged
 
+    total_ms = round((time.time() - t0) * 1000.0, 3)
+
     meta = {
         "version": TOP10_SELECTOR_VERSION,
         "mode": mode,
         "horizon": horizon,
         "roi_key": roi_key,
         "pages_selected": pages,
+        "pages_explicit": bool(getattr(criteria, "pages_explicit", False)),
+        "request_unconstrained": unconstrained,
         "direct_symbols_count": len(direct_symbols or []),
+        "per_page_limit": per_page_limit,
+        "row_fallback_limit": row_fallback_limit,
+        "max_universe_symbols": max_universe_symbols,
+        "allow_row_fallback": allow_row_fallback,
         "universe_symbols": len(symbols),
         "quotes_returned": len([s for s, q in qmap.items() if isinstance(q, dict) and q]),
         "quote_candidates_unfiltered": len(quote_candidates_unfiltered),
@@ -1559,9 +1828,10 @@ async def select_top10(
         },
         "warnings": warnings,
         "fallback_trace": fallback_trace,
+        "stage_durations_ms": stage_ms,
         "timestamp_utc": _now_utc_iso(),
         "timestamp_riyadh": _now_riyadh_iso(),
-        "duration_ms": round((time.time() - t0) * 1000.0, 3),
+        "duration_ms": total_ms,
     }
     return top, meta
 
@@ -1757,6 +2027,7 @@ def _build_criteria_snapshot(criteria: Criteria, *, mode: str) -> Dict[str, Any]
         "invest_period_days": criteria.invest_period_days,
         "horizon": criteria.horizon(),
         "pages_selected": criteria.pages_selected,
+        "pages_explicit": criteria.pages_explicit,
         "min_expected_roi": criteria.min_expected_roi,
         "max_risk_score": criteria.max_risk_score,
         "min_confidence": criteria.min_confidence,
@@ -1965,7 +2236,7 @@ async def select_top10_symbols(
         limit=limit,
     )
     mode2 = _extract_route_mode(mode, body, settings_payload, request_payload)
-    direct_symbols = _extract_direct_symbols_from_sources(body, settings_payload, request_payload)
+    direct_symbols = _extract_direct_symbols_from_sources(criteria, body, settings_payload, request_payload)
 
     top, _meta = await select_top10(
         engine=engine,
@@ -2000,7 +2271,7 @@ async def build_top10_rows(
         limit=limit,
     )
     mode2 = _extract_route_mode(mode, body, settings_payload, request_payload)
-    direct_symbols = _extract_direct_symbols_from_sources(body, settings_payload, request_payload)
+    direct_symbols = _extract_direct_symbols_from_sources(criteria, body, settings_payload, request_payload)
 
     top, meta_sel = await select_top10(
         engine=engine,
@@ -2038,6 +2309,7 @@ async def build_top10_rows(
             **(meta_rows or {}),
             "criteria": {
                 "pages_selected": crit.pages_selected,
+                "pages_explicit": crit.pages_explicit,
                 "invest_period_days": crit.invest_period_days,
                 "horizon": crit.horizon(),
                 "top_n": crit.top_n,
