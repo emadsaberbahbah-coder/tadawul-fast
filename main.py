@@ -2,21 +2,22 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v7.3.0)
+TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v7.4.0)
 ================================================================================
-ALIGNED • DEPLOYMENT-SAFE • PRE-MOUNT + LIFESPAN-VERIFY • ROUTER-SNAPSHOT-AWARE
-ENGINE-STATE-AWARE • OPENAPI-SAFE • RENDER-HEALTH-PROBE-SAFE
+ALIGNED • DEPLOYMENT-SAFE • PRE-MOUNT + STARTUP-VERIFY • ROUTER-SNAPSHOT-AWARE
+ENGINE-STATE-AWARE • OPENAPI-SAFE • RENDER-HEALTH-PROBE-SAFE • PRIORITY-MOUNTED
 
-Why this revision (v7.3.0)
+Why this revision (v7.4.0)
 --------------------------
 - ✅ FIX: Mounts routes once during app creation so OpenAPI sees them immediately
-- ✅ FIX: Lifespan re-checks / normalizes route snapshot without breaking duplicates
-- ✅ FIX: Invalidates OpenAPI cache after any route mount so new paths appear live
+- ✅ FIX: Startup verifies and normalizes the pre-mounted snapshot without remount churn
+- ✅ FIX: OpenAPI cache is invalidated after route mount so new paths appear live
 - ✅ FIX: Preserves app.state.routes_snapshot if routes package already wrote it
 - ✅ FIX: Engine warm-up stores engine on app.state.engine for request-time access
-- ✅ FIX: Fallback route plan aligned to current route modules
+- ✅ FIX: Fallback route plan aligned to canonical router priority order
 - ✅ FIX: Runtime meta reports mounted / duplicate / failed counts accurately
 - ✅ FIX: Adds request-id middleware and X-Request-ID response header
+- ✅ FIX: Debug auth calls core.config.auth_ok using multiple safe signatures
 - ✅ HARDEN: Startup remains safe even if routes or engine imports partially fail
 - ✅ HARDEN: /meta remains schema-visible so OpenAPI is never empty
 - ✅ SAFE: HEAD probes for /, /livez, /readyz, /health remain stable for Render
@@ -33,7 +34,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
@@ -44,7 +45,7 @@ from starlette.middleware.gzip import GZipMiddleware
 # --------------------------------------------------------------------------------------
 # Version
 # --------------------------------------------------------------------------------------
-APP_ENTRY_VERSION = "7.3.0"
+APP_ENTRY_VERSION = "7.4.0"
 
 # --------------------------------------------------------------------------------------
 # Safe env helpers
@@ -123,12 +124,12 @@ def _setup_logging() -> logging.Logger:
     root.handlers.clear()
     root.setLevel(getattr(logging, level, logging.INFO))
 
-    h = logging.StreamHandler(sys.stdout)
+    handler = logging.StreamHandler(sys.stdout)
     if log_json:
-        h.setFormatter(_JsonFormatter())
+        handler.setFormatter(_JsonFormatter())
     else:
-        h.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"))
-    root.addHandler(h)
+        handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"))
+    root.addHandler(handler)
 
     for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
         logging.getLogger(name).setLevel(getattr(logging, level, logging.INFO))
@@ -168,6 +169,7 @@ class _SettingsView:
 
 
 def _load_settings() -> _SettingsView:
+    # 1) env.py
     try:
         env_mod = importlib.import_module("env")
         if hasattr(env_mod, "get_settings"):
@@ -194,6 +196,7 @@ def _load_settings() -> _SettingsView:
     except Exception:
         pass
 
+    # 2) core.config
     try:
         cfg = importlib.import_module("core.config")
         getter = getattr(cfg, "get_settings_cached", None) or getattr(cfg, "get_settings", None)
@@ -221,6 +224,7 @@ def _load_settings() -> _SettingsView:
     except Exception:
         pass
 
+    # 3) env vars
     return _SettingsView(
         APP_NAME=_env_str("APP_NAME", "Tadawul Fast Bridge"),
         APP_VERSION=_env_str("APP_VERSION", "dev"),
@@ -245,8 +249,108 @@ def _load_settings() -> _SettingsView:
 _SETTINGS = _load_settings()
 
 # --------------------------------------------------------------------------------------
+# Default state helpers
+# --------------------------------------------------------------------------------------
+def _default_routes_snapshot() -> Dict[str, Any]:
+    return {
+        "mounted": [],
+        "mounted_count": 0,
+        "duplicate_skips": [],
+        "duplicate_skips_count": 0,
+        "missing": [],
+        "missing_count": 0,
+        "import_errors": {},
+        "mount_errors": {},
+        "no_router": {},
+        "failed_count": 0,
+        "strict": False,
+        "strategy": "",
+        "missing_required_keys": [],
+        "resolved_map": {},
+        "module_to_key": {},
+        "mount_modes": {},
+        "expected_router_modules": [],
+        "plan": [],
+        "resolved_entries": [],
+        "openapi_route_count_after_mount": 0,
+    }
+
+
+def _ensure_app_state_defaults(app: FastAPI) -> None:
+    if not hasattr(app.state, "routes_snapshot") or not isinstance(getattr(app.state, "routes_snapshot", None), dict):
+        app.state.routes_snapshot = _default_routes_snapshot()
+    if not hasattr(app.state, "routes_mounted"):
+        app.state.routes_mounted = False
+    if not hasattr(app.state, "routes_mount_phase"):
+        app.state.routes_mount_phase = ""
+    if not hasattr(app.state, "engine"):
+        app.state.engine = None
+    if not hasattr(app.state, "engine_source"):
+        app.state.engine_source = ""
+
+
+# --------------------------------------------------------------------------------------
 # Auth helper for debug endpoints
 # --------------------------------------------------------------------------------------
+def _call_auth_ok_flexible(fn: Any, request: Request, token_value: str, authorization: str) -> bool:
+    path = str(getattr(getattr(request, "url", None), "path", "") or "")
+    headers_dict = dict(request.headers)
+
+    settings = None
+    try:
+        cfg = importlib.import_module("core.config")
+        getter = getattr(cfg, "get_settings_cached", None) or getattr(cfg, "get_settings", None)
+        if callable(getter):
+            settings = getter()
+    except Exception:
+        settings = None
+
+    attempts = [
+        {
+            "token": token_value or None,
+            "authorization": authorization or None,
+            "headers": headers_dict,
+            "path": path,
+            "request": request,
+            "settings": settings,
+        },
+        {
+            "token": token_value or None,
+            "authorization": authorization or None,
+            "headers": headers_dict,
+            "path": path,
+            "request": request,
+        },
+        {
+            "token": token_value or None,
+            "authorization": authorization or None,
+            "headers": headers_dict,
+            "path": path,
+        },
+        {
+            "token": token_value or None,
+            "authorization": authorization or None,
+            "headers": headers_dict,
+        },
+        {
+            "token": token_value or None,
+            "authorization": authorization or None,
+        },
+        {
+            "token": token_value or None,
+        },
+    ]
+
+    for kwargs in attempts:
+        try:
+            return bool(fn(**kwargs))
+        except TypeError:
+            continue
+        except Exception:
+            return False
+    return False
+
+
 def _auth_ok(request: Request) -> bool:
     try:
         if bool(getattr(_SETTINGS, "OPEN_MODE", False)):
@@ -261,7 +365,8 @@ def _auth_ok(request: Request) -> bool:
             hdr = request.headers.get(_SETTINGS.AUTH_HEADER_NAME, "") or request.headers.get("X-APP-TOKEN", "")
             auth = request.headers.get("Authorization", "")
             token_q = request.query_params.get("token") if request.query_params else None
-            return bool(fn(token=hdr or token_q, authorization=auth, headers=dict(request.headers)))  # type: ignore[misc]
+            token_value = str(hdr or token_q or "").strip()
+            return _call_auth_ok_flexible(fn, request, token_value, auth)
     except Exception:
         pass
 
@@ -385,7 +490,9 @@ def _normalize_routes_snapshot(
     resolved_entries = list(src.get("resolved_entries", []) or [])
 
     failed_count = len(import_errors) + len(mount_errors) + len(no_router)
-    openapi_route_count_after_mount = int(src.get("openapi_route_count_after_mount", 0) or 0)
+    openapi_route_count_after_mount = int(
+        src.get("openapi_route_count_after_mount", len(getattr(app, "routes", []) or []) if app is not None else 0) or 0
+    )
 
     return {
         "mounted": mounted,
@@ -449,9 +556,7 @@ def _merge_snapshots(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]
     merged["mounted_count"] = len(merged["mounted"])
     merged["duplicate_skips_count"] = len(merged["duplicate_skips"])
     merged["missing_count"] = len(merged["missing"])
-    merged["failed_count"] = (
-        len(merged["import_errors"]) + len(merged["mount_errors"]) + len(merged["no_router"])
-    )
+    merged["failed_count"] = len(merged["import_errors"]) + len(merged["mount_errors"]) + len(merged["no_router"])
     merged["openapi_route_count_after_mount"] = int(
         new.get("openapi_route_count_after_mount", old.get("openapi_route_count_after_mount", 0)) or 0
     )
@@ -487,17 +592,18 @@ def _get_router_from_module(mod: Any) -> Tuple[Optional[Any], str]:
 def _mount_routes_fallback(app: FastAPI) -> Dict[str, Any]:
     strict = _env_bool("ROUTES_STRICT_IMPORT", False)
 
+    # Canonical fallback order aligned to routes/__init__.py priority
     plan = [
         "routes.config",
-        "routes.enriched_quote",
         "routes.data_dictionary",
-        "routes.investment_advisor",
+        "routes.analysis_sheet_rows",
+        "routes.advanced_sheet_rows",
         "routes.advanced_analysis",
         "routes.ai_analysis",
         "routes.advisor",
-        "routes.analysis_sheet_rows",
-        "routes.advanced_sheet_rows",
+        "routes.investment_advisor",
         "routes.top10_investments",
+        "routes.enriched_quote",
         "routes.routes_argaam",
     ]
 
@@ -573,6 +679,7 @@ def _mount_routes(app: FastAPI) -> Dict[str, Any]:
                 try:
                     ret = fn(app)  # type: ignore[misc]
                     snap = _normalize_routes_snapshot(ret, used_strategy=used_strategy, app=app)
+                    snap["openapi_route_count_after_mount"] = len(getattr(app, "routes", []) or [])
                     _invalidate_openapi_cache(app)
                     logger.info(
                         "Routes mount summary: mounted=%s duplicate_skips=%s missing=%s failed=%s strategy=%s",
@@ -605,20 +712,19 @@ def _mount_routes(app: FastAPI) -> Dict[str, Any]:
 
 
 def _mount_routes_once(app: FastAPI, phase: str) -> Dict[str, Any]:
-    current = {}
-    try:
-        current = dict(getattr(app.state, "routes_snapshot", {}) or {})
-    except Exception:
-        current = {}
+    _ensure_app_state_defaults(app)
 
-    last_phase = ""
-    try:
-        last_phase = str(getattr(app.state, "routes_mount_phase", "") or "")
-    except Exception:
-        last_phase = ""
+    current = dict(getattr(app.state, "routes_snapshot", {}) or {})
+    last_phase = str(getattr(app.state, "routes_mount_phase", "") or "")
 
     if phase == "startup" and last_phase == "startup":
-        return current
+        snap = _normalize_routes_snapshot(current, used_strategy=str(current.get("strategy", "startup")), app=app)
+        snap["openapi_route_count_after_mount"] = len(getattr(app, "routes", []) or [])
+        app.state.routes_snapshot = snap
+        app.state.routes_mounted = True
+        _invalidate_openapi_cache(app)
+        return snap
+
     if phase == "startup" and last_phase == "prestart":
         snap = _normalize_routes_snapshot(current, used_strategy=str(current.get("strategy", "prestart")), app=app)
         snap["openapi_route_count_after_mount"] = len(getattr(app, "routes", []) or [])
@@ -787,49 +893,7 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        try:
-            app.state.routes_snapshot = getattr(app.state, "routes_snapshot", {}) or {
-                "mounted": [],
-                "mounted_count": 0,
-                "duplicate_skips": [],
-                "duplicate_skips_count": 0,
-                "missing": [],
-                "missing_count": 0,
-                "import_errors": {},
-                "mount_errors": {},
-                "no_router": {},
-                "failed_count": 0,
-                "strict": False,
-                "strategy": "",
-                "plan": [],
-                "mount_modes": {},
-            }
-        except Exception:
-            app.state.routes_snapshot = {
-                "mounted": [],
-                "mounted_count": 0,
-                "duplicate_skips": [],
-                "duplicate_skips_count": 0,
-                "missing": [],
-                "missing_count": 0,
-                "import_errors": {},
-                "mount_errors": {},
-                "no_router": {},
-                "failed_count": 0,
-                "strict": False,
-                "strategy": "",
-                "plan": [],
-                "mount_modes": {},
-            }
-
-        if not hasattr(app.state, "routes_mounted"):
-            app.state.routes_mounted = False
-        if not hasattr(app.state, "routes_mount_phase"):
-            app.state.routes_mount_phase = ""
-        if not hasattr(app.state, "engine"):
-            app.state.engine = None
-        if not hasattr(app.state, "engine_source"):
-            app.state.engine_source = ""
+        _ensure_app_state_defaults(app)
 
         try:
             snap = _mount_routes_once(app, phase="startup")
@@ -880,27 +944,7 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # Initialize state early so prestart mount is safe
-    app.state.routes_snapshot = {
-        "mounted": [],
-        "mounted_count": 0,
-        "duplicate_skips": [],
-        "duplicate_skips_count": 0,
-        "missing": [],
-        "missing_count": 0,
-        "import_errors": {},
-        "mount_errors": {},
-        "no_router": {},
-        "failed_count": 0,
-        "strict": False,
-        "strategy": "",
-        "plan": [],
-        "mount_modes": {},
-    }
-    app.state.routes_mounted = False
-    app.state.routes_mount_phase = ""
-    app.state.engine = None
-    app.state.engine_source = ""
+    _ensure_app_state_defaults(app)
 
     app.add_middleware(RequestIDMiddleware)
     app.add_middleware(GZipMiddleware, minimum_size=1024)
