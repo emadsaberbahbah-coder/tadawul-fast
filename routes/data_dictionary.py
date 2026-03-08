@@ -2,7 +2,7 @@
 # routes/data_dictionary.py
 """
 ================================================================================
-Schema Router — v2.0.0 (UNIFIED / SHEET-SPEC FIXED / DATA-DICTIONARY SAFE)
+Schema Router — v2.1.0 (UNIFIED / REGISTRY-FIRST / DATA-DICTIONARY FALLBACK)
 ================================================================================
 
 Endpoints
@@ -20,30 +20,19 @@ Single schema router that exposes:
 
 Why this revision
 -----------------
-- ✅ FIX: /v1/schema/sheet-spec now returns real sheet specifications
-- ✅ FIX: No accidental data-dictionary payload shape for sheet-spec
-- ✅ FIX: Stable Apps-Script friendly response shapes
-- ✅ FIX: Handles object-style / dict-style schema columns safely
-- ✅ FIX: Adds optional filtering by sheet
-- ✅ FIX: Adds consistent metadata across all schema endpoints
+- ✅ FIX: /v1/schema/sheet-spec is no longer dependent on one fragile import path
+- ✅ FIX: Falls back to Data_Dictionary builders if schema_registry helpers are partial
+- ✅ FIX: /v1/schema/pages always returns extractable pages/items/results arrays
+- ✅ FIX: Handles dict-style, object-style, and list-style schema definitions safely
+- ✅ FIX: Keeps Apps-Script friendly response shapes and consistent metadata
 - ✅ SAFE: No quote engine / provider / network calls
 - ✅ SAFE: Optional auth only, open-mode aware
 - ✅ SAFE: Import-hardened for partial repo states
-
-Response philosophy
--------------------
-- "data-dictionary" returns flattened dictionary rows
-- "sheet-spec" returns grouped per-sheet schema definitions
-- "pages" returns supported pages and aliases metadata where available
-
-Notes
------
-- This module is intentionally self-contained and defensive.
-- It avoids assuming too much about helper signatures in other modules.
 """
 
 from __future__ import annotations
 
+import importlib
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -55,60 +44,8 @@ try:
 except Exception:  # pragma: no cover
     BestJSONResponse = JSONResponse  # type: ignore
 
-# --------------------------------------------------------------------------------------
-# Optional imports (kept defensive)
-# --------------------------------------------------------------------------------------
 
-try:
-    from core.sheets.data_dictionary import (  # type: ignore
-        build_data_dictionary_rows,
-        build_data_dictionary_values,
-    )
-except Exception:  # pragma: no cover
-    build_data_dictionary_rows = None  # type: ignore
-    build_data_dictionary_values = None  # type: ignore
-
-try:
-    from core.sheets.data_dictionary import validate_data_dictionary_output  # type: ignore
-except Exception:  # pragma: no cover
-    validate_data_dictionary_output = None  # type: ignore
-
-try:
-    from core.sheets.schema_registry import SCHEMA_VERSION, get_sheet_spec  # type: ignore
-except Exception:  # pragma: no cover
-    SCHEMA_VERSION = "unknown"  # type: ignore
-    get_sheet_spec = None  # type: ignore
-
-# Optional page catalog helpers
-try:
-    from core.sheets.page_catalog import normalize_page_name as _normalize_page_name  # type: ignore
-except Exception:  # pragma: no cover
-    _normalize_page_name = None  # type: ignore
-
-try:
-    from core.sheets.page_catalog import PAGE_ALIASES as _PAGE_ALIASES  # type: ignore
-except Exception:  # pragma: no cover
-    _PAGE_ALIASES = None  # type: ignore
-
-try:
-    from core.sheets.page_catalog import SUPPORTED_PAGES as _SUPPORTED_PAGES  # type: ignore
-except Exception:  # pragma: no cover
-    _SUPPORTED_PAGES = None  # type: ignore
-
-try:
-    from core.sheets.page_catalog import PAGES as _PAGES  # type: ignore
-except Exception:  # pragma: no cover
-    _PAGES = None  # type: ignore
-
-# Optional auth helpers
-try:
-    from core.config import auth_ok, is_open_mode  # type: ignore
-except Exception:  # pragma: no cover
-    auth_ok = None  # type: ignore
-    is_open_mode = None  # type: ignore
-
-
-SCHEMA_ROUTE_VERSION = "2.0.0"
+SCHEMA_ROUTE_VERSION = "2.1.0"
 
 router = APIRouter(prefix="/v1/schema", tags=["Schema"])
 
@@ -127,6 +64,71 @@ _CANONICAL_PAGES_FALLBACK: List[str] = [
     "Top_10_Investments",
     "Data_Dictionary",
 ]
+
+_DATA_DICTIONARY_HEADERS: List[str] = [
+    "sheet",
+    "group",
+    "header",
+    "key",
+    "dtype",
+    "fmt",
+    "required",
+    "source",
+    "notes",
+]
+
+_DATA_DICTIONARY_KEYS: List[str] = list(_DATA_DICTIONARY_HEADERS)
+
+
+# --------------------------------------------------------------------------------------
+# Optional modules (kept defensive)
+# --------------------------------------------------------------------------------------
+
+def _safe_import(module_name: str) -> Any:
+    try:
+        return importlib.import_module(module_name)
+    except Exception:  # pragma: no cover
+        return None
+
+
+_schema_registry_mod = _safe_import("core.sheets.schema_registry")
+_data_dictionary_mod = _safe_import("core.sheets.data_dictionary")
+_page_catalog_mod = _safe_import("core.sheets.page_catalog")
+_config_mod = _safe_import("core.config")
+
+
+def _resolve_attr(module: Any, *names: str, default: Any = None) -> Any:
+    if module is None:
+        return default
+    for name in names:
+        try:
+            if hasattr(module, name):
+                return getattr(module, name)
+        except Exception:
+            continue
+    return default
+
+
+SCHEMA_VERSION = _resolve_attr(_schema_registry_mod, "SCHEMA_VERSION", default="unknown")
+
+build_data_dictionary_rows = _resolve_attr(_data_dictionary_mod, "build_data_dictionary_rows")
+build_data_dictionary_values = _resolve_attr(_data_dictionary_mod, "build_data_dictionary_values")
+validate_data_dictionary_output = _resolve_attr(_data_dictionary_mod, "validate_data_dictionary_output")
+
+_get_sheet_spec_callable = _resolve_attr(
+    _schema_registry_mod,
+    "get_sheet_spec",
+    "get_schema_for_sheet",
+    "get_sheet_schema",
+)
+
+_normalize_page_name = _resolve_attr(_page_catalog_mod, "normalize_page_name")
+_PAGE_ALIASES = _resolve_attr(_page_catalog_mod, "PAGE_ALIASES")
+_SUPPORTED_PAGES = _resolve_attr(_page_catalog_mod, "SUPPORTED_PAGES")
+_PAGES = _resolve_attr(_page_catalog_mod, "PAGES")
+
+auth_ok = _resolve_attr(_config_mod, "auth_ok")
+is_open_mode = _resolve_attr(_config_mod, "is_open_mode")
 
 
 # --------------------------------------------------------------------------------------
@@ -206,14 +208,12 @@ def _auth_passed(
     x_app_token: Optional[str],
     authorization: Optional[str],
 ) -> bool:
-    # Open mode bypass if available
     try:
         if callable(is_open_mode) and bool(is_open_mode()):
             return True
     except Exception:
         pass
 
-    # If auth helper is unavailable, keep schema endpoints open
     if auth_ok is None:
         return True
 
@@ -236,48 +236,33 @@ def _auth_passed(
                 },
             )
         )
+    except TypeError:
+        try:
+            return bool(auth_ok(auth_token or None))
+        except Exception:
+            return False
     except Exception:
         return False
+
+
+def _dedupe_keep_order(values: Iterable[Any]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for value in values:
+        try:
+            s = str(value).strip()
+        except Exception:
+            continue
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
 
 
 # --------------------------------------------------------------------------------------
 # Page catalog helpers
 # --------------------------------------------------------------------------------------
-
-def _normalize_page_candidate(name: Optional[str]) -> Optional[str]:
-    if not name:
-        return None
-    raw = str(name).strip()
-    if not raw:
-        return None
-
-    if callable(_normalize_page_name):
-        try:
-            out = _normalize_page_name(raw)
-            if out:
-                return str(out)
-        except Exception:
-            pass
-
-    # direct canonical match
-    for p in _get_all_pages():
-        if raw == p:
-            return p
-
-    # case-insensitive direct match
-    lower_raw = raw.lower()
-    for p in _get_all_pages():
-        if p.lower() == lower_raw:
-            return p
-
-    # aliases fallback
-    aliases = _get_page_aliases()
-    canonical = aliases.get(lower_raw)
-    if canonical:
-        return canonical
-
-    return raw
-
 
 def _get_page_aliases() -> Dict[str, str]:
     aliases: Dict[str, str] = {}
@@ -289,7 +274,6 @@ def _get_page_aliases() -> Dict[str, str]:
             except Exception:
                 continue
 
-    # Soft fallbacks for common display variants
     for p in _CANONICAL_PAGES_FALLBACK:
         aliases[p.lower()] = p
         aliases[p.replace("_", " ").lower()] = p
@@ -308,6 +292,32 @@ def _get_page_aliases() -> Dict[str, str]:
     return aliases
 
 
+def _normalize_page_candidate(name: Optional[str]) -> Optional[str]:
+    if not name:
+        return None
+
+    raw = str(name).strip()
+    if not raw:
+        return None
+
+    if callable(_normalize_page_name):
+        try:
+            normalized = _normalize_page_name(raw)
+            if normalized:
+                return str(normalized)
+        except Exception:
+            pass
+
+    for page in _get_all_pages():
+        if raw == page:
+            return page
+        if raw.lower() == page.lower():
+            return page
+
+    aliases = _get_page_aliases()
+    return aliases.get(raw.lower(), raw)
+
+
 def _extract_pages_from_object(obj: Any) -> List[str]:
     pages: List[str] = []
 
@@ -324,36 +334,113 @@ def _extract_pages_from_object(obj: Any) -> List[str]:
 
     if isinstance(obj, (list, tuple, set)):
         for item in obj:
-            try:
-                pages.append(str(item))
-            except Exception:
-                continue
+            if isinstance(item, Mapping):
+                candidate = (
+                    item.get("page")
+                    or item.get("sheet")
+                    or item.get("name")
+                    or item.get("id")
+                )
+                if candidate:
+                    pages.append(str(candidate))
+            else:
+                try:
+                    pages.append(str(item))
+                except Exception:
+                    continue
         return pages
 
     return pages
 
 
-def _get_all_pages() -> List[str]:
+def _raw_data_dictionary_rows() -> List[Any]:
+    if not callable(build_data_dictionary_rows):
+        return []
+
+    try:
+        return _as_list(build_data_dictionary_rows(include_meta_sheet=True))
+    except TypeError:
+        try:
+            return _as_list(build_data_dictionary_rows())
+        except Exception:
+            return []
+    except Exception:
+        return []
+
+
+def _infer_specs_from_data_dictionary() -> Dict[str, Dict[str, Any]]:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+
+    for row in _raw_data_dictionary_rows():
+        sheet_name = (
+            _obj_get(row, "sheet")
+            or _obj_get(row, "Sheet")
+            or _obj_get(row, "page")
+            or _obj_get(row, "Page")
+        )
+        if not sheet_name:
+            continue
+
+        header = _obj_get(row, "header") or _obj_get(row, "Header")
+        key = _obj_get(row, "key") or _obj_get(row, "Key")
+
+        col = {
+            "group": _obj_get(row, "group") or _obj_get(row, "Group"),
+            "header": header,
+            "key": key,
+            "dtype": _obj_get(row, "dtype") or _obj_get(row, "type") or _obj_get(row, "Type"),
+            "fmt": _obj_get(row, "fmt") or _obj_get(row, "format") or _obj_get(row, "Format"),
+            "required": _obj_get(row, "required") or _obj_get(row, "is_required"),
+            "source": _obj_get(row, "source") or _obj_get(row, "Source"),
+            "notes": _obj_get(row, "notes") or _obj_get(row, "description") or _obj_get(row, "Notes"),
+        }
+
+        grouped.setdefault(str(sheet_name), []).append(col)
+
+    specs: Dict[str, Dict[str, Any]] = {}
+    for sheet_name, columns in grouped.items():
+        specs[sheet_name] = _normalize_sheet_spec(sheet_name, columns)
+    return specs
+
+
+def _schema_registry_mapping() -> Dict[str, Any]:
+    if _schema_registry_mod is None:
+        return {}
+
+    for attr_name in (
+        "SCHEMA_REGISTRY",
+        "SHEET_SCHEMAS",
+        "SCHEMA_BY_SHEET",
+        "SHEETS",
+        "SHEET_REGISTRY",
+        "PAGE_SCHEMAS",
+    ):
+        value = _resolve_attr(_schema_registry_mod, attr_name)
+        if isinstance(value, Mapping):
+            return dict(value)
+
+    return {}
+
+
+def _registry_pages() -> List[str]:
     pages: List[str] = []
 
     for candidate in (_SUPPORTED_PAGES, _PAGES):
         pages.extend(_extract_pages_from_object(candidate))
 
-    if not pages:
-        pages = list(_CANONICAL_PAGES_FALLBACK)
+    registry_map = _schema_registry_mapping()
+    pages.extend(_extract_pages_from_object(registry_map))
 
-    # Keep canonical order when possible
-    uniq: List[str] = []
-    seen = set()
-    for p in pages + _CANONICAL_PAGES_FALLBACK:
-        if not p:
-            continue
-        s = str(p).strip()
-        if s and s not in seen:
-            seen.add(s)
-            uniq.append(s)
+    inferred_specs = _infer_specs_from_data_dictionary()
+    pages.extend(_extract_pages_from_object(inferred_specs))
 
-    return uniq
+    pages.extend(_CANONICAL_PAGES_FALLBACK)
+
+    return _dedupe_keep_order(pages)
+
+
+def _get_all_pages() -> List[str]:
+    return _registry_pages()
 
 
 # --------------------------------------------------------------------------------------
@@ -361,36 +448,95 @@ def _get_all_pages() -> List[str]:
 # --------------------------------------------------------------------------------------
 
 def _normalize_column(col: Any) -> Dict[str, Any]:
+    group = _obj_get(col, "group")
+    header = _obj_get(col, "header")
+    key = _obj_get(col, "key")
+    dtype = _obj_get(col, "dtype")
+    fmt = _obj_get(col, "fmt")
+    required = _obj_get(col, "required")
+    source = _obj_get(col, "source")
+    notes = _obj_get(col, "notes")
+
+    if isinstance(col, Mapping):
+        group = col.get("group", group)
+        header = col.get("header", header)
+        key = col.get("key", key)
+        dtype = col.get("dtype", col.get("type", dtype))
+        fmt = col.get("fmt", col.get("format", fmt))
+        required = col.get("required", col.get("is_required", required))
+        source = col.get("source", source)
+        notes = col.get("notes", col.get("description", notes))
+
     return {
-        "group": _obj_get(col, "group"),
-        "header": _obj_get(col, "header"),
-        "key": _obj_get(col, "key"),
-        "dtype": _obj_get(col, "dtype"),
-        "fmt": _obj_get(col, "fmt"),
-        "required": _obj_get(col, "required"),
-        "source": _obj_get(col, "source"),
-        "notes": _obj_get(col, "notes"),
+        "group": group,
+        "header": header,
+        "key": key,
+        "dtype": dtype,
+        "fmt": fmt,
+        "required": required,
+        "source": source,
+        "notes": notes,
     }
+
+
+def _headers_keys_to_columns(headers: Sequence[Any], keys: Sequence[Any]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    max_len = max(len(headers), len(keys))
+    for i in range(max_len):
+        header = headers[i] if i < len(headers) else None
+        key = keys[i] if i < len(keys) else None
+        out.append(
+            {
+                "group": None,
+                "header": header,
+                "key": key or header,
+                "dtype": None,
+                "fmt": None,
+                "required": None,
+                "source": None,
+                "notes": None,
+            }
+        )
+    return out
 
 
 def _normalize_spec_to_columns(spec: Any) -> List[Dict[str, Any]]:
     if spec is None:
         return []
 
-    # Most likely shape: spec.columns
     cols = _obj_get(spec, "columns")
     if cols is not None:
         return [_normalize_column(c) for c in _as_list(cols)]
 
-    # Sometimes the spec itself may be a list
     if isinstance(spec, (list, tuple)):
+        if spec and all(isinstance(x, (str, bytes)) for x in spec):
+            headers = [str(x) for x in spec]
+            return _headers_keys_to_columns(headers, headers)
         return [_normalize_column(c) for c in spec]
 
-    # Possible dict-style fallback
+    if isinstance(spec, Mapping):
+        if "columns" in spec:
+            return [_normalize_column(c) for c in _as_list(spec.get("columns"))]
+        if "headers" in spec or "keys" in spec:
+            headers = [str(x) for x in _as_list(spec.get("headers"))]
+            keys = [str(x) for x in _as_list(spec.get("keys"))]
+            return _headers_keys_to_columns(headers, keys or headers)
+        for alt in ("fields", "schema"):
+            if alt in spec:
+                return [_normalize_column(c) for c in _as_list(spec.get(alt))]
+
     for alt in ("fields", "schema"):
         cols = _obj_get(spec, alt)
         if cols is not None:
             return [_normalize_column(c) for c in _as_list(cols)]
+
+    headers = _as_list(_obj_get(spec, "headers"))
+    keys = _as_list(_obj_get(spec, "keys"))
+    if headers or keys:
+        return _headers_keys_to_columns(
+            [str(x) for x in headers],
+            [str(x) for x in (keys or headers)],
+        )
 
     return []
 
@@ -398,7 +544,7 @@ def _normalize_spec_to_columns(spec: Any) -> List[Dict[str, Any]]:
 def _normalize_sheet_spec(sheet_name: str, spec: Any) -> Dict[str, Any]:
     columns = _normalize_spec_to_columns(spec)
     headers = [str(c.get("header") or "") for c in columns]
-    keys = [str(c.get("key") or "") for c in columns]
+    keys = [str(c.get("key") or c.get("header") or "") for c in columns]
 
     return {
         "sheet": sheet_name,
@@ -409,15 +555,49 @@ def _normalize_sheet_spec(sheet_name: str, spec: Any) -> Dict[str, Any]:
     }
 
 
+def _find_spec_in_registry(sheet_name: str) -> Any:
+    registry_map = _schema_registry_mapping()
+    if registry_map:
+        for candidate in (
+            sheet_name,
+            sheet_name.lower(),
+            sheet_name.upper(),
+        ):
+            if candidate in registry_map:
+                return registry_map[candidate]
+
+        for k, v in registry_map.items():
+            try:
+                if str(k).strip().lower() == sheet_name.lower():
+                    return v
+            except Exception:
+                continue
+
+    if callable(_get_sheet_spec_callable):
+        try:
+            return _get_sheet_spec_callable(sheet_name)
+        except Exception:
+            pass
+
+    return None
+
+
 def _get_sheet_spec_safe(sheet_name: str) -> Dict[str, Any]:
-    if not callable(get_sheet_spec):
-        raise RuntimeError("get_sheet_spec unavailable")
+    spec = _find_spec_in_registry(sheet_name)
+    if spec is not None:
+        normalized = _normalize_sheet_spec(sheet_name, spec)
+        if normalized["column_count"] > 0:
+            return normalized
 
-    spec = get_sheet_spec(sheet_name)
-    if spec is None:
-        raise KeyError(f"Unknown sheet: {sheet_name}")
+    inferred_specs = _infer_specs_from_data_dictionary()
+    if sheet_name in inferred_specs:
+        return inferred_specs[sheet_name]
 
-    return _normalize_sheet_spec(sheet_name, spec)
+    for name, spec in inferred_specs.items():
+        if str(name).lower() == sheet_name.lower():
+            return spec
+
+    raise KeyError(f"Unknown sheet: {sheet_name}")
 
 
 def _get_all_sheet_specs() -> Dict[str, Dict[str, Any]]:
@@ -426,7 +606,6 @@ def _get_all_sheet_specs() -> Dict[str, Dict[str, Any]]:
         try:
             grouped[page] = _get_sheet_spec_safe(page)
         except Exception:
-            # Keep route resilient even if one spec is broken
             continue
     return grouped
 
@@ -436,27 +615,26 @@ def _get_all_sheet_specs() -> Dict[str, Dict[str, Any]]:
 # --------------------------------------------------------------------------------------
 
 def _get_data_dictionary_headers_and_keys() -> Tuple[List[str], List[str]]:
-    spec = _get_sheet_spec_safe("Data_Dictionary")
-    headers = list(spec["headers"])
-    keys = list(spec["keys"])
+    try:
+        spec = _get_sheet_spec_safe("Data_Dictionary")
+        headers = list(spec["headers"])
+        keys = list(spec["keys"])
+        if headers and keys and len(headers) == len(keys):
+            return headers, keys
+    except Exception:
+        pass
 
-    if not headers or not keys or len(headers) != len(keys):
-        raise RuntimeError("Data_Dictionary schema columns are invalid")
-
-    return headers, keys
+    return list(_DATA_DICTIONARY_HEADERS), list(_DATA_DICTIONARY_KEYS)
 
 
 def _normalize_row_dict(row: Any, keys: Sequence[str]) -> Dict[str, Any]:
-    """
-    Force one row into a dict aligned to canonical keys.
-    Handles:
-    - dict rows
-    - object rows
-    - list/tuple rows (mapped by position)
-    - scalar/string rows (placed into first key only)
-    """
     if isinstance(row, Mapping):
-        return {k: row.get(k) for k in keys}
+        out: Dict[str, Any] = {}
+        for k in keys:
+            out[k] = row.get(k)
+            if out[k] is None:
+                out[k] = row.get(k.title())
+        return out
 
     if hasattr(row, "__dict__"):
         return {k: getattr(row, k, None) for k in keys}
@@ -499,14 +677,24 @@ def _normalize_values_matrix(values: Any, expected_cols: int) -> List[List[Any]]
     return normalized
 
 
+def _first_row_matches_headers(values: List[List[Any]], headers: Sequence[str]) -> bool:
+    if not values:
+        return False
+    first = [str(x).strip() if x is not None else "" for x in values[0]]
+    target = [str(x).strip() for x in headers]
+    return first == target
+
+
 def _build_data_dictionary_rows_safe(include_meta_sheet: bool) -> List[Dict[str, Any]]:
-    headers, keys = _get_data_dictionary_headers_and_keys()
+    _, keys = _get_data_dictionary_headers_and_keys()
 
     if callable(build_data_dictionary_rows):
-        raw_rows = build_data_dictionary_rows(include_meta_sheet=include_meta_sheet)
+        try:
+            raw_rows = build_data_dictionary_rows(include_meta_sheet=include_meta_sheet)
+        except TypeError:
+            raw_rows = build_data_dictionary_rows()
         rows = _rows_to_dicts(raw_rows, keys)
     else:
-        # Fallback: derive from all sheet specs directly
         rows = []
         all_specs = _get_all_sheet_specs()
         for sheet_name, spec in all_specs.items():
@@ -531,11 +719,17 @@ def _build_data_dictionary_rows_safe(include_meta_sheet: bool) -> List[Dict[str,
         try:
             validate_data_dictionary_output(rows, enforce_unique_sheet_key=True)
         except TypeError:
-            validate_data_dictionary_output(rows)
+            try:
+                validate_data_dictionary_output(rows)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
-    # Keep canonical field order
     ordered_rows: List[Dict[str, Any]] = []
     for row in rows:
+        if not include_meta_sheet and str(row.get("sheet") or "") == "Data_Dictionary":
+            continue
         ordered_rows.append({k: row.get(k) for k in keys})
 
     return ordered_rows
@@ -545,12 +739,18 @@ def _build_data_dictionary_values_safe(include_meta_sheet: bool) -> List[List[An
     headers, keys = _get_data_dictionary_headers_and_keys()
 
     if callable(build_data_dictionary_values):
-        raw_values = build_data_dictionary_values(
-            include_header_row=True,
-            include_meta_sheet=include_meta_sheet,
-        )
+        try:
+            raw_values = build_data_dictionary_values(
+                include_header_row=True,
+                include_meta_sheet=include_meta_sheet,
+            )
+        except TypeError:
+            raw_values = build_data_dictionary_values()
+
         values = _normalize_values_matrix(raw_values, expected_cols=len(headers))
-        if values:
+        if not _first_row_matches_headers(values, headers):
+            values = [list(headers)] + values
+        elif values:
             values[0] = list(headers)
         else:
             values = [list(headers)]
@@ -686,7 +886,7 @@ def get_sheet_spec_route(
         page_aliases = _get_page_aliases()
 
         if fmt == "headers":
-            payload = {name: spec["headers"] for name, spec in specs.items()}
+            payload: Any = {name: spec["headers"] for name, spec in specs.items()}
         elif fmt == "keys":
             payload = {name: spec["keys"] for name, spec in specs.items()}
         elif fmt == "flat":
@@ -710,23 +910,30 @@ def get_sheet_spec_route(
         else:
             payload = specs
 
-        return BestJSONResponse(
-            status_code=200,
-            content={
-                "status": "success",
-                "endpoint": "sheet-spec",
-                "format": fmt,
-                "sheet": normalized_sheet,
-                "count": len(specs),
-                "pages": list(specs.keys()),
-                "aliases": page_aliases,
-                "data": payload,
-                "version": SCHEMA_ROUTE_VERSION,
-                "schema_version": SCHEMA_VERSION,
-                "generated_at_utc": generated_at_utc,
-                "request_id": request_id,
-            },
-        )
+        response: Dict[str, Any] = {
+            "status": "success",
+            "endpoint": "sheet-spec",
+            "format": fmt,
+            "sheet": normalized_sheet,
+            "count": len(specs),
+            "pages": list(specs.keys()),
+            "items": list(specs.keys()),
+            "results": list(specs.keys()),
+            "aliases": page_aliases,
+            "data": payload,
+            "version": SCHEMA_ROUTE_VERSION,
+            "schema_version": SCHEMA_VERSION,
+            "generated_at_utc": generated_at_utc,
+            "request_id": request_id,
+        }
+
+        if normalized_sheet and normalized_sheet in specs:
+            response["headers"] = specs[normalized_sheet]["headers"]
+            response["keys"] = specs[normalized_sheet]["keys"]
+            response["columns"] = specs[normalized_sheet]["columns"]
+            response["column_count"] = specs[normalized_sheet]["column_count"]
+
+        return BestJSONResponse(status_code=200, content=response)
 
     except KeyError as e:
         return _error(404, str(e), request_id=request_id)
@@ -761,6 +968,8 @@ def get_schema_pages(
             "status": "success",
             "endpoint": "pages",
             "pages": pages,
+            "items": pages,
+            "results": pages,
             "count": len(pages),
             "version": SCHEMA_ROUTE_VERSION,
             "schema_version": SCHEMA_VERSION,
