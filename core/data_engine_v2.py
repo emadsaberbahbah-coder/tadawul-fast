@@ -2,17 +2,28 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.10.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.11.0
 ================================================================================
 
-WHY v5.10.0
+WHY v5.11.0
 -----------
-This revision keeps the advanced-field engine behavior from v5.9.0 and fixes the
-remaining Top10 universe-discovery / selector-compatibility gap.
+This revision keeps the advanced-field engine behavior from v5.10.0 and aligns
+the engine with the repaired route layer so Top10 can remain selector-driven
+without forcing unnecessary broad engine work.
 
 What is added / improved
 ------------------------
-- ✅ FIX: exposes sync cached snapshot methods used by Top10 selector:
+- ✅ FIX: stronger Top10 sheet dispatch alignment with repaired routes
+- ✅ FIX: schema_only / headers_only requests can return fast without heavy work
+- ✅ FIX: Top10 engine-path requests normalize broad/unconstrained bodies safely
+- ✅ FIX: Top10 sheet builder can degrade to cached snapshot instead of hard-failing
+- ✅ FIX: selector payload headers/keys/display_headers are preserved when present
+- ✅ FIX: more selector / wrapper compatibility aliases:
+    - get_analysis_quotes_batch(...)
+    - quotes_batch(...)
+    - get_quote_dict(...)
+- ✅ FIX: positional compatibility improved for common engine methods used by wrappers
+- ✅ FIX: stronger sync cached snapshot methods remain available:
     - get_cached_sheet_snapshot(...)
     - get_sheet_snapshot(...)
     - get_cached_sheet_rows(...)
@@ -69,7 +80,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.10.0"
+__version__ = "5.11.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -1465,6 +1476,8 @@ PAGE_SYMBOL_ENV_KEYS: Dict[str, str] = {
     "My_Portfolio": "MY_PORTFOLIO_SYMBOLS",
 }
 
+TOP10_ENGINE_DEFAULT_PAGES = ["Market_Leaders", "Global_Markets"]
+
 
 def _split_symbols(v: Any) -> List[str]:
     if v is None:
@@ -1500,6 +1513,13 @@ def _normalize_symbol_list(values: Sequence[Any], limit: int = 5000) -> List[str
     return out
 
 
+def _extract_nested_dict(payload: Optional[Dict[str, Any]], key: str) -> Dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    value = payload.get(key)
+    return dict(value) if isinstance(value, dict) else {}
+
+
 def _extract_requested_symbols_from_body(body: Optional[Dict[str, Any]], limit: int = 5000) -> List[str]:
     if not isinstance(body, dict):
         return []
@@ -1522,6 +1542,92 @@ def _extract_requested_symbols_from_body(body: Optional[Dict[str, Any]], limit: 
                 raw.extend(_split_symbols(nested.get(key)))
 
     return _normalize_symbol_list(raw, limit=limit)
+
+
+def _extract_top10_pages_from_body(body: Optional[Dict[str, Any]]) -> List[str]:
+    if not isinstance(body, dict):
+        return []
+    out: List[str] = []
+    for src in (body, _extract_nested_dict(body, "criteria"), _extract_nested_dict(body, "settings")):
+        vals = src.get("pages_selected") or src.get("pages") or src.get("selected_pages") or src.get("pagesSelected")
+        if isinstance(vals, str):
+            vals = [p.strip() for p in re.split(r"[,;\|\n]+", vals) if p.strip()]
+        if isinstance(vals, list):
+            for v in vals:
+                s = _canonicalize_sheet_name(str(v or "").strip())
+                if s and s not in SPECIAL_SHEETS:
+                    out.append(s)
+    dedup: List[str] = []
+    seen = set()
+    for p in out:
+        if p and p not in seen:
+            seen.add(p)
+            dedup.append(p)
+    return dedup
+
+
+def _is_schema_only_body(body: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(body, dict):
+        return False
+    criteria = _extract_nested_dict(body, "criteria")
+    for src in (body, criteria):
+        for key in ("schema_only", "headers_only"):
+            if key in src:
+                val = src.get(key)
+                if isinstance(val, bool):
+                    if val:
+                        return True
+                elif isinstance(val, (int, float)) and not isinstance(val, bool):
+                    if int(val) != 0:
+                        return True
+                elif isinstance(val, str) and val.strip().lower() in {"1", "true", "yes", "y", "on"}:
+                    return True
+    return False
+
+
+def _normalize_top10_body_for_engine(body: Optional[Dict[str, Any]], limit: int) -> Tuple[Dict[str, Any], List[str]]:
+    norm = dict(body or {})
+    warnings: List[str] = []
+
+    norm["page"] = "Top_10_Investments"
+    norm["sheet_name"] = "Top_10_Investments"
+
+    eff_limit = max(1, min(50, int(norm.get("limit") or norm.get("top_n") or limit or 10)))
+    norm["limit"] = eff_limit
+    norm["top_n"] = eff_limit
+
+    criteria = _extract_nested_dict(norm, "criteria")
+    if "top_n" not in criteria or criteria.get("top_n") in (None, "", 0):
+        criteria["top_n"] = eff_limit
+
+    horizon_days = _safe_int(
+        norm.get("horizon_days")
+        or norm.get("invest_period_days")
+        or criteria.get("horizon_days")
+        or criteria.get("invest_period_days")
+    )
+    if horizon_days is not None and horizon_days > 0:
+        norm["horizon_days"] = horizon_days
+        norm["invest_period_days"] = horizon_days
+        criteria.setdefault("horizon_days", horizon_days)
+        criteria.setdefault("invest_period_days", horizon_days)
+
+    direct_symbols = _extract_requested_symbols_from_body(norm, limit=eff_limit * 20)
+    if direct_symbols and ("direct_symbols" not in criteria or not criteria.get("direct_symbols")):
+        criteria["direct_symbols"] = direct_symbols
+
+    pages = _extract_top10_pages_from_body(norm)
+    if not direct_symbols and not pages:
+        default_pages = [p for p in TOP10_ENGINE_DEFAULT_PAGES if p not in SPECIAL_SHEETS]
+        criteria["pages_selected"] = default_pages
+        criteria.setdefault("pages_explicit", False)
+        warnings.append(f"engine_default_pages_applied:{','.join(default_pages)}")
+    elif pages:
+        criteria["pages_selected"] = pages
+        criteria["pages_explicit"] = True
+
+    norm["criteria"] = criteria
+    return norm, warnings
 
 
 def _canonicalize_sheet_name(sheet: str) -> str:
@@ -1691,13 +1797,13 @@ class _EngineSymbolsReaderProxy:
         self._engine = engine
 
     async def get_symbols_for_sheet(self, sheet: str, limit: int = 5000) -> List[str]:
-        return await self._engine.get_sheet_symbols(sheet=sheet, limit=limit)
+        return await self._engine.get_sheet_symbols(sheet, limit=limit)
 
     async def get_symbols_for_page(self, page: str, limit: int = 5000) -> List[str]:
-        return await self._engine.get_page_symbols(page=page, limit=limit)
+        return await self._engine.get_page_symbols(page, limit=limit)
 
     async def list_symbols_for_page(self, page: str, limit: int = 5000) -> List[str]:
-        return await self._engine.list_symbols_for_page(page=page, limit=limit)
+        return await self._engine.list_symbols_for_page(page, limit=limit)
 
 
 class DataEngineV5:
@@ -2073,8 +2179,8 @@ class DataEngineV5:
 
     async def get_sheet_symbols(
         self,
-        *,
         sheet: Optional[str] = None,
+        *,
         sheet_name: Optional[str] = None,
         page: Optional[str] = None,
         limit: int = 5000,
@@ -2084,8 +2190,8 @@ class DataEngineV5:
 
     async def get_page_symbols(
         self,
-        *,
         page: Optional[str] = None,
+        *,
         sheet: Optional[str] = None,
         sheet_name: Optional[str] = None,
         limit: int = 5000,
@@ -2095,8 +2201,8 @@ class DataEngineV5:
 
     async def list_symbols_for_page(
         self,
-        *,
         page: str,
+        *,
         limit: int = 5000,
         body: Optional[Dict[str, Any]] = None,
     ) -> List[str]:
@@ -2104,8 +2210,8 @@ class DataEngineV5:
 
     async def list_symbols(
         self,
-        *,
         sheet: Optional[str] = None,
+        *,
         page: Optional[str] = None,
         sheet_name: Optional[str] = None,
         limit: int = 5000,
@@ -2115,8 +2221,8 @@ class DataEngineV5:
 
     async def get_symbols(
         self,
-        *,
         sheet: Optional[str] = None,
+        *,
         page: Optional[str] = None,
         sheet_name: Optional[str] = None,
         limit: int = 5000,
@@ -2396,11 +2502,14 @@ class DataEngineV5:
     fetch_quote = get_enriched_quote
     fetch_quotes = get_enriched_quotes
     get_quotes_batch = get_enriched_quotes_batch
+    get_analysis_quotes_batch = get_enriched_quotes_batch
+    quotes_batch = get_enriched_quotes_batch
+    get_quote_dict = get_enriched_quote_dict
 
     async def get_page_rows(
         self,
-        *,
         page: Optional[str] = None,
+        *,
         sheet: Optional[str] = None,
         sheet_name: Optional[str] = None,
         limit: int = 2000,
@@ -2409,7 +2518,7 @@ class DataEngineV5:
         body: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         return await self.get_sheet_rows(
-            sheet=page or sheet or sheet_name,
+            page or sheet or sheet_name,
             limit=limit,
             offset=offset,
             mode=mode,
@@ -2418,8 +2527,8 @@ class DataEngineV5:
 
     async def get_sheet(
         self,
-        *,
         sheet_name: Optional[str] = None,
+        *,
         sheet: Optional[str] = None,
         page: Optional[str] = None,
         limit: int = 2000,
@@ -2428,7 +2537,7 @@ class DataEngineV5:
         body: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         return await self.get_sheet_rows(
-            sheet=sheet_name or sheet or page,
+            sheet_name or sheet or page,
             limit=limit,
             offset=offset,
             mode=mode,
@@ -2437,8 +2546,8 @@ class DataEngineV5:
 
     async def get_sheet_rows(
         self,
-        *,
         sheet: Optional[str] = None,
+        *,
         sheet_name: Optional[str] = None,
         page: Optional[str] = None,
         limit: int = 2000,
@@ -2479,6 +2588,26 @@ class DataEngineV5:
                     "schema_source": schema_src,
                     "strict": True,
                     "known_sheets": _list_sheet_names_best_effort(),
+                },
+                "version": self.version,
+            }
+
+        if headers and keys and _is_schema_only_body(body):
+            return {
+                "status": "success",
+                "sheet": target_sheet,
+                "page": target_sheet,
+                "headers": headers,
+                "keys": keys,
+                "rows": [],
+                "rows_matrix": [] if include_matrix else None,
+                "meta": {
+                    "schema_source": schema_src,
+                    "rows": 0,
+                    "limit": limit,
+                    "offset": offset,
+                    "mode": mode,
+                    "built_from": "schema_only_fast_path",
                 },
                 "version": self.version,
             }
@@ -2609,28 +2738,95 @@ class DataEngineV5:
             }
 
         if target_sheet == "Top_10_Investments":
+            top10_body, route_warnings = _normalize_top10_body_for_engine(body, limit=max(1, min(limit, 50)))
+            cached_before = self.get_cached_sheet_snapshot(sheet=target_sheet)
+
+            if _is_schema_only_body(top10_body):
+                return {
+                    "status": "success",
+                    "sheet": target_sheet,
+                    "page": target_sheet,
+                    "headers": headers,
+                    "keys": keys,
+                    "rows": [],
+                    "rows_matrix": [] if include_matrix else None,
+                    "meta": {
+                        "schema_source": schema_src,
+                        "builder": "schema_only_fast_path",
+                        "rows": 0,
+                        "limit": limit,
+                        "offset": offset,
+                        "mode": mode,
+                        "warnings": route_warnings,
+                    },
+                    "version": self.version,
+                }
+
             try:
                 from core.analysis.top10_selector import build_top10_rows  # type: ignore
 
-                criteria = body.get("criteria") if isinstance(body.get("criteria"), dict) else None
+                criteria = top10_body.get("criteria") if isinstance(top10_body.get("criteria"), dict) else None
                 payload = await build_top10_rows(
                     engine=self,
                     settings=self.settings,
                     criteria=criteria,
-                    body=dict(body or {}),
-                    limit=int(body.get("limit") or body.get("top_n") or limit or 10),
+                    body=dict(top10_body or {}),
+                    limit=int(top10_body.get("limit") or top10_body.get("top_n") or min(limit, 10) or 10),
                     mode=mode or "",
                 )
-                rows0 = payload.get("rows") if isinstance(payload, dict) else payload
-                rows0 = _coerce_rows_list(rows0)
+
+                if isinstance(payload, dict):
+                    selector_headers = payload.get("display_headers") or payload.get("sheet_headers") or payload.get("column_headers") or payload.get("headers")
+                    selector_keys = payload.get("keys") or payload.get("headers")
+                    if isinstance(selector_headers, list) and isinstance(selector_keys, list) and selector_headers and selector_keys:
+                        headers = [str(h) for h in selector_headers]
+                        keys = [str(k) for k in selector_keys]
+
+                rows0 = _coerce_rows_list(payload)
                 meta_extra = payload.get("meta") if isinstance(payload, dict) else None
+                status_out = payload.get("status") if isinstance(payload, dict) else None
+
             except Exception as e:
                 rows0 = []
                 meta_extra = {"top10_error": f"{type(e).__name__}: {e}"}
+                status_out = "warn"
 
             full_rows = [_strict_project_row(keys, _normalize_to_schema_keys(keys, headers, r)) for r in rows0]
+
+            if not full_rows and isinstance(cached_before, dict):
+                cached_rows = _coerce_rows_list(cached_before)
+                cached_headers = cached_before.get("headers") if isinstance(cached_before.get("headers"), list) else headers
+                cached_keys = cached_before.get("keys") if isinstance(cached_before.get("keys"), list) else keys
+                if cached_rows and cached_headers and cached_keys:
+                    full_rows_cached = [
+                        _strict_project_row(cached_keys, _normalize_to_schema_keys(cached_keys, cached_headers, r))
+                        for r in cached_rows
+                    ]
+                    rows_page = full_rows_cached[offset : offset + limit]
+                    return {
+                        "status": "warn",
+                        "sheet": target_sheet,
+                        "page": target_sheet,
+                        "headers": cached_headers,
+                        "keys": cached_keys,
+                        "rows": rows_page,
+                        "rows_matrix": _rows_matrix(rows_page, cached_keys) if include_matrix else None,
+                        "meta": {
+                            "schema_source": schema_src,
+                            "builder": "core.analysis.top10_selector",
+                            "rows": len(rows_page),
+                            "limit": limit,
+                            "offset": offset,
+                            "mode": mode,
+                            "built_from": "cached_snapshot_fallback",
+                            "warnings": route_warnings + ["top10_degraded_to_cached_snapshot"],
+                            **(meta_extra or {}),
+                        },
+                        "version": self.version,
+                    }
+
             payload_full = {
-                "status": "success" if full_rows else "warn",
+                "status": status_out or ("success" if full_rows else "warn"),
                 "sheet": target_sheet,
                 "page": target_sheet,
                 "headers": headers,
@@ -2644,11 +2840,14 @@ class DataEngineV5:
                     "limit": limit,
                     "offset": offset,
                     "mode": mode,
+                    "warnings": route_warnings,
                     **(meta_extra or {}),
                 },
                 "version": self.version,
             }
-            self._store_sheet_snapshot(target_sheet, payload_full)
+
+            if full_rows:
+                self._store_sheet_snapshot(target_sheet, payload_full)
 
             rows_page = full_rows[offset : offset + limit]
             return {
@@ -2666,7 +2865,7 @@ class DataEngineV5:
 
         if not requested_symbols and target_sheet in INSTRUMENT_SHEETS:
             requested_symbols = await self.get_sheet_symbols(
-                sheet=target_sheet,
+                target_sheet,
                 limit=limit + offset,
                 body=body,
             )
