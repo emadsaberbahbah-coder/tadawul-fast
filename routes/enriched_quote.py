@@ -2,29 +2,30 @@
 # routes/enriched_quote.py
 """
 ================================================================================
-TFB Enriched Quote Routes Wrapper — v6.4.0
+TFB Enriched Quote Routes Wrapper — v6.5.0
 ================================================================================
 RENDER-SAFE • SCHEMA-AWARE • PAGE-DISPATCH SAFE • HEADER/ROW BALANCED
 SPECIAL-BUILDER PRESERVING • ASYNC-SAFE • GET+POST COMPATIBLE
 QUERY/BODY MERGE • LEGACY ALIAS SAFE • TABLE-MODE SAFE • CORE-WRAPPER SAFE
 TOP10-SPECIAL SAFE • SCHEMA-ONLY SAFE • TIMEOUT-GUARDED • NULL-SAFE
+JSON-SAFE • CONTRACT-HARDENED • SPECIAL-ROUTE FAIL-SAFE
 
 Why this revision
 -----------------
-- ✅ FIX: `_strip(None)` no longer leaks the literal string "None" into route_family,
-        build_status, page, tokens, or other fields
-- ✅ FIX: Explicit schema-only handling for special pages (Top_10_Investments,
-        Insights_Analysis, Data_Dictionary) without invoking heavy builders
-- ✅ FIX: Top10 special-page dispatch is now explicit and guarded
-- ✅ FIX: Special builders are wrapped with a timeout to avoid 502/503 escalation
-- ✅ FIX: Special builder header preference now uses display headers first
-        (display_headers / sheet_headers / column_headers) before keys-like headers
-- ✅ FIX: Better normalization of nested criteria/settings/filters into builder payload
-- ✅ FIX: Better preservation of special builder output while keeping response envelope stable
-- ✅ FIX: More defensive exception handling around special-page dispatch
-- ✅ FIX: Stronger route_family fallback and safer payload/meta normalization
-- ✅ SAFE: No network I/O at import-time
-- ✅ SAFE: No Prometheus metric creation here
+- ✅ FIX: `_strip(None)` never leaks the literal string "None"
+- ✅ FIX: all route payloads are JSON-safe (NaN/Inf/datetime/Decimal/set handled)
+- ✅ FIX: explicit special-page dispatch for Top_10_Investments / Insights_Analysis / Data_Dictionary
+- ✅ FIX: special builders are timeout-guarded and degrade gracefully to schema-only / partial payload
+- ✅ FIX: special builder headers prefer display headers before keys-like fields
+- ✅ FIX: stronger normalization of nested criteria/settings/filters/direct symbols
+- ✅ FIX: consistent response envelope:
+        headers + keys + rows + rows_matrix + quotes + data + meta
+- ✅ FIX: schema-only handling for special pages avoids heavy execution when explicitly requested
+- ✅ FIX: table-mode fallback preserves builder payload shape more safely
+- ✅ FIX: stronger route_family fallback and safer payload/meta normalization
+- ✅ FIX: special routes avoid escalations to 502 where possible
+- ✅ SAFE: no network I/O at import-time
+- ✅ SAFE: no Prometheus metric creation here
 
 Behavior
 --------
@@ -58,16 +59,19 @@ import asyncio
 import importlib
 import inspect
 import logging
+import math
 import os
 import time
 import uuid
+from datetime import date, datetime, time as dt_time
+from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, status
 
 logger = logging.getLogger("routes.enriched_quote")
 
-ROUTER_VERSION = "6.4.0"
+ROUTER_VERSION = "6.5.0"
 
 # Kept lazy for dynamic mount behavior
 router: Optional[APIRouter] = None
@@ -79,6 +83,7 @@ router: Optional[APIRouter] = None
 _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
     "symbol": ["ticker", "code", "instrument", "security", "symbol_code"],
     "ticker": ["symbol", "code", "instrument", "security"],
+    "name": ["company_name", "long_name", "instrument_name", "security_name"],
     "current_price": [
         "price",
         "last_price",
@@ -106,6 +111,60 @@ def _strip(v: Any) -> str:
         return ""
 
 
+def _json_safe(value: Any) -> Any:
+    if value is None:
+        return None
+
+    if isinstance(value, bool):
+        return value
+
+    if isinstance(value, (int, str)):
+        return value
+
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
+
+    if isinstance(value, Decimal):
+        try:
+            f = float(value)
+            if math.isnan(f) or math.isinf(f):
+                return None
+            return f
+        except Exception:
+            return str(value)
+
+    if isinstance(value, (datetime, date, dt_time)):
+        try:
+            return value.isoformat()
+        except Exception:
+            return str(value)
+
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8", errors="replace")
+        except Exception:
+            return str(value)
+
+    if isinstance(value, Mapping):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+
+    if hasattr(value, "__dict__"):
+        try:
+            return _json_safe(vars(value))
+        except Exception:
+            pass
+
+    try:
+        return str(value)
+    except Exception:
+        return None
+
+
 def _as_list(v: Any) -> List[Any]:
     if v is None:
         return []
@@ -116,6 +175,8 @@ def _as_list(v: Any) -> List[Any]:
     if isinstance(v, set):
         return list(v)
     if isinstance(v, str):
+        return [v]
+    if isinstance(v, Mapping):
         return [v]
     if isinstance(v, Iterable):
         try:
@@ -219,7 +280,7 @@ def _extract_token(
 
 
 def _rows_matrix(rows: Sequence[Mapping[str, Any]], keys: Sequence[str]) -> List[List[Any]]:
-    return [[row.get(k) for k in keys] for row in rows]
+    return [[_json_safe(row.get(k)) for k in keys] for row in rows]
 
 
 def _model_to_dict(obj: Any) -> Dict[str, Any]:
@@ -260,19 +321,19 @@ async def _maybe_await(v: Any) -> Any:
 
 def _normalize_item_to_row(item: Any, keys: Sequence[str]) -> Dict[str, Any]:
     if isinstance(item, Mapping):
-        return {k: item.get(k) for k in keys}
+        return {k: _json_safe(item.get(k)) for k in keys}
 
     if hasattr(item, "__dict__"):
         d = _model_to_dict(item)
-        return {k: d.get(k) for k in keys}
+        return {k: _json_safe(d.get(k)) for k in keys}
 
     if isinstance(item, (list, tuple)):
         vals = list(item)
-        return {k: (vals[i] if i < len(vals) else None) for i, k in enumerate(keys)}
+        return {k: _json_safe(vals[i] if i < len(vals) else None) for i, k in enumerate(keys)}
 
     out = {k: None for k in keys}
     if keys:
-        out[keys[0]] = item
+        out[keys[0]] = _json_safe(item)
     return out
 
 
@@ -370,6 +431,7 @@ def _merged_special_body(body: Mapping[str, Any]) -> Dict[str, Any]:
 
     payload = body.get("payload")
     if isinstance(payload, Mapping):
+        _merge_from_mapping(payload)
         _merge_from_mapping(payload.get("criteria"))
 
     if criteria_merged:
@@ -409,13 +471,10 @@ def _merged_special_body(body: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def _special_schema_only_requested(body: Mapping[str, Any]) -> bool:
-    if _get_bool(body, "schema_only", False):
-        return True
-    if _get_bool(body, "headers_only", False):
-        return True
-    if _get_bool(body, "keys_only", False):
-        return True
-    return False
+    return any(
+        _get_bool(body, key, False)
+        for key in ("schema_only", "headers_only", "keys_only")
+    )
 
 
 # =============================================================================
@@ -765,13 +824,15 @@ class _Service:
             k.replace("_", "").lower(),
         ]
         for alias in _FIELD_ALIAS_HINTS.get(k, []):
-            variants.extend([
-                alias,
-                alias.lower(),
-                alias.upper(),
-                alias.replace("_", " "),
-                alias.replace("_", "").lower(),
-            ])
+            variants.extend(
+                [
+                    alias,
+                    alias.lower(),
+                    alias.upper(),
+                    alias.replace("_", " "),
+                    alias.replace("_", "").lower(),
+                ]
+            )
 
         seen = set()
         out: List[str] = []
@@ -797,7 +858,7 @@ class _Service:
         out: Dict[str, Any] = {}
 
         for k in keys:
-            out[k] = self._extract_from_raw(raw_dict, self._key_variants(k))
+            out[k] = _json_safe(self._extract_from_raw(raw_dict, self._key_variants(k)))
 
         if symbol_fallback:
             if "symbol" in out and not out.get("symbol"):
@@ -878,7 +939,7 @@ class _Service:
         rows: List[Dict[str, Any]] = []
         for row in matrix:
             vals = list(row) if isinstance(row, (list, tuple)) else [row]
-            rows.append({k: (vals[i] if i < len(vals) else None) for i, k in enumerate(keys)})
+            rows.append({k: _json_safe(vals[i] if i < len(vals) else None) for i, k in enumerate(keys)})
         return rows
 
     # -----------------------------------------------------------------
@@ -915,6 +976,14 @@ class _Service:
                 "criteria": criteria,
                 "limit": limit,
                 "mode": mode,
+                "page": prepared_body.get("page") or prepared_body.get("sheet") or prepared_body.get("sheet_name"),
+                "sheet": prepared_body.get("sheet") or prepared_body.get("page"),
+                "sheet_name": prepared_body.get("sheet_name") or prepared_body.get("page"),
+                "name": prepared_body.get("name"),
+                "tab": prepared_body.get("tab"),
+                "request_id": prepared_body.get("request_id"),
+                "symbols": prepared_body.get("symbols"),
+                "tickers": prepared_body.get("tickers"),
             },
             {
                 "request": request,
@@ -977,6 +1046,51 @@ class _Service:
                 rows_out.append(_normalize_item_to_row(item, keys))
         return rows_out
 
+    def _envelope(
+        self,
+        *,
+        status: str,
+        page: str,
+        route_family: str,
+        headers: Sequence[str],
+        keys: Sequence[str],
+        rows: Sequence[Mapping[str, Any]],
+        include_headers: bool,
+        include_matrix: bool,
+        request_id: str,
+        started_at: float,
+        mode: str,
+        dispatch: str,
+        error: Optional[str] = None,
+        extra_meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        rows_out = [dict(r) for r in rows]
+        payload = {
+            "status": status,
+            "page": page,
+            "route_family": route_family,
+            "headers": list(headers) if include_headers else [],
+            "keys": list(keys),
+            "display_headers": list(headers),
+            "sheet_headers": list(headers),
+            "column_headers": list(headers),
+            "rows": rows_out,
+            "rows_matrix": _rows_matrix(rows_out, keys) if include_matrix else None,
+            "quotes": rows_out,
+            "data": rows_out,
+            "error": error,
+            "version": ROUTER_VERSION,
+            "request_id": request_id,
+            "meta": {
+                "duration_ms": (time.time() - started_at) * 1000.0,
+                "count": len(rows_out),
+                "dispatch": dispatch,
+                "mode": mode,
+                **(extra_meta or {}),
+            },
+        }
+        return _json_safe(payload)
+
     # -----------------------------------------------------------------
     # Table mode
     # -----------------------------------------------------------------
@@ -1018,9 +1132,9 @@ class _Service:
                     res = fn(*args, **kwargs)
                     res = await _maybe_await(res)
                     if isinstance(res, dict):
-                        return res
+                        return _json_safe(res)
                     if isinstance(res, list):
-                        return {"status": "success", "rows": res}
+                        return {"status": "success", "rows": _json_safe(res)}
                     return {"status": "success", "rows": []}
                 except TypeError as e:
                     last_exc = e
@@ -1052,28 +1166,21 @@ class _Service:
         dispatch_name: str,
         extra_meta: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        extra_meta = extra_meta or {}
-        return {
-            "status": "success",
-            "page": page_norm,
-            "route_family": route_family,
-            "headers": list(headers) if include_headers else [],
-            "keys": list(keys),
-            "rows": [],
-            "rows_matrix": [] if include_matrix else None,
-            "quotes": [],
-            "data": [],
-            "version": ROUTER_VERSION,
-            "request_id": request_id,
-            "meta": {
-                "duration_ms": (time.time() - started_at) * 1000.0,
-                "count": 0,
-                "dispatch": dispatch_name,
-                "mode": mode,
-                "schema_only": True,
-                **extra_meta,
-            },
-        }
+        return self._envelope(
+            status="success",
+            page=page_norm,
+            route_family=route_family,
+            headers=headers,
+            keys=keys,
+            rows=[],
+            include_headers=include_headers,
+            include_matrix=include_matrix,
+            request_id=request_id,
+            started_at=started_at,
+            mode=mode,
+            dispatch=dispatch_name,
+            extra_meta={"schema_only": True, **(extra_meta or {})},
+        )
 
     # -----------------------------------------------------------------
     # Specialized payload builders
@@ -1103,25 +1210,20 @@ class _Service:
                 logger.warning("Data dictionary builder failed: %s", e)
                 rows_out = []
 
-        return {
-            "status": "success",
-            "page": page_norm,
-            "route_family": "dictionary",
-            "headers": list(headers) if include_headers else [],
-            "keys": list(keys),
-            "rows": rows_out,
-            "rows_matrix": _rows_matrix(rows_out, keys) if include_matrix else None,
-            "quotes": rows_out,
-            "data": rows_out,
-            "version": ROUTER_VERSION,
-            "request_id": request_id,
-            "meta": {
-                "duration_ms": (time.time() - started_at) * 1000.0,
-                "count": len(rows_out),
-                "dispatch": "data_dictionary",
-                "mode": mode,
-            },
-        }
+        return self._envelope(
+            status="success",
+            page=page_norm,
+            route_family="dictionary",
+            headers=headers,
+            keys=keys,
+            rows=rows_out,
+            include_headers=include_headers,
+            include_matrix=include_matrix,
+            request_id=request_id,
+            started_at=started_at,
+            mode=mode,
+            dispatch="data_dictionary",
+        )
 
     async def build_special_builder_payload(
         self,
@@ -1204,27 +1306,22 @@ class _Service:
             )
         except Exception as e:
             logger.warning("%s builder failed: %s", dispatch_name, e)
-            return {
-                "status": "partial",
-                "page": page_norm,
-                "route_family": route_family,
-                "headers": list(headers) if include_headers else [],
-                "keys": list(keys),
-                "rows": [],
-                "rows_matrix": [] if include_matrix else None,
-                "quotes": [],
-                "data": [],
-                "error": f"{type(e).__name__}: {e}",
-                "version": ROUTER_VERSION,
-                "request_id": request_id,
-                "meta": {
-                    "duration_ms": (time.time() - started_at) * 1000.0,
-                    "count": 0,
-                    "dispatch": dispatch_name,
-                    "mode": mode,
-                    "warning": f"{dispatch_name}_builder_failed",
-                },
-            }
+            return self._envelope(
+                status="partial",
+                page=page_norm,
+                route_family=route_family,
+                headers=headers,
+                keys=keys,
+                rows=[],
+                include_headers=include_headers,
+                include_matrix=include_matrix,
+                request_id=request_id,
+                started_at=started_at,
+                mode=mode,
+                dispatch=dispatch_name,
+                error=f"{type(e).__name__}: {e}",
+                extra_meta={"warning": f"{dispatch_name}_builder_failed"},
+            )
 
         if isinstance(result, dict):
             result_headers = _first_list(
@@ -1254,66 +1351,59 @@ class _Service:
             if isinstance(rows_raw, list) and rows_raw:
                 rows_out = self._normalize_rows_from_any(rows_raw, keys_out)
             elif isinstance(rows_matrix_raw, list) and rows_matrix_raw:
-                for item in rows_matrix_raw:
-                    rows_out.append(_normalize_item_to_row(item, keys_out))
+                rows_out = self.matrix_to_rows(rows_matrix_raw, keys_out)
             else:
                 matrix_candidate = self.extract_matrix_like(result)
                 if matrix_candidate:
                     rows_out = self.matrix_to_rows(matrix_candidate, keys_out)
 
-            rows_matrix_out = rows_matrix_raw if (include_matrix and isinstance(rows_matrix_raw, list)) else None
-            if include_matrix and rows_matrix_out is None:
-                rows_matrix_out = _rows_matrix(rows_out, keys_out)
-
             status_out, error_out, meta_in = self.extract_status_error_meta(result)
             page_out = _strip(result.get("page")) or page_norm
             route_family_out = _strip(result.get("route_family")) or route_family
 
-            return {
-                "status": status_out,
-                "page": page_out,
-                "route_family": route_family_out,
-                "headers": headers_out if include_headers else [],
-                "keys": keys_out,
-                "rows": rows_out,
-                "rows_matrix": rows_matrix_out if include_matrix else None,
-                "quotes": rows_out,
-                "data": rows_out,
-                "error": error_out,
-                "version": ROUTER_VERSION,
-                "request_id": request_id,
-                "meta": {
+            payload = self._envelope(
+                status=status_out,
+                page=page_out,
+                route_family=route_family_out,
+                headers=headers_out,
+                keys=keys_out,
+                rows=rows_out,
+                include_headers=include_headers,
+                include_matrix=include_matrix,
+                request_id=request_id,
+                started_at=started_at,
+                mode=mode,
+                dispatch=dispatch_name,
+                error=error_out,
+                extra_meta={
                     **meta_in,
-                    "duration_ms": (time.time() - started_at) * 1000.0,
-                    "count": len(rows_out),
-                    "dispatch": dispatch_name,
-                    "mode": mode,
                     "builder_payload_preserved": True,
                 },
-            }
+            )
+
+            if include_matrix and isinstance(rows_matrix_raw, list):
+                payload["rows_matrix"] = _json_safe(
+                    [list(r) if isinstance(r, (list, tuple)) else [r] for r in rows_matrix_raw]
+                )
+            return payload
 
         rows_out = self._normalize_rows_from_any(result, keys)
 
-        return {
-            "status": "success",
-            "page": page_norm,
-            "route_family": route_family,
-            "headers": list(headers) if include_headers else [],
-            "keys": list(keys),
-            "rows": rows_out,
-            "rows_matrix": _rows_matrix(rows_out, keys) if include_matrix else None,
-            "quotes": rows_out,
-            "data": rows_out,
-            "version": ROUTER_VERSION,
-            "request_id": request_id,
-            "meta": {
-                "duration_ms": (time.time() - started_at) * 1000.0,
-                "count": len(rows_out),
-                "dispatch": dispatch_name,
-                "mode": mode,
-                "builder_payload_preserved": False,
-            },
-        }
+        return self._envelope(
+            status="success",
+            page=page_norm,
+            route_family=route_family,
+            headers=headers,
+            keys=keys,
+            rows=rows_out,
+            include_headers=include_headers,
+            include_matrix=include_matrix,
+            request_id=request_id,
+            started_at=started_at,
+            mode=mode,
+            dispatch=dispatch_name,
+            extra_meta={"builder_payload_preserved": False},
+        )
 
 
 # =============================================================================
@@ -1328,13 +1418,15 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
     legacy = APIRouter(tags=["quotes"])
 
     async def _health_payload() -> Dict[str, Any]:
-        return {
-            "status": "ok",
-            "module": "routes.enriched_quote",
-            "router_version": ROUTER_VERSION,
-            "reason": reason,
-            "schema_available": bool(getattr(svc, "_HAS_SCHEMA", False)),
-        }
+        return _json_safe(
+            {
+                "status": "ok",
+                "module": "routes.enriched_quote",
+                "router_version": ROUTER_VERSION,
+                "reason": reason,
+                "schema_available": bool(getattr(svc, "_HAS_SCHEMA", False)),
+            }
+        )
 
     @enriched.get("/health", include_in_schema=False)
     async def enriched_health() -> Dict[str, Any]:
@@ -1348,29 +1440,35 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
     async def enriched_headers(page: str = Query(default="Market_Leaders")) -> Dict[str, Any]:
         page_norm = svc.normalize_page(page)
         headers, keys = svc.schema_for_page(page_norm)
-        return {
-            "status": "success" if headers else "degraded",
-            "page": page_norm,
-            "headers": headers,
-            "keys": keys,
-            "router_version": ROUTER_VERSION,
-            "reason": None if headers else reason,
-            "route_family": svc.route_family(page_norm),
-        }
+        return _json_safe(
+            {
+                "status": "success" if headers else "degraded",
+                "page": page_norm,
+                "headers": headers,
+                "keys": keys,
+                "display_headers": headers,
+                "router_version": ROUTER_VERSION,
+                "reason": None if headers else reason,
+                "route_family": svc.route_family(page_norm),
+            }
+        )
 
     @enriched_quote_alias.get("/headers", include_in_schema=False)
     async def enriched_quote_alias_headers(page: str = Query(default="Market_Leaders")) -> Dict[str, Any]:
         page_norm = svc.normalize_page(page)
         headers, keys = svc.schema_for_page(page_norm)
-        return {
-            "status": "success" if headers else "degraded",
-            "page": page_norm,
-            "headers": headers,
-            "keys": keys,
-            "router_version": ROUTER_VERSION,
-            "reason": None if headers else reason,
-            "route_family": svc.route_family(page_norm),
-        }
+        return _json_safe(
+            {
+                "status": "success" if headers else "degraded",
+                "page": page_norm,
+                "headers": headers,
+                "keys": keys,
+                "display_headers": headers,
+                "router_version": ROUTER_VERSION,
+                "reason": None if headers else reason,
+                "route_family": svc.route_family(page_norm),
+            }
+        )
 
     # -------------------------------------------------------------------------
     # Instrument rows
@@ -1404,11 +1502,15 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
 
             if callable(batch_fn):
                 try:
-                    got = batch_fn(symbols, mode=mode_q or "", schema=list(keys) if keys else None)
+                    got = batch_fn(symbols=symbols, mode=mode_q or "", schema=list(keys) if keys else None)
                     got = await _maybe_await(got)
                 except TypeError:
-                    got = batch_fn(symbols)
-                    got = await _maybe_await(got)
+                    try:
+                        got = batch_fn(symbols, mode=mode_q or "")
+                        got = await _maybe_await(got)
+                    except TypeError:
+                        got = batch_fn(symbols)
+                        got = await _maybe_await(got)
 
                 if isinstance(got, dict):
                     quotes_map = {
@@ -1504,23 +1606,24 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
                 {"symbol": symbol, "ticker": symbol, "error": f"single_quote_not_supported_for_{route_family}_page"},
                 symbol_fallback=symbol,
             )
-            return {
-                "status": "partial",
-                "page": page_norm,
-                "route_family": route_family,
-                "headers": headers,
-                "keys": keys or ["symbol", "error"],
-                "row": row,
-                "quote": row,
-                "data": row,
-                "version": ROUTER_VERSION,
-                "request_id": request_id,
-                "meta": {
-                    "duration_ms": (time.time() - start) * 1000.0,
-                    "mode": mode_q,
-                    "dispatch": "special_guard",
-                },
-            }
+            payload = svc._envelope(
+                status="partial",
+                page=page_norm,
+                route_family=route_family,
+                headers=headers,
+                keys=keys or ["symbol", "error"],
+                rows=[row],
+                include_headers=True,
+                include_matrix=False,
+                request_id=request_id,
+                started_at=start,
+                mode=mode_q,
+                dispatch="special_guard",
+            )
+            payload["row"] = row
+            payload["quote"] = row
+            payload["data"] = row
+            return payload
 
         rows_out, errors = await _build_instrument_rows(page_norm, keys or ["symbol", "error"], [symbol], mode_q, request)
         row = rows_out[0] if rows_out else svc.normalize_row(
@@ -1530,23 +1633,24 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         )
         status_out = "success" if errors == 0 and not row.get("error") else "partial"
 
-        return {
-            "status": status_out,
-            "page": page_norm,
-            "route_family": route_family,
-            "headers": headers,
-            "keys": keys or ["symbol", "error"],
-            "row": row,
-            "quote": row,
-            "data": row,
-            "version": ROUTER_VERSION,
-            "request_id": request_id,
-            "meta": {
-                "duration_ms": (time.time() - start) * 1000.0,
-                "mode": mode_q,
-                "dispatch": "instrument",
-            },
-        }
+        payload = svc._envelope(
+            status=status_out,
+            page=page_norm,
+            route_family=route_family,
+            headers=headers,
+            keys=keys or ["symbol", "error"],
+            rows=[row],
+            include_headers=True,
+            include_matrix=False,
+            request_id=request_id,
+            started_at=start,
+            mode=mode_q,
+            dispatch="instrument",
+        )
+        payload["row"] = row
+        payload["quote"] = row
+        payload["data"] = row
+        return payload
 
     async def _handle_sheet_rows(
         request: Request,
@@ -1660,25 +1764,20 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
                     mode=mode_q,
                 )
 
-            return {
-                "status": "success",
-                "page": page_norm,
-                "route_family": route_family,
-                "headers": headers if include_headers else [],
-                "keys": schema_keys,
-                "rows": [],
-                "rows_matrix": [] if include_matrix else None,
-                "quotes": [],
-                "data": [],
-                "version": ROUTER_VERSION,
-                "request_id": request_id,
-                "meta": {
-                    "duration_ms": (time.time() - start) * 1000.0,
-                    "count": 0,
-                    "dispatch": "special_unknown",
-                    "mode": mode_q,
-                },
-            }
+            return svc._envelope(
+                status="success",
+                page=page_norm,
+                route_family=route_family,
+                headers=headers,
+                keys=schema_keys,
+                rows=[],
+                include_headers=include_headers,
+                include_matrix=include_matrix,
+                request_id=request_id,
+                started_at=start,
+                mode=mode_q,
+                dispatch="special_unknown",
+            )
 
         if not symbols:
             engine = await svc.get_engine(request)
@@ -1692,26 +1791,21 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             )
 
             if payload is None:
-                return {
-                    "status": "success",
-                    "page": page_norm,
-                    "route_family": route_family,
-                    "headers": headers if include_headers else [],
-                    "keys": schema_keys,
-                    "rows": [],
-                    "rows_matrix": [] if include_matrix else None,
-                    "quotes": [],
-                    "data": [],
-                    "version": ROUTER_VERSION,
-                    "request_id": request_id,
-                    "meta": {
-                        "duration_ms": (time.time() - start) * 1000.0,
-                        "requested": 0,
-                        "errors": 0,
-                        "mode": mode_q,
-                        "dispatch": "schema_only_explicit",
-                    },
-                }
+                return svc._envelope(
+                    status="success",
+                    page=page_norm,
+                    route_family=route_family,
+                    headers=headers,
+                    keys=schema_keys,
+                    rows=[],
+                    include_headers=include_headers,
+                    include_matrix=include_matrix,
+                    request_id=request_id,
+                    started_at=start,
+                    mode=mode_q,
+                    dispatch="schema_only_explicit",
+                    extra_meta={"requested": 0, "errors": 0},
+                )
 
             raw_rows = svc.extract_rows_like(payload)
             matrix_rows = svc.extract_matrix_like(payload)
@@ -1725,54 +1819,45 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
                 rows_out = rows_out[:limit]
 
             status_out, error_out, meta_in = svc.extract_status_error_meta(payload)
-
-            return {
-                "status": status_out,
-                "page": page_norm,
-                "route_family": route_family,
-                "headers": headers if include_headers else [],
-                "keys": schema_keys,
-                "rows": rows_out,
-                "rows_matrix": _rows_matrix(rows_out, schema_keys) if include_matrix else None,
-                "quotes": rows_out,
-                "data": rows_out,
-                "error": error_out,
-                "version": ROUTER_VERSION,
-                "request_id": request_id,
-                "meta": {
-                    "duration_ms": (time.time() - start) * 1000.0,
-                    "requested": 0,
-                    "errors": 0,
-                    "mode": mode_q,
-                    "dispatch": "table_mode",
-                    **meta_in,
-                },
-            }
+            result = svc._envelope(
+                status=status_out,
+                page=page_norm,
+                route_family=route_family,
+                headers=headers,
+                keys=schema_keys,
+                rows=rows_out,
+                include_headers=include_headers,
+                include_matrix=include_matrix,
+                request_id=request_id,
+                started_at=start,
+                mode=mode_q,
+                dispatch="table_mode",
+                error=error_out,
+                extra_meta={"requested": 0, "errors": 0, **meta_in},
+            )
+            if include_matrix and isinstance(payload.get("rows_matrix"), list):
+                result["rows_matrix"] = _json_safe(payload.get("rows_matrix"))
+            return result
 
         rows_out, errors = await _build_instrument_rows(page_norm, schema_keys, symbols, mode_q, request)
         status_out = "success" if errors == 0 else ("partial" if errors < len(symbols) else "error")
 
-        return {
-            "status": status_out,
-            "page": page_norm,
-            "route_family": route_family,
-            "headers": headers if include_headers else [],
-            "keys": schema_keys,
-            "rows": rows_out,
-            "rows_matrix": _rows_matrix(rows_out, schema_keys) if include_matrix else None,
-            "quotes": rows_out,
-            "data": rows_out,
-            "error": f"{errors} errors" if errors else None,
-            "version": ROUTER_VERSION,
-            "request_id": request_id,
-            "meta": {
-                "duration_ms": (time.time() - start) * 1000.0,
-                "requested": len(symbols),
-                "errors": errors,
-                "mode": mode_q,
-                "dispatch": "instrument",
-            },
-        }
+        return svc._envelope(
+            status=status_out,
+            page=page_norm,
+            route_family=route_family,
+            headers=headers,
+            keys=schema_keys,
+            rows=rows_out,
+            include_headers=include_headers,
+            include_matrix=include_matrix,
+            request_id=request_id,
+            started_at=start,
+            mode=mode_q,
+            dispatch="instrument",
+            error=f"{errors} errors" if errors else None,
+            extra_meta={"requested": len(symbols), "errors": errors},
+        )
 
     # -------------------------------------------------------------------------
     # Routes: POST quote
