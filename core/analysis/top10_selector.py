@@ -2,11 +2,12 @@
 # core/analysis/top10_selector.py
 """
 ================================================================================
-Top 10 Selector — v3.6.0
+Top 10 Selector — v3.7.0
 ================================================================================
 LIVE • SCHEMA-FIRST • TOP10-METADATA COMPLETE • ROUTE-COMPATIBLE • SHEET-FRIENDLY
 FAIL-SAFE • BODY-AWARE • SETTINGS-AWARE • CONTRACT-HARDENED • FALLBACK-ENHANCED
-PERFORMANCE-GUARDED • CONCURRENCY-AWARE • UNIVERSE-CAPPED
+PERFORMANCE-GUARDED • CONCURRENCY-AWARE • UNIVERSE-CAPPED • JSON-SAFE
+KWARG-TOLERANT • DISPATCH-FRIENDLY • SPECIAL-PAGE SAFE
 
 Purpose
 -------
@@ -15,30 +16,27 @@ selection logic and guaranteed Top10-only fields.
 
 Primary guarantees
 ------------------
-- Always returns Top_10_Investments rows projected to the canonical schema
-- Always attempts to populate the Top10-only fields:
+- Always attempts to return a valid payload contract for Top_10_Investments
+- Never raises to caller for normal route execution; returns WARN payload on error
+- Accepts flexible route-builder calls and extra kwargs safely
+- Keeps Top10-only fields guaranteed:
     - top10_rank
     - selection_reason
     - criteria_snapshot
-- Compatible with flexible route-builder calls:
-    - engine=...
-    - request=..., settings=..., body=...
-    - mode=...
-    - limit=...
 - Uses live quotes when available, snapshot fallback only when necessary
-- Does not fail only because some optional fields are missing
 - No network I/O at import-time
 
-New in v3.6.0
+New in v3.7.0
 -------------
-- ✅ FIX: unconstrained Top10 requests are now narrowed to a fast default page set
-- ✅ FIX: universe discovery is concurrent across pages
-- ✅ FIX: no eager page-row fetch when symbols are already available
-- ✅ FIX: direct_symbols extraction now reads nested criteria/body/settings/request
-- ✅ FIX: total universe is hard-capped before expensive quote collection
-- ✅ FIX: row fallback is lazy and guarded for broad/unconstrained requests
-- ✅ IMPROVE: richer stage timing diagnostics in meta
-- ✅ IMPROVE: more predictable performance for limit-only / broad default requests
+- ✅ FIX: public APIs now accept extra kwargs safely (prevents dispatcher TypeError / 502)
+- ✅ FIX: build_top10_rows is fully fail-safe and always returns a payload contract
+- ✅ FIX: response payload is JSON-safe (NaN/Inf/datetime/Decimal/set handled)
+- ✅ FIX: headers now align with display headers while keys remain explicit separately
+- ✅ FIX: better schema loading from schema_registry via multiple fallback patterns
+- ✅ FIX: concurrent page fetchers no longer fail whole request on one page error
+- ✅ FIX: richer error metadata for easier production diagnostics
+- ✅ IMPROVE: body / settings / request / kwargs are merged more predictably
+- ✅ IMPROVE: special-page route compatibility for sheet/page/name/tab/request_id/etc.
 
 Public APIs
 -----------
@@ -70,13 +68,14 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
+from datetime import date, datetime, time as dt_time, timedelta, timezone
+from decimal import Decimal
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 logger = logging.getLogger("core.analysis.top10_selector")
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "3.6.0"
+TOP10_SELECTOR_VERSION = "3.7.0"
 TOP10_PAGE_NAME = "Top_10_Investments"
 RIYADH_TZ = timezone(timedelta(hours=3))
 
@@ -212,11 +211,88 @@ def _to_payload(obj: Any) -> Dict[str, Any]:
     return {}
 
 
+def _coerce_mapping(obj: Any) -> Dict[str, Any]:
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return dict(obj)
+    if isinstance(obj, Mapping):
+        try:
+            return dict(obj)
+        except Exception:
+            return {}
+    return _to_payload(obj)
+
+
+def _json_safe_value(obj: Any) -> Any:
+    """
+    Convert arbitrary Python objects into JSON-safe primitives.
+    """
+    if obj is None:
+        return None
+
+    if isinstance(obj, bool):
+        return obj
+
+    if isinstance(obj, (int, str)):
+        return obj
+
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+
+    if isinstance(obj, Decimal):
+        try:
+            f = float(obj)
+            if math.isnan(f) or math.isinf(f):
+                return None
+            return f
+        except Exception:
+            return str(obj)
+
+    if isinstance(obj, (datetime, date, dt_time)):
+        try:
+            return obj.isoformat()
+        except Exception:
+            return str(obj)
+
+    if isinstance(obj, bytes):
+        try:
+            return obj.decode("utf-8", errors="replace")
+        except Exception:
+            return str(obj)
+
+    if isinstance(obj, (set, tuple)):
+        return [_json_safe_value(x) for x in obj]
+
+    if isinstance(obj, list):
+        return [_json_safe_value(x) for x in obj]
+
+    if isinstance(obj, Mapping):
+        out: Dict[str, Any] = {}
+        for k, v in obj.items():
+            out[_safe_str(k)] = _json_safe_value(v)
+        return out
+
+    d = _to_payload(obj)
+    if d:
+        return _json_safe_value(d)
+
+    try:
+        return str(obj)
+    except Exception:
+        return None
+
+
 def _json_dumps_safe(obj: Any) -> str:
     try:
-        return json.dumps(obj, ensure_ascii=False, default=str, separators=(",", ":"))
+        return json.dumps(_json_safe_value(obj), ensure_ascii=False, separators=(",", ":"))
     except Exception:
-        return str(obj)
+        try:
+            return json.dumps(str(obj), ensure_ascii=False, separators=(",", ":"))
+        except Exception:
+            return "null"
 
 
 async def _maybe_await(v: Any) -> Any:
@@ -291,7 +367,7 @@ def _coerce_to_list(v: Any) -> List[Any]:
 def _rows_to_matrix(keys: Sequence[str], rows: Sequence[Dict[str, Any]]) -> List[List[Any]]:
     matrix: List[List[Any]] = []
     for row in rows:
-        matrix.append([row.get(k) for k in keys])
+        matrix.append([_json_safe_value(row.get(k)) for k in keys])
     return matrix
 
 
@@ -640,6 +716,30 @@ def _extract_body_criteria(body: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             if isinstance(nested.get("criteria"), dict):
                 merged.update(nested.get("criteria"))
 
+    return merged
+
+
+def _normalize_public_extras(extra: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Preserve unknown route kwargs by merging them into body-like payload.
+    This avoids dispatcher TypeError / incompatibility when route builders pass
+    sheet/page/tab/request_id/symbols/tickers/etc.
+    """
+    out = dict(extra or {})
+    # Remove internal noise if present
+    for k in list(out.keys()):
+        if k.startswith("_"):
+            out.pop(k, None)
+    return out
+
+
+def _merge_body_with_extras(body: Optional[Dict[str, Any]], extra: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    merged: Dict[str, Any] = {}
+    if isinstance(body, dict):
+        merged.update(body)
+    extra2 = _normalize_public_extras(extra)
+    # Put extras after body so dispatcher/runtime keys are visible to downstream parsing
+    merged.update({k: v for k, v in extra2.items() if v is not None})
     return merged
 
 
@@ -1102,11 +1202,11 @@ async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "", 
 
             if isinstance(res, dict):
                 if _dict_is_symbol_map(res, symbols):
-                    return {s: _to_payload(res.get(s)) for s in symbols}
+                    return {s: _coerce_mapping(res.get(s)) for s in symbols}
 
                 nested = res.get("data") or res.get("rows") or res.get("items") or res.get("quotes") or res.get("results")
                 if isinstance(nested, dict) and _dict_is_symbol_map(nested, symbols):
-                    return {s: _to_payload(nested.get(s)) for s in symbols}
+                    return {s: _coerce_mapping(nested.get(s)) for s in symbols}
 
                 rows = _extract_rows_from_any(res)
                 if rows:
@@ -1127,7 +1227,7 @@ async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "", 
                         out_rows2[sym] = d
                 if out_rows2:
                     return {s: out_rows2.get(s, {}) for s in symbols}
-                return {s: _to_payload(v) for s, v in zip(symbols, res)}
+                return {s: _coerce_mapping(v) for s, v in zip(symbols, res)}
         except Exception:
             continue
 
@@ -1139,20 +1239,20 @@ async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "", 
         try:
             if callable(per_dict_fn):
                 try:
-                    out[s] = _to_payload(await _maybe_await(per_dict_fn(s, mode=mode or "", body=body_obj)))
+                    out[s] = _coerce_mapping(await _maybe_await(per_dict_fn(s, mode=mode or "", body=body_obj)))
                 except TypeError:
                     try:
-                        out[s] = _to_payload(await _maybe_await(per_dict_fn(s, mode=mode or "")))
+                        out[s] = _coerce_mapping(await _maybe_await(per_dict_fn(s, mode=mode or "")))
                     except TypeError:
-                        out[s] = _to_payload(await _maybe_await(per_dict_fn(s)))
+                        out[s] = _coerce_mapping(await _maybe_await(per_dict_fn(s)))
             elif callable(per_fn):
                 try:
-                    out[s] = _to_payload(await _maybe_await(per_fn(s, mode=mode or "", body=body_obj)))
+                    out[s] = _coerce_mapping(await _maybe_await(per_fn(s, mode=mode or "", body=body_obj)))
                 except TypeError:
                     try:
-                        out[s] = _to_payload(await _maybe_await(per_fn(s, mode=mode or "")))
+                        out[s] = _coerce_mapping(await _maybe_await(per_fn(s, mode=mode or "")))
                     except TypeError:
-                        out[s] = _to_payload(await _maybe_await(per_fn(s)))
+                        out[s] = _coerce_mapping(await _maybe_await(per_fn(s)))
             else:
                 out[s] = {"symbol": s, "warnings": "engine_missing_quote_methods"}
         except Exception as e:
@@ -1412,7 +1512,7 @@ async def _enrich_top(engine: Any, symbols: List[str], *, mode: str = "", body: 
     try:
         res = await _fetch_quotes_map(engine, symbols, mode=mode or "", body=body or {})
         if isinstance(res, dict) and res:
-            return {s: _to_payload(res.get(s)) for s in symbols}
+            return {s: _coerce_mapping(res.get(s)) for s in symbols}
     except Exception:
         pass
 
@@ -1435,11 +1535,11 @@ async def _enrich_top(engine: Any, symbols: List[str], *, mode: str = "", body: 
                     except TypeError:
                         r = fn(sym)
                 r = await _maybe_await(r)
-                out[sym] = _to_payload(r)
+                out[sym] = _coerce_mapping(r)
             except Exception:
                 out[sym] = {"symbol": sym, "warnings": "enrich_failed"}
 
-    await asyncio.gather(*(one(s) for s in symbols), return_exceptions=False)
+    await asyncio.gather(*(one(s) for s in symbols), return_exceptions=True)
     return out
 
 
@@ -1460,17 +1560,20 @@ async def _fetch_page_symbols_concurrent(
 
     async def one(page: str) -> None:
         async with sem:
-            syms = await _get_universe_symbols_live(
-                engine,
-                page,
-                limit=per_page_limit,
-                mode=mode,
-                body=body,
-                allow_rows_fallback=False,
-            )
-            out[page] = syms
+            try:
+                syms = await _get_universe_symbols_live(
+                    engine,
+                    page,
+                    limit=per_page_limit,
+                    mode=mode,
+                    body=body,
+                    allow_rows_fallback=False,
+                )
+                out[page] = syms
+            except Exception:
+                out[page] = []
 
-    await asyncio.gather(*(one(p) for p in pages), return_exceptions=False)
+    await asyncio.gather(*(one(p) for p in pages), return_exceptions=True)
     return out
 
 
@@ -1488,10 +1591,13 @@ async def _fetch_page_rows_concurrent(
 
     async def one(page: str) -> None:
         async with sem:
-            rows = await _get_page_rows_live(engine, page, limit=row_limit, mode=mode, body=body)
-            out[page] = rows
+            try:
+                rows = await _get_page_rows_live(engine, page, limit=row_limit, mode=mode, body=body)
+                out[page] = rows
+            except Exception:
+                out[page] = []
 
-    await asyncio.gather(*(one(p) for p in pages), return_exceptions=False)
+    await asyncio.gather(*(one(p) for p in pages), return_exceptions=True)
     return out
 
 
@@ -1504,388 +1610,473 @@ async def select_top10(
     body: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[Candidate], Dict[str, Any]]:
     t0 = time.time()
-    stage_started = time.time()
 
-    horizon = criteria.horizon()
-    roi_key = horizon_to_roi_key(horizon)
-
-    pages = _eligible_pages(criteria)
-    warnings: List[str] = []
-    fallback_trace: List[str] = []
-    stage_ms: Dict[str, float] = {}
-
-    direct_symbols = [_normalize_symbol(s) for s in (direct_symbols or []) if _normalize_symbol(s)]
-    direct_symbols = _dedupe_keep_order(direct_symbols)
-
-    unconstrained = (not direct_symbols) and (not bool(getattr(criteria, "pages_explicit", False)))
-    if unconstrained:
-        narrowed = _default_pages_for_unconstrained(pages)
-        if narrowed != pages:
-            warnings.append(f"unconstrained_request_pages_narrowed:{','.join(narrowed)}")
-        pages = narrowed
-
-    per_page_limit, max_universe_symbols, row_fallback_limit = _compute_dynamic_limits(criteria, pages, direct_symbols, unconstrained)
-    allow_row_fallback = _allow_row_fallback(criteria, direct_symbols, pages)
-
-    universe: List[Tuple[str, str]] = []
-
-    if direct_symbols:
-        default_page = pages[0] if pages else "Market_Leaders"
-        for s in direct_symbols:
-            universe.append((s, default_page))
-        warnings.append(f"used_direct_symbols:{len(direct_symbols)}")
-
-    # -------------------------------------------------------------------------
-    # Stage 1: symbol universe discovery (symbols only, concurrent)
-    # -------------------------------------------------------------------------
-    page_symbol_map: Dict[str, List[str]] = {}
-    if not universe and pages:
-        try:
-            page_symbol_map = await _fetch_page_symbols_concurrent(
-                engine,
-                pages,
-                per_page_limit=per_page_limit,
-                mode=mode,
-                body=body,
-            )
-        except Exception as e:
-            warnings.append(f"page_symbol_fetch_error:{e}")
-            page_symbol_map = {}
-
-        for page in pages:
-            page_symbols = page_symbol_map.get(page) or []
-            if page_symbols:
-                for s in page_symbols:
-                    universe.append((s, page))
-            else:
-                warnings.append(f"universe_empty:{page}")
-
-    stage_ms["universe_symbols_ms"] = round((time.time() - stage_started) * 1000.0, 3)
-
-    # Lazy row-only universe fallback if symbols are totally empty and request is not broad/unconstrained
-    if not universe and pages and allow_row_fallback:
+    try:
         stage_started = time.time()
-        try:
-            page_rows_map = await _fetch_page_rows_concurrent(
-                engine,
-                pages,
-                row_limit=row_fallback_limit,
-                mode=mode,
-                body=body,
-            )
-        except Exception as e:
-            warnings.append(f"page_row_discovery_error:{e}")
-            page_rows_map = {}
 
-        for page in pages:
-            rows = page_rows_map.get(page) or []
-            if rows:
-                discovered = 0
-                for row in rows:
-                    sym = _extract_symbol_from_row(row)
-                    if sym:
-                        universe.append((sym, page))
-                        discovered += 1
-                if discovered:
-                    fallback_trace.append(f"rows_only_universe:{page}:{discovered}")
+        horizon = criteria.horizon()
+        roi_key = horizon_to_roi_key(horizon)
 
-        stage_ms["row_universe_fallback_ms"] = round((time.time() - stage_started) * 1000.0, 3)
-    elif not universe and pages and not allow_row_fallback:
-        warnings.append("skipped_row_universe_fallback_for_broad_or_unconstrained_request")
+        pages = _eligible_pages(criteria)
+        warnings: List[str] = []
+        fallback_trace: List[str] = []
+        stage_ms: Dict[str, float] = {}
 
-    # Deduplicate and cap universe BEFORE quote collection
-    seen_u: Set[str] = set()
-    universe_dedup: List[Tuple[str, str]] = []
-    for s, p in universe:
-        if s and s not in seen_u:
-            seen_u.add(s)
-            universe_dedup.append((s, p))
+        direct_symbols = [_normalize_symbol(s) for s in (direct_symbols or []) if _normalize_symbol(s)]
+        direct_symbols = _dedupe_keep_order(direct_symbols)
 
-    if len(universe_dedup) > max_universe_symbols:
-        warnings.append(f"universe_capped:{len(universe_dedup)}->{max_universe_symbols}")
-        universe_dedup = universe_dedup[:max_universe_symbols]
+        unconstrained = (not direct_symbols) and (not bool(getattr(criteria, "pages_explicit", False)))
+        if unconstrained:
+            narrowed = _default_pages_for_unconstrained(pages)
+            if narrowed != pages:
+                warnings.append(f"unconstrained_request_pages_narrowed:{','.join(narrowed)}")
+            pages = narrowed
 
-    symbols = [s for s, _ in universe_dedup]
-    source_map = {s: p for s, p in universe_dedup}
+        per_page_limit, max_universe_symbols, row_fallback_limit = _compute_dynamic_limits(criteria, pages, direct_symbols, unconstrained)
+        allow_row_fallback = _allow_row_fallback(criteria, direct_symbols, pages)
 
-    # -------------------------------------------------------------------------
-    # Stage 2: quote collection
-    # -------------------------------------------------------------------------
-    stage_started = time.time()
-    qmap: Dict[str, Dict[str, Any]] = {}
-    if symbols:
-        qmap = await _fetch_quotes_map(engine, symbols, mode=mode or "", body=body or {})
-    stage_ms["quote_fetch_ms"] = round((time.time() - stage_started) * 1000.0, 3)
+        universe: List[Tuple[str, str]] = []
 
-    # -------------------------------------------------------------------------
-    # Stage 3: primary candidate extraction from quotes
-    # -------------------------------------------------------------------------
-    stage_started = time.time()
-    candidates: List[Candidate] = []
-    quote_candidates_unfiltered: List[Candidate] = []
+        if direct_symbols:
+            default_page = pages[0] if pages else "Market_Leaders"
+            for s in direct_symbols:
+                universe.append((s, default_page))
+            warnings.append(f"used_direct_symbols:{len(direct_symbols)}")
 
-    for sym in symbols:
-        q = qmap.get(sym) or {}
-        if not isinstance(q, dict) or not q:
-            continue
-
-        cand = _extract_candidate_from_quote(sym=sym, page=source_map.get(sym, ""), quote=q, horizon=horizon)
-        if cand is None:
-            continue
-
-        quote_candidates_unfiltered.append(cand)
-
-        if criteria.min_expected_roi is not None and cand.roi < float(criteria.min_expected_roi):
-            continue
-        if criteria.enforce_risk_confidence:
-            if cand.risk_score > float(criteria.max_risk_score):
-                continue
-            if cand.confidence < float(criteria.min_confidence):
-                continue
-        if criteria.min_volume is not None and cand.volume < float(criteria.min_volume):
-            continue
-
-        candidates.append(cand)
-
-    stage_ms["quote_candidate_filter_ms"] = round((time.time() - stage_started) * 1000.0, 3)
-
-    # -------------------------------------------------------------------------
-    # Stage 4: lazy row fallback only if still empty and allowed
-    # -------------------------------------------------------------------------
-    row_candidates_unfiltered: List[Candidate] = []
-    if not candidates and pages and allow_row_fallback:
-        stage_started = time.time()
-        row_based_count = 0
-        try:
-            page_rows_map2 = await _fetch_page_rows_concurrent(
-                engine,
-                pages,
-                row_limit=row_fallback_limit,
-                mode=mode,
-                body=body,
-            )
-        except Exception as e:
-            warnings.append(f"row_candidate_fetch_error:{e}")
-            page_rows_map2 = {}
-
-        for page in pages:
-            rows = page_rows_map2.get(page) or []
-            for row in rows:
-                cand = _extract_candidate_from_row(page=page, row=row, horizon=horizon)
-                if cand is None:
-                    continue
-
-                row_candidates_unfiltered.append(cand)
-
-                if criteria.min_expected_roi is not None and cand.roi < float(criteria.min_expected_roi):
-                    continue
-                if criteria.enforce_risk_confidence:
-                    if cand.risk_score > float(criteria.max_risk_score):
-                        continue
-                    if cand.confidence < float(criteria.min_confidence):
-                        continue
-                if criteria.min_volume is not None and cand.volume < float(criteria.min_volume):
-                    continue
-
-                candidates.append(cand)
-                row_based_count += 1
-
-        if row_based_count > 0:
-            warnings.append(f"used_row_based_fallback:{row_based_count}")
-        stage_ms["row_candidate_fallback_ms"] = round((time.time() - stage_started) * 1000.0, 3)
-    elif not candidates and pages and not allow_row_fallback:
-        warnings.append("skipped_row_candidate_fallback_for_broad_or_unconstrained_request")
-
-    # -------------------------------------------------------------------------
-    # Stage 5: relaxed fallbacks
-    # -------------------------------------------------------------------------
-    if not candidates and quote_candidates_unfiltered:
-        candidates = list(quote_candidates_unfiltered)
-        warnings.append(f"used_relaxed_quote_fallback:{len(candidates)}")
-
-    if not candidates and row_candidates_unfiltered:
-        candidates = list(row_candidates_unfiltered)
-        warnings.append(f"used_relaxed_row_fallback:{len(candidates)}")
-
-    if not candidates and direct_symbols:
-        relaxed_count = 0
-        if not qmap:
-            qmap = await _fetch_quotes_map(engine, direct_symbols, mode=mode or "", body=body or {})
-
-        for sym in direct_symbols:
-            q = qmap.get(sym) or {}
-            if not isinstance(q, dict):
-                q = {}
-
-            roi = _extract_roi_from_any(q, horizon)
-            conf = _get_confidence(q)
-            overall = _get_overall_score(q)
-            risk = _get_risk_score(q)
-            vol = _get_volume(q)
-
-            row = dict(q)
-            row["symbol"] = sym
-            row["source_page"] = source_map.get(sym, pages[0] if pages else "Market_Leaders")
-
-            if roi is None:
-                roi = 0.0
-                row.setdefault("warnings", "direct_symbol_relaxed_without_roi")
-
-            candidates.append(
-                Candidate(
-                    symbol=sym,
-                    source_page=row["source_page"],
-                    roi=float(roi),
-                    confidence=float(conf),
-                    overall_score=float(overall),
-                    risk_score=float(risk),
-                    volume=float(vol),
-                    row=row,
+        # ---------------------------------------------------------------------
+        # Stage 1: symbol universe discovery (symbols only, concurrent)
+        # ---------------------------------------------------------------------
+        page_symbol_map: Dict[str, List[str]] = {}
+        if not universe and pages:
+            try:
+                page_symbol_map = await _fetch_page_symbols_concurrent(
+                    engine,
+                    pages,
+                    per_page_limit=per_page_limit,
+                    mode=mode,
+                    body=body,
                 )
-            )
-            relaxed_count += 1
+            except Exception as e:
+                warnings.append(f"page_symbol_fetch_error:{e}")
+                page_symbol_map = {}
 
-        if relaxed_count > 0:
-            warnings.append(f"used_direct_symbol_relaxed_fallback:{relaxed_count}")
+            for page in pages:
+                page_symbols = page_symbol_map.get(page) or []
+                if page_symbols:
+                    for s in page_symbols:
+                        universe.append((s, page))
+                else:
+                    warnings.append(f"universe_empty:{page}")
 
-    if not candidates and universe_dedup:
-        placeholder_count = 0
-        for sym, page in universe_dedup[: max(1, int(criteria.top_n or 10))]:
-            candidates.append(_make_placeholder_candidate(sym, page, qmap.get(sym)))
-            placeholder_count += 1
-        if placeholder_count > 0:
-            warnings.append(f"used_placeholder_symbol_fallback:{placeholder_count}")
+        stage_ms["universe_symbols_ms"] = round((time.time() - stage_started) * 1000.0, 3)
 
-    # -------------------------------------------------------------------------
-    # Stage 6: dedupe + rank + final top
-    # -------------------------------------------------------------------------
-    stage_started = time.time()
-    best: Dict[str, Candidate] = {}
-    for c in candidates:
-        prev = best.get(c.symbol)
-        if prev is None or _rank_key(c, use_liquidity=criteria.use_liquidity_tiebreak) > _rank_key(prev, use_liquidity=criteria.use_liquidity_tiebreak):
-            best[c.symbol] = c
+        # Lazy row-only universe fallback if symbols are totally empty and request is not broad/unconstrained
+        if not universe and pages and allow_row_fallback:
+            stage_started = time.time()
+            try:
+                page_rows_map = await _fetch_page_rows_concurrent(
+                    engine,
+                    pages,
+                    row_limit=row_fallback_limit,
+                    mode=mode,
+                    body=body,
+                )
+            except Exception as e:
+                warnings.append(f"page_row_discovery_error:{e}")
+                page_rows_map = {}
 
-    deduped = list(best.values())
-    deduped.sort(key=lambda c: _rank_key(c, use_liquidity=criteria.use_liquidity_tiebreak), reverse=True)
+            for page in pages:
+                rows = page_rows_map.get(page) or []
+                if rows:
+                    discovered = 0
+                    for row in rows:
+                        sym = _extract_symbol_from_row(row)
+                        if sym:
+                            universe.append((sym, page))
+                            discovered += 1
+                    if discovered:
+                        fallback_trace.append(f"rows_only_universe:{page}:{discovered}")
 
-    top_n = max(1, int(criteria.top_n or 10))
-    top = deduped[:top_n]
-    stage_ms["rank_and_slice_ms"] = round((time.time() - stage_started) * 1000.0, 3)
+            stage_ms["row_universe_fallback_ms"] = round((time.time() - stage_started) * 1000.0, 3)
+        elif not universe and pages and not allow_row_fallback:
+            warnings.append("skipped_row_universe_fallback_for_broad_or_unconstrained_request")
 
-    # -------------------------------------------------------------------------
-    # Stage 7: enrich final Top-N only
-    # -------------------------------------------------------------------------
-    stage_started = time.time()
-    enrich_map: Dict[str, Dict[str, Any]] = {}
-    if criteria.enrich_final and top:
-        try:
-            enrich_map = await _enrich_top(engine, [c.symbol for c in top], mode=mode or "", body=body or {})
-        except Exception as e:
-            warnings.append(f"enrich_failed:{e}")
-            enrich_map = {}
-    stage_ms["final_enrich_ms"] = round((time.time() - stage_started) * 1000.0, 3)
+        # Deduplicate and cap universe BEFORE quote collection
+        seen_u: Set[str] = set()
+        universe_dedup: List[Tuple[str, str]] = []
+        for s, p in universe:
+            if s and s not in seen_u:
+                seen_u.add(s)
+                universe_dedup.append((s, p))
 
-    for c in top:
-        e = enrich_map.get(c.symbol)
-        if isinstance(e, dict) and e:
-            merged = dict(c.row)
-            merged.update(e)
-            merged["symbol"] = c.symbol
-            merged["source_page"] = c.source_page
-            c.row = merged
+        if len(universe_dedup) > max_universe_symbols:
+            warnings.append(f"universe_capped:{len(universe_dedup)}->{max_universe_symbols}")
+            universe_dedup = universe_dedup[:max_universe_symbols]
 
-    total_ms = round((time.time() - t0) * 1000.0, 3)
+        symbols = [s for s, _ in universe_dedup]
+        source_map = {s: p for s, p in universe_dedup}
 
-    meta = {
-        "version": TOP10_SELECTOR_VERSION,
-        "mode": mode,
-        "horizon": horizon,
-        "roi_key": roi_key,
-        "pages_selected": pages,
-        "pages_explicit": bool(getattr(criteria, "pages_explicit", False)),
-        "request_unconstrained": unconstrained,
-        "direct_symbols_count": len(direct_symbols or []),
-        "per_page_limit": per_page_limit,
-        "row_fallback_limit": row_fallback_limit,
-        "max_universe_symbols": max_universe_symbols,
-        "allow_row_fallback": allow_row_fallback,
-        "universe_symbols": len(symbols),
-        "quotes_returned": len([s for s, q in qmap.items() if isinstance(q, dict) and q]),
-        "quote_candidates_unfiltered": len(quote_candidates_unfiltered),
-        "row_candidates_unfiltered": len(row_candidates_unfiltered),
-        "candidates": len(candidates),
-        "deduped": len(deduped),
-        "returned": len(top),
-        "build_status": "OK" if len(top) > 0 else "WARN",
-        "filters": {
-            "min_expected_roi": criteria.min_expected_roi,
-            "max_risk_score": criteria.max_risk_score,
-            "min_confidence": criteria.min_confidence,
-            "min_volume": criteria.min_volume,
-            "use_liquidity_tiebreak": criteria.use_liquidity_tiebreak,
-            "enforce_risk_confidence": criteria.enforce_risk_confidence,
-        },
-        "warnings": warnings,
-        "fallback_trace": fallback_trace,
-        "stage_durations_ms": stage_ms,
-        "timestamp_utc": _now_utc_iso(),
-        "timestamp_riyadh": _now_riyadh_iso(),
-        "duration_ms": total_ms,
-    }
-    return top, meta
+        # ---------------------------------------------------------------------
+        # Stage 2: quote collection
+        # ---------------------------------------------------------------------
+        stage_started = time.time()
+        qmap: Dict[str, Dict[str, Any]] = {}
+        if symbols:
+            qmap = await _fetch_quotes_map(engine, symbols, mode=mode or "", body=body or {})
+        stage_ms["quote_fetch_ms"] = round((time.time() - stage_started) * 1000.0, 3)
+
+        # ---------------------------------------------------------------------
+        # Stage 3: primary candidate extraction from quotes
+        # ---------------------------------------------------------------------
+        stage_started = time.time()
+        candidates: List[Candidate] = []
+        quote_candidates_unfiltered: List[Candidate] = []
+
+        for sym in symbols:
+            q = qmap.get(sym) or {}
+            if not isinstance(q, dict) or not q:
+                continue
+
+            cand = _extract_candidate_from_quote(sym=sym, page=source_map.get(sym, ""), quote=q, horizon=horizon)
+            if cand is None:
+                continue
+
+            quote_candidates_unfiltered.append(cand)
+
+            if criteria.min_expected_roi is not None and cand.roi < float(criteria.min_expected_roi):
+                continue
+            if criteria.enforce_risk_confidence:
+                if cand.risk_score > float(criteria.max_risk_score):
+                    continue
+                if cand.confidence < float(criteria.min_confidence):
+                    continue
+            if criteria.min_volume is not None and cand.volume < float(criteria.min_volume):
+                continue
+
+            candidates.append(cand)
+
+        stage_ms["quote_candidate_filter_ms"] = round((time.time() - stage_started) * 1000.0, 3)
+
+        # ---------------------------------------------------------------------
+        # Stage 4: lazy row fallback only if still empty and allowed
+        # ---------------------------------------------------------------------
+        row_candidates_unfiltered: List[Candidate] = []
+        if not candidates and pages and allow_row_fallback:
+            stage_started = time.time()
+            row_based_count = 0
+            try:
+                page_rows_map2 = await _fetch_page_rows_concurrent(
+                    engine,
+                    pages,
+                    row_limit=row_fallback_limit,
+                    mode=mode,
+                    body=body,
+                )
+            except Exception as e:
+                warnings.append(f"row_candidate_fetch_error:{e}")
+                page_rows_map2 = {}
+
+            for page in pages:
+                rows = page_rows_map2.get(page) or []
+                for row in rows:
+                    cand = _extract_candidate_from_row(page=page, row=row, horizon=horizon)
+                    if cand is None:
+                        continue
+
+                    row_candidates_unfiltered.append(cand)
+
+                    if criteria.min_expected_roi is not None and cand.roi < float(criteria.min_expected_roi):
+                        continue
+                    if criteria.enforce_risk_confidence:
+                        if cand.risk_score > float(criteria.max_risk_score):
+                            continue
+                        if cand.confidence < float(criteria.min_confidence):
+                            continue
+                    if criteria.min_volume is not None and cand.volume < float(criteria.min_volume):
+                        continue
+
+                    candidates.append(cand)
+                    row_based_count += 1
+
+            if row_based_count > 0:
+                warnings.append(f"used_row_based_fallback:{row_based_count}")
+            stage_ms["row_candidate_fallback_ms"] = round((time.time() - stage_started) * 1000.0, 3)
+        elif not candidates and pages and not allow_row_fallback:
+            warnings.append("skipped_row_candidate_fallback_for_broad_or_unconstrained_request")
+
+        # ---------------------------------------------------------------------
+        # Stage 5: relaxed fallbacks
+        # ---------------------------------------------------------------------
+        if not candidates and quote_candidates_unfiltered:
+            candidates = list(quote_candidates_unfiltered)
+            warnings.append(f"used_relaxed_quote_fallback:{len(candidates)}")
+
+        if not candidates and row_candidates_unfiltered:
+            candidates = list(row_candidates_unfiltered)
+            warnings.append(f"used_relaxed_row_fallback:{len(candidates)}")
+
+        if not candidates and direct_symbols:
+            relaxed_count = 0
+            if not qmap:
+                qmap = await _fetch_quotes_map(engine, direct_symbols, mode=mode or "", body=body or {})
+
+            for sym in direct_symbols:
+                q = qmap.get(sym) or {}
+                if not isinstance(q, dict):
+                    q = {}
+
+                roi = _extract_roi_from_any(q, horizon)
+                conf = _get_confidence(q)
+                overall = _get_overall_score(q)
+                risk = _get_risk_score(q)
+                vol = _get_volume(q)
+
+                row = dict(q)
+                row["symbol"] = sym
+                row["source_page"] = source_map.get(sym, pages[0] if pages else "Market_Leaders")
+
+                if roi is None:
+                    roi = 0.0
+                    row.setdefault("warnings", "direct_symbol_relaxed_without_roi")
+
+                candidates.append(
+                    Candidate(
+                        symbol=sym,
+                        source_page=row["source_page"],
+                        roi=float(roi),
+                        confidence=float(conf),
+                        overall_score=float(overall),
+                        risk_score=float(risk),
+                        volume=float(vol),
+                        row=row,
+                    )
+                )
+                relaxed_count += 1
+
+            if relaxed_count > 0:
+                warnings.append(f"used_direct_symbol_relaxed_fallback:{relaxed_count}")
+
+        if not candidates and universe_dedup:
+            placeholder_count = 0
+            for sym, page in universe_dedup[: max(1, int(criteria.top_n or 10))]:
+                candidates.append(_make_placeholder_candidate(sym, page, qmap.get(sym)))
+                placeholder_count += 1
+            if placeholder_count > 0:
+                warnings.append(f"used_placeholder_symbol_fallback:{placeholder_count}")
+
+        # ---------------------------------------------------------------------
+        # Stage 6: dedupe + rank + final top
+        # ---------------------------------------------------------------------
+        stage_started = time.time()
+        best: Dict[str, Candidate] = {}
+        for c in candidates:
+            prev = best.get(c.symbol)
+            if prev is None or _rank_key(c, use_liquidity=criteria.use_liquidity_tiebreak) > _rank_key(prev, use_liquidity=criteria.use_liquidity_tiebreak):
+                best[c.symbol] = c
+
+        deduped = list(best.values())
+        deduped.sort(key=lambda c: _rank_key(c, use_liquidity=criteria.use_liquidity_tiebreak), reverse=True)
+
+        top_n = max(1, int(criteria.top_n or 10))
+        top = deduped[:top_n]
+        stage_ms["rank_and_slice_ms"] = round((time.time() - stage_started) * 1000.0, 3)
+
+        # ---------------------------------------------------------------------
+        # Stage 7: enrich final Top-N only
+        # ---------------------------------------------------------------------
+        stage_started = time.time()
+        enrich_map: Dict[str, Dict[str, Any]] = {}
+        if criteria.enrich_final and top:
+            try:
+                enrich_map = await _enrich_top(engine, [c.symbol for c in top], mode=mode or "", body=body or {})
+            except Exception as e:
+                warnings.append(f"enrich_failed:{e}")
+                enrich_map = {}
+        stage_ms["final_enrich_ms"] = round((time.time() - stage_started) * 1000.0, 3)
+
+        for c in top:
+            e = enrich_map.get(c.symbol)
+            if isinstance(e, dict) and e:
+                merged = dict(c.row)
+                merged.update(e)
+                merged["symbol"] = c.symbol
+                merged["source_page"] = c.source_page
+                c.row = merged
+
+        total_ms = round((time.time() - t0) * 1000.0, 3)
+
+        meta = {
+            "version": TOP10_SELECTOR_VERSION,
+            "mode": mode,
+            "horizon": horizon,
+            "roi_key": roi_key,
+            "pages_selected": pages,
+            "pages_explicit": bool(getattr(criteria, "pages_explicit", False)),
+            "request_unconstrained": unconstrained,
+            "direct_symbols_count": len(direct_symbols or []),
+            "per_page_limit": per_page_limit,
+            "row_fallback_limit": row_fallback_limit,
+            "max_universe_symbols": max_universe_symbols,
+            "allow_row_fallback": allow_row_fallback,
+            "universe_symbols": len(symbols),
+            "quotes_returned": len([s for s, q in qmap.items() if isinstance(q, dict) and q]),
+            "quote_candidates_unfiltered": len(quote_candidates_unfiltered),
+            "row_candidates_unfiltered": len(row_candidates_unfiltered),
+            "candidates": len(candidates),
+            "deduped": len(deduped),
+            "returned": len(top),
+            "build_status": "OK" if len(top) > 0 else "WARN",
+            "filters": {
+                "min_expected_roi": criteria.min_expected_roi,
+                "max_risk_score": criteria.max_risk_score,
+                "min_confidence": criteria.min_confidence,
+                "min_volume": criteria.min_volume,
+                "use_liquidity_tiebreak": criteria.use_liquidity_tiebreak,
+                "enforce_risk_confidence": criteria.enforce_risk_confidence,
+            },
+            "warnings": warnings,
+            "fallback_trace": fallback_trace,
+            "stage_durations_ms": stage_ms,
+            "timestamp_utc": _now_utc_iso(),
+            "timestamp_riyadh": _now_riyadh_iso(),
+            "duration_ms": total_ms,
+        }
+        return top, meta
+
+    except Exception as e:
+        logger.exception("Top10 select_top10 fatal error")
+        return [], {
+            "version": TOP10_SELECTOR_VERSION,
+            "mode": mode,
+            "build_status": "ERROR",
+            "error": _safe_str(e),
+            "error_type": type(e).__name__,
+            "timestamp_utc": _now_utc_iso(),
+            "timestamp_riyadh": _now_riyadh_iso(),
+            "duration_ms": round((time.time() - t0) * 1000.0, 3),
+            "warnings": ["select_top10_failed"],
+        }
 
 
 # =============================================================================
 # Schema helpers for Top_10_Investments
 # =============================================================================
-def _ensure_schema_contract(
-    display_headers: Sequence[str],
-    keys: Sequence[str],
-    pct_keys: Set[str],
-) -> Tuple[List[str], List[str], Set[str], List[str]]:
-    hdrs = list(display_headers)
-    ks = list(keys)
-    missing: List[str] = []
+def _columns_from_spec_like(spec: Any) -> List[Any]:
+    if spec is None:
+        return []
 
-    for field in TOP10_REQUIRED_FIELDS:
-        if field not in ks:
-            ks.append(field)
-            hdrs.append(TOP10_REQUIRED_HEADERS.get(field, field))
-            missing.append(field)
+    cols = getattr(spec, "columns", None)
+    if isinstance(cols, list) and cols:
+        return cols
 
-    return hdrs, ks, set(pct_keys or set()), missing
+    d = _to_payload(spec)
+    if d:
+        cols2 = d.get("columns")
+        if isinstance(cols2, list) and cols2:
+            return cols2
+
+    return []
+
+
+def _registry_sheet_obj(registry: Any, sheet_name: str) -> Any:
+    if registry is None:
+        return None
+
+    # direct mapping
+    if isinstance(registry, dict):
+        if sheet_name in registry:
+            return registry.get(sheet_name)
+        norm = {_norm_key(k): v for k, v in registry.items()}
+        return norm.get(_norm_key(sheet_name))
+
+    # object with attributes
+    for attr in ("sheets", "registry", "specs", "schemas", "sheet_specs"):
+        obj = getattr(registry, attr, None)
+        if isinstance(obj, dict):
+            if sheet_name in obj:
+                return obj.get(sheet_name)
+            norm = {_norm_key(k): v for k, v in obj.items()}
+            hit = norm.get(_norm_key(sheet_name))
+            if hit is not None:
+                return hit
+
+    return None
 
 
 def _get_top10_schema() -> Tuple[List[str], List[str], Set[str], str, List[str]]:
+    # Primary: canonical schema registry function
     try:
-        from core.sheets.schema_registry import get_sheet_spec  # type: ignore
+        from core.sheets import schema_registry as sr  # type: ignore
 
-        spec = get_sheet_spec(TOP10_PAGE_NAME)
-        cols = getattr(spec, "columns", None) or []
+        # 1) get_sheet_spec(...)
+        get_sheet_spec = getattr(sr, "get_sheet_spec", None)
+        if callable(get_sheet_spec):
+            for name in (TOP10_PAGE_NAME, "Top10_Investments", "Top 10 Investments"):
+                try:
+                    spec = get_sheet_spec(name)
+                    cols = _columns_from_spec_like(spec)
+                    if cols:
+                        headers: List[str] = []
+                        keys: List[str] = []
+                        pct_keys: Set[str] = set()
+                        for c in cols:
+                            cd = _coerce_mapping(c)
+                            if not cd:
+                                cd = {
+                                    "header": _safe_str(getattr(c, "header", "")),
+                                    "key": _safe_str(getattr(c, "key", "")),
+                                    "dtype": _safe_str(getattr(c, "dtype", "")),
+                                }
+                            h = _safe_str(cd.get("header"))
+                            k = _safe_str(cd.get("key"))
+                            if not h or not k:
+                                continue
+                            headers.append(h)
+                            keys.append(k)
+                            dt = _safe_str(cd.get("dtype")).lower()
+                            if dt in {"pct", "percent", "percentage"}:
+                                pct_keys.add(k)
 
-        headers: List[str] = []
-        keys: List[str] = []
-        pct_keys: Set[str] = set()
+                        if headers and keys and len(headers) == len(keys):
+                            hdrs2, keys2, pct2, injected = _ensure_schema_contract(headers, keys, pct_keys)
+                            return hdrs2, keys2, pct2, "schema_registry.get_sheet_spec", injected
+                except Exception:
+                    pass
 
-        for c in cols:
-            h = _safe_str(getattr(c, "header", ""))
-            k = _safe_str(getattr(c, "key", ""))
-            if not h or not k:
-                continue
-            headers.append(h)
-            keys.append(k)
+        # 2) registry-like dict/object
+        for attr in ("SCHEMA_REGISTRY", "SHEET_SPECS", "REGISTRY", "SCHEMA_BY_SHEET", "SHEETS"):
+            reg = getattr(sr, attr, None)
+            sheet_obj = _registry_sheet_obj(reg, TOP10_PAGE_NAME)
+            cols = _columns_from_spec_like(sheet_obj)
+            if cols:
+                headers = []
+                keys = []
+                pct_keys: Set[str] = set()
+                for c in cols:
+                    cd = _coerce_mapping(c)
+                    if not cd:
+                        cd = {
+                            "header": _safe_str(getattr(c, "header", "")),
+                            "key": _safe_str(getattr(c, "key", "")),
+                            "dtype": _safe_str(getattr(c, "dtype", "")),
+                        }
+                    h = _safe_str(cd.get("header"))
+                    k = _safe_str(cd.get("key"))
+                    if not h or not k:
+                        continue
+                    headers.append(h)
+                    keys.append(k)
+                    dt = _safe_str(cd.get("dtype")).lower()
+                    if dt in {"pct", "percent", "percentage"}:
+                        pct_keys.add(k)
 
-            dt = _safe_str(getattr(c, "dtype", "")).lower()
-            if dt in {"pct", "percent", "percentage"}:
-                pct_keys.add(k)
-
-        if headers and keys and len(headers) == len(keys):
-            hdrs2, keys2, pct2, injected = _ensure_schema_contract(headers, keys, pct_keys)
-            return hdrs2, keys2, pct2, "schema_registry.get_sheet_spec", injected
+                if headers and keys and len(headers) == len(keys):
+                    hdrs2, keys2, pct2, injected = _ensure_schema_contract(headers, keys, pct_keys)
+                    return hdrs2, keys2, pct2, f"schema_registry.{attr}", injected
     except Exception:
         pass
 
+    # Minimal but safe fallback
     keys = [
         "symbol",
         "name",
@@ -1919,8 +2110,26 @@ def _get_top10_schema() -> Tuple[List[str], List[str], Set[str], str, List[str]]
     return hdrs2, keys2, pct2, "fallback_minimal", injected
 
 
+def _ensure_schema_contract(
+    display_headers: Sequence[str],
+    keys: Sequence[str],
+    pct_keys: Set[str],
+) -> Tuple[List[str], List[str], Set[str], List[str]]:
+    hdrs = list(display_headers)
+    ks = list(keys)
+    missing: List[str] = []
+
+    for field in TOP10_REQUIRED_FIELDS:
+        if field not in ks:
+            ks.append(field)
+            hdrs.append(TOP10_REQUIRED_HEADERS.get(field, field))
+            missing.append(field)
+
+    return hdrs, ks, set(pct_keys or set()), missing
+
+
 def _project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
-    return {k: row.get(k, None) for k in keys}
+    return {k: _json_safe_value(row.get(k, None)) for k in keys}
 
 
 def _normalize_pct_fields_inplace(raw: Dict[str, Any], pct_keys: Set[str]) -> None:
@@ -2210,6 +2419,88 @@ def _build_top10_output_rows_internal(
     return rows_out, meta
 
 
+def _build_empty_top10_payload(
+    *,
+    criteria: Optional[Criteria],
+    mode: str,
+    warnings: Optional[List[str]] = None,
+    error: Optional[str] = None,
+    error_type: Optional[str] = None,
+    meta_extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    display_headers, keys, _pct_keys, schema_source, injected = _get_top10_schema()
+    crit = criteria or Criteria(
+        pages_selected=["Market_Leaders", "Global_Markets"],
+        invest_period_days=90,
+        top_n=10,
+    )
+
+    meta: Dict[str, Any] = {
+        "version": TOP10_SELECTOR_VERSION,
+        "selector_version": TOP10_SELECTOR_VERSION,
+        "build_status": "WARN" if not error else "ERROR",
+        "schema_source": schema_source,
+        "required_top10_fields": list(TOP10_REQUIRED_FIELDS),
+        "injected_required_schema_fields": injected,
+        "criteria": {
+            "pages_selected": crit.pages_selected,
+            "pages_explicit": crit.pages_explicit,
+            "invest_period_days": crit.invest_period_days,
+            "horizon": crit.horizon(),
+            "top_n": crit.top_n,
+            "min_expected_roi": crit.min_expected_roi,
+            "max_risk_score": crit.max_risk_score,
+            "min_confidence": crit.min_confidence,
+            "min_volume": crit.min_volume,
+            "use_liquidity_tiebreak": crit.use_liquidity_tiebreak,
+            "enforce_risk_confidence": crit.enforce_risk_confidence,
+        },
+        "warnings": _dedupe_keep_order(list(warnings or [])),
+        "timestamp_utc": _now_utc_iso(),
+        "timestamp_riyadh": _now_riyadh_iso(),
+        "response_contract": {
+            "headers_are_display_headers": True,
+            "keys_present": True,
+            "display_headers_present": True,
+            "rows_are_projected_to_keys": True,
+            "rows_matrix_present": True,
+            "json_safe_payload": True,
+        },
+    }
+
+    if error:
+        meta["error"] = error
+    if error_type:
+        meta["error_type"] = error_type
+    if meta_extra:
+        meta.update(_json_safe_value(meta_extra) or {})
+
+    payload = {
+        "status": "error" if error else "warn",
+        "page": TOP10_PAGE_NAME,
+        "sheet": TOP10_PAGE_NAME,
+        "route_family": "top10",
+        "dispatch": "top10_selector",
+        "headers": list(display_headers),
+        "keys": list(keys),
+        "display_headers": list(display_headers),
+        "sheet_headers": list(display_headers),
+        "column_headers": list(display_headers),
+        "header_map": [{"key": k, "header": h} for k, h in zip(keys, display_headers)],
+        "rows": [],
+        "rows_matrix": [],
+        "count": 0,
+        "quotes": [],
+        "meta": _json_safe_value(meta),
+    }
+    return _json_safe_value(payload)  # type: ignore[return-value]
+
+
+def _finalize_payload_json_safe(payload: Dict[str, Any]) -> Dict[str, Any]:
+    safe = _json_safe_value(payload)
+    return safe if isinstance(safe, dict) else {}
+
+
 # =============================================================================
 # Canonical route-friendly public builders
 # =============================================================================
@@ -2222,30 +2513,36 @@ async def select_top10_symbols(
     body: Optional[Dict[str, Any]] = None,
     limit: int = 10,
     mode: str = "",
+    **kwargs: Any,
 ) -> List[str]:
-    request_payload = _request_to_payload(request)
-    settings_payload = _settings_to_payload(settings)
+    try:
+        body_payload = _merge_body_with_extras(body, kwargs)
+        request_payload = _request_to_payload(request)
+        settings_payload = _settings_to_payload(settings)
 
-    engine = engine or _resolve_engine_from_request(request)
-    crit = _merge_criteria_sources(
-        engine=engine,
-        criteria=criteria,
-        body=body,
-        settings=settings_payload,
-        request_payload=request_payload,
-        limit=limit,
-    )
-    mode2 = _extract_route_mode(mode, body, settings_payload, request_payload)
-    direct_symbols = _extract_direct_symbols_from_sources(criteria, body, settings_payload, request_payload)
+        engine = engine or _resolve_engine_from_request(request)
+        crit = _merge_criteria_sources(
+            engine=engine,
+            criteria=criteria,
+            body=body_payload,
+            settings=settings_payload,
+            request_payload=request_payload,
+            limit=limit,
+        )
+        mode2 = _extract_route_mode(mode, body_payload, settings_payload, request_payload)
+        direct_symbols = _extract_direct_symbols_from_sources(criteria, body_payload, settings_payload, request_payload)
 
-    top, _meta = await select_top10(
-        engine=engine,
-        criteria=crit,
-        mode=mode2,
-        direct_symbols=direct_symbols,
-        body=body or request_payload,
-    )
-    return [c.symbol for c in top]
+        top, _meta = await select_top10(
+            engine=engine,
+            criteria=crit,
+            mode=mode2,
+            direct_symbols=direct_symbols,
+            body=body_payload or request_payload,
+        )
+        return [c.symbol for c in top]
+    except Exception:
+        logger.exception("Top10 select_top10_symbols failed")
+        return []
 
 
 async def build_top10_rows(
@@ -2257,83 +2554,111 @@ async def build_top10_rows(
     body: Optional[Dict[str, Any]] = None,
     limit: int = 10,
     mode: str = "",
+    **kwargs: Any,
 ) -> Dict[str, Any]:
-    request_payload = _request_to_payload(request)
-    settings_payload = _settings_to_payload(settings)
+    t0 = time.time()
+    crit_fallback: Optional[Criteria] = None
 
-    engine = engine or _resolve_engine_from_request(request)
-    crit = _merge_criteria_sources(
-        engine=engine,
-        criteria=criteria,
-        body=body,
-        settings=settings_payload,
-        request_payload=request_payload,
-        limit=limit,
-    )
-    mode2 = _extract_route_mode(mode, body, settings_payload, request_payload)
-    direct_symbols = _extract_direct_symbols_from_sources(criteria, body, settings_payload, request_payload)
+    try:
+        body_payload = _merge_body_with_extras(body, kwargs)
+        request_payload = _request_to_payload(request)
+        settings_payload = _settings_to_payload(settings)
 
-    top, meta_sel = await select_top10(
-        engine=engine,
-        criteria=crit,
-        mode=mode2,
-        direct_symbols=direct_symbols,
-        body=body or request_payload,
-    )
-    rows, meta_rows = _build_top10_output_rows_internal(top, criteria=crit, mode=mode2)
-    display_headers, keys, _pct_keys, _schema_source, _injected = _get_top10_schema()
+        engine = engine or _resolve_engine_from_request(request)
+        crit = _merge_criteria_sources(
+            engine=engine,
+            criteria=criteria,
+            body=body_payload,
+            settings=settings_payload,
+            request_payload=request_payload,
+            limit=limit,
+        )
+        crit_fallback = crit
 
-    status_out = "success" if rows else "warn"
-    warnings = list((meta_sel or {}).get("warnings") or [])
-    warnings.extend(list((meta_rows or {}).get("warnings") or []))
-    warnings = _dedupe_keep_order(warnings)
-    if not rows:
-        warnings.append("top10_empty_after_selection")
+        mode2 = _extract_route_mode(mode, body_payload, settings_payload, request_payload)
+        direct_symbols = _extract_direct_symbols_from_sources(criteria, body_payload, settings_payload, request_payload)
 
-    return {
-        "status": status_out,
-        "page": TOP10_PAGE_NAME,
-        "sheet": TOP10_PAGE_NAME,
-        "headers": list(keys),
-        "keys": list(keys),
-        "display_headers": list(display_headers),
-        "sheet_headers": list(display_headers),
-        "column_headers": list(display_headers),
-        "header_map": [{"key": k, "header": h} for k, h in zip(keys, display_headers)],
-        "rows": rows,
-        "rows_matrix": _rows_to_matrix(keys, rows),
-        "count": len(rows),
-        "dispatch": "top10_selector",
-        "meta": {
-            **(meta_sel or {}),
-            **(meta_rows or {}),
-            "criteria": {
-                "pages_selected": crit.pages_selected,
-                "pages_explicit": crit.pages_explicit,
-                "invest_period_days": crit.invest_period_days,
-                "horizon": crit.horizon(),
-                "top_n": crit.top_n,
-                "min_expected_roi": crit.min_expected_roi,
-                "max_risk_score": crit.max_risk_score,
-                "min_confidence": crit.min_confidence,
-                "min_volume": crit.min_volume,
-                "use_liquidity_tiebreak": crit.use_liquidity_tiebreak,
-                "enforce_risk_confidence": crit.enforce_risk_confidence,
+        top, meta_sel = await select_top10(
+            engine=engine,
+            criteria=crit,
+            mode=mode2,
+            direct_symbols=direct_symbols,
+            body=body_payload or request_payload,
+        )
+        rows, meta_rows = _build_top10_output_rows_internal(top, criteria=crit, mode=mode2)
+        display_headers, keys, _pct_keys, _schema_source, _injected = _get_top10_schema()
+
+        status_out = "success" if rows else "warn"
+        warnings = list((meta_sel or {}).get("warnings") or [])
+        warnings.extend(list((meta_rows or {}).get("warnings") or []))
+        warnings = _dedupe_keep_order(warnings)
+        if not rows:
+            warnings.append("top10_empty_after_selection")
+
+        payload = {
+            "status": status_out,
+            "page": TOP10_PAGE_NAME,
+            "sheet": TOP10_PAGE_NAME,
+            "route_family": "top10",
+            "dispatch": "top10_selector",
+            "headers": list(display_headers),
+            "keys": list(keys),
+            "display_headers": list(display_headers),
+            "sheet_headers": list(display_headers),
+            "column_headers": list(display_headers),
+            "header_map": [{"key": k, "header": h} for k, h in zip(keys, display_headers)],
+            "rows": rows,
+            "rows_matrix": _rows_to_matrix(keys, rows),
+            "count": len(rows),
+            "quotes": rows,
+            "meta": {
+                **(meta_sel or {}),
+                **(meta_rows or {}),
+                "criteria": {
+                    "pages_selected": crit.pages_selected,
+                    "pages_explicit": crit.pages_explicit,
+                    "invest_period_days": crit.invest_period_days,
+                    "horizon": crit.horizon(),
+                    "top_n": crit.top_n,
+                    "min_expected_roi": crit.min_expected_roi,
+                    "max_risk_score": crit.max_risk_score,
+                    "min_confidence": crit.min_confidence,
+                    "min_volume": crit.min_volume,
+                    "use_liquidity_tiebreak": crit.use_liquidity_tiebreak,
+                    "enforce_risk_confidence": crit.enforce_risk_confidence,
+                },
+                "direct_symbols": direct_symbols,
+                "warnings": warnings,
+                "engine_present": engine is not None,
+                "request_present": request is not None,
+                "settings_present": settings is not None,
+                "kwargs_received": sorted([str(k) for k in kwargs.keys()]),
+                "response_contract": {
+                    "headers_are_display_headers": True,
+                    "keys_present": True,
+                    "display_headers_present": True,
+                    "rows_are_projected_to_keys": True,
+                    "rows_matrix_present": True,
+                    "json_safe_payload": True,
+                },
+                "duration_ms_public_builder": round((time.time() - t0) * 1000.0, 3),
             },
-            "direct_symbols": direct_symbols,
-            "warnings": warnings,
-            "engine_present": engine is not None,
-            "request_present": request is not None,
-            "settings_present": settings is not None,
-            "response_contract": {
-                "headers_are_keys": True,
-                "display_headers_present": True,
-                "rows_are_projected_to_keys": True,
-                "rows_matrix_present": True,
-                "fake_null_rows_avoided": True,
+        }
+        return _finalize_payload_json_safe(payload)
+
+    except Exception as e:
+        logger.exception("Top10 build_top10_rows fatal error")
+        return _build_empty_top10_payload(
+            criteria=crit_fallback,
+            mode=mode,
+            warnings=["build_top10_rows_failed"],
+            error=_safe_str(e),
+            error_type=type(e).__name__,
+            meta_extra={
+                "kwargs_received": sorted([str(k) for k in kwargs.keys()]),
+                "duration_ms_public_builder": round((time.time() - t0) * 1000.0, 3),
             },
-        },
-    }
+        )
 
 
 async def build_top10_output_rows(
@@ -2345,6 +2670,7 @@ async def build_top10_output_rows(
     body: Optional[Dict[str, Any]] = None,
     limit: int = 10,
     mode: str = "",
+    **kwargs: Any,
 ) -> Dict[str, Any]:
     """
     Route-compatible public alias.
@@ -2359,6 +2685,7 @@ async def build_top10_output_rows(
         body=body,
         limit=limit,
         mode=mode,
+        **kwargs,
     )
 
 
@@ -2371,6 +2698,7 @@ async def build_rows(
     criteria: Optional[Dict[str, Any]] = None,
     limit: Optional[int] = None,
     mode: str = "",
+    **kwargs: Any,
 ) -> List[Dict[str, Any]]:
     payload = await build_top10_rows(
         engine=engine,
@@ -2378,8 +2706,9 @@ async def build_rows(
         settings=settings,
         body=body,
         criteria=criteria,
-        limit=_resolve_limit(limit, criteria, body, settings=_settings_to_payload(settings), request_payload=_request_to_payload(request)),
+        limit=_resolve_limit(limit, criteria, _merge_body_with_extras(body, kwargs), settings=_settings_to_payload(settings), request_payload=_request_to_payload(request)),
         mode=mode,
+        **kwargs,
     )
     rows = payload.get("rows")
     return rows if isinstance(rows, list) else []
@@ -2394,6 +2723,7 @@ async def build_top_10_investments_rows(
     body: Optional[Dict[str, Any]] = None,
     limit: int = 10,
     mode: str = "",
+    **kwargs: Any,
 ) -> List[Dict[str, Any]]:
     payload = await build_top10_rows(
         engine=engine,
@@ -2403,6 +2733,7 @@ async def build_top_10_investments_rows(
         body=body,
         limit=limit,
         mode=mode,
+        **kwargs,
     )
     rows = payload.get("rows")
     return rows if isinstance(rows, list) else []
@@ -2417,6 +2748,7 @@ async def build_top10_investments_rows(
     body: Optional[Dict[str, Any]] = None,
     limit: int = 10,
     mode: str = "",
+    **kwargs: Any,
 ) -> List[Dict[str, Any]]:
     payload = await build_top10_rows(
         engine=engine,
@@ -2426,6 +2758,7 @@ async def build_top10_investments_rows(
         body=body,
         limit=limit,
         mode=mode,
+        **kwargs,
     )
     rows = payload.get("rows")
     return rows if isinstance(rows, list) else []
@@ -2440,6 +2773,7 @@ async def build_top_10_rows(
     body: Optional[Dict[str, Any]] = None,
     limit: int = 10,
     mode: str = "",
+    **kwargs: Any,
 ) -> List[Dict[str, Any]]:
     payload = await build_top10_rows(
         engine=engine,
@@ -2449,6 +2783,7 @@ async def build_top_10_rows(
         body=body,
         limit=limit,
         mode=mode,
+        **kwargs,
     )
     rows = payload.get("rows")
     return rows if isinstance(rows, list) else []
@@ -2463,6 +2798,7 @@ async def get_top10_rows(
     body: Optional[Dict[str, Any]] = None,
     limit: int = 10,
     mode: str = "",
+    **kwargs: Any,
 ) -> List[Dict[str, Any]]:
     payload = await build_top10_rows(
         engine=engine,
@@ -2472,6 +2808,7 @@ async def get_top10_rows(
         body=body,
         limit=limit,
         mode=mode,
+        **kwargs,
     )
     rows = payload.get("rows")
     return rows if isinstance(rows, list) else []
