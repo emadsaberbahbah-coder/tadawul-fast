@@ -2010,8 +2010,8 @@ class _EngineSymbolsReaderProxy:
         return await self._engine.list_symbols_for_page(page, limit=limit)
 
 
-# =========================== PART 2 STARTS NEXT ===========================
-# The next message will continue from:
+# =========================== END OF PART 1 ===========================
+# PART 2 must start directly with:
 # class DataEngineV5:
 class DataEngineV5:
     def __init__(self, settings: Any = None):
@@ -3173,7 +3173,7 @@ class DataEngineV5:
                     mode=mode or "",
                 )
                 rows0 = _coerce_rows_list(payload)
-            except Exception as e:
+            except Exception:
                 rows0 = []
 
             if not rows0:
@@ -3265,7 +3265,6 @@ class DataEngineV5:
                     mode=mode or "",
                 )
 
-                # Keep canonical schema unless selector returns full matching schema
                 if isinstance(payload, dict):
                     selector_headers, selector_keys = _coerce_payload_keys_headers(payload)
                     if (
@@ -3288,7 +3287,6 @@ class DataEngineV5:
 
             full_rows = [_strict_project_row(keys, _normalize_to_schema_keys(keys, headers, r)) for r in rows0]
 
-            # Fallback builder if selector empty
             if not full_rows:
                 fallback_rows = await self._build_top10_rows_fallback(headers, keys, top10_body, limit, mode)
                 if fallback_rows:
@@ -3296,7 +3294,6 @@ class DataEngineV5:
                     builder_used = "fallback:live_ranker"
                     route_warnings = route_warnings + ["selector_empty_used_live_ranker_fallback"]
 
-            # Cached snapshot fallback
             if not full_rows and isinstance(cached_before, dict):
                 cached_rows = _coerce_rows_list(cached_before)
                 cached_headers = cached_before.get("headers") if isinstance(cached_before.get("headers"), list) else headers
@@ -3378,7 +3375,6 @@ class DataEngineV5:
         out_headers = headers[:] if headers else (keys[:] if keys else [])
         out_keys = keys[:] if keys else (headers[:] if headers else [])
 
-        # External rows reader fallback before empty return
         if not requested_symbols and target_sheet in INSTRUMENT_SHEETS:
             ext_rows = await self._get_rows_from_external_reader(target_sheet, limit + offset)
             if ext_rows:
