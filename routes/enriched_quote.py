@@ -2,7 +2,7 @@
 # routes/enriched_quote.py
 """
 ================================================================================
-TFB Enriched Quote Routes Wrapper — v6.6.0
+TFB Enriched Quote Routes Wrapper — v6.7.0
 ================================================================================
 RENDER-SAFE • SCHEMA-AWARE • PAGE-DISPATCH SAFE • HEADER/ROW BALANCED
 SPECIAL-BUILDER PRESERVING • ASYNC-SAFE • GET+POST COMPATIBLE
@@ -10,9 +10,23 @@ QUERY/BODY MERGE • LEGACY ALIAS SAFE • TABLE-MODE SAFE • CORE-WRAPPER SAFE
 TOP10-SPECIAL SAFE • SCHEMA-ONLY SAFE • TIMEOUT-GUARDED • NULL-SAFE
 JSON-SAFE • CONTRACT-HARDENED • SPECIAL-ROUTE FAIL-SAFE
 ENGINE-FALLBACK SAFE • HYDRATION-HARDENED • SPARSE-QUOTE SAFE
+HYPHEN-ALIAS RESTORED • BACKWARD-COMPATIBLE
 
 Why this revision
 -----------------
+- ✅ FIX: restores old public compatibility paths expected by smoke tests / legacy clients:
+        - /v1/enriched-quote
+        - /v1/enriched-quote/quote
+        - /v1/enriched-quote/quotes
+        - /v1/enriched-quote/sheet-rows
+- ✅ FIX: exact GET/POST bridge on /v1/enriched-quote routes page/sheet requests to sheet-rows
+        and single-symbol requests to quote logic
+- ✅ FIX: preserves currently working route families:
+        - /v1/enriched/quote
+        - /v1/enriched/quotes
+        - /v1/enriched/sheet-rows
+        - /v1/enriched_quote/quote
+        - /v1/enriched_quote/sheet-rows
 - ✅ FIX: `_strip(None)` never leaks the literal string "None"
 - ✅ FIX: all route payloads are JSON-safe (NaN/Inf/datetime/Decimal/set handled)
 - ✅ FIX: explicit special-page dispatch for Top_10_Investments / Insights_Analysis / Data_Dictionary
@@ -39,20 +53,22 @@ Supported route families:
 
 Compatibility routes
 --------------------
-- GET  /quote
-- POST /quote
-- GET  /quotes
-- POST /quotes
-- GET  /sheet-rows
-- POST /sheet-rows
-- GET  /v1/enriched/quote
-- POST /v1/enriched/quote
-- GET  /v1/enriched/sheet-rows
-- POST /v1/enriched/sheet-rows
-- GET  /v1/enriched_quote/quote
-- POST /v1/enriched_quote/quote
-- GET  /v1/enriched_quote/sheet-rows
-- POST /v1/enriched_quote/sheet-rows
+- GET/POST /quote
+- GET/POST /quotes
+- GET/POST /sheet-rows
+
+- GET/POST /v1/enriched/quote
+- GET/POST /v1/enriched/quotes
+- GET/POST /v1/enriched/sheet-rows
+
+- GET/POST /v1/enriched_quote/quote
+- GET/POST /v1/enriched_quote/quotes
+- GET/POST /v1/enriched_quote/sheet-rows
+
+- GET/POST /v1/enriched-quote
+- GET/POST /v1/enriched-quote/quote
+- GET/POST /v1/enriched-quote/quotes
+- GET/POST /v1/enriched-quote/sheet-rows
 """
 
 from __future__ import annotations
@@ -73,7 +89,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 
 logger = logging.getLogger("routes.enriched_quote")
 
-ROUTER_VERSION = "6.6.0"
+ROUTER_VERSION = "6.7.0"
 
 # Kept lazy for dynamic mount behavior
 router: Optional[APIRouter] = None
@@ -410,6 +426,44 @@ def _collect_query_body_for_quote(
         body["ticker"] = ticker
     if page not in (None, ""):
         body["page"] = page
+    return body
+
+
+def _collect_query_body_for_hyphen_bridge(
+    *,
+    symbol: Optional[str],
+    ticker: Optional[str],
+    page: Optional[str],
+    sheet_name: Optional[str],
+    sheet: Optional[str],
+    name: Optional[str],
+    tab: Optional[str],
+    symbols: Optional[str],
+    tickers: Optional[str],
+    include_headers: Optional[str],
+    include_matrix: Optional[str],
+    limit: Optional[int],
+    offset: Optional[int],
+    top_n: Optional[int],
+) -> Dict[str, Any]:
+    body = _collect_query_body_for_sheet_rows(
+        page=page,
+        sheet_name=sheet_name,
+        sheet=sheet,
+        name=name,
+        tab=tab,
+        symbols=symbols,
+        tickers=tickers,
+        include_headers=include_headers,
+        include_matrix=include_matrix,
+        limit=limit,
+        offset=offset,
+        top_n=top_n,
+    )
+    if symbol not in (None, ""):
+        body["symbol"] = symbol
+    if ticker not in (None, ""):
+        body["ticker"] = ticker
     return body
 
 
@@ -1676,6 +1730,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
 
     enriched = APIRouter(prefix="/v1/enriched", tags=["enriched"])
     enriched_quote_alias = APIRouter(prefix="/v1/enriched_quote", tags=["enriched"])
+    enriched_hyphen = APIRouter(prefix="/v1/enriched-quote", tags=["enriched"])
     legacy = APIRouter(tags=["quotes"])
 
     async def _health_payload() -> Dict[str, Any]:
@@ -1697,6 +1752,10 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
     async def enriched_quote_alias_health() -> Dict[str, Any]:
         return await _health_payload()
 
+    @enriched_hyphen.get("/health", include_in_schema=False)
+    async def enriched_hyphen_health() -> Dict[str, Any]:
+        return await _health_payload()
+
     @enriched.get("/headers", include_in_schema=False)
     async def enriched_headers(page: str = Query(default="Market_Leaders")) -> Dict[str, Any]:
         page_norm = svc.normalize_page(page)
@@ -1716,6 +1775,23 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
 
     @enriched_quote_alias.get("/headers", include_in_schema=False)
     async def enriched_quote_alias_headers(page: str = Query(default="Market_Leaders")) -> Dict[str, Any]:
+        page_norm = svc.normalize_page(page)
+        headers, keys = svc.schema_for_page(page_norm)
+        return _json_safe(
+            {
+                "status": "success" if headers else "degraded",
+                "page": page_norm,
+                "headers": headers,
+                "keys": keys,
+                "display_headers": headers,
+                "router_version": ROUTER_VERSION,
+                "reason": None if headers else reason,
+                "route_family": svc.route_family(page_norm),
+            }
+        )
+
+    @enriched_hyphen.get("/headers", include_in_schema=False)
+    async def enriched_hyphen_headers(page: str = Query(default="Market_Leaders")) -> Dict[str, Any]:
         page_norm = svc.normalize_page(page)
         headers, keys = svc.schema_for_page(page_norm)
         return _json_safe(
@@ -2181,6 +2257,53 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             extra_meta={"requested": len(symbols), "errors": errors, **hydrate_meta},
         )
 
+    async def _handle_hyphen_bridge(
+        request: Request,
+        body: Dict[str, Any],
+        mode_q: str,
+        token_q: Optional[str],
+        x_app_token: Optional[str],
+        authorization: Optional[str],
+        x_request_id: Optional[str],
+    ) -> Dict[str, Any]:
+        """
+        Backward-compatible bridge for the old /v1/enriched-quote root path.
+
+        Decision rule:
+        - single-symbol request with no explicit sheet selector -> single quote handler
+        - otherwise -> sheet rows handler
+        """
+        prepared = dict(body or {})
+        symbol = _strip(prepared.get("symbol") or prepared.get("ticker") or prepared.get("requested_symbol"))
+        list_symbols = _get_list(prepared, "symbols", "tickers", "tickers_list")
+        explicit_sheet_selector = any(
+            _strip(prepared.get(k))
+            for k in ("sheet", "sheet_name", "name", "tab")
+        )
+        page_q = _strip(prepared.get("page"))
+
+        if symbol and not list_symbols and not explicit_sheet_selector:
+            return await _handle_single_quote(
+                request=request,
+                body=prepared,
+                page_q=page_q,
+                mode_q=mode_q,
+                token_q=token_q,
+                x_app_token=x_app_token,
+                authorization=authorization,
+                x_request_id=x_request_id,
+            )
+
+        return await _handle_sheet_rows(
+            request=request,
+            body=prepared,
+            mode_q=mode_q,
+            token_q=token_q,
+            x_app_token=x_app_token,
+            authorization=authorization,
+            x_request_id=x_request_id,
+        )
+
     # -------------------------------------------------------------------------
     # Routes: POST quote
     # -------------------------------------------------------------------------
@@ -2199,6 +2322,19 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
 
     @enriched_quote_alias.post("/quote")
     async def enriched_quote_alias_post(
+        request: Request,
+        body: Dict[str, Any] = Body(default_factory=dict),
+        page: str = Query(default="", description="Optional page name for schema selection"),
+        mode: str = Query(default="", description="Optional mode hint"),
+        token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+        x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+        authorization: Optional[str] = Header(default=None, alias="Authorization"),
+        x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+    ) -> Dict[str, Any]:
+        return await _handle_single_quote(request, body, page, mode, token, x_app_token, authorization, x_request_id)
+
+    @enriched_hyphen.post("/quote")
+    async def enriched_hyphen_quote_post(
         request: Request,
         body: Dict[str, Any] = Body(default_factory=dict),
         page: str = Query(default="", description="Optional page name for schema selection"),
@@ -2243,6 +2379,171 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         body = _collect_query_body_for_quote(symbol=symbol, ticker=ticker, page=page)
         return await _handle_single_quote(request, body, page, mode, token, x_app_token, authorization, x_request_id)
 
+    @enriched_hyphen.get("/quote", include_in_schema=False)
+    async def enriched_hyphen_quote_get(
+        request: Request,
+        symbol: Optional[str] = Query(default=None),
+        ticker: Optional[str] = Query(default=None),
+        page: str = Query(default="", description="Optional page name for schema selection"),
+        mode: str = Query(default="", description="Optional mode hint"),
+        token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+        x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+        authorization: Optional[str] = Header(default=None, alias="Authorization"),
+        x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+    ) -> Dict[str, Any]:
+        body = _collect_query_body_for_quote(symbol=symbol, ticker=ticker, page=page)
+        return await _handle_single_quote(request, body, page, mode, token, x_app_token, authorization, x_request_id)
+
+    # -------------------------------------------------------------------------
+    # Routes: POST quotes (plural compatibility)
+    # -------------------------------------------------------------------------
+    @enriched.post("/quotes", include_in_schema=False)
+    async def enriched_quotes_post(
+        request: Request,
+        body: Dict[str, Any] = Body(default_factory=dict),
+        mode: str = Query(default="", description="Optional mode hint"),
+        token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+        x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+        authorization: Optional[str] = Header(default=None, alias="Authorization"),
+        x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+    ) -> Dict[str, Any]:
+        return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
+
+    @enriched_quote_alias.post("/quotes", include_in_schema=False)
+    async def enriched_quote_alias_quotes_post(
+        request: Request,
+        body: Dict[str, Any] = Body(default_factory=dict),
+        mode: str = Query(default="", description="Optional mode hint"),
+        token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+        x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+        authorization: Optional[str] = Header(default=None, alias="Authorization"),
+        x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+    ) -> Dict[str, Any]:
+        return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
+
+    @enriched_hyphen.post("/quotes", include_in_schema=False)
+    async def enriched_hyphen_quotes_post(
+        request: Request,
+        body: Dict[str, Any] = Body(default_factory=dict),
+        mode: str = Query(default="", description="Optional mode hint"),
+        token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+        x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+        authorization: Optional[str] = Header(default=None, alias="Authorization"),
+        x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+    ) -> Dict[str, Any]:
+        return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
+
+    @enriched.get("/quotes", include_in_schema=False)
+    async def enriched_quotes_get(
+        request: Request,
+        page: Optional[str] = Query(default=None),
+        sheet_name: Optional[str] = Query(default=None),
+        sheet: Optional[str] = Query(default=None),
+        name: Optional[str] = Query(default=None),
+        tab: Optional[str] = Query(default=None),
+        symbols: Optional[str] = Query(default=None),
+        tickers: Optional[str] = Query(default=None),
+        include_headers: Optional[str] = Query(default=None),
+        include_matrix: Optional[str] = Query(default=None),
+        limit: Optional[int] = Query(default=None),
+        offset: Optional[int] = Query(default=None),
+        top_n: Optional[int] = Query(default=None),
+        mode: str = Query(default="", description="Optional mode hint"),
+        token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+        x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+        authorization: Optional[str] = Header(default=None, alias="Authorization"),
+        x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+    ) -> Dict[str, Any]:
+        body = _collect_query_body_for_sheet_rows(
+            page=page,
+            sheet_name=sheet_name,
+            sheet=sheet,
+            name=name,
+            tab=tab,
+            symbols=symbols,
+            tickers=tickers,
+            include_headers=include_headers,
+            include_matrix=include_matrix,
+            limit=limit,
+            offset=offset,
+            top_n=top_n,
+        )
+        return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
+
+    @enriched_quote_alias.get("/quotes", include_in_schema=False)
+    async def enriched_quote_alias_quotes_get(
+        request: Request,
+        page: Optional[str] = Query(default=None),
+        sheet_name: Optional[str] = Query(default=None),
+        sheet: Optional[str] = Query(default=None),
+        name: Optional[str] = Query(default=None),
+        tab: Optional[str] = Query(default=None),
+        symbols: Optional[str] = Query(default=None),
+        tickers: Optional[str] = Query(default=None),
+        include_headers: Optional[str] = Query(default=None),
+        include_matrix: Optional[str] = Query(default=None),
+        limit: Optional[int] = Query(default=None),
+        offset: Optional[int] = Query(default=None),
+        top_n: Optional[int] = Query(default=None),
+        mode: str = Query(default="", description="Optional mode hint"),
+        token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+        x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+        authorization: Optional[str] = Header(default=None, alias="Authorization"),
+        x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+    ) -> Dict[str, Any]:
+        body = _collect_query_body_for_sheet_rows(
+            page=page,
+            sheet_name=sheet_name,
+            sheet=sheet,
+            name=name,
+            tab=tab,
+            symbols=symbols,
+            tickers=tickers,
+            include_headers=include_headers,
+            include_matrix=include_matrix,
+            limit=limit,
+            offset=offset,
+            top_n=top_n,
+        )
+        return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
+
+    @enriched_hyphen.get("/quotes", include_in_schema=False)
+    async def enriched_hyphen_quotes_get(
+        request: Request,
+        page: Optional[str] = Query(default=None),
+        sheet_name: Optional[str] = Query(default=None),
+        sheet: Optional[str] = Query(default=None),
+        name: Optional[str] = Query(default=None),
+        tab: Optional[str] = Query(default=None),
+        symbols: Optional[str] = Query(default=None),
+        tickers: Optional[str] = Query(default=None),
+        include_headers: Optional[str] = Query(default=None),
+        include_matrix: Optional[str] = Query(default=None),
+        limit: Optional[int] = Query(default=None),
+        offset: Optional[int] = Query(default=None),
+        top_n: Optional[int] = Query(default=None),
+        mode: str = Query(default="", description="Optional mode hint"),
+        token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+        x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+        authorization: Optional[str] = Header(default=None, alias="Authorization"),
+        x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+    ) -> Dict[str, Any]:
+        body = _collect_query_body_for_sheet_rows(
+            page=page,
+            sheet_name=sheet_name,
+            sheet=sheet,
+            name=name,
+            tab=tab,
+            symbols=symbols,
+            tickers=tickers,
+            include_headers=include_headers,
+            include_matrix=include_matrix,
+            limit=limit,
+            offset=offset,
+            top_n=top_n,
+        )
+        return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
+
     # -------------------------------------------------------------------------
     # Routes: POST sheet-rows
     # -------------------------------------------------------------------------
@@ -2260,6 +2561,18 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
 
     @enriched_quote_alias.post("/sheet-rows")
     async def enriched_quote_alias_sheet_rows_post(
+        request: Request,
+        body: Dict[str, Any] = Body(default_factory=dict),
+        mode: str = Query(default="", description="Optional mode hint"),
+        token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+        x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+        authorization: Optional[str] = Header(default=None, alias="Authorization"),
+        x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+    ) -> Dict[str, Any]:
+        return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
+
+    @enriched_hyphen.post("/sheet-rows")
+    async def enriched_hyphen_sheet_rows_post(
         request: Request,
         body: Dict[str, Any] = Body(default_factory=dict),
         mode: str = Query(default="", description="Optional mode hint"),
@@ -2346,6 +2659,115 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             top_n=top_n,
         )
         return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
+
+    @enriched_hyphen.get("/sheet-rows")
+    async def enriched_hyphen_sheet_rows_get(
+        request: Request,
+        page: Optional[str] = Query(default=None),
+        sheet_name: Optional[str] = Query(default=None),
+        sheet: Optional[str] = Query(default=None),
+        name: Optional[str] = Query(default=None),
+        tab: Optional[str] = Query(default=None),
+        symbols: Optional[str] = Query(default=None),
+        tickers: Optional[str] = Query(default=None),
+        include_headers: Optional[str] = Query(default=None),
+        include_matrix: Optional[str] = Query(default=None),
+        limit: Optional[int] = Query(default=None),
+        offset: Optional[int] = Query(default=None),
+        top_n: Optional[int] = Query(default=None),
+        mode: str = Query(default="", description="Optional mode hint"),
+        token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+        x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+        authorization: Optional[str] = Header(default=None, alias="Authorization"),
+        x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+    ) -> Dict[str, Any]:
+        body = _collect_query_body_for_sheet_rows(
+            page=page,
+            sheet_name=sheet_name,
+            sheet=sheet,
+            name=name,
+            tab=tab,
+            symbols=symbols,
+            tickers=tickers,
+            include_headers=include_headers,
+            include_matrix=include_matrix,
+            limit=limit,
+            offset=offset,
+            top_n=top_n,
+        )
+        return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
+
+    # -------------------------------------------------------------------------
+    # Routes: exact root compatibility bridge
+    # -------------------------------------------------------------------------
+    @root.post("/v1/enriched-quote")
+    async def enriched_hyphen_root_post(
+        request: Request,
+        body: Dict[str, Any] = Body(default_factory=dict),
+        mode: str = Query(default="", description="Optional mode hint"),
+        token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+        x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+        authorization: Optional[str] = Header(default=None, alias="Authorization"),
+        x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+    ) -> Dict[str, Any]:
+        return await _handle_hyphen_bridge(
+            request=request,
+            body=body,
+            mode_q=mode,
+            token_q=token,
+            x_app_token=x_app_token,
+            authorization=authorization,
+            x_request_id=x_request_id,
+        )
+
+    @root.get("/v1/enriched-quote")
+    async def enriched_hyphen_root_get(
+        request: Request,
+        symbol: Optional[str] = Query(default=None),
+        ticker: Optional[str] = Query(default=None),
+        page: Optional[str] = Query(default=None),
+        sheet_name: Optional[str] = Query(default=None),
+        sheet: Optional[str] = Query(default=None),
+        name: Optional[str] = Query(default=None),
+        tab: Optional[str] = Query(default=None),
+        symbols: Optional[str] = Query(default=None),
+        tickers: Optional[str] = Query(default=None),
+        include_headers: Optional[str] = Query(default=None),
+        include_matrix: Optional[str] = Query(default=None),
+        limit: Optional[int] = Query(default=None),
+        offset: Optional[int] = Query(default=None),
+        top_n: Optional[int] = Query(default=None),
+        mode: str = Query(default="", description="Optional mode hint"),
+        token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+        x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+        authorization: Optional[str] = Header(default=None, alias="Authorization"),
+        x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+    ) -> Dict[str, Any]:
+        body = _collect_query_body_for_hyphen_bridge(
+            symbol=symbol,
+            ticker=ticker,
+            page=page,
+            sheet_name=sheet_name,
+            sheet=sheet,
+            name=name,
+            tab=tab,
+            symbols=symbols,
+            tickers=tickers,
+            include_headers=include_headers,
+            include_matrix=include_matrix,
+            limit=limit,
+            offset=offset,
+            top_n=top_n,
+        )
+        return await _handle_hyphen_bridge(
+            request=request,
+            body=body,
+            mode_q=mode,
+            token_q=token,
+            x_app_token=x_app_token,
+            authorization=authorization,
+            x_request_id=x_request_id,
+        )
 
     # -------------------------------------------------------------------------
     # Legacy aliases
@@ -2479,6 +2901,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
     # Important: wrapper routers first, optional core router last
     root.include_router(enriched)
     root.include_router(enriched_quote_alias)
+    root.include_router(enriched_hyphen)
     root.include_router(legacy)
 
     if isinstance(core_router, APIRouter):
