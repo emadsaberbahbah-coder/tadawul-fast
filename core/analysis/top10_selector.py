@@ -2,12 +2,12 @@
 # core/analysis/top10_selector.py
 """
 ================================================================================
-Top 10 Selector — v3.7.0
+Top 10 Selector — v3.8.0
 ================================================================================
 LIVE • SCHEMA-FIRST • TOP10-METADATA COMPLETE • ROUTE-COMPATIBLE • SHEET-FRIENDLY
 FAIL-SAFE • BODY-AWARE • SETTINGS-AWARE • CONTRACT-HARDENED • FALLBACK-ENHANCED
 PERFORMANCE-GUARDED • CONCURRENCY-AWARE • UNIVERSE-CAPPED • JSON-SAFE
-KWARG-TOLERANT • DISPATCH-FRIENDLY • SPECIAL-PAGE SAFE
+KWARG-TOLERANT • DISPATCH-FRIENDLY • SPECIAL-PAGE SAFE • HYDRATION-HARDENED
 
 Purpose
 -------
@@ -26,17 +26,15 @@ Primary guarantees
 - Uses live quotes when available, snapshot fallback only when necessary
 - No network I/O at import-time
 
-New in v3.7.0
+New in v3.8.0
 -------------
-- ✅ FIX: public APIs now accept extra kwargs safely (prevents dispatcher TypeError / 502)
-- ✅ FIX: build_top10_rows is fully fail-safe and always returns a payload contract
-- ✅ FIX: response payload is JSON-safe (NaN/Inf/datetime/Decimal/set handled)
-- ✅ FIX: headers now align with display headers while keys remain explicit separately
-- ✅ FIX: better schema loading from schema_registry via multiple fallback patterns
-- ✅ FIX: concurrent page fetchers no longer fail whole request on one page error
-- ✅ FIX: richer error metadata for easier production diagnostics
-- ✅ IMPROVE: body / settings / request / kwargs are merged more predictably
-- ✅ IMPROVE: special-page route compatibility for sheet/page/name/tab/request_id/etc.
+- ✅ FIX: final Top-N rows are now aggressively hydrated to reduce missing fields
+- ✅ FIX: sparse batch-quote results trigger richer per-symbol enrichment fallback
+- ✅ FIX: selected symbols are backfilled from source-page live rows when possible
+- ✅ FIX: canonical Top10 schema stays preserved even when enrichment is partial
+- ✅ FIX: stronger alias backfill for common quote / page-row field names
+- ✅ IMPROVE: richer meta diagnostics for PowerShell live testing
+- ✅ SAFE: still fail-safe and JSON-safe for route execution
 
 Public APIs
 -----------
@@ -75,7 +73,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, 
 logger = logging.getLogger("core.analysis.top10_selector")
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "3.7.0"
+TOP10_SELECTOR_VERSION = "3.8.0"
 TOP10_PAGE_NAME = "Top_10_Investments"
 RIYADH_TZ = timezone(timedelta(hours=3))
 
@@ -459,6 +457,112 @@ def _env_csv(name: str) -> List[str]:
     return _dedupe_keep_order([p.strip() for p in re.split(r"[,\;\|\n]+", raw) if p.strip()])
 
 
+def _has_value(v: Any) -> bool:
+    if v is None:
+        return False
+    if isinstance(v, str):
+        return bool(v.strip())
+    if isinstance(v, float):
+        return not (math.isnan(v) or math.isinf(v))
+    return True
+
+
+def _merge_non_null_overwrite(base: Dict[str, Any], addon: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    out = dict(base or {})
+    if not isinstance(addon, dict):
+        return out
+    for k, v in addon.items():
+        if _has_value(v):
+            out[k] = v
+    return out
+
+
+def _non_null_count(d: Optional[Dict[str, Any]]) -> int:
+    if not isinstance(d, dict):
+        return 0
+    return sum(1 for v in d.values() if _has_value(v))
+
+
+def _row_richness_score(d: Optional[Dict[str, Any]]) -> int:
+    if not isinstance(d, dict):
+        return 0
+
+    important = (
+        "symbol",
+        "name",
+        "asset_class",
+        "exchange",
+        "currency",
+        "country",
+        "sector",
+        "industry",
+        "current_price",
+        "previous_close",
+        "open_price",
+        "day_high",
+        "day_low",
+        "week_52_high",
+        "week_52_low",
+        "volume",
+        "avg_volume_10d",
+        "avg_volume_30d",
+        "market_cap",
+        "pe_ttm",
+        "pe_forward",
+        "eps_ttm",
+        "dividend_yield",
+        "revenue_ttm",
+        "revenue_growth_yoy",
+        "gross_margin",
+        "operating_margin",
+        "profit_margin",
+        "debt_to_equity",
+        "free_cash_flow_ttm",
+        "rsi_14",
+        "volatility_30d",
+        "volatility_90d",
+        "max_drawdown_1y",
+        "var_95_1d",
+        "sharpe_1y",
+        "risk_score",
+        "risk_bucket",
+        "pb_ratio",
+        "ps_ratio",
+        "ev_ebitda",
+        "peg_ratio",
+        "intrinsic_value",
+        "valuation_score",
+        "forecast_price_1m",
+        "forecast_price_3m",
+        "forecast_price_12m",
+        "expected_roi_1m",
+        "expected_roi_3m",
+        "expected_roi_12m",
+        "forecast_confidence",
+        "confidence_score",
+        "confidence_bucket",
+        "value_score",
+        "quality_score",
+        "momentum_score",
+        "growth_score",
+        "overall_score",
+        "opportunity_score",
+        "rank_overall",
+        "recommendation",
+        "recommendation_reason",
+        "horizon_days",
+        "invest_period_label",
+        "data_provider",
+        "last_updated_utc",
+        "last_updated_riyadh",
+    )
+    return sum(1 for k in important if _has_value(d.get(k)))
+
+
+def _is_sparse_quote_like(d: Optional[Dict[str, Any]], threshold: int = 14) -> bool:
+    return _row_richness_score(d) < threshold
+
+
 # =============================================================================
 # Period mapping
 # =============================================================================
@@ -720,13 +824,7 @@ def _extract_body_criteria(body: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _normalize_public_extras(extra: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Preserve unknown route kwargs by merging them into body-like payload.
-    This avoids dispatcher TypeError / incompatibility when route builders pass
-    sheet/page/tab/request_id/symbols/tickers/etc.
-    """
     out = dict(extra or {})
-    # Remove internal noise if present
     for k in list(out.keys()):
         if k.startswith("_"):
             out.pop(k, None)
@@ -738,7 +836,6 @@ def _merge_body_with_extras(body: Optional[Dict[str, Any]], extra: Optional[Dict
     if isinstance(body, dict):
         merged.update(body)
     extra2 = _normalize_public_extras(extra)
-    # Put extras after body so dispatcher/runtime keys are visible to downstream parsing
     merged.update({k: v for k, v in extra2.items() if v is not None})
     return merged
 
@@ -930,7 +1027,6 @@ def _allow_row_fallback(criteria: Criteria, direct_symbols: List[str], pages: Li
     if env_force is not None:
         return _coerce_bool(env_force, True)
 
-    # Broad or unconstrained requests should avoid very expensive row fallback scans.
     if not criteria.pages_explicit and len(pages) > 2:
         return False
 
@@ -1189,15 +1285,18 @@ async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "", 
 
         try:
             try:
-                res = fn(symbols=symbols, mode=mode or "", body=body_obj)
+                res = fn(symbols=symbols, mode=mode or "", body=body_obj, schema=None)
             except TypeError:
                 try:
-                    res = fn(symbols=symbols, mode=mode or "")
+                    res = fn(symbols=symbols, mode=mode or "", body=body_obj)
                 except TypeError:
                     try:
-                        res = fn(symbols)
+                        res = fn(symbols=symbols, mode=mode or "")
                     except TypeError:
-                        res = fn(symbols, mode=mode or "")
+                        try:
+                            res = fn(symbols)
+                        except TypeError:
+                            res = fn(symbols, mode=mode or "")
             res = await _maybe_await(res)
 
             if isinstance(res, dict):
@@ -1239,20 +1338,26 @@ async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "", 
         try:
             if callable(per_dict_fn):
                 try:
-                    out[s] = _coerce_mapping(await _maybe_await(per_dict_fn(s, mode=mode or "", body=body_obj)))
+                    out[s] = _coerce_mapping(await _maybe_await(per_dict_fn(s, mode=mode or "", body=body_obj, schema=None)))
                 except TypeError:
                     try:
-                        out[s] = _coerce_mapping(await _maybe_await(per_dict_fn(s, mode=mode or "")))
+                        out[s] = _coerce_mapping(await _maybe_await(per_dict_fn(s, mode=mode or "", body=body_obj)))
                     except TypeError:
-                        out[s] = _coerce_mapping(await _maybe_await(per_dict_fn(s)))
+                        try:
+                            out[s] = _coerce_mapping(await _maybe_await(per_dict_fn(s, mode=mode or "")))
+                        except TypeError:
+                            out[s] = _coerce_mapping(await _maybe_await(per_dict_fn(s)))
             elif callable(per_fn):
                 try:
-                    out[s] = _coerce_mapping(await _maybe_await(per_fn(s, mode=mode or "", body=body_obj)))
+                    out[s] = _coerce_mapping(await _maybe_await(per_fn(s, mode=mode or "", body=body_obj, schema=None)))
                 except TypeError:
                     try:
-                        out[s] = _coerce_mapping(await _maybe_await(per_fn(s, mode=mode or "")))
+                        out[s] = _coerce_mapping(await _maybe_await(per_fn(s, mode=mode or "", body=body_obj)))
                     except TypeError:
-                        out[s] = _coerce_mapping(await _maybe_await(per_fn(s)))
+                        try:
+                            out[s] = _coerce_mapping(await _maybe_await(per_fn(s, mode=mode or "")))
+                        except TypeError:
+                            out[s] = _coerce_mapping(await _maybe_await(per_fn(s)))
             else:
                 out[s] = {"symbol": s, "warnings": "engine_missing_quote_methods"}
         except Exception as e:
@@ -1325,6 +1430,33 @@ def _risk_from_bucket(bucket: str) -> float:
     if "high" in b:
         return 75.0
     return 60.0
+
+
+def _bucket_from_risk_score(score: Any) -> Optional[str]:
+    f = _safe_float(score, None)
+    if f is None:
+        return None
+    if 0.0 < f <= 1.5:
+        f = f * 100.0
+    if f <= 35:
+        return "Low"
+    if f <= 65:
+        return "Moderate"
+    return "High"
+
+
+def _bucket_from_confidence(conf: Any) -> Optional[str]:
+    f = _safe_float(conf, None)
+    if f is None:
+        return None
+    if f > 1.5:
+        f = f / 100.0
+    f = _clamp(float(f), 0.0, 1.0)
+    if f >= 0.75:
+        return "High"
+    if f >= 0.50:
+        return "Medium"
+    return "Low"
 
 
 def _get_confidence(d: Dict[str, Any]) -> float:
@@ -1509,37 +1641,137 @@ async def _enrich_top(engine: Any, symbols: List[str], *, mode: str = "", body: 
     if engine is None or not symbols:
         return {}
 
-    try:
-        res = await _fetch_quotes_map(engine, symbols, mode=mode or "", body=body or {})
-        if isinstance(res, dict) and res:
-            return {s: _coerce_mapping(res.get(s)) for s in symbols}
-    except Exception:
-        pass
-
     out: Dict[str, Dict[str, Any]] = {}
-    fn = getattr(engine, "get_enriched_quote", None)
-    if not callable(fn):
-        return out
+    body_obj = dict(body or {})
+
+    try:
+        batch_map = await _fetch_quotes_map(engine, symbols, mode=mode or "", body=body_obj)
+        if isinstance(batch_map, dict):
+            for s in symbols:
+                out[s] = _coerce_mapping(batch_map.get(s))
+    except Exception:
+        out = {}
+
+    sparse_symbols = [s for s in symbols if _is_sparse_quote_like(out.get(s))]
+    if not sparse_symbols:
+        return {s: _coerce_mapping(out.get(s)) for s in symbols}
+
+    per_dict_fn = getattr(engine, "get_enriched_quote_dict", None)
+    per_fn = getattr(engine, "get_enriched_quote", None) or getattr(engine, "get_quote", None)
 
     conc = _env_int("TOP10_ENRICH_CONCURRENCY", 8, lo=3, hi=20)
     sem = asyncio.Semaphore(conc)
 
     async def one(sym: str) -> None:
         async with sem:
+            richer: Dict[str, Any] = {}
             try:
-                try:
-                    r = fn(sym, mode=mode or "", body=body or {})
-                except TypeError:
+                if callable(per_dict_fn):
                     try:
-                        r = fn(sym, mode=mode or "")
+                        richer = _coerce_mapping(await _maybe_await(per_dict_fn(sym, mode=mode or "", body=body_obj, schema=None)))
                     except TypeError:
-                        r = fn(sym)
-                r = await _maybe_await(r)
-                out[sym] = _coerce_mapping(r)
+                        try:
+                            richer = _coerce_mapping(await _maybe_await(per_dict_fn(sym, mode=mode or "", body=body_obj)))
+                        except TypeError:
+                            try:
+                                richer = _coerce_mapping(await _maybe_await(per_dict_fn(sym, mode=mode or "")))
+                            except TypeError:
+                                richer = _coerce_mapping(await _maybe_await(per_dict_fn(sym)))
+                elif callable(per_fn):
+                    try:
+                        richer = _coerce_mapping(await _maybe_await(per_fn(sym, mode=mode or "", body=body_obj, schema=None)))
+                    except TypeError:
+                        try:
+                            richer = _coerce_mapping(await _maybe_await(per_fn(sym, mode=mode or "", body=body_obj)))
+                        except TypeError:
+                            try:
+                                richer = _coerce_mapping(await _maybe_await(per_fn(sym, mode=mode or "")))
+                            except TypeError:
+                                richer = _coerce_mapping(await _maybe_await(per_fn(sym)))
             except Exception:
-                out[sym] = {"symbol": sym, "warnings": "enrich_failed"}
+                richer = {}
 
-    await asyncio.gather(*(one(s) for s in symbols), return_exceptions=True)
+            current = _coerce_mapping(out.get(sym))
+            sources = [current, richer]
+            sources = [s for s in sources if isinstance(s, dict)]
+            sources.sort(key=_row_richness_score)
+            merged: Dict[str, Any] = {}
+            for src in sources:
+                merged = _merge_non_null_overwrite(merged, src)
+            out[sym] = merged
+
+    await asyncio.gather(*(one(s) for s in sparse_symbols), return_exceptions=True)
+    return {s: _coerce_mapping(out.get(s)) for s in symbols}
+
+
+async def _fetch_selected_page_rows(
+    engine: Any,
+    candidates: Sequence[Candidate],
+    *,
+    mode: str = "",
+    body: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    Backfill selected top symbols from their source pages using page-row routes.
+    This is especially useful when selector quote maps are sparse.
+    """
+    if engine is None or not candidates:
+        return {}
+
+    by_page: Dict[str, List[str]] = {}
+    for c in candidates:
+        page = _safe_str(c.source_page)
+        sym = _normalize_symbol(c.symbol)
+        if page and sym:
+            by_page.setdefault(page, [])
+            if sym not in by_page[page]:
+                by_page[page].append(sym)
+
+    if not by_page:
+        return {}
+
+    conc = _env_int("TOP10_PAGE_BACKFILL_CONCURRENCY", 4, lo=1, hi=10)
+    sem = asyncio.Semaphore(conc)
+    out: Dict[str, Dict[str, Any]] = {}
+
+    async def one(page: str, syms: List[str]) -> None:
+        async with sem:
+            body_page = dict(body or {})
+            body_page.update(
+                {
+                    "sheet": page,
+                    "sheet_name": page,
+                    "page": page,
+                    "tab": page,
+                    "name": page,
+                    "symbols": list(syms),
+                    "tickers": list(syms),
+                    "selected_symbols": list(syms),
+                    "direct_symbols": list(syms),
+                    "limit": max(len(syms), 10),
+                    "schema_only": False,
+                    "headers_only": False,
+                }
+            )
+            try:
+                rows = await _get_page_rows_live(
+                    engine,
+                    page,
+                    limit=max(len(syms), 10),
+                    mode=mode,
+                    body=body_page,
+                )
+            except Exception:
+                rows = []
+
+            for row in rows:
+                sym = _extract_symbol_from_row(row)
+                if sym and sym in syms:
+                    cur = _coerce_mapping(out.get(sym))
+                    merged = _merge_non_null_overwrite(cur, _coerce_mapping(row))
+                    out[sym] = merged
+
+    await asyncio.gather(*(one(p, s) for p, s in by_page.items()), return_exceptions=True)
     return out
 
 
@@ -1894,14 +2126,39 @@ async def select_top10(
                 enrich_map = {}
         stage_ms["final_enrich_ms"] = round((time.time() - stage_started) * 1000.0, 3)
 
+        # ---------------------------------------------------------------------
+        # Stage 8: source-page backfill for selected Top-N
+        # ---------------------------------------------------------------------
+        stage_started = time.time()
+        page_backfill_map: Dict[str, Dict[str, Any]] = {}
+        if top:
+            try:
+                page_backfill_map = await _fetch_selected_page_rows(engine, top, mode=mode or "", body=body or {})
+            except Exception as e:
+                warnings.append(f"page_backfill_failed:{e}")
+                page_backfill_map = {}
+        stage_ms["selected_page_backfill_ms"] = round((time.time() - stage_started) * 1000.0, 3)
+
+        # Merge all known sources for final candidates
         for c in top:
-            e = enrich_map.get(c.symbol)
-            if isinstance(e, dict) and e:
-                merged = dict(c.row)
-                merged.update(e)
-                merged["symbol"] = c.symbol
-                merged["source_page"] = c.source_page
-                c.row = merged
+            srcs: List[Dict[str, Any]] = []
+            base_row = _coerce_mapping(c.row)
+            quote_row = _coerce_mapping(qmap.get(c.symbol))
+            page_row = _coerce_mapping(page_backfill_map.get(c.symbol))
+            enrich_row = _coerce_mapping(enrich_map.get(c.symbol))
+
+            for src in (base_row, quote_row, page_row, enrich_row):
+                if src:
+                    srcs.append(src)
+
+            srcs.sort(key=_row_richness_score)
+            merged: Dict[str, Any] = {}
+            for src in srcs:
+                merged = _merge_non_null_overwrite(merged, src)
+
+            merged["symbol"] = c.symbol
+            merged["source_page"] = c.source_page
+            c.row = merged
 
         total_ms = round((time.time() - t0) * 1000.0, 3)
 
@@ -1933,6 +2190,10 @@ async def select_top10(
                 "min_volume": criteria.min_volume,
                 "use_liquidity_tiebreak": criteria.use_liquidity_tiebreak,
                 "enforce_risk_confidence": criteria.enforce_risk_confidence,
+            },
+            "hydration": {
+                "batch_quote_sparse_symbols": len([s for s in (enrich_map or {}).keys() if _is_sparse_quote_like(enrich_map.get(s))]),
+                "selected_page_backfill_rows": len(page_backfill_map),
             },
             "warnings": warnings,
             "fallback_trace": fallback_trace,
@@ -1982,14 +2243,12 @@ def _registry_sheet_obj(registry: Any, sheet_name: str) -> Any:
     if registry is None:
         return None
 
-    # direct mapping
     if isinstance(registry, dict):
         if sheet_name in registry:
             return registry.get(sheet_name)
         norm = {_norm_key(k): v for k, v in registry.items()}
         return norm.get(_norm_key(sheet_name))
 
-    # object with attributes
     for attr in ("sheets", "registry", "specs", "schemas", "sheet_specs"):
         obj = getattr(registry, attr, None)
         if isinstance(obj, dict):
@@ -2004,11 +2263,9 @@ def _registry_sheet_obj(registry: Any, sheet_name: str) -> Any:
 
 
 def _get_top10_schema() -> Tuple[List[str], List[str], Set[str], str, List[str]]:
-    # Primary: canonical schema registry function
     try:
         from core.sheets import schema_registry as sr  # type: ignore
 
-        # 1) get_sheet_spec(...)
         get_sheet_spec = getattr(sr, "get_sheet_spec", None)
         if callable(get_sheet_spec):
             for name in (TOP10_PAGE_NAME, "Top10_Investments", "Top 10 Investments"):
@@ -2043,7 +2300,6 @@ def _get_top10_schema() -> Tuple[List[str], List[str], Set[str], str, List[str]]
                 except Exception:
                     pass
 
-        # 2) registry-like dict/object
         for attr in ("SCHEMA_REGISTRY", "SHEET_SPECS", "REGISTRY", "SCHEMA_BY_SHEET", "SHEETS"):
             reg = getattr(sr, attr, None)
             sheet_obj = _registry_sheet_obj(reg, TOP10_PAGE_NAME)
@@ -2076,7 +2332,6 @@ def _get_top10_schema() -> Tuple[List[str], List[str], Set[str], str, List[str]]
     except Exception:
         pass
 
-    # Minimal but safe fallback
     keys = [
         "symbol",
         "name",
@@ -2301,9 +2556,100 @@ def _mirror_runtime_aliases(raw: Dict[str, Any], *, rank: int, criteria: Criteri
         raw["Criteria Snapshot"] = raw.get("criteria_snapshot")
 
 
+def _backfill_alias_fields(raw: Dict[str, Any]) -> None:
+    alias_map: Dict[str, Tuple[str, ...]] = {
+        "name": ("Name", "company_name", "long_name", "instrument_name"),
+        "asset_class": ("Asset Class", "type", "instrument_type"),
+        "exchange": ("Exchange", "market", "mic"),
+        "currency": ("Currency", "ccy"),
+        "country": ("Country", "country_name"),
+        "sector": ("Sector", "sector_name", "gics_sector"),
+        "industry": ("Industry", "industry_name", "gics_industry"),
+        "current_price": ("Current Price", "price", "last", "close"),
+        "previous_close": ("Previous Close", "prev_close"),
+        "open_price": ("Open",),
+        "day_high": ("Day High", "high"),
+        "day_low": ("Day Low", "low"),
+        "week_52_high": ("52W High", "52w_high", "high_52w"),
+        "week_52_low": ("52W Low", "52w_low", "low_52w"),
+        "volume": ("Volume",),
+        "avg_volume_10d": ("Avg Volume 10D",),
+        "avg_volume_30d": ("Avg Volume 30D",),
+        "market_cap": ("Market Cap",),
+        "beta_5y": ("Beta (5Y)",),
+        "pe_ttm": ("P/E (TTM)",),
+        "pe_forward": ("P/E (Forward)",),
+        "eps_ttm": ("EPS (TTM)",),
+        "dividend_yield": ("Dividend Yield",),
+        "payout_ratio": ("Payout Ratio",),
+        "revenue_ttm": ("Revenue (TTM)",),
+        "revenue_growth_yoy": ("Revenue Growth YoY",),
+        "gross_margin": ("Gross Margin",),
+        "operating_margin": ("Operating Margin",),
+        "profit_margin": ("Profit Margin",),
+        "debt_to_equity": ("Debt/Equity",),
+        "free_cash_flow_ttm": ("Free Cash Flow (TTM)",),
+        "rsi_14": ("RSI (14)",),
+        "volatility_30d": ("Volatility 30D",),
+        "volatility_90d": ("Volatility 90D",),
+        "max_drawdown_1y": ("Max Drawdown 1Y",),
+        "var_95_1d": ("VaR 95% (1D)",),
+        "sharpe_1y": ("Sharpe (1Y)",),
+        "risk_score": ("Risk Score", "risk"),
+        "risk_bucket": ("Risk Bucket",),
+        "pb_ratio": ("P/B", "pb"),
+        "ps_ratio": ("P/S", "ps"),
+        "ev_ebitda": ("EV/EBITDA",),
+        "peg_ratio": ("PEG", "peg"),
+        "intrinsic_value": ("Intrinsic Value",),
+        "valuation_score": ("Valuation Score",),
+        "forecast_price_1m": ("Forecast Price 1M",),
+        "forecast_price_3m": ("Forecast Price 3M",),
+        "forecast_price_12m": ("Forecast Price 12M",),
+        "expected_roi_1m": ("Expected ROI 1M",),
+        "expected_roi_3m": ("Expected ROI 3M",),
+        "expected_roi_12m": ("Expected ROI 12M",),
+        "forecast_confidence": ("Forecast Confidence", "confidence", "Confidence Score"),
+        "confidence_score": ("Confidence Score",),
+        "confidence_bucket": ("Confidence Bucket",),
+        "value_score": ("Value Score",),
+        "quality_score": ("Quality Score",),
+        "momentum_score": ("Momentum Score",),
+        "growth_score": ("Growth Score",),
+        "overall_score": ("Overall Score",),
+        "opportunity_score": ("Opportunity Score",),
+        "rank_overall": ("Rank (Overall)",),
+        "recommendation": ("Recommendation",),
+        "recommendation_reason": ("Recommendation Reason",),
+        "horizon_days": ("Horizon Days",),
+        "invest_period_label": ("Invest Period Label",),
+        "position_qty": ("Position Qty",),
+        "avg_cost": ("Avg Cost",),
+        "position_cost": ("Position Cost",),
+        "position_value": ("Position Value",),
+        "unrealized_pl": ("Unrealized P/L",),
+        "unrealized_pl_pct": ("Unrealized P/L %",),
+        "data_provider": ("Data Provider", "provider", "source"),
+        "last_updated_utc": ("Last Updated (UTC)",),
+        "last_updated_riyadh": ("Last Updated (Riyadh)",),
+        "warnings": ("Warnings", "warning"),
+    }
+
+    for dst, srcs in alias_map.items():
+        if _has_value(raw.get(dst)):
+            continue
+        for src in srcs:
+            v = raw.get(src)
+            if _has_value(v):
+                raw[dst] = v
+                break
+
+
 def _ensure_required_top10_fields(raw: Dict[str, Any], *, rank: int, criteria: Criteria, horizon: str, mode: str) -> None:
     roi_key = horizon_to_roi_key(horizon)
     forecast_price_key = horizon_to_forecast_price_key(horizon)
+
+    _backfill_alias_fields(raw)
 
     raw.setdefault("name", raw.get("company_name") or raw.get("long_name") or raw.get("instrument_name") or raw.get("Name") or "")
     raw.setdefault("current_price", raw.get("price") or raw.get("last") or raw.get("close") or raw.get("Current Price"))
@@ -2332,6 +2678,16 @@ def _ensure_required_top10_fields(raw: Dict[str, Any], *, rank: int, criteria: C
     _ensure_recommendation_reason(raw, roi_key)
     _ensure_rank_overall(raw, rank)
     _ensure_period_fields(raw, criteria, horizon)
+
+    if not _safe_str(raw.get("risk_bucket")):
+        rb = _bucket_from_risk_score(raw.get("risk_score"))
+        if rb:
+            raw["risk_bucket"] = rb
+
+    if not _safe_str(raw.get("confidence_bucket")):
+        cb = _bucket_from_confidence(raw.get("forecast_confidence") if raw.get("forecast_confidence") is not None else raw.get("confidence_score"))
+        if cb:
+            raw["confidence_bucket"] = cb
 
     if raw.get(forecast_price_key) is None and raw.get("current_price") is not None and raw.get(roi_key) is not None:
         cp = _safe_float(raw.get("current_price"), None)
@@ -2672,11 +3028,6 @@ async def build_top10_output_rows(
     mode: str = "",
     **kwargs: Any,
 ) -> Dict[str, Any]:
-    """
-    Route-compatible public alias.
-    Historically this name appeared in dispatcher call chains, so it must accept
-    the same flexible keyword signature as build_top10_rows(...).
-    """
     return await build_top10_rows(
         engine=engine,
         request=request,
