@@ -2,7 +2,7 @@
 # routes/enriched_quote.py
 """
 ================================================================================
-TFB Enriched Quote Routes Wrapper — v6.7.0
+TFB Enriched Quote Routes Wrapper — v6.8.0
 ================================================================================
 RENDER-SAFE • SCHEMA-AWARE • PAGE-DISPATCH SAFE • HEADER/ROW BALANCED
 SPECIAL-BUILDER PRESERVING • ASYNC-SAFE • GET+POST COMPATIBLE
@@ -10,23 +10,22 @@ QUERY/BODY MERGE • LEGACY ALIAS SAFE • TABLE-MODE SAFE • CORE-WRAPPER SAFE
 TOP10-SPECIAL SAFE • SCHEMA-ONLY SAFE • TIMEOUT-GUARDED • NULL-SAFE
 JSON-SAFE • CONTRACT-HARDENED • SPECIAL-ROUTE FAIL-SAFE
 ENGINE-FALLBACK SAFE • HYDRATION-HARDENED • SPARSE-QUOTE SAFE
-HYPHEN-ALIAS RESTORED • BACKWARD-COMPATIBLE
+HYPHEN-ALIAS RESTORED • BACKWARD-COMPATIBLE • ROOT-BRIDGE SAFE-FALLBACK
 
 Why this revision
 -----------------
-- ✅ FIX: restores old public compatibility paths expected by smoke tests / legacy clients:
+- ✅ FIX: preserves old public compatibility paths expected by smoke tests / legacy clients:
         - /v1/enriched-quote
         - /v1/enriched-quote/quote
         - /v1/enriched-quote/quotes
         - /v1/enriched-quote/sheet-rows
 - ✅ FIX: exact GET/POST bridge on /v1/enriched-quote routes page/sheet requests to sheet-rows
         and single-symbol requests to quote logic
-- ✅ FIX: preserves currently working route families:
-        - /v1/enriched/quote
-        - /v1/enriched/quotes
-        - /v1/enriched/sheet-rows
-        - /v1/enriched_quote/quote
-        - /v1/enriched_quote/sheet-rows
+- ✅ FIX: hyphen root bridge now explicitly treats special pages
+        (Top_10_Investments / Insights_Analysis / Data_Dictionary) as sheet-rows requests
+- ✅ FIX: unexpected special-page dispatch errors now degrade to JSON partial/schema-safe payloads
+        instead of bubbling to 502
+- ✅ FIX: special routes remain non-fatal even if local builder / engine fallback misbehaves
 - ✅ FIX: `_strip(None)` never leaks the literal string "None"
 - ✅ FIX: all route payloads are JSON-safe (NaN/Inf/datetime/Decimal/set handled)
 - ✅ FIX: explicit special-page dispatch for Top_10_Investments / Insights_Analysis / Data_Dictionary
@@ -39,7 +38,6 @@ Why this revision
         headers + keys + rows + rows_matrix + quotes + data + meta
 - ✅ FIX: schema-only handling for special pages avoids heavy execution when explicitly requested
 - ✅ FIX: table-mode fallback preserves payload shape more safely
-- ✅ FIX: special routes avoid escalations to 502 where possible
 - ✅ SAFE: no network I/O at import-time
 - ✅ SAFE: no Prometheus metric creation here
 
@@ -89,7 +87,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 
 logger = logging.getLogger("routes.enriched_quote")
 
-ROUTER_VERSION = "6.7.0"
+ROUTER_VERSION = "6.8.0"
 
 # Kept lazy for dynamic mount behavior
 router: Optional[APIRouter] = None
@@ -1744,6 +1742,17 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             }
         )
 
+    def _page_from_body(body: Mapping[str, Any]) -> str:
+        return _strip(
+            body.get("page")
+            or body.get("sheet_name")
+            or body.get("sheetName")
+            or body.get("sheet")
+            or body.get("name")
+            or body.get("tab")
+            or ""
+        )
+
     @enriched.get("/health", include_in_schema=False)
     async def enriched_health() -> Dict[str, Any]:
         return await _health_payload()
@@ -2095,88 +2104,109 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         engine = await svc.get_engine(request)
 
         if route_family != "instrument":
-            if _special_schema_only_requested(body_prepared):
-                return svc.build_schema_only_payload(
-                    page_norm=page_norm,
+            try:
+                if _special_schema_only_requested(body_prepared):
+                    return svc.build_schema_only_payload(
+                        page_norm=page_norm,
+                        route_family=route_family,
+                        headers=headers,
+                        keys=schema_keys,
+                        include_headers=include_headers,
+                        include_matrix=include_matrix,
+                        request_id=request_id,
+                        started_at=start,
+                        mode=mode_q,
+                        dispatch_name=f"{route_family}_schema_only",
+                    )
+
+                if route_family == "dictionary":
+                    return await svc.build_dictionary_page_payload(
+                        engine=engine,
+                        request=request,
+                        page_norm=page_norm,
+                        headers=headers,
+                        keys=schema_keys,
+                        body=body_prepared,
+                        limit=top_n,
+                        include_headers=include_headers,
+                        include_matrix=include_matrix,
+                        request_id=request_id,
+                        started_at=start,
+                        mode=mode_q,
+                    )
+
+                if route_family == "insights":
+                    return await svc.build_special_builder_payload(
+                        builder=svc.build_insights_rows,
+                        dispatch_name="insights_builder",
+                        route_family=route_family,
+                        request=request,
+                        engine=engine,
+                        page_norm=page_norm,
+                        headers=headers,
+                        keys=schema_keys,
+                        body=body_prepared,
+                        limit=top_n,
+                        include_headers=include_headers,
+                        include_matrix=include_matrix,
+                        request_id=request_id,
+                        started_at=start,
+                        mode=mode_q,
+                    )
+
+                if route_family == "top10":
+                    return await svc.build_special_builder_payload(
+                        builder=svc.build_top10_rows,
+                        dispatch_name="top10_selector",
+                        route_family=route_family,
+                        request=request,
+                        engine=engine,
+                        page_norm=page_norm,
+                        headers=headers,
+                        keys=schema_keys,
+                        body=body_prepared,
+                        limit=top_n,
+                        include_headers=include_headers,
+                        include_matrix=include_matrix,
+                        request_id=request_id,
+                        started_at=start,
+                        mode=mode_q,
+                    )
+
+                return svc._envelope(
+                    status="success",
+                    page=page_norm,
                     route_family=route_family,
                     headers=headers,
                     keys=schema_keys,
+                    rows=[],
                     include_headers=include_headers,
                     include_matrix=include_matrix,
                     request_id=request_id,
                     started_at=start,
                     mode=mode_q,
-                    dispatch_name=f"{route_family}_schema_only",
+                    dispatch="special_unknown",
                 )
-
-            if route_family == "dictionary":
-                return await svc.build_dictionary_page_payload(
-                    engine=engine,
-                    request=request,
-                    page_norm=page_norm,
-                    headers=headers,
-                    keys=schema_keys,
-                    body=body_prepared,
-                    limit=top_n,
-                    include_headers=include_headers,
-                    include_matrix=include_matrix,
-                    request_id=request_id,
-                    started_at=start,
-                    mode=mode_q,
-                )
-
-            if route_family == "insights":
-                return await svc.build_special_builder_payload(
-                    builder=svc.build_insights_rows,
-                    dispatch_name="insights_builder",
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.exception("Special sheet-rows dispatch failed for page=%s family=%s", page_norm, route_family)
+                return svc._envelope(
+                    status="partial",
+                    page=page_norm,
                     route_family=route_family,
-                    request=request,
-                    engine=engine,
-                    page_norm=page_norm,
                     headers=headers,
                     keys=schema_keys,
-                    body=body_prepared,
-                    limit=top_n,
+                    rows=[],
                     include_headers=include_headers,
                     include_matrix=include_matrix,
                     request_id=request_id,
                     started_at=start,
                     mode=mode_q,
+                    dispatch="special_dispatch_safe_fallback",
+                    error=f"{type(e).__name__}: {e}",
+                    extra_meta={"warning": "special_dispatch_exception"},
                 )
-
-            if route_family == "top10":
-                return await svc.build_special_builder_payload(
-                    builder=svc.build_top10_rows,
-                    dispatch_name="top10_selector",
-                    route_family=route_family,
-                    request=request,
-                    engine=engine,
-                    page_norm=page_norm,
-                    headers=headers,
-                    keys=schema_keys,
-                    body=body_prepared,
-                    limit=top_n,
-                    include_headers=include_headers,
-                    include_matrix=include_matrix,
-                    request_id=request_id,
-                    started_at=start,
-                    mode=mode_q,
-                )
-
-            return svc._envelope(
-                status="success",
-                page=page_norm,
-                route_family=route_family,
-                headers=headers,
-                keys=schema_keys,
-                rows=[],
-                include_headers=include_headers,
-                include_matrix=include_matrix,
-                request_id=request_id,
-                started_at=start,
-                mode=mode_q,
-                dispatch="special_unknown",
-            )
 
         if not symbols:
             payload = await svc.call_table_mode_best_effort(
@@ -2270,39 +2300,76 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         Backward-compatible bridge for the old /v1/enriched-quote root path.
 
         Decision rule:
-        - single-symbol request with no explicit sheet selector -> single quote handler
+        - single-symbol request with no explicit page/sheet selector and instrument family -> single quote handler
         - otherwise -> sheet rows handler
+
+        Special pages are always delegated to sheet-rows flow.
+        Unexpected bridge failures degrade to JSON partial payloads instead of 502.
         """
+        start = time.time()
+        request_id = _request_id(request, x_request_id)
+
         prepared = dict(body or {})
+
+        page_raw = _page_from_body(prepared)
+        page_norm = svc.normalize_page(page_raw or "Market_Leaders")
+        route_family = svc.route_family(page_norm)
+
         symbol = _strip(prepared.get("symbol") or prepared.get("ticker") or prepared.get("requested_symbol"))
         list_symbols = _get_list(prepared, "symbols", "tickers", "tickers_list")
-        explicit_sheet_selector = any(
-            _strip(prepared.get(k))
-            for k in ("sheet", "sheet_name", "name", "tab")
-        )
-        page_q = _strip(prepared.get("page"))
+        explicit_selector = bool(page_raw)
 
-        if symbol and not list_symbols and not explicit_sheet_selector:
-            return await _handle_single_quote(
+        # Force sheet-rows handling for any special page or any explicit selector/list request
+        force_sheet_rows = explicit_selector or bool(list_symbols) or (route_family != "instrument")
+
+        try:
+            if symbol and not force_sheet_rows:
+                return await _handle_single_quote(
+                    request=request,
+                    body=prepared,
+                    page_q=_strip(prepared.get("page")),
+                    mode_q=mode_q,
+                    token_q=token_q,
+                    x_app_token=x_app_token,
+                    authorization=authorization,
+                    x_request_id=x_request_id,
+                )
+
+            return await _handle_sheet_rows(
                 request=request,
                 body=prepared,
-                page_q=page_q,
                 mode_q=mode_q,
                 token_q=token_q,
                 x_app_token=x_app_token,
                 authorization=authorization,
                 x_request_id=x_request_id,
             )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.exception("Hyphen root bridge failed for page=%s family=%s", page_norm, route_family)
+            headers, keys = svc.schema_for_page(page_norm)
+            schema_keys = keys or ["symbol", "error"]
 
-        return await _handle_sheet_rows(
-            request=request,
-            body=prepared,
-            mode_q=mode_q,
-            token_q=token_q,
-            x_app_token=x_app_token,
-            authorization=authorization,
-            x_request_id=x_request_id,
-        )
+            return svc._envelope(
+                status="partial",
+                page=page_norm,
+                route_family=route_family,
+                headers=headers,
+                keys=schema_keys,
+                rows=[],
+                include_headers=True,
+                include_matrix=True,
+                request_id=request_id,
+                started_at=start,
+                mode=mode_q,
+                dispatch="hyphen_bridge_safe_fallback",
+                error=f"{type(e).__name__}: {e}",
+                extra_meta={
+                    "warning": "hyphen_bridge_exception",
+                    "forced_sheet_rows": force_sheet_rows,
+                },
+            )
 
     # -------------------------------------------------------------------------
     # Routes: POST quote
