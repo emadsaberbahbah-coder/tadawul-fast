@@ -2,7 +2,7 @@
 # routes/enriched_quote.py
 """
 ================================================================================
-TFB Enriched Quote Routes Wrapper — v6.8.0
+TFB Enriched Quote Routes Wrapper — v6.9.0
 ================================================================================
 RENDER-SAFE • SCHEMA-AWARE • PAGE-DISPATCH SAFE • HEADER/ROW BALANCED
 SPECIAL-BUILDER PRESERVING • ASYNC-SAFE • GET+POST COMPATIBLE
@@ -10,10 +10,17 @@ QUERY/BODY MERGE • LEGACY ALIAS SAFE • TABLE-MODE SAFE • CORE-WRAPPER SAFE
 TOP10-SPECIAL SAFE • SCHEMA-ONLY SAFE • TIMEOUT-GUARDED • NULL-SAFE
 JSON-SAFE • CONTRACT-HARDENED • SPECIAL-ROUTE FAIL-SAFE
 ENGINE-FALLBACK SAFE • HYDRATION-HARDENED • SPARSE-QUOTE SAFE
-HYPHEN-ALIAS RESTORED • BACKWARD-COMPATIBLE • ROOT-BRIDGE SAFE-FALLBACK
+HYPHEN-ALIAS RESTORED • BACKWARD-COMPATIBLE • THREAD-OFFLOADED
 
 Why this revision
 -----------------
+- ✅ FIX: special builders and engine sheet-row fallbacks are now thread-offloaded
+        when they are synchronous, so they do not block the event loop
+- ✅ FIX: timeout guards now actually protect sync-heavy special builders
+        (Insights / Top10 / Dictionary)
+- ✅ FIX: root /v1/enriched-quote bridge remains backward-compatible
+- ✅ FIX: unexpected special-page failures degrade to JSON partial/schema-safe payloads
+        instead of bubbling into blank-body 502s where possible
 - ✅ FIX: preserves old public compatibility paths expected by smoke tests / legacy clients:
         - /v1/enriched-quote
         - /v1/enriched-quote/quote
@@ -21,11 +28,6 @@ Why this revision
         - /v1/enriched-quote/sheet-rows
 - ✅ FIX: exact GET/POST bridge on /v1/enriched-quote routes page/sheet requests to sheet-rows
         and single-symbol requests to quote logic
-- ✅ FIX: hyphen root bridge now explicitly treats special pages
-        (Top_10_Investments / Insights_Analysis / Data_Dictionary) as sheet-rows requests
-- ✅ FIX: unexpected special-page dispatch errors now degrade to JSON partial/schema-safe payloads
-        instead of bubbling to 502
-- ✅ FIX: special routes remain non-fatal even if local builder / engine fallback misbehaves
 - ✅ FIX: `_strip(None)` never leaks the literal string "None"
 - ✅ FIX: all route payloads are JSON-safe (NaN/Inf/datetime/Decimal/set handled)
 - ✅ FIX: explicit special-page dispatch for Top_10_Investments / Insights_Analysis / Data_Dictionary
@@ -40,33 +42,6 @@ Why this revision
 - ✅ FIX: table-mode fallback preserves payload shape more safely
 - ✅ SAFE: no network I/O at import-time
 - ✅ SAFE: no Prometheus metric creation here
-
-Behavior
---------
-Supported route families:
-- instrument pages      -> engine-backed quote rows
-- insights page         -> local insights builder if available, then engine fallback
-- top10 page            -> local top10 builder if available, then engine fallback
-- data_dictionary page  -> local data dictionary builder if available, then engine fallback
-
-Compatibility routes
---------------------
-- GET/POST /quote
-- GET/POST /quotes
-- GET/POST /sheet-rows
-
-- GET/POST /v1/enriched/quote
-- GET/POST /v1/enriched/quotes
-- GET/POST /v1/enriched/sheet-rows
-
-- GET/POST /v1/enriched_quote/quote
-- GET/POST /v1/enriched_quote/quotes
-- GET/POST /v1/enriched_quote/sheet-rows
-
-- GET/POST /v1/enriched-quote
-- GET/POST /v1/enriched-quote/quote
-- GET/POST /v1/enriched-quote/quotes
-- GET/POST /v1/enriched-quote/sheet-rows
 """
 
 from __future__ import annotations
@@ -87,9 +62,8 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 
 logger = logging.getLogger("routes.enriched_quote")
 
-ROUTER_VERSION = "6.8.0"
+ROUTER_VERSION = "6.9.0"
 
-# Kept lazy for dynamic mount behavior
 router: Optional[APIRouter] = None
 
 
@@ -335,6 +309,20 @@ async def _maybe_await(v: Any) -> Any:
     return v
 
 
+async def _call_func_threadsafe(fn: Any, *args: Any, **kwargs: Any) -> Any:
+    """
+    Call async callables directly, but offload sync callables to a worker thread.
+    This is the key protection for heavy sync special builders and sync engine methods.
+    """
+    if inspect.iscoroutinefunction(fn):
+        return await fn(*args, **kwargs)
+
+    result = await asyncio.to_thread(fn, *args, **kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
 def _normalize_item_to_row(item: Any, keys: Sequence[str]) -> Dict[str, Any]:
     if isinstance(item, Mapping):
         return {k: _json_safe(item.get(k)) for k in keys}
@@ -351,10 +339,6 @@ def _normalize_item_to_row(item: Any, keys: Sequence[str]) -> Dict[str, Any]:
     if keys:
         out[keys[0]] = _json_safe(item)
     return out
-
-
-def _dict_or_empty(v: Any) -> Dict[str, Any]:
-    return v if isinstance(v, dict) else {}
 
 
 def _first_list(*vals: Any) -> List[Any]:
@@ -567,15 +551,11 @@ def _normalize_symbol_token(sym: Any) -> str:
 def _symbol_match_candidates(sym: Any) -> List[str]:
     base = _strip(sym)
     norm = _normalize_symbol_token(base)
-    items = [
-        base,
-        base.upper(),
-        norm,
-        norm.upper(),
-    ]
+    items = [base, base.upper(), norm, norm.upper()]
     if norm.endswith(".SR"):
         code = norm[:-3]
         items.extend([code, code.upper(), f"TADAWUL:{code}"])
+
     seen = set()
     out: List[str] = []
     for item in items:
@@ -631,12 +611,10 @@ def _is_sparse_payload_row(d: Optional[Dict[str, Any]], threshold: int = 10) -> 
 class _Service:
     def __init__(self, reason: str):
         self.reason = reason
-        self.special_builder_timeout_sec = max(
-            0.0,
-            _get_float_env("TFB_SPECIAL_BUILDER_TIMEOUT_SEC", 45.0),
-        )
+        self.special_builder_timeout_sec = max(0.0, _get_float_env("TFB_SPECIAL_BUILDER_TIMEOUT_SEC", 45.0))
+        self.engine_call_timeout_sec = max(0.0, _get_float_env("TFB_ENGINE_CALL_TIMEOUT_SEC", 45.0))
+        self.quote_call_timeout_sec = max(0.0, _get_float_env("TFB_QUOTE_CALL_TIMEOUT_SEC", 45.0))
 
-        # ---------------- Auth helpers (optional) ----------------
         try:
             from core.config import auth_ok as _auth_ok  # type: ignore
             from core.config import get_settings_cached as _get_settings_cached  # type: ignore
@@ -649,7 +627,6 @@ class _Service:
         self._auth_ok = _auth_ok
         self._get_settings_cached = _get_settings_cached
 
-        # ---------------- Schema / page catalog helpers ----------------
         try:
             from core.sheets.page_catalog import (  # type: ignore
                 CANONICAL_PAGES,
@@ -687,7 +664,6 @@ class _Service:
             self.normalize_page_name = normalize_page_name
             self.get_sheet_spec = get_sheet_spec
 
-        # ---------------- Local builders (optional) ----------------
         try:
             from core.sheets.data_dictionary import build_data_dictionary_rows  # type: ignore
         except Exception:
@@ -720,9 +696,6 @@ class _Service:
             core_get_sheet_rows = None  # type: ignore
         self.core_get_sheet_rows = core_get_sheet_rows
 
-    # -----------------------------------------------------------------
-    # Auth
-    # -----------------------------------------------------------------
     def auth_guard(
         self,
         auth_token: str,
@@ -771,9 +744,6 @@ class _Service:
 
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
-    # -----------------------------------------------------------------
-    # Engine
-    # -----------------------------------------------------------------
     async def get_engine(self, request: Optional[Request] = None) -> Any:
         try:
             if request is not None:
@@ -795,9 +765,6 @@ class _Service:
         except Exception:
             return None
 
-    # -----------------------------------------------------------------
-    # Page normalization / routing
-    # -----------------------------------------------------------------
     def _fallback_normalize_page(self, raw: str) -> str:
         s = _strip(raw)
         if not s:
@@ -857,9 +824,6 @@ class _Service:
             pass
         return self._fallback_route_family(page)
 
-    # -----------------------------------------------------------------
-    # Schema
-    # -----------------------------------------------------------------
     def _schema_from_data_dictionary(self, page: str) -> Tuple[List[str], List[str]]:
         if not callable(self.build_data_dictionary_rows):
             return [], []
@@ -1010,7 +974,6 @@ class _Service:
 
     def _extract_from_raw(self, raw: Dict[str, Any], candidates: Sequence[str]) -> Any:
         raw_ci = {str(k).strip().lower(): v for k, v in raw.items()}
-
         for candidate in candidates:
             if candidate in raw:
                 return raw.get(candidate)
@@ -1022,7 +985,6 @@ class _Service:
     def normalize_row(self, keys: Sequence[str], raw: Mapping[str, Any], *, symbol_fallback: str = "") -> Dict[str, Any]:
         raw_dict = dict(raw or {})
         out: Dict[str, Any] = {}
-
         for k in keys:
             out[k] = _json_safe(self._extract_from_raw(raw_dict, self._key_variants(k)))
 
@@ -1036,9 +998,6 @@ class _Service:
 
         return out
 
-    # -----------------------------------------------------------------
-    # Payload parsers
-    # -----------------------------------------------------------------
     def extract_rows_like(self, payload: Any) -> List[Dict[str, Any]]:
         if payload is None:
             return []
@@ -1115,9 +1074,6 @@ class _Service:
         mx = self.extract_matrix_like(payload)
         return bool(mx)
 
-    # -----------------------------------------------------------------
-    # Flexible builder calling
-    # -----------------------------------------------------------------
     async def _call_builder_flexible(
         self,
         builder: Any,
@@ -1196,8 +1152,7 @@ class _Service:
 
         for kwargs in attempts:
             try:
-                result = builder(**kwargs)
-                return await _maybe_await(result)
+                return await _call_func_threadsafe(builder, **kwargs)
             except TypeError as e:
                 last_exc = e
                 continue
@@ -1358,9 +1313,6 @@ class _Service:
             extra_meta=extra_meta,
         )
 
-    # -----------------------------------------------------------------
-    # Table mode / engine page payload
-    # -----------------------------------------------------------------
     async def call_engine_page_payload_best_effort(
         self,
         *,
@@ -1402,13 +1354,22 @@ class _Service:
             last_exc: Optional[Exception] = None
             for args, kwargs in call_specs:
                 try:
-                    res = fn(*args, **kwargs)
-                    res = await _maybe_await(res)
+                    if self.engine_call_timeout_sec > 0:
+                        res = await asyncio.wait_for(
+                            _call_func_threadsafe(fn, *args, **kwargs),
+                            timeout=self.engine_call_timeout_sec,
+                        )
+                    else:
+                        res = await _call_func_threadsafe(fn, *args, **kwargs)
+
                     if isinstance(res, dict):
                         return _json_safe(res)
                     if isinstance(res, list):
                         return {"status": "success", "rows": _json_safe(res)}
                     return {"status": "success", "rows": []}
+                except asyncio.TimeoutError as e:
+                    last_exc = e
+                    continue
                 except TypeError as e:
                     last_exc = e
                     continue
@@ -1440,9 +1401,6 @@ class _Service:
             body=body,
         )
 
-    # -----------------------------------------------------------------
-    # Schema-only payloads
-    # -----------------------------------------------------------------
     def build_schema_only_payload(
         self,
         *,
@@ -1474,9 +1432,6 @@ class _Service:
             extra_meta={"schema_only": True, **(extra_meta or {})},
         )
 
-    # -----------------------------------------------------------------
-    # Specialized payload builders
-    # -----------------------------------------------------------------
     async def build_dictionary_page_payload(
         self,
         *,
@@ -1497,11 +1452,15 @@ class _Service:
 
         if callable(self.build_data_dictionary_rows):
             try:
-                try:
-                    rows_raw = self.build_data_dictionary_rows(include_meta_sheet=True)
-                except TypeError:
-                    rows_raw = self.build_data_dictionary_rows()
+                rows_raw = await _call_func_threadsafe(self.build_data_dictionary_rows, include_meta_sheet=True)
                 rows_out = self._normalize_rows_from_any(rows_raw, keys)
+            except TypeError:
+                try:
+                    rows_raw = await _call_func_threadsafe(self.build_data_dictionary_rows)
+                    rows_out = self._normalize_rows_from_any(rows_raw, keys)
+                except Exception as e:
+                    logger.warning("Data dictionary builder failed: %s", e)
+                    rows_out = []
             except Exception as e:
                 logger.warning("Data dictionary builder failed: %s", e)
                 rows_out = []
@@ -1719,9 +1678,6 @@ class _Service:
         return payload
 
 
-# =============================================================================
-# Router builder
-# =============================================================================
 def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
     svc = _Service(reason=reason)
     root = APIRouter(tags=["tfb"])
@@ -1816,9 +1772,6 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             }
         )
 
-    # -------------------------------------------------------------------------
-    # Instrument rows
-    # -------------------------------------------------------------------------
     async def _build_instrument_rows(
         page_norm: str,
         keys: Sequence[str],
@@ -1874,19 +1827,39 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             if callable(batch_fn):
                 got = None
                 try:
-                    got = batch_fn(symbols=list(symbols), mode=mode_q or "", schema=page_norm)
-                    got = await _maybe_await(got)
+                    if svc.quote_call_timeout_sec > 0:
+                        got = await asyncio.wait_for(
+                            _call_func_threadsafe(batch_fn, symbols=list(symbols), mode=mode_q or "", schema=page_norm),
+                            timeout=svc.quote_call_timeout_sec,
+                        )
+                    else:
+                        got = await _call_func_threadsafe(batch_fn, symbols=list(symbols), mode=mode_q or "", schema=page_norm)
                 except TypeError:
                     try:
-                        got = batch_fn(symbols=list(symbols), mode=mode_q or "")
-                        got = await _maybe_await(got)
+                        if svc.quote_call_timeout_sec > 0:
+                            got = await asyncio.wait_for(
+                                _call_func_threadsafe(batch_fn, symbols=list(symbols), mode=mode_q or ""),
+                                timeout=svc.quote_call_timeout_sec,
+                            )
+                        else:
+                            got = await _call_func_threadsafe(batch_fn, symbols=list(symbols), mode=mode_q or "")
                     except TypeError:
                         try:
-                            got = batch_fn(symbols=list(symbols))
-                            got = await _maybe_await(got)
+                            if svc.quote_call_timeout_sec > 0:
+                                got = await asyncio.wait_for(
+                                    _call_func_threadsafe(batch_fn, symbols=list(symbols)),
+                                    timeout=svc.quote_call_timeout_sec,
+                                )
+                            else:
+                                got = await _call_func_threadsafe(batch_fn, symbols=list(symbols))
                         except TypeError:
-                            got = batch_fn(list(symbols))
-                            got = await _maybe_await(got)
+                            if svc.quote_call_timeout_sec > 0:
+                                got = await asyncio.wait_for(
+                                    _call_func_threadsafe(batch_fn, list(symbols)),
+                                    timeout=svc.quote_call_timeout_sec,
+                                )
+                            else:
+                                got = await _call_func_threadsafe(batch_fn, list(symbols))
 
                 if isinstance(got, dict):
                     for k, v in got.items():
@@ -1927,18 +1900,42 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
                     try:
                         if callable(per_dict_fn):
                             try:
-                                fresh = await _maybe_await(per_dict_fn(sym, schema=page_norm))
+                                if svc.quote_call_timeout_sec > 0:
+                                    fresh = await asyncio.wait_for(
+                                        _call_func_threadsafe(per_dict_fn, sym, schema=page_norm),
+                                        timeout=svc.quote_call_timeout_sec,
+                                    )
+                                else:
+                                    fresh = await _call_func_threadsafe(per_dict_fn, sym, schema=page_norm)
                             except TypeError:
                                 try:
-                                    fresh = await _maybe_await(per_dict_fn(sym))
+                                    if svc.quote_call_timeout_sec > 0:
+                                        fresh = await asyncio.wait_for(
+                                            _call_func_threadsafe(per_dict_fn, sym),
+                                            timeout=svc.quote_call_timeout_sec,
+                                        )
+                                    else:
+                                        fresh = await _call_func_threadsafe(per_dict_fn, sym)
                                 except Exception:
                                     fresh = {}
                         elif callable(per_fn):
                             try:
-                                fresh = await _maybe_await(per_fn(sym, schema=page_norm))
+                                if svc.quote_call_timeout_sec > 0:
+                                    fresh = await asyncio.wait_for(
+                                        _call_func_threadsafe(per_fn, sym, schema=page_norm),
+                                        timeout=svc.quote_call_timeout_sec,
+                                    )
+                                else:
+                                    fresh = await _call_func_threadsafe(per_fn, sym, schema=page_norm)
                             except TypeError:
                                 try:
-                                    fresh = await _maybe_await(per_fn(sym))
+                                    if svc.quote_call_timeout_sec > 0:
+                                        fresh = await asyncio.wait_for(
+                                            _call_func_threadsafe(per_fn, sym),
+                                            timeout=svc.quote_call_timeout_sec,
+                                        )
+                                    else:
+                                        fresh = await _call_func_threadsafe(per_fn, sym)
                                 except Exception:
                                     fresh = {}
                         fresh = fresh if isinstance(fresh, dict) else _model_to_dict(fresh)
@@ -1971,9 +1968,6 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             "sparse_after_rehydrate": sparse_after_rehydrate,
         }
 
-    # -------------------------------------------------------------------------
-    # Main handlers
-    # -------------------------------------------------------------------------
     async def _handle_single_quote(
         request: Request,
         body: Dict[str, Any],
@@ -2296,16 +2290,6 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         authorization: Optional[str],
         x_request_id: Optional[str],
     ) -> Dict[str, Any]:
-        """
-        Backward-compatible bridge for the old /v1/enriched-quote root path.
-
-        Decision rule:
-        - single-symbol request with no explicit page/sheet selector and instrument family -> single quote handler
-        - otherwise -> sheet rows handler
-
-        Special pages are always delegated to sheet-rows flow.
-        Unexpected bridge failures degrade to JSON partial payloads instead of 502.
-        """
         start = time.time()
         request_id = _request_id(request, x_request_id)
 
@@ -2319,7 +2303,6 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         list_symbols = _get_list(prepared, "symbols", "tickers", "tickers_list")
         explicit_selector = bool(page_raw)
 
-        # Force sheet-rows handling for any special page or any explicit selector/list request
         force_sheet_rows = explicit_selector or bool(list_symbols) or (route_family != "instrument")
 
         try:
@@ -2371,9 +2354,6 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
                 },
             )
 
-    # -------------------------------------------------------------------------
-    # Routes: POST quote
-    # -------------------------------------------------------------------------
     @enriched.post("/quote")
     async def enriched_quote_post(
         request: Request,
@@ -2413,9 +2393,6 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
     ) -> Dict[str, Any]:
         return await _handle_single_quote(request, body, page, mode, token, x_app_token, authorization, x_request_id)
 
-    # -------------------------------------------------------------------------
-    # Routes: GET quote
-    # -------------------------------------------------------------------------
     @enriched.get("/quote", include_in_schema=False)
     async def enriched_quote_get(
         request: Request,
@@ -2461,9 +2438,6 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         body = _collect_query_body_for_quote(symbol=symbol, ticker=ticker, page=page)
         return await _handle_single_quote(request, body, page, mode, token, x_app_token, authorization, x_request_id)
 
-    # -------------------------------------------------------------------------
-    # Routes: POST quotes (plural compatibility)
-    # -------------------------------------------------------------------------
     @enriched.post("/quotes", include_in_schema=False)
     async def enriched_quotes_post(
         request: Request,
@@ -2611,9 +2585,6 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         )
         return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
 
-    # -------------------------------------------------------------------------
-    # Routes: POST sheet-rows
-    # -------------------------------------------------------------------------
     @enriched.post("/sheet-rows")
     async def enriched_sheet_rows_post(
         request: Request,
@@ -2650,9 +2621,6 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
     ) -> Dict[str, Any]:
         return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
 
-    # -------------------------------------------------------------------------
-    # Routes: GET sheet-rows
-    # -------------------------------------------------------------------------
     @enriched.get("/sheet-rows")
     async def enriched_sheet_rows_get(
         request: Request,
@@ -2764,9 +2732,6 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         )
         return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
 
-    # -------------------------------------------------------------------------
-    # Routes: exact root compatibility bridge
-    # -------------------------------------------------------------------------
     @root.post("/v1/enriched-quote")
     async def enriched_hyphen_root_post(
         request: Request,
@@ -2836,9 +2801,6 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             x_request_id=x_request_id,
         )
 
-    # -------------------------------------------------------------------------
-    # Legacy aliases
-    # -------------------------------------------------------------------------
     @legacy.post("/quote")
     async def quote_alias_post(
         request: Request,
@@ -2965,7 +2927,6 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         )
         return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
 
-    # Important: wrapper routers first, optional core router last
     root.include_router(enriched)
     root.include_router(enriched_quote_alias)
     root.include_router(enriched_hyphen)
@@ -2980,14 +2941,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
     return root
 
 
-# =============================================================================
-# Router resolution
-# =============================================================================
 def get_router() -> APIRouter:
-    """
-    Lazily import and return the wrapper router.
-    If core.enriched_quote exists, include it AFTER wrapper routes so wrapper paths win.
-    """
     global router
     if router is not None:
         return router
@@ -3015,9 +2969,6 @@ def get_router() -> APIRouter:
 
 
 def mount(app: Any) -> None:
-    """
-    Dynamic loader hook.
-    """
     r = get_router()
     try:
         app.include_router(r)
