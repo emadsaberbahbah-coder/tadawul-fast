@@ -2,13 +2,14 @@
 # routes/data_dictionary.py
 """
 ================================================================================
-Schema Router — v2.3.0 (UNIFIED / REGISTRY-FIRST / SHEET-SPEC CONTRACT-HARDENED)
+Schema Router — v2.4.0 (UNIFIED / REGISTRY-FIRST / BACKWARD-COMPATIBLE)
 ================================================================================
 
 Endpoints
 ---------
 GET /v1/schema/data-dictionary
 GET /v1/schema/sheet-spec
+GET /v1/schema/spec                  (alias of /sheet-spec)
 GET /v1/schema/pages
 GET /v1/schema/health
 
@@ -22,16 +23,16 @@ Single schema router that exposes:
 
 Why this revision
 -----------------
-- ✅ FIX: /v1/schema/sheet-spec now accepts sheet / page / name / tab aliases
-- ✅ FIX: /v1/schema/sheet-spec no longer depends on one fragile schema_registry shape
-- ✅ FIX: /v1/schema/sheet-spec returns stable top-level headers/keys/columns for single sheet
-- ✅ FIX: /v1/schema/pages always returns pages/items/results/sheets arrays + optional page_items
-- ✅ FIX: Data_Dictionary rows/values are normalized and JSON-safe
-- ✅ FIX: registry-first resolution with graceful fallback to inferred Data_Dictionary specs
+- ✅ FIX: /v1/schema/sheet-spec works with or without sheet/page/name/tab
+- ✅ FIX: /v1/schema/spec alias added for backward compatibility
+- ✅ FIX: /v1/schema/pages now preserves canonical_pages + forbidden_pages
+- ✅ FIX: /v1/schema/pages also returns pages/items/results/sheets/page_items
+- ✅ FIX: /v1/schema/sheet-spec returns specs + sheet_specs containers
+- ✅ FIX: single-sheet requests return top-level headers/keys/columns/column_count
+- ✅ FIX: grouped all-sheets response is stable and JSON-safe
+- ✅ FIX: registry-first resolution with graceful Data_Dictionary inference fallback
 - ✅ FIX: handles dict-style, object-style, list-style, headers/keys-style schema safely
-- ✅ FIX: supports get_sheet_spec/get_sheet_headers/get_sheet_keys/list_sheets variants
 - ✅ FIX: safer auth calling across multiple core.config.auth_ok signatures
-- ✅ IMPROVE: schema health includes capability flags and route-contract diagnostics
 - ✅ SAFE: no quote engine / provider / network calls
 - ✅ SAFE: import-hardened for partial repo states
 ================================================================================
@@ -54,7 +55,7 @@ except Exception:  # pragma: no cover
     BestJSONResponse = JSONResponse  # type: ignore
 
 
-SCHEMA_ROUTE_VERSION = "2.3.0"
+SCHEMA_ROUTE_VERSION = "2.4.0"
 router = APIRouter(prefix="/v1/schema", tags=["Schema"])
 
 
@@ -70,6 +71,11 @@ _CANONICAL_PAGES_FALLBACK: List[str] = [
     "Insights_Analysis",
     "Top_10_Investments",
     "Data_Dictionary",
+]
+
+_FORBIDDEN_PAGES_FALLBACK: List[str] = [
+    "Advisor_Criteria",
+    "KSA_Tadawul",
 ]
 
 _DATA_DICTIONARY_HEADERS: List[str] = [
@@ -153,6 +159,7 @@ _CANONICAL_PAGES = _resolve_attr(_page_catalog_mod, "CANONICAL_PAGES")
 _SUPPORTED_PAGES = _resolve_attr(_page_catalog_mod, "SUPPORTED_PAGES")
 _PAGES = _resolve_attr(_page_catalog_mod, "PAGES")
 _PAGE_ALIASES = _resolve_attr(_page_catalog_mod, "PAGE_ALIASES")
+_FORBIDDEN_PAGES = _resolve_attr(_page_catalog_mod, "FORBIDDEN_PAGES", default=None)
 
 auth_ok = _resolve_attr(_config_mod, "auth_ok")
 is_open_mode = _resolve_attr(_config_mod, "is_open_mode")
@@ -334,6 +341,7 @@ def _is_public_path(path: str) -> bool:
         "/v1/schema/health",
         "/v1/schema/pages",
         "/v1/schema/sheet-spec",
+        "/v1/schema/spec",
         "/v1/schema/data-dictionary",
     }:
         return True
@@ -474,6 +482,16 @@ def _get_page_aliases() -> Dict[str, str]:
     aliases.setdefault("data dictionary", "Data_Dictionary")
 
     return aliases
+
+
+def _get_forbidden_pages() -> List[str]:
+    pages: List[str] = []
+
+    if isinstance(_FORBIDDEN_PAGES, (list, tuple, set)):
+        pages.extend(str(x).strip() for x in _FORBIDDEN_PAGES if str(x).strip())
+
+    pages.extend(_FORBIDDEN_PAGES_FALLBACK)
+    return _dedupe_keep_order(pages)
 
 
 def _normalize_page_candidate(name: Optional[str]) -> Optional[str]:
@@ -769,7 +787,6 @@ def _get_all_pages() -> List[str]:
 
 def _find_spec_in_registry(sheet_name: str) -> Any:
     if callable(_get_sheet_spec_callable):
-        # Try both positional and keyword-friendly variants
         for call in (
             lambda: _get_sheet_spec_callable(sheet_name),
             lambda: _get_sheet_spec_callable(sheet=sheet_name),
@@ -1070,6 +1087,8 @@ def get_schema_health(request: Request) -> BestJSONResponse:
         page_catalog_available=_page_catalog_mod is not None,
         pages_count=len(pages),
         pages=pages,
+        canonical_pages=pages,
+        forbidden_pages=_get_forbidden_pages(),
         settings=settings_summary,
         capabilities={
             "get_sheet_spec_callable": callable(_get_sheet_spec_callable),
@@ -1088,7 +1107,7 @@ def get_schema_health(request: Request) -> BestJSONResponse:
         response_contract={
             "data_dictionary_rows_shape": "headers + keys + rows + rows_matrix",
             "sheet_spec_grouped_shape": "data + optional top-level headers/keys/columns for single sheet",
-            "pages_shape": "pages + items + results + sheets + optional page_items",
+            "pages_shape": "canonical_pages + pages + items + results + sheets + page_items",
         },
     )
 
@@ -1178,6 +1197,112 @@ def get_data_dictionary(
         return _error(500, f"{type(e).__name__}: {e}", endpoint="data-dictionary", request_id=request_id)
 
 
+def _sheet_spec_response(
+    *,
+    request: Request,
+    endpoint_name: str,
+    sheet: Optional[str],
+    page: Optional[str],
+    name: Optional[str],
+    tab: Optional[str],
+    format: str,
+    include_aliases: Optional[str],
+    token: Optional[str],
+    x_app_token: Optional[str],
+    authorization: Optional[str],
+) -> BestJSONResponse:
+    request_id = _get_request_id(request)
+
+    if not _auth_passed(request=request, token=token, x_app_token=x_app_token, authorization=authorization):
+        return _error(401, "Invalid token", endpoint=endpoint_name, request_id=request_id)
+
+    fmt = (format or "grouped").strip().lower()
+    if fmt not in {"grouped", "flat", "headers", "keys"}:
+        return _error(
+            400,
+            "format must be 'grouped', 'flat', 'headers', or 'keys'",
+            endpoint=endpoint_name,
+            request_id=request_id,
+        )
+
+    try:
+        include_alias_map = _bool_q(include_aliases, True)
+        normalized_sheet = _resolve_requested_sheet_name(sheet=sheet, page=page, name=name, tab=tab)
+
+        if normalized_sheet:
+            spec = _get_sheet_spec_safe(normalized_sheet)
+            specs = {normalized_sheet: spec}
+        else:
+            specs = _get_all_sheet_specs()
+
+        if not specs:
+            return _error(404, "No sheet specifications available", endpoint=endpoint_name, request_id=request_id)
+
+        page_aliases = _get_page_aliases()
+
+        if fmt == "headers":
+            payload: Any = {name_: spec_["headers"] for name_, spec_ in specs.items()}
+        elif fmt == "keys":
+            payload = {name_: spec_["keys"] for name_, spec_ in specs.items()}
+        elif fmt == "flat":
+            payload = _build_flat_sheet_spec_rows(specs)
+        else:
+            payload = specs
+
+        page_names = list(specs.keys())
+
+        response: Dict[str, Any] = {
+            "format": fmt,
+            "sheet": normalized_sheet,
+            "page": normalized_sheet,
+            "name": normalized_sheet,
+            "tab": normalized_sheet,
+            "count": len(specs),
+            "pages": page_names,
+            "items": page_names,
+            "results": page_names,
+            "sheets": page_names,
+            "canonical_pages": page_names if normalized_sheet else _get_all_pages(),
+            "forbidden_pages": _get_forbidden_pages(),
+            "data": payload,
+            "specs": specs,
+            "sheet_specs": specs,
+            "response_contract": {
+                "single_sheet_top_level_projection": True,
+                "grouped_data_shape": "sheet -> {headers, keys, columns, column_count}",
+                "flat_data_shape": "list[dict]",
+                "json_safe_payload": True,
+            },
+        }
+
+        if include_alias_map:
+            response["aliases"] = page_aliases
+
+        if normalized_sheet and normalized_sheet in specs:
+            response["headers"] = specs[normalized_sheet]["headers"]
+            response["keys"] = specs[normalized_sheet]["keys"]
+            response["columns"] = specs[normalized_sheet]["columns"]
+            response["column_count"] = specs[normalized_sheet]["column_count"]
+
+            if fmt == "grouped":
+                response["data"] = specs[normalized_sheet]
+
+        return _response(
+            status_code=200,
+            status="success",
+            endpoint=endpoint_name,
+            request_id=request_id,
+            **response,
+        )
+
+    except KeyError as e:
+        return _error(404, str(e), endpoint=endpoint_name, request_id=request_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        return _error(500, f"{type(e).__name__}: {e}", endpoint=endpoint_name, request_id=request_id)
+
+
 @router.get("/sheet-spec")
 def get_sheet_spec_route(
     request: Request,
@@ -1200,92 +1325,56 @@ def get_sheet_spec_route(
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
 ) -> BestJSONResponse:
-    request_id = _get_request_id(request)
+    return _sheet_spec_response(
+        request=request,
+        endpoint_name="sheet-spec",
+        sheet=sheet,
+        page=page,
+        name=name,
+        tab=tab,
+        format=format,
+        include_aliases=include_aliases,
+        token=token,
+        x_app_token=x_app_token,
+        authorization=authorization,
+    )
 
-    if not _auth_passed(request=request, token=token, x_app_token=x_app_token, authorization=authorization):
-        return _error(401, "Invalid token", endpoint="sheet-spec", request_id=request_id)
 
-    fmt = (format or "grouped").strip().lower()
-    if fmt not in {"grouped", "flat", "headers", "keys"}:
-        return _error(
-            400,
-            "format must be 'grouped', 'flat', 'headers', or 'keys'",
-            endpoint="sheet-spec",
-            request_id=request_id,
-        )
-
-    try:
-        include_alias_map = _bool_q(include_aliases, True)
-        normalized_sheet = _resolve_requested_sheet_name(sheet=sheet, page=page, name=name, tab=tab)
-
-        if normalized_sheet:
-            spec = _get_sheet_spec_safe(normalized_sheet)
-            specs = {normalized_sheet: spec}
-        else:
-            specs = _get_all_sheet_specs()
-
-        if not specs:
-            return _error(404, "No sheet specifications available", endpoint="sheet-spec", request_id=request_id)
-
-        page_aliases = _get_page_aliases()
-
-        if fmt == "headers":
-            payload: Any = {name_: spec_["headers"] for name_, spec_ in specs.items()}
-        elif fmt == "keys":
-            payload = {name_: spec_["keys"] for name_, spec_ in specs.items()}
-        elif fmt == "flat":
-            flat_rows = _build_flat_sheet_spec_rows(specs)
-            payload = flat_rows
-        else:
-            payload = specs
-
-        response: Dict[str, Any] = {
-            "format": fmt,
-            "sheet": normalized_sheet,
-            "page": normalized_sheet,
-            "name": normalized_sheet,
-            "tab": normalized_sheet,
-            "count": len(specs),
-            "pages": list(specs.keys()),
-            "items": list(specs.keys()),
-            "results": list(specs.keys()),
-            "sheets": list(specs.keys()),
-            "data": payload,
-            "response_contract": {
-                "single_sheet_top_level_projection": True,
-                "grouped_data_shape": "sheet -> {headers, keys, columns, column_count}",
-                "flat_data_shape": "list[dict]",
-                "json_safe_payload": True,
-            },
-        }
-
-        if include_alias_map:
-            response["aliases"] = page_aliases
-
-        if normalized_sheet and normalized_sheet in specs:
-            response["headers"] = specs[normalized_sheet]["headers"]
-            response["keys"] = specs[normalized_sheet]["keys"]
-            response["columns"] = specs[normalized_sheet]["columns"]
-            response["column_count"] = specs[normalized_sheet]["column_count"]
-
-            # Make single-sheet response especially client-friendly
-            if fmt == "grouped":
-                response["data"] = specs[normalized_sheet]
-
-        return _response(
-            status_code=200,
-            status="success",
-            endpoint="sheet-spec",
-            request_id=request_id,
-            **response,
-        )
-
-    except KeyError as e:
-        return _error(404, str(e), endpoint="sheet-spec", request_id=request_id)
-    except HTTPException:
-        raise
-    except Exception as e:
-        return _error(500, f"{type(e).__name__}: {e}", endpoint="sheet-spec", request_id=request_id)
+@router.get("/spec")
+def get_spec_alias_route(
+    request: Request,
+    sheet: Optional[str] = Query(
+        default=None,
+        description="Optional canonical sheet name or alias. Also accepts page/name/tab aliases.",
+    ),
+    page: Optional[str] = Query(default=None, description="Alias of 'sheet'"),
+    name: Optional[str] = Query(default=None, description="Alias of 'sheet'"),
+    tab: Optional[str] = Query(default=None, description="Alias of 'sheet'"),
+    format: str = Query(
+        default="grouped",
+        description="grouped (default), flat, headers, or keys",
+    ),
+    include_aliases: Optional[str] = Query(
+        default="true",
+        description="Include aliases mapping in response",
+    ),
+    token: Optional[str] = Query(default=None, description="Optional token if auth is enabled"),
+    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+) -> BestJSONResponse:
+    return _sheet_spec_response(
+        request=request,
+        endpoint_name="spec",
+        sheet=sheet,
+        page=page,
+        name=name,
+        tab=tab,
+        format=format,
+        include_aliases=include_aliases,
+        token=token,
+        x_app_token=x_app_token,
+        authorization=authorization,
+    )
 
 
 @router.get("/pages")
@@ -1308,6 +1397,7 @@ def get_schema_pages(
         pages = _get_all_pages()
         aliases = _get_page_aliases()
         include_alias_map = _bool_q(include_aliases, True)
+        forbidden_pages = _get_forbidden_pages()
 
         page_items = []
         for p in pages:
@@ -1321,6 +1411,8 @@ def get_schema_pages(
             )
 
         payload: Dict[str, Any] = {
+            "canonical_pages": pages,
+            "forbidden_pages": forbidden_pages,
             "pages": pages,
             "items": pages,
             "results": pages,
@@ -1328,6 +1420,8 @@ def get_schema_pages(
             "page_items": page_items,
             "count": len(pages),
             "response_contract": {
+                "canonical_pages_present": True,
+                "forbidden_pages_present": True,
                 "pages_arrays_present": True,
                 "page_items_present": True,
                 "json_safe_payload": True,
