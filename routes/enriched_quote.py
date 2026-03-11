@@ -2,27 +2,29 @@
 # routes/enriched_quote.py
 """
 ================================================================================
-TFB Enriched Quote Routes Wrapper — v6.5.0
+TFB Enriched Quote Routes Wrapper — v6.6.0
 ================================================================================
 RENDER-SAFE • SCHEMA-AWARE • PAGE-DISPATCH SAFE • HEADER/ROW BALANCED
 SPECIAL-BUILDER PRESERVING • ASYNC-SAFE • GET+POST COMPATIBLE
 QUERY/BODY MERGE • LEGACY ALIAS SAFE • TABLE-MODE SAFE • CORE-WRAPPER SAFE
 TOP10-SPECIAL SAFE • SCHEMA-ONLY SAFE • TIMEOUT-GUARDED • NULL-SAFE
 JSON-SAFE • CONTRACT-HARDENED • SPECIAL-ROUTE FAIL-SAFE
+ENGINE-FALLBACK SAFE • HYDRATION-HARDENED • SPARSE-QUOTE SAFE
 
 Why this revision
 -----------------
 - ✅ FIX: `_strip(None)` never leaks the literal string "None"
 - ✅ FIX: all route payloads are JSON-safe (NaN/Inf/datetime/Decimal/set handled)
 - ✅ FIX: explicit special-page dispatch for Top_10_Investments / Insights_Analysis / Data_Dictionary
-- ✅ FIX: special builders are timeout-guarded and degrade gracefully to schema-only / partial payload
+- ✅ FIX: local special builders now fall back to engine special-page handlers before schema-only degradation
+- ✅ FIX: stronger special builder discovery for Top10 / Insights builder variants
+- ✅ FIX: instrument quote rows are re-hydrated per-symbol if batch results are sparse
+- ✅ FIX: stronger symbol matching between request symbols and engine-returned normalized symbols
 - ✅ FIX: special builder headers prefer display headers before keys-like fields
-- ✅ FIX: stronger normalization of nested criteria/settings/filters/direct symbols
 - ✅ FIX: consistent response envelope:
         headers + keys + rows + rows_matrix + quotes + data + meta
 - ✅ FIX: schema-only handling for special pages avoids heavy execution when explicitly requested
-- ✅ FIX: table-mode fallback preserves builder payload shape more safely
-- ✅ FIX: stronger route_family fallback and safer payload/meta normalization
+- ✅ FIX: table-mode fallback preserves payload shape more safely
 - ✅ FIX: special routes avoid escalations to 502 where possible
 - ✅ SAFE: no network I/O at import-time
 - ✅ SAFE: no Prometheus metric creation here
@@ -31,9 +33,9 @@ Behavior
 --------
 Supported route families:
 - instrument pages      -> engine-backed quote rows
-- insights page         -> local insights builder if available
-- top10 page            -> local top10 builder if available
-- data_dictionary page  -> local data dictionary builder
+- insights page         -> local insights builder if available, then engine fallback
+- top10 page            -> local top10 builder if available, then engine fallback
+- data_dictionary page  -> local data dictionary builder if available, then engine fallback
 
 Compatibility routes
 --------------------
@@ -71,7 +73,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 
 logger = logging.getLogger("routes.enriched_quote")
 
-ROUTER_VERSION = "6.5.0"
+ROUTER_VERSION = "6.6.0"
 
 # Kept lazy for dynamic mount behavior
 router: Optional[APIRouter] = None
@@ -477,6 +479,100 @@ def _special_schema_only_requested(body: Mapping[str, Any]) -> bool:
     )
 
 
+def _has_payload_value(v: Any) -> bool:
+    if v is None:
+        return False
+    if isinstance(v, str):
+        return bool(v.strip())
+    if isinstance(v, float):
+        return not (math.isnan(v) or math.isinf(v))
+    return True
+
+
+def _merge_payload_dicts(base: Optional[Dict[str, Any]], addon: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    out = dict(base or {})
+    if not isinstance(addon, dict):
+        return out
+    for k, v in addon.items():
+        if _has_payload_value(v):
+            out[k] = v
+    return out
+
+
+def _normalize_symbol_token(sym: Any) -> str:
+    s = _strip(sym).upper().replace(" ", "")
+    if not s:
+        return ""
+    if s.startswith("TADAWUL:"):
+        s = s.split(":", 1)[1].strip()
+    if s.endswith(".SA"):
+        s = s[:-3] + ".SR"
+    if s.isdigit() and 3 <= len(s) <= 6:
+        return f"{s}.SR"
+    return s
+
+
+def _symbol_match_candidates(sym: Any) -> List[str]:
+    base = _strip(sym)
+    norm = _normalize_symbol_token(base)
+    items = [
+        base,
+        base.upper(),
+        norm,
+        norm.upper(),
+    ]
+    if norm.endswith(".SR"):
+        code = norm[:-3]
+        items.extend([code, code.upper(), f"TADAWUL:{code}"])
+    seen = set()
+    out: List[str] = []
+    for item in items:
+        item2 = _strip(item)
+        if item2 and item2 not in seen:
+            seen.add(item2)
+            out.append(item2)
+    return out
+
+
+def _payload_row_richness(d: Optional[Dict[str, Any]]) -> int:
+    if not isinstance(d, dict):
+        return 0
+    important = (
+        "symbol",
+        "name",
+        "exchange",
+        "currency",
+        "country",
+        "sector",
+        "industry",
+        "current_price",
+        "previous_close",
+        "open_price",
+        "day_high",
+        "day_low",
+        "volume",
+        "market_cap",
+        "pe_ttm",
+        "pb_ratio",
+        "ps_ratio",
+        "forecast_confidence",
+        "risk_score",
+        "risk_bucket",
+        "overall_score",
+        "opportunity_score",
+        "recommendation",
+        "recommendation_reason",
+        "data_provider",
+        "last_updated_utc",
+        "last_updated_riyadh",
+    )
+    return sum(1 for k in important if _has_payload_value(d.get(k)))
+
+
+def _is_sparse_payload_row(d: Optional[Dict[str, Any]], threshold: int = 10) -> bool:
+    return _payload_row_richness(d) < threshold
+
+
 # =============================================================================
 # Shared lazy service layer
 # =============================================================================
@@ -546,16 +642,24 @@ class _Service:
             build_data_dictionary_rows = None  # type: ignore
         self.build_data_dictionary_rows = build_data_dictionary_rows
 
+        build_insights_rows = None
         try:
-            from core.analysis.insights_builder import build_insights_rows  # type: ignore
+            from core.analysis.insights_builder import build_insights_analysis_rows as build_insights_rows  # type: ignore
         except Exception:
-            build_insights_rows = None  # type: ignore
+            try:
+                from core.analysis.insights_builder import build_insights_rows as build_insights_rows  # type: ignore
+            except Exception:
+                build_insights_rows = None  # type: ignore
         self.build_insights_rows = build_insights_rows
 
+        build_top10_rows = None
         try:
-            from core.analysis.top10_selector import build_top10_rows  # type: ignore
+            from core.analysis.top10_selector import build_top10_rows as build_top10_rows  # type: ignore
         except Exception:
-            build_top10_rows = None  # type: ignore
+            try:
+                from core.analysis.top10_selector import build_top10_output_rows as build_top10_rows  # type: ignore
+            except Exception:
+                build_top10_rows = None  # type: ignore
         self.build_top10_rows = build_top10_rows
 
         try:
@@ -789,6 +893,17 @@ class _Service:
 
         if page_norm == "Data_Dictionary" and (not headers or not keys):
             headers = [
+                "Sheet",
+                "Group",
+                "Header",
+                "Key",
+                "DType",
+                "Format",
+                "Required",
+                "Source",
+                "Notes",
+            ]
+            keys = [
                 "sheet",
                 "group",
                 "header",
@@ -799,7 +914,6 @@ class _Service:
                 "source",
                 "notes",
             ]
-            keys = list(headers)
 
         if not headers and keys:
             headers = list(keys)
@@ -941,6 +1055,13 @@ class _Service:
             vals = list(row) if isinstance(row, (list, tuple)) else [row]
             rows.append({k: _json_safe(vals[i] if i < len(vals) else None) for i, k in enumerate(keys)})
         return rows
+
+    def payload_has_rows(self, payload: Any) -> bool:
+        rows = self.extract_rows_like(payload)
+        if rows:
+            return True
+        mx = self.extract_matrix_like(payload)
+        return bool(mx)
 
     # -----------------------------------------------------------------
     # Flexible builder calling
@@ -1091,69 +1212,10 @@ class _Service:
         }
         return _json_safe(payload)
 
-    # -----------------------------------------------------------------
-    # Table mode
-    # -----------------------------------------------------------------
-    async def call_table_mode_best_effort(
+    def payload_from_result(
         self,
         *,
-        engine: Any,
-        page: str,
-        limit: int,
-        offset: int,
-        mode: str,
-        body: Dict[str, Any],
-    ) -> Optional[Dict[str, Any]]:
-        candidates: List[Any] = []
-
-        if self.core_get_sheet_rows is not None:
-            candidates.append(self.core_get_sheet_rows)
-
-        if engine is not None:
-            for name in ("get_sheet_rows", "sheet_rows", "build_sheet_rows"):
-                fn = getattr(engine, name, None)
-                if callable(fn):
-                    candidates.append(fn)
-
-        for fn in candidates:
-            call_specs = [
-                ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode, "body": body}),
-                ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode}),
-                ((), {"sheet": page, "limit": limit, "offset": offset}),
-                ((page,), {"limit": limit, "offset": offset, "mode": mode, "body": body}),
-                ((page,), {"limit": limit, "offset": offset, "mode": mode}),
-                ((page,), {"limit": limit, "offset": offset}),
-                ((page,), {}),
-            ]
-
-            last_exc: Optional[Exception] = None
-            for args, kwargs in call_specs:
-                try:
-                    res = fn(*args, **kwargs)
-                    res = await _maybe_await(res)
-                    if isinstance(res, dict):
-                        return _json_safe(res)
-                    if isinstance(res, list):
-                        return {"status": "success", "rows": _json_safe(res)}
-                    return {"status": "success", "rows": []}
-                except TypeError as e:
-                    last_exc = e
-                    continue
-                except Exception as e:
-                    last_exc = e
-                    break
-
-            if last_exc:
-                continue
-
-        return None
-
-    # -----------------------------------------------------------------
-    # Schema-only payloads
-    # -----------------------------------------------------------------
-    def build_schema_only_payload(
-        self,
-        *,
+        result: Any,
         page_norm: str,
         route_family: str,
         headers: Sequence[str],
@@ -1163,166 +1225,9 @@ class _Service:
         request_id: str,
         started_at: float,
         mode: str,
-        dispatch_name: str,
+        dispatch: str,
         extra_meta: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        return self._envelope(
-            status="success",
-            page=page_norm,
-            route_family=route_family,
-            headers=headers,
-            keys=keys,
-            rows=[],
-            include_headers=include_headers,
-            include_matrix=include_matrix,
-            request_id=request_id,
-            started_at=started_at,
-            mode=mode,
-            dispatch=dispatch_name,
-            extra_meta={"schema_only": True, **(extra_meta or {})},
-        )
-
-    # -----------------------------------------------------------------
-    # Specialized payload builders
-    # -----------------------------------------------------------------
-    async def build_dictionary_page_payload(
-        self,
-        *,
-        page_norm: str,
-        headers: Sequence[str],
-        keys: Sequence[str],
-        include_headers: bool,
-        include_matrix: bool,
-        request_id: str,
-        started_at: float,
-        mode: str,
-    ) -> Dict[str, Any]:
-        rows_out: List[Dict[str, Any]] = []
-
-        if callable(self.build_data_dictionary_rows):
-            try:
-                try:
-                    rows_raw = self.build_data_dictionary_rows(include_meta_sheet=False)
-                except TypeError:
-                    rows_raw = self.build_data_dictionary_rows()
-                rows_out = self._normalize_rows_from_any(rows_raw, keys)
-            except Exception as e:
-                logger.warning("Data dictionary builder failed: %s", e)
-                rows_out = []
-
-        return self._envelope(
-            status="success",
-            page=page_norm,
-            route_family="dictionary",
-            headers=headers,
-            keys=keys,
-            rows=rows_out,
-            include_headers=include_headers,
-            include_matrix=include_matrix,
-            request_id=request_id,
-            started_at=started_at,
-            mode=mode,
-            dispatch="data_dictionary",
-        )
-
-    async def build_special_builder_payload(
-        self,
-        *,
-        builder: Any,
-        dispatch_name: str,
-        route_family: str,
-        request: Request,
-        engine: Any,
-        page_norm: str,
-        headers: Sequence[str],
-        keys: Sequence[str],
-        body: Mapping[str, Any],
-        limit: int,
-        include_headers: bool,
-        include_matrix: bool,
-        request_id: str,
-        started_at: float,
-        mode: str,
-    ) -> Dict[str, Any]:
-        if not callable(builder):
-            return self.build_schema_only_payload(
-                page_norm=page_norm,
-                route_family=route_family,
-                headers=headers,
-                keys=keys,
-                include_headers=include_headers,
-                include_matrix=include_matrix,
-                request_id=request_id,
-                started_at=started_at,
-                mode=mode,
-                dispatch_name=dispatch_name,
-                extra_meta={"warning": f"{dispatch_name}_builder_unavailable"},
-            )
-
-        try:
-            if self.special_builder_timeout_sec > 0:
-                result = await asyncio.wait_for(
-                    self._call_builder_flexible(
-                        builder,
-                        request=request,
-                        engine=engine,
-                        body=body,
-                        limit=limit,
-                        mode=mode,
-                    ),
-                    timeout=self.special_builder_timeout_sec,
-                )
-            else:
-                result = await self._call_builder_flexible(
-                    builder,
-                    request=request,
-                    engine=engine,
-                    body=body,
-                    limit=limit,
-                    mode=mode,
-                )
-        except asyncio.TimeoutError:
-            logger.warning(
-                "%s builder timed out after %.2fs for page=%s",
-                dispatch_name,
-                self.special_builder_timeout_sec,
-                page_norm,
-            )
-            return self.build_schema_only_payload(
-                page_norm=page_norm,
-                route_family=route_family,
-                headers=headers,
-                keys=keys,
-                include_headers=include_headers,
-                include_matrix=include_matrix,
-                request_id=request_id,
-                started_at=started_at,
-                mode=mode,
-                dispatch_name=dispatch_name,
-                extra_meta={
-                    "warning": f"{dispatch_name}_builder_timeout",
-                    "builder_timeout_sec": self.special_builder_timeout_sec,
-                },
-            )
-        except Exception as e:
-            logger.warning("%s builder failed: %s", dispatch_name, e)
-            return self._envelope(
-                status="partial",
-                page=page_norm,
-                route_family=route_family,
-                headers=headers,
-                keys=keys,
-                rows=[],
-                include_headers=include_headers,
-                include_matrix=include_matrix,
-                request_id=request_id,
-                started_at=started_at,
-                mode=mode,
-                dispatch=dispatch_name,
-                error=f"{type(e).__name__}: {e}",
-                extra_meta={"warning": f"{dispatch_name}_builder_failed"},
-            )
-
         if isinstance(result, dict):
             result_headers = _first_list(
                 result.get("display_headers"),
@@ -1373,12 +1278,9 @@ class _Service:
                 request_id=request_id,
                 started_at=started_at,
                 mode=mode,
-                dispatch=dispatch_name,
+                dispatch=dispatch,
                 error=error_out,
-                extra_meta={
-                    **meta_in,
-                    "builder_payload_preserved": True,
-                },
+                extra_meta={**meta_in, **(extra_meta or {})},
             )
 
             if include_matrix and isinstance(rows_matrix_raw, list):
@@ -1388,7 +1290,6 @@ class _Service:
             return payload
 
         rows_out = self._normalize_rows_from_any(result, keys)
-
         return self._envelope(
             status="success",
             page=page_norm,
@@ -1401,9 +1302,369 @@ class _Service:
             request_id=request_id,
             started_at=started_at,
             mode=mode,
-            dispatch=dispatch_name,
-            extra_meta={"builder_payload_preserved": False},
+            dispatch=dispatch,
+            extra_meta=extra_meta,
         )
+
+    # -----------------------------------------------------------------
+    # Table mode / engine page payload
+    # -----------------------------------------------------------------
+    async def call_engine_page_payload_best_effort(
+        self,
+        *,
+        engine: Any,
+        page: str,
+        limit: int,
+        offset: int,
+        mode: str,
+        body: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        candidates: List[Any] = []
+
+        if self.core_get_sheet_rows is not None:
+            candidates.append(self.core_get_sheet_rows)
+
+        if engine is not None:
+            for name in ("get_sheet_rows", "get_page_rows", "sheet_rows", "build_sheet_rows", "get_sheet"):
+                fn = getattr(engine, name, None)
+                if callable(fn):
+                    candidates.append(fn)
+
+        body2 = dict(body or {})
+        body2.setdefault("page", page)
+        body2.setdefault("sheet", page)
+        body2.setdefault("sheet_name", page)
+
+        for fn in candidates:
+            call_specs = [
+                ((), {"sheet": page, "sheet_name": page, "page": page, "limit": limit, "offset": offset, "mode": mode, "body": body2}),
+                ((), {"sheet": page, "sheet_name": page, "page": page, "limit": limit, "offset": offset, "mode": mode}),
+                ((), {"sheet": page, "page": page, "limit": limit, "offset": offset, "body": body2}),
+                ((), {"sheet": page, "page": page, "limit": limit, "offset": offset}),
+                ((page,), {"limit": limit, "offset": offset, "mode": mode, "body": body2}),
+                ((page,), {"limit": limit, "offset": offset, "mode": mode}),
+                ((page,), {"limit": limit, "offset": offset}),
+                ((page,), {}),
+            ]
+
+            last_exc: Optional[Exception] = None
+            for args, kwargs in call_specs:
+                try:
+                    res = fn(*args, **kwargs)
+                    res = await _maybe_await(res)
+                    if isinstance(res, dict):
+                        return _json_safe(res)
+                    if isinstance(res, list):
+                        return {"status": "success", "rows": _json_safe(res)}
+                    return {"status": "success", "rows": []}
+                except TypeError as e:
+                    last_exc = e
+                    continue
+                except Exception as e:
+                    last_exc = e
+                    break
+
+            if last_exc:
+                continue
+
+        return None
+
+    async def call_table_mode_best_effort(
+        self,
+        *,
+        engine: Any,
+        page: str,
+        limit: int,
+        offset: int,
+        mode: str,
+        body: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        return await self.call_engine_page_payload_best_effort(
+            engine=engine,
+            page=page,
+            limit=limit,
+            offset=offset,
+            mode=mode,
+            body=body,
+        )
+
+    # -----------------------------------------------------------------
+    # Schema-only payloads
+    # -----------------------------------------------------------------
+    def build_schema_only_payload(
+        self,
+        *,
+        page_norm: str,
+        route_family: str,
+        headers: Sequence[str],
+        keys: Sequence[str],
+        include_headers: bool,
+        include_matrix: bool,
+        request_id: str,
+        started_at: float,
+        mode: str,
+        dispatch_name: str,
+        extra_meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return self._envelope(
+            status="success",
+            page=page_norm,
+            route_family=route_family,
+            headers=headers,
+            keys=keys,
+            rows=[],
+            include_headers=include_headers,
+            include_matrix=include_matrix,
+            request_id=request_id,
+            started_at=started_at,
+            mode=mode,
+            dispatch=dispatch_name,
+            extra_meta={"schema_only": True, **(extra_meta or {})},
+        )
+
+    # -----------------------------------------------------------------
+    # Specialized payload builders
+    # -----------------------------------------------------------------
+    async def build_dictionary_page_payload(
+        self,
+        *,
+        engine: Any,
+        request: Request,
+        page_norm: str,
+        headers: Sequence[str],
+        keys: Sequence[str],
+        body: Mapping[str, Any],
+        limit: int,
+        include_headers: bool,
+        include_matrix: bool,
+        request_id: str,
+        started_at: float,
+        mode: str,
+    ) -> Dict[str, Any]:
+        rows_out: List[Dict[str, Any]] = []
+
+        if callable(self.build_data_dictionary_rows):
+            try:
+                try:
+                    rows_raw = self.build_data_dictionary_rows(include_meta_sheet=True)
+                except TypeError:
+                    rows_raw = self.build_data_dictionary_rows()
+                rows_out = self._normalize_rows_from_any(rows_raw, keys)
+            except Exception as e:
+                logger.warning("Data dictionary builder failed: %s", e)
+                rows_out = []
+
+        if rows_out:
+            return self._envelope(
+                status="success",
+                page=page_norm,
+                route_family="dictionary",
+                headers=headers,
+                keys=keys,
+                rows=rows_out,
+                include_headers=include_headers,
+                include_matrix=include_matrix,
+                request_id=request_id,
+                started_at=started_at,
+                mode=mode,
+                dispatch="data_dictionary",
+            )
+
+        engine_payload = await self.call_engine_page_payload_best_effort(
+            engine=engine,
+            page=page_norm,
+            limit=limit,
+            offset=0,
+            mode=mode,
+            body=dict(body or {}),
+        )
+        if isinstance(engine_payload, dict):
+            return self.payload_from_result(
+                result=engine_payload,
+                page_norm=page_norm,
+                route_family="dictionary",
+                headers=headers,
+                keys=keys,
+                include_headers=include_headers,
+                include_matrix=include_matrix,
+                request_id=request_id,
+                started_at=started_at,
+                mode=mode,
+                dispatch="data_dictionary_engine_fallback",
+                extra_meta={"warning": "local_dictionary_builder_empty"},
+            )
+
+        return self.build_schema_only_payload(
+            page_norm=page_norm,
+            route_family="dictionary",
+            headers=headers,
+            keys=keys,
+            include_headers=include_headers,
+            include_matrix=include_matrix,
+            request_id=request_id,
+            started_at=started_at,
+            mode=mode,
+            dispatch_name="data_dictionary_schema_only",
+            extra_meta={"warning": "dictionary_builder_unavailable"},
+        )
+
+    async def build_special_builder_payload(
+        self,
+        *,
+        builder: Any,
+        dispatch_name: str,
+        route_family: str,
+        request: Request,
+        engine: Any,
+        page_norm: str,
+        headers: Sequence[str],
+        keys: Sequence[str],
+        body: Mapping[str, Any],
+        limit: int,
+        include_headers: bool,
+        include_matrix: bool,
+        request_id: str,
+        started_at: float,
+        mode: str,
+    ) -> Dict[str, Any]:
+        async def _engine_fallback_payload(tag: str, warning_text: str) -> Optional[Dict[str, Any]]:
+            engine_payload = await self.call_engine_page_payload_best_effort(
+                engine=engine,
+                page=page_norm,
+                limit=limit,
+                offset=0,
+                mode=mode,
+                body=dict(body or {}),
+            )
+            if isinstance(engine_payload, dict):
+                return self.payload_from_result(
+                    result=engine_payload,
+                    page_norm=page_norm,
+                    route_family=route_family,
+                    headers=headers,
+                    keys=keys,
+                    include_headers=include_headers,
+                    include_matrix=include_matrix,
+                    request_id=request_id,
+                    started_at=started_at,
+                    mode=mode,
+                    dispatch=f"{dispatch_name}_{tag}",
+                    extra_meta={"warning": warning_text},
+                )
+            return None
+
+        if not callable(builder):
+            fallback_payload = await _engine_fallback_payload("engine_fallback", f"{dispatch_name}_builder_unavailable")
+            if fallback_payload is not None:
+                return fallback_payload
+
+            return self.build_schema_only_payload(
+                page_norm=page_norm,
+                route_family=route_family,
+                headers=headers,
+                keys=keys,
+                include_headers=include_headers,
+                include_matrix=include_matrix,
+                request_id=request_id,
+                started_at=started_at,
+                mode=mode,
+                dispatch_name=dispatch_name,
+                extra_meta={"warning": f"{dispatch_name}_builder_unavailable"},
+            )
+
+        try:
+            if self.special_builder_timeout_sec > 0:
+                result = await asyncio.wait_for(
+                    self._call_builder_flexible(
+                        builder,
+                        request=request,
+                        engine=engine,
+                        body=body,
+                        limit=limit,
+                        mode=mode,
+                    ),
+                    timeout=self.special_builder_timeout_sec,
+                )
+            else:
+                result = await self._call_builder_flexible(
+                    builder,
+                    request=request,
+                    engine=engine,
+                    body=body,
+                    limit=limit,
+                    mode=mode,
+                )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "%s builder timed out after %.2fs for page=%s",
+                dispatch_name,
+                self.special_builder_timeout_sec,
+                page_norm,
+            )
+            fallback_payload = await _engine_fallback_payload("engine_fallback", f"{dispatch_name}_builder_timeout")
+            if fallback_payload is not None:
+                return fallback_payload
+
+            return self.build_schema_only_payload(
+                page_norm=page_norm,
+                route_family=route_family,
+                headers=headers,
+                keys=keys,
+                include_headers=include_headers,
+                include_matrix=include_matrix,
+                request_id=request_id,
+                started_at=started_at,
+                mode=mode,
+                dispatch_name=dispatch_name,
+                extra_meta={
+                    "warning": f"{dispatch_name}_builder_timeout",
+                    "builder_timeout_sec": self.special_builder_timeout_sec,
+                },
+            )
+        except Exception as e:
+            logger.warning("%s builder failed: %s", dispatch_name, e)
+            fallback_payload = await _engine_fallback_payload("engine_fallback", f"{dispatch_name}_builder_failed")
+            if fallback_payload is not None:
+                return fallback_payload
+
+            return self._envelope(
+                status="partial",
+                page=page_norm,
+                route_family=route_family,
+                headers=headers,
+                keys=keys,
+                rows=[],
+                include_headers=include_headers,
+                include_matrix=include_matrix,
+                request_id=request_id,
+                started_at=started_at,
+                mode=mode,
+                dispatch=dispatch_name,
+                error=f"{type(e).__name__}: {e}",
+                extra_meta={"warning": f"{dispatch_name}_builder_failed"},
+            )
+
+        payload = self.payload_from_result(
+            result=result,
+            page_norm=page_norm,
+            route_family=route_family,
+            headers=headers,
+            keys=keys,
+            include_headers=include_headers,
+            include_matrix=include_matrix,
+            request_id=request_id,
+            started_at=started_at,
+            mode=mode,
+            dispatch=dispatch_name,
+            extra_meta={"builder_payload_preserved": True},
+        )
+
+        if not _special_schema_only_requested(body) and not self.payload_has_rows(result):
+            fallback_payload = await _engine_fallback_payload("engine_fallback", f"{dispatch_name}_builder_empty")
+            if fallback_payload is not None and self.payload_has_rows(fallback_payload):
+                return fallback_payload
+
+        return payload
 
 
 # =============================================================================
@@ -1479,9 +1740,13 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         symbols: Sequence[str],
         mode_q: str,
         request: Request,
-    ) -> Tuple[List[Dict[str, Any]], int]:
+    ) -> Tuple[List[Dict[str, Any]], int, Dict[str, Any]]:
         if not symbols:
-            return [], 0
+            return [], 0, {
+                "batch_rows": 0,
+                "rehydrated_rows": 0,
+                "sparse_after_rehydrate": 0,
+            }
 
         engine = await svc.get_engine(request)
         if engine is None:
@@ -1493,80 +1758,133 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
                 )
                 for s in symbols
             ]
-            return rows, len(rows)
+            return rows, len(rows), {
+                "batch_rows": 0,
+                "rehydrated_rows": 0,
+                "sparse_after_rehydrate": len(rows),
+            }
 
         quotes_map: Dict[str, Dict[str, Any]] = {}
+        batch_rows = 0
+        rehydrated_rows = 0
+
+        def _put_quote(sym_key: Any, payload: Dict[str, Any]) -> None:
+            if not isinstance(payload, dict):
+                payload = {}
+            for candidate in _symbol_match_candidates(sym_key):
+                if candidate not in quotes_map:
+                    quotes_map[candidate] = dict(payload)
+                else:
+                    quotes_map[candidate] = _merge_payload_dicts(quotes_map.get(candidate), payload)
+
+        def _get_quote(sym: str) -> Dict[str, Any]:
+            for candidate in _symbol_match_candidates(sym):
+                if candidate in quotes_map and isinstance(quotes_map[candidate], dict):
+                    return quotes_map[candidate]
+            return {}
 
         try:
             batch_fn = getattr(engine, "get_enriched_quotes_batch", None) or getattr(engine, "get_quotes_batch", None)
 
             if callable(batch_fn):
+                got = None
                 try:
-                    got = batch_fn(symbols=symbols, mode=mode_q or "", schema=list(keys) if keys else None)
+                    got = batch_fn(symbols=list(symbols), mode=mode_q or "", schema=page_norm)
                     got = await _maybe_await(got)
                 except TypeError:
                     try:
-                        got = batch_fn(symbols, mode=mode_q or "")
+                        got = batch_fn(symbols=list(symbols), mode=mode_q or "")
                         got = await _maybe_await(got)
                     except TypeError:
-                        got = batch_fn(symbols)
-                        got = await _maybe_await(got)
+                        try:
+                            got = batch_fn(symbols=list(symbols))
+                            got = await _maybe_await(got)
+                        except TypeError:
+                            got = batch_fn(list(symbols))
+                            got = await _maybe_await(got)
 
                 if isinstance(got, dict):
-                    quotes_map = {
-                        str(k): (v if isinstance(v, dict) else _model_to_dict(v))
-                        for k, v in got.items()
-                    }
+                    for k, v in got.items():
+                        d = v if isinstance(v, dict) else _model_to_dict(v)
+                        _put_quote(k, d)
+                    batch_rows = len([s for s in symbols if _get_quote(s)])
                 elif isinstance(got, list):
-                    tmp: Dict[str, Dict[str, Any]] = {}
-                    for item in got:
+                    for idx, item in enumerate(got):
                         d = item if isinstance(item, dict) else _model_to_dict(item)
-                        sym = _strip(d.get("symbol") or d.get("ticker") or d.get("Symbol") or "")
-                        if sym:
-                            tmp[sym] = d
-                    quotes_map = tmp
+                        key_sym = _strip(d.get("symbol") or d.get("ticker") or d.get("Symbol") or d.get("Ticker"))
+                        if not key_sym and idx < len(symbols):
+                            key_sym = str(symbols[idx])
+                        if key_sym:
+                            _put_quote(key_sym, d)
+                    batch_rows = len([s for s in symbols if _get_quote(s)])
                 else:
-                    quotes_map = {s: {"symbol": s, "ticker": s, "error": "batch_return_shape_unsupported"} for s in symbols}
-
+                    for s in symbols:
+                        _put_quote(s, {"symbol": s, "ticker": s, "error": "batch_return_shape_unsupported"})
             else:
-                one_fn = getattr(engine, "get_enriched_quote_dict", None) or getattr(engine, "get_quote_dict", None)
-
-                if callable(one_fn):
-                    async def _one(sym: str) -> Any:
-                        try:
-                            try:
-                                res = one_fn(sym, schema=list(keys) if keys else None)
-                            except TypeError:
-                                res = one_fn(sym)
-                            return await _maybe_await(res)
-                        except Exception as e:
-                            return e
-
-                    results = await asyncio.gather(*[_one(s) for s in symbols], return_exceptions=False)
-
-                    for s, item in zip(symbols, results):
-                        if isinstance(item, dict):
-                            quotes_map[s] = item
-                        elif isinstance(item, Exception):
-                            quotes_map[s] = {"symbol": s, "ticker": s, "error": f"{type(item).__name__}: {item}"}
-                        else:
-                            quotes_map[s] = {"symbol": s, "ticker": s, "error": "unknown_item"}
-                else:
-                    quotes_map = {s: {"symbol": s, "ticker": s, "error": "engine_missing_quote_methods"} for s in symbols}
-
+                for s in symbols:
+                    _put_quote(s, {"symbol": s, "ticker": s, "error": "engine_missing_batch_quote_methods"})
         except Exception as e:
-            quotes_map = {s: {"symbol": s, "ticker": s, "error": f"{type(e).__name__}: {e}"} for s in symbols}
+            for s in symbols:
+                _put_quote(s, {"symbol": s, "ticker": s, "error": f"{type(e).__name__}: {e}"})
+
+        sparse_syms = [s for s in symbols if not _get_quote(s) or _is_sparse_payload_row(_get_quote(s))]
+
+        per_dict_fn = getattr(engine, "get_enriched_quote_dict", None) or getattr(engine, "get_quote_dict", None)
+        per_fn = getattr(engine, "get_enriched_quote", None) or getattr(engine, "get_quote", None)
+
+        if sparse_syms and (callable(per_dict_fn) or callable(per_fn)):
+            sem = asyncio.Semaphore(max(2, min(12, int(_get_float_env("TFB_ROUTE_REHYDRATE_CONCURRENCY", 6)))))
+
+            async def _rehydrate_one(sym: str) -> None:
+                nonlocal rehydrated_rows
+                async with sem:
+                    fresh: Dict[str, Any] = {}
+                    try:
+                        if callable(per_dict_fn):
+                            try:
+                                fresh = await _maybe_await(per_dict_fn(sym, schema=page_norm))
+                            except TypeError:
+                                try:
+                                    fresh = await _maybe_await(per_dict_fn(sym))
+                                except Exception:
+                                    fresh = {}
+                        elif callable(per_fn):
+                            try:
+                                fresh = await _maybe_await(per_fn(sym, schema=page_norm))
+                            except TypeError:
+                                try:
+                                    fresh = await _maybe_await(per_fn(sym))
+                                except Exception:
+                                    fresh = {}
+                        fresh = fresh if isinstance(fresh, dict) else _model_to_dict(fresh)
+                    except Exception as e:
+                        fresh = {"symbol": sym, "ticker": sym, "error": f"rehydrate_failed:{type(e).__name__}: {e}"}
+
+                    old = _get_quote(sym)
+                    merged = _merge_payload_dicts(old, fresh)
+                    if merged:
+                        _put_quote(sym, merged)
+                        rehydrated_rows += 1
+
+            await asyncio.gather(*[_rehydrate_one(s) for s in sparse_syms], return_exceptions=True)
 
         rows_out: List[Dict[str, Any]] = []
         errors = 0
+        sparse_after_rehydrate = 0
 
         for s in symbols:
-            raw = quotes_map.get(s) or {"symbol": s, "ticker": s, "error": "missing_row"}
+            raw = _get_quote(s) or {"symbol": s, "ticker": s, "error": "missing_row"}
             if raw.get("error"):
                 errors += 1
+            if _is_sparse_payload_row(raw):
+                sparse_after_rehydrate += 1
             rows_out.append(svc.normalize_row(keys, raw, symbol_fallback=s))
 
-        return rows_out, errors
+        return rows_out, errors, {
+            "batch_rows": batch_rows,
+            "rehydrated_rows": rehydrated_rows,
+            "sparse_after_rehydrate": sparse_after_rehydrate,
+        }
 
     # -------------------------------------------------------------------------
     # Main handlers
@@ -1625,7 +1943,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             payload["data"] = row
             return payload
 
-        rows_out, errors = await _build_instrument_rows(page_norm, keys or ["symbol", "error"], [symbol], mode_q, request)
+        rows_out, errors, hydrate_meta = await _build_instrument_rows(page_norm, keys or ["symbol", "error"], [symbol], mode_q, request)
         row = rows_out[0] if rows_out else svc.normalize_row(
             keys or ["symbol", "error"],
             {"symbol": symbol, "ticker": symbol, "error": "missing_row"},
@@ -1646,6 +1964,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             started_at=start,
             mode=mode_q,
             dispatch="instrument",
+            extra_meta=hydrate_meta,
         )
         payload["row"] = row
         payload["quote"] = row
@@ -1697,9 +2016,9 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         headers, keys = svc.schema_for_page(page_norm)
         schema_keys = keys or ["symbol", "error"]
 
-        if route_family != "instrument":
-            engine = await svc.get_engine(request)
+        engine = await svc.get_engine(request)
 
+        if route_family != "instrument":
             if _special_schema_only_requested(body_prepared):
                 return svc.build_schema_only_payload(
                     page_norm=page_norm,
@@ -1716,9 +2035,13 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
 
             if route_family == "dictionary":
                 return await svc.build_dictionary_page_payload(
+                    engine=engine,
+                    request=request,
                     page_norm=page_norm,
                     headers=headers,
                     keys=schema_keys,
+                    body=body_prepared,
+                    limit=top_n,
                     include_headers=include_headers,
                     include_matrix=include_matrix,
                     request_id=request_id,
@@ -1780,7 +2103,6 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             )
 
         if not symbols:
-            engine = await svc.get_engine(request)
             payload = await svc.call_table_mode_best_effort(
                 engine=engine,
                 page=page_norm,
@@ -1839,7 +2161,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
                 result["rows_matrix"] = _json_safe(payload.get("rows_matrix"))
             return result
 
-        rows_out, errors = await _build_instrument_rows(page_norm, schema_keys, symbols, mode_q, request)
+        rows_out, errors, hydrate_meta = await _build_instrument_rows(page_norm, schema_keys, symbols, mode_q, request)
         status_out = "success" if errors == 0 else ("partial" if errors < len(symbols) else "error")
 
         return svc._envelope(
@@ -1856,7 +2178,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             mode=mode_q,
             dispatch="instrument",
             error=f"{errors} errors" if errors else None,
-            extra_meta={"requested": len(symbols), "errors": errors},
+            extra_meta={"requested": len(symbols), "errors": errors, **hydrate_meta},
         )
 
     # -------------------------------------------------------------------------
