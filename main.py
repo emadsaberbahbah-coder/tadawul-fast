@@ -2,24 +2,23 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v7.4.0)
+TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v7.5.0)
 ================================================================================
 ALIGNED • DEPLOYMENT-SAFE • PRE-MOUNT + STARTUP-VERIFY • ROUTER-SNAPSHOT-AWARE
 ENGINE-STATE-AWARE • OPENAPI-SAFE • RENDER-HEALTH-PROBE-SAFE • PRIORITY-MOUNTED
+ROOT-CONFIG-FIRST • CORE-CONFIG-COMPATIBLE • REQUEST-ID SAFE • STARTUP-HARDENED
 
-Why this revision (v7.4.0)
+Why this revision (v7.5.0)
 --------------------------
-- ✅ FIX: Mounts routes once during app creation so OpenAPI sees them immediately
-- ✅ FIX: Startup verifies and normalizes the pre-mounted snapshot without remount churn
-- ✅ FIX: OpenAPI cache is invalidated after route mount so new paths appear live
-- ✅ FIX: Preserves app.state.routes_snapshot if routes package already wrote it
-- ✅ FIX: Engine warm-up stores engine on app.state.engine for request-time access
-- ✅ FIX: Fallback route plan aligned to canonical router priority order
-- ✅ FIX: Runtime meta reports mounted / duplicate / failed counts accurately
-- ✅ FIX: Adds request-id middleware and X-Request-ID response header
-- ✅ FIX: Debug auth calls core.config.auth_ok using multiple safe signatures
-- ✅ HARDEN: Startup remains safe even if routes or engine imports partially fail
-- ✅ HARDEN: /meta remains schema-visible so OpenAPI is never empty
+- ✅ FIX: prefers root-level `config.py` as the main config source
+- ✅ FIX: still supports `core.config` as backward-compatible fallback
+- ✅ FIX: auth checks now try `config.auth_ok` first, then `core.config.auth_ok`
+- ✅ FIX: settings bridge accepts both uppercase and lowercase config attribute styles
+- ✅ FIX: runtime meta exposes config source for easier Render debugging
+- ✅ FIX: preserves pre-mounted router snapshot and avoids duplicate remount churn
+- ✅ FIX: OpenAPI cache invalidation remains reliable after router changes
+- ✅ FIX: engine warm-up stores engine on `app.state.engine` for route access
+- ✅ HARDEN: startup remains safe even if config/routes/engine imports partially fail
 - ✅ SAFE: HEAD probes for /, /livez, /readyz, /health remain stable for Render
 """
 
@@ -42,10 +41,12 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 
+
 # --------------------------------------------------------------------------------------
 # Version
 # --------------------------------------------------------------------------------------
-APP_ENTRY_VERSION = "7.4.0"
+APP_ENTRY_VERSION = "7.5.0"
+
 
 # --------------------------------------------------------------------------------------
 # Safe env helpers
@@ -94,6 +95,30 @@ def _err_to_str(e: BaseException, limit: int = 1600) -> str:
     return s if len(s) <= limit else (s[:limit] + "...(truncated)")
 
 
+def _pick_attr(obj: Any, *names: str, default: Any = None) -> Any:
+    for name in names:
+        try:
+            value = getattr(obj, name)
+            if value is not None:
+                return value
+        except Exception:
+            continue
+    return default
+
+
+def _to_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    s = str(value).strip().lower()
+    if s in _TRUTHY:
+        return True
+    if s in _FALSY:
+        return False
+    return default
+
+
 # --------------------------------------------------------------------------------------
 # Logging
 # --------------------------------------------------------------------------------------
@@ -140,6 +165,7 @@ def _setup_logging() -> logging.Logger:
 
 logger = _setup_logging()
 
+
 # --------------------------------------------------------------------------------------
 # Settings bridge
 # --------------------------------------------------------------------------------------
@@ -167,64 +193,113 @@ class _SettingsView:
     ENGINE_CACHE_TTL_SEC: int = 20
     MAX_REQUESTS_PER_MINUTE: int = 240
 
+    CONFIG_SOURCE: str = "env"
+
+
+def _settings_from_generic_object(s: Any, source: str) -> _SettingsView:
+    return _SettingsView(
+        APP_NAME=str(
+            _pick_attr(s, "APP_NAME", "app_name", "service_name", default=_env_str("APP_NAME", "Tadawul Fast Bridge"))
+        ),
+        APP_VERSION=str(
+            _pick_attr(s, "APP_VERSION", "app_version", default=_env_str("APP_VERSION", "dev"))
+        ),
+        APP_ENV=str(
+            _pick_attr(s, "APP_ENV", "app_env", "environment", "env", default=_env_str("APP_ENV", "production"))
+        ),
+        TIMEZONE_DEFAULT=str(
+            _pick_attr(s, "TIMEZONE_DEFAULT", "timezone_default", "timezone", default=_env_str("TZ", "Asia/Riyadh"))
+        ),
+        DEBUG=_to_bool(_pick_attr(s, "DEBUG", "debug", default=_env_bool("DEBUG", False)), _env_bool("DEBUG", False)),
+        ENABLE_SWAGGER=_to_bool(
+            _pick_attr(s, "ENABLE_SWAGGER", "enable_swagger", default=_env_bool("ENABLE_SWAGGER", True)),
+            _env_bool("ENABLE_SWAGGER", True),
+        ),
+        ENABLE_REDOC=_to_bool(
+            _pick_attr(s, "ENABLE_REDOC", "enable_redoc", default=_env_bool("ENABLE_REDOC", True)),
+            _env_bool("ENABLE_REDOC", True),
+        ),
+        INIT_ENGINE_ON_BOOT=_to_bool(
+            _pick_attr(s, "INIT_ENGINE_ON_BOOT", "init_engine_on_boot", default=_env_bool("INIT_ENGINE_ON_BOOT", True)),
+            _env_bool("INIT_ENGINE_ON_BOOT", True),
+        ),
+        INIT_ENGINE_STRICT=_to_bool(
+            _pick_attr(s, "INIT_ENGINE_STRICT", "init_engine_strict", default=_env_bool("INIT_ENGINE_STRICT", False)),
+            _env_bool("INIT_ENGINE_STRICT", False),
+        ),
+        REQUIRE_AUTH=_to_bool(
+            _pick_attr(s, "REQUIRE_AUTH", "require_auth", default=_env_bool("REQUIRE_AUTH", True)),
+            _env_bool("REQUIRE_AUTH", True),
+        ),
+        OPEN_MODE=_to_bool(
+            _pick_attr(s, "OPEN_MODE", "open_mode", default=_env_bool("OPEN_MODE", False)),
+            _env_bool("OPEN_MODE", False),
+        ),
+        AUTH_HEADER_NAME=str(
+            _pick_attr(
+                s,
+                "AUTH_HEADER_NAME",
+                "auth_header_name",
+                default=_env_str("AUTH_HEADER_NAME", "X-APP-TOKEN"),
+            )
+        ),
+        ENABLE_CORS_ALL_ORIGINS=_to_bool(
+            _pick_attr(
+                s,
+                "ENABLE_CORS_ALL_ORIGINS",
+                "enable_cors_all_origins",
+                default=_env_bool("ENABLE_CORS_ALL_ORIGINS", False),
+            ),
+            _env_bool("ENABLE_CORS_ALL_ORIGINS", False),
+        ),
+        CORS_ORIGINS=str(
+            _pick_attr(s, "CORS_ORIGINS", "cors_origins", default=_env_str("CORS_ORIGINS", ""))
+        ),
+        BACKEND_BASE_URL=str(
+            _pick_attr(s, "BACKEND_BASE_URL", "backend_base_url", default=_env_str("BACKEND_BASE_URL", ""))
+        ),
+        ENGINE_CACHE_TTL_SEC=int(
+            _pick_attr(s, "ENGINE_CACHE_TTL_SEC", "engine_cache_ttl_sec", default=_env_int("ENGINE_CACHE_TTL_SEC", 20))
+        ),
+        MAX_REQUESTS_PER_MINUTE=int(
+            _pick_attr(s, "MAX_REQUESTS_PER_MINUTE", "max_requests_per_minute", default=_env_int("MAX_REQUESTS_PER_MINUTE", 240))
+        ),
+        CONFIG_SOURCE=source,
+    )
+
 
 def _load_settings() -> _SettingsView:
-    # 1) env.py
+    # 1) Root config.py (primary)
     try:
-        env_mod = importlib.import_module("env")
-        if hasattr(env_mod, "get_settings"):
-            s = env_mod.get_settings()  # type: ignore[attr-defined]
-            return _SettingsView(
-                APP_NAME=getattr(s, "APP_NAME", _env_str("APP_NAME", "Tadawul Fast Bridge")),
-                APP_VERSION=getattr(s, "APP_VERSION", _env_str("APP_VERSION", "dev")),
-                APP_ENV=getattr(s, "APP_ENV", _env_str("APP_ENV", "production")),
-                TIMEZONE_DEFAULT=getattr(s, "TIMEZONE_DEFAULT", _env_str("TZ", "Asia/Riyadh")),
-                DEBUG=bool(getattr(s, "DEBUG", _env_bool("DEBUG", False))),
-                ENABLE_SWAGGER=bool(getattr(s, "ENABLE_SWAGGER", _env_bool("ENABLE_SWAGGER", True))),
-                ENABLE_REDOC=bool(getattr(s, "ENABLE_REDOC", _env_bool("ENABLE_REDOC", True))),
-                INIT_ENGINE_ON_BOOT=bool(getattr(s, "INIT_ENGINE_ON_BOOT", _env_bool("INIT_ENGINE_ON_BOOT", True))),
-                INIT_ENGINE_STRICT=bool(getattr(s, "INIT_ENGINE_STRICT", _env_bool("INIT_ENGINE_STRICT", False))),
-                REQUIRE_AUTH=bool(getattr(s, "REQUIRE_AUTH", _env_bool("REQUIRE_AUTH", True))),
-                OPEN_MODE=bool(getattr(s, "OPEN_MODE", _env_bool("OPEN_MODE", False))),
-                AUTH_HEADER_NAME=str(getattr(s, "AUTH_HEADER_NAME", _env_str("AUTH_HEADER_NAME", "X-APP-TOKEN"))),
-                ENABLE_CORS_ALL_ORIGINS=bool(getattr(s, "ENABLE_CORS_ALL_ORIGINS", _env_bool("ENABLE_CORS_ALL_ORIGINS", False))),
-                CORS_ORIGINS=str(getattr(s, "CORS_ORIGINS", _env_str("CORS_ORIGINS", ""))),
-                BACKEND_BASE_URL=str(getattr(s, "BACKEND_BASE_URL", _env_str("BACKEND_BASE_URL", ""))),
-                ENGINE_CACHE_TTL_SEC=int(getattr(s, "ENGINE_CACHE_TTL_SEC", _env_int("ENGINE_CACHE_TTL_SEC", 20))),
-                MAX_REQUESTS_PER_MINUTE=int(getattr(s, "MAX_REQUESTS_PER_MINUTE", _env_int("MAX_REQUESTS_PER_MINUTE", 240))),
-            )
+        cfg = importlib.import_module("config")
+        getter = getattr(cfg, "get_settings_cached", None) or getattr(cfg, "get_settings", None)
+        if callable(getter):
+            s = getter()
+            return _settings_from_generic_object(s, source="config")
     except Exception:
         pass
 
-    # 2) core.config
+    # 2) env.py
+    try:
+        env_mod = importlib.import_module("env")
+        getter = getattr(env_mod, "get_settings", None)
+        if callable(getter):
+            s = getter()
+            return _settings_from_generic_object(s, source="env")
+    except Exception:
+        pass
+
+    # 3) core.config (fallback compatibility only)
     try:
         cfg = importlib.import_module("core.config")
         getter = getattr(cfg, "get_settings_cached", None) or getattr(cfg, "get_settings", None)
         if callable(getter):
-            s = getter()  # type: ignore[misc]
-            return _SettingsView(
-                APP_NAME=getattr(s, "service_name", _env_str("APP_NAME", "Tadawul Fast Bridge")),
-                APP_VERSION=getattr(s, "app_version", _env_str("APP_VERSION", "dev")),
-                APP_ENV=str(getattr(s, "environment", _env_str("APP_ENV", "production"))),
-                TIMEZONE_DEFAULT=getattr(s, "timezone", _env_str("TZ", "Asia/Riyadh")),
-                DEBUG=_env_bool("DEBUG", False),
-                ENABLE_SWAGGER=_env_bool("ENABLE_SWAGGER", True),
-                ENABLE_REDOC=_env_bool("ENABLE_REDOC", True),
-                INIT_ENGINE_ON_BOOT=_env_bool("INIT_ENGINE_ON_BOOT", True),
-                INIT_ENGINE_STRICT=_env_bool("INIT_ENGINE_STRICT", False),
-                REQUIRE_AUTH=bool(getattr(s, "require_auth", _env_bool("REQUIRE_AUTH", True))),
-                OPEN_MODE=bool(getattr(s, "open_mode", _env_bool("OPEN_MODE", False))),
-                AUTH_HEADER_NAME=getattr(s, "auth_header_name", _env_str("AUTH_HEADER_NAME", "X-APP-TOKEN")),
-                ENABLE_CORS_ALL_ORIGINS=_env_bool("ENABLE_CORS_ALL_ORIGINS", False),
-                CORS_ORIGINS=_env_str("CORS_ORIGINS", ""),
-                BACKEND_BASE_URL=getattr(s, "backend_base_url", _env_str("BACKEND_BASE_URL", "")),
-                ENGINE_CACHE_TTL_SEC=int(getattr(s, "engine_cache_ttl_sec", _env_int("ENGINE_CACHE_TTL_SEC", 20))),
-                MAX_REQUESTS_PER_MINUTE=_env_int("MAX_REQUESTS_PER_MINUTE", 240),
-            )
+            s = getter()
+            return _settings_from_generic_object(s, source="core.config")
     except Exception:
         pass
 
-    # 3) env vars
+    # 4) raw env vars
     return _SettingsView(
         APP_NAME=_env_str("APP_NAME", "Tadawul Fast Bridge"),
         APP_VERSION=_env_str("APP_VERSION", "dev"),
@@ -243,10 +318,12 @@ def _load_settings() -> _SettingsView:
         BACKEND_BASE_URL=_env_str("BACKEND_BASE_URL", ""),
         ENGINE_CACHE_TTL_SEC=_env_int("ENGINE_CACHE_TTL_SEC", 20),
         MAX_REQUESTS_PER_MINUTE=_env_int("MAX_REQUESTS_PER_MINUTE", 240),
+        CONFIG_SOURCE="raw_env",
     )
 
 
 _SETTINGS = _load_settings()
+
 
 # --------------------------------------------------------------------------------------
 # Default state helpers
@@ -287,6 +364,8 @@ def _ensure_app_state_defaults(app: FastAPI) -> None:
         app.state.engine = None
     if not hasattr(app.state, "engine_source"):
         app.state.engine_source = ""
+    if not hasattr(app.state, "config_source"):
+        app.state.config_source = _SETTINGS.CONFIG_SOURCE
 
 
 # --------------------------------------------------------------------------------------
@@ -297,13 +376,15 @@ def _call_auth_ok_flexible(fn: Any, request: Request, token_value: str, authoriz
     headers_dict = dict(request.headers)
 
     settings = None
-    try:
-        cfg = importlib.import_module("core.config")
-        getter = getattr(cfg, "get_settings_cached", None) or getattr(cfg, "get_settings", None)
-        if callable(getter):
-            settings = getter()
-    except Exception:
-        settings = None
+    for mod_name in ("config", "core.config"):
+        try:
+            cfg = importlib.import_module(mod_name)
+            getter = getattr(cfg, "get_settings_cached", None) or getattr(cfg, "get_settings", None)
+            if callable(getter):
+                settings = getter()
+                break
+        except Exception:
+            continue
 
     attempts = [
         {
@@ -358,32 +439,35 @@ def _auth_ok(request: Request) -> bool:
     except Exception:
         pass
 
-    try:
-        cfg = importlib.import_module("core.config")
-        fn = getattr(cfg, "auth_ok", None)
-        if callable(fn):
-            hdr = request.headers.get(_SETTINGS.AUTH_HEADER_NAME, "") or request.headers.get("X-APP-TOKEN", "")
-            auth = request.headers.get("Authorization", "")
-            token_q = request.query_params.get("token") if request.query_params else None
-            token_value = str(hdr or token_q or "").strip()
-            return _call_auth_ok_flexible(fn, request, token_value, auth)
-    except Exception:
-        pass
+    hdr = request.headers.get(_SETTINGS.AUTH_HEADER_NAME, "") or request.headers.get("X-APP-TOKEN", "")
+    auth = request.headers.get("Authorization", "")
+    token_q = request.query_params.get("token") if request.query_params else None
+    token_value = str(hdr or token_q or "").strip()
+
+    for mod_name in ("config", "core.config"):
+        try:
+            cfg = importlib.import_module(mod_name)
+            fn = getattr(cfg, "auth_ok", None)
+            if callable(fn):
+                return _call_auth_ok_flexible(fn, request, token_value, auth)
+        except Exception:
+            continue
 
     allowed = {
-        x for x in (
+        x
+        for x in (
             _env_str("APP_TOKEN", ""),
             _env_str("BACKEND_TOKEN", ""),
             _env_str("BACKUP_APP_TOKEN", ""),
             _env_str("X_APP_TOKEN", ""),
-        ) if x
+            _env_str("AUTH_TOKEN", ""),
+            _env_str("TOKEN", ""),
+            _env_str("TFB_APP_TOKEN", ""),
+        )
+        if x
     }
     if not allowed:
         return False
-
-    hdr = request.headers.get(_SETTINGS.AUTH_HEADER_NAME, "") or request.headers.get("X-APP-TOKEN", "")
-    auth = request.headers.get("Authorization", "")
-    token_q = request.query_params.get("token") if request.query_params else ""
 
     if hdr and hdr in allowed:
         return True
@@ -592,7 +676,6 @@ def _get_router_from_module(mod: Any) -> Tuple[Optional[Any], str]:
 def _mount_routes_fallback(app: FastAPI) -> Dict[str, Any]:
     strict = _env_bool("ROUTES_STRICT_IMPORT", False)
 
-    # Canonical fallback order aligned to routes/__init__.py priority
     plan = [
         "routes.config",
         "routes.data_dictionary",
@@ -755,6 +838,7 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
     engine_source = ""
     routes_mounted = False
     routes_mount_phase = ""
+    config_source = _SETTINGS.CONFIG_SOURCE
 
     try:
         if app is not None and hasattr(app, "state"):
@@ -765,6 +849,7 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
             engine_source = str(getattr(app.state, "engine_source", "") or "")
             routes_mounted = bool(getattr(app.state, "routes_mounted", False))
             routes_mount_phase = str(getattr(app.state, "routes_mount_phase", "") or "")
+            config_source = str(getattr(app.state, "config_source", _SETTINGS.CONFIG_SOURCE) or _SETTINGS.CONFIG_SOURCE)
     except Exception:
         pass
 
@@ -785,6 +870,7 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
         "env": _SETTINGS.APP_ENV,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "python": sys.version.split()[0],
+        "config_source": config_source,
         "routes_mounted": routes_mounted,
         "routes_mount_phase": routes_mount_phase,
         "routes_mounted_count": mounted_count,
@@ -978,7 +1064,6 @@ def create_app() -> FastAPI:
 
     _install_builtin_routes(app)
 
-    # Critical: mount routes before first OpenAPI generation
     try:
         snap = _mount_routes_once(app, phase="prestart")
         logger.info(
