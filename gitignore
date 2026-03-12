@@ -1,20 +1,22 @@
 # =============================================================================
-# TADAWUL FAST BRIDGE – ENTERPRISE GITIGNORE (v6.0.0)
+# TADAWUL FAST BRIDGE – ENTERPRISE GITIGNORE (v7.0.0)
 # =============================================================================
-# QUANTUM EDITION | ZERO-TRUST SECURITY | CLOUD-NATIVE
+# QUANTUM EDITION | ZERO-TRUST SECURITY | CLOUD-NATIVE | NARROW-IGNORE POLICY
 #
 # Core Principles:
 # • Track templates, never secrets
-# • Narrow ignores over broad ignores
-# • Keep core source tracked (core/, routes/, schemas/, scripts/, tests/, integrations/)
+# • Prefer narrow ignores over broad ignores
+# • Keep source and schema files tracked
+# • Ignore generated outputs, runtime state, credentials, and local-only artifacts
 #
-# Version: 6.0.0
+# Version: 7.0.0
 # =============================================================================
 
+
 # =============================================================================
-# TFB SPECIFIC ARTIFACTS (v6.0.0 Ecosystem)
+# TFB-SPECIFIC GENERATED ARTIFACTS
 # =============================================================================
-# Analytics & Profiling
+# Analytics / profiling reports
 profile_*.json
 performance_report_*.json
 performance_report_*.html
@@ -23,29 +25,26 @@ test_report_*.html
 test_report_*.xml
 test_report_*.json
 
-# Sync & Execution Logs
+# App / worker / sync logs
 sync_*.log
 sync_execution.log
 app_*.log
 worker_*.log
 
-# Caching & ML Model Directories
+# Runtime caches / temp
 /models/
 /tmp/cache_*/
 .cache/
 redis_data/
+tmp/
+temp/
 
-# Transient GitHub Actions Credentials
+# Transient credentials
 google_credentials.json
 
-# Load Testing (Locust)
-*_stats.csv
-*_stats_history.csv
-*_failures.csv
-*_exceptions.csv
 
 # =============================================================================
-# PYTHON BYTECODE / COMPILED FILES
+# PYTHON BYTECODE / COMPILED EXTENSIONS
 # =============================================================================
 __pycache__/
 *.py[cod]
@@ -58,15 +57,14 @@ __pycache__/
 *.pyo
 *.pyz
 
+
 # =============================================================================
-# PYTHON VIRTUAL ENVIRONMENTS / PACKAGE MANAGERS
+# PYTHON VIRTUAL ENVIRONMENTS / TOOLING
 # =============================================================================
-# Virtual environments
 venv/
 .venv/
 env/
 ENV/
-.env/
 .venv.bak/
 venv.bak/
 virtualenv/
@@ -86,7 +84,7 @@ anaconda3/
 # Python version files
 .python-version
 
-# Package managers (uv, rye, pdm, poetry, pip)
+# Package/tool caches
 pip-wheel-metadata/
 pip-selfcheck.json
 .pip/
@@ -110,16 +108,20 @@ var/
 MANIFEST
 .installed.cfg
 
-# Keep lock files tracked!
-# !poetry.lock
-# !pdm.lock
-# !uv.lock
-# !requirements.txt
+# Keep dependency manifests tracked
+!requirements.txt
+!requirements-*.txt
+!poetry.lock
+!pdm.lock
+!uv.lock
+!pyproject.toml
+!setup.py
+!setup.cfg
+
 
 # =============================================================================
 # TESTS / COVERAGE / LINTERS / TYPE CHECKERS
 # =============================================================================
-# Test artifacts
 .pytest_cache/
 .tox/
 .nox/
@@ -134,7 +136,6 @@ htmlcov/
 coverage.xml
 pytestdebug.log
 
-# Linters / Formatters
 .ruff_cache/
 .pylint.d/
 .pylintrc.local
@@ -146,15 +147,10 @@ pytestdebug.log
 .pyrightconfig.local
 dmypy.json
 
-# Type checkers
-*.pyi
-*.pyi.orig
-*.pyi.rej
 
 # =============================================================================
-# LOGS / RUNTIME ARTIFACTS / PROFILING
+# LOGS / RUNTIME / OBSERVABILITY
 # =============================================================================
-# Logs
 *.log
 *.log.*
 logs/
@@ -162,7 +158,6 @@ log/
 *.out
 *.err
 
-# Runtime files
 *.sock
 *.socket
 *.pid
@@ -171,7 +166,6 @@ log/
 *.runtime
 *.manifest
 
-# Profiling & Observability
 *.prof
 *.profile
 *.stats
@@ -187,9 +181,9 @@ perf.data
 perf.data.old
 flamegraph.svg
 
-# Uvicorn/Gunicorn runtime configs
 gunicorn.conf.local.py
 uvicorn.conf.local.py
+
 
 # =============================================================================
 # LOCAL DATABASES / SNAPSHOTS / EXPORTS
@@ -204,43 +198,83 @@ uvicorn.conf.local.py
 *.sql.gz
 *.sql.zip
 *.bson
-*.jsonl
-*.ndjson
 dump.rdb
 appendonly.aof
 
-# Data directories
-data/
-!data/samples/
-!data/examples/
-!data/README.md
+# Data directories (generated/local)
+data/*
 !data/.gitkeep
+!data/README.md
+!data/samples/
+!data/samples/**
+!data/examples/
+!data/examples/**
 
-# Exports
+# Generated exports / reports / artifacts directories
 exports/
 reports/
 artifacts/
 output/
-*.csv
-*.xlsx
-*.xls
-*.parquet
-*.feather
-*.arrow
-*.h5
-*.hdf5
+generated/
+generated_exports/
+
+# Ignore generated flat files only inside generated/output-style dirs
+exports/**/*.csv
+exports/**/*.xlsx
+exports/**/*.xls
+exports/**/*.parquet
+exports/**/*.feather
+exports/**/*.arrow
+exports/**/*.h5
+exports/**/*.hdf5
+
+reports/**/*.csv
+reports/**/*.xlsx
+reports/**/*.xls
+reports/**/*.parquet
+reports/**/*.feather
+reports/**/*.arrow
+reports/**/*.h5
+reports/**/*.hdf5
+
+artifacts/**/*.csv
+artifacts/**/*.xlsx
+artifacts/**/*.xls
+artifacts/**/*.parquet
+artifacts/**/*.feather
+artifacts/**/*.arrow
+artifacts/**/*.h5
+artifacts/**/*.hdf5
+
+output/**/*.csv
+output/**/*.xlsx
+output/**/*.xls
+output/**/*.parquet
+output/**/*.feather
+output/**/*.arrow
+output/**/*.h5
+output/**/*.hdf5
+
+# Allow tracked sample/example data anywhere explicit
+!**/samples/**/*.csv
+!**/samples/**/*.xlsx
+!**/examples/**/*.csv
+!**/examples/**/*.xlsx
+!**/*.example.csv
+!**/*.example.xlsx
+!example_*.csv
+!example_*.xlsx
+
 
 # =============================================================================
 # NOTEBOOKS / DATA SCIENCE / ML
 # =============================================================================
-# Jupyter
 .ipynb_checkpoints/
 *.ipynb
-!notebooks/**.ipynb
+!notebooks/**/*.ipynb
 !*.example.ipynb
 !example_*.ipynb
 
-# Jupyter config
 .jupyter/
 jupyter_notebook_config.json
 jupyter_runtime/
@@ -272,10 +306,11 @@ wandb/
 tensorboard/
 *.tfevents.*
 
+
 # =============================================================================
 # SECURITY & SECRETS (CRITICAL)
 # =============================================================================
-# Environment files - TRACK ONLY .env.example
+# Environment files - track only examples/templates
 .env
 .env.*
 !.env.example
@@ -303,7 +338,7 @@ secure/
 certificates/
 certs/
 
-# Google Cloud / Firebase
+# Google Cloud / Firebase / OAuth
 credentials.json
 service-account.json
 service_account.json
@@ -321,7 +356,7 @@ token.json
 tokens.json
 firebase-*.json
 
-# AWS / Azure / GCP configs
+# AWS / Azure / GCP local config
 .aws/
 .azure/
 .gcp/
@@ -344,7 +379,7 @@ azure-credentials.json
 *.keystore
 *.truststore
 
-# Tokens and encryptions
+# Tokens / encrypted blobs
 *.token
 *.tokens
 *.secret
@@ -354,8 +389,9 @@ azure-credentials.json
 *.enc
 *.encrypted
 
+
 # =============================================================================
-# IDE / EDITOR
+# IDE / EDITOR / OS
 # =============================================================================
 # VS Code
 .vscode/
@@ -365,18 +401,18 @@ azure-credentials.json
 !.vscode/extensions.json
 *.code-workspace
 
-# JetBrains (PyCharm, IntelliJ, etc.)
+# JetBrains
 .idea/
 *.iml
 *.iws
 *.ipr
 
-# Cursor / AI Editors
+# Cursor / AI editors
 .cursor/
 .cursorrules.local
 *.cursor.md
 
-# OS Files
+# OS files
 .DS_Store
 .DS_Store?
 ._*
@@ -386,29 +422,44 @@ Thumbs.db
 ehthumbs.db
 $RECYCLE.BIN/
 
+
 # =============================================================================
 # LLM / AI / COPY-PASTE ARTIFACTS
 # =============================================================================
-# ChatGPT / Claude / Gemini
 *.chatgpt.md
 *.claude.md
 *.gemini.md
 *.copilot.md
-
-# Prompt artifacts
 *.prompt.md
 *.system-prompt.md
 *.ai-prompt.md
-
-# Generated code backups
 *.generated.py
 *.md.backup
 *.py.backup
 
+
 # =============================================================================
-# DO NOT IGNORE THESE SOURCE FOLDERS
+# DEPLOYMENT / LOCAL-ONLY OVERRIDES
 # =============================================================================
-# Keep core directories tracked
+.render/
+.vercel/
+.netlify/
+.serverless/
+.terraform/
+terraform.tfstate
+terraform.tfstate.*
+*.tfvars
+*.tfvars.json
+
+# Docker local overrides
+docker-compose.override.yml
+docker-compose.local.yml
+Dockerfile.local
+
+
+# =============================================================================
+# DO NOT IGNORE SOURCE / CONFIG / PROJECT STRUCTURE
+# =============================================================================
 !core/
 !routes/
 !schemas/
@@ -418,17 +469,22 @@ $RECYCLE.BIN/
 !docs/
 !examples/
 !migrations/
-
-# Keep configuration templates
-!.env.example
+!notebooks/
+!main.py
+!app.py
+!config.py
+!requirements.txt
+!requirements-*.txt
 !.gitignore
 !.dockerignore
 !docker-compose.example.yml
 !config.example.yaml
 !config.example.json
+!.env.example
+
 
 # =============================================================================
 # FINAL SAFEGUARD
 # =============================================================================
-# This file is part of TADAWUL FAST BRIDGE v6.0.0
-# Do not remove without understanding the security implications
+# This file is part of TADAWUL FAST BRIDGE v7.0.0
+# Do not remove without understanding the security implications.
