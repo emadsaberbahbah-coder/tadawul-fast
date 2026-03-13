@@ -2,27 +2,26 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.14.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.28.0
 ================================================================================
 
-WHY v5.14.0
+WHY v5.28.0
 -----------
-This revision strengthens the shared foundations used by Part 2 so the engine
-becomes more deterministic, more schema-safe, and more tolerant of mixed payload
-shapes coming from routes, selectors, cached snapshots, and external helpers.
+This revision addresses the final control-flow gap regarding `schema_only` requests
+in loose mode. It prevents the engine from early-exiting with a malformed schema
+fragment for special sheets before their dedicated repair logic can run.
 
-Main improvements in Part 1
+Main improvements in v5.28.0
 ---------------------------
-- ✅ FIX: stronger schema lookup wrapper with alias / canonical-name fallback
-- ✅ FIX: Top_10_Investments schema contract helpers prepared for canonical 83-col handling
-- ✅ FIX: broader object -> dict coercion and safer serialization helpers
-- ✅ FIX: stronger nested symbol extraction from body / payload / rows / matrix shapes
-- ✅ FIX: improved payload row extraction from rows/data/items/records/quotes/matrix
-- ✅ FIX: more robust normalization of patches and schema rows
-- ✅ FIX: safer percent / confidence normalization
-- ✅ FIX: emergency universes preserved but resolution metadata becomes clearer
-- ✅ SAFE: no network I/O at import-time
-- ✅ SAFE: lazy imports preserved for heavy dependencies
+- ✅ FIX: Generic `schema_only` fast-path requires `_usable_contract` to be True.
+- ✅ FIX: `Data_Dictionary`, `Insights_Analysis`, and `Top_10_Investments` safely
+          handle `schema_only` requests internally *after* contract repair.
+- ✅ FIX: `_usable_contract` enforces strict set-based anchor logic requiring both
+          symbol identifiers and identity/value fields to pass validation.
+- ✅ FIX: `Data_Dictionary` delays row normalization until *after* contract 
+          inference, preventing real rows from turning into `{}`.
+- ✅ FIX: `_build_top10_rows_fallback` generates a full union contract if Top10 
+          schema is unusable and strict mode is off, preventing truthy empty rows.
 
 Provider routing constraint (unchanged)
 ---------------------------------------
@@ -56,7 +55,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.14.0"
+__version__ = "5.28.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -219,23 +218,98 @@ except Exception:
     _RAW_GET_SHEET_SPEC = None  # type: ignore
 
 
+def _complete_schema_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple[List[str], List[str]]:
+    raw_headers = list(headers or [])
+    raw_keys = list(keys or [])
+    max_len = max(len(raw_headers), len(raw_keys))
+
+    hdrs: List[str] = []
+    ks: List[str] = []
+
+    for i in range(max_len):
+        h = _safe_str(raw_headers[i]) if i < len(raw_headers) else ""
+        k = _safe_str(raw_keys[i]) if i < len(raw_keys) else ""
+
+        if h and not k:
+            k = _norm_key(h)
+        elif k and not h:
+            h = k.replace("_", " ").title()
+        elif not h and not k:
+            h = f"Column_{i+1}"
+            k = f"key_{i+1}"
+
+        hdrs.append(h)
+        ks.append(k)
+
+    return hdrs, ks
+
+
+def _usable_contract(headers: Sequence[str], keys: Sequence[str], sheet_name: str = "") -> bool:
+    if not headers or not keys:
+        return False
+    if len(headers) != len(keys) or len(headers) == 0:
+        return False
+        
+    if sheet_name:
+        canon = _canonicalize_sheet_name(sheet_name)
+        keyset = set(keys)
+
+        if canon in {"Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds", "My_Portfolio"}:
+            if len(keys) < 50:
+                return False
+            has_symbol_anchor = bool(keyset & {"symbol", "requested_symbol", "ticker"})
+            has_identity_anchor = bool(keyset & {"name", "current_price"})
+            if not has_symbol_anchor or not has_identity_anchor:
+                return False
+
+        elif canon == "Top_10_Investments":
+            if len(keys) < 60:
+                return False
+            has_symbol_anchor = bool(keyset & {"symbol", "requested_symbol", "ticker"})
+            has_required_top10 = {"top10_rank", "selection_reason", "criteria_snapshot"}.issubset(keyset)
+            if not has_symbol_anchor or not has_required_top10:
+                return False
+
+        elif canon == "Data_Dictionary":
+            if len(keys) < 9:
+                return False
+            has_required_dd = {"sheet", "header", "key"}.issubset(keyset)
+            if not has_required_dd:
+                return False
+
+        elif canon == "Insights_Analysis":
+            if len(keys) < 5:
+                return False
+
+    return True
+
+
 def _schema_columns_from_any(spec: Any) -> List[Any]:
     if spec is None:
         return []
 
+    if isinstance(spec, dict) and len(spec) == 1 and "columns" not in spec and "fields" not in spec:
+        first_val = list(spec.values())[0]
+        if isinstance(first_val, dict) and ("columns" in first_val or "fields" in first_val):
+            spec = first_val
+
     cols = getattr(spec, "columns", None)
     if isinstance(cols, list) and cols:
         return cols
+        
+    cols_fields = getattr(spec, "fields", None)
+    if isinstance(cols_fields, list) and cols_fields:
+        return cols_fields
 
     if isinstance(spec, Mapping):
-        cols2 = spec.get("columns")
+        cols2 = spec.get("columns") or spec.get("fields")
         if isinstance(cols2, list) and cols2:
             return cols2
 
     try:
         d = getattr(spec, "__dict__", None)
         if isinstance(d, dict):
-            cols3 = d.get("columns")
+            cols3 = d.get("columns") or d.get("fields")
             if isinstance(cols3, list) and cols3:
                 return cols3
     except Exception:
@@ -245,45 +319,51 @@ def _schema_columns_from_any(spec: Any) -> List[Any]:
 
 
 def _schema_keys_headers_from_spec(spec: Any) -> Tuple[List[str], List[str]]:
+    if isinstance(spec, dict) and len(spec) == 1 and not any(k in spec for k in ("columns", "fields", "headers", "keys", "display_headers")):
+        first_val = list(spec.values())[0]
+        if isinstance(first_val, dict):
+            spec = first_val
+
     cols = _schema_columns_from_any(spec)
     headers: List[str] = []
     keys: List[str] = []
 
     for c in cols:
         if isinstance(c, Mapping):
-            h = _safe_str(c.get("header"))
-            k = _safe_str(c.get("key"))
+            h = _safe_str(c.get("header") or c.get("display_header") or c.get("displayHeader") or c.get("label") or c.get("title"))
+            k = _safe_str(c.get("key") or c.get("field") or c.get("name") or c.get("id"))
         else:
-            h = _safe_str(getattr(c, "header", None))
-            k = _safe_str(getattr(c, "key", None))
+            h = _safe_str(getattr(c, "header", getattr(c, "display_header", getattr(c, "displayHeader", getattr(c, "label", getattr(c, "title", None))))))
+            k = _safe_str(getattr(c, "key", getattr(c, "field", getattr(c, "name", getattr(c, "id", None)))))
 
-        if h:
-            headers.append(h)
-        if k:
-            keys.append(k)
+        if h or k:
+            headers.append(h or k.replace("_", " ").title())
+            keys.append(k or _norm_key(h))
 
-    if not headers and isinstance(spec, Mapping):
-        headers2 = spec.get("headers")
-        keys2 = spec.get("keys")
+    if not headers and not keys and isinstance(spec, Mapping):
+        headers2 = spec.get("headers") or spec.get("display_headers")
+        keys2 = spec.get("keys") or spec.get("fields")
         if isinstance(headers2, list):
             headers = [_safe_str(x) for x in headers2 if _safe_str(x)]
         if isinstance(keys2, list):
             keys = [_safe_str(x) for x in keys2 if _safe_str(x)]
 
-    return headers, keys
+    return _complete_schema_contract(headers, keys)
 
 
 def _ensure_top10_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple[List[str], List[str]]:
     hdrs = list(headers or [])
     ks = list(keys or [])
 
-    if _norm_key("Top_10_Investments") == _norm_key("Top_10_Investments"):
-        for field in TOP10_REQUIRED_FIELDS:
-            if field not in ks:
-                ks.append(field)
-                hdrs.append(TOP10_REQUIRED_HEADERS.get(field, field))
+    if not hdrs and not ks:
+        return hdrs, ks
 
-    return hdrs, ks
+    for field in TOP10_REQUIRED_FIELDS:
+        if field not in ks:
+            ks.append(field)
+            hdrs.append(TOP10_REQUIRED_HEADERS.get(field, field))
+
+    return _complete_schema_contract(hdrs, ks)
 
 
 def _registry_sheet_lookup(sheet: str) -> Any:
@@ -296,6 +376,7 @@ def _registry_sheet_lookup(sheet: str) -> Any:
         sheet.replace("_", " "),
         _norm_key(sheet),
         _norm_key(sheet).replace("_", " ").title().replace(" ", "_"),
+        _norm_key_loose(sheet),
     ]
 
     registry_by_norm: Dict[str, Any] = {}
@@ -317,10 +398,6 @@ def _registry_sheet_lookup(sheet: str) -> Any:
 
 
 def get_sheet_spec(sheet: str) -> Any:  # type: ignore
-    """
-    Robust wrapper around schema_registry.get_sheet_spec.
-    Tries direct lookup first, then registry alias / canonical fallback.
-    """
     sheet2 = _safe_str(sheet)
     if not sheet2:
         raise KeyError("empty sheet name")
@@ -573,6 +650,8 @@ def normalize_row_to_schema(schema: Any, rowdict: Dict[str, Any], *, keep_extras
         if not keys:
             keys = list(_SCHEMA_UNION_KEYS)
             headers = list(_SCHEMA_UNION_KEYS)
+
+    headers, keys = _complete_schema_contract(headers, keys)
 
     raw_ci = {str(k).strip().lower(): v for k, v in raw.items()}
     raw_loose = {_norm_key_loose(k): v for k, v in raw.items()}
@@ -2354,16 +2433,60 @@ def _schema_for_sheet(sheet: str) -> Tuple[Optional[Any], List[str], List[str], 
     if not sheet:
         return None, [], [], "none"
 
-    try:
-        spec = get_sheet_spec(sheet)
-        headers, keys = _schema_keys_headers_from_spec(spec)
-        if _canonicalize_sheet_name(sheet) == "Top_10_Investments":
-            headers, keys = _ensure_top10_contract(headers, keys)
-        if headers and keys and len(headers) == len(keys):
-            return spec, headers, keys, "schema_registry.get_sheet_spec"
-        return spec, headers, keys, "schema_registry.partial"
-    except Exception:
-        return None, [], [], "none"
+    candidates = _dedupe_keep_order([
+        sheet,
+        _canonicalize_sheet_name(sheet),
+        sheet.replace(" ", "_"),
+        sheet.replace("_", " "),
+        _norm_key(sheet),
+        _norm_key_loose(sheet),
+    ])
+
+    best_spec = None
+    best_headers: List[str] = []
+    best_keys: List[str] = []
+    best_src = "none"
+    best_score = (-1, -1)
+
+    def _update_best(s, h, k, src):
+        nonlocal best_spec, best_headers, best_keys, best_src, best_score
+        is_usable = 1 if _usable_contract(h, k, sheet) else 0
+        score = (is_usable, len(k))
+        if score > best_score:
+            best_spec, best_headers, best_keys, best_src = s, h, k, src
+            best_score = score
+
+    # Try full/partial matches via get_sheet_spec and registry directly
+    for cand in candidates:
+        try:
+            if callable(_RAW_GET_SHEET_SPEC):
+                spec = _RAW_GET_SHEET_SPEC(cand)
+                if spec:
+                    h, k = _schema_keys_headers_from_spec(spec)
+                    _update_best(spec, h, k, "schema_registry.get_sheet_spec")
+        except Exception:
+            pass
+
+        spec = _registry_sheet_lookup(cand)
+        if spec is not None:
+            h, k = _schema_keys_headers_from_spec(spec)
+            _update_best(spec, h, k, "schema_registry.registry_lookup")
+
+    # Loose scan fallback over all registry items
+    if isinstance(SCHEMA_REGISTRY, dict):
+        sheet_loose = _norm_key_loose(sheet)
+        for r_key, r_spec in SCHEMA_REGISTRY.items():
+            if _norm_key_loose(r_key) == sheet_loose:
+                h, k = _schema_keys_headers_from_spec(r_spec)
+                _update_best(r_spec, h, k, "schema_registry.loose_scan")
+
+    if _canonicalize_sheet_name(sheet) == "Top_10_Investments":
+        best_headers, best_keys = _ensure_top10_contract(best_headers, best_keys)
+
+    if best_keys and not _usable_contract(best_headers, best_keys, sheet):
+        best_src = best_src.replace("schema_registry.", "schema_registry.partial_")
+
+    return best_spec, best_headers, best_keys, best_src
 
 
 def _strict_project_row(keys: List[str], row: Dict[str, Any]) -> Dict[str, Any]:
@@ -2556,7 +2679,7 @@ def _coerce_payload_keys_headers(payload: Any) -> Tuple[List[str], List[str]]:
     if not keys and headers:
         keys = [_norm_key(h) for h in headers if _norm_key(h)]
 
-    return headers, keys
+    return _complete_schema_contract(headers, keys)
 
 
 def _list_sheet_names_best_effort() -> List[str]:
@@ -2816,7 +2939,7 @@ class DataEngineV5:
     def _top10_schema_contract(self, headers: List[str], keys: List[str]) -> Tuple[List[str], List[str]]:
         if self.top10_force_full_schema:
             return _ensure_top10_contract(headers, keys)
-        return list(headers), list(keys)
+        return _complete_schema_contract(headers, keys)
 
     def _project_rows_to_schema(
         self,
@@ -2825,6 +2948,9 @@ class DataEngineV5:
         headers: List[str],
         keys: List[str],
     ) -> List[Dict[str, Any]]:
+        headers, keys = _complete_schema_contract(headers, keys)
+        if not keys:
+            return []
         out: List[Dict[str, Any]] = []
         for r in rows or []:
             norm = _normalize_to_schema_keys(keys, headers, r)
@@ -2843,6 +2969,7 @@ class DataEngineV5:
         meta: Optional[Dict[str, Any]] = None,
         error: Optional[str] = None,
     ) -> Dict[str, Any]:
+        headers, keys = _complete_schema_contract(headers, keys)
         payload = {
             "status": status,
             "sheet": sheet,
@@ -3069,12 +3196,12 @@ class DataEngineV5:
                 continue
 
             call_variants = [
-                ((), {"sheet": sheet, "limit": limit}),
-                ((), {"sheet_name": sheet, "limit": limit}),
-                ((), {"page": sheet, "limit": limit}),
-                ((), {"tab": sheet, "limit": limit}),
-                ((), {"name": sheet, "limit": limit}),
-                ((), {"worksheet": sheet, "limit": limit}),
+                (() , {"sheet": sheet, "limit": limit}),
+                (() , {"sheet_name": sheet, "limit": limit}),
+                (() , {"page": sheet, "limit": limit}),
+                (() , {"tab": sheet, "limit": limit}),
+                (() , {"name": sheet, "limit": limit}),
+                (() , {"worksheet": sheet, "limit": limit}),
                 ((sheet,), {"limit": limit}),
                 ((sheet,), {}),
             ]
@@ -3404,9 +3531,9 @@ class DataEngineV5:
                 continue
 
             call_variants = [
-                ((), {"sheet": sheet, "limit": limit}),
-                ((), {"sheet_name": sheet, "limit": limit}),
-                ((), {"page": sheet, "limit": limit}),
+                (() , {"sheet": sheet, "limit": limit}),
+                (() , {"sheet_name": sheet, "limit": limit}),
+                (() , {"page": sheet, "limit": limit}),
                 ((sheet,), {"limit": limit}),
                 ((sheet,), {}),
             ]
@@ -3766,12 +3893,20 @@ class DataEngineV5:
         body: Optional[Dict[str, Any]],
         limit: int,
         mode: str,
-    ) -> List[Dict[str, Any]]:
+    ) -> Tuple[List[str], List[str], List[Dict[str, Any]]]:
         body = dict(body or {})
         criteria = _extract_nested_dict(body, "criteria")
         top_n = _safe_int(criteria.get("top_n") or body.get("top_n") or limit, 10, lo=1, hi=50) or 10
 
         headers, keys = self._top10_schema_contract(headers, keys)
+
+        if not _usable_contract(headers, keys, "Top_10_Investments"):
+            keys = list(_SCHEMA_UNION_KEYS)
+            for field in TOP10_REQUIRED_FIELDS:
+                if field not in keys:
+                    keys.append(field)
+            headers = [TOP10_REQUIRED_HEADERS.get(k, k.replace("_", " ").title()) for k in keys]
+            headers, keys = _complete_schema_contract(headers, keys)
 
         direct_symbols = _extract_requested_symbols_from_body(body, limit=top_n * 25)
         pages_selected = _extract_top10_pages_from_body(body)
@@ -3788,12 +3923,12 @@ class DataEngineV5:
 
         symbols = _normalize_symbol_list(symbols, limit=max(top_n * 20, 50))
         if not symbols:
-            return []
+            return headers, keys, []
 
         quotes = await self.get_enriched_quotes(symbols, schema=None)
         rows: List[Dict[str, Any]] = [_model_to_dict(q) for q in quotes]
         if not rows:
-            return []
+            return headers, keys, []
 
         def _sort_key(r: Dict[str, Any]) -> Tuple[float, float, float]:
             op = _as_float(r.get("opportunity_score"))
@@ -3832,7 +3967,7 @@ class DataEngineV5:
                 projected["criteria_snapshot"] = criteria_snapshot
             final_rows.append(projected)
 
-        return final_rows
+        return headers, keys, final_rows
 
     # -------------------------------------------------------------------------
     # sheet/page APIs
@@ -3894,10 +4029,53 @@ class DataEngineV5:
         target_sheet = _canonicalize_sheet_name((sheet or sheet_name or page or "").strip())
         spec, headers, keys, schema_src = _schema_for_sheet(target_sheet)
 
+        headers, keys = _complete_schema_contract(headers, keys)
+
+        # ---------------------------------------------------------------------
+        # SCHEMA CONTRACT RECOVERY FLOW
+        # ---------------------------------------------------------------------
+        if not _usable_contract(headers, keys, target_sheet):
+            recovered = False
+
+            # a) Try to recover from cached snapshot contract
+            cached_snap = self.get_cached_sheet_snapshot(sheet=target_sheet)
+            if isinstance(cached_snap, dict):
+                c_headers = cached_snap.get("headers") or cached_snap.get("display_headers")
+                c_keys = cached_snap.get("keys") or cached_snap.get("fields")
+                if c_headers or c_keys:
+                    headers, keys = _complete_schema_contract(c_headers or [], c_keys or [])
+                    if _usable_contract(headers, keys, target_sheet):
+                        schema_src = "recovered_from_cache_contract"
+                        recovered = True
+
+                # b) Infer from cached rows
+                if not recovered:
+                    c_rows = _coerce_rows_list(cached_snap)
+                    if c_rows and isinstance(c_rows[0], dict):
+                        headers, keys = _complete_schema_contract([], list(c_rows[0].keys()))
+                        if _usable_contract(headers, keys, target_sheet):
+                            schema_src = "recovered_from_cached_rows"
+                            recovered = True
+
+            # c) Infer from external rows (for instrument sheets)
+            if not recovered and target_sheet in INSTRUMENT_SHEETS:
+                try:
+                    ext_rows = await self._get_rows_from_external_reader(target_sheet, 1)
+                    if ext_rows and isinstance(ext_rows[0], dict):
+                        headers, keys = _complete_schema_contract([], list(ext_rows[0].keys()))
+                        if _usable_contract(headers, keys, target_sheet):
+                            schema_src = "recovered_from_external_rows"
+                            recovered = True
+                except Exception:
+                    pass
+
+        # Re-apply Top 10 contract logic safely after ANY recovery pass
         if target_sheet == "Top_10_Investments":
             headers, keys = self._top10_schema_contract(headers, keys)
+            headers, keys = _complete_schema_contract(headers, keys)
 
-        if (not headers or not keys) and self.schema_strict_sheet_rows and _SCHEMA_AVAILABLE:
+        # e) Only then Strict Failure
+        if not _usable_contract(headers, keys, target_sheet) and self.schema_strict_sheet_rows and _SCHEMA_AVAILABLE:
             return self._finalize_payload(
                 sheet=target_sheet,
                 headers=[],
@@ -3913,7 +4091,7 @@ class DataEngineV5:
                 error=f"Unknown sheet or schema missing for '{target_sheet}'",
             )
 
-        if headers and keys and _is_schema_only_body(body):
+        if _usable_contract(headers, keys, target_sheet) and _is_schema_only_body(body):
             return self._finalize_payload(
                 sheet=target_sheet,
                 headers=headers,
@@ -3935,38 +4113,77 @@ class DataEngineV5:
         # Data_Dictionary
         # ---------------------------------------------------------------------
         if target_sheet == "Data_Dictionary":
-            rows: List[Dict[str, Any]] = []
+            raw_rows: List[Dict[str, Any]] = []
             dd_note = None
             try:
                 from core.sheets.data_dictionary import build_data_dictionary_rows as _dd  # type: ignore
-                raw_rows = _dd(include_meta_sheet=True)
-                rows = [_normalize_to_schema_keys(keys, headers, r) for r in _coerce_rows_list(raw_rows)]
+                raw_rows = _coerce_rows_list(_dd(include_meta_sheet=True))
                 dd_note = "core.sheets.data_dictionary.build_data_dictionary_rows"
             except Exception:
-                if not headers or not keys:
-                    headers = ["Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes"]
-                    keys = ["sheet", "group", "header", "key", "dtype", "fmt", "required", "source", "notes"]
-                    schema_src = "fallback:standard_data_dictionary"
                 for sn in _list_sheet_names_best_effort():
                     sp, _, _, _ = _schema_for_sheet(sn)
-                    cols = getattr(sp, "columns", None) if sp else None
+                    cols = _schema_columns_from_any(sp)
                     if not cols:
                         continue
                     for c in cols:
-                        rr = {
-                            "sheet": sn,
-                            "group": str(getattr(c, "group", "")),
-                            "header": str(getattr(c, "header", "")),
-                            "key": str(getattr(c, "key", "")),
-                            "dtype": str(getattr(c, "dtype", "")),
-                            "fmt": str(getattr(c, "fmt", "")),
-                            "required": bool(getattr(c, "required", False)),
-                            "source": str(getattr(c, "source", "")),
-                            "notes": str(getattr(c, "notes", "")),
-                        }
-                        rows.append(_normalize_to_schema_keys(keys, headers, rr))
+                        if isinstance(c, Mapping):
+                            rr = {
+                                "sheet": sn,
+                                "group": str(c.get("group", "")),
+                                "header": str(c.get("header", "")),
+                                "key": str(c.get("key", "")),
+                                "dtype": str(c.get("dtype", "")),
+                                "fmt": str(c.get("fmt", "")),
+                                "required": bool(c.get("required", False)),
+                                "source": str(c.get("source", "")),
+                                "notes": str(c.get("notes", "")),
+                            }
+                        else:
+                            rr = {
+                                "sheet": sn,
+                                "group": str(getattr(c, "group", "")),
+                                "header": str(getattr(c, "header", "")),
+                                "key": str(getattr(c, "key", "")),
+                                "dtype": str(getattr(c, "dtype", "")),
+                                "fmt": str(getattr(c, "fmt", "")),
+                                "required": bool(getattr(c, "required", False)),
+                                "source": str(getattr(c, "source", "")),
+                                "notes": str(getattr(c, "notes", "")),
+                            }
+                        raw_rows.append(rr)
                 dd_note = "fallback:internal"
 
+            if not _usable_contract(headers, keys, target_sheet) and not self.schema_strict_sheet_rows and raw_rows and isinstance(raw_rows[0], dict):
+                keys = list(raw_rows[0].keys())
+                headers = [str(k).replace("_", " ").title() for k in keys]
+                headers, keys = _complete_schema_contract(headers, keys)
+
+            if not _usable_contract(headers, keys, target_sheet):
+                headers = ["Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes"]
+                keys = ["sheet", "group", "header", "key", "dtype", "fmt", "required", "source", "notes"]
+                headers, keys = _complete_schema_contract(headers, keys)
+                if "fallback" not in schema_src:
+                    schema_src = "fallback:standard_data_dictionary"
+
+            if _is_schema_only_body(body):
+                return self._finalize_payload(
+                    sheet="Data_Dictionary",
+                    headers=headers,
+                    keys=keys,
+                    rows=[],
+                    include_matrix=include_matrix,
+                    status="success",
+                    meta={
+                        "schema_source": schema_src,
+                        "builder": dd_note,
+                        "rows": 0,
+                        "limit": limit,
+                        "offset": offset,
+                        "built_from": "schema_only_special_path",
+                    },
+                )
+
+            rows = [_normalize_to_schema_keys(keys, headers, r) for r in raw_rows]
             full_rows = self._project_rows_to_schema(rows, headers=headers, keys=keys)
             payload_full = self._finalize_payload(
                 sheet="Data_Dictionary",
@@ -4032,6 +4249,30 @@ class DataEngineV5:
                 ]
                 builder_name = "fallback:system_row"
 
+            if not _usable_contract(headers, keys, target_sheet) and not self.schema_strict_sheet_rows and rows0 and isinstance(rows0[0], dict):
+                keys = list(rows0[0].keys())
+                headers = [str(k).replace("_", " ").title() for k in keys]
+                headers, keys = _complete_schema_contract(headers, keys)
+
+            if _is_schema_only_body(body):
+                return self._finalize_payload(
+                    sheet=target_sheet,
+                    headers=headers,
+                    keys=keys,
+                    rows=[],
+                    include_matrix=include_matrix,
+                    status="success",
+                    meta={
+                        "schema_source": schema_src,
+                        "builder": builder_name,
+                        "rows": 0,
+                        "limit": limit,
+                        "offset": offset,
+                        "mode": mode,
+                        "built_from": "schema_only_special_path",
+                    },
+                )
+
             full_rows = self._project_rows_to_schema(rows0, headers=headers, keys=keys)
             payload_full = self._finalize_payload(
                 sheet=target_sheet,
@@ -4068,9 +4309,18 @@ class DataEngineV5:
         if target_sheet == "Top_10_Investments":
             top10_body, route_warnings = _normalize_top10_body_for_engine(body, limit=max(1, min(limit, 50)))
             cached_before = self.get_cached_sheet_snapshot(sheet=target_sheet)
-            headers, keys = self._top10_schema_contract(headers, keys)
 
             if _is_schema_only_body(top10_body):
+                if not _usable_contract(headers, keys, target_sheet):
+                    keys = list(_SCHEMA_UNION_KEYS)
+                    for field in TOP10_REQUIRED_FIELDS:
+                        if field not in keys:
+                            keys.append(field)
+                    headers = [TOP10_REQUIRED_HEADERS.get(k, k.replace("_", " ").title()) for k in keys]
+                    headers, keys = _complete_schema_contract(headers, keys)
+                    schema_src = "schema_only_repaired_fallback"
+                    route_warnings.append("schema_repaired_for_schema_only_request")
+
                 return self._finalize_payload(
                     sheet=target_sheet,
                     headers=headers,
@@ -4119,11 +4369,15 @@ class DataEngineV5:
                 meta_extra = {"top10_error": f"{type(e).__name__}: {e}"}
                 status_out = "warn"
 
-            full_rows = self._project_rows_to_schema(rows0, headers=headers, keys=keys)
+            if _usable_contract(headers, keys, target_sheet):
+                full_rows = self._project_rows_to_schema(rows0, headers=headers, keys=keys)
+            else:
+                full_rows = []
 
             if not full_rows:
-                fallback_rows = await self._build_top10_rows_fallback(headers, keys, top10_body, limit, mode)
+                fb_headers, fb_keys, fallback_rows = await self._build_top10_rows_fallback(headers, keys, top10_body, limit, mode)
                 if fallback_rows:
+                    headers, keys = fb_headers, fb_keys
                     full_rows = fallback_rows
                     builder_used = "fallback:live_ranker"
                     route_warnings = route_warnings + ["selector_empty_used_live_ranker_fallback"]
@@ -4133,7 +4387,7 @@ class DataEngineV5:
                 cached_headers = cached_before.get("headers") if isinstance(cached_before.get("headers"), list) else headers
                 cached_keys = cached_before.get("keys") if isinstance(cached_before.get("keys"), list) else keys
                 cached_headers, cached_keys = self._top10_schema_contract(list(cached_headers), list(cached_keys))
-                if cached_rows and cached_headers and cached_keys:
+                if cached_rows and _usable_contract(cached_headers, cached_keys, target_sheet):
                     full_rows_cached = self._project_rows_to_schema(cached_rows, headers=cached_headers, keys=cached_keys)
                     rows_page = full_rows_cached[offset: offset + limit]
                     return self._finalize_payload(
@@ -4218,6 +4472,12 @@ class DataEngineV5:
                 except Exception:
                     pass
             if ext_rows:
+                # Infer contract from rows if strict mode off and contract is missing/unusable
+                if not self.schema_strict_sheet_rows and not _usable_contract(out_headers, out_keys, target_sheet) and isinstance(ext_rows[0], dict):
+                    out_keys = list(ext_rows[0].keys())
+                    out_headers = [k.replace("_", " ").title() for k in out_keys]
+                    out_headers, out_keys = _complete_schema_contract(out_headers, out_keys)
+
                 full_rows = self._project_rows_to_schema(ext_rows, headers=out_headers, keys=out_keys)
                 payload_full = self._finalize_payload(
                     sheet=target_sheet,
@@ -4254,6 +4514,12 @@ class DataEngineV5:
             cached_snap = self.get_cached_sheet_snapshot(sheet=target_sheet)
             cached_rows = _coerce_rows_list(cached_snap)
             if cached_rows:
+                # Infer contract from rows if strict mode off and contract is missing/unusable
+                if not self.schema_strict_sheet_rows and not _usable_contract(out_headers, out_keys, target_sheet) and isinstance(cached_rows[0], dict):
+                    out_keys = list(cached_rows[0].keys())
+                    out_headers = [k.replace("_", " ").title() for k in out_keys]
+                    out_headers, out_keys = _complete_schema_contract(out_headers, out_keys)
+
                 full_rows = self._project_rows_to_schema(cached_rows, headers=out_headers, keys=out_keys)
                 rows_page = full_rows[offset: offset + limit]
                 return self._finalize_payload(
@@ -4278,7 +4544,17 @@ class DataEngineV5:
 
         rows_full: List[Dict[str, Any]] = []
         if requested_symbols:
-            quotes = await self.get_enriched_quotes(requested_symbols, schema=target_sheet if target_sheet else None)
+            effective_quote_schema = target_sheet if _usable_contract(out_headers, out_keys, target_sheet) else None
+            quotes = await self.get_enriched_quotes(requested_symbols, schema=effective_quote_schema)
+            
+            # Infer contract from rows if strict mode off and contract is missing/unusable
+            if not self.schema_strict_sheet_rows and not _usable_contract(out_headers, out_keys, target_sheet) and quotes:
+                first_d = _model_to_dict(quotes[0])
+                if first_d:
+                    out_keys = list(first_d.keys())
+                    out_headers = [k.replace("_", " ").title() for k in out_keys]
+                    out_headers, out_keys = _complete_schema_contract(out_headers, out_keys)
+
             for q in quotes:
                 d = _model_to_dict(q)
                 d = _normalize_to_schema_keys(out_keys, out_headers, d) if out_keys else d
@@ -4338,96 +4614,4 @@ class DataEngineV5:
                 "built_from": built_from,
                 "auto_symbols_count": len(requested_symbols) if built_from != "body_symbols" else 0,
                 "resolved_symbols_count": len(requested_symbols),
-                "symbols_reader_source": self._symbols_reader_source,
-                "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet),
-            },
-        )
-
-    async def sheet_rows(self, *args, **kwargs) -> Dict[str, Any]:
-        return await self.get_sheet_rows(*args, **kwargs)
-
-    async def build_sheet_rows(self, *args, **kwargs) -> Dict[str, Any]:
-        return await self.get_sheet_rows(*args, **kwargs)
-
-    # -------------------------------------------------------------------------
-    # health / stats
-    # -------------------------------------------------------------------------
-    async def health(self) -> Dict[str, Any]:
-        return {
-            "status": "ok",
-            "version": self.version,
-            "schema_available": bool(_SCHEMA_AVAILABLE),
-            "snapshot_sheets": len(self._sheet_snapshots),
-        }
-
-    async def get_health(self) -> Dict[str, Any]:
-        return await self.health()
-
-    async def health_check(self) -> Dict[str, Any]:
-        return await self.health()
-
-    async def get_stats(self) -> Dict[str, Any]:
-        return {
-            "version": self.version,
-            "primary_provider": self.primary_provider,
-            "enabled_providers": self.enabled_providers,
-            "ksa_providers": self.ksa_providers,
-            "global_providers": self.global_providers,
-            "ksa_disallow_eodhd": self.ksa_disallow_eodhd,
-            "flags": dict(self.flags),
-            "provider_stats": await self._registry.get_stats(),
-            "schema_available": bool(_SCHEMA_AVAILABLE),
-            "schema_strict_sheet_rows": bool(self.schema_strict_sheet_rows),
-            "top10_force_full_schema": bool(self.top10_force_full_schema),
-            "rows_hydrate_external": bool(self.rows_hydrate_external),
-            "symbols_reader_source": self._symbols_reader_source,
-            "rows_reader_source": self._rows_reader_source,
-            "snapshot_sheets": sorted(list(self._sheet_snapshots.keys())),
-            "sheet_symbol_resolution_meta": dict(self._sheet_symbol_resolution_meta),
-        }
-
-
-_ENGINE_INSTANCE: Optional[DataEngineV5] = None
-_ENGINE_LOCK = asyncio.Lock()
-
-
-async def get_engine() -> DataEngineV5:
-    global _ENGINE_INSTANCE
-    if _ENGINE_INSTANCE is None:
-        async with _ENGINE_LOCK:
-            if _ENGINE_INSTANCE is None:
-                _ENGINE_INSTANCE = DataEngineV5()
-    return _ENGINE_INSTANCE
-
-
-async def close_engine() -> None:
-    global _ENGINE_INSTANCE
-    if _ENGINE_INSTANCE:
-        await _ENGINE_INSTANCE.aclose()
-        _ENGINE_INSTANCE = None
-
-
-def get_cache() -> Any:
-    global _ENGINE_INSTANCE
-    return getattr(_ENGINE_INSTANCE, "_cache", None)
-
-
-DataEngineV4 = DataEngineV5
-DataEngineV3 = DataEngineV5
-DataEngineV2 = DataEngineV5
-DataEngine = DataEngineV5
-
-__all__ = [
-    "DataEngineV5",
-    "DataEngineV4",
-    "DataEngineV3",
-    "DataEngineV2",
-    "DataEngine",
-    "get_engine",
-    "close_engine",
-    "get_cache",
-    "QuoteQuality",
-    "DataSource",
-    "__version__",
-    "normalize_row_to_schema",
-]
+                "symbols
