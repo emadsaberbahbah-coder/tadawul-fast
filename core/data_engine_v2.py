@@ -4614,4 +4614,96 @@ class DataEngineV5:
                 "built_from": built_from,
                 "auto_symbols_count": len(requested_symbols) if built_from != "body_symbols" else 0,
                 "resolved_symbols_count": len(requested_symbols),
-                "symbols
+                "symbols_reader_source": self._symbols_reader_source,
+                "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet),
+            },
+        )
+
+    async def sheet_rows(self, *args, **kwargs) -> Dict[str, Any]:
+        return await self.get_sheet_rows(*args, **kwargs)
+
+    async def build_sheet_rows(self, *args, **kwargs) -> Dict[str, Any]:
+        return await self.get_sheet_rows(*args, **kwargs)
+
+    # -------------------------------------------------------------------------
+    # health / stats
+    # -------------------------------------------------------------------------
+    async def health(self) -> Dict[str, Any]:
+        return {
+            "status": "ok",
+            "version": self.version,
+            "schema_available": bool(_SCHEMA_AVAILABLE),
+            "snapshot_sheets": len(self._sheet_snapshots),
+        }
+
+    async def get_health(self) -> Dict[str, Any]:
+        return await self.health()
+
+    async def health_check(self) -> Dict[str, Any]:
+        return await self.health()
+
+    async def get_stats(self) -> Dict[str, Any]:
+        return {
+            "version": self.version,
+            "primary_provider": self.primary_provider,
+            "enabled_providers": self.enabled_providers,
+            "ksa_providers": self.ksa_providers,
+            "global_providers": self.global_providers,
+            "ksa_disallow_eodhd": self.ksa_disallow_eodhd,
+            "flags": dict(self.flags),
+            "provider_stats": await self._registry.get_stats(),
+            "schema_available": bool(_SCHEMA_AVAILABLE),
+            "schema_strict_sheet_rows": bool(self.schema_strict_sheet_rows),
+            "top10_force_full_schema": bool(self.top10_force_full_schema),
+            "rows_hydrate_external": bool(self.rows_hydrate_external),
+            "symbols_reader_source": self._symbols_reader_source,
+            "rows_reader_source": self._rows_reader_source,
+            "snapshot_sheets": sorted(list(self._sheet_snapshots.keys())),
+            "sheet_symbol_resolution_meta": dict(self._sheet_symbol_resolution_meta),
+        }
+
+
+_ENGINE_INSTANCE: Optional[DataEngineV5] = None
+_ENGINE_LOCK = asyncio.Lock()
+
+
+async def get_engine() -> DataEngineV5:
+    global _ENGINE_INSTANCE
+    if _ENGINE_INSTANCE is None:
+        async with _ENGINE_LOCK:
+            if _ENGINE_INSTANCE is None:
+                _ENGINE_INSTANCE = DataEngineV5()
+    return _ENGINE_INSTANCE
+
+
+async def close_engine() -> None:
+    global _ENGINE_INSTANCE
+    if _ENGINE_INSTANCE:
+        await _ENGINE_INSTANCE.aclose()
+        _ENGINE_INSTANCE = None
+
+
+def get_cache() -> Any:
+    global _ENGINE_INSTANCE
+    return getattr(_ENGINE_INSTANCE, "_cache", None)
+
+
+DataEngineV4 = DataEngineV5
+DataEngineV3 = DataEngineV5
+DataEngineV2 = DataEngineV5
+DataEngine = DataEngineV5
+
+__all__ = [
+    "DataEngineV5",
+    "DataEngineV4",
+    "DataEngineV3",
+    "DataEngineV2",
+    "DataEngine",
+    "get_engine",
+    "close_engine",
+    "get_cache",
+    "QuoteQuality",
+    "DataSource",
+    "__version__",
+    "normalize_row_to_schema",
+]
