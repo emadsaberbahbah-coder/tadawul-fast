@@ -2,7 +2,7 @@
 # routes/data_dictionary.py
 """
 ================================================================================
-Schema Router — v2.4.0 (UNIFIED / REGISTRY-FIRST / BACKWARD-COMPATIBLE)
+Schema Router — v2.5.0 (UNIFIED / REGISTRY-FIRST / FORMAT-COMPATIBLE)
 ================================================================================
 
 Endpoints
@@ -23,12 +23,12 @@ Single schema router that exposes:
 
 Why this revision
 -----------------
-- ✅ FIX: /v1/schema/sheet-spec works with or without sheet/page/name/tab
-- ✅ FIX: /v1/schema/spec alias added for backward compatibility
-- ✅ FIX: /v1/schema/pages now preserves canonical_pages + forbidden_pages
-- ✅ FIX: /v1/schema/pages also returns pages/items/results/sheets/page_items
-- ✅ FIX: /v1/schema/sheet-spec returns specs + sheet_specs containers
-- ✅ FIX: single-sheet requests return top-level headers/keys/columns/column_count
+- ✅ FIX: accepts format=json for backward compatibility in /data-dictionary
+          and /sheet-spec /spec so PowerShell sweeps do not fail with 400
+- ✅ FIX: /v1/schema/sheet-spec works with sheet / page / sheet_name / name /
+          tab / worksheet aliases
+- ✅ FIX: /v1/schema/spec remains a full alias of /sheet-spec
+- ✅ FIX: single-sheet requests always project top-level headers/keys/columns
 - ✅ FIX: grouped all-sheets response is stable and JSON-safe
 - ✅ FIX: registry-first resolution with graceful Data_Dictionary inference fallback
 - ✅ FIX: handles dict-style, object-style, list-style, headers/keys-style schema safely
@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover
     BestJSONResponse = JSONResponse  # type: ignore
 
 
-SCHEMA_ROUTE_VERSION = "2.4.0"
+SCHEMA_ROUTE_VERSION = "2.5.0"
 router = APIRouter(prefix="/v1/schema", tags=["Schema"])
 
 
@@ -94,6 +94,40 @@ _DATA_DICTIONARY_KEYS: List[str] = list(_DATA_DICTIONARY_HEADERS)
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled"}
+
+_DATA_DICTIONARY_FORMAT_ALIASES: Dict[str, str] = {
+    "rows": "rows",
+    "row": "rows",
+    "json": "rows",
+    "records": "rows",
+    "record": "rows",
+    "table": "rows",
+    "dict": "rows",
+    "objects": "rows",
+    "values": "values",
+    "value": "values",
+    "matrix": "values",
+    "2d": "values",
+    "2d-array": "values",
+    "array": "values",
+}
+
+_SHEET_SPEC_FORMAT_ALIASES: Dict[str, str] = {
+    "grouped": "grouped",
+    "json": "grouped",
+    "object": "grouped",
+    "objects": "grouped",
+    "spec": "grouped",
+    "specs": "grouped",
+    "flat": "flat",
+    "rows": "flat",
+    "row": "flat",
+    "table": "flat",
+    "headers": "headers",
+    "header": "headers",
+    "keys": "keys",
+    "key": "keys",
+}
 
 
 # --------------------------------------------------------------------------------------
@@ -193,6 +227,8 @@ def _as_list(value: Any) -> List[Any]:
         return list(value)
     if isinstance(value, str):
         return [value]
+    if isinstance(value, Mapping):
+        return [value]
     if isinstance(value, Iterable):
         try:
             return list(value)
@@ -210,6 +246,15 @@ def _bool_q(v: Optional[str], default: bool) -> bool:
     if s in _FALSY:
         return False
     return default
+
+
+def _normalize_choice(raw: Optional[str], mapping: Dict[str, str], default: str) -> str:
+    if raw is None:
+        return default
+    s = str(raw).strip().lower()
+    if not s:
+        return default
+    return mapping.get(s, s)
 
 
 def _get_request_id(request: Optional[Request]) -> str:
@@ -286,6 +331,18 @@ def _json_safe(value: Any) -> Any:
 
     if isinstance(value, (list, tuple, set)):
         return [_json_safe(v) for v in value]
+
+    if hasattr(value, "model_dump") and callable(getattr(value, "model_dump")):
+        try:
+            return _json_safe(value.model_dump(mode="python"))
+        except Exception:
+            pass
+
+    if hasattr(value, "dict") and callable(getattr(value, "dict")):
+        try:
+            return _json_safe(value.dict())
+        except Exception:
+            pass
 
     if hasattr(value, "__dict__"):
         try:
@@ -517,22 +574,28 @@ def _normalize_page_candidate(name: Optional[str]) -> Optional[str]:
         except Exception:
             pass
 
+    aliases = _get_page_aliases()
+    alias_hit = aliases.get(raw.lower())
+    if alias_hit:
+        return alias_hit
+
     for page in _get_all_pages():
         if raw == page or raw.lower() == page.lower():
             return page
 
-    aliases = _get_page_aliases()
-    return aliases.get(raw.lower(), raw)
+    return raw
 
 
 def _resolve_requested_sheet_name(
     *,
     sheet: Optional[str] = None,
     page: Optional[str] = None,
+    sheet_name: Optional[str] = None,
     name: Optional[str] = None,
     tab: Optional[str] = None,
+    worksheet: Optional[str] = None,
 ) -> Optional[str]:
-    for candidate in (sheet, page, name, tab):
+    for candidate in (sheet, page, sheet_name, name, tab, worksheet):
         normalized = _normalize_page_candidate(candidate)
         if normalized:
             return normalized
@@ -559,6 +622,7 @@ def _extract_pages_from_object(obj: Any) -> List[str]:
                 candidate = (
                     item.get("page")
                     or item.get("sheet")
+                    or item.get("sheet_name")
                     or item.get("name")
                     or item.get("id")
                 )
@@ -791,8 +855,10 @@ def _find_spec_in_registry(sheet_name: str) -> Any:
             lambda: _get_sheet_spec_callable(sheet_name),
             lambda: _get_sheet_spec_callable(sheet=sheet_name),
             lambda: _get_sheet_spec_callable(page=sheet_name),
+            lambda: _get_sheet_spec_callable(sheet_name=sheet_name),
             lambda: _get_sheet_spec_callable(name=sheet_name),
             lambda: _get_sheet_spec_callable(tab=sheet_name),
+            lambda: _get_sheet_spec_callable(worksheet=sheet_name),
         ):
             try:
                 return call()
@@ -803,11 +869,13 @@ def _find_spec_in_registry(sheet_name: str) -> Any:
 
     headers = []
     keys = []
+
     if callable(_get_sheet_headers_callable):
         for call in (
             lambda: _get_sheet_headers_callable(sheet_name),
             lambda: _get_sheet_headers_callable(sheet=sheet_name),
             lambda: _get_sheet_headers_callable(page=sheet_name),
+            lambda: _get_sheet_headers_callable(sheet_name=sheet_name),
         ):
             try:
                 headers = [str(x) for x in _as_list(call())]
@@ -823,6 +891,7 @@ def _find_spec_in_registry(sheet_name: str) -> Any:
             lambda: _get_sheet_keys_callable(sheet_name),
             lambda: _get_sheet_keys_callable(sheet=sheet_name),
             lambda: _get_sheet_keys_callable(page=sheet_name),
+            lambda: _get_sheet_keys_callable(sheet_name=sheet_name),
         ):
             try:
                 keys = [str(x) for x in _as_list(call())]
@@ -1120,7 +1189,7 @@ def get_data_dictionary(
     request: Request,
     format: str = Query(
         default="rows",
-        description="rows (default) or values (2D array including header row)",
+        description="rows (default), json (alias of rows), or values (2D array including header row)",
     ),
     include_meta_sheet: Optional[str] = Query(
         default="true",
@@ -1136,10 +1205,15 @@ def get_data_dictionary(
         return _error(401, "Invalid token", endpoint="data-dictionary", request_id=request_id)
 
     include_meta = _bool_q(include_meta_sheet, True)
-    fmt = (format or "rows").strip().lower()
+    fmt = _normalize_choice(format, _DATA_DICTIONARY_FORMAT_ALIASES, "rows")
 
     if fmt not in {"rows", "values"}:
-        return _error(400, "format must be 'rows' or 'values'", endpoint="data-dictionary", request_id=request_id)
+        return _error(
+            400,
+            "format must be one of: rows, json, records, table, values, matrix",
+            endpoint="data-dictionary",
+            request_id=request_id,
+        )
 
     try:
         headers, keys = _get_data_dictionary_headers_and_keys()
@@ -1203,8 +1277,10 @@ def _sheet_spec_response(
     endpoint_name: str,
     sheet: Optional[str],
     page: Optional[str],
+    sheet_name: Optional[str],
     name: Optional[str],
     tab: Optional[str],
+    worksheet: Optional[str],
     format: str,
     include_aliases: Optional[str],
     token: Optional[str],
@@ -1216,18 +1292,25 @@ def _sheet_spec_response(
     if not _auth_passed(request=request, token=token, x_app_token=x_app_token, authorization=authorization):
         return _error(401, "Invalid token", endpoint=endpoint_name, request_id=request_id)
 
-    fmt = (format or "grouped").strip().lower()
+    fmt = _normalize_choice(format, _SHEET_SPEC_FORMAT_ALIASES, "grouped")
     if fmt not in {"grouped", "flat", "headers", "keys"}:
         return _error(
             400,
-            "format must be 'grouped', 'flat', 'headers', or 'keys'",
+            "format must be one of: grouped, json, flat, headers, keys",
             endpoint=endpoint_name,
             request_id=request_id,
         )
 
     try:
         include_alias_map = _bool_q(include_aliases, True)
-        normalized_sheet = _resolve_requested_sheet_name(sheet=sheet, page=page, name=name, tab=tab)
+        normalized_sheet = _resolve_requested_sheet_name(
+            sheet=sheet,
+            page=page,
+            sheet_name=sheet_name,
+            name=name,
+            tab=tab,
+            worksheet=worksheet,
+        )
 
         if normalized_sheet:
             spec = _get_sheet_spec_safe(normalized_sheet)
@@ -1255,13 +1338,16 @@ def _sheet_spec_response(
             "format": fmt,
             "sheet": normalized_sheet,
             "page": normalized_sheet,
+            "sheet_name": normalized_sheet,
             "name": normalized_sheet,
             "tab": normalized_sheet,
+            "worksheet": normalized_sheet,
             "count": len(specs),
             "pages": page_names,
             "items": page_names,
             "results": page_names,
             "sheets": page_names,
+            "page_items": page_names,
             "canonical_pages": page_names if normalized_sheet else _get_all_pages(),
             "forbidden_pages": _get_forbidden_pages(),
             "data": payload,
@@ -1308,14 +1394,16 @@ def get_sheet_spec_route(
     request: Request,
     sheet: Optional[str] = Query(
         default=None,
-        description="Optional canonical sheet name or alias. Also accepts page/name/tab aliases.",
+        description="Optional canonical sheet name or alias. Also accepts page/sheet_name/name/tab/worksheet aliases.",
     ),
     page: Optional[str] = Query(default=None, description="Alias of 'sheet'"),
+    sheet_name: Optional[str] = Query(default=None, description="Alias of 'sheet'"),
     name: Optional[str] = Query(default=None, description="Alias of 'sheet'"),
     tab: Optional[str] = Query(default=None, description="Alias of 'sheet'"),
+    worksheet: Optional[str] = Query(default=None, description="Alias of 'sheet'"),
     format: str = Query(
         default="grouped",
-        description="grouped (default), flat, headers, or keys",
+        description="grouped (default), json (alias of grouped), flat, headers, or keys",
     ),
     include_aliases: Optional[str] = Query(
         default="true",
@@ -1330,8 +1418,10 @@ def get_sheet_spec_route(
         endpoint_name="sheet-spec",
         sheet=sheet,
         page=page,
+        sheet_name=sheet_name,
         name=name,
         tab=tab,
+        worksheet=worksheet,
         format=format,
         include_aliases=include_aliases,
         token=token,
@@ -1345,14 +1435,16 @@ def get_spec_alias_route(
     request: Request,
     sheet: Optional[str] = Query(
         default=None,
-        description="Optional canonical sheet name or alias. Also accepts page/name/tab aliases.",
+        description="Optional canonical sheet name or alias. Also accepts page/sheet_name/name/tab/worksheet aliases.",
     ),
     page: Optional[str] = Query(default=None, description="Alias of 'sheet'"),
+    sheet_name: Optional[str] = Query(default=None, description="Alias of 'sheet'"),
     name: Optional[str] = Query(default=None, description="Alias of 'sheet'"),
     tab: Optional[str] = Query(default=None, description="Alias of 'sheet'"),
+    worksheet: Optional[str] = Query(default=None, description="Alias of 'sheet'"),
     format: str = Query(
         default="grouped",
-        description="grouped (default), flat, headers, or keys",
+        description="grouped (default), json (alias of grouped), flat, headers, or keys",
     ),
     include_aliases: Optional[str] = Query(
         default="true",
@@ -1367,8 +1459,10 @@ def get_spec_alias_route(
         endpoint_name="spec",
         sheet=sheet,
         page=page,
+        sheet_name=sheet_name,
         name=name,
         tab=tab,
+        worksheet=worksheet,
         format=format,
         include_aliases=include_aliases,
         token=token,
@@ -1405,6 +1499,7 @@ def get_schema_pages(
                 {
                     "page": p,
                     "sheet": p,
+                    "sheet_name": p,
                     "name": p,
                     "has_aliases": any(v == p for v in aliases.values()),
                 }
