@@ -2,46 +2,40 @@
 # routes/advisor.py
 """
 ================================================================================
-ADVISOR ROUTER — v5.4.0
-(LIVE-BY-DEFAULT / AUTH-SIGNATURE-SAFE / ENGINE-SIGNATURE-TOLERANT)
+ADVISOR ROUTER — v5.5.0
+(LIVE-BY-DEFAULT / MULTI-MODULE-RUNNER-RESOLUTION / QUERY-COMPATIBLE)
 ================================================================================
 
 What this revision fixes
 ------------------------
-- ✅ FIX: auth_ok(...) is now called safely across multiple possible signatures,
-         preventing GET /v1/advisor/recommendations from failing with 500
-         just because core.config.auth_ok changed shape.
-- ✅ FIX: advisor engine execution is now tolerant to sync/async implementations.
-- ✅ FIX: advisor engine invocation now tries multiple compatible call signatures:
-         payload/body + engine/settings/cache/debug variants.
-- ✅ FIX: snapshot warming is optional and safe; snapshot-request failures degrade
-         to live_quotes instead of crashing the route.
-- ✅ FIX: request payload normalization is stricter:
-         - symbols/symbol -> tickers
-         - page/sheet/sheet_name -> sources
-         - drops empty / None / "None"
-- ✅ FIX: result normalization accepts dict / model / list payloads and always
-         returns a JSON-safe dict response.
+- ✅ FIX: short /v1/advisor/* family now resolves advisor runner from:
+         - app.state
+         - multiple core module candidates
+         - direct functions
+         - factory-returned service objects
+         - engine/service class instances
+- ✅ FIX: avoids 503 "Advisor engine runner not found" when the runner exists
+         under a different expected module/object path.
+- ✅ FIX: recommendations endpoint now accepts modern advisor query criteria:
+         risk_level, confidence_level, investment_period_days, min_expected_roi,
+         limit, horizon_days, min_confidence.
+- ✅ FIX: source normalization now safely falls back to base live pages when
+         derived pages (Top_10_Investments / Insights_Analysis / etc.) are passed.
+- ✅ FIX: advisor runner invocation is more signature-tolerant.
+- ✅ FIX: health/meta now expose runner discovery details where available.
 - ✅ SAFE: no network calls at import time.
-- ✅ SAFE: health/metrics remain lightweight and startup-safe.
-
-Endpoints
----------
-GET  /v1/advisor/health
-GET  /v1/advisor/metrics
-POST /v1/advisor/run
-GET  /v1/advisor/recommendations
 ================================================================================
 """
 
 from __future__ import annotations
 
 import asyncio
+import importlib
 import inspect
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, Response, status
 
@@ -49,7 +43,88 @@ router = APIRouter(prefix="/v1/advisor", tags=["advisor"])
 
 logger = logging.getLogger("routes.advisor")
 
-ADVISOR_ROUTE_VERSION = "5.4.0"
+ADVISOR_ROUTE_VERSION = "5.5.0"
+
+_BASE_SOURCE_PAGES = [
+    "Market_Leaders",
+    "Global_Markets",
+    "Mutual_Funds",
+    "Commodities_FX",
+    "My_Portfolio",
+]
+
+_DERIVED_OR_NON_SOURCE_PAGES = {
+    "KSA_TADAWUL",
+    "Advisor_Criteria",
+    "AI_Opportunity_Report",
+    "Insights_Analysis",
+    "Top_10_Investments",
+    "Data_Dictionary",
+}
+
+_RUNNER_NAME_CANDIDATES = (
+    "run_investment_advisor",
+    "run_advisor",
+    "execute_investment_advisor",
+    "execute_advisor",
+    "run",
+    "execute",
+    "recommend",
+    "recommend_investments",
+    "build_recommendations",
+    "get_recommendations",
+)
+
+_FACTORY_OR_OBJECT_CANDIDATES = (
+    "advisor",
+    "investment_advisor",
+    "advisor_service",
+    "investment_advisor_service",
+    "advisor_engine",
+    "investment_advisor_engine",
+    "runner",
+    "advisor_runner",
+    "investment_advisor_runner",
+    "Advisor",
+    "InvestmentAdvisor",
+    "AdvisorService",
+    "InvestmentAdvisorService",
+    "AdvisorEngine",
+    "InvestmentAdvisorEngine",
+    "AdvisorRunner",
+    "InvestmentAdvisorRunner",
+    "create_advisor",
+    "create_investment_advisor",
+    "build_advisor",
+    "build_investment_advisor",
+    "get_advisor",
+    "get_investment_advisor",
+    "get_advisor_service",
+    "get_investment_advisor_service",
+    "create_engine_adapter",
+)
+
+_MODULE_CANDIDATES = (
+    "core.investment_advisor",
+    "core.investment_advisor_engine",
+    "core.analysis.investment_advisor",
+    "core.analysis.investment_advisor_engine",
+    "core.advisor",
+    "core.advisor_engine",
+)
+
+_STATE_RUNNER_ATTRS = (
+    "investment_advisor_runner",
+    "advisor_runner",
+    "run_investment_advisor",
+    "run_advisor",
+    "execute_investment_advisor",
+    "execute_advisor",
+    "investment_advisor_service",
+    "advisor_service",
+    "investment_advisor_engine",
+    "advisor_engine",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -462,34 +537,16 @@ def _normalize_sources(
         if not ss:
             continue
         if ss.upper() == "ALL":
-            out.extend(
-                [
-                    "Market_Leaders",
-                    "Global_Markets",
-                    "Mutual_Funds",
-                    "Commodities_FX",
-                    "My_Portfolio",
-                ]
-            )
+            out.extend(_BASE_SOURCE_PAGES)
         else:
             out.append(ss)
 
     out = _dedupe_keep_order(out)
+    out = [s for s in out if s and s not in _DERIVED_OR_NON_SOURCE_PAGES]
 
-    out = [
-        s
-        for s in out
-        if s
-        and s
-        not in {
-            "KSA_TADAWUL",
-            "Advisor_Criteria",
-            "AI_Opportunity_Report",
-            "Insights_Analysis",
-            "Top_10_Investments",
-            "Data_Dictionary",
-        }
-    ]
+    if not out:
+        out = list(_BASE_SOURCE_PAGES)
+
     return out
 
 
@@ -520,6 +577,33 @@ def _normalize_payload_keys(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     if "tickers" in p:
         p["tickers"] = _dedupe_keep_order(_list_from_any(p.get("tickers")))
+
+    risk_level = _clean_str(p.get("risk_level"))
+    risk_profile = _clean_str(p.get("risk_profile"))
+    if risk_level and not risk_profile:
+        p["risk_profile"] = risk_level
+    if risk_profile and not risk_level:
+        p["risk_level"] = risk_profile
+
+    horizon_days = p.get("horizon_days")
+    investment_period_days = p.get("investment_period_days")
+    if investment_period_days is not None and horizon_days in (None, "", "None"):
+        p["horizon_days"] = investment_period_days
+    if horizon_days is not None and investment_period_days in (None, "", "None"):
+        p["investment_period_days"] = horizon_days
+
+    min_expected_roi = p.get("min_expected_roi")
+    if min_expected_roi is not None and p.get("min_roi") in (None, "", "None"):
+        p["min_roi"] = min_expected_roi
+    if p.get("min_roi") not in (None, "", "None") and min_expected_roi in (None, "", "None"):
+        p["min_expected_roi"] = p.get("min_roi")
+
+    limit = p.get("limit")
+    top_n = p.get("top_n")
+    if limit is not None and top_n in (None, "", "None"):
+        p["top_n"] = limit
+    if top_n is not None and limit in (None, "", "None"):
+        p["limit"] = top_n
 
     cleaned: Dict[str, Any] = {}
     for k, v in p.items():
@@ -563,37 +647,122 @@ def _force_default_live_mode(payload: Dict[str, Any], *, mode_override: str = ""
 
 
 # ---------------------------------------------------------------------------
-# Advisor core loader / caller
+# Advisor runner discovery
 # ---------------------------------------------------------------------------
-def _load_advisor_module() -> Any:
+def _module_import_ok(module_name: str) -> Tuple[Optional[Any], Optional[str]]:
     try:
-        import core.investment_advisor_engine as advisor_mod  # type: ignore
-
-        return advisor_mod
+        return importlib.import_module(module_name), None
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Advisor engine module unavailable: {type(e).__name__}: {e}",
-        )
+        return None, f"{module_name}: {type(e).__name__}: {e}"
 
 
-def _resolve_advisor_runner(module: Any) -> Callable[..., Any]:
-    for fn_name in (
-        "run_investment_advisor",
-        "run_advisor",
-        "execute_investment_advisor",
-        "execute_advisor",
-    ):
-        fn = getattr(module, fn_name, None)
+def _callable_by_names(container: Any, names: Iterable[str]) -> Optional[Tuple[Callable[..., Any], str]]:
+    for name in names:
+        try:
+            fn = getattr(container, name, None)
+        except Exception:
+            fn = None
         if callable(fn):
-            return fn
+            return fn, name
+    return None
 
+
+async def _materialize_holder(holder: Any) -> Any:
+    if holder is None:
+        return None
+
+    try:
+        if inspect.isclass(holder):
+            return holder()
+    except Exception:
+        return None
+
+    if callable(holder):
+        try:
+            return await _call_maybe_async(holder)
+        except TypeError:
+            return None
+        except Exception:
+            return None
+
+    return holder
+
+
+async def _resolve_runner_from_container(container: Any, label: str) -> Optional[Tuple[Callable[..., Any], str, str]]:
+    direct = _callable_by_names(container, _RUNNER_NAME_CANDIDATES)
+    if direct:
+        fn, fn_name = direct
+        return fn, label, fn_name
+
+    for holder_name in _FACTORY_OR_OBJECT_CANDIDATES:
+        try:
+            holder = getattr(container, holder_name, None)
+        except Exception:
+            holder = None
+
+        if holder is None:
+            continue
+
+        obj = await _materialize_holder(holder)
+        if obj is None:
+            continue
+
+        direct_obj = _callable_by_names(obj, _RUNNER_NAME_CANDIDATES)
+        if direct_obj:
+            fn, fn_name = direct_obj
+            return fn, label, f"{holder_name}.{fn_name}"
+
+    return None
+
+
+async def _resolve_advisor_runner(request: Request) -> Tuple[Callable[..., Any], str, str]:
+    searched_labels: List[str] = []
+
+    # 1) app.state first
+    try:
+        st = getattr(request.app, "state", None)
+    except Exception:
+        st = None
+
+    if st is not None:
+        searched_labels.append("app.state")
+        direct_state = _callable_by_names(st, _STATE_RUNNER_ATTRS)
+        if direct_state:
+            fn, fn_name = direct_state
+            return fn, "app.state", fn_name
+
+        state_obj_resolved = await _resolve_runner_from_container(st, "app.state")
+        if state_obj_resolved:
+            return state_obj_resolved
+
+    # 2) module candidates
+    import_errors: List[str] = []
+    for mod_name in _MODULE_CANDIDATES:
+        mod, err = _module_import_ok(mod_name)
+        searched_labels.append(mod_name)
+        if mod is None:
+            if err:
+                import_errors.append(err)
+            continue
+
+        resolved = await _resolve_runner_from_container(mod, mod_name)
+        if resolved:
+            return resolved
+
+    logger.error(
+        "Advisor runner resolution failed. searched=%s import_errors=%s",
+        searched_labels,
+        import_errors,
+    )
     raise HTTPException(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         detail="Advisor engine runner not found",
     )
 
 
+# ---------------------------------------------------------------------------
+# Advisor invocation
+# ---------------------------------------------------------------------------
 async def _warm_adapter_if_possible(adapter: Any, sources: List[str]) -> Any:
     if adapter is None:
         return None
@@ -624,6 +793,7 @@ async def _call_advisor_runner(
     cache_strategy: str,
     cache_ttl: int,
     debug: bool,
+    request: Request,
 ) -> Dict[str, Any]:
     call_attempts = [
         {
@@ -633,6 +803,14 @@ async def _call_advisor_runner(
             "cache_strategy": cache_strategy,
             "cache_ttl": int(cache_ttl),
             "debug": bool(debug),
+            "request": request,
+        },
+        {
+            "payload": payload,
+            "engine": engine,
+            "settings": settings,
+            "debug": bool(debug),
+            "request": request,
         },
         {
             "payload": payload,
@@ -648,12 +826,12 @@ async def _call_advisor_runner(
             "cache_strategy": cache_strategy,
             "cache_ttl": int(cache_ttl),
             "debug": bool(debug),
+            "request": request,
         },
         {
             "body": payload,
             "engine": engine,
-            "cache_strategy": cache_strategy,
-            "cache_ttl": int(cache_ttl),
+            "settings": settings,
             "debug": bool(debug),
         },
         {
@@ -667,12 +845,38 @@ async def _call_advisor_runner(
         {
             "request_data": payload,
             "engine": engine,
-            "cache_strategy": cache_strategy,
-            "cache_ttl": int(cache_ttl),
+            "settings": settings,
+        },
+        {
+            "criteria": payload,
+            "engine": engine,
+            "settings": settings,
             "debug": bool(debug),
+        },
+        {
+            "params": payload,
+            "engine": engine,
+            "settings": settings,
+            "debug": bool(debug),
+        },
+        {
+            "payload": payload,
+        },
+        {
+            "body": payload,
+        },
+        {
+            "request_data": payload,
+        },
+        {
+            "criteria": payload,
+        },
+        {
+            "params": payload,
         },
     ]
 
+    out: Any = None
     for kwargs in call_attempts:
         try:
             out = await _call_maybe_async(runner, **kwargs)
@@ -683,8 +887,9 @@ async def _call_advisor_runner(
         positional_attempts = [
             (payload,),
             (payload, engine),
+            (payload, engine, settings),
+            (payload, settings, engine),
         ]
-        out = None
         last_error: Optional[Exception] = None
         for args in positional_attempts:
             try:
@@ -749,19 +954,34 @@ async def _run_advisor(
     except Exception:
         settings = None
 
-    advisor_mod = _load_advisor_module()
-    runner = _resolve_advisor_runner(advisor_mod)
+    runner, runner_source, runner_name = await _resolve_advisor_runner(request)
 
     eng_for_advisor: Any = engine
     warmed: Any = None
     adapter_used = False
 
     if use_warm:
-        create_engine_adapter = getattr(advisor_mod, "create_engine_adapter", None)
-        if callable(create_engine_adapter):
+        adapter_factory = None
+
+        # Try on resolved runner source module if it exists in app/module space
+        try:
+            source_root_name = runner_source.split(".", 1)[0]
+        except Exception:
+            source_root_name = ""
+
+        for mod_name in _MODULE_CANDIDATES:
+            mod, _ = _module_import_ok(mod_name)
+            if mod is None:
+                continue
+            candidate = getattr(mod, "create_engine_adapter", None)
+            if callable(candidate):
+                adapter_factory = candidate
+                break
+
+        if callable(adapter_factory):
             try:
                 adapter = await _call_maybe_async(
-                    create_engine_adapter,
+                    adapter_factory,
                     engine,
                     cache_strategy=_clean_str(cache_strategy).lower() or "memory",
                     cache_ttl=int(cache_ttl),
@@ -772,7 +992,7 @@ async def _run_advisor(
                     warmed = await _warm_adapter_if_possible(adapter, list(payload2.get("sources") or []))
             except TypeError:
                 try:
-                    adapter = await _call_maybe_async(create_engine_adapter, engine)
+                    adapter = await _call_maybe_async(adapter_factory, engine)
                     if adapter is not None:
                         eng_for_advisor = adapter
                         adapter_used = True
@@ -797,6 +1017,7 @@ async def _run_advisor(
         cache_strategy=_clean_str(cache_strategy).lower() or "memory",
         cache_ttl=int(cache_ttl),
         debug=bool(debug),
+        request=request,
     )
 
     meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
@@ -812,6 +1033,8 @@ async def _run_advisor(
             "warm_results": warmed,
             "cache_strategy": _clean_str(cache_strategy).lower() or "memory",
             "cache_ttl": int(cache_ttl),
+            "runner_source": runner_source,
+            "runner_name": runner_name,
         }
     )
 
@@ -844,12 +1067,24 @@ async def advisor_health(request: Request) -> Dict[str, Any]:
             except Exception:
                 continue
 
+    runner_available = False
+    runner_source = ""
+    runner_name = ""
+    try:
+        _, runner_source, runner_name = await _resolve_advisor_runner(request)
+        runner_available = True
+    except Exception:
+        runner_available = False
+
     return {
         "status": "ok" if engine else "degraded",
         "version": ADVISOR_ROUTE_VERSION,
         "engine_available": bool(engine),
         "engine_type": _safe_engine_type(engine) if engine else "none",
         "engine_health": engine_health,
+        "runner_available": runner_available,
+        "runner_source": runner_source,
+        "runner_name": runner_name,
         "default_mode": (_clean_str(os.getenv("ADVISOR_DATA_MODE")) or "live_quotes").lower(),
         "require_auth": _safe_bool_env("REQUIRE_AUTH", True),
         "prometheus_available": bool(_PROMETHEUS_AVAILABLE),
@@ -915,9 +1150,16 @@ async def advisor_recommendations(
     page: Optional[str] = Query(default=None, description="Single page alias"),
     sheet_name: Optional[str] = Query(default=None, description="Single page alias"),
     top_n: int = Query(default=20, ge=1, le=200),
+    limit: Optional[int] = Query(default=None, ge=1, le=200),
     invest_amount: float = Query(default=0.0, ge=0.0),
     allocation_strategy: str = Query(default="maximum_sharpe"),
     risk_profile: str = Query(default="moderate"),
+    risk_level: Optional[str] = Query(default=None),
+    confidence_level: Optional[str] = Query(default=None),
+    investment_period_days: Optional[int] = Query(default=None, ge=1, le=3650),
+    horizon_days: Optional[int] = Query(default=None, ge=1, le=3650),
+    min_expected_roi: Optional[float] = Query(default=None),
+    min_confidence: Optional[float] = Query(default=None),
     mode: str = Query(default="", description="snapshot | live_sheet | live_quotes | auto"),
     warm_snapshots: bool = Query(default=False),
     cache_strategy: str = Query(default="memory"),
@@ -934,15 +1176,28 @@ async def advisor_recommendations(
         authorization=authorization,
     )
 
+    effective_limit = int(limit) if limit is not None else int(top_n)
+    effective_risk_level = _clean_str(risk_level) or _clean_str(risk_profile) or "moderate"
+
     payload: Dict[str, Any] = {
         "sources": _list_from_any(sources),
         "page": _clean_str(page),
         "sheet_name": _clean_str(sheet_name),
         "tickers": _list_from_any(symbols),
-        "top_n": int(top_n),
+        "top_n": effective_limit,
+        "limit": effective_limit,
         "invest_amount": float(invest_amount),
         "allocation_strategy": _clean_str(allocation_strategy).lower() or "maximum_sharpe",
-        "risk_profile": _clean_str(risk_profile).lower() or "moderate",
+        "risk_profile": effective_risk_level,
+        "risk_level": effective_risk_level,
+        "confidence_level": _clean_str(confidence_level),
+        "investment_period_days": int(investment_period_days) if investment_period_days is not None else None,
+        "horizon_days": int(horizon_days) if horizon_days is not None else (
+            int(investment_period_days) if investment_period_days is not None else None
+        ),
+        "min_expected_roi": min_expected_roi,
+        "min_roi": min_expected_roi,
+        "min_confidence": min_confidence,
         "debug": bool(debug),
     }
 
