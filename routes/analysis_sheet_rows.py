@@ -2,12 +2,12 @@
 # routes/analysis_sheet_rows.py
 """
 ================================================================================
-Analysis Sheet-Rows Router — v2.3.0
+Analysis Sheet-Rows Router — v2.4.0
 ================================================================================
 SCHEMA-FIRST • CANONICAL PAGE DISPATCH • SPECIAL-PAGE SAFE • ROUTE-CANONICAL
 PATH-AWARE AUTH • STABLE RESPONSE SHAPE • POWERSHELL/LIVE-TEST FRIENDLY
 GET+POST SAFE • BUILDER-FLEXIBLE • ENGINE-FLEXIBLE • HEADER/KEY STABLE
-REAL-WORLD PAYLOAD TOLERANT • DATA-ENGINE FALLBACK SAFE
+REAL-WORLD PAYLOAD TOLERANT • DATA-ENGINE FALLBACK SAFE • ENRICHED-FALLBACK SAFE
 
 Endpoints
 ---------
@@ -15,17 +15,27 @@ GET  /v1/analysis/health
 GET  /v1/analysis/sheet-rows
 POST /v1/analysis/sheet-rows
 
-Goals
------
-- Keep schema_registry as the authority for headers/keys
-- Normalize page names through page_catalog
-- Handle special pages explicitly:
-    - Insights_Analysis
-    - Top_10_Investments
-    - Data_Dictionary
-- Support GET and POST probing from browser / PowerShell / Apps Script
-- Keep response envelopes stable even when builders or engine are partial
-- Avoid import-time network I/O
+What this revision fixes
+------------------------
+- ✅ FIX: base pages such as Market_Leaders / Global_Markets / Mutual_Funds /
+         Commodities_FX / My_Portfolio no longer stop at a single fragile
+         engine.get_sheet_rows(...) attempt.
+- ✅ FIX: if core/engine table-mode returns
+         "Unknown sheet or schema missing for '...'"
+         this router now falls back to enriched page builders before degrading.
+- ✅ FIX: Top_10_Investments builder resolution is broader and now tries the
+         actual public selector-style names as well:
+             - build_top10_rows
+             - build_top10_output_rows
+             - select_top10
+             - select_top10_symbols
+             - and more
+- ✅ FIX: if a Top10 builder returns only symbols/tickers, this router can enrich
+         those symbols back into schema-aligned rows using the engine.
+- ✅ FIX: stable response envelopes preserved across GET / POST / degraded cases.
+- ✅ FIX: stronger dispatch metadata for forensic PowerShell tests.
+- ✅ SAFE: no import-time network I/O.
+================================================================================
 """
 
 from __future__ import annotations
@@ -109,13 +119,18 @@ except Exception:  # pragma: no cover
     core_get_sheet_rows = None  # type: ignore
 
 
-ANALYSIS_SHEET_ROWS_VERSION = "2.3.0"
+ANALYSIS_SHEET_ROWS_VERSION = "2.4.0"
 router = APIRouter(prefix="/v1/analysis", tags=["Analysis Sheet Rows"])
 
+_BASE_SOURCE_PAGES = {
+    "Market_Leaders",
+    "Global_Markets",
+    "Commodities_FX",
+    "Mutual_Funds",
+    "My_Portfolio",
+}
+_TOP10_PAGE = "Top_10_Investments"
 
-# =============================================================================
-# Generic helpers
-# =============================================================================
 _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
     "symbol": ["ticker", "code", "instrument", "security", "symbol_code"],
     "ticker": ["symbol", "code", "instrument", "security"],
@@ -135,10 +150,72 @@ _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
     "criteria_snapshot": ["criteria", "criteria_json", "snapshot"],
 }
 
+_TOP10_MODULE_CANDIDATES = (
+    "core.analysis.top10_selector",
+    "core.analysis.top10_builder",
+    "core.analysis.top_10_builder",
+    "core.analysis.top10_investments_builder",
+    "core.analysis.top_10_investments_builder",
+    "routes.top10_investments",
+    "routes.investment_advisor",
+)
 
+_TOP10_FUNCTION_CANDIDATES = (
+    "build_top_10_investments_rows",
+    "build_top10_investments_rows",
+    "build_top_10_rows",
+    "build_top10_rows",
+    "build_top_10_output_rows",
+    "build_top10_output_rows",
+    "select_top10_rows",
+    "get_top10_rows",
+    "select_top10",
+    "select_top10_symbols",
+    "build_rows",
+)
+
+_INSIGHTS_MODULE_CANDIDATES = (
+    "core.analysis.insights_builder",
+    "routes.advanced_analysis",
+    "routes.ai_analysis",
+)
+
+_INSIGHTS_FUNCTION_CANDIDATES = (
+    "build_insights_analysis_rows",
+    "build_insights_rows",
+    "build_insights_output_rows",
+    "build_insights_analysis",
+    "get_insights_rows",
+    "build_rows",
+)
+
+_ENRICHED_MODULE_CANDIDATES = (
+    "core.enriched_quote",
+    "routes.enriched_quote",
+)
+
+_ENRICHED_FUNCTION_CANDIDATES = (
+    "build_enriched_sheet_rows",
+    "build_enriched_quote_rows",
+    "build_sheet_rows",
+    "build_page_rows",
+    "build_enriched_rows",
+    "get_page_rows",
+    "get_sheet_rows",
+    "run_enriched_quote",
+    "build_rows",
+)
+
+
+# =============================================================================
+# Generic helpers
+# =============================================================================
 def _strip(v: Any) -> str:
     try:
-        return str(v).strip()
+        s = str(v).strip()
+        if s.lower() in {"none", "null"}:
+            return ""
+        return s
     except Exception:
         return ""
 
@@ -204,7 +281,7 @@ def _maybe_bool(v: Any, default: bool) -> bool:
 
 
 def _split_symbols_string(v: str) -> List[str]:
-    raw = (v or "").replace(";", ",").replace("\n", ",").replace("\t", ",")
+    raw = (v or "").replace(";", ",").replace("\n", ",").replace("\t", ",").replace(" ", ",")
     parts = [p.strip() for p in raw.split(",") if p.strip()]
     out: List[str] = []
     seen = set()
@@ -309,7 +386,20 @@ def _collect_get_body(request: Request) -> Dict[str, Any]:
                 body[key] = [s.strip() for s in vals if _strip(s)]
             break
 
-    for key in ("limit", "offset", "top_n", "include_matrix"):
+    for key in (
+        "limit",
+        "offset",
+        "top_n",
+        "include_matrix",
+        "risk_level",
+        "risk_profile",
+        "confidence_level",
+        "investment_period_days",
+        "horizon_days",
+        "min_expected_roi",
+        "min_roi",
+        "min_confidence",
+    ):
         v = qp.get(key)
         if v is not None:
             body[key] = v
@@ -475,7 +565,10 @@ def _ensure_page_allowed(page: str) -> None:
     if page in forbidden:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"error": f"Forbidden/removed page: {page}", "forbidden_pages": sorted(list(forbidden))},
+            detail={
+                "error": f"Forbidden/removed page: {page}",
+                "forbidden_pages": sorted(list(forbidden)),
+            },
         )
 
     try:
@@ -542,13 +635,15 @@ def _key_variants(key: str) -> List[str]:
         k.replace("_", "").lower(),
     ]
     for alias in _FIELD_ALIAS_HINTS.get(k, []):
-        variants.extend([
-            alias,
-            alias.lower(),
-            alias.upper(),
-            alias.replace("_", " "),
-            alias.replace("_", "").lower(),
-        ])
+        variants.extend(
+            [
+                alias,
+                alias.lower(),
+                alias.upper(),
+                alias.replace("_", " "),
+                alias.replace("_", "").lower(),
+            ]
+        )
 
     seen = set()
     out: List[str] = []
@@ -595,12 +690,10 @@ def _normalize_to_schema_keys(
 
         out[ks] = v
 
-    # Light enrichment / field harmonization
     if "symbol" in out and not out.get("symbol"):
         out["symbol"] = _extract_from_raw(raw, _key_variants("symbol"))
     if "ticker" in out and not out.get("ticker"):
         out["ticker"] = _extract_from_raw(raw, _key_variants("ticker"))
-
     if "current_price" in out and out.get("current_price") is None:
         out["current_price"] = _extract_from_raw(raw, _key_variants("current_price"))
 
@@ -612,25 +705,38 @@ def _extract_rows_like(payload: Any) -> List[Dict[str, Any]]:
         return []
 
     if isinstance(payload, list):
-        if payload and isinstance(payload[0], (list, tuple)):
+        if not payload:
             return []
-        return [_to_plain_dict(r) for r in payload]
+
+        if isinstance(payload[0], dict):
+            return [_to_plain_dict(r) for r in payload]
+
+        if isinstance(payload[0], (list, tuple)):
+            return []
+
+        # important for selector functions that return symbols only
+        out: List[Dict[str, Any]] = []
+        for item in payload:
+            s = _strip(item)
+            if s:
+                out.append({"symbol": s, "ticker": s})
+        return out
 
     if isinstance(payload, dict):
-        for name in ("rows", "data", "items", "records", "quotes"):
+        for name in ("rows", "data", "items", "records", "quotes", "recommendations"):
             value = payload.get(name)
             if isinstance(value, list):
                 if value and isinstance(value[0], (list, tuple)):
                     continue
-                return [_to_plain_dict(r) for r in value]
+                return _extract_rows_like(value)
 
             if isinstance(value, dict):
-                for inner_name in ("rows", "data", "items", "records", "quotes"):
+                for inner_name in ("rows", "data", "items", "records", "quotes", "recommendations"):
                     inner = value.get(inner_name)
                     if isinstance(inner, list):
                         if inner and isinstance(inner[0], (list, tuple)):
                             continue
-                        return [_to_plain_dict(r) for r in inner]
+                        return _extract_rows_like(inner)
 
         for name in ("payload", "result"):
             nested = payload.get(name)
@@ -663,12 +769,38 @@ def _extract_matrix_like(payload: Any) -> Optional[List[List[Any]]]:
     return None
 
 
+def _extract_symbol_list_like(payload: Any) -> List[str]:
+    if payload is None:
+        return []
+
+    if isinstance(payload, list):
+        out: List[str] = []
+        for item in payload:
+            if isinstance(item, str):
+                s = _strip(item)
+                if s:
+                    out.append(s)
+            elif isinstance(item, dict):
+                s = _strip(item.get("symbol") or item.get("ticker"))
+                if s:
+                    out.append(s)
+        return out
+
+    if isinstance(payload, dict):
+        for key in ("symbols", "tickers", "selected_symbols", "selected_tickers", "universe", "top_symbols"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return [_strip(x) for x in value if _strip(x)]
+
+    return []
+
+
 def _extract_status_error(payload: Any) -> Tuple[str, Optional[str], Dict[str, Any]]:
     if not isinstance(payload, dict):
         return "success", None, {}
 
     status_out = _strip(payload.get("status")) or "success"
-    error_out = payload.get("error")
+    error_out = payload.get("error") or payload.get("detail") or payload.get("message")
     meta_out = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
     return status_out, (str(error_out) if error_out is not None else None), meta_out
 
@@ -694,6 +826,32 @@ def _empty_schema_row(keys: Sequence[str], *, symbol: str = "") -> Dict[str, Any
     return row
 
 
+def _payload_has_real_rows(payload: Any) -> bool:
+    rows = _extract_rows_like(payload)
+    if rows:
+        return True
+    mx = _extract_matrix_like(payload)
+    return bool(mx)
+
+
+def _payload_looks_hard_failure(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    status_out, error_out, _ = _extract_status_error(payload)
+    if status_out.lower() in {"error", "failed", "fail"} and not _payload_has_real_rows(payload):
+        return True
+    err = _strip(error_out).lower()
+    if err and not _payload_has_real_rows(payload):
+        if (
+            "unknown sheet" in err
+            or "schema missing" in err
+            or "builder missing callable" in err
+            or "unavailable" in err
+        ):
+            return True
+    return False
+
+
 def _payload(
     *,
     page: str,
@@ -711,7 +869,7 @@ def _payload(
 ) -> Dict[str, Any]:
     rows_list = [dict(r) for r in rows]
     meta = {
-        "duration_ms": (time.time() - started_at) * 1000.0,
+        "duration_ms": round((time.time() - started_at) * 1000.0, 3),
         "mode": mode,
         "count": len(rows_list),
     }
@@ -928,6 +1086,10 @@ async def _call_builder_best_effort(
     schema_keys: Sequence[str],
     schema_headers: Sequence[str],
     friendly_name: str,
+    page: str,
+    limit: int,
+    offset: int,
+    schema: Any,
 ) -> Tuple[List[Dict[str, Any]], str, Optional[str], Dict[str, Any]]:
     try:
         mod = _import_first_available(module_names)
@@ -947,31 +1109,143 @@ async def _call_builder_best_effort(
         return [], "partial", f"{friendly_name} builder missing callable function", {"builder_missing": True}
 
     call_specs: List[Tuple[Tuple[Any, ...], Dict[str, Any]]] = [
-        ((), {"request": request, "settings": settings, "engine": engine, "mode": mode, "body": body}),
-        ((), {"request": request, "settings": settings, "data_engine": engine, "mode": mode, "body": body}),
-        ((), {"request": request, "settings": settings, "quote_engine": engine, "mode": mode, "body": body}),
-        ((), {"request": request, "settings": settings, "mode": mode, "body": body}),
-        ((), {"request": request, "engine": engine, "mode": mode, "body": body}),
-        ((), {"engine": engine, "mode": mode, "body": body}),
-        ((), {"data_engine": engine, "mode": mode, "body": body}),
-        ((), {"quote_engine": engine, "mode": mode, "body": body}),
-        ((), {"request": request, "settings": settings, "mode": mode}),
-        ((), {"settings": settings, "mode": mode, "body": body}),
-        ((), {"mode": mode, "body": body}),
-        ((), {"body": body}),
-        ((), {"request": request}),
+        (
+            (),
+            {
+                "request": request,
+                "settings": settings,
+                "engine": engine,
+                "data_engine": engine,
+                "quote_engine": engine,
+                "mode": mode,
+                "body": body,
+                "payload": body,
+                "page": page,
+                "sheet": page,
+                "sheet_name": page,
+                "limit": limit,
+                "top_n": limit,
+                "offset": offset,
+                "schema": schema,
+                "schema_keys": list(schema_keys),
+                "schema_headers": list(schema_headers),
+            },
+        ),
+        (
+            (),
+            {
+                "request": request,
+                "settings": settings,
+                "engine": engine,
+                "mode": mode,
+                "body": body,
+                "page": page,
+                "limit": limit,
+                "top_n": limit,
+                "schema": schema,
+            },
+        ),
+        (
+            (),
+            {
+                "engine": engine,
+                "criteria": body,
+                "limit": limit,
+                "mode": mode,
+            },
+        ),
+        (
+            (),
+            {
+                "engine": engine,
+                "payload": body,
+                "limit": limit,
+                "mode": mode,
+            },
+        ),
+        (
+            (),
+            {
+                "engine": engine,
+                "body": body,
+                "limit": limit,
+                "mode": mode,
+            },
+        ),
+        (
+            (),
+            {
+                "request": request,
+                "settings": settings,
+                "mode": mode,
+                "body": body,
+            },
+        ),
+        (
+            (),
+            {
+                "body": body,
+                "mode": mode,
+            },
+        ),
+        (
+            (),
+            {
+                "payload": body,
+                "mode": mode,
+            },
+        ),
+        (
+            (),
+            {
+                "criteria": body,
+                "mode": mode,
+            },
+        ),
+        ((body,), {}),
+        ((engine, body), {}),
+        ((engine,), {}),
         ((), {}),
     ]
 
     try:
         out = await _call_function_flexible(fn, call_specs)
     except Exception as e:
-        return [], "partial", f"{friendly_name} builder call failed: {e}", {"builder_call_failed": True, "builder_function": chosen_name}
+        return [], "partial", f"{friendly_name} builder call failed: {e}", {
+            "builder_call_failed": True,
+            "builder_function": chosen_name,
+        }
 
     rows = _extract_rows_like(out)
     matrix = _extract_matrix_like(out)
     if not rows and matrix:
         rows = _matrix_to_rows(matrix, schema_keys)
+
+    # if builder returned only symbols/tickers, enrich them using engine
+    if not rows:
+        selected_symbols = _extract_symbol_list_like(out)
+        if selected_symbols and engine is not None:
+            try:
+                data_map = await _fetch_analysis_rows(
+                    engine,
+                    selected_symbols,
+                    mode=mode,
+                    settings=settings,
+                    schema=schema,
+                )
+                built_rows: List[Dict[str, Any]] = []
+                for sym in selected_symbols:
+                    raw = _to_plain_dict(data_map.get(sym) or {"symbol": sym, "ticker": sym})
+                    built_rows.append(
+                        _normalize_to_schema_keys(
+                            schema_keys=schema_keys,
+                            schema_headers=schema_headers,
+                            raw=raw,
+                        )
+                    )
+                rows = built_rows
+            except Exception:
+                pass
 
     status_out, error_out, meta_out = _extract_status_error(out)
     normalized = [
@@ -1025,7 +1299,7 @@ async def _call_core_sheet_rows_best_effort(
         candidates.append(core_get_sheet_rows)
 
     if engine is not None:
-        for name in ("get_sheet_rows", "sheet_rows", "build_sheet_rows"):
+        for name in ("get_sheet_rows", "sheet_rows", "build_sheet_rows", "get_page_rows", "get_rows"):
             fn = getattr(engine, name, None)
             if callable(fn):
                 candidates.append(fn)
@@ -1033,8 +1307,12 @@ async def _call_core_sheet_rows_best_effort(
     for fn in candidates:
         call_specs = [
             ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode, "body": body}),
+            ((), {"page": page, "limit": limit, "offset": offset, "mode": mode, "body": body}),
+            ((), {"sheet_name": page, "limit": limit, "offset": offset, "mode": mode, "body": body}),
             ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode}),
+            ((), {"page": page, "limit": limit, "offset": offset, "mode": mode}),
             ((), {"sheet": page, "limit": limit, "offset": offset}),
+            ((), {"page": page, "limit": limit, "offset": offset}),
             ((page,), {"limit": limit, "offset": offset, "mode": mode, "body": body}),
             ((page,), {"limit": limit, "offset": offset, "mode": mode}),
             ((page,), {"limit": limit, "offset": offset}),
@@ -1052,6 +1330,45 @@ async def _call_core_sheet_rows_best_effort(
             continue
 
     return None
+
+
+async def _call_enriched_page_best_effort(
+    *,
+    request: Request,
+    settings: Any,
+    engine: Any,
+    page: str,
+    limit: int,
+    offset: int,
+    mode: str,
+    body: Dict[str, Any],
+    schema_keys: Sequence[str],
+    schema_headers: Sequence[str],
+    schema: Any,
+) -> Tuple[List[Dict[str, Any]], str, Optional[str], Dict[str, Any]]:
+    builder_body = dict(body or {})
+    builder_body["page"] = page
+    builder_body["sheet"] = page
+    builder_body["sheet_name"] = page
+    builder_body["limit"] = limit
+    builder_body["offset"] = offset
+
+    return await _call_builder_best_effort(
+        module_names=_ENRICHED_MODULE_CANDIDATES,
+        function_names=_ENRICHED_FUNCTION_CANDIDATES,
+        request=request,
+        settings=settings,
+        engine=engine,
+        mode=mode,
+        body=builder_body,
+        schema_keys=schema_keys,
+        schema_headers=schema_headers,
+        friendly_name=page,
+        page=page,
+        limit=limit,
+        offset=offset,
+        schema=schema,
+    )
 
 
 # =============================================================================
@@ -1183,8 +1500,9 @@ async def _analysis_sheet_rows_impl(
         )
 
     symbols = _get_list(merged_body, "symbols", "tickers", "tickers_list")
-    top_n = max(1, min(5000, _maybe_int(merged_body.get("top_n"), 2000)))
-    symbols = symbols[:top_n]
+    top_n = max(1, min(5000, _maybe_int(merged_body.get("top_n"), limit)))
+    if symbols:
+        symbols = symbols[:top_n]
 
     engine = await _get_engine(request)
 
@@ -1193,15 +1511,8 @@ async def _analysis_sheet_rows_impl(
     # -------------------------------------------------------------------------
     if route_family == "insights":
         rows, status_out, error_out, meta_out = await _call_builder_best_effort(
-            module_names=("core.analysis.insights_builder",),
-            function_names=(
-                "build_insights_analysis_rows",
-                "build_insights_rows",
-                "build_insights_output_rows",
-                "build_insights_analysis",
-                "get_insights_rows",
-                "build_rows",
-            ),
+            module_names=_INSIGHTS_MODULE_CANDIDATES,
+            function_names=_INSIGHTS_FUNCTION_CANDIDATES,
             request=request,
             settings=settings,
             engine=engine,
@@ -1210,6 +1521,10 @@ async def _analysis_sheet_rows_impl(
             schema_keys=keys,
             schema_headers=headers,
             friendly_name="Insights_Analysis",
+            page=page,
+            limit=limit,
+            offset=offset,
+            schema=spec,
         )
 
         rows = _slice(rows, limit=limit, offset=offset)
@@ -1224,10 +1539,12 @@ async def _analysis_sheet_rows_impl(
             request_id=request_id,
             started_at=start,
             mode=mode,
-            status_out=status_out or "success",
+            status_out=status_out or ("success" if rows else "partial"),
             error_out=error_out,
             meta_extra={
                 "dispatch": "insights_builder",
+                "builder": "insights_builder",
+                "schema_source": "schema_registry",
                 "limit": limit,
                 "offset": offset,
                 **meta_out,
@@ -1236,24 +1553,8 @@ async def _analysis_sheet_rows_impl(
 
     if route_family == "top10":
         rows, status_out, error_out, meta_out = await _call_builder_best_effort(
-            module_names=(
-                "core.analysis.top10_selector",
-                "core.analysis.top10_builder",
-                "core.analysis.top_10_builder",
-                "core.analysis.top_10_investments_builder",
-                "core.analysis.top10_investments_builder",
-            ),
-            function_names=(
-                "build_top_10_investments_rows",
-                "build_top10_investments_rows",
-                "build_top_10_rows",
-                "build_top10_rows",
-                "build_top_10_output_rows",
-                "build_top10_output_rows",
-                "select_top10_rows",
-                "get_top10_rows",
-                "build_rows",
-            ),
+            module_names=_TOP10_MODULE_CANDIDATES,
+            function_names=_TOP10_FUNCTION_CANDIDATES,
             request=request,
             settings=settings,
             engine=engine,
@@ -1262,6 +1563,10 @@ async def _analysis_sheet_rows_impl(
             schema_keys=keys,
             schema_headers=headers,
             friendly_name="Top_10_Investments",
+            page=page,
+            limit=limit,
+            offset=offset,
+            schema=spec,
         )
 
         rows = _slice(rows, limit=limit, offset=offset)
@@ -1280,6 +1585,8 @@ async def _analysis_sheet_rows_impl(
             error_out=error_out,
             meta_extra={
                 "dispatch": "top10_builder",
+                "builder": "top10_builder",
+                "schema_source": "schema_registry",
                 "limit": limit,
                 "offset": offset,
                 **meta_out,
@@ -1304,15 +1611,17 @@ async def _analysis_sheet_rows_impl(
             error_out=dd_error,
             meta_extra={
                 "dispatch": "data_dictionary",
+                "builder": "data_dictionary",
+                "schema_source": "schema_registry",
                 "limit": limit,
                 "offset": offset,
             },
         )
 
     # -------------------------------------------------------------------------
-    # Table mode for instrument pages (no symbols)
+    # Table mode for base source pages without explicit symbols
     # -------------------------------------------------------------------------
-    if not symbols:
+    if not symbols and page in _BASE_SOURCE_PAGES:
         payload = await _call_core_sheet_rows_best_effort(
             engine=engine,
             page=page,
@@ -1322,23 +1631,43 @@ async def _analysis_sheet_rows_impl(
             body=merged_body,
         )
 
-        if payload is None:
+        # if analysis/core path fails or returns empty error payload, fallback to enriched
+        if payload is None or _payload_looks_hard_failure(payload):
+            rows2, status2, err2, meta2 = await _call_enriched_page_best_effort(
+                request=request,
+                settings=settings,
+                engine=engine,
+                page=page,
+                limit=limit,
+                offset=offset,
+                mode=(mode or ""),
+                body=merged_body,
+                schema_keys=keys,
+                schema_headers=headers,
+                schema=spec,
+            )
+
+            rows2 = _slice(rows2, limit=limit, offset=offset)
+
             return _payload(
                 page=page,
                 route_family=route_family,
                 headers=headers,
                 keys=keys,
-                rows=[],
+                rows=rows2,
                 include_matrix=include_matrix,
                 request_id=request_id,
                 started_at=start,
                 mode=mode,
-                status_out="success",
-                error_out=None,
+                status_out=status2 or ("success" if rows2 else "partial"),
+                error_out=err2,
                 meta_extra={
                     "limit": limit,
                     "offset": offset,
-                    "dispatch": "schema_only_table_mode",
+                    "dispatch": "enriched_fallback",
+                    "builder": "enriched_fallback",
+                    "schema_source": "schema_registry",
+                    **meta2,
                 },
             )
 
@@ -1362,18 +1691,45 @@ async def _analysis_sheet_rows_impl(
             request_id=request_id,
             started_at=start,
             mode=mode,
-            status_out=status_out,
+            status_out=status_out or ("success" if rows else "partial"),
             error_out=err_out,
             meta_extra={
                 "limit": limit,
                 "offset": offset,
                 "dispatch": "core_or_engine_get_sheet_rows",
+                "builder": "engine.get_sheet_rows",
+                "schema_source": "schema_registry",
                 **meta_out,
             },
         )
 
     # -------------------------------------------------------------------------
-    # Instrument mode (symbols provided)
+    # Generic non-instrument page without symbols
+    # -------------------------------------------------------------------------
+    if not symbols and not is_instrument_page(page):
+        return _payload(
+            page=page,
+            route_family=route_family,
+            headers=headers,
+            keys=keys,
+            rows=[],
+            include_matrix=include_matrix,
+            request_id=request_id,
+            started_at=start,
+            mode=mode,
+            status_out="partial",
+            error_out=f"No table-mode handler for page '{page}'",
+            meta_extra={
+                "dispatch": "schema_only_non_instrument",
+                "builder": "schema_only",
+                "schema_source": "schema_registry",
+                "limit": limit,
+                "offset": offset,
+            },
+        )
+
+    # -------------------------------------------------------------------------
+    # Instrument mode (symbols provided OR non-base instrument page)
     # -------------------------------------------------------------------------
     if not is_instrument_page(page):
         return _payload(
@@ -1388,7 +1744,32 @@ async def _analysis_sheet_rows_impl(
             mode=mode,
             status_out="error",
             error_out=f"Page '{page}' is not an instrument page for symbol-based retrieval.",
-            meta_extra={"dispatch": "invalid_instrument_mode"},
+            meta_extra={
+                "dispatch": "invalid_instrument_mode",
+                "builder": "invalid",
+                "schema_source": "schema_registry",
+            },
+        )
+
+    # if no symbols for non-base instrument page, degrade safely
+    if not symbols:
+        return _payload(
+            page=page,
+            route_family=route_family,
+            headers=headers,
+            keys=keys,
+            rows=[],
+            include_matrix=include_matrix,
+            request_id=request_id,
+            started_at=start,
+            mode=mode,
+            status_out="partial",
+            error_out="No symbols supplied",
+            meta_extra={
+                "dispatch": "instrument_mode_no_symbols",
+                "builder": "schema_only",
+                "schema_source": "schema_registry",
+            },
         )
 
     if not engine:
@@ -1409,6 +1790,8 @@ async def _analysis_sheet_rows_impl(
                 "requested": len(symbols),
                 "errors": len(symbols),
                 "dispatch": "instrument_mode_no_engine",
+                "builder": "schema_only",
+                "schema_source": "schema_registry",
             },
         )
 
@@ -1417,6 +1800,7 @@ async def _analysis_sheet_rows_impl(
     normalize_fn = None
     try:
         from core.data_engine_v2 import normalize_row_to_schema as _n  # type: ignore
+
         normalize_fn = _n
     except Exception:
         normalize_fn = None
@@ -1475,6 +1859,8 @@ async def _analysis_sheet_rows_impl(
             "forecasting_enabled": bool(getattr(settings, "forecasting_enabled", True)) if settings else True,
             "scoring_enabled": bool(getattr(settings, "scoring_enabled", True)) if settings else True,
             "dispatch": "instrument_mode",
+            "builder": "engine.batch_quote_or_analysis",
+            "schema_source": "schema_registry",
         },
     )
 
