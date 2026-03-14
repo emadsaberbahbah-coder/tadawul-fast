@@ -3,41 +3,40 @@
 """
 routes/investment_advisor.py
 --------------------------------------------------------------------------------
-ADVANCED TOP10 / INVESTMENT ADVISOR ROUTER — v2.3.0
+ADVANCED TOP10 / INVESTMENT ADVISOR ROUTER — v2.4.0
 --------------------------------------------------------------------------------
-ALIGNMENT-FIRST • BUILDER-RESOLUTION SAFE • SCHEMA-FIRST • TIMEOUT-GUARDED
-UNCONSTRAINED-SAFE • FALLBACK-SAFE • APP-STATE / MODULE / ENGINE TOLERANT
-GET+POST ALIAS SAFE • TOP10-FIELD GUARANTEED • JSON-SAFE • CONTRACT-HARDENED
+ALIGNMENT-FIRST • SHARED-RESOLVER READY • BUILDER-RESOLUTION SAFE • SCHEMA-FIRST
+TIMEOUT-GUARDED • UNCONSTRAINED-SAFE • FALLBACK-SAFE • APP-STATE / MODULE /
+ENGINE TOLERANT • GET+POST ALIAS SAFE • TOP10-FIELD GUARANTEED • JSON-SAFE
+CONTRACT-HARDENED
 
 Why this revision
 -----------------
-- ✅ FIX: builder discovery is stricter and safer:
-      - true Top10/advisor builders only
-      - generic sheet-row engine methods are NOT treated as primary builders
-      - app.state / module / factory-object / engine resolution still supported
-- ✅ FIX: builder payload normalization now supports:
+- ✅ FIX: adds shared resolver support for advisor-like runners, including:
+      - run_investment_advisor_engine
+      - run_investment_advisor
+      - run_advisor
+      - execute_investment_advisor
+      - execute_advisor
+- ✅ FIX: exports `_resolve_advisor_runner(...)` so other route families can
+      reuse the same runtime discovery logic safely.
+- ✅ FIX: Top10 builder discovery is stricter first, then safely falls back to
+      advisor-runner discovery when appropriate.
+- ✅ FIX: payload normalization is broader and safer:
       - dict payloads
       - list payloads
       - rows_matrix payloads
       - recommendations/items/data/rows/result shapes
-- ✅ FIX: schema-only responses return success when intentional, partial when degraded.
-- ✅ FIX: response envelope is more aligned with other routers:
-      - headers + keys + display_headers + rows + rows_matrix + data + items + meta
-- ✅ FIX: GET aliases accept broader inputs safely:
-      - pages / sources / page / sheet / sheet_name
-      - symbols / tickers / direct_symbols
-      - risk_level / risk_profile
-      - confidence_level / confidence_bucket
-      - investment_period_days / horizon_days / invest_period_days
-      - min_expected_roi / min_roi
-      - limit / top_n
-- ✅ FIX: derived/output pages are never used as source pages.
-- ✅ FIX: engine fallback first tries engine-level Top10/advisor methods, then
+      - single-row dict payloads
+- ✅ FIX: schema extraction is more tolerant across multiple schema modules.
+- ✅ FIX: engine fallback first tries true Top10/advisor methods, then generic
       page-row methods for Top_10_Investments only if needed.
 - ✅ FIX: Top10 special fields always backfilled:
       - top10_rank
       - selection_reason
       - criteria_snapshot
+- ✅ FIX: response envelope is aligned and stable:
+      - headers + keys + display_headers + rows + rows_matrix + data + items + meta
 - ✅ SAFE: no network calls at import time.
 
 Primary endpoints
@@ -72,7 +71,7 @@ from fastapi.encoders import jsonable_encoder
 logger = logging.getLogger("routes.investment_advisor")
 logger.addHandler(logging.NullHandler())
 
-INVESTMENT_ADVISOR_VERSION = "2.3.0"
+INVESTMENT_ADVISOR_VERSION = "2.4.0"
 TOP10_PAGE_NAME = "Top_10_Investments"
 
 _BASE_SOURCE_PAGES = [
@@ -92,7 +91,7 @@ _DERIVED_OR_NON_SOURCE_PAGES = {
     "Data_Dictionary",
 }
 
-# Primary builder discovery targets
+# Primary modules for Top10/advisor discovery
 _BUILDER_MODULE_CANDIDATES = (
     "core.analysis.top10_selector",
     "core.analysis.top10_builder",
@@ -100,10 +99,12 @@ _BUILDER_MODULE_CANDIDATES = (
     "core.investment_advisor_engine",
     "core.analysis.investment_advisor",
     "core.analysis.investment_advisor_engine",
+    "core.advisor",
+    "core.advisor_engine",
 )
 
-# Builder-like names only (not generic sheet methods)
-_BUILDER_NAME_CANDIDATES = (
+# Strict Top10 builder names
+_TOP10_BUILDER_NAME_CANDIDATES = (
     "build_top10_rows",
     "build_top10_output_rows",
     "build_top10",
@@ -113,6 +114,11 @@ _BUILDER_NAME_CANDIDATES = (
     "build_top_10_investments_rows",
     "select_top10",
     "select_top10_symbols",
+)
+
+# Advisor-like runner names
+_ADVISOR_RUNNER_NAME_CANDIDATES = (
+    "run_investment_advisor_engine",
     "run_investment_advisor",
     "run_advisor",
     "execute_investment_advisor",
@@ -126,6 +132,9 @@ _BUILDER_NAME_CANDIDATES = (
     "execute",
 )
 
+# Combined builder-like names
+_BUILDER_NAME_CANDIDATES = _TOP10_BUILDER_NAME_CANDIDATES + _ADVISOR_RUNNER_NAME_CANDIDATES
+
 # Holder/object names that may expose a builder-like callable
 _CONTAINER_NAME_CANDIDATES = (
     "top10_selector",
@@ -136,12 +145,19 @@ _CONTAINER_NAME_CANDIDATES = (
     "investment_advisor_engine",
     "advisor_runner",
     "investment_advisor_runner",
+    "advisor",
+    "investment_advisor",
+    "service",
+    "engine",
+    "runner",
     "AdvisorService",
     "InvestmentAdvisorService",
     "AdvisorEngine",
     "InvestmentAdvisorEngine",
     "Top10Selector",
     "Top10Builder",
+    "Advisor",
+    "InvestmentAdvisor",
     "create_top10_selector",
     "create_top10_builder",
     "get_top10_selector",
@@ -149,6 +165,10 @@ _CONTAINER_NAME_CANDIDATES = (
     "create_investment_advisor",
     "get_investment_advisor",
     "build_investment_advisor",
+    "create_advisor",
+    "get_advisor",
+    "build_advisor",
+    "create_engine_adapter",
 )
 
 # app.state candidates: direct callable attrs or object attrs
@@ -160,12 +180,15 @@ _STATE_ATTR_CANDIDATES = (
     "build_top10_rows",
     "select_top10",
     "select_top10_symbols",
+    "run_investment_advisor_engine",
     "run_investment_advisor",
     "run_advisor",
     "investment_advisor_service",
     "advisor_service",
     "investment_advisor_engine",
     "advisor_engine",
+    "advisor",
+    "investment_advisor",
 )
 
 # Engine fallback methods only
@@ -174,6 +197,7 @@ _ENGINE_TOP10_METHOD_CANDIDATES = (
     "build_top10_output_rows",
     "select_top10",
     "select_top10_symbols",
+    "run_investment_advisor_engine",
     "run_investment_advisor",
     "run_advisor",
     "recommend",
@@ -185,6 +209,22 @@ _ENGINE_SHEET_METHOD_CANDIDATES = (
     "get_page_rows",
     "sheet_rows",
     "build_sheet_rows",
+)
+
+_SCHEMA_MODULE_CANDIDATES = (
+    "core.sheets.schema_registry",
+    "core.schema_registry",
+    "core.page_catalog",
+    "core.schemas",
+    "core.schema",
+)
+
+_SCHEMA_FN_CANDIDATES = (
+    "get_sheet_spec",
+    "get_page_spec",
+    "get_schema_for_page",
+    "sheet_spec",
+    "build_sheet_spec",
 )
 
 router = APIRouter(prefix="/v1/advanced", tags=["advanced"])
@@ -436,19 +476,24 @@ def _model_to_dict(obj: Any) -> Dict[str, Any]:
 
 def _extract_rows_candidate(payload: Any) -> List[Dict[str, Any]]:
     if isinstance(payload, list):
-        return [dict(x) for x in payload if isinstance(x, dict)]
+        if payload and isinstance(payload[0], dict):
+            return [dict(x) for x in payload if isinstance(x, dict)]
+        return []
 
     if not isinstance(payload, dict):
         return []
 
     for key in ("rows", "recommendations", "data", "items", "results", "records", "quotes"):
         value = payload.get(key)
-        if isinstance(value, list):
+        if isinstance(value, list) and value and isinstance(value[0], dict):
             return [dict(x) for x in value if isinstance(x, dict)]
 
     result = payload.get("result")
-    if isinstance(result, list):
+    if isinstance(result, list) and result and isinstance(result[0], dict):
         return [dict(x) for x in result if isinstance(x, dict)]
+
+    if isinstance(payload.get("row"), dict):
+        return [dict(payload["row"])]
 
     return []
 
@@ -471,7 +516,48 @@ def _extract_matrix_candidate(payload: Any) -> Optional[List[List[Any]]]:
     if isinstance(rows, list) and rows and isinstance(rows[0], (list, tuple)):
         return [list(r) if isinstance(r, (list, tuple)) else [r] for r in rows]
 
+    data = payload.get("data")
+    if isinstance(data, list) and data and isinstance(data[0], (list, tuple)):
+        return [list(r) if isinstance(r, (list, tuple)) else [r] for r in data]
+
     return None
+
+
+def _extract_keys_headers(payload: Any) -> Tuple[List[str], List[str]]:
+    if not isinstance(payload, dict):
+        return [], []
+
+    headers = (
+        payload.get("display_headers")
+        or payload.get("sheet_headers")
+        or payload.get("column_headers")
+        or payload.get("headers")
+        or []
+    )
+    keys = payload.get("keys") or payload.get("fields") or []
+
+    if not isinstance(headers, list):
+        headers = []
+    if not isinstance(keys, list):
+        keys = []
+
+    clean_headers = [_s(x) for x in headers if _s(x)]
+    clean_keys = [_s(x) for x in keys if _s(x)]
+    return clean_headers, clean_keys
+
+
+def _derive_keys_from_rows(rows: List[Dict[str, Any]]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        for key in row.keys():
+            k = _s(key)
+            if k and k not in seen:
+                seen.add(k)
+                out.append(k)
+    return out
 
 
 async def _call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -687,51 +773,104 @@ def _ensure_top10_keys_present(keys: List[str], headers: List[str]) -> Tuple[Lis
     return out_keys, out_headers
 
 
-def _load_schema_defaults() -> Tuple[List[str], List[str]]:
-    try:
-        from core.sheets.schema_registry import get_sheet_spec  # type: ignore
+def _extract_columns_from_spec(spec: Any) -> List[Tuple[str, str]]:
+    columns: List[Tuple[str, str]] = []
 
-        spec = get_sheet_spec(TOP10_PAGE_NAME)
-        cols = getattr(spec, "columns", None) or []
+    # object-style spec.columns
+    raw_columns = None
+    if isinstance(spec, dict):
+        raw_columns = spec.get("columns") or spec.get("fields")
+    else:
+        raw_columns = getattr(spec, "columns", None) or getattr(spec, "fields", None)
 
-        keys = [getattr(c, "key", "") for c in cols]
-        headers = [getattr(c, "header", "") for c in cols]
+    if isinstance(raw_columns, list):
+        for col in raw_columns:
+            if isinstance(col, dict):
+                key = _s(col.get("key") or col.get("field") or col.get("name") or col.get("id"))
+                header = _s(col.get("header") or col.get("title") or col.get("label") or key)
+            else:
+                key = _s(getattr(col, "key", None) or getattr(col, "field", None) or getattr(col, "name", None))
+                header = _s(getattr(col, "header", None) or getattr(col, "title", None) or getattr(col, "label", None) or key)
 
-        keys = [k for k in keys if isinstance(k, str) and k]
-        headers = [h for h in headers if isinstance(h, str) and h]
+            if key:
+                columns.append((key, header or key))
 
-        keys, headers = _ensure_top10_keys_present(keys, headers)
-        return headers, keys
-    except Exception:
-        keys = [
-            "symbol",
-            "name",
-            "current_price",
-            "expected_roi_3m",
-            "forecast_confidence",
-            "risk_score",
-            "overall_score",
-            "recommendation",
-            "last_updated_riyadh",
-            "top10_rank",
-            "selection_reason",
-            "criteria_snapshot",
-        ]
-        headers = [
-            "Symbol",
-            "Name",
-            "Current Price",
-            "Expected ROI 3M",
-            "Forecast Confidence",
-            "Risk Score",
-            "Overall Score",
-            "Recommendation",
-            "Last Updated (Riyadh)",
-            "Top10 Rank",
-            "Selection Reason",
-            "Criteria Snapshot",
-        ]
-        return headers, keys
+    # dict-style already separated
+    if not columns and isinstance(spec, dict):
+        keys = spec.get("keys") or []
+        headers = spec.get("headers") or spec.get("display_headers") or []
+        if isinstance(keys, list):
+            for idx, key in enumerate(keys):
+                k = _s(key)
+                h = _s(headers[idx]) if isinstance(headers, list) and idx < len(headers) else k
+                if k:
+                    columns.append((k, h or k))
+
+    return columns
+
+
+def _load_schema_defaults(page_name: str = TOP10_PAGE_NAME) -> Tuple[List[str], List[str]]:
+    for mod_name in _SCHEMA_MODULE_CANDIDATES:
+        try:
+            mod = importlib.import_module(mod_name)
+        except Exception:
+            continue
+
+        for fn_name in _SCHEMA_FN_CANDIDATES:
+            fn = getattr(mod, fn_name, None)
+            if not callable(fn):
+                continue
+
+            attempts = [
+                {"sheet": page_name},
+                {"page": page_name},
+                {"sheet_name": page_name},
+                {"name": page_name},
+            ]
+
+            for kwargs in attempts:
+                try:
+                    spec = fn(**kwargs)
+                    cols = _extract_columns_from_spec(spec)
+                    if cols:
+                        keys = [k for k, _ in cols]
+                        headers = [h for _, h in cols]
+                        keys, headers = _ensure_top10_keys_present(keys, headers)
+                        return headers, keys
+                except TypeError:
+                    continue
+                except Exception:
+                    continue
+
+    keys = [
+        "symbol",
+        "name",
+        "current_price",
+        "expected_roi_3m",
+        "forecast_confidence",
+        "risk_score",
+        "overall_score",
+        "recommendation",
+        "last_updated_riyadh",
+        "top10_rank",
+        "selection_reason",
+        "criteria_snapshot",
+    ]
+    headers = [
+        "Symbol",
+        "Name",
+        "Current Price",
+        "Expected ROI 3M",
+        "Forecast Confidence",
+        "Risk Score",
+        "Overall Score",
+        "Recommendation",
+        "Last Updated (Riyadh)",
+        "Top10 Rank",
+        "Selection Reason",
+        "Criteria Snapshot",
+    ]
+    return headers, keys
 
 
 def _schema_payload(
@@ -743,6 +882,7 @@ def _schema_payload(
     meta: Dict[str, Any],
     status_text: str = "success",
     error_text: Optional[str] = None,
+    detail_text: Optional[str] = None,
 ) -> Dict[str, Any]:
     return {
         "status": status_text,
@@ -759,6 +899,7 @@ def _schema_payload(
         "items": [],
         "rows_matrix": [] if (include_matrix and keys) else None,
         "error": error_text,
+        "detail": detail_text,
         "version": INVESTMENT_ADVISOR_VERSION,
         "request_id": request_id,
         "meta": meta,
@@ -1084,9 +1225,10 @@ async def _materialize_holder(holder: Any) -> Any:
 async def _resolve_from_container(
     container: Any,
     label: str,
+    direct_names: Sequence[str],
     holder_names: Sequence[str],
 ) -> Optional[Tuple[Callable[..., Any], str, str]]:
-    direct = _callable_by_names(container, _BUILDER_NAME_CANDIDATES)
+    direct = _callable_by_names(container, direct_names)
     if direct:
         fn, fn_name = direct
         return fn, label, fn_name
@@ -1104,12 +1246,77 @@ async def _resolve_from_container(
         if obj is None:
             continue
 
-        direct_obj = _callable_by_names(obj, _BUILDER_NAME_CANDIDATES)
+        # If the holder itself resolves to a callable function/service, accept it.
+        if callable(obj) and not inspect.isclass(obj):
+            return obj, label, holder_name
+
+        direct_obj = _callable_by_names(obj, direct_names)
         if direct_obj:
             fn, fn_name = direct_obj
             return fn, label, f"{holder_name}.{fn_name}"
 
     return None
+
+
+async def _resolve_advisor_runner(
+    request: Request,
+    engine: Any = None,
+) -> Tuple[Optional[Callable[..., Any]], str, str, List[str]]:
+    searched: List[str] = []
+    import_errors: List[str] = []
+
+    try:
+        st = getattr(request.app, "state", None)
+    except Exception:
+        st = None
+
+    if st is not None:
+        searched.append("app.state")
+
+        resolved_state = await _resolve_from_container(
+            st,
+            "app.state",
+            tuple(list(_ADVISOR_RUNNER_NAME_CANDIDATES) + list(_STATE_ATTR_CANDIDATES)),
+            tuple(list(_STATE_ATTR_CANDIDATES) + list(_CONTAINER_NAME_CANDIDATES)),
+        )
+        if resolved_state:
+            fn, src, name = resolved_state
+            return fn, src, name, searched
+
+    for mod_name in _BUILDER_MODULE_CANDIDATES:
+        searched.append(mod_name)
+        try:
+            mod = importlib.import_module(mod_name)
+        except Exception as e:
+            import_errors.append(f"{mod_name}: {type(e).__name__}: {e}")
+            continue
+
+        resolved = await _resolve_from_container(
+            mod,
+            mod_name,
+            _ADVISOR_RUNNER_NAME_CANDIDATES,
+            _CONTAINER_NAME_CANDIDATES,
+        )
+        if resolved:
+            fn, src, name = resolved
+            return fn, src, name, searched
+
+    if engine is not None:
+        searched.append("engine")
+        resolved_engine = await _resolve_from_container(
+            engine,
+            "engine",
+            _ADVISOR_RUNNER_NAME_CANDIDATES,
+            _CONTAINER_NAME_CANDIDATES,
+        )
+        if resolved_engine:
+            fn, src, name = resolved_engine
+            return fn, src, name, searched
+
+    if import_errors:
+        logger.warning("Advisor runner import errors: %s", import_errors)
+
+    return None, "", "", searched
 
 
 async def _resolve_top10_builder(
@@ -1127,15 +1334,10 @@ async def _resolve_top10_builder(
     if st is not None:
         searched.append("app.state")
 
-        direct_state = _callable_by_names(st, _STATE_ATTR_CANDIDATES)
-        if direct_state:
-            fn, fn_name = direct_state
-            if fn_name in _BUILDER_NAME_CANDIDATES:
-                return fn, "app.state", fn_name, searched
-
         resolved_state = await _resolve_from_container(
             st,
             "app.state",
+            tuple(list(_TOP10_BUILDER_NAME_CANDIDATES) + list(_STATE_ATTR_CANDIDATES)),
             tuple(list(_STATE_ATTR_CANDIDATES) + list(_CONTAINER_NAME_CANDIDATES)),
         )
         if resolved_state:
@@ -1150,17 +1352,33 @@ async def _resolve_top10_builder(
             import_errors.append(f"{mod_name}: {type(e).__name__}: {e}")
             continue
 
-        resolved = await _resolve_from_container(mod, mod_name, _CONTAINER_NAME_CANDIDATES)
+        resolved = await _resolve_from_container(
+            mod,
+            mod_name,
+            _TOP10_BUILDER_NAME_CANDIDATES,
+            _CONTAINER_NAME_CANDIDATES,
+        )
         if resolved:
             fn, src, name = resolved
             return fn, src, name, searched
 
     if engine is not None:
         searched.append("engine")
-        direct_engine = _callable_by_names(engine, _ENGINE_TOP10_METHOD_CANDIDATES)
-        if direct_engine:
-            fn, fn_name = direct_engine
-            return fn, "engine", fn_name, searched
+        resolved_engine = await _resolve_from_container(
+            engine,
+            "engine",
+            _ENGINE_TOP10_METHOD_CANDIDATES,
+            _CONTAINER_NAME_CANDIDATES,
+        )
+        if resolved_engine:
+            fn, src, name = resolved_engine
+            return fn, src, name, searched
+
+    # Final safe fallback: advisor-runner discovery
+    runner, runner_source, runner_name, runner_search = await _resolve_advisor_runner(request, engine)
+    if runner is not None:
+        searched.extend([x for x in runner_search if x not in searched])
+        return runner, runner_source, runner_name, searched
 
     if import_errors:
         logger.warning("Top10 builder import errors: %s", import_errors)
@@ -1189,6 +1407,7 @@ async def _call_builder_with_tolerance(
         "top_n": eff_limit,
         "limit": eff_limit,
         "mode": mode or "",
+        "advisor_data_mode": mode or "",
     }
 
     attempts = [
@@ -1198,6 +1417,7 @@ async def _call_builder_with_tolerance(
             "limit": eff_limit,
             "top_n": eff_limit,
             "mode": mode or "",
+            "advisor_data_mode": mode or "",
             "request": request,
             "settings": settings,
             "page": TOP10_PAGE_NAME,
@@ -1227,15 +1447,19 @@ async def _call_builder_with_tolerance(
         },
         {
             "engine": engine,
-            "body": body_payload,
+            "payload": body_payload,
             "limit": eff_limit,
             "mode": mode or "",
         },
         {
-            "engine": engine,
             "payload": body_payload,
-            "limit": eff_limit,
-            "mode": mode or "",
+            "engine": engine,
+            "settings": settings,
+        },
+        {
+            "body": body_payload,
+            "engine": engine,
+            "settings": settings,
         },
         {
             "request": request,
@@ -1248,10 +1472,10 @@ async def _call_builder_with_tolerance(
             "engine": engine,
         },
         {
-            "body": body_payload,
+            "payload": body_payload,
         },
         {
-            "payload": body_payload,
+            "body": body_payload,
         },
         {
             "criteria": criteria,
@@ -1439,7 +1663,7 @@ def _normalize_selector_payload(
     criteria_used: Dict[str, Any],
     eff_limit: int,
     forced_dispatch: str = "",
-) -> Tuple[List[str], List[str], List[Dict[str, Any]], Dict[str, Any], str]:
+) -> Tuple[List[str], List[str], List[Dict[str, Any]], Dict[str, Any], str, str]:
     if isinstance(payload, dict):
         payload_dict = dict(payload)
     elif isinstance(payload, list):
@@ -1447,36 +1671,27 @@ def _normalize_selector_payload(
     else:
         payload_dict = _model_to_dict(payload)
 
-    headers = (
-        payload_dict.get("display_headers")
-        or payload_dict.get("sheet_headers")
-        or payload_dict.get("column_headers")
-        or payload_dict.get("headers")
-        or []
-    )
-    keys = payload_dict.get("keys") or payload_dict.get("fields") or []
+    headers, keys = _extract_keys_headers(payload_dict)
 
-    if not isinstance(headers, list):
-        headers = []
-    if not isinstance(keys, list):
-        keys = []
+    rows = _extract_rows_candidate(payload_dict)
+    matrix = _extract_matrix_candidate(payload_dict)
+
+    if not rows and matrix and keys:
+        rows = [{k: (row[idx] if idx < len(row) else None) for idx, k in enumerate(keys)} for row in matrix]
 
     if not headers or not keys:
         schema_headers, schema_keys = _load_schema_defaults()
-        if not headers:
-            headers = schema_headers
+        if not keys and rows:
+            keys = _derive_keys_from_rows(rows)
         if not keys:
             keys = schema_keys
+        if not headers:
+            headers = schema_headers
 
     keys, headers = _ensure_top10_keys_present(list(keys), list(headers))
 
-    rows = _extract_rows_candidate(payload_dict)
-    if not rows:
-        matrix = _extract_matrix_candidate(payload_dict)
-        if matrix:
-            rows = [{k: (row[idx] if idx < len(row) else None) for idx, k in enumerate(keys)} for row in matrix]
-
     status_out = _s(payload_dict.get("status")) or ("success" if rows else "partial")
+    detail_out = _s(payload_dict.get("detail") or payload_dict.get("error") or payload_dict.get("message"))
 
     dict_rows = [dict(r) for r in rows if isinstance(r, dict)]
     dict_rows = _apply_top10_field_backfill(dict_rows, keys=keys, criteria=criteria_used)
@@ -1488,7 +1703,7 @@ def _normalize_selector_payload(
     if forced_dispatch and not _s(meta.get("dispatch")):
         meta["dispatch"] = forced_dispatch
 
-    return headers, keys, norm_rows, dict(meta), status_out
+    return headers, keys, norm_rows, dict(meta), status_out, detail_out
 
 
 # =============================================================================
@@ -1564,6 +1779,7 @@ async def _execute_advanced_top10(
                 meta=meta,
                 status_text="partial",
                 error_text="Data engine unavailable",
+                detail_text="Data engine unavailable",
             )
         )
 
@@ -1591,6 +1807,7 @@ async def _execute_advanced_top10(
     fallback_used = False
     fallback_reason = ""
     warnings: List[str] = []
+    normalize_detail = ""
 
     # Primary builder path
     if builder is not None:
@@ -1716,12 +1933,13 @@ async def _execute_advanced_top10(
                 meta=meta,
                 status_text="partial",
                 error_text="No advanced Top10 payload could be produced",
+                detail_text="No advanced Top10 payload could be produced",
             )
         )
 
     # Normalize final payload
     s8 = time.perf_counter()
-    headers, keys, norm_rows, meta_in, status_out = _normalize_selector_payload(
+    headers, keys, norm_rows, meta_in, status_out, normalize_detail = _normalize_selector_payload(
         selected_payload,
         criteria_used=selected_criteria,
         eff_limit=eff_limit,
@@ -1793,6 +2011,7 @@ async def _execute_advanced_top10(
         "items": norm_rows,
         "rows_matrix": _rows_to_matrix(norm_rows, keys) if (include_matrix_final and keys) else None,
         "error": None if norm_rows else "No Top10 rows returned",
+        "detail": normalize_detail or (None if norm_rows else "No Top10 rows returned"),
         "version": INVESTMENT_ADVISOR_VERSION,
         "request_id": request_id,
         "meta": meta,
@@ -1808,6 +2027,8 @@ async def _execute_advanced_top10(
 async def advanced_health(request: Request) -> Dict[str, Any]:
     engine = await _get_engine(request)
     builder, builder_source, builder_name, builder_search_path = await _resolve_top10_builder(request, engine)
+    runner, runner_source, runner_name, runner_search_path = await _resolve_advisor_runner(request, engine)
+
     return jsonable_encoder(
         {
             "status": "ok" if engine else "degraded",
@@ -1819,6 +2040,10 @@ async def advanced_health(request: Request) -> Dict[str, Any]:
             "builder_source": builder_source,
             "builder_name": builder_name,
             "builder_search_path": builder_search_path,
+            "advisor_runner_available": bool(runner),
+            "advisor_runner_source": runner_source,
+            "advisor_runner_name": runner_name,
+            "advisor_runner_search_path": runner_search_path,
         }
     )
 
@@ -1961,4 +2186,9 @@ async def advanced_top10_get(
     )
 
 
-__all__ = ["router", "INVESTMENT_ADVISOR_VERSION"]
+__all__ = [
+    "router",
+    "INVESTMENT_ADVISOR_VERSION",
+    "_resolve_advisor_runner",
+    "_resolve_top10_builder",
+]
