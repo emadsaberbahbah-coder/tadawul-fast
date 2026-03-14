@@ -2,33 +2,35 @@
 # routes/advisor.py
 """
 ================================================================================
-ADVISOR ROUTER — v5.6.0
-(LIVE-BY-DEFAULT / UNIFIED-SHEET-ROWS / RESOLVER-HARDENED / QUERY-COMPATIBLE)
+ADVISOR ROUTER — v5.7.0
+(LIVE-BY-DEFAULT / UNIFIED-RUNNER / SHEET-ROWS SAFE / RESOLVER-HARDENED)
 ================================================================================
 
 What this revision fixes
 ------------------------
-- ✅ FIX: short /v1/advisor/* family now resolves advisor runner from:
+- ✅ FIX: short /v1/advisor/* family resolves the advisor runner from:
          - app.state
          - multiple core module candidates
          - direct functions
          - factory-returned service objects
-         - engine/service class instances
+         - engine/service instances
          - optional shared resolver from routes.investment_advisor
-- ✅ FIX: adds support for runner names that were missing before, including:
+- ✅ FIX: supports runner names including:
          - run_investment_advisor_engine
-- ✅ FIX: adds /v1/advisor/sheet-rows directly in this router so the short
-         advisor family no longer depends on a separate fragile route path.
-- ✅ FIX: base source pages (Market_Leaders / Global_Markets / etc.) use
-         engine sheet-row execution; derived pages (Top_10_Investments /
-         Insights_Analysis / etc.) use advisor execution and projection.
-- ✅ FIX: recommendations endpoint accepts modern advisor criteria:
-         risk_level, confidence_level, investment_period_days, min_expected_roi,
-         limit, horizon_days, min_confidence.
-- ✅ FIX: source normalization safely falls back to base live pages when
-         derived pages are passed as sources.
-- ✅ FIX: advisor runner invocation is more signature-tolerant.
-- ✅ FIX: health/meta expose runner discovery details.
+         - run_investment_advisor
+         - run_advisor
+         - execute_investment_advisor
+         - execute_advisor
+         - recommend / get_recommendations / build_recommendations
+- ✅ FIX: /v1/advisor/sheet-rows is unified through the shared advisor runner
+         instead of a fragile separate local execution path.
+- ✅ FIX: sheet-rows projection now uses schema KEYS correctly instead of trying
+         to read values using display-header labels.
+- ✅ FIX: page/sheet/sheet_name targeting is normalized consistently.
+- ✅ FIX: page-specific recommendation calls now honor page when sources were
+         not explicitly provided.
+- ✅ FIX: base pages and derived pages are both supported through one route path.
+- ✅ FIX: health endpoint exposes runner discovery details.
 - ✅ SAFE: no network calls at import time.
 ================================================================================
 """
@@ -41,15 +43,17 @@ import inspect
 import logging
 import os
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, Response, status
 
 router = APIRouter(prefix="/v1/advisor", tags=["advisor"])
 
 logger = logging.getLogger("routes.advisor")
+logger.addHandler(logging.NullHandler())
 
-ADVISOR_ROUTE_VERSION = "5.6.0"
+ADVISOR_ROUTE_VERSION = "5.7.0"
+TOP10_PAGE_NAME = "Top_10_Investments"
 
 _BASE_SOURCE_PAGES = [
     "Market_Leaders",
@@ -143,15 +147,8 @@ _STATE_RUNNER_ATTRS = (
     "advisor_engine",
 )
 
-_ENGINE_SHEET_ROWS_METHODS = (
-    "get_sheet_rows",
-    "sheet_rows",
-    "get_rows_for_page",
-    "build_sheet_rows",
-    "get_rows",
-)
-
 _SCHEMA_MODULE_CANDIDATES = (
+    "core.sheets.schema_registry",
     "core.schema_registry",
     "core.page_catalog",
     "core.schemas",
@@ -260,8 +257,14 @@ def _list_from_any(v: Any) -> List[str]:
         return _list_from_any(list(v))
 
     if isinstance(v, str):
-        s = v.replace(",", " ")
-        return [x.strip() for x in s.split() if _clean_str(x)]
+        s = v.replace(";", ",").replace("\n", ",")
+        out: List[str] = []
+        for part in s.split(","):
+            for token in part.split():
+                st = _clean_str(token)
+                if st:
+                    out.append(st)
+        return out
 
     sx = _clean_str(v)
     return [sx] if sx else []
@@ -371,7 +374,7 @@ async def _call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -
 
 def _route_family_for_page(page: str) -> str:
     p = _clean_str(page)
-    if p == "Top_10_Investments":
+    if p == TOP10_PAGE_NAME:
         return "top10"
     return "advisor"
 
@@ -387,7 +390,7 @@ def _normalize_target_page(
 
 
 # ---------------------------------------------------------------------------
-# Auth helpers (signature-safe)
+# Auth helpers
 # ---------------------------------------------------------------------------
 def _extract_auth_token(
     *,
@@ -540,7 +543,7 @@ def _require_auth_or_401(
 
 
 # ---------------------------------------------------------------------------
-# Engine accessor (lazy + safe)
+# Engine accessor
 # ---------------------------------------------------------------------------
 async def _get_engine(request: Request) -> Optional[Any]:
     try:
@@ -550,19 +553,23 @@ async def _get_engine(request: Request) -> Optional[Any]:
     except Exception:
         pass
 
-    try:
-        from core.data_engine_v2 import get_engine  # type: ignore
+    for mod_name in ("core.data_engine_v2", "core.data_engine"):
+        try:
+            mod = importlib.import_module(mod_name)
+            get_engine = getattr(mod, "get_engine", None)
+            if callable(get_engine):
+                eng = get_engine()
+                if inspect.isawaitable(eng):
+                    eng = await eng
+                return eng
+        except Exception:
+            continue
 
-        eng = get_engine()
-        if inspect.isawaitable(eng):
-            eng = await eng
-        return eng
-    except Exception:
-        return None
+    return None
 
 
 # ---------------------------------------------------------------------------
-# Request helpers (key consistency)
+# Request normalization
 # ---------------------------------------------------------------------------
 def _normalize_sources(
     *,
@@ -696,7 +703,7 @@ def _force_default_live_mode(payload: Dict[str, Any], *, mode_override: str = ""
 
 
 # ---------------------------------------------------------------------------
-# Advisor runner discovery
+# Runner discovery
 # ---------------------------------------------------------------------------
 def _module_import_ok(module_name: str) -> Tuple[Optional[Any], Optional[str]]:
     try:
@@ -789,7 +796,6 @@ async def _resolve_advisor_runner(request: Request) -> Tuple[Callable[..., Any],
     searched_labels: List[str] = []
     import_errors: List[str] = []
 
-    # 1) app.state first
     try:
         st = getattr(request.app, "state", None)
     except Exception:
@@ -806,7 +812,6 @@ async def _resolve_advisor_runner(request: Request) -> Tuple[Callable[..., Any],
         if state_obj_resolved:
             return state_obj_resolved
 
-    # 2) module candidates
     for mod_name in _MODULE_CANDIDATES:
         mod, err = _module_import_ok(mod_name)
         searched_labels.append(mod_name)
@@ -819,7 +824,6 @@ async def _resolve_advisor_runner(request: Request) -> Tuple[Callable[..., Any],
         if resolved:
             return resolved
 
-    # 3) shared route fallback if present
     shared = await _resolve_runner_via_shared_route(request)
     if shared:
         return shared
@@ -886,13 +890,6 @@ async def _call_advisor_runner(
             "settings": settings,
             "debug": bool(debug),
             "request": request,
-        },
-        {
-            "payload": payload,
-            "engine": engine,
-            "cache_strategy": cache_strategy,
-            "cache_ttl": int(cache_ttl),
-            "debug": bool(debug),
         },
         {
             "body": payload,
@@ -997,330 +994,6 @@ async def _call_advisor_runner(
     raise HTTPException(status_code=500, detail="Advisor engine returned invalid response")
 
 
-# ---------------------------------------------------------------------------
-# Schema + projection helpers
-# ---------------------------------------------------------------------------
-def _extract_headers_from_spec(spec: Any) -> List[str]:
-    if spec is None:
-        return []
-
-    if isinstance(spec, dict):
-        for key in ("headers", "display_headers", "keys", "columns"):
-            value = spec.get(key)
-            if isinstance(value, list):
-                if value and isinstance(value[0], dict):
-                    out: List[str] = []
-                    for col in value:
-                        if not isinstance(col, dict):
-                            continue
-                        name = _clean_str(
-                            col.get("name")
-                            or col.get("field")
-                            or col.get("key")
-                            or col.get("id")
-                            or col.get("header")
-                            or col.get("title")
-                        )
-                        if name:
-                            out.append(name)
-                    if out:
-                        return out
-                else:
-                    out = [_clean_str(x) for x in value if _clean_str(x)]
-                    if out:
-                        return out
-
-    return []
-
-
-async def _get_schema_headers(page: str) -> List[str]:
-    for mod_name in _SCHEMA_MODULE_CANDIDATES:
-        mod, _ = _module_import_ok(mod_name)
-        if mod is None:
-            continue
-
-        for fn_name in _SCHEMA_FN_CANDIDATES:
-            fn = getattr(mod, fn_name, None)
-            if not callable(fn):
-                continue
-
-            attempts = [
-                {"sheet": page},
-                {"page": page},
-                {"sheet_name": page},
-                {"name": page},
-            ]
-            for kwargs in attempts:
-                try:
-                    spec = await _call_maybe_async(fn, **kwargs)
-                    headers = _extract_headers_from_spec(spec)
-                    if headers:
-                        return headers
-                except TypeError:
-                    continue
-                except Exception:
-                    continue
-
-    return []
-
-
-def _rows_from_any(obj: Any) -> List[Any]:
-    if obj is None:
-        return []
-
-    if isinstance(obj, dict):
-        for key in ("rows", "recommendations", "data", "items", "results", "records", "quotes"):
-            value = obj.get(key)
-            if value is None:
-                continue
-            if isinstance(value, list):
-                return value
-            return [value]
-
-    if isinstance(obj, list):
-        return obj
-
-    return [obj]
-
-
-def _headers_from_any(obj: Any) -> List[str]:
-    if isinstance(obj, dict):
-        for key in ("headers", "display_headers", "keys", "columns"):
-            value = obj.get(key)
-            if isinstance(value, list):
-                return [_clean_str(x) for x in value if _clean_str(x)]
-    return []
-
-
-def _project_rows_to_headers(items: List[Any], headers: List[str]) -> List[List[Any]]:
-    projected: List[List[Any]] = []
-    if not headers:
-        return projected
-
-    for item in items:
-        if isinstance(item, dict):
-            projected.append([_json_safe(item.get(h)) for h in headers])
-            continue
-
-        if isinstance(item, (list, tuple)):
-            row = list(item)
-            if len(row) < len(headers):
-                row.extend([None] * (len(headers) - len(row)))
-            projected.append([_json_safe(x) for x in row[: len(headers)]])
-            continue
-
-        projected.append([_json_safe(item)] + [None] * (len(headers) - 1))
-
-    return projected
-
-
-def _derive_headers_from_items(items: List[Any]) -> List[str]:
-    seen: List[str] = []
-    seen_set = set()
-
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        for key in item.keys():
-            k = _clean_str(key)
-            if not k or k in seen_set:
-                continue
-            seen_set.add(k)
-            seen.append(k)
-
-    return seen
-
-
-async def _build_sheet_rows_from_advisor_result(
-    *,
-    page: str,
-    advisor_result: Dict[str, Any],
-    route_family: str,
-) -> Dict[str, Any]:
-    headers = _headers_from_any(advisor_result)
-    items = _rows_from_any(advisor_result)
-
-    if not headers:
-        headers = await _get_schema_headers(page)
-
-    if not headers and items:
-        headers = _derive_headers_from_items(items)
-
-    rows = _project_rows_to_headers(items, headers) if headers else []
-
-    meta = advisor_result.get("meta") if isinstance(advisor_result.get("meta"), dict) else {}
-    meta = dict(meta)
-    meta.setdefault("route_version", ADVISOR_ROUTE_VERSION)
-    meta.setdefault("projection", "advisor_result_to_sheet_rows")
-
-    status_value = _clean_str(advisor_result.get("status")) or ("success" if rows else "partial")
-    detail_value = _clean_str(
-        advisor_result.get("detail") or advisor_result.get("error") or advisor_result.get("message")
-    )
-
-    return _json_safe(
-        {
-            "status": status_value,
-            "page": page,
-            "sheet": page,
-            "route_family": route_family,
-            "headers": headers,
-            "display_headers": headers,
-            "keys": headers,
-            "rows": rows,
-            "count": len(rows),
-            "detail": detail_value,
-            "meta": meta,
-        }
-    )
-
-
-# ---------------------------------------------------------------------------
-# Engine sheet-rows execution
-# ---------------------------------------------------------------------------
-async def _call_engine_sheet_rows(
-    *,
-    engine: Any,
-    page: str,
-    limit: int,
-    mode: str,
-    body: Dict[str, Any],
-) -> Dict[str, Any]:
-    if engine is None:
-        raise HTTPException(status_code=503, detail="Data engine unavailable")
-
-    fn = None
-    fn_name = ""
-    for name in _ENGINE_SHEET_ROWS_METHODS:
-        candidate = getattr(engine, name, None)
-        if callable(candidate):
-            fn = candidate
-            fn_name = name
-            break
-
-    if fn is None:
-        raise HTTPException(status_code=503, detail="Engine sheet-rows handler not found")
-
-    attempts = [
-        {
-            "page": page,
-            "limit": limit,
-            "format": "rows",
-            "mode": mode,
-            "body": body,
-        },
-        {
-            "sheet": page,
-            "limit": limit,
-            "format": "rows",
-            "mode": mode,
-            "body": body,
-        },
-        {
-            "sheet_name": page,
-            "limit": limit,
-            "format": "rows",
-            "mode": mode,
-            "body": body,
-        },
-        {
-            "page": page,
-            "limit": limit,
-            "mode": mode,
-        },
-        {
-            "sheet": page,
-            "limit": limit,
-            "mode": mode,
-        },
-        {
-            "sheet_name": page,
-            "limit": limit,
-            "mode": mode,
-        },
-        {
-            "page": page,
-            "limit": limit,
-            "format": "rows",
-        },
-        {
-            "sheet": page,
-            "limit": limit,
-            "format": "rows",
-        },
-        {
-            "sheet_name": page,
-            "limit": limit,
-            "format": "rows",
-        },
-        {
-            "page": page,
-            "limit": limit,
-        },
-        {
-            "sheet": page,
-            "limit": limit,
-        },
-        {
-            "sheet_name": page,
-            "limit": limit,
-        },
-    ]
-
-    out: Any = None
-    for kwargs in attempts:
-        try:
-            out = await _call_maybe_async(fn, **kwargs)
-            break
-        except TypeError:
-            continue
-
-    if out is None:
-        try:
-            out = await _call_maybe_async(fn, page, limit)
-        except TypeError:
-            try:
-                out = await _call_maybe_async(fn, page)
-            except Exception as e:
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Engine sheet-rows call failed: {type(e).__name__}: {e}",
-                )
-
-    if isinstance(out, dict):
-        result = dict(out)
-    elif isinstance(out, list):
-        headers = await _get_schema_headers(page)
-        rows = _project_rows_to_headers(out, headers) if headers else out
-        result = {
-            "status": "success" if out else "partial",
-            "page": page,
-            "sheet": page,
-            "headers": headers,
-            "display_headers": headers,
-            "keys": headers,
-            "rows": rows,
-            "count": len(rows) if isinstance(rows, list) else 0,
-        }
-    else:
-        result = _model_to_dict(out)
-
-    meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
-    meta = dict(meta)
-    meta.setdefault("route_version", ADVISOR_ROUTE_VERSION)
-    meta.setdefault("engine_method", fn_name)
-    result["meta"] = meta
-
-    result.setdefault("page", page)
-    result.setdefault("sheet", page)
-    result.setdefault("route_family", "advisor")
-
-    return _json_safe(result)
-
-
-# ---------------------------------------------------------------------------
-# Core runner
-# ---------------------------------------------------------------------------
 async def _run_advisor(
     *,
     request: Request,
@@ -1433,6 +1106,222 @@ async def _run_advisor(
 
     result["meta"] = meta
     return _json_safe(result)
+
+
+# ---------------------------------------------------------------------------
+# Schema + projection helpers
+# ---------------------------------------------------------------------------
+def _extract_headers_keys_from_spec(spec: Any) -> Tuple[List[str], List[str]]:
+    headers: List[str] = []
+    keys: List[str] = []
+
+    raw_columns = None
+    if isinstance(spec, dict):
+        raw_columns = spec.get("columns") or spec.get("fields")
+        if not raw_columns:
+            maybe_keys = spec.get("keys") or []
+            maybe_headers = spec.get("headers") or spec.get("display_headers") or []
+            if isinstance(maybe_keys, list):
+                keys = [_clean_str(x) for x in maybe_keys if _clean_str(x)]
+                if isinstance(maybe_headers, list):
+                    headers = [_clean_str(x) for x in maybe_headers if _clean_str(x)]
+                if keys and not headers:
+                    headers = list(keys)
+                return headers, keys
+    else:
+        raw_columns = getattr(spec, "columns", None) or getattr(spec, "fields", None)
+
+    if isinstance(raw_columns, list):
+        for col in raw_columns:
+            if isinstance(col, dict):
+                key = _clean_str(col.get("key") or col.get("field") or col.get("name") or col.get("id"))
+                header = _clean_str(col.get("header") or col.get("title") or col.get("label") or key)
+            else:
+                key = _clean_str(getattr(col, "key", None) or getattr(col, "field", None) or getattr(col, "name", None))
+                header = _clean_str(getattr(col, "header", None) or getattr(col, "title", None) or getattr(col, "label", None) or key)
+
+            if key:
+                keys.append(key)
+                headers.append(header or key)
+
+    return headers, keys
+
+
+async def _get_schema_layout(page: str) -> Tuple[List[str], List[str]]:
+    for mod_name in _SCHEMA_MODULE_CANDIDATES:
+        mod, _ = _module_import_ok(mod_name)
+        if mod is None:
+            continue
+
+        for fn_name in _SCHEMA_FN_CANDIDATES:
+            fn = getattr(mod, fn_name, None)
+            if not callable(fn):
+                continue
+
+            attempts = [
+                {"sheet": page},
+                {"page": page},
+                {"sheet_name": page},
+                {"name": page},
+            ]
+            for kwargs in attempts:
+                try:
+                    spec = await _call_maybe_async(fn, **kwargs)
+                    headers, keys = _extract_headers_keys_from_spec(spec)
+                    if headers or keys:
+                        if not keys and headers:
+                            keys = list(headers)
+                        if not headers and keys:
+                            headers = list(keys)
+                        return headers, keys
+                except TypeError:
+                    continue
+                except Exception:
+                    continue
+
+    return [], []
+
+
+def _extract_headers_keys_from_payload(obj: Any) -> Tuple[List[str], List[str]]:
+    if not isinstance(obj, dict):
+        return [], []
+
+    headers = (
+        obj.get("display_headers")
+        or obj.get("sheet_headers")
+        or obj.get("column_headers")
+        or obj.get("headers")
+        or []
+    )
+    keys = obj.get("keys") or obj.get("fields") or []
+
+    if not isinstance(headers, list):
+        headers = []
+    if not isinstance(keys, list):
+        keys = []
+
+    clean_headers = [_clean_str(x) for x in headers if _clean_str(x)]
+    clean_keys = [_clean_str(x) for x in keys if _clean_str(x)]
+    return clean_headers, clean_keys
+
+
+def _rows_from_any(obj: Any) -> List[Any]:
+    if obj is None:
+        return []
+
+    if isinstance(obj, dict):
+        for key in ("rows", "recommendations", "data", "items", "results", "records", "quotes"):
+            value = obj.get(key)
+            if value is None:
+                continue
+            if isinstance(value, list):
+                return value
+            return [value]
+
+    if isinstance(obj, list):
+        return obj
+
+    return [obj]
+
+
+def _rows_are_matrix(rows: List[Any]) -> bool:
+    return bool(rows) and isinstance(rows[0], (list, tuple))
+
+
+def _derive_keys_from_items(items: List[Any]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for key in item.keys():
+            k = _clean_str(key)
+            if not k or k in seen:
+                continue
+            seen.add(k)
+            out.append(k)
+
+    return out
+
+
+def _project_dict_items_to_matrix(items: List[Any], keys: List[str]) -> List[List[Any]]:
+    projected: List[List[Any]] = []
+    for item in items:
+        if isinstance(item, dict):
+            projected.append([_json_safe(item.get(k)) for k in keys])
+        elif isinstance(item, (list, tuple)):
+            row = list(item)
+            if len(row) < len(keys):
+                row.extend([None] * (len(keys) - len(row)))
+            projected.append([_json_safe(x) for x in row[: len(keys)]])
+        else:
+            projected.append([_json_safe(item)] + [None] * (len(keys) - 1))
+    return projected
+
+
+async def _coerce_to_sheet_rows_response(
+    *,
+    page: str,
+    advisor_result: Dict[str, Any],
+) -> Dict[str, Any]:
+    payload = dict(advisor_result or {})
+    items = _rows_from_any(payload)
+
+    payload_headers, payload_keys = _extract_headers_keys_from_payload(payload)
+    schema_headers, schema_keys = await _get_schema_layout(page)
+
+    keys = payload_keys or schema_keys
+    headers = payload_headers or schema_headers
+
+    if not keys and headers:
+        keys = list(headers)
+    if not headers and keys:
+        headers = list(keys)
+
+    if items and not keys and isinstance(items[0], dict):
+        keys = _derive_keys_from_items(items)
+        if not headers:
+            headers = list(keys)
+
+    rows_matrix: List[List[Any]] = []
+    if _rows_are_matrix(items):
+        rows_matrix = [list(r) if isinstance(r, (list, tuple)) else [r] for r in items]
+        if not keys and headers:
+            keys = list(headers)
+        if not headers and keys:
+            headers = list(keys)
+    elif items and keys:
+        rows_matrix = _project_dict_items_to_matrix(items, keys)
+
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    meta = dict(meta)
+    meta.setdefault("route_version", ADVISOR_ROUTE_VERSION)
+    meta.setdefault("projection", "advisor_result_to_sheet_rows")
+
+    status_value = _clean_str(payload.get("status"))
+    if not status_value:
+        status_value = "success" if rows_matrix else "partial"
+
+    detail_value = _clean_str(payload.get("detail") or payload.get("error") or payload.get("message"))
+
+    return _json_safe(
+        {
+            "status": status_value,
+            "page": page,
+            "sheet": page,
+            "route_family": _route_family_for_page(page),
+            "headers": headers,
+            "display_headers": headers,
+            "keys": keys,
+            "rows": rows_matrix,
+            "count": len(rows_matrix),
+            "detail": detail_value,
+            "meta": meta,
+            "version": payload.get("version") or ADVISOR_ROUTE_VERSION,
+            "request_id": payload.get("request_id") or meta.get("request_id"),
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1569,10 +1458,16 @@ async def advisor_recommendations(
 
     effective_limit = int(limit) if limit is not None else int(top_n)
     effective_risk_level = _clean_str(risk_level) or _clean_str(risk_profile) or "moderate"
+    effective_page = _clean_str(page) or _clean_str(sheet_name)
+    normalized_sources = _list_from_any(sources)
+
+    # Honor page-specific requests when sources were not explicitly narrowed.
+    if effective_page and (not normalized_sources or normalized_sources == ["ALL"]):
+        normalized_sources = [effective_page]
 
     payload: Dict[str, Any] = {
-        "sources": _list_from_any(sources),
-        "page": _clean_str(page),
+        "sources": normalized_sources,
+        "page": effective_page,
         "sheet_name": _clean_str(sheet_name),
         "tickers": _list_from_any(symbols),
         "top_n": effective_limit,
@@ -1641,11 +1536,15 @@ async def advisor_sheet_rows(
     target_page = _normalize_target_page(page=page, sheet=sheet, sheet_name=sheet_name)
     effective_limit = int(top_n) if top_n is not None else int(limit)
 
+    normalized_sources = _list_from_any(sources)
+    if target_page and (not normalized_sources or normalized_sources == ["ALL"]):
+        normalized_sources = [target_page]
+
     payload: Dict[str, Any] = {
         "page": target_page,
         "sheet": target_page,
         "sheet_name": target_page,
-        "sources": _list_from_any(sources),
+        "sources": normalized_sources,
         "tickers": _list_from_any(symbols),
         "limit": effective_limit,
         "top_n": effective_limit,
@@ -1662,22 +1561,9 @@ async def advisor_sheet_rows(
         "min_roi": min_expected_roi,
         "min_confidence": min_confidence,
         "debug": bool(debug),
+        "format": "rows",
     }
 
-    # Base source pages -> use engine sheet-rows directly.
-    if target_page in _BASE_SOURCE_PAGES:
-        engine = await _get_engine(request)
-        result = await _call_engine_sheet_rows(
-            engine=engine,
-            page=target_page,
-            limit=effective_limit,
-            mode=_normalize_mode(mode) or "live_quotes",
-            body=payload,
-        )
-        result["route_family"] = "advisor"
-        return result
-
-    # Derived pages -> use advisor execution then project to sheet rows.
     advisor_result = await _run_advisor(
         request=request,
         payload=payload,
@@ -1688,10 +1574,9 @@ async def advisor_sheet_rows(
         debug=bool(debug),
     )
 
-    return await _build_sheet_rows_from_advisor_result(
+    return await _coerce_to_sheet_rows_response(
         page=target_page,
         advisor_result=advisor_result,
-        route_family=_route_family_for_page(target_page),
     )
 
 
