@@ -2,24 +2,42 @@
 """
 routes/investment_advisor.py
 --------------------------------------------------------------------------------
-ADVANCED TOP10 / INVESTMENT ADVISOR ROUTER — v2.1.0
+ADVANCED TOP10 / INVESTMENT ADVISOR ROUTER — v2.2.0
 --------------------------------------------------------------------------------
-ROUTE-STABILITY FIRST • SELECTOR-PRESERVING • SCHEMA-FIRST • TIMEOUT-GUARDED
-UNCONSTRAINED-SAFE • FALLBACK-SAFE • GATEWAY-ESCALATION RESISTANT
+ALIGNMENT-FIRST • BUILDER-RESOLUTION SAFE • SCHEMA-FIRST • TIMEOUT-GUARDED
+UNCONSTRAINED-SAFE • FALLBACK-SAFE • APP-STATE / MODULE / ENGINE TOLERANT
+GET+POST ALIAS SAFE • TOP10-FIELD GUARANTEED • JSON-SAFE
 
 Why this revision
 -----------------
-- ✅ FIX: keeps core/analysis/top10_selector.py untouched
-- ✅ FIX: unstable advanced Top10 requests are guarded at the route level
-- ✅ FIX: unconstrained requests are narrowed safely before they become too expensive
-- ✅ FIX: timeout / selector failures degrade to safe schema-aligned payloads
-- ✅ FIX: avoids turning slow selector behavior into hard 500/502/503 route crashes
-- ✅ FIX: supports advanced route aliases consistently
-- ✅ FIX: preserves / exposes selector diagnostics where available
-- ✅ FIX: guarantees Top10 special fields are present in output:
+- ✅ FIX: builder discovery is now much more tolerant:
+      - app.state
+      - multiple core modules
+      - direct functions
+      - factory/service objects
+      - engine-level methods
+- ✅ FIX: avoids false "builder missing callable" when the callable exists
+      under a different path/name/object.
+- ✅ FIX: auth_ok(...) is now called safely across multiple possible signatures.
+- ✅ FIX: GET aliases added for easier route-level testing:
+      - GET /v1/advanced/sheet-rows
+      - GET /v1/advanced/recommendations
+      - POST /v1/advanced/run
+- ✅ FIX: criteria normalization accepts broader advanced advisor inputs:
+      - risk_level / risk_profile
+      - confidence_level / confidence_bucket
+      - investment_period_days / horizon_days / invest_period_days
+      - min_expected_roi / min_roi
+      - limit / top_n
+      - symbols / tickers / direct_symbols
+- ✅ FIX: derived pages are never used as source pages.
+- ✅ FIX: fallback path can attempt engine-level Top10 methods before degrading.
+- ✅ FIX: schema-safe payload is always returned; no hard crashes for selector drift.
+- ✅ FIX: Top10 special fields always backfilled:
       - top10_rank
       - selection_reason
       - criteria_snapshot
+- ✅ SAFE: no network calls at import time.
 
 Primary endpoints
 -----------------
@@ -27,35 +45,143 @@ Primary endpoints
 - POST /v1/advanced/top10
 - POST /v1/advanced/investment-advisor
 - POST /v1/advanced/advisor
+- POST /v1/advanced/run
+- GET  /v1/advanced/recommendations
+- GET  /v1/advanced/sheet-rows
 - GET  /v1/advanced/health
 
 Design rule
 -----------
-This router is intentionally written to work with the current
-core/analysis/top10_selector.py WITHOUT requiring selector changes.
+This router is intentionally written to work with changing selector/core layouts
+without requiring exact one-name callable stability.
 """
 
 from __future__ import annotations
 
 import asyncio
 import copy
+import importlib
+import inspect
 import json
 import logging
 import os
 import time
 import uuid
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, status
+from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, Response, status
 from fastapi.encoders import jsonable_encoder
 
 logger = logging.getLogger("routes.investment_advisor")
 logger.addHandler(logging.NullHandler())
 
-INVESTMENT_ADVISOR_VERSION = "2.1.0"
+INVESTMENT_ADVISOR_VERSION = "2.2.0"
 TOP10_PAGE_NAME = "Top_10_Investments"
 
+_BASE_SOURCE_PAGES = [
+    "Market_Leaders",
+    "Global_Markets",
+    "Mutual_Funds",
+    "Commodities_FX",
+    "My_Portfolio",
+]
+
+_DERIVED_OR_NON_SOURCE_PAGES = {
+    "KSA_TADAWUL",
+    "Advisor_Criteria",
+    "AI_Opportunity_Report",
+    "Insights_Analysis",
+    "Top_10_Investments",
+    "Data_Dictionary",
+}
+
+_BUILDER_MODULE_CANDIDATES = (
+    "core.analysis.top10_selector",
+    "core.analysis.top10_builder",
+    "core.investment_advisor",
+    "core.investment_advisor_engine",
+    "core.analysis.investment_advisor",
+    "core.analysis.investment_advisor_engine",
+)
+
+_BUILDER_NAME_CANDIDATES = (
+    "build_top10_rows",
+    "build_top10_output_rows",
+    "build_top10",
+    "build_top10_payload",
+    "build_top10_result",
+    "select_top10",
+    "select_top10_symbols",
+    "run_investment_advisor",
+    "run_advisor",
+    "execute_investment_advisor",
+    "execute_advisor",
+)
+
+_CONTAINER_NAME_CANDIDATES = (
+    "top10_selector",
+    "top10_builder",
+    "advisor_service",
+    "investment_advisor_service",
+    "advisor_engine",
+    "investment_advisor_engine",
+    "advisor_runner",
+    "investment_advisor_runner",
+    "AdvisorService",
+    "InvestmentAdvisorService",
+    "AdvisorEngine",
+    "InvestmentAdvisorEngine",
+    "Top10Selector",
+    "Top10Builder",
+    "create_top10_selector",
+    "create_top10_builder",
+    "get_top10_selector",
+    "get_top10_builder",
+    "create_investment_advisor",
+    "get_investment_advisor",
+    "build_investment_advisor",
+)
+
+_STATE_ATTR_CANDIDATES = (
+    "top10_builder",
+    "top10_selector",
+    "investment_advisor_runner",
+    "advisor_runner",
+    "build_top10_rows",
+    "select_top10",
+    "select_top10_symbols",
+    "run_investment_advisor",
+    "run_advisor",
+    "investment_advisor_service",
+    "advisor_service",
+)
+
+_ENGINE_METHOD_CANDIDATES = (
+    "build_top10_rows",
+    "build_top10_output_rows",
+    "select_top10",
+    "select_top10_symbols",
+    "get_top10_rows",
+    "run_investment_advisor",
+    "run_advisor",
+    "get_sheet_rows",
+    "get_page_rows",
+)
+
 router = APIRouter(prefix="/v1/advanced", tags=["advanced"])
+
+
+# =============================================================================
+# Optional Prometheus
+# =============================================================================
+try:
+    from prometheus_client import CONTENT_TYPE_LATEST, generate_latest  # type: ignore
+
+    _PROMETHEUS_AVAILABLE = True
+except Exception:
+    CONTENT_TYPE_LATEST = "text/plain"
+    generate_latest = None  # type: ignore
+    _PROMETHEUS_AVAILABLE = False
 
 
 # =============================================================================
@@ -71,96 +197,20 @@ except Exception:
         return None
 
 
-def _extract_auth_token(
-    *,
-    token_query: Optional[str],
-    x_app_token: Optional[str],
-    authorization: Optional[str],
-) -> str:
-    auth_token = (x_app_token or "").strip()
-
-    if authorization and authorization.strip().lower().startswith("bearer "):
-        auth_token = authorization.strip().split(" ", 1)[1].strip()
-
-    if token_query and not auth_token:
-        allow_query = False
-        try:
-            settings = get_settings_cached()
-            allow_query = bool(getattr(settings, "allow_query_token", False))
-        except Exception:
-            allow_query = False
-        if allow_query:
-            auth_token = token_query.strip()
-
-    return auth_token
-
-
-def _require_auth_or_401(
-    *,
-    token_query: Optional[str],
-    x_app_token: Optional[str],
-    authorization: Optional[str],
-) -> None:
+def _s(v: Any) -> str:
     try:
-        if callable(is_open_mode) and bool(is_open_mode()):
-            return
+        if v is None:
+            return ""
+        s = str(v).strip()
+        return "" if s.lower() in {"none", "null", "nil"} else s
     except Exception:
-        pass
-
-    if auth_ok is None:
-        return
-
-    auth_token = _extract_auth_token(
-        token_query=token_query,
-        x_app_token=x_app_token,
-        authorization=authorization,
-    )
-
-    try:
-        ok = auth_ok(
-            token=auth_token,
-            authorization=authorization,
-            headers={"X-APP-TOKEN": x_app_token, "Authorization": authorization},
-        )
-    except TypeError:
-        ok = auth_ok(token=auth_token)
-
-    if not ok:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token",
-        )
+        return ""
 
 
-# =============================================================================
-# Lazy engine accessor
-# =============================================================================
-async def _get_engine(request: Request) -> Optional[Any]:
-    try:
-        st = getattr(request.app, "state", None)
-        if st and getattr(st, "engine", None):
-            return st.engine
-    except Exception:
-        pass
-
-    for modpath in ("core.data_engine_v2", "core.data_engine"):
-        try:
-            mod = __import__(modpath, fromlist=["get_engine"])
-            get_engine = getattr(mod, "get_engine", None)
-            if callable(get_engine):
-                eng = get_engine()
-                if hasattr(eng, "__await__"):
-                    eng = await eng
-                return eng
-        except Exception:
-            continue
-
-    return None
+def _is_blank(v: Any) -> bool:
+    return v is None or (isinstance(v, str) and not v.strip())
 
 
-# =============================================================================
-# Generic helpers
-# =============================================================================
 def _safe_int(v: Any, default: int) -> int:
     try:
         if isinstance(v, bool):
@@ -196,18 +246,204 @@ def _coerce_bool(v: Any, default: bool = False) -> bool:
     return default
 
 
-def _s(v: Any) -> str:
+def _extract_auth_token(
+    *,
+    token_query: Optional[str],
+    x_app_token: Optional[str],
+    authorization: Optional[str],
+) -> str:
+    auth_token = _s(x_app_token)
+
+    authz = _s(authorization)
+    if authz.lower().startswith("bearer "):
+        auth_token = authz.split(" ", 1)[1].strip()
+
+    if token_query and not auth_token:
+        allow_query = False
+        try:
+            settings = get_settings_cached()
+            allow_query = bool(getattr(settings, "allow_query_token", False))
+        except Exception:
+            allow_query = False
+        if allow_query:
+            auth_token = _s(token_query)
+
+    return auth_token
+
+
+def _is_public_path(path: str) -> bool:
+    p = _s(path)
+    if not p:
+        return False
+
+    if p in {
+        "/v1/advanced/health",
+        "/v1/advanced/metrics",
+    }:
+        return True
+
+    env_paths = os.getenv("PUBLIC_PATHS", "") or os.getenv("AUTH_PUBLIC_PATHS", "")
+    for raw in env_paths.split(","):
+        candidate = raw.strip()
+        if not candidate:
+            continue
+        if candidate.endswith("*") and p.startswith(candidate[:-1]):
+            return True
+        if p == candidate:
+            return True
+
+    return False
+
+
+def _auth_passed(
+    *,
+    request: Request,
+    token_query: Optional[str],
+    x_app_token: Optional[str],
+    authorization: Optional[str],
+) -> bool:
     try:
-        if v is None:
-            return ""
-        s = str(v).strip()
-        return "" if s.lower() == "none" else s
+        if callable(is_open_mode) and bool(is_open_mode()):
+            return True
     except Exception:
-        return ""
+        pass
+
+    try:
+        path = str(getattr(getattr(request, "url", None), "path", "") or "")
+    except Exception:
+        path = ""
+
+    if _is_public_path(path):
+        return True
+
+    if auth_ok is None:
+        return True
+
+    auth_token = _extract_auth_token(
+        token_query=token_query,
+        x_app_token=x_app_token,
+        authorization=authorization,
+    )
+
+    headers_dict = dict(request.headers)
+    settings = None
+    try:
+        settings = get_settings_cached()
+    except Exception:
+        settings = None
+
+    call_attempts = [
+        {
+            "token": auth_token or None,
+            "authorization": authorization,
+            "headers": headers_dict,
+            "path": path,
+            "request": request,
+            "settings": settings,
+        },
+        {
+            "token": auth_token or None,
+            "authorization": authorization,
+            "headers": headers_dict,
+            "path": path,
+            "request": request,
+        },
+        {
+            "token": auth_token or None,
+            "authorization": authorization,
+            "headers": headers_dict,
+            "path": path,
+        },
+        {
+            "token": auth_token or None,
+            "authorization": authorization,
+            "headers": headers_dict,
+        },
+        {
+            "token": auth_token or None,
+            "authorization": authorization,
+        },
+        {
+            "token": auth_token or None,
+        },
+        {},
+    ]
+
+    for kwargs in call_attempts:
+        try:
+            return bool(auth_ok(**kwargs))
+        except TypeError:
+            continue
+        except Exception:
+            return False
+
+    return False
 
 
-def _is_blank(v: Any) -> bool:
-    return v is None or (isinstance(v, str) and not v.strip())
+def _require_auth_or_401(
+    *,
+    request: Request,
+    token_query: Optional[str],
+    x_app_token: Optional[str],
+    authorization: Optional[str],
+) -> None:
+    if not _auth_passed(
+        request=request,
+        token_query=token_query,
+        x_app_token=x_app_token,
+        authorization=authorization,
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid token",
+        )
+
+
+# =============================================================================
+# Lazy engine accessor
+# =============================================================================
+async def _get_engine(request: Request) -> Optional[Any]:
+    try:
+        st = getattr(request.app, "state", None)
+        if st and getattr(st, "engine", None):
+            return st.engine
+    except Exception:
+        pass
+
+    for modpath in ("core.data_engine_v2", "core.data_engine"):
+        try:
+            mod = importlib.import_module(modpath)
+            get_engine = getattr(mod, "get_engine", None)
+            if callable(get_engine):
+                eng = get_engine()
+                if inspect.isawaitable(eng):
+                    eng = await eng
+                return eng
+        except Exception:
+            continue
+
+    return None
+
+
+# =============================================================================
+# Generic helpers
+# =============================================================================
+def _get_request_id(request: Optional[Request], header_request_id: Optional[str] = None) -> str:
+    if _s(header_request_id):
+        return _s(header_request_id)
+
+    try:
+        if request is not None:
+            rid = request.headers.get("X-Request-ID")
+            if rid:
+                return str(rid).strip()
+            state_rid = getattr(getattr(request, "state", None), "request_id", None)
+            if state_rid:
+                return str(state_rid).strip()
+    except Exception:
+        pass
+
+    return str(uuid.uuid4())
 
 
 def _jsonable_snapshot(value: Any) -> Any:
@@ -295,54 +531,98 @@ def _normalize_list(value: Any) -> List[str]:
     return out
 
 
-def _flatten_criteria(body: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Accept criteria from multiple compatible locations.
-    Top-level keys override nested keys.
-    """
-    crit: Dict[str, Any] = {}
+def _dedupe_keep_order(values: Iterable[Any]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for value in values:
+        s = _s(value)
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
 
-    if isinstance(body.get("criteria"), dict):
-        crit.update(body["criteria"])
 
-    if isinstance(body.get("filters"), dict):
-        crit.update(body["filters"])
+def _safe_source_pages(values: Sequence[str]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for item in values:
+        s = _s(item)
+        if not s:
+            continue
+        if s in _DERIVED_OR_NON_SOURCE_PAGES:
+            continue
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
 
-    settings = body.get("settings")
-    if isinstance(settings, dict) and isinstance(settings.get("criteria"), dict):
-        crit.update(settings["criteria"])
 
-    for k in (
-        "pages_selected",
-        "pages",
-        "selected_pages",
-        "direct_symbols",
-        "symbols",
-        "tickers",
-        "invest_period_days",
-        "investment_period_days",
-        "horizon_days",
-        "min_expected_roi",
-        "max_risk_score",
-        "min_confidence",
-        "min_ai_confidence",
-        "min_volume",
-        "use_liquidity_tiebreak",
-        "enforce_risk_confidence",
-        "top_n",
-        "limit",
-        "enrich_final",
-        "risk_level",
-        "confidence_bucket",
-        "invest_period_label",
-        "include_positions",
-        "schema_only",
-        "preview",
-    ):
-        if k in body and body.get(k) is not None:
-            crit[k] = body.get(k)
+def _model_to_dict(obj: Any) -> Dict[str, Any]:
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return dict(obj)
+    if isinstance(obj, Mapping):
+        try:
+            return dict(obj)
+        except Exception:
+            return {}
 
-    return crit
+    try:
+        if hasattr(obj, "model_dump") and callable(getattr(obj, "model_dump")):
+            dumped = obj.model_dump(mode="python")
+            if isinstance(dumped, dict):
+                return dumped
+    except Exception:
+        pass
+
+    try:
+        if hasattr(obj, "dict") and callable(getattr(obj, "dict")):
+            dumped = obj.dict()
+            if isinstance(dumped, dict):
+                return dumped
+    except Exception:
+        pass
+
+    try:
+        if hasattr(obj, "__dict__"):
+            d = vars(obj)
+            if isinstance(d, dict):
+                return dict(d)
+    except Exception:
+        pass
+
+    return {"result": obj}
+
+
+def _extract_rows_candidate(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return [dict(x) for x in payload if isinstance(x, dict)]
+
+    if not isinstance(payload, dict):
+        return []
+
+    for key in ("rows", "recommendations", "data", "items", "results", "records", "quotes"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return [dict(x) for x in value if isinstance(x, dict)]
+
+    result = payload.get("result")
+    if isinstance(result, list):
+        return [dict(x) for x in result if isinstance(x, dict)]
+
+    return []
+
+
+async def _call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    if inspect.iscoroutinefunction(fn):
+        return await fn(*args, **kwargs)
+
+    out = await asyncio.to_thread(fn, *args, **kwargs)
+    if inspect.isawaitable(out):
+        return await out
+    return out
 
 
 def _canonical_selection_reason(row: Dict[str, Any]) -> Optional[str]:
@@ -520,9 +800,12 @@ def _schema_only_payload(
         "status": "partial",
         "page": TOP10_PAGE_NAME,
         "sheet": TOP10_PAGE_NAME,
+        "route_family": "top10",
         "headers": headers,
         "keys": keys,
         "rows": [],
+        "data": [],
+        "items": [],
         "rows_matrix": [] if (include_matrix and keys) else None,
         "version": INVESTMENT_ADVISOR_VERSION,
         "request_id": request_id,
@@ -530,41 +813,57 @@ def _schema_only_payload(
     }
 
 
-def _normalize_selector_payload(
-    payload: Dict[str, Any],
-    *,
-    criteria_used: Dict[str, Any],
-    eff_limit: int,
-) -> Tuple[List[str], List[str], List[Dict[str, Any]], Dict[str, Any], str]:
-    headers = payload.get("display_headers") or payload.get("sheet_headers") or payload.get("column_headers") or payload.get("headers") or []
-    keys = payload.get("keys") or payload.get("headers") or []
-    rows = payload.get("rows") or []
-    status_out = _s(payload.get("status")) or "success"
+# =============================================================================
+# Criteria normalization
+# =============================================================================
+def _flatten_criteria(body: Dict[str, Any]) -> Dict[str, Any]:
+    crit: Dict[str, Any] = {}
 
-    if not isinstance(headers, list):
-        headers = []
-    if not isinstance(keys, list):
-        keys = []
-    if not isinstance(rows, list):
-        rows = []
+    if isinstance(body.get("criteria"), dict):
+        crit.update(body["criteria"])
 
-    if not headers or not keys:
-        schema_headers, schema_keys = _load_schema_defaults()
-        if not headers:
-            headers = schema_headers
-        if not keys:
-            keys = schema_keys
+    if isinstance(body.get("filters"), dict):
+        crit.update(body["filters"])
 
-    keys, headers = _ensure_top10_keys_present(list(keys), list(headers))
+    settings = body.get("settings")
+    if isinstance(settings, dict) and isinstance(settings.get("criteria"), dict):
+        crit.update(settings["criteria"])
 
-    dict_rows = [dict(r) for r in rows if isinstance(r, dict)]
-    dict_rows = _apply_top10_field_backfill(dict_rows, keys=keys, criteria=criteria_used)
-    dict_rows = _rank_rows_in_order(dict_rows)
-    norm_rows = _ensure_schema_projection(dict_rows, keys)
-    norm_rows = norm_rows[:eff_limit]
+    for k in (
+        "pages_selected",
+        "pages",
+        "selected_pages",
+        "direct_symbols",
+        "symbols",
+        "tickers",
+        "limit",
+        "top_n",
+        "invest_period_days",
+        "investment_period_days",
+        "horizon_days",
+        "invest_period_label",
+        "min_expected_roi",
+        "min_roi",
+        "max_risk_score",
+        "risk_level",
+        "risk_profile",
+        "min_confidence",
+        "min_ai_confidence",
+        "confidence_level",
+        "confidence_bucket",
+        "min_volume",
+        "use_liquidity_tiebreak",
+        "enforce_risk_confidence",
+        "include_positions",
+        "enrich_final",
+        "preview",
+        "schema_only",
+        "mode",
+    ):
+        if k in body and body.get(k) is not None:
+            crit[k] = body.get(k)
 
-    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
-    return headers, keys, norm_rows, dict(meta), status_out
+    return crit
 
 
 def _effective_limit(body: Dict[str, Any], limit_q: Optional[int]) -> int:
@@ -589,6 +888,8 @@ def _prepare_effective_criteria(body: Dict[str, Any], eff_limit: int) -> Tuple[D
     crit = _flatten_criteria(body or {})
 
     pages = _normalize_list(crit.get("pages_selected") or crit.get("pages") or crit.get("selected_pages"))
+    pages = _safe_source_pages(pages)
+
     direct_symbols = _normalize_list(crit.get("direct_symbols") or crit.get("symbols") or crit.get("tickers"))
 
     request_unconstrained = (not pages) and (not direct_symbols)
@@ -596,6 +897,7 @@ def _prepare_effective_criteria(body: Dict[str, Any], eff_limit: int) -> Tuple[D
 
     if request_unconstrained:
         pages = _env_csv("ADV_TOP10_DEFAULT_PAGES", ["Market_Leaders", "Global_Markets"])
+        pages = _safe_source_pages(pages)
         crit["pages_selected"] = pages
 
     max_pages = _env_int("ADV_TOP10_MAX_PAGES", 5, lo=1, hi=20)
@@ -608,6 +910,10 @@ def _prepare_effective_criteria(body: Dict[str, Any], eff_limit: int) -> Tuple[D
     if direct_symbols:
         crit["direct_symbols"] = direct_symbols
 
+    risk_level = _s(crit.get("risk_level")) or _s(crit.get("risk_profile")) or "moderate"
+    crit["risk_level"] = risk_level
+    crit["risk_profile"] = risk_level
+
     if crit.get("invest_period_days") is None:
         if crit.get("investment_period_days") is not None:
             crit["invest_period_days"] = crit.get("investment_period_days")
@@ -616,7 +922,16 @@ def _prepare_effective_criteria(body: Dict[str, Any], eff_limit: int) -> Tuple[D
         else:
             crit["invest_period_days"] = 90
 
+    if crit.get("horizon_days") is None and crit.get("invest_period_days") is not None:
+        crit["horizon_days"] = crit.get("invest_period_days")
+
+    if crit.get("min_roi") is None and crit.get("min_expected_roi") is not None:
+        crit["min_roi"] = crit.get("min_expected_roi")
+    if crit.get("min_expected_roi") is None and crit.get("min_roi") is not None:
+        crit["min_expected_roi"] = crit.get("min_roi")
+
     crit["top_n"] = eff_limit
+    crit["limit"] = eff_limit
 
     if "enrich_final" not in crit:
         crit["enrich_final"] = False if request_unconstrained else (len(pages) <= 2 or bool(direct_symbols))
@@ -644,94 +959,422 @@ def _narrow_criteria_for_fallback(criteria: Dict[str, Any], eff_limit: int) -> D
     pages = _normalize_list(
         narrowed.get("pages_selected") or narrowed.get("pages") or narrowed.get("selected_pages")
     )
+    pages = _safe_source_pages(pages)
 
     if direct_symbols:
         narrowed["direct_symbols"] = direct_symbols[: max(1, min(len(direct_symbols), eff_limit))]
         narrowed["top_n"] = min(eff_limit, len(narrowed["direct_symbols"]))
+        narrowed["limit"] = narrowed["top_n"]
     else:
         if not pages:
             pages = _env_csv("ADV_TOP10_DEFAULT_PAGES", ["Market_Leaders"])
-        pages = pages[:fallback_pages_cap]
+        pages = _safe_source_pages(pages)[:fallback_pages_cap]
         narrowed["pages_selected"] = pages
         narrowed["top_n"] = fallback_top_n
+        narrowed["limit"] = fallback_top_n
 
     narrowed["enrich_final"] = False
     return narrowed
 
 
-def _load_top10_builder() -> Any:
-    from core.analysis.top10_selector import build_top10_rows  # type: ignore
-    return build_top10_rows
+# =============================================================================
+# Builder discovery
+# =============================================================================
+def _callable_by_names(container: Any, names: Iterable[str]) -> Optional[Tuple[Callable[..., Any], str]]:
+    for name in names:
+        try:
+            fn = getattr(container, name, None)
+        except Exception:
+            fn = None
+        if callable(fn):
+            return fn, name
+    return None
+
+
+async def _materialize_holder(holder: Any) -> Any:
+    if holder is None:
+        return None
+
+    try:
+        if inspect.isclass(holder):
+            return holder()
+    except Exception:
+        return None
+
+    if callable(holder):
+        try:
+            return await _call_maybe_async(holder)
+        except TypeError:
+            return None
+        except Exception:
+            return None
+
+    return holder
+
+
+async def _resolve_from_container(container: Any, label: str) -> Optional[Tuple[Callable[..., Any], str, str]]:
+    direct = _callable_by_names(container, _BUILDER_NAME_CANDIDATES)
+    if direct:
+        fn, fn_name = direct
+        return fn, label, fn_name
+
+    for holder_name in _CONTAINER_NAME_CANDIDATES:
+        try:
+            holder = getattr(container, holder_name, None)
+        except Exception:
+            holder = None
+
+        if holder is None:
+            continue
+
+        obj = await _materialize_holder(holder)
+        if obj is None:
+            continue
+
+        direct_obj = _callable_by_names(obj, _BUILDER_NAME_CANDIDATES)
+        if direct_obj:
+            fn, fn_name = direct_obj
+            return fn, label, f"{holder_name}.{fn_name}"
+
+    return None
+
+
+async def _resolve_top10_builder(
+    request: Request,
+    engine: Any,
+) -> Tuple[Optional[Callable[..., Any]], str, str, List[str]]:
+    searched: List[str] = []
+    import_errors: List[str] = []
+
+    try:
+        st = getattr(request.app, "state", None)
+    except Exception:
+        st = None
+
+    if st is not None:
+        searched.append("app.state")
+        direct_state = _callable_by_names(st, _STATE_ATTR_CANDIDATES)
+        if direct_state:
+            fn, fn_name = direct_state
+            return fn, "app.state", fn_name, searched
+
+        resolved_state = await _resolve_from_container(st, "app.state")
+        if resolved_state:
+            fn, src, name = resolved_state
+            return fn, src, name, searched
+
+    for mod_name in _BUILDER_MODULE_CANDIDATES:
+        searched.append(mod_name)
+        try:
+            mod = importlib.import_module(mod_name)
+        except Exception as e:
+            import_errors.append(f"{mod_name}: {type(e).__name__}: {e}")
+            continue
+
+        resolved = await _resolve_from_container(mod, mod_name)
+        if resolved:
+            fn, src, name = resolved
+            return fn, src, name, searched
+
+    if engine is not None:
+        searched.append("engine")
+        direct_engine = _callable_by_names(engine, _ENGINE_METHOD_CANDIDATES)
+        if direct_engine:
+            fn, fn_name = direct_engine
+            return fn, "engine", fn_name, searched
+
+    if import_errors:
+        logger.warning("Top10 builder import errors: %s", import_errors)
+
+    return None, "", "", searched
+
+
+# =============================================================================
+# Builder / engine invocation
+# =============================================================================
+async def _call_builder_with_tolerance(
+    builder: Callable[..., Any],
+    *,
+    request: Request,
+    engine: Any,
+    criteria: Dict[str, Any],
+    eff_limit: int,
+    mode: str,
+    settings: Any,
+) -> Any:
+    body_payload = {
+        "page": TOP10_PAGE_NAME,
+        "sheet": TOP10_PAGE_NAME,
+        "criteria": criteria,
+        "top_n": eff_limit,
+        "limit": eff_limit,
+        "mode": mode or "",
+    }
+
+    attempts = [
+        {
+            "engine": engine,
+            "criteria": criteria,
+            "limit": eff_limit,
+            "mode": mode or "",
+            "request": request,
+            "settings": settings,
+            "page": TOP10_PAGE_NAME,
+        },
+        {
+            "engine": engine,
+            "criteria": criteria,
+            "limit": eff_limit,
+            "mode": mode or "",
+            "settings": settings,
+        },
+        {
+            "engine": engine,
+            "criteria": criteria,
+            "limit": eff_limit,
+            "mode": mode or "",
+        },
+        {
+            "engine": engine,
+            "body": body_payload,
+            "limit": eff_limit,
+            "mode": mode or "",
+            "request": request,
+            "settings": settings,
+        },
+        {
+            "engine": engine,
+            "body": body_payload,
+            "limit": eff_limit,
+            "mode": mode or "",
+        },
+        {
+            "engine": engine,
+            "payload": body_payload,
+            "limit": eff_limit,
+            "mode": mode or "",
+        },
+        {
+            "request": request,
+            "body": body_payload,
+            "engine": engine,
+        },
+        {
+            "criteria": criteria,
+            "engine": engine,
+        },
+        {
+            "body": body_payload,
+        },
+        {
+            "payload": body_payload,
+        },
+        {
+            "criteria": criteria,
+        },
+    ]
+
+    for kwargs in attempts:
+        try:
+            return await _call_maybe_async(builder, **kwargs)
+        except TypeError:
+            continue
+
+    positional_attempts = [
+        (engine, criteria, eff_limit),
+        (criteria, engine, eff_limit),
+        (criteria, engine),
+        (engine, criteria),
+        (criteria,),
+        (body_payload,),
+    ]
+
+    last_error: Optional[Exception] = None
+    for args in positional_attempts:
+        try:
+            return await _call_maybe_async(builder, *args)
+        except TypeError as e:
+            last_error = e
+            continue
+
+    if last_error is not None:
+        raise last_error
+
+    raise RuntimeError("No compatible builder signature matched")
 
 
 async def _run_selector_with_timeout(
     *,
-    builder: Any,
+    builder: Callable[..., Any],
+    request: Request,
     engine: Any,
     criteria: Dict[str, Any],
     eff_limit: int,
     mode: str,
     timeout_sec: float,
-) -> Dict[str, Any]:
-    coro = builder(
+    settings: Any,
+) -> Any:
+    coro = _call_builder_with_tolerance(
+        builder,
+        request=request,
         engine=engine,
         criteria=criteria,
-        limit=eff_limit,
-        mode=mode or "",
+        eff_limit=eff_limit,
+        mode=mode,
+        settings=settings,
     )
     return await asyncio.wait_for(coro, timeout=timeout_sec)
 
 
-# =============================================================================
-# Health
-# =============================================================================
-@router.get("/health")
-async def advanced_health(request: Request) -> Dict[str, Any]:
-    engine = await _get_engine(request)
-    return jsonable_encoder(
-        {
-            "status": "ok" if engine else "degraded",
-            "service": "advanced_top10",
-            "version": INVESTMENT_ADVISOR_VERSION,
-            "engine_available": bool(engine),
-            "engine_type": type(engine).__name__ if engine else "none",
-        }
-    )
-
-
-# =============================================================================
-# Main endpoint
-# =============================================================================
-@router.post("/top10-investments")
-@router.post("/top10")
-@router.post("/investment-advisor")
-@router.post("/advisor")
-async def advanced_top10_investments(
+async def _try_engine_top10_fallback(
+    *,
+    engine: Any,
     request: Request,
-    body: Dict[str, Any] = Body(default_factory=dict),
-    mode: str = Query(default="", description="Optional mode hint for selector"),
-    include_matrix: Optional[bool] = Query(default=None, description="Return rows_matrix"),
-    limit: Optional[int] = Query(default=None, ge=1, le=50, description="How many items to return"),
-    schema_only: Optional[bool] = Query(default=None, description="Return schema only"),
-    token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
-    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-    authorization: Optional[str] = Header(default=None, alias="Authorization"),
-    x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+    criteria: Dict[str, Any],
+    eff_limit: int,
+    mode: str,
+) -> Optional[Dict[str, Any]]:
+    if engine is None:
+        return None
+
+    page = TOP10_PAGE_NAME
+    query_symbols = _normalize_list(criteria.get("direct_symbols") or criteria.get("symbols") or criteria.get("tickers"))
+
+    call_plans: List[Tuple[str, Dict[str, Any]]] = [
+        ("build_top10_rows", {"criteria": criteria, "limit": eff_limit, "mode": mode or ""}),
+        ("build_top10_output_rows", {"criteria": criteria, "limit": eff_limit, "mode": mode or ""}),
+        ("select_top10", {"criteria": criteria, "limit": eff_limit, "mode": mode or ""}),
+        ("select_top10_symbols", {"criteria": criteria, "limit": eff_limit, "mode": mode or ""}),
+        (
+            "get_sheet_rows",
+            {
+                "page": page,
+                "sheet": page,
+                "sheet_name": page,
+                "limit": eff_limit,
+                "mode": mode or "",
+                "tickers": query_symbols,
+                "symbols": query_symbols,
+            },
+        ),
+        (
+            "get_page_rows",
+            {
+                "page": page,
+                "sheet": page,
+                "sheet_name": page,
+                "limit": eff_limit,
+                "mode": mode or "",
+                "tickers": query_symbols,
+                "symbols": query_symbols,
+            },
+        ),
+    ]
+
+    for method_name, kwargs in call_plans:
+        fn = getattr(engine, method_name, None)
+        if not callable(fn):
+            continue
+
+        try:
+            out = await _call_maybe_async(fn, **kwargs)
+        except TypeError:
+            try:
+                out = await _call_maybe_async(fn, page)
+            except Exception:
+                continue
+        except Exception:
+            continue
+
+        if isinstance(out, dict):
+            return dict(out)
+
+        rows = _extract_rows_candidate(out)
+        if rows:
+            return {
+                "status": "success",
+                "page": page,
+                "sheet": page,
+                "rows": rows,
+                "meta": {"dispatch": f"engine.{method_name}"},
+            }
+
+    return None
+
+
+# =============================================================================
+# Payload normalization
+# =============================================================================
+def _normalize_selector_payload(
+    payload: Any,
+    *,
+    criteria_used: Dict[str, Any],
+    eff_limit: int,
+    forced_dispatch: str = "",
+) -> Tuple[List[str], List[str], List[Dict[str, Any]], Dict[str, Any], str]:
+    if isinstance(payload, dict):
+        payload_dict = dict(payload)
+    elif isinstance(payload, list):
+        payload_dict = {"rows": payload}
+    else:
+        payload_dict = _model_to_dict(payload)
+
+    headers = (
+        payload_dict.get("display_headers")
+        or payload_dict.get("sheet_headers")
+        or payload_dict.get("column_headers")
+        or payload_dict.get("headers")
+        or []
+    )
+    keys = payload_dict.get("keys") or payload_dict.get("fields") or []
+
+    if not isinstance(headers, list):
+        headers = []
+    if not isinstance(keys, list):
+        keys = []
+
+    rows = _extract_rows_candidate(payload_dict)
+
+    status_out = _s(payload_dict.get("status")) or ("success" if rows else "partial")
+
+    if not headers or not keys:
+        schema_headers, schema_keys = _load_schema_defaults()
+        if not headers:
+            headers = schema_headers
+        if not keys:
+            keys = schema_keys
+
+    keys, headers = _ensure_top10_keys_present(list(keys), list(headers))
+
+    dict_rows = [dict(r) for r in rows if isinstance(r, dict)]
+    dict_rows = _apply_top10_field_backfill(dict_rows, keys=keys, criteria=criteria_used)
+    dict_rows = _rank_rows_in_order(dict_rows)
+    norm_rows = _ensure_schema_projection(dict_rows, keys)
+    norm_rows = norm_rows[:eff_limit]
+
+    meta = payload_dict.get("meta") if isinstance(payload_dict.get("meta"), dict) else {}
+    if forced_dispatch and not _s(meta.get("dispatch")):
+        meta["dispatch"] = forced_dispatch
+
+    return headers, keys, norm_rows, dict(meta), status_out
+
+
+# =============================================================================
+# Core executor
+# =============================================================================
+async def _execute_advanced_top10(
+    *,
+    request: Request,
+    body: Dict[str, Any],
+    mode: str,
+    include_matrix: Optional[bool],
+    limit: Optional[int],
+    schema_only: Optional[bool],
+    x_request_id: Optional[str],
 ) -> Dict[str, Any]:
     t0 = time.perf_counter()
     stages: Dict[str, float] = {}
-    request_id = x_request_id or getattr(request.state, "request_id", None) or str(uuid.uuid4())
-
-    # -------------------------------------------------------------------------
-    # Auth
-    # -------------------------------------------------------------------------
-    s0 = time.perf_counter()
-    _require_auth_or_401(
-        token_query=token,
-        x_app_token=x_app_token,
-        authorization=authorization,
-    )
-    stages["auth_ms"] = round((time.perf_counter() - s0) * 1000.0, 3)
+    request_id = _get_request_id(request, x_request_id)
 
     include_matrix_final = include_matrix if isinstance(include_matrix, bool) else _coerce_bool(body.get("include_matrix"), True)
     schema_only_final = schema_only if isinstance(schema_only, bool) else _coerce_bool(body.get("schema_only"), False)
@@ -740,9 +1383,6 @@ async def advanced_top10_investments(
     schema_headers, schema_keys = _load_schema_defaults()
     schema_keys, schema_headers = _ensure_top10_keys_present(schema_keys, schema_headers)
 
-    # -------------------------------------------------------------------------
-    # Schema only shortcut
-    # -------------------------------------------------------------------------
     if schema_only_final:
         meta = {
             "route_version": INVESTMENT_ADVISOR_VERSION,
@@ -765,9 +1405,6 @@ async def advanced_top10_investments(
             )
         )
 
-    # -------------------------------------------------------------------------
-    # Engine
-    # -------------------------------------------------------------------------
     s1 = time.perf_counter()
     engine = await _get_engine(request)
     stages["engine_ms"] = round((time.perf_counter() - s1) * 1000.0, 3)
@@ -795,127 +1432,116 @@ async def advanced_top10_investments(
             )
         )
 
-    # -------------------------------------------------------------------------
-    # Selector import
-    # -------------------------------------------------------------------------
     s2 = time.perf_counter()
+    settings = None
     try:
-        build_top10_rows = _load_top10_builder()
-        builder_import_error = None
-    except Exception as e:
-        build_top10_rows = None
-        builder_import_error = f"{type(e).__name__}: {e}"
-    stages["builder_import_ms"] = round((time.perf_counter() - s2) * 1000.0, 3)
+        settings = get_settings_cached()
+    except Exception:
+        settings = None
+    stages["settings_ms"] = round((time.perf_counter() - s2) * 1000.0, 3)
 
-    if build_top10_rows is None:
-        meta = {
-            "route_version": INVESTMENT_ADVISOR_VERSION,
-            "request_id": request_id,
-            "limit": eff_limit,
-            "mode": mode or "",
-            "schema_aligned": bool(schema_keys),
-            "build_status": "DEGRADED",
-            "dispatch": "advanced_top10",
-            "warning": "top10_builder_unavailable",
-            "detail": builder_import_error,
-            "stage_durations_ms": stages,
-            "duration_ms": round((time.perf_counter() - t0) * 1000.0, 3),
-        }
-        return jsonable_encoder(
-            _schema_only_payload(
-                request_id=request_id,
-                headers=schema_headers,
-                keys=schema_keys,
-                include_matrix=include_matrix_final,
-                meta=meta,
-            )
-        )
-
-    # -------------------------------------------------------------------------
-    # Criteria preparation
-    # -------------------------------------------------------------------------
     s3 = time.perf_counter()
+    builder, builder_source, builder_name, builder_search_path = await _resolve_top10_builder(request, engine)
+    stages["builder_resolve_ms"] = round((time.perf_counter() - s3) * 1000.0, 3)
+
+    s4 = time.perf_counter()
     effective_criteria, prep_meta = _prepare_effective_criteria(body or {}, eff_limit)
-    stages["criteria_prepare_ms"] = round((time.perf_counter() - s3) * 1000.0, 3)
+    stages["criteria_prepare_ms"] = round((time.perf_counter() - s4) * 1000.0, 3)
 
     primary_timeout_sec = _env_float("ADV_TOP10_TIMEOUT_SEC", 45.0, lo=3.0, hi=300.0)
     fallback_timeout_sec = _env_float("ADV_TOP10_FALLBACK_TIMEOUT_SEC", 15.0, lo=2.0, hi=120.0)
 
-    selected_payload: Optional[Dict[str, Any]] = None
+    selected_payload: Optional[Any] = None
     selected_criteria = copy.deepcopy(effective_criteria)
     fallback_used = False
     fallback_reason = ""
     warnings: List[str] = []
 
-    # -------------------------------------------------------------------------
-    # Primary run
-    # -------------------------------------------------------------------------
-    s4 = time.perf_counter()
-    try:
-        payload_primary = await _run_selector_with_timeout(
-            builder=build_top10_rows,
-            engine=engine,
-            criteria=effective_criteria,
-            eff_limit=eff_limit,
-            mode=mode or "",
-            timeout_sec=primary_timeout_sec,
-        )
-        if not isinstance(payload_primary, dict):
-            raise ValueError("selector returned non-dict payload")
-        selected_payload = payload_primary
-    except asyncio.TimeoutError:
-        fallback_used = True
-        fallback_reason = f"primary_timeout_{primary_timeout_sec}s"
-        warnings.append("primary_selector_timeout")
-    except Exception as e:
-        fallback_used = True
-        fallback_reason = f"primary_error:{type(e).__name__}"
-        warnings.append(f"primary_selector_error:{type(e).__name__}:{e}")
-    stages["primary_selector_ms"] = round((time.perf_counter() - s4) * 1000.0, 3)
+    if builder is not None:
+        s5 = time.perf_counter()
+        try:
+            payload_primary = await _run_selector_with_timeout(
+                builder=builder,
+                request=request,
+                engine=engine,
+                criteria=effective_criteria,
+                eff_limit=eff_limit,
+                mode=mode or "",
+                timeout_sec=primary_timeout_sec,
+                settings=settings,
+            )
+            selected_payload = payload_primary
+        except asyncio.TimeoutError:
+            fallback_used = True
+            fallback_reason = f"primary_timeout_{primary_timeout_sec}s"
+            warnings.append("primary_selector_timeout")
+        except Exception as e:
+            fallback_used = True
+            fallback_reason = f"primary_error:{type(e).__name__}"
+            warnings.append(f"primary_selector_error:{type(e).__name__}:{e}")
+        stages["primary_selector_ms"] = round((time.perf_counter() - s5) * 1000.0, 3)
 
-    # If unconstrained primary call returns no rows, try narrowed fallback
+    else:
+        fallback_used = True
+        fallback_reason = "builder_unavailable"
+        warnings.append("top10_builder_unavailable")
+
     try:
-        if isinstance(selected_payload, dict):
-            rows_candidate = selected_payload.get("rows")
-            if prep_meta.get("request_unconstrained") and (not isinstance(rows_candidate, list) or len(rows_candidate) == 0):
-                fallback_used = True
-                fallback_reason = "primary_empty_unconstrained"
-                warnings.append("primary_empty_for_unconstrained_request")
-                selected_payload = None
+        normalized_rows_probe = _extract_rows_candidate(selected_payload)
+        if prep_meta.get("request_unconstrained") and len(normalized_rows_probe) == 0:
+            fallback_used = True
+            fallback_reason = fallback_reason or "primary_empty_unconstrained"
+            warnings.append("primary_empty_for_unconstrained_request")
+            selected_payload = None
     except Exception:
         pass
 
-    # -------------------------------------------------------------------------
-    # Fallback run
-    # -------------------------------------------------------------------------
     if selected_payload is None:
-        s5 = time.perf_counter()
+        s6 = time.perf_counter()
         narrowed_criteria = _narrow_criteria_for_fallback(effective_criteria, eff_limit)
-        try:
-            payload_fallback = await _run_selector_with_timeout(
-                builder=build_top10_rows,
+
+        if builder is not None:
+            try:
+                payload_fallback = await _run_selector_with_timeout(
+                    builder=builder,
+                    request=request,
+                    engine=engine,
+                    criteria=narrowed_criteria,
+                    eff_limit=min(eff_limit, _safe_int(narrowed_criteria.get("top_n"), eff_limit)),
+                    mode=mode or "",
+                    timeout_sec=fallback_timeout_sec,
+                    settings=settings,
+                )
+                selected_payload = payload_fallback
+                selected_criteria = narrowed_criteria
+            except asyncio.TimeoutError:
+                warnings.append("fallback_selector_timeout")
+                fallback_reason = (fallback_reason + "; " if fallback_reason else "") + f"fallback_timeout_{fallback_timeout_sec}s"
+            except Exception as e:
+                warnings.append(f"fallback_selector_error:{type(e).__name__}:{e}")
+                fallback_reason = (fallback_reason + "; " if fallback_reason else "") + f"fallback_error:{type(e).__name__}"
+        stages["fallback_selector_ms"] = round((time.perf_counter() - s6) * 1000.0, 3)
+
+        if selected_payload is None:
+            s7 = time.perf_counter()
+            engine_payload = await _try_engine_top10_fallback(
                 engine=engine,
+                request=request,
                 criteria=narrowed_criteria,
                 eff_limit=min(eff_limit, _safe_int(narrowed_criteria.get("top_n"), eff_limit)),
                 mode=mode or "",
-                timeout_sec=fallback_timeout_sec,
             )
-            if not isinstance(payload_fallback, dict):
-                raise ValueError("fallback selector returned non-dict payload")
-            selected_payload = payload_fallback
-            selected_criteria = narrowed_criteria
-        except asyncio.TimeoutError:
-            warnings.append("fallback_selector_timeout")
-            fallback_reason = (fallback_reason + "; " if fallback_reason else "") + f"fallback_timeout_{fallback_timeout_sec}s"
-        except Exception as e:
-            warnings.append(f"fallback_selector_error:{type(e).__name__}:{e}")
-            fallback_reason = (fallback_reason + "; " if fallback_reason else "") + f"fallback_error:{type(e).__name__}"
-        stages["fallback_selector_ms"] = round((time.perf_counter() - s5) * 1000.0, 3)
+            stages["engine_fallback_ms"] = round((time.perf_counter() - s7) * 1000.0, 3)
 
-    # -------------------------------------------------------------------------
-    # Final safe degraded payload
-    # -------------------------------------------------------------------------
-    if not isinstance(selected_payload, dict):
+            if engine_payload is not None:
+                selected_payload = engine_payload
+                selected_criteria = narrowed_criteria
+                warnings.append("engine_top10_fallback_used")
+                fallback_used = True
+                if not fallback_reason:
+                    fallback_reason = "engine_top10_fallback"
+
+    if selected_payload is None:
         meta = {
             "route_version": INVESTMENT_ADVISOR_VERSION,
             "request_id": request_id,
@@ -936,6 +1562,10 @@ async def advanced_top10_investments(
             "warnings": warnings,
             "engine_present": True,
             "engine_type": type(engine).__name__,
+            "builder_available": bool(builder),
+            "builder_source": builder_source,
+            "builder_name": builder_name,
+            "builder_search_path": builder_search_path,
             "stage_durations_ms": stages,
             "duration_ms": round((time.perf_counter() - t0) * 1000.0, 3),
         }
@@ -949,16 +1579,14 @@ async def advanced_top10_investments(
             )
         )
 
-    # -------------------------------------------------------------------------
-    # Normalize selector payload
-    # -------------------------------------------------------------------------
-    s6 = time.perf_counter()
+    s8 = time.perf_counter()
     headers, keys, norm_rows, meta_in, status_out = _normalize_selector_payload(
         selected_payload,
         criteria_used=selected_criteria,
         eff_limit=eff_limit,
+        forced_dispatch="advanced_top10",
     )
-    stages["normalize_ms"] = round((time.perf_counter() - s6) * 1000.0, 3)
+    stages["normalize_ms"] = round((time.perf_counter() - s8) * 1000.0, 3)
 
     build_status = _s(meta_in.get("build_status"))
     if not build_status:
@@ -998,6 +1626,10 @@ async def advanced_top10_investments(
             "fallback_reason": fallback_reason,
             "engine_present": True,
             "engine_type": type(engine).__name__,
+            "builder_available": bool(builder),
+            "builder_source": builder_source,
+            "builder_name": builder_name,
+            "builder_search_path": builder_search_path,
             "warnings": dedup_warnings,
             "build_status": build_status,
             "dispatch": _s(meta_in.get("dispatch")) or "advanced_top10",
@@ -1009,9 +1641,12 @@ async def advanced_top10_investments(
         "status": status_out or ("success" if norm_rows else "partial"),
         "page": TOP10_PAGE_NAME,
         "sheet": TOP10_PAGE_NAME,
+        "route_family": "top10",
         "headers": headers,
         "keys": keys,
         "rows": norm_rows,
+        "data": norm_rows,
+        "items": norm_rows,
         "rows_matrix": _rows_to_matrix(norm_rows, keys) if (include_matrix_final and keys) else None,
         "version": INVESTMENT_ADVISOR_VERSION,
         "request_id": request_id,
@@ -1019,6 +1654,142 @@ async def advanced_top10_investments(
     }
 
     return jsonable_encoder(response)
+
+
+# =============================================================================
+# Health / Metrics
+# =============================================================================
+@router.get("/health")
+async def advanced_health(request: Request) -> Dict[str, Any]:
+    engine = await _get_engine(request)
+    builder, builder_source, builder_name, builder_search_path = await _resolve_top10_builder(request, engine)
+    return jsonable_encoder(
+        {
+            "status": "ok" if engine else "degraded",
+            "service": "advanced_top10",
+            "version": INVESTMENT_ADVISOR_VERSION,
+            "engine_available": bool(engine),
+            "engine_type": type(engine).__name__ if engine else "none",
+            "builder_available": bool(builder),
+            "builder_source": builder_source,
+            "builder_name": builder_name,
+            "builder_search_path": builder_search_path,
+        }
+    )
+
+
+@router.get("/metrics")
+async def advanced_metrics() -> Response:
+    if not _PROMETHEUS_AVAILABLE or generate_latest is None:
+        return Response(content="Metrics not available", media_type="text/plain", status_code=503)
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+# =============================================================================
+# POST routes
+# =============================================================================
+@router.post("/top10-investments")
+@router.post("/top10")
+@router.post("/investment-advisor")
+@router.post("/advisor")
+@router.post("/run")
+async def advanced_top10_investments(
+    request: Request,
+    body: Dict[str, Any] = Body(default_factory=dict),
+    mode: str = Query(default="", description="Optional mode hint for selector"),
+    include_matrix: Optional[bool] = Query(default=None, description="Return rows_matrix"),
+    limit: Optional[int] = Query(default=None, ge=1, le=50, description="How many items to return"),
+    schema_only: Optional[bool] = Query(default=None, description="Return schema only"),
+    token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+) -> Dict[str, Any]:
+    _require_auth_or_401(
+        request=request,
+        token_query=token,
+        x_app_token=x_app_token,
+        authorization=authorization,
+    )
+
+    return await _execute_advanced_top10(
+        request=request,
+        body=dict(body or {}),
+        mode=mode,
+        include_matrix=include_matrix,
+        limit=limit,
+        schema_only=schema_only,
+        x_request_id=x_request_id,
+    )
+
+
+# =============================================================================
+# GET aliases
+# =============================================================================
+@router.get("/recommendations")
+@router.get("/sheet-rows")
+async def advanced_top10_get(
+    request: Request,
+    symbols: Optional[str] = Query(default=None, description="Comma/space separated symbols"),
+    tickers: Optional[str] = Query(default=None, description="Comma/space separated tickers"),
+    pages: Optional[str] = Query(default=None, description="Comma/space separated source pages"),
+    sources: Optional[str] = Query(default=None, description="Comma/space separated source pages"),
+    risk_level: Optional[str] = Query(default=None),
+    risk_profile: Optional[str] = Query(default=None),
+    confidence_level: Optional[str] = Query(default=None),
+    confidence_bucket: Optional[str] = Query(default=None),
+    investment_period_days: Optional[int] = Query(default=None, ge=1, le=3650),
+    horizon_days: Optional[int] = Query(default=None, ge=1, le=3650),
+    min_expected_roi: Optional[float] = Query(default=None),
+    min_roi: Optional[float] = Query(default=None),
+    min_confidence: Optional[float] = Query(default=None),
+    top_n: Optional[int] = Query(default=None, ge=1, le=50),
+    limit: Optional[int] = Query(default=None, ge=1, le=50),
+    mode: str = Query(default="", description="Optional mode hint for selector"),
+    include_matrix: Optional[bool] = Query(default=None),
+    schema_only: Optional[bool] = Query(default=None),
+    token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+) -> Dict[str, Any]:
+    _require_auth_or_401(
+        request=request,
+        token_query=token,
+        x_app_token=x_app_token,
+        authorization=authorization,
+    )
+
+    direct_symbols = _normalize_list(symbols) or _normalize_list(tickers)
+    selected_pages = _normalize_list(pages) or _normalize_list(sources)
+
+    body: Dict[str, Any] = {
+        "direct_symbols": direct_symbols,
+        "pages_selected": selected_pages,
+        "risk_level": _s(risk_level) or _s(risk_profile),
+        "risk_profile": _s(risk_profile) or _s(risk_level),
+        "confidence_level": _s(confidence_level),
+        "confidence_bucket": _s(confidence_bucket),
+        "investment_period_days": investment_period_days,
+        "horizon_days": horizon_days,
+        "min_expected_roi": min_expected_roi,
+        "min_roi": min_roi if min_roi is not None else min_expected_roi,
+        "min_confidence": min_confidence,
+        "top_n": top_n if top_n is not None else limit,
+        "limit": limit if limit is not None else top_n,
+        "include_matrix": include_matrix,
+        "schema_only": schema_only,
+    }
+
+    return await _execute_advanced_top10(
+        request=request,
+        body=body,
+        mode=mode,
+        include_matrix=include_matrix,
+        limit=limit if limit is not None else top_n,
+        schema_only=schema_only,
+        x_request_id=x_request_id,
+    )
 
 
 __all__ = ["router", "INVESTMENT_ADVISOR_VERSION"]
