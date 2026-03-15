@@ -2,26 +2,16 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.28.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.31.0
 ================================================================================
 
-WHY v5.28.0
+WHY v5.31.0
 -----------
-This revision addresses the final control-flow gap regarding `schema_only` requests
-in loose mode. It prevents the engine from early-exiting with a malformed schema
-fragment for special sheets before their dedicated repair logic can run.
-
-Main improvements in v5.28.0
----------------------------
-- ✅ FIX: Generic `schema_only` fast-path requires `_usable_contract` to be True.
-- ✅ FIX: `Data_Dictionary`, `Insights_Analysis`, and `Top_10_Investments` safely
-          handle `schema_only` requests internally *after* contract repair.
-- ✅ FIX: `_usable_contract` enforces strict set-based anchor logic requiring both
-          symbol identifiers and identity/value fields to pass validation.
-- ✅ FIX: `Data_Dictionary` delays row normalization until *after* contract 
-          inference, preventing real rows from turning into `{}`.
-- ✅ FIX: `_build_top10_rows_fallback` generates a full union contract if Top10 
-          schema is unusable and strict mode is off, preventing truthy empty rows.
+This revision addresses the remaining edge cases to ensure full production readiness:
+- ✅ FIX: `get_enriched_quote()` schema projection is now strict (`keep_extras=False`).
+- ✅ FIX: `Singleflight` caching lanes isolate `use_cache=True` vs `use_cache=False`.
+- ✅ FIX: Schema-only requests for unknown sheets return `status="warn"`.
+- ✅ FIX: `_fetch_patch` provider call loop aggregates errors across variants for better debugging.
 
 Provider routing constraint (unchanged)
 ---------------------------------------
@@ -55,7 +45,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.28.0"
+__version__ = "5.31.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -255,30 +245,24 @@ def _usable_contract(headers: Sequence[str], keys: Sequence[str], sheet_name: st
         keyset = set(keys)
 
         if canon in {"Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds", "My_Portfolio"}:
-            if len(keys) < 50:
-                return False
             has_symbol_anchor = bool(keyset & {"symbol", "requested_symbol", "ticker"})
-            has_identity_anchor = bool(keyset & {"name", "current_price"})
+            has_identity_anchor = bool(keyset & {"name", "current_price", "price"})
             if not has_symbol_anchor or not has_identity_anchor:
                 return False
 
         elif canon == "Top_10_Investments":
-            if len(keys) < 60:
-                return False
             has_symbol_anchor = bool(keyset & {"symbol", "requested_symbol", "ticker"})
             has_required_top10 = {"top10_rank", "selection_reason", "criteria_snapshot"}.issubset(keyset)
             if not has_symbol_anchor or not has_required_top10:
                 return False
 
         elif canon == "Data_Dictionary":
-            if len(keys) < 9:
-                return False
             has_required_dd = {"sheet", "header", "key"}.issubset(keyset)
             if not has_required_dd:
                 return False
 
         elif canon == "Insights_Analysis":
-            if len(keys) < 5:
+            if not bool(keyset & {"section", "item", "value", "metric", "symbol"}):
                 return False
 
     return True
@@ -1254,10 +1238,11 @@ def _pick_provider_callable(module: Any, provider_name: str) -> Optional[Callabl
 
 
 async def _call_maybe_async(fn: Callable, *args, **kwargs) -> Any:
-    out = fn(*args, **kwargs)
-    if inspect.isawaitable(out):
-        return await out
-    return out
+    if inspect.iscoroutinefunction(fn):
+        return await fn(*args, **kwargs)
+
+    result = await asyncio.to_thread(fn, *args, **kwargs)
+    return await result if inspect.isawaitable(result) else result
 
 
 @dataclass(slots=True)
@@ -1526,9 +1511,11 @@ async def _maybe_apply_scoring_module(row: Dict[str, Any], settings: Any) -> Dic
         fn = getattr(mod, fn_name, None)
         if callable(fn):
             try:
-                r = fn(row, settings=settings) if _fn_accepts_settings(fn) else fn(row)
-                if inspect.isawaitable(r):
-                    r = await r
+                if _fn_accepts_settings(fn):
+                    r = await _call_maybe_async(fn, row, settings=settings)
+                else:
+                    r = await _call_maybe_async(fn, row)
+                
                 if isinstance(r, dict):
                     for k, v in r.items():
                         if v is not None:
@@ -1547,9 +1534,11 @@ async def _maybe_apply_forecast(row: Dict[str, Any], settings: Any) -> Dict[str,
         fn = getattr(mod, fn_name, None)
         if callable(fn):
             try:
-                r = fn(row, settings=settings) if _fn_accepts_settings(fn) else fn(row)
-                if inspect.isawaitable(r):
-                    r = await r
+                if _fn_accepts_settings(fn):
+                    r = await _call_maybe_async(fn, row, settings=settings)
+                else:
+                    r = await _call_maybe_async(fn, row)
+                
                 if isinstance(r, dict):
                     for k, v in r.items():
                         if v is not None:
@@ -2916,7 +2905,7 @@ class DataEngineV5:
                     if qn:
                         quote_map[str(qn)] = dict(qd)
         except Exception:
-            return [normalize_row_to_schema(schema, dict(r)) if schema is not None else dict(r) for r in rows]
+            return [normalize_row_to_schema(schema, dict(r), keep_extras=False) if schema is not None else dict(r) for r in rows]
 
         out: List[Dict[str, Any]] = []
         for row in rows:
@@ -2931,7 +2920,7 @@ class DataEngineV5:
             if norm and not merged.get("symbol_normalized"):
                 merged["symbol_normalized"] = norm
             if schema is not None:
-                merged = normalize_row_to_schema(schema, merged)
+                merged = normalize_row_to_schema(schema, merged, keep_extras=False)
             out.append(merged)
 
         return out
@@ -3190,6 +3179,8 @@ class DataEngineV5:
             "read_sheet_symbols",
         ]
 
+        timeout_s = _get_env_float("SHEET_SYMBOLS_TIMEOUT_SECONDS", 15.0)
+
         for name in method_names:
             fn = getattr(obj, name, None)
             if not callable(fn):
@@ -3208,8 +3199,12 @@ class DataEngineV5:
 
             for args, kwargs in call_variants:
                 try:
-                    res = await _call_maybe_async(fn, *args, **kwargs)
+                    async with asyncio.timeout(timeout_s):
+                        res = await _call_maybe_async(fn, *args, **kwargs)
                 except TypeError:
+                    continue
+                except TimeoutError:
+                    logger.warning(f"Timeout calling symbols reader {name}")
                     continue
                 except Exception:
                     continue
@@ -3525,6 +3520,8 @@ class DataEngineV5:
             "get_rows",
         ]
 
+        timeout_s = _get_env_float("ROWS_READER_TIMEOUT_SECONDS", 20.0)
+
         for name in method_names:
             fn = getattr(obj, name, None)
             if not callable(fn):
@@ -3540,8 +3537,12 @@ class DataEngineV5:
 
             for args, kwargs in call_variants:
                 try:
-                    res = await _call_maybe_async(fn, *args, **kwargs)
+                    async with asyncio.timeout(timeout_s):
+                        res = await _call_maybe_async(fn, *args, **kwargs)
                 except TypeError:
+                    continue
+                except TimeoutError:
+                    logger.warning(f"Timeout calling rows reader {name}")
                     continue
                 except Exception:
                     continue
@@ -3580,30 +3581,53 @@ class DataEngineV5:
                 return provider, None, (time.time() - start) * 1000.0, err
 
             provider_symbol = self._provider_symbol(provider, symbol)
-            try:
-                async with asyncio.timeout(self.request_timeout):
-                    res = await _call_maybe_async(fn, provider_symbol)
-                latency = (time.time() - start) * 1000.0
-                if isinstance(res, dict) and res:
-                    patch = _normalize_patch_keys(_clean_patch(res))
-                    if _is_useful_patch(patch):
-                        await self._registry.record_success(provider, latency)
-                        return provider, patch, latency, None
-                    err = str(res.get("error") or "empty_result")
-                    await self._registry.record_failure(provider, err)
-                    return provider, None, latency, err
-                err = "non_dict_or_empty"
+            
+            call_variants = [
+                ((provider_symbol,), {}),
+                ((), {"symbol": provider_symbol}),
+                ((), {"ticker": provider_symbol}),
+                ((), {"requested_symbol": provider_symbol}),
+                ((provider_symbol,), {"settings": self.settings}),
+                ((), {"symbol": provider_symbol, "settings": self.settings}),
+                ((), {"ticker": provider_symbol, "settings": self.settings}),
+            ]
+            
+            res = None
+            call_success = False
+            collected_errs: List[str] = []
+            
+            for args, kwargs in call_variants:
+                try:
+                    async with asyncio.timeout(self.request_timeout):
+                        res = await _call_maybe_async(fn, *args, **kwargs)
+                    call_success = True
+                    break
+                except TimeoutError:
+                    collected_errs.append("timeout")
+                    break
+                except Exception as e:
+                    collected_errs.append(f"{type(e).__name__}: {str(e)[:100]}")
+                    continue
+
+            latency = (time.time() - start) * 1000.0
+
+            if not call_success:
+                err = " | ".join(collected_errs) if collected_errs else "provider_call_failed"
                 await self._registry.record_failure(provider, err)
                 return provider, None, latency, err
-            except TimeoutError:
-                latency = (time.time() - start) * 1000.0
-                err = "timeout"
+
+            if isinstance(res, dict) and res:
+                patch = _normalize_patch_keys(_clean_patch(res))
+                if _is_useful_patch(patch):
+                    await self._registry.record_success(provider, latency)
+                    return provider, patch, latency, None
+                err = str(res.get("error") or "empty_result")
                 await self._registry.record_failure(provider, err)
                 return provider, None, latency, err
-            except Exception as e:
-                latency = (time.time() - start) * 1000.0
-                await self._registry.record_failure(provider, repr(e))
-                return provider, None, latency, repr(e)
+                
+            err = "non_dict_or_empty"
+            await self._registry.record_failure(provider, err)
+            return provider, None, latency, err
 
     def _merge(self, requested_symbol: str, norm: str, patches: List[Tuple[str, Dict[str, Any], float]]) -> Dict[str, Any]:
         merged: Dict[str, Any] = {
@@ -3702,16 +3726,26 @@ class DataEngineV5:
     # quote APIs
     # -------------------------------------------------------------------------
     async def get_enriched_quote(self, symbol: str, use_cache: bool = True, *, schema: Any = None) -> UnifiedQuote:
-        return await self._singleflight.execute(
-            f"quote:{symbol}",
-            lambda: self._get_enriched_quote_impl(symbol, use_cache, schema=schema),
+        info = get_symbol_info(symbol)
+        norm = info.get("normalized") or _safe_str(symbol)
+        key = f"quote:{norm}:{'cache' if use_cache else 'live'}"
+        
+        raw_q = await self._singleflight.execute(
+            key,
+            lambda: self._get_enriched_quote_impl(symbol, use_cache),
         )
+        
+        if schema is not None:
+            d = _model_to_dict(raw_q)
+            d = normalize_row_to_schema(schema, d, keep_extras=False)
+            return UnifiedQuote(**d)
+        return raw_q
 
     async def get_enriched_quote_dict(self, symbol: str, use_cache: bool = True, *, schema: Any = None) -> Dict[str, Any]:
         q = await self.get_enriched_quote(symbol, use_cache=use_cache, schema=schema)
         return _model_to_dict(q)
 
-    async def _get_enriched_quote_impl(self, symbol: str, use_cache: bool = True, *, schema: Any = None) -> UnifiedQuote:
+    async def _get_enriched_quote_impl(self, symbol: str, use_cache: bool = True) -> UnifiedQuote:
         info = get_symbol_info(symbol)
         norm = info.get("normalized") or ""
         is_ksa_sym = bool(info.get("is_ksa"))
@@ -3727,7 +3761,7 @@ class DataEngineV5:
                 "last_updated_riyadh": _now_riyadh_iso(),
             }
             _ensure_required_advanced_fields(row)
-            row = normalize_row_to_schema(schema, row) if schema is not None else normalize_row_to_schema(None, row)
+            row = normalize_row_to_schema(None, row)
             return UnifiedQuote(**row)  # type: ignore
 
         if use_cache:
@@ -3755,7 +3789,7 @@ class DataEngineV5:
                 "last_updated_riyadh": _now_riyadh_iso(),
             }
             _ensure_required_advanced_fields(row)
-            row = normalize_row_to_schema(schema, row) if schema is not None else normalize_row_to_schema(None, row)
+            row = normalize_row_to_schema(None, row)
             return UnifiedQuote(**row)  # type: ignore
 
         top_n = _get_env_int("PROVIDER_TOP_N", 4)
@@ -3788,7 +3822,7 @@ class DataEngineV5:
                 "last_updated_riyadh": _now_riyadh_iso(),
             }
             _ensure_required_advanced_fields(row)
-            row = normalize_row_to_schema(schema, row) if schema is not None else normalize_row_to_schema(None, row)
+            row = normalize_row_to_schema(None, row)
             q = UnifiedQuote(**row)  # type: ignore
             if use_cache:
                 await self._cache.set(_model_to_dict(q), symbol=norm)
@@ -3825,7 +3859,7 @@ class DataEngineV5:
             or ""
         )
 
-        row = normalize_row_to_schema(schema, row) if schema is not None else normalize_row_to_schema(None, row)
+        row = normalize_row_to_schema(None, row)
         q = UnifiedQuote(**row)  # type: ignore
 
         if use_cache:
@@ -4026,91 +4060,19 @@ class DataEngineV5:
         offset = max(0, int(offset or 0))
         include_matrix = _safe_bool(body.get("include_matrix"), True)
 
-        target_sheet = _canonicalize_sheet_name((sheet or sheet_name or page or "").strip())
+        target_sheet = _canonicalize_sheet_name((sheet or sheet_name or page or "Market_Leaders").strip()) or "Market_Leaders"
         spec, headers, keys, schema_src = _schema_for_sheet(target_sheet)
-
         headers, keys = _complete_schema_contract(headers, keys)
 
-        # ---------------------------------------------------------------------
-        # SCHEMA CONTRACT RECOVERY FLOW
-        # ---------------------------------------------------------------------
-        if not _usable_contract(headers, keys, target_sheet):
-            recovered = False
+        target_sheet_known = target_sheet in INSTRUMENT_SHEETS or target_sheet in SPECIAL_SHEETS or bool(spec)
+        strict_req = bool(self.schema_strict_sheet_rows)
 
-            # a) Try to recover from cached snapshot contract
-            cached_snap = self.get_cached_sheet_snapshot(sheet=target_sheet)
-            if isinstance(cached_snap, dict):
-                c_headers = cached_snap.get("headers") or cached_snap.get("display_headers")
-                c_keys = cached_snap.get("keys") or cached_snap.get("fields")
-                if c_headers or c_keys:
-                    headers, keys = _complete_schema_contract(c_headers or [], c_keys or [])
-                    if _usable_contract(headers, keys, target_sheet):
-                        schema_src = "recovered_from_cache_contract"
-                        recovered = True
-
-                # b) Infer from cached rows
-                if not recovered:
-                    c_rows = _coerce_rows_list(cached_snap)
-                    if c_rows and isinstance(c_rows[0], dict):
-                        headers, keys = _complete_schema_contract([], list(c_rows[0].keys()))
-                        if _usable_contract(headers, keys, target_sheet):
-                            schema_src = "recovered_from_cached_rows"
-                            recovered = True
-
-            # c) Infer from external rows (for instrument sheets)
-            if not recovered and target_sheet in INSTRUMENT_SHEETS:
-                try:
-                    ext_rows = await self._get_rows_from_external_reader(target_sheet, 1)
-                    if ext_rows and isinstance(ext_rows[0], dict):
-                        headers, keys = _complete_schema_contract([], list(ext_rows[0].keys()))
-                        if _usable_contract(headers, keys, target_sheet):
-                            schema_src = "recovered_from_external_rows"
-                            recovered = True
-                except Exception:
-                    pass
-
-        # Re-apply Top 10 contract logic safely after ANY recovery pass
-        if target_sheet == "Top_10_Investments":
-            headers, keys = self._top10_schema_contract(headers, keys)
-            headers, keys = _complete_schema_contract(headers, keys)
-
-        # e) Only then Strict Failure
-        if not _usable_contract(headers, keys, target_sheet) and self.schema_strict_sheet_rows and _SCHEMA_AVAILABLE:
-            return self._finalize_payload(
-                sheet=target_sheet,
-                headers=[],
-                keys=[],
-                rows=[],
-                include_matrix=include_matrix,
-                status="error",
-                meta={
-                    "schema_source": schema_src,
-                    "strict": True,
-                    "known_sheets": _list_sheet_names_best_effort(),
-                },
-                error=f"Unknown sheet or schema missing for '{target_sheet}'",
-            )
-
-        if _usable_contract(headers, keys, target_sheet) and _is_schema_only_body(body):
-            return self._finalize_payload(
-                sheet=target_sheet,
-                headers=headers,
-                keys=keys,
-                rows=[],
-                include_matrix=include_matrix,
-                status="success",
-                meta={
-                    "schema_source": schema_src,
-                    "rows": 0,
-                    "limit": limit,
-                    "offset": offset,
-                    "mode": mode,
-                    "built_from": "schema_only_fast_path",
-                },
-            )
+        contract_level = "canonical" if _usable_contract(headers, keys, target_sheet) else "partial"
+        schema_warning = None
+        recovered_from = None
 
         # ---------------------------------------------------------------------
-        # Data_Dictionary
+        # SPECIAL SHEETS: Handle logic FIRST, before any global strict failure
         # ---------------------------------------------------------------------
         if target_sheet == "Data_Dictionary":
             raw_rows: List[Dict[str, Any]] = []
@@ -4153,10 +4115,12 @@ class DataEngineV5:
                         raw_rows.append(rr)
                 dd_note = "fallback:internal"
 
-            if not _usable_contract(headers, keys, target_sheet) and not self.schema_strict_sheet_rows and raw_rows and isinstance(raw_rows[0], dict):
+            if not _usable_contract(headers, keys, target_sheet) and raw_rows and isinstance(raw_rows[0], dict):
                 keys = list(raw_rows[0].keys())
                 headers = [str(k).replace("_", " ").title() for k in keys]
                 headers, keys = _complete_schema_contract(headers, keys)
+                contract_level = "inferred"
+                recovered_from = "builder_rows"
 
             if not _usable_contract(headers, keys, target_sheet):
                 headers = ["Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes"]
@@ -4164,58 +4128,45 @@ class DataEngineV5:
                 headers, keys = _complete_schema_contract(headers, keys)
                 if "fallback" not in schema_src:
                     schema_src = "fallback:standard_data_dictionary"
+                    contract_level = "union_fallback"
+                    recovered_from = "internal_fallback"
+
+            base_meta = {
+                "schema_source": schema_src,
+                "contract_level": contract_level,
+                "strict_requested": strict_req,
+                "strict_enforced": False,
+                "target_sheet_known": True,
+                "builder": dd_note,
+            }
+            if recovered_from: base_meta["recovered_from"] = recovered_from
 
             if _is_schema_only_body(body):
                 return self._finalize_payload(
                     sheet="Data_Dictionary",
-                    headers=headers,
-                    keys=keys,
-                    rows=[],
-                    include_matrix=include_matrix,
-                    status="success",
-                    meta={
-                        "schema_source": schema_src,
-                        "builder": dd_note,
-                        "rows": 0,
-                        "limit": limit,
-                        "offset": offset,
-                        "built_from": "schema_only_special_path",
-                    },
+                    headers=headers, keys=keys, rows=[],
+                    include_matrix=include_matrix, status="success",
+                    meta={**base_meta, "rows": 0, "limit": limit, "offset": offset, "built_from": "schema_only_special_path"},
                 )
 
             rows = [_normalize_to_schema_keys(keys, headers, r) for r in raw_rows]
             full_rows = self._project_rows_to_schema(rows, headers=headers, keys=keys)
             payload_full = self._finalize_payload(
                 sheet="Data_Dictionary",
-                headers=headers,
-                keys=keys,
-                rows=full_rows,
-                include_matrix=include_matrix,
-                status="success",
-                meta={
-                    "schema_source": schema_src,
-                    "builder": dd_note,
-                    "rows": len(full_rows),
-                    "limit": limit,
-                    "offset": offset,
-                },
+                headers=headers, keys=keys, rows=full_rows,
+                include_matrix=include_matrix, status="success",
+                meta={**base_meta, "rows": len(full_rows), "limit": limit, "offset": offset},
             )
             self._store_sheet_snapshot("Data_Dictionary", payload_full)
 
             rows_page = full_rows[offset: offset + limit]
             return self._finalize_payload(
                 sheet="Data_Dictionary",
-                headers=headers,
-                keys=keys,
-                rows=rows_page,
-                include_matrix=include_matrix,
-                status="success",
+                headers=headers, keys=keys, rows=rows_page,
+                include_matrix=include_matrix, status="success",
                 meta={**payload_full.get("meta", {}), "rows": len(rows_page)},
             )
 
-        # ---------------------------------------------------------------------
-        # Insights_Analysis
-        # ---------------------------------------------------------------------
         if target_sheet == "Insights_Analysis":
             rows0: List[Dict[str, Any]] = []
             builder_name = "core.analysis.insights_builder"
@@ -4225,11 +4176,8 @@ class DataEngineV5:
                 universes = body.get("universes") if isinstance(body.get("universes"), dict) else None
                 symbols = body.get("symbols") if isinstance(body.get("symbols"), list) else None
                 payload = await build_insights_analysis_rows(
-                    engine=self,
-                    criteria=crit,
-                    universes=universes,
-                    symbols=symbols,
-                    mode=mode or "",
+                    engine=self, criteria=crit, universes=universes,
+                    symbols=symbols, mode=mode or "",
                 )
                 rows0 = _coerce_rows_list(payload)
             except Exception:
@@ -4249,63 +4197,48 @@ class DataEngineV5:
                 ]
                 builder_name = "fallback:system_row"
 
-            if not _usable_contract(headers, keys, target_sheet) and not self.schema_strict_sheet_rows and rows0 and isinstance(rows0[0], dict):
+            if not _usable_contract(headers, keys, target_sheet) and rows0 and isinstance(rows0[0], dict):
                 keys = list(rows0[0].keys())
                 headers = [str(k).replace("_", " ").title() for k in keys]
                 headers, keys = _complete_schema_contract(headers, keys)
+                contract_level = "inferred"
+                recovered_from = "builder_rows"
+
+            base_meta = {
+                "schema_source": schema_src,
+                "contract_level": contract_level,
+                "strict_requested": strict_req,
+                "strict_enforced": False,
+                "target_sheet_known": True,
+                "builder": builder_name,
+            }
+            if recovered_from: base_meta["recovered_from"] = recovered_from
 
             if _is_schema_only_body(body):
                 return self._finalize_payload(
                     sheet=target_sheet,
-                    headers=headers,
-                    keys=keys,
-                    rows=[],
-                    include_matrix=include_matrix,
-                    status="success",
-                    meta={
-                        "schema_source": schema_src,
-                        "builder": builder_name,
-                        "rows": 0,
-                        "limit": limit,
-                        "offset": offset,
-                        "mode": mode,
-                        "built_from": "schema_only_special_path",
-                    },
+                    headers=headers, keys=keys, rows=[],
+                    include_matrix=include_matrix, status="success",
+                    meta={**base_meta, "rows": 0, "limit": limit, "offset": offset, "mode": mode, "built_from": "schema_only_special_path"},
                 )
 
             full_rows = self._project_rows_to_schema(rows0, headers=headers, keys=keys)
             payload_full = self._finalize_payload(
                 sheet=target_sheet,
-                headers=headers,
-                keys=keys,
-                rows=full_rows,
-                include_matrix=include_matrix,
-                status="success",
-                meta={
-                    "schema_source": schema_src,
-                    "builder": builder_name,
-                    "rows": len(full_rows),
-                    "limit": limit,
-                    "offset": offset,
-                    "mode": mode,
-                },
+                headers=headers, keys=keys, rows=full_rows,
+                include_matrix=include_matrix, status="success",
+                meta={**base_meta, "rows": len(full_rows), "limit": limit, "offset": offset, "mode": mode},
             )
             self._store_sheet_snapshot(target_sheet, payload_full)
 
             rows_page = full_rows[offset: offset + limit]
             return self._finalize_payload(
                 sheet=target_sheet,
-                headers=headers,
-                keys=keys,
-                rows=rows_page,
-                include_matrix=include_matrix,
-                status="success",
+                headers=headers, keys=keys, rows=rows_page,
+                include_matrix=include_matrix, status="success",
                 meta={**payload_full.get("meta", {}), "rows": len(rows_page)},
             )
 
-        # ---------------------------------------------------------------------
-        # Top_10_Investments
-        # ---------------------------------------------------------------------
         if target_sheet == "Top_10_Investments":
             top10_body, route_warnings = _normalize_top10_body_for_engine(body, limit=max(1, min(limit, 50)))
             cached_before = self.get_cached_sheet_snapshot(sheet=target_sheet)
@@ -4319,22 +4252,21 @@ class DataEngineV5:
                     headers = [TOP10_REQUIRED_HEADERS.get(k, k.replace("_", " ").title()) for k in keys]
                     headers, keys = _complete_schema_contract(headers, keys)
                     schema_src = "schema_only_repaired_fallback"
+                    contract_level = "union_fallback"
                     route_warnings.append("schema_repaired_for_schema_only_request")
 
                 return self._finalize_payload(
                     sheet=target_sheet,
-                    headers=headers,
-                    keys=keys,
-                    rows=[],
-                    include_matrix=include_matrix,
-                    status="success",
+                    headers=headers, keys=keys, rows=[],
+                    include_matrix=include_matrix, status="success",
                     meta={
                         "schema_source": schema_src,
+                        "contract_level": contract_level,
+                        "strict_requested": strict_req,
+                        "strict_enforced": False,
+                        "target_sheet_known": True,
                         "builder": "schema_only_fast_path",
-                        "rows": 0,
-                        "limit": limit,
-                        "offset": offset,
-                        "mode": mode,
+                        "rows": 0, "limit": limit, "offset": offset, "mode": mode,
                         "warnings": route_warnings,
                     },
                 )
@@ -4346,24 +4278,18 @@ class DataEngineV5:
 
             try:
                 from core.analysis.top10_selector import build_top10_rows  # type: ignore
-
                 criteria = top10_body.get("criteria") if isinstance(top10_body.get("criteria"), dict) else None
                 payload = await build_top10_rows(
-                    engine=self,
-                    settings=self.settings,
-                    criteria=criteria,
+                    engine=self, settings=self.settings, criteria=criteria,
                     body=dict(top10_body or {}),
                     limit=int(top10_body.get("limit") or top10_body.get("top_n") or min(limit, 10) or 10),
                     mode=mode or "",
                 )
-
                 rows0 = _coerce_rows_list(payload)
                 if rows0:
                     rows0 = await self._hydrate_rows_with_quotes(rows0, schema=None)
-
                 meta_extra = payload.get("meta") if isinstance(payload, dict) and isinstance(payload.get("meta"), dict) else {}
                 status_out = payload.get("status") if isinstance(payload, dict) and payload.get("status") else "success"
-
             except Exception as e:
                 rows0 = []
                 meta_extra = {"top10_error": f"{type(e).__name__}: {e}"}
@@ -4380,6 +4306,7 @@ class DataEngineV5:
                     headers, keys = fb_headers, fb_keys
                     full_rows = fallback_rows
                     builder_used = "fallback:live_ranker"
+                    contract_level = "union_fallback"
                     route_warnings = route_warnings + ["selector_empty_used_live_ranker_fallback"]
 
             if not full_rows and isinstance(cached_before, dict):
@@ -4392,19 +4319,18 @@ class DataEngineV5:
                     rows_page = full_rows_cached[offset: offset + limit]
                     return self._finalize_payload(
                         sheet=target_sheet,
-                        headers=cached_headers,
-                        keys=cached_keys,
-                        rows=rows_page,
-                        include_matrix=include_matrix,
-                        status="warn",
+                        headers=cached_headers, keys=cached_keys, rows=rows_page,
+                        include_matrix=include_matrix, status="warn",
                         meta={
                             "schema_source": schema_src,
+                            "contract_level": "recovered",
+                            "recovered_from": "cached_snapshot",
+                            "strict_requested": strict_req,
+                            "strict_enforced": False,
+                            "target_sheet_known": True,
                             "builder": "cached_snapshot_fallback",
-                            "rows": len(rows_page),
-                            "limit": limit,
-                            "offset": offset,
-                            "mode": mode,
-                            "built_from": "cached_snapshot_fallback",
+                            "rows": len(rows_page), "limit": limit, "offset": offset,
+                            "mode": mode, "built_from": "cached_snapshot_fallback",
                             "warnings": route_warnings + ["top10_degraded_to_cached_snapshot"],
                             **(meta_extra or {}),
                         },
@@ -4412,18 +4338,16 @@ class DataEngineV5:
 
             payload_full = self._finalize_payload(
                 sheet=target_sheet,
-                headers=headers,
-                keys=keys,
-                rows=full_rows,
-                include_matrix=include_matrix,
-                status=status_out or ("success" if full_rows else "warn"),
+                headers=headers, keys=keys, rows=full_rows,
+                include_matrix=include_matrix, status=status_out or ("success" if full_rows else "warn"),
                 meta={
                     "schema_source": schema_src,
+                    "contract_level": contract_level,
+                    "strict_requested": strict_req,
+                    "strict_enforced": False,
+                    "target_sheet_known": True,
                     "builder": builder_used,
-                    "rows": len(full_rows),
-                    "limit": limit,
-                    "offset": offset,
-                    "mode": mode,
+                    "rows": len(full_rows), "limit": limit, "offset": offset, "mode": mode,
                     "warnings": route_warnings,
                     **(meta_extra or {}),
                 },
@@ -4435,16 +4359,138 @@ class DataEngineV5:
             rows_page = full_rows[offset: offset + limit]
             return self._finalize_payload(
                 sheet=target_sheet,
-                headers=headers,
-                keys=keys,
-                rows=rows_page,
-                include_matrix=include_matrix,
-                status=payload_full.get("status", "success"),
+                headers=headers, keys=keys, rows=rows_page,
+                include_matrix=include_matrix, status=payload_full.get("status", "success"),
                 meta={**payload_full.get("meta", {}), "rows": len(rows_page)},
             )
 
+
         # ---------------------------------------------------------------------
-        # Instrument sheets
+        # SCHEMA CONTRACT RECOVERY FLOW (Instrument & Unknown Sheets)
+        # ---------------------------------------------------------------------
+        if contract_level != "canonical":
+            recovered = False
+
+            # a) Try to recover from cached snapshot contract
+            cached_snap = self.get_cached_sheet_snapshot(sheet=target_sheet)
+            if isinstance(cached_snap, dict):
+                c_headers = cached_snap.get("headers") or cached_snap.get("display_headers")
+                c_keys = cached_snap.get("keys") or cached_snap.get("fields")
+                if c_headers or c_keys:
+                    ch, ck = _complete_schema_contract(c_headers or [], c_keys or [])
+                    if _usable_contract(ch, ck, target_sheet):
+                        headers, keys = ch, ck
+                        schema_src = "recovered_from_cache_contract"
+                        recovered_from = "cache_contract"
+                        contract_level = "recovered"
+                        recovered = True
+
+            # b) Infer from cached rows
+            if not recovered:
+                c_rows = _coerce_rows_list(cached_snap) if 'cached_snap' in locals() else None
+                if c_rows and isinstance(c_rows[0], dict):
+                    ch, ck = _complete_schema_contract([], list(c_rows[0].keys()))
+                    if _usable_contract(ch, ck, target_sheet):
+                        headers, keys = ch, ck
+                        schema_src = "recovered_from_cached_rows"
+                        recovered_from = "cached_rows"
+                        contract_level = "inferred"
+                        recovered = True
+
+            # c) Infer from external rows (for instrument sheets)
+            if not recovered and target_sheet in INSTRUMENT_SHEETS:
+                try:
+                    ext_rows = await self._get_rows_from_external_reader(target_sheet, 1)
+                    if ext_rows and isinstance(ext_rows[0], dict):
+                        ch, ck = _complete_schema_contract([], list(ext_rows[0].keys()))
+                        if _usable_contract(ch, ck, target_sheet):
+                            headers, keys = ch, ck
+                            schema_src = "recovered_from_external_rows"
+                            recovered_from = "external_rows"
+                            contract_level = "inferred"
+                            recovered = True
+                except Exception:
+                    pass
+
+            # d) Infer from live quote (for instrument sheets)
+            if not recovered and target_sheet in INSTRUMENT_SHEETS:
+                try:
+                    sample_syms = await self.get_sheet_symbols(target_sheet, limit=1, body=body)
+                    if sample_syms:
+                        sample_q = await self.get_enriched_quote_dict(sample_syms[0], schema=None)
+                        if sample_q:
+                            ch, ck = _complete_schema_contract([], list(sample_q.keys()))
+                            if _usable_contract(ch, ck, target_sheet):
+                                headers, keys = ch, ck
+                                schema_src = "recovered_from_live_quote"
+                                recovered_from = "live_quote"
+                                contract_level = "inferred"
+                                recovered = True
+                except Exception:
+                    pass
+                    
+            # e) Fallback to Union for known instrument sheets instead of immediate failure
+            if not recovered and target_sheet in INSTRUMENT_SHEETS:
+                keys = list(_SCHEMA_UNION_KEYS)
+                headers = list(_SCHEMA_UNION_KEYS)
+                schema_src = "fallback_union"
+                recovered_from = "union_fallback"
+                contract_level = "union_fallback"
+                schema_warning = "canonical_schema_unusable_used_union_schema"
+                recovered = True
+
+            # f) Strict Mode Hard Failure ONLY IF it's NOT a known sheet and NO recovery succeeded
+            if not recovered and strict_req and _SCHEMA_AVAILABLE and not target_sheet_known:
+                base_meta_err = {
+                    "schema_source": schema_src,
+                    "contract_level": "failed",
+                    "strict_requested": True,
+                    "strict_enforced": True,
+                    "target_sheet_known": target_sheet_known,
+                    "known_sheets": _list_sheet_names_best_effort(),
+                }
+                return self._finalize_payload(
+                    sheet=target_sheet,
+                    headers=[], keys=[], rows=[],
+                    include_matrix=include_matrix, status="error",
+                    meta=base_meta_err,
+                    error=f"Unknown sheet or schema missing for '{target_sheet}'",
+                )
+
+        final_status = "success"
+        if not target_sheet_known and not strict_req:
+            final_status = "warn"
+            schema_warning = schema_warning or "unknown_sheet_non_strict_mode"
+
+        base_meta = {
+            "schema_source": schema_src,
+            "contract_level": contract_level,
+            "strict_requested": strict_req,
+            "strict_enforced": strict_req and not target_sheet_known and not _usable_contract(headers, keys, target_sheet),
+            "target_sheet_known": target_sheet_known,
+        }
+        if recovered_from: base_meta["recovered_from"] = recovered_from
+        if schema_warning: base_meta["schema_warning"] = schema_warning
+
+
+        # ---------------------------------------------------------------------
+        # SCHEMA ONLY FAST PATH FOR INSTRUMENT SHEETS
+        # ---------------------------------------------------------------------
+        if _is_schema_only_body(body):
+            return self._finalize_payload(
+                sheet=target_sheet,
+                headers=headers, keys=keys, rows=[],
+                include_matrix=include_matrix, status=final_status,
+                meta={
+                    **base_meta,
+                    "rows": 0, "limit": limit, "offset": offset, "mode": mode,
+                    "built_from": "schema_only_fast_path",
+                },
+            )
+
+
+        # ---------------------------------------------------------------------
+        # STANDARD INSTRUMENT SHEETS DATA HYDRATION
         # ---------------------------------------------------------------------
         requested_symbols = _extract_requested_symbols_from_body(body, limit=limit + offset)
         built_from = "body_symbols" if requested_symbols else "live_quotes"
@@ -4453,11 +4499,7 @@ class DataEngineV5:
             self._set_sheet_symbols_meta(target_sheet, "body_symbols", len(requested_symbols))
 
         if not requested_symbols and target_sheet in INSTRUMENT_SHEETS:
-            requested_symbols = await self.get_sheet_symbols(
-                target_sheet,
-                limit=limit + offset,
-                body=body,
-            )
+            requested_symbols = await self.get_sheet_symbols(target_sheet, limit=limit + offset, body=body)
             sym_meta0 = self._get_sheet_symbols_meta(target_sheet)
             built_from = sym_meta0.get("source") or ("auto_sheet_symbols" if requested_symbols else "empty")
 
@@ -4472,8 +4514,7 @@ class DataEngineV5:
                 except Exception:
                     pass
             if ext_rows:
-                # Infer contract from rows if strict mode off and contract is missing/unusable
-                if not self.schema_strict_sheet_rows and not _usable_contract(out_headers, out_keys, target_sheet) and isinstance(ext_rows[0], dict):
+                if not strict_req and not _usable_contract(out_headers, out_keys, target_sheet) and isinstance(ext_rows[0], dict):
                     out_keys = list(ext_rows[0].keys())
                     out_headers = [k.replace("_", " ").title() for k in out_keys]
                     out_headers, out_keys = _complete_schema_contract(out_headers, out_keys)
@@ -4481,17 +4522,11 @@ class DataEngineV5:
                 full_rows = self._project_rows_to_schema(ext_rows, headers=out_headers, keys=out_keys)
                 payload_full = self._finalize_payload(
                     sheet=target_sheet,
-                    headers=out_headers,
-                    keys=out_keys,
-                    rows=full_rows,
-                    include_matrix=include_matrix,
-                    status="success",
+                    headers=out_headers, keys=out_keys, rows=full_rows,
+                    include_matrix=include_matrix, status=final_status,
                     meta={
-                        "schema_source": schema_src,
-                        "rows": len(full_rows),
-                        "limit": limit,
-                        "offset": offset,
-                        "mode": mode,
+                        **base_meta,
+                        "rows": len(full_rows), "limit": limit, "offset": offset, "mode": mode,
                         "built_from": "external_rows_reader",
                         "rows_reader_source": self._rows_reader_source,
                         "symbols_reader_source": self._symbols_reader_source,
@@ -4502,20 +4537,16 @@ class DataEngineV5:
                 rows_page = full_rows[offset: offset + limit]
                 return self._finalize_payload(
                     sheet=target_sheet,
-                    headers=out_headers,
-                    keys=out_keys,
-                    rows=rows_page,
-                    include_matrix=include_matrix,
-                    status="success",
+                    headers=out_headers, keys=out_keys, rows=rows_page,
+                    include_matrix=include_matrix, status=final_status,
                     meta={**payload_full.get("meta", {}), "rows": len(rows_page)},
                 )
 
         if not requested_symbols:
-            cached_snap = self.get_cached_sheet_snapshot(sheet=target_sheet)
+            cached_snap = self.get_cached_sheet_snapshot(sheet=target_sheet) if 'cached_snap' not in locals() else cached_snap
             cached_rows = _coerce_rows_list(cached_snap)
             if cached_rows:
-                # Infer contract from rows if strict mode off and contract is missing/unusable
-                if not self.schema_strict_sheet_rows and not _usable_contract(out_headers, out_keys, target_sheet) and isinstance(cached_rows[0], dict):
+                if not strict_req and not _usable_contract(out_headers, out_keys, target_sheet) and isinstance(cached_rows[0], dict):
                     out_keys = list(cached_rows[0].keys())
                     out_headers = [k.replace("_", " ").title() for k in out_keys]
                     out_headers, out_keys = _complete_schema_contract(out_headers, out_keys)
@@ -4524,19 +4555,12 @@ class DataEngineV5:
                 rows_page = full_rows[offset: offset + limit]
                 return self._finalize_payload(
                     sheet=target_sheet,
-                    headers=out_headers,
-                    keys=out_keys,
-                    rows=rows_page,
-                    include_matrix=include_matrix,
-                    status="success",
+                    headers=out_headers, keys=out_keys, rows=rows_page,
+                    include_matrix=include_matrix, status=final_status,
                     meta={
-                        "schema_source": schema_src,
-                        "rows": len(rows_page),
-                        "limit": limit,
-                        "offset": offset,
-                        "mode": mode,
-                        "built_from": "cached_snapshot",
-                        "auto_symbols_count": 0,
+                        **base_meta,
+                        "rows": len(rows_page), "limit": limit, "offset": offset, "mode": mode,
+                        "built_from": "cached_snapshot", "auto_symbols_count": 0,
                         "symbols_reader_source": self._symbols_reader_source,
                         "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet),
                     },
@@ -4544,11 +4568,10 @@ class DataEngineV5:
 
         rows_full: List[Dict[str, Any]] = []
         if requested_symbols:
-            effective_quote_schema = target_sheet if _usable_contract(out_headers, out_keys, target_sheet) else None
-            quotes = await self.get_enriched_quotes(requested_symbols, schema=effective_quote_schema)
+            # We now process quotes agnostic of schema entirely, schema projection is explicit down below.
+            quotes = await self.get_enriched_quotes(requested_symbols, schema=None)
             
-            # Infer contract from rows if strict mode off and contract is missing/unusable
-            if not self.schema_strict_sheet_rows and not _usable_contract(out_headers, out_keys, target_sheet) and quotes:
+            if not strict_req and not _usable_contract(out_headers, out_keys, target_sheet) and quotes:
                 first_d = _model_to_dict(quotes[0])
                 if first_d:
                     out_keys = list(first_d.keys())
@@ -4567,17 +4590,11 @@ class DataEngineV5:
             sym_meta = self._get_sheet_symbols_meta(target_sheet)
             payload_full = self._finalize_payload(
                 sheet=target_sheet,
-                headers=out_headers,
-                keys=out_keys,
-                rows=rows_full,
-                include_matrix=include_matrix,
-                status="success",
+                headers=out_headers, keys=out_keys, rows=rows_full,
+                include_matrix=include_matrix, status=final_status,
                 meta={
-                    "schema_source": schema_src,
-                    "rows": len(rows_full),
-                    "limit": limit,
-                    "offset": offset,
-                    "mode": mode,
+                    **base_meta,
+                    "rows": len(rows_full), "limit": limit, "offset": offset, "mode": mode,
                     "built_from": built_from,
                     "auto_symbols_count": len(requested_symbols) if built_from != "body_symbols" else 0,
                     "resolved_symbols_count": len(requested_symbols),
@@ -4590,27 +4607,18 @@ class DataEngineV5:
             rows_page = rows_full[offset: offset + limit]
             return self._finalize_payload(
                 sheet=target_sheet,
-                headers=out_headers,
-                keys=out_keys,
-                rows=rows_page,
-                include_matrix=include_matrix,
-                status="success",
+                headers=out_headers, keys=out_keys, rows=rows_page,
+                include_matrix=include_matrix, status=final_status,
                 meta={**payload_full.get("meta", {}), "rows": len(rows_page)},
             )
 
         return self._finalize_payload(
             sheet=target_sheet,
-            headers=out_headers,
-            keys=out_keys,
-            rows=[],
-            include_matrix=include_matrix,
-            status="success",
+            headers=out_headers, keys=out_keys, rows=[],
+            include_matrix=include_matrix, status=final_status,
             meta={
-                "schema_source": schema_src,
-                "rows": 0,
-                "limit": limit,
-                "offset": offset,
-                "mode": mode,
+                **base_meta,
+                "rows": 0, "limit": limit, "offset": offset, "mode": mode,
                 "built_from": built_from,
                 "auto_symbols_count": len(requested_symbols) if built_from != "body_symbols" else 0,
                 "resolved_symbols_count": len(requested_symbols),
