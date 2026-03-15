@@ -3,10 +3,29 @@
 """
 core/investment_advisor_engine.py
 ================================================================================
-INVESTMENT ADVISOR ENGINE — v3.0.0
+INVESTMENT ADVISOR ENGINE — v3.1.0
 ================================================================================
-COMPATIBILITY-FIRST • EXPORT-HARDENED • ROUTE-TOLERANT • ENGINE-AWARE
-NO-IMPORT-TIME-NETWORK • ADVISOR + SHEET-ROWS SAFE • TOP10 FIELD GUARANTEED
+SYNC-EXPORT SAFE • ASYNC-INTERNAL • EXPORT-HARDENED • ROUTE-TOLERANT
+ENGINE-AWARE • NO-IMPORT-TIME-NETWORK • ADVISOR + SHEET-ROWS SAFE
+TOP10 FIELD GUARANTEED • JSON-SAFE • 502-RESISTANT
+
+What this revision fixes
+------------------------
+- ✅ FIX: public runner exports are now sync-compatible for route layers that call
+         the advisor runner inside a worker thread and expect an immediate dict.
+- ✅ FIX: keeps async internal execution for engine access and flexible runtime work.
+- ✅ FIX: prevents uncaught exceptions from escaping normal production flows by
+         returning structured error payloads instead of raising.
+- ✅ FIX: normalizes engine page payloads into stable sheet-rows contracts:
+         headers / display_headers / keys / rows / rows_matrix / data / items
+- ✅ FIX: explicit non-Top10 sheet-rows requests now try direct engine page access
+         first for *all* requested pages, not only a limited subset.
+- ✅ FIX: adds lightweight derived-page fallbacks for:
+         - Advisor_Criteria
+         - AI_Opportunity_Report
+         - KSA_TADAWUL
+- ✅ FIX: schema resolution now supports sync or async schema functions.
+- ✅ FIX: exported methods and singleton service objects remain compatibility-safe.
 
 Purpose
 -------
@@ -27,7 +46,7 @@ This module is intentionally tolerant to many calling styles used by the
 existing route layer. It can:
 - act as the runtime advisor runner for /run and /recommendations
 - act as a sheet-rows source for /sheet-rows
-- pass through engine page rows for base pages
+- pass through engine page rows for explicit page requests
 - build Top_10_Investments style outputs for derived Top10 requests
 - avoid raising in normal production flows
 
@@ -35,10 +54,10 @@ Design notes
 ------------
 - No external network calls at import time.
 - Engine access is lazy and runtime only.
-- If base page rows are requested via a sheet-rows route, the module tries to
-  return engine rows directly.
-- If Top_10_Investments / advisor execution is requested, the module collects
-  candidate rows from source pages, scores them, and returns recommendations.
+- Public exports are synchronous wrappers around an async core, so both:
+    - sync callers
+    - async-aware callers
+  remain compatible through the route layer.
 ================================================================================
 """
 
@@ -50,14 +69,14 @@ import inspect
 import json
 import logging
 import math
-import os
+import threading
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 logger = logging.getLogger("core.investment_advisor_engine")
 logger.addHandler(logging.NullHandler())
 
-INVESTMENT_ADVISOR_ENGINE_VERSION = "3.0.0"
+INVESTMENT_ADVISOR_ENGINE_VERSION = "3.1.0"
 TOP10_PAGE_NAME = "Top_10_Investments"
 
 _BASE_SOURCE_PAGES = [
@@ -196,7 +215,7 @@ def _normalize_list(value: Any) -> List[str]:
 
 def _jsonable_snapshot(value: Any) -> Any:
     try:
-        return json.loads(json.dumps(value, default=str))
+        return json.loads(json.dumps(value, default=str, ensure_ascii=False))
     except Exception:
         try:
             return str(value)
@@ -395,6 +414,87 @@ def _derive_keys_from_rows(rows: List[Dict[str, Any]]) -> List[str]:
     return out
 
 
+def _has_tabular_shape(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if isinstance(payload.get("rows"), list):
+        return True
+    if isinstance(payload.get("rows_matrix"), list):
+        return True
+    if isinstance(payload.get("headers"), list):
+        return True
+    if isinstance(payload.get("keys"), list):
+        return True
+    return False
+
+
+def _route_family_for_page(page: str) -> str:
+    return "top10" if page == TOP10_PAGE_NAME else "advisor"
+
+
+def _make_error_payload(
+    detail: str,
+    *,
+    request: Any = None,
+    page: str = TOP10_PAGE_NAME,
+    operation: str = "run",
+    extra_meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    meta = {
+        "engine_version": INVESTMENT_ADVISOR_ENGINE_VERSION,
+        "request_id": _get_request_id(request),
+        "generated_at_utc": _now_utc_iso(),
+        "operation": operation,
+        "target_page": page,
+    }
+    if isinstance(extra_meta, dict):
+        meta.update(extra_meta)
+
+    return {
+        "status": "error",
+        "page": page,
+        "sheet": page,
+        "route_family": _route_family_for_page(page),
+        "headers": [],
+        "display_headers": [],
+        "keys": [],
+        "rows": [],
+        "items": [],
+        "data": [],
+        "rows_matrix": [],
+        "count": 0,
+        "detail": detail,
+        "meta": meta,
+    }
+
+
+def _run_coro_sync(coro: Any) -> Dict[str, Any]:
+    try:
+        asyncio.get_running_loop()
+        running_loop = True
+    except RuntimeError:
+        running_loop = False
+
+    if not running_loop:
+        return asyncio.run(coro)
+
+    box: Dict[str, Any] = {"result": None, "error": None}
+
+    def _runner() -> None:
+        try:
+            box["result"] = asyncio.run(coro)
+        except Exception as exc:  # pragma: no cover
+            box["error"] = exc
+
+    t = threading.Thread(target=_runner, daemon=True)
+    t.start()
+    t.join()
+
+    if box["error"] is not None:
+        raise box["error"]
+    return box["result"]
+
+
 # =============================================================================
 # Schema helpers
 # =============================================================================
@@ -450,7 +550,7 @@ def _extract_columns_from_spec(spec: Any) -> List[Tuple[str, str]]:
     return columns
 
 
-def _load_schema_defaults(page_name: str = TOP10_PAGE_NAME) -> Tuple[List[str], List[str]]:
+async def _load_schema_defaults(page_name: str = TOP10_PAGE_NAME) -> Tuple[List[str], List[str]]:
     for mod_name in _SCHEMA_MODULE_CANDIDATES:
         try:
             mod = importlib.import_module(mod_name)
@@ -471,7 +571,7 @@ def _load_schema_defaults(page_name: str = TOP10_PAGE_NAME) -> Tuple[List[str], 
 
             for kwargs in attempts:
                 try:
-                    spec = fn(**kwargs)
+                    spec = await _call_maybe_async(fn, **kwargs)
                     cols = _extract_columns_from_spec(spec)
                     if cols:
                         keys = [k for k, _ in cols]
@@ -567,7 +667,7 @@ def _merge_dicts(base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:
 
 async def _extract_context(*args: Any, **kwargs: Any) -> Tuple[Any, Any, Any, Dict[str, Any]]:
     request = kwargs.get("request")
-    engine = kwargs.get("engine")
+    engine = kwargs.get("engine") or kwargs.get("data_engine") or kwargs.get("quote_engine")
     settings = kwargs.get("settings")
 
     payload: Dict[str, Any] = {}
@@ -591,7 +691,6 @@ async def _extract_context(*args: Any, **kwargs: Any) -> Tuple[Any, Any, Any, Di
             continue
 
         if isinstance(arg, dict):
-            # If payload is empty, use direct dict. Otherwise nest as criteria if it looks like selector params.
             if not payload:
                 payload = _merge_dicts(payload, arg)
             else:
@@ -607,7 +706,6 @@ async def _extract_context(*args: Any, **kwargs: Any) -> Tuple[Any, Any, Any, Di
     if settings is None:
         try:
             from core.config import get_settings_cached  # type: ignore
-
             settings = get_settings_cached()
         except Exception:
             settings = None
@@ -655,8 +753,11 @@ def _flatten_criteria(payload: Dict[str, Any]) -> Dict[str, Any]:
         "advisor_data_mode",
         "debug",
         "schema_only",
+        "headers_only",
         "include_matrix",
         "format",
+        "invest_amount",
+        "allocation_strategy",
     ):
         if key in payload and payload.get(key) is not None:
             out[key] = payload.get(key)
@@ -678,7 +779,6 @@ def _normalize_sources(criteria: Dict[str, Any]) -> List[str]:
 
     pages = _dedupe_keep_order(pages)
 
-    # If explicit ALL-like semantics are used, expand to base pages.
     out: List[str] = []
     for item in pages:
         if item.upper() == "ALL":
@@ -756,13 +856,12 @@ async def _call_engine_sheet_rows(
     payload: Dict[str, Any],
 ) -> Dict[str, Any]:
     if engine is None:
-        return {
-            "status": "error",
-            "page": page,
-            "sheet": page,
-            "detail": "Data engine unavailable",
-            "meta": {"dispatch": "engine.missing"},
-        }
+        return _make_error_payload(
+            "Data engine unavailable",
+            page=page,
+            operation="sheet_rows",
+            extra_meta={"dispatch": "engine.missing"},
+        )
 
     fn = None
     fn_name = ""
@@ -774,78 +873,26 @@ async def _call_engine_sheet_rows(
             break
 
     if fn is None:
-        return {
-            "status": "error",
-            "page": page,
-            "sheet": page,
-            "detail": "Engine sheet-row handler not found",
-            "meta": {"dispatch": "engine.sheet_rows_missing"},
-        }
+        return _make_error_payload(
+            "Engine sheet-row handler not found",
+            page=page,
+            operation="sheet_rows",
+            extra_meta={"dispatch": "engine.sheet_rows_missing"},
+        )
 
     attempts = [
-        {
-            "page": page,
-            "limit": limit,
-            "format": "rows",
-            "mode": mode,
-            "body": payload,
-        },
-        {
-            "sheet": page,
-            "limit": limit,
-            "format": "rows",
-            "mode": mode,
-            "body": payload,
-        },
-        {
-            "sheet_name": page,
-            "limit": limit,
-            "format": "rows",
-            "mode": mode,
-            "body": payload,
-        },
-        {
-            "page": page,
-            "limit": limit,
-            "mode": mode,
-        },
-        {
-            "sheet": page,
-            "limit": limit,
-            "mode": mode,
-        },
-        {
-            "sheet_name": page,
-            "limit": limit,
-            "mode": mode,
-        },
-        {
-            "page": page,
-            "limit": limit,
-            "format": "rows",
-        },
-        {
-            "sheet": page,
-            "limit": limit,
-            "format": "rows",
-        },
-        {
-            "sheet_name": page,
-            "limit": limit,
-            "format": "rows",
-        },
-        {
-            "page": page,
-            "limit": limit,
-        },
-        {
-            "sheet": page,
-            "limit": limit,
-        },
-        {
-            "sheet_name": page,
-            "limit": limit,
-        },
+        {"page": page, "limit": limit, "format": "rows", "mode": mode, "body": payload},
+        {"sheet": page, "limit": limit, "format": "rows", "mode": mode, "body": payload},
+        {"sheet_name": page, "limit": limit, "format": "rows", "mode": mode, "body": payload},
+        {"page": page, "limit": limit, "mode": mode},
+        {"sheet": page, "limit": limit, "mode": mode},
+        {"sheet_name": page, "limit": limit, "mode": mode},
+        {"page": page, "limit": limit, "format": "rows"},
+        {"sheet": page, "limit": limit, "format": "rows"},
+        {"sheet_name": page, "limit": limit, "format": "rows"},
+        {"page": page, "limit": limit},
+        {"sheet": page, "limit": limit},
+        {"sheet_name": page, "limit": limit},
     ]
 
     out: Any = None
@@ -856,13 +903,12 @@ async def _call_engine_sheet_rows(
         except TypeError:
             continue
         except Exception as e:
-            return {
-                "status": "error",
-                "page": page,
-                "sheet": page,
-                "detail": f"Engine page call failed: {type(e).__name__}: {e}",
-                "meta": {"dispatch": f"engine.{fn_name}"},
-            }
+            return _make_error_payload(
+                f"Engine page call failed: {type(e).__name__}: {e}",
+                page=page,
+                operation="sheet_rows",
+                extra_meta={"dispatch": f"engine.{fn_name}"},
+            )
 
     if out is None:
         try:
@@ -871,24 +917,20 @@ async def _call_engine_sheet_rows(
             try:
                 out = await _call_maybe_async(fn, page)
             except Exception as e:
-                return {
-                    "status": "error",
-                    "page": page,
-                    "sheet": page,
-                    "detail": f"Engine page call failed: {type(e).__name__}: {e}",
-                    "meta": {"dispatch": f"engine.{fn_name}"},
-                }
+                return _make_error_payload(
+                    f"Engine page call failed: {type(e).__name__}: {e}",
+                    page=page,
+                    operation="sheet_rows",
+                    extra_meta={"dispatch": f"engine.{fn_name}"},
+                )
 
     if isinstance(out, dict):
         result = dict(out)
     elif isinstance(out, list):
-        headers, keys = _extract_headers_keys({"headers": [], "keys": []})
         if out and isinstance(out[0], dict):
             rows = [dict(x) for x in out if isinstance(x, dict)]
-            if not keys:
-                keys = _derive_keys_from_rows(rows)
-            if not headers:
-                headers = list(keys)
+            keys = _derive_keys_from_rows(rows)
+            headers = list(keys)
             result = {
                 "status": "success" if rows else "partial",
                 "page": page,
@@ -899,6 +941,7 @@ async def _call_engine_sheet_rows(
                 "rows": rows,
                 "data": rows,
                 "items": rows,
+                "rows_matrix": _rows_to_matrix(rows, keys) if keys else [],
             }
         else:
             result = {
@@ -906,6 +949,10 @@ async def _call_engine_sheet_rows(
                 "page": page,
                 "sheet": page,
                 "detail": "Engine returned non-dict list rows",
+                "rows": [],
+                "rows_matrix": [],
+                "headers": [],
+                "keys": [],
             }
     else:
         result = _model_to_dict(out)
@@ -917,6 +964,58 @@ async def _call_engine_sheet_rows(
     result.setdefault("page", page)
     result.setdefault("sheet", page)
     return result
+
+
+def _normalize_engine_page_payload(result: Dict[str, Any], *, page: str) -> Dict[str, Any]:
+    payload = dict(result or {})
+
+    headers, keys = _extract_headers_keys(payload)
+    rows = _extract_rows_candidate(payload)
+    matrix = _extract_matrix_candidate(payload)
+
+    if not rows and matrix:
+        if not keys:
+            keys = list(headers)
+        if not keys and matrix and isinstance(matrix[0], list):
+            keys = [f"col_{i+1}" for i in range(len(matrix[0]))]
+        if keys:
+            rows = _matrix_to_rows(matrix, keys)
+
+    if rows and not keys:
+        keys = _derive_keys_from_rows(rows)
+    if keys and not headers:
+        headers = list(keys)
+    if rows and not matrix and keys:
+        matrix = _rows_to_matrix(rows, keys)
+    if matrix is None:
+        matrix = []
+
+    status_value = _s(payload.get("status"))
+    if not status_value:
+        status_value = "success" if rows or matrix or headers or keys else "partial"
+
+    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    meta = dict(meta)
+
+    out = {
+        "status": status_value,
+        "page": _s(payload.get("page")) or page,
+        "sheet": _s(payload.get("sheet")) or page,
+        "route_family": _route_family_for_page(page),
+        "headers": headers,
+        "display_headers": headers,
+        "sheet_headers": headers,
+        "column_headers": headers,
+        "keys": keys,
+        "rows": rows,
+        "items": rows,
+        "data": rows,
+        "rows_matrix": matrix,
+        "count": max(len(rows), len(matrix)),
+        "detail": _s(payload.get("detail") or payload.get("error") or payload.get("message")),
+        "meta": meta,
+    }
+    return out
 
 
 # =============================================================================
@@ -970,6 +1069,7 @@ async def _collect_candidate_rows(
     collected: List[Dict[str, Any]] = []
     by_symbol: Dict[str, Dict[str, Any]] = {}
     page_counts: Dict[str, int] = {}
+    page_errors: Dict[str, str] = {}
 
     for page in pages:
         page_result = await _call_engine_sheet_rows(
@@ -982,6 +1082,11 @@ async def _collect_candidate_rows(
 
         page_rows = _rows_from_engine_result(page_result)
         page_counts[page] = len(page_rows)
+
+        if not page_rows:
+            detail = _s(page_result.get("detail") or page_result.get("error"))
+            if detail:
+                page_errors[page] = detail
 
         for row in page_rows:
             item = dict(row)
@@ -999,13 +1104,11 @@ async def _collect_candidate_rows(
                 by_symbol[key] = item
                 collected.append(item)
             else:
-                # Prefer the first non-empty values but enrich missing fields from later rows.
                 existing = by_symbol[key]
                 for k, v in item.items():
                     if existing.get(k) in (None, "", "None") and v not in (None, "", "None"):
                         existing[k] = v
 
-    # If direct symbols were requested and nothing was found, create placeholders.
     if direct_symbols and not collected:
         for sym in direct_symbols:
             collected.append(
@@ -1019,6 +1122,7 @@ async def _collect_candidate_rows(
     meta = {
         "pages_effective": pages,
         "page_counts": page_counts,
+        "page_errors": page_errors,
         "candidate_rows": len(collected),
         "direct_symbols_count": len(direct_symbols),
     }
@@ -1248,7 +1352,6 @@ def _score_and_rank_rows(
         confidence_score_pct = confidence * 100.0
         safety_score = 100.0 - risk_score
 
-        # Mild bias by risk preference
         if risk_pref == "low":
             safety_score = _clamp(safety_score + 10.0, 0.0, 100.0)
         elif risk_pref == "high":
@@ -1256,6 +1359,9 @@ def _score_and_rank_rows(
 
         overall_score = (roi_score * 0.45) + (confidence_score_pct * 0.30) + (safety_score * 0.25)
         overall_score = _clamp(overall_score, 0.0, 100.0)
+
+        if expected_roi_3m < min_roi:
+            overall_score = _clamp(overall_score - 7.5, 0.0, 100.0)
 
         r["forecast_confidence"] = round(confidence, 4)
         r["confidence_bucket"] = _confidence_bucket(confidence)
@@ -1298,24 +1404,36 @@ def _score_and_rank_rows(
 # =============================================================================
 # Output builders
 # =============================================================================
-async def _build_top10_sheet_payload(
-    recommendations: List[Dict[str, Any]],
+async def _build_projected_sheet_payload(
+    page_name: str,
+    rows: List[Dict[str, Any]],
     *,
-    criteria: Dict[str, Any],
     meta: Dict[str, Any],
+    detail: str = "",
 ) -> Dict[str, Any]:
-    headers, keys = _load_schema_defaults(TOP10_PAGE_NAME)
-    keys, headers = _ensure_top10_keys_present(keys, headers)
+    headers, keys = await _load_schema_defaults(page_name)
+
+    if not keys and rows:
+        keys = _derive_keys_from_rows(rows)
+    if not headers and keys:
+        headers = list(keys)
+    if page_name == TOP10_PAGE_NAME:
+        keys, headers = _ensure_top10_keys_present(keys, headers)
 
     projected: List[Dict[str, Any]] = []
-    for row in recommendations:
-        projected.append({k: row.get(k, None) for k in keys})
+    if keys:
+        for row in rows:
+            projected.append({k: row.get(k, None) for k in keys})
+    else:
+        projected = [dict(r) for r in rows]
+
+    matrix = _rows_to_matrix(projected, keys) if keys else []
 
     return {
-        "status": "success" if projected else "partial",
-        "page": TOP10_PAGE_NAME,
-        "sheet": TOP10_PAGE_NAME,
-        "route_family": "top10",
+        "status": "success" if projected or headers or keys else "partial",
+        "page": page_name,
+        "sheet": page_name,
+        "route_family": _route_family_for_page(page_name),
         "headers": headers,
         "display_headers": headers,
         "sheet_headers": headers,
@@ -1324,9 +1442,9 @@ async def _build_top10_sheet_payload(
         "rows": projected,
         "data": projected,
         "items": projected,
-        "rows_matrix": _rows_to_matrix(projected, keys),
+        "rows_matrix": matrix,
         "count": len(projected),
-        "detail": "" if projected else "No Top10 rows returned",
+        "detail": detail,
         "meta": meta,
     }
 
@@ -1334,10 +1452,9 @@ async def _build_top10_sheet_payload(
 def _build_recommendations_payload(
     recommendations: List[Dict[str, Any]],
     *,
-    criteria: Dict[str, Any],
     meta: Dict[str, Any],
 ) -> Dict[str, Any]:
-    payload = {
+    return {
         "status": "success" if recommendations else "error",
         "page": TOP10_PAGE_NAME,
         "sheet": TOP10_PAGE_NAME,
@@ -1350,125 +1467,247 @@ def _build_recommendations_payload(
         "detail": "" if recommendations else "No advisor recommendations produced",
         "meta": meta,
     }
-    return payload
+
+
+async def _build_criteria_sheet_payload(criteria: Dict[str, Any], *, meta: Dict[str, Any]) -> Dict[str, Any]:
+    row = {
+        "criteria": "active",
+        "risk_profile": _s(criteria.get("risk_profile")) or _s(criteria.get("risk_level")) or "moderate",
+        "risk_level": _s(criteria.get("risk_level")) or _s(criteria.get("risk_profile")) or "moderate",
+        "allocation_strategy": _s(criteria.get("allocation_strategy")) or "maximum_sharpe",
+        "horizon_days": _safe_int(criteria.get("horizon_days") or criteria.get("investment_period_days"), 90),
+        "investment_period_days": _safe_int(criteria.get("investment_period_days") or criteria.get("horizon_days"), 90),
+        "top_n": _effective_limit(criteria),
+        "min_expected_roi": _maybe_ratio(criteria.get("min_expected_roi") or criteria.get("min_roi")),
+        "min_confidence": _maybe_ratio(criteria.get("min_confidence")),
+        "symbols": ",".join(_normalize_direct_symbols(criteria)),
+        "sources": ",".join(_normalize_sources(criteria)),
+        "advisor_data_mode": _normalize_mode(criteria),
+        "generated_at_utc": _now_utc_iso(),
+    }
+    return await _build_projected_sheet_payload(
+        "Advisor_Criteria",
+        [row],
+        meta=meta,
+        detail="Criteria fallback payload built by advisor engine",
+    )
+
+
+def _filter_ksa_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        symbol = _symbol_of(row).upper()
+        country = _s(row.get("country")).upper()
+        exchange = _s(row.get("exchange")).upper()
+        if symbol.endswith(".SR") or country in {"SA", "SAU", "KSA"} or "TADAWUL" in exchange:
+            out.append(dict(row))
+    return out
 
 
 # =============================================================================
 # Main executor
 # =============================================================================
-async def _execute_engine(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    request, engine, settings, payload = await _extract_context(*args, **kwargs)
-    criteria = _flatten_criteria(payload)
-    target_page = _normalize_target_page(criteria)
-    mode = _normalize_mode(criteria)
-    limit = _effective_limit(criteria, default=10)
-    operation = _infer_operation(request, criteria)
+async def _execute_engine_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+    request = None
+    target_page = TOP10_PAGE_NAME
+    operation = "run"
 
-    request_id = _get_request_id(request)
+    try:
+        request, engine, settings, payload = await _extract_context(*args, **kwargs)
+        criteria = _flatten_criteria(payload)
+        target_page = _normalize_target_page(criteria)
+        mode = _normalize_mode(criteria)
+        limit = _effective_limit(criteria, default=10)
+        operation = _infer_operation(request, criteria)
 
-    base_meta: Dict[str, Any] = {
-        "engine_version": INVESTMENT_ADVISOR_ENGINE_VERSION,
-        "request_id": request_id,
-        "generated_at_utc": _now_utc_iso(),
-        "operation": operation,
-        "target_page": target_page,
-        "advisor_data_mode_effective": mode,
-        "engine_present": bool(engine),
-        "engine_type": type(engine).__name__ if engine is not None else "none",
-    }
+        request_id = _get_request_id(request)
 
-    # Sheet-rows passthrough for explicit non-Top10 pages.
-    if operation == "sheet_rows" and target_page in _PASSTHROUGH_PAGES and target_page != TOP10_PAGE_NAME:
-        result = await _call_engine_sheet_rows(
-            engine,
-            page=target_page,
-            limit=limit,
-            mode=mode,
-            payload=criteria,
-        )
+        base_meta: Dict[str, Any] = {
+            "engine_version": INVESTMENT_ADVISOR_ENGINE_VERSION,
+            "request_id": request_id,
+            "generated_at_utc": _now_utc_iso(),
+            "operation": operation,
+            "target_page": target_page,
+            "advisor_data_mode_effective": mode,
+            "engine_present": bool(engine),
+            "engine_type": type(engine).__name__ if engine is not None else "none",
+        }
 
-        meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
-        meta = dict(meta)
-        meta.update(base_meta)
-        meta["dispatch"] = meta.get("dispatch") or "engine_passthrough"
-        result["meta"] = meta
-        result.setdefault("route_family", "advisor")
-        result.setdefault("page", target_page)
-        result.setdefault("sheet", target_page)
-        return _jsonable_snapshot(result)
+        # schema-only / headers-only fast path
+        if _coerce_bool(criteria.get("schema_only")) or _coerce_bool(criteria.get("headers_only")):
+            headers, keys = await _load_schema_defaults(target_page)
+            if target_page == TOP10_PAGE_NAME:
+                keys, headers = _ensure_top10_keys_present(keys, headers)
 
-    # Collect candidate rows from source pages.
-    candidate_rows, collect_meta = await _collect_candidate_rows(
-        engine=engine,
-        criteria=criteria,
-        mode=mode,
-    )
+            return _jsonable_snapshot(
+                {
+                    "status": "success",
+                    "page": target_page,
+                    "sheet": target_page,
+                    "route_family": _route_family_for_page(target_page),
+                    "headers": headers,
+                    "display_headers": headers,
+                    "sheet_headers": headers,
+                    "column_headers": headers,
+                    "keys": keys,
+                    "rows": [],
+                    "items": [],
+                    "data": [],
+                    "rows_matrix": [],
+                    "count": 0,
+                    "detail": "Schema-only advisor response",
+                    "meta": {**base_meta, "dispatch": "schema_only"},
+                }
+            )
 
-    base_meta.update(collect_meta)
-
-    if not candidate_rows:
-        # For explicit passthrough-like target pages, try direct page access once more.
-        if target_page and target_page != TOP10_PAGE_NAME:
-            result = await _call_engine_sheet_rows(
+        # Explicit non-Top10 sheet-rows requests: try direct engine page access first.
+        if operation == "sheet_rows" and target_page != TOP10_PAGE_NAME:
+            direct_result = await _call_engine_sheet_rows(
                 engine,
                 page=target_page,
                 limit=limit,
                 mode=mode,
                 payload=criteria,
             )
-            meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
-            meta = dict(meta)
-            meta.update(base_meta)
-            meta["dispatch"] = meta.get("dispatch") or "engine_passthrough_fallback"
-            result["meta"] = meta
-            result.setdefault("route_family", "advisor")
-            result.setdefault("page", target_page)
-            result.setdefault("sheet", target_page)
-            return _jsonable_snapshot(result)
-
-        return _jsonable_snapshot(
-            {
-                "status": "error",
-                "page": TOP10_PAGE_NAME,
-                "sheet": TOP10_PAGE_NAME,
-                "route_family": "top10",
-                "recommendations": [],
-                "rows": [],
-                "data": [],
-                "items": [],
-                "count": 0,
-                "detail": "No candidate rows found for advisor execution",
-                "meta": base_meta,
+            direct_payload = _normalize_engine_page_payload(direct_result, page=target_page)
+            direct_payload["meta"] = {
+                **(direct_payload.get("meta") if isinstance(direct_payload.get("meta"), dict) else {}),
+                **base_meta,
+                "dispatch": (
+                    direct_payload.get("meta", {}).get("dispatch")
+                    if isinstance(direct_payload.get("meta"), dict)
+                    else "engine_direct_page"
+                ) or "engine_direct_page",
             }
+
+            direct_status = _s(direct_payload.get("status")).lower()
+            if _has_tabular_shape(direct_payload) or direct_status not in {"error", "failed"}:
+                return _jsonable_snapshot(direct_payload)
+
+        candidate_rows, collect_meta = await _collect_candidate_rows(
+            engine=engine,
+            criteria=criteria,
+            mode=mode,
         )
 
-    recommendations = _score_and_rank_rows(
-        candidate_rows,
-        criteria=criteria,
-        limit=limit,
-    )
+        base_meta.update(collect_meta)
 
-    meta = dict(base_meta)
-    meta["dispatch"] = "advisor_scoring"
-    meta["recommendation_count"] = len(recommendations)
+        if not candidate_rows:
+            if operation == "sheet_rows" and target_page == "Advisor_Criteria":
+                return _jsonable_snapshot(
+                    await _build_criteria_sheet_payload(
+                        criteria,
+                        meta={**base_meta, "dispatch": "criteria_fallback"},
+                    )
+                )
 
-    # sheet-rows for Top10 should return schema-aligned rows
-    if operation == "sheet_rows" or target_page == TOP10_PAGE_NAME:
+            return _jsonable_snapshot(
+                _make_error_payload(
+                    "No candidate rows found for advisor execution",
+                    request=request,
+                    page=(target_page if operation == "sheet_rows" else TOP10_PAGE_NAME),
+                    operation=operation,
+                    extra_meta=base_meta,
+                )
+            )
+
+        recommendations = _score_and_rank_rows(
+            candidate_rows,
+            criteria=criteria,
+            limit=limit,
+        )
+
+        meta = dict(base_meta)
+        meta["dispatch"] = "advisor_scoring"
+        meta["recommendation_count"] = len(recommendations)
+
+        # Explicit derived page fallbacks
+        if operation == "sheet_rows":
+            if target_page == TOP10_PAGE_NAME:
+                return _jsonable_snapshot(
+                    await _build_projected_sheet_payload(
+                        TOP10_PAGE_NAME,
+                        recommendations,
+                        meta=meta,
+                    )
+                )
+
+            if target_page == "AI_Opportunity_Report":
+                return _jsonable_snapshot(
+                    await _build_projected_sheet_payload(
+                        "AI_Opportunity_Report",
+                        recommendations,
+                        meta={**meta, "dispatch": "ai_opportunity_fallback"},
+                        detail="AI Opportunity fallback built from advisor scoring",
+                    )
+                )
+
+            if target_page == "Advisor_Criteria":
+                return _jsonable_snapshot(
+                    await _build_criteria_sheet_payload(
+                        criteria,
+                        meta={**meta, "dispatch": "criteria_fallback"},
+                    )
+                )
+
+            if target_page == "KSA_TADAWUL":
+                ksa_rows = _filter_ksa_rows(candidate_rows)
+                return _jsonable_snapshot(
+                    await _build_projected_sheet_payload(
+                        "KSA_TADAWUL",
+                        ksa_rows,
+                        meta={**meta, "dispatch": "ksa_fallback"},
+                        detail="KSA_TADAWUL fallback built from advisor source rows",
+                    )
+                )
+
+            # Generic explicit page fallback: return projected scored rows
+            return _jsonable_snapshot(
+                await _build_projected_sheet_payload(
+                    target_page,
+                    recommendations,
+                    meta={**meta, "dispatch": "generic_sheet_fallback"},
+                    detail=f"{target_page} fallback built from advisor scoring",
+                )
+            )
+
         return _jsonable_snapshot(
-            await _build_top10_sheet_payload(
+            _build_recommendations_payload(
                 recommendations,
-                criteria=criteria,
                 meta=meta,
             )
         )
 
-    return _jsonable_snapshot(
-        _build_recommendations_payload(
-            recommendations,
-            criteria=criteria,
-            meta=meta,
+    except Exception as e:
+        logger.exception("Investment advisor engine execution failed: %s", e)
+        return _jsonable_snapshot(
+            _make_error_payload(
+                f"{type(e).__name__}: {e}",
+                request=request,
+                page=target_page,
+                operation=operation,
+                extra_meta={"dispatch": "engine_exception"},
+            )
         )
-    )
+
+
+def _execute_engine_sync(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+    try:
+        return _run_coro_sync(_execute_engine_async(*args, **kwargs))
+    except Exception as e:
+        logger.exception("Investment advisor engine sync wrapper failed: %s", e)
+        request = kwargs.get("request")
+        payload = kwargs.get("payload") or kwargs.get("body") or kwargs.get("request_data") or kwargs.get("params") or {}
+        page = TOP10_PAGE_NAME
+        if isinstance(payload, dict):
+            page = _s(payload.get("page") or payload.get("sheet") or payload.get("sheet_name")) or TOP10_PAGE_NAME
+        return _make_error_payload(
+            f"{type(e).__name__}: {e}",
+            request=request,
+            page=page,
+            operation="run",
+            extra_meta={"dispatch": "sync_wrapper_exception"},
+        )
 
 
 # =============================================================================
@@ -1477,35 +1716,35 @@ async def _execute_engine(*args: Any, **kwargs: Any) -> Dict[str, Any]:
 class InvestmentAdvisorEngine:
     """Compatibility object exposing the expected advisor runner methods."""
 
-    async def run_investment_advisor_engine(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return await _execute_engine(*args, **kwargs)
+    def run_investment_advisor_engine(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return _execute_engine_sync(*args, **kwargs)
 
-    async def run_investment_advisor(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return await _execute_engine(*args, **kwargs)
+    def run_investment_advisor(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return _execute_engine_sync(*args, **kwargs)
 
-    async def run_advisor(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return await _execute_engine(*args, **kwargs)
+    def run_advisor(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return _execute_engine_sync(*args, **kwargs)
 
-    async def execute_investment_advisor(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return await _execute_engine(*args, **kwargs)
+    def execute_investment_advisor(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return _execute_engine_sync(*args, **kwargs)
 
-    async def execute_advisor(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return await _execute_engine(*args, **kwargs)
+    def execute_advisor(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return _execute_engine_sync(*args, **kwargs)
 
-    async def recommend(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return await _execute_engine(*args, **kwargs)
+    def recommend(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return _execute_engine_sync(*args, **kwargs)
 
-    async def recommend_investments(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return await _execute_engine(*args, **kwargs)
+    def recommend_investments(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return _execute_engine_sync(*args, **kwargs)
 
-    async def get_recommendations(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return await _execute_engine(*args, **kwargs)
+    def get_recommendations(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return _execute_engine_sync(*args, **kwargs)
 
-    async def build_recommendations(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return await _execute_engine(*args, **kwargs)
+    def build_recommendations(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return _execute_engine_sync(*args, **kwargs)
 
-    async def __call__(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return await _execute_engine(*args, **kwargs)
+    def __call__(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return _execute_engine_sync(*args, **kwargs)
 
 
 _SINGLETON_ENGINE = InvestmentAdvisorEngine()
@@ -1552,7 +1791,7 @@ class _EngineAdapter:
         self.cache_strategy = _s(cache_strategy).lower() or "memory"
         self.cache_ttl = _safe_int(cache_ttl, 600)
 
-    async def warm_cache(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    def warm_cache(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         return {
             "status": "ok",
             "cache_strategy": self.cache_strategy,
@@ -1560,14 +1799,14 @@ class _EngineAdapter:
             "warmed": False,
         }
 
-    async def warm_snapshots(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return await self.warm_cache(*args, **kwargs)
+    def warm_snapshots(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return self.warm_cache(*args, **kwargs)
 
-    async def preload_snapshots(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return await self.warm_cache(*args, **kwargs)
+    def preload_snapshots(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return self.warm_cache(*args, **kwargs)
 
-    async def build_snapshot_cache(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        return await self.warm_cache(*args, **kwargs)
+    def build_snapshot_cache(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return self.warm_cache(*args, **kwargs)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.engine, name)
@@ -1580,40 +1819,40 @@ def create_engine_adapter(engine: Any, cache_strategy: str = "memory", cache_ttl
 # =============================================================================
 # Direct function exports expected by routes
 # =============================================================================
-async def run_investment_advisor_engine(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return await _execute_engine(*args, **kwargs)
+def run_investment_advisor_engine(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+    return _execute_engine_sync(*args, **kwargs)
 
 
-async def run_investment_advisor(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return await _execute_engine(*args, **kwargs)
+def run_investment_advisor(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+    return _execute_engine_sync(*args, **kwargs)
 
 
-async def run_advisor(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return await _execute_engine(*args, **kwargs)
+def run_advisor(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+    return _execute_engine_sync(*args, **kwargs)
 
 
-async def execute_investment_advisor(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return await _execute_engine(*args, **kwargs)
+def execute_investment_advisor(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+    return _execute_engine_sync(*args, **kwargs)
 
 
-async def execute_advisor(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return await _execute_engine(*args, **kwargs)
+def execute_advisor(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+    return _execute_engine_sync(*args, **kwargs)
 
 
-async def recommend(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return await _execute_engine(*args, **kwargs)
+def recommend(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+    return _execute_engine_sync(*args, **kwargs)
 
 
-async def recommend_investments(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return await _execute_engine(*args, **kwargs)
+def recommend_investments(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+    return _execute_engine_sync(*args, **kwargs)
 
 
-async def get_recommendations(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return await _execute_engine(*args, **kwargs)
+def get_recommendations(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+    return _execute_engine_sync(*args, **kwargs)
 
 
-async def build_recommendations(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return await _execute_engine(*args, **kwargs)
+def build_recommendations(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+    return _execute_engine_sync(*args, **kwargs)
 
 
 __all__ = [
