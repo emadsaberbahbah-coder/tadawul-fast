@@ -2,7 +2,7 @@
 # routes/enriched_quote.py
 """
 ================================================================================
-TFB Enriched Quote Routes Wrapper — v7.0.0
+TFB Enriched Quote Routes Wrapper — v7.1.0
 ================================================================================
 LEANER • SCHEMA-AWARE • PAGE-DISPATCH SAFE • GET+POST COMPATIBLE
 ROOT /v1/enriched-quote COMPATIBLE • SPECIAL-PAGE SAFE • THREAD-OFFLOADED
@@ -21,6 +21,18 @@ Design goals
 - Preserve stable response envelope:
     headers + keys + rows + rows_matrix + quotes + data + meta
 - No network calls at import time
+
+What v7.1.0 fixes
+-----------------
+- ✅ FIX: schema_only / headers_only / keys_only now short-circuit for instrument pages
+        and do not fall into engine table-mode execution
+- ✅ FIX: engine resolution now prefers request.app.state.engine methods before older
+        module-level fallbacks
+- ✅ FIX: engine candidate execution no longer returns the first empty/error payload;
+        it keeps trying compatible call styles until a row-bearing payload is found
+- ✅ FIX: canonical page probing is used consistently for table-mode engine calls
+- ✅ FIX: when all engine candidates fail, the strongest payload is returned instead of
+        a misleading early fallback
 ================================================================================
 """
 
@@ -36,13 +48,13 @@ import time
 import uuid
 from datetime import date, datetime, time as dt_time
 from decimal import Decimal
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, status
 
 logger = logging.getLogger("routes.enriched_quote")
 
-ROUTER_VERSION = "7.0.0"
+ROUTER_VERSION = "7.1.0"
 router: Optional[APIRouter] = None
 
 _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
@@ -635,6 +647,29 @@ class _Service:
 
         return headers, keys
 
+    def page_is_known(self, page: str) -> bool:
+        if not _strip(page):
+            return False
+
+        if self._has_schema:
+            try:
+                spec = self.get_sheet_spec(page)
+                if spec is not None:
+                    if isinstance(spec, Mapping):
+                        if spec.get("columns") or spec.get("headers") or spec.get("keys"):
+                            return True
+                    else:
+                        cols = getattr(spec, "columns", None)
+                        if cols is not None:
+                            return True
+                        if getattr(spec, "headers", None) or getattr(spec, "keys", None):
+                            return True
+            except Exception:
+                pass
+
+        dd_headers, dd_keys = self._schema_from_data_dictionary(page)
+        return bool(dd_headers and dd_keys)
+
     def schema_for_page(self, page: str) -> Tuple[List[str], List[str]]:
         headers: List[str] = []
         keys: List[str] = []
@@ -771,6 +806,8 @@ class _Service:
 
         status_out = _strip(payload.get("status")) or "success"
         error_out = payload.get("error")
+        if error_out in (None, ""):
+            error_out = payload.get("detail") or payload.get("message")
         meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
         return status_out, (str(error_out) if error_out is not None else None), meta
 
@@ -783,6 +820,50 @@ class _Service:
 
     def payload_has_rows(self, payload: Any) -> bool:
         return bool(self.extract_rows_like(payload) or self.extract_matrix_like(payload))
+
+    def payload_quality_score(self, payload: Any) -> int:
+        if payload is None:
+            return -10
+        if isinstance(payload, list):
+            return 100 if payload else 0
+        if not isinstance(payload, dict):
+            return 0
+
+        score = 0
+        if self.payload_has_rows(payload):
+            score += 100
+        rows_like = self.extract_rows_like(payload)
+        if rows_like:
+            score += min(25, len(rows_like))
+        if self.extract_matrix_like(payload):
+            score += 10
+
+        status_out, error_out, meta_in = self.extract_status_error_meta(payload)
+
+        if payload.get("headers"):
+            score += 4
+        if payload.get("keys"):
+            score += 4
+        if payload.get("display_headers"):
+            score += 2
+        if payload.get("page"):
+            score += 1
+        if payload.get("route_family"):
+            score += 1
+        if isinstance(meta_in, dict) and meta_in.get("known_sheets"):
+            score += 1
+
+        if _strip(status_out).lower() == "success":
+            score += 3
+        elif _strip(status_out).lower() == "partial":
+            score += 1
+        elif _strip(status_out).lower() == "error":
+            score -= 2
+
+        if _strip(error_out):
+            score -= 5
+
+        return score
 
     def envelope(
         self,
@@ -927,30 +1008,56 @@ class _Service:
         body: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
         candidates: List[Any] = []
-
-        if callable(self.core_get_sheet_rows):
-            candidates.append(self.core_get_sheet_rows)
+        seen_ids = set()
 
         if engine is not None:
-            for name in ("get_sheet_rows", "get_page_rows", "sheet_rows", "build_sheet_rows", "get_sheet"):
+            for name in (
+                "get_sheet_rows",
+                "get_page_rows",
+                "sheet_rows",
+                "build_sheet_rows",
+                "get_sheet",
+                "build_sheet",
+            ):
                 fn = getattr(engine, name, None)
-                if callable(fn):
+                if callable(fn) and id(fn) not in seen_ids:
+                    seen_ids.add(id(fn))
                     candidates.append(fn)
 
+        if callable(self.core_get_sheet_rows) and id(self.core_get_sheet_rows) not in seen_ids:
+            seen_ids.add(id(self.core_get_sheet_rows))
+            candidates.append(self.core_get_sheet_rows)
+
         payload = dict(body or {})
-        payload.setdefault("page", page)
-        payload.setdefault("sheet", page)
-        payload.setdefault("sheet_name", page)
+        payload["page"] = page
+        payload["sheet"] = page
+        payload["sheet_name"] = page
+        payload.setdefault("limit", limit)
+        payload.setdefault("offset", offset)
+        if mode not in (None, ""):
+            payload.setdefault("mode", mode)
 
         signatures = [
-            ((), {"sheet": page, "page": page, "sheet_name": page, "limit": limit, "offset": offset, "mode": mode, "body": payload}),
-            ((), {"sheet": page, "page": page, "sheet_name": page, "limit": limit, "offset": offset, "mode": mode}),
-            ((), {"sheet": page, "page": page, "limit": limit, "offset": offset}),
-            ((page,), {"limit": limit, "offset": offset, "mode": mode, "body": payload}),
+            ((), {"engine": engine, "page": page, "sheet": page, "sheet_name": page, "limit": limit, "offset": offset, "mode": mode, "body": payload}),
+            ((), {"engine": engine, "page": page, "limit": limit, "offset": offset, "mode": mode, "body": payload}),
+            ((), {"page": page, "sheet": page, "sheet_name": page, "limit": limit, "offset": offset, "mode": mode, "body": payload}),
+            ((), {"page": page, "limit": limit, "offset": offset, "mode": mode, "body": payload}),
+            ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode, "body": payload}),
+            ((), {"page": page, "sheet": page, "sheet_name": page, "limit": limit, "offset": offset, "mode": mode}),
+            ((), {"page": page, "limit": limit, "offset": offset, "mode": mode}),
+            ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode}),
+            ((), {"sheet_name": page, "limit": limit, "offset": offset, "mode": mode}),
+            ((payload,), {}),
+            ((page, payload), {}),
+            ((page,), {"engine": engine, "body": payload, "limit": limit, "offset": offset, "mode": mode}),
+            ((page,), {"body": payload, "limit": limit, "offset": offset, "mode": mode}),
             ((page,), {"limit": limit, "offset": offset, "mode": mode}),
             ((page,), {"limit": limit, "offset": offset}),
             ((page,), {}),
         ]
+
+        best_payload: Optional[Dict[str, Any]] = None
+        best_score = -9999
 
         for fn in candidates:
             for args, kwargs in signatures:
@@ -962,20 +1069,30 @@ class _Service:
                         )
                     else:
                         res = await _call_maybe_async(fn, *args, **kwargs)
-
-                    if isinstance(res, dict):
-                        return _json_safe(res)
-                    if isinstance(res, list):
-                        return {"status": "success", "rows": _json_safe(res)}
-                    return {"status": "success", "rows": []}
                 except TypeError:
                     continue
                 except asyncio.TimeoutError:
+                    logger.warning("Engine table-mode candidate timed out. fn=%s page=%s", getattr(fn, "__name__", str(fn)), page)
                     break
                 except Exception:
-                    break
+                    continue
 
-        return None
+                if isinstance(res, list):
+                    payload_out = {"status": "success", "page": page, "rows": _json_safe(res)}
+                elif isinstance(res, dict):
+                    payload_out = _json_safe(res)
+                else:
+                    payload_out = {"status": "success", "page": page, "rows": []}
+
+                score = self.payload_quality_score(payload_out)
+                if score > best_score:
+                    best_score = score
+                    best_payload = payload_out
+
+                if self.payload_has_rows(payload_out):
+                    return payload_out
+
+        return best_payload
 
     async def call_builder_best_effort(
         self,
@@ -1566,6 +1683,23 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
                 mode=mode_q,
             )
 
+        if _special_schema_only_requested(prepared):
+            return svc.envelope(
+                status="success",
+                page=page,
+                route_family=route_family,
+                headers=headers,
+                keys=keys,
+                rows=[],
+                include_headers=include_headers,
+                include_matrix=include_matrix,
+                request_id=request_id,
+                started_at=start,
+                mode=mode_q,
+                dispatch="instrument_schema_only",
+                extra_meta={"schema_only": True},
+            )
+
         if not symbols:
             payload = await svc.call_engine_page_payload_best_effort(
                 engine=engine,
@@ -1578,7 +1712,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
 
             if payload is None:
                 return svc.envelope(
-                    status="success",
+                    status="partial",
                     page=page,
                     route_family=route_family,
                     headers=headers,
@@ -1589,7 +1723,9 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
                     request_id=request_id,
                     started_at=start,
                     mode=mode_q,
-                    dispatch="schema_only_table_mode",
+                    dispatch="table_mode",
+                    error="engine_table_mode_no_payload",
+                    extra_meta={"page_known": svc.page_is_known(page)},
                 )
 
             raw_rows = svc.extract_rows_like(payload)
@@ -1619,7 +1755,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
                 mode=mode_q,
                 dispatch="table_mode",
                 error=error_out,
-                extra_meta=meta_in,
+                extra_meta={"page_known": svc.page_is_known(page), **meta_in},
             )
             if include_matrix and isinstance(payload.get("rows_matrix"), list):
                 result["rows_matrix"] = _json_safe(payload.get("rows_matrix"))
