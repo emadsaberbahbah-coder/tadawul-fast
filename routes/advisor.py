@@ -2,35 +2,37 @@
 # routes/advisor.py
 """
 ================================================================================
-ADVISOR ROUTER — v5.7.0
-(LIVE-BY-DEFAULT / UNIFIED-RUNNER / SHEET-ROWS SAFE / RESOLVER-HARDENED)
+ADVISOR ROUTER — v6.0.0
+(ENGINE-NATIVE-SHEET-ROWS / UNIFIED-RUNNER / STATUS-PRESERVING /
+ SHARED-RESOLVER / AUTH-TOLERANT / SCHEMA-KEY-CORRECT)
 ================================================================================
 
 What this revision fixes
 ------------------------
-- ✅ FIX: short /v1/advisor/* family resolves the advisor runner from:
+- ✅ FIX: /v1/advisor/sheet-rows now prefers native engine execution first via:
+         - get_sheet_rows(...)
+         - sheet_rows(...)
+         - build_sheet_rows(...)
+         - get_page_rows(...)
+         - get_sheet(...)
+- ✅ FIX: advisor runner resolution is hardened across:
          - app.state
-         - multiple core module candidates
-         - direct functions
-         - factory-returned service objects
          - engine/service instances
+         - multiple core modules
+         - factory-returned service objects
          - optional shared resolver from routes.investment_advisor
-- ✅ FIX: supports runner names including:
-         - run_investment_advisor_engine
-         - run_investment_advisor
-         - run_advisor
-         - execute_investment_advisor
-         - execute_advisor
-         - recommend / get_recommendations / build_recommendations
-- ✅ FIX: /v1/advisor/sheet-rows is unified through the shared advisor runner
-         instead of a fragile separate local execution path.
-- ✅ FIX: sheet-rows projection now uses schema KEYS correctly instead of trying
-         to read values using display-header labels.
+- ✅ FIX: if native sheet-rows succeeds, its status/meta/contract are preserved.
+- ✅ FIX: if native sheet-rows is unavailable, fallback goes through the advisor
+         runner and then projects correctly to schema KEYS (not display headers).
 - ✅ FIX: page/sheet/sheet_name targeting is normalized consistently.
-- ✅ FIX: page-specific recommendation calls now honor page when sources were
-         not explicitly provided.
-- ✅ FIX: base pages and derived pages are both supported through one route path.
-- ✅ FIX: health endpoint exposes runner discovery details.
+- ✅ FIX: page-specific recommendation calls honor page when sources were not
+         explicitly narrowed.
+- ✅ FIX: GET and POST /v1/advisor/sheet-rows are both supported.
+- ✅ FIX: health endpoint exposes:
+         - runner discovery
+         - native engine sheet-row methods
+         - engine health when available
+- ✅ FIX: auth_ok(...) is called tolerantly across multiple possible signatures.
 - ✅ SAFE: no network calls at import time.
 ================================================================================
 """
@@ -41,6 +43,7 @@ import asyncio
 import importlib
 import inspect
 import logging
+import math
 import os
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -52,7 +55,7 @@ router = APIRouter(prefix="/v1/advisor", tags=["advisor"])
 logger = logging.getLogger("routes.advisor")
 logger.addHandler(logging.NullHandler())
 
-ADVISOR_ROUTE_VERSION = "5.7.0"
+ADVISOR_ROUTE_VERSION = "6.0.0"
 TOP10_PAGE_NAME = "Top_10_Investments"
 
 _BASE_SOURCE_PAGES = [
@@ -372,11 +375,66 @@ async def _call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -
     return out
 
 
+def _snake_like(header: str) -> str:
+    s = str(header or "").strip().replace("%", " pct").replace("/", " ")
+    out = []
+    prev_us = False
+    for ch in s:
+        if ch.isalnum():
+            out.append(ch.lower())
+            prev_us = False
+        else:
+            if not prev_us:
+                out.append("_")
+                prev_us = True
+    res = "".join(out).strip("_")
+    while "__" in res:
+        res = res.replace("__", "_")
+    return res
+
+
 def _route_family_for_page(page: str) -> str:
     p = _clean_str(page)
     if p == TOP10_PAGE_NAME:
         return "top10"
+    if p == "Insights_Analysis":
+        return "insights"
+    if p == "Data_Dictionary":
+        return "schema"
+    if p in _BASE_SOURCE_PAGES:
+        return "sheet"
     return "advisor"
+
+
+def _normalize_page_name(raw: Any) -> str:
+    s = _clean_str(raw)
+    if not s:
+        return s
+
+    try:
+        from core.sheets.page_catalog import normalize_page_name  # type: ignore
+
+        out = normalize_page_name(s, allow_output_pages=True)
+        if out:
+            return str(out)
+    except Exception:
+        pass
+
+    compact = s.replace("-", "_").replace(" ", "_").lower()
+    mapping = {
+        "top_10_investments": "Top_10_Investments",
+        "top10_investments": "Top_10_Investments",
+        "top10": "Top_10_Investments",
+        "insights_analysis": "Insights_Analysis",
+        "insights": "Insights_Analysis",
+        "data_dictionary": "Data_Dictionary",
+        "market_leaders": "Market_Leaders",
+        "global_markets": "Global_Markets",
+        "mutual_funds": "Mutual_Funds",
+        "commodities_fx": "Commodities_FX",
+        "my_portfolio": "My_Portfolio",
+    }
+    return mapping.get(compact, s)
 
 
 def _normalize_target_page(
@@ -386,7 +444,37 @@ def _normalize_target_page(
     sheet_name: Any = None,
     default: str = "Market_Leaders",
 ) -> str:
-    return _clean_str(page) or _clean_str(sheet) or _clean_str(sheet_name) or default
+    target = _clean_str(page) or _clean_str(sheet) or _clean_str(sheet_name) or default
+    return _normalize_page_name(target)
+
+
+def _complete_headers_keys(headers: Sequence[Any], keys: Sequence[Any]) -> Tuple[List[str], List[str]]:
+    hdrs = [_clean_str(h) for h in (headers or []) if _clean_str(h)]
+    ks = [_clean_str(k) for k in (keys or []) if _clean_str(k)]
+
+    if not ks and hdrs:
+        ks = [_snake_like(h) for h in hdrs if _snake_like(h)]
+    if not hdrs and ks:
+        hdrs = [k.replace("_", " ").title() for k in ks]
+
+    n = max(len(hdrs), len(ks))
+    out_h: List[str] = []
+    out_k: List[str] = []
+
+    for i in range(n):
+        h = hdrs[i] if i < len(hdrs) else ""
+        k = ks[i] if i < len(ks) else ""
+        if h and not k:
+            k = _snake_like(h)
+        elif k and not h:
+            h = k.replace("_", " ").title()
+        elif not h and not k:
+            h = f"Column {i + 1}"
+            k = f"column_{i + 1}"
+        out_h.append(h)
+        out_k.append(k)
+
+    return out_h, out_k
 
 
 # ---------------------------------------------------------------------------
@@ -440,37 +528,9 @@ def _is_public_path(path: str) -> bool:
     return False
 
 
-def _auth_passed(
-    *,
-    request: Request,
-    token_query: Optional[str],
-    x_app_token: Optional[str],
-    authorization: Optional[str],
-) -> bool:
-    try:
-        if callable(is_open_mode) and bool(is_open_mode()):
-            return True
-    except Exception:
-        pass
-
-    try:
-        path = str(getattr(getattr(request, "url", None), "path", "") or "")
-    except Exception:
-        path = ""
-
-    if _is_public_path(path):
-        return True
-
-    if auth_ok is None:
-        return True
-
-    auth_token = _extract_auth_token(
-        token_query=token_query,
-        x_app_token=x_app_token,
-        authorization=authorization,
-    )
-
+def _call_auth_ok_tolerant(request: Request, auth_token: str, authorization: Optional[str]) -> bool:
     headers_dict = dict(request.headers)
+    path = str(getattr(getattr(request, "url", None), "path", "") or "")
 
     settings = None
     try:
@@ -511,6 +571,16 @@ def _auth_passed(
         },
         {
             "token": auth_token or None,
+            "request": request,
+        },
+        {
+            "token": auth_token or None,
+        },
+        {
+            "authorization": authorization,
+        },
+        {
+            "request": request,
         },
         {},
     ]
@@ -524,6 +594,38 @@ def _auth_passed(
             return False
 
     return False
+
+
+def _auth_passed(
+    *,
+    request: Request,
+    token_query: Optional[str],
+    x_app_token: Optional[str],
+    authorization: Optional[str],
+) -> bool:
+    try:
+        if callable(is_open_mode) and bool(is_open_mode()):
+            return True
+    except Exception:
+        pass
+
+    try:
+        path = str(getattr(getattr(request, "url", None), "path", "") or "")
+    except Exception:
+        path = ""
+
+    if _is_public_path(path):
+        return True
+
+    if auth_ok is None:
+        return True
+
+    auth_token = _extract_auth_token(
+        token_query=token_query,
+        x_app_token=x_app_token,
+        authorization=authorization,
+    )
+    return _call_auth_ok_tolerant(request, auth_token, authorization)
 
 
 def _require_auth_or_401(
@@ -578,8 +680,8 @@ def _normalize_sources(
     sheet: Any = None,
     sheet_name: Any = None,
 ) -> List[str]:
-    page_s = _clean_str(page) or _clean_str(sheet) or _clean_str(sheet_name)
-    sources = _list_from_any(sources_in)
+    page_s = _normalize_page_name(_clean_str(page) or _clean_str(sheet) or _clean_str(sheet_name))
+    sources = [_normalize_page_name(s) for s in _list_from_any(sources_in)]
 
     if page_s and not sources:
         sources = [page_s]
@@ -616,6 +718,13 @@ def _normalize_payload_keys(payload: Dict[str, Any]) -> Dict[str, Any]:
         if sym_in is not None:
             p["tickers"] = _list_from_any(sym_in)
 
+    if not _clean_str(p.get("page")) and (_clean_str(p.get("sheet")) or _clean_str(p.get("sheet_name"))):
+        p["page"] = _normalize_target_page(
+            page=p.get("page"),
+            sheet=p.get("sheet"),
+            sheet_name=p.get("sheet_name"),
+        )
+
     p["sources"] = _normalize_sources(
         sources_in=p.get("sources"),
         page=p.get("page"),
@@ -624,7 +733,9 @@ def _normalize_payload_keys(payload: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     for k in ("page", "sheet", "sheet_name"):
-        if k in p and not _clean_str(p.get(k)):
+        if k in p and _clean_str(p.get(k)):
+            p[k] = _normalize_page_name(p.get(k))
+        elif k in p:
             p.pop(k, None)
 
     for k in ("mode", "data_mode", "advisor_data_mode"):
@@ -775,7 +886,10 @@ async def _resolve_runner_from_container(container: Any, label: str) -> Optional
     return None
 
 
-async def _resolve_runner_via_shared_route(request: Request) -> Optional[Tuple[Callable[..., Any], str, str]]:
+async def _resolve_runner_via_shared_route(
+    request: Request,
+    engine: Any = None,
+) -> Optional[Tuple[Callable[..., Any], str, str]]:
     for mod_name in _SHARED_ROUTE_MODULES:
         mod, _ = _module_import_ok(mod_name)
         if mod is None:
@@ -783,16 +897,25 @@ async def _resolve_runner_via_shared_route(request: Request) -> Optional[Tuple[C
 
         resolver = getattr(mod, "_resolve_advisor_runner", None)
         if callable(resolver):
-            try:
-                out = await _call_maybe_async(resolver, request)
-                if isinstance(out, tuple) and len(out) >= 3 and callable(out[0]):
-                    return out[0], str(out[1]), str(out[2])
-            except Exception:
-                continue
+            attempts = [
+                {"request": request, "engine": engine},
+                {"request": request},
+            ]
+            for kwargs in attempts:
+                try:
+                    out = await _call_maybe_async(resolver, **kwargs)
+                    if isinstance(out, tuple) and len(out) >= 2 and callable(out[0]):
+                        source = str(out[1]) if len(out) > 1 else mod_name
+                        name = str(out[2]) if len(out) > 2 else getattr(out[0], "__name__", "runner")
+                        return out[0], source, name
+                except TypeError:
+                    continue
+                except Exception:
+                    continue
     return None
 
 
-async def _resolve_advisor_runner(request: Request) -> Tuple[Callable[..., Any], str, str]:
+async def _resolve_advisor_runner(request: Request, engine: Any = None) -> Tuple[Callable[..., Any], str, str]:
     searched_labels: List[str] = []
     import_errors: List[str] = []
 
@@ -812,6 +935,12 @@ async def _resolve_advisor_runner(request: Request) -> Tuple[Callable[..., Any],
         if state_obj_resolved:
             return state_obj_resolved
 
+    if engine is not None:
+        searched_labels.append("engine")
+        resolved_engine = await _resolve_runner_from_container(engine, "engine")
+        if resolved_engine:
+            return resolved_engine
+
     for mod_name in _MODULE_CANDIDATES:
         mod, err = _module_import_ok(mod_name)
         searched_labels.append(mod_name)
@@ -824,7 +953,7 @@ async def _resolve_advisor_runner(request: Request) -> Tuple[Callable[..., Any],
         if resolved:
             return resolved
 
-    shared = await _resolve_runner_via_shared_route(request)
+    shared = await _resolve_runner_via_shared_route(request, engine=engine)
     if shared:
         return shared
 
@@ -994,6 +1123,43 @@ async def _call_advisor_runner(
     raise HTTPException(status_code=500, detail="Advisor engine returned invalid response")
 
 
+async def _run_shared_advisor_if_possible(
+    request: Request,
+    payload: Dict[str, Any],
+    *,
+    engine: Any,
+    timeout_sec: float,
+) -> Optional[Dict[str, Any]]:
+    for mod_name in _SHARED_ROUTE_MODULES:
+        mod, _ = _module_import_ok(mod_name)
+        if mod is None:
+            continue
+
+        fn = getattr(mod, "_run_core_advisor", None)
+        if not callable(fn):
+            continue
+
+        attempts = [
+            {"request": request, "payload": payload, "engine": engine, "timeout_sec": timeout_sec},
+            {"payload": payload, "engine": engine, "timeout_sec": timeout_sec},
+        ]
+
+        for kwargs in attempts:
+            try:
+                out = await _call_maybe_async(fn, **kwargs)
+                if isinstance(out, dict):
+                    return dict(out)
+                d = _model_to_dict(out)
+                if d:
+                    return d
+            except TypeError:
+                continue
+            except Exception:
+                continue
+
+    return None
+
+
 async def _run_advisor(
     *,
     request: Request,
@@ -1013,8 +1179,35 @@ async def _run_advisor(
     payload0 = _normalize_payload_keys(payload or {})
     payload2 = _force_default_live_mode(payload0, mode_override=mode)
 
-    advisor_mode = _clean_str(payload2.get("advisor_data_mode")).lower()
-    wants_snapshot = advisor_mode == "snapshot"
+    timeout_sec = max(5.0, min(180.0, float(os.getenv("ADVISOR_ROUTE_TIMEOUT_SEC", "75") or "75")))
+
+    shared = await _run_shared_advisor_if_possible(
+        request,
+        payload2,
+        engine=engine,
+        timeout_sec=timeout_sec,
+    )
+    if isinstance(shared, dict):
+        result = dict(shared)
+        meta = result.get("meta") if isinstance(result.get("meta"), dict) else {}
+        meta.update(
+            {
+                "route_version": ADVISOR_ROUTE_VERSION,
+                "request_id": request_id,
+                "generated_at_utc": _now_utc_iso(),
+                "engine_type": _safe_engine_type(engine),
+                "advisor_data_mode_effective": _clean_str(payload2.get("advisor_data_mode")),
+                "warm_snapshots": bool(warm_snapshots),
+                "cache_strategy": _clean_str(cache_strategy).lower() or "memory",
+                "cache_ttl": int(cache_ttl),
+                "shared_runner_used": True,
+            }
+        )
+        result.setdefault("status", "success")
+        result["meta"] = meta
+        return _json_safe(result)
+
+    wants_snapshot = _clean_str(payload2.get("advisor_data_mode")).lower() == "snapshot"
     use_warm = bool(warm_snapshots or wants_snapshot)
 
     settings = None
@@ -1023,7 +1216,7 @@ async def _run_advisor(
     except Exception:
         settings = None
 
-    runner, runner_source, runner_name = await _resolve_advisor_runner(request)
+    runner, runner_source, runner_name = await _resolve_advisor_runner(request, engine=engine)
 
     eng_for_advisor: Any = engine
     warmed: Any = None
@@ -1098,6 +1291,7 @@ async def _run_advisor(
             "cache_ttl": int(cache_ttl),
             "runner_source": runner_source,
             "runner_name": runner_name,
+            "shared_runner_used": False,
         }
     )
 
@@ -1126,7 +1320,7 @@ def _extract_headers_keys_from_spec(spec: Any) -> Tuple[List[str], List[str]]:
                 if isinstance(maybe_headers, list):
                     headers = [_clean_str(x) for x in maybe_headers if _clean_str(x)]
                 if keys and not headers:
-                    headers = list(keys)
+                    headers = [k.replace("_", " ").title() for k in keys]
                 return headers, keys
     else:
         raw_columns = getattr(spec, "columns", None) or getattr(spec, "fields", None)
@@ -1137,8 +1331,18 @@ def _extract_headers_keys_from_spec(spec: Any) -> Tuple[List[str], List[str]]:
                 key = _clean_str(col.get("key") or col.get("field") or col.get("name") or col.get("id"))
                 header = _clean_str(col.get("header") or col.get("title") or col.get("label") or key)
             else:
-                key = _clean_str(getattr(col, "key", None) or getattr(col, "field", None) or getattr(col, "name", None))
-                header = _clean_str(getattr(col, "header", None) or getattr(col, "title", None) or getattr(col, "label", None) or key)
+                key = _clean_str(
+                    getattr(col, "key", None)
+                    or getattr(col, "field", None)
+                    or getattr(col, "name", None)
+                    or getattr(col, "id", None)
+                )
+                header = _clean_str(
+                    getattr(col, "header", None)
+                    or getattr(col, "title", None)
+                    or getattr(col, "label", None)
+                    or key
+                )
 
             if key:
                 keys.append(key)
@@ -1148,6 +1352,8 @@ def _extract_headers_keys_from_spec(spec: Any) -> Tuple[List[str], List[str]]:
 
 
 async def _get_schema_layout(page: str) -> Tuple[List[str], List[str]]:
+    page = _normalize_page_name(page)
+
     for mod_name in _SCHEMA_MODULE_CANDIDATES:
         mod, _ = _module_import_ok(mod_name)
         if mod is None:
@@ -1168,18 +1374,138 @@ async def _get_schema_layout(page: str) -> Tuple[List[str], List[str]]:
                 try:
                     spec = await _call_maybe_async(fn, **kwargs)
                     headers, keys = _extract_headers_keys_from_spec(spec)
+                    headers, keys = _complete_headers_keys(headers, keys)
                     if headers or keys:
-                        if not keys and headers:
-                            keys = list(headers)
-                        if not headers and keys:
-                            headers = list(keys)
                         return headers, keys
                 except TypeError:
                     continue
                 except Exception:
                     continue
 
-    return [], []
+    if page == "Top_10_Investments":
+        return _complete_headers_keys(
+            [
+                "Symbol",
+                "Recommendation",
+                "Recommendation Reason",
+                "Current Price",
+                "Forecast Price 1M",
+                "Forecast Price 3M",
+                "Forecast Price 12M",
+                "Expected ROI 1M",
+                "Expected ROI 3M",
+                "Expected ROI 12M",
+                "Forecast Confidence",
+                "Overall Score",
+                "Risk Bucket",
+                "Horizon Days",
+                "Invest Period Label",
+                "Top10 Rank",
+                "Selection Reason",
+                "Criteria Snapshot",
+            ],
+            [
+                "symbol",
+                "recommendation",
+                "recommendation_reason",
+                "current_price",
+                "forecast_price_1m",
+                "forecast_price_3m",
+                "forecast_price_12m",
+                "expected_roi_1m",
+                "expected_roi_3m",
+                "expected_roi_12m",
+                "forecast_confidence",
+                "overall_score",
+                "risk_bucket",
+                "horizon_days",
+                "invest_period_label",
+                "top10_rank",
+                "selection_reason",
+                "criteria_snapshot",
+            ],
+        )
+
+    if page == "Insights_Analysis":
+        return _complete_headers_keys(
+            [
+                "Section",
+                "Item",
+                "Symbol",
+                "Metric",
+                "Value",
+                "Notes",
+                "Last Updated Riyadh",
+            ],
+            [
+                "section",
+                "item",
+                "symbol",
+                "metric",
+                "value",
+                "notes",
+                "last_updated_riyadh",
+            ],
+        )
+
+    if page == "Data_Dictionary":
+        return _complete_headers_keys(
+            [
+                "Sheet",
+                "Group",
+                "Header",
+                "Key",
+                "DType",
+                "Format",
+                "Required",
+                "Source",
+                "Notes",
+            ],
+            [
+                "sheet",
+                "group",
+                "header",
+                "key",
+                "dtype",
+                "fmt",
+                "required",
+                "source",
+                "notes",
+            ],
+        )
+
+    return _complete_headers_keys(
+        [
+            "Symbol",
+            "Name",
+            "Current Price",
+            "Recommendation",
+            "Recommendation Reason",
+            "Overall Score",
+            "Risk Bucket",
+            "Forecast Confidence",
+            "Horizon Days",
+            "Invest Period Label",
+            "Top10 Rank",
+            "Selection Reason",
+            "Criteria Snapshot",
+        ],
+        [
+            "symbol",
+            "name",
+            "current_price",
+            "recommendation",
+            "recommendation_reason",
+            "overall_score",
+            "risk_bucket",
+            "forecast_confidence",
+            "horizon_days",
+            "invest_period_label",
+            "top10_rank",
+            "selection_reason",
+            "criteria_snapshot",
+        ],
+    )
 
 
 def _extract_headers_keys_from_payload(obj: Any) -> Tuple[List[str], List[str]]:
@@ -1202,7 +1528,7 @@ def _extract_headers_keys_from_payload(obj: Any) -> Tuple[List[str], List[str]]:
 
     clean_headers = [_clean_str(x) for x in headers if _clean_str(x)]
     clean_keys = [_clean_str(x) for x in keys if _clean_str(x)]
-    return clean_headers, clean_keys
+    return _complete_headers_keys(clean_headers, clean_keys)
 
 
 def _rows_from_any(obj: Any) -> List[Any]:
@@ -1273,24 +1599,15 @@ async def _coerce_to_sheet_rows_response(
 
     keys = payload_keys or schema_keys
     headers = payload_headers or schema_headers
-
-    if not keys and headers:
-        keys = list(headers)
-    if not headers and keys:
-        headers = list(keys)
+    headers, keys = _complete_headers_keys(headers, keys)
 
     if items and not keys and isinstance(items[0], dict):
         keys = _derive_keys_from_items(items)
-        if not headers:
-            headers = list(keys)
+        headers, keys = _complete_headers_keys(headers, keys)
 
     rows_matrix: List[List[Any]] = []
     if _rows_are_matrix(items):
         rows_matrix = [list(r) if isinstance(r, (list, tuple)) else [r] for r in items]
-        if not keys and headers:
-            keys = list(headers)
-        if not headers and keys:
-            headers = list(keys)
     elif items and keys:
         rows_matrix = _project_dict_items_to_matrix(items, keys)
 
@@ -1315,11 +1632,195 @@ async def _coerce_to_sheet_rows_response(
             "display_headers": headers,
             "keys": keys,
             "rows": rows_matrix,
+            "rows_matrix": rows_matrix,
             "count": len(rows_matrix),
             "detail": detail_value,
             "meta": meta,
             "version": payload.get("version") or ADVISOR_ROUTE_VERSION,
             "request_id": payload.get("request_id") or meta.get("request_id"),
+        }
+    )
+
+
+def _looks_like_sheet_payload(obj: Any) -> bool:
+    if not isinstance(obj, dict):
+        return False
+
+    if isinstance(obj.get("headers"), list) or isinstance(obj.get("keys"), list):
+        if isinstance(obj.get("rows"), list) or isinstance(obj.get("rows_matrix"), list):
+            return True
+
+    if any(k in obj for k in ("sheet", "page", "headers", "keys", "rows", "rows_matrix")):
+        score = 0
+        if isinstance(obj.get("headers"), list):
+            score += 1
+        if isinstance(obj.get("keys"), list):
+            score += 1
+        if isinstance(obj.get("rows"), list):
+            score += 1
+        if isinstance(obj.get("rows_matrix"), list):
+            score += 1
+        if obj.get("sheet") or obj.get("page"):
+            score += 1
+        return score >= 2
+
+    return False
+
+
+def _unwrap_sheet_payload(obj: Any) -> Dict[str, Any]:
+    if not isinstance(obj, dict):
+        return {}
+
+    if _looks_like_sheet_payload(obj):
+        return dict(obj)
+
+    for key in ("data", "payload", "result"):
+        inner = obj.get(key)
+        if isinstance(inner, dict) and _looks_like_sheet_payload(inner):
+            return dict(inner)
+
+    return dict(obj)
+
+
+async def _run_native_sheet_rows(
+    payload: Dict[str, Any],
+    *,
+    engine: Any,
+    timeout_sec: float,
+) -> Tuple[Optional[Dict[str, Any]], str, Optional[str]]:
+    target_page = _normalize_target_page(
+        page=payload.get("page"),
+        sheet=payload.get("sheet"),
+        sheet_name=payload.get("sheet_name"),
+        default="Market_Leaders",
+    )
+
+    methods = (
+        "get_sheet_rows",
+        "sheet_rows",
+        "build_sheet_rows",
+        "get_page_rows",
+        "get_sheet",
+    )
+    errors: List[str] = []
+
+    limit = int(payload.get("limit") or payload.get("top_n") or 20)
+    offset = int(payload.get("offset") or 0)
+    mode = _clean_str(payload.get("mode"))
+
+    for method_name in methods:
+        fn = getattr(engine, method_name, None)
+        if not callable(fn):
+            continue
+
+        attempts = [
+            {"sheet": target_page, "limit": limit, "offset": offset, "mode": mode, "body": payload},
+            {"sheet_name": target_page, "limit": limit, "offset": offset, "mode": mode, "body": payload},
+            {"page": target_page, "limit": limit, "offset": offset, "mode": mode, "body": payload},
+            {"sheet": target_page, "limit": limit, "offset": offset, "mode": mode},
+            {"sheet_name": target_page, "limit": limit, "offset": offset, "mode": mode},
+            {"page": target_page, "limit": limit, "offset": offset, "mode": mode},
+        ]
+
+        out = None
+        for kwargs in attempts:
+            try:
+                out = await asyncio.wait_for(
+                    _call_maybe_async(fn, **{k: v for k, v in kwargs.items() if v not in (None, "")}),
+                    timeout=timeout_sec,
+                )
+                break
+            except TypeError:
+                continue
+            except Exception as e:
+                errors.append(f"{method_name}: {type(e).__name__}: {e}")
+                out = None
+                break
+
+        if out is None:
+            for args in [(target_page,), (target_page, limit), (target_page, limit, offset)]:
+                try:
+                    out = await asyncio.wait_for(_call_maybe_async(fn, *args), timeout=timeout_sec)
+                    break
+                except TypeError:
+                    continue
+                except Exception as e:
+                    errors.append(f"{method_name}: {type(e).__name__}: {e}")
+                    out = None
+                    break
+
+        if isinstance(out, dict):
+            return dict(out), f"engine.{method_name}", None
+
+        d = _model_to_dict(out)
+        if d:
+            return d, f"engine.{method_name}", None
+
+    return None, "native_sheet_rows_unresolved", (
+        " | ".join(errors)[:3000] if errors else "no native sheet rows method available"
+    )
+
+
+def _normalize_sheet_payload(
+    *,
+    raw_result: Dict[str, Any],
+    target_page: str,
+    request_id: str,
+    source: str,
+) -> Dict[str, Any]:
+    raw = _unwrap_sheet_payload(raw_result)
+    page = _normalize_page_name(raw.get("page") or raw.get("sheet") or target_page)
+
+    headers = raw.get("headers") or raw.get("display_headers") or []
+    keys = raw.get("keys") or raw.get("fields") or []
+    headers, keys = _complete_headers_keys(headers, keys)
+
+    rows_obj = raw.get("rows")
+    matrix_obj = raw.get("rows_matrix")
+    rows_matrix: List[List[Any]] = []
+
+    if isinstance(rows_obj, list) and rows_obj:
+        if all(isinstance(r, dict) for r in rows_obj):
+            if not keys:
+                keys = list(rows_obj[0].keys())
+                headers, keys = _complete_headers_keys(headers, keys)
+            rows_matrix = _project_dict_items_to_matrix(rows_obj, keys)
+        elif all(isinstance(r, (list, tuple)) for r in rows_obj):
+            rows_matrix = [list(r) for r in rows_obj]
+    elif isinstance(matrix_obj, list):
+        rows_matrix = [list(r) if isinstance(r, (list, tuple)) else [r] for r in matrix_obj]
+
+    if not keys and rows_matrix and headers:
+        keys = [_snake_like(h) for h in headers]
+        headers, keys = _complete_headers_keys(headers, keys)
+
+    if not headers and keys:
+        headers, keys = _complete_headers_keys(headers, keys)
+
+    meta = raw.get("meta") if isinstance(raw.get("meta"), dict) else {}
+    meta = dict(meta)
+    meta["route_version"] = ADVISOR_ROUTE_VERSION
+    meta["native_source"] = source
+    meta["count"] = len(rows_matrix)
+
+    status_value = _clean_str(raw.get("status")) or ("success" if rows_matrix else "warn")
+
+    return _json_safe(
+        {
+            "status": status_value,
+            "page": page,
+            "sheet": page,
+            "route_family": _route_family_for_page(page),
+            "headers": headers,
+            "display_headers": headers,
+            "keys": keys,
+            "rows": rows_matrix,
+            "rows_matrix": rows_matrix,
+            "count": len(rows_matrix),
+            "detail": _clean_str(raw.get("detail") or raw.get("error") or raw.get("message")),
+            "meta": meta,
+            "version": raw.get("version") or ADVISOR_ROUTE_VERSION,
+            "request_id": request_id,
         }
     )
 
@@ -1332,6 +1833,7 @@ async def advisor_health(request: Request) -> Dict[str, Any]:
     engine = await _get_engine(request)
 
     engine_health: Optional[Dict[str, Any]] = None
+    native_methods: List[str] = []
     if engine is not None:
         for attr in ("health", "health_check", "get_health"):
             try:
@@ -1346,11 +1848,17 @@ async def advisor_health(request: Request) -> Dict[str, Any]:
             except Exception:
                 continue
 
+        native_methods = [
+            name
+            for name in ("get_sheet_rows", "sheet_rows", "build_sheet_rows", "get_page_rows", "get_sheet")
+            if callable(getattr(engine, name, None))
+        ]
+
     runner_available = False
     runner_source = ""
     runner_name = ""
     try:
-        _, runner_source, runner_name = await _resolve_advisor_runner(request)
+        _, runner_source, runner_name = await _resolve_advisor_runner(request, engine=engine)
         runner_available = True
     except Exception:
         runner_available = False
@@ -1364,6 +1872,7 @@ async def advisor_health(request: Request) -> Dict[str, Any]:
         "runner_available": runner_available,
         "runner_source": runner_source,
         "runner_name": runner_name,
+        "native_sheet_rows_methods": native_methods,
         "default_mode": (_clean_str(os.getenv("ADVISOR_DATA_MODE")) or "live_quotes").lower(),
         "require_auth": _safe_bool_env("REQUIRE_AUTH", True),
         "prometheus_available": bool(_PROMETHEUS_AVAILABLE),
@@ -1403,10 +1912,10 @@ async def advisor_run(
     payload = dict(body or {})
 
     if _clean_str(page) and not _clean_str(payload.get("page")) and not _clean_str(payload.get("sources")):
-        payload["page"] = _clean_str(page)
+        payload["page"] = _normalize_page_name(page)
 
     if _clean_str(sheet_name) and not _clean_str(payload.get("sheet_name")) and not _clean_str(payload.get("sources")):
-        payload["sheet_name"] = _clean_str(sheet_name)
+        payload["sheet_name"] = _normalize_page_name(sheet_name)
 
     if "tickers" not in payload and "symbols" in payload:
         payload["tickers"] = payload.get("symbols")
@@ -1458,17 +1967,16 @@ async def advisor_recommendations(
 
     effective_limit = int(limit) if limit is not None else int(top_n)
     effective_risk_level = _clean_str(risk_level) or _clean_str(risk_profile) or "moderate"
-    effective_page = _clean_str(page) or _clean_str(sheet_name)
+    effective_page = _normalize_page_name(_clean_str(page) or _clean_str(sheet_name))
     normalized_sources = _list_from_any(sources)
 
-    # Honor page-specific requests when sources were not explicitly narrowed.
     if effective_page and (not normalized_sources or normalized_sources == ["ALL"]):
         normalized_sources = [effective_page]
 
     payload: Dict[str, Any] = {
         "sources": normalized_sources,
         "page": effective_page,
-        "sheet_name": _clean_str(sheet_name),
+        "sheet_name": effective_page if effective_page else _clean_str(sheet_name),
         "tickers": _list_from_any(symbols),
         "top_n": effective_limit,
         "limit": effective_limit,
@@ -1507,6 +2015,7 @@ async def advisor_sheet_rows(
     symbols: Optional[str] = Query(default=None, description="Comma/space separated symbols"),
     sources: Optional[str] = Query(default="ALL", description="ALL or comma-separated pages"),
     limit: int = Query(default=20, ge=1, le=500),
+    offset: int = Query(default=0, ge=0, le=5000),
     top_n: Optional[int] = Query(default=None, ge=1, le=500),
     invest_amount: float = Query(default=0.0, ge=0.0),
     allocation_strategy: str = Query(default="maximum_sharpe"),
@@ -1517,6 +2026,9 @@ async def advisor_sheet_rows(
     horizon_days: Optional[int] = Query(default=None, ge=1, le=3650),
     min_expected_roi: Optional[float] = Query(default=None),
     min_confidence: Optional[float] = Query(default=None),
+    schema_only: bool = Query(default=False),
+    headers_only: bool = Query(default=False),
+    include_matrix: bool = Query(default=True),
     mode: str = Query(default="", description="snapshot | live_sheet | live_quotes | auto"),
     warm_snapshots: bool = Query(default=False),
     cache_strategy: str = Query(default="memory"),
@@ -1533,7 +2045,7 @@ async def advisor_sheet_rows(
         authorization=authorization,
     )
 
-    target_page = _normalize_target_page(page=page, sheet=sheet, sheet_name=sheet_name)
+    target_page = _normalize_target_page(page=page, sheet=sheet, sheet_name=sheet_name, default="Market_Leaders")
     effective_limit = int(top_n) if top_n is not None else int(limit)
 
     normalized_sources = _list_from_any(sources)
@@ -1547,6 +2059,7 @@ async def advisor_sheet_rows(
         "sources": normalized_sources,
         "tickers": _list_from_any(symbols),
         "limit": effective_limit,
+        "offset": int(offset),
         "top_n": effective_limit,
         "invest_amount": float(invest_amount),
         "allocation_strategy": _clean_str(allocation_strategy).lower() or "maximum_sharpe",
@@ -1562,7 +2075,30 @@ async def advisor_sheet_rows(
         "min_confidence": min_confidence,
         "debug": bool(debug),
         "format": "rows",
+        "schema_only": bool(schema_only),
+        "headers_only": bool(headers_only),
+        "include_matrix": bool(include_matrix),
+        "mode": _normalize_mode(mode),
     }
+
+    engine = await _get_engine(request)
+    if engine is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Data engine unavailable")
+
+    timeout_sec = max(5.0, min(180.0, float(os.getenv("ADVISOR_ROUTE_TIMEOUT_SEC", "75") or "75")))
+    native_result, native_source, native_error = await _run_native_sheet_rows(
+        payload,
+        engine=engine,
+        timeout_sec=timeout_sec,
+    )
+
+    if isinstance(native_result, dict) and _looks_like_sheet_payload(native_result):
+        return _normalize_sheet_payload(
+            raw_result=native_result,
+            target_page=target_page,
+            request_id=_get_request_id(request),
+            source=native_source,
+        )
 
     advisor_result = await _run_advisor(
         request=request,
@@ -1574,10 +2110,90 @@ async def advisor_sheet_rows(
         debug=bool(debug),
     )
 
-    return await _coerce_to_sheet_rows_response(
+    sheet_rows = await _coerce_to_sheet_rows_response(
         page=target_page,
         advisor_result=advisor_result,
     )
+    meta = sheet_rows.get("meta") if isinstance(sheet_rows.get("meta"), dict) else {}
+    meta["native_sheet_rows_attempted"] = True
+    meta["native_source"] = native_source
+    meta["native_error"] = native_error
+    sheet_rows["meta"] = meta
+    return sheet_rows
+
+
+@router.post("/sheet-rows")
+async def advisor_sheet_rows_post(
+    request: Request,
+    body: Dict[str, Any] = Body(default_factory=dict),
+    mode: str = Query(default="", description="snapshot | live_sheet | live_quotes | auto"),
+    warm_snapshots: bool = Query(default=False),
+    cache_strategy: str = Query(default="memory"),
+    cache_ttl: int = Query(default=600, ge=30, le=86400),
+    debug: bool = Query(default=False),
+    token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+) -> Dict[str, Any]:
+    _require_auth_or_401(
+        request=request,
+        token_query=token,
+        x_app_token=x_app_token,
+        authorization=authorization,
+    )
+
+    payload = dict(body or {})
+    target_page = _normalize_target_page(
+        page=payload.get("page"),
+        sheet=payload.get("sheet"),
+        sheet_name=payload.get("sheet_name"),
+        default="Market_Leaders",
+    )
+    payload["page"] = target_page
+    payload["sheet"] = target_page
+    payload["sheet_name"] = target_page
+    payload.setdefault("format", "rows")
+    payload.setdefault("offset", 0)
+
+    engine = await _get_engine(request)
+    if engine is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Data engine unavailable")
+
+    timeout_sec = max(5.0, min(180.0, float(os.getenv("ADVISOR_ROUTE_TIMEOUT_SEC", "75") or "75")))
+    native_result, native_source, native_error = await _run_native_sheet_rows(
+        payload,
+        engine=engine,
+        timeout_sec=timeout_sec,
+    )
+
+    if isinstance(native_result, dict) and _looks_like_sheet_payload(native_result):
+        return _normalize_sheet_payload(
+            raw_result=native_result,
+            target_page=target_page,
+            request_id=_get_request_id(request),
+            source=native_source,
+        )
+
+    advisor_result = await _run_advisor(
+        request=request,
+        payload=payload,
+        mode=mode,
+        warm_snapshots=bool(warm_snapshots),
+        cache_strategy=_clean_str(cache_strategy).lower() or "memory",
+        cache_ttl=int(cache_ttl),
+        debug=bool(debug),
+    )
+
+    sheet_rows = await _coerce_to_sheet_rows_response(
+        page=target_page,
+        advisor_result=advisor_result,
+    )
+    meta = sheet_rows.get("meta") if isinstance(sheet_rows.get("meta"), dict) else {}
+    meta["native_sheet_rows_attempted"] = True
+    meta["native_source"] = native_source
+    meta["native_error"] = native_error
+    sheet_rows["meta"] = meta
+    return sheet_rows
 
 
 __all__ = ["router"]
