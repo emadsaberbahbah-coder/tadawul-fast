@@ -2,24 +2,27 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v7.5.0)
+TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v7.6.0)
 ================================================================================
 ALIGNED • DEPLOYMENT-SAFE • PRE-MOUNT + STARTUP-VERIFY • ROUTER-SNAPSHOT-AWARE
 ENGINE-STATE-AWARE • OPENAPI-SAFE • RENDER-HEALTH-PROBE-SAFE • PRIORITY-MOUNTED
 ROOT-CONFIG-FIRST • CORE-CONFIG-COMPATIBLE • REQUEST-ID SAFE • STARTUP-HARDENED
+ORJSON-READY • PREEXISTING-ENGINE SAFE • ROUTE-VERIFY SAFE • DEBUG-HARDENED
 
-Why this revision (v7.5.0)
+Why this revision (v7.6.0)
 --------------------------
-- ✅ FIX: prefers root-level `config.py` as the main config source
-- ✅ FIX: still supports `core.config` as backward-compatible fallback
-- ✅ FIX: auth checks now try `config.auth_ok` first, then `core.config.auth_ok`
-- ✅ FIX: settings bridge accepts both uppercase and lowercase config attribute styles
-- ✅ FIX: runtime meta exposes config source for easier Render debugging
-- ✅ FIX: preserves pre-mounted router snapshot and avoids duplicate remount churn
-- ✅ FIX: OpenAPI cache invalidation remains reliable after router changes
-- ✅ FIX: engine warm-up stores engine on `app.state.engine` for route access
-- ✅ HARDEN: startup remains safe even if config/routes/engine imports partially fail
-- ✅ SAFE: HEAD probes for /, /livez, /readyz, /health remain stable for Render
+- ✅ FIX: keeps root-level `config.py` as primary config source
+- ✅ FIX: still supports `env.py` and `core.config` as backward-compatible fallbacks
+- ✅ FIX: startup now truly verifies pre-mounted routes instead of blindly trusting snapshot state
+- ✅ FIX: remount is triggered only when prestart snapshot looks inconsistent with live route signatures
+- ✅ FIX: preserves preexisting `app.state.engine` if another layer initialized it first
+- ✅ FIX: stores `engine_init_error` and `engine_source` on app state for runtime diagnostics
+- ✅ FIX: runtime meta now exposes route signature count and engine readiness details
+- ✅ FIX: fallback route snapshot now stores signature counts as well as OpenAPI counts
+- ✅ FIX: debug route auth now also respects `REQUIRE_AUTH` / `OPEN_MODE`
+- ✅ HARDEN: shutdown tries multiple Google Sheets service module locations safely
+- ✅ HARDEN: optional ORJSON response path used automatically when available
+- ✅ SAFE: HEAD probes for `/`, `/livez`, `/readyz`, `/health`, `/healthz` remain stable for Render
 """
 
 from __future__ import annotations
@@ -41,11 +44,16 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 
+try:
+    from fastapi.responses import ORJSONResponse as _FastAPI_ORJSONResponse  # type: ignore
+except Exception:
+    _FastAPI_ORJSONResponse = JSONResponse  # type: ignore
+
 
 # --------------------------------------------------------------------------------------
 # Version
 # --------------------------------------------------------------------------------------
-APP_ENTRY_VERSION = "7.5.0"
+APP_ENTRY_VERSION = "7.6.0"
 
 
 # --------------------------------------------------------------------------------------
@@ -53,6 +61,20 @@ APP_ENTRY_VERSION = "7.5.0"
 # --------------------------------------------------------------------------------------
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
+
+_BUILTIN_META_PATHS = {
+    "/",
+    "/meta",
+    "/ping",
+    "/livez",
+    "/readyz",
+    "/health",
+    "/healthz",
+    "/_debug/routes",
+    "/docs",
+    "/redoc",
+    "/openapi.json",
+}
 
 
 def _env_str(name: str, default: str = "") -> str:
@@ -274,8 +296,7 @@ def _load_settings() -> _SettingsView:
         cfg = importlib.import_module("config")
         getter = getattr(cfg, "get_settings_cached", None) or getattr(cfg, "get_settings", None)
         if callable(getter):
-            s = getter()
-            return _settings_from_generic_object(s, source="config")
+            return _settings_from_generic_object(getter(), source="config")
     except Exception:
         pass
 
@@ -284,18 +305,16 @@ def _load_settings() -> _SettingsView:
         env_mod = importlib.import_module("env")
         getter = getattr(env_mod, "get_settings", None)
         if callable(getter):
-            s = getter()
-            return _settings_from_generic_object(s, source="env")
+            return _settings_from_generic_object(getter(), source="env")
     except Exception:
         pass
 
-    # 3) core.config (fallback compatibility only)
+    # 3) core.config (fallback compatibility)
     try:
         cfg = importlib.import_module("core.config")
         getter = getattr(cfg, "get_settings_cached", None) or getattr(cfg, "get_settings", None)
         if callable(getter):
-            s = getter()
-            return _settings_from_generic_object(s, source="core.config")
+            return _settings_from_generic_object(getter(), source="core.config")
     except Exception:
         pass
 
@@ -350,6 +369,7 @@ def _default_routes_snapshot() -> Dict[str, Any]:
         "plan": [],
         "resolved_entries": [],
         "openapi_route_count_after_mount": 0,
+        "route_signature_count_after_mount": 0,
     }
 
 
@@ -364,8 +384,14 @@ def _ensure_app_state_defaults(app: FastAPI) -> None:
         app.state.engine = None
     if not hasattr(app.state, "engine_source"):
         app.state.engine_source = ""
+    if not hasattr(app.state, "engine_init_error"):
+        app.state.engine_init_error = ""
     if not hasattr(app.state, "config_source"):
         app.state.config_source = _SETTINGS.CONFIG_SOURCE
+    if not hasattr(app.state, "settings"):
+        app.state.settings = _SETTINGS
+    if not hasattr(app.state, "startup_warnings"):
+        app.state.startup_warnings = []
 
 
 # --------------------------------------------------------------------------------------
@@ -436,6 +462,8 @@ def _auth_ok(request: Request) -> bool:
     try:
         if bool(getattr(_SETTINGS, "OPEN_MODE", False)):
             return True
+        if not bool(getattr(_SETTINGS, "REQUIRE_AUTH", True)):
+            return True
     except Exception:
         pass
 
@@ -497,10 +525,12 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
 # --------------------------------------------------------------------------------------
 # Router mounting helpers
 # --------------------------------------------------------------------------------------
-def _app_route_signature_set(app: Any) -> Set[Tuple[str, str]]:
+def _app_route_signature_set(app: Any, *, include_builtin: bool = True) -> Set[Tuple[str, str]]:
     sigs: Set[Tuple[str, str]] = set()
     for r in getattr(app, "routes", []) or []:
         path = str(getattr(r, "path", "") or "")
+        if not include_builtin and path in _BUILTIN_META_PATHS:
+            continue
         methods = getattr(r, "methods", None) or set()
         if not isinstance(methods, (set, list, tuple)):
             methods = set()
@@ -526,6 +556,10 @@ def _router_would_duplicate_existing(app: Any, router: Any) -> bool:
     if not router_sigs:
         return False
     return router_sigs.issubset(_app_route_signature_set(app))
+
+
+def _route_signature_count(app: Any, *, include_builtin: bool = True) -> int:
+    return len(_app_route_signature_set(app, include_builtin=include_builtin))
 
 
 def _invalidate_openapi_cache(app: FastAPI) -> None:
@@ -577,6 +611,12 @@ def _normalize_routes_snapshot(
     openapi_route_count_after_mount = int(
         src.get("openapi_route_count_after_mount", len(getattr(app, "routes", []) or []) if app is not None else 0) or 0
     )
+    route_signature_count_after_mount = int(
+        src.get(
+            "route_signature_count_after_mount",
+            _route_signature_count(app, include_builtin=True) if app is not None else 0,
+        ) or 0
+    )
 
     return {
         "mounted": mounted,
@@ -599,6 +639,7 @@ def _normalize_routes_snapshot(
         "plan": plan,
         "resolved_entries": resolved_entries,
         "openapi_route_count_after_mount": openapi_route_count_after_mount,
+        "route_signature_count_after_mount": route_signature_count_after_mount,
     }
 
 
@@ -643,6 +684,9 @@ def _merge_snapshots(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]
     merged["failed_count"] = len(merged["import_errors"]) + len(merged["mount_errors"]) + len(merged["no_router"])
     merged["openapi_route_count_after_mount"] = int(
         new.get("openapi_route_count_after_mount", old.get("openapi_route_count_after_mount", 0)) or 0
+    )
+    merged["route_signature_count_after_mount"] = int(
+        new.get("route_signature_count_after_mount", old.get("route_signature_count_after_mount", 0)) or 0
     )
     return merged
 
@@ -745,6 +789,7 @@ def _mount_routes_fallback(app: FastAPI) -> Dict[str, Any]:
         "plan": plan,
         "mount_modes": mount_modes,
         "openapi_route_count_after_mount": len(getattr(app, "routes", []) or []),
+        "route_signature_count_after_mount": _route_signature_count(app, include_builtin=True),
     }
     _invalidate_openapi_cache(app)
     return snap
@@ -763,6 +808,7 @@ def _mount_routes(app: FastAPI) -> Dict[str, Any]:
                     ret = fn(app)  # type: ignore[misc]
                     snap = _normalize_routes_snapshot(ret, used_strategy=used_strategy, app=app)
                     snap["openapi_route_count_after_mount"] = len(getattr(app, "routes", []) or [])
+                    snap["route_signature_count_after_mount"] = _route_signature_count(app, include_builtin=True)
                     _invalidate_openapi_cache(app)
                     logger.info(
                         "Routes mount summary: mounted=%s duplicate_skips=%s missing=%s failed=%s strategy=%s",
@@ -794,6 +840,30 @@ def _mount_routes(app: FastAPI) -> Dict[str, Any]:
     return snap
 
 
+def _should_reverify_prestart_snapshot(app: FastAPI, snap: Dict[str, Any]) -> bool:
+    if not isinstance(snap, dict) or not snap:
+        return True
+
+    current_sig_count = _route_signature_count(app, include_builtin=True)
+    snap_sig_count = int(snap.get("route_signature_count_after_mount", 0) or 0)
+    snap_route_count = int(snap.get("openapi_route_count_after_mount", 0) or 0)
+    mounted_count = int(snap.get("mounted_count", len(snap.get("mounted", []) or [])) or 0)
+
+    if current_sig_count <= 0:
+        return True
+
+    if snap_sig_count > 0 and current_sig_count + 1 < snap_sig_count:
+        return True
+
+    if snap_route_count > 0 and len(getattr(app, "routes", []) or []) + 1 < snap_route_count:
+        return True
+
+    if mounted_count <= 0 and current_sig_count <= len(_BUILTIN_META_PATHS) + 2:
+        return True
+
+    return False
+
+
 def _mount_routes_once(app: FastAPI, phase: str) -> Dict[str, Any]:
     _ensure_app_state_defaults(app)
 
@@ -803,24 +873,29 @@ def _mount_routes_once(app: FastAPI, phase: str) -> Dict[str, Any]:
     if phase == "startup" and last_phase == "startup":
         snap = _normalize_routes_snapshot(current, used_strategy=str(current.get("strategy", "startup")), app=app)
         snap["openapi_route_count_after_mount"] = len(getattr(app, "routes", []) or [])
+        snap["route_signature_count_after_mount"] = _route_signature_count(app, include_builtin=True)
         app.state.routes_snapshot = snap
         app.state.routes_mounted = True
         _invalidate_openapi_cache(app)
         return snap
 
     if phase == "startup" and last_phase == "prestart":
-        snap = _normalize_routes_snapshot(current, used_strategy=str(current.get("strategy", "prestart")), app=app)
-        snap["openapi_route_count_after_mount"] = len(getattr(app, "routes", []) or [])
-        app.state.routes_snapshot = snap
-        app.state.routes_mounted = True
-        app.state.routes_mount_phase = "startup"
-        _invalidate_openapi_cache(app)
-        return snap
+        promote_only = not _should_reverify_prestart_snapshot(app, current)
+        if promote_only:
+            snap = _normalize_routes_snapshot(current, used_strategy=str(current.get("strategy", "prestart")), app=app)
+            snap["openapi_route_count_after_mount"] = len(getattr(app, "routes", []) or [])
+            snap["route_signature_count_after_mount"] = _route_signature_count(app, include_builtin=True)
+            app.state.routes_snapshot = snap
+            app.state.routes_mounted = True
+            app.state.routes_mount_phase = "startup"
+            _invalidate_openapi_cache(app)
+            return snap
 
     fresh = _mount_routes(app)
     snap = _merge_snapshots(current, fresh) if current else fresh
     snap = _normalize_routes_snapshot(snap, used_strategy=str(snap.get("strategy", "mount")), app=app)
     snap["openapi_route_count_after_mount"] = len(getattr(app, "routes", []) or [])
+    snap["route_signature_count_after_mount"] = _route_signature_count(app, include_builtin=True)
 
     app.state.routes_snapshot = snap
     app.state.routes_mounted = True
@@ -836,9 +911,11 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
     snap: Dict[str, Any] = {}
     engine_obj: Any = None
     engine_source = ""
+    engine_init_error = ""
     routes_mounted = False
     routes_mount_phase = ""
     config_source = _SETTINGS.CONFIG_SOURCE
+    startup_warnings: List[str] = []
 
     try:
         if app is not None and hasattr(app, "state"):
@@ -847,9 +924,11 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
                 snap = state_snap
             engine_obj = getattr(app.state, "engine", None)
             engine_source = str(getattr(app.state, "engine_source", "") or "")
+            engine_init_error = str(getattr(app.state, "engine_init_error", "") or "")
             routes_mounted = bool(getattr(app.state, "routes_mounted", False))
             routes_mount_phase = str(getattr(app.state, "routes_mount_phase", "") or "")
             config_source = str(getattr(app.state, "config_source", _SETTINGS.CONFIG_SOURCE) or _SETTINGS.CONFIG_SOURCE)
+            startup_warnings = list(getattr(app.state, "startup_warnings", []) or [])
     except Exception:
         pass
 
@@ -862,6 +941,9 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
         ) or 0
     )
     strategy = str(snap.get("strategy", "") or "")
+    route_signature_count = int(
+        snap.get("route_signature_count_after_mount", _route_signature_count(app, include_builtin=True) if app is not None else 0) or 0
+    )
 
     return {
         "service": _SETTINGS.APP_NAME,
@@ -877,39 +959,52 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
         "routes_duplicate_skips_count": duplicate_skips_count,
         "routes_failed_count": failed_count,
         "routes_strategy": strategy,
+        "route_signature_count": route_signature_count,
         "engine_present": engine_obj is not None,
+        "engine_ready": engine_obj is not None and not engine_init_error,
         "engine_source": engine_source,
+        "engine_init_error": engine_init_error,
+        "startup_warnings": startup_warnings,
     }
 
 
 def _install_builtin_routes(app: FastAPI) -> None:
+    def _status_payload(label: str) -> Dict[str, Any]:
+        return {"status": label, **_runtime_meta(app)}
+
     @app.get("/meta", tags=["meta"])
     async def meta():
-        return {"status": "ok", **_runtime_meta(app)}
+        return _status_payload("ok")
 
     @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
     async def root(request: Request):
         if request.method == "HEAD":
             return Response(status_code=200)
-        return {"status": "ok", **_runtime_meta(app)}
+        return _status_payload("ok")
 
     @app.api_route("/readyz", methods=["GET", "HEAD"], include_in_schema=False)
     async def readyz(request: Request):
         if request.method == "HEAD":
             return Response(status_code=200)
-        return {"status": "ready", **_runtime_meta(app)}
+        return _status_payload("ready")
 
     @app.api_route("/livez", methods=["GET", "HEAD"], include_in_schema=False)
     async def livez(request: Request):
         if request.method == "HEAD":
             return Response(status_code=200)
-        return {"status": "live", **_runtime_meta(app)}
+        return _status_payload("live")
 
     @app.api_route("/health", methods=["GET", "HEAD"], include_in_schema=False)
     async def health(request: Request):
         if request.method == "HEAD":
             return Response(status_code=200)
-        return {"status": "healthy", **_runtime_meta(app)}
+        return _status_payload("healthy")
+
+    @app.api_route("/healthz", methods=["GET", "HEAD"], include_in_schema=False)
+    async def healthz(request: Request):
+        if request.method == "HEAD":
+            return Response(status_code=200)
+        return _status_payload("healthy")
 
     @app.get("/ping", include_in_schema=False)
     async def ping():
@@ -920,8 +1015,18 @@ def _install_builtin_routes(app: FastAPI) -> None:
 # Optional engine warm-up
 # --------------------------------------------------------------------------------------
 async def _maybe_init_engine(app: FastAPI) -> Optional[str]:
-    if not bool(_SETTINGS.INIT_ENGINE_ON_BOOT):
+    if getattr(app.state, "engine", None) is not None:
+        if not str(getattr(app.state, "engine_source", "") or "").strip():
+            app.state.engine_source = "preexisting"
+        app.state.engine_init_error = ""
         return None
+
+    if not bool(_SETTINGS.INIT_ENGINE_ON_BOOT):
+        app.state.engine_init_error = ""
+        return None
+
+    err_v2 = ""
+    err_v1 = ""
 
     try:
         de2 = importlib.import_module("core.data_engine_v2")
@@ -932,11 +1037,10 @@ async def _maybe_init_engine(app: FastAPI) -> Optional[str]:
             if engine is not None:
                 app.state.engine = engine
                 app.state.engine_source = "core.data_engine_v2"
+                app.state.engine_init_error = ""
                 return None
     except Exception as e:
         err_v2 = _err_to_str(e)
-    else:
-        err_v2 = ""
 
     try:
         de1 = importlib.import_module("core.data_engine")
@@ -947,13 +1051,14 @@ async def _maybe_init_engine(app: FastAPI) -> Optional[str]:
             if engine is not None:
                 app.state.engine = engine
                 app.state.engine_source = "core.data_engine"
+                app.state.engine_init_error = ""
                 return None
     except Exception as e:
         err_v1 = _err_to_str(e)
-    else:
-        err_v1 = ""
 
-    return f"data_engine_v2 failed: {err_v2} | data_engine failed: {err_v1}"
+    err = f"data_engine_v2 failed: {err_v2 or 'not available'} | data_engine failed: {err_v1 or 'not available'}"
+    app.state.engine_init_error = err
+    return err
 
 
 async def _maybe_close_engine() -> None:
@@ -961,6 +1066,25 @@ async def _maybe_close_engine() -> None:
         try:
             mod = importlib.import_module(mod_name)
             fn = getattr(mod, "close_engine", None) or getattr(mod, "shutdown_engine", None)
+            if callable(fn):
+                maybe = fn()
+                if hasattr(maybe, "__await__"):
+                    await maybe
+        except Exception:
+            continue
+
+
+async def _maybe_close_google_sheets_service() -> None:
+    candidates = (
+        "integrations.google_sheets_service",
+        "core.integrations.google_sheets_service",
+        "google_sheets_service",
+        "core.google_sheets_service",
+    )
+    for mod_name in candidates:
+        try:
+            mod = importlib.import_module(mod_name)
+            fn = getattr(mod, "close", None) or getattr(mod, "shutdown", None)
             if callable(fn):
                 maybe = fn()
                 if hasattr(maybe, "__await__"):
@@ -992,7 +1116,12 @@ def create_app() -> FastAPI:
                 snap.get("strategy", ""),
             )
         except Exception as e:
-            logger.error("Route mounting crashed during startup: %s", e, exc_info=True)
+            msg = f"Route mounting crashed during startup: {_err_to_str(e)}"
+            logger.error(msg, exc_info=True)
+            try:
+                app.state.startup_warnings.append(msg)
+            except Exception:
+                pass
             if _env_bool("ROUTES_STRICT_IMPORT", False):
                 raise
 
@@ -1003,21 +1132,16 @@ def create_app() -> FastAPI:
                 logger.error("Engine init failed (strict): %s", err)
                 raise RuntimeError(f"Engine init failed: {err}")
             logger.warning("Engine init failed (non-fatal): %s", err)
+            try:
+                app.state.startup_warnings.append(f"engine_init_warning: {err}")
+            except Exception:
+                pass
 
         logger.info("Startup complete: %s", _runtime_meta(app))
         try:
             yield
         finally:
-            try:
-                m = importlib.import_module("integrations.google_sheets_service")
-                fn = getattr(m, "close", None)
-                if callable(fn):
-                    maybe = fn()
-                    if hasattr(maybe, "__await__"):
-                        await maybe
-            except Exception:
-                pass
-
+            await _maybe_close_google_sheets_service()
             await _maybe_close_engine()
             logger.info("Shutdown complete.")
 
@@ -1028,9 +1152,12 @@ def create_app() -> FastAPI:
         redoc_url=redoc_url,
         openapi_url=openapi_url,
         lifespan=lifespan,
+        default_response_class=_FastAPI_ORJSONResponse,  # type: ignore[arg-type]
     )
 
     _ensure_app_state_defaults(app)
+    app.state.settings = _SETTINGS
+    app.state.config_source = _SETTINGS.CONFIG_SOURCE
 
     app.add_middleware(RequestIDMiddleware)
     app.add_middleware(GZipMiddleware, minimum_size=1024)
@@ -1076,18 +1203,28 @@ def create_app() -> FastAPI:
         )
     except Exception as e:
         logger.error("Prestart route mounting failed: %s", e, exc_info=True)
+        try:
+            app.state.startup_warnings.append(f"prestart_route_mount_failed: {_err_to_str(e)}")
+        except Exception:
+            pass
         if _env_bool("ROUTES_STRICT_IMPORT", False):
             raise
 
     @app.get("/_debug/routes", include_in_schema=False)
     async def debug_routes(request: Request):
-        if _SETTINGS.APP_ENV == "production" and not _auth_ok(request):
+        if _SETTINGS.APP_ENV == "production" and bool(_SETTINGS.REQUIRE_AUTH) and not _auth_ok(request):
             return JSONResponse(status_code=401, content={"status": "error", "error": "unauthorized"})
+
+        route_paths = sorted({str(getattr(r, "path", "") or "") for r in (getattr(request.app, "routes", []) or [])})
+        route_sigs = sorted([f"{path} [{methods}]" for path, methods in _app_route_signature_set(request.app, include_builtin=True)])
+
         return {
             "status": "ok",
             "routes_snapshot": getattr(request.app.state, "routes_snapshot", {}),
             "app_route_count": len(getattr(request.app, "routes", []) or []),
-            "route_paths": sorted({str(getattr(r, "path", "") or "") for r in (getattr(request.app, "routes", []) or [])}),
+            "app_route_signature_count": _route_signature_count(request.app, include_builtin=True),
+            "route_paths": route_paths,
+            "route_signatures": route_sigs,
             **_runtime_meta(app),
         }
 
