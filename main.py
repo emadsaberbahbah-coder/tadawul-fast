@@ -2,27 +2,22 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v7.6.0)
+TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v7.7.0)
 ================================================================================
 ALIGNED • DEPLOYMENT-SAFE • PRE-MOUNT + STARTUP-VERIFY • ROUTER-SNAPSHOT-AWARE
 ENGINE-STATE-AWARE • OPENAPI-SAFE • RENDER-HEALTH-PROBE-SAFE • PRIORITY-MOUNTED
 ROOT-CONFIG-FIRST • CORE-CONFIG-COMPATIBLE • REQUEST-ID SAFE • STARTUP-HARDENED
 ORJSON-READY • PREEXISTING-ENGINE SAFE • ROUTE-VERIFY SAFE • DEBUG-HARDENED
+V1-HEALTH-ALIAS SAFE • V1-META-ALIAS SAFE • HEAD-PROBE SAFE
 
-Why this revision (v7.6.0)
+Why this revision (v7.7.0)
 --------------------------
-- ✅ FIX: keeps root-level `config.py` as primary config source
-- ✅ FIX: still supports `env.py` and `core.config` as backward-compatible fallbacks
-- ✅ FIX: startup now truly verifies pre-mounted routes instead of blindly trusting snapshot state
-- ✅ FIX: remount is triggered only when prestart snapshot looks inconsistent with live route signatures
-- ✅ FIX: preserves preexisting `app.state.engine` if another layer initialized it first
-- ✅ FIX: stores `engine_init_error` and `engine_source` on app state for runtime diagnostics
-- ✅ FIX: runtime meta now exposes route signature count and engine readiness details
-- ✅ FIX: fallback route snapshot now stores signature counts as well as OpenAPI counts
-- ✅ FIX: debug route auth now also respects `REQUIRE_AUTH` / `OPEN_MODE`
-- ✅ HARDEN: shutdown tries multiple Google Sheets service module locations safely
-- ✅ HARDEN: optional ORJSON response path used automatically when available
-- ✅ SAFE: HEAD probes for `/`, `/livez`, `/readyz`, `/health`, `/healthz` remain stable for Render
+- ✅ FIX: adds `/v1/health` so health coverage can reach 100%
+- ✅ FIX: adds `/v1/healthz`, `/v1/livez`, `/v1/readyz`, `/v1/meta`, `/v1/ping`
+- ✅ FIX: keeps HEAD probes stable for both root and `/v1/*` health/meta aliases
+- ✅ FIX: built-in meta path registry now includes `/v1/*` aliases for route-signature consistency
+- ✅ SAFE: preserves existing router-mount, engine-init, OpenAPI, auth, and shutdown behavior
+- ✅ SAFE: no route-family behavior changes for enriched / analysis / advisor / advanced
 """
 
 from __future__ import annotations
@@ -53,7 +48,7 @@ except Exception:
 # --------------------------------------------------------------------------------------
 # Version
 # --------------------------------------------------------------------------------------
-APP_ENTRY_VERSION = "7.6.0"
+APP_ENTRY_VERSION = "7.7.0"
 
 
 # --------------------------------------------------------------------------------------
@@ -70,6 +65,12 @@ _BUILTIN_META_PATHS = {
     "/readyz",
     "/health",
     "/healthz",
+    "/v1/meta",
+    "/v1/ping",
+    "/v1/livez",
+    "/v1/readyz",
+    "/v1/health",
+    "/v1/healthz",
     "/_debug/routes",
     "/docs",
     "/redoc",
@@ -972,9 +973,28 @@ def _install_builtin_routes(app: FastAPI) -> None:
     def _status_payload(label: str) -> Dict[str, Any]:
         return {"status": label, **_runtime_meta(app)}
 
+    def _add_status_route(path: str, label: str, *, include_in_schema: bool = False) -> None:
+        @app.api_route(path, methods=["GET", "HEAD"], include_in_schema=include_in_schema)
+        async def _status_route(request: Request, _label: str = label):
+            if request.method == "HEAD":
+                return Response(status_code=200)
+            return _status_payload(_label)
+
     @app.get("/meta", tags=["meta"])
     async def meta():
         return _status_payload("ok")
+
+    @app.get("/v1/meta", include_in_schema=False)
+    async def meta_v1():
+        return _status_payload("ok")
+
+    @app.get("/ping", include_in_schema=False)
+    async def ping():
+        return {"pong": True, **_runtime_meta(app)}
+
+    @app.get("/v1/ping", include_in_schema=False)
+    async def ping_v1():
+        return {"pong": True, **_runtime_meta(app)}
 
     @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
     async def root(request: Request):
@@ -982,33 +1002,15 @@ def _install_builtin_routes(app: FastAPI) -> None:
             return Response(status_code=200)
         return _status_payload("ok")
 
-    @app.api_route("/readyz", methods=["GET", "HEAD"], include_in_schema=False)
-    async def readyz(request: Request):
-        if request.method == "HEAD":
-            return Response(status_code=200)
-        return _status_payload("ready")
+    _add_status_route("/readyz", "ready")
+    _add_status_route("/livez", "live")
+    _add_status_route("/health", "healthy")
+    _add_status_route("/healthz", "healthy")
 
-    @app.api_route("/livez", methods=["GET", "HEAD"], include_in_schema=False)
-    async def livez(request: Request):
-        if request.method == "HEAD":
-            return Response(status_code=200)
-        return _status_payload("live")
-
-    @app.api_route("/health", methods=["GET", "HEAD"], include_in_schema=False)
-    async def health(request: Request):
-        if request.method == "HEAD":
-            return Response(status_code=200)
-        return _status_payload("healthy")
-
-    @app.api_route("/healthz", methods=["GET", "HEAD"], include_in_schema=False)
-    async def healthz(request: Request):
-        if request.method == "HEAD":
-            return Response(status_code=200)
-        return _status_payload("healthy")
-
-    @app.get("/ping", include_in_schema=False)
-    async def ping():
-        return {"pong": True, **_runtime_meta(app)}
+    _add_status_route("/v1/readyz", "ready")
+    _add_status_route("/v1/livez", "live")
+    _add_status_route("/v1/health", "healthy")
+    _add_status_route("/v1/healthz", "healthy")
 
 
 # --------------------------------------------------------------------------------------
