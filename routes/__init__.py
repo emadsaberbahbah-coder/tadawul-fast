@@ -2,31 +2,35 @@
 # routes/__init__.py
 """
 ================================================================================
-TADAWUL FAST BRIDGE — ROUTER DISCOVERY & MOUNT LOGIC (v3.3.0)
+TADAWUL FAST BRIDGE — ROUTER DISCOVERY & MOUNT LOGIC (v3.4.0)
 ================================================================================
 PROD-SAFE • IMPORT-SAFE • RENDER-SAFE • DETERMINISTIC • DUPLICATE-AWARE
 MAIN-PY-COMPATIBLE • DIAGNOSTIC-RICH • REPO-ALIGNED • PRIORITY-MOUNT SAFE
 CANONICAL-OWNER SAFE • PROTECTED-PREFIX SAFE • CONFLICT-ROLLBACK SAFE
+PREFIX-OWNER ENFORCED • ENRICHED-OWNER FIRST
 
 Why this revision
 -----------------
-- ✅ FIX: data_dictionary now mounts BEFORE config so canonical schema routes win first
-- ✅ FIX: later routers that overlap protected canonical paths are skipped safely
-- ✅ FIX: protected-path conflict handling works for both router exports and mount(app)
-- ✅ FIX: mount(app) conflicts can be rolled back by removing newly-added routes
-- ✅ FIX: exposes richer conflict diagnostics in snapshot:
-      - conflict_skips
-      - protected_prefixes
-      - overlap_details
-- ✅ FIX: duplicate logic now prefers earlier canonical routers for shared paths
-- ✅ FIX: keeps repo-aligned module names and stable mount order
-- ✅ COMPAT: preserves aliases expected by main.py:
-      - mount_all_routers(app)  [preferred]
-      - mount_all(app)
-      - mount_routers(app)
-      - mount_routes(app)
-      - get_expected_router_modules()
-      - get_mount_plan()
+- ✅ FIX: `routes.enriched_quote` now mounts earlier so it can claim `/v1/enriched*`
+      before later compatibility routers
+- ✅ FIX: protected-prefix ownership is now enforced by logical router key,
+      not only exact route-signature overlap
+- ✅ FIX: later routers are skipped when they try to claim canonical prefixes
+      already owned by an earlier router
+- ✅ FIX: routers whose protected prefixes belong to another canonical owner
+      are skipped even if exact route signatures differ
+- ✅ FIX: `mount(app)` additions are inspected for protected-prefix ownership,
+      and rolled back safely on conflict
+- ✅ FIX: snapshot now exposes:
+      - canonical_owner_map
+      - prefix_owners
+      - claimed_prefixes
+      - owner_conflicts
+- ✅ FIX: deterministic owner behavior for:
+      - `/v1/schema*`  -> data_dictionary
+      - `/schema*`     -> data_dictionary
+      - `/v1/enriched*`/`/v1/enriched_quote*`/`/v1/enriched-quote*`
+        `/quote` `/quotes` `/sheet-rows` -> enriched_quote
 
 Optional env controls
 ---------------------
@@ -34,7 +38,7 @@ Optional env controls
 - ROUTES_INCLUDE="a,b,c"              -> include logical keys and/or module names only
 - ROUTES_EXCLUDE="a,b,c"              -> exclude logical keys and/or module names
 - ROUTES_LOG_PLAN=1                   -> log resolved plan before mounting
-- ROUTES_PROTECTED_PREFIXES="a,b,c"   -> protected path prefixes; later overlaps are skipped
+- ROUTES_PROTECTED_PREFIXES="a,b,c"   -> protected path prefixes
 """
 
 from __future__ import annotations
@@ -112,6 +116,23 @@ def _protected_prefixes() -> List[str]:
     return out
 
 
+def _canonical_owner_map() -> Dict[str, str]:
+    """
+    Canonical logical owner per protected prefix.
+    The key is the logical RouterSpec.key, not the module name.
+    """
+    return {
+        "/v1/schema": "data_dictionary",
+        "/schema": "data_dictionary",
+        "/v1/enriched": "enriched_quote",
+        "/v1/enriched_quote": "enriched_quote",
+        "/v1/enriched-quote": "enriched_quote",
+        "/quote": "enriched_quote",
+        "/quotes": "enriched_quote",
+        "/sheet-rows": "enriched_quote",
+    }
+
+
 # ======================================================================================
 # Cheap module existence checks
 # ======================================================================================
@@ -149,13 +170,10 @@ def _default_catalog() -> List[RouterSpec]:
 
     Order rationale:
     1) canonical schema/meta routers first
-    2) canonical sheet-rows routers
-    3) advisor routes
-    4) compatibility/wrapper routes
+    2) canonical enriched owner early so `/v1/enriched*` is claimed by wrapper
+    3) canonical sheet/advisor routers
+    4) compatibility/wrapper extras
     5) extras
-
-    This order matters because duplicate/conflict-skip is route-signature based.
-    The first mounted strong router should win.
     """
     return [
         RouterSpec(
@@ -163,6 +181,12 @@ def _default_catalog() -> List[RouterSpec]:
             candidates=("routes.data_dictionary",),
             required=False,
             priority=10,
+        ),
+        RouterSpec(
+            key="enriched_quote",
+            candidates=("routes.enriched_quote",),
+            required=False,
+            priority=15,
         ),
         RouterSpec(
             key="config",
@@ -211,12 +235,6 @@ def _default_catalog() -> List[RouterSpec]:
             candidates=("routes.top10_investments",),
             required=False,
             priority=90,
-        ),
-        RouterSpec(
-            key="enriched_quote",
-            candidates=("routes.enriched_quote",),
-            required=False,
-            priority=100,
         ),
         RouterSpec(
             key="routes_argaam",
@@ -375,6 +393,17 @@ def _route_signature_set_from_routes(routes: Sequence[Any]) -> Set[Tuple[str, st
     return sigs
 
 
+def _route_paths_from_routes(routes: Sequence[Any]) -> List[str]:
+    out: List[str] = []
+    seen: Set[str] = set()
+    for r in routes or []:
+        path = str(getattr(r, "path", "") or "")
+        if path and path not in seen:
+            seen.add(path)
+            out.append(path)
+    return out
+
+
 def _app_route_signature_set(app: Any) -> Set[Tuple[str, str]]:
     return _route_signature_set_from_routes(getattr(app, "routes", []) or [])
 
@@ -383,9 +412,30 @@ def _router_route_signature_set(router: Any) -> Set[Tuple[str, str]]:
     return _route_signature_set_from_routes(getattr(router, "routes", []) or [])
 
 
+def _router_route_paths(router: Any) -> List[str]:
+    return _route_paths_from_routes(getattr(router, "routes", []) or [])
+
+
 def _is_protected_path(path: str, protected_prefixes: Sequence[str]) -> bool:
     p = str(path or "")
     return any(p.startswith(prefix) for prefix in protected_prefixes)
+
+
+def _claimed_protected_prefixes_from_paths(
+    paths: Sequence[str],
+    protected_prefixes: Sequence[str],
+) -> List[str]:
+    claimed: List[str] = []
+    seen: Set[str] = set()
+
+    for path in paths:
+        p = str(path or "")
+        for prefix in protected_prefixes:
+            if p.startswith(prefix) and prefix not in seen:
+                seen.add(prefix)
+                claimed.append(prefix)
+
+    return claimed
 
 
 def _overlap_details(
@@ -412,6 +462,55 @@ def _router_would_duplicate_existing(app: Any, router: Any) -> bool:
     return router_sigs.issubset(app_sigs)
 
 
+def _canonical_owner_for_prefix(prefix: str, owner_map: Dict[str, str]) -> Optional[str]:
+    return owner_map.get(str(prefix or "").strip())
+
+
+def _owner_conflicts_for_claimed_prefixes(
+    *,
+    module_key: str,
+    module_name: str,
+    claimed_prefixes: Sequence[str],
+    prefix_owners: Dict[str, str],
+    module_to_key: Dict[str, str],
+    canonical_owner_map: Dict[str, str],
+) -> List[Dict[str, Any]]:
+    conflicts: List[Dict[str, Any]] = []
+
+    for prefix in claimed_prefixes:
+        canonical_owner_key = _canonical_owner_for_prefix(prefix, canonical_owner_map)
+        if canonical_owner_key and canonical_owner_key != module_key:
+            conflicts.append(
+                {
+                    "prefix": prefix,
+                    "reason": "canonical_owner_mismatch",
+                    "candidate_module": module_name,
+                    "candidate_key": module_key,
+                    "canonical_owner_key": canonical_owner_key,
+                    "existing_owner_module": prefix_owners.get(prefix),
+                    "existing_owner_key": module_to_key.get(prefix_owners.get(prefix, ""), ""),
+                }
+            )
+            continue
+
+        existing_owner_module = prefix_owners.get(prefix)
+        existing_owner_key = module_to_key.get(existing_owner_module, "") if existing_owner_module else ""
+        if existing_owner_module and existing_owner_module != module_name:
+            conflicts.append(
+                {
+                    "prefix": prefix,
+                    "reason": "prefix_already_owned",
+                    "candidate_module": module_name,
+                    "candidate_key": module_key,
+                    "existing_owner_module": existing_owner_module,
+                    "existing_owner_key": existing_owner_key,
+                    "canonical_owner_key": canonical_owner_key or existing_owner_key or module_key,
+                }
+            )
+
+    return conflicts
+
+
 def _get_or_init_snapshot_store(app: Any) -> Dict[str, Any]:
     snap = {
         "mounted_modules": [],
@@ -427,6 +526,10 @@ def _get_or_init_snapshot_store(app: Any) -> Dict[str, Any]:
         "priority_map": {},
         "overlap_details": {},
         "protected_prefixes": _protected_prefixes(),
+        "canonical_owner_map": _canonical_owner_map(),
+        "prefix_owners": {},
+        "claimed_prefixes": {},
+        "owner_conflicts": {},
     }
     try:
         if hasattr(app, "state"):
@@ -465,7 +568,11 @@ def _mount_one(
     app: Any,
     module_name: str,
     *,
+    module_key: str,
     protected_prefixes: Sequence[str],
+    prefix_owners: Dict[str, str],
+    module_to_key: Dict[str, str],
+    canonical_owner_map: Dict[str, str],
 ) -> Tuple[bool, Optional[str], str, Dict[str, Any]]:
     """
     Mount strategies:
@@ -487,24 +594,39 @@ def _mount_one(
         if router is not None:
             existing_sigs = _app_route_signature_set(app)
             router_sigs = _router_route_signature_set(router)
+            router_paths = _router_route_paths(router)
+            claimed_prefixes = _claimed_protected_prefixes_from_paths(router_paths, protected_prefixes)
 
             if router_sigs and router_sigs.issubset(existing_sigs):
                 return True, None, "duplicate_skip", {
                     "reason": "router_signatures_subset_of_existing",
                     "route_count": len(router_sigs),
+                    "claimed_prefixes": claimed_prefixes,
+                }
+
+            owner_conflicts = _owner_conflicts_for_claimed_prefixes(
+                module_key=module_key,
+                module_name=module_name,
+                claimed_prefixes=claimed_prefixes,
+                prefix_owners=prefix_owners,
+                module_to_key=module_to_key,
+                canonical_owner_map=canonical_owner_map,
+            )
+            if owner_conflicts:
+                return True, None, "conflict_skip", {
+                    "reason": "protected_prefix_owner_conflict",
+                    "route_count": len(router_sigs),
+                    "claimed_prefixes": claimed_prefixes,
+                    "owner_conflicts": owner_conflicts,
                 }
 
             details = _overlap_details(existing_sigs, router_sigs, protected_prefixes)
-            if details["protected_overlap_count"] > 0:
-                return True, None, "conflict_skip", {
-                    "reason": "protected_path_overlap",
-                    **details,
-                }
-
             app.include_router(router)
             return True, None, source, {
                 "route_count": len(getattr(router, "routes", []) or []),
                 "prefix": str(getattr(router, "prefix", "") or ""),
+                "claimed_prefixes": claimed_prefixes,
+                **details,
             }
 
         if callable(mount_fn):
@@ -517,27 +639,42 @@ def _mount_one(
             after_routes = list(getattr(app, "routes", []) or [])
             added_routes = [r for r in after_routes if id(r) not in before_ids]
             added_sigs = _route_signature_set_from_routes(added_routes)
+            added_paths = _route_paths_from_routes(added_routes)
+            claimed_prefixes = _claimed_protected_prefixes_from_paths(added_paths, protected_prefixes)
 
             if not added_routes:
-                return True, None, "mount_fn", {"route_count": 0}
+                return True, None, "mount_fn", {"route_count": 0, "claimed_prefixes": []}
 
             if added_sigs.issubset(before_sigs):
                 _remove_added_routes(app, added_routes)
                 return True, None, "duplicate_skip", {
                     "reason": "mount_fn_added_only_duplicate_routes",
                     "route_count": len(added_sigs),
+                    "claimed_prefixes": claimed_prefixes,
+                }
+
+            owner_conflicts = _owner_conflicts_for_claimed_prefixes(
+                module_key=module_key,
+                module_name=module_name,
+                claimed_prefixes=claimed_prefixes,
+                prefix_owners=prefix_owners,
+                module_to_key=module_to_key,
+                canonical_owner_map=canonical_owner_map,
+            )
+            if owner_conflicts:
+                _remove_added_routes(app, added_routes)
+                return True, None, "conflict_skip", {
+                    "reason": "mount_fn_protected_prefix_owner_conflict",
+                    "route_count": len(added_sigs),
+                    "claimed_prefixes": claimed_prefixes,
+                    "owner_conflicts": owner_conflicts,
                 }
 
             details = _overlap_details(before_sigs, added_sigs, protected_prefixes)
-            if details["protected_overlap_count"] > 0:
-                _remove_added_routes(app, added_routes)
-                return True, None, "conflict_skip", {
-                    "reason": "mount_fn_added_protected_overlap",
-                    **details,
-                }
-
             return True, None, "mount_fn", {
                 "route_count": len(added_sigs),
+                "claimed_prefixes": claimed_prefixes,
+                **details,
             }
 
         return False, "No router export and no mount(app) function found", "no_router", {}
@@ -558,6 +695,7 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
     strict = _env_bool("ROUTES_STRICT_IMPORT", False)
     log_plan = _env_bool("ROUTES_LOG_PLAN", False)
     protected_prefixes = _protected_prefixes()
+    canonical_owner_map = _canonical_owner_map()
 
     catalog = _default_catalog()
     resolved_entries, missing_required = _resolve_catalog(catalog)
@@ -586,6 +724,8 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
     resolved_map: Dict[str, str] = {}
     priority_map: Dict[str, int] = {}
     overlap_details: Dict[str, Any] = {}
+    claimed_prefixes_by_module: Dict[str, List[str]] = {}
+    owner_conflicts: Dict[str, Any] = {}
 
     plan_modules: List[str] = []
 
@@ -604,6 +744,9 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
         if m not in seen_plan:
             seen_plan.add(m)
             plan_modules_unique.append(m)
+
+    # Prefix ownership store grows as we successfully mount canonical owners.
+    prefix_owners: Dict[str, str] = dict(snap.get("prefix_owners", {}) or {})
 
     for entry in resolved_entries:
         key = str(entry.get("key") or "")
@@ -628,11 +771,18 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
         ok, err, mode, details = _mount_one(
             app,
             module_name,
+            module_key=key,
             protected_prefixes=protected_prefixes,
+            prefix_owners=prefix_owners,
+            module_to_key=module_to_key,
+            canonical_owner_map=canonical_owner_map,
         )
 
         if details:
             overlap_details[module_name] = details
+            claimed_prefixes_by_module[module_name] = list(details.get("claimed_prefixes", []) or [])
+            if details.get("owner_conflicts"):
+                owner_conflicts[module_name] = details.get("owner_conflicts")
 
         if ok:
             if mode == "duplicate_skip":
@@ -641,6 +791,10 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
                 conflict_skips.append(module_name)
             else:
                 mounted.append(module_name)
+
+                # Claim protected prefixes only for actual mounted modules.
+                for prefix in claimed_prefixes_by_module.get(module_name, []):
+                    prefix_owners[prefix] = module_name
 
             mount_modes[module_name] = mode
 
@@ -699,6 +853,10 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
         "resolved_entries": resolved_entries,
         "openapi_route_count_after_mount": len(getattr(app, "routes", []) or []),
         "protected_prefixes": protected_prefixes,
+        "canonical_owner_map": canonical_owner_map,
+        "prefix_owners": prefix_owners,
+        "claimed_prefixes": claimed_prefixes_by_module,
+        "owner_conflicts": owner_conflicts,
         "overlap_details": overlap_details,
     }
 
@@ -732,6 +890,8 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
         logger.info("Duplicate router skips: %s", ", ".join(duplicate_skips))
     if conflict_skips:
         logger.info("Conflict router skips: %s", ", ".join(conflict_skips))
+    if owner_conflicts:
+        logger.info("Owner conflicts: %s", json.dumps(owner_conflicts, ensure_ascii=False))
 
     try:
         if hasattr(app, "state"):
