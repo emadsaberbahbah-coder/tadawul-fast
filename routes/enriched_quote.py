@@ -2,11 +2,11 @@
 # routes/enriched_quote.py
 """
 ================================================================================
-TFB Enriched Quote Routes Wrapper — v7.1.0
+TFB Enriched Quote Routes Wrapper — v7.2.0
 ================================================================================
 LEANER • SCHEMA-AWARE • PAGE-DISPATCH SAFE • GET+POST COMPATIBLE
 ROOT /v1/enriched-quote COMPATIBLE • SPECIAL-PAGE SAFE • THREAD-OFFLOADED
-JSON-SAFE • TABLE-MODE SAFE • INSTRUMENT HYDRATION SAFE
+JSON-SAFE • TABLE-MODE SAFE • INSTRUMENT HYDRATION SAFE • LATENCY-FIRST
 
 Design goals
 ------------
@@ -22,17 +22,19 @@ Design goals
     headers + keys + rows + rows_matrix + quotes + data + meta
 - No network calls at import time
 
-What v7.1.0 fixes
+What v7.2.0 fixes
 -----------------
-- ✅ FIX: schema_only / headers_only / keys_only now short-circuit for instrument pages
-        and do not fall into engine table-mode execution
-- ✅ FIX: engine resolution now prefers request.app.state.engine methods before older
-        module-level fallbacks
-- ✅ FIX: engine candidate execution no longer returns the first empty/error payload;
-        it keeps trying compatible call styles until a row-bearing payload is found
-- ✅ FIX: canonical page probing is used consistently for table-mode engine calls
-- ✅ FIX: when all engine candidates fail, the strongest payload is returned instead of
-        a misleading early fallback
+- ✅ FIX: table-mode engine execution now uses a narrower, priority-ordered call
+        plan instead of a large compatibility fan-out that could add latency
+- ✅ FIX: strong engine payloads are recognized earlier and returned sooner
+- ✅ FIX: table-mode payload quality scoring now rewards headers/keys/rows_matrix,
+        not rows only, reducing unnecessary extra retries
+- ✅ FIX: sparse quote rehydration is now capped and configurable to avoid heavy
+        per-symbol follow-up calls on large batches
+- ✅ FIX: batch quote execution prefers app.state.engine methods first, then falls
+        back cleanly without over-trying legacy signatures
+- ✅ FIX: enriched wrapper preserves large useful engine payloads more efficiently
+        while keeping the stable response envelope
 ================================================================================
 """
 
@@ -54,7 +56,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 
 logger = logging.getLogger("routes.enriched_quote")
 
-ROUTER_VERSION = "7.1.0"
+ROUTER_VERSION = "7.2.0"
 router: Optional[APIRouter] = None
 
 _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
@@ -338,7 +340,7 @@ def _payload_row_richness(d: Optional[Dict[str, Any]]) -> int:
     return sum(1 for key in important if d.get(key) not in (None, "", [], {}))
 
 
-def _is_sparse_payload_row(d: Optional[Dict[str, Any]], threshold: int = 10) -> bool:
+def _is_sparse_payload_row(d: Optional[Dict[str, Any]], threshold: int = 6) -> bool:
     return _payload_row_richness(d) < threshold
 
 
@@ -412,9 +414,12 @@ class _Service:
     def __init__(self, reason: str):
         self.reason = reason
         self.special_builder_timeout_sec = self._env_float("TFB_SPECIAL_BUILDER_TIMEOUT_SEC", 45.0)
-        self.engine_call_timeout_sec = self._env_float("TFB_ENGINE_CALL_TIMEOUT_SEC", 45.0)
-        self.quote_call_timeout_sec = self._env_float("TFB_QUOTE_CALL_TIMEOUT_SEC", 45.0)
-        self.rehydrate_concurrency = max(2, min(12, int(self._env_float("TFB_ROUTE_REHYDRATE_CONCURRENCY", 6))))
+        self.engine_call_timeout_sec = self._env_float("TFB_ENGINE_CALL_TIMEOUT_SEC", 25.0)
+        self.quote_call_timeout_sec = self._env_float("TFB_QUOTE_CALL_TIMEOUT_SEC", 20.0)
+        self.rehydrate_concurrency = max(2, min(12, int(self._env_float("TFB_ROUTE_REHYDRATE_CONCURRENCY", 4))))
+        self.rehydrate_enabled = self._env_bool("TFB_ROUTE_ENABLE_REHYDRATE", True)
+        self.rehydrate_max_symbols = max(0, min(250, int(self._env_float("TFB_ROUTE_REHYDRATE_MAX_SYMBOLS", 25))))
+        self.rehydrate_sparse_threshold = max(2, min(20, int(self._env_float("TFB_ROUTE_SPARSE_THRESHOLD", 6))))
 
         try:
             from core.config import auth_ok, get_settings_cached, is_open_mode  # type: ignore
@@ -482,6 +487,17 @@ class _Service:
             return float(raw) if raw else float(default)
         except Exception:
             return float(default)
+
+    @staticmethod
+    def _env_bool(name: str, default: bool) -> bool:
+        raw = os.getenv(name, "").strip().lower()
+        if not raw:
+            return bool(default)
+        if raw in {"1", "true", "yes", "y", "on"}:
+            return True
+        if raw in {"0", "false", "no", "n", "off"}:
+            return False
+        return bool(default)
 
     @staticmethod
     def _resolve_first_callable(module_name: str, names: Sequence[str]) -> Any:
@@ -800,6 +816,46 @@ class _Service:
 
         return None
 
+    def extract_headers_like(self, payload: Any) -> List[str]:
+        if not isinstance(payload, dict):
+            return []
+
+        for name in ("display_headers", "sheet_headers", "column_headers", "headers", "columns"):
+            value = payload.get(name)
+            if isinstance(value, list):
+                out = [_strip(x) for x in value if _strip(x)]
+                if out:
+                    return out
+
+        for name in ("payload", "result"):
+            nested = payload.get(name)
+            if isinstance(nested, dict):
+                found = self.extract_headers_like(nested)
+                if found:
+                    return found
+
+        return []
+
+    def extract_keys_like(self, payload: Any) -> List[str]:
+        if not isinstance(payload, dict):
+            return []
+
+        for name in ("keys", "fields", "column_keys", "schema_keys"):
+            value = payload.get(name)
+            if isinstance(value, list):
+                out = [_strip(x) for x in value if _strip(x)]
+                if out:
+                    return out
+
+        for name in ("payload", "result"):
+            nested = payload.get(name)
+            if isinstance(nested, dict):
+                found = self.extract_keys_like(nested)
+                if found:
+                    return found
+
+        return []
+
     def extract_status_error_meta(self, payload: Any) -> Tuple[str, Optional[str], Dict[str, Any]]:
         if not isinstance(payload, dict):
             return "success", None, {}
@@ -821,6 +877,13 @@ class _Service:
     def payload_has_rows(self, payload: Any) -> bool:
         return bool(self.extract_rows_like(payload) or self.extract_matrix_like(payload))
 
+    def payload_has_structural_value(self, payload: Any) -> bool:
+        return bool(
+            self.payload_has_rows(payload)
+            or self.extract_headers_like(payload)
+            or self.extract_keys_like(payload)
+        )
+
     def payload_quality_score(self, payload: Any) -> int:
         if payload is None:
             return -10
@@ -830,38 +893,34 @@ class _Service:
             return 0
 
         score = 0
-        if self.payload_has_rows(payload):
-            score += 100
         rows_like = self.extract_rows_like(payload)
+        matrix_like = self.extract_matrix_like(payload)
+        headers_like = self.extract_headers_like(payload)
+        keys_like = self.extract_keys_like(payload)
+
         if rows_like:
-            score += min(25, len(rows_like))
-        if self.extract_matrix_like(payload):
-            score += 10
+            score += 100 + min(25, len(rows_like))
+        if matrix_like:
+            score += 85 + min(15, len(matrix_like))
+        if headers_like:
+            score += 8
+        if keys_like:
+            score += 8
 
         status_out, error_out, meta_in = self.extract_status_error_meta(payload)
 
-        if payload.get("headers"):
+        if _strip(status_out).lower() == "success":
             score += 4
-        if payload.get("keys"):
-            score += 4
-        if payload.get("display_headers"):
+        elif _strip(status_out).lower() == "partial":
             score += 2
-        if payload.get("page"):
-            score += 1
-        if payload.get("route_family"):
-            score += 1
+        elif _strip(status_out).lower() == "error":
+            score -= 3
+
         if isinstance(meta_in, dict) and meta_in.get("known_sheets"):
             score += 1
 
-        if _strip(status_out).lower() == "success":
-            score += 3
-        elif _strip(status_out).lower() == "partial":
-            score += 1
-        elif _strip(status_out).lower() == "error":
-            score -= 2
-
         if _strip(error_out):
-            score -= 5
+            score -= 6
 
         return score
 
@@ -928,13 +987,8 @@ class _Service:
         extra_meta: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         if isinstance(result, dict):
-            result_headers = _first_list(
-                result.get("display_headers"),
-                result.get("sheet_headers"),
-                result.get("column_headers"),
-                result.get("headers"),
-            )
-            result_keys = _first_list(result.get("keys"))
+            result_headers = self.extract_headers_like(result)
+            result_keys = self.extract_keys_like(result)
 
             headers_out = [str(x) for x in (result_headers or list(headers)) if _strip(x)] or list(headers)
             keys_out = [str(x) for x in (result_keys or list(keys)) if _strip(x)] or list(keys)
@@ -997,6 +1051,24 @@ class _Service:
             extra_meta=extra_meta,
         )
 
+    def _coerce_engine_result_payload(self, result: Any, page: str) -> Dict[str, Any]:
+        if isinstance(result, dict):
+            return _json_safe(result)
+
+        if isinstance(result, list):
+            if result and isinstance(result[0], (list, tuple)):
+                return {"status": "success", "page": page, "rows_matrix": _json_safe(result)}
+            return {"status": "success", "page": page, "rows": _json_safe(result)}
+
+        if result is None:
+            return {"status": "partial", "page": page, "rows": []}
+
+        d = _model_to_dict(result)
+        if d:
+            return {"status": "success", "page": page, "rows": [d]}
+
+        return {"status": "success", "page": page, "rows": []}
+
     async def call_engine_page_payload_best_effort(
         self,
         *,
@@ -1036,31 +1108,65 @@ class _Service:
         payload.setdefault("offset", offset)
         if mode not in (None, ""):
             payload.setdefault("mode", mode)
+        payload.setdefault("include_headers", True)
+        payload.setdefault("include_matrix", True)
 
-        signatures = [
-            ((), {"engine": engine, "page": page, "sheet": page, "sheet_name": page, "limit": limit, "offset": offset, "mode": mode, "body": payload}),
-            ((), {"engine": engine, "page": page, "limit": limit, "offset": offset, "mode": mode, "body": payload}),
-            ((), {"page": page, "sheet": page, "sheet_name": page, "limit": limit, "offset": offset, "mode": mode, "body": payload}),
-            ((), {"page": page, "limit": limit, "offset": offset, "mode": mode, "body": payload}),
-            ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode, "body": payload}),
-            ((), {"page": page, "sheet": page, "sheet_name": page, "limit": limit, "offset": offset, "mode": mode}),
-            ((), {"page": page, "limit": limit, "offset": offset, "mode": mode}),
-            ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode}),
-            ((), {"sheet_name": page, "limit": limit, "offset": offset, "mode": mode}),
-            ((payload,), {}),
-            ((page, payload), {}),
-            ((page,), {"engine": engine, "body": payload, "limit": limit, "offset": offset, "mode": mode}),
-            ((page,), {"body": payload, "limit": limit, "offset": offset, "mode": mode}),
-            ((page,), {"limit": limit, "offset": offset, "mode": mode}),
-            ((page,), {"limit": limit, "offset": offset}),
-            ((page,), {}),
+        attempts: List[Tuple[str, Tuple[Any, ...], Dict[str, Any]]] = [
+            ("payload_only", (payload,), {}),
+            (
+                "page_kwargs_full",
+                (),
+                {
+                    "page": page,
+                    "sheet": page,
+                    "sheet_name": page,
+                    "limit": limit,
+                    "offset": offset,
+                    "mode": mode,
+                    "body": payload,
+                },
+            ),
+            (
+                "page_kwargs_body",
+                (),
+                {
+                    "page": page,
+                    "limit": limit,
+                    "offset": offset,
+                    "mode": mode,
+                    "body": payload,
+                },
+            ),
+            (
+                "page_kwargs_simple",
+                (),
+                {
+                    "page": page,
+                    "limit": limit,
+                    "offset": offset,
+                    "mode": mode,
+                },
+            ),
+            (
+                "sheet_kwargs_simple",
+                (),
+                {
+                    "sheet": page,
+                    "limit": limit,
+                    "offset": offset,
+                    "mode": mode,
+                },
+            ),
+            ("page_only", (page,), {"limit": limit, "offset": offset}),
         ]
 
         best_payload: Optional[Dict[str, Any]] = None
         best_score = -9999
 
         for fn in candidates:
-            for args, kwargs in signatures:
+            fn_name = getattr(fn, "__name__", str(fn))
+
+            for _label, args, kwargs in attempts:
                 try:
                     if self.engine_call_timeout_sec > 0:
                         res = await asyncio.wait_for(
@@ -1072,24 +1178,22 @@ class _Service:
                 except TypeError:
                     continue
                 except asyncio.TimeoutError:
-                    logger.warning("Engine table-mode candidate timed out. fn=%s page=%s", getattr(fn, "__name__", str(fn)), page)
+                    logger.warning("Engine table-mode candidate timed out. fn=%s page=%s", fn_name, page)
                     break
                 except Exception:
                     continue
 
-                if isinstance(res, list):
-                    payload_out = {"status": "success", "page": page, "rows": _json_safe(res)}
-                elif isinstance(res, dict):
-                    payload_out = _json_safe(res)
-                else:
-                    payload_out = {"status": "success", "page": page, "rows": []}
-
+                payload_out = self._coerce_engine_result_payload(res, page)
                 score = self.payload_quality_score(payload_out)
+
                 if score > best_score:
                     best_score = score
                     best_payload = payload_out
 
                 if self.payload_has_rows(payload_out):
+                    return payload_out
+
+                if score >= 95 and self.payload_has_structural_value(payload_out):
                     return payload_out
 
         return best_payload
@@ -1405,7 +1509,6 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             signatures = [
                 ((), {"symbols": list(symbols), "mode": mode, "schema": page}),
                 ((), {"symbols": list(symbols), "mode": mode}),
-                ((), {"symbols": list(symbols)}),
                 ((list(symbols),), {}),
             ]
 
@@ -1442,7 +1545,10 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
                 _put_quote(s, {"symbol": s, "ticker": s, "error": "engine_missing_batch_quote_methods"})
 
         batch_rows = len([s for s in symbols if _get_quote(s)])
-        sparse_symbols = [s for s in symbols if not _get_quote(s) or _is_sparse_payload_row(_get_quote(s))]
+        sparse_symbols = [
+            s for s in symbols
+            if not _get_quote(s) or _is_sparse_payload_row(_get_quote(s), threshold=svc.rehydrate_sparse_threshold)
+        ]
 
         per_fn = None
         for name in ("get_enriched_quote_dict", "get_quote_dict", "get_enriched_quote", "get_quote"):
@@ -1451,7 +1557,12 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
                 per_fn = candidate
                 break
 
-        if sparse_symbols and callable(per_fn):
+        if (
+            sparse_symbols
+            and callable(per_fn)
+            and svc.rehydrate_enabled
+            and len(sparse_symbols) <= svc.rehydrate_max_symbols
+        ):
             sem = asyncio.Semaphore(svc.rehydrate_concurrency)
 
             async def _rehydrate(sym: str) -> None:
@@ -1490,7 +1601,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             raw = _get_quote(sym) or {"symbol": sym, "ticker": sym, "error": "missing_row"}
             if raw.get("error"):
                 errors += 1
-            if _is_sparse_payload_row(raw):
+            if _is_sparse_payload_row(raw, threshold=svc.rehydrate_sparse_threshold):
                 sparse_after += 1
             rows_out.append(svc.normalize_row(keys, raw, symbol_fallback=sym))
 
@@ -1740,13 +1851,16 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             if limit > 0:
                 rows_out = rows_out[:limit]
 
+            payload_headers = svc.extract_headers_like(payload) or headers
+            payload_keys = svc.extract_keys_like(payload) or keys
+
             status_out, error_out, meta_in = svc.extract_status_error_meta(payload)
             result = svc.envelope(
                 status=status_out,
                 page=page,
                 route_family=route_family,
-                headers=headers,
-                keys=keys,
+                headers=payload_headers,
+                keys=payload_keys,
                 rows=rows_out,
                 include_headers=include_headers,
                 include_matrix=include_matrix,
