@@ -3,11 +3,11 @@
 """
 core/analysis/top10_selector.py
 ================================================================================
-Top 10 Selector — v4.1.0
+Top 10 Selector — v4.2.0
 ================================================================================
 LIVE • SCHEMA-FIRST • ROUTE-COMPATIBLE • ENGINE-SELF-RESOLVING • JSON-SAFE
 TOP10-METADATA GUARANTEED • SOURCE-PAGE SAFE • SNAPSHOT FALLBACK SAFE
-SYNC+ASYNC CALLER TOLERANT
+SYNC+ASYNC CALLER TOLERANT • MODULE/APP-STATE ENGINE DISCOVERY HARDENED
 
 Purpose
 -------
@@ -18,14 +18,16 @@ Produce stable, schema-aligned Top_10_Investments rows for:
 - routes/advanced_analysis.py
 - internal callers
 
-Key fixes in v4.1.0
+Key fixes in v4.2.0
 -------------------
-- ✅ FIX: self-resolves engine when route does not pass engine explicitly
-- ✅ FIX: accepts payload/body/criteria from positional or keyword inputs
-- ✅ FIX: handles sync callers and async callers safely
-- ✅ FIX: reconstructs rows correctly from dict rows OR matrix rows
-- ✅ FIX: broadens engine/source-page method compatibility
-- ✅ FIX: relaxes filters when candidates exist but strict filtering empties result
+- ✅ FIX: much stronger engine discovery from kwargs, positional args, mappings,
+        app.state, loaded modules, imported modules, and engine-like modules
+- ✅ FIX: supports module-level engine functions and engine-like modules as fallbacks
+- ✅ FIX: broader sheet-row / snapshot / quote method compatibility
+- ✅ FIX: continues trying alternative call shapes when one engine call fails
+- ✅ FIX: safer reconstruction of rows from dict rows, matrix rows, keyed maps,
+        nested payloads, and output-wrapper payloads
+- ✅ FIX: richer fallback metadata for live debugging
 - ✅ FIX: guarantees top10_rank / selection_reason / criteria_snapshot
 - ✅ FIX: preserves JSON-safe output only
 ================================================================================
@@ -34,19 +36,22 @@ Key fixes in v4.1.0
 from __future__ import annotations
 
 import asyncio
+import importlib
 import inspect
 import json
 import logging
 import math
 import os
+import sys
 import time
 from decimal import Decimal
+from types import ModuleType
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 logger = logging.getLogger("core.analysis.top10_selector")
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "4.1.0"
+TOP10_SELECTOR_VERSION = "4.2.0"
 OUTPUT_PAGE = "Top_10_Investments"
 
 DEFAULT_SOURCE_PAGES = [
@@ -527,8 +532,11 @@ def _header_to_key(header: Any) -> str:
     while "__" in key:
         key = key.replace("__", "_")
     key = key.replace("52w", "week_52")
-    key = key.replace("1d", "1d")
     return key
+
+
+def _is_mapping_like(obj: Any) -> bool:
+    return isinstance(obj, Mapping)
 
 
 # =============================================================================
@@ -596,45 +604,132 @@ def _load_schema_defaults() -> Tuple[List[str], List[str]]:
 # =============================================================================
 # Engine detection / resolution
 # =============================================================================
+_ENGINE_METHOD_NAMES = (
+    "get_sheet_rows",
+    "get_page_rows",
+    "sheet_rows",
+    "build_sheet_rows",
+    "execute_sheet_rows",
+    "run_sheet_rows",
+    "build_analysis_sheet_rows",
+    "run_analysis_sheet_rows",
+    "get_cached_sheet_snapshot",
+    "get_sheet_snapshot",
+    "get_cached_sheet_rows",
+    "get_page_snapshot",
+    "get_enriched_quotes_batch",
+    "get_analysis_quotes_batch",
+    "get_quotes_batch",
+    "quotes_batch",
+    "get_quotes",
+    "get_quote",
+    "get_quote_dict",
+    "get_enriched_quote",
+)
+
+_ENGINE_HOLDER_ATTRS = (
+    "engine",
+    "data_engine",
+    "quote_engine",
+    "cache_engine",
+    "_engine",
+    "_data_engine",
+    "service",
+    "runner",
+    "advisor_engine",
+)
+
+_APP_ATTRS = (
+    "app",
+    "application",
+    "fastapi_app",
+    "api",
+)
+
+_STATE_ATTRS = (
+    "state",
+    "app_state",
+)
+
+_MODULE_CANDIDATE_NAMES = (
+    "main",
+    "app",
+    "core.data_engine_v2",
+    "core.data_engine",
+    "routes.analysis_sheet_rows",
+    "routes.investment_advisor",
+    "routes.advanced_analysis",
+    "routes.enriched_quote",
+    "routes.advisor",
+)
+
+
 def _looks_like_engine(obj: Any) -> bool:
     if obj is None:
         return False
-    if isinstance(obj, (str, bytes, int, float, bool, list, tuple, set, dict)):
+    if isinstance(obj, (str, bytes, int, float, bool, list, tuple, set)):
         return False
+    if isinstance(obj, Mapping):
+        return False
+    return any(callable(getattr(obj, m, None)) for m in _ENGINE_METHOD_NAMES)
 
-    method_names = (
-        "get_sheet_rows",
-        "get_page_rows",
-        "sheet_rows",
-        "build_sheet_rows",
-        "execute_sheet_rows",
-        "run_sheet_rows",
-        "get_cached_sheet_snapshot",
-        "get_sheet_snapshot",
-        "get_cached_sheet_rows",
-        "get_enriched_quotes_batch",
-        "get_analysis_quotes_batch",
-        "get_quotes_batch",
-        "quotes_batch",
-        "get_quotes",
-        "get_quote",
-        "get_quote_dict",
-        "get_enriched_quote",
-    )
-    return any(callable(getattr(obj, m, None)) for m in method_names)
+
+def _safe_getattr(obj: Any, name: str, default: Any = None) -> Any:
+    try:
+        return getattr(obj, name, default)
+    except Exception:
+        return default
+
+
+def _iter_mapping_values(mapping: Mapping[str, Any]) -> Iterable[Tuple[str, Any]]:
+    try:
+        for k, v in mapping.items():
+            yield _s(k), v
+    except Exception:
+        return
+
+
+def _iter_object_values(obj: Any) -> Iterable[Tuple[str, Any]]:
+    if obj is None:
+        return
+
+    if isinstance(obj, Mapping):
+        yield from _iter_mapping_values(obj)
+        return
+
+    names: List[str] = []
+    try:
+        if hasattr(obj, "__dict__") and isinstance(getattr(obj, "__dict__", None), dict):
+            names.extend([n for n in obj.__dict__.keys() if isinstance(n, str)])
+    except Exception:
+        pass
+
+    preferred = list(_ENGINE_HOLDER_ATTRS) + list(_APP_ATTRS) + list(_STATE_ATTRS)
+    names = preferred + [n for n in names if n not in preferred]
+
+    seen = set()
+    for name in names:
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        try:
+            yield name, getattr(obj, name)
+        except Exception:
+            continue
 
 
 def _collect_engine_candidates_from_object(
     obj: Any,
     prefix: str = "",
     seen: Optional[set] = None,
+    depth: int = 0,
 ) -> List[Tuple[Any, str]]:
     if seen is None:
         seen = set()
 
     out: List[Tuple[Any, str]] = []
 
-    if obj is None:
+    if obj is None or depth > 4:
         return out
 
     obj_id = id(obj)
@@ -645,28 +740,58 @@ def _collect_engine_candidates_from_object(
     if _looks_like_engine(obj):
         out.append((obj, prefix or type(obj).__name__))
 
-    for attr in ("engine", "data_engine", "quote_engine", "cache_engine"):
-        try:
-            val = getattr(obj, attr, None)
-        except Exception:
-            val = None
-        if _looks_like_engine(val):
-            out.append((val, f"{prefix}.{attr}" if prefix else attr))
+    if isinstance(obj, Mapping):
+        for name, value in _iter_mapping_values(obj):
+            if name in set(_ENGINE_HOLDER_ATTRS + _APP_ATTRS + _STATE_ATTRS) or _looks_like_engine(value):
+                out.extend(
+                    _collect_engine_candidates_from_object(
+                        value,
+                        f"{prefix}.{name}" if prefix else name,
+                        seen,
+                        depth + 1,
+                    )
+                )
+        return out
 
-    # Request / app / state chains
-    try:
-        app = getattr(obj, "app", None)
-        if app is not None:
-            out.extend(_collect_engine_candidates_from_object(app, f"{prefix}.app" if prefix else "app", seen))
-    except Exception:
-        pass
+    # direct engine-holder attributes
+    for attr in _ENGINE_HOLDER_ATTRS:
+        val = _safe_getattr(obj, attr, None)
+        if val is not None:
+            out.extend(
+                _collect_engine_candidates_from_object(
+                    val,
+                    f"{prefix}.{attr}" if prefix else attr,
+                    seen,
+                    depth + 1,
+                )
+            )
 
-    try:
-        state = getattr(obj, "state", None)
-        if state is not None:
-            out.extend(_collect_engine_candidates_from_object(state, f"{prefix}.state" if prefix else "state", seen))
-    except Exception:
-        pass
+    # app / state chain
+    for attr in _APP_ATTRS + _STATE_ATTRS:
+        val = _safe_getattr(obj, attr, None)
+        if val is not None:
+            out.extend(
+                _collect_engine_candidates_from_object(
+                    val,
+                    f"{prefix}.{attr}" if prefix else attr,
+                    seen,
+                    depth + 1,
+                )
+            )
+
+    # selected object values from __dict__
+    for name, value in _iter_object_values(obj):
+        if value is None:
+            continue
+        if name in set(_ENGINE_HOLDER_ATTRS + _APP_ATTRS + _STATE_ATTRS) or _looks_like_engine(value):
+            out.extend(
+                _collect_engine_candidates_from_object(
+                    value,
+                    f"{prefix}.{name}" if prefix else name,
+                    seen,
+                    depth + 1,
+                )
+            )
 
     return out
 
@@ -681,6 +806,44 @@ async def _call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -
     return result
 
 
+async def _safe_call_zero_arg(fn: Callable[..., Any]) -> Any:
+    try:
+        result = fn()
+        if inspect.isawaitable(result):
+            return await result
+        return result
+    except TypeError:
+        return None
+    except Exception:
+        return None
+
+
+async def _scan_module_for_engine(module: Any, module_name: str) -> List[Tuple[Any, str]]:
+    out: List[Tuple[Any, str]] = []
+
+    if module is None:
+        return out
+
+    if _looks_like_engine(module):
+        out.append((module, module_name))
+
+    # module-level constructor / getter functions
+    for fn_name in ("get_engine", "resolve_engine", "load_engine", "build_engine", "create_engine"):
+        fn = _safe_getattr(module, fn_name, None)
+        if callable(fn):
+            result = await _safe_call_zero_arg(fn)
+            if _looks_like_engine(result):
+                out.append((result, f"{module_name}.{fn_name}"))
+
+    # module-level attrs
+    for attr in _ENGINE_HOLDER_ATTRS + _APP_ATTRS + _STATE_ATTRS + ("ENGINE", "engine", "_ENGINE"):
+        value = _safe_getattr(module, attr, None)
+        if value is not None:
+            out.extend(_collect_engine_candidates_from_object(value, f"{module_name}.{attr}"))
+
+    return out
+
+
 async def _resolve_engine_from_modules() -> Tuple[Optional[Any], str]:
     global _ENGINE_CACHE, _ENGINE_CACHE_SOURCE
 
@@ -693,50 +856,37 @@ async def _resolve_engine_from_modules() -> Tuple[Optional[Any], str]:
 
         candidates: List[Tuple[Any, str]] = []
 
-        # core.data_engine_v2.get_engine
-        try:
-            from core.data_engine_v2 import get_engine as get_engine_v2  # type: ignore
+        # explicitly import common modules
+        for module_name in _MODULE_CANDIDATE_NAMES:
+            try:
+                mod = importlib.import_module(module_name)
+            except Exception:
+                mod = None
+            if mod is not None:
+                candidates.extend(await _scan_module_for_engine(mod, module_name))
 
-            eng = get_engine_v2()
-            if inspect.isawaitable(eng):
-                eng = await eng
-            if _looks_like_engine(eng):
-                candidates.append((eng, "core.data_engine_v2.get_engine"))
-        except Exception:
-            pass
+        # scan already loaded modules
+        loaded_names = sorted(
+            name for name in sys.modules.keys()
+            if isinstance(name, str)
+            and (
+                name == "main"
+                or name == "app"
+                or name.startswith("core.")
+                or name.startswith("routes.")
+            )
+        )
 
-        # core.data_engine.get_engine
-        try:
-            from core.data_engine import get_engine as get_engine_legacy  # type: ignore
-
-            eng = get_engine_legacy()
-            if inspect.isawaitable(eng):
-                eng = await eng
-            if _looks_like_engine(eng):
-                candidates.append((eng, "core.data_engine.get_engine"))
-        except Exception:
-            pass
-
-        # module globals
-        try:
-            import core.data_engine_v2 as dev2  # type: ignore
-
-            for attr in ("ENGINE", "engine", "_ENGINE"):
-                eng = getattr(dev2, attr, None)
-                if _looks_like_engine(eng):
-                    candidates.append((eng, f"core.data_engine_v2.{attr}"))
-        except Exception:
-            pass
-
-        try:
-            import core.data_engine as delegacy  # type: ignore
-
-            for attr in ("ENGINE", "engine", "_ENGINE"):
-                eng = getattr(delegacy, attr, None)
-                if _looks_like_engine(eng):
-                    candidates.append((eng, f"core.data_engine.{attr}"))
-        except Exception:
-            pass
+        seen_sources = set(src for _, src in candidates)
+        for module_name in loaded_names:
+            mod = sys.modules.get(module_name)
+            if mod is None:
+                continue
+            scanned = await _scan_module_for_engine(mod, module_name)
+            for candidate, source in scanned:
+                if source not in seen_sources:
+                    seen_sources.add(source)
+                    candidates.append((candidate, source))
 
         if candidates:
             _ENGINE_CACHE, _ENGINE_CACHE_SOURCE = candidates[0]
@@ -747,14 +897,7 @@ async def _resolve_engine_from_modules() -> Tuple[Optional[Any], str]:
 
 async def _resolve_engine(*args: Any, **kwargs: Any) -> Tuple[Optional[Any], str]:
     # explicit kwargs first
-    for key in ("engine", "data_engine", "quote_engine", "cache_engine"):
-        if kwargs.get(key) is not None:
-            candidates = _collect_engine_candidates_from_object(kwargs.get(key), key)
-            if candidates:
-                return candidates[0]
-
-    # request/app/body-like kwargs
-    for key in ("request", "req", "app", "service", "runner", "context"):
+    for key in ("engine", "data_engine", "quote_engine", "cache_engine", "service", "runner", "request", "req", "app", "context"):
         if kwargs.get(key) is not None:
             candidates = _collect_engine_candidates_from_object(kwargs.get(key), key)
             if candidates:
@@ -766,15 +909,20 @@ async def _resolve_engine(*args: Any, **kwargs: Any) -> Tuple[Optional[Any], str
         if candidates:
             return candidates[0]
 
-    # payload/body may contain request/app
-    for key in ("body", "payload", "request_data", "params"):
+    # payload/body-like kwargs
+    for key in ("body", "payload", "request_data", "params", "criteria"):
         val = kwargs.get(key)
         if isinstance(val, Mapping):
-            for inner_key in ("request", "req", "app", "service", "engine", "data_engine", "quote_engine"):
-                if val.get(inner_key) is not None:
-                    candidates = _collect_engine_candidates_from_object(val.get(inner_key), f"{key}.{inner_key}")
-                    if candidates:
-                        return candidates[0]
+            candidates = _collect_engine_candidates_from_object(val, key)
+            if candidates:
+                return candidates[0]
+
+    # positional mapping objects
+    for i, arg in enumerate(args):
+        if isinstance(arg, Mapping):
+            candidates = _collect_engine_candidates_from_object(arg, f"arg{i}")
+            if candidates:
+                return candidates[0]
 
     return await _resolve_engine_from_modules()
 
@@ -789,7 +937,12 @@ def _payload_keys_like(payload: Mapping[str, Any]) -> List[str]:
         if out:
             return out
 
-    headers = payload.get("headers") or payload.get("display_headers") or payload.get("sheet_headers")
+    headers = (
+        payload.get("headers")
+        or payload.get("display_headers")
+        or payload.get("sheet_headers")
+        or payload.get("column_headers")
+    )
     if isinstance(headers, list):
         out = [_header_to_key(h) for h in headers if _header_to_key(h)]
         if out:
@@ -798,13 +951,42 @@ def _payload_keys_like(payload: Mapping[str, Any]) -> List[str]:
     return []
 
 
+def _unwrap_payload_like(payload: Any) -> Any:
+    current = payload
+    for _ in range(8):
+        if current is None:
+            return None
+        if isinstance(current, list):
+            return current
+        if not isinstance(current, Mapping):
+            return current
+
+        if any(k in current for k in ("rows", "records", "items", "results", "data", "quotes", "rows_matrix", "headers", "keys")):
+            return current
+
+        next_payload = None
+        for key in ("payload", "result", "response", "output", "data"):
+            if key in current and current.get(key) is not None:
+                next_payload = current.get(key)
+                break
+
+        if next_payload is None:
+            return current
+        current = next_payload
+
+    return current
+
+
 def _extract_rows_like(payload: Any) -> List[Dict[str, Any]]:
+    payload = _unwrap_payload_like(payload)
+
     if payload is None:
         return []
 
     if isinstance(payload, list):
-        out = [dict(x) for x in payload if isinstance(x, dict)]
-        return out
+        if all(isinstance(x, dict) for x in payload):
+            return [dict(x) for x in payload if isinstance(x, dict)]
+        return []
 
     if not isinstance(payload, Mapping):
         return []
@@ -866,6 +1048,8 @@ async def _call_engine_method(
     if engine is None:
         return None
 
+    last_exc: Optional[Exception] = None
+
     for method_name in method_names:
         fn = getattr(engine, method_name, None)
         if not callable(fn):
@@ -874,19 +1058,27 @@ async def _call_engine_method(
         for args, kwargs in attempts:
             try:
                 return await _call_maybe_async(fn, *args, **kwargs)
-            except TypeError:
+            except TypeError as exc:
+                last_exc = exc
                 continue
-            except Exception:
-                break
+            except Exception as exc:
+                last_exc = exc
+                continue
 
+    if last_exc is not None:
+        logger.debug("Engine call attempts exhausted: %s", last_exc)
     return None
 
 
 async def _fetch_page_rows(engine: Any, page: str, limit: int, mode: str) -> List[Dict[str, Any]]:
     body = {
         "page": page,
+        "page_name": page,
         "sheet": page,
         "sheet_name": page,
+        "tab": page,
+        "worksheet": page,
+        "name": page,
         "limit": limit,
         "top_n": limit,
         "mode": mode or "",
@@ -898,9 +1090,11 @@ async def _fetch_page_rows(engine: Any, page: str, limit: int, mode: str) -> Lis
 
     attempts = [
         ((), {"page": page, "sheet": page, "sheet_name": page, "limit": limit, "mode": mode or "", "body": body}),
+        ((), {"page_name": page, "sheet_name": page, "limit": limit, "mode": mode or "", "body": body}),
         ((), {"payload": body}),
         ((), {"body": body}),
         ((), {"page": page, "sheet": page, "sheet_name": page, "limit": limit, "mode": mode or ""}),
+        ((), {"page_name": page, "sheet_name": page, "limit": limit, "mode": mode or ""}),
         ((), {"page": page, "sheet": page, "limit": limit, "mode": mode or ""}),
         ((), {"page": page, "limit": limit, "mode": mode or ""}),
         ((page,), {"limit": limit, "mode": mode or ""}),
@@ -917,6 +1111,8 @@ async def _fetch_page_rows(engine: Any, page: str, limit: int, mode: str) -> Lis
             "build_sheet_rows",
             "execute_sheet_rows",
             "run_sheet_rows",
+            "build_analysis_sheet_rows",
+            "run_analysis_sheet_rows",
             "get_rows_for_sheet",
             "get_rows_for_page",
         ),
@@ -931,6 +1127,7 @@ async def _fetch_page_snapshot_rows(engine: Any, page: str) -> List[Dict[str, An
         ((), {"sheet_name": page}),
         ((), {"sheet": page}),
         ((), {"page": page}),
+        ((), {"page_name": page}),
         ((page,), {}),
     ]
 
@@ -941,6 +1138,7 @@ async def _fetch_page_snapshot_rows(engine: Any, page: str) -> List[Dict[str, An
             "get_sheet_snapshot",
             "get_cached_sheet_rows",
             "get_page_snapshot",
+            "get_sheet_cache",
         ),
         attempts,
     )
@@ -1042,6 +1240,7 @@ def _collect_criteria_from_inputs(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         "selected_pages",
         "sources",
         "page",
+        "page_name",
         "sheet",
         "sheet_name",
         "symbols",
@@ -1079,6 +1278,7 @@ def _collect_criteria_from_inputs(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         or _normalize_list(criteria.get("selected_pages"))
         or _normalize_list(criteria.get("sources"))
         or _normalize_list(criteria.get("page"))
+        or _normalize_list(criteria.get("page_name"))
         or _normalize_list(criteria.get("sheet"))
         or _normalize_list(criteria.get("sheet_name"))
     )
@@ -1426,8 +1626,11 @@ async def _collect_candidate_rows(
             )
             enriched_rows = await _fetch_direct_symbol_rows(engine, symbols_from_page, mode)
             if enriched_rows:
-                # merge enriched over page rows
-                page_map = { _normalize_symbol(r.get("symbol") or r.get("ticker") or r.get("requested_symbol")): dict(r) for r in rows }
+                page_map = {
+                    _normalize_symbol(r.get("symbol") or r.get("ticker") or r.get("requested_symbol")): dict(r)
+                    for r in rows
+                    if _normalize_symbol(r.get("symbol") or r.get("ticker") or r.get("requested_symbol"))
+                }
                 for er in enriched_rows:
                     sym = _normalize_symbol(er.get("symbol") or er.get("ticker"))
                     if sym:
