@@ -2,7 +2,7 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v7.8.0)
+TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v7.8.1)
 ================================================================================
 ALIGNED • DEPLOYMENT-SAFE • PRE-MOUNT + STARTUP-VERIFY • ROUTER-SNAPSHOT-AWARE
 ENGINE-STATE-AWARE • OPENAPI-SAFE • RENDER-HEALTH-PROBE-SAFE • PRIORITY-MOUNTED
@@ -10,19 +10,21 @@ ROOT-CONFIG-FIRST • CORE-CONFIG-COMPATIBLE • REQUEST-ID SAFE • STARTUP-HAR
 ORJSON-READY • PREEXISTING-ENGINE SAFE • ROUTE-VERIFY SAFE • DEBUG-HARDENED
 V1-HEALTH-ALIAS SAFE • V1-META-ALIAS SAFE • HEAD-PROBE SAFE
 CONTROLLED-ROUTE-OWNERSHIP • PARTIAL-DUPLICATE-BLOCK SAFE • FILTERED-MOUNT SAFE
+SYNTAX-REPAIRED
 
-Why this revision (v7.8.0)
+Why this revision (v7.8.1)
 --------------------------
-- ✅ FIX: route mounting now uses a controlled internal priority plan by default
-        instead of blindly trusting a package-level bulk mounter that can
-        reintroduce duplicate route families.
-- ✅ FIX: partial route-family conflicts are prevented with per-module path
+- ✅ FIX: removes the broken duplicate function header that caused Render build
+        failure with SyntaxError near `_mount_routes_once(...)`.
+- ✅ FIX: preserves controlled internal priority route mounting to prevent
+        duplicate route-family conflicts.
+- ✅ FIX: partial route-family conflicts remain blocked with per-module path
         filtering, especially for:
         - routes.advisor
         - routes.investment_advisor
         - routes.advanced_analysis
         - routes.enriched_quote
-- ✅ FIX: duplicate detection is now route-signature aware at per-route level,
+- ✅ FIX: duplicate detection remains route-signature aware at per-route level,
         not only whole-router subset level.
 - ✅ FIX: canonical ownership is preserved:
         - /v1/advisor/*           -> routes.advisor
@@ -39,7 +41,7 @@ Why this revision (v7.8.0)
         - /schema/*
 - ✅ FIX: enriched_quote legacy root `/sheet-rows` is blocked here so it cannot
         override schema-driven root `/sheet-rows`.
-- ✅ FIX: startup route verification now records missing critical route families.
+- ✅ FIX: startup route verification records missing critical route families.
 - ✅ FIX: `/v1/health`, `/v1/healthz`, `/v1/livez`, `/v1/readyz`, `/v1/meta`,
         `/v1/ping`, and HEAD probes remain stable.
 - ✅ SAFE: preserves existing engine-init, OpenAPI, auth, middleware, and
@@ -74,7 +76,7 @@ except Exception:
 # --------------------------------------------------------------------------------------
 # Version
 # --------------------------------------------------------------------------------------
-APP_ENTRY_VERSION = "7.8.0"
+APP_ENTRY_VERSION = "7.8.1"
 
 
 # --------------------------------------------------------------------------------------
@@ -311,7 +313,12 @@ def _settings_from_generic_object(s: Any, source: str) -> _SettingsView:
             _pick_attr(s, "ENGINE_CACHE_TTL_SEC", "engine_cache_ttl_sec", default=_env_int("ENGINE_CACHE_TTL_SEC", 20))
         ),
         MAX_REQUESTS_PER_MINUTE=int(
-            _pick_attr(s, "MAX_REQUESTS_PER_MINUTE", "max_requests_per_minute", default=_env_int("MAX_REQUESTS_PER_MINUTE", 240))
+            _pick_attr(
+                s,
+                "MAX_REQUESTS_PER_MINUTE",
+                "max_requests_per_minute",
+                default=_env_int("MAX_REQUESTS_PER_MINUTE", 240),
+            )
         ),
         CONFIG_SOURCE=source,
     )
@@ -936,7 +943,11 @@ def _mount_routes_controlled(app: FastAPI) -> Dict[str, Any]:
                         duplicate_skips.append(mod_name)
                     if int(stats.get("partial_duplicate_skips", 0)) > 0:
                         partial_duplicate_skips.append(mod_name)
-                    if int(stats.get("filtered_out", 0)) > 0 and int(stats.get("duplicate_skips", 0)) == 0 and int(stats.get("partial_duplicate_skips", 0)) == 0:
+                    if (
+                        int(stats.get("filtered_out", 0)) > 0
+                        and int(stats.get("duplicate_skips", 0)) == 0
+                        and int(stats.get("partial_duplicate_skips", 0)) == 0
+                    ):
                         no_router[mod_name] = "All routes filtered by controlled ownership policy"
                     elif int(stats.get("duplicate_skips", 0)) > 0 or int(stats.get("partial_duplicate_skips", 0)) > 0:
                         mount_modes[mod_name] = "filtered_duplicate_skip"
@@ -1075,9 +1086,6 @@ def _should_reverify_prestart_snapshot(app: FastAPI, snap: Dict[str, Any]) -> bo
     return False
 
 
-def _mount_routes_once(app: FastAPI, phase: str) -> Dict False
-
-
 def _mount_routes_once(app: FastAPI, phase: str) -> Dict[str, Any]:
     _ensure_app_state_defaults(app)
 
@@ -1150,7 +1158,11 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
     duplicate_skips_count = int(snap.get("duplicate_skips_count", len(snap.get("duplicate_skips", []) or [])) or 0)
     partial_duplicate_skips_count = int(snap.get("partial_duplicate_skips_count", len(snap.get("partial_duplicate_skips", []) or [])) or 0)
     failed_count = int(
-        snap.get("failed_count", len(snap.get("import_errors", {}) or {}) + len(snap.get("mount_errors", {}) or {}) + len(snap.get("no_router", {}) or {})) or 0
+        snap.get(
+            "failed_count",
+            len(snap.get("import_errors", {}) or {}) + len(snap.get("mount_errors", {}) or {}) + len(snap.get("no_router", {}) or {}),
+        )
+        or 0
     )
     strategy = str(snap.get("strategy", "") or "")
     route_signature_count = int(
