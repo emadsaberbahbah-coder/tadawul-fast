@@ -2,12 +2,13 @@
 # routes/analysis_sheet_rows.py
 """
 ================================================================================
-Analysis Sheet-Rows Router — v2.4.0
+Analysis Sheet-Rows Router — v2.5.0
 ================================================================================
 SCHEMA-FIRST • CANONICAL PAGE DISPATCH • SPECIAL-PAGE SAFE • ROUTE-CANONICAL
 PATH-AWARE AUTH • STABLE RESPONSE SHAPE • POWERSHELL/LIVE-TEST FRIENDLY
 GET+POST SAFE • BUILDER-FLEXIBLE • ENGINE-FLEXIBLE • HEADER/KEY STABLE
 REAL-WORLD PAYLOAD TOLERANT • DATA-ENGINE FALLBACK SAFE • ENRICHED-FALLBACK SAFE
+WRAPPER-PAYLOAD SAFE • TOP10/INSIGHTS HARDENED • JSON-SAFE
 
 Endpoints
 ---------
@@ -15,25 +16,24 @@ GET  /v1/analysis/health
 GET  /v1/analysis/sheet-rows
 POST /v1/analysis/sheet-rows
 
-What this revision fixes
-------------------------
-- ✅ FIX: base pages such as Market_Leaders / Global_Markets / Mutual_Funds /
-         Commodities_FX / My_Portfolio no longer stop at a single fragile
-         engine.get_sheet_rows(...) attempt.
-- ✅ FIX: if core/engine table-mode returns
-         "Unknown sheet or schema missing for '...'"
-         this router now falls back to enriched page builders before degrading.
-- ✅ FIX: Top_10_Investments builder resolution is broader and now tries the
-         actual public selector-style names as well:
-             - build_top10_rows
-             - build_top10_output_rows
-             - select_top10
-             - select_top10_symbols
-             - and more
-- ✅ FIX: if a Top10 builder returns only symbols/tickers, this router can enrich
-         those symbols back into schema-aligned rows using the engine.
-- ✅ FIX: stable response envelopes preserved across GET / POST / degraded cases.
-- ✅ FIX: stronger dispatch metadata for forensic PowerShell tests.
+What this revision improves
+---------------------------
+- ✅ FIX: stronger schema extraction from registry specs using columns / fields /
+         headers / keys and nested dict-like spec shapes.
+- ✅ FIX: stable response envelope now includes:
+         headers / display_headers / sheet_headers / column_headers
+         keys / columns / fields
+         rows / items / data / quotes / rows_matrix
+         page / sheet / sheet_name
+- ✅ FIX: base pages use a broader engine table-mode plan, then compare against
+         enriched fallback when engine payload is weak or hard-failed.
+- ✅ FIX: Top10 / Insights builders now preserve richer payloads and can recover
+         from rows, rows_matrix, nested wrappers, symbol-only outputs, or
+         symbol-map outputs.
+- ✅ FIX: symbol-only Top10 outputs can be rehydrated through the engine into
+         schema-aligned rows.
+- ✅ FIX: instrument batch retrieval supports more engine aliases and returns
+         safer degraded rows when the engine is unavailable.
 - ✅ SAFE: no import-time network I/O.
 ================================================================================
 """
@@ -43,10 +43,14 @@ from __future__ import annotations
 import importlib
 import inspect
 import logging
+import math
 import os
+import re
 import time
 import uuid
 from dataclasses import is_dataclass
+from datetime import date, datetime, time as dt_time
+from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, status
@@ -119,7 +123,7 @@ except Exception:  # pragma: no cover
     core_get_sheet_rows = None  # type: ignore
 
 
-ANALYSIS_SHEET_ROWS_VERSION = "2.4.0"
+ANALYSIS_SHEET_ROWS_VERSION = "2.5.0"
 router = APIRouter(prefix="/v1/analysis", tags=["Analysis Sheet Rows"])
 
 _BASE_SOURCE_PAGES = {
@@ -128,12 +132,23 @@ _BASE_SOURCE_PAGES = {
     "Commodities_FX",
     "Mutual_Funds",
     "My_Portfolio",
+    "My_Investments",
 }
 _TOP10_PAGE = "Top_10_Investments"
+_TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
+    "top10_rank",
+    "selection_reason",
+    "criteria_snapshot",
+)
+_TOP10_REQUIRED_HEADERS: Dict[str, str] = {
+    "top10_rank": "Top10 Rank",
+    "selection_reason": "Selection Reason",
+    "criteria_snapshot": "Criteria Snapshot",
+}
 
 _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
-    "symbol": ["ticker", "code", "instrument", "security", "symbol_code"],
-    "ticker": ["symbol", "code", "instrument", "security"],
+    "symbol": ["ticker", "code", "instrument", "security", "symbol_code", "requested_symbol"],
+    "ticker": ["symbol", "code", "instrument", "security", "requested_symbol"],
     "current_price": [
         "price",
         "last_price",
@@ -218,6 +233,56 @@ def _strip(v: Any) -> str:
         return s
     except Exception:
         return ""
+
+
+def _json_safe(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+
+    if isinstance(value, float):
+        return None if (math.isnan(value) or math.isinf(value)) else value
+
+    if isinstance(value, Decimal):
+        try:
+            f = float(value)
+            return None if (math.isnan(f) or math.isinf(f)) else f
+        except Exception:
+            return str(value)
+
+    if isinstance(value, (datetime, date, dt_time)):
+        try:
+            return value.isoformat()
+        except Exception:
+            return str(value)
+
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8", errors="replace")
+        except Exception:
+            return str(value)
+
+    if isinstance(value, Mapping):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+
+    try:
+        if hasattr(value, "model_dump") and callable(getattr(value, "model_dump")):
+            return _json_safe(value.model_dump(mode="python"))  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+    try:
+        if hasattr(value, "dict") and callable(getattr(value, "dict")):
+            return _json_safe(value.dict())  # type: ignore[attr-defined]
+    except Exception:
+        pass
+
+    try:
+        return _json_safe(vars(value))
+    except Exception:
+        return str(value)
 
 
 def _as_list(v: Any) -> List[Any]:
@@ -317,14 +382,14 @@ def _to_plain_dict(obj: Any) -> Dict[str, Any]:
 
     try:
         if hasattr(obj, "model_dump") and callable(getattr(obj, "model_dump")):
-            d = obj.model_dump(mode="python")  # type: ignore
+            d = obj.model_dump(mode="python")  # type: ignore[attr-defined]
             return d if isinstance(d, dict) else {}
     except Exception:
         pass
 
     try:
         if hasattr(obj, "dict") and callable(getattr(obj, "dict")):
-            d = obj.dict()  # type: ignore
+            d = obj.dict()  # type: ignore[attr-defined]
             return d if isinstance(d, dict) else {}
     except Exception:
         pass
@@ -584,28 +649,114 @@ def _ensure_page_allowed(page: str) -> None:
         return
 
 
+def _complete_schema_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple[List[str], List[str]]:
+    raw_headers = list(headers or [])
+    raw_keys = list(keys or [])
+    max_len = max(len(raw_headers), len(raw_keys))
+
+    hdrs: List[str] = []
+    ks: List[str] = []
+
+    for i in range(max_len):
+        h = _strip(raw_headers[i]) if i < len(raw_headers) else ""
+        k = _strip(raw_keys[i]) if i < len(raw_keys) else ""
+
+        if h and not k:
+            k = re.sub(r"[^a-z0-9]+", "_", h.lower()).strip("_")
+        elif k and not h:
+            h = k.replace("_", " ").title()
+        elif not h and not k:
+            h = f"Column_{i+1}"
+            k = f"key_{i+1}"
+
+        hdrs.append(h)
+        ks.append(k)
+
+    return hdrs, ks
+
+
+def _ensure_top10_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple[List[str], List[str]]:
+    hdrs = list(headers or [])
+    ks = list(keys or [])
+    for field in _TOP10_REQUIRED_FIELDS:
+        if field not in ks:
+            ks.append(field)
+            hdrs.append(_TOP10_REQUIRED_HEADERS[field])
+    return _complete_schema_contract(hdrs, ks)
+
+
+def _schema_columns_from_any(spec: Any) -> List[Any]:
+    if spec is None:
+        return []
+
+    if isinstance(spec, dict) and len(spec) == 1 and "columns" not in spec and "fields" not in spec:
+        first_val = list(spec.values())[0]
+        if isinstance(first_val, dict) and ("columns" in first_val or "fields" in first_val):
+            spec = first_val
+
+    cols = getattr(spec, "columns", None)
+    if isinstance(cols, list) and cols:
+        return cols
+
+    fields = getattr(spec, "fields", None)
+    if isinstance(fields, list) and fields:
+        return fields
+
+    if isinstance(spec, Mapping):
+        cols2 = spec.get("columns") or spec.get("fields")
+        if isinstance(cols2, list) and cols2:
+            return cols2
+
+    try:
+        d = getattr(spec, "__dict__", None)
+        if isinstance(d, dict):
+            cols3 = d.get("columns") or d.get("fields")
+            if isinstance(cols3, list) and cols3:
+                return cols3
+    except Exception:
+        pass
+
+    return []
+
+
 def _schema_headers_keys(page: str) -> Tuple[List[str], List[str], Any]:
     if get_sheet_spec is None:
         raise KeyError("schema_registry unavailable")
 
     spec = get_sheet_spec(page)
-
-    cols = getattr(spec, "columns", None)
-    if cols is None and isinstance(spec, Mapping):
-        cols = spec.get("columns")
-    cols = _as_list(cols)
-
     headers: List[str] = []
     keys: List[str] = []
 
+    cols = _schema_columns_from_any(spec)
     for c in cols:
-        cd = c if isinstance(c, Mapping) else _to_plain_dict(c)
-        h = _strip(cd.get("header") if isinstance(cd, dict) else getattr(c, "header", None))
-        k = _strip(cd.get("key") if isinstance(cd, dict) else getattr(c, "key", None))
-        if h:
-            headers.append(h)
-        if k:
-            keys.append(k)
+        if isinstance(c, Mapping):
+            h = _strip(c.get("header") or c.get("display_header") or c.get("displayHeader") or c.get("label") or c.get("title"))
+            k = _strip(c.get("key") or c.get("field") or c.get("name") or c.get("id"))
+        else:
+            h = _strip(
+                getattr(
+                    c,
+                    "header",
+                    getattr(c, "display_header", getattr(c, "displayHeader", getattr(c, "label", getattr(c, "title", None)))),
+                )
+            )
+            k = _strip(getattr(c, "key", getattr(c, "field", getattr(c, "name", getattr(c, "id", None)))))
+
+        if h or k:
+            headers.append(h or k.replace("_", " ").title())
+            keys.append(k or re.sub(r"[^a-z0-9]+", "_", h.lower()).strip("_"))
+
+    if not headers and not keys and isinstance(spec, Mapping):
+        headers2 = spec.get("headers") or spec.get("display_headers")
+        keys2 = spec.get("keys") or spec.get("fields") or spec.get("columns")
+        if isinstance(headers2, list):
+            headers = [_strip(x) for x in headers2 if _strip(x)]
+        if isinstance(keys2, list):
+            keys = [_strip(x) for x in keys2 if _strip(x)]
+
+    headers, keys = _complete_schema_contract(headers, keys)
+    if page == _TOP10_PAGE:
+        headers, keys = _ensure_top10_contract(headers, keys)
 
     return headers, keys, spec
 
@@ -619,7 +770,7 @@ def _slice(rows: List[Dict[str, Any]], *, limit: int, offset: int) -> List[Dict[
 
 
 def _rows_to_matrix(rows: Sequence[Mapping[str, Any]], keys: Sequence[str]) -> List[List[Any]]:
-    return [[r.get(k) for k in keys] for r in rows]
+    return [[_json_safe(r.get(k)) for k in keys] for r in rows]
 
 
 def _key_variants(key: str) -> List[str]:
@@ -656,6 +807,7 @@ def _key_variants(key: str) -> List[str]:
 
 def _extract_from_raw(raw: Dict[str, Any], candidates: Sequence[str]) -> Any:
     raw_ci = {str(k).strip().lower(): v for k, v in raw.items()}
+    raw_comp = {re.sub(r"[^a-z0-9]+", "", str(k).lower()): v for k, v in raw.items()}
 
     for candidate in candidates:
         if candidate in raw:
@@ -663,6 +815,9 @@ def _extract_from_raw(raw: Dict[str, Any], candidates: Sequence[str]) -> Any:
         lc = candidate.lower()
         if lc in raw_ci:
             return raw_ci.get(lc)
+        cc = re.sub(r"[^a-z0-9]+", "", candidate.lower())
+        if cc in raw_comp:
+            return raw_comp.get(cc)
     return None
 
 
@@ -688,7 +843,7 @@ def _normalize_to_schema_keys(
             if h:
                 v = _extract_from_raw(raw, [h, h.lower(), h.upper()])
 
-        out[ks] = v
+        out[ks] = _json_safe(v)
 
     if "symbol" in out and not out.get("symbol"):
         out["symbol"] = _extract_from_raw(raw, _key_variants("symbol"))
@@ -700,21 +855,59 @@ def _normalize_to_schema_keys(
     return out
 
 
-def _extract_rows_like(payload: Any) -> List[Dict[str, Any]]:
-    if payload is None:
+def _looks_like_symbol_token(x: Any) -> bool:
+    s = _strip(x).upper()
+    if not s or " " in s or len(s) > 24:
+        return False
+    return bool(re.fullmatch(r"[A-Z0-9\.\=\-\^:_/]{1,24}", s))
+
+
+def _looks_like_explicit_row_dict(d: Any) -> bool:
+    if not isinstance(d, Mapping) or not d:
+        return False
+
+    keyset = {str(k) for k in d.keys()}
+    if keyset & {"symbol", "ticker", "code", "requested_symbol"}:
+        return True
+    if {"sheet", "header", "key"}.issubset(keyset):
+        return True
+    if {"section", "item"}.issubset(keyset):
+        return True
+    if {"top10_rank", "selection_reason"}.issubset(keyset):
+        return True
+    return False
+
+
+def _rows_from_matrix(rows_matrix: Any, cols: Sequence[str]) -> List[Dict[str, Any]]:
+    if not isinstance(rows_matrix, list) or not cols:
+        return []
+    keys = [_strip(c) for c in cols if _strip(c)]
+    if not keys:
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for row in rows_matrix:
+        if not isinstance(row, (list, tuple)):
+            continue
+        vals = list(row)
+        out.append({keys[i]: (vals[i] if i < len(vals) else None) for i in range(len(keys))})
+    return out
+
+
+def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
+    if payload is None or depth > 8:
         return []
 
     if isinstance(payload, list):
         if not payload:
             return []
 
-        if isinstance(payload[0], dict):
+        if all(isinstance(x, dict) for x in payload):
             return [_to_plain_dict(r) for r in payload]
 
-        if isinstance(payload[0], (list, tuple)):
+        if payload and isinstance(payload[0], (list, tuple)):
             return []
 
-        # important for selector functions that return symbols only
         out: List[Dict[str, Any]] = []
         for item in payload:
             s = _strip(item)
@@ -722,35 +915,77 @@ def _extract_rows_like(payload: Any) -> List[Dict[str, Any]]:
                 out.append({"symbol": s, "ticker": s})
         return out
 
-    if isinstance(payload, dict):
-        for name in ("rows", "data", "items", "records", "quotes", "recommendations"):
-            value = payload.get(name)
-            if isinstance(value, list):
-                if value and isinstance(value[0], (list, tuple)):
-                    continue
-                return _extract_rows_like(value)
+    if not isinstance(payload, Mapping):
+        d = _to_plain_dict(payload)
+        return [d] if _looks_like_explicit_row_dict(d) else []
 
-            if isinstance(value, dict):
-                for inner_name in ("rows", "data", "items", "records", "quotes", "recommendations"):
-                    inner = value.get(inner_name)
-                    if isinstance(inner, list):
-                        if inner and isinstance(inner[0], (list, tuple)):
-                            continue
-                        return _extract_rows_like(inner)
+    if _looks_like_explicit_row_dict(payload):
+        return [dict(payload)]
 
-        for name in ("payload", "result"):
-            nested = payload.get(name)
-            if isinstance(nested, dict):
-                nested_rows = _extract_rows_like(nested)
-                if nested_rows:
-                    return nested_rows
+    maybe_symbol_map = True
+    symbol_like_keys = 0
+    rows_from_symbol_map: List[Dict[str, Any]] = []
+    for k, v in payload.items():
+        if not isinstance(v, Mapping):
+            maybe_symbol_map = False
+            break
+        if not _looks_like_symbol_token(k):
+            maybe_symbol_map = False
+            break
+        symbol_like_keys += 1
+        row = dict(v)
+        if not row.get("symbol") and not row.get("ticker"):
+            row["symbol"] = _strip(k)
+            row["ticker"] = _strip(k)
+        rows_from_symbol_map.append(row)
+    if maybe_symbol_map and symbol_like_keys > 0 and rows_from_symbol_map:
+        return rows_from_symbol_map
+
+    keys_like = _extract_keys_like(payload)
+    if not keys_like:
+        hdrs = _extract_headers_like(payload)
+        if hdrs:
+            keys_like = [re.sub(r"[^a-z0-9]+", "_", h.lower()).strip("_") for h in hdrs if _strip(h)]
+
+    for name in ("rows", "data", "items", "records", "quotes", "recommendations", "results"):
+        value = payload.get(name)
+
+        if isinstance(value, list):
+            if value and isinstance(value[0], (list, tuple)) and keys_like:
+                rows = _rows_from_matrix(value, keys_like)
+                if rows:
+                    return rows
+            rows = _extract_rows_like(value, depth + 1)
+            if rows:
+                return rows
+
+        if isinstance(value, Mapping):
+            rows = _extract_rows_like(value, depth + 1)
+            if rows:
+                return rows
+
+    rows_matrix = payload.get("rows_matrix") or payload.get("matrix") or payload.get("values")
+    if isinstance(rows_matrix, list) and keys_like:
+        rows = _rows_from_matrix(rows_matrix, keys_like)
+        if rows:
+            return rows
+
+    for name in ("payload", "result", "response", "output", "data"):
+        nested = payload.get(name)
+        if nested is not None and nested is not payload:
+            rows = _extract_rows_like(nested, depth + 1)
+            if rows:
+                return rows
 
     return []
 
 
-def _extract_matrix_like(payload: Any) -> Optional[List[List[Any]]]:
+def _extract_matrix_like(payload: Any, depth: int = 0) -> Optional[List[List[Any]]]:
+    if depth > 8:
+        return None
+
     if isinstance(payload, dict):
-        for name in ("rows_matrix",):
+        for name in ("rows_matrix", "matrix", "values"):
             value = payload.get(name)
             if isinstance(value, list):
                 return [list(r) if isinstance(r, (list, tuple)) else [r] for r in value]
@@ -759,14 +994,62 @@ def _extract_matrix_like(payload: Any) -> Optional[List[List[Any]]]:
         if isinstance(rows_value, list) and rows_value and isinstance(rows_value[0], (list, tuple)):
             return [list(r) if isinstance(r, (list, tuple)) else [r] for r in rows_value]
 
-        for name in ("data", "payload", "result"):
+        for name in ("data", "payload", "result", "response", "output"):
             nested = payload.get(name)
             if isinstance(nested, dict):
-                mx = _extract_matrix_like(nested)
+                mx = _extract_matrix_like(nested, depth + 1)
                 if mx is not None:
                     return mx
 
     return None
+
+
+def _extract_keys_like(payload: Any, depth: int = 0) -> List[str]:
+    if depth > 8 or not isinstance(payload, dict):
+        return []
+
+    for name in ("keys", "fields", "column_keys", "schema_keys", "columns"):
+        value = payload.get(name)
+        if isinstance(value, list):
+            out = [_strip(x) for x in value if _strip(x)]
+            if out:
+                return out
+
+    for name in ("payload", "result", "response", "output", "data"):
+        nested = payload.get(name)
+        if isinstance(nested, dict):
+            found = _extract_keys_like(nested, depth + 1)
+            if found:
+                return found
+
+    return []
+
+
+def _extract_headers_like(payload: Any, depth: int = 0) -> List[str]:
+    if depth > 8 or not isinstance(payload, dict):
+        return []
+
+    for name in ("display_headers", "sheet_headers", "column_headers", "headers"):
+        value = payload.get(name)
+        if isinstance(value, list):
+            out = [_strip(x) for x in value if _strip(x)]
+            if out:
+                return out
+
+    columns = payload.get("columns")
+    if isinstance(columns, list):
+        out = [_strip(x) for x in columns if _strip(x)]
+        if out and any(" " in x or x.istitle() for x in out):
+            return out
+
+    for name in ("payload", "result", "response", "output", "data"):
+        nested = payload.get(name)
+        if isinstance(nested, dict):
+            found = _extract_headers_like(nested, depth + 1)
+            if found:
+                return found
+
+    return []
 
 
 def _extract_symbol_list_like(payload: Any) -> List[str]:
@@ -852,6 +1135,54 @@ def _payload_looks_hard_failure(payload: Any) -> bool:
     return False
 
 
+def _payload_quality_score(payload: Any, page: str = "") -> int:
+    if payload is None:
+        return -10
+    if isinstance(payload, list):
+        return 100 if payload else 0
+    if not isinstance(payload, dict):
+        return 0
+
+    score = 0
+    rows_like = _extract_rows_like(payload)
+    matrix_like = _extract_matrix_like(payload)
+    headers_like = _extract_headers_like(payload)
+    keys_like = _extract_keys_like(payload)
+
+    if rows_like:
+        score += 100 + min(25, len(rows_like))
+    if matrix_like:
+        score += 85 + min(15, len(matrix_like))
+    if headers_like:
+        score += 8
+    if keys_like:
+        score += 8
+
+    if page == _TOP10_PAGE and rows_like:
+        for field in _TOP10_REQUIRED_FIELDS:
+            if any(isinstance(r, Mapping) and r.get(field) not in (None, "", [], {}) for r in rows_like):
+                score += 10
+
+    status_out, error_out, meta_in = _extract_status_error(payload)
+
+    if _strip(status_out).lower() == "success":
+        score += 4
+    elif _strip(status_out).lower() == "partial":
+        score += 2
+    elif _strip(status_out).lower() == "warn":
+        score += 1
+    elif _strip(status_out).lower() == "error":
+        score -= 3
+
+    if isinstance(meta_in, dict) and meta_in.get("known_sheets"):
+        score += 1
+
+    if _strip(error_out):
+        score -= 6
+
+    return score
+
+
 def _payload(
     *,
     page: str,
@@ -868,6 +1199,8 @@ def _payload(
     meta_extra: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     rows_list = [dict(r) for r in rows]
+    hdrs = list(headers)
+    ks = list(keys)
     meta = {
         "duration_ms": round((time.time() - started_at) * 1000.0, 3),
         "mode": mode,
@@ -876,21 +1209,31 @@ def _payload(
     if meta_extra:
         meta.update(meta_extra)
 
-    return {
-        "status": status_out,
-        "page": page,
-        "route_family": route_family,
-        "headers": list(headers),
-        "keys": list(keys),
-        "rows": rows_list,
-        "rows_matrix": _rows_to_matrix(rows_list, keys) if include_matrix else None,
-        "data": rows_list,
-        "quotes": rows_list,
-        "error": error_out,
-        "version": ANALYSIS_SHEET_ROWS_VERSION,
-        "request_id": request_id,
-        "meta": meta,
-    }
+    return _json_safe(
+        {
+            "status": status_out,
+            "page": page,
+            "sheet": page,
+            "sheet_name": page,
+            "route_family": route_family,
+            "headers": hdrs,
+            "display_headers": hdrs,
+            "sheet_headers": hdrs,
+            "column_headers": hdrs,
+            "keys": ks,
+            "columns": ks,
+            "fields": ks,
+            "rows": rows_list,
+            "items": rows_list,
+            "rows_matrix": _rows_to_matrix(rows_list, ks) if include_matrix else [],
+            "data": rows_list,
+            "quotes": rows_list,
+            "error": error_out,
+            "version": ANALYSIS_SHEET_ROWS_VERSION,
+            "request_id": request_id,
+            "meta": meta,
+        }
+    )
 
 
 # =============================================================================
@@ -899,8 +1242,11 @@ def _payload(
 async def _get_engine(request: Request) -> Optional[Any]:
     try:
         st = getattr(request.app, "state", None)
-        if st and getattr(st, "engine", None):
-            return st.engine
+        if st:
+            for attr in ("engine", "data_engine", "quote_engine", "cache_engine"):
+                value = getattr(st, attr, None)
+                if value is not None:
+                    return value
     except Exception:
         pass
 
@@ -967,9 +1313,10 @@ async def _fetch_analysis_rows(
         preferred += ["get_enriched_quotes_batch"]
 
     preferred += [
-        "get_enriched_quotes",
         "get_quotes_batch",
         "quotes_batch",
+        "get_enriched_quotes",
+        "get_quotes",
     ]
 
     for method in preferred:
@@ -993,7 +1340,7 @@ async def _fetch_analysis_rows(
                 if _dict_is_symbol_map(res, symbols):
                     return res
 
-                data = res.get("data") or res.get("rows") or res.get("items")
+                data = res.get("data") or res.get("rows") or res.get("items") or res.get("quotes")
                 if isinstance(data, dict) and _dict_is_symbol_map(data, symbols):
                     return data
                 if isinstance(data, list):
@@ -1006,7 +1353,11 @@ async def _fetch_analysis_rows(
             continue
 
     out: Dict[str, Any] = {}
-    per_dict_fn = getattr(engine, "get_enriched_quote_dict", None) or getattr(engine, "get_analysis_row_dict", None)
+    per_dict_fn = (
+        getattr(engine, "get_enriched_quote_dict", None)
+        or getattr(engine, "get_analysis_row_dict", None)
+        or getattr(engine, "get_quote_dict", None)
+    )
     per_fn = (
         getattr(engine, "get_enriched_quote", None)
         or getattr(engine, "get_analysis_row", None)
@@ -1117,6 +1468,7 @@ async def _call_builder_best_effort(
                 "engine": engine,
                 "data_engine": engine,
                 "quote_engine": engine,
+                "cache_engine": engine,
                 "mode": mode,
                 "body": body,
                 "payload": body,
@@ -1221,7 +1573,6 @@ async def _call_builder_best_effort(
     if not rows and matrix:
         rows = _matrix_to_rows(matrix, schema_keys)
 
-    # if builder returned only symbols/tickers, enrich them using engine
     if not rows:
         selected_symbols = _extract_symbol_list_like(out)
         if selected_symbols and engine is not None:
@@ -1254,6 +1605,7 @@ async def _call_builder_best_effort(
     ]
     meta_out = dict(meta_out or {})
     meta_out["builder_function"] = chosen_name
+    meta_out["raw_payload_quality"] = _payload_quality_score(out, page=page)
     return normalized, status_out, error_out, meta_out
 
 
@@ -1299,10 +1651,27 @@ async def _call_core_sheet_rows_best_effort(
         candidates.append(core_get_sheet_rows)
 
     if engine is not None:
-        for name in ("get_sheet_rows", "sheet_rows", "build_sheet_rows", "get_page_rows", "get_rows"):
+        for name in (
+            "get_sheet_rows",
+            "sheet_rows",
+            "build_sheet_rows",
+            "execute_sheet_rows",
+            "run_sheet_rows",
+            "get_page_rows",
+            "get_rows",
+            "get_rows_for_sheet",
+            "get_rows_for_page",
+            "get_sheet",
+            "get_cached_sheet_rows",
+            "get_sheet_snapshot",
+            "get_cached_sheet_snapshot",
+        ):
             fn = getattr(engine, name, None)
             if callable(fn):
                 candidates.append(fn)
+
+    best_payload: Optional[Dict[str, Any]] = None
+    best_score = -9999
 
     for fn in candidates:
         call_specs = [
@@ -1321,15 +1690,17 @@ async def _call_core_sheet_rows_best_effort(
 
         try:
             res = await _call_function_flexible(fn, call_specs)
-            if isinstance(res, dict):
-                return res
-            if isinstance(res, list):
-                return {"status": "success", "rows": res}
-            return {"status": "success", "rows": []}
+            payload = res if isinstance(res, dict) else {"status": "success", "rows": res if isinstance(res, list) else []}
+            score = _payload_quality_score(payload, page=page)
+            if score > best_score:
+                best_score = score
+                best_payload = payload
+            if _payload_has_real_rows(payload):
+                return payload
         except Exception:
             continue
 
-    return None
+    return best_payload
 
 
 async def _call_enriched_page_best_effort(
@@ -1393,15 +1764,17 @@ async def analysis_sheet_rows_health(request: Request) -> Dict[str, Any]:
     except Exception:
         auth_summary = None
 
-    return {
-        "status": "ok",
-        "service": "analysis_sheet_rows",
-        "version": ANALYSIS_SHEET_ROWS_VERSION,
-        "schema_available": bool(get_sheet_spec is not None),
-        "allowed_pages_count": len(allowed_pages()) if callable(allowed_pages) else len(CANONICAL_PAGES),
-        "auth": auth_summary,
-        "path": str(getattr(getattr(request, "url", None), "path", "")),
-    }
+    return _json_safe(
+        {
+            "status": "ok",
+            "service": "analysis_sheet_rows",
+            "version": ANALYSIS_SHEET_ROWS_VERSION,
+            "schema_available": bool(get_sheet_spec is not None),
+            "allowed_pages_count": len(allowed_pages()) if callable(allowed_pages) else len(CANONICAL_PAGES),
+            "auth": auth_summary,
+            "path": str(getattr(getattr(request, "url", None), "path", "")),
+        }
+    )
 
 
 # =============================================================================
@@ -1435,9 +1808,6 @@ async def _analysis_sheet_rows_impl(
     except Exception:
         settings = None
 
-    # -------------------------------------------------------------------------
-    # Auth
-    # -------------------------------------------------------------------------
     auth_token = _extract_auth_token(
         token_query=token,
         x_app_token=x_app_token,
@@ -1454,9 +1824,6 @@ async def _analysis_sheet_rows_impl(
     ):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
-    # -------------------------------------------------------------------------
-    # Page resolution
-    # -------------------------------------------------------------------------
     merged_body = _merge_body_with_query(body, request)
 
     page_raw = _pick_page_from_body(merged_body) or "Market_Leaders"
@@ -1506,9 +1873,6 @@ async def _analysis_sheet_rows_impl(
 
     engine = await _get_engine(request)
 
-    # -------------------------------------------------------------------------
-    # Explicit special-page dispatch
-    # -------------------------------------------------------------------------
     if route_family == "insights":
         rows, status_out, error_out, meta_out = await _call_builder_best_effort(
             module_names=_INSIGHTS_MODULE_CANDIDATES,
@@ -1618,11 +1982,8 @@ async def _analysis_sheet_rows_impl(
             },
         )
 
-    # -------------------------------------------------------------------------
-    # Table mode for base source pages without explicit symbols
-    # -------------------------------------------------------------------------
     if not symbols and page in _BASE_SOURCE_PAGES:
-        payload = await _call_core_sheet_rows_best_effort(
+        payload_engine = await _call_core_sheet_rows_best_effort(
             engine=engine,
             page=page,
             limit=limit,
@@ -1630,82 +1991,100 @@ async def _analysis_sheet_rows_impl(
             mode=(mode or ""),
             body=merged_body,
         )
+        engine_score = _payload_quality_score(payload_engine, page=page)
 
-        # if analysis/core path fails or returns empty error payload, fallback to enriched
-        if payload is None or _payload_looks_hard_failure(payload):
-            rows2, status2, err2, meta2 = await _call_enriched_page_best_effort(
-                request=request,
-                settings=settings,
-                engine=engine,
-                page=page,
-                limit=limit,
-                offset=offset,
-                mode=(mode or ""),
-                body=merged_body,
-                schema_keys=keys,
-                schema_headers=headers,
-                schema=spec,
-            )
+        rows2, status2, err2, meta2 = await _call_enriched_page_best_effort(
+            request=request,
+            settings=settings,
+            engine=engine,
+            page=page,
+            limit=limit,
+            offset=offset,
+            mode=(mode or ""),
+            body=merged_body,
+            schema_keys=keys,
+            schema_headers=headers,
+            schema=spec,
+        )
+        payload_enriched = {
+            "status": status2,
+            "rows": rows2,
+            "meta": meta2,
+            "error": err2,
+            "headers": headers,
+            "keys": keys,
+        }
+        enriched_score = _payload_quality_score(payload_enriched, page=page)
 
-            rows2 = _slice(rows2, limit=limit, offset=offset)
+        use_engine = payload_engine is not None and not _payload_looks_hard_failure(payload_engine)
+        if use_engine and enriched_score > engine_score and rows2:
+            use_engine = False
+
+        if use_engine and payload_engine is not None:
+            raw_rows = _extract_rows_like(payload_engine)
+            matrix_rows = _extract_matrix_like(payload_engine)
+            payload_keys = _extract_keys_like(payload_engine) or keys
+            payload_headers = _extract_headers_like(payload_engine) or headers
+            payload_headers, payload_keys = _complete_schema_contract(payload_headers, payload_keys)
+
+            if not raw_rows and matrix_rows:
+                raw_rows = _matrix_to_rows(matrix_rows, payload_keys)
+
+            rows = [_normalize_to_schema_keys(schema_keys=keys, schema_headers=headers, raw=r) for r in raw_rows]
+            rows = _slice(rows, limit=limit, offset=offset)
+
+            status_out, err_out, meta_out = _extract_status_error(payload_engine)
 
             return _payload(
                 page=page,
                 route_family=route_family,
                 headers=headers,
                 keys=keys,
-                rows=rows2,
+                rows=rows,
                 include_matrix=include_matrix,
                 request_id=request_id,
                 started_at=start,
                 mode=mode,
-                status_out=status2 or ("success" if rows2 else "partial"),
-                error_out=err2,
+                status_out=status_out or ("success" if rows else "partial"),
+                error_out=err_out,
                 meta_extra={
                     "limit": limit,
                     "offset": offset,
-                    "dispatch": "enriched_fallback",
-                    "builder": "enriched_fallback",
+                    "dispatch": "core_or_engine_get_sheet_rows",
+                    "builder": "engine.get_sheet_rows",
                     "schema_source": "schema_registry",
-                    **meta2,
+                    "engine_payload_quality": engine_score,
+                    "enriched_payload_quality": enriched_score,
+                    **meta_out,
                 },
             )
 
-        raw_rows = _extract_rows_like(payload)
-        matrix_rows = _extract_matrix_like(payload)
-        if not raw_rows and matrix_rows:
-            raw_rows = _matrix_to_rows(matrix_rows, keys)
-
-        rows = [_normalize_to_schema_keys(schema_keys=keys, schema_headers=headers, raw=r) for r in raw_rows]
-        rows = _slice(rows, limit=limit, offset=offset)
-
-        status_out, err_out, meta_out = _extract_status_error(payload)
+        rows2 = _slice(rows2, limit=limit, offset=offset)
 
         return _payload(
             page=page,
             route_family=route_family,
             headers=headers,
             keys=keys,
-            rows=rows,
+            rows=rows2,
             include_matrix=include_matrix,
             request_id=request_id,
             started_at=start,
             mode=mode,
-            status_out=status_out or ("success" if rows else "partial"),
-            error_out=err_out,
+            status_out=status2 or ("success" if rows2 else "partial"),
+            error_out=err2,
             meta_extra={
                 "limit": limit,
                 "offset": offset,
-                "dispatch": "core_or_engine_get_sheet_rows",
-                "builder": "engine.get_sheet_rows",
+                "dispatch": "enriched_fallback",
+                "builder": "enriched_fallback",
                 "schema_source": "schema_registry",
-                **meta_out,
+                "engine_payload_quality": engine_score,
+                "enriched_payload_quality": enriched_score,
+                **meta2,
             },
         )
 
-    # -------------------------------------------------------------------------
-    # Generic non-instrument page without symbols
-    # -------------------------------------------------------------------------
     if not symbols and not is_instrument_page(page):
         return _payload(
             page=page,
@@ -1728,9 +2107,6 @@ async def _analysis_sheet_rows_impl(
             },
         )
 
-    # -------------------------------------------------------------------------
-    # Instrument mode (symbols provided OR non-base instrument page)
-    # -------------------------------------------------------------------------
     if not is_instrument_page(page):
         return _payload(
             page=page,
@@ -1751,7 +2127,6 @@ async def _analysis_sheet_rows_impl(
             },
         )
 
-    # if no symbols for non-base instrument page, degrade safely
     if not symbols:
         return _payload(
             page=page,
