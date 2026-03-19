@@ -2,22 +2,48 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v7.7.0)
+TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v7.8.0)
 ================================================================================
 ALIGNED • DEPLOYMENT-SAFE • PRE-MOUNT + STARTUP-VERIFY • ROUTER-SNAPSHOT-AWARE
 ENGINE-STATE-AWARE • OPENAPI-SAFE • RENDER-HEALTH-PROBE-SAFE • PRIORITY-MOUNTED
 ROOT-CONFIG-FIRST • CORE-CONFIG-COMPATIBLE • REQUEST-ID SAFE • STARTUP-HARDENED
 ORJSON-READY • PREEXISTING-ENGINE SAFE • ROUTE-VERIFY SAFE • DEBUG-HARDENED
 V1-HEALTH-ALIAS SAFE • V1-META-ALIAS SAFE • HEAD-PROBE SAFE
+CONTROLLED-ROUTE-OWNERSHIP • PARTIAL-DUPLICATE-BLOCK SAFE • FILTERED-MOUNT SAFE
 
-Why this revision (v7.7.0)
+Why this revision (v7.8.0)
 --------------------------
-- ✅ FIX: adds `/v1/health` so health coverage can reach 100%
-- ✅ FIX: adds `/v1/healthz`, `/v1/livez`, `/v1/readyz`, `/v1/meta`, `/v1/ping`
-- ✅ FIX: keeps HEAD probes stable for both root and `/v1/*` health/meta aliases
-- ✅ FIX: built-in meta path registry now includes `/v1/*` aliases for route-signature consistency
-- ✅ SAFE: preserves existing router-mount, engine-init, OpenAPI, auth, and shutdown behavior
-- ✅ SAFE: no route-family behavior changes for enriched / analysis / advisor / advanced
+- ✅ FIX: route mounting now uses a controlled internal priority plan by default
+        instead of blindly trusting a package-level bulk mounter that can
+        reintroduce duplicate route families.
+- ✅ FIX: partial route-family conflicts are prevented with per-module path
+        filtering, especially for:
+        - routes.advisor
+        - routes.investment_advisor
+        - routes.advanced_analysis
+        - routes.enriched_quote
+- ✅ FIX: duplicate detection is now route-signature aware at per-route level,
+        not only whole-router subset level.
+- ✅ FIX: canonical ownership is preserved:
+        - /v1/advisor/*           -> routes.advisor
+        - /v1/advanced/*          -> routes.investment_advisor
+        - /v1/schema/*, /schema/* -> routes.advanced_analysis
+        - /v1/analysis/*          -> routes.analysis_sheet_rows
+        - /v1/enriched*           -> routes.enriched_quote
+- ✅ FIX: advanced_analysis contributes only its non-conflicting special routes:
+        - /sheet-rows
+        - /v1/advanced/insights-analysis
+        - /v1/advanced/top10-investments
+        - /v1/advanced/insights-criteria
+        - /v1/schema/*
+        - /schema/*
+- ✅ FIX: enriched_quote legacy root `/sheet-rows` is blocked here so it cannot
+        override schema-driven root `/sheet-rows`.
+- ✅ FIX: startup route verification now records missing critical route families.
+- ✅ FIX: `/v1/health`, `/v1/healthz`, `/v1/livez`, `/v1/readyz`, `/v1/meta`,
+        `/v1/ping`, and HEAD probes remain stable.
+- ✅ SAFE: preserves existing engine-init, OpenAPI, auth, middleware, and
+        shutdown behavior.
 """
 
 from __future__ import annotations
@@ -31,7 +57,7 @@ import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
@@ -48,7 +74,7 @@ except Exception:
 # --------------------------------------------------------------------------------------
 # Version
 # --------------------------------------------------------------------------------------
-APP_ENTRY_VERSION = "7.7.0"
+APP_ENTRY_VERSION = "7.8.0"
 
 
 # --------------------------------------------------------------------------------------
@@ -292,7 +318,6 @@ def _settings_from_generic_object(s: Any, source: str) -> _SettingsView:
 
 
 def _load_settings() -> _SettingsView:
-    # 1) Root config.py (primary)
     try:
         cfg = importlib.import_module("config")
         getter = getattr(cfg, "get_settings_cached", None) or getattr(cfg, "get_settings", None)
@@ -301,7 +326,6 @@ def _load_settings() -> _SettingsView:
     except Exception:
         pass
 
-    # 2) env.py
     try:
         env_mod = importlib.import_module("env")
         getter = getattr(env_mod, "get_settings", None)
@@ -310,7 +334,6 @@ def _load_settings() -> _SettingsView:
     except Exception:
         pass
 
-    # 3) core.config (fallback compatibility)
     try:
         cfg = importlib.import_module("core.config")
         getter = getattr(cfg, "get_settings_cached", None) or getattr(cfg, "get_settings", None)
@@ -319,7 +342,6 @@ def _load_settings() -> _SettingsView:
     except Exception:
         pass
 
-    # 4) raw env vars
     return _SettingsView(
         APP_NAME=_env_str("APP_NAME", "Tadawul Fast Bridge"),
         APP_VERSION=_env_str("APP_VERSION", "dev"),
@@ -354,6 +376,9 @@ def _default_routes_snapshot() -> Dict[str, Any]:
         "mounted_count": 0,
         "duplicate_skips": [],
         "duplicate_skips_count": 0,
+        "partial_duplicate_skips": [],
+        "partial_duplicate_skips_count": 0,
+        "filtered_out_routes": {},
         "missing": [],
         "missing_count": 0,
         "import_errors": {},
@@ -526,37 +551,25 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
 # --------------------------------------------------------------------------------------
 # Router mounting helpers
 # --------------------------------------------------------------------------------------
+def _route_signature_pairs_from_route(route: Any) -> Set[Tuple[str, str]]:
+    path = str(getattr(route, "path", "") or "")
+    methods = getattr(route, "methods", None)
+
+    if isinstance(methods, (set, list, tuple)) and methods:
+        return {(path, str(m)) for m in methods}
+
+    route_kind = type(route).__name__.upper() or "ROUTE"
+    return {(path, route_kind)}
+
+
 def _app_route_signature_set(app: Any, *, include_builtin: bool = True) -> Set[Tuple[str, str]]:
     sigs: Set[Tuple[str, str]] = set()
     for r in getattr(app, "routes", []) or []:
         path = str(getattr(r, "path", "") or "")
         if not include_builtin and path in _BUILTIN_META_PATHS:
             continue
-        methods = getattr(r, "methods", None) or set()
-        if not isinstance(methods, (set, list, tuple)):
-            methods = set()
-        meth = ",".join(sorted(str(m) for m in methods))
-        sigs.add((path, meth))
+        sigs.update(_route_signature_pairs_from_route(r))
     return sigs
-
-
-def _router_route_signature_set(router: Any) -> Set[Tuple[str, str]]:
-    sigs: Set[Tuple[str, str]] = set()
-    for r in getattr(router, "routes", []) or []:
-        path = str(getattr(r, "path", "") or "")
-        methods = getattr(r, "methods", None) or set()
-        if not isinstance(methods, (set, list, tuple)):
-            methods = set()
-        meth = ",".join(sorted(str(m) for m in methods))
-        sigs.add((path, meth))
-    return sigs
-
-
-def _router_would_duplicate_existing(app: Any, router: Any) -> bool:
-    router_sigs = _router_route_signature_set(router)
-    if not router_sigs:
-        return False
-    return router_sigs.issubset(_app_route_signature_set(app))
 
 
 def _route_signature_count(app: Any, *, include_builtin: bool = True) -> int:
@@ -568,6 +581,20 @@ def _invalidate_openapi_cache(app: FastAPI) -> None:
         app.openapi_schema = None  # type: ignore[attr-defined]
     except Exception:
         pass
+
+
+def _router_route_signature_set(router: Any) -> Set[Tuple[str, str]]:
+    sigs: Set[Tuple[str, str]] = set()
+    for r in getattr(router, "routes", []) or []:
+        sigs.update(_route_signature_pairs_from_route(r))
+    return sigs
+
+
+def _router_would_duplicate_existing(app: Any, router: Any) -> bool:
+    router_sigs = _router_route_signature_set(router)
+    if not router_sigs:
+        return False
+    return router_sigs.issubset(_app_route_signature_set(app))
 
 
 def _normalize_routes_snapshot(
@@ -593,10 +620,12 @@ def _normalize_routes_snapshot(
 
     mounted = list(src.get("mounted", []) or [])
     duplicate_skips = list(src.get("duplicate_skips", []) or [])
+    partial_duplicate_skips = list(src.get("partial_duplicate_skips", []) or [])
     missing = list(src.get("missing", []) or [])
     import_errors = dict(src.get("import_errors", {}) or {})
     mount_errors = dict(src.get("mount_errors", {}) or {})
     no_router = dict(src.get("no_router", {}) or {})
+    filtered_out_routes = dict(src.get("filtered_out_routes", {}) or {})
     strict = bool(src.get("strict", _env_bool("ROUTES_STRICT_IMPORT", False)))
     strategy = str(src.get("strategy", used_strategy) or used_strategy)
 
@@ -624,6 +653,9 @@ def _normalize_routes_snapshot(
         "mounted_count": len(mounted),
         "duplicate_skips": duplicate_skips,
         "duplicate_skips_count": len(duplicate_skips),
+        "partial_duplicate_skips": partial_duplicate_skips,
+        "partial_duplicate_skips_count": len(partial_duplicate_skips),
+        "filtered_out_routes": filtered_out_routes,
         "missing": missing,
         "missing_count": len(missing),
         "import_errors": import_errors,
@@ -664,6 +696,8 @@ def _merge_snapshots(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]
     merged = {
         "mounted": _merge_list(old.get("mounted"), new.get("mounted")),
         "duplicate_skips": _merge_list(old.get("duplicate_skips"), new.get("duplicate_skips")),
+        "partial_duplicate_skips": _merge_list(old.get("partial_duplicate_skips"), new.get("partial_duplicate_skips")),
+        "filtered_out_routes": _merge_dict(old.get("filtered_out_routes"), new.get("filtered_out_routes")),
         "missing": _merge_list(old.get("missing"), new.get("missing")),
         "import_errors": _merge_dict(old.get("import_errors"), new.get("import_errors")),
         "mount_errors": _merge_dict(old.get("mount_errors"), new.get("mount_errors")),
@@ -681,6 +715,7 @@ def _merge_snapshots(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]
 
     merged["mounted_count"] = len(merged["mounted"])
     merged["duplicate_skips_count"] = len(merged["duplicate_skips"])
+    merged["partial_duplicate_skips_count"] = len(merged["partial_duplicate_skips"])
     merged["missing_count"] = len(merged["missing"])
     merged["failed_count"] = len(merged["import_errors"]) + len(merged["mount_errors"]) + len(merged["no_router"])
     merged["openapi_route_count_after_mount"] = int(
@@ -718,30 +753,163 @@ def _get_router_from_module(mod: Any) -> Tuple[Optional[Any], str]:
     return None, "none"
 
 
-def _mount_routes_fallback(app: FastAPI) -> Dict[str, Any]:
-    strict = _env_bool("ROUTES_STRICT_IMPORT", False)
+_MODULE_ROUTE_POLICIES: Dict[str, Dict[str, Sequence[str]]] = {
+    "routes.advisor": {
+        "allow_prefixes": ("/v1/advisor",),
+    },
+    "routes.investment_advisor": {
+        "allow_prefixes": ("/v1/advanced", "/v1/investment_advisor", "/v1/investment-advisor"),
+        "block_prefixes": ("/v1/advisor",),
+    },
+    "routes.advanced_analysis": {
+        "allow_prefixes": ("/v1/schema", "/schema"),
+        "allow_exact": (
+            "/sheet-rows",
+            "/v1/advanced/insights-analysis",
+            "/v1/advanced/top10-investments",
+            "/v1/advanced/insights-criteria",
+        ),
+    },
+    "routes.enriched_quote": {
+        "allow_prefixes": ("/v1/enriched", "/v1/enriched_quote", "/v1/enriched-quote"),
+        "allow_exact": ("/quote", "/quotes"),
+        "block_exact": ("/sheet-rows",),
+    },
+}
 
+
+def _path_allowed_for_module(module_name: str, path: str) -> bool:
+    policy = _MODULE_ROUTE_POLICIES.get(module_name)
+    if not policy:
+        return True
+
+    allow_prefixes = tuple(policy.get("allow_prefixes", ()) or ())
+    allow_exact = tuple(policy.get("allow_exact", ()) or ())
+    block_prefixes = tuple(policy.get("block_prefixes", ()) or ())
+    block_exact = tuple(policy.get("block_exact", ()) or ())
+
+    if path in block_exact:
+        return False
+    if any(path.startswith(prefix) for prefix in block_prefixes):
+        return False
+
+    if allow_exact or allow_prefixes:
+        if path in allow_exact:
+            return True
+        if any(path.startswith(prefix) for prefix in allow_prefixes):
+            return True
+        return False
+
+    return True
+
+
+def _append_router_routes_filtered(app: FastAPI, router_obj: Any, module_name: str) -> Dict[str, Any]:
+    existing = _app_route_signature_set(app, include_builtin=True)
+
+    added = 0
+    duplicate_skips = 0
+    partial_duplicate_skips = 0
+    filtered_out = 0
+
+    for route in list(getattr(router_obj, "routes", []) or []):
+        path = str(getattr(route, "path", "") or "")
+        if not _path_allowed_for_module(module_name, path):
+            filtered_out += 1
+            continue
+
+        sigs = _route_signature_pairs_from_route(route)
+        if not sigs:
+            continue
+
+        overlap = sigs & existing
+        if overlap == sigs:
+            duplicate_skips += 1
+            continue
+
+        if overlap:
+            partial_duplicate_skips += 1
+            logger.warning(
+                "Skipped partial-duplicate route while mounting %s: path=%s overlap=%s",
+                module_name,
+                path,
+                sorted(list(overlap)),
+            )
+            continue
+
+        app.router.routes.append(route)
+        existing.update(sigs)
+        added += 1
+
+    _invalidate_openapi_cache(app)
+    return {
+        "added": added,
+        "duplicate_skips": duplicate_skips,
+        "partial_duplicate_skips": partial_duplicate_skips,
+        "filtered_out": filtered_out,
+    }
+
+
+def _build_controlled_mount_plan() -> List[str]:
     plan = [
         "routes.config",
         "routes.data_dictionary",
         "routes.analysis_sheet_rows",
-        "routes.advanced_sheet_rows",
         "routes.advanced_analysis",
         "routes.ai_analysis",
         "routes.advisor",
         "routes.investment_advisor",
-        "routes.top10_investments",
         "routes.enriched_quote",
         "routes.routes_argaam",
     ]
 
+    extra_modules = _parse_csv(_env_str("EXTRA_ROUTE_MODULES", ""))
+    for mod_name in extra_modules:
+        if mod_name not in plan:
+            plan.append(mod_name)
+
+    return plan
+
+
+def _verify_required_route_families(app: FastAPI) -> List[str]:
+    all_paths = {str(getattr(r, "path", "") or "") for r in (getattr(app, "routes", []) or [])}
+
+    required_checks = {
+        "advisor": lambda paths: any(p.startswith("/v1/advisor") for p in paths),
+        "advanced": lambda paths: any(p.startswith("/v1/advanced") for p in paths),
+        "analysis": lambda paths: any(p.startswith("/v1/analysis") for p in paths),
+        "schema": lambda paths: any(p.startswith("/v1/schema") or p.startswith("/schema") for p in paths),
+        "enriched": lambda paths: any(
+            p.startswith("/v1/enriched") or p.startswith("/v1/enriched_quote") or p.startswith("/v1/enriched-quote")
+            for p in paths
+        ),
+        "root_health_alias": lambda paths: "/health" in paths and "/v1/health" in paths,
+        "root_meta_alias": lambda paths: "/meta" in paths and "/v1/meta" in paths,
+    }
+
+    missing: List[str] = []
+    for key, predicate in required_checks.items():
+        try:
+            if not bool(predicate(all_paths)):
+                missing.append(key)
+        except Exception:
+            missing.append(key)
+    return missing
+
+
+def _mount_routes_controlled(app: FastAPI) -> Dict[str, Any]:
+    strict = _env_bool("ROUTES_STRICT_IMPORT", False)
+    plan = _build_controlled_mount_plan()
+
     mounted: List[str] = []
     duplicate_skips: List[str] = []
+    partial_duplicate_skips: List[str] = []
     missing: List[str] = []
     import_errors: Dict[str, str] = {}
     mount_errors: Dict[str, str] = {}
     no_router: Dict[str, str] = {}
+    filtered_out_routes: Dict[str, int] = {}
     mount_modes: Dict[str, str] = {}
+    resolved_entries: List[Dict[str, Any]] = []
 
     for mod_name in plan:
         mod, exc = _import_router_module(mod_name)
@@ -757,19 +925,50 @@ def _mount_routes_fallback(app: FastAPI) -> Dict[str, Any]:
 
         try:
             if router_obj is not None:
-                if _router_would_duplicate_existing(app, router_obj):
-                    duplicate_skips.append(mod_name)
-                    mount_modes[mod_name] = "duplicate_skip"
-                    continue
-                app.include_router(router_obj)
-                mounted.append(mod_name)
-                mount_modes[mod_name] = source
+                stats = _append_router_routes_filtered(app, router_obj, mod_name)
+                filtered_out_routes[mod_name] = int(stats.get("filtered_out", 0))
+
+                if int(stats.get("added", 0)) > 0:
+                    mounted.append(mod_name)
+                    mount_modes[mod_name] = f"filtered_router:{source}"
+                else:
+                    if int(stats.get("duplicate_skips", 0)) > 0:
+                        duplicate_skips.append(mod_name)
+                    if int(stats.get("partial_duplicate_skips", 0)) > 0:
+                        partial_duplicate_skips.append(mod_name)
+                    if int(stats.get("filtered_out", 0)) > 0 and int(stats.get("duplicate_skips", 0)) == 0 and int(stats.get("partial_duplicate_skips", 0)) == 0:
+                        no_router[mod_name] = "All routes filtered by controlled ownership policy"
+                    elif int(stats.get("duplicate_skips", 0)) > 0 or int(stats.get("partial_duplicate_skips", 0)) > 0:
+                        mount_modes[mod_name] = "filtered_duplicate_skip"
+                    else:
+                        no_router[mod_name] = "Router present but no eligible routes were mounted"
+
+                resolved_entries.append(
+                    {
+                        "module": mod_name,
+                        "router_source": source,
+                        "added_routes": int(stats.get("added", 0)),
+                        "filtered_out_routes": int(stats.get("filtered_out", 0)),
+                        "duplicate_skips": int(stats.get("duplicate_skips", 0)),
+                        "partial_duplicate_skips": int(stats.get("partial_duplicate_skips", 0)),
+                    }
+                )
                 continue
 
             if callable(mount_fn):
                 mount_fn(app)
                 mounted.append(mod_name)
                 mount_modes[mod_name] = "mount_fn"
+                resolved_entries.append(
+                    {
+                        "module": mod_name,
+                        "router_source": "mount_fn",
+                        "added_routes": None,
+                        "filtered_out_routes": 0,
+                        "duplicate_skips": 0,
+                        "partial_duplicate_skips": 0,
+                    }
+                )
                 continue
 
             no_router[mod_name] = "No router export and no mount(app) function found"
@@ -778,17 +977,23 @@ def _mount_routes_fallback(app: FastAPI) -> Dict[str, Any]:
             if strict:
                 raise
 
+    missing_required_keys = _verify_required_route_families(app)
+
     snap = {
         "mounted": mounted,
         "duplicate_skips": duplicate_skips,
+        "partial_duplicate_skips": partial_duplicate_skips,
+        "filtered_out_routes": filtered_out_routes,
         "missing": missing,
         "import_errors": import_errors,
         "mount_errors": mount_errors,
         "no_router": no_router,
         "strict": strict,
-        "strategy": "main.fallback_plan",
+        "strategy": "main.controlled_priority_plan",
         "plan": plan,
         "mount_modes": mount_modes,
+        "resolved_entries": resolved_entries,
+        "missing_required_keys": missing_required_keys,
         "openapi_route_count_after_mount": len(getattr(app, "routes", []) or []),
         "route_signature_count_after_mount": _route_signature_count(app, include_builtin=True),
     }
@@ -797,43 +1002,48 @@ def _mount_routes_fallback(app: FastAPI) -> Dict[str, Any]:
 
 
 def _mount_routes(app: FastAPI) -> Dict[str, Any]:
+    use_package_mounter = _env_bool("USE_PACKAGE_ROUTE_MOUNTER", False)
     strict = _env_bool("ROUTES_STRICT_IMPORT", False)
 
-    try:
-        routes_pkg = importlib.import_module("routes")
-        for fn_name in ("mount_all_routers", "mount_all", "mount_routers", "mount_routes", "mount_all_routes"):
-            fn = getattr(routes_pkg, fn_name, None)
-            if callable(fn):
-                used_strategy = f"routes.{fn_name}"
-                try:
-                    ret = fn(app)  # type: ignore[misc]
-                    snap = _normalize_routes_snapshot(ret, used_strategy=used_strategy, app=app)
-                    snap["openapi_route_count_after_mount"] = len(getattr(app, "routes", []) or [])
-                    snap["route_signature_count_after_mount"] = _route_signature_count(app, include_builtin=True)
-                    _invalidate_openapi_cache(app)
-                    logger.info(
-                        "Routes mount summary: mounted=%s duplicate_skips=%s missing=%s failed=%s strategy=%s",
-                        snap["mounted_count"],
-                        snap["duplicate_skips_count"],
-                        snap["missing_count"],
-                        snap["failed_count"],
-                        snap["strategy"],
-                    )
-                    return snap
-                except Exception as e:
-                    logger.warning("%s(app) failed; falling back to internal plan. err=%s", used_strategy, _err_to_str(e))
-                    if strict:
-                        raise
-                break
-    except Exception:
-        pass
+    if use_package_mounter:
+        try:
+            routes_pkg = importlib.import_module("routes")
+            for fn_name in ("mount_all_routers", "mount_all", "mount_routers", "mount_routes", "mount_all_routes"):
+                fn = getattr(routes_pkg, fn_name, None)
+                if callable(fn):
+                    used_strategy = f"routes.{fn_name}"
+                    try:
+                        ret = fn(app)  # type: ignore[misc]
+                        snap = _normalize_routes_snapshot(ret, used_strategy=used_strategy, app=app)
+                        snap["missing_required_keys"] = _verify_required_route_families(app)
+                        snap["openapi_route_count_after_mount"] = len(getattr(app, "routes", []) or [])
+                        snap["route_signature_count_after_mount"] = _route_signature_count(app, include_builtin=True)
+                        _invalidate_openapi_cache(app)
+                        logger.info(
+                            "Routes mount summary: mounted=%s duplicate_skips=%s partial_duplicate_skips=%s missing=%s failed=%s strategy=%s",
+                            snap["mounted_count"],
+                            snap["duplicate_skips_count"],
+                            snap["partial_duplicate_skips_count"],
+                            snap["missing_count"],
+                            snap["failed_count"],
+                            snap["strategy"],
+                        )
+                        return snap
+                    except Exception as e:
+                        logger.warning("%s(app) failed; falling back to controlled plan. err=%s", used_strategy, _err_to_str(e))
+                        if strict:
+                            raise
+                    break
+        except Exception:
+            pass
 
-    snap = _mount_routes_fallback(app)
-    snap = _normalize_routes_snapshot(snap, used_strategy="main.fallback_plan", app=app)
+    snap = _mount_routes_controlled(app)
+    snap = _normalize_routes_snapshot(snap, used_strategy="main.controlled_priority_plan", app=app)
     logger.info(
-        "Routes mount summary: mounted=%s duplicate_skips=%s missing=%s failed=%s strategy=%s",
+        "Routes mount summary: mounted=%s duplicate_skips=%s partial_duplicate_skips=%s missing=%s failed=%s strategy=%s",
         snap["mounted_count"],
         snap["duplicate_skips_count"],
+        snap["partial_duplicate_skips_count"],
         snap["missing_count"],
         snap["failed_count"],
         snap["strategy"],
@@ -863,6 +1073,9 @@ def _should_reverify_prestart_snapshot(app: FastAPI, snap: Dict[str, Any]) -> bo
         return True
 
     return False
+
+
+def _mount_routes_once(app: FastAPI, phase: str) -> Dict False
 
 
 def _mount_routes_once(app: FastAPI, phase: str) -> Dict[str, Any]:
@@ -935,11 +1148,9 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
 
     mounted_count = int(snap.get("mounted_count", len(snap.get("mounted", []) or [])) or 0)
     duplicate_skips_count = int(snap.get("duplicate_skips_count", len(snap.get("duplicate_skips", []) or [])) or 0)
+    partial_duplicate_skips_count = int(snap.get("partial_duplicate_skips_count", len(snap.get("partial_duplicate_skips", []) or [])) or 0)
     failed_count = int(
-        snap.get(
-            "failed_count",
-            len(snap.get("import_errors", {}) or {}) + len(snap.get("mount_errors", {}) or {}) + len(snap.get("no_router", {}) or {}),
-        ) or 0
+        snap.get("failed_count", len(snap.get("import_errors", {}) or {}) + len(snap.get("mount_errors", {}) or {}) + len(snap.get("no_router", {}) or {})) or 0
     )
     strategy = str(snap.get("strategy", "") or "")
     route_signature_count = int(
@@ -958,9 +1169,11 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
         "routes_mount_phase": routes_mount_phase,
         "routes_mounted_count": mounted_count,
         "routes_duplicate_skips_count": duplicate_skips_count,
+        "routes_partial_duplicate_skips_count": partial_duplicate_skips_count,
         "routes_failed_count": failed_count,
         "routes_strategy": strategy,
         "route_signature_count": route_signature_count,
+        "missing_required_keys": list(snap.get("missing_required_keys", []) or []),
         "engine_present": engine_obj is not None,
         "engine_ready": engine_obj is not None and not engine_init_error,
         "engine_source": engine_source,
@@ -1110,13 +1323,22 @@ def create_app() -> FastAPI:
         try:
             snap = _mount_routes_once(app, phase="startup")
             logger.info(
-                "Routes verified at startup: mounted=%s duplicate_skips=%s missing=%s failed=%s strategy=%s",
+                "Routes verified at startup: mounted=%s duplicate_skips=%s partial_duplicate_skips=%s missing=%s failed=%s strategy=%s",
                 snap.get("mounted_count", 0),
                 snap.get("duplicate_skips_count", 0),
+                snap.get("partial_duplicate_skips_count", 0),
                 snap.get("missing_count", 0),
                 snap.get("failed_count", 0),
                 snap.get("strategy", ""),
             )
+            missing_required = list(snap.get("missing_required_keys", []) or [])
+            if missing_required:
+                warning = f"missing_required_route_families: {', '.join(missing_required)}"
+                logger.warning(warning)
+                try:
+                    app.state.startup_warnings.append(warning)
+                except Exception:
+                    pass
         except Exception as e:
             msg = f"Route mounting crashed during startup: {_err_to_str(e)}"
             logger.error(msg, exc_info=True)
@@ -1196,9 +1418,10 @@ def create_app() -> FastAPI:
     try:
         snap = _mount_routes_once(app, phase="prestart")
         logger.info(
-            "Routes mounted at app creation: mounted=%s duplicate_skips=%s missing=%s failed=%s strategy=%s",
+            "Routes mounted at app creation: mounted=%s duplicate_skips=%s partial_duplicate_skips=%s missing=%s failed=%s strategy=%s",
             snap.get("mounted_count", 0),
             snap.get("duplicate_skips_count", 0),
+            snap.get("partial_duplicate_skips_count", 0),
             snap.get("missing_count", 0),
             snap.get("failed_count", 0),
             snap.get("strategy", ""),
@@ -1218,7 +1441,7 @@ def create_app() -> FastAPI:
             return JSONResponse(status_code=401, content={"status": "error", "error": "unauthorized"})
 
         route_paths = sorted({str(getattr(r, "path", "") or "") for r in (getattr(request.app, "routes", []) or [])})
-        route_sigs = sorted([f"{path} [{methods}]" for path, methods in _app_route_signature_set(request.app, include_builtin=True)])
+        route_sigs = sorted([f"{path} [{method}]" for path, method in _app_route_signature_set(request.app, include_builtin=True)])
 
         return {
             "status": "ok",
