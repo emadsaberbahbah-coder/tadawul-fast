@@ -2,28 +2,33 @@
 # routes/advisor.py
 """
 ================================================================================
-ADVISOR ROUTER — v6.0.0
+ADVISOR ROUTER — v6.1.0
 (ENGINE-NATIVE-SHEET-ROWS / UNIFIED-RUNNER / STATUS-PRESERVING /
- SHARED-RESOLVER / AUTH-TOLERANT / SCHEMA-KEY-CORRECT)
+ SHARED-PIPELINE / AUTH-TOLERANT / SCHEMA-KEY-CORRECT / SPECIAL-PAGE SAFE)
 ================================================================================
 
 What this revision fixes
 ------------------------
-- ✅ FIX: /v1/advisor/sheet-rows now prefers native engine execution first via:
+- ✅ FIX: /v1/advisor/sheet-rows prefers native engine execution first via:
          - get_sheet_rows(...)
          - sheet_rows(...)
          - build_sheet_rows(...)
          - get_page_rows(...)
          - get_sheet(...)
+         - get_cached_sheet_rows(...)
+         - get_sheet_snapshot(...)
+         - get_cached_sheet_snapshot(...)
 - ✅ FIX: advisor runner resolution is hardened across:
          - app.state
          - engine/service instances
          - multiple core modules
          - factory-returned service objects
-         - optional shared resolver from routes.investment_advisor
-- ✅ FIX: if native sheet-rows succeeds, its status/meta/contract are preserved.
-- ✅ FIX: if native sheet-rows is unavailable, fallback goes through the advisor
-         runner and then projects correctly to schema KEYS (not display headers).
+         - optional shared helpers from routes.investment_advisor
+- ✅ FIX: if native sheet-rows succeeds, its status/meta/contract are preserved,
+         while only missing stable fields are supplemented.
+- ✅ FIX: if native sheet-rows is unavailable, fallback goes through the shared
+         page pipeline when available, then the advisor runner, and finally
+         projects correctly to schema KEYS (not display headers).
 - ✅ FIX: page/sheet/sheet_name targeting is normalized consistently.
 - ✅ FIX: page-specific recommendation calls honor page when sources were not
          explicitly narrowed.
@@ -33,6 +38,7 @@ What this revision fixes
          - native engine sheet-row methods
          - engine health when available
 - ✅ FIX: auth_ok(...) is called tolerantly across multiple possible signatures.
+- ✅ FIX: schema_only / headers_only short-circuit safely for sheet-rows.
 - ✅ SAFE: no network calls at import time.
 ================================================================================
 """
@@ -45,7 +51,8 @@ import inspect
 import logging
 import math
 import os
-from datetime import datetime, timezone
+from datetime import date, datetime, time as dt_time, timezone
+from decimal import Decimal
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, Response, status
@@ -55,7 +62,7 @@ router = APIRouter(prefix="/v1/advisor", tags=["advisor"])
 logger = logging.getLogger("routes.advisor")
 logger.addHandler(logging.NullHandler())
 
-ADVISOR_ROUTE_VERSION = "6.0.0"
+ADVISOR_ROUTE_VERSION = "6.1.0"
 TOP10_PAGE_NAME = "Top_10_Investments"
 
 _BASE_SOURCE_PAGES = [
@@ -150,21 +157,7 @@ _STATE_RUNNER_ATTRS = (
     "advisor_engine",
 )
 
-_SCHEMA_MODULE_CANDIDATES = (
-    "core.sheets.schema_registry",
-    "core.schema_registry",
-    "core.page_catalog",
-    "core.schemas",
-    "core.schema",
-)
-
-_SCHEMA_FN_CANDIDATES = (
-    "get_sheet_spec",
-    "get_page_spec",
-    "get_schema_for_page",
-    "build_sheet_spec",
-    "sheet_spec",
-)
+_TOP10_REQUIRED_FIELDS = ("top10_rank", "selection_reason", "criteria_snapshot")
 
 # ---------------------------------------------------------------------------
 # Optional Prometheus (safe)
@@ -208,7 +201,7 @@ def _clean_str(v: Any) -> str:
         return ""
     if not s:
         return ""
-    if s.lower() in {"none", "null", "nil"}:
+    if s.lower() in {"none", "null", "nil", "undefined"}:
         return ""
     return s
 
@@ -285,94 +278,34 @@ def _dedupe_keep_order(values: Iterable[Any]) -> List[str]:
     return out
 
 
-def _model_to_dict(obj: Any) -> Dict[str, Any]:
-    if obj is None:
-        return {}
-    if isinstance(obj, dict):
-        return dict(obj)
-    if isinstance(obj, Mapping):
-        try:
-            return dict(obj)
-        except Exception:
-            return {}
-
+def _safe_int(v: Any, default: int) -> int:
     try:
-        if hasattr(obj, "model_dump") and callable(getattr(obj, "model_dump")):
-            dumped = obj.model_dump(mode="python")
-            if isinstance(dumped, dict):
-                return dumped
+        if v is None or isinstance(v, bool):
+            return default
+        return int(float(v))
     except Exception:
-        pass
+        return default
 
+
+def _safe_float(v: Any, default: Optional[float] = None) -> Optional[float]:
     try:
-        if hasattr(obj, "dict") and callable(getattr(obj, "dict")):
-            dumped = obj.dict()
-            if isinstance(dumped, dict):
-                return dumped
+        if v is None or isinstance(v, bool):
+            return default
+        f = float(v)
+        if math.isnan(f) or math.isinf(f):
+            return default
+        return f
     except Exception:
-        pass
-
-    try:
-        if hasattr(obj, "__dict__"):
-            d = vars(obj)
-            if isinstance(d, dict):
-                return dict(d)
-    except Exception:
-        pass
-
-    return {"result": obj}
+        return default
 
 
-def _json_safe(value: Any) -> Any:
-    if value is None:
+def _as_ratio(v: Any) -> Optional[float]:
+    f = _safe_float(v, None)
+    if f is None:
         return None
-
-    if isinstance(value, (bool, int, str)):
-        return value
-
-    if isinstance(value, float):
-        if value != value or value in (float("inf"), float("-inf")):
-            return None
-        return value
-
-    if isinstance(value, Mapping):
-        return {str(k): _json_safe(v) for k, v in value.items()}
-
-    if isinstance(value, (list, tuple, set)):
-        return [_json_safe(v) for v in value]
-
-    try:
-        if hasattr(value, "model_dump") and callable(getattr(value, "model_dump")):
-            return _json_safe(value.model_dump(mode="python"))
-    except Exception:
-        pass
-
-    try:
-        if hasattr(value, "dict") and callable(getattr(value, "dict")):
-            return _json_safe(value.dict())
-    except Exception:
-        pass
-
-    try:
-        if hasattr(value, "__dict__"):
-            return _json_safe(vars(value))
-    except Exception:
-        pass
-
-    try:
-        return str(value)
-    except Exception:
-        return None
-
-
-async def _call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-    if inspect.iscoroutinefunction(fn):
-        return await fn(*args, **kwargs)
-
-    out = await asyncio.to_thread(fn, *args, **kwargs)
-    if inspect.isawaitable(out):
-        return await out
-    return out
+    if abs(f) > 1.5:
+        return f / 100.0
+    return f
 
 
 def _snake_like(header: str) -> str:
@@ -404,6 +337,19 @@ def _route_family_for_page(page: str) -> str:
     if p in _BASE_SOURCE_PAGES:
         return "sheet"
     return "advisor"
+
+
+def _normalize_symbol(sym: Any) -> str:
+    s = _clean_str(sym).upper().replace(" ", "")
+    if not s:
+        return ""
+    if s.startswith("TADAWUL:"):
+        s = s.split(":", 1)[1]
+    if s.endswith(".SA"):
+        s = s[:-3] + ".SR"
+    if s.isdigit():
+        return f"{s}.SR"
+    return s
 
 
 def _normalize_page_name(raw: Any) -> str:
@@ -475,6 +421,125 @@ def _complete_headers_keys(headers: Sequence[Any], keys: Sequence[Any]) -> Tuple
         out_k.append(k)
 
     return out_h, out_k
+
+
+def _ensure_top10_fields(headers: Sequence[Any], keys: Sequence[Any]) -> Tuple[List[str], List[str]]:
+    hdrs, ks = _complete_headers_keys(headers, keys)
+    extras = {
+        "top10_rank": "Top10 Rank",
+        "selection_reason": "Selection Reason",
+        "criteria_snapshot": "Criteria Snapshot",
+    }
+    for k, h in extras.items():
+        if k not in ks:
+            ks.append(k)
+            hdrs.append(h)
+    return hdrs, ks
+
+
+def _json_safe(value: Any) -> Any:
+    if value is None:
+        return None
+
+    if isinstance(value, (bool, int, str)):
+        return value
+
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            return None
+        return value
+
+    if isinstance(value, Decimal):
+        try:
+            f = float(value)
+            if f != f or f in (float("inf"), float("-inf")):
+                return None
+            return f
+        except Exception:
+            return str(value)
+
+    if isinstance(value, (datetime, date, dt_time)):
+        try:
+            return value.isoformat()
+        except Exception:
+            return str(value)
+
+    if isinstance(value, Mapping):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+
+    try:
+        if hasattr(value, "model_dump") and callable(getattr(value, "model_dump")):
+            return _json_safe(value.model_dump(mode="python"))
+    except Exception:
+        pass
+
+    try:
+        if hasattr(value, "dict") and callable(getattr(value, "dict")):
+            return _json_safe(value.dict())
+    except Exception:
+        pass
+
+    try:
+        if hasattr(value, "__dict__"):
+            return _json_safe(vars(value))
+    except Exception:
+        pass
+
+    try:
+        return str(value)
+    except Exception:
+        return None
+
+
+def _model_to_dict(obj: Any) -> Dict[str, Any]:
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return dict(obj)
+    if isinstance(obj, Mapping):
+        try:
+            return dict(obj)
+        except Exception:
+            return {}
+
+    try:
+        if hasattr(obj, "model_dump") and callable(getattr(obj, "model_dump")):
+            dumped = obj.model_dump(mode="python")
+            if isinstance(dumped, dict):
+                return dumped
+    except Exception:
+        pass
+
+    try:
+        if hasattr(obj, "dict") and callable(getattr(obj, "dict")):
+            dumped = obj.dict()
+            if isinstance(dumped, dict):
+                return dumped
+    except Exception:
+        pass
+
+    try:
+        if hasattr(obj, "__dict__"):
+            d = vars(obj)
+            if isinstance(d, dict):
+                return dict(d)
+    except Exception:
+        pass
+
+    return {"result": obj}
+
+
+async def _call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    if inspect.iscoroutinefunction(fn):
+        return await fn(*args, **kwargs)
+
+    out = await asyncio.to_thread(fn, *args, **kwargs)
+    if inspect.isawaitable(out):
+        return await out
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -743,7 +808,7 @@ def _normalize_payload_keys(payload: Dict[str, Any]) -> Dict[str, Any]:
             p.pop(k, None)
 
     if "tickers" in p:
-        p["tickers"] = _dedupe_keep_order(_list_from_any(p.get("tickers")))
+        p["tickers"] = [_normalize_symbol(x) for x in _dedupe_keep_order(_list_from_any(p.get("tickers"))) if _normalize_symbol(x)]
 
     risk_level = _clean_str(p.get("risk_level"))
     risk_profile = _clean_str(p.get("risk_profile"))
@@ -895,23 +960,24 @@ async def _resolve_runner_via_shared_route(
         if mod is None:
             continue
 
-        resolver = getattr(mod, "_resolve_advisor_runner", None)
-        if callable(resolver):
-            attempts = [
-                {"request": request, "engine": engine},
-                {"request": request},
-            ]
-            for kwargs in attempts:
-                try:
-                    out = await _call_maybe_async(resolver, **kwargs)
-                    if isinstance(out, tuple) and len(out) >= 2 and callable(out[0]):
-                        source = str(out[1]) if len(out) > 1 else mod_name
-                        name = str(out[2]) if len(out) > 2 else getattr(out[0], "__name__", "runner")
-                        return out[0], source, name
-                except TypeError:
-                    continue
-                except Exception:
-                    continue
+        for helper_name in ("_resolve_advisor_runner", "_resolve_runner"):
+            resolver = getattr(mod, helper_name, None)
+            if callable(resolver):
+                attempts = [
+                    {"request": request, "engine": engine},
+                    {"request": request},
+                ]
+                for kwargs in attempts:
+                    try:
+                        out = await _call_maybe_async(resolver, **kwargs)
+                        if isinstance(out, tuple) and len(out) >= 2 and callable(out[0]):
+                            source = str(out[1]) if len(out) > 1 else mod_name
+                            name = str(out[2]) if len(out) > 2 else getattr(out[0], "__name__", "runner")
+                            return out[0], source, name
+                    except TypeError:
+                        continue
+                    except Exception:
+                        continue
     return None
 
 
@@ -966,6 +1032,55 @@ async def _resolve_advisor_runner(request: Request, engine: Any = None) -> Tuple
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         detail="Advisor engine runner not found",
     )
+
+
+# ---------------------------------------------------------------------------
+# Shared page pipeline helpers
+# ---------------------------------------------------------------------------
+def _result_count(result: Mapping[str, Any]) -> int:
+    if not isinstance(result, Mapping):
+        return 0
+    for key in ("items", "rows", "data", "quotes", "rows_matrix"):
+        value = result.get(key)
+        if isinstance(value, list):
+            return len(value)
+    return 0
+
+
+async def _run_shared_page_pipeline(
+    *,
+    request: Request,
+    payload: Dict[str, Any],
+    page: str,
+    engine: Any,
+    timeout_sec: float,
+) -> Optional[Dict[str, Any]]:
+    for mod_name in _SHARED_ROUTE_MODULES:
+        mod, _ = _module_import_ok(mod_name)
+        if mod is None:
+            continue
+
+        fn = getattr(mod, "_run_page_pipeline", None)
+        if not callable(fn):
+            continue
+
+        attempts = [
+            {"page": page, "payload": payload, "request": request, "engine": engine, "timeout_sec": timeout_sec},
+            {"page": page, "payload": payload, "request": request, "engine": engine},
+        ]
+        for kwargs in attempts:
+            try:
+                out = await _call_maybe_async(fn, **kwargs)
+                if isinstance(out, dict):
+                    return dict(out)
+                d = _model_to_dict(out)
+                if d:
+                    return d
+            except TypeError:
+                continue
+            except Exception:
+                continue
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1123,43 +1238,6 @@ async def _call_advisor_runner(
     raise HTTPException(status_code=500, detail="Advisor engine returned invalid response")
 
 
-async def _run_shared_advisor_if_possible(
-    request: Request,
-    payload: Dict[str, Any],
-    *,
-    engine: Any,
-    timeout_sec: float,
-) -> Optional[Dict[str, Any]]:
-    for mod_name in _SHARED_ROUTE_MODULES:
-        mod, _ = _module_import_ok(mod_name)
-        if mod is None:
-            continue
-
-        fn = getattr(mod, "_run_core_advisor", None)
-        if not callable(fn):
-            continue
-
-        attempts = [
-            {"request": request, "payload": payload, "engine": engine, "timeout_sec": timeout_sec},
-            {"payload": payload, "engine": engine, "timeout_sec": timeout_sec},
-        ]
-
-        for kwargs in attempts:
-            try:
-                out = await _call_maybe_async(fn, **kwargs)
-                if isinstance(out, dict):
-                    return dict(out)
-                d = _model_to_dict(out)
-                if d:
-                    return d
-            except TypeError:
-                continue
-            except Exception:
-                continue
-
-    return None
-
-
 async def _run_advisor(
     *,
     request: Request,
@@ -1171,19 +1249,28 @@ async def _run_advisor(
     debug: bool,
 ) -> Dict[str, Any]:
     request_id = _get_request_id(request)
-
     engine = await _get_engine(request)
     if engine is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Data engine unavailable")
 
     payload0 = _normalize_payload_keys(payload or {})
     payload2 = _force_default_live_mode(payload0, mode_override=mode)
+    target_page = _normalize_target_page(
+        page=payload2.get("page"),
+        sheet=payload2.get("sheet"),
+        sheet_name=payload2.get("sheet_name"),
+        default="Market_Leaders",
+    )
+    payload2["page"] = target_page
+    payload2["sheet"] = target_page
+    payload2["sheet_name"] = target_page
 
     timeout_sec = max(5.0, min(180.0, float(os.getenv("ADVISOR_ROUTE_TIMEOUT_SEC", "75") or "75")))
 
-    shared = await _run_shared_advisor_if_possible(
-        request,
-        payload2,
+    shared = await _run_shared_page_pipeline(
+        request=request,
+        payload=payload2,
+        page=target_page,
         engine=engine,
         timeout_sec=timeout_sec,
     )
@@ -1200,7 +1287,7 @@ async def _run_advisor(
                 "warm_snapshots": bool(warm_snapshots),
                 "cache_strategy": _clean_str(cache_strategy).lower() or "memory",
                 "cache_ttl": int(cache_ttl),
-                "shared_runner_used": True,
+                "shared_pipeline_used": True,
             }
         )
         result.setdefault("status", "success")
@@ -1291,7 +1378,7 @@ async def _run_advisor(
             "cache_ttl": int(cache_ttl),
             "runner_source": runner_source,
             "runner_name": runner_name,
-            "shared_runner_used": False,
+            "shared_pipeline_used": False,
         }
     )
 
@@ -1305,85 +1392,24 @@ async def _run_advisor(
 # ---------------------------------------------------------------------------
 # Schema + projection helpers
 # ---------------------------------------------------------------------------
-def _extract_headers_keys_from_spec(spec: Any) -> Tuple[List[str], List[str]]:
-    headers: List[str] = []
-    keys: List[str] = []
-
-    raw_columns = None
-    if isinstance(spec, dict):
-        raw_columns = spec.get("columns") or spec.get("fields")
-        if not raw_columns:
-            maybe_keys = spec.get("keys") or []
-            maybe_headers = spec.get("headers") or spec.get("display_headers") or []
-            if isinstance(maybe_keys, list):
-                keys = [_clean_str(x) for x in maybe_keys if _clean_str(x)]
-                if isinstance(maybe_headers, list):
-                    headers = [_clean_str(x) for x in maybe_headers if _clean_str(x)]
-                if keys and not headers:
-                    headers = [k.replace("_", " ").title() for k in keys]
-                return headers, keys
-    else:
-        raw_columns = getattr(spec, "columns", None) or getattr(spec, "fields", None)
-
-    if isinstance(raw_columns, list):
-        for col in raw_columns:
-            if isinstance(col, dict):
-                key = _clean_str(col.get("key") or col.get("field") or col.get("name") or col.get("id"))
-                header = _clean_str(col.get("header") or col.get("title") or col.get("label") or key)
-            else:
-                key = _clean_str(
-                    getattr(col, "key", None)
-                    or getattr(col, "field", None)
-                    or getattr(col, "name", None)
-                    or getattr(col, "id", None)
-                )
-                header = _clean_str(
-                    getattr(col, "header", None)
-                    or getattr(col, "title", None)
-                    or getattr(col, "label", None)
-                    or key
-                )
-
-            if key:
-                keys.append(key)
-                headers.append(header or key)
-
-    return headers, keys
-
-
 async def _get_schema_layout(page: str) -> Tuple[List[str], List[str]]:
     page = _normalize_page_name(page)
 
-    for mod_name in _SCHEMA_MODULE_CANDIDATES:
-        mod, _ = _module_import_ok(mod_name)
-        if mod is None:
-            continue
+    try:
+        from core.sheets.schema_registry import get_sheet_spec  # type: ignore
 
-        for fn_name in _SCHEMA_FN_CANDIDATES:
-            fn = getattr(mod, fn_name, None)
-            if not callable(fn):
-                continue
+        spec = get_sheet_spec(page)
+        headers, keys = _extract_headers_keys_from_spec(spec)
+        headers, keys = _complete_headers_keys(headers, keys)
+        if page == TOP10_PAGE_NAME:
+            headers, keys = _ensure_top10_fields(headers, keys)
+        if headers or keys:
+            return headers, keys
+    except Exception:
+        pass
 
-            attempts = [
-                {"sheet": page},
-                {"page": page},
-                {"sheet_name": page},
-                {"name": page},
-            ]
-            for kwargs in attempts:
-                try:
-                    spec = await _call_maybe_async(fn, **kwargs)
-                    headers, keys = _extract_headers_keys_from_spec(spec)
-                    headers, keys = _complete_headers_keys(headers, keys)
-                    if headers or keys:
-                        return headers, keys
-                except TypeError:
-                    continue
-                except Exception:
-                    continue
-
-    if page == "Top_10_Investments":
-        return _complete_headers_keys(
+    if page == TOP10_PAGE_NAME:
+        return _ensure_top10_fields(
             [
                 "Symbol",
                 "Recommendation",
@@ -1400,9 +1426,6 @@ async def _get_schema_layout(page: str) -> Tuple[List[str], List[str]]:
                 "Risk Bucket",
                 "Horizon Days",
                 "Invest Period Label",
-                "Top10 Rank",
-                "Selection Reason",
-                "Criteria Snapshot",
             ],
             [
                 "symbol",
@@ -1420,9 +1443,6 @@ async def _get_schema_layout(page: str) -> Tuple[List[str], List[str]]:
                 "risk_bucket",
                 "horizon_days",
                 "invest_period_label",
-                "top10_rank",
-                "selection_reason",
-                "criteria_snapshot",
             ],
         )
 
@@ -1508,6 +1528,52 @@ async def _get_schema_layout(page: str) -> Tuple[List[str], List[str]]:
     )
 
 
+def _extract_headers_keys_from_spec(spec: Any) -> Tuple[List[str], List[str]]:
+    headers: List[str] = []
+    keys: List[str] = []
+
+    raw_columns = None
+    if isinstance(spec, dict):
+        raw_columns = spec.get("columns") or spec.get("fields")
+        if not raw_columns:
+            maybe_keys = spec.get("keys") or []
+            maybe_headers = spec.get("headers") or spec.get("display_headers") or []
+            if isinstance(maybe_keys, list):
+                keys = [_clean_str(x) for x in maybe_keys if _clean_str(x)]
+                if isinstance(maybe_headers, list):
+                    headers = [_clean_str(x) for x in maybe_headers if _clean_str(x)]
+                if keys and not headers:
+                    headers = [k.replace("_", " ").title() for k in keys]
+                return headers, keys
+    else:
+        raw_columns = getattr(spec, "columns", None) or getattr(spec, "fields", None)
+
+    if isinstance(raw_columns, list):
+        for col in raw_columns:
+            if isinstance(col, dict):
+                key = _clean_str(col.get("key") or col.get("field") or col.get("name") or col.get("id"))
+                header = _clean_str(col.get("header") or col.get("title") or col.get("label") or key)
+            else:
+                key = _clean_str(
+                    getattr(col, "key", None)
+                    or getattr(col, "field", None)
+                    or getattr(col, "name", None)
+                    or getattr(col, "id", None)
+                )
+                header = _clean_str(
+                    getattr(col, "header", None)
+                    or getattr(col, "title", None)
+                    or getattr(col, "label", None)
+                    or key
+                )
+
+            if key:
+                keys.append(key)
+                headers.append(header or key)
+
+    return headers, keys
+
+
 def _extract_headers_keys_from_payload(obj: Any) -> Tuple[List[str], List[str]]:
     if not isinstance(obj, dict):
         return [], []
@@ -1579,65 +1645,241 @@ def _project_dict_items_to_matrix(items: List[Any], keys: List[str]) -> List[Lis
         elif isinstance(item, (list, tuple)):
             row = list(item)
             if len(row) < len(keys):
-                row.extend([None] * (len(keys) - len(row)))
+                row.extend([None] * (len(keys) - 1))
             projected.append([_json_safe(x) for x in row[: len(keys)]])
         else:
             projected.append([_json_safe(item)] + [None] * (len(keys) - 1))
     return projected
 
 
+def _extract_value_ci(raw: Mapping[str, Any], key: str) -> Any:
+    if key in raw:
+        return raw.get(key)
+    lowmap = {str(k).strip().lower(): v for k, v in raw.items()}
+    if key.lower() in lowmap:
+        return lowmap[key.lower()]
+    compact = _snake_like(key).replace("_", "")
+    for rk, rv in raw.items():
+        if _snake_like(str(rk)).replace("_", "") == compact:
+            return rv
+    return None
+
+
+def _infer_horizon_days(payload: Mapping[str, Any]) -> Optional[int]:
+    for key in ("horizon_days", "invest_period_days", "investment_period_days", "period_days", "days"):
+        v = _safe_int(payload.get(key), 0)
+        if v > 0:
+            return v
+
+    label = _clean_str(
+        payload.get("invest_period_label")
+        or payload.get("investment_period_label")
+        or payload.get("period_label")
+        or payload.get("horizon_label")
+    ).upper()
+
+    label_map = {
+        "1M": 30,
+        "30D": 30,
+        "3M": 90,
+        "90D": 90,
+        "6M": 180,
+        "180D": 180,
+        "12M": 365,
+        "1Y": 365,
+        "365D": 365,
+    }
+    return label_map.get(label)
+
+
+def _infer_invest_period_label(payload: Mapping[str, Any], days: Optional[int]) -> str:
+    label = _clean_str(
+        payload.get("invest_period_label")
+        or payload.get("investment_period_label")
+        or payload.get("period_label")
+        or payload.get("horizon_label")
+    ).upper()
+    if label:
+        return label
+    if days is None:
+        return ""
+    if days <= 45:
+        return "1M"
+    if days <= 135:
+        return "3M"
+    if days <= 240:
+        return "6M"
+    return "12M"
+
+
+def _criteria_snapshot(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    compact = {
+        "page": _normalize_page_name(
+            payload.get("page")
+            or payload.get("sheet_name")
+            or payload.get("sheet")
+            or payload.get("name")
+            or payload.get("tab")
+            or TOP10_PAGE_NAME
+        ),
+        "risk_profile": payload.get("risk_profile"),
+        "allocation_strategy": payload.get("allocation_strategy"),
+        "invest_amount": payload.get("invest_amount"),
+        "horizon_days": _infer_horizon_days(payload),
+        "invest_period_label": _infer_invest_period_label(payload, _infer_horizon_days(payload)),
+        "top_n": payload.get("top_n") or payload.get("limit"),
+        "symbols": payload.get("symbols") or payload.get("tickers"),
+    }
+    return {k: _json_safe(v) for k, v in compact.items() if v not in (None, "", [], {})}
+
+
+def _build_recommendation_reason(row: Dict[str, Any], payload: Mapping[str, Any]) -> str:
+    rec = _clean_str(row.get("recommendation")).upper()
+    if not rec:
+        return "Selected by advisor scoring."
+
+    horizon_days = _safe_int(row.get("horizon_days"), 0) or (_infer_horizon_days(payload) or 0)
+    invest_period_label = _clean_str(row.get("invest_period_label")) or _infer_invest_period_label(payload, horizon_days)
+    current_price = _safe_float(row.get("current_price") or row.get("price"))
+    fp1 = _safe_float(row.get("forecast_price_1m"))
+    fp3 = _safe_float(row.get("forecast_price_3m"))
+    fp12 = _safe_float(row.get("forecast_price_12m"))
+    roi1 = _as_ratio(row.get("expected_roi_1m"))
+    roi3 = _as_ratio(row.get("expected_roi_3m"))
+    roi12 = _as_ratio(row.get("expected_roi_12m"))
+    overall = _safe_float(row.get("overall_score"))
+    confidence = _as_ratio(row.get("forecast_confidence") or row.get("confidence_score"))
+    risk_bucket = _clean_str(row.get("risk_bucket"))
+    risk_score = _safe_float(row.get("risk_score"))
+    selected_roi = roi3
+    selected_fp = fp3
+
+    if horizon_days:
+        if horizon_days <= 45:
+            selected_roi = roi1 if roi1 is not None else roi3
+            selected_fp = fp1 if fp1 is not None else fp3
+        elif horizon_days > 135:
+            selected_roi = roi12 if roi12 is not None else roi3
+            selected_fp = fp12 if fp12 is not None else fp3
+
+    parts: List[str] = []
+    if selected_roi is not None:
+        parts.append(f"expected {invest_period_label or 'target-horizon'} return is {round(selected_roi * 100.0, 2)}%")
+    if selected_fp is not None and current_price is not None:
+        cmp = "above" if selected_fp > current_price else "below" if selected_fp < current_price else "near"
+        parts.append(f"forecast price {round(selected_fp, 2)} is {cmp} current price {round(current_price, 2)}")
+    if confidence is not None:
+        parts.append(f"confidence is {round(confidence * 100.0, 2)}%")
+    if overall is not None:
+        parts.append(f"overall score is {round(overall, 2)}")
+    if risk_bucket:
+        parts.append(f"risk bucket is {risk_bucket}")
+    elif risk_score is not None:
+        parts.append(f"risk score is {round(risk_score, 2)}")
+
+    if not parts:
+        return f"{rec} based on the current risk-return profile."
+    return f"{rec} because " + ", ".join(parts[:4]) + "."
+
+
+def _ensure_top10_context(row: Dict[str, Any], payload: Mapping[str, Any], rank: Optional[int]) -> Dict[str, Any]:
+    out = dict(row or {})
+    inferred_horizon_days = _infer_horizon_days(payload)
+    inferred_label = _infer_invest_period_label(payload, inferred_horizon_days)
+
+    if out.get("horizon_days") is None and inferred_horizon_days is not None:
+        out["horizon_days"] = inferred_horizon_days
+
+    if not out.get("invest_period_label") and inferred_label:
+        out["invest_period_label"] = inferred_label
+
+    if out.get("recommendation") and not _clean_str(out.get("recommendation_reason")):
+        out["recommendation_reason"] = _build_recommendation_reason(out, payload)
+
+    if rank is not None and out.get("top10_rank") is None:
+        out["top10_rank"] = rank
+
+    if not out.get("selection_reason"):
+        out["selection_reason"] = out.get("recommendation_reason") or "Selected by advisor scoring."
+
+    if not out.get("criteria_snapshot"):
+        out["criteria_snapshot"] = _criteria_snapshot(payload)
+
+    return out
+
+
 async def _coerce_to_sheet_rows_response(
     *,
     page: str,
     advisor_result: Dict[str, Any],
+    payload: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    payload = dict(advisor_result or {})
-    items = _rows_from_any(payload)
+    raw = dict(advisor_result or {})
+    items = _rows_from_any(raw)
 
-    payload_headers, payload_keys = _extract_headers_keys_from_payload(payload)
+    payload_headers, payload_keys = _extract_headers_keys_from_payload(raw)
     schema_headers, schema_keys = await _get_schema_layout(page)
 
     keys = payload_keys or schema_keys
     headers = payload_headers or schema_headers
     headers, keys = _complete_headers_keys(headers, keys)
-
-    if items and not keys and isinstance(items[0], dict):
-        keys = _derive_keys_from_items(items)
-        headers, keys = _complete_headers_keys(headers, keys)
+    if page == TOP10_PAGE_NAME:
+        headers, keys = _ensure_top10_fields(headers, keys)
 
     rows_matrix: List[List[Any]] = []
-    if _rows_are_matrix(items):
-        rows_matrix = [list(r) if isinstance(r, (list, tuple)) else [r] for r in items]
-    elif items and keys:
-        rows_matrix = _project_dict_items_to_matrix(items, keys)
 
-    meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+    if items and _rows_are_matrix(items):
+        source_keys = payload_keys or keys
+        projected_rows: List[Dict[str, Any]] = []
+        for row in items:
+            vals = list(row) if isinstance(row, (list, tuple)) else [row]
+            item = {source_keys[i]: (vals[i] if i < len(vals) else None) for i in range(len(source_keys))}
+            if page == TOP10_PAGE_NAME:
+                item = _ensure_top10_context(item, payload, len(projected_rows) + 1)
+            projected_rows.append({k: _json_safe(item.get(k)) for k in keys})
+        rows_matrix = _project_dict_items_to_matrix(projected_rows, keys)
+
+    else:
+        dict_items: List[Dict[str, Any]] = []
+        for idx, item in enumerate(items, start=1):
+            d = item if isinstance(item, dict) else _model_to_dict(item)
+            if not isinstance(d, dict):
+                d = {}
+            if page == TOP10_PAGE_NAME:
+                d = _ensure_top10_context(d, payload, idx)
+            dict_items.append({k: _json_safe(_extract_value_ci(d, k)) for k in keys})
+        rows_matrix = _project_dict_items_to_matrix(dict_items, keys)
+
+    meta = raw.get("meta") if isinstance(raw.get("meta"), dict) else {}
     meta = dict(meta)
     meta.setdefault("route_version", ADVISOR_ROUTE_VERSION)
     meta.setdefault("projection", "advisor_result_to_sheet_rows")
 
-    status_value = _clean_str(payload.get("status"))
+    status_value = _clean_str(raw.get("status"))
     if not status_value:
         status_value = "success" if rows_matrix else "partial"
 
-    detail_value = _clean_str(payload.get("detail") or payload.get("error") or payload.get("message"))
+    detail_value = _clean_str(raw.get("detail") or raw.get("error") or raw.get("message"))
 
     return _json_safe(
         {
             "status": status_value,
             "page": page,
             "sheet": page,
+            "sheet_name": page,
             "route_family": _route_family_for_page(page),
             "headers": headers,
             "display_headers": headers,
+            "sheet_headers": headers,
+            "column_headers": headers,
             "keys": keys,
             "rows": rows_matrix,
             "rows_matrix": rows_matrix,
             "count": len(rows_matrix),
             "detail": detail_value,
             "meta": meta,
-            "version": payload.get("version") or ADVISOR_ROUTE_VERSION,
-            "request_id": payload.get("request_id") or meta.get("request_id"),
+            "version": raw.get("version") or ADVISOR_ROUTE_VERSION,
+            "request_id": raw.get("request_id") or meta.get("request_id"),
         }
     )
 
@@ -1682,6 +1924,85 @@ def _unwrap_sheet_payload(obj: Any) -> Dict[str, Any]:
     return dict(obj)
 
 
+def _normalize_sheet_payload(
+    *,
+    raw_result: Dict[str, Any],
+    target_page: str,
+    request_id: str,
+    source: str,
+    schema_only: bool = False,
+    headers_only: bool = False,
+    include_matrix: bool = True,
+) -> Dict[str, Any]:
+    raw = _unwrap_sheet_payload(raw_result)
+    page = _normalize_page_name(raw.get("page") or raw.get("sheet") or target_page)
+
+    headers = raw.get("headers") or raw.get("display_headers") or []
+    keys = raw.get("keys") or raw.get("fields") or []
+    headers, keys = _complete_headers_keys(headers, keys)
+    if page == TOP10_PAGE_NAME:
+        headers, keys = _ensure_top10_fields(headers, keys)
+
+    rows_obj = raw.get("rows")
+    matrix_obj = raw.get("rows_matrix")
+    rows_matrix: List[List[Any]] = []
+
+    if schema_only or headers_only:
+        rows_matrix = []
+    elif isinstance(rows_obj, list) and rows_obj:
+        if all(isinstance(r, dict) for r in rows_obj):
+            if not keys:
+                keys = list(rows_obj[0].keys())
+                headers, keys = _complete_headers_keys(headers, keys)
+            rows_matrix = _project_dict_items_to_matrix(rows_obj, keys)
+        elif all(isinstance(r, (list, tuple)) for r in rows_obj):
+            rows_matrix = [list(r) for r in rows_obj]
+    elif isinstance(matrix_obj, list):
+        rows_matrix = [list(r) if isinstance(r, (list, tuple)) else [r] for r in matrix_obj]
+
+    if not include_matrix:
+        rows_matrix = []
+
+    if not keys and rows_matrix and headers:
+        keys = [_snake_like(h) for h in headers]
+        headers, keys = _complete_headers_keys(headers, keys)
+
+    if not headers and keys:
+        headers, keys = _complete_headers_keys(headers, keys)
+
+    meta = raw.get("meta") if isinstance(raw.get("meta"), dict) else {}
+    meta = dict(meta)
+    meta["route_version"] = ADVISOR_ROUTE_VERSION
+    meta["native_source"] = source
+    meta["count"] = len(rows_matrix)
+    meta["schema_only"] = bool(schema_only)
+    meta["headers_only"] = bool(headers_only)
+
+    status_value = _clean_str(raw.get("status")) or ("success" if rows_matrix or schema_only or headers_only else "warn")
+
+    return _json_safe(
+        {
+            "status": status_value,
+            "page": page,
+            "sheet": page,
+            "sheet_name": page,
+            "route_family": _route_family_for_page(page),
+            "headers": headers,
+            "display_headers": headers,
+            "sheet_headers": headers,
+            "column_headers": headers,
+            "keys": keys,
+            "rows": rows_matrix,
+            "rows_matrix": rows_matrix,
+            "count": len(rows_matrix),
+            "detail": _clean_str(raw.get("detail") or raw.get("error") or raw.get("message")),
+            "meta": meta,
+            "version": raw.get("version") or ADVISOR_ROUTE_VERSION,
+            "request_id": request_id,
+        }
+    )
+
+
 async def _run_native_sheet_rows(
     payload: Dict[str, Any],
     *,
@@ -1701,12 +2022,15 @@ async def _run_native_sheet_rows(
         "build_sheet_rows",
         "get_page_rows",
         "get_sheet",
+        "get_cached_sheet_rows",
+        "get_sheet_snapshot",
+        "get_cached_sheet_snapshot",
     )
     errors: List[str] = []
 
     limit = int(payload.get("limit") or payload.get("top_n") or 20)
     offset = int(payload.get("offset") or 0)
-    mode = _clean_str(payload.get("mode"))
+    mode = _clean_str(payload.get("mode") or payload.get("advisor_data_mode"))
 
     for method_name in methods:
         fn = getattr(engine, method_name, None)
@@ -1761,65 +2085,133 @@ async def _run_native_sheet_rows(
     )
 
 
-def _normalize_sheet_payload(
+def _build_schema_only_sheet_payload(
     *,
-    raw_result: Dict[str, Any],
-    target_page: str,
+    page: str,
     request_id: str,
-    source: str,
+    schema_only: bool,
+    headers_only: bool,
+    include_matrix: bool,
+    headers: Sequence[str],
+    keys: Sequence[str],
 ) -> Dict[str, Any]:
-    raw = _unwrap_sheet_payload(raw_result)
-    page = _normalize_page_name(raw.get("page") or raw.get("sheet") or target_page)
+    headers2, keys2 = _complete_headers_keys(headers, keys)
+    if page == TOP10_PAGE_NAME:
+        headers2, keys2 = _ensure_top10_fields(headers2, keys2)
 
-    headers = raw.get("headers") or raw.get("display_headers") or []
-    keys = raw.get("keys") or raw.get("fields") or []
-    headers, keys = _complete_headers_keys(headers, keys)
+    return _json_safe(
+        {
+            "status": "success",
+            "page": page,
+            "sheet": page,
+            "sheet_name": page,
+            "route_family": _route_family_for_page(page),
+            "headers": headers2,
+            "display_headers": headers2,
+            "sheet_headers": headers2,
+            "column_headers": headers2,
+            "keys": keys2,
+            "rows": [],
+            "rows_matrix": [] if include_matrix else [],
+            "count": 0,
+            "detail": "",
+            "meta": {
+                "route_version": ADVISOR_ROUTE_VERSION,
+                "request_id": request_id,
+                "schema_only": bool(schema_only),
+                "headers_only": bool(headers_only),
+                "projection": "schema_layout_only",
+            },
+            "version": ADVISOR_ROUTE_VERSION,
+            "request_id": request_id,
+        }
+    )
 
-    rows_obj = raw.get("rows")
-    matrix_obj = raw.get("rows_matrix")
-    rows_matrix: List[List[Any]] = []
 
-    if isinstance(rows_obj, list) and rows_obj:
-        if all(isinstance(r, dict) for r in rows_obj):
-            if not keys:
-                keys = list(rows_obj[0].keys())
-                headers, keys = _complete_headers_keys(headers, keys)
-            rows_matrix = _project_dict_items_to_matrix(rows_obj, keys)
-        elif all(isinstance(r, (list, tuple)) for r in rows_obj):
-            rows_matrix = [list(r) for r in rows_obj]
-    elif isinstance(matrix_obj, list):
-        rows_matrix = [list(r) if isinstance(r, (list, tuple)) else [r] for r in matrix_obj]
+def _build_data_dictionary_sheet_payload(
+    *,
+    request_id: str,
+    include_matrix: bool,
+    schema_only: bool,
+    headers_only: bool,
+) -> Dict[str, Any]:
+    headers, keys = _complete_headers_keys(
+        [
+            "Sheet",
+            "Group",
+            "Header",
+            "Key",
+            "DType",
+            "Format",
+            "Required",
+            "Source",
+            "Notes",
+        ],
+        [
+            "sheet",
+            "group",
+            "header",
+            "key",
+            "dtype",
+            "fmt",
+            "required",
+            "source",
+            "notes",
+        ],
+    )
 
-    if not keys and rows_matrix and headers:
-        keys = [_snake_like(h) for h in headers]
-        headers, keys = _complete_headers_keys(headers, keys)
+    if schema_only or headers_only:
+        return _build_schema_only_sheet_payload(
+            page="Data_Dictionary",
+            request_id=request_id,
+            schema_only=schema_only,
+            headers_only=headers_only,
+            include_matrix=include_matrix,
+            headers=headers,
+            keys=keys,
+        )
 
-    if not headers and keys:
-        headers, keys = _complete_headers_keys(headers, keys)
-
-    meta = raw.get("meta") if isinstance(raw.get("meta"), dict) else {}
-    meta = dict(meta)
-    meta["route_version"] = ADVISOR_ROUTE_VERSION
-    meta["native_source"] = source
-    meta["count"] = len(rows_matrix)
-
-    status_value = _clean_str(raw.get("status")) or ("success" if rows_matrix else "warn")
+    rows: List[List[Any]] = []
+    try:
+        mod = importlib.import_module("core.sheets.data_dictionary")
+        build_rows = getattr(mod, "build_data_dictionary_rows", None)
+        raw_rows = []
+        if callable(build_rows):
+            try:
+                raw_rows = build_rows(include_meta_sheet=True)
+            except TypeError:
+                raw_rows = build_rows()
+        for item in raw_rows or []:
+            d = item if isinstance(item, dict) else _model_to_dict(item)
+            rows.append([_json_safe(d.get(k)) for k in keys])
+        status_value = "success"
+        detail_value = ""
+    except Exception as e:
+        status_value = "partial"
+        detail_value = f"{type(e).__name__}: {e}"
 
     return _json_safe(
         {
             "status": status_value,
-            "page": page,
-            "sheet": page,
-            "route_family": _route_family_for_page(page),
+            "page": "Data_Dictionary",
+            "sheet": "Data_Dictionary",
+            "sheet_name": "Data_Dictionary",
+            "route_family": "schema",
             "headers": headers,
             "display_headers": headers,
+            "sheet_headers": headers,
+            "column_headers": headers,
             "keys": keys,
-            "rows": rows_matrix,
-            "rows_matrix": rows_matrix,
-            "count": len(rows_matrix),
-            "detail": _clean_str(raw.get("detail") or raw.get("error") or raw.get("message")),
-            "meta": meta,
-            "version": raw.get("version") or ADVISOR_ROUTE_VERSION,
+            "rows": rows,
+            "rows_matrix": rows if include_matrix else [],
+            "count": len(rows),
+            "detail": detail_value,
+            "meta": {
+                "route_version": ADVISOR_ROUTE_VERSION,
+                "request_id": request_id,
+                "projection": "data_dictionary",
+            },
+            "version": ADVISOR_ROUTE_VERSION,
             "request_id": request_id,
         }
     )
@@ -1850,7 +2242,16 @@ async def advisor_health(request: Request) -> Dict[str, Any]:
 
         native_methods = [
             name
-            for name in ("get_sheet_rows", "sheet_rows", "build_sheet_rows", "get_page_rows", "get_sheet")
+            for name in (
+                "get_sheet_rows",
+                "sheet_rows",
+                "build_sheet_rows",
+                "get_page_rows",
+                "get_sheet",
+                "get_cached_sheet_rows",
+                "get_sheet_snapshot",
+                "get_cached_sheet_snapshot",
+            )
             if callable(getattr(engine, name, None))
         ]
 
@@ -2047,10 +2448,31 @@ async def advisor_sheet_rows(
 
     target_page = _normalize_target_page(page=page, sheet=sheet, sheet_name=sheet_name, default="Market_Leaders")
     effective_limit = int(top_n) if top_n is not None else int(limit)
-
     normalized_sources = _list_from_any(sources)
     if target_page and (not normalized_sources or normalized_sources == ["ALL"]):
         normalized_sources = [target_page]
+
+    schema_headers, schema_keys = await _get_schema_layout(target_page)
+    request_id = _get_request_id(request)
+
+    if target_page == "Data_Dictionary":
+        return _build_data_dictionary_sheet_payload(
+            request_id=request_id,
+            include_matrix=bool(include_matrix),
+            schema_only=bool(schema_only),
+            headers_only=bool(headers_only),
+        )
+
+    if schema_only or headers_only:
+        return _build_schema_only_sheet_payload(
+            page=target_page,
+            request_id=request_id,
+            schema_only=bool(schema_only),
+            headers_only=bool(headers_only),
+            include_matrix=bool(include_matrix),
+            headers=schema_headers,
+            keys=schema_keys,
+        )
 
     payload: Dict[str, Any] = {
         "page": target_page,
@@ -2096,9 +2518,33 @@ async def advisor_sheet_rows(
         return _normalize_sheet_payload(
             raw_result=native_result,
             target_page=target_page,
-            request_id=_get_request_id(request),
+            request_id=request_id,
             source=native_source,
+            schema_only=bool(schema_only),
+            headers_only=bool(headers_only),
+            include_matrix=bool(include_matrix),
         )
+
+    shared_pipeline = await _run_shared_page_pipeline(
+        request=request,
+        payload=payload,
+        page=target_page,
+        engine=engine,
+        timeout_sec=timeout_sec,
+    )
+    if isinstance(shared_pipeline, dict):
+        sheet_rows = await _coerce_to_sheet_rows_response(
+            page=target_page,
+            advisor_result=shared_pipeline,
+            payload=payload,
+        )
+        meta = sheet_rows.get("meta") if isinstance(sheet_rows.get("meta"), dict) else {}
+        meta["native_sheet_rows_attempted"] = True
+        meta["native_source"] = native_source
+        meta["native_error"] = native_error
+        meta["shared_pipeline_used"] = True
+        sheet_rows["meta"] = meta
+        return sheet_rows
 
     advisor_result = await _run_advisor(
         request=request,
@@ -2113,11 +2559,13 @@ async def advisor_sheet_rows(
     sheet_rows = await _coerce_to_sheet_rows_response(
         page=target_page,
         advisor_result=advisor_result,
+        payload=payload,
     )
     meta = sheet_rows.get("meta") if isinstance(sheet_rows.get("meta"), dict) else {}
     meta["native_sheet_rows_attempted"] = True
     meta["native_source"] = native_source
     meta["native_error"] = native_error
+    meta["shared_pipeline_used"] = False
     sheet_rows["meta"] = meta
     return sheet_rows
 
@@ -2155,6 +2603,31 @@ async def advisor_sheet_rows_post(
     payload.setdefault("format", "rows")
     payload.setdefault("offset", 0)
 
+    include_matrix = bool(payload.get("include_matrix", True))
+    schema_only = bool(payload.get("schema_only", False))
+    headers_only = bool(payload.get("headers_only", False))
+    schema_headers, schema_keys = await _get_schema_layout(target_page)
+    request_id = _get_request_id(request)
+
+    if target_page == "Data_Dictionary":
+        return _build_data_dictionary_sheet_payload(
+            request_id=request_id,
+            include_matrix=include_matrix,
+            schema_only=schema_only,
+            headers_only=headers_only,
+        )
+
+    if schema_only or headers_only:
+        return _build_schema_only_sheet_payload(
+            page=target_page,
+            request_id=request_id,
+            schema_only=schema_only,
+            headers_only=headers_only,
+            include_matrix=include_matrix,
+            headers=schema_headers,
+            keys=schema_keys,
+        )
+
     engine = await _get_engine(request)
     if engine is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Data engine unavailable")
@@ -2170,9 +2643,33 @@ async def advisor_sheet_rows_post(
         return _normalize_sheet_payload(
             raw_result=native_result,
             target_page=target_page,
-            request_id=_get_request_id(request),
+            request_id=request_id,
             source=native_source,
+            schema_only=schema_only,
+            headers_only=headers_only,
+            include_matrix=include_matrix,
         )
+
+    shared_pipeline = await _run_shared_page_pipeline(
+        request=request,
+        payload=payload,
+        page=target_page,
+        engine=engine,
+        timeout_sec=timeout_sec,
+    )
+    if isinstance(shared_pipeline, dict):
+        sheet_rows = await _coerce_to_sheet_rows_response(
+            page=target_page,
+            advisor_result=shared_pipeline,
+            payload=payload,
+        )
+        meta = sheet_rows.get("meta") if isinstance(sheet_rows.get("meta"), dict) else {}
+        meta["native_sheet_rows_attempted"] = True
+        meta["native_source"] = native_source
+        meta["native_error"] = native_error
+        meta["shared_pipeline_used"] = True
+        sheet_rows["meta"] = meta
+        return sheet_rows
 
     advisor_result = await _run_advisor(
         request=request,
@@ -2187,13 +2684,15 @@ async def advisor_sheet_rows_post(
     sheet_rows = await _coerce_to_sheet_rows_response(
         page=target_page,
         advisor_result=advisor_result,
+        payload=payload,
     )
     meta = sheet_rows.get("meta") if isinstance(sheet_rows.get("meta"), dict) else {}
     meta["native_sheet_rows_attempted"] = True
     meta["native_source"] = native_source
     meta["native_error"] = native_error
+    meta["shared_pipeline_used"] = False
     sheet_rows["meta"] = meta
     return sheet_rows
 
 
-__all__ = ["router"]
+__all__ = ["router", "ADVISOR_ROUTE_VERSION"]
