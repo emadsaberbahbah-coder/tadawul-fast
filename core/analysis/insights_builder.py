@@ -2,21 +2,23 @@
 # core/analysis/insights_builder.py
 """
 ================================================================================
-Insights Analysis Builder — v1.3.0
-(SCHEMA-FIRST / TOP10-CONTEXT-AWARE / NUMERIC-SAFE / GREEN-STATUS)
+Insights Analysis Builder — v1.4.0
+(SCHEMA-FIRST / TOP10-CONTEXT-AWARE / IMPORT-SAFE / NUMERIC-SAFE / ROBUST)
 ================================================================================
 Tadawul Fast Bridge (TFB)
 
 What this revision fixes
-- ✅ FIX: keeps Insights_Analysis schema-first and import-safe
-- ✅ FIX: adds richer Top10 contextual rows using selector output when available
-- ✅ FIX: carries criteria context consistently into Insights sections
-- ✅ FIX: improves criteria packaging for downstream Top10 / advisor flow
-- ✅ FIX: keeps VALUE numeric when possible for Sheets formulas / icons
-- ✅ FIX: percent handling remains normalized to percent-points for display rows
-- ✅ FIX: always returns Build Status rows (never blank)
-- ✅ SAFE: no network calls at import time
-- ✅ SAFE: best-effort engine access only
+- ✅ FIX: keeps Insights_Analysis schema-first and fully import-safe.
+- ✅ FIX: preserves numeric VALUE output when possible for Sheets formulas/icons.
+- ✅ FIX: improves schema extraction tolerance across schema_registry payload shapes.
+- ✅ FIX: strengthens Top10 payload parsing across rows/items/data/quotes shapes.
+- ✅ FIX: supports symbol-only Top10 fallback when row payloads are unavailable.
+- ✅ FIX: keeps Build Status rows always present (never blank).
+- ✅ FIX: avoids hard failure when engine methods differ across versions.
+- ✅ FIX: carries criteria context consistently into summary / Top10 sections.
+- ✅ SAFE: no network calls at import time.
+- ✅ SAFE: best-effort engine access only.
+- ✅ SAFE: builder never raises for normal route execution; returns schema-correct rows.
 
 Expected Insights_Analysis columns
 - section
@@ -41,12 +43,12 @@ import json
 import logging
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 logger = logging.getLogger("core.analysis.insights_builder")
 logger.addHandler(logging.NullHandler())
 
-INSIGHTS_BUILDER_VERSION = "1.3.0"
+INSIGHTS_BUILDER_VERSION = "1.4.0"
 _RIYADH_TZ = timezone(timedelta(hours=3))
 
 
@@ -75,7 +77,7 @@ def _as_float(v: Any) -> Optional[float]:
         if s.endswith("%"):
             s = s[:-1].strip()
         x = float(s)
-        if x != x:
+        if x != x:  # NaN
             return None
         return x
     except Exception:
@@ -162,9 +164,126 @@ def _compact_json(obj: Any) -> str:
         return _safe_str(obj)
 
 
+def _safe_bool(v: Any, default: bool = False) -> bool:
+    if isinstance(v, bool):
+        return v
+    s = _safe_str(v).lower()
+    if s in {"1", "true", "yes", "y", "on", "t"}:
+        return True
+    if s in {"0", "false", "no", "n", "off", "f"}:
+        return False
+    return default
+
+
+# -----------------------------------------------------------------------------
+# Dict/model extraction helpers
+# -----------------------------------------------------------------------------
+def _extract_row_dict(v: Any) -> Dict[str, Any]:
+    if isinstance(v, dict):
+        return dict(v)
+    try:
+        if hasattr(v, "model_dump") and callable(getattr(v, "model_dump")):
+            d = v.model_dump(mode="python")  # type: ignore[attr-defined]
+            if isinstance(d, dict):
+                return d
+    except Exception:
+        pass
+    try:
+        if hasattr(v, "dict") and callable(getattr(v, "dict")):
+            d = v.dict()  # type: ignore[attr-defined]
+            if isinstance(d, dict):
+                return d
+    except Exception:
+        pass
+    try:
+        if hasattr(v, "__dict__"):
+            d = getattr(v, "__dict__", None)
+            if isinstance(d, dict):
+                return dict(d)
+    except Exception:
+        pass
+    return {}
+
+
+def _coerce_rows_list(payload: Any) -> List[Dict[str, Any]]:
+    if payload is None:
+        return []
+
+    if isinstance(payload, list):
+        out: List[Dict[str, Any]] = []
+        for item in payload:
+            d = _extract_row_dict(item)
+            if d:
+                out.append(d)
+        return out
+
+    if isinstance(payload, dict):
+        for key in ("rows", "items", "data", "quotes", "records", "result", "payload"):
+            val = payload.get(key)
+            if isinstance(val, list):
+                out2: List[Dict[str, Any]] = []
+                for item in val:
+                    d = _extract_row_dict(item)
+                    if d:
+                        out2.append(d)
+                if out2:
+                    return out2
+
+        d0 = _extract_row_dict(payload)
+        if d0 and any(k in d0 for k in ("symbol", "item", "section", "metric", "recommendation", "overall_score")):
+            return [d0]
+
+    return []
+
+
+def _maybe_rows_from_payload(payload: Any) -> List[Dict[str, Any]]:
+    rows = _coerce_rows_list(payload)
+    if rows:
+        return rows
+
+    d = _extract_row_dict(payload)
+    if d:
+        for key in ("top10_rows", "insights_rows", "analysis_rows"):
+            val = d.get(key)
+            rows2 = _coerce_rows_list(val)
+            if rows2:
+                return rows2
+
+    return []
+
+
 # -----------------------------------------------------------------------------
 # Schema helpers
 # -----------------------------------------------------------------------------
+def _spec_columns(spec: Any) -> List[Any]:
+    if spec is None:
+        return []
+
+    if isinstance(spec, dict):
+        if isinstance(spec.get("columns"), list):
+            return spec["columns"]
+        if isinstance(spec.get("fields"), list):
+            return spec["fields"]
+
+        if len(spec) == 1:
+            only_val = next(iter(spec.values()))
+            if isinstance(only_val, dict):
+                if isinstance(only_val.get("columns"), list):
+                    return only_val["columns"]
+                if isinstance(only_val.get("fields"), list):
+                    return only_val["fields"]
+
+    cols = getattr(spec, "columns", None)
+    if isinstance(cols, list):
+        return cols
+
+    fields = getattr(spec, "fields", None)
+    if isinstance(fields, list):
+        return fields
+
+    return []
+
+
 def get_insights_schema() -> Tuple[List[str], List[str], str]:
     """
     Returns (headers, keys, source_marker).
@@ -174,11 +293,44 @@ def get_insights_schema() -> Tuple[List[str], List[str], str]:
         from core.sheets.schema_registry import get_sheet_spec  # type: ignore
 
         spec = get_sheet_spec("Insights_Analysis")
-        cols = getattr(spec, "columns", None) or []
-        headers = [str(getattr(c, "header")) for c in cols if getattr(c, "header", None)]
-        keys = [str(getattr(c, "key")) for c in cols if getattr(c, "key", None)]
+        cols = _spec_columns(spec)
+
+        headers: List[str] = []
+        keys: List[str] = []
+
+        for c in cols:
+            if isinstance(c, Mapping):
+                h = _safe_str(c.get("header") or c.get("display_header") or c.get("label") or c.get("title"))
+                k = _safe_str(c.get("key") or c.get("field") or c.get("name") or c.get("id"))
+            else:
+                h = _safe_str(
+                    getattr(c, "header", None)
+                    or getattr(c, "display_header", None)
+                    or getattr(c, "label", None)
+                    or getattr(c, "title", None)
+                )
+                k = _safe_str(
+                    getattr(c, "key", None)
+                    or getattr(c, "field", None)
+                    or getattr(c, "name", None)
+                    or getattr(c, "id", None)
+                )
+
+            if h or k:
+                headers.append(h or k.replace("_", " ").title())
+                keys.append(k or h.lower().replace(" ", "_"))
+
         if headers and keys and len(headers) == len(keys):
             return headers, keys, "schema_registry.get_sheet_spec"
+
+        if isinstance(spec, Mapping):
+            h2 = spec.get("headers") or spec.get("display_headers")
+            k2 = spec.get("keys") or spec.get("fields")
+            if isinstance(h2, list) and isinstance(k2, list) and h2 and k2 and len(h2) == len(k2):
+                headers2 = [_safe_str(x) for x in h2 if _safe_str(x)]
+                keys2 = [_safe_str(x) for x in k2 if _safe_str(x)]
+                if headers2 and keys2 and len(headers2) == len(keys2):
+                    return headers2, keys2, "schema_registry.mapping_fields"
     except Exception as e:
         logger.debug("get_insights_schema: schema_registry unavailable: %r", e)
 
@@ -196,27 +348,46 @@ def _get_criteria_fields() -> List[Dict[str, Any]]:
         from core.sheets.schema_registry import get_sheet_spec  # type: ignore
 
         spec = get_sheet_spec("Insights_Analysis")
-        cfs = getattr(spec, "criteria_fields", None) or ()
+        cfs = getattr(spec, "criteria_fields", None)
+
+        if cfs is None and isinstance(spec, Mapping):
+            cfs = spec.get("criteria_fields")
+
         out: List[Dict[str, Any]] = []
-        for cf in cfs:
-            out.append(
-                {
-                    "key": _safe_str(getattr(cf, "key", "")),
-                    "label": _safe_str(getattr(cf, "label", "")) or _safe_str(getattr(cf, "key", "")),
-                    "dtype": _safe_str(getattr(cf, "dtype", "str")) or "str",
-                    "default": getattr(cf, "default", ""),
-                    "notes": _safe_str(getattr(cf, "notes", "")),
-                }
-            )
-        return [x for x in out if x.get("key")]
+        for cf in list(cfs or []):
+            if isinstance(cf, Mapping):
+                out.append(
+                    {
+                        "key": _safe_str(cf.get("key", "")),
+                        "label": _safe_str(cf.get("label", "")) or _safe_str(cf.get("key", "")),
+                        "dtype": _safe_str(cf.get("dtype", "str")) or "str",
+                        "default": cf.get("default", ""),
+                        "notes": _safe_str(cf.get("notes", "")),
+                    }
+                )
+            else:
+                out.append(
+                    {
+                        "key": _safe_str(getattr(cf, "key", "")),
+                        "label": _safe_str(getattr(cf, "label", "")) or _safe_str(getattr(cf, "key", "")),
+                        "dtype": _safe_str(getattr(cf, "dtype", "str")) or "str",
+                        "default": getattr(cf, "default", ""),
+                        "notes": _safe_str(getattr(cf, "notes", "")),
+                    }
+                )
+        out = [x for x in out if x.get("key")]
+        if out:
+            return out
     except Exception:
-        return [
-            {"key": "risk_level", "label": "Risk Level", "dtype": "str", "default": "Moderate", "notes": "Low / Moderate / High."},
-            {"key": "confidence_level", "label": "Confidence Level", "dtype": "str", "default": "High", "notes": "High / Medium / Low."},
-            {"key": "invest_period_days", "label": "Investment Period (Days)", "dtype": "int", "default": "90", "notes": "Always treated in DAYS internally."},
-            {"key": "required_return_pct", "label": "Required Return %", "dtype": "pct", "default": "0.10", "notes": "Minimum expected ROI threshold."},
-            {"key": "amount", "label": "Amount", "dtype": "float", "default": "0", "notes": "Investment amount (optional)."},
-        ]
+        pass
+
+    return [
+        {"key": "risk_level", "label": "Risk Level", "dtype": "str", "default": "Moderate", "notes": "Low / Moderate / High."},
+        {"key": "confidence_level", "label": "Confidence Level", "dtype": "str", "default": "High", "notes": "High / Medium / Low."},
+        {"key": "invest_period_days", "label": "Investment Period (Days)", "dtype": "int", "default": "90", "notes": "Always treated in DAYS internally."},
+        {"key": "required_return_pct", "label": "Required Return %", "dtype": "pct", "default": "0.10", "notes": "Minimum expected ROI threshold."},
+        {"key": "amount", "label": "Amount", "dtype": "float", "default": "0", "notes": "Investment amount (optional)."},
+    ]
 
 
 # -----------------------------------------------------------------------------
@@ -236,6 +407,7 @@ def _normalize_criteria_input(criteria: Optional[Dict[str, Any]]) -> Dict[str, A
         c.get("invest_period_days")
         or c.get("investment_period_days")
         or c.get("period_days")
+        or c.get("horizon_days")
         or 90
     )
     if invest_days is None or invest_days <= 0:
@@ -269,14 +441,15 @@ def _normalize_criteria_input(criteria: Optional[Dict[str, Any]]) -> Dict[str, A
     normalized = {
         "pages_selected": pages or ["Market_Leaders", "Global_Markets", "Mutual_Funds", "Commodities_FX", "My_Portfolio"],
         "invest_period_days": invest_days,
+        "horizon_days": invest_days,
         "min_expected_roi": min_roi_frac,
         "max_risk_score": max_risk,
         "min_confidence": min_conf,
         "min_volume": min_volume,
-        "use_liquidity_tiebreak": bool(c.get("use_liquidity_tiebreak", True)),
-        "enforce_risk_confidence": bool(c.get("enforce_risk_confidence", True)),
+        "use_liquidity_tiebreak": _safe_bool(c.get("use_liquidity_tiebreak", True), True),
+        "enforce_risk_confidence": _safe_bool(c.get("enforce_risk_confidence", True), True),
         "top_n": max(1, min(50, top_n)),
-        "enrich_final": bool(c.get("enrich_final", True)),
+        "enrich_final": _safe_bool(c.get("enrich_final", True), True),
     }
 
     for k, v in c.items():
@@ -453,23 +626,11 @@ async def _maybe_await(v: Any) -> Any:
     return v
 
 
-def _extract_row_dict(v: Any) -> Dict[str, Any]:
-    if isinstance(v, dict):
-        return v
-    try:
-        if hasattr(v, "model_dump"):
-            return v.model_dump(mode="python")  # type: ignore
-        if hasattr(v, "dict"):
-            return v.dict()  # type: ignore
-    except Exception:
-        pass
-    return {}
-
-
 async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "") -> Dict[str, Dict[str, Any]]:
     if not engine or not symbols:
         return {}
 
+    # batch dict API
     fn = getattr(engine, "get_enriched_quotes_batch", None)
     if callable(fn):
         try:
@@ -485,6 +646,7 @@ async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "") 
         except Exception:
             pass
 
+    # batch list API
     fn2 = getattr(engine, "get_enriched_quotes", None)
     if callable(fn2):
         try:
@@ -497,6 +659,7 @@ async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "") 
         except Exception:
             pass
 
+    # single quote APIs
     out3: Dict[str, Dict[str, Any]] = {}
     fn3 = getattr(engine, "get_enriched_quote_dict", None)
     fn4 = getattr(engine, "get_enriched_quote", None) or getattr(engine, "get_quote", None)
@@ -513,20 +676,77 @@ async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "") 
     return out3
 
 
-async def _fetch_top10_payload(engine: Any, criteria: Optional[Dict[str, Any]] = None, *, limit: int = 10, mode: str = "") -> Dict[str, Any]:
+async def _fetch_top10_payload(
+    engine: Any,
+    criteria: Optional[Dict[str, Any]] = None,
+    *,
+    limit: int = 10,
+    mode: str = "",
+) -> Dict[str, Any]:
     if not engine:
         return {}
 
+    # preferred selector path
     try:
         from core.analysis.top10_selector import build_top10_rows  # type: ignore
 
-        payload = await _maybe_await(build_top10_rows(engine=engine, criteria=criteria or {}, limit=limit, mode=mode or ""))
-        return payload if isinstance(payload, dict) else {}
+        payload = await _maybe_await(
+            build_top10_rows(
+                engine=engine,
+                criteria=criteria or {},
+                limit=limit,
+                mode=mode or "",
+            )
+        )
+        if isinstance(payload, dict):
+            return payload
     except Exception:
-        return {}
+        pass
+
+    # engine fallbacks
+    candidate_names = (
+        "build_top10_rows",
+        "get_top10_rows",
+        "top10_rows",
+        "build_top10",
+        "get_top10_investments",
+        "select_top10",
+    )
+
+    for name in candidate_names:
+        fn = getattr(engine, name, None)
+        if not callable(fn):
+            continue
+
+        variants = [
+            {"criteria": criteria or {}, "limit": limit, "mode": mode or ""},
+            {"criteria": criteria or {}, "limit": limit},
+            {"limit": limit},
+            {},
+        ]
+
+        for kwargs in variants:
+            try:
+                payload = await _maybe_await(fn(**kwargs))
+                if isinstance(payload, dict):
+                    return payload
+                rows = _maybe_rows_from_payload(payload)
+                if rows:
+                    return {"rows": rows}
+            except TypeError:
+                continue
+            except Exception:
+                continue
+
+    return {}
 
 
-async def _fetch_top10_symbols(engine: Any, criteria: Optional[Dict[str, Any]] = None, *, limit: int = 10) -> List[str]:
+async def _fetch_top10_symbols(
+    engine: Any,
+    criteria: Optional[Dict[str, Any]] = None,
+    *,
+    limit: int = 10,
+) -> List[str]:
     if not engine:
         return []
 
@@ -587,12 +807,12 @@ async def _fetch_top10_symbols(engine: Any, criteria: Optional[Dict[str, Any]] =
             if isinstance(res.get("symbols"), (list, tuple)):
                 out = [_safe_str(x) for x in res["symbols"] if _safe_str(x)]
                 return out[: max(1, limit)]
-            rows = res.get("rows") or res.get("items")
-            if isinstance(rows, (list, tuple)):
-                out_syms2 = []
+
+            rows = _maybe_rows_from_payload(res)
+            if rows:
+                out_syms2: List[str] = []
                 for r in rows:
-                    if isinstance(r, dict):
-                        out_syms2.append(_safe_str(r.get("symbol") or r.get("ticker") or r.get("code")))
+                    out_syms2.append(_safe_str(r.get("symbol") or r.get("ticker") or r.get("code")))
                 out2 = [_safe_str(x) for x in out_syms2 if _safe_str(x)]
                 return out2[: max(1, limit)]
 
@@ -892,6 +1112,10 @@ def _build_portfolio_kpi_rows(
     return rows
 
 
+def _normalize_top10_rows(top10_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return _maybe_rows_from_payload(top10_payload)
+
+
 def _build_top10_context_rows(
     *,
     keys: Sequence[str],
@@ -901,8 +1125,9 @@ def _build_top10_context_rows(
 ) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     norm_criteria = _normalize_criteria_input(criteria)
-    top_rows = top10_payload.get("rows") if isinstance(top10_payload, dict) else None
-    if not isinstance(top_rows, list) or not top_rows:
+    top_rows = _normalize_top10_rows(top10_payload)
+
+    if not top_rows:
         rows.append(
             _make_row(
                 keys=keys,
@@ -925,7 +1150,7 @@ def _build_top10_context_rows(
             symbol="",
             metric="top10_count",
             value=len(top_rows),
-            notes="Top10 rows generated through core.analysis.top10_selector.",
+            notes="Top10 rows generated through selector/engine path.",
             last_updated_riyadh=ts,
         )
     )
@@ -947,7 +1172,7 @@ def _build_top10_context_rows(
         if not isinstance(raw, dict):
             continue
 
-        sym = _safe_str(raw.get("symbol"))
+        sym = _safe_str(raw.get("symbol") or raw.get("ticker") or raw.get("code"))
         name = _safe_str(raw.get("name"))
         rank = _as_int(raw.get("top10_rank"))
         if rank is None:
