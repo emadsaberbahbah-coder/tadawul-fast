@@ -2,39 +2,47 @@
 # routes/enriched_quote.py
 """
 ================================================================================
-TFB Enriched Quote Routes Wrapper — v7.2.0
+TFB Enriched Quote Routes Wrapper — v7.3.0
 ================================================================================
-LEANER • SCHEMA-AWARE • PAGE-DISPATCH SAFE • GET+POST COMPATIBLE
+SCHEMA-AWARE • PAGE-DISPATCH SAFE • GET+POST COMPATIBLE
 ROOT /v1/enriched-quote COMPATIBLE • SPECIAL-PAGE SAFE • THREAD-OFFLOADED
 JSON-SAFE • TABLE-MODE SAFE • INSTRUMENT HYDRATION SAFE • LATENCY-FIRST
+WRAPPER-PAYLOAD SAFE • ROUTE-TOLERANT • CONTRACT-ALIGNED
 
 Design goals
 ------------
 - Keep public endpoint compatibility already used by tests/legacy clients
 - Keep enriched route strong for normal instrument pages
-- Use direct page dispatch from page_catalog + schema_registry
+- Use direct page dispatch from page_catalog + schema_registry when available
 - Keep special-page handling explicit:
     - Insights_Analysis
     - Top_10_Investments
     - Data_Dictionary
-- Reduce oversized compatibility/fallback layers
-- Preserve stable response envelope:
-    headers + keys + rows + rows_matrix + quotes + data + meta
-- No network calls at import time
+- Preserve stable response envelope with tolerant aliases:
+    headers + keys + rows + rows_matrix + quotes + data + items + meta
+    display_headers / sheet_headers / column_headers
+    columns / fields
+- Recognize richer engine payloads earlier and preserve them
+- Avoid network calls at import time
 
-What v7.2.0 fixes
------------------
-- ✅ FIX: table-mode engine execution now uses a narrower, priority-ordered call
-        plan instead of a large compatibility fan-out that could add latency
-- ✅ FIX: strong engine payloads are recognized earlier and returned sooner
-- ✅ FIX: table-mode payload quality scoring now rewards headers/keys/rows_matrix,
-        not rows only, reducing unnecessary extra retries
-- ✅ FIX: sparse quote rehydration is now capped and configurable to avoid heavy
-        per-symbol follow-up calls on large batches
-- ✅ FIX: batch quote execution prefers app.state.engine methods first, then falls
-        back cleanly without over-trying legacy signatures
-- ✅ FIX: enriched wrapper preserves large useful engine payloads more efficiently
-        while keeping the stable response envelope
+What v7.3.0 improves
+--------------------
+- ✅ FIX: much stronger wrapper payload extraction from nested payload/result/data
+        envelopes, rows_matrix payloads, direct row lists, and symbol maps
+- ✅ FIX: schema extraction now accepts columns / fields / headers / keys shapes
+- ✅ FIX: stable envelope now exposes:
+        - display_headers / sheet_headers / column_headers
+        - columns / fields
+        - items
+        - sheet / sheet_name
+- ✅ FIX: Top10 special-page scoring rewards top10-only fields and prefers the
+        richer payload when builder vs engine fallback differ
+- ✅ FIX: table-mode engine dispatch now includes execute/run/get_rows aliases
+- ✅ FIX: page-known detection is more tolerant for registry/data-dictionary specs
+- ✅ FIX: special-page builder fallback compares quality instead of only checking
+        whether any rows exist
+- ✅ FIX: instrument quote hydration keeps latency-first behavior while staying
+        compatible with newer engine aliases
 ================================================================================
 """
 
@@ -46,22 +54,29 @@ import inspect
 import logging
 import math
 import os
+import re
 import time
 import uuid
 from datetime import date, datetime, time as dt_time
 from decimal import Decimal
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, status
 
 logger = logging.getLogger("routes.enriched_quote")
 
-ROUTER_VERSION = "7.2.0"
+ROUTER_VERSION = "7.3.0"
 router: Optional[APIRouter] = None
 
+TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
+    "top10_rank",
+    "selection_reason",
+    "criteria_snapshot",
+)
+
 _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
-    "symbol": ["ticker", "code", "instrument", "security", "symbol_code"],
-    "ticker": ["symbol", "code", "instrument", "security"],
+    "symbol": ["ticker", "code", "instrument", "security", "symbol_code", "requested_symbol"],
+    "ticker": ["symbol", "code", "instrument", "security", "requested_symbol"],
     "name": ["company_name", "long_name", "instrument_name", "security_name"],
     "current_price": ["price", "last_price", "last", "close", "market_price", "current", "spot", "nav"],
     "recommendation_reason": ["reason", "reco_reason", "recommendation_notes"],
@@ -257,13 +272,6 @@ def _int_from_body(body: Mapping[str, Any], key: str, default: int) -> int:
     return default
 
 
-def _first_list(*values: Any) -> List[Any]:
-    for value in values:
-        if isinstance(value, list):
-            return value
-    return []
-
-
 def _rows_matrix(rows: Sequence[Mapping[str, Any]], keys: Sequence[str]) -> List[List[Any]]:
     return [[_json_safe(row.get(k)) for k in keys] for row in rows]
 
@@ -304,6 +312,13 @@ def _symbol_match_candidates(sym: Any) -> List[str]:
     return out
 
 
+def _looks_like_symbol_token(x: Any) -> bool:
+    s = _strip(x).upper()
+    if not s or " " in s or len(s) > 24:
+        return False
+    return bool(re.fullmatch(r"[A-Z0-9\.\=\-\^:_/]{1,24}", s))
+
+
 def _payload_row_richness(d: Optional[Dict[str, Any]]) -> int:
     if not isinstance(d, dict):
         return 0
@@ -336,6 +351,9 @@ def _payload_row_richness(d: Optional[Dict[str, Any]]) -> int:
         "data_provider",
         "last_updated_utc",
         "last_updated_riyadh",
+        "top10_rank",
+        "selection_reason",
+        "criteria_snapshot",
     )
     return sum(1 for key in important if d.get(key) not in (None, "", [], {}))
 
@@ -410,6 +428,82 @@ def _merged_special_body(body: Mapping[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _complete_schema_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple[List[str], List[str]]:
+    raw_headers = list(headers or [])
+    raw_keys = list(keys or [])
+    max_len = max(len(raw_headers), len(raw_keys))
+
+    hdrs: List[str] = []
+    ks: List[str] = []
+
+    for i in range(max_len):
+        h = _strip(raw_headers[i]) if i < len(raw_headers) else ""
+        k = _strip(raw_keys[i]) if i < len(raw_keys) else ""
+
+        if h and not k:
+            k = h.lower().replace(" ", "_")
+        elif k and not h:
+            h = k.replace("_", " ").title()
+        elif not h and not k:
+            h = f"Column_{i+1}"
+            k = f"key_{i+1}"
+
+        hdrs.append(h)
+        ks.append(k)
+
+    return hdrs, ks
+
+
+def _ensure_top10_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple[List[str], List[str]]:
+    hdrs = list(headers or [])
+    ks = list(keys or [])
+
+    header_map = {
+        "top10_rank": "Top10 Rank",
+        "selection_reason": "Selection Reason",
+        "criteria_snapshot": "Criteria Snapshot",
+    }
+    for key in TOP10_REQUIRED_FIELDS:
+        if key not in ks:
+            ks.append(key)
+            hdrs.append(header_map[key])
+
+    return _complete_schema_contract(hdrs, ks)
+
+
+def _looks_like_explicit_row_dict(d: Any) -> bool:
+    if not isinstance(d, Mapping) or not d:
+        return False
+
+    keyset = {str(k) for k in d.keys()}
+    if keyset & {"symbol", "ticker", "code", "requested_symbol"}:
+        return True
+    if {"sheet", "header", "key"}.issubset(keyset):
+        return True
+    if {"section", "item"}.issubset(keyset):
+        return True
+    if {"top10_rank", "selection_reason"}.issubset(keyset):
+        return True
+
+    return False
+
+
+def _rows_from_matrix(rows_matrix: Any, cols: Sequence[str]) -> List[Dict[str, Any]]:
+    if not isinstance(rows_matrix, list) or not cols:
+        return []
+    keys = [_strip(c) for c in cols if _strip(c)]
+    if not keys:
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for row in rows_matrix:
+        if not isinstance(row, (list, tuple)):
+            continue
+        vals = list(row)
+        out.append({keys[i]: (vals[i] if i < len(vals) else None) for i in range(len(keys))})
+    return out
+
+
 class _Service:
     def __init__(self, reason: str):
         self.reason = reason
@@ -471,7 +565,12 @@ class _Service:
         )
         self.build_top10_rows = self._resolve_first_callable(
             "core.analysis.top10_selector",
-            ("build_top10_rows", "build_top10_output_rows"),
+            (
+                "build_top10_rows",
+                "build_top10_output_rows",
+                "build_top10_investments_rows",
+                "get_top10_rows",
+            ),
         )
 
         try:
@@ -578,8 +677,11 @@ class _Service:
         try:
             if request is not None:
                 state = getattr(request.app, "state", None)
-                if state is not None and getattr(state, "engine", None) is not None:
-                    return state.engine
+                if state is not None:
+                    for attr in ("engine", "data_engine", "quote_engine", "cache_engine"):
+                        value = getattr(state, attr, None)
+                        if value is not None:
+                            return value
         except Exception:
             pass
 
@@ -611,6 +713,7 @@ class _Service:
             "commodities_and_fx": "Commodities_FX",
             "mutual_funds": "Mutual_Funds",
             "my_portfolio": "My_Portfolio",
+            "my_investments": "My_Investments",
             "insights_analysis": "Insights_Analysis",
             "top10": "Top_10_Investments",
             "top10_investments": "Top_10_Investments",
@@ -634,6 +737,72 @@ class _Service:
         if page == "Data_Dictionary":
             return "dictionary"
         return "instrument"
+
+    def _schema_columns_from_any(self, spec: Any) -> List[Any]:
+        if spec is None:
+            return []
+
+        if isinstance(spec, dict) and len(spec) == 1 and "columns" not in spec and "fields" not in spec:
+            first_val = list(spec.values())[0]
+            if isinstance(first_val, dict) and ("columns" in first_val or "fields" in first_val):
+                spec = first_val
+
+        cols = getattr(spec, "columns", None)
+        if isinstance(cols, list) and cols:
+            return cols
+
+        fields = getattr(spec, "fields", None)
+        if isinstance(fields, list) and fields:
+            return fields
+
+        if isinstance(spec, Mapping):
+            cols2 = spec.get("columns") or spec.get("fields")
+            if isinstance(cols2, list) and cols2:
+                return cols2
+
+        try:
+            d = getattr(spec, "__dict__", None)
+            if isinstance(d, dict):
+                cols3 = d.get("columns") or d.get("fields")
+                if isinstance(cols3, list) and cols3:
+                    return cols3
+        except Exception:
+            pass
+
+        return []
+
+    def _schema_keys_headers_from_spec(self, spec: Any) -> Tuple[List[str], List[str]]:
+        headers: List[str] = []
+        keys: List[str] = []
+
+        cols = self._schema_columns_from_any(spec)
+        for c in cols:
+            if isinstance(c, Mapping):
+                h = _strip(c.get("header") or c.get("display_header") or c.get("displayHeader") or c.get("label") or c.get("title"))
+                k = _strip(c.get("key") or c.get("field") or c.get("name") or c.get("id"))
+            else:
+                h = _strip(
+                    getattr(
+                        c,
+                        "header",
+                        getattr(c, "display_header", getattr(c, "displayHeader", getattr(c, "label", getattr(c, "title", None)))),
+                    )
+                )
+                k = _strip(getattr(c, "key", getattr(c, "field", getattr(c, "name", getattr(c, "id", None)))))
+
+            if h or k:
+                headers.append(h or k.replace("_", " ").title())
+                keys.append(k or h.lower().replace(" ", "_"))
+
+        if not headers and not keys and isinstance(spec, Mapping):
+            headers2 = spec.get("headers") or spec.get("display_headers")
+            keys2 = spec.get("keys") or spec.get("columns") or spec.get("fields")
+            if isinstance(headers2, list):
+                headers = [_strip(x) for x in headers2 if _strip(x)]
+            if isinstance(keys2, list):
+                keys = [_strip(x) for x in keys2 if _strip(x)]
+
+        return _complete_schema_contract(headers, keys)
 
     def _schema_from_data_dictionary(self, page: str) -> Tuple[List[str], List[str]]:
         if not callable(self.build_data_dictionary_rows):
@@ -670,16 +839,9 @@ class _Service:
         if self._has_schema:
             try:
                 spec = self.get_sheet_spec(page)
-                if spec is not None:
-                    if isinstance(spec, Mapping):
-                        if spec.get("columns") or spec.get("headers") or spec.get("keys"):
-                            return True
-                    else:
-                        cols = getattr(spec, "columns", None)
-                        if cols is not None:
-                            return True
-                        if getattr(spec, "headers", None) or getattr(spec, "keys", None):
-                            return True
+                headers, keys = self._schema_keys_headers_from_spec(spec)
+                if headers and keys:
+                    return True
             except Exception:
                 pass
 
@@ -693,22 +855,7 @@ class _Service:
         if self._has_schema:
             try:
                 spec = self.get_sheet_spec(page)
-                cols = list(getattr(spec, "columns", None) or [])
-
-                if not cols and isinstance(spec, Mapping):
-                    cols = list(spec.get("columns") or [])
-                    if not cols:
-                        headers = [_strip(x) for x in list(spec.get("headers") or []) if _strip(x)]
-                        keys = [_strip(x) for x in list(spec.get("keys") or []) if _strip(x)]
-
-                for col in cols:
-                    d = col if isinstance(col, Mapping) else _model_to_dict(col)
-                    h = _strip(d.get("header") or getattr(col, "header", None))
-                    k = _strip(d.get("key") or getattr(col, "key", None))
-                    if h:
-                        headers.append(h)
-                    if k:
-                        keys.append(k)
+                headers, keys = self._schema_keys_headers_from_spec(spec)
             except Exception:
                 headers, keys = [], []
 
@@ -721,12 +868,16 @@ class _Service:
             headers = ["Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes"]
             keys = ["sheet", "group", "header", "key", "dtype", "fmt", "required", "source", "notes"]
 
+        if page == "Top_10_Investments":
+            headers, keys = _ensure_top10_contract(headers, keys)
+
         if not headers and keys:
-            headers = list(keys)
+            headers = [k.replace("_", " ").title() for k in keys]
         if not keys and headers:
             keys = [h.lower().replace(" ", "_") for h in headers]
 
-        return (headers or ["Symbol", "Error"], keys or ["symbol", "error"])
+        headers, keys = _complete_schema_contract(headers or ["Symbol", "Error"], keys or ["symbol", "error"])
+        return headers, keys
 
     def _key_variants(self, key: str) -> List[str]:
         base = _strip(key)
@@ -748,12 +899,17 @@ class _Service:
 
     def _extract_from_raw(self, raw: Dict[str, Any], candidates: Sequence[str]) -> Any:
         lowered = {str(k).strip().lower(): v for k, v in raw.items()}
+        compressed = {re.sub(r"[^a-z0-9]+", "", str(k).lower()): v for k, v in raw.items()}
+
         for candidate in candidates:
             if candidate in raw:
                 return raw[candidate]
             lc = candidate.lower()
             if lc in lowered:
                 return lowered[lc]
+            cc = re.sub(r"[^a-z0-9]+", "", candidate.lower())
+            if cc in compressed:
+                return compressed[cc]
         return None
 
     def normalize_row(self, keys: Sequence[str], raw: Mapping[str, Any], *, symbol_fallback: str = "") -> Dict[str, Any]:
@@ -768,36 +924,89 @@ class _Service:
 
         return row
 
-    def extract_rows_like(self, payload: Any) -> List[Dict[str, Any]]:
-        if payload is None:
+    def extract_rows_like(self, payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
+        if payload is None or depth > 8:
             return []
 
         if isinstance(payload, list):
-            if payload and isinstance(payload[0], (list, tuple)):
+            if not payload:
                 return []
-            return [x if isinstance(x, Mapping) else _model_to_dict(x) for x in payload]
+            if all(isinstance(x, Mapping) for x in payload):
+                return [dict(x) for x in payload if isinstance(x, Mapping)]
+            model_rows = [_model_to_dict(x) for x in payload]
+            model_rows = [r for r in model_rows if isinstance(r, dict) and r]
+            if model_rows and all(_looks_like_explicit_row_dict(r) or _strip(r.get("symbol") or r.get("ticker")) for r in model_rows):
+                return model_rows
+            return []
 
-        if isinstance(payload, dict):
-            for name in ("rows", "data", "items", "records", "quotes"):
-                value = payload.get(name)
-                if isinstance(value, list):
-                    if value and isinstance(value[0], (list, tuple)):
-                        continue
-                    return [x if isinstance(x, Mapping) else _model_to_dict(x) for x in value]
-                if isinstance(value, dict):
-                    nested = self.extract_rows_like(value)
-                    if nested:
-                        return nested
+        if not isinstance(payload, Mapping):
+            d = _model_to_dict(payload)
+            return [d] if _looks_like_explicit_row_dict(d) else []
 
-            for name in ("payload", "result"):
-                if isinstance(payload.get(name), dict):
-                    nested = self.extract_rows_like(payload.get(name))
-                    if nested:
-                        return nested
+        if _looks_like_explicit_row_dict(payload):
+            return [dict(payload)]
+
+        maybe_symbol_map = True
+        rows_from_symbol_map: List[Dict[str, Any]] = []
+        symbol_like_keys = 0
+        for k, v in payload.items():
+            if not isinstance(v, Mapping):
+                maybe_symbol_map = False
+                break
+            if not _looks_like_symbol_token(k):
+                maybe_symbol_map = False
+                break
+            symbol_like_keys += 1
+            row = dict(v)
+            if not row.get("symbol") and not row.get("ticker"):
+                row["symbol"] = _strip(k)
+                row["ticker"] = _strip(k)
+            rows_from_symbol_map.append(row)
+        if maybe_symbol_map and symbol_like_keys > 0 and rows_from_symbol_map:
+            return rows_from_symbol_map
+
+        keys_like = self.extract_keys_like(payload)
+        if not keys_like:
+            hdrs = self.extract_headers_like(payload)
+            if hdrs:
+                keys_like = [h.lower().replace(" ", "_") for h in hdrs if _strip(h)]
+
+        for key in ("rows", "items", "data", "results", "records", "quotes"):
+            value = payload.get(key)
+
+            if isinstance(value, list):
+                rows = self.extract_rows_like(value, depth + 1)
+                if rows:
+                    return rows
+                if value and any(isinstance(x, (list, tuple)) for x in value) and keys_like:
+                    rows = _rows_from_matrix(value, keys_like)
+                    if rows:
+                        return rows
+
+            if isinstance(value, Mapping):
+                rows = self.extract_rows_like(value, depth + 1)
+                if rows:
+                    return rows
+
+        rows_matrix = payload.get("rows_matrix") or payload.get("matrix") or payload.get("values")
+        if isinstance(rows_matrix, list) and keys_like:
+            rows = _rows_from_matrix(rows_matrix, keys_like)
+            if rows:
+                return rows
+
+        for key in ("payload", "result", "response", "output", "data"):
+            value = payload.get(key)
+            if value is not None and value is not payload:
+                rows = self.extract_rows_like(value, depth + 1)
+                if rows:
+                    return rows
 
         return []
 
-    def extract_matrix_like(self, payload: Any) -> Optional[List[List[Any]]]:
+    def extract_matrix_like(self, payload: Any, depth: int = 0) -> Optional[List[List[Any]]]:
+        if depth > 8:
+            return None
+
         if isinstance(payload, dict):
             value = payload.get("rows_matrix")
             if isinstance(value, list):
@@ -807,50 +1016,62 @@ class _Service:
             if isinstance(rows, list) and rows and isinstance(rows[0], (list, tuple)):
                 return [list(r) if isinstance(r, (list, tuple)) else [r] for r in rows]
 
-            for name in ("data", "payload", "result"):
+            for name in ("matrix", "values"):
+                nested_value = payload.get(name)
+                if isinstance(nested_value, list):
+                    return [list(r) if isinstance(r, (list, tuple)) else [r] for r in nested_value]
+
+            for name in ("data", "payload", "result", "response", "output"):
                 nested = payload.get(name)
                 if isinstance(nested, dict):
-                    found = self.extract_matrix_like(nested)
+                    found = self.extract_matrix_like(nested, depth + 1)
                     if found is not None:
                         return found
 
         return None
 
-    def extract_headers_like(self, payload: Any) -> List[str]:
-        if not isinstance(payload, dict):
+    def extract_headers_like(self, payload: Any, depth: int = 0) -> List[str]:
+        if depth > 8 or not isinstance(payload, dict):
             return []
 
-        for name in ("display_headers", "sheet_headers", "column_headers", "headers", "columns"):
+        for name in ("display_headers", "sheet_headers", "column_headers", "headers"):
             value = payload.get(name)
             if isinstance(value, list):
                 out = [_strip(x) for x in value if _strip(x)]
                 if out:
                     return out
 
-        for name in ("payload", "result"):
+        # columns may be keys-like, but if they look human-readable keep them as headers
+        columns = payload.get("columns")
+        if isinstance(columns, list):
+            out = [_strip(x) for x in columns if _strip(x)]
+            if out and any(" " in x or x.istitle() for x in out):
+                return out
+
+        for name in ("payload", "result", "response", "output", "data"):
             nested = payload.get(name)
             if isinstance(nested, dict):
-                found = self.extract_headers_like(nested)
+                found = self.extract_headers_like(nested, depth + 1)
                 if found:
                     return found
 
         return []
 
-    def extract_keys_like(self, payload: Any) -> List[str]:
-        if not isinstance(payload, dict):
+    def extract_keys_like(self, payload: Any, depth: int = 0) -> List[str]:
+        if depth > 8 or not isinstance(payload, dict):
             return []
 
-        for name in ("keys", "fields", "column_keys", "schema_keys"):
+        for name in ("keys", "fields", "column_keys", "schema_keys", "columns"):
             value = payload.get(name)
             if isinstance(value, list):
                 out = [_strip(x) for x in value if _strip(x)]
                 if out:
                     return out
 
-        for name in ("payload", "result"):
+        for name in ("payload", "result", "response", "output", "data"):
             nested = payload.get(name)
             if isinstance(nested, dict):
-                found = self.extract_keys_like(nested)
+                found = self.extract_keys_like(nested, depth + 1)
                 if found:
                     return found
 
@@ -884,7 +1105,17 @@ class _Service:
             or self.extract_keys_like(payload)
         )
 
-    def payload_quality_score(self, payload: Any) -> int:
+    def _top10_coverage_score(self, payload: Any) -> int:
+        rows = self.extract_rows_like(payload)
+        if not rows:
+            return 0
+        score = 0
+        for field in TOP10_REQUIRED_FIELDS:
+            if any(isinstance(r, Mapping) and r.get(field) not in (None, "", [], {}) for r in rows):
+                score += 1
+        return score
+
+    def payload_quality_score(self, payload: Any, page: str = "") -> int:
         if payload is None:
             return -10
         if isinstance(payload, list):
@@ -907,12 +1138,17 @@ class _Service:
         if keys_like:
             score += 8
 
+        if self.normalize_page(page) == "Top_10_Investments":
+            score += 10 * self._top10_coverage_score(payload)
+
         status_out, error_out, meta_in = self.extract_status_error_meta(payload)
 
         if _strip(status_out).lower() == "success":
             score += 4
         elif _strip(status_out).lower() == "partial":
             score += 2
+        elif _strip(status_out).lower() == "warn":
+            score += 1
         elif _strip(status_out).lower() == "error":
             score -= 3
 
@@ -943,18 +1179,25 @@ class _Service:
         extra_meta: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         rows_out = [dict(r) for r in rows]
+        hdrs = list(headers)
+        ks = list(keys)
         return _json_safe(
             {
                 "status": status,
                 "page": page,
+                "sheet": page,
+                "sheet_name": page,
                 "route_family": route_family,
-                "headers": list(headers) if include_headers else [],
-                "keys": list(keys),
-                "display_headers": list(headers),
-                "sheet_headers": list(headers),
-                "column_headers": list(headers),
+                "headers": hdrs if include_headers else [],
+                "display_headers": hdrs if include_headers else [],
+                "sheet_headers": hdrs if include_headers else [],
+                "column_headers": hdrs if include_headers else [],
+                "keys": ks,
+                "columns": ks,
+                "fields": ks,
                 "rows": rows_out,
-                "rows_matrix": _rows_matrix(rows_out, keys) if include_matrix else None,
+                "items": rows_out,
+                "rows_matrix": _rows_matrix(rows_out, ks) if include_matrix else [],
                 "quotes": rows_out,
                 "data": rows_out,
                 "error": error,
@@ -993,29 +1236,25 @@ class _Service:
             headers_out = [str(x) for x in (result_headers or list(headers)) if _strip(x)] or list(headers)
             keys_out = [str(x) for x in (result_keys or list(keys)) if _strip(x)] or list(keys)
 
-            rows_raw = result.get("rows")
-            rows_matrix_raw = result.get("rows_matrix")
+            if page == "Top_10_Investments":
+                headers_out, keys_out = _ensure_top10_contract(headers_out, keys_out)
+            else:
+                headers_out, keys_out = _complete_schema_contract(headers_out, keys_out)
+
+            rows_raw = self.extract_rows_like(result)
             rows_out: List[Dict[str, Any]] = []
 
-            if isinstance(rows_raw, list) and rows_raw:
-                for item in rows_raw:
-                    d = item if isinstance(item, Mapping) else _model_to_dict(item)
-                    rows_out.append(self.normalize_row(keys_out, d) if d else {k: None for k in keys_out})
-            elif isinstance(rows_matrix_raw, list) and rows_matrix_raw:
-                rows_out = self.matrix_to_rows(rows_matrix_raw, keys_out)
+            if rows_raw:
+                rows_out = [self.normalize_row(keys_out, r) for r in rows_raw]
             else:
-                extracted = self.extract_rows_like(result)
-                if extracted:
-                    rows_out = [self.normalize_row(keys_out, r) for r in extracted]
-                else:
-                    matrix = self.extract_matrix_like(result)
-                    if matrix:
-                        rows_out = self.matrix_to_rows(matrix, keys_out)
+                matrix = self.extract_matrix_like(result)
+                if matrix:
+                    rows_out = self.matrix_to_rows(matrix, keys_out)
 
             status_out, error_out, meta_in = self.extract_status_error_meta(result)
             return self.envelope(
                 status=status_out,
-                page=_strip(result.get("page")) or page,
+                page=_strip(result.get("page") or result.get("sheet") or result.get("sheet_name")) or page,
                 route_family=_strip(result.get("route_family")) or route_family,
                 headers=headers_out,
                 keys=keys_out,
@@ -1088,8 +1327,16 @@ class _Service:
                 "get_page_rows",
                 "sheet_rows",
                 "build_sheet_rows",
+                "execute_sheet_rows",
+                "run_sheet_rows",
+                "get_rows_for_sheet",
+                "get_rows_for_page",
                 "get_sheet",
                 "build_sheet",
+                "get_cached_sheet_rows",
+                "get_sheet_snapshot",
+                "get_cached_sheet_snapshot",
+                "get_page_snapshot",
             ):
                 fn = getattr(engine, name, None)
                 if callable(fn) and id(fn) not in seen_ids:
@@ -1184,7 +1431,7 @@ class _Service:
                     continue
 
                 payload_out = self._coerce_engine_result_payload(res, page)
-                score = self.payload_quality_score(payload_out)
+                score = self.payload_quality_score(payload_out, page=page)
 
                 if score > best_score:
                     best_score = score
@@ -1375,7 +1622,7 @@ class _Service:
                 error=f"{type(e).__name__}: {e}",
             )
 
-        payload = self.payload_from_result(
+        builder_payload = self.payload_from_result(
             result=result,
             page=page,
             route_family=route_family,
@@ -1390,12 +1637,23 @@ class _Service:
             extra_meta={"builder_payload_preserved": True},
         )
 
-        if not _special_schema_only_requested(body) and not self.payload_has_rows(result):
-            fallback = await _engine_fallback(f"{builder_name}_empty")
-            if fallback is not None and self.payload_has_rows(fallback):
-                return fallback
+        builder_score = self.payload_quality_score(builder_payload, page=page)
 
-        return payload
+        if _special_schema_only_requested(body):
+            return builder_payload
+
+        need_compare_fallback = not self.payload_has_rows(builder_payload)
+        if page == "Top_10_Investments":
+            need_compare_fallback = need_compare_fallback or self._top10_coverage_score(builder_payload) < 2
+
+        if need_compare_fallback:
+            fallback = await _engine_fallback(f"{builder_name}_empty_or_low_quality")
+            if fallback is not None:
+                fallback_score = self.payload_quality_score(fallback, page=page)
+                if fallback_score >= builder_score:
+                    return fallback
+
+        return builder_payload
 
 
 def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
@@ -1499,7 +1757,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             return {}
 
         batch_fn = None
-        for name in ("get_enriched_quotes_batch", "get_analysis_quotes_batch", "get_quotes_batch"):
+        for name in ("get_enriched_quotes_batch", "get_analysis_quotes_batch", "get_quotes_batch", "quotes_batch"):
             candidate = getattr(engine, name, None)
             if callable(candidate):
                 batch_fn = candidate
@@ -1509,6 +1767,9 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             signatures = [
                 ((), {"symbols": list(symbols), "mode": mode, "schema": page}),
                 ((), {"symbols": list(symbols), "mode": mode}),
+                ((), {"symbols": list(symbols)}),
+                ((list(symbols),), {"mode": mode, "schema": page}),
+                ((list(symbols),), {"mode": mode}),
                 ((list(symbols),), {}),
             ]
 
@@ -1568,7 +1829,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             async def _rehydrate(sym: str) -> None:
                 nonlocal rehydrated_rows
                 async with sem:
-                    signatures = [((sym,), {"schema": page}), ((sym,), {})]
+                    signatures = [((sym,), {"schema": page}), ((sym,), {}), ((), {"symbol": sym, "schema": page}), ((), {"symbol": sym})]
                     fresh: Dict[str, Any] = {}
 
                     for args, kwargs in signatures:
@@ -1843,16 +2104,22 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             if not raw_rows:
                 matrix = svc.extract_matrix_like(payload)
                 if matrix:
-                    raw_rows = svc.matrix_to_rows(matrix, keys)
+                    payload_keys = svc.extract_keys_like(payload) or keys
+                    raw_rows = svc.matrix_to_rows(matrix, payload_keys)
 
-            rows_out = [svc.normalize_row(keys, r) for r in raw_rows]
+            payload_headers = svc.extract_headers_like(payload) or headers
+            payload_keys = svc.extract_keys_like(payload) or keys
+
+            if page == "Top_10_Investments":
+                payload_headers, payload_keys = _ensure_top10_contract(payload_headers, payload_keys)
+            else:
+                payload_headers, payload_keys = _complete_schema_contract(payload_headers, payload_keys)
+
+            rows_out = [svc.normalize_row(payload_keys, r) for r in raw_rows]
             if offset > 0:
                 rows_out = rows_out[offset:]
             if limit > 0:
                 rows_out = rows_out[:limit]
-
-            payload_headers = svc.extract_headers_like(payload) or headers
-            payload_keys = svc.extract_keys_like(payload) or keys
 
             status_out, error_out, meta_in = svc.extract_status_error_meta(payload)
             result = svc.envelope(
@@ -1949,9 +2216,15 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             {
                 "status": "success" if hdrs else "degraded",
                 "page": page_norm,
+                "sheet": page_norm,
+                "sheet_name": page_norm,
                 "headers": hdrs,
-                "keys": keys,
                 "display_headers": hdrs,
+                "sheet_headers": hdrs,
+                "column_headers": hdrs,
+                "keys": keys,
+                "columns": keys,
+                "fields": keys,
                 "route_family": svc.route_family(page_norm),
                 "router_version": ROUTER_VERSION,
                 "reason": None if hdrs else reason,
