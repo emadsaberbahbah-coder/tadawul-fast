@@ -2304,4 +2304,4 @@ router.include_router(advanced_router)
 router.include_router(schema_router_v1)
 router.include_router(schema_router_compat)
 
-__all__ = ["router", "ADVANCED_ANALYSIS_VERSION"]
+__all__ = ["router", "ADVANCED_ANALYSIS_VERSION"]         give me full revised script 
