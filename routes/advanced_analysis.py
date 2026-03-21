@@ -2,29 +2,30 @@
 """
 routes/advanced_analysis.py
 --------------------------------------------------------------------------------
-TADAWUL ADVANCED ANALYSIS ROUTER — v6.6.0
-(SHARED-PIPELINE ALIGNED / ROOT+V1 COMPAT / INSIGHTS+TOP10 WIRED /
- SHEET-ROWS CONTRACT ALIGNED / SCHEMA-ENDPOINTS STABLE / DATA-DICTIONARY SAFE /
- JSON-SAFE / LIMIT+OFFSET CONSISTENT / ROW-OBJECTS + MATRIX)
+TADAWUL ADVANCED ANALYSIS ROUTER — v6.7.0
+(SHARED-PIPELINE HARDENED / ROOT+V1 COMPAT / INSIGHTS+TOP10 WIRED /
+ SHEET-ROWS CONTRACT FIXED / ROW-OBJECTS PRIMARY / MATRIX SECONDARY /
+ SCHEMA-ENDPOINTS STABLE / DATA-DICTIONARY SAFE / JSON-SAFE /
+ LIMIT+OFFSET CONSISTENT / ASYNC-SAFE)
 
 What this revision improves
-- ✅ FIX: aligns sheet-rows payload contract with advisor / investment_advisor /
-         enriched_quote:
-         - rows / rows_matrix => matrix aligned to keys
-         - row_objects / items / records / data / quotes => dict rows
-- ✅ FIX: schema endpoints remain stable for both /v1/schema/* and /schema/*.
-- ✅ FIX: keeps root /sheet-rows compatibility and /v1/advanced/sheet-rows.
-- ✅ FIX: GET + POST for sheet-rows remain available on both route families.
-- ✅ FIX: Top_10_Investments and Insights_Analysis prefer shared builder pipeline
-         first, then fall back safely.
-- ✅ FIX: Data_Dictionary is always schema-driven and canonical.
-- ✅ FIX: row slicing consistently honors offset/limit after normalization.
-- ✅ FIX: import-time safe: no network calls; heavy imports stay inside handlers.
+- ✅ FIX: imports asyncio at module level so shared pipeline / builder thread-offload
+         paths cannot fail with NameError.
+- ✅ FIX: `rows` now returns keyed row objects; `rows_matrix` remains the positional
+         matrix for legacy callers.
+- ✅ FIX: improves key/header extraction from `columns=[{key,header,...}]` payloads.
+- ✅ FIX: shared pipeline no longer short-circuits special pages when it only returns
+         structural placeholders or hard-failure payloads.
+- ✅ FIX: Top_10_Investments / Insights_Analysis now fall through more safely to
+         builder + engine fallback logic.
+- ✅ FIX: Data_Dictionary follows the same contract as other pages.
+- ✅ FIX: payload normalization preserves both row_objects and matrix consistently.
 --------------------------------------------------------------------------------
 """
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import math
@@ -46,7 +47,7 @@ from fastapi.routing import APIRouter
 logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
-ADVANCED_ANALYSIS_VERSION = "6.6.0"
+ADVANCED_ANALYSIS_VERSION = "6.7.0"
 
 # -----------------------------------------------------------------------------
 # Routers
@@ -257,6 +258,13 @@ def _now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _normalize_key_name(name: Any) -> str:
+    s = _strip(name)
+    if not s:
+        return ""
+    return re.sub(r"[^a-z0-9]+", "_", s.lower()).strip("_")
+
+
 # -----------------------------------------------------------------------------
 # JSON safety
 # -----------------------------------------------------------------------------
@@ -377,19 +385,22 @@ def _require_auth_or_401(
         {"token": auth_token},
     ]
 
+    type_error_seen = False
     for kwargs in attempts:
         try:
             if bool(auth_ok(**kwargs)):
                 return
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
         except TypeError:
+            type_error_seen = True
             continue
         except HTTPException:
             raise
         except Exception:
             raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
-    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+    if type_error_seen:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
 
 # -----------------------------------------------------------------------------
@@ -405,7 +416,7 @@ async def _call_maybe_async(fn: Any, *args: Any, **kwargs: Any) -> Any:
     if inspect.iscoroutinefunction(fn):
         return await fn(*args, **kwargs)
 
-    out = await asyncio.to_thread(fn, *args, **kwargs)  # type: ignore[name-defined]
+    out = await asyncio.to_thread(fn, *args, **kwargs)
     return await out if inspect.isawaitable(out) else out
 
 
@@ -511,7 +522,7 @@ def _complete_schema_contract(headers: Sequence[str], keys: Sequence[str]) -> Tu
         k = _strip(raw_keys[i]) if i < len(raw_keys) else ""
 
         if h and not k:
-            k = re.sub(r"[^a-z0-9]+", "_", h.lower()).strip("_")
+            k = _normalize_key_name(h)
         elif k and not h:
             h = k.replace("_", " ").title()
         elif not h and not k:
@@ -591,7 +602,7 @@ def _schema_headers_keys_from_spec(sheet: str, spec: Any) -> Tuple[List[str], Li
 
         if h or k:
             headers.append(h or k.replace("_", " ").title())
-            keys.append(k or re.sub(r"[^a-z0-9]+", "_", h.lower()).strip("_"))
+            keys.append(k or _normalize_key_name(h))
 
     if not headers and not keys and isinstance(spec, Mapping):
         headers2 = spec.get("headers") or spec.get("display_headers")
@@ -796,7 +807,7 @@ def _looks_like_symbol_token(x: Any) -> bool:
     s = _strip(x).upper()
     if not s or " " in s or len(s) > 24:
         return False
-    return bool(re.fullmatch(r"[A-Z0-9\\.=\\-\\^:_/]{1,24}", s))
+    return bool(re.fullmatch(r"[A-Z0-9\.\=\-\^:_/]{1,24}", s))
 
 
 def _looks_like_explicit_row_dict(d: Any) -> bool:
@@ -816,6 +827,32 @@ def _looks_like_explicit_row_dict(d: Any) -> bool:
         return True
 
     return False
+
+
+def _columns_to_keys_headers(columns: Any) -> Tuple[List[str], List[str]]:
+    keys: List[str] = []
+    headers: List[str] = []
+
+    if not isinstance(columns, list):
+        return keys, headers
+
+    for c in columns:
+        if isinstance(c, Mapping):
+            key = _strip(c.get("key") or c.get("field") or c.get("name") or c.get("id"))
+            header = _strip(c.get("header") or c.get("display_header") or c.get("displayHeader") or c.get("label") or c.get("title"))
+        else:
+            key = ""
+            header = ""
+            text = _strip(c)
+            if text:
+                key = _normalize_key_name(text)
+                header = text
+
+        if key or header:
+            headers.append(header or key.replace("_", " ").title())
+            keys.append(key or _normalize_key_name(header))
+
+    return _complete_schema_contract(headers, keys)
 
 
 def _rows_from_matrix_with_cols(rows_matrix: Any, cols: Sequence[str]) -> List[Dict[str, Any]]:
@@ -838,12 +875,21 @@ def _extract_keys_like(payload: Any, depth: int = 0) -> List[str]:
     if depth > 8 or not isinstance(payload, Mapping):
         return []
 
-    for name in ("keys", "fields", "column_keys", "schema_keys", "columns"):
+    for name in ("keys", "fields", "column_keys", "schema_keys"):
         value = payload.get(name)
         if isinstance(value, list):
             out = [_strip(x) for x in value if _strip(x)]
             if out:
                 return out
+
+    columns = payload.get("columns")
+    if isinstance(columns, list):
+        _headers, _keys = _columns_to_keys_headers(columns)
+        if _keys:
+            return _keys
+        out = [_strip(x) for x in columns if isinstance(x, str) and _strip(x)]
+        if out:
+            return out
 
     for name in ("payload", "result", "response", "output", "data"):
         nested = payload.get(name)
@@ -866,9 +912,12 @@ def _extract_headers_like(payload: Any, depth: int = 0) -> List[str]:
             if out:
                 return out
 
-    cols = payload.get("columns")
-    if isinstance(cols, list):
-        out = [_strip(x) for x in cols if _strip(x)]
+    columns = payload.get("columns")
+    if isinstance(columns, list):
+        _headers, _keys = _columns_to_keys_headers(columns)
+        if _headers:
+            return _headers
+        out = [_strip(x) for x in columns if isinstance(x, str) and _strip(x)]
         if out and any((" " in x) or x.istitle() for x in out):
             return out
 
@@ -931,7 +980,7 @@ def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
     if not keys_like:
         hdrs = _extract_headers_like(payload)
         if hdrs:
-            keys_like = [re.sub(r"[^a-z0-9]+", "_", h.lower()).strip("_") for h in hdrs if _strip(h)]
+            keys_like = [_normalize_key_name(h) for h in hdrs if _strip(h)]
 
     for name in ("row_objects", "records", "items", "data", "quotes", "rows", "results", "recommendations"):
         value = payload.get(name)
@@ -1093,6 +1142,18 @@ def _payload_quality_score(payload: Any, page: str = "") -> int:
         score -= 6
 
     return score
+
+
+def _shared_payload_acceptable(payload: Any, page: str) -> bool:
+    if payload is None:
+        return False
+    if _payload_looks_hard_failure(payload):
+        return False
+    if _payload_has_real_rows(payload):
+        return True
+    if page in {"Top_10_Investments", "Insights_Analysis"}:
+        return False
+    return _payload_has_structural_value(payload)
 
 
 # -----------------------------------------------------------------------------
@@ -1657,8 +1718,9 @@ def _build_data_dictionary_rows_payload(
             "keys": keys,
             "columns": keys,
             "fields": keys,
-            "rows": matrix,
+            "rows": rows,
             "rows_matrix": matrix,
+            "matrix": matrix,
             "row_objects": rows,
             "items": rows,
             "records": rows,
@@ -1679,6 +1741,7 @@ def _build_data_dictionary_rows_payload(
                 "limit": limit,
                 "count": len(rows),
                 "row_object_count": len(rows),
+                "matrix_row_count": len(matrix),
             },
         }
     )
@@ -1742,6 +1805,7 @@ def _schema_only_payload(
     hdrs = list(headers or [])
     ks = list(keys or [])
     matrix: List[List[Any]] = [] if include_matrix else []
+    rows: List[Dict[str, Any]] = []
 
     return _json_safe(
         {
@@ -1757,13 +1821,14 @@ def _schema_only_payload(
             "keys": ks,
             "columns": ks,
             "fields": ks,
-            "rows": matrix,
+            "rows": rows,
             "rows_matrix": matrix,
-            "row_objects": [],
-            "items": [],
-            "records": [],
-            "data": [],
-            "quotes": [],
+            "matrix": matrix,
+            "row_objects": rows,
+            "items": rows,
+            "records": rows,
+            "data": rows,
+            "quotes": rows,
             "count": 0,
             "detail": "",
             "error": None,
@@ -1776,6 +1841,7 @@ def _schema_only_payload(
                 "headers_only": bool(headers_only),
                 "count": 0,
                 "row_object_count": 0,
+                "matrix_row_count": 0,
                 **(meta or {}),
             },
         }
@@ -1855,8 +1921,9 @@ def _normalize_result_to_payload(
             "keys": list(proj_keys),
             "columns": list(proj_keys),
             "fields": list(proj_keys),
-            "rows": matrix,
+            "rows": rows,
             "rows_matrix": matrix,
+            "matrix": matrix,
             "row_objects": rows,
             "items": rows,
             "records": rows,
@@ -1876,6 +1943,7 @@ def _normalize_result_to_payload(
                 "limit": limit,
                 "count": len(rows),
                 "row_object_count": len(rows),
+                "matrix_row_count": len(matrix),
                 **(meta_in or {}),
                 **(extra_meta or {}),
             },
@@ -1897,8 +1965,6 @@ async def _run_advanced_sheet_rows_impl(
     authorization: Optional[str],
     x_request_id: Optional[str],
 ) -> Dict[str, Any]:
-    import asyncio  # kept local-safe and explicit for import-time safety
-
     t0 = time.perf_counter()
     body = _safe_dict(body)
     _require_auth_or_401(token_query=token, x_app_token=x_app_token, authorization=authorization)
@@ -1976,7 +2042,7 @@ async def _run_advanced_sheet_rows_impl(
         prefer_engine_sheet=(sheet not in {"Top_10_Investments", "Insights_Analysis"}),
     )
 
-    if shared_payload is not None and _payload_has_structural_value(shared_payload):
+    if _shared_payload_acceptable(shared_payload, sheet):
         return _normalize_result_to_payload(
             result=shared_payload,
             page=sheet,
@@ -2017,12 +2083,15 @@ async def _run_advanced_sheet_rows_impl(
             allow_symbol_rehydrate=False,
         )
 
-        if result is None and engine is not None:
+        if (result is None or _payload_looks_hard_failure(result) or not _payload_has_real_rows(result)) and engine is not None:
             try:
-                result = await _engine_fetch_any(engine, sheet=sheet, limit=limit, offset=offset, mode=mode or "", body=body)
-                dispatch = f"{dispatch or 'none'}_engine_fallback"
+                engine_result = await _engine_fetch_any(engine, sheet=sheet, limit=limit, offset=offset, mode=mode or "", body=body)
+                if engine_result is not None and (_payload_quality_score(engine_result, page=sheet) >= _payload_quality_score(result, page=sheet)):
+                    result = engine_result
+                    dispatch = "insights_engine_fallback_best"
             except Exception as e:
-                result = {"status": "partial", "row_objects": [], "error": str(e)}
+                if result is None:
+                    result = {"status": "partial", "row_objects": [], "error": str(e)}
 
         return _normalize_result_to_payload(
             result=result or {"status": "partial", "row_objects": []},
@@ -2069,7 +2138,7 @@ async def _run_advanced_sheet_rows_impl(
         engine_result = None
         engine_score = -9999
 
-        if engine is not None and (result is None or builder_score < 120):
+        if engine is not None and (result is None or builder_score < 120 or _payload_looks_hard_failure(result)):
             try:
                 engine_result = await _engine_fetch_any(engine, sheet=sheet, limit=limit, offset=offset, mode=mode or "", body=body)
                 engine_score = _payload_quality_score(engine_result, page=sheet)
@@ -2078,7 +2147,7 @@ async def _run_advanced_sheet_rows_impl(
 
         chosen = result
         chosen_dispatch = dispatch or "top10_builder"
-        if engine_result is not None and engine_score > builder_score:
+        if engine_result is not None and engine_score >= builder_score:
             chosen = engine_result
             chosen_dispatch = "engine_fallback_best"
 
@@ -2121,8 +2190,9 @@ async def _run_advanced_sheet_rows_impl(
                 "keys": schema_keys,
                 "columns": schema_keys,
                 "fields": schema_keys,
-                "rows": [] if include_matrix_final else [],
+                "rows": [],
                 "rows_matrix": [] if include_matrix_final else [],
+                "matrix": [] if include_matrix_final else [],
                 "row_objects": [],
                 "items": [],
                 "records": [],
@@ -2142,6 +2212,7 @@ async def _run_advanced_sheet_rows_impl(
                     "offset": offset,
                     "count": 0,
                     "row_object_count": 0,
+                    "matrix_row_count": 0,
                 },
             }
         )
@@ -2184,8 +2255,9 @@ async def _run_advanced_sheet_rows_impl(
                 "keys": schema_keys,
                 "columns": schema_keys,
                 "fields": schema_keys,
-                "rows": matrix,
+                "rows": rows,
                 "rows_matrix": matrix,
+                "matrix": matrix,
                 "row_objects": rows,
                 "items": rows,
                 "records": rows,
@@ -2208,6 +2280,7 @@ async def _run_advanced_sheet_rows_impl(
                     "limit": limit,
                     "count": len(rows),
                     "row_object_count": len(rows),
+                    "matrix_row_count": len(matrix),
                 },
             }
         )
@@ -2404,6 +2477,7 @@ async def advanced_health(request: Request) -> Dict[str, Any]:
             "insights_builder_wired": True,
             "top10_builder_wired": True,
             "shared_pipeline_aligned": True,
+            "rows_object_primary": True,
         }
     )
 
