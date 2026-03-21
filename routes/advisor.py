@@ -2,44 +2,27 @@
 # routes/advisor.py
 """
 ================================================================================
-ADVISOR ROUTER — v6.1.0
+ADVISOR ROUTER — v6.2.0
 (ENGINE-NATIVE-SHEET-ROWS / UNIFIED-RUNNER / STATUS-PRESERVING /
- SHARED-PIPELINE / AUTH-TOLERANT / SCHEMA-KEY-CORRECT / SPECIAL-PAGE SAFE)
+ SHARED-PIPELINE / AUTH-TOLERANT / SCHEMA-KEY-CORRECT /
+ ROW-OBJECTS + MATRIX / HEADER-ALIAS WIRING / SPECIAL-PAGE SAFE)
 ================================================================================
 
 What this revision fixes
 ------------------------
-- ✅ FIX: /v1/advisor/sheet-rows prefers native engine execution first via:
-         - get_sheet_rows(...)
-         - sheet_rows(...)
-         - build_sheet_rows(...)
-         - get_page_rows(...)
-         - get_sheet(...)
-         - get_cached_sheet_rows(...)
-         - get_sheet_snapshot(...)
-         - get_cached_sheet_snapshot(...)
-- ✅ FIX: advisor runner resolution is hardened across:
-         - app.state
-         - engine/service instances
-         - multiple core modules
-         - factory-returned service objects
-         - optional shared helpers from routes.investment_advisor
-- ✅ FIX: if native sheet-rows succeeds, its status/meta/contract are preserved,
-         while only missing stable fields are supplemented.
-- ✅ FIX: if native sheet-rows is unavailable, fallback goes through the shared
-         page pipeline when available, then the advisor runner, and finally
-         projects correctly to schema KEYS (not display headers).
-- ✅ FIX: page/sheet/sheet_name targeting is normalized consistently.
-- ✅ FIX: page-specific recommendation calls honor page when sources were not
-         explicitly narrowed.
-- ✅ FIX: GET and POST /v1/advisor/sheet-rows are both supported.
-- ✅ FIX: health endpoint exposes:
-         - runner discovery
-         - native engine sheet-row methods
-         - engine health when available
-- ✅ FIX: auth_ok(...) is called tolerantly across multiple possible signatures.
-- ✅ FIX: schema_only / headers_only short-circuit safely for sheet-rows.
-- ✅ SAFE: no network calls at import time.
+- ✅ FIX: /v1/advisor/sheet-rows now returns BOTH:
+         - rows / rows_matrix (matrix aligned to headers/keys)
+         - row_objects / items / records (dict rows aligned to keys)
+- ✅ FIX: dict-row projection now maps values by BOTH canonical key and display
+         header aliases, preventing all-null rows when upstream uses display
+         headers instead of schema keys.
+- ✅ FIX: native sheet payload normalization preserves compatible contract while
+         supplementing row_objects for easier testing/debugging.
+- ✅ FIX: advisor/shared/native fallbacks all converge to one stable sheet-rows
+         contract with correct key/header alignment.
+- ✅ FIX: Top_10_Investments context fields remain guaranteed in matrix and dict
+         forms.
+- ✅ SAFE: backward compatibility preserved for existing matrix consumers.
 ================================================================================
 """
 
@@ -62,7 +45,7 @@ router = APIRouter(prefix="/v1/advisor", tags=["advisor"])
 logger = logging.getLogger("routes.advisor")
 logger.addHandler(logging.NullHandler())
 
-ADVISOR_ROUTE_VERSION = "6.1.0"
+ADVISOR_ROUTE_VERSION = "6.2.0"
 TOP10_PAGE_NAME = "Top_10_Investments"
 
 _BASE_SOURCE_PAGES = [
@@ -1040,7 +1023,7 @@ async def _resolve_advisor_runner(request: Request, engine: Any = None) -> Tuple
 def _result_count(result: Mapping[str, Any]) -> int:
     if not isinstance(result, Mapping):
         return 0
-    for key in ("items", "rows", "data", "quotes", "rows_matrix"):
+    for key in ("items", "records", "row_objects", "rows", "data", "quotes", "rows_matrix"):
         value = result.get(key)
         if isinstance(value, list):
             return len(value)
@@ -1602,7 +1585,7 @@ def _rows_from_any(obj: Any) -> List[Any]:
         return []
 
     if isinstance(obj, dict):
-        for key in ("rows", "recommendations", "data", "items", "results", "records", "quotes"):
+        for key in ("row_objects", "records", "items", "rows", "data", "results", "quotes", "rows_matrix"):
             value = obj.get(key)
             if value is None:
                 continue
@@ -1645,10 +1628,10 @@ def _project_dict_items_to_matrix(items: List[Any], keys: List[str]) -> List[Lis
         elif isinstance(item, (list, tuple)):
             row = list(item)
             if len(row) < len(keys):
-                row.extend([None] * (len(keys) - 1))
+                row.extend([None] * (len(keys) - len(row)))
             projected.append([_json_safe(x) for x in row[: len(keys)]])
         else:
-            projected.append([_json_safe(item)] + [None] * (len(keys) - 1))
+            projected.append([_json_safe(item)] + [None] * (max(0, len(keys) - 1)))
     return projected
 
 
@@ -1663,6 +1646,102 @@ def _extract_value_ci(raw: Mapping[str, Any], key: str) -> Any:
         if _snake_like(str(rk)).replace("_", "") == compact:
             return rv
     return None
+
+
+def _lookup_candidates_for_key_header(key: str, header: str) -> List[str]:
+    candidates: List[str] = []
+
+    def _push(v: Any) -> None:
+        s = _clean_str(v)
+        if s:
+            candidates.append(s)
+
+    _push(key)
+    _push(header)
+
+    if key:
+        _push(key.lower())
+        _push(key.upper())
+        _push(key.replace("_", " "))
+        _push(key.replace("_", ""))
+        _push(key.replace("_", "-"))
+        _push(key.replace("_", "."))
+        _push(key.title())
+        _push(key.upper().replace("_", " "))
+        _push(key.lower().replace("_", " "))
+
+    if header:
+        _push(header.lower())
+        _push(header.upper())
+        _push(header.title())
+        _push(header.replace(" ", "_"))
+        _push(header.replace(" ", ""))
+        _push(header.replace(" ", "-"))
+        _push(_snake_like(header))
+
+    return _dedupe_keep_order(candidates)
+
+
+def _extract_value_by_key_header(raw: Mapping[str, Any], key: str, header: str) -> Any:
+    for candidate in _lookup_candidates_for_key_header(key, header):
+        value = _extract_value_ci(raw, candidate)
+        if value is not None:
+            return value
+    return None
+
+
+def _matrix_row_to_row_object(
+    row: Any,
+    *,
+    headers: Sequence[str],
+    keys: Sequence[str],
+    page: str,
+    payload: Optional[Mapping[str, Any]] = None,
+    rank: Optional[int] = None,
+) -> Dict[str, Any]:
+    vals = list(row) if isinstance(row, (list, tuple)) else [row]
+    raw: Dict[str, Any] = {}
+
+    for i, value in enumerate(vals):
+        if i < len(keys):
+            raw[str(keys[i])] = value
+        if i < len(headers):
+            hdr = _clean_str(headers[i])
+            if hdr and hdr not in raw:
+                raw[hdr] = value
+
+    return _project_item_to_row_object(
+        raw,
+        headers=headers,
+        keys=keys,
+        page=page,
+        payload=payload,
+        rank=rank,
+    )
+
+
+def _project_item_to_row_object(
+    item: Any,
+    *,
+    headers: Sequence[str],
+    keys: Sequence[str],
+    page: str,
+    payload: Optional[Mapping[str, Any]] = None,
+    rank: Optional[int] = None,
+) -> Dict[str, Any]:
+    raw = item if isinstance(item, dict) else _model_to_dict(item)
+    if not isinstance(raw, dict):
+        raw = {}
+
+    out: Dict[str, Any] = {}
+    for idx, key in enumerate(keys):
+        header = headers[idx] if idx < len(headers) else key
+        out[key] = _json_safe(_extract_value_by_key_header(raw, key, header))
+
+    if page == TOP10_PAGE_NAME:
+        out = _ensure_top10_context(out, payload or {}, rank)
+
+    return out
 
 
 def _infer_horizon_days(payload: Mapping[str, Any]) -> Optional[int]:
@@ -1808,6 +1887,52 @@ def _ensure_top10_context(row: Dict[str, Any], payload: Mapping[str, Any], rank:
     return out
 
 
+def _row_objects_from_matrix(
+    rows_matrix: Sequence[Any],
+    *,
+    headers: Sequence[str],
+    keys: Sequence[str],
+    page: str,
+    payload: Optional[Mapping[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for idx, row in enumerate(rows_matrix, start=1):
+        out.append(
+            _matrix_row_to_row_object(
+                row,
+                headers=headers,
+                keys=keys,
+                page=page,
+                payload=payload,
+                rank=idx,
+            )
+        )
+    return out
+
+
+def _row_objects_from_items(
+    items: Sequence[Any],
+    *,
+    headers: Sequence[str],
+    keys: Sequence[str],
+    page: str,
+    payload: Optional[Mapping[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for idx, item in enumerate(items, start=1):
+        out.append(
+            _project_item_to_row_object(
+                item,
+                headers=headers,
+                keys=keys,
+                page=page,
+                payload=payload,
+                rank=idx,
+            )
+        )
+    return out
+
+
 async def _coerce_to_sheet_rows_response(
     *,
     page: str,
@@ -1820,40 +1945,62 @@ async def _coerce_to_sheet_rows_response(
     payload_headers, payload_keys = _extract_headers_keys_from_payload(raw)
     schema_headers, schema_keys = await _get_schema_layout(page)
 
-    keys = payload_keys or schema_keys
     headers = payload_headers or schema_headers
+    keys = payload_keys or schema_keys
+
+    if not keys and items and not _rows_are_matrix(items):
+        derived = _derive_keys_from_items([x for x in items if isinstance(x, dict)])
+        if derived:
+            keys = derived
+
     headers, keys = _complete_headers_keys(headers, keys)
     if page == TOP10_PAGE_NAME:
         headers, keys = _ensure_top10_fields(headers, keys)
 
-    rows_matrix: List[List[Any]] = []
+    row_objects: List[Dict[str, Any]] = []
 
     if items and _rows_are_matrix(items):
+        source_headers = payload_headers or headers
         source_keys = payload_keys or keys
-        projected_rows: List[Dict[str, Any]] = []
+        source_headers, source_keys = _complete_headers_keys(source_headers, source_keys)
+
+        raw_like_items: List[Dict[str, Any]] = []
         for row in items:
             vals = list(row) if isinstance(row, (list, tuple)) else [row]
-            item = {source_keys[i]: (vals[i] if i < len(vals) else None) for i in range(len(source_keys))}
-            if page == TOP10_PAGE_NAME:
-                item = _ensure_top10_context(item, payload, len(projected_rows) + 1)
-            projected_rows.append({k: _json_safe(item.get(k)) for k in keys})
-        rows_matrix = _project_dict_items_to_matrix(projected_rows, keys)
+            temp: Dict[str, Any] = {}
+            for i, value in enumerate(vals):
+                if i < len(source_keys):
+                    temp[str(source_keys[i])] = value
+                if i < len(source_headers):
+                    hdr = _clean_str(source_headers[i])
+                    if hdr and hdr not in temp:
+                        temp[hdr] = value
+            raw_like_items.append(temp)
 
+        row_objects = _row_objects_from_items(
+            raw_like_items,
+            headers=headers,
+            keys=keys,
+            page=page,
+            payload=payload,
+        )
     else:
-        dict_items: List[Dict[str, Any]] = []
-        for idx, item in enumerate(items, start=1):
-            d = item if isinstance(item, dict) else _model_to_dict(item)
-            if not isinstance(d, dict):
-                d = {}
-            if page == TOP10_PAGE_NAME:
-                d = _ensure_top10_context(d, payload, idx)
-            dict_items.append({k: _json_safe(_extract_value_ci(d, k)) for k in keys})
-        rows_matrix = _project_dict_items_to_matrix(dict_items, keys)
+        row_objects = _row_objects_from_items(
+            items,
+            headers=headers,
+            keys=keys,
+            page=page,
+            payload=payload,
+        )
+
+    rows_matrix = _project_dict_items_to_matrix(row_objects, keys)
 
     meta = raw.get("meta") if isinstance(raw.get("meta"), dict) else {}
     meta = dict(meta)
     meta.setdefault("route_version", ADVISOR_ROUTE_VERSION)
     meta.setdefault("projection", "advisor_result_to_sheet_rows")
+    meta["count"] = len(row_objects)
+    meta["row_object_count"] = len(row_objects)
 
     status_value = _clean_str(raw.get("status"))
     if not status_value:
@@ -1875,7 +2022,10 @@ async def _coerce_to_sheet_rows_response(
             "keys": keys,
             "rows": rows_matrix,
             "rows_matrix": rows_matrix,
-            "count": len(rows_matrix),
+            "row_objects": row_objects,
+            "items": row_objects,
+            "records": row_objects,
+            "count": len(row_objects),
             "detail": detail_value,
             "meta": meta,
             "version": raw.get("version") or ADVISOR_ROUTE_VERSION,
@@ -1889,10 +2039,16 @@ def _looks_like_sheet_payload(obj: Any) -> bool:
         return False
 
     if isinstance(obj.get("headers"), list) or isinstance(obj.get("keys"), list):
-        if isinstance(obj.get("rows"), list) or isinstance(obj.get("rows_matrix"), list):
+        if (
+            isinstance(obj.get("rows"), list)
+            or isinstance(obj.get("rows_matrix"), list)
+            or isinstance(obj.get("row_objects"), list)
+            or isinstance(obj.get("items"), list)
+            or isinstance(obj.get("records"), list)
+        ):
             return True
 
-    if any(k in obj for k in ("sheet", "page", "headers", "keys", "rows", "rows_matrix")):
+    if any(k in obj for k in ("sheet", "page", "headers", "keys", "rows", "rows_matrix", "row_objects", "items", "records")):
         score = 0
         if isinstance(obj.get("headers"), list):
             score += 1
@@ -1901,6 +2057,12 @@ def _looks_like_sheet_payload(obj: Any) -> bool:
         if isinstance(obj.get("rows"), list):
             score += 1
         if isinstance(obj.get("rows_matrix"), list):
+            score += 1
+        if isinstance(obj.get("row_objects"), list):
+            score += 1
+        if isinstance(obj.get("items"), list):
+            score += 1
+        if isinstance(obj.get("records"), list):
             score += 1
         if obj.get("sheet") or obj.get("page"):
             score += 1
@@ -1940,28 +2102,66 @@ def _normalize_sheet_payload(
     headers = raw.get("headers") or raw.get("display_headers") or []
     keys = raw.get("keys") or raw.get("fields") or []
     headers, keys = _complete_headers_keys(headers, keys)
-    if page == TOP10_PAGE_NAME:
-        headers, keys = _ensure_top10_fields(headers, keys)
+
+    row_objects_input = raw.get("row_objects")
+    if not isinstance(row_objects_input, list):
+        row_objects_input = raw.get("records")
+    if not isinstance(row_objects_input, list):
+        row_objects_input = raw.get("items")
 
     rows_obj = raw.get("rows")
     matrix_obj = raw.get("rows_matrix")
-    rows_matrix: List[List[Any]] = []
+
+    if page == TOP10_PAGE_NAME:
+        headers, keys = _ensure_top10_fields(headers, keys)
+
+    row_objects: List[Dict[str, Any]] = []
 
     if schema_only or headers_only:
-        rows_matrix = []
+        row_objects = []
+    elif isinstance(row_objects_input, list) and row_objects_input:
+        if not keys:
+            derived = _derive_keys_from_items([x for x in row_objects_input if isinstance(x, dict)])
+            if derived:
+                keys = derived
+                headers, keys = _complete_headers_keys(headers, keys)
+                if page == TOP10_PAGE_NAME:
+                    headers, keys = _ensure_top10_fields(headers, keys)
+        row_objects = _row_objects_from_items(
+            row_objects_input,
+            headers=headers,
+            keys=keys,
+            page=page,
+        )
     elif isinstance(rows_obj, list) and rows_obj:
         if all(isinstance(r, dict) for r in rows_obj):
             if not keys:
-                keys = list(rows_obj[0].keys())
+                keys = _derive_keys_from_items(rows_obj)
                 headers, keys = _complete_headers_keys(headers, keys)
-            rows_matrix = _project_dict_items_to_matrix(rows_obj, keys)
+                if page == TOP10_PAGE_NAME:
+                    headers, keys = _ensure_top10_fields(headers, keys)
+            row_objects = _row_objects_from_items(
+                rows_obj,
+                headers=headers,
+                keys=keys,
+                page=page,
+            )
         elif all(isinstance(r, (list, tuple)) for r in rows_obj):
-            rows_matrix = [list(r) for r in rows_obj]
+            row_objects = _row_objects_from_matrix(
+                rows_obj,
+                headers=headers,
+                keys=keys,
+                page=page,
+            )
     elif isinstance(matrix_obj, list):
-        rows_matrix = [list(r) if isinstance(r, (list, tuple)) else [r] for r in matrix_obj]
+        row_objects = _row_objects_from_matrix(
+            matrix_obj,
+            headers=headers,
+            keys=keys,
+            page=page,
+        )
 
-    if not include_matrix:
-        rows_matrix = []
+    rows_matrix = _project_dict_items_to_matrix(row_objects, keys) if include_matrix else []
 
     if not keys and rows_matrix and headers:
         keys = [_snake_like(h) for h in headers]
@@ -1970,15 +2170,24 @@ def _normalize_sheet_payload(
     if not headers and keys:
         headers, keys = _complete_headers_keys(headers, keys)
 
+    if not row_objects and rows_matrix:
+        row_objects = _row_objects_from_matrix(
+            rows_matrix,
+            headers=headers,
+            keys=keys,
+            page=page,
+        )
+
     meta = raw.get("meta") if isinstance(raw.get("meta"), dict) else {}
     meta = dict(meta)
     meta["route_version"] = ADVISOR_ROUTE_VERSION
     meta["native_source"] = source
-    meta["count"] = len(rows_matrix)
+    meta["count"] = len(row_objects)
+    meta["row_object_count"] = len(row_objects)
     meta["schema_only"] = bool(schema_only)
     meta["headers_only"] = bool(headers_only)
 
-    status_value = _clean_str(raw.get("status")) or ("success" if rows_matrix or schema_only or headers_only else "warn")
+    status_value = _clean_str(raw.get("status")) or ("success" if row_objects or schema_only or headers_only else "warn")
 
     return _json_safe(
         {
@@ -1994,7 +2203,10 @@ def _normalize_sheet_payload(
             "keys": keys,
             "rows": rows_matrix,
             "rows_matrix": rows_matrix,
-            "count": len(rows_matrix),
+            "row_objects": row_objects,
+            "items": row_objects,
+            "records": row_objects,
+            "count": len(row_objects),
             "detail": _clean_str(raw.get("detail") or raw.get("error") or raw.get("message")),
             "meta": meta,
             "version": raw.get("version") or ADVISOR_ROUTE_VERSION,
@@ -2113,6 +2325,9 @@ def _build_schema_only_sheet_payload(
             "keys": keys2,
             "rows": [],
             "rows_matrix": [] if include_matrix else [],
+            "row_objects": [],
+            "items": [],
+            "records": [],
             "count": 0,
             "detail": "",
             "meta": {
@@ -2121,6 +2336,7 @@ def _build_schema_only_sheet_payload(
                 "schema_only": bool(schema_only),
                 "headers_only": bool(headers_only),
                 "projection": "schema_layout_only",
+                "row_object_count": 0,
             },
             "version": ADVISOR_ROUTE_VERSION,
             "request_id": request_id,
@@ -2171,7 +2387,10 @@ def _build_data_dictionary_sheet_payload(
             keys=keys,
         )
 
-    rows: List[List[Any]] = []
+    row_objects: List[Dict[str, Any]] = []
+    status_value = "success"
+    detail_value = ""
+
     try:
         mod = importlib.import_module("core.sheets.data_dictionary")
         build_rows = getattr(mod, "build_data_dictionary_rows", None)
@@ -2181,14 +2400,16 @@ def _build_data_dictionary_sheet_payload(
                 raw_rows = build_rows(include_meta_sheet=True)
             except TypeError:
                 raw_rows = build_rows()
+
         for item in raw_rows or []:
             d = item if isinstance(item, dict) else _model_to_dict(item)
-            rows.append([_json_safe(d.get(k)) for k in keys])
-        status_value = "success"
-        detail_value = ""
+            row_objects.append({k: _json_safe(d.get(k)) for k in keys})
+
     except Exception as e:
         status_value = "partial"
         detail_value = f"{type(e).__name__}: {e}"
+
+    rows = _project_dict_items_to_matrix(row_objects, keys) if include_matrix else []
 
     return _json_safe(
         {
@@ -2203,13 +2424,17 @@ def _build_data_dictionary_sheet_payload(
             "column_headers": headers,
             "keys": keys,
             "rows": rows,
-            "rows_matrix": rows if include_matrix else [],
-            "count": len(rows),
+            "rows_matrix": rows,
+            "row_objects": row_objects,
+            "items": row_objects,
+            "records": row_objects,
+            "count": len(row_objects),
             "detail": detail_value,
             "meta": {
                 "route_version": ADVISOR_ROUTE_VERSION,
                 "request_id": request_id,
                 "projection": "data_dictionary",
+                "row_object_count": len(row_objects),
             },
             "version": ADVISOR_ROUTE_VERSION,
             "request_id": request_id,
