@@ -2,32 +2,26 @@
 """
 routes/investment_advisor.py
 ================================================================================
-TFB Advanced / Investment Advisor Routes — v6.2.0
+TFB Advanced / Investment Advisor Routes — v6.3.0
 ================================================================================
 ENGINE-FIRST SHEET-ROWS • SPECIAL-BUILDER-AWARE • TOP10/INSIGHTS SAFE
 GENERIC-ADVISOR FALLBACK • SCHEMA-CONTRACT PRESERVING • AUTH-BRIDGED
 JSON-SAFE • WRAPPER-PAYLOAD SAFE • ASYNC+SYNC TOLERANT • CACHE/STATE TOLERANT
+ROW-OBJECTS + MATRIX • HEADER/KEY ALIGNED • SCHEMA-ONLY / HEADERS-ONLY SAFE
 
 What this revision improves
 ---------------------------
-- ✅ FIX: sheet-rows now prefers engine.get_sheet_rows / engine.get_page_rows first,
-         aligned with core.data_engine_v2 canonical contracts.
-- ✅ FIX: Top10 / Insights still prefer richer special builders when they beat the
-         engine payload on row quality / required-field coverage.
-- ✅ FIX: row normalization is schema-driven and alias-aware, not exact-key-only.
-- ✅ FIX: supports payload aliases:
-         headers / display_headers / sheet_headers / column_headers
-         keys / columns / fields
-         rows / items / data / quotes / rows_matrix
-- ✅ FIX: stronger engine discovery:
-         app.state.engine / data_engine / quote_engine / cache_engine
-         core.data_engine_v2.get_engine / peek_engine / get_engine_if_ready
-         core.data_engine.get_engine
-- ✅ FIX: generic advisor runner discovery is broader and async-safe.
-- ✅ FIX: context backfill is more robust for:
-         recommendation_reason / horizon_days / invest_period_label /
-         top10_rank / selection_reason / criteria_snapshot
-- ✅ FIX: health/metrics remain import-safe and Prometheus-free.
+- ✅ FIX: sheet-rows now returns BOTH:
+         - rows / rows_matrix (matrix aligned to keys)
+         - row_objects / items / records (dict rows aligned to keys)
+- ✅ FIX: display headers are kept separate from canonical keys to avoid all-null
+         capture when tests look up values by the wrong field names.
+- ✅ FIX: supports schema_only / headers_only for faster live contract testing.
+- ✅ FIX: Data_Dictionary gets a stable schema-driven payload.
+- ✅ FIX: row extraction now recognizes row_objects / records in addition to
+         rows / items / data / quotes / rows_matrix.
+- ✅ FIX: result_count / payload-quality scoring now understand row_objects too.
+- ✅ SAFE: route aliases and engine-first / special-builder behavior are preserved.
 ================================================================================
 """
 from __future__ import annotations
@@ -130,7 +124,7 @@ except Exception:
 logger = logging.getLogger("routes.investment_advisor")
 logger.addHandler(logging.NullHandler())
 
-ROUTER_VERSION = "6.2.0"
+ROUTER_VERSION = "6.3.0"
 MODULE_NAME = "routes.investment_advisor"
 
 router = APIRouter(tags=["advisor"])
@@ -186,9 +180,80 @@ _TOP10_HEADERS_FALLBACK: List[str] = [
     "Criteria Snapshot",
 ]
 
+_INSIGHTS_KEYS_FALLBACK: List[str] = [
+    "section",
+    "item",
+    "symbol",
+    "metric",
+    "value",
+    "notes",
+    "last_updated_riyadh",
+]
+
+_INSIGHTS_HEADERS_FALLBACK: List[str] = [
+    "Section",
+    "Item",
+    "Symbol",
+    "Metric",
+    "Value",
+    "Notes",
+    "Last Updated Riyadh",
+]
+
+_DATA_DICTIONARY_KEYS_FALLBACK: List[str] = [
+    "sheet",
+    "group",
+    "header",
+    "key",
+    "dtype",
+    "fmt",
+    "required",
+    "source",
+    "notes",
+]
+
+_DATA_DICTIONARY_HEADERS_FALLBACK: List[str] = [
+    "Sheet",
+    "Group",
+    "Header",
+    "Key",
+    "DType",
+    "Format",
+    "Required",
+    "Source",
+    "Notes",
+]
+
+_GENERIC_KEYS_FALLBACK: List[str] = [
+    "symbol",
+    "name",
+    "current_price",
+    "recommendation",
+    "recommendation_reason",
+    "overall_score",
+    "risk_bucket",
+    "forecast_confidence",
+    "horizon_days",
+    "invest_period_label",
+]
+
+_GENERIC_HEADERS_FALLBACK: List[str] = [
+    "Symbol",
+    "Name",
+    "Current Price",
+    "Recommendation",
+    "Recommendation Reason",
+    "Overall Score",
+    "Risk Bucket",
+    "Forecast Confidence",
+    "Horizon Days",
+    "Invest Period Label",
+]
+
 _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
     "symbol": ["ticker", "code", "instrument", "security", "requested_symbol", "symbol_normalized"],
     "ticker": ["symbol", "code", "instrument", "security", "requested_symbol"],
+    "name": ["company_name", "security_name", "instrument_name", "title"],
     "current_price": ["price", "last_price", "last", "close", "market_price", "current", "spot", "nav"],
     "recommendation_reason": ["reason", "reco_reason", "recommendation_notes"],
     "horizon_days": ["invest_period_days", "investment_period_days", "period_days"],
@@ -441,7 +506,7 @@ async def _maybe_await(v: Any) -> Any:
 def _result_count(result: Mapping[str, Any]) -> int:
     if not isinstance(result, Mapping):
         return 0
-    for key in ("items", "rows", "data", "quotes", "rows_matrix"):
+    for key in ("row_objects", "records", "items", "rows", "data", "quotes", "rows_matrix"):
         value = result.get(key)
         if isinstance(value, list):
             return len(value)
@@ -451,9 +516,17 @@ def _result_count(result: Mapping[str, Any]) -> int:
 def _top10_fields_coverage(result: Mapping[str, Any]) -> int:
     if not isinstance(result, Mapping):
         return 0
-    items = result.get("items")
+
+    items = None
+    for key in ("row_objects", "records", "items", "rows", "data"):
+        value = result.get(key)
+        if isinstance(value, list) and value:
+            items = value
+            break
+
     if not isinstance(items, list) or not items:
         return 0
+
     coverage = 0
     for field in TOP10_REQUIRED_FIELDS:
         if any(isinstance(item, Mapping) and item.get(field) not in (None, "", [], {}) for item in items):
@@ -682,6 +755,8 @@ def _route_family(page: str) -> str:
         return "top10"
     if p == "Insights_Analysis":
         return "insights"
+    if p == "Data_Dictionary":
+        return "schema"
     return "advisor"
 
 
@@ -702,8 +777,8 @@ def _complete_schema_contract(headers: Sequence[str], keys: Sequence[str]) -> Tu
         elif k and not h:
             h = k.replace("_", " ").title()
         elif not h and not k:
-            h = f"Column_{i+1}"
-            k = f"key_{i+1}"
+            h = f"Column {i + 1}"
+            k = f"column_{i + 1}"
 
         out_headers.append(h)
         out_keys.append(k)
@@ -831,8 +906,128 @@ def _schema_for_page(page: str) -> Tuple[List[str], List[str]]:
 
     if p == "Top_10_Investments":
         return _ensure_top10_contract(list(_TOP10_HEADERS_FALLBACK), list(_TOP10_KEYS_FALLBACK))
+    if p == "Insights_Analysis":
+        return _complete_schema_contract(list(_INSIGHTS_HEADERS_FALLBACK), list(_INSIGHTS_KEYS_FALLBACK))
+    if p == "Data_Dictionary":
+        return _complete_schema_contract(list(_DATA_DICTIONARY_HEADERS_FALLBACK), list(_DATA_DICTIONARY_KEYS_FALLBACK))
 
-    return list(_TOP10_HEADERS_FALLBACK), list(_TOP10_KEYS_FALLBACK)
+    return _complete_schema_contract(list(_GENERIC_HEADERS_FALLBACK), list(_GENERIC_KEYS_FALLBACK))
+
+
+def _build_schema_only_payload(
+    *,
+    page: str,
+    request_id: str,
+    include_headers: bool,
+    include_matrix: bool,
+    schema_only: bool,
+    headers_only: bool,
+) -> Dict[str, Any]:
+    page_norm = _normalize_page_name(page)
+    headers, keys = _schema_for_page(page_norm)
+
+    return {
+        "status": "success",
+        "page": page_norm,
+        "sheet": page_norm,
+        "sheet_name": page_norm,
+        "route_family": _route_family(page_norm),
+        "headers": headers if include_headers else [],
+        "display_headers": headers if include_headers else [],
+        "sheet_headers": headers if include_headers else [],
+        "column_headers": headers if include_headers else [],
+        "keys": keys,
+        "columns": keys,
+        "fields": keys,
+        "rows": [] if include_matrix else [],
+        "rows_matrix": [] if include_matrix else [],
+        "row_objects": [],
+        "items": [],
+        "records": [],
+        "data": [],
+        "quotes": [],
+        "count": 0,
+        "detail": "",
+        "version": ROUTER_VERSION,
+        "request_id": request_id,
+        "meta": {
+            "ok": True,
+            "router_version": ROUTER_VERSION,
+            "source": "schema_only",
+            "count": 0,
+            "row_object_count": 0,
+            "sheet_mode": True,
+            "page": page_norm,
+            "route_family": _route_family(page_norm),
+            "schema_only": bool(schema_only),
+            "headers_only": bool(headers_only),
+        },
+    }
+
+
+def _build_data_dictionary_rows() -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+
+    mod = _safe_import("core.sheets.data_dictionary")
+    if mod is not None:
+        build_rows = getattr(mod, "build_data_dictionary_rows", None)
+        if callable(build_rows):
+            try:
+                raw_rows = build_rows(include_meta_sheet=True)
+            except TypeError:
+                raw_rows = build_rows()
+            except Exception:
+                raw_rows = []
+            if isinstance(raw_rows, list):
+                for item in raw_rows:
+                    d = item if isinstance(item, Mapping) else _model_to_dict(item)
+                    if isinstance(d, dict) and d:
+                        rows.append(dict(d))
+
+    if rows:
+        return rows
+
+    spec_sources = []
+    if callable(_registry_get_sheet_spec):
+        spec_sources.append(("registry", _registry_get_sheet_spec))
+    if callable(_engine_get_sheet_spec):
+        spec_sources.append(("engine", _engine_get_sheet_spec))
+
+    pages_to_try = [
+        "Market_Leaders",
+        "Global_Markets",
+        "Mutual_Funds",
+        "Commodities_FX",
+        "My_Portfolio",
+        "Insights_Analysis",
+        "Top_10_Investments",
+        "Data_Dictionary",
+    ]
+
+    for source_name, fn in spec_sources:
+        for page in pages_to_try:
+            try:
+                spec = fn(page)
+                headers, keys = _schema_keys_headers_from_spec(spec)
+                headers, keys = _complete_schema_contract(headers, keys)
+                for h, k in zip(headers, keys):
+                    rows.append(
+                        {
+                            "sheet": page,
+                            "group": "",
+                            "header": h,
+                            "key": k,
+                            "dtype": "",
+                            "fmt": "",
+                            "required": "",
+                            "source": source_name,
+                            "notes": "",
+                        }
+                    )
+            except Exception:
+                continue
+
+    return rows
 
 
 # -----------------------------------------------------------------------------
@@ -1088,19 +1283,19 @@ def _ensure_item_context(item: Dict[str, Any], payload: Dict[str, Any], rank: Op
 # -----------------------------------------------------------------------------
 # Row extraction / normalization
 # -----------------------------------------------------------------------------
-def _headers_from_items(items: Sequence[Mapping[str, Any]]) -> Tuple[List[str], List[str]]:
-    keys: List[str] = []
-    headers: List[str] = []
-    seen = set()
-    for item in items or []:
-        for k in item.keys():
-            s = _clean_str(k)
-            if not s or s in seen:
-                continue
-            seen.add(s)
-            keys.append(s)
-            headers.append(s.replace("_", " ").title())
-    return headers, keys
+def _rows_from_matrix(rows_matrix: Any, cols: Sequence[str]) -> List[Dict[str, Any]]:
+    if not isinstance(rows_matrix, list) or not rows_matrix or not cols:
+        return []
+    keys = [_clean_str(c) for c in cols if _clean_str(c)]
+    if not keys:
+        return []
+    out: List[Dict[str, Any]] = []
+    for row in rows_matrix:
+        if not isinstance(row, (list, tuple)):
+            continue
+        vals = list(row)
+        out.append({keys[i]: (vals[i] if i < len(vals) else None) for i in range(len(keys))})
+    return out
 
 
 def _looks_like_explicit_row_dict(d: Any) -> bool:
@@ -1118,21 +1313,6 @@ def _looks_like_explicit_row_dict(d: Any) -> bool:
     if keyset & {"recommendation", "overall_score", "current_price"}:
         return True
     return False
-
-
-def _rows_from_matrix(rows_matrix: Any, cols: Sequence[str]) -> List[Dict[str, Any]]:
-    if not isinstance(rows_matrix, list) or not rows_matrix or not cols:
-        return []
-    keys = [_clean_str(c) for c in cols if _clean_str(c)]
-    if not keys:
-        return []
-    out: List[Dict[str, Any]] = []
-    for row in rows_matrix:
-        if not isinstance(row, (list, tuple)):
-            continue
-        vals = list(row)
-        out.append({keys[i]: (vals[i] if i < len(vals) else None) for i in range(len(keys))})
-    return out
 
 
 def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
@@ -1187,7 +1367,7 @@ def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
         if isinstance(hdrs, list) and hdrs:
             keys_like = [_snake_like(h) for h in hdrs if _clean_str(h)]
 
-    for key in ("rows", "items", "data", "results", "records", "quotes", "recommendations"):
+    for key in ("row_objects", "records", "items", "rows", "data", "results", "quotes", "recommendations"):
         value = payload.get(key)
 
         if isinstance(value, list):
@@ -1281,6 +1461,8 @@ def _payload_quality_score(payload: Any, page: str = "") -> int:
     if isinstance(payload.get("headers"), list) or isinstance(payload.get("display_headers"), list):
         score += 8
     if isinstance(payload.get("keys"), list) or isinstance(payload.get("columns"), list) or isinstance(payload.get("fields"), list):
+        score += 8
+    if isinstance(payload.get("row_objects"), list) or isinstance(payload.get("records"), list):
         score += 8
 
     if page == "Top_10_Investments" and rows_like:
@@ -1397,6 +1579,8 @@ def _normalize_any_result(
     norm: Dict[str, Any] = {
         "headers": list(schema_headers),
         "keys": list(schema_keys),
+        "row_objects": [],
+        "records": [],
         "items": [],
         "rows": [],
         "rows_matrix": [],
@@ -1437,14 +1621,19 @@ def _normalize_any_result(
     meta = dict(meta_out or {})
     meta["ok"] = bool(meta.get("ok", False)) or bool(count > 0 or status_out.lower() in {"success", "warn", "partial"})
     meta["count"] = count
+    meta["row_object_count"] = count
     meta["source"] = source
     meta["router_version"] = ROUTER_VERSION
     if error_out and not meta.get("error"):
         meta["error"] = error_out
 
+    rows_matrix = [[row.get(k) for k in schema_keys] for row in fixed_items]
+
+    norm["row_objects"] = fixed_items
+    norm["records"] = fixed_items
     norm["items"] = fixed_items
-    norm["rows"] = fixed_items
-    norm["rows_matrix"] = [[row.get(k) for k in schema_keys] for row in fixed_items]
+    norm["rows"] = rows_matrix
+    norm["rows_matrix"] = rows_matrix
     norm["meta"] = meta
     return norm
 
@@ -1896,6 +2085,8 @@ async def _run_engine_sheet_mode(
         return {
             "headers": headers,
             "keys": keys,
+            "row_objects": [],
+            "records": [],
             "items": [],
             "rows": [],
             "rows_matrix": [],
@@ -1951,6 +2142,8 @@ async def _run_engine_sheet_mode(
     return {
         "headers": headers,
         "keys": keys,
+        "row_objects": [],
+        "records": [],
         "items": [],
         "rows": [],
         "rows_matrix": [],
@@ -2013,6 +2206,8 @@ async def _run_generic_advisor(
     return {
         "headers": headers,
         "keys": keys,
+        "row_objects": [],
+        "records": [],
         "items": [],
         "rows": [],
         "rows_matrix": [],
@@ -2086,6 +2281,8 @@ async def _run_special_page_builder(
     return {
         "headers": headers,
         "keys": keys,
+        "row_objects": [],
+        "records": [],
         "items": [],
         "rows": [],
         "rows_matrix": [],
@@ -2275,6 +2472,16 @@ def _normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     else:
         out["include_matrix"] = _boolish(out.get("include_matrix"), True)
 
+    if out.get("schema_only") is None:
+        out["schema_only"] = False
+    else:
+        out["schema_only"] = _boolish(out.get("schema_only"), False)
+
+    if out.get("headers_only") is None:
+        out["headers_only"] = False
+    else:
+        out["headers_only"] = _boolish(out.get("headers_only"), False)
+
     if out.get("invest_period_days") is None and out.get("horizon_days") is not None:
         out["invest_period_days"] = out.get("horizon_days")
     if out.get("horizon_days") is None and out.get("invest_period_days") is not None:
@@ -2298,6 +2505,8 @@ def _normalize_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "invest_period_label",
         "include_headers",
         "include_matrix",
+        "schema_only",
+        "headers_only",
     ):
         if out.get(key) is not None and criteria.get(key) is None:
             criteria[key] = out.get(key)
@@ -2325,6 +2534,8 @@ def _payload_from_query(
     invest_period_label: Optional[str],
     include_headers: Optional[str],
     include_matrix: Optional[str],
+    schema_only: Optional[str],
+    headers_only: Optional[str],
     debug: bool,
 ) -> Dict[str, Any]:
     sym_list: List[str] = []
@@ -2349,6 +2560,8 @@ def _payload_from_query(
         "invest_period_label": invest_period_label,
         "include_headers": include_headers if include_headers is not None else True,
         "include_matrix": include_matrix if include_matrix is not None else True,
+        "schema_only": schema_only if schema_only is not None else False,
+        "headers_only": headers_only if headers_only is not None else False,
         "debug": bool(debug),
     }
     payload = {k: v for k, v in payload.items() if v is not None and v != ""}
@@ -2373,6 +2586,8 @@ def _payload_from_sheet_rows_query(
     invest_period_label: Optional[str],
     include_headers: Optional[str],
     include_matrix: Optional[str],
+    schema_only: Optional[str],
+    headers_only: Optional[str],
     debug: bool,
 ) -> Dict[str, Any]:
     chosen_page = page or sheet_name or sheet or name or tab or "Top_10_Investments"
@@ -2388,6 +2603,8 @@ def _payload_from_sheet_rows_query(
         invest_period_label=invest_period_label,
         include_headers=include_headers,
         include_matrix=include_matrix,
+        schema_only=schema_only,
+        headers_only=headers_only,
         debug=debug,
     )
     return _normalize_payload(payload)
@@ -2396,7 +2613,7 @@ def _payload_from_sheet_rows_query(
 # -----------------------------------------------------------------------------
 # Outward envelopes
 # -----------------------------------------------------------------------------
-def _rows_matrix(rows: Sequence[Mapping[str, Any]], keys: Sequence[str]) -> List[List[Any]]:
+def _rows_matrix_from_objects(rows: Sequence[Mapping[str, Any]], keys: Sequence[str]) -> List[List[Any]]:
     out: List[List[Any]] = []
     for row in rows:
         out.append([row.get(k) for k in keys])
@@ -2423,15 +2640,21 @@ def _result_to_sheet_payload(
     include_matrix = _boolish(payload.get("include_matrix"), True)
 
     schema_headers, schema_keys = _schema_for_page(page_norm)
-    keys = list(schema_keys or _TOP10_KEYS_FALLBACK)
-    headers = list(schema_headers or _TOP10_HEADERS_FALLBACK)
+    keys = list(schema_keys)
+    headers = list(schema_headers)
 
-    items = result.get("items")
-    if not isinstance(items, list):
-        items = []
+    source_items = None
+    for k in ("row_objects", "records", "items", "data", "quotes"):
+        value = result.get(k)
+        if isinstance(value, list):
+            source_items = value
+            break
+
+    if source_items is None:
+        source_items = []
 
     normalized_items: List[Dict[str, Any]] = []
-    for i, item in enumerate(items, start=1):
+    for i, item in enumerate(source_items, start=1):
         row_map = dict(item) if isinstance(item, Mapping) else {}
         row_map = _ensure_item_context(row_map, payload, rank=i)
         normalized_items.append(
@@ -2442,7 +2665,7 @@ def _result_to_sheet_payload(
             )
         )
 
-    matrix = _rows_matrix(normalized_items, keys)
+    matrix = _rows_matrix_from_objects(normalized_items, keys)
     meta = result.get("meta") if isinstance(result.get("meta"), Mapping) else {}
     meta = dict(meta)
     ok_flag = bool(meta.get("ok", False)) or bool(normalized_items)
@@ -2450,6 +2673,7 @@ def _result_to_sheet_payload(
 
     meta["router_version"] = ROUTER_VERSION
     meta["count"] = len(normalized_items)
+    meta["row_object_count"] = len(normalized_items)
     meta["sheet_mode"] = True
     meta["page"] = page_norm
     meta["route_family"] = route_family
@@ -2469,11 +2693,15 @@ def _result_to_sheet_payload(
         "keys": keys,
         "columns": keys,
         "fields": keys,
-        "rows": normalized_items,
-        "items": normalized_items,
-        "quotes": normalized_items,
-        "data": normalized_items,
+        "rows": matrix if include_matrix else [],
         "rows_matrix": matrix if include_matrix else [],
+        "row_objects": normalized_items,
+        "items": normalized_items,
+        "records": normalized_items,
+        "data": normalized_items,
+        "quotes": normalized_items,
+        "count": len(normalized_items),
+        "detail": error or "",
         "error": error,
         "version": ROUTER_VERSION,
         "request_id": request_id,
@@ -2579,6 +2807,8 @@ async def advisor_recommendations_handler(
         invest_period_label=invest_period_label,
         include_headers="true",
         include_matrix="true",
+        schema_only="false",
+        headers_only="false",
         debug=debug,
     )
 
@@ -2657,6 +2887,8 @@ async def advisor_sheet_rows_get_handler(
     invest_period_label: Optional[str] = Query(default=None),
     include_headers: Optional[str] = Query(default="true"),
     include_matrix: Optional[str] = Query(default="true"),
+    schema_only: Optional[str] = Query(default="false"),
+    headers_only: Optional[str] = Query(default="false"),
     token: Optional[str] = Query(default=None),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
@@ -2668,16 +2900,6 @@ async def advisor_sheet_rows_get_handler(
     if not _auth_ok(request, token_query=token, x_app_token=x_app_token, authorization=authorization):
         await _record_metrics(False, True, (time.time() - t0) * 1000.0, "unauthorized")
         return _error(401, rid, "Unauthorized", extra={"open_mode": _safe_is_open_mode()})
-
-    engine, engine_source, engine_err = await _get_engine(request)
-    if engine is None:
-        await _record_metrics(False, False, (time.time() - t0) * 1000.0, engine_err or "engine_unavailable")
-        return _error(
-            503,
-            rid,
-            "Advisor engine unavailable",
-            extra={"engine_source": engine_source, "engine_error": engine_err},
-        )
 
     payload = _payload_from_sheet_rows_query(
         page=page,
@@ -2696,8 +2918,102 @@ async def advisor_sheet_rows_get_handler(
         invest_period_label=invest_period_label,
         include_headers=include_headers,
         include_matrix=include_matrix,
+        schema_only=schema_only,
+        headers_only=headers_only,
         debug=debug,
     )
+
+    page_norm = _normalize_page_name(payload.get("page"))
+    include_headers_bool = _boolish(payload.get("include_headers"), True)
+    include_matrix_bool = _boolish(payload.get("include_matrix"), True)
+    schema_only_bool = _boolish(payload.get("schema_only"), False)
+    headers_only_bool = _boolish(payload.get("headers_only"), False)
+
+    if page_norm == "Data_Dictionary":
+        if schema_only_bool or headers_only_bool:
+            sheet_payload = _build_schema_only_payload(
+                page=page_norm,
+                request_id=rid,
+                include_headers=include_headers_bool,
+                include_matrix=include_matrix_bool,
+                schema_only=schema_only_bool,
+                headers_only=headers_only_bool,
+            )
+        else:
+            headers, keys = _schema_for_page(page_norm)
+            raw_rows = _build_data_dictionary_rows()
+            row_objects = []
+            for item in raw_rows:
+                row_objects.append(
+                    _normalize_to_schema_keys(
+                        schema_keys=keys,
+                        schema_headers=headers,
+                        raw=item,
+                    )
+                )
+            matrix = _rows_matrix_from_objects(row_objects, keys)
+            sheet_payload = {
+                "status": "success",
+                "page": page_norm,
+                "sheet": page_norm,
+                "sheet_name": page_norm,
+                "route_family": _route_family(page_norm),
+                "headers": headers if include_headers_bool else [],
+                "display_headers": headers if include_headers_bool else [],
+                "sheet_headers": headers if include_headers_bool else [],
+                "column_headers": headers if include_headers_bool else [],
+                "keys": keys,
+                "columns": keys,
+                "fields": keys,
+                "rows": matrix if include_matrix_bool else [],
+                "rows_matrix": matrix if include_matrix_bool else [],
+                "row_objects": row_objects,
+                "items": row_objects,
+                "records": row_objects,
+                "data": row_objects,
+                "quotes": row_objects,
+                "count": len(row_objects),
+                "detail": "",
+                "error": None,
+                "version": ROUTER_VERSION,
+                "request_id": rid,
+                "meta": {
+                    "ok": True,
+                    "router_version": ROUTER_VERSION,
+                    "source": "data_dictionary",
+                    "count": len(row_objects),
+                    "row_object_count": len(row_objects),
+                    "sheet_mode": True,
+                    "page": page_norm,
+                    "route_family": _route_family(page_norm),
+                    "schema_only": False,
+                    "headers_only": False,
+                },
+            }
+        await _record_metrics(True, False, (time.time() - t0) * 1000.0, "")
+        return BestJSONResponse(content=_json_safe(sheet_payload))
+
+    if schema_only_bool or headers_only_bool:
+        sheet_payload = _build_schema_only_payload(
+            page=page_norm,
+            request_id=rid,
+            include_headers=include_headers_bool,
+            include_matrix=include_matrix_bool,
+            schema_only=schema_only_bool,
+            headers_only=headers_only_bool,
+        )
+        await _record_metrics(True, False, (time.time() - t0) * 1000.0, "")
+        return BestJSONResponse(content=_json_safe(sheet_payload))
+
+    engine, engine_source, engine_err = await _get_engine(request)
+    if engine is None:
+        await _record_metrics(False, False, (time.time() - t0) * 1000.0, engine_err or "engine_unavailable")
+        return _error(
+            503,
+            rid,
+            "Advisor engine unavailable",
+            extra={"engine_source": engine_source, "engine_error": engine_err},
+        )
 
     result = await _run_page_pipeline(
         page=payload.get("page") or "Top_10_Investments",
@@ -2730,6 +3046,89 @@ async def advisor_sheet_rows_post_handler(
         await _record_metrics(False, True, (time.time() - t0) * 1000.0, "unauthorized")
         return _error(401, rid, "Unauthorized", extra={"open_mode": _safe_is_open_mode()})
 
+    payload = _normalize_payload(dict(body or {}))
+    page_norm = _normalize_page_name(payload.get("page"))
+    include_headers_bool = _boolish(payload.get("include_headers"), True)
+    include_matrix_bool = _boolish(payload.get("include_matrix"), True)
+    schema_only_bool = _boolish(payload.get("schema_only"), False)
+    headers_only_bool = _boolish(payload.get("headers_only"), False)
+
+    if page_norm == "Data_Dictionary":
+        if schema_only_bool or headers_only_bool:
+            sheet_payload = _build_schema_only_payload(
+                page=page_norm,
+                request_id=rid,
+                include_headers=include_headers_bool,
+                include_matrix=include_matrix_bool,
+                schema_only=schema_only_bool,
+                headers_only=headers_only_bool,
+            )
+        else:
+            headers, keys = _schema_for_page(page_norm)
+            raw_rows = _build_data_dictionary_rows()
+            row_objects = []
+            for item in raw_rows:
+                row_objects.append(
+                    _normalize_to_schema_keys(
+                        schema_keys=keys,
+                        schema_headers=headers,
+                        raw=item,
+                    )
+                )
+            matrix = _rows_matrix_from_objects(row_objects, keys)
+            sheet_payload = {
+                "status": "success",
+                "page": page_norm,
+                "sheet": page_norm,
+                "sheet_name": page_norm,
+                "route_family": _route_family(page_norm),
+                "headers": headers if include_headers_bool else [],
+                "display_headers": headers if include_headers_bool else [],
+                "sheet_headers": headers if include_headers_bool else [],
+                "column_headers": headers if include_headers_bool else [],
+                "keys": keys,
+                "columns": keys,
+                "fields": keys,
+                "rows": matrix if include_matrix_bool else [],
+                "rows_matrix": matrix if include_matrix_bool else [],
+                "row_objects": row_objects,
+                "items": row_objects,
+                "records": row_objects,
+                "data": row_objects,
+                "quotes": row_objects,
+                "count": len(row_objects),
+                "detail": "",
+                "error": None,
+                "version": ROUTER_VERSION,
+                "request_id": rid,
+                "meta": {
+                    "ok": True,
+                    "router_version": ROUTER_VERSION,
+                    "source": "data_dictionary",
+                    "count": len(row_objects),
+                    "row_object_count": len(row_objects),
+                    "sheet_mode": True,
+                    "page": page_norm,
+                    "route_family": _route_family(page_norm),
+                    "schema_only": False,
+                    "headers_only": False,
+                },
+            }
+        await _record_metrics(True, False, (time.time() - t0) * 1000.0, "")
+        return BestJSONResponse(content=_json_safe(sheet_payload))
+
+    if schema_only_bool or headers_only_bool:
+        sheet_payload = _build_schema_only_payload(
+            page=page_norm,
+            request_id=rid,
+            include_headers=include_headers_bool,
+            include_matrix=include_matrix_bool,
+            schema_only=schema_only_bool,
+            headers_only=headers_only_bool,
+        )
+        await _record_metrics(True, False, (time.time() - t0) * 1000.0, "")
+        return BestJSONResponse(content=_json_safe(sheet_payload))
+
     engine, engine_source, engine_err = await _get_engine(request)
     if engine is None:
         await _record_metrics(False, False, (time.time() - t0) * 1000.0, engine_err or "engine_unavailable")
@@ -2740,7 +3139,6 @@ async def advisor_sheet_rows_post_handler(
             extra={"engine_source": engine_source, "engine_error": engine_err},
         )
 
-    payload = _normalize_payload(dict(body or {}))
     result = await _run_page_pipeline(
         page=payload.get("page") or "Top_10_Investments",
         payload=payload,
@@ -2780,4 +3178,4 @@ router.include_router(_router_advanced)
 router.include_router(_router_compat_us)
 router.include_router(_router_compat_dash)
 
-__all__ = ["router", "ROUTER_VERSION"]
+__all__ = ["router", "ROUTER_VERSION", "_run_page_pipeline"]
