@@ -2,35 +2,30 @@
 """
 routes/advanced_analysis.py
 --------------------------------------------------------------------------------
-TADAWUL ADVANCED ANALYSIS ROUTER — v6.0.0
-(SCHEMA-ENDPOINTS FIXED / ROOT+V1 COMPAT / INSIGHTS+TOP10 WIRED / STARTUP-SAFE
- / SHEET-ROWS CANONICAL / BUILDER-FIRST / ENGINE-FALLBACK / JSON-SAFE)
+TADAWUL ADVANCED ANALYSIS ROUTER — v6.1.0
+(SCHEMA-ENDPOINTS HARDENED / ROOT+V1 COMPAT / INSIGHTS+TOP10 WIRED /
+ STARTUP-SAFE / SHEET-ROWS CANONICAL / BUILDER-FIRST / ENGINE-FALLBACK /
+ JSON-SAFE / LIMIT+OFFSET CONSISTENT)
 
 What this revision improves
-- ✅ FIX: real schema endpoints:
-      /v1/schema/sheet-spec
-      /v1/schema/spec
-      /schema/sheet-spec
-      /schema/spec
-  They return 200 even when no sheet/query param is provided.
-- ✅ FIX: keeps root /sheet-rows compatibility and /v1/advanced/sheet-rows.
-- ✅ FIX: adds GET + POST for /sheet-rows on both root and /v1/advanced.
+- ✅ FIX: imports `inspect` so async/sync detection works safely.
+- ✅ FIX: removes undefined `_to_jsonable(...)` reference.
+- ✅ FIX: schema endpoints remain stable for both `/v1/schema/*` and `/schema/*`.
+- ✅ FIX: keeps root `/sheet-rows` compatibility and `/v1/advanced/sheet-rows`.
+- ✅ FIX: GET + POST for sheet-rows remain available on both route families.
 - ✅ FIX: Insights_Analysis stays builder-driven and schema-projected.
-- ✅ FIX: Top_10_Investments uses builder-first execution before engine fallback.
-- ✅ FIX: Data_Dictionary stays schema-generated and projected to canonical keys.
-- ✅ FIX: stable response envelope now includes:
-      headers / display_headers / sheet_headers / column_headers
-      keys / columns / fields
-      rows / items / data / quotes / rows_matrix
-      page / sheet / sheet_name / request_id / version / meta
-- ✅ FIX: engine table-mode uses best-effort scoring instead of a single fragile call.
-- ✅ FIX: builder payloads can be rows / rows_matrix / nested wrappers / symbol maps
-         / symbol lists, with optional symbol rehydration through the engine.
-- ✅ FIX: import-time safe: no network calls; heavy imports remain inside handlers.
+- ✅ FIX: Top_10_Investments remains builder-first before engine fallback.
+- ✅ FIX: Data_Dictionary remains schema-generated and canonical.
+- ✅ FIX: stable response envelope includes legacy aliases and canonical aliases.
+- ✅ FIX: row slicing now consistently honors offset/limit after builder/engine normalization.
+- ✅ FIX: builder payload handling remains tolerant for rows / matrix / wrappers /
+         symbol maps / symbol lists, with optional symbol rehydration.
+- ✅ FIX: import-time safe: no network calls; heavy imports stay inside handlers.
 """
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 import math
@@ -42,14 +37,15 @@ from dataclasses import asdict, is_dataclass
 from datetime import date, datetime, time as dt_time, timezone
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from importlib import import_module
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from fastapi import Body, Header, HTTPException, Query, Request, Response, status
 from fastapi.encoders import jsonable_encoder
 from fastapi.routing import APIRouter
 
 logger = logging.getLogger("routes.advanced_analysis")
-ADVANCED_ANALYSIS_VERSION = "6.0.0"
+ADVANCED_ANALYSIS_VERSION = "6.1.0"
 
 # -----------------------------------------------------------------------------
 # Routers
@@ -114,7 +110,6 @@ TOP10_MODULE_CANDIDATES = (
     "routes.top10_investments",
     "routes.investment_advisor",
 )
-
 TOP10_FUNCTION_CANDIDATES = (
     "build_top10_rows",
     "build_top10_output_rows",
@@ -131,7 +126,6 @@ INSIGHTS_MODULE_CANDIDATES = (
     "core.analysis.insights_analysis",
     "routes.advanced_analysis",
 )
-
 INSIGHTS_FUNCTION_CANDIDATES = (
     "build_insights_analysis_rows",
     "build_insights_rows",
@@ -145,7 +139,6 @@ ENRICHED_MODULE_CANDIDATES = (
     "core.enriched_quote",
     "routes.enriched_quote",
 )
-
 ENRICHED_FUNCTION_CANDIDATES = (
     "build_enriched_sheet_rows",
     "build_enriched_quote_rows",
@@ -178,6 +171,10 @@ def _strip(v: Any) -> str:
     except Exception:
         return ""
     return "" if s.lower() in {"none", "null", "nil", "undefined"} else s
+
+
+def _safe_dict(v: Any) -> Dict[str, Any]:
+    return dict(v) if isinstance(v, Mapping) else {}
 
 
 def _json_safe(obj: Any) -> Any:
@@ -285,13 +282,8 @@ def _require_auth_or_401(
             "authorization": authorization,
             "headers": {"X-APP-TOKEN": x_app_token, "Authorization": authorization},
         },
-        {
-            "token": auth_token,
-            "authorization": authorization,
-        },
-        {
-            "token": auth_token,
-        },
+        {"token": auth_token, "authorization": authorization},
+        {"token": auth_token},
     ]
 
     for kwargs in attempts:
@@ -335,7 +327,8 @@ def _get_list(body: Mapping[str, Any], *keys: str) -> List[str]:
                 if s and s not in seen:
                     seen.add(s)
                     out.append(s)
-            return out
+            if out:
+                return out
         if isinstance(v, str):
             raw = v.replace(";", ",").replace("\n", ",").replace("\t", ",")
             out = []
@@ -354,7 +347,7 @@ def _get_bool(body: Mapping[str, Any], key: str, default: bool) -> bool:
     v = body.get(key)
     if isinstance(v, bool):
         return v
-    if isinstance(v, (int, float)):
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
         try:
             return bool(int(v))
         except Exception:
@@ -369,18 +362,6 @@ def _safe_int(v: Any, default: int) -> int:
         if v is None or isinstance(v, bool):
             return default
         return int(float(v))
-    except Exception:
-        return default
-
-
-def _safe_float(v: Any, default: Optional[float] = None) -> Optional[float]:
-    try:
-        if v is None or isinstance(v, bool):
-            return default
-        f = float(v)
-        if math.isnan(f) or math.isinf(f):
-            return default
-        return f
     except Exception:
         return default
 
@@ -433,12 +414,11 @@ async def _get_engine(request: Request) -> Optional[Any]:
 
     for modpath in ("core.data_engine_v2", "core.data_engine"):
         try:
-            mod = __import__(modpath, fromlist=["get_engine"])
+            mod = import_module(modpath)
             get_engine = getattr(mod, "get_engine", None)
             if callable(get_engine):
                 eng = get_engine()
-                eng = await _maybe_await(eng)
-                return eng
+                return await _maybe_await(eng)
         except Exception:
             continue
     return None
@@ -461,7 +441,7 @@ def _canonicalize_sheet_name(sheet: str) -> str:
 
     for fn_name in ("normalize_page_name", "resolve_page", "canonicalize_page"):
         try:
-            mod = __import__("core.sheets.page_catalog", fromlist=[fn_name])
+            mod = import_module("core.sheets.page_catalog")
             fn = getattr(mod, fn_name, None)
             if callable(fn):
                 try:
@@ -509,8 +489,8 @@ def _complete_schema_contract(headers: Sequence[str], keys: Sequence[str]) -> Tu
         elif k and not h:
             h = k.replace("_", " ").title()
         elif not h and not k:
-            h = f"Column_{i+1}"
-            k = f"key_{i+1}"
+            h = f"Column_{i + 1}"
+            k = f"key_{i + 1}"
 
         hdrs.append(h)
         ks.append(k)
@@ -649,6 +629,12 @@ def _matrix_to_rows(rows_matrix: List[List[Any]], keys: Sequence[str]) -> List[D
     return out
 
 
+def _slice_rows(rows: Sequence[Mapping[str, Any]], offset: int, limit: int) -> List[Dict[str, Any]]:
+    start = max(0, int(offset or 0))
+    end = start + max(1, int(limit or 1))
+    return [dict(r) for r in list(rows)[start:end]]
+
+
 def _key_variants(key: str) -> List[str]:
     k = _strip(key)
     if not k:
@@ -704,9 +690,7 @@ def _normalize_to_schema_keys(
     raw: Mapping[str, Any],
 ) -> Dict[str, Any]:
     raw = dict(raw or {})
-    header_by_key: Dict[str, str] = {}
-    for k, h in zip(schema_keys, schema_headers):
-        header_by_key[str(k)] = str(h)
+    header_by_key: Dict[str, str] = {str(k): str(h) for k, h in zip(schema_keys, schema_headers)}
 
     out: Dict[str, Any] = {}
     for k in schema_keys:
@@ -828,7 +812,7 @@ def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
         return out
 
     if not isinstance(payload, Mapping):
-        d = _to_jsonable(payload)
+        d = _json_safe(payload)
         if isinstance(d, Mapping) and _looks_like_explicit_row_dict(d):
             return [dict(d)]
         return []
@@ -840,10 +824,7 @@ def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
     symbol_like_keys = 0
     rows_from_symbol_map: List[Dict[str, Any]] = []
     for k, v in payload.items():
-        if not isinstance(v, Mapping):
-            maybe_symbol_map = False
-            break
-        if not _looks_like_symbol_token(k):
+        if not isinstance(v, Mapping) or not _looks_like_symbol_token(k):
             maybe_symbol_map = False
             break
         symbol_like_keys += 1
@@ -1044,6 +1025,7 @@ def _final_payload(
     ks = list(keys or [])
     if page == "Top_10_Investments":
         hdrs, ks = _ensure_top10_contract(hdrs, ks)
+
     rows_list = [dict(r) for r in rows]
     payload = {
         "status": status,
@@ -1088,6 +1070,8 @@ def _normalize_result_to_payload(
     started_at: float,
     mode: str,
     dispatch: str,
+    limit: int,
+    offset: int,
     default_status: str = "success",
     default_error: Optional[str] = None,
     extra_meta: Optional[Dict[str, Any]] = None,
@@ -1109,13 +1093,16 @@ def _normalize_result_to_payload(
         if mx:
             raw_rows = _matrix_to_rows(mx, result_keys or proj_keys)
 
+    total_raw_rows = len(raw_rows)
+    raw_rows = _slice_rows(raw_rows, offset=offset, limit=limit)
+
     rows: List[Dict[str, Any]] = []
-    for r in raw_rows:
+    for idx, r in enumerate(raw_rows, start=offset + 1):
         rr = _normalize_row_to_schema(page, dict(r))
         rr = _normalize_to_schema_keys(schema_keys=proj_keys, schema_headers=proj_headers, raw=rr)
         if page == "Top_10_Investments":
             if rr.get("top10_rank") is None and "top10_rank" in proj_keys:
-                rr["top10_rank"] = len(rows) + 1
+                rr["top10_rank"] = idx
             if not rr.get("criteria_snapshot") and "criteria_snapshot" in proj_keys:
                 rr["criteria_snapshot"] = "{}"
             if not rr.get("selection_reason") and "selection_reason" in proj_keys:
@@ -1125,6 +1112,8 @@ def _normalize_result_to_payload(
     status_out, error_out, meta_in = _extract_status_error(result)
     final_status = _strip(status_out) or default_status
     if rows and final_status in {"error", "failed", "fail"}:
+        final_status = "partial"
+    if not rows and final_status == "success" and error_out:
         final_status = "partial"
 
     return _final_payload(
@@ -1142,6 +1131,9 @@ def _normalize_result_to_payload(
         meta={
             "dispatch": dispatch,
             "result_payload_quality": _payload_quality_score(result, page=page),
+            "source_row_count": total_raw_rows,
+            "offset": offset,
+            "limit": limit,
             **(meta_in or {}),
             **(extra_meta or {}),
         },
@@ -1153,7 +1145,7 @@ def _normalize_result_to_payload(
 # -----------------------------------------------------------------------------
 def _collect_schema_registry() -> Tuple[Dict[str, Any], str]:
     try:
-        mod = __import__("core.sheets.schema_registry", fromlist=["*"])
+        mod = import_module("core.sheets.schema_registry")
     except Exception:
         return {}, "import_failed"
 
@@ -1180,8 +1172,7 @@ def _collect_schema_registry() -> Tuple[Dict[str, Any], str]:
         if isinstance(out, dict):
             normalized: Dict[str, Any] = {}
             for k, v in out.items():
-                kk = _canonicalize_sheet_name(str(k))
-                normalized[kk] = v
+                normalized[_canonicalize_sheet_name(str(k))] = v
             if normalized:
                 return normalized, f"schema_registry.{name}"
 
@@ -1189,9 +1180,8 @@ def _collect_schema_registry() -> Tuple[Dict[str, Any], str]:
             normalized2: Dict[str, Any] = {}
             for spec in out:
                 sheet_name = str(_column_attr(spec, "sheet", "") or _column_attr(spec, "name", "") or "").strip()
-                if not sheet_name:
-                    continue
-                normalized2[_canonicalize_sheet_name(sheet_name)] = spec
+                if sheet_name:
+                    normalized2[_canonicalize_sheet_name(sheet_name)] = spec
             if normalized2:
                 return normalized2, f"schema_registry.{name}"
 
@@ -1346,7 +1336,7 @@ async def _engine_fetch_any(
     best_payload: Any = None
     best_score = -9999
 
-    for name, fn in candidates:
+    for _name, fn in candidates:
         call_specs = [
             ((), {"sheet": sheet, "page": sheet, "sheet_name": sheet, "limit": limit, "offset": offset, "mode": mode, "body": body}),
             ((), {"sheet": sheet, "page": sheet, "sheet_name": sheet, "limit": limit, "offset": offset, "mode": mode}),
@@ -1394,20 +1384,11 @@ async def _fetch_analysis_rows(
 
     preferred: List[str] = []
     if want_analysis:
-        preferred += [
-            "get_analysis_rows_batch",
-            "get_analysis_quotes_batch",
-            "get_enriched_quotes_batch",
-        ]
+        preferred += ["get_analysis_rows_batch", "get_analysis_quotes_batch", "get_enriched_quotes_batch"]
     else:
         preferred += ["get_enriched_quotes_batch"]
 
-    preferred += [
-        "get_quotes_batch",
-        "quotes_batch",
-        "get_enriched_quotes",
-        "get_quotes",
-    ]
+    preferred += ["get_quotes_batch", "quotes_batch", "get_enriched_quotes", "get_quotes"]
 
     for method in preferred:
         fn = getattr(engine, method, None)
@@ -1502,7 +1483,7 @@ async def _call_builder_best_effort(
 
     for module_name in module_names:
         try:
-            imported_mod = __import__(module_name, fromlist=["*"])
+            imported_mod = import_module(module_name)
             imported_name = module_name
             break
         except Exception as e:
@@ -1572,31 +1553,9 @@ async def _call_builder_best_effort(
                 "mode": mode,
             },
         ),
-        (
-            (),
-            {
-                "engine": engine,
-                "body": body,
-                "limit": limit,
-                "mode": mode,
-            },
-        ),
-        (
-            (),
-            {
-                "payload": body,
-                "limit": limit,
-                "mode": mode,
-            },
-        ),
-        (
-            (),
-            {
-                "criteria": criteria or None,
-                "limit": limit,
-                "mode": mode,
-            },
-        ),
+        ((), {"engine": engine, "body": body, "limit": limit, "mode": mode}),
+        ((), {"payload": body, "limit": limit, "mode": mode}),
+        ((), {"criteria": criteria or None, "limit": limit, "mode": mode}),
         ((body,), {}),
         ((engine, body), {}),
         ((engine,), {}),
@@ -1649,6 +1608,8 @@ def _build_data_dictionary_rows_payload(
     request_id: str,
     started_at: float,
     mode: str,
+    limit: int,
+    offset: int,
 ) -> Dict[str, Any]:
     headers, keys, schema_source = _schema_headers_keys("Data_Dictionary")
     if not headers or not keys:
@@ -1660,7 +1621,7 @@ def _build_data_dictionary_rows_payload(
     error_out: Optional[str] = None
 
     try:
-        mod = __import__("core.sheets.data_dictionary", fromlist=["*"])
+        mod = import_module("core.sheets.data_dictionary")
         build_rows = getattr(mod, "build_data_dictionary_rows", None)
         if callable(build_rows):
             try:
@@ -1668,10 +1629,9 @@ def _build_data_dictionary_rows_payload(
             except TypeError:
                 raw_rows = build_rows()
             for r in raw_rows or []:
-                if not isinstance(r, Mapping):
-                    continue
-                rr = _normalize_to_schema_keys(schema_keys=keys, schema_headers=headers, raw=dict(r))
-                rows.append(_project_row(keys, rr))
+                if isinstance(r, Mapping):
+                    rr = _normalize_to_schema_keys(schema_keys=keys, schema_headers=headers, raw=dict(r))
+                    rows.append(_project_row(keys, rr))
     except Exception as e:
         error_out = f"{type(e).__name__}: {e}"
 
@@ -1695,13 +1655,15 @@ def _build_data_dictionary_rows_payload(
                 rr = _normalize_to_schema_keys(schema_keys=keys, schema_headers=headers, raw=rr)
                 rows.append(_project_row(keys, rr))
 
+    sliced_rows = _slice_rows(rows, offset=offset, limit=limit)
+
     return _final_payload(
         status="success" if rows else "partial",
         page="Data_Dictionary",
         route_family="dictionary",
         headers=headers,
         keys=keys,
-        rows=rows,
+        rows=sliced_rows,
         include_matrix=include_matrix,
         request_id=request_id,
         started_at=started_at,
@@ -1711,6 +1673,9 @@ def _build_data_dictionary_rows_payload(
             "schema_source": schema_source,
             "dispatch": "data_dictionary",
             "generated": True,
+            "source_row_count": len(rows),
+            "offset": offset,
+            "limit": limit,
         },
     )
 
@@ -1781,6 +1746,7 @@ async def _run_advanced_sheet_rows_impl(
     x_request_id: Optional[str],
 ) -> Dict[str, Any]:
     t0 = time.perf_counter()
+    body = _safe_dict(body)
     _require_auth_or_401(token_query=token, x_app_token=x_app_token, authorization=authorization)
     request_id = _request_id(request, x_request_id)
 
@@ -1796,7 +1762,6 @@ async def _run_advanced_sheet_rows_impl(
         raise HTTPException(status_code=422, detail="Missing required field: sheet")
 
     sheet = _canonicalize_sheet_name(raw_sheet)
-
     limit = max(1, min(5000, _safe_int(body.get("limit"), 2000)))
     offset = max(0, _safe_int(body.get("offset"), 0))
     include_matrix_final = include_matrix_q if isinstance(include_matrix_q, bool) else _get_bool(body, "include_matrix", True)
@@ -1810,12 +1775,13 @@ async def _run_advanced_sheet_rows_impl(
             request_id=request_id,
             started_at=t0,
             mode=mode or "",
+            limit=limit,
+            offset=offset,
         )
-        payload["meta"]["request_path"] = str(getattr(getattr(request, "url", None), "path", "") or "")
+        payload.setdefault("meta", {})["request_path"] = str(getattr(getattr(request, "url", None), "path", "") or "")
         return _json_safe(payload)
 
     engine = await _get_engine(request)
-    settings = None
     try:
         settings = get_settings_cached()
     except Exception:
@@ -1847,7 +1813,7 @@ async def _run_advanced_sheet_rows_impl(
             except Exception as e:
                 result = {"status": "partial", "rows": [], "error": str(e)}
 
-        payload = _normalize_result_to_payload(
+        return _normalize_result_to_payload(
             result=result or {"status": "partial", "rows": []},
             page=sheet,
             route_family=route_family,
@@ -1858,6 +1824,8 @@ async def _run_advanced_sheet_rows_impl(
             started_at=t0,
             mode=mode or "",
             dispatch=dispatch or "insights_builder",
+            limit=limit,
+            offset=offset,
             default_status="partial",
             extra_meta={
                 "schema_source": schema_source,
@@ -1866,7 +1834,6 @@ async def _run_advanced_sheet_rows_impl(
                 **builder_meta,
             },
         )
-        return payload
 
     if sheet == "Top_10_Investments":
         result, dispatch, builder_meta = await _call_builder_best_effort(
@@ -1904,7 +1871,7 @@ async def _run_advanced_sheet_rows_impl(
             chosen = engine_result
             chosen_dispatch = "engine_fallback_best"
 
-        payload = _normalize_result_to_payload(
+        return _normalize_result_to_payload(
             result=chosen or {"status": "partial", "rows": []},
             page=sheet,
             route_family=route_family,
@@ -1915,6 +1882,8 @@ async def _run_advanced_sheet_rows_impl(
             started_at=t0,
             mode=mode or "",
             dispatch=chosen_dispatch,
+            limit=limit,
+            offset=offset,
             default_status="partial",
             extra_meta={
                 "schema_source": schema_source,
@@ -1925,7 +1894,6 @@ async def _run_advanced_sheet_rows_impl(
                 **builder_meta,
             },
         )
-        return payload
 
     if engine is None:
         return _final_payload(
@@ -1952,10 +1920,11 @@ async def _run_advanced_sheet_rows_impl(
     schema = _get_sheet_spec(sheet)
 
     if symbols:
-        data_map = await _fetch_analysis_rows(engine, symbols[:limit], mode=mode or "", settings=settings, schema=schema)
+        selected = symbols[:limit]
+        data_map = await _fetch_analysis_rows(engine, selected, mode=mode or "", settings=settings, schema=schema)
         rows: List[Dict[str, Any]] = []
         errors = 0
-        for sym in symbols[:limit]:
+        for sym in selected:
             raw = data_map.get(sym) if isinstance(data_map, Mapping) else None
             if not isinstance(raw, Mapping):
                 raw = {"symbol": sym, "ticker": sym, "error": "missing_row"}
@@ -1969,7 +1938,7 @@ async def _run_advanced_sheet_rows_impl(
             rows.append(_project_row(schema_keys, rr))
 
         return _final_payload(
-            status="success" if errors == 0 else ("partial" if errors < len(symbols[:limit]) else "error"),
+            status="success" if errors == 0 else ("partial" if errors < len(selected) else "error"),
             page=sheet,
             route_family=route_family,
             headers=schema_headers,
@@ -1985,13 +1954,13 @@ async def _run_advanced_sheet_rows_impl(
                 "engine_available": True,
                 "engine_type": _safe_engine_type(engine),
                 "path": "instrument_batch",
-                "requested": len(symbols[:limit]),
+                "requested": len(selected),
                 "errors": errors,
+                "offset": 0,
+                "limit": limit,
             },
         )
 
-    engine_payload = None
-    engine_score = -9999
     try:
         engine_payload = await _engine_fetch_any(engine, sheet=sheet, limit=limit, offset=offset, mode=mode or "", body=body)
         engine_score = _payload_quality_score(engine_payload, page=sheet)
@@ -2000,7 +1969,7 @@ async def _run_advanced_sheet_rows_impl(
         engine_score = _payload_quality_score(engine_payload, page=sheet)
 
     if _payload_looks_hard_failure(engine_payload):
-        enriched_result, dispatch, builder_meta = await _call_builder_best_effort(
+        enriched_result, _dispatch, builder_meta = await _call_builder_best_effort(
             module_names=ENRICHED_MODULE_CANDIDATES,
             function_names=ENRICHED_FUNCTION_CANDIDATES,
             request=request,
@@ -2031,6 +2000,8 @@ async def _run_advanced_sheet_rows_impl(
             started_at=t0,
             mode=mode or "",
             dispatch=chosen_dispatch,
+            limit=limit,
+            offset=offset,
             default_status="partial",
             extra_meta={
                 "schema_source": schema_source,
@@ -2053,6 +2024,8 @@ async def _run_advanced_sheet_rows_impl(
         started_at=t0,
         mode=mode or "",
         dispatch="engine_table_mode",
+        limit=limit,
+        offset=offset,
         default_status="success",
         extra_meta={
             "schema_source": schema_source,
@@ -2251,7 +2224,7 @@ async def insights_analysis(
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
-    payload = dict(body or {})
+    payload = _safe_dict(body)
     payload["sheet"] = "Insights_Analysis"
     payload["limit"] = limit
     payload["offset"] = offset
@@ -2280,7 +2253,7 @@ async def top10_investments(
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
-    payload = dict(body or {})
+    payload = _safe_dict(body)
     payload["sheet"] = "Top_10_Investments"
     payload["limit"] = limit
     payload["offset"] = offset
@@ -2304,4 +2277,4 @@ router.include_router(advanced_router)
 router.include_router(schema_router_v1)
 router.include_router(schema_router_compat)
 
-__all__ = ["router", "ADVANCED_ANALYSIS_VERSION"]         give me full revised script 
+__all__ = ["router", "ADVANCED_ANALYSIS_VERSION"]
