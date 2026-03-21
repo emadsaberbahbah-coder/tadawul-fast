@@ -2,33 +2,32 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.36.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.40.0
 ================================================================================
 
-WHY v5.36.0
+WHY v5.40.0
 -----------
-- FIX: makes V2 import-safe and startup-safe even when optional integrations,
-       provider modules, schema registry modules, or page catalog modules are
-       unavailable.
-- FIX: introduces static canonical contracts for all core pages so known sheets
-       never degrade to "schema empty" during runtime.
-- FIX: preserves route compatibility aliases expected by wrappers, selectors,
-       and direct router calls.
-- FIX: returns canonical headers/keys/columns/fields consistently across all
-       payload families.
-- FIX: supports external rows/symbol readers when available, but degrades
-       safely to snapshots and emergency symbols instead of acting like a stub.
-- FIX: exposes singleton aliases ENGINE / engine / _ENGINE and import-safe
-       get_engine() / close_engine() helpers.
-- FIX: adds stronger Top10 and Insights fallbacks inside the engine so sheet-row
-       routes remain useful even when specialized builders are temporarily down.
-- FIX: avoids fake-row coercion from nested wrapper dicts.
+- FIX: aligns engine sheet-row payloads with revised routers:
+       - rows / rows_matrix => matrix aligned to keys
+       - row_objects / items / records / data / quotes => dict rows
+- FIX: keeps import-safe / startup-safe behavior when optional integrations,
+       providers, schema modules, or page catalog modules are unavailable.
+- FIX: preserves canonical contracts for known pages, including Top10, Insights,
+       and Data Dictionary.
+- FIX: keeps route compatibility aliases expected by advisor / advanced /
+       enriched wrappers and direct router calls.
+- FIX: strengthens row extraction from snapshots / external readers by preferring
+       row_objects / records / items before falling back to rows or matrices.
+- FIX: improves snapshot usefulness by storing the aligned contract, not only a
+       partially compatible payload shape.
+- FIX: retains Top10 / Insights fallbacks inside the engine so sheet-row routes
+       stay useful even when specialized builders are unavailable.
 
 Design goals
 ------------
 - Never fail import because an optional module is missing.
 - Never return an empty schema for a known page.
-- Prefer live external readers/providers when available.
+- Prefer live or external rows when available.
 - Preserve schema-first contracts for route stability.
 - Keep payloads JSON-safe and route-tolerant.
 ================================================================================
@@ -44,13 +43,13 @@ import os
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import date, datetime, time as dt_time, timezone
 from decimal import Decimal
 from enum import Enum
 from importlib import import_module
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 try:
     from zoneinfo import ZoneInfo
@@ -60,17 +59,25 @@ except Exception:  # pragma: no cover
 try:
     from pydantic import BaseModel, ConfigDict
 except Exception:  # pragma: no cover
-    BaseModel = object  # type: ignore
-    ConfigDict = dict  # type: ignore
+    class BaseModel:  # type: ignore
+        def __init__(self, **data: Any) -> None:
+            self.__dict__.update(data)
+
+        def model_dump(self, mode: str = "python") -> Dict[str, Any]:
+            return dict(self.__dict__)
+
+    def ConfigDict(**kwargs: Any) -> Dict[str, Any]:  # type: ignore
+        return dict(kwargs)
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.36.0"
+__version__ = "5.40.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
+
 
 # =============================================================================
 # Minimal domain models
@@ -361,6 +368,7 @@ INSTRUMENT_SHEETS: Set[str] = {
     "Top_10_Investments",
 }
 SPECIAL_SHEETS: Set[str] = {"Insights_Analysis", "Data_Dictionary"}
+
 TOP10_ENGINE_DEFAULT_PAGES: List[str] = [
     "Market_Leaders",
     "Global_Markets",
@@ -393,7 +401,15 @@ PAGE_SYMBOL_ENV_KEYS: Dict[str, str] = {
 DEFAULT_PROVIDERS = ["eodhd", "yahoo", "finnhub"]
 DEFAULT_KSA_PROVIDERS = ["tadawul", "argaam", "yahoo"]
 DEFAULT_GLOBAL_PROVIDERS = ["eodhd", "yahoo", "finnhub"]
-PROVIDER_PRIORITIES = {"tadawul": 10, "argaam": 20, "eodhd": 30, "yahoo": 40, "finnhub": 50, "yahoo_chart": 60}
+PROVIDER_PRIORITIES = {
+    "tadawul": 10,
+    "argaam": 20,
+    "eodhd": 30,
+    "yahoo": 40,
+    "finnhub": 50,
+    "yahoo_chart": 60,
+}
+
 
 # =============================================================================
 # Small helpers
@@ -658,26 +674,6 @@ def _get_env_list(name: str, default: Sequence[str]) -> List[str]:
     return [p.strip().lower() for p in re.split(r"[,;|\s]+", raw) if p.strip()]
 
 
-def _rows_matrix(rows: List[Dict[str, Any]], keys: List[str]) -> List[List[Any]]:
-    out: List[List[Any]] = []
-    for row in rows or []:
-        out.append([_json_safe(row.get(k)) for k in keys])
-    return out
-
-
-def _rows_from_matrix(matrix: Any, cols: Sequence[Any]) -> List[Dict[str, Any]]:
-    keys = [_safe_str(c) for c in cols if _safe_str(c)]
-    out: List[Dict[str, Any]] = []
-    for row in matrix or []:
-        if not isinstance(row, (list, tuple)):
-            continue
-        d: Dict[str, Any] = {}
-        for i, k in enumerate(keys):
-            d[k] = row[i] if i < len(row) else None
-        out.append(d)
-    return out
-
-
 def _complete_schema_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple[List[str], List[str]]:
     raw_headers = list(headers or [])
     raw_keys = list(keys or [])
@@ -735,46 +731,6 @@ def _ensure_top10_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple
     return _complete_schema_contract(hdrs, ks)
 
 
-def _normalize_to_schema_keys(keys: Sequence[str], headers: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
-    src = dict(row or {})
-    src_ci = {str(k).strip().lower(): v for k, v in src.items()}
-    src_loose = {_norm_key_loose(k): v for k, v in src.items()}
-    out: Dict[str, Any] = {}
-    for idx, key in enumerate(keys or []):
-        header = headers[idx] if idx < len(headers) else key
-        aliases = [
-            key,
-            header,
-            _norm_key(key),
-            _norm_key(header),
-            key.lower(),
-            header.lower(),
-            key.replace("_", " "),
-        ]
-        val = None
-        found = False
-        for alias in aliases:
-            if alias in src:
-                val = src[alias]
-                found = True
-                break
-            if alias.lower() in src_ci:
-                val = src_ci[alias.lower()]
-                found = True
-                break
-            loose = _norm_key_loose(alias)
-            if loose in src_loose:
-                val = src_loose[loose]
-                found = True
-                break
-        out[key] = val if found else None
-    return out
-
-
-def _strict_project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
-    return {k: row.get(k) for k in keys}
-
-
 def _json_safe(value: Any) -> Any:
     if value is None:
         return None
@@ -794,6 +750,11 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, bytes):
         try:
             return value.decode("utf-8", errors="replace")
+        except Exception:
+            return str(value)
+    if is_dataclass(value):
+        try:
+            return {str(k): _json_safe(v) for k, v in asdict(value).items()}
         except Exception:
             return str(value)
     if isinstance(value, Mapping):
@@ -865,9 +826,29 @@ def _looks_like_explicit_row_dict(d: Any) -> bool:
     return False
 
 
+def _rows_from_matrix_payload(matrix: Any, cols: Sequence[Any]) -> List[Dict[str, Any]]:
+    keys = [_safe_str(c) for c in cols if _safe_str(c)]
+    out: List[Dict[str, Any]] = []
+    for row in matrix or []:
+        if not isinstance(row, (list, tuple)):
+            continue
+        d: Dict[str, Any] = {}
+        for i, k in enumerate(keys):
+            d[k] = row[i] if i < len(row) else None
+        out.append(d)
+    return out
+
+
 def _coerce_rows_list(out: Any) -> List[Dict[str, Any]]:
+    """
+    Prefer explicit dict-row collections first:
+    row_objects / records / items / data / quotes
+    Then accept rows if they are dict rows.
+    Finally fall back to matrix + keys or to explicit single row dicts.
+    """
     if out is None:
         return []
+
     if isinstance(out, list):
         if not out:
             return []
@@ -875,7 +856,8 @@ def _coerce_rows_list(out: Any) -> List[Dict[str, Any]]:
             return [dict(r) for r in out if isinstance(r, dict)]
         if isinstance(out[0], (list, tuple)):
             return []
-        return [_model_to_dict(r) for r in out]
+        return [_model_to_dict(r) for r in out if _model_to_dict(r)]
+
     if isinstance(out, dict):
         maybe_symbol_map = True
         rows_from_map: List[Dict[str, Any]] = []
@@ -895,7 +877,8 @@ def _coerce_rows_list(out: Any) -> List[Dict[str, Any]]:
                 rows_from_map.append(row)
         if maybe_symbol_map and symbol_like_keys > 0 and rows_from_map:
             return rows_from_map
-        for key in ("rows", "data", "items", "records", "payload", "result", "quotes"):
+
+        for key in ("row_objects", "records", "items", "data", "quotes", "rows"):
             val = out.get(key)
             if isinstance(val, list):
                 if val and isinstance(val[0], dict):
@@ -903,19 +886,29 @@ def _coerce_rows_list(out: Any) -> List[Dict[str, Any]]:
                 if val and isinstance(val[0], (list, tuple)):
                     cols = out.get("keys") or out.get("headers") or out.get("columns") or []
                     if isinstance(cols, list) and cols:
-                        return _rows_from_matrix(val, cols)
+                        return _rows_from_matrix_payload(val, cols)
             if isinstance(val, dict):
                 nested_rows = _coerce_rows_list(val)
-                if nested_rows and all(_looks_like_explicit_row_dict(x) for x in nested_rows):
+                if nested_rows:
                     return nested_rows
+
         rows_matrix = out.get("rows_matrix") or out.get("matrix")
         if isinstance(rows_matrix, list):
             cols = out.get("keys") or out.get("headers") or out.get("columns") or []
             if isinstance(cols, list) and cols:
-                return _rows_from_matrix(rows_matrix, cols)
+                return _rows_from_matrix_payload(rows_matrix, cols)
+
         if _looks_like_explicit_row_dict(out):
             return [dict(out)]
+
+        for key in ("payload", "result", "response", "output"):
+            nested = out.get(key)
+            nested_rows = _coerce_rows_list(nested)
+            if nested_rows:
+                return nested_rows
+
         return []
+
     d = _model_to_dict(out)
     return [d] if _looks_like_explicit_row_dict(d) else []
 
@@ -933,6 +926,51 @@ def _extract_symbols_from_rows(rows: Sequence[Dict[str, Any]], limit: int = 5000
     return _normalize_symbol_list(raw, limit=limit)
 
 
+def _normalize_to_schema_keys(keys: Sequence[str], headers: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
+    src = dict(row or {})
+    src_ci = {str(k).strip().lower(): v for k, v in src.items()}
+    src_loose = {_norm_key_loose(k): v for k, v in src.items()}
+
+    out: Dict[str, Any] = {}
+    for idx, key in enumerate(keys or []):
+        header = headers[idx] if idx < len(headers) else key
+        aliases = [
+            key,
+            header,
+            _norm_key(key),
+            _norm_key(header),
+            key.lower(),
+            header.lower(),
+            key.replace("_", " "),
+        ]
+        val = None
+        found = False
+        for alias in aliases:
+            if alias in src:
+                val = src[alias]
+                found = True
+                break
+            if alias.lower() in src_ci:
+                val = src_ci[alias.lower()]
+                found = True
+                break
+            loose = _norm_key_loose(alias)
+            if loose in src_loose:
+                val = src_loose[loose]
+                found = True
+                break
+        out[key] = val if found else None
+    return out
+
+
+def _strict_project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: _json_safe(row.get(k)) for k in keys}
+
+
+def _rows_matrix_from_rows(rows: List[Dict[str, Any]], keys: List[str]) -> List[List[Any]]:
+    return [[_json_safe(row.get(k)) for k in keys] for row in rows or []]
+
+
 def _compute_scores_fallback(row: Dict[str, Any]) -> None:
     price = _as_float(row.get("current_price")) or _as_float(row.get("price"))
     pe = _as_float(row.get("pe_ttm"))
@@ -944,8 +982,7 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
     if roi_3m is None:
         roi_3m = _as_float(row.get("expected_roi_12m"))
 
-    value_score = row.get("value_score")
-    if value_score is None:
+    if row.get("value_score") is None:
         value_score = 60.0
         if pe is not None:
             value_score += max(0.0, 20.0 - min(pe, 20.0))
@@ -955,8 +992,7 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
             value_score += min(div_yield * 100.0, 10.0)
         row["value_score"] = round(_clamp(float(value_score), 0.0, 100.0), 2)
 
-    quality_score = row.get("quality_score")
-    if quality_score is None:
+    if row.get("quality_score") is None:
         quality_score = 55.0
         gm = _as_float(row.get("gross_margin"))
         pm = _as_float(row.get("profit_margin"))
@@ -966,8 +1002,7 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
             quality_score += min(pm * 100.0, 15.0) if pm <= 1.5 else min(pm, 15.0)
         row["quality_score"] = round(_clamp(float(quality_score), 0.0, 100.0), 2)
 
-    momentum_score = row.get("momentum_score")
-    if momentum_score is None:
+    if row.get("momentum_score") is None:
         pct = _as_float(row.get("percent_change"))
         if pct is None:
             pct = _as_float(row.get("change_pct"))
@@ -975,18 +1010,15 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
             pct = 0.0
         if abs(pct) > 1.5:
             pct = pct / 100.0
-        momentum_score = 50.0 + (pct * 100.0)
-        row["momentum_score"] = round(_clamp(float(momentum_score), 0.0, 100.0), 2)
+        row["momentum_score"] = round(_clamp(50.0 + (pct * 100.0), 0.0, 100.0), 2)
 
-    growth_score = row.get("growth_score")
-    if growth_score is None:
+    if row.get("growth_score") is None:
         rg = _as_float(row.get("revenue_growth_yoy"))
         if rg is None:
             rg = 0.0
         if abs(rg) > 1.5:
             rg = rg / 100.0
-        growth_score = 50.0 + (rg * 100.0)
-        row["growth_score"] = round(_clamp(float(growth_score), 0.0, 100.0), 2)
+        row["growth_score"] = round(_clamp(50.0 + (rg * 100.0), 0.0, 100.0), 2)
 
     conf = _as_float(row.get("forecast_confidence"))
     if conf is None:
@@ -998,8 +1030,7 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
     row.setdefault("forecast_confidence", round(_clamp(conf, 0.0, 1.0), 4))
     row.setdefault("confidence_score", round(_clamp(conf * 100.0, 0.0, 100.0), 2))
 
-    risk_score = _as_float(row.get("risk_score"))
-    if risk_score is None:
+    if row.get("risk_score") is None:
         vol = _as_float(row.get("volatility_90d"))
         beta = _as_float(row.get("beta_5y"))
         risk_score = 40.0
@@ -1009,8 +1040,7 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
             risk_score += min(max(beta * 10.0, 0.0), 20.0)
         row["risk_score"] = round(_clamp(risk_score, 0.0, 100.0), 2)
 
-    overall = row.get("overall_score")
-    if overall is None:
+    if row.get("overall_score") is None:
         vals = [
             _as_float(row.get("value_score")),
             _as_float(row.get("quality_score")),
@@ -1021,8 +1051,7 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         overall = sum(vals2) / len(vals2) if vals2 else 50.0
         row["overall_score"] = round(_clamp(float(overall), 0.0, 100.0), 2)
 
-    opp = row.get("opportunity_score")
-    if opp is None:
+    if row.get("opportunity_score") is None:
         base = _as_float(row.get("overall_score")) or 50.0
         boost = 0.0
         if roi_3m is not None:
@@ -1033,21 +1062,11 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
 
     if not row.get("risk_bucket"):
         rs = _as_float(row.get("risk_score")) or 50.0
-        if rs < 40:
-            row["risk_bucket"] = "LOW"
-        elif rs < 70:
-            row["risk_bucket"] = "MODERATE"
-        else:
-            row["risk_bucket"] = "HIGH"
+        row["risk_bucket"] = "LOW" if rs < 40 else "MODERATE" if rs < 70 else "HIGH"
 
     if not row.get("confidence_bucket"):
         cs = _as_float(row.get("confidence_score")) or 55.0
-        if cs >= 75:
-            row["confidence_bucket"] = "HIGH"
-        elif cs >= 55:
-            row["confidence_bucket"] = "MODERATE"
-        else:
-            row["confidence_bucket"] = "LOW"
+        row["confidence_bucket"] = "HIGH" if cs >= 75 else "MODERATE" if cs >= 55 else "LOW"
 
     if price is not None and row.get("forecast_price_3m") is None:
         row["forecast_price_3m"] = round(price * 1.03, 4)
@@ -1055,6 +1074,7 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         row["forecast_price_1m"] = round(price * 1.01, 4)
     if price is not None and row.get("forecast_price_12m") is None:
         row["forecast_price_12m"] = round(price * 1.08, 4)
+
     if price is not None and row.get("expected_roi_1m") is None:
         fp1 = _as_float(row.get("forecast_price_1m"))
         if fp1 is not None and price:
@@ -1084,7 +1104,10 @@ def _compute_recommendation(row: Dict[str, Any]) -> None:
     else:
         rec = "HOLD"
     row["recommendation"] = rec
-    row.setdefault("recommendation_reason", f"overall={round(overall,1)} confidence={round(conf,1)} risk={round(risk,1)}")
+    row.setdefault(
+        "recommendation_reason",
+        f"overall={round(overall,1)} confidence={round(conf,1)} risk={round(risk,1)}",
+    )
 
 
 def _apply_rank_overall(rows: List[Dict[str, Any]]) -> None:
@@ -1103,7 +1126,12 @@ def _apply_rank_overall(rows: List[Dict[str, Any]]) -> None:
 
 def _top10_selection_reason(row: Dict[str, Any]) -> str:
     parts: List[str] = []
-    for key, label in (("overall_score", "overall"), ("opportunity_score", "opportunity"), ("confidence_score", "confidence"), ("risk_score", "risk")):
+    for key, label in (
+        ("overall_score", "overall"),
+        ("opportunity_score", "opportunity"),
+        ("confidence_score", "confidence"),
+        ("risk_score", "risk"),
+    ):
         val = _as_float(row.get(key))
         if val is None:
             continue
@@ -1154,13 +1182,12 @@ def _try_get_settings() -> Any:
     return None
 
 
-def _call_maybe_async(fn: Any, *args: Any, **kwargs: Any) -> Any:
-    result = fn(*args, **kwargs)
-    if inspect.isawaitable(result):
-        return result
-    async def _wrap() -> Any:
-        return result
-    return _wrap()
+async def _call_maybe_async(fn: Any, *args: Any, **kwargs: Any) -> Any:
+    if inspect.iscoroutinefunction(fn):
+        return await fn(*args, **kwargs)
+
+    result = await asyncio.to_thread(fn, *args, **kwargs)
+    return await result if inspect.isawaitable(result) else result
 
 
 # =============================================================================
@@ -1271,6 +1298,7 @@ def _schema_for_sheet(sheet: str) -> Tuple[Any, List[str], List[str], str]:
         if canon == "Top_10_Investments":
             h, k = _ensure_top10_contract(h, k)
         return dict(static_contract), h, k, "static_canonical_contract"
+
     try:
         spec = get_sheet_spec(canon)
         h, k = _schema_keys_headers_from_spec(spec)
@@ -1280,13 +1308,14 @@ def _schema_for_sheet(sheet: str) -> Tuple[Any, List[str], List[str], str]:
             return spec, h, k, "schema_registry"
     except Exception:
         pass
-    # final fallback for known pages
+
     if canon in STATIC_CANONICAL_SHEET_CONTRACTS:
         c = STATIC_CANONICAL_SHEET_CONTRACTS[canon]
         h, k = _complete_schema_contract(c["headers"], c["keys"])
         if canon == "Top_10_Investments":
             h, k = _ensure_top10_contract(h, k)
         return dict(c), h, k, "static_canonical_contract_fallback"
+
     return None, [], [], "missing"
 
 
@@ -1337,8 +1366,9 @@ def _build_union_schema_keys() -> List[str]:
 
 _SCHEMA_UNION_KEYS: List[str] = _build_union_schema_keys()
 
+
 # =============================================================================
-# Light async utilities
+# Async utilities
 # =============================================================================
 class SingleFlight:
     def __init__(self) -> None:
@@ -1360,7 +1390,7 @@ class SingleFlight:
 
 
 class MultiLevelCache:
-    def __init__(self, name: str, l1_ttl: int = 60, l3_ttl: int = 3600, max_l1_size: int = 5000) -> None:
+    def __init__(self, name: str, l1_ttl: int = 60, max_l1_size: int = 5000) -> None:
         self.name = name
         self.l1_ttl = max(1, int(l1_ttl))
         self.max_l1_size = max(1, int(max_l1_size))
@@ -1411,10 +1441,11 @@ class ProviderRegistry:
                 break
             except Exception:
                 continue
-        stats = type("ProviderStats", (), {
-            "is_circuit_open": False,
-            "last_import_error": "" if module is not None else "provider module missing",
-        })()
+        stats = type(
+            "ProviderStats",
+            (),
+            {"is_circuit_open": False, "last_import_error": "" if module is not None else "provider module missing"},
+        )()
         return module, stats
 
     async def record_success(self, provider: str, latency_ms: float) -> None:
@@ -1432,13 +1463,7 @@ class ProviderRegistry:
 
 
 def _pick_provider_callable(module: Any, provider: str) -> Optional[Any]:
-    for name in (
-        "get_quote",
-        "fetch_quote",
-        "fetch_enriched_quote",
-        "get_enriched_quote",
-        "quote",
-    ):
+    for name in ("get_quote", "fetch_quote", "fetch_enriched_quote", "get_enriched_quote", "quote"):
         fn = getattr(module, name, None)
         if callable(fn):
             return fn
@@ -1473,17 +1498,22 @@ class _EngineSymbolsReaderProxy:
 # DataEngineV5
 # =============================================================================
 class DataEngineV5:
-    def __init__(self, settings: Any = None):
+    def __init__(self, settings: Any = None) -> None:
         self.settings = settings if settings is not None else _try_get_settings()
         self.flags = _feature_flags(self.settings)
         self.version = __version__
-        self.primary_provider = _safe_str(getattr(self.settings, "primary_provider", "eodhd") if self.settings is not None else _safe_env("PRIMARY_PROVIDER", "eodhd")).lower() or "eodhd"
+
+        self.primary_provider = (
+            _safe_str(getattr(self.settings, "primary_provider", "eodhd") if self.settings is not None else _safe_env("PRIMARY_PROVIDER", "eodhd")).lower()
+            or "eodhd"
+        )
         self.enabled_providers = _get_env_list("ENABLED_PROVIDERS", DEFAULT_PROVIDERS)
         self.ksa_providers = _get_env_list("KSA_PROVIDERS", DEFAULT_KSA_PROVIDERS)
         self.global_providers = _get_env_list("GLOBAL_PROVIDERS", DEFAULT_GLOBAL_PROVIDERS)
         self.max_concurrency = _get_env_int("DATA_ENGINE_MAX_CONCURRENCY", 25)
         self.request_timeout = _get_env_float("DATA_ENGINE_TIMEOUT_SECONDS", 20.0)
         self.ksa_disallow_eodhd = _get_env_bool("KSA_DISALLOW_EODHD", True)
+
         self.schema_strict_sheet_rows = _get_env_bool("SCHEMA_STRICT_SHEET_ROWS", True)
         self.top10_force_full_schema = _get_env_bool("TOP10_FORCE_FULL_SCHEMA", True)
         self.rows_hydrate_external = _get_env_bool("ROWS_HYDRATE_EXTERNAL_READER", True)
@@ -1491,8 +1521,16 @@ class DataEngineV5:
         self._sem = asyncio.Semaphore(max(1, self.max_concurrency))
         self._singleflight = SingleFlight()
         self._registry = ProviderRegistry()
-        self._cache = MultiLevelCache(name="data_engine", l1_ttl=_get_env_int("CACHE_L1_TTL", 60), l3_ttl=_get_env_int("CACHE_L3_TTL", 3600), max_l1_size=_get_env_int("CACHE_L1_MAX", 5000))
-        self._symbols_cache = MultiLevelCache(name="sheet_symbols", l1_ttl=_get_env_int("SHEET_SYMBOLS_L1_TTL", 300), l3_ttl=_get_env_int("SHEET_SYMBOLS_L3_TTL", 1800), max_l1_size=_get_env_int("SHEET_SYMBOLS_L1_MAX", 256))
+        self._cache = MultiLevelCache(
+            name="data_engine",
+            l1_ttl=_get_env_int("CACHE_L1_TTL", 60),
+            max_l1_size=_get_env_int("CACHE_L1_MAX", 5000),
+        )
+        self._symbols_cache = MultiLevelCache(
+            name="sheet_symbols",
+            l1_ttl=_get_env_int("SHEET_SYMBOLS_L1_TTL", 300),
+            max_l1_size=_get_env_int("SHEET_SYMBOLS_L1_MAX", 256),
+        )
 
         self._symbols_reader_lock = asyncio.Lock()
         self._symbols_reader_ready = False
@@ -1512,55 +1550,70 @@ class DataEngineV5:
     async def aclose(self) -> None:
         return
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # compatibility aliases
-    # ---------------------------------------------------------------------
-    async def execute_sheet_rows(self, *args, **kwargs) -> Dict[str, Any]:
+    # ------------------------------------------------------------------
+    async def execute_sheet_rows(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         return await self.get_sheet_rows(*args, **kwargs)
 
-    async def run_sheet_rows(self, *args, **kwargs) -> Dict[str, Any]:
+    async def run_sheet_rows(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         return await self.get_sheet_rows(*args, **kwargs)
 
-    async def build_analysis_sheet_rows(self, *args, **kwargs) -> Dict[str, Any]:
+    async def build_analysis_sheet_rows(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         return await self.get_sheet_rows(*args, **kwargs)
 
-    async def run_analysis_sheet_rows(self, *args, **kwargs) -> Dict[str, Any]:
+    async def run_analysis_sheet_rows(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         return await self.get_sheet_rows(*args, **kwargs)
 
-    async def get_rows_for_sheet(self, *args, **kwargs) -> Dict[str, Any]:
+    async def get_rows_for_sheet(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         return await self.get_sheet_rows(*args, **kwargs)
 
-    async def get_rows_for_page(self, *args, **kwargs) -> Dict[str, Any]:
+    async def get_rows_for_page(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         return await self.get_page_rows(*args, **kwargs)
 
-    def get_page_snapshot(self, *args, **kwargs) -> Optional[Dict[str, Any]]:
+    def get_page_snapshot(self, *args: Any, **kwargs: Any) -> Optional[Dict[str, Any]]:
         return self.get_cached_sheet_snapshot(*args, **kwargs)
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # snapshot helpers
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     def _store_sheet_snapshot(self, sheet: str, payload: Dict[str, Any]) -> None:
         target = _canonicalize_sheet_name(sheet)
         if not target or not isinstance(payload, dict):
             return
         self._sheet_snapshots[target] = dict(payload)
 
-    def get_cached_sheet_snapshot(self, sheet: Optional[str] = None, page: Optional[str] = None, sheet_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def get_cached_sheet_snapshot(
+        self,
+        sheet: Optional[str] = None,
+        page: Optional[str] = None,
+        sheet_name: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         target = _canonicalize_sheet_name(sheet or page or sheet_name or "")
         if not target:
             return None
         snap = self._sheet_snapshots.get(target)
         return dict(snap) if isinstance(snap, dict) else None
 
-    def get_sheet_snapshot(self, page: Optional[str] = None, sheet: Optional[str] = None, sheet_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def get_sheet_snapshot(
+        self,
+        page: Optional[str] = None,
+        sheet: Optional[str] = None,
+        sheet_name: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         return self.get_cached_sheet_snapshot(sheet=sheet, page=page, sheet_name=sheet_name)
 
-    def get_cached_sheet_rows(self, sheet_name: Optional[str] = None, sheet: Optional[str] = None, page: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    def get_cached_sheet_rows(
+        self,
+        sheet_name: Optional[str] = None,
+        sheet: Optional[str] = None,
+        page: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
         return self.get_cached_sheet_snapshot(sheet=sheet, page=page, sheet_name=sheet_name)
 
-    # ---------------------------------------------------------------------
-    # meta helpers
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # symbol resolution meta
+    # ------------------------------------------------------------------
     def _set_sheet_symbols_meta(self, sheet: str, source: str, count: int, note: Optional[str] = None) -> None:
         target = _canonicalize_sheet_name(sheet)
         if not target:
@@ -1588,22 +1641,25 @@ class DataEngineV5:
                 return _safe_str(v)
         return ""
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # final payload
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     def _finalize_payload(
         self,
         *,
         sheet: str,
         headers: List[str],
         keys: List[str],
-        rows: List[Dict[str, Any]],
+        row_objects: List[Dict[str, Any]],
         include_matrix: bool,
         status: str = "success",
         meta: Optional[Dict[str, Any]] = None,
         error: Optional[str] = None,
     ) -> Dict[str, Any]:
         headers, keys = _complete_schema_contract(headers, keys)
+        dict_rows = [_strict_project_row(keys, r) for r in (row_objects or [])]
+        matrix_rows = _rows_matrix_from_rows(dict_rows, keys) if include_matrix else []
+
         payload = {
             "status": status,
             "sheet": sheet,
@@ -1616,12 +1672,14 @@ class DataEngineV5:
             "keys": keys,
             "columns": keys,
             "fields": keys,
-            "rows": rows,
-            "data": rows,
-            "items": rows,
-            "quotes": rows,
-            "rows_matrix": _rows_matrix(rows, keys) if include_matrix else [],
-            "count": len(rows),
+            "rows": matrix_rows,
+            "rows_matrix": matrix_rows,
+            "row_objects": dict_rows,
+            "items": dict_rows,
+            "records": dict_rows,
+            "data": dict_rows,
+            "quotes": dict_rows,
+            "count": len(dict_rows),
             "meta": dict(meta or {}),
             "version": self.version,
         }
@@ -1629,15 +1687,17 @@ class DataEngineV5:
             payload["error"] = error
         return _json_safe(payload)
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # rows reader discovery
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     async def _init_rows_reader(self) -> Tuple[Any, str]:
         if self._rows_reader_ready:
             return self._rows_reader_obj, self._rows_reader_source
+
         async with self._rows_reader_lock:
             if self._rows_reader_ready:
                 return self._rows_reader_obj, self._rows_reader_source
+
             obj: Any = None
             source = ""
             for mod_path in (
@@ -1652,18 +1712,25 @@ class DataEngineV5:
                     mod = import_module(mod_path)
                 except Exception:
                     continue
-                if any(callable(getattr(mod, nm, None)) for nm in ("get_rows_for_sheet", "read_rows_for_sheet", "get_sheet_rows", "fetch_sheet_rows", "sheet_rows", "get_rows")):
+
+                if any(
+                    callable(getattr(mod, nm, None))
+                    for nm in ("get_rows_for_sheet", "read_rows_for_sheet", "get_sheet_rows", "fetch_sheet_rows", "sheet_rows", "get_rows")
+                ):
                     obj = mod
                     source = mod_path
                     break
+
                 for attr_name in ("service", "reader", "rows_reader", "google_sheets_service"):
                     candidate = getattr(mod, attr_name, None)
                     if candidate is not None:
                         obj = candidate
                         source = f"{mod_path}.{attr_name}"
                         break
+
                 if obj is not None:
                     break
+
             self._rows_reader_obj = obj
             self._rows_reader_source = source
             self._rows_reader_ready = True
@@ -1672,10 +1739,12 @@ class DataEngineV5:
     async def _call_rows_reader(self, obj: Any, sheet: str, limit: int) -> List[Dict[str, Any]]:
         if obj is None:
             return []
+
         for name in ("get_rows_for_sheet", "read_rows_for_sheet", "get_sheet_rows", "fetch_sheet_rows", "sheet_rows", "get_rows"):
             fn = getattr(obj, name, None)
             if not callable(fn):
                 continue
+
             variants = [
                 ((), {"sheet": sheet, "limit": limit}),
                 ((), {"sheet_name": sheet, "limit": limit}),
@@ -1694,24 +1763,26 @@ class DataEngineV5:
                     continue
                 except Exception:
                     continue
+
         return []
 
     async def _get_rows_from_external_reader(self, sheet: str, limit: int) -> List[Dict[str, Any]]:
-        obj, _ = await self._init_rows_reader()
+        obj, _src = await self._init_rows_reader()
         if obj is None:
             return []
-        rows = await self._call_rows_reader(obj, sheet, limit)
-        return rows[:limit] if rows else []
+        return await self._call_rows_reader(obj, sheet, limit)
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # symbols reader discovery
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     async def _init_symbols_reader(self) -> Tuple[Any, str]:
         if self._symbols_reader_ready:
             return self._symbols_reader_obj, self._symbols_reader_source
+
         async with self._symbols_reader_lock:
             if self._symbols_reader_ready:
                 return self._symbols_reader_obj, self._symbols_reader_source
+
             obj: Any = None
             source = ""
             for mod_path in (
@@ -1728,18 +1799,35 @@ class DataEngineV5:
                     mod = import_module(mod_path)
                 except Exception:
                     continue
-                if any(callable(getattr(mod, nm, None)) for nm in ("get_symbols_for_sheet", "read_symbols_for_sheet", "get_sheet_symbols", "get_symbols", "list_symbols_for_page", "get_symbols_for_page", "read_symbols", "load_symbols", "read_sheet_symbols")):
+
+                if any(
+                    callable(getattr(mod, nm, None))
+                    for nm in (
+                        "get_symbols_for_sheet",
+                        "read_symbols_for_sheet",
+                        "get_sheet_symbols",
+                        "get_symbols",
+                        "list_symbols_for_page",
+                        "get_symbols_for_page",
+                        "read_symbols",
+                        "load_symbols",
+                        "read_sheet_symbols",
+                    )
+                ):
                     obj = mod
                     source = mod_path
                     break
+
                 for attr_name in ("symbols_reader", "reader", "symbol_reader", "sheet_reader", "service"):
                     candidate = getattr(mod, attr_name, None)
                     if candidate is not None:
                         obj = candidate
                         source = f"{mod_path}.{attr_name}"
                         break
+
                 if obj is not None:
                     break
+
             self._symbols_reader_obj = obj
             self._symbols_reader_source = source
             self._symbols_reader_ready = True
@@ -1748,16 +1836,30 @@ class DataEngineV5:
     async def _call_symbols_reader(self, obj: Any, sheet: str, limit: int) -> List[str]:
         if obj is None:
             return []
+
         if isinstance(obj, dict):
             for key in _sheet_lookup_candidates(sheet):
                 vals = obj.get(key)
                 syms = _normalize_symbol_list(_split_symbols(vals), limit=limit)
                 if syms:
                     return syms
-        for name in ("get_symbols_for_sheet", "read_symbols_for_sheet", "get_sheet_symbols", "get_symbols_for_page", "list_symbols_for_page", "get_symbols", "list_symbols", "read_symbols", "load_symbols", "read_sheet_symbols"):
+
+        for name in (
+            "get_symbols_for_sheet",
+            "read_symbols_for_sheet",
+            "get_sheet_symbols",
+            "get_symbols_for_page",
+            "list_symbols_for_page",
+            "get_symbols",
+            "list_symbols",
+            "read_symbols",
+            "load_symbols",
+            "read_sheet_symbols",
+        ):
             fn = getattr(obj, name, None)
             if not callable(fn):
                 continue
+
             variants = [
                 ((), {"sheet": sheet, "limit": limit}),
                 ((), {"sheet_name": sheet, "limit": limit}),
@@ -1778,6 +1880,7 @@ class DataEngineV5:
                     continue
                 except Exception:
                     continue
+
         return []
 
     async def _get_symbols_from_env(self, sheet: str, limit: int) -> List[str]:
@@ -1785,11 +1888,14 @@ class DataEngineV5:
         specific = PAGE_SYMBOL_ENV_KEYS.get(sheet)
         if specific:
             env_candidates.append(specific)
+
         for cand in _sheet_lookup_candidates(sheet):
             token = re.sub(r"[^A-Za-z0-9]+", "_", cand).strip("_").upper()
             if token:
                 env_candidates.extend([f"{token}_SYMBOLS", f"{token}_TICKERS", f"{token}_CODES"])
+
         env_candidates.extend(["TOP10_FALLBACK_SYMBOLS", "DEFAULT_PAGE_SYMBOLS", "DEFAULT_SYMBOLS"])
+
         seen: Set[str] = set()
         for env_key in env_candidates:
             if not env_key or env_key in seen:
@@ -1806,11 +1912,20 @@ class DataEngineV5:
         if self.settings is None:
             return []
         candidates = _sheet_lookup_candidates(sheet)
-        for attr_name in (f"{sheet.lower()}_symbols", f"{sheet.lower()}_tickers", f"{sheet.lower()}_codes", "default_symbols", "page_symbols", "sheet_symbols"):
+
+        for attr_name in (
+            f"{sheet.lower()}_symbols",
+            f"{sheet.lower()}_tickers",
+            f"{sheet.lower()}_codes",
+            "default_symbols",
+            "page_symbols",
+            "sheet_symbols",
+        ):
             try:
                 raw = getattr(self.settings, attr_name, None)
             except Exception:
                 raw = None
+
             if isinstance(raw, dict):
                 for cand in candidates:
                     vals = raw.get(cand)
@@ -1821,15 +1936,18 @@ class DataEngineV5:
                 syms = _normalize_symbol_list(_split_symbols(raw), limit=limit)
                 if syms:
                     return syms
+
         return []
 
     async def _get_symbols_from_page_catalog(self, sheet: str, limit: int) -> List[str]:
         candidates = _sheet_lookup_candidates(sheet)
+
         for mod_path in ("core.sheets.page_catalog", "sheets.page_catalog"):
             try:
                 mod = import_module(mod_path)
             except Exception:
                 continue
+
             for attr_name in ("PAGE_SYMBOLS", "SHEET_SYMBOLS", "DEFAULT_PAGE_SYMBOLS", "PAGE_DEFAULT_SYMBOLS"):
                 mapping = getattr(mod, attr_name, None)
                 if isinstance(mapping, dict):
@@ -1838,11 +1956,17 @@ class DataEngineV5:
                         syms = _normalize_symbol_list(_split_symbols(vals), limit=limit)
                         if syms:
                             return syms
+
             for fn_name in ("get_default_symbols", "get_page_symbols", "get_symbols_for_page"):
                 fn = getattr(mod, fn_name, None)
                 if not callable(fn):
                     continue
-                for args, kwargs in [((sheet,), {"limit": limit}), ((sheet,), {}), ((), {"page": sheet, "limit": limit}), ((), {"sheet": sheet, "limit": limit})]:
+                for args, kwargs in [
+                    ((sheet,), {"limit": limit}),
+                    ((sheet,), {}),
+                    ((), {"page": sheet, "limit": limit}),
+                    ((), {"sheet": sheet, "limit": limit}),
+                ]:
                     try:
                         result = await _call_maybe_async(fn, *args, **kwargs)
                         syms = _normalize_symbol_list(_split_symbols(result), limit=limit)
@@ -1852,6 +1976,7 @@ class DataEngineV5:
                         continue
                     except Exception:
                         continue
+
         return []
 
     async def _get_symbols_for_sheet_impl(self, sheet: str, limit: int = 5000, body: Optional[Dict[str, Any]] = None) -> List[str]:
@@ -1859,16 +1984,19 @@ class DataEngineV5:
         if target in SPECIAL_SHEETS:
             self._set_sheet_symbols_meta(target, "special_sheet", 0)
             return []
+
         limit = max(1, min(5000, int(limit or 5000)))
         from_body = _extract_requested_symbols_from_body(body, limit=limit)
         if from_body:
             self._set_sheet_symbols_meta(target, "body_symbols", len(from_body))
             return from_body
+
         cached = await self._symbols_cache.get(sheet=target, limit=limit)
         if isinstance(cached, list) and cached:
             syms = _normalize_symbol_list(cached, limit=limit)
             self._set_sheet_symbols_meta(target, "symbols_cache", len(syms))
             return syms
+
         obj, src = await self._init_symbols_reader()
         if obj is not None:
             syms = await self._call_symbols_reader(obj, target, limit=limit)
@@ -1876,21 +2004,25 @@ class DataEngineV5:
                 self._set_sheet_symbols_meta(target, f"symbols_reader:{src or 'unknown'}", len(syms))
                 await self._symbols_cache.set(syms, sheet=target, limit=limit)
                 return syms
+
         syms = await self._get_symbols_from_page_catalog(target, limit=limit)
         if syms:
             self._set_sheet_symbols_meta(target, "page_catalog", len(syms))
             await self._symbols_cache.set(syms, sheet=target, limit=limit)
             return syms
+
         syms = await self._get_symbols_from_env(target, limit=limit)
         if syms:
             self._set_sheet_symbols_meta(target, "env", len(syms))
             await self._symbols_cache.set(syms, sheet=target, limit=limit)
             return syms
+
         syms = await self._get_symbols_from_settings(target, limit=limit)
         if syms:
             self._set_sheet_symbols_meta(target, "settings", len(syms))
             await self._symbols_cache.set(syms, sheet=target, limit=limit)
             return syms
+
         snap = self.get_cached_sheet_snapshot(sheet=target)
         snap_rows = _coerce_rows_list(snap)
         if snap_rows:
@@ -1899,48 +2031,85 @@ class DataEngineV5:
                 self._set_sheet_symbols_meta(target, "snapshot_rows", len(syms))
                 await self._symbols_cache.set(syms, sheet=target, limit=limit)
                 return syms
+
         emergency = EMERGENCY_PAGE_SYMBOLS.get(target) or []
         if emergency:
             syms = _normalize_symbol_list(emergency, limit=limit)
             self._set_sheet_symbols_meta(target, "emergency_page_symbols", len(syms), note="last_resort_fallback")
             await self._symbols_cache.set(syms, sheet=target, limit=limit)
             return syms
+
         self._set_sheet_symbols_meta(target, "none", 0, note=(src or "no_source"))
         return []
 
-    async def get_sheet_symbols(self, sheet: Optional[str] = None, *, sheet_name: Optional[str] = None, page: Optional[str] = None, limit: int = 5000, body: Optional[Dict[str, Any]] = None) -> List[str]:
+    async def get_sheet_symbols(
+        self,
+        sheet: Optional[str] = None,
+        *,
+        sheet_name: Optional[str] = None,
+        page: Optional[str] = None,
+        limit: int = 5000,
+        body: Optional[Dict[str, Any]] = None,
+    ) -> List[str]:
         return await self._get_symbols_for_sheet_impl(page or sheet or sheet_name or "", limit=limit, body=body)
 
-    async def get_page_symbols(self, page: Optional[str] = None, *, sheet: Optional[str] = None, sheet_name: Optional[str] = None, limit: int = 5000, body: Optional[Dict[str, Any]] = None) -> List[str]:
+    async def get_page_symbols(
+        self,
+        page: Optional[str] = None,
+        *,
+        sheet: Optional[str] = None,
+        sheet_name: Optional[str] = None,
+        limit: int = 5000,
+        body: Optional[Dict[str, Any]] = None,
+    ) -> List[str]:
         return await self._get_symbols_for_sheet_impl(page or sheet or sheet_name or "", limit=limit, body=body)
 
     async def list_symbols_for_page(self, page: str, *, limit: int = 5000, body: Optional[Dict[str, Any]] = None) -> List[str]:
         return await self._get_symbols_for_sheet_impl(page, limit=limit, body=body)
 
-    async def list_symbols(self, sheet: Optional[str] = None, *, page: Optional[str] = None, sheet_name: Optional[str] = None, limit: int = 5000, body: Optional[Dict[str, Any]] = None) -> List[str]:
+    async def list_symbols(
+        self,
+        sheet: Optional[str] = None,
+        *,
+        page: Optional[str] = None,
+        sheet_name: Optional[str] = None,
+        limit: int = 5000,
+        body: Optional[Dict[str, Any]] = None,
+    ) -> List[str]:
         return await self._get_symbols_for_sheet_impl(page or sheet or sheet_name or "", limit=limit, body=body)
 
-    async def get_symbols(self, sheet: Optional[str] = None, *, page: Optional[str] = None, sheet_name: Optional[str] = None, limit: int = 5000, body: Optional[Dict[str, Any]] = None) -> List[str]:
+    async def get_symbols(
+        self,
+        sheet: Optional[str] = None,
+        *,
+        page: Optional[str] = None,
+        sheet_name: Optional[str] = None,
+        limit: int = 5000,
+        body: Optional[Dict[str, Any]] = None,
+    ) -> List[str]:
         return await self._get_symbols_for_sheet_impl(page or sheet or sheet_name or "", limit=limit, body=body)
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # quote APIs
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     async def _fetch_patch(self, provider: str, symbol: str) -> Tuple[str, Optional[Dict[str, Any]], float, Optional[str]]:
         start = time.time()
         async with self._sem:
             module, stats = await self._registry.get_provider(provider)
             if getattr(stats, "is_circuit_open", False):
                 return provider, None, 0.0, "circuit_open"
+
             if module is None:
                 err = getattr(stats, "last_import_error", "provider module missing")
                 await self._registry.record_failure(provider, err)
                 return provider, None, (time.time() - start) * 1000.0, err
+
             fn = _pick_provider_callable(module, provider)
             if fn is None:
                 err = f"no callable fetch function for provider '{provider}'"
                 await self._registry.record_failure(provider, err)
                 return provider, None, (time.time() - start) * 1000.0, err
+
             call_variants = [
                 ((symbol,), {}),
                 ((), {"symbol": symbol}),
@@ -1949,6 +2118,7 @@ class DataEngineV5:
                 ((symbol,), {"settings": self.settings}),
                 ((), {"symbol": symbol, "settings": self.settings}),
             ]
+
             result = None
             collected_errs: List[str] = []
             for args, kwargs in call_variants:
@@ -1961,11 +2131,13 @@ class DataEngineV5:
                 except Exception as exc:
                     collected_errs.append(f"{type(exc).__name__}: {str(exc)[:120]}")
                     continue
+
             latency = (time.time() - start) * 1000.0
             patch = _model_to_dict(result)
             if patch and isinstance(patch, dict):
                 await self._registry.record_success(provider, latency)
                 return provider, patch, latency, None
+
             err = " | ".join(collected_errs) if collected_errs else "non_dict_or_empty"
             await self._registry.record_failure(provider, err)
             return provider, None, latency, err
@@ -1975,12 +2147,15 @@ class DataEngineV5:
         is_ksa_sym = bool(info.get("is_ksa"))
         providers = list(self.ksa_providers if is_ksa_sym else self.global_providers)
         providers = [p for p in providers if p in self.enabled_providers]
+
         if is_ksa_sym and self.ksa_disallow_eodhd:
             providers = [p for p in providers if p != "eodhd"]
+
         if self.primary_provider and self.primary_provider in self.enabled_providers:
             if self.primary_provider in providers:
                 providers = [p for p in providers if p != self.primary_provider]
             providers.insert(0, self.primary_provider)
+
         seen: Set[str] = set()
         out: List[str] = []
         for p in providers:
@@ -1999,8 +2174,16 @@ class DataEngineV5:
             "data_sources": [],
             "provider_latency": {},
         }
+
         protected = {"symbol", "symbol_normalized", "requested_symbol"}
-        sorted_patches = sorted(patches, key=lambda item: (PROVIDER_PRIORITIES.get(item[0], 999), -sum(1 for v in item[1].values() if v not in (None, "", [], {}))))
+        sorted_patches = sorted(
+            patches,
+            key=lambda item: (
+                PROVIDER_PRIORITIES.get(item[0], 999),
+                -sum(1 for v in item[1].values() if v not in (None, "", [], {})),
+            ),
+        )
+
         for prov, patch, latency in sorted_patches:
             merged["data_sources"].append(prov)
             merged["provider_latency"][prov] = round(float(latency or 0.0), 2)
@@ -2009,12 +2192,14 @@ class DataEngineV5:
                     continue
                 if k not in merged or merged.get(k) in (None, "", []):
                     merged[k] = v
+
         if merged.get("current_price") is None and merged.get("price") is not None:
             merged["current_price"] = merged.get("price")
         if merged.get("price") is None and merged.get("current_price") is not None:
             merged["price"] = merged.get("current_price")
         if merged.get("name") is None:
             merged["name"] = norm
+
         return merged
 
     def _data_quality(self, row: Dict[str, Any]) -> str:
@@ -2025,6 +2210,7 @@ class DataEngineV5:
     async def _get_enriched_quote_impl(self, symbol: str, use_cache: bool = True) -> UnifiedQuote:
         info = get_symbol_info(symbol)
         norm = _safe_str(info.get("normalized"))
+
         if not norm:
             row = {
                 "symbol": _safe_str(symbol),
@@ -2038,10 +2224,12 @@ class DataEngineV5:
             _compute_scores_fallback(row)
             _compute_recommendation(row)
             return UnifiedQuote(**row)
+
         if use_cache:
             cached = await self._cache.get(symbol=norm)
             if isinstance(cached, dict) and cached:
                 return UnifiedQuote(**cached)
+
         providers = self._providers_for(norm)
         patches_ok: List[Tuple[str, Dict[str, Any], float]] = []
         if providers:
@@ -2051,6 +2239,7 @@ class DataEngineV5:
                     provider, patch, latency, _err = item
                     if patch:
                         patches_ok.append((provider, patch, latency))
+
         if patches_ok:
             row = self._merge(symbol, norm, patches_ok)
         else:
@@ -2066,13 +2255,16 @@ class DataEngineV5:
                 "last_updated_utc": _now_utc_iso(),
                 "last_updated_riyadh": _now_riyadh_iso(),
             }
+
         _compute_scores_fallback(row)
         _compute_recommendation(row)
         row["data_quality"] = self._data_quality(row)
         row["data_provider"] = row.get("data_provider") or ((row.get("data_sources") or [""])[0] if isinstance(row.get("data_sources"), list) else "")
         q = UnifiedQuote(**row)
+
         if use_cache:
             await self._cache.set(_model_to_dict(q), symbol=norm)
+
         return q
 
     async def get_enriched_quote(self, symbol: str, use_cache: bool = True, *, schema: Any = None) -> UnifiedQuote:
@@ -2081,8 +2273,11 @@ class DataEngineV5:
         if schema is None:
             return raw_q
         row = _model_to_dict(raw_q)
-        projected = _normalize_to_schema_keys(_schema_for_sheet(_safe_str(schema))[2], _schema_for_sheet(_safe_str(schema))[1], row) if isinstance(schema, str) else row
-        return UnifiedQuote(**projected)
+        if isinstance(schema, str):
+            _spec, hdrs, keys, _src = _schema_for_sheet(_safe_str(schema))
+            projected = _normalize_to_schema_keys(keys, hdrs, row)
+            return UnifiedQuote(**projected)
+        return raw_q
 
     async def get_enriched_quote_dict(self, symbol: str, use_cache: bool = True, *, schema: Any = None) -> Dict[str, Any]:
         q = await self.get_enriched_quote(symbol, use_cache=use_cache, schema=schema)
@@ -2124,25 +2319,27 @@ class DataEngineV5:
     quotes_batch = get_enriched_quotes_batch
     get_quote_dict = get_enriched_quote_dict
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # builder fallbacks
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     async def _build_data_dictionary_rows(self) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
         for sheet_name in _list_sheet_names_best_effort():
             _spec, headers, keys, source = _schema_for_sheet(sheet_name)
             for idx, (header, key) in enumerate(zip(headers, keys), start=1):
-                rows.append({
-                    "sheet": sheet_name,
-                    "group": "Canonical",
-                    "header": header,
-                    "key": key,
-                    "dtype": "string",
-                    "fmt": "",
-                    "required": idx <= 3,
-                    "source": source,
-                    "notes": "static/registry contract",
-                })
+                rows.append(
+                    {
+                        "sheet": sheet_name,
+                        "group": "Canonical",
+                        "header": header,
+                        "key": key,
+                        "dtype": "string",
+                        "fmt": "",
+                        "required": idx <= 3,
+                        "source": source,
+                        "notes": "static/registry contract",
+                    }
+                )
         return rows
 
     async def _build_insights_rows_fallback(self, body: Optional[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
@@ -2154,41 +2351,53 @@ class DataEngineV5:
         symbols = _normalize_symbol_list(symbols, limit=max(limit, 20))
         if not symbols:
             symbols = list(EMERGENCY_PAGE_SYMBOLS.get("Market_Leaders", [])[: max(limit, 5)])
+
         quotes = await self.get_enriched_quotes(symbols, schema=None)
         rows: List[Dict[str, Any]] = []
         for q in quotes[:limit]:
             d = _model_to_dict(q)
-            rows.append({
-                "symbol": d.get("symbol"),
-                "recommendation": d.get("recommendation"),
-                "recommendation_reason": d.get("recommendation_reason"),
-                "current_price": d.get("current_price"),
-                "forecast_price_1m": d.get("forecast_price_1m"),
-                "forecast_price_3m": d.get("forecast_price_3m"),
-                "forecast_price_12m": d.get("forecast_price_12m"),
-                "expected_roi_1m": d.get("expected_roi_1m"),
-                "expected_roi_3m": d.get("expected_roi_3m"),
-                "expected_roi_12m": d.get("expected_roi_12m"),
-                "forecast_confidence": d.get("forecast_confidence"),
-                "overall_score": d.get("overall_score"),
-                "risk_bucket": d.get("risk_bucket"),
-                "horizon_days": d.get("horizon_days") or 90,
-                "invest_period_label": d.get("invest_period_label") or "3M",
-                "top10_rank": None,
-                "selection_reason": None,
-                "criteria_snapshot": None,
-            })
+            rows.append(
+                {
+                    "symbol": d.get("symbol"),
+                    "recommendation": d.get("recommendation"),
+                    "recommendation_reason": d.get("recommendation_reason"),
+                    "current_price": d.get("current_price"),
+                    "forecast_price_1m": d.get("forecast_price_1m"),
+                    "forecast_price_3m": d.get("forecast_price_3m"),
+                    "forecast_price_12m": d.get("forecast_price_12m"),
+                    "expected_roi_1m": d.get("expected_roi_1m"),
+                    "expected_roi_3m": d.get("expected_roi_3m"),
+                    "expected_roi_12m": d.get("expected_roi_12m"),
+                    "forecast_confidence": d.get("forecast_confidence"),
+                    "overall_score": d.get("overall_score"),
+                    "risk_bucket": d.get("risk_bucket"),
+                    "horizon_days": d.get("horizon_days") or 90,
+                    "invest_period_label": d.get("invest_period_label") or "3M",
+                    "top10_rank": None,
+                    "selection_reason": None,
+                    "criteria_snapshot": None,
+                }
+            )
         return rows
 
-    async def _build_top10_rows_fallback(self, headers: List[str], keys: List[str], body: Optional[Dict[str, Any]], limit: int, mode: str) -> Tuple[List[str], List[str], List[Dict[str, Any]]]:
+    async def _build_top10_rows_fallback(
+        self,
+        headers: List[str],
+        keys: List[str],
+        body: Optional[Dict[str, Any]],
+        limit: int,
+        mode: str,
+    ) -> Tuple[List[str], List[str], List[Dict[str, Any]]]:
         body = dict(body or {})
         criteria = _extract_nested_dict(body, "criteria")
         top_n = _safe_int(criteria.get("top_n") or body.get("top_n") or limit, 10, lo=1, hi=50)
         headers, keys = _ensure_top10_contract(headers, keys)
+
         direct_symbols = _extract_requested_symbols_from_body(body, limit=top_n * 25)
         pages_selected = _extract_top10_pages_from_body(body)
         if not pages_selected:
             pages_selected = [p for p in TOP10_ENGINE_DEFAULT_PAGES if p in INSTRUMENT_SHEETS]
+
         symbols: List[str] = []
         if direct_symbols:
             symbols = direct_symbols
@@ -2196,17 +2405,24 @@ class DataEngineV5:
             for page_name in pages_selected:
                 syms = await self.get_sheet_symbols(page_name, limit=top_n * 15, body=body)
                 symbols.extend(syms)
+
         symbols = _normalize_symbol_list(symbols, limit=max(top_n * 20, 50))
         if not symbols:
             return headers, keys, []
+
         quotes = await self.get_enriched_quotes(symbols, schema=None)
         rows = [_model_to_dict(q) for q in quotes]
         if not rows:
             return headers, keys, []
+
         min_roi = _as_pct_fraction(criteria.get("min_expected_roi"))
         req_risk = _safe_str(criteria.get("risk_level")).upper()
         req_conf = _safe_str(criteria.get("confidence_level")).upper()
-        horizon_days = _safe_int(criteria.get("horizon_days") or criteria.get("invest_period_days") or body.get("horizon_days") or body.get("invest_period_days"), 365)
+        horizon_days = _safe_int(
+            criteria.get("horizon_days") or criteria.get("invest_period_days") or body.get("horizon_days") or body.get("invest_period_days"),
+            365,
+        )
+
         filtered_rows: List[Dict[str, Any]] = []
         for row in rows:
             if min_roi is not None:
@@ -2218,17 +2434,22 @@ class DataEngineV5:
                     roi = _as_float(row.get("expected_roi_12m")) or _as_float(row.get("expected_roi_3m")) or _as_float(row.get("expected_roi_1m")) or -999.0
                 if roi < min_roi:
                     continue
+
             if req_risk and req_risk != "ALL":
                 row_risk = _safe_str(row.get("risk_bucket")).upper()
                 if row_risk and row_risk != req_risk:
                     continue
+
             if req_conf and req_conf != "ALL":
                 row_conf = _safe_str(row.get("confidence_bucket")).upper()
                 if row_conf and row_conf != req_conf:
                     continue
+
             filtered_rows.append(row)
+
         if not filtered_rows and rows:
             filtered_rows = rows
+
         def _sort_key(r: Dict[str, Any]) -> Tuple[float, float, float]:
             op = _as_float(r.get("opportunity_score"))
             ov = _as_float(r.get("overall_score"))
@@ -2237,10 +2458,16 @@ class DataEngineV5:
                 conf = _as_float(r.get("confidence_score"))
             if conf is not None and conf > 1.5:
                 conf = conf / 100.0
-            return (op if op is not None else -1.0, ov if ov is not None else -1.0, conf if conf is not None else -1.0)
+            return (
+                op if op is not None else -1.0,
+                ov if ov is not None else -1.0,
+                conf if conf is not None else -1.0,
+            )
+
         filtered_rows.sort(key=_sort_key, reverse=True)
         filtered_rows = filtered_rows[:top_n]
         _apply_rank_overall(filtered_rows)
+
         snapshot = _top10_criteria_snapshot(criteria)
         final_rows: List[Dict[str, Any]] = []
         for i, row in enumerate(filtered_rows, start=1):
@@ -2255,25 +2482,58 @@ class DataEngineV5:
             if not projected.get("criteria_snapshot"):
                 projected["criteria_snapshot"] = snapshot
             final_rows.append(projected)
+
         return headers, keys, final_rows
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # main sheet/page APIs
-    # ---------------------------------------------------------------------
-    async def get_page_rows(self, page: Optional[str] = None, *, sheet: Optional[str] = None, sheet_name: Optional[str] = None, limit: int = 2000, offset: int = 0, mode: str = "", body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    # ------------------------------------------------------------------
+    async def get_page_rows(
+        self,
+        page: Optional[str] = None,
+        *,
+        sheet: Optional[str] = None,
+        sheet_name: Optional[str] = None,
+        limit: int = 2000,
+        offset: int = 0,
+        mode: str = "",
+        body: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         return await self.get_sheet_rows(page or sheet or sheet_name, limit=limit, offset=offset, mode=mode, body=body)
 
-    async def get_sheet(self, sheet_name: Optional[str] = None, *, sheet: Optional[str] = None, page: Optional[str] = None, limit: int = 2000, offset: int = 0, mode: str = "", body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def get_sheet(
+        self,
+        sheet_name: Optional[str] = None,
+        *,
+        sheet: Optional[str] = None,
+        page: Optional[str] = None,
+        limit: int = 2000,
+        offset: int = 0,
+        mode: str = "",
+        body: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         return await self.get_sheet_rows(sheet_name or sheet or page, limit=limit, offset=offset, mode=mode, body=body)
 
-    async def get_sheet_rows(self, sheet: Optional[str] = None, *, sheet_name: Optional[str] = None, page: Optional[str] = None, limit: int = 2000, offset: int = 0, mode: str = "", body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    async def get_sheet_rows(
+        self,
+        sheet: Optional[str] = None,
+        *,
+        sheet_name: Optional[str] = None,
+        page: Optional[str] = None,
+        limit: int = 2000,
+        offset: int = 0,
+        mode: str = "",
+        body: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         body = dict(body or {})
         limit = max(1, min(5000, int(limit or 2000)))
         offset = max(0, int(offset or 0))
         include_matrix = _safe_bool(body.get("include_matrix"), True)
         target_sheet = _canonicalize_sheet_name((sheet or sheet_name or page or "Market_Leaders").strip()) or "Market_Leaders"
+
         spec, headers, keys, schema_src = _schema_for_sheet(target_sheet)
         headers, keys = _complete_schema_contract(headers, keys)
+
         target_sheet_known = target_sheet in INSTRUMENT_SHEETS or target_sheet in SPECIAL_SHEETS or bool(spec)
         strict_req = bool(self.schema_strict_sheet_rows)
         contract_level = "canonical" if _usable_contract(headers, keys, target_sheet) else "partial"
@@ -2282,18 +2542,85 @@ class DataEngineV5:
         # Data Dictionary
         if target_sheet == "Data_Dictionary":
             if _is_schema_only_body(body):
-                return self._finalize_payload(sheet=target_sheet, headers=headers, keys=keys, rows=[], include_matrix=include_matrix, status="success", meta={"schema_source": schema_src, "contract_level": contract_level, "strict_requested": strict_req, "strict_enforced": False, "target_sheet_known": True, "builder": "schema_only_fast_path", "rows": 0, "limit": limit, "offset": offset, "mode": mode})
+                return self._finalize_payload(
+                    sheet=target_sheet,
+                    headers=headers,
+                    keys=keys,
+                    row_objects=[],
+                    include_matrix=include_matrix,
+                    status="success",
+                    meta={
+                        "schema_source": schema_src,
+                        "contract_level": contract_level,
+                        "strict_requested": strict_req,
+                        "strict_enforced": False,
+                        "target_sheet_known": True,
+                        "builder": "schema_only_fast_path",
+                        "rows": 0,
+                        "limit": limit,
+                        "offset": offset,
+                        "mode": mode,
+                    },
+                )
+
             rows_all = await self._build_data_dictionary_rows()
             rows_proj = [_strict_project_row(keys, _normalize_to_schema_keys(keys, headers, r)) for r in rows_all]
-            payload_full = self._finalize_payload(sheet=target_sheet, headers=headers, keys=keys, rows=rows_proj, include_matrix=include_matrix, status="success", meta={"schema_source": schema_src, "contract_level": contract_level, "strict_requested": strict_req, "strict_enforced": False, "target_sheet_known": True, "builder": "engine.internal_data_dictionary", "rows": len(rows_proj), "limit": limit, "offset": offset, "mode": mode})
+            payload_full = self._finalize_payload(
+                sheet=target_sheet,
+                headers=headers,
+                keys=keys,
+                row_objects=rows_proj,
+                include_matrix=include_matrix,
+                status="success",
+                meta={
+                    "schema_source": schema_src,
+                    "contract_level": contract_level,
+                    "strict_requested": strict_req,
+                    "strict_enforced": False,
+                    "target_sheet_known": True,
+                    "builder": "engine.internal_data_dictionary",
+                    "rows": len(rows_proj),
+                    "limit": limit,
+                    "offset": offset,
+                    "mode": mode,
+                },
+            )
             self._store_sheet_snapshot(target_sheet, payload_full)
-            rows_page = rows_proj[offset: offset + limit]
-            return self._finalize_payload(sheet=target_sheet, headers=headers, keys=keys, rows=rows_page, include_matrix=include_matrix, status="success", meta={**payload_full.get("meta", {}), "rows": len(rows_page)})
+            rows_page = rows_proj[offset : offset + limit]
+            return self._finalize_payload(
+                sheet=target_sheet,
+                headers=headers,
+                keys=keys,
+                row_objects=rows_page,
+                include_matrix=include_matrix,
+                status="success",
+                meta={**payload_full.get("meta", {}), "rows": len(rows_page)},
+            )
 
         # Insights Analysis
         if target_sheet == "Insights_Analysis":
             if _is_schema_only_body(body):
-                return self._finalize_payload(sheet=target_sheet, headers=headers, keys=keys, rows=[], include_matrix=include_matrix, status="success", meta={"schema_source": schema_src, "contract_level": contract_level, "strict_requested": strict_req, "strict_enforced": False, "target_sheet_known": True, "builder": "schema_only_fast_path", "rows": 0, "limit": limit, "offset": offset, "mode": mode})
+                return self._finalize_payload(
+                    sheet=target_sheet,
+                    headers=headers,
+                    keys=keys,
+                    row_objects=[],
+                    include_matrix=include_matrix,
+                    status="success",
+                    meta={
+                        "schema_source": schema_src,
+                        "contract_level": contract_level,
+                        "strict_requested": strict_req,
+                        "strict_enforced": False,
+                        "target_sheet_known": True,
+                        "builder": "schema_only_fast_path",
+                        "rows": 0,
+                        "limit": limit,
+                        "offset": offset,
+                        "mode": mode,
+                    },
+                )
+
             rows0: List[Dict[str, Any]] = []
             builder_name = "core.analysis.insights_builder"
             try:
@@ -2301,33 +2628,97 @@ class DataEngineV5:
                 crit = body.get("criteria") if isinstance(body.get("criteria"), dict) else None
                 universes = body.get("universes") if isinstance(body.get("universes"), dict) else None
                 symbols = body.get("symbols") if isinstance(body.get("symbols"), list) else None
-                payload = await build_insights_analysis_rows(engine=self, criteria=crit, universes=universes, symbols=symbols, mode=mode or "")
+                payload = await build_insights_analysis_rows(
+                    engine=self,
+                    criteria=crit,
+                    universes=universes,
+                    symbols=symbols,
+                    mode=mode or "",
+                )
                 rows0 = _coerce_rows_list(payload)
             except Exception as exc:
                 builder_name = f"fallback:insights_builder_failed:{type(exc).__name__}"
                 rows0 = []
+
             if not rows0:
                 rows0 = await self._build_insights_rows_fallback(body, limit=max(limit + offset, 10))
                 builder_name = "fallback:engine_insights_rows"
+
             rows_proj = [_strict_project_row(keys, _normalize_to_schema_keys(keys, headers, r)) for r in rows0]
-            payload_full = self._finalize_payload(sheet=target_sheet, headers=headers, keys=keys, rows=rows_proj, include_matrix=include_matrix, status="success" if rows_proj else "warn", meta={"schema_source": schema_src, "contract_level": contract_level, "strict_requested": strict_req, "strict_enforced": False, "target_sheet_known": True, "builder": builder_name, "rows": len(rows_proj), "limit": limit, "offset": offset, "mode": mode})
+            payload_full = self._finalize_payload(
+                sheet=target_sheet,
+                headers=headers,
+                keys=keys,
+                row_objects=rows_proj,
+                include_matrix=include_matrix,
+                status="success" if rows_proj else "warn",
+                meta={
+                    "schema_source": schema_src,
+                    "contract_level": contract_level,
+                    "strict_requested": strict_req,
+                    "strict_enforced": False,
+                    "target_sheet_known": True,
+                    "builder": builder_name,
+                    "rows": len(rows_proj),
+                    "limit": limit,
+                    "offset": offset,
+                    "mode": mode,
+                },
+            )
             self._store_sheet_snapshot(target_sheet, payload_full)
-            rows_page = rows_proj[offset: offset + limit]
-            return self._finalize_payload(sheet=target_sheet, headers=headers, keys=keys, rows=rows_page, include_matrix=include_matrix, status=payload_full.get("status", "success"), meta={**payload_full.get("meta", {}), "rows": len(rows_page)})
+            rows_page = rows_proj[offset : offset + limit]
+            return self._finalize_payload(
+                sheet=target_sheet,
+                headers=headers,
+                keys=keys,
+                row_objects=rows_page,
+                include_matrix=include_matrix,
+                status=payload_full.get("status", "success"),
+                meta={**payload_full.get("meta", {}), "rows": len(rows_page)},
+            )
 
         # Top10
         if target_sheet == "Top_10_Investments":
             top10_body, route_warnings = _normalize_top10_body_for_engine(body, limit=max(1, min(limit, 50)))
             if _is_schema_only_body(top10_body):
                 headers, keys = _ensure_top10_contract(headers, keys)
-                return self._finalize_payload(sheet=target_sheet, headers=headers, keys=keys, rows=[], include_matrix=include_matrix, status="success", meta={"schema_source": schema_src, "contract_level": contract_level, "strict_requested": strict_req, "strict_enforced": False, "target_sheet_known": True, "builder": "schema_only_fast_path", "rows": 0, "limit": limit, "offset": offset, "mode": mode, "warnings": route_warnings})
+                return self._finalize_payload(
+                    sheet=target_sheet,
+                    headers=headers,
+                    keys=keys,
+                    row_objects=[],
+                    include_matrix=include_matrix,
+                    status="success",
+                    meta={
+                        "schema_source": schema_src,
+                        "contract_level": contract_level,
+                        "strict_requested": strict_req,
+                        "strict_enforced": False,
+                        "target_sheet_known": True,
+                        "builder": "schema_only_fast_path",
+                        "rows": 0,
+                        "limit": limit,
+                        "offset": offset,
+                        "mode": mode,
+                        "warnings": route_warnings,
+                    },
+                )
+
             rows_proj: List[Dict[str, Any]] = []
             builder_used = "core.analysis.top10_selector"
             status_out = "success"
+
             try:
                 from core.analysis.top10_selector import build_top10_rows  # type: ignore
                 criteria = top10_body.get("criteria") if isinstance(top10_body.get("criteria"), dict) else None
-                payload = await build_top10_rows(engine=self, settings=self.settings, criteria=criteria, body=dict(top10_body or {}), limit=int(top10_body.get("limit") or top10_body.get("top_n") or min(limit, 10) or 10), mode=mode or "")
+                payload = await build_top10_rows(
+                    engine=self,
+                    settings=self.settings,
+                    criteria=criteria,
+                    body=dict(top10_body or {}),
+                    limit=int(top10_body.get("limit") or top10_body.get("top_n") or min(limit, 10) or 10),
+                    mode=mode or "",
+                )
                 rows0 = _coerce_rows_list(payload)
                 if rows0:
                     rows_proj = [_strict_project_row(keys, _normalize_to_schema_keys(keys, headers, r)) for r in rows0]
@@ -2335,16 +2726,47 @@ class DataEngineV5:
             except Exception as exc:
                 builder_used = f"fallback:top10_selector_failed:{type(exc).__name__}"
                 status_out = "warn"
+
             if not rows_proj:
                 headers, keys, rows_proj = await self._build_top10_rows_fallback(headers, keys, top10_body, limit=max(limit + offset, 10), mode=mode)
                 builder_used = "fallback:live_ranker"
                 if rows_proj:
                     status_out = "warn"
-            payload_full = self._finalize_payload(sheet=target_sheet, headers=headers, keys=keys, rows=rows_proj, include_matrix=include_matrix, status=status_out if rows_proj else "warn", meta={"schema_source": schema_src, "contract_level": contract_level, "strict_requested": strict_req, "strict_enforced": False, "target_sheet_known": True, "builder": builder_used, "rows": len(rows_proj), "limit": limit, "offset": offset, "mode": mode, "warnings": route_warnings})
+
+            payload_full = self._finalize_payload(
+                sheet=target_sheet,
+                headers=headers,
+                keys=keys,
+                row_objects=rows_proj,
+                include_matrix=include_matrix,
+                status=status_out if rows_proj else "warn",
+                meta={
+                    "schema_source": schema_src,
+                    "contract_level": contract_level,
+                    "strict_requested": strict_req,
+                    "strict_enforced": False,
+                    "target_sheet_known": True,
+                    "builder": builder_used,
+                    "rows": len(rows_proj),
+                    "limit": limit,
+                    "offset": offset,
+                    "mode": mode,
+                    "warnings": route_warnings,
+                },
+            )
             if rows_proj:
                 self._store_sheet_snapshot(target_sheet, payload_full)
-            rows_page = rows_proj[offset: offset + limit]
-            return self._finalize_payload(sheet=target_sheet, headers=headers, keys=keys, rows=rows_page, include_matrix=include_matrix, status=payload_full.get("status", "warn"), meta={**payload_full.get("meta", {}), "rows": len(rows_page)})
+
+            rows_page = rows_proj[offset : offset + limit]
+            return self._finalize_payload(
+                sheet=target_sheet,
+                headers=headers,
+                keys=keys,
+                row_objects=rows_page,
+                include_matrix=include_matrix,
+                status=payload_full.get("status", "warn"),
+                meta={**payload_full.get("meta", {}), "rows": len(rows_page)},
+            )
 
         # Contract recovery for instrument pages
         if contract_level != "canonical":
@@ -2361,6 +2783,7 @@ class DataEngineV5:
                         contract_level = "recovered"
                         recovered_from = "cache_contract"
                         recovered = True
+
             if not recovered and target_sheet in STATIC_CANONICAL_SHEET_CONTRACTS:
                 c = STATIC_CANONICAL_SHEET_CONTRACTS[target_sheet]
                 headers, keys = _complete_schema_contract(c["headers"], c["keys"])
@@ -2368,6 +2791,7 @@ class DataEngineV5:
                 contract_level = "recovered"
                 recovered_from = "static_contract"
                 recovered = True
+
             if not recovered and target_sheet in INSTRUMENT_SHEETS:
                 headers, keys = list(INSTRUMENT_CANONICAL_HEADERS), list(INSTRUMENT_CANONICAL_KEYS)
                 schema_src = "fallback_union"
@@ -2396,7 +2820,15 @@ class DataEngineV5:
             base_meta["schema_warning"] = schema_warning
 
         if _is_schema_only_body(body):
-            return self._finalize_payload(sheet=target_sheet, headers=headers, keys=keys, rows=[], include_matrix=include_matrix, status=final_status, meta={**base_meta, "rows": 0, "limit": limit, "offset": offset, "mode": mode, "built_from": "schema_only_fast_path"})
+            return self._finalize_payload(
+                sheet=target_sheet,
+                headers=headers,
+                keys=keys,
+                row_objects=[],
+                include_matrix=include_matrix,
+                status=final_status,
+                meta={**base_meta, "rows": 0, "limit": limit, "offset": offset, "mode": mode, "built_from": "schema_only_fast_path"},
+            )
 
         requested_symbols = _extract_requested_symbols_from_body(body, limit=limit + offset)
         built_from = "body_symbols" if requested_symbols else "live_quotes"
@@ -2416,12 +2848,14 @@ class DataEngineV5:
                 enriched_rows: List[Dict[str, Any]] = []
                 symbols = _extract_symbols_from_rows(ext_rows, limit=limit + offset)
                 quote_map: Dict[str, Dict[str, Any]] = {}
+
                 if self.rows_hydrate_external and symbols:
                     for q in await self.get_enriched_quotes(symbols, schema=None):
                         d = _model_to_dict(q)
                         sym = normalize_symbol(_safe_str(d.get("symbol")))
                         if sym:
                             quote_map[sym] = d
+
                 for row in ext_rows:
                     merged = dict(row)
                     sym = normalize_symbol(self._extract_row_symbol(row))
@@ -2432,19 +2866,64 @@ class DataEngineV5:
                     _compute_scores_fallback(merged)
                     _compute_recommendation(merged)
                     enriched_rows.append(_strict_project_row(out_keys, _normalize_to_schema_keys(out_keys, out_headers, merged)))
+
                 _apply_rank_overall(enriched_rows)
-                payload_full = self._finalize_payload(sheet=target_sheet, headers=out_headers, keys=out_keys, rows=enriched_rows, include_matrix=include_matrix, status=final_status, meta={**base_meta, "rows": len(enriched_rows), "limit": limit, "offset": offset, "mode": mode, "built_from": "external_rows_reader", "rows_reader_source": self._rows_reader_source, "symbols_reader_source": self._symbols_reader_source, "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet)})
+
+                payload_full = self._finalize_payload(
+                    sheet=target_sheet,
+                    headers=out_headers,
+                    keys=out_keys,
+                    row_objects=enriched_rows,
+                    include_matrix=include_matrix,
+                    status=final_status,
+                    meta={
+                        **base_meta,
+                        "rows": len(enriched_rows),
+                        "limit": limit,
+                        "offset": offset,
+                        "mode": mode,
+                        "built_from": "external_rows_reader",
+                        "rows_reader_source": self._rows_reader_source,
+                        "symbols_reader_source": self._symbols_reader_source,
+                        "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet),
+                    },
+                )
                 self._store_sheet_snapshot(target_sheet, payload_full)
-                rows_page = enriched_rows[offset: offset + limit]
-                return self._finalize_payload(sheet=target_sheet, headers=out_headers, keys=out_keys, rows=rows_page, include_matrix=include_matrix, status=final_status, meta={**payload_full.get("meta", {}), "rows": len(rows_page)})
+                rows_page = enriched_rows[offset : offset + limit]
+                return self._finalize_payload(
+                    sheet=target_sheet,
+                    headers=out_headers,
+                    keys=out_keys,
+                    row_objects=rows_page,
+                    include_matrix=include_matrix,
+                    status=final_status,
+                    meta={**payload_full.get("meta", {}), "rows": len(rows_page)},
+                )
 
         if not requested_symbols:
             cached_snap = self.get_cached_sheet_snapshot(sheet=target_sheet)
             cached_rows = _coerce_rows_list(cached_snap)
             if cached_rows:
                 proj_rows = [_strict_project_row(out_keys, _normalize_to_schema_keys(out_keys, out_headers, row)) for row in cached_rows]
-                rows_page = proj_rows[offset: offset + limit]
-                return self._finalize_payload(sheet=target_sheet, headers=out_headers, keys=out_keys, rows=rows_page, include_matrix=include_matrix, status=final_status, meta={**base_meta, "rows": len(rows_page), "limit": limit, "offset": offset, "mode": mode, "built_from": "cached_snapshot", "symbols_reader_source": self._symbols_reader_source, "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet)})
+                rows_page = proj_rows[offset : offset + limit]
+                return self._finalize_payload(
+                    sheet=target_sheet,
+                    headers=out_headers,
+                    keys=out_keys,
+                    row_objects=rows_page,
+                    include_matrix=include_matrix,
+                    status=final_status,
+                    meta={
+                        **base_meta,
+                        "rows": len(rows_page),
+                        "limit": limit,
+                        "offset": offset,
+                        "mode": mode,
+                        "built_from": "cached_snapshot",
+                        "symbols_reader_source": self._symbols_reader_source,
+                        "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet),
+                    },
+                )
 
         rows_full: List[Dict[str, Any]] = []
         if requested_symbols:
@@ -2455,22 +2934,66 @@ class DataEngineV5:
             _apply_rank_overall(rows_full)
 
         if rows_full:
-            payload_full = self._finalize_payload(sheet=target_sheet, headers=out_headers, keys=out_keys, rows=rows_full, include_matrix=include_matrix, status=final_status, meta={**base_meta, "rows": len(rows_full), "limit": limit, "offset": offset, "mode": mode, "built_from": built_from, "resolved_symbols_count": len(requested_symbols), "symbols_reader_source": self._symbols_reader_source, "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet)})
+            payload_full = self._finalize_payload(
+                sheet=target_sheet,
+                headers=out_headers,
+                keys=out_keys,
+                row_objects=rows_full,
+                include_matrix=include_matrix,
+                status=final_status,
+                meta={
+                    **base_meta,
+                    "rows": len(rows_full),
+                    "limit": limit,
+                    "offset": offset,
+                    "mode": mode,
+                    "built_from": built_from,
+                    "resolved_symbols_count": len(requested_symbols),
+                    "symbols_reader_source": self._symbols_reader_source,
+                    "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet),
+                },
+            )
             self._store_sheet_snapshot(target_sheet, payload_full)
-            rows_page = rows_full[offset: offset + limit]
-            return self._finalize_payload(sheet=target_sheet, headers=out_headers, keys=out_keys, rows=rows_page, include_matrix=include_matrix, status=final_status, meta={**payload_full.get("meta", {}), "rows": len(rows_page)})
+            rows_page = rows_full[offset : offset + limit]
+            return self._finalize_payload(
+                sheet=target_sheet,
+                headers=out_headers,
+                keys=out_keys,
+                row_objects=rows_page,
+                include_matrix=include_matrix,
+                status=final_status,
+                meta={**payload_full.get("meta", {}), "rows": len(rows_page)},
+            )
 
-        return self._finalize_payload(sheet=target_sheet, headers=out_headers, keys=out_keys, rows=[], include_matrix=include_matrix, status=final_status, meta={**base_meta, "rows": 0, "limit": limit, "offset": offset, "mode": mode, "built_from": built_from, "resolved_symbols_count": len(requested_symbols), "symbols_reader_source": self._symbols_reader_source, "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet)})
+        return self._finalize_payload(
+            sheet=target_sheet,
+            headers=out_headers,
+            keys=out_keys,
+            row_objects=[],
+            include_matrix=include_matrix,
+            status=final_status,
+            meta={
+                **base_meta,
+                "rows": 0,
+                "limit": limit,
+                "offset": offset,
+                "mode": mode,
+                "built_from": built_from,
+                "resolved_symbols_count": len(requested_symbols),
+                "symbols_reader_source": self._symbols_reader_source,
+                "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet),
+            },
+        )
 
-    async def sheet_rows(self, *args, **kwargs) -> Dict[str, Any]:
+    async def sheet_rows(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         return await self.get_sheet_rows(*args, **kwargs)
 
-    async def build_sheet_rows(self, *args, **kwargs) -> Dict[str, Any]:
+    async def build_sheet_rows(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         return await self.get_sheet_rows(*args, **kwargs)
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     # health / stats
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
     async def health(self) -> Dict[str, Any]:
         return {
             "status": "ok",
@@ -2573,5 +3096,6 @@ __all__ = [
     "DataSource",
     "UnifiedQuote",
     "__version__",
+    "STATIC_CANONICAL_SHEET_CONTRACTS",
     "get_sheet_spec",
 ]
