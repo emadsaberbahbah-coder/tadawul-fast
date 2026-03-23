@@ -2,7 +2,7 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v7.8.1)
+TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v7.9.0)
 ================================================================================
 ALIGNED • DEPLOYMENT-SAFE • PRE-MOUNT + STARTUP-VERIFY • ROUTER-SNAPSHOT-AWARE
 ENGINE-STATE-AWARE • OPENAPI-SAFE • RENDER-HEALTH-PROBE-SAFE • PRIORITY-MOUNTED
@@ -12,38 +12,28 @@ V1-HEALTH-ALIAS SAFE • V1-META-ALIAS SAFE • HEAD-PROBE SAFE
 CONTROLLED-ROUTE-OWNERSHIP • PARTIAL-DUPLICATE-BLOCK SAFE • FILTERED-MOUNT SAFE
 SYNTAX-REPAIRED
 
-Why this revision (v7.8.1)
+Why this revision (v7.9.0)
 --------------------------
-- ✅ FIX: removes the broken duplicate function header that caused Render build
-        failure with SyntaxError near `_mount_routes_once(...)`.
-- ✅ FIX: preserves controlled internal priority route mounting to prevent
-        duplicate route-family conflicts.
-- ✅ FIX: partial route-family conflicts remain blocked with per-module path
-        filtering, especially for:
-        - routes.advisor
-        - routes.investment_advisor
-        - routes.advanced_analysis
-        - routes.enriched_quote
-- ✅ FIX: duplicate detection remains route-signature aware at per-route level,
-        not only whole-router subset level.
-- ✅ FIX: canonical ownership is preserved:
+- ✅ FIX: keeps controlled internal priority route mounting as the runtime source
+        of truth for active route ownership.
+- ✅ FIX: ownership filtering now also protects earlier-mounted modules that were
+        still able to reclaim protected paths:
+        - routes.data_dictionary
+        - routes.analysis_sheet_rows
+- ✅ FIX: package-route mounting is now compatibility-checked before use, so an
+        outdated `routes/__init__.py` canonical owner map cannot silently take
+        over `/v1/schema*` or root `/sheet-rows`.
+- ✅ FIX: canonical ownership is enforced as:
         - /v1/advisor/*           -> routes.advisor
         - /v1/advanced/*          -> routes.investment_advisor
         - /v1/schema/*, /schema/* -> routes.advanced_analysis
         - /v1/analysis/*          -> routes.analysis_sheet_rows
         - /v1/enriched*           -> routes.enriched_quote
-- ✅ FIX: advanced_analysis contributes only its non-conflicting special routes:
-        - /sheet-rows
-        - /v1/advanced/insights-analysis
-        - /v1/advanced/top10-investments
-        - /v1/advanced/insights-criteria
-        - /v1/schema/*
-        - /schema/*
-- ✅ FIX: enriched_quote legacy root `/sheet-rows` is blocked here so it cannot
-        override schema-driven root `/sheet-rows`.
-- ✅ FIX: startup route verification records missing critical route families.
-- ✅ FIX: `/v1/health`, `/v1/healthz`, `/v1/livez`, `/v1/readyz`, `/v1/meta`,
-        `/v1/ping`, and HEAD probes remain stable.
+        - /sheet-rows             -> routes.advanced_analysis
+- ✅ FIX: enriched_quote legacy root `/sheet-rows` remains blocked here so it
+        cannot override the schema-driven root `/sheet-rows`.
+- ✅ FIX: startup verification now also checks that the canonical root
+        `/sheet-rows` endpoint is present.
 - ✅ SAFE: preserves existing engine-init, OpenAPI, auth, middleware, and
         shutdown behavior.
 """
@@ -76,7 +66,7 @@ except Exception:
 # --------------------------------------------------------------------------------------
 # Version
 # --------------------------------------------------------------------------------------
-APP_ENTRY_VERSION = "7.8.1"
+APP_ENTRY_VERSION = "7.9.0"
 
 
 # --------------------------------------------------------------------------------------
@@ -103,6 +93,35 @@ _BUILTIN_META_PATHS = {
     "/docs",
     "/redoc",
     "/openapi.json",
+}
+
+
+_CONTROLLED_PROTECTED_PREFIXES: Tuple[str, ...] = (
+    "/v1/advisor",
+    "/v1/advanced",
+    "/v1/analysis",
+    "/v1/schema",
+    "/schema",
+    "/v1/enriched",
+    "/v1/enriched_quote",
+    "/v1/enriched-quote",
+    "/quote",
+    "/quotes",
+    "/sheet-rows",
+)
+
+_CONTROLLED_CANONICAL_OWNER_MAP: Dict[str, str] = {
+    "/v1/advisor": "advisor",
+    "/v1/advanced": "investment_advisor",
+    "/v1/analysis": "analysis_sheet_rows",
+    "/v1/schema": "advanced_analysis",
+    "/schema": "advanced_analysis",
+    "/v1/enriched": "enriched_quote",
+    "/v1/enriched_quote": "enriched_quote",
+    "/v1/enriched-quote": "enriched_quote",
+    "/quote": "enriched_quote",
+    "/quotes": "enriched_quote",
+    "/sheet-rows": "advanced_analysis",
 }
 
 
@@ -401,6 +420,8 @@ def _default_routes_snapshot() -> Dict[str, Any]:
         "expected_router_modules": [],
         "plan": [],
         "resolved_entries": [],
+        "protected_prefixes": list(_CONTROLLED_PROTECTED_PREFIXES),
+        "canonical_owner_map": dict(_CONTROLLED_CANONICAL_OWNER_MAP),
         "openapi_route_count_after_mount": 0,
         "route_signature_count_after_mount": 0,
     }
@@ -643,6 +664,8 @@ def _normalize_routes_snapshot(
     expected_router_modules = list(src.get("expected_router_modules", []) or [])
     plan = list(src.get("plan", []) or [])
     resolved_entries = list(src.get("resolved_entries", []) or [])
+    protected_prefixes = list(src.get("protected_prefixes", list(_CONTROLLED_PROTECTED_PREFIXES)) or list(_CONTROLLED_PROTECTED_PREFIXES))
+    canonical_owner_map = dict(src.get("canonical_owner_map", dict(_CONTROLLED_CANONICAL_OWNER_MAP)) or dict(_CONTROLLED_CANONICAL_OWNER_MAP))
 
     failed_count = len(import_errors) + len(mount_errors) + len(no_router)
     openapi_route_count_after_mount = int(
@@ -678,6 +701,8 @@ def _normalize_routes_snapshot(
         "expected_router_modules": expected_router_modules,
         "plan": plan,
         "resolved_entries": resolved_entries,
+        "protected_prefixes": protected_prefixes,
+        "canonical_owner_map": canonical_owner_map,
         "openapi_route_count_after_mount": openapi_route_count_after_mount,
         "route_signature_count_after_mount": route_signature_count_after_mount,
     }
@@ -718,6 +743,8 @@ def _merge_snapshots(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]
         "expected_router_modules": _merge_list(old.get("expected_router_modules"), new.get("expected_router_modules")),
         "plan": _merge_list(old.get("plan"), new.get("plan")),
         "resolved_entries": _merge_list(old.get("resolved_entries"), new.get("resolved_entries")),
+        "protected_prefixes": _merge_list(old.get("protected_prefixes"), new.get("protected_prefixes")),
+        "canonical_owner_map": _merge_dict(old.get("canonical_owner_map"), new.get("canonical_owner_map")),
     }
 
     merged["mounted_count"] = len(merged["mounted"])
@@ -760,7 +787,71 @@ def _get_router_from_module(mod: Any) -> Tuple[Optional[Any], str]:
     return None, "none"
 
 
+def _logical_key_from_module(module_name: str) -> str:
+    return str(module_name or "").rsplit(".", 1)[-1].strip()
+
+
+def _package_mounter_compatibility(routes_pkg: Any) -> Tuple[bool, Dict[str, Any]]:
+    owner_map: Dict[str, Any] = {}
+    protected_prefixes: List[str] = []
+
+    try:
+        getter = getattr(routes_pkg, "_canonical_owner_map", None)
+        if callable(getter):
+            raw = getter()
+            if isinstance(raw, dict):
+                owner_map = {str(k): str(v) for k, v in raw.items()}
+    except Exception:
+        owner_map = {}
+
+    try:
+        getter = getattr(routes_pkg, "_protected_prefixes", None)
+        if callable(getter):
+            raw = getter()
+            if isinstance(raw, (list, tuple, set)):
+                protected_prefixes = [str(x) for x in raw]
+    except Exception:
+        protected_prefixes = []
+
+    critical_prefixes = (
+        "/v1/schema",
+        "/schema",
+        "/v1/enriched",
+        "/v1/enriched_quote",
+        "/v1/enriched-quote",
+        "/quote",
+        "/quotes",
+        "/sheet-rows",
+    )
+
+    mismatches: Dict[str, Dict[str, str]] = {}
+    for prefix in critical_prefixes:
+        expected_owner = _CONTROLLED_CANONICAL_OWNER_MAP.get(prefix, "")
+        actual_owner = str(owner_map.get(prefix, "") or "")
+        if actual_owner != expected_owner:
+            mismatches[prefix] = {
+                "expected_owner": expected_owner,
+                "package_owner": actual_owner or "(missing)",
+            }
+
+    missing_protected = [prefix for prefix in critical_prefixes if prefix not in set(protected_prefixes)]
+
+    details = {
+        "critical_prefixes": list(critical_prefixes),
+        "mismatches": mismatches,
+        "missing_protected_prefixes": missing_protected,
+    }
+    return (not mismatches and not missing_protected), details
+
+
 _MODULE_ROUTE_POLICIES: Dict[str, Dict[str, Sequence[str]]] = {
+    "routes.data_dictionary": {
+        "block_prefixes": ("/v1/schema", "/schema"),
+        "block_exact": ("/sheet-rows",),
+    },
+    "routes.analysis_sheet_rows": {
+        "allow_prefixes": ("/v1/analysis",),
+    },
     "routes.advisor": {
         "allow_prefixes": ("/v1/advisor",),
     },
@@ -889,6 +980,7 @@ def _verify_required_route_families(app: FastAPI) -> List[str]:
             p.startswith("/v1/enriched") or p.startswith("/v1/enriched_quote") or p.startswith("/v1/enriched-quote")
             for p in paths
         ),
+        "root_sheet_rows": lambda paths: "/sheet-rows" in paths,
         "root_health_alias": lambda paths: "/health" in paths and "/v1/health" in paths,
         "root_meta_alias": lambda paths: "/meta" in paths and "/v1/meta" in paths,
     }
@@ -906,6 +998,8 @@ def _verify_required_route_families(app: FastAPI) -> List[str]:
 def _mount_routes_controlled(app: FastAPI) -> Dict[str, Any]:
     strict = _env_bool("ROUTES_STRICT_IMPORT", False)
     plan = _build_controlled_mount_plan()
+    resolved_map: Dict[str, str] = {}
+    module_to_key: Dict[str, str] = {}
 
     mounted: List[str] = []
     duplicate_skips: List[str] = []
@@ -917,6 +1011,11 @@ def _mount_routes_controlled(app: FastAPI) -> Dict[str, Any]:
     filtered_out_routes: Dict[str, int] = {}
     mount_modes: Dict[str, str] = {}
     resolved_entries: List[Dict[str, Any]] = []
+
+    for mod_name in plan:
+        key = _logical_key_from_module(mod_name)
+        resolved_map[key] = mod_name
+        module_to_key[mod_name] = key
 
     for mod_name in plan:
         mod, exc = _import_router_module(mod_name)
@@ -1001,9 +1100,13 @@ def _mount_routes_controlled(app: FastAPI) -> Dict[str, Any]:
         "no_router": no_router,
         "strict": strict,
         "strategy": "main.controlled_priority_plan",
+        "resolved_map": resolved_map,
+        "module_to_key": module_to_key,
         "plan": plan,
         "mount_modes": mount_modes,
         "resolved_entries": resolved_entries,
+        "protected_prefixes": list(_CONTROLLED_PROTECTED_PREFIXES),
+        "canonical_owner_map": dict(_CONTROLLED_CANONICAL_OWNER_MAP),
         "missing_required_keys": missing_required_keys,
         "openapi_route_count_after_mount": len(getattr(app, "routes", []) or []),
         "route_signature_count_after_mount": _route_signature_count(app, include_builtin=True),
@@ -1019,34 +1122,45 @@ def _mount_routes(app: FastAPI) -> Dict[str, Any]:
     if use_package_mounter:
         try:
             routes_pkg = importlib.import_module("routes")
-            for fn_name in ("mount_all_routers", "mount_all", "mount_routers", "mount_routes", "mount_all_routes"):
-                fn = getattr(routes_pkg, fn_name, None)
-                if callable(fn):
-                    used_strategy = f"routes.{fn_name}"
-                    try:
-                        ret = fn(app)  # type: ignore[misc]
-                        snap = _normalize_routes_snapshot(ret, used_strategy=used_strategy, app=app)
-                        snap["missing_required_keys"] = _verify_required_route_families(app)
-                        snap["openapi_route_count_after_mount"] = len(getattr(app, "routes", []) or [])
-                        snap["route_signature_count_after_mount"] = _route_signature_count(app, include_builtin=True)
-                        _invalidate_openapi_cache(app)
-                        logger.info(
-                            "Routes mount summary: mounted=%s duplicate_skips=%s partial_duplicate_skips=%s missing=%s failed=%s strategy=%s",
-                            snap["mounted_count"],
-                            snap["duplicate_skips_count"],
-                            snap["partial_duplicate_skips_count"],
-                            snap["missing_count"],
-                            snap["failed_count"],
-                            snap["strategy"],
-                        )
-                        return snap
-                    except Exception as e:
-                        logger.warning("%s(app) failed; falling back to controlled plan. err=%s", used_strategy, _err_to_str(e))
-                        if strict:
-                            raise
-                    break
-        except Exception:
-            pass
+            compatible, compatibility_details = _package_mounter_compatibility(routes_pkg)
+            if not compatible:
+                logger.warning(
+                    "Package route mounter ownership mismatch; falling back to controlled plan. details=%s",
+                    json.dumps(compatibility_details, ensure_ascii=False),
+                )
+            else:
+                for fn_name in ("mount_all_routers", "mount_all", "mount_routers", "mount_routes", "mount_all_routes"):
+                    fn = getattr(routes_pkg, fn_name, None)
+                    if callable(fn):
+                        used_strategy = f"routes.{fn_name}"
+                        try:
+                            ret = fn(app)  # type: ignore[misc]
+                            snap = _normalize_routes_snapshot(ret, used_strategy=used_strategy, app=app)
+                            snap["missing_required_keys"] = _verify_required_route_families(app)
+                            snap["protected_prefixes"] = list(_CONTROLLED_PROTECTED_PREFIXES)
+                            snap["canonical_owner_map"] = dict(_CONTROLLED_CANONICAL_OWNER_MAP)
+                            snap["openapi_route_count_after_mount"] = len(getattr(app, "routes", []) or [])
+                            snap["route_signature_count_after_mount"] = _route_signature_count(app, include_builtin=True)
+                            _invalidate_openapi_cache(app)
+                            logger.info(
+                                "Routes mount summary: mounted=%s duplicate_skips=%s partial_duplicate_skips=%s missing=%s failed=%s strategy=%s",
+                                snap["mounted_count"],
+                                snap["duplicate_skips_count"],
+                                snap["partial_duplicate_skips_count"],
+                                snap["missing_count"],
+                                snap["failed_count"],
+                                snap["strategy"],
+                            )
+                            return snap
+                        except Exception as e:
+                            logger.warning("%s(app) failed; falling back to controlled plan. err=%s", used_strategy, _err_to_str(e))
+                            if strict:
+                                raise
+                        break
+        except Exception as e:
+            logger.warning("Package route mounter import/compatibility check failed; falling back to controlled plan. err=%s", _err_to_str(e))
+            if strict:
+                raise
 
     snap = _mount_routes_controlled(app)
     snap = _normalize_routes_snapshot(snap, used_strategy="main.controlled_priority_plan", app=app)
