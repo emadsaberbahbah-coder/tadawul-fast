@@ -2,30 +2,27 @@
 # routes/analysis_sheet_rows.py
 """
 ================================================================================
-Analysis Sheet-Rows Router — v3.0.0
+Analysis Sheet-Rows Router — v3.1.0
 ================================================================================
-CANONICAL • FALLBACK-FIRST • NO HARD 503 ON SCHEMA GAPS • V2-ENGINE FIRST
+CANONICAL • FAIL-SAFE • NO HARD 5XX ON WEAK BUILDERS • V2-ENGINE FIRST
 SPECIAL-PAGE SAFE • GET+POST SAFE • OBJECT + MATRIX RESPONSE SAFE
 TOP10 / INSIGHTS / DICTIONARY HARDENED • JSON-SAFE • LIVE-TEST FRIENDLY
+ROUTE-LOCAL FALLBACKS • NO ROUTE-CIRCULAR BUILDER DEPENDENCY
 
 What this revision fixes
 ------------------------
-- FIX: removes the hard dependency that previously returned 503 when
-       schema_registry import failed or when a page schema resolved to empty.
-- FIX: resolves schema through a fallback chain:
-       schema_registry -> page_catalog/static hints -> payload-derived contract
-       -> safe page defaults.
-- FIX: prefers data_engine_v2 consistently and only uses older fallbacks
-       as a last-resort compatibility path.
-- FIX: generic pages now degrade to schema-shaped payloads instead of throwing
-       backend 503 just because one contract source is weak.
-- FIX: preserves stable envelope:
-       headers/display_headers/sheet_headers/column_headers
-       keys/columns/fields
-       rows/items/data/quotes/records
-       rows_matrix
+- FIX: wraps request execution in a hard fail-safe so unexpected runtime errors
+       degrade to schema-shaped partial payloads instead of backend 5xx/503.
+- FIX: removes route-to-route builder dependence as a primary strategy.
+       This router now prefers core builders and route-local fallbacks.
+- FIX: normalizes page names and route-family resolution through tolerant helper
+       wrappers so page_catalog signature drift does not break live requests.
+- FIX: keeps stable response envelope even when engine, schema, or builder
+       layers are unavailable.
+- FIX: generic pages now return at least a contract-shaped payload with headers
+       instead of failing entirely during live smoke tests.
 - FIX: special pages Top_10_Investments / Insights_Analysis / Data_Dictionary
-       stay on dedicated builder paths with graceful degradation.
+       remain supported here with graceful fallback behavior.
 ================================================================================
 """
 
@@ -100,7 +97,7 @@ except Exception:  # pragma: no cover
         return None
 
 
-ANALYSIS_SHEET_ROWS_VERSION = "3.0.0"
+ANALYSIS_SHEET_ROWS_VERSION = "3.1.0"
 router = APIRouter(prefix="/v1/analysis", tags=["Analysis Sheet Rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -198,7 +195,6 @@ _TOP10_FUNCTION_CANDIDATES = (
 
 _INSIGHTS_MODULE_CANDIDATES = (
     "core.analysis.insights_builder",
-    "routes.advanced_analysis",
     "routes.ai_analysis",
 )
 
@@ -213,7 +209,6 @@ _INSIGHTS_FUNCTION_CANDIDATES = (
 
 _ENRICHED_MODULE_CANDIDATES = (
     "core.enriched_quote",
-    "routes.enriched_quote",
 )
 
 _ENRICHED_FUNCTION_CANDIDATES = (
@@ -341,7 +336,7 @@ def _as_list(v: Any) -> List[Any]:
         return list(v)
     if isinstance(v, str):
         return [v]
-    if isinstance(v, Iterable):
+    if isinstance(v, Iterable) and not isinstance(v, Mapping):
         try:
             return list(v)
         except Exception:
@@ -641,6 +636,57 @@ def _auth_passed(
 # =============================================================================
 # Schema / contract helpers
 # =============================================================================
+def _normalize_page_flexible(page_raw: str) -> str:
+    raw = _strip(page_raw)
+    if not raw:
+        return "Market_Leaders"
+
+    for kwargs in (
+        {"allow_output_pages": True},
+        {},
+    ):
+        try:
+            value = normalize_page_name(raw, **kwargs)  # type: ignore[misc]
+            normalized = _strip(value)
+            if normalized:
+                return normalized
+        except TypeError:
+            continue
+        except Exception:
+            break
+
+    return raw.replace(" ", "_")
+
+
+def _route_family_flexible(page: str) -> str:
+    try:
+        family = _strip(get_route_family(page))
+        if family:
+            return family
+    except Exception:
+        pass
+
+    if page == _TOP10_PAGE:
+        return "top10"
+    if page == _INSIGHTS_PAGE:
+        return "insights"
+    if page == _DICTIONARY_PAGE:
+        return "dictionary"
+    return "instrument"
+
+
+def _safe_allowed_pages() -> List[str]:
+    try:
+        pages = allowed_pages()
+        if isinstance(pages, list):
+            return pages
+        if isinstance(pages, tuple):
+            return list(pages)
+    except Exception:
+        pass
+    return list(CANONICAL_PAGES or [])
+
+
 def _ensure_page_allowed(page: str) -> None:
     forbidden = set(FORBIDDEN_PAGES or set())
     if page in forbidden:
@@ -652,17 +698,12 @@ def _ensure_page_allowed(page: str) -> None:
             },
         )
 
-    try:
-        ap = allowed_pages()
-        if ap and page not in set(ap):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={"error": f"Unknown page: {page}", "allowed_pages": ap},
-            )
-    except HTTPException:
-        raise
-    except Exception:
-        return
+    ap = _safe_allowed_pages()
+    if ap and page not in set(ap):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"error": f"Unknown page: {page}", "allowed_pages": ap},
+        )
 
 
 def _complete_schema_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple[List[str], List[str]]:
@@ -791,6 +832,54 @@ def _schema_from_static(page: str) -> Tuple[List[str], List[str], Any, str]:
 
     headers, keys = _complete_schema_contract(contract.get("headers", []), contract.get("keys", []))
     return headers, keys, {"source": "static_contract", "page": page}, "static_contract"
+
+
+def _extract_keys_like(payload: Any, depth: int = 0) -> List[str]:
+    if depth > 8 or not isinstance(payload, dict):
+        return []
+
+    for name in ("keys", "fields", "column_keys", "schema_keys", "columns"):
+        value = payload.get(name)
+        if isinstance(value, list):
+            out = [_strip(x) for x in value if _strip(x)]
+            if out:
+                return out
+
+    for name in ("payload", "result", "response", "output", "data"):
+        nested = payload.get(name)
+        if isinstance(nested, dict):
+            found = _extract_keys_like(nested, depth + 1)
+            if found:
+                return found
+
+    return []
+
+
+def _extract_headers_like(payload: Any, depth: int = 0) -> List[str]:
+    if depth > 8 or not isinstance(payload, dict):
+        return []
+
+    for name in ("display_headers", "sheet_headers", "column_headers", "headers"):
+        value = payload.get(name)
+        if isinstance(value, list):
+            out = [_strip(x) for x in value if _strip(x)]
+            if out:
+                return out
+
+    columns = payload.get("columns")
+    if isinstance(columns, list):
+        out = [_strip(x) for x in columns if _strip(x)]
+        if out:
+            return out
+
+    for name in ("payload", "result", "response", "output", "data"):
+        nested = payload.get(name)
+        if isinstance(nested, dict):
+            found = _extract_headers_like(nested, depth + 1)
+            if found:
+                return found
+
+    return []
 
 
 def _derive_contract_from_payload(payload: Any) -> Tuple[List[str], List[str], str]:
@@ -962,54 +1051,6 @@ def _rows_from_matrix(rows_matrix: Any, cols: Sequence[str]) -> List[Dict[str, A
         vals = list(row)
         out.append({keys[i]: (vals[i] if i < len(vals) else None) for i in range(len(keys))})
     return out
-
-
-def _extract_keys_like(payload: Any, depth: int = 0) -> List[str]:
-    if depth > 8 or not isinstance(payload, dict):
-        return []
-
-    for name in ("keys", "fields", "column_keys", "schema_keys", "columns"):
-        value = payload.get(name)
-        if isinstance(value, list):
-            out = [_strip(x) for x in value if _strip(x)]
-            if out:
-                return out
-
-    for name in ("payload", "result", "response", "output", "data"):
-        nested = payload.get(name)
-        if isinstance(nested, dict):
-            found = _extract_keys_like(nested, depth + 1)
-            if found:
-                return found
-
-    return []
-
-
-def _extract_headers_like(payload: Any, depth: int = 0) -> List[str]:
-    if depth > 8 or not isinstance(payload, dict):
-        return []
-
-    for name in ("display_headers", "sheet_headers", "column_headers", "headers"):
-        value = payload.get(name)
-        if isinstance(value, list):
-            out = [_strip(x) for x in value if _strip(x)]
-            if out:
-                return out
-
-    columns = payload.get("columns")
-    if isinstance(columns, list):
-        out = [_strip(x) for x in columns if _strip(x)]
-        if out:
-            return out
-
-    for name in ("payload", "result", "response", "output", "data"):
-        nested = payload.get(name)
-        if isinstance(nested, dict):
-            found = _extract_headers_like(nested, depth + 1)
-            if found:
-                return found
-
-    return []
 
 
 def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
@@ -1285,6 +1326,37 @@ def _payload(
             "request_id": request_id,
             "meta": meta,
         }
+    )
+
+
+def _emergency_payload(
+    *,
+    page: str,
+    request_id: str,
+    started_at: float,
+    mode: str,
+    route_family: Optional[str] = None,
+    payload_hint: Any = None,
+    error_out: str,
+    meta_extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    headers, keys, _spec, schema_source = _resolve_contract(page, payload_hint=payload_hint)
+    meta = dict(meta_extra or {})
+    meta.setdefault("dispatch", "analysis_sheet_rows_emergency_fallback")
+    meta.setdefault("schema_source", schema_source)
+    return _payload(
+        page=page,
+        route_family=route_family or _route_family_flexible(page),
+        headers=headers,
+        keys=keys,
+        rows=[],
+        include_matrix=True,
+        request_id=request_id,
+        started_at=started_at,
+        mode=mode,
+        status_out="partial",
+        error_out=error_out,
+        meta_extra=meta,
     )
 
 
@@ -1656,7 +1728,6 @@ async def _call_sheet_rows_payload_best_effort(
             if callable(fn):
                 candidates.append(fn)
 
-    # Last-resort compatibility functions only after engine methods
     for modpath in ("core.data_engine_v2", "core.data_engine"):
         try:
             mod = importlib.import_module(modpath)
@@ -1768,7 +1839,7 @@ async def analysis_sheet_rows_health(request: Request) -> Dict[str, Any]:
             "version": ANALYSIS_SHEET_ROWS_VERSION,
             "schema_registry_available": bool(get_sheet_spec is not None),
             "schema_import_error": _SCHEMA_IMPORT_ERROR,
-            "allowed_pages_count": len(allowed_pages()) if callable(allowed_pages) else len(CANONICAL_PAGES),
+            "allowed_pages_count": len(_safe_allowed_pages()),
             "auth": auth_summary,
             "path": str(getattr(getattr(request, "url", None), "path", "")),
         }
@@ -1778,7 +1849,7 @@ async def analysis_sheet_rows_health(request: Request) -> Dict[str, Any]:
 # =============================================================================
 # Internal implementation
 # =============================================================================
-async def _analysis_sheet_rows_impl(
+async def _analysis_sheet_rows_impl_core(
     request: Request,
     body: Dict[str, Any],
     mode: str,
@@ -1815,19 +1886,9 @@ async def _analysis_sheet_rows_impl(
     merged_body = _merge_body_with_query(body, request)
 
     page_raw = _pick_page_from_body(merged_body) or "Market_Leaders"
-    try:
-        page = normalize_page_name(page_raw, allow_output_pages=True)
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "error": f"Invalid page: {str(e)}",
-                "allowed_pages": allowed_pages() if callable(allowed_pages) else list(CANONICAL_PAGES),
-            },
-        )
-
+    page = _normalize_page_flexible(page_raw)
     _ensure_page_allowed(page)
-    route_family = str(get_route_family(page))
+    route_family = _route_family_flexible(page)
 
     include_matrix = _maybe_bool(
         merged_body.get("include_matrix"),
@@ -1843,12 +1904,8 @@ async def _analysis_sheet_rows_impl(
 
     engine, engine_source = await _get_engine(request)
 
-    # Start with registry/static contract and allow later payload-based refinement.
     headers, keys, spec, schema_source = _resolve_contract(page)
 
-    # -------------------------------------------------------------------------
-    # Data Dictionary
-    # -------------------------------------------------------------------------
     if route_family == "dictionary":
         rows, error_out, raw_payload = _build_data_dictionary_rows_to_schema(
             schema_keys=keys,
@@ -1883,9 +1940,6 @@ async def _analysis_sheet_rows_impl(
             },
         )
 
-    # -------------------------------------------------------------------------
-    # Insights
-    # -------------------------------------------------------------------------
     if route_family == "insights":
         rows, status_out, error_out, meta_out, raw_payload = await _call_builder_best_effort(
             module_names=_INSIGHTS_MODULE_CANDIDATES,
@@ -1933,9 +1987,6 @@ async def _analysis_sheet_rows_impl(
             },
         )
 
-    # -------------------------------------------------------------------------
-    # Top10
-    # -------------------------------------------------------------------------
     if route_family == "top10":
         headers, keys = _ensure_top10_contract(headers, keys)
 
@@ -1986,9 +2037,6 @@ async def _analysis_sheet_rows_impl(
             },
         )
 
-    # -------------------------------------------------------------------------
-    # Instrument mode with explicit symbols
-    # -------------------------------------------------------------------------
     if symbols:
         if engine is None:
             fallback_rows = [_empty_schema_row(keys, symbol=s) for s in symbols]
@@ -2079,9 +2127,6 @@ async def _analysis_sheet_rows_impl(
             },
         )
 
-    # -------------------------------------------------------------------------
-    # Generic page mode
-    # -------------------------------------------------------------------------
     engine_payload = await _call_sheet_rows_payload_best_effort(
         engine=engine,
         page=page,
@@ -2112,7 +2157,6 @@ async def _analysis_sheet_rows_impl(
             schema=spec,
         )
 
-    # Contract refinement if the engine returned headers/keys even when registry was weak
     if engine_payload is not None:
         dh, dk, dsrc = _derive_contract_from_payload(engine_payload)
         if dh and dk:
@@ -2184,6 +2228,48 @@ async def _analysis_sheet_rows_impl(
         error_out=error_out,
         meta_extra=meta_out,
     )
+
+
+async def _analysis_sheet_rows_impl(
+    request: Request,
+    body: Dict[str, Any],
+    mode: str,
+    include_matrix_q: Optional[bool],
+    token: Optional[str],
+    x_app_token: Optional[str],
+    authorization: Optional[str],
+    x_request_id: Optional[str],
+) -> Dict[str, Any]:
+    start = time.time()
+    request_id = _request_id(request, x_request_id)
+    merged_body = _merge_body_with_query(body, request)
+    fallback_page = _normalize_page_flexible(_pick_page_from_body(merged_body) or "Market_Leaders")
+
+    try:
+        return await _analysis_sheet_rows_impl_core(
+            request=request,
+            body=body,
+            mode=mode,
+            include_matrix_q=include_matrix_q,
+            token=token,
+            x_app_token=x_app_token,
+            authorization=authorization,
+            x_request_id=x_request_id,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("analysis_sheet_rows_impl_unhandled", extra={"page": fallback_page})
+        return _emergency_payload(
+            page=fallback_page,
+            request_id=request_id,
+            started_at=start,
+            mode=mode,
+            error_out=f"analysis_sheet_rows runtime fallback: {e}",
+            meta_extra={
+                "exception_type": type(e).__name__,
+            },
+        )
 
 
 # =============================================================================
