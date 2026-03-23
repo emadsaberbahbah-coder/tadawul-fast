@@ -2,7 +2,7 @@
 # routes/enriched_quote.py
 """
 ================================================================================
-TFB Enriched Quote Routes Wrapper — v7.4.0
+TFB Enriched Quote Routes Wrapper — v7.5.0
 ================================================================================
 SCHEMA-AWARE • PAGE-DISPATCH SAFE • GET+POST COMPATIBLE
 ROOT /v1/enriched-quote COMPATIBLE • SPECIAL-PAGE SAFE • THREAD-OFFLOADED
@@ -10,18 +10,18 @@ JSON-SAFE • TABLE-MODE SAFE • INSTRUMENT HYDRATION SAFE • LATENCY-FIRST
 WRAPPER-PAYLOAD SAFE • ROUTE-TOLERANT • CONTRACT-ALIGNED
 ROW-OBJECTS + MATRIX • SHARED-PIPELINE ALIGNED
 
-What v7.4.0 improves
+What v7.5.0 improves
 --------------------
-- ✅ FIX: stable output contract now aligns with advisor / investment_advisor:
-        - rows / rows_matrix => matrix aligned to keys
-        - row_objects / items / records / data / quotes => dict rows
-- ✅ FIX: shared pipeline hook added so special pages can reuse
-        routes.investment_advisor._run_page_pipeline when available.
-- ✅ FIX: wrapper payload extraction recognizes row_objects / records earlier.
-- ✅ FIX: page payload adaptation preserves headers vs keys separation.
-- ✅ FIX: single-instrument and multi-instrument instrument pages keep
-        latency-first quote hydration while returning the aligned contract.
-- ✅ FIX: schema_only / headers_only support kept for faster live testing.
+- ✅ FIX: enriched router is now quote-owned only; it no longer acts as a
+        generic sheet-row owner for non-instrument pages.
+- ✅ FIX: `/quotes` is limited to instrument quote batches and returns a clear
+        owner hint when callers try to use advanced/dictionary pages here.
+- ✅ FIX: `/v1/enriched*/sheet-rows` routes are removed so generic sheet rows
+        stay with the canonical analysis/advanced routers.
+- ✅ FIX: root `/v1/enriched-quote` bridge still supports single and batch
+        quote flows, but now fences non-instrument page requests cleanly.
+- ✅ FIX: stable output contract remains aligned with advisor families while
+        preserving schema_only / headers_only for instrument quote testing.
 ================================================================================
 """
 
@@ -44,7 +44,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 
 logger = logging.getLogger("routes.enriched_quote")
 
-ROUTER_VERSION = "7.4.0"
+ROUTER_VERSION = "7.5.0"
 router: Optional[APIRouter] = None
 
 TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
@@ -1488,6 +1488,32 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             body["page"] = page
         return body
 
+
+    def _canonical_owner_hint(page: str, route_family: str) -> Dict[str, str]:
+        if route_family == "instrument":
+            return {
+                "canonical_owner": "routes.analysis_sheet_rows",
+                "canonical_endpoint": "/v1/analysis/sheet-rows",
+                "canonical_reason": "instrument_table_mode_owned_by_analysis_sheet_rows",
+            }
+        if route_family in {"insights", "top10"}:
+            return {
+                "canonical_owner": "routes.investment_advisor",
+                "canonical_endpoint": "/v1/advanced/sheet-rows",
+                "canonical_reason": "derived_output_page_owned_by_investment_advisor",
+            }
+        if route_family == "dictionary":
+            return {
+                "canonical_owner": "routes.advanced_analysis",
+                "canonical_endpoint": "/sheet-rows",
+                "canonical_reason": "data_dictionary_owned_by_advanced_analysis",
+            }
+        return {
+            "canonical_owner": "routes.analysis_sheet_rows",
+            "canonical_endpoint": "/v1/analysis/sheet-rows",
+            "canonical_reason": f"page_{page}_owned_by_analysis_sheet_rows",
+        }
+
     async def _build_instrument_rows(
         page: str,
         keys: Sequence[str],
@@ -1708,7 +1734,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         payload["quote"] = row
         return payload
 
-    async def _handle_sheet_rows(
+    async def _handle_quotes_batch(
         request: Request,
         body: Dict[str, Any],
         mode_q: str,
@@ -1734,12 +1760,33 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
 
         top_n = max(1, min(5000, _int_from_body(prepared, "top_n", 200)))
         limit = max(0, min(5000, _int_from_body(prepared, "limit", 0)))
-        offset = max(0, _int_from_body(prepared, "offset", 0))
         if limit > 0:
             top_n = limit
 
         symbols = _list_from_body(prepared, "symbols", "tickers", "tickers_list")[:top_n]
-        engine = await svc.get_engine(request)
+
+        if route_family != "instrument":
+            hint = _canonical_owner_hint(page, route_family)
+            return svc.envelope(
+                status="partial",
+                page=page,
+                route_family=route_family,
+                headers=headers,
+                keys=keys,
+                row_objects=[],
+                include_headers=include_headers,
+                include_matrix=include_matrix,
+                request_id=request_id,
+                started_at=start,
+                mode=mode_q,
+                dispatch="owner_guard",
+                error="enriched_quote_batch_not_supported_for_non_instrument_page",
+                extra_meta={
+                    "page_known": svc.page_is_known(page),
+                    "requested_symbols": len(symbols),
+                    **hint,
+                },
+            )
 
         if schema_only or headers_only:
             return svc.envelope(
@@ -1754,83 +1801,12 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
                 request_id=request_id,
                 started_at=start,
                 mode=mode_q,
-                dispatch=f"{route_family}_schema_only",
+                dispatch="instrument_schema_only",
                 extra_meta={"schema_only": bool(schema_only), "headers_only": bool(headers_only)},
             )
 
-        if route_family == "dictionary":
-            return await svc.build_data_dictionary_payload(
-                page=page,
-                route_family=route_family,
-                headers=headers,
-                keys=keys,
-                include_headers=include_headers,
-                include_matrix=include_matrix,
-                request_id=request_id,
-                started_at=start,
-                mode=mode_q,
-            )
-
-        shared_payload = await svc.call_shared_page_pipeline(
-            page=page,
-            payload={
-                **prepared,
-                "page": page,
-                "sheet": page,
-                "sheet_name": page,
-                "include_headers": include_headers,
-                "include_matrix": include_matrix,
-                "limit": top_n,
-                "offset": offset,
-                "mode": mode_q,
-            },
-            request=request,
-            engine=engine,
-            prefer_engine_sheet=True,
-        )
-
-        if route_family != "instrument":
-            if shared_payload is not None and svc.payload_has_structural_value(shared_payload):
-                return svc.payload_from_result(
-                    result=shared_payload,
-                    page=page,
-                    route_family=route_family,
-                    headers=headers,
-                    keys=keys,
-                    include_headers=include_headers,
-                    include_matrix=include_matrix,
-                    request_id=request_id,
-                    started_at=start,
-                    mode=mode_q,
-                    dispatch="shared_pipeline",
-                    extra_meta={"page_known": svc.page_is_known(page)},
-                )
-
-            engine_payload = await svc.call_engine_page_payload_best_effort(
-                engine=engine,
-                page=page,
-                limit=(limit or 2000),
-                offset=offset,
-                mode=mode_q,
-                body=prepared,
-            )
-
-            if engine_payload is not None:
-                return svc.payload_from_result(
-                    result=engine_payload,
-                    page=page,
-                    route_family=route_family,
-                    headers=headers,
-                    keys=keys,
-                    include_headers=include_headers,
-                    include_matrix=include_matrix,
-                    request_id=request_id,
-                    started_at=start,
-                    mode=mode_q,
-                    dispatch="engine_fallback",
-                    extra_meta={"page_known": svc.page_is_known(page)},
-                )
-
+        if not symbols:
+            hint = _canonical_owner_hint(page, route_family)
             return svc.envelope(
                 status="partial",
                 page=page,
@@ -1843,86 +1819,30 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
                 request_id=request_id,
                 started_at=start,
                 mode=mode_q,
-                dispatch="special_empty",
-                error="special_page_no_payload",
-                extra_meta={"page_known": svc.page_is_known(page)},
+                dispatch="instrument_guard",
+                error="symbols_or_tickers_required_for_enriched_quotes",
+                extra_meta={
+                    "page_known": svc.page_is_known(page),
+                    **hint,
+                },
             )
 
-        if symbols:
-            rows_out, errors, hydrate_meta = await _build_instrument_rows(page, keys, symbols, mode_q, request)
-            return svc.envelope(
-                status="success" if errors == 0 else ("partial" if errors < len(symbols) else "error"),
-                page=page,
-                route_family=route_family,
-                headers=headers,
-                keys=keys,
-                row_objects=rows_out,
-                include_headers=include_headers,
-                include_matrix=include_matrix,
-                request_id=request_id,
-                started_at=start,
-                mode=mode_q,
-                dispatch="instrument",
-                error=f"{errors} errors" if errors else None,
-                extra_meta={"requested": len(symbols), "errors": errors, **hydrate_meta},
-            )
-
-        if shared_payload is not None and svc.payload_has_structural_value(shared_payload):
-            return svc.payload_from_result(
-                result=shared_payload,
-                page=page,
-                route_family=route_family,
-                headers=headers,
-                keys=keys,
-                include_headers=include_headers,
-                include_matrix=include_matrix,
-                request_id=request_id,
-                started_at=start,
-                mode=mode_q,
-                dispatch="shared_pipeline",
-                extra_meta={"page_known": svc.page_is_known(page)},
-            )
-
-        engine_payload = await svc.call_engine_page_payload_best_effort(
-            engine=engine,
-            page=page,
-            limit=(limit or 2000),
-            offset=offset,
-            mode=mode_q,
-            body=prepared,
-        )
-
-        if engine_payload is None:
-            return svc.envelope(
-                status="partial",
-                page=page,
-                route_family=route_family,
-                headers=headers,
-                keys=keys,
-                row_objects=[],
-                include_headers=include_headers,
-                include_matrix=include_matrix,
-                request_id=request_id,
-                started_at=start,
-                mode=mode_q,
-                dispatch="table_mode",
-                error="engine_table_mode_no_payload",
-                extra_meta={"page_known": svc.page_is_known(page)},
-            )
-
-        return svc.payload_from_result(
-            result=engine_payload,
+        rows_out, errors, hydrate_meta = await _build_instrument_rows(page, keys, symbols, mode_q, request)
+        return svc.envelope(
+            status="success" if errors == 0 else ("partial" if errors < len(symbols) else "error"),
             page=page,
             route_family=route_family,
             headers=headers,
             keys=keys,
+            row_objects=rows_out,
             include_headers=include_headers,
             include_matrix=include_matrix,
             request_id=request_id,
             started_at=start,
             mode=mode_q,
-            dispatch="table_mode",
-            extra_meta={"page_known": svc.page_is_known(page)},
+            dispatch="instrument_batch",
+            error=f"{errors} errors" if errors else None,
+            extra_meta={"requested": len(symbols), "errors": errors, **hydrate_meta},
         )
 
     async def _handle_hyphen_bridge(
@@ -1935,15 +1855,12 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         x_request_id: Optional[str],
     ) -> Dict[str, Any]:
         prepared = dict(body or {})
-        page = svc.normalize_page(_page_from_body(prepared) or "Market_Leaders")
-        route_family = svc.route_family(page)
 
         symbol = _strip(prepared.get("symbol") or prepared.get("ticker") or prepared.get("requested_symbol"))
         list_symbols = _list_from_body(prepared, "symbols", "tickers", "tickers_list")
         explicit_page = bool(_page_from_body(prepared))
-        force_sheet_rows = explicit_page or bool(list_symbols) or route_family != "instrument"
 
-        if symbol and not force_sheet_rows:
+        if symbol and not explicit_page and not list_symbols:
             return await _handle_single_quote(
                 request,
                 prepared,
@@ -1955,7 +1872,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
                 x_request_id,
             )
 
-        return await _handle_sheet_rows(
+        return await _handle_quotes_batch(
             request,
             prepared,
             mode_q,
@@ -1964,7 +1881,6 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             authorization,
             x_request_id,
         )
-
     @enriched.get("/health", include_in_schema=False)
     @enriched_quote_alias.get("/health", include_in_schema=False)
     @enriched_hyphen.get("/health", include_in_schema=False)
@@ -2043,7 +1959,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         authorization: Optional[str] = Header(default=None, alias="Authorization"),
         x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
     ) -> Dict[str, Any]:
-        return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
+        return await _handle_quotes_batch(request, body, mode, token, x_app_token, authorization, x_request_id)
 
     @enriched.get("/quotes", include_in_schema=False)
     @enriched_quote_alias.get("/quotes", include_in_schema=False)
@@ -2087,66 +2003,8 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
             schema_only=schema_only,
             headers_only=headers_only,
         )
-        return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
+        return await _handle_quotes_batch(request, body, mode, token, x_app_token, authorization, x_request_id)
 
-    @enriched.post("/sheet-rows")
-    @enriched_quote_alias.post("/sheet-rows")
-    @enriched_hyphen.post("/sheet-rows")
-    @legacy.post("/sheet-rows", include_in_schema=False)
-    async def sheet_rows_post(
-        request: Request,
-        body: Dict[str, Any] = Body(default_factory=dict),
-        mode: str = Query(default="", description="Optional mode hint"),
-        token: Optional[str] = Query(default=None, description="Auth token"),
-        x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-        authorization: Optional[str] = Header(default=None, alias="Authorization"),
-        x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
-    ) -> Dict[str, Any]:
-        return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
-
-    @enriched.get("/sheet-rows")
-    @enriched_quote_alias.get("/sheet-rows")
-    @enriched_hyphen.get("/sheet-rows")
-    @legacy.get("/sheet-rows", include_in_schema=False)
-    async def sheet_rows_get(
-        request: Request,
-        page: Optional[str] = Query(default=None),
-        sheet_name: Optional[str] = Query(default=None),
-        sheet: Optional[str] = Query(default=None),
-        name: Optional[str] = Query(default=None),
-        tab: Optional[str] = Query(default=None),
-        symbols: Optional[str] = Query(default=None),
-        tickers: Optional[str] = Query(default=None),
-        include_headers: Optional[str] = Query(default=None),
-        include_matrix: Optional[str] = Query(default=None),
-        limit: Optional[int] = Query(default=None),
-        offset: Optional[int] = Query(default=None),
-        top_n: Optional[int] = Query(default=None),
-        schema_only: Optional[str] = Query(default=None),
-        headers_only: Optional[str] = Query(default=None),
-        mode: str = Query(default="", description="Optional mode hint"),
-        token: Optional[str] = Query(default=None, description="Auth token"),
-        x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-        authorization: Optional[str] = Header(default=None, alias="Authorization"),
-        x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
-    ) -> Dict[str, Any]:
-        body = _collect_sheet_rows_body(
-            page=page,
-            sheet_name=sheet_name,
-            sheet=sheet,
-            name=name,
-            tab=tab,
-            symbols=symbols,
-            tickers=tickers,
-            include_headers=include_headers,
-            include_matrix=include_matrix,
-            limit=limit,
-            offset=offset,
-            top_n=top_n,
-            schema_only=schema_only,
-            headers_only=headers_only,
-        )
-        return await _handle_sheet_rows(request, body, mode, token, x_app_token, authorization, x_request_id)
 
     @root.post("/v1/enriched-quote")
     async def hyphen_root_post(
