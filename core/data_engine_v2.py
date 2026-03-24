@@ -2,10 +2,10 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.40.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.41.0
 ================================================================================
 
-WHY v5.40.0
+WHY v5.41.0
 -----------
 - FIX: aligns engine sheet-row payloads with revised routers:
        - rows / rows_matrix => matrix aligned to keys
@@ -73,7 +73,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.40.0"
+__version__ = "5.41.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -280,44 +280,22 @@ TOP10_REQUIRED_HEADERS: Dict[str, str] = {
 }
 
 INSIGHTS_HEADERS: List[str] = [
-    "Symbol",
-    "Recommendation",
-    "Recommendation Reason",
-    "Current Price",
-    "Forecast Price 1M",
-    "Forecast Price 3M",
-    "Forecast Price 12M",
-    "Expected ROI 1M",
-    "Expected ROI 3M",
-    "Expected ROI 12M",
-    "Forecast Confidence",
-    "Overall Score",
-    "Risk Bucket",
-    "Horizon Days",
-    "Invest Period Label",
-    "Top10 Rank",
-    "Selection Reason",
-    "Criteria Snapshot",
+    "Section",
+    "Item",
+    "Metric",
+    "Value",
+    "Notes",
+    "Source",
+    "Sort Order",
 ]
 INSIGHTS_KEYS: List[str] = [
-    "symbol",
-    "recommendation",
-    "recommendation_reason",
-    "current_price",
-    "forecast_price_1m",
-    "forecast_price_3m",
-    "forecast_price_12m",
-    "expected_roi_1m",
-    "expected_roi_3m",
-    "expected_roi_12m",
-    "forecast_confidence",
-    "overall_score",
-    "risk_bucket",
-    "horizon_days",
-    "invest_period_label",
-    "top10_rank",
-    "selection_reason",
-    "criteria_snapshot",
+    "section",
+    "item",
+    "metric",
+    "value",
+    "notes",
+    "source",
+    "sort_order",
 ]
 
 DATA_DICTIONARY_HEADERS: List[str] = [
@@ -713,7 +691,7 @@ def _usable_contract(headers: Sequence[str], keys: Sequence[str], sheet_name: st
         if not set(TOP10_REQUIRED_FIELDS).issubset(keyset):
             return False
     if canon == "Insights_Analysis":
-        if not ({"symbol", "recommendation", "overall_score", "selection_reason"} & keyset):
+        if not ({"section", "item", "metric", "value"} <= keyset):
             return False
     if canon == "Data_Dictionary":
         if not {"sheet", "header", "key"}.issubset(keyset):
@@ -926,40 +904,328 @@ def _extract_symbols_from_rows(rows: Sequence[Dict[str, Any]], limit: int = 5000
     return _normalize_symbol_list(raw, limit=limit)
 
 
-def _normalize_to_schema_keys(keys: Sequence[str], headers: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
-    src = dict(row or {})
+_NULL_STRINGS: Set[str] = {"", "null", "none", "n/a", "na", "nan", "-", "--"}
+
+_CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
+    "symbol": ("symbol", "ticker", "code", "requested_symbol", "regularMarketSymbol"),
+    "name": ("name", "shortName", "longName", "displayName", "companyName", "fundName", "description"),
+    "asset_class": ("asset_class", "assetClass", "quoteType", "assetType", "instrumentType", "securityType", "type"),
+    "exchange": ("exchange", "exchangeName", "fullExchangeName", "market", "marketName", "mic", "exchangeCode"),
+    "currency": ("currency", "financialCurrency", "reportingCurrency", "quoteCurrency", "baseCurrency"),
+    "country": ("country", "countryName", "country_code", "countryCode", "localeCountry"),
+    "sector": ("sector", "sectorDisp", "gicsSector", "industryGroup"),
+    "industry": ("industry", "industryDisp", "gicsIndustry", "category"),
+    "current_price": ("current_price", "price", "last", "lastPrice", "latestPrice", "regularMarketPrice", "nav", "close"),
+    "previous_close": ("previous_close", "previousClose", "regularMarketPreviousClose", "prevClose", "priorClose"),
+    "open_price": ("open_price", "open", "openPrice", "regularMarketOpen"),
+    "day_high": ("day_high", "high", "dayHigh", "regularMarketDayHigh", "sessionHigh"),
+    "day_low": ("day_low", "low", "dayLow", "regularMarketDayLow", "sessionLow"),
+    "week_52_high": ("week_52_high", "52WeekHigh", "fiftyTwoWeekHigh", "yearHigh", "week52High"),
+    "week_52_low": ("week_52_low", "52WeekLow", "fiftyTwoWeekLow", "yearLow", "week52Low"),
+    "price_change": ("price_change", "change", "priceChange", "regularMarketChange", "netChange"),
+    "percent_change": ("percent_change", "changePercent", "percentChange", "regularMarketChangePercent", "pctChange", "change_pct"),
+    "volume": ("volume", "regularMarketVolume", "sharesTraded", "tradeVolume"),
+    "avg_volume_10d": ("avg_volume_10d", "averageVolume10days", "avgVolume10Day", "avgVol10d"),
+    "avg_volume_30d": ("avg_volume_30d", "averageVolume", "averageDailyVolume3Month", "avgVolume3Month", "avgVol30d"),
+    "market_cap": ("market_cap", "marketCap", "marketCapitalization"),
+    "float_shares": ("float_shares", "floatShares", "sharesFloat"),
+    "beta_5y": ("beta_5y", "beta", "beta5Y"),
+    "pe_ttm": ("pe_ttm", "trailingPE", "peRatio", "priceEarningsTTM", "pe"),
+    "pe_forward": ("pe_forward", "forwardPE", "forwardPe"),
+    "eps_ttm": ("eps_ttm", "trailingEps", "eps", "earningsPerShare", "epsTTM"),
+    "dividend_yield": ("dividend_yield", "dividendYield", "trailingAnnualDividendYield", "distributionYield"),
+    "payout_ratio": ("payout_ratio", "payoutRatio"),
+    "revenue_ttm": ("revenue_ttm", "totalRevenue", "revenueTTM", "revenue"),
+    "revenue_growth_yoy": ("revenue_growth_yoy", "revenueGrowth", "revenueGrowthYoY", "revenue_yoy_growth"),
+    "gross_margin": ("gross_margin", "grossMargins", "grossMargin"),
+    "operating_margin": ("operating_margin", "operatingMargins", "operatingMargin"),
+    "profit_margin": ("profit_margin", "profitMargins", "profitMargin", "netMargin"),
+    "debt_to_equity": ("debt_to_equity", "debtToEquity", "deRatio"),
+    "free_cash_flow_ttm": ("free_cash_flow_ttm", "freeCashflow", "freeCashFlow", "fcf"),
+    "rsi_14": ("rsi_14", "rsi", "rsi14"),
+    "volatility_30d": ("volatility_30d", "volatility30d", "vol30d"),
+    "volatility_90d": ("volatility_90d", "volatility90d", "vol90d"),
+    "max_drawdown_1y": ("max_drawdown_1y", "maxDrawdown1y", "drawdown1y"),
+    "var_95_1d": ("var_95_1d", "var95_1d", "valueAtRisk95_1d"),
+    "sharpe_1y": ("sharpe_1y", "sharpe1y", "sharpeRatio"),
+    "risk_score": ("risk_score",),
+    "risk_bucket": ("risk_bucket",),
+    "pb_ratio": ("pb_ratio", "priceToBook", "pb"),
+    "ps_ratio": ("ps_ratio", "priceToSalesTrailing12Months", "ps"),
+    "ev_ebitda": ("ev_ebitda", "enterpriseToEbitda", "evToEbitda"),
+    "peg_ratio": ("peg_ratio", "peg", "pegRatio"),
+    "intrinsic_value": ("intrinsic_value", "fairValue", "dcf", "dcfValue", "intrinsicValue"),
+    "valuation_score": ("valuation_score",),
+    "forecast_price_1m": ("forecast_price_1m", "targetPrice1m", "priceTarget1m"),
+    "forecast_price_3m": ("forecast_price_3m", "targetPrice3m", "priceTarget3m", "targetPrice", "targetMeanPrice"),
+    "forecast_price_12m": ("forecast_price_12m", "targetPrice12m", "priceTarget12m", "targetMedianPrice", "targetHighPrice"),
+    "expected_roi_1m": ("expected_roi_1m", "expectedReturn1m", "roi1m"),
+    "expected_roi_3m": ("expected_roi_3m", "expectedReturn3m", "roi3m"),
+    "expected_roi_12m": ("expected_roi_12m", "expectedReturn12m", "roi12m"),
+    "forecast_confidence": ("forecast_confidence", "confidence", "confidencePct", "modelConfidence"),
+    "confidence_score": ("confidence_score", "modelConfidenceScore"),
+    "confidence_bucket": ("confidence_bucket",),
+    "value_score": ("value_score",),
+    "quality_score": ("quality_score",),
+    "momentum_score": ("momentum_score",),
+    "growth_score": ("growth_score",),
+    "overall_score": ("overall_score", "score", "compositeScore"),
+    "opportunity_score": ("opportunity_score",),
+    "rank_overall": ("rank_overall", "rank", "overallRank"),
+    "recommendation": ("recommendation", "rating", "action", "reco", "consensus"),
+    "recommendation_reason": ("recommendation_reason", "reason", "summary", "thesis", "analysis"),
+    "horizon_days": ("horizon_days", "horizon", "days"),
+    "invest_period_label": ("invest_period_label", "periodLabel", "horizonLabel"),
+    "position_qty": ("position_qty", "positionQty", "qty", "quantity", "shares", "holdingQty"),
+    "avg_cost": ("avg_cost", "avgCost", "averageCost", "costBasisPerShare"),
+    "position_cost": ("position_cost", "positionCost", "costBasis", "totalCost"),
+    "position_value": ("position_value", "marketValue", "positionValue", "holdingValue"),
+    "unrealized_pl": ("unrealized_pl", "unrealizedPnL", "unrealizedPL", "profitLoss"),
+    "unrealized_pl_pct": ("unrealized_pl_pct", "unrealizedPnLPct", "unrealizedPLPct"),
+    "data_provider": ("data_provider", "provider", "source", "dataProvider"),
+    "last_updated_utc": ("last_updated_utc", "lastUpdated", "updatedAt", "timestamp", "asOf"),
+    "last_updated_riyadh": ("last_updated_riyadh",),
+    "warnings": ("warnings", "warning", "messages", "errors"),
+}
+
+_COMMODITY_SYMBOL_HINTS: Tuple[str, ...] = ("GC=F", "SI=F", "BZ=F", "CL=F", "NG=F", "HG=F")
+
+
+def _is_blank_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in _NULL_STRINGS
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value) == 0
+    return False
+
+
+def _to_scalar(value: Any) -> Any:
+    if isinstance(value, (list, tuple, set)):
+        seq = [v for v in value if not _is_blank_value(v)]
+        if not seq:
+            return None
+        if all(not isinstance(v, (dict, list, tuple, set)) for v in seq):
+            if len(seq) == 1:
+                return seq[0]
+            return "; ".join(_safe_str(v) for v in seq if _safe_str(v))
+        return None
+    return value
+
+
+def _flatten_scalar_fields(obj: Any, out: Optional[Dict[str, Any]] = None, prefix: str = "", depth: int = 0, max_depth: int = 4) -> Dict[str, Any]:
+    if out is None:
+        out = {}
+    if depth > max_depth or obj is None:
+        return out
+    if isinstance(obj, Mapping):
+        for k, v in obj.items():
+            key = _safe_str(k)
+            if not key:
+                continue
+            full = f"{prefix}.{key}" if prefix else key
+            if isinstance(v, Mapping):
+                _flatten_scalar_fields(v, out=out, prefix=full, depth=depth + 1, max_depth=max_depth)
+                continue
+            if isinstance(v, (list, tuple, set)) and v and isinstance(next(iter(v)), Mapping):
+                continue
+            scalar = _to_scalar(v)
+            if scalar is None:
+                continue
+            out.setdefault(key, scalar)
+            out.setdefault(full, scalar)
+    return out
+
+
+def _lookup_alias_value(src: Mapping[str, Any], flat: Mapping[str, Any], alias: str) -> Any:
+    if not alias:
+        return None
+    candidates = [
+        alias,
+        alias.lower(),
+        _norm_key(alias),
+        _norm_key_loose(alias),
+        alias.replace("_", " "),
+        alias.replace("_", "-"),
+    ]
     src_ci = {str(k).strip().lower(): v for k, v in src.items()}
     src_loose = {_norm_key_loose(k): v for k, v in src.items()}
+    flat_ci = {str(k).strip().lower(): v for k, v in flat.items()}
+    flat_loose = {_norm_key_loose(k): v for k, v in flat.items()}
+    for cand in candidates:
+        if cand in src and not _is_blank_value(src.get(cand)):
+            return src.get(cand)
+        if cand in flat and not _is_blank_value(flat.get(cand)):
+            return flat.get(cand)
+        lower = cand.lower()
+        if lower in src_ci and not _is_blank_value(src_ci.get(lower)):
+            return src_ci.get(lower)
+        if lower in flat_ci and not _is_blank_value(flat_ci.get(lower)):
+            return flat_ci.get(lower)
+        loose = _norm_key_loose(cand)
+        if loose in src_loose and not _is_blank_value(src_loose.get(loose)):
+            return src_loose.get(loose)
+        if loose in flat_loose and not _is_blank_value(flat_loose.get(loose)):
+            return flat_loose.get(loose)
+    return None
+
+
+def _infer_asset_class_from_symbol(symbol: str) -> str:
+    s = normalize_symbol(symbol)
+    if not s:
+        return ""
+    if s.endswith(".SR") or re.match(r"^[0-9]{4}$", s):
+        return "Equity"
+    if s.endswith("=X"):
+        return "FX"
+    if s.endswith("=F") or s in _COMMODITY_SYMBOL_HINTS:
+        return "Commodity"
+    if s in {"SPY", "QQQ", "VTI", "VOO", "IWM", "DIA"}:
+        return "ETF"
+    return "Equity"
+
+
+def _infer_exchange_from_symbol(symbol: str) -> str:
+    s = normalize_symbol(symbol)
+    if s.endswith(".SR") or re.match(r"^[0-9]{4}$", s):
+        return "Tadawul"
+    if s.endswith("=X"):
+        return "FX"
+    if s.endswith("=F"):
+        return "Futures"
+    return "NASDAQ/NYSE"
+
+
+def _infer_currency_from_symbol(symbol: str) -> str:
+    s = normalize_symbol(symbol)
+    if s.endswith(".SR") or re.match(r"^[0-9]{4}$", s):
+        return "SAR"
+    if s.endswith("=X"):
+        return s[:3] if len(s) >= 3 else "FX"
+    if s.endswith("=F"):
+        return "USD"
+    return "USD"
+
+
+def _infer_country_from_symbol(symbol: str) -> str:
+    s = normalize_symbol(symbol)
+    if s.endswith(".SR") or re.match(r"^[0-9]{4}$", s):
+        return "Saudi Arabia"
+    if s.endswith("=X") or s.endswith("=F"):
+        return "Global"
+    return "USA"
+
+
+def _coerce_datetime_like(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, (datetime, date)):
+        try:
+            return value.isoformat()
+        except Exception:
+            return _safe_str(value)
+    return _safe_str(value) or None
+
+
+def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", normalized_symbol: str = "", provider: str = "") -> Dict[str, Any]:
+    src = dict(row or {})
+    flat = _flatten_scalar_fields(src)
+    symbol = normalized_symbol or normalize_symbol(_safe_str(_lookup_alias_value(src, flat, "symbol") or requested_symbol))
+    out: Dict[str, Any] = {
+        "symbol": symbol or requested_symbol,
+        "symbol_normalized": symbol or requested_symbol,
+        "requested_symbol": requested_symbol or symbol,
+    }
+    for field, aliases in _CANONICAL_FIELD_ALIASES.items():
+        for alias in (field,) + tuple(aliases):
+            val = _lookup_alias_value(src, flat, alias)
+            if not _is_blank_value(val):
+                out[field] = _json_safe(_to_scalar(val))
+                break
+
+    if not out.get("name"):
+        out["name"] = out.get("symbol") or normalized_symbol or requested_symbol
+    if not out.get("asset_class"):
+        out["asset_class"] = _infer_asset_class_from_symbol(out.get("symbol") or normalized_symbol or requested_symbol)
+    if not out.get("exchange"):
+        out["exchange"] = _infer_exchange_from_symbol(out.get("symbol") or normalized_symbol or requested_symbol)
+    if not out.get("currency"):
+        out["currency"] = _infer_currency_from_symbol(out.get("symbol") or normalized_symbol or requested_symbol)
+    if not out.get("country"):
+        out["country"] = _infer_country_from_symbol(out.get("symbol") or normalized_symbol or requested_symbol)
+
+    if provider and not out.get("data_provider"):
+        out["data_provider"] = provider
+
+    if not out.get("last_updated_utc"):
+        out["last_updated_utc"] = _coerce_datetime_like(_lookup_alias_value(src, flat, "last_updated_utc")) or _now_utc_iso()
+    if not out.get("last_updated_riyadh"):
+        out["last_updated_riyadh"] = _now_riyadh_iso()
+
+    warnings = out.get("warnings")
+    if isinstance(warnings, (list, tuple, set)):
+        out["warnings"] = "; ".join(_safe_str(v) for v in warnings if _safe_str(v))
+
+    price = _as_float(out.get("current_price")) or _as_float(out.get("price"))
+    prev = _as_float(out.get("previous_close"))
+    change = _as_float(out.get("price_change"))
+    pct = _as_float(out.get("percent_change"))
+    if price is None:
+        price = _as_float(out.get("close"))
+        if price is not None:
+            out["current_price"] = price
+    if prev is None and price is not None and change is not None:
+        prev = price - change
+        out["previous_close"] = prev
+    if change is None and price is not None and prev is not None:
+        change = price - prev
+        out["price_change"] = round(change, 6)
+    if pct is None and price is not None and prev not in (None, 0):
+        pct = ((price - prev) / prev) * 100.0
+        out["percent_change"] = round(pct, 6)
+    elif pct is not None and abs(pct) <= 1.5:
+        out["percent_change"] = round(pct * 100.0, 6)
+
+    high52 = _as_float(out.get("week_52_high"))
+    low52 = _as_float(out.get("week_52_low"))
+    if price is not None and high52 is not None and low52 is not None and high52 > low52 and out.get("week_52_position_pct") is None:
+        out["week_52_position_pct"] = round(((price - low52) / (high52 - low52)) * 100.0, 6)
+
+    qty = _as_float(out.get("position_qty"))
+    avg_cost = _as_float(out.get("avg_cost"))
+    if qty is not None and price is not None and out.get("position_value") is None:
+        out["position_value"] = round(qty * price, 6)
+    if qty is not None and avg_cost is not None and out.get("position_cost") is None:
+        out["position_cost"] = round(qty * avg_cost, 6)
+    pos_val = _as_float(out.get("position_value"))
+    pos_cost = _as_float(out.get("position_cost"))
+    if pos_val is not None and pos_cost is not None and out.get("unrealized_pl") is None:
+        out["unrealized_pl"] = round(pos_val - pos_cost, 6)
+    upl = _as_float(out.get("unrealized_pl"))
+    if upl is not None and pos_cost not in (None, 0) and out.get("unrealized_pl_pct") is None:
+        out["unrealized_pl_pct"] = round((upl / pos_cost) * 100.0, 6)
+
+    return out
+
+
+def _normalize_to_schema_keys(keys: Sequence[str], headers: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
+    src = _canonicalize_provider_row(dict(row or {}), requested_symbol=_safe_str((row or {}).get("requested_symbol")), normalized_symbol=normalize_symbol(_safe_str((row or {}).get("symbol") or (row or {}).get("ticker"))), provider=_safe_str((row or {}).get("data_provider") or (row or {}).get("provider")))
+    flat = _flatten_scalar_fields(src)
 
     out: Dict[str, Any] = {}
     for idx, key in enumerate(keys or []):
         header = headers[idx] if idx < len(headers) else key
-        aliases = [
-            key,
-            header,
-            _norm_key(key),
-            _norm_key(header),
-            key.lower(),
-            header.lower(),
-            key.replace("_", " "),
-        ]
+        aliases = [key, header, _norm_key(key), _norm_key(header), key.lower(), header.lower(), key.replace("_", " ")]
+        aliases.extend(_CANONICAL_FIELD_ALIASES.get(key, ()))
         val = None
         found = False
         for alias in aliases:
-            if alias in src:
-                val = src[alias]
+            val = _lookup_alias_value(src, flat, alias)
+            if not _is_blank_value(val):
                 found = True
                 break
-            if alias.lower() in src_ci:
-                val = src_ci[alias.lower()]
-                found = True
-                break
-            loose = _norm_key_loose(alias)
-            if loose in src_loose:
-                val = src_loose[loose]
-                found = True
-                break
-        out[key] = val if found else None
+        out[key] = _json_safe(_to_scalar(val)) if found else None
     return out
 
 
@@ -1273,9 +1539,6 @@ def _registry_sheet_lookup(sheet: str) -> Any:
 
 def get_sheet_spec(sheet: str) -> Any:
     canon = _canonicalize_sheet_name(sheet)
-    static_contract = STATIC_CANONICAL_SHEET_CONTRACTS.get(canon)
-    if static_contract:
-        return dict(static_contract)
     if callable(_RAW_GET_SHEET_SPEC):
         for cand in _dedupe_keep_order([canon, canon.replace("_", " "), _norm_key(canon), sheet]):
             try:
@@ -1287,17 +1550,14 @@ def get_sheet_spec(sheet: str) -> Any:
     spec = _registry_sheet_lookup(canon)
     if spec is not None:
         return spec
+    static_contract = STATIC_CANONICAL_SHEET_CONTRACTS.get(canon)
+    if static_contract:
+        return dict(static_contract)
     raise KeyError(f"Unknown sheet spec: {sheet}")
 
 
 def _schema_for_sheet(sheet: str) -> Tuple[Any, List[str], List[str], str]:
     canon = _canonicalize_sheet_name(sheet)
-    static_contract = STATIC_CANONICAL_SHEET_CONTRACTS.get(canon)
-    if static_contract:
-        h, k = _complete_schema_contract(static_contract.get("headers", []), static_contract.get("keys", []))
-        if canon == "Top_10_Investments":
-            h, k = _ensure_top10_contract(h, k)
-        return dict(static_contract), h, k, "static_canonical_contract"
 
     try:
         spec = get_sheet_spec(canon)
@@ -2164,6 +2424,197 @@ class DataEngineV5:
                 out.append(p)
         return out
 
+    def _coerce_history_rows(self, result: Any) -> List[Dict[str, Any]]:
+        if result is None:
+            return []
+        if hasattr(result, "to_dict") and callable(getattr(result, "to_dict")):
+            try:
+                rows = result.to_dict("records")
+                if isinstance(rows, list):
+                    return [dict(r) for r in rows if isinstance(r, dict)]
+            except Exception:
+                pass
+        if isinstance(result, list):
+            out: List[Dict[str, Any]] = []
+            for item in result:
+                if isinstance(item, dict):
+                    out.append(dict(item))
+                elif isinstance(item, (list, tuple)) and len(item) >= 5:
+                    out.append({
+                        "timestamp": item[0],
+                        "open": item[1],
+                        "high": item[2],
+                        "low": item[3],
+                        "close": item[4],
+                        "volume": item[5] if len(item) > 5 else None,
+                    })
+            return out
+        if isinstance(result, dict):
+            for key in ("history", "bars", "candles", "prices", "data", "items", "rows", "chart"):
+                if key in result:
+                    nested = self._coerce_history_rows(result.get(key))
+                    if nested:
+                        return nested
+            if {"open", "high", "low", "close"} & set(result.keys()):
+                return [dict(result)]
+        return []
+
+    def _safe_mean(self, values: List[float]) -> float:
+        return sum(values) / len(values) if values else 0.0
+
+    def _safe_std(self, values: List[float]) -> float:
+        if len(values) < 2:
+            return 0.0
+        mean = self._safe_mean(values)
+        var = sum((v - mean) ** 2 for v in values) / (len(values) - 1)
+        return math.sqrt(max(var, 0.0))
+
+    def _quantile(self, values: List[float], q: float) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        pos = max(0.0, min(1.0, q)) * (len(ordered) - 1)
+        lo = int(math.floor(pos))
+        hi = int(math.ceil(pos))
+        if lo == hi:
+            return ordered[lo]
+        frac = pos - lo
+        return ordered[lo] + (ordered[hi] - ordered[lo]) * frac
+
+    def _compute_history_patch_from_rows(self, rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+        closes: List[float] = []
+        highs: List[float] = []
+        lows: List[float] = []
+        volumes: List[float] = []
+        opens: List[float] = []
+        for row in rows or []:
+            close = _as_float(row.get("close") or row.get("adjclose") or row.get("price") or row.get("value"))
+            high = _as_float(row.get("high") or row.get("day_high"))
+            low = _as_float(row.get("low") or row.get("day_low"))
+            vol = _as_float(row.get("volume"))
+            opn = _as_float(row.get("open") or row.get("open_price"))
+            if close is not None:
+                closes.append(close)
+            if high is not None:
+                highs.append(high)
+            if low is not None:
+                lows.append(low)
+            if vol is not None:
+                volumes.append(vol)
+            if opn is not None:
+                opens.append(opn)
+        if len(closes) < 2:
+            return {}
+        returns = []
+        for prev, cur in zip(closes[:-1], closes[1:]):
+            if prev not in (None, 0):
+                returns.append((cur / prev) - 1.0)
+        if not returns:
+            return {}
+        recent14 = closes[-15:]
+        gains: List[float] = []
+        losses: List[float] = []
+        for prev, cur in zip(recent14[:-1], recent14[1:]):
+            delta = cur - prev
+            if delta >= 0:
+                gains.append(delta)
+                losses.append(0.0)
+            else:
+                gains.append(0.0)
+                losses.append(abs(delta))
+        avg_gain = self._safe_mean(gains)
+        avg_loss = self._safe_mean(losses)
+        rsi = None
+        if gains and losses:
+            if avg_loss == 0:
+                rsi = 100.0
+            else:
+                rs = avg_gain / avg_loss
+                rsi = 100.0 - (100.0 / (1.0 + rs))
+        last30 = returns[-30:] if len(returns) >= 30 else returns
+        last90 = returns[-90:] if len(returns) >= 90 else returns
+        vol30 = self._safe_std(last30) * math.sqrt(252.0) if last30 else None
+        vol90 = self._safe_std(last90) * math.sqrt(252.0) if last90 else None
+        mean_daily = self._safe_mean(last90)
+        std_daily = self._safe_std(last90)
+        sharpe = (mean_daily / std_daily) * math.sqrt(252.0) if std_daily not in (None, 0.0) else None
+        var95 = abs(self._quantile(last90, 0.05)) if last90 else None
+        peak = closes[0]
+        max_dd = 0.0
+        for price in closes:
+            peak = max(peak, price)
+            if peak > 0:
+                dd = (price / peak) - 1.0
+                max_dd = min(max_dd, dd)
+        patch: Dict[str, Any] = {
+            "current_price": closes[-1],
+            "previous_close": closes[-2],
+            "open_price": opens[-1] if opens else None,
+            "day_high": highs[-1] if highs else None,
+            "day_low": lows[-1] if lows else None,
+            "week_52_high": max(highs) if highs else max(closes),
+            "week_52_low": min(lows) if lows else min(closes),
+            "avg_volume_10d": self._safe_mean(volumes[-10:]) if volumes else None,
+            "avg_volume_30d": self._safe_mean(volumes[-30:]) if volumes else None,
+            "volatility_30d": vol30,
+            "volatility_90d": vol90,
+            "max_drawdown_1y": abs(max_dd) * 100.0,
+            "var_95_1d": var95 * 100.0 if var95 is not None else None,
+            "sharpe_1y": sharpe,
+            "rsi_14": rsi,
+            "price_change": closes[-1] - closes[-2],
+            "percent_change": ((closes[-1] - closes[-2]) / closes[-2]) * 100.0 if closes[-2] not in (None, 0) else None,
+            "volume": volumes[-1] if volumes else None,
+        }
+        if patch.get("current_price") is not None and patch.get("week_52_high") is not None and patch.get("week_52_low") is not None:
+            hi = _as_float(patch.get("week_52_high"))
+            lo = _as_float(patch.get("week_52_low"))
+            cp = _as_float(patch.get("current_price"))
+            if hi is not None and lo is not None and cp is not None and hi > lo:
+                patch["week_52_position_pct"] = ((cp - lo) / (hi - lo)) * 100.0
+        return {k: v for k, v in patch.items() if v is not None}
+
+    async def _fetch_history_patch(self, provider: str, symbol: str) -> Dict[str, Any]:
+        module, _stats = await self._registry.get_provider(provider)
+        if module is None:
+            return {}
+        callables = []
+        for name in ("get_history", "fetch_history", "get_price_history", "fetch_price_history", "history", "get_chart", "fetch_chart", "get_ohlcv", "fetch_ohlcv"):
+            fn = getattr(module, name, None)
+            if callable(fn):
+                callables.append(fn)
+        if not callables:
+            return {}
+        variants = [
+            ((symbol,), {"period": "1y", "interval": "1d"}),
+            ((symbol,), {"range": "1y", "interval": "1d"}),
+            ((), {"symbol": symbol, "period": "1y", "interval": "1d"}),
+            ((), {"ticker": symbol, "period": "1y", "interval": "1d"}),
+            ((symbol,), {}),
+        ]
+        for fn in callables:
+            for args, kwargs in variants:
+                try:
+                    async with asyncio.timeout(max(5.0, self.request_timeout)):
+                        result = await _call_maybe_async(fn, *args, **kwargs)
+                    rows = self._coerce_history_rows(result)
+                    patch = self._compute_history_patch_from_rows(rows)
+                    if patch:
+                        patch["data_provider"] = provider
+                        return patch
+                except TypeError:
+                    continue
+                except Exception:
+                    continue
+        return {}
+
+    async def _get_history_patch_best_effort(self, symbol: str, providers: Sequence[str]) -> Dict[str, Any]:
+        for provider in providers:
+            patch = await self._fetch_history_patch(provider, symbol)
+            if patch:
+                return patch
+        return {}
+
     def _merge(self, requested_symbol: str, norm: str, patches: List[Tuple[str, Dict[str, Any], float]]) -> Dict[str, Any]:
         merged: Dict[str, Any] = {
             "symbol": norm,
@@ -2176,8 +2627,13 @@ class DataEngineV5:
         }
 
         protected = {"symbol", "symbol_normalized", "requested_symbol"}
+        normalized_patches: List[Tuple[str, Dict[str, Any], float]] = []
+        for prov, patch, latency in patches:
+            canonical = _canonicalize_provider_row(patch, requested_symbol=requested_symbol, normalized_symbol=norm, provider=prov)
+            normalized_patches.append((prov, canonical, latency))
+
         sorted_patches = sorted(
-            patches,
+            normalized_patches,
             key=lambda item: (
                 PROVIDER_PRIORITIES.get(item[0], 999),
                 -sum(1 for v in item[1].values() if v not in (None, "", [], {})),
@@ -2190,17 +2646,12 @@ class DataEngineV5:
             for k, v in patch.items():
                 if k in protected or v is None:
                     continue
-                if k not in merged or merged.get(k) in (None, "", []):
+                if k not in merged or merged.get(k) in (None, "", [], {}):
                     merged[k] = v
 
-        if merged.get("current_price") is None and merged.get("price") is not None:
-            merged["current_price"] = merged.get("price")
-        if merged.get("price") is None and merged.get("current_price") is not None:
-            merged["price"] = merged.get("current_price")
-        if merged.get("name") is None:
-            merged["name"] = norm
-
+        merged = _canonicalize_provider_row(merged, requested_symbol=requested_symbol, normalized_symbol=norm, provider=_safe_str((merged.get("data_sources") or [""])[0] if isinstance(merged.get("data_sources"), list) else ""))
         return merged
+
 
     def _data_quality(self, row: Dict[str, Any]) -> str:
         if _as_float(row.get("current_price")) is None:
@@ -2255,6 +2706,23 @@ class DataEngineV5:
                 "last_updated_utc": _now_utc_iso(),
                 "last_updated_riyadh": _now_riyadh_iso(),
             }
+
+        missing_history_fields = [
+            "week_52_high",
+            "week_52_low",
+            "avg_volume_10d",
+            "avg_volume_30d",
+            "volatility_30d",
+            "volatility_90d",
+            "max_drawdown_1y",
+            "var_95_1d",
+            "sharpe_1y",
+            "rsi_14",
+        ]
+        if any(row.get(k) in (None, "", [], {}) for k in missing_history_fields):
+            hist_patch = await self._get_history_patch_best_effort(norm, providers)
+            if hist_patch:
+                row = self._merge(symbol, norm, patches_ok + [(hist_patch.get("data_provider") or "history", hist_patch, 0.0)])
 
         _compute_scores_fallback(row)
         _compute_recommendation(row)
@@ -2344,7 +2812,7 @@ class DataEngineV5:
 
     async def _build_insights_rows_fallback(self, body: Optional[Dict[str, Any]], limit: int) -> List[Dict[str, Any]]:
         body = dict(body or {})
-        symbols = _extract_requested_symbols_from_body(body, limit=limit)
+        symbols = _extract_requested_symbols_from_body(body, limit=max(limit, 10))
         if not symbols:
             for page_name in TOP10_ENGINE_DEFAULT_PAGES:
                 symbols.extend(await self.get_sheet_symbols(page_name, limit=max(limit, 10), body=body))
@@ -2353,32 +2821,38 @@ class DataEngineV5:
             symbols = list(EMERGENCY_PAGE_SYMBOLS.get("Market_Leaders", [])[: max(limit, 5)])
 
         quotes = await self.get_enriched_quotes(symbols, schema=None)
+        quote_rows = [_model_to_dict(q) for q in quotes]
+        quote_rows.sort(key=lambda r: (_as_float(r.get("overall_score")) or 0.0, _as_float(r.get("opportunity_score")) or 0.0), reverse=True)
+
         rows: List[Dict[str, Any]] = []
-        for q in quotes[:limit]:
-            d = _model_to_dict(q)
+        for idx, d in enumerate(quote_rows, start=1):
             rows.append(
                 {
-                    "symbol": d.get("symbol"),
-                    "recommendation": d.get("recommendation"),
-                    "recommendation_reason": d.get("recommendation_reason"),
-                    "current_price": d.get("current_price"),
-                    "forecast_price_1m": d.get("forecast_price_1m"),
-                    "forecast_price_3m": d.get("forecast_price_3m"),
-                    "forecast_price_12m": d.get("forecast_price_12m"),
-                    "expected_roi_1m": d.get("expected_roi_1m"),
-                    "expected_roi_3m": d.get("expected_roi_3m"),
-                    "expected_roi_12m": d.get("expected_roi_12m"),
-                    "forecast_confidence": d.get("forecast_confidence"),
-                    "overall_score": d.get("overall_score"),
-                    "risk_bucket": d.get("risk_bucket"),
-                    "horizon_days": d.get("horizon_days") or 90,
-                    "invest_period_label": d.get("invest_period_label") or "3M",
-                    "top10_rank": None,
-                    "selection_reason": None,
-                    "criteria_snapshot": None,
+                    "section": "Top Ideas",
+                    "item": d.get("symbol"),
+                    "metric": "Recommendation",
+                    "value": d.get("recommendation"),
+                    "notes": d.get("recommendation_reason") or f"overall={d.get('overall_score')} risk={d.get('risk_bucket')}",
+                    "source": "engine_fallback",
+                    "sort_order": idx,
                 }
             )
-        return rows
+            if len(rows) >= limit:
+                break
+            rows.append(
+                {
+                    "section": "Top Ideas",
+                    "item": d.get("symbol"),
+                    "metric": "Expected ROI 3M",
+                    "value": d.get("expected_roi_3m"),
+                    "notes": f"confidence={d.get('confidence_score')} price={d.get('current_price')}",
+                    "source": "engine_fallback",
+                    "sort_order": idx + 0.1,
+                }
+            )
+            if len(rows) >= limit:
+                break
+        return rows[:limit]
 
     async def _build_top10_rows_fallback(
         self,
