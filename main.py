@@ -2,17 +2,17 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.0.0)
+TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.1.0)
 ================================================================================
 ALIGNED • DEPLOYMENT-SAFE • PRE-MOUNT + STARTUP-VERIFY • ROUTER-SNAPSHOT-AWARE
 ENGINE-STATE-AWARE • OPENAPI-SAFE • RENDER-HEALTH-PROBE-SAFE • PRIORITY-MOUNTED
 ROOT-CONFIG-FIRST • CORE-CONFIG-COMPATIBLE • REQUEST-ID SAFE • STARTUP-HARDENED
-ORJSON-READY • PREEXISTING-ENGINE SAFE • ROUTE-VERIFY SAFE • DEBUG-HARDENED
+STRICT-JSON-READY • PREEXISTING-ENGINE SAFE • ROUTE-VERIFY SAFE • DEBUG-HARDENED
 V1-HEALTH-ALIAS SAFE • V1-META-ALIAS SAFE • HEAD-PROBE SAFE
 CONTROLLED-ROUTE-OWNERSHIP • PARTIAL-DUPLICATE-BLOCK SAFE • FILTERED-MOUNT SAFE
-ADVANCED-SHEET-ROWS OWNER FIXED
+ADVANCED-SHEET-ROWS OWNER FIXED • STRICT-JSON SAFE
 
-Why this revision (v8.0.0)
+Why this revision (v8.1.0)
 --------------------------
 - ✅ FIX: keeps controlled internal priority route mounting as the runtime source
         of truth for active route ownership.
@@ -27,6 +27,13 @@ Why this revision (v8.0.0)
         `/v1/advanced/sheet-rows` as the compatibility alias for root `/sheet-rows`.
 - ✅ FIX: startup verification now checks for the exact `/v1/advanced/sheet-rows`
         family in addition to root `/sheet-rows`.
+- ✅ FIX: replaces the app-wide default response serializer with a strict
+        JSON-safe renderer that normalizes NaN/Infinity, Decimal, datetime,
+        bytes, enums, UUIDs, sets, dataclasses, and model objects before
+        serialization.
+- ✅ FIX: avoids malformed-but-200 JSON bodies that were visible in live
+        diagnostics where raw prefixes looked correct but full-body parsing
+        failed client-side.
 - ✅ SAFE: preserves existing engine-init, OpenAPI, auth, middleware, and
         shutdown behavior.
 """
@@ -36,27 +43,152 @@ from __future__ import annotations
 import importlib
 import json
 import logging
+import math
 import os
 import sys
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from dataclasses import asdict, dataclass, is_dataclass
+from datetime import date, datetime, time as dt_time, timezone
+from decimal import Decimal
+from enum import Enum
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from fastapi import FastAPI, Request, Response
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 
-try:
-    from fastapi.responses import ORJSONResponse as _FastAPI_ORJSONResponse  # type: ignore
-except Exception:
-    _FastAPI_ORJSONResponse = JSONResponse  # type: ignore
+def _scrub_text(value: Any) -> str:
+    try:
+        s = value if isinstance(value, str) else str(value)
+    except Exception:
+        s = repr(value)
+    s = s.replace("\x00", "")
+    try:
+        s = s.encode("utf-8", "replace").decode("utf-8", "replace")
+    except Exception:
+        pass
+    return s
 
 
-APP_ENTRY_VERSION = "8.0.0"
+def _json_safe(value: Any, _seen: Optional[Set[int]] = None) -> Any:
+    if value is None or isinstance(value, (bool, int)):
+        return value
+
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+
+    if isinstance(value, str):
+        return _scrub_text(value)
+
+    if isinstance(value, Decimal):
+        try:
+            f = float(value)
+            return f if math.isfinite(f) else None
+        except Exception:
+            return _scrub_text(value)
+
+    if isinstance(value, (datetime, date, dt_time)):
+        try:
+            return value.isoformat()
+        except Exception:
+            return _scrub_text(value)
+
+    if isinstance(value, timezone):
+        return _scrub_text(value)
+
+    if isinstance(value, uuid.UUID):
+        return str(value)
+
+    if isinstance(value, Enum):
+        return _json_safe(value.value, _seen)
+
+    if isinstance(value, (bytes, bytearray, memoryview)):
+        try:
+            return bytes(value).decode("utf-8", "replace")
+        except Exception:
+            return _scrub_text(value)
+
+    if _seen is None:
+        _seen = set()
+
+    obj_id = id(value)
+    if obj_id in _seen:
+        return None
+
+    _seen.add(obj_id)
+    try:
+        if is_dataclass(value):
+            try:
+                return _json_safe(asdict(value), _seen)
+            except Exception:
+                return _scrub_text(value)
+
+        dump_fn = getattr(value, "model_dump", None)
+        if callable(dump_fn):
+            try:
+                return _json_safe(dump_fn(), _seen)
+            except Exception:
+                pass
+
+        dict_fn = getattr(value, "dict", None)
+        if callable(dict_fn):
+            try:
+                return _json_safe(dict_fn(), _seen)
+            except Exception:
+                pass
+
+        if isinstance(value, Mapping):
+            out: Dict[str, Any] = {}
+            for k, v in value.items():
+                out[_scrub_text(k)] = _json_safe(v, _seen)
+            return out
+
+        if isinstance(value, (list, tuple, set, frozenset)):
+            return [_json_safe(v, _seen) for v in value]
+
+        try:
+            encoded = jsonable_encoder(
+                value,
+                custom_encoder={
+                    Decimal: lambda v: (float(v) if math.isfinite(float(v)) else None),
+                    datetime: lambda v: v.isoformat(),
+                    date: lambda v: v.isoformat(),
+                    dt_time: lambda v: v.isoformat(),
+                    uuid.UUID: lambda v: str(v),
+                    bytes: lambda v: bytes(v).decode("utf-8", "replace"),
+                    bytearray: lambda v: bytes(v).decode("utf-8", "replace"),
+                    memoryview: lambda v: bytes(v).decode("utf-8", "replace"),
+                    Enum: lambda v: v.value,
+                },
+            )
+            if encoded is not value:
+                return _json_safe(encoded, _seen)
+        except Exception:
+            pass
+
+        return _scrub_text(value)
+    finally:
+        _seen.discard(obj_id)
+
+
+class _StrictJSONResponse(JSONResponse):
+    media_type = "application/json"
+
+    def render(self, content: Any) -> bytes:
+        safe_content = _json_safe(content)
+        return json.dumps(
+            safe_content,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+
+APP_ENTRY_VERSION = "8.1.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
@@ -1460,7 +1592,7 @@ def create_app() -> FastAPI:
         redoc_url=redoc_url,
         openapi_url=openapi_url,
         lifespan=lifespan,
-        default_response_class=_FastAPI_ORJSONResponse,  # type: ignore[arg-type]
+        default_response_class=_StrictJSONResponse,
     )
 
     _ensure_app_state_defaults(app)
@@ -1486,7 +1618,7 @@ def create_app() -> FastAPI:
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception):
         logger.error("Unhandled exception: %s", exc, exc_info=True)
-        return JSONResponse(
+        return _StrictJSONResponse(
             status_code=500,
             content={
                 "status": "error",
