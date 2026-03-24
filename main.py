@@ -2,7 +2,7 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v7.9.0)
+TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.0.0)
 ================================================================================
 ALIGNED • DEPLOYMENT-SAFE • PRE-MOUNT + STARTUP-VERIFY • ROUTER-SNAPSHOT-AWARE
 ENGINE-STATE-AWARE • OPENAPI-SAFE • RENDER-HEALTH-PROBE-SAFE • PRIORITY-MOUNTED
@@ -10,30 +10,23 @@ ROOT-CONFIG-FIRST • CORE-CONFIG-COMPATIBLE • REQUEST-ID SAFE • STARTUP-HAR
 ORJSON-READY • PREEXISTING-ENGINE SAFE • ROUTE-VERIFY SAFE • DEBUG-HARDENED
 V1-HEALTH-ALIAS SAFE • V1-META-ALIAS SAFE • HEAD-PROBE SAFE
 CONTROLLED-ROUTE-OWNERSHIP • PARTIAL-DUPLICATE-BLOCK SAFE • FILTERED-MOUNT SAFE
-SYNTAX-REPAIRED
+ADVANCED-SHEET-ROWS OWNER FIXED
 
-Why this revision (v7.9.0)
+Why this revision (v8.0.0)
 --------------------------
 - ✅ FIX: keeps controlled internal priority route mounting as the runtime source
         of truth for active route ownership.
-- ✅ FIX: ownership filtering now also protects earlier-mounted modules that were
-        still able to reclaim protected paths:
-        - routes.data_dictionary
-        - routes.analysis_sheet_rows
-- ✅ FIX: package-route mounting is now compatibility-checked before use, so an
-        outdated `routes/__init__.py` canonical owner map cannot silently take
-        over `/v1/schema*` or root `/sheet-rows`.
-- ✅ FIX: canonical ownership is enforced as:
-        - /v1/advisor/*           -> routes.advisor
-        - /v1/advanced/*          -> routes.investment_advisor
-        - /v1/schema/*, /schema/* -> routes.advanced_analysis
-        - /v1/analysis/*          -> routes.analysis_sheet_rows
-        - /v1/enriched*           -> routes.enriched_quote
-        - /sheet-rows             -> routes.advanced_analysis
-- ✅ FIX: enriched_quote legacy root `/sheet-rows` remains blocked here so it
-        cannot override the schema-driven root `/sheet-rows`.
-- ✅ FIX: startup verification now also checks that the canonical root
-        `/sheet-rows` endpoint is present.
+- ✅ FIX: ownership filtering continues to protect earlier-mounted modules that were
+        still able to reclaim protected paths.
+- ✅ FIX: explicit canonical carve-out added for `/v1/advanced/sheet-rows` so it is
+        owned by `routes.advanced_analysis`, matching the current root/schema-driven
+        sheet-rows design.
+- ✅ FIX: `routes.investment_advisor` is now blocked from reclaiming
+        `/v1/advanced/sheet-rows` while still owning the rest of `/v1/advanced/*`.
+- ✅ FIX: `routes.advanced_analysis` is now allowed to publish
+        `/v1/advanced/sheet-rows` as the compatibility alias for root `/sheet-rows`.
+- ✅ FIX: startup verification now checks for the exact `/v1/advanced/sheet-rows`
+        family in addition to root `/sheet-rows`.
 - ✅ SAFE: preserves existing engine-init, OpenAPI, auth, middleware, and
         shutdown behavior.
 """
@@ -63,15 +56,8 @@ except Exception:
     _FastAPI_ORJSONResponse = JSONResponse  # type: ignore
 
 
-# --------------------------------------------------------------------------------------
-# Version
-# --------------------------------------------------------------------------------------
-APP_ENTRY_VERSION = "7.9.0"
+APP_ENTRY_VERSION = "8.0.0"
 
-
-# --------------------------------------------------------------------------------------
-# Safe env helpers
-# --------------------------------------------------------------------------------------
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
 
@@ -95,7 +81,6 @@ _BUILTIN_META_PATHS = {
     "/openapi.json",
 }
 
-
 _CONTROLLED_PROTECTED_PREFIXES: Tuple[str, ...] = (
     "/v1/advisor",
     "/v1/advanced",
@@ -112,6 +97,7 @@ _CONTROLLED_PROTECTED_PREFIXES: Tuple[str, ...] = (
 
 _CONTROLLED_CANONICAL_OWNER_MAP: Dict[str, str] = {
     "/v1/advisor": "advisor",
+    "/v1/advanced/sheet-rows": "advanced_analysis",
     "/v1/advanced": "investment_advisor",
     "/v1/analysis": "analysis_sheet_rows",
     "/v1/schema": "advanced_analysis",
@@ -189,9 +175,6 @@ def _to_bool(value: Any, default: bool = False) -> bool:
     return default
 
 
-# --------------------------------------------------------------------------------------
-# Logging
-# --------------------------------------------------------------------------------------
 class _JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload = {
@@ -236,9 +219,6 @@ def _setup_logging() -> logging.Logger:
 logger = _setup_logging()
 
 
-# --------------------------------------------------------------------------------------
-# Settings bridge
-# --------------------------------------------------------------------------------------
 @dataclass(frozen=True)
 class _SettingsView:
     APP_NAME: str = "Tadawul Fast Bridge"
@@ -393,9 +373,6 @@ def _load_settings() -> _SettingsView:
 _SETTINGS = _load_settings()
 
 
-# --------------------------------------------------------------------------------------
-# Default state helpers
-# --------------------------------------------------------------------------------------
 def _default_routes_snapshot() -> Dict[str, Any]:
     return {
         "mounted": [],
@@ -448,9 +425,6 @@ def _ensure_app_state_defaults(app: FastAPI) -> None:
         app.state.startup_warnings = []
 
 
-# --------------------------------------------------------------------------------------
-# Auth helper for debug endpoints
-# --------------------------------------------------------------------------------------
 def _call_auth_ok_flexible(fn: Any, request: Request, token_value: str, authorization: str) -> bool:
     path = str(getattr(getattr(request, "url", None), "path", "") or "")
     headers_dict = dict(request.headers)
@@ -561,9 +535,6 @@ def _auth_ok(request: Request) -> bool:
     return False
 
 
-# --------------------------------------------------------------------------------------
-# Request ID middleware
-# --------------------------------------------------------------------------------------
 class RequestIDMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         request_id = request.headers.get("X-Request-ID", "").strip() or uuid.uuid4().hex[:12]
@@ -576,9 +547,6 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         return response
 
 
-# --------------------------------------------------------------------------------------
-# Router mounting helpers
-# --------------------------------------------------------------------------------------
 def _route_signature_pairs_from_route(route: Any) -> Set[Tuple[str, str]]:
     path = str(getattr(route, "path", "") or "")
     methods = getattr(route, "methods", None)
@@ -616,13 +584,6 @@ def _router_route_signature_set(router: Any) -> Set[Tuple[str, str]]:
     for r in getattr(router, "routes", []) or []:
         sigs.update(_route_signature_pairs_from_route(r))
     return sigs
-
-
-def _router_would_duplicate_existing(app: Any, router: Any) -> bool:
-    router_sigs = _router_route_signature_set(router)
-    if not router_sigs:
-        return False
-    return router_sigs.issubset(_app_route_signature_set(app))
 
 
 def _normalize_routes_snapshot(
@@ -816,6 +777,7 @@ def _package_mounter_compatibility(routes_pkg: Any) -> Tuple[bool, Dict[str, Any
     critical_prefixes = (
         "/v1/schema",
         "/schema",
+        "/v1/advanced/sheet-rows",
         "/v1/enriched",
         "/v1/enriched_quote",
         "/v1/enriched-quote",
@@ -847,7 +809,7 @@ def _package_mounter_compatibility(routes_pkg: Any) -> Tuple[bool, Dict[str, Any
 _MODULE_ROUTE_POLICIES: Dict[str, Dict[str, Sequence[str]]] = {
     "routes.data_dictionary": {
         "block_prefixes": ("/v1/schema", "/schema"),
-        "block_exact": ("/sheet-rows",),
+        "block_exact": ("/sheet-rows", "/v1/advanced/sheet-rows"),
     },
     "routes.analysis_sheet_rows": {
         "allow_prefixes": ("/v1/analysis",),
@@ -858,11 +820,13 @@ _MODULE_ROUTE_POLICIES: Dict[str, Dict[str, Sequence[str]]] = {
     "routes.investment_advisor": {
         "allow_prefixes": ("/v1/advanced", "/v1/investment_advisor", "/v1/investment-advisor"),
         "block_prefixes": ("/v1/advisor",),
+        "block_exact": ("/v1/advanced/sheet-rows",),
     },
     "routes.advanced_analysis": {
         "allow_prefixes": ("/v1/schema", "/schema"),
         "allow_exact": (
             "/sheet-rows",
+            "/v1/advanced/sheet-rows",
             "/v1/advanced/insights-analysis",
             "/v1/advanced/top10-investments",
             "/v1/advanced/insights-criteria",
@@ -871,12 +835,15 @@ _MODULE_ROUTE_POLICIES: Dict[str, Dict[str, Sequence[str]]] = {
     "routes.enriched_quote": {
         "allow_prefixes": ("/v1/enriched", "/v1/enriched_quote", "/v1/enriched-quote"),
         "allow_exact": ("/quote", "/quotes"),
-        "block_exact": ("/sheet-rows",),
+        "block_exact": ("/sheet-rows", "/v1/advanced/sheet-rows"),
     },
 }
 
 
 def _path_allowed_for_module(module_name: str, path: str) -> bool:
+    if path == "/v1/advanced/sheet-rows":
+        return module_name == "routes.advanced_analysis"
+
     policy = _MODULE_ROUTE_POLICIES.get(module_name)
     if not policy:
         return True
@@ -973,7 +940,7 @@ def _verify_required_route_families(app: FastAPI) -> List[str]:
 
     required_checks = {
         "advisor": lambda paths: any(p.startswith("/v1/advisor") for p in paths),
-        "advanced": lambda paths: any(p.startswith("/v1/advanced") for p in paths),
+        "advanced": lambda paths: "/v1/advanced/sheet-rows" in paths,
         "analysis": lambda paths: any(p.startswith("/v1/analysis") for p in paths),
         "schema": lambda paths: any(p.startswith("/v1/schema") or p.startswith("/schema") for p in paths),
         "enriched": lambda paths: any(
@@ -1240,9 +1207,6 @@ def _mount_routes_once(app: FastAPI, phase: str) -> Dict[str, Any]:
     return snap
 
 
-# --------------------------------------------------------------------------------------
-# Built-in endpoints
-# --------------------------------------------------------------------------------------
 def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
     snap: Dict[str, Any] = {}
     engine_obj: Any = None
@@ -1352,9 +1316,6 @@ def _install_builtin_routes(app: FastAPI) -> None:
     _add_status_route("/v1/healthz", "healthy")
 
 
-# --------------------------------------------------------------------------------------
-# Optional engine warm-up
-# --------------------------------------------------------------------------------------
 async def _maybe_init_engine(app: FastAPI) -> Optional[str]:
     if getattr(app.state, "engine", None) is not None:
         if not str(getattr(app.state, "engine_source", "") or "").strip():
@@ -1434,9 +1395,6 @@ async def _maybe_close_google_sheets_service() -> None:
             continue
 
 
-# --------------------------------------------------------------------------------------
-# App factory
-# --------------------------------------------------------------------------------------
 def create_app() -> FastAPI:
     docs_url = "/docs" if bool(_SETTINGS.ENABLE_SWAGGER) else None
     redoc_url = "/redoc" if bool(_SETTINGS.ENABLE_REDOC) else None
@@ -1582,7 +1540,4 @@ def create_app() -> FastAPI:
     return app
 
 
-# --------------------------------------------------------------------------------------
-# ASGI export
-# --------------------------------------------------------------------------------------
 app = create_app()
