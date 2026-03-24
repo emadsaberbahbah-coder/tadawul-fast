@@ -2,7 +2,7 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.1.0)
+TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.2.0)
 ================================================================================
 ALIGNED • DEPLOYMENT-SAFE • PRE-MOUNT + STARTUP-VERIFY • ROUTER-SNAPSHOT-AWARE
 ENGINE-STATE-AWARE • OPENAPI-SAFE • RENDER-HEALTH-PROBE-SAFE • PRIORITY-MOUNTED
@@ -10,32 +10,27 @@ ROOT-CONFIG-FIRST • CORE-CONFIG-COMPATIBLE • REQUEST-ID SAFE • STARTUP-HAR
 STRICT-JSON-READY • PREEXISTING-ENGINE SAFE • ROUTE-VERIFY SAFE • DEBUG-HARDENED
 V1-HEALTH-ALIAS SAFE • V1-META-ALIAS SAFE • HEAD-PROBE SAFE
 CONTROLLED-ROUTE-OWNERSHIP • PARTIAL-DUPLICATE-BLOCK SAFE • FILTERED-MOUNT SAFE
-ADVANCED-SHEET-ROWS OWNER FIXED • STRICT-JSON SAFE
+ADVANCED-SHEET-ROWS OWNER FIXED • STRICT-JSON SAFE • ADVISOR-FAMILY NORMALIZED
+HEALTH-COUNT DE-NOISED
 
-Why this revision (v8.1.0)
+Why this revision (v8.2.0)
 --------------------------
-- ✅ FIX: keeps controlled internal priority route mounting as the runtime source
-        of truth for active route ownership.
-- ✅ FIX: ownership filtering continues to protect earlier-mounted modules that were
-        still able to reclaim protected paths.
-- ✅ FIX: explicit canonical carve-out added for `/v1/advanced/sheet-rows` so it is
-        owned by `routes.advanced_analysis`, matching the current root/schema-driven
-        sheet-rows design.
-- ✅ FIX: `routes.investment_advisor` is now blocked from reclaiming
-        `/v1/advanced/sheet-rows` while still owning the rest of `/v1/advanced/*`.
-- ✅ FIX: `routes.advanced_analysis` is now allowed to publish
-        `/v1/advanced/sheet-rows` as the compatibility alias for root `/sheet-rows`.
-- ✅ FIX: startup verification now checks for the exact `/v1/advanced/sheet-rows`
-        family in addition to root `/sheet-rows`.
-- ✅ FIX: replaces the app-wide default response serializer with a strict
-        JSON-safe renderer that normalizes NaN/Infinity, Decimal, datetime,
-        bytes, enums, UUIDs, sets, dataclasses, and model objects before
-        serialization.
-- ✅ FIX: avoids malformed-but-200 JSON bodies that were visible in live
-        diagnostics where raw prefixes looked correct but full-body parsing
-        failed client-side.
-- ✅ SAFE: preserves existing engine-init, OpenAPI, auth, middleware, and
-        shutdown behavior.
+- ✅ FIX: health/startup validation now treats advisor routes as satisfied when
+        any of these families are present:
+        - /v1/advisor/*
+        - /v1/investment_advisor/*
+        - /v1/investment-advisor/*
+- ✅ FIX: controlled protected-prefix ownership now explicitly includes both
+        investment-advisor families, preventing accidental route reclamation.
+- ✅ FIX: compatibility checks now validate the investment-advisor families too.
+- ✅ FIX: `routes_failed_count` now reflects effective functional failures and
+        ignores optional/non-critical route modules that do not affect the live
+        API contract.
+- ✅ FIX: startup metadata now exposes advisor-family presence diagnostics,
+        making it easier to distinguish a real missing router from a naming
+        mismatch.
+- ✅ SAFE: preserves strict JSON rendering, route mounting behavior, engine init,
+        middleware, docs, auth, and shutdown behavior.
 """
 
 from __future__ import annotations
@@ -60,6 +55,7 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
+
 
 def _scrub_text(value: Any) -> str:
     try:
@@ -188,7 +184,7 @@ class _StrictJSONResponse(JSONResponse):
         ).encode("utf-8")
 
 
-APP_ENTRY_VERSION = "8.1.0"
+APP_ENTRY_VERSION = "8.2.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
@@ -215,6 +211,8 @@ _BUILTIN_META_PATHS = {
 
 _CONTROLLED_PROTECTED_PREFIXES: Tuple[str, ...] = (
     "/v1/advisor",
+    "/v1/investment_advisor",
+    "/v1/investment-advisor",
     "/v1/advanced",
     "/v1/analysis",
     "/v1/schema",
@@ -229,6 +227,8 @@ _CONTROLLED_PROTECTED_PREFIXES: Tuple[str, ...] = (
 
 _CONTROLLED_CANONICAL_OWNER_MAP: Dict[str, str] = {
     "/v1/advisor": "advisor",
+    "/v1/investment_advisor": "investment_advisor",
+    "/v1/investment-advisor": "investment_advisor",
     "/v1/advanced/sheet-rows": "advanced_analysis",
     "/v1/advanced": "investment_advisor",
     "/v1/analysis": "analysis_sheet_rows",
@@ -240,6 +240,14 @@ _CONTROLLED_CANONICAL_OWNER_MAP: Dict[str, str] = {
     "/quote": "enriched_quote",
     "/quotes": "enriched_quote",
     "/sheet-rows": "advanced_analysis",
+}
+
+_OPTIONAL_ROUTE_MODULES: Set[str] = {
+    "routes.config",
+    "routes.data_dictionary",
+    "routes.ai_analysis",
+    "routes.routes_argaam",
+    "routes.advisor",
 }
 
 
@@ -305,6 +313,10 @@ def _to_bool(value: Any, default: bool = False) -> bool:
     if s in _FALSY:
         return False
     return default
+
+
+def _paths_start_with_any(paths: Set[str], *prefixes: str) -> bool:
+    return any(any(path.startswith(prefix) for prefix in prefixes) for path in paths)
 
 
 class _JsonFormatter(logging.Formatter):
@@ -533,6 +545,9 @@ def _default_routes_snapshot() -> Dict[str, Any]:
         "canonical_owner_map": dict(_CONTROLLED_CANONICAL_OWNER_MAP),
         "openapi_route_count_after_mount": 0,
         "route_signature_count_after_mount": 0,
+        "route_family_presence": {},
+        "effective_failed_modules": [],
+        "optional_route_modules": sorted(list(_OPTIONAL_ROUTE_MODULES)),
     }
 
 
@@ -718,6 +733,41 @@ def _router_route_signature_set(router: Any) -> Set[Tuple[str, str]]:
     return sigs
 
 
+def _route_family_presence_from_paths(paths: Set[str]) -> Dict[str, bool]:
+    advisor_short = _paths_start_with_any(paths, "/v1/advisor")
+    advisor_long_underscore = _paths_start_with_any(paths, "/v1/investment_advisor")
+    advisor_long_hyphen = _paths_start_with_any(paths, "/v1/investment-advisor")
+
+    return {
+        "advisor_short": advisor_short,
+        "advisor_long_underscore": advisor_long_underscore,
+        "advisor_long_hyphen": advisor_long_hyphen,
+        "advisor_any": advisor_short or advisor_long_underscore or advisor_long_hyphen,
+        "advanced_sheet_rows": "/v1/advanced/sheet-rows" in paths,
+        "advanced_any": _paths_start_with_any(paths, "/v1/advanced"),
+        "analysis": _paths_start_with_any(paths, "/v1/analysis"),
+        "schema": _paths_start_with_any(paths, "/v1/schema", "/schema"),
+        "enriched": _paths_start_with_any(paths, "/v1/enriched", "/v1/enriched_quote", "/v1/enriched-quote"),
+        "root_sheet_rows": "/sheet-rows" in paths,
+        "root_health_alias": "/health" in paths and "/v1/health" in paths,
+        "root_meta_alias": "/meta" in paths and "/v1/meta" in paths,
+    }
+
+
+def _effective_failed_modules(src: Dict[str, Any]) -> List[str]:
+    import_errors = dict(src.get("import_errors", {}) or {})
+    mount_errors = dict(src.get("mount_errors", {}) or {})
+    no_router = dict(src.get("no_router", {}) or {})
+
+    failed: Set[str] = set()
+    for bucket in (import_errors, mount_errors, no_router):
+        for module_name in bucket.keys():
+            if module_name in _OPTIONAL_ROUTE_MODULES:
+                continue
+            failed.add(str(module_name))
+    return sorted(failed)
+
+
 def _normalize_routes_snapshot(
     ret: Any,
     *,
@@ -760,7 +810,6 @@ def _normalize_routes_snapshot(
     protected_prefixes = list(src.get("protected_prefixes", list(_CONTROLLED_PROTECTED_PREFIXES)) or list(_CONTROLLED_PROTECTED_PREFIXES))
     canonical_owner_map = dict(src.get("canonical_owner_map", dict(_CONTROLLED_CANONICAL_OWNER_MAP)) or dict(_CONTROLLED_CANONICAL_OWNER_MAP))
 
-    failed_count = len(import_errors) + len(mount_errors) + len(no_router)
     openapi_route_count_after_mount = int(
         src.get("openapi_route_count_after_mount", len(getattr(app, "routes", []) or []) if app is not None else 0) or 0
     )
@@ -770,6 +819,25 @@ def _normalize_routes_snapshot(
             _route_signature_count(app, include_builtin=True) if app is not None else 0,
         ) or 0
     )
+
+    all_paths: Set[str] = set()
+    if app is not None:
+        all_paths = {str(getattr(r, "path", "") or "") for r in (getattr(app, "routes", []) or [])}
+    route_family_presence = dict(src.get("route_family_presence", {}) or {})
+    if all_paths:
+        route_family_presence = _route_family_presence_from_paths(all_paths)
+
+    effective_failed_modules = list(src.get("effective_failed_modules", []) or [])
+    if import_errors or mount_errors or no_router:
+        effective_failed_modules = _effective_failed_modules(
+            {
+                "import_errors": import_errors,
+                "mount_errors": mount_errors,
+                "no_router": no_router,
+            }
+        )
+
+    failed_count = len(effective_failed_modules)
 
     return {
         "mounted": mounted,
@@ -798,6 +866,9 @@ def _normalize_routes_snapshot(
         "canonical_owner_map": canonical_owner_map,
         "openapi_route_count_after_mount": openapi_route_count_after_mount,
         "route_signature_count_after_mount": route_signature_count_after_mount,
+        "route_family_presence": route_family_presence,
+        "effective_failed_modules": effective_failed_modules,
+        "optional_route_modules": sorted(list(_OPTIONAL_ROUTE_MODULES)),
     }
 
 
@@ -838,13 +909,16 @@ def _merge_snapshots(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]
         "resolved_entries": _merge_list(old.get("resolved_entries"), new.get("resolved_entries")),
         "protected_prefixes": _merge_list(old.get("protected_prefixes"), new.get("protected_prefixes")),
         "canonical_owner_map": _merge_dict(old.get("canonical_owner_map"), new.get("canonical_owner_map")),
+        "route_family_presence": _merge_dict(old.get("route_family_presence"), new.get("route_family_presence")),
+        "effective_failed_modules": _merge_list(old.get("effective_failed_modules"), new.get("effective_failed_modules")),
+        "optional_route_modules": _merge_list(old.get("optional_route_modules"), new.get("optional_route_modules")),
     }
 
     merged["mounted_count"] = len(merged["mounted"])
     merged["duplicate_skips_count"] = len(merged["duplicate_skips"])
     merged["partial_duplicate_skips_count"] = len(merged["partial_duplicate_skips"])
     merged["missing_count"] = len(merged["missing"])
-    merged["failed_count"] = len(merged["import_errors"]) + len(merged["mount_errors"]) + len(merged["no_router"])
+    merged["failed_count"] = len(_effective_failed_modules(merged))
     merged["openapi_route_count_after_mount"] = int(
         new.get("openapi_route_count_after_mount", old.get("openapi_route_count_after_mount", 0)) or 0
     )
@@ -907,6 +981,9 @@ def _package_mounter_compatibility(routes_pkg: Any) -> Tuple[bool, Dict[str, Any
         protected_prefixes = []
 
     critical_prefixes = (
+        "/v1/advisor",
+        "/v1/investment_advisor",
+        "/v1/investment-advisor",
         "/v1/schema",
         "/schema",
         "/v1/advanced/sheet-rows",
@@ -1069,25 +1146,23 @@ def _build_controlled_mount_plan() -> List[str]:
 
 def _verify_required_route_families(app: FastAPI) -> List[str]:
     all_paths = {str(getattr(r, "path", "") or "") for r in (getattr(app, "routes", []) or [])}
+    presence = _route_family_presence_from_paths(all_paths)
 
     required_checks = {
-        "advisor": lambda paths: any(p.startswith("/v1/advisor") for p in paths),
-        "advanced": lambda paths: "/v1/advanced/sheet-rows" in paths,
-        "analysis": lambda paths: any(p.startswith("/v1/analysis") for p in paths),
-        "schema": lambda paths: any(p.startswith("/v1/schema") or p.startswith("/schema") for p in paths),
-        "enriched": lambda paths: any(
-            p.startswith("/v1/enriched") or p.startswith("/v1/enriched_quote") or p.startswith("/v1/enriched-quote")
-            for p in paths
-        ),
-        "root_sheet_rows": lambda paths: "/sheet-rows" in paths,
-        "root_health_alias": lambda paths: "/health" in paths and "/v1/health" in paths,
-        "root_meta_alias": lambda paths: "/meta" in paths and "/v1/meta" in paths,
+        "advisor": lambda p: bool(p.get("advisor_any", False)),
+        "advanced": lambda p: bool(p.get("advanced_sheet_rows", False)),
+        "analysis": lambda p: bool(p.get("analysis", False)),
+        "schema": lambda p: bool(p.get("schema", False)),
+        "enriched": lambda p: bool(p.get("enriched", False)),
+        "root_sheet_rows": lambda p: bool(p.get("root_sheet_rows", False)),
+        "root_health_alias": lambda p: bool(p.get("root_health_alias", False)),
+        "root_meta_alias": lambda p: bool(p.get("root_meta_alias", False)),
     }
 
     missing: List[str] = []
     for key, predicate in required_checks.items():
         try:
-            if not bool(predicate(all_paths)):
+            if not bool(predicate(presence)):
                 missing.append(key)
         except Exception:
             missing.append(key)
@@ -1187,6 +1262,16 @@ def _mount_routes_controlled(app: FastAPI) -> Dict[str, Any]:
                 raise
 
     missing_required_keys = _verify_required_route_families(app)
+    route_family_presence = _route_family_presence_from_paths(
+        {str(getattr(r, "path", "") or "") for r in (getattr(app, "routes", []) or [])}
+    )
+    effective_failed_modules = _effective_failed_modules(
+        {
+            "import_errors": import_errors,
+            "mount_errors": mount_errors,
+            "no_router": no_router,
+        }
+    )
 
     snap = {
         "mounted": mounted,
@@ -1209,6 +1294,9 @@ def _mount_routes_controlled(app: FastAPI) -> Dict[str, Any]:
         "missing_required_keys": missing_required_keys,
         "openapi_route_count_after_mount": len(getattr(app, "routes", []) or []),
         "route_signature_count_after_mount": _route_signature_count(app, include_builtin=True),
+        "route_family_presence": route_family_presence,
+        "effective_failed_modules": effective_failed_modules,
+        "optional_route_modules": sorted(list(_OPTIONAL_ROUTE_MODULES)),
     }
     _invalidate_openapi_cache(app)
     return snap
@@ -1238,6 +1326,12 @@ def _mount_routes(app: FastAPI) -> Dict[str, Any]:
                             snap["missing_required_keys"] = _verify_required_route_families(app)
                             snap["protected_prefixes"] = list(_CONTROLLED_PROTECTED_PREFIXES)
                             snap["canonical_owner_map"] = dict(_CONTROLLED_CANONICAL_OWNER_MAP)
+                            snap["route_family_presence"] = _route_family_presence_from_paths(
+                                {str(getattr(r, "path", "") or "") for r in (getattr(app, "routes", []) or [])}
+                            )
+                            snap["effective_failed_modules"] = _effective_failed_modules(snap)
+                            snap["failed_count"] = len(snap["effective_failed_modules"])
+                            snap["optional_route_modules"] = sorted(list(_OPTIONAL_ROUTE_MODULES))
                             snap["openapi_route_count_after_mount"] = len(getattr(app, "routes", []) or [])
                             snap["route_signature_count_after_mount"] = _route_signature_count(app, include_builtin=True)
                             _invalidate_openapi_cache(app)
@@ -1367,13 +1461,7 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
     mounted_count = int(snap.get("mounted_count", len(snap.get("mounted", []) or [])) or 0)
     duplicate_skips_count = int(snap.get("duplicate_skips_count", len(snap.get("duplicate_skips", []) or [])) or 0)
     partial_duplicate_skips_count = int(snap.get("partial_duplicate_skips_count", len(snap.get("partial_duplicate_skips", []) or [])) or 0)
-    failed_count = int(
-        snap.get(
-            "failed_count",
-            len(snap.get("import_errors", {}) or {}) + len(snap.get("mount_errors", {}) or {}) + len(snap.get("no_router", {}) or {}),
-        )
-        or 0
-    )
+    failed_count = int(snap.get("failed_count", len(snap.get("effective_failed_modules", []) or [])) or 0)
     strategy = str(snap.get("strategy", "") or "")
     route_signature_count = int(
         snap.get("route_signature_count_after_mount", _route_signature_count(app, include_builtin=True) if app is not None else 0) or 0
@@ -1396,6 +1484,8 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
         "routes_strategy": strategy,
         "route_signature_count": route_signature_count,
         "missing_required_keys": list(snap.get("missing_required_keys", []) or []),
+        "route_family_presence": dict(snap.get("route_family_presence", {}) or {}),
+        "effective_failed_modules": list(snap.get("effective_failed_modules", []) or []),
         "engine_present": engine_obj is not None,
         "engine_ready": engine_obj is not None and not engine_init_error,
         "engine_source": engine_source,
