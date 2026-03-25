@@ -3,34 +3,25 @@
 """
 core/enriched_quote.py
 ===============================================================================
-TFB Enriched Quote Core — v3.1.0
+TFB Enriched Quote Core — v3.2.0
 ===============================================================================
 CORE-ONLY • SCHEMA-FIRST • PAGE-CANONICAL • SPECIAL-PAGE SAFE • ENGINE-TOLERANT
 JSON-SAFE • SYNC/ASYNC SAFE • ROUTE-FRIENDLY • LIGHTWEIGHT • IMPORT-SAFE
 
-Purpose
--------
-Provide one reusable core builder for enriched quote / sheet-row payloads that:
-- route wrappers can call
-- tests can call
-- internal services can call
-
-Design principles
+Why this revision
 -----------------
-- No network calls at import time
-- No heavy HTTP/router duplication here
-- Canonical schema order first
-- Stable payload contract
-- Graceful degradation if engine / builder / schema pieces are partial
-
-Public APIs
------------
-- build_enriched_quote_payload(...)
-- get_enriched_quote_payload(...)
-- build_enriched_sheet_rows_payload(...)
-- enriched_quote(...)
-- quote(...)
-- build_enriched_quote_payload_sync(...)
+- FIX: defines rows->matrix conversion used by the response envelope.
+- FIX: adds engine auto-resolution from request/app state and tolerant module
+  factories / singletons when the caller does not pass an engine explicitly.
+- FIX: preserves known-page contracts even when schema_registry is unavailable by
+  falling back to canonical contracts from core.data_engine_v2 when available.
+- FIX: special pages use builder-first execution, then engine sheet-row fallback,
+  while remaining schema-safe for Top10 / Insights / Data Dictionary.
+- FIX: instrument symbol requests can recover through sheet-row execution if
+  quote methods are unavailable or return sparse payloads.
+- FIX: normalizes rows from dicts, matrices, dataclasses, pydantic models, and
+  mixed envelopes more consistently.
+- SAFE: no network calls at import time, no route publishing here.
 """
 
 from __future__ import annotations
@@ -41,12 +32,15 @@ import importlib
 import inspect
 import logging
 import math
+import time
+from dataclasses import asdict, is_dataclass
 from decimal import Decimal
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 logger = logging.getLogger("core.enriched_quote")
+logger.addHandler(logging.NullHandler())
 
-MODULE_VERSION = "3.1.0"
+MODULE_VERSION = "3.2.0"
 
 # -----------------------------------------------------------------------------
 # Canonical page groups
@@ -97,7 +91,7 @@ _PAGE_ALIASES = {
 }
 
 # -----------------------------------------------------------------------------
-# Engine method candidates
+# Engine / service method candidates
 # -----------------------------------------------------------------------------
 _BATCH_QUOTE_METHODS = (
     "get_enriched_quotes_batch",
@@ -132,6 +126,33 @@ _SNAPSHOT_METHODS = (
     "get_cached_sheet_rows",
 )
 
+_ENGINE_ATTR_CANDIDATES = (
+    "engine",
+    "data_engine",
+    "data_engine_v2",
+    "tfb_engine",
+)
+
+_ENGINE_MODULE_CANDIDATES = (
+    "core.data_engine_v2",
+    "core.data_engine",
+)
+
+_ENGINE_FACTORY_NAMES = (
+    "get_engine",
+    "get_data_engine",
+    "build_engine",
+    "create_engine",
+    "get_or_create_engine",
+)
+
+_ENGINE_SINGLETON_NAMES = (
+    "engine",
+    "data_engine",
+    "ENGINE",
+    "DATA_ENGINE",
+)
+
 # -----------------------------------------------------------------------------
 # Optional page catalog / schema registry
 # -----------------------------------------------------------------------------
@@ -141,10 +162,7 @@ try:
         is_instrument_page as _catalog_is_instrument_page,
         normalize_page_name as _catalog_normalize_page_name,
     )
-    _HAS_PAGE_CATALOG = True
 except Exception:
-    _HAS_PAGE_CATALOG = False
-
     def _catalog_normalize_page_name(name: str, allow_output_pages: bool = True) -> str:
         return str(name or "").strip()
 
@@ -162,12 +180,236 @@ except Exception:
 
 try:
     from core.sheets.schema_registry import get_sheet_spec as _get_sheet_spec  # type: ignore
-    _HAS_SCHEMA = True
 except Exception:
-    _HAS_SCHEMA = False
-
     def _get_sheet_spec(sheet_name: str) -> Any:
         raise KeyError("schema_registry unavailable")
+
+
+# -----------------------------------------------------------------------------
+# Canonical contract fallbacks
+# -----------------------------------------------------------------------------
+def _title_header(key: str) -> str:
+    txt = str(key or "").replace("_", " ").strip()
+    if not txt:
+        return ""
+    words = []
+    for part in txt.split():
+        up = part.upper()
+        if up in {"TTM", "ROI", "RSI14", "EPS", "EV", "P", "W", "D", "Y", "FX", "UTC"}:
+            words.append(up)
+        elif part.lower() in {"m", "d", "w", "y"}:
+            words.append(part.upper())
+        else:
+            words.append(part.capitalize())
+    return " ".join(words)
+
+
+_FALLBACK_INSTRUMENT_KEYS: List[str] = [
+    "symbol",
+    "name",
+    "asset_class",
+    "exchange",
+    "currency",
+    "country",
+    "sector",
+    "industry",
+    "current_price",
+    "previous_close",
+    "open_price",
+    "day_high",
+    "day_low",
+    "high_52w",
+    "low_52w",
+    "price_change",
+    "percent_change",
+    "position_52w_pct",
+    "volume",
+    "avg_volume_10d",
+    "avg_volume_30d",
+    "market_cap",
+    "float_shares",
+    "beta_5y",
+    "pe_ttm",
+    "pe_forward",
+    "eps_ttm",
+    "dividend_yield",
+    "payout_ratio",
+    "revenue_ttm",
+    "revenue_growth_yoy",
+    "gross_margin",
+    "operating_margin",
+    "profit_margin",
+    "debt_to_equity",
+    "free_cash_flow_ttm",
+    "rsi_14",
+    "volatility_30d",
+    "volatility_90d",
+    "max_drawdown_1y",
+    "var_95_1d",
+    "sharpe_1y",
+    "risk_score",
+    "risk_bucket",
+    "pb_ratio",
+    "ps_ratio",
+    "ev_ebitda",
+    "peg_ratio",
+    "intrinsic_value",
+    "valuation_score",
+    "forecast_price_1m",
+    "expected_roi_1m",
+    "forecast_price_3m",
+    "expected_roi_3m",
+    "forecast_price_12m",
+    "expected_roi_12m",
+    "forecast_confidence",
+    "analyst_target_price",
+    "analyst_upside_pct",
+    "recommendation",
+    "value_score",
+    "quality_score",
+    "momentum_score",
+    "growth_score",
+    "overall_score",
+    "opportunity_score",
+    "rank_overall",
+    "confidence_bucket",
+    "source",
+    "as_of_utc",
+    "last_updated_riyadh",
+    "notes",
+    "primary_provider",
+    "classification_source",
+    "history_source",
+    "fundamentals_source",
+    "forecast_source",
+    "source_page",
+    "row_status",
+    "degraded",
+]
+
+_FALLBACK_TOP10_EXTRA_KEYS = [
+    "top10_rank",
+    "selection_reason",
+    "criteria_snapshot",
+]
+
+_FALLBACK_INSIGHTS_KEYS = [
+    "section",
+    "item",
+    "metric",
+    "value",
+    "notes",
+    "priority",
+    "as_of_utc",
+]
+
+_FALLBACK_DATA_DICTIONARY_KEYS = [
+    "sheet",
+    "group",
+    "header",
+    "key",
+    "dtype",
+    "fmt",
+    "required",
+    "source",
+    "notes",
+]
+
+
+def _contract_from_keys(keys: Sequence[str]) -> Tuple[List[str], List[str], List[str], List[Dict[str, Any]]]:
+    keys_list = [str(k) for k in keys if _strip(k)]
+    headers = [_title_header(k) or k for k in keys_list]
+    columns = [
+        {
+            "group": None,
+            "header": headers[idx],
+            "key": key,
+            "dtype": None,
+            "fmt": None,
+            "required": False,
+            "source": None,
+            "notes": None,
+        }
+        for idx, key in enumerate(keys_list)
+    ]
+    return headers, keys_list, list(headers), columns
+
+
+def _canonical_contract_fallback(page: str) -> Tuple[List[str], List[str], List[str], List[Dict[str, Any]]]:
+    # Prefer contracts from data_engine_v2 if available.
+    for module_name in ("core.data_engine_v2", "core.data_engine"):
+        try:
+            mod = importlib.import_module(module_name)
+        except Exception:
+            continue
+
+        contracts = getattr(mod, "STATIC_CANONICAL_SHEET_CONTRACTS", None)
+        if isinstance(contracts, Mapping) and page in contracts:
+            entry = contracts.get(page) or {}
+            headers = [str(x) for x in _as_list(entry.get("headers")) if _strip(x)]
+            keys = [str(x) for x in _as_list(entry.get("keys")) if _strip(x)]
+            if keys:
+                display_headers = headers or [_title_header(k) or k for k in keys]
+                columns = [
+                    {
+                        "group": None,
+                        "header": display_headers[idx] if idx < len(display_headers) else (_title_header(key) or key),
+                        "key": key,
+                        "dtype": None,
+                        "fmt": None,
+                        "required": False,
+                        "source": "static_canonical_contract",
+                        "notes": None,
+                    }
+                    for idx, key in enumerate(keys)
+                ]
+                return headers or display_headers, keys, display_headers, columns
+
+        if page in INSTRUMENT_PAGES:
+            headers = [str(x) for x in _as_list(getattr(mod, "INSTRUMENT_CANONICAL_HEADERS", [])) if _strip(x)]
+            keys = [str(x) for x in _as_list(getattr(mod, "INSTRUMENT_CANONICAL_KEYS", [])) if _strip(x)]
+            if keys:
+                display_headers = headers or [_title_header(k) or k for k in keys]
+                columns = [
+                    {
+                        "group": None,
+                        "header": display_headers[idx] if idx < len(display_headers) else (_title_header(key) or key),
+                        "key": key,
+                        "dtype": None,
+                        "fmt": None,
+                        "required": False,
+                        "source": "instrument_canonical_contract",
+                        "notes": None,
+                    }
+                    for idx, key in enumerate(keys)
+                ]
+                return headers or display_headers, keys, display_headers, columns
+
+    if page == "Top_10_Investments":
+        return _contract_from_keys(_FALLBACK_INSTRUMENT_KEYS + _FALLBACK_TOP10_EXTRA_KEYS)
+    if page == "Insights_Analysis":
+        return _contract_from_keys(_FALLBACK_INSIGHTS_KEYS)
+    if page == "Data_Dictionary":
+        headers = ["Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes"]
+        keys = list(_FALLBACK_DATA_DICTIONARY_KEYS)
+        columns = [
+            {
+                "group": None,
+                "header": headers[idx],
+                "key": key,
+                "dtype": None,
+                "fmt": None,
+                "required": False,
+                "source": "fallback_data_dictionary_contract",
+                "notes": None,
+            }
+            for idx, key in enumerate(keys)
+        ]
+        return headers, keys, list(headers), columns
+    if page in INSTRUMENT_PAGES:
+        return _contract_from_keys(_FALLBACK_INSTRUMENT_KEYS)
+    return _contract_from_keys(["status", "error"])
+
 
 # -----------------------------------------------------------------------------
 # Small helpers
@@ -177,7 +419,7 @@ def _strip(value: Any) -> str:
         return ""
     try:
         s = str(value).strip()
-        return "" if s.lower() == "none" else s
+        return "" if s.lower() in {"none", "null", "nil"} else s
     except Exception:
         return ""
 
@@ -208,13 +450,26 @@ def _clean_mode(mode: Any) -> str:
     m = _strip(mode).lower()
     if not m:
         return ""
+    if m in {"auto"}:
+        return "auto"
     if m in {"live", "live_quotes", "quotes"}:
         return "live_quotes"
-    if m in {"sheet", "live_sheet"}:
+    if m in {"sheet", "live_sheet", "rows", "sheet_rows"}:
         return "live_sheet"
     if m in {"snapshot", "snapshots"}:
         return "snapshot"
     return m
+
+
+def _infer_mode(page: str, symbols: Sequence[str], requested_mode: str) -> str:
+    mode = _clean_mode(requested_mode)
+    if mode and mode != "auto":
+        return mode
+    if page in SPECIAL_PAGES:
+        return "live_sheet"
+    if symbols:
+        return "live_quotes"
+    return "live_sheet"
 
 
 def _json_safe(value: Any) -> Any:
@@ -241,6 +496,12 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (_dt.datetime, _dt.date, _dt.time)):
         try:
             return value.isoformat()
+        except Exception:
+            return str(value)
+
+    if is_dataclass(value):
+        try:
+            return _json_safe(asdict(value))
         except Exception:
             return str(value)
 
@@ -282,6 +543,12 @@ def _as_dict(value: Any) -> Dict[str, Any]:
     if isinstance(value, Mapping):
         try:
             return dict(value)
+        except Exception:
+            return {}
+    if is_dataclass(value):
+        try:
+            dumped = asdict(value)
+            return dumped if isinstance(dumped, dict) else {}
         except Exception:
             return {}
     try:
@@ -346,7 +613,8 @@ def _request_id(request: Any, explicit: Optional[str] = None) -> str:
         return _strip(explicit)
     try:
         if request is not None:
-            hdr = _strip(getattr(request, "headers", {}).get("X-Request-ID"))
+            headers = getattr(request, "headers", {}) or {}
+            hdr = _strip(headers.get("X-Request-ID"))
             if hdr:
                 return hdr
             st = getattr(request, "state", None)
@@ -511,6 +779,17 @@ def _is_instrument_page(page: str) -> bool:
         return page in INSTRUMENT_PAGES
 
 
+def _rows_to_matrix(rows: Sequence[Mapping[str, Any]], keys: Sequence[str]) -> List[List[Any]]:
+    key_list = [str(k) for k in keys if _strip(k)]
+    if not key_list:
+        return []
+    out: List[List[Any]] = []
+    for row in rows:
+        rowd = dict(row or {})
+        out.append([_json_safe(rowd.get(k)) for k in key_list])
+    return out
+
+
 def _page_schema(page: str) -> Tuple[List[str], List[str], List[str], List[Dict[str, Any]]]:
     headers: List[str] = []
     keys: List[str] = []
@@ -523,7 +802,7 @@ def _page_schema(page: str) -> Tuple[List[str], List[str], List[str], List[Dict[
         spec = None
 
     if spec is None:
-        return headers, keys, display_headers, columns
+        return _canonical_contract_fallback(page)
 
     cols = getattr(spec, "columns", None)
     if cols is None and isinstance(spec, Mapping):
@@ -553,12 +832,10 @@ def _page_schema(page: str) -> Tuple[List[str], List[str], List[str], List[Dict[
             )
         )
 
-    if page == "Data_Dictionary" and not keys:
-        keys = ["sheet", "group", "header", "key", "dtype", "fmt", "required", "source", "notes"]
-        headers = ["Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes"]
-        display_headers = list(headers)
+    if not keys:
+        return _canonical_contract_fallback(page)
 
-    return headers, keys, display_headers, columns
+    return headers, keys, display_headers or headers, columns
 
 
 def _row_from_any(value: Any) -> Optional[Dict[str, Any]]:
@@ -583,7 +860,7 @@ def _extract_rows_like(payload: Any) -> List[Dict[str, Any]]:
         return rows
 
     if isinstance(payload, Mapping):
-        for key in ("rows", "data", "items", "results", "records", "quotes"):
+        for key in ("row_objects", "records", "items", "rows", "data", "results", "quotes"):
             value = payload.get(key)
             if isinstance(value, list):
                 rows = []
@@ -617,7 +894,7 @@ def _extract_matrix_like(payload: Any) -> Optional[List[List[Any]]]:
     if not isinstance(payload, Mapping):
         return None
 
-    for key in ("rows_matrix",):
+    for key in ("rows_matrix", "matrix"):
         value = payload.get(key)
         if isinstance(value, list):
             return [list(r) if isinstance(r, (list, tuple)) else [r] for r in value]
@@ -638,10 +915,11 @@ def _extract_matrix_like(payload: Any) -> Optional[List[List[Any]]]:
 
 def _matrix_to_rows(matrix: Sequence[Sequence[Any]], keys: Sequence[str]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
+    key_list = [str(k) for k in keys]
     for row in matrix:
         vals = list(row) if isinstance(row, (list, tuple)) else [row]
         item: Dict[str, Any] = {}
-        for idx, key in enumerate(keys):
+        for idx, key in enumerate(key_list):
             item[key] = vals[idx] if idx < len(vals) else None
         rows.append(item)
     return rows
@@ -651,7 +929,10 @@ def _looks_like_row(value: Any) -> bool:
     if not isinstance(value, Mapping):
         return False
     keys = {str(k).lower() for k in value.keys()}
-    return bool(keys & {"symbol", "ticker", "name", "current_price", "company_name"})
+    return bool(keys & {
+        "symbol", "ticker", "name", "company_name", "current_price",
+        "section", "metric", "header", "key"
+    })
 
 
 def _payload_meta(payload: Any) -> Dict[str, Any]:
@@ -663,7 +944,7 @@ def _payload_meta(payload: Any) -> Dict[str, Any]:
 
 def _payload_status(payload: Any) -> str:
     if not isinstance(payload, Mapping):
-        return "success"
+        return "success" if payload is not None else "partial"
     return _strip(payload.get("status")) or "success"
 
 
@@ -795,6 +1076,11 @@ def _row_richness(row: Optional[Dict[str, Any]]) -> int:
         "opportunity_score",
         "recommendation",
         "recommendation_reason",
+        "selection_reason",
+        "metric",
+        "value",
+        "header",
+        "key",
     )
     score = 0
     for key in important:
@@ -834,7 +1120,7 @@ def _schema_projection(row: Mapping[str, Any], keys: Sequence[str]) -> Dict[str,
     return out
 
 
-def _normalize_rows(rows: Sequence[Mapping[str, Any]], keys: Sequence[str]) -> List[Dict[str, Any]]:
+def _normalize_rows(rows: Sequence[Mapping[str, Any]], keys: Sequence[str], page: str) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     for row in rows:
         rd = dict(row or {})
@@ -842,8 +1128,90 @@ def _normalize_rows(rows: Sequence[Mapping[str, Any]], keys: Sequence[str]) -> L
             rd["symbol"] = rd.get("ticker")
         if "ticker" not in rd and "symbol" in rd:
             rd["ticker"] = rd.get("symbol")
+
+        if page == "Top_10_Investments":
+            if rd.get("top10_rank") is None and rd.get("rank_overall") is not None:
+                rd["top10_rank"] = rd.get("rank_overall")
+            if rd.get("selection_reason") in {None, ""}:
+                reco = _strip(rd.get("recommendation"))
+                roi = rd.get("expected_roi_3m")
+                conf = rd.get("forecast_confidence")
+                if reco or roi is not None or conf is not None:
+                    rd["selection_reason"] = (
+                        f"{reco or 'Candidate'} | ROI 3M={roi if roi is not None else 'NA'} | "
+                        f"Confidence={conf if conf is not None else 'NA'}"
+                    )
+            if rd.get("criteria_snapshot") in {None, ""}:
+                rd["criteria_snapshot"] = None
+
         out.append(_schema_projection(rd, keys))
     return out
+
+
+def _safe_status(status: Any, rows: Sequence[Mapping[str, Any]], headers: Sequence[str], error: Optional[str], warnings: Sequence[str]) -> str:
+    st = _strip(status).lower()
+    if st in {"success", "ok"}:
+        return "success"
+    if st in {"error", "failed", "fail"}:
+        return "error"
+    if rows or headers:
+        return "partial" if error or warnings else "success"
+    return "error" if error else "partial"
+
+
+def _resolve_app_state_engine(request: Any) -> Any:
+    try:
+        app = getattr(request, "app", None)
+        state = getattr(app, "state", None)
+        if state is None:
+            return None
+        for name in _ENGINE_ATTR_CANDIDATES:
+            obj = getattr(state, name, None)
+            if obj is not None:
+                return obj
+    except Exception:
+        return None
+    return None
+
+
+async def _resolve_engine(engine: Any, request: Any = None) -> Any:
+    if engine is not None:
+        return engine
+
+    app_engine = _resolve_app_state_engine(request)
+    if app_engine is not None:
+        return app_engine
+
+    for module_name in _ENGINE_MODULE_CANDIDATES:
+        try:
+            mod = importlib.import_module(module_name)
+        except Exception:
+            continue
+
+        for name in _ENGINE_SINGLETON_NAMES:
+            obj = getattr(mod, name, None)
+            if obj is not None:
+                return obj
+
+        for name in _ENGINE_FACTORY_NAMES:
+            fn = getattr(mod, name, None)
+            if not callable(fn):
+                continue
+            try:
+                result = await _call_variants(
+                    fn,
+                    [
+                        {"request": request},
+                        {},
+                    ],
+                    timeout_sec=DEFAULT_TIMEOUT_SEC,
+                )
+                if result is not None:
+                    return result
+            except Exception:
+                continue
+
+    return None
 
 
 async def _call_special_builder(
@@ -861,18 +1229,20 @@ async def _call_special_builder(
     criteria = merged_body.get("criteria") if isinstance(merged_body.get("criteria"), dict) else None
 
     def _variants() -> List[Dict[str, Any]]:
+        base = {
+            "engine": engine,
+            "request": request,
+            "settings": settings,
+            "body": merged_body,
+            "criteria": criteria,
+            "page": page,
+            "sheet": page,
+            "mode": mode,
+            "limit": limit,
+        }
         return [
-            {
-                "engine": engine,
-                "request": request,
-                "settings": settings,
-                "body": merged_body,
-                "criteria": criteria,
-                "page": page,
-                "sheet": page,
-                "mode": mode,
-                "limit": limit,
-            },
+            {**base},
+            {**base, "payload": merged_body},
             {
                 "request": request,
                 "settings": settings,
@@ -912,6 +1282,16 @@ async def _call_special_builder(
                 "select_top10",
                 "select_top10_symbols",
             )),
+            ("core.investment_advisor_engine", (
+                "run_investment_advisor_engine",
+                "run_advisor_engine",
+            )),
+            ("core.investment_advisor", (
+                "run_investment_advisor",
+                "run_advisor",
+                "_run_investment_advisor_impl",
+                "_run_advisor_impl",
+            )),
         ]
     elif page == "Insights_Analysis":
         candidates = [
@@ -920,6 +1300,10 @@ async def _call_special_builder(
                 "build_insights_rows",
                 "build_insights_output_rows",
                 "build_insights_analysis",
+            )),
+            ("core.investment_advisor_engine", (
+                "run_investment_advisor_engine",
+                "run_advisor_engine",
             )),
         ]
     elif page == "Data_Dictionary":
@@ -942,61 +1326,64 @@ async def _call_special_builder(
             if not callable(fn):
                 continue
             try:
-                return await _call_variants(fn, _variants(), timeout_sec=timeout_sec)
+                result = await _call_variants(fn, _variants(), timeout_sec=timeout_sec)
             except Exception as exc:
                 logger.warning("Special builder %s.%s failed: %s", module_name, fn_name, exc)
                 continue
 
+            if result is not None:
+                return result
+
     if page == "Data_Dictionary":
         dd_rows = _build_data_dictionary_from_schema()
         if dd_rows:
-            return {"status": "success", "rows": dd_rows}
+            return {"status": "success", "rows": dd_rows, "meta": {"dispatch": "schema_fallback"}}
 
     return None
 
 
 def _build_data_dictionary_from_schema() -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
-    module_candidates = ("core.sheets.schema_registry", "core.schema_registry")
-    registry: Optional[Mapping[str, Any]] = None
+    page_names = list(INSTRUMENT_PAGES) + ["Top_10_Investments", "Insights_Analysis", "Data_Dictionary"]
+    seen = set()
 
-    for module_name in module_candidates:
-        try:
-            mod = importlib.import_module(module_name)
-        except Exception:
+    for sheet_name in page_names:
+        if sheet_name in seen:
             continue
-        registry = getattr(mod, "SCHEMA_REGISTRY", None) or getattr(mod, "SHEET_SCHEMAS", None)
-        if isinstance(registry, Mapping):
-            break
-
-    if not isinstance(registry, Mapping):
-        return rows
-
-    for sheet_name, raw in registry.items():
+        seen.add(sheet_name)
         headers, keys, _, columns = _page_schema(str(sheet_name))
         if columns:
             for col in columns:
-                row = dict(col)
-                row["sheet"] = str(sheet_name)
-                rows.append(row)
-            continue
-
-        if headers and keys:
-            for idx, (header, key) in enumerate(zip(headers, keys), start=1):
                 rows.append(
                     {
                         "sheet": str(sheet_name),
-                        "group": None,
-                        "header": header,
-                        "key": key,
-                        "dtype": None,
-                        "fmt": None,
-                        "required": False,
-                        "source": None,
-                        "notes": None,
-                        "column_order": idx,
+                        "group": col.get("group"),
+                        "header": col.get("header"),
+                        "key": col.get("key"),
+                        "dtype": col.get("dtype"),
+                        "fmt": col.get("fmt"),
+                        "required": col.get("required"),
+                        "source": col.get("source"),
+                        "notes": col.get("notes"),
                     }
                 )
+            continue
+
+        for idx, key in enumerate(keys):
+            header = headers[idx] if idx < len(headers) else (_title_header(key) or key)
+            rows.append(
+                {
+                    "sheet": str(sheet_name),
+                    "group": None,
+                    "header": header,
+                    "key": key,
+                    "dtype": None,
+                    "fmt": None,
+                    "required": False,
+                    "source": "schema_fallback",
+                    "notes": None,
+                }
+            )
     return rows
 
 
@@ -1048,12 +1435,13 @@ async def _engine_sheet_rows(
                 rows = _matrix_to_rows(matrix, keys)
 
         meta = _payload_meta(payload)
+        meta.setdefault("dispatch", f"engine.{method_name}")
         status = _payload_status(payload)
         error = _payload_error(payload)
         if rows or isinstance(payload, Mapping):
             return rows, meta, status, error
 
-    return [], {}, "partial", "no_sheet_rows_returned"
+    return [], {"dispatch": "engine.sheet_rows_missing"}, "partial", "no_sheet_rows_returned"
 
 
 async def _engine_quotes(
@@ -1069,10 +1457,10 @@ async def _engine_quotes(
     timeout_sec: float,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any], str, Optional[str]]:
     if engine is None:
-        return [], {}, "partial", "engine_unavailable"
+        return [], {"dispatch": "engine.missing"}, "partial", "engine_unavailable"
 
     if not symbols:
-        return [], {}, "success", None
+        return [], {"dispatch": "quotes.no_symbols"}, "success", None
 
     variants = _method_variants(
         page=page,
@@ -1116,6 +1504,7 @@ async def _engine_quotes(
             continue
 
         meta = _merge_payload_dicts(meta, _payload_meta(payload))
+        meta.setdefault("dispatch", f"engine.{method_name}")
         status = _payload_status(payload) or status
         error = _payload_error(payload) or error
 
@@ -1129,7 +1518,6 @@ async def _engine_quotes(
                     if sym:
                         _put(sym, row)
             else:
-                # maybe symbol map
                 for k, v in payload.items():
                     if isinstance(v, Mapping):
                         rd = dict(v)
@@ -1146,7 +1534,7 @@ async def _engine_quotes(
                 if sym:
                     _put(sym, row)
 
-        if any(_get(sym) for sym in symbols):
+        if all(_get(sym) and not _is_sparse_row(_get(sym)) for sym in symbols):
             break
 
     # Rehydrate sparse / missing rows with single methods
@@ -1187,10 +1575,7 @@ async def _engine_quotes(
         out_rows.append(row)
 
     if any(_strip(r.get("error")) for r in out_rows):
-        if all(_strip(r.get("error")) for r in out_rows):
-            status = "error"
-        else:
-            status = "partial"
+        status = "error" if all(_strip(r.get("error")) for r in out_rows) else "partial"
 
     return out_rows, meta, status, error
 
@@ -1226,12 +1611,9 @@ def _derive_headers_keys(
                 derived_keys.append(ks)
 
     if not derived_keys:
-        if page in SPECIAL_PAGES:
-            derived_keys = ["status", "error"]
-        else:
-            derived_keys = ["symbol", "ticker", "current_price"]
+        return _canonical_contract_fallback(page)
 
-    derived_headers = list(derived_keys)
+    derived_headers = [_title_header(k) or k for k in derived_keys]
     return derived_headers, derived_keys, list(derived_headers), []
 
 
@@ -1268,7 +1650,9 @@ def _envelope(
         "rows": rows_out,
         "rows_matrix": _rows_to_matrix(rows_out, keys) if include_matrix and keys else None,
         "data": rows_out,
+        "items": rows_out,
         "quotes": rows_out,
+        "count": len(rows_out),
         "error": error,
         "version": MODULE_VERSION,
         "request_id": request_id,
@@ -1278,9 +1662,7 @@ def _envelope(
             "module_version": MODULE_VERSION,
             "mode": mode,
             "count": len(rows_out),
-            "duration_ms": round((asyncio.get_event_loop().time() - started_at) * 1000.0, 3)
-            if started_at is not None
-            else None,
+            "duration_ms": round((time.perf_counter() - started_at) * 1000.0, 3) if started_at is not None else None,
             **(meta_extra or {}),
         },
     }
@@ -1312,7 +1694,7 @@ async def build_enriched_quote_payload(
     request_id: Optional[str] = None,
     **extra: Any,
 ) -> Dict[str, Any]:
-    started_at = asyncio.get_event_loop().time()
+    started_at = time.perf_counter()
 
     request_query = _extract_request_query(request)
     request_path = _extract_request_path_params(request)
@@ -1334,7 +1716,6 @@ async def build_enriched_quote_payload(
     route_family = _route_family(page_norm)
 
     req_id = _request_id(request, request_id)
-    mode_out = _clean_mode(mode or merged.get("mode"))
     limit_out = max(1, min(5000, int(limit) if isinstance(limit, int) and limit > 0 else _to_int(merged.get("limit"), DEFAULT_LIMIT)))
     schema_only_out = bool(schema_only) if isinstance(schema_only, bool) else _truthy(merged.get("schema_only"), False)
     headers_only_out = bool(headers_only) if isinstance(headers_only, bool) else _truthy(merged.get("headers_only"), False)
@@ -1342,6 +1723,7 @@ async def build_enriched_quote_payload(
     table_mode_out = bool(table_mode) if isinstance(table_mode, bool) else _truthy(merged.get("table_mode"), False)
 
     resolved_symbols = _extract_symbols(body_dict, request_query, request_path, extra_dict, explicit_symbol=symbol, explicit_symbols=symbols)
+    mode_out = _infer_mode(page_norm, resolved_symbols, mode or merged.get("mode"))
 
     warnings: List[str] = []
     rows: List[Dict[str, Any]] = []
@@ -1349,12 +1731,12 @@ async def build_enriched_quote_payload(
     status_out = "success"
     error_out: Optional[str] = None
 
+    engine_obj = await _resolve_engine(engine, request)
+
     # Special pages first
     if page_norm in SPECIAL_PAGES:
         if schema_only_out or headers_only_out:
             headers, keys, display_headers, columns = _page_schema(page_norm)
-            if not keys:
-                headers, keys, display_headers, columns = _derive_headers_keys(page=page_norm, rows=[], source_meta={})
             return _envelope(
                 page=page_norm,
                 route_family=route_family,
@@ -1370,13 +1752,13 @@ async def build_enriched_quote_payload(
                 status="success",
                 error=None,
                 warnings=["schema_only_special_page"] if schema_only_out or headers_only_out else [],
-                meta_extra={"schema_only": True, "headers_only": headers_only_out},
+                meta_extra={"schema_only": True, "headers_only": headers_only_out, "engine_present": engine_obj is not None},
             )
 
         try:
             special_payload = await _call_special_builder(
                 page=page_norm,
-                engine=engine,
+                engine=engine_obj,
                 request=request,
                 settings=settings,
                 body=merged,
@@ -1395,7 +1777,7 @@ async def build_enriched_quote_payload(
 
         if not rows:
             eng_rows, eng_meta, eng_status, eng_error = await _engine_sheet_rows(
-                engine=engine,
+                engine=engine_obj,
                 page=page_norm,
                 body=merged,
                 symbols=resolved_symbols,
@@ -1418,7 +1800,7 @@ async def build_enriched_quote_payload(
     # Instrument quote mode
     elif resolved_symbols and _is_instrument_page(page_norm):
         quote_rows, quote_meta, quote_status, quote_error = await _engine_quotes(
-            engine=engine,
+            engine=engine_obj,
             page=page_norm,
             symbols=resolved_symbols[:limit_out],
             request=request,
@@ -1433,10 +1815,33 @@ async def build_enriched_quote_payload(
         status_out = quote_status
         error_out = quote_error
 
+        if (not rows) or all(_is_sparse_row(r) for r in rows):
+            sheet_rows, sheet_meta, sheet_status, sheet_error = await _engine_sheet_rows(
+                engine=engine_obj,
+                page=page_norm,
+                body=merged,
+                symbols=resolved_symbols,
+                request=request,
+                settings=settings,
+                mode="live_sheet",
+                limit=limit_out,
+                schema_only=False,
+                headers_only=False,
+                table_mode=True,
+                timeout_sec=DEFAULT_TIMEOUT_SEC,
+            )
+            if sheet_rows:
+                rows = [_merge_payload_dicts(rows[idx] if idx < len(rows) else {}, row) for idx, row in enumerate(sheet_rows)]
+                source_meta = _merge_payload_dicts(source_meta, sheet_meta)
+                if sheet_status:
+                    status_out = sheet_status
+                error_out = sheet_error or error_out
+                warnings.append("quotes_rehydrated_from_sheet_rows")
+
     # Table mode / page mode
     else:
         sheet_rows, sheet_meta, sheet_status, sheet_error = await _engine_sheet_rows(
-            engine=engine,
+            engine=engine_obj,
             page=page_norm,
             body=merged,
             symbols=resolved_symbols,
@@ -1460,21 +1865,18 @@ async def build_enriched_quote_payload(
         source_meta=source_meta,
     )
 
-    if not keys and page_norm in INSTRUMENT_PAGES:
-        keys = ["symbol", "ticker", "name", "current_price"]
-        headers = ["symbol", "ticker", "name", "current_price"]
-        display_headers = list(headers)
-
     if schema_only_out or headers_only_out:
         rows = []
     else:
-        rows = _normalize_rows(rows[:limit_out], keys)
+        rows = _normalize_rows(rows[:limit_out], keys, page_norm)
 
     if not rows and not (schema_only_out or headers_only_out):
         if error_out:
-            status_out = "partial" if status_out == "success" else status_out
+            warnings.append("no_rows_with_error")
         else:
             warnings.append("no_rows_returned")
+
+    status_final = _safe_status(status_out, rows, headers, error_out, warnings)
 
     return _envelope(
         page=page_norm,
@@ -1488,7 +1890,7 @@ async def build_enriched_quote_payload(
         request_id=req_id,
         started_at=started_at,
         mode=mode_out,
-        status=status_out or ("partial" if warnings else "success"),
+        status=status_final,
         error=error_out,
         warnings=warnings,
         meta_extra={
@@ -1498,7 +1900,8 @@ async def build_enriched_quote_payload(
             "schema_only": schema_only_out,
             "headers_only": headers_only_out,
             "table_mode": table_mode_out,
-            "has_engine": engine is not None,
+            "engine_present": engine_obj is not None,
+            "engine_type": type(engine_obj).__name__ if engine_obj is not None else "none",
             "source_meta_keys": sorted(list(source_meta.keys())) if isinstance(source_meta, Mapping) else [],
         },
     )
