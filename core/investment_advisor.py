@@ -2,27 +2,30 @@
 """
 routes/investment_advisor.py
 --------------------------------------------------------------------------------
-ADVANCED TOP10 / INVESTMENT ADVISOR ROUTER — v2.3.0
+ADVANCED INVESTMENT ADVISOR ROUTER — v2.4.0
 --------------------------------------------------------------------------------
-LIVE-FIRST • CANONICAL-SCHEMA SAFE • PAGE-CATALOG AWARE • BUILDER/RUNNER TOLERANT
-GET+POST ALIAS SAFE • TOP10 83-COLUMN FALLBACK • ENGINE/ROUTER FALLBACK SAFE
-JSON-SAFE • STARTUP-SAFE • REQUEST-ID SAFE
+PAGE-AWARE • LIVE-FIRST • CANONICAL-SCHEMA SAFE • PAGE-CATALOG AWARE
+TOP10 / INSIGHTS / DATA-DICTIONARY SAFE • GET+POST ALIAS SAFE
+ENGINE / RUNNER / BUILDER TOLERANT • JSON-SAFE • STARTUP-SAFE • REQUEST-ID SAFE
 
 What this revision improves
 ---------------------------
-- ✅ FIX: stronger Top10 schema recovery with a full 83-column fallback contract
-      (80 canonical instrument columns + 3 Top10 fields).
-- ✅ FIX: page normalization now prefers core.sheets.page_catalog aliases before
-      falling back to local alias handling.
-- ✅ FIX: builder/runner discovery is broader across app.state, core modules,
-      service factories, and engine methods.
-- ✅ FIX: normalization now understands dict rows, matrix rows, item records,
-      dataclass/model outputs, and mixed payload envelopes.
-- ✅ FIX: fallback path can use engine-level Top10 methods and generic sheet-row
-      accessors with schema-safe projection.
-- ✅ FIX: GET and POST /v1/advanced/sheet-rows both work as route-test aliases.
-- ✅ FIX: Top10 fields are always backfilled and row ranking is stabilized.
-- ✅ SAFE: no network calls at import time.
+- FIX: stops treating every advanced request as Top_10_Investments. The router is
+  now page-aware and returns the correct target page in the response envelope.
+- FIX: keeps Top_10_Investments builder-first, but routes other advanced pages
+  through runner/engine fallbacks instead of forcing Top10 shaping.
+- FIX: schema loading now works for any requested page and sanitizes blank/ghost
+  columns instead of fabricating misaligned leading fields.
+- FIX: keeps special pages schema-safe:
+      - Top_10_Investments -> 83 columns fallback
+      - Insights_Analysis  -> 7 columns fallback
+      - Data_Dictionary    -> 9 columns fallback
+      - base/source pages  -> canonical 80 columns fallback
+- FIX: broader runner / builder discovery across app.state, core modules,
+  factories, service objects, and engine methods.
+- FIX: GET and POST /v1/advanced/sheet-rows remain stable aliases, while still
+  supporting /top10, /advisor, /investment-advisor, /recommendations, and /run.
+- SAFE: no network calls at import time.
 """
 
 from __future__ import annotations
@@ -45,24 +48,26 @@ from fastapi.encoders import jsonable_encoder
 logger = logging.getLogger("routes.investment_advisor")
 logger.addHandler(logging.NullHandler())
 
-INVESTMENT_ADVISOR_VERSION = "2.3.0"
+INVESTMENT_ADVISOR_VERSION = "2.4.0"
 TOP10_PAGE_NAME = "Top_10_Investments"
+INSIGHTS_PAGE_NAME = "Insights_Analysis"
+DATA_DICTIONARY_PAGE_NAME = "Data_Dictionary"
 
-_BASE_SOURCE_PAGES = [
+_BASE_SOURCE_PAGES = {
     "Market_Leaders",
     "Global_Markets",
     "Mutual_Funds",
     "Commodities_FX",
     "My_Portfolio",
-]
+}
 
 _DERIVED_OR_NON_SOURCE_PAGES = {
     "KSA_TADAWUL",
     "Advisor_Criteria",
     "AI_Opportunity_Report",
-    "Insights_Analysis",
-    "Top_10_Investments",
-    "Data_Dictionary",
+    INSIGHTS_PAGE_NAME,
+    TOP10_PAGE_NAME,
+    DATA_DICTIONARY_PAGE_NAME,
 }
 
 _PAGE_ALIAS_MAP = {
@@ -77,6 +82,13 @@ _PAGE_ALIAS_MAP = {
     "investment_advisor": TOP10_PAGE_NAME,
     "investment-advisor": TOP10_PAGE_NAME,
     "advisor": TOP10_PAGE_NAME,
+    "insights": INSIGHTS_PAGE_NAME,
+    "insight": INSIGHTS_PAGE_NAME,
+    "insights_analysis": INSIGHTS_PAGE_NAME,
+    "insights-analysis": INSIGHTS_PAGE_NAME,
+    "data_dictionary": DATA_DICTIONARY_PAGE_NAME,
+    "data-dictionary": DATA_DICTIONARY_PAGE_NAME,
+    "dictionary": DATA_DICTIONARY_PAGE_NAME,
 }
 
 _BUILDER_MODULE_CANDIDATES = (
@@ -88,7 +100,16 @@ _BUILDER_MODULE_CANDIDATES = (
     "core.analysis.investment_advisor_engine",
 )
 
-_BUILDER_NAME_CANDIDATES = (
+_RUNNER_MODULE_CANDIDATES = (
+    "core.investment_advisor",
+    "core.investment_advisor_engine",
+    "core.analysis.investment_advisor",
+    "core.analysis.investment_advisor_engine",
+    "core.data_engine_v2",
+    "core.data_engine",
+)
+
+_TOP10_BUILDER_NAME_CANDIDATES = (
     "build_top10_rows",
     "build_top10_output_rows",
     "build_top10_investments_rows",
@@ -98,11 +119,21 @@ _BUILDER_NAME_CANDIDATES = (
     "build_top10_result",
     "select_top10",
     "select_top10_symbols",
-    "run_investment_advisor",
+)
+
+_RUNNER_NAME_CANDIDATES = (
     "run_investment_advisor_engine",
+    "run_investment_advisor",
     "run_advisor",
     "execute_investment_advisor",
     "execute_advisor",
+    "get_sheet_rows",
+    "get_page_rows",
+    "build_top10_rows",
+    "build_top10_output_rows",
+    "build_top10_investments_rows",
+    "select_top10",
+    "select_top10_symbols",
 )
 
 _CONTAINER_NAME_CANDIDATES = (
@@ -142,6 +173,7 @@ _STATE_ATTR_CANDIDATES = (
     "run_advisor",
     "investment_advisor_service",
     "advisor_service",
+    "engine",
 )
 
 _ENGINE_METHOD_CANDIDATES = (
@@ -154,6 +186,8 @@ _ENGINE_METHOD_CANDIDATES = (
     "run_investment_advisor",
     "run_investment_advisor_engine",
     "run_advisor",
+    "execute_investment_advisor",
+    "execute_advisor",
     "get_sheet_rows",
     "get_page_rows",
 )
@@ -187,6 +221,9 @@ except Exception:
         return None
 
 
+# =============================================================================
+# Basic helpers
+# =============================================================================
 def _s(v: Any) -> str:
     try:
         if v is None:
@@ -242,7 +279,6 @@ def _env_int(name: str, default: int, *, lo: Optional[int] = None, hi: Optional[
         val = int(raw) if raw else int(default)
     except Exception:
         val = int(default)
-
     if lo is not None:
         val = max(lo, val)
     if hi is not None:
@@ -256,7 +292,6 @@ def _env_float(name: str, default: float, *, lo: Optional[float] = None, hi: Opt
         val = float(raw) if raw else float(default)
     except Exception:
         val = float(default)
-
     if lo is not None:
         val = max(lo, val)
     if hi is not None:
@@ -282,10 +317,9 @@ def _normalize_list(value: Any) -> List[str]:
     if value is None:
         return []
 
-    seq: List[Any]
     if isinstance(value, str):
-        normalized = value.replace(";", ",").replace("\n", ",")
-        seq = [x.strip() for x in normalized.split(",") if x.strip()]
+        normalized = value.replace(";", ",").replace("\n", ",").replace(" ", ",")
+        seq: List[Any] = [x.strip() for x in normalized.split(",") if x.strip()]
     elif isinstance(value, (list, tuple, set)):
         seq = list(value)
     else:
@@ -333,7 +367,6 @@ def _json_compact(value: Any) -> str:
 def _get_request_id(request: Optional[Request], header_request_id: Optional[str] = None) -> str:
     if _s(header_request_id):
         return _s(header_request_id)
-
     try:
         if request is not None:
             rid = request.headers.get("X-Request-ID")
@@ -344,7 +377,6 @@ def _get_request_id(request: Optional[Request], header_request_id: Optional[str]
                 return str(state_rid).strip()
     except Exception:
         pass
-
     return str(uuid.uuid4())
 
 
@@ -377,6 +409,19 @@ def _normalize_page_name(value: Any) -> str:
     return _PAGE_ALIAS_MAP.get(compact, raw)
 
 
+def _page_family(page: str) -> str:
+    normalized = _normalize_page_name(page)
+    if normalized == TOP10_PAGE_NAME:
+        return "top10"
+    if normalized == INSIGHTS_PAGE_NAME:
+        return "insights"
+    if normalized == DATA_DICTIONARY_PAGE_NAME:
+        return "data_dictionary"
+    if normalized in _BASE_SOURCE_PAGES:
+        return "source"
+    return "advanced"
+
+
 def _safe_source_pages(values: Sequence[str]) -> List[str]:
     out: List[str] = []
     seen = set()
@@ -392,6 +437,9 @@ def _safe_source_pages(values: Sequence[str]) -> List[str]:
     return out
 
 
+# =============================================================================
+# Auth helpers
+# =============================================================================
 def _extract_auth_token(
     *,
     token_query: Optional[str],
@@ -421,7 +469,6 @@ def _is_public_path(path: str) -> bool:
     p = _s(path)
     if not p:
         return False
-
     if p in {"/v1/advanced/health", "/v1/advanced/metrics"}:
         return True
 
@@ -434,7 +481,6 @@ def _is_public_path(path: str) -> bool:
             return True
         if p == candidate:
             return True
-
     return False
 
 
@@ -458,7 +504,6 @@ def _auth_passed(
 
     if _is_public_path(path):
         return True
-
     if auth_ok is None:
         return True
 
@@ -514,7 +559,6 @@ def _auth_passed(
             continue
         except Exception:
             return False
-
     return False
 
 
@@ -556,12 +600,11 @@ async def _get_engine(request: Request) -> Optional[Any]:
                 return eng
         except Exception:
             continue
-
     return None
 
 
 # =============================================================================
-# Canonical Top10 schema fallback (83 columns)
+# Canonical fallback schemas
 # =============================================================================
 _CANONICAL_TOP10_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("symbol", "Symbol"),
@@ -649,6 +692,92 @@ _CANONICAL_TOP10_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("criteria_snapshot", "Criteria Snapshot"),
 ]
 
+_CANONICAL_INSTRUMENT_SCHEMA_FALLBACK: List[Tuple[str, str]] = _CANONICAL_TOP10_SCHEMA_FALLBACK[:-3]
+
+_CANONICAL_INSIGHTS_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
+    ("section", "Section"),
+    ("item", "Item"),
+    ("metric", "Metric"),
+    ("value", "Value"),
+    ("confidence", "Confidence"),
+    ("notes", "Notes"),
+    ("as_of_utc", "As Of UTC"),
+]
+
+_CANONICAL_DATA_DICTIONARY_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
+    ("sheet_name", "Sheet Name"),
+    ("column_key", "Column Key"),
+    ("header", "Header"),
+    ("section", "Section"),
+    ("data_type", "Data Type"),
+    ("required", "Required"),
+    ("description", "Description"),
+    ("example", "Example"),
+    ("order_index", "Order Index"),
+]
+
+
+def _schema_fallback_for_page(page: str) -> Tuple[List[str], List[str]]:
+    family = _page_family(page)
+    if family == "top10":
+        schema = _CANONICAL_TOP10_SCHEMA_FALLBACK
+    elif family == "insights":
+        schema = _CANONICAL_INSIGHTS_SCHEMA_FALLBACK
+    elif family == "data_dictionary":
+        schema = _CANONICAL_DATA_DICTIONARY_SCHEMA_FALLBACK
+    else:
+        schema = _CANONICAL_INSTRUMENT_SCHEMA_FALLBACK
+    return [h for _, h in schema], [k for k, _ in schema]
+
+
+def _ensure_top10_keys_present(keys: List[str], headers: List[str]) -> Tuple[List[str], List[str]]:
+    extras = [
+        ("top10_rank", "Top10 Rank"),
+        ("selection_reason", "Selection Reason"),
+        ("criteria_snapshot", "Criteria Snapshot"),
+    ]
+    out_keys = list(keys or [])
+    out_headers = list(headers or [])
+    for key, header in extras:
+        if key not in out_keys:
+            out_keys.append(key)
+            out_headers.append(header)
+    return out_keys, out_headers
+
+
+def _load_schema_defaults(page: str) -> Tuple[List[str], List[str]]:
+    normalized_page = _normalize_page_name(page)
+    try:
+        from core.sheets.schema_registry import get_sheet_spec  # type: ignore
+
+        spec = get_sheet_spec(normalized_page)
+        cols = getattr(spec, "columns", None) or []
+        if cols:
+            keys: List[str] = []
+            headers: List[str] = []
+            for idx, col in enumerate(cols):
+                key = _s(getattr(col, "key", ""))
+                header = _s(getattr(col, "header", ""))
+                if not key and not header:
+                    continue
+                if not key and header:
+                    key = f"column_{idx + 1}"
+                if key and not header:
+                    header = key.replace("_", " ").title()
+                keys.append(key)
+                headers.append(header)
+            if keys and headers:
+                if normalized_page == TOP10_PAGE_NAME:
+                    keys, headers = _ensure_top10_keys_present(keys, headers)
+                return headers, keys
+    except Exception:
+        pass
+
+    headers, keys = _schema_fallback_for_page(normalized_page)
+    if normalized_page == TOP10_PAGE_NAME:
+        keys, headers = _ensure_top10_keys_present(keys, headers)
+    return headers, keys
+
 
 # =============================================================================
 # Generic row / payload helpers
@@ -703,7 +832,6 @@ def _rows_to_matrix(rows: List[Dict[str, Any]], keys: List[str]) -> List[List[An
 def _dicts_from_matrix(matrix: Any, keys: List[str]) -> List[Dict[str, Any]]:
     if not isinstance(matrix, list) or not keys:
         return []
-
     out: List[Dict[str, Any]] = []
     for row in matrix:
         if isinstance(row, dict):
@@ -795,7 +923,6 @@ def _extract_rows_candidate(payload: Any, *, keys_hint: Optional[List[str]] = No
 async def _call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     if inspect.iscoroutinefunction(fn):
         return await fn(*args, **kwargs)
-
     out = await asyncio.to_thread(fn, *args, **kwargs)
     if inspect.isawaitable(out):
         return await out
@@ -822,11 +949,7 @@ def _canonical_selection_reason(row: Dict[str, Any]) -> Optional[str]:
             score_parts.append(f"{label}={round(float(val), 2)}")
 
     roi_parts: List[str] = []
-    for label, key in (
-        ("1M", "expected_roi_1m"),
-        ("3M", "expected_roi_3m"),
-        ("12M", "expected_roi_12m"),
-    ):
+    for label, key in (("1M", "expected_roi_1m"), ("3M", "expected_roi_3m"), ("12M", "expected_roi_12m")):
         val = row.get(key)
         if isinstance(val, (int, float)):
             roi_parts.append(f"{label} ROI={round(float(val) * 100, 2)}%")
@@ -860,41 +983,29 @@ def _rank_rows_in_order(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return out
 
 
-def _apply_top10_field_backfill(
-    rows: List[Dict[str, Any]],
-    *,
-    keys: List[str],
-    criteria: Dict[str, Any],
-) -> List[Dict[str, Any]]:
+def _apply_top10_field_backfill(rows: List[Dict[str, Any]], *, keys: List[str], criteria: Dict[str, Any]) -> List[Dict[str, Any]]:
     criteria_snapshot = _json_compact(criteria) if criteria else None
     out: List[Dict[str, Any]] = []
 
     for idx, row in enumerate(rows, start=1):
         r = dict(row)
-
         if "top10_rank" in keys and _is_blank(r.get("top10_rank")):
             r["top10_rank"] = idx
-
         if "selection_reason" in keys and _is_blank(r.get("selection_reason")):
             r["selection_reason"] = _canonical_selection_reason(r)
-
         if "criteria_snapshot" in keys and _is_blank(r.get("criteria_snapshot")) and criteria_snapshot is not None:
             r["criteria_snapshot"] = criteria_snapshot
-
         if "source_page" in keys and _is_blank(r.get("source_page")):
             src_page = _normalize_page_name(row.get("source_page") or row.get("page") or row.get("sheet"))
             if src_page and src_page != TOP10_PAGE_NAME:
                 r["source_page"] = src_page
-
         out.append(r)
-
     return out
 
 
 def _ensure_schema_projection(rows: List[Dict[str, Any]], keys: List[str]) -> List[Dict[str, Any]]:
     if not keys:
         return [dict(r) for r in rows if isinstance(r, dict)]
-
     normalized: List[Dict[str, Any]] = []
     for row in rows:
         if not isinstance(row, dict):
@@ -903,82 +1014,27 @@ def _ensure_schema_projection(rows: List[Dict[str, Any]], keys: List[str]) -> Li
     return normalized
 
 
-def _ensure_top10_keys_present(keys: List[str], headers: List[str]) -> Tuple[List[str], List[str]]:
-    extras = [
-        ("top10_rank", "Top10 Rank"),
-        ("selection_reason", "Selection Reason"),
-        ("criteria_snapshot", "Criteria Snapshot"),
-    ]
-
-    out_keys = list(keys or [])
-    out_headers = list(headers or [])
-
-    for key, header in extras:
-        if key not in out_keys:
-            out_keys.append(key)
-            out_headers.append(header)
-
-    return out_keys, out_headers
-
-
-def _load_schema_defaults() -> Tuple[List[str], List[str]]:
-    tried_pages = [TOP10_PAGE_NAME, _normalize_page_name(TOP10_PAGE_NAME)]
-    tried_pages = _dedupe_keep_order(tried_pages)
-
-    try:
-        from core.sheets.schema_registry import get_sheet_spec  # type: ignore
-
-        for page_name in tried_pages:
-            spec = get_sheet_spec(page_name)
-            cols = getattr(spec, "columns", None) or []
-            if not cols:
-                continue
-
-            keys: List[str] = []
-            headers: List[str] = []
-            for idx, col in enumerate(cols):
-                key = _s(getattr(col, "key", ""))
-                header = _s(getattr(col, "header", ""))
-                if not key and not header:
-                    continue
-                if not key and header:
-                    key = f"column_{idx + 1}"
-                if key and not header:
-                    header = key.replace("_", " ").title()
-                keys.append(key)
-                headers.append(header)
-
-            if keys and headers:
-                keys, headers = _ensure_top10_keys_present(keys, headers)
-                return headers, keys
-    except Exception:
-        pass
-
-    fallback_keys = [k for k, _ in _CANONICAL_TOP10_SCHEMA_FALLBACK]
-    fallback_headers = [h for _, h in _CANONICAL_TOP10_SCHEMA_FALLBACK]
-    fallback_keys, fallback_headers = _ensure_top10_keys_present(fallback_keys, fallback_headers)
-    return fallback_headers, fallback_keys
-
-
 def _schema_only_payload(
     *,
     request_id: str,
+    target_page: str,
     headers: List[str],
     keys: List[str],
     include_matrix: bool,
     meta: Dict[str, Any],
 ) -> Dict[str, Any]:
+    rows_matrix = [] if (include_matrix and keys) else None
     return {
         "status": "partial",
-        "page": TOP10_PAGE_NAME,
-        "sheet": TOP10_PAGE_NAME,
-        "route_family": "top10",
+        "page": target_page,
+        "sheet": target_page,
+        "route_family": _page_family(target_page),
         "headers": headers,
         "keys": keys,
         "rows": [],
         "data": [],
         "items": [],
-        "rows_matrix": [] if (include_matrix and keys) else None,
+        "rows_matrix": rows_matrix,
         "version": INVESTMENT_ADVISOR_VERSION,
         "request_id": request_id,
         "meta": meta,
@@ -990,13 +1046,10 @@ def _schema_only_payload(
 # =============================================================================
 def _flatten_criteria(body: Dict[str, Any]) -> Dict[str, Any]:
     crit: Dict[str, Any] = {}
-
     if isinstance(body.get("criteria"), dict):
         crit.update(body["criteria"])
-
     if isinstance(body.get("filters"), dict):
         crit.update(body["filters"])
-
     settings = body.get("settings")
     if isinstance(settings, dict) and isinstance(settings.get("criteria"), dict):
         crit.update(settings["criteria"])
@@ -1040,25 +1093,19 @@ def _flatten_criteria(body: Dict[str, Any]) -> Dict[str, Any]:
     ):
         if k in body and body.get(k) is not None:
             crit[k] = body.get(k)
-
     return crit
 
 
 def _effective_limit(body: Dict[str, Any], limit_q: Optional[int]) -> int:
     max_limit = _env_int("ADV_TOP10_MAX_LIMIT", 50, lo=1, hi=200)
     default_limit = _env_int("ADV_TOP10_DEFAULT_LIMIT", 10, lo=1, hi=max_limit)
-
     if isinstance(limit_q, int):
         eff = limit_q
     else:
         eff = _safe_int(
-            body.get("limit")
-            or body.get("top_n")
-            or body.get("criteria", {}).get("top_n")
-            or default_limit,
+            body.get("limit") or body.get("top_n") or body.get("criteria", {}).get("top_n") or default_limit,
             default_limit,
         )
-
     return max(1, min(max_limit, int(eff)))
 
 
@@ -1066,12 +1113,7 @@ def _prepare_effective_criteria(body: Dict[str, Any], eff_limit: int) -> Tuple[D
     crit = _flatten_criteria(body or {})
 
     target_page = _normalize_page_name(
-        crit.get("page")
-        or crit.get("sheet")
-        or crit.get("sheet_name")
-        or crit.get("name")
-        or crit.get("tab")
-        or TOP10_PAGE_NAME
+        crit.get("page") or crit.get("sheet") or crit.get("sheet_name") or crit.get("name") or crit.get("tab") or TOP10_PAGE_NAME
     )
     crit["page"] = target_page
     crit["sheet"] = target_page
@@ -1082,7 +1124,7 @@ def _prepare_effective_criteria(body: Dict[str, Any], eff_limit: int) -> Tuple[D
 
     direct_symbols = _normalize_list(crit.get("direct_symbols") or crit.get("symbols") or crit.get("tickers"))
 
-    request_unconstrained = (not pages) and (not direct_symbols)
+    request_unconstrained = (not pages) and (not direct_symbols) and target_page == TOP10_PAGE_NAME
     pages_explicit = bool(pages)
 
     if request_unconstrained:
@@ -1126,7 +1168,10 @@ def _prepare_effective_criteria(body: Dict[str, Any], eff_limit: int) -> Tuple[D
     crit["limit"] = eff_limit
 
     if "enrich_final" not in crit:
-        crit["enrich_final"] = False if request_unconstrained else (len(pages) <= 2 or bool(direct_symbols))
+        if target_page == TOP10_PAGE_NAME:
+            crit["enrich_final"] = False if request_unconstrained else (len(pages) <= 2 or bool(direct_symbols))
+        else:
+            crit["enrich_final"] = True
 
     prep_meta = {
         "request_unconstrained": request_unconstrained,
@@ -1136,44 +1181,47 @@ def _prepare_effective_criteria(body: Dict[str, Any], eff_limit: int) -> Tuple[D
         "pages_trimmed": pages_trimmed,
         "allow_row_fallback": True,
         "target_page": target_page,
+        "page_family": _page_family(target_page),
     }
     return crit, prep_meta
 
 
 def _narrow_criteria_for_fallback(criteria: Dict[str, Any], eff_limit: int) -> Dict[str, Any]:
     narrowed = copy.deepcopy(criteria)
+    target_page = _normalize_page_name(narrowed.get("page") or TOP10_PAGE_NAME)
 
     fallback_pages_cap = _env_int("ADV_TOP10_FALLBACK_MAX_PAGES", 2, lo=1, hi=10)
     fallback_top_n = _env_int("ADV_TOP10_FALLBACK_TOP_N", min(3, eff_limit), lo=1, hi=eff_limit)
 
-    direct_symbols = _normalize_list(
-        narrowed.get("direct_symbols") or narrowed.get("symbols") or narrowed.get("tickers")
-    )
-    pages = _normalize_list(
-        narrowed.get("pages_selected") or narrowed.get("pages") or narrowed.get("selected_pages")
-    )
+    direct_symbols = _normalize_list(narrowed.get("direct_symbols") or narrowed.get("symbols") or narrowed.get("tickers"))
+    pages = _normalize_list(narrowed.get("pages_selected") or narrowed.get("pages") or narrowed.get("selected_pages"))
     pages = _safe_source_pages(pages)
 
-    if direct_symbols:
-        narrowed["direct_symbols"] = direct_symbols[: max(1, min(len(direct_symbols), eff_limit))]
-        narrowed["symbols"] = narrowed["direct_symbols"]
-        narrowed["tickers"] = narrowed["direct_symbols"]
-        narrowed["top_n"] = min(eff_limit, len(narrowed["direct_symbols"]))
-        narrowed["limit"] = narrowed["top_n"]
+    if target_page == TOP10_PAGE_NAME:
+        if direct_symbols:
+            narrowed["direct_symbols"] = direct_symbols[: max(1, min(len(direct_symbols), eff_limit))]
+            narrowed["symbols"] = narrowed["direct_symbols"]
+            narrowed["tickers"] = narrowed["direct_symbols"]
+            narrowed["top_n"] = min(eff_limit, len(narrowed["direct_symbols"]))
+            narrowed["limit"] = narrowed["top_n"]
+        else:
+            if not pages:
+                pages = _env_csv("ADV_TOP10_DEFAULT_PAGES", ["Market_Leaders"])
+            pages = _safe_source_pages(pages)[:fallback_pages_cap]
+            narrowed["pages_selected"] = pages
+            narrowed["top_n"] = fallback_top_n
+            narrowed["limit"] = fallback_top_n
+        narrowed["enrich_final"] = False
     else:
-        if not pages:
-            pages = _env_csv("ADV_TOP10_DEFAULT_PAGES", ["Market_Leaders"])
-        pages = _safe_source_pages(pages)[:fallback_pages_cap]
-        narrowed["pages_selected"] = pages
-        narrowed["top_n"] = fallback_top_n
-        narrowed["limit"] = fallback_top_n
+        narrowed["top_n"] = eff_limit
+        narrowed["limit"] = eff_limit
+        narrowed["enrich_final"] = True
 
-    narrowed["enrich_final"] = False
     return narrowed
 
 
 # =============================================================================
-# Builder discovery
+# Discovery helpers
 # =============================================================================
 def _callable_by_names(container: Any, names: Iterable[str]) -> Optional[Tuple[Callable[..., Any], str]]:
     for name in names:
@@ -1189,7 +1237,6 @@ def _callable_by_names(container: Any, names: Iterable[str]) -> Optional[Tuple[C
 async def _materialize_holder(holder: Any) -> Any:
     if holder is None:
         return None
-
     try:
         if inspect.isclass(holder):
             return holder()
@@ -1203,12 +1250,11 @@ async def _materialize_holder(holder: Any) -> Any:
             return None
         except Exception:
             return None
-
     return holder
 
 
-async def _resolve_from_container(container: Any, label: str) -> Optional[Tuple[Callable[..., Any], str, str]]:
-    direct = _callable_by_names(container, _BUILDER_NAME_CANDIDATES)
+async def _resolve_from_container(container: Any, label: str, names: Sequence[str]) -> Optional[Tuple[Callable[..., Any], str, str]]:
+    direct = _callable_by_names(container, names)
     if direct:
         fn, fn_name = direct
         return fn, label, fn_name
@@ -1218,25 +1264,24 @@ async def _resolve_from_container(container: Any, label: str) -> Optional[Tuple[
             holder = getattr(container, holder_name, None)
         except Exception:
             holder = None
-
         if holder is None:
             continue
-
         obj = await _materialize_holder(holder)
         if obj is None:
             continue
-
-        direct_obj = _callable_by_names(obj, _BUILDER_NAME_CANDIDATES)
+        direct_obj = _callable_by_names(obj, names)
         if direct_obj:
             fn, fn_name = direct_obj
             return fn, label, f"{holder_name}.{fn_name}"
-
     return None
 
 
-async def _resolve_top10_builder(
+async def _resolve_callable(
     request: Request,
     engine: Any,
+    *,
+    modules: Sequence[str],
+    names: Sequence[str],
 ) -> Tuple[Optional[Callable[..., Any]], str, str, List[str]]:
     searched: List[str] = []
     import_errors: List[str] = []
@@ -1248,47 +1293,44 @@ async def _resolve_top10_builder(
 
     if st is not None:
         searched.append("app.state")
-        direct_state = _callable_by_names(st, _STATE_ATTR_CANDIDATES)
+        direct_state = _callable_by_names(st, list(names) + list(_STATE_ATTR_CANDIDATES))
         if direct_state:
             fn, fn_name = direct_state
             return fn, "app.state", fn_name, searched
-
-        resolved_state = await _resolve_from_container(st, "app.state")
+        resolved_state = await _resolve_from_container(st, "app.state", names)
         if resolved_state:
             fn, src, name = resolved_state
             return fn, src, name, searched
 
-    for mod_name in _BUILDER_MODULE_CANDIDATES:
+    for mod_name in modules:
         searched.append(mod_name)
         try:
             mod = importlib.import_module(mod_name)
         except Exception as e:
             import_errors.append(f"{mod_name}: {type(e).__name__}: {e}")
             continue
-
-        resolved = await _resolve_from_container(mod, mod_name)
+        resolved = await _resolve_from_container(mod, mod_name, names)
         if resolved:
             fn, src, name = resolved
             return fn, src, name, searched
 
     if engine is not None:
         searched.append("engine")
-        direct_engine = _callable_by_names(engine, _ENGINE_METHOD_CANDIDATES)
+        direct_engine = _callable_by_names(engine, list(names) + list(_ENGINE_METHOD_CANDIDATES))
         if direct_engine:
             fn, fn_name = direct_engine
             return fn, "engine", fn_name, searched
 
     if import_errors:
-        logger.warning("Top10 builder import errors: %s", import_errors)
-
+        logger.warning("Advanced callable import errors: %s", import_errors)
     return None, "", "", searched
 
 
 # =============================================================================
-# Builder / engine invocation
+# Invocation helpers
 # =============================================================================
-async def _call_builder_with_tolerance(
-    builder: Callable[..., Any],
+async def _call_runner_with_tolerance(
+    runner: Callable[..., Any],
     *,
     request: Request,
     engine: Any,
@@ -1296,14 +1338,10 @@ async def _call_builder_with_tolerance(
     eff_limit: int,
     mode: str,
     settings: Any,
+    include_matrix: bool,
+    schema_only: bool,
 ) -> Any:
-    page = _normalize_page_name(
-        criteria.get("page")
-        or criteria.get("sheet")
-        or criteria.get("sheet_name")
-        or TOP10_PAGE_NAME
-    )
-
+    page = _normalize_page_name(criteria.get("page") or criteria.get("sheet") or criteria.get("sheet_name") or TOP10_PAGE_NAME)
     body_payload = {
         "page": page,
         "sheet": page,
@@ -1312,6 +1350,8 @@ async def _call_builder_with_tolerance(
         "top_n": eff_limit,
         "limit": eff_limit,
         "mode": mode or "",
+        "include_matrix": include_matrix,
+        "schema_only": schema_only,
     }
 
     attempts = [
@@ -1325,6 +1365,8 @@ async def _call_builder_with_tolerance(
             "page": page,
             "sheet": page,
             "sheet_name": page,
+            "include_matrix": include_matrix,
+            "schema_only": schema_only,
         },
         {
             "engine": engine,
@@ -1332,8 +1374,19 @@ async def _call_builder_with_tolerance(
             "limit": eff_limit,
             "mode": mode or "",
             "settings": settings,
+            "page": page,
+            "sheet": page,
+            "sheet_name": page,
         },
-        {"engine": engine, "criteria": criteria, "limit": eff_limit, "mode": mode or ""},
+        {
+            "engine": engine,
+            "criteria": criteria,
+            "limit": eff_limit,
+            "mode": mode or "",
+            "page": page,
+            "sheet": page,
+            "sheet_name": page,
+        },
         {
             "engine": engine,
             "body": body_payload,
@@ -1349,11 +1402,13 @@ async def _call_builder_with_tolerance(
         {"body": body_payload},
         {"payload": body_payload},
         {"criteria": criteria},
+        {"page": page, "limit": eff_limit},
+        {"page": page},
     ]
 
     for kwargs in attempts:
         try:
-            return await _call_maybe_async(builder, **kwargs)
+            return await _call_maybe_async(runner, **kwargs)
         except TypeError:
             continue
 
@@ -1364,25 +1419,24 @@ async def _call_builder_with_tolerance(
         (engine, criteria),
         (criteria,),
         (body_payload,),
+        (page,),
     ]
-
     last_error: Optional[Exception] = None
     for args in positional_attempts:
         try:
-            return await _call_maybe_async(builder, *args)
+            return await _call_maybe_async(runner, *args)
         except TypeError as e:
             last_error = e
             continue
 
     if last_error is not None:
         raise last_error
+    raise RuntimeError("No compatible runner signature matched")
 
-    raise RuntimeError("No compatible builder signature matched")
 
-
-async def _run_selector_with_timeout(
+async def _run_callable_with_timeout(
     *,
-    builder: Callable[..., Any],
+    runner: Callable[..., Any],
     request: Request,
     engine: Any,
     criteria: Dict[str, Any],
@@ -1390,75 +1444,121 @@ async def _run_selector_with_timeout(
     mode: str,
     timeout_sec: float,
     settings: Any,
+    include_matrix: bool,
+    schema_only: bool,
 ) -> Any:
-    coro = _call_builder_with_tolerance(
-        builder,
+    coro = _call_runner_with_tolerance(
+        runner,
         request=request,
         engine=engine,
         criteria=criteria,
         eff_limit=eff_limit,
         mode=mode,
         settings=settings,
+        include_matrix=include_matrix,
+        schema_only=schema_only,
     )
     return await asyncio.wait_for(coro, timeout=timeout_sec)
 
 
-async def _try_engine_top10_fallback(
+async def _try_engine_page_fallback(
     *,
     engine: Any,
-    request: Request,
     criteria: Dict[str, Any],
     eff_limit: int,
     mode: str,
+    include_matrix: bool,
+    schema_only: bool,
 ) -> Optional[Dict[str, Any]]:
     if engine is None:
         return None
 
-    page = _normalize_page_name(
-        criteria.get("page")
-        or criteria.get("sheet")
-        or criteria.get("sheet_name")
-        or TOP10_PAGE_NAME
-    )
+    page = _normalize_page_name(criteria.get("page") or criteria.get("sheet") or criteria.get("sheet_name") or TOP10_PAGE_NAME)
     query_symbols = _normalize_list(criteria.get("direct_symbols") or criteria.get("symbols") or criteria.get("tickers"))
+    family = _page_family(page)
 
-    call_plans: List[Tuple[str, Dict[str, Any]]] = [
-        ("build_top10_rows", {"criteria": criteria, "limit": eff_limit, "mode": mode or ""}),
-        ("build_top10_output_rows", {"criteria": criteria, "limit": eff_limit, "mode": mode or ""}),
-        ("build_top10_investments_rows", {"criteria": criteria, "limit": eff_limit, "mode": mode or ""}),
-        ("select_top10", {"criteria": criteria, "limit": eff_limit, "mode": mode or ""}),
-        ("select_top10_symbols", {"criteria": criteria, "limit": eff_limit, "mode": mode or ""}),
-        (
-            "get_sheet_rows",
-            {
-                "page": page,
-                "sheet": page,
-                "sheet_name": page,
-                "limit": eff_limit,
-                "mode": mode or "",
-                "tickers": query_symbols,
-                "symbols": query_symbols,
-            },
-        ),
-        (
-            "get_page_rows",
-            {
-                "page": page,
-                "sheet": page,
-                "sheet_name": page,
-                "limit": eff_limit,
-                "mode": mode or "",
-                "tickers": query_symbols,
-                "symbols": query_symbols,
-            },
-        ),
-    ]
+    call_plans: List[Tuple[str, Dict[str, Any]]] = []
+    if family == "top10":
+        call_plans.extend(
+            [
+                ("build_top10_rows", {"criteria": criteria, "limit": eff_limit, "mode": mode or ""}),
+                ("build_top10_output_rows", {"criteria": criteria, "limit": eff_limit, "mode": mode or ""}),
+                ("build_top10_investments_rows", {"criteria": criteria, "limit": eff_limit, "mode": mode or ""}),
+                ("select_top10", {"criteria": criteria, "limit": eff_limit, "mode": mode or ""}),
+                ("select_top10_symbols", {"criteria": criteria, "limit": eff_limit, "mode": mode or ""}),
+            ]
+        )
+
+    call_plans.extend(
+        [
+            (
+                "run_investment_advisor_engine",
+                {
+                    "criteria": criteria,
+                    "page": page,
+                    "sheet": page,
+                    "sheet_name": page,
+                    "limit": eff_limit,
+                    "mode": mode or "",
+                },
+            ),
+            (
+                "run_investment_advisor",
+                {
+                    "criteria": criteria,
+                    "page": page,
+                    "sheet": page,
+                    "sheet_name": page,
+                    "limit": eff_limit,
+                    "mode": mode or "",
+                },
+            ),
+            (
+                "run_advisor",
+                {
+                    "criteria": criteria,
+                    "page": page,
+                    "sheet": page,
+                    "sheet_name": page,
+                    "limit": eff_limit,
+                    "mode": mode or "",
+                },
+            ),
+            (
+                "get_sheet_rows",
+                {
+                    "page": page,
+                    "sheet": page,
+                    "sheet_name": page,
+                    "limit": eff_limit,
+                    "mode": mode or "",
+                    "tickers": query_symbols,
+                    "symbols": query_symbols,
+                    "include_matrix": include_matrix,
+                    "schema_only": schema_only,
+                },
+            ),
+            (
+                "get_page_rows",
+                {
+                    "page": page,
+                    "sheet": page,
+                    "sheet_name": page,
+                    "limit": eff_limit,
+                    "mode": mode or "",
+                    "tickers": query_symbols,
+                    "symbols": query_symbols,
+                    "include_matrix": include_matrix,
+                    "schema_only": schema_only,
+                },
+            ),
+        ]
+    )
 
     for method_name, kwargs in call_plans:
         fn = getattr(engine, method_name, None)
         if not callable(fn):
             continue
-
         try:
             out = await _call_maybe_async(fn, **kwargs)
         except TypeError:
@@ -1471,7 +1571,6 @@ async def _try_engine_top10_fallback(
 
         if isinstance(out, dict):
             return dict(out)
-
         rows = _extract_rows_candidate(out)
         if rows:
             return {
@@ -1481,16 +1580,16 @@ async def _try_engine_top10_fallback(
                 "rows": rows,
                 "meta": {"dispatch": f"engine.{method_name}"},
             }
-
     return None
 
 
 # =============================================================================
 # Payload normalization
 # =============================================================================
-def _normalize_selector_payload(
+def _normalize_page_payload(
     payload: Any,
     *,
+    target_page: str,
     criteria_used: Dict[str, Any],
     eff_limit: int,
     forced_dispatch: str = "",
@@ -1503,39 +1602,40 @@ def _normalize_selector_payload(
         payload_dict = _model_to_dict(payload)
 
     headers, keys = _extract_headers_and_keys(payload_dict)
-
     if not headers or not keys:
-        schema_headers, schema_keys = _load_schema_defaults()
+        schema_headers, schema_keys = _load_schema_defaults(target_page)
         if not headers:
             headers = schema_headers
         if not keys:
             keys = schema_keys
 
-    keys, headers = _ensure_top10_keys_present(list(keys), list(headers))
+    if _normalize_page_name(target_page) == TOP10_PAGE_NAME:
+        keys, headers = _ensure_top10_keys_present(list(keys), list(headers))
 
     rows = _extract_rows_candidate(payload_dict, keys_hint=keys)
     if not rows and isinstance(payload_dict.get("payload"), dict):
         rows = _extract_rows_candidate(payload_dict.get("payload"), keys_hint=keys)
 
     status_out = _s(payload_dict.get("status")) or ("success" if rows else "partial")
-
     dict_rows = [dict(r) for r in rows if isinstance(r, dict)]
-    dict_rows = _apply_top10_field_backfill(dict_rows, keys=keys, criteria=criteria_used)
-    dict_rows = _rank_rows_in_order(dict_rows)
+
+    if _normalize_page_name(target_page) == TOP10_PAGE_NAME:
+        dict_rows = _apply_top10_field_backfill(dict_rows, keys=keys, criteria=criteria_used)
+        dict_rows = _rank_rows_in_order(dict_rows)
+
     norm_rows = _ensure_schema_projection(dict_rows, keys)
     norm_rows = norm_rows[:eff_limit]
 
     meta = payload_dict.get("meta") if isinstance(payload_dict.get("meta"), dict) else {}
     if forced_dispatch and not _s(meta.get("dispatch")):
         meta["dispatch"] = forced_dispatch
-
     return headers, keys, norm_rows, dict(meta), status_out
 
 
 # =============================================================================
 # Core executor
 # =============================================================================
-async def _execute_advanced_top10(
+async def _execute_advanced_request(
     *,
     request: Request,
     body: Dict[str, Any],
@@ -1553,8 +1653,15 @@ async def _execute_advanced_top10(
     schema_only_final = schema_only if isinstance(schema_only, bool) else _coerce_bool(body.get("schema_only"), False)
     eff_limit = _effective_limit(body or {}, limit)
 
-    schema_headers, schema_keys = _load_schema_defaults()
-    schema_keys, schema_headers = _ensure_top10_keys_present(schema_keys, schema_headers)
+    s0 = time.perf_counter()
+    effective_criteria, prep_meta = _prepare_effective_criteria(body or {}, eff_limit)
+    if not _s(mode) and _s(effective_criteria.get("mode")):
+        mode = _s(effective_criteria.get("mode"))
+    target_page = _normalize_page_name(prep_meta.get("target_page") or TOP10_PAGE_NAME)
+    page_family = _page_family(target_page)
+    stages["criteria_prepare_ms"] = round((time.perf_counter() - s0) * 1000.0, 3)
+
+    schema_headers, schema_keys = _load_schema_defaults(target_page)
 
     if schema_only_final:
         meta = {
@@ -1565,13 +1672,15 @@ async def _execute_advanced_top10(
             "schema_aligned": bool(schema_keys),
             "schema_columns": len(schema_keys),
             "build_status": "SCHEMA_ONLY",
-            "dispatch": "advanced_top10",
+            "dispatch": "advanced_request",
+            "page_family": page_family,
             "stage_durations_ms": stages,
             "duration_ms": round((time.perf_counter() - t0) * 1000.0, 3),
         }
         return jsonable_encoder(
             _schema_only_payload(
                 request_id=request_id,
+                target_page=target_page,
                 headers=schema_headers,
                 keys=schema_keys,
                 include_matrix=include_matrix_final,
@@ -1592,14 +1701,16 @@ async def _execute_advanced_top10(
             "schema_aligned": bool(schema_keys),
             "schema_columns": len(schema_keys),
             "build_status": "DEGRADED",
-            "dispatch": "advanced_top10",
+            "dispatch": "advanced_request",
             "warning": "engine_unavailable",
+            "page_family": page_family,
             "stage_durations_ms": stages,
             "duration_ms": round((time.perf_counter() - t0) * 1000.0, 3),
         }
         return jsonable_encoder(
             _schema_only_payload(
                 request_id=request_id,
+                target_page=target_page,
                 headers=schema_headers,
                 keys=schema_keys,
                 include_matrix=include_matrix_final,
@@ -1616,29 +1727,41 @@ async def _execute_advanced_top10(
     stages["settings_ms"] = round((time.perf_counter() - s2) * 1000.0, 3)
 
     s3 = time.perf_counter()
-    builder, builder_source, builder_name, builder_search_path = await _resolve_top10_builder(request, engine)
-    stages["builder_resolve_ms"] = round((time.perf_counter() - s3) * 1000.0, 3)
+    top10_builder, top10_builder_source, top10_builder_name, top10_builder_search_path = await _resolve_callable(
+        request,
+        engine,
+        modules=_BUILDER_MODULE_CANDIDATES,
+        names=_TOP10_BUILDER_NAME_CANDIDATES,
+    )
+    stages["top10_builder_resolve_ms"] = round((time.perf_counter() - s3) * 1000.0, 3)
 
     s4 = time.perf_counter()
-    effective_criteria, prep_meta = _prepare_effective_criteria(body or {}, eff_limit)
-    if not _s(mode) and _s(effective_criteria.get("mode")):
-        mode = _s(effective_criteria.get("mode"))
-    stages["criteria_prepare_ms"] = round((time.perf_counter() - s4) * 1000.0, 3)
+    runner, runner_source, runner_name, runner_search_path = await _resolve_callable(
+        request,
+        engine,
+        modules=_RUNNER_MODULE_CANDIDATES,
+        names=_RUNNER_NAME_CANDIDATES,
+    )
+    stages["runner_resolve_ms"] = round((time.perf_counter() - s4) * 1000.0, 3)
 
     primary_timeout_sec = _env_float("ADV_TOP10_TIMEOUT_SEC", 45.0, lo=3.0, hi=300.0)
     fallback_timeout_sec = _env_float("ADV_TOP10_FALLBACK_TIMEOUT_SEC", 15.0, lo=2.0, hi=120.0)
 
     selected_payload: Optional[Any] = None
     selected_criteria = copy.deepcopy(effective_criteria)
+    selected_source = ""
     fallback_used = False
     fallback_reason = ""
     warnings: List[str] = []
 
-    if builder is not None:
+    primary_callable = top10_builder if page_family == "top10" and top10_builder is not None else runner
+    primary_source = top10_builder_source if page_family == "top10" and top10_builder is not None else runner_source
+
+    if primary_callable is not None:
         s5 = time.perf_counter()
         try:
-            payload_primary = await _run_selector_with_timeout(
-                builder=builder,
+            payload_primary = await _run_callable_with_timeout(
+                runner=primary_callable,
                 request=request,
                 engine=engine,
                 criteria=effective_criteria,
@@ -1646,25 +1769,28 @@ async def _execute_advanced_top10(
                 mode=mode or "",
                 timeout_sec=primary_timeout_sec,
                 settings=settings,
+                include_matrix=include_matrix_final,
+                schema_only=schema_only_final,
             )
             selected_payload = payload_primary
+            selected_source = primary_source or "primary"
         except asyncio.TimeoutError:
             fallback_used = True
             fallback_reason = f"primary_timeout_{primary_timeout_sec}s"
-            warnings.append("primary_selector_timeout")
+            warnings.append("primary_callable_timeout")
         except Exception as e:
             fallback_used = True
             fallback_reason = f"primary_error:{type(e).__name__}"
-            warnings.append(f"primary_selector_error:{type(e).__name__}:{e}")
-        stages["primary_selector_ms"] = round((time.perf_counter() - s5) * 1000.0, 3)
+            warnings.append(f"primary_callable_error:{type(e).__name__}:{e}")
+        stages["primary_callable_ms"] = round((time.perf_counter() - s5) * 1000.0, 3)
     else:
         fallback_used = True
-        fallback_reason = "builder_unavailable"
-        warnings.append("top10_builder_unavailable")
+        fallback_reason = "primary_callable_unavailable"
+        warnings.append("primary_callable_unavailable")
 
     try:
         normalized_rows_probe = _extract_rows_candidate(selected_payload)
-        if prep_meta.get("request_unconstrained") and len(normalized_rows_probe) == 0:
+        if page_family == "top10" and prep_meta.get("request_unconstrained") and len(normalized_rows_probe) == 0:
             fallback_used = True
             fallback_reason = fallback_reason or "primary_empty_unconstrained"
             warnings.append("primary_empty_for_unconstrained_request")
@@ -1675,11 +1801,13 @@ async def _execute_advanced_top10(
     if selected_payload is None:
         s6 = time.perf_counter()
         narrowed_criteria = _narrow_criteria_for_fallback(effective_criteria, eff_limit)
-
-        if builder is not None:
+        fallback_callable = None
+        if page_family == "top10" and runner is not None and runner is not primary_callable:
+            fallback_callable = runner
+        if fallback_callable is not None:
             try:
-                payload_fallback = await _run_selector_with_timeout(
-                    builder=builder,
+                payload_fallback = await _run_callable_with_timeout(
+                    runner=fallback_callable,
                     request=request,
                     engine=engine,
                     criteria=narrowed_criteria,
@@ -1687,35 +1815,39 @@ async def _execute_advanced_top10(
                     mode=mode or "",
                     timeout_sec=fallback_timeout_sec,
                     settings=settings,
+                    include_matrix=include_matrix_final,
+                    schema_only=schema_only_final,
                 )
                 selected_payload = payload_fallback
                 selected_criteria = narrowed_criteria
+                selected_source = runner_source if fallback_callable is runner else top10_builder_source
             except asyncio.TimeoutError:
-                warnings.append("fallback_selector_timeout")
+                warnings.append("fallback_callable_timeout")
                 fallback_reason = (fallback_reason + "; " if fallback_reason else "") + f"fallback_timeout_{fallback_timeout_sec}s"
             except Exception as e:
-                warnings.append(f"fallback_selector_error:{type(e).__name__}:{e}")
+                warnings.append(f"fallback_callable_error:{type(e).__name__}:{e}")
                 fallback_reason = (fallback_reason + "; " if fallback_reason else "") + f"fallback_error:{type(e).__name__}"
-        stages["fallback_selector_ms"] = round((time.perf_counter() - s6) * 1000.0, 3)
+        stages["fallback_callable_ms"] = round((time.perf_counter() - s6) * 1000.0, 3)
 
         if selected_payload is None:
             s7 = time.perf_counter()
-            engine_payload = await _try_engine_top10_fallback(
+            engine_payload = await _try_engine_page_fallback(
                 engine=engine,
-                request=request,
                 criteria=narrowed_criteria,
                 eff_limit=min(eff_limit, _safe_int(narrowed_criteria.get("top_n"), eff_limit)),
                 mode=mode or "",
+                include_matrix=include_matrix_final,
+                schema_only=schema_only_final,
             )
             stages["engine_fallback_ms"] = round((time.perf_counter() - s7) * 1000.0, 3)
-
             if engine_payload is not None:
                 selected_payload = engine_payload
                 selected_criteria = narrowed_criteria
-                warnings.append("engine_top10_fallback_used")
+                selected_source = "engine_fallback"
+                warnings.append("engine_page_fallback_used")
                 fallback_used = True
                 if not fallback_reason:
-                    fallback_reason = "engine_top10_fallback"
+                    fallback_reason = "engine_page_fallback"
 
     if selected_payload is None:
         meta = {
@@ -1726,30 +1858,36 @@ async def _execute_advanced_top10(
             "schema_aligned": bool(schema_keys),
             "schema_columns": len(schema_keys),
             "build_status": "DEGRADED",
-            "dispatch": "advanced_top10",
+            "dispatch": "advanced_request",
+            "page_family": page_family,
             "request_unconstrained": prep_meta.get("request_unconstrained", False),
             "pages_explicit": prep_meta.get("pages_explicit", False),
             "pages_effective": prep_meta.get("pages_effective", []),
             "direct_symbols_count": prep_meta.get("direct_symbols_count", 0),
             "pages_trimmed": prep_meta.get("pages_trimmed", False),
             "allow_row_fallback": prep_meta.get("allow_row_fallback", True),
-            "target_page": prep_meta.get("target_page", TOP10_PAGE_NAME),
+            "target_page": target_page,
             "fallback_used": fallback_used,
             "fallback_reason": fallback_reason,
             "criteria_used": _jsonable_snapshot(selected_criteria),
             "warnings": warnings,
             "engine_present": True,
             "engine_type": type(engine).__name__,
-            "builder_available": bool(builder),
-            "builder_source": builder_source,
-            "builder_name": builder_name,
-            "builder_search_path": builder_search_path,
+            "top10_builder_available": bool(top10_builder),
+            "top10_builder_source": top10_builder_source,
+            "top10_builder_name": top10_builder_name,
+            "top10_builder_search_path": top10_builder_search_path,
+            "runner_available": bool(runner),
+            "runner_source": runner_source,
+            "runner_name": runner_name,
+            "runner_search_path": runner_search_path,
             "stage_durations_ms": stages,
             "duration_ms": round((time.perf_counter() - t0) * 1000.0, 3),
         }
         return jsonable_encoder(
             _schema_only_payload(
                 request_id=request_id,
+                target_page=target_page,
                 headers=schema_headers,
                 keys=schema_keys,
                 include_matrix=include_matrix_final,
@@ -1758,11 +1896,12 @@ async def _execute_advanced_top10(
         )
 
     s8 = time.perf_counter()
-    headers, keys, norm_rows, meta_in, status_out = _normalize_selector_payload(
+    headers, keys, norm_rows, meta_in, status_out = _normalize_page_payload(
         selected_payload,
+        target_page=target_page,
         criteria_used=selected_criteria,
         eff_limit=eff_limit,
-        forced_dispatch="advanced_top10",
+        forced_dispatch="advanced_request",
     )
     stages["normalize_ms"] = round((time.perf_counter() - s8) * 1000.0, 3)
 
@@ -1775,7 +1914,6 @@ async def _execute_advanced_top10(
     if isinstance(meta_warnings, list):
         merged_warnings.extend([_s(x) for x in meta_warnings if _s(x)])
     merged_warnings.extend([_s(x) for x in warnings if _s(x)])
-
     dedup_warnings: List[str] = []
     seen_warn = set()
     for w in merged_warnings:
@@ -1793,7 +1931,7 @@ async def _execute_advanced_top10(
             "duration_ms": round((time.perf_counter() - t0) * 1000.0, 3),
             "schema_aligned": bool(keys),
             "schema_columns": len(keys),
-            "top10_fields_backfilled": True,
+            "page_family": page_family,
             "criteria_used": _jsonable_snapshot(selected_criteria),
             "request_unconstrained": prep_meta.get("request_unconstrained", False),
             "pages_explicit": prep_meta.get("pages_explicit", False),
@@ -1801,27 +1939,32 @@ async def _execute_advanced_top10(
             "direct_symbols_count": prep_meta.get("direct_symbols_count", 0),
             "pages_trimmed": prep_meta.get("pages_trimmed", False),
             "allow_row_fallback": prep_meta.get("allow_row_fallback", True),
-            "target_page": prep_meta.get("target_page", TOP10_PAGE_NAME),
+            "target_page": target_page,
             "fallback_used": fallback_used,
             "fallback_reason": fallback_reason,
             "engine_present": True,
             "engine_type": type(engine).__name__,
-            "builder_available": bool(builder),
-            "builder_source": builder_source,
-            "builder_name": builder_name,
-            "builder_search_path": builder_search_path,
+            "top10_builder_available": bool(top10_builder),
+            "top10_builder_source": top10_builder_source,
+            "top10_builder_name": top10_builder_name,
+            "top10_builder_search_path": top10_builder_search_path,
+            "runner_available": bool(runner),
+            "runner_source": runner_source,
+            "runner_name": runner_name,
+            "runner_search_path": runner_search_path,
+            "selected_source": selected_source,
             "warnings": dedup_warnings,
             "build_status": build_status,
-            "dispatch": _s(meta_in.get("dispatch")) or "advanced_top10",
+            "dispatch": _s(meta_in.get("dispatch")) or "advanced_request",
             "stage_durations_ms": stages,
         }
     )
 
     response = {
         "status": status_out or ("success" if norm_rows else "partial"),
-        "page": TOP10_PAGE_NAME,
-        "sheet": TOP10_PAGE_NAME,
-        "route_family": "top10",
+        "page": target_page,
+        "sheet": target_page,
+        "route_family": page_family,
         "headers": headers,
         "keys": keys,
         "rows": norm_rows,
@@ -1832,7 +1975,6 @@ async def _execute_advanced_top10(
         "request_id": request_id,
         "meta": meta,
     }
-
     return jsonable_encoder(response)
 
 
@@ -1842,18 +1984,33 @@ async def _execute_advanced_top10(
 @router.get("/health")
 async def advanced_health(request: Request) -> Dict[str, Any]:
     engine = await _get_engine(request)
-    builder, builder_source, builder_name, builder_search_path = await _resolve_top10_builder(request, engine)
+    top10_builder, top10_builder_source, top10_builder_name, top10_builder_search_path = await _resolve_callable(
+        request,
+        engine,
+        modules=_BUILDER_MODULE_CANDIDATES,
+        names=_TOP10_BUILDER_NAME_CANDIDATES,
+    )
+    runner, runner_source, runner_name, runner_search_path = await _resolve_callable(
+        request,
+        engine,
+        modules=_RUNNER_MODULE_CANDIDATES,
+        names=_RUNNER_NAME_CANDIDATES,
+    )
     return jsonable_encoder(
         {
             "status": "ok" if engine else "degraded",
-            "service": "advanced_top10",
+            "service": "advanced_investment_advisor",
             "version": INVESTMENT_ADVISOR_VERSION,
             "engine_available": bool(engine),
             "engine_type": type(engine).__name__ if engine else "none",
-            "builder_available": bool(builder),
-            "builder_source": builder_source,
-            "builder_name": builder_name,
-            "builder_search_path": builder_search_path,
+            "top10_builder_available": bool(top10_builder),
+            "top10_builder_source": top10_builder_source,
+            "top10_builder_name": top10_builder_name,
+            "top10_builder_search_path": top10_builder_search_path,
+            "runner_available": bool(runner),
+            "runner_source": runner_source,
+            "runner_name": runner_name,
+            "runner_search_path": runner_search_path,
         }
     )
 
@@ -1874,8 +2031,9 @@ async def advanced_metrics() -> Response:
 @router.post("/advisor")
 @router.post("/run")
 @router.post("/sheet-rows")
-async def advanced_top10_investments(
+async def advanced_request_post(
     request: Request,
+    response: Response,
     body: Dict[str, Any] = Body(default_factory=dict),
     mode: str = Query(default="", description="Optional mode hint for selector"),
     include_matrix: Optional[bool] = Query(default=None, description="Return rows_matrix"),
@@ -1893,7 +2051,7 @@ async def advanced_top10_investments(
         authorization=authorization,
     )
 
-    return await _execute_advanced_top10(
+    payload = await _execute_advanced_request(
         request=request,
         body=dict(body or {}),
         mode=mode,
@@ -1902,6 +2060,8 @@ async def advanced_top10_investments(
         schema_only=schema_only,
         x_request_id=x_request_id,
     )
+    response.headers["X-Request-ID"] = payload.get("request_id") or _get_request_id(request, x_request_id)
+    return payload
 
 
 # =============================================================================
@@ -1909,8 +2069,9 @@ async def advanced_top10_investments(
 # =============================================================================
 @router.get("/recommendations")
 @router.get("/sheet-rows")
-async def advanced_top10_get(
+async def advanced_request_get(
     request: Request,
+    response: Response,
     page: Optional[str] = Query(default=None),
     sheet: Optional[str] = Query(default=None),
     sheet_name: Optional[str] = Query(default=None),
@@ -1971,7 +2132,7 @@ async def advanced_top10_get(
         "schema_only": schema_only,
     }
 
-    return await _execute_advanced_top10(
+    payload = await _execute_advanced_request(
         request=request,
         body=body,
         mode=mode,
@@ -1980,6 +2141,8 @@ async def advanced_top10_get(
         schema_only=schema_only,
         x_request_id=x_request_id,
     )
+    response.headers["X-Request-ID"] = payload.get("request_id") or _get_request_id(request, x_request_id)
+    return payload
 
 
 __all__ = ["router", "INVESTMENT_ADVISOR_VERSION"]
