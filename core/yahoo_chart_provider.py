@@ -2,7 +2,7 @@
 """
 core/yahoo_chart_provider.py
 ===========================================================
-YAHOO CHART SHIM — v3.2.0 (SAFE · FAST · FULL COMPATIBILITY)
+YAHOO CHART SHIM — v3.3.0 (SAFE · FAST · FULL COMPATIBILITY)
 ===========================================================
 Emad Bahbah – Production Architecture
 
@@ -13,16 +13,17 @@ Goals
 - Fast hot-path: cached signature inspection + singleflight provider load
 - Resiliency: circuit breaker + full-jitter retry
 - Observability: OpenTelemetry spans + Prometheus metrics (optional)
+- Broader legacy compatibility surface for class-based callers
 """
 
 from __future__ import annotations
 
 import asyncio
-import functools
 import inspect
 import logging
 import os
 import random
+import re
 import sys
 import threading
 import time
@@ -36,7 +37,9 @@ from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, TypeVa
 # Versioning / constants
 # =============================================================================
 
-SHIM_VERSION = "3.2.0"
+SHIM_VERSION = "3.3.0"
+VERSION = SHIM_VERSION
+PROVIDER_VERSION = SHIM_VERSION
 DATA_SOURCE = "yahoo_chart"
 CANONICAL_IMPORT_PATHS = (
     "core.providers.yahoo_chart_provider",
@@ -53,6 +56,9 @@ _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 _FALSY = {"0", "false", "no", "n", "off", "f"}
 
 
+# =============================================================================
+# Small helpers
+# =============================================================================
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = (os.getenv(name) or "").strip().lower()
     if not raw:
@@ -66,26 +72,26 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 def _env_int(name: str, default: int, lo: Optional[int] = None, hi: Optional[int] = None) -> int:
     try:
-        v = int(float((os.getenv(name) or str(default)).strip()))
+        value = int(float((os.getenv(name) or str(default)).strip()))
     except Exception:
-        v = default
-    if lo is not None and v < lo:
-        v = lo
-    if hi is not None and v > hi:
-        v = hi
-    return v
+        value = default
+    if lo is not None and value < lo:
+        value = lo
+    if hi is not None and value > hi:
+        value = hi
+    return value
 
 
 def _env_float(name: str, default: float, lo: Optional[float] = None, hi: Optional[float] = None) -> float:
     try:
-        v = float((os.getenv(name) or str(default)).strip())
+        value = float((os.getenv(name) or str(default)).strip())
     except Exception:
-        v = default
-    if lo is not None and v < lo:
-        v = lo
-    if hi is not None and v > hi:
-        v = hi
-    return v
+        value = default
+    if lo is not None and value < lo:
+        value = lo
+    if hi is not None and value > hi:
+        value = hi
+    return value
 
 
 def _utc_iso(dt: Optional[datetime] = None) -> str:
@@ -102,12 +108,38 @@ def _riyadh_iso(dt: Optional[datetime] = None) -> str:
     return d.astimezone(RIYADH).isoformat()
 
 
-def _safe_symbol(s: Any) -> str:
+def _safe_symbol(value: Any) -> str:
     try:
-        x = str(s or "").strip().upper()
-        return x
+        return str(value or "").strip().upper()
     except Exception:
         return ""
+
+
+def _nonempty_count(obj: Any) -> int:
+    if not isinstance(obj, dict):
+        return 0
+    total = 0
+    for v in obj.values():
+        if v in (None, "", [], {}, ()):
+            continue
+        total += 1
+    return total
+
+
+def _extract_version_parts(value: str) -> Tuple[int, int, int]:
+    raw = str(value or "").strip()
+    nums = re.findall(r"\d+", raw)
+    parts = [int(x) for x in nums[:3]]
+    while len(parts) < 3:
+        parts.append(0)
+    return (parts[0], parts[1], parts[2])
+
+
+def _version_tuple(value: str) -> Tuple[int, int, int]:
+    try:
+        return _extract_version_parts(value)
+    except Exception:
+        return (0, 0, 0)
 
 
 # =============================================================================
@@ -124,7 +156,6 @@ try:
             v = v.encode("utf-8")
         return orjson.loads(v)
 
-    _HAS_ORJSON = True
 except Exception:
     import json
 
@@ -136,13 +167,10 @@ except Exception:
             v = v.decode("utf-8", errors="replace")
         return json.loads(v)
 
-    _HAS_ORJSON = False
-
 
 # =============================================================================
 # Logging
 # =============================================================================
-
 _LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
 logging.basicConfig(
     level=getattr(logging, _LOG_LEVEL, logging.INFO),
@@ -155,9 +183,8 @@ logger = logging.getLogger("core.yahoo_chart_shim")
 # Prometheus (optional)
 # =============================================================================
 try:
-    from prometheus_client import Counter, Histogram, Gauge  # type: ignore
+    from prometheus_client import Counter, Gauge, Histogram  # type: ignore
 
-    _PROM_AVAILABLE = True
     shim_requests_total = Counter(
         "tfb_yahoo_shim_requests_total",
         "Total requests handled by yahoo shim",
@@ -177,8 +204,6 @@ try:
         "Circuit state (0=closed,1=half,2=open)",
     )
 except Exception:
-    _PROM_AVAILABLE = False
-
     class _DummyMetric:
         def labels(self, *args, **kwargs):
             return self
@@ -205,23 +230,18 @@ try:
     from opentelemetry import trace  # type: ignore
     from opentelemetry.trace import Status, StatusCode  # type: ignore
 
-    _OTEL_AVAILABLE = True
     _TRACER = trace.get_tracer(__name__)
+    _OTEL_AVAILABLE = True
 except Exception:
-    _OTEL_AVAILABLE = False
-    _TRACER = None
     Status = None  # type: ignore
     StatusCode = None  # type: ignore
+    _TRACER = None
+    _OTEL_AVAILABLE = False
 
 _TRACING_ENABLED = _env_bool("CORE_TRACING_ENABLED", False)
 
 
 class TraceContext:
-    """
-    Sync + async context manager.
-    Uses start_as_current_span safely (works with stdlib OTEL tracer).
-    """
-
     def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
         self.name = name
         self.attributes = attributes or {}
@@ -233,7 +253,7 @@ class TraceContext:
             try:
                 self._cm = _TRACER.start_as_current_span(self.name)
                 self._span = self._cm.__enter__()
-                for k, v in (self.attributes or {}).items():
+                for k, v in self.attributes.items():
                     try:
                         self._span.set_attribute(str(k), v)
                     except Exception:
@@ -306,11 +326,11 @@ class TelemetryCollector:
         self._max = max(200, int(max_items))
         self._calls: List[CallMetrics] = []
 
-    def record(self, m: CallMetrics) -> None:
+    def record(self, metric: CallMetrics) -> None:
         if not _env_bool("SHIM_YAHOO_TELEMETRY", True):
             return
         with self._lock:
-            self._calls.append(m)
+            self._calls.append(metric)
             if len(self._calls) > self._max:
                 self._calls = self._calls[-self._max :]
 
@@ -330,16 +350,16 @@ class TelemetryCollector:
 
         by_fn: Dict[str, Dict[str, Any]] = {}
         for c in calls:
-            s = by_fn.setdefault(c.fn, {"calls": 0, "ok": 0, "fail": 0, "dur_ms_sum": 0.0})
-            s["calls"] += 1
-            s["ok"] += 1 if c.ok else 0
-            s["fail"] += 0 if c.ok else 1
-            s["dur_ms_sum"] += c.duration_ms
+            row = by_fn.setdefault(c.fn, {"calls": 0, "ok": 0, "fail": 0, "dur_ms_sum": 0.0})
+            row["calls"] += 1
+            row["ok"] += 1 if c.ok else 0
+            row["fail"] += 0 if c.ok else 1
+            row["dur_ms_sum"] += c.duration_ms
 
-        for s in by_fn.values():
-            s["avg_duration_ms"] = s["dur_ms_sum"] / max(1, s["calls"])
-            s["success_rate"] = s["ok"] / max(1, s["calls"])
-            s.pop("dur_ms_sum", None)
+        for row in by_fn.values():
+            row["avg_duration_ms"] = row["dur_ms_sum"] / max(1, row["calls"])
+            row["success_rate"] = row["ok"] / max(1, row["calls"])
+            row.pop("dur_ms_sum", None)
 
         return {
             "total_calls": total,
@@ -387,16 +407,16 @@ class SingleFlight:
                 leader = True
 
         if not leader:
-            return await fut  # type: ignore
+            return await fut  # type: ignore[return-value]
 
         try:
             res = await coro_fn()
             if not fut.done():
                 fut.set_result(res)
             return res
-        except Exception as e:
+        except Exception as exc:
             if not fut.done():
-                fut.set_exception(e)
+                fut.set_exception(exc)
             raise
         finally:
             async with self._lock:
@@ -419,11 +439,11 @@ class FullJitterBackoff:
         for i in range(total_tries):
             try:
                 return await fn()
-            except Exception as e:
-                last = e
+            except Exception as exc:
+                last = exc
                 if i >= total_tries - 1:
                     break
-                temp = min(self.cap, self.base * (2**i))
+                temp = min(self.cap, self.base * (2 ** i))
                 await asyncio.sleep(random.uniform(0.0, temp))
 
         raise last if last else RuntimeError("retry_exhausted")
@@ -480,7 +500,6 @@ class CircuitBreaker:
                 if self.half_used >= self.half_open_calls:
                     raise CircuitBreakerOpenError("circuit_half_open_limit")
                 self.half_used += 1
-                return
 
     async def on_ok(self) -> None:
         async with self._lock:
@@ -520,18 +539,8 @@ class ProviderInfo:
     funcs: Dict[str, Callable[..., Any]]
     available: bool
     checked_mono: float
+    origin_path: Optional[str] = None
     error: Optional[str] = None
-
-
-def _version_tuple(v: str) -> Tuple[int, int, int]:
-    try:
-        parts = (v or "").strip().split(".")
-        a = int(parts[0]) if len(parts) > 0 else 0
-        b = int(parts[1]) if len(parts) > 1 else 0
-        c = int(parts[2]) if len(parts) > 2 else 0
-        return (a, b, c)
-    except Exception:
-        return (0, 0, 0)
 
 
 class ProviderCache:
@@ -547,15 +556,13 @@ class ProviderCache:
         )
 
     def _valid(self) -> bool:
-        if self._info is None:
-            return False
-        return (time.monotonic() - self._info.checked_mono) < self.ttl
+        return self._info is not None and (time.monotonic() - self._info.checked_mono) < self.ttl
 
     async def get(self) -> ProviderInfo:
         async with self._lock:
             if self._valid():
-                shim_provider_available.set(1 if self._info.available else 0)
-                return self._info
+                shim_provider_available.set(1 if self._info and self._info.available else 0)
+                return self._info  # type: ignore[return-value]
 
         info = await self._sf.do("provider_load", self._load)
         async with self._lock:
@@ -569,19 +576,21 @@ class ProviderCache:
             try:
                 mod = None
                 last_err = None
-                for p in CANONICAL_IMPORT_PATHS:
+                origin_path = None
+                for path in CANONICAL_IMPORT_PATHS:
                     try:
-                        mod = __import__(p, fromlist=["__all__"])
+                        mod = __import__(path, fromlist=["__all__"])
+                        origin_path = path
                         last_err = None
                         break
-                    except Exception as e:
-                        last_err = e
+                    except Exception as exc:
+                        last_err = exc
                         continue
 
                 if mod is None:
                     raise ImportError(f"canonical_missing:{last_err.__class__.__name__ if last_err else 'unknown'}")
 
-                ver = str(getattr(mod, "PROVIDER_VERSION", getattr(mod, "VERSION", "unknown")) or "unknown")
+                ver = str(getattr(mod, "PROVIDER_VERSION", getattr(mod, "VERSION", getattr(mod, "SHIM_VERSION", "unknown"))) or "unknown")
                 if _version_tuple(ver) < _version_tuple(MIN_CANONICAL_VERSION):
                     raise RuntimeError(f"canonical_version_too_old:{ver}")
 
@@ -603,9 +612,10 @@ class ProviderCache:
                     funcs=funcs,
                     available=True,
                     checked_mono=time.monotonic(),
+                    origin_path=origin_path,
                     error=None,
                 )
-            except Exception as e:
+            except Exception as exc:
                 await self._cb.on_fail()
                 return ProviderInfo(
                     module=None,
@@ -613,7 +623,8 @@ class ProviderCache:
                     funcs={},
                     available=False,
                     checked_mono=time.monotonic(),
-                    error=str(e),
+                    origin_path=None,
+                    error=str(exc),
                 )
 
         with TraceContext("yahoo_shim.provider_load"):
@@ -639,18 +650,17 @@ def _adapt_kwargs(fn: Callable[..., Any], kwargs: Dict[str, Any]) -> Dict[str, A
         params = _sig_params(fn)
         if not params:
             return dict(kwargs)
-        accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
-        if accepts_var_kw:
+        if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()):
             return dict(kwargs)
         return {k: v for k, v in kwargs.items() if k in params}
     except Exception:
         return dict(kwargs)
 
 
-async def _maybe_await(v: Any) -> Any:
-    if inspect.isawaitable(v):
-        return await v
-    return v
+async def _maybe_await(value: Any) -> Any:
+    if inspect.isawaitable(value):
+        return await value
+    return value
 
 
 # =============================================================================
@@ -664,7 +674,7 @@ def _ensure_shape(payload: Any, *, symbol: str, provider_version: Optional[str],
     sym = _safe_symbol(out.get("symbol") or symbol)
     out["symbol"] = sym
     out.setdefault("symbol_normalized", sym)
-
+    out.setdefault("requested_symbol", sym)
     out.setdefault("data_source", DATA_SOURCE)
     out.setdefault("provider", DATA_SOURCE)
     out.setdefault("shim_version", SHIM_VERSION)
@@ -691,6 +701,7 @@ def _error_payload(symbol: str, err: str, *, fn_name: str) -> Dict[str, Any]:
         "status": "error",
         "symbol": sym,
         "symbol_normalized": sym,
+        "requested_symbol": sym,
         "data_source": DATA_SOURCE,
         "provider": DATA_SOURCE,
         "data_quality": DataQuality.ERROR.value,
@@ -703,77 +714,6 @@ def _error_payload(symbol: str, err: str, *, fn_name: str) -> Dict[str, Any]:
 
 
 # =============================================================================
-# Shim callable
-# =============================================================================
-class ShimFunction:
-    def __init__(
-        self,
-        name: str,
-        *,
-        canonical_name: Optional[str] = None,
-        default_factory: Optional[Callable[..., Any]] = None,
-        fallback_factory: Optional[Callable[..., Any]] = None,
-    ):
-        self.name = name
-        self.canonical_name = canonical_name or name
-        self.default_factory = default_factory
-        self.fallback_factory = fallback_factory
-        self._backoff = FullJitterBackoff(
-            attempts=_env_int("SHIM_YAHOO_RETRY_ATTEMPTS", 2, lo=0, hi=6),
-            base=_env_float("SHIM_YAHOO_RETRY_BASE_SEC", 0.35, lo=0.05, hi=5.0),
-            cap=_env_float("SHIM_YAHOO_RETRY_CAP_SEC", 3.0, lo=0.2, hi=20.0),
-        )
-
-    async def __call__(self, *args, **kwargs) -> Any:
-        start_mono = time.monotonic()
-        sym = _safe_symbol(kwargs.get("symbol") or (args[0] if args else ""))
-
-        async def _call_canonical() -> Any:
-            info = await _PROVIDER.get()
-            if not info.available:
-                raise RuntimeError(info.error or "canonical_unavailable")
-            fn = info.funcs.get(self.canonical_name)
-            if fn is None:
-                raise AttributeError(f"canonical_missing_fn:{self.canonical_name}")
-            k2 = _adapt_kwargs(fn, kwargs)
-            res = fn(*args, **k2)
-            res = await _maybe_await(res)
-            return _ensure_shape(res, symbol=sym, provider_version=info.version, fn_name=self.name)
-
-        async def _call_fallback() -> Any:
-            if self.fallback_factory is None:
-                raise RuntimeError("fallback_missing")
-            res = self.fallback_factory(*args, **kwargs)
-            res = await _maybe_await(res)
-            return _ensure_shape(res, symbol=sym, provider_version=None, fn_name=self.name)
-
-        with TraceContext(f"yahoo_shim.{self.name}", {"symbol": sym, "fn": self.name}):
-            try:
-                t0 = time.monotonic()
-                out = await self._backoff.run(_call_canonical)
-                shim_requests_total.labels(fn=self.name, status="ok").inc()
-                shim_request_seconds.labels(fn=self.name).observe(max(0.0, time.monotonic() - t0))
-                _track(self.name, start_mono, True)
-                return out
-            except Exception as e:
-                shim_requests_total.labels(fn=self.name, status="err").inc()
-                _track(self.name, start_mono, False, e)
-
-                # fallback path (if enabled)
-                if _env_bool("SHIM_YAHOO_FALLBACK_ON_ERROR", True) and self.fallback_factory is not None:
-                    try:
-                        t0 = time.monotonic()
-                        out = await self._backoff.run(_call_fallback)
-                        shim_requests_total.labels(fn=self.name, status="fallback").inc()
-                        shim_request_seconds.labels(fn=self.name).observe(max(0.0, time.monotonic() - t0))
-                        return out
-                    except Exception as e2:
-                        return _error_payload(sym, f"{e.__class__.__name__}:{e}; fallback:{e2.__class__.__name__}:{e2}", fn_name=self.name)
-
-                return _error_payload(sym, f"{e.__class__.__name__}:{e}", fn_name=self.name)
-
-
-# =============================================================================
 # Default handlers (used only if canonical missing)
 # =============================================================================
 async def _default_quote(symbol: str, *args, **kwargs) -> Dict[str, Any]:
@@ -782,6 +722,7 @@ async def _default_quote(symbol: str, *args, **kwargs) -> Dict[str, Any]:
         "status": "error",
         "symbol": sym,
         "symbol_normalized": sym,
+        "requested_symbol": sym,
         "data_source": DATA_SOURCE,
         "provider": DATA_SOURCE,
         "data_quality": DataQuality.MISSING.value,
@@ -803,6 +744,78 @@ async def _default_history(*args, **kwargs) -> List[Dict[str, Any]]:
 
 
 # =============================================================================
+# Shim callable
+# =============================================================================
+class ShimFunction:
+    def __init__(
+        self,
+        name: str,
+        *,
+        canonical_name: Optional[str] = None,
+        fallback_factory: Optional[Callable[..., Any]] = None,
+    ):
+        self.name = name
+        self.canonical_name = canonical_name or name
+        self.fallback_factory = fallback_factory
+        self._backoff = FullJitterBackoff(
+            attempts=_env_int("SHIM_YAHOO_RETRY_ATTEMPTS", 2, lo=0, hi=6),
+            base=_env_float("SHIM_YAHOO_RETRY_BASE_SEC", 0.35, lo=0.05, hi=5.0),
+            cap=_env_float("SHIM_YAHOO_RETRY_CAP_SEC", 3.0, lo=0.2, hi=20.0),
+        )
+
+    async def __call__(self, *args, **kwargs) -> Any:
+        start_mono = time.monotonic()
+        sym = _safe_symbol(kwargs.get("symbol") or kwargs.get("ticker") or (args[0] if args else ""))
+
+        async def _call_canonical() -> Any:
+            info = await _PROVIDER.get()
+            if not info.available:
+                raise RuntimeError(info.error or "canonical_unavailable")
+            fn = info.funcs.get(self.canonical_name)
+            if fn is None:
+                raise AttributeError(f"canonical_missing_fn:{self.canonical_name}")
+            adapted_kwargs = _adapt_kwargs(fn, kwargs)
+            result = fn(*args, **adapted_kwargs)
+            result = await _maybe_await(result)
+            return _ensure_shape(result, symbol=sym, provider_version=info.version, fn_name=self.name)
+
+        async def _call_fallback() -> Any:
+            if self.fallback_factory is None:
+                raise RuntimeError("fallback_missing")
+            result = self.fallback_factory(*args, **kwargs)
+            result = await _maybe_await(result)
+            return _ensure_shape(result, symbol=sym, provider_version=None, fn_name=self.name)
+
+        with TraceContext(f"yahoo_shim.{self.name}", {"symbol": sym, "fn": self.name}):
+            try:
+                t0 = time.monotonic()
+                out = await self._backoff.run(_call_canonical)
+                shim_requests_total.labels(fn=self.name, status="ok").inc()
+                shim_request_seconds.labels(fn=self.name).observe(max(0.0, time.monotonic() - t0))
+                _track(self.name, start_mono, True)
+                return out
+            except Exception as exc:
+                shim_requests_total.labels(fn=self.name, status="err").inc()
+                _track(self.name, start_mono, False, exc)
+
+                if _env_bool("SHIM_YAHOO_FALLBACK_ON_ERROR", True) and self.fallback_factory is not None:
+                    try:
+                        t0 = time.monotonic()
+                        out = await self._backoff.run(_call_fallback)
+                        shim_requests_total.labels(fn=self.name, status="fallback").inc()
+                        shim_request_seconds.labels(fn=self.name).observe(max(0.0, time.monotonic() - t0))
+                        return out
+                    except Exception as fallback_exc:
+                        return _error_payload(
+                            sym,
+                            f"{exc.__class__.__name__}:{exc}; fallback:{fallback_exc.__class__.__name__}:{fallback_exc}",
+                            fn_name=self.name,
+                        )
+
+                return _error_payload(sym, f"{exc.__class__.__name__}:{exc}", fn_name=self.name)
+
+
+# =============================================================================
 # Public shim callables (legacy API surface)
 # =============================================================================
 fetch_quote = ShimFunction("fetch_quote", canonical_name="fetch_quote", fallback_factory=_default_quote)
@@ -811,13 +824,11 @@ get_quote = ShimFunction("get_quote", canonical_name="get_quote", fallback_facto
 get_quote_patch = ShimFunction("get_quote_patch", canonical_name="get_quote_patch", fallback_factory=_default_patch)
 fetch_quote_patch = ShimFunction("fetch_quote_patch", canonical_name="fetch_quote_patch", fallback_factory=_default_patch)
 fetch_enriched_quote_patch = ShimFunction("fetch_enriched_quote_patch", canonical_name="fetch_enriched_quote_patch", fallback_factory=_default_patch)
-
 fetch_quote_and_enrichment_patch = ShimFunction(
     "fetch_quote_and_enrichment_patch",
     canonical_name="fetch_quote_and_enrichment_patch",
     fallback_factory=_default_patch,
 )
-
 fetch_quote_and_fundamentals_patch = ShimFunction(
     "fetch_quote_and_fundamentals_patch",
     canonical_name="fetch_quote_and_fundamentals_patch",
@@ -872,34 +883,60 @@ class YahooChartProvider:
         await self._ensure_inner()
         if self._inner is not None and hasattr(self._inner, "aclose"):
             try:
-                v = self._inner.aclose()
-                if inspect.isawaitable(v):
-                    await v
+                value = self._inner.aclose()
+                if inspect.isawaitable(value):
+                    await value
             except Exception:
                 pass
         self._inner = None
 
-    async def fetch_quote(self, symbol: str, *args, **kwargs) -> Dict[str, Any]:
+    async def _dispatch(self, method_name: str, shim_fn: Callable[..., Awaitable[Any]], *args, **kwargs) -> Any:
         await self._ensure_inner()
-        if self._inner is not None and hasattr(self._inner, "fetch_quote"):
+        if self._inner is not None and hasattr(self._inner, method_name):
             try:
-                v = self._inner.fetch_quote(symbol, *args, **kwargs)
-                v = await _maybe_await(v)
-                return _ensure_shape(v, symbol=_safe_symbol(symbol), provider_version=None, fn_name="fetch_quote")
+                value = getattr(self._inner, method_name)(*args, **kwargs)
+                value = await _maybe_await(value)
+                symbol = _safe_symbol(kwargs.get("symbol") or kwargs.get("ticker") or (args[0] if args else ""))
+                return _ensure_shape(value, symbol=symbol, provider_version=None, fn_name=method_name)
             except Exception:
                 pass
-        return await fetch_quote(symbol=symbol, *args, **kwargs)
+        return await shim_fn(*args, **kwargs)
+
+    async def fetch_quote(self, symbol: str, *args, **kwargs) -> Dict[str, Any]:
+        return await self._dispatch("fetch_quote", fetch_quote, symbol, *args, **kwargs)
+
+    async def get_quote(self, symbol: str, *args, **kwargs) -> Dict[str, Any]:
+        return await self._dispatch("get_quote", get_quote, symbol, *args, **kwargs)
 
     async def get_quote_patch(self, symbol: str, base: Optional[Dict[str, Any]] = None, *args, **kwargs) -> Dict[str, Any]:
-        await self._ensure_inner()
-        if self._inner is not None and hasattr(self._inner, "get_quote_patch"):
-            try:
-                v = self._inner.get_quote_patch(symbol, base, *args, **kwargs)
-                v = await _maybe_await(v)
-                return _ensure_shape(v, symbol=_safe_symbol(symbol), provider_version=None, fn_name="get_quote_patch")
-            except Exception:
-                pass
-        return await get_quote_patch(symbol=symbol, base=base, *args, **kwargs)
+        return await self._dispatch("get_quote_patch", get_quote_patch, symbol, base, *args, **kwargs)
+
+    async def fetch_quote_patch(self, symbol: str, base: Optional[Dict[str, Any]] = None, *args, **kwargs) -> Dict[str, Any]:
+        return await self._dispatch("fetch_quote_patch", fetch_quote_patch, symbol, base, *args, **kwargs)
+
+    async def fetch_enriched_quote_patch(self, symbol: str, base: Optional[Dict[str, Any]] = None, *args, **kwargs) -> Dict[str, Any]:
+        return await self._dispatch("fetch_enriched_quote_patch", fetch_enriched_quote_patch, symbol, base, *args, **kwargs)
+
+    async def fetch_quote_and_enrichment_patch(self, symbol: str, base: Optional[Dict[str, Any]] = None, *args, **kwargs) -> Dict[str, Any]:
+        return await self._dispatch("fetch_quote_and_enrichment_patch", fetch_quote_and_enrichment_patch, symbol, base, *args, **kwargs)
+
+    async def fetch_quote_and_fundamentals_patch(self, symbol: str, base: Optional[Dict[str, Any]] = None, *args, **kwargs) -> Dict[str, Any]:
+        return await self._dispatch("fetch_quote_and_fundamentals_patch", fetch_quote_and_fundamentals_patch, symbol, base, *args, **kwargs)
+
+    async def fetch_price_history(self, *args, **kwargs) -> List[Dict[str, Any]]:
+        return await self._dispatch("fetch_price_history", fetch_price_history, *args, **kwargs)
+
+    async def fetch_history(self, *args, **kwargs) -> List[Dict[str, Any]]:
+        return await self._dispatch("fetch_history", fetch_history, *args, **kwargs)
+
+    async def fetch_ohlc_history(self, *args, **kwargs) -> List[Dict[str, Any]]:
+        return await self._dispatch("fetch_ohlc_history", fetch_ohlc_history, *args, **kwargs)
+
+    async def fetch_history_patch(self, *args, **kwargs) -> List[Dict[str, Any]]:
+        return await self._dispatch("fetch_history_patch", fetch_history_patch, *args, **kwargs)
+
+    async def fetch_prices(self, *args, **kwargs) -> List[Dict[str, Any]]:
+        return await self._dispatch("fetch_prices", fetch_prices, *args, **kwargs)
 
 
 # =============================================================================
@@ -909,9 +946,11 @@ async def get_provider_status() -> Dict[str, Any]:
     info = await _PROVIDER.get()
     return {
         "shim_version": SHIM_VERSION,
+        "provider_version": PROVIDER_VERSION,
         "data_source": DATA_SOURCE,
         "canonical_available": bool(info.available),
         "canonical_version": info.version if info.available else None,
+        "canonical_origin_path": info.origin_path if info.available else None,
         "canonical_error": info.error if not info.available else None,
         "ttl_sec": _PROVIDER.ttl,
         "telemetry": _TELEMETRY.snapshot(),
@@ -930,11 +969,10 @@ def get_version() -> str:
     return SHIM_VERSION
 
 
-# =============================================================================
-# Exports
-# =============================================================================
 __all__ = [
     "SHIM_VERSION",
+    "VERSION",
+    "PROVIDER_VERSION",
     "DATA_SOURCE",
     "DataQuality",
     "YahooChartProvider",
@@ -957,15 +995,12 @@ __all__ = [
 ]
 
 
-# =============================================================================
-# Self-run diagnostics (manual)
-# =============================================================================
 if __name__ == "__main__":
     async def _diag() -> None:
         sys.stdout.write("Yahoo shim diagnostics\n")
         sys.stdout.write("=" * 60 + "\n")
-        st = await get_provider_status()
-        sys.stdout.write(json_dumps(st, default=str) + "\n")
+        status = await get_provider_status()
+        sys.stdout.write(json_dumps(status, default=str) + "\n")
         sys.stdout.write("=" * 60 + "\n")
         res = await fetch_quote(symbol="AAPL")
         sys.stdout.write(json_dumps(res, default=str) + "\n")
