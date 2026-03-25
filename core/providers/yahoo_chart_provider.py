@@ -2,40 +2,28 @@
 # core/providers/yahoo_chart_provider.py
 """
 ================================================================================
-Yahoo Chart Provider (Global + KSA History) — v6.7.1 (PHASE D: RISK STATS FILLED)
+Yahoo Chart Provider (Global + KSA History) — v6.8.0
 ================================================================================
+QUOTE/HISTORY HARDENED • COMMODITIES/FX FALLBACKS • CANONICAL FIELD ENRICHMENT
+FUNDAMENTALS-LIGHT • HISTORY-DERIVED AVG VOLUME / 52W / RISK STATS • IMPORT-SAFE
 
-Why this revision (Phase D)
-- ✅ FIX: Risk/statistical fields were blank across pages.
-  This provider now computes and returns (schema keys):
-    volatility_90d, max_drawdown_1y, var_95_1d, sharpe_1y
-  computed directly from Yahoo historical prices (best-effort).
-
-v6.7.1 hotfix
-- ✅ FIX: SyntaxError unmatched ')' in _env_float().
+Why this revision
+- ✅ FIX: strengthen quote extraction for commodities / FX / futures by using
+      more Yahoo aliases and metadata fallbacks.
+- ✅ FIX: fill history-derived core fields more consistently:
+      current_price, previous_close, open_price, day_high, day_low, volume,
+      week_52_high, week_52_low, week_52_position_pct, avg_volume_10d,
+      avg_volume_30d.
+- ✅ FIX: opportunistically return light fundamentals/profile fields when Yahoo
+      info exposes them, so the engine can hydrate more canonical columns.
+- ✅ FIX: expand compatibility aliases / methods for legacy callers.
 
 What this provider guarantees
 - ✅ Startup-safe: no network calls at import-time
 - ✅ Async-friendly: yfinance is blocking → executed in threadpool
 - ✅ Deterministic + safe fallbacks (no heavy ML required)
-- ✅ Canonical schema-aligned keys (engine-friendly):
-    current_price, previous_close, open_price, day_high, day_low, week_52_high, week_52_low,
-    volume, market_cap, currency, name, exchange, asset_class,
-    price_change, percent_change, week_52_position_pct,
-    rsi_14, volatility_30d, volatility_90d, max_drawdown_1y, var_95_1d, sharpe_1y,
-    forecast_price_1m/3m/12m, expected_roi_1m/3m/12m, forecast_confidence (0..1),
-    last_updated_utc, last_updated_riyadh, history_last_utc
-
-Backwards-compatible aliases preserved:
-    price, prev_close, open, 52w_high, 52w_low, change, change_pct
-
-History API (for engine risk-stats fallback)
-- ✅ Exposes: fetch_history(symbol, period?, interval?) returning list[dict] with {date, close}
-  (also get_history alias)
-
-Prometheus safety
-- ✅ Metrics are created lazily and duplicate-safe (reuse collector if already registered).
-
+- ✅ Canonical schema-aligned keys (engine-friendly)
+- ✅ History API: fetch_history(symbol, period?, interval?) → list[{date, close}]
 ================================================================================
 """
 
@@ -206,7 +194,6 @@ except Exception:
     trace = None  # type: ignore
     _HAS_OTEL = False
 
-# Prefer core TraceContext if available (aligned with core/config.py)
 try:
     from core.config import TraceContext as CoreTraceContext  # type: ignore
 
@@ -250,7 +237,8 @@ logger = logging.getLogger("core.providers.yahoo_chart_provider")
 logger.addHandler(logging.NullHandler())
 
 PROVIDER_NAME = "yahoo_chart"
-PROVIDER_VERSION = "6.7.1"
+PROVIDER_VERSION = "6.8.0"
+VERSION = PROVIDER_VERSION
 
 # =============================================================================
 # Env helpers (safe)
@@ -259,6 +247,7 @@ _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled"}
 
 _KSA_CODE_RE = re.compile(r"^\d{3,6}$", re.IGNORECASE)
+_FX_PAIR_RE = re.compile(r"^([A-Z]{6})=X$")
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 
 
@@ -278,7 +267,6 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _env_float(name: str, default: float) -> float:
-    # v6.7.1: fixed unmatched ')'
     try:
         return float(str(os.getenv(name, str(default))).strip())
     except Exception:
@@ -422,6 +410,39 @@ def safe_float(x: Any) -> Optional[float]:
         return None
 
 
+def _percentish(x: Any) -> Optional[float]:
+    f = safe_float(x)
+    if f is None:
+        return None
+    if -1.0 <= f <= 1.0:
+        return float(f * 100.0)
+    return float(f)
+
+
+def _first_number(*values: Any) -> Optional[float]:
+    for v in values:
+        f = safe_float(v)
+        if f is not None:
+            return f
+    return None
+
+
+def _first_percentish(*values: Any) -> Optional[float]:
+    for v in values:
+        f = _percentish(v)
+        if f is not None:
+            return f
+    return None
+
+
+def _first_str(*values: Any) -> Optional[str]:
+    for v in values:
+        s = safe_str(v)
+        if s is not None:
+            return s
+    return None
+
+
 def normalize_symbol(symbol: str) -> str:
     s = (symbol or "").strip()
     if not s:
@@ -501,7 +522,7 @@ class CircuitBreaker:
     failures: int = 0
     successes: int = 0
     opened_at: float = 0.0
-    state: str = "closed"  # closed/open/half_open
+    state: str = "closed"
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def allow(self) -> bool:
@@ -546,7 +567,7 @@ class CircuitBreaker:
 
 
 # =============================================================================
-# SingleFlight (hardened)
+# SingleFlight
 # =============================================================================
 class SingleFlight:
     def __init__(self) -> None:
@@ -624,7 +645,7 @@ class AdvancedCache:
 
 
 # =============================================================================
-# Risk / Stats helpers (PHASE D)
+# Risk / Stats helpers
 # =============================================================================
 def _simple_returns(closes: List[float]) -> List[float]:
     out: List[float] = []
@@ -691,7 +712,6 @@ def _var_95_1d(closes: List[float]) -> Optional[float]:
     if len(rets) < 30:
         return None
     try:
-        # 5th percentile
         if _HAS_NUMPY and np is not None:
             q = float(np.quantile(np.asarray(rets, dtype=float), 0.05))
         else:
@@ -707,7 +727,6 @@ def _sharpe_1y(closes: List[float]) -> Optional[float]:
     rets = _simple_returns(closes)
     if len(rets) < 60:
         return None
-    # use last 252 if possible
     w = rets[-252:] if len(rets) >= 252 else rets[:]
     if len(w) < 30:
         return None
@@ -721,15 +740,11 @@ def _sharpe_1y(closes: List[float]) -> Optional[float]:
             sd = float(statistics.stdev(w))
         if sd <= 0 or math.isnan(sd) or math.isinf(sd):
             return None
-        # annualized Sharpe, rf ~ 0
         return float((mu * 252.0) / (sd * math.sqrt(252.0)))
     except Exception:
         return None
 
 
-# =============================================================================
-# Indicators
-# =============================================================================
 def _rsi_14(closes: List[float]) -> Optional[float]:
     if len(closes) < 15:
         return None
@@ -768,10 +783,6 @@ def _rsi_14(closes: List[float]) -> Optional[float]:
 
 
 def _simple_forecast(closes: List[float], horizon_days: int) -> Tuple[Optional[float], Optional[float], float]:
-    """
-    Simple log-linear forecast:
-    returns (forecast_price, expected_roi_pct, confidence_0_1)
-    """
     if len(closes) < 60 or horizon_days <= 0:
         return None, None, 0.0
     try:
@@ -826,10 +837,9 @@ def _get_attr(obj: Any, *names: str) -> Any:
     for n in names:
         try:
             if obj is None:
-                return None
-            if isinstance(obj, dict):
-                if n in obj:
-                    return obj.get(n)
+                continue
+            if isinstance(obj, dict) and n in obj:
+                return obj.get(n)
             if hasattr(obj, n):
                 return getattr(obj, n)
         except Exception:
@@ -837,71 +847,168 @@ def _get_attr(obj: Any, *names: str) -> Any:
     return None
 
 
-def _detect_asset_class(info: Any, symbol: str) -> Optional[str]:
-    try:
-        if isinstance(info, dict):
-            qt = safe_str(info.get("quoteType") or info.get("quote_type") or info.get("type"))
-            if qt:
-                return qt
-    except Exception:
-        pass
-    if symbol and symbol.endswith(".SR"):
+def _safe_history_metadata(ticker: Any) -> Dict[str, Any]:
+    for attr_name in ("history_metadata",):
+        try:
+            meta = getattr(ticker, attr_name)
+            if isinstance(meta, dict) and meta:
+                return meta
+        except Exception:
+            pass
+    for fn_name in ("get_history_metadata",):
+        try:
+            fn = getattr(ticker, fn_name, None)
+            if callable(fn):
+                meta = fn()
+                if isinstance(meta, dict) and meta:
+                    return meta
+        except Exception:
+            pass
+    return {}
+
+
+def _infer_asset_class(symbol: str, info: Any = None, meta: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    qt = None
+    if isinstance(info, dict):
+        qt = safe_str(info.get("quoteType") or info.get("quote_type") or info.get("type"))
+    if qt is None and isinstance(meta, dict):
+        qt = safe_str(meta.get("instrumentType") or meta.get("quoteType"))
+    if qt:
+        qtu = qt.upper()
+        if qtu in {"CURRENCY", "FOREX", "FX"}:
+            return "FX"
+        if qtu in {"ETF", "MUTUALFUND", "MUTUAL FUND"}:
+            return qtu
+        return qtu
+
+    s = symbol.upper()
+    if s.endswith(".SR"):
         return "EQUITY"
+    if s.endswith("=F"):
+        return "FUTURE"
+    if s.endswith("=X"):
+        return "FX"
+    if s.startswith("^"):
+        return "INDEX"
     return None
 
 
-def _history_df_to_series(hist: Any) -> Tuple[List[float], Optional[datetime], Optional[Any]]:
-    closes: List[float] = []
-    hist_last_dt: Optional[datetime] = None
-    last_row = None
+def _infer_exchange(symbol: str, info: Any = None, meta: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    if isinstance(info, dict):
+        ex = _first_str(info.get("exchange"), info.get("fullExchangeName"), info.get("exchangeName"))
+        if ex:
+            return ex
+    if isinstance(meta, dict):
+        ex = _first_str(meta.get("exchangeName"), meta.get("exchangeTimezoneName"))
+        if ex:
+            return ex
+
+    s = symbol.upper()
+    if s.endswith(".SR"):
+        return "Tadawul"
+    if s.endswith("=F"):
+        return "Yahoo Futures"
+    if s.endswith("=X"):
+        return "Yahoo FX"
+    return None
+
+
+def _infer_currency(symbol: str, info: Any = None, meta: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    if isinstance(info, dict):
+        cur = _first_str(info.get("currency"), info.get("financialCurrency"))
+        if cur:
+            return cur
+    if isinstance(meta, dict):
+        cur = _first_str(meta.get("currency"), meta.get("financialCurrency"))
+        if cur:
+            return cur
+
+    s = symbol.upper()
+    if s.endswith(".SR"):
+        return "SAR"
+    m = _FX_PAIR_RE.match(s)
+    if m:
+        pair = m.group(1)
+        if len(pair) == 6:
+            return pair[3:]
+    return None
+
+
+def _infer_country(symbol: str, info: Any = None) -> Optional[str]:
+    if isinstance(info, dict):
+        c = safe_str(info.get("country"))
+        if c:
+            return c
+    if symbol.upper().endswith(".SR"):
+        return "Saudi Arabia"
+    return None
+
+
+def _history_df_extract(hist: Any) -> Dict[str, Any]:
+    bundle: Dict[str, Any] = {
+        "closes": [],
+        "opens": [],
+        "highs": [],
+        "lows": [],
+        "volumes": [],
+        "last_row": None,
+        "last_dt": None,
+    }
     if hist is None:
-        return closes, hist_last_dt, last_row
+        return bundle
 
     try:
-        empty = getattr(hist, "empty", None)
-        if empty is True:
-            return closes, hist_last_dt, last_row
+        if getattr(hist, "empty", None) is True:
+            return bundle
     except Exception:
         pass
 
     try:
-        # last row / last timestamp
-        try:
-            last_row = hist.iloc[-1] if hasattr(hist, "iloc") else None
-        except Exception:
-            last_row = None
-
+        if hasattr(hist, "iloc"):
+            try:
+                bundle["last_row"] = hist.iloc[-1]
+            except Exception:
+                bundle["last_row"] = None
         try:
             idx = hist.index[-1]
-            hist_last_dt = idx.to_pydatetime() if hasattr(idx, "to_pydatetime") else idx
+            bundle["last_dt"] = idx.to_pydatetime() if hasattr(idx, "to_pydatetime") else idx
         except Exception:
-            hist_last_dt = None
+            bundle["last_dt"] = None
 
-        # closes list
-        try:
-            if _HAS_PANDAS and pd is not None:
-                c = hist["Close"].dropna().astype(float).tolist()
-            else:
-                c = [safe_float(x) for x in list(hist["Close"])]
-                c = [x for x in c if x is not None]
-            closes = [float(x) for x in c if x is not None and x > 0]
-        except Exception:
-            closes = []
+        def _series(col: str) -> List[float]:
+            try:
+                if _HAS_PANDAS and pd is not None:
+                    vals = hist[col].dropna().astype(float).tolist()
+                else:
+                    vals = [safe_float(x) for x in list(hist[col])]
+                    vals = [x for x in vals if x is not None]
+                return [float(x) for x in vals if x is not None]
+            except Exception:
+                return []
+
+        bundle["closes"] = [x for x in _series("Close") if x > 0]
+        bundle["opens"] = [x for x in _series("Open") if x > 0]
+        bundle["highs"] = [x for x in _series("High") if x > 0]
+        bundle["lows"] = [x for x in _series("Low") if x > 0]
+        bundle["volumes"] = [x for x in _series("Volume") if x >= 0]
     except Exception:
-        return [], None, None
-
-    return closes, hist_last_dt, last_row
+        return {
+            "closes": [],
+            "opens": [],
+            "highs": [],
+            "lows": [],
+            "volumes": [],
+            "last_row": None,
+            "last_dt": None,
+        }
+    return bundle
 
 
 def _history_df_to_list(hist: Any) -> List[Dict[str, Any]]:
-    """
-    Convert a yfinance history DF to list[{date, close}].
-    """
     if hist is None:
         return []
     try:
-        empty = getattr(hist, "empty", None)
-        if empty is True:
+        if getattr(hist, "empty", None) is True:
             return []
     except Exception:
         pass
@@ -924,6 +1031,26 @@ def _history_df_to_list(hist: Any) -> List[Dict[str, Any]]:
     return out
 
 
+def _avg_last_n(values: List[float], n: int) -> Optional[float]:
+    if not values:
+        return None
+    window = [float(v) for v in values[-n:] if v is not None]
+    if not window:
+        return None
+    return float(sum(window) / len(window))
+
+
+def _row_get(row: Any, key: str) -> Any:
+    try:
+        if row is None:
+            return None
+        if hasattr(row, "get"):
+            return row.get(key)
+        return row[key]
+    except Exception:
+        return None
+
+
 @dataclass(slots=True)
 class YahooChartProvider:
     name: str = PROVIDER_NAME
@@ -943,9 +1070,6 @@ class YahooChartProvider:
         default_factory=lambda: CircuitBreaker(_cb_fail_threshold(), _cb_cooldown_sec(), _cb_success_threshold())
     )
 
-    # -------------------------------------------------------------------------
-    # Blocking: history
-    # -------------------------------------------------------------------------
     def _blocking_fetch_history(self, symbol: str, period: str, interval: str) -> Dict[str, Any]:
         if not _HAS_YFINANCE or yf is None:
             return {"symbol": symbol, "error": "yfinance_not_installed", "provider": PROVIDER_NAME}
@@ -981,9 +1105,6 @@ class YahooChartProvider:
                 time.sleep(random.uniform(0.0, base))
         return {"symbol": symbol, "error": f"history_fetch_failed: {last_err}", "provider": PROVIDER_NAME}
 
-    # -------------------------------------------------------------------------
-    # Blocking: quote + computed stats
-    # -------------------------------------------------------------------------
     def _blocking_fetch(self, symbol: str) -> Dict[str, Any]:
         if not _HAS_YFINANCE or yf is None:
             return {
@@ -1011,97 +1132,157 @@ class YahooChartProvider:
                 except Exception:
                     info = None
 
+                meta: Dict[str, Any] = {}
                 out: Dict[str, Any] = {
                     "symbol": symbol,
+                    "requested_symbol": symbol,
                     "provider": PROVIDER_NAME,
                     "provider_version": PROVIDER_VERSION,
                     "data_sources": [PROVIDER_NAME],
                 }
 
-                # Prices
-                price = safe_float(_get_attr(fast_info, "last_price", "lastPrice", "regularMarketPrice"))
-                prev_close = safe_float(_get_attr(fast_info, "previous_close", "previousClose", "regularMarketPreviousClose"))
-                open_price = safe_float(_get_attr(fast_info, "open", "open_price", "regularMarketOpen"))
-
-                if isinstance(info, dict):
-                    price = price if price is not None else safe_float(info.get("regularMarketPrice"))
-                    prev_close = prev_close if prev_close is not None else safe_float(info.get("regularMarketPreviousClose"))
-                    open_price = open_price if open_price is not None else safe_float(info.get("regularMarketOpen"))
-
-                # Day range
-                day_high = safe_float(_get_attr(fast_info, "day_high", "dayHigh"))
-                day_low = safe_float(_get_attr(fast_info, "day_low", "dayLow"))
-                if isinstance(info, dict):
-                    day_high = day_high or safe_float(info.get("dayHigh"))
-                    day_low = day_low or safe_float(info.get("dayLow"))
-
-                # 52W
-                w52_high = safe_float(_get_attr(fast_info, "fifty_two_week_high", "fiftyTwoWeekHigh", "week52High"))
-                w52_low = safe_float(_get_attr(fast_info, "fifty_two_week_low", "fiftyTwoWeekLow", "week52Low"))
-                if isinstance(info, dict):
-                    w52_high = w52_high or safe_float(info.get("fiftyTwoWeekHigh"))
-                    w52_low = w52_low or safe_float(info.get("fiftyTwoWeekLow"))
-
-                # Volume / market cap
-                volume = safe_float(_get_attr(fast_info, "last_volume", "lastVolume", "regularMarketVolume"))
-                market_cap = safe_float(_get_attr(fast_info, "market_cap", "marketCap"))
-                if isinstance(info, dict):
-                    volume = volume or safe_float(info.get("regularMarketVolume"))
-                    market_cap = market_cap or safe_float(info.get("marketCap"))
-
-                currency = None
-                name = None
-                exchange = None
-                asset_class = _detect_asset_class(info, symbol)
-
-                if isinstance(info, dict):
-                    currency = safe_str(info.get("currency"))
-                    name = safe_str(info.get("shortName") or info.get("longName"))
-                    exchange = safe_str(info.get("exchange") or info.get("fullExchangeName"))
-
-                # History (for indicators + risk stats)
-                closes: List[float] = []
-                hist_last_dt: Optional[datetime] = None
-                last_hist_row = None
-
+                hist = None
+                history_bundle = {
+                    "closes": [],
+                    "opens": [],
+                    "highs": [],
+                    "lows": [],
+                    "volumes": [],
+                    "last_row": None,
+                    "last_dt": None,
+                }
                 try:
                     hist = ticker.history(period=_history_period(), interval=_history_interval(), auto_adjust=False)
-                    closes, hist_last_dt, last_hist_row = _history_df_to_series(hist)
-
-                    # fallback price/prev close
-                    if closes:
-                        if price is None:
-                            price = float(closes[-1])
-                        if prev_close is None and len(closes) >= 2:
-                            prev_close = float(closes[-2])
-
-                    # fallback 52w from last 252 closes
-                    if (w52_high is None or w52_low is None) and closes:
-                        window = closes[-252:] if len(closes) > 252 else closes
-                        w52_high = w52_high or max(window)
-                        w52_low = w52_low or min(window)
-
-                    # fallback open/high/low/volume from last row
-                    if last_hist_row is not None:
-                        try:
-                            getter = last_hist_row.get if hasattr(last_hist_row, "get") else None
-                            if open_price is None:
-                                open_price = safe_float(getter("Open") if getter else last_hist_row["Open"])
-                            if day_high is None:
-                                day_high = safe_float(getter("High") if getter else last_hist_row["High"])
-                            if day_low is None:
-                                day_low = safe_float(getter("Low") if getter else last_hist_row["Low"])
-                            if volume is None:
-                                volume = safe_float(getter("Volume") if getter else last_hist_row["Volume"])
-                        except Exception:
-                            pass
+                    history_bundle = _history_df_extract(hist)
+                    meta = _safe_history_metadata(ticker)
                 except Exception:
-                    closes = []
+                    hist = None
+                    history_bundle = {
+                        "closes": [],
+                        "opens": [],
+                        "highs": [],
+                        "lows": [],
+                        "volumes": [],
+                        "last_row": None,
+                        "last_dt": None,
+                    }
+                    meta = _safe_history_metadata(ticker)
+
+                closes: List[float] = history_bundle["closes"]
+                opens: List[float] = history_bundle["opens"]
+                highs: List[float] = history_bundle["highs"]
+                lows: List[float] = history_bundle["lows"]
+                volumes: List[float] = history_bundle["volumes"]
+                last_hist_row = history_bundle["last_row"]
+                hist_last_dt: Optional[datetime] = history_bundle["last_dt"]
+
+                if isinstance(info, dict):
+                    out["raw_quote_type"] = safe_str(info.get("quoteType"))
+                if isinstance(meta, dict):
+                    out["raw_instrument_type"] = safe_str(meta.get("instrumentType"))
+
+                price = _first_number(
+                    _get_attr(fast_info, "last_price", "lastPrice", "regularMarketPrice"),
+                    info.get("regularMarketPrice") if isinstance(info, dict) else None,
+                    info.get("currentPrice") if isinstance(info, dict) else None,
+                    info.get("navPrice") if isinstance(info, dict) else None,
+                    meta.get("regularMarketPrice") if isinstance(meta, dict) else None,
+                    _row_get(last_hist_row, "Close"),
+                    closes[-1] if closes else None,
+                )
+
+                prev_close = _first_number(
+                    _get_attr(fast_info, "previous_close", "previousClose", "regularMarketPreviousClose"),
+                    info.get("regularMarketPreviousClose") if isinstance(info, dict) else None,
+                    info.get("previousClose") if isinstance(info, dict) else None,
+                    meta.get("previousClose") if isinstance(meta, dict) else None,
+                    meta.get("chartPreviousClose") if isinstance(meta, dict) else None,
+                    closes[-2] if len(closes) >= 2 else None,
+                )
+
+                open_price = _first_number(
+                    _get_attr(fast_info, "open", "open_price", "regularMarketOpen"),
+                    info.get("regularMarketOpen") if isinstance(info, dict) else None,
+                    info.get("open") if isinstance(info, dict) else None,
+                    _row_get(last_hist_row, "Open"),
+                    opens[-1] if opens else None,
+                )
+
+                day_high = _first_number(
+                    _get_attr(fast_info, "day_high", "dayHigh", "regularMarketDayHigh"),
+                    info.get("regularMarketDayHigh") if isinstance(info, dict) else None,
+                    info.get("dayHigh") if isinstance(info, dict) else None,
+                    _row_get(last_hist_row, "High"),
+                    highs[-1] if highs else None,
+                )
+
+                day_low = _first_number(
+                    _get_attr(fast_info, "day_low", "dayLow", "regularMarketDayLow"),
+                    info.get("regularMarketDayLow") if isinstance(info, dict) else None,
+                    info.get("dayLow") if isinstance(info, dict) else None,
+                    _row_get(last_hist_row, "Low"),
+                    lows[-1] if lows else None,
+                )
+
+                w52_high = _first_number(
+                    _get_attr(fast_info, "fifty_two_week_high", "fiftyTwoWeekHigh", "week52High", "year_high", "yearHigh"),
+                    info.get("fiftyTwoWeekHigh") if isinstance(info, dict) else None,
+                    info.get("regularMarketDayHigh") if isinstance(info, dict) and symbol.endswith("=F") and not highs else None,
+                    max(highs[-252:]) if highs else None,
+                    max(closes[-252:]) if closes else None,
+                )
+
+                w52_low = _first_number(
+                    _get_attr(fast_info, "fifty_two_week_low", "fiftyTwoWeekLow", "week52Low", "year_low", "yearLow"),
+                    info.get("fiftyTwoWeekLow") if isinstance(info, dict) else None,
+                    min(lows[-252:]) if lows else None,
+                    min(closes[-252:]) if closes else None,
+                )
+
+                volume = _first_number(
+                    _get_attr(fast_info, "last_volume", "lastVolume", "regularMarketVolume", "volume"),
+                    info.get("regularMarketVolume") if isinstance(info, dict) else None,
+                    info.get("volume") if isinstance(info, dict) else None,
+                    meta.get("regularMarketVolume") if isinstance(meta, dict) else None,
+                    _row_get(last_hist_row, "Volume"),
+                    volumes[-1] if volumes else None,
+                )
+
+                avg_volume_10d = _first_number(
+                    info.get("averageDailyVolume10Day") if isinstance(info, dict) else None,
+                    info.get("averageVolume10days") if isinstance(info, dict) else None,
+                    info.get("averageVolume10Day") if isinstance(info, dict) else None,
+                    _avg_last_n(volumes, 10),
+                )
+
+                avg_volume_30d = _first_number(
+                    info.get("averageVolume") if isinstance(info, dict) else None,
+                    info.get("averageVolume3Month") if isinstance(info, dict) else None,
+                    _avg_last_n(volumes, 30),
+                )
+
+                market_cap = _first_number(
+                    _get_attr(fast_info, "market_cap", "marketCap"),
+                    info.get("marketCap") if isinstance(info, dict) else None,
+                )
+
+                currency = _infer_currency(symbol, info=info, meta=meta)
+                name = _first_str(
+                    info.get("shortName") if isinstance(info, dict) else None,
+                    info.get("longName") if isinstance(info, dict) else None,
+                    meta.get("shortName") if isinstance(meta, dict) else None,
+                    meta.get("longName") if isinstance(meta, dict) else None,
+                    symbol,
+                )
+                exchange = _infer_exchange(symbol, info=info, meta=meta)
+                asset_class = _infer_asset_class(symbol, info=info, meta=meta)
+                country = _infer_country(symbol, info=info)
+                sector = _first_str(info.get("sector") if isinstance(info, dict) else None)
+                industry = _first_str(info.get("industry") if isinstance(info, dict) else None)
 
                 if price is None:
                     raise ValueError("no_price_from_yahoo")
 
-                # Canonical keys (schema-aligned)
                 out["current_price"] = float(price)
                 out["previous_close"] = float(prev_close) if prev_close is not None else None
                 out["open_price"] = float(open_price) if open_price is not None else None
@@ -1110,13 +1291,17 @@ class YahooChartProvider:
                 out["week_52_high"] = float(w52_high) if w52_high is not None else None
                 out["week_52_low"] = float(w52_low) if w52_low is not None else None
                 out["volume"] = float(volume) if volume is not None else None
+                out["avg_volume_10d"] = float(avg_volume_10d) if avg_volume_10d is not None else None
+                out["avg_volume_30d"] = float(avg_volume_30d) if avg_volume_30d is not None else None
                 out["market_cap"] = float(market_cap) if market_cap is not None else None
                 out["currency"] = currency
                 out["name"] = name
                 out["exchange"] = exchange
                 out["asset_class"] = asset_class
+                out["country"] = country
+                out["sector"] = sector
+                out["industry"] = industry
 
-                # Derived canonical
                 if out.get("previous_close") not in (None, 0.0):
                     chg = out["current_price"] - float(out["previous_close"])
                     out["price_change"] = float(chg)
@@ -1131,7 +1316,28 @@ class YahooChartProvider:
                         ((out["current_price"] - out["week_52_low"]) / (out["week_52_high"] - out["week_52_low"])) * 100.0
                     )
 
-                # Indicators + Forecasts + Risk Stats (PHASE D)
+                # Light fundamentals / profile from Yahoo info when available.
+                if isinstance(info, dict):
+                    out["float_shares"] = _first_number(info.get("floatShares"), info.get("sharesOutstanding"))
+                    out["beta_5y"] = _first_number(info.get("beta"), info.get("beta3Year"))
+                    out["pe_ttm"] = _first_number(info.get("trailingPE"), info.get("currentPrice") and info.get("trailingPE"))
+                    out["pe_forward"] = _first_number(info.get("forwardPE"))
+                    out["eps_ttm"] = _first_number(info.get("trailingEps"), info.get("epsTrailingTwelveMonths"))
+                    out["dividend_yield"] = _first_percentish(info.get("dividendYield"), info.get("trailingAnnualDividendYield"))
+                    out["payout_ratio"] = _first_percentish(info.get("payoutRatio"))
+                    out["pb_ratio"] = _first_number(info.get("priceToBook"))
+                    out["ps_ratio"] = _first_number(info.get("priceToSalesTrailing12Months"))
+                    out["peg_ratio"] = _first_number(info.get("pegRatio"))
+                    out["ev_ebitda"] = _first_number(info.get("enterpriseToEbitda"))
+                    out["revenue_ttm"] = _first_number(info.get("totalRevenue"), info.get("revenuePerShare"))
+                    out["revenue_growth_yoy"] = _first_percentish(info.get("revenueGrowth"))
+                    out["gross_margin"] = _first_percentish(info.get("grossMargins"))
+                    out["operating_margin"] = _first_percentish(info.get("operatingMargins"))
+                    out["profit_margin"] = _first_percentish(info.get("profitMargins"))
+                    out["debt_to_equity"] = _first_number(info.get("debtToEquity"))
+                    out["free_cash_flow_ttm"] = _first_number(info.get("freeCashflow"), info.get("operatingCashflow"))
+
+                # Indicators + Forecasts + Risk Stats
                 if closes:
                     rsi = _rsi_14(closes)
                     if rsi is not None:
@@ -1178,11 +1384,21 @@ class YahooChartProvider:
                     out["history_last_utc"] = _utc_iso(hist_last_dt)
 
                 filled = 0
-                for k in ("current_price", "previous_close", "open_price", "volume", "week_52_high", "week_52_low"):
+                for k in (
+                    "current_price",
+                    "previous_close",
+                    "open_price",
+                    "day_high",
+                    "day_low",
+                    "volume",
+                    "week_52_high",
+                    "week_52_low",
+                    "avg_volume_10d",
+                    "avg_volume_30d",
+                ):
                     if out.get(k) is not None:
                         filled += 1
-                out["data_quality_score"] = float(filled / 6.0)
-
+                out["data_quality_score"] = float(filled / 10.0)
                 out["_fetch_ms"] = int((time.time() - t0) * 1000)
 
                 # Backward-compatible aliases
@@ -1193,6 +1409,8 @@ class YahooChartProvider:
                 out["change_pct"] = out.get("percent_change")
                 out["52w_high"] = out.get("week_52_high")
                 out["52w_low"] = out.get("week_52_low")
+                out["avg_volume_10_day"] = out.get("avg_volume_10d")
+                out["avg_volume_30_day"] = out.get("avg_volume_30d")
 
                 return clean_dict(out)
 
@@ -1203,19 +1421,18 @@ class YahooChartProvider:
 
         return {
             "symbol": symbol,
+            "requested_symbol": symbol,
             "error": f"fetch_failed: {str(last_err)}",
             "provider": PROVIDER_NAME,
             "provider_version": PROVIDER_VERSION,
             "data_sources": [PROVIDER_NAME],
         }
 
-    # -------------------------------------------------------------------------
-    # Async public APIs
-    # -------------------------------------------------------------------------
     async def fetch_enriched_quote_patch(self, symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         if not _configured():
             return {
                 "symbol": symbol,
+                "requested_symbol": symbol,
                 "error": "provider_disabled_or_yfinance_missing",
                 "provider": PROVIDER_NAME,
                 "provider_version": PROVIDER_VERSION,
@@ -1226,6 +1443,7 @@ class YahooChartProvider:
         if not sym:
             return {
                 "symbol": symbol,
+                "requested_symbol": symbol,
                 "error": "invalid_symbol",
                 "provider": PROVIDER_NAME,
                 "provider_version": PROVIDER_VERSION,
@@ -1235,6 +1453,7 @@ class YahooChartProvider:
         if not await self._cb.allow():
             return {
                 "symbol": sym,
+                "requested_symbol": symbol,
                 "error": "circuit_open",
                 "provider": PROVIDER_NAME,
                 "provider_version": PROVIDER_VERSION,
@@ -1242,7 +1461,6 @@ class YahooChartProvider:
             }
 
         m = metrics()
-
         cached = await self.quote_cache.get(sym, kind="quote")
         if cached is not None:
             m.cache_hits_total.labels(symbol=sym).inc()
@@ -1255,8 +1473,7 @@ class YahooChartProvider:
                 t0 = time.time()
                 try:
                     loop = asyncio.get_running_loop()
-                    with_trace = _tracing_enabled()
-                    if with_trace:
+                    if _tracing_enabled():
                         async with TraceContext("yahoo_chart_fetch", {"symbol": sym}):
                             res = await loop.run_in_executor(_CPU_EXECUTOR, self._blocking_fetch, sym)
                     else:
@@ -1275,13 +1492,13 @@ class YahooChartProvider:
                     if ok:
                         await self.quote_cache.set(sym, res, kind="quote", ttl_sec=_quote_ttl_sec())
                     return res
-
                 except Exception as e:
                     await self._cb.record_failure()
                     m.requests_total.labels(symbol=sym, op="quote", status="exception").inc()
                     m.request_duration.labels(symbol=sym, op="quote").observe(max(0.0, time.time() - t0))
                     return {
                         "symbol": sym,
+                        "requested_symbol": symbol,
                         "error": f"exception: {e}",
                         "provider": PROVIDER_NAME,
                         "provider_version": PROVIDER_VERSION,
@@ -1290,11 +1507,17 @@ class YahooChartProvider:
 
         return await self.singleflight.run(f"yahoo:quote:{sym}", _do_fetch)
 
+    # compatibility aliases on the class
+    async def fetch_quote_patch(self, symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return await self.fetch_enriched_quote_patch(symbol, debug=debug, *args, **kwargs)
+
+    async def fetch_quote(self, symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return await self.fetch_enriched_quote_patch(symbol, debug=debug, *args, **kwargs)
+
+    async def get_quote(self, symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        return await self.fetch_enriched_quote_patch(symbol, debug=debug, *args, **kwargs)
+
     async def fetch_history(self, symbol: str, period: Optional[str] = None, interval: Optional[str] = None) -> List[Dict[str, Any]]:
-        """
-        Engine-friendly history endpoint:
-          returns list of dicts: {date, close}
-        """
         if not _configured():
             return []
 
@@ -1322,7 +1545,6 @@ class YahooChartProvider:
 
         return await self.singleflight.run(f"yahoo:history:{sym}:{per}:{itv}", _do_fetch)
 
-    # aliases
     async def get_history(self, symbol: str, period: Optional[str] = None, interval: Optional[str] = None) -> List[Dict[str, Any]]:
         return await self.fetch_history(symbol, period=period, interval=interval)
 
@@ -1340,12 +1562,16 @@ class YahooChartProvider:
             else:
                 out[s] = {
                     "symbol": s,
+                    "requested_symbol": s,
                     "error": str(r),
                     "provider": PROVIDER_NAME,
                     "provider_version": PROVIDER_VERSION,
                     "data_sources": [PROVIDER_NAME],
                 }
         return out
+
+    async def fetch_prices(self, symbols: List[str], debug: bool = False) -> Dict[str, Dict[str, Any]]:
+        return await self.fetch_batch(symbols, debug=debug)
 
     async def clear_caches(self) -> None:
         await self.quote_cache.clear()
@@ -1397,12 +1623,24 @@ async def fetch_enriched_quote_patch(symbol: str, debug: bool = False, *args: An
     return await (await aget_provider()).fetch_enriched_quote_patch(symbol, debug=debug, *args, **kwargs)
 
 
-# Compatibility alias
-fetch_quote_patch = fetch_enriched_quote_patch
+async def fetch_quote_patch(symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    return await (await aget_provider()).fetch_quote_patch(symbol, debug=debug, *args, **kwargs)
+
+
+async def fetch_quote(symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    return await (await aget_provider()).fetch_quote(symbol, debug=debug, *args, **kwargs)
+
+
+async def get_quote(symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    return await (await aget_provider()).get_quote(symbol, debug=debug, *args, **kwargs)
 
 
 async def fetch_batch_patch(symbols: List[str], debug: bool = False) -> Dict[str, Dict[str, Any]]:
     return await (await aget_provider()).fetch_batch(symbols, debug=debug)
+
+
+async def fetch_prices(symbols: List[str], debug: bool = False) -> Dict[str, Dict[str, Any]]:
+    return await (await aget_provider()).fetch_prices(symbols, debug=debug)
 
 
 async def fetch_history(symbol: str, period: Optional[str] = None, interval: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -1431,7 +1669,7 @@ async def aclose_yahoo_client() -> None:
 
 
 # =============================================================================
-# Loader-friendly adapter (NO await required to obtain provider)
+# Loader-friendly adapter
 # =============================================================================
 class YahooProviderAdapter:
     async def get_quote(self, symbol: str) -> Dict[str, Any]:
@@ -1443,6 +1681,12 @@ class YahooProviderAdapter:
     async def fetch_quote(self, symbol: str) -> Dict[str, Any]:
         return await fetch_enriched_quote_patch(symbol)
 
+    async def fetch_quote_patch(self, symbol: str) -> Dict[str, Any]:
+        return await fetch_enriched_quote_patch(symbol)
+
+    async def fetch_prices(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+        return await fetch_batch_patch(symbols)
+
     async def history(self, symbol: str, period: Optional[str] = None, interval: Optional[str] = None) -> List[Dict[str, Any]]:
         return await fetch_history(symbol, period=period, interval=interval)
 
@@ -1450,7 +1694,6 @@ class YahooProviderAdapter:
         await aclose_yahoo_client()
 
 
-# Export loader-friendly names
 provider = YahooProviderAdapter()
 PROVIDER = provider
 Provider = YahooProviderAdapter
@@ -1493,18 +1736,21 @@ if __name__ == "__main__":
 __all__ = [
     "PROVIDER_NAME",
     "PROVIDER_VERSION",
-    # engine async exports
+    "VERSION",
+    "YahooChartProvider",
     "aget_provider",
     "fetch_enriched_quote_patch",
     "fetch_quote_patch",
+    "fetch_quote",
+    "get_quote",
     "fetch_batch_patch",
+    "fetch_prices",
     "fetch_history",
     "get_history",
     "get_client_metrics",
     "health_check",
     "clear_caches",
     "aclose_yahoo_client",
-    # loader-friendly exports
     "provider",
     "PROVIDER",
     "Provider",
