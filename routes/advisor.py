@@ -2,24 +2,26 @@
 """
 routes/advisor.py
 ================================================================================
-ADVISOR ROUTER — v6.0.0
+ADVISOR ROUTER — v6.1.0
 ================================================================================
 SHORT-ADVISOR FAMILY RESTORED • LIVE-BY-DEFAULT • UNIFIED-SHEET-ROWS
 RESOLVER-HARDENED • QUERY+BODY COMPATIBLE • JSON-SAFE • ENGINE-TOLERANT
-ADVANCED-ROUTER BRIDGE • TOP10 DEFAULT • ASYNC-SAFE
+ADVANCED-ROUTER BRIDGE • ADVISOR-FIRST FOR DERIVED PAGES • ASYNC-SAFE
 
 Why this revision
 -----------------
-- Restores the short advisor family under `/v1/advisor/*`.
-- Adds direct `/v1/advisor/sheet-rows` and `/v1/advisor/sheet_rows`.
-- Bridges short advisor sheet-rows to `routes.advanced_analysis` so schema,
-  root/v1 behavior, Top10, Insights, and dictionary handling stay aligned.
-- Prefers LIVE mode and defaults to `Top_10_Investments` when advisor-specific
-  endpoints are called without an explicit page.
-- Tolerantly resolves advisor runners from `routes.investment_advisor`,
-  `core.investment_advisor`, and `core.investment_advisor_engine`.
-- Falls back safely to schema-aligned sheet-rows output when a dedicated
-  advisor runner is unavailable.
+- FIX: derived advisor pages (`Top_10_Investments`, `Insights_Analysis`) now
+  prefer a real advisor runner before falling back to advanced sheet-rows.
+- FIX: base/source pages still bridge to advanced/engine sheet-rows directly, so
+  canonical schema behavior remains aligned with the analysis routes.
+- FIX: advisor runner resolution now checks `app.state` first, then modules,
+  service objects, factories, and tolerant private implementation names.
+- FIX: adds engine-level sheet-rows fallback if `routes.advanced_analysis` is
+  unavailable or its private implementation name differs.
+- FIX: normalizes list / model / dataclass / mapping outputs into a stable JSON
+  envelope so `/recommendations`, `/run`, and `/sheet-rows` stay robust.
+- FIX: keeps live mode default, Top10 default page, request-id propagation, and
+  auth/open-mode compatibility.
 """
 
 from __future__ import annotations
@@ -35,7 +37,7 @@ from datetime import date, datetime, time as dt_time, timezone
 from decimal import Decimal
 from enum import Enum
 from importlib import import_module
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from fastapi import Body, Header, HTTPException, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
@@ -44,7 +46,7 @@ from fastapi.routing import APIRouter
 logger = logging.getLogger("routes.advisor")
 logger.addHandler(logging.NullHandler())
 
-ADVISOR_VERSION = "6.0.0"
+ADVISOR_VERSION = "6.1.0"
 
 router = APIRouter(prefix="/v1/advisor", tags=["advisor"])
 
@@ -56,11 +58,11 @@ BASE_PAGES = {
     "Mutual_Funds",
     "My_Portfolio",
 }
-SPECIAL_PAGES = {
+DERIVED_ADVISOR_PAGES = {
     "Top_10_Investments",
     "Insights_Analysis",
-    "Data_Dictionary",
 }
+DIRECT_BRIDGE_PAGES = BASE_PAGES | {"Data_Dictionary"}
 
 RUNNER_MODULE_CANDIDATES: Tuple[str, ...] = (
     "routes.investment_advisor",
@@ -69,6 +71,8 @@ RUNNER_MODULE_CANDIDATES: Tuple[str, ...] = (
 )
 
 RUNNER_FUNCTION_CANDIDATES: Tuple[str, ...] = (
+    "_run_investment_advisor_impl",
+    "_run_advisor_impl",
     "run_investment_advisor_engine",
     "run_investment_advisor",
     "run_advisor",
@@ -97,8 +101,24 @@ SERVICE_OBJECT_CANDIDATES: Tuple[str, ...] = (
     "investment_advisor_service",
     "advisor_runner",
     "advisor_engine",
+    "investment_advisor_engine",
     "engine",
     "service",
+)
+
+ADVANCED_IMPL_CANDIDATES: Tuple[str, ...] = (
+    "_run_advanced_sheet_rows_impl",
+    "run_advanced_sheet_rows_impl",
+    "_advanced_sheet_rows_impl",
+)
+
+ENGINE_SHEET_ROWS_METHOD_CANDIDATES: Tuple[str, ...] = (
+    "get_sheet_rows",
+    "sheet_rows",
+    "fetch_sheet_rows",
+    "build_sheet_rows",
+    "read_sheet_rows",
+    "run_sheet_rows",
 )
 
 # -----------------------------------------------------------------------------
@@ -150,18 +170,6 @@ def _safe_int(v: Any, default: int) -> int:
         return int(float(v))
     except Exception:
         return default
-
-
-def _safe_float(v: Any) -> Optional[float]:
-    try:
-        if v is None or isinstance(v, bool):
-            return None
-        f = float(v)
-        if math.isnan(f) or math.isinf(f):
-            return None
-        return f
-    except Exception:
-        return None
 
 
 def _boolish(v: Any, default: bool = False) -> bool:
@@ -265,6 +273,16 @@ def _json_safe(value: Any) -> Any:
             return {str(k): _clean(v) for k, v in obj.items()}
         if isinstance(obj, (list, tuple, set)):
             return [_clean(x) for x in obj]
+        if hasattr(obj, "model_dump") and callable(getattr(obj, "model_dump")):
+            try:
+                return _clean(obj.model_dump(mode="python"))
+            except Exception:
+                pass
+        if hasattr(obj, "dict") and callable(getattr(obj, "dict")):
+            try:
+                return _clean(obj.dict())
+            except Exception:
+                pass
         try:
             return jsonable_encoder(obj)
         except Exception:
@@ -505,6 +523,7 @@ def _default_payload(data: Mapping[str, Any], default_page: str = DEFAULT_ADVISO
         payload["symbols"] = symbols
         payload["tickers"] = list(symbols)
 
+    payload["top_n"] = max(1, min(100, _safe_int(payload.get("top_n"), 10)))
     payload["limit"] = max(1, min(5000, _safe_int(payload.get("limit"), 200)))
     payload["offset"] = max(0, _safe_int(payload.get("offset"), 0))
     return payload
@@ -592,65 +611,119 @@ async def _call_with_tolerant_signatures(fn: Callable[..., Any], *args: Any, **k
     return None
 
 
-def _resolve_runner_from_module(module: Any):
+async def _call_factory(factory: Callable[..., Any]) -> Any:
+    try:
+        out = factory()
+        if inspect.isawaitable(out):
+            out = await out
+        return out
+    except Exception:
+        return None
+
+
+def _resolve_callable_from_object(obj: Any, *, object_name: str, module_name: str) -> Tuple[Optional[Callable[..., Any]], Dict[str, Any]]:
+    if obj is None:
+        return None, {}
+
+    if callable(obj) and object_name in RUNNER_FUNCTION_CANDIDATES:
+        return obj, {"module": module_name, "callable": object_name, "kind": "direct_callable"}
+
+    for method_name in RUNNER_METHOD_CANDIDATES:
+        fn = getattr(obj, method_name, None)
+        if callable(fn):
+            return fn, {
+                "module": module_name,
+                "object": object_name,
+                "callable": method_name,
+                "kind": "object_method",
+            }
+    return None, {}
+
+
+async def _resolve_runner_from_state(request: Request) -> Tuple[Optional[Callable[..., Any]], Dict[str, Any]]:
+    try:
+        state = request.app.state
+    except Exception:
+        return None, {}
+
+    for attr_name in RUNNER_FUNCTION_CANDIDATES:
+        candidate = getattr(state, attr_name, None)
+        if callable(candidate):
+            return candidate, {"module": "app.state", "callable": attr_name, "kind": "state_function"}
+
+    for attr_name in SERVICE_OBJECT_CANDIDATES:
+        obj = getattr(state, attr_name, None)
+        fn, meta = _resolve_callable_from_object(obj, object_name=attr_name, module_name="app.state")
+        if fn is not None:
+            return fn, meta
+
+    for factory_name in ("get_service", "build_service", "create_service", "get_advisor_service"):
+        factory = getattr(state, factory_name, None)
+        if not callable(factory):
+            continue
+        obj = await _call_factory(factory)
+        fn, meta = _resolve_callable_from_object(obj, object_name=factory_name, module_name="app.state")
+        if fn is not None:
+            meta["kind"] = "state_factory_method"
+            return fn, meta
+
+    return None, {}
+
+
+async def _resolve_runner_from_module(module: Any) -> Tuple[Optional[Callable[..., Any]], Dict[str, Any]]:
     if module is None:
         return None, {}
+
+    module_name = getattr(module, "__name__", "unknown")
 
     for fn_name in RUNNER_FUNCTION_CANDIDATES:
         fn = getattr(module, fn_name, None)
         if callable(fn):
-            return fn, {"module": getattr(module, "__name__", "unknown"), "callable": fn_name, "kind": "function"}
+            return fn, {"module": module_name, "callable": fn_name, "kind": "function"}
 
     for obj_name in SERVICE_OBJECT_CANDIDATES:
         obj = getattr(module, obj_name, None)
-        if obj is None:
-            continue
-        for method_name in RUNNER_METHOD_CANDIDATES:
-            fn = getattr(obj, method_name, None)
-            if callable(fn):
-                return fn, {
-                    "module": getattr(module, "__name__", "unknown"),
-                    "object": obj_name,
-                    "callable": method_name,
-                    "kind": "object_method",
-                }
+        fn, meta = _resolve_callable_from_object(obj, object_name=obj_name, module_name=module_name)
+        if fn is not None:
+            return fn, meta
 
     for factory_name in ("get_service", "build_service", "create_service", "get_advisor_service"):
         factory = getattr(module, factory_name, None)
         if not callable(factory):
             continue
-        try:
-            obj = factory()
-            if inspect.isawaitable(obj):
-                continue
-            if obj is None:
-                continue
-            for method_name in RUNNER_METHOD_CANDIDATES:
-                fn = getattr(obj, method_name, None)
-                if callable(fn):
-                    return fn, {
-                        "module": getattr(module, "__name__", "unknown"),
-                        "object": factory_name,
-                        "callable": method_name,
-                        "kind": "factory_method",
-                    }
-        except Exception:
-            continue
+        obj = await _call_factory(factory)
+        fn, meta = _resolve_callable_from_object(obj, object_name=factory_name, module_name=module_name)
+        if fn is not None:
+            meta["kind"] = "factory_method"
+            return fn, meta
 
     return None, {}
 
 
-def _resolve_advisor_runner():
+async def _resolve_advisor_runner(request: Request) -> Tuple[Optional[Callable[..., Any]], Dict[str, Any]]:
+    fn, meta = await _resolve_runner_from_state(request)
+    if fn is not None:
+        return fn, meta
+
     for module_name in RUNNER_MODULE_CANDIDATES:
         module = _import_module_safely(module_name)
-        fn, meta = _resolve_runner_from_module(module)
+        fn, meta = await _resolve_runner_from_module(module)
         if fn is not None:
             return fn, meta
     return None, {}
 
 
-def _is_payload_like(value: Any) -> bool:
-    return isinstance(value, Mapping)
+async def _resolve_advanced_impl() -> Optional[Callable[..., Any]]:
+    module = _import_module_safely("routes.advanced_analysis")
+    if module is None:
+        return None
+
+    for name in ADVANCED_IMPL_CANDIDATES:
+        impl = getattr(module, name, None)
+        if callable(impl):
+            return impl
+
+    return None
 
 
 async def _delegate_to_advanced_sheet_rows(
@@ -663,12 +736,8 @@ async def _delegate_to_advanced_sheet_rows(
     authorization: Optional[str],
     x_request_id: Optional[str],
 ) -> Dict[str, Any]:
-    module = _import_module_safely("routes.advanced_analysis")
-    if module is None:
-        raise HTTPException(status_code=503, detail="Advanced analysis router not available")
-
-    impl = getattr(module, "_run_advanced_sheet_rows_impl", None)
-    if not callable(impl):
+    impl = await _resolve_advanced_impl()
+    if impl is None:
         raise HTTPException(status_code=503, detail="Advanced sheet-rows implementation not available")
 
     out = impl(
@@ -683,9 +752,108 @@ async def _delegate_to_advanced_sheet_rows(
     )
     if inspect.isawaitable(out):
         out = await out
-    if not isinstance(out, dict):
-        return _json_safe({"status": "error", "detail": "Unexpected advanced-analysis response"})
-    return _json_safe(out)
+    result = _normalize_result_payload(out, page=_extract_page(payload))
+    return result
+
+
+async def _run_engine_sheet_rows_fallback(
+    *,
+    request: Request,
+    payload: Dict[str, Any],
+    request_id: str,
+) -> Optional[Dict[str, Any]]:
+    engine = await _get_engine(request)
+    if engine is None:
+        return None
+
+    page = _extract_page(payload)
+    include_matrix = _boolish(payload.get("include_matrix"), True)
+    mode = _strip(payload.get("mode")) or "live"
+
+    last_error: Optional[Exception] = None
+    for method_name in ENGINE_SHEET_ROWS_METHOD_CANDIDATES:
+        method = getattr(engine, method_name, None)
+        if not callable(method):
+            continue
+
+        attempts = [
+            {
+                "request": request,
+                "body": payload,
+                "mode": mode,
+                "include_matrix": include_matrix,
+                "page": page,
+                "sheet": page,
+                "sheet_name": page,
+                "target_sheet": page,
+                "limit": payload.get("limit"),
+                "offset": payload.get("offset"),
+            },
+            {
+                "body": payload,
+                "mode": mode,
+                "include_matrix": include_matrix,
+                "page": page,
+                "sheet": page,
+                "sheet_name": page,
+                "target_sheet": page,
+                "limit": payload.get("limit"),
+                "offset": payload.get("offset"),
+            },
+            {
+                "body": payload,
+                "page": page,
+                "sheet": page,
+                "sheet_name": page,
+                "target_sheet": page,
+            },
+            {"page": page, "sheet": page, "sheet_name": page, "target_sheet": page},
+            {"sheet": page},
+            {},
+        ]
+
+        for kwargs in attempts:
+            kwargs = {k: v for k, v in kwargs.items() if v is not None}
+            try:
+                out = method(**kwargs)
+                if inspect.isawaitable(out):
+                    out = await out
+                result = _normalize_result_payload(out, page=page)
+                meta = _safe_dict(result.get("meta"))
+                meta.setdefault("resolver", {"source": _safe_engine_type(engine), "callable": method_name, "kind": "engine_fallback"})
+                meta.setdefault("request_id", request_id)
+                result["meta"] = meta
+                return result
+            except TypeError as exc:
+                last_error = exc
+                continue
+            except Exception as exc:
+                last_error = exc
+                continue
+
+    if last_error is not None:
+        logger.warning("Engine sheet-rows fallback failed. error=%s", last_error, exc_info=True)
+    return None
+
+
+def _normalize_result_payload(out: Any, *, page: str) -> Dict[str, Any]:
+    safe = _json_safe(out)
+
+    if isinstance(safe, Mapping):
+        result = dict(safe)
+    elif isinstance(safe, list):
+        result = {"status": "success", "page": page, "data": safe, "items": safe}
+        if all(isinstance(x, Mapping) for x in safe):
+            result.setdefault("rows", safe)
+    else:
+        result = {"status": "success", "page": page, "data": safe}
+
+    result.setdefault("status", "success")
+    result.setdefault("page", page)
+    result.setdefault("sheet", result.get("page") or page)
+    result.setdefault("sheet_name", result.get("page") or page)
+    result.setdefault("meta", {})
+    return result
 
 
 def _envelope_from_payload_result(
@@ -695,25 +863,69 @@ def _envelope_from_payload_result(
     request_id: str,
     started_at: float,
     resolver_meta: Optional[Dict[str, Any]] = None,
+    operation: str = "sheet_rows",
 ) -> Dict[str, Any]:
-    meta = _safe_dict(result.get("meta"))
+    out = _normalize_result_payload(result, page=page)
+    meta = _safe_dict(out.get("meta"))
     meta.update({
         "request_id": request_id,
         "elapsed_ms": round((time.perf_counter() - started_at) * 1000.0, 2),
         "router": "advisor_short",
         "advisor_version": ADVISOR_VERSION,
         "page": page,
+        "operation": operation,
     })
     if resolver_meta:
         meta["resolver"] = resolver_meta
 
-    out = dict(result)
     out["status"] = _strip(out.get("status")) or "success"
     out["page"] = _strip(out.get("page")) or page
     out["sheet"] = _strip(out.get("sheet")) or out["page"]
     out["sheet_name"] = _strip(out.get("sheet_name")) or out["page"]
     out["meta"] = meta
     return _json_safe(out)
+
+
+def _prefer_direct_bridge(page: str, *, operation: str) -> bool:
+    if page == "Data_Dictionary":
+        return True
+    if operation == "sheet_rows" and page in DIRECT_BRIDGE_PAGES:
+        return True
+    return False
+
+
+def _prefer_runner(page: str, *, operation: str) -> bool:
+    if page in DERIVED_ADVISOR_PAGES:
+        return True
+    if operation in {"recommendations", "run"} and page != "Data_Dictionary":
+        return True
+    if page not in DIRECT_BRIDGE_PAGES:
+        return True
+    return False
+
+
+async def _run_advisor_runner(
+    *,
+    request: Request,
+    payload: Dict[str, Any],
+    page: str,
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    runner, resolver_meta = await _resolve_advisor_runner(request)
+    if runner is None:
+        return None, {}
+
+    try:
+        out = await _call_with_tolerant_signatures(
+            runner,
+            request=request,
+            body=payload,
+            payload=payload,
+            mode=_strip(payload.get("mode")) or "live",
+        )
+        return _normalize_result_payload(out, page=page), resolver_meta
+    except Exception as exc:
+        logger.warning("Advisor runner failed; page=%s error=%s", page, exc, exc_info=True)
+        return None, resolver_meta or {}
 
 
 async def _run_advisor_logic(
@@ -724,6 +936,7 @@ async def _run_advisor_logic(
     x_app_token: Optional[str],
     authorization: Optional[str],
     x_request_id: Optional[str],
+    operation: str = "sheet_rows",
 ) -> Dict[str, Any]:
     started_at = time.perf_counter()
     _require_auth_or_401(token_query=token, x_app_token=x_app_token, authorization=authorization)
@@ -735,7 +948,59 @@ async def _run_advisor_logic(
     payload["sheet"] = page
     payload["sheet_name"] = page
 
-    if page in BASE_PAGES or page in SPECIAL_PAGES:
+    if _prefer_direct_bridge(page, operation=operation):
+        try:
+            advanced_result = await _delegate_to_advanced_sheet_rows(
+                request=request,
+                payload=payload,
+                include_matrix_q=_boolish(payload.get("include_matrix"), True),
+                token=token,
+                x_app_token=x_app_token,
+                authorization=authorization,
+                x_request_id=request_id,
+            )
+            return _envelope_from_payload_result(
+                result=advanced_result,
+                page=page,
+                request_id=request_id,
+                started_at=started_at,
+                resolver_meta={"source": "routes.advanced_analysis", "kind": "bridge"},
+                operation=operation,
+            )
+        except Exception as exc:
+            logger.warning("Advanced bridge failed; falling back to engine. page=%s error=%s", page, exc, exc_info=True)
+            engine_result = await _run_engine_sheet_rows_fallback(
+                request=request,
+                payload=payload,
+                request_id=request_id,
+            )
+            if engine_result is not None:
+                return _envelope_from_payload_result(
+                    result=engine_result,
+                    page=page,
+                    request_id=request_id,
+                    started_at=started_at,
+                    resolver_meta={"source": "engine", "kind": "direct_fallback"},
+                    operation=operation,
+                )
+
+    if _prefer_runner(page, operation=operation):
+        runner_result, runner_meta = await _run_advisor_runner(
+            request=request,
+            payload=payload,
+            page=page,
+        )
+        if runner_result is not None:
+            return _envelope_from_payload_result(
+                result=runner_result,
+                page=page,
+                request_id=request_id,
+                started_at=started_at,
+                resolver_meta=runner_meta,
+                operation=operation,
+            )
+
+    try:
         advanced_result = await _delegate_to_advanced_sheet_rows(
             request=request,
             payload=payload,
@@ -750,60 +1015,37 @@ async def _run_advisor_logic(
             page=page,
             request_id=request_id,
             started_at=started_at,
-            resolver_meta={"source": "routes.advanced_analysis", "kind": "bridge"},
+            resolver_meta={"source": "routes.advanced_analysis", "kind": "fallback_bridge"},
+            operation=operation,
         )
+    except Exception as exc:
+        logger.warning("Advanced bridge fallback failed; page=%s error=%s", page, exc, exc_info=True)
 
-    runner, resolver_meta = _resolve_advisor_runner()
-    if runner is not None:
-        try:
-            out = await _call_with_tolerant_signatures(
-                runner,
-                request=request,
-                body=payload,
-                payload=payload,
-                mode=_strip(payload.get("mode")) or "live",
-            )
-            if isinstance(out, dict):
-                return _envelope_from_payload_result(
-                    result=out,
-                    page=page,
-                    request_id=request_id,
-                    started_at=started_at,
-                    resolver_meta=resolver_meta,
-                )
-            if _is_payload_like(out):
-                return _envelope_from_payload_result(
-                    result=dict(out),
-                    page=page,
-                    request_id=request_id,
-                    started_at=started_at,
-                    resolver_meta=resolver_meta,
-                )
-        except Exception as exc:
-            logger.warning("Advisor runner failed; falling back to advanced sheet-rows. error=%s", exc, exc_info=True)
-
-    advanced_result = await _delegate_to_advanced_sheet_rows(
+    engine_result = await _run_engine_sheet_rows_fallback(
         request=request,
         payload=payload,
-        include_matrix_q=_boolish(payload.get("include_matrix"), True),
-        token=token,
-        x_app_token=x_app_token,
-        authorization=authorization,
-        x_request_id=request_id,
-    )
-    return _envelope_from_payload_result(
-        result=advanced_result,
-        page=page,
         request_id=request_id,
-        started_at=started_at,
-        resolver_meta={"source": "routes.advanced_analysis", "kind": "fallback_bridge"},
     )
+    if engine_result is not None:
+        return _envelope_from_payload_result(
+            result=engine_result,
+            page=page,
+            request_id=request_id,
+            started_at=started_at,
+            resolver_meta={"source": "engine", "kind": "final_fallback"},
+            operation=operation,
+        )
+
+    raise HTTPException(status_code=503, detail="Advisor router could not resolve runner or sheet-rows provider")
 
 
 @router.get("/health")
+@router.get("/healthz")
+@router.get("/ping")
 async def advisor_health(request: Request) -> Dict[str, Any]:
     engine = await _get_engine(request)
-    runner, resolver_meta = _resolve_advisor_runner()
+    runner, resolver_meta = await _resolve_advisor_runner(request)
+    advanced_impl = await _resolve_advanced_impl()
 
     settings_summary: Dict[str, Any] = {}
     try:
@@ -817,16 +1059,18 @@ async def advisor_health(request: Request) -> Dict[str, Any]:
         settings_summary = {}
 
     return _json_safe({
-        "status": "ok" if engine is not None else "degraded",
+        "status": "ok" if (engine is not None or runner is not None) else "degraded",
         "version": ADVISOR_VERSION,
         "short_family": True,
         "engine_available": bool(engine),
         "engine_type": _safe_engine_type(engine),
         "advisor_runner_available": bool(runner),
         "advisor_runner": resolver_meta or None,
+        "advanced_impl_available": bool(advanced_impl),
         "default_page": DEFAULT_ADVISOR_PAGE,
         "base_pages": sorted(BASE_PAGES),
-        "special_pages": sorted(SPECIAL_PAGES),
+        "derived_pages": sorted(DERIVED_ADVISOR_PAGES),
+        "direct_bridge_pages": sorted(DIRECT_BRIDGE_PAGES),
         "open_mode": _is_open_mode_enabled(),
         "settings": settings_summary or None,
         "timestamp_utc": _now_utc(),
@@ -837,7 +1081,8 @@ async def advisor_health(request: Request) -> Dict[str, Any]:
 @router.get("/meta")
 async def advisor_meta(request: Request) -> Dict[str, Any]:
     engine = await _get_engine(request)
-    runner, resolver_meta = _resolve_advisor_runner()
+    runner, resolver_meta = await _resolve_advisor_runner(request)
+    advanced_impl = await _resolve_advanced_impl()
     return _json_safe({
         "status": "success",
         "version": ADVISOR_VERSION,
@@ -847,6 +1092,7 @@ async def advisor_meta(request: Request) -> Dict[str, Any]:
         "engine_type": _safe_engine_type(engine),
         "advisor_runner_available": bool(runner),
         "advisor_runner": resolver_meta or None,
+        "advanced_impl_available": bool(advanced_impl),
         "timestamp_utc": _now_utc(),
         "request_id": _strip(getattr(request.state, "request_id", "")) or None,
     })
@@ -909,6 +1155,7 @@ async def advisor_sheet_rows_get(
         x_app_token=x_app_token,
         authorization=authorization,
         x_request_id=x_request_id,
+        operation="sheet_rows",
     )
 
 
@@ -929,6 +1176,7 @@ async def advisor_sheet_rows_post(
         x_app_token=x_app_token,
         authorization=authorization,
         x_request_id=x_request_id,
+        operation="sheet_rows",
     )
 
 
@@ -975,6 +1223,7 @@ async def advisor_recommendations_get(
         x_app_token=x_app_token,
         authorization=authorization,
         x_request_id=x_request_id,
+        operation="recommendations",
     )
 
 
@@ -996,6 +1245,7 @@ async def advisor_recommendations_post(
         x_app_token=x_app_token,
         authorization=authorization,
         x_request_id=x_request_id,
+        operation="recommendations",
     )
 
 
@@ -1039,6 +1289,7 @@ async def advisor_run_get(
         x_app_token=x_app_token,
         authorization=authorization,
         x_request_id=x_request_id,
+        operation="run",
     )
 
 
@@ -1058,4 +1309,8 @@ async def advisor_run_post(
         x_app_token=x_app_token,
         authorization=authorization,
         x_request_id=x_request_id,
+        operation="run",
     )
+
+
+__all__ = ["router"]
