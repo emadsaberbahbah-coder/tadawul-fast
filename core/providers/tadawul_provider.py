@@ -2,46 +2,27 @@
 # core/providers/tadawul_provider.py
 """
 ================================================================================
-Tadawul Provider (KSA Market Data) — v4.3.0 (KSA CLASSIFICATION FIX + SCHEMA KEYS)
+Tadawul Provider (KSA Market Data) — v4.4.0
 ================================================================================
 
-Phase E — KSA completeness fix (your key constraint)
-----------------------------------------------------
-KSA Market_Leaders was missing: country / sector / industry + inconsistent identity fields.
-
-This revision guarantees (even when Tadawul payloads are sparse):
-- ✅ country is ALWAYS set for KSA: country="SAU"
-- ✅ currency ALWAYS set: currency="SAR"
-- ✅ exchange ALWAYS set: exchange="Tadawul"
-- ✅ name best-effort from Tadawul payloads, else fallback to symbol
-- ✅ sector/industry best-effort extraction from ALL Tadawul payload shapes (quote/fundamentals/profile)
-- ✅ canonical schema keys emitted whenever possible:
-    country, sector, industry, name, exchange, currency, asset_class,
-    current_price, previous_close, open_price, day_high, day_low,
-    week_52_high, week_52_low, volume, market_cap,
-    price_change, percent_change, week_52_position_pct,
-    rsi_14, volatility_30d,
-    forecast_price_1m/3m/12m, expected_roi_1m/3m/12m, forecast_confidence,
-    last_updated_utc, last_updated_riyadh
+Why this revision
+-----------------
+- Stronger KSA quote/profile extraction from sparse Tadawul payloads
+- History parser now supports OHLCV arrays and list-of-dict payloads
+- History patch can now backfill quote fields when real-time payload is sparse:
+    current_price, previous_close, open_price, day_high, day_low, volume
+- Adds history-derived:
+    avg_volume_10d, avg_volume_30d,
+    week_52_high, week_52_low, week_52_position_pct,
+    rsi_14, volatility_30d
+- Keeps KSA defaults guaranteed:
+    country=SAU, currency=SAR, exchange=Tadawul
+- Keeps startup-safe import behavior and async-compatible public exports
 
 Notes
-- This provider is KSA-only. EODHD is not used for KSA.
-- Sector/industry may still be missing if Tadawul does not provide classification for a symbol;
-  Argaam provider (next phase) should enrich missing classification/profile fields.
-
-Exported (engine-compatible)
-- fetch_enriched_quote_patch(symbol)
-- fetch_quote_patch(symbol)
-- fetch_fundamentals_patch(symbol)
-- fetch_history_patch(symbol)
-
-Adapter exports (router/health-friendly)
-- provider, get_provider(), build_provider()
-
-Startup safety
-- No network I/O at import-time.
-- Optional deps never crash startup.
-
+-----
+- This provider remains KSA-only.
+- Argaam should still be the next fallback for missing classification/profile fields.
 ================================================================================
 """
 
@@ -60,23 +41,22 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 import httpx
 
 # =============================================================================
-# Optional numeric stack (NEVER crash if missing)
+# Optional numeric stack (never crash if missing)
 # =============================================================================
 try:
     import numpy as _np  # type: ignore
-
     _HAS_NUMPY = True
 except Exception:
     _np = None  # type: ignore
     _HAS_NUMPY = False
 
 # ---------------------------------------------------------------------------
-# High-Performance JSON fallback
+# High-performance JSON fallback
 # ---------------------------------------------------------------------------
 try:
     import orjson  # type: ignore
@@ -92,46 +72,7 @@ except Exception:
         return json.loads(data)
 
 # ---------------------------------------------------------------------------
-# Optional Scientific & ML Stack (safe)
-# ---------------------------------------------------------------------------
-try:
-    from scipy import stats  # type: ignore
-
-    SCIPY_AVAILABLE = True
-except Exception:
-    stats = None  # type: ignore
-    SCIPY_AVAILABLE = False
-
-try:
-    from sklearn.ensemble import RandomForestRegressor  # type: ignore
-
-    SKLEARN_AVAILABLE = True
-except Exception:
-    RandomForestRegressor = None  # type: ignore
-    SKLEARN_AVAILABLE = False
-
-try:
-    import xgboost as xgb  # type: ignore
-
-    XGB_AVAILABLE = True
-except Exception:
-    xgb = None  # type: ignore
-    XGB_AVAILABLE = False
-
-try:
-    from statsmodels.tsa.arima.model import ARIMA as StatsARIMA  # type: ignore
-
-    import warnings
-    from statsmodels.tools.sm_exceptions import ConvergenceWarning  # type: ignore
-
-    warnings.simplefilter("ignore", ConvergenceWarning)
-    STATSMODELS_AVAILABLE = True
-except Exception:
-    StatsARIMA = None  # type: ignore
-    STATSMODELS_AVAILABLE = False
-
-# ---------------------------------------------------------------------------
-# Tracing and Metrics Stack (safe)
+# Optional tracing/metrics (safe)
 # ---------------------------------------------------------------------------
 try:
     from opentelemetry import trace  # type: ignore
@@ -145,18 +86,18 @@ except Exception:
     _OTEL_AVAILABLE = False
 
 try:
-    from prometheus_client import Counter, Histogram, Gauge  # type: ignore
+    from prometheus_client import Counter, Gauge  # type: ignore
 
-    _PROMETHEUS_AVAILABLE = True
+    _PROM_AVAILABLE = True
 except Exception:
-    Counter = Histogram = Gauge = None  # type: ignore
-    _PROMETHEUS_AVAILABLE = False
+    Counter = Gauge = None  # type: ignore
+    _PROM_AVAILABLE = False
 
 logger = logging.getLogger("core.providers.tadawul_provider")
 logger.addHandler(logging.NullHandler())
 
 PROVIDER_NAME = "tadawul"
-PROVIDER_VERSION = "4.3.0"
+PROVIDER_VERSION = "4.4.0"
 
 USER_AGENT_DEFAULT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -166,24 +107,17 @@ USER_AGENT_DEFAULT = (
 
 DEFAULT_TIMEOUT_SEC = 25.0
 DEFAULT_RETRY_ATTEMPTS = 4
-DEFAULT_MAX_CONCURRENCY = 40
-DEFAULT_RATE_LIMIT = 15.0  # requests per second
-DEFAULT_CIRCUIT_BREAKER_THRESHOLD = 5
-DEFAULT_CIRCUIT_BREAKER_TIMEOUT = 30.0
-DEFAULT_QUEUE_SIZE = 2000
+DEFAULT_MAX_CONCURRENCY = 30
+DEFAULT_RATE_LIMIT = 15.0
 
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
-
 _KSA_CODE_RE = re.compile(r"^\d{3,6}$", re.IGNORECASE)
 
 _TRACING_ENABLED = os.getenv("TADAWUL_TRACING_ENABLED", "").strip().lower() in _TRUTHY
 _METRICS_ENABLED = os.getenv("TADAWUL_METRICS_ENABLED", "").strip().lower() in _TRUTHY
 
-# =============================================================================
-# Phase E defaults (KSA identity)
-# =============================================================================
 KSA_COUNTRY_CODE = "SAU"
 KSA_COUNTRY_NAME = "Saudi Arabia"
 KSA_EXCHANGE_NAME = "Tadawul"
@@ -191,14 +125,8 @@ KSA_CURRENCY = "SAR"
 
 
 # =============================================================================
-# Enums & Data Classes
+# Enums & data classes
 # =============================================================================
-class CircuitState(Enum):
-    CLOSED = "closed"
-    OPEN = "open"
-    HALF_OPEN = "half_open"
-
-
 class MarketRegime(Enum):
     BULL = "bull"
     BEAR = "bear"
@@ -215,40 +143,27 @@ class DataQuality(Enum):
     BAD = "bad"
 
 
-class RequestPriority(Enum):
-    LOW = 0
-    NORMAL = 1
-    HIGH = 2
-    CRITICAL = 3
-
-
-@dataclass
-class CircuitBreakerStats:
-    failures: int = 0
-    successes: int = 0
-    state: CircuitState = CircuitState.CLOSED
-    open_until: float = 0.0
-    current_cooldown: float = DEFAULT_CIRCUIT_BREAKER_TIMEOUT
-    total_failures: int = 0
-    total_successes: int = 0
-
-
 @dataclass
 class RequestQueueItem:
-    priority: RequestPriority
+    priority: int
     url: str
     future: asyncio.Future
     created_at: float = field(default_factory=time.time)
 
 
+@dataclass
+class ParsedHistory:
+    rows: List[Dict[str, Any]]
+    last_dt: Optional[datetime]
+
+
 # =============================================================================
-# Shared Normalizer Integration (optional)
+# Shared normalizer integration (optional)
 # =============================================================================
 def _try_import_shared_ksa_helpers() -> Tuple[Optional[Any], Optional[Any]]:
     try:
         from core.symbols.normalize import normalize_ksa_symbol as _nksa  # type: ignore
         from core.symbols.normalize import looks_like_ksa as _lk  # type: ignore
-
         return _nksa, _lk
     except Exception:
         return None, None
@@ -258,7 +173,7 @@ _SHARED_NORM_KSA, _SHARED_LOOKS_KSA = _try_import_shared_ksa_helpers()
 
 
 # =============================================================================
-# Environment Helpers
+# Environment helpers
 # =============================================================================
 def _env_str(name: str, default: str = "") -> str:
     v = os.getenv(name)
@@ -285,10 +200,10 @@ def _env_bool(name: str, default: bool) -> bool:
     raw = (os.getenv(name) or "").strip().lower()
     if not raw:
         return default
-    if raw in _FALSY:
-        return False
     if raw in _TRUTHY:
         return True
+    if raw in _FALSY:
+        return False
     return default
 
 
@@ -302,7 +217,6 @@ def _safe_str(x: Any) -> Optional[str]:
 def _configured() -> bool:
     if not _env_bool("TADAWUL_ENABLED", True):
         return False
-    # At minimum quote URL must exist
     return bool(_safe_str(_env_str("TADAWUL_QUOTE_URL", "")))
 
 
@@ -319,16 +233,11 @@ def _enable_history() -> bool:
 
 
 def _enable_profile() -> bool:
-    # New optional enrichment endpoint (safe): if not configured, no effect.
     return _env_bool("TADAWUL_ENABLE_PROFILE", True)
 
 
 def _enable_forecast() -> bool:
     return _env_bool("TADAWUL_ENABLE_FORECAST", True)
-
-
-def _enable_ml() -> bool:
-    return _env_bool("TADAWUL_ENABLE_ML", True)
 
 
 def _timeout_sec() -> float:
@@ -340,23 +249,11 @@ def _retry_attempts() -> int:
 
 
 def _rate_limit() -> float:
-    return _env_float("TADAWUL_RATE_LIMIT", DEFAULT_RATE_LIMIT)
-
-
-def _circuit_breaker_threshold() -> int:
-    return _env_int("TADAWUL_CB_THRESHOLD", DEFAULT_CIRCUIT_BREAKER_THRESHOLD)
-
-
-def _circuit_breaker_timeout() -> float:
-    return _env_float("TADAWUL_CB_TIMEOUT", DEFAULT_CIRCUIT_BREAKER_TIMEOUT)
+    return max(0.0, _env_float("TADAWUL_RATE_LIMIT", DEFAULT_RATE_LIMIT))
 
 
 def _max_concurrency() -> int:
     return max(2, _env_int("TADAWUL_MAX_CONCURRENCY", DEFAULT_MAX_CONCURRENCY))
-
-
-def _queue_size() -> int:
-    return _env_int("TADAWUL_QUEUE_SIZE", DEFAULT_QUEUE_SIZE)
 
 
 def _quote_ttl_sec() -> float:
@@ -372,7 +269,7 @@ def _hist_ttl_sec() -> float:
 
 
 def _profile_ttl_sec() -> float:
-    return max(3600.0, _env_float("TADAWUL_PROFILE_TTL_SEC", 43200.0))  # 12h default
+    return max(3600.0, _env_float("TADAWUL_PROFILE_TTL_SEC", 43200.0))
 
 
 def _err_ttl_sec() -> float:
@@ -392,20 +289,16 @@ def _extra_headers() -> Dict[str, str]:
     if not raw:
         return {}
     try:
-        js = json.loads(raw)
-        if isinstance(js, dict):
-            return {
-                str(k).strip(): str(v).strip()
-                for k, v in js.items()
-                if str(k).strip() and str(v).strip()
-            }
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            return {str(k).strip(): str(v).strip() for k, v in obj.items() if str(k).strip() and str(v).strip()}
     except Exception:
         pass
     return {}
 
 
 # =============================================================================
-# Time helpers (UTC + Riyadh)
+# Time helpers
 # =============================================================================
 _RIYADH_TZ = timezone(timedelta(hours=3))
 
@@ -434,7 +327,7 @@ def _to_riyadh_iso(dt: Optional[datetime]) -> Optional[str]:
 
 
 # =============================================================================
-# KSA Symbol Normalization (Strict)
+# Symbol normalization (strict KSA)
 # =============================================================================
 def normalize_ksa_symbol(symbol: str) -> str:
     raw = (symbol or "").strip()
@@ -463,19 +356,19 @@ def normalize_ksa_symbol(symbol: str) -> str:
     return ""
 
 
-def format_url(tpl: str, symbol: str, *, days: Optional[int] = None) -> str:
+def format_url(template: str, symbol: str, *, days: Optional[int] = None) -> str:
     sym = normalize_ksa_symbol(symbol)
     if not sym:
-        return tpl
+        return template
     code = sym[:-3] if sym.endswith(".SR") else sym
-    url = tpl.replace("{symbol}", sym).replace("{code}", code)
+    url = template.replace("{symbol}", sym).replace("{code}", code)
     if days is not None:
         url = url.replace("{days}", str(int(days)))
     return url
 
 
 # =============================================================================
-# Safe numeric helpers (no numpy required)
+# Small helpers
 # =============================================================================
 def _diff(arr: List[float]) -> List[float]:
     if len(arr) < 2:
@@ -495,15 +388,6 @@ def _mean(arr: List[float]) -> float:
     return sum(arr) / len(arr) if arr else 0.0
 
 
-def _np_or_py_std(arr: List[float]) -> float:
-    if _HAS_NUMPY and _np is not None and arr:
-        try:
-            return float(_np.std(_np.asarray(arr, dtype=float), ddof=1)) if len(arr) > 1 else 0.0
-        except Exception:
-            return _std(arr)
-    return _std(arr)
-
-
 def safe_float(val: Any) -> Optional[float]:
     if val is None:
         return None
@@ -512,25 +396,18 @@ def safe_float(val: Any) -> Optional[float]:
             f = float(val)
             return f if not math.isnan(f) and not math.isinf(f) else None
         s = str(val).strip()
-        if not s or s.lower() in {"-", "—", "n/a", "na", "null", "none", ""}:
+        if not s or s.lower() in {"-", "—", "n/a", "na", "null", "none"}:
             return None
-        s = (
-            s.translate(_ARABIC_DIGITS)
-            .replace("٬", ",")
-            .replace("٫", ".")
-            .replace("−", "-")
-        )
-        s = s.replace("SAR", "").replace("ريال", "").strip()
-        s = s.replace("%", "").replace(",", "").replace("+", "").strip()
+        s = s.translate(_ARABIC_DIGITS).replace("٬", ",").replace("٫", ".").replace("−", "-")
+        s = s.replace("SAR", "").replace("ريال", "").replace("%", "").replace(",", "").replace("+", "").strip()
         if s.startswith("(") and s.endswith(")"):
             s = "-" + s[1:-1].strip()
         m = re.match(r"^(-?\d+(\.\d+)?)([KMB])$", s, re.IGNORECASE)
         mult = 1.0
         if m:
-            num = m.group(1)
+            s = m.group(1)
             suf = m.group(3).upper()
             mult = 1_000.0 if suf == "K" else 1_000_000.0 if suf == "M" else 1_000_000_000.0
-            s = num
         f = float(s) * mult
         return f if not math.isnan(f) and not math.isinf(f) else None
     except Exception:
@@ -548,13 +425,13 @@ def safe_str(val: Any) -> Optional[str]:
 
 def unwrap_common_envelopes(js: Union[dict, list]) -> Union[dict, list]:
     current = js
-    for _ in range(4):
-        if isinstance(current, dict):
-            for key in ("data", "result", "payload", "quote", "profile", "response", "content"):
-                if key in current and isinstance(current[key], (dict, list)):
-                    current = current[key]
-                    break
-            else:
+    for _ in range(5):
+        if not isinstance(current, dict):
+            break
+        for key in ("data", "result", "payload", "quote", "profile", "response", "content", "results", "items"):
+            nxt = current.get(key)
+            if isinstance(nxt, (dict, list)):
+                current = nxt
                 break
         else:
             break
@@ -569,12 +446,7 @@ def coerce_dict(data: Union[dict, list]) -> dict:
     return {}
 
 
-def find_first_value(
-    obj: Any,
-    keys: Sequence[str],
-    max_depth: int = 8,
-    max_nodes: int = 5000,
-) -> Any:
+def find_first_value(obj: Any, keys: Sequence[str], max_depth: int = 8, max_nodes: int = 5000) -> Any:
     if obj is None:
         return None
     keys_lower = {str(k).strip().lower() for k in keys if k}
@@ -622,47 +494,34 @@ def pick_pct(obj: Any, *keys: str) -> Optional[float]:
     v = safe_float(find_first_value(obj, keys))
     if v is None:
         return None
-    # If it's likely fraction (<= 1), convert to percent-points
     return v * 100.0 if abs(v) <= 1.0 else v
 
 
-def clean_patch(p: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        k: v
-        for k, v in (p or {}).items()
-        if v is not None and not (isinstance(v, str) and not v.strip())
-    }
+def clean_patch(patch: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in (patch or {}).items() if v is not None and not (isinstance(v, str) and not v.strip())}
 
 
 def merge_into(dst: Dict[str, Any], src: Dict[str, Any], *, force_keys: Sequence[str] = ()) -> None:
-    fset = set(force_keys or ())
+    force = set(force_keys or ())
     for k, v in (src or {}).items():
         if v is None:
             continue
-        if (
-            k in fset
-            or k not in dst
-            or dst.get(k) is None
-            or (isinstance(dst.get(k), str) and not str(dst.get(k)).strip())
-        ):
+        if k in force or k not in dst or dst.get(k) is None or (isinstance(dst.get(k), str) and not str(dst.get(k)).strip()):
             dst[k] = v
 
 
 def _ensure_ksa_identity(patch: Dict[str, Any], *, symbol: str) -> None:
-    # Phase E guarantees
     patch["country"] = KSA_COUNTRY_CODE
     patch["currency"] = patch.get("currency") or KSA_CURRENCY
     patch["exchange"] = patch.get("exchange") or KSA_EXCHANGE_NAME
     patch["asset_class"] = patch.get("asset_class") or "EQUITY"
     if not patch.get("name"):
-        # fallback (safe)
         patch["name"] = symbol
 
 
 def fill_derived_quote_fields(patch: Dict[str, Any]) -> None:
     cur = safe_float(patch.get("current_price"))
     prev = safe_float(patch.get("previous_close"))
-    vol = safe_float(patch.get("volume"))
     w52h = safe_float(patch.get("week_52_high"))
     w52l = safe_float(patch.get("week_52_low"))
 
@@ -675,16 +534,9 @@ def fill_derived_quote_fields(patch: Dict[str, Any]) -> None:
         except Exception:
             pass
 
-    if (
-        patch.get("week_52_position_pct") is None
-        and cur is not None
-        and w52h is not None
-        and w52l is not None
-        and w52h != w52l
-    ):
+    if patch.get("week_52_position_pct") is None and cur is not None and w52h is not None and w52l is not None and w52h != w52l:
         patch["week_52_position_pct"] = ((cur - w52l) / (w52h - w52l)) * 100.0
 
-    # legacy aliases (harmless; engine may ignore)
     if patch.get("price") is None and patch.get("current_price") is not None:
         patch["price"] = patch["current_price"]
     if patch.get("prev_close") is None and patch.get("previous_close") is not None:
@@ -700,7 +552,7 @@ def data_quality_score(patch: Dict[str, Any]) -> Tuple[DataQuality, float]:
     if safe_float(patch.get("current_price")) is None:
         score -= 30
     if safe_float(patch.get("previous_close")) is None:
-        score -= 12
+        score -= 10
     if safe_float(patch.get("volume")) is None:
         score -= 8
     if safe_str(patch.get("name")) is None:
@@ -724,7 +576,7 @@ def data_quality_score(patch: Dict[str, Any]) -> Tuple[DataQuality, float]:
 
 
 # =============================================================================
-# Tracing (safe)
+# Tracing
 # =============================================================================
 class TraceContext:
     def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
@@ -735,7 +587,6 @@ class TraceContext:
         self.span = None
 
     async def __aenter__(self):
-        # Prefer proper CM start_as_current_span if available
         if self.tracer:
             try:
                 start_as_current = getattr(self.tracer, "start_as_current_span", None)
@@ -744,7 +595,7 @@ class TraceContext:
                     self.span = self._span_cm.__enter__()
                 else:
                     self.span = self.tracer.start_span(self.name)  # type: ignore
-                if self.span and self.attributes:
+                if self.span:
                     for k, v in self.attributes.items():
                         try:
                             self.span.set_attribute(str(k), v)  # type: ignore
@@ -770,83 +621,43 @@ class TraceContext:
                 self._span_cm.__exit__(exc_type, exc_val, exc_tb)
             except Exception:
                 pass
-        else:
-            if self.span:
-                try:
-                    self.span.end()  # type: ignore
-                except Exception:
-                    pass
+        elif self.span:
+            try:
+                self.span.end()  # type: ignore
+            except Exception:
+                pass
 
 
 def _trace(name: Optional[str] = None):
     def decorator(func):
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
-            trace_name = name or func.__name__
-            async with TraceContext(trace_name, {"function": func.__name__}):
+            async with TraceContext(name or func.__name__, {"function": func.__name__}):
                 return await func(*args, **kwargs)
-
         return wrapper
-
     return decorator
 
 
 # =============================================================================
 # Metrics (optional)
 # =============================================================================
-class MetricsRegistry:
-    def __init__(self, namespace: str = "tadawul"):
-        self.namespace = namespace
-        self._metrics: Dict[str, Any] = {}
-        self._lock = threading.RLock()
-        if _PROMETHEUS_AVAILABLE and _METRICS_ENABLED and Counter and Histogram and Gauge:
-            self._init_metrics()
-
-    def _init_metrics(self):
-        with self._lock:
-            self._metrics["requests_total"] = Counter(
-                f"{self.namespace}_requests_total", "Total requests", ["status"]
-            )
-            self._metrics["queue_size"] = Gauge(
-                f"{self.namespace}_queue_size", "Queue size"
-            )
-            self._metrics["rate_limiter_tokens"] = Gauge(
-                f"{self.namespace}_rate_limiter_tokens", "Tokens"
-            )
-            self._metrics["circuit_breaker_state"] = Gauge(
-                f"{self.namespace}_circuit_breaker_state", "State (1=closed, 0=open, -1=half)"
-            )
-
-    def inc(self, name: str, value: float = 1.0, labels: Optional[Dict[str, str]] = None):
-        if not (_PROMETHEUS_AVAILABLE and _METRICS_ENABLED):
-            return
-        with self._lock:
-            metric = self._metrics.get(name)
-            if not metric:
-                return
-            if labels:
-                metric.labels(**labels).inc(value)
-            else:
-                metric.inc(value)
-
-    def set(self, name: str, value: float, labels: Optional[Dict[str, str]] = None):
-        if not (_PROMETHEUS_AVAILABLE and _METRICS_ENABLED):
-            return
-        with self._lock:
-            metric = self._metrics.get(name)
-            if not metric:
-                return
-            if labels:
-                metric.labels(**labels).set(value)
-            else:
-                metric.set(value)
-
-
-_METRICS = MetricsRegistry()
+if _PROM_AVAILABLE and _METRICS_ENABLED and Counter and Gauge:
+    tadawul_requests_total = Counter("tadawul_requests_total", "Tadawul provider requests", ["status"])
+    tadawul_queue_size = Gauge("tadawul_queue_size", "Tadawul request queue size")
+else:
+    class _DummyMetric:
+        def labels(self, *args: Any, **kwargs: Any):
+            return self
+        def inc(self, *args: Any, **kwargs: Any) -> None:
+            return None
+        def set(self, *args: Any, **kwargs: Any) -> None:
+            return None
+    tadawul_requests_total = _DummyMetric()
+    tadawul_queue_size = _DummyMetric()
 
 
 # =============================================================================
-# Core tools (Cache, Limiter, Circuit Breaker, Queue, SingleFlight)
+# Lightweight async primitives
 # =============================================================================
 class SmartCache:
     def __init__(self, maxsize: int = 5000, ttl: float = 300.0):
@@ -872,18 +683,14 @@ class SmartCache:
     async def set(self, key: str, value: Any, ttl: Optional[float] = None) -> None:
         async with self._lock:
             if len(self._cache) >= self.maxsize and key not in self._cache:
-                await self._evict_lru()
+                oldest = min(self._access_times.items(), key=lambda x: x[1])[0] if self._access_times else None
+                if oldest:
+                    self._cache.pop(oldest, None)
+                    self._expires.pop(oldest, None)
+                    self._access_times.pop(oldest, None)
             self._cache[key] = value
             self._expires[key] = time.monotonic() + (ttl or self.ttl)
             self._access_times[key] = time.monotonic()
-
-    async def _evict_lru(self) -> None:
-        if not self._access_times:
-            return
-        oldest_key = min(self._access_times.items(), key=lambda x: x[1])[0]
-        self._cache.pop(oldest_key, None)
-        self._expires.pop(oldest_key, None)
-        self._access_times.pop(oldest_key, None)
 
     async def size(self) -> int:
         async with self._lock:
@@ -898,127 +705,19 @@ class TokenBucket:
         self.last = time.monotonic()
         self._lock = asyncio.Lock()
 
-    async def acquire(self, tokens: float = 1.0) -> bool:
-        if self.rate <= 0:
-            return True
-        async with self._lock:
-            now = time.monotonic()
-            self.tokens = min(self.capacity, self.tokens + max(0.0, now - self.last) * self.rate)
-            self.last = now
-            if self.tokens >= tokens:
-                self.tokens -= tokens
-                _METRICS.set("rate_limiter_tokens", self.tokens)
-                return True
-            return False
-
     async def wait_and_acquire(self, tokens: float = 1.0) -> None:
+        if self.rate <= 0:
+            return
         while True:
-            if await self.acquire(tokens):
-                return
             async with self._lock:
+                now = time.monotonic()
+                self.tokens = min(self.capacity, self.tokens + max(0.0, now - self.last) * self.rate)
+                self.last = now
+                if self.tokens >= tokens:
+                    self.tokens -= tokens
+                    return
                 wait = (tokens - self.tokens) / self.rate if self.rate > 0 else 0.1
             await asyncio.sleep(min(1.0, max(0.05, wait)))
-
-
-class DynamicCircuitBreaker:
-    def __init__(self, fail_threshold: int = 5, base_cooldown: float = 30.0):
-        self.fail_threshold = int(fail_threshold)
-        self.base_cooldown = float(base_cooldown)
-        self.stats = CircuitBreakerStats(current_cooldown=self.base_cooldown)
-        self.half_open_calls = 0
-        self._lock = asyncio.Lock()
-
-    async def allow_request(self) -> bool:
-        async with self._lock:
-            now = time.monotonic()
-            if self.stats.state == CircuitState.CLOSED:
-                _METRICS.set("circuit_breaker_state", 1)
-                return True
-            if self.stats.state == CircuitState.OPEN:
-                if now >= self.stats.open_until:
-                    self.stats.state = CircuitState.HALF_OPEN
-                    self.half_open_calls = 0
-                    _METRICS.set("circuit_breaker_state", -1)
-                    return True
-                _METRICS.set("circuit_breaker_state", 0)
-                return False
-            # HALF_OPEN
-            if self.half_open_calls < 2:
-                self.half_open_calls += 1
-                _METRICS.set("circuit_breaker_state", -1)
-                return True
-            return False
-
-    async def on_success(self) -> None:
-        async with self._lock:
-            self.stats.successes += 1
-            self.stats.total_successes += 1
-            if self.stats.state == CircuitState.HALF_OPEN:
-                self.stats.state = CircuitState.CLOSED
-                self.stats.failures = 0
-                self.stats.current_cooldown = self.base_cooldown
-                _METRICS.set("circuit_breaker_state", 1)
-            else:
-                self.stats.failures = max(0, self.stats.failures - 1)
-
-    async def on_failure(self, status_code: int = 500) -> None:
-        async with self._lock:
-            self.stats.failures += 1
-            self.stats.total_failures += 1
-
-            if status_code in (401, 403, 429):
-                self.stats.current_cooldown = min(300.0, self.stats.current_cooldown * 1.5)
-
-            if self.stats.state == CircuitState.CLOSED and self.stats.failures >= self.fail_threshold:
-                self.stats.state = CircuitState.OPEN
-                self.stats.open_until = time.monotonic() + self.stats.current_cooldown
-                _METRICS.set("circuit_breaker_state", 0)
-            elif self.stats.state == CircuitState.HALF_OPEN:
-                self.stats.state = CircuitState.OPEN
-                self.stats.current_cooldown = min(300.0, self.stats.current_cooldown * 2.0)
-                self.stats.open_until = time.monotonic() + self.stats.current_cooldown
-                _METRICS.set("circuit_breaker_state", 0)
-
-    def get_stats(self) -> Dict[str, Any]:
-        return {
-            "state": self.stats.state.value,
-            "failures": self.stats.failures,
-            "successes": self.stats.successes,
-            "open_until": self.stats.open_until,
-            "current_cooldown": self.stats.current_cooldown,
-            "total_failures": self.stats.total_failures,
-            "total_successes": self.stats.total_successes,
-        }
-
-
-class RequestQueue:
-    def __init__(self, max_size: int = 1000):
-        self.max_size = int(max_size)
-        self.queues: Dict[RequestPriority, asyncio.Queue] = {
-            RequestPriority.LOW: asyncio.Queue(),
-            RequestPriority.NORMAL: asyncio.Queue(),
-            RequestPriority.HIGH: asyncio.Queue(),
-            RequestPriority.CRITICAL: asyncio.Queue(),
-        }
-        self._lock = asyncio.Lock()
-
-    async def put(self, item: RequestQueueItem) -> bool:
-        async with self._lock:
-            total_size = sum(q.qsize() for q in self.queues.values())
-            if total_size >= self.max_size:
-                return False
-            await self.queues[item.priority].put(item)
-            _METRICS.set("queue_size", total_size + 1)
-            return True
-
-    async def get(self) -> Optional[RequestQueueItem]:
-        for priority in sorted(RequestPriority, key=lambda p: p.value, reverse=True):
-            q = self.queues[priority]
-            if not q.empty():
-                item = await q.get()
-                _METRICS.set("queue_size", sum(qq.qsize() for qq in self.queues.values()))
-                return item
-        return None
 
 
 class SingleFlight:
@@ -1034,14 +733,13 @@ class SingleFlight:
             loop = asyncio.get_running_loop()
             fut = loop.create_future()
             self._futures[key] = fut
-
         try:
             result = await coro_fn()
-            if not fut.cancelled() and not fut.done():
+            if not fut.done():
                 fut.set_result(result)
             return result
         except Exception as e:
-            if not fut.cancelled() and not fut.done():
+            if not fut.done():
                 fut.set_exception(e)
             raise
         finally:
@@ -1050,71 +748,119 @@ class SingleFlight:
 
 
 # =============================================================================
-# Technical Indicators (minimal)
+# History analytics
 # =============================================================================
 def _rsi_14(closes: List[float]) -> Optional[float]:
     if len(closes) < 15:
         return None
-    try:
-        diffs = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
-        gains = [d if d > 0 else 0.0 for d in diffs]
-        losses = [-d if d < 0 else 0.0 for d in diffs]
-        n = 14
-        avg_gain = sum(gains[:n]) / n
-        avg_loss = sum(losses[:n]) / n
-        for i in range(n, len(gains)):
-            avg_gain = (avg_gain * (n - 1) + gains[i]) / n
-            avg_loss = (avg_loss * (n - 1) + losses[i]) / n
-        if avg_loss == 0:
-            return 100.0
-        rs = avg_gain / avg_loss
-        return float(100.0 - (100.0 / (1.0 + rs)))
-    except Exception:
-        return None
+    diffs = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains = [d if d > 0 else 0.0 for d in diffs]
+    losses = [-d if d < 0 else 0.0 for d in diffs]
+    n = 14
+    avg_gain = sum(gains[:n]) / n
+    avg_loss = sum(losses[:n]) / n
+    for i in range(n, len(gains)):
+        avg_gain = (avg_gain * (n - 1) + gains[i]) / n
+        avg_loss = (avg_loss * (n - 1) + losses[i]) / n
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return float(100.0 - (100.0 / (1.0 + rs)))
 
 
 def _volatility_30d(closes: List[float]) -> Optional[float]:
     if len(closes) < 31:
         return None
-    try:
-        window = closes[-31:]
-        rets: List[float] = []
-        for i in range(1, len(window)):
-            if window[i - 1] > 0 and window[i] > 0:
-                rets.append(math.log(window[i] / window[i - 1]))
-        if len(rets) < 2:
-            return None
-        return float(_std(rets) * math.sqrt(252) * 100.0)  # percent points
-    except Exception:
+    window = closes[-31:]
+    rets: List[float] = []
+    for i in range(1, len(window)):
+        if window[i - 1] > 0 and window[i] > 0:
+            rets.append(math.log(window[i] / window[i - 1]))
+    if len(rets) < 2:
         return None
+    return float(_std(rets) * math.sqrt(252) * 100.0)
 
 
-# =============================================================================
-# History Analytics (light + schema aligned)
-# =============================================================================
-def compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
-    if not closes or len(closes) < 20:
+def _avg_last(values: List[float], n: int) -> Optional[float]:
+    if not values:
+        return None
+    window = values[-n:] if len(values) >= n else values
+    vals = [v for v in window if v is not None]
+    return float(_mean(vals)) if vals else None
+
+
+def compute_history_analytics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if not rows or len(rows) < 2:
         return {}
-    out: Dict[str, Any] = {}
-    rsi = _rsi_14(closes)
-    if rsi is not None:
-        out["rsi_14"] = float(rsi)
-    vol30 = _volatility_30d(closes)
-    if vol30 is not None:
-        out["volatility_30d"] = float(vol30)
+    closes = [safe_float(r.get("close")) for r in rows]
+    highs = [safe_float(r.get("high")) for r in rows]
+    lows = [safe_float(r.get("low")) for r in rows]
+    volumes = [safe_float(r.get("volume")) for r in rows]
 
-    # simple forecasts (best-effort): do not overfit; keep stable
-    if _enable_forecast() and len(closes) >= 90:
-        last = float(closes[-1])
+    closes_f = [x for x in closes if x is not None]
+    highs_f = [x for x in highs if x is not None]
+    lows_f = [x for x in lows if x is not None]
+    vols_f = [x for x in volumes if x is not None]
+
+    if len(closes_f) < 2:
+        return {}
+
+    out: Dict[str, Any] = {}
+
+    # Quote fallbacks from latest two bars
+    latest = rows[-1]
+    prev = rows[-2] if len(rows) >= 2 else None
+    if safe_float(latest.get("close")) is not None:
+        out["current_price"] = safe_float(latest.get("close"))
+    if prev and safe_float(prev.get("close")) is not None:
+        out["previous_close"] = safe_float(prev.get("close"))
+    if safe_float(latest.get("open")) is not None:
+        out["open_price"] = safe_float(latest.get("open"))
+    if safe_float(latest.get("high")) is not None:
+        out["day_high"] = safe_float(latest.get("high"))
+    if safe_float(latest.get("low")) is not None:
+        out["day_low"] = safe_float(latest.get("low"))
+    if safe_float(latest.get("volume")) is not None:
+        out["volume"] = safe_float(latest.get("volume"))
+
+    # 52W and liquidity
+    last_252_highs = highs_f[-252:] if highs_f else []
+    last_252_lows = lows_f[-252:] if lows_f else []
+    if last_252_highs:
+        out["week_52_high"] = max(last_252_highs)
+    elif closes_f:
+        out["week_52_high"] = max(closes_f[-252:])
+    if last_252_lows:
+        out["week_52_low"] = min(last_252_lows)
+    elif closes_f:
+        out["week_52_low"] = min(closes_f[-252:])
+
+    avg10 = _avg_last(vols_f, 10)
+    avg30 = _avg_last(vols_f, 30)
+    if avg10 is not None:
+        out["avg_volume_10d"] = avg10
+    if avg30 is not None:
+        out["avg_volume_30d"] = avg30
+
+    rsi = _rsi_14(closes_f)
+    if rsi is not None:
+        out["rsi_14"] = rsi
+
+    vol30 = _volatility_30d(closes_f)
+    if vol30 is not None:
+        out["volatility_30d"] = vol30
+
+    if _enable_forecast() and len(closes_f) >= 90:
+        last = float(closes_f[-1])
+
         def _forecast(h: int) -> Tuple[Optional[float], Optional[float]]:
-            if len(closes) < 60 or last <= 0:
+            if len(closes_f) < 60 or last <= 0:
                 return None, None
-            # drift based on last 60 trading days
-            w = closes[-61:]
+            window = closes_f[-61:]
             rets = []
-            for i in range(1, len(w)):
-                if w[i - 1] > 0:
-                    rets.append((w[i] / w[i - 1]) - 1.0)
+            for i in range(1, len(window)):
+                if window[i - 1] > 0:
+                    rets.append((window[i] / window[i - 1]) - 1.0)
             mu = _mean(rets) if rets else 0.0
             price = last * ((1.0 + mu) ** h)
             roi = (price / last - 1.0) * 100.0
@@ -1134,24 +880,23 @@ def compute_history_analytics(closes: List[float]) -> Dict[str, Any]:
             out["forecast_price_12m"] = p12
             out["expected_roi_12m"] = r12
 
-        # confidence 0..1 (simple function of vol)
-        vol = vol30 / 100.0 if vol30 is not None else 0.35
-        conf = max(0.20, min(0.85, 0.70 * (1.0 / (1.0 + max(0.0, vol - 0.30)))))
+        conf = 0.70
+        if vol30 is not None:
+            vol = vol30 / 100.0
+            conf = max(0.20, min(0.85, 0.70 * (1.0 / (1.0 + max(0.0, vol - 0.30)))))
         out["forecast_confidence"] = float(conf)
 
-    return out
+    fill_derived_quote_fields(out)
+    return clean_patch(out)
 
 
 # =============================================================================
-# Tadawul Client
+# Tadawul client
 # =============================================================================
 class TadawulClient:
-    """Async Tadawul API client with queue + singleflight + cache + CB + rate limiter."""
-
     def __init__(self) -> None:
         self.timeout_sec = _timeout_sec()
         self.retry_attempts = _retry_attempts()
-
         self.quote_url = _safe_str(_env_str("TADAWUL_QUOTE_URL", ""))
         self.fundamentals_url = _safe_str(_env_str("TADAWUL_FUNDAMENTALS_URL", ""))
         self.history_url = _safe_str(_env_str("TADAWUL_HISTORY_URL", "")) or _safe_str(_env_str("TADAWUL_CANDLES_URL", ""))
@@ -1168,7 +913,7 @@ class TadawulClient:
             timeout=httpx.Timeout(self.timeout_sec),
             follow_redirects=True,
             headers=headers,
-            limits=httpx.Limits(max_keepalive_connections=25, max_connections=60),
+            limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
             http2=True,
         )
 
@@ -1180,271 +925,226 @@ class TadawulClient:
 
         self.semaphore = asyncio.Semaphore(_max_concurrency())
         self.rate_limiter = TokenBucket(_rate_limit())
-        self.circuit_breaker = DynamicCircuitBreaker(
-            fail_threshold=_circuit_breaker_threshold(),
-            base_cooldown=_circuit_breaker_timeout(),
-        )
-
-        self.request_queue = RequestQueue(max_size=_queue_size())
         self.singleflight = SingleFlight()
-
-        self._queue_task: Optional[asyncio.Task] = None
         self._closing = False
 
         logger.info(
-            "TadawulClient v%s initialized | configured=%s | rate=%s/s | cb=%s/%ss | has_profile=%s",
-            PROVIDER_VERSION,
-            _configured(),
-            _rate_limit(),
-            _circuit_breaker_threshold(),
-            _circuit_breaker_timeout(),
-            bool(self.profile_url),
+            "TadawulClient v%s initialized | configured=%s | has_profile=%s | has_history=%s",
+            PROVIDER_VERSION, _configured(), bool(self.profile_url), bool(self.history_url)
         )
 
-    async def _ensure_queue_task(self) -> None:
-        if self._queue_task and not self._queue_task.done():
-            return
-        loop = asyncio.get_running_loop()
-        self._queue_task = loop.create_task(self._process_queue())
-
     @_trace("tadawul_request")
-    async def _request(
-        self,
-        url: str,
-        priority: RequestPriority = RequestPriority.NORMAL,
-    ) -> Tuple[Optional[Union[dict, list]], Optional[str]]:
-        _METRICS.inc("requests_total", 1, {"status": "started"})
-
-        if not await self.circuit_breaker.allow_request():
-            return None, "circuit_breaker_open"
-
-        await self._ensure_queue_task()
-
-        loop = asyncio.get_running_loop()
-        future = loop.create_future()
-        item = RequestQueueItem(priority=priority, url=url, future=future)
-
-        if not await self.request_queue.put(item):
-            return None, "queue_full"
-
-        try:
-            return await future
-        except asyncio.CancelledError:
-            return None, "cancelled"
-
-    async def _process_queue(self) -> None:
-        try:
-            while not self._closing:
-                item = await self.request_queue.get()
-                if item is None:
-                    await asyncio.sleep(0.05)
-                    continue
-                asyncio.create_task(self._process_queue_item(item))
-        except asyncio.CancelledError:
-            return
-        except Exception as e:
-            logger.exception("Queue processor crashed: %s", e)
-
-    async def _process_queue_item(self, item: RequestQueueItem) -> None:
-        if item.future.cancelled():
-            return
-        try:
-            result = await self._execute_request(item.url)
-            if not item.future.cancelled() and not item.future.done():
-                item.future.set_result(result)
-        except Exception as e:
-            if not item.future.cancelled() and not item.future.done():
-                item.future.set_exception(e)
-
-    async def _execute_request(self, url: str) -> Tuple[Optional[Union[dict, list]], Optional[str]]:
+    async def _request(self, url: str) -> Tuple[Optional[Union[dict, list]], Optional[str]]:
         await self.rate_limiter.wait_and_acquire()
-        last_err = None
-
         async with self.semaphore:
+            last_err = None
             for attempt in range(self.retry_attempts):
                 try:
                     resp = await self._client.get(url)
                     status = resp.status_code
-
                     if status == 429:
-                        await self.circuit_breaker.on_failure(status)
-                        await asyncio.sleep(min(30, int(resp.headers.get("Retry-After", 5))))
+                        retry_after = safe_float(resp.headers.get("Retry-After")) or 3.0
+                        await asyncio.sleep(min(30.0, max(1.0, retry_after)))
+                        last_err = "http_429"
                         continue
-
                     if 500 <= status < 600:
-                        await self.circuit_breaker.on_failure(status)
-                        base_wait = 2 ** attempt
-                        await asyncio.sleep(min(10.0, base_wait + random.uniform(0, base_wait)))
+                        base = 2 ** attempt
+                        await asyncio.sleep(min(8.0, base + random.uniform(0, base)))
+                        last_err = f"http_{status}"
                         continue
-
                     if status >= 400 and status != 404:
-                        await self.circuit_breaker.on_failure(status)
+                        tadawul_requests_total.labels(status="error").inc()
                         return None, f"HTTP {status}"
 
                     try:
                         data = json_loads(resp.content)
                         data = unwrap_common_envelopes(data)
                     except Exception:
-                        await self.circuit_breaker.on_failure()
+                        tadawul_requests_total.labels(status="error").inc()
                         return None, "invalid_json"
 
                     if not isinstance(data, (dict, list)):
-                        await self.circuit_breaker.on_failure()
+                        tadawul_requests_total.labels(status="error").inc()
                         return None, "unexpected_response_type"
 
-                    await self.circuit_breaker.on_success()
-                    _METRICS.inc("requests_total", 1, {"status": "success"})
+                    tadawul_requests_total.labels(status="success").inc()
                     return data, None
-
                 except httpx.RequestError as e:
                     last_err = f"network_error_{e.__class__.__name__}"
-                    base_wait = 2 ** attempt
-                    await asyncio.sleep(min(10.0, base_wait + random.uniform(0, base_wait)))
-
-        await self.circuit_breaker.on_failure()
-        _METRICS.inc("requests_total", 1, {"status": "error"})
-        return None, last_err or "max_retries_exceeded"
+                    base = 2 ** attempt
+                    await asyncio.sleep(min(8.0, base + random.uniform(0, base)))
+            tadawul_requests_total.labels(status="error").inc()
+            return None, last_err or "max_retries_exceeded"
 
     # -------------------------------------------------------------------------
-    # Mapping helpers (Phase E: classification + identity)
+    # Mapping helpers
     # -------------------------------------------------------------------------
     def _map_identity_from_any(self, root: Any) -> Dict[str, Any]:
-        """
-        Extracts name/sector/industry/exchange/currency from any Tadawul payload shape.
-        Best-effort: if missing, caller will fill defaults.
-        """
         patch: Dict[str, Any] = {}
         patch["name"] = pick_str(
             root,
-            "name",
-            "company_name",
-            "companyName",
-            "securityName",
-            "securityNameEn",
-            "securityNameAr",
-            "instrumentName",
-            "symbolName",
-            "shortName",
-            "longName",
+            "name", "company_name", "companyName", "securityName", "securityNameEn",
+            "securityNameAr", "instrumentName", "symbolName", "shortName", "longName"
         )
         patch["sector"] = pick_str(
             root,
-            "sector",
-            "sectorName",
-            "sector_name",
-            "sectorEn",
-            "sectorAr",
-            "gicsSector",
-            "sector_description",
+            "sector", "sectorName", "sector_name", "sectorEn", "sectorAr",
+            "gicsSector", "sector_description", "classificationSector", "sectorDesc"
         )
         patch["industry"] = pick_str(
             root,
-            "industry",
-            "industryName",
-            "industry_name",
-            "industryEn",
-            "industryAr",
-            "gicsIndustry",
-            "industry_description",
-            "subSectorName",
-            "sub_sector",
-            "subSector",
+            "industry", "industryName", "industry_name", "industryEn", "industryAr",
+            "gicsIndustry", "industry_description", "subSectorName", "sub_sector",
+            "subSector", "classificationIndustry", "industryDesc"
         )
-
-        # Some APIs return exchange fields
         patch["exchange"] = pick_str(root, "exchange", "exchangeName", "market", "marketName", "mic")
         patch["currency"] = pick_str(root, "currency", "ccy", "tradingCurrency")
-
         return clean_patch(patch)
 
     def _map_quote(self, root: Any) -> Dict[str, Any]:
         patch: Dict[str, Any] = {}
-
-        # Identity/classification (in case quote provides it)
         merge_into(patch, self._map_identity_from_any(root))
 
-        # Canonical price fields
-        patch["current_price"] = pick_num(root, "last", "last_price", "price", "close", "c", "tradingPrice", "regularMarketPrice")
-        patch["previous_close"] = pick_num(root, "previous_close", "prev_close", "pc", "PreviousClose", "prevClose", "regularMarketPreviousClose")
-        patch["open_price"] = pick_num(root, "open", "open_price", "regularMarketOpen", "o", "Open", "openPrice")
-        patch["day_high"] = pick_num(root, "high", "day_high", "h", "High", "dayHigh", "sessionHigh")
-        patch["day_low"] = pick_num(root, "low", "day_low", "l", "Low", "dayLow", "sessionLow")
-        patch["volume"] = pick_num(root, "volume", "v", "Volume", "tradedVolume", "qty", "quantity")
+        patch["current_price"] = pick_num(
+            root,
+            "last", "last_price", "lastPrice", "price", "close", "c", "tradingPrice",
+            "regularMarketPrice", "tradePrice", "ltp", "lastTradePrice", "value"
+        )
+        patch["previous_close"] = pick_num(
+            root,
+            "previous_close", "prev_close", "pc", "PreviousClose", "prevClose",
+            "regularMarketPreviousClose", "yesterdayClose", "closePrev"
+        )
+        patch["open_price"] = pick_num(
+            root,
+            "open", "open_price", "regularMarketOpen", "o", "Open", "openPrice",
+            "sessionOpen"
+        )
+        patch["day_high"] = pick_num(
+            root,
+            "high", "day_high", "h", "High", "dayHigh", "sessionHigh", "highPrice"
+        )
+        patch["day_low"] = pick_num(
+            root,
+            "low", "day_low", "l", "Low", "dayLow", "sessionLow", "lowPrice"
+        )
+        patch["volume"] = pick_num(
+            root,
+            "volume", "v", "Volume", "tradedVolume", "qty", "quantity",
+            "totalVolume", "tradeVolume"
+        )
         patch["market_cap"] = pick_num(root, "market_cap", "marketCap", "marketCapitalization", "MarketCap")
         patch["week_52_high"] = pick_num(root, "week_52_high", "fiftyTwoWeekHigh", "52w_high", "yearHigh", "week52High")
         patch["week_52_low"] = pick_num(root, "week_52_low", "fiftyTwoWeekLow", "52w_low", "yearLow", "week52Low")
         patch["price_change"] = pick_num(root, "change", "d", "price_change", "Change", "diff", "delta")
         patch["percent_change"] = pick_pct(root, "change_pct", "change_percent", "dp", "percent_change", "pctChange", "changePercent")
+        patch["beta_5y"] = pick_num(root, "beta", "beta5y", "beta_5y")
+        patch["asset_class"] = pick_str(root, "asset_class", "assetClass", "type", "securityType")
 
         fill_derived_quote_fields(patch)
         return clean_patch(patch)
 
     def _map_fundamentals(self, root: Any) -> Dict[str, Any]:
         patch: Dict[str, Any] = {}
-
-        # Identity/classification (fundamentals often better for sector/industry)
         merge_into(patch, self._map_identity_from_any(root), force_keys=("sector", "industry", "name"))
 
         patch["market_cap"] = pick_num(root, "market_cap", "marketCap", "marketCapitalization", "MarketCap")
-        patch["float_shares"] = pick_num(root, "floatShares", "float_shares", "freeFloatShares")
+        patch["float_shares"] = pick_num(root, "floatShares", "float_shares", "freeFloatShares", "free_float_shares")
         patch["shares_outstanding"] = pick_num(root, "shares", "shares_outstanding", "shareOutstanding", "SharesOutstanding")
-
         patch["pe_ttm"] = pick_num(root, "pe", "pe_ttm", "trailingPE", "PE", "priceEarnings")
         patch["pb_ratio"] = pick_num(root, "pb", "pb_ratio", "priceToBook", "PBR", "price_book")
+        patch["ps_ratio"] = pick_num(root, "ps", "ps_ratio", "priceToSales")
         patch["eps_ttm"] = pick_num(root, "eps", "eps_ttm", "trailingEps", "EPS")
         patch["dividend_yield"] = pick_pct(root, "dividend_yield", "divYield", "yield", "DividendYield")
-
+        patch["payout_ratio"] = pick_pct(root, "payout_ratio", "payoutRatio")
+        patch["beta_5y"] = pick_num(root, "beta", "beta5y", "beta_5y")
+        patch["revenue_ttm"] = pick_num(root, "revenue_ttm", "revenue", "sales", "totalRevenue")
+        patch["revenue_growth_yoy"] = pick_pct(root, "revenue_growth_yoy", "revenueGrowth", "salesGrowth")
+        patch["gross_margin"] = pick_pct(root, "gross_margin", "grossMargin")
+        patch["operating_margin"] = pick_pct(root, "operating_margin", "operatingMargin")
+        patch["profit_margin"] = pick_pct(root, "profit_margin", "netMargin", "profitMargin")
         return clean_patch(patch)
 
     def _map_profile(self, root: Any) -> Dict[str, Any]:
-        """
-        Optional profile endpoint mapping (if configured).
-        Intended mainly for sector/industry/name (Phase E).
-        """
         patch = self._map_identity_from_any(root)
-        # Some profile endpoints contain standardized fields
         if "sector" not in patch:
             patch["sector"] = pick_str(root, "sectorClassification", "classificationSector", "sectorDesc")
         if "industry" not in patch:
             patch["industry"] = pick_str(root, "industryClassification", "classificationIndustry", "industryDesc")
+        if "name" not in patch:
+            patch["name"] = pick_str(root, "issuerName", "issuer_name")
         return clean_patch(patch)
 
-    def _parse_candles(self, js: Any) -> Tuple[List[float], Optional[datetime]]:
-        closes: List[float] = []
+    def _parse_history_payload(self, js: Any) -> ParsedHistory:
+        rows: List[Dict[str, Any]] = []
         last_dt: Optional[datetime] = None
 
+        # Case 1: dict of aligned arrays
         if isinstance(js, dict):
+            t_raw = js.get("t") or js.get("time") or js.get("timestamp") or js.get("dates")
+            o_raw = js.get("o") or js.get("open")
+            h_raw = js.get("h") or js.get("high")
+            l_raw = js.get("l") or js.get("low")
             c_raw = js.get("c") or js.get("close")
-            t_raw = js.get("t") or js.get("time") or js.get("timestamp")
+            v_raw = js.get("v") or js.get("volume")
 
             if isinstance(c_raw, list):
-                closes = [f for f in (safe_float(x) for x in c_raw) if f is not None]
+                n = len(c_raw)
+                for i in range(n):
+                    row: Dict[str, Any] = {
+                        "open": safe_float(o_raw[i]) if isinstance(o_raw, list) and i < len(o_raw) else None,
+                        "high": safe_float(h_raw[i]) if isinstance(h_raw, list) and i < len(h_raw) else None,
+                        "low": safe_float(l_raw[i]) if isinstance(l_raw, list) and i < len(l_raw) else None,
+                        "close": safe_float(c_raw[i]),
+                        "volume": safe_float(v_raw[i]) if isinstance(v_raw, list) and i < len(v_raw) else None,
+                    }
+                    t = t_raw[i] if isinstance(t_raw, list) and i < len(t_raw) else None
+                    if t is not None:
+                        try:
+                            if isinstance(t, (int, float)):
+                                dt = datetime.fromtimestamp(float(t), tz=timezone.utc)
+                            else:
+                                dt = datetime.fromisoformat(str(t).replace("Z", "+00:00"))
+                            row["date"] = dt.isoformat()
+                            last_dt = dt
+                        except Exception:
+                            pass
+                    rows.append(row)
 
-            if isinstance(t_raw, list) and t_raw:
-                try:
-                    last_dt = datetime.fromtimestamp(float(t_raw[-1]), tz=timezone.utc)
-                except Exception:
-                    last_dt = None
+            if not rows:
+                for key in ("candles", "data", "items", "prices", "history", "rows"):
+                    if isinstance(js.get(key), list):
+                        js = js[key]
+                        break
 
-            if not closes:
-                candles = js.get("candles") or js.get("data") or js.get("items") or js.get("prices") or js.get("history")
-                if isinstance(candles, list) and candles and isinstance(candles[0], dict):
-                    for item in candles:
-                        c = safe_float(item.get("c") or item.get("close"))
-                        if c is not None:
-                            closes.append(c)
-                        t = item.get("t") or item.get("time") or item.get("date")
-                        if t is not None:
-                            try:
-                                if isinstance(t, (int, float)):
-                                    last_dt = datetime.fromtimestamp(float(t), tz=timezone.utc)
-                                elif isinstance(t, str):
-                                    last_dt = datetime.fromisoformat(t.replace("Z", "+00:00"))
-                            except Exception:
-                                pass
+        # Case 2: list of dict bars
+        if isinstance(js, list):
+            for item in js:
+                if not isinstance(item, dict):
+                    continue
+                row = {
+                    "open": safe_float(item.get("o") if "o" in item else item.get("open")),
+                    "high": safe_float(item.get("h") if "h" in item else item.get("high")),
+                    "low": safe_float(item.get("l") if "l" in item else item.get("low")),
+                    "close": safe_float(item.get("c") if "c" in item else item.get("close")),
+                    "volume": safe_float(item.get("v") if "v" in item else item.get("volume")),
+                }
+                t = item.get("t") or item.get("time") or item.get("timestamp") or item.get("date")
+                if t is not None:
+                    try:
+                        if isinstance(t, (int, float)):
+                            dt = datetime.fromtimestamp(float(t), tz=timezone.utc)
+                        else:
+                            dt = datetime.fromisoformat(str(t).replace("Z", "+00:00"))
+                        row["date"] = dt.isoformat()
+                        last_dt = dt
+                    except Exception:
+                        pass
+                rows.append(row)
 
         maxp = _history_points_max()
-        return closes[-maxp:], last_dt
+        rows = rows[-maxp:]
+        return ParsedHistory(rows=rows, last_dt=last_dt)
 
     # -------------------------------------------------------------------------
     # Public fetchers
@@ -1457,23 +1157,21 @@ class TadawulClient:
             return {} if not _emit_warnings() else {"_warn": "invalid_symbol_or_url"}
 
         cache_key = f"quote:{sym}"
-        if await self.error_cache.get(cache_key):
-            return {}
+        cached = await self.quote_cache.get(cache_key)
+        if cached is not None:
+            return dict(cached)
 
         async def _fetch():
-            js, err = await self._request(format_url(self.quote_url or "", sym), priority=RequestPriority.HIGH)
+            js, err = await self._request(format_url(self.quote_url or "", sym))
             if js is None:
                 await self.error_cache.set(cache_key, True)
                 return {} if not _emit_warnings() else {"_warn": f"quote_failed: {err}"}
 
             mapped = self._map_quote(coerce_dict(js))
-            if safe_float(mapped.get("current_price")) is None:
-                await self.error_cache.set(cache_key, True)
-                return {}
+            if safe_float(mapped.get("current_price")) is None and safe_float(mapped.get("day_high")) is None and safe_float(mapped.get("day_low")) is None:
+                return {} if not _emit_warnings() else {"_warn": "quote_payload_sparse"}
 
-            # Phase E: always inject KSA identity defaults
             _ensure_ksa_identity(mapped, symbol=sym)
-
             result = {
                 "requested_symbol": symbol,
                 "symbol": sym,
@@ -1485,11 +1183,11 @@ class TadawulClient:
                 "last_updated_riyadh": _riyadh_iso(),
                 **mapped,
             }
+            fill_derived_quote_fields(result)
             await self.quote_cache.set(cache_key, result)
             return result
 
-        cached = await self.quote_cache.get(cache_key)
-        return dict(cached) if cached else await self.singleflight.run(cache_key, _fetch)
+        return await self.singleflight.run(cache_key, _fetch)
 
     async def fetch_fundamentals_patch(self, symbol: str) -> Dict[str, Any]:
         if not (_configured() and _enable_fundamentals()):
@@ -1499,38 +1197,31 @@ class TadawulClient:
             return {}
 
         cache_key = f"fund:{sym}"
-        if await self.error_cache.get(cache_key):
-            return {}
+        cached = await self.fund_cache.get(cache_key)
+        if cached is not None:
+            return dict(cached)
 
         async def _fetch():
-            js, err = await self._request(format_url(self.fundamentals_url or "", sym), priority=RequestPriority.NORMAL)
+            js, err = await self._request(format_url(self.fundamentals_url or "", sym))
             if js is None:
                 await self.error_cache.set(cache_key, True)
                 return {}
             mapped = self._map_fundamentals(coerce_dict(js))
             if not mapped:
-                await self.error_cache.set(cache_key, True)
                 return {}
-
             _ensure_ksa_identity(mapped, symbol=sym)
-
-            result = {
+            out = {
                 "provider": PROVIDER_NAME,
                 "data_source": PROVIDER_NAME,
                 "provider_version": PROVIDER_VERSION,
                 **mapped,
             }
-            await self.fund_cache.set(cache_key, result)
-            return result
+            await self.fund_cache.set(cache_key, out)
+            return out
 
-        cached = await self.fund_cache.get(cache_key)
-        return dict(cached) if cached else await self.singleflight.run(cache_key, _fetch)
+        return await self.singleflight.run(cache_key, _fetch)
 
     async def fetch_profile_patch(self, symbol: str) -> Dict[str, Any]:
-        """
-        Optional: profile endpoint mainly to improve name/sector/industry (Phase E).
-        If TADAWUL_PROFILE_URL is not set, this returns {}.
-        """
         if not (_configured() and _enable_profile()):
             return {}
         sym = normalize_ksa_symbol(symbol)
@@ -1540,10 +1231,10 @@ class TadawulClient:
         cache_key = f"profile:{sym}"
         cached = await self.profile_cache.get(cache_key)
         if cached is not None:
-            return dict(cached) if isinstance(cached, dict) else {}
+            return dict(cached)
 
         async def _fetch():
-            js, err = await self._request(format_url(self.profile_url or "", sym), priority=RequestPriority.NORMAL)
+            js, err = await self._request(format_url(self.profile_url or "", sym))
             if js is None:
                 return {}
             mapped = self._map_profile(coerce_dict(js))
@@ -1570,42 +1261,39 @@ class TadawulClient:
 
         days = _history_days()
         cache_key = f"history:{sym}:{days}"
-        if await self.error_cache.get(cache_key):
-            return {}
+        cached = await self.history_cache.get(cache_key)
+        if cached is not None:
+            return dict(cached)
 
         async def _fetch():
-            js, err = await self._request(format_url(self.history_url or "", sym, days=days), priority=RequestPriority.LOW)
+            js, err = await self._request(format_url(self.history_url or "", sym, days=days))
             if js is None:
                 await self.error_cache.set(cache_key, True)
                 return {}
-            closes, last_dt = self._parse_candles(js)
-            if not closes or len(closes) < 20:
-                await self.error_cache.set(cache_key, True)
+            parsed = self._parse_history_payload(js)
+            rows = parsed.rows
+            if len(rows) < 2:
                 return {}
-
-            analytics = compute_history_analytics(closes)
+            analytics = compute_history_analytics(rows)
             out = {
                 "requested_symbol": symbol,
                 "normalized_symbol": sym,
-                "history_points": len(closes),
-                "history_last_utc": _utc_iso(last_dt),
-                "history_last_riyadh": _to_riyadh_iso(last_dt),
+                "history_points": len(rows),
+                "history_last_utc": _utc_iso(parsed.last_dt),
+                "history_last_riyadh": _to_riyadh_iso(parsed.last_dt),
                 "provider": PROVIDER_NAME,
                 "data_source": PROVIDER_NAME,
                 "provider_version": PROVIDER_VERSION,
                 **analytics,
             }
+            _ensure_ksa_identity(out, symbol=sym)
+            fill_derived_quote_fields(out)
             await self.history_cache.set(cache_key, out)
             return out
 
-        cached = await self.history_cache.get(cache_key)
-        return dict(cached) if cached else await self.singleflight.run(cache_key, _fetch)
+        return await self.singleflight.run(cache_key, _fetch)
 
     async def fetch_enriched_quote_patch(self, symbol: str) -> Dict[str, Any]:
-        """
-        Enriched KSA quote: quote + fundamentals + history + optional profile
-        and Phase E identity defaults (country/currency/exchange always).
-        """
         if not _configured():
             return {}
         sym = normalize_ksa_symbol(symbol)
@@ -1636,22 +1324,28 @@ class TadawulClient:
             "last_updated_riyadh": _riyadh_iso(),
         }
 
-        # Merge order: profile (classification) -> fundamentals -> history -> quote already in base
+        # Classification/profile before fundamentals; history mainly as fallback for quote/52w/avg vol
         if prof_data:
             merge_into(result, prof_data, force_keys=("name", "sector", "industry", "exchange", "currency", "country"))
         if fund_data:
-            merge_into(result, fund_data, force_keys=("market_cap", "pe_ttm", "eps_ttm", "name", "sector", "industry"))
+            merge_into(
+                result,
+                fund_data,
+                force_keys=("market_cap", "pe_ttm", "eps_ttm", "pb_ratio", "ps_ratio", "dividend_yield", "beta_5y"),
+            )
         if hist_data:
             merge_into(
                 result,
-                {k: v for k, v in hist_data.items() if v is not None},
-                force_keys=("rsi_14", "volatility_30d", "forecast_confidence", "forecast_price_1m", "forecast_price_3m", "forecast_price_12m"),
+                hist_data,
+                force_keys=(
+                    "week_52_high", "week_52_low", "week_52_position_pct",
+                    "avg_volume_10d", "avg_volume_30d", "rsi_14", "volatility_30d",
+                    "forecast_confidence", "forecast_price_1m", "forecast_price_3m", "forecast_price_12m",
+                    "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
+                ),
             )
 
-        # Always enforce KSA identity defaults
         _ensure_ksa_identity(result, symbol=sym)
-
-        # Derived + aliases
         fill_derived_quote_fields(result)
 
         cat, score = data_quality_score(result)
@@ -1679,7 +1373,6 @@ class TadawulClient:
                 "history": bool(self.history_url),
                 "profile": bool(self.profile_url),
             },
-            "circuit_breaker": self.circuit_breaker.get_stats(),
             "cache_sizes": {
                 "quote": await self.quote_cache.size(),
                 "fund": await self.fund_cache.size(),
@@ -1687,24 +1380,15 @@ class TadawulClient:
                 "profile": await self.profile_cache.size(),
                 "error": await self.error_cache.size(),
             },
-            "runtime": {
-                "has_numpy": _HAS_NUMPY,
-                "has_scipy": SCIPY_AVAILABLE,
-                "has_sklearn": SKLEARN_AVAILABLE,
-                "has_xgboost": XGB_AVAILABLE,
-                "has_statsmodels": STATSMODELS_AVAILABLE,
+            "ksa_defaults": {
+                "country": KSA_COUNTRY_CODE,
+                "currency": KSA_CURRENCY,
+                "exchange": KSA_EXCHANGE_NAME,
             },
-            "ksa_defaults": {"country": KSA_COUNTRY_CODE, "currency": KSA_CURRENCY, "exchange": KSA_EXCHANGE_NAME},
         }
 
     async def close(self) -> None:
         self._closing = True
-        if self._queue_task and not self._queue_task.done():
-            self._queue_task.cancel()
-            try:
-                await self._queue_task
-            except Exception:
-                pass
         await self._client.aclose()
 
 
@@ -1769,6 +1453,23 @@ async def fetch_quote_and_history_patch(symbol: str, *args: Any, **kwargs: Any) 
     return clean_patch(result)
 
 
+# Extra compatibility aliases
+async def fetch_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    return await fetch_enriched_quote_patch(symbol, *args, **kwargs)
+
+
+async def get_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    return await fetch_enriched_quote_patch(symbol, *args, **kwargs)
+
+
+async def fetch_history(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    return await fetch_history_patch(symbol, *args, **kwargs)
+
+
+async def get_history(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    return await fetch_history_patch(symbol, *args, **kwargs)
+
+
 async def get_client_metrics() -> Dict[str, Any]:
     return await (await get_client()).get_metrics()
 
@@ -1778,7 +1479,7 @@ async def aclose_tadawul_client() -> None:
 
 
 # =============================================================================
-# Provider adapter (router/health compatible)
+# Provider adapter
 # =============================================================================
 class _TadawulProviderAdapter:
     async def get_quote(self, symbol: str) -> Dict[str, Any]:
@@ -1789,6 +1490,30 @@ class _TadawulProviderAdapter:
 
     async def fetch_quote(self, symbol: str) -> Dict[str, Any]:
         return await fetch_enriched_quote_patch(symbol)
+
+    async def fetch_enriched_quote(self, symbol: str) -> Dict[str, Any]:
+        return await fetch_enriched_quote_patch(symbol)
+
+    async def fetch_quote_patch(self, symbol: str) -> Dict[str, Any]:
+        return await fetch_quote_patch(symbol)
+
+    async def fetch_enriched_quote_patch(self, symbol: str) -> Dict[str, Any]:
+        return await fetch_enriched_quote_patch(symbol)
+
+    async def fetch_fundamentals_patch(self, symbol: str) -> Dict[str, Any]:
+        return await fetch_fundamentals_patch(symbol)
+
+    async def fetch_history_patch(self, symbol: str) -> Dict[str, Any]:
+        return await fetch_history_patch(symbol)
+
+    async def fetch_history(self, symbol: str) -> Dict[str, Any]:
+        return await fetch_history_patch(symbol)
+
+    async def get_history(self, symbol: str) -> Dict[str, Any]:
+        return await fetch_history_patch(symbol)
+
+    async def get_metrics(self) -> Dict[str, Any]:
+        return await get_client_metrics()
 
 
 provider = _TadawulProviderAdapter()
@@ -1813,11 +1538,14 @@ __all__ = [
     "fetch_profile_patch",
     "fetch_quote_and_fundamentals_patch",
     "fetch_quote_and_history_patch",
+    "fetch_quote",
+    "get_quote",
+    "fetch_history",
+    "get_history",
     "get_client_metrics",
     "aclose_tadawul_client",
     "MarketRegime",
     "DataQuality",
-    # adapter exports
     "provider",
     "get_provider",
     "build_provider",
