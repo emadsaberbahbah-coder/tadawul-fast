@@ -76,7 +76,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.43.0"
+__version__ = "5.43.1"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -482,9 +482,6 @@ def _dedupe_keep_order(items: Sequence[Any]) -> List[Any]:
             continue
         seen.add(item)
         out.append(item)
-    out = _apply_symbol_context_defaults(out, symbol=inferred_symbol)
-    if _as_float(out.get("current_price")) is not None and _safe_str(out.get("warnings")).lower() == "no live provider data available":
-        out["warnings"] = "Recovered from history/chart fallback"
     return out
 
 
@@ -1477,10 +1474,10 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
     profit_margin_pct = _as_pct_points(row.get("profit_margin")) or 0.0
     revenue_growth_pct = _as_pct_points(row.get("revenue_growth_yoy")) or 0.0
 
-    roi_1m = _as_pct_points(row.get("expected_roi_1m"))
-    roi_3m = _as_pct_points(row.get("expected_roi_3m"))
-    roi_12m = _as_pct_points(row.get("expected_roi_12m"))
-    best_roi = next((v for v in (roi_3m, roi_12m, roi_1m) if v is not None), 0.0)
+    seed_roi_1m = _as_pct_points(row.get("expected_roi_1m"))
+    seed_roi_3m = _as_pct_points(row.get("expected_roi_3m"))
+    seed_roi_12m = _as_pct_points(row.get("expected_roi_12m"))
+    seed_best_roi = next((v for v in (seed_roi_3m, seed_roi_12m, seed_roi_1m) if v is not None), 0.0)
 
     if row.get("value_score") is None:
         value_score = 55.0
@@ -1565,29 +1562,14 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         overall = sum(vals2) / len(vals2) if vals2 else 50.0
         row["overall_score"] = round(_clamp(float(overall), 0.0, 100.0), 2)
 
-    if row.get("opportunity_score") is None:
-        base = _as_float(row.get("overall_score")) or 50.0
-        confidence_boost = ((_as_float(row.get("confidence_score")) or 50.0) - 50.0) * 0.20
-        risk_penalty = ((_as_float(row.get("risk_score")) or 50.0) - 50.0) * 0.25
-        roi_boost = _clamp(best_roi, -25.0, 35.0) * 0.35
-        row["opportunity_score"] = round(_clamp(base + confidence_boost + roi_boost - risk_penalty, 0.0, 100.0), 2)
-
-    if not row.get("risk_bucket"):
-        rs = _as_float(row.get("risk_score")) or 50.0
-        row["risk_bucket"] = "LOW" if rs < 40 else "MODERATE" if rs < 70 else "HIGH"
-
-    if not row.get("confidence_bucket"):
-        cs = _as_float(row.get("confidence_score")) or 55.0
-        row["confidence_bucket"] = "HIGH" if cs >= 75 else "MODERATE" if cs >= 55 else "LOW"
-
     if price is not None and row.get("forecast_price_1m") is None:
-        drift = max(0.5, min(4.0, best_roi if best_roi else 1.0))
+        drift = max(0.5, min(4.0, seed_best_roi if seed_best_roi else 1.0))
         row["forecast_price_1m"] = round(price * (1.0 + drift / 300.0), 4)
     if price is not None and row.get("forecast_price_3m") is None:
-        drift = max(1.0, min(8.0, best_roi if best_roi else 3.0))
+        drift = max(1.0, min(8.0, seed_best_roi if seed_best_roi else 3.0))
         row["forecast_price_3m"] = round(price * (1.0 + drift / 100.0), 4)
     if price is not None and row.get("forecast_price_12m") is None:
-        drift = max(3.0, min(18.0, (roi_12m if roi_12m is not None else best_roi) or 8.0))
+        drift = max(3.0, min(18.0, (seed_roi_12m if seed_roi_12m is not None else seed_best_roi) or 8.0))
         row["forecast_price_12m"] = round(price * (1.0 + drift / 100.0), 4)
 
     if price is not None and row.get("expected_roi_1m") is None:
@@ -1602,6 +1584,28 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         fp12 = _as_float(row.get("forecast_price_12m"))
         if fp12 is not None and price:
             row["expected_roi_12m"] = round((fp12 - price) / price, 6)
+
+    final_roi_1m = _as_pct_points(row.get("expected_roi_1m"))
+    final_roi_3m = _as_pct_points(row.get("expected_roi_3m"))
+    final_roi_12m = _as_pct_points(row.get("expected_roi_12m"))
+    final_best_roi = next((v for v in (final_roi_3m, final_roi_12m, final_roi_1m) if v is not None), 0.0)
+
+    if row.get("opportunity_score") is None:
+        base = _as_float(row.get("overall_score")) or 50.0
+        confidence_boost = ((_as_float(row.get("confidence_score")) or 50.0) - 50.0) * 0.20
+        risk_penalty = ((_as_float(row.get("risk_score")) or 50.0) - 50.0) * 0.25
+        roi_boost = _clamp(final_best_roi, -25.0, 35.0) * 0.35
+        row["opportunity_score"] = round(_clamp(base + confidence_boost + roi_boost - risk_penalty, 0.0, 100.0), 2)
+
+    if not row.get("risk_bucket"):
+        rs = _as_float(row.get("risk_score")) or 50.0
+        row["risk_bucket"] = "LOW" if rs < 40 else "MODERATE" if rs < 70 else "HIGH"
+
+    if not row.get("confidence_bucket"):
+        cs = _as_float(row.get("confidence_score")) or 55.0
+        row["confidence_bucket"] = "HIGH" if cs >= 75 else "MODERATE" if cs >= 55 else "LOW"
+
+
 def _compute_recommendation(row: Dict[str, Any]) -> None:
     if row.get("recommendation"):
         return
