@@ -2,7 +2,7 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.3.0)
+TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.4.0)
 ================================================================================
 ALIGNED • DEPLOYMENT-SAFE • PRE-MOUNT + STARTUP-VERIFY • ROUTER-SNAPSHOT-AWARE
 ENGINE-STATE-AWARE • OPENAPI-SAFE • RENDER-HEALTH-PROBE-SAFE • PRIORITY-MOUNTED
@@ -12,14 +12,19 @@ V1-HEALTH-ALIAS SAFE • V1-META-ALIAS SAFE • HEAD-PROBE SAFE
 CONTROLLED-ROUTE-OWNERSHIP • PARTIAL-DUPLICATE-BLOCK SAFE • FILTERED-MOUNT SAFE
 ADVANCED-SHEET-ROWS OWNER FIXED • STRICT-JSON SAFE • ADVISOR-FAMILY NORMALIZED
 HEALTH-COUNT DE-NOISED • NO-RESPONSE GUARD SAFE • ROOT-SHEET-ROWS DIAGNOSTICS
+MOUNT-FN FILTER SAFE • CANONICAL-OWNER COVERAGE EXPANDED • TFB-TOKEN SAFE
 
-Why this revision (v8.3.0)
+Why this revision (v8.4.0)
 --------------------------
 - FIX: adds a response guard middleware that converts downstream
        `RuntimeError: No response returned.` into strict JSON instead of letting
        the request collapse ambiguously.
 - FIX: startup/runtime metadata now exposes canonical path owner diagnostics for
-       critical paths like `/sheet-rows` and `/v1/advanced/sheet-rows`.
+       the full controlled owner map, not only a narrow subset of exact paths.
+- FIX: `mount(app)` modules are now captured into a temporary app and filtered
+       through the same controlled ownership policy instead of bypassing it.
+- FIX: auth fallback now honors `TFB_TOKEN` in addition to `TFB_APP_TOKEN`,
+       which keeps direct PowerShell diagnostics aligned with runtime auth.
 - FIX: route verification keeps controlled ownership but now surfaces exact
        owner mismatches more clearly in debug/meta signals.
 - SAFE: preserves strict JSON rendering, route mounting behavior, engine init,
@@ -180,7 +185,7 @@ class _StrictJSONResponse(JSONResponse):
         ).encode("utf-8")
 
 
-APP_ENTRY_VERSION = "8.3.0"
+APP_ENTRY_VERSION = "8.4.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
@@ -695,6 +700,7 @@ def _auth_ok(request: Request) -> bool:
             _env_str("AUTH_TOKEN", ""),
             _env_str("TOKEN", ""),
             _env_str("TFB_APP_TOKEN", ""),
+            _env_str("TFB_TOKEN", ""),
         )
         if x
     }
@@ -841,29 +847,48 @@ def _endpoint_module_name(route: Any) -> str:
         return ""
 
 
+_CANONICAL_DIAGNOSTIC_PATHS: Tuple[str, ...] = tuple(
+    sorted(
+        set(_CONTROLLED_CANONICAL_OWNER_MAP.keys())
+        | {
+            "/v1/advisor/sheet-rows",
+            "/v1/analysis/sheet-rows",
+            "/v1/schema/sheet-spec",
+            "/schema/sheet-spec",
+        }
+    )
+)
+
+
+def _route_matches_canonical_target(route_path: str, canonical_path: str) -> bool:
+    rp = str(route_path or "").strip()
+    cp = str(canonical_path or "").strip()
+    if not rp or not cp:
+        return False
+    if rp == cp:
+        return True
+    return rp.startswith(cp.rstrip("/") + "/")
+
+
 def _canonical_path_owners_from_routes(app: FastAPI) -> Dict[str, str]:
-    wanted_paths = {
-        "/sheet-rows",
-        "/v1/advanced/sheet-rows",
-        "/v1/advisor/sheet-rows",
-        "/v1/analysis/sheet-rows",
-        "/v1/schema/sheet-spec",
-        "/schema/sheet-spec",
-    }
+    routes = list(getattr(app, "routes", []) or [])
     owners: Dict[str, str] = {}
-    for route in getattr(app, "routes", []) or []:
-        path = str(getattr(route, "path", "") or "")
-        if path in wanted_paths and path not in owners:
-            owners[path] = _endpoint_module_name(route)
+
+    for canonical_path in _CANONICAL_DIAGNOSTIC_PATHS:
+        for route in routes:
+            path = str(getattr(route, "path", "") or "")
+            if _route_matches_canonical_target(path, canonical_path):
+                owners[canonical_path] = _endpoint_module_name(route)
+                break
     return owners
 
 
 def _canonical_path_owner_mismatches(path_owners: Mapping[str, str]) -> Dict[str, Dict[str, str]]:
     mismatches: Dict[str, Dict[str, str]] = {}
     for path, expected_owner in _CONTROLLED_CANONICAL_OWNER_MAP.items():
-        if path not in path_owners:
-            continue
         actual_module = str(path_owners.get(path, "") or "")
+        if not actual_module:
+            continue
         actual_owner = actual_module.rsplit(".", 1)[-1] if actual_module else ""
         if actual_owner and actual_owner != expected_owner:
             mismatches[path] = {
@@ -1112,20 +1137,8 @@ def _package_mounter_compatibility(routes_pkg: Any) -> Tuple[bool, Dict[str, Any
     except Exception:
         protected_prefixes = []
 
-    critical_prefixes = (
-        "/v1/advisor",
-        "/v1/investment_advisor",
-        "/v1/investment-advisor",
-        "/v1/schema",
-        "/schema",
-        "/v1/advanced/sheet-rows",
-        "/v1/enriched",
-        "/v1/enriched_quote",
-        "/v1/enriched-quote",
-        "/quote",
-        "/quotes",
-        "/sheet-rows",
-    )
+    critical_prefixes = tuple(_CONTROLLED_CANONICAL_OWNER_MAP.keys())
+    expected_protected = set(_CONTROLLED_PROTECTED_PREFIXES)
 
     mismatches: Dict[str, Dict[str, str]] = {}
     for prefix in critical_prefixes:
@@ -1137,7 +1150,7 @@ def _package_mounter_compatibility(routes_pkg: Any) -> Tuple[bool, Dict[str, Any
                 "package_owner": actual_owner or "(missing)",
             }
 
-    missing_protected = [prefix for prefix in critical_prefixes if prefix not in set(protected_prefixes)]
+    missing_protected = sorted(prefix for prefix in expected_protected if prefix not in set(protected_prefixes))
 
     details = {
         "critical_prefixes": list(critical_prefixes),
@@ -1209,7 +1222,7 @@ def _path_allowed_for_module(module_name: str, path: str) -> bool:
     return True
 
 
-def _append_router_routes_filtered(app: FastAPI, router_obj: Any, module_name: str) -> Dict[str, Any]:
+def _append_routes_from_iterable_filtered(app: FastAPI, routes_iter: Sequence[Any], module_name: str) -> Dict[str, Any]:
     existing = _app_route_signature_set(app, include_builtin=True)
 
     added = 0
@@ -1217,7 +1230,7 @@ def _append_router_routes_filtered(app: FastAPI, router_obj: Any, module_name: s
     partial_duplicate_skips = 0
     filtered_out = 0
 
-    for route in list(getattr(router_obj, "routes", []) or []):
+    for route in list(routes_iter or []):
         path = str(getattr(route, "path", "") or "")
         if not _path_allowed_for_module(module_name, path):
             filtered_out += 1
@@ -1253,6 +1266,27 @@ def _append_router_routes_filtered(app: FastAPI, router_obj: Any, module_name: s
         "partial_duplicate_skips": partial_duplicate_skips,
         "filtered_out": filtered_out,
     }
+
+
+
+def _append_router_routes_filtered(app: FastAPI, router_obj: Any, module_name: str) -> Dict[str, Any]:
+    return _append_routes_from_iterable_filtered(
+        app,
+        list(getattr(router_obj, "routes", []) or []),
+        module_name,
+    )
+
+
+
+def _append_mount_fn_routes_filtered(app: FastAPI, mount_fn: Any, module_name: str) -> Dict[str, Any]:
+    temp_app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, default_response_class=_StrictJSONResponse)
+    _ensure_app_state_defaults(temp_app)
+    mount_fn(temp_app)
+    return _append_routes_from_iterable_filtered(
+        app,
+        list(getattr(temp_app, "routes", []) or []),
+        module_name,
+    )
 
 
 def _build_controlled_mount_plan() -> List[str]:
@@ -1372,17 +1406,36 @@ def _mount_routes_controlled(app: FastAPI) -> Dict[str, Any]:
                 continue
 
             if callable(mount_fn):
-                mount_fn(app)
-                mounted.append(mod_name)
-                mount_modes[mod_name] = "mount_fn"
+                stats = _append_mount_fn_routes_filtered(app, mount_fn, mod_name)
+                filtered_out_routes[mod_name] = int(stats.get("filtered_out", 0))
+
+                if int(stats.get("added", 0)) > 0:
+                    mounted.append(mod_name)
+                    mount_modes[mod_name] = "filtered_mount_fn"
+                else:
+                    if int(stats.get("duplicate_skips", 0)) > 0:
+                        duplicate_skips.append(mod_name)
+                    if int(stats.get("partial_duplicate_skips", 0)) > 0:
+                        partial_duplicate_skips.append(mod_name)
+                    if (
+                        int(stats.get("filtered_out", 0)) > 0
+                        and int(stats.get("duplicate_skips", 0)) == 0
+                        and int(stats.get("partial_duplicate_skips", 0)) == 0
+                    ):
+                        no_router[mod_name] = "mount(app) produced routes but all were filtered by controlled ownership policy"
+                    elif int(stats.get("duplicate_skips", 0)) > 0 or int(stats.get("partial_duplicate_skips", 0)) > 0:
+                        mount_modes[mod_name] = "filtered_mount_fn_duplicate_skip"
+                    else:
+                        no_router[mod_name] = "mount(app) completed but produced no eligible routes"
+
                 resolved_entries.append(
                     {
                         "module": mod_name,
                         "router_source": "mount_fn",
-                        "added_routes": None,
-                        "filtered_out_routes": 0,
-                        "duplicate_skips": 0,
-                        "partial_duplicate_skips": 0,
+                        "added_routes": int(stats.get("added", 0)),
+                        "filtered_out_routes": int(stats.get("filtered_out", 0)),
+                        "duplicate_skips": int(stats.get("duplicate_skips", 0)),
+                        "partial_duplicate_skips": int(stats.get("partial_duplicate_skips", 0)),
                     }
                 )
                 continue
