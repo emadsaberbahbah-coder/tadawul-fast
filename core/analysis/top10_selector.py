@@ -3,35 +3,36 @@
 """
 core/analysis/top10_selector.py
 ================================================================================
-Top 10 Selector — v4.4.0
+Top 10 Selector — v4.5.0
 ================================================================================
 LIVE • SCHEMA-FIRST • ROUTE-COMPATIBLE • ENGINE-SELF-RESOLVING • JSON-SAFE
 TOP10-METADATA GUARANTEED • SOURCE-PAGE SAFE • SNAPSHOT FALLBACK SAFE
 SYNC+ASYNC CALLER TOLERANT • MODULE/APP-STATE ENGINE DISCOVERY HARDENED
 WRAPPER-PAYLOAD SAFE • STRICT ROW COERCION • HORIZON-AWARE FILTERING
 PARTIAL-DEGRADATION SAFE • DIRECT-SYMBOLS SAFE • PAYLOAD-ALIAS COMPLETE
+TIMEOUT-GUARDED • PARTIAL-PAGE SUCCESS SAFE • LOW-LATENCY TARGETED HYDRATION
 
 Purpose
 -------
 Produce stable, schema-aligned Top_10_Investments rows for:
+- routes/advisor.py
 - routes/investment_advisor.py
 - routes/analysis_sheet_rows.py
 - routes/enriched_quote.py
 - routes/advanced_analysis.py
 - internal callers
 
-What is improved in v4.4.0
+What is improved in v4.5.0
 --------------------------
-- ✅ FIX: stricter extraction from nested wrapper payloads and rows_matrix payloads
-- ✅ FIX: avoids fake rows caused by meta/wrapper dicts
-- ✅ FIX: supports keys/columns/fields/headers/display_headers aliases consistently
-- ✅ FIX: schema loading tolerates dict/object/list spec shapes more safely
-- ✅ FIX: Top10 payload includes all route-friendly aliases and `count`
-- ✅ FIX: horizon-aware ROI filtering and horizon-aware ranking tie-breaks
-- ✅ FIX: if ROI filter empties the pool, filtering relaxes gracefully instead of hard failing
-- ✅ FIX: direct-symbol quote fetching supports batch and single-quote engine variants
-- ✅ FIX: engine discovery scans kwargs/app.state/module-level holders more safely
-- ✅ FIX: richer metadata for debugging page rows, snapshot rows, and symbol hydration
+- FIX: every engine call is now timeout-guarded to reduce Top10 hangs / 502s.
+- FIX: candidate collection degrades page-by-page instead of failing as one block.
+- FIX: page hydration is capped and prioritized so Top10 no longer over-hydrates
+  large source pages.
+- FIX: direct symbol and page-source collection now keep partial success even if
+  one provider call times out.
+- FIX: richer debug metadata records which pages succeeded, timed out, or fell
+  back to snapshots.
+- FIX: adds builder aliases expected by stricter routers and wrapper callers.
 ================================================================================
 """
 
@@ -53,7 +54,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 logger = logging.getLogger("core.analysis.top10_selector")
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "4.4.0"
+TOP10_SELECTOR_VERSION = "4.5.0"
 OUTPUT_PAGE = "Top_10_Investments"
 
 DEFAULT_SOURCE_PAGES = [
@@ -214,6 +215,37 @@ DEFAULT_FALLBACK_HEADERS = [
 _ENGINE_CACHE: Optional[Any] = None
 _ENGINE_CACHE_SOURCE: str = ""
 _ENGINE_LOCK = asyncio.Lock()
+
+
+# =============================================================================
+# Runtime knobs
+# =============================================================================
+def _env_float(name: str, default: float) -> float:
+    try:
+        value = float(os.getenv(name, str(default)).strip())
+        if math.isnan(value) or math.isinf(value):
+            return default
+        return max(0.1, value)
+    except Exception:
+        return default
+
+
+def _env_int(name: str, default: int, minimum: int = 1, maximum: int = 100000) -> int:
+    try:
+        value = int(float(os.getenv(name, str(default)).strip()))
+        return max(minimum, min(value, maximum))
+    except Exception:
+        return default
+
+
+ENGINE_CALL_TIMEOUT_SEC = _env_float("TFB_TOP10_ENGINE_CALL_TIMEOUT_SEC", 8.0)
+PAGE_TOTAL_TIMEOUT_SEC = _env_float("TFB_TOP10_PAGE_TIMEOUT_SEC", 12.0)
+BUILDER_TOTAL_TIMEOUT_SEC = _env_float("TFB_TOP10_TOTAL_TIMEOUT_SEC", 32.0)
+SOURCE_PAGE_LIMIT = _env_int("TOP10_SELECTOR_SOURCE_PAGE_LIMIT", 80, minimum=10, maximum=1000)
+HYDRATION_SYMBOL_CAP = _env_int("TOP10_SELECTOR_HYDRATION_SYMBOL_CAP", 30, minimum=5, maximum=250)
+MAX_SOURCE_PAGES = _env_int("TOP10_SELECTOR_MAX_SOURCE_PAGES", 5, minimum=1, maximum=20)
+MAX_LIMIT = _env_int("TOP10_SELECTOR_MAX_LIMIT", 50, minimum=1, maximum=200)
+EARLY_STOP_MULTIPLIER = _env_int("TOP10_SELECTOR_EARLY_STOP_MULTIPLIER", 6, minimum=2, maximum=20)
 
 
 # =============================================================================
@@ -401,7 +433,7 @@ def _safe_source_pages(values: Sequence[str]) -> List[str]:
         if s not in seen:
             seen.add(s)
             out.append(s)
-    return out
+    return out[:MAX_SOURCE_PAGES]
 
 
 def _rows_to_matrix(rows: Sequence[Mapping[str, Any]], keys: Sequence[str]) -> List[List[Any]]:
@@ -471,6 +503,17 @@ def _model_to_dict(obj: Any) -> Dict[str, Any]:
     except Exception:
         pass
     return {}
+
+
+def _count_nonblank_fields(row: Mapping[str, Any]) -> int:
+    count = 0
+    for value in row.values():
+        if isinstance(value, str):
+            if value.strip():
+                count += 1
+        elif value not in (None, [], {}, ()):
+            count += 1
+    return count
 
 
 # =============================================================================
@@ -709,19 +752,21 @@ def _collect_engine_candidates_from_object(
 
 async def _call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     if inspect.iscoroutinefunction(fn):
-        return await fn(*args, **kwargs)
+        result = fn(*args, **kwargs)
+        return await result
     result = await asyncio.to_thread(fn, *args, **kwargs)
     if inspect.isawaitable(result):
         return await result
     return result
 
 
+async def _call_with_timeout(fn: Callable[..., Any], *args: Any, timeout: float, **kwargs: Any) -> Any:
+    return await asyncio.wait_for(_call_maybe_async(fn, *args, **kwargs), timeout=timeout)
+
+
 async def _safe_call_zero_arg(fn: Callable[..., Any]) -> Any:
     try:
-        result = fn()
-        if inspect.isawaitable(result):
-            return await result
-        return result
+        return await _call_with_timeout(fn, timeout=min(ENGINE_CALL_TIMEOUT_SEC, 6.0))
     except TypeError:
         return None
     except Exception:
@@ -929,6 +974,8 @@ async def _call_engine_method(
     engine: Any,
     method_names: Sequence[str],
     attempts: Sequence[Tuple[Tuple[Any, ...], Dict[str, Any]]],
+    *,
+    timeout_seconds: float = ENGINE_CALL_TIMEOUT_SEC,
 ) -> Any:
     if engine is None:
         return None
@@ -939,7 +986,11 @@ async def _call_engine_method(
             continue
         for args, kwargs in attempts:
             try:
-                return await _call_maybe_async(fn, *args, **kwargs)
+                return await _call_with_timeout(fn, *args, timeout=timeout_seconds, **kwargs)
+            except asyncio.TimeoutError as exc:
+                last_exc = exc
+                logger.debug("Engine method timed out: %s", method_name)
+                continue
             except TypeError as exc:
                 last_exc = exc
                 continue
@@ -995,6 +1046,7 @@ async def _fetch_page_snapshot_rows(engine: Any, page: str) -> List[Dict[str, An
         engine,
         ("get_cached_sheet_snapshot", "get_sheet_snapshot", "get_cached_sheet_rows", "get_page_snapshot", "get_sheet_cache"),
         attempts,
+        timeout_seconds=min(ENGINE_CALL_TIMEOUT_SEC, 6.0),
     )
     return _extract_rows_like(payload)
 
@@ -1017,6 +1069,7 @@ async def _fetch_direct_symbol_rows(engine: Any, symbols: Sequence[str], mode: s
         engine,
         ("get_enriched_quotes_batch", "get_analysis_quotes_batch", "get_quotes_batch", "quotes_batch", "get_quotes"),
         attempts,
+        timeout_seconds=min(ENGINE_CALL_TIMEOUT_SEC, 7.0),
     )
     rows = _extract_rows_like(payload)
     if rows:
@@ -1032,7 +1085,7 @@ async def _fetch_direct_symbol_rows(engine: Any, symbols: Sequence[str], mode: s
             return direct_rows
 
     out: List[Dict[str, Any]] = []
-    for sym in syms:
+    for sym in syms[:HYDRATION_SYMBOL_CAP]:
         single_attempts = [
             ((sym,), {"mode": mode or "", "schema": OUTPUT_PAGE}),
             ((sym,), {"mode": mode or ""}),
@@ -1044,6 +1097,7 @@ async def _fetch_direct_symbol_rows(engine: Any, symbols: Sequence[str], mode: s
             engine,
             ("get_enriched_quote", "get_quote", "get_quote_dict"),
             single_attempts,
+            timeout_seconds=min(ENGINE_CALL_TIMEOUT_SEC, 5.0),
         )
         single_rows = _extract_rows_like(row_payload)
         if single_rows:
@@ -1134,7 +1188,7 @@ def _collect_criteria_from_inputs(*args: Any, **kwargs: Any) -> Dict[str, Any]:
     direct_symbols = [_normalize_symbol(s) for s in direct_symbols if _normalize_symbol(s)]
 
     limit = _safe_int(criteria.get("limit") or criteria.get("top_n") or kwargs.get("limit"), 10)
-    limit = max(1, min(limit, _safe_int(os.getenv("TOP10_SELECTOR_MAX_LIMIT", "50"), 50)))
+    limit = max(1, min(limit, MAX_LIMIT))
 
     horizon_days = _safe_int(
         criteria.get("horizon_days") or criteria.get("invest_period_days") or criteria.get("investment_period_days"),
@@ -1164,8 +1218,8 @@ def _collect_criteria_from_inputs(*args: Any, **kwargs: Any) -> Dict[str, Any]:
     normalized["min_roi"] = min_roi_ratio
     normalized["schema_only"] = _coerce_bool(normalized.get("schema_only"), False)
     normalized["headers_only"] = _coerce_bool(normalized.get("headers_only"), False)
-    normalized["include_headers"] = _coerce_bool(normalized.get("include_headers"), True)
-    normalized["include_matrix"] = _coerce_bool(normalized.get("include_matrix"), True)
+    normalized["include_headers"] = _coerce_bool(normalized.get("include_headers", True), True)
+    normalized["include_matrix"] = _coerce_bool(normalized.get("include_matrix", True), True)
     normalized.setdefault("enrich_final", True)
     return normalized
 
@@ -1200,7 +1254,7 @@ def _normalize_candidate_row(raw: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def _row_richness(row: Mapping[str, Any]) -> int:
-    return sum(1 for _, v in row.items() if not _is_blank(v))
+    return _count_nonblank_fields(row)
 
 
 def _choose_horizon_roi(row: Mapping[str, Any], horizon_days: int) -> Optional[float]:
@@ -1389,10 +1443,121 @@ def _rank_and_project_rows(rows: Sequence[Mapping[str, Any]], keys: Sequence[str
 # =============================================================================
 # Candidate collection
 # =============================================================================
+def _page_priority_symbol_limit(criteria: Mapping[str, Any]) -> int:
+    limit = _safe_int(criteria.get("limit"), 10)
+    return max(min(limit * 3, HYDRATION_SYMBOL_CAP), min(HYDRATION_SYMBOL_CAP, 12))
+
+
+def _merge_row_prefer_richer(base: Mapping[str, Any], update: Mapping[str, Any]) -> Dict[str, Any]:
+    merged = dict(base)
+    for key, value in dict(update).items():
+        if value not in (None, "", [], {}, ()):
+            merged[key] = value
+    return merged
+
+
+async def _collect_page_rows_with_fallback(engine: Any, page: str, mode: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    meta: Dict[str, Any] = {
+        "page": page,
+        "rows": 0,
+        "snapshot_rows": 0,
+        "used_snapshot": False,
+        "timed_out": False,
+        "error": "",
+    }
+    try:
+        rows = await asyncio.wait_for(_fetch_page_rows(engine, page, SOURCE_PAGE_LIMIT, mode), timeout=PAGE_TOTAL_TIMEOUT_SEC)
+        meta["rows"] = len(rows)
+    except asyncio.TimeoutError:
+        rows = []
+        meta["timed_out"] = True
+        meta["error"] = "page_rows_timeout"
+    except Exception as exc:
+        rows = []
+        meta["error"] = f"page_rows_failed:{type(exc).__name__}"
+
+    if rows:
+        return rows, meta
+
+    try:
+        snap_rows = await asyncio.wait_for(_fetch_page_snapshot_rows(engine, page), timeout=min(PAGE_TOTAL_TIMEOUT_SEC, 8.0))
+        meta["snapshot_rows"] = len(snap_rows)
+        meta["used_snapshot"] = bool(snap_rows)
+        return snap_rows, meta
+    except asyncio.TimeoutError:
+        if not meta["error"]:
+            meta["error"] = "snapshot_timeout"
+        return [], meta
+    except Exception as exc:
+        if not meta["error"]:
+            meta["error"] = f"snapshot_failed:{type(exc).__name__}"
+        return [], meta
+
+
+async def _hydrate_page_rows(engine: Any, rows: List[Dict[str, Any]], mode: str, criteria: Mapping[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    meta: Dict[str, Any] = {
+        "requested_symbols": 0,
+        "enriched_rows": 0,
+        "hydration_used": False,
+        "hydration_error": "",
+    }
+    if not rows:
+        return rows, meta
+
+    ranked_candidates: List[Tuple[float, Dict[str, Any]]] = []
+    for row in rows:
+        normalized = _normalize_candidate_row(row)
+        sym = _normalize_symbol(normalized.get("symbol") or normalized.get("ticker"))
+        if not sym:
+            continue
+        ranked_candidates.append((_selector_score(normalized, criteria), normalized))
+
+    ranked_candidates.sort(key=lambda x: (x[0], _row_richness(x[1])), reverse=True)
+    symbols = _dedupe_keep_order(
+        _normalize_symbol(item[1].get("symbol") or item[1].get("ticker")) for item in ranked_candidates
+    )[: _page_priority_symbol_limit(criteria)]
+
+    meta["requested_symbols"] = len(symbols)
+    if not symbols:
+        return rows, meta
+
+    try:
+        enriched_rows = await asyncio.wait_for(_fetch_direct_symbol_rows(engine, symbols, mode), timeout=min(PAGE_TOTAL_TIMEOUT_SEC, 10.0))
+        meta["enriched_rows"] = len(enriched_rows)
+        meta["hydration_used"] = bool(enriched_rows)
+    except asyncio.TimeoutError:
+        meta["hydration_error"] = "hydration_timeout"
+        return rows, meta
+    except Exception as exc:
+        meta["hydration_error"] = f"hydration_failed:{type(exc).__name__}"
+        return rows, meta
+
+    if not enriched_rows:
+        return rows, meta
+
+    row_map: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        normalized = _normalize_candidate_row(row)
+        sym = _normalize_symbol(normalized.get("symbol") or normalized.get("ticker"))
+        if sym:
+            row_map[sym] = normalized
+
+    for er in enriched_rows:
+        normalized = _normalize_candidate_row(er)
+        sym = _normalize_symbol(normalized.get("symbol") or normalized.get("ticker"))
+        if not sym:
+            continue
+        if sym in row_map:
+            row_map[sym] = _merge_row_prefer_richer(row_map[sym], normalized)
+        else:
+            row_map[sym] = normalized
+
+    return list(row_map.values()), meta
+
+
 async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     direct_symbols = _normalize_list(criteria.get("direct_symbols"))
     pages = _safe_source_pages(_normalize_list(criteria.get("pages_selected")))
-    per_page_limit = max(10, min(_safe_int(os.getenv("TOP10_SELECTOR_SOURCE_PAGE_LIMIT", "250"), 250), 1000))
 
     meta: Dict[str, Any] = {
         "engine_source": _ENGINE_CACHE_SOURCE or "",
@@ -1401,6 +1566,9 @@ async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode
         "source_page_rows": {},
         "snapshot_rows": {},
         "direct_symbol_rows": 0,
+        "page_diagnostics": [],
+        "hydration_diagnostics": [],
+        "partial_success": False,
     }
 
     candidates: Dict[str, Dict[str, Any]] = {}
@@ -1417,51 +1585,68 @@ async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode
             candidates[sym] = row
 
     if direct_symbols:
-        direct_rows = await _fetch_direct_symbol_rows(engine, direct_symbols, mode)
-        meta["direct_symbol_rows"] = len(direct_rows)
-        for row in direct_rows:
-            _put_row(row, "")
+        try:
+            direct_rows = await asyncio.wait_for(_fetch_direct_symbol_rows(engine, direct_symbols[:HYDRATION_SYMBOL_CAP], mode), timeout=min(BUILDER_TOTAL_TIMEOUT_SEC / 2.0, 12.0))
+            meta["direct_symbol_rows"] = len(direct_rows)
+            meta["partial_success"] = meta["partial_success"] or bool(direct_rows)
+            for row in direct_rows:
+                _put_row(row, "")
+        except asyncio.TimeoutError:
+            meta["direct_symbol_error"] = "direct_symbol_timeout"
+        except Exception as exc:
+            meta["direct_symbol_error"] = f"direct_symbol_failed:{type(exc).__name__}"
+
+    early_stop_target = max(10, _safe_int(criteria.get("limit"), 10) * EARLY_STOP_MULTIPLIER)
 
     for page in pages:
-        rows = await _fetch_page_rows(engine, page, per_page_limit, mode)
-        meta["source_page_rows"][page] = len(rows)
+        page_rows, page_meta = await _collect_page_rows_with_fallback(engine, page, mode)
+        meta["source_page_rows"][page] = page_meta.get("rows", 0)
+        meta["snapshot_rows"][page] = page_meta.get("snapshot_rows", 0)
 
-        if not rows:
-            snap_rows = await _fetch_page_snapshot_rows(engine, page)
-            meta["snapshot_rows"][page] = len(snap_rows)
-            rows = snap_rows
+        hydrated_rows = page_rows
+        hydration_meta: Dict[str, Any] = {"page": page}
+        if page_rows:
+            hydrated_rows, hydration_meta = await _hydrate_page_rows(engine, page_rows, mode, criteria)
+            hydration_meta["page"] = page
 
-        if rows:
-            symbols_from_page = _dedupe_keep_order(
-                _normalize_symbol(r.get("symbol") or r.get("ticker") or r.get("requested_symbol")) for r in rows
-            )
-            enriched_rows = await _fetch_direct_symbol_rows(engine, symbols_from_page, mode)
-            if enriched_rows:
-                page_map = {
-                    _normalize_symbol(r.get("symbol") or r.get("ticker") or r.get("requested_symbol")): dict(r)
-                    for r in rows
-                    if _normalize_symbol(r.get("symbol") or r.get("ticker") or r.get("requested_symbol"))
-                }
-                for er in enriched_rows:
-                    sym = _normalize_symbol(er.get("symbol") or er.get("ticker"))
-                    if sym:
-                        base = page_map.get(sym, {})
-                        merged = dict(base)
-                        for k, v in dict(er).items():
-                            if v not in (None, "", [], {}):
-                                merged[k] = v
-                        page_map[sym] = merged
-                rows = list(page_map.values())
+        meta["page_diagnostics"].append(_json_safe(page_meta))
+        meta["hydration_diagnostics"].append(_json_safe(hydration_meta))
+        if hydrated_rows:
+            meta["partial_success"] = True
 
-        for row in rows:
+        for row in hydrated_rows:
             _put_row(row, page)
 
+        if len(candidates) >= early_stop_target and page != "My_Portfolio":
+            meta["early_stop"] = True
+            meta["early_stop_after_page"] = page
+            break
+
     if not candidates:
-        fallback_rows = await _fetch_page_rows(engine, OUTPUT_PAGE, max(50, _safe_int(criteria.get("limit"), 10) * 3), mode)
-        meta["top10_output_fallback_rows"] = len(fallback_rows)
+        try:
+            fallback_rows = await asyncio.wait_for(
+                _fetch_page_rows(engine, OUTPUT_PAGE, max(30, _safe_int(criteria.get("limit"), 10) * 2), mode),
+                timeout=min(PAGE_TOTAL_TIMEOUT_SEC, 10.0),
+            )
+            meta["top10_output_fallback_rows"] = len(fallback_rows)
+        except asyncio.TimeoutError:
+            fallback_rows = []
+            meta["top10_output_fallback_error"] = "top10_output_timeout"
+        except Exception as exc:
+            fallback_rows = []
+            meta["top10_output_fallback_error"] = f"top10_output_failed:{type(exc).__name__}"
+
         if not fallback_rows:
-            fallback_rows = await _fetch_page_snapshot_rows(engine, OUTPUT_PAGE)
-            meta["top10_output_snapshot_rows"] = len(fallback_rows)
+            try:
+                fallback_rows = await asyncio.wait_for(_fetch_page_snapshot_rows(engine, OUTPUT_PAGE), timeout=min(PAGE_TOTAL_TIMEOUT_SEC, 8.0))
+                meta["top10_output_snapshot_rows"] = len(fallback_rows)
+            except asyncio.TimeoutError:
+                fallback_rows = []
+                meta["top10_output_snapshot_error"] = "top10_output_snapshot_timeout"
+            except Exception as exc:
+                fallback_rows = []
+                meta["top10_output_snapshot_error"] = f"top10_output_snapshot_failed:{type(exc).__name__}"
+
         for row in fallback_rows:
             _put_row(row, OUTPUT_PAGE)
 
@@ -1492,6 +1677,8 @@ def _build_payload(*, status: str, headers: List[str], keys: List[str], rows: Li
         "data": rows,
         "items": rows,
         "quotes": rows,
+        "records": rows,
+        "row_objects": rows,
         "rows_matrix": _rows_to_matrix(rows, keys) if include_matrix else [],
         "count": len(rows),
         "version": TOP10_SELECTOR_VERSION,
@@ -1504,55 +1691,130 @@ def _build_payload(*, status: str, headers: List[str], keys: List[str], rows: Li
 # Core async implementation
 # =============================================================================
 async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    started = time.perf_counter()
-    headers, keys = _load_schema_defaults()
-    criteria = _collect_criteria_from_inputs(*args, **kwargs)
-    mode = _s(kwargs.get("mode") or criteria.get("mode") or "")
-    limit = max(1, _safe_int(criteria.get("limit") or kwargs.get("limit"), 10))
+    async def _inner() -> Dict[str, Any]:
+        started = time.perf_counter()
+        headers, keys = _load_schema_defaults()
+        criteria = _collect_criteria_from_inputs(*args, **kwargs)
+        mode = _s(kwargs.get("mode") or criteria.get("mode") or "")
+        limit = max(1, _safe_int(criteria.get("limit") or kwargs.get("limit"), 10))
 
-    if criteria.get("schema_only") or criteria.get("headers_only"):
-        return _build_payload(
-            status="success",
-            headers=headers,
-            keys=keys,
-            rows=[],
-            meta={
-                "build_status": "OK",
-                "dispatch": "top10_selector",
-                "selector_version": TOP10_SELECTOR_VERSION,
-                "schema_only": bool(criteria.get("schema_only")),
-                "headers_only": bool(criteria.get("headers_only")),
-                "criteria_used": _json_safe(criteria),
-                "include_headers": criteria.get("include_headers", True),
-                "include_matrix": criteria.get("include_matrix", True),
-                "duration_ms": round((time.perf_counter() - started) * 1000.0, 3),
-            },
+        if criteria.get("schema_only") or criteria.get("headers_only"):
+            return _build_payload(
+                status="success",
+                headers=headers,
+                keys=keys,
+                rows=[],
+                meta={
+                    "build_status": "OK",
+                    "dispatch": "top10_selector",
+                    "selector_version": TOP10_SELECTOR_VERSION,
+                    "schema_only": bool(criteria.get("schema_only")),
+                    "headers_only": bool(criteria.get("headers_only")),
+                    "criteria_used": _json_safe(criteria),
+                    "include_headers": criteria.get("include_headers", True),
+                    "include_matrix": criteria.get("include_matrix", True),
+                    "duration_ms": round((time.perf_counter() - started) * 1000.0, 3),
+                },
+            )
+
+        engine, engine_source = await _resolve_engine(*args, **kwargs)
+        if engine is None:
+            return _build_payload(
+                status="warn",
+                headers=headers,
+                keys=keys,
+                rows=[],
+                meta={
+                    "build_status": "DEGRADED",
+                    "dispatch": "top10_selector",
+                    "selector_version": TOP10_SELECTOR_VERSION,
+                    "warning": "engine_unavailable",
+                    "criteria_used": _json_safe(criteria),
+                    "include_headers": criteria.get("include_headers", True),
+                    "include_matrix": criteria.get("include_matrix", True),
+                    "engine_source": engine_source,
+                    "duration_ms": round((time.perf_counter() - started) * 1000.0, 3),
+                },
+            )
+
+        try:
+            candidates, collect_meta = await _collect_candidate_rows(engine, criteria, mode)
+        except Exception as exc:
+            logger.warning("Top10 candidate collection failed: %s", exc, exc_info=True)
+            return _build_payload(
+                status="warn",
+                headers=headers,
+                keys=keys,
+                rows=[],
+                meta={
+                    "build_status": "DEGRADED",
+                    "dispatch": "top10_selector",
+                    "selector_version": TOP10_SELECTOR_VERSION,
+                    "warning": f"candidate_collection_failed:{type(exc).__name__}",
+                    "criteria_used": _json_safe(criteria),
+                    "include_headers": criteria.get("include_headers", True),
+                    "include_matrix": criteria.get("include_matrix", True),
+                    "engine_source": engine_source,
+                    "duration_ms": round((time.perf_counter() - started) * 1000.0, 3),
+                },
+            )
+
+        filtered = [r for r in candidates if _passes_filters(r, criteria)]
+        filter_relaxed = False
+        selected_pool = filtered
+        if not selected_pool and candidates:
+            selected_pool = list(candidates)
+            filter_relaxed = True
+
+        horizon_days = _safe_int(criteria.get("horizon_days") or criteria.get("invest_period_days"), 90)
+        scored: List[Tuple[float, Dict[str, Any]]] = []
+        for row in selected_pool:
+            scored.append((_selector_score(row, criteria), dict(row)))
+
+        scored.sort(
+            key=lambda x: (
+                x[0],
+                _choose_horizon_roi(x[1], horizon_days) or 0.0,
+                _safe_float(x[1].get("opportunity_score"), 0.0) or 0.0,
+                _safe_float(x[1].get("overall_score"), 0.0) or 0.0,
+                _safe_float(x[1].get("forecast_confidence"), 0.0) or 0.0,
+                -(_safe_float(x[1].get("risk_score"), 999.0) or 999.0),
+                _safe_float(x[1].get("liquidity_score"), 0.0) or 0.0,
+                _row_richness(x[1]),
+            ),
+            reverse=True,
         )
 
-    engine, engine_source = await _resolve_engine(*args, **kwargs)
-    if engine is None:
-        return _build_payload(
-            status="warn",
-            headers=headers,
-            keys=keys,
-            rows=[],
-            meta={
-                "build_status": "DEGRADED",
-                "dispatch": "top10_selector",
-                "selector_version": TOP10_SELECTOR_VERSION,
-                "warning": "engine_unavailable",
-                "criteria_used": _json_safe(criteria),
-                "include_headers": criteria.get("include_headers", True),
-                "include_matrix": criteria.get("include_matrix", True),
-                "engine_source": engine_source,
-                "duration_ms": round((time.perf_counter() - started) * 1000.0, 3),
-            },
-        )
+        top_rows = [row for _, row in scored[:limit]]
+        projected_rows = _rank_and_project_rows(top_rows, keys, criteria)
+
+        status = "success" if projected_rows else "warn"
+        meta = {
+            "build_status": "OK" if projected_rows else "WARN",
+            "dispatch": "top10_selector",
+            "selector_version": TOP10_SELECTOR_VERSION,
+            "criteria_used": _json_safe(criteria),
+            "candidate_count": len(candidates),
+            "filtered_count": len(filtered),
+            "selected_count": len(projected_rows),
+            "filter_relaxed": filter_relaxed,
+            "selected_symbols": [_s(r.get("symbol")) for r in projected_rows if _s(r.get("symbol"))],
+            "include_headers": criteria.get("include_headers", True),
+            "include_matrix": criteria.get("include_matrix", True),
+            "engine_source": engine_source,
+            "duration_ms": round((time.perf_counter() - started) * 1000.0, 3),
+            **collect_meta,
+        }
+        if not projected_rows:
+            meta["warning"] = "no_top10_rows_after_filtering"
+
+        return _build_payload(status=status, headers=headers, keys=keys, rows=projected_rows, meta=meta)
 
     try:
-        candidates, collect_meta = await _collect_candidate_rows(engine, criteria, mode)
-    except Exception as exc:
-        logger.warning("Top10 candidate collection failed: %s", exc)
+        return await asyncio.wait_for(_inner(), timeout=BUILDER_TOTAL_TIMEOUT_SEC)
+    except asyncio.TimeoutError:
+        headers, keys = _load_schema_defaults()
+        criteria = _collect_criteria_from_inputs(*args, **kwargs)
         return _build_payload(
             status="warn",
             headers=headers,
@@ -1562,65 +1824,12 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
                 "build_status": "DEGRADED",
                 "dispatch": "top10_selector",
                 "selector_version": TOP10_SELECTOR_VERSION,
-                "warning": f"candidate_collection_failed:{type(exc).__name__}",
+                "warning": "builder_total_timeout",
                 "criteria_used": _json_safe(criteria),
                 "include_headers": criteria.get("include_headers", True),
                 "include_matrix": criteria.get("include_matrix", True),
-                "engine_source": engine_source,
-                "duration_ms": round((time.perf_counter() - started) * 1000.0, 3),
             },
         )
-
-    filtered = [r for r in candidates if _passes_filters(r, criteria)]
-    filter_relaxed = False
-    selected_pool = filtered
-    if not selected_pool and candidates:
-        selected_pool = list(candidates)
-        filter_relaxed = True
-
-    horizon_days = _safe_int(criteria.get("horizon_days") or criteria.get("invest_period_days"), 90)
-    scored: List[Tuple[float, Dict[str, Any]]] = []
-    for row in selected_pool:
-        scored.append((_selector_score(row, criteria), dict(row)))
-
-    scored.sort(
-        key=lambda x: (
-            x[0],
-            _choose_horizon_roi(x[1], horizon_days) or 0.0,
-            _safe_float(x[1].get("opportunity_score"), 0.0) or 0.0,
-            _safe_float(x[1].get("overall_score"), 0.0) or 0.0,
-            _safe_float(x[1].get("forecast_confidence"), 0.0) or 0.0,
-            -(_safe_float(x[1].get("risk_score"), 999.0) or 999.0),
-            _safe_float(x[1].get("liquidity_score"), 0.0) or 0.0,
-            _row_richness(x[1]),
-        ),
-        reverse=True,
-    )
-
-    top_rows = [row for _, row in scored[:limit]]
-    projected_rows = _rank_and_project_rows(top_rows, keys, criteria)
-
-    status = "success" if projected_rows else "warn"
-    meta = {
-        "build_status": "OK" if projected_rows else "WARN",
-        "dispatch": "top10_selector",
-        "selector_version": TOP10_SELECTOR_VERSION,
-        "criteria_used": _json_safe(criteria),
-        "candidate_count": len(candidates),
-        "filtered_count": len(filtered),
-        "selected_count": len(projected_rows),
-        "filter_relaxed": filter_relaxed,
-        "selected_symbols": [_s(r.get("symbol")) for r in projected_rows if _s(r.get("symbol"))],
-        "include_headers": criteria.get("include_headers", True),
-        "include_matrix": criteria.get("include_matrix", True),
-        "engine_source": engine_source,
-        "duration_ms": round((time.perf_counter() - started) * 1000.0, 3),
-        **collect_meta,
-    }
-    if not projected_rows:
-        meta["warning"] = "no_top10_rows_after_filtering"
-
-    return _build_payload(status=status, headers=headers, keys=keys, rows=projected_rows, meta=meta)
 
 
 # =============================================================================
@@ -1644,6 +1853,22 @@ def build_top10_investments_rows(*args: Any, **kwargs: Any) -> Any:
 
 
 def build_top_10_investments_rows(*args: Any, **kwargs: Any) -> Any:
+    return build_top10_rows(*args, **kwargs)
+
+
+def build_top10(*args: Any, **kwargs: Any) -> Any:
+    return build_top10_rows(*args, **kwargs)
+
+
+def build_top10_investments(*args: Any, **kwargs: Any) -> Any:
+    return build_top10_rows(*args, **kwargs)
+
+
+def build_top10_output(*args: Any, **kwargs: Any) -> Any:
+    return build_top10_rows(*args, **kwargs)
+
+
+def build_top10_payload(*args: Any, **kwargs: Any) -> Any:
     return build_top10_rows(*args, **kwargs)
 
 
@@ -1682,6 +1907,10 @@ __all__ = [
     "build_top10_output_rows",
     "build_top10_investments_rows",
     "build_top_10_investments_rows",
+    "build_top10",
+    "build_top10_investments",
+    "build_top10_output",
+    "build_top10_payload",
     "get_top10_rows",
     "select_top10",
     "select_top10_symbols",
