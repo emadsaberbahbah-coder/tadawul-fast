@@ -2,7 +2,7 @@
 # routes/enriched_quote.py
 """
 ================================================================================
-TFB Enriched Quote Routes Wrapper — v7.5.0
+TFB Enriched Quote Routes Wrapper — v7.6.0
 ================================================================================
 SCHEMA-AWARE • PAGE-DISPATCH SAFE • GET+POST COMPATIBLE
 ROOT /v1/enriched-quote COMPATIBLE • SPECIAL-PAGE SAFE • THREAD-OFFLOADED
@@ -10,7 +10,7 @@ JSON-SAFE • TABLE-MODE SAFE • INSTRUMENT HYDRATION SAFE • LATENCY-FIRST
 WRAPPER-PAYLOAD SAFE • ROUTE-TOLERANT • CONTRACT-ALIGNED
 ROW-OBJECTS + MATRIX • SHARED-PIPELINE ALIGNED
 
-What v7.5.0 improves
+What v7.6.0 improves
 --------------------
 - ✅ FIX: enriched router is now quote-owned only; it no longer acts as a
         generic sheet-row owner for non-instrument pages.
@@ -22,6 +22,12 @@ What v7.5.0 improves
         quote flows, but now fences non-instrument page requests cleanly.
 - ✅ FIX: stable output contract remains aligned with advisor families while
         preserving schema_only / headers_only for instrument quote testing.
+- ✅ FIX: root `/v1/enriched-quote` now treats `symbol + page` as a true
+        single-quote request instead of leaking into batch mode.
+- ✅ FIX: `/quotes` now accepts a singleton `symbol` / `ticker` payload as a
+        one-item batch for safer compatibility.
+- ✅ FIX: wrapper no longer re-includes the core router wholesale, which could
+        silently reintroduce non-canonical enriched routes such as sheet-rows.
 ================================================================================
 """
 
@@ -44,7 +50,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 
 logger = logging.getLogger("routes.enriched_quote")
 
-ROUTER_VERSION = "7.5.0"
+ROUTER_VERSION = "7.6.0"
 router: Optional[APIRouter] = None
 
 TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
@@ -1685,6 +1691,7 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         keys = keys or ["symbol", "error"]
 
         if route_family != "instrument":
+            hint = _canonical_owner_hint(page, route_family)
             row = svc.normalize_row(
                 keys,
                 {"symbol": symbol, "ticker": symbol, "error": f"single_quote_not_supported_for_{route_family}_page"},
@@ -1703,6 +1710,10 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
                 started_at=start,
                 mode=mode_q,
                 dispatch="special_guard",
+                extra_meta={
+                    "page_known": svc.page_is_known(page),
+                    **hint,
+                },
             )
             payload["row"] = row
             payload["quote"] = row
@@ -1763,7 +1774,12 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
         if limit > 0:
             top_n = limit
 
-        symbols = _list_from_body(prepared, "symbols", "tickers", "tickers_list")[:top_n]
+        symbols = _list_from_body(prepared, "symbols", "tickers", "tickers_list")
+        if not symbols:
+            single_symbol = _strip(prepared.get("symbol") or prepared.get("ticker") or prepared.get("requested_symbol"))
+            if single_symbol:
+                symbols = [single_symbol]
+        symbols = symbols[:top_n]
 
         if route_family != "instrument":
             hint = _canonical_owner_hint(page, route_family)
@@ -1858,13 +1874,12 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
 
         symbol = _strip(prepared.get("symbol") or prepared.get("ticker") or prepared.get("requested_symbol"))
         list_symbols = _list_from_body(prepared, "symbols", "tickers", "tickers_list")
-        explicit_page = bool(_page_from_body(prepared))
 
-        if symbol and not explicit_page and not list_symbols:
+        if symbol and not list_symbols:
             return await _handle_single_quote(
                 request,
                 prepared,
-                _strip(prepared.get("page")),
+                _strip(prepared.get("page") or prepared.get("sheet_name") or prepared.get("sheet") or prepared.get("name") or prepared.get("tab")),
                 mode_q,
                 token_q,
                 x_app_token,
@@ -2072,10 +2087,10 @@ def _build_router(reason: str, core_router: Optional[APIRouter]) -> APIRouter:
     root.include_router(legacy)
 
     if isinstance(core_router, APIRouter):
-        try:
-            root.include_router(core_router)
-        except Exception as e:
-            logger.warning("Including core enriched router failed: %s", e)
+        logger.info(
+            "Core enriched router detected but intentionally not re-included to preserve canonical ownership. version=%s",
+            ROUTER_VERSION,
+        )
 
     return root
 
@@ -2098,6 +2113,8 @@ def get_router() -> APIRouter:
         if not isinstance(core_router, APIRouter):
             core_router = None
             reason = "core.enriched_quote_no_router"
+        else:
+            reason = "wrapper_ok_core_router_detected_not_reincluded"
     except Exception as e:
         reason = f"core_import_failed: {type(e).__name__}: {e}"
         core_router = None
