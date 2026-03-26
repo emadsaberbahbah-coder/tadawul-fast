@@ -2,30 +2,35 @@
 """
 routes/advisor.py
 ================================================================================
-ADVISOR ROUTER — v6.1.0
+ADVISOR ROUTER — v6.2.0
 ================================================================================
-SHORT-ADVISOR FAMILY RESTORED • LIVE-BY-DEFAULT • UNIFIED-SHEET-ROWS
-RESOLVER-HARDENED • QUERY+BODY COMPATIBLE • JSON-SAFE • ENGINE-TOLERANT
-ADVANCED-ROUTER BRIDGE • ADVISOR-FIRST FOR DERIVED PAGES • ASYNC-SAFE
+TOP10-SAFE • SHORT-ADVISOR FAMILY RESTORED • LIVE-BY-DEFAULT •
+UNIFIED-SHEET-ROWS • RESOLVER-HARDENED • QUERY+BODY COMPATIBLE • JSON-SAFE •
+ENGINE-TOLERANT • ADVANCED-ROUTER BRIDGE • ADVISOR-FIRST FOR DERIVED PAGES •
+ASYNC-SAFE • TIMEOUT-GUARDED
 
 Why this revision
 -----------------
-- FIX: derived advisor pages (`Top_10_Investments`, `Insights_Analysis`) now
-  prefer a real advisor runner before falling back to advanced sheet-rows.
-- FIX: base/source pages still bridge to advanced/engine sheet-rows directly, so
-  canonical schema behavior remains aligned with the analysis routes.
-- FIX: advisor runner resolution now checks `app.state` first, then modules,
-  service objects, factories, and tolerant private implementation names.
-- FIX: adds engine-level sheet-rows fallback if `routes.advanced_analysis` is
-  unavailable or its private implementation name differs.
-- FIX: normalizes list / model / dataclass / mapping outputs into a stable JSON
-  envelope so `/recommendations`, `/run`, and `/sheet-rows` stay robust.
-- FIX: keeps live mode default, Top10 default page, request-id propagation, and
-  auth/open-mode compatibility.
+- FIX: `Top_10_Investments` now has a direct Top10 builder path before generic
+  advisor runner resolution, reducing 502 / timeout risk on the short advisor
+  family.
+- FIX: sheet-rows bridge resolution now searches the real row providers first
+  (`routes.investment_advisor`, `routes.analysis_sheet_rows`) before schema-only
+  modules, preventing false fallback into the wrong module family.
+- FIX: sync callables are executed safely via `asyncio.to_thread` and guarded by
+  configurable timeouts so long-running builders no longer block the event loop.
+- FIX: empty / schema-only / unusable derived-page payloads no longer count as a
+  successful result; the router keeps falling back until it finds a usable row
+  producer.
+- FIX: normalized envelopes now backfill `rows`, `rows_matrix`, `items`, and
+  `data` more consistently, including object-row alignment to headers.
+- FIX: preserves live mode default, request-id propagation, auth/open-mode
+  compatibility, and engine-safe fallback behavior.
 """
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import math
@@ -37,7 +42,7 @@ from datetime import date, datetime, time as dt_time, timezone
 from decimal import Decimal
 from enum import Enum
 from importlib import import_module
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from fastapi import Body, Header, HTTPException, Query, Request, Response
 from fastapi.encoders import jsonable_encoder
@@ -46,7 +51,7 @@ from fastapi.routing import APIRouter
 logger = logging.getLogger("routes.advisor")
 logger.addHandler(logging.NullHandler())
 
-ADVISOR_VERSION = "6.1.0"
+ADVISOR_VERSION = "6.2.0"
 
 router = APIRouter(prefix="/v1/advisor", tags=["advisor"])
 
@@ -106,10 +111,19 @@ SERVICE_OBJECT_CANDIDATES: Tuple[str, ...] = (
     "service",
 )
 
-ADVANCED_IMPL_CANDIDATES: Tuple[str, ...] = (
+BRIDGE_MODULE_CANDIDATES: Tuple[str, ...] = (
+    "routes.investment_advisor",
+    "routes.analysis_sheet_rows",
+    "routes.advanced_analysis",
+)
+
+BRIDGE_IMPL_CANDIDATES: Tuple[str, ...] = (
     "_run_advanced_sheet_rows_impl",
     "run_advanced_sheet_rows_impl",
     "_advanced_sheet_rows_impl",
+    "_run_sheet_rows_impl",
+    "run_sheet_rows_impl",
+    "_sheet_rows_impl",
 )
 
 ENGINE_SHEET_ROWS_METHOD_CANDIDATES: Tuple[str, ...] = (
@@ -119,6 +133,32 @@ ENGINE_SHEET_ROWS_METHOD_CANDIDATES: Tuple[str, ...] = (
     "build_sheet_rows",
     "read_sheet_rows",
     "run_sheet_rows",
+)
+
+TOP10_MODULE_CANDIDATES: Tuple[str, ...] = (
+    "core.analysis.top10_selector",
+    "routes.investment_advisor",
+    "core.investment_advisor",
+    "core.investment_advisor_engine",
+)
+
+TOP10_FUNCTION_CANDIDATES: Tuple[str, ...] = (
+    "build_top10_output_rows",
+    "build_top10_rows",
+    "build_top10_investments_rows",
+    "build_top10_investments",
+    "build_top10",
+    "get_top10_rows",
+)
+
+TOP10_METHOD_CANDIDATES: Tuple[str, ...] = (
+    "build_top10_output_rows",
+    "build_top10_rows",
+    "build_top10_investments_rows",
+    "build_top10_investments",
+    "build_top10",
+    "get_top10_rows",
+    "top10_rows",
 )
 
 # -----------------------------------------------------------------------------
@@ -168,6 +208,18 @@ def _safe_int(v: Any, default: int) -> int:
         if v is None or isinstance(v, bool):
             return default
         return int(float(v))
+    except Exception:
+        return default
+
+
+def _safe_float(v: Any, default: float) -> float:
+    try:
+        if v is None or isinstance(v, bool):
+            return default
+        out = float(v)
+        if math.isnan(out) or math.isinf(out):
+            return default
+        return out
     except Exception:
         return default
 
@@ -241,6 +293,20 @@ def _safe_engine_type(engine: Any) -> str:
         return f"{engine.__class__.__module__}.{engine.__class__.__name__}"
     except Exception:
         return type(engine).__name__
+
+
+def _timeout_seconds(env_name: str, default: float) -> float:
+    return max(0.1, _safe_float(os.getenv(env_name), default))
+
+
+def _row_count(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, (list, tuple, set)):
+        return len(value)
+    if isinstance(value, Mapping):
+        return len(value)
+    return 1
 
 
 def _json_safe(value: Any) -> Any:
@@ -526,6 +592,7 @@ def _default_payload(data: Mapping[str, Any], default_page: str = DEFAULT_ADVISO
     payload["top_n"] = max(1, min(100, _safe_int(payload.get("top_n"), 10)))
     payload["limit"] = max(1, min(5000, _safe_int(payload.get("limit"), 200)))
     payload["offset"] = max(0, _safe_int(payload.get("offset"), 0))
+    payload.setdefault("include_matrix", payload.get("include_matrix") if "include_matrix" in payload else True)
     return payload
 
 
@@ -578,16 +645,34 @@ def _payload_from_get(
     return payload
 
 
-async def _call_with_tolerant_signatures(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+async def _invoke_callable(fn: Callable[..., Any], *args: Any, timeout_seconds: float, **kwargs: Any) -> Any:
+    if inspect.iscoroutinefunction(fn):
+        return await asyncio.wait_for(fn(*args, **kwargs), timeout=timeout_seconds)
+
+    async def _runner() -> Any:
+        return await asyncio.to_thread(fn, *args, **kwargs)
+
+    return await asyncio.wait_for(_runner(), timeout=timeout_seconds)
+
+
+async def _call_with_tolerant_signatures(
+    fn: Callable[..., Any],
+    *,
+    timeout_seconds: float,
+    args: Sequence[Any] = (),
+    kwargs: Optional[Dict[str, Any]] = None,
+) -> Any:
+    payload_kwargs = kwargs or {}
     attempts = [
-        (args, kwargs),
-        ((), kwargs),
-        ((), {"request": kwargs.get("request"), "body": kwargs.get("body"), "payload": kwargs.get("payload")}),
-        ((), {"payload": kwargs.get("payload"), "mode": kwargs.get("mode")}),
-        ((), {"body": kwargs.get("body"), "mode": kwargs.get("mode")}),
-        ((), {"payload": kwargs.get("payload")}),
-        ((), {"body": kwargs.get("body")}),
-        ((), {"request": kwargs.get("request")}),
+        (tuple(args), payload_kwargs),
+        ((), payload_kwargs),
+        ((), {"request": payload_kwargs.get("request"), "body": payload_kwargs.get("body"), "payload": payload_kwargs.get("payload")}),
+        ((), {"payload": payload_kwargs.get("payload"), "mode": payload_kwargs.get("mode")}),
+        ((), {"body": payload_kwargs.get("body"), "mode": payload_kwargs.get("mode")}),
+        ((), {"payload": payload_kwargs.get("payload")}),
+        ((), {"body": payload_kwargs.get("body")}),
+        ((), {"request": payload_kwargs.get("request")}),
+        ((), {"page": payload_kwargs.get("page"), "sheet": payload_kwargs.get("sheet"), "sheet_name": payload_kwargs.get("sheet_name"), "symbols": payload_kwargs.get("symbols"), "tickers": payload_kwargs.get("tickers"), "top_n": payload_kwargs.get("top_n"), "limit": payload_kwargs.get("limit")}),
         ((), {}),
     ]
 
@@ -595,12 +680,13 @@ async def _call_with_tolerant_signatures(fn: Callable[..., Any], *args: Any, **k
     for call_args, call_kwargs in attempts:
         call_kwargs = {k: v for k, v in call_kwargs.items() if v is not None}
         try:
-            out = fn(*call_args, **call_kwargs)
-            if inspect.isawaitable(out):
-                out = await out
-            return out
+            return await _invoke_callable(fn, *call_args, timeout_seconds=timeout_seconds, **call_kwargs)
         except TypeError as exc:
             last_error = exc
+            continue
+        except asyncio.TimeoutError as exc:
+            last_error = exc
+            logger.warning("Callable timed out. fn=%s timeout=%.2fs", getattr(fn, "__name__", repr(fn)), timeout_seconds)
             continue
         except Exception as exc:
             last_error = exc
@@ -613,22 +699,30 @@ async def _call_with_tolerant_signatures(fn: Callable[..., Any], *args: Any, **k
 
 async def _call_factory(factory: Callable[..., Any]) -> Any:
     try:
-        out = factory()
-        if inspect.isawaitable(out):
-            out = await out
-        return out
+        return await _call_with_tolerant_signatures(
+            factory,
+            timeout_seconds=_timeout_seconds("TFB_ADVISOR_FACTORY_TIMEOUT_SEC", 8.0),
+            kwargs={},
+        )
     except Exception:
         return None
 
 
-def _resolve_callable_from_object(obj: Any, *, object_name: str, module_name: str) -> Tuple[Optional[Callable[..., Any]], Dict[str, Any]]:
+def _resolve_callable_from_object(
+    obj: Any,
+    *,
+    object_name: str,
+    module_name: str,
+    method_candidates: Sequence[str],
+    direct_name_candidates: Optional[Sequence[str]] = None,
+) -> Tuple[Optional[Callable[..., Any]], Dict[str, Any]]:
     if obj is None:
         return None, {}
 
-    if callable(obj) and object_name in RUNNER_FUNCTION_CANDIDATES:
+    if callable(obj) and direct_name_candidates and object_name in direct_name_candidates:
         return obj, {"module": module_name, "callable": object_name, "kind": "direct_callable"}
 
-    for method_name in RUNNER_METHOD_CANDIDATES:
+    for method_name in method_candidates:
         fn = getattr(obj, method_name, None)
         if callable(fn):
             return fn, {
@@ -653,7 +747,12 @@ async def _resolve_runner_from_state(request: Request) -> Tuple[Optional[Callabl
 
     for attr_name in SERVICE_OBJECT_CANDIDATES:
         obj = getattr(state, attr_name, None)
-        fn, meta = _resolve_callable_from_object(obj, object_name=attr_name, module_name="app.state")
+        fn, meta = _resolve_callable_from_object(
+            obj,
+            object_name=attr_name,
+            module_name="app.state",
+            method_candidates=RUNNER_METHOD_CANDIDATES,
+        )
         if fn is not None:
             return fn, meta
 
@@ -662,7 +761,12 @@ async def _resolve_runner_from_state(request: Request) -> Tuple[Optional[Callabl
         if not callable(factory):
             continue
         obj = await _call_factory(factory)
-        fn, meta = _resolve_callable_from_object(obj, object_name=factory_name, module_name="app.state")
+        fn, meta = _resolve_callable_from_object(
+            obj,
+            object_name=factory_name,
+            module_name="app.state",
+            method_candidates=RUNNER_METHOD_CANDIDATES,
+        )
         if fn is not None:
             meta["kind"] = "state_factory_method"
             return fn, meta
@@ -683,7 +787,12 @@ async def _resolve_runner_from_module(module: Any) -> Tuple[Optional[Callable[..
 
     for obj_name in SERVICE_OBJECT_CANDIDATES:
         obj = getattr(module, obj_name, None)
-        fn, meta = _resolve_callable_from_object(obj, object_name=obj_name, module_name=module_name)
+        fn, meta = _resolve_callable_from_object(
+            obj,
+            object_name=obj_name,
+            module_name=module_name,
+            method_candidates=RUNNER_METHOD_CANDIDATES,
+        )
         if fn is not None:
             return fn, meta
 
@@ -692,7 +801,12 @@ async def _resolve_runner_from_module(module: Any) -> Tuple[Optional[Callable[..
         if not callable(factory):
             continue
         obj = await _call_factory(factory)
-        fn, meta = _resolve_callable_from_object(obj, object_name=factory_name, module_name=module_name)
+        fn, meta = _resolve_callable_from_object(
+            obj,
+            object_name=factory_name,
+            module_name=module_name,
+            method_candidates=RUNNER_METHOD_CANDIDATES,
+        )
         if fn is not None:
             meta["kind"] = "factory_method"
             return fn, meta
@@ -713,127 +827,167 @@ async def _resolve_advisor_runner(request: Request) -> Tuple[Optional[Callable[.
     return None, {}
 
 
-async def _resolve_advanced_impl() -> Optional[Callable[..., Any]]:
-    module = _import_module_safely("routes.advanced_analysis")
+async def _resolve_bridge_impl() -> Tuple[Optional[Callable[..., Any]], Dict[str, Any]]:
+    for module_name in BRIDGE_MODULE_CANDIDATES:
+        module = _import_module_safely(module_name)
+        if module is None:
+            continue
+        for name in BRIDGE_IMPL_CANDIDATES:
+            impl = getattr(module, name, None)
+            if callable(impl):
+                return impl, {"module": module_name, "callable": name}
+    return None, {}
+
+
+async def _resolve_top10_builder_from_module(module: Any) -> Tuple[Optional[Callable[..., Any]], Dict[str, Any]]:
     if module is None:
-        return None
+        return None, {}
 
-    for name in ADVANCED_IMPL_CANDIDATES:
-        impl = getattr(module, name, None)
-        if callable(impl):
-            return impl
+    module_name = getattr(module, "__name__", "unknown")
 
-    return None
+    for fn_name in TOP10_FUNCTION_CANDIDATES:
+        fn = getattr(module, fn_name, None)
+        if callable(fn):
+            return fn, {"module": module_name, "callable": fn_name, "kind": "function"}
+
+    for obj_name in ("top10_selector", "top10_builder", "advisor_service", "investment_advisor_service", "engine", "service"):
+        obj = getattr(module, obj_name, None)
+        fn, meta = _resolve_callable_from_object(
+            obj,
+            object_name=obj_name,
+            module_name=module_name,
+            method_candidates=TOP10_METHOD_CANDIDATES,
+            direct_name_candidates=TOP10_FUNCTION_CANDIDATES,
+        )
+        if fn is not None:
+            return fn, meta
+
+    return None, {}
 
 
-async def _delegate_to_advanced_sheet_rows(
-    *,
-    request: Request,
-    payload: Dict[str, Any],
-    include_matrix_q: Optional[bool],
-    token: Optional[str],
-    x_app_token: Optional[str],
-    authorization: Optional[str],
-    x_request_id: Optional[str],
-) -> Dict[str, Any]:
-    impl = await _resolve_advanced_impl()
-    if impl is None:
-        raise HTTPException(status_code=503, detail="Advanced sheet-rows implementation not available")
+async def _resolve_top10_builder(request: Request) -> Tuple[Optional[Callable[..., Any]], Dict[str, Any]]:
+    try:
+        state = request.app.state
+    except Exception:
+        state = None
 
-    out = impl(
-        request=request,
-        body=payload,
-        mode=_strip(payload.get("mode")) or "live",
-        include_matrix_q=include_matrix_q,
-        token=token,
-        x_app_token=x_app_token,
-        authorization=authorization,
-        x_request_id=x_request_id,
-    )
-    if inspect.isawaitable(out):
-        out = await out
-    result = _normalize_result_payload(out, page=_extract_page(payload))
+    if state is not None:
+        for attr_name in TOP10_FUNCTION_CANDIDATES:
+            candidate = getattr(state, attr_name, None)
+            if callable(candidate):
+                return candidate, {"module": "app.state", "callable": attr_name, "kind": "state_function"}
+
+        for attr_name in ("top10_selector", "top10_builder", "advisor_service", "investment_advisor_service", "engine", "service"):
+            obj = getattr(state, attr_name, None)
+            fn, meta = _resolve_callable_from_object(
+                obj,
+                object_name=attr_name,
+                module_name="app.state",
+                method_candidates=TOP10_METHOD_CANDIDATES,
+                direct_name_candidates=TOP10_FUNCTION_CANDIDATES,
+            )
+            if fn is not None:
+                return fn, meta
+
+    for module_name in TOP10_MODULE_CANDIDATES:
+        module = _import_module_safely(module_name)
+        fn, meta = await _resolve_top10_builder_from_module(module)
+        if fn is not None:
+            return fn, meta
+
+    return None, {}
+
+
+def _mapping_list_to_rows(rows: Iterable[Mapping[str, Any]], headers: Sequence[str]) -> List[List[Any]]:
+    matrix: List[List[Any]] = []
+    for row in rows:
+        matrix.append([row.get(h) for h in headers])
+    return matrix
+
+
+def _ensure_tabular_shape(result: Dict[str, Any], *, page: str) -> Dict[str, Any]:
+    headers = result.get("headers")
+    rows = result.get("rows")
+    row_objects = result.get("row_objects")
+    items = result.get("items")
+    data = result.get("data")
+    quotes = result.get("quotes")
+    rows_matrix = result.get("rows_matrix")
+
+    object_rows: Optional[List[Mapping[str, Any]]] = None
+    for candidate in (row_objects, rows, items, data, quotes):
+        if isinstance(candidate, list) and candidate and all(isinstance(x, Mapping) for x in candidate):
+            object_rows = [dict(x) for x in candidate]
+            break
+
+    if object_rows:
+        result.setdefault("row_objects", object_rows)
+        result.setdefault("items", object_rows)
+        if not isinstance(headers, list) or not headers:
+            seen: List[str] = []
+            for row in object_rows:
+                for key in row.keys():
+                    key_s = _strip(key)
+                    if key_s and key_s not in seen:
+                        seen.append(key_s)
+            headers = seen
+            result["headers"] = headers
+            result.setdefault("keys", headers)
+            result.setdefault("display_headers", headers)
+        if isinstance(headers, list) and headers:
+            result.setdefault("rows_matrix", _mapping_list_to_rows(object_rows, headers))
+        result.setdefault("rows", object_rows)
+
+    if isinstance(rows, list) and rows and all(not isinstance(x, Mapping) for x in rows):
+        result.setdefault("rows_matrix", rows)
+
+    if isinstance(rows_matrix, list) and rows_matrix:
+        result.setdefault("rows", rows_matrix)
+
+    if isinstance(result.get("headers"), list):
+        result.setdefault("keys", result["headers"])
+        result.setdefault("display_headers", result["headers"])
+
+    if page == "Top_10_Investments":
+        if isinstance(result.get("row_objects"), list):
+            for idx, row in enumerate(result["row_objects"], start=1):
+                if isinstance(row, Mapping):
+                    row.setdefault("top10_rank", idx)
+                    row.setdefault("selection_reason", row.get("selection_reason") or None)
+                    row.setdefault("criteria_snapshot", row.get("criteria_snapshot") or None)
+        if isinstance(result.get("headers"), list):
+            for special_key in ("top10_rank", "selection_reason", "criteria_snapshot"):
+                if special_key not in result["headers"]:
+                    result["headers"].append(special_key)
+            result["keys"] = result["headers"]
+            result["display_headers"] = result["headers"]
+            if isinstance(result.get("row_objects"), list):
+                result["rows_matrix"] = _mapping_list_to_rows(result["row_objects"], result["headers"])
+
     return result
 
 
-async def _run_engine_sheet_rows_fallback(
-    *,
-    request: Request,
-    payload: Dict[str, Any],
-    request_id: str,
-) -> Optional[Dict[str, Any]]:
-    engine = await _get_engine(request)
-    if engine is None:
-        return None
+def _has_usable_payload(result: Mapping[str, Any], *, page: str) -> bool:
+    if _row_count(result.get("rows_matrix")) > 0:
+        return True
+    if _row_count(result.get("row_objects")) > 0:
+        return True
+    if _row_count(result.get("rows")) > 0:
+        return True
+    if _row_count(result.get("items")) > 0:
+        return True
+    if _row_count(result.get("data")) > 0 and page != "Data_Dictionary":
+        return True
+    if _row_count(result.get("quotes")) > 0:
+        return True
 
-    page = _extract_page(payload)
-    include_matrix = _boolish(payload.get("include_matrix"), True)
-    mode = _strip(payload.get("mode")) or "live"
+    if page == "Data_Dictionary" and _row_count(result.get("headers")) > 0:
+        return True
 
-    last_error: Optional[Exception] = None
-    for method_name in ENGINE_SHEET_ROWS_METHOD_CANDIDATES:
-        method = getattr(engine, method_name, None)
-        if not callable(method):
-            continue
+    if _boolish(result.get("schema_only"), False) or _boolish(result.get("headers_only"), False):
+        return _row_count(result.get("headers")) > 0
 
-        attempts = [
-            {
-                "request": request,
-                "body": payload,
-                "mode": mode,
-                "include_matrix": include_matrix,
-                "page": page,
-                "sheet": page,
-                "sheet_name": page,
-                "target_sheet": page,
-                "limit": payload.get("limit"),
-                "offset": payload.get("offset"),
-            },
-            {
-                "body": payload,
-                "mode": mode,
-                "include_matrix": include_matrix,
-                "page": page,
-                "sheet": page,
-                "sheet_name": page,
-                "target_sheet": page,
-                "limit": payload.get("limit"),
-                "offset": payload.get("offset"),
-            },
-            {
-                "body": payload,
-                "page": page,
-                "sheet": page,
-                "sheet_name": page,
-                "target_sheet": page,
-            },
-            {"page": page, "sheet": page, "sheet_name": page, "target_sheet": page},
-            {"sheet": page},
-            {},
-        ]
-
-        for kwargs in attempts:
-            kwargs = {k: v for k, v in kwargs.items() if v is not None}
-            try:
-                out = method(**kwargs)
-                if inspect.isawaitable(out):
-                    out = await out
-                result = _normalize_result_payload(out, page=page)
-                meta = _safe_dict(result.get("meta"))
-                meta.setdefault("resolver", {"source": _safe_engine_type(engine), "callable": method_name, "kind": "engine_fallback"})
-                meta.setdefault("request_id", request_id)
-                result["meta"] = meta
-                return result
-            except TypeError as exc:
-                last_error = exc
-                continue
-            except Exception as exc:
-                last_error = exc
-                continue
-
-    if last_error is not None:
-        logger.warning("Engine sheet-rows fallback failed. error=%s", last_error, exc_info=True)
-    return None
+    return False
 
 
 def _normalize_result_payload(out: Any, *, page: str) -> Dict[str, Any]:
@@ -844,7 +998,7 @@ def _normalize_result_payload(out: Any, *, page: str) -> Dict[str, Any]:
     elif isinstance(safe, list):
         result = {"status": "success", "page": page, "data": safe, "items": safe}
         if all(isinstance(x, Mapping) for x in safe):
-            result.setdefault("rows", safe)
+            result["row_objects"] = safe
     else:
         result = {"status": "success", "page": page, "data": safe}
 
@@ -853,7 +1007,7 @@ def _normalize_result_payload(out: Any, *, page: str) -> Dict[str, Any]:
     result.setdefault("sheet", result.get("page") or page)
     result.setdefault("sheet_name", result.get("page") or page)
     result.setdefault("meta", {})
-    return result
+    return _ensure_tabular_shape(result, page=page)
 
 
 def _envelope_from_payload_result(
@@ -894,6 +1048,10 @@ def _prefer_direct_bridge(page: str, *, operation: str) -> bool:
     return False
 
 
+def _prefer_top10_builder(page: str, *, operation: str) -> bool:
+    return page == "Top_10_Investments" and operation in {"sheet_rows", "recommendations", "run"}
+
+
 def _prefer_runner(page: str, *, operation: str) -> bool:
     if page in DERIVED_ADVISOR_PAGES:
         return True
@@ -902,6 +1060,179 @@ def _prefer_runner(page: str, *, operation: str) -> bool:
     if page not in DIRECT_BRIDGE_PAGES:
         return True
     return False
+
+
+async def _delegate_to_bridge_sheet_rows(
+    *,
+    request: Request,
+    payload: Dict[str, Any],
+    include_matrix_q: Optional[bool],
+    token: Optional[str],
+    x_app_token: Optional[str],
+    authorization: Optional[str],
+    x_request_id: Optional[str],
+) -> Dict[str, Any]:
+    impl, impl_meta = await _resolve_bridge_impl()
+    if impl is None:
+        raise HTTPException(status_code=503, detail="Sheet-rows bridge implementation not available")
+
+    out = await _call_with_tolerant_signatures(
+        impl,
+        timeout_seconds=_timeout_seconds("TFB_ADVISOR_BRIDGE_TIMEOUT_SEC", 25.0),
+        kwargs={
+            "request": request,
+            "body": payload,
+            "payload": payload,
+            "mode": _strip(payload.get("mode")) or "live",
+            "include_matrix_q": include_matrix_q,
+            "token": token,
+            "x_app_token": x_app_token,
+            "authorization": authorization,
+            "x_request_id": x_request_id,
+            "page": payload.get("page"),
+            "sheet": payload.get("sheet"),
+            "sheet_name": payload.get("sheet_name"),
+            "symbols": payload.get("symbols"),
+            "tickers": payload.get("tickers"),
+            "top_n": payload.get("top_n"),
+            "limit": payload.get("limit"),
+        },
+    )
+    result = _normalize_result_payload(out, page=_extract_page(payload))
+    result_meta = _safe_dict(result.get("meta"))
+    result_meta.setdefault("resolver", {"source": impl_meta.get("module"), "callable": impl_meta.get("callable"), "kind": "bridge"})
+    result["meta"] = result_meta
+    return result
+
+
+async def _run_engine_sheet_rows_fallback(
+    *,
+    request: Request,
+    payload: Dict[str, Any],
+    request_id: str,
+) -> Optional[Dict[str, Any]]:
+    engine = await _get_engine(request)
+    if engine is None:
+        return None
+
+    page = _extract_page(payload)
+    include_matrix = _boolish(payload.get("include_matrix"), True)
+    mode = _strip(payload.get("mode")) or "live"
+
+    last_error: Optional[Exception] = None
+    for method_name in ENGINE_SHEET_ROWS_METHOD_CANDIDATES:
+        method = getattr(engine, method_name, None)
+        if not callable(method):
+            continue
+
+        attempts = [
+            {
+                "request": request,
+                "body": payload,
+                "payload": payload,
+                "mode": mode,
+                "include_matrix": include_matrix,
+                "page": page,
+                "sheet": page,
+                "sheet_name": page,
+                "target_sheet": page,
+                "limit": payload.get("limit"),
+                "offset": payload.get("offset"),
+                "symbols": payload.get("symbols"),
+                "tickers": payload.get("tickers"),
+                "top_n": payload.get("top_n"),
+            },
+            {
+                "body": payload,
+                "payload": payload,
+                "mode": mode,
+                "include_matrix": include_matrix,
+                "page": page,
+                "sheet": page,
+                "sheet_name": page,
+                "target_sheet": page,
+                "limit": payload.get("limit"),
+                "offset": payload.get("offset"),
+                "symbols": payload.get("symbols"),
+                "tickers": payload.get("tickers"),
+                "top_n": payload.get("top_n"),
+            },
+            {
+                "body": payload,
+                "page": page,
+                "sheet": page,
+                "sheet_name": page,
+                "target_sheet": page,
+            },
+            {"page": page, "sheet": page, "sheet_name": page, "target_sheet": page},
+            {"sheet": page},
+            {},
+        ]
+
+        for kwargs in attempts:
+            kwargs = {k: v for k, v in kwargs.items() if v is not None}
+            try:
+                out = await _call_with_tolerant_signatures(
+                    method,
+                    timeout_seconds=_timeout_seconds("TFB_ADVISOR_ENGINE_TIMEOUT_SEC", 25.0),
+                    kwargs=kwargs,
+                )
+                result = _normalize_result_payload(out, page=page)
+                if not _has_usable_payload(result, page=page):
+                    continue
+                meta = _safe_dict(result.get("meta"))
+                meta.setdefault("resolver", {"source": _safe_engine_type(engine), "callable": method_name, "kind": "engine_fallback"})
+                meta.setdefault("request_id", request_id)
+                result["meta"] = meta
+                return result
+            except TypeError as exc:
+                last_error = exc
+                continue
+            except Exception as exc:
+                last_error = exc
+                continue
+
+    if last_error is not None:
+        logger.warning("Engine sheet-rows fallback failed. error=%s", last_error, exc_info=True)
+    return None
+
+
+async def _run_top10_builder(
+    *,
+    request: Request,
+    payload: Dict[str, Any],
+    page: str,
+) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    builder, resolver_meta = await _resolve_top10_builder(request)
+    if builder is None:
+        return None, {}
+
+    try:
+        out = await _call_with_tolerant_signatures(
+            builder,
+            timeout_seconds=_timeout_seconds("TFB_TOP10_BUILDER_TIMEOUT_SEC", 35.0),
+            kwargs={
+                "request": request,
+                "body": payload,
+                "payload": payload,
+                "page": page,
+                "sheet": page,
+                "sheet_name": page,
+                "mode": _strip(payload.get("mode")) or "live",
+                "symbols": payload.get("symbols"),
+                "tickers": payload.get("tickers"),
+                "top_n": payload.get("top_n"),
+                "limit": payload.get("limit"),
+                "offset": payload.get("offset"),
+            },
+        )
+        result = _normalize_result_payload(out, page=page)
+        if _has_usable_payload(result, page=page):
+            return result, resolver_meta
+        return None, resolver_meta
+    except Exception as exc:
+        logger.warning("Top10 builder failed; page=%s error=%s", page, exc, exc_info=True)
+        return None, resolver_meta or {}
 
 
 async def _run_advisor_runner(
@@ -917,12 +1248,26 @@ async def _run_advisor_runner(
     try:
         out = await _call_with_tolerant_signatures(
             runner,
-            request=request,
-            body=payload,
-            payload=payload,
-            mode=_strip(payload.get("mode")) or "live",
+            timeout_seconds=_timeout_seconds("TFB_ADVISOR_RUNNER_TIMEOUT_SEC", 35.0),
+            kwargs={
+                "request": request,
+                "body": payload,
+                "payload": payload,
+                "page": page,
+                "sheet": page,
+                "sheet_name": page,
+                "mode": _strip(payload.get("mode")) or "live",
+                "symbols": payload.get("symbols"),
+                "tickers": payload.get("tickers"),
+                "top_n": payload.get("top_n"),
+                "limit": payload.get("limit"),
+                "offset": payload.get("offset"),
+            },
         )
-        return _normalize_result_payload(out, page=page), resolver_meta
+        result = _normalize_result_payload(out, page=page)
+        if _has_usable_payload(result, page=page):
+            return result, resolver_meta
+        return None, resolver_meta
     except Exception as exc:
         logger.warning("Advisor runner failed; page=%s error=%s", page, exc, exc_info=True)
         return None, resolver_meta or {}
@@ -950,7 +1295,7 @@ async def _run_advisor_logic(
 
     if _prefer_direct_bridge(page, operation=operation):
         try:
-            advanced_result = await _delegate_to_advanced_sheet_rows(
+            advanced_result = await _delegate_to_bridge_sheet_rows(
                 request=request,
                 payload=payload,
                 include_matrix_q=_boolish(payload.get("include_matrix"), True),
@@ -959,30 +1304,48 @@ async def _run_advisor_logic(
                 authorization=authorization,
                 x_request_id=request_id,
             )
-            return _envelope_from_payload_result(
-                result=advanced_result,
-                page=page,
-                request_id=request_id,
-                started_at=started_at,
-                resolver_meta={"source": "routes.advanced_analysis", "kind": "bridge"},
-                operation=operation,
-            )
-        except Exception as exc:
-            logger.warning("Advanced bridge failed; falling back to engine. page=%s error=%s", page, exc, exc_info=True)
-            engine_result = await _run_engine_sheet_rows_fallback(
-                request=request,
-                payload=payload,
-                request_id=request_id,
-            )
-            if engine_result is not None:
+            if _has_usable_payload(advanced_result, page=page):
                 return _envelope_from_payload_result(
-                    result=engine_result,
+                    result=advanced_result,
                     page=page,
                     request_id=request_id,
                     started_at=started_at,
-                    resolver_meta={"source": "engine", "kind": "direct_fallback"},
+                    resolver_meta={"source": advanced_result.get("meta", {}).get("resolver", {}).get("source"), "kind": "bridge"},
                     operation=operation,
                 )
+        except Exception as exc:
+            logger.warning("Bridge failed; falling back to engine. page=%s error=%s", page, exc, exc_info=True)
+
+        engine_result = await _run_engine_sheet_rows_fallback(
+            request=request,
+            payload=payload,
+            request_id=request_id,
+        )
+        if engine_result is not None:
+            return _envelope_from_payload_result(
+                result=engine_result,
+                page=page,
+                request_id=request_id,
+                started_at=started_at,
+                resolver_meta={"source": "engine", "kind": "direct_fallback"},
+                operation=operation,
+            )
+
+    if _prefer_top10_builder(page, operation=operation):
+        top10_result, top10_meta = await _run_top10_builder(
+            request=request,
+            payload=payload,
+            page=page,
+        )
+        if top10_result is not None:
+            return _envelope_from_payload_result(
+                result=top10_result,
+                page=page,
+                request_id=request_id,
+                started_at=started_at,
+                resolver_meta=top10_meta or {"source": "top10_builder", "kind": "direct"},
+                operation=operation,
+            )
 
     if _prefer_runner(page, operation=operation):
         runner_result, runner_meta = await _run_advisor_runner(
@@ -1001,7 +1364,7 @@ async def _run_advisor_logic(
             )
 
     try:
-        advanced_result = await _delegate_to_advanced_sheet_rows(
+        advanced_result = await _delegate_to_bridge_sheet_rows(
             request=request,
             payload=payload,
             include_matrix_q=_boolish(payload.get("include_matrix"), True),
@@ -1010,16 +1373,17 @@ async def _run_advisor_logic(
             authorization=authorization,
             x_request_id=request_id,
         )
-        return _envelope_from_payload_result(
-            result=advanced_result,
-            page=page,
-            request_id=request_id,
-            started_at=started_at,
-            resolver_meta={"source": "routes.advanced_analysis", "kind": "fallback_bridge"},
-            operation=operation,
-        )
+        if _has_usable_payload(advanced_result, page=page):
+            return _envelope_from_payload_result(
+                result=advanced_result,
+                page=page,
+                request_id=request_id,
+                started_at=started_at,
+                resolver_meta={"source": advanced_result.get("meta", {}).get("resolver", {}).get("source"), "kind": "fallback_bridge"},
+                operation=operation,
+            )
     except Exception as exc:
-        logger.warning("Advanced bridge fallback failed; page=%s error=%s", page, exc, exc_info=True)
+        logger.warning("Bridge fallback failed; page=%s error=%s", page, exc, exc_info=True)
 
     engine_result = await _run_engine_sheet_rows_fallback(
         request=request,
@@ -1036,7 +1400,7 @@ async def _run_advisor_logic(
             operation=operation,
         )
 
-    raise HTTPException(status_code=503, detail="Advisor router could not resolve runner or sheet-rows provider")
+    raise HTTPException(status_code=503, detail="Advisor router could not resolve a usable runner or sheet-rows provider")
 
 
 @router.get("/health")
@@ -1045,7 +1409,8 @@ async def _run_advisor_logic(
 async def advisor_health(request: Request) -> Dict[str, Any]:
     engine = await _get_engine(request)
     runner, resolver_meta = await _resolve_advisor_runner(request)
-    advanced_impl = await _resolve_advanced_impl()
+    bridge_impl, bridge_meta = await _resolve_bridge_impl()
+    top10_builder, top10_meta = await _resolve_top10_builder(request)
 
     settings_summary: Dict[str, Any] = {}
     try:
@@ -1059,14 +1424,17 @@ async def advisor_health(request: Request) -> Dict[str, Any]:
         settings_summary = {}
 
     return _json_safe({
-        "status": "ok" if (engine is not None or runner is not None) else "degraded",
+        "status": "ok" if (engine is not None or runner is not None or bridge_impl is not None) else "degraded",
         "version": ADVISOR_VERSION,
         "short_family": True,
         "engine_available": bool(engine),
         "engine_type": _safe_engine_type(engine),
         "advisor_runner_available": bool(runner),
         "advisor_runner": resolver_meta or None,
-        "advanced_impl_available": bool(advanced_impl),
+        "bridge_impl_available": bool(bridge_impl),
+        "bridge_impl": bridge_meta or None,
+        "top10_builder_available": bool(top10_builder),
+        "top10_builder": top10_meta or None,
         "default_page": DEFAULT_ADVISOR_PAGE,
         "base_pages": sorted(BASE_PAGES),
         "derived_pages": sorted(DERIVED_ADVISOR_PAGES),
@@ -1082,7 +1450,8 @@ async def advisor_health(request: Request) -> Dict[str, Any]:
 async def advisor_meta(request: Request) -> Dict[str, Any]:
     engine = await _get_engine(request)
     runner, resolver_meta = await _resolve_advisor_runner(request)
-    advanced_impl = await _resolve_advanced_impl()
+    bridge_impl, bridge_meta = await _resolve_bridge_impl()
+    top10_builder, top10_meta = await _resolve_top10_builder(request)
     return _json_safe({
         "status": "success",
         "version": ADVISOR_VERSION,
@@ -1092,7 +1461,10 @@ async def advisor_meta(request: Request) -> Dict[str, Any]:
         "engine_type": _safe_engine_type(engine),
         "advisor_runner_available": bool(runner),
         "advisor_runner": resolver_meta or None,
-        "advanced_impl_available": bool(advanced_impl),
+        "bridge_impl_available": bool(bridge_impl),
+        "bridge_impl": bridge_meta or None,
+        "top10_builder_available": bool(top10_builder),
+        "top10_builder": top10_meta or None,
         "timestamp_utc": _now_utc(),
         "request_id": _strip(getattr(request.state, "request_id", "")) or None,
     })
