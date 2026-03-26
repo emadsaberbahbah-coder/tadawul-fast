@@ -2,7 +2,7 @@
 # routes/advanced_sheet_rows.py
 """
 ================================================================================
-Advanced Sheet-Rows Router — v2.2.0
+Advanced Sheet-Rows Router — v2.3.0
 ================================================================================
 SCHEMA-FIRST • CANONICAL PAGE DISPATCH • ANALYSIS-ALIGNED • SPECIAL-PAGE SAFE
 PATH-AWARE AUTH • PUBLIC-PATH AWARE • STABLE RESPONSE SHAPE • LIVE-TEST READY
@@ -23,48 +23,15 @@ Advanced sheet-rows behavior aligned with the rest of the TFB stack so that:
 
 What this revision improves
 ---------------------------
-- ✅ FIX: Path-aware auth with public-path bypass support
-- ✅ FIX: Accepts X-APP-TOKEN, X-API-Key, Bearer auth, optional query token
-- ✅ FIX: Stronger builder payload parsing:
-      rows / rows_matrix / data / items / records / nested data
-- ✅ FIX: Stronger engine sheet-rows fallback:
-      engine.get_sheet_rows / sheet_rows / build_sheet_rows first,
-      then optional core.data_engine.get_sheet_rows
-- ✅ FIX: Better top10 / insights builder handling when payload is dict-shaped
-- ✅ FIX: More stable metadata and response diagnostics
-- ✅ FIX: Better symbol parsing + dedupe + top_n enforcement
+- ✅ FIX: table mode no longer double-applies limit/offset after engine payloads
+- ✅ FIX: symbol mode now honors offset/limit after top_n normalization
+- ✅ FIX: table-mode payload extraction now accepts row_objects / quotes / results
+- ✅ FIX: insights status now respects builder-reported warn/partial/error states
+- ✅ FIX: table-mode dispatch now reports the real source used
+- ✅ FIX: schema-only empty table fallback now reports warn instead of silent success
+- ✅ FIX: better metadata for requested vs returned symbols and rows
 - ✅ SAFE: No network I/O at import time
 - ✅ SAFE: Optional auth only if core.config.auth_ok exists
-
-Accepted body fields
---------------------
-Page:
-- sheet / page / sheet_name / sheetName / name / tab
-
-Symbols:
-- symbols / tickers / tickers_list
-
-Optional:
-- limit
-- offset
-- include_matrix
-- top_n
-
-Response
---------
-{
-  status,
-  page,
-  route_family,
-  headers,
-  keys,
-  rows,
-  rows_matrix?,
-  error?,
-  version,
-  request_id,
-  meta
-}
 ================================================================================
 """
 
@@ -148,7 +115,7 @@ except Exception:  # pragma: no cover
     core_get_sheet_rows = None  # type: ignore
 
 
-ADVANCED_SHEET_ROWS_VERSION = "2.2.0"
+ADVANCED_SHEET_ROWS_VERSION = "2.3.0"
 router = APIRouter(prefix="/v1/advanced", tags=["Advanced Sheet Rows"])
 
 
@@ -304,6 +271,15 @@ def _slice(rows: List[Dict[str, Any]], *, limit: int, offset: int) -> List[Dict[
     return rows[start:end]
 
 
+def _slice_values(values: Sequence[str], *, limit: int, offset: int) -> List[str]:
+    start = max(0, int(offset))
+    vals = list(values)
+    if limit <= 0:
+        return vals[start:]
+    end = start + max(0, int(limit))
+    return vals[start:end]
+
+
 def _rows_to_matrix(rows: Sequence[Mapping[str, Any]], keys: Sequence[str]) -> List[List[Any]]:
     return [[r.get(k) for k in keys] for r in rows]
 
@@ -334,13 +310,6 @@ def _normalize_to_schema_keys(
     schema_headers: Sequence[str],
     raw: Mapping[str, Any],
 ) -> Dict[str, Any]:
-    """
-    Normalize raw dict to schema keys.
-    Accepts:
-    - schema keys directly
-    - schema headers directly
-    - case-insensitive variants
-    """
     raw = dict(raw or {})
     raw_ci = {str(k).strip().lower(): v for k, v in raw.items()}
 
@@ -375,6 +344,9 @@ def _extract_rows_like(payload: Any) -> List[Dict[str, Any]]:
     """
     Accept rows from various helper shapes:
     - {"rows": [...]}
+    - {"row_objects": [...]}
+    - {"quotes": [...]}
+    - {"results": [...]}
     - {"data": [...]}
     - {"items": [...]}
     - {"records": [...]}
@@ -388,7 +360,7 @@ def _extract_rows_like(payload: Any) -> List[Dict[str, Any]]:
         return [_to_plain_dict(r) for r in payload]
 
     if isinstance(payload, dict):
-        for name in ("rows", "data", "items", "records"):
+        for name in ("rows", "row_objects", "quotes", "results", "data", "items", "records"):
             value = payload.get(name)
             if isinstance(value, list):
                 return [_to_plain_dict(r) for r in value]
@@ -423,6 +395,43 @@ def _matrix_to_rows(matrix: Sequence[Sequence[Any]], keys: Sequence[str]) -> Lis
             item[k] = vals[idx] if idx < len(vals) else None
         rows.append(item)
     return rows
+
+
+def _coerce_status(value: Any, default: str = "success") -> str:
+    s = _strip(value).lower()
+    return s if s in {"success", "warn", "warning", "partial", "error", "failed"} else default
+
+
+def _normalize_status_word(value: str) -> str:
+    v = _strip(value).lower()
+    if v == "warning":
+        return "warn"
+    if v == "failed":
+        return "error"
+    return v or "success"
+
+
+def _payload_meta(payload: Any) -> Dict[str, Any]:
+    if isinstance(payload, dict):
+        m = payload.get("meta")
+        if isinstance(m, dict):
+            return m
+    return {}
+
+
+def _payload_matches_requested_window(payload: Any, *, limit: int, offset: int) -> bool:
+    meta = _payload_meta(payload)
+    meta_limit = meta.get("limit", payload.get("limit") if isinstance(payload, dict) else None)
+    meta_offset = meta.get("offset", payload.get("offset") if isinstance(payload, dict) else None)
+
+    try:
+        if meta_limit is not None and int(meta_limit) != int(limit):
+            return False
+        if meta_offset is not None and int(meta_offset) != int(offset):
+            return False
+        return meta_limit is not None or meta_offset is not None
+    except Exception:
+        return False
 
 
 # =============================================================================
@@ -719,7 +728,7 @@ async def _fetch_advanced_rows(
                 if _dict_is_symbol_map(res, symbols):
                     return res
 
-                data = res.get("data") or res.get("rows") or res.get("items")
+                data = res.get("data") or res.get("rows") or res.get("items") or res.get("quotes")
                 if isinstance(data, dict) and _dict_is_symbol_map(data, symbols):
                     return data
                 if isinstance(data, list):
@@ -779,9 +788,9 @@ async def _call_engine_sheet_rows_best_effort(
     offset: int,
     mode: str,
     body: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     if engine is None:
-        return None
+        return None, None
 
     candidates = [
         ("get_sheet_rows", {"sheet": page, "limit": limit, "offset": offset, "mode": mode, "body": body}),
@@ -803,15 +812,15 @@ async def _call_engine_sheet_rows_best_effort(
         try:
             res = await _call_engine(fn, **kwargs)
             if isinstance(res, dict):
-                return res
+                return res, f"engine:{method_name}"
             if isinstance(res, list):
-                return {"rows": res}
+                return {"rows": res}, f"engine:{method_name}"
         except TypeError:
             continue
         except Exception:
             continue
 
-    return None
+    return None, None
 
 
 # =============================================================================
@@ -952,9 +961,9 @@ async def _call_core_sheet_rows_best_effort(
     offset: int,
     mode: str,
     body: Dict[str, Any],
-) -> Optional[Dict[str, Any]]:
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     if core_get_sheet_rows is None:
-        return None
+        return None, None
 
     last_err: Optional[Exception] = None
     candidates = [
@@ -972,8 +981,8 @@ async def _call_core_sheet_rows_best_effort(
             res = core_get_sheet_rows(*args, **kwargs)
             res = await _maybe_await(res)
             if isinstance(res, dict):
-                return res
-            return {"rows": res} if isinstance(res, list) else {"rows": []}
+                return res, "core:get_sheet_rows"
+            return ({"rows": res} if isinstance(res, list) else {"rows": []}), "core:get_sheet_rows"
         except TypeError as e:
             last_err = e
             continue
@@ -982,8 +991,8 @@ async def _call_core_sheet_rows_best_effort(
             break
 
     if last_err is not None:
-        return {"status": "error", "error": str(last_err), "rows": []}
-    return None
+        return {"status": "error", "error": str(last_err), "rows": []}, "core:get_sheet_rows"
+    return None, None
 
 
 # =============================================================================
@@ -1059,9 +1068,6 @@ async def advanced_sheet_rows(
     except Exception:
         settings = None
 
-    # -------------------------------------------------------------------------
-    # Auth
-    # -------------------------------------------------------------------------
     _ensure_authorized(
         request=request,
         settings=settings,
@@ -1071,9 +1077,6 @@ async def advanced_sheet_rows(
         authorization=authorization,
     )
 
-    # -------------------------------------------------------------------------
-    # Page resolution
-    # -------------------------------------------------------------------------
     page_raw = _pick_page_from_body(body) or "Market_Leaders"
     try:
         page = normalize_page_name(page_raw, allow_output_pages=True)
@@ -1111,13 +1114,10 @@ async def advanced_sheet_rows(
             detail={"error": f"Schema for page '{page}' is empty", "page": page},
         )
 
-    symbols = _get_list(body, "symbols", "tickers", "tickers_list")
-    top_n = max(1, min(5000, _maybe_int(body.get("top_n"), len(symbols) if symbols else limit)))
-    symbols = _dedupe_keep_order(symbols)[:top_n]
+    raw_symbols = _get_list(body, "symbols", "tickers", "tickers_list")
+    top_n = max(1, min(5000, _maybe_int(body.get("top_n"), len(raw_symbols) if raw_symbols else limit)))
+    symbols_all = _dedupe_keep_order(raw_symbols)[:top_n]
 
-    # -------------------------------------------------------------------------
-    # Explicit special-page dispatch
-    # -------------------------------------------------------------------------
     if route_family == "insights":
         rows, builder_meta = await _call_builder_best_effort(
             module_names=("core.analysis.insights_builder",),
@@ -1137,9 +1137,10 @@ async def advanced_sheet_rows(
             friendly_name="Insights_Analysis",
         )
         rows = _slice(rows, limit=limit, offset=offset)
+        builder_status = _normalize_status_word(_coerce_status(builder_meta.get("builder_status") if isinstance(builder_meta, dict) else None, "success"))
 
         return {
-            "status": "success",
+            "status": builder_status,
             "page": page,
             "route_family": route_family,
             "headers": headers,
@@ -1188,12 +1189,10 @@ async def advanced_sheet_rows(
         rows = _slice(rows, limit=limit, offset=offset)
 
         status_out = "success" if rows else "warn"
-        builder_status = _strip((builder_meta.get("builder_status") if isinstance(builder_meta, dict) else None) or "")
-        if builder_status:
-            status_out = builder_status.lower() if builder_status.lower() in {"success", "warn", "partial", "error"} else status_out
+        builder_status = _normalize_status_word(_coerce_status(builder_meta.get("builder_status") if isinstance(builder_meta, dict) else None, status_out))
 
         return {
-            "status": status_out,
+            "status": builder_status,
             "page": page,
             "route_family": route_family,
             "headers": headers,
@@ -1237,14 +1236,10 @@ async def advanced_sheet_rows(
             },
         }
 
-    # -------------------------------------------------------------------------
-    # Instrument / table mode
-    # -------------------------------------------------------------------------
     engine = await _get_engine(request)
 
-    # Table mode when no symbols were supplied
-    if not symbols:
-        payload = await _call_engine_sheet_rows_best_effort(
+    if not symbols_all:
+        payload, payload_source = await _call_engine_sheet_rows_best_effort(
             engine=engine,
             page=page,
             limit=limit,
@@ -1254,7 +1249,7 @@ async def advanced_sheet_rows(
         )
 
         if payload is None:
-            payload = await _call_core_sheet_rows_best_effort(
+            payload, payload_source = await _call_core_sheet_rows_best_effort(
                 page=page,
                 limit=limit,
                 offset=offset,
@@ -1264,7 +1259,7 @@ async def advanced_sheet_rows(
 
         if payload is None:
             return {
-                "status": "success",
+                "status": "warn",
                 "page": page,
                 "route_family": route_family,
                 "headers": headers,
@@ -1278,8 +1273,10 @@ async def advanced_sheet_rows(
                     "mode": mode,
                     "limit": limit,
                     "offset": offset,
+                    "count": 0,
                     "dispatch": "schema_only_table_mode",
                     "engine_present": bool(engine),
+                    "warning": "no_table_payload_from_engine_or_core",
                 },
             }
 
@@ -1289,11 +1286,10 @@ async def advanced_sheet_rows(
             raw_rows = _matrix_to_rows(matrix_rows, keys)
 
         rows = [_normalize_to_schema_keys(schema_keys=keys, schema_headers=headers, raw=r) for r in raw_rows]
-        rows = _slice(rows, limit=limit, offset=offset)
+        if not _payload_matches_requested_window(payload, limit=limit, offset=offset):
+            rows = _slice(rows, limit=limit, offset=offset)
 
-        status_out = payload.get("status") if isinstance(payload, dict) else None
-        if not status_out:
-            status_out = "success"
+        status_out = _normalize_status_word(_coerce_status(payload.get("status") if isinstance(payload, dict) else None, "success"))
         err_out = payload.get("error") if isinstance(payload, dict) else None
 
         return {
@@ -1312,15 +1308,13 @@ async def advanced_sheet_rows(
                 "mode": mode,
                 "limit": limit,
                 "offset": offset,
-                "dispatch": "engine_sheet_rows" if engine is not None else "core_get_sheet_rows",
+                "count": len(rows),
+                "dispatch": payload_source or ("engine_sheet_rows" if engine is not None else "core_get_sheet_rows"),
                 "engine_present": bool(engine),
-                **((payload.get("meta") or {}) if isinstance(payload, dict) else {}),
+                **_payload_meta(payload),
             },
         }
 
-    # -------------------------------------------------------------------------
-    # Symbol-based instrument mode
-    # -------------------------------------------------------------------------
     if not is_instrument_page(page):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1330,6 +1324,7 @@ async def advanced_sheet_rows(
     if not engine:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Data engine unavailable")
 
+    symbols = _slice_values(symbols_all, limit=limit, offset=offset)
     data_map = await _fetch_advanced_rows(engine, symbols, mode=(mode or ""), settings=settings, schema=spec)
 
     normalize_fn = None
@@ -1363,6 +1358,8 @@ async def advanced_sheet_rows(
 
         if "symbol" in keys and not row.get("symbol"):
             row["symbol"] = sym
+        if "ticker" in keys and not row.get("ticker"):
+            row["ticker"] = sym
 
         normalized_rows.append(row)
 
@@ -1381,9 +1378,14 @@ async def advanced_sheet_rows(
         "request_id": request_id,
         "meta": {
             "duration_ms": (time.time() - start) * 1000.0,
-            "requested": len(symbols),
+            "requested_total": len(symbols_all),
+            "requested_window": len(symbols),
+            "returned": len(normalized_rows),
             "errors": errors,
             "mode": mode,
+            "limit": limit,
+            "offset": offset,
+            "top_n": top_n,
             "schema_headers_always": bool(getattr(settings, "schema_headers_always", True)) if settings else True,
             "computations_enabled": _settings_get_bool(settings, "computations_enabled", default=True),
             "forecasting_enabled": _settings_get_bool(settings, "forecasting_enabled", default=True),
