@@ -1,19 +1,37 @@
 #!/usr/bin/env python3
 """
 core/yahoo_chart_provider.py
-===========================================================
-YAHOO CHART SHIM — v3.3.0 (SAFE · FAST · FULL COMPATIBILITY)
-===========================================================
-Emad Bahbah – Production Architecture
+================================================================================
+YAHOO CHART COMPATIBILITY SHIM — v4.0.0
+================================================================================
+SAFE • STARTUP-FRIENDLY • CANONICAL-DELEGATING • HISTORY-AWARE •
+COMMODITY/FX-TOLERANT • ROUTE/ENGINE COMPATIBLE
 
-Goals
-- Zero downtime compatibility layer for legacy imports -> canonical provider
-- Render-safe import behavior (no event-loop work at import time)
-- Strict hygiene: no stdout helpers except sys.stdout.write in __main__
-- Fast hot-path: cached signature inspection + singleflight provider load
-- Resiliency: circuit breaker + full-jitter retry
-- Observability: OpenTelemetry spans + Prometheus metrics (optional)
-- Broader legacy compatibility surface for class-based callers
+Purpose
+-------
+This module is a compatibility shim for legacy imports that still reference
+`core.yahoo_chart_provider` instead of the canonical provider module.
+
+Design goals
+------------
+- Never perform network or event-loop work at import time.
+- Prefer the canonical provider when available:
+    - core.providers.yahoo_chart_provider
+    - providers.yahoo_chart_provider
+- Remain safe when the canonical provider is missing or temporarily broken.
+- Normalize weak chart/history payloads into useful outputs for callers.
+- Help upstream engine routes by recovering quote-like fields from history.
+- Preserve a broad compatibility surface for function-based and class-based code.
+
+Why this revision
+-----------------
+- FIX: normalize Yahoo chart payloads (`chart.result[0]...`) into usable rows.
+- FIX: derive quote fields from history when quote payloads are sparse.
+- FIX: stronger commodity / FX defaults for symbol class, exchange, and labels.
+- FIX: merge patch/base payloads more safely instead of overwriting useful fields.
+- FIX: keep return shapes stable for both dict-style quote calls and list-style
+  history calls, even when the canonical provider returns mixed payloads.
+- FIX: add more tolerant legacy method resolution and result coercion.
 """
 
 from __future__ import annotations
@@ -21,23 +39,24 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import math
 import os
 import random
 import re
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, is_dataclass, asdict
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from functools import lru_cache
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple, TypeVar, Union
+from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, TypeVar, Union
 
 # =============================================================================
 # Versioning / constants
 # =============================================================================
 
-SHIM_VERSION = "3.3.0"
+SHIM_VERSION = "4.0.0"
 VERSION = SHIM_VERSION
 PROVIDER_VERSION = SHIM_VERSION
 DATA_SOURCE = "yahoo_chart"
@@ -55,10 +74,57 @@ _T = TypeVar("_T")
 _TRUTHY = {"1", "true", "yes", "y", "on", "t"}
 _FALSY = {"0", "false", "no", "n", "off", "f"}
 
+PRICE_FIELD_ALIASES = (
+    "current_price",
+    "price",
+    "last_price",
+    "regularMarketPrice",
+    "regular_market_price",
+    "close",
+    "last_close",
+)
+PREV_CLOSE_ALIASES = (
+    "previous_close",
+    "prev_close",
+    "regularMarketPreviousClose",
+    "chartPreviousClose",
+)
+OPEN_ALIASES = ("open", "regularMarketOpen")
+HIGH_ALIASES = ("day_high", "high", "regularMarketDayHigh")
+LOW_ALIASES = ("day_low", "low", "regularMarketDayLow")
+VOLUME_ALIASES = ("volume", "regularMarketVolume")
+NAME_ALIASES = (
+    "name",
+    "shortName",
+    "longName",
+    "displayName",
+    "instrument_name",
+)
+EXCHANGE_ALIASES = (
+    "exchange",
+    "fullExchangeName",
+    "exchangeName",
+    "market",
+)
+CURRENCY_ALIASES = ("currency", "financialCurrency")
+
+HISTORY_ROW_KEYS = (
+    "timestamp",
+    "date",
+    "open",
+    "high",
+    "low",
+    "close",
+    "adj_close",
+    "adjclose",
+    "volume",
+)
 
 # =============================================================================
 # Small helpers
 # =============================================================================
+
+
 def _env_bool(name: str, default: bool = False) -> bool:
     raw = (os.getenv(name) or "").strip().lower()
     if not raw:
@@ -70,16 +136,18 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return default
 
 
+
 def _env_int(name: str, default: int, lo: Optional[int] = None, hi: Optional[int] = None) -> int:
     try:
         value = int(float((os.getenv(name) or str(default)).strip()))
     except Exception:
         value = default
-    if lo is not None and value < lo:
-        value = lo
-    if hi is not None and value > hi:
-        value = hi
+    if lo is not None:
+        value = max(lo, value)
+    if hi is not None:
+        value = min(hi, value)
     return value
+
 
 
 def _env_float(name: str, default: float, lo: Optional[float] = None, hi: Optional[float] = None) -> float:
@@ -87,11 +155,12 @@ def _env_float(name: str, default: float, lo: Optional[float] = None, hi: Option
         value = float((os.getenv(name) or str(default)).strip())
     except Exception:
         value = default
-    if lo is not None and value < lo:
-        value = lo
-    if hi is not None and value > hi:
-        value = hi
+    if lo is not None:
+        value = max(lo, value)
+    if hi is not None:
+        value = min(hi, value)
     return value
+
 
 
 def _utc_iso(dt: Optional[datetime] = None) -> str:
@@ -101,11 +170,13 @@ def _utc_iso(dt: Optional[datetime] = None) -> str:
     return d.astimezone(UTC).isoformat()
 
 
+
 def _riyadh_iso(dt: Optional[datetime] = None) -> str:
     d = dt or datetime.now(UTC)
     if d.tzinfo is None:
         d = d.replace(tzinfo=UTC)
     return d.astimezone(RIYADH).isoformat()
+
 
 
 def _safe_symbol(value: Any) -> str:
@@ -115,15 +186,16 @@ def _safe_symbol(value: Any) -> str:
         return ""
 
 
+
 def _nonempty_count(obj: Any) -> int:
     if not isinstance(obj, dict):
         return 0
     total = 0
-    for v in obj.values():
-        if v in (None, "", [], {}, ()):
-            continue
-        total += 1
+    for value in obj.values():
+        if _is_nonempty(value):
+            total += 1
     return total
+
 
 
 def _extract_version_parts(value: str) -> Tuple[int, int, int]:
@@ -135,11 +207,218 @@ def _extract_version_parts(value: str) -> Tuple[int, int, int]:
     return (parts[0], parts[1], parts[2])
 
 
+
 def _version_tuple(value: str) -> Tuple[int, int, int]:
     try:
         return _extract_version_parts(value)
     except Exception:
         return (0, 0, 0)
+
+
+
+def _is_nonempty(value: Any) -> bool:
+    if value is None:
+        return False
+    if value == 0:
+        return True
+    if value is False:
+        return True
+    if isinstance(value, float) and math.isnan(value):
+        return False
+    if isinstance(value, str) and not value.strip():
+        return False
+    if isinstance(value, (list, tuple, set, dict)) and len(value) == 0:
+        return False
+    return True
+
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        try:
+            if isinstance(value, float) and math.isnan(value):
+                return None
+            return float(value)
+        except Exception:
+            return None
+    try:
+        text = str(value).strip().replace(",", "")
+        if not text or text.lower() in {"none", "nan", "null", "n/a", "na"}:
+            return None
+        return float(text)
+    except Exception:
+        return None
+
+
+
+def _coerce_int(value: Any) -> Optional[int]:
+    num = _coerce_float(value)
+    if num is None:
+        return None
+    try:
+        return int(num)
+    except Exception:
+        return None
+
+
+
+def _safe_get(mapping: Any, *keys: str, default: Any = None) -> Any:
+    if not isinstance(mapping, dict):
+        return default
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            return mapping[key]
+    return default
+
+
+
+def _deep_get(mapping: Any, path: Sequence[Union[str, int]], default: Any = None) -> Any:
+    cur = mapping
+    try:
+        for part in path:
+            if isinstance(part, int):
+                if not isinstance(cur, (list, tuple)) or part >= len(cur):
+                    return default
+                cur = cur[part]
+            else:
+                if not isinstance(cur, dict) or part not in cur:
+                    return default
+                cur = cur[part]
+        return cur
+    except Exception:
+        return default
+
+
+
+def _to_dict(value: Any) -> Dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    if is_dataclass(value):
+        try:
+            return asdict(value)
+        except Exception:
+            return {}
+    if hasattr(value, "model_dump"):
+        try:
+            dumped = value.model_dump()  # pydantic v2
+            return dict(dumped) if isinstance(dumped, dict) else {}
+        except Exception:
+            pass
+    if hasattr(value, "dict"):
+        try:
+            dumped = value.dict()  # pydantic v1
+            return dict(dumped) if isinstance(dumped, dict) else {}
+        except Exception:
+            pass
+    if hasattr(value, "__dict__"):
+        try:
+            raw = vars(value)
+            return dict(raw) if isinstance(raw, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+
+def _merge_nonempty(base: Optional[Dict[str, Any]], patch: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    out = dict(base or {})
+    for key, value in (patch or {}).items():
+        if _is_nonempty(value) or key not in out:
+            out[key] = value
+    return out
+
+
+
+def _symbol_kind(symbol: str) -> str:
+    sym = _safe_symbol(symbol)
+    if not sym:
+        return "unknown"
+    if sym.endswith("=X"):
+        return "fx"
+    if "-USD" in sym or sym.endswith("USD") and "=" not in sym and "." not in sym and len(sym) <= 10:
+        return "crypto"
+    if sym.endswith("=F"):
+        return "future"
+    if sym.endswith(".SR"):
+        return "ksa_equity"
+    if any(ch in sym for ch in ("ETF",)):
+        return "fund"
+    return "equity"
+
+
+
+def _identity_defaults_for_symbol(symbol: str) -> Dict[str, Any]:
+    sym = _safe_symbol(symbol)
+    kind = _symbol_kind(sym)
+    defaults: Dict[str, Any] = {
+        "symbol": sym,
+        "symbol_normalized": sym,
+        "requested_symbol": sym,
+    }
+
+    if kind == "fx":
+        pair = sym.replace("=X", "")
+        if len(pair) == 6:
+            name = f"{pair[:3]}/{pair[3:]}"
+        else:
+            name = sym
+        defaults.update(
+            {
+                "name": name,
+                "asset_class": "FX",
+                "exchange": "FX",
+                "currency": pair[3:] if len(pair) == 6 else None,
+                "country": "Global",
+                "sector": "Foreign Exchange",
+                "industry": "Currency Pair",
+            }
+        )
+    elif kind == "future":
+        name_map = {
+            "GC=F": "Gold Futures",
+            "SI=F": "Silver Futures",
+            "HG=F": "Copper Futures",
+            "CL=F": "Crude Oil Futures",
+            "BZ=F": "Brent Crude Futures",
+            "NG=F": "Natural Gas Futures",
+        }
+        defaults.update(
+            {
+                "name": name_map.get(sym, sym),
+                "asset_class": "Commodity",
+                "exchange": "Futures",
+                "currency": "USD",
+                "country": "Global",
+                "sector": "Commodities",
+                "industry": "Futures Contract",
+            }
+        )
+    elif kind == "crypto":
+        defaults.update(
+            {
+                "asset_class": "Crypto",
+                "exchange": "Crypto",
+                "country": "Global",
+                "sector": "Digital Assets",
+                "industry": "Cryptocurrency",
+            }
+        )
+    elif kind == "ksa_equity":
+        defaults.update(
+            {
+                "asset_class": "Equity",
+                "exchange": "Tadawul",
+                "currency": "SAR",
+                "country": "Saudi Arabia",
+            }
+        )
+    return defaults
 
 
 # =============================================================================
@@ -253,9 +532,9 @@ class TraceContext:
             try:
                 self._cm = _TRACER.start_as_current_span(self.name)
                 self._span = self._cm.__enter__()
-                for k, v in self.attributes.items():
+                for key, value in self.attributes.items():
                     try:
-                        self._span.set_attribute(str(k), v)
+                        self._span.set_attribute(str(key), value)
                     except Exception:
                         pass
             except Exception:
@@ -388,6 +667,409 @@ def _track(fn_name: str, start_mono: float, ok: bool, err: Optional[BaseExceptio
 
 
 # =============================================================================
+# Result normalization helpers
+# =============================================================================
+
+def _normalize_timestamp(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        dt = value if value.tzinfo else value.replace(tzinfo=UTC)
+        return dt.astimezone(UTC).isoformat()
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(float(value), tz=UTC).isoformat()
+        except Exception:
+            return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC).isoformat()
+    except Exception:
+        return text
+
+
+
+def _ensure_history_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    out = dict(row)
+    timestamp = _normalize_timestamp(_safe_get(out, "timestamp", "date"))
+    if timestamp:
+        out["timestamp"] = timestamp
+    for key in ("open", "high", "low", "close", "adj_close", "adjclose"):
+        if key in out:
+            out[key] = _coerce_float(out[key])
+    if "volume" in out:
+        out["volume"] = _coerce_int(out["volume"])
+    return out
+
+
+
+def _rows_from_parallel_arrays(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    timestamps = _deep_get(payload, ["timestamp"], default=None)
+    if not isinstance(timestamps, list):
+        timestamps = _deep_get(payload, ["timestamps"], default=None)
+    quotes = _deep_get(payload, ["indicators", "quote", 0], default={})
+    adjclose_block = _deep_get(payload, ["indicators", "adjclose", 0], default={})
+
+    if not isinstance(timestamps, list) or not isinstance(quotes, dict):
+        return []
+
+    opens = quotes.get("open") if isinstance(quotes.get("open"), list) else []
+    highs = quotes.get("high") if isinstance(quotes.get("high"), list) else []
+    lows = quotes.get("low") if isinstance(quotes.get("low"), list) else []
+    closes = quotes.get("close") if isinstance(quotes.get("close"), list) else []
+    vols = quotes.get("volume") if isinstance(quotes.get("volume"), list) else []
+    adjs = adjclose_block.get("adjclose") if isinstance(adjclose_block.get("adjclose"), list) else []
+
+    rows: List[Dict[str, Any]] = []
+    for idx, ts in enumerate(timestamps):
+        row = {
+            "timestamp": _normalize_timestamp(ts),
+            "open": opens[idx] if idx < len(opens) else None,
+            "high": highs[idx] if idx < len(highs) else None,
+            "low": lows[idx] if idx < len(lows) else None,
+            "close": closes[idx] if idx < len(closes) else None,
+            "adj_close": adjs[idx] if idx < len(adjs) else None,
+            "volume": vols[idx] if idx < len(vols) else None,
+        }
+        rows.append(_ensure_history_row(row))
+    return [r for r in rows if any(_is_nonempty(v) for v in r.values())]
+
+
+
+def _extract_history_rows(payload: Any) -> List[Dict[str, Any]]:
+    if payload is None:
+        return []
+
+    if isinstance(payload, list):
+        rows: List[Dict[str, Any]] = []
+        for item in payload:
+            if isinstance(item, dict):
+                if any(key in item for key in HISTORY_ROW_KEYS):
+                    rows.append(_ensure_history_row(item))
+                else:
+                    nested = _extract_history_rows(item)
+                    if nested:
+                        rows.extend(nested)
+            else:
+                as_dict = _to_dict(item)
+                if as_dict:
+                    rows.extend(_extract_history_rows(as_dict))
+        return rows
+
+    payload_dict = _to_dict(payload)
+    if not payload_dict:
+        return []
+
+    if any(key in payload_dict for key in HISTORY_ROW_KEYS):
+        return [_ensure_history_row(payload_dict)]
+
+    for key in ("rows", "history", "prices", "data", "items", "records"):
+        nested = payload_dict.get(key)
+        rows = _extract_history_rows(nested)
+        if rows:
+            return rows
+
+    chart_root = _deep_get(payload_dict, ["chart", "result", 0], default=None)
+    if chart_root:
+        rows = _rows_from_parallel_arrays(chart_root)
+        if rows:
+            return rows
+
+    for key in ("result", "quoteResponse", "response"):
+        nested = payload_dict.get(key)
+        rows = _extract_history_rows(nested)
+        if rows:
+            return rows
+
+    return []
+
+
+
+def _derive_quote_from_rows(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    cleaned = [r for r in rows if isinstance(r, dict)]
+    if not cleaned:
+        return {}
+
+    latest = cleaned[-1]
+    previous = cleaned[-2] if len(cleaned) >= 2 else {}
+
+    closes = [_coerce_float(r.get("close")) for r in cleaned]
+    highs = [_coerce_float(r.get("high")) for r in cleaned]
+    lows = [_coerce_float(r.get("low")) for r in cleaned]
+    volumes = [_coerce_int(r.get("volume")) for r in cleaned]
+
+    closes_valid = [v for v in closes if v is not None]
+    highs_valid = [v for v in highs if v is not None]
+    lows_valid = [v for v in lows if v is not None]
+    vols_valid = [v for v in volumes if v is not None]
+
+    current = _coerce_float(_safe_get(latest, "close", "adj_close", "adjclose"))
+    previous_close = _coerce_float(_safe_get(previous, "close", "adj_close", "adjclose"))
+    if previous_close is None and len(closes_valid) >= 2:
+        previous_close = closes_valid[-2]
+
+    out: Dict[str, Any] = {
+        "current_price": current,
+        "price": current,
+        "previous_close": previous_close,
+        "open": _coerce_float(latest.get("open")),
+        "day_high": _coerce_float(latest.get("high")),
+        "day_low": _coerce_float(latest.get("low")),
+        "volume": _coerce_int(latest.get("volume")),
+        "52w_high": max(highs_valid) if highs_valid else None,
+        "52w_low": min(lows_valid) if lows_valid else None,
+        "avg_volume_30d": int(sum(vols_valid[-30:]) / len(vols_valid[-30:])) if vols_valid else None,
+        "avg_volume_10d": int(sum(vols_valid[-10:]) / len(vols_valid[-10:])) if vols_valid else None,
+        "history_points": len(cleaned),
+        "history_last_timestamp": _normalize_timestamp(_safe_get(latest, "timestamp", "date")),
+    }
+
+    if current is not None and previous_close not in (None, 0):
+        price_change = current - previous_close
+        out["price_change"] = price_change
+        out["percent_change"] = (price_change / previous_close) * 100.0
+
+    if current is not None and highs_valid and lows_valid and max(highs_valid) != min(lows_valid):
+        lo = min(lows_valid)
+        hi = max(highs_valid)
+        out["52w_position_pct"] = ((current - lo) / (hi - lo)) * 100.0
+
+    return out
+
+
+
+def _derive_quote_from_chart_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    result: Dict[str, Any] = {}
+    chart_root = _deep_get(payload, ["chart", "result", 0], default=None)
+    if not isinstance(chart_root, dict):
+        chart_root = payload
+
+    meta = chart_root.get("meta") if isinstance(chart_root.get("meta"), dict) else {}
+    rows = _rows_from_parallel_arrays(chart_root)
+    derived = _derive_quote_from_rows(rows)
+
+    meta_price = _coerce_float(_safe_get(meta, *PRICE_FIELD_ALIASES))
+    meta_prev = _coerce_float(_safe_get(meta, *PREV_CLOSE_ALIASES))
+
+    if meta_price is not None:
+        result["current_price"] = meta_price
+        result["price"] = meta_price
+    if meta_prev is not None:
+        result["previous_close"] = meta_prev
+    result["open"] = _coerce_float(_safe_get(meta, *OPEN_ALIASES))
+    result["day_high"] = _coerce_float(_safe_get(meta, *HIGH_ALIASES))
+    result["day_low"] = _coerce_float(_safe_get(meta, *LOW_ALIASES))
+    result["volume"] = _coerce_int(_safe_get(meta, *VOLUME_ALIASES))
+    result["exchange"] = _safe_get(meta, *EXCHANGE_ALIASES)
+    result["currency"] = _safe_get(meta, *CURRENCY_ALIASES)
+    result["name"] = _safe_get(meta, *NAME_ALIASES)
+    result["52w_high"] = _coerce_float(_safe_get(meta, "fiftyTwoWeekHigh", "fifty_two_week_high", "52w_high"))
+    result["52w_low"] = _coerce_float(_safe_get(meta, "fiftyTwoWeekLow", "fifty_two_week_low", "52w_low"))
+    result["market_state"] = _safe_get(meta, "marketState", "market_state")
+
+    result = _merge_nonempty(derived, result)
+
+    current = _coerce_float(_safe_get(result, "current_price", "price"))
+    prev = _coerce_float(result.get("previous_close"))
+    if current is not None and prev not in (None, 0):
+        price_change = current - prev
+        result.setdefault("price_change", price_change)
+        result.setdefault("percent_change", (price_change / prev) * 100.0)
+
+    return {k: v for k, v in result.items() if _is_nonempty(v)}
+
+
+
+def _classify_quality(payload: Dict[str, Any]) -> str:
+    nonempty = _nonempty_count(payload)
+    if nonempty >= 22:
+        return DataQuality.EXCELLENT.value
+    if nonempty >= 16:
+        return DataQuality.HIGH.value
+    if nonempty >= 10:
+        return DataQuality.MEDIUM.value
+    if nonempty >= 5:
+        return DataQuality.PARTIAL.value
+    if payload.get("error"):
+        return DataQuality.ERROR.value
+    return DataQuality.LOW.value
+
+
+
+def _normalize_quote_payload(payload: Any, *, symbol: str) -> Dict[str, Any]:
+    sym = _safe_symbol(symbol)
+    defaults = _identity_defaults_for_symbol(sym)
+
+    if payload is None:
+        return defaults
+
+    payload_dict = _to_dict(payload)
+    if not payload_dict and isinstance(payload, list):
+        rows = _extract_history_rows(payload)
+        return _merge_nonempty(defaults, _derive_quote_from_rows(rows))
+    if not payload_dict:
+        return defaults
+
+    out = dict(defaults)
+
+    # direct quote-ish fields
+    for alias in NAME_ALIASES:
+        if _is_nonempty(payload_dict.get(alias)):
+            out["name"] = payload_dict.get(alias)
+            break
+    for alias in EXCHANGE_ALIASES:
+        if _is_nonempty(payload_dict.get(alias)):
+            out["exchange"] = payload_dict.get(alias)
+            break
+    for alias in CURRENCY_ALIASES:
+        if _is_nonempty(payload_dict.get(alias)):
+            out["currency"] = payload_dict.get(alias)
+            break
+
+    out["current_price"] = _coerce_float(_safe_get(payload_dict, *PRICE_FIELD_ALIASES))
+    out["price"] = _coerce_float(_safe_get(payload_dict, *PRICE_FIELD_ALIASES))
+    out["previous_close"] = _coerce_float(_safe_get(payload_dict, *PREV_CLOSE_ALIASES))
+    out["open"] = _coerce_float(_safe_get(payload_dict, *OPEN_ALIASES))
+    out["day_high"] = _coerce_float(_safe_get(payload_dict, *HIGH_ALIASES))
+    out["day_low"] = _coerce_float(_safe_get(payload_dict, *LOW_ALIASES))
+    out["volume"] = _coerce_int(_safe_get(payload_dict, *VOLUME_ALIASES))
+    out["52w_high"] = _coerce_float(_safe_get(payload_dict, "52w_high", "fiftyTwoWeekHigh", "fifty_two_week_high"))
+    out["52w_low"] = _coerce_float(_safe_get(payload_dict, "52w_low", "fiftyTwoWeekLow", "fifty_two_week_low"))
+    out["market_cap"] = _coerce_float(_safe_get(payload_dict, "market_cap", "marketCap"))
+    out["beta_5y"] = _coerce_float(_safe_get(payload_dict, "beta_5y", "beta", "beta5YMonthly"))
+    out["dividend_yield"] = _coerce_float(_safe_get(payload_dict, "dividend_yield", "dividendYield"))
+    out["long_name"] = _safe_get(payload_dict, "longName", "long_name")
+    out["short_name"] = _safe_get(payload_dict, "shortName", "short_name")
+    out["market_state"] = _safe_get(payload_dict, "market_state", "marketState")
+
+    # nested raw/meta/chart payloads
+    chart_derived = _derive_quote_from_chart_payload(payload_dict)
+    history_rows = _extract_history_rows(payload_dict)
+    history_derived = _derive_quote_from_rows(history_rows)
+
+    out = _merge_nonempty(out, chart_derived)
+    out = _merge_nonempty(out, history_derived)
+
+    current = _coerce_float(_safe_get(out, "current_price", "price"))
+    prev = _coerce_float(out.get("previous_close"))
+    if current is not None and prev not in (None, 0):
+        price_change = current - prev
+        out["price_change"] = price_change
+        out["percent_change"] = (price_change / prev) * 100.0
+
+    warnings = []
+    for key in ("warnings", "warning", "notes"):
+        value = payload_dict.get(key)
+        if isinstance(value, list):
+            warnings.extend([str(x) for x in value if _is_nonempty(x)])
+        elif _is_nonempty(value):
+            warnings.append(str(value))
+    if warnings:
+        out["warnings"] = warnings
+
+    return {k: v for k, v in out.items() if _is_nonempty(v) or k in {"symbol", "symbol_normalized", "requested_symbol"}}
+
+
+
+def _normalize_history_payload(payload: Any, *, symbol: str) -> List[Dict[str, Any]]:
+    rows = _extract_history_rows(payload)
+    if rows:
+        return rows
+
+    sym = _safe_symbol(symbol)
+    quote = _normalize_quote_payload(payload, symbol=sym)
+    current = _coerce_float(_safe_get(quote, "current_price", "price"))
+    if current is None:
+        return []
+
+    synthetic = {
+        "timestamp": _utc_iso(),
+        "open": _coerce_float(quote.get("open")),
+        "high": _coerce_float(quote.get("day_high")),
+        "low": _coerce_float(quote.get("day_low")),
+        "close": current,
+        "adj_close": current,
+        "volume": _coerce_int(quote.get("volume")),
+    }
+    return [_ensure_history_row(synthetic)]
+
+
+
+def _normalize_patch_payload(payload: Any, *, symbol: str, base: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    patch = _normalize_quote_payload(payload, symbol=symbol)
+    merged = _merge_nonempty(base or {}, patch)
+    if not _is_nonempty(merged.get("current_price")):
+        rows = _normalize_history_payload(payload, symbol=symbol)
+        merged = _merge_nonempty(merged, _derive_quote_from_rows(rows))
+    return merged
+
+
+
+def _ensure_shape(payload: Any, *, symbol: str, provider_version: Optional[str], fn_name: str, result_kind: str) -> Any:
+    sym = _safe_symbol(symbol)
+
+    if result_kind == "history":
+        rows = _normalize_history_payload(payload, symbol=sym)
+        return rows
+
+    if result_kind == "patch":
+        base = None
+        if isinstance(payload, dict):
+            base_candidate = payload.get("base")
+            if isinstance(base_candidate, dict):
+                base = base_candidate
+        out = _normalize_patch_payload(payload, symbol=sym, base=base)
+    else:
+        out = _normalize_quote_payload(payload, symbol=sym)
+
+    out.setdefault("symbol", sym)
+    out.setdefault("symbol_normalized", sym)
+    out.setdefault("requested_symbol", sym)
+    out.setdefault("data_source", DATA_SOURCE)
+    out.setdefault("provider", DATA_SOURCE)
+    out.setdefault("shim_version", SHIM_VERSION)
+    if provider_version:
+        out.setdefault("provider_version", provider_version)
+    out.setdefault("last_updated_utc", _utc_iso())
+    out.setdefault("last_updated_riyadh", _riyadh_iso())
+
+    if out.get("error"):
+        out.setdefault("status", "error")
+        out.setdefault("data_quality", DataQuality.ERROR.value)
+    else:
+        out.setdefault("status", "ok")
+        out.setdefault("data_quality", _classify_quality(out))
+
+    out.setdefault("where", fn_name)
+    return out
+
+
+
+def _error_payload(symbol: str, err: str, *, fn_name: str) -> Dict[str, Any]:
+    sym = _safe_symbol(symbol)
+    out = _identity_defaults_for_symbol(sym)
+    out.update(
+        {
+            "status": "error",
+            "data_source": DATA_SOURCE,
+            "provider": DATA_SOURCE,
+            "data_quality": DataQuality.ERROR.value,
+            "error": err,
+            "where": fn_name,
+            "shim_version": SHIM_VERSION,
+            "last_updated_utc": _utc_iso(),
+            "last_updated_riyadh": _riyadh_iso(),
+        }
+    )
+    return out
+
+
+# =============================================================================
 # SingleFlight (async)
 # =============================================================================
 class SingleFlight:
@@ -436,14 +1118,14 @@ class FullJitterBackoff:
         last: Optional[BaseException] = None
         total_tries = max(1, self.attempts + 1)
 
-        for i in range(total_tries):
+        for idx in range(total_tries):
             try:
                 return await fn()
             except Exception as exc:
                 last = exc
-                if i >= total_tries - 1:
+                if idx >= total_tries - 1:
                     break
-                temp = min(self.cap, self.base * (2 ** i))
+                temp = min(self.cap, self.base * (2 ** idx))
                 await asyncio.sleep(random.uniform(0.0, temp))
 
         raise last if last else RuntimeError("retry_exhausted")
@@ -590,7 +1272,10 @@ class ProviderCache:
                 if mod is None:
                     raise ImportError(f"canonical_missing:{last_err.__class__.__name__ if last_err else 'unknown'}")
 
-                ver = str(getattr(mod, "PROVIDER_VERSION", getattr(mod, "VERSION", getattr(mod, "SHIM_VERSION", "unknown"))) or "unknown")
+                ver = str(
+                    getattr(mod, "PROVIDER_VERSION", getattr(mod, "VERSION", getattr(mod, "SHIM_VERSION", "unknown")))
+                    or "unknown"
+                )
                 if _version_tuple(ver) < _version_tuple(MIN_CANONICAL_VERSION):
                     raise RuntimeError(f"canonical_version_too_old:{ver}")
 
@@ -645,6 +1330,7 @@ def _sig_params(fn: Callable[..., Any]) -> Dict[str, inspect.Parameter]:
         return {}
 
 
+
 def _adapt_kwargs(fn: Callable[..., Any], kwargs: Dict[str, Any]) -> Dict[str, Any]:
     try:
         params = _sig_params(fn)
@@ -657,6 +1343,28 @@ def _adapt_kwargs(fn: Callable[..., Any], kwargs: Dict[str, Any]) -> Dict[str, A
         return dict(kwargs)
 
 
+
+def _coerce_args_for_call(fn: Callable[..., Any], args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
+    """
+    Keep broad compatibility across slightly different canonical signatures.
+    """
+    params = _sig_params(fn)
+    if not params:
+        return args, dict(kwargs)
+
+    arg_names = [name for name, p in params.items() if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)]
+    out_kwargs = _adapt_kwargs(fn, kwargs)
+
+    # Avoid passing duplicated positional/keyword symbol/base values.
+    if args:
+        if len(arg_names) >= 1 and arg_names[0] in out_kwargs:
+            out_kwargs.pop(arg_names[0], None)
+        if len(args) >= 2 and len(arg_names) >= 2 and arg_names[1] in out_kwargs:
+            out_kwargs.pop(arg_names[1], None)
+
+    return args, out_kwargs
+
+
 async def _maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
@@ -664,73 +1372,24 @@ async def _maybe_await(value: Any) -> Any:
 
 
 # =============================================================================
-# Response normalization
-# =============================================================================
-def _ensure_shape(payload: Any, *, symbol: str, provider_version: Optional[str], fn_name: str) -> Any:
-    if not isinstance(payload, dict):
-        return payload
-
-    out = dict(payload)
-    sym = _safe_symbol(out.get("symbol") or symbol)
-    out["symbol"] = sym
-    out.setdefault("symbol_normalized", sym)
-    out.setdefault("requested_symbol", sym)
-    out.setdefault("data_source", DATA_SOURCE)
-    out.setdefault("provider", DATA_SOURCE)
-    out.setdefault("shim_version", SHIM_VERSION)
-    if provider_version:
-        out.setdefault("provider_version", provider_version)
-
-    out.setdefault("last_updated_utc", _utc_iso())
-    out.setdefault("last_updated_riyadh", _riyadh_iso())
-
-    if out.get("error"):
-        out.setdefault("status", "error")
-        out.setdefault("data_quality", DataQuality.ERROR.value)
-        out.setdefault("where", fn_name)
-    else:
-        out.setdefault("status", "ok")
-        out.setdefault("data_quality", out.get("data_quality") or DataQuality.OK.value)
-
-    return out
-
-
-def _error_payload(symbol: str, err: str, *, fn_name: str) -> Dict[str, Any]:
-    sym = _safe_symbol(symbol)
-    return {
-        "status": "error",
-        "symbol": sym,
-        "symbol_normalized": sym,
-        "requested_symbol": sym,
-        "data_source": DATA_SOURCE,
-        "provider": DATA_SOURCE,
-        "data_quality": DataQuality.ERROR.value,
-        "error": err,
-        "where": fn_name,
-        "shim_version": SHIM_VERSION,
-        "last_updated_utc": _utc_iso(),
-        "last_updated_riyadh": _riyadh_iso(),
-    }
-
-
-# =============================================================================
 # Default handlers (used only if canonical missing)
 # =============================================================================
 async def _default_quote(symbol: str, *args, **kwargs) -> Dict[str, Any]:
     sym = _safe_symbol(symbol)
-    return {
-        "status": "error",
-        "symbol": sym,
-        "symbol_normalized": sym,
-        "requested_symbol": sym,
-        "data_source": DATA_SOURCE,
-        "provider": DATA_SOURCE,
-        "data_quality": DataQuality.MISSING.value,
-        "error": "canonical_unavailable",
-        "shim_version": SHIM_VERSION,
-        "last_updated_utc": _utc_iso(),
-        "last_updated_riyadh": _riyadh_iso(),
-    }
+    out = _identity_defaults_for_symbol(sym)
+    out.update(
+        {
+            "status": "error",
+            "data_source": DATA_SOURCE,
+            "provider": DATA_SOURCE,
+            "data_quality": DataQuality.MISSING.value,
+            "error": "canonical_unavailable",
+            "shim_version": SHIM_VERSION,
+            "last_updated_utc": _utc_iso(),
+            "last_updated_riyadh": _riyadh_iso(),
+        }
+    )
+    return out
 
 
 async def _default_patch(symbol: str, base: Optional[Dict[str, Any]] = None, *args, **kwargs) -> Dict[str, Any]:
@@ -751,12 +1410,14 @@ class ShimFunction:
         self,
         name: str,
         *,
-        canonical_name: Optional[str] = None,
+        canonical_names: Optional[Sequence[str]] = None,
         fallback_factory: Optional[Callable[..., Any]] = None,
+        result_kind: str = "quote",
     ):
         self.name = name
-        self.canonical_name = canonical_name or name
+        self.canonical_names = tuple(canonical_names or (name,))
         self.fallback_factory = fallback_factory
+        self.result_kind = result_kind
         self._backoff = FullJitterBackoff(
             attempts=_env_int("SHIM_YAHOO_RETRY_ATTEMPTS", 2, lo=0, hi=6),
             base=_env_float("SHIM_YAHOO_RETRY_BASE_SEC", 0.35, lo=0.05, hi=5.0),
@@ -771,20 +1432,38 @@ class ShimFunction:
             info = await _PROVIDER.get()
             if not info.available:
                 raise RuntimeError(info.error or "canonical_unavailable")
-            fn = info.funcs.get(self.canonical_name)
+
+            fn = None
+            for candidate in self.canonical_names:
+                fn = info.funcs.get(candidate)
+                if fn is not None:
+                    break
             if fn is None:
-                raise AttributeError(f"canonical_missing_fn:{self.canonical_name}")
-            adapted_kwargs = _adapt_kwargs(fn, kwargs)
-            result = fn(*args, **adapted_kwargs)
+                raise AttributeError(f"canonical_missing_fn:{self.canonical_names[0]}")
+
+            call_args, call_kwargs = _coerce_args_for_call(fn, tuple(args), dict(kwargs))
+            result = fn(*call_args, **call_kwargs)
             result = await _maybe_await(result)
-            return _ensure_shape(result, symbol=sym, provider_version=info.version, fn_name=self.name)
+            return _ensure_shape(
+                result,
+                symbol=sym,
+                provider_version=info.version,
+                fn_name=self.name,
+                result_kind=self.result_kind,
+            )
 
         async def _call_fallback() -> Any:
             if self.fallback_factory is None:
                 raise RuntimeError("fallback_missing")
             result = self.fallback_factory(*args, **kwargs)
             result = await _maybe_await(result)
-            return _ensure_shape(result, symbol=sym, provider_version=None, fn_name=self.name)
+            return _ensure_shape(
+                result,
+                symbol=sym,
+                provider_version=None,
+                fn_name=self.name,
+                result_kind=self.result_kind,
+            )
 
         with TraceContext(f"yahoo_shim.{self.name}", {"symbol": sym, "fn": self.name}):
             try:
@@ -818,30 +1497,97 @@ class ShimFunction:
 # =============================================================================
 # Public shim callables (legacy API surface)
 # =============================================================================
-fetch_quote = ShimFunction("fetch_quote", canonical_name="fetch_quote", fallback_factory=_default_quote)
-get_quote = ShimFunction("get_quote", canonical_name="get_quote", fallback_factory=_default_quote)
+fetch_quote = ShimFunction(
+    "fetch_quote",
+    canonical_names=("fetch_quote", "get_quote", "yahoo_chart_quote"),
+    fallback_factory=_default_quote,
+    result_kind="quote",
+)
+get_quote = ShimFunction(
+    "get_quote",
+    canonical_names=("get_quote", "fetch_quote", "yahoo_chart_quote"),
+    fallback_factory=_default_quote,
+    result_kind="quote",
+)
 
-get_quote_patch = ShimFunction("get_quote_patch", canonical_name="get_quote_patch", fallback_factory=_default_patch)
-fetch_quote_patch = ShimFunction("fetch_quote_patch", canonical_name="fetch_quote_patch", fallback_factory=_default_patch)
-fetch_enriched_quote_patch = ShimFunction("fetch_enriched_quote_patch", canonical_name="fetch_enriched_quote_patch", fallback_factory=_default_patch)
+yahoo_chart_quote = ShimFunction(
+    "yahoo_chart_quote",
+    canonical_names=("yahoo_chart_quote", "fetch_quote", "get_quote"),
+    fallback_factory=_default_quote,
+    result_kind="quote",
+)
+
+get_quote_patch = ShimFunction(
+    "get_quote_patch",
+    canonical_names=("get_quote_patch", "fetch_quote_patch", "fetch_enriched_quote_patch", "fetch_quote"),
+    fallback_factory=_default_patch,
+    result_kind="patch",
+)
+fetch_quote_patch = ShimFunction(
+    "fetch_quote_patch",
+    canonical_names=("fetch_quote_patch", "get_quote_patch", "fetch_enriched_quote_patch", "fetch_quote"),
+    fallback_factory=_default_patch,
+    result_kind="patch",
+)
+fetch_enriched_quote_patch = ShimFunction(
+    "fetch_enriched_quote_patch",
+    canonical_names=("fetch_enriched_quote_patch", "fetch_quote_patch", "get_quote_patch", "fetch_quote"),
+    fallback_factory=_default_patch,
+    result_kind="patch",
+)
 fetch_quote_and_enrichment_patch = ShimFunction(
     "fetch_quote_and_enrichment_patch",
-    canonical_name="fetch_quote_and_enrichment_patch",
+    canonical_names=(
+        "fetch_quote_and_enrichment_patch",
+        "fetch_enriched_quote_patch",
+        "fetch_quote_patch",
+        "fetch_quote",
+    ),
     fallback_factory=_default_patch,
+    result_kind="patch",
 )
 fetch_quote_and_fundamentals_patch = ShimFunction(
     "fetch_quote_and_fundamentals_patch",
-    canonical_name="fetch_quote_and_fundamentals_patch",
+    canonical_names=(
+        "fetch_quote_and_fundamentals_patch",
+        "fetch_enriched_quote_patch",
+        "fetch_quote_patch",
+        "fetch_quote",
+    ),
     fallback_factory=_default_patch,
+    result_kind="patch",
 )
 
-yahoo_chart_quote = ShimFunction("yahoo_chart_quote", canonical_name="yahoo_chart_quote", fallback_factory=_default_quote)
-
-fetch_price_history = ShimFunction("fetch_price_history", canonical_name="fetch_price_history", fallback_factory=_default_history)
-fetch_history = ShimFunction("fetch_history", canonical_name="fetch_history", fallback_factory=_default_history)
-fetch_ohlc_history = ShimFunction("fetch_ohlc_history", canonical_name="fetch_ohlc_history", fallback_factory=_default_history)
-fetch_history_patch = ShimFunction("fetch_history_patch", canonical_name="fetch_history_patch", fallback_factory=_default_history)
-fetch_prices = ShimFunction("fetch_prices", canonical_name="fetch_prices", fallback_factory=_default_history)
+fetch_price_history = ShimFunction(
+    "fetch_price_history",
+    canonical_names=("fetch_price_history", "fetch_history", "fetch_ohlc_history", "fetch_prices"),
+    fallback_factory=_default_history,
+    result_kind="history",
+)
+fetch_history = ShimFunction(
+    "fetch_history",
+    canonical_names=("fetch_history", "fetch_price_history", "fetch_ohlc_history", "fetch_prices"),
+    fallback_factory=_default_history,
+    result_kind="history",
+)
+fetch_ohlc_history = ShimFunction(
+    "fetch_ohlc_history",
+    canonical_names=("fetch_ohlc_history", "fetch_history", "fetch_price_history", "fetch_prices"),
+    fallback_factory=_default_history,
+    result_kind="history",
+)
+fetch_history_patch = ShimFunction(
+    "fetch_history_patch",
+    canonical_names=("fetch_history_patch", "fetch_history", "fetch_price_history", "fetch_ohlc_history"),
+    fallback_factory=_default_history,
+    result_kind="history",
+)
+fetch_prices = ShimFunction(
+    "fetch_prices",
+    canonical_names=("fetch_prices", "fetch_history", "fetch_price_history", "fetch_ohlc_history"),
+    fallback_factory=_default_history,
+    result_kind="history",
+)
 
 
 # =============================================================================
@@ -849,7 +1595,7 @@ fetch_prices = ShimFunction("fetch_prices", canonical_name="fetch_prices", fallb
 # =============================================================================
 class YahooChartProvider:
     """
-    Backward compatible provider class.
+    Backward-compatible provider class.
     Delegates to canonical class if available, otherwise to shim callables.
     """
 
@@ -890,53 +1636,58 @@ class YahooChartProvider:
                 pass
         self._inner = None
 
-    async def _dispatch(self, method_name: str, shim_fn: Callable[..., Awaitable[Any]], *args, **kwargs) -> Any:
+    async def _dispatch(self, method_names: Sequence[str], shim_fn: Callable[..., Awaitable[Any]], *args, **kwargs) -> Any:
         await self._ensure_inner()
-        if self._inner is not None and hasattr(self._inner, method_name):
-            try:
-                value = getattr(self._inner, method_name)(*args, **kwargs)
-                value = await _maybe_await(value)
-                symbol = _safe_symbol(kwargs.get("symbol") or kwargs.get("ticker") or (args[0] if args else ""))
-                return _ensure_shape(value, symbol=symbol, provider_version=None, fn_name=method_name)
-            except Exception:
-                pass
+        if self._inner is not None:
+            for method_name in method_names:
+                if hasattr(self._inner, method_name):
+                    try:
+                        value = getattr(self._inner, method_name)(*args, **kwargs)
+                        value = await _maybe_await(value)
+                        symbol = _safe_symbol(kwargs.get("symbol") or kwargs.get("ticker") or (args[0] if args else ""))
+                        kind = "history" if "history" in method_name or method_name in {"fetch_prices"} else "quote"
+                        if "patch" in method_name:
+                            kind = "patch"
+                        return _ensure_shape(value, symbol=symbol, provider_version=None, fn_name=method_name, result_kind=kind)
+                    except Exception:
+                        continue
         return await shim_fn(*args, **kwargs)
 
     async def fetch_quote(self, symbol: str, *args, **kwargs) -> Dict[str, Any]:
-        return await self._dispatch("fetch_quote", fetch_quote, symbol, *args, **kwargs)
+        return await self._dispatch(("fetch_quote", "get_quote"), fetch_quote, symbol, *args, **kwargs)
 
     async def get_quote(self, symbol: str, *args, **kwargs) -> Dict[str, Any]:
-        return await self._dispatch("get_quote", get_quote, symbol, *args, **kwargs)
+        return await self._dispatch(("get_quote", "fetch_quote"), get_quote, symbol, *args, **kwargs)
 
     async def get_quote_patch(self, symbol: str, base: Optional[Dict[str, Any]] = None, *args, **kwargs) -> Dict[str, Any]:
-        return await self._dispatch("get_quote_patch", get_quote_patch, symbol, base, *args, **kwargs)
+        return await self._dispatch(("get_quote_patch", "fetch_quote_patch", "fetch_enriched_quote_patch"), get_quote_patch, symbol, base, *args, **kwargs)
 
     async def fetch_quote_patch(self, symbol: str, base: Optional[Dict[str, Any]] = None, *args, **kwargs) -> Dict[str, Any]:
-        return await self._dispatch("fetch_quote_patch", fetch_quote_patch, symbol, base, *args, **kwargs)
+        return await self._dispatch(("fetch_quote_patch", "get_quote_patch", "fetch_enriched_quote_patch"), fetch_quote_patch, symbol, base, *args, **kwargs)
 
     async def fetch_enriched_quote_patch(self, symbol: str, base: Optional[Dict[str, Any]] = None, *args, **kwargs) -> Dict[str, Any]:
-        return await self._dispatch("fetch_enriched_quote_patch", fetch_enriched_quote_patch, symbol, base, *args, **kwargs)
+        return await self._dispatch(("fetch_enriched_quote_patch", "fetch_quote_patch", "get_quote_patch"), fetch_enriched_quote_patch, symbol, base, *args, **kwargs)
 
     async def fetch_quote_and_enrichment_patch(self, symbol: str, base: Optional[Dict[str, Any]] = None, *args, **kwargs) -> Dict[str, Any]:
-        return await self._dispatch("fetch_quote_and_enrichment_patch", fetch_quote_and_enrichment_patch, symbol, base, *args, **kwargs)
+        return await self._dispatch(("fetch_quote_and_enrichment_patch", "fetch_enriched_quote_patch", "fetch_quote_patch"), fetch_quote_and_enrichment_patch, symbol, base, *args, **kwargs)
 
     async def fetch_quote_and_fundamentals_patch(self, symbol: str, base: Optional[Dict[str, Any]] = None, *args, **kwargs) -> Dict[str, Any]:
-        return await self._dispatch("fetch_quote_and_fundamentals_patch", fetch_quote_and_fundamentals_patch, symbol, base, *args, **kwargs)
+        return await self._dispatch(("fetch_quote_and_fundamentals_patch", "fetch_enriched_quote_patch", "fetch_quote_patch"), fetch_quote_and_fundamentals_patch, symbol, base, *args, **kwargs)
 
     async def fetch_price_history(self, *args, **kwargs) -> List[Dict[str, Any]]:
-        return await self._dispatch("fetch_price_history", fetch_price_history, *args, **kwargs)
+        return await self._dispatch(("fetch_price_history", "fetch_history", "fetch_ohlc_history", "fetch_prices"), fetch_price_history, *args, **kwargs)
 
     async def fetch_history(self, *args, **kwargs) -> List[Dict[str, Any]]:
-        return await self._dispatch("fetch_history", fetch_history, *args, **kwargs)
+        return await self._dispatch(("fetch_history", "fetch_price_history", "fetch_ohlc_history", "fetch_prices"), fetch_history, *args, **kwargs)
 
     async def fetch_ohlc_history(self, *args, **kwargs) -> List[Dict[str, Any]]:
-        return await self._dispatch("fetch_ohlc_history", fetch_ohlc_history, *args, **kwargs)
+        return await self._dispatch(("fetch_ohlc_history", "fetch_history", "fetch_price_history", "fetch_prices"), fetch_ohlc_history, *args, **kwargs)
 
     async def fetch_history_patch(self, *args, **kwargs) -> List[Dict[str, Any]]:
-        return await self._dispatch("fetch_history_patch", fetch_history_patch, *args, **kwargs)
+        return await self._dispatch(("fetch_history_patch", "fetch_history", "fetch_price_history", "fetch_ohlc_history"), fetch_history_patch, *args, **kwargs)
 
     async def fetch_prices(self, *args, **kwargs) -> List[Dict[str, Any]]:
-        return await self._dispatch("fetch_prices", fetch_prices, *args, **kwargs)
+        return await self._dispatch(("fetch_prices", "fetch_history", "fetch_price_history", "fetch_ohlc_history"), fetch_prices, *args, **kwargs)
 
 
 # =============================================================================
@@ -963,6 +1714,7 @@ async def clear_cache() -> None:
     global _PROVIDER
     _PROVIDER = ProviderCache()
     shim_provider_available.set(0)
+
 
 
 def get_version() -> str:
@@ -1004,5 +1756,7 @@ if __name__ == "__main__":
         sys.stdout.write("=" * 60 + "\n")
         res = await fetch_quote(symbol="AAPL")
         sys.stdout.write(json_dumps(res, default=str) + "\n")
+        hist = await fetch_history(symbol="GC=F")
+        sys.stdout.write(json_dumps({"history_rows": len(hist), "sample": hist[:2]}, default=str) + "\n")
 
     asyncio.run(_diag())
