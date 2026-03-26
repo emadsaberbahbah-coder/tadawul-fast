@@ -2,7 +2,7 @@
 # routes/__init__.py
 """
 ================================================================================
-TADAWUL FAST BRIDGE — ROUTER DISCOVERY & MOUNT LOGIC (v3.5.0)
+TADAWUL FAST BRIDGE — ROUTER DISCOVERY & MOUNT LOGIC (v3.6.0)
 ================================================================================
 MAIN-PY-ALIGNED • IMPORT-SAFE • RENDER-SAFE • DETERMINISTIC • DUPLICATE-AWARE
 CONTROLLED-OWNER SAFE • ROUTE-LEVEL FILTER SAFE • PREFIX-OWNER ENFORCED
@@ -10,23 +10,17 @@ PACKAGE-MOUNT COMPATIBLE • CONFLICT-ROLLBACK SAFE • SNAPSHOT-RICH
 
 Why this revision
 -----------------
-- ✅ ALIGN: canonical owner map now matches `main.py` runtime ownership:
-      - `/v1/advisor*`           -> advisor
-      - `/v1/advanced*`          -> investment_advisor
-      - `/v1/analysis*`          -> analysis_sheet_rows
-      - `/v1/schema*`, `/schema*`-> advanced_analysis
-      - `/v1/enriched*`          -> enriched_quote
-      - `/quote`, `/quotes`      -> enriched_quote
-      - `/sheet-rows`            -> advanced_analysis
-- ✅ FIX: `data_dictionary` is no longer allowed to claim `/v1/schema*`, `/schema*`,
-      or `/sheet-rows` through package mounting.
-- ✅ FIX: `enriched_quote` is no longer allowed to reclaim root `/sheet-rows`.
-- ✅ FIX: package mount order is aligned to the controlled runtime plan used by `main.py`.
-- ✅ FIX: router mounting is now route-level filtered, so a module can keep valid routes
-      while protected/conflicting routes are skipped.
-- ✅ FIX: `mount(app)` additions are filtered and rolled back at route level when needed.
-- ✅ FIX: snapshot now exposes policy skips, filtered routes, claimed prefixes,
-      prefix owners, and owner conflicts for easier debugging.
+- ✅ ALIGN: canonical owner map stays aligned with the controlled runtime policy
+        used by main.py.
+- ✅ FIX: mount(app) additions are now filtered for disallowed AND duplicate routes
+        at route level, instead of only rolling back the all-duplicate case.
+- ✅ FIX: snapshot now records partial duplicate skips and count fields explicitly.
+- ✅ FIX: route-level append diagnostics track the exact route objects added,
+        improving overlap and route-count reporting.
+- ✅ FIX: package-level policy blocks now also fence root/advanced sheet-row
+        reclaim attempts more consistently for data-dictionary style modules.
+- ✅ FIX: route/debug snapshots include route_signature_count_after_mount to align
+        better with main.py diagnostics.
 
 Optional env controls
 ---------------------
@@ -82,6 +76,18 @@ def _parse_csv(value: str) -> List[str]:
     return [x.strip() for x in s.split(",") if x.strip()]
 
 
+def _dedupe_keep_order(items: Sequence[str]) -> List[str]:
+    out: List[str] = []
+    seen: Set[str] = set()
+    for item in items:
+        s = str(item or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
 def _err_to_str(e: BaseException, limit: int = 2000) -> str:
     try:
         s = f"{type(e).__name__}: {e}"
@@ -101,21 +107,13 @@ def _protected_prefixes() -> List[str]:
             "/v1/advisor,/v1/advanced,/v1/analysis,/v1/schema,/schema,/v1/enriched,/v1/enriched_quote,/v1/enriched-quote,/quote,/quotes,/sheet-rows",
         )
     )
-    out: List[str] = []
-    seen: Set[str] = set()
-    for item in raw:
-        s = item.strip()
-        if not s or s in seen:
-            continue
-        seen.add(s)
-        out.append(s)
-    return out
+    return _dedupe_keep_order(raw)
 
 
 def _canonical_owner_map() -> Dict[str, str]:
     """
     Canonical logical owner per protected prefix.
-    The key is the logical RouterSpec.key, not the module name.
+    The value is the logical RouterSpec.key, not the module name.
     """
     return {
         "/v1/advisor": "advisor",
@@ -136,7 +134,7 @@ def _module_route_policies() -> Dict[str, Dict[str, Sequence[str]]]:
     return {
         "routes.data_dictionary": {
             "block_prefixes": ("/v1/schema", "/schema"),
-            "block_exact": ("/sheet-rows",),
+            "block_exact": ("/sheet-rows", "/v1/advanced/sheet-rows"),
         },
         "routes.analysis_sheet_rows": {
             "allow_prefixes": ("/v1/analysis",),
@@ -202,60 +200,15 @@ def _default_catalog() -> List[RouterSpec]:
     Package-level mount order aligned to the controlled runtime mount plan in main.py.
     """
     return [
-        RouterSpec(
-            key="config",
-            candidates=("routes.config",),
-            required=False,
-            priority=10,
-        ),
-        RouterSpec(
-            key="data_dictionary",
-            candidates=("routes.data_dictionary",),
-            required=False,
-            priority=20,
-        ),
-        RouterSpec(
-            key="analysis_sheet_rows",
-            candidates=("routes.analysis_sheet_rows",),
-            required=False,
-            priority=30,
-        ),
-        RouterSpec(
-            key="advanced_analysis",
-            candidates=("routes.advanced_analysis",),
-            required=False,
-            priority=40,
-        ),
-        RouterSpec(
-            key="ai_analysis",
-            candidates=("routes.ai_analysis",),
-            required=False,
-            priority=50,
-        ),
-        RouterSpec(
-            key="advisor",
-            candidates=("routes.advisor",),
-            required=False,
-            priority=60,
-        ),
-        RouterSpec(
-            key="investment_advisor",
-            candidates=("routes.investment_advisor",),
-            required=False,
-            priority=70,
-        ),
-        RouterSpec(
-            key="enriched_quote",
-            candidates=("routes.enriched_quote",),
-            required=False,
-            priority=80,
-        ),
-        RouterSpec(
-            key="routes_argaam",
-            candidates=("routes.routes_argaam",),
-            required=False,
-            priority=90,
-        ),
+        RouterSpec("config", ("routes.config",), required=False, priority=10),
+        RouterSpec("data_dictionary", ("routes.data_dictionary",), required=False, priority=20),
+        RouterSpec("analysis_sheet_rows", ("routes.analysis_sheet_rows",), required=False, priority=30),
+        RouterSpec("advanced_analysis", ("routes.advanced_analysis",), required=False, priority=40),
+        RouterSpec("ai_analysis", ("routes.ai_analysis",), required=False, priority=50),
+        RouterSpec("advisor", ("routes.advisor",), required=False, priority=60),
+        RouterSpec("investment_advisor", ("routes.investment_advisor",), required=False, priority=70),
+        RouterSpec("enriched_quote", ("routes.enriched_quote",), required=False, priority=80),
+        RouterSpec("routes_argaam", ("routes.routes_argaam",), required=False, priority=90),
     ]
 
 
@@ -314,13 +267,10 @@ def _filter_resolved_entries(entries: Sequence[Dict[str, Any]]) -> List[Dict[str
         key = _norm_name(str(entry.get("key") or ""))
         module = _norm_name(str(entry.get("module") or ""))
 
-        if include:
-            if key not in include and module not in include:
-                continue
-
-        if exclude:
-            if key in exclude or module in exclude:
-                continue
+        if include and key not in include and module not in include:
+            continue
+        if exclude and (key in exclude or module in exclude):
+            continue
 
         filtered.append(dict(entry))
 
@@ -331,15 +281,7 @@ def _filter_resolved_entries(entries: Sequence[Dict[str, Any]]) -> List[Dict[str
 def get_mount_plan() -> List[str]:
     resolved, _missing_required = _resolve_catalog(_default_catalog())
     resolved = _filter_resolved_entries(resolved)
-    plan = [str(x["module"]) for x in resolved if x.get("module")]
-
-    seen: Set[str] = set()
-    out: List[str] = []
-    for m in plan:
-        if m not in seen:
-            seen.add(m)
-            out.append(m)
-    return out
+    return _dedupe_keep_order([str(x["module"]) for x in resolved if x.get("module")])
 
 
 # ======================================================================================
@@ -429,6 +371,10 @@ def _route_paths_from_routes(routes: Sequence[Any]) -> List[str]:
 
 def _app_route_signature_set(app: Any) -> Set[Tuple[str, str]]:
     return _route_signature_set_from_routes(getattr(app, "routes", []) or [])
+
+
+def _route_signature_count(app: Any) -> int:
+    return len(_app_route_signature_set(app))
 
 
 def _router_route_paths(router: Any) -> List[str]:
@@ -559,6 +505,7 @@ def _get_or_init_snapshot_store(app: Any) -> Dict[str, Any]:
     snap = {
         "mounted_modules": [],
         "duplicate_skips": [],
+        "partial_duplicate_skips": [],
         "conflict_skips": [],
         "policy_skips": [],
         "missing_modules": [],
@@ -576,13 +523,13 @@ def _get_or_init_snapshot_store(app: Any) -> Dict[str, Any]:
         "claimed_prefixes": {},
         "owner_conflicts": {},
         "policy_filtered_routes": {},
+        "route_signature_count_after_mount": 0,
     }
     try:
         if hasattr(app, "state"):
             existing = getattr(app.state, "routes_snapshot", None)
             if isinstance(existing, dict):
-                for k, v in existing.items():
-                    snap[k] = v
+                snap.update(existing)
     except Exception:
         pass
     return snap
@@ -618,6 +565,7 @@ def _append_router_routes_filtered(app: Any, router_obj: Any, module_name: str) 
     filtered_out = 0
     filtered_paths: List[str] = []
     added_paths: List[str] = []
+    added_routes: List[Any] = []
 
     for route in list(getattr(router_obj, "routes", []) or []):
         path = str(getattr(route, "path", "") or "")
@@ -649,6 +597,7 @@ def _append_router_routes_filtered(app: Any, router_obj: Any, module_name: str) 
         app.router.routes.append(route)
         existing.update(sigs)
         added += 1
+        added_routes.append(route)
         if path:
             added_paths.append(path)
 
@@ -658,9 +607,39 @@ def _append_router_routes_filtered(app: Any, router_obj: Any, module_name: str) 
         "duplicate_skips": duplicate_skips,
         "partial_duplicate_skips": partial_duplicate_skips,
         "filtered_out": filtered_out,
-        "filtered_paths": filtered_paths,
-        "added_paths": added_paths,
+        "filtered_paths": _dedupe_keep_order(filtered_paths),
+        "added_paths": _dedupe_keep_order(added_paths),
+        "added_routes": added_routes,
     }
+
+
+def _split_added_routes_by_duplicate(
+    existing_sigs: Set[Tuple[str, str]],
+    added_routes: Sequence[Any],
+) -> Tuple[List[Any], List[Any], List[Any]]:
+    kept: List[Any] = []
+    duplicate_only: List[Any] = []
+    partial_duplicate: List[Any] = []
+    seen_existing = set(existing_sigs)
+
+    for route in added_routes or []:
+        sigs = _route_signature_pairs_from_route(route)
+        if not sigs:
+            kept.append(route)
+            continue
+
+        overlap = sigs & seen_existing
+        if overlap == sigs:
+            duplicate_only.append(route)
+            continue
+        if overlap:
+            partial_duplicate.append(route)
+            continue
+
+        kept.append(route)
+        seen_existing.update(sigs)
+
+    return kept, duplicate_only, partial_duplicate
 
 
 # ======================================================================================
@@ -712,14 +691,17 @@ def _mount_one(
                     "route_count": len(getattr(router, "routes", []) or []),
                     "claimed_prefixes": claimed_prefixes,
                     "owner_conflicts": owner_conflicts,
+                    "policy_filtered_routes": [],
+                    "duplicate_skips": 0,
+                    "partial_duplicate_skips": 0,
+                    "filtered_out": 0,
                 }
 
             existing_before = _app_route_signature_set(app)
             append_stats = _append_router_routes_filtered(app, router, module_name)
-            added_paths = list(append_stats.get("added_paths", []) or [])
-            added_sigs = _route_signature_set_from_routes(
-                [r for r in list(getattr(app, "routes", []) or []) if str(getattr(r, "path", "") or "") in set(added_paths)]
-            )
+            added_routes = list(append_stats.get("added_routes", []) or [])
+            added_sigs = _route_signature_set_from_routes(added_routes)
+
             details = {
                 "route_count": len(getattr(router, "routes", []) or []),
                 "prefix": str(getattr(router, "prefix", "") or ""),
@@ -735,6 +717,8 @@ def _mount_one(
             if details["added_count"] <= 0:
                 if details["filtered_out"] > 0:
                     return True, None, "policy_skip", details
+                if details["partial_duplicate_skips"] > 0:
+                    return True, None, "partial_duplicate_skip", details
                 return True, None, "duplicate_skip", details
 
             return True, None, source, details
@@ -749,17 +733,31 @@ def _mount_one(
             after_routes = list(getattr(app, "routes", []) or [])
             added_routes = [r for r in after_routes if id(r) not in before_ids]
             if not added_routes:
-                return True, None, "mount_fn", {"route_count": 0, "claimed_prefixes": [], "policy_filtered_routes": []}
+                return True, None, "mount_fn", {
+                    "route_count": 0,
+                    "claimed_prefixes": [],
+                    "policy_filtered_routes": [],
+                    "duplicate_skips": 0,
+                    "partial_duplicate_skips": 0,
+                    "filtered_out": 0,
+                }
 
             disallowed_routes = [
                 r for r in added_routes if not _path_allowed_for_module(module_name, str(getattr(r, "path", "") or ""))
             ]
             if disallowed_routes:
                 _remove_added_routes(app, disallowed_routes)
-                added_routes = [r for r in added_routes if id(r) not in {id(x) for x in disallowed_routes}]
 
-            added_paths = _route_paths_from_routes(added_routes)
-            claimed_prefixes = _claimed_protected_prefixes_from_paths(added_paths, protected_prefixes)
+            remaining_routes = [r for r in added_routes if id(r) not in {id(x) for x in disallowed_routes}]
+            kept_routes, duplicate_routes, partial_duplicate_routes = _split_added_routes_by_duplicate(before_sigs, remaining_routes)
+
+            if duplicate_routes:
+                _remove_added_routes(app, duplicate_routes)
+            if partial_duplicate_routes:
+                _remove_added_routes(app, partial_duplicate_routes)
+
+            kept_paths = _route_paths_from_routes(kept_routes)
+            claimed_prefixes = _claimed_protected_prefixes_from_paths(kept_paths, protected_prefixes)
 
             owner_conflicts = _owner_conflicts_for_claimed_prefixes(
                 module_key=module_key,
@@ -770,32 +768,39 @@ def _mount_one(
                 canonical_owner_map=canonical_owner_map,
             )
             if owner_conflicts:
-                _remove_added_routes(app, added_routes)
+                _remove_added_routes(app, kept_routes)
                 return True, None, "conflict_skip", {
                     "reason": "mount_fn_protected_prefix_owner_conflict",
-                    "route_count": len(added_routes),
+                    "route_count": len(kept_routes),
                     "claimed_prefixes": claimed_prefixes,
                     "policy_filtered_routes": _route_paths_from_routes(disallowed_routes),
                     "owner_conflicts": owner_conflicts,
+                    "duplicate_skips": len(duplicate_routes),
+                    "partial_duplicate_skips": len(partial_duplicate_routes),
+                    "filtered_out": len(disallowed_routes),
                 }
 
-            added_sigs = _route_signature_set_from_routes(added_routes)
-            duplicate_only = added_sigs.issubset(before_sigs)
-            if duplicate_only:
-                _remove_added_routes(app, added_routes)
-                return True, None, "duplicate_skip", {
-                    "reason": "mount_fn_added_only_duplicate_routes",
-                    "route_count": len(added_sigs),
-                    "claimed_prefixes": claimed_prefixes,
-                    "policy_filtered_routes": _route_paths_from_routes(disallowed_routes),
-                }
-
-            return True, None, "mount_fn", {
-                "route_count": len(added_sigs),
+            kept_sigs = _route_signature_set_from_routes(kept_routes)
+            details = {
+                "route_count": len(kept_sigs),
                 "claimed_prefixes": claimed_prefixes,
                 "policy_filtered_routes": _route_paths_from_routes(disallowed_routes),
-                **_overlap_details(before_sigs, added_sigs, protected_prefixes),
+                "duplicate_skips": len(duplicate_routes),
+                "partial_duplicate_skips": len(partial_duplicate_routes),
+                "filtered_out": len(disallowed_routes),
+                **_overlap_details(before_sigs, kept_sigs, protected_prefixes),
             }
+
+            if not kept_routes:
+                if details["filtered_out"] > 0:
+                    return True, None, "policy_skip", details
+                if details["partial_duplicate_skips"] > 0:
+                    return True, None, "partial_duplicate_skip", details
+                if details["duplicate_skips"] > 0:
+                    return True, None, "duplicate_skip", details
+                return True, None, "mount_fn", details
+
+            return True, None, "mount_fn", details
 
         return False, "No router export and no mount(app) function found", "no_router", {}
 
@@ -834,6 +839,7 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
 
     mounted: List[str] = []
     duplicate_skips: List[str] = []
+    partial_duplicate_skips: List[str] = []
     conflict_skips: List[str] = []
     policy_skips: List[str] = []
     missing: List[str] = []
@@ -860,13 +866,7 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
             priority_map[str(module_name)] = priority
             plan_modules.append(str(module_name))
 
-    seen_plan: Set[str] = set()
-    plan_modules_unique: List[str] = []
-    for m in plan_modules:
-        if m not in seen_plan:
-            seen_plan.add(m)
-            plan_modules_unique.append(m)
-
+    plan_modules_unique = _dedupe_keep_order(plan_modules)
     prefix_owners: Dict[str, str] = dict(snap.get("prefix_owners", {}) or {})
 
     for entry in resolved_entries:
@@ -909,6 +909,8 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
         if ok:
             if mode == "duplicate_skip":
                 duplicate_skips.append(module_name)
+            elif mode == "partial_duplicate_skip":
+                partial_duplicate_skips.append(module_name)
             elif mode == "conflict_skip":
                 conflict_skips.append(module_name)
             elif mode == "policy_skip":
@@ -932,7 +934,6 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
                     }
             except Exception:
                 pass
-
             continue
 
         if mode == "import_error" or (err and "modulenotfounderror" in err.lower()):
@@ -952,6 +953,8 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
         "mounted_count": len(mounted),
         "duplicate_skips": duplicate_skips,
         "duplicate_skips_count": len(duplicate_skips),
+        "partial_duplicate_skips": partial_duplicate_skips,
+        "partial_duplicate_skips_count": len(partial_duplicate_skips),
         "conflict_skips": conflict_skips,
         "conflict_skips_count": len(conflict_skips),
         "policy_skips": policy_skips,
@@ -976,6 +979,7 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
         "catalog_keys": [spec.key for spec in sorted(catalog, key=lambda s: (int(s.priority), s.key))],
         "resolved_entries": resolved_entries,
         "openapi_route_count_after_mount": len(getattr(app, "routes", []) or []),
+        "route_signature_count_after_mount": _route_signature_count(app),
         "protected_prefixes": protected_prefixes,
         "canonical_owner_map": canonical_owner_map,
         "prefix_owners": prefix_owners,
@@ -986,9 +990,10 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
     }
 
     logger.info(
-        "Routes mount summary: mounted=%s duplicate_skips=%s conflict_skips=%s policy_skips=%s missing=%s failed=%s strict=%s",
+        "Routes mount summary: mounted=%s duplicate_skips=%s partial_duplicate_skips=%s conflict_skips=%s policy_skips=%s missing=%s failed=%s strict=%s",
         len(mounted),
         len(duplicate_skips),
+        len(partial_duplicate_skips),
         len(conflict_skips),
         len(policy_skips),
         len(missing),
@@ -1014,6 +1019,8 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
         logger.warning("Routers with no router/mount: %s", json.dumps(no_router, ensure_ascii=False))
     if duplicate_skips:
         logger.info("Duplicate router skips: %s", ", ".join(duplicate_skips))
+    if partial_duplicate_skips:
+        logger.info("Partial duplicate router skips: %s", ", ".join(partial_duplicate_skips))
     if conflict_skips:
         logger.info("Conflict router skips: %s", ", ".join(conflict_skips))
     if policy_skips:
