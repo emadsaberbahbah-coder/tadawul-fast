@@ -2,36 +2,29 @@
 """
 core/yahoo_chart_provider.py
 ================================================================================
-YAHOO CHART COMPATIBILITY SHIM — v4.0.0
+YAHOO CHART COMPATIBILITY SHIM — v4.1.0
 ================================================================================
 SAFE • STARTUP-FRIENDLY • CANONICAL-DELEGATING • HISTORY-AWARE •
 COMMODITY/FX-TOLERANT • ROUTE/ENGINE COMPATIBLE
 
 Purpose
 -------
-This module is a compatibility shim for legacy imports that still reference
+Compatibility shim for legacy imports that still reference
 `core.yahoo_chart_provider` instead of the canonical provider module.
 
-Design goals
-------------
-- Never perform network or event-loop work at import time.
-- Prefer the canonical provider when available:
-    - core.providers.yahoo_chart_provider
-    - providers.yahoo_chart_provider
-- Remain safe when the canonical provider is missing or temporarily broken.
-- Normalize weak chart/history payloads into useful outputs for callers.
-- Help upstream engine routes by recovering quote-like fields from history.
-- Preserve a broad compatibility surface for function-based and class-based code.
-
-Why this revision
------------------
-- FIX: normalize Yahoo chart payloads (`chart.result[0]...`) into usable rows.
-- FIX: derive quote fields from history when quote payloads are sparse.
-- FIX: stronger commodity / FX defaults for symbol class, exchange, and labels.
-- FIX: merge patch/base payloads more safely instead of overwriting useful fields.
-- FIX: keep return shapes stable for both dict-style quote calls and list-style
-  history calls, even when the canonical provider returns mixed payloads.
-- FIX: add more tolerant legacy method resolution and result coercion.
+What this revision improves
+---------------------------
+- FIX: stronger normalization from nested Yahoo payloads:
+      - chart.result[0].meta / indicators
+      - quoteResponse.result[0]
+      - spark.result[0].response[0].meta
+      - rows/history/prices/items/records
+- FIX: derives quote-like fields from history more aggressively when live quote
+      payloads are sparse, especially for commodities / FX.
+- FIX: preserves non-empty base fields when patch-style calls return weak data.
+- FIX: broader commodity/FX identity defaults and display-name normalization.
+- FIX: safer compatibility wrapper for class-based callers.
+- FIX: keeps import-time behavior network-safe and startup-safe.
 """
 
 from __future__ import annotations
@@ -46,17 +39,18 @@ import re
 import sys
 import threading
 import time
-from dataclasses import dataclass, field, is_dataclass, asdict
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from functools import lru_cache
+from importlib import import_module
 from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, TypeVar, Union
 
 # =============================================================================
 # Versioning / constants
 # =============================================================================
 
-SHIM_VERSION = "4.0.0"
+SHIM_VERSION = "4.1.0"
 VERSION = SHIM_VERSION
 PROVIDER_VERSION = SHIM_VERSION
 DATA_SOURCE = "yahoo_chart"
@@ -78,8 +72,13 @@ PRICE_FIELD_ALIASES = (
     "current_price",
     "price",
     "last_price",
+    "last",
     "regularMarketPrice",
     "regular_market_price",
+    "postMarketPrice",
+    "preMarketPrice",
+    "bid",
+    "ask",
     "close",
     "last_close",
 )
@@ -88,11 +87,12 @@ PREV_CLOSE_ALIASES = (
     "prev_close",
     "regularMarketPreviousClose",
     "chartPreviousClose",
+    "previousClose",
 )
 OPEN_ALIASES = ("open", "regularMarketOpen")
-HIGH_ALIASES = ("day_high", "high", "regularMarketDayHigh")
-LOW_ALIASES = ("day_low", "low", "regularMarketDayLow")
-VOLUME_ALIASES = ("volume", "regularMarketVolume")
+HIGH_ALIASES = ("day_high", "high", "regularMarketDayHigh", "fiftyTwoWeekHigh", "dayHigh")
+LOW_ALIASES = ("day_low", "low", "regularMarketDayLow", "fiftyTwoWeekLow", "dayLow")
+VOLUME_ALIASES = ("volume", "regularMarketVolume", "averageDailyVolume3Month", "avgVolume")
 NAME_ALIASES = (
     "name",
     "shortName",
@@ -107,7 +107,6 @@ EXCHANGE_ALIASES = (
     "market",
 )
 CURRENCY_ALIASES = ("currency", "financialCurrency")
-
 HISTORY_ROW_KEYS = (
     "timestamp",
     "date",
@@ -121,7 +120,7 @@ HISTORY_ROW_KEYS = (
 )
 
 # =============================================================================
-# Small helpers
+# Env helpers / time helpers
 # =============================================================================
 
 
@@ -136,7 +135,6 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return default
 
 
-
 def _env_int(name: str, default: int, lo: Optional[int] = None, hi: Optional[int] = None) -> int:
     try:
         value = int(float((os.getenv(name) or str(default)).strip()))
@@ -147,7 +145,6 @@ def _env_int(name: str, default: int, lo: Optional[int] = None, hi: Optional[int
     if hi is not None:
         value = min(hi, value)
     return value
-
 
 
 def _env_float(name: str, default: float, lo: Optional[float] = None, hi: Optional[float] = None) -> float:
@@ -162,13 +159,11 @@ def _env_float(name: str, default: float, lo: Optional[float] = None, hi: Option
     return value
 
 
-
 def _utc_iso(dt: Optional[datetime] = None) -> str:
     d = dt or datetime.now(UTC)
     if d.tzinfo is None:
         d = d.replace(tzinfo=UTC)
     return d.astimezone(UTC).isoformat()
-
 
 
 def _riyadh_iso(dt: Optional[datetime] = None) -> str:
@@ -178,252 +173,17 @@ def _riyadh_iso(dt: Optional[datetime] = None) -> str:
     return d.astimezone(RIYADH).isoformat()
 
 
-
-def _safe_symbol(value: Any) -> str:
-    try:
-        return str(value or "").strip().upper()
-    except Exception:
-        return ""
-
-
-
-def _nonempty_count(obj: Any) -> int:
-    if not isinstance(obj, dict):
-        return 0
-    total = 0
-    for value in obj.values():
-        if _is_nonempty(value):
-            total += 1
-    return total
-
-
-
-def _extract_version_parts(value: str) -> Tuple[int, int, int]:
-    raw = str(value or "").strip()
-    nums = re.findall(r"\d+", raw)
-    parts = [int(x) for x in nums[:3]]
-    while len(parts) < 3:
-        parts.append(0)
-    return (parts[0], parts[1], parts[2])
-
-
-
-def _version_tuple(value: str) -> Tuple[int, int, int]:
-    try:
-        return _extract_version_parts(value)
-    except Exception:
-        return (0, 0, 0)
-
-
-
-def _is_nonempty(value: Any) -> bool:
-    if value is None:
-        return False
-    if value == 0:
-        return True
-    if value is False:
-        return True
-    if isinstance(value, float) and math.isnan(value):
-        return False
-    if isinstance(value, str) and not value.strip():
-        return False
-    if isinstance(value, (list, tuple, set, dict)) and len(value) == 0:
-        return False
-    return True
-
-
-
-def _coerce_float(value: Any) -> Optional[float]:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return float(value)
-    if isinstance(value, (int, float)):
-        try:
-            if isinstance(value, float) and math.isnan(value):
-                return None
-            return float(value)
-        except Exception:
-            return None
-    try:
-        text = str(value).strip().replace(",", "")
-        if not text or text.lower() in {"none", "nan", "null", "n/a", "na"}:
-            return None
-        return float(text)
-    except Exception:
-        return None
-
-
-
-def _coerce_int(value: Any) -> Optional[int]:
-    num = _coerce_float(value)
-    if num is None:
-        return None
-    try:
-        return int(num)
-    except Exception:
-        return None
-
-
-
-def _safe_get(mapping: Any, *keys: str, default: Any = None) -> Any:
-    if not isinstance(mapping, dict):
-        return default
-    for key in keys:
-        if key in mapping and mapping[key] is not None:
-            return mapping[key]
-    return default
-
-
-
-def _deep_get(mapping: Any, path: Sequence[Union[str, int]], default: Any = None) -> Any:
-    cur = mapping
-    try:
-        for part in path:
-            if isinstance(part, int):
-                if not isinstance(cur, (list, tuple)) or part >= len(cur):
-                    return default
-                cur = cur[part]
-            else:
-                if not isinstance(cur, dict) or part not in cur:
-                    return default
-                cur = cur[part]
-        return cur
-    except Exception:
-        return default
-
-
-
-def _to_dict(value: Any) -> Dict[str, Any]:
-    if value is None:
-        return {}
-    if isinstance(value, dict):
-        return dict(value)
-    if is_dataclass(value):
-        try:
-            return asdict(value)
-        except Exception:
-            return {}
-    if hasattr(value, "model_dump"):
-        try:
-            dumped = value.model_dump()  # pydantic v2
-            return dict(dumped) if isinstance(dumped, dict) else {}
-        except Exception:
-            pass
-    if hasattr(value, "dict"):
-        try:
-            dumped = value.dict()  # pydantic v1
-            return dict(dumped) if isinstance(dumped, dict) else {}
-        except Exception:
-            pass
-    if hasattr(value, "__dict__"):
-        try:
-            raw = vars(value)
-            return dict(raw) if isinstance(raw, dict) else {}
-        except Exception:
-            return {}
-    return {}
-
-
-
-def _merge_nonempty(base: Optional[Dict[str, Any]], patch: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    out = dict(base or {})
-    for key, value in (patch or {}).items():
-        if _is_nonempty(value) or key not in out:
-            out[key] = value
-    return out
-
-
-
-def _symbol_kind(symbol: str) -> str:
-    sym = _safe_symbol(symbol)
-    if not sym:
-        return "unknown"
-    if sym.endswith("=X"):
-        return "fx"
-    if "-USD" in sym or sym.endswith("USD") and "=" not in sym and "." not in sym and len(sym) <= 10:
-        return "crypto"
-    if sym.endswith("=F"):
-        return "future"
-    if sym.endswith(".SR"):
-        return "ksa_equity"
-    if any(ch in sym for ch in ("ETF",)):
-        return "fund"
-    return "equity"
-
-
-
-def _identity_defaults_for_symbol(symbol: str) -> Dict[str, Any]:
-    sym = _safe_symbol(symbol)
-    kind = _symbol_kind(sym)
-    defaults: Dict[str, Any] = {
-        "symbol": sym,
-        "symbol_normalized": sym,
-        "requested_symbol": sym,
-    }
-
-    if kind == "fx":
-        pair = sym.replace("=X", "")
-        if len(pair) == 6:
-            name = f"{pair[:3]}/{pair[3:]}"
-        else:
-            name = sym
-        defaults.update(
-            {
-                "name": name,
-                "asset_class": "FX",
-                "exchange": "FX",
-                "currency": pair[3:] if len(pair) == 6 else None,
-                "country": "Global",
-                "sector": "Foreign Exchange",
-                "industry": "Currency Pair",
-            }
-        )
-    elif kind == "future":
-        name_map = {
-            "GC=F": "Gold Futures",
-            "SI=F": "Silver Futures",
-            "HG=F": "Copper Futures",
-            "CL=F": "Crude Oil Futures",
-            "BZ=F": "Brent Crude Futures",
-            "NG=F": "Natural Gas Futures",
-        }
-        defaults.update(
-            {
-                "name": name_map.get(sym, sym),
-                "asset_class": "Commodity",
-                "exchange": "Futures",
-                "currency": "USD",
-                "country": "Global",
-                "sector": "Commodities",
-                "industry": "Futures Contract",
-            }
-        )
-    elif kind == "crypto":
-        defaults.update(
-            {
-                "asset_class": "Crypto",
-                "exchange": "Crypto",
-                "country": "Global",
-                "sector": "Digital Assets",
-                "industry": "Cryptocurrency",
-            }
-        )
-    elif kind == "ksa_equity":
-        defaults.update(
-            {
-                "asset_class": "Equity",
-                "exchange": "Tadawul",
-                "currency": "SAR",
-                "country": "Saudi Arabia",
-            }
-        )
-    return defaults
-
-
 # =============================================================================
-# JSON helpers (optional orjson)
+# Logging / optional JSON / metrics / tracing
 # =============================================================================
+
+_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
+logging.basicConfig(
+    level=getattr(logging, _LOG_LEVEL, logging.INFO),
+    format="%(asctime)s | %(levelname)8s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("core.yahoo_chart_shim")
+
 try:
     import orjson  # type: ignore
 
@@ -446,21 +206,6 @@ except Exception:
             v = v.decode("utf-8", errors="replace")
         return json.loads(v)
 
-
-# =============================================================================
-# Logging
-# =============================================================================
-_LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
-logging.basicConfig(
-    level=getattr(logging, _LOG_LEVEL, logging.INFO),
-    format="%(asctime)s | %(levelname)8s | %(name)s | %(message)s",
-)
-logger = logging.getLogger("core.yahoo_chart_shim")
-
-
-# =============================================================================
-# Prometheus (optional)
-# =============================================================================
 try:
     from prometheus_client import Counter, Gauge, Histogram  # type: ignore
 
@@ -501,10 +246,6 @@ except Exception:
     shim_provider_available = _DummyMetric()
     shim_cb_state = _DummyMetric()
 
-
-# =============================================================================
-# OpenTelemetry (optional)
-# =============================================================================
 try:
     from opentelemetry import trace  # type: ignore
     from opentelemetry.trace import Status, StatusCode  # type: ignore
@@ -569,8 +310,10 @@ class TraceContext:
 
 
 # =============================================================================
-# Data Quality
+# Data quality / telemetry
 # =============================================================================
+
+
 class DataQuality(str, Enum):
     EXCELLENT = "EXCELLENT"
     HIGH = "HIGH"
@@ -583,9 +326,6 @@ class DataQuality(str, Enum):
     ERROR = "ERROR"
 
 
-# =============================================================================
-# Telemetry (in-memory, thread-safe)
-# =============================================================================
 @dataclass(slots=True)
 class CallMetrics:
     fn: str
@@ -667,8 +407,154 @@ def _track(fn_name: str, start_mono: float, ok: bool, err: Optional[BaseExceptio
 
 
 # =============================================================================
-# Result normalization helpers
+# General helpers
 # =============================================================================
+
+
+def _safe_symbol(value: Any) -> str:
+    try:
+        return str(value or "").strip().upper()
+    except Exception:
+        return ""
+
+
+def _extract_version_parts(value: str) -> Tuple[int, int, int]:
+    raw = str(value or "").strip()
+    nums = re.findall(r"\d+", raw)
+    parts = [int(x) for x in nums[:3]]
+    while len(parts) < 3:
+        parts.append(0)
+    return (parts[0], parts[1], parts[2])
+
+
+def _version_tuple(value: str) -> Tuple[int, int, int]:
+    try:
+        return _extract_version_parts(value)
+    except Exception:
+        return (0, 0, 0)
+
+
+def _is_nonempty(value: Any) -> bool:
+    if value is None:
+        return False
+    if value == 0:
+        return True
+    if value is False:
+        return True
+    if isinstance(value, float) and math.isnan(value):
+        return False
+    if isinstance(value, str) and not value.strip():
+        return False
+    if isinstance(value, (list, tuple, set, dict)) and len(value) == 0:
+        return False
+    return True
+
+
+def _nonempty_count(obj: Any) -> int:
+    if not isinstance(obj, dict):
+        return 0
+    total = 0
+    for value in obj.values():
+        if _is_nonempty(value):
+            total += 1
+    return total
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return float(value)
+    if isinstance(value, (int, float)):
+        try:
+            if isinstance(value, float) and math.isnan(value):
+                return None
+            return float(value)
+        except Exception:
+            return None
+    try:
+        text = str(value).strip().replace(",", "")
+        if not text or text.lower() in {"none", "nan", "null", "n/a", "na"}:
+            return None
+        return float(text)
+    except Exception:
+        return None
+
+
+def _coerce_int(value: Any) -> Optional[int]:
+    num = _coerce_float(value)
+    if num is None:
+        return None
+    try:
+        return int(num)
+    except Exception:
+        return None
+
+
+def _safe_get(mapping: Any, *keys: str, default: Any = None) -> Any:
+    if not isinstance(mapping, dict):
+        return default
+    for key in keys:
+        if key in mapping and mapping[key] is not None:
+            return mapping[key]
+    return default
+
+
+def _deep_get(mapping: Any, path: Sequence[Union[str, int]], default: Any = None) -> Any:
+    cur = mapping
+    try:
+        for part in path:
+            if isinstance(part, int):
+                if not isinstance(cur, (list, tuple)) or part >= len(cur):
+                    return default
+                cur = cur[part]
+            else:
+                if not isinstance(cur, dict) or part not in cur:
+                    return default
+                cur = cur[part]
+        return cur
+    except Exception:
+        return default
+
+
+def _to_dict(value: Any) -> Dict[str, Any]:
+    if value is None:
+        return {}
+    if isinstance(value, dict):
+        return dict(value)
+    if is_dataclass(value):
+        try:
+            return asdict(value)
+        except Exception:
+            return {}
+    if hasattr(value, "model_dump"):
+        try:
+            dumped = value.model_dump()  # pydantic v2
+            return dict(dumped) if isinstance(dumped, dict) else {}
+        except Exception:
+            pass
+    if hasattr(value, "dict"):
+        try:
+            dumped = value.dict()  # pydantic v1
+            return dict(dumped) if isinstance(dumped, dict) else {}
+        except Exception:
+            pass
+    if hasattr(value, "__dict__"):
+        try:
+            raw = vars(value)
+            return dict(raw) if isinstance(raw, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _merge_nonempty(base: Optional[Dict[str, Any]], patch: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    out = dict(base or {})
+    for key, value in (patch or {}).items():
+        if _is_nonempty(value) or key not in out:
+            out[key] = value
+    return out
+
 
 def _normalize_timestamp(value: Any) -> Optional[str]:
     if value is None:
@@ -693,6 +579,115 @@ def _normalize_timestamp(value: Any) -> Optional[str]:
         return text
 
 
+# =============================================================================
+# Symbol classification / defaults
+# =============================================================================
+
+
+def _symbol_kind(symbol: str) -> str:
+    sym = _safe_symbol(symbol)
+    if not sym:
+        return "unknown"
+    if sym.endswith("=X"):
+        return "fx"
+    if "-USD" in sym or (sym.endswith("USD") and "=" not in sym and "." not in sym and len(sym) <= 10):
+        return "crypto"
+    if sym.endswith("=F"):
+        return "future"
+    if sym.endswith(".SR"):
+        return "ksa_equity"
+    if any(tag in sym for tag in ("ETF", "VOO", "VTI", "QQQ", "SPY")):
+        return "fund"
+    return "equity"
+
+
+def _fx_display_name(sym: str) -> str:
+    root = sym.replace("=X", "")
+    if len(root) == 6:
+        return f"{root[:3]}/{root[3:]}"
+    if len(root) == 3:
+        return f"{root}/USD"
+    return sym
+
+
+def _identity_defaults_for_symbol(symbol: str) -> Dict[str, Any]:
+    sym = _safe_symbol(symbol)
+    kind = _symbol_kind(sym)
+    defaults: Dict[str, Any] = {
+        "symbol": sym,
+        "symbol_normalized": sym,
+        "requested_symbol": sym,
+    }
+
+    if kind == "fx":
+        root = sym.replace("=X", "")
+        defaults.update(
+            {
+                "name": _fx_display_name(sym),
+                "asset_class": "FX",
+                "exchange": "FX",
+                "currency": root[3:] if len(root) == 6 else "USD",
+                "country": "Global",
+                "sector": "Foreign Exchange",
+                "industry": "Currency Pair",
+            }
+        )
+    elif kind == "future":
+        name_map = {
+            "GC=F": "Gold Futures",
+            "SI=F": "Silver Futures",
+            "HG=F": "Copper Futures",
+            "CL=F": "Crude Oil Futures",
+            "BZ=F": "Brent Crude Futures",
+            "NG=F": "Natural Gas Futures",
+        }
+        defaults.update(
+            {
+                "name": name_map.get(sym, sym),
+                "asset_class": "Commodity",
+                "exchange": "Futures",
+                "currency": "USD",
+                "country": "Global",
+                "sector": "Commodities",
+                "industry": "Futures Contract",
+            }
+        )
+    elif kind == "crypto":
+        defaults.update(
+            {
+                "asset_class": "Crypto",
+                "exchange": "Crypto",
+                "country": "Global",
+                "sector": "Digital Assets",
+                "industry": "Cryptocurrency",
+            }
+        )
+    elif kind == "ksa_equity":
+        defaults.update(
+            {
+                "asset_class": "Equity",
+                "exchange": "Tadawul",
+                "currency": "SAR",
+                "country": "Saudi Arabia",
+            }
+        )
+    elif kind == "fund":
+        defaults.update(
+            {
+                "asset_class": "Fund",
+                "exchange": "ETF",
+                "country": "Global",
+                "sector": "Funds",
+                "industry": "Exchange Traded Fund",
+            }
+        )
+    return defaults
+
+
+# =============================================================================
+# History / quote normalization
+# =============================================================================
+
 
 def _ensure_history_row(row: Dict[str, Any]) -> Dict[str, Any]:
     out = dict(row)
@@ -707,11 +702,11 @@ def _ensure_history_row(row: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
-
 def _rows_from_parallel_arrays(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     timestamps = _deep_get(payload, ["timestamp"], default=None)
     if not isinstance(timestamps, list):
         timestamps = _deep_get(payload, ["timestamps"], default=None)
+
     quotes = _deep_get(payload, ["indicators", "quote", 0], default={})
     adjclose_block = _deep_get(payload, ["indicators", "adjclose", 0], default={})
 
@@ -736,9 +731,33 @@ def _rows_from_parallel_arrays(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             "adj_close": adjs[idx] if idx < len(adjs) else None,
             "volume": vols[idx] if idx < len(vols) else None,
         }
-        rows.append(_ensure_history_row(row))
-    return [r for r in rows if any(_is_nonempty(v) for v in r.values())]
+        row = _ensure_history_row(row)
+        if any(_is_nonempty(v) for v in row.values()):
+            rows.append(row)
+    return rows
 
+
+def _extract_candidate_dicts(payload_dict: Dict[str, Any]) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = [payload_dict]
+
+    paths = [
+        ("meta",),
+        ("price",),
+        ("summaryDetail",),
+        ("defaultKeyStatistics",),
+        ("quoteResponse", "result", 0),
+        ("spark", "result", 0, "response", 0, "meta"),
+        ("chart", "result", 0, "meta"),
+        ("chart", "result", 0),
+        ("result", 0),
+        ("response", 0),
+    ]
+    for path in paths:
+        value = _deep_get(payload_dict, path, default=None)
+        value_dict = _to_dict(value)
+        if value_dict:
+            candidates.append(value_dict)
+    return candidates
 
 
 def _extract_history_rows(payload: Any) -> List[Dict[str, Any]]:
@@ -775,8 +794,14 @@ def _extract_history_rows(payload: Any) -> List[Dict[str, Any]]:
             return rows
 
     chart_root = _deep_get(payload_dict, ["chart", "result", 0], default=None)
-    if chart_root:
+    if isinstance(chart_root, dict):
         rows = _rows_from_parallel_arrays(chart_root)
+        if rows:
+            return rows
+
+    spark_root = _deep_get(payload_dict, ["spark", "result", 0, "response", 0], default=None)
+    if isinstance(spark_root, dict):
+        rows = _rows_from_parallel_arrays(spark_root)
         if rows:
             return rows
 
@@ -787,7 +812,6 @@ def _extract_history_rows(payload: Any) -> List[Dict[str, Any]]:
             return rows
 
     return []
-
 
 
 def _derive_quote_from_rows(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
@@ -801,11 +825,13 @@ def _derive_quote_from_rows(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     closes = [_coerce_float(r.get("close")) for r in cleaned]
     highs = [_coerce_float(r.get("high")) for r in cleaned]
     lows = [_coerce_float(r.get("low")) for r in cleaned]
+    opens = [_coerce_float(r.get("open")) for r in cleaned]
     volumes = [_coerce_int(r.get("volume")) for r in cleaned]
 
     closes_valid = [v for v in closes if v is not None]
     highs_valid = [v for v in highs if v is not None]
     lows_valid = [v for v in lows if v is not None]
+    opens_valid = [v for v in opens if v is not None]
     vols_valid = [v for v in volumes if v is not None]
 
     current = _coerce_float(_safe_get(latest, "close", "adj_close", "adjclose"))
@@ -813,14 +839,19 @@ def _derive_quote_from_rows(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     if previous_close is None and len(closes_valid) >= 2:
         previous_close = closes_valid[-2]
 
+    latest_open = _coerce_float(latest.get("open"))
+    latest_high = _coerce_float(latest.get("high"))
+    latest_low = _coerce_float(latest.get("low"))
+    latest_volume = _coerce_int(latest.get("volume"))
+
     out: Dict[str, Any] = {
         "current_price": current,
         "price": current,
         "previous_close": previous_close,
-        "open": _coerce_float(latest.get("open")),
-        "day_high": _coerce_float(latest.get("high")),
-        "day_low": _coerce_float(latest.get("low")),
-        "volume": _coerce_int(latest.get("volume")),
+        "open": latest_open if latest_open is not None else (opens_valid[-1] if opens_valid else None),
+        "day_high": latest_high if latest_high is not None else current,
+        "day_low": latest_low if latest_low is not None else current,
+        "volume": latest_volume,
         "52w_high": max(highs_valid) if highs_valid else None,
         "52w_low": min(lows_valid) if lows_valid else None,
         "avg_volume_30d": int(sum(vols_valid[-30:]) / len(vols_valid[-30:])) if vols_valid else None,
@@ -839,12 +870,57 @@ def _derive_quote_from_rows(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         hi = max(highs_valid)
         out["52w_position_pct"] = ((current - lo) / (hi - lo)) * 100.0
 
-    return out
+    # Lightweight stats that help the engine fill commodity/FX rows.
+    if len(closes_valid) >= 2:
+        rets: List[float] = []
+        for i in range(1, len(closes_valid)):
+            prev = closes_valid[i - 1]
+            cur = closes_valid[i]
+            if prev not in (None, 0) and cur is not None:
+                rets.append((cur / prev) - 1.0)
+        if rets:
+            mean_ret = sum(rets) / len(rets)
+            if len(rets) >= 2:
+                variance = sum((r - mean_ret) ** 2 for r in rets) / max(1, len(rets) - 1)
+                daily_vol = math.sqrt(max(0.0, variance))
+                out["volatility_30d"] = daily_vol * math.sqrt(min(30, len(rets)))
+                out["volatility_90d"] = daily_vol * math.sqrt(min(90, len(rets)))
+            if current is not None and closes_valid:
+                peak = closes_valid[0]
+                max_drawdown = 0.0
+                for price in closes_valid:
+                    peak = max(peak, price)
+                    if peak not in (None, 0):
+                        dd = (price / peak) - 1.0
+                        max_drawdown = min(max_drawdown, dd)
+                out["max_drawdown_1y"] = max_drawdown
+            if len(rets) >= 5:
+                downside = sorted(rets)[max(0, int(len(rets) * 0.05) - 1)]
+                out["var_95_1d"] = downside
+            if len(rets) >= 5:
+                denom = math.sqrt(sum((r - mean_ret) ** 2 for r in rets) / max(1, len(rets) - 1))
+                if denom > 0:
+                    out["sharpe_1y"] = (mean_ret / denom) * math.sqrt(min(252, len(rets)))
+            if len(closes_valid) >= 15:
+                gains: List[float] = []
+                losses: List[float] = []
+                tail = closes_valid[-15:]
+                for i in range(1, len(tail)):
+                    delta = tail[i] - tail[i - 1]
+                    gains.append(max(delta, 0.0))
+                    losses.append(abs(min(delta, 0.0)))
+                avg_gain = sum(gains) / max(1, len(gains))
+                avg_loss = sum(losses) / max(1, len(losses))
+                if avg_loss == 0 and avg_gain > 0:
+                    out["rsi_14"] = 100.0
+                elif avg_loss > 0:
+                    rs = avg_gain / avg_loss
+                    out["rsi_14"] = 100.0 - (100.0 / (1.0 + rs))
 
+    return {k: v for k, v in out.items() if _is_nonempty(v)}
 
 
 def _derive_quote_from_chart_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    result: Dict[str, Any] = {}
     chart_root = _deep_get(payload, ["chart", "result", 0], default=None)
     if not isinstance(chart_root, dict):
         chart_root = payload
@@ -853,24 +929,21 @@ def _derive_quote_from_chart_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     rows = _rows_from_parallel_arrays(chart_root)
     derived = _derive_quote_from_rows(rows)
 
-    meta_price = _coerce_float(_safe_get(meta, *PRICE_FIELD_ALIASES))
-    meta_prev = _coerce_float(_safe_get(meta, *PREV_CLOSE_ALIASES))
-
-    if meta_price is not None:
-        result["current_price"] = meta_price
-        result["price"] = meta_price
-    if meta_prev is not None:
-        result["previous_close"] = meta_prev
-    result["open"] = _coerce_float(_safe_get(meta, *OPEN_ALIASES))
-    result["day_high"] = _coerce_float(_safe_get(meta, *HIGH_ALIASES))
-    result["day_low"] = _coerce_float(_safe_get(meta, *LOW_ALIASES))
-    result["volume"] = _coerce_int(_safe_get(meta, *VOLUME_ALIASES))
-    result["exchange"] = _safe_get(meta, *EXCHANGE_ALIASES)
-    result["currency"] = _safe_get(meta, *CURRENCY_ALIASES)
-    result["name"] = _safe_get(meta, *NAME_ALIASES)
-    result["52w_high"] = _coerce_float(_safe_get(meta, "fiftyTwoWeekHigh", "fifty_two_week_high", "52w_high"))
-    result["52w_low"] = _coerce_float(_safe_get(meta, "fiftyTwoWeekLow", "fifty_two_week_low", "52w_low"))
-    result["market_state"] = _safe_get(meta, "marketState", "market_state")
+    result: Dict[str, Any] = {
+        "current_price": _coerce_float(_safe_get(meta, *PRICE_FIELD_ALIASES)),
+        "price": _coerce_float(_safe_get(meta, *PRICE_FIELD_ALIASES)),
+        "previous_close": _coerce_float(_safe_get(meta, *PREV_CLOSE_ALIASES)),
+        "open": _coerce_float(_safe_get(meta, *OPEN_ALIASES)),
+        "day_high": _coerce_float(_safe_get(meta, *HIGH_ALIASES)),
+        "day_low": _coerce_float(_safe_get(meta, *LOW_ALIASES)),
+        "volume": _coerce_int(_safe_get(meta, *VOLUME_ALIASES)),
+        "exchange": _safe_get(meta, *EXCHANGE_ALIASES),
+        "currency": _safe_get(meta, *CURRENCY_ALIASES),
+        "name": _safe_get(meta, *NAME_ALIASES),
+        "52w_high": _coerce_float(_safe_get(meta, "fiftyTwoWeekHigh", "fifty_two_week_high", "52w_high")),
+        "52w_low": _coerce_float(_safe_get(meta, "fiftyTwoWeekLow", "fifty_two_week_low", "52w_low")),
+        "market_state": _safe_get(meta, "marketState", "market_state"),
+    }
 
     result = _merge_nonempty(derived, result)
 
@@ -882,7 +955,6 @@ def _derive_quote_from_chart_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         result.setdefault("percent_change", (price_change / prev) * 100.0)
 
     return {k: v for k, v in result.items() if _is_nonempty(v)}
-
 
 
 def _classify_quality(payload: Dict[str, Any]) -> str:
@@ -898,7 +970,6 @@ def _classify_quality(payload: Dict[str, Any]) -> str:
     if payload.get("error"):
         return DataQuality.ERROR.value
     return DataQuality.LOW.value
-
 
 
 def _normalize_quote_payload(payload: Any, *, symbol: str) -> Dict[str, Any]:
@@ -917,37 +988,41 @@ def _normalize_quote_payload(payload: Any, *, symbol: str) -> Dict[str, Any]:
 
     out = dict(defaults)
 
-    # direct quote-ish fields
-    for alias in NAME_ALIASES:
-        if _is_nonempty(payload_dict.get(alias)):
-            out["name"] = payload_dict.get(alias)
-            break
-    for alias in EXCHANGE_ALIASES:
-        if _is_nonempty(payload_dict.get(alias)):
-            out["exchange"] = payload_dict.get(alias)
-            break
-    for alias in CURRENCY_ALIASES:
-        if _is_nonempty(payload_dict.get(alias)):
-            out["currency"] = payload_dict.get(alias)
-            break
+    for candidate in _extract_candidate_dicts(payload_dict):
+        for alias in NAME_ALIASES:
+            if _is_nonempty(candidate.get(alias)):
+                out["name"] = candidate.get(alias)
+                break
+        for alias in EXCHANGE_ALIASES:
+            if _is_nonempty(candidate.get(alias)):
+                out["exchange"] = candidate.get(alias)
+                break
+        for alias in CURRENCY_ALIASES:
+            if _is_nonempty(candidate.get(alias)):
+                out["currency"] = candidate.get(alias)
+                break
 
-    out["current_price"] = _coerce_float(_safe_get(payload_dict, *PRICE_FIELD_ALIASES))
-    out["price"] = _coerce_float(_safe_get(payload_dict, *PRICE_FIELD_ALIASES))
-    out["previous_close"] = _coerce_float(_safe_get(payload_dict, *PREV_CLOSE_ALIASES))
-    out["open"] = _coerce_float(_safe_get(payload_dict, *OPEN_ALIASES))
-    out["day_high"] = _coerce_float(_safe_get(payload_dict, *HIGH_ALIASES))
-    out["day_low"] = _coerce_float(_safe_get(payload_dict, *LOW_ALIASES))
-    out["volume"] = _coerce_int(_safe_get(payload_dict, *VOLUME_ALIASES))
-    out["52w_high"] = _coerce_float(_safe_get(payload_dict, "52w_high", "fiftyTwoWeekHigh", "fifty_two_week_high"))
-    out["52w_low"] = _coerce_float(_safe_get(payload_dict, "52w_low", "fiftyTwoWeekLow", "fifty_two_week_low"))
-    out["market_cap"] = _coerce_float(_safe_get(payload_dict, "market_cap", "marketCap"))
-    out["beta_5y"] = _coerce_float(_safe_get(payload_dict, "beta_5y", "beta", "beta5YMonthly"))
-    out["dividend_yield"] = _coerce_float(_safe_get(payload_dict, "dividend_yield", "dividendYield"))
-    out["long_name"] = _safe_get(payload_dict, "longName", "long_name")
-    out["short_name"] = _safe_get(payload_dict, "shortName", "short_name")
-    out["market_state"] = _safe_get(payload_dict, "market_state", "marketState")
+        out = _merge_nonempty(
+            out,
+            {
+                "current_price": _coerce_float(_safe_get(candidate, *PRICE_FIELD_ALIASES)),
+                "price": _coerce_float(_safe_get(candidate, *PRICE_FIELD_ALIASES)),
+                "previous_close": _coerce_float(_safe_get(candidate, *PREV_CLOSE_ALIASES)),
+                "open": _coerce_float(_safe_get(candidate, *OPEN_ALIASES)),
+                "day_high": _coerce_float(_safe_get(candidate, *HIGH_ALIASES)),
+                "day_low": _coerce_float(_safe_get(candidate, *LOW_ALIASES)),
+                "volume": _coerce_int(_safe_get(candidate, *VOLUME_ALIASES)),
+                "52w_high": _coerce_float(_safe_get(candidate, "52w_high", "fiftyTwoWeekHigh", "fifty_two_week_high")),
+                "52w_low": _coerce_float(_safe_get(candidate, "52w_low", "fiftyTwoWeekLow", "fifty_two_week_low")),
+                "market_cap": _coerce_float(_safe_get(candidate, "market_cap", "marketCap")),
+                "beta_5y": _coerce_float(_safe_get(candidate, "beta_5y", "beta", "beta5YMonthly")),
+                "dividend_yield": _coerce_float(_safe_get(candidate, "dividend_yield", "dividendYield")),
+                "long_name": _safe_get(candidate, "longName", "long_name"),
+                "short_name": _safe_get(candidate, "shortName", "short_name"),
+                "market_state": _safe_get(candidate, "market_state", "marketState"),
+            },
+        )
 
-    # nested raw/meta/chart payloads
     chart_derived = _derive_quote_from_chart_payload(payload_dict)
     history_rows = _extract_history_rows(payload_dict)
     history_derived = _derive_quote_from_rows(history_rows)
@@ -962,8 +1037,8 @@ def _normalize_quote_payload(payload: Any, *, symbol: str) -> Dict[str, Any]:
         out["price_change"] = price_change
         out["percent_change"] = (price_change / prev) * 100.0
 
-    warnings = []
-    for key in ("warnings", "warning", "notes"):
+    warnings: List[str] = []
+    for key in ("warnings", "warning", "notes", "message"):
         value = payload_dict.get(key)
         if isinstance(value, list):
             warnings.extend([str(x) for x in value if _is_nonempty(x)])
@@ -973,7 +1048,6 @@ def _normalize_quote_payload(payload: Any, *, symbol: str) -> Dict[str, Any]:
         out["warnings"] = warnings
 
     return {k: v for k, v in out.items() if _is_nonempty(v) or k in {"symbol", "symbol_normalized", "requested_symbol"}}
-
 
 
 def _normalize_history_payload(payload: Any, *, symbol: str) -> List[Dict[str, Any]]:
@@ -999,15 +1073,13 @@ def _normalize_history_payload(payload: Any, *, symbol: str) -> List[Dict[str, A
     return [_ensure_history_row(synthetic)]
 
 
-
 def _normalize_patch_payload(payload: Any, *, symbol: str, base: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     patch = _normalize_quote_payload(payload, symbol=symbol)
     merged = _merge_nonempty(base or {}, patch)
-    if not _is_nonempty(merged.get("current_price")):
+    if not _is_nonempty(merged.get("current_price")) and not _is_nonempty(merged.get("price")):
         rows = _normalize_history_payload(payload, symbol=symbol)
         merged = _merge_nonempty(merged, _derive_quote_from_rows(rows))
     return merged
-
 
 
 def _ensure_shape(payload: Any, *, symbol: str, provider_version: Optional[str], fn_name: str, result_kind: str) -> Any:
@@ -1049,7 +1121,6 @@ def _ensure_shape(payload: Any, *, symbol: str, provider_version: Optional[str],
     return out
 
 
-
 def _error_payload(symbol: str, err: str, *, fn_name: str) -> Dict[str, Any]:
     sym = _safe_symbol(symbol)
     out = _identity_defaults_for_symbol(sym)
@@ -1070,8 +1141,10 @@ def _error_payload(symbol: str, err: str, *, fn_name: str) -> Dict[str, Any]:
 
 
 # =============================================================================
-# SingleFlight (async)
+# Async control helpers
 # =============================================================================
+
+
 class SingleFlight:
     def __init__(self):
         self._lock = asyncio.Lock()
@@ -1105,9 +1178,6 @@ class SingleFlight:
                 self._futs.pop(key, None)
 
 
-# =============================================================================
-# Full Jitter retry (async)
-# =============================================================================
 class FullJitterBackoff:
     def __init__(self, attempts: int = 2, base: float = 0.4, cap: float = 4.0):
         self.attempts = max(0, int(attempts))
@@ -1131,9 +1201,6 @@ class FullJitterBackoff:
         raise last if last else RuntimeError("retry_exhausted")
 
 
-# =============================================================================
-# Circuit breaker (async)
-# =============================================================================
 class CircuitState(str, Enum):
     CLOSED = "closed"
     HALF = "half_open"
@@ -1212,8 +1279,10 @@ class CircuitBreaker:
 
 
 # =============================================================================
-# Canonical provider cache (TTL + singleflight)
+# Canonical provider cache
 # =============================================================================
+
+
 @dataclass(slots=True)
 class ProviderInfo:
     module: Any
@@ -1257,11 +1326,12 @@ class ProviderCache:
             await self._cb.allow()
             try:
                 mod = None
-                last_err = None
                 origin_path = None
+                last_err: Optional[BaseException] = None
+
                 for path in CANONICAL_IMPORT_PATHS:
                     try:
-                        mod = __import__(path, fromlist=["__all__"])
+                        mod = import_module(path)
                         origin_path = path
                         last_err = None
                         break
@@ -1320,15 +1390,16 @@ _PROVIDER = ProviderCache()
 
 
 # =============================================================================
-# Signature cache
+# Signature helpers
 # =============================================================================
+
+
 @lru_cache(maxsize=256)
 def _sig_params(fn: Callable[..., Any]) -> Dict[str, inspect.Parameter]:
     try:
         return dict(inspect.signature(fn).parameters)
     except Exception:
         return {}
-
 
 
 def _adapt_kwargs(fn: Callable[..., Any], kwargs: Dict[str, Any]) -> Dict[str, Any]:
@@ -1343,11 +1414,7 @@ def _adapt_kwargs(fn: Callable[..., Any], kwargs: Dict[str, Any]) -> Dict[str, A
         return dict(kwargs)
 
 
-
 def _coerce_args_for_call(fn: Callable[..., Any], args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Tuple[Tuple[Any, ...], Dict[str, Any]]:
-    """
-    Keep broad compatibility across slightly different canonical signatures.
-    """
     params = _sig_params(fn)
     if not params:
         return args, dict(kwargs)
@@ -1355,7 +1422,6 @@ def _coerce_args_for_call(fn: Callable[..., Any], args: Tuple[Any, ...], kwargs:
     arg_names = [name for name, p in params.items() if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)]
     out_kwargs = _adapt_kwargs(fn, kwargs)
 
-    # Avoid passing duplicated positional/keyword symbol/base values.
     if args:
         if len(arg_names) >= 1 and arg_names[0] in out_kwargs:
             out_kwargs.pop(arg_names[0], None)
@@ -1372,8 +1438,10 @@ async def _maybe_await(value: Any) -> Any:
 
 
 # =============================================================================
-# Default handlers (used only if canonical missing)
+# Default handlers
 # =============================================================================
+
+
 async def _default_quote(symbol: str, *args, **kwargs) -> Dict[str, Any]:
     sym = _safe_symbol(symbol)
     out = _identity_defaults_for_symbol(sym)
@@ -1384,6 +1452,7 @@ async def _default_quote(symbol: str, *args, **kwargs) -> Dict[str, Any]:
             "provider": DATA_SOURCE,
             "data_quality": DataQuality.MISSING.value,
             "error": "canonical_unavailable",
+            "warnings": ["No live provider data available"],
             "shim_version": SHIM_VERSION,
             "last_updated_utc": _utc_iso(),
             "last_updated_riyadh": _riyadh_iso(),
@@ -1405,6 +1474,8 @@ async def _default_history(*args, **kwargs) -> List[Dict[str, Any]]:
 # =============================================================================
 # Shim callable
 # =============================================================================
+
+
 class ShimFunction:
     def __init__(
         self,
@@ -1495,8 +1566,9 @@ class ShimFunction:
 
 
 # =============================================================================
-# Public shim callables (legacy API surface)
+# Public shim callables
 # =============================================================================
+
 fetch_quote = ShimFunction(
     "fetch_quote",
     canonical_names=("fetch_quote", "get_quote", "yahoo_chart_quote"),
@@ -1509,7 +1581,6 @@ get_quote = ShimFunction(
     fallback_factory=_default_quote,
     result_kind="quote",
 )
-
 yahoo_chart_quote = ShimFunction(
     "yahoo_chart_quote",
     canonical_names=("yahoo_chart_quote", "fetch_quote", "get_quote"),
@@ -1537,23 +1608,13 @@ fetch_enriched_quote_patch = ShimFunction(
 )
 fetch_quote_and_enrichment_patch = ShimFunction(
     "fetch_quote_and_enrichment_patch",
-    canonical_names=(
-        "fetch_quote_and_enrichment_patch",
-        "fetch_enriched_quote_patch",
-        "fetch_quote_patch",
-        "fetch_quote",
-    ),
+    canonical_names=("fetch_quote_and_enrichment_patch", "fetch_enriched_quote_patch", "fetch_quote_patch", "fetch_quote"),
     fallback_factory=_default_patch,
     result_kind="patch",
 )
 fetch_quote_and_fundamentals_patch = ShimFunction(
     "fetch_quote_and_fundamentals_patch",
-    canonical_names=(
-        "fetch_quote_and_fundamentals_patch",
-        "fetch_enriched_quote_patch",
-        "fetch_quote_patch",
-        "fetch_quote",
-    ),
+    canonical_names=("fetch_quote_and_fundamentals_patch", "fetch_enriched_quote_patch", "fetch_quote_patch", "fetch_quote"),
     fallback_factory=_default_patch,
     result_kind="patch",
 )
@@ -1593,6 +1654,8 @@ fetch_prices = ShimFunction(
 # =============================================================================
 # Class compatibility wrapper
 # =============================================================================
+
+
 class YahooChartProvider:
     """
     Backward-compatible provider class.
@@ -1642,10 +1705,12 @@ class YahooChartProvider:
             for method_name in method_names:
                 if hasattr(self._inner, method_name):
                     try:
-                        value = getattr(self._inner, method_name)(*args, **kwargs)
+                        method = getattr(self._inner, method_name)
+                        call_args, call_kwargs = _coerce_args_for_call(method, tuple(args), dict(kwargs))
+                        value = method(*call_args, **call_kwargs)
                         value = await _maybe_await(value)
                         symbol = _safe_symbol(kwargs.get("symbol") or kwargs.get("ticker") or (args[0] if args else ""))
-                        kind = "history" if "history" in method_name or method_name in {"fetch_prices"} else "quote"
+                        kind = "history" if ("history" in method_name or method_name in {"fetch_prices"}) else "quote"
                         if "patch" in method_name:
                             kind = "patch"
                         return _ensure_shape(value, symbol=symbol, provider_version=None, fn_name=method_name, result_kind=kind)
@@ -1693,6 +1758,8 @@ class YahooChartProvider:
 # =============================================================================
 # Utilities
 # =============================================================================
+
+
 async def get_provider_status() -> Dict[str, Any]:
     info = await _PROVIDER.get()
     return {
@@ -1714,7 +1781,6 @@ async def clear_cache() -> None:
     global _PROVIDER
     _PROVIDER = ProviderCache()
     shim_provider_available.set(0)
-
 
 
 def get_version() -> str:
