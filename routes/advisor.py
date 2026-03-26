@@ -2,30 +2,28 @@
 """
 routes/advisor.py
 ================================================================================
-ADVISOR ROUTER — v6.2.0
+ADVISOR ROUTER — v6.4.0
 ================================================================================
-TOP10-SAFE • SHORT-ADVISOR FAMILY RESTORED • LIVE-BY-DEFAULT •
+TOP10-CONTRACT-ALIGNED • SHORT-ADVISOR FAMILY HARDENED • LIVE-BY-DEFAULT •
 UNIFIED-SHEET-ROWS • RESOLVER-HARDENED • QUERY+BODY COMPATIBLE • JSON-SAFE •
-ENGINE-TOLERANT • ADVANCED-ROUTER BRIDGE • ADVISOR-FIRST FOR DERIVED PAGES •
-ASYNC-SAFE • TIMEOUT-GUARDED
+ENGINE-TOLERANT • ADVANCED-ROUTER BRIDGE • ASYNC-SAFE • TIMEOUT-GUARDED •
+DERIVED-PAGE QUALITY GATES • CONTRACT-PROJECTION • DEGRADATION-AWARE
 
 Why this revision
 -----------------
-- FIX: `Top_10_Investments` now has a direct Top10 builder path before generic
-  advisor runner resolution, reducing 502 / timeout risk on the short advisor
-  family.
-- FIX: sheet-rows bridge resolution now searches the real row providers first
-  (`routes.investment_advisor`, `routes.analysis_sheet_rows`) before schema-only
-  modules, preventing false fallback into the wrong module family.
-- FIX: sync callables are executed safely via `asyncio.to_thread` and guarded by
-  configurable timeouts so long-running builders no longer block the event loop.
-- FIX: empty / schema-only / unusable derived-page payloads no longer count as a
-  successful result; the router keeps falling back until it finds a usable row
-  producer.
-- FIX: normalized envelopes now backfill `rows`, `rows_matrix`, `items`, and
-  `data` more consistently, including object-row alignment to headers.
-- FIX: preserves live mode default, request-id propagation, auth/open-mode
-  compatibility, and engine-safe fallback behavior.
+- FIX: `Top_10_Investments` now prefers:
+      Top10 builder -> advanced/analysis bridge -> advisor runner -> engine fallback
+      so the short advisor route stops returning weak fallback rows too early.
+- FIX: derived-page acceptance is stricter. A non-empty payload is no longer
+      automatically "good enough" for Top10 if it is clearly fallback-only.
+- FIX: responses are projected to canonical sheet contracts whenever schema
+      headers can be resolved, improving header count / row-width alignment.
+- FIX: downstream payload decoration is more consistent (`request_id`,
+      `page_name`, `target_sheet`, `format=rows`, include flags, advisor modes).
+- FIX: timeouts are stage-aware so advisor short path fails faster and more
+      predictably instead of drifting into very long waits.
+- FIX: response envelopes expose richer resolver metadata and contract metadata
+      while remaining JSON-safe.
 """
 
 from __future__ import annotations
@@ -51,11 +49,12 @@ from fastapi.routing import APIRouter
 logger = logging.getLogger("routes.advisor")
 logger.addHandler(logging.NullHandler())
 
-ADVISOR_VERSION = "6.2.0"
+ADVISOR_VERSION = "6.4.0"
 
 router = APIRouter(prefix="/v1/advisor", tags=["advisor"])
 
 DEFAULT_ADVISOR_PAGE = "Top_10_Investments"
+
 BASE_PAGES = {
     "Market_Leaders",
     "Global_Markets",
@@ -63,11 +62,51 @@ BASE_PAGES = {
     "Mutual_Funds",
     "My_Portfolio",
 }
+
 DERIVED_ADVISOR_PAGES = {
     "Top_10_Investments",
     "Insights_Analysis",
 }
+
 DIRECT_BRIDGE_PAGES = BASE_PAGES | {"Data_Dictionary"}
+
+KNOWN_CANONICAL_HEADER_COUNTS: Dict[str, int] = {
+    "Market_Leaders": 80,
+    "Global_Markets": 80,
+    "Commodities_FX": 80,
+    "Mutual_Funds": 80,
+    "My_Portfolio": 80,
+    "Insights_Analysis": 7,
+    "Top_10_Investments": 83,
+    "Data_Dictionary": 9,
+}
+
+TOP10_SPECIAL_FIELDS: Tuple[str, ...] = (
+    "top10_rank",
+    "selection_reason",
+    "criteria_snapshot",
+)
+
+TOP10_BUSINESS_SIGNAL_FIELDS: Tuple[str, ...] = (
+    "symbol",
+    "name",
+    "asset_class",
+    "exchange",
+    "currency",
+    "country",
+    "sector",
+    "industry",
+    "current_price",
+    "price_change",
+    "percent_change",
+    "risk_score",
+    "valuation_score",
+    "overall_score",
+    "opportunity_score",
+    "risk_bucket",
+    "confidence_bucket",
+    "recommendation",
+)
 
 RUNNER_MODULE_CANDIDATES: Tuple[str, ...] = (
     "routes.investment_advisor",
@@ -161,6 +200,31 @@ TOP10_METHOD_CANDIDATES: Tuple[str, ...] = (
     "top10_rows",
 )
 
+SCHEMA_MODULE_CANDIDATES: Tuple[str, ...] = (
+    "core.sheets.schema_registry",
+    "core.schema_registry",
+    "core.sheets.page_catalog",
+)
+
+SCHEMA_MAP_CANDIDATES: Tuple[str, ...] = (
+    "SCHEMA_REGISTRY",
+    "SHEET_SPEC",
+    "SHEET_SPECS",
+    "PAGE_SPECS",
+    "SPECS",
+    "SHEET_CONTRACTS",
+    "STATIC_CANONICAL_SHEET_CONTRACTS",
+)
+
+SCHEMA_FUNCTION_CANDIDATES: Tuple[str, ...] = (
+    "get_sheet_spec",
+    "get_schema_for_sheet",
+    "get_schema",
+    "resolve_sheet_spec",
+    "resolve_sheet_schema",
+    "get_contract_for_sheet",
+)
+
 # -----------------------------------------------------------------------------
 # Optional Prometheus
 # -----------------------------------------------------------------------------
@@ -184,6 +248,12 @@ except Exception:
 
     def get_settings_cached(*args: Any, **kwargs: Any) -> Any:  # type: ignore
         return None
+
+
+# -----------------------------------------------------------------------------
+# Small shared caches
+# -----------------------------------------------------------------------------
+_SCHEMA_HEADERS_CACHE: Dict[str, List[str]] = {}
 
 
 # -----------------------------------------------------------------------------
@@ -297,6 +367,25 @@ def _safe_engine_type(engine: Any) -> str:
 
 def _timeout_seconds(env_name: str, default: float) -> float:
     return max(0.1, _safe_float(os.getenv(env_name), default))
+
+
+def _resolver_timeout(stage: str, *, page: str) -> float:
+    page = _strip(page)
+    defaults = {
+        "factory": 8.0,
+        "bridge": 16.0 if page == "Top_10_Investments" else 20.0,
+        "engine": 18.0 if page in DERIVED_ADVISOR_PAGES else 25.0,
+        "top10": 18.0,
+        "runner": 12.0 if page == "Top_10_Investments" else 24.0,
+    }
+    env_map = {
+        "factory": "TFB_ADVISOR_FACTORY_TIMEOUT_SEC",
+        "bridge": "TFB_ADVISOR_BRIDGE_TIMEOUT_SEC",
+        "engine": "TFB_ADVISOR_ENGINE_TIMEOUT_SEC",
+        "top10": "TFB_TOP10_BUILDER_TIMEOUT_SEC",
+        "runner": "TFB_ADVISOR_RUNNER_TIMEOUT_SEC",
+    }
+    return _timeout_seconds(env_map[stage], defaults[stage])
 
 
 def _row_count(value: Any) -> int:
@@ -572,17 +661,35 @@ def _extract_page(data: Mapping[str, Any], default_page: str = DEFAULT_ADVISOR_P
     return page or default_page
 
 
+def _normalize_mode(value: Any) -> str:
+    raw = _strip(value).lower()
+    if raw in {"", "live", "default"}:
+        return "live"
+    if raw in {"live_quotes", "quotes", "quote", "market"}:
+        return "live_quotes"
+    if raw in {"snapshot", "cached", "cache"}:
+        return "snapshot"
+    return _strip(value) or "live"
+
+
 def _default_payload(data: Mapping[str, Any], default_page: str = DEFAULT_ADVISOR_PAGE) -> Dict[str, Any]:
     payload = _safe_dict(data)
     page = _extract_page(payload, default_page=default_page)
+    mode = _normalize_mode(payload.get("mode") or payload.get("advisor_mode") or payload.get("data_mode"))
+
     payload["page"] = page
     payload["sheet"] = page
     payload["sheet_name"] = page
     payload["name"] = page
-    payload.setdefault("mode", payload.get("advisor_mode") or payload.get("data_mode") or "live")
-    payload.setdefault("advisor_mode", payload.get("mode") or "live")
-    payload.setdefault("data_mode", payload.get("mode") or "live")
-    payload["mode"] = _strip(payload.get("mode")) or "live"
+    payload["page_name"] = page
+    payload["tab"] = page
+    payload["target_sheet"] = page
+
+    payload["mode"] = mode
+    payload["advisor_mode"] = _strip(payload.get("advisor_mode")) or mode
+    payload["data_mode"] = _strip(payload.get("data_mode")) or mode
+    payload["advisor_data_mode"] = _strip(payload.get("advisor_data_mode")) or mode
+    payload["format"] = _strip(payload.get("format")) or "rows"
 
     symbols = _get_list(payload, "symbols", "tickers", "symbol", "ticker")
     if symbols:
@@ -592,8 +699,41 @@ def _default_payload(data: Mapping[str, Any], default_page: str = DEFAULT_ADVISO
     payload["top_n"] = max(1, min(100, _safe_int(payload.get("top_n"), 10)))
     payload["limit"] = max(1, min(5000, _safe_int(payload.get("limit"), 200)))
     payload["offset"] = max(0, _safe_int(payload.get("offset"), 0))
-    payload.setdefault("include_matrix", payload.get("include_matrix") if "include_matrix" in payload else True)
+
+    payload["include_matrix"] = _boolish(payload.get("include_matrix"), True)
+    payload["include_headers"] = _boolish(payload.get("include_headers"), True)
+    payload["schema_only"] = _boolish(payload.get("schema_only"), False)
+    payload["headers_only"] = _boolish(payload.get("headers_only"), False)
+
     return payload
+
+
+def _prepare_payload_for_downstream(
+    payload: Mapping[str, Any],
+    *,
+    request_id: str,
+    operation: str,
+) -> Dict[str, Any]:
+    out = _default_payload(payload)
+    page = _extract_page(out)
+
+    out["page"] = page
+    out["sheet"] = page
+    out["sheet_name"] = page
+    out["name"] = page
+    out["page_name"] = page
+    out["tab"] = page
+    out["target_sheet"] = page
+    out["request_id"] = request_id
+    out["operation"] = operation
+    out["router"] = "advisor_short"
+    out["advisor_version"] = ADVISOR_VERSION
+    out["format"] = _strip(out.get("format")) or "rows"
+    out["include_headers"] = _boolish(out.get("include_headers"), True)
+    out["include_matrix"] = _boolish(out.get("include_matrix"), True)
+    out["schema_only"] = _boolish(out.get("schema_only"), False)
+    out["headers_only"] = _boolish(out.get("headers_only"), False)
+    return out
 
 
 def _payload_from_get(
@@ -663,6 +803,7 @@ async def _call_with_tolerant_signatures(
     kwargs: Optional[Dict[str, Any]] = None,
 ) -> Any:
     payload_kwargs = kwargs or {}
+
     attempts = [
         (tuple(args), payload_kwargs),
         ((), payload_kwargs),
@@ -672,11 +813,22 @@ async def _call_with_tolerant_signatures(
         ((), {"payload": payload_kwargs.get("payload")}),
         ((), {"body": payload_kwargs.get("body")}),
         ((), {"request": payload_kwargs.get("request")}),
-        ((), {"page": payload_kwargs.get("page"), "sheet": payload_kwargs.get("sheet"), "sheet_name": payload_kwargs.get("sheet_name"), "symbols": payload_kwargs.get("symbols"), "tickers": payload_kwargs.get("tickers"), "top_n": payload_kwargs.get("top_n"), "limit": payload_kwargs.get("limit")}),
+        ((), {
+            "page": payload_kwargs.get("page"),
+            "sheet": payload_kwargs.get("sheet"),
+            "sheet_name": payload_kwargs.get("sheet_name"),
+            "symbols": payload_kwargs.get("symbols"),
+            "tickers": payload_kwargs.get("tickers"),
+            "top_n": payload_kwargs.get("top_n"),
+            "limit": payload_kwargs.get("limit"),
+            "offset": payload_kwargs.get("offset"),
+            "mode": payload_kwargs.get("mode"),
+        }),
         ((), {}),
     ]
 
     last_error: Optional[Exception] = None
+
     for call_args, call_kwargs in attempts:
         call_kwargs = {k: v for k, v in call_kwargs.items() if v is not None}
         try:
@@ -697,11 +849,11 @@ async def _call_with_tolerant_signatures(
     return None
 
 
-async def _call_factory(factory: Callable[..., Any]) -> Any:
+async def _call_factory(factory: Callable[..., Any], *, page: str) -> Any:
     try:
         return await _call_with_tolerant_signatures(
             factory,
-            timeout_seconds=_timeout_seconds("TFB_ADVISOR_FACTORY_TIMEOUT_SEC", 8.0),
+            timeout_seconds=_resolver_timeout("factory", page=page),
             kwargs={},
         )
     except Exception:
@@ -734,7 +886,7 @@ def _resolve_callable_from_object(
     return None, {}
 
 
-async def _resolve_runner_from_state(request: Request) -> Tuple[Optional[Callable[..., Any]], Dict[str, Any]]:
+async def _resolve_runner_from_state(request: Request, *, page: str) -> Tuple[Optional[Callable[..., Any]], Dict[str, Any]]:
     try:
         state = request.app.state
     except Exception:
@@ -760,7 +912,7 @@ async def _resolve_runner_from_state(request: Request) -> Tuple[Optional[Callabl
         factory = getattr(state, factory_name, None)
         if not callable(factory):
             continue
-        obj = await _call_factory(factory)
+        obj = await _call_factory(factory, page=page)
         fn, meta = _resolve_callable_from_object(
             obj,
             object_name=factory_name,
@@ -774,7 +926,7 @@ async def _resolve_runner_from_state(request: Request) -> Tuple[Optional[Callabl
     return None, {}
 
 
-async def _resolve_runner_from_module(module: Any) -> Tuple[Optional[Callable[..., Any]], Dict[str, Any]]:
+async def _resolve_runner_from_module(module: Any, *, page: str) -> Tuple[Optional[Callable[..., Any]], Dict[str, Any]]:
     if module is None:
         return None, {}
 
@@ -800,7 +952,7 @@ async def _resolve_runner_from_module(module: Any) -> Tuple[Optional[Callable[..
         factory = getattr(module, factory_name, None)
         if not callable(factory):
             continue
-        obj = await _call_factory(factory)
+        obj = await _call_factory(factory, page=page)
         fn, meta = _resolve_callable_from_object(
             obj,
             object_name=factory_name,
@@ -814,14 +966,14 @@ async def _resolve_runner_from_module(module: Any) -> Tuple[Optional[Callable[..
     return None, {}
 
 
-async def _resolve_advisor_runner(request: Request) -> Tuple[Optional[Callable[..., Any]], Dict[str, Any]]:
-    fn, meta = await _resolve_runner_from_state(request)
+async def _resolve_advisor_runner(request: Request, *, page: str) -> Tuple[Optional[Callable[..., Any]], Dict[str, Any]]:
+    fn, meta = await _resolve_runner_from_state(request, page=page)
     if fn is not None:
         return fn, meta
 
     for module_name in RUNNER_MODULE_CANDIDATES:
         module = _import_module_safely(module_name)
-        fn, meta = await _resolve_runner_from_module(module)
+        fn, meta = await _resolve_runner_from_module(module, page=page)
         if fn is not None:
             return fn, meta
     return None, {}
@@ -898,11 +1050,167 @@ async def _resolve_top10_builder(request: Request) -> Tuple[Optional[Callable[..
     return None, {}
 
 
+def _nonempty(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    return True
+
+
 def _mapping_list_to_rows(rows: Iterable[Mapping[str, Any]], headers: Sequence[str]) -> List[List[Any]]:
     matrix: List[List[Any]] = []
     for row in rows:
         matrix.append([row.get(h) for h in headers])
     return matrix
+
+
+def _rows_matrix_to_objects(matrix: Sequence[Sequence[Any]], headers: Sequence[str]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for row in matrix:
+        row_list = list(row)
+        item: Dict[str, Any] = {}
+        for idx, h in enumerate(headers):
+            item[str(h)] = row_list[idx] if idx < len(row_list) else None
+        out.append(item)
+    return out
+
+
+def _pad_or_trim_matrix(matrix: Sequence[Sequence[Any]], width: int) -> List[List[Any]]:
+    out: List[List[Any]] = []
+    for row in matrix:
+        row_list = list(row)
+        if len(row_list) < width:
+            row_list = row_list + [None] * (width - len(row_list))
+        elif len(row_list) > width:
+            row_list = row_list[:width]
+        out.append(row_list)
+    return out
+
+
+def _extract_meta_mapping(result: Mapping[str, Any]) -> Dict[str, Any]:
+    meta = result.get("meta")
+    return dict(meta) if isinstance(meta, Mapping) else {}
+
+
+def _extract_headers_from_spec(spec: Any) -> List[str]:
+    if spec is None:
+        return []
+
+    if isinstance(spec, Mapping):
+        for key in ("headers", "display_headers", "keys", "columns"):
+            value = spec.get(key)
+            if isinstance(value, list) and value:
+                return [_strip(x) for x in value if _strip(x)]
+
+        for key in ("sheet", "spec", "schema", "contract", "definition"):
+            nested = spec.get(key)
+            headers = _extract_headers_from_spec(nested)
+            if headers:
+                return headers
+
+    return []
+
+
+def _resolve_contract_headers(page: str) -> List[str]:
+    page = _canonicalize_page_name(page)
+    if not page:
+        return []
+    if page in _SCHEMA_HEADERS_CACHE:
+        return list(_SCHEMA_HEADERS_CACHE[page])
+
+    for module_name in SCHEMA_MODULE_CANDIDATES:
+        module = _import_module_safely(module_name)
+        if module is None:
+            continue
+
+        for map_name in SCHEMA_MAP_CANDIDATES:
+            spec_map = getattr(module, map_name, None)
+            if isinstance(spec_map, Mapping):
+                try:
+                    hit = spec_map.get(page) or spec_map.get(page.lower()) or spec_map.get(page.upper())
+                except Exception:
+                    hit = None
+                headers = _extract_headers_from_spec(hit)
+                if headers:
+                    _SCHEMA_HEADERS_CACHE[page] = headers
+                    return list(headers)
+
+        for fn_name in SCHEMA_FUNCTION_CANDIDATES:
+            fn = getattr(module, fn_name, None)
+            if not callable(fn):
+                continue
+            for kwargs in (
+                {"sheet": page},
+                {"page": page},
+                {"sheet_name": page},
+                {"name": page},
+                {},
+            ):
+                try:
+                    out = fn(**kwargs) if kwargs else fn(page)
+                except TypeError:
+                    continue
+                except Exception:
+                    out = None
+                headers = _extract_headers_from_spec(out)
+                if headers:
+                    _SCHEMA_HEADERS_CACHE[page] = headers
+                    return list(headers)
+
+    return []
+
+
+def _contract_header_count(page: str) -> int:
+    headers = _resolve_contract_headers(page)
+    if headers:
+        return len(headers)
+    return KNOWN_CANONICAL_HEADER_COUNTS.get(page, 0)
+
+
+def _append_missing_headers(headers: List[str], fields: Sequence[str]) -> List[str]:
+    out = list(headers)
+    for field in fields:
+        if field not in out:
+            out.append(field)
+    return out
+
+
+def _project_to_contract_headers(
+    *,
+    page: str,
+    headers: List[str],
+    row_objects: List[Dict[str, Any]],
+    rows_matrix: List[List[Any]],
+) -> Tuple[List[str], List[Dict[str, Any]], List[List[Any]]]:
+    contract_headers = _resolve_contract_headers(page)
+    effective_headers = list(contract_headers or headers or [])
+
+    if page == "Top_10_Investments":
+        effective_headers = _append_missing_headers(effective_headers, TOP10_SPECIAL_FIELDS)
+
+    if not effective_headers and row_objects:
+        seen: List[str] = []
+        for row in row_objects:
+            for key in row.keys():
+                key_s = _strip(key)
+                if key_s and key_s not in seen:
+                    seen.append(key_s)
+        effective_headers = seen
+
+    if page == "Top_10_Investments":
+        for idx, row in enumerate(row_objects, start=1):
+            row.setdefault("top10_rank", idx)
+            row.setdefault("selection_reason", row.get("selection_reason") or None)
+            row.setdefault("criteria_snapshot", row.get("criteria_snapshot") or None)
+
+    if row_objects and effective_headers:
+        rows_matrix = _mapping_list_to_rows(row_objects, effective_headers)
+    elif rows_matrix and effective_headers:
+        rows_matrix = _pad_or_trim_matrix(rows_matrix, len(effective_headers))
+        row_objects = _rows_matrix_to_objects(rows_matrix, effective_headers)
+
+    return effective_headers, row_objects, rows_matrix
 
 
 def _ensure_tabular_shape(result: Dict[str, Any], *, page: str) -> Dict[str, Any]:
@@ -914,80 +1222,122 @@ def _ensure_tabular_shape(result: Dict[str, Any], *, page: str) -> Dict[str, Any
     quotes = result.get("quotes")
     rows_matrix = result.get("rows_matrix")
 
-    object_rows: Optional[List[Mapping[str, Any]]] = None
+    effective_headers: List[str] = list(headers) if isinstance(headers, list) else []
+
+    object_rows: List[Dict[str, Any]] = []
     for candidate in (row_objects, rows, items, data, quotes):
         if isinstance(candidate, list) and candidate and all(isinstance(x, Mapping) for x in candidate):
             object_rows = [dict(x) for x in candidate]
             break
 
-    if object_rows:
-        result.setdefault("row_objects", object_rows)
-        result.setdefault("items", object_rows)
-        if not isinstance(headers, list) or not headers:
-            seen: List[str] = []
-            for row in object_rows:
-                for key in row.keys():
-                    key_s = _strip(key)
-                    if key_s and key_s not in seen:
-                        seen.append(key_s)
-            headers = seen
-            result["headers"] = headers
-            result.setdefault("keys", headers)
-            result.setdefault("display_headers", headers)
-        if isinstance(headers, list) and headers:
-            result.setdefault("rows_matrix", _mapping_list_to_rows(object_rows, headers))
-        result.setdefault("rows", object_rows)
-
-    if isinstance(rows, list) and rows and all(not isinstance(x, Mapping) for x in rows):
-        result.setdefault("rows_matrix", rows)
-
+    matrix_rows: List[List[Any]] = []
     if isinstance(rows_matrix, list) and rows_matrix:
-        result.setdefault("rows", rows_matrix)
+        matrix_rows = [list(x) if isinstance(x, (list, tuple)) else [x] for x in rows_matrix]
+    elif isinstance(rows, list) and rows and all(not isinstance(x, Mapping) for x in rows):
+        matrix_rows = [list(x) if isinstance(x, (list, tuple)) else [x] for x in rows]
 
-    if isinstance(result.get("headers"), list):
-        result.setdefault("keys", result["headers"])
-        result.setdefault("display_headers", result["headers"])
+    effective_headers, object_rows, matrix_rows = _project_to_contract_headers(
+        page=page,
+        headers=effective_headers,
+        row_objects=object_rows,
+        rows_matrix=matrix_rows,
+    )
 
-    if page == "Top_10_Investments":
-        if isinstance(result.get("row_objects"), list):
-            for idx, row in enumerate(result["row_objects"], start=1):
-                if isinstance(row, Mapping):
-                    row.setdefault("top10_rank", idx)
-                    row.setdefault("selection_reason", row.get("selection_reason") or None)
-                    row.setdefault("criteria_snapshot", row.get("criteria_snapshot") or None)
-        if isinstance(result.get("headers"), list):
-            for special_key in ("top10_rank", "selection_reason", "criteria_snapshot"):
-                if special_key not in result["headers"]:
-                    result["headers"].append(special_key)
-            result["keys"] = result["headers"]
-            result["display_headers"] = result["headers"]
-            if isinstance(result.get("row_objects"), list):
-                result["rows_matrix"] = _mapping_list_to_rows(result["row_objects"], result["headers"])
+    result["headers"] = effective_headers
+    result["keys"] = list(effective_headers)
+    result["display_headers"] = list(effective_headers)
+
+    if object_rows:
+        result["row_objects"] = object_rows
+        result["items"] = object_rows
+        result["data"] = object_rows if page != "Data_Dictionary" else result.get("data", object_rows)
+
+    if matrix_rows:
+        result["rows_matrix"] = matrix_rows
+        result["rows"] = matrix_rows if not object_rows else object_rows
+    elif object_rows:
+        result["rows_matrix"] = _mapping_list_to_rows(object_rows, effective_headers)
+        result["rows"] = object_rows
+
+    meta = _extract_meta_mapping(result)
+    if effective_headers:
+        meta.setdefault("contract_header_count", _contract_header_count(page) or len(effective_headers))
+        meta.setdefault("actual_header_count", len(effective_headers))
+    result["meta"] = meta
 
     return result
 
 
+def _looks_like_fallback_only_top10(result: Mapping[str, Any]) -> bool:
+    page = _strip(result.get("page"))
+    if page != "Top_10_Investments":
+        return False
+
+    meta = _extract_meta_mapping(result)
+    fallback_flag = _boolish(meta.get("fallback"), False)
+    reason = _strip(meta.get("reason")).lower()
+
+    rows: List[Mapping[str, Any]] = []
+    candidate = result.get("row_objects")
+    if isinstance(candidate, list) and candidate and all(isinstance(x, Mapping) for x in candidate):
+        rows = [dict(x) for x in candidate]
+    elif isinstance(result.get("items"), list) and result.get("items") and all(isinstance(x, Mapping) for x in result.get("items")):
+        rows = [dict(x) for x in result.get("items")]
+
+    if not rows:
+        return False
+
+    fallback_selection_hits = 0
+    low_signal_rows = 0
+
+    for row in rows:
+        selection_reason = _strip(row.get("selection_reason")).lower()
+        if "fallback candidate" in selection_reason:
+            fallback_selection_hits += 1
+
+        informative = 0
+        for field in TOP10_BUSINESS_SIGNAL_FIELDS:
+            if field in {"top10_rank", "selection_reason", "criteria_snapshot"}:
+                continue
+            if _nonempty(row.get(field)):
+                informative += 1
+
+        # recommendation alone should not make a row look "real"
+        if informative <= 2:
+            low_signal_rows += 1
+
+    mostly_fallback_selection = fallback_selection_hits >= max(1, math.ceil(len(rows) * 0.6))
+    mostly_low_signal = low_signal_rows >= max(1, math.ceil(len(rows) * 0.6))
+
+    if fallback_flag and (mostly_fallback_selection or mostly_low_signal):
+        return True
+
+    if "engine_unavailable_or_empty" in reason and mostly_low_signal:
+        return True
+
+    return False
+
+
 def _has_usable_payload(result: Mapping[str, Any], *, page: str) -> bool:
-    if _row_count(result.get("rows_matrix")) > 0:
-        return True
-    if _row_count(result.get("row_objects")) > 0:
-        return True
-    if _row_count(result.get("rows")) > 0:
-        return True
-    if _row_count(result.get("items")) > 0:
-        return True
-    if _row_count(result.get("data")) > 0 and page != "Data_Dictionary":
-        return True
-    if _row_count(result.get("quotes")) > 0:
-        return True
-
-    if page == "Data_Dictionary" and _row_count(result.get("headers")) > 0:
-        return True
-
     if _boolish(result.get("schema_only"), False) or _boolish(result.get("headers_only"), False):
         return _row_count(result.get("headers")) > 0
 
-    return False
+    if page == "Data_Dictionary":
+        if _row_count(result.get("rows_matrix")) > 0 or _row_count(result.get("row_objects")) > 0:
+            return True
+        return _row_count(result.get("headers")) > 0
+
+    has_rows = any(
+        _row_count(result.get(k)) > 0
+        for k in ("rows_matrix", "row_objects", "rows", "items", "data", "quotes")
+    )
+    if not has_rows:
+        return False
+
+    if page == "Top_10_Investments" and _looks_like_fallback_only_top10(result):
+        return False
+
+    return True
 
 
 def _normalize_result_payload(out: Any, *, page: str) -> Dict[str, Any]:
@@ -997,7 +1347,7 @@ def _normalize_result_payload(out: Any, *, page: str) -> Dict[str, Any]:
         result = dict(safe)
     elif isinstance(safe, list):
         result = {"status": "success", "page": page, "data": safe, "items": safe}
-        if all(isinstance(x, Mapping) for x in safe):
+        if safe and all(isinstance(x, Mapping) for x in safe):
             result["row_objects"] = safe
     else:
         result = {"status": "success", "page": page, "data": safe}
@@ -1007,7 +1357,16 @@ def _normalize_result_payload(out: Any, *, page: str) -> Dict[str, Any]:
     result.setdefault("sheet", result.get("page") or page)
     result.setdefault("sheet_name", result.get("page") or page)
     result.setdefault("meta", {})
-    return _ensure_tabular_shape(result, page=page)
+    result = _ensure_tabular_shape(result, page=page)
+    return result
+
+
+def _merge_meta_resolver(result: Dict[str, Any], resolver_meta: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    meta = _extract_meta_mapping(result)
+    if resolver_meta:
+        meta["resolver"] = dict(resolver_meta)
+    result["meta"] = meta
+    return result
 
 
 def _envelope_from_payload_result(
@@ -1020,7 +1379,9 @@ def _envelope_from_payload_result(
     operation: str = "sheet_rows",
 ) -> Dict[str, Any]:
     out = _normalize_result_payload(result, page=page)
-    meta = _safe_dict(out.get("meta"))
+    out = _merge_meta_resolver(out, resolver_meta)
+
+    meta = _extract_meta_mapping(out)
     meta.update({
         "request_id": request_id,
         "elapsed_ms": round((time.perf_counter() - started_at) * 1000.0, 2),
@@ -1028,9 +1389,10 @@ def _envelope_from_payload_result(
         "advisor_version": ADVISOR_VERSION,
         "page": page,
         "operation": operation,
+        "contract_header_count": _contract_header_count(page),
+        "actual_header_count": len(out.get("headers", []) or []),
+        "degraded_top10_rejected": False,
     })
-    if resolver_meta:
-        meta["resolver"] = resolver_meta
 
     out["status"] = _strip(out.get("status")) or "success"
     out["page"] = _strip(out.get("page")) or page
@@ -1062,6 +1424,14 @@ def _prefer_runner(page: str, *, operation: str) -> bool:
     return False
 
 
+def _prefer_bridge_before_runner(page: str, *, operation: str) -> bool:
+    if page == "Top_10_Investments":
+        return True
+    if page == "Insights_Analysis" and operation in {"sheet_rows", "recommendations", "run"}:
+        return True
+    return False
+
+
 async def _delegate_to_bridge_sheet_rows(
     *,
     request: Request,
@@ -1076,9 +1446,11 @@ async def _delegate_to_bridge_sheet_rows(
     if impl is None:
         raise HTTPException(status_code=503, detail="Sheet-rows bridge implementation not available")
 
+    page = _extract_page(payload)
+
     out = await _call_with_tolerant_signatures(
         impl,
-        timeout_seconds=_timeout_seconds("TFB_ADVISOR_BRIDGE_TIMEOUT_SEC", 25.0),
+        timeout_seconds=_resolver_timeout("bridge", page=page),
         kwargs={
             "request": request,
             "body": payload,
@@ -1096,12 +1468,15 @@ async def _delegate_to_bridge_sheet_rows(
             "tickers": payload.get("tickers"),
             "top_n": payload.get("top_n"),
             "limit": payload.get("limit"),
+            "offset": payload.get("offset"),
         },
     )
-    result = _normalize_result_payload(out, page=_extract_page(payload))
-    result_meta = _safe_dict(result.get("meta"))
-    result_meta.setdefault("resolver", {"source": impl_meta.get("module"), "callable": impl_meta.get("callable"), "kind": "bridge"})
-    result["meta"] = result_meta
+
+    result = _normalize_result_payload(out, page=page)
+    result = _merge_meta_resolver(
+        result,
+        {"source": impl_meta.get("module"), "callable": impl_meta.get("callable"), "kind": "bridge"},
+    )
     return result
 
 
@@ -1120,6 +1495,7 @@ async def _run_engine_sheet_rows_fallback(
     mode = _strip(payload.get("mode")) or "live"
 
     last_error: Optional[Exception] = None
+
     for method_name in ENGINE_SHEET_ROWS_METHOD_CANDIDATES:
         method = getattr(engine, method_name, None)
         if not callable(method):
@@ -1174,14 +1550,17 @@ async def _run_engine_sheet_rows_fallback(
             try:
                 out = await _call_with_tolerant_signatures(
                     method,
-                    timeout_seconds=_timeout_seconds("TFB_ADVISOR_ENGINE_TIMEOUT_SEC", 25.0),
+                    timeout_seconds=_resolver_timeout("engine", page=page),
                     kwargs=kwargs,
                 )
                 result = _normalize_result_payload(out, page=page)
                 if not _has_usable_payload(result, page=page):
                     continue
-                meta = _safe_dict(result.get("meta"))
-                meta.setdefault("resolver", {"source": _safe_engine_type(engine), "callable": method_name, "kind": "engine_fallback"})
+                result = _merge_meta_resolver(
+                    result,
+                    {"source": _safe_engine_type(engine), "callable": method_name, "kind": "engine_fallback"},
+                )
+                meta = _extract_meta_mapping(result)
                 meta.setdefault("request_id", request_id)
                 result["meta"] = meta
                 return result
@@ -1210,7 +1589,7 @@ async def _run_top10_builder(
     try:
         out = await _call_with_tolerant_signatures(
             builder,
-            timeout_seconds=_timeout_seconds("TFB_TOP10_BUILDER_TIMEOUT_SEC", 35.0),
+            timeout_seconds=_resolver_timeout("top10", page=page),
             kwargs={
                 "request": request,
                 "body": payload,
@@ -1241,14 +1620,14 @@ async def _run_advisor_runner(
     payload: Dict[str, Any],
     page: str,
 ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-    runner, resolver_meta = await _resolve_advisor_runner(request)
+    runner, resolver_meta = await _resolve_advisor_runner(request, page=page)
     if runner is None:
         return None, {}
 
     try:
         out = await _call_with_tolerant_signatures(
             runner,
-            timeout_seconds=_timeout_seconds("TFB_ADVISOR_RUNNER_TIMEOUT_SEC", 35.0),
+            timeout_seconds=_resolver_timeout("runner", page=page),
             kwargs={
                 "request": request,
                 "body": payload,
@@ -1273,6 +1652,33 @@ async def _run_advisor_runner(
         return None, resolver_meta or {}
 
 
+async def _try_bridge_result(
+    *,
+    request: Request,
+    payload: Dict[str, Any],
+    page: str,
+    token: Optional[str],
+    x_app_token: Optional[str],
+    authorization: Optional[str],
+    request_id: str,
+) -> Optional[Dict[str, Any]]:
+    try:
+        result = await _delegate_to_bridge_sheet_rows(
+            request=request,
+            payload=payload,
+            include_matrix_q=_boolish(payload.get("include_matrix"), True),
+            token=token,
+            x_app_token=x_app_token,
+            authorization=authorization,
+            x_request_id=request_id,
+        )
+        if _has_usable_payload(result, page=page):
+            return result
+    except Exception as exc:
+        logger.warning("Bridge execution failed. page=%s error=%s", page, exc, exc_info=True)
+    return None
+
+
 async def _run_advisor_logic(
     *,
     request: Request,
@@ -1285,36 +1691,34 @@ async def _run_advisor_logic(
 ) -> Dict[str, Any]:
     started_at = time.perf_counter()
     _require_auth_or_401(token_query=token, x_app_token=x_app_token, authorization=authorization)
-    request_id = _request_id(request, x_request_id)
 
-    payload = _default_payload(payload, default_page=DEFAULT_ADVISOR_PAGE)
+    request_id = _request_id(request, x_request_id)
+    payload = _prepare_payload_for_downstream(payload, request_id=request_id, operation=operation)
     page = _extract_page(payload, default_page=DEFAULT_ADVISOR_PAGE)
+
     payload["page"] = page
     payload["sheet"] = page
     payload["sheet_name"] = page
 
     if _prefer_direct_bridge(page, operation=operation):
-        try:
-            advanced_result = await _delegate_to_bridge_sheet_rows(
-                request=request,
-                payload=payload,
-                include_matrix_q=_boolish(payload.get("include_matrix"), True),
-                token=token,
-                x_app_token=x_app_token,
-                authorization=authorization,
-                x_request_id=request_id,
+        bridge_result = await _try_bridge_result(
+            request=request,
+            payload=payload,
+            page=page,
+            token=token,
+            x_app_token=x_app_token,
+            authorization=authorization,
+            request_id=request_id,
+        )
+        if bridge_result is not None:
+            return _envelope_from_payload_result(
+                result=bridge_result,
+                page=page,
+                request_id=request_id,
+                started_at=started_at,
+                resolver_meta=_extract_meta_mapping(bridge_result).get("resolver"),
+                operation=operation,
             )
-            if _has_usable_payload(advanced_result, page=page):
-                return _envelope_from_payload_result(
-                    result=advanced_result,
-                    page=page,
-                    request_id=request_id,
-                    started_at=started_at,
-                    resolver_meta={"source": advanced_result.get("meta", {}).get("resolver", {}).get("source"), "kind": "bridge"},
-                    operation=operation,
-                )
-        except Exception as exc:
-            logger.warning("Bridge failed; falling back to engine. page=%s error=%s", page, exc, exc_info=True)
 
         engine_result = await _run_engine_sheet_rows_fallback(
             request=request,
@@ -1327,7 +1731,7 @@ async def _run_advisor_logic(
                 page=page,
                 request_id=request_id,
                 started_at=started_at,
-                resolver_meta={"source": "engine", "kind": "direct_fallback"},
+                resolver_meta=_extract_meta_mapping(engine_result).get("resolver"),
                 operation=operation,
             )
 
@@ -1347,6 +1751,26 @@ async def _run_advisor_logic(
                 operation=operation,
             )
 
+    if _prefer_bridge_before_runner(page, operation=operation):
+        bridge_result = await _try_bridge_result(
+            request=request,
+            payload=payload,
+            page=page,
+            token=token,
+            x_app_token=x_app_token,
+            authorization=authorization,
+            request_id=request_id,
+        )
+        if bridge_result is not None:
+            return _envelope_from_payload_result(
+                result=bridge_result,
+                page=page,
+                request_id=request_id,
+                started_at=started_at,
+                resolver_meta=_extract_meta_mapping(bridge_result).get("resolver"),
+                operation=operation,
+            )
+
     if _prefer_runner(page, operation=operation):
         runner_result, runner_meta = await _run_advisor_runner(
             request=request,
@@ -1363,27 +1787,24 @@ async def _run_advisor_logic(
                 operation=operation,
             )
 
-    try:
-        advanced_result = await _delegate_to_bridge_sheet_rows(
-            request=request,
-            payload=payload,
-            include_matrix_q=_boolish(payload.get("include_matrix"), True),
-            token=token,
-            x_app_token=x_app_token,
-            authorization=authorization,
-            x_request_id=request_id,
+    bridge_result = await _try_bridge_result(
+        request=request,
+        payload=payload,
+        page=page,
+        token=token,
+        x_app_token=x_app_token,
+        authorization=authorization,
+        request_id=request_id,
+    )
+    if bridge_result is not None:
+        return _envelope_from_payload_result(
+            result=bridge_result,
+            page=page,
+            request_id=request_id,
+            started_at=started_at,
+            resolver_meta=_extract_meta_mapping(bridge_result).get("resolver"),
+            operation=operation,
         )
-        if _has_usable_payload(advanced_result, page=page):
-            return _envelope_from_payload_result(
-                result=advanced_result,
-                page=page,
-                request_id=request_id,
-                started_at=started_at,
-                resolver_meta={"source": advanced_result.get("meta", {}).get("resolver", {}).get("source"), "kind": "fallback_bridge"},
-                operation=operation,
-            )
-    except Exception as exc:
-        logger.warning("Bridge fallback failed; page=%s error=%s", page, exc, exc_info=True)
 
     engine_result = await _run_engine_sheet_rows_fallback(
         request=request,
@@ -1396,7 +1817,7 @@ async def _run_advisor_logic(
             page=page,
             request_id=request_id,
             started_at=started_at,
-            resolver_meta={"source": "engine", "kind": "final_fallback"},
+            resolver_meta=_extract_meta_mapping(engine_result).get("resolver"),
             operation=operation,
         )
 
@@ -1408,7 +1829,7 @@ async def _run_advisor_logic(
 @router.get("/ping")
 async def advisor_health(request: Request) -> Dict[str, Any]:
     engine = await _get_engine(request)
-    runner, resolver_meta = await _resolve_advisor_runner(request)
+    runner, resolver_meta = await _resolve_advisor_runner(request, page=DEFAULT_ADVISOR_PAGE)
     bridge_impl, bridge_meta = await _resolve_bridge_impl()
     top10_builder, top10_meta = await _resolve_top10_builder(request)
 
@@ -1422,6 +1843,8 @@ async def advisor_health(request: Request) -> Dict[str, Any]:
                     settings_summary[key] = value
     except Exception:
         settings_summary = {}
+
+    contract_counts = {k: _contract_header_count(k) for k in KNOWN_CANONICAL_HEADER_COUNTS.keys()}
 
     return _json_safe({
         "status": "ok" if (engine is not None or runner is not None or bridge_impl is not None) else "degraded",
@@ -1439,6 +1862,7 @@ async def advisor_health(request: Request) -> Dict[str, Any]:
         "base_pages": sorted(BASE_PAGES),
         "derived_pages": sorted(DERIVED_ADVISOR_PAGES),
         "direct_bridge_pages": sorted(DIRECT_BRIDGE_PAGES),
+        "contract_header_counts": contract_counts,
         "open_mode": _is_open_mode_enabled(),
         "settings": settings_summary or None,
         "timestamp_utc": _now_utc(),
@@ -1449,7 +1873,7 @@ async def advisor_health(request: Request) -> Dict[str, Any]:
 @router.get("/meta")
 async def advisor_meta(request: Request) -> Dict[str, Any]:
     engine = await _get_engine(request)
-    runner, resolver_meta = await _resolve_advisor_runner(request)
+    runner, resolver_meta = await _resolve_advisor_runner(request, page=DEFAULT_ADVISOR_PAGE)
     bridge_impl, bridge_meta = await _resolve_bridge_impl()
     top10_builder, top10_meta = await _resolve_top10_builder(request)
     return _json_safe({
@@ -1465,6 +1889,7 @@ async def advisor_meta(request: Request) -> Dict[str, Any]:
         "bridge_impl": bridge_meta or None,
         "top10_builder_available": bool(top10_builder),
         "top10_builder": top10_meta or None,
+        "contract_header_counts": {k: _contract_header_count(k) for k in KNOWN_CANONICAL_HEADER_COUNTS.keys()},
         "timestamp_utc": _now_utc(),
         "request_id": _strip(getattr(request.state, "request_id", "")) or None,
     })
