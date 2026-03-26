@@ -2,10 +2,10 @@
 """
 core/yahoo_chart_provider.py
 ================================================================================
-YAHOO CHART COMPATIBILITY SHIM — v4.1.0
+YAHOO CHART COMPATIBILITY SHIM — v4.2.0
 ================================================================================
 SAFE • STARTUP-FRIENDLY • CANONICAL-DELEGATING • HISTORY-AWARE •
-COMMODITY/FX-TOLERANT • ROUTE/ENGINE COMPATIBLE
+COMMODITY/FX-TOLERANT • ROUTE/ENGINE COMPATIBLE • PAYLOAD-RECOVERY ENHANCED
 
 Purpose
 -------
@@ -19,10 +19,15 @@ What this revision improves
       - quoteResponse.result[0]
       - spark.result[0].response[0].meta
       - rows/history/prices/items/records
+      - common candle / OHLC array shapes
+      - DataFrame-like dict-of-dicts history payloads
 - FIX: derives quote-like fields from history more aggressively when live quote
       payloads are sparse, especially for commodities / FX.
-- FIX: preserves non-empty base fields when patch-style calls return weak data.
+- FIX: preserves stronger base fields during patch merges instead of letting thin
+      fallback payloads overwrite better upstream values.
 - FIX: broader commodity/FX identity defaults and display-name normalization.
+- FIX: better synthetic quote recovery for weak payloads, including last trade,
+      52W range, volume averages, RSI, volatility, drawdown, VaR, Sharpe.
 - FIX: safer compatibility wrapper for class-based callers.
 - FIX: keeps import-time behavior network-safe and startup-safe.
 """
@@ -50,7 +55,7 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Seq
 # Versioning / constants
 # =============================================================================
 
-SHIM_VERSION = "4.1.0"
+SHIM_VERSION = "4.2.0"
 VERSION = SHIM_VERSION
 PROVIDER_VERSION = SHIM_VERSION
 DATA_SOURCE = "yahoo_chart"
@@ -81,6 +86,7 @@ PRICE_FIELD_ALIASES = (
     "ask",
     "close",
     "last_close",
+    "navPrice",
 )
 PREV_CLOSE_ALIASES = (
     "previous_close",
@@ -92,7 +98,7 @@ PREV_CLOSE_ALIASES = (
 OPEN_ALIASES = ("open", "regularMarketOpen")
 HIGH_ALIASES = ("day_high", "high", "regularMarketDayHigh", "fiftyTwoWeekHigh", "dayHigh")
 LOW_ALIASES = ("day_low", "low", "regularMarketDayLow", "fiftyTwoWeekLow", "dayLow")
-VOLUME_ALIASES = ("volume", "regularMarketVolume", "averageDailyVolume3Month", "avgVolume")
+VOLUME_ALIASES = ("volume", "regularMarketVolume", "averageDailyVolume3Month", "avgVolume", "averageVolume")
 NAME_ALIASES = (
     "name",
     "shortName",
@@ -529,13 +535,13 @@ def _to_dict(value: Any) -> Dict[str, Any]:
             return {}
     if hasattr(value, "model_dump"):
         try:
-            dumped = value.model_dump()  # pydantic v2
+            dumped = value.model_dump()
             return dict(dumped) if isinstance(dumped, dict) else {}
         except Exception:
             pass
     if hasattr(value, "dict"):
         try:
-            dumped = value.dict()  # pydantic v1
+            dumped = value.dict()
             return dict(dumped) if isinstance(dumped, dict) else {}
         except Exception:
             pass
@@ -552,6 +558,16 @@ def _merge_nonempty(base: Optional[Dict[str, Any]], patch: Optional[Dict[str, An
     out = dict(base or {})
     for key, value in (patch or {}).items():
         if _is_nonempty(value) or key not in out:
+            out[key] = value
+    return out
+
+
+def _merge_prefer_base(base: Optional[Dict[str, Any]], patch: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    out = dict(base or {})
+    for key, value in (patch or {}).items():
+        if not _is_nonempty(out.get(key)) and _is_nonempty(value):
+            out[key] = value
+        elif key not in out:
             out[key] = value
     return out
 
@@ -617,6 +633,7 @@ def _identity_defaults_for_symbol(symbol: str) -> Dict[str, Any]:
         "symbol": sym,
         "symbol_normalized": sym,
         "requested_symbol": sym,
+        "instrument_type": kind,
     }
 
     if kind == "fx":
@@ -737,6 +754,71 @@ def _rows_from_parallel_arrays(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     return rows
 
 
+def _rows_from_candle_arrays(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    ts = payload.get("timestamp") or payload.get("timestamps") or payload.get("t") or []
+    opens = payload.get("open") or payload.get("o") or []
+    highs = payload.get("high") or payload.get("h") or []
+    lows = payload.get("low") or payload.get("l") or []
+    closes = payload.get("close") or payload.get("c") or []
+    vols = payload.get("volume") or payload.get("v") or []
+
+    if not isinstance(ts, list):
+        return []
+    if not any(isinstance(x, list) for x in (opens, highs, lows, closes, vols)) and not isinstance(closes, list):
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    for idx, raw_ts in enumerate(ts):
+        row = {
+            "timestamp": _normalize_timestamp(raw_ts),
+            "open": opens[idx] if isinstance(opens, list) and idx < len(opens) else None,
+            "high": highs[idx] if isinstance(highs, list) and idx < len(highs) else None,
+            "low": lows[idx] if isinstance(lows, list) and idx < len(lows) else None,
+            "close": closes[idx] if isinstance(closes, list) and idx < len(closes) else None,
+            "volume": vols[idx] if isinstance(vols, list) and idx < len(vols) else None,
+        }
+        row = _ensure_history_row(row)
+        if any(_is_nonempty(v) for v in row.values()):
+            rows.append(row)
+    return rows
+
+
+def _rows_from_dataframe_like(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    keys = {k.lower(): k for k in payload.keys()}
+    core_cols = [keys.get(k) for k in ("open", "high", "low", "close")]
+    if not any(core_cols):
+        return []
+
+    # pandas.to_dict() often yields {column: {index: value}}
+    if not any(isinstance(payload.get(col), dict) for col in core_cols if col):
+        return []
+
+    index_values: List[Any] = []
+    for col in core_cols:
+        if col and isinstance(payload.get(col), dict):
+            index_values = list(payload[col].keys())
+            if index_values:
+                break
+    if not index_values:
+        return []
+
+    rows: List[Dict[str, Any]] = []
+    for idx in index_values:
+        row = {
+            "timestamp": _normalize_timestamp(idx),
+            "open": payload.get(keys.get("open"), {}).get(idx) if keys.get("open") else None,
+            "high": payload.get(keys.get("high"), {}).get(idx) if keys.get("high") else None,
+            "low": payload.get(keys.get("low"), {}).get(idx) if keys.get("low") else None,
+            "close": payload.get(keys.get("close"), {}).get(idx) if keys.get("close") else None,
+            "adj_close": payload.get(keys.get("adj_close") or keys.get("adjclose"), {}).get(idx) if keys.get("adj_close") or keys.get("adjclose") else None,
+            "volume": payload.get(keys.get("volume"), {}).get(idx) if keys.get("volume") else None,
+        }
+        row = _ensure_history_row(row)
+        if any(_is_nonempty(v) for v in row.values()):
+            rows.append(row)
+    return rows
+
+
 def _extract_candidate_dicts(payload_dict: Dict[str, Any]) -> List[Dict[str, Any]]:
     candidates: List[Dict[str, Any]] = [payload_dict]
 
@@ -751,6 +833,9 @@ def _extract_candidate_dicts(payload_dict: Dict[str, Any]) -> List[Dict[str, Any
         ("chart", "result", 0),
         ("result", 0),
         ("response", 0),
+        ("data", 0),
+        ("items", 0),
+        ("records", 0),
     ]
     for path in paths:
         value = _deep_get(payload_dict, path, default=None)
@@ -787,11 +872,19 @@ def _extract_history_rows(payload: Any) -> List[Dict[str, Any]]:
     if any(key in payload_dict for key in HISTORY_ROW_KEYS):
         return [_ensure_history_row(payload_dict)]
 
-    for key in ("rows", "history", "prices", "data", "items", "records"):
+    for key in ("rows", "history", "prices", "data", "items", "records", "candles", "ohlcv"):
         nested = payload_dict.get(key)
         rows = _extract_history_rows(nested)
         if rows:
             return rows
+
+    dataframe_rows = _rows_from_dataframe_like(payload_dict)
+    if dataframe_rows:
+        return dataframe_rows
+
+    candle_rows = _rows_from_candle_arrays(payload_dict)
+    if candle_rows:
+        return candle_rows
 
     chart_root = _deep_get(payload_dict, ["chart", "result", 0], default=None)
     if isinstance(chart_root, dict):
@@ -834,7 +927,7 @@ def _derive_quote_from_rows(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     opens_valid = [v for v in opens if v is not None]
     vols_valid = [v for v in volumes if v is not None]
 
-    current = _coerce_float(_safe_get(latest, "close", "adj_close", "adjclose"))
+    current = _coerce_float(_safe_get(latest, "close", "adj_close", "adjclose", "high", "low", "open"))
     previous_close = _coerce_float(_safe_get(previous, "close", "adj_close", "adjclose"))
     if previous_close is None and len(closes_valid) >= 2:
         previous_close = closes_valid[-2]
@@ -870,7 +963,6 @@ def _derive_quote_from_rows(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         hi = max(highs_valid)
         out["52w_position_pct"] = ((current - lo) / (hi - lo)) * 100.0
 
-    # Lightweight stats that help the engine fill commodity/FX rows.
     if len(closes_valid) >= 2:
         rets: List[float] = []
         for i in range(1, len(closes_valid)):
@@ -927,6 +1019,8 @@ def _derive_quote_from_chart_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     meta = chart_root.get("meta") if isinstance(chart_root.get("meta"), dict) else {}
     rows = _rows_from_parallel_arrays(chart_root)
+    if not rows:
+        rows = _rows_from_candle_arrays(chart_root)
     derived = _derive_quote_from_rows(rows)
 
     result: Dict[str, Any] = {
@@ -943,6 +1037,8 @@ def _derive_quote_from_chart_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "52w_high": _coerce_float(_safe_get(meta, "fiftyTwoWeekHigh", "fifty_two_week_high", "52w_high")),
         "52w_low": _coerce_float(_safe_get(meta, "fiftyTwoWeekLow", "fifty_two_week_low", "52w_low")),
         "market_state": _safe_get(meta, "marketState", "market_state"),
+        "instrument_type": _safe_get(meta, "instrumentType", "quoteType", "typeDisp"),
+        "exchange_timezone": _safe_get(meta, "exchangeTimezoneName", "timezone"),
     }
 
     result = _merge_nonempty(derived, result)
@@ -1020,6 +1116,8 @@ def _normalize_quote_payload(payload: Any, *, symbol: str) -> Dict[str, Any]:
                 "long_name": _safe_get(candidate, "longName", "long_name"),
                 "short_name": _safe_get(candidate, "shortName", "short_name"),
                 "market_state": _safe_get(candidate, "market_state", "marketState"),
+                "instrument_type": _safe_get(candidate, "instrumentType", "quoteType", "typeDisp"),
+                "exchange_timezone": _safe_get(candidate, "exchangeTimezoneName", "timezone"),
             },
         )
 
@@ -1047,7 +1145,7 @@ def _normalize_quote_payload(payload: Any, *, symbol: str) -> Dict[str, Any]:
     if warnings:
         out["warnings"] = warnings
 
-    return {k: v for k, v in out.items() if _is_nonempty(v) or k in {"symbol", "symbol_normalized", "requested_symbol"}}
+    return {k: v for k, v in out.items() if _is_nonempty(v) or k in {"symbol", "symbol_normalized", "requested_symbol", "instrument_type"}}
 
 
 def _normalize_history_payload(payload: Any, *, symbol: str) -> List[Dict[str, Any]]:
@@ -1075,10 +1173,10 @@ def _normalize_history_payload(payload: Any, *, symbol: str) -> List[Dict[str, A
 
 def _normalize_patch_payload(payload: Any, *, symbol: str, base: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     patch = _normalize_quote_payload(payload, symbol=symbol)
-    merged = _merge_nonempty(base or {}, patch)
+    merged = _merge_prefer_base(base or {}, patch)
     if not _is_nonempty(merged.get("current_price")) and not _is_nonempty(merged.get("price")):
         rows = _normalize_history_payload(payload, symbol=symbol)
-        merged = _merge_nonempty(merged, _derive_quote_from_rows(rows))
+        merged = _merge_prefer_base(merged, _derive_quote_from_rows(rows))
     return merged
 
 
@@ -1086,8 +1184,7 @@ def _ensure_shape(payload: Any, *, symbol: str, provider_version: Optional[str],
     sym = _safe_symbol(symbol)
 
     if result_kind == "history":
-        rows = _normalize_history_payload(payload, symbol=sym)
-        return rows
+        return _normalize_history_payload(payload, symbol=sym)
 
     if result_kind == "patch":
         base = None
@@ -1462,9 +1559,9 @@ async def _default_quote(symbol: str, *args, **kwargs) -> Dict[str, Any]:
 
 
 async def _default_patch(symbol: str, base: Optional[Dict[str, Any]] = None, *args, **kwargs) -> Dict[str, Any]:
-    out = dict(base or {})
-    out.update(await _default_quote(symbol, *args, **kwargs))
-    return out
+    base_dict = dict(base or {})
+    fallback = await _default_quote(symbol, *args, **kwargs)
+    return _merge_prefer_base(base_dict, fallback)
 
 
 async def _default_history(*args, **kwargs) -> List[Dict[str, Any]]:
