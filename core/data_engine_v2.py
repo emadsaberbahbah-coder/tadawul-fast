@@ -2,10 +2,10 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.42.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.43.0
 ================================================================================
 
-WHY v5.42.0
+WHY v5.43.0
 -----------
 - FIX: keeps rows / rows_matrix strictly matrix-aligned to keys while
        row_objects / items / records / data / quotes stay dict-row payloads.
@@ -21,6 +21,10 @@ WHY v5.42.0
        and more stable opportunity/recommendation support.
 - FIX: preserves aligned snapshots and route compatibility aliases expected by
        advisor / advanced / enriched wrappers and direct router calls.
+- FIX: adds commodity/FX self-recovery from chart/history payloads when live
+       quote payloads are sparse or unavailable.
+- FIX: applies symbol-aware page defaults so Commodities_FX rows keep useful
+       identity/context fields even during provider degradation.
 
 Design goals
 ------------
@@ -72,7 +76,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.42.0"
+__version__ = "5.43.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -478,6 +482,9 @@ def _dedupe_keep_order(items: Sequence[Any]) -> List[Any]:
             continue
         seen.add(item)
         out.append(item)
+    out = _apply_symbol_context_defaults(out, symbol=inferred_symbol)
+    if _as_float(out.get("current_price")) is not None and _safe_str(out.get("warnings")).lower() == "no live provider data available":
+        out["warnings"] = "Recovered from history/chart fallback"
     return out
 
 
@@ -1066,6 +1073,22 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
 }
 
 _COMMODITY_SYMBOL_HINTS: Tuple[str, ...] = ("GC=F", "SI=F", "BZ=F", "CL=F", "NG=F", "HG=F")
+_COMMODITY_DISPLAY_NAMES: Dict[str, str] = {
+    "GC=F": "Gold Futures",
+    "SI=F": "Silver Futures",
+    "BZ=F": "Brent Crude Futures",
+    "CL=F": "WTI Crude Futures",
+    "NG=F": "Natural Gas Futures",
+    "HG=F": "Copper Futures",
+}
+_COMMODITY_INDUSTRY_HINTS: Dict[str, str] = {
+    "GC=F": "Precious Metals",
+    "SI=F": "Precious Metals",
+    "HG=F": "Industrial Metals",
+    "BZ=F": "Energy",
+    "CL=F": "Energy",
+    "NG=F": "Energy",
+}
 
 
 def _is_blank_value(value: Any) -> bool:
@@ -1179,7 +1202,12 @@ def _infer_currency_from_symbol(symbol: str) -> str:
     if s.endswith(".SR") or re.match(r"^[0-9]{4}$", s):
         return "SAR"
     if s.endswith("=X"):
-        return s[:3] if len(s) >= 3 else "FX"
+        pair = s[:-2]
+        if len(pair) >= 6:
+            return pair[-3:]
+        if pair:
+            return pair
+        return "FX"
     if s.endswith("=F"):
         return "USD"
     return "USD"
@@ -1192,6 +1220,90 @@ def _infer_country_from_symbol(symbol: str) -> str:
     if s.endswith("=X") or s.endswith("=F"):
         return "Global"
     return "USA"
+
+
+def _infer_sector_from_symbol(symbol: str) -> str:
+    s = normalize_symbol(symbol)
+    if s.endswith("=X"):
+        return "Currencies"
+    if s.endswith("=F") or s in _COMMODITY_SYMBOL_HINTS:
+        return "Commodities"
+    if s.endswith(".SR") or re.match(r"^[0-9]{4}$", s):
+        return "Saudi Market"
+    return ""
+
+
+def _infer_industry_from_symbol(symbol: str) -> str:
+    s = normalize_symbol(symbol)
+    if s in _COMMODITY_INDUSTRY_HINTS:
+        return _COMMODITY_INDUSTRY_HINTS[s]
+    if s.endswith("=X"):
+        return "Foreign Exchange"
+    if s.endswith("=F"):
+        return "Commodity Futures"
+    if s.endswith(".SR") or re.match(r"^[0-9]{4}$", s):
+        return "Listed Equities"
+    return ""
+
+
+def _infer_display_name_from_symbol(symbol: str) -> str:
+    s = normalize_symbol(symbol)
+    if not s:
+        return ""
+    if s in _COMMODITY_DISPLAY_NAMES:
+        return _COMMODITY_DISPLAY_NAMES[s]
+    if s.endswith("=X"):
+        pair = s[:-2]
+        if len(pair) >= 6:
+            return f"{pair[:3]}/{pair[3:6]}"
+        return f"{pair} FX" if pair else s
+    if s.endswith("=F"):
+        return _safe_str(s.replace("=F", "")).strip() or s
+    return s
+
+
+def _apply_symbol_context_defaults(row: Dict[str, Any], symbol: str = "", page: str = "") -> Dict[str, Any]:
+    out = dict(row or {})
+    sym = normalize_symbol(symbol or _safe_str(out.get("symbol") or out.get("ticker") or out.get("requested_symbol")))
+    if not sym:
+        return out
+
+    page = _canonicalize_sheet_name(page) if page else ""
+
+    if not out.get("symbol"):
+        out["symbol"] = sym
+    if not out.get("requested_symbol"):
+        out["requested_symbol"] = sym
+    if not out.get("symbol_normalized"):
+        out["symbol_normalized"] = sym
+
+    if page == "Commodities_FX" or sym.endswith("=F") or sym.endswith("=X"):
+        out.setdefault("asset_class", _infer_asset_class_from_symbol(sym))
+        out.setdefault("exchange", _infer_exchange_from_symbol(sym))
+        out.setdefault("currency", _infer_currency_from_symbol(sym))
+        out.setdefault("country", _infer_country_from_symbol(sym))
+        out.setdefault("sector", _infer_sector_from_symbol(sym))
+        out.setdefault("industry", _infer_industry_from_symbol(sym))
+
+        current_name = _safe_str(out.get("name"))
+        inferred_name = _infer_display_name_from_symbol(sym)
+        if not current_name or current_name == sym:
+            out["name"] = inferred_name or sym
+
+        if sym.endswith("=X"):
+            out.setdefault("market_cap", None)
+            out.setdefault("float_shares", None)
+            out.setdefault("beta_5y", None)
+        if sym.endswith("=F"):
+            out.setdefault("market_cap", None)
+            out.setdefault("float_shares", None)
+
+        if out.get("invest_period_label") in (None, ""):
+            out["invest_period_label"] = "1Y"
+        if out.get("horizon_days") in (None, ""):
+            out["horizon_days"] = 365
+
+    return out
 
 
 def _coerce_datetime_like(value: Any) -> Optional[str]:
@@ -1221,16 +1333,22 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
                 out[field] = _json_safe(_to_scalar(val))
                 break
 
-    if not out.get("name"):
-        out["name"] = out.get("symbol") or normalized_symbol or requested_symbol
+    inferred_symbol = out.get("symbol") or normalized_symbol or requested_symbol
+    inferred_name = _infer_display_name_from_symbol(inferred_symbol)
+    if not out.get("name") or _safe_str(out.get("name")) == _safe_str(inferred_symbol):
+        out["name"] = inferred_name or out.get("symbol") or normalized_symbol or requested_symbol
     if not out.get("asset_class"):
-        out["asset_class"] = _infer_asset_class_from_symbol(out.get("symbol") or normalized_symbol or requested_symbol)
+        out["asset_class"] = _infer_asset_class_from_symbol(inferred_symbol)
     if not out.get("exchange"):
-        out["exchange"] = _infer_exchange_from_symbol(out.get("symbol") or normalized_symbol or requested_symbol)
+        out["exchange"] = _infer_exchange_from_symbol(inferred_symbol)
     if not out.get("currency"):
-        out["currency"] = _infer_currency_from_symbol(out.get("symbol") or normalized_symbol or requested_symbol)
+        out["currency"] = _infer_currency_from_symbol(inferred_symbol)
     if not out.get("country"):
-        out["country"] = _infer_country_from_symbol(out.get("symbol") or normalized_symbol or requested_symbol)
+        out["country"] = _infer_country_from_symbol(inferred_symbol)
+    if not out.get("sector"):
+        out["sector"] = _infer_sector_from_symbol(inferred_symbol)
+    if not out.get("industry"):
+        out["industry"] = _infer_industry_from_symbol(inferred_symbol)
 
     if provider and not out.get("data_provider"):
         out["data_provider"] = provider
@@ -1283,6 +1401,10 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
     if upl is not None and pos_cost not in (None, 0) and out.get("unrealized_pl_pct") is None:
         out["unrealized_pl_pct"] = round((upl / pos_cost) * 100.0, 6)
 
+    out = _apply_symbol_context_defaults(out, symbol=inferred_symbol)
+    if _as_float(out.get("current_price")) is not None and _safe_str(out.get("warnings")).lower() == "no live provider data available":
+        out["warnings"] = "Recovered from history/chart fallback"
+
     return out
 
 
@@ -1303,6 +1425,31 @@ def _normalize_to_schema_keys(keys: Sequence[str], headers: Sequence[str], row: 
                 found = True
                 break
         out[key] = _json_safe(_to_scalar(val)) if found else None
+    return out
+
+
+def _apply_page_row_backfill(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
+    target = _canonicalize_sheet_name(sheet)
+    out = _apply_symbol_context_defaults(dict(row or {}), page=target)
+    sym = normalize_symbol(_safe_str(out.get("symbol") or out.get("requested_symbol")))
+
+    if target == "Commodities_FX" or sym.endswith("=F") or sym.endswith("=X"):
+        out.setdefault("data_provider", _safe_str(out.get("data_provider"), "history_or_fallback"))
+        if out.get("forecast_confidence") in (None, ""):
+            out["forecast_confidence"] = 0.55
+        if out.get("confidence_score") in (None, ""):
+            out["confidence_score"] = 55.0
+        if out.get("forecast_confidence") not in (None, "") and out.get("confidence_bucket") in (None, ""):
+            conf = _as_float(out.get("confidence_score")) or ((_as_float(out.get("forecast_confidence")) or 0.55) * 100.0)
+            out["confidence_bucket"] = "HIGH" if conf >= 75 else "MODERATE" if conf >= 55 else "LOW"
+        if out.get("warnings") in (None, "") and _as_float(out.get("current_price")) is None:
+            out["warnings"] = "Live quote sparse; chart/history fallback unavailable"
+
+    if target == "Mutual_Funds" and out.get("asset_class") in (None, ""):
+        out["asset_class"] = "Fund"
+        out.setdefault("sector", "Diversified")
+        out.setdefault("industry", "Mutual Funds")
+
     return out
 
 
@@ -1870,6 +2017,10 @@ class DataEngineV5:
         self.enabled_providers = _get_env_list("ENABLED_PROVIDERS", DEFAULT_PROVIDERS)
         self.ksa_providers = _get_env_list("KSA_PROVIDERS", DEFAULT_KSA_PROVIDERS)
         self.global_providers = _get_env_list("GLOBAL_PROVIDERS", DEFAULT_GLOBAL_PROVIDERS)
+        self.history_fallback_providers = _get_env_list(
+            "HISTORY_FALLBACK_PROVIDERS",
+            ["yahoo_chart", "yahoo", "eodhd", "finnhub", "tadawul", "argaam"],
+        )
         self.max_concurrency = _get_env_int("DATA_ENGINE_MAX_CONCURRENCY", 25)
         self.request_timeout = _get_env_float("DATA_ENGINE_TIMEOUT_SECONDS", 20.0)
         self.ksa_disallow_eodhd = _get_env_bool("KSA_DISALLOW_EODHD", True)
@@ -2528,6 +2679,35 @@ class DataEngineV5:
                 out.append(p)
         return out
 
+    def _rows_from_parallel_series(
+        self,
+        timestamps: Sequence[Any],
+        opens: Optional[Sequence[Any]] = None,
+        highs: Optional[Sequence[Any]] = None,
+        lows: Optional[Sequence[Any]] = None,
+        closes: Optional[Sequence[Any]] = None,
+        volumes: Optional[Sequence[Any]] = None,
+        adjcloses: Optional[Sequence[Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        ts_list = list(timestamps or [])
+        if not ts_list:
+            return []
+
+        rows: List[Dict[str, Any]] = []
+        for idx, ts in enumerate(ts_list):
+            row = {
+                "timestamp": ts,
+                "open": opens[idx] if opens is not None and idx < len(opens) else None,
+                "high": highs[idx] if highs is not None and idx < len(highs) else None,
+                "low": lows[idx] if lows is not None and idx < len(lows) else None,
+                "close": closes[idx] if closes is not None and idx < len(closes) else None,
+                "volume": volumes[idx] if volumes is not None and idx < len(volumes) else None,
+                "adjclose": adjcloses[idx] if adjcloses is not None and idx < len(adjcloses) else None,
+            }
+            if any(v is not None for k, v in row.items() if k != "timestamp"):
+                rows.append(row)
+        return rows
+
     def _coerce_history_rows(self, result: Any) -> List[Dict[str, Any]]:
         if result is None:
             return []
@@ -2542,7 +2722,14 @@ class DataEngineV5:
             out: List[Dict[str, Any]] = []
             for item in result:
                 if isinstance(item, dict):
-                    out.append(dict(item))
+                    if {"open", "high", "low", "close"} & set(item.keys()) and not isinstance(item.get("open"), list):
+                        out.append(dict(item))
+                    else:
+                        nested = self._coerce_history_rows(item)
+                        if nested:
+                            out.extend(nested)
+                        else:
+                            out.append(dict(item))
                 elif isinstance(item, (list, tuple)) and len(item) >= 5:
                     out.append({
                         "timestamp": item[0],
@@ -2554,6 +2741,76 @@ class DataEngineV5:
                     })
             return out
         if isinstance(result, dict):
+            # Yahoo chart-style payloads
+            if isinstance(result.get("chart"), Mapping):
+                chart = result.get("chart") or {}
+                nested = self._coerce_history_rows(chart.get("result"))
+                if nested:
+                    return nested
+
+            if isinstance(result.get("result"), list):
+                for item in result.get("result") or []:
+                    nested = self._coerce_history_rows(item)
+                    if nested:
+                        return nested
+
+            timestamps = result.get("timestamp") or result.get("timestamps") or result.get("time")
+            if isinstance(timestamps, list) and timestamps:
+                indicators = result.get("indicators") if isinstance(result.get("indicators"), Mapping) else {}
+                quote = None
+                if isinstance(indicators.get("quote"), list) and indicators.get("quote"):
+                    quote = indicators.get("quote")[0]
+                adj = None
+                if isinstance(indicators.get("adjclose"), list) and indicators.get("adjclose"):
+                    adj = indicators.get("adjclose")[0]
+                if isinstance(quote, Mapping):
+                    rows = self._rows_from_parallel_series(
+                        timestamps=timestamps,
+                        opens=list(quote.get("open") or []),
+                        highs=list(quote.get("high") or []),
+                        lows=list(quote.get("low") or []),
+                        closes=list(quote.get("close") or []),
+                        volumes=list(quote.get("volume") or []),
+                        adjcloses=list(adj.get("adjclose") or []) if isinstance(adj, Mapping) else None,
+                    )
+                    if rows:
+                        return rows
+
+            # Generic parallel-array payloads
+            if any(isinstance(result.get(k), list) for k in ("close", "open", "high", "low", "volume")):
+                ts = result.get("timestamp") or list(range(len(result.get("close") or result.get("price") or [])))
+                rows = self._rows_from_parallel_series(
+                    timestamps=list(ts or []),
+                    opens=list(result.get("open") or []),
+                    highs=list(result.get("high") or []),
+                    lows=list(result.get("low") or []),
+                    closes=list(result.get("close") or result.get("adjclose") or result.get("price") or result.get("value") or []),
+                    volumes=list(result.get("volume") or []),
+                    adjcloses=list(result.get("adjclose") or []),
+                )
+                if rows:
+                    return rows
+
+            # AlphaVantage-style keyed time series
+            for key in ("Time Series (Daily)", "time_series", "series"):
+                series = result.get(key)
+                if isinstance(series, Mapping):
+                    rows: List[Dict[str, Any]] = []
+                    for ts, entry in series.items():
+                        if not isinstance(entry, Mapping):
+                            continue
+                        rows.append({
+                            "timestamp": ts,
+                            "open": entry.get("1. open") or entry.get("open"),
+                            "high": entry.get("2. high") or entry.get("high"),
+                            "low": entry.get("3. low") or entry.get("low"),
+                            "close": entry.get("4. close") or entry.get("close"),
+                            "volume": entry.get("5. volume") or entry.get("volume"),
+                        })
+                    if rows:
+                        rows.sort(key=lambda r: _safe_str(r.get("timestamp")))
+                        return rows
+
             for key in ("history", "bars", "candles", "prices", "data", "items", "rows", "chart"):
                 if key in result:
                     nested = self._coerce_history_rows(result.get(key))
@@ -2683,7 +2940,27 @@ class DataEngineV5:
         if module is None:
             return {}
         callables = []
-        for name in ("get_history", "fetch_history", "get_price_history", "fetch_price_history", "history", "get_chart", "fetch_chart", "get_ohlcv", "fetch_ohlcv"):
+        for name in (
+            "get_history",
+            "fetch_history",
+            "get_price_history",
+            "fetch_price_history",
+            "history",
+            "get_chart",
+            "fetch_chart",
+            "get_chart_history",
+            "fetch_chart_history",
+            "get_historical_data",
+            "fetch_historical_data",
+            "get_history_rows",
+            "fetch_history_rows",
+            "get_timeseries",
+            "fetch_timeseries",
+            "get_series",
+            "fetch_series",
+            "get_ohlcv",
+            "fetch_ohlcv",
+        ):
             fn = getattr(module, name, None)
             if callable(fn):
                 callables.append(fn)
@@ -2692,8 +2969,12 @@ class DataEngineV5:
         variants = [
             ((symbol,), {"period": "1y", "interval": "1d"}),
             ((symbol,), {"range": "1y", "interval": "1d"}),
+            ((symbol,), {"lookback": "1y", "interval": "1d"}),
             ((), {"symbol": symbol, "period": "1y", "interval": "1d"}),
             ((), {"ticker": symbol, "period": "1y", "interval": "1d"}),
+            ((), {"code": symbol, "period": "1y", "interval": "1d"}),
+            ((), {"symbol": symbol, "range": "1y", "interval": "1d"}),
+            ((), {"ticker": symbol, "range": "1y", "interval": "1d"}),
             ((symbol,), {}),
         ]
         for fn in callables:
@@ -2713,7 +2994,20 @@ class DataEngineV5:
         return {}
 
     async def _get_history_patch_best_effort(self, symbol: str, providers: Sequence[str]) -> Dict[str, Any]:
-        for provider in providers:
+        candidates: List[str] = []
+        for provider in list(providers or []):
+            if provider and provider not in candidates:
+                candidates.append(provider)
+
+        preferred_history = list(self.history_fallback_providers or [])
+        if symbol.endswith("=F") or symbol.endswith("=X"):
+            preferred_history = ["yahoo_chart", "yahoo", "eodhd", "finnhub"] + preferred_history
+
+        for provider in preferred_history:
+            if provider and provider not in candidates and provider in self.enabled_providers + preferred_history:
+                candidates.append(provider)
+
+        for provider in candidates:
             patch = await self._fetch_history_patch(provider, symbol)
             if patch:
                 return patch
@@ -2776,6 +3070,7 @@ class DataEngineV5:
                 "last_updated_utc": _now_utc_iso(),
                 "last_updated_riyadh": _now_riyadh_iso(),
             }
+            row = _apply_symbol_context_defaults(row, symbol=_safe_str(symbol))
             _compute_scores_fallback(row)
             _compute_recommendation(row)
             return UnifiedQuote(**row)
@@ -2802,7 +3097,7 @@ class DataEngineV5:
                 "symbol": norm,
                 "symbol_normalized": norm,
                 "requested_symbol": _safe_str(symbol),
-                "name": norm,
+                "name": _infer_display_name_from_symbol(norm) or norm,
                 "current_price": None,
                 "data_sources": [],
                 "provider_latency": {},
@@ -2811,7 +3106,13 @@ class DataEngineV5:
                 "last_updated_riyadh": _now_riyadh_iso(),
             }
 
+        row = _apply_symbol_context_defaults(row, symbol=norm)
+
         missing_history_fields = [
+            "current_price",
+            "previous_close",
+            "day_high",
+            "day_low",
             "week_52_high",
             "week_52_low",
             "avg_volume_10d",
@@ -2827,6 +3128,12 @@ class DataEngineV5:
             hist_patch = await self._get_history_patch_best_effort(norm, providers)
             if hist_patch:
                 row = self._merge(symbol, norm, patches_ok + [(hist_patch.get("data_provider") or "history", hist_patch, 0.0)])
+                row = _apply_symbol_context_defaults(row, symbol=norm)
+
+        if _as_float(row.get("current_price")) is not None and _safe_str(row.get("warnings")).lower() == "no live provider data available":
+            row["warnings"] = "Recovered from history/chart fallback"
+        elif _as_float(row.get("current_price")) is None and not row.get("warnings"):
+            row["warnings"] = "No live quote payload and no usable history fallback"
 
         _compute_scores_fallback(row)
         _compute_recommendation(row)
@@ -3457,6 +3764,7 @@ class DataEngineV5:
                         for k, v in quote_map[sym].items():
                             if merged.get(k) in (None, "", [], {}):
                                 merged[k] = v
+                    merged = _apply_page_row_backfill(target_sheet, merged)
                     _compute_scores_fallback(merged)
                     _compute_recommendation(merged)
                     enriched_rows.append(_strict_project_row(out_keys, _normalize_to_schema_keys(out_keys, out_headers, merged)))
@@ -3523,7 +3831,7 @@ class DataEngineV5:
         if requested_symbols:
             quotes = await self.get_enriched_quotes(requested_symbols, schema=None)
             for q in quotes:
-                row = _model_to_dict(q)
+                row = _apply_page_row_backfill(target_sheet, _model_to_dict(q))
                 rows_full.append(_strict_project_row(out_keys, _normalize_to_schema_keys(out_keys, out_headers, row)))
             _apply_rank_overall(rows_full)
 
@@ -3612,6 +3920,7 @@ class DataEngineV5:
             "enabled_providers": list(self.enabled_providers),
             "ksa_providers": list(self.ksa_providers),
             "global_providers": list(self.global_providers),
+            "history_fallback_providers": list(self.history_fallback_providers),
             "ksa_disallow_eodhd": bool(self.ksa_disallow_eodhd),
             "flags": dict(self.flags),
             "provider_stats": await self._registry.get_stats(),
