@@ -2,7 +2,7 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.2.0)
+TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.3.0)
 ================================================================================
 ALIGNED • DEPLOYMENT-SAFE • PRE-MOUNT + STARTUP-VERIFY • ROUTER-SNAPSHOT-AWARE
 ENGINE-STATE-AWARE • OPENAPI-SAFE • RENDER-HEALTH-PROBE-SAFE • PRIORITY-MOUNTED
@@ -11,26 +11,19 @@ STRICT-JSON-READY • PREEXISTING-ENGINE SAFE • ROUTE-VERIFY SAFE • DEBUG-HA
 V1-HEALTH-ALIAS SAFE • V1-META-ALIAS SAFE • HEAD-PROBE SAFE
 CONTROLLED-ROUTE-OWNERSHIP • PARTIAL-DUPLICATE-BLOCK SAFE • FILTERED-MOUNT SAFE
 ADVANCED-SHEET-ROWS OWNER FIXED • STRICT-JSON SAFE • ADVISOR-FAMILY NORMALIZED
-HEALTH-COUNT DE-NOISED
+HEALTH-COUNT DE-NOISED • NO-RESPONSE GUARD SAFE • ROOT-SHEET-ROWS DIAGNOSTICS
 
-Why this revision (v8.2.0)
+Why this revision (v8.3.0)
 --------------------------
-- ✅ FIX: health/startup validation now treats advisor routes as satisfied when
-        any of these families are present:
-        - /v1/advisor/*
-        - /v1/investment_advisor/*
-        - /v1/investment-advisor/*
-- ✅ FIX: controlled protected-prefix ownership now explicitly includes both
-        investment-advisor families, preventing accidental route reclamation.
-- ✅ FIX: compatibility checks now validate the investment-advisor families too.
-- ✅ FIX: `routes_failed_count` now reflects effective functional failures and
-        ignores optional/non-critical route modules that do not affect the live
-        API contract.
-- ✅ FIX: startup metadata now exposes advisor-family presence diagnostics,
-        making it easier to distinguish a real missing router from a naming
-        mismatch.
-- ✅ SAFE: preserves strict JSON rendering, route mounting behavior, engine init,
-        middleware, docs, auth, and shutdown behavior.
+- FIX: adds a response guard middleware that converts downstream
+       `RuntimeError: No response returned.` into strict JSON instead of letting
+       the request collapse ambiguously.
+- FIX: startup/runtime metadata now exposes canonical path owner diagnostics for
+       critical paths like `/sheet-rows` and `/v1/advanced/sheet-rows`.
+- FIX: route verification keeps controlled ownership but now surfaces exact
+       owner mismatches more clearly in debug/meta signals.
+- SAFE: preserves strict JSON rendering, route mounting behavior, engine init,
+       middleware, docs, auth, and shutdown behavior.
 """
 
 from __future__ import annotations
@@ -57,6 +50,9 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.gzip import GZipMiddleware
 
 
+# =============================================================================
+# JSON safety
+# =============================================================================
 def _scrub_text(value: Any) -> str:
     try:
         s = value if isinstance(value, str) else str(value)
@@ -184,7 +180,7 @@ class _StrictJSONResponse(JSONResponse):
         ).encode("utf-8")
 
 
-APP_ENTRY_VERSION = "8.2.0"
+APP_ENTRY_VERSION = "8.3.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
@@ -251,6 +247,9 @@ _OPTIONAL_ROUTE_MODULES: Set[str] = {
 }
 
 
+# =============================================================================
+# Env / generic helpers
+# =============================================================================
 def _env_str(name: str, default: str = "") -> str:
     v = os.getenv(name)
     return default if v is None else str(v).strip()
@@ -319,6 +318,25 @@ def _paths_start_with_any(paths: Set[str], *prefixes: str) -> bool:
     return any(any(path.startswith(prefix) for prefix in prefixes) for path in paths)
 
 
+def _request_id_from_request(request: Request) -> str:
+    try:
+        rid = str(getattr(request.state, "request_id", "") or "").strip()
+        if rid:
+            return rid
+    except Exception:
+        pass
+    try:
+        hdr = str(request.headers.get("X-Request-ID", "") or "").strip()
+        if hdr:
+            return hdr
+    except Exception:
+        pass
+    return uuid.uuid4().hex[:12]
+
+
+# =============================================================================
+# Logging
+# =============================================================================
 class _JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         payload = {
@@ -363,6 +381,9 @@ def _setup_logging() -> logging.Logger:
 logger = _setup_logging()
 
 
+# =============================================================================
+# Settings
+# =============================================================================
 @dataclass(frozen=True)
 class _SettingsView:
     APP_NAME: str = "Tadawul Fast Bridge"
@@ -517,6 +538,9 @@ def _load_settings() -> _SettingsView:
 _SETTINGS = _load_settings()
 
 
+# =============================================================================
+# App state defaults
+# =============================================================================
 def _default_routes_snapshot() -> Dict[str, Any]:
     return {
         "mounted": [],
@@ -548,6 +572,8 @@ def _default_routes_snapshot() -> Dict[str, Any]:
         "route_family_presence": {},
         "effective_failed_modules": [],
         "optional_route_modules": sorted(list(_OPTIONAL_ROUTE_MODULES)),
+        "canonical_path_owners": {},
+        "canonical_path_owner_mismatches": {},
     }
 
 
@@ -572,6 +598,9 @@ def _ensure_app_state_defaults(app: FastAPI) -> None:
         app.state.startup_warnings = []
 
 
+# =============================================================================
+# Auth
+# =============================================================================
 def _call_auth_ok_flexible(fn: Any, request: Request, token_value: str, authorization: str) -> bool:
     path = str(getattr(getattr(request, "url", None), "path", "") or "")
     headers_dict = dict(request.headers)
@@ -682,6 +711,9 @@ def _auth_ok(request: Request) -> bool:
     return False
 
 
+# =============================================================================
+# Middleware
+# =============================================================================
 class RequestIDMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         request_id = request.headers.get("X-Request-ID", "").strip() or uuid.uuid4().hex[:12]
@@ -694,6 +726,49 @@ class RequestIDMiddleware(BaseHTTPMiddleware):
         return response
 
 
+class NoResponseGuardMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        request_id = _request_id_from_request(request)
+        try:
+            response = await call_next(request)
+            if response is None:
+                logger.error(
+                    "Downstream returned None response",
+                    extra={"request_id": request_id, "path": str(request.url.path), "status_code": 500},
+                )
+                return _StrictJSONResponse(
+                    status_code=500,
+                    content={
+                        "status": "error",
+                        "error": "RuntimeError: No response returned.",
+                        "path": str(request.url.path),
+                        "request_id": request_id,
+                        "ts_utc": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+            return response
+        except RuntimeError as exc:
+            if "No response returned" in str(exc):
+                logger.error(
+                    "Caught downstream no-response runtime error",
+                    extra={"request_id": request_id, "path": str(request.url.path), "status_code": 500},
+                )
+                return _StrictJSONResponse(
+                    status_code=500,
+                    content={
+                        "status": "error",
+                        "error": f"{type(exc).__name__}: {str(exc)}",
+                        "path": str(request.url.path),
+                        "request_id": request_id,
+                        "ts_utc": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+            raise
+
+
+# =============================================================================
+# Route diagnostics helpers
+# =============================================================================
 def _route_signature_pairs_from_route(route: Any) -> Set[Tuple[str, str]]:
     path = str(getattr(route, "path", "") or "")
     methods = getattr(route, "methods", None)
@@ -752,6 +827,51 @@ def _route_family_presence_from_paths(paths: Set[str]) -> Dict[str, bool]:
         "root_health_alias": "/health" in paths and "/v1/health" in paths,
         "root_meta_alias": "/meta" in paths and "/v1/meta" in paths,
     }
+
+
+def _endpoint_module_name(route: Any) -> str:
+    endpoint = getattr(route, "endpoint", None)
+    module_name = str(getattr(endpoint, "__module__", "") or "")
+    if module_name:
+        return module_name
+    try:
+        app_ref = getattr(route, "app", None)
+        return str(getattr(app_ref, "__module__", "") or "")
+    except Exception:
+        return ""
+
+
+def _canonical_path_owners_from_routes(app: FastAPI) -> Dict[str, str]:
+    wanted_paths = {
+        "/sheet-rows",
+        "/v1/advanced/sheet-rows",
+        "/v1/advisor/sheet-rows",
+        "/v1/analysis/sheet-rows",
+        "/v1/schema/sheet-spec",
+        "/schema/sheet-spec",
+    }
+    owners: Dict[str, str] = {}
+    for route in getattr(app, "routes", []) or []:
+        path = str(getattr(route, "path", "") or "")
+        if path in wanted_paths and path not in owners:
+            owners[path] = _endpoint_module_name(route)
+    return owners
+
+
+def _canonical_path_owner_mismatches(path_owners: Mapping[str, str]) -> Dict[str, Dict[str, str]]:
+    mismatches: Dict[str, Dict[str, str]] = {}
+    for path, expected_owner in _CONTROLLED_CANONICAL_OWNER_MAP.items():
+        if path not in path_owners:
+            continue
+        actual_module = str(path_owners.get(path, "") or "")
+        actual_owner = actual_module.rsplit(".", 1)[-1] if actual_module else ""
+        if actual_owner and actual_owner != expected_owner:
+            mismatches[path] = {
+                "expected_owner": expected_owner,
+                "actual_module": actual_module,
+                "actual_owner": actual_owner,
+            }
+    return mismatches
 
 
 def _effective_failed_modules(src: Dict[str, Any]) -> List[str]:
@@ -821,8 +941,13 @@ def _normalize_routes_snapshot(
     )
 
     all_paths: Set[str] = set()
+    path_owners: Dict[str, str] = {}
+    path_owner_mismatches: Dict[str, Dict[str, str]] = {}
     if app is not None:
         all_paths = {str(getattr(r, "path", "") or "") for r in (getattr(app, "routes", []) or [])}
+        path_owners = _canonical_path_owners_from_routes(app)
+        path_owner_mismatches = _canonical_path_owner_mismatches(path_owners)
+
     route_family_presence = dict(src.get("route_family_presence", {}) or {})
     if all_paths:
         route_family_presence = _route_family_presence_from_paths(all_paths)
@@ -869,6 +994,8 @@ def _normalize_routes_snapshot(
         "route_family_presence": route_family_presence,
         "effective_failed_modules": effective_failed_modules,
         "optional_route_modules": sorted(list(_OPTIONAL_ROUTE_MODULES)),
+        "canonical_path_owners": path_owners,
+        "canonical_path_owner_mismatches": path_owner_mismatches,
     }
 
 
@@ -912,6 +1039,8 @@ def _merge_snapshots(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]
         "route_family_presence": _merge_dict(old.get("route_family_presence"), new.get("route_family_presence")),
         "effective_failed_modules": _merge_list(old.get("effective_failed_modules"), new.get("effective_failed_modules")),
         "optional_route_modules": _merge_list(old.get("optional_route_modules"), new.get("optional_route_modules")),
+        "canonical_path_owners": _merge_dict(old.get("canonical_path_owners"), new.get("canonical_path_owners")),
+        "canonical_path_owner_mismatches": _merge_dict(old.get("canonical_path_owner_mismatches"), new.get("canonical_path_owner_mismatches")),
     }
 
     merged["mounted_count"] = len(merged["mounted"])
@@ -928,6 +1057,9 @@ def _merge_snapshots(old: Dict[str, Any], new: Dict[str, Any]) -> Dict[str, Any]
     return merged
 
 
+# =============================================================================
+# Route importing / ownership / mounting
+# =============================================================================
 def _import_router_module(module_name: str) -> Tuple[Optional[Any], Optional[BaseException]]:
     try:
         mod = importlib.import_module(module_name)
@@ -1272,6 +1404,8 @@ def _mount_routes_controlled(app: FastAPI) -> Dict[str, Any]:
             "no_router": no_router,
         }
     )
+    canonical_path_owners = _canonical_path_owners_from_routes(app)
+    canonical_path_owner_mismatches = _canonical_path_owner_mismatches(canonical_path_owners)
 
     snap = {
         "mounted": mounted,
@@ -1297,6 +1431,8 @@ def _mount_routes_controlled(app: FastAPI) -> Dict[str, Any]:
         "route_family_presence": route_family_presence,
         "effective_failed_modules": effective_failed_modules,
         "optional_route_modules": sorted(list(_OPTIONAL_ROUTE_MODULES)),
+        "canonical_path_owners": canonical_path_owners,
+        "canonical_path_owner_mismatches": canonical_path_owner_mismatches,
     }
     _invalidate_openapi_cache(app)
     return snap
@@ -1334,6 +1470,8 @@ def _mount_routes(app: FastAPI) -> Dict[str, Any]:
                             snap["optional_route_modules"] = sorted(list(_OPTIONAL_ROUTE_MODULES))
                             snap["openapi_route_count_after_mount"] = len(getattr(app, "routes", []) or [])
                             snap["route_signature_count_after_mount"] = _route_signature_count(app, include_builtin=True)
+                            snap["canonical_path_owners"] = _canonical_path_owners_from_routes(app)
+                            snap["canonical_path_owner_mismatches"] = _canonical_path_owner_mismatches(snap["canonical_path_owners"])
                             _invalidate_openapi_cache(app)
                             logger.info(
                                 "Routes mount summary: mounted=%s duplicate_skips=%s partial_duplicate_skips=%s missing=%s failed=%s strategy=%s",
@@ -1403,6 +1541,8 @@ def _mount_routes_once(app: FastAPI, phase: str) -> Dict[str, Any]:
         snap = _normalize_routes_snapshot(current, used_strategy=str(current.get("strategy", "startup")), app=app)
         snap["openapi_route_count_after_mount"] = len(getattr(app, "routes", []) or [])
         snap["route_signature_count_after_mount"] = _route_signature_count(app, include_builtin=True)
+        snap["canonical_path_owners"] = _canonical_path_owners_from_routes(app)
+        snap["canonical_path_owner_mismatches"] = _canonical_path_owner_mismatches(snap["canonical_path_owners"])
         app.state.routes_snapshot = snap
         app.state.routes_mounted = True
         _invalidate_openapi_cache(app)
@@ -1414,6 +1554,8 @@ def _mount_routes_once(app: FastAPI, phase: str) -> Dict[str, Any]:
             snap = _normalize_routes_snapshot(current, used_strategy=str(current.get("strategy", "prestart")), app=app)
             snap["openapi_route_count_after_mount"] = len(getattr(app, "routes", []) or [])
             snap["route_signature_count_after_mount"] = _route_signature_count(app, include_builtin=True)
+            snap["canonical_path_owners"] = _canonical_path_owners_from_routes(app)
+            snap["canonical_path_owner_mismatches"] = _canonical_path_owner_mismatches(snap["canonical_path_owners"])
             app.state.routes_snapshot = snap
             app.state.routes_mounted = True
             app.state.routes_mount_phase = "startup"
@@ -1425,6 +1567,8 @@ def _mount_routes_once(app: FastAPI, phase: str) -> Dict[str, Any]:
     snap = _normalize_routes_snapshot(snap, used_strategy=str(snap.get("strategy", "mount")), app=app)
     snap["openapi_route_count_after_mount"] = len(getattr(app, "routes", []) or [])
     snap["route_signature_count_after_mount"] = _route_signature_count(app, include_builtin=True)
+    snap["canonical_path_owners"] = _canonical_path_owners_from_routes(app)
+    snap["canonical_path_owner_mismatches"] = _canonical_path_owner_mismatches(snap["canonical_path_owners"])
 
     app.state.routes_snapshot = snap
     app.state.routes_mounted = True
@@ -1433,6 +1577,9 @@ def _mount_routes_once(app: FastAPI, phase: str) -> Dict[str, Any]:
     return snap
 
 
+# =============================================================================
+# Runtime meta
+# =============================================================================
 def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
     snap: Dict[str, Any] = {}
     engine_obj: Any = None
@@ -1486,6 +1633,8 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
         "missing_required_keys": list(snap.get("missing_required_keys", []) or []),
         "route_family_presence": dict(snap.get("route_family_presence", {}) or {}),
         "effective_failed_modules": list(snap.get("effective_failed_modules", []) or []),
+        "canonical_path_owners": dict(snap.get("canonical_path_owners", {}) or {}),
+        "canonical_path_owner_mismatches": dict(snap.get("canonical_path_owner_mismatches", {}) or {}),
         "engine_present": engine_obj is not None,
         "engine_ready": engine_obj is not None and not engine_init_error,
         "engine_source": engine_source,
@@ -1494,6 +1643,9 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
     }
 
 
+# =============================================================================
+# Built-in routes
+# =============================================================================
 def _install_builtin_routes(app: FastAPI) -> None:
     def _status_payload(label: str) -> Dict[str, Any]:
         return {"status": label, **_runtime_meta(app)}
@@ -1538,6 +1690,9 @@ def _install_builtin_routes(app: FastAPI) -> None:
     _add_status_route("/v1/healthz", "healthy")
 
 
+# =============================================================================
+# Engine init / shutdown
+# =============================================================================
 async def _maybe_init_engine(app: FastAPI) -> Optional[str]:
     if getattr(app.state, "engine", None) is not None:
         if not str(getattr(app.state, "engine_source", "") or "").strip():
@@ -1617,6 +1772,9 @@ async def _maybe_close_google_sheets_service() -> None:
             continue
 
 
+# =============================================================================
+# App factory
+# =============================================================================
 def create_app() -> FastAPI:
     docs_url = "/docs" if bool(_SETTINGS.ENABLE_SWAGGER) else None
     redoc_url = "/redoc" if bool(_SETTINGS.ENABLE_REDOC) else None
@@ -1640,6 +1798,15 @@ def create_app() -> FastAPI:
             missing_required = list(snap.get("missing_required_keys", []) or [])
             if missing_required:
                 warning = f"missing_required_route_families: {', '.join(missing_required)}"
+                logger.warning(warning)
+                try:
+                    app.state.startup_warnings.append(warning)
+                except Exception:
+                    pass
+
+            owner_mismatches = dict(snap.get("canonical_path_owner_mismatches", {}) or {})
+            if owner_mismatches:
+                warning = f"canonical_path_owner_mismatches: {json.dumps(owner_mismatches, ensure_ascii=False)}"
                 logger.warning(warning)
                 try:
                     app.state.startup_warnings.append(warning)
@@ -1690,6 +1857,7 @@ def create_app() -> FastAPI:
     app.state.config_source = _SETTINGS.CONFIG_SOURCE
 
     app.add_middleware(RequestIDMiddleware)
+    app.add_middleware(NoResponseGuardMiddleware)
     app.add_middleware(GZipMiddleware, minimum_size=1024)
 
     cors_all = bool(_SETTINGS.ENABLE_CORS_ALL_ORIGINS)
@@ -1707,14 +1875,20 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception):
-        logger.error("Unhandled exception: %s", exc, exc_info=True)
+        request_id = _request_id_from_request(request)
+        logger.error(
+            "Unhandled exception: %s",
+            exc,
+            exc_info=True,
+            extra={"request_id": request_id, "path": str(request.url.path), "status_code": 500},
+        )
         return _StrictJSONResponse(
             status_code=500,
             content={
                 "status": "error",
                 "error": f"{type(exc).__name__}: {str(exc)}",
                 "path": str(request.url.path),
-                "request_id": getattr(request.state, "request_id", ""),
+                "request_id": request_id,
                 "ts_utc": datetime.now(timezone.utc).isoformat(),
             },
         )
@@ -1748,6 +1922,8 @@ def create_app() -> FastAPI:
 
         route_paths = sorted({str(getattr(r, "path", "") or "") for r in (getattr(request.app, "routes", []) or [])})
         route_sigs = sorted([f"{path} [{method}]" for path, method in _app_route_signature_set(request.app, include_builtin=True)])
+        path_owners = _canonical_path_owners_from_routes(request.app)
+        owner_mismatches = _canonical_path_owner_mismatches(path_owners)
 
         return {
             "status": "ok",
@@ -1756,6 +1932,8 @@ def create_app() -> FastAPI:
             "app_route_signature_count": _route_signature_count(request.app, include_builtin=True),
             "route_paths": route_paths,
             "route_signatures": route_sigs,
+            "canonical_path_owners": path_owners,
+            "canonical_path_owner_mismatches": owner_mismatches,
             **_runtime_meta(app),
         }
 
