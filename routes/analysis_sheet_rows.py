@@ -2,11 +2,11 @@
 # routes/analysis_sheet_rows.py
 """
 ================================================================================
-Analysis Sheet-Rows Router — v3.2.0
+Analysis Sheet-Rows Router — v3.3.0
 ================================================================================
 CANONICAL • REGISTRY-FIRST • FIXED-WIDTH CONTRACTS • FAIL-SAFE • V2-ENGINE FIRST
 SPECIAL-PAGE SAFE • GET+POST SAFE • OBJECT + MATRIX RESPONSE SAFE • JSON-SAFE
-TOP10 / INSIGHTS / DICTIONARY HARDENED • NO WEAK 5-COL FALLBACKS
+TOP10 / INSIGHTS / DICTIONARY HARDENED • NO WEAK 5-COL FALLBACKS • ROOT-FALLBACK BRIDGED
 
 What this revision improves
 --------------------------
@@ -21,6 +21,8 @@ What this revision improves
        instead of drifting into inconsistent contracts.
 - FIX: builder/engine failures degrade gracefully without backend 5xx from this router.
 - FIX: Top 10 always guarantees top10_rank / selection_reason / criteria_snapshot.
+- FIX: Top 10 now falls back to engine/root sheet-rows payloads and symbol-driven scoring when the builder returns zero rows.
+- FIX: canonical key extraction now searches nested payloads and common provider aliases for price / range / score fields.
 ================================================================================
 """
 
@@ -28,6 +30,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import json
 import logging
 import math
 import os
@@ -99,7 +102,7 @@ except Exception:  # pragma: no cover
         return None
 
 
-ANALYSIS_SHEET_ROWS_VERSION = "3.2.0"
+ANALYSIS_SHEET_ROWS_VERSION = "3.3.0"
 router = APIRouter(prefix="/v1/analysis", tags=["Analysis Sheet Rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -130,10 +133,46 @@ _TOP10_REQUIRED_HEADERS: Dict[str, str] = {
 }
 
 _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
-    "symbol": ["ticker", "code", "instrument", "security", "requested_symbol"],
-    "ticker": ["symbol", "code", "instrument", "security", "requested_symbol"],
-    "current_price": ["price", "last_price", "last", "close", "market_price", "nav", "spot"],
-    "top10_rank": ["rank", "top_rank"],
+    "symbol": ["ticker", "code", "instrument", "security", "requested_symbol", "symbol_code"],
+    "ticker": ["symbol", "code", "instrument", "security", "requested_symbol", "symbol_code"],
+    "name": ["short_name", "long_name", "display_name", "instrument_name", "security_name"],
+    "asset_class": ["asset_type", "assetType", "quote_type", "quoteType", "instrument_type", "security_type", "type"],
+    "exchange": ["exchange_name", "full_exchange_name", "market", "market_name", "mic"],
+    "currency": ["currency_code", "ccy", "fx_currency"],
+    "country": ["country_name", "region_country", "domicile_country"],
+    "sector": ["sector_name", "gics_sector"],
+    "industry": ["industry_name", "gics_industry"],
+    "current_price": ["price", "last_price", "last", "close", "market_price", "nav", "spot", "currentPrice", "regularMarketPrice", "value"],
+    "previous_close": ["prev_close", "previousClose", "prior_close", "regularMarketPreviousClose"],
+    "open_price": ["open", "openPrice", "regularMarketOpen"],
+    "day_high": ["high", "dayHigh", "regularMarketDayHigh", "session_high"],
+    "day_low": ["low", "dayLow", "regularMarketDayLow", "session_low"],
+    "week_52_high": ["fiftyTwoWeekHigh", "fifty_two_week_high", "year_high", "52_week_high"],
+    "week_52_low": ["fiftyTwoWeekLow", "fifty_two_week_low", "year_low", "52_week_low"],
+    "price_change": ["change", "net_change", "regularMarketChange"],
+    "percent_change": ["pct_change", "change_pct", "changePercent", "regularMarketChangePercent", "percentChange"],
+    "volume": ["regularMarketVolume", "trade_volume", "traded_volume", "volume_traded"],
+    "avg_volume_10d": ["averageDailyVolume10Day", "avg10_volume", "ten_day_avg_volume", "average_volume_10d"],
+    "avg_volume_30d": ["averageDailyVolume3Month", "averageVolume3Month", "avg30_volume", "thirty_day_avg_volume"],
+    "market_cap": ["marketCap", "market_capitalization"],
+    "float_shares": ["floatShares", "sharesFloat", "free_float_shares"],
+    "overall_score": ["score", "composite_score", "total_score"],
+    "opportunity_score": ["opportunity", "opportunity_rank_score", "conviction_score"],
+    "forecast_confidence": ["confidence", "confidence_pct", "forecastConfidence"],
+    "confidence_score": ["confidence", "confidence_pct"],
+    "expected_roi_1m": ["roi_1m", "expected_return_1m", "target_return_1m"],
+    "expected_roi_3m": ["roi_3m", "expected_return_3m", "target_return_3m"],
+    "expected_roi_12m": ["roi_12m", "expected_return_12m", "target_return_12m"],
+    "forecast_price_1m": ["target_price_1m", "projected_price_1m"],
+    "forecast_price_3m": ["target_price_3m", "projected_price_3m"],
+    "forecast_price_12m": ["target_price_12m", "projected_price_12m"],
+    "recommendation": ["signal", "rating", "action"],
+    "recommendation_reason": ["rationale", "reasoning", "signal_reason"],
+    "data_provider": ["provider", "source_provider", "primary_provider"],
+    "last_updated_utc": ["updated_at", "timestamp_utc", "as_of_utc", "last_updated", "last_update_utc"],
+    "last_updated_riyadh": ["timestamp_riyadh", "as_of_riyadh", "last_update_riyadh"],
+    "warnings": ["warning", "messages", "errors", "issues"],
+    "top10_rank": ["rank", "top_rank", "position_rank"],
     "selection_reason": ["reason", "selection_notes", "selector_reason"],
     "criteria_snapshot": ["criteria", "criteria_json", "snapshot"],
     "group": ["section"],
@@ -981,23 +1020,211 @@ def _extract_from_raw(raw: Dict[str, Any], candidates: Sequence[str]) -> Any:
     return None
 
 
+def _extract_from_nested_raw(raw: Any, candidates: Sequence[str], depth: int = 0) -> Any:
+    if raw is None or depth > 2:
+        return None
+    if isinstance(raw, Mapping):
+        direct = _extract_from_raw(dict(raw), candidates)
+        if direct is not None:
+            return direct
+        preferred_nested_keys = (
+            "quote",
+            "analysis",
+            "fundamentals",
+            "forecast",
+            "scores",
+            "metrics",
+            "summary",
+            "snapshot",
+            "payload",
+            "data",
+            "item",
+            "record",
+            "row",
+            "meta",
+            "stats",
+            "price",
+            "market_data",
+        )
+        for nk in preferred_nested_keys:
+            nv = raw.get(nk)
+            if isinstance(nv, Mapping):
+                found = _extract_from_nested_raw(nv, candidates, depth + 1)
+                if found is not None:
+                    return found
+        for nv in raw.values():
+            if isinstance(nv, Mapping):
+                found = _extract_from_nested_raw(nv, candidates, depth + 1)
+                if found is not None:
+                    return found
+    return None
+
+
 def _normalize_to_schema_keys(*, schema_keys: Sequence[str], schema_headers: Sequence[str], raw: Mapping[str, Any]) -> Dict[str, Any]:
     raw = dict(raw or {})
     header_by_key = {str(k): str(h) for k, h in zip(schema_keys, schema_headers)}
     out: Dict[str, Any] = {}
     for k in schema_keys:
         ks = str(k)
-        v = _extract_from_raw(raw, _key_variants(ks))
+        v = _extract_from_nested_raw(raw, _key_variants(ks))
         if v is None:
             h = header_by_key.get(ks, "")
             if h:
-                v = _extract_from_raw(raw, [h, h.lower(), h.upper()])
+                v = _extract_from_nested_raw(raw, [h, h.lower(), h.upper()])
+        if ks in {"warnings", "recommendation_reason", "selection_reason"} and isinstance(v, (list, tuple, set)):
+            v = "; ".join([_strip(x) for x in v if _strip(x)])
         out[ks] = _json_safe(v)
     if "symbol" in out and not out.get("symbol"):
-        out["symbol"] = _extract_from_raw(raw, _key_variants("symbol"))
+        out["symbol"] = _extract_from_nested_raw(raw, _key_variants("symbol"))
     if "current_price" in out and out.get("current_price") is None:
-        out["current_price"] = _extract_from_raw(raw, _key_variants("current_price"))
+        out["current_price"] = _extract_from_nested_raw(raw, _key_variants("current_price"))
     return out
+
+
+def _to_number(value: Any) -> float:
+    if value is None:
+        return float("-inf")
+    if isinstance(value, bool):
+        return float(int(value))
+    if isinstance(value, (int, float)):
+        try:
+            f = float(value)
+            return f if math.isfinite(f) else float("-inf")
+        except Exception:
+            return float("-inf")
+    s = _strip(value)
+    if not s:
+        return float("-inf")
+    s = s.replace("%", "").replace(",", "")
+    try:
+        f = float(s)
+        return f if math.isfinite(f) else float("-inf")
+    except Exception:
+        return float("-inf")
+
+
+def _row_has_any_signal(row: Mapping[str, Any]) -> bool:
+    if not isinstance(row, Mapping):
+        return False
+    signal_keys = (
+        "symbol",
+        "name",
+        "current_price",
+        "overall_score",
+        "opportunity_score",
+        "expected_roi_3m",
+        "expected_roi_1m",
+        "recommendation",
+        "selection_reason",
+    )
+    for key in signal_keys:
+        value = row.get(key)
+        if value not in (None, "", [], {}, ()):
+            return True
+    return False
+
+
+def _top10_sort_key(row: Mapping[str, Any]) -> Tuple[float, ...]:
+    return (
+        _to_number(row.get("overall_score")),
+        _to_number(row.get("opportunity_score")),
+        _to_number(row.get("expected_roi_3m")),
+        _to_number(row.get("expected_roi_1m")),
+        _to_number(row.get("forecast_confidence")),
+        _to_number(row.get("confidence_score")),
+        _to_number(row.get("value_score")),
+        _to_number(row.get("quality_score")),
+        _to_number(row.get("momentum_score")),
+        _to_number(row.get("growth_score")),
+        _to_number(row.get("current_price")),
+    )
+
+
+def _top10_selection_reason(row: Mapping[str, Any]) -> str:
+    parts: List[str] = []
+    labels = (
+        ("overall_score", "Overall"),
+        ("opportunity_score", "Opportunity"),
+        ("expected_roi_3m", "Exp ROI 3M"),
+        ("forecast_confidence", "Forecast Conf"),
+        ("confidence_score", "Confidence"),
+        ("recommendation", "Reco"),
+    )
+    for key, label in labels:
+        value = row.get(key)
+        if value in (None, "", [], {}, ()):
+            continue
+        if isinstance(value, float):
+            parts.append(f"{label} {round(value, 2)}")
+        else:
+            parts.append(f"{label} {value}")
+        if len(parts) >= 3:
+            break
+    return " | ".join(parts) if parts else "Top10 fallback selection based on strongest available composite signals."
+
+
+def _top10_criteria_snapshot(row: Mapping[str, Any]) -> str:
+    snapshot = {}
+    for key in (
+        "overall_score",
+        "opportunity_score",
+        "expected_roi_1m",
+        "expected_roi_3m",
+        "expected_roi_12m",
+        "forecast_confidence",
+        "confidence_score",
+        "risk_bucket",
+        "recommendation",
+        "symbol",
+    ):
+        value = row.get(key)
+        if value not in (None, "", [], {}, ()):
+            snapshot[key] = _json_safe(value)
+    try:
+        return json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        return str(snapshot)
+
+
+def _ensure_top10_rows(rows: Sequence[Mapping[str, Any]], *, requested_symbols: Sequence[str], top_n: int, schema_keys: Sequence[str], schema_headers: Sequence[str]) -> List[Dict[str, Any]]:
+    normalized_rows: List[Dict[str, Any]] = []
+    for raw_row in rows or []:
+        normalized = _normalize_to_schema_keys(schema_keys=schema_keys, schema_headers=schema_headers, raw=(raw_row or {}))
+        if _row_has_any_signal(normalized):
+            normalized_rows.append(normalized)
+
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for row in sorted(normalized_rows, key=_top10_sort_key, reverse=True):
+        sym = _strip(row.get("symbol"))
+        name = _strip(row.get("name"))
+        key = sym or name or f"row_{len(deduped)+1}"
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(row)
+
+    if requested_symbols:
+        requested = {_strip(s): idx for idx, s in enumerate(requested_symbols) if _strip(s)}
+        deduped.sort(
+            key=lambda r: (
+                0 if _strip(r.get("symbol")) in requested else 1,
+                requested.get(_strip(r.get("symbol")), 10**6),
+                -_top10_sort_key(r)[0],
+                -_top10_sort_key(r)[1],
+            )
+        )
+        deduped = sorted(deduped, key=_top10_sort_key, reverse=True)
+
+    final_rows = deduped[: max(1, int(top_n))]
+    for idx, row in enumerate(final_rows, start=1):
+        row["top10_rank"] = idx
+        if not _strip(row.get("selection_reason")):
+            row["selection_reason"] = _top10_selection_reason(row)
+        if not _strip(row.get("criteria_snapshot")):
+            row["criteria_snapshot"] = _top10_criteria_snapshot(row)
+    return final_rows
+
 
 
 def _looks_like_symbol_token(x: Any) -> bool:
@@ -1377,9 +1604,13 @@ async def _call_builder_best_effort(*, module_names: Sequence[str], function_nam
             break
     if fn is None:
         return [], "partial", f"{friendly_name} builder missing callable function", {"builder_missing": True}, None
+
+    requested_top_n = max(1, _maybe_int(body.get("top_n"), limit))
+    requested_symbols = _get_list(body, "symbols", "tickers", "tickers_list")
+
     call_specs: List[Tuple[Tuple[Any, ...], Dict[str, Any]]] = [
-        ((), {"request": request, "settings": settings, "engine": engine, "data_engine": engine, "quote_engine": engine, "cache_engine": engine, "mode": mode, "body": body, "payload": body, "page": page, "sheet": page, "sheet_name": page, "limit": limit, "top_n": limit, "offset": offset, "schema": schema, "schema_keys": list(schema_keys), "schema_headers": list(schema_headers)}),
-        ((), {"request": request, "settings": settings, "engine": engine, "mode": mode, "body": body, "page": page, "limit": limit, "top_n": limit, "schema": schema}),
+        ((), {"request": request, "settings": settings, "engine": engine, "data_engine": engine, "quote_engine": engine, "cache_engine": engine, "mode": mode, "body": body, "payload": body, "page": page, "sheet": page, "sheet_name": page, "limit": limit, "top_n": requested_top_n, "offset": offset, "schema": schema, "schema_keys": list(schema_keys), "schema_headers": list(schema_headers), "symbols": requested_symbols, "tickers": requested_symbols, "route_family": _route_family_flexible(page)}),
+        ((), {"request": request, "settings": settings, "engine": engine, "mode": mode, "body": body, "page": page, "limit": limit, "top_n": requested_top_n, "offset": offset, "schema": schema, "symbols": requested_symbols, "tickers": requested_symbols}),
         ((body,), {}),
         ((engine, body), {}),
         ((engine,), {}),
@@ -1399,6 +1630,31 @@ async def _call_builder_best_effort(*, module_names: Sequence[str], function_nam
     meta_out["builder_function"] = chosen_name
     meta_out["raw_payload_quality"] = _payload_quality_score(out, page=page)
     return normalized, status_out, error_out, meta_out, out
+
+
+
+async def _build_top10_from_requested_symbols(*, engine: Any, settings: Any, symbols: Sequence[str], page: str, mode: str, schema_keys: Sequence[str], schema_headers: Sequence[str], schema: Any, top_n: int) -> List[Dict[str, Any]]:
+    if engine is None or not symbols:
+        return []
+    requested_symbols = [_strip(s) for s in symbols if _strip(s)]
+    if not requested_symbols:
+        return []
+    data_map = await _fetch_analysis_rows(engine, requested_symbols, mode=mode, settings=settings, schema=schema)
+    raw_rows: List[Dict[str, Any]] = []
+    for sym in requested_symbols:
+        raw = _to_plain_dict(data_map.get(sym))
+        if not raw:
+            raw = {"symbol": sym}
+        if not raw.get("symbol"):
+            raw["symbol"] = sym
+        raw_rows.append(raw)
+    return _ensure_top10_rows(
+        raw_rows,
+        requested_symbols=requested_symbols,
+        top_n=top_n,
+        schema_keys=schema_keys,
+        schema_headers=schema_headers,
+    )
 
 
 def _build_data_dictionary_rows_to_schema(*, schema_keys: Sequence[str], schema_headers: Sequence[str]) -> Tuple[List[Dict[str, Any]], Optional[str], Any]:
@@ -1599,7 +1855,10 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
 
     if route_family == "top10":
         headers, keys = _ensure_top10_contract(headers, keys)
-        rows, status_out, error_out, meta_out, _raw_payload = await _call_builder_best_effort(
+        requested_symbols = _get_list(merged_body, "symbols", "tickers", "tickers_list")
+        requested_top_n = max(1, min(5000, _maybe_int(merged_body.get("top_n"), top_n)))
+
+        rows, status_out, error_out, meta_out, raw_builder_payload = await _call_builder_best_effort(
             module_names=_TOP10_MODULE_CANDIDATES,
             function_names=_TOP10_FUNCTION_CANDIDATES,
             request=request,
@@ -1615,6 +1874,66 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
             offset=offset,
             schema=spec,
         )
+
+        rows = _ensure_top10_rows(
+            rows,
+            requested_symbols=requested_symbols,
+            top_n=requested_top_n,
+            schema_keys=keys,
+            schema_headers=headers,
+        )
+
+        dispatch = "top10_builder"
+        raw_quality = _payload_quality_score(raw_builder_payload, page=page)
+
+        if not rows:
+            engine_payload = await _call_sheet_rows_payload_best_effort(
+                engine=engine,
+                page=page,
+                limit=max(limit, requested_top_n),
+                offset=0,
+                mode=(mode or ""),
+                body=merged_body,
+            )
+            if _payload_has_real_rows(engine_payload):
+                payload_rows = _extract_rows_like(engine_payload)
+                payload_matrix = _extract_matrix_like(engine_payload)
+                if not payload_rows and payload_matrix:
+                    payload_rows = _rows_from_matrix(payload_matrix, keys)
+                rows = _ensure_top10_rows(
+                    payload_rows,
+                    requested_symbols=requested_symbols,
+                    top_n=requested_top_n,
+                    schema_keys=keys,
+                    schema_headers=headers,
+                )
+                if rows:
+                    dispatch = "top10_engine_sheet_rows_fallback"
+                    status_from_engine, error_from_engine, payload_meta = _extract_status_error(engine_payload if isinstance(engine_payload, dict) else {})
+                    status_out = status_from_engine or status_out
+                    error_out = error_from_engine or error_out
+                    meta_out = {**dict(meta_out or {}), **dict(payload_meta or {})}
+                    meta_out["engine_payload_quality"] = _payload_quality_score(engine_payload, page=page)
+
+        if not rows and requested_symbols:
+            symbol_rows = await _build_top10_from_requested_symbols(
+                engine=engine,
+                settings=settings,
+                symbols=requested_symbols,
+                page=page,
+                mode=(mode or ""),
+                schema_keys=keys,
+                schema_headers=headers,
+                schema=spec,
+                top_n=requested_top_n,
+            )
+            if symbol_rows:
+                rows = symbol_rows
+                dispatch = "top10_symbol_rank_fallback"
+                if not error_out:
+                    error_out = "Top10 builder returned no rows; generated fallback ranking from requested symbols."
+                status_out = "partial"
+
         rows = _slice(rows, limit=limit, offset=offset)
         return _payload(
             page=page,
@@ -1628,7 +1947,16 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
             mode=mode,
             status_out=status_out or ("success" if rows else "partial"),
             error_out=error_out,
-            meta_extra={"dispatch": "top10_builder", "builder": "top10_selector", "schema_source": schema_source, "engine_source": engine_source, **dict(meta_out or {})},
+            meta_extra={
+                "dispatch": dispatch,
+                "builder": "top10_selector",
+                "schema_source": schema_source,
+                "engine_source": engine_source,
+                "requested_symbols": len(requested_symbols),
+                "requested_top_n": requested_top_n,
+                "builder_payload_quality": raw_quality,
+                **dict(meta_out or {}),
+            },
         )
 
     if symbols:
