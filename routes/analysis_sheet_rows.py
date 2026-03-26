@@ -2,7 +2,7 @@
 # routes/analysis_sheet_rows.py
 """
 ================================================================================
-Analysis Sheet-Rows Router — v3.3.0
+Analysis Sheet-Rows Router — v3.4.0
 ================================================================================
 CANONICAL • REGISTRY-FIRST • FIXED-WIDTH CONTRACTS • FAIL-SAFE • V2-ENGINE FIRST
 SPECIAL-PAGE SAFE • GET+POST SAFE • OBJECT + MATRIX RESPONSE SAFE • JSON-SAFE
@@ -102,7 +102,7 @@ except Exception:  # pragma: no cover
         return None
 
 
-ANALYSIS_SHEET_ROWS_VERSION = "3.3.0"
+ANALYSIS_SHEET_ROWS_VERSION = "3.4.0"
 router = APIRouter(prefix="/v1/analysis", tags=["Analysis Sheet Rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -1212,9 +1212,17 @@ def _ensure_top10_rows(rows: Sequence[Mapping[str, Any]], *, requested_symbols: 
                 requested.get(_strip(r.get("symbol")), 10**6),
                 -_top10_sort_key(r)[0],
                 -_top10_sort_key(r)[1],
+                -_top10_sort_key(r)[2],
+                -_top10_sort_key(r)[3],
+                -_top10_sort_key(r)[4],
+                -_top10_sort_key(r)[5],
+                -_top10_sort_key(r)[6],
+                -_top10_sort_key(r)[7],
+                -_top10_sort_key(r)[8],
+                -_top10_sort_key(r)[9],
+                -_top10_sort_key(r)[10],
             )
         )
-        deduped = sorted(deduped, key=_top10_sort_key, reverse=True)
 
     final_rows = deduped[: max(1, int(top_n))]
     for idx, row in enumerate(final_rows, start=1):
@@ -1297,7 +1305,7 @@ def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
         rows_from_symbol_map.append(row)
     if maybe_symbol_map and rows_from_symbol_map:
         return rows_from_symbol_map
-    for name in ("rows", "data", "items", "records", "quotes", "recommendations", "results"):
+    for name in ("row_objects", "rowObjects", "rows", "data", "items", "records", "quotes", "recommendations", "results"):
         value = payload.get(name)
         if isinstance(value, list):
             rows = _extract_rows_like(value, depth + 1)
@@ -1380,6 +1388,15 @@ def _slice(rows: List[Dict[str, Any]], *, limit: int, offset: int) -> List[Dict[
     if limit <= 0:
         return rows[start:]
     return rows[start:start + max(0, int(limit))]
+
+
+def _build_fetch_window(limit: int, offset: int, *, minimum: int = 0, ceiling: int = 5000) -> Tuple[int, int]:
+    safe_limit = max(1, int(limit))
+    safe_offset = max(0, int(offset))
+    requested = safe_limit + safe_offset
+    fetch_limit = min(int(ceiling), max(int(minimum), requested))
+    fetch_limit = max(1, fetch_limit)
+    return fetch_limit, 0
 
 
 def _empty_schema_row(keys: Sequence[str], *, symbol: str = "") -> Dict[str, Any]:
@@ -1797,7 +1814,8 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
     top_n = max(1, min(5000, _maybe_int(merged_body.get("top_n"), limit)))
     symbols = _get_list(merged_body, "symbols", "tickers", "tickers_list")
     if symbols:
-        symbols = symbols[:top_n]
+        symbol_fetch_cap = max(top_n, limit + offset)
+        symbols = symbols[:symbol_fetch_cap]
 
     headers, keys, spec, schema_source = _resolve_contract(page)
     engine, engine_source = await _get_engine(request)
@@ -1821,6 +1839,7 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
         )
 
     if route_family == "insights":
+        fetch_limit, fetch_offset = _build_fetch_window(limit, offset)
         rows, status_out, error_out, meta_out, _raw_payload = await _call_builder_best_effort(
             module_names=_INSIGHTS_MODULE_CANDIDATES,
             function_names=_INSIGHTS_FUNCTION_CANDIDATES,
@@ -1833,8 +1852,8 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
             schema_headers=headers,
             friendly_name="Insights_Analysis",
             page=page,
-            limit=limit,
-            offset=offset,
+            limit=fetch_limit,
+            offset=fetch_offset,
             schema=spec,
         )
         rows = _slice(rows, limit=limit, offset=offset)
@@ -1850,13 +1869,14 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
             mode=mode,
             status_out=status_out or ("success" if rows else "partial"),
             error_out=error_out,
-            meta_extra={"dispatch": "insights_builder", "builder": "insights_builder", "schema_source": schema_source, "engine_source": engine_source, **dict(meta_out or {})},
+            meta_extra={"dispatch": "insights_builder", "builder": "insights_builder", "schema_source": schema_source, "engine_source": engine_source, "fetch_limit": fetch_limit, "fetch_offset": fetch_offset, **dict(meta_out or {})},
         )
 
     if route_family == "top10":
         headers, keys = _ensure_top10_contract(headers, keys)
         requested_symbols = _get_list(merged_body, "symbols", "tickers", "tickers_list")
         requested_top_n = max(1, min(5000, _maybe_int(merged_body.get("top_n"), top_n)))
+        fetch_limit, fetch_offset = _build_fetch_window(limit, offset, minimum=requested_top_n)
 
         rows, status_out, error_out, meta_out, raw_builder_payload = await _call_builder_best_effort(
             module_names=_TOP10_MODULE_CANDIDATES,
@@ -1870,8 +1890,8 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
             schema_headers=headers,
             friendly_name="Top_10_Investments",
             page=page,
-            limit=limit,
-            offset=offset,
+            limit=fetch_limit,
+            offset=fetch_offset,
             schema=spec,
         )
 
@@ -1890,8 +1910,8 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
             engine_payload = await _call_sheet_rows_payload_best_effort(
                 engine=engine,
                 page=page,
-                limit=max(limit, requested_top_n),
-                offset=0,
+                limit=fetch_limit,
+                offset=fetch_offset,
                 mode=(mode or ""),
                 body=merged_body,
             )
@@ -1955,6 +1975,8 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
                 "requested_symbols": len(requested_symbols),
                 "requested_top_n": requested_top_n,
                 "builder_payload_quality": raw_quality,
+                "fetch_limit": fetch_limit,
+                "fetch_offset": fetch_offset,
                 **dict(meta_out or {}),
             },
         )
@@ -1962,6 +1984,7 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
     if symbols:
         if engine is None:
             fallback_rows = [_empty_schema_row(keys, symbol=s) for s in symbols]
+            fallback_rows = _slice(fallback_rows, limit=limit, offset=offset)
             return _payload(
                 page=page,
                 route_family=route_family,
@@ -1974,7 +1997,7 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
                 mode=mode,
                 status_out="partial",
                 error_out="Data engine unavailable",
-                meta_extra={"requested": len(symbols), "errors": len(symbols), "dispatch": "instrument_mode_no_engine", "builder": "schema_only", "schema_source": schema_source, "engine_source": engine_source},
+                meta_extra={"requested": len(symbols), "returned": len(fallback_rows), "errors": len(symbols), "dispatch": "instrument_mode_no_engine", "builder": "schema_only", "schema_source": schema_source, "engine_source": engine_source},
             )
         data_map = await _fetch_analysis_rows(engine, symbols, mode=(mode or ""), settings=settings, schema=spec)
         normalized_rows: List[Dict[str, Any]] = []
@@ -2004,6 +2027,7 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
             if "symbol" in keys and not normalized.get("symbol"):
                 normalized["symbol"] = sym
             normalized_rows.append(normalized)
+        normalized_rows = _slice(normalized_rows, limit=limit, offset=offset)
         status_out = "success" if errors == 0 else ("partial" if errors < len(symbols) else "error")
         return _payload(
             page=page,
@@ -2017,14 +2041,15 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
             mode=mode,
             status_out=status_out,
             error_out=f"{errors} errors" if errors else None,
-            meta_extra={"requested": len(symbols), "errors": errors, "dispatch": "instrument_mode", "builder": "engine.batch_quote_or_analysis", "schema_source": schema_source, "engine_source": engine_source},
+            meta_extra={"requested": len(symbols), "returned": len(normalized_rows), "errors": errors, "dispatch": "instrument_mode", "builder": "engine.batch_quote_or_analysis", "schema_source": schema_source, "engine_source": engine_source},
         )
 
-    engine_payload = await _call_sheet_rows_payload_best_effort(engine=engine, page=page, limit=limit, offset=offset, mode=(mode or ""), body=merged_body)
+    fetch_limit, fetch_offset = _build_fetch_window(limit, offset)
+    engine_payload = await _call_sheet_rows_payload_best_effort(engine=engine, page=page, limit=fetch_limit, offset=fetch_offset, mode=(mode or ""), body=merged_body)
     rows: List[Dict[str, Any]] = []
     status_out = "partial"
     error_out: Optional[str] = None
-    meta_out: Dict[str, Any] = {"dispatch": "engine_sheet_rows", "builder": "engine_or_enriched_fallback", "schema_source": schema_source, "engine_source": engine_source}
+    meta_out: Dict[str, Any] = {"dispatch": "engine_sheet_rows", "builder": "engine_or_enriched_fallback", "schema_source": schema_source, "engine_source": engine_source, "fetch_limit": fetch_limit, "fetch_offset": fetch_offset}
 
     if _payload_has_real_rows(engine_payload):
         payload_rows = _extract_rows_like(engine_payload)
@@ -2041,8 +2066,8 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
             settings=settings,
             engine=engine,
             page=page,
-            limit=limit,
-            offset=offset,
+            limit=fetch_limit,
+            offset=fetch_offset,
             mode=(mode or ""),
             body=merged_body,
             schema_keys=keys,
