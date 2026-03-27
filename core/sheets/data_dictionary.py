@@ -2,7 +2,7 @@
 # core/sheets/data_dictionary.py
 """
 ================================================================================
-Data Dictionary Generator — v3.0.0
+Data Dictionary Generator — v3.2.0
 ================================================================================
 SCHEMA-DRIVEN • CONTRACT-EXPLICIT • SHEET-SPEC SAFE • DRIFT-PROOF • IMPORT-SAFE
 
@@ -25,6 +25,7 @@ What this revision improves
 - ✅ Produces strict 2D values output in canonical order
 - ✅ Adds explicit validation helpers for row shape / width / duplicates
 - ✅ Adds metadata helpers so routes can identify this as dictionary-only output
+- ✅ Exposes row_objects/items/records/data aliases in payload for router alignment
 - ✅ Preserves import-safety: no I/O, no network calls, no engine usage
 
 Expected Data_Dictionary headers
@@ -59,6 +60,7 @@ __all__ = [
     "data_dictionary_keys",
     "data_dictionary_contract",
     "preferred_sheet_order",
+    "resolve_requested_sheets",
     "row_dict_from_column",
     "normalize_data_dictionary_row",
     "normalize_data_dictionary_rows",
@@ -67,7 +69,7 @@ __all__ = [
     "is_data_dictionary_payload",
 ]
 
-DATA_DICTIONARY_VERSION = "3.0.0"
+DATA_DICTIONARY_VERSION = "3.2.0"
 SCHEMA_VERSION = getattr(_schema_registry, "SCHEMA_VERSION", "unknown")
 
 DATA_DICTIONARY_SHEET_NAME = "Data_Dictionary"
@@ -151,6 +153,22 @@ def _as_list(value: Any) -> List[Any]:
     return [value]
 
 
+def _normalize_token(v: Any) -> str:
+    return _s(v).lower().replace("-", "_").replace(" ", "_")
+
+
+def _dedupe_keep_order(items: Sequence[str]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for item in items:
+        s = _s(item)
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
 # -----------------------------------------------------------------------------
 # Registry compatibility helpers
 # -----------------------------------------------------------------------------
@@ -162,14 +180,87 @@ def _schema_registry_map() -> Mapping[str, Any]:
     return {}
 
 
+def _sheet_alias_index() -> Dict[str, str]:
+    reg = _schema_registry_map()
+    out: Dict[str, str] = {}
+
+    for sheet_name in reg.keys():
+        sheet = _s(sheet_name)
+        if not sheet:
+            continue
+        candidates = {
+            sheet,
+            sheet.replace("_", " "),
+            sheet.replace("_", "-"),
+            _normalize_token(sheet),
+        }
+        try:
+            fn = getattr(_schema_registry, "list_sheet_aliases", None)
+            if callable(fn):
+                for alias in _as_list(fn(sheet) or []):
+                    if _s(alias):
+                        candidates.add(_s(alias))
+                        candidates.add(_normalize_token(alias))
+        except Exception:
+            pass
+
+        for candidate in candidates:
+            token = _normalize_token(candidate)
+            if token and token not in out:
+                out[token] = sheet
+
+    return out
+
+
+def _best_effort_page_catalog_resolve(name: str) -> str:
+    raw = _s(name)
+    if not raw:
+        return raw
+
+    try:
+        import core.sheets.page_catalog as page_catalog  # type: ignore
+
+        for fn_name in ("resolve_page_candidate", "resolve_page", "normalize_page_name", "canonicalize_page"):
+            fn = getattr(page_catalog, fn_name, None)
+            if not callable(fn):
+                continue
+
+            for kwargs in (
+                {"allow_output_pages": True},
+                {"allow_special_pages": True},
+                {},
+            ):
+                try:
+                    out = fn(raw, **kwargs)
+                    out_s = _s(out)
+                    if out_s:
+                        return out_s
+                except TypeError:
+                    continue
+                except Exception:
+                    break
+    except Exception:
+        pass
+
+    return raw
+
+
 def _get_sheet_spec(sheet_name: str) -> Any:
     fn = getattr(_schema_registry, "get_sheet_spec", None)
     if callable(fn):
-        return fn(sheet_name)
+        try:
+            return fn(sheet_name)
+        except Exception:
+            pass
 
     reg = _schema_registry_map()
     if sheet_name in reg:
         return reg[sheet_name]
+
+    alias_map = _sheet_alias_index()
+    canonical = alias_map.get(_normalize_token(sheet_name))
+    if canonical and canonical in reg:
+        return reg[canonical]
 
     raise ValueError(f"Unknown sheet: {sheet_name}")
 
@@ -177,7 +268,10 @@ def _get_sheet_spec(sheet_name: str) -> Any:
 def _list_sheets() -> List[str]:
     fn = getattr(_schema_registry, "list_sheets", None)
     if callable(fn):
-        return [_s(x) for x in _as_list(fn()) if _s(x)]
+        try:
+            return [_s(x) for x in _as_list(fn()) if _s(x)]
+        except Exception:
+            pass
 
     reg = _schema_registry_map()
     return [_s(x) for x in reg.keys() if _s(x)]
@@ -238,7 +332,7 @@ def data_dictionary_contract() -> Tuple[List[str], List[str]]:
 
 
 # -----------------------------------------------------------------------------
-# Ordering
+# Ordering / sheet resolution
 # -----------------------------------------------------------------------------
 def preferred_sheet_order() -> List[str]:
     """
@@ -260,87 +354,63 @@ def preferred_sheet_order() -> List[str]:
         if sheet in reg_keys and sheet not in ordered:
             ordered.append(sheet)
 
-    if ordered:
-        for sheet in _list_sheets():
-            if sheet in reg_keys and sheet not in ordered:
-                ordered.append(sheet)
-        for sheet in sorted(reg_keys):
-            if sheet not in ordered:
-                ordered.append(sheet)
-        return ordered
+    if not ordered:
+        try:
+            from core.sheets.page_catalog import CANONICAL_PAGES  # type: ignore
 
-    try:
-        from core.sheets.page_catalog import CANONICAL_PAGES  # type: ignore
-
-        for sheet in _as_list(CANONICAL_PAGES):
-            s = _s(sheet)
-            if s in reg_keys and s not in ordered:
-                ordered.append(s)
-    except Exception:
-        pass
-
-    if ordered:
-        for sheet in _list_sheets():
-            if sheet in reg_keys and sheet not in ordered:
-                ordered.append(sheet)
-        for sheet in sorted(reg_keys):
-            if sheet not in ordered:
-                ordered.append(sheet)
-        return ordered
+            for sheet in _as_list(CANONICAL_PAGES):
+                s = _s(sheet)
+                if s in reg_keys and s not in ordered:
+                    ordered.append(s)
+        except Exception:
+            pass
 
     listed = [s for s in _list_sheets() if s in reg_keys]
-    if listed:
-        for sheet in listed:
-            if sheet not in ordered:
-                ordered.append(sheet)
-        for sheet in sorted(reg_keys):
-            if sheet not in ordered:
-                ordered.append(sheet)
-        return ordered
-
-    return sorted(reg_keys)
+    ordered.extend([s for s in listed if s not in ordered])
+    ordered.extend([s for s in sorted(reg_keys) if s not in ordered])
+    return ordered
 
 
 def _canonicalize_sheet_name(name: str) -> str:
-    """
-    Best-effort canonicalization.
-    """
     raw = _s(name)
     if not raw:
         return raw
 
-    try:
-        import core.sheets.page_catalog as page_catalog  # type: ignore
+    reg = _schema_registry_map()
+    if raw in reg:
+        return raw
 
-        for fn_name in ("normalize_page_name", "resolve_page", "canonicalize_page"):
-            fn = getattr(page_catalog, fn_name, None)
-            if callable(fn):
-                for kwargs in (
-                    {"allow_output_pages": True},
-                    {"allow_special_pages": True},
-                    {},
-                ):
-                    try:
-                        out = fn(raw, **kwargs)
-                        out_s = _s(out)
-                        if out_s:
-                            return out_s
-                        break
-                    except TypeError:
-                        continue
-                    except Exception:
-                        break
-                try:
-                    out = fn(raw)
-                    out_s = _s(out)
-                    if out_s:
-                        return out_s
-                except Exception:
-                    pass
-    except Exception:
-        pass
+    resolved = _best_effort_page_catalog_resolve(raw)
+    if resolved in reg:
+        return resolved
 
-    return raw.replace(" ", "_")
+    alias_map = _sheet_alias_index()
+    token = _normalize_token(resolved or raw)
+    return alias_map.get(token, raw.replace(" ", "_"))
+
+
+def resolve_requested_sheets(
+    sheets: Optional[Sequence[str]],
+    *,
+    include_meta_sheet: bool = True,
+) -> List[str]:
+    reg = _schema_registry_map()
+    if not reg:
+        return []
+
+    if sheets is None:
+        ordered = preferred_sheet_order()
+    else:
+        ordered = _dedupe_keep_order([_canonicalize_sheet_name(s) for s in list(sheets)])
+
+    missing = [s for s in ordered if s not in reg]
+    if missing:
+        raise ValueError(f"Unknown sheets in data_dictionary request: {missing}")
+
+    if not include_meta_sheet:
+        ordered = [s for s in ordered if s != DATA_DICTIONARY_SHEET_NAME]
+
+    return ordered
 
 
 # -----------------------------------------------------------------------------
@@ -359,9 +429,9 @@ def normalize_data_dictionary_row(row: Mapping[str, Any]) -> Dict[str, Any]:
 
     canonical_map: Dict[str, Any] = {
         "sheet": row.get("sheet", row_ci.get("sheet", row_ci.get("page"))),
-        "group": row.get("group", row_ci.get("group")),
+        "group": row.get("group", row_ci.get("group", row_ci.get("section"))),
         "header": row.get("header", row_ci.get("header", row_ci.get("column"))),
-        "key": row.get("key", row_ci.get("key")),
+        "key": row.get("key", row_ci.get("key", row_ci.get("field"))),
         "dtype": row.get("dtype", row_ci.get("dtype", row_ci.get("type"))),
         "fmt": row.get("fmt", row_ci.get("fmt", row_ci.get("format"))),
         "required": row.get("required", row_ci.get("required", row_ci.get("is_required"))),
@@ -379,11 +449,11 @@ def normalize_data_dictionary_row(row: Mapping[str, Any]) -> Dict[str, Any]:
             value = canonical_map[lk]
         elif lk in {"sheet", "page"}:
             value = canonical_map.get("sheet")
-        elif lk == "group":
+        elif lk in {"group", "section"}:
             value = canonical_map.get("group")
         elif lk in {"header", "column"}:
             value = canonical_map.get("header")
-        elif lk == "key":
+        elif lk in {"key", "field"}:
             value = canonical_map.get("key")
         elif lk in {"dtype", "type"}:
             value = canonical_map.get("dtype")
@@ -424,7 +494,7 @@ def row_dict_from_column(sheet: str, col: Any) -> Dict[str, Any]:
         "dtype": _s(_obj_get(col, "dtype", "type", default="")),
         "fmt": _s(_obj_get(col, "fmt", "format", default="")),
         "required": _bool(_obj_get(col, "required", default=False)),
-        "source": _s(_obj_get(col, "source", default="")),
+        "source": _s(_obj_get(col, "source", default="schema_registry")),
         "notes": _s(_obj_get(col, "notes", "note", "description", default="")),
     }
     return normalize_data_dictionary_row(base)
@@ -450,19 +520,13 @@ def build_data_dictionary_rows(
     if not reg:
         return []
 
-    if sheets is None:
-        ordered_sheets = preferred_sheet_order()
-    else:
-        ordered_sheets = [_canonicalize_sheet_name(s) for s in list(sheets)]
-        missing = [s for s in ordered_sheets if s not in reg]
-        if missing:
-            raise ValueError(f"Unknown sheets in data_dictionary request: {missing}")
+    ordered_sheets = resolve_requested_sheets(
+        sheets,
+        include_meta_sheet=include_meta_sheet,
+    )
 
     rows: List[Dict[str, Any]] = []
     for sheet in ordered_sheets:
-        if not include_meta_sheet and sheet == DATA_DICTIONARY_SHEET_NAME:
-            continue
-
         spec = reg.get(sheet)
         if spec is None:
             continue
@@ -521,7 +585,7 @@ def build_data_dictionary_payload(
     module as a sheet-spec builder.
 
     format:
-      - "rows"   -> returns rows + rows_matrix
+      - "rows"   -> returns rows + rows_matrix + row_objects aliases
       - "values" -> returns values matrix
     """
     fmt = _s(format).lower() or "rows"
@@ -539,8 +603,11 @@ def build_data_dictionary_payload(
         return {
             "kind": DATA_DICTIONARY_OUTPUT_KIND,
             "sheet": DATA_DICTIONARY_SHEET_NAME,
+            "page": DATA_DICTIONARY_SHEET_NAME,
+            "sheet_name": DATA_DICTIONARY_SHEET_NAME,
             "format": "values",
             "headers": headers,
+            "display_headers": headers,
             "keys": keys,
             "values": values,
             "count": max(0, len(values) - (1 if include_header_row else 0)),
@@ -552,14 +619,23 @@ def build_data_dictionary_payload(
         sheets=sheets,
         include_meta_sheet=include_meta_sheet,
     )
+    rows_matrix = [[row.get(k) for k in keys] for row in rows]
     return {
         "kind": DATA_DICTIONARY_OUTPUT_KIND,
         "sheet": DATA_DICTIONARY_SHEET_NAME,
+        "page": DATA_DICTIONARY_SHEET_NAME,
+        "sheet_name": DATA_DICTIONARY_SHEET_NAME,
         "format": "rows",
         "headers": headers,
+        "display_headers": headers,
         "keys": keys,
         "rows": rows,
-        "rows_matrix": [[row.get(k) for k in keys] for row in rows],
+        "row_objects": rows,
+        "items": rows,
+        "records": rows,
+        "data": rows,
+        "quotes": rows,
+        "rows_matrix": rows_matrix,
         "count": len(rows),
         "version": DATA_DICTIONARY_VERSION,
         "schema_version": SCHEMA_VERSION,
@@ -579,6 +655,7 @@ def validate_data_dictionary_output(
     rows: Sequence[Dict[str, Any]],
     *,
     enforce_unique_sheet_key: bool = True,
+    enforce_unique_sheet_header: bool = False,
     forbid_extra_keys: bool = False,
 ) -> None:
     """
@@ -586,7 +663,7 @@ def validate_data_dictionary_output(
     """
     _, dd_keys = data_dictionary_contract()
     required_keys = set(dd_keys)
-    normalized_rows = list(rows)
+    normalized_rows = [normalize_data_dictionary_row(r) for r in rows]
 
     for i, row in enumerate(normalized_rows):
         missing = required_keys - set(row.keys())
@@ -598,17 +675,20 @@ def validate_data_dictionary_output(
             if extra:
                 raise ValueError(f"Row {i} has extra keys not in spec: {sorted(extra)}")
 
+    sheet_key: Optional[str] = None
+    col_key: Optional[str] = None
+    header_key: Optional[str] = None
+
+    for original_key in dd_keys:
+        lk = original_key.strip().lower().replace(" ", "_")
+        if lk in {"sheet", "page"} and sheet_key is None:
+            sheet_key = original_key
+        if lk == "key" and col_key is None:
+            col_key = original_key
+        if lk == "header" and header_key is None:
+            header_key = original_key
+
     if enforce_unique_sheet_key:
-        sheet_key: Optional[str] = None
-        col_key: Optional[str] = None
-
-        for original_key in dd_keys:
-            lk = original_key.strip().lower().replace(" ", "_")
-            if lk in {"sheet", "page"} and sheet_key is None:
-                sheet_key = original_key
-            if lk == "key" and col_key is None:
-                col_key = original_key
-
         if not sheet_key or not col_key:
             raise ValueError("Cannot validate uniqueness: Data_Dictionary spec missing sheet/key columns")
 
@@ -618,6 +698,17 @@ def validate_data_dictionary_output(
             if pair in seen:
                 raise ValueError(f"Duplicate (sheet,key) found in data dictionary: {pair}")
             seen.add(pair)
+
+    if enforce_unique_sheet_header:
+        if not sheet_key or not header_key:
+            raise ValueError("Cannot validate header uniqueness: Data_Dictionary spec missing sheet/header columns")
+
+        seen_headers = set()
+        for row in normalized_rows:
+            pair = (_s(row.get(sheet_key)), _s(row.get(header_key)))
+            if pair in seen_headers:
+                raise ValueError(f"Duplicate (sheet,header) found in data dictionary: {pair}")
+            seen_headers.add(pair)
 
 
 def validate_data_dictionary_values(
@@ -667,6 +758,7 @@ def _self_check() -> None:
     validate_data_dictionary_output(
         rows,
         enforce_unique_sheet_key=True,
+        enforce_unique_sheet_header=False,
         forbid_extra_keys=True,
     )
 
