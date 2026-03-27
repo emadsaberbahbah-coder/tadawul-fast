@@ -1,34 +1,29 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 core/investment_advisor_engine.py
 ================================================================================
-INVESTMENT ADVISOR ENGINE — v3.4.0
+INVESTMENT ADVISOR ENGINE — v3.5.0
 ================================================================================
 SYNC-EXPORT SAFE • ASYNC-INTERNAL • EXPORT-HARDENED • ROUTE-TOLERANT
 ENGINE-AWARE • PAGE-CATALOG NORMALIZED • TOP10-BUILDER FIRST
 INSIGHTS FALLBACK SAFE • SPECIAL-SCHEMA SAFE • NO-IMPORT-TIME-NETWORK
-ADVISOR + SHEET-ROWS SAFE • JSON-SAFE • 502-RESISTANT
+ADVISOR + SHEET-ROWS SAFE • JSON-SAFE • 502-RESISTANT • MATRIX/ROW-OBJECT SAFE
 
 What this revision improves
 ---------------------------
-- ✅ FIX: canonical page normalization now prefers page-catalog resolution before
-         fallback aliases, reducing cross-router page drift.
-- ✅ FIX: Top_10_Investments now prefers the dedicated top10 selector/builder
-         when available, instead of relying only on local fallback scoring.
-- ✅ FIX: Insights_Analysis fallback now returns structured insight rows instead
-         of generic scored instrument rows when the direct page builder is absent.
-- ✅ FIX: Data_Dictionary fallback stays schema-safe (empty schema payload)
-         rather than degrading into the advisor instrument fallback.
-- ✅ FIX: special schema defaults now include Top10, Insights, and
-         Data_Dictionary so these pages do not accidentally collapse into a
-         generic shape when schema helpers are unavailable.
-- ✅ FIX: source-page normalization and explicit target-page normalization are
-         aligned across payload/query/body/criteria inputs.
-- ✅ FIX: builder / runner resolution checks app.state first, then tolerant
-         module-level candidates, factories, and service objects.
-- ✅ FIX: more stable metadata and dispatch tags for debugging live execution.
+- ✅ FIX: explicit non-Top10 `sheet-rows` requests no longer return too early on
+         empty / weak direct engine payloads and block intended fallback builders.
+- ✅ FIX: tolerant calling only skips real signature-mismatch `TypeError`s; real
+         runtime failures now surface cleanly instead of being silently retried.
+- ✅ FIX: row extraction now supports `row_objects`, `rowObjects`, nested
+         `payload` / `result`, and matrix-only payloads.
+- ✅ FIX: direct-symbol fallback preserves user order instead of using unordered
+         sets that can change rank stability and payload determinism.
+- ✅ FIX: normalized tabular payloads now include `row_objects` to stay aligned
+         with the newer engine/router contract.
+- ✅ FIX: Top10 builder and engine page adapters backfill canonical fields more
+         consistently so downstream routes receive stable envelopes.
 
 Purpose
 -------
@@ -52,15 +47,6 @@ existing route layer. It can:
 - pass through engine page rows for explicit page requests
 - build Top_10_Investments style outputs for derived Top10 requests
 - avoid raising in normal production flows
-
-Design notes
-------------
-- No external network calls at import time.
-- Engine access is lazy and runtime only.
-- Public exports are synchronous wrappers around an async core, so both:
-    - sync callers
-    - async-aware callers
-  remain compatible through the route layer.
 ================================================================================
 """
 
@@ -79,7 +65,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 logger = logging.getLogger("core.investment_advisor_engine")
 logger.addHandler(logging.NullHandler())
 
-INVESTMENT_ADVISOR_ENGINE_VERSION = "3.4.0"
+INVESTMENT_ADVISOR_ENGINE_VERSION = "3.5.0"
 TOP10_PAGE_NAME = "Top_10_Investments"
 INSIGHTS_PAGE_NAME = "Insights_Analysis"
 DATA_DICTIONARY_PAGE_NAME = "Data_Dictionary"
@@ -280,15 +266,15 @@ def _normalize_list(value: Any) -> List[str]:
         return []
 
     if isinstance(value, str):
-        seq = []
+        seq: List[str] = []
         for part in value.replace(";", ",").replace("\n", ",").split(","):
             p = part.strip()
             if p:
                 seq.append(p)
     elif isinstance(value, (list, tuple, set)):
-        seq = list(value)
+        seq = [ _s(v) for v in value ]
     else:
-        seq = [value]
+        seq = [_s(value)]
 
     return _dedupe_keep_order(seq)
 
@@ -323,6 +309,23 @@ def _callable(obj: Any) -> bool:
         return callable(obj)
     except Exception:
         return False
+
+
+def _is_signature_mismatch_typeerror(exc: TypeError) -> bool:
+    msg = _s(exc).lower()
+    indicators = (
+        "unexpected keyword argument",
+        "positional argument",
+        "required positional argument",
+        "takes ",
+        "got an unexpected keyword",
+        "got multiple values for argument",
+        "missing 1 required positional argument",
+        "missing required positional argument",
+        "but ",
+        "was given",
+    )
+    return any(token in msg for token in indicators)
 
 
 async def _call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -396,19 +399,31 @@ def _model_to_dict(obj: Any) -> Dict[str, Any]:
 
 def _extract_rows_candidate(payload: Any) -> List[Dict[str, Any]]:
     if isinstance(payload, list):
-        return [dict(x) for x in payload if isinstance(x, dict)]
-
-    if not isinstance(payload, dict):
+        if payload and isinstance(payload[0], dict):
+            return [dict(x) for x in payload if isinstance(x, dict)]
         return []
 
-    for key in ("rows", "recommendations", "data", "items", "results", "records", "quotes", "row_objects"):
-        value = payload.get(key)
-        if isinstance(value, list) and value and isinstance(value[0], dict):
-            return [dict(x) for x in value if isinstance(x, dict)]
+    if not isinstance(payload, dict):
+        payload = _model_to_dict(payload)
+        if not isinstance(payload, dict):
+            return []
 
-    result = payload.get("result")
-    if isinstance(result, list) and result and isinstance(result[0], dict):
-        return [dict(x) for x in result if isinstance(x, dict)]
+    for key in ("row_objects", "rowObjects", "rows", "recommendations", "data", "items", "results", "records", "quotes"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            if not value:
+                return []
+            if isinstance(value[0], dict):
+                return [dict(x) for x in value if isinstance(x, dict)]
+
+    for nested_key in ("payload", "result"):
+        nested = payload.get(nested_key)
+        if isinstance(nested, dict):
+            rows = _extract_rows_candidate(nested)
+            if rows:
+                return rows
+        elif isinstance(nested, list) and nested and isinstance(nested[0], dict):
+            return [dict(x) for x in nested if isinstance(x, dict)]
 
     if isinstance(payload.get("row"), dict):
         return [dict(payload["row"])]
@@ -418,7 +433,9 @@ def _extract_rows_candidate(payload: Any) -> List[Dict[str, Any]]:
 
 def _extract_matrix_candidate(payload: Any) -> Optional[List[List[Any]]]:
     if not isinstance(payload, dict):
-        return None
+        payload = _model_to_dict(payload)
+        if not isinstance(payload, dict):
+            return None
 
     for key in ("rows_matrix", "data_matrix", "matrix"):
         value = payload.get(key)
@@ -431,20 +448,23 @@ def _extract_matrix_candidate(payload: Any) -> Optional[List[List[Any]]]:
                     out.append([row])
             return out
 
-    rows = payload.get("rows")
-    if isinstance(rows, list) and rows and isinstance(rows[0], (list, tuple)):
-        return [list(r) if isinstance(r, (list, tuple)) else [r] for r in rows]
+    for key in ("rows", "data", "result"):
+        value = payload.get(key)
+        if isinstance(value, list) and value and isinstance(value[0], (list, tuple)):
+            return [list(r) if isinstance(r, (list, tuple)) else [r] for r in value]
 
-    data = payload.get("data")
-    if isinstance(data, list) and data and isinstance(data[0], (list, tuple)):
-        return [list(r) if isinstance(r, (list, tuple)) else [r] for r in data]
+    nested = payload.get("payload")
+    if isinstance(nested, dict):
+        return _extract_matrix_candidate(nested)
 
     return None
 
 
 def _extract_headers_keys(payload: Any) -> Tuple[List[str], List[str]]:
     if not isinstance(payload, dict):
-        return [], []
+        payload = _model_to_dict(payload)
+        if not isinstance(payload, dict):
+            return [], []
 
     headers = (
         payload.get("display_headers")
@@ -462,6 +482,26 @@ def _extract_headers_keys(payload: Any) -> Tuple[List[str], List[str]]:
 
     clean_headers = [_s(x) for x in headers if _s(x)]
     clean_keys = [_s(x) for x in keys if _s(x)]
+
+    if not clean_keys and clean_headers:
+        clean_keys = list(clean_headers)
+
+    if not clean_headers:
+        for carrier in ("row_objects", "rowObjects", "rows", "data", "items", "records", "quotes"):
+            value = payload.get(carrier)
+            if isinstance(value, list) and value and isinstance(value[0], dict):
+                clean_keys = clean_keys or _derive_keys_from_rows([dict(x) for x in value if isinstance(x, dict)])
+                clean_headers = list(clean_keys)
+                break
+
+    nested = payload.get("payload")
+    if isinstance(nested, dict) and (not clean_headers or not clean_keys):
+        nested_headers, nested_keys = _extract_headers_keys(nested)
+        if not clean_headers:
+            clean_headers = nested_headers
+        if not clean_keys:
+            clean_keys = nested_keys
+
     return clean_headers, clean_keys
 
 
@@ -494,18 +534,37 @@ def _derive_keys_from_rows(rows: List[Dict[str, Any]]) -> List[str]:
     return out
 
 
+def _count_tabular_payload(payload: Any) -> int:
+    if not isinstance(payload, dict):
+        return 0
+    for key in ("row_objects", "rowObjects", "rows", "data", "items", "records", "results", "quotes"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return len(value)
+    for key in ("rows_matrix", "matrix", "data_matrix"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return len(value)
+    return 0
+
+
 def _has_tabular_shape(payload: Any) -> bool:
     if not isinstance(payload, dict):
         return False
-    if isinstance(payload.get("rows"), list):
-        return True
-    if isinstance(payload.get("rows_matrix"), list):
-        return True
-    if isinstance(payload.get("headers"), list):
-        return True
-    if isinstance(payload.get("keys"), list):
-        return True
+    for key in ("rows", "row_objects", "rowObjects", "rows_matrix", "matrix", "headers", "keys", "display_headers"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return True
     return False
+
+
+def _has_meaningful_tabular_content(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    headers, keys = _extract_headers_keys(payload)
+    rows = _extract_rows_candidate(payload)
+    matrix = _extract_matrix_candidate(payload)
+    return bool(rows or matrix or headers or keys)
 
 
 def _route_family_for_page(page: str) -> str:
@@ -539,6 +598,7 @@ def _make_error_payload(
         "display_headers": [],
         "keys": [],
         "rows": [],
+        "row_objects": [],
         "items": [],
         "data": [],
         "rows_matrix": [],
@@ -627,8 +687,10 @@ def _normalize_page_name(value: Any) -> str:
             for kwargs in ({"page": raw}, {"sheet": raw}, {"sheet_name": raw}, {"name": raw}, {}):
                 try:
                     out = fn(**kwargs) if kwargs else fn(raw)
-                except TypeError:
-                    continue
+                except TypeError as exc:
+                    if _is_signature_mismatch_typeerror(exc):
+                        continue
+                    break
                 except Exception:
                     continue
 
@@ -738,8 +800,10 @@ async def _load_schema_defaults(page_name: str = TOP10_PAGE_NAME) -> Tuple[List[
                         if canonical_page == TOP10_PAGE_NAME:
                             keys, headers = _ensure_top10_keys_present(keys, headers)
                         return headers, keys
-                except TypeError:
-                    continue
+                except TypeError as exc:
+                    if _is_signature_mismatch_typeerror(exc):
+                        continue
+                    break
                 except Exception:
                     continue
 
@@ -892,6 +956,7 @@ def _flatten_criteria(payload: Dict[str, Any]) -> Dict[str, Any]:
         "tickers",
         "limit",
         "top_n",
+        "offset",
         "investment_period_days",
         "invest_period_days",
         "horizon_days",
@@ -915,7 +980,6 @@ def _flatten_criteria(payload: Dict[str, Any]) -> Dict[str, Any]:
         if key in payload and payload.get(key) is not None:
             out[key] = payload.get(key)
 
-    # Canonical page resolution for direct target
     for key in ("page", "sheet", "sheet_name"):
         if key in out:
             normalized = _normalize_page_name(out.get(key))
@@ -982,6 +1046,10 @@ def _normalize_direct_symbols(criteria: Dict[str, Any]) -> List[str]:
 def _effective_limit(criteria: Dict[str, Any], default: int = 10) -> int:
     limit = _safe_int(criteria.get("limit") or criteria.get("top_n"), default)
     return max(1, min(200, limit))
+
+
+def _effective_offset(criteria: Dict[str, Any], default: int = 0) -> int:
+    return max(0, _safe_int(criteria.get("offset"), default))
 
 
 def _normalize_mode(criteria: Dict[str, Any]) -> str:
@@ -1063,6 +1131,8 @@ async def _call_engine_sheet_rows(
         {"sheet": page, "limit": limit, "format": "rows", "mode": mode, "body": payload},
         {"sheet_name": page, "limit": limit, "format": "rows", "mode": mode, "body": payload},
         {"name": page, "limit": limit, "format": "rows", "mode": mode, "body": payload},
+        {"page": page, "limit": limit, "mode": mode, "payload": payload},
+        {"sheet": page, "limit": limit, "mode": mode, "payload": payload},
         {"page": page, "limit": limit, "mode": mode},
         {"sheet": page, "limit": limit, "mode": mode},
         {"sheet_name": page, "limit": limit, "mode": mode},
@@ -1082,8 +1152,15 @@ async def _call_engine_sheet_rows(
         try:
             out = await _call_maybe_async(fn, **kwargs)
             break
-        except TypeError:
-            continue
+        except TypeError as exc:
+            if _is_signature_mismatch_typeerror(exc):
+                continue
+            return _make_error_payload(
+                f"Engine page call failed: {type(exc).__name__}: {exc}",
+                page=page,
+                operation="sheet_rows",
+                extra_meta={"dispatch": f"engine.{fn_name}"},
+            )
         except Exception as e:
             return _make_error_payload(
                 f"Engine page call failed: {type(e).__name__}: {e}",
@@ -1093,11 +1170,19 @@ async def _call_engine_sheet_rows(
             )
 
     if out is None:
-        try:
-            out = await _call_maybe_async(fn, page, limit)
-        except TypeError:
+        for args in ((page, limit), (page,), tuple()):
             try:
-                out = await _call_maybe_async(fn, page)
+                out = await _call_maybe_async(fn, *args)
+                break
+            except TypeError as exc:
+                if _is_signature_mismatch_typeerror(exc):
+                    continue
+                return _make_error_payload(
+                    f"Engine page call failed: {type(exc).__name__}: {exc}",
+                    page=page,
+                    operation="sheet_rows",
+                    extra_meta={"dispatch": f"engine.{fn_name}"},
+                )
             except Exception as e:
                 return _make_error_payload(
                     f"Engine page call failed: {type(e).__name__}: {e}",
@@ -1121,6 +1206,7 @@ async def _call_engine_sheet_rows(
                 "display_headers": headers,
                 "keys": keys,
                 "rows": rows,
+                "row_objects": rows,
                 "data": rows,
                 "items": rows,
                 "rows_matrix": _rows_to_matrix(rows, keys) if keys else [],
@@ -1132,6 +1218,7 @@ async def _call_engine_sheet_rows(
                 "sheet": page,
                 "detail": "Engine returned non-dict list rows",
                 "rows": [],
+                "row_objects": [],
                 "rows_matrix": [],
                 "headers": [],
                 "keys": [],
@@ -1179,6 +1266,7 @@ def _normalize_engine_page_payload(result: Dict[str, Any], *, page: str) -> Dict
 
     meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
     meta = dict(meta)
+    meta.setdefault("normalized_by", "core.investment_advisor_engine")
 
     out = {
         "status": status_value,
@@ -1191,6 +1279,7 @@ def _normalize_engine_page_payload(result: Dict[str, Any], *, page: str) -> Dict
         "column_headers": headers,
         "keys": keys,
         "rows": rows,
+        "row_objects": rows,
         "items": rows,
         "data": rows,
         "rows_matrix": matrix,
@@ -1246,19 +1335,24 @@ async def _collect_candidate_rows(
     mode: str,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     pages = _normalize_sources(criteria)
-    direct_symbols = set([s.upper() for s in _normalize_direct_symbols(criteria)])
+    direct_symbol_list = _normalize_direct_symbols(criteria)
+    direct_symbol_lookup = {s.upper(): s for s in direct_symbol_list}
+    direct_symbols_upper = set(direct_symbol_lookup.keys())
     limit = max(_effective_limit(criteria), 1)
+    offset = _effective_offset(criteria)
 
     collected: List[Dict[str, Any]] = []
     by_symbol: Dict[str, Dict[str, Any]] = {}
     page_counts: Dict[str, int] = {}
     page_errors: Dict[str, str] = {}
 
+    fetch_limit = max((limit + offset) * 5, 25)
+
     for page in pages:
         page_result = await _call_engine_sheet_rows(
             engine,
             page=page,
-            limit=max(limit * 5, 25),
+            limit=fetch_limit,
             mode=mode,
             payload=criteria,
         )
@@ -1276,10 +1370,10 @@ async def _collect_candidate_rows(
             item.setdefault("source_page", page)
 
             sym = _symbol_of(item)
-            if not sym and direct_symbols:
+            if not sym and direct_symbols_upper:
                 continue
 
-            if direct_symbols and sym.upper() not in direct_symbols:
+            if direct_symbols_upper and sym.upper() not in direct_symbols_upper:
                 continue
 
             key = sym.upper() if sym else f"__row_{len(collected)+1}"
@@ -1292,22 +1386,25 @@ async def _collect_candidate_rows(
                     if existing.get(k) in (None, "", "None") and v not in (None, "", "None"):
                         existing[k] = v
 
-    if direct_symbols and not collected:
-        for sym in direct_symbols:
-            collected.append(
-                {
-                    "symbol": sym,
-                    "name": sym,
-                    "source_page": "direct_symbols",
-                }
-            )
+    if direct_symbols_upper:
+        existing_upper = { _symbol_of(row).upper() for row in collected if _symbol_of(row) }
+        for sym_upper in direct_symbol_lookup.keys():
+            if sym_upper not in existing_upper:
+                seed = direct_symbol_lookup[sym_upper]
+                collected.append(
+                    {
+                        "symbol": seed,
+                        "name": seed,
+                        "source_page": "direct_symbols",
+                    }
+                )
 
     meta = {
         "pages_effective": pages,
         "page_counts": page_counts,
         "page_errors": page_errors,
         "candidate_rows": len(collected),
-        "direct_symbols_count": len(direct_symbols),
+        "direct_symbols_count": len(direct_symbols_upper),
     }
     return collected, meta
 
@@ -1340,7 +1437,7 @@ def _extract_current_price(row: Dict[str, Any]) -> Optional[float]:
 
 
 def _extract_target_price(row: Dict[str, Any]) -> Optional[float]:
-    for key in ("target_price", "fair_value", "intrinsic_value", "forecast_price"):
+    for key in ("target_price", "fair_value", "intrinsic_value", "forecast_price", "forecast_price_3m"):
         v = _maybe_ratio(row.get(key))
         if v is not None:
             return v
@@ -1500,6 +1597,7 @@ def _score_and_rank_rows(
     *,
     criteria: Dict[str, Any],
     limit: int,
+    offset: int = 0,
 ) -> List[Dict[str, Any]]:
     min_roi = _maybe_ratio(criteria.get("min_expected_roi"))
     if min_roi is None:
@@ -1552,6 +1650,7 @@ def _score_and_rank_rows(
         r["risk_bucket"] = _risk_bucket(risk_score)
         r["overall_score"] = round(overall_score, 2)
         r["opportunity_score"] = round((roi_score * 0.60) + (confidence_score_pct * 0.40), 2)
+        r.setdefault("last_updated_riyadh", _now_utc_iso())
 
         if _is_blank(r.get("recommendation")):
             r["recommendation"] = _recommendation_from_scores(overall_score, expected_roi_3m, confidence, risk_score)
@@ -1573,8 +1672,9 @@ def _score_and_rank_rows(
         reverse=True,
     )
 
+    window = scored[offset : offset + max(1, limit)]
     out: List[Dict[str, Any]] = []
-    for idx, row in enumerate(scored[: max(1, limit)], start=1):
+    for idx, row in enumerate(window, start=1 + offset):
         r = dict(row)
         r["top10_rank"] = idx
         if _is_blank(r.get("rank_overall")):
@@ -1669,6 +1769,7 @@ async def _build_top10_via_builder(
     engine: Any,
     criteria: Dict[str, Any],
     limit: int,
+    offset: int,
     mode: str,
 ) -> Dict[str, Any]:
     builder, dispatch = await _resolve_top10_builder(request, engine)
@@ -1681,7 +1782,8 @@ async def _build_top10_via_builder(
             "engine": engine,
             "criteria": criteria,
             "limit": limit,
-            "top_n": limit,
+            "offset": offset,
+            "top_n": limit + offset,
             "mode": mode,
             "page": TOP10_PAGE_NAME,
         },
@@ -1689,28 +1791,28 @@ async def _build_top10_via_builder(
             "request": request,
             "engine": engine,
             "criteria": criteria,
-            "limit": limit,
+            "limit": limit + offset,
             "page": TOP10_PAGE_NAME,
         },
         {
             "request": request,
             "engine": engine,
             "criteria": criteria,
-            "top_n": limit,
+            "top_n": limit + offset,
             "page": TOP10_PAGE_NAME,
         },
         {
             "request": request,
             "engine": engine,
             "body": criteria,
-            "limit": limit,
+            "limit": limit + offset,
             "page": TOP10_PAGE_NAME,
         },
         {
             "request": request,
             "engine": engine,
             "payload": criteria,
-            "limit": limit,
+            "limit": limit + offset,
             "page": TOP10_PAGE_NAME,
         },
         {
@@ -1718,11 +1820,11 @@ async def _build_top10_via_builder(
             "engine": engine,
             "symbols": _normalize_direct_symbols(criteria),
             "criteria": criteria,
-            "limit": limit,
+            "limit": limit + offset,
         },
         {
             "criteria": criteria,
-            "limit": limit,
+            "limit": limit + offset,
             "engine": engine,
         },
     ]
@@ -1733,8 +1835,12 @@ async def _build_top10_via_builder(
             out = await _call_maybe_async(builder, **kwargs)
             rows = _normalize_top10_builder_rows(out)
             if rows:
+                window = rows[offset : offset + max(1, limit)]
+                for idx, row in enumerate(window, start=1 + offset):
+                    row.setdefault("top10_rank", idx)
+                    row.setdefault("criteria_snapshot", _json_compact(criteria))
                 return {
-                    "rows": rows,
+                    "rows": window,
                     "meta": {
                         "dispatch": dispatch,
                         "builder_used": True,
@@ -1747,8 +1853,11 @@ async def _build_top10_via_builder(
                 payload_meta.update({"dispatch": dispatch, "builder_used": True})
                 payload["meta"] = payload_meta
                 return payload
-        except TypeError:
-            continue
+        except TypeError as exc:
+            if _is_signature_mismatch_typeerror(exc):
+                continue
+            last_error = f"{type(exc).__name__}: {exc}"
+            break
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
 
@@ -1802,6 +1911,7 @@ async def _build_projected_sheet_payload(
         "column_headers": headers,
         "keys": keys,
         "rows": projected,
+        "row_objects": projected,
         "data": projected,
         "items": projected,
         "rows_matrix": matrix,
@@ -1823,6 +1933,7 @@ def _build_recommendations_payload(
         "route_family": "top10",
         "recommendations": recommendations,
         "rows": recommendations,
+        "row_objects": recommendations,
         "data": recommendations,
         "items": recommendations,
         "count": len(recommendations),
@@ -1840,6 +1951,7 @@ async def _build_criteria_sheet_payload(criteria: Dict[str, Any], *, meta: Dict[
         "horizon_days": _safe_int(criteria.get("horizon_days") or criteria.get("investment_period_days"), 90),
         "investment_period_days": _safe_int(criteria.get("investment_period_days") or criteria.get("horizon_days"), 90),
         "top_n": _effective_limit(criteria),
+        "offset": _effective_offset(criteria),
         "min_expected_roi": _maybe_ratio(criteria.get("min_expected_roi") or criteria.get("min_roi")),
         "min_confidence": _maybe_ratio(criteria.get("min_confidence")),
         "symbols": ",".join(_normalize_direct_symbols(criteria)),
@@ -1879,6 +1991,7 @@ async def _build_empty_schema_payload(page_name: str, *, meta: Dict[str, Any], d
         "column_headers": headers,
         "keys": keys,
         "rows": [],
+        "row_objects": [],
         "data": [],
         "items": [],
         "rows_matrix": [],
@@ -2008,6 +2121,7 @@ async def _execute_engine_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         target_page = _normalize_target_page(criteria)
         mode = _normalize_mode(criteria)
         limit = _effective_limit(criteria, default=10)
+        offset = _effective_offset(criteria, default=0)
         operation = _infer_operation(request, criteria)
 
         request_id = _get_request_id(request)
@@ -2021,9 +2135,10 @@ async def _execute_engine_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             "advisor_data_mode_effective": mode,
             "engine_present": bool(engine),
             "engine_type": type(engine).__name__ if engine is not None else "none",
+            "offset": offset,
+            "limit": limit,
         }
 
-        # schema-only / headers-only fast path
         if _coerce_bool(criteria.get("schema_only")) or _coerce_bool(criteria.get("headers_only")):
             headers, keys = await _load_schema_defaults(target_page)
             if target_page == TOP10_PAGE_NAME:
@@ -2041,6 +2156,7 @@ async def _execute_engine_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
                     "column_headers": headers,
                     "keys": keys,
                     "rows": [],
+                    "row_objects": [],
                     "items": [],
                     "data": [],
                     "rows_matrix": [],
@@ -2050,37 +2166,64 @@ async def _execute_engine_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
                 }
             )
 
-        # Explicit non-Top10 sheet-rows requests: try direct engine page access first.
         if operation == "sheet_rows" and target_page != TOP10_PAGE_NAME:
             direct_result = await _call_engine_sheet_rows(
                 engine,
                 page=target_page,
-                limit=limit,
+                limit=limit + offset,
                 mode=mode,
                 payload=criteria,
             )
             direct_payload = _normalize_engine_page_payload(direct_result, page=target_page)
+            direct_meta = direct_payload.get("meta") if isinstance(direct_payload.get("meta"), dict) else {}
             direct_payload["meta"] = {
-                **(direct_payload.get("meta") if isinstance(direct_payload.get("meta"), dict) else {}),
+                **direct_meta,
                 **base_meta,
-                "dispatch": (
-                    direct_payload.get("meta", {}).get("dispatch")
-                    if isinstance(direct_payload.get("meta"), dict)
-                    else "engine_direct_page"
-                ) or "engine_direct_page",
+                "dispatch": direct_meta.get("dispatch") or "engine_direct_page",
             }
 
             direct_status = _s(direct_payload.get("status")).lower()
-            if _has_tabular_shape(direct_payload) or direct_status not in {"error", "failed"}:
+            direct_count = int(direct_payload.get("count") or 0)
+            direct_meaningful = _has_meaningful_tabular_content(direct_payload)
+            is_source_page = target_page in _BASE_SOURCE_PAGES
+
+            if is_source_page and (direct_meaningful or direct_status not in {"error", "failed"}):
+                if offset and isinstance(direct_payload.get("rows"), list):
+                    rows = [dict(r) for r in direct_payload.get("rows", []) if isinstance(r, dict)]
+                    keys = [k for k in direct_payload.get("keys", []) if _s(k)]
+                    rows = rows[offset : offset + limit]
+                    direct_payload["rows"] = rows
+                    direct_payload["row_objects"] = rows
+                    direct_payload["items"] = rows
+                    direct_payload["data"] = rows
+                    direct_payload["rows_matrix"] = _rows_to_matrix(rows, keys) if keys else []
+                    direct_payload["count"] = len(rows)
                 return _jsonable_snapshot(direct_payload)
 
-        # Prefer the dedicated Top10 builder whenever Top10/recommendation flows are requested.
+            if target_page in {INSIGHTS_PAGE_NAME, DATA_DICTIONARY_PAGE_NAME, "AI_Opportunity_Report", "Advisor_Criteria", "KSA_TADAWUL"}:
+                base_meta["direct_page_empty_or_weak"] = not direct_meaningful
+                base_meta["direct_page_status"] = direct_status
+                base_meta["direct_page_count"] = direct_count
+            elif direct_meaningful or direct_count > 0:
+                if offset and isinstance(direct_payload.get("rows"), list):
+                    rows = [dict(r) for r in direct_payload.get("rows", []) if isinstance(r, dict)]
+                    keys = [k for k in direct_payload.get("keys", []) if _s(k)]
+                    rows = rows[offset : offset + limit]
+                    direct_payload["rows"] = rows
+                    direct_payload["row_objects"] = rows
+                    direct_payload["items"] = rows
+                    direct_payload["data"] = rows
+                    direct_payload["rows_matrix"] = _rows_to_matrix(rows, keys) if keys else []
+                    direct_payload["count"] = len(rows)
+                return _jsonable_snapshot(direct_payload)
+
         if target_page == TOP10_PAGE_NAME or operation in {"recommendations", "run"}:
             builder_result = await _build_top10_via_builder(
                 request=request,
                 engine=engine,
                 criteria=criteria,
                 limit=limit,
+                offset=offset,
                 mode=mode,
             )
 
@@ -2093,7 +2236,7 @@ async def _execute_engine_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
                     elif maybe_rows:
                         builder_rows = _normalize_top10_builder_rows(maybe_rows)
                 if builder_rows:
-                    for idx, row in enumerate(builder_rows, start=1):
+                    for idx, row in enumerate(builder_rows, start=1 + offset):
                         row.setdefault("top10_rank", idx)
                         row.setdefault("criteria_snapshot", _json_compact(criteria))
                     builder_meta = dict(base_meta)
@@ -2116,7 +2259,7 @@ async def _execute_engine_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
                         )
                     )
 
-                if _has_tabular_shape(builder_result):
+                if _has_meaningful_tabular_content(builder_result):
                     payload = _normalize_engine_page_payload(builder_result, page=TOP10_PAGE_NAME)
                     payload_meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
                     payload_meta = {**base_meta, **payload_meta}
@@ -2167,13 +2310,13 @@ async def _execute_engine_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             candidate_rows,
             criteria=criteria,
             limit=limit,
+            offset=offset,
         )
 
         meta = dict(base_meta)
         meta["dispatch"] = "advisor_scoring"
         meta["recommendation_count"] = len(recommendations)
 
-        # Explicit derived page fallbacks
         if operation == "sheet_rows":
             if target_page == TOP10_PAGE_NAME:
                 return _jsonable_snapshot(
@@ -2231,7 +2374,6 @@ async def _execute_engine_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
                     )
                 )
 
-            # Generic explicit page fallback: return projected scored rows
             return _jsonable_snapshot(
                 await _build_projected_sheet_payload(
                     target_page,
