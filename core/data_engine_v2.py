@@ -2,10 +2,10 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.43.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.44.0
 ================================================================================
 
-WHY v5.43.0
+WHY v5.44.0
 -----------
 - FIX: keeps rows / rows_matrix strictly matrix-aligned to keys while
        row_objects / items / records / data / quotes stay dict-row payloads.
@@ -25,6 +25,10 @@ WHY v5.43.0
        quote payloads are sparse or unavailable.
 - FIX: applies symbol-aware page defaults so Commodities_FX rows keep useful
        identity/context fields even during provider degradation.
+- FIX: adds a native Top 10 engine fallback ranker so the engine does not
+       depend on an external selector to build Top_10_Investments rows.
+- FIX: exposes normalize_row_to_schema and batch-analysis aliases expected by
+       downstream analysis/advisor routers.
 
 Design goals
 ------------
@@ -76,7 +80,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.43.1"
+__version__ = "5.44.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -2086,6 +2090,12 @@ class DataEngineV5:
     async def get_rows_for_page(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         return await self.get_page_rows(*args, **kwargs)
 
+    async def get_analysis_rows_batch(self, symbols: List[str], mode: str = "", *, schema: Any = None) -> Dict[str, Dict[str, Any]]:
+        return await self.get_enriched_quotes_batch(symbols, mode=mode, schema=schema)
+
+    async def get_analysis_row_dict(self, symbol: str, use_cache: bool = True, *, schema: Any = None) -> Dict[str, Any]:
+        return await self.get_enriched_quote_dict(symbol, use_cache=use_cache, schema=schema)
+
     def get_page_snapshot(self, *args: Any, **kwargs: Any) -> Optional[Dict[str, Any]]:
         return self.get_cached_sheet_snapshot(*args, **kwargs)
 
@@ -3383,6 +3393,93 @@ class DataEngineV5:
 
         return rows[:limit]
 
+    def _top10_sort_key(self, row: Dict[str, Any]) -> Tuple[float, ...]:
+        return (
+            _as_float(row.get("opportunity_score")) or float("-inf"),
+            _as_float(row.get("overall_score")) or float("-inf"),
+            _as_float(row.get("confidence_score")) or float("-inf"),
+            _as_float(row.get("expected_roi_3m")) or float("-inf"),
+            _as_float(row.get("expected_roi_12m")) or float("-inf"),
+            _as_float(row.get("value_score")) or float("-inf"),
+            _as_float(row.get("quality_score")) or float("-inf"),
+            _as_float(row.get("momentum_score")) or float("-inf"),
+            _as_float(row.get("growth_score")) or float("-inf"),
+            _as_float(row.get("current_price")) or float("-inf"),
+        )
+
+    async def _build_top10_rows_fallback(
+        self,
+        headers: Sequence[str],
+        keys: Sequence[str],
+        body: Optional[Dict[str, Any]],
+        limit: int,
+        mode: str = "",
+    ) -> Tuple[List[str], List[str], List[Dict[str, Any]]]:
+        body = dict(body or {})
+        criteria = dict(body.get("criteria") or {}) if isinstance(body.get("criteria"), dict) else {}
+        out_headers, out_keys = _ensure_top10_contract(headers, keys)
+
+        top_n = max(1, min(int(criteria.get("top_n") or body.get("top_n") or 10), max(1, limit)))
+        requested_pages = _extract_top10_pages_from_body(body) or list(TOP10_ENGINE_DEFAULT_PAGES)
+        requested_symbols = _extract_requested_symbols_from_body(body, limit=max(limit * 10, 200))
+
+        for page_name in requested_pages:
+            if len(requested_symbols) >= max(limit * 10, 200):
+                break
+            syms = await self.get_sheet_symbols(page_name, limit=max(limit * 2, 25), body=body)
+            if syms:
+                requested_symbols.extend(syms)
+
+        if not requested_symbols:
+            requested_symbols = list(EMERGENCY_PAGE_SYMBOLS.get("Top_10_Investments") or [])
+
+        requested_symbols = _normalize_symbol_list(requested_symbols, limit=max(limit * 10, 200))
+        if not requested_symbols:
+            return out_headers, out_keys, []
+
+        quotes = await self.get_enriched_quotes(requested_symbols, schema=None)
+        rows: List[Dict[str, Any]] = []
+        for q in quotes:
+            row = _model_to_dict(q)
+            row = _apply_page_row_backfill("Top_10_Investments", row)
+            _compute_scores_fallback(row)
+            _compute_recommendation(row)
+            rows.append(row)
+
+        if not rows:
+            return out_headers, out_keys, []
+
+        _apply_rank_overall(rows)
+        rows.sort(key=self._top10_sort_key, reverse=True)
+
+        criteria_snapshot = _top10_criteria_snapshot({
+            **criteria,
+            "pages_selected": requested_pages,
+            "direct_symbols": requested_symbols,
+            "top_n": top_n,
+        })
+
+        selected: List[Dict[str, Any]] = []
+        seen: Set[str] = set()
+        for row in rows:
+            sym = normalize_symbol(_safe_str(row.get("symbol") or row.get("ticker") or row.get("requested_symbol")))
+            dedupe_key = sym or _safe_str(row.get("name")) or f"row_{len(selected)+1}"
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+            row["top10_rank"] = len(selected) + 1
+            row["selection_reason"] = row.get("selection_reason") or _top10_selection_reason(row)
+            row["criteria_snapshot"] = row.get("criteria_snapshot") or criteria_snapshot
+            projected = _normalize_to_schema_keys(out_keys, out_headers, row)
+            projected["top10_rank"] = row["top10_rank"]
+            projected["selection_reason"] = row["selection_reason"]
+            projected["criteria_snapshot"] = row["criteria_snapshot"]
+            selected.append(_strict_project_row(out_keys, projected))
+            if len(selected) >= top_n:
+                break
+
+        return out_headers, out_keys, selected
+
     # ------------------------------------------------------------------
     # main sheet/page APIs
     # ------------------------------------------------------------------
@@ -3939,6 +4036,20 @@ class DataEngineV5:
         }
 
 
+
+def normalize_row_to_schema(sheet: str, row: Dict[str, Any], keep_extras: bool = False) -> Dict[str, Any]:
+    target = _canonicalize_sheet_name(sheet) or sheet or "Market_Leaders"
+    _spec, headers, keys, _src = _schema_for_sheet(target)
+    if target == "Top_10_Investments":
+        headers, keys = _ensure_top10_contract(headers, keys)
+    normalized = _normalize_to_schema_keys(keys, headers, dict(row or {}))
+    normalized = _apply_page_row_backfill(target, normalized)
+    if keep_extras and isinstance(row, dict):
+        for k, v in row.items():
+            if k not in normalized:
+                normalized[k] = _json_safe(v)
+    return normalized
+
 _ENGINE_INSTANCE: Optional[DataEngineV5] = None
 ENGINE: Optional[DataEngineV5] = None
 engine: Optional[DataEngineV5] = None
@@ -4005,4 +4116,5 @@ __all__ = [
     "__version__",
     "STATIC_CANONICAL_SHEET_CONTRACTS",
     "get_sheet_spec",
+    "normalize_row_to_schema",
 ]
