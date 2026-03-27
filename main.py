@@ -2,7 +2,7 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.6.0)
+TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.6.1)
 ================================================================================
 ALIGNED • DEPLOYMENT-SAFE • STARTUP-ONLY ROUTE MOUNT BY DEFAULT • ROUTER-SNAPSHOT-AWARE
 ENGINE-STATE-AWARE • OPENAPI-SAFE • RENDER-HEALTH-PROBE-SAFE • PRIORITY-MOUNTED
@@ -236,7 +236,7 @@ _CONTROLLED_CANONICAL_OWNER_MAP: Dict[str, str] = {
     "/v1/advisor": "advisor",
     "/v1/investment_advisor": "investment_advisor",
     "/v1/investment-advisor": "investment_advisor",
-    "/v1/advanced/sheet-rows": "advanced_analysis",
+    "/v1/advanced/sheet-rows": "investment_advisor",
     "/v1/advanced": "investment_advisor",
     "/v1/analysis": "analysis_sheet_rows",
     "/v1/schema": "advanced_analysis",
@@ -1239,16 +1239,11 @@ _MODULE_ROUTE_POLICIES: Dict[str, Dict[str, Sequence[str]]] = {
     "routes.investment_advisor": {
         "allow_prefixes": ("/v1/advanced", "/v1/investment_advisor", "/v1/investment-advisor"),
         "block_prefixes": ("/v1/advisor",),
-        "block_exact": ("/v1/advanced/sheet-rows",),
     },
     "routes.advanced_analysis": {
         "allow_prefixes": ("/v1/schema", "/schema"),
         "allow_exact": (
             "/sheet-rows",
-            "/v1/advanced/sheet-rows",
-            "/v1/advanced/insights-analysis",
-            "/v1/advanced/top10-investments",
-            "/v1/advanced/insights-criteria",
         ),
     },
     "routes.enriched_quote": {
@@ -1260,9 +1255,6 @@ _MODULE_ROUTE_POLICIES: Dict[str, Dict[str, Sequence[str]]] = {
 
 
 def _path_allowed_for_module(module_name: str, path: str) -> bool:
-    if path == "/v1/advanced/sheet-rows":
-        return module_name == "routes.advanced_analysis"
-
     policy = _MODULE_ROUTE_POLICIES.get(module_name)
     if not policy:
         return True
@@ -1381,7 +1373,7 @@ def _verify_required_route_families(app: FastAPI) -> List[str]:
 
     required_checks = {
         "advisor": lambda p: bool(p.get("advisor_any", False)),
-        "advanced": lambda p: bool(p.get("advanced_sheet_rows", False)),
+        "advanced": lambda p: bool(p.get("advanced_any", False)),
         "analysis": lambda p: bool(p.get("analysis", False)),
         "schema": lambda p: bool(p.get("schema", False)),
         "enriched": lambda p: bool(p.get("enriched", False)),
