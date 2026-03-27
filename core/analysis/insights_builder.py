@@ -2,37 +2,23 @@
 # core/analysis/insights_builder.py
 """
 ================================================================================
-Insights Analysis Builder — v1.4.0
+Insights Analysis Builder — v1.6.0
 (SCHEMA-FIRST / TOP10-CONTEXT-AWARE / IMPORT-SAFE / NUMERIC-SAFE / ROBUST)
 ================================================================================
 Tadawul Fast Bridge (TFB)
 
-What this revision fixes
-- ✅ FIX: keeps Insights_Analysis schema-first and fully import-safe.
-- ✅ FIX: preserves numeric VALUE output when possible for Sheets formulas/icons.
-- ✅ FIX: improves schema extraction tolerance across schema_registry payload shapes.
-- ✅ FIX: strengthens Top10 payload parsing across rows/items/data/quotes shapes.
-- ✅ FIX: supports symbol-only Top10 fallback when row payloads are unavailable.
-- ✅ FIX: keeps Build Status rows always present (never blank).
-- ✅ FIX: avoids hard failure when engine methods differ across versions.
-- ✅ FIX: carries criteria context consistently into summary / Top10 sections.
-- ✅ SAFE: no network calls at import time.
-- ✅ SAFE: best-effort engine access only.
-- ✅ SAFE: builder never raises for normal route execution; returns schema-correct rows.
-
-Expected Insights_Analysis columns
-- section
-- item
-- symbol
-- metric
-- value
-- notes
-- last_updated_riyadh
-
-Public API
-- build_insights_analysis_rows(...)
-- build_criteria_rows(...)
-- get_insights_schema()
+What this revision improves
+- FIX: accepts row_objects / rowObjects / rows_matrix / matrix payload shapes.
+- FIX: supports symbol-map payloads and nested payload/result envelopes.
+- FIX: keeps Top10 parsing aligned with revised engine / selector outputs.
+- FIX: retries alternate call signatures only for real signature-mismatch TypeErrors.
+- FIX: keeps direct symbol order stable and de-duplicated.
+- FIX: emits row_objects and rows_matrix in the final envelope for downstream stability.
+- FIX: improves quote-batch parsing when engine returns payload-style dicts instead of raw symbol maps.
+- FIX: keeps Build Status rows always present (never blank).
+- SAFE: no network calls at import time.
+- SAFE: best-effort engine access only.
+- SAFE: builder never raises for normal route execution; returns schema-correct rows.
 ================================================================================
 """
 
@@ -43,13 +29,15 @@ import json
 import logging
 import os
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 logger = logging.getLogger("core.analysis.insights_builder")
 logger.addHandler(logging.NullHandler())
 
-INSIGHTS_BUILDER_VERSION = "1.4.0"
+INSIGHTS_BUILDER_VERSION = "1.6.0"
 _RIYADH_TZ = timezone(timedelta(hours=3))
+_FALLBACK_KEYS = ["section", "item", "symbol", "metric", "value", "notes", "last_updated_riyadh"]
+_FALLBACK_HEADERS = ["Section", "Item", "Symbol", "Metric", "Value", "Notes", "Last Updated (Riyadh)"]
 
 
 # -----------------------------------------------------------------------------
@@ -175,6 +163,58 @@ def _safe_bool(v: Any, default: bool = False) -> bool:
     return default
 
 
+def _dedupe_keep_order(values: Iterable[Any]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for value in values:
+        s = _safe_str(value)
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+    return out
+
+
+def _rows_to_matrix(rows: Sequence[Mapping[str, Any]], keys: Sequence[str]) -> List[List[Any]]:
+    out: List[List[Any]] = []
+    key_list = [_safe_str(k) for k in keys if _safe_str(k)]
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        out.append([row.get(k, "") for k in key_list])
+    return out
+
+
+def _is_probable_symbol_token(value: Any) -> bool:
+    s = _safe_str(value)
+    if not s:
+        return False
+    if len(s) > 32:
+        return False
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._=^-:")
+    return all(ch in allowed for ch in s)
+
+
+def _is_signature_mismatch_typeerror(exc: TypeError) -> bool:
+    msg = _safe_str(exc).lower()
+    if not msg:
+        return False
+    markers = (
+        "unexpected keyword",
+        "positional argument",
+        "required positional argument",
+        "takes no keyword",
+        "takes from",
+        "takes exactly",
+        "got an unexpected keyword",
+        "got multiple values for argument",
+        "missing 1 required positional argument",
+        "missing required positional argument",
+        "keyword-only argument",
+    )
+    return any(marker in msg for marker in markers)
+
+
 # -----------------------------------------------------------------------------
 # Dict/model extraction helpers
 # -----------------------------------------------------------------------------
@@ -205,12 +245,38 @@ def _extract_row_dict(v: Any) -> Dict[str, Any]:
     return {}
 
 
+def _rows_from_matrix_payload(matrix: Any, cols: Sequence[Any]) -> List[Dict[str, Any]]:
+    keys = [_safe_str(c) for c in cols if _safe_str(c)]
+    if not keys:
+        return []
+    out: List[Dict[str, Any]] = []
+    for row in matrix or []:
+        if not isinstance(row, (list, tuple)):
+            continue
+        d: Dict[str, Any] = {}
+        for i, key in enumerate(keys):
+            d[key] = row[i] if i < len(row) else None
+        out.append(d)
+    return out
+
+
+def _looks_like_explicit_row_dict(d: Mapping[str, Any]) -> bool:
+    keyset = {str(k) for k in d.keys()}
+    if {"section", "item", "metric"}.issubset(keyset):
+        return True
+    if keyset & {"symbol", "recommendation", "overall_score", "expected_roi_3m", "current_price"}:
+        return True
+    return False
+
+
 def _coerce_rows_list(payload: Any) -> List[Dict[str, Any]]:
     if payload is None:
         return []
 
     if isinstance(payload, list):
         out: List[Dict[str, Any]] = []
+        if payload and isinstance(payload[0], (list, tuple)):
+            return []
         for item in payload:
             d = _extract_row_dict(item)
             if d:
@@ -218,20 +284,72 @@ def _coerce_rows_list(payload: Any) -> List[Dict[str, Any]]:
         return out
 
     if isinstance(payload, dict):
-        for key in ("rows", "items", "data", "quotes", "records", "result", "payload"):
+        # symbol-map payloads: {"AAPL": {...}, "MSFT": {...}}
+        if payload:
+            maybe_symbol_map = True
+            symbol_rows: List[Dict[str, Any]] = []
+            for k, v in payload.items():
+                if not isinstance(v, dict) or not _is_probable_symbol_token(k):
+                    maybe_symbol_map = False
+                    break
+                row = dict(v)
+                if not row.get("symbol"):
+                    row["symbol"] = _safe_str(k)
+                symbol_rows.append(row)
+            if maybe_symbol_map and symbol_rows:
+                return symbol_rows
+
+        for key in (
+            "row_objects",
+            "rowObjects",
+            "records",
+            "items",
+            "data",
+            "quotes",
+            "rows",
+            "results",
+        ):
             val = payload.get(key)
             if isinstance(val, list):
-                out2: List[Dict[str, Any]] = []
+                if not val:
+                    continue
+                if isinstance(val[0], dict):
+                    return [dict(r) for r in val if isinstance(r, dict)]
+                if isinstance(val[0], (list, tuple)):
+                    cols = payload.get("keys") or payload.get("headers") or payload.get("columns") or []
+                    if isinstance(cols, list) and cols:
+                        rows_from_matrix = _rows_from_matrix_payload(val, cols)
+                        if rows_from_matrix:
+                            return rows_from_matrix
+                out_list: List[Dict[str, Any]] = []
                 for item in val:
                     d = _extract_row_dict(item)
                     if d:
-                        out2.append(d)
-                if out2:
-                    return out2
+                        out_list.append(d)
+                if out_list:
+                    return out_list
+            if isinstance(val, dict):
+                nested = _coerce_rows_list(val)
+                if nested:
+                    return nested
+
+        rows_matrix = payload.get("rows_matrix") or payload.get("matrix")
+        if isinstance(rows_matrix, list):
+            cols = payload.get("keys") or payload.get("headers") or payload.get("columns") or []
+            if isinstance(cols, list) and cols:
+                rows_from_matrix = _rows_from_matrix_payload(rows_matrix, cols)
+                if rows_from_matrix:
+                    return rows_from_matrix
 
         d0 = _extract_row_dict(payload)
-        if d0 and any(k in d0 for k in ("symbol", "item", "section", "metric", "recommendation", "overall_score")):
+        if d0 and _looks_like_explicit_row_dict(d0):
             return [d0]
+
+        for key in ("result", "payload", "response", "output"):
+            nested = payload.get(key)
+            nested_rows = _coerce_rows_list(nested)
+            if nested_rows:
+                return nested_rows
 
     return []
 
@@ -334,9 +452,7 @@ def get_insights_schema() -> Tuple[List[str], List[str], str]:
     except Exception as e:
         logger.debug("get_insights_schema: schema_registry unavailable: %r", e)
 
-    keys = ["section", "item", "symbol", "metric", "value", "notes", "last_updated_riyadh"]
-    headers = ["Section", "Item", "Symbol", "Metric", "Value", "Notes", "Last Updated (Riyadh)"]
-    return headers, keys, "fallback"
+    return list(_FALLBACK_HEADERS), list(_FALLBACK_KEYS), "fallback"
 
 
 def _get_criteria_fields() -> List[Dict[str, Any]]:
@@ -630,18 +746,36 @@ async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "") 
     if not engine or not symbols:
         return {}
 
+    requested = _dedupe_keep_order(symbols)
+
+    def _rows_to_symbol_map(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        out: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            sym = _safe_str(row.get("symbol") or row.get("ticker") or row.get("code"))
+            if sym:
+                out[sym] = dict(row)
+        return out
+
     # batch dict API
     fn = getattr(engine, "get_enriched_quotes_batch", None)
     if callable(fn):
         try:
             try:
-                res = await _maybe_await(fn(symbols, mode=mode or ""))
-            except TypeError:
-                res = await _maybe_await(fn(symbols))
+                res = await _maybe_await(fn(requested, mode=mode or ""))
+            except TypeError as exc:
+                if not _is_signature_mismatch_typeerror(exc):
+                    raise
+                res = await _maybe_await(fn(requested))
             if isinstance(res, dict):
+                rows_from_payload = _maybe_rows_from_payload(res)
+                if rows_from_payload:
+                    row_map = _rows_to_symbol_map(rows_from_payload)
+                    return {s: row_map.get(s, {"symbol": s}) for s in requested}
                 out: Dict[str, Dict[str, Any]] = {}
-                for s in symbols:
-                    out[s] = _extract_row_dict(res.get(s))
+                for s in requested:
+                    out[s] = _extract_row_dict(res.get(s)) if isinstance(res.get(s), dict) else {"symbol": s}
                 return out
         except Exception:
             pass
@@ -650,10 +784,14 @@ async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "") 
     fn2 = getattr(engine, "get_enriched_quotes", None)
     if callable(fn2):
         try:
-            res = await _maybe_await(fn2(symbols))
+            res = await _maybe_await(fn2(requested))
+            rows_from_payload = _maybe_rows_from_payload(res)
+            if rows_from_payload:
+                row_map = _rows_to_symbol_map(rows_from_payload)
+                return {s: row_map.get(s, {"symbol": s}) for s in requested}
             if isinstance(res, list):
                 out2: Dict[str, Dict[str, Any]] = {}
-                for s, v in zip(symbols, res):
+                for s, v in zip(requested, res):
                     out2[s] = _extract_row_dict(v)
                 return out2
         except Exception:
@@ -663,7 +801,7 @@ async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "") 
     out3: Dict[str, Dict[str, Any]] = {}
     fn3 = getattr(engine, "get_enriched_quote_dict", None)
     fn4 = getattr(engine, "get_enriched_quote", None) or getattr(engine, "get_quote", None)
-    for s in symbols:
+    for s in requested:
         try:
             if callable(fn3):
                 out3[s] = _extract_row_dict(await _maybe_await(fn3(s)))
@@ -700,6 +838,9 @@ async def _fetch_top10_payload(
         )
         if isinstance(payload, dict):
             return payload
+        rows = _maybe_rows_from_payload(payload)
+        if rows:
+            return {"rows": rows}
     except Exception:
         pass
 
@@ -733,8 +874,11 @@ async def _fetch_top10_payload(
                 rows = _maybe_rows_from_payload(payload)
                 if rows:
                     return {"rows": rows}
-            except TypeError:
-                continue
+            except TypeError as exc:
+                if _is_signature_mismatch_typeerror(exc):
+                    continue
+                logger.debug("_fetch_top10_payload: runtime TypeError from %s: %r", name, exc)
+                break
             except Exception:
                 continue
 
@@ -755,8 +899,7 @@ async def _fetch_top10_symbols(
 
         syms = await _maybe_await(select_top10_symbols(engine=engine, criteria=criteria or {}, limit=limit))
         if isinstance(syms, (list, tuple)):
-            out = [_safe_str(x) for x in syms if _safe_str(x)]
-            return out[: max(1, limit)]
+            return _dedupe_keep_order(syms)[: max(1, limit)]
     except Exception:
         pass
 
@@ -776,11 +919,15 @@ async def _fetch_top10_symbols(
         try:
             try:
                 res = await _maybe_await(fn(criteria=criteria or {}, limit=limit))  # type: ignore[arg-type]
-            except TypeError:
+            except TypeError as exc1:
+                if not _is_signature_mismatch_typeerror(exc1):
+                    raise
                 try:
-                    res = await _maybe_await(fn(limit=limit))  # type: ignore
-                except TypeError:
-                    res = await _maybe_await(fn())  # type: ignore
+                    res = await _maybe_await(fn(limit=limit))  # type: ignore[misc]
+                except TypeError as exc2:
+                    if not _is_signature_mismatch_typeerror(exc2):
+                        raise
+                    res = await _maybe_await(fn())  # type: ignore[misc]
         except Exception:
             continue
 
@@ -794,27 +941,18 @@ async def _fetch_top10_symbols(
                 else:
                     d = _extract_row_dict(item)
                     out_syms.append(_safe_str(d.get("symbol") or d.get("ticker") or d.get("code")))
-            out = [_safe_str(x) for x in out_syms if _safe_str(x)]
-            seen = set()
-            uniq: List[str] = []
-            for s in out:
-                if s not in seen:
-                    seen.add(s)
-                    uniq.append(s)
-            return uniq[: max(1, limit)]
+            return _dedupe_keep_order(out_syms)[: max(1, limit)]
 
         if isinstance(res, dict):
             if isinstance(res.get("symbols"), (list, tuple)):
-                out = [_safe_str(x) for x in res["symbols"] if _safe_str(x)]
-                return out[: max(1, limit)]
+                return _dedupe_keep_order(res["symbols"])[: max(1, limit)]
 
             rows = _maybe_rows_from_payload(res)
             if rows:
                 out_syms2: List[str] = []
                 for r in rows:
                     out_syms2.append(_safe_str(r.get("symbol") or r.get("ticker") or r.get("code")))
-                out2 = [_safe_str(x) for x in out_syms2 if _safe_str(x)]
-                return out2[: max(1, limit)]
+                return _dedupe_keep_order(out_syms2)[: max(1, limit)]
 
     return []
 
@@ -1330,12 +1468,12 @@ async def build_insights_analysis_rows(
 
     if universes:
         for name, seq in (universes or {}).items():
-            sym_list = [_safe_str(s) for s in (seq or []) if _safe_str(s)]
+            sym_list = _dedupe_keep_order(seq or [])
             if sym_list:
                 eff_universes[_safe_str(name) or "Universe"] = sym_list
 
     if not eff_universes and symbols:
-        sym_list2 = [_safe_str(s) for s in (symbols or []) if _safe_str(s)]
+        sym_list2 = _dedupe_keep_order(symbols or [])
         if sym_list2:
             eff_universes["Selected Symbols"] = sym_list2
 
@@ -1417,6 +1555,8 @@ async def build_insights_analysis_rows(
             "headers": headers,
             "keys": keys,
             "rows": rows,
+            "row_objects": rows,
+            "rows_matrix": _rows_to_matrix(rows, keys),
             "meta": {
                 "schema_source": schema_source,
                 "generated_at_riyadh": ts,
@@ -1430,7 +1570,7 @@ async def build_insights_analysis_rows(
         }
 
     for section_name, sym_list in eff_universes.items():
-        syms = [_safe_str(s) for s in (sym_list or []) if _safe_str(s)]
+        syms = _dedupe_keep_order(sym_list or [])
         if not syms:
             continue
 
@@ -1477,7 +1617,7 @@ async def build_insights_analysis_rows(
                     if name:
                         note_parts.append(name)
                     if conf is not None:
-                        note_parts.append(f"conf={_fmt_num(conf)}")
+                        note_parts.append(f"conf={_fmt_pct(conf)}")
                     if reco:
                         note_parts.append(f"reco={reco}")
                     notes = " | ".join(note_parts) if note_parts else "Top10 item."
@@ -1514,6 +1654,8 @@ async def build_insights_analysis_rows(
         "headers": headers,
         "keys": keys,
         "rows": rows,
+        "row_objects": rows,
+        "rows_matrix": _rows_to_matrix(rows, keys),
         "meta": {
             "schema_source": schema_source,
             "generated_at_riyadh": ts,
