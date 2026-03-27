@@ -1,38 +1,28 @@
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 core/investment_advisor.py
 ================================================================================
-INVESTMENT ADVISOR ORCHESTRATOR — v4.1.0
+INVESTMENT ADVISOR ORCHESTRATOR — v4.2.0
 ================================================================================
 LIVE-BY-DEFAULT • ENGINE-FIRST • SNAPSHOT-TOLERANT • ROUTE-COMPATIBLE
 MODE-AWARE • SCHEMA-SAFE • JSON-SAFE • IMPORT-SAFE • WORKER-THREAD SAFE
 
 What this revision fixes
 ------------------------
-- ✅ FIX: restores this module to its intended role as an orchestration wrapper,
-         instead of duplicating or overlapping `core.investment_advisor_engine`.
-- ✅ FIX: defaults to LIVE mode when the caller does not specify a mode.
-- ✅ FIX: supports the expected advisor data modes:
-         - auto        -> live_quotes
-         - live        -> live_quotes
-         - live_quotes -> live_quotes
-         - live_sheet  -> live_sheet
-         - snapshot    -> snapshot
-- ✅ FIX: resolves the engine lazily from app.state or core modules, without any
-         import-time network work.
-- ✅ FIX: keeps route compatibility with many calling styles used across:
-         - routes/advisor.py
-         - routes/investment_advisor.py
-         - routes/enriched_quote.py
-- ✅ FIX: provides lightweight snapshot warming / caching so routes that expect
-         snapshot helpers do not fail even when the deployment runs mostly live.
-- ✅ FIX: adds safe recommendation backfill when upstream rows are sparse or do
-         not include recommendation fields yet.
-- ✅ FIX: keeps Top_10_Investments fields guaranteed on fallback rows:
-         - top10_rank
-         - selection_reason
-         - criteria_snapshot
+- ✅ FIX: keeps this module as an orchestration wrapper over the engine rather
+         than becoming a second independent engine.
+- ✅ FIX: supports aligned engine output shapes including:
+         - row_objects / rowObjects
+         - rows_matrix / matrix
+         - nested payload / result / response payloads
+- ✅ FIX: honors and normalizes offset locally, not only limit/top_n.
+- ✅ FIX: hardens tolerant engine calling so only signature-mismatch TypeErrors
+         trigger fallback retries; runtime exceptions now surface correctly.
+- ✅ FIX: prevents snapshot cross-talk by keying cache with request shape
+         (page + mode + symbols + limit + offset), not page alone.
+- ✅ FIX: preserves stable JSON-safe envelopes and fallback recommendation logic.
 
 Purpose
 -------
@@ -50,6 +40,7 @@ It should NOT become a second independent engine.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import inspect
 import json
@@ -66,9 +57,10 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping,
 logger = logging.getLogger("core.investment_advisor")
 logger.addHandler(logging.NullHandler())
 
-INVESTMENT_ADVISOR_VERSION = "4.1.0"
+INVESTMENT_ADVISOR_VERSION = "4.2.0"
 DEFAULT_PAGE = "Top_10_Investments"
 DEFAULT_LIMIT = 10
+DEFAULT_OFFSET = 0
 DEFAULT_SNAPSHOT_TTL_SEC = 900
 
 BASE_SOURCE_PAGES = {
@@ -329,6 +321,24 @@ def _normalize_key(key: str) -> str:
     return _s(key).strip().lower().replace(" ", "_").replace("-", "_")
 
 
+def _criteria_fingerprint(criteria: Mapping[str, Any]) -> str:
+    payload = {
+        "page": _normalize_page_name(criteria.get("page")) or DEFAULT_PAGE,
+        "mode": _normalize_mode(criteria.get("advisor_data_mode") or criteria.get("mode")),
+        "symbols": _normalize_list(criteria.get("symbols") or criteria.get("tickers")),
+        "limit": max(1, _safe_int(criteria.get("limit") or criteria.get("top_n"), DEFAULT_LIMIT)),
+        "offset": max(0, _safe_int(criteria.get("offset"), DEFAULT_OFFSET)),
+    }
+    encoded = _json_compact(payload)
+    return hashlib.sha1(encoded.encode("utf-8")).hexdigest()
+
+
+def _slice_rows(rows: List[Dict[str, Any]], offset: int, limit: int) -> List[Dict[str, Any]]:
+    start = max(0, _safe_int(offset, DEFAULT_OFFSET))
+    size = max(1, _safe_int(limit, DEFAULT_LIMIT))
+    return rows[start:start + size]
+
+
 # =============================================================================
 # Page / mode normalization
 # =============================================================================
@@ -464,7 +474,7 @@ def _headers_to_keys(headers: List[str]) -> List[str]:
     keys: List[str] = []
     seen = set()
     for idx, header in enumerate(headers):
-        k = _normalize_key(header) or f"col_{idx+1}"
+        k = _normalize_key(header) or f"col_{idx + 1}"
         base = k
         n = 2
         while k in seen:
@@ -567,8 +577,12 @@ def _normalize_payload(*, request: Any = None, body: Any = None, payload: Any = 
 
     limit = _safe_int(out.get("limit") or out.get("top_n") or DEFAULT_LIMIT, DEFAULT_LIMIT)
     limit = max(1, min(200, limit))
+    offset = _safe_int(out.get("offset") or DEFAULT_OFFSET, DEFAULT_OFFSET)
+    offset = max(0, offset)
+
     out["limit"] = limit
     out["top_n"] = limit
+    out["offset"] = offset
 
     out["include_matrix"] = _coerce_bool(out.get("include_matrix"), True)
     out["include_headers"] = _coerce_bool(out.get("include_headers"), True)
@@ -583,6 +597,20 @@ async def _maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
     return value
+
+
+def _signature_typeerror_is_retryable(exc: TypeError) -> bool:
+    msg = _s(exc).lower()
+    retry_markers = (
+        "unexpected keyword argument",
+        "got an unexpected keyword argument",
+        "takes ",
+        "positional argument",
+        "required positional argument",
+        "missing 1 required positional argument",
+        "too many positional arguments",
+    )
+    return any(marker in msg for marker in retry_markers)
 
 
 async def _call_tolerant(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -605,10 +633,11 @@ async def _call_tolerant(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> A
             return await _maybe_await(out)
         except TypeError as exc:
             last_error = exc
-            continue
-        except Exception as exc:
-            last_error = exc
-            continue
+            if _signature_typeerror_is_retryable(exc):
+                continue
+            raise
+        except Exception:
+            raise
     if last_error is not None:
         raise last_error
     return None
@@ -651,12 +680,16 @@ def _run_sync(awaitable: Any) -> Any:
 # =============================================================================
 # Snapshot cache helpers
 # =============================================================================
-def _snapshot_key(page: str, mode: str) -> str:
-    return f"{_normalize_page_name(page) or DEFAULT_PAGE}::{_normalize_mode(mode)}"
+def _snapshot_key(page: str, mode: str, criteria: Optional[Mapping[str, Any]] = None) -> str:
+    normalized_page = _normalize_page_name(page) or DEFAULT_PAGE
+    normalized_mode = _normalize_mode(mode)
+    if not isinstance(criteria, Mapping):
+        return f"{normalized_page}::{normalized_mode}"
+    return f"{normalized_page}::{normalized_mode}::{_criteria_fingerprint(criteria)}"
 
 
-def _snapshot_get(page: str, mode: str, ttl_sec: int = DEFAULT_SNAPSHOT_TTL_SEC) -> Optional[Dict[str, Any]]:
-    key = _snapshot_key(page, mode)
+def _snapshot_get(page: str, mode: str, criteria: Optional[Mapping[str, Any]] = None, ttl_sec: int = DEFAULT_SNAPSHOT_TTL_SEC) -> Optional[Dict[str, Any]]:
+    key = _snapshot_key(page, mode, criteria=criteria)
     now = time.time()
     with _SNAPSHOT_LOCK:
         entry = _SNAPSHOT_STORE.get(key)
@@ -672,10 +705,10 @@ def _snapshot_get(page: str, mode: str, ttl_sec: int = DEFAULT_SNAPSHOT_TTL_SEC)
         return None
 
 
-def _snapshot_put(page: str, mode: str, payload: Dict[str, Any]) -> None:
+def _snapshot_put(page: str, mode: str, criteria: Optional[Mapping[str, Any]], payload: Dict[str, Any]) -> None:
     if not isinstance(payload, Mapping):
         return
-    key = _snapshot_key(page, mode)
+    key = _snapshot_key(page, mode, criteria=criteria)
     with _SNAPSHOT_LOCK:
         _SNAPSHOT_STORE[key] = {
             "ts": time.time(),
@@ -782,13 +815,13 @@ def _pick_first_mapping(result: Mapping[str, Any], *keys: str) -> Optional[Mappi
 def _normalize_rows(result: Mapping[str, Any], keys: List[str]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
 
-    for key in ("rows", "items", "records", "data", "quotes", "recommendations"):
+    for key in ("row_objects", "rowObjects", "rows", "items", "records", "data", "quotes", "recommendations"):
         value = result.get(key)
         if isinstance(value, list) and value:
-            if value and isinstance(value[0], Mapping):
+            if isinstance(value[0], Mapping):
                 rows = [dict(v) for v in value if isinstance(v, Mapping)]
                 break
-            if value and isinstance(value[0], (list, tuple)):
+            if isinstance(value[0], (list, tuple)):
                 matrix_rows = []
                 for row in value:
                     if isinstance(row, (list, tuple)):
@@ -799,7 +832,17 @@ def _normalize_rows(result: Mapping[str, Any], keys: List[str]) -> List[Dict[str
     if rows:
         return rows
 
-    nested = _pick_first_mapping(result, "payload", "result")
+    for key in ("rows_matrix", "matrix"):
+        value = result.get(key)
+        if isinstance(value, list) and value and isinstance(value[0], (list, tuple)):
+            matrix_rows = []
+            for row in value:
+                if isinstance(row, (list, tuple)):
+                    matrix_rows.append({keys[idx]: row[idx] if idx < len(row) else None for idx in range(len(keys))})
+            if matrix_rows:
+                return matrix_rows
+
+    nested = _pick_first_mapping(result, "payload", "result", "response")
     if nested:
         return _normalize_rows(dict(nested), keys)
 
@@ -985,6 +1028,7 @@ def _build_special_fallback(page: str, criteria: Dict[str, Any]) -> Dict[str, An
             "display_headers": headers,
             "keys": keys,
             "rows": rows,
+            "row_objects": rows,
             "rows_matrix": _rows_to_matrix(rows, keys),
             "meta": {
                 "source": "core.investment_advisor",
@@ -1020,6 +1064,7 @@ def _build_special_fallback(page: str, criteria: Dict[str, Any]) -> Dict[str, An
             "display_headers": headers,
             "keys": keys,
             "rows": rows,
+            "row_objects": rows,
             "rows_matrix": _rows_to_matrix(rows, keys),
             "meta": {
                 "source": "core.investment_advisor",
@@ -1049,6 +1094,7 @@ def _build_special_fallback(page: str, criteria: Dict[str, Any]) -> Dict[str, An
         rows.append(row)
     rows = _backfill_rows(rows, page, criteria)
     rows = _ensure_rows_cover_keys(rows, keys)
+    rows = _slice_rows(rows, criteria.get("offset", DEFAULT_OFFSET), criteria.get("limit", DEFAULT_LIMIT))
     return {
         "status": "warn",
         "page": page,
@@ -1058,6 +1104,7 @@ def _build_special_fallback(page: str, criteria: Dict[str, Any]) -> Dict[str, An
         "display_headers": headers,
         "keys": keys,
         "rows": rows,
+        "row_objects": rows,
         "rows_matrix": _rows_to_matrix(rows, keys),
         "meta": {
             "source": "core.investment_advisor",
@@ -1091,6 +1138,11 @@ def _normalize_engine_result(result: Optional[Mapping[str, Any]], criteria: Dict
     rows = _backfill_rows(rows, page, criteria)
     rows = _ensure_rows_cover_keys(rows, keys)
 
+    total_rows_before_slice = len(rows)
+    offset = criteria.get("offset", DEFAULT_OFFSET)
+    limit = criteria.get("limit", DEFAULT_LIMIT)
+    rows = _slice_rows(rows, offset, limit)
+
     out: Dict[str, Any] = {
         "status": _s(result.get("status")) or ("success" if rows else "warn"),
         "page": page,
@@ -1101,6 +1153,7 @@ def _normalize_engine_result(result: Optional[Mapping[str, Any]], criteria: Dict
         "display_headers": display_headers,
         "keys": keys,
         "rows": rows,
+        "row_objects": rows,
         "rows_matrix": _rows_to_matrix(rows, keys),
         "data": rows,
         "items": rows,
@@ -1115,6 +1168,10 @@ def _normalize_engine_result(result: Optional[Mapping[str, Any]], criteria: Dict
             "advisor_data_mode_effective": criteria.get("advisor_data_mode"),
             "normalized_by": "core.investment_advisor",
             "timestamp_utc": _now_utc(),
+            "offset": max(0, _safe_int(offset, DEFAULT_OFFSET)),
+            "limit": max(1, _safe_int(limit, DEFAULT_LIMIT)),
+            "rows_before_local_slice": total_rows_before_slice,
+            "rows_after_local_slice": len(rows),
         },
     }
 
@@ -1149,10 +1206,18 @@ async def _run_investment_advisor_async(*args: Any, **kwargs: Any) -> Dict[str, 
     criteria = _normalize_payload(request=request, body=body, payload=payload, mode=mode, **passthrough_kwargs)
     page = criteria["page"]
     effective_mode = criteria["advisor_data_mode"]
-    ttl_sec = max(0, _safe_int(criteria.get("snapshot_ttl") or os.getenv("ADVISOR_SNAPSHOT_TTL_SEC") or DEFAULT_SNAPSHOT_TTL_SEC, DEFAULT_SNAPSHOT_TTL_SEC))
+    ttl_sec = max(
+        0,
+        _safe_int(
+            criteria.get("snapshot_ttl")
+            or os.getenv("ADVISOR_SNAPSHOT_TTL_SEC")
+            or DEFAULT_SNAPSHOT_TTL_SEC,
+            DEFAULT_SNAPSHOT_TTL_SEC,
+        ),
+    )
 
     if effective_mode == "snapshot":
-        cached = _snapshot_get(page, effective_mode, ttl_sec=ttl_sec)
+        cached = _snapshot_get(page, effective_mode, criteria=criteria, ttl_sec=ttl_sec)
         if cached:
             meta = dict(cached.get("meta") or {})
             meta.update({
@@ -1160,6 +1225,7 @@ async def _run_investment_advisor_async(*args: Any, **kwargs: Any) -> Dict[str, 
                 "advisor_data_mode_effective": effective_mode,
                 "source": meta.get("source") or "core.investment_advisor.snapshot",
                 "timestamp_utc": _now_utc(),
+                "snapshot_key": _snapshot_key(page, effective_mode, criteria=criteria),
             })
             cached["meta"] = meta
             cached["status"] = _s(cached.get("status")) or "success"
@@ -1169,9 +1235,9 @@ async def _run_investment_advisor_async(*args: Any, **kwargs: Any) -> Dict[str, 
     normalized = _normalize_engine_result(engine_result, criteria, resolver_meta)
 
     if normalized.get("rows"):
-        _snapshot_put(page, effective_mode, normalized)
+        _snapshot_put(page, effective_mode, criteria, normalized)
         if effective_mode != "snapshot":
-            _snapshot_put(page, "snapshot", normalized)
+            _snapshot_put(page, "snapshot", criteria, normalized)
 
     return normalized
 
@@ -1234,7 +1300,7 @@ class InvestmentAdvisor:
             local_payload.update({"page": normalized_page, "sheet": normalized_page, "sheet_name": normalized_page})
             result = self.run_investment_advisor(payload=local_payload, mode="live_quotes")
             if result.get("rows"):
-                _snapshot_put(normalized_page, "snapshot", result)
+                _snapshot_put(normalized_page, "snapshot", local_payload, result)
             results.append({
                 "page": normalized_page,
                 "rows": len(result.get("rows") or []),
