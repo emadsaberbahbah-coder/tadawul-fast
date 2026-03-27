@@ -3,25 +3,25 @@
 """
 core/analysis/top10_selector.py
 ================================================================================
-Top 10 Selector — v4.7.0
+Top 10 Selector — v4.8.0
 ================================================================================
 LIVE • SCHEMA-FIRST • ROUTE-COMPATIBLE • ENGINE-SELF-RESOLVING • JSON-SAFE
 TOP10-METADATA GUARANTEED • SOURCE-PAGE SAFE • SNAPSHOT FALLBACK SAFE
 SYNC+ASYNC CALLER TOLERANT • DISPLAY-HEADER TOLERANT • WRAPPER-PAYLOAD SAFE
 PARTIAL-DEGRADATION SAFE • DIRECT-SYMBOLS SAFE • TIMEOUT-GUARDED
 
-Why v4.7.0
+Why v4.8.0
 ----------
-- FIX: stops over-broad TypeError retries so real runtime failures are not masked
-  as harmless signature mismatches.
-- FIX: prevents row extraction from wandering into metadata-only dicts, which can
-  create false candidate rows or bad matrix alignment.
-- FIX: preserves and prioritizes explicit direct-symbol requests after page-level
-  hydration and dedupe, so user-requested symbols are not diluted by page scans.
-- FIX: keeps partial success page-by-page and symbol-by-symbol instead of failing
-  the whole builder when one source call is sparse or slow.
-- FIX: keeps emergency symbol fallback via env or criteria to avoid zero-row Top10
-  when source pages are available only partially.
+- FIX: recognizes singular wrapper payloads like `quote`, `record`, and `item`
+  in addition to plural envelopes, so valid single-row results are not dropped.
+- FIX: lets sparse live page rows merge with snapshot rows instead of choosing
+  one or the other, improving resilience when one source is only partially filled.
+- FIX: allows Top10 output-page fallback to supplement sparse candidate pools,
+  not only completely empty pools, reducing zero-row or under-filled results.
+- FIX: preserves direct-symbol intent during final selection when the ranked
+  result set is smaller than the requested limit.
+- FIX: retains the earlier protections around signature-safe retries, wrapper
+  payload safety, partial degradation, and emergency symbol fallback.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 logger = logging.getLogger("core.analysis.top10_selector")
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "4.7.0"
+TOP10_SELECTOR_VERSION = "4.8.0"
 OUTPUT_PAGE = "Top_10_Investments"
 
 DEFAULT_SOURCE_PAGES = [
@@ -204,7 +204,7 @@ CANONICAL_KEY_SET = set(DEFAULT_FALLBACK_KEYS)
 WRAPPER_KEYS = {
     "status", "page", "sheet", "sheet_name", "route_family", "headers", "display_headers", "sheet_headers",
     "column_headers", "keys", "columns", "fields", "rows", "rows_matrix", "matrix", "row_objects", "records",
-    "items", "quotes", "data", "result", "payload", "response", "output", "meta", "count", "version",
+    "items", "item", "quotes", "quote", "data", "record", "result", "payload", "response", "output", "meta", "count", "version",
     "snapshot", "envelope", "content", "schema", "sheet_spec", "spec",
 }
 
@@ -955,7 +955,7 @@ def _payload_keys_like(payload: Any, depth: int = 0) -> List[str]:
             out = [_header_to_key(h) for h in headers if _header_to_key(h)]
             if out:
                 return out
-    for name in ("spec", "sheet_spec", "schema", "payload", "result", "response", "output", "data"):
+    for name in ("spec", "sheet_spec", "schema", "payload", "result", "response", "output", "data", "quote", "record", "item"):
         nested = mapping.get(name)
         if nested is not None and nested is not payload:
             out = _payload_keys_like(nested, depth + 1)
@@ -1028,7 +1028,7 @@ def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
     if maybe_symbol_map and symbol_like_keys > 0 and rows_from_symbol_map:
         return rows_from_symbol_map
 
-    for key in ("row_objects", "rows", "records", "items", "results", "recommendations", "quotes", "data"):
+    for key in ("row_objects", "rows", "records", "record", "items", "item", "results", "recommendations", "quotes", "quote", "data"):
         value = mapping.get(key)
         if isinstance(value, list):
             rows = _extract_rows_like(value, depth + 1)
@@ -1565,6 +1565,28 @@ def _page_priority_symbol_limit(criteria: Mapping[str, Any]) -> int:
     return max(min(limit * 3, HYDRATION_SYMBOL_CAP), min(HYDRATION_SYMBOL_CAP, 12))
 
 
+def _merge_symbol_row_lists(primary: Sequence[Mapping[str, Any]], secondary: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {}
+
+    def _put(raw: Mapping[str, Any]) -> None:
+        row = _normalize_candidate_row(raw)
+        sym = _normalize_symbol(row.get("symbol") or row.get("ticker"))
+        if not sym:
+            return
+        existing = merged.get(sym)
+        if existing is None:
+            merged[sym] = dict(row)
+            return
+        richer, poorer = (row, existing) if _row_richness(row) >= _row_richness(existing) else (existing, row)
+        merged[sym] = _merge_row_prefer_richer(poorer, richer)
+
+    for row in primary:
+        _put(row)
+    for row in secondary:
+        _put(row)
+    return list(merged.values())
+
+
 def _merge_row_prefer_richer(base: Mapping[str, Any], update: Mapping[str, Any]) -> Dict[str, Any]:
     merged = dict(base)
     for key, value in dict(update).items():
@@ -1579,6 +1601,7 @@ async def _collect_page_rows_with_fallback(engine: Any, page: str, mode: str) ->
         "rows": 0,
         "snapshot_rows": 0,
         "used_snapshot": False,
+        "merged_snapshot": False,
         "timed_out": False,
         "error": "",
     }
@@ -1593,22 +1616,29 @@ async def _collect_page_rows_with_fallback(engine: Any, page: str, mode: str) ->
         rows = []
         meta["error"] = f"page_rows_failed:{type(exc).__name__}"
 
-    if rows:
+    should_try_snapshot_merge = bool(rows) and (len(rows) < 5 or max((_row_richness(r) for r in rows), default=0) < 10)
+    if rows and not should_try_snapshot_merge:
         return rows, meta
 
     try:
         snap_rows = await asyncio.wait_for(_fetch_page_snapshot_rows(engine, page), timeout=min(PAGE_TOTAL_TIMEOUT_SEC, 8.0))
         meta["snapshot_rows"] = len(snap_rows)
         meta["used_snapshot"] = bool(snap_rows)
-        return snap_rows, meta
+        if rows and snap_rows:
+            merged_rows = _merge_symbol_row_lists(rows, snap_rows)
+            meta["merged_snapshot"] = True
+            return merged_rows, meta
+        if snap_rows:
+            return snap_rows, meta
+        return rows, meta
     except asyncio.TimeoutError:
         if not meta["error"]:
             meta["error"] = "snapshot_timeout"
-        return [], meta
+        return rows if rows else [], meta
     except Exception as exc:
         if not meta["error"]:
             meta["error"] = f"snapshot_failed:{type(exc).__name__}"
-        return [], meta
+        return rows if rows else [], meta
 
 
 async def _hydrate_page_rows(engine: Any, rows: List[Dict[str, Any]], mode: str, criteria: Mapping[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
@@ -1764,10 +1794,11 @@ async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode
         except Exception as exc:
             meta["emergency_symbol_error"] = f"emergency_symbol_failed:{type(exc).__name__}"
 
-    if not candidates:
+    fallback_target = max(1, _safe_int(criteria.get("limit"), 10))
+    if len(candidates) < fallback_target:
         try:
             fallback_rows = await asyncio.wait_for(
-                _fetch_page_rows(engine, OUTPUT_PAGE, max(30, _safe_int(criteria.get("limit"), 10) * 2), mode),
+                _fetch_page_rows(engine, OUTPUT_PAGE, max(30, fallback_target * 2), mode),
                 timeout=min(PAGE_TOTAL_TIMEOUT_SEC, 10.0),
             )
             meta["top10_output_fallback_rows"] = len(fallback_rows)
@@ -1789,6 +1820,8 @@ async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode
                 fallback_rows = []
                 meta["top10_output_snapshot_error"] = f"top10_output_snapshot_failed:{type(exc).__name__}"
 
+        if fallback_rows:
+            meta["top10_output_fallback_used"] = True
         for row in fallback_rows:
             _put_row(row, OUTPUT_PAGE)
 
@@ -1929,7 +1962,21 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         )
 
         top_rows = [row for _, row in scored[:limit]]
-        projected_rows = _rank_and_project_rows(top_rows, keys, criteria)
+
+        if len(top_rows) < limit:
+            seen_symbols = {_normalize_symbol(r.get("symbol") or r.get("ticker")) for r in top_rows if _normalize_symbol(r.get("symbol") or r.get("ticker"))}
+            direct_rows = [row for _, row in scored if _direct_symbol_order_index(row, criteria) is not None]
+            direct_rows.sort(key=lambda row: _direct_symbol_order_index(row, criteria) if _direct_symbol_order_index(row, criteria) is not None else 999999)
+            for row in direct_rows:
+                sym = _normalize_symbol(row.get("symbol") or row.get("ticker"))
+                if not sym or sym in seen_symbols:
+                    continue
+                top_rows.append(row)
+                seen_symbols.add(sym)
+                if len(top_rows) >= limit:
+                    break
+
+        projected_rows = _rank_and_project_rows(top_rows[:limit], keys, criteria)
 
         status = "success" if projected_rows else "warn"
         meta = {
