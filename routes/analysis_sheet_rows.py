@@ -2,27 +2,21 @@
 # routes/analysis_sheet_rows.py
 """
 ================================================================================
-Analysis Sheet-Rows Router — v3.4.0
+Analysis Sheet-Rows Router — v3.5.0
 ================================================================================
 CANONICAL • REGISTRY-FIRST • FIXED-WIDTH CONTRACTS • FAIL-SAFE • V2-ENGINE FIRST
 SPECIAL-PAGE SAFE • GET+POST SAFE • OBJECT + MATRIX RESPONSE SAFE • JSON-SAFE
-TOP10 / INSIGHTS / DICTIONARY HARDENED • NO WEAK 5-COL FALLBACKS • ROOT-FALLBACK BRIDGED
+TOP10 / INSIGHTS / DICTIONARY HARDENED • NO WEAK 5-COL FALLBACKS • ROOT-FALLBACK
+BRIDGED • WRAPPER-AWARE • CONTRACT-PRESERVING
 
 What this revision improves
 --------------------------
-- FIX: contract resolution is now registry-first and exact-width always.
-       Weak payloads can no longer redefine the response shape.
-- FIX: static fallbacks now preserve canonical widths:
-       standard pages=80, Top_10_Investments=83, Insights_Analysis=7,
-       Data_Dictionary=9.
-- FIX: schema extraction prefers schema_registry helpers directly
-       (get_sheet_headers/get_sheet_keys/get_sheet_len) before looser introspection.
-- FIX: empty-success payloads are downgraded to stable partial schema-shaped responses
-       instead of drifting into inconsistent contracts.
-- FIX: builder/engine failures degrade gracefully without backend 5xx from this router.
-- FIX: Top 10 always guarantees top10_rank / selection_reason / criteria_snapshot.
-- FIX: Top 10 now falls back to engine/root sheet-rows payloads and symbol-driven scoring when the builder returns zero rows.
-- FIX: canonical key extraction now searches nested payloads and common provider aliases for price / range / score fields.
+- FIX: stronger page wrapper unwrapping for engine/builder payloads.
+- FIX: broader sheet-row fallback signatures (request/settings/schema/body/page aliases).
+- FIX: preserves strong payloads nested under result/response/output/page wrappers.
+- FIX: accepts page_name / worksheet aliases and keeps canonical schema widths.
+- FIX: avoids silent degradation when a usable payload exists but is wrapped.
+- FIX: keeps exact-width canonical fallbacks for instrument / Top10 / Insights / Dictionary.
 ================================================================================
 """
 
@@ -102,7 +96,7 @@ except Exception:  # pragma: no cover
         return None
 
 
-ANALYSIS_SHEET_ROWS_VERSION = "3.4.0"
+ANALYSIS_SHEET_ROWS_VERSION = "3.5.0"
 router = APIRouter(prefix="/v1/analysis", tags=["Analysis Sheet Rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -230,215 +224,49 @@ _ENRICHED_FUNCTION_CANDIDATES = (
 )
 
 # -----------------------------------------------------------------------------
-# Canonical static contracts (exact widths; used only when registry is weak)
+# Canonical static contracts
 # -----------------------------------------------------------------------------
 _CANONICAL_80_HEADERS: List[str] = [
-    "Symbol",
-    "Name",
-    "Asset Class",
-    "Exchange",
-    "Currency",
-    "Country",
-    "Sector",
-    "Industry",
-    "Current Price",
-    "Previous Close",
-    "Open",
-    "Day High",
-    "Day Low",
-    "52W High",
-    "52W Low",
-    "Price Change",
-    "Percent Change",
-    "52W Position %",
-    "Volume",
-    "Avg Volume 10D",
-    "Avg Volume 30D",
-    "Market Cap",
-    "Float Shares",
-    "Beta (5Y)",
-    "P/E (TTM)",
-    "P/E (Forward)",
-    "EPS (TTM)",
-    "Dividend Yield",
-    "Payout Ratio",
-    "Revenue (TTM)",
-    "Revenue Growth YoY",
-    "Gross Margin",
-    "Operating Margin",
-    "Profit Margin",
-    "Debt/Equity",
-    "Free Cash Flow (TTM)",
-    "RSI (14)",
-    "Volatility 30D",
-    "Volatility 90D",
-    "Max Drawdown 1Y",
-    "VaR 95% (1D)",
-    "Sharpe (1Y)",
-    "Risk Score",
-    "Risk Bucket",
-    "P/B",
-    "P/S",
-    "EV/EBITDA",
-    "PEG",
-    "Intrinsic Value",
-    "Valuation Score",
-    "Forecast Price 1M",
-    "Forecast Price 3M",
-    "Forecast Price 12M",
-    "Expected ROI 1M",
-    "Expected ROI 3M",
-    "Expected ROI 12M",
-    "Forecast Confidence",
-    "Confidence Score",
-    "Confidence Bucket",
-    "Value Score",
-    "Quality Score",
-    "Momentum Score",
-    "Growth Score",
-    "Overall Score",
-    "Opportunity Score",
-    "Rank (Overall)",
-    "Recommendation",
-    "Recommendation Reason",
-    "Horizon Days",
-    "Invest Period Label",
-    "Position Qty",
-    "Avg Cost",
-    "Position Cost",
-    "Position Value",
-    "Unrealized P/L",
-    "Unrealized P/L %",
-    "Data Provider",
-    "Last Updated (UTC)",
-    "Last Updated (Riyadh)",
-    "Warnings",
+    "Symbol", "Name", "Asset Class", "Exchange", "Currency", "Country", "Sector", "Industry",
+    "Current Price", "Previous Close", "Open", "Day High", "Day Low", "52W High", "52W Low",
+    "Price Change", "Percent Change", "52W Position %", "Volume", "Avg Volume 10D", "Avg Volume 30D",
+    "Market Cap", "Float Shares", "Beta (5Y)", "P/E (TTM)", "P/E (Forward)", "EPS (TTM)",
+    "Dividend Yield", "Payout Ratio", "Revenue (TTM)", "Revenue Growth YoY", "Gross Margin",
+    "Operating Margin", "Profit Margin", "Debt/Equity", "Free Cash Flow (TTM)", "RSI (14)",
+    "Volatility 30D", "Volatility 90D", "Max Drawdown 1Y", "VaR 95% (1D)", "Sharpe (1Y)",
+    "Risk Score", "Risk Bucket", "P/B", "P/S", "EV/EBITDA", "PEG", "Intrinsic Value",
+    "Valuation Score", "Forecast Price 1M", "Forecast Price 3M", "Forecast Price 12M",
+    "Expected ROI 1M", "Expected ROI 3M", "Expected ROI 12M", "Forecast Confidence",
+    "Confidence Score", "Confidence Bucket", "Value Score", "Quality Score", "Momentum Score",
+    "Growth Score", "Overall Score", "Opportunity Score", "Rank (Overall)", "Recommendation",
+    "Recommendation Reason", "Horizon Days", "Invest Period Label", "Position Qty", "Avg Cost",
+    "Position Cost", "Position Value", "Unrealized P/L", "Unrealized P/L %", "Data Provider",
+    "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
 ]
 
 _CANONICAL_80_KEYS: List[str] = [
-    "symbol",
-    "name",
-    "asset_class",
-    "exchange",
-    "currency",
-    "country",
-    "sector",
-    "industry",
-    "current_price",
-    "previous_close",
-    "open_price",
-    "day_high",
-    "day_low",
-    "week_52_high",
-    "week_52_low",
-    "price_change",
-    "percent_change",
-    "week_52_position_pct",
-    "volume",
-    "avg_volume_10d",
-    "avg_volume_30d",
-    "market_cap",
-    "float_shares",
-    "beta_5y",
-    "pe_ttm",
-    "pe_forward",
-    "eps_ttm",
-    "dividend_yield",
-    "payout_ratio",
-    "revenue_ttm",
-    "revenue_growth_yoy",
-    "gross_margin",
-    "operating_margin",
-    "profit_margin",
-    "debt_to_equity",
-    "free_cash_flow_ttm",
-    "rsi_14",
-    "volatility_30d",
-    "volatility_90d",
-    "max_drawdown_1y",
-    "var_95_1d",
-    "sharpe_1y",
-    "risk_score",
-    "risk_bucket",
-    "pb_ratio",
-    "ps_ratio",
-    "ev_ebitda",
-    "peg_ratio",
-    "intrinsic_value",
-    "valuation_score",
-    "forecast_price_1m",
-    "forecast_price_3m",
-    "forecast_price_12m",
-    "expected_roi_1m",
-    "expected_roi_3m",
-    "expected_roi_12m",
-    "forecast_confidence",
-    "confidence_score",
-    "confidence_bucket",
-    "value_score",
-    "quality_score",
-    "momentum_score",
-    "growth_score",
-    "overall_score",
-    "opportunity_score",
-    "rank_overall",
-    "recommendation",
-    "recommendation_reason",
-    "horizon_days",
-    "invest_period_label",
-    "position_qty",
-    "avg_cost",
-    "position_cost",
-    "position_value",
-    "unrealized_pl",
-    "unrealized_pl_pct",
-    "data_provider",
-    "last_updated_utc",
-    "last_updated_riyadh",
-    "warnings",
+    "symbol", "name", "asset_class", "exchange", "currency", "country", "sector", "industry",
+    "current_price", "previous_close", "open_price", "day_high", "day_low", "week_52_high",
+    "week_52_low", "price_change", "percent_change", "week_52_position_pct", "volume",
+    "avg_volume_10d", "avg_volume_30d", "market_cap", "float_shares", "beta_5y", "pe_ttm",
+    "pe_forward", "eps_ttm", "dividend_yield", "payout_ratio", "revenue_ttm", "revenue_growth_yoy",
+    "gross_margin", "operating_margin", "profit_margin", "debt_to_equity", "free_cash_flow_ttm",
+    "rsi_14", "volatility_30d", "volatility_90d", "max_drawdown_1y", "var_95_1d", "sharpe_1y",
+    "risk_score", "risk_bucket", "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio",
+    "intrinsic_value", "valuation_score", "forecast_price_1m", "forecast_price_3m",
+    "forecast_price_12m", "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
+    "forecast_confidence", "confidence_score", "confidence_bucket", "value_score", "quality_score",
+    "momentum_score", "growth_score", "overall_score", "opportunity_score", "rank_overall",
+    "recommendation", "recommendation_reason", "horizon_days", "invest_period_label", "position_qty",
+    "avg_cost", "position_cost", "position_value", "unrealized_pl", "unrealized_pl_pct",
+    "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
 ]
 
-_INSIGHTS_HEADERS: List[str] = [
-    "Section",
-    "Item",
-    "Symbol",
-    "Metric",
-    "Value",
-    "Notes",
-    "Last Updated (Riyadh)",
-]
-_INSIGHTS_KEYS: List[str] = [
-    "section",
-    "item",
-    "symbol",
-    "metric",
-    "value",
-    "notes",
-    "last_updated_riyadh",
-]
+_INSIGHTS_HEADERS = ["Section", "Item", "Symbol", "Metric", "Value", "Notes", "Last Updated (Riyadh)"]
+_INSIGHTS_KEYS = ["section", "item", "symbol", "metric", "value", "notes", "last_updated_riyadh"]
 
-_DICTIONARY_HEADERS: List[str] = [
-    "Sheet",
-    "Group",
-    "Header",
-    "Key",
-    "DType",
-    "Format",
-    "Required",
-    "Source",
-    "Notes",
-]
-_DICTIONARY_KEYS: List[str] = [
-    "sheet",
-    "group",
-    "header",
-    "key",
-    "dtype",
-    "fmt",
-    "required",
-    "source",
-    "notes",
-]
+_DICTIONARY_HEADERS = ["Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes"]
+_DICTIONARY_KEYS = ["sheet", "group", "header", "key", "dtype", "fmt", "required", "source", "notes"]
 
 
 # =============================================================================
@@ -625,7 +453,7 @@ def _get_list(body: Mapping[str, Any], *keys: str) -> List[str]:
 
 
 def _pick_page_from_body(body: Mapping[str, Any]) -> str:
-    for k in ("sheet", "page", "sheet_name", "sheetName", "name", "tab"):
+    for k in ("sheet", "page", "sheet_name", "sheetName", "page_name", "pageName", "worksheet", "name", "tab"):
         s = _strip(body.get(k))
         if s:
             return s
@@ -635,7 +463,7 @@ def _pick_page_from_body(body: Mapping[str, Any]) -> str:
 def _collect_get_body(request: Request) -> Dict[str, Any]:
     qp = request.query_params
     body: Dict[str, Any] = {}
-    for key in ("sheet", "page", "sheet_name", "sheetName", "name", "tab"):
+    for key in ("sheet", "page", "sheet_name", "sheetName", "page_name", "pageName", "worksheet", "name", "tab"):
         v = _strip(qp.get(key))
         if v:
             body[key] = v
@@ -861,7 +689,8 @@ def _ensure_top10_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple
 
 def _static_contract(page: str) -> Tuple[List[str], List[str], str]:
     if page == _TOP10_PAGE:
-        return _ensure_top10_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS)[0], _ensure_top10_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS)[1], "static_canonical_top10"
+        h, k = _ensure_top10_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS)
+        return h, k, "static_canonical_top10"
     if page == _INSIGHTS_PAGE:
         h, k = _pad_contract(_INSIGHTS_HEADERS, _INSIGHTS_KEYS, 7)
         return h, k, "static_canonical_insights"
@@ -954,7 +783,8 @@ def _schema_from_registry(page: str) -> Tuple[List[str], List[str], Any, str]:
                         spec = get_sheet_spec(page)  # type: ignore[misc]
                     except Exception:
                         spec = None
-                return _complete_schema_contract(headers, keys)[0], _complete_schema_contract(headers, keys)[1], spec, "schema_registry.helpers"
+                h, k = _complete_schema_contract(headers, keys)
+                return h, k, spec, "schema_registry.helpers"
         except Exception:
             pass
     if get_sheet_spec is None:
@@ -1021,30 +851,15 @@ def _extract_from_raw(raw: Dict[str, Any], candidates: Sequence[str]) -> Any:
 
 
 def _extract_from_nested_raw(raw: Any, candidates: Sequence[str], depth: int = 0) -> Any:
-    if raw is None or depth > 2:
+    if raw is None or depth > 3:
         return None
     if isinstance(raw, Mapping):
         direct = _extract_from_raw(dict(raw), candidates)
         if direct is not None:
             return direct
         preferred_nested_keys = (
-            "quote",
-            "analysis",
-            "fundamentals",
-            "forecast",
-            "scores",
-            "metrics",
-            "summary",
-            "snapshot",
-            "payload",
-            "data",
-            "item",
-            "record",
-            "row",
-            "meta",
-            "stats",
-            "price",
-            "market_data",
+            "quote", "analysis", "fundamentals", "forecast", "scores", "metrics", "summary", "snapshot",
+            "payload", "data", "item", "record", "row", "meta", "stats", "price", "market_data",
         )
         for nk in preferred_nested_keys:
             nv = raw.get(nk)
@@ -1104,18 +919,9 @@ def _to_number(value: Any) -> float:
 
 
 def _row_has_any_signal(row: Mapping[str, Any]) -> bool:
-    if not isinstance(row, Mapping):
-        return False
     signal_keys = (
-        "symbol",
-        "name",
-        "current_price",
-        "overall_score",
-        "opportunity_score",
-        "expected_roi_3m",
-        "expected_roi_1m",
-        "recommendation",
-        "selection_reason",
+        "symbol", "name", "current_price", "overall_score", "opportunity_score",
+        "expected_roi_3m", "expected_roi_1m", "recommendation", "selection_reason",
     )
     for key in signal_keys:
         value = row.get(key)
@@ -1154,10 +960,7 @@ def _top10_selection_reason(row: Mapping[str, Any]) -> str:
         value = row.get(key)
         if value in (None, "", [], {}, ()):
             continue
-        if isinstance(value, float):
-            parts.append(f"{label} {round(value, 2)}")
-        else:
-            parts.append(f"{label} {value}")
+        parts.append(f"{label} {round(value, 2) if isinstance(value, float) else value}")
         if len(parts) >= 3:
             break
     return " | ".join(parts) if parts else "Top10 fallback selection based on strongest available composite signals."
@@ -1166,16 +969,8 @@ def _top10_selection_reason(row: Mapping[str, Any]) -> str:
 def _top10_criteria_snapshot(row: Mapping[str, Any]) -> str:
     snapshot = {}
     for key in (
-        "overall_score",
-        "opportunity_score",
-        "expected_roi_1m",
-        "expected_roi_3m",
-        "expected_roi_12m",
-        "forecast_confidence",
-        "confidence_score",
-        "risk_bucket",
-        "recommendation",
-        "symbol",
+        "overall_score", "opportunity_score", "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
+        "forecast_confidence", "confidence_score", "risk_bucket", "recommendation", "symbol",
     ):
         value = row.get(key)
         if value not in (None, "", [], {}, ()):
@@ -1210,17 +1005,10 @@ def _ensure_top10_rows(rows: Sequence[Mapping[str, Any]], *, requested_symbols: 
             key=lambda r: (
                 0 if _strip(r.get("symbol")) in requested else 1,
                 requested.get(_strip(r.get("symbol")), 10**6),
-                -_top10_sort_key(r)[0],
-                -_top10_sort_key(r)[1],
-                -_top10_sort_key(r)[2],
-                -_top10_sort_key(r)[3],
-                -_top10_sort_key(r)[4],
-                -_top10_sort_key(r)[5],
-                -_top10_sort_key(r)[6],
-                -_top10_sort_key(r)[7],
-                -_top10_sort_key(r)[8],
-                -_top10_sort_key(r)[9],
-                -_top10_sort_key(r)[10],
+                -_top10_sort_key(r)[0], -_top10_sort_key(r)[1], -_top10_sort_key(r)[2],
+                -_top10_sort_key(r)[3], -_top10_sort_key(r)[4], -_top10_sort_key(r)[5],
+                -_top10_sort_key(r)[6], -_top10_sort_key(r)[7], -_top10_sort_key(r)[8],
+                -_top10_sort_key(r)[9], -_top10_sort_key(r)[10],
             )
         )
 
@@ -1232,7 +1020,6 @@ def _ensure_top10_rows(rows: Sequence[Mapping[str, Any]], *, requested_symbols: 
         if not _strip(row.get("criteria_snapshot")):
             row["criteria_snapshot"] = _top10_criteria_snapshot(row)
     return final_rows
-
 
 
 def _looks_like_symbol_token(x: Any) -> bool:
@@ -1257,6 +1044,84 @@ def _looks_like_explicit_row_dict(d: Any) -> bool:
     return False
 
 
+def _is_meta_wrapper_key(key: Any) -> bool:
+    s = _strip(key).lower()
+    return s in {
+        "status", "ok", "success", "error", "detail", "message", "meta", "request_id", "requestid",
+        "version", "count", "total", "returned", "page", "sheet", "sheet_name", "sheetname",
+        "page_name", "pagename", "route_family", "schema_source", "engine_source", "duration_ms",
+        "duration", "elapsed_ms", "elapsed",
+    }
+
+
+def _page_aliases(page: str) -> List[str]:
+    raw = _strip(page)
+    if not raw:
+        return []
+    variants = {
+        raw,
+        raw.lower(),
+        raw.upper(),
+        raw.replace(" ", "_"),
+        raw.replace("_", " "),
+        raw.replace("-", "_"),
+        raw.replace("_", "-"),
+        raw.replace(" ", ""),
+        raw.replace("_", "").lower(),
+        raw.replace("-", "").lower(),
+    }
+    return [v for v in variants if v]
+
+
+def _extract_contract_from_payload(payload: Any, depth: int = 0) -> Tuple[List[str], List[str]]:
+    if payload is None or depth > 8:
+        return [], []
+    if isinstance(payload, Mapping):
+        headers: List[str] = []
+        keys: List[str] = []
+        for h_name in ("headers", "display_headers", "sheet_headers", "column_headers"):
+            hv = payload.get(h_name)
+            if isinstance(hv, list):
+                headers = [_strip(x) for x in hv if _strip(x)]
+                if headers:
+                    break
+        for k_name in ("keys", "columns", "fields"):
+            kv = payload.get(k_name)
+            if isinstance(kv, list):
+                keys = [_strip(x) for x in kv if _strip(x)]
+                if keys:
+                    break
+        if headers or keys:
+            return _complete_schema_contract(headers, keys)
+        for nested_name in ("schema", "spec", "payload", "result", "response", "output", "data"):
+            nested = payload.get(nested_name)
+            if isinstance(nested, Mapping):
+                hh, kk = _extract_contract_from_payload(nested, depth + 1)
+                if hh or kk:
+                    return hh, kk
+        for v in payload.values():
+            if isinstance(v, Mapping):
+                hh, kk = _extract_contract_from_payload(v, depth + 1)
+                if hh or kk:
+                    return hh, kk
+    return [], []
+
+
+def _rows_from_index_map(payload: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    if not payload or not all(str(k).isdigit() for k in payload.keys()):
+        return []
+    out: List[Dict[str, Any]] = []
+    for k in sorted(payload.keys(), key=lambda x: int(str(x))):
+        v = payload[k]
+        if isinstance(v, Mapping):
+            out.append(dict(v))
+        else:
+            s = _strip(v)
+            if s:
+                out.append({"symbol": s})
+    return out
+
+
 def _rows_from_matrix(rows_matrix: Any, cols: Sequence[str]) -> List[Dict[str, Any]]:
     if not isinstance(rows_matrix, list) or not cols:
         return []
@@ -1272,7 +1137,7 @@ def _rows_from_matrix(rows_matrix: Any, cols: Sequence[str]) -> List[Dict[str, A
     return out
 
 
-def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
+def _extract_rows_like(payload: Any, depth: int = 0, page: str = "") -> List[Dict[str, Any]]:
     if payload is None or depth > 8:
         return []
     if isinstance(payload, list):
@@ -1293,9 +1158,16 @@ def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
         return [d] if _looks_like_explicit_row_dict(d) else []
     if _looks_like_explicit_row_dict(payload):
         return [dict(payload)]
+
+    index_rows = _rows_from_index_map(payload)
+    if index_rows:
+        return index_rows
+
     maybe_symbol_map = True
     rows_from_symbol_map: List[Dict[str, Any]] = []
     for k, v in payload.items():
+        if _is_meta_wrapper_key(k):
+            continue
         if not isinstance(v, Mapping) or not _looks_like_symbol_token(k):
             maybe_symbol_map = False
             break
@@ -1305,21 +1177,41 @@ def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
         rows_from_symbol_map.append(row)
     if maybe_symbol_map and rows_from_symbol_map:
         return rows_from_symbol_map
-    for name in ("row_objects", "rowObjects", "rows", "data", "items", "records", "quotes", "recommendations", "results"):
+
+    if page:
+        for alias in _page_aliases(page):
+            nested = payload.get(alias)
+            if isinstance(nested, (Mapping, list)):
+                rows = _extract_rows_like(nested, depth + 1, page=page)
+                if rows:
+                    return rows
+
+    for name in (
+        "row_objects", "rowObjects", "rows", "data", "items", "records", "quotes", "recommendations",
+        "results", "sheet_rows", "sheetRows", "page_rows", "pageRows", "sheet_payload", "sheetPayload",
+        "sheet_result", "sheetResult", "dataset", "value", "content", "body", "payload", "result",
+        "response", "output",
+    ):
         value = payload.get(name)
-        if isinstance(value, list):
-            rows = _extract_rows_like(value, depth + 1)
+        if isinstance(value, (list, Mapping)):
+            rows = _extract_rows_like(value, depth + 1, page=page)
             if rows:
                 return rows
-        if isinstance(value, Mapping):
-            rows = _extract_rows_like(value, depth + 1)
-            if rows:
-                return rows
+
+    non_meta_children = [(k, v) for k, v in payload.items() if not _is_meta_wrapper_key(k) and isinstance(v, (Mapping, list))]
+    if len(non_meta_children) == 1:
+        rows = _extract_rows_like(non_meta_children[0][1], depth + 1, page=page)
+        if rows:
+            return rows
+    for _, child in non_meta_children:
+        rows = _extract_rows_like(child, depth + 1, page=page)
+        if rows:
+            return rows
     return []
 
 
-def _extract_matrix_like(payload: Any, depth: int = 0) -> Optional[List[List[Any]]]:
-    if depth > 8:
+def _extract_matrix_like(payload: Any, depth: int = 0, page: str = "") -> Optional[List[List[Any]]]:
+    if payload is None or depth > 8:
         return None
     if isinstance(payload, dict):
         for name in ("rows_matrix", "matrix", "values"):
@@ -1329,12 +1221,26 @@ def _extract_matrix_like(payload: Any, depth: int = 0) -> Optional[List[List[Any
         rows_value = payload.get("rows")
         if isinstance(rows_value, list) and rows_value and isinstance(rows_value[0], (list, tuple)):
             return [list(r) if isinstance(r, (list, tuple)) else [r] for r in rows_value]
-        for name in ("data", "payload", "result", "response", "output"):
+        if page:
+            for alias in _page_aliases(page):
+                nested = payload.get(alias)
+                if isinstance(nested, Mapping):
+                    mx = _extract_matrix_like(nested, depth + 1, page=page)
+                    if mx is not None:
+                        return mx
+        for name in ("data", "payload", "result", "response", "output", "content", "body", "value", "dataset", "sheet_rows", "page_rows"):
             nested = payload.get(name)
             if isinstance(nested, dict):
-                mx = _extract_matrix_like(nested, depth + 1)
+                mx = _extract_matrix_like(nested, depth + 1, page=page)
                 if mx is not None:
                     return mx
+            if isinstance(nested, list) and nested and isinstance(nested[0], (list, tuple)):
+                return [list(r) if isinstance(r, (list, tuple)) else [r] for r in nested]
+        non_meta_children = [v for k, v in payload.items() if not _is_meta_wrapper_key(k) and isinstance(v, Mapping)]
+        if len(non_meta_children) == 1:
+            mx = _extract_matrix_like(non_meta_children[0], depth + 1, page=page)
+            if mx is not None:
+                return mx
     return None
 
 
@@ -1347,8 +1253,8 @@ def _extract_status_error(payload: Any) -> Tuple[str, Optional[str], Dict[str, A
     return status_out, (str(error_out) if error_out is not None else None), meta_out
 
 
-def _payload_has_real_rows(payload: Any) -> bool:
-    return bool(_extract_rows_like(payload) or _extract_matrix_like(payload))
+def _payload_has_real_rows(payload: Any, page: str = "") -> bool:
+    return bool(_extract_rows_like(payload, page=page) or _extract_matrix_like(payload, page=page))
 
 
 def _payload_quality_score(payload: Any, page: str = "") -> int:
@@ -1359,12 +1265,17 @@ def _payload_quality_score(payload: Any, page: str = "") -> int:
     if not isinstance(payload, dict):
         return 0
     score = 0
-    rows_like = _extract_rows_like(payload)
-    matrix_like = _extract_matrix_like(payload)
+    rows_like = _extract_rows_like(payload, page=page)
+    matrix_like = _extract_matrix_like(payload, page=page)
+    payload_headers, payload_keys = _extract_contract_from_payload(payload)
     if rows_like:
         score += 100 + min(25, len(rows_like))
     if matrix_like:
         score += 85 + min(15, len(matrix_like))
+    if payload_headers:
+        score += 8
+    if payload_keys:
+        score += 8
     if page == _TOP10_PAGE and rows_like:
         for field in _TOP10_REQUIRED_FIELDS:
             if any(isinstance(r, Mapping) and r.get(field) not in (None, "", [], {}) for r in rows_like):
@@ -1376,7 +1287,7 @@ def _payload_quality_score(payload: Any, page: str = "") -> int:
         score += 2
     elif _strip(status_out).lower() == "error":
         score -= 3
-    if isinstance(meta_in, dict) and meta_in.get("known_sheets"):
+    if isinstance(meta_in, dict) and (meta_in.get("known_sheets") or meta_in.get("count") or meta_in.get("returned")):
         score += 1
     if _strip(error_out):
         score -= 6
@@ -1401,9 +1312,8 @@ def _build_fetch_window(limit: int, offset: int, *, minimum: int = 0, ceiling: i
 
 def _empty_schema_row(keys: Sequence[str], *, symbol: str = "") -> Dict[str, Any]:
     row = {k: None for k in keys}
-    if symbol:
-        if "symbol" in row and not row.get("symbol"):
-            row["symbol"] = symbol
+    if symbol and "symbol" in row and not row.get("symbol"):
+        row["symbol"] = symbol
     return row
 
 
@@ -1504,7 +1414,7 @@ def _dict_is_symbol_map(d: Dict[str, Any], symbols: Sequence[str]) -> bool:
     if not keys:
         return False
     hit = sum(1 for k in keys if k in symset)
-    return hit == len(symset) if len(symset) > 0 else False
+    return hit == len(symset) if symset else False
 
 
 async def _fetch_analysis_rows(engine: Any, symbols: List[str], *, mode: str, settings: Any, schema: Any) -> Dict[str, Any]:
@@ -1514,27 +1424,33 @@ async def _fetch_analysis_rows(engine: Any, symbols: List[str], *, mode: str, se
     forecasting_enabled = bool(getattr(settings, "forecasting_enabled", True)) if settings is not None else True
     scoring_enabled = bool(getattr(settings, "scoring_enabled", True)) if settings is not None else True
     want_analysis = computations_enabled and (forecasting_enabled or scoring_enabled)
+
     preferred: List[str] = []
     if want_analysis:
         preferred += ["get_analysis_rows_batch", "get_analysis_quotes_batch", "get_enriched_quotes_batch"]
     else:
         preferred += ["get_enriched_quotes_batch"]
     preferred += ["get_quotes_batch", "quotes_batch", "get_enriched_quotes", "get_quotes"]
+
     for method in preferred:
         fn = getattr(engine, method, None)
         if not callable(fn):
             continue
         try:
-            try:
-                res = await _call_engine(fn, symbols, mode=mode, schema=schema)
-            except TypeError:
+            for kwargs in (
+                {"mode": mode, "schema": schema},
+                {"schema": schema},
+                {"mode": mode},
+                {},
+            ):
                 try:
-                    res = await _call_engine(fn, symbols, schema=schema)
+                    res = await _call_engine(fn, symbols, **kwargs)
+                    break
                 except TypeError:
-                    try:
-                        res = await _call_engine(fn, symbols, mode=mode)
-                    except TypeError:
-                        res = await _call_engine(fn, symbols)
+                    res = None
+                    continue
+            else:
+                res = None
             if isinstance(res, dict):
                 if _dict_is_symbol_map(res, symbols):
                     return res
@@ -1547,33 +1463,30 @@ async def _fetch_analysis_rows(engine: Any, symbols: List[str], *, mode: str, se
                 return {s: r for s, r in zip(symbols, res)}
         except Exception:
             continue
+
     out: Dict[str, Any] = {}
     per_dict_fn = getattr(engine, "get_enriched_quote_dict", None) or getattr(engine, "get_analysis_row_dict", None) or getattr(engine, "get_quote_dict", None)
     per_fn = getattr(engine, "get_enriched_quote", None) or getattr(engine, "get_analysis_row", None) or getattr(engine, "get_quote", None)
     for s in symbols:
         try:
             if callable(per_dict_fn):
-                try:
-                    out[s] = await _call_engine(per_dict_fn, s, mode=mode, schema=schema)
-                except TypeError:
+                for kwargs in ({"mode": mode, "schema": schema}, {"schema": schema}, {"mode": mode}, {}):
                     try:
-                        out[s] = await _call_engine(per_dict_fn, s, schema=schema)
+                        out[s] = await _call_engine(per_dict_fn, s, **kwargs)
+                        break
                     except TypeError:
-                        try:
-                            out[s] = await _call_engine(per_dict_fn, s, mode=mode)
-                        except TypeError:
-                            out[s] = await _call_engine(per_dict_fn, s)
+                        continue
+                else:
+                    out[s] = {"symbol": s, "error": "per_symbol_dict_call_failed"}
             elif callable(per_fn):
-                try:
-                    out[s] = await _call_engine(per_fn, s, mode=mode, schema=schema)
-                except TypeError:
+                for kwargs in ({"mode": mode, "schema": schema}, {"schema": schema}, {"mode": mode}, {}):
                     try:
-                        out[s] = await _call_engine(per_fn, s, schema=schema)
+                        out[s] = await _call_engine(per_fn, s, **kwargs)
+                        break
                     except TypeError:
-                        try:
-                            out[s] = await _call_engine(per_fn, s, mode=mode)
-                        except TypeError:
-                            out[s] = await _call_engine(per_fn, s)
+                        continue
+                else:
+                    out[s] = {"symbol": s, "error": "per_symbol_call_failed"}
             else:
                 out[s] = {"symbol": s, "error": "engine_missing_quote_method"}
         except Exception as e:
@@ -1588,7 +1501,6 @@ def _import_first_available(mod_names: Sequence[str]):
             return importlib.import_module(mn)
         except Exception as e:
             last_err = e
-            continue
     raise RuntimeError(str(last_err) if last_err else "import failed")
 
 
@@ -1611,6 +1523,7 @@ async def _call_builder_best_effort(*, module_names: Sequence[str], function_nam
         mod = _import_first_available(module_names)
     except Exception as e:
         return [], "partial", f"{friendly_name} builder import failed: {e}", {"builder_import_failed": True}, None
+
     fn = None
     chosen_name = ""
     for name in function_names:
@@ -1624,9 +1537,8 @@ async def _call_builder_best_effort(*, module_names: Sequence[str], function_nam
 
     requested_top_n = max(1, _maybe_int(body.get("top_n"), limit))
     requested_symbols = _get_list(body, "symbols", "tickers", "tickers_list")
-
     call_specs: List[Tuple[Tuple[Any, ...], Dict[str, Any]]] = [
-        ((), {"request": request, "settings": settings, "engine": engine, "data_engine": engine, "quote_engine": engine, "cache_engine": engine, "mode": mode, "body": body, "payload": body, "page": page, "sheet": page, "sheet_name": page, "limit": limit, "top_n": requested_top_n, "offset": offset, "schema": schema, "schema_keys": list(schema_keys), "schema_headers": list(schema_headers), "symbols": requested_symbols, "tickers": requested_symbols, "route_family": _route_family_flexible(page)}),
+        ((), {"request": request, "settings": settings, "engine": engine, "data_engine": engine, "quote_engine": engine, "cache_engine": engine, "mode": mode, "body": body, "payload": body, "page": page, "sheet": page, "sheet_name": page, "page_name": page, "worksheet": page, "limit": limit, "top_n": requested_top_n, "offset": offset, "schema": schema, "schema_keys": list(schema_keys), "schema_headers": list(schema_headers), "symbols": requested_symbols, "tickers": requested_symbols, "route_family": _route_family_flexible(page)}),
         ((), {"request": request, "settings": settings, "engine": engine, "mode": mode, "body": body, "page": page, "limit": limit, "top_n": requested_top_n, "offset": offset, "schema": schema, "symbols": requested_symbols, "tickers": requested_symbols}),
         ((body,), {}),
         ((engine, body), {}),
@@ -1637,8 +1549,9 @@ async def _call_builder_best_effort(*, module_names: Sequence[str], function_nam
         out = await _call_function_flexible(fn, call_specs)
     except Exception as e:
         return [], "partial", f"{friendly_name} builder call failed: {e}", {"builder_call_failed": True}, None
-    rows = _extract_rows_like(out)
-    matrix = _extract_matrix_like(out)
+
+    rows = _extract_rows_like(out, page=page)
+    matrix = _extract_matrix_like(out, page=page)
     if not rows and matrix:
         rows = _rows_from_matrix(matrix, schema_keys)
     status_out, error_out, meta_out = _extract_status_error(out)
@@ -1649,8 +1562,7 @@ async def _call_builder_best_effort(*, module_names: Sequence[str], function_nam
     return normalized, status_out, error_out, meta_out, out
 
 
-
-async def _build_top10_from_requested_symbols(*, engine: Any, settings: Any, symbols: Sequence[str], page: str, mode: str, schema_keys: Sequence[str], schema_headers: Sequence[str], schema: Any, top_n: int) -> List[Dict[str, Any]]:
+async def _build_top10_from_requested_symbols(*, engine: Any, settings: Any, symbols: Sequence[str], mode: str, schema_keys: Sequence[str], schema_headers: Sequence[str], schema: Any, top_n: int) -> List[Dict[str, Any]]:
     if engine is None or not symbols:
         return []
     requested_symbols = [_strip(s) for s in symbols if _strip(s)]
@@ -1665,13 +1577,7 @@ async def _build_top10_from_requested_symbols(*, engine: Any, settings: Any, sym
         if not raw.get("symbol"):
             raw["symbol"] = sym
         raw_rows.append(raw)
-    return _ensure_top10_rows(
-        raw_rows,
-        requested_symbols=requested_symbols,
-        top_n=top_n,
-        schema_keys=schema_keys,
-        schema_headers=schema_headers,
-    )
+    return _ensure_top10_rows(raw_rows, requested_symbols=requested_symbols, top_n=top_n, schema_keys=schema_keys, schema_headers=schema_headers)
 
 
 def _build_data_dictionary_rows_to_schema(*, schema_keys: Sequence[str], schema_headers: Sequence[str]) -> Tuple[List[Dict[str, Any]], Optional[str], Any]:
@@ -1680,12 +1586,10 @@ def _build_data_dictionary_rows_to_schema(*, schema_keys: Sequence[str], schema_
     except Exception as e:
         return [], f"Data_Dictionary generator import failed: {e}", None
     try:
-        raw_rows = build_data_dictionary_rows(include_meta_sheet=True)
-    except TypeError:
         try:
+            raw_rows = build_data_dictionary_rows(include_meta_sheet=True)
+        except TypeError:
             raw_rows = build_data_dictionary_rows()
-        except Exception as e:
-            return [], f"Data_Dictionary generator failed: {e}", None
     except Exception as e:
         return [], f"Data_Dictionary generator failed: {e}", None
     out: List[Dict[str, Any]] = []
@@ -1694,34 +1598,46 @@ def _build_data_dictionary_rows_to_schema(*, schema_keys: Sequence[str], schema_
     return out, None, raw_rows
 
 
-async def _call_sheet_rows_payload_best_effort(*, engine: Any, page: str, limit: int, offset: int, mode: str, body: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+async def _call_sheet_rows_payload_best_effort(*, request: Request, settings: Any, engine: Any, page: str, limit: int, offset: int, mode: str, body: Dict[str, Any], schema: Any) -> Optional[Dict[str, Any]]:
     candidates: List[Any] = []
     if engine is not None:
-        for name in ("get_sheet_rows", "sheet_rows", "build_sheet_rows", "execute_sheet_rows", "run_sheet_rows", "get_page_rows", "get_rows", "get_rows_for_sheet", "get_rows_for_page", "get_sheet", "get_cached_sheet_rows", "get_sheet_snapshot", "get_cached_sheet_snapshot"):
+        for name in (
+            "get_sheet_rows", "sheet_rows", "build_sheet_rows", "execute_sheet_rows", "run_sheet_rows", "get_page_rows",
+            "get_rows", "get_rows_for_sheet", "get_rows_for_page", "get_sheet", "get_cached_sheet_rows",
+            "get_sheet_snapshot", "get_cached_sheet_snapshot",
+        ):
             fn = getattr(engine, name, None)
             if callable(fn):
                 candidates.append(fn)
-    for modpath in ("core.data_engine_v2", "core.data_engine"):
+
+    for modpath in ("core.data_engine_v2", "core.data_engine", "routes.advanced_analysis", "routes.investment_advisor", "routes.enriched_quote"):
         try:
             mod = importlib.import_module(modpath)
-            for name in ("get_sheet_rows", "sheet_rows", "build_sheet_rows", "get_page_rows"):
+            for name in ("get_sheet_rows", "sheet_rows", "build_sheet_rows", "get_page_rows", "run_sheet_rows", "sheet_rows_impl", "advanced_sheet_rows"):
                 fn = getattr(mod, name, None)
                 if callable(fn):
                     candidates.append(fn)
         except Exception:
             continue
+
+    page_aliases = {"page": page, "sheet": page, "sheet_name": page, "page_name": page, "worksheet": page, "name": page, "tab": page}
+    body_with_aliases = dict(body or {})
+    for k, v in page_aliases.items():
+        body_with_aliases.setdefault(k, v)
+
     best_payload: Optional[Dict[str, Any]] = None
     best_score = -9999
     for fn in candidates:
         call_specs = [
-            ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode, "body": body}),
-            ((), {"page": page, "limit": limit, "offset": offset, "mode": mode, "body": body}),
-            ((), {"sheet_name": page, "limit": limit, "offset": offset, "mode": mode, "body": body}),
-            ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode}),
-            ((), {"page": page, "limit": limit, "offset": offset, "mode": mode}),
-            ((), {"sheet": page, "limit": limit, "offset": offset}),
-            ((), {"page": page, "limit": limit, "offset": offset}),
-            ((page,), {"limit": limit, "offset": offset, "mode": mode, "body": body}),
+            ((), {**page_aliases, "limit": limit, "offset": offset, "mode": mode, "body": body_with_aliases, "payload": body_with_aliases, "request": request, "settings": settings, "schema": schema}),
+            ((), {**page_aliases, "limit": limit, "offset": offset, "mode": mode, "body": body_with_aliases, "request": request, "schema": schema}),
+            ((), {**page_aliases, "limit": limit, "offset": offset, "mode": mode, "body": body_with_aliases}),
+            ((), {**page_aliases, "limit": limit, "offset": offset, "mode": mode}),
+            ((), {**page_aliases, "limit": limit, "offset": offset}),
+            ((request,), {**page_aliases, "limit": limit, "offset": offset, "mode": mode, "body": body_with_aliases, "settings": settings, "schema": schema}),
+            ((body_with_aliases,), {}),
+            ((page,), {"limit": limit, "offset": offset, "mode": mode, "body": body_with_aliases, "request": request, "settings": settings, "schema": schema}),
+            ((page,), {"limit": limit, "offset": offset, "mode": mode, "body": body_with_aliases}),
             ((page,), {"limit": limit, "offset": offset, "mode": mode}),
             ((page,), {"limit": limit, "offset": offset}),
             ((page,), {}),
@@ -1733,7 +1649,7 @@ async def _call_sheet_rows_payload_best_effort(*, engine: Any, page: str, limit:
             if score > best_score:
                 best_score = score
                 best_payload = payload
-            if _payload_has_real_rows(payload):
+            if _payload_has_real_rows(payload, page=page):
                 return payload
         except Exception:
             continue
@@ -1742,7 +1658,7 @@ async def _call_sheet_rows_payload_best_effort(*, engine: Any, page: str, limit:
 
 async def _call_enriched_page_best_effort(*, request: Request, settings: Any, engine: Any, page: str, limit: int, offset: int, mode: str, body: Dict[str, Any], schema_keys: Sequence[str], schema_headers: Sequence[str], schema: Any) -> Tuple[List[Dict[str, Any]], str, Optional[str], Dict[str, Any], Any]:
     builder_body = dict(body or {})
-    builder_body.update({"page": page, "sheet": page, "sheet_name": page, "limit": limit, "offset": offset})
+    builder_body.update({"page": page, "sheet": page, "sheet_name": page, "page_name": page, "worksheet": page, "limit": limit, "offset": offset})
     return await _call_builder_best_effort(
         module_names=_ENRICHED_MODULE_CANDIDATES,
         function_names=_ENRICHED_FUNCTION_CANDIDATES,
@@ -1800,6 +1716,7 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
         settings = get_settings_cached()
     except Exception:
         settings = None
+
     auth_token = _extract_auth_token(token_query=token, x_app_token=x_app_token, authorization=authorization, settings=settings, request=request)
     if not _auth_passed(request=request, settings=settings, auth_token=auth_token, authorization=authorization):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
@@ -1814,8 +1731,7 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
     top_n = max(1, min(5000, _maybe_int(merged_body.get("top_n"), limit)))
     symbols = _get_list(merged_body, "symbols", "tickers", "tickers_list")
     if symbols:
-        symbol_fetch_cap = max(top_n, limit + offset)
-        symbols = symbols[:symbol_fetch_cap]
+        symbols = symbols[: max(top_n, limit + offset)]
 
     headers, keys, spec, schema_source = _resolve_contract(page)
     engine, engine_source = await _get_engine(request)
@@ -1895,38 +1811,18 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
             schema=spec,
         )
 
-        rows = _ensure_top10_rows(
-            rows,
-            requested_symbols=requested_symbols,
-            top_n=requested_top_n,
-            schema_keys=keys,
-            schema_headers=headers,
-        )
-
+        rows = _ensure_top10_rows(rows, requested_symbols=requested_symbols, top_n=requested_top_n, schema_keys=keys, schema_headers=headers)
         dispatch = "top10_builder"
         raw_quality = _payload_quality_score(raw_builder_payload, page=page)
 
         if not rows:
-            engine_payload = await _call_sheet_rows_payload_best_effort(
-                engine=engine,
-                page=page,
-                limit=fetch_limit,
-                offset=fetch_offset,
-                mode=(mode or ""),
-                body=merged_body,
-            )
-            if _payload_has_real_rows(engine_payload):
-                payload_rows = _extract_rows_like(engine_payload)
-                payload_matrix = _extract_matrix_like(engine_payload)
+            engine_payload = await _call_sheet_rows_payload_best_effort(request=request, settings=settings, engine=engine, page=page, limit=fetch_limit, offset=fetch_offset, mode=(mode or ""), body=merged_body, schema=spec)
+            if _payload_has_real_rows(engine_payload, page=page):
+                payload_rows = _extract_rows_like(engine_payload, page=page)
+                payload_matrix = _extract_matrix_like(engine_payload, page=page)
                 if not payload_rows and payload_matrix:
                     payload_rows = _rows_from_matrix(payload_matrix, keys)
-                rows = _ensure_top10_rows(
-                    payload_rows,
-                    requested_symbols=requested_symbols,
-                    top_n=requested_top_n,
-                    schema_keys=keys,
-                    schema_headers=headers,
-                )
+                rows = _ensure_top10_rows(payload_rows, requested_symbols=requested_symbols, top_n=requested_top_n, schema_keys=keys, schema_headers=headers)
                 if rows:
                     dispatch = "top10_engine_sheet_rows_fallback"
                     status_from_engine, error_from_engine, payload_meta = _extract_status_error(engine_payload if isinstance(engine_payload, dict) else {})
@@ -1936,17 +1832,7 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
                     meta_out["engine_payload_quality"] = _payload_quality_score(engine_payload, page=page)
 
         if not rows and requested_symbols:
-            symbol_rows = await _build_top10_from_requested_symbols(
-                engine=engine,
-                settings=settings,
-                symbols=requested_symbols,
-                page=page,
-                mode=(mode or ""),
-                schema_keys=keys,
-                schema_headers=headers,
-                schema=spec,
-                top_n=requested_top_n,
-            )
+            symbol_rows = await _build_top10_from_requested_symbols(engine=engine, settings=settings, symbols=requested_symbols, mode=(mode or ""), schema_keys=keys, schema_headers=headers, schema=spec, top_n=requested_top_n)
             if symbol_rows:
                 rows = symbol_rows
                 dispatch = "top10_symbol_rank_fallback"
@@ -1999,6 +1885,7 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
                 error_out="Data engine unavailable",
                 meta_extra={"requested": len(symbols), "returned": len(fallback_rows), "errors": len(symbols), "dispatch": "instrument_mode_no_engine", "builder": "schema_only", "schema_source": schema_source, "engine_source": engine_source},
             )
+
         data_map = await _fetch_analysis_rows(engine, symbols, mode=(mode or ""), settings=settings, schema=spec)
         normalized_rows: List[Dict[str, Any]] = []
         errors = 0
@@ -2015,14 +1902,13 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
                 errors += 1
             elif isinstance(raw, dict) and raw.get("error"):
                 errors += 1
+            row = raw
             if callable(normalize_fn):
                 try:
-                    row = normalize_fn(page, raw, keep_extras=True)
-                    row = row if isinstance(row, dict) else raw
+                    maybe_row = normalize_fn(page, raw, keep_extras=True)
+                    row = maybe_row if isinstance(maybe_row, dict) else raw
                 except Exception:
                     row = raw
-            else:
-                row = raw
             normalized = _normalize_to_schema_keys(schema_keys=keys, schema_headers=headers, raw=row)
             if "symbol" in keys and not normalized.get("symbol"):
                 normalized["symbol"] = sym
@@ -2045,15 +1931,23 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
         )
 
     fetch_limit, fetch_offset = _build_fetch_window(limit, offset)
-    engine_payload = await _call_sheet_rows_payload_best_effort(engine=engine, page=page, limit=fetch_limit, offset=fetch_offset, mode=(mode or ""), body=merged_body)
+    engine_payload = await _call_sheet_rows_payload_best_effort(request=request, settings=settings, engine=engine, page=page, limit=fetch_limit, offset=fetch_offset, mode=(mode or ""), body=merged_body, schema=spec)
+
     rows: List[Dict[str, Any]] = []
     status_out = "partial"
     error_out: Optional[str] = None
-    meta_out: Dict[str, Any] = {"dispatch": "engine_sheet_rows", "builder": "engine_or_enriched_fallback", "schema_source": schema_source, "engine_source": engine_source, "fetch_limit": fetch_limit, "fetch_offset": fetch_offset}
+    meta_out: Dict[str, Any] = {
+        "dispatch": "engine_sheet_rows",
+        "builder": "engine_or_enriched_fallback",
+        "schema_source": schema_source,
+        "engine_source": engine_source,
+        "fetch_limit": fetch_limit,
+        "fetch_offset": fetch_offset,
+    }
 
-    if _payload_has_real_rows(engine_payload):
-        payload_rows = _extract_rows_like(engine_payload)
-        payload_matrix = _extract_matrix_like(engine_payload)
+    if _payload_has_real_rows(engine_payload, page=page):
+        payload_rows = _extract_rows_like(engine_payload, page=page)
+        payload_matrix = _extract_matrix_like(engine_payload, page=page)
         if not payload_rows and payload_matrix:
             payload_rows = _rows_from_matrix(payload_matrix, keys)
         rows = [_normalize_to_schema_keys(schema_keys=keys, schema_headers=headers, raw=(r or {})) for r in payload_rows]
@@ -2085,6 +1979,12 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
                 _, engine_error, engine_meta = _extract_status_error(engine_payload)
                 error_out = engine_error
                 meta_out.update(engine_meta or {})
+                payload_headers, payload_keys = _extract_contract_from_payload(engine_payload)
+                if payload_headers:
+                    meta_out["payload_headers_detected"] = len(payload_headers)
+                if payload_keys:
+                    meta_out["payload_keys_detected"] = len(payload_keys)
+                meta_out["engine_payload_quality"] = _payload_quality_score(engine_payload, page=page)
             if not error_out:
                 error_out = "No usable rows returned; schema-shaped fallback emitted"
             rows = []
@@ -2129,6 +2029,8 @@ async def analysis_sheet_rows_get(
     page: str = Query(default="", description="sheet/page name"),
     sheet: str = Query(default="", description="sheet/page name"),
     sheet_name: str = Query(default="", description="sheet/page name"),
+    page_name: str = Query(default="", description="sheet/page name"),
+    worksheet: str = Query(default="", description="sheet/page name"),
     name: str = Query(default="", description="sheet/page name"),
     tab: str = Query(default="", description="sheet/page name"),
     symbols: str = Query(default="", description="comma-separated symbols"),
@@ -2144,7 +2046,20 @@ async def analysis_sheet_rows_get(
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
     body: Dict[str, Any] = {}
-    for k, v in {"page": page, "sheet": sheet, "sheet_name": sheet_name, "name": name, "tab": tab, "symbols": symbols, "tickers": tickers, "limit": limit, "offset": offset, "top_n": top_n}.items():
+    for k, v in {
+        "page": page,
+        "sheet": sheet,
+        "sheet_name": sheet_name,
+        "page_name": page_name,
+        "worksheet": worksheet,
+        "name": name,
+        "tab": tab,
+        "symbols": symbols,
+        "tickers": tickers,
+        "limit": limit,
+        "offset": offset,
+        "top_n": top_n,
+    }.items():
         if v not in (None, ""):
             body[k] = v
     return await _analysis_sheet_rows_impl(request=request, body=body, mode=mode, include_matrix_q=include_matrix_q, token=token, x_app_token=x_app_token, authorization=authorization, x_request_id=x_request_id)
