@@ -3,23 +3,24 @@
 """
 core/analysis/top10_selector.py
 ================================================================================
-Top 10 Selector — v4.6.0
+Top 10 Selector — v4.7.0
 ================================================================================
 LIVE • SCHEMA-FIRST • ROUTE-COMPATIBLE • ENGINE-SELF-RESOLVING • JSON-SAFE
 TOP10-METADATA GUARANTEED • SOURCE-PAGE SAFE • SNAPSHOT FALLBACK SAFE
 SYNC+ASYNC CALLER TOLERANT • DISPLAY-HEADER TOLERANT • WRAPPER-PAYLOAD SAFE
 PARTIAL-DEGRADATION SAFE • DIRECT-SYMBOLS SAFE • TIMEOUT-GUARDED
 
-Why v4.6.0
+Why v4.7.0
 ----------
-- FIX: normalizes both canonical keys and display-header keys (for example
-  "Current Price", "Overall Score", "Expected ROI 3M") into canonical fields.
-- FIX: extracts rows from more envelope shapes: payload/result/response/output/
-  data/rows/row_objects/records/items/quotes/matrix/snapshot.
-- FIX: improves engine method tolerance with broader method/signature attempts.
+- FIX: stops over-broad TypeError retries so real runtime failures are not masked
+  as harmless signature mismatches.
+- FIX: prevents row extraction from wandering into metadata-only dicts, which can
+  create false candidate rows or bad matrix alignment.
+- FIX: preserves and prioritizes explicit direct-symbol requests after page-level
+  hydration and dedupe, so user-requested symbols are not diluted by page scans.
 - FIX: keeps partial success page-by-page and symbol-by-symbol instead of failing
   the whole builder when one source call is sparse or slow.
-- FIX: adds emergency symbol fallback via env or criteria to avoid zero-row Top10
+- FIX: keeps emergency symbol fallback via env or criteria to avoid zero-row Top10
   when source pages are available only partially.
 """
 
@@ -41,7 +42,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 logger = logging.getLogger("core.analysis.top10_selector")
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "4.6.0"
+TOP10_SELECTOR_VERSION = "4.7.0"
 OUTPUT_PAGE = "Top_10_Investments"
 
 DEFAULT_SOURCE_PAGES = [
@@ -333,6 +334,25 @@ def _coerce_bool(v: Any, default: bool = False) -> bool:
         except Exception:
             return default
     return default
+
+
+def _is_signature_mismatch_typeerror(exc: TypeError) -> bool:
+    msg = _s(exc).lower()
+    if not msg:
+        return False
+    signature_markers = (
+        "unexpected keyword argument",
+        "positional argument",
+        "required positional argument",
+        "takes ",
+        "got an unexpected keyword",
+        "multiple values for argument",
+        "missing 1 required positional argument",
+        "missing required positional argument",
+        "too many positional arguments",
+        "not enough positional arguments",
+    )
+    return any(marker in msg for marker in signature_markers)
 
 
 def _json_safe(value: Any) -> Any:
@@ -935,7 +955,7 @@ def _payload_keys_like(payload: Any, depth: int = 0) -> List[str]:
             out = [_header_to_key(h) for h in headers if _header_to_key(h)]
             if out:
                 return out
-    for name in ("spec", "sheet_spec", "schema", "payload", "result", "response", "output", "data", "meta"):
+    for name in ("spec", "sheet_spec", "schema", "payload", "result", "response", "output", "data"):
         nested = mapping.get(name)
         if nested is not None and nested is not payload:
             out = _payload_keys_like(nested, depth + 1)
@@ -982,7 +1002,9 @@ def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
     if _looks_like_row_dict(mapping):
         return [mapping]
 
-    # Symbol-keyed dict of row payloads.
+    # Symbol-keyed dict of row payloads. Only accept when values themselves look
+    # like rows or can unwrap into a single row. Avoid treating diagnostics/meta
+    # dicts as candidate rows.
     rows_from_symbol_map: List[Dict[str, Any]] = []
     maybe_symbol_map = True
     symbol_like_keys = 0
@@ -994,7 +1016,11 @@ def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
             maybe_symbol_map = False
             break
         symbol_like_keys += 1
-        row = _coerce_mapping(v)
+        nested_rows = _extract_rows_like(v, depth + 1)
+        row = nested_rows[0] if len(nested_rows) == 1 else _coerce_mapping(v)
+        if not row or not _looks_like_row_dict(row):
+            maybe_symbol_map = False
+            break
         if _is_blank(row.get("symbol")) and _is_blank(row.get("ticker")):
             row["symbol"] = _normalize_symbol(k)
             row["ticker"] = _normalize_symbol(k)
@@ -1026,7 +1052,7 @@ def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
             if rows:
                 return rows
 
-    for key in ("payload", "result", "response", "output", "snapshot", "content", "envelope", "spec", "schema", "sheet_spec", "meta"):
+    for key in ("payload", "result", "response", "output", "snapshot", "content", "envelope", "spec", "schema", "sheet_spec"):
         value = mapping.get(key)
         if value is not None and value is not payload:
             rows = _extract_rows_like(value, depth + 1)
@@ -1059,7 +1085,10 @@ async def _call_engine_method(
                 continue
             except TypeError as exc:
                 last_exc = exc
-                continue
+                if _is_signature_mismatch_typeerror(exc):
+                    continue
+                logger.debug("Engine method raised non-signature TypeError: %s", method_name, exc_info=True)
+                raise
             except Exception as exc:
                 last_exc = exc
                 continue
@@ -1277,6 +1306,7 @@ def _collect_criteria_from_inputs(*args: Any, **kwargs: Any) -> Dict[str, Any]:
     normalized = dict(criteria)
     normalized["pages_selected"] = pages
     normalized["direct_symbols"] = direct_symbols
+    normalized["direct_symbol_order"] = list(direct_symbols)
     normalized["emergency_symbols"] = emergency_symbols
     normalized["limit"] = limit
     normalized["top_n"] = limit
@@ -1412,6 +1442,19 @@ def _passes_filters(row: Mapping[str, Any], criteria: Mapping[str, Any]) -> bool
     return True
 
 
+def _direct_symbol_order_index(row: Mapping[str, Any], criteria: Mapping[str, Any]) -> Optional[int]:
+    direct_symbols = [_normalize_symbol(s) for s in _normalize_list(criteria.get("direct_symbol_order") or criteria.get("direct_symbols"))]
+    if not direct_symbols:
+        return None
+    sym = _normalize_symbol(row.get("symbol") or row.get("ticker") or row.get("requested_symbol"))
+    if not sym:
+        return None
+    try:
+        return direct_symbols.index(sym)
+    except ValueError:
+        return None
+
+
 def _selector_score(row: Mapping[str, Any], criteria: Mapping[str, Any]) -> float:
     overall = _safe_float(row.get("overall_score"), None)
     opportunity = _safe_float(row.get("opportunity_score"), None)
@@ -1449,6 +1492,10 @@ def _selector_score(row: Mapping[str, Any], criteria: Mapping[str, Any]) -> floa
         score += (100.0 - risk) * 0.08
     if roi is not None:
         score += roi * 100.0 * 0.20
+
+    direct_order_index = _direct_symbol_order_index(row, criteria)
+    if direct_order_index is not None:
+        score += max(0.0, 140.0 - float(direct_order_index * 2))
 
     score += min(_row_richness(row), 120) * 0.03
     return float(score)
@@ -1626,14 +1673,16 @@ async def _hydrate_page_rows(engine: Any, rows: List[Dict[str, Any]], mode: str,
 
 
 async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    direct_symbols = _normalize_list(criteria.get("direct_symbols"))
+    direct_symbols = [_normalize_symbol(s) for s in _normalize_list(criteria.get("direct_symbols")) if _normalize_symbol(s)]
     emergency_symbols = _normalize_list(criteria.get("emergency_symbols"))
     pages = _safe_source_pages(_normalize_list(criteria.get("pages_selected")))
+    direct_symbol_index_map = {sym: idx for idx, sym in enumerate(direct_symbols)}
 
     meta: Dict[str, Any] = {
         "engine_source": _ENGINE_CACHE_SOURCE or "",
         "source_pages": pages,
         "direct_symbols_count": len(direct_symbols),
+        "direct_symbols_requested": list(direct_symbols),
         "source_page_rows": {},
         "snapshot_rows": {},
         "direct_symbol_rows": 0,
@@ -1652,9 +1701,17 @@ async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode
             return
         if source_page and _is_blank(row.get("source_page")):
             row["source_page"] = source_page
+        if sym in direct_symbol_index_map:
+            row["_direct_symbol_priority"] = True
+            row["_direct_symbol_index"] = direct_symbol_index_map[sym]
+            if _is_blank(row.get("source_page")):
+                row["source_page"] = "Direct"
         existing = candidates.get(sym)
-        if existing is None or _row_richness(row) > _row_richness(existing):
+        if existing is None:
             candidates[sym] = row
+            return
+        richer, poorer = (row, existing) if _row_richness(row) >= _row_richness(existing) else (existing, row)
+        candidates[sym] = _merge_row_prefer_richer(poorer, richer)
 
     if direct_symbols:
         try:
@@ -1885,6 +1942,11 @@ async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             "selected_count": len(projected_rows),
             "filter_relaxed": filter_relaxed,
             "selected_symbols": [_s(r.get("symbol")) for r in projected_rows if _s(r.get("symbol"))],
+            "selected_direct_symbols": [
+                _s(r.get("symbol"))
+                for r in projected_rows
+                if _direct_symbol_order_index(r, criteria) is not None and _s(r.get("symbol"))
+            ],
             "include_headers": criteria.get("include_headers", True),
             "include_matrix": criteria.get("include_matrix", True),
             "engine_source": engine_source,
