@@ -2,40 +2,32 @@
 """
 routes/config.py
 ================================================================================
-TFB Config + Schema Routes — v5.6.1 (PROMETHEUS-SAFE / RENDER-SAFE / SCHEMA-HARDENED)
+TFB Config Routes — v5.7.0
 ================================================================================
+CONFIG-ONLY • SCHEMA-DECOUPLED • PROMETHEUS-SAFE • RENDER-SAFE • AUTH-COMPATIBLE
 
-What this revision fixes
-- ✅ FIX: /v1/schema/sheet-spec is hardened to avoid 500s caused by:
-      - normalize_page_name signature mismatch
-      - dict-vs-object schema spec structures
-      - missing optional criteria_fields
-      - missing helper functions in page_catalog / schema_registry
-- ✅ FIX: /v1/schema/data-dictionary is guaranteed to use the authoritative
-      builder in core/sheets/data_dictionary.py and never the quote engine
-- ✅ FIX: Data_Dictionary output is normalized and validated before response
-- ✅ SAFE: no Prometheus metric creation here
-- ✅ SAFE: no network calls at import time
-- ✅ SAFE: import fallbacks + defensive compatibility for older/newer core modules
+Why this revision
+-----------------
+- FIX: restores this module to a true config-only router.
+- FIX: removes ownership of `/v1/schema/*` from `routes.config` so canonical
+       schema ownership can live in `routes.advanced_analysis`.
+- FIX: keeps auth/config helpers stable for other routers without mounting
+       schema endpoints from this module.
+- SAFE: no Prometheus metric creation here.
+- SAFE: no network calls at import time.
+- SAFE: defensive compatibility with older/newer `core.config` variants.
 
 Endpoints kept
+--------------
 - GET  /v1/config/health
 - GET  /v1/config/settings
 - POST /v1/config/reload
 - GET  /v1/config/versions
 
-Schema endpoints
-- GET  /v1/schema/health
-- GET  /v1/schema/pages
-- GET  /v1/schema/data-dictionary
-- GET  /v1/schema/sheet-spec?sheet=<name>
-
-Auth policy
-- Uses core.config.is_open_mode/auth_ok when available
-- Supports:
-    X-APP-TOKEN, X-API-KEY, Authorization: Bearer <token>
-- Query token is allowed only if settings.allow_query_token=True
-  or env ALLOW_QUERY_TOKEN=1
+Important note
+--------------
+This file intentionally does NOT mount `/v1/schema/*`.
+Those endpoints should be owned and mounted by `routes.advanced_analysis`.
 """
 
 from __future__ import annotations
@@ -44,7 +36,7 @@ import logging
 import os
 import uuid
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
@@ -56,10 +48,11 @@ except Exception:  # pragma: no cover
 
 logger = logging.getLogger("routes.config")
 
-ROUTER_VERSION = "5.6.1"
+ROUTER_VERSION = "5.7.0"
+ROUTE_OWNER_NAME = "config"
+ROUTE_FAMILY_NAME = "config"
 
 config_router = APIRouter(prefix="/v1/config", tags=["config"])
-schema_router = APIRouter(prefix="/v1/schema", tags=["schema"])
 
 
 # =============================================================================
@@ -85,13 +78,6 @@ def _safe_bool_env(name: str, default: bool = False) -> bool:
         return default
 
 
-def _safe_int(value: Any, default: int = 0) -> int:
-    try:
-        return int(value)
-    except Exception:
-        return default
-
-
 def _error(status_code: int, request_id: str, message: str) -> BestJSONResponse:
     return BestJSONResponse(
         status_code=status_code,
@@ -101,6 +87,8 @@ def _error(status_code: int, request_id: str, message: str) -> BestJSONResponse:
             "request_id": request_id,
             "timestamp_utc": _now_utc(),
             "version": ROUTER_VERSION,
+            "route_owner": ROUTE_OWNER_NAME,
+            "route_family": ROUTE_FAMILY_NAME,
         },
     )
 
@@ -136,15 +124,6 @@ def _as_list(value: Any) -> List[Any]:
         except Exception:
             return [value]
     return [value]
-
-
-def _normalize_bool(value: Any, default: bool = False) -> bool:
-    if isinstance(value, bool):
-        return value
-    if value is None:
-        return default
-    s = str(value).strip().lower()
-    return s in {"1", "true", "yes", "y", "on", "t"}
 
 
 # =============================================================================
@@ -213,165 +192,6 @@ def _auth_ok(request: Request, *, query_token: Optional[str] = None) -> bool:
 
 
 # =============================================================================
-# Schema/page helpers
-# =============================================================================
-def _page_catalog_module() -> Any:
-    from core.sheets import page_catalog  # type: ignore
-
-    return page_catalog
-
-
-def _schema_registry_module() -> Any:
-    from core.sheets import schema_registry  # type: ignore
-
-    return schema_registry
-
-
-def _normalize_sheet_name(raw_sheet: str) -> str:
-    if not raw_sheet or not str(raw_sheet).strip():
-        raise ValueError("sheet is required")
-
-    page_catalog = _page_catalog_module()
-    raw = str(raw_sheet).strip()
-
-    normalize_fn = getattr(page_catalog, "normalize_page_name", None)
-    if callable(normalize_fn):
-        # Try most specific signature first, then degrade safely.
-        for kwargs in (
-            {"allow_output_pages": True},
-            {"allow_special_pages": True},
-            {},
-        ):
-            try:
-                return str(normalize_fn(raw, **kwargs))
-            except TypeError:
-                continue
-            except Exception:
-                break
-
-        try:
-            return str(normalize_fn(raw))
-        except Exception:
-            pass
-
-    # Fallbacks from common catalog patterns.
-    canonical_pages = _as_list(getattr(page_catalog, "CANONICAL_PAGES", []))
-    aliases = getattr(page_catalog, "PAGE_ALIASES", None) or getattr(page_catalog, "ALIASES", None) or {}
-
-    if isinstance(aliases, Mapping):
-        aliased = aliases.get(raw) or aliases.get(raw.lower()) or aliases.get(raw.upper())
-        if aliased:
-            return str(aliased)
-
-    raw_lower = raw.lower()
-    for page in canonical_pages:
-        if str(page).lower() == raw_lower:
-            return str(page)
-
-    # Gentle fallback: preserve caller input.
-    return raw
-
-
-def _get_all_pages() -> Dict[str, List[str]]:
-    page_catalog = _page_catalog_module()
-
-    canonical_pages = [str(x) for x in _as_list(getattr(page_catalog, "CANONICAL_PAGES", []))]
-    forbidden_pages = [str(x) for x in _as_list(getattr(page_catalog, "FORBIDDEN_PAGES", []))]
-
-    if not canonical_pages:
-        try:
-            registry = _schema_registry_module()
-            list_sheets_fn = getattr(registry, "list_sheets", None)
-            canonical_pages = [str(x) for x in _as_list(_call_if_callable(list_sheets_fn))]
-        except Exception:
-            canonical_pages = []
-
-    return {
-        "canonical_pages": canonical_pages,
-        "forbidden_pages": sorted(set(forbidden_pages)),
-    }
-
-
-def _get_sheet_spec_compat(canonical_sheet: str) -> Any:
-    registry = _schema_registry_module()
-
-    # Preferred exact helper.
-    get_sheet_spec = getattr(registry, "get_sheet_spec", None)
-    if callable(get_sheet_spec):
-        return get_sheet_spec(canonical_sheet)
-
-    # Fallback registry containers seen in many codebases.
-    for attr_name in ("SHEET_SPECS", "SCHEMA_REGISTRY", "SHEETS", "REGISTRY"):
-        container = getattr(registry, attr_name, None)
-        if isinstance(container, Mapping) and canonical_sheet in container:
-            return container[canonical_sheet]
-
-    raise ValueError(f"unknown sheet: {canonical_sheet}")
-
-
-def _normalize_column_item(item: Any) -> Dict[str, Any]:
-    return {
-        "group": _obj_get(item, "group", ""),
-        "header": _obj_get(item, "header", ""),
-        "key": _obj_get(item, "key", ""),
-        "dtype": _obj_get(item, "dtype", "str"),
-        "fmt": _obj_get(item, "fmt", "text"),
-        "required": bool(_obj_get(item, "required", False)),
-        "source": _obj_get(item, "source", ""),
-        "notes": _obj_get(item, "notes", ""),
-    }
-
-
-def _normalize_criteria_item(item: Any) -> Dict[str, Any]:
-    return {
-        "key": _obj_get(item, "key", ""),
-        "label": _obj_get(item, "label", ""),
-        "dtype": _obj_get(item, "dtype", "str"),
-        "default": _obj_get(item, "default", None),
-        "notes": _obj_get(item, "notes", ""),
-    }
-
-
-def _extract_spec_columns(spec: Any) -> List[Dict[str, Any]]:
-    columns = _obj_get(spec, "columns", None)
-
-    if columns is None and isinstance(spec, Mapping):
-        columns = spec.get("headers") or spec.get("cols")
-
-    return [_normalize_column_item(x) for x in _as_list(columns)]
-
-
-def _extract_spec_criteria_fields(spec: Any) -> List[Dict[str, Any]]:
-    criteria_fields = _obj_get(spec, "criteria_fields", None)
-    if criteria_fields is None and isinstance(spec, Mapping):
-        criteria_fields = spec.get("criteria") or spec.get("advisor_fields")
-    return [_normalize_criteria_item(x) for x in _as_list(criteria_fields)]
-
-
-def _extract_spec_kind(spec: Any) -> str:
-    kind = _obj_get(spec, "kind", None)
-    if kind is None and isinstance(spec, Mapping):
-        kind = spec.get("sheet_kind") or spec.get("type") or ""
-    return str(kind or "")
-
-
-def _get_sheet_headers_compat(sheet_name: str) -> List[str]:
-    registry = _schema_registry_module()
-
-    get_sheet_headers = getattr(registry, "get_sheet_headers", None)
-    if callable(get_sheet_headers):
-        headers = get_sheet_headers(sheet_name)
-        return [str(x) for x in _as_list(headers)]
-
-    spec = _get_sheet_spec_compat(sheet_name)
-    cols = _extract_spec_columns(spec)
-    if cols:
-        return [str(c.get("header", "")) for c in cols]
-
-    return []
-
-
-# =============================================================================
 # /v1/config/*
 # =============================================================================
 @config_router.get("/health", include_in_schema=False)
@@ -391,10 +211,43 @@ async def config_health() -> Any:
             "errors": [f"{type(e).__name__}: {e}"],
         }
 
+    try:
+        settings = _get_settings_cached(force_reload=False)
+        open_mode = bool(_obj_get(settings, "open_mode", False))
+        allow_query_token = _allow_query_token(settings)
+    except Exception:
+        open_mode = False
+        allow_query_token = _safe_bool_env("ALLOW_QUERY_TOKEN", False)
+
     data["module"] = "routes.config"
     data["version"] = ROUTER_VERSION
+    data["route_owner"] = ROUTE_OWNER_NAME
+    data["route_family"] = ROUTE_FAMILY_NAME
+    data["open_mode"] = open_mode
+    data["allow_query_token"] = allow_query_token
     data["timestamp_utc"] = _now_utc()
     return data
+
+
+@config_router.get("")
+@config_router.get("/", include_in_schema=False)
+async def config_root() -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        "service": "config",
+        "version": ROUTER_VERSION,
+        "route_owner": ROUTE_OWNER_NAME,
+        "route_family": ROUTE_FAMILY_NAME,
+        "root_path": "/v1/config",
+        "supported_paths": [
+            "/v1/config",
+            "/v1/config/health",
+            "/v1/config/settings",
+            "/v1/config/reload",
+            "/v1/config/versions",
+        ],
+        "timestamp_utc": _now_utc(),
+    }
 
 
 @config_router.get("/settings")
@@ -420,6 +273,8 @@ async def get_masked_settings(
                 "timestamp_utc": _now_utc(),
                 "settings": payload,
                 "version": ROUTER_VERSION,
+                "route_owner": ROUTE_OWNER_NAME,
+                "route_family": ROUTE_FAMILY_NAME,
             },
         )
     except Exception as e:
@@ -466,6 +321,8 @@ async def reload_config(
                 "request_id": request_id,
                 "timestamp_utc": _now_utc(),
                 "version": ROUTER_VERSION,
+                "route_owner": ROUTE_OWNER_NAME,
+                "route_family": ROUTE_FAMILY_NAME,
                 "meta": {"author": author, "comment": comment},
                 "validation": {"errors": errors, "warnings": warnings},
                 "settings": masked,
@@ -506,6 +363,8 @@ async def config_versions(
                 "request_id": request_id,
                 "timestamp_utc": _now_utc(),
                 "version": ROUTER_VERSION,
+                "route_owner": ROUTE_OWNER_NAME,
+                "route_family": ROUTE_FAMILY_NAME,
                 "count": len(items),
                 "items": items,
             },
@@ -516,233 +375,10 @@ async def config_versions(
 
 
 # =============================================================================
-# /v1/schema/*
-# =============================================================================
-@schema_router.get("/health", include_in_schema=False)
-async def schema_health() -> BestJSONResponse:
-    ok = True
-    err = None
-    schema_version = "unknown"
-    sheets: List[str] = []
-
-    try:
-        registry = _schema_registry_module()
-        schema_version = str(getattr(registry, "SCHEMA_VERSION", "unknown"))
-        list_sheets = getattr(registry, "list_sheets", None)
-        sheets = [str(x) for x in _as_list(_call_if_callable(list_sheets))]
-        if not sheets:
-            pages = _get_all_pages()
-            sheets = pages["canonical_pages"]
-    except Exception as e:
-        ok = False
-        err = f"{type(e).__name__}: {e}"
-
-    return BestJSONResponse(
-        status_code=200 if ok else 503,
-        content={
-            "status": "ok" if ok else "degraded",
-            "version": ROUTER_VERSION,
-            "schema_version": schema_version,
-            "sheets_count": len(sheets),
-            "sheets": sheets,
-            "error": err,
-            "timestamp_utc": _now_utc(),
-        },
-    )
-
-
-@schema_router.get("/pages")
-async def schema_pages(
-    request: Request,
-    token: Optional[str] = Query(None, description="Query token if allow_query_token is enabled"),
-) -> BestJSONResponse:
-    request_id = _get_request_id(request)
-    if not _auth_ok(request, query_token=token):
-        return _error(401, request_id, "unauthorized")
-
-    try:
-        pages = _get_all_pages()
-        return BestJSONResponse(
-            status_code=200,
-            content={
-                "status": "ok",
-                "request_id": request_id,
-                "timestamp_utc": _now_utc(),
-                "version": ROUTER_VERSION,
-                "canonical_pages": pages["canonical_pages"],
-                "forbidden_pages": pages["forbidden_pages"],
-            },
-        )
-    except Exception as e:
-        logger.warning("schema_pages failed: %s", e)
-        return _error(500, request_id, f"{type(e).__name__}: {e}")
-
-
-@schema_router.get("/sheet-spec")
-async def schema_sheet_spec(
-    request: Request,
-    sheet: str = Query(..., description="Canonical sheet name or accepted alias"),
-    token: Optional[str] = Query(None, description="Query token if allow_query_token is enabled"),
-) -> BestJSONResponse:
-    """
-    Returns a robust sheet spec response:
-      {
-        sheet,
-        kind,
-        columns: [{group,header,key,dtype,fmt,required,source,notes}],
-        criteria_fields: [{key,label,dtype,default,notes}],
-        counts: {columns, criteria_fields}
-      }
-    """
-    request_id = _get_request_id(request)
-    if not _auth_ok(request, query_token=token):
-        return _error(401, request_id, "unauthorized")
-
-    try:
-        canonical = _normalize_sheet_name(sheet)
-        spec = _get_sheet_spec_compat(canonical)
-
-        cols = _extract_spec_columns(spec)
-        if not cols:
-            headers = _get_sheet_headers_compat(canonical)
-            cols = [
-                {
-                    "group": "",
-                    "header": header,
-                    "key": "",
-                    "dtype": "str",
-                    "fmt": "text",
-                    "required": False,
-                    "source": "",
-                    "notes": "",
-                }
-                for header in headers
-            ]
-
-        criteria_fields = _extract_spec_criteria_fields(spec)
-        kind = _extract_spec_kind(spec)
-
-        return BestJSONResponse(
-            status_code=200,
-            content={
-                "status": "ok",
-                "request_id": request_id,
-                "timestamp_utc": _now_utc(),
-                "version": ROUTER_VERSION,
-                "sheet": canonical,
-                "kind": kind,
-                "columns": cols,
-                "criteria_fields": criteria_fields,
-                "counts": {
-                    "columns": len(cols),
-                    "criteria_fields": len(criteria_fields),
-                },
-            },
-        )
-    except ValueError as e:
-        return _error(400, request_id, str(e))
-    except Exception as e:
-        logger.warning("schema_sheet_spec failed for sheet=%r: %s", sheet, e)
-        return _error(500, request_id, f"{type(e).__name__}: {e}")
-
-
-@schema_router.get("/data-dictionary")
-async def schema_data_dictionary(
-    request: Request,
-    format: str = Query("json", description="json or values"),
-    include_meta_sheet: bool = Query(True, description="Include Data_Dictionary meta sheet rows"),
-    token: Optional[str] = Query(None, description="Query token if allow_query_token is enabled"),
-) -> BestJSONResponse:
-    """
-    Authoritative Data Dictionary endpoint.
-
-    - format=json:
-        returns rows as list[dict]
-    - format=values:
-        returns 2D array suitable for Google Sheets writeback
-
-    Important:
-    - never calls the quote engine
-    - always uses core/sheets/data_dictionary.py
-    """
-    request_id = _get_request_id(request)
-    if not _auth_ok(request, query_token=token):
-        return _error(401, request_id, "unauthorized")
-
-    fmt = (format or "json").strip().lower()
-    if fmt not in {"json", "values"}:
-        return _error(400, request_id, "format must be 'json' or 'values'")
-
-    try:
-        from core.sheets.data_dictionary import (  # type: ignore
-            DATA_DICTIONARY_VERSION,
-            build_data_dictionary_rows,
-            build_data_dictionary_values,
-            validate_data_dictionary_output,
-        )
-
-        headers = _get_sheet_headers_compat("Data_Dictionary")
-
-        if fmt == "values":
-            values = build_data_dictionary_values(
-                include_header_row=True,
-                include_meta_sheet=bool(include_meta_sheet),
-            )
-            values = _as_list(values)
-            return BestJSONResponse(
-                status_code=200,
-                content={
-                    "status": "ok",
-                    "request_id": request_id,
-                    "timestamp_utc": _now_utc(),
-                    "version": ROUTER_VERSION,
-                    "data_dictionary_version": DATA_DICTIONARY_VERSION,
-                    "format": "values",
-                    "headers": headers,
-                    "values": values,
-                    "counts": {
-                        "rows": max(0, len(values) - 1),
-                        "cols": len(headers),
-                    },
-                },
-            )
-
-        rows = build_data_dictionary_rows(include_meta_sheet=bool(include_meta_sheet))
-        rows = _as_list(rows)
-
-        validate = validate_data_dictionary_output if callable(validate_data_dictionary_output) else None
-        if callable(validate):
-            validate(rows, enforce_unique_sheet_key=True)
-
-        return BestJSONResponse(
-            status_code=200,
-            content={
-                "status": "ok",
-                "request_id": request_id,
-                "timestamp_utc": _now_utc(),
-                "version": ROUTER_VERSION,
-                "data_dictionary_version": DATA_DICTIONARY_VERSION,
-                "format": "json",
-                "include_meta_sheet": bool(include_meta_sheet),
-                "headers": headers,
-                "rows": rows,
-                "counts": {
-                    "rows": len(rows),
-                    "cols": len(headers),
-                },
-            },
-        )
-    except Exception as e:
-        logger.warning("schema_data_dictionary failed: %s", e)
-        return _error(500, request_id, f"{type(e).__name__}: {e}")
-
-
-# =============================================================================
 # Router mounting / compat exports
 # =============================================================================
 def mount(app: Any) -> None:
     app.include_router(config_router)
-    app.include_router(schema_router)
 
 
 def get_settings() -> Any:
@@ -794,8 +430,9 @@ def auth_ok_request(
 
 __all__ = [
     "ROUTER_VERSION",
+    "ROUTE_OWNER_NAME",
+    "ROUTE_FAMILY_NAME",
     "config_router",
-    "schema_router",
     "mount",
     "get_settings",
     "allowed_tokens",
