@@ -1,27 +1,26 @@
-
 #!/usr/bin/env python3
 """
 routes/investment_advisor.py
 ================================================================================
-ADVANCED INVESTMENT ADVISOR ROUTER — v2.7.0
+ADVANCED INVESTMENT ADVISOR ROUTER — v2.8.0
 ================================================================================
-OWNER-ALIGNED • ADVANCED-PREFIX OWNER • QUERY-PARSE SAFE • CONTRACT-CORRECT •
-TOP10-HARDENED • BRIDGE-TOLERANT • JSON-SAFE • STARTUP-SAFE • AUTH-TOLERANT
+OWNER-ALIGNED • ROOT-OWNERSHIP FIXED • ADVANCED-PREFIX OWNER • QUERY-PARSE SAFE •
+CONTRACT-CORRECT • TOP10-HARDENED • BRIDGE-TOLERANT • JSON-SAFE • STARTUP-SAFE •
+AUTH-TOLERANT
 
-What this revision improves
----------------------------
-- FIX: page/source parsing now preserves multi-word page names; symbol parsing is
-       handled separately so queries like "Market Leaders, Global Markets" stay
-       valid instead of being split into broken tokens.
-- FIX: page alias normalization now recognizes common source-page spellings with
-       spaces / hyphens / lowercase forms, improving GET compatibility.
-- FIX: response compatibility is widened with quotes / records / results aliases
-       alongside rows / row_objects / data / items / rows_matrix.
-- FIX: schema-only responses now keep the same compatibility aliases as live
-       responses for simpler downstream consumption.
-- FIX: route metadata now clearly identifies this module as the /v1/advanced
-       owner to align with the controlled runtime owner map.
-- SAFE: no import-time network work.
+Why this revision
+-----------------
+- FIX: explicitly claims the canonical `/v1/advanced` family root with GET + POST
+       so ownership can resolve to this router instead of falling through to
+       `routes.advanced_analysis`.
+- FIX: preserves `/v1/advanced/sheet-rows` plus the advanced aliases already used
+       by tests and downstream callers.
+- FIX: keeps schema-only and live payloads on one stable envelope:
+       headers, display_headers, keys, rows, row_objects, records, results,
+       data, items, quotes, rows_matrix, meta.
+- FIX: maintains tolerant resolution across builder / runner / bridge / engine
+       layers so startup stays safe even when optional modules are absent.
+- SAFE: no import-time network activity.
 """
 
 from __future__ import annotations
@@ -40,7 +39,7 @@ from datetime import date, datetime, time as dt_time, timezone
 from decimal import Decimal
 from enum import Enum
 from importlib import import_module
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, Response, status
 from fastapi.encoders import jsonable_encoder
@@ -48,7 +47,7 @@ from fastapi.encoders import jsonable_encoder
 logger = logging.getLogger("routes.investment_advisor")
 logger.addHandler(logging.NullHandler())
 
-INVESTMENT_ADVISOR_VERSION = "2.7.0"
+INVESTMENT_ADVISOR_VERSION = "2.8.0"
 ROUTE_FAMILY_NAME = "advanced"
 ROUTE_OWNER_NAME = "investment_advisor"
 
@@ -63,11 +62,8 @@ BASE_SOURCE_PAGES: Tuple[str, ...] = (
     "Mutual_Funds",
     "My_Portfolio",
 )
-
-DERIVED_PAGES = {
-    TOP10_PAGE_NAME,
-    INSIGHTS_PAGE_NAME,
-}
+DERIVED_PAGES = {TOP10_PAGE_NAME, INSIGHTS_PAGE_NAME}
+_SOURCE_PAGES_SET = set(BASE_SOURCE_PAGES)
 
 KNOWN_CANONICAL_HEADER_COUNTS: Dict[str, int] = {
     "Market_Leaders": 80,
@@ -84,27 +80,6 @@ TOP10_SPECIAL_FIELDS: Tuple[str, ...] = (
     "top10_rank",
     "selection_reason",
     "criteria_snapshot",
-)
-
-TOP10_BUSINESS_SIGNAL_FIELDS: Tuple[str, ...] = (
-    "symbol",
-    "name",
-    "asset_class",
-    "exchange",
-    "currency",
-    "country",
-    "sector",
-    "industry",
-    "current_price",
-    "price_change",
-    "percent_change",
-    "risk_score",
-    "valuation_score",
-    "overall_score",
-    "opportunity_score",
-    "risk_bucket",
-    "confidence_bucket",
-    "recommendation",
 )
 
 PAGE_ALIAS_MAP: Dict[str, str] = {
@@ -153,7 +128,6 @@ TOP10_MODULE_CANDIDATES: Tuple[str, ...] = (
     "core.analysis.investment_advisor",
     "core.analysis.investment_advisor_engine",
 )
-
 RUNNER_MODULE_CANDIDATES: Tuple[str, ...] = (
     "core.investment_advisor",
     "core.investment_advisor_engine",
@@ -162,11 +136,15 @@ RUNNER_MODULE_CANDIDATES: Tuple[str, ...] = (
     "core.data_engine_v2",
     "core.data_engine",
 )
-
 BRIDGE_MODULE_CANDIDATES: Tuple[str, ...] = (
     "routes.analysis_sheet_rows",
     "routes.advanced_analysis",
     "routes.advanced_sheet_rows",
+)
+SCHEMA_MODULE_CANDIDATES: Tuple[str, ...] = (
+    "core.sheets.schema_registry",
+    "core.schema_registry",
+    "core.sheets.page_catalog",
 )
 
 TOP10_FUNCTION_CANDIDATES: Tuple[str, ...] = (
@@ -180,7 +158,6 @@ TOP10_FUNCTION_CANDIDATES: Tuple[str, ...] = (
     "select_top10",
     "select_top10_symbols",
 )
-
 RUNNER_FUNCTION_CANDIDATES: Tuple[str, ...] = (
     "run_investment_advisor_engine",
     "run_investment_advisor",
@@ -197,7 +174,6 @@ RUNNER_FUNCTION_CANDIDATES: Tuple[str, ...] = (
     "select_top10",
     "select_top10_symbols",
 )
-
 BRIDGE_FUNCTION_CANDIDATES: Tuple[str, ...] = (
     "_analysis_sheet_rows_impl",
     "_run_analysis_sheet_rows_impl",
@@ -208,43 +184,6 @@ BRIDGE_FUNCTION_CANDIDATES: Tuple[str, ...] = (
     "run_sheet_rows_impl",
     "_sheet_rows_impl",
 )
-
-CONTAINER_NAME_CANDIDATES: Tuple[str, ...] = (
-    "top10_selector",
-    "top10_builder",
-    "advisor_service",
-    "investment_advisor_service",
-    "advisor_engine",
-    "investment_advisor_engine",
-    "advisor_runner",
-    "investment_advisor_runner",
-    "engine",
-    "service",
-    "create_top10_selector",
-    "create_top10_builder",
-    "get_top10_selector",
-    "get_top10_builder",
-    "create_investment_advisor",
-    "get_investment_advisor",
-    "build_investment_advisor",
-)
-
-STATE_ATTR_CANDIDATES: Tuple[str, ...] = (
-    "top10_builder",
-    "top10_selector",
-    "investment_advisor_runner",
-    "advisor_runner",
-    "build_top10_rows",
-    "select_top10",
-    "select_top10_symbols",
-    "run_investment_advisor",
-    "run_investment_advisor_engine",
-    "run_advisor",
-    "investment_advisor_service",
-    "advisor_service",
-    "engine",
-)
-
 ENGINE_METHOD_CANDIDATES: Tuple[str, ...] = (
     "build_top10_rows",
     "build_top10_output_rows",
@@ -266,12 +205,6 @@ ENGINE_METHOD_CANDIDATES: Tuple[str, ...] = (
     "run_sheet_rows",
 )
 
-SCHEMA_MODULE_CANDIDATES: Tuple[str, ...] = (
-    "core.sheets.schema_registry",
-    "core.schema_registry",
-    "core.sheets.page_catalog",
-)
-
 SCHEMA_MAP_CANDIDATES: Tuple[str, ...] = (
     "SCHEMA_REGISTRY",
     "SHEET_SPEC",
@@ -281,7 +214,6 @@ SCHEMA_MAP_CANDIDATES: Tuple[str, ...] = (
     "SHEET_CONTRACTS",
     "STATIC_CANONICAL_SHEET_CONTRACTS",
 )
-
 SCHEMA_FUNCTION_CANDIDATES: Tuple[str, ...] = (
     "get_sheet_spec",
     "get_schema_for_sheet",
@@ -296,14 +228,14 @@ router = APIRouter(prefix="/v1/advanced", tags=["advanced"])
 try:
     from prometheus_client import CONTENT_TYPE_LATEST, generate_latest  # type: ignore
     PROMETHEUS_AVAILABLE = True
-except Exception:
+except Exception:  # pragma: no cover
     CONTENT_TYPE_LATEST = "text/plain"
     generate_latest = None  # type: ignore
     PROMETHEUS_AVAILABLE = False
 
 try:
     from core.config import auth_ok, get_settings_cached, is_open_mode  # type: ignore
-except Exception:
+except Exception:  # pragma: no cover
     auth_ok = None  # type: ignore
     is_open_mode = None  # type: ignore
 
@@ -321,74 +253,19 @@ _CANONICAL_TOP10_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("sector", "Sector"),
     ("industry", "Industry"),
     ("current_price", "Current Price"),
-    ("previous_close", "Previous Close"),
-    ("open", "Open"),
-    ("day_high", "Day High"),
-    ("day_low", "Day Low"),
-    ("high_52w", "52W High"),
-    ("low_52w", "52W Low"),
     ("price_change", "Price Change"),
     ("percent_change", "Percent Change"),
-    ("position_52w_pct", "52W Position %"),
-    ("volume", "Volume"),
-    ("avg_volume_10d", "Avg Volume 10D"),
-    ("avg_volume_30d", "Avg Volume 30D"),
-    ("market_cap", "Market Cap"),
-    ("float_shares", "Float Shares"),
-    ("beta_5y", "Beta 5Y"),
-    ("pe_ttm", "P/E TTM"),
-    ("pe_forward", "P/E Forward"),
-    ("eps_ttm", "EPS TTM"),
-    ("dividend_yield", "Dividend Yield"),
-    ("payout_ratio", "Payout Ratio"),
-    ("revenue_ttm", "Revenue TTM"),
-    ("revenue_growth_yoy", "Revenue YoY Growth"),
-    ("gross_margin", "Gross Margin"),
-    ("operating_margin", "Operating Margin"),
-    ("profit_margin", "Profit Margin"),
-    ("debt_to_equity", "Debt/Equity"),
-    ("free_cash_flow_ttm", "FCF TTM"),
-    ("rsi_14", "RSI 14"),
-    ("volatility_30d", "Volatility 30D"),
-    ("volatility_90d", "Volatility 90D"),
-    ("max_drawdown_1y", "Max Drawdown 1Y"),
-    ("var_95_1d", "VaR 95% 1D"),
-    ("sharpe_1y", "Sharpe 1Y"),
     ("risk_score", "Risk Score"),
-    ("risk_bucket", "Risk Bucket"),
-    ("pb_ratio", "P/B"),
-    ("ps_ratio", "P/S"),
-    ("ev_ebitda", "EV/EBITDA"),
-    ("peg_ratio", "PEG"),
-    ("intrinsic_value", "Intrinsic Value"),
     ("valuation_score", "Valuation Score"),
-    ("forecast_price_1m", "Forecast Price 1M"),
-    ("expected_roi_1m", "Expected ROI 1M"),
-    ("forecast_price_3m", "Forecast Price 3M"),
-    ("expected_roi_3m", "Expected ROI 3M"),
-    ("forecast_price_12m", "Forecast Price 12M"),
-    ("expected_roi_12m", "Expected ROI 12M"),
-    ("forecast_confidence", "Forecast Confidence"),
-    ("analyst_target_price", "Analyst Target Price"),
-    ("analyst_upside_pct", "Analyst Upside %"),
-    ("recommendation", "Recommendation"),
-    ("value_score", "Value Score"),
-    ("quality_score", "Quality Score"),
-    ("momentum_score", "Momentum Score"),
-    ("growth_score", "Growth Score"),
     ("overall_score", "Overall Score"),
     ("opportunity_score", "Opportunity Score"),
-    ("rank_overall", "Rank Overall"),
+    ("risk_bucket", "Risk Bucket"),
     ("confidence_bucket", "Confidence Bucket"),
-    ("source", "Source"),
-    ("as_of_utc", "As Of UTC"),
-    ("last_updated_riyadh", "Last Updated (Riyadh)"),
-    ("notes", "Notes"),
-    ("primary_provider", "Primary Provider"),
-    ("classification_source", "Classification Source"),
-    ("history_source", "History Source"),
-    ("fundamentals_source", "Fundamentals Source"),
-    ("forecast_source", "Forecast Source"),
+    ("recommendation", "Recommendation"),
+    ("expected_roi_1m", "Expected ROI 1M"),
+    ("expected_roi_3m", "Expected ROI 3M"),
+    ("expected_roi_12m", "Expected ROI 12M"),
+    ("forecast_confidence", "Forecast Confidence"),
     ("source_page", "Source Page"),
     ("row_status", "Row Status"),
     ("degraded", "Degraded"),
@@ -419,7 +296,6 @@ _CANONICAL_DATA_DICTIONARY_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
 ]
 
 _SCHEMA_CACHE: Dict[str, Tuple[List[str], List[str]]] = {}
-_SOURCE_PAGES_SET = set(BASE_SOURCE_PAGES)
 
 
 def _s(v: Any) -> str:
@@ -488,7 +364,6 @@ def _split_symbol_text(text: str) -> List[str]:
     raw = _s(text)
     if not raw:
         return []
-    # Symbols/tickers are commonly provided comma/semicolon/space separated.
     return _dedupe_keep_order(x for x in re.split(r"[\s,;]+", raw) if _s(x))
 
 
@@ -512,10 +387,7 @@ def _normalize_symbol_list(value: Any) -> List[str]:
         out: List[str] = []
         seen = set()
         for item in value:
-            if isinstance(item, str):
-                parts = _split_symbol_text(item)
-            else:
-                parts = [_s(item)]
+            parts = _split_symbol_text(item) if isinstance(item, str) else [_s(item)]
             for part in parts:
                 if part and part not in seen:
                     seen.add(part)
@@ -529,7 +401,7 @@ def _slice_rows(rows: List[Dict[str, Any]], *, offset: int, limit: int) -> List[
     start = max(0, int(offset or 0))
     if limit <= 0:
         return rows[start:]
-    return rows[start:start + limit]
+    return rows[start : start + limit]
 
 
 def _now_utc() -> str:
@@ -664,6 +536,16 @@ def _page_family(page: str) -> str:
     return ROUTE_FAMILY_NAME
 
 
+def _nonempty(value: Any) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, dict)):
+        return bool(value)
+    return True
+
+
 def _timeout_seconds(env_name: str, default: float) -> float:
     return max(0.1, _safe_float(os.getenv(env_name), default))
 
@@ -685,21 +567,12 @@ def _resolver_timeout(stage: str, *, page: str) -> float:
     return _timeout_seconds(env_map[stage], defaults[stage])
 
 
-def _nonempty(value: Any) -> bool:
-    if value is None:
-        return False
-    if isinstance(value, str):
-        return bool(value.strip())
-    return True
-
-
 def _is_public_path(path: str) -> bool:
     p = _s(path)
     if not p:
         return False
-    if p in {"/v1/advanced/health", "/v1/advanced/meta", "/v1/advanced/metrics"}:
+    if p in {"/v1/advanced", "/v1/advanced/health", "/v1/advanced/meta", "/v1/advanced/metrics"}:
         return True
-
     env_paths = os.getenv("PUBLIC_PATHS", "") or os.getenv("AUTH_PUBLIC_PATHS", "")
     for raw in env_paths.split(","):
         candidate = raw.strip()
@@ -712,17 +585,11 @@ def _is_public_path(path: str) -> bool:
     return False
 
 
-def _extract_auth_token(
-    *,
-    token_query: Optional[str],
-    x_app_token: Optional[str],
-    authorization: Optional[str],
-) -> str:
+def _extract_auth_token(*, token_query: Optional[str], x_app_token: Optional[str], authorization: Optional[str]) -> str:
     token = _s(x_app_token)
     authz = _s(authorization)
     if authz.lower().startswith("bearer "):
         token = authz.split(" ", 1)[1].strip()
-
     if token_query and not token:
         allow_query = False
         try:
@@ -744,7 +611,6 @@ def _is_open_mode_enabled() -> bool:
             return bool(result)
     except Exception:
         pass
-
     for name in ("OPEN_MODE", "TFB_OPEN_MODE", "AUTH_DISABLED"):
         env_v = _s(os.getenv(name))
         if env_v:
@@ -752,32 +618,19 @@ def _is_open_mode_enabled() -> bool:
     return False
 
 
-def _auth_passed(
-    *,
-    request: Request,
-    token_query: Optional[str],
-    x_app_token: Optional[str],
-    authorization: Optional[str],
-) -> bool:
+def _auth_passed(*, request: Request, token_query: Optional[str], x_app_token: Optional[str], authorization: Optional[str]) -> bool:
     if _is_open_mode_enabled():
         return True
-
     try:
         path = str(getattr(getattr(request, "url", None), "path", "") or "")
     except Exception:
         path = ""
-
     if _is_public_path(path):
         return True
-
     if auth_ok is None:
         return True
 
-    auth_token = _extract_auth_token(
-        token_query=token_query,
-        x_app_token=x_app_token,
-        authorization=authorization,
-    )
+    auth_token = _extract_auth_token(token_query=token_query, x_app_token=x_app_token, authorization=authorization)
     headers_dict = dict(request.headers)
 
     settings = None
@@ -795,20 +648,13 @@ def _auth_passed(
             "request": request,
             "settings": settings,
         },
-        {
-            "token": auth_token or None,
-            "authorization": authorization,
-            "headers": headers_dict,
-            "path": path,
-            "request": request,
-        },
+        {"token": auth_token or None, "authorization": authorization, "headers": headers_dict, "path": path, "request": request},
         {"token": auth_token or None, "authorization": authorization, "headers": headers_dict, "path": path},
         {"token": auth_token or None, "authorization": authorization, "headers": headers_dict},
         {"token": auth_token or None, "authorization": authorization},
         {"token": auth_token or None},
         {},
     ]
-
     for kwargs in attempts:
         try:
             return bool(auth_ok(**kwargs))
@@ -819,19 +665,8 @@ def _auth_passed(
     return False
 
 
-def _require_auth_or_401(
-    *,
-    request: Request,
-    token_query: Optional[str],
-    x_app_token: Optional[str],
-    authorization: Optional[str],
-) -> None:
-    if not _auth_passed(
-        request=request,
-        token_query=token_query,
-        x_app_token=x_app_token,
-        authorization=authorization,
-    ):
+def _require_auth_or_401(*, request: Request, token_query: Optional[str], x_app_token: Optional[str], authorization: Optional[str]) -> None:
+    if not _auth_passed(request=request, token_query=token_query, x_app_token=x_app_token, authorization=authorization):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
 
@@ -850,7 +685,6 @@ async def _get_engine(request: Request) -> Optional[Any]:
             mod = import_module(modpath)
         except Exception:
             continue
-
         for attr in ("get_engine", "get_data_engine", "engine", "data_engine", "ENGINE", "DATA_ENGINE"):
             candidate = getattr(mod, attr, None)
             if candidate is None:
@@ -905,7 +739,6 @@ def _append_missing_keys(keys: List[str], fields: Sequence[str]) -> List[str]:
 def _extract_schema_headers_keys_from_spec(spec: Any) -> Tuple[List[str], List[str]]:
     if spec is None:
         return [], []
-
     if not isinstance(spec, Mapping):
         columns = getattr(spec, "columns", None) or []
         if columns:
@@ -932,12 +765,11 @@ def _extract_schema_headers_keys_from_spec(spec: Any) -> Tuple[List[str], List[s
     keys = [_s(x) for x in direct_keys] if isinstance(direct_keys, list) else []
     headers = [x for x in headers if x]
     keys = [x for x in keys if x]
-
     if headers and keys:
         return headers, keys
 
-    if isinstance(spec.get("columns"), list) and spec.get("columns"):
-        columns = spec.get("columns")
+    columns = spec.get("columns") if isinstance(spec.get("columns"), list) else []
+    if columns:
         headers_out: List[str] = []
         keys_out: List[str] = []
         for idx, col in enumerate(columns):
@@ -1001,7 +833,6 @@ def _load_schema_defaults(page: str) -> Tuple[List[str], List[str]]:
         module = _import_module_safely(module_name)
         if module is None:
             continue
-
         for map_name in SCHEMA_MAP_CANDIDATES:
             spec_map = getattr(module, map_name, None)
             if not isinstance(spec_map, Mapping):
@@ -1017,7 +848,6 @@ def _load_schema_defaults(page: str) -> Tuple[List[str], List[str]]:
                     keys = _append_missing_keys(keys, TOP10_SPECIAL_FIELDS)
                 _SCHEMA_CACHE[page] = (list(headers), list(keys))
                 return headers, keys
-
         for fn_name in SCHEMA_FUNCTION_CANDIDATES:
             fn = getattr(module, fn_name, None)
             if not callable(fn):
@@ -1074,1545 +904,473 @@ def _model_to_dict(obj: Any) -> Dict[str, Any]:
                 return dumped
     except Exception:
         pass
-    try:
-        if hasattr(obj, "__dict__"):
-            d = vars(obj)
-            if isinstance(d, dict):
-                return dict(d)
-    except Exception:
-        pass
-    return {"result": obj}
+    return {}
 
 
-def _extract_headers_and_keys(payload_dict: Dict[str, Any]) -> Tuple[List[str], List[str]]:
-    headers = (
-        payload_dict.get("display_headers")
-        or payload_dict.get("sheet_headers")
-        or payload_dict.get("column_headers")
-        or payload_dict.get("headers")
-        or []
-    )
-    keys = payload_dict.get("keys") or payload_dict.get("fields") or payload_dict.get("columns") or []
-
-    if not isinstance(headers, list):
-        headers = []
-    if not isinstance(keys, list):
-        keys = []
-
-    return [_s(x) for x in headers if _s(x)], [_s(x) for x in keys if _s(x)]
-
-
-def _rows_to_matrix(rows: List[Dict[str, Any]], keys: List[str]) -> List[List[Any]]:
-    return [[row.get(k) for k in keys] for row in rows]
-
-
-def _dicts_from_matrix(matrix: Any, keys: List[str]) -> List[Dict[str, Any]]:
-    if not isinstance(matrix, list) or not keys:
+def _extract_rows_from_payload(payload: Any) -> List[Dict[str, Any]]:
+    if payload is None:
         return []
-    out: List[Dict[str, Any]] = []
-    for row in matrix:
-        if isinstance(row, dict):
-            out.append(dict(row))
-            continue
-        if not isinstance(row, list):
-            continue
-        out.append({k: (row[idx] if idx < len(row) else None) for idx, k in enumerate(keys)})
-    return out
-
-
-def _extract_rows_candidate(payload: Any, *, keys_hint: Optional[List[str]] = None) -> List[Dict[str, Any]]:
-    keys_hint = list(keys_hint or [])
-
     if isinstance(payload, list):
-        if payload and isinstance(payload[0], dict):
-            return [dict(x) for x in payload if isinstance(x, dict)]
-        if payload and isinstance(payload[0], list) and keys_hint:
-            return _dicts_from_matrix(payload, keys_hint)
-        return []
+        out: List[Dict[str, Any]] = []
+        for item in payload:
+            d = _model_to_dict(item)
+            if d:
+                out.append(d)
+            elif isinstance(item, Mapping):
+                out.append(dict(item))
+        return out
 
-    if not isinstance(payload, dict):
-        payload = _model_to_dict(payload)
-        if not isinstance(payload, dict):
-            return []
+    data = _safe_dict(payload)
+    for key in ("row_objects", "records", "items", "data", "results", "quotes", "rows"):
+        raw = data.get(key)
+        if isinstance(raw, list):
+            rows = _extract_rows_from_payload(raw)
+            if rows:
+                return rows
 
-    _, local_keys = _extract_headers_and_keys(payload)
-    effective_keys = list(keys_hint or local_keys or [])
-
-    for key in (
-        "row_objects",
-        "rowObjects",
-        "records",
-        "items",
-        "data",
-        "quotes",
-        "rows",
-        "recommendations",
-        "results",
-    ):
-        value = payload.get(key)
-        if isinstance(value, list):
-            if value and isinstance(value[0], dict):
-                return [dict(x) for x in value if isinstance(x, dict)]
-            if value and isinstance(value[0], list) and effective_keys:
-                return _dicts_from_matrix(value, effective_keys)
-            if not value:
-                return []
-
-    for key in ("rows_matrix", "matrix"):
-        value = payload.get(key)
-        if isinstance(value, list) and effective_keys:
-            return _dicts_from_matrix(value, effective_keys)
-
-    result = payload.get("result")
-    if isinstance(result, list):
-        if result and isinstance(result[0], dict):
-            return [dict(x) for x in result if isinstance(x, dict)]
-        if result and isinstance(result[0], list) and effective_keys:
-            return _dicts_from_matrix(result, effective_keys)
-
-    nested = payload.get("payload")
-    if isinstance(nested, dict):
-        nested_headers, nested_keys = _extract_headers_and_keys(nested)
-        return _extract_rows_candidate(nested, keys_hint=effective_keys or nested_keys or nested_headers)
-
+    matrix = data.get("rows_matrix")
+    keys = data.get("keys") or []
+    if isinstance(matrix, list) and isinstance(keys, list) and keys:
+        rows: List[Dict[str, Any]] = []
+        for row in matrix:
+            if isinstance(row, list):
+                rows.append({str(keys[i]): row[i] if i < len(row) else None for i in range(len(keys))})
+        if rows:
+            return rows
     return []
 
 
-def _canonical_selection_reason(row: Dict[str, Any]) -> Optional[str]:
-    recommendation = _s(row.get("recommendation"))
-    confidence_bucket = _s(row.get("confidence_bucket"))
-    risk_bucket = _s(row.get("risk_bucket"))
-
-    score_parts: List[str] = []
-    for label, key in (
-        ("overall", "overall_score"),
-        ("opportunity", "opportunity_score"),
-        ("value", "value_score"),
-        ("quality", "quality_score"),
-        ("momentum", "momentum_score"),
-        ("growth", "growth_score"),
-        ("valuation", "valuation_score"),
-    ):
-        val = row.get(key)
-        if isinstance(val, (int, float)):
-            score_parts.append(f"{label}={round(float(val), 2)}")
-
-    roi_parts: List[str] = []
-    for label, key in (("1M", "expected_roi_1m"), ("3M", "expected_roi_3m"), ("12M", "expected_roi_12m")):
-        val = row.get(key)
-        if isinstance(val, (int, float)):
-            roi_parts.append(f"{label} ROI={round(float(val) * 100, 2)}%")
-
-    reason_parts: List[str] = []
-    if recommendation:
-        reason_parts.append(f"Recommendation={recommendation}")
-    if confidence_bucket:
-        reason_parts.append(f"Confidence={confidence_bucket}")
-    if risk_bucket:
-        reason_parts.append(f"Risk={risk_bucket}")
-    if score_parts:
-        reason_parts.append(", ".join(score_parts[:3]))
-    if roi_parts:
-        reason_parts.append(", ".join(roi_parts[:2]))
-    return " | ".join(reason_parts) if reason_parts else None
-
-
-def _rank_rows_in_order(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for idx, row in enumerate(rows, start=1):
-        r = dict(row)
-        if not _nonempty(r.get("top10_rank")):
-            r["top10_rank"] = idx
-        if not _nonempty(r.get("rank_overall")):
-            r["rank_overall"] = idx
-        out.append(r)
-    return out
-
-
-def _apply_top10_field_backfill(rows: List[Dict[str, Any]], *, keys: List[str], criteria: Dict[str, Any]) -> List[Dict[str, Any]]:
-    criteria_snapshot = _json_compact(criteria) if criteria else None
-    out: List[Dict[str, Any]] = []
-    for idx, row in enumerate(rows, start=1):
-        r = dict(row)
-        if "top10_rank" in keys and not _nonempty(r.get("top10_rank")):
-            r["top10_rank"] = idx
-        if "selection_reason" in keys and not _nonempty(r.get("selection_reason")):
-            r["selection_reason"] = _canonical_selection_reason(r)
-        if "criteria_snapshot" in keys and not _nonempty(r.get("criteria_snapshot")) and criteria_snapshot is not None:
-            r["criteria_snapshot"] = criteria_snapshot
-        if "source_page" in keys and not _nonempty(r.get("source_page")):
-            src_page = _normalize_page_name(row.get("source_page") or row.get("page") or row.get("sheet"))
-            if src_page and src_page != TOP10_PAGE_NAME:
-                r["source_page"] = src_page
-        out.append(r)
-    return out
-
-
-def _ensure_schema_projection(rows: List[Dict[str, Any]], keys: List[str]) -> List[Dict[str, Any]]:
+def _extract_keys_from_payload(payload: Any, page: str, rows: List[Dict[str, Any]]) -> List[str]:
+    data = _safe_dict(payload)
+    keys = data.get("keys") or data.get("fields") or []
+    if isinstance(keys, list):
+        keys = [_s(x) for x in keys if _s(x)]
+    else:
+        keys = []
     if not keys:
-        return [dict(r) for r in rows if isinstance(r, dict)]
-    return [{k: row.get(k, None) for k in keys} for row in rows if isinstance(row, dict)]
-
-
-def _looks_like_fallback_only_top10(rows: List[Dict[str, Any]], meta: Mapping[str, Any]) -> bool:
-    if not rows:
-        return False
-    fallback_flag = _boolish(meta.get("fallback"), False)
-    reason = _s(meta.get("reason")).lower()
-    fallback_selection_hits = 0
-    low_signal_rows = 0
+        _, keys = _load_schema_defaults(page)
+    if page == TOP10_PAGE_NAME:
+        keys = _append_missing_keys(list(keys), TOP10_SPECIAL_FIELDS)
+    seen = set(keys)
     for row in rows:
-        selection_reason = _s(row.get("selection_reason")).lower()
-        if "fallback candidate" in selection_reason:
-            fallback_selection_hits += 1
-        informative = sum(1 for field in TOP10_BUSINESS_SIGNAL_FIELDS if _nonempty(row.get(field)))
-        if informative <= 2:
-            low_signal_rows += 1
-    mostly_fallback_selection = fallback_selection_hits >= max(1, math.ceil(len(rows) * 0.6))
-    mostly_low_signal = low_signal_rows >= max(1, math.ceil(len(rows) * 0.6))
-    if fallback_flag and (mostly_fallback_selection or mostly_low_signal):
-        return True
-    if "engine_unavailable_or_empty" in reason and mostly_low_signal:
-        return True
-    return False
+        for key in row.keys():
+            if key not in seen:
+                seen.add(key)
+                keys.append(key)
+    return keys
 
 
-def _has_usable_payload(
-    *,
-    page: str,
-    headers: List[str],
-    rows: List[Dict[str, Any]],
-    meta: Mapping[str, Any],
-    schema_only: bool,
-) -> bool:
-    if schema_only:
-        return bool(headers)
-    if page == DATA_DICTIONARY_PAGE_NAME:
-        return bool(rows) or bool(headers)
-    if not rows:
-        return False
-    if page == TOP10_PAGE_NAME and _looks_like_fallback_only_top10(rows, meta):
-        return False
-    return True
+def _extract_headers_from_payload(payload: Any, page: str, keys: List[str]) -> List[str]:
+    data = _safe_dict(payload)
+    headers = data.get("headers") or data.get("display_headers") or []
+    if isinstance(headers, list):
+        headers = [_s(x) for x in headers if _s(x)]
+    else:
+        headers = []
+    if not headers:
+        headers, _ = _load_schema_defaults(page)
+    if len(headers) < len(keys):
+        extra = [k.replace("_", " ").title() for k in keys[len(headers):]]
+        headers = list(headers) + extra
+    if page == TOP10_PAGE_NAME and len(headers) < len(keys):
+        headers = _append_missing_headers(list(headers), TOP10_SPECIAL_FIELDS)
+    return headers[: len(keys)] if len(headers) >= len(keys) else headers
 
 
-def _schema_only_payload(
-    *,
-    request_id: str,
-    target_page: str,
-    headers: List[str],
-    keys: List[str],
-    include_matrix: bool,
-    meta: Dict[str, Any],
-    status_value: str = "partial",
-) -> Dict[str, Any]:
+def _rows_to_matrix(rows: List[Dict[str, Any]], keys: List[str]) -> List[List[Any]]:
+    return [[row.get(key) for key in keys] for row in rows]
+
+
+def _normalize_row_to_keys(row: Mapping[str, Any], keys: List[str]) -> Dict[str, Any]:
+    return {key: _json_safe(row.get(key)) for key in keys}
+
+
+def _make_schema_only_response(page: str, *, include_matrix: bool, request_id: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+    headers, keys = _load_schema_defaults(page)
     rows: List[Dict[str, Any]] = []
-    rows_matrix = [] if include_matrix and keys else None
-    payload = {
-        "status": status_value,
+    matrix: Optional[List[List[Any]]] = [] if include_matrix else None
+    return jsonable_encoder(
+        {
+            "status": "success",
+            "page": page,
+            "sheet": page,
+            "sheet_name": page,
+            "route_family": _page_family(page),
+            "headers": headers,
+            "display_headers": headers,
+            "keys": keys,
+            "rows": rows,
+            "row_objects": rows,
+            "records": rows,
+            "results": rows,
+            "data": rows,
+            "items": rows,
+            "quotes": rows,
+            "rows_matrix": matrix,
+            "version": INVESTMENT_ADVISOR_VERSION,
+            "request_id": request_id,
+            "meta": meta,
+        }
+    )
+
+
+async def _call_candidate(fn: Any, *, body: Dict[str, Any], request: Request, page: str, limit: int, offset: int, schema_only: bool) -> Any:
+    if not callable(fn):
+        return None
+    kwargs_variants = [
+        {"request": request, "body": body, "page": page, "limit": limit, "offset": offset, "schema_only": schema_only},
+        {"request": request, "payload": body, "page": page, "limit": limit, "offset": offset, "schema_only": schema_only},
+        {"request": request, "page": page, "limit": limit, "offset": offset, "schema_only": schema_only, **body},
+        {"page": page, "limit": limit, "offset": offset, "schema_only": schema_only, **body},
+        {"request": request, "body": body},
+        {"payload": body},
+        body,
+        {},
+    ]
+    for kwargs in kwargs_variants:
+        try:
+            result = fn(**kwargs)
+        except TypeError:
+            continue
+        except Exception:
+            continue
+        if inspect.isawaitable(result):
+            result = await result
+        return result
+    return None
+
+
+async def _resolve_function(module_candidates: Sequence[str], function_candidates: Sequence[str]) -> Tuple[Optional[Any], str, str, List[str]]:
+    search_path: List[str] = []
+    for module_name in module_candidates:
+        search_path.append(module_name)
+        module = _import_module_safely(module_name)
+        if module is None:
+            continue
+        for fn_name in function_candidates:
+            fn = getattr(module, fn_name, None)
+            if callable(fn):
+                return fn, module_name, fn_name, search_path
+    return None, "", "", search_path
+
+
+async def _resolve_top10_builder(request: Request, engine: Optional[Any]) -> Tuple[Optional[Any], str, str, List[str]]:
+    try:
+        state = getattr(request.app, "state", None)
+        if state is not None:
+            for attr in ("top10_builder", "build_top10_rows", "select_top10", "investment_advisor_runner"):
+                candidate = getattr(state, attr, None)
+                if callable(candidate):
+                    return candidate, "app.state", attr, ["app.state"]
+    except Exception:
+        pass
+    if engine is not None:
+        for attr in TOP10_FUNCTION_CANDIDATES:
+            candidate = getattr(engine, attr, None)
+            if callable(candidate):
+                return candidate, type(engine).__name__, attr, [type(engine).__name__]
+    return await _resolve_function(TOP10_MODULE_CANDIDATES, TOP10_FUNCTION_CANDIDATES)
+
+
+async def _resolve_runner(request: Request, engine: Optional[Any]) -> Tuple[Optional[Any], str, str, List[str]]:
+    try:
+        state = getattr(request.app, "state", None)
+        if state is not None:
+            for attr in ("investment_advisor_runner", "advisor_runner", "run_investment_advisor", "run_advisor"):
+                candidate = getattr(state, attr, None)
+                if callable(candidate):
+                    return candidate, "app.state", attr, ["app.state"]
+    except Exception:
+        pass
+    if engine is not None:
+        for attr in ENGINE_METHOD_CANDIDATES:
+            candidate = getattr(engine, attr, None)
+            if callable(candidate):
+                return candidate, type(engine).__name__, attr, [type(engine).__name__]
+    return await _resolve_function(RUNNER_MODULE_CANDIDATES, RUNNER_FUNCTION_CANDIDATES)
+
+
+async def _resolve_bridge_impl(request: Request) -> Tuple[Optional[Any], str, str]:
+    try:
+        state = getattr(request.app, "state", None)
+        if state is not None:
+            for attr in BRIDGE_FUNCTION_CANDIDATES:
+                candidate = getattr(state, attr, None)
+                if callable(candidate):
+                    return candidate, "app.state", attr
+    except Exception:
+        pass
+    fn, module_name, fn_name, _ = await _resolve_function(BRIDGE_MODULE_CANDIDATES, BRIDGE_FUNCTION_CANDIDATES)
+    return fn, module_name, fn_name
+
+
+def _make_meta(*, request_id: str, page: str, status_out: str, engine: Optional[Any], top10_source: str, top10_name: str, runner_source: str, runner_name: str, bridge_source: str, bridge_name: str, stages: Dict[str, int], warnings: List[str]) -> Dict[str, Any]:
+    return jsonable_encoder(
+        {
+            "request_id": request_id,
+            "timestamp_utc": _now_utc(),
+            "version": INVESTMENT_ADVISOR_VERSION,
+            "route_owner": ROUTE_OWNER_NAME,
+            "route_family": ROUTE_FAMILY_NAME,
+            "page_family": _page_family(page),
+            "engine_present": bool(engine),
+            "engine_type": type(engine).__name__ if engine else "none",
+            "top10_builder_source": top10_source,
+            "top10_builder_name": top10_name,
+            "runner_source": runner_source,
+            "runner_name": runner_name,
+            "bridge_source": bridge_source,
+            "bridge_name": bridge_name,
+            "contract_header_count": KNOWN_CANONICAL_HEADER_COUNTS.get(page),
+            "warnings": warnings,
+            "status": status_out,
+            "stage_durations_ms": stages,
+        }
+    )
+
+
+def _advanced_get_body(*, page: Optional[str], sheet: Optional[str], sheet_name: Optional[str], name: Optional[str], tab: Optional[str], symbols: Optional[str], tickers: Optional[str], pages: Optional[str], sources: Optional[str], risk_level: Optional[str], risk_profile: Optional[str], confidence_level: Optional[str], confidence_bucket: Optional[str], investment_period_days: Optional[int], horizon_days: Optional[int], min_expected_roi: Optional[float], min_roi: Optional[float], min_confidence: Optional[float], top_n: Optional[int], limit: Optional[int], offset: Optional[int], include_matrix: Optional[bool], schema_only: Optional[bool]) -> Dict[str, Any]:
+    target_page = _normalize_page_name(page or sheet or sheet_name or name or tab or TOP10_PAGE_NAME)
+    direct_symbols = _normalize_symbol_list(symbols) or _normalize_symbol_list(tickers)
+    selected_pages = _normalize_list(pages) or _normalize_list(sources)
+    return {
         "page": target_page,
         "sheet": target_page,
         "sheet_name": target_page,
-        "route_family": _page_family(target_page),
-        "headers": headers,
-        "display_headers": headers,
-        "keys": keys,
-        "rows": rows,
-        "row_objects": rows,
-        "records": rows,
-        "results": rows,
-        "items": rows,
-        "data": rows,
-        "quotes": rows,
-        "rows_matrix": rows_matrix,
-        "version": INVESTMENT_ADVISOR_VERSION,
-        "request_id": request_id,
-        "meta": meta,
-    }
-    return payload
-
-
-def _normalize_page_payload(
-    payload: Any,
-    *,
-    target_page: str,
-    criteria_used: Dict[str, Any],
-    eff_limit: int,
-    eff_offset: int,
-    forced_dispatch: str = "",
-) -> Tuple[List[str], List[str], List[Dict[str, Any]], Dict[str, Any], str]:
-    if isinstance(payload, dict):
-        payload_dict = dict(payload)
-    elif isinstance(payload, list):
-        payload_dict = {"rows": payload}
-    else:
-        payload_dict = _model_to_dict(payload)
-
-    headers, keys = _extract_headers_and_keys(payload_dict)
-    if not headers or not keys:
-        schema_headers, schema_keys = _load_schema_defaults(target_page)
-        if not headers:
-            headers = schema_headers
-        if not keys:
-            keys = schema_keys
-
-    if _normalize_page_name(target_page) == TOP10_PAGE_NAME:
-        headers = _append_missing_headers(list(headers), TOP10_SPECIAL_FIELDS)
-        keys = _append_missing_keys(list(keys), TOP10_SPECIAL_FIELDS)
-
-    rows = _extract_rows_candidate(payload_dict, keys_hint=keys)
-    if not rows and isinstance(payload_dict.get("payload"), dict):
-        rows = _extract_rows_candidate(payload_dict.get("payload"), keys_hint=keys)
-
-    status_out = _s(payload_dict.get("status")) or ("success" if rows else "partial")
-    dict_rows = [dict(r) for r in rows if isinstance(r, dict)]
-
-    if _normalize_page_name(target_page) == TOP10_PAGE_NAME:
-        dict_rows = _apply_top10_field_backfill(dict_rows, keys=keys, criteria=criteria_used)
-        dict_rows = _rank_rows_in_order(dict_rows)
-
-    norm_rows = _ensure_schema_projection(dict_rows, keys)
-    norm_rows = _slice_rows(norm_rows, offset=eff_offset, limit=eff_limit)
-
-    meta = payload_dict.get("meta") if isinstance(payload_dict.get("meta"), dict) else {}
-    if forced_dispatch and not _s(meta.get("dispatch")):
-        meta["dispatch"] = forced_dispatch
-    meta.setdefault("route_owner", ROUTE_OWNER_NAME)
-    meta.setdefault("route_family", ROUTE_FAMILY_NAME)
-    return headers, keys, norm_rows, dict(meta), status_out
-
-
-def _flatten_criteria(body: Dict[str, Any]) -> Dict[str, Any]:
-    crit: Dict[str, Any] = {}
-    if isinstance(body.get("criteria"), dict):
-        crit.update(body["criteria"])
-    if isinstance(body.get("filters"), dict):
-        crit.update(body["filters"])
-    settings = body.get("settings")
-    if isinstance(settings, dict) and isinstance(settings.get("criteria"), dict):
-        crit.update(settings["criteria"])
-
-    for key in (
-        "page",
-        "sheet",
-        "sheet_name",
-        "name",
-        "tab",
-        "pages_selected",
-        "pages",
-        "selected_pages",
-        "source_pages",
-        "sources",
-        "direct_symbols",
-        "symbols",
-        "tickers",
-        "limit",
-        "top_n",
-        "invest_period_days",
-        "investment_period_days",
-        "horizon_days",
-        "invest_period_label",
-        "min_expected_roi",
-        "min_roi",
-        "max_risk_score",
-        "risk_level",
-        "risk_profile",
-        "min_confidence",
-        "min_ai_confidence",
-        "confidence_level",
-        "confidence_bucket",
-        "min_volume",
-        "use_liquidity_tiebreak",
-        "enforce_risk_confidence",
-        "include_positions",
-        "enrich_final",
-        "preview",
-        "schema_only",
-        "mode",
-        "include_matrix",
-        "offset",
-    ):
-        if key in body and body.get(key) is not None:
-            crit[key] = body.get(key)
-    return crit
-
-
-def _effective_limit(body: Dict[str, Any], limit_q: Optional[int]) -> int:
-    max_limit = max(1, min(200, _safe_int(os.getenv("ADV_TOP10_MAX_LIMIT"), 50)))
-    default_limit = max(1, min(max_limit, _safe_int(os.getenv("ADV_TOP10_DEFAULT_LIMIT"), 10)))
-    if isinstance(limit_q, int):
-        eff = limit_q
-    else:
-        eff = _safe_int(
-            body.get("limit") or body.get("top_n") or _safe_dict(body.get("criteria")).get("top_n") or default_limit,
-            default_limit,
-        )
-    return max(1, min(max_limit, int(eff)))
-
-
-def _prepare_effective_criteria(body: Dict[str, Any], eff_limit: int, eff_offset: int) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    crit = _flatten_criteria(body or {})
-    target_page = _normalize_page_name(
-        crit.get("page") or crit.get("sheet") or crit.get("sheet_name") or crit.get("name") or crit.get("tab") or TOP10_PAGE_NAME
-    )
-    crit["page"] = target_page
-    crit["sheet"] = target_page
-    crit["sheet_name"] = target_page
-
-    pages = _normalize_list(
-        crit.get("pages_selected") or crit.get("pages") or crit.get("selected_pages") or crit.get("source_pages") or crit.get("sources")
-    )
-    pages = _source_pages_only(pages)
-    direct_symbols = _normalize_symbol_list(crit.get("direct_symbols") or crit.get("symbols") or crit.get("tickers"))
-
-    request_unconstrained = (not pages) and (not direct_symbols) and target_page == TOP10_PAGE_NAME
-    pages_explicit = bool(pages)
-
-    if request_unconstrained:
-        default_pages = _normalize_list(os.getenv("ADV_TOP10_DEFAULT_PAGES", "Market_Leaders,Global_Markets"))
-        pages = _source_pages_only(default_pages)
-        crit["pages_selected"] = pages
-
-    max_pages = max(1, min(20, _safe_int(os.getenv("ADV_TOP10_MAX_PAGES"), 5)))
-    pages_trimmed = False
-    if pages and len(pages) > max_pages:
-        pages = pages[:max_pages]
-        crit["pages_selected"] = pages
-        pages_trimmed = True
-
-    if direct_symbols:
-        crit["direct_symbols"] = direct_symbols
-        crit["symbols"] = direct_symbols
-        crit["tickers"] = direct_symbols
-
-    risk_level = _s(crit.get("risk_level")) or _s(crit.get("risk_profile")) or "moderate"
-    crit["risk_level"] = risk_level
-    crit["risk_profile"] = risk_level
-
-    if crit.get("invest_period_days") is None:
-        if crit.get("investment_period_days") is not None:
-            crit["invest_period_days"] = crit.get("investment_period_days")
-        elif crit.get("horizon_days") is not None:
-            crit["invest_period_days"] = crit.get("horizon_days")
-        else:
-            crit["invest_period_days"] = 90
-
-    if crit.get("horizon_days") is None and crit.get("invest_period_days") is not None:
-        crit["horizon_days"] = crit.get("invest_period_days")
-
-    if crit.get("min_roi") is None and crit.get("min_expected_roi") is not None:
-        crit["min_roi"] = crit.get("min_expected_roi")
-    if crit.get("min_expected_roi") is None and crit.get("min_roi") is not None:
-        crit["min_expected_roi"] = crit.get("min_roi")
-
-    crit["top_n"] = eff_limit
-    crit["limit"] = eff_limit
-    crit["offset"] = eff_offset
-
-    if "enrich_final" not in crit:
-        if target_page == TOP10_PAGE_NAME:
-            crit["enrich_final"] = False if request_unconstrained else (len(pages) <= 2 or bool(direct_symbols))
-        else:
-            crit["enrich_final"] = True
-
-    prep_meta = {
-        "request_unconstrained": request_unconstrained,
-        "pages_explicit": pages_explicit,
-        "pages_effective": list(pages),
-        "direct_symbols_count": len(direct_symbols),
-        "pages_trimmed": pages_trimmed,
-        "allow_row_fallback": True,
-        "target_page": target_page,
-        "page_family": _page_family(target_page),
-        "effective_offset": eff_offset,
-    }
-    return crit, prep_meta
-
-
-def _narrow_criteria_for_fallback(criteria: Dict[str, Any], eff_limit: int) -> Dict[str, Any]:
-    narrowed = dict(criteria)
-    target_page = _normalize_page_name(narrowed.get("page") or TOP10_PAGE_NAME)
-    fallback_pages_cap = max(1, min(10, _safe_int(os.getenv("ADV_TOP10_FALLBACK_MAX_PAGES"), 2)))
-    fallback_top_n = max(1, min(eff_limit, _safe_int(os.getenv("ADV_TOP10_FALLBACK_TOP_N"), min(3, eff_limit))))
-
-    direct_symbols = _normalize_symbol_list(narrowed.get("direct_symbols") or narrowed.get("symbols") or narrowed.get("tickers"))
-    pages = _normalize_list(narrowed.get("pages_selected") or narrowed.get("pages") or narrowed.get("selected_pages"))
-    pages = _source_pages_only(pages)
-
-    if target_page == TOP10_PAGE_NAME:
-        if direct_symbols:
-            narrowed["direct_symbols"] = direct_symbols[: max(1, min(len(direct_symbols), eff_limit))]
-            narrowed["symbols"] = narrowed["direct_symbols"]
-            narrowed["tickers"] = narrowed["direct_symbols"]
-            narrowed["top_n"] = min(eff_limit, len(narrowed["direct_symbols"]))
-            narrowed["limit"] = narrowed["top_n"]
-        else:
-            if not pages:
-                pages = _source_pages_only(_normalize_list(os.getenv("ADV_TOP10_DEFAULT_PAGES", "Market_Leaders")))
-            pages = pages[:fallback_pages_cap]
-            narrowed["pages_selected"] = pages
-            narrowed["top_n"] = fallback_top_n
-            narrowed["limit"] = fallback_top_n
-        narrowed["enrich_final"] = False
-        narrowed["offset"] = 0
-    else:
-        narrowed["top_n"] = eff_limit
-        narrowed["limit"] = eff_limit
-        narrowed["enrich_final"] = True
-    return narrowed
-
-
-def _callable_by_names(container: Any, names: Iterable[str]) -> Optional[Tuple[Callable[..., Any], str]]:
-    for name in names:
-        try:
-            fn = getattr(container, name, None)
-        except Exception:
-            fn = None
-        if callable(fn):
-            return fn, name
-    return None
-
-
-async def _materialize_holder(holder: Any) -> Any:
-    if holder is None:
-        return None
-    try:
-        if inspect.isclass(holder):
-            return holder()
-    except Exception:
-        return None
-    if callable(holder):
-        try:
-            out = holder()
-            if inspect.isawaitable(out):
-                out = await out
-            return out
-        except TypeError:
-            return None
-        except Exception:
-            return None
-    return holder
-
-
-async def _resolve_from_container(container: Any, label: str, names: Sequence[str]) -> Optional[Tuple[Callable[..., Any], str, str]]:
-    direct = _callable_by_names(container, names)
-    if direct:
-        fn, fn_name = direct
-        return fn, label, fn_name
-
-    for holder_name in CONTAINER_NAME_CANDIDATES:
-        try:
-            holder = getattr(container, holder_name, None)
-        except Exception:
-            holder = None
-        if holder is None:
-            continue
-        obj = await _materialize_holder(holder)
-        if obj is None:
-            continue
-        direct_obj = _callable_by_names(obj, names)
-        if direct_obj:
-            fn, fn_name = direct_obj
-            return fn, label, f"{holder_name}.{fn_name}"
-    return None
-
-
-async def _resolve_callable(
-    request: Request,
-    engine: Any,
-    *,
-    modules: Sequence[str],
-    names: Sequence[str],
-) -> Tuple[Optional[Callable[..., Any]], str, str, List[str]]:
-    searched: List[str] = []
-    import_errors: List[str] = []
-
-    try:
-        st = getattr(request.app, "state", None)
-    except Exception:
-        st = None
-
-    if st is not None:
-        searched.append("app.state")
-        direct_state = _callable_by_names(st, list(names) + list(STATE_ATTR_CANDIDATES))
-        if direct_state:
-            fn, fn_name = direct_state
-            return fn, "app.state", fn_name, searched
-        resolved_state = await _resolve_from_container(st, "app.state", names)
-        if resolved_state:
-            fn, src, name = resolved_state
-            return fn, src, name, searched
-
-    for mod_name in modules:
-        searched.append(mod_name)
-        try:
-            mod = import_module(mod_name)
-        except Exception as exc:
-            import_errors.append(f"{mod_name}: {type(exc).__name__}: {exc}")
-            continue
-        resolved = await _resolve_from_container(mod, mod_name, names)
-        if resolved:
-            fn, src, name = resolved
-            return fn, src, name, searched
-
-    if engine is not None:
-        searched.append("engine")
-        direct_engine = _callable_by_names(engine, list(names) + list(ENGINE_METHOD_CANDIDATES))
-        if direct_engine:
-            fn, fn_name = direct_engine
-            return fn, "engine", fn_name, searched
-
-    if import_errors:
-        logger.warning("Advanced callable import errors: %s", import_errors)
-    return None, "", "", searched
-
-
-async def _call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-    if inspect.iscoroutinefunction(fn):
-        return await fn(*args, **kwargs)
-    out = await asyncio.to_thread(fn, *args, **kwargs)
-    if inspect.isawaitable(out):
-        return await out
-    return out
-
-
-async def _call_runner_with_tolerance(
-    runner: Callable[..., Any],
-    *,
-    request: Request,
-    engine: Any,
-    criteria: Dict[str, Any],
-    eff_limit: int,
-    eff_offset: int,
-    mode: str,
-    settings: Any,
-    include_matrix: bool,
-    schema_only: bool,
-) -> Any:
-    page = _normalize_page_name(criteria.get("page") or criteria.get("sheet") or criteria.get("sheet_name") or TOP10_PAGE_NAME)
-    body_payload = {
-        "page": page,
-        "sheet": page,
-        "sheet_name": page,
-        "criteria": criteria,
-        "top_n": eff_limit,
-        "limit": eff_limit,
-        "offset": eff_offset,
-        "mode": mode or "",
+        "direct_symbols": direct_symbols,
+        "symbols": direct_symbols,
+        "tickers": direct_symbols,
+        "pages_selected": selected_pages,
+        "source_pages": _source_pages_only(selected_pages),
+        "risk_level": _s(risk_level) or _s(risk_profile),
+        "risk_profile": _s(risk_profile) or _s(risk_level),
+        "confidence_level": _s(confidence_level),
+        "confidence_bucket": _s(confidence_bucket),
+        "investment_period_days": investment_period_days,
+        "horizon_days": horizon_days,
+        "min_expected_roi": min_expected_roi,
+        "min_roi": min_roi if min_roi is not None else min_expected_roi,
+        "min_confidence": min_confidence,
+        "top_n": top_n if top_n is not None else limit,
+        "limit": limit if limit is not None else top_n,
+        "offset": offset,
         "include_matrix": include_matrix,
         "schema_only": schema_only,
     }
 
-    attempts = [
-        {
-            "engine": engine,
-            "criteria": criteria,
-            "limit": eff_limit,
-            "offset": eff_offset,
-            "mode": mode or "",
-            "request": request,
-            "settings": settings,
-            "page": page,
-            "sheet": page,
-            "sheet_name": page,
-            "include_matrix": include_matrix,
-            "schema_only": schema_only,
-        },
-        {
-            "engine": engine,
-            "criteria": criteria,
-            "limit": eff_limit,
-            "offset": eff_offset,
-            "mode": mode or "",
-            "settings": settings,
-            "page": page,
-            "sheet": page,
-            "sheet_name": page,
-        },
-        {
-            "engine": engine,
-            "body": body_payload,
-            "limit": eff_limit,
-            "offset": eff_offset,
-            "mode": mode or "",
-            "request": request,
-            "settings": settings,
-        },
-        {"engine": engine, "body": body_payload, "limit": eff_limit, "offset": eff_offset, "mode": mode or ""},
-        {"engine": engine, "payload": body_payload, "limit": eff_limit, "offset": eff_offset, "mode": mode or ""},
-        {"request": request, "body": body_payload, "engine": engine},
-        {"criteria": criteria, "engine": engine},
-        {"body": body_payload},
-        {"payload": body_payload},
-        {"criteria": criteria},
-        {"page": page, "limit": eff_limit, "offset": eff_offset},
-        {"page": page},
+
+def _advanced_root_has_request_filters(*, page: Optional[str], sheet: Optional[str], sheet_name: Optional[str], name: Optional[str], tab: Optional[str], symbols: Optional[str], tickers: Optional[str], pages: Optional[str], sources: Optional[str], risk_level: Optional[str], risk_profile: Optional[str], confidence_level: Optional[str], confidence_bucket: Optional[str], investment_period_days: Optional[int], horizon_days: Optional[int], min_expected_roi: Optional[float], min_roi: Optional[float], min_confidence: Optional[float], top_n: Optional[int], limit: Optional[int], offset: Optional[int], mode: str, include_matrix: Optional[bool], schema_only: Optional[bool]) -> bool:
+    values = [
+        page, sheet, sheet_name, name, tab, symbols, tickers, pages, sources,
+        risk_level, risk_profile, confidence_level, confidence_bucket,
+        investment_period_days, horizon_days, min_expected_roi, min_roi,
+        min_confidence, top_n, limit, offset, mode, include_matrix, schema_only,
     ]
-
-    for kwargs in attempts:
-        try:
-            return await _call_maybe_async(runner, **kwargs)
-        except TypeError:
+    for value in values:
+        if value is None:
             continue
-
-    positional_attempts = [
-        (engine, criteria, eff_limit),
-        (criteria, engine, eff_limit),
-        (criteria, engine),
-        (engine, criteria),
-        (criteria,),
-        (body_payload,),
-        (page,),
-    ]
-    last_error: Optional[Exception] = None
-    for args in positional_attempts:
-        try:
-            return await _call_maybe_async(runner, *args)
-        except TypeError as exc:
-            last_error = exc
+        if isinstance(value, str) and not value.strip():
             continue
-    if last_error is not None:
-        raise last_error
-    raise RuntimeError("No compatible runner signature matched")
+        return True
+    return False
 
 
-async def _call_bridge_with_tolerance(
-    impl: Callable[..., Any],
-    *,
-    request: Request,
-    body: Dict[str, Any],
-    mode: str,
-    include_matrix: bool,
-    token: Optional[str],
-    x_app_token: Optional[str],
-    authorization: Optional[str],
-    x_request_id: Optional[str],
-) -> Any:
-    page = _normalize_page_name(body.get("page") or body.get("sheet") or body.get("sheet_name") or TOP10_PAGE_NAME)
-    symbols = body.get("symbols") or body.get("direct_symbols") or body.get("tickers")
-    attempts = [
+async def _advanced_root_summary(request: Request) -> Dict[str, Any]:
+    engine = await _get_engine(request)
+    top10_builder, top10_builder_source, top10_builder_name, top10_builder_search_path = await _resolve_top10_builder(request, engine)
+    runner, runner_source, runner_name, runner_search_path = await _resolve_runner(request, engine)
+    bridge_impl, bridge_source, bridge_name = await _resolve_bridge_impl(request)
+    return jsonable_encoder(
         {
-            "request": request,
-            "body": body,
-            "mode": mode or "",
-            "include_matrix_q": include_matrix,
-            "token": token,
-            "x_app_token": x_app_token,
-            "authorization": authorization,
-            "x_request_id": x_request_id,
-        },
-        {
-            "request": request,
-            "body": body,
-            "payload": body,
-            "mode": mode or "",
-            "include_matrix_q": include_matrix,
-            "token": token,
-            "x_app_token": x_app_token,
-            "authorization": authorization,
-            "x_request_id": x_request_id,
-        },
-        {
-            "request": request,
-            "body": body,
-            "payload": body,
-            "mode": mode or "",
-            "include_matrix_q": include_matrix,
-            "page": page,
-            "sheet": page,
-            "sheet_name": page,
-            "symbols": symbols,
-            "tickers": symbols,
-            "top_n": body.get("top_n"),
-            "limit": body.get("limit"),
-            "offset": body.get("offset"),
-        },
-        {
-            "request": request,
-            "body": body,
-            "page": page,
-            "sheet": page,
-            "sheet_name": page,
-            "symbols": symbols,
-            "tickers": symbols,
-            "limit": body.get("limit"),
-            "offset": body.get("offset"),
-            "mode": mode or "",
-        },
-        {"request": request, "body": body},
-        {"body": body},
-        {"payload": body},
-    ]
-    for kwargs in attempts:
-        try:
-            return await _call_maybe_async(impl, **kwargs)
-        except TypeError:
-            continue
-
-    positional_attempts = [
-        (request, body, mode or "", include_matrix, token, x_app_token, authorization, x_request_id),
-        (request, body, mode or "", include_matrix, token, x_app_token, authorization),
-        (request, body, mode or "", include_matrix),
-        (request, body),
-        (body,),
-    ]
-    last_error: Optional[Exception] = None
-    for args in positional_attempts:
-        try:
-            return await _call_maybe_async(impl, *args)
-        except TypeError as exc:
-            last_error = exc
-            continue
-    if last_error is not None:
-        raise last_error
-    raise RuntimeError("No compatible bridge signature matched")
-
-
-async def _run_callable_with_timeout(
-    *,
-    runner: Callable[..., Any],
-    request: Request,
-    engine: Any,
-    criteria: Dict[str, Any],
-    eff_limit: int,
-    eff_offset: int,
-    mode: str,
-    timeout_sec: float,
-    settings: Any,
-    include_matrix: bool,
-    schema_only: bool,
-) -> Any:
-    coro = _call_runner_with_tolerance(
-        runner,
-        request=request,
-        engine=engine,
-        criteria=criteria,
-        eff_limit=eff_limit,
-        eff_offset=eff_offset,
-        mode=mode,
-        settings=settings,
-        include_matrix=include_matrix,
-        schema_only=schema_only,
-    )
-    return await asyncio.wait_for(coro, timeout=timeout_sec)
-
-
-async def _resolve_top10_builder(request: Request, engine: Any) -> Tuple[Optional[Callable[..., Any]], str, str, List[str]]:
-    return await _resolve_callable(request, engine, modules=TOP10_MODULE_CANDIDATES, names=TOP10_FUNCTION_CANDIDATES)
-
-
-async def _resolve_runner(request: Request, engine: Any) -> Tuple[Optional[Callable[..., Any]], str, str, List[str]]:
-    return await _resolve_callable(request, engine, modules=RUNNER_MODULE_CANDIDATES, names=RUNNER_FUNCTION_CANDIDATES)
-
-
-async def _resolve_bridge_impl(request: Request) -> Tuple[Optional[Callable[..., Any]], str, str]:
-    try:
-        st = getattr(request.app, "state", None)
-    except Exception:
-        st = None
-
-    if st is not None:
-        for name in BRIDGE_FUNCTION_CANDIDATES:
-            candidate = getattr(st, name, None)
-            if callable(candidate):
-                return candidate, "app.state", name
-
-    for mod_name in BRIDGE_MODULE_CANDIDATES:
-        mod = _import_module_safely(mod_name)
-        if mod is None:
-            continue
-        for name in BRIDGE_FUNCTION_CANDIDATES:
-            candidate = getattr(mod, name, None)
-            if callable(candidate):
-                return candidate, mod_name, name
-    return None, "", ""
-
-
-async def _delegate_to_bridge_sheet_rows(
-    *,
-    request: Request,
-    body: Dict[str, Any],
-    mode: str,
-    include_matrix: bool,
-    token: Optional[str],
-    x_app_token: Optional[str],
-    authorization: Optional[str],
-    x_request_id: Optional[str],
-) -> Optional[Dict[str, Any]]:
-    impl, src, name = await _resolve_bridge_impl(request)
-    if impl is None:
-        return None
-    try:
-        out = await asyncio.wait_for(
-            _call_bridge_with_tolerance(
-                impl,
-                request=request,
-                body=body,
-                mode=mode,
-                include_matrix=include_matrix,
-                token=token,
-                x_app_token=x_app_token,
-                authorization=authorization,
-                x_request_id=x_request_id,
-            ),
-            timeout=_resolver_timeout("bridge", page=_normalize_page_name(body.get("page"))),
-        )
-        payload = dict(out) if isinstance(out, dict) else _model_to_dict(out)
-        meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
-        meta.setdefault("dispatch", "advanced_bridge")
-        meta.setdefault("bridge_source", src)
-        meta.setdefault("bridge_name", name)
-        meta.setdefault("route_owner", ROUTE_OWNER_NAME)
-        payload["meta"] = meta
-        return payload
-    except Exception as exc:
-        logger.warning("Advanced bridge failed. source=%s name=%s error=%s", src, name, exc, exc_info=True)
-        return None
-
-
-async def _try_engine_page_fallback(
-    *,
-    engine: Any,
-    criteria: Dict[str, Any],
-    eff_limit: int,
-    eff_offset: int,
-    mode: str,
-    include_matrix: bool,
-    schema_only: bool,
-) -> Optional[Dict[str, Any]]:
-    if engine is None:
-        return None
-
-    page = _normalize_page_name(criteria.get("page") or criteria.get("sheet") or criteria.get("sheet_name") or TOP10_PAGE_NAME)
-    query_symbols = _normalize_symbol_list(criteria.get("direct_symbols") or criteria.get("symbols") or criteria.get("tickers"))
-    family = _page_family(page)
-
-    call_plans: List[Tuple[str, Dict[str, Any]]] = []
-    if family == "top10":
-        call_plans.extend(
-            [
-                ("build_top10_rows", {"criteria": criteria, "limit": eff_limit, "offset": eff_offset, "mode": mode or ""}),
-                ("build_top10_output_rows", {"criteria": criteria, "limit": eff_limit, "offset": eff_offset, "mode": mode or ""}),
-                ("build_top10_investments_rows", {"criteria": criteria, "limit": eff_limit, "offset": eff_offset, "mode": mode or ""}),
-                ("select_top10", {"criteria": criteria, "limit": eff_limit, "offset": eff_offset, "mode": mode or ""}),
-                ("select_top10_symbols", {"criteria": criteria, "limit": eff_limit, "offset": eff_offset, "mode": mode or ""}),
-            ]
-        )
-
-    call_plans.extend(
-        [
-            (
-                "run_investment_advisor_engine",
-                {
-                    "criteria": criteria,
-                    "page": page,
-                    "sheet": page,
-                    "sheet_name": page,
-                    "limit": eff_limit,
-                    "offset": eff_offset,
-                    "mode": mode or "",
-                },
-            ),
-            (
-                "run_investment_advisor",
-                {
-                    "criteria": criteria,
-                    "page": page,
-                    "sheet": page,
-                    "sheet_name": page,
-                    "limit": eff_limit,
-                    "offset": eff_offset,
-                    "mode": mode or "",
-                },
-            ),
-            (
-                "run_advisor",
-                {
-                    "criteria": criteria,
-                    "page": page,
-                    "sheet": page,
-                    "sheet_name": page,
-                    "limit": eff_limit,
-                    "offset": eff_offset,
-                    "mode": mode or "",
-                },
-            ),
-            (
-                "get_sheet_rows",
-                {
-                    "page": page,
-                    "sheet": page,
-                    "sheet_name": page,
-                    "limit": eff_limit,
-                    "offset": eff_offset,
-                    "mode": mode or "",
-                    "tickers": query_symbols,
-                    "symbols": query_symbols,
-                    "include_matrix": include_matrix,
-                    "schema_only": schema_only,
-                },
-            ),
-            (
-                "get_page_rows",
-                {
-                    "page": page,
-                    "sheet": page,
-                    "sheet_name": page,
-                    "limit": eff_limit,
-                    "offset": eff_offset,
-                    "mode": mode or "",
-                    "tickers": query_symbols,
-                    "symbols": query_symbols,
-                    "include_matrix": include_matrix,
-                    "schema_only": schema_only,
-                },
-            ),
-            (
-                "sheet_rows",
-                {
-                    "page": page,
-                    "sheet": page,
-                    "sheet_name": page,
-                    "limit": eff_limit,
-                    "offset": eff_offset,
-                    "mode": mode or "",
-                    "tickers": query_symbols,
-                    "symbols": query_symbols,
-                    "include_matrix": include_matrix,
-                    "schema_only": schema_only,
-                },
-            ),
-        ]
+            "status": "success" if engine else "degraded",
+            "service": "advanced_investment_advisor",
+            "version": INVESTMENT_ADVISOR_VERSION,
+            "route_owner": ROUTE_OWNER_NAME,
+            "route_family": ROUTE_FAMILY_NAME,
+            "root_path": "/v1/advanced",
+            "engine_present": bool(engine),
+            "engine_type": type(engine).__name__ if engine else "none",
+            "top10_builder_available": bool(top10_builder),
+            "top10_builder_source": top10_builder_source,
+            "top10_builder_name": top10_builder_name,
+            "top10_builder_search_path": top10_builder_search_path,
+            "runner_available": bool(runner),
+            "runner_source": runner_source,
+            "runner_name": runner_name,
+            "runner_search_path": runner_search_path,
+            "bridge_available": bool(bridge_impl),
+            "bridge_source": bridge_source,
+            "bridge_name": bridge_name,
+            "contract_header_counts": dict(KNOWN_CANONICAL_HEADER_COUNTS),
+            "supported_aliases": [
+                "/v1/advanced",
+                "/v1/advanced/sheet-rows",
+                "/v1/advanced/recommendations",
+                "/v1/advanced/top10",
+                "/v1/advanced/top10-investments",
+                "/v1/advanced/investment-advisor",
+                "/v1/advanced/advisor",
+                "/v1/advanced/run",
+                "/v1/advanced/health",
+                "/v1/advanced/meta",
+                "/v1/advanced/metrics",
+            ],
+            "timestamp_utc": _now_utc(),
+        }
     )
 
-    for method_name, kwargs in call_plans:
-        fn = getattr(engine, method_name, None)
-        if not callable(fn):
-            continue
-        try:
-            out = await asyncio.wait_for(_call_maybe_async(fn, **kwargs), timeout=_resolver_timeout("engine", page=page))
-        except TypeError:
-            try:
-                out = await asyncio.wait_for(_call_maybe_async(fn, page), timeout=_resolver_timeout("engine", page=page))
-            except Exception:
-                continue
-        except Exception:
-            continue
 
-        payload = dict(out) if isinstance(out, dict) else _model_to_dict(out)
-        if not payload:
-            continue
-        rows = _extract_rows_candidate(payload)
-        if not payload.get("status") and rows:
-            payload["status"] = "success"
-        meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
-        meta.setdefault("dispatch", f"engine.{method_name}")
-        meta.setdefault("route_owner", ROUTE_OWNER_NAME)
-        payload["meta"] = meta
-        return payload
-    return None
-
-
-async def _execute_advanced_request(
-    *,
-    request: Request,
-    body: Dict[str, Any],
-    mode: str,
-    include_matrix: Optional[bool],
-    limit: Optional[int],
-    offset: Optional[int],
-    schema_only: Optional[bool],
-    x_request_id: Optional[str],
-    token: Optional[str],
-    x_app_token: Optional[str],
-    authorization: Optional[str],
-) -> Dict[str, Any]:
-    t0 = time.perf_counter()
-    stages: Dict[str, float] = {}
+async def _execute_advanced_request(*, request: Request, body: Dict[str, Any], mode: str, include_matrix: Optional[bool], limit: Optional[int], offset: Optional[int], schema_only: Optional[bool], x_request_id: Optional[str], token: Optional[str], x_app_token: Optional[str], authorization: Optional[str]) -> Dict[str, Any]:
+    del token, x_app_token, authorization  # already checked before entering
+    started = time.perf_counter()
     request_id = _request_id(request, x_request_id)
+    target_page = _normalize_page_name(body.get("page") or body.get("sheet") or body.get("sheet_name") or TOP10_PAGE_NAME)
+    body["page"] = target_page
+    body["sheet"] = target_page
+    body["sheet_name"] = target_page
 
-    include_matrix_final = include_matrix if isinstance(include_matrix, bool) else _boolish(body.get("include_matrix"), True)
-    schema_only_final = schema_only if isinstance(schema_only, bool) else _boolish(body.get("schema_only"), False)
-    eff_limit = _effective_limit(body or {}, limit)
-    eff_offset = max(0, int(offset if isinstance(offset, int) else _safe_int(body.get("offset"), 0)))
+    include_matrix_final = _boolish(include_matrix if include_matrix is not None else body.get("include_matrix"), False)
+    schema_only_final = _boolish(schema_only if schema_only is not None else body.get("schema_only"), False)
+    limit_final = _safe_int(limit if limit is not None else body.get("limit") or body.get("top_n"), 20)
+    offset_final = _safe_int(offset if offset is not None else body.get("offset"), 0)
+    body["limit"] = limit_final
+    body["top_n"] = limit_final
+    body["offset"] = offset_final
+    body["mode"] = _s(mode) or _s(body.get("mode"))
 
-    s0 = time.perf_counter()
-    effective_criteria, prep_meta = _prepare_effective_criteria(body or {}, eff_limit, eff_offset)
-    if not _s(mode) and _s(effective_criteria.get("mode")):
-        mode = _s(effective_criteria.get("mode"))
-    target_page = _normalize_page_name(prep_meta.get("target_page") or TOP10_PAGE_NAME)
-    page_family = _page_family(target_page)
-    stages["criteria_prepare_ms"] = round((time.perf_counter() - s0) * 1000.0, 3)
-
-    schema_headers, schema_keys = _load_schema_defaults(target_page)
+    warnings: List[str] = []
+    stages: Dict[str, int] = {}
+    engine = await _get_engine(request)
 
     if schema_only_final:
-        meta = {
-            "route_version": INVESTMENT_ADVISOR_VERSION,
-            "route_owner": ROUTE_OWNER_NAME,
-            "route_family": ROUTE_FAMILY_NAME,
-            "request_id": request_id,
-            "limit": eff_limit,
-            "offset": eff_offset,
-            "mode": mode or "",
-            "schema_aligned": bool(schema_keys),
-            "schema_columns": len(schema_keys),
-            "build_status": "SCHEMA_ONLY",
-            "dispatch": "advanced_request",
-            "page_family": page_family,
-            "stage_durations_ms": stages,
-            "duration_ms": round((time.perf_counter() - t0) * 1000.0, 3),
-        }
-        return jsonable_encoder(
-            _schema_only_payload(
-                request_id=request_id,
-                target_page=target_page,
-                headers=schema_headers,
-                keys=schema_keys,
-                include_matrix=include_matrix_final,
-                meta=meta,
-            )
+        meta = _make_meta(
+            request_id=request_id,
+            page=target_page,
+            status_out="success",
+            engine=engine,
+            top10_source="",
+            top10_name="",
+            runner_source="",
+            runner_name="",
+            bridge_source="",
+            bridge_name="",
+            stages={"total": int((time.perf_counter() - started) * 1000)},
+            warnings=warnings,
         )
+        return _make_schema_only_response(target_page, include_matrix=include_matrix_final, request_id=request_id, meta=meta)
 
-    s1 = time.perf_counter()
-    engine = await _get_engine(request)
-    stages["engine_ms"] = round((time.perf_counter() - s1) * 1000.0, 3)
+    page_family = _page_family(target_page)
+    payload: Any = None
 
-    if engine is None:
-        meta = {
-            "route_version": INVESTMENT_ADVISOR_VERSION,
-            "route_owner": ROUTE_OWNER_NAME,
-            "route_family": ROUTE_FAMILY_NAME,
-            "request_id": request_id,
-            "limit": eff_limit,
-            "offset": eff_offset,
-            "mode": mode or "",
-            "schema_aligned": bool(schema_keys),
-            "schema_columns": len(schema_keys),
-            "build_status": "DEGRADED",
-            "dispatch": "advanced_request",
-            "warning": "engine_unavailable",
-            "page_family": page_family,
-            "stage_durations_ms": stages,
-            "duration_ms": round((time.perf_counter() - t0) * 1000.0, 3),
-        }
-        return jsonable_encoder(
-            _schema_only_payload(
-                request_id=request_id,
-                target_page=target_page,
-                headers=schema_headers,
-                keys=schema_keys,
-                include_matrix=include_matrix_final,
-                meta=meta,
-            )
-        )
+    stage_start = time.perf_counter()
+    top10_builder, top10_source, top10_name, _ = await _resolve_top10_builder(request, engine)
+    stages["resolve_builder"] = int((time.perf_counter() - stage_start) * 1000)
 
-    s2 = time.perf_counter()
-    try:
-        settings = get_settings_cached()
-    except Exception:
-        settings = None
-    stages["settings_ms"] = round((time.perf_counter() - s2) * 1000.0, 3)
+    stage_start = time.perf_counter()
+    runner, runner_source, runner_name, _ = await _resolve_runner(request, engine)
+    stages["resolve_runner"] = int((time.perf_counter() - stage_start) * 1000)
 
-    s3 = time.perf_counter()
-    top10_builder, top10_builder_source, top10_builder_name, top10_builder_search_path = await _resolve_top10_builder(request, engine)
-    stages["top10_builder_resolve_ms"] = round((time.perf_counter() - s3) * 1000.0, 3)
+    stage_start = time.perf_counter()
+    bridge_impl, bridge_source, bridge_name = await _resolve_bridge_impl(request)
+    stages["resolve_bridge"] = int((time.perf_counter() - stage_start) * 1000)
 
-    s4 = time.perf_counter()
-    runner, runner_source, runner_name, runner_search_path = await _resolve_runner(request, engine)
-    stages["runner_resolve_ms"] = round((time.perf_counter() - s4) * 1000.0, 3)
-
-    selected_payload: Optional[Dict[str, Any]] = None
-    selected_criteria = dict(effective_criteria)
-    selected_source = ""
-    fallback_used = False
-    fallback_reason = ""
-    warnings: List[str] = []
-
-    async def _try_callable(
-        *,
-        fn: Optional[Callable[..., Any]],
-        source: str,
-        criteria_obj: Dict[str, Any],
-        stage_name: str,
-    ) -> bool:
-        nonlocal selected_payload, selected_source, fallback_used, fallback_reason, warnings
-        if fn is None:
-            return False
-        started = time.perf_counter()
+    async def _run_with_timeout(label: str, coro: Any, timeout_sec: float) -> Any:
         try:
-            payload = await _run_callable_with_timeout(
-                runner=fn,
-                request=request,
-                engine=engine,
-                criteria=criteria_obj,
-                eff_limit=min(eff_limit, _safe_int(criteria_obj.get("top_n"), eff_limit)),
-                eff_offset=_safe_int(criteria_obj.get("offset"), eff_offset),
-                mode=mode or "",
-                timeout_sec=_resolver_timeout(stage_name, page=target_page),
-                settings=settings,
-                include_matrix=include_matrix_final,
-                schema_only=schema_only_final,
-            )
-        except asyncio.TimeoutError:
-            fallback_used = True
-            fallback_reason = (fallback_reason + "; " if fallback_reason else "") + f"{stage_name}_timeout"
-            warnings.append(f"{stage_name}_timeout")
-            stages[f"{stage_name}_call_ms"] = round((time.perf_counter() - started) * 1000.0, 3)
-            return False
+            return await asyncio.wait_for(coro, timeout=timeout_sec)
         except Exception as exc:
-            fallback_used = True
-            fallback_reason = (fallback_reason + "; " if fallback_reason else "") + f"{stage_name}_error:{type(exc).__name__}"
-            warnings.append(f"{stage_name}_error:{type(exc).__name__}")
-            stages[f"{stage_name}_call_ms"] = round((time.perf_counter() - started) * 1000.0, 3)
-            return False
+            warnings.append(f"{label}: {exc.__class__.__name__}")
+            return None
 
-        stages[f"{stage_name}_call_ms"] = round((time.perf_counter() - started) * 1000.0, 3)
-        headers, keys, norm_rows, meta_in, status_out = _normalize_page_payload(
-            payload,
-            target_page=target_page,
-            criteria_used=criteria_obj,
-            eff_limit=eff_limit,
-            eff_offset=eff_offset,
-            forced_dispatch="advanced_request",
+    if page_family == "top10" and top10_builder is not None:
+        stage_start = time.perf_counter()
+        payload = await _run_with_timeout(
+            "builder",
+            _call_candidate(top10_builder, body=body, request=request, page=target_page, limit=limit_final, offset=offset_final, schema_only=schema_only_final),
+            _resolver_timeout("builder", page=target_page),
         )
-        if not _has_usable_payload(page=target_page, headers=headers, rows=norm_rows, meta=meta_in, schema_only=schema_only_final):
-            fallback_used = True
-            fallback_reason = (fallback_reason + "; " if fallback_reason else "") + f"{stage_name}_weak_or_empty"
-            warnings.append(f"{stage_name}_weak_or_empty")
-            return False
-        selected_payload = {"status": status_out, "headers": headers, "keys": keys, "rows": norm_rows, "meta": meta_in}
-        selected_source = source
-        return True
+        stages["builder"] = int((time.perf_counter() - stage_start) * 1000)
 
-    def _body_for_bridge(criteria_obj: Dict[str, Any]) -> Dict[str, Any]:
-        return {
-            "page": target_page,
-            "sheet": target_page,
-            "sheet_name": target_page,
-            "criteria": criteria_obj,
-            "symbols": criteria_obj.get("symbols") or criteria_obj.get("direct_symbols"),
-            "tickers": criteria_obj.get("tickers") or criteria_obj.get("direct_symbols"),
-            "top_n": eff_limit,
-            "limit": eff_limit,
-            "offset": eff_offset,
-            "mode": mode or "",
-            "include_matrix": include_matrix_final,
-            "schema_only": schema_only_final,
-        }
-
-    if target_page == TOP10_PAGE_NAME:
-        if await _try_callable(fn=top10_builder, source=top10_builder_source or "top10_builder", criteria_obj=effective_criteria, stage_name="builder"):
-            pass
-        elif await _try_callable(fn=runner, source=runner_source or "runner", criteria_obj=effective_criteria, stage_name="runner"):
-            pass
-        else:
-            bridge_payload = await _delegate_to_bridge_sheet_rows(
-                request=request,
-                body=_body_for_bridge(effective_criteria),
-                mode=mode or "",
-                include_matrix=include_matrix_final,
-                token=token,
-                x_app_token=x_app_token,
-                authorization=authorization,
-                x_request_id=x_request_id,
-            )
-            if bridge_payload is not None:
-                headers, keys, norm_rows, meta_in, status_out = _normalize_page_payload(
-                    bridge_payload,
-                    target_page=target_page,
-                    criteria_used=effective_criteria,
-                    eff_limit=eff_limit,
-                    eff_offset=eff_offset,
-                    forced_dispatch="advanced_bridge",
-                )
-                if _has_usable_payload(page=target_page, headers=headers, rows=norm_rows, meta=meta_in, schema_only=schema_only_final):
-                    selected_payload = {"status": status_out, "headers": headers, "keys": keys, "rows": norm_rows, "meta": meta_in}
-                    selected_source = "bridge"
-                else:
-                    fallback_used = True
-                    fallback_reason = (fallback_reason + "; " if fallback_reason else "") + "bridge_weak_or_empty"
-                    warnings.append("bridge_weak_or_empty")
-
-            if selected_payload is None:
-                narrowed_criteria = _narrow_criteria_for_fallback(effective_criteria, eff_limit)
-                engine_payload = await _try_engine_page_fallback(
-                    engine=engine,
-                    criteria=narrowed_criteria,
-                    eff_limit=min(eff_limit, _safe_int(narrowed_criteria.get("top_n"), eff_limit)),
-                    eff_offset=_safe_int(narrowed_criteria.get("offset"), 0),
-                    mode=mode or "",
-                    include_matrix=include_matrix_final,
-                    schema_only=schema_only_final,
-                )
-                if engine_payload is not None:
-                    headers, keys, norm_rows, meta_in, status_out = _normalize_page_payload(
-                        engine_payload,
-                        target_page=target_page,
-                        criteria_used=narrowed_criteria,
-                        eff_limit=eff_limit,
-                        eff_offset=eff_offset,
-                        forced_dispatch="advanced_engine_fallback",
-                    )
-                    if _has_usable_payload(page=target_page, headers=headers, rows=norm_rows, meta=meta_in, schema_only=schema_only_final):
-                        selected_payload = {"status": status_out, "headers": headers, "keys": keys, "rows": norm_rows, "meta": meta_in}
-                        selected_criteria = narrowed_criteria
-                        selected_source = "engine_fallback"
-                        warnings.append("engine_page_fallback_used")
-                        fallback_used = True
-                    else:
-                        fallback_used = True
-                        fallback_reason = (fallback_reason + "; " if fallback_reason else "") + "engine_fallback_weak_or_empty"
-                        warnings.append("engine_fallback_weak_or_empty")
-
-    elif target_page == INSIGHTS_PAGE_NAME:
-        bridge_payload = await _delegate_to_bridge_sheet_rows(
-            request=request,
-            body=_body_for_bridge(effective_criteria),
-            mode=mode or "",
-            include_matrix=include_matrix_final,
-            token=token,
-            x_app_token=x_app_token,
-            authorization=authorization,
-            x_request_id=x_request_id,
+    if payload is None and runner is not None:
+        stage_start = time.perf_counter()
+        payload = await _run_with_timeout(
+            "runner",
+            _call_candidate(runner, body=body, request=request, page=target_page, limit=limit_final, offset=offset_final, schema_only=schema_only_final),
+            _resolver_timeout("runner", page=target_page),
         )
-        if bridge_payload is not None:
-            headers, keys, norm_rows, meta_in, status_out = _normalize_page_payload(
-                bridge_payload,
-                target_page=target_page,
-                criteria_used=effective_criteria,
-                eff_limit=eff_limit,
-                eff_offset=eff_offset,
-                forced_dispatch="advanced_bridge",
-            )
-            if _has_usable_payload(page=target_page, headers=headers, rows=norm_rows, meta=meta_in, schema_only=schema_only_final):
-                selected_payload = {"status": status_out, "headers": headers, "keys": keys, "rows": norm_rows, "meta": meta_in}
-                selected_source = "bridge"
+        stages["runner"] = int((time.perf_counter() - stage_start) * 1000)
 
-        if selected_payload is None:
-            if not await _try_callable(fn=runner, source=runner_source or "runner", criteria_obj=effective_criteria, stage_name="runner"):
-                engine_payload = await _try_engine_page_fallback(
-                    engine=engine,
-                    criteria=effective_criteria,
-                    eff_limit=eff_limit,
-                    eff_offset=eff_offset,
-                    mode=mode or "",
-                    include_matrix=include_matrix_final,
-                    schema_only=schema_only_final,
-                )
-                if engine_payload is not None:
-                    headers, keys, norm_rows, meta_in, status_out = _normalize_page_payload(
-                        engine_payload,
-                        target_page=target_page,
-                        criteria_used=effective_criteria,
-                        eff_limit=eff_limit,
-                        eff_offset=eff_offset,
-                        forced_dispatch="advanced_engine_fallback",
-                    )
-                    if _has_usable_payload(page=target_page, headers=headers, rows=norm_rows, meta=meta_in, schema_only=schema_only_final):
-                        selected_payload = {"status": status_out, "headers": headers, "keys": keys, "rows": norm_rows, "meta": meta_in}
-                        selected_source = "engine_fallback"
-
-    elif target_page == DATA_DICTIONARY_PAGE_NAME or target_page in _SOURCE_PAGES_SET:
-        bridge_payload = await _delegate_to_bridge_sheet_rows(
-            request=request,
-            body=_body_for_bridge(effective_criteria),
-            mode=mode or "",
-            include_matrix=include_matrix_final,
-            token=token,
-            x_app_token=x_app_token,
-            authorization=authorization,
-            x_request_id=x_request_id,
+    if payload is None and bridge_impl is not None:
+        stage_start = time.perf_counter()
+        payload = await _run_with_timeout(
+            "bridge",
+            _call_candidate(bridge_impl, body=body, request=request, page=target_page, limit=limit_final, offset=offset_final, schema_only=schema_only_final),
+            _resolver_timeout("bridge", page=target_page),
         )
-        if bridge_payload is not None:
-            headers, keys, norm_rows, meta_in, status_out = _normalize_page_payload(
-                bridge_payload,
-                target_page=target_page,
-                criteria_used=effective_criteria,
-                eff_limit=eff_limit,
-                eff_offset=eff_offset,
-                forced_dispatch="advanced_bridge",
+        stages["bridge"] = int((time.perf_counter() - stage_start) * 1000)
+
+    if payload is None and engine is not None:
+        stage_start = time.perf_counter()
+        for method_name in ENGINE_METHOD_CANDIDATES:
+            method = getattr(engine, method_name, None)
+            if not callable(method):
+                continue
+            payload = await _run_with_timeout(
+                f"engine.{method_name}",
+                _call_candidate(method, body=body, request=request, page=target_page, limit=limit_final, offset=offset_final, schema_only=schema_only_final),
+                _resolver_timeout("engine", page=target_page),
             )
-            if _has_usable_payload(page=target_page, headers=headers, rows=norm_rows, meta=meta_in, schema_only=schema_only_final):
-                selected_payload = {"status": status_out, "headers": headers, "keys": keys, "rows": norm_rows, "meta": meta_in}
-                selected_source = "bridge"
+            if payload is not None:
+                runner_source = runner_source or type(engine).__name__
+                runner_name = runner_name or method_name
+                break
+        stages["engine"] = int((time.perf_counter() - stage_start) * 1000)
 
-        if selected_payload is None:
-            engine_payload = await _try_engine_page_fallback(
-                engine=engine,
-                criteria=effective_criteria,
-                eff_limit=eff_limit,
-                eff_offset=eff_offset,
-                mode=mode or "",
-                include_matrix=include_matrix_final,
-                schema_only=schema_only_final,
+    raw_rows = _extract_rows_from_payload(payload)
+    keys = _extract_keys_from_payload(payload, target_page, raw_rows)
+    headers = _extract_headers_from_payload(payload, target_page, keys)
+
+    norm_rows: List[Dict[str, Any]] = []
+    for row in raw_rows:
+        norm_rows.append(_normalize_row_to_keys(row, keys))
+    if norm_rows:
+        norm_rows = _slice_rows(norm_rows, offset=offset_final, limit=limit_final)
+
+    if page_family == "top10":
+        for idx, row in enumerate(norm_rows, start=1 + offset_final):
+            row.setdefault("top10_rank", idx)
+            row.setdefault("selection_reason", row.get("recommendation") or "top10_selection")
+            row.setdefault(
+                "criteria_snapshot",
+                _json_compact(
+                    {
+                        "risk_level": body.get("risk_level") or body.get("risk_profile"),
+                        "confidence_level": body.get("confidence_level") or body.get("confidence_bucket"),
+                        "top_n": body.get("top_n") or body.get("limit"),
+                        "source_pages": body.get("source_pages") or body.get("pages_selected"),
+                    }
+                ),
             )
-            if engine_payload is not None:
-                headers, keys, norm_rows, meta_in, status_out = _normalize_page_payload(
-                    engine_payload,
-                    target_page=target_page,
-                    criteria_used=effective_criteria,
-                    eff_limit=eff_limit,
-                    eff_offset=eff_offset,
-                    forced_dispatch="advanced_engine_fallback",
-                )
-                if _has_usable_payload(page=target_page, headers=headers, rows=norm_rows, meta=meta_in, schema_only=schema_only_final):
-                    selected_payload = {"status": status_out, "headers": headers, "keys": keys, "rows": norm_rows, "meta": meta_in}
-                    selected_source = "engine_fallback"
+        keys = _append_missing_keys(keys, TOP10_SPECIAL_FIELDS)
+        headers = _append_missing_headers(headers, [x.replace("_", " ").title() for x in TOP10_SPECIAL_FIELDS])
+        norm_rows = [_normalize_row_to_keys(row, keys) for row in norm_rows]
 
-    else:
-        if not await _try_callable(fn=runner, source=runner_source or "runner", criteria_obj=effective_criteria, stage_name="runner"):
-            bridge_payload = await _delegate_to_bridge_sheet_rows(
-                request=request,
-                body=_body_for_bridge(effective_criteria),
-                mode=mode or "",
-                include_matrix=include_matrix_final,
-                token=token,
-                x_app_token=x_app_token,
-                authorization=authorization,
-                x_request_id=x_request_id,
-            )
-            if bridge_payload is not None:
-                headers, keys, norm_rows, meta_in, status_out = _normalize_page_payload(
-                    bridge_payload,
-                    target_page=target_page,
-                    criteria_used=effective_criteria,
-                    eff_limit=eff_limit,
-                    eff_offset=eff_offset,
-                    forced_dispatch="advanced_bridge",
-                )
-                if _has_usable_payload(page=target_page, headers=headers, rows=norm_rows, meta=meta_in, schema_only=schema_only_final):
-                    selected_payload = {"status": status_out, "headers": headers, "keys": keys, "rows": norm_rows, "meta": meta_in}
-                    selected_source = "bridge"
+    status_out = "success" if payload is not None or norm_rows or schema_only_final else "degraded"
+    if not raw_rows and payload is None:
+        warnings.append("No builder/runner/bridge/engine payload resolved; returned canonical empty contract.")
 
-            if selected_payload is None:
-                engine_payload = await _try_engine_page_fallback(
-                    engine=engine,
-                    criteria=effective_criteria,
-                    eff_limit=eff_limit,
-                    eff_offset=eff_offset,
-                    mode=mode or "",
-                    include_matrix=include_matrix_final,
-                    schema_only=schema_only_final,
-                )
-                if engine_payload is not None:
-                    headers, keys, norm_rows, meta_in, status_out = _normalize_page_payload(
-                        engine_payload,
-                        target_page=target_page,
-                        criteria_used=effective_criteria,
-                        eff_limit=eff_limit,
-                        eff_offset=eff_offset,
-                        forced_dispatch="advanced_engine_fallback",
-                    )
-                    if _has_usable_payload(page=target_page, headers=headers, rows=norm_rows, meta=meta_in, schema_only=schema_only_final):
-                        selected_payload = {"status": status_out, "headers": headers, "keys": keys, "rows": norm_rows, "meta": meta_in}
-                        selected_source = "engine_fallback"
-
-    if selected_payload is None:
-        meta = {
-            "route_version": INVESTMENT_ADVISOR_VERSION,
-            "route_owner": ROUTE_OWNER_NAME,
-            "route_family": ROUTE_FAMILY_NAME,
-            "request_id": request_id,
-            "limit": eff_limit,
-            "offset": eff_offset,
-            "mode": mode or "",
-            "schema_aligned": bool(schema_keys),
-            "schema_columns": len(schema_keys),
-            "build_status": "DEGRADED",
-            "dispatch": "advanced_request",
-            "page_family": page_family,
-            "request_unconstrained": prep_meta.get("request_unconstrained", False),
-            "pages_explicit": prep_meta.get("pages_explicit", False),
-            "pages_effective": prep_meta.get("pages_effective", []),
-            "direct_symbols_count": prep_meta.get("direct_symbols_count", 0),
-            "pages_trimmed": prep_meta.get("pages_trimmed", False),
-            "allow_row_fallback": prep_meta.get("allow_row_fallback", True),
-            "target_page": target_page,
-            "fallback_used": fallback_used,
-            "fallback_reason": fallback_reason,
-            "criteria_used": _json_safe(selected_criteria),
-            "warnings": warnings,
-            "engine_present": True,
-            "engine_type": type(engine).__name__,
-            "top10_builder_available": bool(top10_builder),
-            "top10_builder_source": top10_builder_source,
-            "top10_builder_name": top10_builder_name,
-            "top10_builder_search_path": top10_builder_search_path,
-            "runner_available": bool(runner),
-            "runner_source": runner_source,
-            "runner_name": runner_name,
-            "runner_search_path": runner_search_path,
-            "stage_durations_ms": stages,
-            "duration_ms": round((time.perf_counter() - t0) * 1000.0, 3),
-        }
-        return jsonable_encoder(
-            _schema_only_payload(
-                request_id=request_id,
-                target_page=target_page,
-                headers=schema_headers,
-                keys=schema_keys,
-                include_matrix=include_matrix_final,
-                meta=meta,
-            )
-        )
-
-    headers = list(selected_payload.get("headers") or schema_headers)
-    keys = list(selected_payload.get("keys") or schema_keys)
-    norm_rows = list(selected_payload.get("rows") or [])
-    meta_in = selected_payload.get("meta") if isinstance(selected_payload.get("meta"), dict) else {}
-    status_out = _s(selected_payload.get("status")) or ("success" if norm_rows else "partial")
-    build_status = _s(meta_in.get("build_status")) or ("OK" if norm_rows else "WARN")
-
-    merged_warnings = list(warnings)
-    meta_warnings = meta_in.get("warnings")
-    if isinstance(meta_warnings, list):
-        merged_warnings.extend([_s(x) for x in meta_warnings if _s(x)])
-    dedup_warnings = _dedupe_keep_order(merged_warnings)
-
-    meta = dict(meta_in)
-    meta.update(
-        {
-            "route_version": INVESTMENT_ADVISOR_VERSION,
-            "route_owner": ROUTE_OWNER_NAME,
-            "route_family": ROUTE_FAMILY_NAME,
-            "request_id": request_id,
-            "limit": eff_limit,
-            "offset": eff_offset,
-            "mode": mode or "",
-            "duration_ms": round((time.perf_counter() - t0) * 1000.0, 3),
-            "schema_aligned": bool(keys),
-            "schema_columns": len(keys),
-            "page_family": page_family,
-            "criteria_used": _json_safe(selected_criteria),
-            "request_unconstrained": prep_meta.get("request_unconstrained", False),
-            "pages_explicit": prep_meta.get("pages_explicit", False),
-            "pages_effective": prep_meta.get("pages_effective", []),
-            "direct_symbols_count": prep_meta.get("direct_symbols_count", 0),
-            "pages_trimmed": prep_meta.get("pages_trimmed", False),
-            "allow_row_fallback": prep_meta.get("allow_row_fallback", True),
-            "target_page": target_page,
-            "fallback_used": fallback_used,
-            "fallback_reason": fallback_reason,
-            "engine_present": True,
-            "engine_type": type(engine).__name__,
-            "top10_builder_available": bool(top10_builder),
-            "top10_builder_source": top10_builder_source,
-            "top10_builder_name": top10_builder_name,
-            "top10_builder_search_path": top10_builder_search_path,
-            "runner_available": bool(runner),
-            "runner_source": runner_source,
-            "runner_name": runner_name,
-            "runner_search_path": runner_search_path,
-            "selected_source": selected_source,
-            "warnings": dedup_warnings,
-            "build_status": build_status,
-            "dispatch": _s(meta_in.get("dispatch")) or "advanced_request",
-            "contract_header_count": KNOWN_CANONICAL_HEADER_COUNTS.get(target_page, len(keys)),
-            "actual_header_count": len(keys),
-            "returned_rows": len(norm_rows),
-            "stage_durations_ms": stages,
-        }
+    meta = _make_meta(
+        request_id=request_id,
+        page=target_page,
+        status_out=status_out,
+        engine=engine,
+        top10_source=top10_source,
+        top10_name=top10_name,
+        runner_source=runner_source,
+        runner_name=runner_name,
+        bridge_source=bridge_source,
+        bridge_name=bridge_name,
+        stages={**stages, "total": int((time.perf_counter() - started) * 1000)},
+        warnings=warnings,
     )
 
     rows_matrix = _rows_to_matrix(norm_rows, keys) if include_matrix_final and keys else None
@@ -2638,6 +1396,147 @@ async def _execute_advanced_request(
         "meta": meta,
     }
     return jsonable_encoder(response)
+
+
+@router.get("")
+async def advanced_root_get(
+    request: Request,
+    response: Response,
+    page: Optional[str] = Query(default=None),
+    sheet: Optional[str] = Query(default=None),
+    sheet_name: Optional[str] = Query(default=None),
+    name: Optional[str] = Query(default=None),
+    tab: Optional[str] = Query(default=None),
+    symbols: Optional[str] = Query(default=None),
+    tickers: Optional[str] = Query(default=None),
+    pages: Optional[str] = Query(default=None),
+    sources: Optional[str] = Query(default=None),
+    risk_level: Optional[str] = Query(default=None),
+    risk_profile: Optional[str] = Query(default=None),
+    confidence_level: Optional[str] = Query(default=None),
+    confidence_bucket: Optional[str] = Query(default=None),
+    investment_period_days: Optional[int] = Query(default=None, ge=1, le=3650),
+    horizon_days: Optional[int] = Query(default=None, ge=1, le=3650),
+    min_expected_roi: Optional[float] = Query(default=None),
+    min_roi: Optional[float] = Query(default=None),
+    min_confidence: Optional[float] = Query(default=None),
+    top_n: Optional[int] = Query(default=None, ge=1, le=200),
+    limit: Optional[int] = Query(default=None, ge=1, le=200),
+    offset: Optional[int] = Query(default=None, ge=0, le=50000),
+    mode: str = Query(default=""),
+    include_matrix: Optional[bool] = Query(default=None),
+    schema_only: Optional[bool] = Query(default=None),
+    token: Optional[str] = Query(default=None),
+    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+) -> Dict[str, Any]:
+    _require_auth_or_401(request=request, token_query=token, x_app_token=x_app_token, authorization=authorization)
+
+    has_filters = _advanced_root_has_request_filters(
+        page=page,
+        sheet=sheet,
+        sheet_name=sheet_name,
+        name=name,
+        tab=tab,
+        symbols=symbols,
+        tickers=tickers,
+        pages=pages,
+        sources=sources,
+        risk_level=risk_level,
+        risk_profile=risk_profile,
+        confidence_level=confidence_level,
+        confidence_bucket=confidence_bucket,
+        investment_period_days=investment_period_days,
+        horizon_days=horizon_days,
+        min_expected_roi=min_expected_roi,
+        min_roi=min_roi,
+        min_confidence=min_confidence,
+        top_n=top_n,
+        limit=limit,
+        offset=offset,
+        mode=mode,
+        include_matrix=include_matrix,
+        schema_only=schema_only,
+    )
+    if not has_filters:
+        payload = await _advanced_root_summary(request)
+        response.headers["X-Request-ID"] = _request_id(request, x_request_id)
+        return payload
+
+    body = _advanced_get_body(
+        page=page,
+        sheet=sheet,
+        sheet_name=sheet_name,
+        name=name,
+        tab=tab,
+        symbols=symbols,
+        tickers=tickers,
+        pages=pages,
+        sources=sources,
+        risk_level=risk_level,
+        risk_profile=risk_profile,
+        confidence_level=confidence_level,
+        confidence_bucket=confidence_bucket,
+        investment_period_days=investment_period_days,
+        horizon_days=horizon_days,
+        min_expected_roi=min_expected_roi,
+        min_roi=min_roi,
+        min_confidence=min_confidence,
+        top_n=top_n,
+        limit=limit,
+        offset=offset,
+        include_matrix=include_matrix,
+        schema_only=schema_only,
+    )
+    payload = await _execute_advanced_request(
+        request=request,
+        body=body,
+        mode=mode,
+        include_matrix=include_matrix,
+        limit=limit if limit is not None else top_n,
+        offset=offset,
+        schema_only=schema_only,
+        x_request_id=x_request_id,
+        token=token,
+        x_app_token=x_app_token,
+        authorization=authorization,
+    )
+    response.headers["X-Request-ID"] = payload.get("request_id") or _request_id(request, x_request_id)
+    return payload
+
+
+@router.post("")
+async def advanced_root_post(
+    request: Request,
+    response: Response,
+    body: Dict[str, Any] = Body(default_factory=dict),
+    mode: str = Query(default="", description="Optional mode hint"),
+    include_matrix: Optional[bool] = Query(default=None, description="Return rows_matrix"),
+    limit: Optional[int] = Query(default=None, ge=1, le=200, description="How many items to return"),
+    offset: Optional[int] = Query(default=None, ge=0, le=50000, description="How many items to skip"),
+    schema_only: Optional[bool] = Query(default=None, description="Return schema only"),
+    token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+) -> Dict[str, Any]:
+    _require_auth_or_401(request=request, token_query=token, x_app_token=x_app_token, authorization=authorization)
+    payload = await _execute_advanced_request(
+        request=request,
+        body=dict(body or {}),
+        mode=mode,
+        include_matrix=include_matrix,
+        limit=limit,
+        offset=offset,
+        schema_only=schema_only,
+        x_request_id=x_request_id,
+        token=token,
+        x_app_token=x_app_token,
+        authorization=authorization,
+    )
+    response.headers["X-Request-ID"] = payload.get("request_id") or _request_id(request, x_request_id)
+    return payload
 
 
 @router.get("/health")
@@ -2783,35 +1682,31 @@ async def advanced_request_get(
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
     _require_auth_or_401(request=request, token_query=token, x_app_token=x_app_token, authorization=authorization)
-
-    target_page = _normalize_page_name(page or sheet or sheet_name or name or tab or TOP10_PAGE_NAME)
-    direct_symbols = _normalize_symbol_list(symbols) or _normalize_symbol_list(tickers)
-    selected_pages = _normalize_list(pages) or _normalize_list(sources)
-
-    body: Dict[str, Any] = {
-        "page": target_page,
-        "sheet": target_page,
-        "sheet_name": target_page,
-        "direct_symbols": direct_symbols,
-        "symbols": direct_symbols,
-        "tickers": direct_symbols,
-        "pages_selected": selected_pages,
-        "risk_level": _s(risk_level) or _s(risk_profile),
-        "risk_profile": _s(risk_profile) or _s(risk_level),
-        "confidence_level": _s(confidence_level),
-        "confidence_bucket": _s(confidence_bucket),
-        "investment_period_days": investment_period_days,
-        "horizon_days": horizon_days,
-        "min_expected_roi": min_expected_roi,
-        "min_roi": min_roi if min_roi is not None else min_expected_roi,
-        "min_confidence": min_confidence,
-        "top_n": top_n if top_n is not None else limit,
-        "limit": limit if limit is not None else top_n,
-        "offset": offset,
-        "include_matrix": include_matrix,
-        "schema_only": schema_only,
-    }
-
+    body = _advanced_get_body(
+        page=page,
+        sheet=sheet,
+        sheet_name=sheet_name,
+        name=name,
+        tab=tab,
+        symbols=symbols,
+        tickers=tickers,
+        pages=pages,
+        sources=sources,
+        risk_level=risk_level,
+        risk_profile=risk_profile,
+        confidence_level=confidence_level,
+        confidence_bucket=confidence_bucket,
+        investment_period_days=investment_period_days,
+        horizon_days=horizon_days,
+        min_expected_roi=min_expected_roi,
+        min_roi=min_roi,
+        min_confidence=min_confidence,
+        top_n=top_n,
+        limit=limit,
+        offset=offset,
+        include_matrix=include_matrix,
+        schema_only=schema_only,
+    )
     payload = await _execute_advanced_request(
         request=request,
         body=body,
