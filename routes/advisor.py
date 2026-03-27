@@ -2,7 +2,7 @@
 """
 routes/advisor.py
 ================================================================================
-ADVISOR ROUTER — v6.4.0
+ADVISOR ROUTER — v6.5.0
 ================================================================================
 TOP10-CONTRACT-ALIGNED • SHORT-ADVISOR FAMILY HARDENED • LIVE-BY-DEFAULT •
 UNIFIED-SHEET-ROWS • RESOLVER-HARDENED • QUERY+BODY COMPATIBLE • JSON-SAFE •
@@ -49,7 +49,7 @@ from fastapi.routing import APIRouter
 logger = logging.getLogger("routes.advisor")
 logger.addHandler(logging.NullHandler())
 
-ADVISOR_VERSION = "6.4.0"
+ADVISOR_VERSION = "6.5.0"
 
 router = APIRouter(prefix="/v1/advisor", tags=["advisor"])
 
@@ -254,6 +254,17 @@ except Exception:
 # Small shared caches
 # -----------------------------------------------------------------------------
 _SCHEMA_HEADERS_CACHE: Dict[str, List[str]] = {}
+
+AUTH_ENV_TOKEN_NAMES: Tuple[str, ...] = (
+    "TFB_TOKEN",
+    "APP_TOKEN",
+    "BACKEND_TOKEN",
+    "BACKUP_APP_TOKEN",
+    "X_APP_TOKEN",
+    "AUTH_TOKEN",
+    "TOKEN",
+    "TFB_APP_TOKEN",
+)
 
 
 # -----------------------------------------------------------------------------
@@ -494,6 +505,45 @@ def _auth_ok_via_hook(token_query: Optional[str], x_app_token: Optional[str], au
     return False
 
 
+def _candidate_tokens_from_env() -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for name in AUTH_ENV_TOKEN_NAMES:
+        token = _strip(os.getenv(name))
+        if token and token not in seen:
+            seen.add(token)
+            out.append(token)
+    return out
+
+
+def _auth_ok_via_env_match(
+    token_query: Optional[str],
+    x_app_token: Optional[str],
+    authorization: Optional[str],
+) -> bool:
+    env_tokens = _candidate_tokens_from_env()
+    if not env_tokens:
+        return False
+
+    presented: List[str] = []
+    for value in (token_query, x_app_token):
+        token = _strip(value)
+        if token:
+            presented.append(token)
+
+    authz = _strip(authorization)
+    if authz:
+        lowered = authz.lower()
+        if lowered.startswith("bearer "):
+            bearer = _strip(authz[7:])
+            if bearer:
+                presented.append(bearer)
+        else:
+            presented.append(authz)
+
+    return any(token in env_tokens for token in presented)
+
+
 def _require_auth_or_401(
     *,
     token_query: Optional[str],
@@ -503,6 +553,8 @@ def _require_auth_or_401(
     if _is_open_mode_enabled():
         return
     if _auth_ok_via_hook(token_query=token_query, x_app_token=x_app_token, authorization=authorization):
+        return
+    if _auth_ok_via_env_match(token_query=token_query, x_app_token=x_app_token, authorization=authorization):
         return
     raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -795,6 +847,23 @@ async def _invoke_callable(fn: Callable[..., Any], *args: Any, timeout_seconds: 
     return await asyncio.wait_for(_runner(), timeout=timeout_seconds)
 
 
+def _looks_like_signature_type_error(exc: TypeError) -> bool:
+    message = _strip(exc).lower()
+    signature_markers = (
+        "unexpected keyword",
+        "unexpected positional",
+        "positional argument",
+        "required positional argument",
+        "takes ",
+        "got an unexpected",
+        "multiple values for argument",
+        "missing 1 required",
+        "missing required",
+        "keyword-only argument",
+    )
+    return any(marker in message for marker in signature_markers)
+
+
 async def _call_with_tolerant_signatures(
     fn: Callable[..., Any],
     *,
@@ -829,20 +898,27 @@ async def _call_with_tolerant_signatures(
 
     last_error: Optional[Exception] = None
 
-    for call_args, call_kwargs in attempts:
+    for idx, (call_args, call_kwargs) in enumerate(attempts):
         call_kwargs = {k: v for k, v in call_kwargs.items() if v is not None}
         try:
             return await _invoke_callable(fn, *call_args, timeout_seconds=timeout_seconds, **call_kwargs)
         except TypeError as exc:
             last_error = exc
-            continue
+            if _looks_like_signature_type_error(exc):
+                continue
+            raise
         except asyncio.TimeoutError as exc:
             last_error = exc
-            logger.warning("Callable timed out. fn=%s timeout=%.2fs", getattr(fn, "__name__", repr(fn)), timeout_seconds)
-            continue
+            logger.warning(
+                "Callable timed out. fn=%s timeout=%.2fs attempt=%s",
+                getattr(fn, "__name__", repr(fn)),
+                timeout_seconds,
+                idx + 1,
+            )
+            raise
         except Exception as exc:
             last_error = exc
-            continue
+            raise
 
     if last_error is not None:
         raise last_error
@@ -1213,28 +1289,37 @@ def _project_to_contract_headers(
     return effective_headers, row_objects, rows_matrix
 
 
-def _ensure_tabular_shape(result: Dict[str, Any], *, page: str) -> Dict[str, Any]:
-    headers = result.get("headers")
-    rows = result.get("rows")
-    row_objects = result.get("row_objects")
-    items = result.get("items")
-    data = result.get("data")
-    quotes = result.get("quotes")
-    rows_matrix = result.get("rows_matrix")
-
-    effective_headers: List[str] = list(headers) if isinstance(headers, list) else []
-
-    object_rows: List[Dict[str, Any]] = []
-    for candidate in (row_objects, rows, items, data, quotes):
+def _extract_object_rows_any(result: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    for key in ("row_objects", "rowObjects", "rows", "items", "data", "quotes", "results", "records"):
+        candidate = result.get(key)
         if isinstance(candidate, list) and candidate and all(isinstance(x, Mapping) for x in candidate):
-            object_rows = [dict(x) for x in candidate]
-            break
+            return [dict(x) for x in candidate]
+    return []
 
-    matrix_rows: List[List[Any]] = []
-    if isinstance(rows_matrix, list) and rows_matrix:
-        matrix_rows = [list(x) if isinstance(x, (list, tuple)) else [x] for x in rows_matrix]
-    elif isinstance(rows, list) and rows and all(not isinstance(x, Mapping) for x in rows):
-        matrix_rows = [list(x) if isinstance(x, (list, tuple)) else [x] for x in rows]
+
+def _extract_matrix_rows_any(result: Mapping[str, Any]) -> List[List[Any]]:
+    for key in ("rows_matrix", "matrix", "rows"):
+        candidate = result.get(key)
+        if isinstance(candidate, list) and candidate and all(not isinstance(x, Mapping) for x in candidate):
+            return [list(x) if isinstance(x, (list, tuple)) else [x] for x in candidate]
+    return []
+
+
+def _effective_headers_from_result(result: Mapping[str, Any]) -> List[str]:
+    for key in ("headers", "display_headers", "keys", "columns"):
+        candidate = result.get(key)
+        if isinstance(candidate, list):
+            headers = [_strip(x) for x in candidate if _strip(x)]
+            if headers:
+                return headers
+    return []
+
+
+def _ensure_tabular_shape(result: Dict[str, Any], *, page: str) -> Dict[str, Any]:
+    effective_headers: List[str] = _effective_headers_from_result(result)
+
+    object_rows: List[Dict[str, Any]] = _extract_object_rows_any(result)
+    matrix_rows: List[List[Any]] = _extract_matrix_rows_any(result)
 
     effective_headers, object_rows, matrix_rows = _project_to_contract_headers(
         page=page,
@@ -1277,12 +1362,12 @@ def _looks_like_fallback_only_top10(result: Mapping[str, Any]) -> bool:
     fallback_flag = _boolish(meta.get("fallback"), False)
     reason = _strip(meta.get("reason")).lower()
 
-    rows: List[Mapping[str, Any]] = []
-    candidate = result.get("row_objects")
-    if isinstance(candidate, list) and candidate and all(isinstance(x, Mapping) for x in candidate):
-        rows = [dict(x) for x in candidate]
-    elif isinstance(result.get("items"), list) and result.get("items") and all(isinstance(x, Mapping) for x in result.get("items")):
-        rows = [dict(x) for x in result.get("items")]
+    rows: List[Mapping[str, Any]] = _extract_object_rows_any(result)
+    if not rows:
+        headers = _effective_headers_from_result(result)
+        matrix_rows = _extract_matrix_rows_any(result)
+        if headers and matrix_rows:
+            rows = _rows_matrix_to_objects(matrix_rows, headers)
 
     if not rows:
         return False
