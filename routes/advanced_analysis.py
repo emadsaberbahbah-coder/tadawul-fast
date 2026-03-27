@@ -2,25 +2,26 @@
 """
 routes/advanced_analysis.py
 --------------------------------------------------------------------------------
-TADAWUL ADVANCED ANALYSIS ROUTER — v7.2.0
-(ROOT-SHEET-ROWS OWNER GUARANTEED / SHARED-PIPELINE HARDENED /
- ROOT+V1 COMPAT / INSIGHTS+TOP10 WIRED / SHEET-ROWS CONTRACT FIXED /
- ROW-OBJECTS PRIMARY / MATRIX SECONDARY / SCHEMA-ENDPOINTS STABLE /
- DATA-DICTIONARY SAFE / JSON-SAFE / LIMIT+OFFSET CONSISTENT / ASYNC-SAFE)
+TADAWUL ADVANCED ANALYSIS ROUTER — v7.3.0
+(SCHEMA OWNER RESTORED / ROOT-SHEET-ROWS OWNER GUARANTEED /
+ CANONICAL ROUTE-ALIGNMENT / ROOT+V1 COMPAT / SHARED-PIPELINE HARDENED /
+ SCHEMA-ENDPOINTS EXPANDED / DATA-DICTIONARY SAFE / JSON-SAFE / ASYNC-SAFE)
 
 What this revision improves
-- ✅ FIX: shared-pipeline, builder, and engine table-mode paths now fetch with
-         a widened local window and slice only once locally, preventing
-         double-pagination drift.
-- ✅ FIX: tolerant callable dispatch now retries only on genuine signature
-         mismatch TypeErrors instead of masking runtime bugs.
-- ✅ FIX: row extraction accepts row_objects / rowObjects / quotes / results /
-         records / items / data / nested payloads / matrix-only payloads.
-- ✅ FIX: auth fallback can validate direct env tokens such as TFB_TOKEN,
-         APP_TOKEN, and BACKEND_TOKEN when core.config auth helper is absent.
-- ✅ FIX: Top_10_Investments always keeps the full 83-column contract.
+- ✅ FIX: removes `/v1/advanced/*` family ownership from this module so the
+         canonical owner map can move that family back to `routes.investment_advisor`.
+- ✅ FIX: keeps this module focused on the schema family and the canonical
+         root `/sheet-rows` owner path.
+- ✅ FIX: adds stable schema endpoints for:
+         `/v1/schema`, `/v1/schema/health`, `/v1/schema/pages`,
+         `/v1/schema/sheet-spec`, and `/v1/schema/data-dictionary`
+         plus `/schema/*` compatibility aliases.
+- ✅ FIX: preserves the schema-driven root `/sheet-rows` GET/POST pipeline,
+         including Data_Dictionary, Insights, and Top10-safe normalization.
+- ✅ FIX: remains import-safe, auth-tolerant, JSON-safe, and startup-safe.
 --------------------------------------------------------------------------------
 """
+
 
 from __future__ import annotations
 
@@ -46,14 +47,16 @@ from fastapi.routing import APIRouter
 logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
-ADVANCED_ANALYSIS_VERSION = "7.2.0"
+ADVANCED_ANALYSIS_VERSION = "7.3.0"
 
 # -----------------------------------------------------------------------------
 # Routers
 # -----------------------------------------------------------------------------
-_base_router_import_error: Optional[str] = None
+SCHEMA_ROUTE_OWNER = "advanced_analysis"
+SCHEMA_ROUTE_FAMILY = "schema"
+ROOT_SHEET_ROWS_OWNER = "advanced_analysis"
+
 _root_sheet_rows_router = APIRouter(tags=["advanced-root"])
-advanced_router = APIRouter(prefix="/v1/advanced", tags=["advanced"])
 schema_router_v1 = APIRouter(prefix="/v1/schema", tags=["schema"])
 schema_router_compat = APIRouter(prefix="/schema", tags=["schema"])
 router = APIRouter(tags=["advanced-analysis"])
@@ -2187,6 +2190,165 @@ async def _run_advanced_sheet_rows_impl(
 # -----------------------------------------------------------------------------
 # Schema endpoints
 # -----------------------------------------------------------------------------
+def _known_schema_pages() -> List[str]:
+    registry, _ = _collect_schema_registry()
+    pages = sorted({_canonicalize_sheet_name(k) for k in registry.keys() if _strip(k)})
+    if pages:
+        return pages
+
+    fallback_pages = [
+        "Market_Leaders",
+        "Global_Markets",
+        "Commodities_FX",
+        "Mutual_Funds",
+        "My_Portfolio",
+        "Insights_Analysis",
+        "Top_10_Investments",
+        "Data_Dictionary",
+    ]
+    return [_canonicalize_sheet_name(x) for x in fallback_pages]
+
+
+def _schema_pages_payload() -> Dict[str, Any]:
+    registry, source = _collect_schema_registry()
+    pages = _known_schema_pages()
+    items: List[Dict[str, Any]] = []
+
+    for page in pages:
+        headers, keys, schema_source = _schema_headers_keys(page)
+        items.append(
+            {
+                "page": page,
+                "sheet": page,
+                "route_family": _strip(_maybe_route_family(page)) or "instrument",
+                "column_count": len(headers),
+                "header_count": len(headers),
+                "key_count": len(keys),
+                "schema_source": schema_source,
+                "has_registry_entry": page in registry,
+            }
+        )
+
+    return _json_safe(
+        {
+            "status": "success",
+            "version": ADVANCED_ANALYSIS_VERSION,
+            "route_owner": SCHEMA_ROUTE_OWNER,
+            "route_family": SCHEMA_ROUTE_FAMILY,
+            "sheet_count": len(items),
+            "pages": [item["page"] for item in items],
+            "items": items,
+            "source": source,
+        }
+    )
+
+
+def _schema_root_payload(request: Optional[Request] = None) -> Dict[str, Any]:
+    pages_payload = _schema_pages_payload()
+    request_id = None
+    if request is not None:
+        try:
+            request_id = getattr(request.state, "request_id", None)
+        except Exception:
+            request_id = None
+
+    return _json_safe(
+        {
+            "status": "success",
+            "version": ADVANCED_ANALYSIS_VERSION,
+            "route_owner": SCHEMA_ROUTE_OWNER,
+            "route_family": SCHEMA_ROUTE_FAMILY,
+            "root_path": "/v1/schema",
+            "compat_root_path": "/schema",
+            "request_id": request_id,
+            "pages": pages_payload.get("pages", []),
+            "sheet_count": pages_payload.get("sheet_count", 0),
+            "supported_aliases": [
+                "/v1/schema",
+                "/v1/schema/health",
+                "/v1/schema/pages",
+                "/v1/schema/sheet-spec",
+                "/v1/schema/spec",
+                "/v1/schema/data-dictionary",
+                "/schema",
+                "/schema/health",
+                "/schema/pages",
+                "/schema/sheet-spec",
+                "/schema/spec",
+                "/schema/data-dictionary",
+                "/sheet-rows",
+            ],
+        }
+    )
+
+
+@schema_router_v1.get("")
+@schema_router_compat.get("")
+async def schema_root(
+    request: Request,
+    token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+) -> Dict[str, Any]:
+    _require_auth_or_401(
+        token_query=token,
+        x_app_token=x_app_token,
+        x_api_key=x_api_key,
+        authorization=authorization,
+    )
+    return _schema_root_payload(request)
+
+
+@schema_router_v1.get("/health")
+@schema_router_compat.get("/health")
+async def schema_health(
+    request: Request,
+    token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+) -> Dict[str, Any]:
+    _require_auth_or_401(
+        token_query=token,
+        x_app_token=x_app_token,
+        x_api_key=x_api_key,
+        authorization=authorization,
+    )
+    registry, source = _collect_schema_registry()
+    request_id = getattr(request.state, "request_id", None)
+    return _json_safe(
+        {
+            "status": "ok",
+            "version": ADVANCED_ANALYSIS_VERSION,
+            "route_owner": SCHEMA_ROUTE_OWNER,
+            "route_family": SCHEMA_ROUTE_FAMILY,
+            "request_id": request_id,
+            "registry_source": source,
+            "registry_entries": len(registry),
+            "sheet_count": len(_known_schema_pages()),
+            "root_sheet_rows_owner": ROOT_SHEET_ROWS_OWNER,
+        }
+    )
+
+
+@schema_router_v1.get("/pages")
+@schema_router_compat.get("/pages")
+async def schema_pages(
+    token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+) -> Dict[str, Any]:
+    _require_auth_or_401(
+        token_query=token,
+        x_app_token=x_app_token,
+        x_api_key=x_api_key,
+        authorization=authorization,
+    )
+    return _schema_pages_payload()
+
+
 @schema_router_v1.get("/sheet-spec")
 @schema_router_v1.get("/spec")
 @schema_router_compat.get("/sheet-spec")
@@ -2198,15 +2360,49 @@ async def schema_sheet_spec(
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
 ) -> Dict[str, Any]:
-    _require_auth_or_401(token_query=token, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization)
+    _require_auth_or_401(
+        token_query=token,
+        x_app_token=x_app_token,
+        x_api_key=x_api_key,
+        authorization=authorization,
+    )
     return _schema_spec_payload(sheet_filter=sheet)
+
+
+@schema_router_v1.get("/data-dictionary")
+@schema_router_compat.get("/data-dictionary")
+async def schema_data_dictionary(
+    request: Request,
+    include_matrix: Optional[bool] = Query(default=None, description="Return rows_matrix for legacy clients"),
+    limit: int = Query(default=2000, ge=1, le=5000, description="Max rows to return"),
+    offset: int = Query(default=0, ge=0, description="Row offset"),
+    token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
+    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+) -> Dict[str, Any]:
+    _require_auth_or_401(
+        token_query=token,
+        x_app_token=x_app_token,
+        x_api_key=x_api_key,
+        authorization=authorization,
+    )
+    request_id = _request_id(request, x_request_id)
+    started_at = time.perf_counter()
+    return _build_data_dictionary_rows_payload(
+        include_matrix=bool(include_matrix if isinstance(include_matrix, bool) else True),
+        request_id=request_id,
+        started_at=started_at,
+        limit=limit,
+        offset=offset,
+    )
 
 
 # -----------------------------------------------------------------------------
 # Main sheet-rows endpoints
 # -----------------------------------------------------------------------------
 @_root_sheet_rows_router.get("/sheet-rows")
-@advanced_router.get("/sheet-rows")
 async def advanced_sheet_rows_get(
     request: Request,
     sheet: str = Query(default="", description="sheet/page name"),
@@ -2262,7 +2458,6 @@ async def advanced_sheet_rows_get(
 
 
 @_root_sheet_rows_router.post("/sheet-rows")
-@advanced_router.post("/sheet-rows")
 async def advanced_sheet_rows_schema_driven(
     request: Request,
     body: Dict[str, Any] = Body(...),
@@ -2288,166 +2483,9 @@ async def advanced_sheet_rows_schema_driven(
 
 
 # -----------------------------------------------------------------------------
-# Health / metrics / helper endpoints
-# -----------------------------------------------------------------------------
-@advanced_router.get("/health")
-async def advanced_health(request: Request) -> Dict[str, Any]:
-    engine = await _get_engine(request)
-    schema_pages = None
-    try:
-        from core.sheets.page_catalog import CANONICAL_PAGES  # type: ignore
-        schema_pages = list(CANONICAL_PAGES)
-    except Exception:
-        schema_pages = None
-
-    engine_health: Optional[Dict[str, Any]] = None
-    engine_stats: Optional[Dict[str, Any]] = None
-    if engine is not None:
-        for attr in ("health", "health_check", "get_health"):
-            fn = getattr(engine, attr, None)
-            if callable(fn):
-                try:
-                    out = fn()
-                    if inspect.isawaitable(out):
-                        out = await out
-                    if isinstance(out, dict):
-                        engine_health = out
-                        break
-                except Exception:
-                    continue
-        for attr in ("get_stats", "stats", "metrics"):
-            fn = getattr(engine, attr, None)
-            if callable(fn):
-                try:
-                    out = fn()
-                    if inspect.isawaitable(out):
-                        out = await out
-                    if isinstance(out, dict):
-                        engine_stats = out
-                        break
-                except Exception:
-                    continue
-
-    request_id = getattr(request.state, "request_id", None)
-    return _json_safe({
-        "status": "ok" if engine else "degraded",
-        "version": ADVANCED_ANALYSIS_VERSION,
-        "engine_available": bool(engine),
-        "engine_type": _safe_engine_type(engine) if engine else "none",
-        "engine_health": engine_health,
-        "engine_stats": engine_stats,
-        "schema_pages": schema_pages,
-        "port": _strip(os.getenv("PORT")) or None,
-        "require_auth": bool(_strip(os.getenv("REQUIRE_AUTH", "true")).lower() not in {"0", "false", "no", "off"}),
-        "request_id": request_id,
-        "sheet_rows_schema_driven": True,
-        "standalone_root_sheet_rows_owner": True,
-        "base_router_import_error": _base_router_import_error,
-        "insights_builder_wired": True,
-        "top10_builder_wired": True,
-        "shared_pipeline_aligned": True,
-        "rows_object_primary": True,
-    })
-
-
-@advanced_router.get("/metrics")
-async def advanced_metrics() -> Response:
-    if not _PROMETHEUS_AVAILABLE or generate_latest is None:
-        return Response(content="Metrics not available", media_type="text/plain", status_code=503)
-    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
-
-
-@advanced_router.get("/insights-criteria")
-async def insights_criteria(
-    token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
-    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
-    authorization: Optional[str] = Header(default=None, alias="Authorization"),
-) -> Dict[str, Any]:
-    _require_auth_or_401(token_query=token, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization)
-    weights = {
-        "w_valuation": 0.30,
-        "w_momentum": 0.30,
-        "w_quality": 0.20,
-        "w_opportunity": 0.20,
-        "risk_penalty_strength": 0.55,
-        "confidence_penalty_strength": 0.45,
-        "source": "defaults",
-    }
-    return _json_safe({
-        "status": "success",
-        "version": ADVANCED_ANALYSIS_VERSION,
-        "criteria": {"generated_at_utc": _now_utc(), "weights": weights, "embedded_target": "Insights_Analysis"},
-    })
-
-
-@advanced_router.post("/insights-analysis")
-async def insights_analysis(
-    request: Request,
-    body: Dict[str, Any] = Body(default_factory=dict),
-    mode: str = Query(default="", description="Optional mode hint for engine/provider"),
-    include_matrix: Optional[bool] = Query(default=None, description="Return rows_matrix for legacy clients"),
-    limit: int = Query(default=2000, ge=1, le=5000, description="Max rows to return"),
-    offset: int = Query(default=0, ge=0, description="Row offset"),
-    token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
-    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
-    authorization: Optional[str] = Header(default=None, alias="Authorization"),
-    x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
-) -> Dict[str, Any]:
-    payload = _safe_dict(body)
-    payload["sheet"] = "Insights_Analysis"
-    payload["limit"] = limit
-    payload["offset"] = offset
-    return await _run_advanced_sheet_rows_impl(
-        request=request,
-        body=payload,
-        mode=mode or "",
-        include_matrix_q=include_matrix,
-        token=token,
-        x_app_token=x_app_token,
-        x_api_key=x_api_key,
-        authorization=authorization,
-        x_request_id=x_request_id,
-    )
-
-
-@advanced_router.post("/top10-investments")
-async def top10_investments(
-    request: Request,
-    body: Dict[str, Any] = Body(default_factory=dict),
-    mode: str = Query(default="", description="Optional mode hint for engine/provider"),
-    include_matrix: Optional[bool] = Query(default=None, description="Return rows_matrix for legacy clients"),
-    limit: int = Query(default=2000, ge=1, le=5000, description="Max rows to return"),
-    offset: int = Query(default=0, ge=0, description="Row offset"),
-    token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
-    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
-    authorization: Optional[str] = Header(default=None, alias="Authorization"),
-    x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
-) -> Dict[str, Any]:
-    payload = _safe_dict(body)
-    payload["sheet"] = "Top_10_Investments"
-    payload["limit"] = limit
-    payload["offset"] = offset
-    return await _run_advanced_sheet_rows_impl(
-        request=request,
-        body=payload,
-        mode=mode or "",
-        include_matrix_q=include_matrix,
-        token=token,
-        x_app_token=x_app_token,
-        x_api_key=x_api_key,
-        authorization=authorization,
-        x_request_id=x_request_id,
-    )
-
-
-# -----------------------------------------------------------------------------
 # Final router composition
 # -----------------------------------------------------------------------------
 router.include_router(_root_sheet_rows_router)
-router.include_router(advanced_router)
 router.include_router(schema_router_v1)
 router.include_router(schema_router_compat)
 
