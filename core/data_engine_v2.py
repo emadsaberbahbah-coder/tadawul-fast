@@ -5,7 +5,7 @@
 Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.43.2
 ================================================================================
 
-WHY v5.43.0
+WHY v5.43.2
 -----------
 - FIX: keeps rows / rows_matrix strictly matrix-aligned to keys while
        row_objects / items / records / data / quotes stay dict-row payloads.
@@ -25,8 +25,8 @@ WHY v5.43.0
        quote payloads are sparse or unavailable.
 - FIX: applies symbol-aware page defaults so Commodities_FX rows keep useful
        identity/context fields even during provider degradation.
-- FIX: restores missing internal Top10 fallback builder so sheet generation
-       does not fail when the external selector is unavailable or returns empty.
+- FIX: restores internal Top 10 live-ranker fallback so the engine can
+       still build Top_10_Investments rows when the selector returns none.
 
 Design goals
 ------------
@@ -3385,130 +3385,161 @@ class DataEngineV5:
 
         return rows[:limit]
 
+    # ------------------------------------------------------------------
+    # main sheet/page APIs
+    # ------------------------------------------------------------------
 
     async def _build_top10_rows_fallback(
         self,
         headers: Sequence[str],
         keys: Sequence[str],
         body: Optional[Dict[str, Any]],
-        limit: int,
+        limit: int = 10,
         mode: str = "",
     ) -> Tuple[List[str], List[str], List[Dict[str, Any]]]:
-        headers2, keys2 = _ensure_top10_contract(headers, keys)
+        headers_out, keys_out = _ensure_top10_contract(list(headers or []), list(keys or []))
         body = dict(body or {})
         criteria = dict(body.get("criteria") or {}) if isinstance(body.get("criteria"), dict) else {}
 
-        selected_pages = _extract_top10_pages_from_body(body)
-        if not selected_pages:
-            selected_pages = criteria.get("pages_selected") or criteria.get("pages") or []
-            if not isinstance(selected_pages, (list, tuple, set)):
-                selected_pages = [selected_pages] if _safe_str(selected_pages) else []
-            selected_pages = [_canonicalize_sheet_name(_safe_str(p)) for p in selected_pages if _safe_str(p)]
-        if not selected_pages:
-            selected_pages = list(TOP10_ENGINE_DEFAULT_PAGES)
-        selected_pages = [
-            p
-            for p in _dedupe_keep_order(selected_pages)
-            if p and p not in {"Top_10_Investments", "Insights_Analysis", "Data_Dictionary"}
-        ]
-        criteria.setdefault("pages_selected", selected_pages)
-
-        top_n = _safe_int(
-            criteria.get("top_n") or body.get("top_n") or limit or 10,
-            default=10,
+        requested_limit = _safe_int(
+            criteria.get("top_n") or body.get("top_n") or body.get("limit") or limit,
+            10,
             lo=1,
-            hi=max(1, min(limit or 10, 50)),
+            hi=50,
         )
-        scan_limit = max(top_n * 12, min(max(limit, 25) * 8, 400))
+        limit = max(requested_limit, _safe_int(limit, requested_limit, lo=1, hi=5000))
 
-        candidate_symbols: List[str] = []
-        candidate_symbols.extend(_extract_requested_symbols_from_body(body, limit=scan_limit))
+        candidate_pages = _extract_top10_pages_from_body(body)
+        if not candidate_pages:
+            candidate_pages = list(TOP10_ENGINE_DEFAULT_PAGES)
 
-        for page_name in selected_pages:
-            syms = await self.get_sheet_symbols(page_name, limit=scan_limit, body=body)
-            if syms:
-                candidate_symbols.extend(syms)
-            if len(candidate_symbols) >= scan_limit:
-                break
+        direct_symbols = _extract_requested_symbols_from_body(body, limit=max(limit * 5, 50))
+        direct_set = {normalize_symbol(s) for s in direct_symbols if _safe_str(s)}
+
+        candidate_rows: List[Dict[str, Any]] = []
+        candidate_symbols: List[str] = list(direct_symbols)
+
+        def _extend_candidate_rows(rows: Sequence[Dict[str, Any]], source_page: str = "") -> None:
+            for raw in rows or []:
+                if not isinstance(raw, dict):
+                    continue
+                row = _apply_page_row_backfill(source_page or "Top_10_Investments", dict(raw))
+                candidate_rows.append(row)
+                sym = normalize_symbol(self._extract_row_symbol(row))
+                if sym:
+                    candidate_symbols.append(sym)
+
+        for page_name in candidate_pages:
+            snap = self.get_cached_sheet_snapshot(sheet=page_name)
+            snap_rows = _coerce_rows_list(snap)
+            if snap_rows:
+                _extend_candidate_rows(snap_rows, page_name)
+
+        if len(candidate_rows) < requested_limit:
+            for page_name in candidate_pages:
+                try:
+                    page_rows_payload = await self.get_sheet_rows(
+                        page_name,
+                        limit=max(limit * 2, requested_limit * 3),
+                        offset=0,
+                        mode=mode,
+                        body={"schema_only": False, "headers_only": False, "include_matrix": False},
+                    )
+                    live_rows = _coerce_rows_list(page_rows_payload)
+                    if live_rows:
+                        _extend_candidate_rows(live_rows, page_name)
+                except Exception:
+                    continue
+
+        if len(candidate_rows) < requested_limit:
+            for page_name in candidate_pages:
+                try:
+                    ext_rows = await self._get_rows_from_external_reader(page_name, max(limit * 2, requested_limit * 3))
+                except Exception:
+                    ext_rows = []
+                if ext_rows:
+                    _extend_candidate_rows(ext_rows, page_name)
+
+        for page_name in candidate_pages:
+            try:
+                page_symbols = await self.get_sheet_symbols(page_name, limit=max(limit * 5, 50), body=body)
+            except Exception:
+                page_symbols = []
+            if page_symbols:
+                candidate_symbols.extend(page_symbols)
 
         if not candidate_symbols:
-            for page_name in TOP10_ENGINE_DEFAULT_PAGES:
+            candidate_symbols.extend(_extract_symbols_from_rows(candidate_rows, limit=max(limit * 5, 50)))
+
+        if not candidate_symbols:
+            candidate_symbols.extend(EMERGENCY_PAGE_SYMBOLS.get("Top_10_Investments", []))
+            for page_name in candidate_pages:
                 candidate_symbols.extend(EMERGENCY_PAGE_SYMBOLS.get(page_name, []))
-                if len(candidate_symbols) >= scan_limit:
-                    break
 
-        candidate_symbols = _normalize_symbol_list(candidate_symbols, limit=scan_limit)
-        if not candidate_symbols:
-            return headers2, keys2, []
+        hydrated_symbols = _normalize_symbol_list(candidate_symbols, limit=max(limit * 6, 100))
+        if hydrated_symbols:
+            try:
+                hydrated_quotes = await self.get_enriched_quotes(hydrated_symbols, schema=None)
+            except Exception:
+                hydrated_quotes = []
+            for quote in hydrated_quotes:
+                row = _model_to_dict(quote)
+                if isinstance(row, dict):
+                    candidate_rows.append(_apply_page_row_backfill("Top_10_Investments", row))
 
-        quotes = await self.get_enriched_quotes(candidate_symbols, schema=None)
-        rows_all: List[Dict[str, Any]] = []
-        for quote in quotes:
-            row = _model_to_dict(quote)
+        deduped: Dict[str, Dict[str, Any]] = {}
+
+        def _row_density(row: Dict[str, Any]) -> int:
+            return sum(1 for v in row.values() if v not in (None, "", [], {}))
+
+        for row in candidate_rows:
             if not isinstance(row, dict):
                 continue
-            row = _apply_page_row_backfill("Top_10_Investments", row)
-            _compute_scores_fallback(row)
-            _compute_recommendation(row)
-            rows_all.append(row)
-
-        if not rows_all:
-            return headers2, keys2, []
-
-        min_roi = _as_pct_fraction(criteria.get("min_expected_roi"))
-        conf_req = _as_float(criteria.get("min_confidence_score"))
-        if conf_req is None:
-            conf_req = _as_float(criteria.get("confidence_score"))
-        if conf_req is None:
-            conf_level = _safe_str(criteria.get("confidence_level")).upper()
-            if conf_level in {"HIGH", "MEDIUM", "LOW"}:
-                conf_req = {"HIGH": 70.0, "MEDIUM": 55.0, "LOW": 40.0}[conf_level]
-
-        risk_pref = _safe_str(criteria.get("risk_level") or criteria.get("risk_bucket")).upper()
-        risk_rank = {"LOW": 0, "MODERATE": 1, "MEDIUM": 1, "HIGH": 2}
-
-        filtered: List[Dict[str, Any]] = []
-        for row in rows_all:
-            roi3 = _as_pct_fraction(row.get("expected_roi_3m"))
-            conf = _as_float(row.get("confidence_score"))
-            bucket = _safe_str(row.get("risk_bucket")).upper()
-            if min_roi is not None and roi3 is not None and roi3 < min_roi:
+            normalized = _apply_page_row_backfill("Top_10_Investments", dict(row))
+            _compute_scores_fallback(normalized)
+            _compute_recommendation(normalized)
+            sym = normalize_symbol(self._extract_row_symbol(normalized))
+            if not sym:
                 continue
-            if conf_req is not None and conf is not None and conf < conf_req:
-                continue
-            if risk_pref in risk_rank and bucket in risk_rank and risk_rank[bucket] > risk_rank[risk_pref]:
-                continue
-            filtered.append(row)
+            normalized["symbol"] = sym
+            normalized.setdefault("requested_symbol", sym)
+            current = deduped.get(sym)
+            if current is None or _row_density(normalized) > _row_density(current):
+                deduped[sym] = normalized
+            else:
+                merged = dict(current)
+                for k, v in normalized.items():
+                    if merged.get(k) in (None, "", [], {}) and v not in (None, "", [], {}):
+                        merged[k] = v
+                deduped[sym] = merged
 
-        ranked_pool = filtered or rows_all
-        _apply_rank_overall(ranked_pool)
-        ranked_pool.sort(
+        rows_ranked = list(deduped.values())
+        rows_ranked.sort(
             key=lambda r: (
-                1 if _as_float(r.get("current_price")) is not None else 0,
+                1 if normalize_symbol(_safe_str(r.get("symbol"))) in direct_set else 0,
                 _as_float(r.get("opportunity_score")) or -1e9,
                 _as_float(r.get("overall_score")) or -1e9,
                 _as_float(r.get("confidence_score")) or -1e9,
-                -((_as_float(r.get("risk_score")) or 1000.0)),
-                _as_float(r.get("expected_roi_3m")) or -1e9,
-                _as_float(r.get("expected_roi_12m")) or -1e9,
+                -(_as_float(r.get("risk_score")) or 1e9),
+                _as_float(r.get("expected_roi_3m")) or _as_float(r.get("expected_roi_12m")) or -1e9,
             ),
             reverse=True,
         )
 
-        criteria_snapshot = _top10_criteria_snapshot(criteria)
-        projected: List[Dict[str, Any]] = []
-        for idx, row in enumerate(ranked_pool[:top_n], start=1):
-            row = dict(row)
-            row["top10_rank"] = idx
+        selected = rows_ranked[:requested_limit]
+        criteria_snapshot = _top10_criteria_snapshot(criteria or body)
+
+        for idx2, row in enumerate(selected, start=1):
+            row["top10_rank"] = idx2
             row.setdefault("selection_reason", _top10_selection_reason(row))
             row.setdefault("criteria_snapshot", criteria_snapshot)
-            projected.append(_strict_project_row(keys2, _normalize_to_schema_keys(keys2, headers2, row)))
 
-        return headers2, keys2, projected
+        rows_proj = [
+            _strict_project_row(keys_out, _normalize_to_schema_keys(keys_out, headers_out, row))
+            for row in selected
+        ]
+        return headers_out, keys_out, rows_proj
 
-    # ------------------------------------------------------------------
-    # main sheet/page APIs
-    # ------------------------------------------------------------------
     async def get_page_rows(
         self,
         page: Optional[str] = None,
