@@ -1,8 +1,9 @@
+
 #!/usr/bin/env python3
 # core/sheets/page_catalog.py
 """
 ================================================================================
-Page Catalog — v3.1.0 (SCHEMA-FIRST / CANONICAL / ROUTE-DISPATCH SAFE)
+Page Catalog — v3.2.0 (SCHEMA-FIRST / CANONICAL / ROUTE-DISPATCH SAFE)
 ================================================================================
 
 Purpose
@@ -18,7 +19,7 @@ Why this revision
 - ✅ FIX: Exposes stable helpers for sheet-rows, schema, top10, and meta pages
 - ✅ FIX: Keeps schema_registry as the single source of truth
 - ✅ FIX: Supports common route/query variants:
-      - sheet / sheet_name / page / name / tab
+      - sheet / sheet_name / page / page_name / name / tab / worksheet
 - ✅ FIX: Adds safer fallback imports for schema_registry variants
 - ✅ FIX: Handles dict-style OR object-style sheet specs
 - ✅ FIX: Ensures Top_10_Investments and Data_Dictionary are always output/special pages
@@ -26,6 +27,8 @@ Why this revision
       - PAGE_ALIASES
       - SUPPORTED_PAGES
       - PAGES
+- ✅ FIX: Adds input-only normalization helpers for scanners/selectors/builders
+- ✅ FIX: Detects normalized alias collisions instead of silently overwriting them
 
 Hard rules
 ----------
@@ -66,7 +69,7 @@ except Exception as e:  # pragma: no cover
     raise ImportError(f"page_catalog failed to import get_sheet_spec: {e!r}") from e
 
 
-PAGE_CATALOG_VERSION = "3.1.0"
+PAGE_CATALOG_VERSION = "3.2.0"
 
 __all__ = [
     "PAGE_CATALOG_VERSION",
@@ -74,8 +77,10 @@ __all__ = [
     "CANONICAL_PAGES",
     "SUPPORTED_PAGES",
     "PAGES",
+    "INPUT_PAGES",
     "FORBIDDEN_PAGES",
     "FORBIDDEN_ALIASES",
+    "PAGE_PARAM_NAMES",
     "ALIAS_TO_CANONICAL",
     "PAGE_ALIASES",
     "OUTPUT_PAGES",
@@ -90,9 +95,13 @@ __all__ = [
     "is_output_page",
     "is_special_page",
     "is_instrument_page",
+    "is_input_page",
     "normalize_page_name",
+    "normalize_input_page_name",
     "resolve_page",
     "canonicalize_page",
+    "extract_page_candidate",
+    "resolve_page_candidate",
     "normalize_page_names",
     "get_top10_feed_pages",
     "get_page_aliases",
@@ -125,6 +134,16 @@ OUTPUT_PAGES: Set[str] = {"Top_10_Investments", "Data_Dictionary"}
 
 # Pages that must never be routed to the generic instrument fallback by mistake
 SPECIAL_PAGES: Set[str] = {"Insights_Analysis", "Top_10_Investments", "Data_Dictionary"}
+
+PAGE_PARAM_NAMES: Tuple[str, ...] = (
+    "sheet",
+    "sheet_name",
+    "page",
+    "page_name",
+    "name",
+    "tab",
+    "worksheet",
+)
 
 _DESC_OVERRIDES: Dict[str, str] = {
     "Market_Leaders": "Primary leaders/watchlist universe.",
@@ -237,6 +256,29 @@ def _spec_kind(spec: Any) -> str:
     return ""
 
 
+def _extract_nested_page_candidate(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+
+    if isinstance(value, str):
+        return value
+
+    for field in PAGE_PARAM_NAMES:
+        got = _obj_get(value, field)
+        if isinstance(got, str) and got.strip():
+            return got.strip()
+
+    for container_name in ("payload", "params", "query", "body", "data", "result", "request"):
+        nested = _obj_get(value, container_name)
+        if nested is value or nested is None:
+            continue
+        got = _extract_nested_page_candidate(nested)
+        if isinstance(got, str) and got.strip():
+            return got.strip()
+
+    return None
+
+
 # --------------------------------------------------------------------------------------
 # Canonical pages derived from schema_registry
 # --------------------------------------------------------------------------------------
@@ -341,6 +383,11 @@ INSTRUMENT_PAGES: Set[str] = {
     if info.is_data_page and not info.is_special_page
 }
 
+INPUT_PAGES: List[str] = [
+    p for p in CANONICAL_PAGES
+    if p in PAGE_INFO and PAGE_INFO[p].is_data_page and not PAGE_INFO[p].is_special_page
+]
+
 TOP10_FEED_PAGES_DEFAULT: List[str] = [
     p for p in ["Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds", "My_Portfolio"]
     if p in PAGE_INFO and PAGE_INFO[p].eligible_for_top10
@@ -355,8 +402,15 @@ ALIAS_TO_CANONICAL: Dict[str, str] = {}
 
 def _add_alias(alias: str, canonical: str) -> None:
     tok = _normalize_token(alias)
-    if tok:
-        ALIAS_TO_CANONICAL[tok] = canonical
+    if not tok:
+        return
+    prior = ALIAS_TO_CANONICAL.get(tok)
+    if prior and prior != canonical:
+        raise ValueError(
+            f"Alias collision for token '{tok}': '{prior}' vs '{canonical}'. "
+            f"Rename one of the conflicting aliases."
+        )
+    ALIAS_TO_CANONICAL[tok] = canonical
 
 
 # Canonical self aliases
@@ -368,7 +422,6 @@ for c in CANONICAL_PAGES:
     _add_alias(c.replace("_", "/"), c)
     _add_alias(c.replace("_", ""), c)
 
-# Generic route parameter names should never map accidentally, but page values should.
 # Friendly aliases
 _add_alias("Market Leaders", "Market_Leaders")
 _add_alias("Leaders", "Market_Leaders")
@@ -455,7 +508,7 @@ FORBIDDEN_ALIASES: Set[str] = {
 # Public helpers
 # --------------------------------------------------------------------------------------
 def page_info(page: str) -> PageInfo:
-    canonical = normalize_page_name(page, allow_output_pages=True)
+    canonical = normalize_page_name(page, allow_output_pages=True, allow_special_pages=True)
     return PAGE_INFO[canonical]
 
 
@@ -464,7 +517,7 @@ def allowed_pages() -> List[str]:
 
 
 def allowed_input_pages() -> List[str]:
-    return [p for p in CANONICAL_PAGES if p in PAGE_INFO and not PAGE_INFO[p].is_output_page]
+    return list(INPUT_PAGES)
 
 
 def get_page_aliases() -> Dict[str, str]:
@@ -486,7 +539,7 @@ def is_forbidden_page(page: str) -> bool:
 
 def is_output_page(page: str) -> bool:
     try:
-        canonical = normalize_page_name(page, allow_output_pages=True)
+        canonical = normalize_page_name(page, allow_output_pages=True, allow_special_pages=True)
     except Exception:
         return False
     return canonical in OUTPUT_PAGES
@@ -494,7 +547,7 @@ def is_output_page(page: str) -> bool:
 
 def is_special_page(page: str) -> bool:
     try:
-        canonical = normalize_page_name(page, allow_output_pages=True)
+        canonical = normalize_page_name(page, allow_output_pages=True, allow_special_pages=True)
     except Exception:
         return False
     return canonical in SPECIAL_PAGES
@@ -502,13 +555,26 @@ def is_special_page(page: str) -> bool:
 
 def is_instrument_page(page: str) -> bool:
     try:
-        canonical = normalize_page_name(page, allow_output_pages=True)
+        canonical = normalize_page_name(page, allow_output_pages=True, allow_special_pages=True)
     except Exception:
         return False
     return canonical in INSTRUMENT_PAGES
 
 
-def normalize_page_name(page: str, *, allow_output_pages: bool = True) -> str:
+def is_input_page(page: str) -> bool:
+    try:
+        canonical = normalize_input_page_name(page)
+    except Exception:
+        return False
+    return canonical in INSTRUMENT_PAGES
+
+
+def normalize_page_name(
+    page: str,
+    *,
+    allow_output_pages: bool = True,
+    allow_special_pages: bool = True,
+) -> str:
     raw = (page or "").strip()
     if not raw:
         raise ValueError("Page name is empty. Provide a valid page name.")
@@ -537,31 +603,77 @@ def normalize_page_name(page: str, *, allow_output_pages: bool = True) -> str:
             f"Allowed pages: {', '.join(CANONICAL_PAGES)}"
         )
 
-    if not allow_output_pages and PAGE_INFO[canonical].is_output_page:
+    info = PAGE_INFO[canonical]
+
+    if not allow_output_pages and info.is_output_page:
         raise ValueError(f"Page '{canonical}' is an output/meta sheet and not allowed for this operation.")
+
+    if not allow_special_pages and info.is_special_page:
+        raise ValueError(f"Page '{canonical}' is a special/output page and not allowed for this operation.")
 
     return canonical
 
 
+def normalize_input_page_name(page: str) -> str:
+    canonical = normalize_page_name(page, allow_output_pages=False, allow_special_pages=False)
+    info = PAGE_INFO.get(canonical)
+    if not info or not info.is_data_page:
+        raise ValueError(f"Page '{canonical}' is not a valid instrument/input page.")
+    return canonical
+
+
 def resolve_page(page: str) -> str:
-    return normalize_page_name(page, allow_output_pages=True)
+    return normalize_page_name(page, allow_output_pages=True, allow_special_pages=True)
 
 
 def canonicalize_page(page: str) -> str:
-    return normalize_page_name(page, allow_output_pages=True)
+    return normalize_page_name(page, allow_output_pages=True, allow_special_pages=True)
+
+
+def extract_page_candidate(value: Any) -> Optional[str]:
+    candidate = _extract_nested_page_candidate(value)
+    if isinstance(candidate, str) and candidate.strip():
+        return candidate.strip()
+    return None
+
+
+def resolve_page_candidate(
+    value: Any,
+    *,
+    allow_output_pages: bool = True,
+    allow_special_pages: bool = True,
+    required: bool = False,
+) -> Optional[str]:
+    candidate = extract_page_candidate(value)
+    if not candidate:
+        if required:
+            raise ValueError(
+                f"Could not resolve page candidate from fields: {', '.join(PAGE_PARAM_NAMES)}"
+            )
+        return None
+    return normalize_page_name(
+        candidate,
+        allow_output_pages=allow_output_pages,
+        allow_special_pages=allow_special_pages,
+    )
 
 
 def normalize_page_names(
     pages: Sequence[str],
     *,
     allow_output_pages: bool = True,
+    allow_special_pages: bool = True,
     dedupe: bool = True,
 ) -> List[str]:
     out: List[str] = []
     seen: Set[str] = set()
 
     for page in pages:
-        canonical = normalize_page_name(page, allow_output_pages=allow_output_pages)
+        canonical = normalize_page_name(
+            page,
+            allow_output_pages=allow_output_pages,
+            allow_special_pages=allow_special_pages,
+        )
         if dedupe:
             if canonical in seen:
                 continue
@@ -576,7 +688,7 @@ def get_top10_feed_pages(pages_override: Optional[Sequence[str]] = None) -> List
     normalized: List[str] = []
 
     for p in pages:
-        canonical = normalize_page_name(p, allow_output_pages=False)
+        canonical = normalize_input_page_name(p)
         info = PAGE_INFO.get(canonical)
         if info and info.eligible_for_top10 and info.is_data_page and not info.is_special_page:
             normalized.append(canonical)
@@ -600,7 +712,7 @@ def get_route_family(page: str) -> str:
     - "top10"
     - "dictionary"
     """
-    canonical = normalize_page_name(page, allow_output_pages=True)
+    canonical = normalize_page_name(page, allow_output_pages=True, allow_special_pages=True)
 
     if canonical == "Insights_Analysis":
         return "insights"
@@ -624,6 +736,17 @@ def validate_page_catalog() -> None:
     for canonical in CANONICAL_PAGES:
         if canonical not in _CANONICAL_FROM_SCHEMA:
             raise ValueError(f"Page '{canonical}' exists in page_catalog but not in schema_registry.")
+
+    # Canonical tokens must be unique after normalization
+    normalized_canonical_tokens: Dict[str, str] = {}
+    for canonical in CANONICAL_PAGES:
+        tok = _canonical_token_for_page(canonical)
+        prior = normalized_canonical_tokens.get(tok)
+        if prior and prior != canonical:
+            raise ValueError(
+                f"Canonical token collision after normalization: '{prior}' vs '{canonical}' -> '{tok}'"
+            )
+        normalized_canonical_tokens[tok] = canonical
 
     # Critical normalization checks
     must_resolve: List[Tuple[str, str]] = [
@@ -649,9 +772,25 @@ def validate_page_catalog() -> None:
         ("DataDict", "Data_Dictionary"),
     ]
     for raw, expected in must_resolve:
-        resolved = normalize_page_name(raw, allow_output_pages=True)
+        resolved = normalize_page_name(raw, allow_output_pages=True, allow_special_pages=True)
         if resolved != expected:
             raise ValueError(f"Normalization failed for '{raw}' -> '{resolved}' (expected '{expected}')")
+
+    # Payload-style resolution checks
+    payload_examples: List[Tuple[Any, str]] = [
+        ({"sheet": "Market Leaders"}, "Market_Leaders"),
+        ({"sheet_name": "GlobalMarkets"}, "Global_Markets"),
+        ({"page": "Commodities & FX"}, "Commodities_FX"),
+        ({"page_name": "Mutual Funds"}, "Mutual_Funds"),
+        ({"name": "My Portfolio"}, "My_Portfolio"),
+        ({"tab": "Insights Analysis"}, "Insights_Analysis"),
+        ({"worksheet": "Top10"}, "Top_10_Investments"),
+        ({"payload": {"sheet": "Data Dictionary"}}, "Data_Dictionary"),
+    ]
+    for value, expected in payload_examples:
+        resolved = resolve_page_candidate(value, required=True)
+        if resolved != expected:
+            raise ValueError(f"Payload resolution failed for {value!r} -> '{resolved}' (expected '{expected}')")
 
     # Aliases must map only to valid non-forbidden pages
     for alias_token, canonical in ALIAS_TO_CANONICAL.items():
@@ -675,6 +814,14 @@ def validate_page_catalog() -> None:
             raise ValueError(f"Output page '{op}' must be marked is_output_page=True.")
         if not PAGE_INFO[op].is_special_page:
             raise ValueError(f"Output page '{op}' must be marked is_special_page=True.")
+
+    # Input pages must be the non-special data pages only
+    expected_input_pages = [
+        p for p in CANONICAL_PAGES
+        if p in PAGE_INFO and PAGE_INFO[p].is_data_page and not PAGE_INFO[p].is_special_page
+    ]
+    if INPUT_PAGES != expected_input_pages:
+        raise ValueError(f"INPUT_PAGES drift detected: got {INPUT_PAGES!r}, expected {expected_input_pages!r}")
 
     # Top10 default feeds must be valid input universes
     for p in TOP10_FEED_PAGES_DEFAULT:
