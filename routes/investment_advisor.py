@@ -1,26 +1,26 @@
+
 #!/usr/bin/env python3
 """
 routes/investment_advisor.py
 ================================================================================
-ADVANCED INVESTMENT ADVISOR ROUTER — v2.6.0
+ADVANCED INVESTMENT ADVISOR ROUTER — v2.7.0
 ================================================================================
-ALIGNED • OFFSET-SAFE • BRIDGE-TOLERANT • CONTRACT-CORRECT • TOP10-HARDENED •
-JSON-SAFE • STARTUP-SAFE • REQUEST-ID SAFE • AUTH-TOLERANT • PAGE-AWARE
+OWNER-ALIGNED • ADVANCED-PREFIX OWNER • QUERY-PARSE SAFE • CONTRACT-CORRECT •
+TOP10-HARDENED • BRIDGE-TOLERANT • JSON-SAFE • STARTUP-SAFE • AUTH-TOLERANT
 
 What this revision improves
 ---------------------------
-- FIX: schema cache now preserves canonical headers and canonical keys together.
-       The prior pattern could rebuild keys from headers on cache hits, which
-       breaks projection and matrix alignment.
-- FIX: local offset is now honored consistently for builder / runner / bridge /
-       engine payloads, so advanced pagination is stable even when a downstream
-       callable ignores offset.
-- FIX: bridge dispatch now uses signature-tolerant invocation instead of one
-       oversized kwargs call that could fail on otherwise valid implementations.
-- FIX: row extraction accepts more payload shapes (rowObjects / payload nesting /
-       matrix-only payloads) without losing rows.
-- FIX: GET aliases now accept offset explicitly and route it through the same
-       normalized execution path as POST.
+- FIX: page/source parsing now preserves multi-word page names; symbol parsing is
+       handled separately so queries like "Market Leaders, Global Markets" stay
+       valid instead of being split into broken tokens.
+- FIX: page alias normalization now recognizes common source-page spellings with
+       spaces / hyphens / lowercase forms, improving GET compatibility.
+- FIX: response compatibility is widened with quotes / records / results aliases
+       alongside rows / row_objects / data / items / rows_matrix.
+- FIX: schema-only responses now keep the same compatibility aliases as live
+       responses for simpler downstream consumption.
+- FIX: route metadata now clearly identifies this module as the /v1/advanced
+       owner to align with the controlled runtime owner map.
 - SAFE: no import-time network work.
 """
 
@@ -32,6 +32,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 import uuid
 from dataclasses import asdict, is_dataclass
@@ -47,19 +48,21 @@ from fastapi.encoders import jsonable_encoder
 logger = logging.getLogger("routes.investment_advisor")
 logger.addHandler(logging.NullHandler())
 
-INVESTMENT_ADVISOR_VERSION = "2.6.0"
+INVESTMENT_ADVISOR_VERSION = "2.7.0"
+ROUTE_FAMILY_NAME = "advanced"
+ROUTE_OWNER_NAME = "investment_advisor"
 
 TOP10_PAGE_NAME = "Top_10_Investments"
 INSIGHTS_PAGE_NAME = "Insights_Analysis"
 DATA_DICTIONARY_PAGE_NAME = "Data_Dictionary"
 
-BASE_SOURCE_PAGES = {
+BASE_SOURCE_PAGES: Tuple[str, ...] = (
     "Market_Leaders",
     "Global_Markets",
     "Commodities_FX",
     "Mutual_Funds",
     "My_Portfolio",
-}
+)
 
 DERIVED_PAGES = {
     TOP10_PAGE_NAME,
@@ -107,20 +110,39 @@ TOP10_BUSINESS_SIGNAL_FIELDS: Tuple[str, ...] = (
 PAGE_ALIAS_MAP: Dict[str, str] = {
     "top10": TOP10_PAGE_NAME,
     "top_10": TOP10_PAGE_NAME,
+    "top-10": TOP10_PAGE_NAME,
     "top10investments": TOP10_PAGE_NAME,
     "top_10_investments": TOP10_PAGE_NAME,
     "top-10-investments": TOP10_PAGE_NAME,
     "top 10 investments": TOP10_PAGE_NAME,
     "investment_advisor": TOP10_PAGE_NAME,
     "investment-advisor": TOP10_PAGE_NAME,
+    "investment advisor": TOP10_PAGE_NAME,
     "advisor": TOP10_PAGE_NAME,
     "insights": INSIGHTS_PAGE_NAME,
     "insight": INSIGHTS_PAGE_NAME,
     "insights_analysis": INSIGHTS_PAGE_NAME,
     "insights-analysis": INSIGHTS_PAGE_NAME,
+    "insights analysis": INSIGHTS_PAGE_NAME,
     "data_dictionary": DATA_DICTIONARY_PAGE_NAME,
     "data-dictionary": DATA_DICTIONARY_PAGE_NAME,
+    "data dictionary": DATA_DICTIONARY_PAGE_NAME,
     "dictionary": DATA_DICTIONARY_PAGE_NAME,
+    "market_leaders": "Market_Leaders",
+    "market-leaders": "Market_Leaders",
+    "market leaders": "Market_Leaders",
+    "global_markets": "Global_Markets",
+    "global-markets": "Global_Markets",
+    "global markets": "Global_Markets",
+    "commodities_fx": "Commodities_FX",
+    "commodities-fx": "Commodities_FX",
+    "commodities fx": "Commodities_FX",
+    "mutual_funds": "Mutual_Funds",
+    "mutual-funds": "Mutual_Funds",
+    "mutual funds": "Mutual_Funds",
+    "my_portfolio": "My_Portfolio",
+    "my-portfolio": "My_Portfolio",
+    "my portfolio": "My_Portfolio",
 }
 
 TOP10_MODULE_CANDIDATES: Tuple[str, ...] = (
@@ -273,7 +295,6 @@ router = APIRouter(prefix="/v1/advanced", tags=["advanced"])
 
 try:
     from prometheus_client import CONTENT_TYPE_LATEST, generate_latest  # type: ignore
-
     PROMETHEUS_AVAILABLE = True
 except Exception:
     CONTENT_TYPE_LATEST = "text/plain"
@@ -375,7 +396,6 @@ _CANONICAL_TOP10_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("selection_reason", "Selection Reason"),
     ("criteria_snapshot", "Criteria Snapshot"),
 ]
-
 _CANONICAL_INSTRUMENT_SCHEMA_FALLBACK: List[Tuple[str, str]] = _CANONICAL_TOP10_SCHEMA_FALLBACK[:-3]
 _CANONICAL_INSIGHTS_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("section", "Section"),
@@ -399,6 +419,7 @@ _CANONICAL_DATA_DICTIONARY_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
 ]
 
 _SCHEMA_CACHE: Dict[str, Tuple[List[str], List[str]]] = {}
+_SOURCE_PAGES_SET = set(BASE_SOURCE_PAGES)
 
 
 def _s(v: Any) -> str:
@@ -447,31 +468,58 @@ def _boolish(v: Any, default: bool = False) -> bool:
     return default
 
 
-def _split_csv(text: str) -> List[str]:
-    raw = (text or "").replace(";", ",").replace("\n", ",").replace("\t", ",")
+def _dedupe_keep_order(values: Iterable[str]) -> List[str]:
     out: List[str] = []
     seen = set()
-    for part in raw.split(","):
-        item = _s(part)
-        if item and item not in seen:
-            seen.add(item)
-            out.append(item)
+    for item in values:
+        s = _s(item)
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
     return out
+
+
+def _split_csv(text: str) -> List[str]:
+    raw = (text or "").replace(";", ",").replace("\n", ",").replace("\t", ",")
+    return _dedupe_keep_order(part for part in raw.split(","))
+
+
+def _split_symbol_text(text: str) -> List[str]:
+    raw = _s(text)
+    if not raw:
+        return []
+    # Symbols/tickers are commonly provided comma/semicolon/space separated.
+    return _dedupe_keep_order(x for x in re.split(r"[\s,;]+", raw) if _s(x))
 
 
 def _normalize_list(value: Any) -> List[str]:
     if value is None:
         return []
     if isinstance(value, str):
-        return _split_csv(value.replace(" ", ","))
+        return _split_csv(value)
+    if isinstance(value, (list, tuple, set)):
+        return _dedupe_keep_order(_s(item) for item in value)
+    s = _s(value)
+    return [s] if s else []
+
+
+def _normalize_symbol_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return _split_symbol_text(value)
     if isinstance(value, (list, tuple, set)):
         out: List[str] = []
         seen = set()
         for item in value:
-            s = _s(item)
-            if s and s not in seen:
-                seen.add(s)
-                out.append(s)
+            if isinstance(item, str):
+                parts = _split_symbol_text(item)
+            else:
+                parts = [_s(item)]
+            for part in parts:
+                if part and part not in seen:
+                    seen.add(part)
+                    out.append(part)
         return out
     s = _s(value)
     return [s] if s else []
@@ -481,18 +529,7 @@ def _slice_rows(rows: List[Dict[str, Any]], *, offset: int, limit: int) -> List[
     start = max(0, int(offset or 0))
     if limit <= 0:
         return rows[start:]
-    return rows[start : start + limit]
-
-
-def _source_pages_only(values: Sequence[str]) -> List[str]:
-    out: List[str] = []
-    seen = set()
-    for item in values:
-        page = _normalize_page_name(item)
-        if page and page in BASE_SOURCE_PAGES and page not in seen:
-            seen.add(page)
-            out.append(page)
-    return out
+    return rows[start:start + limit]
 
 
 def _now_utc() -> str:
@@ -571,6 +608,13 @@ def _json_compact(value: Any) -> str:
         return _s(value)
 
 
+def _canonicalize_name(raw: str) -> str:
+    text = _s(raw).lower()
+    text = re.sub(r"[\s\-]+", "_", text)
+    text = re.sub(r"_+", "_", text)
+    return text.strip("_")
+
+
 def _normalize_page_name(value: Any) -> str:
     raw = _s(value)
     if not raw:
@@ -578,7 +622,6 @@ def _normalize_page_name(value: Any) -> str:
 
     try:
         from core.sheets.page_catalog import normalize_page_name as normalize_from_catalog  # type: ignore
-
         normalized = _s(normalize_from_catalog(raw))
         if normalized:
             return normalized
@@ -587,15 +630,25 @@ def _normalize_page_name(value: Any) -> str:
 
     try:
         from core.sheets.page_catalog import resolve_page_name as resolve_from_catalog  # type: ignore
-
         normalized = _s(resolve_from_catalog(raw))
         if normalized:
             return normalized
     except Exception:
         pass
 
-    compact = raw.strip().lower().replace(" ", "_")
-    return PAGE_ALIAS_MAP.get(compact, raw)
+    compact = _canonicalize_name(raw)
+    return PAGE_ALIAS_MAP.get(compact, PAGE_ALIAS_MAP.get(raw.strip().lower(), raw))
+
+
+def _source_pages_only(values: Sequence[str]) -> List[str]:
+    out: List[str] = []
+    seen = set()
+    for item in values:
+        page = _normalize_page_name(item)
+        if page in _SOURCE_PAGES_SET and page not in seen:
+            seen.add(page)
+            out.append(page)
+    return out
 
 
 def _page_family(page: str) -> str:
@@ -606,9 +659,9 @@ def _page_family(page: str) -> str:
         return "insights"
     if normalized == DATA_DICTIONARY_PAGE_NAME:
         return "data_dictionary"
-    if normalized in BASE_SOURCE_PAGES:
+    if normalized in _SOURCE_PAGES_SET:
         return "source"
-    return "advanced"
+    return ROUTE_FAMILY_NAME
 
 
 def _timeout_seconds(env_name: str, default: float) -> float:
@@ -620,7 +673,7 @@ def _resolver_timeout(stage: str, *, page: str) -> float:
     defaults = {
         "builder": 14.0 if page == TOP10_PAGE_NAME else 10.0,
         "runner": 12.0 if page == TOP10_PAGE_NAME else 16.0,
-        "bridge": 10.0 if page in BASE_SOURCE_PAGES or page == DATA_DICTIONARY_PAGE_NAME else 14.0,
+        "bridge": 10.0 if page in _SOURCE_PAGES_SET or page == DATA_DICTIONARY_PAGE_NAME else 14.0,
         "engine": 12.0 if page in DERIVED_PAGES else 16.0,
     }
     env_map = {
@@ -831,17 +884,21 @@ def _schema_fallback_for_page(page: str) -> Tuple[List[str], List[str]]:
 
 def _append_missing_headers(headers: List[str], fields: Sequence[str]) -> List[str]:
     out = list(headers)
+    existing = set(out)
     for field in fields:
-        if field not in out:
+        if field not in existing:
             out.append(field)
+            existing.add(field)
     return out
 
 
 def _append_missing_keys(keys: List[str], fields: Sequence[str]) -> List[str]:
     out = list(keys)
+    existing = set(out)
     for field in fields:
-        if field not in out:
+        if field not in existing:
             out.append(field)
+            existing.add(field)
     return out
 
 
@@ -871,14 +928,10 @@ def _extract_schema_headers_keys_from_spec(spec: Any) -> Tuple[List[str], List[s
     direct_headers = spec.get("headers") or spec.get("display_headers") or []
     direct_keys = spec.get("keys") or spec.get("fields") or spec.get("columns") or []
 
-    if isinstance(direct_headers, list):
-        headers = [_s(x) for x in direct_headers if _s(x)]
-    else:
-        headers = []
-    if isinstance(direct_keys, list):
-        keys = [_s(x) for x in direct_keys if _s(x)]
-    else:
-        keys = []
+    headers = [_s(x) for x in direct_headers] if isinstance(direct_headers, list) else []
+    keys = [_s(x) for x in direct_keys] if isinstance(direct_keys, list) else []
+    headers = [x for x in headers if x]
+    keys = [x for x in keys if x]
 
     if headers and keys:
         return headers, keys
@@ -907,10 +960,17 @@ def _extract_schema_headers_keys_from_spec(spec: Any) -> Tuple[List[str], List[s
 
     for nested_key in ("sheet", "spec", "schema", "contract", "definition"):
         nested = spec.get(nested_key)
-        headers, keys = _extract_schema_headers_keys_from_spec(nested)
-        if headers or keys:
-            return headers, keys
+        headers2, keys2 = _extract_schema_headers_keys_from_spec(nested)
+        if headers2 and keys2:
+            return headers2, keys2
     return headers, keys
+
+
+def _import_module_safely(name: str) -> Optional[Any]:
+    try:
+        return import_module(name)
+    except Exception:
+        return None
 
 
 def _load_schema_defaults(page: str) -> Tuple[List[str], List[str]]:
@@ -926,7 +986,6 @@ def _load_schema_defaults(page: str) -> Tuple[List[str], List[str]]:
 
     try:
         from core.sheets.schema_registry import get_sheet_spec  # type: ignore
-
         spec = get_sheet_spec(page)
         headers, keys = _extract_schema_headers_keys_from_spec(spec)
         if headers and keys:
@@ -963,13 +1022,7 @@ def _load_schema_defaults(page: str) -> Tuple[List[str], List[str]]:
             fn = getattr(module, fn_name, None)
             if not callable(fn):
                 continue
-            for kwargs in (
-                {"sheet": page},
-                {"page": page},
-                {"sheet_name": page},
-                {"name": page},
-                {},
-            ):
+            for kwargs in ({"sheet": page}, {"page": page}, {"sheet_name": page}, {"name": page}, {}):
                 try:
                     out = fn(**kwargs) if kwargs else fn(page)
                 except TypeError:
@@ -1082,7 +1135,7 @@ def _extract_rows_candidate(payload: Any, *, keys_hint: Optional[List[str]] = No
         if not isinstance(payload, dict):
             return []
 
-    local_headers, local_keys = _extract_headers_and_keys(payload)
+    _, local_keys = _extract_headers_and_keys(payload)
     effective_keys = list(keys_hint or local_keys or [])
 
     for key in (
@@ -1120,7 +1173,7 @@ def _extract_rows_candidate(payload: Any, *, keys_hint: Optional[List[str]] = No
     nested = payload.get("payload")
     if isinstance(nested, dict):
         nested_headers, nested_keys = _extract_headers_and_keys(nested)
-        return _extract_rows_candidate(nested, keys_hint=effective_keys or nested_keys or local_keys or nested_headers)
+        return _extract_rows_candidate(nested, keys_hint=effective_keys or nested_keys or nested_headers)
 
     return []
 
@@ -1198,60 +1251,7 @@ def _apply_top10_field_backfill(rows: List[Dict[str, Any]], *, keys: List[str], 
 def _ensure_schema_projection(rows: List[Dict[str, Any]], keys: List[str]) -> List[Dict[str, Any]]:
     if not keys:
         return [dict(r) for r in rows if isinstance(r, dict)]
-    out: List[Dict[str, Any]] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        out.append({k: row.get(k, None) for k in keys})
-    return out
-
-
-def _normalize_page_payload(
-    payload: Any,
-    *,
-    target_page: str,
-    criteria_used: Dict[str, Any],
-    eff_limit: int,
-    eff_offset: int,
-    forced_dispatch: str = "",
-) -> Tuple[List[str], List[str], List[Dict[str, Any]], Dict[str, Any], str]:
-    if isinstance(payload, dict):
-        payload_dict = dict(payload)
-    elif isinstance(payload, list):
-        payload_dict = {"rows": payload}
-    else:
-        payload_dict = _model_to_dict(payload)
-
-    headers, keys = _extract_headers_and_keys(payload_dict)
-    if not headers or not keys:
-        schema_headers, schema_keys = _load_schema_defaults(target_page)
-        if not headers:
-            headers = schema_headers
-        if not keys:
-            keys = schema_keys
-
-    if _normalize_page_name(target_page) == TOP10_PAGE_NAME:
-        headers = _append_missing_headers(list(headers), TOP10_SPECIAL_FIELDS)
-        keys = _append_missing_keys(list(keys), TOP10_SPECIAL_FIELDS)
-
-    rows = _extract_rows_candidate(payload_dict, keys_hint=keys)
-    if not rows and isinstance(payload_dict.get("payload"), dict):
-        rows = _extract_rows_candidate(payload_dict.get("payload"), keys_hint=keys)
-
-    status_out = _s(payload_dict.get("status")) or ("success" if rows else "partial")
-    dict_rows = [dict(r) for r in rows if isinstance(r, dict)]
-
-    if _normalize_page_name(target_page) == TOP10_PAGE_NAME:
-        dict_rows = _apply_top10_field_backfill(dict_rows, keys=keys, criteria=criteria_used)
-        dict_rows = _rank_rows_in_order(dict_rows)
-
-    norm_rows = _ensure_schema_projection(dict_rows, keys)
-    norm_rows = _slice_rows(norm_rows, offset=eff_offset, limit=eff_limit)
-
-    meta = payload_dict.get("meta") if isinstance(payload_dict.get("meta"), dict) else {}
-    if forced_dispatch and not _s(meta.get("dispatch")):
-        meta["dispatch"] = forced_dispatch
-    return headers, keys, norm_rows, dict(meta), status_out
+    return [{k: row.get(k, None) for k in keys} for row in rows if isinstance(row, dict)]
 
 
 def _looks_like_fallback_only_top10(rows: List[Dict[str, Any]], meta: Mapping[str, Any]) -> bool:
@@ -1304,10 +1304,12 @@ def _schema_only_payload(
     keys: List[str],
     include_matrix: bool,
     meta: Dict[str, Any],
+    status_value: str = "partial",
 ) -> Dict[str, Any]:
+    rows: List[Dict[str, Any]] = []
     rows_matrix = [] if include_matrix and keys else None
-    return {
-        "status": "partial",
+    payload = {
+        "status": status_value,
         "page": target_page,
         "sheet": target_page,
         "sheet_name": target_page,
@@ -1315,15 +1317,69 @@ def _schema_only_payload(
         "headers": headers,
         "display_headers": headers,
         "keys": keys,
-        "rows": [],
-        "row_objects": [],
-        "items": [],
-        "data": [],
+        "rows": rows,
+        "row_objects": rows,
+        "records": rows,
+        "results": rows,
+        "items": rows,
+        "data": rows,
+        "quotes": rows,
         "rows_matrix": rows_matrix,
         "version": INVESTMENT_ADVISOR_VERSION,
         "request_id": request_id,
         "meta": meta,
     }
+    return payload
+
+
+def _normalize_page_payload(
+    payload: Any,
+    *,
+    target_page: str,
+    criteria_used: Dict[str, Any],
+    eff_limit: int,
+    eff_offset: int,
+    forced_dispatch: str = "",
+) -> Tuple[List[str], List[str], List[Dict[str, Any]], Dict[str, Any], str]:
+    if isinstance(payload, dict):
+        payload_dict = dict(payload)
+    elif isinstance(payload, list):
+        payload_dict = {"rows": payload}
+    else:
+        payload_dict = _model_to_dict(payload)
+
+    headers, keys = _extract_headers_and_keys(payload_dict)
+    if not headers or not keys:
+        schema_headers, schema_keys = _load_schema_defaults(target_page)
+        if not headers:
+            headers = schema_headers
+        if not keys:
+            keys = schema_keys
+
+    if _normalize_page_name(target_page) == TOP10_PAGE_NAME:
+        headers = _append_missing_headers(list(headers), TOP10_SPECIAL_FIELDS)
+        keys = _append_missing_keys(list(keys), TOP10_SPECIAL_FIELDS)
+
+    rows = _extract_rows_candidate(payload_dict, keys_hint=keys)
+    if not rows and isinstance(payload_dict.get("payload"), dict):
+        rows = _extract_rows_candidate(payload_dict.get("payload"), keys_hint=keys)
+
+    status_out = _s(payload_dict.get("status")) or ("success" if rows else "partial")
+    dict_rows = [dict(r) for r in rows if isinstance(r, dict)]
+
+    if _normalize_page_name(target_page) == TOP10_PAGE_NAME:
+        dict_rows = _apply_top10_field_backfill(dict_rows, keys=keys, criteria=criteria_used)
+        dict_rows = _rank_rows_in_order(dict_rows)
+
+    norm_rows = _ensure_schema_projection(dict_rows, keys)
+    norm_rows = _slice_rows(norm_rows, offset=eff_offset, limit=eff_limit)
+
+    meta = payload_dict.get("meta") if isinstance(payload_dict.get("meta"), dict) else {}
+    if forced_dispatch and not _s(meta.get("dispatch")):
+        meta["dispatch"] = forced_dispatch
+    meta.setdefault("route_owner", ROUTE_OWNER_NAME)
+    meta.setdefault("route_family", ROUTE_FAMILY_NAME)
+    return headers, keys, norm_rows, dict(meta), status_out
 
 
 def _flatten_criteria(body: Dict[str, Any]) -> Dict[str, Any]:
@@ -1345,6 +1401,8 @@ def _flatten_criteria(body: Dict[str, Any]) -> Dict[str, Any]:
         "pages_selected",
         "pages",
         "selected_pages",
+        "source_pages",
+        "sources",
         "direct_symbols",
         "symbols",
         "tickers",
@@ -1385,7 +1443,10 @@ def _effective_limit(body: Dict[str, Any], limit_q: Optional[int]) -> int:
     if isinstance(limit_q, int):
         eff = limit_q
     else:
-        eff = _safe_int(body.get("limit") or body.get("top_n") or _safe_dict(body.get("criteria")).get("top_n") or default_limit, default_limit)
+        eff = _safe_int(
+            body.get("limit") or body.get("top_n") or _safe_dict(body.get("criteria")).get("top_n") or default_limit,
+            default_limit,
+        )
     return max(1, min(max_limit, int(eff)))
 
 
@@ -1398,9 +1459,11 @@ def _prepare_effective_criteria(body: Dict[str, Any], eff_limit: int, eff_offset
     crit["sheet"] = target_page
     crit["sheet_name"] = target_page
 
-    pages = _normalize_list(crit.get("pages_selected") or crit.get("pages") or crit.get("selected_pages"))
+    pages = _normalize_list(
+        crit.get("pages_selected") or crit.get("pages") or crit.get("selected_pages") or crit.get("source_pages") or crit.get("sources")
+    )
     pages = _source_pages_only(pages)
-    direct_symbols = _normalize_list(crit.get("direct_symbols") or crit.get("symbols") or crit.get("tickers"))
+    direct_symbols = _normalize_symbol_list(crit.get("direct_symbols") or crit.get("symbols") or crit.get("tickers"))
 
     request_unconstrained = (not pages) and (not direct_symbols) and target_page == TOP10_PAGE_NAME
     pages_explicit = bool(pages)
@@ -1472,7 +1535,7 @@ def _narrow_criteria_for_fallback(criteria: Dict[str, Any], eff_limit: int) -> D
     fallback_pages_cap = max(1, min(10, _safe_int(os.getenv("ADV_TOP10_FALLBACK_MAX_PAGES"), 2)))
     fallback_top_n = max(1, min(eff_limit, _safe_int(os.getenv("ADV_TOP10_FALLBACK_TOP_N"), min(3, eff_limit))))
 
-    direct_symbols = _normalize_list(narrowed.get("direct_symbols") or narrowed.get("symbols") or narrowed.get("tickers"))
+    direct_symbols = _normalize_symbol_list(narrowed.get("direct_symbols") or narrowed.get("symbols") or narrowed.get("tickers"))
     pages = _normalize_list(narrowed.get("pages_selected") or narrowed.get("pages") or narrowed.get("selected_pages"))
     pages = _source_pages_only(pages)
 
@@ -1497,13 +1560,6 @@ def _narrow_criteria_for_fallback(criteria: Dict[str, Any], eff_limit: int) -> D
         narrowed["limit"] = eff_limit
         narrowed["enrich_final"] = True
     return narrowed
-
-
-def _import_module_safely(name: str) -> Optional[Any]:
-    try:
-        return import_module(name)
-    except Exception:
-        return None
 
 
 def _callable_by_names(container: Any, names: Iterable[str]) -> Optional[Tuple[Callable[..., Any], str]]:
@@ -1906,6 +1962,7 @@ async def _delegate_to_bridge_sheet_rows(
         meta.setdefault("dispatch", "advanced_bridge")
         meta.setdefault("bridge_source", src)
         meta.setdefault("bridge_name", name)
+        meta.setdefault("route_owner", ROUTE_OWNER_NAME)
         payload["meta"] = meta
         return payload
     except Exception as exc:
@@ -1927,7 +1984,7 @@ async def _try_engine_page_fallback(
         return None
 
     page = _normalize_page_name(criteria.get("page") or criteria.get("sheet") or criteria.get("sheet_name") or TOP10_PAGE_NAME)
-    query_symbols = _normalize_list(criteria.get("direct_symbols") or criteria.get("symbols") or criteria.get("tickers"))
+    query_symbols = _normalize_symbol_list(criteria.get("direct_symbols") or criteria.get("symbols") or criteria.get("tickers"))
     family = _page_family(page)
 
     call_plans: List[Tuple[str, Dict[str, Any]]] = []
@@ -2050,6 +2107,7 @@ async def _try_engine_page_fallback(
             payload["status"] = "success"
         meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
         meta.setdefault("dispatch", f"engine.{method_name}")
+        meta.setdefault("route_owner", ROUTE_OWNER_NAME)
         payload["meta"] = meta
         return payload
     return None
@@ -2091,6 +2149,8 @@ async def _execute_advanced_request(
     if schema_only_final:
         meta = {
             "route_version": INVESTMENT_ADVISOR_VERSION,
+            "route_owner": ROUTE_OWNER_NAME,
+            "route_family": ROUTE_FAMILY_NAME,
             "request_id": request_id,
             "limit": eff_limit,
             "offset": eff_offset,
@@ -2121,6 +2181,8 @@ async def _execute_advanced_request(
     if engine is None:
         meta = {
             "route_version": INVESTMENT_ADVISOR_VERSION,
+            "route_owner": ROUTE_OWNER_NAME,
+            "route_family": ROUTE_FAMILY_NAME,
             "request_id": request_id,
             "limit": eff_limit,
             "offset": eff_offset,
@@ -2351,7 +2413,7 @@ async def _execute_advanced_request(
                         selected_payload = {"status": status_out, "headers": headers, "keys": keys, "rows": norm_rows, "meta": meta_in}
                         selected_source = "engine_fallback"
 
-    elif target_page == DATA_DICTIONARY_PAGE_NAME or target_page in BASE_SOURCE_PAGES:
+    elif target_page == DATA_DICTIONARY_PAGE_NAME or target_page in _SOURCE_PAGES_SET:
         bridge_payload = await _delegate_to_bridge_sheet_rows(
             request=request,
             body=_body_for_bridge(effective_criteria),
@@ -2449,6 +2511,8 @@ async def _execute_advanced_request(
     if selected_payload is None:
         meta = {
             "route_version": INVESTMENT_ADVISOR_VERSION,
+            "route_owner": ROUTE_OWNER_NAME,
+            "route_family": ROUTE_FAMILY_NAME,
             "request_id": request_id,
             "limit": eff_limit,
             "offset": eff_offset,
@@ -2498,24 +2562,20 @@ async def _execute_advanced_request(
     norm_rows = list(selected_payload.get("rows") or [])
     meta_in = selected_payload.get("meta") if isinstance(selected_payload.get("meta"), dict) else {}
     status_out = _s(selected_payload.get("status")) or ("success" if norm_rows else "partial")
-
     build_status = _s(meta_in.get("build_status")) or ("OK" if norm_rows else "WARN")
 
     merged_warnings = list(warnings)
     meta_warnings = meta_in.get("warnings")
     if isinstance(meta_warnings, list):
         merged_warnings.extend([_s(x) for x in meta_warnings if _s(x)])
-    dedup_warnings: List[str] = []
-    seen_warn = set()
-    for item in merged_warnings:
-        if item and item not in seen_warn:
-            seen_warn.add(item)
-            dedup_warnings.append(item)
+    dedup_warnings = _dedupe_keep_order(merged_warnings)
 
     meta = dict(meta_in)
     meta.update(
         {
             "route_version": INVESTMENT_ADVISOR_VERSION,
+            "route_owner": ROUTE_OWNER_NAME,
+            "route_family": ROUTE_FAMILY_NAME,
             "request_id": request_id,
             "limit": eff_limit,
             "offset": eff_offset,
@@ -2555,6 +2615,7 @@ async def _execute_advanced_request(
         }
     )
 
+    rows_matrix = _rows_to_matrix(norm_rows, keys) if include_matrix_final and keys else None
     response = {
         "status": status_out,
         "page": target_page,
@@ -2566,9 +2627,12 @@ async def _execute_advanced_request(
         "keys": keys,
         "rows": norm_rows,
         "row_objects": norm_rows,
+        "records": norm_rows,
+        "results": norm_rows,
         "data": norm_rows,
         "items": norm_rows,
-        "rows_matrix": _rows_to_matrix(norm_rows, keys) if include_matrix_final and keys else None,
+        "quotes": norm_rows,
+        "rows_matrix": rows_matrix,
         "version": INVESTMENT_ADVISOR_VERSION,
         "request_id": request_id,
         "meta": meta,
@@ -2587,6 +2651,8 @@ async def advanced_health(request: Request) -> Dict[str, Any]:
             "status": "ok" if engine else "degraded",
             "service": "advanced_investment_advisor",
             "version": INVESTMENT_ADVISOR_VERSION,
+            "route_owner": ROUTE_OWNER_NAME,
+            "route_family": ROUTE_FAMILY_NAME,
             "engine_available": bool(engine),
             "engine_type": type(engine).__name__ if engine else "none",
             "top10_builder_available": bool(top10_builder),
@@ -2616,7 +2682,8 @@ async def advanced_meta(request: Request) -> Dict[str, Any]:
         {
             "status": "success",
             "version": INVESTMENT_ADVISOR_VERSION,
-            "route_family": "advanced",
+            "route_owner": ROUTE_OWNER_NAME,
+            "route_family": ROUTE_FAMILY_NAME,
             "engine_present": bool(engine),
             "engine_type": type(engine).__name__ if engine else "none",
             "top10_builder_available": bool(top10_builder),
@@ -2693,8 +2760,8 @@ async def advanced_request_get(
     tab: Optional[str] = Query(default=None),
     symbols: Optional[str] = Query(default=None, description="Comma/space separated symbols"),
     tickers: Optional[str] = Query(default=None, description="Comma/space separated tickers"),
-    pages: Optional[str] = Query(default=None, description="Comma/space separated source pages"),
-    sources: Optional[str] = Query(default=None, description="Comma/space separated source pages"),
+    pages: Optional[str] = Query(default=None, description="Comma separated source pages"),
+    sources: Optional[str] = Query(default=None, description="Comma separated source pages"),
     risk_level: Optional[str] = Query(default=None),
     risk_profile: Optional[str] = Query(default=None),
     confidence_level: Optional[str] = Query(default=None),
@@ -2718,7 +2785,7 @@ async def advanced_request_get(
     _require_auth_or_401(request=request, token_query=token, x_app_token=x_app_token, authorization=authorization)
 
     target_page = _normalize_page_name(page or sheet or sheet_name or name or tab or TOP10_PAGE_NAME)
-    direct_symbols = _normalize_list(symbols) or _normalize_list(tickers)
+    direct_symbols = _normalize_symbol_list(symbols) or _normalize_symbol_list(tickers)
     selected_pages = _normalize_list(pages) or _normalize_list(sources)
 
     body: Dict[str, Any] = {
