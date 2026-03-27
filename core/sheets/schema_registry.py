@@ -2,7 +2,7 @@
 # core/sheets/schema_registry.py
 """
 ================================================================================
-Schema Registry — v2.1.2 (CANONICAL / SHEET-FIRST / STARTUP-SAFE)
+Schema Registry — v2.2.0 (CANONICAL / SHEET-FIRST / STARTUP-SAFE / ALIAS-HARDENED)
 ================================================================================
 Tadawul Fast Bridge (TFB)
 
@@ -24,13 +24,15 @@ Special sheets (must NOT fall back to the 80-col instrument schema):
 - Top_10_Investments: 83 columns (80 canonical + 3 Top10 extras)
 - Data_Dictionary: 9 columns (generated from registry)
 
-v2.1.2 FIX (addresses “❌ red X” causes)
+v2.2.0 FIX (addresses alignment + lookup drift causes)
 - ✅ Sanitization keeps removing BLANK/EMPTY columns.
 - ✅ FIX: Top10 extra columns are sanitized as a *fragment* (no “first column must be symbol” rule).
   This prevents import-time validation crashes that cause schema endpoints to fail and downstream
   consumers to fall back to tiny schemas (Symbol/Error only).
 - ✅ Startup-safe validation: by default, validation errors do NOT crash import.
   Set STRICT_SCHEMA_VALIDATION=1 to raise (CI / tests).
+- ✅ Canonical sheet lookup now supports stable aliases / case / space / hyphen variants.
+- ✅ Snapshot digest now captures groups / formats / required flags for stronger drift detection.
 
 ================================================================================
 """
@@ -54,6 +56,8 @@ __all__ = [
     "SCHEMA_VALIDATION_ERRORS",
     "list_sheets",
     "get_sheet_spec",
+    "has_sheet",
+    "normalize_sheet_name",
     "get_sheet_columns",
     "get_sheet_headers",
     "get_sheet_keys",
@@ -65,7 +69,7 @@ __all__ = [
     "validate_schema_registry",
 ]
 
-SCHEMA_VERSION = "2.1.2"
+SCHEMA_VERSION = "2.2.0"
 
 # -----------------------------
 # Types / Models
@@ -461,6 +465,109 @@ CANONICAL_SHEETS: Tuple[str, ...] = (
 )
 
 # -----------------------------
+# Name normalization / aliases
+# -----------------------------
+
+def _sheet_name_variants(value: Any) -> List[str]:
+    raw = str(value or "").strip()
+    if not raw:
+        return []
+
+    compact = raw.replace("-", "_").replace(" ", "_")
+    lowered = compact.lower()
+    collapsed = lowered.replace("__", "_")
+    variants = [raw, compact, lowered, collapsed, lowered.replace("_", "")]
+    if raw:
+        variants.extend([raw.lower(), raw.upper(), raw.title()])
+
+    seen = set()
+    out: List[str] = []
+    for item in variants:
+        s = str(item or "").strip()
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+def _build_sheet_alias_map() -> Dict[str, str]:
+    alias_map: Dict[str, str] = {}
+
+    explicit = {
+        "marketleaders": "Market_Leaders",
+        "market_leaders": "Market_Leaders",
+        "market leaders": "Market_Leaders",
+        "globalmarkets": "Global_Markets",
+        "global_markets": "Global_Markets",
+        "global markets": "Global_Markets",
+        "commoditiesfx": "Commodities_FX",
+        "commodities_fx": "Commodities_FX",
+        "commodities fx": "Commodities_FX",
+        "mutualfunds": "Mutual_Funds",
+        "mutual_funds": "Mutual_Funds",
+        "mutual funds": "Mutual_Funds",
+        "myportfolio": "My_Portfolio",
+        "my_portfolio": "My_Portfolio",
+        "my portfolio": "My_Portfolio",
+        "insights": "Insights_Analysis",
+        "insightsanalysis": "Insights_Analysis",
+        "insights_analysis": "Insights_Analysis",
+        "insights analysis": "Insights_Analysis",
+        "top10": "Top_10_Investments",
+        "top_10": "Top_10_Investments",
+        "top 10": "Top_10_Investments",
+        "top10investments": "Top_10_Investments",
+        "top_10_investments": "Top_10_Investments",
+        "top 10 investments": "Top_10_Investments",
+        "top10_investments": "Top_10_Investments",
+        "datadictionary": "Data_Dictionary",
+        "data_dictionary": "Data_Dictionary",
+        "data dictionary": "Data_Dictionary",
+        "dictionary": "Data_Dictionary",
+    }
+    alias_map.update(explicit)
+
+    for canonical in CANONICAL_SHEETS:
+        for variant in _sheet_name_variants(canonical):
+            alias_map.setdefault(variant, canonical)
+            alias_map.setdefault(variant.lower(), canonical)
+            alias_map.setdefault(variant.replace("_", " ").lower(), canonical)
+            alias_map.setdefault(variant.replace("_", "").lower(), canonical)
+
+    return alias_map
+
+
+_SHEET_ALIAS_MAP: Dict[str, str] = _build_sheet_alias_map()
+
+
+def normalize_sheet_name(sheet: Any) -> str:
+    raw = str(sheet or "").strip()
+    if not raw:
+        return ""
+
+    # Explicitly keep removed/forbidden pages out of the registry contract.
+    forbidden = raw.replace("-", "_").replace(" ", "_").strip().lower()
+    if forbidden in {"ksa_tadawul", "ksa tadawul", "ksatadawul", "advisor_criteria", "advisor criteria", "advisorcriteria"}:
+        return ""
+
+    if raw in SCHEMA_REGISTRY:
+        return raw
+
+    for variant in _sheet_name_variants(raw):
+        if variant in SCHEMA_REGISTRY:
+            return variant
+        mapped = _SHEET_ALIAS_MAP.get(variant) or _SHEET_ALIAS_MAP.get(variant.lower())
+        if mapped:
+            return mapped
+
+    return raw
+
+
+def has_sheet(sheet: Any) -> bool:
+    canonical = normalize_sheet_name(sheet)
+    return bool(canonical and canonical in SCHEMA_REGISTRY)
+
+# -----------------------------
 # Public helpers
 # -----------------------------
 
@@ -471,11 +578,11 @@ def list_sheets() -> List[str]:
 
 
 def get_sheet_spec(sheet: str) -> SheetSpec:
-    s = (sheet or "").strip()
-    try:
-        return SCHEMA_REGISTRY[s]
-    except KeyError as e:
-        raise KeyError(f"Unknown sheet '{s}'. Known: {', '.join(list_sheets())}") from e
+    requested = str(sheet or "").strip()
+    canonical = normalize_sheet_name(requested)
+    if canonical and canonical in SCHEMA_REGISTRY:
+        return SCHEMA_REGISTRY[canonical]
+    raise KeyError(f"Unknown sheet '{requested}'. Known: {', '.join(list_sheets())}")
 
 
 def get_sheet_columns(sheet: str) -> Tuple[ColumnSpec, ...]:
@@ -519,7 +626,7 @@ _build_indexes()
 
 
 def get_sheet_key_index(sheet: str) -> Dict[str, int]:
-    s = (sheet or "").strip()
+    s = normalize_sheet_name(sheet)
     if s in _KEY_INDEX:
         return _KEY_INDEX[s]
     _ = get_sheet_spec(s)
@@ -528,7 +635,7 @@ def get_sheet_key_index(sheet: str) -> Dict[str, int]:
 
 
 def get_sheet_header_index(sheet: str) -> Dict[str, int]:
-    s = (sheet or "").strip()
+    s = normalize_sheet_name(sheet)
     if s in _HEADER_INDEX:
         return _HEADER_INDEX[s]
     _ = get_sheet_spec(s)
@@ -549,8 +656,20 @@ def schema_registry_snapshot() -> Dict[str, Dict[str, Any]]:
             "len": len(spec.columns),
             "headers": [c.header for c in spec.columns],
             "keys": [c.key for c in spec.columns],
+            "groups": [c.group for c in spec.columns],
             "dtypes": [c.dtype for c in spec.columns],
+            "formats": [c.fmt for c in spec.columns],
+            "required": [bool(c.required) for c in spec.columns],
             "criteria_fields": [cf.key for cf in spec.criteria_fields],
+            "criteria_fields_meta": [
+                {
+                    "key": cf.key,
+                    "label": cf.label,
+                    "dtype": cf.dtype,
+                    "default": cf.default,
+                }
+                for cf in spec.criteria_fields
+            ],
             "notes": spec.notes,
         }
     return out
@@ -578,6 +697,16 @@ def validate_schema_registry(registry: Optional[Dict[str, SheetSpec]] = None) ->
     for s in CANONICAL_SHEETS:
         if s not in reg:
             raise ValueError(f"Missing required sheet in registry: {s}")
+
+    normalized_seen: Dict[str, str] = {}
+    for sheet_name in reg.keys():
+        norm = normalize_sheet_name(sheet_name) or str(sheet_name or "").strip()
+        compact = norm.replace("-", "_").replace(" ", "_").lower()
+        if compact in normalized_seen and normalized_seen[compact] != sheet_name:
+            raise ValueError(
+                f"Schema registry normalized-name collision: '{normalized_seen[compact]}' and '{sheet_name}' -> '{compact}'"
+            )
+        normalized_seen[compact] = sheet_name
 
     for sheet_name, spec in reg.items():
         sn = (sheet_name or "").strip()
