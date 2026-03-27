@@ -2,7 +2,7 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.43.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.43.2
 ================================================================================
 
 WHY v5.43.0
@@ -25,6 +25,8 @@ WHY v5.43.0
        quote payloads are sparse or unavailable.
 - FIX: applies symbol-aware page defaults so Commodities_FX rows keep useful
        identity/context fields even during provider degradation.
+- FIX: restores missing internal Top10 fallback builder so sheet generation
+       does not fail when the external selector is unavailable or returns empty.
 
 Design goals
 ------------
@@ -76,7 +78,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.43.1"
+__version__ = "5.43.2"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -3382,6 +3384,127 @@ class DataEngineV5:
                 )
 
         return rows[:limit]
+
+
+    async def _build_top10_rows_fallback(
+        self,
+        headers: Sequence[str],
+        keys: Sequence[str],
+        body: Optional[Dict[str, Any]],
+        limit: int,
+        mode: str = "",
+    ) -> Tuple[List[str], List[str], List[Dict[str, Any]]]:
+        headers2, keys2 = _ensure_top10_contract(headers, keys)
+        body = dict(body or {})
+        criteria = dict(body.get("criteria") or {}) if isinstance(body.get("criteria"), dict) else {}
+
+        selected_pages = _extract_top10_pages_from_body(body)
+        if not selected_pages:
+            selected_pages = criteria.get("pages_selected") or criteria.get("pages") or []
+            if not isinstance(selected_pages, (list, tuple, set)):
+                selected_pages = [selected_pages] if _safe_str(selected_pages) else []
+            selected_pages = [_canonicalize_sheet_name(_safe_str(p)) for p in selected_pages if _safe_str(p)]
+        if not selected_pages:
+            selected_pages = list(TOP10_ENGINE_DEFAULT_PAGES)
+        selected_pages = [
+            p
+            for p in _dedupe_keep_order(selected_pages)
+            if p and p not in {"Top_10_Investments", "Insights_Analysis", "Data_Dictionary"}
+        ]
+        criteria.setdefault("pages_selected", selected_pages)
+
+        top_n = _safe_int(
+            criteria.get("top_n") or body.get("top_n") or limit or 10,
+            default=10,
+            lo=1,
+            hi=max(1, min(limit or 10, 50)),
+        )
+        scan_limit = max(top_n * 12, min(max(limit, 25) * 8, 400))
+
+        candidate_symbols: List[str] = []
+        candidate_symbols.extend(_extract_requested_symbols_from_body(body, limit=scan_limit))
+
+        for page_name in selected_pages:
+            syms = await self.get_sheet_symbols(page_name, limit=scan_limit, body=body)
+            if syms:
+                candidate_symbols.extend(syms)
+            if len(candidate_symbols) >= scan_limit:
+                break
+
+        if not candidate_symbols:
+            for page_name in TOP10_ENGINE_DEFAULT_PAGES:
+                candidate_symbols.extend(EMERGENCY_PAGE_SYMBOLS.get(page_name, []))
+                if len(candidate_symbols) >= scan_limit:
+                    break
+
+        candidate_symbols = _normalize_symbol_list(candidate_symbols, limit=scan_limit)
+        if not candidate_symbols:
+            return headers2, keys2, []
+
+        quotes = await self.get_enriched_quotes(candidate_symbols, schema=None)
+        rows_all: List[Dict[str, Any]] = []
+        for quote in quotes:
+            row = _model_to_dict(quote)
+            if not isinstance(row, dict):
+                continue
+            row = _apply_page_row_backfill("Top_10_Investments", row)
+            _compute_scores_fallback(row)
+            _compute_recommendation(row)
+            rows_all.append(row)
+
+        if not rows_all:
+            return headers2, keys2, []
+
+        min_roi = _as_pct_fraction(criteria.get("min_expected_roi"))
+        conf_req = _as_float(criteria.get("min_confidence_score"))
+        if conf_req is None:
+            conf_req = _as_float(criteria.get("confidence_score"))
+        if conf_req is None:
+            conf_level = _safe_str(criteria.get("confidence_level")).upper()
+            if conf_level in {"HIGH", "MEDIUM", "LOW"}:
+                conf_req = {"HIGH": 70.0, "MEDIUM": 55.0, "LOW": 40.0}[conf_level]
+
+        risk_pref = _safe_str(criteria.get("risk_level") or criteria.get("risk_bucket")).upper()
+        risk_rank = {"LOW": 0, "MODERATE": 1, "MEDIUM": 1, "HIGH": 2}
+
+        filtered: List[Dict[str, Any]] = []
+        for row in rows_all:
+            roi3 = _as_pct_fraction(row.get("expected_roi_3m"))
+            conf = _as_float(row.get("confidence_score"))
+            bucket = _safe_str(row.get("risk_bucket")).upper()
+            if min_roi is not None and roi3 is not None and roi3 < min_roi:
+                continue
+            if conf_req is not None and conf is not None and conf < conf_req:
+                continue
+            if risk_pref in risk_rank and bucket in risk_rank and risk_rank[bucket] > risk_rank[risk_pref]:
+                continue
+            filtered.append(row)
+
+        ranked_pool = filtered or rows_all
+        _apply_rank_overall(ranked_pool)
+        ranked_pool.sort(
+            key=lambda r: (
+                1 if _as_float(r.get("current_price")) is not None else 0,
+                _as_float(r.get("opportunity_score")) or -1e9,
+                _as_float(r.get("overall_score")) or -1e9,
+                _as_float(r.get("confidence_score")) or -1e9,
+                -((_as_float(r.get("risk_score")) or 1000.0)),
+                _as_float(r.get("expected_roi_3m")) or -1e9,
+                _as_float(r.get("expected_roi_12m")) or -1e9,
+            ),
+            reverse=True,
+        )
+
+        criteria_snapshot = _top10_criteria_snapshot(criteria)
+        projected: List[Dict[str, Any]] = []
+        for idx, row in enumerate(ranked_pool[:top_n], start=1):
+            row = dict(row)
+            row["top10_rank"] = idx
+            row.setdefault("selection_reason", _top10_selection_reason(row))
+            row.setdefault("criteria_snapshot", criteria_snapshot)
+            projected.append(_strict_project_row(keys2, _normalize_to_schema_keys(keys2, headers2, row)))
+
+        return headers2, keys2, projected
 
     # ------------------------------------------------------------------
     # main sheet/page APIs
