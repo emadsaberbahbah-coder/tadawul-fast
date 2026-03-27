@@ -2,7 +2,7 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.5.0)
+TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.6.0)
 ================================================================================
 ALIGNED • DEPLOYMENT-SAFE • STARTUP-ONLY ROUTE MOUNT BY DEFAULT • ROUTER-SNAPSHOT-AWARE
 ENGINE-STATE-AWARE • OPENAPI-SAFE • RENDER-HEALTH-PROBE-SAFE • PRIORITY-MOUNTED
@@ -14,8 +14,9 @@ ADVANCED-SHEET-ROWS OWNER FIXED • STRICT-JSON SAFE • ADVISOR-FAMILY NORMALIZ
 HEALTH-COUNT DE-NOISED • NO-RESPONSE GUARD SAFE • ROOT-SHEET-ROWS DIAGNOSTICS
 MOUNT-FN FILTER SAFE • CANONICAL-OWNER COVERAGE EXPANDED • TFB-TOKEN SAFE
 ENGINE-INIT TIMEOUT SAFE • BOOT-LIGHTER PRESTART FLOW
+OWNER-DIAGNOSTICS EXACT-MATCH SAFE • CONFIG-FAMILY FILTER SAFE
 
-Why this revision (v8.5.0)
+Why this revision (v8.6.0)
 --------------------------
 - FIX: disables heavy prestart route mounting by default; controlled routes mount once
        at startup unless PRESTART_MOUNT_ROUTES=1 is explicitly enabled.
@@ -25,6 +26,11 @@ Why this revision (v8.5.0)
        event-loop blocking during startup and shutdown.
 - FIX: startup promotes an already-mounted prestart snapshot instead of remounting,
        keeping controlled ownership diagnostics without duplicate mount work.
+- FIX: canonical owner diagnostics now prefer exact path matches and then the
+       nearest descendant route, preventing family-root mislabeling when a child
+       path (for example /v1/advanced/sheet-rows) mounts earlier than its root.
+- FIX: controlled module filtering now constrains routes.config to /v1/config so
+       schema ownership cannot drift back through an overly broad config router.
 - SAFE: preserves strict JSON rendering, route ownership policy, docs, health/meta,
        auth helpers, middleware, and shutdown behavior.
 """
@@ -185,7 +191,7 @@ class _StrictJSONResponse(JSONResponse):
         ).encode("utf-8")
 
 
-APP_ENTRY_VERSION = "8.5.0"
+APP_ENTRY_VERSION = "8.6.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
@@ -898,16 +904,33 @@ def _route_matches_canonical_target(route_path: str, canonical_path: str) -> boo
     return rp.startswith(cp.rstrip("/") + "/")
 
 
+def _canonical_route_match_rank(route_path: str, canonical_path: str) -> Tuple[int, int, int]:
+    rp = str(route_path or "").strip()
+    cp = str(canonical_path or "").strip()
+
+    exact_flag = 0 if rp == cp else 1
+    segment_count = rp.count("/")
+    extra_depth = max(segment_count - cp.count("/"), 0)
+    length_delta = max(len(rp) - len(cp), 0)
+    return (exact_flag, extra_depth, length_delta)
+
+
 def _canonical_path_owners_from_routes(app: FastAPI) -> Dict[str, str]:
     routes = list(getattr(app, "routes", []) or [])
     owners: Dict[str, str] = {}
 
     for canonical_path in _CANONICAL_DIAGNOSTIC_PATHS:
-        for route in routes:
+        candidates: List[Tuple[Tuple[int, int, int], int, Any]] = []
+        for idx, route in enumerate(routes):
             path = str(getattr(route, "path", "") or "")
             if _route_matches_canonical_target(path, canonical_path):
-                owners[canonical_path] = _endpoint_module_name(route)
-                break
+                candidates.append((_canonical_route_match_rank(path, canonical_path), idx, route))
+
+        if not candidates:
+            continue
+
+        _, _, best_route = sorted(candidates, key=lambda item: (item[0], item[1]))[0]
+        owners[canonical_path] = _endpoint_module_name(best_route)
     return owners
 
 
@@ -1198,6 +1221,11 @@ def _package_mounter_compatibility(routes_pkg: Any) -> Tuple[bool, Dict[str, Any
 
 
 _MODULE_ROUTE_POLICIES: Dict[str, Dict[str, Sequence[str]]] = {
+    "routes.config": {
+        "allow_prefixes": ("/v1/config",),
+        "block_prefixes": ("/v1/schema", "/schema"),
+        "block_exact": ("/sheet-rows", "/v1/advanced/sheet-rows"),
+    },
     "routes.data_dictionary": {
         "block_prefixes": ("/v1/schema", "/schema"),
         "block_exact": ("/sheet-rows", "/v1/advanced/sheet-rows"),
