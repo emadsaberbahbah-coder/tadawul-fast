@@ -2,7 +2,7 @@
 """
 routes/investment_advisor.py
 ================================================================================
-ADVANCED INVESTMENT ADVISOR ROUTER — v2.9.0
+ADVANCED INVESTMENT ADVISOR ROUTER — v2.10.0
 ================================================================================
 OWNER-ALIGNED • SPECIAL-PAGE SAFE • ADVANCED-PREFIX OWNER • QUERY-PARSE SAFE •
 CONTRACT-CORRECT • TOP10-HARDENED • BRIDGE-TOLERANT • JSON-SAFE • STARTUP-SAFE •
@@ -11,13 +11,13 @@ AUTH-TOLERANT
 Why this revision
 -----------------
 - FIX: preserves special-page routing for `Insights_Analysis` and `Data_Dictionary`
-       by preferring engine sheet-row methods instead of Top10-oriented runners.
-- FIX: makes resolver order page-aware so `/v1/advanced/sheet-rows?page=Insights_Analysis`
-       no longer falls into Top10/advanced-advisor builders.
-- FIX: keeps known canonical pages on their exact schema contract rather than
-       widening keys from stray payload fields.
-- FIX: strengthens row projection so canonical keys can be populated from exact,
-       case-insensitive, normalized, and header-style aliases.
+       by preferring analysis/schema bridges before generic advisor runners.
+- FIX: hard-enforces canonical page contracts during final projection so known pages
+       cannot widen headers from stray payload keys or matrix contracts.
+- FIX: reconstructs dict rows from matrix payloads using payload keys/headers, then
+       re-projects every row to the exact canonical key set.
+- FIX: for special pages, bridge and engine stages run before generic runners to
+       avoid accidental Top10/source-page widening under `/v1/advanced/sheet-rows`.
 - FIX: keeps `/v1/advanced` family ownership stable with GET + POST at the family
        root and all canonical aliases used by live tests.
 - SAFE: no import-time network activity.
@@ -47,7 +47,7 @@ from fastapi.encoders import jsonable_encoder
 logger = logging.getLogger("routes.investment_advisor")
 logger.addHandler(logging.NullHandler())
 
-INVESTMENT_ADVISOR_VERSION = "2.9.0"
+INVESTMENT_ADVISOR_VERSION = "2.10.0"
 ROUTE_FAMILY_NAME = "advanced"
 ROUTE_OWNER_NAME = "investment_advisor"
 
@@ -908,36 +908,108 @@ def _model_to_dict(obj: Any) -> Dict[str, Any]:
     return {}
 
 
-def _extract_rows_from_payload(payload: Any) -> List[Dict[str, Any]]:
+
+
+def _extract_payload_contract(payload: Any) -> Tuple[List[str], List[str]]:
+    data = _safe_dict(payload)
+    payload_headers = data.get("headers") or data.get("display_headers") or data.get("sheet_headers") or []
+    payload_keys = data.get("keys") or data.get("fields") or []
+
+    headers = [_s(x) for x in payload_headers] if isinstance(payload_headers, list) else []
+    keys = [_s(x) for x in payload_keys] if isinstance(payload_keys, list) else []
+
+    headers = [x for x in headers if x]
+    keys = [x for x in keys if x]
+
+    if not headers and isinstance(data.get("columns"), list):
+        for idx, col in enumerate(data.get("columns") or []):
+            if isinstance(col, Mapping):
+                key = _s(col.get("key") or col.get("field") or col.get("name"))
+                header = _s(col.get("header") or col.get("label") or col.get("title"))
+            else:
+                key = _s(getattr(col, "key", "") or getattr(col, "field", "") or getattr(col, "name", ""))
+                header = _s(getattr(col, "header", "") or getattr(col, "label", "") or getattr(col, "title", ""))
+            if key or header:
+                if not key:
+                    key = f"column_{idx + 1}"
+                if not header:
+                    header = key.replace("_", " ").title()
+                keys.append(key)
+                headers.append(header)
+
+    if not keys and headers:
+        keys = [_canonical_key_name(h) or f"column_{idx + 1}" for idx, h in enumerate(headers)]
+    if not headers and keys:
+        headers = [k.replace("_", " ").title() for k in keys]
+
+    return headers, keys
+
+
+def _matrix_rows_to_dicts(matrix: Any, contract_keys: Sequence[str]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    if not isinstance(matrix, list):
+        return rows
+    keys = [str(k) for k in contract_keys if _s(k)]
+    if not keys:
+        return rows
+
+    for row in matrix:
+        if not isinstance(row, list):
+            continue
+        out: Dict[str, Any] = {}
+        for idx, key in enumerate(keys):
+            out[key] = row[idx] if idx < len(row) else None
+        rows.append(out)
+    return rows
+
+
+def _extract_rows_from_payload(payload: Any, *, payload_keys: Optional[Sequence[str]] = None, payload_headers: Optional[Sequence[str]] = None) -> List[Dict[str, Any]]:
     if payload is None:
         return []
+
     if isinstance(payload, list):
         out: List[Dict[str, Any]] = []
         for item in payload:
+            if isinstance(item, Mapping):
+                out.append(dict(item))
+                continue
             d = _model_to_dict(item)
             if d:
                 out.append(d)
-            elif isinstance(item, Mapping):
-                out.append(dict(item))
+                continue
+            if isinstance(item, list):
+                contract = list(payload_keys or payload_headers or [])
+                if contract:
+                    out.append({str(contract[i]): item[i] if i < len(item) else None for i in range(len(contract))})
         return out
 
     data = _safe_dict(payload)
-    for key in ("row_objects", "records", "items", "data", "results", "quotes", "rows"):
+
+    for key in ("row_objects", "records", "items", "data", "results", "quotes"):
         raw = data.get(key)
         if isinstance(raw, list):
-            rows = _extract_rows_from_payload(raw)
+            rows = _extract_rows_from_payload(raw, payload_keys=payload_keys, payload_headers=payload_headers)
+            if rows:
+                return rows
+
+    raw_rows = data.get("rows")
+    if isinstance(raw_rows, list) and raw_rows:
+        first = raw_rows[0]
+        if isinstance(first, Mapping):
+            return [dict(r) for r in raw_rows if isinstance(r, Mapping)]
+        if isinstance(first, list):
+            contract = list(payload_keys or payload_headers or [])
+            rows = _matrix_rows_to_dicts(raw_rows, contract)
             if rows:
                 return rows
 
     matrix = data.get("rows_matrix")
-    keys = data.get("keys") or []
-    if isinstance(matrix, list) and isinstance(keys, list) and keys:
-        rows: List[Dict[str, Any]] = []
-        for row in matrix:
-            if isinstance(row, list):
-                rows.append({str(keys[i]): row[i] if i < len(row) else None for i in range(len(keys))})
+    if isinstance(matrix, list):
+        contract = list(payload_keys or payload_headers or [])
+        rows = _matrix_rows_to_dicts(matrix, contract)
         if rows:
             return rows
+
     return []
 
 
@@ -980,15 +1052,11 @@ def _row_value_for_aliases(row: Mapping[str, Any], aliases: Sequence[str]) -> An
     return None
 
 
+
 def _extract_keys_from_payload(payload: Any, page: str, rows: List[Dict[str, Any]]) -> List[str]:
     page = _normalize_page_name(page)
-    schema_headers, schema_keys = _load_schema_defaults(page)
-    data = _safe_dict(payload)
-    payload_keys = data.get("keys") or data.get("fields") or []
-    if isinstance(payload_keys, list):
-        payload_keys = [_s(x) for x in payload_keys if _s(x)]
-    else:
-        payload_keys = []
+    _, schema_keys = _load_schema_defaults(page)
+    _, payload_keys = _extract_payload_contract(payload)
 
     if _canonical_page_has_fixed_contract(page):
         keys = list(schema_keys)
@@ -1007,15 +1075,11 @@ def _extract_keys_from_payload(payload: Any, page: str, rows: List[Dict[str, Any
     return keys
 
 
+
 def _extract_headers_from_payload(payload: Any, page: str, keys: List[str]) -> List[str]:
     page = _normalize_page_name(page)
-    schema_headers, schema_keys = _load_schema_defaults(page)
-    data = _safe_dict(payload)
-    payload_headers = data.get("headers") or data.get("display_headers") or []
-    if isinstance(payload_headers, list):
-        payload_headers = [_s(x) for x in payload_headers if _s(x)]
-    else:
-        payload_headers = []
+    schema_headers, _ = _load_schema_defaults(page)
+    payload_headers, _ = _extract_payload_contract(payload)
 
     if _canonical_page_has_fixed_contract(page):
         headers = list(schema_headers)
@@ -1028,6 +1092,26 @@ def _extract_headers_from_payload(payload: Any, page: str, keys: List[str]) -> L
         extra = [k.replace("_", " ").title() for k in keys[len(headers):]]
         headers.extend(extra)
     return headers[: len(keys)] if len(headers) >= len(keys) else headers
+
+
+def _project_payload_to_contract(payload: Any, page: str, *, include_top10_fields: bool = True) -> Tuple[List[str], List[str], List[Dict[str, Any]]]:
+    page = _normalize_page_name(page)
+    payload_headers, payload_keys = _extract_payload_contract(payload)
+    rows = _extract_rows_from_payload(payload, payload_keys=payload_keys, payload_headers=payload_headers)
+
+    keys = _extract_keys_from_payload(payload, page, rows)
+    headers = _extract_headers_from_payload(payload, page, keys)
+
+    projected: List[Dict[str, Any]] = []
+    for row in rows:
+        projected.append(_normalize_row_to_keys(row, keys, headers))
+
+    if page == TOP10_PAGE_NAME and include_top10_fields:
+        keys = _append_missing_keys(keys, TOP10_SPECIAL_FIELDS)
+        headers = _append_missing_headers(headers, [x.replace("_", " ").title() for x in TOP10_SPECIAL_FIELDS])
+        projected = [_normalize_row_to_keys(row, keys, headers) for row in projected]
+
+    return headers, keys, projected
 
 
 def _rows_to_matrix(rows: List[Dict[str, Any]], keys: List[str]) -> List[List[Any]]:
@@ -1306,6 +1390,7 @@ async def _advanced_root_summary(request: Request) -> Dict[str, Any]:
     )
 
 
+
 async def _execute_advanced_request(*, request: Request, body: Dict[str, Any], mode: str, include_matrix: Optional[bool], limit: Optional[int], offset: Optional[int], schema_only: Optional[bool], x_request_id: Optional[str], token: Optional[str], x_app_token: Optional[str], authorization: Optional[str]) -> Dict[str, Any]:
     del token, x_app_token, authorization  # already checked before entering
     started = time.perf_counter()
@@ -1362,6 +1447,8 @@ async def _execute_advanced_request(*, request: Request, body: Dict[str, Any], m
             warnings.append(f"{label}: {exc.__class__.__name__}")
             return None
 
+    special_page_mode = target_page in SPECIAL_PAGES
+
     if page_family == "top10":
         stage_start = time.perf_counter()
         top10_builder, top10_source, top10_name, _ = await _resolve_top10_builder(request, engine)
@@ -1383,19 +1470,10 @@ async def _execute_advanced_request(*, request: Request, body: Dict[str, Any], m
     bridge_impl, bridge_source, bridge_name = await _resolve_bridge_impl(request)
     stages["resolve_bridge"] = int((time.perf_counter() - stage_start) * 1000)
 
-    if payload is None and runner is not None:
+    if payload is None and special_page_mode and bridge_impl is not None:
         stage_start = time.perf_counter()
         payload = await _run_with_timeout(
-            "runner",
-            _call_candidate(runner, body=body, request=request, page=target_page, limit=limit_final, offset=offset_final, schema_only=schema_only_final),
-            _resolver_timeout("runner", page=target_page),
-        )
-        stages["runner"] = int((time.perf_counter() - stage_start) * 1000)
-
-    if payload is None and bridge_impl is not None:
-        stage_start = time.perf_counter()
-        payload = await _run_with_timeout(
-            "bridge",
+            "bridge.special",
             _call_candidate(bridge_impl, body=body, request=request, page=target_page, limit=limit_final, offset=offset_final, schema_only=schema_only_final),
             _resolver_timeout("bridge", page=target_page),
         )
@@ -1418,37 +1496,46 @@ async def _execute_advanced_request(*, request: Request, body: Dict[str, Any], m
                 break
         stages["engine"] = int((time.perf_counter() - stage_start) * 1000)
 
-    raw_rows = _extract_rows_from_payload(payload)
-    keys = _extract_keys_from_payload(payload, target_page, raw_rows)
-    headers = _extract_headers_from_payload(payload, target_page, keys)
+    if payload is None and runner is not None and (not special_page_mode or runner_source in {"app.state", type(engine).__name__ if engine else ""}):
+        stage_start = time.perf_counter()
+        payload = await _run_with_timeout(
+            "runner",
+            _call_candidate(runner, body=body, request=request, page=target_page, limit=limit_final, offset=offset_final, schema_only=schema_only_final),
+            _resolver_timeout("runner", page=target_page),
+        )
+        stages["runner"] = int((time.perf_counter() - stage_start) * 1000)
 
-    norm_rows: List[Dict[str, Any]] = []
-    for row in raw_rows:
-        norm_rows.append(_normalize_row_to_keys(row, keys, headers))
+    if payload is None and (not special_page_mode) and bridge_impl is not None:
+        stage_start = time.perf_counter()
+        payload = await _run_with_timeout(
+            "bridge",
+            _call_candidate(bridge_impl, body=body, request=request, page=target_page, limit=limit_final, offset=offset_final, schema_only=schema_only_final),
+            _resolver_timeout("bridge", page=target_page),
+        )
+        stages["bridge_fallback"] = int((time.perf_counter() - stage_start) * 1000)
+
+    headers, keys, norm_rows = _project_payload_to_contract(payload, target_page)
     if norm_rows:
         norm_rows = _slice_rows(norm_rows, offset=offset_final, limit=limit_final)
 
     if page_family == "top10":
         for idx, row in enumerate(norm_rows, start=1 + offset_final):
-            row.setdefault("top10_rank", idx)
-            row.setdefault("selection_reason", row.get("recommendation") or "top10_selection")
-            row.setdefault(
-                "criteria_snapshot",
-                _json_compact(
-                    {
-                        "risk_level": body.get("risk_level") or body.get("risk_profile"),
-                        "confidence_level": body.get("confidence_level") or body.get("confidence_bucket"),
-                        "top_n": body.get("top_n") or body.get("limit"),
-                        "source_pages": body.get("source_pages") or body.get("pages_selected"),
-                    }
-                ),
+            row["top10_rank"] = row.get("top10_rank") or idx
+            row["selection_reason"] = row.get("selection_reason") or row.get("recommendation") or "top10_selection"
+            row["criteria_snapshot"] = row.get("criteria_snapshot") or _json_compact(
+                {
+                    "risk_level": body.get("risk_level") or body.get("risk_profile"),
+                    "confidence_level": body.get("confidence_level") or body.get("confidence_bucket"),
+                    "top_n": body.get("top_n") or body.get("limit"),
+                    "source_pages": body.get("source_pages") or body.get("pages_selected"),
+                }
             )
         keys = _append_missing_keys(keys, TOP10_SPECIAL_FIELDS)
         headers = _append_missing_headers(headers, [x.replace("_", " ").title() for x in TOP10_SPECIAL_FIELDS])
         norm_rows = [_normalize_row_to_keys(row, keys, headers) for row in norm_rows]
 
     status_out = "success" if payload is not None or norm_rows or schema_only_final else "degraded"
-    if not raw_rows and payload is None:
+    if payload is None and not norm_rows:
         warnings.append("No builder/runner/bridge/engine payload resolved; returned canonical empty contract.")
 
     meta = _make_meta(
