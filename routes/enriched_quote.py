@@ -2,22 +2,22 @@
 # routes/enriched_quote.py
 """
 ================================================================================
-TFB Enriched Quote Routes Wrapper — v7.9.0
+TFB Enriched Quote Routes Wrapper — v8.0.0
 ================================================================================
 STARTUP-SAFE • EAGER-ROUTER • QUOTE-OWNED • IMPORT-TOLERANT
 GET+POST COMPATIBLE • ROOT ALIAS BRIDGE SAFE
-NON-INSTRUMENT PAGE FENCING • JSON-SAFE • SCHEMA-AWARE
+SPECIAL-PAGE BRIDGE-FIRST • JSON-SAFE • SCHEMA-AWARE
 BATCH HYDRATION SAFE • AUTH-TOLERANT • CANONICAL-OWNERSHIP SAFE
 
 Why this revision
 -----------------
-- FIX: registers exact full-path handlers for `/v1/enriched`, `/v1/enriched_quote`,
-       and `/v1/enriched-quote` so the underscore alias cannot disappear behind
-       prefix/include ordering or controlled mount filtering.
+- FIX: keeps exact full-path handlers for `/v1/enriched`, `/v1/enriched_quote`,
+       and `/v1/enriched-quote` so alias ownership remains stable.
 - FIX: preserves `/quote` and `/quotes` root ownership expected by canonical
        startup maps and live route tests.
-- FIX: keeps enriched quote-owned only; no `/sheet-rows` ownership here.
-- FIX: fences non-instrument pages with clear canonical owner hints.
+- FIX: still keeps enriched quote-owned only; no `/sheet-rows` ownership here.
+- FIX: non-instrument pages now try a canonical bridge first (analysis/root/advanced)
+       instead of stopping at an owner-hint partial payload.
 - FIX: stays import-safe even when optional core/schema/auth modules are absent.
 ================================================================================
 """
@@ -42,11 +42,34 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 logger = logging.getLogger("routes.enriched_quote")
 logger.addHandler(logging.NullHandler())
 
-ROUTER_VERSION = "7.9.0"
+ROUTER_VERSION = "8.0.0"
 TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
     "top10_rank",
     "selection_reason",
     "criteria_snapshot",
+)
+
+BRIDGE_MODULE_ORDER_DEFAULT: Tuple[str, ...] = (
+    "routes.analysis_sheet_rows",
+    "routes.advanced_analysis",
+    "routes.investment_advisor",
+)
+BRIDGE_MODULE_ORDER_DERIVED: Tuple[str, ...] = (
+    "routes.analysis_sheet_rows",
+    "routes.advanced_analysis",
+    "routes.investment_advisor",
+)
+BRIDGE_MODULE_ORDER_DICTIONARY: Tuple[str, ...] = (
+    "routes.advanced_analysis",
+    "routes.analysis_sheet_rows",
+    "routes.investment_advisor",
+)
+BRIDGE_IMPL_CANDIDATES: Tuple[str, ...] = (
+    "_analysis_sheet_rows_impl",
+    "_run_advanced_sheet_rows_impl",
+    "_run_investment_advisor_impl",
+    "run_investment_advisor_engine",
+    "run_investment_advisor",
 )
 
 _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
@@ -151,6 +174,44 @@ async def _call_maybe_async(fn: Any, *args: Any, **kwargs: Any) -> Any:
     return await result if inspect.isawaitable(result) else result
 
 
+async def _call_with_tolerant_signatures(
+    fn: Any,
+    *,
+    timeout_seconds: float,
+    kwargs: Optional[Dict[str, Any]] = None,
+) -> Any:
+    payload_kwargs = dict(kwargs or {})
+    attempts = [
+        payload_kwargs,
+        {k: payload_kwargs.get(k) for k in ("request", "body", "payload", "mode", "include_matrix_q", "token", "x_app_token", "authorization", "x_request_id")},
+        {k: payload_kwargs.get(k) for k in ("request", "body", "mode")},
+        {k: payload_kwargs.get(k) for k in ("request", "body")},
+        {k: payload_kwargs.get(k) for k in ("body", "mode")},
+        {k: payload_kwargs.get(k) for k in ("body",)},
+        {
+            k: payload_kwargs.get(k)
+            for k in ("page", "sheet", "sheet_name", "name", "tab", "symbols", "tickers", "top_n", "limit", "offset", "mode")
+        },
+        {},
+    ]
+    last_error: Optional[Exception] = None
+    for attempt in attempts:
+        call_kwargs = {k: v for k, v in attempt.items() if v is not None}
+        try:
+            if timeout_seconds > 0:
+                return await asyncio.wait_for(_call_maybe_async(fn, **call_kwargs), timeout=timeout_seconds)
+            return await _call_maybe_async(fn, **call_kwargs)
+        except TypeError as exc:
+            last_error = exc
+            continue
+        except Exception as exc:
+            last_error = exc
+            raise
+    if last_error is not None:
+        raise last_error
+    return None
+
+
 def _request_id(request: Request, x_request_id: Optional[str]) -> str:
     rid = _strip(x_request_id)
     if rid:
@@ -168,18 +229,6 @@ def _request_id(request: Request, x_request_id: Optional[str]) -> str:
     except Exception:
         pass
     return uuid.uuid4().hex[:12]
-
-
-def _split_csv(value: str) -> List[str]:
-    raw = (value or "").replace(";", ",").replace("\n", ",").replace("\t", ",")
-    out: List[str] = []
-    seen = set()
-    for part in raw.split(","):
-        s = _strip(part)
-        if s and s not in seen:
-            seen.add(s)
-            out.append(s)
-    return out
 
 
 def _split_symbols(value: str) -> List[str]:
@@ -352,10 +401,27 @@ def _merge_dicts(base: Optional[Dict[str, Any]], addon: Optional[Dict[str, Any]]
     return out
 
 
+def _row_count(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, (list, tuple, set)):
+        return len(value)
+    if isinstance(value, Mapping):
+        return len(value)
+    return 1
+
+
+def _has_usable_payload(result: Any) -> bool:
+    if not isinstance(result, Mapping):
+        return False
+    return any(_row_count(result.get(k)) > 0 for k in ("row_objects", "items", "records", "data", "quotes", "rows", "rows_matrix")) or _row_count(result.get("headers")) > 0
+
+
 class _Service:
     def __init__(self, reason: str):
         self.reason = reason
         self.quote_call_timeout_sec = self._env_float("TFB_QUOTE_CALL_TIMEOUT_SEC", 20.0)
+        self.bridge_timeout_sec = self._env_float("TFB_ENRICHED_BRIDGE_TIMEOUT_SEC", 25.0)
         self.rehydrate_concurrency = max(2, min(12, int(self._env_float("TFB_ROUTE_REHYDRATE_CONCURRENCY", 4))))
         self.rehydrate_enabled = self._env_bool("TFB_ROUTE_ENABLE_REHYDRATE", True)
         self.rehydrate_max_symbols = max(0, min(250, int(self._env_float("TFB_ROUTE_REHYDRATE_MAX_SYMBOLS", 25))))
@@ -769,6 +835,115 @@ def _canonical_owner_hint(page: str, route_family: str) -> Dict[str, str]:
     }
 
 
+def _bridge_module_order(page: str, route_family: str) -> Tuple[str, ...]:
+    if route_family == "dictionary" or page == "Data_Dictionary":
+        return BRIDGE_MODULE_ORDER_DICTIONARY
+    if route_family in {"top10", "insights"} or page in {"Top_10_Investments", "Insights_Analysis"}:
+        return BRIDGE_MODULE_ORDER_DERIVED
+    return BRIDGE_MODULE_ORDER_DEFAULT
+
+
+async def _resolve_bridge_impl(page: str, route_family: str) -> Tuple[Optional[Any], Dict[str, Any]]:
+    for module_name in _bridge_module_order(page, route_family):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        for callable_name in BRIDGE_IMPL_CANDIDATES:
+            fn = getattr(module, callable_name, None)
+            if callable(fn):
+                return fn, {"module": module_name, "callable": callable_name}
+    return None, {}
+
+
+async def _delegate_special_page_via_bridge(
+    svc: _Service,
+    request: Request,
+    page: str,
+    route_family: str,
+    body: Dict[str, Any],
+    mode_q: str,
+    token_q: Optional[str],
+    x_app_token: Optional[str],
+    authorization: Optional[str],
+    x_request_id: Optional[str],
+) -> Optional[Dict[str, Any]]:
+    impl, impl_meta = await _resolve_bridge_impl(page, route_family)
+    if impl is None:
+        return None
+
+    prepared = dict(body or {})
+    prepared["page"] = page
+    prepared["sheet"] = page
+    prepared["sheet_name"] = page
+    prepared["name"] = page
+    prepared["tab"] = page
+
+    kwargs = {
+        "request": request,
+        "body": prepared,
+        "payload": prepared,
+        "mode": mode_q or "",
+        "include_matrix_q": _bool_from_body(prepared, "include_matrix", True),
+        "include_matrix": _bool_from_body(prepared, "include_matrix", True),
+        "token": token_q,
+        "x_app_token": x_app_token,
+        "authorization": authorization,
+        "x_request_id": x_request_id,
+        "page": page,
+        "sheet": page,
+        "sheet_name": page,
+        "name": page,
+        "tab": page,
+        "symbols": _list_from_body(prepared, "symbols", "tickers", "tickers_list"),
+        "tickers": _list_from_body(prepared, "symbols", "tickers", "tickers_list"),
+        "top_n": _int_from_body(prepared, "top_n", 200),
+        "limit": _int_from_body(prepared, "limit", 0),
+        "offset": _int_from_body(prepared, "offset", 0),
+    }
+
+    out = await _call_with_tolerant_signatures(
+        impl,
+        timeout_seconds=svc.bridge_timeout_sec,
+        kwargs=kwargs,
+    )
+    safe = _json_safe(out)
+    if isinstance(safe, list):
+        headers, keys = svc.schema_for_page(page)
+        rows = [svc.normalize_row(keys, item if isinstance(item, Mapping) else _model_to_dict(item)) for item in safe]
+        return svc.envelope(
+            status="success" if rows else "partial",
+            page=page,
+            route_family=route_family,
+            headers=headers,
+            keys=keys,
+            row_objects=rows,
+            include_headers=True,
+            include_matrix=True,
+            request_id=_request_id(request, x_request_id),
+            started_at=time.time(),
+            mode=mode_q or "",
+            dispatch="special_bridge_list",
+            extra_meta={"bridge_source_module": impl_meta.get("module"), "bridge_callable": impl_meta.get("callable"), **_canonical_owner_hint(page, route_family)},
+        )
+    if not isinstance(safe, Mapping):
+        return None
+
+    result = dict(safe)
+    result.setdefault("page", page)
+    result.setdefault("sheet", page)
+    result.setdefault("sheet_name", page)
+    meta = result.get("meta")
+    if not isinstance(meta, Mapping):
+        meta = {}
+    meta = dict(meta)
+    meta.setdefault("bridge_source_module", impl_meta.get("module"))
+    meta.setdefault("bridge_callable", impl_meta.get("callable"))
+    meta.update(_canonical_owner_hint(page, route_family))
+    result["meta"] = meta
+    return result if _has_usable_payload(result) else result
+
+
 async def _build_instrument_rows(
     svc: _Service,
     page: str,
@@ -892,7 +1067,6 @@ async def _build_instrument_rows(
     return rows_out, errors, {"batch_rows": batch_rows, "rehydrated_rows": rehydrated_rows, "sparse_after_rehydrate": sparse_after}
 
 
-
 def _build_router(reason: str) -> APIRouter:
     svc = _Service(reason)
     root = APIRouter(tags=["enriched"])
@@ -985,6 +1159,12 @@ def _build_router(reason: str) -> APIRouter:
         route_family = svc.route_family(page)
 
         if route_family != "instrument":
+            bridge_result = await _delegate_special_page_via_bridge(
+                svc, request, page, route_family, body, mode_q, token_q, x_app_token, authorization, x_request_id
+            )
+            if bridge_result is not None and _has_usable_payload(bridge_result):
+                return bridge_result
+
             hint = _canonical_owner_hint(page, route_family)
             row = svc.normalize_row(keys, {"symbol": symbol, "ticker": symbol, "error": f"single_quote_not_supported_for_{route_family}_page"}, symbol_fallback=symbol)
             payload = svc.envelope(
@@ -1063,6 +1243,12 @@ def _build_router(reason: str) -> APIRouter:
         symbols = symbols[:top_n]
 
         if route_family != "instrument":
+            bridge_result = await _delegate_special_page_via_bridge(
+                svc, request, page, route_family, prepared, mode_q, token_q, x_app_token, authorization, x_request_id
+            )
+            if bridge_result is not None and _has_usable_payload(bridge_result):
+                return bridge_result
+
             hint = _canonical_owner_hint(page, route_family)
             return svc.envelope(
                 status="partial",
