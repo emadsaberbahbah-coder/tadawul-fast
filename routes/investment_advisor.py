@@ -1,28 +1,30 @@
+
 #!/usr/bin/env python3
 """
 routes/investment_advisor.py
 ================================================================================
-ADVANCED INVESTMENT ADVISOR ROUTER — v2.10.0
+ADVANCED INVESTMENT ADVISOR ROUTER — v2.11.0
 ================================================================================
-OWNER-ALIGNED • SPECIAL-PAGE SAFE • ADVANCED-PREFIX OWNER • QUERY-PARSE SAFE •
-CONTRACT-CORRECT • TOP10-HARDENED • BRIDGE-TOLERANT • JSON-SAFE • STARTUP-SAFE •
-AUTH-TOLERANT
+OWNER-ALIGNED • BRIDGE-FIRST FOR SPECIAL PAGES • ADVANCED-PREFIX OWNER
+QUERY-PARSE SAFE • CONTRACT-CORRECT • TOP10-HARDENED • JSON-SAFE
+STARTUP-SAFE • AUTH-TOLERANT • GET+POST CANONICAL ALIASES
 
-Why this revision
------------------
-- FIX: preserves special-page routing for `Insights_Analysis` and `Data_Dictionary`
-       by preferring analysis/schema bridges before generic advisor runners.
-- FIX: hard-enforces canonical page contracts during final projection so known pages
-       cannot widen headers from stray payload keys or matrix contracts.
-- FIX: reconstructs dict rows from matrix payloads using payload keys/headers, then
-       re-projects every row to the exact canonical key set.
-- FIX: for special pages, bridge and engine stages run before generic runners to
-       avoid accidental Top10/source-page widening under `/v1/advanced/sheet-rows`.
-- FIX: keeps `/v1/advanced` family ownership stable with GET + POST at the family
-       root and all canonical aliases used by live tests.
-- SAFE: no import-time network activity.
+What this revision improves
+---------------------------
+- FIX: `Top_10_Investments` now prefers:
+       Top10 builder -> analysis/schema bridge -> engine -> generic runner
+       so `/v1/advanced/sheet-rows` stops widening or degrading before it reaches
+       the canonical special-page path.
+- FIX: `Insights_Analysis` and `Data_Dictionary` are bridge-first, then engine,
+       then generic runner; generic advisor runners are no longer consulted first
+       for those pages.
+- FIX: final payload projection always re-projects rows to the exact canonical
+       key set for known pages, preventing header/key widening from stray payload
+       contracts.
+- FIX: matrix payloads are reconstructed to dict rows using payload keys/headers
+       and then projected back to canonical keys.
+- SAFE: no import-time network work.
 """
-
 from __future__ import annotations
 
 import asyncio
@@ -47,7 +49,7 @@ from fastapi.encoders import jsonable_encoder
 logger = logging.getLogger("routes.investment_advisor")
 logger.addHandler(logging.NullHandler())
 
-INVESTMENT_ADVISOR_VERSION = "2.10.0"
+INVESTMENT_ADVISOR_VERSION = "2.11.0"
 ROUTE_FAMILY_NAME = "advanced"
 ROUTE_OWNER_NAME = "investment_advisor"
 
@@ -62,9 +64,9 @@ BASE_SOURCE_PAGES: Tuple[str, ...] = (
     "Mutual_Funds",
     "My_Portfolio",
 )
-DERIVED_PAGES = {TOP10_PAGE_NAME, INSIGHTS_PAGE_NAME}
+SOURCE_PAGES_SET = set(BASE_SOURCE_PAGES)
 SPECIAL_PAGES = {INSIGHTS_PAGE_NAME, DATA_DICTIONARY_PAGE_NAME}
-_SOURCE_PAGES_SET = set(BASE_SOURCE_PAGES)
+DERIVED_PAGES = {TOP10_PAGE_NAME, INSIGHTS_PAGE_NAME}
 
 KNOWN_CANONICAL_HEADER_COUNTS: Dict[str, int] = {
     "Market_Leaders": 80,
@@ -142,11 +144,6 @@ BRIDGE_MODULE_CANDIDATES: Tuple[str, ...] = (
     "routes.advanced_analysis",
     "routes.advanced_sheet_rows",
 )
-SCHEMA_MODULE_CANDIDATES: Tuple[str, ...] = (
-    "core.sheets.schema_registry",
-    "core.schema_registry",
-    "core.sheets.page_catalog",
-)
 
 TOP10_FUNCTION_CANDIDATES: Tuple[str, ...] = (
     "build_top10_output_rows",
@@ -174,7 +171,6 @@ GENERIC_RUNNER_FUNCTION_CANDIDATES: Tuple[str, ...] = (
     "execute_investment_advisor",
     "execute_advisor",
 )
-TOP10_RUNNER_FUNCTION_CANDIDATES: Tuple[str, ...] = TOP10_FUNCTION_CANDIDATES + GENERIC_RUNNER_FUNCTION_CANDIDATES
 BRIDGE_FUNCTION_CANDIDATES: Tuple[str, ...] = (
     "_analysis_sheet_rows_impl",
     "_run_analysis_sheet_rows_impl",
@@ -185,23 +181,12 @@ BRIDGE_FUNCTION_CANDIDATES: Tuple[str, ...] = (
     "run_sheet_rows_impl",
     "_sheet_rows_impl",
 )
-GENERIC_ENGINE_METHOD_CANDIDATES: Tuple[str, ...] = (
-    "get_sheet_rows",
-    "get_page_rows",
-    "sheet_rows",
-    "fetch_sheet_rows",
-    "build_sheet_rows",
-    "read_sheet_rows",
-    "run_sheet_rows",
-    "execute_sheet_rows",
-    "get_rows_for_sheet",
-    "get_rows_for_page",
-    "execute_sheet_rows",
-    "run_analysis_sheet_rows",
-    "build_analysis_sheet_rows",
-)
-TOP10_ENGINE_METHOD_CANDIDATES: Tuple[str, ...] = TOP10_FUNCTION_CANDIDATES + GENERIC_ENGINE_METHOD_CANDIDATES
 
+SCHEMA_MODULE_CANDIDATES: Tuple[str, ...] = (
+    "core.sheets.schema_registry",
+    "core.schema_registry",
+    "core.sheets.page_catalog",
+)
 SCHEMA_MAP_CANDIDATES: Tuple[str, ...] = (
     "SCHEMA_REGISTRY",
     "SHEET_SPEC",
@@ -514,7 +499,7 @@ def _source_pages_only(values: Sequence[str]) -> List[str]:
     seen = set()
     for item in values:
         page = _normalize_page_name(item)
-        if page in _SOURCE_PAGES_SET and page not in seen:
+        if page in SOURCE_PAGES_SET and page not in seen:
             seen.add(page)
             out.append(page)
     return out
@@ -528,7 +513,7 @@ def _page_family(page: str) -> str:
         return "insights"
     if normalized == DATA_DICTIONARY_PAGE_NAME:
         return "data_dictionary"
-    if normalized in _SOURCE_PAGES_SET:
+    if normalized in SOURCE_PAGES_SET:
         return "source"
     return ROUTE_FAMILY_NAME
 
@@ -556,7 +541,7 @@ def _resolver_timeout(stage: str, *, page: str) -> float:
     defaults = {
         "builder": 14.0 if page == TOP10_PAGE_NAME else 10.0,
         "runner": 12.0 if page == TOP10_PAGE_NAME else 16.0,
-        "bridge": 10.0 if page in _SOURCE_PAGES_SET or page == DATA_DICTIONARY_PAGE_NAME else 14.0,
+        "bridge": 10.0 if page in SOURCE_PAGES_SET or page == DATA_DICTIONARY_PAGE_NAME else 14.0,
         "engine": 12.0 if page in DERIVED_PAGES else 16.0,
     }
     env_map = {
@@ -908,8 +893,6 @@ def _model_to_dict(obj: Any) -> Dict[str, Any]:
     return {}
 
 
-
-
 def _extract_payload_contract(payload: Any) -> Tuple[List[str], List[str]]:
     data = _safe_dict(payload)
     payload_headers = data.get("headers") or data.get("display_headers") or data.get("sheet_headers") or []
@@ -1052,7 +1035,6 @@ def _row_value_for_aliases(row: Mapping[str, Any], aliases: Sequence[str]) -> An
     return None
 
 
-
 def _extract_keys_from_payload(payload: Any, page: str, rows: List[Dict[str, Any]]) -> List[str]:
     page = _normalize_page_name(page)
     _, schema_keys = _load_schema_defaults(page)
@@ -1075,7 +1057,6 @@ def _extract_keys_from_payload(payload: Any, page: str, rows: List[Dict[str, Any
     return keys
 
 
-
 def _extract_headers_from_payload(payload: Any, page: str, keys: List[str]) -> List[str]:
     page = _normalize_page_name(page)
     schema_headers, _ = _load_schema_defaults(page)
@@ -1092,6 +1073,18 @@ def _extract_headers_from_payload(payload: Any, page: str, keys: List[str]) -> L
         extra = [k.replace("_", " ").title() for k in keys[len(headers):]]
         headers.extend(extra)
     return headers[: len(keys)] if len(headers) >= len(keys) else headers
+
+
+def _normalize_row_to_keys(row: Mapping[str, Any], keys: List[str], headers: Optional[List[str]] = None) -> Dict[str, Any]:
+    header_lookup = headers or []
+    out: Dict[str, Any] = {}
+    for idx, key in enumerate(keys):
+        aliases = [key, key.replace("_", " "), key.replace("_", "-")]
+        if idx < len(header_lookup):
+            aliases.extend([header_lookup[idx], header_lookup[idx].replace(" ", "_"), header_lookup[idx].replace(" ", "-")])
+        val = _row_value_for_aliases(row, aliases)
+        out[key] = _json_safe(val)
+    return out
 
 
 def _project_payload_to_contract(payload: Any, page: str, *, include_top10_fields: bool = True) -> Tuple[List[str], List[str], List[Dict[str, Any]]]:
@@ -1118,16 +1111,37 @@ def _rows_to_matrix(rows: List[Dict[str, Any]], keys: List[str]) -> List[List[An
     return [[row.get(key) for key in keys] for row in rows]
 
 
-def _normalize_row_to_keys(row: Mapping[str, Any], keys: List[str], headers: Optional[List[str]] = None) -> Dict[str, Any]:
-    header_lookup = headers or []
-    out: Dict[str, Any] = {}
-    for idx, key in enumerate(keys):
-        aliases = [key, key.replace("_", " "), key.replace("_", "-")]
-        if idx < len(header_lookup):
-            aliases.extend([header_lookup[idx], header_lookup[idx].replace(" ", "_"), header_lookup[idx].replace(" ", "-")])
-        val = _row_value_for_aliases(row, aliases)
-        out[key] = _json_safe(val)
-    return out
+def _payload_has_rows(payload: Any, page: str) -> bool:
+    _, _, rows = _project_payload_to_contract(payload, page)
+    return len(rows) > 0
+
+
+def _payload_quality_score(payload: Any, page: str) -> int:
+    if payload is None:
+        return -999
+    headers, keys, rows = _project_payload_to_contract(payload, page)
+    score = 0
+    if headers:
+        score += min(20, len(headers))
+    if keys:
+        score += min(20, len(keys))
+    if rows:
+        score += 100 + min(25, len(rows))
+    if _canonical_page_has_fixed_contract(page) and headers:
+        expected = KNOWN_CANONICAL_HEADER_COUNTS.get(page, 0)
+        if len(headers) == expected:
+            score += 50
+        else:
+            score -= abs(len(headers) - expected) * 3
+    if isinstance(payload, Mapping):
+        status_s = _s(payload.get("status")).lower()
+        if status_s == "success":
+            score += 5
+        elif status_s == "partial":
+            score += 2
+        elif status_s in {"error", "degraded"}:
+            score -= 5
+    return score
 
 
 def _make_schema_only_response(page: str, *, include_matrix: bool, request_id: str, meta: Dict[str, Any]) -> Dict[str, Any]:
@@ -1200,17 +1214,11 @@ async def _resolve_function(module_candidates: Sequence[str], function_candidate
 
 
 def _engine_method_candidates_for_page(page: str) -> Tuple[str, ...]:
-    family = _page_family(page)
-    if family == "top10":
-        return TOP10_ENGINE_METHOD_CANDIDATES
-    return GENERIC_ENGINE_METHOD_CANDIDATES
+    return TOP10_FUNCTION_CANDIDATES + GENERIC_RUNNER_FUNCTION_CANDIDATES if _page_family(page) == "top10" else GENERIC_RUNNER_FUNCTION_CANDIDATES
 
 
 def _runner_function_candidates_for_page(page: str) -> Tuple[str, ...]:
-    family = _page_family(page)
-    if family == "top10":
-        return TOP10_RUNNER_FUNCTION_CANDIDATES
-    return GENERIC_RUNNER_FUNCTION_CANDIDATES
+    return TOP10_FUNCTION_CANDIDATES + GENERIC_RUNNER_FUNCTION_CANDIDATES if _page_family(page) == "top10" else GENERIC_RUNNER_FUNCTION_CANDIDATES
 
 
 async def _resolve_top10_builder(request: Request, engine: Optional[Any]) -> Tuple[Optional[Any], str, str, List[str]]:
@@ -1232,9 +1240,7 @@ async def _resolve_top10_builder(request: Request, engine: Optional[Any]) -> Tup
 
 
 async def _resolve_runner(request: Request, engine: Optional[Any], page: str) -> Tuple[Optional[Any], str, str, List[str]]:
-    family = _page_family(page)
-
-    if family != "top10" and engine is not None:
+    if _page_family(page) != "top10" and engine is not None:
         for attr in _engine_method_candidates_for_page(page):
             candidate = getattr(engine, attr, None)
             if callable(candidate):
@@ -1251,7 +1257,7 @@ async def _resolve_runner(request: Request, engine: Optional[Any], page: str) ->
     except Exception:
         pass
 
-    if family == "top10" and engine is not None:
+    if _page_family(page) == "top10" and engine is not None:
         for attr in _engine_method_candidates_for_page(page):
             candidate = getattr(engine, attr, None)
             if callable(candidate):
@@ -1274,7 +1280,7 @@ async def _resolve_bridge_impl(request: Request) -> Tuple[Optional[Any], str, st
     return fn, module_name, fn_name
 
 
-def _make_meta(*, request_id: str, page: str, status_out: str, engine: Optional[Any], top10_source: str, top10_name: str, runner_source: str, runner_name: str, bridge_source: str, bridge_name: str, stages: Dict[str, int], warnings: List[str]) -> Dict[str, Any]:
+def _make_meta(*, request_id: str, page: str, status_out: str, engine: Optional[Any], top10_source: str, top10_name: str, runner_source: str, runner_name: str, bridge_source: str, bridge_name: str, stages: Dict[str, int], warnings: List[str], resolution_order: Sequence[str]) -> Dict[str, Any]:
     return jsonable_encoder(
         {
             "request_id": request_id,
@@ -1295,6 +1301,7 @@ def _make_meta(*, request_id: str, page: str, status_out: str, engine: Optional[
             "warnings": warnings,
             "status": status_out,
             "stage_durations_ms": stages,
+            "resolution_order": list(resolution_order),
         }
     )
 
@@ -1390,9 +1397,23 @@ async def _advanced_root_summary(request: Request) -> Dict[str, Any]:
     )
 
 
+async def _run_stage(label: str, timeout_sec: float, fn: Any, *, body: Dict[str, Any], request: Request, page: str, limit: int, offset: int, schema_only: bool, warnings: List[str], stages: Dict[str, int]) -> Any:
+    stage_start = time.perf_counter()
+    try:
+        result = await asyncio.wait_for(
+            _call_candidate(fn, body=body, request=request, page=page, limit=limit, offset=offset, schema_only=schema_only),
+            timeout=timeout_sec,
+        )
+        return result
+    except Exception as exc:
+        warnings.append(f"{label}: {exc.__class__.__name__}")
+        return None
+    finally:
+        stages[label] = int((time.perf_counter() - stage_start) * 1000)
+
 
 async def _execute_advanced_request(*, request: Request, body: Dict[str, Any], mode: str, include_matrix: Optional[bool], limit: Optional[int], offset: Optional[int], schema_only: Optional[bool], x_request_id: Optional[str], token: Optional[str], x_app_token: Optional[str], authorization: Optional[str]) -> Dict[str, Any]:
-    del token, x_app_token, authorization  # already checked before entering
+    del token, x_app_token, authorization
     started = time.perf_counter()
     request_id = _request_id(request, x_request_id)
     target_page = _normalize_page_name(body.get("page") or body.get("sheet") or body.get("sheet_name") or TOP10_PAGE_NAME)
@@ -1427,11 +1448,11 @@ async def _execute_advanced_request(*, request: Request, body: Dict[str, Any], m
             bridge_name="",
             stages={"total": int((time.perf_counter() - started) * 1000)},
             warnings=warnings,
+            resolution_order=["schema_only"],
         )
         return _make_schema_only_response(target_page, include_matrix=include_matrix_final, request_id=request_id, meta=meta)
 
     page_family = _page_family(target_page)
-    payload: Any = None
 
     top10_source = ""
     top10_name = ""
@@ -1440,27 +1461,9 @@ async def _execute_advanced_request(*, request: Request, body: Dict[str, Any], m
     bridge_source = ""
     bridge_name = ""
 
-    async def _run_with_timeout(label: str, coro: Any, timeout_sec: float) -> Any:
-        try:
-            return await asyncio.wait_for(coro, timeout=timeout_sec)
-        except Exception as exc:
-            warnings.append(f"{label}: {exc.__class__.__name__}")
-            return None
-
-    special_page_mode = target_page in SPECIAL_PAGES
-
-    if page_family == "top10":
-        stage_start = time.perf_counter()
-        top10_builder, top10_source, top10_name, _ = await _resolve_top10_builder(request, engine)
-        stages["resolve_builder"] = int((time.perf_counter() - stage_start) * 1000)
-        if top10_builder is not None:
-            stage_start = time.perf_counter()
-            payload = await _run_with_timeout(
-                "builder",
-                _call_candidate(top10_builder, body=body, request=request, page=target_page, limit=limit_final, offset=offset_final, schema_only=schema_only_final),
-                _resolver_timeout("builder", page=target_page),
-            )
-            stages["builder"] = int((time.perf_counter() - stage_start) * 1000)
+    stage_start = time.perf_counter()
+    top10_builder, top10_source, top10_name, _ = await _resolve_top10_builder(request, engine)
+    stages["resolve_builder"] = int((time.perf_counter() - stage_start) * 1000)
 
     stage_start = time.perf_counter()
     runner, runner_source, runner_name, _ = await _resolve_runner(request, engine, target_page)
@@ -1470,51 +1473,127 @@ async def _execute_advanced_request(*, request: Request, body: Dict[str, Any], m
     bridge_impl, bridge_source, bridge_name = await _resolve_bridge_impl(request)
     stages["resolve_bridge"] = int((time.perf_counter() - stage_start) * 1000)
 
-    if payload is None and special_page_mode and bridge_impl is not None:
-        stage_start = time.perf_counter()
-        payload = await _run_with_timeout(
-            "bridge.special",
-            _call_candidate(bridge_impl, body=body, request=request, page=target_page, limit=limit_final, offset=offset_final, schema_only=schema_only_final),
-            _resolver_timeout("bridge", page=target_page),
-        )
-        stages["bridge"] = int((time.perf_counter() - stage_start) * 1000)
+    candidate_payloads: List[Tuple[str, Any]] = []
+    resolution_order: List[str] = []
 
-    if payload is None and engine is not None:
-        stage_start = time.perf_counter()
-        for method_name in _engine_method_candidates_for_page(target_page):
-            method = getattr(engine, method_name, None)
-            if not callable(method):
+    if page_family == "top10":
+        resolution_order = ["builder", "bridge", "engine", "runner"]
+    elif page_family in {"insights", "data_dictionary", "source"}:
+        resolution_order = ["bridge", "engine", "runner"]
+    else:
+        resolution_order = ["runner", "bridge", "engine"]
+
+    for stage_name in resolution_order:
+        if stage_name == "builder":
+            if top10_builder is None:
+                warnings.append("builder: unavailable")
                 continue
-            payload = await _run_with_timeout(
-                f"engine.{method_name}",
-                _call_candidate(method, body=body, request=request, page=target_page, limit=limit_final, offset=offset_final, schema_only=schema_only_final),
-                _resolver_timeout("engine", page=target_page),
+            payload = await _run_stage(
+                "builder",
+                _resolver_timeout("builder", page=target_page),
+                top10_builder,
+                body=body,
+                request=request,
+                page=target_page,
+                limit=limit_final,
+                offset=offset_final,
+                schema_only=schema_only_final,
+                warnings=warnings,
+                stages=stages,
             )
             if payload is not None:
-                runner_source = runner_source or type(engine).__name__
-                runner_name = runner_name or method_name
+                candidate_payloads.append((stage_name, payload))
+                if _payload_has_rows(payload, target_page):
+                    break
+
+        elif stage_name == "bridge":
+            if bridge_impl is None:
+                warnings.append("bridge: unavailable")
+                continue
+            payload = await _run_stage(
+                "bridge",
+                _resolver_timeout("bridge", page=target_page),
+                bridge_impl,
+                body=body,
+                request=request,
+                page=target_page,
+                limit=limit_final,
+                offset=offset_final,
+                schema_only=schema_only_final,
+                warnings=warnings,
+                stages=stages,
+            )
+            if payload is not None:
+                candidate_payloads.append((stage_name, payload))
+                if _payload_has_rows(payload, target_page):
+                    break
+
+        elif stage_name == "engine":
+            if engine is None:
+                warnings.append("engine: unavailable")
+                continue
+            stage_engine_start = time.perf_counter()
+            payload = None
+            for method_name in _engine_method_candidates_for_page(target_page):
+                method = getattr(engine, method_name, None)
+                if not callable(method):
+                    continue
+                payload = await _run_stage(
+                    f"engine.{method_name}",
+                    _resolver_timeout("engine", page=target_page),
+                    method,
+                    body=body,
+                    request=request,
+                    page=target_page,
+                    limit=limit_final,
+                    offset=offset_final,
+                    schema_only=schema_only_final,
+                    warnings=warnings,
+                    stages=stages,
+                )
+                if payload is not None:
+                    runner_source = runner_source or type(engine).__name__
+                    runner_name = runner_name or method_name
+                    candidate_payloads.append(("engine", payload))
+                    if _payload_has_rows(payload, target_page):
+                        break
+            stages["engine"] = int((time.perf_counter() - stage_engine_start) * 1000)
+            if candidate_payloads and candidate_payloads[-1][0] == "engine" and _payload_has_rows(candidate_payloads[-1][1], target_page):
                 break
-        stages["engine"] = int((time.perf_counter() - stage_start) * 1000)
 
-    if payload is None and runner is not None and (not special_page_mode or runner_source in {"app.state", type(engine).__name__ if engine else ""}):
-        stage_start = time.perf_counter()
-        payload = await _run_with_timeout(
-            "runner",
-            _call_candidate(runner, body=body, request=request, page=target_page, limit=limit_final, offset=offset_final, schema_only=schema_only_final),
-            _resolver_timeout("runner", page=target_page),
-        )
-        stages["runner"] = int((time.perf_counter() - stage_start) * 1000)
+        elif stage_name == "runner":
+            if runner is None:
+                warnings.append("runner: unavailable")
+                continue
+            payload = await _run_stage(
+                "runner",
+                _resolver_timeout("runner", page=target_page),
+                runner,
+                body=body,
+                request=request,
+                page=target_page,
+                limit=limit_final,
+                offset=offset_final,
+                schema_only=schema_only_final,
+                warnings=warnings,
+                stages=stages,
+            )
+            if payload is not None:
+                candidate_payloads.append((stage_name, payload))
+                if _payload_has_rows(payload, target_page):
+                    break
 
-    if payload is None and (not special_page_mode) and bridge_impl is not None:
-        stage_start = time.perf_counter()
-        payload = await _run_with_timeout(
-            "bridge",
-            _call_candidate(bridge_impl, body=body, request=request, page=target_page, limit=limit_final, offset=offset_final, schema_only=schema_only_final),
-            _resolver_timeout("bridge", page=target_page),
-        )
-        stages["bridge_fallback"] = int((time.perf_counter() - stage_start) * 1000)
+    best_payload = None
+    best_stage = ""
+    best_score = -999999
+    for stage_name, payload in candidate_payloads:
+        score = _payload_quality_score(payload, target_page)
+        if score > best_score:
+            best_payload = payload
+            best_stage = stage_name
+            best_score = score
 
-    headers, keys, norm_rows = _project_payload_to_contract(payload, target_page)
+    headers, keys, norm_rows = _project_payload_to_contract(best_payload, target_page)
     if norm_rows:
         norm_rows = _slice_rows(norm_rows, offset=offset_final, limit=limit_final)
 
@@ -1534,9 +1613,9 @@ async def _execute_advanced_request(*, request: Request, body: Dict[str, Any], m
         headers = _append_missing_headers(headers, [x.replace("_", " ").title() for x in TOP10_SPECIAL_FIELDS])
         norm_rows = [_normalize_row_to_keys(row, keys, headers) for row in norm_rows]
 
-    status_out = "success" if payload is not None or norm_rows or schema_only_final else "degraded"
-    if payload is None and not norm_rows:
-        warnings.append("No builder/runner/bridge/engine payload resolved; returned canonical empty contract.")
+    status_out = "success" if best_payload is not None or norm_rows else "degraded"
+    if best_payload is None and not norm_rows:
+        warnings.append("No builder/bridge/engine/runner payload resolved; returned canonical empty contract.")
 
     meta = _make_meta(
         request_id=request_id,
@@ -1551,6 +1630,7 @@ async def _execute_advanced_request(*, request: Request, body: Dict[str, Any], m
         bridge_name=bridge_name,
         stages={**stages, "total": int((time.perf_counter() - started) * 1000)},
         warnings=warnings,
+        resolution_order=resolution_order + ([f"best:{best_stage}"] if best_stage else []),
     )
 
     rows_matrix = _rows_to_matrix(norm_rows, keys) if include_matrix_final and keys else None
