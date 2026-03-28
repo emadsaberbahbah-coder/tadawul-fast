@@ -2,7 +2,7 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.6.3)
+TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.7.0)
 ================================================================================
 ALIGNED • DEPLOYMENT-SAFE • STARTUP-ONLY ROUTE MOUNT BY DEFAULT • ROUTER-SNAPSHOT-AWARE
 ENGINE-STATE-AWARE • OPENAPI-SAFE • RENDER-HEALTH-PROBE-SAFE • PRIORITY-MOUNTED
@@ -15,19 +15,18 @@ HEALTH-COUNT DE-NOISED • NO-RESPONSE GUARD SAFE • ROOT-SHEET-ROWS DIAGNOSTIC
 MOUNT-FN FILTER SAFE • CANONICAL-OWNER COVERAGE EXPANDED • TFB-TOKEN SAFE
 ENGINE-INIT TIMEOUT SAFE • BOOT-LIGHTER PRESTART FLOW
 OWNER-DIAGNOSTICS EXACT-MATCH SAFE • CONFIG-FAMILY FILTER SAFE
-APP-EXPORT SAFE
+APP-EXPORT SAFE • ROUTE-SIGNATURE COUNT FIXED • LIVE-METRICS PREFERRED
 
-Why this revision (v8.6.3)
+Why this revision (v8.7.0)
 --------------------------
-- FIX: guarantees the real FastAPI export at module scope via `app = create_app()`
-       so gunicorn `main:app` resolves reliably.
-- FIX: keeps controlled route mounting as the default strategy and preserves
-       ownership diagnostics for advisor / advanced / analysis / schema / enriched.
+- FIX: recomputes route signature counts and route totals from the live mounted app
+       instead of preserving the default zero values from the empty state snapshot.
+- FIX: keeps canonical owner diagnostics live-derived when an app instance exists,
+       which prevents stale startup metrics from leaking into `/meta` and `/health`.
+- FIX: preserves controlled route mounting and exact-owner verification across
+       advisor / advanced / analysis / schema / enriched families.
 - FIX: keeps startup engine initialization timeout-aware and non-fatal unless
        strict mode is explicitly enabled.
-- FIX: filters broad routers so schema ownership cannot drift through unrelated
-       modules, especially for `/sheet-rows` and `/v1/config`.
-- FIX: normalizes canonical-path owner checks and startup warnings.
 - SAFE: remains import-tolerant when optional modules are missing.
 """
 
@@ -184,7 +183,7 @@ class _StrictJSONResponse(JSONResponse):
         ).encode("utf-8")
 
 
-APP_ENTRY_VERSION = "8.6.3"
+APP_ENTRY_VERSION = "8.7.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
@@ -859,6 +858,30 @@ def _verify_required_route_families(app: FastAPI) -> List[str]:
     return sorted([k for k, ok in required.items() if not bool(ok)])
 
 
+def _live_route_metrics(app: Optional[FastAPI]) -> Tuple[int, int]:
+    if app is None:
+        return 0, 0
+    try:
+        live_route_count = len(getattr(app, "routes", []) or [])
+    except Exception:
+        live_route_count = 0
+    try:
+        live_signature_count = _route_signature_count(app, include_builtin=True)
+    except Exception:
+        live_signature_count = 0
+    return int(live_route_count), int(live_signature_count)
+
+
+def _prefer_live_metric(raw_value: Any, live_value: int) -> int:
+    try:
+        parsed = int(raw_value)
+    except Exception:
+        parsed = 0
+    if live_value > 0:
+        return int(live_value)
+    return max(0, parsed)
+
+
 def _normalize_routes_snapshot(
     ret: Any,
     *,
@@ -901,29 +924,25 @@ def _normalize_routes_snapshot(
     protected_prefixes = list(src.get("protected_prefixes", list(_CONTROLLED_PROTECTED_PREFIXES)) or list(_CONTROLLED_PROTECTED_PREFIXES))
     canonical_owner_map = dict(src.get("canonical_owner_map", dict(_CONTROLLED_CANONICAL_OWNER_MAP)) or dict(_CONTROLLED_CANONICAL_OWNER_MAP))
 
-    openapi_route_count_after_mount = int(src.get("openapi_route_count_after_mount", len(getattr(app, "routes", []) or []) if app is not None else 0) or 0)
-    route_signature_count_after_mount = int(src.get("route_signature_count_after_mount", _route_signature_count(app, include_builtin=True) if app is not None else 0) or 0)
+    live_route_count, live_signature_count = _live_route_metrics(app)
+    openapi_route_count_after_mount = _prefer_live_metric(src.get("openapi_route_count_after_mount", 0), live_route_count)
+    route_signature_count_after_mount = _prefer_live_metric(src.get("route_signature_count_after_mount", 0), live_signature_count)
 
     all_paths: Set[str] = set()
     path_owners: Dict[str, str] = {}
     path_owner_mismatches: Dict[str, Dict[str, str]] = {}
+    route_family_presence = dict(src.get("route_family_presence", {}) or {})
+
     if app is not None:
         all_paths = {str(getattr(r, "path", "") or "") for r in (getattr(app, "routes", []) or [])}
+        route_family_presence = _route_family_presence_from_paths(all_paths)
         path_owners = _canonical_path_owners_from_routes(app)
         path_owner_mismatches = _canonical_path_owner_mismatches(path_owners)
-
-    route_family_presence = dict(src.get("route_family_presence", {}) or {})
-    if all_paths:
-        route_family_presence = _route_family_presence_from_paths(all_paths)
-
-    effective_failed_modules = list(src.get("effective_failed_modules", []) or [])
-    if not effective_failed_modules:
-        effective_failed_modules = _effective_failed_modules(
-            {"import_errors": import_errors, "mount_errors": mount_errors, "no_router": no_router}
-        )
-
-    if app is not None and not missing_required_keys:
         missing_required_keys = _verify_required_route_families(app)
+
+    effective_failed_modules = _effective_failed_modules(
+        {"import_errors": import_errors, "mount_errors": mount_errors, "no_router": no_router}
+    )
 
     out = {
         "mounted": mounted,
@@ -1093,7 +1112,9 @@ def _mount_routes_controlled(app: FastAPI) -> Dict[str, Any]:
                 snap["duplicate_skips"].append({"module": module_name, "path": route.path, "methods": sorted([m for _, m in sigs])})
                 continue
             if overlap:
-                snap["partial_duplicate_skips"].append({"module": module_name, "path": route.path, "methods": sorted([m for _, m in sigs]), "overlap": sorted([m for _, m in overlap])})
+                snap["partial_duplicate_skips"].append(
+                    {"module": module_name, "path": route.path, "methods": sorted([m for _, m in sigs]), "overlap": sorted([m for _, m in overlap])}
+                )
                 continue
 
             try:
@@ -1110,7 +1131,6 @@ def _mount_routes_controlled(app: FastAPI) -> Dict[str, Any]:
         else:
             snap["resolved_entries"].append({"module": module_name, "status": "loaded_but_skipped"})
 
-    snap["missing_required_keys"] = _verify_required_route_families(app)
     snap = _normalize_routes_snapshot(snap, used_strategy="main.controlled_priority_plan", app=app)
     _invalidate_openapi_cache(app)
     return snap
@@ -1163,7 +1183,25 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
     partial_duplicate_skips_count = int(snap.get("partial_duplicate_skips_count", len(snap.get("partial_duplicate_skips", []) or [])) or 0)
     failed_count = int(snap.get("failed_count", len(snap.get("effective_failed_modules", []) or [])) or 0)
     strategy = str(snap.get("strategy", "") or "")
-    route_signature_count = int(snap.get("route_signature_count_after_mount", _route_signature_count(app, include_builtin=True) if app is not None else 0) or 0)
+
+    live_route_count, live_signature_count = _live_route_metrics(app)
+    snapshot_route_signature_count = int(snap.get("route_signature_count_after_mount", 0) or 0)
+    route_signature_count = live_signature_count if live_signature_count > 0 else snapshot_route_signature_count
+
+    path_owners = dict(snap.get("canonical_path_owners", {}) or {})
+    path_owner_mismatches = dict(snap.get("canonical_path_owner_mismatches", {}) or {})
+    route_family_presence = dict(snap.get("route_family_presence", {}) or {})
+    missing_required_keys = list(snap.get("missing_required_keys", []) or [])
+
+    if app is not None:
+        try:
+            path_owners = _canonical_path_owners_from_routes(app)
+            path_owner_mismatches = _canonical_path_owner_mismatches(path_owners)
+            all_paths = {str(getattr(r, "path", "") or "") for r in (getattr(app, "routes", []) or [])}
+            route_family_presence = _route_family_presence_from_paths(all_paths)
+            missing_required_keys = _verify_required_route_families(app)
+        except Exception:
+            pass
 
     return {
         "service": _SETTINGS.APP_NAME,
@@ -1181,11 +1219,12 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
         "routes_failed_count": failed_count,
         "routes_strategy": strategy,
         "route_signature_count": route_signature_count,
-        "missing_required_keys": list(snap.get("missing_required_keys", []) or []),
-        "route_family_presence": dict(snap.get("route_family_presence", {}) or {}),
+        "route_count_live": live_route_count,
+        "missing_required_keys": missing_required_keys,
+        "route_family_presence": route_family_presence,
         "effective_failed_modules": list(snap.get("effective_failed_modules", []) or []),
-        "canonical_path_owners": dict(snap.get("canonical_path_owners", {}) or {}),
-        "canonical_path_owner_mismatches": dict(snap.get("canonical_path_owner_mismatches", {}) or {}),
+        "canonical_path_owners": path_owners,
+        "canonical_path_owner_mismatches": path_owner_mismatches,
         "engine_present": engine_obj is not None,
         "engine_ready": engine_obj is not None and not engine_init_error,
         "engine_source": engine_source,
@@ -1343,13 +1382,14 @@ def create_app() -> FastAPI:
         try:
             snap = _mount_routes_once(app, phase="startup")
             logger.info(
-                "Routes verified at startup: mounted=%s duplicate_skips=%s partial_duplicate_skips=%s missing=%s failed=%s strategy=%s",
+                "Routes verified at startup: mounted=%s duplicate_skips=%s partial_duplicate_skips=%s missing=%s failed=%s strategy=%s route_signatures=%s",
                 snap.get("mounted_count", 0),
                 snap.get("duplicate_skips_count", 0),
                 snap.get("partial_duplicate_skips_count", 0),
                 snap.get("missing_count", 0),
                 snap.get("failed_count", 0),
                 snap.get("strategy", ""),
+                snap.get("route_signature_count_after_mount", 0),
             )
             missing_required = list(snap.get("missing_required_keys", []) or [])
             if missing_required:
@@ -1463,13 +1503,14 @@ def create_app() -> FastAPI:
         try:
             snap = _mount_routes_once(app, phase="prestart")
             logger.info(
-                "Routes mounted at app creation: mounted=%s duplicate_skips=%s partial_duplicate_skips=%s missing=%s failed=%s strategy=%s",
+                "Routes mounted at app creation: mounted=%s duplicate_skips=%s partial_duplicate_skips=%s missing=%s failed=%s strategy=%s route_signatures=%s",
                 snap.get("mounted_count", 0),
                 snap.get("duplicate_skips_count", 0),
                 snap.get("partial_duplicate_skips_count", 0),
                 snap.get("missing_count", 0),
                 snap.get("failed_count", 0),
                 snap.get("strategy", ""),
+                snap.get("route_signature_count_after_mount", 0),
             )
         except Exception as e:
             logger.error("Prestart route mounting failed: %s", e, exc_info=True)
