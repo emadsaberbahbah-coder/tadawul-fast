@@ -2,20 +2,20 @@
 # routes/enriched_quote.py
 """
 ================================================================================
-TFB Enriched Quote Routes Wrapper — v7.7.0
+TFB Enriched Quote Routes Wrapper — v7.8.0
 ================================================================================
 STARTUP-SAFE • EAGER-ROUTER • QUOTE-OWNED • IMPORT-TOLERANT
-GET+POST COMPATIBLE • ROOT /v1/enriched-quote BRIDGE SAFE
+GET+POST COMPATIBLE • ROOT ALIAS BRIDGE SAFE
 NON-INSTRUMENT PAGE FENCING • JSON-SAFE • SCHEMA-AWARE
 BATCH HYDRATION SAFE • AUTH-TOLERANT • CANONICAL-OWNERSHIP SAFE
 
 Why this revision
 -----------------
-- FIX: exposes a real module-level `router` during import so controlled startup
-       mount plans do not see `None` for the enriched family.
-- FIX: keeps enriched quote-owned only; no `/sheet-rows` ownership here.
 - FIX: preserves `/v1/enriched`, `/v1/enriched_quote`, `/v1/enriched-quote`,
-       and root `/v1/enriched-quote` compatibility.
+       and real bare-root compatibility for all three aliases.
+- FIX: keeps enriched quote-owned only; no `/sheet-rows` ownership here.
+- FIX: maintains `/quote` and `/quotes` root ownership expected by canonical
+       startup maps and live route tests.
 - FIX: fences non-instrument pages with clear canonical owner hints.
 - FIX: stays import-safe even when optional core/schema/auth modules are absent.
 ================================================================================
@@ -39,8 +39,9 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, status
 
 logger = logging.getLogger("routes.enriched_quote")
+logger.addHandler(logging.NullHandler())
 
-ROUTER_VERSION = "7.7.0"
+ROUTER_VERSION = "7.8.0"
 TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
     "top10_rank",
     "selection_reason",
@@ -76,47 +77,38 @@ def _strip(v: Any) -> str:
 def _json_safe(value: Any) -> Any:
     if value is None or isinstance(value, (bool, int, str)):
         return value
-
     if isinstance(value, float):
         return None if (math.isnan(value) or math.isinf(value)) else value
-
     if isinstance(value, Decimal):
         try:
             f = float(value)
             return None if (math.isnan(f) or math.isinf(f)) else f
         except Exception:
             return str(value)
-
     if isinstance(value, (datetime, date, dt_time)):
         try:
             return value.isoformat()
         except Exception:
             return str(value)
-
     if isinstance(value, bytes):
         try:
             return value.decode("utf-8", errors="replace")
         except Exception:
             return str(value)
-
     if isinstance(value, Mapping):
         return {str(k): _json_safe(v) for k, v in value.items()}
-
     if isinstance(value, (list, tuple, set)):
         return [_json_safe(v) for v in value]
-
     try:
         if hasattr(value, "model_dump"):
             return _json_safe(value.model_dump())  # type: ignore[attr-defined]
     except Exception:
         pass
-
     try:
         if hasattr(value, "dict"):
             return _json_safe(value.dict())  # type: ignore[attr-defined]
     except Exception:
         pass
-
     try:
         return _json_safe(vars(value))
     except Exception:
@@ -128,21 +120,18 @@ def _model_to_dict(obj: Any) -> Dict[str, Any]:
         return dict(obj)
     if obj is None:
         return {}
-
     try:
         if hasattr(obj, "model_dump"):
             d = obj.model_dump()  # type: ignore[attr-defined]
             return d if isinstance(d, dict) else {}
     except Exception:
         pass
-
     try:
         if hasattr(obj, "dict"):
             d = obj.dict()  # type: ignore[attr-defined]
             return d if isinstance(d, dict) else {}
     except Exception:
         pass
-
     try:
         d = vars(obj)
         return d if isinstance(d, dict) else {}
@@ -162,23 +151,21 @@ async def _call_maybe_async(fn: Any, *args: Any, **kwargs: Any) -> Any:
 
 
 def _request_id(request: Request, x_request_id: Optional[str]) -> str:
-    if _strip(x_request_id):
-        return _strip(x_request_id)
-
+    rid = _strip(x_request_id)
+    if rid:
+        return rid
     try:
         rid = _strip(getattr(request.state, "request_id", ""))
         if rid:
             return rid
     except Exception:
         pass
-
     try:
         rid = _strip(request.headers.get("X-Request-ID"))
         if rid:
             return rid
     except Exception:
         pass
-
     return uuid.uuid4().hex[:12]
 
 
@@ -187,6 +174,20 @@ def _split_csv(value: str) -> List[str]:
     out: List[str] = []
     seen = set()
     for part in raw.split(","):
+        s = _strip(part)
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+def _split_symbols(value: str) -> List[str]:
+    raw = _strip(value)
+    if not raw:
+        return []
+    out: List[str] = []
+    seen = set()
+    for part in re.split(r"[\s,;|]+", raw):
         s = _strip(part)
         if s and s not in seen:
             seen.add(s)
@@ -208,7 +209,7 @@ def _list_from_body(body: Mapping[str, Any], *keys: str) -> List[str]:
             if out:
                 return out
         if isinstance(value, str) and value.strip():
-            out = _split_csv(value)
+            out = _split_symbols(value)
             if out:
                 return out
     return []
@@ -255,14 +256,11 @@ def _complete_schema_contract(headers: Sequence[str], keys: Sequence[str]) -> Tu
     raw_headers = list(headers or [])
     raw_keys = list(keys or [])
     max_len = max(len(raw_headers), len(raw_keys))
-
     out_headers: List[str] = []
     out_keys: List[str] = []
-
     for i in range(max_len):
         h = _strip(raw_headers[i]) if i < len(raw_headers) else ""
         k = _strip(raw_keys[i]) if i < len(raw_keys) else ""
-
         if h and not k:
             k = re.sub(r"[^a-z0-9]+", "_", h.lower()).strip("_")
         elif k and not h:
@@ -270,10 +268,8 @@ def _complete_schema_contract(headers: Sequence[str], keys: Sequence[str]) -> Tu
         elif not h and not k:
             h = f"Column {i + 1}"
             k = f"column_{i + 1}"
-
         out_headers.append(h)
         out_keys.append(k)
-
     return out_headers, out_keys
 
 
@@ -316,7 +312,6 @@ def _symbol_match_candidates(sym: Any) -> List[str]:
     if norm.endswith(".SR"):
         code = norm[:-3]
         items.extend([code, code.upper(), f"TADAWUL:{code}"])
-
     out: List[str] = []
     seen = set()
     for item in items:
@@ -330,38 +325,14 @@ def _symbol_match_candidates(sym: Any) -> List[str]:
 def _payload_row_richness(d: Optional[Dict[str, Any]]) -> int:
     if not isinstance(d, dict):
         return 0
-
     important = (
-        "symbol",
-        "name",
-        "exchange",
-        "currency",
-        "country",
-        "sector",
-        "industry",
-        "current_price",
-        "previous_close",
-        "open_price",
-        "day_high",
-        "day_low",
-        "volume",
-        "market_cap",
-        "pe_ttm",
-        "pb_ratio",
-        "ps_ratio",
-        "forecast_confidence",
-        "risk_score",
-        "risk_bucket",
-        "overall_score",
-        "opportunity_score",
-        "recommendation",
-        "recommendation_reason",
-        "data_provider",
-        "last_updated_utc",
-        "last_updated_riyadh",
-        "top10_rank",
-        "selection_reason",
-        "criteria_snapshot",
+        "symbol", "name", "exchange", "currency", "country", "sector", "industry",
+        "current_price", "previous_close", "open_price", "day_high", "day_low",
+        "volume", "market_cap", "pe_ttm", "pb_ratio", "ps_ratio",
+        "forecast_confidence", "risk_score", "risk_bucket", "overall_score",
+        "opportunity_score", "recommendation", "recommendation_reason",
+        "data_provider", "last_updated_utc", "last_updated_riyadh",
+        "top10_rank", "selection_reason", "criteria_snapshot",
     )
     return sum(1 for key in important if d.get(key) not in (None, "", [], {}))
 
@@ -394,7 +365,6 @@ class _Service:
         except Exception:
             auth_ok = None  # type: ignore
             is_open_mode = None  # type: ignore
-
             def get_settings_cached(*args: Any, **kwargs: Any) -> Any:  # type: ignore
                 return None
 
@@ -470,7 +440,6 @@ class _Service:
 
         token = _strip(x_app_token)
         auth = _strip(authorization)
-
         if auth.lower().startswith("bearer "):
             token = _strip(auth.split(" ", 1)[1])
         elif not token and allow_query:
@@ -478,7 +447,6 @@ class _Service:
 
         headers = dict(request.headers)
         path = str(getattr(getattr(request, "url", None), "path", "") or "")
-
         attempts = [
             {"token": token, "authorization": authorization, "headers": headers, "path": path, "request": request, "settings": settings},
             {"token": token, "authorization": authorization, "headers": headers, "path": path, "request": request},
@@ -487,7 +455,6 @@ class _Service:
             {"token": token, "authorization": authorization},
             {"token": token},
         ]
-
         for kwargs in attempts:
             try:
                 if bool(self._auth_ok(**kwargs)):
@@ -499,7 +466,6 @@ class _Service:
                 raise
             except Exception:
                 raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
-
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
     async def get_engine(self, request: Optional[Request]) -> Any:
@@ -572,20 +538,16 @@ class _Service:
             first_val = list(spec.values())[0]
             if isinstance(first_val, dict) and ("columns" in first_val or "fields" in first_val):
                 spec = first_val
-
         cols = getattr(spec, "columns", None)
         if isinstance(cols, list) and cols:
             return cols
-
         fields = getattr(spec, "fields", None)
         if isinstance(fields, list) and fields:
             return fields
-
         if isinstance(spec, Mapping):
             cols2 = spec.get("columns") or spec.get("fields")
             if isinstance(cols2, list) and cols2:
                 return cols2
-
         try:
             d = getattr(spec, "__dict__", None)
             if isinstance(d, dict):
@@ -594,27 +556,18 @@ class _Service:
                     return cols3
         except Exception:
             pass
-
         return []
 
     def _schema_keys_headers_from_spec(self, spec: Any) -> Tuple[List[str], List[str]]:
         headers: List[str] = []
         keys: List[str] = []
-
         for c in self._schema_columns_from_any(spec):
             if isinstance(c, Mapping):
                 h = _strip(c.get("header") or c.get("display_header") or c.get("displayHeader") or c.get("label") or c.get("title"))
                 k = _strip(c.get("key") or c.get("field") or c.get("name") or c.get("id"))
             else:
-                h = _strip(
-                    getattr(
-                        c,
-                        "header",
-                        getattr(c, "display_header", getattr(c, "displayHeader", getattr(c, "label", getattr(c, "title", None)))),
-                    )
-                )
+                h = _strip(getattr(c, "header", getattr(c, "display_header", getattr(c, "displayHeader", getattr(c, "label", getattr(c, "title", None))))))
                 k = _strip(getattr(c, "key", getattr(c, "field", getattr(c, "name", getattr(c, "id", None)))))
-
             if h or k:
                 headers.append(h or k.replace("_", " ").title())
                 keys.append(k or re.sub(r"[^a-z0-9]+", "_", h.lower()).strip("_"))
@@ -632,7 +585,6 @@ class _Service:
     def _schema_from_data_dictionary(self, page: str) -> Tuple[List[str], List[str]]:
         if not callable(self.build_data_dictionary_rows):
             return [], []
-
         try:
             try:
                 rows = self.build_data_dictionary_rows(include_meta_sheet=True)
@@ -640,10 +592,8 @@ class _Service:
                 rows = self.build_data_dictionary_rows()
         except Exception:
             return [], []
-
         headers: List[str] = []
         keys: List[str] = []
-
         for row in rows if isinstance(rows, list) else []:
             d = row if isinstance(row, Mapping) else _model_to_dict(row)
             sheet_name = _strip(d.get("sheet") or d.get("Sheet") or d.get("page"))
@@ -655,7 +605,6 @@ class _Service:
                 headers.append(h)
             if k:
                 keys.append(k)
-
         return headers, keys
 
     def page_is_known(self, page: str) -> bool:
@@ -675,31 +624,25 @@ class _Service:
     def schema_for_page(self, page: str) -> Tuple[List[str], List[str]]:
         headers: List[str] = []
         keys: List[str] = []
-
         if self._has_schema:
             try:
                 spec = self.get_sheet_spec(page)
                 headers, keys = self._schema_keys_headers_from_spec(spec)
             except Exception:
                 headers, keys = [], []
-
         if not headers or not keys:
             dd_headers, dd_keys = self._schema_from_data_dictionary(page)
             headers = headers or dd_headers
             keys = keys or dd_keys
-
         if page == "Data_Dictionary" and (not headers or not keys):
             headers = ["Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes"]
             keys = ["sheet", "group", "header", "key", "dtype", "fmt", "required", "source", "notes"]
-
         if page == "Top_10_Investments":
             headers, keys = _ensure_top10_contract(headers, keys)
-
         if not headers and keys:
             headers = [k.replace("_", " ").title() for k in keys]
         if not keys and headers:
             keys = [re.sub(r"[^a-z0-9]+", "_", h.lower()).strip("_") for h in headers]
-
         return _complete_schema_contract(headers or ["Symbol", "Error"], keys or ["symbol", "error"])
 
     def _key_variants(self, key: str) -> List[str]:
@@ -708,10 +651,7 @@ class _Service:
             return []
         variants = [base, base.lower(), base.upper(), base.replace("_", " "), re.sub(r"[^a-z0-9]+", "", base.lower())]
         for alias in _FIELD_ALIAS_HINTS.get(base, []):
-            variants.extend(
-                [alias, alias.lower(), alias.upper(), alias.replace("_", " "), re.sub(r"[^a-z0-9]+", "", alias.lower())]
-            )
-
+            variants.extend([alias, alias.lower(), alias.upper(), alias.replace("_", " "), re.sub(r"[^a-z0-9]+", "", alias.lower())])
         out: List[str] = []
         seen = set()
         for value in variants:
@@ -767,42 +707,39 @@ class _Service:
         hdrs = list(headers)
         ks = list(keys)
         matrix = _rows_matrix_from_objects(rows_out, ks)
-
-        return _json_safe(
-            {
-                "status": status,
-                "page": page,
-                "sheet": page,
-                "sheet_name": page,
-                "route_family": route_family,
-                "headers": hdrs if include_headers else [],
-                "display_headers": hdrs if include_headers else [],
-                "sheet_headers": hdrs if include_headers else [],
-                "column_headers": hdrs if include_headers else [],
-                "keys": ks,
-                "columns": ks,
-                "fields": ks,
-                "rows": matrix if include_matrix else [],
-                "rows_matrix": matrix if include_matrix else [],
-                "row_objects": rows_out,
-                "items": rows_out,
-                "records": rows_out,
-                "data": rows_out,
-                "quotes": rows_out,
+        return _json_safe({
+            "status": status,
+            "page": page,
+            "sheet": page,
+            "sheet_name": page,
+            "route_family": route_family,
+            "headers": hdrs if include_headers else [],
+            "display_headers": hdrs if include_headers else [],
+            "sheet_headers": hdrs if include_headers else [],
+            "column_headers": hdrs if include_headers else [],
+            "keys": ks,
+            "columns": ks,
+            "fields": ks,
+            "rows": matrix if include_matrix else [],
+            "rows_matrix": matrix if include_matrix else [],
+            "row_objects": rows_out,
+            "items": rows_out,
+            "records": rows_out,
+            "data": rows_out,
+            "quotes": rows_out,
+            "count": len(rows_out),
+            "detail": error or "",
+            "error": error,
+            "version": ROUTER_VERSION,
+            "request_id": request_id,
+            "meta": {
+                "duration_ms": (time.time() - started_at) * 1000.0,
                 "count": len(rows_out),
-                "detail": error or "",
-                "error": error,
-                "version": ROUTER_VERSION,
-                "request_id": request_id,
-                "meta": {
-                    "duration_ms": (time.time() - started_at) * 1000.0,
-                    "count": len(rows_out),
-                    "dispatch": dispatch,
-                    "mode": mode,
-                    **(extra_meta or {}),
-                },
-            }
-        )
+                "dispatch": dispatch,
+                "mode": mode,
+                **(extra_meta or {}),
+            },
+        })
 
 
 def _canonical_owner_hint(page: str, route_family: str) -> Dict[str, str]:
@@ -844,10 +781,7 @@ async def _build_instrument_rows(
 
     engine = await svc.get_engine(request)
     if engine is None:
-        rows = [
-            svc.normalize_row(keys, {"symbol": s, "ticker": s, "error": "Data engine unavailable"}, symbol_fallback=s)
-            for s in symbols
-        ]
+        rows = [svc.normalize_row(keys, {"symbol": s, "ticker": s, "error": "Data engine unavailable"}, symbol_fallback=s) for s in symbols]
         return rows, len(rows), {"batch_rows": 0, "rehydrated_rows": 0, "sparse_after_rehydrate": len(rows)}
 
     quotes_map: Dict[str, Dict[str, Any]] = {}
@@ -880,14 +814,12 @@ async def _build_instrument_rows(
             ((list(symbols),), {"mode": mode}),
             ((list(symbols),), {}),
         ]
-
         for args, kwargs in signatures:
             try:
                 if svc.quote_call_timeout_sec > 0:
                     got = await asyncio.wait_for(_call_maybe_async(batch_fn, *args, **kwargs), timeout=svc.quote_call_timeout_sec)
                 else:
                     got = await _call_maybe_async(batch_fn, *args, **kwargs)
-
                 if isinstance(got, dict):
                     for k, v in got.items():
                         _put_quote(k, v if isinstance(v, dict) else _model_to_dict(v))
@@ -911,11 +843,7 @@ async def _build_instrument_rows(
             _put_quote(s, {"symbol": s, "ticker": s, "error": "engine_missing_batch_quote_methods"})
 
     batch_rows = len([s for s in symbols if _get_quote(s)])
-
-    sparse_symbols = [
-        s for s in symbols
-        if not _get_quote(s) or _is_sparse_payload_row(_get_quote(s), threshold=svc.rehydrate_sparse_threshold)
-    ]
+    sparse_symbols = [s for s in symbols if not _get_quote(s) or _is_sparse_payload_row(_get_quote(s), threshold=svc.rehydrate_sparse_threshold)]
 
     per_fn = None
     for name in ("get_enriched_quote_dict", "get_quote_dict", "get_enriched_quote", "get_quote"):
@@ -953,7 +881,6 @@ async def _build_instrument_rows(
     rows_out: List[Dict[str, Any]] = []
     errors = 0
     sparse_after = 0
-
     for sym in symbols:
         raw = _get_quote(sym) or {"symbol": sym, "ticker": sym, "error": "missing_row"}
         if raw.get("error"):
@@ -961,12 +888,7 @@ async def _build_instrument_rows(
         if _is_sparse_payload_row(raw, threshold=svc.rehydrate_sparse_threshold):
             sparse_after += 1
         rows_out.append(svc.normalize_row(keys, raw, symbol_fallback=sym))
-
-    return rows_out, errors, {
-        "batch_rows": batch_rows,
-        "rehydrated_rows": rehydrated_rows,
-        "sparse_after_rehydrate": sparse_after,
-    }
+    return rows_out, errors, {"batch_rows": batch_rows, "rehydrated_rows": rehydrated_rows, "sparse_after_rehydrate": sparse_after}
 
 
 def _build_router(reason: str) -> APIRouter:
@@ -979,17 +901,15 @@ def _build_router(reason: str) -> APIRouter:
     legacy = APIRouter(tags=["quotes"])
 
     async def _health_payload() -> Dict[str, Any]:
-        return _json_safe(
-            {
-                "status": "ok",
-                "module": "routes.enriched_quote",
-                "router_version": ROUTER_VERSION,
-                "reason": reason,
-                "schema_available": bool(svc._has_schema),
-                "router_ready": True,
-                "router_init_error": _router_init_error,
-            }
-        )
+        return _json_safe({
+            "status": "ok",
+            "module": "routes.enriched_quote",
+            "router_version": ROUTER_VERSION,
+            "reason": reason,
+            "schema_available": bool(svc._has_schema),
+            "router_ready": True,
+            "router_init_error": _router_init_error,
+        })
 
     def _collect_quote_body(*, symbol: Optional[str], ticker: Optional[str], page: Optional[str]) -> Dict[str, Any]:
         body: Dict[str, Any] = {}
@@ -1069,11 +989,7 @@ def _build_router(reason: str) -> APIRouter:
 
         if route_family != "instrument":
             hint = _canonical_owner_hint(page, route_family)
-            row = svc.normalize_row(
-                keys,
-                {"symbol": symbol, "ticker": symbol, "error": f"single_quote_not_supported_for_{route_family}_page"},
-                symbol_fallback=symbol,
-            )
+            row = svc.normalize_row(keys, {"symbol": symbol, "ticker": symbol, "error": f"single_quote_not_supported_for_{route_family}_page"}, symbol_fallback=symbol)
             payload = svc.envelope(
                 status="partial",
                 page=page,
@@ -1095,7 +1011,6 @@ def _build_router(reason: str) -> APIRouter:
 
         rows_out, errors, meta = await _build_instrument_rows(svc, page, keys, [symbol], mode_q, request)
         row = rows_out[0] if rows_out else svc.normalize_row(keys, {"symbol": symbol, "ticker": symbol, "error": "missing_row"}, symbol_fallback=symbol)
-
         payload = svc.envelope(
             status="success" if errors == 0 and not row.get("error") else "partial",
             page=page,
@@ -1236,16 +1151,7 @@ def _build_router(reason: str) -> APIRouter:
         symbol = _strip(prepared.get("symbol") or prepared.get("ticker") or prepared.get("requested_symbol"))
         list_symbols = _list_from_body(prepared, "symbols", "tickers", "tickers_list")
         if symbol and not list_symbols:
-            return await _handle_single_quote(
-                request,
-                prepared,
-                _page_from_body(prepared),
-                mode_q,
-                token_q,
-                x_app_token,
-                authorization,
-                x_request_id,
-            )
+            return await _handle_single_quote(request, prepared, _page_from_body(prepared), mode_q, token_q, x_app_token, authorization, x_request_id)
         return await _handle_quotes_batch(request, prepared, mode_q, token_q, x_app_token, authorization, x_request_id)
 
     @enriched.get("/health", include_in_schema=False)
@@ -1260,24 +1166,22 @@ def _build_router(reason: str) -> APIRouter:
     async def headers(page: str = Query(default="Market_Leaders")) -> Dict[str, Any]:
         page_norm = svc.normalize_page(page)
         hdrs, keys = svc.schema_for_page(page_norm)
-        return _json_safe(
-            {
-                "status": "success" if hdrs else "degraded",
-                "page": page_norm,
-                "sheet": page_norm,
-                "sheet_name": page_norm,
-                "headers": hdrs,
-                "display_headers": hdrs,
-                "sheet_headers": hdrs,
-                "column_headers": hdrs,
-                "keys": keys,
-                "columns": keys,
-                "fields": keys,
-                "route_family": svc.route_family(page_norm),
-                "router_version": ROUTER_VERSION,
-                "reason": None if hdrs else reason,
-            }
-        )
+        return _json_safe({
+            "status": "success" if hdrs else "degraded",
+            "page": page_norm,
+            "sheet": page_norm,
+            "sheet_name": page_norm,
+            "headers": hdrs,
+            "display_headers": hdrs,
+            "sheet_headers": hdrs,
+            "column_headers": hdrs,
+            "keys": keys,
+            "columns": keys,
+            "fields": keys,
+            "route_family": svc.route_family(page_norm),
+            "router_version": ROUTER_VERSION,
+            "reason": None if hdrs else reason,
+        })
 
     @enriched.post("/quote")
     @enriched_quote_alias.post("/quote")
@@ -1355,25 +1259,17 @@ def _build_router(reason: str) -> APIRouter:
         x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
     ) -> Dict[str, Any]:
         body = _collect_quotes_body(
-            page=page,
-            sheet_name=sheet_name,
-            sheet=sheet,
-            name=name,
-            tab=tab,
-            symbols=symbols,
-            tickers=tickers,
-            include_headers=include_headers,
-            include_matrix=include_matrix,
-            limit=limit,
-            offset=offset,
-            top_n=top_n,
-            schema_only=schema_only,
-            headers_only=headers_only,
+            page=page, sheet_name=sheet_name, sheet=sheet, name=name, tab=tab,
+            symbols=symbols, tickers=tickers, include_headers=include_headers,
+            include_matrix=include_matrix, limit=limit, offset=offset, top_n=top_n,
+            schema_only=schema_only, headers_only=headers_only,
         )
         return await _handle_quotes_batch(request, body, mode, token, x_app_token, authorization, x_request_id)
 
-    @root.post("/v1/enriched-quote")
-    async def hyphen_root_post(
+    @enriched.post("")
+    @enriched_quote_alias.post("")
+    @enriched_hyphen.post("")
+    async def alias_root_post(
         request: Request,
         body: Dict[str, Any] = Body(default_factory=dict),
         mode: str = Query(default="", description="Optional mode hint"),
@@ -1384,8 +1280,10 @@ def _build_router(reason: str) -> APIRouter:
     ) -> Dict[str, Any]:
         return await _handle_root_bridge(request, body, mode, token, x_app_token, authorization, x_request_id)
 
-    @root.get("/v1/enriched-quote")
-    async def hyphen_root_get(
+    @enriched.get("")
+    @enriched_quote_alias.get("")
+    @enriched_hyphen.get("")
+    async def alias_root_get(
         request: Request,
         symbol: Optional[str] = Query(default=None),
         ticker: Optional[str] = Query(default=None),
@@ -1410,20 +1308,10 @@ def _build_router(reason: str) -> APIRouter:
         x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
     ) -> Dict[str, Any]:
         body = _collect_quotes_body(
-            page=page,
-            sheet_name=sheet_name,
-            sheet=sheet,
-            name=name,
-            tab=tab,
-            symbols=symbols,
-            tickers=tickers,
-            include_headers=include_headers,
-            include_matrix=include_matrix,
-            limit=limit,
-            offset=offset,
-            top_n=top_n,
-            schema_only=schema_only,
-            headers_only=headers_only,
+            page=page, sheet_name=sheet_name, sheet=sheet, name=name, tab=tab,
+            symbols=symbols, tickers=tickers, include_headers=include_headers,
+            include_matrix=include_matrix, limit=limit, offset=offset, top_n=top_n,
+            schema_only=schema_only, headers_only=headers_only,
         )
         if symbol not in (None, ""):
             body["symbol"] = symbol
@@ -1444,18 +1332,18 @@ def _build_fallback_router(reason: str) -> APIRouter:
     @fallback.get("/v1/enriched/health", include_in_schema=False)
     @fallback.get("/v1/enriched_quote/health", include_in_schema=False)
     @fallback.get("/v1/enriched-quote/health", include_in_schema=False)
+    @fallback.get("/v1/enriched", include_in_schema=False)
+    @fallback.get("/v1/enriched_quote", include_in_schema=False)
     @fallback.get("/v1/enriched-quote", include_in_schema=False)
     async def fallback_health() -> Dict[str, Any]:
-        return _json_safe(
-            {
-                "status": "degraded",
-                "module": "routes.enriched_quote",
-                "router_version": ROUTER_VERSION,
-                "reason": reason,
-                "router_ready": False,
-                "router_init_error": _router_init_error,
-            }
-        )
+        return _json_safe({
+            "status": "degraded",
+            "module": "routes.enriched_quote",
+            "router_version": ROUTER_VERSION,
+            "reason": reason,
+            "router_ready": False,
+            "router_init_error": _router_init_error,
+        })
 
     return fallback
 
