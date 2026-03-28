@@ -1,39 +1,31 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 core/investment_advisor.py
 ================================================================================
-INVESTMENT ADVISOR ORCHESTRATOR — v4.2.0
+INVESTMENT ADVISOR ORCHESTRATOR — v4.3.0
 ================================================================================
 LIVE-BY-DEFAULT • ENGINE-FIRST • SNAPSHOT-TOLERANT • ROUTE-COMPATIBLE
 MODE-AWARE • SCHEMA-SAFE • JSON-SAFE • IMPORT-SAFE • WORKER-THREAD SAFE
+SPECIAL-PAGE SAFE • CONTRACT-PRESERVING • DICTIONARY-HARDENED
 
 What this revision fixes
 ------------------------
-- ✅ FIX: keeps this module as an orchestration wrapper over the engine rather
+- FIX: keeps this module as an orchestration wrapper over the engine rather
          than becoming a second independent engine.
-- ✅ FIX: supports aligned engine output shapes including:
+- FIX: supports aligned engine output shapes including:
          - row_objects / rowObjects
          - rows_matrix / matrix
          - nested payload / result / response payloads
-- ✅ FIX: honors and normalizes offset locally, not only limit/top_n.
-- ✅ FIX: hardens tolerant engine calling so only signature-mismatch TypeErrors
+- FIX: honors and normalizes offset locally, not only limit/top_n.
+- FIX: hardens tolerant engine calling so only signature-mismatch TypeErrors
          trigger fallback retries; runtime exceptions now surface correctly.
-- ✅ FIX: prevents snapshot cross-talk by keying cache with request shape
+- FIX: prevents snapshot cross-talk by keying cache with request shape
          (page + mode + symbols + limit + offset), not page alone.
-- ✅ FIX: preserves stable JSON-safe envelopes and fallback recommendation logic.
-
-Purpose
--------
-This module is the advisor orchestration layer. It should:
-- normalize payloads coming from routes
-- choose effective data mode
-- delegate execution to `core.investment_advisor_engine`
-- optionally serve cached snapshots
-- return stable, JSON-safe envelopes
-
-It should NOT become a second independent engine.
+- FIX: preserves stable JSON-safe envelopes and fallback recommendation logic.
+- FIX: preserves exact canonical contracts for Top10 / Insights / Data Dictionary.
+- FIX: uses real Data Dictionary builder rows when engine output is empty.
+- FIX: reconstructs rows from nested payload + matrix payloads before fallback.
 ================================================================================
 """
 
@@ -47,17 +39,18 @@ import json
 import logging
 import math
 import os
+import re
 import threading
 import time
 from copy import deepcopy
-from dataclasses import is_dataclass, asdict
+from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple
 
 logger = logging.getLogger("core.investment_advisor")
 logger.addHandler(logging.NullHandler())
 
-INVESTMENT_ADVISOR_VERSION = "4.2.0"
+INVESTMENT_ADVISOR_VERSION = "4.3.0"
 DEFAULT_PAGE = "Top_10_Investments"
 DEFAULT_LIMIT = 10
 DEFAULT_OFFSET = 0
@@ -149,7 +142,7 @@ SCHEMA_FUNCTION_CANDIDATES = (
     "build_sheet_spec",
 )
 
-GENERIC_FALLBACK_HEADERS = [
+_GENERIC_FALLBACK_HEADERS = [
     "Symbol",
     "Name",
     "Asset Class",
@@ -188,6 +181,23 @@ _TOP10_EXTRA_HEADERS = ["Top10 Rank", "Selection Reason", "Criteria Snapshot"]
 _SNAPSHOT_LOCK = threading.RLock()
 _SNAPSHOT_STORE: Dict[str, Dict[str, Any]] = {}
 
+_FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
+    "symbol": ["ticker", "code", "requested_symbol"],
+    "ticker": ["symbol", "code", "requested_symbol"],
+    "name": ["company_name", "long_name", "instrument_name", "security_name", "title"],
+    "current_price": ["price", "last_price", "last", "close", "market_price", "nav"],
+    "price_change": ["change", "net_change"],
+    "percent_change": ["change_pct", "change_percent", "pct_change"],
+    "risk_score": ["risk", "riskscore"],
+    "valuation_score": ["valuation", "valuationscore"],
+    "overall_score": ["score", "overall", "totalscore"],
+    "opportunity_score": ["opportunity", "opportunityscore"],
+    "recommendation": ["signal", "rating", "action"],
+    "selection_reason": ["reason", "recommendation_reason", "reco_reason"],
+    "criteria_snapshot": ["criteria", "criteria_json", "snapshot"],
+    "updated_at": ["updated_at_utc", "last_updated", "timestamp_utc"],
+}
+
 
 # =============================================================================
 # Generic helpers
@@ -217,7 +227,8 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
             return default
         if value is None:
             return default
-        return float(value)
+        out = float(value)
+        return default if math.isnan(out) or math.isinf(out) else out
     except Exception:
         return default
 
@@ -321,6 +332,10 @@ def _normalize_key(key: str) -> str:
     return _s(key).strip().lower().replace(" ", "_").replace("-", "_")
 
 
+def _normalize_key_loose(key: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", _s(key).lower())
+
+
 def _criteria_fingerprint(criteria: Mapping[str, Any]) -> str:
     payload = {
         "page": _normalize_page_name(criteria.get("page")) or DEFAULT_PAGE,
@@ -337,6 +352,40 @@ def _slice_rows(rows: List[Dict[str, Any]], offset: int, limit: int) -> List[Dic
     start = max(0, _safe_int(offset, DEFAULT_OFFSET))
     size = max(1, _safe_int(limit, DEFAULT_LIMIT))
     return rows[start:start + size]
+
+
+def _row_value_for_aliases(row: Mapping[str, Any], aliases: Sequence[str]) -> Any:
+    if not isinstance(row, Mapping):
+        return None
+    exact = {str(k): v for k, v in row.items()}
+    lower = {str(k).lower(): v for k, v in row.items()}
+    canon = {_normalize_key(str(k)): v for k, v in row.items()}
+    loose = {_normalize_key_loose(str(k)): v for k, v in row.items()}
+
+    expanded: List[str] = []
+    seen = set()
+    for alias in aliases:
+        a = _s(alias)
+        if not a:
+            continue
+        for candidate in [a, a.lower(), _normalize_key(a), _normalize_key_loose(a)] + _FIELD_ALIAS_HINTS.get(_normalize_key(a), []):
+            c = _s(candidate)
+            if c and c not in seen:
+                seen.add(c)
+                expanded.append(c)
+
+    for alias in expanded:
+        if alias in exact and exact[alias] is not None:
+            return exact[alias]
+        if alias.lower() in lower and lower[alias.lower()] is not None:
+            return lower[alias.lower()]
+        nk = _normalize_key(alias)
+        if nk in canon and canon[nk] is not None:
+            return canon[nk]
+        nl = _normalize_key_loose(alias)
+        if nl in loose and loose[nl] is not None:
+            return loose[nl]
+    return None
 
 
 # =============================================================================
@@ -465,9 +514,9 @@ async def _load_headers_for_page(page: str) -> List[str]:
     if normalized == "Data_Dictionary":
         return list(_DICTIONARY_HEADERS)
     if normalized == "Top_10_Investments":
-        base = list(GENERIC_FALLBACK_HEADERS)
+        base = list(_GENERIC_FALLBACK_HEADERS)
         return base + [h for h in _TOP10_EXTRA_HEADERS if h not in base]
-    return list(GENERIC_FALLBACK_HEADERS)
+    return list(_GENERIC_FALLBACK_HEADERS)
 
 
 def _headers_to_keys(headers: List[str]) -> List[str]:
@@ -561,6 +610,11 @@ def _normalize_payload(*, request: Any = None, body: Any = None, payload: Any = 
     if symbols:
         out["symbols"] = symbols
         out["tickers"] = list(symbols)
+
+    selected_pages = _normalize_list(out.get("source_pages") or out.get("pages_selected") or out.get("pages") or out.get("sources"))
+    if selected_pages:
+        out["pages_selected"] = [_normalize_page_name(p) for p in selected_pages]
+        out["source_pages"] = [p for p in out["pages_selected"] if p in BASE_SOURCE_PAGES]
 
     effective_mode = _normalize_mode(
         mode
@@ -812,6 +866,46 @@ def _pick_first_mapping(result: Mapping[str, Any], *keys: str) -> Optional[Mappi
     return None
 
 
+def _extract_payload_contract(result: Mapping[str, Any]) -> Tuple[List[str], List[str]]:
+    headers = [_s(v) for v in (result.get("display_headers") or result.get("headers") or result.get("sheet_headers") or []) if _s(v)]
+    keys = [_normalize_key(v) for v in (result.get("keys") or result.get("fields") or []) if _s(v)]
+    if not headers and isinstance(result.get("columns"), list):
+        for idx, col in enumerate(result.get("columns") or []):
+            if isinstance(col, Mapping):
+                key = _normalize_key(col.get("key") or col.get("field") or col.get("name"))
+                header = _s(col.get("display_header") or col.get("header") or col.get("label") or col.get("title"))
+            else:
+                key = ""
+                header = _s(col)
+            if not key and header:
+                key = f"column_{idx + 1}"
+            if not header and key:
+                header = _title_case_header(key)
+            if header:
+                headers.append(header)
+            if key:
+                keys.append(key)
+    if headers and not keys:
+        keys = _headers_to_keys(headers)
+    if keys and not headers:
+        headers = [_title_case_header(k) for k in keys]
+    return headers, keys
+
+
+def _matrix_rows_to_dicts(matrix: Any, keys: Sequence[str]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if not isinstance(matrix, list):
+        return out
+    usable_keys = [str(k) for k in keys if _s(k)]
+    if not usable_keys:
+        return out
+    for row in matrix:
+        if isinstance(row, (list, tuple)):
+            item = {usable_keys[idx]: row[idx] if idx < len(row) else None for idx in range(len(usable_keys))}
+            out.append(item)
+    return out
+
+
 def _normalize_rows(result: Mapping[str, Any], keys: List[str]) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
 
@@ -822,12 +916,7 @@ def _normalize_rows(result: Mapping[str, Any], keys: List[str]) -> List[Dict[str
                 rows = [dict(v) for v in value if isinstance(v, Mapping)]
                 break
             if isinstance(value[0], (list, tuple)):
-                matrix_rows = []
-                for row in value:
-                    if isinstance(row, (list, tuple)):
-                        matrix_rows.append({keys[idx]: row[idx] if idx < len(row) else None for idx in range(len(keys))})
-                rows = matrix_rows
-                break
+                return _matrix_rows_to_dicts(value, keys)
 
     if rows:
         return rows
@@ -835,43 +924,47 @@ def _normalize_rows(result: Mapping[str, Any], keys: List[str]) -> List[Dict[str
     for key in ("rows_matrix", "matrix"):
         value = result.get(key)
         if isinstance(value, list) and value and isinstance(value[0], (list, tuple)):
-            matrix_rows = []
-            for row in value:
-                if isinstance(row, (list, tuple)):
-                    matrix_rows.append({keys[idx]: row[idx] if idx < len(row) else None for idx in range(len(keys))})
-            if matrix_rows:
-                return matrix_rows
+            return _matrix_rows_to_dicts(value, keys)
 
     nested = _pick_first_mapping(result, "payload", "result", "response")
     if nested:
-        return _normalize_rows(dict(nested), keys)
+        nested_headers, nested_keys = _extract_payload_contract(dict(nested))
+        return _normalize_rows(dict(nested), nested_keys or nested_headers or keys)
 
     return []
 
 
 def _normalize_headers_keys(result: Mapping[str, Any], page: str) -> Tuple[List[str], List[str], List[str]]:
-    headers = [
-        _s(v)
-        for v in (result.get("display_headers") or result.get("headers") or [])
-        if _s(v)
-    ]
+    page = _normalize_page_name(page) or DEFAULT_PAGE
+    headers = [_s(v) for v in (result.get("display_headers") or result.get("headers") or []) if _s(v)]
     keys = [_normalize_key(v) for v in (result.get("keys") or []) if _s(v)]
+
+    if not headers or not keys or len(headers) != len(keys):
+        payload_headers, payload_keys = _extract_payload_contract(result)
+        headers = headers or payload_headers
+        keys = keys or payload_keys
 
     if not headers and keys:
         headers = [_title_case_header(k) for k in keys]
     if headers and not keys:
         keys = _headers_to_keys(headers)
 
-    if not headers or not keys or len(headers) != len(keys):
-        fallback_headers = _run_sync(_load_headers_for_page(page))
-        fallback_keys = _headers_to_keys(fallback_headers)
-        if not headers:
-            headers = fallback_headers
-        if not keys:
-            keys = fallback_keys
-        if len(headers) != len(keys):
-            headers = fallback_headers
-            keys = fallback_keys
+    schema_headers = _run_sync(_load_headers_for_page(page))
+    schema_keys = _headers_to_keys(schema_headers)
+
+    if page in SPECIAL_PAGES or page == DEFAULT_PAGE:
+        headers = list(schema_headers)
+        keys = list(schema_keys)
+    elif not headers or not keys or len(headers) != len(keys):
+        headers = list(schema_headers)
+        keys = list(schema_keys)
+
+    if page == "Top_10_Investments":
+        for extra_h, extra_k in zip(_TOP10_EXTRA_HEADERS, _TOP10_EXTRA_KEYS):
+            if extra_h not in headers:
+                headers.append(extra_h)
+            if extra_k not in keys:
+                keys.append(extra_k)
 
     display_headers = list(headers)
     return headers, display_headers, keys
@@ -965,29 +1058,57 @@ def _backfill_rows(rows: List[Dict[str, Any]], page: str, criteria: Dict[str, An
     return rows
 
 
-def _ensure_rows_cover_keys(rows: List[Dict[str, Any]], keys: List[str]) -> List[Dict[str, Any]]:
+def _ensure_rows_cover_keys(rows: List[Dict[str, Any]], keys: List[str], headers: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
+    headers = headers or []
     for row in rows:
         normalized: Dict[str, Any] = {k: None for k in keys}
-        for key in keys:
-            if key in row:
-                normalized[key] = row.get(key)
-                continue
-            header_style = _title_case_header(key)
-            if header_style in row:
-                normalized[key] = row.get(header_style)
-                continue
-            compact_key = key.replace("_", " ")
-            for source_key, value in row.items():
-                if _normalize_key(source_key) == key or _s(source_key).lower() == compact_key:
-                    normalized[key] = value
-                    break
-        for source_key, value in row.items():
-            nk = _normalize_key(source_key)
-            if nk in normalized and normalized[nk] is None:
-                normalized[nk] = value
+        for idx, key in enumerate(keys):
+            aliases = [key, key.replace("_", " "), key.replace("_", "-")]
+            if idx < len(headers):
+                aliases.extend([headers[idx], headers[idx].replace(" ", "_"), headers[idx].replace(" ", "-")])
+            value = _row_value_for_aliases(row, aliases)
+            normalized[key] = _jsonable(value)
         out.append(normalized)
     return out
+
+
+def _build_data_dictionary_rows(criteria: Dict[str, Any]) -> List[Dict[str, Any]]:
+    page = _normalize_page_name(criteria.get("page") or DEFAULT_PAGE)
+    try:
+        mod = importlib.import_module("core.sheets.data_dictionary")
+        build_fn = getattr(mod, "build_data_dictionary_rows", None)
+        if callable(build_fn):
+            try:
+                raw_rows = build_fn(include_meta_sheet=True)
+            except TypeError:
+                raw_rows = build_fn()
+            out: List[Dict[str, Any]] = []
+            for row in raw_rows if isinstance(raw_rows, list) else []:
+                if isinstance(row, Mapping):
+                    out.append(dict(row))
+                else:
+                    d = _jsonable(row)
+                    if isinstance(d, Mapping):
+                        out.append(dict(d))
+            if out:
+                return out
+    except Exception:
+        pass
+
+    return [
+        {
+            "sheet": criteria.get("page") or DEFAULT_PAGE,
+            "column_key": "recommendation",
+            "display_header": "Recommendation",
+            "section": "Advisor",
+            "type": "string",
+            "description": "Advisor recommendation label",
+            "example": "Buy",
+            "required": "No",
+            "notes": "Fallback dictionary row generated by advisor wrapper",
+        }
+    ]
 
 
 def _build_special_fallback(page: str, criteria: Dict[str, Any]) -> Dict[str, Any]:
@@ -1018,7 +1139,7 @@ def _build_special_fallback(page: str, criteria: Dict[str, Any]) -> Dict[str, An
         ]
         headers = list(_INSIGHTS_HEADERS)
         keys = _headers_to_keys(headers)
-        rows = _ensure_rows_cover_keys(rows, keys)
+        rows = _ensure_rows_cover_keys(rows, keys, headers)
         return {
             "status": "warn",
             "page": page,
@@ -1041,22 +1162,9 @@ def _build_special_fallback(page: str, criteria: Dict[str, Any]) -> Dict[str, An
     if page == "Data_Dictionary":
         headers = list(_DICTIONARY_HEADERS)
         keys = _headers_to_keys(headers)
-        rows = [
-            {
-                "sheet": criteria.get("page") or DEFAULT_PAGE,
-                "column_key": "recommendation",
-                "display_header": "Recommendation",
-                "section": "Advisor",
-                "type": "string",
-                "description": "Advisor recommendation label",
-                "example": "Buy",
-                "required": "No",
-                "notes": "Fallback dictionary row generated by advisor wrapper",
-            }
-        ]
-        rows = _ensure_rows_cover_keys(rows, keys)
+        rows = _ensure_rows_cover_keys(_build_data_dictionary_rows(criteria), keys, headers)
         return {
-            "status": "warn",
+            "status": "warn" if rows else "error",
             "page": page,
             "sheet": page,
             "sheet_name": page,
@@ -1093,7 +1201,7 @@ def _build_special_fallback(page: str, criteria: Dict[str, Any]) -> Dict[str, An
             row["criteria_snapshot"] = _json_compact(criteria)
         rows.append(row)
     rows = _backfill_rows(rows, page, criteria)
-    rows = _ensure_rows_cover_keys(rows, keys)
+    rows = _ensure_rows_cover_keys(rows, keys, headers)
     rows = _slice_rows(rows, criteria.get("offset", DEFAULT_OFFSET), criteria.get("limit", DEFAULT_LIMIT))
     return {
         "status": "warn",
@@ -1136,7 +1244,7 @@ def _normalize_engine_result(result: Optional[Mapping[str, Any]], criteria: Dict
         return fallback
 
     rows = _backfill_rows(rows, page, criteria)
-    rows = _ensure_rows_cover_keys(rows, keys)
+    rows = _ensure_rows_cover_keys(rows, keys, headers)
 
     total_rows_before_slice = len(rows)
     offset = criteria.get("offset", DEFAULT_OFFSET)
