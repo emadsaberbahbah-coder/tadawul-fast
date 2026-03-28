@@ -2,10 +2,10 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.44.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.45.0
 ================================================================================
 
-WHY v5.44.0
+WHY v5.45.0
 -----------
 - FIX: keeps rows / rows_matrix strictly matrix-aligned to keys while
        row_objects / items / records / data / quotes stay dict-row payloads.
@@ -29,6 +29,10 @@ WHY v5.44.0
        depend on an external selector to build Top_10_Investments rows.
 - FIX: exposes normalize_row_to_schema and batch-analysis aliases expected by
        downstream analysis/advisor routers.
+- FIX: adds snapshot-assisted row backfill for sparse live quote rows so
+       previously cached richer rows can safely fill missing schema fields.
+- FIX: exposes display-header object payloads alongside canonical key-based
+       row objects to make diagnostics and route wrappers easier to validate.
 
 Design goals
 ------------
@@ -80,7 +84,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.44.0"
+__version__ = "5.45.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -1434,6 +1438,25 @@ def _apply_page_row_backfill(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
     out = _apply_symbol_context_defaults(dict(row or {}), page=target)
     sym = normalize_symbol(_safe_str(out.get("symbol") or out.get("requested_symbol")))
 
+    if out.get("invest_period_label") in (None, ""):
+        out["invest_period_label"] = "1Y"
+    if out.get("horizon_days") in (None, ""):
+        out["horizon_days"] = 365
+
+    if out.get("data_provider") in (None, ""):
+        sources = out.get("data_sources")
+        if isinstance(sources, list) and sources:
+            out["data_provider"] = _safe_str(sources[0])
+
+    conf = _as_float(out.get("confidence_score"))
+    if conf is None:
+        conf_fraction = _as_float(out.get("forecast_confidence"))
+        if conf_fraction is not None:
+            conf = conf_fraction * 100.0 if conf_fraction <= 1.5 else conf_fraction
+            out.setdefault("confidence_score", round(_clamp(conf, 0.0, 100.0), 2))
+    if conf is not None and out.get("confidence_bucket") in (None, ""):
+        out["confidence_bucket"] = "HIGH" if conf >= 75 else "MODERATE" if conf >= 55 else "LOW"
+
     if target == "Commodities_FX" or sym.endswith("=F") or sym.endswith("=X"):
         out.setdefault("data_provider", _safe_str(out.get("data_provider"), "history_or_fallback"))
         if out.get("forecast_confidence") in (None, ""):
@@ -1456,6 +1479,28 @@ def _apply_page_row_backfill(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
 
 def _strict_project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
     return {k: _json_safe(row.get(k)) for k in keys}
+
+
+def _strict_project_row_display(headers: Sequence[str], keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for idx, key in enumerate(keys or []):
+        header = headers[idx] if idx < len(headers or []) else key
+        out[header] = _json_safe(row.get(key))
+    return out
+
+
+def _rows_display_objects_from_rows(rows: List[Dict[str, Any]], headers: List[str], keys: List[str]) -> List[Dict[str, Any]]:
+    return [_strict_project_row_display(headers, keys, row) for row in (rows or [])]
+
+
+def _merge_missing_fields(base_row: Dict[str, Any], template_row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    out = dict(base_row or {})
+    if not isinstance(template_row, dict):
+        return out
+    for k, v in template_row.items():
+        if out.get(k) in (None, "", [], {}) and v not in (None, "", [], {}):
+            out[k] = _json_safe(v)
+    return out
 
 
 def _rows_matrix_from_rows(rows: List[Dict[str, Any]], keys: List[str]) -> List[List[Any]]:
@@ -2166,6 +2211,19 @@ class DataEngineV5:
                 return _safe_str(v)
         return ""
 
+    def _get_cached_snapshot_symbol_map(self, sheet: str) -> Dict[str, Dict[str, Any]]:
+        target = _canonicalize_sheet_name(sheet)
+        snap = self.get_cached_sheet_snapshot(sheet=target)
+        rows = _coerce_rows_list(snap)
+        out: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            sym = normalize_symbol(self._extract_row_symbol(row))
+            if sym and sym not in out:
+                out[sym] = dict(row)
+        return out
+
     # ------------------------------------------------------------------
     # final payload
     # ------------------------------------------------------------------
@@ -2183,6 +2241,7 @@ class DataEngineV5:
     ) -> Dict[str, Any]:
         headers, keys = _complete_schema_contract(headers, keys)
         dict_rows = [_strict_project_row(keys, r) for r in (row_objects or [])]
+        display_row_objects = _rows_display_objects_from_rows(dict_rows, headers, keys)
         matrix_rows = _rows_matrix_from_rows(dict_rows, keys) if include_matrix else []
 
         payload = {
@@ -2204,6 +2263,10 @@ class DataEngineV5:
             "records": dict_rows,
             "data": dict_rows,
             "quotes": dict_rows,
+            "display_row_objects": display_row_objects,
+            "display_items": display_row_objects,
+            "display_records": display_row_objects,
+            "rows_dict_display": display_row_objects,
             "count": len(dict_rows),
             "meta": dict(meta or {}),
             "version": self.version,
@@ -3858,13 +3921,15 @@ class DataEngineV5:
                         if sym:
                             quote_map[sym] = d
 
+                snapshot_map = self._get_cached_snapshot_symbol_map(target_sheet)
+
                 for row in ext_rows:
                     merged = dict(row)
                     sym = normalize_symbol(self._extract_row_symbol(row))
+                    if sym and sym in snapshot_map:
+                        merged = _merge_missing_fields(merged, snapshot_map[sym])
                     if sym and sym in quote_map:
-                        for k, v in quote_map[sym].items():
-                            if merged.get(k) in (None, "", [], {}):
-                                merged[k] = v
+                        merged = _merge_missing_fields(merged, quote_map[sym])
                     merged = _apply_page_row_backfill(target_sheet, merged)
                     _compute_scores_fallback(merged)
                     _compute_recommendation(merged)
@@ -3930,9 +3995,16 @@ class DataEngineV5:
 
         rows_full: List[Dict[str, Any]] = []
         if requested_symbols:
+            snapshot_map = self._get_cached_snapshot_symbol_map(target_sheet)
             quotes = await self.get_enriched_quotes(requested_symbols, schema=None)
             for q in quotes:
-                row = _apply_page_row_backfill(target_sheet, _model_to_dict(q))
+                row = _model_to_dict(q)
+                sym = normalize_symbol(_safe_str(row.get("symbol") or row.get("requested_symbol")))
+                if sym and sym in snapshot_map:
+                    row = _merge_missing_fields(row, snapshot_map[sym])
+                row = _apply_page_row_backfill(target_sheet, row)
+                _compute_scores_fallback(row)
+                _compute_recommendation(row)
                 rows_full.append(_strict_project_row(out_keys, _normalize_to_schema_keys(out_keys, out_headers, row)))
             _apply_rank_overall(rows_full)
 
