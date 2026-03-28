@@ -2,24 +2,24 @@
 """
 routes/investment_advisor.py
 ================================================================================
-ADVANCED INVESTMENT ADVISOR ROUTER — v2.8.0
+ADVANCED INVESTMENT ADVISOR ROUTER — v2.9.0
 ================================================================================
-OWNER-ALIGNED • ROOT-OWNERSHIP FIXED • ADVANCED-PREFIX OWNER • QUERY-PARSE SAFE •
+OWNER-ALIGNED • SPECIAL-PAGE SAFE • ADVANCED-PREFIX OWNER • QUERY-PARSE SAFE •
 CONTRACT-CORRECT • TOP10-HARDENED • BRIDGE-TOLERANT • JSON-SAFE • STARTUP-SAFE •
 AUTH-TOLERANT
 
 Why this revision
 -----------------
-- FIX: explicitly claims the canonical `/v1/advanced` family root with GET + POST
-       so ownership can resolve to this router instead of falling through to
-       `routes.advanced_analysis`.
-- FIX: preserves `/v1/advanced/sheet-rows` plus the advanced aliases already used
-       by tests and downstream callers.
-- FIX: keeps schema-only and live payloads on one stable envelope:
-       headers, display_headers, keys, rows, row_objects, records, results,
-       data, items, quotes, rows_matrix, meta.
-- FIX: maintains tolerant resolution across builder / runner / bridge / engine
-       layers so startup stays safe even when optional modules are absent.
+- FIX: preserves special-page routing for `Insights_Analysis` and `Data_Dictionary`
+       by preferring engine sheet-row methods instead of Top10-oriented runners.
+- FIX: makes resolver order page-aware so `/v1/advanced/sheet-rows?page=Insights_Analysis`
+       no longer falls into Top10/advanced-advisor builders.
+- FIX: keeps known canonical pages on their exact schema contract rather than
+       widening keys from stray payload fields.
+- FIX: strengthens row projection so canonical keys can be populated from exact,
+       case-insensitive, normalized, and header-style aliases.
+- FIX: keeps `/v1/advanced` family ownership stable with GET + POST at the family
+       root and all canonical aliases used by live tests.
 - SAFE: no import-time network activity.
 """
 
@@ -47,7 +47,7 @@ from fastapi.encoders import jsonable_encoder
 logger = logging.getLogger("routes.investment_advisor")
 logger.addHandler(logging.NullHandler())
 
-INVESTMENT_ADVISOR_VERSION = "2.8.0"
+INVESTMENT_ADVISOR_VERSION = "2.9.0"
 ROUTE_FAMILY_NAME = "advanced"
 ROUTE_OWNER_NAME = "investment_advisor"
 
@@ -63,6 +63,7 @@ BASE_SOURCE_PAGES: Tuple[str, ...] = (
     "My_Portfolio",
 )
 DERIVED_PAGES = {TOP10_PAGE_NAME, INSIGHTS_PAGE_NAME}
+SPECIAL_PAGES = {INSIGHTS_PAGE_NAME, DATA_DICTIONARY_PAGE_NAME}
 _SOURCE_PAGES_SET = set(BASE_SOURCE_PAGES)
 
 KNOWN_CANONICAL_HEADER_COUNTS: Dict[str, int] = {
@@ -158,22 +159,22 @@ TOP10_FUNCTION_CANDIDATES: Tuple[str, ...] = (
     "select_top10",
     "select_top10_symbols",
 )
-RUNNER_FUNCTION_CANDIDATES: Tuple[str, ...] = (
+GENERIC_RUNNER_FUNCTION_CANDIDATES: Tuple[str, ...] = (
+    "get_sheet_rows",
+    "get_page_rows",
+    "sheet_rows",
+    "build_sheet_rows",
+    "fetch_sheet_rows",
+    "read_sheet_rows",
+    "run_sheet_rows",
+    "execute_sheet_rows",
     "run_investment_advisor_engine",
     "run_investment_advisor",
     "run_advisor",
     "execute_investment_advisor",
     "execute_advisor",
-    "get_sheet_rows",
-    "get_page_rows",
-    "sheet_rows",
-    "build_sheet_rows",
-    "build_top10_rows",
-    "build_top10_output_rows",
-    "build_top10_investments_rows",
-    "select_top10",
-    "select_top10_symbols",
 )
+TOP10_RUNNER_FUNCTION_CANDIDATES: Tuple[str, ...] = TOP10_FUNCTION_CANDIDATES + GENERIC_RUNNER_FUNCTION_CANDIDATES
 BRIDGE_FUNCTION_CANDIDATES: Tuple[str, ...] = (
     "_analysis_sheet_rows_impl",
     "_run_analysis_sheet_rows_impl",
@@ -184,18 +185,7 @@ BRIDGE_FUNCTION_CANDIDATES: Tuple[str, ...] = (
     "run_sheet_rows_impl",
     "_sheet_rows_impl",
 )
-ENGINE_METHOD_CANDIDATES: Tuple[str, ...] = (
-    "build_top10_rows",
-    "build_top10_output_rows",
-    "build_top10_investments_rows",
-    "select_top10",
-    "select_top10_symbols",
-    "get_top10_rows",
-    "run_investment_advisor",
-    "run_investment_advisor_engine",
-    "run_advisor",
-    "execute_investment_advisor",
-    "execute_advisor",
+GENERIC_ENGINE_METHOD_CANDIDATES: Tuple[str, ...] = (
     "get_sheet_rows",
     "get_page_rows",
     "sheet_rows",
@@ -203,7 +193,14 @@ ENGINE_METHOD_CANDIDATES: Tuple[str, ...] = (
     "build_sheet_rows",
     "read_sheet_rows",
     "run_sheet_rows",
+    "execute_sheet_rows",
+    "get_rows_for_sheet",
+    "get_rows_for_page",
+    "execute_sheet_rows",
+    "run_analysis_sheet_rows",
+    "build_analysis_sheet_rows",
 )
+TOP10_ENGINE_METHOD_CANDIDATES: Tuple[str, ...] = TOP10_FUNCTION_CANDIDATES + GENERIC_ENGINE_METHOD_CANDIDATES
 
 SCHEMA_MAP_CANDIDATES: Tuple[str, ...] = (
     "SCHEMA_REGISTRY",
@@ -536,6 +533,10 @@ def _page_family(page: str) -> str:
     return ROUTE_FAMILY_NAME
 
 
+def _canonical_page_has_fixed_contract(page: str) -> bool:
+    return _normalize_page_name(page) in KNOWN_CANONICAL_HEADER_COUNTS
+
+
 def _nonempty(value: Any) -> bool:
     if value is None:
         return False
@@ -812,7 +813,7 @@ def _load_schema_defaults(page: str) -> Tuple[List[str], List[str]]:
         headers = list(headers)
         keys = list(keys)
         if page == TOP10_PAGE_NAME:
-            headers = _append_missing_headers(headers, TOP10_SPECIAL_FIELDS)
+            headers = _append_missing_headers(headers, [x.replace("_", " ").title() for x in TOP10_SPECIAL_FIELDS])
             keys = _append_missing_keys(keys, TOP10_SPECIAL_FIELDS)
         return headers, keys
 
@@ -822,7 +823,7 @@ def _load_schema_defaults(page: str) -> Tuple[List[str], List[str]]:
         headers, keys = _extract_schema_headers_keys_from_spec(spec)
         if headers and keys:
             if page == TOP10_PAGE_NAME:
-                headers = _append_missing_headers(headers, TOP10_SPECIAL_FIELDS)
+                headers = _append_missing_headers(headers, [x.replace("_", " ").title() for x in TOP10_SPECIAL_FIELDS])
                 keys = _append_missing_keys(keys, TOP10_SPECIAL_FIELDS)
             _SCHEMA_CACHE[page] = (list(headers), list(keys))
             return headers, keys
@@ -844,7 +845,7 @@ def _load_schema_defaults(page: str) -> Tuple[List[str], List[str]]:
             headers, keys = _extract_schema_headers_keys_from_spec(hit)
             if headers and keys:
                 if page == TOP10_PAGE_NAME:
-                    headers = _append_missing_headers(headers, TOP10_SPECIAL_FIELDS)
+                    headers = _append_missing_headers(headers, [x.replace("_", " ").title() for x in TOP10_SPECIAL_FIELDS])
                     keys = _append_missing_keys(keys, TOP10_SPECIAL_FIELDS)
                 _SCHEMA_CACHE[page] = (list(headers), list(keys))
                 return headers, keys
@@ -862,14 +863,14 @@ def _load_schema_defaults(page: str) -> Tuple[List[str], List[str]]:
                 headers, keys = _extract_schema_headers_keys_from_spec(out)
                 if headers and keys:
                     if page == TOP10_PAGE_NAME:
-                        headers = _append_missing_headers(headers, TOP10_SPECIAL_FIELDS)
+                        headers = _append_missing_headers(headers, [x.replace("_", " ").title() for x in TOP10_SPECIAL_FIELDS])
                         keys = _append_missing_keys(keys, TOP10_SPECIAL_FIELDS)
                     _SCHEMA_CACHE[page] = (list(headers), list(keys))
                     return headers, keys
 
     headers, keys = _schema_fallback_for_page(page)
     if page == TOP10_PAGE_NAME:
-        headers = _append_missing_headers(headers, TOP10_SPECIAL_FIELDS)
+        headers = _append_missing_headers(headers, [x.replace("_", " ").title() for x in TOP10_SPECIAL_FIELDS])
         keys = _append_missing_keys(keys, TOP10_SPECIAL_FIELDS)
     _SCHEMA_CACHE[page] = (list(headers), list(keys))
     return headers, keys
@@ -940,40 +941,92 @@ def _extract_rows_from_payload(payload: Any) -> List[Dict[str, Any]]:
     return []
 
 
+def _canonical_key_name(value: str) -> str:
+    text = _s(value).strip().lower()
+    if not text:
+        return ""
+    text = text.replace("-", "_").replace("/", "_").replace("&", "_")
+    text = re.sub(r"\s+", "_", text)
+    text = re.sub(r"_+", "_", text)
+    return text.strip("_")
+
+
+def _canonical_key_loose(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", _s(value).lower())
+
+
+def _row_value_for_aliases(row: Mapping[str, Any], aliases: Sequence[str]) -> Any:
+    if not isinstance(row, Mapping):
+        return None
+    exact = {str(k): v for k, v in row.items()}
+    lower = {str(k).lower(): v for k, v in row.items()}
+    canon = {_canonical_key_name(str(k)): v for k, v in row.items()}
+    loose = {_canonical_key_loose(str(k)): v for k, v in row.items()}
+
+    for alias in aliases:
+        a = _s(alias)
+        if not a:
+            continue
+        if a in exact and exact[a] is not None:
+            return exact[a]
+        if a.lower() in lower and lower[a.lower()] is not None:
+            return lower[a.lower()]
+        ck = _canonical_key_name(a)
+        if ck in canon and canon[ck] is not None:
+            return canon[ck]
+        lk = _canonical_key_loose(a)
+        if lk in loose and loose[lk] is not None:
+            return loose[lk]
+    return None
+
+
 def _extract_keys_from_payload(payload: Any, page: str, rows: List[Dict[str, Any]]) -> List[str]:
+    page = _normalize_page_name(page)
+    schema_headers, schema_keys = _load_schema_defaults(page)
     data = _safe_dict(payload)
-    keys = data.get("keys") or data.get("fields") or []
-    if isinstance(keys, list):
-        keys = [_s(x) for x in keys if _s(x)]
+    payload_keys = data.get("keys") or data.get("fields") or []
+    if isinstance(payload_keys, list):
+        payload_keys = [_s(x) for x in payload_keys if _s(x)]
     else:
-        keys = []
-    if not keys:
-        _, keys = _load_schema_defaults(page)
-    if page == TOP10_PAGE_NAME:
-        keys = _append_missing_keys(list(keys), TOP10_SPECIAL_FIELDS)
+        payload_keys = []
+
+    if _canonical_page_has_fixed_contract(page):
+        keys = list(schema_keys)
+        if page == TOP10_PAGE_NAME:
+            keys = _append_missing_keys(keys, TOP10_SPECIAL_FIELDS)
+        return keys
+
+    keys = list(payload_keys) if payload_keys else list(schema_keys)
     seen = set(keys)
     for row in rows:
         for key in row.keys():
-            if key not in seen:
-                seen.add(key)
-                keys.append(key)
+            sk = _s(key)
+            if sk and sk not in seen:
+                seen.add(sk)
+                keys.append(sk)
     return keys
 
 
 def _extract_headers_from_payload(payload: Any, page: str, keys: List[str]) -> List[str]:
+    page = _normalize_page_name(page)
+    schema_headers, schema_keys = _load_schema_defaults(page)
     data = _safe_dict(payload)
-    headers = data.get("headers") or data.get("display_headers") or []
-    if isinstance(headers, list):
-        headers = [_s(x) for x in headers if _s(x)]
+    payload_headers = data.get("headers") or data.get("display_headers") or []
+    if isinstance(payload_headers, list):
+        payload_headers = [_s(x) for x in payload_headers if _s(x)]
     else:
-        headers = []
-    if not headers:
-        headers, _ = _load_schema_defaults(page)
+        payload_headers = []
+
+    if _canonical_page_has_fixed_contract(page):
+        headers = list(schema_headers)
+        if page == TOP10_PAGE_NAME:
+            headers = _append_missing_headers(headers, [x.replace("_", " ").title() for x in TOP10_SPECIAL_FIELDS])
+        return headers[: len(keys)]
+
+    headers = list(payload_headers) if payload_headers else list(schema_headers)
     if len(headers) < len(keys):
         extra = [k.replace("_", " ").title() for k in keys[len(headers):]]
-        headers = list(headers) + extra
-    if page == TOP10_PAGE_NAME and len(headers) < len(keys):
-        headers = _append_missing_headers(list(headers), TOP10_SPECIAL_FIELDS)
+        headers.extend(extra)
     return headers[: len(keys)] if len(headers) >= len(keys) else headers
 
 
@@ -981,8 +1034,16 @@ def _rows_to_matrix(rows: List[Dict[str, Any]], keys: List[str]) -> List[List[An
     return [[row.get(key) for key in keys] for row in rows]
 
 
-def _normalize_row_to_keys(row: Mapping[str, Any], keys: List[str]) -> Dict[str, Any]:
-    return {key: _json_safe(row.get(key)) for key in keys}
+def _normalize_row_to_keys(row: Mapping[str, Any], keys: List[str], headers: Optional[List[str]] = None) -> Dict[str, Any]:
+    header_lookup = headers or []
+    out: Dict[str, Any] = {}
+    for idx, key in enumerate(keys):
+        aliases = [key, key.replace("_", " "), key.replace("_", "-")]
+        if idx < len(header_lookup):
+            aliases.extend([header_lookup[idx], header_lookup[idx].replace(" ", "_"), header_lookup[idx].replace(" ", "-")])
+        val = _row_value_for_aliases(row, aliases)
+        out[key] = _json_safe(val)
+    return out
 
 
 def _make_schema_only_response(page: str, *, include_matrix: bool, request_id: str, meta: Dict[str, Any]) -> Dict[str, Any]:
@@ -1054,6 +1115,20 @@ async def _resolve_function(module_candidates: Sequence[str], function_candidate
     return None, "", "", search_path
 
 
+def _engine_method_candidates_for_page(page: str) -> Tuple[str, ...]:
+    family = _page_family(page)
+    if family == "top10":
+        return TOP10_ENGINE_METHOD_CANDIDATES
+    return GENERIC_ENGINE_METHOD_CANDIDATES
+
+
+def _runner_function_candidates_for_page(page: str) -> Tuple[str, ...]:
+    family = _page_family(page)
+    if family == "top10":
+        return TOP10_RUNNER_FUNCTION_CANDIDATES
+    return GENERIC_RUNNER_FUNCTION_CANDIDATES
+
+
 async def _resolve_top10_builder(request: Request, engine: Optional[Any]) -> Tuple[Optional[Any], str, str, List[str]]:
     try:
         state = getattr(request.app, "state", None)
@@ -1072,22 +1147,33 @@ async def _resolve_top10_builder(request: Request, engine: Optional[Any]) -> Tup
     return await _resolve_function(TOP10_MODULE_CANDIDATES, TOP10_FUNCTION_CANDIDATES)
 
 
-async def _resolve_runner(request: Request, engine: Optional[Any]) -> Tuple[Optional[Any], str, str, List[str]]:
+async def _resolve_runner(request: Request, engine: Optional[Any], page: str) -> Tuple[Optional[Any], str, str, List[str]]:
+    family = _page_family(page)
+
+    if family != "top10" and engine is not None:
+        for attr in _engine_method_candidates_for_page(page):
+            candidate = getattr(engine, attr, None)
+            if callable(candidate):
+                return candidate, type(engine).__name__, attr, [type(engine).__name__]
+
     try:
         state = getattr(request.app, "state", None)
         if state is not None:
-            for attr in ("investment_advisor_runner", "advisor_runner", "run_investment_advisor", "run_advisor"):
+            attrs = ("investment_advisor_runner", "advisor_runner", "run_investment_advisor", "run_advisor")
+            for attr in attrs:
                 candidate = getattr(state, attr, None)
                 if callable(candidate):
                     return candidate, "app.state", attr, ["app.state"]
     except Exception:
         pass
-    if engine is not None:
-        for attr in ENGINE_METHOD_CANDIDATES:
+
+    if family == "top10" and engine is not None:
+        for attr in _engine_method_candidates_for_page(page):
             candidate = getattr(engine, attr, None)
             if callable(candidate):
                 return candidate, type(engine).__name__, attr, [type(engine).__name__]
-    return await _resolve_function(RUNNER_MODULE_CANDIDATES, RUNNER_FUNCTION_CANDIDATES)
+
+    return await _resolve_function(RUNNER_MODULE_CANDIDATES, _runner_function_candidates_for_page(page))
 
 
 async def _resolve_bridge_impl(request: Request) -> Tuple[Optional[Any], str, str]:
@@ -1178,7 +1264,7 @@ def _advanced_root_has_request_filters(*, page: Optional[str], sheet: Optional[s
 async def _advanced_root_summary(request: Request) -> Dict[str, Any]:
     engine = await _get_engine(request)
     top10_builder, top10_builder_source, top10_builder_name, top10_builder_search_path = await _resolve_top10_builder(request, engine)
-    runner, runner_source, runner_name, runner_search_path = await _resolve_runner(request, engine)
+    runner, runner_source, runner_name, runner_search_path = await _resolve_runner(request, engine, TOP10_PAGE_NAME)
     bridge_impl, bridge_source, bridge_name = await _resolve_bridge_impl(request)
     return jsonable_encoder(
         {
@@ -1262,17 +1348,12 @@ async def _execute_advanced_request(*, request: Request, body: Dict[str, Any], m
     page_family = _page_family(target_page)
     payload: Any = None
 
-    stage_start = time.perf_counter()
-    top10_builder, top10_source, top10_name, _ = await _resolve_top10_builder(request, engine)
-    stages["resolve_builder"] = int((time.perf_counter() - stage_start) * 1000)
-
-    stage_start = time.perf_counter()
-    runner, runner_source, runner_name, _ = await _resolve_runner(request, engine)
-    stages["resolve_runner"] = int((time.perf_counter() - stage_start) * 1000)
-
-    stage_start = time.perf_counter()
-    bridge_impl, bridge_source, bridge_name = await _resolve_bridge_impl(request)
-    stages["resolve_bridge"] = int((time.perf_counter() - stage_start) * 1000)
+    top10_source = ""
+    top10_name = ""
+    runner_source = ""
+    runner_name = ""
+    bridge_source = ""
+    bridge_name = ""
 
     async def _run_with_timeout(label: str, coro: Any, timeout_sec: float) -> Any:
         try:
@@ -1281,14 +1362,26 @@ async def _execute_advanced_request(*, request: Request, body: Dict[str, Any], m
             warnings.append(f"{label}: {exc.__class__.__name__}")
             return None
 
-    if page_family == "top10" and top10_builder is not None:
+    if page_family == "top10":
         stage_start = time.perf_counter()
-        payload = await _run_with_timeout(
-            "builder",
-            _call_candidate(top10_builder, body=body, request=request, page=target_page, limit=limit_final, offset=offset_final, schema_only=schema_only_final),
-            _resolver_timeout("builder", page=target_page),
-        )
-        stages["builder"] = int((time.perf_counter() - stage_start) * 1000)
+        top10_builder, top10_source, top10_name, _ = await _resolve_top10_builder(request, engine)
+        stages["resolve_builder"] = int((time.perf_counter() - stage_start) * 1000)
+        if top10_builder is not None:
+            stage_start = time.perf_counter()
+            payload = await _run_with_timeout(
+                "builder",
+                _call_candidate(top10_builder, body=body, request=request, page=target_page, limit=limit_final, offset=offset_final, schema_only=schema_only_final),
+                _resolver_timeout("builder", page=target_page),
+            )
+            stages["builder"] = int((time.perf_counter() - stage_start) * 1000)
+
+    stage_start = time.perf_counter()
+    runner, runner_source, runner_name, _ = await _resolve_runner(request, engine, target_page)
+    stages["resolve_runner"] = int((time.perf_counter() - stage_start) * 1000)
+
+    stage_start = time.perf_counter()
+    bridge_impl, bridge_source, bridge_name = await _resolve_bridge_impl(request)
+    stages["resolve_bridge"] = int((time.perf_counter() - stage_start) * 1000)
 
     if payload is None and runner is not None:
         stage_start = time.perf_counter()
@@ -1310,7 +1403,7 @@ async def _execute_advanced_request(*, request: Request, body: Dict[str, Any], m
 
     if payload is None and engine is not None:
         stage_start = time.perf_counter()
-        for method_name in ENGINE_METHOD_CANDIDATES:
+        for method_name in _engine_method_candidates_for_page(target_page):
             method = getattr(engine, method_name, None)
             if not callable(method):
                 continue
@@ -1331,7 +1424,7 @@ async def _execute_advanced_request(*, request: Request, body: Dict[str, Any], m
 
     norm_rows: List[Dict[str, Any]] = []
     for row in raw_rows:
-        norm_rows.append(_normalize_row_to_keys(row, keys))
+        norm_rows.append(_normalize_row_to_keys(row, keys, headers))
     if norm_rows:
         norm_rows = _slice_rows(norm_rows, offset=offset_final, limit=limit_final)
 
@@ -1352,7 +1445,7 @@ async def _execute_advanced_request(*, request: Request, body: Dict[str, Any], m
             )
         keys = _append_missing_keys(keys, TOP10_SPECIAL_FIELDS)
         headers = _append_missing_headers(headers, [x.replace("_", " ").title() for x in TOP10_SPECIAL_FIELDS])
-        norm_rows = [_normalize_row_to_keys(row, keys) for row in norm_rows]
+        norm_rows = [_normalize_row_to_keys(row, keys, headers) for row in norm_rows]
 
     status_out = "success" if payload is not None or norm_rows or schema_only_final else "degraded"
     if not raw_rows and payload is None:
@@ -1543,7 +1636,7 @@ async def advanced_root_post(
 async def advanced_health(request: Request) -> Dict[str, Any]:
     engine = await _get_engine(request)
     top10_builder, top10_builder_source, top10_builder_name, top10_builder_search_path = await _resolve_top10_builder(request, engine)
-    runner, runner_source, runner_name, runner_search_path = await _resolve_runner(request, engine)
+    runner, runner_source, runner_name, runner_search_path = await _resolve_runner(request, engine, TOP10_PAGE_NAME)
     bridge_impl, bridge_source, bridge_name = await _resolve_bridge_impl(request)
     return jsonable_encoder(
         {
@@ -1575,7 +1668,7 @@ async def advanced_health(request: Request) -> Dict[str, Any]:
 async def advanced_meta(request: Request) -> Dict[str, Any]:
     engine = await _get_engine(request)
     top10_builder, top10_builder_source, top10_builder_name, top10_builder_search_path = await _resolve_top10_builder(request, engine)
-    runner, runner_source, runner_name, runner_search_path = await _resolve_runner(request, engine)
+    runner, runner_source, runner_name, runner_search_path = await _resolve_runner(request, engine, TOP10_PAGE_NAME)
     bridge_impl, bridge_source, bridge_name = await _resolve_bridge_impl(request)
     return jsonable_encoder(
         {
