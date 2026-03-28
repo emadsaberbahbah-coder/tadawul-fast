@@ -2,7 +2,7 @@
 # routes/enriched_quote.py
 """
 ================================================================================
-TFB Enriched Quote Routes Wrapper — v7.8.0
+TFB Enriched Quote Routes Wrapper — v7.9.0
 ================================================================================
 STARTUP-SAFE • EAGER-ROUTER • QUOTE-OWNED • IMPORT-TOLERANT
 GET+POST COMPATIBLE • ROOT ALIAS BRIDGE SAFE
@@ -11,11 +11,12 @@ BATCH HYDRATION SAFE • AUTH-TOLERANT • CANONICAL-OWNERSHIP SAFE
 
 Why this revision
 -----------------
-- FIX: preserves `/v1/enriched`, `/v1/enriched_quote`, `/v1/enriched-quote`,
-       and real bare-root compatibility for all three aliases.
-- FIX: keeps enriched quote-owned only; no `/sheet-rows` ownership here.
-- FIX: maintains `/quote` and `/quotes` root ownership expected by canonical
+- FIX: registers exact full-path handlers for `/v1/enriched`, `/v1/enriched_quote`,
+       and `/v1/enriched-quote` so the underscore alias cannot disappear behind
+       prefix/include ordering or controlled mount filtering.
+- FIX: preserves `/quote` and `/quotes` root ownership expected by canonical
        startup maps and live route tests.
+- FIX: keeps enriched quote-owned only; no `/sheet-rows` ownership here.
 - FIX: fences non-instrument pages with clear canonical owner hints.
 - FIX: stays import-safe even when optional core/schema/auth modules are absent.
 ================================================================================
@@ -41,7 +42,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 logger = logging.getLogger("routes.enriched_quote")
 logger.addHandler(logging.NullHandler())
 
-ROUTER_VERSION = "7.8.0"
+ROUTER_VERSION = "7.9.0"
 TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
     "top10_rank",
     "selection_reason",
@@ -891,14 +892,10 @@ async def _build_instrument_rows(
     return rows_out, errors, {"batch_rows": batch_rows, "rehydrated_rows": rehydrated_rows, "sparse_after_rehydrate": sparse_after}
 
 
+
 def _build_router(reason: str) -> APIRouter:
     svc = _Service(reason)
-
-    root = APIRouter(tags=["tfb"])
-    enriched = APIRouter(prefix="/v1/enriched", tags=["enriched"])
-    enriched_quote_alias = APIRouter(prefix="/v1/enriched_quote", tags=["enriched"])
-    enriched_hyphen = APIRouter(prefix="/v1/enriched-quote", tags=["enriched"])
-    legacy = APIRouter(tags=["quotes"])
+    root = APIRouter(tags=["enriched"])
 
     async def _health_payload() -> Dict[str, Any]:
         return _json_safe({
@@ -1154,15 +1151,15 @@ def _build_router(reason: str) -> APIRouter:
             return await _handle_single_quote(request, prepared, _page_from_body(prepared), mode_q, token_q, x_app_token, authorization, x_request_id)
         return await _handle_quotes_batch(request, prepared, mode_q, token_q, x_app_token, authorization, x_request_id)
 
-    @enriched.get("/health", include_in_schema=False)
-    @enriched_quote_alias.get("/health", include_in_schema=False)
-    @enriched_hyphen.get("/health", include_in_schema=False)
+    @root.get("/v1/enriched/health", include_in_schema=False)
+    @root.get("/v1/enriched_quote/health", include_in_schema=False)
+    @root.get("/v1/enriched-quote/health", include_in_schema=False)
     async def health() -> Dict[str, Any]:
         return await _health_payload()
 
-    @enriched.get("/headers", include_in_schema=False)
-    @enriched_quote_alias.get("/headers", include_in_schema=False)
-    @enriched_hyphen.get("/headers", include_in_schema=False)
+    @root.get("/v1/enriched/headers", include_in_schema=False)
+    @root.get("/v1/enriched_quote/headers", include_in_schema=False)
+    @root.get("/v1/enriched-quote/headers", include_in_schema=False)
     async def headers(page: str = Query(default="Market_Leaders")) -> Dict[str, Any]:
         page_norm = svc.normalize_page(page)
         hdrs, keys = svc.schema_for_page(page_norm)
@@ -1183,10 +1180,10 @@ def _build_router(reason: str) -> APIRouter:
             "reason": None if hdrs else reason,
         })
 
-    @enriched.post("/quote")
-    @enriched_quote_alias.post("/quote")
-    @enriched_hyphen.post("/quote")
-    @legacy.post("/quote")
+    @root.post("/v1/enriched/quote")
+    @root.post("/v1/enriched_quote/quote")
+    @root.post("/v1/enriched-quote/quote")
+    @root.post("/quote")
     async def quote_post(
         request: Request,
         body: Dict[str, Any] = Body(default_factory=dict),
@@ -1199,10 +1196,10 @@ def _build_router(reason: str) -> APIRouter:
     ) -> Dict[str, Any]:
         return await _handle_single_quote(request, body, page, mode, token, x_app_token, authorization, x_request_id)
 
-    @enriched.get("/quote", include_in_schema=False)
-    @enriched_quote_alias.get("/quote", include_in_schema=False)
-    @enriched_hyphen.get("/quote", include_in_schema=False)
-    @legacy.get("/quote", include_in_schema=False)
+    @root.get("/v1/enriched/quote", include_in_schema=False)
+    @root.get("/v1/enriched_quote/quote", include_in_schema=False)
+    @root.get("/v1/enriched-quote/quote", include_in_schema=False)
+    @root.get("/quote", include_in_schema=False)
     async def quote_get(
         request: Request,
         symbol: Optional[str] = Query(default=None),
@@ -1217,10 +1214,10 @@ def _build_router(reason: str) -> APIRouter:
         body = _collect_quote_body(symbol=symbol, ticker=ticker, page=page)
         return await _handle_single_quote(request, body, page, mode, token, x_app_token, authorization, x_request_id)
 
-    @enriched.post("/quotes", include_in_schema=False)
-    @enriched_quote_alias.post("/quotes", include_in_schema=False)
-    @enriched_hyphen.post("/quotes", include_in_schema=False)
-    @legacy.post("/quotes")
+    @root.post("/v1/enriched/quotes", include_in_schema=False)
+    @root.post("/v1/enriched_quote/quotes", include_in_schema=False)
+    @root.post("/v1/enriched-quote/quotes", include_in_schema=False)
+    @root.post("/quotes")
     async def quotes_post(
         request: Request,
         body: Dict[str, Any] = Body(default_factory=dict),
@@ -1232,10 +1229,10 @@ def _build_router(reason: str) -> APIRouter:
     ) -> Dict[str, Any]:
         return await _handle_quotes_batch(request, body, mode, token, x_app_token, authorization, x_request_id)
 
-    @enriched.get("/quotes", include_in_schema=False)
-    @enriched_quote_alias.get("/quotes", include_in_schema=False)
-    @enriched_hyphen.get("/quotes", include_in_schema=False)
-    @legacy.get("/quotes", include_in_schema=False)
+    @root.get("/v1/enriched/quotes", include_in_schema=False)
+    @root.get("/v1/enriched_quote/quotes", include_in_schema=False)
+    @root.get("/v1/enriched-quote/quotes", include_in_schema=False)
+    @root.get("/quotes", include_in_schema=False)
     async def quotes_get(
         request: Request,
         page: Optional[str] = Query(default=None),
@@ -1259,16 +1256,26 @@ def _build_router(reason: str) -> APIRouter:
         x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
     ) -> Dict[str, Any]:
         body = _collect_quotes_body(
-            page=page, sheet_name=sheet_name, sheet=sheet, name=name, tab=tab,
-            symbols=symbols, tickers=tickers, include_headers=include_headers,
-            include_matrix=include_matrix, limit=limit, offset=offset, top_n=top_n,
-            schema_only=schema_only, headers_only=headers_only,
+            page=page,
+            sheet_name=sheet_name,
+            sheet=sheet,
+            name=name,
+            tab=tab,
+            symbols=symbols,
+            tickers=tickers,
+            include_headers=include_headers,
+            include_matrix=include_matrix,
+            limit=limit,
+            offset=offset,
+            top_n=top_n,
+            schema_only=schema_only,
+            headers_only=headers_only,
         )
         return await _handle_quotes_batch(request, body, mode, token, x_app_token, authorization, x_request_id)
 
-    @enriched.post("")
-    @enriched_quote_alias.post("")
-    @enriched_hyphen.post("")
+    @root.post("/v1/enriched")
+    @root.post("/v1/enriched_quote")
+    @root.post("/v1/enriched-quote")
     async def alias_root_post(
         request: Request,
         body: Dict[str, Any] = Body(default_factory=dict),
@@ -1280,9 +1287,9 @@ def _build_router(reason: str) -> APIRouter:
     ) -> Dict[str, Any]:
         return await _handle_root_bridge(request, body, mode, token, x_app_token, authorization, x_request_id)
 
-    @enriched.get("")
-    @enriched_quote_alias.get("")
-    @enriched_hyphen.get("")
+    @root.get("/v1/enriched")
+    @root.get("/v1/enriched_quote")
+    @root.get("/v1/enriched-quote")
     async def alias_root_get(
         request: Request,
         symbol: Optional[str] = Query(default=None),
@@ -1308,10 +1315,20 @@ def _build_router(reason: str) -> APIRouter:
         x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
     ) -> Dict[str, Any]:
         body = _collect_quotes_body(
-            page=page, sheet_name=sheet_name, sheet=sheet, name=name, tab=tab,
-            symbols=symbols, tickers=tickers, include_headers=include_headers,
-            include_matrix=include_matrix, limit=limit, offset=offset, top_n=top_n,
-            schema_only=schema_only, headers_only=headers_only,
+            page=page,
+            sheet_name=sheet_name,
+            sheet=sheet,
+            name=name,
+            tab=tab,
+            symbols=symbols,
+            tickers=tickers,
+            include_headers=include_headers,
+            include_matrix=include_matrix,
+            limit=limit,
+            offset=offset,
+            top_n=top_n,
+            schema_only=schema_only,
+            headers_only=headers_only,
         )
         if symbol not in (None, ""):
             body["symbol"] = symbol
@@ -1319,10 +1336,6 @@ def _build_router(reason: str) -> APIRouter:
             body["ticker"] = ticker
         return await _handle_root_bridge(request, body, mode, token, x_app_token, authorization, x_request_id)
 
-    root.include_router(enriched)
-    root.include_router(enriched_quote_alias)
-    root.include_router(enriched_hyphen)
-    root.include_router(legacy)
     return root
 
 
@@ -1335,6 +1348,8 @@ def _build_fallback_router(reason: str) -> APIRouter:
     @fallback.get("/v1/enriched", include_in_schema=False)
     @fallback.get("/v1/enriched_quote", include_in_schema=False)
     @fallback.get("/v1/enriched-quote", include_in_schema=False)
+    @fallback.get("/quote", include_in_schema=False)
+    @fallback.get("/quotes", include_in_schema=False)
     async def fallback_health() -> Dict[str, Any]:
         return _json_safe({
             "status": "degraded",
