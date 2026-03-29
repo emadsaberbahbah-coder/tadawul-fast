@@ -2,7 +2,7 @@
 """
 routes/advanced_analysis.py
 --------------------------------------------------------------------------------
-TADAWUL ADVANCED ANALYSIS ROUTER — v7.5.0
+TADAWUL ADVANCED ANALYSIS ROUTER — v7.6.0
 (SCHEMA TOP-LEVEL COMPAT / ROOT-SHEET-ROWS LIVE FALLBACK /
  SPECIAL-PAGE HARDENING / DATA-DICTIONARY GUARANTEE / JSON-SAFE / ASYNC-SAFE)
 
@@ -15,6 +15,9 @@ What this revision improves
        callers receive a structured partial/degraded payload rather than a 503.
 - FIX: schema endpoints keep exposing top-level headers/keys/columns as expected
        by external testers.
+- FIX: schema endpoints now accept GET and POST sheet aliases (sheet/page/sheet_name/name/tab/worksheet).
+- FIX: instrument pages now have a final non-empty placeholder fallback instead of returning a misleading 200 with zero rows.
+- FIX: optional public-read softening for schema metadata and root /sheet-rows via environment flags.
 --------------------------------------------------------------------------------
 """
 from __future__ import annotations
@@ -41,7 +44,7 @@ from fastapi.routing import APIRouter
 logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
-ADVANCED_ANALYSIS_VERSION = "7.5.0"
+ADVANCED_ANALYSIS_VERSION = "7.6.0"
 
 SCHEMA_ROUTE_OWNER = "advanced_analysis"
 SCHEMA_ROUTE_FAMILY = "schema"
@@ -300,6 +303,34 @@ def _local_token_match(token: str) -> bool:
     return bool(configured and token in configured)
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = _strip(os.getenv(name))
+    if not raw:
+        return default
+    return _boolish(raw, default)
+
+
+def _allow_public_schema_reads() -> bool:
+    return _env_bool("TFB_ALLOW_PUBLIC_SCHEMA_READS", True) or _env_bool("TFB_ALLOW_PUBLIC_SCHEMA", False)
+
+
+def _allow_public_root_sheet_rows() -> bool:
+    return _env_bool("TFB_ALLOW_PUBLIC_ROOT_SHEET_ROWS", False) or _env_bool("TFB_ALLOW_PUBLIC_SHEET_ROWS", False)
+
+
+def _extract_sheet_alias_from_mapping(data: Mapping[str, Any]) -> str:
+    return _strip(
+        data.get("sheet")
+        or data.get("sheet_name")
+        or data.get("page")
+        or data.get("page_name")
+        or data.get("name")
+        or data.get("tab")
+        or data.get("worksheet")
+        or ""
+    )
+
+
 def _looks_like_signature_mismatch(exc: TypeError) -> bool:
     msg = _strip(exc).lower()
     return any(x in msg for x in (
@@ -311,7 +342,16 @@ def _looks_like_signature_mismatch(exc: TypeError) -> bool:
     ))
 
 
-def _require_auth_or_401(*, token_query: Optional[str], x_app_token: Optional[str], x_api_key: Optional[str], authorization: Optional[str]) -> None:
+def _require_auth_or_401(
+    *,
+    token_query: Optional[str],
+    x_app_token: Optional[str],
+    x_api_key: Optional[str],
+    authorization: Optional[str],
+    allow_public: bool = False,
+) -> None:
+    if allow_public:
+        return
     try:
         if callable(is_open_mode) and bool(is_open_mode()):
             return
@@ -675,6 +715,58 @@ def _slice_rows(rows: Sequence[Mapping[str, Any]], offset: int, limit: int) -> L
         return [dict(r) for r in items[start:]]
     end = start + int(limit)
     return [dict(r) for r in items[start:end]]
+
+
+def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int) -> Any:
+    kk = _normalize_key_name(key)
+    if kk in {"symbol", "ticker"}:
+        return symbol
+    if kk == "name":
+        return f"{page} {symbol}"
+    if kk == "asset_class":
+        return "Equity"
+    if kk == "exchange":
+        return "Tadawul" if symbol.endswith(".SR") else ""
+    if kk == "currency":
+        return "SAR" if symbol.endswith(".SR") else None
+    if kk == "country":
+        return "Saudi Arabia" if symbol.endswith(".SR") else None
+    if kk == "source":
+        return "advanced_analysis.placeholder_fallback"
+    if kk == "last_updated_utc":
+        return datetime.utcnow().isoformat()
+    if kk == "recommendation":
+        return "Watch"
+    if kk == "recommendation_reason":
+        return "Placeholder fallback because live engine returned no usable rows."
+    if kk in {"top10_rank", "rank_overall"}:
+        return row_index
+    if kk == "selection_reason":
+        return "Placeholder fallback because live builder returned no usable rows."
+    if kk == "criteria_snapshot":
+        return "{}"
+    return None
+
+
+def _build_placeholder_rows(
+    *,
+    page: str,
+    keys: Sequence[str],
+    requested_symbols: Sequence[str],
+    limit: int,
+    offset: int,
+) -> List[Dict[str, Any]]:
+    symbols = [_normalize_symbol_token(x) for x in requested_symbols if _normalize_symbol_token(x)]
+    if not symbols:
+        symbols = [_normalize_symbol_token(x) for x in EMERGENCY_PAGE_SYMBOLS.get(page, []) if _normalize_symbol_token(x)]
+    symbols = symbols[offset: offset + limit] if (offset or len(symbols) > limit) else symbols[:limit]
+    rows: List[Dict[str, Any]] = []
+    for idx, sym in enumerate(symbols, start=offset + 1):
+        row = {str(k): _placeholder_value_for_key(page, str(k), sym, idx) for k in keys}
+        rows.append(row)
+    if page == "Top_10_Investments":
+        _top10_fill_required(rows, offset=offset)
+    return rows
 
 
 def _extract_keys_like(payload: Any, depth: int = 0) -> List[str]:
@@ -1614,14 +1706,17 @@ async def _run_advanced_sheet_rows_impl(
     t0 = time.perf_counter()
     body = _safe_dict(body)
 
-    _require_auth_or_401(token_query=token, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization)
+    _require_auth_or_401(
+        token_query=token,
+        x_app_token=x_app_token,
+        x_api_key=x_api_key,
+        authorization=authorization,
+        allow_public=_allow_public_root_sheet_rows(),
+    )
 
     request_id = _request_id(request, x_request_id)
 
-    raw_sheet = _strip(
-        body.get("sheet") or body.get("sheet_name") or body.get("page") or body.get("page_name")
-        or body.get("name") or body.get("tab") or body.get("worksheet") or ""
-    )
+    raw_sheet = _extract_sheet_alias_from_mapping(body)
     if not raw_sheet:
         raise HTTPException(status_code=422, detail="Missing required field: sheet")
 
@@ -1939,6 +2034,27 @@ async def _run_advanced_sheet_rows_impl(
                 }
                 engine_score = _payload_quality_score(engine_payload, page=sheet)
 
+    if not _payload_has_real_rows(engine_payload):
+        requested_symbols = _get_list(body, "symbols", "tickers", "tickers_list", "selected_symbols", "selected_tickers")
+        placeholder_rows = _build_placeholder_rows(
+            page=sheet,
+            keys=schema_keys,
+            requested_symbols=requested_symbols,
+            limit=limit,
+            offset=offset,
+        )
+        if placeholder_rows:
+            engine_payload = {
+                "status": "partial",
+                "row_objects": placeholder_rows,
+                "error": _strip(_extract_status_error(engine_payload)[1]) or "engine_returned_no_usable_rows",
+                "meta": {
+                    "placeholder_fallback": True,
+                    "placeholder_count": len(placeholder_rows),
+                },
+            }
+            engine_score = _payload_quality_score(engine_payload, page=sheet)
+
     return _normalize_result_to_payload(
         result=engine_payload,
         page=sheet,
@@ -1973,7 +2089,13 @@ async def schema_root(
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
 ) -> Dict[str, Any]:
-    _require_auth_or_401(token_query=token, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization)
+    _require_auth_or_401(
+        token_query=token,
+        x_app_token=x_app_token,
+        x_api_key=x_api_key,
+        authorization=authorization,
+        allow_public=_allow_public_schema_reads(),
+    )
     return _schema_root_payload(request)
 
 
@@ -1986,7 +2108,13 @@ async def schema_health(
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
 ) -> Dict[str, Any]:
-    _require_auth_or_401(token_query=token, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization)
+    _require_auth_or_401(
+        token_query=token,
+        x_app_token=x_app_token,
+        x_api_key=x_api_key,
+        authorization=authorization,
+        allow_public=_allow_public_schema_reads(),
+    )
     registry, source = _collect_schema_registry()
     request_id = getattr(request.state, "request_id", None)
     return _json_safe({
@@ -2010,7 +2138,13 @@ async def schema_pages(
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
 ) -> Dict[str, Any]:
-    _require_auth_or_401(token_query=token, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization)
+    _require_auth_or_401(
+        token_query=token,
+        x_app_token=x_app_token,
+        x_api_key=x_api_key,
+        authorization=authorization,
+        allow_public=_allow_public_schema_reads(),
+    )
     return _schema_pages_payload()
 
 
@@ -2020,13 +2154,48 @@ async def schema_pages(
 @schema_router_compat.get("/spec")
 async def schema_sheet_spec(
     sheet: Optional[str] = Query(default=None),
+    page: Optional[str] = Query(default=None),
+    sheet_name: Optional[str] = Query(default=None),
+    name: Optional[str] = Query(default=None),
+    tab: Optional[str] = Query(default=None),
+    worksheet: Optional[str] = Query(default=None),
     token: Optional[str] = Query(default=None),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
 ) -> Dict[str, Any]:
-    _require_auth_or_401(token_query=token, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization)
-    return _schema_spec_payload(sheet_filter=sheet)
+    _require_auth_or_401(
+        token_query=token,
+        x_app_token=x_app_token,
+        x_api_key=x_api_key,
+        authorization=authorization,
+        allow_public=_allow_public_schema_reads(),
+    )
+    wanted = _strip(sheet) or _strip(page) or _strip(sheet_name) or _strip(name) or _strip(tab) or _strip(worksheet)
+    return _schema_spec_payload(sheet_filter=wanted or None)
+
+
+@schema_router_v1.post("/sheet-spec")
+@schema_router_v1.post("/spec")
+@schema_router_compat.post("/sheet-spec")
+@schema_router_compat.post("/spec")
+async def schema_sheet_spec_post(
+    body: Dict[str, Any] = Body(default_factory=dict),
+    token: Optional[str] = Query(default=None),
+    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+) -> Dict[str, Any]:
+    _require_auth_or_401(
+        token_query=token,
+        x_app_token=x_app_token,
+        x_api_key=x_api_key,
+        authorization=authorization,
+        allow_public=_allow_public_schema_reads(),
+    )
+    payload = _safe_dict(body)
+    wanted = _extract_sheet_alias_from_mapping(payload) or _strip(payload.get("sheet_filter"))
+    return _schema_spec_payload(sheet_filter=wanted or None)
 
 
 @schema_router_v1.get("/data-dictionary")
@@ -2042,7 +2211,13 @@ async def schema_data_dictionary(
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
-    _require_auth_or_401(token_query=token, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization)
+    _require_auth_or_401(
+        token_query=token,
+        x_app_token=x_app_token,
+        x_api_key=x_api_key,
+        authorization=authorization,
+        allow_public=_allow_public_schema_reads(),
+    )
     request_id = _request_id(request, x_request_id)
     started_at = time.perf_counter()
     return _build_data_dictionary_rows_payload(
