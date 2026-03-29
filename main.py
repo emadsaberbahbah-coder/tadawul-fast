@@ -2,32 +2,24 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.7.0)
+TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.8.0)
 ================================================================================
-ALIGNED • DEPLOYMENT-SAFE • STARTUP-ONLY ROUTE MOUNT BY DEFAULT • ROUTER-SNAPSHOT-AWARE
-ENGINE-STATE-AWARE • OPENAPI-SAFE • RENDER-HEALTH-PROBE-SAFE • PRIORITY-MOUNTED
-ROOT-CONFIG-FIRST • CORE-CONFIG-COMPATIBLE • REQUEST-ID SAFE • STARTUP-HARDENED
-STRICT-JSON-READY • PREEXISTING-ENGINE SAFE • ROUTE-VERIFY SAFE • DEBUG-HARDENED
-V1-HEALTH-ALIAS SAFE • V1-META-ALIAS SAFE • HEAD-PROBE SAFE
-CONTROLLED-ROUTE-OWNERSHIP • PARTIAL-DUPLICATE-BLOCK SAFE • FILTERED-MOUNT SAFE
-ADVANCED-SHEET-ROWS OWNER FIXED • STRICT-JSON SAFE • ADVISOR-FAMILY NORMALIZED
-HEALTH-COUNT DE-NOISED • NO-RESPONSE GUARD SAFE • ROOT-SHEET-ROWS DIAGNOSTICS
-MOUNT-FN FILTER SAFE • CANONICAL-OWNER COVERAGE EXPANDED • TFB-TOKEN SAFE
-ENGINE-INIT TIMEOUT SAFE • BOOT-LIGHTER PRESTART FLOW
-OWNER-DIAGNOSTICS EXACT-MATCH SAFE • CONFIG-FAMILY FILTER SAFE
-APP-EXPORT SAFE • ROUTE-SIGNATURE COUNT FIXED • LIVE-METRICS PREFERRED
+FASTAPI-NATIVE ROUTER INCLUDE • PRESTART-FIRST ROUTE MOUNT • OPENAPI CACHE SAFE
+REQUEST-ID SAFE • ENGINE-STATE AWARE • CONTROLLED-ROUTE-OWNERSHIP SAFE
+STRICT-JSON SAFE • HEALTH / META ALIAS SAFE • DEBUG ROUTE SAFE
 
-Why this revision (v8.7.0)
+Why this revision (v8.8.0)
 --------------------------
-- FIX: recomputes route signature counts and route totals from the live mounted app
-       instead of preserving the default zero values from the empty state snapshot.
-- FIX: keeps canonical owner diagnostics live-derived when an app instance exists,
-       which prevents stale startup metrics from leaking into `/meta` and `/health`.
-- FIX: preserves controlled route mounting and exact-owner verification across
-       advisor / advanced / analysis / schema / enriched families.
-- FIX: keeps startup engine initialization timeout-aware and non-fatal unless
-       strict mode is explicitly enabled.
-- SAFE: remains import-tolerant when optional modules are missing.
+- FIX: mounts controlled routers with app.include_router(...) instead of directly
+       appending APIRoute objects to app.router.routes.
+- FIX: forces router mounting before normal runtime use so /openapi.json and live
+       route handlers see the same mounted route set.
+- FIX: adds a custom OpenAPI builder that refreshes whenever the live route
+       signature count changes.
+- FIX: preserves controlled owner diagnostics for advisor / advanced / analysis /
+       schema / enriched families while keeping duplicate protection.
+- SAFE: keeps startup engine init timeout-aware and non-fatal unless strict mode
+       is explicitly enabled.
 """
 
 from __future__ import annotations
@@ -50,6 +42,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, 
 
 from fastapi import APIRouter, FastAPI, Request, Response
 from fastapi.encoders import jsonable_encoder
+from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -183,7 +176,7 @@ class _StrictJSONResponse(JSONResponse):
         ).encode("utf-8")
 
 
-APP_ENTRY_VERSION = "8.7.0"
+APP_ENTRY_VERSION = "8.8.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
@@ -251,6 +244,15 @@ _OPTIONAL_ROUTE_MODULES: Set[str] = {
     "routes.ai_analysis",
     "routes.routes_argaam",
 }
+
+_CONTROLLED_ROUTE_PLAN: Tuple[Tuple[str, str], ...] = (
+    ("config", "routes.config"),
+    ("advanced_analysis", "routes.advanced_analysis"),
+    ("analysis_sheet_rows", "routes.analysis_sheet_rows"),
+    ("investment_advisor", "routes.investment_advisor"),
+    ("advisor", "routes.advisor"),
+    ("enriched_quote", "routes.enriched_quote"),
+)
 
 
 # =============================================================================
@@ -422,7 +424,7 @@ class _SettingsView:
     INIT_ENGINE_ON_BOOT: bool = True
     INIT_ENGINE_STRICT: bool = False
     ENGINE_INIT_TIMEOUT_SEC: float = 12.0
-    PRESTART_MOUNT_ROUTES: bool = False
+    PRESTART_MOUNT_ROUTES: bool = True
 
     REQUIRE_AUTH: bool = True
     OPEN_MODE: bool = False
@@ -450,7 +452,7 @@ def _settings_from_generic_object(s: Any, source: str) -> _SettingsView:
         INIT_ENGINE_ON_BOOT=_to_bool(_pick_attr(s, "INIT_ENGINE_ON_BOOT", "init_engine_on_boot", default=_env_bool("INIT_ENGINE_ON_BOOT", True)), _env_bool("INIT_ENGINE_ON_BOOT", True)),
         INIT_ENGINE_STRICT=_to_bool(_pick_attr(s, "INIT_ENGINE_STRICT", "init_engine_strict", default=_env_bool("INIT_ENGINE_STRICT", False)), _env_bool("INIT_ENGINE_STRICT", False)),
         ENGINE_INIT_TIMEOUT_SEC=float(_pick_attr(s, "ENGINE_INIT_TIMEOUT_SEC", "engine_init_timeout_sec", default=_env_float("ENGINE_INIT_TIMEOUT_SEC", 12.0))),
-        PRESTART_MOUNT_ROUTES=_to_bool(_pick_attr(s, "PRESTART_MOUNT_ROUTES", "prestart_mount_routes", default=_env_bool("PRESTART_MOUNT_ROUTES", False)), _env_bool("PRESTART_MOUNT_ROUTES", False)),
+        PRESTART_MOUNT_ROUTES=_to_bool(_pick_attr(s, "PRESTART_MOUNT_ROUTES", "prestart_mount_routes", default=_env_bool("PRESTART_MOUNT_ROUTES", True)), _env_bool("PRESTART_MOUNT_ROUTES", True)),
         REQUIRE_AUTH=_to_bool(_pick_attr(s, "REQUIRE_AUTH", "require_auth", default=_env_bool("REQUIRE_AUTH", True)), _env_bool("REQUIRE_AUTH", True)),
         OPEN_MODE=_to_bool(_pick_attr(s, "OPEN_MODE", "open_mode", default=_env_bool("OPEN_MODE", False)), _env_bool("OPEN_MODE", False)),
         AUTH_HEADER_NAME=str(_pick_attr(s, "AUTH_HEADER_NAME", "auth_header_name", default=_env_str("AUTH_HEADER_NAME", "X-APP-TOKEN"))),
@@ -489,7 +491,7 @@ def _load_settings() -> _SettingsView:
         INIT_ENGINE_ON_BOOT=_env_bool("INIT_ENGINE_ON_BOOT", True),
         INIT_ENGINE_STRICT=_env_bool("INIT_ENGINE_STRICT", False),
         ENGINE_INIT_TIMEOUT_SEC=_env_float("ENGINE_INIT_TIMEOUT_SEC", 12.0),
-        PRESTART_MOUNT_ROUTES=_env_bool("PRESTART_MOUNT_ROUTES", False),
+        PRESTART_MOUNT_ROUTES=_env_bool("PRESTART_MOUNT_ROUTES", True),
         REQUIRE_AUTH=_env_bool("REQUIRE_AUTH", True),
         OPEN_MODE=_env_bool("OPEN_MODE", False),
         AUTH_HEADER_NAME=_env_str("AUTH_HEADER_NAME", "X-APP-TOKEN"),
@@ -563,6 +565,8 @@ def _ensure_app_state_defaults(app: FastAPI) -> None:
         app.state.settings = _SETTINGS
     if not hasattr(app.state, "startup_warnings"):
         app.state.startup_warnings = []
+    if not hasattr(app.state, "_openapi_route_signature_count"):
+        app.state._openapi_route_signature_count = -1
 
 
 # =============================================================================
@@ -736,6 +740,10 @@ def _route_signature_count(app: Any, *, include_builtin: bool = True) -> int:
 def _invalidate_openapi_cache(app: FastAPI) -> None:
     try:
         app.openapi_schema = None  # type: ignore[attr-defined]
+    except Exception:
+        pass
+    try:
+        app.state._openapi_route_signature_count = -1
     except Exception:
         pass
 
@@ -928,17 +936,19 @@ def _normalize_routes_snapshot(
     openapi_route_count_after_mount = _prefer_live_metric(src.get("openapi_route_count_after_mount", 0), live_route_count)
     route_signature_count_after_mount = _prefer_live_metric(src.get("route_signature_count_after_mount", 0), live_signature_count)
 
-    all_paths: Set[str] = set()
     path_owners: Dict[str, str] = {}
     path_owner_mismatches: Dict[str, Dict[str, str]] = {}
     route_family_presence = dict(src.get("route_family_presence", {}) or {})
 
     if app is not None:
-        all_paths = {str(getattr(r, "path", "") or "") for r in (getattr(app, "routes", []) or [])}
-        route_family_presence = _route_family_presence_from_paths(all_paths)
-        path_owners = _canonical_path_owners_from_routes(app)
-        path_owner_mismatches = _canonical_path_owner_mismatches(path_owners)
-        missing_required_keys = _verify_required_route_families(app)
+        try:
+            all_paths = {str(getattr(r, "path", "") or "") for r in (getattr(app, "routes", []) or [])}
+            route_family_presence = _route_family_presence_from_paths(all_paths)
+            path_owners = _canonical_path_owners_from_routes(app)
+            path_owner_mismatches = _canonical_path_owner_mismatches(path_owners)
+            missing_required_keys = _verify_required_route_families(app)
+        except Exception:
+            pass
 
     effective_failed_modules = _effective_failed_modules(
         {"import_errors": import_errors, "mount_errors": mount_errors, "no_router": no_router}
@@ -986,16 +996,6 @@ def _normalize_routes_snapshot(
 # =============================================================================
 # Controlled route mounting
 # =============================================================================
-_CONTROLLED_ROUTE_PLAN: Tuple[Tuple[str, str], ...] = (
-    ("config", "routes.config"),
-    ("advanced_analysis", "routes.advanced_analysis"),
-    ("analysis_sheet_rows", "routes.analysis_sheet_rows"),
-    ("investment_advisor", "routes.investment_advisor"),
-    ("advisor", "routes.advisor"),
-    ("enriched_quote", "routes.enriched_quote"),
-)
-
-
 def _allowed_prefixes_for_key(key: str) -> Tuple[str, ...]:
     mapping = {
         "config": ("/v1/config",),
@@ -1022,10 +1022,11 @@ def _iter_router_api_routes(router: APIRouter) -> Iterable[APIRoute]:
             yield route
 
 
-def _clone_filtered_router(router: APIRouter, *, key: str) -> Tuple[APIRouter, List[str]]:
+def _clone_filtered_router(router: APIRouter, *, key: str) -> Tuple[APIRouter, List[str], List[str]]:
     allowed = _allowed_prefixes_for_key(key)
     out = APIRouter()
     filtered_out: List[str] = []
+    added_paths: List[str] = []
 
     for route in _iter_router_api_routes(router):
         path = str(getattr(route, "path", "") or "")
@@ -1033,36 +1034,49 @@ def _clone_filtered_router(router: APIRouter, *, key: str) -> Tuple[APIRouter, L
             filtered_out.append(path)
             continue
 
+        kwargs = {
+            "path": path,
+            "endpoint": route.endpoint,
+            "methods": list(route.methods or []),
+            "name": route.name,
+            "include_in_schema": route.include_in_schema,
+            "response_class": getattr(route, "response_class", None),
+            "status_code": getattr(route, "status_code", None),
+            "tags": list(getattr(route, "tags", []) or []),
+            "summary": getattr(route, "summary", None),
+            "description": getattr(route, "description", None),
+            "response_description": getattr(route, "response_description", "Successful Response"),
+            "deprecated": getattr(route, "deprecated", None),
+            "operation_id": getattr(route, "operation_id", None),
+            "responses": getattr(route, "responses", None),
+            "dependencies": list(getattr(route, "dependencies", []) or []),
+        }
+
         try:
-            out.add_api_route(
-                path=path,
-                endpoint=route.endpoint,
-                methods=list(route.methods or []),
-                name=route.name,
-                include_in_schema=route.include_in_schema,
-                response_class=getattr(route, "response_class", None),
-                status_code=getattr(route, "status_code", None),
-                tags=list(getattr(route, "tags", []) or []),
-                summary=getattr(route, "summary", None),
-                description=getattr(route, "description", None),
-                response_description=getattr(route, "response_description", "Successful Response"),
-                deprecated=getattr(route, "deprecated", None),
-                operation_id=getattr(route, "operation_id", None),
-                responses=getattr(route, "responses", None),
-            )
+            out.add_api_route(**kwargs)
+            added_paths.append(path)
         except Exception:
             try:
-                out.add_api_route(
-                    path=path,
-                    endpoint=route.endpoint,
-                    methods=list(route.methods or []),
-                    name=route.name,
-                    include_in_schema=route.include_in_schema,
-                )
+                fallback_kwargs = {
+                    "path": path,
+                    "endpoint": route.endpoint,
+                    "methods": list(route.methods or []),
+                    "name": route.name,
+                    "include_in_schema": route.include_in_schema,
+                }
+                out.add_api_route(**fallback_kwargs)
+                added_paths.append(path)
             except Exception:
                 filtered_out.append(path)
 
-    return out, filtered_out
+    return out, filtered_out, added_paths
+
+
+def _router_signature_set(router: APIRouter) -> Set[Tuple[str, str]]:
+    sigs: Set[Tuple[str, str]] = set()
+    for route in _iter_router_api_routes(router):
+        sigs.update(_route_signature_pairs_from_route(route))
+    return sigs
 
 
 def _mount_routes_controlled(app: FastAPI) -> Dict[str, Any]:
@@ -1076,7 +1090,7 @@ def _mount_routes_controlled(app: FastAPI) -> Dict[str, Any]:
     for key, module_name in _CONTROLLED_ROUTE_PLAN:
         snap["module_to_key"][module_name] = key
         snap["resolved_map"][key] = module_name
-        snap["mount_modes"][module_name] = "filtered"
+        snap["mount_modes"][module_name] = "include_router_filtered"
 
         try:
             mod = importlib.import_module(module_name)
@@ -1093,7 +1107,7 @@ def _mount_routes_controlled(app: FastAPI) -> Dict[str, Any]:
                 raise RuntimeError(f"{module_name} has no APIRouter")
             continue
 
-        filtered_router, filtered_out = _clone_filtered_router(router, key=key)
+        filtered_router, filtered_out, added_paths = _clone_filtered_router(router, key=key)
         if filtered_out:
             snap["filtered_out_routes"][module_name] = filtered_out
 
@@ -1103,33 +1117,32 @@ def _mount_routes_controlled(app: FastAPI) -> Dict[str, Any]:
             continue
 
         existing_sigs = _app_route_signature_set(app, include_builtin=True)
-        mounted_this_module = 0
+        router_sigs = _router_signature_set(filtered_router)
+        overlap = router_sigs & existing_sigs
 
-        for route in routes_to_add:
-            sigs = _route_signature_pairs_from_route(route)
-            overlap = sigs & existing_sigs
-            if overlap == sigs:
-                snap["duplicate_skips"].append({"module": module_name, "path": route.path, "methods": sorted([m for _, m in sigs])})
-                continue
-            if overlap:
-                snap["partial_duplicate_skips"].append(
-                    {"module": module_name, "path": route.path, "methods": sorted([m for _, m in sigs]), "overlap": sorted([m for _, m in overlap])}
-                )
-                continue
+        if router_sigs and overlap == router_sigs:
+            snap["duplicate_skips"].append({
+                "module": module_name,
+                "paths": sorted(set(added_paths)),
+                "signature_count": len(router_sigs),
+            })
+            continue
 
-            try:
-                app.router.routes.append(route)
-                existing_sigs.update(sigs)
-                mounted_this_module += 1
-            except Exception as e:
-                snap["mount_errors"][module_name] = _err_to_str(e)
-                if strict and module_name not in _OPTIONAL_ROUTE_MODULES:
-                    raise
+        if overlap:
+            snap["partial_duplicate_skips"].append({
+                "module": module_name,
+                "paths": sorted(set(added_paths)),
+                "overlap_count": len(overlap),
+                "signature_count": len(router_sigs),
+            })
 
-        if mounted_this_module > 0:
+        try:
+            app.include_router(filtered_router)
             snap["mounted"].append(module_name)
-        else:
-            snap["resolved_entries"].append({"module": module_name, "status": "loaded_but_skipped"})
+        except Exception as e:
+            snap["mount_errors"][module_name] = _err_to_str(e)
+            if strict and module_name not in _OPTIONAL_ROUTE_MODULES:
+                raise
 
     snap = _normalize_routes_snapshot(snap, used_strategy="main.controlled_priority_plan", app=app)
     _invalidate_openapi_cache(app)
@@ -1278,6 +1291,31 @@ def _install_builtin_routes(app: FastAPI) -> None:
     _add_status_route("/v1/livez", "live")
     _add_status_route("/v1/health", "healthy")
     _add_status_route("/v1/healthz", "healthy")
+
+
+# =============================================================================
+# OpenAPI
+# =============================================================================
+def _install_custom_openapi(app: FastAPI) -> None:
+    def custom_openapi() -> Dict[str, Any]:
+        current_signature_count = _route_signature_count(app, include_builtin=True)
+        cached_signature_count = int(getattr(app.state, "_openapi_route_signature_count", -1) or -1)
+        cached_schema = getattr(app, "openapi_schema", None)
+
+        if cached_schema is not None and cached_signature_count == current_signature_count:
+            return cached_schema  # type: ignore[return-value]
+
+        schema = get_openapi(
+            title=_SETTINGS.APP_NAME,
+            version=str(_SETTINGS.APP_VERSION),
+            routes=app.routes,
+            description="Tadawul Fast Bridge API",
+        )
+        app.openapi_schema = schema
+        app.state._openapi_route_signature_count = current_signature_count
+        return schema
+
+    app.openapi = custom_openapi  # type: ignore[assignment]
 
 
 # =============================================================================
@@ -1498,30 +1536,29 @@ def create_app() -> FastAPI:
         )
 
     _install_builtin_routes(app)
+    _install_custom_openapi(app)
 
-    if bool(_SETTINGS.PRESTART_MOUNT_ROUTES):
+    # Always mount before serving requests so OpenAPI and runtime use the same route set.
+    try:
+        snap = _mount_routes_once(app, phase="prestart")
+        logger.info(
+            "Routes mounted at app creation: mounted=%s duplicate_skips=%s partial_duplicate_skips=%s missing=%s failed=%s strategy=%s route_signatures=%s",
+            snap.get("mounted_count", 0),
+            snap.get("duplicate_skips_count", 0),
+            snap.get("partial_duplicate_skips_count", 0),
+            snap.get("missing_count", 0),
+            snap.get("failed_count", 0),
+            snap.get("strategy", ""),
+            snap.get("route_signature_count_after_mount", 0),
+        )
+    except Exception as e:
+        logger.error("Prestart route mounting failed: %s", e, exc_info=True)
         try:
-            snap = _mount_routes_once(app, phase="prestart")
-            logger.info(
-                "Routes mounted at app creation: mounted=%s duplicate_skips=%s partial_duplicate_skips=%s missing=%s failed=%s strategy=%s route_signatures=%s",
-                snap.get("mounted_count", 0),
-                snap.get("duplicate_skips_count", 0),
-                snap.get("partial_duplicate_skips_count", 0),
-                snap.get("missing_count", 0),
-                snap.get("failed_count", 0),
-                snap.get("strategy", ""),
-                snap.get("route_signature_count_after_mount", 0),
-            )
-        except Exception as e:
-            logger.error("Prestart route mounting failed: %s", e, exc_info=True)
-            try:
-                app.state.startup_warnings.append(f"prestart_route_mount_failed: {_err_to_str(e)}")
-            except Exception:
-                pass
-            if _env_bool("ROUTES_STRICT_IMPORT", False):
-                raise
-    else:
-        logger.info("Prestart route mounting skipped by configuration.")
+            app.state.startup_warnings.append(f"prestart_route_mount_failed: {_err_to_str(e)}")
+        except Exception:
+            pass
+        if _env_bool("ROUTES_STRICT_IMPORT", False):
+            raise
 
     @app.get("/_debug/routes", include_in_schema=False)
     async def debug_routes(request: Request):
