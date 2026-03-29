@@ -2,10 +2,10 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.45.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.42.0
 ================================================================================
 
-WHY v5.45.0
+WHY v5.42.0
 -----------
 - FIX: keeps rows / rows_matrix strictly matrix-aligned to keys while
        row_objects / items / records / data / quotes stay dict-row payloads.
@@ -21,18 +21,6 @@ WHY v5.45.0
        and more stable opportunity/recommendation support.
 - FIX: preserves aligned snapshots and route compatibility aliases expected by
        advisor / advanced / enriched wrappers and direct router calls.
-- FIX: adds commodity/FX self-recovery from chart/history payloads when live
-       quote payloads are sparse or unavailable.
-- FIX: applies symbol-aware page defaults so Commodities_FX rows keep useful
-       identity/context fields even during provider degradation.
-- FIX: adds a native Top 10 engine fallback ranker so the engine does not
-       depend on an external selector to build Top_10_Investments rows.
-- FIX: exposes normalize_row_to_schema and batch-analysis aliases expected by
-       downstream analysis/advisor routers.
-- FIX: adds snapshot-assisted row backfill for sparse live quote rows so
-       previously cached richer rows can safely fill missing schema fields.
-- FIX: exposes display-header object payloads alongside canonical key-based
-       row objects to make diagnostics and route wrappers easier to validate.
 
 Design goals
 ------------
@@ -84,7 +72,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.45.0"
+__version__ = "5.42.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -1078,22 +1066,6 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
 }
 
 _COMMODITY_SYMBOL_HINTS: Tuple[str, ...] = ("GC=F", "SI=F", "BZ=F", "CL=F", "NG=F", "HG=F")
-_COMMODITY_DISPLAY_NAMES: Dict[str, str] = {
-    "GC=F": "Gold Futures",
-    "SI=F": "Silver Futures",
-    "BZ=F": "Brent Crude Futures",
-    "CL=F": "WTI Crude Futures",
-    "NG=F": "Natural Gas Futures",
-    "HG=F": "Copper Futures",
-}
-_COMMODITY_INDUSTRY_HINTS: Dict[str, str] = {
-    "GC=F": "Precious Metals",
-    "SI=F": "Precious Metals",
-    "HG=F": "Industrial Metals",
-    "BZ=F": "Energy",
-    "CL=F": "Energy",
-    "NG=F": "Energy",
-}
 
 
 def _is_blank_value(value: Any) -> bool:
@@ -1207,12 +1179,7 @@ def _infer_currency_from_symbol(symbol: str) -> str:
     if s.endswith(".SR") or re.match(r"^[0-9]{4}$", s):
         return "SAR"
     if s.endswith("=X"):
-        pair = s[:-2]
-        if len(pair) >= 6:
-            return pair[-3:]
-        if pair:
-            return pair
-        return "FX"
+        return s[:3] if len(s) >= 3 else "FX"
     if s.endswith("=F"):
         return "USD"
     return "USD"
@@ -1225,90 +1192,6 @@ def _infer_country_from_symbol(symbol: str) -> str:
     if s.endswith("=X") or s.endswith("=F"):
         return "Global"
     return "USA"
-
-
-def _infer_sector_from_symbol(symbol: str) -> str:
-    s = normalize_symbol(symbol)
-    if s.endswith("=X"):
-        return "Currencies"
-    if s.endswith("=F") or s in _COMMODITY_SYMBOL_HINTS:
-        return "Commodities"
-    if s.endswith(".SR") or re.match(r"^[0-9]{4}$", s):
-        return "Saudi Market"
-    return ""
-
-
-def _infer_industry_from_symbol(symbol: str) -> str:
-    s = normalize_symbol(symbol)
-    if s in _COMMODITY_INDUSTRY_HINTS:
-        return _COMMODITY_INDUSTRY_HINTS[s]
-    if s.endswith("=X"):
-        return "Foreign Exchange"
-    if s.endswith("=F"):
-        return "Commodity Futures"
-    if s.endswith(".SR") or re.match(r"^[0-9]{4}$", s):
-        return "Listed Equities"
-    return ""
-
-
-def _infer_display_name_from_symbol(symbol: str) -> str:
-    s = normalize_symbol(symbol)
-    if not s:
-        return ""
-    if s in _COMMODITY_DISPLAY_NAMES:
-        return _COMMODITY_DISPLAY_NAMES[s]
-    if s.endswith("=X"):
-        pair = s[:-2]
-        if len(pair) >= 6:
-            return f"{pair[:3]}/{pair[3:6]}"
-        return f"{pair} FX" if pair else s
-    if s.endswith("=F"):
-        return _safe_str(s.replace("=F", "")).strip() or s
-    return s
-
-
-def _apply_symbol_context_defaults(row: Dict[str, Any], symbol: str = "", page: str = "") -> Dict[str, Any]:
-    out = dict(row or {})
-    sym = normalize_symbol(symbol or _safe_str(out.get("symbol") or out.get("ticker") or out.get("requested_symbol")))
-    if not sym:
-        return out
-
-    page = _canonicalize_sheet_name(page) if page else ""
-
-    if not out.get("symbol"):
-        out["symbol"] = sym
-    if not out.get("requested_symbol"):
-        out["requested_symbol"] = sym
-    if not out.get("symbol_normalized"):
-        out["symbol_normalized"] = sym
-
-    if page == "Commodities_FX" or sym.endswith("=F") or sym.endswith("=X"):
-        out.setdefault("asset_class", _infer_asset_class_from_symbol(sym))
-        out.setdefault("exchange", _infer_exchange_from_symbol(sym))
-        out.setdefault("currency", _infer_currency_from_symbol(sym))
-        out.setdefault("country", _infer_country_from_symbol(sym))
-        out.setdefault("sector", _infer_sector_from_symbol(sym))
-        out.setdefault("industry", _infer_industry_from_symbol(sym))
-
-        current_name = _safe_str(out.get("name"))
-        inferred_name = _infer_display_name_from_symbol(sym)
-        if not current_name or current_name == sym:
-            out["name"] = inferred_name or sym
-
-        if sym.endswith("=X"):
-            out.setdefault("market_cap", None)
-            out.setdefault("float_shares", None)
-            out.setdefault("beta_5y", None)
-        if sym.endswith("=F"):
-            out.setdefault("market_cap", None)
-            out.setdefault("float_shares", None)
-
-        if out.get("invest_period_label") in (None, ""):
-            out["invest_period_label"] = "1Y"
-        if out.get("horizon_days") in (None, ""):
-            out["horizon_days"] = 365
-
-    return out
 
 
 def _coerce_datetime_like(value: Any) -> Optional[str]:
@@ -1338,22 +1221,16 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
                 out[field] = _json_safe(_to_scalar(val))
                 break
 
-    inferred_symbol = out.get("symbol") or normalized_symbol or requested_symbol
-    inferred_name = _infer_display_name_from_symbol(inferred_symbol)
-    if not out.get("name") or _safe_str(out.get("name")) == _safe_str(inferred_symbol):
-        out["name"] = inferred_name or out.get("symbol") or normalized_symbol or requested_symbol
+    if not out.get("name"):
+        out["name"] = out.get("symbol") or normalized_symbol or requested_symbol
     if not out.get("asset_class"):
-        out["asset_class"] = _infer_asset_class_from_symbol(inferred_symbol)
+        out["asset_class"] = _infer_asset_class_from_symbol(out.get("symbol") or normalized_symbol or requested_symbol)
     if not out.get("exchange"):
-        out["exchange"] = _infer_exchange_from_symbol(inferred_symbol)
+        out["exchange"] = _infer_exchange_from_symbol(out.get("symbol") or normalized_symbol or requested_symbol)
     if not out.get("currency"):
-        out["currency"] = _infer_currency_from_symbol(inferred_symbol)
+        out["currency"] = _infer_currency_from_symbol(out.get("symbol") or normalized_symbol or requested_symbol)
     if not out.get("country"):
-        out["country"] = _infer_country_from_symbol(inferred_symbol)
-    if not out.get("sector"):
-        out["sector"] = _infer_sector_from_symbol(inferred_symbol)
-    if not out.get("industry"):
-        out["industry"] = _infer_industry_from_symbol(inferred_symbol)
+        out["country"] = _infer_country_from_symbol(out.get("symbol") or normalized_symbol or requested_symbol)
 
     if provider and not out.get("data_provider"):
         out["data_provider"] = provider
@@ -1406,10 +1283,6 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
     if upl is not None and pos_cost not in (None, 0) and out.get("unrealized_pl_pct") is None:
         out["unrealized_pl_pct"] = round((upl / pos_cost) * 100.0, 6)
 
-    out = _apply_symbol_context_defaults(out, symbol=inferred_symbol)
-    if _as_float(out.get("current_price")) is not None and _safe_str(out.get("warnings")).lower() == "no live provider data available":
-        out["warnings"] = "Recovered from history/chart fallback"
-
     return out
 
 
@@ -1433,74 +1306,8 @@ def _normalize_to_schema_keys(keys: Sequence[str], headers: Sequence[str], row: 
     return out
 
 
-def _apply_page_row_backfill(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
-    target = _canonicalize_sheet_name(sheet)
-    out = _apply_symbol_context_defaults(dict(row or {}), page=target)
-    sym = normalize_symbol(_safe_str(out.get("symbol") or out.get("requested_symbol")))
-
-    if out.get("invest_period_label") in (None, ""):
-        out["invest_period_label"] = "1Y"
-    if out.get("horizon_days") in (None, ""):
-        out["horizon_days"] = 365
-
-    if out.get("data_provider") in (None, ""):
-        sources = out.get("data_sources")
-        if isinstance(sources, list) and sources:
-            out["data_provider"] = _safe_str(sources[0])
-
-    conf = _as_float(out.get("confidence_score"))
-    if conf is None:
-        conf_fraction = _as_float(out.get("forecast_confidence"))
-        if conf_fraction is not None:
-            conf = conf_fraction * 100.0 if conf_fraction <= 1.5 else conf_fraction
-            out.setdefault("confidence_score", round(_clamp(conf, 0.0, 100.0), 2))
-    if conf is not None and out.get("confidence_bucket") in (None, ""):
-        out["confidence_bucket"] = "HIGH" if conf >= 75 else "MODERATE" if conf >= 55 else "LOW"
-
-    if target == "Commodities_FX" or sym.endswith("=F") or sym.endswith("=X"):
-        out.setdefault("data_provider", _safe_str(out.get("data_provider"), "history_or_fallback"))
-        if out.get("forecast_confidence") in (None, ""):
-            out["forecast_confidence"] = 0.55
-        if out.get("confidence_score") in (None, ""):
-            out["confidence_score"] = 55.0
-        if out.get("forecast_confidence") not in (None, "") and out.get("confidence_bucket") in (None, ""):
-            conf = _as_float(out.get("confidence_score")) or ((_as_float(out.get("forecast_confidence")) or 0.55) * 100.0)
-            out["confidence_bucket"] = "HIGH" if conf >= 75 else "MODERATE" if conf >= 55 else "LOW"
-        if out.get("warnings") in (None, "") and _as_float(out.get("current_price")) is None:
-            out["warnings"] = "Live quote sparse; chart/history fallback unavailable"
-
-    if target == "Mutual_Funds" and out.get("asset_class") in (None, ""):
-        out["asset_class"] = "Fund"
-        out.setdefault("sector", "Diversified")
-        out.setdefault("industry", "Mutual Funds")
-
-    return out
-
-
 def _strict_project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
     return {k: _json_safe(row.get(k)) for k in keys}
-
-
-def _strict_project_row_display(headers: Sequence[str], keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for idx, key in enumerate(keys or []):
-        header = headers[idx] if idx < len(headers or []) else key
-        out[header] = _json_safe(row.get(key))
-    return out
-
-
-def _rows_display_objects_from_rows(rows: List[Dict[str, Any]], headers: List[str], keys: List[str]) -> List[Dict[str, Any]]:
-    return [_strict_project_row_display(headers, keys, row) for row in (rows or [])]
-
-
-def _merge_missing_fields(base_row: Dict[str, Any], template_row: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    out = dict(base_row or {})
-    if not isinstance(template_row, dict):
-        return out
-    for k, v in template_row.items():
-        if out.get(k) in (None, "", [], {}) and v not in (None, "", [], {}):
-            out[k] = _json_safe(v)
-    return out
 
 
 def _rows_matrix_from_rows(rows: List[Dict[str, Any]], keys: List[str]) -> List[List[Any]]:
@@ -1523,10 +1330,10 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
     profit_margin_pct = _as_pct_points(row.get("profit_margin")) or 0.0
     revenue_growth_pct = _as_pct_points(row.get("revenue_growth_yoy")) or 0.0
 
-    seed_roi_1m = _as_pct_points(row.get("expected_roi_1m"))
-    seed_roi_3m = _as_pct_points(row.get("expected_roi_3m"))
-    seed_roi_12m = _as_pct_points(row.get("expected_roi_12m"))
-    seed_best_roi = next((v for v in (seed_roi_3m, seed_roi_12m, seed_roi_1m) if v is not None), 0.0)
+    roi_1m = _as_pct_points(row.get("expected_roi_1m"))
+    roi_3m = _as_pct_points(row.get("expected_roi_3m"))
+    roi_12m = _as_pct_points(row.get("expected_roi_12m"))
+    best_roi = next((v for v in (roi_3m, roi_12m, roi_1m) if v is not None), 0.0)
 
     if row.get("value_score") is None:
         value_score = 55.0
@@ -1611,14 +1418,29 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         overall = sum(vals2) / len(vals2) if vals2 else 50.0
         row["overall_score"] = round(_clamp(float(overall), 0.0, 100.0), 2)
 
+    if row.get("opportunity_score") is None:
+        base = _as_float(row.get("overall_score")) or 50.0
+        confidence_boost = ((_as_float(row.get("confidence_score")) or 50.0) - 50.0) * 0.20
+        risk_penalty = ((_as_float(row.get("risk_score")) or 50.0) - 50.0) * 0.25
+        roi_boost = _clamp(best_roi, -25.0, 35.0) * 0.35
+        row["opportunity_score"] = round(_clamp(base + confidence_boost + roi_boost - risk_penalty, 0.0, 100.0), 2)
+
+    if not row.get("risk_bucket"):
+        rs = _as_float(row.get("risk_score")) or 50.0
+        row["risk_bucket"] = "LOW" if rs < 40 else "MODERATE" if rs < 70 else "HIGH"
+
+    if not row.get("confidence_bucket"):
+        cs = _as_float(row.get("confidence_score")) or 55.0
+        row["confidence_bucket"] = "HIGH" if cs >= 75 else "MODERATE" if cs >= 55 else "LOW"
+
     if price is not None and row.get("forecast_price_1m") is None:
-        drift = max(0.5, min(4.0, seed_best_roi if seed_best_roi else 1.0))
+        drift = max(0.5, min(4.0, best_roi if best_roi else 1.0))
         row["forecast_price_1m"] = round(price * (1.0 + drift / 300.0), 4)
     if price is not None and row.get("forecast_price_3m") is None:
-        drift = max(1.0, min(8.0, seed_best_roi if seed_best_roi else 3.0))
+        drift = max(1.0, min(8.0, best_roi if best_roi else 3.0))
         row["forecast_price_3m"] = round(price * (1.0 + drift / 100.0), 4)
     if price is not None and row.get("forecast_price_12m") is None:
-        drift = max(3.0, min(18.0, (seed_roi_12m if seed_roi_12m is not None else seed_best_roi) or 8.0))
+        drift = max(3.0, min(18.0, (roi_12m if roi_12m is not None else best_roi) or 8.0))
         row["forecast_price_12m"] = round(price * (1.0 + drift / 100.0), 4)
 
     if price is not None and row.get("expected_roi_1m") is None:
@@ -1633,28 +1455,6 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         fp12 = _as_float(row.get("forecast_price_12m"))
         if fp12 is not None and price:
             row["expected_roi_12m"] = round((fp12 - price) / price, 6)
-
-    final_roi_1m = _as_pct_points(row.get("expected_roi_1m"))
-    final_roi_3m = _as_pct_points(row.get("expected_roi_3m"))
-    final_roi_12m = _as_pct_points(row.get("expected_roi_12m"))
-    final_best_roi = next((v for v in (final_roi_3m, final_roi_12m, final_roi_1m) if v is not None), 0.0)
-
-    if row.get("opportunity_score") is None:
-        base = _as_float(row.get("overall_score")) or 50.0
-        confidence_boost = ((_as_float(row.get("confidence_score")) or 50.0) - 50.0) * 0.20
-        risk_penalty = ((_as_float(row.get("risk_score")) or 50.0) - 50.0) * 0.25
-        roi_boost = _clamp(final_best_roi, -25.0, 35.0) * 0.35
-        row["opportunity_score"] = round(_clamp(base + confidence_boost + roi_boost - risk_penalty, 0.0, 100.0), 2)
-
-    if not row.get("risk_bucket"):
-        rs = _as_float(row.get("risk_score")) or 50.0
-        row["risk_bucket"] = "LOW" if rs < 40 else "MODERATE" if rs < 70 else "HIGH"
-
-    if not row.get("confidence_bucket"):
-        cs = _as_float(row.get("confidence_score")) or 55.0
-        row["confidence_bucket"] = "HIGH" if cs >= 75 else "MODERATE" if cs >= 55 else "LOW"
-
-
 def _compute_recommendation(row: Dict[str, Any]) -> None:
     if row.get("recommendation"):
         return
@@ -2070,10 +1870,6 @@ class DataEngineV5:
         self.enabled_providers = _get_env_list("ENABLED_PROVIDERS", DEFAULT_PROVIDERS)
         self.ksa_providers = _get_env_list("KSA_PROVIDERS", DEFAULT_KSA_PROVIDERS)
         self.global_providers = _get_env_list("GLOBAL_PROVIDERS", DEFAULT_GLOBAL_PROVIDERS)
-        self.history_fallback_providers = _get_env_list(
-            "HISTORY_FALLBACK_PROVIDERS",
-            ["yahoo_chart", "yahoo", "eodhd", "finnhub", "tadawul", "argaam"],
-        )
         self.max_concurrency = _get_env_int("DATA_ENGINE_MAX_CONCURRENCY", 25)
         self.request_timeout = _get_env_float("DATA_ENGINE_TIMEOUT_SECONDS", 20.0)
         self.ksa_disallow_eodhd = _get_env_bool("KSA_DISALLOW_EODHD", True)
@@ -2134,12 +1930,6 @@ class DataEngineV5:
 
     async def get_rows_for_page(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         return await self.get_page_rows(*args, **kwargs)
-
-    async def get_analysis_rows_batch(self, symbols: List[str], mode: str = "", *, schema: Any = None) -> Dict[str, Dict[str, Any]]:
-        return await self.get_enriched_quotes_batch(symbols, mode=mode, schema=schema)
-
-    async def get_analysis_row_dict(self, symbol: str, use_cache: bool = True, *, schema: Any = None) -> Dict[str, Any]:
-        return await self.get_enriched_quote_dict(symbol, use_cache=use_cache, schema=schema)
 
     def get_page_snapshot(self, *args: Any, **kwargs: Any) -> Optional[Dict[str, Any]]:
         return self.get_cached_sheet_snapshot(*args, **kwargs)
@@ -2211,19 +2001,6 @@ class DataEngineV5:
                 return _safe_str(v)
         return ""
 
-    def _get_cached_snapshot_symbol_map(self, sheet: str) -> Dict[str, Dict[str, Any]]:
-        target = _canonicalize_sheet_name(sheet)
-        snap = self.get_cached_sheet_snapshot(sheet=target)
-        rows = _coerce_rows_list(snap)
-        out: Dict[str, Dict[str, Any]] = {}
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            sym = normalize_symbol(self._extract_row_symbol(row))
-            if sym and sym not in out:
-                out[sym] = dict(row)
-        return out
-
     # ------------------------------------------------------------------
     # final payload
     # ------------------------------------------------------------------
@@ -2241,7 +2018,6 @@ class DataEngineV5:
     ) -> Dict[str, Any]:
         headers, keys = _complete_schema_contract(headers, keys)
         dict_rows = [_strict_project_row(keys, r) for r in (row_objects or [])]
-        display_row_objects = _rows_display_objects_from_rows(dict_rows, headers, keys)
         matrix_rows = _rows_matrix_from_rows(dict_rows, keys) if include_matrix else []
 
         payload = {
@@ -2263,10 +2039,6 @@ class DataEngineV5:
             "records": dict_rows,
             "data": dict_rows,
             "quotes": dict_rows,
-            "display_row_objects": display_row_objects,
-            "display_items": display_row_objects,
-            "display_records": display_row_objects,
-            "rows_dict_display": display_row_objects,
             "count": len(dict_rows),
             "meta": dict(meta or {}),
             "version": self.version,
@@ -2756,35 +2528,6 @@ class DataEngineV5:
                 out.append(p)
         return out
 
-    def _rows_from_parallel_series(
-        self,
-        timestamps: Sequence[Any],
-        opens: Optional[Sequence[Any]] = None,
-        highs: Optional[Sequence[Any]] = None,
-        lows: Optional[Sequence[Any]] = None,
-        closes: Optional[Sequence[Any]] = None,
-        volumes: Optional[Sequence[Any]] = None,
-        adjcloses: Optional[Sequence[Any]] = None,
-    ) -> List[Dict[str, Any]]:
-        ts_list = list(timestamps or [])
-        if not ts_list:
-            return []
-
-        rows: List[Dict[str, Any]] = []
-        for idx, ts in enumerate(ts_list):
-            row = {
-                "timestamp": ts,
-                "open": opens[idx] if opens is not None and idx < len(opens) else None,
-                "high": highs[idx] if highs is not None and idx < len(highs) else None,
-                "low": lows[idx] if lows is not None and idx < len(lows) else None,
-                "close": closes[idx] if closes is not None and idx < len(closes) else None,
-                "volume": volumes[idx] if volumes is not None and idx < len(volumes) else None,
-                "adjclose": adjcloses[idx] if adjcloses is not None and idx < len(adjcloses) else None,
-            }
-            if any(v is not None for k, v in row.items() if k != "timestamp"):
-                rows.append(row)
-        return rows
-
     def _coerce_history_rows(self, result: Any) -> List[Dict[str, Any]]:
         if result is None:
             return []
@@ -2799,14 +2542,7 @@ class DataEngineV5:
             out: List[Dict[str, Any]] = []
             for item in result:
                 if isinstance(item, dict):
-                    if {"open", "high", "low", "close"} & set(item.keys()) and not isinstance(item.get("open"), list):
-                        out.append(dict(item))
-                    else:
-                        nested = self._coerce_history_rows(item)
-                        if nested:
-                            out.extend(nested)
-                        else:
-                            out.append(dict(item))
+                    out.append(dict(item))
                 elif isinstance(item, (list, tuple)) and len(item) >= 5:
                     out.append({
                         "timestamp": item[0],
@@ -2818,76 +2554,6 @@ class DataEngineV5:
                     })
             return out
         if isinstance(result, dict):
-            # Yahoo chart-style payloads
-            if isinstance(result.get("chart"), Mapping):
-                chart = result.get("chart") or {}
-                nested = self._coerce_history_rows(chart.get("result"))
-                if nested:
-                    return nested
-
-            if isinstance(result.get("result"), list):
-                for item in result.get("result") or []:
-                    nested = self._coerce_history_rows(item)
-                    if nested:
-                        return nested
-
-            timestamps = result.get("timestamp") or result.get("timestamps") or result.get("time")
-            if isinstance(timestamps, list) and timestamps:
-                indicators = result.get("indicators") if isinstance(result.get("indicators"), Mapping) else {}
-                quote = None
-                if isinstance(indicators.get("quote"), list) and indicators.get("quote"):
-                    quote = indicators.get("quote")[0]
-                adj = None
-                if isinstance(indicators.get("adjclose"), list) and indicators.get("adjclose"):
-                    adj = indicators.get("adjclose")[0]
-                if isinstance(quote, Mapping):
-                    rows = self._rows_from_parallel_series(
-                        timestamps=timestamps,
-                        opens=list(quote.get("open") or []),
-                        highs=list(quote.get("high") or []),
-                        lows=list(quote.get("low") or []),
-                        closes=list(quote.get("close") or []),
-                        volumes=list(quote.get("volume") or []),
-                        adjcloses=list(adj.get("adjclose") or []) if isinstance(adj, Mapping) else None,
-                    )
-                    if rows:
-                        return rows
-
-            # Generic parallel-array payloads
-            if any(isinstance(result.get(k), list) for k in ("close", "open", "high", "low", "volume")):
-                ts = result.get("timestamp") or list(range(len(result.get("close") or result.get("price") or [])))
-                rows = self._rows_from_parallel_series(
-                    timestamps=list(ts or []),
-                    opens=list(result.get("open") or []),
-                    highs=list(result.get("high") or []),
-                    lows=list(result.get("low") or []),
-                    closes=list(result.get("close") or result.get("adjclose") or result.get("price") or result.get("value") or []),
-                    volumes=list(result.get("volume") or []),
-                    adjcloses=list(result.get("adjclose") or []),
-                )
-                if rows:
-                    return rows
-
-            # AlphaVantage-style keyed time series
-            for key in ("Time Series (Daily)", "time_series", "series"):
-                series = result.get(key)
-                if isinstance(series, Mapping):
-                    rows: List[Dict[str, Any]] = []
-                    for ts, entry in series.items():
-                        if not isinstance(entry, Mapping):
-                            continue
-                        rows.append({
-                            "timestamp": ts,
-                            "open": entry.get("1. open") or entry.get("open"),
-                            "high": entry.get("2. high") or entry.get("high"),
-                            "low": entry.get("3. low") or entry.get("low"),
-                            "close": entry.get("4. close") or entry.get("close"),
-                            "volume": entry.get("5. volume") or entry.get("volume"),
-                        })
-                    if rows:
-                        rows.sort(key=lambda r: _safe_str(r.get("timestamp")))
-                        return rows
-
             for key in ("history", "bars", "candles", "prices", "data", "items", "rows", "chart"):
                 if key in result:
                     nested = self._coerce_history_rows(result.get(key))
@@ -3017,27 +2683,7 @@ class DataEngineV5:
         if module is None:
             return {}
         callables = []
-        for name in (
-            "get_history",
-            "fetch_history",
-            "get_price_history",
-            "fetch_price_history",
-            "history",
-            "get_chart",
-            "fetch_chart",
-            "get_chart_history",
-            "fetch_chart_history",
-            "get_historical_data",
-            "fetch_historical_data",
-            "get_history_rows",
-            "fetch_history_rows",
-            "get_timeseries",
-            "fetch_timeseries",
-            "get_series",
-            "fetch_series",
-            "get_ohlcv",
-            "fetch_ohlcv",
-        ):
+        for name in ("get_history", "fetch_history", "get_price_history", "fetch_price_history", "history", "get_chart", "fetch_chart", "get_ohlcv", "fetch_ohlcv"):
             fn = getattr(module, name, None)
             if callable(fn):
                 callables.append(fn)
@@ -3046,12 +2692,8 @@ class DataEngineV5:
         variants = [
             ((symbol,), {"period": "1y", "interval": "1d"}),
             ((symbol,), {"range": "1y", "interval": "1d"}),
-            ((symbol,), {"lookback": "1y", "interval": "1d"}),
             ((), {"symbol": symbol, "period": "1y", "interval": "1d"}),
             ((), {"ticker": symbol, "period": "1y", "interval": "1d"}),
-            ((), {"code": symbol, "period": "1y", "interval": "1d"}),
-            ((), {"symbol": symbol, "range": "1y", "interval": "1d"}),
-            ((), {"ticker": symbol, "range": "1y", "interval": "1d"}),
             ((symbol,), {}),
         ]
         for fn in callables:
@@ -3071,20 +2713,7 @@ class DataEngineV5:
         return {}
 
     async def _get_history_patch_best_effort(self, symbol: str, providers: Sequence[str]) -> Dict[str, Any]:
-        candidates: List[str] = []
-        for provider in list(providers or []):
-            if provider and provider not in candidates:
-                candidates.append(provider)
-
-        preferred_history = list(self.history_fallback_providers or [])
-        if symbol.endswith("=F") or symbol.endswith("=X"):
-            preferred_history = ["yahoo_chart", "yahoo", "eodhd", "finnhub"] + preferred_history
-
-        for provider in preferred_history:
-            if provider and provider not in candidates and provider in self.enabled_providers + preferred_history:
-                candidates.append(provider)
-
-        for provider in candidates:
+        for provider in providers:
             patch = await self._fetch_history_patch(provider, symbol)
             if patch:
                 return patch
@@ -3147,7 +2776,6 @@ class DataEngineV5:
                 "last_updated_utc": _now_utc_iso(),
                 "last_updated_riyadh": _now_riyadh_iso(),
             }
-            row = _apply_symbol_context_defaults(row, symbol=_safe_str(symbol))
             _compute_scores_fallback(row)
             _compute_recommendation(row)
             return UnifiedQuote(**row)
@@ -3174,7 +2802,7 @@ class DataEngineV5:
                 "symbol": norm,
                 "symbol_normalized": norm,
                 "requested_symbol": _safe_str(symbol),
-                "name": _infer_display_name_from_symbol(norm) or norm,
+                "name": norm,
                 "current_price": None,
                 "data_sources": [],
                 "provider_latency": {},
@@ -3183,13 +2811,7 @@ class DataEngineV5:
                 "last_updated_riyadh": _now_riyadh_iso(),
             }
 
-        row = _apply_symbol_context_defaults(row, symbol=norm)
-
         missing_history_fields = [
-            "current_price",
-            "previous_close",
-            "day_high",
-            "day_low",
             "week_52_high",
             "week_52_low",
             "avg_volume_10d",
@@ -3205,12 +2827,6 @@ class DataEngineV5:
             hist_patch = await self._get_history_patch_best_effort(norm, providers)
             if hist_patch:
                 row = self._merge(symbol, norm, patches_ok + [(hist_patch.get("data_provider") or "history", hist_patch, 0.0)])
-                row = _apply_symbol_context_defaults(row, symbol=norm)
-
-        if _as_float(row.get("current_price")) is not None and _safe_str(row.get("warnings")).lower() == "no live provider data available":
-            row["warnings"] = "Recovered from history/chart fallback"
-        elif _as_float(row.get("current_price")) is None and not row.get("warnings"):
-            row["warnings"] = "No live quote payload and no usable history fallback"
 
         _compute_scores_fallback(row)
         _compute_recommendation(row)
@@ -3455,93 +3071,6 @@ class DataEngineV5:
                 )
 
         return rows[:limit]
-
-    def _top10_sort_key(self, row: Dict[str, Any]) -> Tuple[float, ...]:
-        return (
-            _as_float(row.get("opportunity_score")) or float("-inf"),
-            _as_float(row.get("overall_score")) or float("-inf"),
-            _as_float(row.get("confidence_score")) or float("-inf"),
-            _as_float(row.get("expected_roi_3m")) or float("-inf"),
-            _as_float(row.get("expected_roi_12m")) or float("-inf"),
-            _as_float(row.get("value_score")) or float("-inf"),
-            _as_float(row.get("quality_score")) or float("-inf"),
-            _as_float(row.get("momentum_score")) or float("-inf"),
-            _as_float(row.get("growth_score")) or float("-inf"),
-            _as_float(row.get("current_price")) or float("-inf"),
-        )
-
-    async def _build_top10_rows_fallback(
-        self,
-        headers: Sequence[str],
-        keys: Sequence[str],
-        body: Optional[Dict[str, Any]],
-        limit: int,
-        mode: str = "",
-    ) -> Tuple[List[str], List[str], List[Dict[str, Any]]]:
-        body = dict(body or {})
-        criteria = dict(body.get("criteria") or {}) if isinstance(body.get("criteria"), dict) else {}
-        out_headers, out_keys = _ensure_top10_contract(headers, keys)
-
-        top_n = max(1, min(int(criteria.get("top_n") or body.get("top_n") or 10), max(1, limit)))
-        requested_pages = _extract_top10_pages_from_body(body) or list(TOP10_ENGINE_DEFAULT_PAGES)
-        requested_symbols = _extract_requested_symbols_from_body(body, limit=max(limit * 10, 200))
-
-        for page_name in requested_pages:
-            if len(requested_symbols) >= max(limit * 10, 200):
-                break
-            syms = await self.get_sheet_symbols(page_name, limit=max(limit * 2, 25), body=body)
-            if syms:
-                requested_symbols.extend(syms)
-
-        if not requested_symbols:
-            requested_symbols = list(EMERGENCY_PAGE_SYMBOLS.get("Top_10_Investments") or [])
-
-        requested_symbols = _normalize_symbol_list(requested_symbols, limit=max(limit * 10, 200))
-        if not requested_symbols:
-            return out_headers, out_keys, []
-
-        quotes = await self.get_enriched_quotes(requested_symbols, schema=None)
-        rows: List[Dict[str, Any]] = []
-        for q in quotes:
-            row = _model_to_dict(q)
-            row = _apply_page_row_backfill("Top_10_Investments", row)
-            _compute_scores_fallback(row)
-            _compute_recommendation(row)
-            rows.append(row)
-
-        if not rows:
-            return out_headers, out_keys, []
-
-        _apply_rank_overall(rows)
-        rows.sort(key=self._top10_sort_key, reverse=True)
-
-        criteria_snapshot = _top10_criteria_snapshot({
-            **criteria,
-            "pages_selected": requested_pages,
-            "direct_symbols": requested_symbols,
-            "top_n": top_n,
-        })
-
-        selected: List[Dict[str, Any]] = []
-        seen: Set[str] = set()
-        for row in rows:
-            sym = normalize_symbol(_safe_str(row.get("symbol") or row.get("ticker") or row.get("requested_symbol")))
-            dedupe_key = sym or _safe_str(row.get("name")) or f"row_{len(selected)+1}"
-            if dedupe_key in seen:
-                continue
-            seen.add(dedupe_key)
-            row["top10_rank"] = len(selected) + 1
-            row["selection_reason"] = row.get("selection_reason") or _top10_selection_reason(row)
-            row["criteria_snapshot"] = row.get("criteria_snapshot") or criteria_snapshot
-            projected = _normalize_to_schema_keys(out_keys, out_headers, row)
-            projected["top10_rank"] = row["top10_rank"]
-            projected["selection_reason"] = row["selection_reason"]
-            projected["criteria_snapshot"] = row["criteria_snapshot"]
-            selected.append(_strict_project_row(out_keys, projected))
-            if len(selected) >= top_n:
-                break
-
-        return out_headers, out_keys, selected
 
     # ------------------------------------------------------------------
     # main sheet/page APIs
@@ -3921,16 +3450,13 @@ class DataEngineV5:
                         if sym:
                             quote_map[sym] = d
 
-                snapshot_map = self._get_cached_snapshot_symbol_map(target_sheet)
-
                 for row in ext_rows:
                     merged = dict(row)
                     sym = normalize_symbol(self._extract_row_symbol(row))
-                    if sym and sym in snapshot_map:
-                        merged = _merge_missing_fields(merged, snapshot_map[sym])
                     if sym and sym in quote_map:
-                        merged = _merge_missing_fields(merged, quote_map[sym])
-                    merged = _apply_page_row_backfill(target_sheet, merged)
+                        for k, v in quote_map[sym].items():
+                            if merged.get(k) in (None, "", [], {}):
+                                merged[k] = v
                     _compute_scores_fallback(merged)
                     _compute_recommendation(merged)
                     enriched_rows.append(_strict_project_row(out_keys, _normalize_to_schema_keys(out_keys, out_headers, merged)))
@@ -3995,16 +3521,9 @@ class DataEngineV5:
 
         rows_full: List[Dict[str, Any]] = []
         if requested_symbols:
-            snapshot_map = self._get_cached_snapshot_symbol_map(target_sheet)
             quotes = await self.get_enriched_quotes(requested_symbols, schema=None)
             for q in quotes:
                 row = _model_to_dict(q)
-                sym = normalize_symbol(_safe_str(row.get("symbol") or row.get("requested_symbol")))
-                if sym and sym in snapshot_map:
-                    row = _merge_missing_fields(row, snapshot_map[sym])
-                row = _apply_page_row_backfill(target_sheet, row)
-                _compute_scores_fallback(row)
-                _compute_recommendation(row)
                 rows_full.append(_strict_project_row(out_keys, _normalize_to_schema_keys(out_keys, out_headers, row)))
             _apply_rank_overall(rows_full)
 
@@ -4093,7 +3612,6 @@ class DataEngineV5:
             "enabled_providers": list(self.enabled_providers),
             "ksa_providers": list(self.ksa_providers),
             "global_providers": list(self.global_providers),
-            "history_fallback_providers": list(self.history_fallback_providers),
             "ksa_disallow_eodhd": bool(self.ksa_disallow_eodhd),
             "flags": dict(self.flags),
             "provider_stats": await self._registry.get_stats(),
@@ -4107,20 +3625,6 @@ class DataEngineV5:
             "sheet_symbol_resolution_meta": dict(self._sheet_symbol_resolution_meta),
         }
 
-
-
-def normalize_row_to_schema(sheet: str, row: Dict[str, Any], keep_extras: bool = False) -> Dict[str, Any]:
-    target = _canonicalize_sheet_name(sheet) or sheet or "Market_Leaders"
-    _spec, headers, keys, _src = _schema_for_sheet(target)
-    if target == "Top_10_Investments":
-        headers, keys = _ensure_top10_contract(headers, keys)
-    normalized = _normalize_to_schema_keys(keys, headers, dict(row or {}))
-    normalized = _apply_page_row_backfill(target, normalized)
-    if keep_extras and isinstance(row, dict):
-        for k, v in row.items():
-            if k not in normalized:
-                normalized[k] = _json_safe(v)
-    return normalized
 
 _ENGINE_INSTANCE: Optional[DataEngineV5] = None
 ENGINE: Optional[DataEngineV5] = None
@@ -4188,5 +3692,4 @@ __all__ = [
     "__version__",
     "STATIC_CANONICAL_SHEET_CONTRACTS",
     "get_sheet_spec",
-    "normalize_row_to_schema",
 ]
