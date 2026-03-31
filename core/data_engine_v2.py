@@ -2,14 +2,20 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.46.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.47.0
 ================================================================================
 
-WHY v5.46.0
+WHY v5.47.0
 -----------
-- FIX: hardens route input normalization so router/query/body aliases like
-       page, sheet_name, name, tab, worksheet, symbols, tickers, params,
-       payload, request, and include_headers no longer break sheet-row calls.
+- FIX: makes provider priority page-aware so non-KSA pages like
+       Global_Markets, Commodities_FX, and Mutual_Funds prefer EODHD first
+       while KSA pages keep their protected local-first routing.
+- FIX: makes quote cache / singleflight keys provider-profile aware so a row
+       cached for one page context does not silently override another page
+       that should use a different primary provider.
+- FIX: threads page context through enriched quote batch builders so
+       Global_Markets, Commodities_FX, and Mutual_Funds consistently use the
+       intended provider order during page builds and fallback hydration.
 - FIX: public engine entrypoints now tolerate extra kwargs from route wrappers
        instead of failing on TypeError before building a canonical envelope.
 - FIX: merges request/query/body dicts into one normalized body so GET and POST
@@ -93,7 +99,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.46.0"
+__version__ = "5.47.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -399,6 +405,8 @@ PAGE_SYMBOL_ENV_KEYS: Dict[str, str] = {
 DEFAULT_PROVIDERS = ["eodhd", "yahoo", "finnhub"]
 DEFAULT_KSA_PROVIDERS = ["tadawul", "argaam", "yahoo"]
 DEFAULT_GLOBAL_PROVIDERS = ["eodhd", "yahoo", "finnhub"]
+NON_KSA_EODHD_PRIMARY_PAGES = {"Global_Markets", "Commodities_FX", "Mutual_Funds"}
+PAGE_PRIMARY_PROVIDER_DEFAULTS = {page: "eodhd" for page in NON_KSA_EODHD_PRIMARY_PAGES}
 PROVIDER_PRIORITIES = {
     "tadawul": 10,
     "argaam": 20,
@@ -2211,6 +2219,23 @@ class DataEngineV5:
         self.enabled_providers = _get_env_list("ENABLED_PROVIDERS", DEFAULT_PROVIDERS)
         self.ksa_providers = _get_env_list("KSA_PROVIDERS", DEFAULT_KSA_PROVIDERS)
         self.global_providers = _get_env_list("GLOBAL_PROVIDERS", DEFAULT_GLOBAL_PROVIDERS)
+        self.non_ksa_primary_provider = (
+            _safe_str(
+                getattr(self.settings, "non_ksa_primary_provider", None) if self.settings is not None else None,
+                _safe_env("NON_KSA_PRIMARY_PROVIDER", "eodhd"),
+            ).lower()
+            or "eodhd"
+        )
+        configured_non_ksa_pages = [
+            _canonicalize_sheet_name(p)
+            for p in _get_env_list("NON_KSA_PRIMARY_PAGES", list(NON_KSA_EODHD_PRIMARY_PAGES))
+            if _safe_str(p)
+        ]
+        self.page_primary_providers = {
+            page: self.non_ksa_primary_provider
+            for page in configured_non_ksa_pages
+            if page
+        }
         self.history_fallback_providers = _get_env_list(
             "HISTORY_FALLBACK_PROVIDERS",
             ["yahoo_chart", "yahoo", "eodhd", "finnhub", "tadawul", "argaam"],
@@ -2871,6 +2896,55 @@ class DataEngineV5:
         return await self._get_symbols_for_sheet_impl(target_sheet, limit=effective_limit, body=normalized_body)
 
     # ------------------------------------------------------------------
+    # quote context / provider preference helpers
+    # ------------------------------------------------------------------
+    def _resolve_quote_page_context(
+        self,
+        *,
+        page: Optional[str] = None,
+        sheet: Optional[str] = None,
+        body: Optional[Dict[str, Any]] = None,
+        schema: Any = None,
+        extras: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        merged = _merge_route_body_dicts(body, extras or {})
+        target_raw = (
+            page
+            or sheet
+            or _safe_str(merged.get("page"))
+            or _safe_str(merged.get("sheet"))
+            or _safe_str(merged.get("sheet_name"))
+            or _safe_str(merged.get("page_name"))
+            or _safe_str(merged.get("name"))
+            or _safe_str(merged.get("tab"))
+            or _safe_str(merged.get("worksheet"))
+        )
+        if not target_raw and isinstance(schema, str):
+            target_raw = schema
+        return _canonicalize_sheet_name(target_raw) if target_raw else ""
+
+    def _page_primary_provider_for(self, symbol: str, page: str = "") -> str:
+        info = get_symbol_info(symbol)
+        is_ksa_sym = bool(info.get("is_ksa"))
+        page_ctx = _canonicalize_sheet_name(page) if page else ""
+        if (
+            not is_ksa_sym
+            and page_ctx
+            and page_ctx in self.page_primary_providers
+        ):
+            candidate = _safe_str(self.page_primary_providers.get(page_ctx), self.non_ksa_primary_provider).lower()
+            if candidate:
+                return candidate
+        return self.primary_provider
+
+    def _provider_profile_key(self, symbol: str, page: str = "") -> str:
+        info = get_symbol_info(symbol)
+        page_ctx = _canonicalize_sheet_name(page) if page else ""
+        primary = self._page_primary_provider_for(symbol, page_ctx)
+        market = "ksa" if bool(info.get("is_ksa")) else "global"
+        return f"{market}|{page_ctx or 'default'}|{primary or 'none'}"
+
+    # ------------------------------------------------------------------
     # quote APIs
     # ------------------------------------------------------------------
     async def _fetch_patch(self, provider: str, symbol: str) -> Tuple[str, Optional[Dict[str, Any]], float, Optional[str]]:
@@ -2923,12 +2997,14 @@ class DataEngineV5:
             await self._registry.record_failure(provider, err)
             return provider, None, latency, err
 
-    def _providers_for(self, symbol: str) -> List[str]:
+    def _providers_for(self, symbol: str, page: str = "") -> List[str]:
         info = get_symbol_info(symbol)
         is_ksa_sym = bool(info.get("is_ksa"))
+        page_ctx = _canonicalize_sheet_name(page) if page else ""
 
         def _provider_allowed(provider: str) -> bool:
-            if provider not in self.enabled_providers:
+            provider = _safe_str(provider).lower()
+            if not provider or provider not in self.enabled_providers:
                 return False
             if is_ksa_sym and self.ksa_disallow_eodhd and provider == "eodhd":
                 return False
@@ -2936,17 +3012,26 @@ class DataEngineV5:
 
         providers = [p for p in (self.ksa_providers if is_ksa_sym else self.global_providers) if _provider_allowed(p)]
 
-        if self.primary_provider and _provider_allowed(self.primary_provider):
-            if self.primary_provider in providers:
-                providers = [p for p in providers if p != self.primary_provider]
-            providers.insert(0, self.primary_provider)
+        primary_provider = self._page_primary_provider_for(symbol, page_ctx)
+        if primary_provider and _provider_allowed(primary_provider):
+            if primary_provider in providers:
+                providers = [p for p in providers if p != primary_provider]
+            providers.insert(0, primary_provider)
+
+        # Preserve paid EODHD priority for configured non-KSA/global pages even
+        # when settings or env put another global provider first.
+        if (not is_ksa_sym) and page_ctx and page_ctx in self.page_primary_providers and _provider_allowed("eodhd"):
+            providers = [p for p in providers if p != "eodhd"]
+            providers.insert(0, "eodhd")
 
         seen: Set[str] = set()
         out: List[str] = []
         for p in providers:
-            if p not in seen:
-                seen.add(p)
-                out.append(p)
+            p2 = _safe_str(p).lower()
+            if not p2 or p2 in seen:
+                continue
+            seen.add(p2)
+            out.append(p2)
         return out
 
     def _rows_from_parallel_series(
@@ -3263,18 +3348,24 @@ class DataEngineV5:
                     continue
         return {}
 
-    async def _get_history_patch_best_effort(self, symbol: str, providers: Sequence[str]) -> Dict[str, Any]:
+    async def _get_history_patch_best_effort(self, symbol: str, providers: Sequence[str], page: str = "") -> Dict[str, Any]:
         candidates: List[str] = []
         for provider in list(providers or []):
             if provider and provider not in candidates:
                 candidates.append(provider)
 
+        page_ctx = _canonicalize_sheet_name(page) if page else ""
         preferred_history = list(self.history_fallback_providers or [])
-        if symbol.endswith("=F") or symbol.endswith("=X"):
+        primary_provider = self._page_primary_provider_for(symbol, page_ctx)
+
+        if (not get_symbol_info(symbol).get("is_ksa")) and page_ctx and page_ctx in self.page_primary_providers:
+            preferred_history = [primary_provider, "yahoo_chart", "yahoo", "eodhd", "finnhub"] + preferred_history
+        elif symbol.endswith("=F") or symbol.endswith("=X"):
             preferred_history = ["yahoo_chart", "yahoo", "eodhd", "finnhub"] + preferred_history
 
         for provider in preferred_history:
-            if provider and provider not in candidates and provider in self.enabled_providers + preferred_history:
+            provider = _safe_str(provider).lower()
+            if provider and provider not in candidates and (provider in self.enabled_providers or provider in preferred_history):
                 candidates.append(provider)
 
         for provider in candidates:
@@ -3326,7 +3417,7 @@ class DataEngineV5:
             return QuoteQuality.MISSING.value
         return QuoteQuality.GOOD.value if any(row.get(k) is not None for k in ("overall_score", "forecast_price_3m", "pb_ratio")) else QuoteQuality.FAIR.value
 
-    async def _get_enriched_quote_impl(self, symbol: str, use_cache: bool = True) -> UnifiedQuote:
+    async def _get_enriched_quote_impl(self, symbol: str, use_cache: bool = True, *, page: str = "", sheet: str = "", body: Optional[Dict[str, Any]] = None, **kwargs: Any) -> UnifiedQuote:
         info = get_symbol_info(symbol)
         norm = _safe_str(info.get("normalized"))
 
@@ -3345,12 +3436,15 @@ class DataEngineV5:
             _compute_recommendation(row)
             return UnifiedQuote(**row)
 
+        page_context = self._resolve_quote_page_context(page=page, sheet=sheet, body=body, extras=kwargs)
+        provider_profile = self._provider_profile_key(norm, page_context)
+
         if use_cache:
-            cached = await self._cache.get(symbol=norm)
+            cached = await self._cache.get(symbol=norm, provider_profile=provider_profile)
             if isinstance(cached, dict) and cached:
                 return UnifiedQuote(**cached)
 
-        providers = self._providers_for(norm)
+        providers = self._providers_for(norm, page=page_context)
         patches_ok: List[Tuple[str, Dict[str, Any], float]] = []
         if providers:
             gathered = await asyncio.gather(*[self._fetch_patch(p, norm) for p in providers[:4]], return_exceptions=True)
@@ -3395,7 +3489,7 @@ class DataEngineV5:
             "rsi_14",
         ]
         if any(row.get(k) in (None, "", [], {}) for k in missing_history_fields):
-            hist_patch = await self._get_history_patch_best_effort(norm, providers)
+            hist_patch = await self._get_history_patch_best_effort(norm, providers, page=page_context)
             if hist_patch:
                 row = self._merge(symbol, norm, patches_ok + [(hist_patch.get("data_provider") or "history", hist_patch, 0.0)])
                 row = _apply_symbol_context_defaults(row, symbol=norm)
@@ -3412,13 +3506,28 @@ class DataEngineV5:
         q = UnifiedQuote(**row)
 
         if use_cache:
-            await self._cache.set(_model_to_dict(q), symbol=norm)
+            await self._cache.set(_model_to_dict(q), symbol=norm, provider_profile=provider_profile)
 
         return q
 
-    async def get_enriched_quote(self, symbol: str, use_cache: bool = True, *, schema: Any = None) -> UnifiedQuote:
-        key = f"quote:{normalize_symbol(symbol)}:{'cache' if use_cache else 'live'}"
-        raw_q = await self._singleflight.execute(key, lambda: self._get_enriched_quote_impl(symbol, use_cache))
+    async def get_enriched_quote(
+        self,
+        symbol: str,
+        use_cache: bool = True,
+        *,
+        schema: Any = None,
+        page: str = "",
+        sheet: str = "",
+        body: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> UnifiedQuote:
+        page_context = self._resolve_quote_page_context(page=page, sheet=sheet, body=body, schema=schema, extras=kwargs)
+        provider_profile = self._provider_profile_key(normalize_symbol(symbol), page_context)
+        key = f"quote:{normalize_symbol(symbol)}:{provider_profile}:{'cache' if use_cache else 'live'}"
+        raw_q = await self._singleflight.execute(
+            key,
+            lambda: self._get_enriched_quote_impl(symbol, use_cache, page=page_context, body=body, schema=schema, **kwargs),
+        )
         if schema is None:
             return raw_q
         row = _model_to_dict(raw_q)
@@ -3428,24 +3537,58 @@ class DataEngineV5:
             return UnifiedQuote(**projected)
         return raw_q
 
-    async def get_enriched_quote_dict(self, symbol: str, use_cache: bool = True, *, schema: Any = None) -> Dict[str, Any]:
-        q = await self.get_enriched_quote(symbol, use_cache=use_cache, schema=schema)
+    async def get_enriched_quote_dict(
+        self,
+        symbol: str,
+        use_cache: bool = True,
+        *,
+        schema: Any = None,
+        page: str = "",
+        sheet: str = "",
+        body: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        q = await self.get_enriched_quote(symbol, use_cache=use_cache, schema=schema, page=page, sheet=sheet, body=body, **kwargs)
         return _model_to_dict(q)
 
-    async def get_enriched_quotes(self, symbols: List[str], *, schema: Any = None) -> List[UnifiedQuote]:
+    async def get_enriched_quotes(
+        self,
+        symbols: List[str],
+        *,
+        schema: Any = None,
+        page: str = "",
+        sheet: str = "",
+        body: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> List[UnifiedQuote]:
         if not symbols:
             return []
         batch = max(1, min(500, _get_env_int("QUOTE_BATCH_SIZE", 25)))
         out: List[UnifiedQuote] = []
         for i in range(0, len(symbols), batch):
             part = symbols[i:i + batch]
-            out.extend(await asyncio.gather(*[self.get_enriched_quote(s, schema=schema) for s in part]))
+            out.extend(
+                await asyncio.gather(*[
+                    self.get_enriched_quote(s, schema=schema, page=page, sheet=sheet, body=body, **kwargs)
+                    for s in part
+                ])
+            )
         return out
 
-    async def get_enriched_quotes_batch(self, symbols: List[str], mode: str = "", *, schema: Any = None) -> Dict[str, Dict[str, Any]]:
+    async def get_enriched_quotes_batch(
+        self,
+        symbols: List[str],
+        mode: str = "",
+        *,
+        schema: Any = None,
+        page: str = "",
+        sheet: str = "",
+        body: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Dict[str, Dict[str, Any]]:
         out: Dict[str, Dict[str, Any]] = {}
         norm_syms = _normalize_symbol_list(symbols, limit=len(symbols) + 10)
-        quotes = await asyncio.gather(*[self.get_enriched_quote_dict(s, schema=schema) for s in norm_syms])
+        quotes = await asyncio.gather(*[self.get_enriched_quote_dict(s, schema=schema, page=page, sheet=sheet, body=body, **kwargs) for s in norm_syms])
         for req_sym, qd in zip(norm_syms, quotes):
             out[req_sym] = qd
             norm = _safe_str(qd.get("symbol_normalized") or qd.get("symbol"))
@@ -3535,7 +3678,7 @@ class DataEngineV5:
         if not symbols:
             symbols = list(EMERGENCY_PAGE_SYMBOLS.get("Market_Leaders", [])[: max(limit, 6)])
 
-        quotes = await self.get_enriched_quotes(symbols, schema=None)
+        quotes = await self.get_enriched_quotes(symbols, schema=None, page="Insights_Analysis", body=body)
         quote_rows = [_model_to_dict(q) for q in quotes]
         quote_rows = [r for r in quote_rows if isinstance(r, dict)]
         quote_rows.sort(
@@ -3693,7 +3836,7 @@ class DataEngineV5:
         if not requested_symbols:
             return out_headers, out_keys, []
 
-        quotes = await self.get_enriched_quotes(requested_symbols, schema=None)
+        quotes = await self.get_enriched_quotes(requested_symbols, schema=None, page="Top_10_Investments", body=body)
         rows: List[Dict[str, Any]] = []
         for q in quotes:
             row = _model_to_dict(q)
@@ -4139,7 +4282,7 @@ class DataEngineV5:
                 quote_map: Dict[str, Dict[str, Any]] = {}
 
                 if self.rows_hydrate_external and symbols:
-                    for q in await self.get_enriched_quotes(symbols, schema=None):
+                    for q in await self.get_enriched_quotes(symbols, schema=None, page=target_sheet, body=body):
                         d = _model_to_dict(q)
                         sym = normalize_symbol(_safe_str(d.get("symbol")))
                         if sym:
@@ -4220,7 +4363,7 @@ class DataEngineV5:
         rows_full: List[Dict[str, Any]] = []
         if requested_symbols:
             snapshot_map = self._get_cached_snapshot_symbol_map(target_sheet)
-            quotes = await self.get_enriched_quotes(requested_symbols, schema=None)
+            quotes = await self.get_enriched_quotes(requested_symbols, schema=None, page=target_sheet, body=body)
             for q in quotes:
                 row = _model_to_dict(q)
                 sym = normalize_symbol(_safe_str(row.get("symbol") or row.get("requested_symbol")))
@@ -4349,6 +4492,8 @@ class DataEngineV5:
             "enabled_providers": list(self.enabled_providers),
             "ksa_providers": list(self.ksa_providers),
             "global_providers": list(self.global_providers),
+            "non_ksa_primary_provider": self.non_ksa_primary_provider,
+            "page_primary_providers": dict(self.page_primary_providers),
             "history_fallback_providers": list(self.history_fallback_providers),
             "ksa_disallow_eodhd": bool(self.ksa_disallow_eodhd),
             "flags": dict(self.flags),
