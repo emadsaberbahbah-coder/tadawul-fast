@@ -2,10 +2,10 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.47.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.47.1
 ================================================================================
 
-WHY v5.47.0
+WHY v5.47.1
 -----------
 - FIX: makes provider priority page-aware so non-KSA pages like
        Global_Markets, Commodities_FX, and Mutual_Funds prefer EODHD first
@@ -48,6 +48,13 @@ WHY v5.47.0
        previously cached richer rows can safely fill missing schema fields.
 - FIX: exposes display-header object payloads alongside canonical key-based
        row objects to make diagnostics and route wrappers easier to validate.
+- FIX: bridges EODHD-style aliases used by the new global provider revision,
+       including forward_pe -> pe_forward, day_open -> open_price,
+       fcf_ttm -> free_cash_flow_ttm, d_e_ratio -> debt_to_equity,
+       and avg_vol_* -> avg_volume_*.
+- FIX: strengthens page-aware backfill for Mutual_Funds and Commodities_FX so
+       identity/context fields stay populated without fabricating missing
+       equity-only fundamentals.
 
 Design goals
 ------------
@@ -99,7 +106,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.47.0"
+__version__ = "5.47.1"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -1153,9 +1160,9 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "country": ("country", "countryName", "country_code", "countryCode", "localeCountry"),
     "sector": ("sector", "sectorDisp", "gicsSector", "industryGroup"),
     "industry": ("industry", "industryDisp", "gicsIndustry", "category"),
-    "current_price": ("current_price", "price", "last", "lastPrice", "latestPrice", "regularMarketPrice", "nav", "close"),
+    "current_price": ("current_price", "currentPrice", "price", "last", "lastPrice", "latestPrice", "regularMarketPrice", "nav", "close", "adjusted_close", "adjclose"),
     "previous_close": ("previous_close", "previousClose", "regularMarketPreviousClose", "prevClose", "priorClose"),
-    "open_price": ("open_price", "open", "openPrice", "regularMarketOpen"),
+    "open_price": ("open_price", "day_open", "dayOpen", "open", "openPrice", "regularMarketOpen"),
     "day_high": ("day_high", "high", "dayHigh", "regularMarketDayHigh", "sessionHigh"),
     "day_low": ("day_low", "low", "dayLow", "regularMarketDayLow", "sessionLow"),
     "week_52_high": ("week_52_high", "52WeekHigh", "fiftyTwoWeekHigh", "yearHigh", "week52High"),
@@ -1163,13 +1170,13 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "price_change": ("price_change", "change", "priceChange", "regularMarketChange", "netChange"),
     "percent_change": ("percent_change", "changePercent", "percentChange", "regularMarketChangePercent", "pctChange", "change_pct"),
     "volume": ("volume", "regularMarketVolume", "sharesTraded", "tradeVolume"),
-    "avg_volume_10d": ("avg_volume_10d", "averageVolume10days", "avgVolume10Day", "avgVol10d"),
-    "avg_volume_30d": ("avg_volume_30d", "averageVolume", "averageDailyVolume3Month", "avgVolume3Month", "avgVol30d"),
+    "avg_volume_10d": ("avg_volume_10d", "avg_vol_10d", "averageVolume10days", "avgVolume10Day", "avgVol10d"),
+    "avg_volume_30d": ("avg_volume_30d", "avg_vol_30d", "averageVolume", "averageDailyVolume3Month", "avgVolume3Month", "avgVol30d"),
     "market_cap": ("market_cap", "marketCap", "marketCapitalization"),
     "float_shares": ("float_shares", "floatShares", "sharesFloat"),
     "beta_5y": ("beta_5y", "beta", "beta5Y"),
     "pe_ttm": ("pe_ttm", "trailingPE", "peRatio", "priceEarningsTTM", "pe"),
-    "pe_forward": ("pe_forward", "forwardPE", "forwardPe"),
+    "pe_forward": ("pe_forward", "forward_pe", "forwardPE", "forwardPe"),
     "eps_ttm": ("eps_ttm", "trailingEps", "eps", "earningsPerShare", "epsTTM"),
     "dividend_yield": ("dividend_yield", "dividendYield", "trailingAnnualDividendYield", "distributionYield"),
     "payout_ratio": ("payout_ratio", "payoutRatio"),
@@ -1178,8 +1185,8 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "gross_margin": ("gross_margin", "grossMargins", "grossMargin"),
     "operating_margin": ("operating_margin", "operatingMargins", "operatingMargin"),
     "profit_margin": ("profit_margin", "profitMargins", "profitMargin", "netMargin"),
-    "debt_to_equity": ("debt_to_equity", "debtToEquity", "deRatio"),
-    "free_cash_flow_ttm": ("free_cash_flow_ttm", "freeCashflow", "freeCashFlow", "fcf"),
+    "debt_to_equity": ("debt_to_equity", "d_e_ratio", "debtToEquity", "deRatio"),
+    "free_cash_flow_ttm": ("free_cash_flow_ttm", "fcf_ttm", "freeCashflow", "freeCashFlow", "fcf"),
     "rsi_14": ("rsi_14", "rsi", "rsi14"),
     "volatility_30d": ("volatility_30d", "volatility30d", "vol30d"),
     "volatility_90d": ("volatility_90d", "volatility90d", "vol90d"),
@@ -1618,10 +1625,23 @@ def _apply_page_row_backfill(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
         if out.get("warnings") in (None, "") and _as_float(out.get("current_price")) is None:
             out["warnings"] = "Live quote sparse; chart/history fallback unavailable"
 
-    if target == "Mutual_Funds" and out.get("asset_class") in (None, ""):
-        out["asset_class"] = "Fund"
-        out.setdefault("sector", "Diversified")
-        out.setdefault("industry", "Mutual Funds")
+    if target == "Mutual_Funds":
+        if out.get("asset_class") in (None, ""):
+            out["asset_class"] = "Fund"
+        if out.get("sector") in (None, ""):
+            out["sector"] = "Diversified"
+        if out.get("industry") in (None, ""):
+            out["industry"] = "Mutual Funds"
+        if out.get("country") in (None, ""):
+            out["country"] = _infer_country_from_symbol(sym)
+        if out.get("exchange") in (None, ""):
+            out["exchange"] = _infer_exchange_from_symbol(sym)
+        if out.get("currency") in (None, ""):
+            out["currency"] = _infer_currency_from_symbol(sym)
+        if out.get("invest_period_label") in (None, ""):
+            out["invest_period_label"] = "1Y"
+        if out.get("horizon_days") in (None, ""):
+            out["horizon_days"] = 365
 
     return out
 
