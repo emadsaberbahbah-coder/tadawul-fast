@@ -2,7 +2,7 @@
 """
 routes/advanced_analysis.py
 --------------------------------------------------------------------------------
-TADAWUL ADVANCED ANALYSIS ROUTER — v7.7.0
+TADAWUL ADVANCED ANALYSIS ROUTER — v7.8.0
 (ROOT /SHEET-ROWS HARDENING / ENGINE-CONTRACT ALIGNMENT /
  SPECIAL-PAGE FAIL-SOFT / DATA-DICTIONARY GUARANTEE / JSON-SAFE / ASYNC-SAFE)
 
@@ -16,11 +16,13 @@ What this revision improves
 - FIX: root /sheet-rows keeps a guaranteed non-empty fail-soft path for
        instrument pages, Insights_Analysis, Top_10_Investments, and Data_Dictionary.
 - FIX: Data_Dictionary never bubbles builder issues as 5xx.
+- FIX: adds explicit timeout guards for special-page engine/builder/rehydrate awaits.
 - FIX: schema endpoints keep exposing top-level pages/specs/headers/keys/columns.
 --------------------------------------------------------------------------------
 """
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import math
@@ -42,7 +44,7 @@ from fastapi.routing import APIRouter
 logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
-ADVANCED_ANALYSIS_VERSION = "7.7.0"
+ADVANCED_ANALYSIS_VERSION = "7.8.0"
 SCHEMA_ROUTE_OWNER = "advanced_analysis"
 SCHEMA_ROUTE_FAMILY = "schema"
 ROOT_SHEET_ROWS_OWNER = "advanced_analysis"
@@ -187,6 +189,35 @@ def _safe_int(v: Any, default: int) -> int:
         return int(float(v))
     except Exception:
         return default
+
+
+def _safe_float(v: Any, default: float) -> float:
+    try:
+        if v is None or isinstance(v, bool):
+            return default
+        value = float(v)
+        if math.isnan(value) or math.isinf(value):
+            return default
+        return value
+    except Exception:
+        return default
+
+
+def _special_timeout_env(name: str, default: float) -> float:
+    return max(0.25, _safe_float(os.getenv(name), default))
+
+
+SPECIAL_PAGE_ENGINE_TIMEOUT_SEC = _special_timeout_env("TFB_SPECIAL_PAGE_ENGINE_TIMEOUT_SEC", 8.0)
+SPECIAL_PAGE_BUILDER_TIMEOUT_SEC = _special_timeout_env("TFB_SPECIAL_PAGE_BUILDER_TIMEOUT_SEC", 10.0)
+SPECIAL_PAGE_REHYDRATE_TIMEOUT_SEC = _special_timeout_env("TFB_SPECIAL_PAGE_REHYDRATE_TIMEOUT_SEC", 8.0)
+
+
+async def _await_with_timeout(awaitable: Any, timeout_sec: float, label: str) -> Any:
+    try:
+        async with asyncio.timeout(max(0.25, float(timeout_sec))):
+            return await awaitable
+    except TimeoutError as e:
+        raise TimeoutError(f"{label} timed out after {timeout_sec:.2f}s") from e
 
 
 def _boolish(v: Any, default: bool = False) -> bool:
@@ -1696,93 +1727,170 @@ async def _run_advanced_sheet_rows_impl(
 
     # Special pages: compare engine and builder outputs, keep the best, never 5xx.
     if sheet in {"Insights_Analysis", "Top_10_Investments"}:
-        result_engine = None
-        score_engine = -9999
-        if engine is not None:
-            try:
-                result_engine = await _engine_fetch_any(engine, sheet=sheet, fetch_limit=fetch_limit, mode=mode or "", body=body)
-                score_engine = _payload_quality_score(result_engine, page=sheet)
-            except Exception as e:
-                logger.warning("%s engine fetch failed: %s", sheet, e)
+        try:
+            result_engine = None
+            score_engine = -9999
+            special_error_parts: List[str] = []
 
-        if sheet == "Insights_Analysis":
-            builder_modules = ("core.analysis.insights_builder", "core.analysis.insights_analysis", "routes.investment_advisor")
-            builder_functions = ("build_insights_analysis_rows", "build_insights_rows", "build_insights_output_rows", "build_insights_analysis", "get_insights_rows", "build_rows")
-        else:
-            builder_modules = ("core.analysis.top10_selector", "core.analysis.top10_builder", "core.analysis.top_10_builder", "core.analysis.top10_investments_builder", "core.analysis.top_10_investments_builder", "routes.investment_advisor")
-            builder_functions = ("build_top10_rows", "build_top10_output_rows", "build_top10_investments_rows", "build_top_10_investments_rows", "get_top10_rows", "select_top10", "select_top10_symbols", "build_rows")
-
-        result_builder, builder_meta = await _call_builder_best_effort(
-            module_names=builder_modules,
-            function_names=builder_functions,
-            request=request,
-            settings=settings,
-            engine=engine,
-            mode=mode or "",
-            body=body,
-            page=sheet,
-            fetch_limit=fetch_limit,
-            schema=schema,
-            schema_headers=schema_headers,
-            schema_keys=schema_keys,
-            friendly_name=sheet,
-        )
-        score_builder = _payload_quality_score(result_builder, page=sheet) if result_builder is not None else -9999
-
-        chosen = result_engine if score_engine >= score_builder else result_builder
-        chosen_dispatch = "engine_special_best" if score_engine >= score_builder else "builder_special_best"
-        if chosen is None:
-            chosen = {"status": "partial", "row_objects": [], "error": f"{sheet} builder and engine returned no payload"}
-
-        # Rehydrate symbols-only builder result for Top10 if necessary.
-        if sheet == "Top_10_Investments" and not _payload_has_real_rows(chosen):
-            syms = _extract_requested_symbols(body, limit=fetch_limit)
-            if not syms:
-                syms = await _resolve_engine_symbols_for_sheet(engine, sheet, body, fetch_limit)
-            if syms and engine is not None:
+            if engine is not None:
                 try:
-                    data_map = await _fetch_analysis_rows(engine, syms[:fetch_limit], mode=mode or "", schema=schema)
-                    rebuilt: List[Dict[str, Any]] = []
-                    for idx, sym in enumerate(syms[:fetch_limit], start=1):
-                        raw = data_map.get(sym) or {"symbol": sym, "ticker": sym}
-                        rr = _normalize_to_schema_keys(schema_keys=schema_keys, schema_headers=schema_headers, raw=dict(raw))
-                        rr.setdefault("top10_rank", idx)
-                        rr.setdefault("selection_reason", "Selected by Top10 fallback rehydrate.")
-                        rr.setdefault("criteria_snapshot", "{}")
-                        rebuilt.append(_project_row(schema_keys, rr))
-                    chosen = {"status": "partial", "row_objects": rebuilt, "meta": {"symbols_rehydrated": True, "rehydrated_count": len(rebuilt)}}
-                    chosen_dispatch = "top10_rehydrated_from_symbols"
+                    result_engine = await _await_with_timeout(
+                        _engine_fetch_any(engine, sheet=sheet, fetch_limit=fetch_limit, mode=mode or "", body=body),
+                        SPECIAL_PAGE_ENGINE_TIMEOUT_SEC,
+                        f"{sheet} engine fetch",
+                    )
+                    score_engine = _payload_quality_score(result_engine, page=sheet)
                 except Exception as e:
-                    logger.warning("Top10 symbol rehydrate failed: %s", e)
+                    special_error_parts.append(f"engine={e}")
+                    logger.warning("%s engine fetch failed softly: %s", sheet, e)
 
-        if not _payload_has_real_rows(chosen):
+            if sheet == "Insights_Analysis":
+                builder_modules = ("core.analysis.insights_builder", "core.analysis.insights_analysis", "routes.investment_advisor")
+                builder_functions = ("build_insights_analysis_rows", "build_insights_rows", "build_insights_output_rows", "build_insights_analysis", "get_insights_rows", "build_rows")
+            else:
+                builder_modules = ("core.analysis.top10_selector", "core.analysis.top10_builder", "core.analysis.top_10_builder", "core.analysis.top10_investments_builder", "core.analysis.top_10_investments_builder", "routes.investment_advisor")
+                builder_functions = ("build_top10_rows", "build_top10_output_rows", "build_top10_investments_rows", "build_top_10_investments_rows", "get_top10_rows", "select_top10", "select_top10_symbols", "build_rows")
+
+            builder_meta: Dict[str, Any] = {}
+            result_builder = None
+            try:
+                result_builder, builder_meta = await _await_with_timeout(
+                    _call_builder_best_effort(
+                        module_names=builder_modules,
+                        function_names=builder_functions,
+                        request=request,
+                        settings=settings,
+                        engine=engine,
+                        mode=mode or "",
+                        body=body,
+                        page=sheet,
+                        fetch_limit=fetch_limit,
+                        schema=schema,
+                        schema_headers=schema_headers,
+                        schema_keys=schema_keys,
+                        friendly_name=sheet,
+                    ),
+                    SPECIAL_PAGE_BUILDER_TIMEOUT_SEC,
+                    f"{sheet} builder call",
+                )
+            except Exception as e:
+                builder_meta = {"builder_call_failed": True, "builder_error": str(e)}
+                special_error_parts.append(f"builder={e}")
+                logger.warning("%s builder failed softly: %s", sheet, e)
+
+            score_builder = _payload_quality_score(result_builder, page=sheet) if result_builder is not None else -9999
+
+            chosen = result_engine if score_engine >= score_builder else result_builder
+            chosen_dispatch = "engine_special_best" if score_engine >= score_builder else "builder_special_best"
+            if chosen is None:
+                chosen = {"status": "partial", "row_objects": [], "error": f"{sheet} builder and engine returned no payload"}
+
+            # Rehydrate symbols-only builder result for Top10 if necessary.
+            if sheet == "Top_10_Investments" and not _payload_has_real_rows(chosen):
+                syms = _extract_requested_symbols(body, limit=fetch_limit)
+                if not syms:
+                    try:
+                        syms = await _await_with_timeout(
+                            _resolve_engine_symbols_for_sheet(engine, sheet, body, fetch_limit),
+                            SPECIAL_PAGE_REHYDRATE_TIMEOUT_SEC,
+                            f"{sheet} resolve symbols",
+                        )
+                    except Exception as e:
+                        special_error_parts.append(f"resolve_symbols={e}")
+                        logger.warning("Top10 symbol resolve failed softly: %s", e)
+                        syms = []
+
+                if syms and engine is not None:
+                    try:
+                        data_map = await _await_with_timeout(
+                            _fetch_analysis_rows(engine, syms[:fetch_limit], mode=mode or "", schema=schema),
+                            SPECIAL_PAGE_REHYDRATE_TIMEOUT_SEC,
+                            f"{sheet} rehydrate fetch",
+                        )
+                        rebuilt: List[Dict[str, Any]] = []
+                        for idx, sym in enumerate(syms[:fetch_limit], start=1):
+                            raw = data_map.get(sym) or {"symbol": sym, "ticker": sym}
+                            rr = _normalize_to_schema_keys(schema_keys=schema_keys, schema_headers=schema_headers, raw=dict(raw))
+                            rr.setdefault("top10_rank", idx)
+                            rr.setdefault("selection_reason", "Selected by Top10 fallback rehydrate.")
+                            rr.setdefault("criteria_snapshot", "{}")
+                            rebuilt.append(_project_row(schema_keys, rr))
+                        chosen = {"status": "partial", "row_objects": rebuilt, "meta": {"symbols_rehydrated": True, "rehydrated_count": len(rebuilt)}}
+                        chosen_dispatch = "top10_rehydrated_from_symbols"
+                    except Exception as e:
+                        special_error_parts.append(f"rehydrate={e}")
+                        logger.warning("Top10 symbol rehydrate failed softly: %s", e)
+
+            if not _payload_has_real_rows(chosen):
+                requested_symbols = _extract_requested_symbols(body, limit=fetch_limit)
+                placeholder_rows = _build_placeholder_rows(page=sheet, keys=schema_keys, requested_symbols=requested_symbols, limit=limit, offset=offset)
+                chosen = {
+                    "status": "partial",
+                    "row_objects": placeholder_rows,
+                    "error": _strip(_extract_status_error(chosen)[1]) or ("; ".join(special_error_parts) if special_error_parts else "no_usable_special_payload"),
+                }
+                chosen_dispatch = f"{sheet.lower()}_placeholder_fallback"
+
+            return _normalize_result_to_payload(
+                result=chosen,
+                page=sheet,
+                route_family=route_family,
+                schema_headers=schema_headers,
+                schema_keys=schema_keys,
+                include_matrix=bool(include_matrix_final),
+                request_id=request_id,
+                started_at=t0,
+                dispatch=chosen_dispatch,
+                limit=limit,
+                offset=offset,
+                default_status="partial",
+                extra_meta={
+                    "schema_source": schema_source,
+                    "engine_available": bool(engine),
+                    "engine_type": _safe_engine_type(engine) if engine else "none",
+                    "fetch_limit": fetch_limit,
+                    "engine_payload_quality": score_engine,
+                    "special_timeout_engine_sec": SPECIAL_PAGE_ENGINE_TIMEOUT_SEC,
+                    "special_timeout_builder_sec": SPECIAL_PAGE_BUILDER_TIMEOUT_SEC,
+                    "special_timeout_rehydrate_sec": SPECIAL_PAGE_REHYDRATE_TIMEOUT_SEC,
+                    "special_error_parts": special_error_parts,
+                    **builder_meta,
+                },
+            )
+        except Exception as e:
+            logger.exception("%s special-page block failed softly: %s", sheet, e)
             requested_symbols = _extract_requested_symbols(body, limit=fetch_limit)
-            placeholder_rows = _build_placeholder_rows(page=sheet, keys=schema_keys, requested_symbols=requested_symbols, limit=limit, offset=offset)
-            chosen = {"status": "partial", "row_objects": placeholder_rows, "error": _strip(_extract_status_error(chosen)[1]) or "no_usable_special_payload"}
-            chosen_dispatch = f"{sheet.lower()}_placeholder_fallback"
-
-        return _normalize_result_to_payload(
-            result=chosen,
-            page=sheet,
-            route_family=route_family,
-            schema_headers=schema_headers,
-            schema_keys=schema_keys,
-            include_matrix=bool(include_matrix_final),
-            request_id=request_id,
-            started_at=t0,
-            dispatch=chosen_dispatch,
-            limit=limit,
-            offset=offset,
-            default_status="partial",
-            extra_meta={
-                "schema_source": schema_source,
-                "engine_available": bool(engine),
-                "engine_type": _safe_engine_type(engine) if engine else "none",
-                "fetch_limit": fetch_limit,
-                "engine_payload_quality": score_engine,
-                **builder_meta,
-            },
-        )
+            placeholder_rows = _build_placeholder_rows(
+                page=sheet,
+                keys=schema_keys,
+                requested_symbols=requested_symbols,
+                limit=limit,
+                offset=offset,
+            )
+            return _payload_envelope(
+                page=sheet,
+                route_family=route_family,
+                headers=schema_headers,
+                keys=schema_keys,
+                row_objects=placeholder_rows,
+                include_matrix=bool(include_matrix_final),
+                request_id=request_id,
+                started_at=t0,
+                status_out="partial",
+                error_out=str(e),
+                meta={
+                    "schema_source": schema_source,
+                    "engine_available": bool(engine),
+                    "engine_type": _safe_engine_type(engine) if engine else "none",
+                    "dispatch": f"{sheet.lower()}_outer_fail_soft",
+                    "fetch_limit": fetch_limit,
+                    "offset": offset,
+                    "limit": limit,
+                    "special_timeout_engine_sec": SPECIAL_PAGE_ENGINE_TIMEOUT_SEC,
+                    "special_timeout_builder_sec": SPECIAL_PAGE_BUILDER_TIMEOUT_SEC,
+                    "special_timeout_rehydrate_sec": SPECIAL_PAGE_REHYDRATE_TIMEOUT_SEC,
+                },
+            )
 
     # Instrument-style pages.
     if engine is None:
