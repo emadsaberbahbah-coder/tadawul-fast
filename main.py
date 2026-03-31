@@ -2,13 +2,13 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.8.0)
+TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.8.1)
 ================================================================================
 FASTAPI-NATIVE ROUTER INCLUDE • PRESTART-FIRST ROUTE MOUNT • OPENAPI CACHE SAFE
 REQUEST-ID SAFE • ENGINE-STATE AWARE • CONTROLLED-ROUTE-OWNERSHIP SAFE
 STRICT-JSON SAFE • HEALTH / META ALIAS SAFE • DEBUG ROUTE SAFE
 
-Why this revision (v8.8.0)
+Why this revision (v8.8.1)
 --------------------------
 - FIX: mounts controlled routers with app.include_router(...) instead of directly
        appending APIRoute objects to app.router.routes.
@@ -18,6 +18,8 @@ Why this revision (v8.8.0)
        signature count changes.
 - FIX: preserves controlled owner diagnostics for advisor / advanced / analysis /
        schema / enriched families while keeping duplicate protection.
+- FIX: tracks exact enriched sheet-row aliases in diagnostics so missing
+       /v1/enriched*/sheet-rows exposure is visible at startup and in /_debug/routes.
 - SAFE: keeps startup engine init timeout-aware and non-fatal unless strict mode
        is explicitly enabled.
 """
@@ -176,7 +178,7 @@ class _StrictJSONResponse(JSONResponse):
         ).encode("utf-8")
 
 
-APP_ENTRY_VERSION = "8.8.0"
+APP_ENTRY_VERSION = "8.8.1"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
@@ -232,8 +234,11 @@ _CONTROLLED_CANONICAL_OWNER_MAP: Dict[str, str] = {
     "/schema/sheet-spec": "advanced_analysis",
     "/sheet-rows": "advanced_analysis",
     "/v1/enriched": "enriched_quote",
+    "/v1/enriched/sheet-rows": "enriched_quote",
     "/v1/enriched_quote": "enriched_quote",
+    "/v1/enriched_quote/sheet-rows": "enriched_quote",
     "/v1/enriched-quote": "enriched_quote",
+    "/v1/enriched-quote/sheet-rows": "enriched_quote",
     "/quote": "enriched_quote",
     "/quotes": "enriched_quote",
 }
@@ -752,6 +757,9 @@ def _route_family_presence_from_paths(paths: Set[str]) -> Dict[str, bool]:
     advisor_short = _paths_start_with_any(paths, "/v1/advisor")
     advisor_long_underscore = _paths_start_with_any(paths, "/v1/investment_advisor")
     advisor_long_hyphen = _paths_start_with_any(paths, "/v1/investment-advisor")
+    enriched_primary = "/v1/enriched/sheet-rows" in paths
+    enriched_underscore = "/v1/enriched_quote/sheet-rows" in paths
+    enriched_hyphen = "/v1/enriched-quote/sheet-rows" in paths
 
     return {
         "advisor_short": advisor_short,
@@ -763,6 +771,10 @@ def _route_family_presence_from_paths(paths: Set[str]) -> Dict[str, bool]:
         "analysis": _paths_start_with_any(paths, "/v1/analysis"),
         "schema": _paths_start_with_any(paths, "/v1/schema", "/schema"),
         "enriched": _paths_start_with_any(paths, "/v1/enriched", "/v1/enriched_quote", "/v1/enriched-quote"),
+        "enriched_sheet_rows_primary": enriched_primary,
+        "enriched_sheet_rows_underscore": enriched_underscore,
+        "enriched_sheet_rows_hyphen": enriched_hyphen,
+        "enriched_sheet_rows_any": enriched_primary or enriched_underscore or enriched_hyphen,
         "root_sheet_rows": "/sheet-rows" in paths,
         "root_health_alias": "/health" in paths and "/v1/health" in paths,
         "root_meta_alias": "/meta" in paths and "/v1/meta" in paths,
@@ -859,6 +871,7 @@ def _verify_required_route_families(app: FastAPI) -> List[str]:
         "analysis": presence.get("analysis", False),
         "schema": presence.get("schema", False),
         "enriched": presence.get("enriched", False),
+        "enriched_sheet_rows_any": presence.get("enriched_sheet_rows_any", False),
         "root_sheet_rows": presence.get("root_sheet_rows", False),
         "root_health_alias": presence.get("root_health_alias", False),
         "root_meta_alias": presence.get("root_meta_alias", False),
@@ -1570,6 +1583,12 @@ def create_app() -> FastAPI:
         path_owners = _canonical_path_owners_from_routes(request.app)
         owner_mismatches = _canonical_path_owner_mismatches(path_owners)
 
+        enriched_alias_presence = {
+            "/v1/enriched/sheet-rows": "/v1/enriched/sheet-rows" in route_paths,
+            "/v1/enriched_quote/sheet-rows": "/v1/enriched_quote/sheet-rows" in route_paths,
+            "/v1/enriched-quote/sheet-rows": "/v1/enriched-quote/sheet-rows" in route_paths,
+        }
+
         return {
             "status": "ok",
             "routes_snapshot": getattr(request.app.state, "routes_snapshot", {}),
@@ -1579,6 +1598,7 @@ def create_app() -> FastAPI:
             "route_signatures": route_sigs,
             "canonical_path_owners": path_owners,
             "canonical_path_owner_mismatches": owner_mismatches,
+            "enriched_alias_presence": enriched_alias_presence,
             **_runtime_meta(app),
         }
 
