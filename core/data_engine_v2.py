@@ -2,10 +2,10 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.47.1
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.47.2
 ================================================================================
 
-WHY v5.47.1
+WHY v5.47.2
 -----------
 - FIX: makes provider priority page-aware so non-KSA pages like
        Global_Markets, Commodities_FX, and Mutual_Funds prefer EODHD first
@@ -55,6 +55,13 @@ WHY v5.47.1
 - FIX: strengthens page-aware backfill for Mutual_Funds and Commodities_FX so
        identity/context fields stay populated without fabricating missing
        equity-only fundamentals.
+- FIX: expands global-provider alias bridges for fundamentals / margins /
+       market-cap style fields commonly returned under alternative names.
+- FIX: adds cross-snapshot symbol backfill so richer rows built on one page can
+       safely fill sparse rows on Top_10_Investments, My_Portfolio, and other
+       dependent pages.
+- FIX: improves ETF / fund context defaults so non-KSA pages keep better
+       identity metadata when provider payloads are thin.
 
 Design goals
 ------------
@@ -106,7 +113,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.47.1"
+__version__ = "5.47.2"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -1158,35 +1165,35 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "exchange": ("exchange", "exchangeName", "fullExchangeName", "market", "marketName", "mic", "exchangeCode"),
     "currency": ("currency", "financialCurrency", "reportingCurrency", "quoteCurrency", "baseCurrency"),
     "country": ("country", "countryName", "country_code", "countryCode", "localeCountry"),
-    "sector": ("sector", "sectorDisp", "gicsSector", "industryGroup"),
-    "industry": ("industry", "industryDisp", "gicsIndustry", "category"),
-    "current_price": ("current_price", "currentPrice", "price", "last", "lastPrice", "latestPrice", "regularMarketPrice", "nav", "close", "adjusted_close", "adjclose"),
-    "previous_close": ("previous_close", "previousClose", "regularMarketPreviousClose", "prevClose", "priorClose"),
-    "open_price": ("open_price", "day_open", "dayOpen", "open", "openPrice", "regularMarketOpen"),
-    "day_high": ("day_high", "high", "dayHigh", "regularMarketDayHigh", "sessionHigh"),
-    "day_low": ("day_low", "low", "dayLow", "regularMarketDayLow", "sessionLow"),
+    "sector": ("sector", "sectorDisp", "gicsSector", "industryGroup", "sectorName", "gics_sector", "Sector", "General.Sector"),
+    "industry": ("industry", "industryDisp", "gicsIndustry", "category", "industryName", "Industry", "General.Industry", "industry_group"),
+    "current_price": ("current_price", "currentPrice", "price", "last", "lastPrice", "latestPrice", "regularMarketPrice", "nav", "close", "adjusted_close", "adjclose", "closePrice", "last_trade_price", "regular_market_price", "price_close"),
+    "previous_close": ("previous_close", "previousClose", "regularMarketPreviousClose", "prevClose", "priorClose", "close_yesterday", "previous_close_price"),
+    "open_price": ("open_price", "day_open", "dayOpen", "open", "openPrice", "regularMarketOpen", "open_price_day", "dailyOpen", "sessionOpen"),
+    "day_high": ("day_high", "high", "dayHigh", "regularMarketDayHigh", "sessionHigh", "highPrice", "intradayHigh", "dailyHigh"),
+    "day_low": ("day_low", "low", "dayLow", "regularMarketDayLow", "sessionLow", "lowPrice", "intradayLow", "dailyLow"),
     "week_52_high": ("week_52_high", "52WeekHigh", "fiftyTwoWeekHigh", "yearHigh", "week52High"),
     "week_52_low": ("week_52_low", "52WeekLow", "fiftyTwoWeekLow", "yearLow", "week52Low"),
     "price_change": ("price_change", "change", "priceChange", "regularMarketChange", "netChange"),
     "percent_change": ("percent_change", "changePercent", "percentChange", "regularMarketChangePercent", "pctChange", "change_pct"),
-    "volume": ("volume", "regularMarketVolume", "sharesTraded", "tradeVolume"),
-    "avg_volume_10d": ("avg_volume_10d", "avg_vol_10d", "averageVolume10days", "avgVolume10Day", "avgVol10d"),
-    "avg_volume_30d": ("avg_volume_30d", "avg_vol_30d", "averageVolume", "averageDailyVolume3Month", "avgVolume3Month", "avgVol30d"),
-    "market_cap": ("market_cap", "marketCap", "marketCapitalization"),
-    "float_shares": ("float_shares", "floatShares", "sharesFloat"),
-    "beta_5y": ("beta_5y", "beta", "beta5Y"),
-    "pe_ttm": ("pe_ttm", "trailingPE", "peRatio", "priceEarningsTTM", "pe"),
-    "pe_forward": ("pe_forward", "forward_pe", "forwardPE", "forwardPe"),
-    "eps_ttm": ("eps_ttm", "trailingEps", "eps", "earningsPerShare", "epsTTM"),
-    "dividend_yield": ("dividend_yield", "dividendYield", "trailingAnnualDividendYield", "distributionYield"),
-    "payout_ratio": ("payout_ratio", "payoutRatio"),
-    "revenue_ttm": ("revenue_ttm", "totalRevenue", "revenueTTM", "revenue"),
-    "revenue_growth_yoy": ("revenue_growth_yoy", "revenueGrowth", "revenueGrowthYoY", "revenue_yoy_growth"),
-    "gross_margin": ("gross_margin", "grossMargins", "grossMargin"),
-    "operating_margin": ("operating_margin", "operatingMargins", "operatingMargin"),
-    "profit_margin": ("profit_margin", "profitMargins", "profitMargin", "netMargin"),
-    "debt_to_equity": ("debt_to_equity", "d_e_ratio", "debtToEquity", "deRatio"),
-    "free_cash_flow_ttm": ("free_cash_flow_ttm", "fcf_ttm", "freeCashflow", "freeCashFlow", "fcf"),
+    "volume": ("volume", "regularMarketVolume", "sharesTraded", "tradeVolume", "Volume", "vol", "trade_count_volume"),
+    "avg_volume_10d": ("avg_volume_10d", "avg_vol_10d", "averageVolume10days", "avgVolume10Day", "avgVol10d", "averageVolume10Day", "avg_volume_10_day"),
+    "avg_volume_30d": ("avg_volume_30d", "avg_vol_30d", "averageVolume", "averageDailyVolume3Month", "avgVolume3Month", "avgVol30d", "averageVolume30Day", "avg_volume_30_day"),
+    "market_cap": ("market_cap", "marketCap", "marketCapitalization", "MarketCapitalization", "capitalization", "Capitalization", "market_capitalization"),
+    "float_shares": ("float_shares", "floatShares", "sharesFloat", "FloatShares", "SharesFloat", "sharesOutstanding", "SharesOutstanding"),
+    "beta_5y": ("beta_5y", "beta", "beta5Y", "Beta", "beta5Year"),
+    "pe_ttm": ("pe_ttm", "trailingPE", "peRatio", "priceEarningsTTM", "pe", "PERatio", "PriceEarningsTTM", "peTTM"),
+    "pe_forward": ("pe_forward", "forward_pe", "forwardPE", "forwardPe", "ForwardPE", "ForwardPERatio", "forwardPERatio"),
+    "eps_ttm": ("eps_ttm", "trailingEps", "eps", "earningsPerShare", "epsTTM", "EarningsShare", "epsTtm", "DilutedEPSTTM"),
+    "dividend_yield": ("dividend_yield", "dividendYield", "trailingAnnualDividendYield", "distributionYield", "DividendYield", "forwardAnnualDividendYield", "Yield"),
+    "payout_ratio": ("payout_ratio", "payoutRatio", "PayoutRatio", "payout", "PayoutRatioTTM"),
+    "revenue_ttm": ("revenue_ttm", "totalRevenue", "revenueTTM", "revenue", "RevenueTTM", "TotalRevenueTTM", "Revenue", "SalesTTM"),
+    "revenue_growth_yoy": ("revenue_growth_yoy", "revenueGrowth", "revenueGrowthYoY", "revenue_yoy_growth", "RevenueGrowthYOY", "QuarterlyRevenueGrowthYOY", "revenueGrowthYoy"),
+    "gross_margin": ("gross_margin", "grossMargins", "grossMargin", "GrossMargin", "GrossProfitMargin", "grossMarginTTM"),
+    "operating_margin": ("operating_margin", "operatingMargins", "operatingMargin", "OperatingMargin", "OperatingMarginTTM", "operatingMarginTTM"),
+    "profit_margin": ("profit_margin", "profitMargins", "profitMargin", "netMargin", "ProfitMargin", "NetProfitMargin", "profitMarginTTM"),
+    "debt_to_equity": ("debt_to_equity", "d_e_ratio", "debtToEquity", "deRatio", "DebtToEquity", "TotalDebtEquity"),
+    "free_cash_flow_ttm": ("free_cash_flow_ttm", "fcf_ttm", "freeCashflow", "freeCashFlow", "fcf", "FreeCashFlow", "FreeCashFlowTTM"),
     "rsi_14": ("rsi_14", "rsi", "rsi14"),
     "volatility_30d": ("volatility_30d", "volatility30d", "vol30d"),
     "volatility_90d": ("volatility_90d", "volatility90d", "vol90d"),
@@ -1234,6 +1241,19 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
 }
 
 _COMMODITY_SYMBOL_HINTS: Tuple[str, ...] = ("GC=F", "SI=F", "BZ=F", "CL=F", "NG=F", "HG=F")
+_ETF_SYMBOL_HINTS: Tuple[str, ...] = ("SPY", "QQQ", "VTI", "VOO", "IWM", "DIA", "IVV", "EFA", "EEM", "ARKK")
+_ETF_DISPLAY_NAMES: Dict[str, str] = {
+    "SPY": "SPDR S&P 500 ETF",
+    "QQQ": "Invesco QQQ Trust",
+    "VTI": "Vanguard Total Stock Market ETF",
+    "VOO": "Vanguard S&P 500 ETF",
+    "IWM": "iShares Russell 2000 ETF",
+    "DIA": "SPDR Dow Jones Industrial Average ETF",
+    "IVV": "iShares Core S&P 500 ETF",
+    "EFA": "iShares MSCI EAFE ETF",
+    "EEM": "iShares MSCI Emerging Markets ETF",
+    "ARKK": "ARK Innovation ETF",
+}
 _COMMODITY_DISPLAY_NAMES: Dict[str, str] = {
     "GC=F": "Gold Futures",
     "SI=F": "Silver Futures",
@@ -1389,6 +1409,8 @@ def _infer_sector_from_symbol(symbol: str) -> str:
         return "Currencies"
     if s.endswith("=F") or s in _COMMODITY_SYMBOL_HINTS:
         return "Commodities"
+    if s in _ETF_SYMBOL_HINTS:
+        return "Broad Market"
     if s.endswith(".SR") or re.match(r"^[0-9]{4}$", s):
         return "Saudi Market"
     return ""
@@ -1402,6 +1424,8 @@ def _infer_industry_from_symbol(symbol: str) -> str:
         return "Foreign Exchange"
     if s.endswith("=F"):
         return "Commodity Futures"
+    if s in _ETF_SYMBOL_HINTS:
+        return "ETF"
     if s.endswith(".SR") or re.match(r"^[0-9]{4}$", s):
         return "Listed Equities"
     return ""
@@ -1413,6 +1437,8 @@ def _infer_display_name_from_symbol(symbol: str) -> str:
         return ""
     if s in _COMMODITY_DISPLAY_NAMES:
         return _COMMODITY_DISPLAY_NAMES[s]
+    if s in _ETF_DISPLAY_NAMES:
+        return _ETF_DISPLAY_NAMES[s]
     if s.endswith("=X"):
         pair = s[:-2]
         if len(pair) >= 6:
@@ -1642,6 +1668,16 @@ def _apply_page_row_backfill(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
             out["invest_period_label"] = "1Y"
         if out.get("horizon_days") in (None, ""):
             out["horizon_days"] = 365
+
+    if target in {"Global_Markets", "Market_Leaders", "My_Portfolio", "Top_10_Investments"}:
+        asset_class = _safe_str(out.get("asset_class"))
+        if sym in _ETF_SYMBOL_HINTS or asset_class.upper() == "ETF":
+            out.setdefault("asset_class", "ETF")
+            out.setdefault("sector", "Broad Market")
+            out.setdefault("industry", "ETF")
+            inferred_name = _infer_display_name_from_symbol(sym)
+            if inferred_name and (_safe_str(out.get("name")) in ("", sym)):
+                out["name"] = inferred_name
 
     return out
 
@@ -2409,6 +2445,37 @@ class DataEngineV5:
             if sym and sym not in out:
                 out[sym] = dict(row)
         return out
+
+    @staticmethod
+    def _non_empty_field_count(row: Optional[Dict[str, Any]]) -> int:
+        if not isinstance(row, dict):
+            return 0
+        return sum(1 for v in row.values() if v not in (None, "", [], {}))
+
+    def _get_best_cached_snapshot_row_for_symbol(self, symbol: str, prefer_sheet: str = "") -> Optional[Dict[str, Any]]:
+        sym = normalize_symbol(symbol)
+        if not sym:
+            return None
+        preferred = _canonicalize_sheet_name(prefer_sheet) if prefer_sheet else ""
+        best_row: Optional[Dict[str, Any]] = None
+        best_score: float = -1.0
+        for sheet_name, snap in self._sheet_snapshots.items():
+            rows = _coerce_rows_list(snap)
+            if not rows:
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                row_sym = normalize_symbol(self._extract_row_symbol(row))
+                if row_sym != sym:
+                    continue
+                score = float(self._non_empty_field_count(row))
+                if preferred and _canonicalize_sheet_name(sheet_name) == preferred:
+                    score += 1000.0
+                if score > best_score:
+                    best_score = score
+                    best_row = dict(row)
+        return best_row
 
     # ------------------------------------------------------------------
     # final payload
@@ -3492,6 +3559,11 @@ class DataEngineV5:
 
         row = _apply_symbol_context_defaults(row, symbol=norm)
 
+        cached_best_row = self._get_best_cached_snapshot_row_for_symbol(norm, prefer_sheet=page_context)
+        if cached_best_row:
+            row = _merge_missing_fields(row, cached_best_row)
+            row = _apply_page_row_backfill(page_context or sheet or "", row)
+
         missing_history_fields = [
             "current_price",
             "previous_close",
@@ -3513,6 +3585,10 @@ class DataEngineV5:
             if hist_patch:
                 row = self._merge(symbol, norm, patches_ok + [(hist_patch.get("data_provider") or "history", hist_patch, 0.0)])
                 row = _apply_symbol_context_defaults(row, symbol=norm)
+
+        if cached_best_row:
+            row = _merge_missing_fields(row, cached_best_row)
+            row = _apply_page_row_backfill(page_context or sheet or "", row)
 
         if _as_float(row.get("current_price")) is not None and _safe_str(row.get("warnings")).lower() == "no live provider data available":
             row["warnings"] = "Recovered from history/chart fallback"
@@ -4315,6 +4391,9 @@ class DataEngineV5:
                     sym = normalize_symbol(self._extract_row_symbol(row))
                     if sym and sym in snapshot_map:
                         merged = _merge_missing_fields(merged, snapshot_map[sym])
+                    best_snapshot_row = self._get_best_cached_snapshot_row_for_symbol(sym, prefer_sheet=target_sheet) if sym else None
+                    if best_snapshot_row:
+                        merged = _merge_missing_fields(merged, best_snapshot_row)
                     if sym and sym in quote_map:
                         merged = _merge_missing_fields(merged, quote_map[sym])
                     merged = _apply_page_row_backfill(target_sheet, merged)
@@ -4389,6 +4468,9 @@ class DataEngineV5:
                 sym = normalize_symbol(_safe_str(row.get("symbol") or row.get("requested_symbol")))
                 if sym and sym in snapshot_map:
                     row = _merge_missing_fields(row, snapshot_map[sym])
+                best_snapshot_row = self._get_best_cached_snapshot_row_for_symbol(sym, prefer_sheet=target_sheet) if sym else None
+                if best_snapshot_row:
+                    row = _merge_missing_fields(row, best_snapshot_row)
                 row = _apply_page_row_backfill(target_sheet, row)
                 _compute_scores_fallback(row)
                 _compute_recommendation(row)
