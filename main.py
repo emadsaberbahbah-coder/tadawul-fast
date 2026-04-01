@@ -2,26 +2,23 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.8.1)
+TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.9.0)
 ================================================================================
 FASTAPI-NATIVE ROUTER INCLUDE • PRESTART-FIRST ROUTE MOUNT • OPENAPI CACHE SAFE
 REQUEST-ID SAFE • ENGINE-STATE AWARE • CONTROLLED-ROUTE-OWNERSHIP SAFE
 STRICT-JSON SAFE • HEALTH / META ALIAS SAFE • DEBUG ROUTE SAFE
+ADVANCED-SHEET-ROWS EXPLICIT MOUNT • EXACT CANONICAL OWNER PROTECTION
 
-Why this revision (v8.8.1)
+Why this revision (v8.9.0)
 --------------------------
-- FIX: mounts controlled routers with app.include_router(...) instead of directly
-       appending APIRoute objects to app.router.routes.
-- FIX: forces router mounting before normal runtime use so /openapi.json and live
-       route handlers see the same mounted route set.
-- FIX: adds a custom OpenAPI builder that refreshes whenever the live route
-       signature count changes.
-- FIX: preserves controlled owner diagnostics for advisor / advanced / analysis /
-       schema / enriched families while keeping duplicate protection.
-- FIX: tracks exact enriched sheet-row aliases in diagnostics so missing
-       /v1/enriched*/sheet-rows exposure is visible at startup and in /_debug/routes.
-- SAFE: keeps startup engine init timeout-aware and non-fatal unless strict mode
-       is explicitly enabled.
+- FIX: explicitly mounts routes.advanced_sheet_rows in the controlled plan so
+       /v1/advanced/sheet-rows no longer depends on other modules.
+- FIX: protects exact canonical paths during filtered router cloning so a later
+       router cannot steal an owner-locked path such as /v1/advanced/sheet-rows.
+- FIX: keeps prestart/startup route mounting and OpenAPI cache refresh aligned.
+- FIX: preserves route diagnostics for advisor / advanced / analysis /
+       advanced-sheet-rows / schema / enriched families.
+- SAFE: engine init remains timeout-aware and non-fatal unless strict mode is enabled.
 """
 
 from __future__ import annotations
@@ -71,35 +68,27 @@ def _scrub_text(value: Any) -> str:
 def _json_safe(value: Any, _seen: Optional[Set[int]] = None) -> Any:
     if value is None or isinstance(value, (bool, int)):
         return value
-
     if isinstance(value, float):
         return value if math.isfinite(value) else None
-
     if isinstance(value, str):
         return _scrub_text(value)
-
     if isinstance(value, Decimal):
         try:
             f = float(value)
             return f if math.isfinite(f) else None
         except Exception:
             return _scrub_text(value)
-
     if isinstance(value, (datetime, date, dt_time)):
         try:
             return value.isoformat()
         except Exception:
             return _scrub_text(value)
-
     if isinstance(value, timezone):
         return _scrub_text(value)
-
     if isinstance(value, uuid.UUID):
         return str(value)
-
     if isinstance(value, Enum):
         return _json_safe(value.value, _seen)
-
     if isinstance(value, (bytes, bytearray, memoryview)):
         try:
             return bytes(value).decode("utf-8", "replace")
@@ -108,7 +97,6 @@ def _json_safe(value: Any, _seen: Optional[Set[int]] = None) -> Any:
 
     if _seen is None:
         _seen = set()
-
     obj_id = id(value)
     if obj_id in _seen:
         return None
@@ -137,7 +125,6 @@ def _json_safe(value: Any, _seen: Optional[Set[int]] = None) -> Any:
 
         if isinstance(value, Mapping):
             return {_scrub_text(k): _json_safe(v, _seen) for k, v in value.items()}
-
         if isinstance(value, (list, tuple, set, frozenset)):
             return [_json_safe(v, _seen) for v in value]
 
@@ -178,29 +165,15 @@ class _StrictJSONResponse(JSONResponse):
         ).encode("utf-8")
 
 
-APP_ENTRY_VERSION = "8.8.1"
+APP_ENTRY_VERSION = "8.9.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
 
 _BUILTIN_META_PATHS = {
-    "/",
-    "/meta",
-    "/ping",
-    "/livez",
-    "/readyz",
-    "/health",
-    "/healthz",
-    "/v1/meta",
-    "/v1/ping",
-    "/v1/livez",
-    "/v1/readyz",
-    "/v1/health",
-    "/v1/healthz",
-    "/_debug/routes",
-    "/docs",
-    "/redoc",
-    "/openapi.json",
+    "/", "/meta", "/ping", "/livez", "/readyz", "/health", "/healthz",
+    "/v1/meta", "/v1/ping", "/v1/livez", "/v1/readyz", "/v1/health", "/v1/healthz",
+    "/_debug/routes", "/docs", "/redoc", "/openapi.json",
 }
 
 _CONTROLLED_PROTECTED_PREFIXES: Tuple[str, ...] = (
@@ -219,13 +192,14 @@ _CONTROLLED_PROTECTED_PREFIXES: Tuple[str, ...] = (
     "/sheet-rows",
 )
 
+# Canonical owners are the route-family keys used in the controlled plan.
 _CONTROLLED_CANONICAL_OWNER_MAP: Dict[str, str] = {
     "/v1/advisor": "advisor",
     "/v1/advisor/sheet-rows": "advisor",
     "/v1/investment_advisor": "investment_advisor",
     "/v1/investment-advisor": "investment_advisor",
     "/v1/advanced": "investment_advisor",
-    "/v1/advanced/sheet-rows": "investment_advisor",
+    "/v1/advanced/sheet-rows": "advanced_sheet_rows",
     "/v1/analysis": "analysis_sheet_rows",
     "/v1/analysis/sheet-rows": "analysis_sheet_rows",
     "/v1/schema": "advanced_analysis",
@@ -253,6 +227,7 @@ _OPTIONAL_ROUTE_MODULES: Set[str] = {
 _CONTROLLED_ROUTE_PLAN: Tuple[Tuple[str, str], ...] = (
     ("config", "routes.config"),
     ("advanced_analysis", "routes.advanced_analysis"),
+    ("advanced_sheet_rows", "routes.advanced_sheet_rows"),
     ("analysis_sheet_rows", "routes.analysis_sheet_rows"),
     ("investment_advisor", "routes.investment_advisor"),
     ("advisor", "routes.advisor"),
@@ -650,7 +625,6 @@ def _auth_ok(request: Request) -> bool:
     }
     if not allowed:
         return False
-
     if hdr and hdr in allowed:
         return True
     if token_q and token_q in allowed:
@@ -903,12 +877,7 @@ def _prefer_live_metric(raw_value: Any, live_value: int) -> int:
     return max(0, parsed)
 
 
-def _normalize_routes_snapshot(
-    ret: Any,
-    *,
-    used_strategy: str,
-    app: Optional[FastAPI] = None,
-) -> Dict[str, Any]:
+def _normalize_routes_snapshot(ret: Any, *, used_strategy: str, app: Optional[FastAPI] = None) -> Dict[str, Any]:
     base_from_state: Dict[str, Any] = {}
     if app is not None:
         try:
@@ -1013,12 +982,17 @@ def _allowed_prefixes_for_key(key: str) -> Tuple[str, ...]:
     mapping = {
         "config": ("/v1/config",),
         "advanced_analysis": ("/v1/schema", "/schema", "/sheet-rows"),
+        "advanced_sheet_rows": ("/v1/advanced",),
         "analysis_sheet_rows": ("/v1/analysis",),
         "investment_advisor": ("/v1/advanced", "/v1/investment_advisor", "/v1/investment-advisor"),
         "advisor": ("/v1/advisor",),
         "enriched_quote": ("/v1/enriched", "/v1/enriched_quote", "/v1/enriched-quote", "/quote", "/quotes"),
     }
     return mapping.get(key, tuple())
+
+
+def _canonical_owner_for_exact_path(path: str) -> str:
+    return str(_CONTROLLED_CANONICAL_OWNER_MAP.get(str(path or "").strip(), "") or "")
 
 
 def _router_from_module(mod: Any) -> Optional[APIRouter]:
@@ -1044,6 +1018,11 @@ def _clone_filtered_router(router: APIRouter, *, key: str) -> Tuple[APIRouter, L
     for route in _iter_router_api_routes(router):
         path = str(getattr(route, "path", "") or "")
         if allowed and not any(path.startswith(prefix) for prefix in allowed):
+            filtered_out.append(path)
+            continue
+
+        canonical_owner = _canonical_owner_for_exact_path(path)
+        if canonical_owner and canonical_owner != key:
             filtered_out.append(path)
             continue
 
@@ -1204,16 +1183,7 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
     except Exception:
         pass
 
-    mounted_count = int(snap.get("mounted_count", len(snap.get("mounted", []) or [])) or 0)
-    duplicate_skips_count = int(snap.get("duplicate_skips_count", len(snap.get("duplicate_skips", []) or [])) or 0)
-    partial_duplicate_skips_count = int(snap.get("partial_duplicate_skips_count", len(snap.get("partial_duplicate_skips", []) or [])) or 0)
-    failed_count = int(snap.get("failed_count", len(snap.get("effective_failed_modules", []) or [])) or 0)
-    strategy = str(snap.get("strategy", "") or "")
-
     live_route_count, live_signature_count = _live_route_metrics(app)
-    snapshot_route_signature_count = int(snap.get("route_signature_count_after_mount", 0) or 0)
-    route_signature_count = live_signature_count if live_signature_count > 0 else snapshot_route_signature_count
-
     path_owners = dict(snap.get("canonical_path_owners", {}) or {})
     path_owner_mismatches = dict(snap.get("canonical_path_owner_mismatches", {}) or {})
     route_family_presence = dict(snap.get("route_family_presence", {}) or {})
@@ -1239,12 +1209,12 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
         "config_source": config_source,
         "routes_mounted": routes_mounted,
         "routes_mount_phase": routes_mount_phase,
-        "routes_mounted_count": mounted_count,
-        "routes_duplicate_skips_count": duplicate_skips_count,
-        "routes_partial_duplicate_skips_count": partial_duplicate_skips_count,
-        "routes_failed_count": failed_count,
-        "routes_strategy": strategy,
-        "route_signature_count": route_signature_count,
+        "routes_mounted_count": int(snap.get("mounted_count", len(snap.get("mounted", []) or [])) or 0),
+        "routes_duplicate_skips_count": int(snap.get("duplicate_skips_count", len(snap.get("duplicate_skips", []) or [])) or 0),
+        "routes_partial_duplicate_skips_count": int(snap.get("partial_duplicate_skips_count", len(snap.get("partial_duplicate_skips", []) or [])) or 0),
+        "routes_failed_count": int(snap.get("failed_count", len(snap.get("effective_failed_modules", []) or [])) or 0),
+        "routes_strategy": str(snap.get("strategy", "") or ""),
+        "route_signature_count": live_signature_count if live_signature_count > 0 else int(snap.get("route_signature_count_after_mount", 0) or 0),
         "route_count_live": live_route_count,
         "missing_required_keys": missing_required_keys,
         "route_family_presence": route_family_presence,
@@ -1299,7 +1269,6 @@ def _install_builtin_routes(app: FastAPI) -> None:
     _add_status_route("/livez", "live")
     _add_status_route("/health", "healthy")
     _add_status_route("/healthz", "healthy")
-
     _add_status_route("/v1/readyz", "ready")
     _add_status_route("/v1/livez", "live")
     _add_status_route("/v1/health", "healthy")
@@ -1442,6 +1411,7 @@ def create_app() -> FastAPI:
                 snap.get("strategy", ""),
                 snap.get("route_signature_count_after_mount", 0),
             )
+
             missing_required = list(snap.get("missing_required_keys", []) or [])
             if missing_required:
                 warning = f"missing_required_route_families: {', '.join(missing_required)}"
@@ -1551,7 +1521,6 @@ def create_app() -> FastAPI:
     _install_builtin_routes(app)
     _install_custom_openapi(app)
 
-    # Always mount before serving requests so OpenAPI and runtime use the same route set.
     try:
         snap = _mount_routes_once(app, phase="prestart")
         logger.info(
