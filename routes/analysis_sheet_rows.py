@@ -2,24 +2,28 @@
 # routes/analysis_sheet_rows.py
 """
 ================================================================================
-Analysis Sheet-Rows Router — v3.6.0
+Analysis Sheet-Rows Router — v3.7.0
 ================================================================================
-PROXY-FIRST • ROOT-OWNER ALIGNED • SPECIAL-PAGE SAFE • FAIL-SOFT • JSON-SAFE
-GET+POST SAFE • FIXED-WIDTH CONTRACTS • WRAPPER-COMPAT • ENGINE FALLBACK
+ROOT-PROXY FIRST • ADVANCED-ROUTE ALIGNED • ADAPTER-FIRST FALLBACK • SPECIAL-
+PAGE SAFE • SCHEMA-FIRST • STABLE ENVELOPE • GET+POST MERGED • FAIL-SOFT
 
 What this revision improves
 --------------------------
-- FIX: delegates special pages to routes.advanced_analysis root /sheet-rows owner
-       first, instead of re-breaking pages that already work at the root owner.
-- FIX: keeps Top_10_Investments, Insights_Analysis, and Data_Dictionary aligned
-       with the canonical root special-page dispatcher.
-- FIX: preserves canonical schema widths even when upstream payloads are nested
-       or partially wrapped.
-- FIX: fail-soft behavior now emits schema-shaped partial payloads instead of
-       bubbling wrapper-specific 5xx failures when root proxy or engine fallback
-       can still respond.
-- FIX: GET and POST now share the same merged request-body contract and alias
-       handling for page/sheet names.
+- ALIGN: tries the canonical root owner first (routes.advanced_analysis) and
+         then the advanced route owner before doing local fallback work.
+- ALIGN: prefers core.data_engine.get_sheet_rows as the adapter-level fallback
+         before dropping down to symbol-level engine calls.
+- ALIGN: emits the same stable response contract used by the aligned routes:
+         headers/display_headers/sheet_headers/column_headers/keys/rows/
+         rows_matrix/row_objects/items/records/data/quotes.
+- FIX: supports schema_only / headers_only in both GET and POST flows.
+- FIX: accepts page aliases plus direct symbol aliases (symbol/ticker/code/
+         requested_symbol/direct_symbols/selected_symbols) consistently.
+- FIX: preserves canonical widths for instrument, Top_10_Investments,
+         Insights_Analysis, and Data_Dictionary even when upstream wraps payloads.
+- FIX: keeps Top10 required fields filled in fail-soft scenarios.
+- SAFE: if every upstream path degrades, returns a schema-shaped partial payload
+         instead of bubbling a wrapper-specific 5xx.
 ================================================================================
 """
 
@@ -88,16 +92,22 @@ except Exception:
         return "instrument"
 
 try:
-    from core.config import auth_ok, get_settings_cached, mask_settings  # type: ignore
+    from core.config import auth_ok, get_settings_cached, is_open_mode, mask_settings  # type: ignore
 except Exception:
     auth_ok = None  # type: ignore
+    is_open_mode = None  # type: ignore
     mask_settings = None  # type: ignore
 
-    def get_settings_cached(*args, **kwargs):  # type: ignore
+    def get_settings_cached(*args: Any, **kwargs: Any) -> Any:  # type: ignore
         return None
 
+try:
+    from core.data_engine import get_sheet_rows as core_get_sheet_rows  # type: ignore
+except Exception:
+    core_get_sheet_rows = None  # type: ignore
 
-ANALYSIS_SHEET_ROWS_VERSION = "3.6.0"
+
+ANALYSIS_SHEET_ROWS_VERSION = "3.7.0"
 router = APIRouter(prefix="/v1/analysis", tags=["Analysis Sheet Rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -218,6 +228,16 @@ _INSIGHTS_KEYS = ["section", "item", "symbol", "metric", "value", "notes", "last
 
 _DICTIONARY_HEADERS = ["Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes"]
 _DICTIONARY_KEYS = ["sheet", "group", "header", "key", "dtype", "fmt", "required", "source", "notes"]
+
+EMERGENCY_PAGE_SYMBOLS: Dict[str, List[str]] = {
+    "Market_Leaders": ["2222.SR", "1120.SR", "2010.SR", "7010.SR", "AAPL", "MSFT", "NVDA", "GOOGL"],
+    "Global_Markets": ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AVGO"],
+    "Commodities_FX": ["GC=F", "BZ=F", "SI=F", "EURUSD=X", "GBPUSD=X", "JPY=X", "SAR=X", "CL=F"],
+    "Mutual_Funds": ["SPY", "QQQ", "VTI", "VOO", "IWM"],
+    "My_Portfolio": ["2222.SR", "AAPL", "MSFT", "QQQ", "GC=F"],
+    "Insights_Analysis": ["2222.SR", "AAPL", "GC=F"],
+    "Top_10_Investments": ["2222.SR", "1120.SR", "AAPL", "MSFT", "NVDA"],
+}
 
 # =============================================================================
 # Generic helpers
@@ -361,7 +381,7 @@ def _maybe_int(v: Any, default: int) -> int:
 def _maybe_bool(v: Any, default: bool) -> bool:
     if isinstance(v, bool):
         return v
-    if isinstance(v, (int, float)):
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
         try:
             return bool(int(v))
         except Exception:
@@ -385,6 +405,19 @@ def _split_symbols_string(v: str) -> List[str]:
     return out
 
 
+def _normalize_symbol_token(sym: Any) -> str:
+    s = _strip(sym).upper().replace(" ", "")
+    if not s:
+        return ""
+    if s.startswith("TADAWUL:"):
+        s = s.split(":", 1)[1].strip()
+    if s.endswith(".SA"):
+        s = s[:-3] + ".SR"
+    if s.isdigit() and 3 <= len(s) <= 6:
+        return f"{s}.SR"
+    return s
+
+
 def _get_list(body: Mapping[str, Any], *keys: str) -> List[str]:
     for k in keys:
         v = body.get(k)
@@ -392,14 +425,45 @@ def _get_list(body: Mapping[str, Any], *keys: str) -> List[str]:
             out: List[str] = []
             seen = set()
             for item in v:
-                s = _strip(item)
+                s = _normalize_symbol_token(item) if "symbol" in k or "ticker" in k or k in {"code", "requested_symbol"} else _strip(item)
                 if s and s not in seen:
                     seen.add(s)
                     out.append(s)
-            return out
+            if out:
+                return out
         if isinstance(v, str) and v.strip():
-            return _split_symbols_string(v)
+            parts = _split_symbols_string(v)
+            if "symbol" in k or "ticker" in k or k in {"code", "requested_symbol"}:
+                parts = [_normalize_symbol_token(x) for x in parts if _normalize_symbol_token(x)]
+            if parts:
+                return parts
     return []
+
+
+def _extract_requested_symbols(body: Mapping[str, Any], limit: int) -> List[str]:
+    symbols: List[str] = []
+    for key in (
+        "symbols", "tickers", "tickers_list", "selected_symbols", "selected_tickers", "direct_symbols",
+        "symbol", "ticker", "code", "requested_symbol",
+    ):
+        symbols.extend(_get_list(body, key))
+    criteria = body.get("criteria") if isinstance(body.get("criteria"), Mapping) else None
+    if criteria:
+        for key in (
+            "symbols", "tickers", "tickers_list", "selected_symbols", "selected_tickers", "direct_symbols",
+            "symbol", "ticker", "code", "requested_symbol",
+        ):
+            symbols.extend(_get_list(criteria, key))
+    out: List[str] = []
+    seen = set()
+    for sym in symbols:
+        s = _normalize_symbol_token(sym)
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def _pick_page_from_body(body: Mapping[str, Any]) -> str:
@@ -417,11 +481,10 @@ def _collect_get_body(request: Request) -> Dict[str, Any]:
         v = _strip(qp.get(key))
         if v:
             body[key] = v
-    for key in ("symbols", "tickers", "tickers_list"):
+    for key in ("symbols", "tickers", "tickers_list", "selected_symbols", "selected_tickers", "direct_symbols", "symbol", "ticker", "code", "requested_symbol"):
         vals = qp.getlist(key)
         if vals:
             body[key] = _split_symbols_string(vals[0]) if len(vals) == 1 else [s.strip() for s in vals if _strip(s)]
-            break
     for key in (
         "limit", "offset", "top_n", "include_matrix", "risk_level", "risk_profile", "confidence_level",
         "investment_period_days", "horizon_days", "min_expected_roi", "min_roi", "min_confidence",
@@ -488,8 +551,8 @@ def _allow_query_token(settings: Any, request: Request) -> bool:
     return False
 
 
-def _extract_auth_token(*, token_query: Optional[str], x_app_token: Optional[str], authorization: Optional[str], settings: Any, request: Request) -> str:
-    auth_token = _strip(x_app_token)
+def _extract_auth_token(*, token_query: Optional[str], x_app_token: Optional[str], x_api_key: Optional[str], authorization: Optional[str], settings: Any, request: Request) -> str:
+    auth_token = _strip(x_app_token) or _strip(x_api_key)
     if authorization and authorization.strip().lower().startswith("bearer "):
         auth_token = authorization.strip().split(" ", 1)[1].strip()
     if token_query and not auth_token and _allow_query_token(settings, request):
@@ -500,6 +563,11 @@ def _extract_auth_token(*, token_query: Optional[str], x_app_token: Optional[str
 def _auth_passed(*, request: Request, settings: Any, auth_token: str, authorization: Optional[str]) -> bool:
     if auth_ok is None:
         return True
+    try:
+        if callable(is_open_mode) and bool(is_open_mode()):
+            return True
+    except Exception:
+        pass
     path = str(getattr(getattr(request, "url", None), "path", "") or "")
     if _is_public_path(settings, path):
         return True
@@ -750,6 +818,13 @@ def _rows_to_matrix(rows: Sequence[Mapping[str, Any]], keys: Sequence[str]) -> L
     return [[_json_safe(r.get(k)) for k in keys] for r in rows]
 
 
+def _slice(rows: List[Dict[str, Any]], *, limit: int, offset: int) -> List[Dict[str, Any]]:
+    start = max(0, int(offset))
+    if limit <= 0:
+        return rows[start:]
+    return rows[start:start + max(0, int(limit))]
+
+
 def _key_variants(key: str) -> List[str]:
     k = _strip(key)
     if not k:
@@ -821,7 +896,7 @@ def _normalize_to_schema_keys(*, schema_keys: Sequence[str], schema_headers: Seq
             v = "; ".join([_strip(x) for x in v if _strip(x)])
         out[ks] = _json_safe(v)
     if "symbol" in out and not out.get("symbol"):
-        out["symbol"] = _extract_from_nested_raw(raw, _key_variants("symbol"))
+        out["symbol"] = _normalize_symbol_token(_extract_from_nested_raw(raw, _key_variants("symbol")))
     if "current_price" in out and out.get("current_price") is None:
         out["current_price"] = _extract_from_nested_raw(raw, _key_variants("current_price"))
     return out
@@ -1175,40 +1250,56 @@ def _payload_has_real_rows(payload: Any, page: str = "") -> bool:
     return bool(_extract_rows_like(payload, page=page) or _extract_matrix_like(payload, page=page))
 
 
-def _slice(rows: List[Dict[str, Any]], *, limit: int, offset: int) -> List[Dict[str, Any]]:
-    start = max(0, int(offset))
-    if limit <= 0:
-        return rows[start:]
-    return rows[start:start + max(0, int(limit))]
+def _payload_quality_score(payload: Any, page: str = "") -> int:
+    if payload is None:
+        return -100
+    if isinstance(payload, list):
+        return 100 + min(25, len(payload))
+    if not isinstance(payload, Mapping):
+        return 0
+    score = 0
+    rows_like = _extract_rows_like(payload, page=page)
+    matrix_like = _extract_matrix_like(payload, page=page)
+    headers_like, keys_like = _extract_contract_from_payload(payload)
+    if rows_like:
+        score += 100 + min(25, len(rows_like))
+    if matrix_like:
+        score += 85 + min(15, len(matrix_like))
+    if headers_like:
+        score += 8
+    if keys_like:
+        score += 8
+    if page == _TOP10_PAGE and rows_like:
+        for field in _TOP10_REQUIRED_FIELDS:
+            if any(isinstance(r, Mapping) and r.get(field) not in (None, "", [], {}) for r in rows_like):
+                score += 10
+    status_out, error_out, _ = _extract_status_error(payload)
+    if status_out.lower() == "success":
+        score += 4
+    elif status_out.lower() == "partial":
+        score += 2
+    elif status_out.lower() in {"error", "failed", "fail"}:
+        score -= 4
+    if _strip(error_out):
+        score -= 6
+    return score
 
 
-def _build_fetch_window(limit: int, offset: int, *, minimum: int = 0, ceiling: int = 5000) -> Tuple[int, int]:
-    safe_limit = max(1, int(limit))
-    safe_offset = max(0, int(offset))
-    requested = safe_limit + safe_offset
-    fetch_limit = min(int(ceiling), max(int(minimum), requested))
-    fetch_limit = max(1, fetch_limit)
-    return fetch_limit, 0
+def _project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
+    return {str(k): _json_safe(row.get(k)) for k in keys}
 
 
-def _empty_schema_row(keys: Sequence[str], *, symbol: str = "") -> Dict[str, Any]:
-    row = {k: None for k in keys}
-    if symbol and "symbol" in row and not row.get("symbol"):
-        row["symbol"] = symbol
-    return row
-
-
-def _payload(*, page: str, route_family: str, headers: Sequence[str], keys: Sequence[str], rows: Sequence[Mapping[str, Any]], include_matrix: bool, request_id: str, started_at: float, mode: str, status_out: str = "success", error_out: Optional[str] = None, meta_extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    rows_list = [dict(r) for r in rows]
-    hdrs = list(headers)
-    ks = list(keys)
-    meta = {
-        "duration_ms": round((time.time() - started_at) * 1000.0, 3),
-        "mode": mode,
-        "count": len(rows_list),
-    }
-    if meta_extra:
-        meta.update(meta_extra)
+def _payload_envelope(*, page: str, route_family: str, headers: Sequence[str], keys: Sequence[str], row_objects: Sequence[Mapping[str, Any]], include_matrix: bool, request_id: str, started_at: float, mode: str, status_out: str, error_out: Optional[str], meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    hdrs = list(headers or [])
+    ks = list(keys or [])
+    rows_dict = [_project_row(ks, dict(r)) for r in (row_objects or [])]
+    if page == _TOP10_PAGE:
+        for idx, row in enumerate(rows_dict, start=1):
+            row.setdefault("top10_rank", idx)
+            row.setdefault("selection_reason", "Selected by analysis_sheet_rows.")
+            row.setdefault("criteria_snapshot", "{}")
+    matrix = _rows_to_matrix(rows_dict, ks) if include_matrix else []
+    display_rows = [{hdrs[i]: _json_safe(row.get(ks[i])) for i in range(len(ks))} for row in rows_dict]
     return _json_safe({
         "status": status_out,
         "page": page,
@@ -1222,38 +1313,133 @@ def _payload(*, page: str, route_family: str, headers: Sequence[str], keys: Sequ
         "keys": ks,
         "columns": ks,
         "fields": ks,
-        "rows": rows_list,
-        "items": rows_list,
-        "data": rows_list,
-        "quotes": rows_list,
-        "records": rows_list,
-        "rows_matrix": _rows_to_matrix(rows_list, ks) if include_matrix else [],
+        "rows": matrix,
+        "rows_matrix": matrix,
+        "matrix": matrix,
+        "row_objects": rows_dict,
+        "items": rows_dict,
+        "records": rows_dict,
+        "data": rows_dict,
+        "quotes": rows_dict,
+        "display_row_objects": display_rows,
+        "display_items": display_rows,
+        "display_records": display_rows,
+        "rows_dict_display": display_rows,
+        "count": len(rows_dict),
+        "detail": error_out or "",
         "error": error_out,
         "version": ANALYSIS_SHEET_ROWS_VERSION,
         "request_id": request_id,
-        "meta": meta,
+        "meta": {
+            "duration_ms": round((time.time() - started_at) * 1000.0, 3),
+            "mode": mode,
+            "count": len(rows_dict),
+            "row_object_count": len(rows_dict),
+            "matrix_row_count": len(matrix),
+            **(meta or {}),
+        },
     })
 
 
-def _emergency_payload(*, page: str, request_id: str, started_at: float, mode: str, route_family: Optional[str] = None, error_out: str, meta_extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    headers, keys, _spec, schema_source = _resolve_contract(page)
-    meta = dict(meta_extra or {})
-    meta.setdefault("dispatch", "analysis_sheet_rows_emergency_fallback")
-    meta.setdefault("schema_source", schema_source)
-    return _payload(
+def _normalize_external_payload(*, external_payload: Mapping[str, Any], page: str, headers: Sequence[str], keys: Sequence[str], include_matrix: bool, request_id: str, started_at: float, mode: str, route_family: str, meta_extra: Optional[Dict[str, Any]] = None, limit: int = 2000, offset: int = 0, top_n: int = 2000, requested_symbols: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+    ext = dict(external_payload or {})
+    payload_headers, payload_keys = _extract_contract_from_payload(ext)
+    hdrs = list(headers or payload_headers or [])
+    ks = list(keys or payload_keys or [])
+
+    if page == _TOP10_PAGE:
+        hdrs, ks = _ensure_top10_contract(hdrs, ks)
+    else:
+        hdrs, ks = _pad_contract(hdrs, ks, _expected_len(page))
+
+    rows = _extract_rows_like(ext, page=page)
+    matrix = _extract_matrix_like(ext, page=page)
+    if not rows and matrix:
+        rows = _rows_from_matrix(matrix, ks)
+
+    normalized_rows = [_normalize_to_schema_keys(schema_keys=ks, schema_headers=hdrs, raw=(r or {})) for r in rows]
+    if page == _TOP10_PAGE:
+        normalized_rows = _ensure_top10_rows(normalized_rows, requested_symbols=requested_symbols or [], top_n=top_n, schema_keys=ks, schema_headers=hdrs)
+
+    normalized_rows = _slice(normalized_rows, limit=limit, offset=offset)
+    status_out, error_out, ext_meta = _extract_status_error(ext)
+    final_meta = dict(ext_meta or {})
+    if meta_extra:
+        final_meta.update(meta_extra)
+    final_meta["source_route_family"] = _strip(ext.get("route_family")) or None
+    final_meta.setdefault("dispatch", "external_proxy")
+    return _payload_envelope(
         page=page,
-        route_family=route_family or _route_family_flexible(page),
-        headers=headers,
-        keys=keys,
-        rows=[],
-        include_matrix=True,
+        route_family=route_family,
+        headers=hdrs,
+        keys=ks,
+        row_objects=normalized_rows,
+        include_matrix=include_matrix,
         request_id=request_id,
         started_at=started_at,
         mode=mode,
-        status_out="partial",
+        status_out=status_out or ("success" if normalized_rows else "partial"),
         error_out=error_out,
-        meta_extra=meta,
+        meta=final_meta,
     )
+
+
+def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int) -> Any:
+    kk = _normalize_key_name(key)
+    if kk in {"symbol", "ticker"}:
+        return symbol
+    if kk == "name":
+        return f"{page} {symbol}"
+    if kk == "asset_class":
+        return "Commodity" if symbol.endswith("=F") else "FX" if symbol.endswith("=X") else "Fund" if page == "Mutual_Funds" else "Equity"
+    if kk == "exchange":
+        if symbol.endswith(".SR"):
+            return "Tadawul"
+        if symbol.endswith("=F"):
+            return "Futures"
+        if symbol.endswith("=X"):
+            return "FX"
+        return "NASDAQ/NYSE"
+    if kk == "currency":
+        return "SAR" if symbol.endswith(".SR") else "USD"
+    if kk == "country":
+        return "Saudi Arabia" if symbol.endswith(".SR") else "Global"
+    if kk == "data_provider":
+        return "analysis_sheet_rows.placeholder_fallback"
+    if kk == "last_updated_utc":
+        return datetime.utcnow().isoformat()
+    if kk == "last_updated_riyadh":
+        return datetime.utcnow().isoformat()
+    if kk == "recommendation":
+        return "Watch"
+    if kk == "recommendation_reason":
+        return "Placeholder fallback because live engine returned no usable rows."
+    if kk in {"top10_rank", "rank_overall"}:
+        return row_index
+    if kk == "selection_reason":
+        return "Placeholder fallback because upstream builders returned no usable rows."
+    if kk == "criteria_snapshot":
+        return "{}"
+    if kk in {"warnings", "notes"}:
+        return "placeholder"
+    return None
+
+
+def _build_placeholder_rows(*, page: str, keys: Sequence[str], requested_symbols: Sequence[str], limit: int, offset: int) -> List[Dict[str, Any]]:
+    symbols = [_normalize_symbol_token(x) for x in requested_symbols if _normalize_symbol_token(x)]
+    if not symbols:
+        symbols = [_normalize_symbol_token(x) for x in EMERGENCY_PAGE_SYMBOLS.get(page, []) if _normalize_symbol_token(x)]
+    symbols = symbols[offset : offset + limit] if (offset or len(symbols) > limit) else symbols[:limit]
+    rows: List[Dict[str, Any]] = []
+    for idx, sym in enumerate(symbols, start=offset + 1):
+        row = {str(k): _placeholder_value_for_key(page, str(k), sym, idx) for k in keys}
+        rows.append(row)
+    if page == _TOP10_PAGE:
+        for idx, row in enumerate(rows, start=offset + 1):
+            row["top10_rank"] = idx
+            row.setdefault("selection_reason", "Placeholder fallback because upstream builders returned no usable rows.")
+            row.setdefault("criteria_snapshot", "{}")
+    return rows
 
 
 # =============================================================================
@@ -1362,17 +1548,58 @@ async def _fetch_analysis_rows(engine: Any, symbols: List[str], *, mode: str, se
     return out
 
 
-async def _proxy_root_sheet_rows(*, request: Request, body: Dict[str, Any], mode: str, include_matrix_q: Optional[bool], token: Optional[str], x_app_token: Optional[str], authorization: Optional[str], x_request_id: Optional[str], page: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-    meta: Dict[str, Any] = {"root_proxy_attempted": True, "root_proxy_page": page}
-    try:
-        mod = importlib.import_module("routes.advanced_analysis")
-    except Exception as e:
-        meta["root_proxy_import_error"] = str(e)
-        return None, meta
+async def _call_core_sheet_rows_best_effort(*, page: str, limit: int, offset: int, mode: str, body: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    if core_get_sheet_rows is None:
+        return None, None
+    candidates = [
+        ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode, "body": body}),
+        ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode}),
+        ((), {"sheet": page, "limit": limit, "offset": offset}),
+        ((page,), {"limit": limit, "offset": offset, "mode": mode, "body": body}),
+        ((page,), {"limit": limit, "offset": offset, "mode": mode}),
+        ((page,), {"limit": limit, "offset": offset}),
+        ((page,), {}),
+    ]
+    last_err: Optional[Exception] = None
+    for args, kwargs in candidates:
+        try:
+            res = core_get_sheet_rows(*args, **kwargs)
+            res = await _maybe_await(res)
+            if isinstance(res, dict):
+                return res, "core:get_sheet_rows"
+            if isinstance(res, list):
+                return {"row_objects": res}, "core:get_sheet_rows"
+        except TypeError as e:
+            last_err = e
+            continue
+        except Exception as e:
+            last_err = e
+            break
+    if last_err is not None:
+        return {"status": "error", "error": str(last_err), "row_objects": []}, "core:get_sheet_rows"
+    return None, None
 
-    fn = getattr(mod, "_run_advanced_sheet_rows_impl", None)
+
+async def _proxy_callable(*, module_names: Sequence[str], function_name: str, request: Request, body: Dict[str, Any], mode: str, include_matrix_q: Optional[bool], token: Optional[str], x_app_token: Optional[str], x_api_key: Optional[str], authorization: Optional[str], x_request_id: Optional[str], page: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    meta: Dict[str, Any] = {"proxy_attempted": True, "proxy_target": function_name, "proxy_page": page}
+    imported = None
+    imported_name = ""
+    last_import_error: Optional[Exception] = None
+    for module_name in module_names:
+        try:
+            imported = importlib.import_module(module_name)
+            imported_name = module_name
+            break
+        except Exception as e:
+            last_import_error = e
+            continue
+    if imported is None:
+        meta["proxy_import_error"] = str(last_import_error) if last_import_error else "import failed"
+        return None, meta
+    fn = getattr(imported, function_name, None)
     if not callable(fn):
-        meta["root_proxy_missing_callable"] = True
+        meta["proxy_missing_callable"] = True
+        meta["proxy_module"] = imported_name
         return None, meta
 
     proxy_body = dict(body or {})
@@ -1388,64 +1615,39 @@ async def _proxy_root_sheet_rows(*, request: Request, body: Dict[str, Any], mode
                 include_matrix_q=include_matrix_q,
                 token=token,
                 x_app_token=x_app_token,
-                x_api_key=None,
+                x_api_key=x_api_key,
                 authorization=authorization,
                 x_request_id=x_request_id,
             )
         )
         if isinstance(result, dict):
-            meta["root_proxy_ok"] = True
-            meta["root_proxy_status"] = _strip(result.get("status")) or "success"
-            meta["root_proxy_has_rows"] = _payload_has_real_rows(result, page=page)
+            meta["proxy_ok"] = True
+            meta["proxy_module"] = imported_name
+            meta["proxy_status"] = _strip(result.get("status")) or "success"
+            meta["proxy_has_rows"] = _payload_has_real_rows(result, page=page)
             return result, meta
-        meta["root_proxy_non_dict"] = True
+        meta["proxy_non_dict"] = True
+        meta["proxy_module"] = imported_name
         return None, meta
     except Exception as e:
-        meta["root_proxy_call_error"] = str(e)
+        meta["proxy_call_error"] = str(e)
+        meta["proxy_module"] = imported_name
         return None, meta
 
 
-def _normalize_external_payload(*, external_payload: Mapping[str, Any], page: str, headers: Sequence[str], keys: Sequence[str], include_matrix: bool, request_id: str, started_at: float, mode: str, route_family: str, meta_extra: Optional[Dict[str, Any]] = None, limit: int = 2000, offset: int = 0, top_n: int = 2000, requested_symbols: Optional[Sequence[str]] = None) -> Dict[str, Any]:
-    ext = dict(external_payload or {})
-    payload_headers, payload_keys = _extract_contract_from_payload(ext)
-    hdrs = list(headers or payload_headers or [])
-    ks = list(keys or payload_keys or [])
-
-    if page == _TOP10_PAGE:
-        hdrs, ks = _ensure_top10_contract(hdrs, ks)
-    else:
-        hdrs, ks = _pad_contract(hdrs, ks, _expected_len(page))
-
-    rows = _extract_rows_like(ext, page=page)
-    matrix = _extract_matrix_like(ext, page=page)
-    if not rows and matrix:
-        rows = _rows_from_matrix(matrix, ks)
-
-    normalized_rows = [_normalize_to_schema_keys(schema_keys=ks, schema_headers=hdrs, raw=(r or {})) for r in rows]
-    if page == _TOP10_PAGE:
-        normalized_rows = _ensure_top10_rows(normalized_rows, requested_symbols=requested_symbols or [], top_n=top_n, schema_keys=ks, schema_headers=hdrs)
-
-    normalized_rows = _slice(normalized_rows, limit=limit, offset=offset)
-    status_out, error_out, ext_meta = _extract_status_error(ext)
-    final_meta = dict(ext_meta or {})
-    if meta_extra:
-        final_meta.update(meta_extra)
-    final_meta["dispatch"] = final_meta.get("dispatch") or "root_proxy"
-    final_meta["source_route_family"] = _strip(ext.get("route_family")) or None
-    return _payload(
-        page=page,
-        route_family=route_family,
-        headers=hdrs,
-        keys=ks,
-        rows=normalized_rows,
-        include_matrix=include_matrix,
-        request_id=request_id,
-        started_at=started_at,
-        mode=mode,
-        status_out=status_out or ("success" if normalized_rows else "partial"),
-        error_out=error_out,
-        meta_extra=final_meta,
-    )
+def _pick_best_payload(candidates: Sequence[Tuple[Optional[Dict[str, Any]], Dict[str, Any], str]], page: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any], str]:
+    best_payload: Optional[Dict[str, Any]] = None
+    best_meta: Dict[str, Any] = {}
+    best_name = ""
+    best_score = -10**9
+    for payload, meta, name in candidates:
+        score = _payload_quality_score(payload, page=page) if isinstance(payload, dict) else -10**9
+        if score > best_score:
+            best_payload = payload
+            best_meta = dict(meta or {})
+            best_name = name
+            best_score = score
+    return best_payload, best_meta, best_name
 
 
 # =============================================================================
@@ -1470,17 +1672,21 @@ async def analysis_sheet_rows_health(request: Request) -> Dict[str, Any]:
         "service": "analysis_sheet_rows",
         "version": ANALYSIS_SHEET_ROWS_VERSION,
         "schema_registry_available": bool(get_sheet_spec is not None),
+        "adapter_available": bool(core_get_sheet_rows is not None),
         "allowed_pages_count": len(_safe_allowed_pages()),
         "auth": auth_summary,
         "path": str(getattr(getattr(request, "url", None), "path", "")),
-        "proxy_target": "routes.advanced_analysis._run_advanced_sheet_rows_impl",
+        "proxy_targets": [
+            "routes.advanced_analysis._run_advanced_sheet_rows_impl",
+            "routes.advanced_sheet_rows._run_advanced_sheet_rows_impl",
+        ],
     })
 
 
 # =============================================================================
 # Internal implementation
 # =============================================================================
-async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any], mode: str, include_matrix_q: Optional[bool], token: Optional[str], x_app_token: Optional[str], authorization: Optional[str], x_request_id: Optional[str]) -> Dict[str, Any]:
+async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any], mode: str, include_matrix_q: Optional[bool], token: Optional[str], x_app_token: Optional[str], x_api_key: Optional[str], authorization: Optional[str], x_request_id: Optional[str]) -> Dict[str, Any]:
     start = time.time()
     request_id = _request_id(request, x_request_id)
     try:
@@ -1488,7 +1694,7 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
     except Exception:
         settings = None
 
-    auth_token = _extract_auth_token(token_query=token, x_app_token=x_app_token, authorization=authorization, settings=settings, request=request)
+    auth_token = _extract_auth_token(token_query=token, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization, settings=settings, request=request)
     if not _auth_passed(request=request, settings=settings, auth_token=auth_token, authorization=authorization):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
@@ -1500,37 +1706,94 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
     limit = max(1, min(5000, _maybe_int(merged_body.get("limit"), 2000)))
     offset = max(0, _maybe_int(merged_body.get("offset"), 0))
     top_n = max(1, min(5000, _maybe_int(merged_body.get("top_n"), limit)))
-    symbols = _get_list(merged_body, "symbols", "tickers", "tickers_list")
-    if symbols:
-        symbols = symbols[: max(top_n, limit + offset)]
+    schema_only = _maybe_bool(merged_body.get("schema_only"), False)
+    headers_only = _maybe_bool(merged_body.get("headers_only"), False)
+    requested_symbols = _extract_requested_symbols(merged_body, max(top_n, limit + offset, 50))
 
     headers, keys, spec, schema_source = _resolve_contract(page)
     engine, engine_source = await _get_engine(request)
 
-    # ------------------------------------------------------------------
-    # Proxy-first alignment to the canonical root owner.
-    # This is the main wrapper fix for special pages and is also safe for
-    # normal pages because the root owner already exposes the canonical
-    # schema-driven /sheet-rows contract.
-    # ------------------------------------------------------------------
-    root_payload, root_meta = await _proxy_root_sheet_rows(
+    if schema_only or headers_only:
+        return _payload_envelope(
+            page=page,
+            route_family=route_family,
+            headers=headers,
+            keys=keys,
+            row_objects=[],
+            include_matrix=include_matrix,
+            request_id=request_id,
+            started_at=start,
+            mode=mode,
+            status_out="success",
+            error_out=None,
+            meta={"dispatch": "schema_only", "schema_source": schema_source, "headers_only": headers_only, "schema_only": schema_only, "engine_source": engine_source},
+        )
+
+    root_payload, root_meta = await _proxy_callable(
+        module_names=("routes.advanced_analysis",),
+        function_name="_run_advanced_sheet_rows_impl",
         request=request,
         body=merged_body,
         mode=mode,
         include_matrix_q=include_matrix_q,
         token=token,
         x_app_token=x_app_token,
+        x_api_key=x_api_key,
         authorization=authorization,
         x_request_id=x_request_id,
         page=page,
     )
-    if isinstance(root_payload, dict):
-        root_has_rows = _payload_has_real_rows(root_payload, page=page)
-        root_status, root_error, _ = _extract_status_error(root_payload)
-        root_is_usable = root_has_rows or page in _SPECIAL_PAGES or _strip(root_status).lower() == "success"
-        if root_is_usable:
+
+    adv_payload, adv_meta = await _proxy_callable(
+        module_names=("routes.advanced_sheet_rows",),
+        function_name="_run_advanced_sheet_rows_impl",
+        request=request,
+        body=merged_body,
+        mode=mode,
+        include_matrix_q=include_matrix_q,
+        token=token,
+        x_app_token=x_app_token,
+        x_api_key=x_api_key,
+        authorization=authorization,
+        x_request_id=x_request_id,
+        page=page,
+    )
+
+    fetch_limit = min(5000, max(limit + offset, top_n, 1))
+    adapter_payload, adapter_source = await _call_core_sheet_rows_best_effort(
+        page=page,
+        limit=fetch_limit,
+        offset=0,
+        mode=mode or "",
+        body=merged_body,
+    )
+    adapter_meta = {"adapter_attempted": True, "adapter_source": adapter_source, "adapter_has_rows": _payload_has_real_rows(adapter_payload, page=page) if isinstance(adapter_payload, dict) else False}
+
+    best_payload, best_meta, best_name = _pick_best_payload(
+        [
+            (root_payload, root_meta, "root_proxy"),
+            (adv_payload, adv_meta, "advanced_proxy"),
+            (adapter_payload, adapter_meta, "adapter"),
+        ],
+        page=page,
+    )
+
+    if isinstance(best_payload, dict):
+        best_has_rows = _payload_has_real_rows(best_payload, page=page)
+        best_status, best_error, _ = _extract_status_error(best_payload)
+        best_is_usable = best_has_rows or page in _SPECIAL_PAGES or _strip(best_status).lower() == "success"
+        if best_is_usable:
+            meta_extra = {
+                "schema_source": schema_source,
+                "engine_source": engine_source,
+                "best_source": best_name,
+                "requested_symbols_count": len(requested_symbols),
+                **(best_meta or {}),
+            }
+            if best_error:
+                meta_extra.setdefault("upstream_error", best_error)
             return _normalize_external_payload(
-                external_payload=root_payload,
+                external_payload=best_payload,
                 page=page,
                 headers=headers,
                 keys=keys,
@@ -1539,101 +1802,159 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
                 started_at=start,
                 mode=mode,
                 route_family=route_family,
-                meta_extra={"schema_source": schema_source, "engine_source": engine_source, **root_meta},
+                meta_extra=meta_extra,
                 limit=limit,
                 offset=offset,
                 top_n=top_n,
-                requested_symbols=symbols,
+                requested_symbols=requested_symbols,
             )
-        if root_error:
-            root_meta["root_proxy_error"] = root_error
 
-    # ------------------------------------------------------------------
-    # Instrument symbol-mode fallback if root proxy was not usable.
-    # ------------------------------------------------------------------
-    if symbols:
-        if engine is None:
-            fallback_rows = [_empty_schema_row(keys, symbol=s) for s in symbols]
-            fallback_rows = _slice(fallback_rows, limit=limit, offset=offset)
-            return _payload(
+    # Symbol-mode instrument fallback.
+    if requested_symbols:
+        if engine is not None:
+            data_map = await _fetch_analysis_rows(engine, requested_symbols, mode=(mode or ""), settings=settings, schema=spec)
+            normalized_rows: List[Dict[str, Any]] = []
+            errors = 0
+            for sym in requested_symbols:
+                raw = _to_plain_dict(data_map.get(sym))
+                if not raw:
+                    raw = {"symbol": sym, "error": "missing_row"}
+                    errors += 1
+                elif isinstance(raw, dict) and raw.get("error"):
+                    errors += 1
+                normalized = _normalize_to_schema_keys(schema_keys=keys, schema_headers=headers, raw=raw)
+                if "symbol" in keys and not normalized.get("symbol"):
+                    normalized["symbol"] = sym
+                normalized_rows.append(normalized)
+
+            if page == _TOP10_PAGE:
+                normalized_rows = _ensure_top10_rows(
+                    normalized_rows,
+                    requested_symbols=requested_symbols,
+                    top_n=top_n,
+                    schema_keys=keys,
+                    schema_headers=headers,
+                )
+
+            normalized_rows = _slice(normalized_rows, limit=limit, offset=offset)
+            status_out = "success" if errors == 0 else ("partial" if errors < len(requested_symbols) else "error")
+            return _payload_envelope(
                 page=page,
                 route_family=route_family,
                 headers=headers,
                 keys=keys,
-                rows=fallback_rows,
+                row_objects=normalized_rows,
                 include_matrix=include_matrix,
                 request_id=request_id,
                 started_at=start,
                 mode=mode,
-                status_out="partial",
-                error_out="Data engine unavailable and root proxy unusable",
-                meta_extra={"requested": len(symbols), "returned": len(fallback_rows), "dispatch": "instrument_mode_no_engine", "schema_source": schema_source, "engine_source": engine_source, **root_meta},
+                status_out=status_out,
+                error_out=f"{errors} errors" if errors else None,
+                meta={
+                    "requested_total": len(requested_symbols),
+                    "returned": len(normalized_rows),
+                    "errors": errors,
+                    "dispatch": "instrument_mode",
+                    "schema_source": schema_source,
+                    "engine_source": engine_source,
+                    "best_source": best_name or "engine",
+                    "root_meta": root_meta,
+                    "advanced_meta": adv_meta,
+                    "adapter_meta": adapter_meta,
+                },
             )
 
-        data_map = await _fetch_analysis_rows(engine, symbols, mode=(mode or ""), settings=settings, schema=spec)
-        normalized_rows: List[Dict[str, Any]] = []
-        errors = 0
-        for sym in symbols:
-            raw = _to_plain_dict(data_map.get(sym))
-            if not raw:
-                raw = {"symbol": sym, "error": "missing_row"}
-                errors += 1
-            elif isinstance(raw, dict) and raw.get("error"):
-                errors += 1
-            normalized = _normalize_to_schema_keys(schema_keys=keys, schema_headers=headers, raw=raw)
-            if "symbol" in keys and not normalized.get("symbol"):
-                normalized["symbol"] = sym
-            normalized_rows.append(normalized)
-        if page == _TOP10_PAGE:
-            normalized_rows = _ensure_top10_rows(normalized_rows, requested_symbols=symbols, top_n=top_n, schema_keys=keys, schema_headers=headers)
-        normalized_rows = _slice(normalized_rows, limit=limit, offset=offset)
-        status_out = "success" if errors == 0 else ("partial" if errors < len(symbols) else "error")
-        return _payload(
+        placeholder_rows = _build_placeholder_rows(
+            page=page,
+            keys=keys,
+            requested_symbols=requested_symbols,
+            limit=limit,
+            offset=offset,
+        )
+        return _payload_envelope(
             page=page,
             route_family=route_family,
             headers=headers,
             keys=keys,
-            rows=normalized_rows,
+            row_objects=placeholder_rows,
             include_matrix=include_matrix,
             request_id=request_id,
             started_at=start,
             mode=mode,
-            status_out=status_out,
-            error_out=f"{errors} errors" if errors else None,
-            meta_extra={"requested": len(symbols), "returned": len(normalized_rows), "errors": errors, "dispatch": "instrument_mode", "schema_source": schema_source, "engine_source": engine_source, **root_meta},
+            status_out="partial",
+            error_out="Data engine unavailable; emitted placeholder fallback",
+            meta={
+                "dispatch": "placeholder_symbol_fallback",
+                "schema_source": schema_source,
+                "engine_source": engine_source,
+                "best_source": best_name or "none",
+                "root_meta": root_meta,
+                "advanced_meta": adv_meta,
+                "adapter_meta": adapter_meta,
+            },
         )
 
-    # ------------------------------------------------------------------
-    # Final fail-soft schema-shaped response.
-    # ------------------------------------------------------------------
-    return _payload(
+    # Last fail-soft schema-shaped response.
+    return _payload_envelope(
         page=page,
         route_family=route_family,
         headers=headers,
         keys=keys,
-        rows=[],
+        row_objects=[],
         include_matrix=include_matrix,
         request_id=request_id,
         started_at=start,
         mode=mode,
         status_out="partial",
         error_out="No usable rows returned; schema-shaped fallback emitted",
-        meta_extra={"dispatch": "analysis_wrapper_fail_soft", "schema_source": schema_source, "engine_source": engine_source, **root_meta},
+        meta={
+            "dispatch": "analysis_wrapper_fail_soft",
+            "schema_source": schema_source,
+            "engine_source": engine_source,
+            "best_source": best_name or "none",
+            "root_meta": root_meta,
+            "advanced_meta": adv_meta,
+            "adapter_meta": adapter_meta,
+        },
     )
 
 
-async def _analysis_sheet_rows_impl(request: Request, body: Dict[str, Any], mode: str, include_matrix_q: Optional[bool], token: Optional[str], x_app_token: Optional[str], authorization: Optional[str], x_request_id: Optional[str]) -> Dict[str, Any]:
+async def _analysis_sheet_rows_impl(request: Request, body: Dict[str, Any], mode: str, include_matrix_q: Optional[bool], token: Optional[str], x_app_token: Optional[str], x_api_key: Optional[str], authorization: Optional[str], x_request_id: Optional[str]) -> Dict[str, Any]:
     start = time.time()
     request_id = _request_id(request, x_request_id)
     merged_body = _merge_body_with_query(body, request)
     fallback_page = _normalize_page_flexible(_pick_page_from_body(merged_body) or "Market_Leaders")
     try:
-        return await _analysis_sheet_rows_impl_core(request=request, body=body, mode=mode, include_matrix_q=include_matrix_q, token=token, x_app_token=x_app_token, authorization=authorization, x_request_id=x_request_id)
+        return await _analysis_sheet_rows_impl_core(
+            request=request,
+            body=body,
+            mode=mode,
+            include_matrix_q=include_matrix_q,
+            token=token,
+            x_app_token=x_app_token,
+            x_api_key=x_api_key,
+            authorization=authorization,
+            x_request_id=x_request_id,
+        )
     except HTTPException:
         raise
     except Exception as e:
         logger.exception("analysis_sheet_rows_impl_unhandled", extra={"page": fallback_page})
-        return _emergency_payload(page=fallback_page, request_id=request_id, started_at=start, mode=mode, error_out=f"analysis_sheet_rows runtime fallback: {e}", meta_extra={"exception_type": type(e).__name__})
+        headers, keys, _spec, schema_source = _resolve_contract(fallback_page)
+        return _payload_envelope(
+            page=fallback_page,
+            route_family=_route_family_flexible(fallback_page),
+            headers=headers,
+            keys=keys,
+            row_objects=[],
+            include_matrix=True,
+            request_id=request_id,
+            started_at=start,
+            mode=mode,
+            status_out="partial",
+            error_out=f"analysis_sheet_rows runtime fallback: {e}",
+            meta={"dispatch": "analysis_sheet_rows_emergency_fallback", "schema_source": schema_source, "exception_type": type(e).__name__},
+        )
 
 
 # =============================================================================
@@ -1651,6 +1972,11 @@ async def analysis_sheet_rows_get(
     tab: str = Query(default="", description="sheet/page name"),
     symbols: str = Query(default="", description="comma-separated symbols"),
     tickers: str = Query(default="", description="comma-separated tickers"),
+    direct_symbols: str = Query(default="", description="comma-separated direct symbols"),
+    symbol: str = Query(default="", description="single symbol"),
+    ticker: str = Query(default="", description="single ticker"),
+    code: str = Query(default="", description="single code"),
+    requested_symbol: str = Query(default="", description="single requested symbol"),
     limit: Optional[int] = Query(default=None),
     offset: Optional[int] = Query(default=None),
     top_n: Optional[int] = Query(default=None),
@@ -1658,6 +1984,7 @@ async def analysis_sheet_rows_get(
     include_matrix_q: Optional[bool] = Query(default=None, alias="include_matrix"),
     token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
@@ -1672,13 +1999,28 @@ async def analysis_sheet_rows_get(
         "tab": tab,
         "symbols": symbols,
         "tickers": tickers,
+        "direct_symbols": direct_symbols,
+        "symbol": symbol,
+        "ticker": ticker,
+        "code": code,
+        "requested_symbol": requested_symbol,
         "limit": limit,
         "offset": offset,
         "top_n": top_n,
     }.items():
         if v not in (None, ""):
             body[k] = v
-    return await _analysis_sheet_rows_impl(request=request, body=body, mode=mode, include_matrix_q=include_matrix_q, token=token, x_app_token=x_app_token, authorization=authorization, x_request_id=x_request_id)
+    return await _analysis_sheet_rows_impl(
+        request=request,
+        body=body,
+        mode=mode,
+        include_matrix_q=include_matrix_q,
+        token=token,
+        x_app_token=x_app_token,
+        x_api_key=x_api_key,
+        authorization=authorization,
+        x_request_id=x_request_id,
+    )
 
 
 @router.post("/sheet-rows")
@@ -1689,10 +2031,21 @@ async def analysis_sheet_rows(
     include_matrix_q: Optional[bool] = Query(default=None, alias="include_matrix"),
     token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
-    return await _analysis_sheet_rows_impl(request=request, body=body, mode=mode, include_matrix_q=include_matrix_q, token=token, x_app_token=x_app_token, authorization=authorization, x_request_id=x_request_id)
+    return await _analysis_sheet_rows_impl(
+        request=request,
+        body=body,
+        mode=mode,
+        include_matrix_q=include_matrix_q,
+        token=token,
+        x_app_token=x_app_token,
+        x_api_key=x_api_key,
+        authorization=authorization,
+        x_request_id=x_request_id,
+    )
 
 
 __all__ = ["router", "ANALYSIS_SHEET_ROWS_VERSION"]
