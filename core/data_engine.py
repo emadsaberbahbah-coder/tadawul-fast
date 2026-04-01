@@ -2,7 +2,7 @@
 """
 core/data_engine.py
 ================================================================================
-Enterprise Data Engine — v6.6.0 (ALIGNED / SAFE / PROD-HARDENED / SHEET-ROWS)
+Enterprise Data Engine — v6.7.0 (ALIGNED / SAFE / PROD-HARDENED / SHEET-ROWS+)
 ================================================================================
 
 Primary goals (this revision)
@@ -65,7 +65,7 @@ from typing import (
 # Version Information
 # =============================================================================
 
-__version__ = "6.6.0"
+__version__ = "6.7.0"
 ADAPTER_VERSION = __version__
 
 # =============================================================================
@@ -737,10 +737,17 @@ class DistributedCache:
             self.backend = CacheBackend.MEMORY
             return
         try:
-            # NOTE: many repos store memcached as "host:port" list; aiomcache expects (host, port).
-            # If your env uses strings, prefer staying on MEMORY unless you implemented parsing elsewhere.
-            self._memcached_client = aiomcache.Client(self._memcached_servers)  # type: ignore
-            _dbg("Memcached cache ready", "info")
+            server = None
+            raw = self._memcached_servers[0]
+            if isinstance(raw, str):
+                host, _, port = raw.partition(":")
+                server = (host.strip() or "127.0.0.1", int((port or "11211").strip()))
+            elif isinstance(raw, (list, tuple)) and len(raw) >= 2:
+                server = (str(raw[0]).strip() or "127.0.0.1", int(raw[1]))
+            if not server:
+                raise ValueError("invalid memcached server config")
+            self._memcached_client = aiomcache.Client(server[0], server[1])  # type: ignore[arg-type]
+            _dbg(f"Memcached cache ready: {server[0]}:{server[1]}", "info")
         except Exception as e:
             _dbg(f"Memcached init failed: {e}", "warn")
             self.backend = CacheBackend.MEMORY
@@ -1847,98 +1854,234 @@ def _align_batch_results(results: Any, requested_symbols: List[str]) -> List[Any
     return arr + [None] * (len(requested_symbols) - len(arr))
 
 # =============================================================================
-# Sheet Rows (NEW in v6.6.0) — adapter-level API
+# Sheet Rows (NEW in v6.7.0) — adapter-level API
 # =============================================================================
 
-async def _call_engine_sheet_rows(engine: Any, *, sheet: str, limit: int, offset: int, mode: str, body: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Call sheet-rows on:
-      1) V2 module-level get_engine().get_sheet_rows (preferred)
-      2) engine methods: get_sheet_rows / sheet_rows / build_sheet_rows
-    Then enforce schema projection in this adapter (safety net).
-    """
-    sheet2 = _safe_str(sheet) or ""
-    limit = max(1, min(5000, int(limit or 2000)))
-    offset = max(0, int(offset or 0))
+_SPECIAL_SHEET_CANONICAL: Dict[str, str] = {
+    "insights_analysis": "Insights_Analysis",
+    "top_10_investments": "Top_10_Investments",
+    "top10investments": "Top_10_Investments",
+    "data_dictionary": "Data_Dictionary",
+}
+
+_SPECIAL_SHEET_METHODS: Dict[str, List[str]] = {
+    "Insights_Analysis": [
+        "build_insights_analysis",
+        "get_insights_analysis",
+        "build_insights_sheet_rows",
+        "get_insights_sheet_rows",
+        "build_insights_rows",
+        "get_insights_rows",
+    ],
+    "Top_10_Investments": [
+        "build_top_10_investments",
+        "build_top10_investments",
+        "get_top_10_investments",
+        "get_top10_investments",
+        "build_top10_sheet_rows",
+        "get_top10_sheet_rows",
+        "build_top10_rows",
+        "get_top10_rows",
+    ],
+    "Data_Dictionary": [
+        "build_data_dictionary",
+        "get_data_dictionary",
+        "build_data_dictionary_sheet_rows",
+        "get_data_dictionary_sheet_rows",
+        "build_data_dictionary_rows",
+        "get_data_dictionary_rows",
+    ],
+}
+
+def _boolish(v: Any, default: bool = False) -> bool:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(int(v))
+    if isinstance(v, str):
+        return v.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return default
+
+def _canonicalize_sheet_name(sheet: Any) -> str:
+    raw = _safe_str(sheet)
+    if not raw:
+        return ""
+    compact = raw.strip().lower().replace(" ", "_").replace("-", "_")
+    compact2 = compact.replace("__", "_")
+    return _SPECIAL_SHEET_CANONICAL.get(compact2, raw)
+
+def _resolve_sheet_from_inputs(sheet: Any, body: Optional[Dict[str, Any]] = None) -> str:
     body = body or {}
+    primary = _canonicalize_sheet_name(sheet)
+    if primary:
+        return primary
+    for key in ("sheet", "page", "sheet_name", "name", "tab", "worksheet"):
+        value = _canonicalize_sheet_name(body.get(key))
+        if value:
+            return value
+    return ""
 
-    # schema
-    headers, keys, _spec = _schema_headers_keys(sheet2)
+def _is_special_sheet(sheet: str) -> bool:
+    return _canonicalize_sheet_name(sheet) in _SPECIAL_SHEET_METHODS
 
-    # strict schema enforcement
-    if _SCHEMA_STRICT_SHEET_ROWS and _SCHEMA_AVAILABLE and (not headers or not keys):
-        return {
-            "status": "error",
-            "sheet": sheet2,
-            "page": sheet2,
-            "headers": [],
-            "keys": [],
-            "rows": [],
-            "rows_matrix": [],
-            "error": f"Unknown sheet or schema missing for '{sheet2}'",
-            "meta": {"strict": True},
-            "version": __version__,
-        }
+def _stable_body_for_cache(body: Optional[Dict[str, Any]]) -> str:
+    body = dict(body or {})
+    for noisy_key in ("request_id", "trace_id", "ts", "timestamp", "_ts", "_rid"):
+        body.pop(noisy_key, None)
+    try:
+        dumped = json_dumps(body)
+        if isinstance(dumped, bytes):
+            return dumped.decode("utf-8", errors="ignore")
+        return str(dumped)
+    except Exception:
+        try:
+            return str(sorted(body.items()))
+        except Exception:
+            return ""
 
-    # call engine
-    payload: Optional[Dict[str, Any]] = None
-    used = None
+def _rows_from_matrix(matrix: Any, keys: Sequence[str]) -> List[Dict[str, Any]]:
+    if not isinstance(matrix, list) or not keys:
+        return []
+    out: List[Dict[str, Any]] = []
+    for row in matrix:
+        if isinstance(row, dict):
+            out.append(_project_row(keys, row))
+            continue
+        if not isinstance(row, (list, tuple)):
+            continue
+        out.append({k: (row[i] if i < len(row) else None) for i, k in enumerate(keys)})
+    return out
 
-    # try calling methods on engine
-    for m in _candidate_sheet_rows_methods():
-        fn = getattr(engine, m, None)
+def _extract_payload_rows(payload: Dict[str, Any], keys_hint: Sequence[str], headers_hint: Sequence[str]) -> List[Dict[str, Any]]:
+    for bucket in ("rows", "data", "items", "records", "quotes", "results"):
+        rr = payload.get(bucket)
+        if isinstance(rr, list):
+            dict_rows = [r for r in rr if isinstance(r, dict)]
+            if dict_rows:
+                return dict_rows
+            if rr and all(isinstance(r, (list, tuple, dict)) for r in rr) and keys_hint:
+                return _rows_from_matrix(rr, keys_hint)
+
+    matrix = payload.get("rows_matrix") or payload.get("matrix")
+    if isinstance(matrix, list):
+        return _rows_from_matrix(matrix, keys_hint)
+
+    one = payload.get("row")
+    if isinstance(one, dict):
+        return [one]
+
+    if keys_hint and any(k in payload for k in keys_hint):
+        return [{k: payload.get(k) for k in keys_hint}]
+
+    if headers_hint and any(h in payload for h in headers_hint):
+        return [{k: payload.get(h) for k, h in zip(keys_hint, headers_hint)}]
+
+    return []
+
+async def _invoke_callable_candidates(target: Any, method_names: Sequence[str], *, sheet: str, limit: int, offset: int, mode: str, body: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    for method_name in method_names:
+        fn = getattr(target, method_name, None)
         if not callable(fn):
             continue
-        try:
-            res = fn(sheet=sheet2, limit=limit, offset=offset, mode=mode, body=body)
-            if inspect.isawaitable(res):
-                res = await res
-            if isinstance(res, dict):
-                payload = res
-                used = f"engine.{m}"
-                break
-        except TypeError:
-            # try positional fallbacks
+
+        attempts = [
+            lambda: fn(sheet=sheet, limit=limit, offset=offset, mode=mode, body=body),
+            lambda: fn(page=sheet, limit=limit, offset=offset, mode=mode, body=body),
+            lambda: fn(sheet, limit=limit, offset=offset, mode=mode, body=body),
+            lambda: fn(sheet=sheet, limit=limit, offset=offset, mode=mode, **body),
+            lambda: fn(page=sheet, limit=limit, offset=offset, mode=mode, **body),
+            lambda: fn(sheet=sheet, limit=limit, offset=offset, **body),
+            lambda: fn(page=sheet, limit=limit, offset=offset, **body),
+            lambda: fn(sheet, limit=limit, offset=offset, **body),
+            lambda: fn(sheet),
+            lambda: fn(page=sheet),
+            lambda: fn(body),
+            lambda: fn(),
+        ]
+
+        for attempt in attempts:
             try:
-                res = fn(sheet2, limit=limit, offset=offset, mode=mode, body=body)
+                res = attempt()
                 if inspect.isawaitable(res):
                     res = await res
                 if isinstance(res, dict):
-                    payload = res
-                    used = f"engine.{m}"
-                    break
+                    return res, method_name
+                if isinstance(res, list):
+                    return {"status": "success", "sheet": sheet, "page": sheet, "rows": res}, method_name
+            except TypeError:
+                continue
             except Exception:
                 continue
-        except Exception:
-            continue
+    return None, None
 
-    # fallback: schema-only if engine didn't provide rows
-    if payload is None:
-        return {
-            "status": "success",
-            "sheet": sheet2,
-            "page": sheet2,
-            "headers": headers or [],
-            "keys": keys or [],
-            "rows": [],
-            "rows_matrix": [] if (headers and keys) else [],
-            "meta": {"path": "schema_only_fallback", "builder": "none"},
-            "version": __version__,
-        }
+async def _call_special_sheet_rows_builder(engine: Any, *, sheet: str, limit: int, offset: int, mode: str, body: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    canonical = _canonicalize_sheet_name(sheet)
+    method_names = _SPECIAL_SHEET_METHODS.get(canonical, [])
+    if not method_names:
+        return None, None
 
-    # normalize output to schema (safety net)
-    out_headers = payload.get("headers") if isinstance(payload.get("headers"), list) else (headers or [])
-    out_keys = payload.get("keys") if isinstance(payload.get("keys"), list) else (keys or [])
+    payload, used = await _invoke_callable_candidates(
+        engine,
+        method_names,
+        sheet=canonical,
+        limit=limit,
+        offset=offset,
+        mode=mode,
+        body=body,
+    )
+    if payload is not None:
+        return payload, f"engine.{used}"
 
-    # if schema exists, always force it
-    if headers and keys:
-        out_headers = headers[:]
-        out_keys = keys[:]
+    mode2, info, _ = _V2_DISCOVERY.discover()
+    if mode2 in (EngineMode.V2, EngineMode.LEGACY) and info and info.module is not None:
+        payload, used = await _invoke_callable_candidates(
+            info.module,
+            method_names,
+            sheet=canonical,
+            limit=limit,
+            offset=offset,
+            mode=mode,
+            body=body,
+        )
+        if payload is not None:
+            return payload, f"module.{used}"
 
-    raw_rows = payload.get("rows") or payload.get("data") or payload.get("items") or []
-    if not isinstance(raw_rows, list):
-        raw_rows = []
-    raw_rows = [r for r in raw_rows if isinstance(r, dict)]
+    return None, None
+
+def _normalize_sheet_payload(
+    payload: Optional[Dict[str, Any]],
+    *,
+    sheet: str,
+    limit: int,
+    offset: int,
+    mode: str,
+    body: Dict[str, Any],
+    used: Optional[str],
+) -> Dict[str, Any]:
+    payload = payload or {}
+
+    sheet2 = _canonicalize_sheet_name(sheet)
+    headers_schema, keys_schema, _spec = _schema_headers_keys(sheet2)
+
+    payload_headers = payload.get("headers") or payload.get("display_headers") or payload.get("columns") or []
+    payload_keys = payload.get("keys") or payload.get("field_names") or payload.get("fields") or []
+
+    out_headers = [str(x) for x in payload_headers] if isinstance(payload_headers, list) else []
+    out_keys = [str(x) for x in payload_keys] if isinstance(payload_keys, list) else []
+
+    if headers_schema and keys_schema:
+        out_headers = headers_schema[:]
+        out_keys = keys_schema[:]
+    elif out_headers and not out_keys:
+        out_keys = out_headers[:]
+    elif out_keys and not out_headers:
+        out_headers = out_keys[:]
+
+    raw_rows = _extract_payload_rows(payload, out_keys, out_headers)
+
+    if not raw_rows and out_keys:
+        matrix = payload.get("rows_matrix") or payload.get("matrix")
+        raw_rows = _rows_from_matrix(matrix, out_keys)
 
     rows_norm: List[Dict[str, Any]] = []
     if out_keys:
@@ -1948,39 +2091,134 @@ async def _call_engine_sheet_rows(engine: Any, *, sheet: str, limit: int, offset
     else:
         rows_norm = [dict(r) for r in raw_rows]
 
-    rows_norm = rows_norm[offset : offset + limit] if rows_norm else rows_norm
+    headers_only = _boolish(body.get("headers_only"), False)
+    schema_only = _boolish(body.get("schema_only"), False)
+    include_matrix = _boolish(body.get("include_matrix", True), True)
 
-    include_matrix = True
-    try:
-        v = body.get("include_matrix", True)
-        if isinstance(v, bool):
-            include_matrix = v
-        elif isinstance(v, (int, float)):
-            include_matrix = bool(int(v))
-        elif isinstance(v, str):
-            include_matrix = v.strip().lower() in {"1", "true", "yes", "y", "on"}
-    except Exception:
-        include_matrix = True
+    if schema_only:
+        rows_norm = []
+    elif rows_norm:
+        rows_norm = rows_norm[offset : offset + limit]
+
+    rows_matrix = _rows_to_matrix(rows_norm, out_keys) if (include_matrix and out_keys and not (headers_only or schema_only)) else ([] if include_matrix and out_keys and (headers_only or schema_only) else None)
+
+    status = payload.get("status") or "success"
+    if _SCHEMA_STRICT_SHEET_ROWS and _SCHEMA_AVAILABLE and (not out_headers or not out_keys):
+        status = "error"
+
+    meta_in = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
 
     return {
-        "status": payload.get("status") or "success",
+        "status": status,
         "sheet": payload.get("sheet") or sheet2,
         "page": payload.get("page") or sheet2,
         "headers": out_headers,
+        "display_headers": out_headers,
         "keys": out_keys,
-        "rows": rows_norm,
-        "rows_matrix": _rows_to_matrix(rows_norm, out_keys) if (include_matrix and out_keys) else None,
+        "rows": [] if headers_only else rows_norm,
+        "rows_matrix": rows_matrix,
+        "data": [] if headers_only else rows_norm,
+        "items": [] if headers_only else rows_norm,
         "error": payload.get("error"),
         "meta": {
-            **(payload.get("meta") or {}),
-            "adapter_schema_enforced": bool(headers and keys),
-            "builder": used or payload.get("meta", {}).get("builder") or "unknown",
+            **meta_in,
+            "adapter_schema_enforced": bool(headers_schema and keys_schema),
+            "special_dispatch": _is_special_sheet(sheet2),
+            "builder": used or meta_in.get("builder") or "unknown",
             "limit": limit,
             "offset": offset,
             "mode": mode,
+            "headers_only": headers_only,
+            "schema_only": schema_only,
+            "row_count": 0 if headers_only else len(rows_norm),
         },
         "version": payload.get("version") or __version__,
     }
+
+async def _call_engine_sheet_rows(engine: Any, *, sheet: str, limit: int, offset: int, mode: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Call sheet-rows on:
+      1) Special sheet builders for Insights_Analysis / Top_10_Investments / Data_Dictionary
+      2) Engine methods: get_sheet_rows / sheet_rows / build_sheet_rows
+      3) Schema-only fallback when builders are unavailable
+
+    Then enforce schema projection in this adapter as the final safety net.
+    """
+    sheet2 = _resolve_sheet_from_inputs(sheet, body)
+    limit = max(1, min(5000, int(limit or 2000)))
+    offset = max(0, int(offset or 0))
+    body = dict(body or {})
+    mode = _safe_str(mode)
+
+    headers, keys, _spec = _schema_headers_keys(sheet2)
+
+    if _SCHEMA_STRICT_SHEET_ROWS and _SCHEMA_AVAILABLE and (not headers or not keys):
+        return {
+            "status": "error",
+            "sheet": sheet2,
+            "page": sheet2,
+            "headers": [],
+            "display_headers": [],
+            "keys": [],
+            "rows": [],
+            "rows_matrix": [],
+            "data": [],
+            "items": [],
+            "error": f"Unknown sheet or schema missing for '{sheet2}'",
+            "meta": {"strict": True, "builder": "schema_guard"},
+            "version": __version__,
+        }
+
+    payload: Optional[Dict[str, Any]] = None
+    used: Optional[str] = None
+
+    if _is_special_sheet(sheet2):
+        payload, used = await _call_special_sheet_rows_builder(
+            engine,
+            sheet=sheet2,
+            limit=limit,
+            offset=offset,
+            mode=mode,
+            body=body,
+        )
+
+    if payload is None:
+        payload, method_used = await _invoke_callable_candidates(
+            engine,
+            _candidate_sheet_rows_methods(),
+            sheet=sheet2,
+            limit=limit,
+            offset=offset,
+            mode=mode,
+            body=body,
+        )
+        used = used or (f"engine.{method_used}" if method_used else None)
+
+    if payload is None:
+        payload = {
+            "status": "success",
+            "sheet": sheet2,
+            "page": sheet2,
+            "headers": headers or [],
+            "display_headers": headers or [],
+            "keys": keys or [],
+            "rows": [],
+            "rows_matrix": [] if (headers and keys and _boolish(body.get("include_matrix", True), True)) else None,
+            "data": [],
+            "items": [],
+            "meta": {"path": "schema_only_fallback", "builder": "none"},
+            "version": __version__,
+        }
+
+    return _normalize_sheet_payload(
+        payload,
+        sheet=sheet2,
+        limit=limit,
+        offset=offset,
+        mode=mode,
+        body=body,
+        used=used,
+    )
 
 @otel_traced("get_sheet_rows")
 @monitor_perf("get_sheet_rows")
@@ -1996,14 +2234,15 @@ async def get_sheet_rows(
     """
     Public adapter-level Sheet Rows API.
 
-    - Uses V2 engine's native get_sheet_rows if available.
-    - Enforces schema projection (adapter safety net).
+    - Resolves sheet aliases from both explicit arguments and request body.
+    - Uses special builders for Insights_Analysis / Top_10_Investments / Data_Dictionary when available.
+    - Enforces schema projection as the final adapter safety net.
     - Optional caching is supported (off by default; sheet-rows often dynamic).
     """
-    sheet2 = _safe_str(sheet) or ""
-    body = body or {}
+    body = dict(body or {})
+    sheet2 = _resolve_sheet_from_inputs(sheet, body)
 
-    cache_key = f"{sheet2}:{limit}:{offset}:{mode}:{'1' if body.get('include_matrix', True) else '0'}"
+    cache_key = f"{sheet2}:{limit}:{offset}:{mode}:{_stable_body_for_cache(body)}"
     if use_cache:
         cached = await _ENGINE_MANAGER.get_cache().get("sheet_rows", cache_key)
         if cached is not None and isinstance(cached, dict):
@@ -2026,7 +2265,17 @@ def get_sheet_rows_sync(
     use_cache: bool = False,
     ttl: Optional[int] = None,
 ) -> Dict[str, Any]:
-    return _run_coro_sync(get_sheet_rows(sheet, limit=limit, offset=offset, mode=mode, body=body, use_cache=use_cache, ttl=ttl))
+    return _run_coro_sync(
+        get_sheet_rows(
+            sheet,
+            limit=limit,
+            offset=offset,
+            mode=mode,
+            body=body,
+            use_cache=use_cache,
+            ttl=ttl,
+        )
+    )
 
 # =============================================================================
 # Quote calling internals (unchanged)
