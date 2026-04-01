@@ -2,11 +2,13 @@
 """
 routes/advanced_analysis.py
 --------------------------------------------------------------------------------
-TADAWUL ADVANCED ANALYSIS ROUTER — v7.8.0
+TADAWUL ADVANCED ANALYSIS ROUTER — v7.9.0
 (ROOT /SHEET-ROWS HARDENING / ENGINE-CONTRACT ALIGNMENT /
  SPECIAL-PAGE FAIL-SOFT / DATA-DICTIONARY GUARANTEE / JSON-SAFE / ASYNC-SAFE)
 
 What this revision improves
+- FIX: adds adapter-first sheet-rows alignment with core.data_engine.get_sheet_rows
+       so this router stays consistent with the revised adapter contract.
 - FIX: aligns fallback headers/keys with core.data_engine_v2 canonical contracts
        instead of deriving keys from display headers.
 - FIX: accepts direct symbol aliases (symbol/ticker/code/requested_symbol) in GET
@@ -44,7 +46,7 @@ from fastapi.routing import APIRouter
 logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
-ADVANCED_ANALYSIS_VERSION = "7.8.0"
+ADVANCED_ANALYSIS_VERSION = "7.9.0"
 SCHEMA_ROUTE_OWNER = "advanced_analysis"
 SCHEMA_ROUTE_FAMILY = "schema"
 ROOT_SHEET_ROWS_OWNER = "advanced_analysis"
@@ -208,6 +210,7 @@ def _special_timeout_env(name: str, default: float) -> float:
 
 
 SPECIAL_PAGE_ENGINE_TIMEOUT_SEC = _special_timeout_env("TFB_SPECIAL_PAGE_ENGINE_TIMEOUT_SEC", 8.0)
+SPECIAL_PAGE_ADAPTER_TIMEOUT_SEC = _special_timeout_env("TFB_SPECIAL_PAGE_ADAPTER_TIMEOUT_SEC", 8.0)
 SPECIAL_PAGE_BUILDER_TIMEOUT_SEC = _special_timeout_env("TFB_SPECIAL_PAGE_BUILDER_TIMEOUT_SEC", 10.0)
 SPECIAL_PAGE_REHYDRATE_TIMEOUT_SEC = _special_timeout_env("TFB_SPECIAL_PAGE_REHYDRATE_TIMEOUT_SEC", 8.0)
 
@@ -583,6 +586,62 @@ async def _get_engine(request: Request) -> Optional[Any]:
         except Exception:
             continue
     return None
+
+
+async def _adapter_fetch_any(*, sheet: str, fetch_limit: int, mode: str, body: Dict[str, Any]) -> Any:
+    best_payload: Any = None
+    best_score = -9999
+
+    for modpath in ("core.data_engine", "core.data_engine_v2"):
+        try:
+            mod = import_module(modpath)
+        except Exception:
+            continue
+
+        callables: List[Tuple[Any, str]] = []
+        for name in ("get_sheet_rows", "sheet_rows", "build_sheet_rows"):
+            fn = getattr(mod, name, None)
+            if callable(fn):
+                callables.append((fn, f"{modpath}.{name}"))
+
+        data_engine_cls = getattr(mod, "DataEngine", None)
+        if callable(data_engine_cls):
+            try:
+                instance = data_engine_cls()
+                fn = getattr(instance, "get_sheet_rows", None)
+                if callable(fn):
+                    callables.append((fn, f"{modpath}.DataEngine.get_sheet_rows"))
+            except Exception:
+                pass
+
+        for fn, dispatch_name in callables:
+            try:
+                out = await _call_function_flexible(fn, [
+                    ((), {"sheet": sheet, "limit": fetch_limit, "offset": 0, "mode": mode, "body": body, "use_cache": False}),
+                    ((), {"sheet": sheet, "limit": fetch_limit, "offset": 0, "mode": mode, "body": body}),
+                    ((), {"sheet": sheet, "page": sheet, "sheet_name": sheet, "limit": fetch_limit, "offset": 0, "mode": mode, "body": body}),
+                    ((sheet,), {"limit": fetch_limit, "offset": 0, "mode": mode, "body": body, "use_cache": False}),
+                    ((sheet,), {"limit": fetch_limit, "offset": 0, "mode": mode, "body": body}),
+                    ((sheet,), {"limit": fetch_limit, "offset": 0}),
+                    ((sheet,), {}),
+                ])
+                score = _payload_quality_score(out, page=sheet)
+                if isinstance(out, Mapping):
+                    out = dict(out)
+                    out.setdefault("meta", {})
+                    if isinstance(out.get("meta"), dict):
+                        out["meta"].setdefault("adapter_dispatch", dispatch_name)
+                if score > best_score:
+                    best_payload = out
+                    best_score = score
+                if _payload_has_real_rows(out):
+                    return out
+            except Exception:
+                continue
+
+    if best_payload is not None:
+        return best_payload
+    raise RuntimeError("Adapter has no supported sheet-rows method")
 
 
 def _safe_engine_type(engine: Any) -> str:
@@ -1725,12 +1784,27 @@ async def _run_advanced_sheet_rows_impl(
     engine = await _get_engine(request)
     schema = _get_sheet_spec(sheet)
 
-    # Special pages: compare engine and builder outputs, keep the best, never 5xx.
+    # Special pages: compare adapter, engine, and builder outputs; keep the best; never 5xx.
     if sheet in {"Insights_Analysis", "Top_10_Investments"}:
         try:
+            result_adapter = None
             result_engine = None
+            result_builder = None
+            score_adapter = -9999
             score_engine = -9999
+            score_builder = -9999
             special_error_parts: List[str] = []
+
+            try:
+                result_adapter = await _await_with_timeout(
+                    _adapter_fetch_any(sheet=sheet, fetch_limit=fetch_limit, mode=mode or "", body=body),
+                    SPECIAL_PAGE_ADAPTER_TIMEOUT_SEC,
+                    f"{sheet} adapter fetch",
+                )
+                score_adapter = _payload_quality_score(result_adapter, page=sheet)
+            except Exception as e:
+                special_error_parts.append(f"adapter={e}")
+                logger.warning("%s adapter fetch failed softly: %s", sheet, e)
 
             if engine is not None:
                 try:
@@ -1752,7 +1826,6 @@ async def _run_advanced_sheet_rows_impl(
                 builder_functions = ("build_top10_rows", "build_top10_output_rows", "build_top10_investments_rows", "build_top_10_investments_rows", "get_top10_rows", "select_top10", "select_top10_symbols", "build_rows")
 
             builder_meta: Dict[str, Any] = {}
-            result_builder = None
             try:
                 result_builder, builder_meta = await _await_with_timeout(
                     _call_builder_best_effort(
@@ -1780,12 +1853,18 @@ async def _run_advanced_sheet_rows_impl(
 
             score_builder = _payload_quality_score(result_builder, page=sheet) if result_builder is not None else -9999
 
-            chosen = result_engine if score_engine >= score_builder else result_builder
-            chosen_dispatch = "engine_special_best" if score_engine >= score_builder else "builder_special_best"
-            if chosen is None:
-                chosen = {"status": "partial", "row_objects": [], "error": f"{sheet} builder and engine returned no payload"}
+            candidates = [
+                ("adapter_special_best", result_adapter, score_adapter),
+                ("engine_special_best", result_engine, score_engine),
+                ("builder_special_best", result_builder, score_builder),
+            ]
+            candidates.sort(key=lambda x: x[2], reverse=True)
+            chosen_dispatch, chosen, _chosen_score = candidates[0]
 
-            # Rehydrate symbols-only builder result for Top10 if necessary.
+            if chosen is None:
+                chosen = {"status": "partial", "row_objects": [], "error": f"{sheet} adapter, builder, and engine returned no payload"}
+
+            # Rehydrate symbols-only builder/adapter result for Top10 if necessary.
             if sheet == "Top_10_Investments" and not _payload_has_real_rows(chosen):
                 syms = _extract_requested_symbols(body, limit=fetch_limit)
                 if not syms:
@@ -1846,10 +1925,13 @@ async def _run_advanced_sheet_rows_impl(
                 default_status="partial",
                 extra_meta={
                     "schema_source": schema_source,
+                    "adapter_payload_quality": score_adapter,
                     "engine_available": bool(engine),
                     "engine_type": _safe_engine_type(engine) if engine else "none",
-                    "fetch_limit": fetch_limit,
                     "engine_payload_quality": score_engine,
+                    "builder_payload_quality": score_builder,
+                    "fetch_limit": fetch_limit,
+                    "special_timeout_adapter_sec": SPECIAL_PAGE_ADAPTER_TIMEOUT_SEC,
                     "special_timeout_engine_sec": SPECIAL_PAGE_ENGINE_TIMEOUT_SEC,
                     "special_timeout_builder_sec": SPECIAL_PAGE_BUILDER_TIMEOUT_SEC,
                     "special_timeout_rehydrate_sec": SPECIAL_PAGE_REHYDRATE_TIMEOUT_SEC,
@@ -1886,6 +1968,7 @@ async def _run_advanced_sheet_rows_impl(
                     "fetch_limit": fetch_limit,
                     "offset": offset,
                     "limit": limit,
+                    "special_timeout_adapter_sec": SPECIAL_PAGE_ADAPTER_TIMEOUT_SEC,
                     "special_timeout_engine_sec": SPECIAL_PAGE_ENGINE_TIMEOUT_SEC,
                     "special_timeout_builder_sec": SPECIAL_PAGE_BUILDER_TIMEOUT_SEC,
                     "special_timeout_rehydrate_sec": SPECIAL_PAGE_REHYDRATE_TIMEOUT_SEC,
@@ -1893,7 +1976,21 @@ async def _run_advanced_sheet_rows_impl(
             )
 
     # Instrument-style pages.
-    if engine is None:
+    result_adapter = None
+    score_adapter = -9999
+    adapter_error: Optional[str] = None
+    try:
+        result_adapter = await _await_with_timeout(
+            _adapter_fetch_any(sheet=sheet, fetch_limit=fetch_limit, mode=mode or "", body=body),
+            SPECIAL_PAGE_ADAPTER_TIMEOUT_SEC,
+            f"{sheet} adapter fetch",
+        )
+        score_adapter = _payload_quality_score(result_adapter, page=sheet)
+    except Exception as e:
+        adapter_error = str(e)
+        logger.warning("Adapter table fetch failed for %s: %s", sheet, e)
+
+    if engine is None and result_adapter is None:
         requested_symbols = _extract_requested_symbols(body, limit=fetch_limit)
         placeholder_rows = _build_placeholder_rows(page=sheet, keys=schema_keys, requested_symbols=requested_symbols, limit=limit, offset=offset)
         return _payload_envelope(
@@ -1906,11 +2003,12 @@ async def _run_advanced_sheet_rows_impl(
             request_id=request_id,
             started_at=t0,
             status_out="degraded" if placeholder_rows else "partial",
-            error_out=None if placeholder_rows else "engine unavailable",
+            error_out=adapter_error if not placeholder_rows else None,
             meta={
                 "schema_source": schema_source,
                 "engine_available": False,
-                "dispatch": "placeholder_no_engine",
+                "adapter_payload_quality": score_adapter,
+                "dispatch": "placeholder_no_engine_or_adapter",
                 "fetch_limit": fetch_limit,
                 "offset": offset,
                 "limit": limit,
@@ -1918,7 +2016,7 @@ async def _run_advanced_sheet_rows_impl(
         )
 
     requested_symbols = _extract_requested_symbols(body, limit=fetch_limit)
-    if requested_symbols:
+    if requested_symbols and engine is not None:
         selected = requested_symbols[offset: offset + limit] if (offset or len(requested_symbols) > limit) else requested_symbols[:limit]
         data_map = await _fetch_analysis_rows(engine, selected, mode=mode or "", schema=schema)
         rows: List[Dict[str, Any]] = []
@@ -1934,26 +2032,46 @@ async def _run_advanced_sheet_rows_impl(
             if "symbol" in schema_keys and not rr.get("symbol"):
                 rr["symbol"] = _normalize_symbol_token(sym)
             rows.append(_project_row(schema_keys, rr))
+
         if not rows:
             rows = _build_placeholder_rows(page=sheet, keys=schema_keys, requested_symbols=selected, limit=limit, offset=offset)
-        return _payload_envelope(
-            page=sheet,
-            route_family=route_family,
-            headers=schema_headers,
-            keys=schema_keys,
-            row_objects=rows,
-            include_matrix=bool(include_matrix_final),
-            request_id=request_id,
-            started_at=t0,
-            status_out="success" if errors == 0 else ("partial" if errors < len(selected) else "error"),
-            error_out=(f"{errors} errors" if errors else None),
-            meta={
-                "schema_source": schema_source,
-                "engine_available": True,
-                "engine_type": _safe_engine_type(engine),
+
+        batch_payload = {
+            "status": "success" if errors == 0 else ("partial" if errors < len(selected) else "error"),
+            "row_objects": rows,
+            "error": (f"{errors} errors" if errors else None),
+            "meta": {
                 "dispatch": "instrument_batch",
                 "requested": len(selected),
                 "errors": errors,
+                "offset": offset,
+                "limit": limit,
+            },
+        }
+        batch_score = _payload_quality_score(batch_payload, page=sheet)
+        chosen_payload = result_adapter if score_adapter > batch_score else batch_payload
+        chosen_dispatch = "adapter_batch_best" if score_adapter > batch_score else "instrument_batch"
+
+        return _normalize_result_to_payload(
+            result=chosen_payload,
+            page=sheet,
+            route_family=route_family,
+            schema_headers=schema_headers,
+            schema_keys=schema_keys,
+            include_matrix=bool(include_matrix_final),
+            request_id=request_id,
+            started_at=t0,
+            dispatch=chosen_dispatch,
+            limit=limit,
+            offset=offset,
+            default_status="partial",
+            extra_meta={
+                "schema_source": schema_source,
+                "adapter_payload_quality": score_adapter,
+                "engine_available": True,
+                "engine_type": _safe_engine_type(engine),
+                "batch_payload_quality": batch_score,
+                "fetch_limit": fetch_limit,
                 "offset": offset,
                 "limit": limit,
             },
@@ -1967,7 +2085,7 @@ async def _run_advanced_sheet_rows_impl(
         engine_payload = {"status": "partial", "row_objects": [], "error": str(e)}
         engine_score = _payload_quality_score(engine_payload, page=sheet)
 
-    if not _payload_has_real_rows(engine_payload) and route_family == "instrument":
+    if not _payload_has_real_rows(engine_payload) and route_family == "instrument" and engine is not None:
         synth_symbols = await _resolve_engine_symbols_for_sheet(engine, sheet, body, fetch_limit)
         if synth_symbols:
             data_map = await _fetch_analysis_rows(engine, synth_symbols, mode=mode or "", schema=schema)
@@ -1996,8 +2114,11 @@ async def _run_advanced_sheet_rows_impl(
             }
             engine_score = _payload_quality_score(engine_payload, page=sheet)
 
+    chosen_payload = result_adapter if score_adapter > engine_score else engine_payload
+    chosen_dispatch = "adapter_table_best" if score_adapter > engine_score else "engine_table_mode"
+
     return _normalize_result_to_payload(
-        result=engine_payload,
+        result=chosen_payload,
         page=sheet,
         route_family=route_family,
         schema_headers=schema_headers,
@@ -2005,21 +2126,21 @@ async def _run_advanced_sheet_rows_impl(
         include_matrix=bool(include_matrix_final),
         request_id=request_id,
         started_at=t0,
-        dispatch="engine_table_mode",
+        dispatch=chosen_dispatch,
         limit=limit,
         offset=offset,
         default_status="partial",
         extra_meta={
             "schema_source": schema_source,
-            "engine_available": True,
-            "engine_type": _safe_engine_type(engine),
+            "adapter_payload_quality": score_adapter,
+            "engine_available": bool(engine),
+            "engine_type": _safe_engine_type(engine) if engine else "none",
             "engine_payload_quality": engine_score,
             "fetch_limit": fetch_limit,
             "offset": offset,
             "limit": limit,
         },
     )
-
 
 # ---------------------------------------------------------------------------
 # Schema routes
