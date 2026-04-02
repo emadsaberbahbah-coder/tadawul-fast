@@ -2,7 +2,7 @@
 # routes/analysis_sheet_rows.py
 """
 ================================================================================
-Analysis Sheet-Rows Router — v3.7.0
+Analysis Sheet-Rows Router — v3.8.0
 ================================================================================
 ROOT-PROXY FIRST • ADVANCED-ROUTE ALIGNED • ADAPTER-FIRST FALLBACK • SPECIAL-
 PAGE SAFE • SCHEMA-FIRST • STABLE ENVELOPE • GET+POST MERGED • FAIL-SOFT
@@ -24,6 +24,8 @@ What this revision improves
 - FIX: keeps Top10 required fields filled in fail-soft scenarios.
 - SAFE: if every upstream path degrades, returns a schema-shaped partial payload
          instead of bubbling a wrapper-specific 5xx.
+- ENHANCE: prefers the correct upstream owner by page family and adds local
+         non-empty fallbacks for Top10 / Insights / Data_Dictionary.
 ================================================================================
 """
 
@@ -101,13 +103,19 @@ except Exception:
     def get_settings_cached(*args: Any, **kwargs: Any) -> Any:  # type: ignore
         return None
 
+CORE_GET_SHEET_ROWS_SOURCE = "unavailable"
 try:
     from core.data_engine import get_sheet_rows as core_get_sheet_rows  # type: ignore
+    CORE_GET_SHEET_ROWS_SOURCE = "core.data_engine.get_sheet_rows"
 except Exception:
-    core_get_sheet_rows = None  # type: ignore
+    try:
+        from core.data_engine_v2 import get_sheet_rows as core_get_sheet_rows  # type: ignore
+        CORE_GET_SHEET_ROWS_SOURCE = "core.data_engine_v2.get_sheet_rows"
+    except Exception:
+        core_get_sheet_rows = None  # type: ignore
 
 
-ANALYSIS_SHEET_ROWS_VERSION = "3.7.0"
+ANALYSIS_SHEET_ROWS_VERSION = "3.8.0"
 router = APIRouter(prefix="/v1/analysis", tags=["Analysis Sheet Rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -1411,7 +1419,7 @@ def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int)
     if kk == "last_updated_riyadh":
         return datetime.utcnow().isoformat()
     if kk == "recommendation":
-        return "Watch"
+        return "Watch" if row_index > 3 else "Accumulate"
     if kk == "recommendation_reason":
         return "Placeholder fallback because live engine returned no usable rows."
     if kk in {"top10_rank", "rank_overall"}:
@@ -1419,9 +1427,83 @@ def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int)
     if kk == "selection_reason":
         return "Placeholder fallback because upstream builders returned no usable rows."
     if kk == "criteria_snapshot":
-        return "{}"
+        return json.dumps({"symbol": symbol, "row_index": row_index, "source": "placeholder"}, ensure_ascii=False)
     if kk in {"warnings", "notes"}:
         return "placeholder"
+    if kk in {"current_price", "previous_close", "open_price", "day_high", "day_low", "forecast_price_1m", "forecast_price_3m", "forecast_price_12m", "avg_cost", "position_cost", "position_value", "intrinsic_value"}:
+        base = 100.0 + float(row_index)
+        if kk == "previous_close":
+            return round(base - 0.5, 2)
+        if kk == "open_price":
+            return round(base - 0.25, 2)
+        if kk == "day_high":
+            return round(base + 1.0, 2)
+        if kk == "day_low":
+            return round(base - 1.0, 2)
+        if kk == "forecast_price_1m":
+            return round(base * 1.02, 2)
+        if kk == "forecast_price_3m":
+            return round(base * 1.05, 2)
+        if kk == "forecast_price_12m":
+            return round(base * 1.10, 2)
+        if kk == "intrinsic_value":
+            return round(base * 1.04, 2)
+        return round(base, 2)
+    if kk in {"price_change", "percent_change", "expected_roi_1m", "expected_roi_3m", "expected_roi_12m", "week_52_position_pct", "unrealized_pl_pct", "dividend_yield", "payout_ratio", "forecast_confidence", "confidence_score", "overall_score", "opportunity_score", "value_score", "quality_score", "momentum_score", "growth_score", "valuation_score", "risk_score", "beta_5y", "rsi_14", "gross_margin", "operating_margin", "profit_margin", "sharpe_1y", "var_95_1d", "volatility_30d", "volatility_90d", "max_drawdown_1y"}:
+        score_base = max(1.0, 100.0 - float(row_index * 3))
+        mapping = {
+            "price_change": round(0.5 + row_index * 0.1, 2),
+            "percent_change": round(0.75 + row_index * 0.15, 2),
+            "expected_roi_1m": round(2.0 + row_index * 0.2, 2),
+            "expected_roi_3m": round(5.0 + row_index * 0.35, 2),
+            "expected_roi_12m": round(12.0 + row_index * 0.5, 2),
+            "forecast_confidence": round(min(99.0, score_base), 2),
+            "confidence_score": round(min(99.0, score_base - 2), 2),
+            "overall_score": round(min(99.0, score_base), 2),
+            "opportunity_score": round(min(99.0, score_base - 1), 2),
+            "value_score": round(min(99.0, score_base - 3), 2),
+            "quality_score": round(min(99.0, score_base - 4), 2),
+            "momentum_score": round(min(99.0, score_base - 5), 2),
+            "growth_score": round(min(99.0, score_base - 6), 2),
+            "valuation_score": round(min(99.0, score_base - 7), 2),
+            "risk_score": round(20 + row_index * 2, 2),
+            "beta_5y": round(0.8 + row_index * 0.03, 2),
+            "rsi_14": round(48 + row_index, 2),
+            "gross_margin": round(32 + row_index * 0.5, 2),
+            "operating_margin": round(18 + row_index * 0.3, 2),
+            "profit_margin": round(14 + row_index * 0.25, 2),
+            "sharpe_1y": round(1.1 + row_index * 0.05, 2),
+            "var_95_1d": round(-1.5 - row_index * 0.1, 2),
+            "volatility_30d": round(18 + row_index * 0.4, 2),
+            "volatility_90d": round(22 + row_index * 0.5, 2),
+            "max_drawdown_1y": round(-12 - row_index * 0.5, 2),
+            "week_52_position_pct": round(40 + row_index * 3, 2),
+            "unrealized_pl_pct": round(1.5 + row_index * 0.2, 2),
+            "dividend_yield": round(2.5 + row_index * 0.1, 2),
+            "payout_ratio": round(35 + row_index, 2),
+        }
+        return mapping.get(kk, round(score_base, 2))
+    if kk in {"market_cap", "revenue_ttm", "free_cash_flow_ttm", "position_qty", "position_value", "unrealized_pl", "volume", "avg_volume_10d", "avg_volume_30d", "float_shares"}:
+        scale = float(row_index)
+        mapping = {
+            "market_cap": 1000000000 + int(scale * 25000000),
+            "revenue_ttm": 500000000 + int(scale * 15000000),
+            "free_cash_flow_ttm": 100000000 + int(scale * 5000000),
+            "position_qty": 10 + int(scale),
+            "position_value": round(1000 + scale * 75, 2),
+            "unrealized_pl": round(25 + scale * 3, 2),
+            "volume": 100000 + int(scale * 5000),
+            "avg_volume_10d": 90000 + int(scale * 4500),
+            "avg_volume_30d": 85000 + int(scale * 4000),
+            "float_shares": 50000000 + int(scale * 1000000),
+        }
+        return mapping.get(kk)
+    if kk in {"risk_bucket", "confidence_bucket"}:
+        return "Moderate" if row_index > 3 else "High Confidence"
+    if kk == "invest_period_label":
+        return "3M"
+    if kk == "horizon_days":
+        return 90
     return None
 
 
@@ -1440,6 +1522,88 @@ def _build_placeholder_rows(*, page: str, keys: Sequence[str], requested_symbols
             row.setdefault("selection_reason", "Placeholder fallback because upstream builders returned no usable rows.")
             row.setdefault("criteria_snapshot", "{}")
     return rows
+
+
+def _build_dictionary_fallback_rows(*, page: str, headers: Sequence[str], keys: Sequence[str], limit: int, offset: int) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for idx, (header, key) in enumerate(zip(headers, keys), start=1):
+        rows.append({
+            "sheet": page,
+            "group": "Core Contract",
+            "header": header,
+            "key": key,
+            "dtype": "number" if any(token in key for token in ("price", "score", "roi", "qty", "value", "cap", "volume", "margin")) else "text",
+            "fmt": "" if "score" not in key and "roi" not in key else "0.00",
+            "required": key in {"sheet", "header", "key", "symbol", "name", "current_price"},
+            "source": "analysis_sheet_rows.local_dictionary_fallback",
+            "notes": f"Auto-generated fallback row {idx} from schema contract",
+        })
+    return _slice(rows, limit=limit, offset=offset)
+
+
+def _build_insights_fallback_rows(*, requested_symbols: Sequence[str], limit: int, offset: int) -> List[Dict[str, Any]]:
+    symbols = [_normalize_symbol_token(x) for x in requested_symbols if _normalize_symbol_token(x)]
+    if not symbols:
+        symbols = [_normalize_symbol_token(x) for x in EMERGENCY_PAGE_SYMBOLS.get(_INSIGHTS_PAGE, []) if _normalize_symbol_token(x)]
+    stamp = datetime.utcnow().isoformat()
+    rows: List[Dict[str, Any]] = [
+        {
+            "section": "Coverage",
+            "item": "Requested symbols",
+            "symbol": "",
+            "metric": "count",
+            "value": len(symbols),
+            "notes": "Local insights fallback summary",
+            "last_updated_riyadh": stamp,
+        },
+        {
+            "section": "Coverage",
+            "item": "Universe sample",
+            "symbol": "",
+            "metric": "symbols",
+            "value": ", ".join(symbols[:5]),
+            "notes": "Sample of the symbols used by fallback mode",
+            "last_updated_riyadh": stamp,
+        },
+    ]
+    for idx, sym in enumerate(symbols[: max(1, limit + offset)], start=1):
+        rows.append({
+            "section": "Signals",
+            "item": f"Fallback signal {idx}",
+            "symbol": sym,
+            "metric": "recommendation",
+            "value": "Watch" if idx > 2 else "Accumulate",
+            "notes": "Generated locally because upstream insights payload was unavailable",
+            "last_updated_riyadh": stamp,
+        })
+    return _slice(rows, limit=limit, offset=offset)
+
+
+def _build_nonempty_failsoft_rows(*, page: str, headers: Sequence[str], keys: Sequence[str], requested_symbols: Sequence[str], limit: int, offset: int, top_n: int) -> List[Dict[str, Any]]:
+    if page == _DICTIONARY_PAGE:
+        return _build_dictionary_fallback_rows(page=page, headers=headers, keys=keys, limit=limit, offset=offset)
+    if page == _INSIGHTS_PAGE:
+        return _build_insights_fallback_rows(requested_symbols=requested_symbols, limit=limit, offset=offset)
+    if page == _TOP10_PAGE:
+        rows = _build_placeholder_rows(page=page, keys=keys, requested_symbols=requested_symbols or EMERGENCY_PAGE_SYMBOLS.get(page, []), limit=max(limit, top_n), offset=0)
+        rows = _ensure_top10_rows(rows, requested_symbols=requested_symbols, top_n=top_n, schema_keys=keys, schema_headers=headers)
+        return _slice(rows, limit=limit, offset=offset)
+    return _build_placeholder_rows(page=page, keys=keys, requested_symbols=requested_symbols or EMERGENCY_PAGE_SYMBOLS.get(page, []), limit=limit, offset=offset)
+
+
+def _ordered_payload_candidates(page: str, root_payload: Optional[Dict[str, Any]], root_meta: Dict[str, Any], adv_payload: Optional[Dict[str, Any]], adv_meta: Dict[str, Any], adapter_payload: Optional[Dict[str, Any]], adapter_meta: Dict[str, Any]) -> List[Tuple[Optional[Dict[str, Any]], Dict[str, Any], str]]:
+    mapping = {
+        "root_proxy": (root_payload, root_meta, "root_proxy"),
+        "advanced_proxy": (adv_payload, adv_meta, "advanced_proxy"),
+        "adapter": (adapter_payload, adapter_meta, "adapter"),
+    }
+    if page == _TOP10_PAGE:
+        order = ("advanced_proxy", "root_proxy", "adapter")
+    elif page in {_INSIGHTS_PAGE, _DICTIONARY_PAGE}:
+        order = ("root_proxy", "advanced_proxy", "adapter")
+    else:
+        order = ("root_proxy", "adapter", "advanced_proxy")
+    return [mapping[name] for name in order]
 
 
 # =============================================================================
@@ -1726,7 +1890,14 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
             mode=mode,
             status_out="success",
             error_out=None,
-            meta={"dispatch": "schema_only", "schema_source": schema_source, "headers_only": headers_only, "schema_only": schema_only, "engine_source": engine_source},
+            meta={
+                "dispatch": "schema_only",
+                "schema_source": schema_source,
+                "headers_only": headers_only,
+                "schema_only": schema_only,
+                "engine_source": engine_source,
+                "adapter_source": CORE_GET_SHEET_ROWS_SOURCE,
+            },
         )
 
     root_payload, root_meta = await _proxy_callable(
@@ -1767,14 +1938,14 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
         mode=mode or "",
         body=merged_body,
     )
-    adapter_meta = {"adapter_attempted": True, "adapter_source": adapter_source, "adapter_has_rows": _payload_has_real_rows(adapter_payload, page=page) if isinstance(adapter_payload, dict) else False}
+    adapter_meta = {
+        "adapter_attempted": True,
+        "adapter_source": adapter_source or CORE_GET_SHEET_ROWS_SOURCE,
+        "adapter_has_rows": _payload_has_real_rows(adapter_payload, page=page) if isinstance(adapter_payload, dict) else False,
+    }
 
     best_payload, best_meta, best_name = _pick_best_payload(
-        [
-            (root_payload, root_meta, "root_proxy"),
-            (adv_payload, adv_meta, "advanced_proxy"),
-            (adapter_payload, adapter_meta, "adapter"),
-        ],
+        _ordered_payload_candidates(page, root_payload, root_meta, adv_payload, adv_meta, adapter_payload, adapter_meta),
         page=page,
     )
 
@@ -1788,6 +1959,7 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
                 "engine_source": engine_source,
                 "best_source": best_name,
                 "requested_symbols_count": len(requested_symbols),
+                "preferred_order": [name for _payload, _meta, name in _ordered_payload_candidates(page, root_payload, root_meta, adv_payload, adv_meta, adapter_payload, adapter_meta)],
                 **(best_meta or {}),
             }
             if best_error:
@@ -1810,7 +1982,7 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
             )
 
     # Symbol-mode instrument fallback.
-    if requested_symbols:
+    if requested_symbols and page not in {_INSIGHTS_PAGE, _DICTIONARY_PAGE}:
         if engine is not None:
             data_map = await _fetch_analysis_rows(engine, requested_symbols, mode=(mode or ""), settings=settings, schema=spec)
             normalized_rows: List[Dict[str, Any]] = []
@@ -1864,53 +2036,35 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
                 },
             )
 
-        placeholder_rows = _build_placeholder_rows(
-            page=page,
-            keys=keys,
-            requested_symbols=requested_symbols,
-            limit=limit,
-            offset=offset,
-        )
-        return _payload_envelope(
-            page=page,
-            route_family=route_family,
-            headers=headers,
-            keys=keys,
-            row_objects=placeholder_rows,
-            include_matrix=include_matrix,
-            request_id=request_id,
-            started_at=start,
-            mode=mode,
-            status_out="partial",
-            error_out="Data engine unavailable; emitted placeholder fallback",
-            meta={
-                "dispatch": "placeholder_symbol_fallback",
-                "schema_source": schema_source,
-                "engine_source": engine_source,
-                "best_source": best_name or "none",
-                "root_meta": root_meta,
-                "advanced_meta": adv_meta,
-                "adapter_meta": adapter_meta,
-            },
-        )
-
-    # Last fail-soft schema-shaped response.
+    # Non-empty local fail-soft fallback, especially for special pages.
+    fallback_rows = _build_nonempty_failsoft_rows(
+        page=page,
+        headers=headers,
+        keys=keys,
+        requested_symbols=requested_symbols,
+        limit=limit,
+        offset=offset,
+        top_n=top_n,
+    )
+    fallback_status = "partial" if fallback_rows else "error"
+    fallback_error = "Local non-empty fallback emitted after upstream degradation" if fallback_rows else "No usable rows returned; schema-shaped fallback emitted"
     return _payload_envelope(
         page=page,
         route_family=route_family,
         headers=headers,
         keys=keys,
-        row_objects=[],
+        row_objects=fallback_rows,
         include_matrix=include_matrix,
         request_id=request_id,
         started_at=start,
         mode=mode,
-        status_out="partial",
-        error_out="No usable rows returned; schema-shaped fallback emitted",
+        status_out=fallback_status,
+        error_out=fallback_error,
         meta={
-            "dispatch": "analysis_wrapper_fail_soft",
+            "dispatch": "analysis_wrapper_fail_soft_nonempty" if fallback_rows else "analysis_wrapper_fail_soft",
             "schema_source": schema_source,
             "engine_source": engine_source,
+            "adapter_source": adapter_source or CORE_GET_SHEET_ROWS_SOURCE,
             "best_source": best_name or "none",
             "root_meta": root_meta,
             "advanced_meta": adv_meta,
