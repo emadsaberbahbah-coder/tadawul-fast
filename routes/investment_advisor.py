@@ -2,7 +2,7 @@
 """
 routes/investment_advisor.py
 ================================================================================
-ADVANCED INVESTMENT ADVISOR ROUTER — v2.13.0
+ADVANCED INVESTMENT ADVISOR ROUTER — v2.13.1
 ================================================================================
 BRIDGE-FIRST • ROOT-OWNER ALIGNED • TOP10 FAIL-SOFT • STARTUP-SAFE
 AUTH-TOLERANT • GET+POST CANONICAL ALIASES • JSON-SAFE
@@ -47,7 +47,7 @@ from fastapi.encoders import jsonable_encoder
 logger = logging.getLogger("routes.investment_advisor")
 logger.addHandler(logging.NullHandler())
 
-INVESTMENT_ADVISOR_VERSION = "2.13.0"
+INVESTMENT_ADVISOR_VERSION = "2.13.1"
 ROUTE_FAMILY_NAME = "advanced"
 ROUTE_OWNER_NAME = "investment_advisor"
 
@@ -1437,6 +1437,7 @@ async def advanced_request_post(
     limit: Optional[int] = Query(default=None, ge=1, le=200),
     offset: Optional[int] = Query(default=None, ge=0, le=50000),
     schema_only: Optional[bool] = Query(default=None),
+    headers_only: Optional[bool] = Query(default=None),
     token: Optional[str] = Query(default=None),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
@@ -1490,6 +1491,7 @@ async def advanced_request_get(
     mode: str = Query(default=""),
     include_matrix: Optional[bool] = Query(default=None),
     schema_only: Optional[bool] = Query(default=None),
+    headers_only: Optional[bool] = Query(default=None),
     token: Optional[str] = Query(default=None),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
@@ -1533,6 +1535,7 @@ async def advanced_request_get(
         limit=limit if limit is not None else top_n,
         offset=offset,
         schema_only=schema_only,
+        headers_only=headers_only,
         x_request_id=x_request_id,
     )
     response.headers["X-Request-ID"] = payload.get("request_id") or _request_id(request, x_request_id)
