@@ -2,7 +2,7 @@
 """
 routes/investment_advisor.py
 ================================================================================
-ADVANCED INVESTMENT ADVISOR ROUTER — v2.12.0
+ADVANCED INVESTMENT ADVISOR ROUTER — v2.13.0
 ================================================================================
 BRIDGE-FIRST • ROOT-OWNER ALIGNED • TOP10 FAIL-SOFT • STARTUP-SAFE
 AUTH-TOLERANT • GET+POST CANONICAL ALIASES • JSON-SAFE
@@ -15,11 +15,13 @@ rebuild Top_10_Investments locally.
 
 Why this revision
 -----------------
-- FIX: Top_10_Investments now prefers the canonical root owner first.
-- FIX: /v1/advanced/sheet-rows returns a bounded partial payload instead of
-       bubbling 502/5xx when the root-owner bridge stalls or fails.
-- FIX: Data_Dictionary / Insights_Analysis / source pages remain aligned with
-       the root /sheet-rows owner.
+- FIX: keeps the canonical root-owner bridge first while preserving bounded
+       partial payloads instead of bubbling 502/5xx on bridge failure.
+- FIX: stops masking non-TypeError bridge exceptions during signature probing.
+- FIX: downgrades empty bridge payloads for Top_10_Investments,
+       Insights_Analysis, and Data_Dictionary to partial with warnings.
+- FIX: aligns fallback schema keys with the canonical engine contract
+       (for example open_price, week_52_high, pb_ratio, ps_ratio, peg_ratio).
 - SAFE: no import-time network work and no hard dependency on optional modules.
 """
 
@@ -45,7 +47,7 @@ from fastapi.encoders import jsonable_encoder
 logger = logging.getLogger("routes.investment_advisor")
 logger.addHandler(logging.NullHandler())
 
-INVESTMENT_ADVISOR_VERSION = "2.12.0"
+INVESTMENT_ADVISOR_VERSION = "2.13.0"
 ROUTE_FAMILY_NAME = "advanced"
 ROUTE_OWNER_NAME = "investment_advisor"
 
@@ -161,14 +163,14 @@ _CANONICAL_TOP10_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("industry", "Industry"),
     ("current_price", "Current Price"),
     ("previous_close", "Previous Close"),
-    ("open", "Open"),
+    ("open_price", "Open"),
     ("day_high", "Day High"),
     ("day_low", "Day Low"),
-    ("high_52w", "52W High"),
-    ("low_52w", "52W Low"),
+    ("week_52_high", "52W High"),
+    ("week_52_low", "52W Low"),
     ("price_change", "Price Change"),
     ("percent_change", "Percent Change"),
-    ("position_52w_pct", "52W Position %"),
+    ("week_52_position_pct", "52W Position %"),
     ("volume", "Volume"),
     ("avg_volume_10d", "Avg Volume 10D"),
     ("avg_volume_30d", "Avg Volume 30D"),
@@ -195,10 +197,10 @@ _CANONICAL_TOP10_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("sharpe_1y", "Sharpe (1Y)"),
     ("risk_score", "Risk Score"),
     ("risk_bucket", "Risk Bucket"),
-    ("pb", "P/B"),
-    ("ps", "P/S"),
+    ("pb_ratio", "P/B"),
+    ("ps_ratio", "P/S"),
     ("ev_ebitda", "EV/EBITDA"),
-    ("peg", "PEG"),
+    ("peg_ratio", "PEG"),
     ("intrinsic_value", "Intrinsic Value"),
     ("valuation_score", "Valuation Score"),
     ("forecast_price_1m", "Forecast Price 1M"),
@@ -239,11 +241,11 @@ _CANONICAL_INSTRUMENT_SCHEMA_FALLBACK: List[Tuple[str, str]] = _CANONICAL_TOP10_
 _CANONICAL_INSIGHTS_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("section", "Section"),
     ("item", "Item"),
+    ("symbol", "Symbol"),
     ("metric", "Metric"),
     ("value", "Value"),
-    ("confidence", "Confidence"),
     ("notes", "Notes"),
-    ("as_of_utc", "As Of UTC"),
+    ("last_updated_riyadh", "Last Updated (Riyadh)"),
 ]
 _CANONICAL_DATA_DICTIONARY_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("sheet", "Sheet"),
@@ -841,18 +843,21 @@ async def _call_candidate(fn: Any, *, body: Dict[str, Any], request: Request, pa
         {},
     ]
 
+    last_type_error: Optional[Exception] = None
     for kwargs in kwargs_variants:
         try:
             result = fn(**kwargs)
-        except TypeError:
+            if inspect.isawaitable(result):
+                result = await result
+            return result
+        except TypeError as exc:
+            last_type_error = exc
             continue
         except Exception:
-            continue
+            raise
 
-        if inspect.isawaitable(result):
-            result = await result
-        return result
-
+    if last_type_error is not None:
+        raise last_type_error
     return None
 
 
@@ -870,6 +875,13 @@ def _bridge_timeout_for_page(page: str) -> float:
         return max(0.5, env_value)
     except Exception:
         return default
+
+
+def _append_warning(meta: Dict[str, Any], warning: str) -> None:
+    warnings = _normalize_list(meta.get("warnings"))
+    if warning not in warnings:
+        warnings.append(warning)
+    meta["warnings"] = warnings
 
 
 def _normalize_payload_from_bridge(
@@ -943,11 +955,17 @@ def _normalize_payload_from_bridge(
         elif out.get("rows_matrix") is None:
             out["rows_matrix"] = []
 
-    if not _rows_present(out) and page == TOP10_PAGE_NAME:
-        out["status"] = out.get("status") or "partial"
-        out["meta"]["warnings"] = list(_normalize_list(out["meta"].get("warnings"))) + ["Top10 bridge returned no rows."]
-    elif not _rows_present(out) and out.get("status") not in {"success", "partial"}:
+    has_rows = _rows_present(out)
+    if not has_rows:
         out["status"] = "partial"
+        if page == TOP10_PAGE_NAME:
+            _append_warning(out["meta"], "Top10 bridge returned no rows.")
+        elif page == INSIGHTS_PAGE_NAME:
+            _append_warning(out["meta"], "Insights bridge returned no rows.")
+        elif page == DATA_DICTIONARY_PAGE_NAME:
+            _append_warning(out["meta"], "Data Dictionary bridge returned no rows.")
+        else:
+            _append_warning(out["meta"], "Bridge returned no rows.")
     elif not out.get("status"):
         out["status"] = "success"
 
@@ -962,6 +980,7 @@ async def _execute_via_bridge(
     limit: Optional[int],
     offset: Optional[int],
     schema_only: Optional[bool],
+    headers_only: Optional[bool],
     x_request_id: Optional[str],
 ) -> Dict[str, Any]:
     page = _normalize_page_name(body.get("page") or body.get("sheet") or body.get("sheet_name") or TOP10_PAGE_NAME)
@@ -972,6 +991,7 @@ async def _execute_via_bridge(
 
     include_matrix_final = _boolish(include_matrix if include_matrix is not None else body.get("include_matrix"), False)
     schema_only_final = _boolish(schema_only if schema_only is not None else body.get("schema_only"), False)
+    headers_only_final = _boolish(headers_only if headers_only is not None else body.get("headers_only"), False)
     limit_final = _safe_int(limit if limit is not None else body.get("limit") or body.get("top_n"), 20)
     offset_final = _safe_int(offset if offset is not None else body.get("offset"), 0)
 
@@ -980,18 +1000,20 @@ async def _execute_via_bridge(
     body["offset"] = offset_final
     body["include_matrix"] = include_matrix_final
     body["schema_only"] = schema_only_final
+    body["headers_only"] = headers_only_final
 
     request_id = _request_id(request, x_request_id)
 
     bridge_impl, bridge_source, bridge_name = await _resolve_bridge_impl()
 
-    if schema_only_final:
+    if schema_only_final or headers_only_final:
         return _make_schema_only_response(
             page,
             include_matrix=include_matrix_final,
             request_id=request_id,
             bridge_source=bridge_source,
             bridge_name=bridge_name,
+            warnings=(["headers_only"] if headers_only_final else None),
         )
 
     if bridge_impl is None:
@@ -1076,6 +1098,7 @@ def _advanced_get_body(
     offset: Optional[int],
     include_matrix: Optional[bool],
     schema_only: Optional[bool],
+    headers_only: Optional[bool],
 ) -> Dict[str, Any]:
     target_page = _normalize_page_name(page or sheet or sheet_name or name or tab or TOP10_PAGE_NAME)
     direct_symbols = _normalize_symbol_list(symbols) or _normalize_symbol_list(tickers)
@@ -1104,6 +1127,7 @@ def _advanced_get_body(
         "offset": offset,
         "include_matrix": include_matrix,
         "schema_only": schema_only,
+        "headers_only": headers_only,
     }
 
 
@@ -1133,6 +1157,7 @@ def _advanced_root_has_request_filters(
     mode: str,
     include_matrix: Optional[bool],
     schema_only: Optional[bool],
+    headers_only: Optional[bool],
 ) -> bool:
     values = [
         page,
@@ -1159,6 +1184,7 @@ def _advanced_root_has_request_filters(
         mode,
         include_matrix,
         schema_only,
+        headers_only,
     ]
     for value in values:
         if value is None:
@@ -1233,6 +1259,7 @@ async def advanced_root_get(
     mode: str = Query(default=""),
     include_matrix: Optional[bool] = Query(default=None),
     schema_only: Optional[bool] = Query(default=None),
+    headers_only: Optional[bool] = Query(default=None),
     token: Optional[str] = Query(default=None),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
@@ -1265,6 +1292,7 @@ async def advanced_root_get(
         mode=mode,
         include_matrix=include_matrix,
         schema_only=schema_only,
+        headers_only=headers_only,
     )
 
     if not has_filters:
@@ -1296,6 +1324,7 @@ async def advanced_root_get(
         offset=offset,
         include_matrix=include_matrix,
         schema_only=schema_only,
+        headers_only=headers_only,
     )
 
     payload = await _execute_via_bridge(
@@ -1305,6 +1334,7 @@ async def advanced_root_get(
         limit=limit if limit is not None else top_n,
         offset=offset,
         schema_only=schema_only,
+        headers_only=headers_only,
         x_request_id=x_request_id,
     )
     response.headers["X-Request-ID"] = payload.get("request_id") or _request_id(request, x_request_id)
@@ -1321,6 +1351,7 @@ async def advanced_root_post(
     limit: Optional[int] = Query(default=None, ge=1, le=200),
     offset: Optional[int] = Query(default=None, ge=0, le=50000),
     schema_only: Optional[bool] = Query(default=None),
+    headers_only: Optional[bool] = Query(default=None),
     token: Optional[str] = Query(default=None),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
@@ -1334,6 +1365,7 @@ async def advanced_root_post(
         limit=limit,
         offset=offset,
         schema_only=schema_only,
+        headers_only=headers_only,
         x_request_id=x_request_id,
     )
     response.headers["X-Request-ID"] = payload.get("request_id") or _request_id(request, x_request_id)
@@ -1422,6 +1454,7 @@ async def advanced_request_post(
         limit=limit,
         offset=offset,
         schema_only=schema_only,
+        headers_only=headers_only,
         x_request_id=x_request_id,
     )
     response.headers["X-Request-ID"] = payload.get("request_id") or _request_id(request, x_request_id)
@@ -1488,6 +1521,7 @@ async def advanced_request_get(
         offset=offset,
         include_matrix=include_matrix,
         schema_only=schema_only,
+        headers_only=headers_only,
     )
     if mode:
         body["mode"] = mode
