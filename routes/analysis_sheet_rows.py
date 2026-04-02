@@ -2,7 +2,7 @@
 # routes/analysis_sheet_rows.py
 """
 ================================================================================
-Analysis Sheet-Rows Router — v3.8.0
+Analysis Sheet-Rows Router — v3.9.0
 ================================================================================
 ROOT-PROXY FIRST • ADVANCED-ROUTE ALIGNED • ADAPTER-FIRST FALLBACK • SPECIAL-
 PAGE SAFE • SCHEMA-FIRST • STABLE ENVELOPE • GET+POST MERGED • FAIL-SOFT
@@ -24,8 +24,10 @@ What this revision improves
 - FIX: keeps Top10 required fields filled in fail-soft scenarios.
 - SAFE: if every upstream path degrades, returns a schema-shaped partial payload
          instead of bubbling a wrapper-specific 5xx.
-- ENHANCE: prefers the correct upstream owner by page family and adds local
-         non-empty fallbacks for Top10 / Insights / Data_Dictionary.
+- ENHANCE: prefers the canonical root owner first for Top10 and only accepts
+         special-page upstream payloads when they contain real rows.
+- ENHANCE: keeps local non-empty fallbacks for Top10 / Insights / Data_Dictionary
+         when upstream returns empty success/partial envelopes.
 ================================================================================
 """
 
@@ -115,7 +117,7 @@ except Exception:
         core_get_sheet_rows = None  # type: ignore
 
 
-ANALYSIS_SHEET_ROWS_VERSION = "3.8.0"
+ANALYSIS_SHEET_ROWS_VERSION = "3.9.0"
 router = APIRouter(prefix="/v1/analysis", tags=["Analysis Sheet Rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -1598,7 +1600,7 @@ def _ordered_payload_candidates(page: str, root_payload: Optional[Dict[str, Any]
         "adapter": (adapter_payload, adapter_meta, "adapter"),
     }
     if page == _TOP10_PAGE:
-        order = ("advanced_proxy", "root_proxy", "adapter")
+        order = ("root_proxy", "advanced_proxy", "adapter")
     elif page in {_INSIGHTS_PAGE, _DICTIONARY_PAGE}:
         order = ("root_proxy", "advanced_proxy", "adapter")
     else:
@@ -1952,7 +1954,8 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
     if isinstance(best_payload, dict):
         best_has_rows = _payload_has_real_rows(best_payload, page=page)
         best_status, best_error, _ = _extract_status_error(best_payload)
-        best_is_usable = best_has_rows or page in _SPECIAL_PAGES or _strip(best_status).lower() == "success"
+        best_status_lc = _strip(best_status).lower()
+        best_is_usable = best_has_rows or (best_status_lc == "success" and page not in _SPECIAL_PAGES)
         if best_is_usable:
             meta_extra = {
                 "schema_source": schema_source,
@@ -1962,6 +1965,8 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
                 "preferred_order": [name for _payload, _meta, name in _ordered_payload_candidates(page, root_payload, root_meta, adv_payload, adv_meta, adapter_payload, adapter_meta)],
                 **(best_meta or {}),
             }
+            meta_extra["best_status"] = best_status_lc or "unknown"
+            meta_extra["best_has_rows"] = best_has_rows
             if best_error:
                 meta_extra.setdefault("upstream_error", best_error)
             return _normalize_external_payload(
@@ -2037,6 +2042,17 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
             )
 
     # Non-empty local fail-soft fallback, especially for special pages.
+    degraded_upstream_meta = {
+        "schema_source": schema_source,
+        "engine_source": engine_source,
+        "best_source": best_name or "none",
+        "root_meta": root_meta,
+        "advanced_meta": adv_meta,
+        "adapter_meta": adapter_meta,
+    }
+    if isinstance(best_payload, dict):
+        degraded_upstream_meta["best_payload_status"] = _strip(best_payload.get("status"))
+        degraded_upstream_meta["best_payload_had_rows"] = _payload_has_real_rows(best_payload, page=page)
     fallback_rows = _build_nonempty_failsoft_rows(
         page=page,
         headers=headers,
@@ -2062,13 +2078,8 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
         error_out=fallback_error,
         meta={
             "dispatch": "analysis_wrapper_fail_soft_nonempty" if fallback_rows else "analysis_wrapper_fail_soft",
-            "schema_source": schema_source,
-            "engine_source": engine_source,
             "adapter_source": adapter_source or CORE_GET_SHEET_ROWS_SOURCE,
-            "best_source": best_name or "none",
-            "root_meta": root_meta,
-            "advanced_meta": adv_meta,
-            "adapter_meta": adapter_meta,
+            **degraded_upstream_meta,
         },
     )
 
@@ -2101,7 +2112,7 @@ async def _analysis_sheet_rows_impl(request: Request, body: Dict[str, Any], mode
             headers=headers,
             keys=keys,
             row_objects=[],
-            include_matrix=True,
+            include_matrix=_maybe_bool(merged_body.get("include_matrix"), True),
             request_id=request_id,
             started_at=start,
             mode=mode,
