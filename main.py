@@ -2,25 +2,26 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.9.0)
+TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.10.0)
 ================================================================================
 FASTAPI-NATIVE ROUTER INCLUDE • PRESTART-FIRST ROUTE MOUNT • OPENAPI CACHE SAFE
 REQUEST-ID SAFE • ENGINE-STATE AWARE • CONTROLLED-ROUTE-OWNERSHIP SAFE
 STRICT-JSON SAFE • HEALTH / META ALIAS SAFE • DEBUG ROUTE SAFE
-ADVANCED-SHEET-ROWS EXPLICIT MOUNT • EXACT CANONICAL OWNER PROTECTION
+INVESTMENT-ADVISOR CANONICAL OWNER PROTECTION • ADVANCED ROUTE PRIORITY SAFE
 
-Why this revision (v8.9.0)
---------------------------
-- FIX: explicitly mounts routes.advanced_sheet_rows in the controlled plan so
-       /v1/advanced/sheet-rows no longer depends on other modules.
-- FIX: protects exact canonical paths during filtered router cloning so a later
-       router cannot steal an owner-locked path such as /v1/advanced/sheet-rows.
-- FIX: keeps prestart/startup route mounting and OpenAPI cache refresh aligned.
-- FIX: preserves route diagnostics for advisor / advanced / analysis /
-       advanced-sheet-rows / schema / enriched families.
+Why this revision (v8.10.0)
+---------------------------
+- FIX: makes routes.investment_advisor the canonical owner of
+       /v1/advanced/sheet-rows so the revised advanced router is the effective
+       public owner after deployment.
+- FIX: reorders the controlled mount plan so routes.investment_advisor mounts
+       before routes.advanced_sheet_rows, reducing overlap risk.
+- FIX: preserves exact canonical-path protection during filtered router cloning
+       so later routers cannot steal owner-locked public paths.
+- FIX: keeps prestart/startup route mounting, OpenAPI cache refresh, and live
+       ownership diagnostics aligned.
 - SAFE: engine init remains timeout-aware and non-fatal unless strict mode is enabled.
 """
-
 from __future__ import annotations
 
 import asyncio
@@ -165,7 +166,7 @@ class _StrictJSONResponse(JSONResponse):
         ).encode("utf-8")
 
 
-APP_ENTRY_VERSION = "8.9.0"
+APP_ENTRY_VERSION = "8.10.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
@@ -199,7 +200,7 @@ _CONTROLLED_CANONICAL_OWNER_MAP: Dict[str, str] = {
     "/v1/investment_advisor": "investment_advisor",
     "/v1/investment-advisor": "investment_advisor",
     "/v1/advanced": "investment_advisor",
-    "/v1/advanced/sheet-rows": "advanced_sheet_rows",
+    "/v1/advanced/sheet-rows": "investment_advisor",
     "/v1/analysis": "analysis_sheet_rows",
     "/v1/analysis/sheet-rows": "analysis_sheet_rows",
     "/v1/schema": "advanced_analysis",
@@ -227,9 +228,9 @@ _OPTIONAL_ROUTE_MODULES: Set[str] = {
 _CONTROLLED_ROUTE_PLAN: Tuple[Tuple[str, str], ...] = (
     ("config", "routes.config"),
     ("advanced_analysis", "routes.advanced_analysis"),
-    ("advanced_sheet_rows", "routes.advanced_sheet_rows"),
     ("analysis_sheet_rows", "routes.analysis_sheet_rows"),
     ("investment_advisor", "routes.investment_advisor"),
+    ("advanced_sheet_rows", "routes.advanced_sheet_rows"),
     ("advisor", "routes.advisor"),
     ("enriched_quote", "routes.enriched_quote"),
 )
@@ -354,13 +355,13 @@ class _JsonFormatter(logging.Formatter):
         }
         if record.exc_info:
             payload["exc"] = self.formatException(record.exc_info)
-        for k in ("request_id", "path", "status_code"):
-            if hasattr(record, k):
-                payload[k] = getattr(record, k)
+        for key in ("request_id", "path", "status_code"):
+            if hasattr(record, key):
+                payload[key] = getattr(record, key)
         try:
             return json.dumps(payload, ensure_ascii=False)
         except Exception:
-            return f"{payload}"
+            return str(payload)
 
 
 def _setup_logging() -> logging.Logger:
@@ -575,7 +576,6 @@ def _call_auth_ok_flexible(fn: Any, request: Request, token_value: str, authoriz
         {"token": token_value or None, "authorization": authorization or None},
         {"token": token_value or None},
     ]
-
     for kwargs in attempts:
         try:
             return bool(fn(**kwargs))
@@ -610,8 +610,7 @@ def _auth_ok(request: Request) -> bool:
             continue
 
     allowed = {
-        x
-        for x in (
+        x for x in (
             _env_str("APP_TOKEN", ""),
             _env_str("BACKEND_TOKEN", ""),
             _env_str("BACKUP_APP_TOKEN", ""),
@@ -620,8 +619,7 @@ def _auth_ok(request: Request) -> bool:
             _env_str("TOKEN", ""),
             _env_str("TFB_APP_TOKEN", ""),
             _env_str("TFB_TOKEN", ""),
-        )
-        if x
+        ) if x
     }
     if not allowed:
         return False
@@ -656,36 +654,18 @@ class NoResponseGuardMiddleware(BaseHTTPMiddleware):
         try:
             response = await call_next(request)
             if response is None:
-                logger.error(
-                    "Downstream returned None response",
-                    extra={"request_id": request_id, "path": str(request.url.path), "status_code": 500},
-                )
+                logger.error("Downstream returned None response", extra={"request_id": request_id, "path": str(request.url.path), "status_code": 500})
                 return _StrictJSONResponse(
                     status_code=500,
-                    content={
-                        "status": "error",
-                        "error": "RuntimeError: No response returned.",
-                        "path": str(request.url.path),
-                        "request_id": request_id,
-                        "ts_utc": datetime.now(timezone.utc).isoformat(),
-                    },
+                    content={"status": "error", "error": "RuntimeError: No response returned.", "path": str(request.url.path), "request_id": request_id, "ts_utc": datetime.now(timezone.utc).isoformat()},
                 )
             return response
         except RuntimeError as exc:
             if "No response returned" in str(exc):
-                logger.error(
-                    "Caught downstream no-response runtime error",
-                    extra={"request_id": request_id, "path": str(request.url.path), "status_code": 500},
-                )
+                logger.error("Caught downstream no-response runtime error", extra={"request_id": request_id, "path": str(request.url.path), "status_code": 500})
                 return _StrictJSONResponse(
                     status_code=500,
-                    content={
-                        "status": "error",
-                        "error": f"{type(exc).__name__}: {str(exc)}",
-                        "path": str(request.url.path),
-                        "request_id": request_id,
-                        "ts_utc": datetime.now(timezone.utc).isoformat(),
-                    },
+                    content={"status": "error", "error": f"{type(exc).__name__}: {str(exc)}", "path": str(request.url.path), "request_id": request_id, "ts_utc": datetime.now(timezone.utc).isoformat()},
                 )
             raise
 
@@ -704,11 +684,11 @@ def _route_signature_pairs_from_route(route: Any) -> Set[Tuple[str, str]]:
 
 def _app_route_signature_set(app: Any, *, include_builtin: bool = True) -> Set[Tuple[str, str]]:
     sigs: Set[Tuple[str, str]] = set()
-    for r in getattr(app, "routes", []) or []:
-        path = str(getattr(r, "path", "") or "")
+    for route in getattr(app, "routes", []) or []:
+        path = str(getattr(route, "path", "") or "")
         if not include_builtin and path in _BUILTIN_META_PATHS:
             continue
-        sigs.update(_route_signature_pairs_from_route(r))
+        sigs.update(_route_signature_pairs_from_route(route))
     return sigs
 
 
@@ -792,7 +772,6 @@ def _canonical_route_match_rank(route_path: str, canonical_path: str) -> Tuple[i
 def _canonical_path_owners_from_routes(app: FastAPI) -> Dict[str, str]:
     routes = list(getattr(app, "routes", []) or [])
     owners: Dict[str, str] = {}
-
     for canonical_path in _CANONICAL_DIAGNOSTIC_PATHS:
         candidates: List[Tuple[Tuple[int, int, int], int, Any]] = []
         for idx, route in enumerate(routes):
@@ -803,7 +782,6 @@ def _canonical_path_owners_from_routes(app: FastAPI) -> Dict[str, str]:
             continue
         _, _, best_route = sorted(candidates, key=lambda item: (item[0], item[1]))[0]
         owners[canonical_path] = _endpoint_module_name(best_route)
-
     return owners
 
 
@@ -815,11 +793,7 @@ def _canonical_path_owner_mismatches(path_owners: Mapping[str, str]) -> Dict[str
             continue
         actual_owner = actual_module.rsplit(".", 1)[-1] if actual_module else ""
         if actual_owner and actual_owner != expected_owner:
-            mismatches[path] = {
-                "expected_owner": expected_owner,
-                "actual_module": actual_module,
-                "actual_owner": actual_owner,
-            }
+            mismatches[path] = {"expected_owner": expected_owner, "actual_module": actual_module, "actual_owner": actual_owner}
     return mismatches
 
 
@@ -850,7 +824,7 @@ def _verify_required_route_families(app: FastAPI) -> List[str]:
         "root_health_alias": presence.get("root_health_alias", False),
         "root_meta_alias": presence.get("root_meta_alias", False),
     }
-    return sorted([k for k, ok in required.items() if not bool(ok)])
+    return sorted([key for key, ok in required.items() if not bool(ok)])
 
 
 def _live_route_metrics(app: Optional[FastAPI]) -> Tuple[int, int]:
@@ -921,7 +895,6 @@ def _normalize_routes_snapshot(ret: Any, *, used_strategy: str, app: Optional[Fa
     path_owners: Dict[str, str] = {}
     path_owner_mismatches: Dict[str, Dict[str, str]] = {}
     route_family_presence = dict(src.get("route_family_presence", {}) or {})
-
     if app is not None:
         try:
             all_paths = {str(getattr(r, "path", "") or "") for r in (getattr(app, "routes", []) or [])}
@@ -932,9 +905,7 @@ def _normalize_routes_snapshot(ret: Any, *, used_strategy: str, app: Optional[Fa
         except Exception:
             pass
 
-    effective_failed_modules = _effective_failed_modules(
-        {"import_errors": import_errors, "mount_errors": mount_errors, "no_router": no_router}
-    )
+    effective_failed_modules = _effective_failed_modules({"import_errors": import_errors, "mount_errors": mount_errors, "no_router": no_router})
 
     out = {
         "mounted": mounted,
@@ -969,7 +940,6 @@ def _normalize_routes_snapshot(ret: Any, *, used_strategy: str, app: Optional[Fa
         "canonical_path_owners": path_owners,
         "canonical_path_owner_mismatches": path_owner_mismatches,
     }
-
     if app is not None:
         app.state.routes_snapshot = out
     return out
@@ -1043,20 +1013,12 @@ def _clone_filtered_router(router: APIRouter, *, key: str) -> Tuple[APIRouter, L
             "responses": getattr(route, "responses", None),
             "dependencies": list(getattr(route, "dependencies", []) or []),
         }
-
         try:
             out.add_api_route(**kwargs)
             added_paths.append(path)
         except Exception:
             try:
-                fallback_kwargs = {
-                    "path": path,
-                    "endpoint": route.endpoint,
-                    "methods": list(route.methods or []),
-                    "name": route.name,
-                    "include_in_schema": route.include_in_schema,
-                }
-                out.add_api_route(**fallback_kwargs)
+                out.add_api_route(path=path, endpoint=route.endpoint, methods=list(route.methods or []), name=route.name, include_in_schema=route.include_in_schema)
                 added_paths.append(path)
             except Exception:
                 filtered_out.append(path)
@@ -1113,20 +1075,11 @@ def _mount_routes_controlled(app: FastAPI) -> Dict[str, Any]:
         overlap = router_sigs & existing_sigs
 
         if router_sigs and overlap == router_sigs:
-            snap["duplicate_skips"].append({
-                "module": module_name,
-                "paths": sorted(set(added_paths)),
-                "signature_count": len(router_sigs),
-            })
+            snap["duplicate_skips"].append({"module": module_name, "paths": sorted(set(added_paths)), "signature_count": len(router_sigs)})
             continue
 
         if overlap:
-            snap["partial_duplicate_skips"].append({
-                "module": module_name,
-                "paths": sorted(set(added_paths)),
-                "overlap_count": len(overlap),
-                "signature_count": len(router_sigs),
-            })
+            snap["partial_duplicate_skips"].append({"module": module_name, "paths": sorted(set(added_paths)), "overlap_count": len(overlap), "signature_count": len(router_sigs)})
 
         try:
             app.include_router(filtered_router)
@@ -1143,7 +1096,6 @@ def _mount_routes_controlled(app: FastAPI) -> Dict[str, Any]:
 
 def _mount_routes_once(app: FastAPI, *, phase: str) -> Dict[str, Any]:
     _ensure_app_state_defaults(app)
-
     if bool(getattr(app.state, "routes_mounted", False)) and isinstance(getattr(app.state, "routes_snapshot", None), dict):
         snap = _normalize_routes_snapshot(getattr(app.state, "routes_snapshot", {}), used_strategy="main.controlled_priority_plan", app=app)
         app.state.routes_mount_phase = str(getattr(app.state, "routes_mount_phase", phase) or phase)
@@ -1283,7 +1235,6 @@ def _install_custom_openapi(app: FastAPI) -> None:
         current_signature_count = _route_signature_count(app, include_builtin=True)
         cached_signature_count = int(getattr(app.state, "_openapi_route_signature_count", -1) or -1)
         cached_schema = getattr(app, "openapi_schema", None)
-
         if cached_schema is not None and cached_signature_count == current_signature_count:
             return cached_schema  # type: ignore[return-value]
 
@@ -1481,41 +1432,19 @@ def create_app() -> FastAPI:
     app.add_middleware(GZipMiddleware, minimum_size=1024)
 
     if bool(_SETTINGS.ENABLE_CORS_ALL_ORIGINS):
-        app.add_middleware(
-            CORSMiddleware,
-            allow_origins=["*"],
-            allow_credentials=True,
-            allow_methods=["*"],
-            allow_headers=["*"],
-        )
+        app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
     else:
         origins = _parse_csv(_SETTINGS.CORS_ORIGINS)
         if origins:
-            app.add_middleware(
-                CORSMiddleware,
-                allow_origins=origins,
-                allow_credentials=True,
-                allow_methods=["*"],
-                allow_headers=["*"],
-            )
+            app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception):
         request_id = _request_id_from_request(request)
-        logger.error(
-            "Unhandled exception",
-            exc_info=True,
-            extra={"request_id": request_id, "path": str(request.url.path), "status_code": 500},
-        )
+        logger.error("Unhandled exception", exc_info=True, extra={"request_id": request_id, "path": str(request.url.path), "status_code": 500})
         return _StrictJSONResponse(
             status_code=500,
-            content={
-                "status": "error",
-                "error": f"{type(exc).__name__}: {str(exc)}",
-                "path": str(request.url.path),
-                "request_id": request_id,
-                "ts_utc": datetime.now(timezone.utc).isoformat(),
-            },
+            content={"status": "error", "error": f"{type(exc).__name__}: {str(exc)}", "path": str(request.url.path), "request_id": request_id, "ts_utc": datetime.now(timezone.utc).isoformat()},
         )
 
     _install_builtin_routes(app)
@@ -1580,5 +1509,4 @@ application = app
 
 if __name__ == "__main__":
     import uvicorn
-
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
