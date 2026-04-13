@@ -1,20 +1,14 @@
 # =============================================================================
 # render.yaml
 # =============================================================================
-# TADAWUL FAST BRIDGE – RENDER BLUEPRINT (v7.7.0)
+# TADAWUL FAST BRIDGE – RENDER BLUEPRINT (v7.8.0)
 # =============================================================================
-# Goals:
-# - Clean, spec-compliant blueprint
-# - Use requirements.render.txt for build (Render-safe)
-# - Use scripts/start_web.sh as the single start entrypoint
-# - Respect Render's PORT + your env groups
-#
-# v7.7.0 Changes:
-# - FIX: Removed dead WORKERS_MAX env var (was never read by start_web.sh,
-#         only WEB_CONCURRENCY is used — having both caused confusion).
-# - FIX: Added worker service so worker.py actually runs on Render.
-#         Previously the worker was fixed in code but had no Render service
-#         definition, meaning it was never deployed or executed.
+# Goals
+# - Clean, Render-safe blueprint
+# - Use requirements.render.txt for build when present
+# - Use scripts/start_web.sh as the single startup entrypoint
+# - Align env vars with the simplified start_web.sh
+# - Keep EODHD as primary provider for non-KSA/global pages
 # =============================================================================
 
 previews:
@@ -32,7 +26,7 @@ services:
     plan: pro
     branch: main
 
-    healthCheckPath: /readyz
+    healthCheckPath: /health
     autoDeployTrigger: commit
 
     buildFilter:
@@ -54,10 +48,9 @@ services:
         - .vscode/**
         - README.md
 
-    # Build: Render-safe deps + compileall (NO hashes)
     buildCommand: |
       set -euo pipefail
-      python -m pip install -U pip
+      python -m pip install --upgrade pip
       if [ -f requirements.render.txt ]; then
         python -m pip install --no-cache-dir -r requirements.render.txt
       else
@@ -65,16 +58,13 @@ services:
       fi
       python -m pip check || true
       python -m compileall -q -f .
+      chmod +x scripts/start_web.sh || true
 
-    # Start: real shell wrapper (must exist + be executable)
-    startCommand: |
-      set -euo pipefail
-      chmod +x scripts/start_web.sh
-      exec ./scripts/start_web.sh
+    startCommand: ./scripts/start_web.sh
 
     scaling:
-      minInstances: 2
-      maxInstances: 10
+      minInstances: 1
+      maxInstances: 5
       targetMemoryPercent: 80
       targetCPUPercent: 75
 
@@ -99,7 +89,7 @@ services:
           type: keyvalue
           property: connectionString
 
-      # Secrets (set in Render dashboard — never put values here)
+      # Secrets — set values in Render dashboard only
       - key: APP_TOKEN
         sync: false
       - key: BACKUP_APP_TOKEN
@@ -116,11 +106,7 @@ services:
         sync: false
 
   # ===========================================================================
-  # WORKER SERVICE — Background job processor (worker.py)
-  # Polls Redis queue "tfb_background_jobs" and dispatches:
-  #   - dashboard_sync  → run_dashboard_sync pipeline
-  #   - market_scan     → run_market_scan pipeline
-  #   - refresh_data    → refresh_data pipeline
+  # WORKER SERVICE — Background job processor
   # ===========================================================================
   - type: worker
     name: tadawul-worker
@@ -131,12 +117,13 @@ services:
 
     buildCommand: |
       set -euo pipefail
-      python -m pip install -U pip
+      python -m pip install --upgrade pip
       if [ -f requirements.render.txt ]; then
         python -m pip install --no-cache-dir -r requirements.render.txt
       else
         python -m pip install --no-cache-dir -r requirements.txt
       fi
+      python -m pip check || true
       python -m compileall -q -f .
 
     startCommand: python scripts/worker.py
@@ -147,6 +134,7 @@ services:
       - fromGroup: tfb-providers
       - fromGroup: tfb-cache
       - fromGroup: tfb-sheets
+      - fromGroup: tfb-security
 
       - key: REDIS_URL
         fromService:
@@ -154,7 +142,6 @@ services:
           type: keyvalue
           property: connectionString
 
-      # Worker needs the same secrets as the web service for sync pipelines
       - key: APP_TOKEN
         sync: false
       - key: BACKUP_APP_TOKEN
@@ -193,9 +180,9 @@ envVarGroups:
       - key: APP_ENV
         value: "production"
       - key: APP_VERSION
-        value: "7.7.0"
+        value: "5.3.1"
       - key: SERVICE_VERSION
-        value: "7.7.0"
+        value: "8.10.0"
       - key: PYTHONUNBUFFERED
         value: "1"
       - key: PYTHONDONTWRITEBYTECODE
@@ -207,8 +194,6 @@ envVarGroups:
         value: "INFO"
       - key: LOG_JSON
         value: "1"
-      - key: UVICORN_ACCESS_LOG
-        value: "1"
       - key: ENABLE_TRACING
         value: "1"
       - key: CORE_TRACING_ENABLED
@@ -216,18 +201,18 @@ envVarGroups:
 
   - name: tfb-server
     envVars:
-      - key: HOST
+      - key: TFB_HOST
         value: "0.0.0.0"
-      # WEB_CONCURRENCY is the only worker-count variable read by start_web.sh.
-      # WORKERS_MAX has been removed — it was never read and caused confusion.
       - key: WEB_CONCURRENCY
         value: "1"
-      - key: UVICORN_KEEPALIVE
-        value: "75"
-      - key: UVICORN_GRACEFUL_TIMEOUT
-        value: "30"
-      - key: UVICORN_BACKLOG
-        value: "2048"
+      - key: TFB_TIMEOUT
+        value: "180"
+      - key: TFB_GRACEFUL_TIMEOUT
+        value: "45"
+      - key: TFB_KEEPALIVE
+        value: "10"
+      - key: TFB_ACCESS_LOG
+        value: "1"
 
   - name: tfb-security
     envVars:
