@@ -208,7 +208,12 @@ jobs:
           fi
           echo "::endgroup::"
 
-      - name: 🧪 Run Contract + Schema Alignment Tests (sync guard)
+      # ---------------------------------------------------------------------------
+      # FIX: Schema alignment is now a HARD FAIL — not a warning.
+      # If column headers drift, data will be written to the wrong columns in
+      # Google Sheets. This gate must block the sync, not just warn.
+      # ---------------------------------------------------------------------------
+      - name: 🧪 Run Contract + Schema Alignment Tests (sync guard — HARD FAIL)
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
@@ -216,6 +221,7 @@ jobs:
           echo "::group::Tests"
           python -c "import pytest" 2>/dev/null || python -m pip install -q pytest
 
+          # --- Scoring engine contract (always hard fail) ---
           if [ -f "test_scoring_engine_contract.py" ]; then
             python -m pytest -q test_scoring_engine_contract.py
           elif [ -f "core/test_scoring_engine_contract.py" ]; then
@@ -227,12 +233,19 @@ jobs:
             exit 1
           fi
 
-          # schema drift gate (warning-only for scheduler to avoid cron spam)
+          # --- Schema alignment gate (HARD FAIL — was warning-only before) ---
+          # A schema drift failure means data would be written to wrong columns.
+          # This MUST stop the sync. Do not downgrade back to warning.
           if [ -f "tests/test_schema_alignment.py" ]; then
-            python -m pytest -q tests/test_schema_alignment.py || echo "::warning::Schema alignment test failed (scheduler continues)."
+            echo "▶️ Running schema alignment gate (hard fail)..."
+            python -m pytest -q tests/test_schema_alignment.py
+            echo "✅ Schema alignment passed."
           else
-            echo "::warning::tests/test_schema_alignment.py not found; schema drift gate not running in scheduler."
+            echo "::error::tests/test_schema_alignment.py not found. Schema drift gate cannot run."
+            echo "::error::Add this file or the sync cannot proceed safely."
+            exit 1
           fi
+
           echo "::endgroup::"
 
       - name: ⚙️ Smart Configuration Resolution (robust for schedule + manual)
@@ -265,7 +278,6 @@ jobs:
           }
 
           upper_underscore() {
-            # normalize to UPPER_SNAKE (spaces/dashes -> underscores, collapse)
             echo "${1:-}" \
               | tr '[:lower:]' '[:upper:]' \
               | tr ',;|\n\r\t' '      ' \
@@ -275,11 +287,6 @@ jobs:
           }
 
           normalize_keys_list() {
-            # Supports:
-            # - space separated: "A B C"
-            # - comma/semicolon: "A,B;C"
-            # - newline separated
-            # - JSON array: ["A","B","C"]
             local raw="$1"
             raw="$(echo "${raw:-}" | tr -d '\r' | xargs || true)"
 
@@ -288,7 +295,6 @@ jobs:
               return 0
             fi
 
-            # JSON array input
             if echo "$raw" | jq -e 'type=="array"' >/dev/null 2>&1; then
               raw="$(echo "$raw" | jq -r '.[]' | tr '\n' ' ' | xargs || true)"
             fi
@@ -301,15 +307,12 @@ jobs:
             local raw="$1"
             raw="$(normalize_keys_list "$raw")"
 
-            # normalize common aliases (keep it simple/portable)
             raw="$(echo "$raw" | sed 's/TOP10_INVESTMENTS/TOP_10_INVESTMENTS/g')"
             raw="$(echo "$raw" | sed 's/\bTOP10\b/TOP_10_INVESTMENTS/g' || true)"
 
-            # drop forbidden legacy keys (SAFE under set -e)
             raw="$(echo "$raw" | tr ' ' '\n' | grep -v -E '^(KSA_TADAWUL|ADVISOR_CRITERIA)$' || true)"
             raw="$(echo "$raw" | tr '\n' ' ' | xargs || true)"
 
-            # de-dup while preserving order
             raw="$(python - <<'PY'
 import os
 keys = os.environ.get("RAW_KEYS","").split()
@@ -383,7 +386,6 @@ PY
             exit 1
           fi
 
-          # hard fail if forbidden slipped in
           if echo "$KEYS" | tr ' ' '\n' | grep -q -E '^(KSA_TADAWUL|ADVISOR_CRITERIA)$'; then
             echo "::error::Forbidden key present in SYNC_KEYS after sanitization."
             exit 1
@@ -406,7 +408,6 @@ PY
           fi
 
           if [[ -n "${RAW_CREDS:-}" ]]; then
-            # mask only email (avoid multiline add-mask issues)
             SA_EMAIL="$(echo "$RAW_CREDS" | jq -r '.client_email // empty' 2>/dev/null || true)"
             if [[ -n "${SA_EMAIL:-}" ]]; then
               echo "::add-mask::$SA_EMAIL"
@@ -573,6 +574,43 @@ PY
           retention-days: 7
           compression-level: 6
           if-no-files-found: warn
+
+      # ---------------------------------------------------------------------------
+      # FIX: Failure notification added.
+      # Since you manage everything from mobile/GitHub — no PC — you need to know
+      # immediately when a sync fails. Add SLACK_WEBHOOK_URL to your GitHub Secrets
+      # (Settings → Secrets → Actions → New repository secret).
+      # If you don't have Slack, you can replace this with any webhook (Discord, etc.)
+      # ---------------------------------------------------------------------------
+      - name: 🔔 Notify on Failure
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          if [[ -z "${SLACK_WEBHOOK_URL:-}" ]]; then
+            echo "::warning::SLACK_WEBHOOK_URL secret not set. Skipping failure notification."
+            echo "::notice::Add SLACK_WEBHOOK_URL to GitHub Secrets to receive alerts on sync failure."
+            exit 0
+          fi
+
+          RIYADH_TIME="$(TZ=Asia/Riyadh date '+%Y-%m-%d %H:%M:%S %Z')"
+          RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"text\": \"❌ *Tadawul Dashboard Sync FAILED*\",
+              \"attachments\": [{
+                \"color\": \"danger\",
+                \"fields\": [
+                  {\"title\": \"Trigger\", \"value\": \"${{ github.event_name }}\", \"short\": true},
+                  {\"title\": \"Time (Riyadh)\", \"value\": \"$RIYADH_TIME\", \"short\": true},
+                  {\"title\": \"Run Mode\", \"value\": \"${RUN_MODE:-unknown}\", \"short\": true},
+                  {\"title\": \"Keys\", \"value\": \"${SYNC_KEYS:-unknown}\", \"short\": true},
+                  {\"title\": \"Details\", \"value\": \"<$RUN_URL|View Run Logs>\", \"short\": false}
+                ]
+              }]
+            }" || echo "::warning::Slack notification failed to send (webhook error)."
 
       - name: 🧹 Secure Cleanup
         if: always()
