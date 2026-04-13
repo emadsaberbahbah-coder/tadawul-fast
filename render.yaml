@@ -1,13 +1,20 @@
 # =============================================================================
 # render.yaml
 # =============================================================================
-# TADAWUL FAST BRIDGE – RENDER BLUEPRINT (v7.6.0)
+# TADAWUL FAST BRIDGE – RENDER BLUEPRINT (v7.7.0)
 # =============================================================================
 # Goals:
 # - Clean, spec-compliant blueprint
 # - Use requirements.render.txt for build (Render-safe)
 # - Use scripts/start_web.sh as the single start entrypoint
 # - Respect Render's PORT + your env groups
+#
+# v7.7.0 Changes:
+# - FIX: Removed dead WORKERS_MAX env var (was never read by start_web.sh,
+#         only WEB_CONCURRENCY is used — having both caused confusion).
+# - FIX: Added worker service so worker.py actually runs on Render.
+#         Previously the worker was fixed in code but had no Render service
+#         definition, meaning it was never deployed or executed.
 # =============================================================================
 
 previews:
@@ -15,6 +22,9 @@ previews:
   expireAfterDays: 7
 
 services:
+  # ===========================================================================
+  # WEB SERVICE — FastAPI via Gunicorn + UvicornWorker
+  # ===========================================================================
   - type: web
     name: tadawul-fast-bridge
     runtime: python
@@ -89,7 +99,7 @@ services:
           type: keyvalue
           property: connectionString
 
-      # Secrets (set in Render dashboard)
+      # Secrets (set in Render dashboard — never put values here)
       - key: APP_TOKEN
         sync: false
       - key: BACKUP_APP_TOKEN
@@ -105,6 +115,64 @@ services:
       - key: DEFAULT_SPREADSHEET_ID
         sync: false
 
+  # ===========================================================================
+  # WORKER SERVICE — Background job processor (worker.py)
+  # Polls Redis queue "tfb_background_jobs" and dispatches:
+  #   - dashboard_sync  → run_dashboard_sync pipeline
+  #   - market_scan     → run_market_scan pipeline
+  #   - refresh_data    → refresh_data pipeline
+  # ===========================================================================
+  - type: worker
+    name: tadawul-worker
+    runtime: python
+    region: frankfurt
+    plan: starter
+    branch: main
+
+    buildCommand: |
+      set -euo pipefail
+      python -m pip install -U pip
+      if [ -f requirements.render.txt ]; then
+        python -m pip install --no-cache-dir -r requirements.render.txt
+      else
+        python -m pip install --no-cache-dir -r requirements.txt
+      fi
+      python -m compileall -q -f .
+
+    startCommand: python scripts/worker.py
+
+    envVars:
+      - fromGroup: tfb-core
+      - fromGroup: tfb-logging
+      - fromGroup: tfb-providers
+      - fromGroup: tfb-cache
+      - fromGroup: tfb-sheets
+
+      - key: REDIS_URL
+        fromService:
+          name: tadawul-redis
+          type: keyvalue
+          property: connectionString
+
+      # Worker needs the same secrets as the web service for sync pipelines
+      - key: APP_TOKEN
+        sync: false
+      - key: BACKUP_APP_TOKEN
+        sync: false
+      - key: EODHD_API_KEY
+        sync: false
+      - key: FINNHUB_API_KEY
+        sync: false
+      - key: ARGAAM_API_KEY
+        sync: false
+      - key: GOOGLE_SHEETS_CREDENTIALS
+        sync: false
+      - key: DEFAULT_SPREADSHEET_ID
+        sync: false
+
+  # ===========================================================================
+  # REDIS — Queue + Cache
+  # ===========================================================================
   - type: keyvalue
     name: tadawul-redis
     region: frankfurt
@@ -112,6 +180,9 @@ services:
     ipAllowList: []
     maxmemoryPolicy: allkeys-lru
 
+# =============================================================================
+# ENV VAR GROUPS
+# =============================================================================
 envVarGroups:
   - name: tfb-core
     envVars:
@@ -122,9 +193,9 @@ envVarGroups:
       - key: APP_ENV
         value: "production"
       - key: APP_VERSION
-        value: "7.6.0"
+        value: "7.7.0"
       - key: SERVICE_VERSION
-        value: "7.6.0"
+        value: "7.7.0"
       - key: PYTHONUNBUFFERED
         value: "1"
       - key: PYTHONDONTWRITEBYTECODE
@@ -147,12 +218,10 @@ envVarGroups:
     envVars:
       - key: HOST
         value: "0.0.0.0"
-      # Render-safe:
-      # Use WEB_CONCURRENCY (what start_web.sh reads)
+      # WEB_CONCURRENCY is the only worker-count variable read by start_web.sh.
+      # WORKERS_MAX has been removed — it was never read and caused confusion.
       - key: WEB_CONCURRENCY
         value: "1"
-      - key: WORKERS_MAX
-        value: "4"
       - key: UVICORN_KEEPALIVE
         value: "75"
       - key: UVICORN_GRACEFUL_TIMEOUT
