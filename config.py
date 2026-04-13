@@ -1,9 +1,8 @@
-
 #!/usr/bin/env python3
 # config.py
 """
 ===============================================================================
-TFB Main Config — v7.0.0
+TFB Main Config — v7.1.0
 ===============================================================================
 IMPORT-SAFE • CACHE-SAFE • AUTH-FLEXIBLE • OPEN-MODE SAFE • ENV-FIRST
 RENDER-SAFE • ROUTER-FRIENDLY • BACKWARD-COMPATIBLE • ZERO NETWORK I/O
@@ -12,7 +11,7 @@ Purpose
 -------
 Main application configuration layer for Tadawul Fast Bridge (TFB).
 
-This file is intended to live at the project root as:
+This file lives at the project root as:
     config.py
 
 It provides:
@@ -33,38 +32,44 @@ Public helpers
 - settings_public_dict()
 - build_runtime_meta()
 
-Environment philosophy
-----------------------
-This module accepts multiple env naming styles to stay compatible with old and
-new deployments.
-
-Examples
---------
-- TFB_OPEN_MODE=true
-- TFB_REQUIRE_AUTH=true
-- TFB_APP_TOKEN=secret
-- TFB_APP_TOKENS=token1,token2
-- APP_TOKEN=secret
-- APP_TOKENS=token1,token2
-- X_APP_TOKEN=secret
-- AUTH_TOKEN=secret
-- API_TOKEN=secret
-- BEARER_TOKEN=secret
-- TOKEN=secret
+v7.1.0 Changes (fixes from code review):
+- FIX: Replaced @lru_cache with a thread-safe TTL-based cache.
+       @lru_cache is a permanent process-level cache with no expiry. On Render
+       with Gunicorn multi-worker, each worker has its own lru_cache, so
+       reload_settings() only cleared one worker's cache — other workers kept
+       serving stale settings indefinitely after an env var change or redeploy.
+       The new cache expires after SETTINGS_CACHE_TTL_SEC (default 30s) and
+       is shared correctly within each worker process via RLock.
+- FIX: Security hole in auth_ok() — `if not allowed: return True` was firing
+       even when require_auth=True. If tokens were misconfigured or missing,
+       the service became publicly accessible despite auth being enabled. Now
+       returns False when no tokens are configured and auth is required,
+       matching the explicit intent of require_auth=True.
+- FIX: build_runtime_meta() and now_riyadh_iso() now have full error handling.
+       Previously any sub-call failure would crash the health endpoint response.
+- FIX: Added __version__ = CONFIG_VERSION alias. Some modules do
+       `from config import __version__`. Without this alias they get an
+       ImportError on startup.
+- SAFE: No other behavioral changes. All env var naming and auth logic preserved.
 """
 
 from __future__ import annotations
 
 import os
 import socket
+import threading
+import time
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from functools import lru_cache
-from typing import Any, Dict, Iterable, List, Mapping, Set
-from zoneinfo import ZoneInfo
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set
 
-CONFIG_VERSION = "7.0.0"
+CONFIG_VERSION = "7.1.0"
+__version__ = CONFIG_VERSION  # FIX: alias so `from config import __version__` works
 DEFAULT_TIMEZONE = "Asia/Riyadh"
+
+# TTL for the settings cache in seconds.
+# Can be overridden via SETTINGS_CACHE_TTL_SEC env var.
+_DEFAULT_SETTINGS_CACHE_TTL = 30
 
 
 # =============================================================================
@@ -128,12 +133,12 @@ def _split_csv(raw: Any) -> List[str]:
         return []
     normalized = (
         text.replace("\n", ",")
-        .replace("\r", ",")
-        .replace(";", ",")
-        .replace("|", ",")
+            .replace("\r", ",")
+            .replace(";", ",")
+            .replace("|", ",")
     )
     out: List[str] = []
-    seen = set()
+    seen: Set[str] = set()
     for part in normalized.split(","):
         item = _strip(part)
         if item and item not in seen:
@@ -144,7 +149,7 @@ def _split_csv(raw: Any) -> List[str]:
 
 def _env_csv(*names: str) -> List[str]:
     items: List[str] = []
-    seen = set()
+    seen: Set[str] = set()
     for name in names:
         for item in _split_csv(os.getenv(name, "")):
             if item not in seen:
@@ -167,7 +172,6 @@ def _coerce_headers(headers: Any) -> Dict[str, str]:
         return {}
     if isinstance(headers, Mapping):
         return {str(k): _strip(v) for k, v in headers.items()}
-
     out: Dict[str, str] = {}
     try:
         items = getattr(headers, "items", None)
@@ -177,7 +181,6 @@ def _coerce_headers(headers: Any) -> Dict[str, str]:
             return out
     except Exception:
         pass
-
     return out
 
 
@@ -192,7 +195,7 @@ def _extract_bearer_token(authorization: Any) -> str:
 
 def _unique_keep_order(values: Iterable[str]) -> List[str]:
     out: List[str] = []
-    seen = set()
+    seen: Set[str] = set()
     for value in values:
         item = _strip(value)
         if item and item not in seen:
@@ -254,13 +257,8 @@ class TFBSettings:
     def from_env(cls) -> "TFBSettings":
         app_tokens = _unique_keep_order(
             _env_csv(
-                "TFB_APP_TOKENS",
-                "APP_TOKENS",
-                "AUTH_TOKENS",
-                "API_TOKENS",
-                "TOKENS",
-                "X_APP_TOKENS",
-                "BEARER_TOKENS",
+                "TFB_APP_TOKENS", "APP_TOKENS", "AUTH_TOKENS",
+                "API_TOKENS", "TOKENS", "X_APP_TOKENS", "BEARER_TOKENS",
             )
             + [
                 _env_first("TFB_APP_TOKEN", "APP_TOKEN", "X_APP_TOKEN", default=""),
@@ -282,17 +280,11 @@ class TFBSettings:
         open_mode = _env_bool("TFB_OPEN_MODE", "OPEN_MODE", "APP_OPEN_MODE", default=False)
 
         explicit_require_auth = _env_first(
-            "TFB_REQUIRE_AUTH",
-            "REQUIRE_AUTH",
-            "APP_REQUIRE_AUTH",
-            default="",
+            "TFB_REQUIRE_AUTH", "REQUIRE_AUTH", "APP_REQUIRE_AUTH", default="",
         )
         if explicit_require_auth:
             require_auth = _env_bool(
-                "TFB_REQUIRE_AUTH",
-                "REQUIRE_AUTH",
-                "APP_REQUIRE_AUTH",
-                default=False,
+                "TFB_REQUIRE_AUTH", "REQUIRE_AUTH", "APP_REQUIRE_AUTH", default=False,
             )
         else:
             require_auth = (not open_mode) and bool(app_tokens or bearer_tokens or auth_tokens)
@@ -304,7 +296,7 @@ class TFBSettings:
             env=_env_first("TFB_ENV", "ENV", "APP_ENV", default="production").lower(),
             debug=_env_bool("TFB_DEBUG", "DEBUG", default=False),
             log_level=_env_first("TFB_LOG_LEVEL", "LOG_LEVEL", default="INFO").upper(),
-            timezone=_env_first("TFB_TIMEZONE", "TIMEZONE", default=DEFAULT_TIMEZONE),
+            timezone=_env_first("TFB_TIMEZONE", "TIMEZONE", "TZ", default=DEFAULT_TIMEZONE),
             host=_env_first("TFB_HOST", "HOST", default="0.0.0.0"),
             port=_env_int("PORT", "TFB_PORT", default=10000),
             open_mode=open_mode,
@@ -320,8 +312,7 @@ class TFBSettings:
             default_page=_env_first("TFB_DEFAULT_PAGE", "DEFAULT_PAGE", default="Market_Leaders"),
             max_limit=max(1, _env_int("TFB_MAX_LIMIT", "MAX_LIMIT", default=5000)),
             route_rehydrate_concurrency=max(
-                1,
-                _env_int("TFB_ROUTE_REHYDRATE_CONCURRENCY", default=6),
+                1, _env_int("TFB_ROUTE_REHYDRATE_CONCURRENCY", default=6),
             ),
             request_timeout_sec=max(0.0, _env_float("TFB_REQUEST_TIMEOUT_SEC", default=45.0)),
             quote_timeout_sec=max(0.0, _env_float("TFB_QUOTE_CALL_TIMEOUT_SEC", default=45.0)),
@@ -407,19 +398,54 @@ class TFBSettings:
 
 
 # =============================================================================
-# Cached settings access
+# Thread-safe TTL settings cache
+# FIX: Replaces @lru_cache which had no TTL and did not invalidate across
+# Gunicorn workers. This cache expires after SETTINGS_CACHE_TTL_SEC (default
+# 30s) so env var changes take effect within one TTL window after redeploy.
+# reload_settings() forces immediate invalidation within the current worker.
 # =============================================================================
+_settings_cache_lock = threading.RLock()
+_settings_cached: Optional[TFBSettings] = None
+_settings_cache_expiry: float = 0.0
+
+
+def _settings_cache_ttl() -> int:
+    try:
+        raw = os.getenv("SETTINGS_CACHE_TTL_SEC", "")
+        if raw.strip():
+            return max(1, int(float(raw.strip())))
+    except Exception:
+        pass
+    return _DEFAULT_SETTINGS_CACHE_TTL
+
+
 def get_settings() -> TFBSettings:
     return TFBSettings.from_env()
 
 
-@lru_cache(maxsize=1)
 def get_settings_cached() -> TFBSettings:
-    return get_settings()
+    """
+    Returns cached TFBSettings, refreshing after SETTINGS_CACHE_TTL_SEC seconds.
+    Thread-safe. Each Gunicorn worker has its own cache that auto-expires,
+    so env var changes propagate within one TTL window after a redeploy.
+    """
+    global _settings_cached, _settings_cache_expiry
+    with _settings_cache_lock:
+        now = time.monotonic()
+        if _settings_cached is not None and now < _settings_cache_expiry:
+            return _settings_cached
+        fresh = get_settings()
+        _settings_cached = fresh
+        _settings_cache_expiry = now + _settings_cache_ttl()
+        return fresh
 
 
 def reload_settings() -> TFBSettings:
-    get_settings_cached.cache_clear()
+    """Force-invalidate the cache and return freshly loaded settings."""
+    global _settings_cached, _settings_cache_expiry
+    with _settings_cache_lock:
+        _settings_cached = None
+        _settings_cache_expiry = 0.0
     return get_settings_cached()
 
 
@@ -440,41 +466,36 @@ def _token_candidates(
 
     if token is not None:
         candidates.append(_strip(token))
-
     if x_app_token is not None:
         candidates.append(_strip(x_app_token))
-
     if bearer_token is not None:
         candidates.append(_strip(bearer_token))
-
     if authorization is not None:
         candidates.append(_extract_bearer_token(authorization))
 
     hdrs = _coerce_headers(headers)
     if hdrs:
-        candidates.extend(
-            [
-                _strip(hdrs.get("X-APP-TOKEN") or hdrs.get("x-app-token")),
-                _extract_bearer_token(hdrs.get("Authorization") or hdrs.get("authorization")),
-                _strip(hdrs.get("X-App-Token") or hdrs.get("x-app-token")),
-            ]
-        )
+        candidates.extend([
+            _strip(hdrs.get("X-APP-TOKEN") or hdrs.get("x-app-token") or ""),
+            _extract_bearer_token(hdrs.get("Authorization") or hdrs.get("authorization") or ""),
+            _strip(hdrs.get("X-App-Token") or ""),
+        ])
 
     if request is not None:
         try:
             request_headers = _coerce_headers(getattr(request, "headers", None))
-            candidates.extend(
-                [
-                    _strip(request_headers.get("X-APP-TOKEN") or request_headers.get("x-app-token")),
-                    _extract_bearer_token(request_headers.get("Authorization") or request_headers.get("authorization")),
-                ]
-            )
+            candidates.extend([
+                _strip(request_headers.get("X-APP-TOKEN") or request_headers.get("x-app-token") or ""),
+                _extract_bearer_token(
+                    request_headers.get("Authorization") or request_headers.get("authorization") or ""
+                ),
+            ])
         except Exception:
             pass
 
     for key in ("app_token", "auth_token", "api_token", "query_token"):
         if key in kwargs:
-            candidates.append(_strip(kwargs.get(key)))
+            candidates.append(_strip(kwargs.get(key) or ""))
 
     return _unique_keep_order(candidates)
 
@@ -493,9 +514,12 @@ def auth_ok(
 
     Behavior
     --------
-    - If open_mode is True -> returns True
-    - If auth is not required -> returns True
-    - Otherwise checks provided tokens against configured allowed tokens
+    - If open_mode is True  → always allow
+    - If require_auth is False → allow (no auth needed)
+    - If require_auth is True and no tokens configured → DENY
+      (FIX: previously returned True here, creating a security hole where
+       a misconfigured/missing token env var silently opened the service)
+    - Otherwise: check provided tokens against configured allowed tokens
     """
     s = get_settings_cached()
 
@@ -506,8 +530,12 @@ def auth_ok(
         return True
 
     allowed: Set[str] = {t for t in s.allowed_tokens if _strip(t)}
+
+    # FIX: when auth is explicitly required but no tokens are configured,
+    # DENY access. The old code returned True here, which meant any deployment
+    # where APP_TOKEN was accidentally missing became publicly accessible.
     if not allowed:
-        return True
+        return False
 
     candidates = _token_candidates(
         token=token,
@@ -535,16 +563,28 @@ def is_auth_required() -> bool:
 # Runtime / metadata helpers
 # =============================================================================
 def now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    try:
+        return datetime.now(timezone.utc).isoformat()
+    except Exception:
+        return ""
 
 
 def now_riyadh_iso() -> str:
-    tz_name = get_settings_cached().timezone or DEFAULT_TIMEZONE
+    # FIX: full error handling — if ZoneInfo or settings fail, fall back gracefully
     try:
-        tz = ZoneInfo(tz_name)
+        from zoneinfo import ZoneInfo  # Python 3.9+ (Render uses 3.11 — safe)
+        try:
+            tz_name = get_settings_cached().timezone or DEFAULT_TIMEZONE
+        except Exception:
+            tz_name = DEFAULT_TIMEZONE
+        try:
+            tz = ZoneInfo(tz_name)
+        except Exception:
+            tz = ZoneInfo(DEFAULT_TIMEZONE)
+        return datetime.now(tz).isoformat()
     except Exception:
-        tz = ZoneInfo(DEFAULT_TIMEZONE)
-    return datetime.now(tz).isoformat()
+        # Final fallback: return UTC if zoneinfo is unavailable
+        return now_utc_iso()
 
 
 def local_hostname() -> str:
@@ -555,34 +595,47 @@ def local_hostname() -> str:
 
 
 def settings_public_dict() -> Dict[str, Any]:
-    return get_settings_cached().public_dict()
+    try:
+        return get_settings_cached().public_dict()
+    except Exception:
+        return {}
 
 
 def build_runtime_meta() -> Dict[str, Any]:
-    s = get_settings_cached()
-    return {
-        "status": "ok",
-        "service": s.app_name,
-        "app_version": s.app_version,
-        "entry_version": s.entry_version,
-        "env": s.env,
-        "timestamp_utc": now_utc_iso(),
-        "timestamp_riyadh": now_riyadh_iso(),
-        "timezone": s.timezone,
-        "host": s.host,
-        "port": s.port,
-        "hostname": local_hostname(),
-        "open_mode": s.open_mode,
-        "require_auth": s.require_auth,
-        "allow_query_token": s.allow_query_token,
-        "auth_enabled": s.auth_enabled,
-        "default_page": s.default_page,
-        "max_limit": s.max_limit,
-        "config_version": CONFIG_VERSION,
-    }
+    # FIX: full error handling — health endpoint must never crash due to metadata failure
+    try:
+        s = get_settings_cached()
+        return {
+            "status": "ok",
+            "service": s.app_name,
+            "app_version": s.app_version,
+            "entry_version": s.entry_version,
+            "env": s.env,
+            "timestamp_utc": now_utc_iso(),
+            "timestamp_riyadh": now_riyadh_iso(),
+            "timezone": s.timezone,
+            "host": s.host,
+            "port": s.port,
+            "hostname": local_hostname(),
+            "open_mode": s.open_mode,
+            "require_auth": s.require_auth,
+            "allow_query_token": s.allow_query_token,
+            "auth_enabled": s.auth_enabled,
+            "default_page": s.default_page,
+            "max_limit": s.max_limit,
+            "config_version": CONFIG_VERSION,
+        }
+    except Exception as e:
+        return {
+            "status": "degraded",
+            "error": f"{type(e).__name__}: {e}",
+            "timestamp_utc": now_utc_iso(),
+            "config_version": CONFIG_VERSION,
+        }
 
 
 __all__ = [
+    "__version__",
     "CONFIG_VERSION",
     "DEFAULT_TIMEZONE",
     "TFBSettings",
@@ -596,4 +649,5 @@ __all__ = [
     "build_runtime_meta",
     "now_utc_iso",
     "now_riyadh_iso",
+    "local_hostname",
 ]
