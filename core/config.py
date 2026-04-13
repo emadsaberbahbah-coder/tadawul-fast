@@ -2,7 +2,7 @@
 # core/config.py
 """
 ================================================================================
-Core Configuration Module — v5.7.0
+Core Configuration Module — v5.8.0
 (RENDER-SAFE / STARTUP-SAFE / SCHEMA-AWARE / ROUTE-AUTH-CONTROLLED)
 ================================================================================
 TADAWUL FAST BRIDGE – Enterprise Configuration Management
@@ -11,17 +11,26 @@ Primary goals:
 - ✅ Avoid deploy/startup failures (NO network calls, NO heavy init at import-time)
 - ✅ Defensive env parsing + safe optional dependencies
 - ✅ Google credentials normalization (JSON / base64 / file path)
-- ✅ Distributed config sources are LAZY and opt-in (won’t block Render port binding)
+- ✅ Distributed config sources are LAZY and opt-in (won't block Render port binding)
 - ✅ Schema/page alignment via core.sheets.page_catalog + core.sheets.schema_registry
 - ✅ CRITICAL: headers/columns MUST ALWAYS exist even if computations are disabled
-- ✅ Granular route auth controls:
-     - Keep service protected by default
-     - Allow explicit PUBLIC_EXACT_PATHS / PUBLIC_PATH_PREFIXES
-     - Support protected overrides
-     - Make auth decisions path-aware without forcing OPEN_MODE=true
+- ✅ Granular route auth controls
 
-Safe-by-default philosophy:
-- Importing this module must NEVER crash, NEVER hang, NEVER do network I/O.
+v5.8.0 Changes (fixes from code review):
+- FIX: batch_concurrency no longer falls back to WEB_CONCURRENCY.
+       On Render, WEB_CONCURRENCY=1 (for memory safety). Using it as the
+       batch concurrency cap was silently limiting all data fetches to 1
+       concurrent request — a severe performance regression. batch_concurrency
+       now reads only BATCH_CONCURRENCY (default 5).
+- FIX: Added resolve_google_credentials() as an alias for
+       normalize_google_credentials(). Several modules (env.py, setup_credentials,
+       migrate_schema_v2) import under this older name. Without the alias,
+       those modules fail at import time on a fresh deploy.
+- FIX: normalize_google_credentials and resolve_google_credentials now both
+       appear in __all__ so they are discoverable by import * callers.
+- FIX: google_credentials_dict is now deep-copied when stored in the frozen
+       Settings dataclass to prevent external mutation of the stored dict.
+- SAFE: No other behavioral changes. All other logic preserved exactly.
 """
 
 from __future__ import annotations
@@ -45,7 +54,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Un
 # =============================================================================
 # Version
 # =============================================================================
-__version__ = "5.7.0"
+__version__ = "5.8.0"
 CONFIG_VERSION = __version__
 CONFIG_BUILD_TIMESTAMP = datetime.now(timezone.utc).isoformat()
 
@@ -84,7 +93,6 @@ except Exception:
 # =============================================================================
 try:
     import yaml  # type: ignore
-
     _HAS_YAML = True
 except Exception:
     yaml = None  # type: ignore
@@ -92,7 +100,6 @@ except Exception:
 
 try:
     import toml  # type: ignore
-
     _HAS_TOML = True
 except Exception:
     toml = None  # type: ignore
@@ -100,7 +107,6 @@ except Exception:
 
 try:
     from cryptography.fernet import Fernet  # type: ignore
-
     _HAS_CRYPTO = True
 except Exception:
     Fernet = None  # type: ignore
@@ -109,7 +115,6 @@ except Exception:
 try:
     from opentelemetry import trace  # type: ignore
     from opentelemetry.trace import Status, StatusCode  # type: ignore
-
     _OTEL_AVAILABLE = True
 except Exception:
     trace = None  # type: ignore
@@ -119,7 +124,6 @@ except Exception:
 
 try:
     import consul  # type: ignore
-
     _CONSUL_AVAILABLE = True
 except Exception:
     consul = None  # type: ignore
@@ -127,7 +131,6 @@ except Exception:
 
 try:
     import etcd3  # type: ignore
-
     _ETCD_AVAILABLE = True
 except Exception:
     etcd3 = None  # type: ignore
@@ -135,7 +138,6 @@ except Exception:
 
 try:
     from kazoo.client import KazooClient  # type: ignore
-
     _ZOOKEEPER_AVAILABLE = True
 except Exception:
     KazooClient = None  # type: ignore
@@ -271,11 +273,7 @@ def _dbg(message: str, level: str = "info", **kwargs: Any) -> None:
 # TraceContext (safe)
 # =============================================================================
 _TRACING_ENABLED = (os.getenv("CORE_TRACING_ENABLED", "") or os.getenv("TRACING_ENABLED", "")).strip().lower() in {
-    "1",
-    "true",
-    "yes",
-    "y",
-    "on",
+    "1", "true", "yes", "y", "on",
 }
 
 
@@ -331,7 +329,6 @@ class TraceContext:
         def wrapper(*args, **kwargs):
             with TraceContext(self.name, self.attributes):
                 return fn(*args, **kwargs)
-
         wrapper.__name__ = getattr(fn, "__name__", "wrapped")
         wrapper.__doc__ = getattr(fn, "__doc__", None)
         return wrapper
@@ -438,19 +435,9 @@ def is_valid_url(url: str) -> bool:
 # Sensitive masking helpers
 # =============================================================================
 SENSITIVE_KEYS = {
-    "token",
-    "secret",
-    "key",
-    "api_key",
-    "apikey",
-    "password",
-    "credential",
-    "authorization",
-    "bearer",
-    "jwt",
-    "private_key",
-    "client_secret",
-    "encryption_key",
+    "token", "secret", "key", "api_key", "apikey", "password",
+    "credential", "authorization", "bearer", "jwt", "private_key",
+    "client_secret", "encryption_key",
 }
 
 
@@ -507,19 +494,15 @@ def load_file_content(path: Path) -> Dict[str, Any]:
         if not raw:
             return {}
         suffix = path.suffix.lower()
-
         if suffix == ".json":
             obj = json_loads(raw)
             return obj if isinstance(obj, dict) else {}
-
         if suffix in (".yml", ".yaml") and _HAS_YAML and yaml is not None:
             obj = yaml.safe_load(raw)
             return obj if isinstance(obj, dict) else {}
-
         if suffix == ".toml" and _HAS_TOML and toml is not None:
             obj = toml.loads(raw)
             return obj if isinstance(obj, dict) else {}
-
         obj = json_loads(raw)
         return obj if isinstance(obj, dict) else {}
     except Exception as e:
@@ -673,11 +656,11 @@ class ConfigVersionManager:
         with self._lock:
             self._versions.append(v)
             if len(self._versions) > self.max_versions:
-                self._versions = self._versions[-self.max_versions :]
+                self._versions = self._versions[-self.max_versions:]
 
     def history(self, limit: int = 20) -> List[ConfigVersion]:
         with self._lock:
-            return list(reversed(self._versions[-max(1, int(limit)) :]))
+            return list(reversed(self._versions[-max(1, int(limit)):]))
 
 
 _VERSION_MANAGER = ConfigVersionManager(max_versions=100)
@@ -795,6 +778,11 @@ def normalize_google_credentials() -> Tuple[Optional[str], Optional[Dict[str, An
     return (None, None)
 
 
+# FIX: alias for backward compatibility with env.py, setup_credentials,
+# migrate_schema_v2, and any other module that imports the older name.
+resolve_google_credentials = normalize_google_credentials
+
+
 # =============================================================================
 # Page + Schema helpers
 # =============================================================================
@@ -862,18 +850,16 @@ def schema_columns(sheet: str) -> List[Dict[str, Any]]:
             return []
         out: List[Dict[str, Any]] = []
         for c in spec.columns:
-            out.append(
-                {
-                    "group": getattr(c, "group", None),
-                    "header": getattr(c, "header", None),
-                    "key": getattr(c, "key", None),
-                    "dtype": getattr(c, "dtype", None),
-                    "fmt": getattr(c, "fmt", None),
-                    "required": bool(getattr(c, "required", False)),
-                    "source": getattr(c, "source", None),
-                    "notes": getattr(c, "notes", None),
-                }
-            )
+            out.append({
+                "group": getattr(c, "group", None),
+                "header": getattr(c, "header", None),
+                "key": getattr(c, "key", None),
+                "dtype": getattr(c, "dtype", None),
+                "fmt": getattr(c, "fmt", None),
+                "required": bool(getattr(c, "required", False)),
+                "source": getattr(c, "source", None),
+                "notes": getattr(c, "notes", None),
+            })
         return out
     except Exception:
         return []
@@ -898,12 +884,10 @@ def normalize_row_to_schema(
         keys = schema_keys(sheet)
         if not keys:
             return dict(row)
-
         fill = None if fill_missing_with_null else ""
         out: Dict[str, Any] = {}
         for k in keys:
             out[k] = row.get(k, fill)
-
         for k, v in row.items():
             if k not in out:
                 out[k] = v
@@ -990,11 +974,8 @@ class Settings:
     forbidden_pages: List[str] = field(default_factory=lambda: sorted(list(forbidden_pages())))
     default_data_pages: List[str] = field(
         default_factory=lambda: [
-            "Market_Leaders",
-            "Global_Markets",
-            "Commodities_FX",
-            "Mutual_Funds",
-            "My_Portfolio",
+            "Market_Leaders", "Global_Markets", "Commodities_FX",
+            "Mutual_Funds", "My_Portfolio",
         ]
     )
     top10_feed_pages: List[str] = field(default_factory=lambda: top10_feed_pages_default())
@@ -1033,13 +1014,11 @@ class Settings:
     # Provider keys + base URLs
     eodhd_api_key: Optional[str] = None
     eodhd_base_url: str = "https://eodhd.com/api"
-
     finnhub_api_key: Optional[str] = None
     fmp_api_key: Optional[str] = None
     alphavantage_api_key: Optional[str] = None
     marketstack_api_key: Optional[str] = None
     twelvedata_api_key: Optional[str] = None
-
     fmp_base_url: Optional[str] = None
 
     # EODHD global defaults
@@ -1190,19 +1169,13 @@ class Settings:
                 except Exception:
                     continue
             default_data_pages = ddp or [
-                "Market_Leaders",
-                "Global_Markets",
-                "Commodities_FX",
-                "Mutual_Funds",
-                "My_Portfolio",
+                "Market_Leaders", "Global_Markets", "Commodities_FX",
+                "Mutual_Funds", "My_Portfolio",
             ]
         else:
             default_data_pages = [
-                "Market_Leaders",
-                "Global_Markets",
-                "Commodities_FX",
-                "Mutual_Funds",
-                "My_Portfolio",
+                "Market_Leaders", "Global_Markets", "Commodities_FX",
+                "Mutual_Funds", "My_Portfolio",
             ]
 
         top10_feed_pages_env = coerce_list(os.getenv("TOP10_FEED_PAGES"))
@@ -1213,15 +1186,28 @@ class Settings:
 
         http_timeout_sec = coerce_float(os.getenv("HTTP_TIMEOUT_SEC"), 45.0, lo=5.0, hi=300.0)
         max_retries = coerce_int(os.getenv("MAX_RETRIES"), 2, lo=0, hi=20)
-        retry_delay_sec = coerce_float(os.getenv("RETRY_DELAY") or os.getenv("RETRY_DELAY_SEC"), 1.0, lo=0.0, hi=30.0)
+        retry_delay_sec = coerce_float(
+            os.getenv("RETRY_DELAY") or os.getenv("RETRY_DELAY_SEC"), 1.0, lo=0.0, hi=30.0
+        )
 
-        cache_ttl_sec = coerce_int(os.getenv("CACHE_TTL_SEC") or os.getenv("CACHE_DEFAULT_TTL"), 20, lo=1, hi=3600)
+        cache_ttl_sec = coerce_int(
+            os.getenv("CACHE_TTL_SEC") or os.getenv("CACHE_DEFAULT_TTL"), 20, lo=1, hi=3600
+        )
         engine_cache_ttl_sec = coerce_int(os.getenv("ENGINE_CACHE_TTL_SEC"), 60, lo=1, hi=86400)
         cache_max_size = coerce_int(os.getenv("CACHE_MAX_SIZE"), 2048, lo=128, hi=200000)
 
-        batch_concurrency = coerce_int(os.getenv("BATCH_CONCURRENCY") or os.getenv("WEB_CONCURRENCY"), 5, lo=1, hi=50)
+        # FIX: batch_concurrency must NOT fall back to WEB_CONCURRENCY.
+        # On Render, WEB_CONCURRENCY=1 (for memory safety with heavy FastAPI apps).
+        # Using it as a data fetch concurrency cap was limiting all provider
+        # requests to 1 concurrent call — a severe performance regression that
+        # silently slows down every market scan and dashboard sync.
+        # batch_concurrency now reads ONLY its own dedicated env var.
+        batch_concurrency = coerce_int(os.getenv("BATCH_CONCURRENCY"), 5, lo=1, hi=50)
+
         ai_batch_size = coerce_int(os.getenv("AI_BATCH_SIZE"), 20, lo=1, hi=500)
-        quote_batch_size = coerce_int(os.getenv("QUOTE_BATCH_SIZE") or os.getenv("TADAWUL_MAX_SYMBOLS"), 50, lo=1, hi=500)
+        quote_batch_size = coerce_int(
+            os.getenv("QUOTE_BATCH_SIZE") or os.getenv("TADAWUL_MAX_SYMBOLS"), 50, lo=1, hi=500
+        )
 
         init_engine_on_boot = coerce_bool(os.getenv("INIT_ENGINE_ON_BOOT"), True)
         defer_router_mount = coerce_bool(os.getenv("DEFER_ROUTER_MOUNT"), False)
@@ -1245,6 +1231,10 @@ class Settings:
         google_apps_script_backup_url = strip_value(os.getenv("GOOGLE_APPS_SCRIPT_BACKUP_URL") or "") or None
 
         tz = strip_value(os.getenv("TZ") or "Asia/Riyadh")
+
+        # FIX: deep-copy google_credentials_dict before storing in frozen dataclass
+        # to prevent external callers from mutating the stored credentials dict.
+        safe_gs_dict = copy.deepcopy(gs_dict) if isinstance(gs_dict, dict) else gs_dict
 
         return cls(
             schema_enabled=schema_enabled,
@@ -1308,7 +1298,7 @@ class Settings:
             defer_router_mount=defer_router_mount,
             default_spreadsheet_id=default_spreadsheet_id,
             google_sheets_credentials_json=gs_json,
-            google_credentials_dict=gs_dict,
+            google_credentials_dict=safe_gs_dict,
             google_apps_script_url=google_apps_script_url,
             google_apps_script_backup_url=google_apps_script_backup_url,
         )
@@ -1339,28 +1329,39 @@ class Settings:
 
         if self.primary_provider and self.primary_provider.lower() not in enabled_lower:
             warnings_list.append(
-                f"PRIMARY_PROVIDER={self.primary_provider!r} not included in ENABLED_PROVIDERS={self.enabled_providers!r}."
+                f"PRIMARY_PROVIDER={self.primary_provider!r} not included in "
+                f"ENABLED_PROVIDERS={self.enabled_providers!r}."
             )
 
         if self.require_auth and not self.open_mode:
             if not (self.app_token or self.backup_app_token or allowed_tokens()):
                 errors.append(
-                    "REQUIRE_AUTH=true but no APP_TOKEN/BACKUP_APP_TOKEN/ALLOWED_TOKENS configured (and OPEN_MODE=false)."
+                    "REQUIRE_AUTH=true but no APP_TOKEN/BACKUP_APP_TOKEN/ALLOWED_TOKENS "
+                    "configured (and OPEN_MODE=false)."
                 )
 
         if self.open_mode and (self.app_token or self.backup_app_token):
-            warnings_list.append("OPEN_MODE=true while tokens exist. Service may be publicly exposed unintentionally.")
+            warnings_list.append(
+                "OPEN_MODE=true while tokens exist. Service may be publicly exposed unintentionally."
+            )
 
         if self.schema_enabled and self.schema_headers_always is not True:
-            warnings_list.append("SCHEMA_ENABLED=true but SCHEMA_HEADERS_ALWAYS is not true. This can break column guarantees.")
+            warnings_list.append(
+                "SCHEMA_ENABLED=true but SCHEMA_HEADERS_ALWAYS is not true. "
+                "This can break column guarantees."
+            )
 
         if self.schema_enabled and not schema_available():
-            warnings_list.append("Schema modules not available/importable yet. Falling back to static page list.")
+            warnings_list.append(
+                "Schema modules not available/importable yet. Falling back to static page list."
+            )
 
         if self.public_exact_paths and self.protected_exact_paths:
             overlap = set(self.public_exact_paths) & set(self.protected_exact_paths)
             if overlap:
-                warnings_list.append(f"Paths appear in both public_exact_paths and protected_exact_paths: {sorted(overlap)}")
+                warnings_list.append(
+                    f"Paths appear in both public_exact_paths and protected_exact_paths: {sorted(overlap)}"
+                )
 
         return errors, warnings_list
 
@@ -1483,14 +1484,13 @@ class ConsulConfigSource:
             _, data = client.kv.get(self.prefix, recurse=True)  # type: ignore
             if not data:
                 return None
-
             out: Dict[str, Any] = {}
             for item in data:
                 k = item.get("Key") or ""
                 raw = item.get("Value")
                 if not k or raw is None:
                     continue
-                rel = k[len(self.prefix) + 1 :] if k.startswith(self.prefix) else k
+                rel = k[len(self.prefix) + 1:] if k.startswith(self.prefix) else k
                 try:
                     txt = raw.decode("utf-8", errors="replace") if isinstance(raw, (bytes, bytearray)) else str(raw)
                     try:
@@ -1499,7 +1499,6 @@ class ConsulConfigSource:
                         val = txt
                 except Exception:
                     continue
-
                 parts = [p for p in rel.split("/") if p]
                 cur = out
                 for p in parts[:-1]:
@@ -1529,7 +1528,7 @@ class EtcdConfigSource:
             out: Dict[str, Any] = {}
             for value, meta in client.get_prefix(self.prefix):  # type: ignore
                 key = (meta.key or b"").decode("utf-8", errors="replace")
-                rel = key[len(self.prefix) :].lstrip("/")
+                rel = key[len(self.prefix):].lstrip("/")
                 try:
                     txt = value.decode("utf-8", errors="replace") if isinstance(value, (bytes, bytearray)) else str(value)
                     try:
@@ -1538,7 +1537,6 @@ class EtcdConfigSource:
                         val = txt
                 except Exception:
                     continue
-
                 parts = [p for p in rel.split("/") if p]
                 cur = out
                 for p in parts[:-1]:
@@ -1567,7 +1565,6 @@ class ZooKeeperConfigSource:
         try:
             client = KazooClient(hosts=self.hosts)  # type: ignore
             client.start(timeout=self.start_timeout_sec)
-
             out: Dict[str, Any] = {}
 
             def walk(path: str, cur: Dict[str, Any]) -> None:
@@ -1692,19 +1689,10 @@ def config_health_check() -> Dict[str, Any]:
 # Auth helpers
 # =============================================================================
 def allowed_tokens() -> List[str]:
-    """
-    Allowed tokens list (comma-separated).
-    Priority:
-      1) ALLOWED_TOKENS
-      2) TFB_ALLOWED_TOKENS
-      3) APP_TOKENS
-      4) APP_TOKEN + BACKUP_APP_TOKEN
-    """
     toks = coerce_list(os.getenv("ALLOWED_TOKENS") or os.getenv("TFB_ALLOWED_TOKENS") or os.getenv("APP_TOKENS"))
     toks = [t for t in toks if t]
     if toks:
         return toks
-
     t1 = strip_value(os.getenv("APP_TOKEN") or os.getenv("TFB_APP_TOKEN") or os.getenv("BACKEND_TOKEN") or "")
     t2 = strip_value(os.getenv("BACKUP_APP_TOKEN") or "")
     out: List[str] = []
@@ -1716,14 +1704,9 @@ def allowed_tokens() -> List[str]:
 
 
 def is_open_mode() -> bool:
-    """
-    If OPEN_MODE is set => honor it.
-    Else open only when REQUIRE_AUTH is false AND no tokens exist.
-    """
     env_flag = os.getenv("OPEN_MODE")
     if env_flag is not None:
         return coerce_bool(env_flag, False)
-
     req = coerce_bool(os.getenv("REQUIRE_AUTH"), True)
     return (not req) and (len(allowed_tokens()) == 0)
 
@@ -1789,17 +1772,6 @@ def auth_ok(
     settings: Optional[Settings] = None,
     **_: Any,
 ) -> bool:
-    """
-    Standard auth check used by routes.
-
-    Supports:
-      - OPEN_MODE / REQUIRE_AUTH semantics
-      - path-aware public exemptions
-      - token param
-      - Authorization: Bearer <token>
-      - configured auth header name (default X-APP-TOKEN)
-      - X-API-KEY header
-    """
     s = settings or get_settings_cached()
 
     req_path = path
@@ -1808,7 +1780,10 @@ def auth_ok(
     if request is not None:
         try:
             if not req_path:
-                req_path = getattr(getattr(request, "url", None), "path", None) or getattr(request, "scope", {}).get("path")
+                req_path = (
+                    getattr(getattr(request, "url", None), "path", None)
+                    or getattr(request, "scope", {}).get("path")
+                )
         except Exception:
             pass
         try:
@@ -1928,4 +1903,7 @@ __all__ = [
     "auth_ok",
     "mask_settings",
     "init_distributed_config",
+    # FIX: both credential function names exported for full backward compatibility
+    "normalize_google_credentials",
+    "resolve_google_credentials",
 ]
