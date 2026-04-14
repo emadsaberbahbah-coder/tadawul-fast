@@ -2,34 +2,23 @@
 # core/scoring.py
 """
 ================================================================================
-Scoring Module — v2.3.0
+Scoring Module — v2.4.0
 (SCHEMA-ALIGNED / ENGINE-READY / CONTRACT-HARDENED / DETERMINISTIC / RANK-AWARE)
 ================================================================================
 
-v2.3.0 Changes (fixes from code review):
-- FIX: _as_fraction boundary bug — changed `> 1.5` to `>= 1.5`.
-       Previously, values of exactly ±1.5 were treated as fractions (±150%)
-       instead of percentages (±1.5%). abs(-1.5) == 1.5 which is NOT > 1.5,
-       so -1.5 stayed as -1.5 (interpreted as -150% ROI). With `>= 1.5`,
-       ±1.5 is now correctly divided by 100 → ±0.015 (1.5%).
-
-- FIX: Added _as_roi_fraction() with threshold `> 1.0` for ROI-specific
-       fields. The general _as_fraction threshold of 1.5 is too loose for
-       ROI/return values: a value of 1.2 (meaning 1.2% ROI from a provider)
-       would stay as 1.2 and be interpreted as 120% ROI — a severe distortion
-       for Saudi equities and global stocks where >100% ROI is extremely rare.
-       ROI fields in _derive_forecast_patch now use _as_roi_fraction.
-       Note: _as_fraction (threshold >= 1.5) is preserved for fields like
-       volatility and growth where >100% values can legitimately occur.
-
-- FIX: Added RECOMMENDATION_LABEL_MAP constant for label normalization.
-       scoring.py outputs STRONG_BUY/BUY/HOLD/REDUCE/SELL (uppercase).
-       top10_selector.py and investment_advisor_engine.py use title case
-       (Strong Buy/Buy/Hold/Avoid). Without normalization, Google Sheets
-       consumers receive inconsistent recommendation labels across sheets.
-       Use normalize_recommendation_label() for consumer-facing output.
-
-- SAFE: All weights, scoring formulas, and ranking logic preserved exactly.
+v2.4.0 Changes
+--------------
+- KEEP: all v2.3.0 ROI fixes:
+  - _as_fraction boundary bug fixed (`>= 1.5`)
+  - _as_roi_fraction added for ROI-specific fields
+- ENHANCE: recommendation labels are now governed by one canonical enum:
+  STRONG_BUY / BUY / HOLD / REDUCE / SELL
+- ENHANCE: added normalize_recommendation_code() so downstream modules can
+  normalize mixed label styles to one internal code safely
+- ENHANCE: normalize_recommendation_label() is now case-insensitive and tolerant
+  to spaces / hyphens / underscores / legacy labels like Accumulate / Avoid
+- SAFE: scoring formulas and ranking logic preserved; this revision focuses on
+  normalization and contract stability for downstream routes / selectors
 """
 
 from __future__ import annotations
@@ -40,7 +29,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
-__version__ = "2.3.0"
+__version__ = "2.4.0"
 SCORING_VERSION = __version__
 
 _UTC = timezone.utc
@@ -136,24 +125,12 @@ def _as_fraction(x: Any) -> Optional[float]:
     Convert percent-like values to fraction for general financial metrics.
     Threshold: abs(f) >= 1.5 → divide by 100.
 
-    Examples:
-      "12%" → 0.12
-      12    → 0.12   (12 >= 1.5 → treated as percentage)
-      0.12  → 0.12   (0.12 < 1.5 → treated as fraction already)
-      1.5   → 0.015  (FIX: was `> 1.5` so 1.5 stayed as 1.5 = 150%)
-      -1.5  → -0.015 (FIX: abs(-1.5) = 1.5 >= 1.5 → now correctly converted)
-
-    Note: This threshold is intentionally >= 1.5 (not > 1.0) for fields like
-    volatility, growth rates, and drawdowns where values between 1.0 and 1.5
-    can legitimately be fractions (e.g. 120% annualized volatility for crypto,
-    130% revenue growth for a hypergrowth company). For ROI-specific fields
-    where >100% return is extremely rare in normal equities, use
-    _as_roi_fraction() which uses the tighter > 1.0 threshold.
+    Use for volatility, drawdown, growth rates, and general percentage-like
+    metrics where values >100% can still be legitimate.
     """
     f = _safe_float(x)
     if f is None:
         return None
-    # FIX: was `> 1.5` — values exactly at ±1.5 were misclassified as fractions
     if abs(f) >= 1.5:
         return f / 100.0
     return f
@@ -164,21 +141,8 @@ def _as_roi_fraction(x: Any) -> Optional[float]:
     Convert ROI / return values to fraction form with a tighter threshold.
     Threshold: abs(f) > 1.0 → divide by 100.
 
-    This is stricter than _as_fraction() because:
-    - ROI/return values > 100% are extremely rare for Saudi and global equities
-    - A provider returning 1.2 almost always means 1.2% return, not 120%
-    - A provider returning -1.2 almost always means -1.2% loss, not -120%
-
-    Examples:
-      1.2   → 0.012  (1.2% ROI, not 120%)
-      -1.2  → -0.012 (-1.2% loss, not -120%)
-      12.5  → 0.125  (12.5% ROI)
-      0.08  → 0.08   (8% ROI already as fraction)
-      1.0   → 1.0    (exactly 100% ROI — kept as fraction, legitimate M&A premium)
-
-    Use this for: expected_roi_1m, expected_roi_3m, expected_roi_12m,
-    expected_return_*, and any ROI field read directly from provider row data.
-    Do NOT use for volatility, growth rates, or drawdowns — use _as_fraction.
+    Use for expected_roi_* / expected_return_* / percent_change style fields
+    where 1.2 should usually mean 1.2%, not 120%.
     """
     f = _safe_float(x)
     if f is None:
@@ -218,41 +182,68 @@ def _env_float(name: str, default: float) -> float:
 
 # =============================================================================
 # Recommendation label normalization
-# FIX: scoring.py outputs UPPERCASE_UNDERSCORE labels. top10_selector.py and
-# investment_advisor_engine.py use Title Case. Without a shared mapping,
-# Google Sheets consumers receive inconsistent labels across sheets.
-# Use normalize_recommendation_label() for all consumer-facing output.
 # =============================================================================
+CANONICAL_RECOMMENDATION_CODES: Tuple[str, ...] = (
+    "STRONG_BUY",
+    "BUY",
+    "HOLD",
+    "REDUCE",
+    "SELL",
+)
+
 RECOMMENDATION_LABEL_MAP: Dict[str, str] = {
-    # scoring.py internal labels → canonical display labels
     "STRONG_BUY": "Strong Buy",
     "BUY": "Buy",
     "HOLD": "Hold",
     "REDUCE": "Reduce",
     "SELL": "Sell",
-    # already-normalized variants (pass-through)
-    "Strong Buy": "Strong Buy",
-    "Buy": "Buy",
-    "Hold": "Hold",
-    "Reduce": "Reduce",
-    "Sell": "Sell",
-    # advisor engine variants
-    "Avoid": "Avoid",
-    "AVOID": "Avoid",
-    "ACCUMULATE": "Buy",  # map legacy label
-    "Accumulate": "Buy",
+}
+
+_RECOMMENDATION_CODE_ALIASES: Dict[str, str] = {
+    "STRONG_BUY": "STRONG_BUY",
+    "STRONGBUY": "STRONG_BUY",
+    "STRONG-BUY": "STRONG_BUY",
+    "STRONG BUY": "STRONG_BUY",
+    "BUY": "BUY",
+    "ACCUMULATE": "BUY",
+    "ADD": "BUY",
+    "HOLD": "HOLD",
+    "NEUTRAL": "HOLD",
+    "REDUCE": "REDUCE",
+    "TRIM": "REDUCE",
+    "SELL": "SELL",
+    "AVOID": "SELL",
+    "EXIT": "SELL",
 }
 
 
-def normalize_recommendation_label(label: str) -> str:
+def _normalize_label_token(label: Any) -> str:
+    s = _safe_str(label).upper()
+    if not s:
+        return ""
+    s = s.replace("-", "_").replace(" ", "_")
+    while "__" in s:
+        s = s.replace("__", "_")
+    return s.strip("_")
+
+
+def normalize_recommendation_code(label: Any) -> str:
+    """
+    Normalize a recommendation label into the canonical uppercase enum:
+    STRONG_BUY / BUY / HOLD / REDUCE / SELL
+    """
+    token = _normalize_label_token(label)
+    if not token:
+        return "HOLD"
+    return _RECOMMENDATION_CODE_ALIASES.get(token, token if token in CANONICAL_RECOMMENDATION_CODES else "HOLD")
+
+
+def normalize_recommendation_label(label: Any) -> str:
     """
     Normalize a recommendation label to canonical Title Case display format.
-    Returns the input unchanged if the label is not recognized.
     """
-    s = _safe_str(label)
-    if not s:
-        return "Hold"
-    return RECOMMENDATION_LABEL_MAP.get(s, s)
+    code = normalize_recommendation_code(label)
+    return RECOMMENDATION_LABEL_MAP.get(code, "Hold")
 
 
 # =============================================================================
@@ -261,11 +252,7 @@ def normalize_recommendation_label(label: str) -> str:
 @dataclass(slots=True)
 class ScoreWeights:
     # NOTE: These weights govern the overall_score computation in scoring.py.
-    # top10_selector.py uses a separate composite scoring function with
-    # different weights (overall=35%, opportunity=20%, roi=20%, etc.)
-    # This is intentional: scoring.py computes the fundamental per-asset score
-    # while top10_selector.py applies a selection-specific ranking that also
-    # considers liquidity, direct symbols, and row richness.
+    # top10_selector.py may use a separate selector ranking model on top.
     w_valuation: float = 0.30
     w_momentum: float = 0.25
     w_quality: float = 0.20
@@ -451,11 +438,6 @@ def _derive_forecast_patch(row: Mapping[str, Any], forecasts: ForecastParameters
         "forecast_price_1m",
     )
 
-    # FIX: Use _as_roi_fraction (threshold > 1.0) instead of _as_fraction
-    # (threshold >= 1.5) for ROI fields read from provider row data.
-    # Provider data may return 1.2 meaning 1.2% ROI (percentage form). With
-    # the old _as_fraction threshold of >= 1.5, this would stay as 1.2 and be
-    # treated as 120% ROI — a severe scoring distortion for equities.
     roi1 = _as_roi_fraction(_get(row, "expected_roi_1m", "expected_return_1m"))
     roi3 = _as_roi_fraction(_get(row, "expected_roi_3m", "expected_return_3m"))
     roi12 = _as_roi_fraction(_get(row, "expected_roi_12m", "expected_return_12m"))
@@ -591,7 +573,6 @@ def _valuation_score(row: Mapping[str, Any]) -> Optional[float]:
     if fair is not None and fair > 0:
         upside = (fair / price) - 1.0
 
-    # Use _as_roi_fraction for ROI fields in valuation context
     roi3 = _as_roi_fraction(_get(row, "expected_roi_3m", "expected_return_3m"))
     roi12 = _as_roi_fraction(_get(row, "expected_roi_12m", "expected_return_12m"))
 
@@ -647,8 +628,6 @@ def _valuation_score(row: Mapping[str, Any]) -> Optional[float]:
 
 
 def _growth_score(row: Mapping[str, Any]) -> Optional[float]:
-    # Use _as_fraction (not _as_roi_fraction) for growth — values like 1.2
-    # (120% YoY growth) are possible for fast-growing companies.
     g = _as_fraction(_get(row, "revenue_growth_yoy", "revenue_growth", "growth_yoy"))
     if g is None:
         return None
@@ -656,9 +635,6 @@ def _growth_score(row: Mapping[str, Any]) -> Optional[float]:
 
 
 def _momentum_score(row: Mapping[str, Any]) -> Optional[float]:
-    # Use _as_roi_fraction for percent_change (daily/weekly % moves > 100% are
-    # essentially impossible for equities). Use _as_fraction for 52-week
-    # position (0-1 scale, can legitimately be 1.0 at top of range).
     pct = _as_roi_fraction(_get(row, "percent_change", "change_pct", "change_percent"))
     rsi = _getf(row, "rsi_14", "rsi", "rsi14")
     pos = _as_fraction(_get(row, "week_52_position_pct", "position_52w_pct", "week52_position_pct"))
@@ -680,9 +656,6 @@ def _momentum_score(row: Mapping[str, Any]) -> Optional[float]:
 
 
 def _risk_score(row: Mapping[str, Any]) -> Optional[float]:
-    # Use _as_fraction (threshold >= 1.5) for volatility and drawdown because
-    # values like 1.2 (120% annualized volatility) can legitimately occur for
-    # high-volatility assets and should NOT be divided by 100.
     vol90 = _as_fraction(_get(row, "volatility_90d"))
     dd1y = _as_fraction(_get(row, "max_drawdown_1y"))
     var1d = _as_fraction(_get(row, "var_95_1d"))
@@ -726,7 +699,6 @@ def _opportunity_score(
     valuation: Optional[float],
     momentum: Optional[float],
 ) -> Optional[float]:
-    # Use _as_roi_fraction for ROI inputs to opportunity score
     roi1 = _as_roi_fraction(_get(row, "expected_roi_1m", "expected_return_1m"))
     roi3 = _as_roi_fraction(_get(row, "expected_roi_3m", "expected_return_3m"))
     roi12 = _as_roi_fraction(_get(row, "expected_roi_12m", "expected_return_12m"))
@@ -794,10 +766,6 @@ def _recommendation(
 # Public API
 # =============================================================================
 def compute_scores(row: Dict[str, Any], *, settings: Any = None) -> Dict[str, Any]:
-    """
-    Main entrypoint.
-    Returns a patch dict to merge into row.
-    """
     source = dict(row or {})
     scoring_errors: List[str] = []
 
@@ -858,7 +826,6 @@ def compute_scores(row: Dict[str, Any], *, settings: Any = None) -> Dict[str, An
     rb = _risk_bucket(risk)
     cb = _confidence_bucket(conf01)
 
-    # Use _as_roi_fraction for the final roi3 used in recommendation
     roi3 = _as_roi_fraction(working.get("expected_roi_3m"))
     rec, reason = _recommendation(overall, risk, confidence100, roi3)
 
@@ -877,7 +844,7 @@ def compute_scores(row: Dict[str, Any], *, settings: Any = None) -> Dict[str, An
         overall_score=overall,
         overall_score_raw=overall_raw,
         overall_penalty_factor=penalty_factor,
-        recommendation=rec,
+        recommendation=normalize_recommendation_code(rec),
         recommendation_reason=reason,
         forecast_price_1m=forecast_patch.get("forecast_price_1m"),
         forecast_price_3m=forecast_patch.get("forecast_price_3m"),
@@ -1019,7 +986,9 @@ __all__ = [
     "DEFAULT_WEIGHTS",
     "DEFAULT_FORECASTS",
     "SCORING_VERSION",
+    "CANONICAL_RECOMMENDATION_CODES",
     "RECOMMENDATION_LABEL_MAP",
+    "normalize_recommendation_code",
     "normalize_recommendation_label",
     "__version__",
 ]
