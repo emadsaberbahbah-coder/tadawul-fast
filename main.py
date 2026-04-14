@@ -2,29 +2,28 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.10.0)
+TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.11.0)
 ================================================================================
-FASTAPI-NATIVE ROUTER INCLUDE • PRESTART-FIRST ROUTE MOUNT • OPENAPI CACHE SAFE
+FASTAPI-NATIVE ROUTER INCLUDE • PRESTART/STARTUP ROUTE MOUNT • OPENAPI CACHE SAFE
 REQUEST-ID SAFE • ENGINE-STATE AWARE • CONTROLLED-ROUTE-OWNERSHIP SAFE
 STRICT-JSON SAFE • HEALTH / META ALIAS SAFE • DEBUG ROUTE SAFE
 INVESTMENT-ADVISOR CANONICAL OWNER PROTECTION • ADVANCED ROUTE PRIORITY SAFE
 
-Why this revision (v8.10.0)
----------------------------
-- FIX: makes routes.investment_advisor the canonical owner of
-       /v1/advanced/sheet-rows so the revised advanced router is the effective
-       public owner after deployment.
-- FIX: reorders the controlled mount plan so routes.investment_advisor mounts
-       before routes.advanced_sheet_rows, reducing overlap risk.
-- FIX: preserves exact canonical-path protection during filtered router cloning
-       so later routers cannot steal owner-locked public paths.
-- FIX: keeps prestart/startup route mounting, OpenAPI cache refresh, and live
-       ownership diagnostics aligned.
-- SAFE: engine init remains timeout-aware and non-fatal unless strict mode is enabled.
+What v8.11.0 revises
+--------------------
+- FIX: honors PRESTART_MOUNT_ROUTES instead of always forcing prestart mount.
+- FIX: aligns fallback auth behavior with revised config.py:
+       supports X-API-Key / Api-Key and only allows query-token fallback when
+       allow_query_token is enabled.
+- FIX: constant-time fallback token checks for local env-token comparisons.
+- ENH: clearer startup warning when prestart route mounting is intentionally disabled.
+- SAFE: preserves controlled canonical owner mapping, JSON safety, health/meta
+        aliases, engine init behavior, and route diagnostics.
 """
 from __future__ import annotations
 
 import asyncio
+import hmac
 import importlib
 import inspect
 import json
@@ -166,7 +165,7 @@ class _StrictJSONResponse(JSONResponse):
         ).encode("utf-8")
 
 
-APP_ENTRY_VERSION = "8.10.0"
+APP_ENTRY_VERSION = "8.11.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
@@ -193,7 +192,6 @@ _CONTROLLED_PROTECTED_PREFIXES: Tuple[str, ...] = (
     "/sheet-rows",
 )
 
-# Canonical owners are the route-family keys used in the controlled plan.
 _CONTROLLED_CANONICAL_OWNER_MAP: Dict[str, str] = {
     "/v1/advisor": "advisor",
     "/v1/advisor/sheet-rows": "advisor",
@@ -342,6 +340,13 @@ def _coerce_positive_timeout(value: float, fallback: float) -> float:
     return float(fallback)
 
 
+def _secure_equals(left: str, right: str) -> bool:
+    try:
+        return hmac.compare_digest(str(left), str(right))
+    except Exception:
+        return str(left) == str(right)
+
+
 # =============================================================================
 # Logging
 # =============================================================================
@@ -409,6 +414,7 @@ class _SettingsView:
 
     REQUIRE_AUTH: bool = True
     OPEN_MODE: bool = False
+    ALLOW_QUERY_TOKEN: bool = False
     AUTH_HEADER_NAME: str = "X-APP-TOKEN"
 
     ENABLE_CORS_ALL_ORIGINS: bool = False
@@ -436,6 +442,7 @@ def _settings_from_generic_object(s: Any, source: str) -> _SettingsView:
         PRESTART_MOUNT_ROUTES=_to_bool(_pick_attr(s, "PRESTART_MOUNT_ROUTES", "prestart_mount_routes", default=_env_bool("PRESTART_MOUNT_ROUTES", True)), _env_bool("PRESTART_MOUNT_ROUTES", True)),
         REQUIRE_AUTH=_to_bool(_pick_attr(s, "REQUIRE_AUTH", "require_auth", default=_env_bool("REQUIRE_AUTH", True)), _env_bool("REQUIRE_AUTH", True)),
         OPEN_MODE=_to_bool(_pick_attr(s, "OPEN_MODE", "open_mode", default=_env_bool("OPEN_MODE", False)), _env_bool("OPEN_MODE", False)),
+        ALLOW_QUERY_TOKEN=_to_bool(_pick_attr(s, "ALLOW_QUERY_TOKEN", "allow_query_token", default=_env_bool("ALLOW_QUERY_TOKEN", False)), _env_bool("ALLOW_QUERY_TOKEN", False)),
         AUTH_HEADER_NAME=str(_pick_attr(s, "AUTH_HEADER_NAME", "auth_header_name", default=_env_str("AUTH_HEADER_NAME", "X-APP-TOKEN"))),
         ENABLE_CORS_ALL_ORIGINS=_to_bool(_pick_attr(s, "ENABLE_CORS_ALL_ORIGINS", "enable_cors_all_origins", default=_env_bool("ENABLE_CORS_ALL_ORIGINS", False)), _env_bool("ENABLE_CORS_ALL_ORIGINS", False)),
         CORS_ORIGINS=str(_pick_attr(s, "CORS_ORIGINS", "cors_origins", default=_env_str("CORS_ORIGINS", ""))),
@@ -475,6 +482,7 @@ def _load_settings() -> _SettingsView:
         PRESTART_MOUNT_ROUTES=_env_bool("PRESTART_MOUNT_ROUTES", True),
         REQUIRE_AUTH=_env_bool("REQUIRE_AUTH", True),
         OPEN_MODE=_env_bool("OPEN_MODE", False),
+        ALLOW_QUERY_TOKEN=_env_bool("ALLOW_QUERY_TOKEN", False),
         AUTH_HEADER_NAME=_env_str("AUTH_HEADER_NAME", "X-APP-TOKEN"),
         ENABLE_CORS_ALL_ORIGINS=_env_bool("ENABLE_CORS_ALL_ORIGINS", False),
         CORS_ORIGINS=_env_str("CORS_ORIGINS", ""),
@@ -553,7 +561,7 @@ def _ensure_app_state_defaults(app: FastAPI) -> None:
 # =============================================================================
 # Auth
 # =============================================================================
-def _call_auth_ok_flexible(fn: Any, request: Request, token_value: str, authorization: str) -> bool:
+def _call_auth_ok_flexible(fn: Any, request: Request, token_value: str, authorization: str, api_key_value: str) -> bool:
     path = str(getattr(getattr(request, "url", None), "path", "") or "")
     headers_dict = dict(request.headers)
 
@@ -568,13 +576,42 @@ def _call_auth_ok_flexible(fn: Any, request: Request, token_value: str, authoriz
         except Exception:
             continue
 
+    query_token = ""
+    if bool(getattr(_SETTINGS, "ALLOW_QUERY_TOKEN", False)):
+        try:
+            query_token = str(request.query_params.get("token") or "").strip()
+        except Exception:
+            query_token = ""
+
     attempts = [
-        {"token": token_value or None, "authorization": authorization or None, "headers": headers_dict, "path": path, "request": request, "settings": settings},
-        {"token": token_value or None, "authorization": authorization or None, "headers": headers_dict, "path": path, "request": request},
-        {"token": token_value or None, "authorization": authorization or None, "headers": headers_dict, "path": path},
-        {"token": token_value or None, "authorization": authorization or None, "headers": headers_dict},
-        {"token": token_value or None, "authorization": authorization or None},
-        {"token": token_value or None},
+        {
+            "token": token_value or None,
+            "authorization": authorization or None,
+            "headers": headers_dict,
+            "path": path,
+            "request": request,
+            "settings": settings,
+            "x_app_token": token_value or None,
+            "api_token": api_key_value or None,
+            "query_token": query_token or None,
+        },
+        {
+            "token": token_value or api_key_value or None,
+            "authorization": authorization or None,
+            "headers": headers_dict,
+            "path": path,
+            "request": request,
+        },
+        {
+            "token": token_value or api_key_value or None,
+            "authorization": authorization or None,
+            "headers": headers_dict,
+        },
+        {
+            "token": token_value or api_key_value or None,
+            "authorization": authorization or None,
+        },
+        {"token": token_value or api_key_value or None},
     ]
     for kwargs in attempts:
         try:
@@ -595,21 +632,30 @@ def _auth_ok(request: Request) -> bool:
     except Exception:
         pass
 
-    hdr = request.headers.get(_SETTINGS.AUTH_HEADER_NAME, "") or request.headers.get("X-APP-TOKEN", "")
+    x_app_token = request.headers.get(_SETTINGS.AUTH_HEADER_NAME, "") or request.headers.get("X-APP-TOKEN", "")
+    api_key_value = request.headers.get("X-API-Key", "") or request.headers.get("Api-Key", "")
     auth = request.headers.get("Authorization", "")
-    token_q = request.query_params.get("token") if request.query_params else None
-    token_value = str(hdr or token_q or "").strip()
+
+    token_value = str(x_app_token or api_key_value or "").strip()
+    query_token = ""
+    if bool(getattr(_SETTINGS, "ALLOW_QUERY_TOKEN", False)):
+        try:
+            query_token = str(request.query_params.get("token") or "").strip()
+        except Exception:
+            query_token = ""
+        if not token_value:
+            token_value = query_token
 
     for mod_name in ("config", "core.config"):
         try:
             cfg = importlib.import_module(mod_name)
             fn = getattr(cfg, "auth_ok", None)
             if callable(fn):
-                return _call_auth_ok_flexible(fn, request, token_value, auth)
+                return _call_auth_ok_flexible(fn, request, token_value, auth, api_key_value)
         except Exception:
             continue
 
-    allowed = {
+    allowed = [
         x for x in (
             _env_str("APP_TOKEN", ""),
             _env_str("BACKEND_TOKEN", ""),
@@ -619,17 +665,20 @@ def _auth_ok(request: Request) -> bool:
             _env_str("TOKEN", ""),
             _env_str("TFB_APP_TOKEN", ""),
             _env_str("TFB_TOKEN", ""),
+            _env_str("API_TOKEN", ""),
         ) if x
-    }
+    ]
     if not allowed:
         return False
-    if hdr and hdr in allowed:
+
+    if token_value and any(_secure_equals(token_value, allowed_token) for allowed_token in allowed):
         return True
-    if token_q and token_q in allowed:
-        return True
+    if query_token and bool(getattr(_SETTINGS, "ALLOW_QUERY_TOKEN", False)):
+        if any(_secure_equals(query_token, allowed_token) for allowed_token in allowed):
+            return True
     if auth.lower().startswith("bearer "):
         t = auth.split(" ", 1)[1].strip()
-        return bool(t and t in allowed)
+        return bool(t and any(_secure_equals(t, allowed_token) for allowed_token in allowed))
     return False
 
 
@@ -657,7 +706,13 @@ class NoResponseGuardMiddleware(BaseHTTPMiddleware):
                 logger.error("Downstream returned None response", extra={"request_id": request_id, "path": str(request.url.path), "status_code": 500})
                 return _StrictJSONResponse(
                     status_code=500,
-                    content={"status": "error", "error": "RuntimeError: No response returned.", "path": str(request.url.path), "request_id": request_id, "ts_utc": datetime.now(timezone.utc).isoformat()},
+                    content={
+                        "status": "error",
+                        "error": "RuntimeError: No response returned.",
+                        "path": str(request.url.path),
+                        "request_id": request_id,
+                        "ts_utc": datetime.now(timezone.utc).isoformat(),
+                    },
                 )
             return response
         except RuntimeError as exc:
@@ -665,7 +720,13 @@ class NoResponseGuardMiddleware(BaseHTTPMiddleware):
                 logger.error("Caught downstream no-response runtime error", extra={"request_id": request_id, "path": str(request.url.path), "status_code": 500})
                 return _StrictJSONResponse(
                     status_code=500,
-                    content={"status": "error", "error": f"{type(exc).__name__}: {str(exc)}", "path": str(request.url.path), "request_id": request_id, "ts_utc": datetime.now(timezone.utc).isoformat()},
+                    content={
+                        "status": "error",
+                        "error": f"{type(exc).__name__}: {str(exc)}",
+                        "path": str(request.url.path),
+                        "request_id": request_id,
+                        "ts_utc": datetime.now(timezone.utc).isoformat(),
+                    },
                 )
             raise
 
@@ -793,7 +854,11 @@ def _canonical_path_owner_mismatches(path_owners: Mapping[str, str]) -> Dict[str
             continue
         actual_owner = actual_module.rsplit(".", 1)[-1] if actual_module else ""
         if actual_owner and actual_owner != expected_owner:
-            mismatches[path] = {"expected_owner": expected_owner, "actual_module": actual_module, "actual_owner": actual_owner}
+            mismatches[path] = {
+                "expected_owner": expected_owner,
+                "actual_module": actual_module,
+                "actual_owner": actual_owner,
+            }
     return mismatches
 
 
@@ -905,7 +970,11 @@ def _normalize_routes_snapshot(ret: Any, *, used_strategy: str, app: Optional[Fa
         except Exception:
             pass
 
-    effective_failed_modules = _effective_failed_modules({"import_errors": import_errors, "mount_errors": mount_errors, "no_router": no_router})
+    effective_failed_modules = _effective_failed_modules({
+        "import_errors": import_errors,
+        "mount_errors": mount_errors,
+        "no_router": no_router,
+    })
 
     out = {
         "mounted": mounted,
@@ -1018,7 +1087,13 @@ def _clone_filtered_router(router: APIRouter, *, key: str) -> Tuple[APIRouter, L
             added_paths.append(path)
         except Exception:
             try:
-                out.add_api_route(path=path, endpoint=route.endpoint, methods=list(route.methods or []), name=route.name, include_in_schema=route.include_in_schema)
+                out.add_api_route(
+                    path=path,
+                    endpoint=route.endpoint,
+                    methods=list(route.methods or []),
+                    name=route.name,
+                    include_in_schema=route.include_in_schema,
+                )
                 added_paths.append(path)
             except Exception:
                 filtered_out.append(path)
@@ -1075,11 +1150,20 @@ def _mount_routes_controlled(app: FastAPI) -> Dict[str, Any]:
         overlap = router_sigs & existing_sigs
 
         if router_sigs and overlap == router_sigs:
-            snap["duplicate_skips"].append({"module": module_name, "paths": sorted(set(added_paths)), "signature_count": len(router_sigs)})
+            snap["duplicate_skips"].append({
+                "module": module_name,
+                "paths": sorted(set(added_paths)),
+                "signature_count": len(router_sigs),
+            })
             continue
 
         if overlap:
-            snap["partial_duplicate_skips"].append({"module": module_name, "paths": sorted(set(added_paths)), "overlap_count": len(overlap), "signature_count": len(router_sigs)})
+            snap["partial_duplicate_skips"].append({
+                "module": module_name,
+                "paths": sorted(set(added_paths)),
+                "overlap_count": len(overlap),
+                "signature_count": len(router_sigs),
+            })
 
         try:
             app.include_router(filtered_router)
@@ -1432,44 +1516,73 @@ def create_app() -> FastAPI:
     app.add_middleware(GZipMiddleware, minimum_size=1024)
 
     if bool(_SETTINGS.ENABLE_CORS_ALL_ORIGINS):
-        app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
     else:
         origins = _parse_csv(_SETTINGS.CORS_ORIGINS)
         if origins:
-            app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+            app.add_middleware(
+                CORSMiddleware,
+                allow_origins=origins,
+                allow_credentials=True,
+                allow_methods=["*"],
+                allow_headers=["*"],
+            )
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception):
         request_id = _request_id_from_request(request)
-        logger.error("Unhandled exception", exc_info=True, extra={"request_id": request_id, "path": str(request.url.path), "status_code": 500})
+        logger.error(
+            "Unhandled exception",
+            exc_info=True,
+            extra={"request_id": request_id, "path": str(request.url.path), "status_code": 500},
+        )
         return _StrictJSONResponse(
             status_code=500,
-            content={"status": "error", "error": f"{type(exc).__name__}: {str(exc)}", "path": str(request.url.path), "request_id": request_id, "ts_utc": datetime.now(timezone.utc).isoformat()},
+            content={
+                "status": "error",
+                "error": f"{type(exc).__name__}: {str(exc)}",
+                "path": str(request.url.path),
+                "request_id": request_id,
+                "ts_utc": datetime.now(timezone.utc).isoformat(),
+            },
         )
 
     _install_builtin_routes(app)
     _install_custom_openapi(app)
 
-    try:
-        snap = _mount_routes_once(app, phase="prestart")
-        logger.info(
-            "Routes mounted at app creation: mounted=%s duplicate_skips=%s partial_duplicate_skips=%s missing=%s failed=%s strategy=%s route_signatures=%s",
-            snap.get("mounted_count", 0),
-            snap.get("duplicate_skips_count", 0),
-            snap.get("partial_duplicate_skips_count", 0),
-            snap.get("missing_count", 0),
-            snap.get("failed_count", 0),
-            snap.get("strategy", ""),
-            snap.get("route_signature_count_after_mount", 0),
-        )
-    except Exception as e:
-        logger.error("Prestart route mounting failed: %s", e, exc_info=True)
+    if bool(_SETTINGS.PRESTART_MOUNT_ROUTES):
         try:
-            app.state.startup_warnings.append(f"prestart_route_mount_failed: {_err_to_str(e)}")
+            snap = _mount_routes_once(app, phase="prestart")
+            logger.info(
+                "Routes mounted at app creation: mounted=%s duplicate_skips=%s partial_duplicate_skips=%s missing=%s failed=%s strategy=%s route_signatures=%s",
+                snap.get("mounted_count", 0),
+                snap.get("duplicate_skips_count", 0),
+                snap.get("partial_duplicate_skips_count", 0),
+                snap.get("missing_count", 0),
+                snap.get("failed_count", 0),
+                snap.get("strategy", ""),
+                snap.get("route_signature_count_after_mount", 0),
+            )
+        except Exception as e:
+            logger.error("Prestart route mounting failed: %s", e, exc_info=True)
+            try:
+                app.state.startup_warnings.append(f"prestart_route_mount_failed: {_err_to_str(e)}")
+            except Exception:
+                pass
+            if _env_bool("ROUTES_STRICT_IMPORT", False):
+                raise
+    else:
+        try:
+            app.state.startup_warnings.append("prestart_route_mount_disabled")
         except Exception:
             pass
-        if _env_bool("ROUTES_STRICT_IMPORT", False):
-            raise
+        logger.info("Prestart route mounting disabled by PRESTART_MOUNT_ROUTES")
 
     @app.get("/_debug/routes", include_in_schema=False)
     async def debug_routes(request: Request):
@@ -1509,4 +1622,5 @@ application = app
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
