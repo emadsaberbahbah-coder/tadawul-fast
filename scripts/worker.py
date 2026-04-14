@@ -2,39 +2,27 @@
 """
 scripts/worker.py
 ===========================================================
-TADAWUL FAST BRIDGE – ENTERPRISE WORKER ORCHESTRATOR (v4.1.0)
+TADAWUL FAST BRIDGE – ENTERPRISE WORKER ORCHESTRATOR (v4.2.0)
 ===========================================================
-QUANTUM EDITION | ASYNC BATCHING | DISTRIBUTED QUEUES
+RECOVERY-ALIGNED • REDIS-COMPATIBLE • TRACE-SAFE • STARTUP-SAFE
 
-What's new in v4.1.0:
-- ✅ FIXED: _process_payload() now delegates to real sync pipelines
-  (run_dashboard_sync, run_market_scan) based on task_type in payload.
-- ✅ Persistent ThreadPoolExecutor: CPU-heavy tasks offloaded cleanly.
-- ✅ High-Performance JSON (orjson): Blazing fast serialization.
-- ✅ Full Jitter Exponential Backoff: Safe retry under burst load.
-- ✅ OpenTelemetry Tracing: Granular background task tracking.
-- ✅ Redis Pub/Sub polling to trigger sync pipelines.
-- ✅ Graceful shutdown, signal trapping, idle fallback.
+What v4.2.0 revises
+- FIX: supports modern `redis.asyncio` first, with `aioredis` fallback.
+       This matches environments where `redis` is installed but `aioredis`
+       is not.
+- FIX: TraceContext now uses OpenTelemetry context managers correctly.
+- FIX: clean Redis shutdown across both client variants.
+- FIX: dead-letter support for exhausted jobs.
+- ENH: central worker config via env vars.
+- ENH: deterministic pipeline dispatch helpers for dashboard_sync,
+       market_scan, and refresh_data.
+- SAFE: preserves idle fallback when Redis is unavailable, unless fail-fast
+       is explicitly enabled.
 
 Supported task_type values in Redis queue payload:
-  - "dashboard_sync"  → runs run_dashboard_sync pipeline
-  - "market_scan"     → runs run_market_scan pipeline
-  - "refresh_data"    → runs refresh_data pipeline
-  - (unrecognized)    → logged and skipped safely
-
-Payload shape (JSON pushed to Redis queue "tfb_background_jobs"):
-  {
-    "task_id": "abc-123",
-    "task_type": "dashboard_sync",
-    "sheet_name": "Market_Leaders",      # optional, for scoped syncs
-    "symbols": ["2222.SR", "AAPL"],      # optional
-    "limit": 10,                          # optional
-    "horizon": "3m",                      # optional, for market_scan
-    "min_confidence": 0.65,              # optional, for market_scan
-    "max_risk": 60.0,                    # optional, for market_scan
-    "spreadsheet_id": "...",             # optional override
-    "mode": "engine"                     # optional
-  }
+  - "dashboard_sync"
+  - "market_scan"
+  - "refresh_data"
 """
 
 from __future__ import annotations
@@ -49,72 +37,99 @@ import random
 import signal
 import sys
 import time
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional, Union
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 # ---------------------------------------------------------------------------
-# High-Performance JSON fallback
+# High-performance JSON fallback
 # ---------------------------------------------------------------------------
 try:
-    import orjson
+    import orjson  # type: ignore
+
     def json_dumps(v: Any, *, indent: int = 0) -> str:
         option = orjson.OPT_INDENT_2 if indent else 0
-        return orjson.dumps(v, option=option).decode("utf-8")
+        return orjson.dumps(v, option=option, default=str).decode("utf-8")
+
     def json_loads(data: Union[str, bytes]) -> Any:
         return orjson.loads(data)
+
     _HAS_ORJSON = True
-except ImportError:
+except Exception:
     import json
+
     def json_dumps(v: Any, *, indent: int = 0) -> str:
         return json.dumps(v, indent=indent if indent else None, default=str)
+
     def json_loads(data: Union[str, bytes]) -> Any:
         return json.loads(data)
+
     _HAS_ORJSON = False
 
 # ---------------------------------------------------------------------------
-# Optional Tracing
+# Optional tracing
 # ---------------------------------------------------------------------------
 try:
-    from opentelemetry import trace
-    from opentelemetry.trace import Status, StatusCode
+    from opentelemetry import trace  # type: ignore
+    from opentelemetry.trace import Status, StatusCode  # type: ignore
+
     _OTEL_AVAILABLE = True
-    tracer = trace.get_tracer(__name__)
-except ImportError:
+    _TRACER = trace.get_tracer(__name__)
+except Exception:
+    trace = None  # type: ignore
+    Status = None  # type: ignore
+    StatusCode = None  # type: ignore
     _OTEL_AVAILABLE = False
-    class DummySpan:
-        def set_attribute(self, *args, **kwargs): pass
-        def set_status(self, *args, **kwargs): pass
-        def record_exception(self, *args, **kwargs): pass
-        def __enter__(self): return self
-        def __exit__(self, *args, **kwargs): pass
-    class DummyTracer:
-        def start_as_current_span(self, *args, **kwargs): return DummySpan()
-    tracer = DummyTracer()
+    _TRACER = None
 
 _TRACING_ENABLED = os.getenv("CORE_TRACING_ENABLED", "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 class TraceContext:
+    """OpenTelemetry context manager that never raises."""
+
     def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
         self.name = name
         self.attributes = attributes or {}
-        self.tracer = tracer if _OTEL_AVAILABLE and _TRACING_ENABLED else None
-        self.span = None
+        self._cm = None
+        self._span = None
 
     def __enter__(self):
-        if self.tracer:
-            self.span = self.tracer.start_as_current_span(self.name)
-            if self.attributes:
-                self.span.set_attributes(self.attributes)
+        if not (_OTEL_AVAILABLE and _TRACING_ENABLED and _TRACER is not None):
+            return self
+        try:
+            self._cm = _TRACER.start_as_current_span(self.name)
+            self._span = self._cm.__enter__()
+            if self._span is not None and self.attributes:
+                for k, v in self.attributes.items():
+                    try:
+                        self._span.set_attribute(str(k), v)
+                    except Exception:
+                        pass
+        except Exception:
+            self._cm = None
+            self._span = None
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        if self.span and _OTEL_AVAILABLE:
-            if exc_val:
-                self.span.record_exception(exc_val)
-                self.span.set_status(Status(StatusCode.ERROR, str(exc_val)))
-            self.span.end()
+        try:
+            if self._span is not None and exc_val is not None:
+                try:
+                    if hasattr(self._span, "record_exception"):
+                        self._span.record_exception(exc_val)
+                except Exception:
+                    pass
+                try:
+                    if Status is not None and StatusCode is not None and hasattr(self._span, "set_status"):
+                        self._span.set_status(Status(StatusCode.ERROR, str(exc_val)))
+                except Exception:
+                    pass
+        finally:
+            if self._cm is not None:
+                try:
+                    return self._cm.__exit__(exc_type, exc_val, exc_tb)
+                except Exception:
+                    return False
+        return False
 
     async def __aenter__(self):
         return self.__enter__()
@@ -124,15 +139,26 @@ class TraceContext:
 
 
 # ---------------------------------------------------------------------------
-# Redis
+# Redis client resolution
 # ---------------------------------------------------------------------------
+_REDIS_LIB = "none"
 try:
-    import aioredis
-    _REDIS_AVAILABLE = True
-except ImportError:
-    _REDIS_AVAILABLE = False
+    import redis.asyncio as redis_async  # type: ignore
 
-SCRIPT_VERSION = "4.1.0"
+    _REDIS_AVAILABLE = True
+    _REDIS_LIB = "redis.asyncio"
+except Exception:
+    try:
+        import aioredis as redis_async  # type: ignore
+
+        _REDIS_AVAILABLE = True
+        _REDIS_LIB = "aioredis"
+    except Exception:
+        redis_async = None  # type: ignore
+        _REDIS_AVAILABLE = False
+
+
+SCRIPT_VERSION = "4.2.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -141,136 +167,184 @@ logging.basicConfig(
 )
 logger = logging.getLogger("Worker")
 
-_CPU_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="JobWorker")
+
+def _safe_int(v: Any, default: int, *, lo: Optional[int] = None, hi: Optional[int] = None) -> int:
+    try:
+        x = int(float(str(v).strip()))
+    except Exception:
+        x = default
+    if lo is not None and x < lo:
+        x = lo
+    if hi is not None and x > hi:
+        x = hi
+    return x
+
+
+def _safe_float(v: Any, default: float, *, lo: Optional[float] = None, hi: Optional[float] = None) -> float:
+    try:
+        x = float(str(v).strip())
+    except Exception:
+        x = default
+    if lo is not None and x < lo:
+        x = lo
+    if hi is not None and x > hi:
+        x = hi
+    return x
+
+
+@dataclass(slots=True)
+class WorkerConfig:
+    queue_name: str = os.getenv("TFB_WORKER_QUEUE_NAME", "tfb_background_jobs")
+    dead_letter_queue: str = os.getenv("TFB_WORKER_DLQ_NAME", "tfb_background_jobs_dead")
+    redis_url: str = os.getenv("REDIS_URL", "").strip()
+    redis_block_timeout_sec: int = _safe_int(os.getenv("TFB_WORKER_REDIS_BLOCK_TIMEOUT_SEC", "5"), 5, lo=1, hi=60)
+    idle_sleep_sec: float = _safe_float(os.getenv("TFB_WORKER_IDLE_SLEEP_SEC", "5"), 5.0, lo=0.5, hi=60.0)
+    max_retries: int = _safe_int(os.getenv("TFB_WORKER_MAX_RETRIES", "5"), 5, lo=1, hi=20)
+    backoff_base_sec: float = _safe_float(os.getenv("TFB_WORKER_BACKOFF_BASE_SEC", "1.0"), 1.0, lo=0.1, hi=30.0)
+    backoff_max_sec: float = _safe_float(os.getenv("TFB_WORKER_BACKOFF_MAX_SEC", "30.0"), 30.0, lo=1.0, hi=300.0)
+    cpu_workers: int = _safe_int(os.getenv("TFB_WORKER_CPU_WORKERS", "4"), 4, lo=1, hi=32)
+    fail_fast_if_no_redis: bool = os.getenv("TFB_WORKER_FAIL_FAST_NO_REDIS", "false").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+CONFIG = WorkerConfig()
+_CPU_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=CONFIG.cpu_workers, thread_name_prefix="TFBWorker")
 SHUTDOWN_EVENT = asyncio.Event()
 
 
 # =============================================================================
-# Full Jitter Exponential Backoff
+# Full jitter exponential backoff
 # =============================================================================
 class FullJitterBackoff:
-    """Safe retry mechanism implementing AWS Full Jitter Backoff."""
-
     def __init__(self, max_retries: int = 5, base_delay: float = 1.0, max_delay: float = 30.0):
         self.max_retries = max_retries
         self.base_delay = base_delay
         self.max_delay = max_delay
 
-    async def execute_async(self, func: Callable, *args, **kwargs) -> Any:
-        last_exc = None
+    async def execute_async(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        last_exc: Optional[Exception] = None
         for attempt in range(self.max_retries):
             try:
                 return await func(*args, **kwargs)
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 last_exc = e
-                if attempt == self.max_retries - 1:
+                if attempt >= self.max_retries - 1:
                     raise
-                temp = min(self.max_delay, self.base_delay * (2 ** attempt))
-                sleep_time = random.uniform(0, temp)
-                logger.debug(f"Task failed: {e}. Retrying in {sleep_time:.2f}s")
+                ceiling = min(self.max_delay, self.base_delay * (2 ** attempt))
+                sleep_time = random.uniform(0.0, ceiling)
+                logger.warning("Task failed on attempt %s/%s: %s. Retrying in %.2fs", attempt + 1, self.max_retries, e, sleep_time)
                 await asyncio.sleep(sleep_time)
-        raise last_exc
+        raise last_exc if last_exc is not None else RuntimeError("backoff_exhausted")
 
 
 # =============================================================================
-# Sync pipeline dispatchers
+# Generic import / execution helpers
 # =============================================================================
-
-async def _run_dashboard_sync_task(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Delegates to run_dashboard_sync pipeline.
-    Supports optional scoping by sheet_name and symbols.
-    """
-    try:
-        mod = importlib.import_module("run_dashboard_sync")
-    except ImportError:
+def _import_first(candidates: Sequence[str]):
+    last_exc: Optional[Exception] = None
+    for name in candidates:
         try:
-            mod = importlib.import_module("scripts.run_dashboard_sync")
-        except ImportError:
-            logger.error("run_dashboard_sync module not found. Ensure it is in the Python path.")
-            return {"ok": False, "error": "module_not_found", "task_type": "dashboard_sync"}
+            return importlib.import_module(name)
+        except Exception as exc:
+            last_exc = exc
+    if last_exc is not None:
+        raise last_exc
+    raise ImportError("No module candidates provided")
 
-    sheet_name = payload.get("sheet_name") or ""
-    symbols = payload.get("symbols") or []
-    spreadsheet_id = payload.get("spreadsheet_id") or os.getenv("DEFAULT_SPREADSHEET_ID", "")
-    limit = int(payload.get("limit") or 800)
 
-    # Prefer async run function if available, else fall back to sync
-    run_fn = (
-        getattr(mod, "run_async", None)
-        or getattr(mod, "run_dashboard_sync_async", None)
-        or getattr(mod, "main_async", None)
-    )
-    run_sync_fn = (
-        getattr(mod, "run", None)
-        or getattr(mod, "run_dashboard_sync", None)
-        or getattr(mod, "main", None)
-    )
+async def _run_sync_in_pool(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_CPU_EXECUTOR, lambda: fn(*args, **kwargs))
 
-    kwargs: Dict[str, Any] = {
-        "spreadsheet_id": spreadsheet_id,
-        "limit": limit,
-    }
+
+async def _maybe_call(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    if asyncio.iscoroutinefunction(fn):
+        return await fn(*args, **kwargs)
+    result = await _run_sync_in_pool(fn, *args, **kwargs)
+    if asyncio.iscoroutine(result):
+        return await result
+    return result
+
+
+async def _call_first_callable(module: Any, names: Sequence[str], *args: Any, **kwargs: Any) -> Tuple[bool, Any]:
+    for name in names:
+        fn = getattr(module, name, None)
+        if callable(fn):
+            return True, await _maybe_call(fn, *args, **kwargs)
+    return False, None
+
+
+def _as_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    return [value]
+
+
+def _result_dict(result: Any, *, ok_default: bool = True) -> Dict[str, Any]:
+    if isinstance(result, dict):
+        return result
+    return {"ok": ok_default, "result": str(result)}
+
+
+# =============================================================================
+# Pipeline dispatchers
+# =============================================================================
+async def _run_dashboard_sync_task(payload: Dict[str, Any]) -> Dict[str, Any]:
+    try:
+        mod = _import_first(("scripts.run_dashboard_sync", "run_dashboard_sync"))
+    except Exception:
+        logger.exception("run_dashboard_sync module not found")
+        return {"ok": False, "error": "module_not_found", "task_type": "dashboard_sync"}
+
+    sheet_name = str(payload.get("sheet_name") or "").strip()
+    symbols = _as_list(payload.get("symbols") or [])
+    spreadsheet_id = str(payload.get("spreadsheet_id") or os.getenv("DEFAULT_SPREADSHEET_ID", "")).strip()
+    limit = _safe_int(payload.get("limit") or 800, 800, lo=1, hi=50000)
+
+    kwargs: Dict[str, Any] = {"spreadsheet_id": spreadsheet_id, "limit": limit}
     if sheet_name:
         kwargs["sheet_name"] = sheet_name
         kwargs["keys"] = [sheet_name]
     if symbols:
         kwargs["symbols"] = symbols
 
-    if callable(run_fn):
-        result = await run_fn(**kwargs)
-        return result if isinstance(result, dict) else {"ok": True, "result": str(result)}
-
-    if callable(run_sync_fn):
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(_CPU_EXECUTOR, lambda: run_sync_fn(**kwargs))
-        return result if isinstance(result, dict) else {"ok": True, "result": str(result)}
-
-    logger.error("run_dashboard_sync: no callable run/run_async/main function found in module.")
-    return {"ok": False, "error": "no_callable_found", "task_type": "dashboard_sync"}
+    found, result = await _call_first_callable(
+        mod,
+        ("run_async", "run_dashboard_sync_async", "main_async", "run", "run_dashboard_sync", "main"),
+        **kwargs,
+    )
+    if not found:
+        logger.error("run_dashboard_sync: no callable entrypoint found")
+        return {"ok": False, "error": "no_callable_found", "task_type": "dashboard_sync"}
+    return _result_dict(result)
 
 
 async def _run_market_scan_task(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Delegates to run_market_scan pipeline.
-    Passes scan parameters extracted from the payload.
-    """
     try:
-        mod = importlib.import_module("run_market_scan")
-    except ImportError:
-        try:
-            mod = importlib.import_module("scripts.run_market_scan")
-        except ImportError:
-            logger.error("run_market_scan module not found. Ensure it is in the Python path.")
-            return {"ok": False, "error": "module_not_found", "task_type": "market_scan"}
+        mod = _import_first(("scripts.run_market_scan", "run_market_scan"))
+    except Exception:
+        logger.exception("run_market_scan module not found")
+        return {"ok": False, "error": "module_not_found", "task_type": "market_scan"}
 
-    spreadsheet_id = payload.get("spreadsheet_id") or os.getenv("DEFAULT_SPREADSHEET_ID", "")
-    keys = payload.get("keys") or payload.get("sheet_names") or ["Market_Leaders"]
-    top_n = int(payload.get("limit") or payload.get("top_n") or 10)
-    horizon = str(payload.get("horizon") or "3m").lower()
-    min_confidence = float(payload.get("min_confidence") or 0.65)
-    max_risk = float(payload.get("max_risk") or 60.0)
-    min_roi = float(payload.get("min_roi") or 0.0)
-    mode = str(payload.get("mode") or "engine")
+    spreadsheet_id = str(payload.get("spreadsheet_id") or os.getenv("DEFAULT_SPREADSHEET_ID", "")).strip()
+    keys = _as_list(payload.get("keys") or payload.get("sheet_names") or ["Market_Leaders"])
+    top_n = _safe_int(payload.get("limit") or payload.get("top_n") or 10, 10, lo=1, hi=1000)
+    horizon = str(payload.get("horizon") or "3m").strip().lower()
+    min_confidence = _safe_float(payload.get("min_confidence") or 0.65, 0.65, lo=0.0, hi=1.0)
+    max_risk = _safe_float(payload.get("max_risk") or 60.0, 60.0, lo=0.0, hi=100.0)
+    min_roi = _safe_float(payload.get("min_roi") or 0.0, 0.0, lo=-1000.0, hi=1000.0)
+    mode = str(payload.get("mode") or "engine").strip()
 
-    run_fn = (
-        getattr(mod, "run_scan_async", None)
-        or getattr(mod, "run_async", None)
-        or getattr(mod, "main_async", None)
-    )
-    run_sync_fn = (
-        getattr(mod, "run_scan", None)
-        or getattr(mod, "run", None)
-        or getattr(mod, "main", None)
-    )
-
-    # Build a ScanConfig if the module exposes it, otherwise pass raw kwargs
     scan_config_cls = getattr(mod, "ScanConfig", None)
-
     if scan_config_cls is not None:
         cfg = scan_config_cls(
             spreadsheet_id=spreadsheet_id,
-            keys=keys if isinstance(keys, list) else [keys],
+            keys=keys,
             top_n=top_n,
             horizon=horizon,
             min_confidence=min_confidence,
@@ -278,205 +352,243 @@ async def _run_market_scan_task(payload: Dict[str, Any]) -> Dict[str, Any]:
             min_expected_roi=min_roi,
             mode=mode,
         )
-        if callable(run_fn):
-            rows, meta = await run_fn(cfg)
-            return {"ok": True, "rows": len(rows), "meta": meta}
-        if callable(run_sync_fn):
-            loop = asyncio.get_running_loop()
-            rows, meta = await loop.run_in_executor(_CPU_EXECUTOR, lambda: run_sync_fn(cfg))
-            return {"ok": True, "rows": len(rows), "meta": meta}
-    else:
-        kwargs = dict(
-            spreadsheet_id=spreadsheet_id,
-            keys=keys,
-            top_n=top_n,
-            horizon=horizon,
-            min_confidence=min_confidence,
-            max_risk=max_risk,
-            min_roi=min_roi,
-            mode=mode,
-        )
-        if callable(run_fn):
-            result = await run_fn(**kwargs)
-            return result if isinstance(result, dict) else {"ok": True, "result": str(result)}
-        if callable(run_sync_fn):
-            loop = asyncio.get_running_loop()
-            result = await loop.run_in_executor(_CPU_EXECUTOR, lambda: run_sync_fn(**kwargs))
-            return result if isinstance(result, dict) else {"ok": True, "result": str(result)}
+        found, result = await _call_first_callable(mod, ("run_scan_async", "run_async", "main_async", "run_scan", "run", "main"), cfg)
+        if not found:
+            logger.error("run_market_scan: no callable entrypoint found")
+            return {"ok": False, "error": "no_callable_found", "task_type": "market_scan"}
+        if isinstance(result, tuple) and len(result) == 2:
+            rows, meta = result
+            return {"ok": True, "rows": len(rows or []), "meta": meta}
+        return _result_dict(result)
 
-    logger.error("run_market_scan: no callable run/run_async/main function found in module.")
-    return {"ok": False, "error": "no_callable_found", "task_type": "market_scan"}
+    kwargs = {
+        "spreadsheet_id": spreadsheet_id,
+        "keys": keys,
+        "top_n": top_n,
+        "horizon": horizon,
+        "min_confidence": min_confidence,
+        "max_risk": max_risk,
+        "min_roi": min_roi,
+        "mode": mode,
+    }
+    found, result = await _call_first_callable(mod, ("run_scan_async", "run_async", "main_async", "run_scan", "run", "main"), **kwargs)
+    if not found:
+        logger.error("run_market_scan: no callable entrypoint found")
+        return {"ok": False, "error": "no_callable_found", "task_type": "market_scan"}
+    return _result_dict(result)
 
 
 async def _run_refresh_data_task(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Delegates to refresh_data pipeline.
-    """
     try:
-        mod = importlib.import_module("refresh_data")
-    except ImportError:
-        try:
-            mod = importlib.import_module("scripts.refresh_data")
-        except ImportError:
-            logger.error("refresh_data module not found.")
-            return {"ok": False, "error": "module_not_found", "task_type": "refresh_data"}
+        mod = _import_first(("scripts.refresh_data", "refresh_data"))
+    except Exception:
+        logger.exception("refresh_data module not found")
+        return {"ok": False, "error": "module_not_found", "task_type": "refresh_data"}
 
-    run_fn = getattr(mod, "run_async", None) or getattr(mod, "main_async", None)
-    run_sync_fn = getattr(mod, "run", None) or getattr(mod, "main", None)
-
-    sheet_name = payload.get("sheet_name") or ""
-    symbols = payload.get("symbols") or []
     kwargs: Dict[str, Any] = {}
+    sheet_name = str(payload.get("sheet_name") or "").strip()
+    symbols = _as_list(payload.get("symbols") or [])
     if sheet_name:
         kwargs["sheet_name"] = sheet_name
     if symbols:
         kwargs["symbols"] = symbols
 
-    if callable(run_fn):
-        result = await run_fn(**kwargs)
-        return result if isinstance(result, dict) else {"ok": True}
-
-    if callable(run_sync_fn):
-        loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(_CPU_EXECUTOR, lambda: run_sync_fn(**kwargs))
-        return result if isinstance(result, dict) else {"ok": True}
-
-    logger.error("refresh_data: no callable run/main function found in module.")
-    return {"ok": False, "error": "no_callable_found", "task_type": "refresh_data"}
+    found, result = await _call_first_callable(mod, ("run_async", "main_async", "run", "main"), **kwargs)
+    if not found:
+        logger.error("refresh_data: no callable entrypoint found")
+        return {"ok": False, "error": "no_callable_found", "task_type": "refresh_data"}
+    return _result_dict(result)
 
 
 # =============================================================================
-# Execution Core — REAL IMPLEMENTATION
+# Task processing
 # =============================================================================
-
-async def _process_payload(payload: Dict[str, Any]) -> None:
-    """
-    Main task dispatcher. Routes each job to the correct sync pipeline
-    based on the task_type field in the Redis queue payload.
-
-    Supported task_type values:
-      - "dashboard_sync"  → run_dashboard_sync pipeline
-      - "market_scan"     → run_market_scan pipeline
-      - "refresh_data"    → refresh_data pipeline
-    """
-    task_id = payload.get("task_id", "unknown")
+async def _process_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    task_id = str(payload.get("task_id") or "unknown")
     task_type = str(payload.get("task_type") or "dashboard_sync").strip().lower()
     started = time.time()
 
     with TraceContext("worker_process_task", {"task_id": task_id, "task_type": task_type}):
-        logger.info(f"[{task_id}] Starting task type={task_type!r}")
+        logger.info("[%s] Starting task type=%r", task_id, task_type)
+        if task_type == "dashboard_sync":
+            result = await _run_dashboard_sync_task(payload)
+        elif task_type == "market_scan":
+            result = await _run_market_scan_task(payload)
+        elif task_type == "refresh_data":
+            result = await _run_refresh_data_task(payload)
+        else:
+            logger.warning("[%s] Unknown task_type=%r. Supported: dashboard_sync, market_scan, refresh_data", task_id, task_type)
+            return {"ok": False, "error": "unknown_task_type", "task_type": task_type}
 
-        try:
-            if task_type == "dashboard_sync":
-                result = await _run_dashboard_sync_task(payload)
+        elapsed = round(time.time() - started, 2)
+        ok = bool(result.get("ok", True)) if isinstance(result, dict) else True
+        if ok:
+            logger.info("[%s] Task type=%r completed in %ss. result=%s", task_id, task_type, elapsed, json_dumps(result))
+        else:
+            logger.error("[%s] Task type=%r failed in %ss. result=%s", task_id, task_type, elapsed, json_dumps(result))
+            raise RuntimeError(json_dumps(result))
+        return _result_dict(result)
 
-            elif task_type == "market_scan":
-                result = await _run_market_scan_task(payload)
 
-            elif task_type == "refresh_data":
-                result = await _run_refresh_data_task(payload)
+# =============================================================================
+# Redis helpers
+# =============================================================================
+async def _create_redis_client(redis_url: str):
+    if not (_REDIS_AVAILABLE and redis_async is not None and redis_url):
+        return None
+    try:
+        if _REDIS_LIB == "redis.asyncio":
+            return redis_async.from_url(redis_url, decode_responses=True)
+        return await redis_async.from_url(redis_url, decode_responses=True)
+    except TypeError:
+        return redis_async.from_url(redis_url, decode_responses=True)
 
-            else:
-                logger.warning(
-                    f"[{task_id}] Unknown task_type={task_type!r}. "
-                    "Supported: dashboard_sync, market_scan, refresh_data. Skipping."
-                )
-                return
 
-            elapsed = round(time.time() - started, 2)
-            ok = result.get("ok", True) if isinstance(result, dict) else True
-            if ok:
-                logger.info(f"[{task_id}] Task type={task_type!r} completed in {elapsed}s. result={json_dumps(result)}")
-            else:
-                logger.error(f"[{task_id}] Task type={task_type!r} reported failure in {elapsed}s. result={json_dumps(result)}")
+async def _close_redis_client(client: Any) -> None:
+    if client is None:
+        return
+    try:
+        close_fn = getattr(client, "aclose", None)
+        if callable(close_fn):
+            await close_fn()
+            return
+    except Exception:
+        pass
+    try:
+        close_fn = getattr(client, "close", None)
+        if callable(close_fn):
+            result = close_fn()
+            if asyncio.iscoroutine(result):
+                await result
+    except Exception:
+        pass
+    try:
+        wait_closed = getattr(client, "wait_closed", None)
+        if callable(wait_closed):
+            result = wait_closed()
+            if asyncio.iscoroutine(result):
+                await result
+    except Exception:
+        pass
 
-        except Exception as e:
-            elapsed = round(time.time() - started, 2)
-            logger.exception(f"[{task_id}] Task type={task_type!r} raised exception after {elapsed}s: {e}")
-            raise  # re-raise so FullJitterBackoff can retry
+
+async def _push_dead_letter(client: Any, raw_payload: str, error_text: str) -> None:
+    if client is None or not CONFIG.dead_letter_queue:
+        return
+    envelope = {
+        "failed_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "error": error_text,
+        "raw_payload": raw_payload,
+    }
+    try:
+        await client.rpush(CONFIG.dead_letter_queue, json_dumps(envelope))
+    except Exception:
+        logger.exception("Failed to push payload to dead-letter queue")
 
 
 async def _poll_redis_queue(redis_url: str) -> None:
-    logger.info(f"Connecting to Redis queue at {redis_url}")
-    redis = await aioredis.from_url(redis_url, decode_responses=True)
-    backoff = FullJitterBackoff()
+    logger.info("Connecting to Redis via %s using %s", redis_url, _REDIS_LIB)
+    redis_client = await _create_redis_client(redis_url)
+    if redis_client is None:
+        raise RuntimeError("redis_client_unavailable")
 
-    while not SHUTDOWN_EVENT.is_set():
-        try:
-            # BLPOP blocks up to 5s waiting for a job
-            result = await redis.blpop("tfb_background_jobs", timeout=5)
-            if result:
-                _, data_raw = result
-                try:
-                    payload = json_loads(data_raw)
-                except Exception as parse_err:
-                    logger.error(f"Failed to parse queue payload: {parse_err} | raw={data_raw[:200]!r}")
+    backoff = FullJitterBackoff(
+        max_retries=CONFIG.max_retries,
+        base_delay=CONFIG.backoff_base_sec,
+        max_delay=CONFIG.backoff_max_sec,
+    )
+
+    try:
+        while not SHUTDOWN_EVENT.is_set():
+            try:
+                result = await redis_client.blpop(CONFIG.queue_name, timeout=CONFIG.redis_block_timeout_sec)
+                if not result:
                     continue
 
-                # Execute with full jitter retry
-                await backoff.execute_async(_process_payload, payload)
+                _, data_raw = result
+                if isinstance(data_raw, bytes):
+                    data_raw = data_raw.decode("utf-8", errors="replace")
 
-        except asyncio.TimeoutError:
-            continue
-        except Exception as e:
-            logger.error(f"Queue polling error: {e}")
-            await asyncio.sleep(2)
+                try:
+                    payload = json_loads(data_raw)
+                    if not isinstance(payload, dict):
+                        raise ValueError("payload_not_dict")
+                except Exception as parse_err:
+                    logger.error("Failed to parse queue payload: %s | raw=%r", parse_err, str(data_raw)[:300])
+                    await _push_dead_letter(redis_client, str(data_raw), f"parse_error:{parse_err}")
+                    continue
 
-    await redis.close()
-    logger.info("Redis connection closed.")
+                try:
+                    await backoff.execute_async(_process_payload, payload)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exec_err:
+                    logger.exception("Task exhausted retries: %s", exec_err)
+                    await _push_dead_letter(redis_client, str(data_raw), f"task_failed:{exec_err}")
+            except asyncio.CancelledError:
+                raise
+            except Exception as poll_err:
+                logger.error("Queue polling error: %s", poll_err)
+                await asyncio.sleep(2)
+    finally:
+        await _close_redis_client(redis_client)
+        logger.info("Redis connection closed")
+
+
+async def _idle_loop() -> None:
+    while not SHUTDOWN_EVENT.is_set():
+        await asyncio.sleep(CONFIG.idle_sleep_sec)
 
 
 async def main_async(args: argparse.Namespace) -> int:
-    logger.info(f"🚀 Starting TFB Worker v{SCRIPT_VERSION}")
+    del args
+    logger.info("🚀 Starting TFB Worker v%s | redis_lib=%s | has_orjson=%s", SCRIPT_VERSION, _REDIS_LIB, _HAS_ORJSON)
 
-    redis_url = os.getenv("REDIS_URL")
-    tasks = []
-
-    if _REDIS_AVAILABLE and redis_url:
-        logger.info(f"Redis available. Polling queue: tfb_background_jobs")
-        tasks.append(asyncio.create_task(_poll_redis_queue(redis_url)))
+    tasks: List[asyncio.Task[Any]] = []
+    if _REDIS_AVAILABLE and CONFIG.redis_url:
+        logger.info("Redis available. Polling queue=%s", CONFIG.queue_name)
+        tasks.append(asyncio.create_task(_poll_redis_queue(CONFIG.redis_url), name="redis-poller"))
     else:
-        logger.warning(
-            "Redis not available or REDIS_URL is empty. "
-            "Worker is in idle mode — no jobs will be processed until Redis is configured."
-        )
+        message = "Redis not available or REDIS_URL is empty. Worker is in idle mode."
+        if CONFIG.fail_fast_if_no_redis:
+            logger.error(message)
+            return 2
+        logger.warning(message)
+        tasks.append(asyncio.create_task(_idle_loop(), name="idle-loop"))
 
-        async def idle_loop():
-            while not SHUTDOWN_EVENT.is_set():
-                await asyncio.sleep(5)
-
-        tasks.append(asyncio.create_task(idle_loop()))
-
-    # Wait for shutdown signal (SIGTERM or SIGINT)
     await SHUTDOWN_EVENT.wait()
     logger.info("Shutdown signal received. Draining tasks...")
 
-    for t in tasks:
-        t.cancel()
-
+    for task in tasks:
+        task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
-    _CPU_EXECUTOR.shutdown(wait=False)
-    logger.info("Worker stopped cleanly.")
+
+    _CPU_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+    logger.info("Worker stopped cleanly")
     return 0
 
 
-def handle_signal(sig, frame):
-    logger.info(f"Signal {sig} received. Initiating graceful shutdown...")
+def _handle_signal(sig: int, _frame: Any) -> None:
+    logger.info("Signal %s received. Initiating graceful shutdown...", sig)
     SHUTDOWN_EVENT.set()
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description=f"Tadawul Distributed Worker v{SCRIPT_VERSION}")
     args = parser.parse_args()
 
-    signal.signal(signal.SIGINT, handle_signal)
-    signal.signal(signal.SIGTERM, handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
 
     try:
-        sys.exit(asyncio.run(main_async(args)))
+        raise SystemExit(asyncio.run(main_async(args)))
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+    except SystemExit:
+        raise
     except Exception as e:
-        logger.exception(f"Fatal worker crash: {e}")
-        sys.exit(1)
+        logger.exception("Fatal worker crash: %s", e)
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
