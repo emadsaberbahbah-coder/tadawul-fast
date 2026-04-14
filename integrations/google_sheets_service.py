@@ -2,9 +2,9 @@
 """
 integrations/google_sheets_service.py
 ===========================================================
-GOOGLE SHEETS SERVICE FOR TADAWUL FAST BRIDGE — v5.5.0 (RECOVERY ALIGNED)
+GOOGLE SHEETS SERVICE FOR TADAWUL FAST BRIDGE — v5.5.2 (RECOVERY+HYGIENE ALIGNED)
 
-What v5.5.0 revises
+What v5.5.2 revises
 - FIX: SheetsAPIClient no longer gets stuck forever after one failed init.
        Added reset(), reset-on-demand retry, and proper close() cleanup.
 - FIX: CredentialsManager now supports reset_cache(), so updated credentials can
@@ -13,6 +13,9 @@ What v5.5.0 revises
 - FIX: close() now actually tears down the Sheets singleton + httpx client +
        async executor so the service can recover cleanly.
 - ENH: get_service_status() now exposes Sheets client failure / cache state.
+- ENH: reset_sheets_service() now also clears header cache and can optionally
+        close the backend client for a cleaner ops recovery path.
+- ENH: close() now clears header cache + credential cache as part of shutdown.
 - SAFE: Phase 2 schema enforcement, forbidden-page blocking, header exactness,
         preserve-columns logic, and startup-safe behavior remain intact.
 """
@@ -183,7 +186,7 @@ class TraceContext:
 # ---------------------------------------------------------------------------
 # Version
 # ---------------------------------------------------------------------------
-SERVICE_VERSION = "5.5.0"
+SERVICE_VERSION = "5.5.2"
 MIN_CORE_VERSION = "5.0.0"
 
 logger = logging.getLogger("integrations.google_sheets_service")
@@ -835,9 +838,25 @@ def get_sheets_service(*, retry_initialize: bool = True, reset_failed: bool = Fa
     return _sheets_client.get_service(retry_initialize=retry_initialize, reset_failed=reset_failed)
 
 
-def reset_sheets_service(*, reason: str = "manual_reset") -> Dict[str, Any]:
+def reset_sheets_service(*, reason: str = "manual_reset", clear_header_cache: bool = True, close_backend_client: bool = False) -> Dict[str, Any]:
     _sheets_client.reset(reason=reason)
-    return {"status": "ok", "reason": reason, "service_version": SERVICE_VERSION}
+    if clear_header_cache:
+        try:
+            _header_cache.clear()
+        except Exception:
+            pass
+    if close_backend_client:
+        try:
+            _backend_client.close()
+        except Exception:
+            pass
+    return {
+        "status": "ok",
+        "reason": reason,
+        "clear_header_cache": bool(clear_header_cache),
+        "close_backend_client": bool(close_backend_client),
+        "service_version": SERVICE_VERSION,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -949,7 +968,8 @@ def index_to_col(idx: int) -> str:
 
 
 def safe_sheet_name(name: str) -> str:
-    return f"'{(_strip(name) or 'Sheet1').replace("'", "''")}'"
+    safe = (_strip(name) or "Sheet1").replace("'", "''")
+    return f"'{safe}'"
 
 
 def compute_clear_end_col(start_col: str, num_cols: int) -> str:
@@ -2117,6 +2137,7 @@ def get_service_status() -> Dict[str, Any]:
         "telemetry": _telemetry.get_stats() if _CONFIG.enable_telemetry else {},
         "sheets_client": _sheets_client.status(),
         "header_cache_enabled": _CONFIG.enable_header_cache,
+        "credentials_cached": _credentials_manager._creds_info is not None,
         "has_orjson": _HAS_ORJSON,
         "has_httpx": _HAS_HTTPX,
         "has_prometheus": _PROMETHEUS_AVAILABLE,
@@ -2140,6 +2161,14 @@ def close() -> None:
         pass
     try:
         _sheets_client.close()
+    except Exception:
+        pass
+    try:
+        _credentials_manager.reset_cache()
+    except Exception:
+        pass
+    try:
+        _header_cache.clear()
     except Exception:
         pass
     try:
