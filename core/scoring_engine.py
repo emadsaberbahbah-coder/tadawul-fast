@@ -2,17 +2,19 @@
 # core/scoring_engine.py
 """
 ================================================================================
-Scoring Engine Compatibility Bridge — v2.2.0
-(COMPATIBILITY / CONTRACT-HARDENED / STARTUP-SAFE)
+Scoring Engine Compatibility Bridge — v2.3.0
+(COMPATIBILITY / CONTRACT-HARDENED / STARTUP-SAFE / LABEL-ALIGNED)
 ================================================================================
 
 Purpose
 - Preserve the legacy `core.scoring_engine` import surface expected by tests,
   scripts, and older callers.
 - Delegate actual scoring logic to `core.scoring`.
-- Keep startup behavior safe: no network I/O, no heavy imports, no side effects.
+- Re-export recommendation normalization helpers introduced in newer
+  `core.scoring` revisions so older callers stay aligned.
+- Keep startup behavior safe: no network I/O, no heavy side effects.
 
-This module intentionally exposes:
+This bridge intentionally exposes:
 - compute_scores(...)
 - enrich_with_scores(...)
 - score_row(...)
@@ -20,6 +22,9 @@ This module intentionally exposes:
 - rank_rows_by_overall(...)
 - assign_rank_overall(...)
 - score_and_rank_rows(...)
+- normalize_recommendation_label(...)
+- normalize_recommendation_code(...)
+- RECOMMENDATION_LABEL_MAP
 - AssetScores
 - ScoringEngine
 - ScoringWeights
@@ -37,19 +42,55 @@ from core.scoring import (
     __version__ as _SCORING_VERSION,
     AssetScores,
     ForecastParameters,
+    RECOMMENDATION_LABEL_MAP,
     ScoringWeights,
     ScoreWeights,
     assign_rank_overall,
     compute_scores as _compute_scores,
     enrich_with_scores as _enrich_with_scores,
+    normalize_recommendation_label,
     rank_rows_by_overall,
     score_and_rank_rows,
     score_quote,
     score_row,
 )
 
+try:
+    from core.scoring import CANONICAL_RECOMMENDATION_CODES, normalize_recommendation_code
+except Exception:  # pragma: no cover
+    CANONICAL_RECOMMENDATION_CODES = (
+        "STRONG_BUY",
+        "BUY",
+        "HOLD",
+        "REDUCE",
+        "SELL",
+    )
+
+    _FALLBACK_CODE_MAP = {
+        "STRONG BUY": "STRONG_BUY",
+        "STRONG_BUY": "STRONG_BUY",
+        "BUY": "BUY",
+        "ACCUMULATE": "BUY",
+        "ADD": "BUY",
+        "HOLD": "HOLD",
+        "NEUTRAL": "HOLD",
+        "REDUCE": "REDUCE",
+        "TRIM": "REDUCE",
+        "SELL": "SELL",
+        "AVOID": "SELL",
+        "EXIT": "SELL",
+    }
+
+    def normalize_recommendation_code(label: Any) -> str:
+        s = str(label or "").strip().upper().replace("-", "_").replace(" ", "_")
+        while "__" in s:
+            s = s.replace("__", "_")
+        return _FALLBACK_CODE_MAP.get(s, "HOLD")
+
+
 SCORING_ENGINE_VERSION = _SCORING_VERSION
 VERSION = SCORING_ENGINE_VERSION
+__version__ = SCORING_ENGINE_VERSION
 
 
 # =============================================================================
@@ -103,6 +144,7 @@ def compute_scores(row: Dict[str, Any], *, settings: Any = None) -> Dict[str, An
     return _as_dict(_compute_scores(row or {}, settings=settings))
 
 
+
 def enrich_with_scores(
     row: Dict[str, Any],
     *,
@@ -124,6 +166,8 @@ class ScoringEngine:
     """
     Small compatibility wrapper for older class-based callers.
     """
+
+    version = SCORING_ENGINE_VERSION
 
     def __init__(
         self,
@@ -180,6 +224,12 @@ class ScoringEngine:
             inplace=inplace,
         )
 
+    def normalize_recommendation_label(self, label: Any) -> str:
+        return normalize_recommendation_label(label)
+
+    def normalize_recommendation_code(self, label: Any) -> str:
+        return normalize_recommendation_code(label)
+
 
 __all__ = [
     "compute_scores",
@@ -189,6 +239,10 @@ __all__ = [
     "rank_rows_by_overall",
     "assign_rank_overall",
     "score_and_rank_rows",
+    "normalize_recommendation_label",
+    "normalize_recommendation_code",
+    "RECOMMENDATION_LABEL_MAP",
+    "CANONICAL_RECOMMENDATION_CODES",
     "AssetScores",
     "ScoringEngine",
     "ScoringWeights",
@@ -196,4 +250,5 @@ __all__ = [
     "ScoreWeights",
     "SCORING_ENGINE_VERSION",
     "VERSION",
+    "__version__",
 ]
