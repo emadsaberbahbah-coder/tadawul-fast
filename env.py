@@ -6,7 +6,21 @@ TADAWUL FAST BRIDGE – ENTERPRISE ENVIRONMENT MANAGER (v7.7.0)
 ================================================================================
 RENDER-SAFE | STARTUP-SAFE | GLOBAL-FIRST | HOT-RELOAD | SECRETS-SAFE | ROUTE-AUTH-AWARE
 
-Why this revision
+Why this revision (v7.8.0)
+- FIX: PROVIDERS env var fallback removed from provider resolution. In v7.7.0
+  `get_first_env_list("ENABLED_PROVIDERS", "PROVIDERS", ...)` silently used a
+  dead Render env var if ENABLED_PROVIDERS wasn't set. Now warns and ignores it.
+- FIX: PRIMARY_PROVIDER re-ordering now logs a warning when it overrides the
+  ENABLED_PROVIDERS list order. Previously silent conflicts caused unexpected
+  provider priority without any diagnostic trace.
+- ENH: Added missing critical env vars to Settings:
+  FUNDAMENTALS_ENABLED, TFB_PERCENT_MODE, CACHE_BACKEND,
+  COMPUTATIONS_ENABLED, SCORING_ENABLED, TECHNICALS_ENABLED, FORECASTING_ENABLED.
+  These are all in the Render Env Audit action list — missing here meant they
+  were never validated, documented, or exported to dependent modules.
+- ENH: validate() now warns when FUNDAMENTALS_ENABLED is False (causes all
+  fundamentals to be blank in Google Sheets output).
+Why v7.7.0
 - ✅ Aligned with core/config.py route-aware auth model
 - ✅ Added PUBLIC_EXACT_PATHS / PUBLIC_PATH_PREFIXES / PROTECTED_EXACT_PATHS / PROTECTED_PATH_PREFIXES
 - ✅ Added path-aware helpers:
@@ -67,7 +81,7 @@ except Exception:
 # =============================================================================
 # Version & Core Configuration
 # =============================================================================
-ENV_VERSION = "7.7.0"
+ENV_VERSION = "7.8.0"
 ENV_SCHEMA_VERSION = "2.3"
 MIN_PYTHON = (3, 8)
 
@@ -760,6 +774,22 @@ class Settings:
     ADV_BATCH_SIZE: int = 25
     BATCH_CONCURRENCY: int = 5
 
+    # ---------------------------------------------------------------------------
+    # Feature flags — from Render Env Audit (all were missing in v7.7.0).
+    # When absent, these default to safe values but produce blank output columns.
+    # ---------------------------------------------------------------------------
+    FUNDAMENTALS_ENABLED: bool = False    # CRITICAL: False → all P/E, Market Cap, Sector blank
+    COMPUTATIONS_ENABLED: bool = True
+    SCORING_ENABLED: bool = True
+    TECHNICALS_ENABLED: bool = True
+    FORECASTING_ENABLED: bool = True
+
+    # Cache backend selection (redis / memory / none)
+    CACHE_BACKEND: str = "memory"
+
+    # Percent display format — must match backend output (points = default for TFB)
+    TFB_PERCENT_MODE: str = "points"
+
     RENDER_API_KEY: Optional[str] = None
     RENDER_SERVICE_ID: Optional[str] = None
     RENDER_SERVICE_NAME: Optional[str] = None
@@ -816,16 +846,44 @@ class Settings:
             tokens_exist=tokens_exist,
         )
 
-        enabled_providers = normalize_providers(
-            get_first_env_list("ENABLED_PROVIDERS", "PROVIDERS", default=auto_global)
-        )
+        # FIX v7.8.0: Read ENABLED_PROVIDERS directly. Do NOT fall back to the
+        # dead `PROVIDERS` env var. In v7.7.0, `get_first_env_list("ENABLED_PROVIDERS",
+        # "PROVIDERS", ...)` silently used PROVIDERS if ENABLED_PROVIDERS wasn't set,
+        # creating invisible provider misconfiguration on Render.
+        # PROVIDERS is documented as deprecated in the Render Env Audit.
+        _raw_providers_env = get_first_env_list("ENABLED_PROVIDERS", default=[])
+        _dead_providers_env = get_first_env("PROVIDERS")
+        if _dead_providers_env and not _raw_providers_env:
+            logger.warning(
+                "env.py: PROVIDERS env var is deprecated — rename it to ENABLED_PROVIDERS. "
+                "Using PROVIDERS as fallback this boot but this will stop working."
+            )
+            _raw_providers_env = coerce_list(_dead_providers_env)
+        enabled_providers = normalize_providers(_raw_providers_env or auto_global)
         ksa_providers = normalize_providers(get_first_env_list("KSA_PROVIDERS", default=auto_ksa))
 
         primary_provider = strip_value(
             get_first_env("PRIMARY_PROVIDER") or (enabled_providers[0] if enabled_providers else "eodhd")
         ).lower()
 
+        # FIX v7.8.0: Warn when PRIMARY_PROVIDER re-orders ENABLED_PROVIDERS.
+        # In v7.7.0 this was silent — you could set ENABLED_PROVIDERS=finnhub,eodhd
+        # and PRIMARY_PROVIDER=eodhd and the final list would be eodhd,finnhub
+        # with no log entry explaining why provider priority changed.
         if primary_provider and primary_provider not in enabled_providers:
+            logger.warning(
+                "PRIMARY_PROVIDER=%r not in ENABLED_PROVIDERS=%r — prepending it. "
+                "Add it to ENABLED_PROVIDERS explicitly to suppress this warning.",
+                primary_provider, enabled_providers,
+            )
+            enabled_providers = [primary_provider] + [p for p in enabled_providers if p != primary_provider]
+        elif primary_provider and enabled_providers and enabled_providers[0] != primary_provider:
+            logger.warning(
+                "PRIMARY_PROVIDER=%r overrides ENABLED_PROVIDERS list order (was: %s). "
+                "Reordering so PRIMARY_PROVIDER is first. "
+                "Set ENABLED_PROVIDERS with the desired provider as the first entry to avoid this.",
+                primary_provider, enabled_providers,
+            )
             enabled_providers = [primary_provider] + [p for p in enabled_providers if p != primary_provider]
 
         public_exact_paths = get_public_exact_paths()
@@ -899,6 +957,14 @@ class Settings:
             AI_MAX_TICKERS=get_first_env_int("AI_MAX_TICKERS", default=500, lo=1, hi=20000),
             ADV_BATCH_SIZE=get_first_env_int("ADV_BATCH_SIZE", default=25, lo=1, hi=500),
             BATCH_CONCURRENCY=get_first_env_int("BATCH_CONCURRENCY", default=5, lo=1, hi=50),
+            # FIX v7.8.0: Added missing critical feature flags
+            FUNDAMENTALS_ENABLED=coerce_bool(get_first_env("FUNDAMENTALS_ENABLED"), False),
+            COMPUTATIONS_ENABLED=coerce_bool(get_first_env("COMPUTATIONS_ENABLED"), True),
+            SCORING_ENABLED=coerce_bool(get_first_env("SCORING_ENABLED"), True),
+            TECHNICALS_ENABLED=coerce_bool(get_first_env("TECHNICALS_ENABLED"), True),
+            FORECASTING_ENABLED=coerce_bool(get_first_env("FORECASTING_ENABLED"), True),
+            CACHE_BACKEND=strip_value(get_first_env("CACHE_BACKEND") or "memory").lower(),
+            TFB_PERCENT_MODE=strip_value(get_first_env("TFB_PERCENT_MODE") or "points").lower(),
             RENDER_API_KEY=get_first_env("RENDER_API_KEY"),
             RENDER_SERVICE_ID=get_first_env("RENDER_SERVICE_ID"),
             RENDER_SERVICE_NAME=get_first_env("RENDER_SERVICE_NAME"),
@@ -924,6 +990,26 @@ class Settings:
             warns.append("Provider 'eodhd' enabled but EODHD_API_KEY missing.")
         if "finnhub" in (self.ENABLED_PROVIDERS or []) and not self.FINNHUB_API_KEY:
             warns.append("Provider 'finnhub' enabled but FINNHUB_API_KEY missing.")
+
+        # FIX v7.8.0: Warn on critical missing flags that cause blank output
+        if not self.FUNDAMENTALS_ENABLED:
+            warns.append(
+                "FUNDAMENTALS_ENABLED is False (or unset). All fundamentals will be blank "
+                "in Google Sheets output (P/E, Market Cap, Sector, ROE, etc.). "
+                "Set FUNDAMENTALS_ENABLED=1 in Render env vars."
+            )
+
+        if self.TFB_PERCENT_MODE not in ("points", "fraction"):
+            warns.append(
+                f"TFB_PERCENT_MODE={self.TFB_PERCENT_MODE!r} is not a recognised value. "
+                "Expected 'points' (default) or 'fraction'. Defaulting to points."
+            )
+
+        if self.CACHE_BACKEND == "redis" and not os.getenv("REDIS_URL", "").strip():
+            warns.append(
+                "CACHE_BACKEND=redis but REDIS_URL is not set. "
+                "Redis cache will fail silently; set REDIS_URL or use CACHE_BACKEND=memory."
+            )
 
         if self.BACKEND_BASE_URL and not is_valid_url(self.BACKEND_BASE_URL):
             warns.append(f"BACKEND_BASE_URL does not look like a URL: {self.BACKEND_BASE_URL!r}")
@@ -1104,6 +1190,14 @@ GOOGLE_SHEETS_CREDENTIALS = settings.GOOGLE_SHEETS_CREDENTIALS
 ENABLED_PROVIDERS = settings.ENABLED_PROVIDERS
 KSA_PROVIDERS = settings.KSA_PROVIDERS
 PRIMARY_PROVIDER = settings.PRIMARY_PROVIDER
+# FIX v7.8.0: Added critical feature flag exports
+FUNDAMENTALS_ENABLED = settings.FUNDAMENTALS_ENABLED
+COMPUTATIONS_ENABLED = settings.COMPUTATIONS_ENABLED
+SCORING_ENABLED = settings.SCORING_ENABLED
+TECHNICALS_ENABLED = settings.TECHNICALS_ENABLED
+FORECASTING_ENABLED = settings.FORECASTING_ENABLED
+CACHE_BACKEND = settings.CACHE_BACKEND
+TFB_PERCENT_MODE = settings.TFB_PERCENT_MODE
 
 __all__ = [
     "ENV_VERSION",
@@ -1184,4 +1278,12 @@ __all__ = [
     "ENABLED_PROVIDERS",
     "KSA_PROVIDERS",
     "PRIMARY_PROVIDER",
+    # v7.8.0 additions
+    "FUNDAMENTALS_ENABLED",
+    "COMPUTATIONS_ENABLED",
+    "SCORING_ENABLED",
+    "TECHNICALS_ENABLED",
+    "FORECASTING_ENABLED",
+    "CACHE_BACKEND",
+    "TFB_PERCENT_MODE",
 ]
