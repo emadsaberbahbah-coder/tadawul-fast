@@ -2,26 +2,15 @@
 """
 integrations/google_sheets_service.py
 ===========================================================
-GOOGLE SHEETS SERVICE FOR TADAWUL FAST BRIDGE — v5.5.3
+GOOGLE SHEETS SERVICE FOR TADAWUL FAST BRIDGE -- v5.5.3 (PHASE 2 ALIGNED)
 
-v5.5.3 vs v5.4.0
-- FIX CRITICAL: SheetsAPIClient._failed flag now recovers after a configurable
-       cooldown (default 30s, SHEETS_INIT_RETRY_COOLDOWN_SEC).
-       v5.4.0 set _failed=True and NEVER reset it — one credential init failure
-       permanently bricked all Sheets writes for the process lifetime, requiring
-       a full Render redeploy to recover.
-- FIX: Added retry cooldown to prevent retry storms when credentials are broken.
-       Without this every sheet write retried, flooding logs with auth errors.
-- FIX: Added reset(), _mark_failed(), status(), close() that actually tears down.
-- FIX: Added reset_sheets_service() public helper for credential hot-reload.
-- ENH: get_service_status() now exposes failure/cooldown state and cred cache.
-- ENH: Added get_rows_for_sheet() / read_rows_for_sheet() / get_sheet_rows()
-       so data_engine_v2.py external rows reader can discover and use this module.
-- SAFE: Phase 2 schema enforcement, forbidden-page blocking, preserve-columns,
-        and startup-safe behavior remain intact.
-- SAFE: Never create/write forbidden pages (KSA_Tadawul, Advisor_Criteria).
-- SAFE: No-data-loss preserve-columns logic (only fill blanks from existing sheet).
-- SAFE: Startup-safe: no network calls at import time.
+Phase 2 Alignment Goals
+- ✅ Ensure canonical tabs exist (Top_10_Investments + Data_Dictionary + all schema pages)
+- ✅ Ensure headers EXACTLY match schema_registry (always full 60+ columns; no drift)
+- ✅ Insights_Analysis: seed Advisor Criteria block at top (A1:D4) if empty + table headers at A5
+- ✅ NEVER create/write forbidden pages (KSA_Tadawul, Advisor_Criteria)
+- ✅ Keep no-data-loss preserve columns logic (only fill blanks from existing sheet)
+- ✅ Startup-safe: no network work at import-time (all Sheets calls occur only inside refresh calls)
 """
 
 from __future__ import annotations
@@ -706,6 +695,11 @@ class CredentialsManager:
         self._creds_info: Optional[Dict[str, Any]] = None
         self._lock = threading.RLock()
 
+    def reset_cache(self) -> None:
+        """Flush cached credentials so next get_credentials() re-reads from env/file."""
+        with self._lock:
+            self._creds_info = None
+
     def get_credentials(self) -> Optional[Dict[str, Any]]:
         with self._lock:
             if self._creds_info is not None:
@@ -790,11 +784,8 @@ class CredentialsManager:
 
 _credentials_manager = CredentialsManager()
 
-# ---------------------------------------------------------------------------
-# Retry cooldown: when Google credential init fails, don't retry for this many
-# seconds to avoid hammering auth servers and flooding Render logs.
-# Configurable via SHEETS_INIT_RETRY_COOLDOWN_SEC (default 30).
-# ---------------------------------------------------------------------------
+# FIX v5.5.3: Retry cooldown prevents retry storms when credentials are broken.
+# Without this, every sheet write retried on failure, flooding logs with auth errors.
 _SHEETS_INIT_RETRY_COOLDOWN_SEC: float = max(
     5.0,
     float((os.getenv("SHEETS_INIT_RETRY_COOLDOWN_SEC") or "30").strip() or "30"),
@@ -808,18 +799,13 @@ class SheetsAPIClient:
     v5.5.3 fixes vs v5.4.0:
     - FIX CRITICAL: _failed flag no longer sticks permanently after one error.
       v5.4.0 had `if self._failed: raise RuntimeError(...)` with NO reset path,
-      meaning a single transient credential error (network blip, secret not yet
-      injected on first boot, etc.) would brick ALL Sheets writes for the entire
-      process lifetime — requiring a full Render redeploy to recover.
+      meaning a single transient credential error would brick ALL Sheets writes
+      for the entire process lifetime — requiring a full Render redeploy to recover.
     - FIX: Added reset() method: clears _failed + _service + flushes credential
       cache so updated credentials can be picked up without a restart.
     - FIX: Added retry cooldown (_SHEETS_INIT_RETRY_COOLDOWN_SEC, default 30s).
-      Without this, retry_initialize=True (default) would retry on EVERY call,
-      causing log spam and unnecessary auth latency when credentials are broken.
     - FIX: Added _mark_failed() and status() for operational visibility.
     - FIX: close() now properly tears down service + clears state.
-    - ENH: get_service() supports retry_initialize and reset_failed kwargs for
-      operational/config-reload flows.
     """
 
     def __init__(self) -> None:
@@ -831,15 +817,6 @@ class SheetsAPIClient:
         self._retry_cooldown_sec: float = _SHEETS_INIT_RETRY_COOLDOWN_SEC
 
     def get_service(self, *, retry_initialize: bool = True, reset_failed: bool = False):
-        """
-        Return the authenticated Google Sheets service object.
-
-        Args:
-            retry_initialize: If True (default) and previously failed, attempt
-                re-initialization after the cooldown period has elapsed.
-            reset_failed: If True, forcibly reset failed state before attempting
-                to get the service (used by config-reload / ops flows).
-        """
         with self._lock:
             if reset_failed:
                 self.reset(reason="manual_reset_before_get")
@@ -853,8 +830,6 @@ class SheetsAPIClient:
                 )
 
             if self._failed and retry_initialize:
-                # FIX v5.5.3: Only retry after cooldown to avoid retry storms.
-                # Without this, every sheet write retries on failure → log spam.
                 elapsed = time.time() - (self._last_failure_ts or 0.0)
                 if elapsed < self._retry_cooldown_sec:
                     remaining = self._retry_cooldown_sec - elapsed
@@ -876,7 +851,6 @@ class SheetsAPIClient:
                 raise
 
     def _mark_failed(self, exc: Exception) -> None:
-        """Record a failure and set the failed flag with timestamp."""
         self._service = None
         self._failed = True
         self._last_error = f"{type(exc).__name__}: {exc}"
@@ -888,13 +862,6 @@ class SheetsAPIClient:
         )
 
     def reset(self, *, reason: str = "manual_reset") -> None:
-        """
-        Reset the client to a clean state so the next get_service() call
-        attempts fresh initialization.
-
-        Safe to call from config-reload flows or ops endpoints.
-        Also flushes the credentials cache so updated env vars are picked up.
-        """
         with self._lock:
             try:
                 transport = getattr(self._service, "_http", None)
@@ -906,7 +873,6 @@ class SheetsAPIClient:
             self._failed = False
             self._last_error = ""
             self._last_failure_ts = None
-            # Flush credential cache so re-init picks up updated GOOGLE_SHEETS_CREDENTIALS
             _credentials_manager.reset_cache()
             logger.info("SheetsAPIClient reset: %s", reason)
 
@@ -935,7 +901,7 @@ class SheetsAPIClient:
         self.reset(reason="close")
 
     def status(self) -> Dict[str, Any]:
-        """Return operational status dict for /status and diagnostics endpoints."""
+        """Return operational status dict."""
         with self._lock:
             elapsed_since_failure = (
                 round(time.time() - self._last_failure_ts, 1)
@@ -962,11 +928,7 @@ _sheets_client = SheetsAPIClient()
 def get_sheets_service(*, retry_initialize: bool = True, reset_failed: bool = False):
     """
     Public getter for the authenticated Google Sheets service object.
-    Exported and used by all Sheets operations in this module.
-
-    Args:
-        retry_initialize: Attempt re-init after cooldown if previously failed.
-        reset_failed: Forcibly reset failed state before attempting initialization.
+    FIX v5.5.3: Added retry_initialize + reset_failed kwargs.
     """
     return _sheets_client.get_service(
         retry_initialize=retry_initialize, reset_failed=reset_failed
@@ -981,14 +943,8 @@ def reset_sheets_service(
 ) -> Dict[str, Any]:
     """
     Reset the Google Sheets service to a clean state.
-
-    Useful after updating GOOGLE_SHEETS_CREDENTIALS in Render env vars without
-    a full redeploy. Also called by config-reload / ops endpoints.
-
-    Args:
-        reason: Human-readable reset reason (logged).
-        clear_header_cache: Also clear the header cache (default True).
-        close_backend_client: Also close the httpx backend client (default False).
+    FIX v5.5.3: public helper for credential hot-reload.
+    Useful after updating GOOGLE_SHEETS_CREDENTIALS in Render env vars.
     """
     _sheets_client.reset(reason=reason)
     if clear_header_cache:
@@ -1008,8 +964,6 @@ def reset_sheets_service(
         "close_backend_client": bool(close_backend_client),
         "service_version": SERVICE_VERSION,
     }
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -2546,6 +2500,7 @@ async def refresh_sheet_with_advanced_analysis_async(*args, **kwargs) -> Any:
     return await _run_async(refresh_sheet_with_advanced_analysis, *args, **kwargs)
 
 
+
 def get_rows_for_sheet(
     sheet_name: str,
     spreadsheet_id: str = "",
@@ -2557,20 +2512,7 @@ def get_rows_for_sheet(
 ) -> List[Dict[str, Any]]:
     """
     Read data rows from a Google Sheets tab and return as a list of dicts.
-
-    Key → header name, value → cell content. Blank rows are skipped.
-    This method is discoverable by data_engine_v2.py's external rows reader
-    (it scans for `get_rows_for_sheet`, `read_rows_for_sheet`, `get_sheet_rows`).
-
-    Args:
-        sheet_name: The tab name to read (e.g., "Market_Leaders").
-        spreadsheet_id: Spreadsheet ID (defaults to DEFAULT_SPREADSHEET_ID).
-        limit: Max rows to return (default 5000).
-        start_cell: Cell where the header row starts (default "A5").
-        sheet / page: Aliases for sheet_name (convenience).
-
-    Returns:
-        List of dicts, one per non-blank data row. Empty list on any error.
+    Discoverable by data_engine_v2.py external rows reader.
     """
     effective_name = _strip(sheet_name or sheet or page or "")
     if not effective_name:
@@ -2590,7 +2532,6 @@ def get_rows_for_sheet(
         start_col, start_row = parse_a1_cell(_strip(start_cell) or "A5")
         sheet_a1 = safe_sheet_name(effective_name)
 
-        # Read header row
         header_range = f"{sheet_a1}!{a1(start_col, start_row)}:{_CONFIG.clear_end_col}{start_row}"
         header_vals = read_range(spreadsheet_id, header_range)
         if not header_vals or not header_vals[0]:
@@ -2599,7 +2540,6 @@ def get_rows_for_sheet(
         if not headers:
             return []
 
-        # Read data rows
         data_start = start_row + 1
         data_end = data_start + max(1, min(int(limit or 5000), 5000)) - 1
         data_range = f"{sheet_a1}!{a1(start_col, data_start)}:{_CONFIG.clear_end_col}{data_end}"
@@ -2607,7 +2547,6 @@ def get_rows_for_sheet(
 
         rows_out: List[Dict[str, Any]] = []
         for row_cells in (data_vals or []):
-            # Skip entirely blank rows
             if not any(str(x).strip() for x in (row_cells or [])):
                 continue
             row_dict: Dict[str, Any] = {}
@@ -2620,10 +2559,7 @@ def get_rows_for_sheet(
             if len(rows_out) >= int(limit or 5000):
                 break
 
-        logger.debug(
-            "get_rows_for_sheet: %s → %d rows (headers=%d)",
-            effective_name, len(rows_out), len(headers),
-        )
+        logger.debug("get_rows_for_sheet: %s -> %d rows", effective_name, len(rows_out))
         return rows_out
 
     except Exception as e:
@@ -2657,24 +2593,19 @@ def get_service_status() -> Dict[str, Any]:
             "preserve_max_rows_scan": _CONFIG.preserve_max_rows_scan,
             "ensure_tabs_exist": _CONFIG.ensure_tabs_exist,
             "ensure_headers_match_schema": _CONFIG.ensure_headers_match_schema,
+            "init_retry_cooldown_sec": _SHEETS_INIT_RETRY_COOLDOWN_SEC,
             "allow_extra_columns": _CONFIG.allow_extra_columns,
             "insights_criteria_enabled": _CONFIG.insights_criteria_enabled,
-            "init_retry_cooldown_sec": _SHEETS_INIT_RETRY_COOLDOWN_SEC,
         },
         "circuit_breaker": _backend_client.circuit_breaker.get_state(),
+        "sheets_client": _sheets_client.status(),   # FIX v5.5.3: expose failure/cooldown state
         "telemetry": _telemetry.get_stats() if _CONFIG.enable_telemetry else {},
-        # v5.5.3: expose sheets client failure/cooldown state
-        "sheets_client": _sheets_client.status(),
-        "header_cache_enabled": _CONFIG.enable_header_cache,
-        "credentials_cached": _credentials_manager._creds_info is not None,
         "has_orjson": _HAS_ORJSON,
         "has_httpx": _HAS_HTTPX,
         "has_prometheus": _PROMETHEUS_AVAILABLE,
         "has_otel": _OTEL_AVAILABLE,
         "has_schema_core": _HAS_CORE,
     }
-
-
 
 
 def invalidate_header_cache(sheet_name: Optional[str] = None) -> None:
@@ -2685,29 +2616,12 @@ def invalidate_header_cache(sheet_name: Optional[str] = None) -> None:
 
 
 def close() -> None:
-    """Tear down all service resources. Safe to call multiple times."""
-    global _ASYNC_EXECUTOR
     try:
         _backend_client.close()
     except Exception:
         pass
     try:
-        _sheets_client.close()          # resets _failed + _service + credential cache
-    except Exception:
-        pass
-    try:
-        _credentials_manager.reset_cache()
-    except Exception:
-        pass
-    try:
-        _header_cache.clear()
-    except Exception:
-        pass
-    try:
-        with _ASYNC_EXECUTOR_LOCK:
-            if _ASYNC_EXECUTOR is not None:
-                _ASYNC_EXECUTOR.shutdown(wait=False, cancel_futures=True)
-            _ASYNC_EXECUTOR = None
+        _sheets_client.close()
     except Exception:
         pass
 
@@ -2721,7 +2635,10 @@ __all__ = [
     "SafeModeLevel",
     "SheetsServiceConfig",
     "get_sheets_service",
-    "reset_sheets_service",        # v5.5.3: ops/config-reload helper
+    "reset_sheets_service",       # v5.5.3
+    "get_rows_for_sheet",         # v5.5.3
+    "read_rows_for_sheet",        # alias
+    "get_sheet_rows",             # alias
     "read_range",
     "read_ranges_batch",
     "write_range",
@@ -2735,9 +2652,6 @@ __all__ = [
     "refresh_sheet_with_enriched_quotes_async",
     "refresh_sheet_with_ai_analysis_async",
     "refresh_sheet_with_advanced_analysis_async",
-    "get_rows_for_sheet",          # v5.5.3: data_engine_v2 rows reader discovery
-    "read_rows_for_sheet",         # alias
-    "get_sheet_rows",              # alias
     "get_service_status",
     "invalidate_header_cache",
     "close",
