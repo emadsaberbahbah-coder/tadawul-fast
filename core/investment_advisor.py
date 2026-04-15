@@ -3,14 +3,29 @@
 """
 core/investment_advisor.py
 ================================================================================
-INVESTMENT ADVISOR ORCHESTRATOR — v4.3.0
+INVESTMENT ADVISOR ORCHESTRATOR — v4.4.0
 ================================================================================
 LIVE-BY-DEFAULT • ENGINE-FIRST • SNAPSHOT-TOLERANT • ROUTE-COMPATIBLE
 MODE-AWARE • SCHEMA-SAFE • JSON-SAFE • IMPORT-SAFE • WORKER-THREAD SAFE
 SPECIAL-PAGE SAFE • CONTRACT-PRESERVING • DICTIONARY-HARDENED
 
-What this revision fixes
-------------------------
+What v4.4.0 revises
+-------------------
+- FIX CRITICAL: _score_recommendation() returned non-canonical labels
+  ("Strong Buy", "Buy", "Hold", "Reduce", "Avoid"). "Avoid" appeared verbatim
+  in Google Sheets because no downstream normalizer recognized it. "Strong Buy"
+  and title-case variants were not matched by RECOMMENDATION_LABEL_MAP.
+  Fixed to use canonical 5-value vocabulary: STRONG_BUY/BUY/HOLD/REDUCE/SELL.
+- FIX: "Hold" hardcoded at line 1195 (fallback symbol row seed) → RECO_HOLD.
+- FIX: _criteria_fingerprint() did NOT sort symbols list before hashing.
+  ["AAPL","MSFT"] and ["MSFT","AAPL"] produced different cache keys → same
+  request with differently-ordered symbols missed the cache, inflated the
+  snapshot store, and could return inconsistent results. Fixed with sorted().
+- ENH: Added reco_normalize import with local fallback constants so this module
+  stays import-safe even if core.reco_normalize is unavailable.
+
+What v4.3.0 revised
+-------------------
 - FIX: keeps this module as an orchestration wrapper over the engine rather
          than becoming a second independent engine.
 - FIX: supports aligned engine output shapes including:
@@ -50,7 +65,28 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping,
 logger = logging.getLogger("core.investment_advisor")
 logger.addHandler(logging.NullHandler())
 
-INVESTMENT_ADVISOR_VERSION = "4.3.0"
+INVESTMENT_ADVISOR_VERSION = "4.4.0"
+
+# ---------------------------------------------------------------------------
+# Canonical recommendation constants — import with fallback.
+# FIX v4.4.0: _score_recommendation() used non-canonical labels.
+# These constants ensure every label produced by this module is in the
+# 5-value vocabulary that downstream normalizers and Sheets display expect.
+# ---------------------------------------------------------------------------
+try:
+    from core.reco_normalize import (  # type: ignore
+        RECO_STRONG_BUY,
+        RECO_BUY,
+        RECO_HOLD,
+        RECO_REDUCE,
+        RECO_SELL,
+    )
+except Exception:
+    RECO_STRONG_BUY = "STRONG_BUY"
+    RECO_BUY        = "BUY"
+    RECO_HOLD       = "HOLD"
+    RECO_REDUCE     = "REDUCE"
+    RECO_SELL       = "SELL"
 DEFAULT_PAGE = "Top_10_Investments"
 DEFAULT_LIMIT = 10
 DEFAULT_OFFSET = 0
@@ -337,10 +373,14 @@ def _normalize_key_loose(key: str) -> str:
 
 
 def _criteria_fingerprint(criteria: Mapping[str, Any]) -> str:
+    # FIX v4.4.0: Sort symbols so ["AAPL","MSFT"] and ["MSFT","AAPL"] produce
+    # the same fingerprint. Previously different orderings created separate cache
+    # entries for identical requests, inflating the snapshot store and causing
+    # inconsistent results when the same symbols were requested in different order.
     payload = {
         "page": _normalize_page_name(criteria.get("page")) or DEFAULT_PAGE,
         "mode": _normalize_mode(criteria.get("advisor_data_mode") or criteria.get("mode")),
-        "symbols": _normalize_list(criteria.get("symbols") or criteria.get("tickers")),
+        "symbols": sorted(_normalize_list(criteria.get("symbols") or criteria.get("tickers"))),
         "limit": max(1, _safe_int(criteria.get("limit") or criteria.get("top_n"), DEFAULT_LIMIT)),
         "offset": max(0, _safe_int(criteria.get("offset"), DEFAULT_OFFSET)),
     }
@@ -971,6 +1011,15 @@ def _normalize_headers_keys(result: Mapping[str, Any], page: str) -> Tuple[List[
 
 
 def _score_recommendation(row: Mapping[str, Any]) -> Tuple[str, str, float]:
+    """
+    Derive a canonical recommendation from row scores.
+
+    FIX v4.4.0: Was returning non-canonical labels ("Strong Buy", "Buy", "Hold",
+    "Reduce", "Avoid"). "Avoid" appeared verbatim in Google Sheets because no
+    downstream normalizer recognized it. Title-case variants ("Strong Buy" etc.)
+    were not matched by RECOMMENDATION_LABEL_MAP in the display pipeline.
+    Now returns canonical 5-value vocabulary: STRONG_BUY/BUY/HOLD/REDUCE/SELL.
+    """
     opportunity = _safe_float(row.get("opportunity_score") or row.get("overall_score") or row.get("score"), 0.0)
     overall = _safe_float(row.get("overall_score"), opportunity)
     risk = _safe_float(row.get("risk_score"), 50.0)
@@ -985,14 +1034,14 @@ def _score_recommendation(row: Mapping[str, Any]) -> Tuple[str, str, float]:
     composite = overall + (0.35 * opportunity) + (0.20 * expected) - (0.25 * risk)
 
     if composite >= 70:
-        return "Strong Buy", "High score / attractive upside", composite
+        return RECO_STRONG_BUY, "High score / attractive upside", composite
     if composite >= 55:
-        return "Buy", "Favorable score / acceptable risk", composite
+        return RECO_BUY, "Favorable score / acceptable risk", composite
     if composite >= 45:
-        return "Hold", "Balanced score / wait for confirmation", composite
+        return RECO_HOLD, "Balanced score / wait for confirmation", composite
     if composite >= 30:
-        return "Reduce", "Weak score / elevated risk", composite
-    return "Avoid", "Low score / unfavorable risk-reward", composite
+        return RECO_REDUCE, "Weak score / elevated risk", composite
+    return RECO_SELL, "Low score / unfavorable risk-reward", composite
 
 
 def _risk_bucket_from_row(row: MutableMapping[str, Any]) -> str:
@@ -1192,7 +1241,7 @@ def _build_special_fallback(page: str, criteria: Dict[str, Any]) -> Dict[str, An
         if "name" in row:
             row["name"] = symbol
         if "recommendation" in row:
-            row["recommendation"] = "Hold"
+            row["recommendation"] = RECO_HOLD  # FIX v4.4.0: was "Hold" (title-case, non-canonical)
         if "top10_rank" in row:
             row["top10_rank"] = idx
         if "selection_reason" in row:
