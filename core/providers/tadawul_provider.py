@@ -97,7 +97,8 @@ logger = logging.getLogger("core.providers.tadawul_provider")
 logger.addHandler(logging.NullHandler())
 
 PROVIDER_NAME = "tadawul"
-PROVIDER_VERSION = "4.4.0"
+PROVIDER_VERSION         = "4.5.0"
+PROVIDER_BATCH_SUPPORTED = True   # ENH v4.5.0
 
 USER_AGENT_DEFAULT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -491,10 +492,26 @@ def pick_str(obj: Any, *keys: str) -> Optional[str]:
 
 
 def pick_pct(obj: Any, *keys: str) -> Optional[float]:
+    """LEGACY: converts fraction->percent-points. Do NOT use for dtype=pct fields."""
     v = safe_float(find_first_value(obj, keys))
     if v is None:
         return None
     return v * 100.0 if abs(v) <= 1.0 else v
+
+
+def pick_frac(obj: Any, *keys: str) -> Optional[float]:  # FIX v4.5.0: fraction
+    """
+    FIX v4.5.0: dtype=pct fields must be stored as FRACTIONS (0.0142 = 1.42%).
+    Uses _percentish_to_fraction logic: abs(v) > 1.5 -> divide by 100.
+    Use this for all schema dtype=pct fields (percent_change, week_52_position_pct,
+    dividend_yield, gross_margin, etc.).
+    """
+    v = safe_float(find_first_value(obj, keys))
+    if v is None:
+        return None
+    if abs(v) > 1.5:
+        return v / 100.0
+    return v
 
 
 def clean_patch(patch: Dict[str, Any]) -> Dict[str, Any]:
@@ -530,12 +547,12 @@ def fill_derived_quote_fields(patch: Dict[str, Any]) -> None:
 
     if patch.get("percent_change") is None and cur is not None and prev not in (None, 0.0):
         try:
-            patch["percent_change"] = (cur - prev) / prev * 100.0
+            patch["percent_change"] = (cur - prev) / prev  # FIX v4.5.0: fraction (dtype=pct)
         except Exception:
             pass
 
     if patch.get("week_52_position_pct") is None and cur is not None and w52h is not None and w52l is not None and w52h != w52l:
-        patch["week_52_position_pct"] = ((cur - w52l) / (w52h - w52l)) * 100.0
+        patch["week_52_position_pct"] = (cur - w52l) / (w52h - w52l)  # FIX v4.5.0: fraction (dtype=pct)
 
     if patch.get("price") is None and patch.get("current_price") is not None:
         patch["price"] = patch["current_price"]
@@ -778,7 +795,7 @@ def _volatility_30d(closes: List[float]) -> Optional[float]:
             rets.append(math.log(window[i] / window[i - 1]))
     if len(rets) < 2:
         return None
-    return float(_std(rets) * math.sqrt(252) * 100.0)
+    return float(_std(rets) * math.sqrt(252))  # FIX v4.5.0: fraction not percent points
 
 
 def _avg_last(values: List[float], n: int) -> Optional[float]:
@@ -863,7 +880,7 @@ def compute_history_analytics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
                     rets.append((window[i] / window[i - 1]) - 1.0)
             mu = _mean(rets) if rets else 0.0
             price = last * ((1.0 + mu) ** h)
-            roi = (price / last - 1.0) * 100.0
+            roi = (price / last) - 1.0  # FIX v4.5.0: fraction (dtype=pct)
             return float(price), float(roi)
 
         p1, r1 = _forecast(21)
@@ -1037,7 +1054,7 @@ class TadawulClient:
         patch["week_52_high"] = pick_num(root, "week_52_high", "fiftyTwoWeekHigh", "52w_high", "yearHigh", "week52High")
         patch["week_52_low"] = pick_num(root, "week_52_low", "fiftyTwoWeekLow", "52w_low", "yearLow", "week52Low")
         patch["price_change"] = pick_num(root, "change", "d", "price_change", "Change", "diff", "delta")
-        patch["percent_change"] = pick_pct(root, "change_pct", "change_percent", "dp", "percent_change", "pctChange", "changePercent")
+        patch["percent_change"] = pick_frac(root, "change_pct", "change_percent", "dp", "percent_change", "pctChange", "changePercent")  # FIX v4.5.0: fraction
         patch["beta_5y"] = pick_num(root, "beta", "beta5y", "beta_5y")
         patch["asset_class"] = pick_str(root, "asset_class", "assetClass", "type", "securityType")
 
@@ -1055,14 +1072,14 @@ class TadawulClient:
         patch["pb_ratio"] = pick_num(root, "pb", "pb_ratio", "priceToBook", "PBR", "price_book")
         patch["ps_ratio"] = pick_num(root, "ps", "ps_ratio", "priceToSales")
         patch["eps_ttm"] = pick_num(root, "eps", "eps_ttm", "trailingEps", "EPS")
-        patch["dividend_yield"] = pick_pct(root, "dividend_yield", "divYield", "yield", "DividendYield")
-        patch["payout_ratio"] = pick_pct(root, "payout_ratio", "payoutRatio")
+        patch["dividend_yield"] = pick_frac(root, "dividend_yield", "divYield", "yield", "DividendYield")  # FIX v4.5.0: fraction
+        patch["payout_ratio"] = pick_frac(root, "payout_ratio", "payoutRatio")  # FIX v4.5.0: fraction
         patch["beta_5y"] = pick_num(root, "beta", "beta5y", "beta_5y")
         patch["revenue_ttm"] = pick_num(root, "revenue_ttm", "revenue", "sales", "totalRevenue")
-        patch["revenue_growth_yoy"] = pick_pct(root, "revenue_growth_yoy", "revenueGrowth", "salesGrowth")
-        patch["gross_margin"] = pick_pct(root, "gross_margin", "grossMargin")
-        patch["operating_margin"] = pick_pct(root, "operating_margin", "operatingMargin")
-        patch["profit_margin"] = pick_pct(root, "profit_margin", "netMargin", "profitMargin")
+        patch["revenue_growth_yoy"] = pick_frac(root, "revenue_growth_yoy", "revenueGrowth", "salesGrowth")  # FIX v4.5.0: fraction
+        patch["gross_margin"] = pick_frac(root, "gross_margin", "grossMargin")  # FIX v4.5.0: fraction
+        patch["operating_margin"] = pick_frac(root, "operating_margin", "operatingMargin")  # FIX v4.5.0: fraction
+        patch["profit_margin"] = pick_frac(root, "profit_margin", "netMargin", "profitMargin")  # FIX v4.5.0: fraction
         return clean_patch(patch)
 
     def _map_profile(self, root: Any) -> Dict[str, Any]:
@@ -1362,6 +1379,31 @@ class TadawulClient:
 
         return clean_patch(result)
 
+
+    async def get_enriched_quotes_batch(
+        self,
+        symbols: List[str],
+        *,
+        mode: str = "",
+    ) -> Dict[str, Dict[str, Any]]:
+        """ENH v4.5.0: Batch fetch for multiple KSA symbols."""
+        if not symbols:
+            return {}
+        results = await asyncio.gather(
+            *(self.fetch_enriched_quote_patch(sym) for sym in symbols),
+            return_exceptions=True,
+        )
+        out: Dict[str, Dict[str, Any]] = {}
+        for sym, result in zip(symbols, results):
+            if isinstance(result, Exception):
+                out[sym] = {"symbol": sym, "provider": PROVIDER_NAME, "data_quality": "MISSING"}
+            elif isinstance(result, dict):
+                key = result.get("symbol") or normalize_ksa_symbol(sym) or sym
+                out[key] = result
+            else:
+                out[sym] = {"symbol": sym, "provider": PROVIDER_NAME, "data_quality": "MISSING"}
+        return out
+
     async def get_metrics(self) -> Dict[str, Any]:
         return {
             "provider": PROVIDER_NAME,
@@ -1418,6 +1460,14 @@ async def close_client() -> None:
 async def fetch_enriched_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     return await (await get_client()).fetch_enriched_quote_patch(symbol)
 
+
+
+async def fetch_enriched_quotes_batch(
+    symbols: List[str], *, mode: str = "", **kwargs: Any
+) -> Dict[str, Dict[str, Any]]:
+    """ENH v4.5.0: Batch fetch enriched patches for multiple KSA symbols."""
+    client = await get_client()
+    return await client.get_enriched_quotes_batch(symbols, mode=mode)
 
 async def fetch_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
     return await (await get_client()).fetch_quote_patch(symbol)
@@ -1512,6 +1562,31 @@ class _TadawulProviderAdapter:
     async def get_history(self, symbol: str) -> Dict[str, Any]:
         return await fetch_history_patch(symbol)
 
+
+    async def get_enriched_quotes_batch(
+        self,
+        symbols: List[str],
+        *,
+        mode: str = "",
+    ) -> Dict[str, Dict[str, Any]]:
+        """ENH v4.5.0: Batch fetch for multiple KSA symbols."""
+        if not symbols:
+            return {}
+        results = await asyncio.gather(
+            *(self.fetch_enriched_quote_patch(sym) for sym in symbols),
+            return_exceptions=True,
+        )
+        out: Dict[str, Dict[str, Any]] = {}
+        for sym, result in zip(symbols, results):
+            if isinstance(result, Exception):
+                out[sym] = {"symbol": sym, "provider": PROVIDER_NAME, "data_quality": "MISSING"}
+            elif isinstance(result, dict):
+                key = result.get("symbol") or normalize_ksa_symbol(sym) or sym
+                out[key] = result
+            else:
+                out[sym] = {"symbol": sym, "provider": PROVIDER_NAME, "data_quality": "MISSING"}
+        return out
+
     async def get_metrics(self) -> Dict[str, Any]:
         return await get_client_metrics()
 
@@ -1532,6 +1607,8 @@ __all__ = [
     "PROVIDER_VERSION",
     "normalize_ksa_symbol",
     "fetch_enriched_quote_patch",
+    "fetch_enriched_quotes_batch",
+    "PROVIDER_BATCH_SUPPORTED",
     "fetch_quote_patch",
     "fetch_fundamentals_patch",
     "fetch_history_patch",
