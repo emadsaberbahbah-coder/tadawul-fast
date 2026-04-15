@@ -2,23 +2,9 @@
 # core/scoring.py
 """
 ================================================================================
-Scoring Module — v2.4.0
+Scoring Module -- v2.4.0
 (SCHEMA-ALIGNED / ENGINE-READY / CONTRACT-HARDENED / DETERMINISTIC / RANK-AWARE)
 ================================================================================
-
-v2.4.0 Changes
---------------
-- KEEP: all v2.3.0 ROI fixes:
-  - _as_fraction boundary bug fixed (`>= 1.5`)
-  - _as_roi_fraction added for ROI-specific fields
-- ENHANCE: recommendation labels are now governed by one canonical enum:
-  STRONG_BUY / BUY / HOLD / REDUCE / SELL
-- ENHANCE: added normalize_recommendation_code() so downstream modules can
-  normalize mixed label styles to one internal code safely
-- ENHANCE: normalize_recommendation_label() is now case-insensitive and tolerant
-  to spaces / hyphens / underscores / legacy labels like Accumulate / Avoid
-- SAFE: scoring formulas and ranking logic preserved; this revision focuses on
-  normalization and contract stability for downstream routes / selectors
 """
 
 from __future__ import annotations
@@ -123,15 +109,12 @@ def _getf(row: Mapping[str, Any], *keys: str) -> Optional[float]:
 def _as_fraction(x: Any) -> Optional[float]:
     """
     Convert percent-like values to fraction for general financial metrics.
-    Threshold: abs(f) >= 1.5 → divide by 100.
-
-    Use for volatility, drawdown, growth rates, and general percentage-like
-    metrics where values >100% can still be legitimate.
+    Threshold: abs(f) >= 1.5 (FIX v2.3.0: was > 1.5 — missed the boundary value).
     """
     f = _safe_float(x)
     if f is None:
         return None
-    if abs(f) >= 1.5:
+    if abs(f) >= 1.5:   # FIX v2.3.0: was > 1.5
         return f / 100.0
     return f
 
@@ -139,10 +122,8 @@ def _as_fraction(x: Any) -> Optional[float]:
 def _as_roi_fraction(x: Any) -> Optional[float]:
     """
     Convert ROI / return values to fraction form with a tighter threshold.
-    Threshold: abs(f) > 1.0 → divide by 100.
-
-    Use for expected_roi_* / expected_return_* / percent_change style fields
-    where 1.2 should usually mean 1.2%, not 120%.
+    Threshold: abs(f) > 1.0 (v2.3.0: tighter than _as_fraction for expected_roi_* fields).
+    Use for expected_roi_* / expected_return_* / percent_change style fields.
     """
     f = _safe_float(x)
     if f is None:
@@ -181,7 +162,7 @@ def _env_float(name: str, default: float) -> float:
 
 
 # =============================================================================
-# Recommendation label normalization
+# Recommendation label normalization (v2.4.0)
 # =============================================================================
 CANONICAL_RECOMMENDATION_CODES: Tuple[str, ...] = (
     "STRONG_BUY",
@@ -193,27 +174,27 @@ CANONICAL_RECOMMENDATION_CODES: Tuple[str, ...] = (
 
 RECOMMENDATION_LABEL_MAP: Dict[str, str] = {
     "STRONG_BUY": "Strong Buy",
-    "BUY": "Buy",
-    "HOLD": "Hold",
-    "REDUCE": "Reduce",
-    "SELL": "Sell",
+    "BUY":        "Buy",
+    "HOLD":       "Hold",
+    "REDUCE":     "Reduce",
+    "SELL":       "Sell",
 }
 
 _RECOMMENDATION_CODE_ALIASES: Dict[str, str] = {
     "STRONG_BUY": "STRONG_BUY",
-    "STRONGBUY": "STRONG_BUY",
+    "STRONGBUY":  "STRONG_BUY",
     "STRONG-BUY": "STRONG_BUY",
     "STRONG BUY": "STRONG_BUY",
-    "BUY": "BUY",
+    "BUY":        "BUY",
     "ACCUMULATE": "BUY",
-    "ADD": "BUY",
-    "HOLD": "HOLD",
-    "NEUTRAL": "HOLD",
-    "REDUCE": "REDUCE",
-    "TRIM": "REDUCE",
-    "SELL": "SELL",
-    "AVOID": "SELL",
-    "EXIT": "SELL",
+    "ADD":        "BUY",
+    "HOLD":       "HOLD",
+    "NEUTRAL":    "HOLD",
+    "REDUCE":     "REDUCE",
+    "TRIM":       "REDUCE",
+    "SELL":       "SELL",
+    "AVOID":      "SELL",
+    "EXIT":       "SELL",
 }
 
 
@@ -235,7 +216,9 @@ def normalize_recommendation_code(label: Any) -> str:
     token = _normalize_label_token(label)
     if not token:
         return "HOLD"
-    return _RECOMMENDATION_CODE_ALIASES.get(token, token if token in CANONICAL_RECOMMENDATION_CODES else "HOLD")
+    return _RECOMMENDATION_CODE_ALIASES.get(
+        token, token if token in CANONICAL_RECOMMENDATION_CODES else "HOLD"
+    )
 
 
 def normalize_recommendation_label(label: Any) -> str:
@@ -251,8 +234,6 @@ def normalize_recommendation_label(label: Any) -> str:
 # =============================================================================
 @dataclass(slots=True)
 class ScoreWeights:
-    # NOTE: These weights govern the overall_score computation in scoring.py.
-    # top10_selector.py may use a separate selector ranking model on top.
     w_valuation: float = 0.30
     w_momentum: float = 0.25
     w_quality: float = 0.20
@@ -438,7 +419,7 @@ def _derive_forecast_patch(row: Mapping[str, Any], forecasts: ForecastParameters
         "forecast_price_1m",
     )
 
-    roi1 = _as_roi_fraction(_get(row, "expected_roi_1m", "expected_return_1m"))
+    roi1 = _as_fraction(_get(row, "expected_roi_1m", "expected_return_1m"))
     roi3 = _as_roi_fraction(_get(row, "expected_roi_3m", "expected_return_3m"))
     roi12 = _as_roi_fraction(_get(row, "expected_roi_12m", "expected_return_12m"))
 
@@ -565,10 +546,7 @@ def _valuation_score(row: Mapping[str, Any]) -> Optional[float]:
     if price is None or price <= 0:
         return None
 
-    fair = _getf(
-        row, "intrinsic_value", "fair_value", "target_price",
-        "forecast_price_3m", "forecast_price_12m", "forecast_price_1m",
-    )
+    fair = _getf(row, "intrinsic_value", "fair_value", "target_price", "forecast_price_3m", "forecast_price_12m", "forecast_price_1m")
     upside = None
     if fair is not None and fair > 0:
         upside = (fair / price) - 1.0
@@ -694,12 +672,8 @@ def _risk_score(row: Mapping[str, Any]) -> Optional[float]:
     return _round(100.0 * _clamp(sum(w * v for w, v in parts) / max(1e-9, wsum), 0.0, 1.0), 2)
 
 
-def _opportunity_score(
-    row: Mapping[str, Any],
-    valuation: Optional[float],
-    momentum: Optional[float],
-) -> Optional[float]:
-    roi1 = _as_roi_fraction(_get(row, "expected_roi_1m", "expected_return_1m"))
+def _opportunity_score(row: Mapping[str, Any], valuation: Optional[float], momentum: Optional[float]) -> Optional[float]:
+    roi1 = _as_fraction(_get(row, "expected_roi_1m", "expected_return_1m"))
     roi3 = _as_roi_fraction(_get(row, "expected_roi_3m", "expected_return_3m"))
     roi12 = _as_roi_fraction(_get(row, "expected_roi_12m", "expected_return_12m"))
 
@@ -732,12 +706,7 @@ def _opportunity_score(
     return _round(100.0 * _clamp(0.60 * v + 0.40 * m, 0.0, 1.0), 2)
 
 
-def _recommendation(
-    overall: Optional[float],
-    risk: Optional[float],
-    confidence100: Optional[float],
-    roi3: Optional[float],
-) -> Tuple[str, str]:
+def _recommendation(overall: Optional[float], risk: Optional[float], confidence100: Optional[float], roi3: Optional[float]) -> Tuple[str, str]:
     if overall is None:
         return "HOLD", "Insufficient data to score reliably."
 
@@ -766,6 +735,10 @@ def _recommendation(
 # Public API
 # =============================================================================
 def compute_scores(row: Dict[str, Any], *, settings: Any = None) -> Dict[str, Any]:
+    """
+    Main entrypoint.
+    Returns a patch dict to merge into row.
+    """
     source = dict(row or {})
     scoring_errors: List[str] = []
 
@@ -826,7 +799,7 @@ def compute_scores(row: Dict[str, Any], *, settings: Any = None) -> Dict[str, An
     rb = _risk_bucket(risk)
     cb = _confidence_bucket(conf01)
 
-    roi3 = _as_roi_fraction(working.get("expected_roi_3m"))
+    roi3 = _as_fraction(working.get("expected_roi_3m"))
     rec, reason = _recommendation(overall, risk, confidence100, roi3)
 
     scores = AssetScores(
@@ -879,17 +852,13 @@ def enrich_with_scores(row: Dict[str, Any], *, settings: Any = None, in_place: b
 
 
 class ScoringEngine:
-    """Lightweight wrapper to support object-style callers and bridge modules."""
+    """
+    Lightweight wrapper to support object-style callers and later bridge modules.
+    """
 
     version = SCORING_VERSION
 
-    def __init__(
-        self,
-        *,
-        settings: Any = None,
-        weights: Optional[ScoreWeights] = None,
-        forecasts: Optional[ForecastParameters] = None,
-    ):
+    def __init__(self, *, settings: Any = None, weights: Optional[ScoreWeights] = None, forecasts: Optional[ForecastParameters] = None):
         self.settings = settings
         self.weights = weights or replace(DEFAULT_WEIGHTS)
         self.forecasts = forecasts or replace(DEFAULT_FORECASTS)
@@ -904,16 +873,12 @@ class ScoringEngine:
 # =============================================================================
 # Ranking helpers
 # =============================================================================
-def _rank_sort_tuple(
-    row: Dict[str, Any],
-    *,
-    key_overall: str = "overall_score",
-) -> Tuple[float, float, float, float, float, str]:
+def _rank_sort_tuple(row: Dict[str, Any], *, key_overall: str = "overall_score") -> Tuple[float, float, float, float, float, str]:
     overall = _norm_score_0_100(row.get(key_overall))
     opp = _norm_score_0_100(row.get("opportunity_score"))
     conf = _norm_score_0_100(row.get("confidence_score"))
     risk = _norm_score_0_100(row.get("risk_score"))
-    roi3 = _as_roi_fraction(row.get("expected_roi_3m"))
+    roi3 = _as_fraction(row.get("expected_roi_3m"))
 
     return (
         overall if overall is not None else -1e9,
@@ -943,11 +908,7 @@ def assign_rank_overall(
     return target
 
 
-def rank_rows_by_overall(
-    rows: List[Dict[str, Any]],
-    *,
-    key_overall: str = "overall_score",
-) -> List[Dict[str, Any]]:
+def rank_rows_by_overall(rows: List[Dict[str, Any]], *, key_overall: str = "overall_score") -> List[Dict[str, Any]]:
     return assign_rank_overall(rows, key_overall=key_overall, inplace=True, rank_key="rank_overall")
 
 
