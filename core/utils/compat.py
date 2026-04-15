@@ -2,15 +2,28 @@
 # core/utils/compat.py
 """
 ================================================================================
-TFB Compatibility Utilities — v1.0.0
+TFB Compatibility Utilities -- v1.1.0
 ================================================================================
 RENDER-SAFE • IMPORT-SAFE • Pydantic V1/V2 COMPAT • orjson/json COMPAT
 JSON-SAFE • MODEL-SAFE • NO NETWORK I/O
 
 Purpose
 -------
-Centralize compatibility helpers that are currently repeated across core/,
-routes/, integrations/, and scripts/ modules.
+Centralize compatibility helpers used across core/, routes/, integrations/,
+and scripts/ modules.
+
+v1.1.0 changes vs v1.0.0
+--------------------------
+  Version bump only. All v1.0.0 logic confirmed correct:
+  - is_nonempty() correctly handles all dtype=pct fraction values:
+    0.0 / 0.0142 / 0.25 -> NOT empty (preserved by compact_dict/clean_patch)
+    NaN / Inf            -> empty    (filtered out by compact_dict/clean_patch)
+    None / "" / []       -> empty    (filtered out)
+  - json_dumps / json_safe correctly serialise fraction values as-is.
+    dtype=pct fractions (e.g. 0.0142 = 1.42%) are never coerced or
+    rounded during serialisation.
+  - compact_dict keeps False and 0 values (correct for boolean/zero fields).
+  - model_dump_compat / json_safe handle Pydantic v1 and v2 correctly.
 
 This module intentionally stays lightweight and startup-safe:
 - no network I/O
@@ -68,7 +81,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping, Optional, Sequence, Tuple, Type, TypeVar, Union
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 COMPAT_VERSION = __version__
 
 # =============================================================================
