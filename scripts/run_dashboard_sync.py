@@ -3,22 +3,31 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.3.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.4.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
-v6.3.0 fixes (targets your recurring ❌ causes)
-- ✅ Sheets-safe ALWAYS: backend rows (dicts or lists) -> strict 2D matrix (pads/truncates to header length)
-- ✅ JSON-safe value coercion for Google API (datetime/Enum/set/etc -> primitives)
-- ✅ Key parsing is robust: --keys supports space, comma, semicolon, JSON array-like tokens
-- ✅ Stronger backend compatibility: sends sheet/sheet_name/page/name/tab + tickers/symbols + request_id
-- ✅ Health preflight probes /readyz + /health + /livez (best-effort)
-- ✅ Credentials loader hardened: supports GOOGLE_APPLICATION_CREDENTIALS file + env JSON + env base64; fixes "\\n" private_key
-- ✅ Never runs forbidden legacy keys (KSA_TADAWUL / ADVISOR_CRITERIA)
-- ✅ Deterministic exit codes:
-    0 = all success
-    1 = partial (some partial/skipped) but no hard failures
-    2 = one or more failed
+v6.4.0 fixes
+- FIX: Added dedup guard before Sheets write. When the backend returns duplicate
+  symbol rows (e.g. a symbol appears on two source pages), all duplicates after
+  the first occurrence are dropped before writing to Google Sheets.
+- FIX: Added run_from_worker_payload() — programmatic entry point for worker.py.
+  In v6.3.0, worker.py had to construct a fake argparse.Namespace to call
+  main_async(), which broke whenever new CLI args were added. Now worker.py
+  calls run_from_worker_payload(payload) directly.
+- ENH: Added WORKER_PAYLOAD_SCHEMA dict — documents the contract for the
+  task_type="dashboard_sync" payload sent by worker.py. Prevents silent schema
+  drift between worker.py and this module.
+
+v6.3.0 fixes
+- Sheets-safe ALWAYS: backend rows (dicts or lists) -> strict 2D matrix
+- JSON-safe value coercion for Google API
+- Key parsing is robust: supports space, comma, semicolon, JSON array-like tokens
+- Stronger backend compatibility: sends sheet/page/name/tab + tickers/symbols
+- Health preflight probes /readyz + /health + /livez
+- Credentials loader hardened
+- Never runs forbidden legacy keys (KSA_TADAWUL / ADVISOR_CRITERIA)
+- Exit codes: 0 = success, 1 = partial, 2 = failed
 
 Design rules
 - No network calls at import-time.
@@ -46,7 +55,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.3.0"
+SCRIPT_VERSION = "6.4.0"
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -876,6 +885,34 @@ async def _run_one_task(
         res.gateway_used = f"{task.gateway}:{used_endpoint}" if used_endpoint else task.gateway
         res.symbols_processed = len(symbols)
 
+        # FIX v6.4.0: Dedup guard before Sheets write.
+        # When the backend returns duplicate symbol rows (e.g. a symbol appears
+        # in two source pages, or data_engine_v2 emits the same symbol twice
+        # before its v5.48.0 dedup fix is deployed), we drop all but the first
+        # occurrence here to prevent duplicate rows in Google Sheets.
+        if rows_matrix:
+            # Find the symbol column index (column 0 is almost always Symbol,
+            # but check headers to be safe — look for "symbol" or "ticker")
+            sym_col_idx: Optional[int] = None
+            for col_idx, h in enumerate(headers):
+                if str(h).strip().lower() in ("symbol", "ticker", "requestedsymbol"):
+                    sym_col_idx = col_idx
+                    break
+            if sym_col_idx is not None:
+                seen_syms: set = set()
+                deduped: List[List[Any]] = []
+                for row in rows_matrix:
+                    sym_val = str(row[sym_col_idx] or "").strip().upper() if sym_col_idx < len(row) else ""
+                    if not sym_val or sym_val not in seen_syms:
+                        if sym_val:
+                            seen_syms.add(sym_val)
+                        deduped.append(row)
+                dropped = len(rows_matrix) - len(deduped)
+                if dropped > 0:
+                    logger.info("Dedup: dropped %d duplicate symbol rows for %s", dropped, task.sheet_name)
+                    res.warnings.append(f"Dedup: dropped {dropped} duplicate symbol rows before write.")
+                rows_matrix = deduped
+
         # No creds => partial (data fetched but not written)
         if sheets is None or sheets._get_service() is None:
             res.status = "partial"
@@ -1103,6 +1140,141 @@ def main() -> int:
     except Exception as e:
         logger.exception("Unhandled error: %s", e)
         return 2
+
+
+# =============================================================================
+# Worker integration API
+# =============================================================================
+
+# FIX v6.4.0: Documents the expected task payload schema for worker.py.
+# When worker.py dispatches task_type="dashboard_sync", it should send a dict
+# matching these fields. Previously undocumented, causing silent schema drift.
+WORKER_PAYLOAD_SCHEMA: Dict[str, Any] = {
+    "task_type": "dashboard_sync",        # (required) always "dashboard_sync"
+    "keys": [],                           # (optional) list[str] — subset of ALLOWED_KEYS to sync
+                                          #   e.g. ["MARKET_LEADERS", "GLOBAL_MARKETS"]
+                                          #   omit or empty = sync all default tasks
+    "spreadsheet_id": "",                 # (optional) override DEFAULT_SPREADSHEET_ID
+    "backend_url": "",                    # (optional) override BACKEND_BASE_URL
+    "start_cell": "A5",                   # (optional) header start cell, default A5
+    "max_symbols": -1,                    # (optional) -1 = use per-task defaults
+    "workers": 4,                         # (optional) parallel task workers
+    "clear_before_write": False,          # (optional) clear sheet range before writing
+    "dry_run": False,                     # (optional) fetch data but don't write sheets
+    "timeout_sec": 30,                    # (optional) backend request timeout
+    "no_lock": False,                     # (optional) skip Redis distributed lock
+    # --- worker tracing fields (added by worker.py, not required here) ---
+    "task_id": "",                        # worker task UUID for correlation
+    "queued_at": "",                      # ISO timestamp when task was queued
+    "retry_count": 0,                     # number of times this task has been retried
+}
+
+
+async def run_from_worker_payload_async(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Programmatic entry point for worker.py (async version).
+
+    FIX v6.4.0: In v6.3.0, worker.py had to call main_async() by constructing
+    a fake argparse.Namespace. This broke whenever new --args were added to the
+    CLI parser. Now worker.py calls this function directly with the task payload.
+
+    Args:
+        payload: Dict matching WORKER_PAYLOAD_SCHEMA.
+
+    Returns:
+        Dict with keys: status, exit_code, summary, errors.
+        status: "success" | "partial" | "failed"
+        exit_code: 0 | 1 | 2
+    """
+    task_id = str(payload.get("task_id") or uuid.uuid4())
+    logger.info("run_from_worker_payload: task_id=%s", task_id)
+
+    # Validate required fields
+    task_type = str(payload.get("task_type") or "").strip()
+    if task_type and task_type != "dashboard_sync":
+        return {
+            "status": "failed",
+            "exit_code": 2,
+            "errors": [f"run_from_worker_payload: expected task_type='dashboard_sync', got {task_type!r}"],
+            "summary": {},
+            "task_id": task_id,
+        }
+
+    # Build a minimal argv list from payload so main_async() stays the single
+    # source of truth for arg parsing. This avoids duplicating logic here.
+    argv: List[str] = []
+
+    spreadsheet_id = str(payload.get("spreadsheet_id") or "").strip()
+    if spreadsheet_id:
+        argv += ["--sheet-id", spreadsheet_id]
+
+    backend_url = str(payload.get("backend_url") or "").strip()
+    if backend_url:
+        argv += ["--backend", backend_url]
+
+    keys = payload.get("keys") or []
+    if isinstance(keys, list) and keys:
+        argv += ["--keys"] + [str(k) for k in keys]
+    elif isinstance(keys, str) and keys.strip():
+        argv += ["--keys", keys.strip()]
+
+    start_cell = str(payload.get("start_cell") or "A5").strip()
+    argv += ["--start-cell", start_cell]
+
+    max_symbols = payload.get("max_symbols", -1)
+    argv += ["--max-symbols", str(max_symbols)]
+
+    workers = payload.get("workers", 4)
+    argv += ["--workers", str(workers)]
+
+    timeout_sec = payload.get("timeout_sec", 30)
+    argv += ["--timeout", str(timeout_sec)]
+
+    if payload.get("clear_before_write"):
+        argv.append("--clear")
+
+    if payload.get("dry_run"):
+        argv.append("--dry-run")
+
+    if payload.get("no_lock"):
+        argv.append("--no-lock")
+
+    try:
+        exit_code = await main_async(argv)
+        status = "success" if exit_code == 0 else ("partial" if exit_code == 1 else "failed")
+        return {
+            "status": status,
+            "exit_code": exit_code,
+            "errors": [],
+            "summary": {},
+            "task_id": task_id,
+        }
+    except Exception as e:
+        logger.exception("run_from_worker_payload failed: %s", e)
+        return {
+            "status": "failed",
+            "exit_code": 2,
+            "errors": [str(e)],
+            "summary": {},
+            "task_id": task_id,
+        }
+
+
+def run_from_worker_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Sync wrapper for worker.py (which runs in a sync context).
+    Calls run_from_worker_payload_async() via asyncio.run().
+    """
+    try:
+        return asyncio.run(run_from_worker_payload_async(payload))
+    except Exception as e:
+        return {
+            "status": "failed",
+            "exit_code": 2,
+            "errors": [str(e)],
+            "summary": {},
+            "task_id": str(payload.get("task_id") or ""),
+        }
 
 
 if __name__ == "__main__":
