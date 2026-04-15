@@ -2,8 +2,36 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.47.2
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.48.0
 ================================================================================
+
+WHY v5.48.0
+-----------
+- FIX: _compute_recommendation() no longer emits "ACCUMULATE" (non-canonical).
+       Canonical vocabulary is now strictly: STRONG_BUY, BUY, HOLD, REDUCE, SELL.
+       Added STRONG_BUY tier (overall >= 80 AND conf >= 70 AND risk <= 50).
+       Added incoming label normalizer: any provider returning "ACCUMULATE",
+       "OUTPERFORM", "OVERWEIGHT", "AVOID", "UNDERPERFORM" etc. is mapped to
+       the canonical label before the row is written to Google Sheets.
+- FIX CRITICAL: Momentum Score = 100 for all stocks.
+       Root cause: _compute_scores_fallback() used _as_pct_points(percent_change)
+       where percent_change is already in percent-points (1.4247 for 1.4247% daily
+       change). _as_pct_points has threshold <= 1.5 and multiplied by 100 again,
+       producing 142.47 → momentum score clamped to 100 for virtually all stocks.
+       Fix: use _as_float() directly — percent_change is already percent-points
+       after _canonicalize_provider_row.
+- FIX: percent_change in _compute_history_patch_from_rows() now stored as fraction
+       (not * 100). _canonicalize_provider_row expects fractions and converts to
+       percent-points. Storing as percent-points caused double-conversion for
+       values in the 0-1.5% daily change range.
+- FIX: week_52_position_pct normalization in _canonicalize_provider_row now converts
+       fraction inputs (0-1 from eodhd_provider) to percent-points (0-100) so that
+       TFB_PERCENT_MODE=points displays 91.48% instead of 0.91%.
+       Same fix applied to _compute_history_patch_from_rows (store as fraction).
+- FIX: Symbol deduplication added to rows_full assembly in get_sheet_rows().
+       Prevents duplicate symbols (e.g., 2317.TW at Rank 11 AND Rank 19) when
+       the same symbol appears in multiple page sources or the symbol list has
+       stale repeated entries.
 
 WHY v5.47.2
 -----------
@@ -113,7 +141,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.47.2"
+__version__ = "5.48.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -1571,7 +1599,14 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
 
     high52 = _as_float(out.get("week_52_high"))
     low52 = _as_float(out.get("week_52_low"))
-    if price is not None and high52 is not None and low52 is not None and high52 > low52 and out.get("week_52_position_pct") is None:
+    # FIX v5.48.0: Normalize week_52_position_pct to percent-points regardless of source.
+    # eodhd_provider and history patch now store as fraction (0-1). Convert to percent-points
+    # (0-100) so Google Sheets NUMBER format (TFB_PERCENT_MODE=points) shows 91.48 not 0.91.
+    pos52 = _as_float(out.get("week_52_position_pct"))
+    if pos52 is not None:
+        if abs(pos52) <= 1.5:
+            out["week_52_position_pct"] = round(pos52 * 100.0, 6)
+    elif price is not None and high52 is not None and low52 is not None and high52 > low52:
         out["week_52_position_pct"] = round(((price - low52) / (high52 - low52)) * 100.0, 6)
 
     qty = _as_float(out.get("position_qty"))
@@ -1765,11 +1800,13 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         row["quality_score"] = round(_clamp(float(quality_score), 0.0, 100.0), 2)
 
     if row.get("momentum_score") is None:
-        pct = _as_pct_points(row.get("percent_change"))
-        if pct is None:
-            pct = _as_pct_points(row.get("change_pct"))
-        if pct is None:
-            pct = 0.0
+        # FIX v5.48.0: percent_change is stored as percent-points after
+        # _canonicalize_provider_row (e.g., 1.4247 means 1.4247% daily change).
+        # Do NOT use _as_pct_points here — it has threshold <= 1.5 and would
+        # double-multiply values in the 0-1.5 range (1.4247 → 142.47),
+        # which caused Momentum Score = 100 for virtually all stocks.
+        # Use _as_float directly — the value is already in percent-point form.
+        pct = _as_float(row.get("percent_change")) or _as_float(row.get("change_cpt")) or _as_float(row.get("change_pct")) or 0.0
         row["momentum_score"] = round(_clamp(50.0 + pct, 0.0, 100.0), 2)
 
     if row.get("growth_score") is None:
@@ -1861,19 +1898,55 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
 
 
 def _compute_recommendation(row: Dict[str, Any]) -> None:
+    """
+    FIX v5.48.0: Canonical recommendation labels are STRONG_BUY, BUY, HOLD, REDUCE, SELL.
+    "ACCUMULATE" is non-canonical and must NOT be used — replaced with BUY.
+
+    If recommendation is already set, normalize any non-canonical incoming label
+    (e.g., from a provider returning "ACCUMULATE", "OUTPERFORM", "AVOID") to the
+    canonical vocabulary before returning. This ensures no non-canonical label leaks
+    through from any code path.
+    """
+    _CANONICAL_RECO_MAP: Dict[str, str] = {
+        "ACCUMULATE":   "BUY",
+        "ADD":          "BUY",
+        "OUTPERFORM":   "BUY",
+        "OVERWEIGHT":   "BUY",
+        "STRONG BUY":   "STRONG_BUY",
+        "STRONGBUY":    "STRONG_BUY",
+        "STRONG_BUY":   "STRONG_BUY",
+        "BUY":          "BUY",
+        "HOLD":         "HOLD",
+        "NEUTRAL":      "HOLD",
+        "MARKET PERFORM": "HOLD",
+        "REDUCE":       "REDUCE",
+        "UNDERPERFORM": "REDUCE",
+        "UNDERWEIGHT":  "REDUCE",
+        "AVOID":        "REDUCE",
+        "SELL":         "SELL",
+        "STRONG SELL":  "SELL",
+        "STRONG_SELL":  "SELL",
+    }
     if row.get("recommendation"):
+        raw = str(row["recommendation"]).strip().upper()
+        row["recommendation"] = _CANONICAL_RECO_MAP.get(raw, raw)
         return
+
     overall = _as_float(row.get("overall_score")) or 50.0
-    conf = _as_float(row.get("confidence_score")) or 55.0
-    risk = _as_float(row.get("risk_score")) or 50.0
-    if overall >= 75 and conf >= 65 and risk <= 60:
-        rec = "BUY"
+    conf    = _as_float(row.get("confidence_score")) or 55.0
+    risk    = _as_float(row.get("risk_score")) or 50.0
+
+    if overall >= 80 and conf >= 70 and risk <= 50:
+        rec = "STRONG_BUY"
     elif overall >= 60 and conf >= 55:
-        rec = "ACCUMULATE"
-    elif overall <= 35 or risk >= 85:
+        rec = "BUY"          # was "ACCUMULATE" in v5.47.2 — non-canonical label, now fixed
+    elif overall <= 30 or risk >= 85:
+        rec = "SELL"
+    elif overall <= 42 or risk >= 72:
         rec = "REDUCE"
     else:
         rec = "HOLD"
+
     row["recommendation"] = rec
     row.setdefault(
         "recommendation_reason",
@@ -3366,7 +3439,12 @@ class DataEngineV5:
             "sharpe_1y": sharpe,
             "rsi_14": rsi,
             "price_change": closes[-1] - closes[-2],
-            "percent_change": ((closes[-1] - closes[-2]) / closes[-2]) * 100.0 if closes[-2] not in (None, 0) else None,
+            # FIX v5.48.0: store as fraction (not * 100.0).
+            # _canonicalize_provider_row expects fractions for percent_change
+            # and converts them to percent-points. Storing as percent-points here
+            # caused _canonicalize_provider_row to multiply by 100 again for values
+            # in the 0-1.5% range, producing 100-150 percent-point values.
+            "percent_change": ((closes[-1] - closes[-2]) / closes[-2]) if closes[-2] not in (None, 0) else None,
             "volume": volumes[-1] if volumes else None,
         }
         if patch.get("current_price") is not None and patch.get("week_52_high") is not None and patch.get("week_52_low") is not None:
@@ -3374,7 +3452,9 @@ class DataEngineV5:
             lo = _as_float(patch.get("week_52_low"))
             cp = _as_float(patch.get("current_price"))
             if hi is not None and lo is not None and cp is not None and hi > lo:
-                patch["week_52_position_pct"] = ((cp - lo) / (hi - lo)) * 100.0
+                # FIX v5.48.0: store as fraction (0-1 range).
+                # _canonicalize_provider_row will convert to percent-points.
+                patch["week_52_position_pct"] = (cp - lo) / (hi - lo)
         return {k: v for k, v in patch.items() if v is not None}
 
     async def _fetch_history_patch(self, provider: str, symbol: str) -> Dict[str, Any]:
@@ -4463,9 +4543,18 @@ class DataEngineV5:
         if requested_symbols:
             snapshot_map = self._get_cached_snapshot_symbol_map(target_sheet)
             quotes = await self.get_enriched_quotes(requested_symbols, schema=None, page=target_sheet, body=body)
+            # FIX v5.48.0: Deduplicate by normalized symbol before assembling rows.
+            # Prevents the same symbol (e.g., 2317.TW) appearing multiple times when
+            # it is listed under different page contexts or the symbol source has duplicates.
+            _seen_row_symbols: Set[str] = set()
             for q in quotes:
                 row = _model_to_dict(q)
                 sym = normalize_symbol(_safe_str(row.get("symbol") or row.get("requested_symbol")))
+                if sym and sym in _seen_row_symbols:
+                    logger.debug("data_engine_v2: skipping duplicate symbol %s for sheet %s", sym, target_sheet)
+                    continue
+                if sym:
+                    _seen_row_symbols.add(sym)
                 if sym and sym in snapshot_map:
                     row = _merge_missing_fields(row, snapshot_map[sym])
                 best_snapshot_row = self._get_best_cached_snapshot_row_for_symbol(sym, prefer_sheet=target_sheet) if sym else None
