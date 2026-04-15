@@ -2,20 +2,46 @@
 # core/analysis/insights_builder.py
 """
 ================================================================================
-Insights Analysis Builder — v1.7.0
-(SCHEMA-FIRST / TIME-BOXED / TOP10-CONTEXT-AWARE / IMPORT-SAFE / NUMERIC-SAFE)
+Insights Analysis Builder -- v2.0.0
+(EXECUTIVE-LAYOUT / 4-SECTION / SCHEMA-10-COL / SCENARIO-AWARE / TIME-BOXED)
 ================================================================================
 Tadawul Fast Bridge (TFB)
 
-What this revision improves
-- FIX: keeps PS/runtime-compatible payload parsing for rows / row_objects / rows_matrix.
-- FIX: adds per-call async timeout guards for quote and Top10 lookups.
-- FIX: adds a soft overall build budget so Insights can finish before outer route timeouts.
-- FIX: keeps Build Status and warning rows always present even when upstream calls degrade.
-- FIX: emits meta.warnings for downstream route diagnostics.
-- SAFE: no network calls at import time.
-- SAFE: best-effort engine access only.
-- SAFE: builder never raises for normal route execution; returns schema-correct rows.
+v2.0.0 changes vs v1.7.0
+--------------------------
+FIX: Schema updated to 10 columns (schema_registry v3.0.0).
+  Old fallback was 7 columns. New: section, category, item, symbol, metric,
+  value, signal, score, notes, last_updated_riyadh.
+  All _make_row() calls now populate the 3 new columns.
+
+FIX: _make_row() signature extended with category, signal, score parameters.
+  Callers using keyword args are fully backward-compatible (all new params
+  default to empty/"").
+
+REDESIGN: Executive 4-section layout replacing the raw universe-snapshot rows.
+  Section 1 -- Market Summary     (one sub-row per universe with trend signal)
+  Section 2 -- Risk Scenarios     (3 rows: Conservative / Moderate / Aggressive)
+  Section 3 -- Top Opportunities  (Top 10 ranked with score + signal)
+  Section 4 -- Portfolio Health   (P/L KPIs with OK/WARN/ALERT signal)
+
+  Sections are controlled by criteria_model.AdvisorCriteria include flags:
+    include_market_summary, include_risk_scenarios,
+    include_top_opportunities, include_portfolio_health.
+  All default to True; callers can disable individual sections.
+
+ENH: Integrates criteria_model.signal_for_value() for consistent Signal column.
+ENH: Integrates criteria_model.build_scenario_specs() for Risk Scenarios section.
+ENH: Portfolio Health now counts at-risk positions (risk_score > max_risk) and
+  day P/L from My_Portfolio's day_pl field.
+ENH: Market Summary derives a BULLISH/BEARISH/NEUTRAL trend signal per universe
+  from average percent_change and average overall_score.
+
+Preserved from v1.7.0:
+  All async timeout guards and build budget logic.
+  All engine integration patterns (batch, per-symbol, fallback chains).
+  All payload parsing helpers (_coerce_rows_list, etc.).
+  build_criteria_rows() API is unchanged.
+  get_insights_schema() API is unchanged.
 ================================================================================
 """
 
@@ -32,19 +58,43 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 logger = logging.getLogger("core.analysis.insights_builder")
 logger.addHandler(logging.NullHandler())
 
-INSIGHTS_BUILDER_VERSION = "1.7.0"
+INSIGHTS_BUILDER_VERSION = "2.0.0"
 _RIYADH_TZ = timezone(timedelta(hours=3))
-_FALLBACK_KEYS = ["section", "item", "symbol", "metric", "value", "notes", "last_updated_riyadh"]
-_FALLBACK_HEADERS = ["Section", "Item", "Symbol", "Metric", "Value", "Notes", "Last Updated (Riyadh)"]
-_DEFAULT_QUOTES_TIMEOUT_SEC = float(os.getenv("TFB_INSIGHTS_QUOTES_TIMEOUT_SEC", "4.0") or "4.0")
-_DEFAULT_TOP10_TIMEOUT_SEC = float(os.getenv("TFB_INSIGHTS_TOP10_TIMEOUT_SEC", "4.0") or "4.0")
-_DEFAULT_BUILD_BUDGET_SEC = float(os.getenv("TFB_INSIGHTS_BUILD_BUDGET_SEC", "10.0") or "10.0")
-_DEFAULT_MAX_SYMBOLS_PER_UNIVERSE = int(os.getenv("TFB_INSIGHTS_MAX_SYMBOLS_PER_UNIVERSE", "12") or "12")
+
+# 10-column schema (aligned with schema_registry v3.0.0)
+_FALLBACK_KEYS = [
+    "section", "category", "item", "symbol",
+    "metric", "value", "signal", "score",
+    "notes", "last_updated_riyadh",
+]
+_FALLBACK_HEADERS = [
+    "Section", "Category", "Item", "Symbol",
+    "Metric", "Value", "Signal", "Score",
+    "Notes", "Last Updated (Riyadh)",
+]
+
+# Signal vocabulary (matches schema_registry Signal col description)
+_SIGNAL_UP       = "UP"
+_SIGNAL_DOWN     = "DOWN"
+_SIGNAL_NEUTRAL  = "NEUTRAL"
+_SIGNAL_HIGH     = "HIGH"
+_SIGNAL_MODERATE = "MODERATE"
+_SIGNAL_LOW      = "LOW"
+_SIGNAL_OK       = "OK"
+_SIGNAL_WARN     = "WARN"
+_SIGNAL_ALERT    = "ALERT"
+
+# Env-configurable timeouts
+_DEFAULT_QUOTES_TIMEOUT_SEC     = float(os.getenv("TFB_INSIGHTS_QUOTES_TIMEOUT_SEC", "4.0") or "4.0")
+_DEFAULT_TOP10_TIMEOUT_SEC      = float(os.getenv("TFB_INSIGHTS_TOP10_TIMEOUT_SEC", "4.0") or "4.0")
+_DEFAULT_BUILD_BUDGET_SEC       = float(os.getenv("TFB_INSIGHTS_BUILD_BUDGET_SEC", "10.0") or "10.0")
+_DEFAULT_MAX_SYMBOLS_PER_UNIV   = int(os.getenv("TFB_INSIGHTS_MAX_SYMBOLS_PER_UNIVERSE", "12") or "12")
 
 
-# -----------------------------------------------------------------------------
-# Small utils
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Small utilities
+# =============================================================================
+
 def _safe_str(v: Any) -> str:
     try:
         return str(v).strip()
@@ -73,9 +123,7 @@ def _as_fraction(v: Any) -> Optional[float]:
     x = _as_float(v)
     if x is None:
         return None
-    if abs(x) >= 1.5:
-        return x / 100.0
-    return x
+    return x / 100.0 if abs(x) >= 1.5 else x
 
 
 def _as_int(v: Any) -> Optional[int]:
@@ -91,9 +139,7 @@ def _pct_points(v: Any) -> Optional[float]:
     x = _as_float(v)
     if x is None:
         return None
-    if abs(x) <= 1.5:
-        return x * 100.0
-    return x
+    return x * 100.0 if abs(x) <= 1.5 else x
 
 
 def _fmt_pct(v: Any) -> str:
@@ -101,15 +147,15 @@ def _fmt_pct(v: Any) -> str:
     return "" if x is None else f"{x:.2f}%"
 
 
-def _fmt_num(v: Any) -> str:
+def _fmt_num(v: Any, decimals: int = 2) -> str:
     x = _as_float(v)
-    return _safe_str(v) if x is None else f"{x:.2f}"
+    return _safe_str(v) if x is None else f"{x:.{decimals}f}"
 
 
 def _csv_list(raw: str) -> List[str]:
     items = [p.strip() for p in (raw or "").replace("\n", ",").split(",") if p.strip()]
+    seen: set = set()
     out: List[str] = []
-    seen = set()
     for item in items:
         if item not in seen:
             seen.add(item)
@@ -141,7 +187,7 @@ def _safe_bool(v: Any, default: bool = False) -> bool:
 
 def _dedupe_keep_order(values: Iterable[Any]) -> List[str]:
     out: List[str] = []
-    seen = set()
+    seen: set = set()
     for value in values:
         s = _safe_str(value)
         if not s or s in seen:
@@ -156,35 +202,15 @@ def _rows_to_matrix(rows: Sequence[Mapping[str, Any]], keys: Sequence[str]) -> L
     return [[row.get(k, "") for k in key_list] for row in rows if isinstance(row, Mapping)]
 
 
-def _is_probable_symbol_token(value: Any) -> bool:
-    s = _safe_str(value)
-    if not s or len(s) > 32:
-        return False
-    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._=^-:")
-    return all(ch in allowed for ch in s)
-
-
-def _is_signature_mismatch_typeerror(exc: TypeError) -> bool:
-    msg = _safe_str(exc).lower()
-    markers = (
-        "unexpected keyword",
-        "positional argument",
-        "required positional argument",
-        "takes no keyword",
-        "takes from",
-        "takes exactly",
-        "got an unexpected keyword",
-        "got multiple values for argument",
-        "missing 1 required positional argument",
-        "missing required positional argument",
-        "keyword-only argument",
-    )
-    return any(marker in msg for marker in markers)
+def _avg(vals: List[float]) -> Optional[float]:
+    return None if not vals else sum(vals) / float(len(vals))
 
 
 def _remaining_budget(deadline: Optional[float]) -> Optional[float]:
     if deadline is None:
         return None
+    remaining = asyncio.get_running_loop().time() - deadline
+    # Note: deadline - current_time
     remaining = deadline - asyncio.get_running_loop().time()
     return max(0.01, remaining)
 
@@ -201,26 +227,94 @@ async def _await_with_timeout(awaitable: Any, timeout_sec: Optional[float], labe
         raise TimeoutError(f"{label} timed out after {timeout_sec:.2f}s") from exc
 
 
-# -----------------------------------------------------------------------------
-# Dict/model extraction helpers
-# -----------------------------------------------------------------------------
+def _is_signature_mismatch_typeerror(exc: TypeError) -> bool:
+    msg = _safe_str(exc).lower()
+    markers = (
+        "unexpected keyword", "positional argument", "required positional argument",
+        "takes no keyword", "takes from", "takes exactly", "got an unexpected keyword",
+        "got multiple values", "missing 1 required", "keyword-only argument",
+    )
+    return any(m in msg for m in markers)
+
+
+def _is_probable_symbol_token(value: Any) -> bool:
+    s = _safe_str(value)
+    if not s or len(s) > 32:
+        return False
+    allowed = set("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._=^-:")
+    return all(ch in allowed for ch in s)
+
+
+# =============================================================================
+# Signal helpers
+# =============================================================================
+
+def _signal_from_reco(reco: str) -> str:
+    """Map recommendation string to Signal column value."""
+    r = _safe_str(reco).upper().replace(" ", "_").replace("-", "_")
+    return {
+        "STRONG_BUY": "STRONG_BUY",
+        "BUY": "BUY",
+        "HOLD": "HOLD",
+        "NEUTRAL": "NEUTRAL",
+        "REDUCE": "REDUCE",
+        "SELL": "SELL",
+        "ACCUMULATE": "BUY",
+        "AVOID": "SELL",
+    }.get(r, "")
+
+
+def _signal_from_percent_change(avg_pct: Optional[float]) -> str:
+    """UP/DOWN/NEUTRAL based on average percent change (fraction)."""
+    if avg_pct is None:
+        return _SIGNAL_NEUTRAL
+    pp = _pct_points(avg_pct) or 0.0
+    if pp > 0.5:
+        return _SIGNAL_UP
+    if pp < -0.5:
+        return _SIGNAL_DOWN
+    return _SIGNAL_NEUTRAL
+
+
+def _signal_from_score(score: Optional[float], *, high: float = 65.0, low: float = 40.0) -> str:
+    """HIGH/MODERATE/LOW based on 0-100 score."""
+    if score is None:
+        return _SIGNAL_NEUTRAL
+    if score >= high:
+        return _SIGNAL_HIGH
+    if score >= low:
+        return _SIGNAL_MODERATE
+    return _SIGNAL_LOW
+
+
+def _signal_from_pl_pct(pl_pct: Optional[float]) -> str:
+    """OK/WARN/ALERT based on P/L %."""
+    if pl_pct is None:
+        return _SIGNAL_NEUTRAL
+    pct = _pct_points(pl_pct) or 0.0
+    if pct >= 0:
+        return _SIGNAL_OK
+    if pct >= -10.0:
+        return _SIGNAL_WARN
+    return _SIGNAL_ALERT
+
+
+# =============================================================================
+# Dict/model extraction helpers (preserved from v1.7.0)
+# =============================================================================
+
 def _extract_row_dict(v: Any) -> Dict[str, Any]:
     if isinstance(v, dict):
         return dict(v)
-    try:
-        if hasattr(v, "model_dump") and callable(getattr(v, "model_dump")):
-            d = v.model_dump(mode="python")  # type: ignore[attr-defined]
-            if isinstance(d, dict):
-                return d
-    except Exception:
-        pass
-    try:
-        if hasattr(v, "dict") and callable(getattr(v, "dict")):
-            d = v.dict()  # type: ignore[attr-defined]
-            if isinstance(d, dict):
-                return d
-    except Exception:
-        pass
+    for method in ("model_dump", "dict"):
+        try:
+            fn = getattr(v, method, None)
+            if callable(fn):
+                d = fn(mode="python") if method == "model_dump" else fn()
+                if isinstance(d, dict):
+                    return d
+        except Exception:
+            pass
     try:
         d = getattr(v, "__dict__", None)
         if isinstance(d, dict):
@@ -238,8 +332,7 @@ def _rows_from_matrix_payload(matrix: Any, cols: Sequence[Any]) -> List[Dict[str
     for row in matrix or []:
         if not isinstance(row, (list, tuple)):
             continue
-        d = {key: row[i] if i < len(row) else None for i, key in enumerate(keys)}
-        out.append(d)
+        out.append({key: row[i] if i < len(row) else None for i, key in enumerate(keys)})
     return out
 
 
@@ -320,70 +413,33 @@ def _maybe_rows_from_payload(payload: Any) -> List[Dict[str, Any]]:
     return []
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Schema helpers
-# -----------------------------------------------------------------------------
-def _spec_columns(spec: Any) -> List[Any]:
-    if spec is None:
-        return []
-    if isinstance(spec, dict):
-        if isinstance(spec.get("columns"), list):
-            return spec["columns"]
-        if isinstance(spec.get("fields"), list):
-            return spec["fields"]
-        if len(spec) == 1:
-            only_val = next(iter(spec.values()))
-            if isinstance(only_val, dict):
-                if isinstance(only_val.get("columns"), list):
-                    return only_val["columns"]
-                if isinstance(only_val.get("fields"), list):
-                    return only_val["fields"]
-    cols = getattr(spec, "columns", None)
-    if isinstance(cols, list):
-        return cols
-    fields = getattr(spec, "fields", None)
-    if isinstance(fields, list):
-        return fields
-    return []
-
+# =============================================================================
 
 def get_insights_schema() -> Tuple[List[str], List[str], str]:
+    """
+    Return (headers, keys, source_marker) for the Insights_Analysis schema.
+    Reads from schema_registry v3.0.0 (10 columns).
+    Falls back to _FALLBACK_HEADERS / _FALLBACK_KEYS if registry unavailable.
+    """
     try:
-        from core.sheets.schema_registry import get_sheet_spec  # type: ignore
-
-        spec = get_sheet_spec("Insights_Analysis")
-        cols = _spec_columns(spec)
-        headers: List[str] = []
-        keys: List[str] = []
-        for c in cols:
-            if isinstance(c, Mapping):
-                h = _safe_str(c.get("header") or c.get("display_header") or c.get("label") or c.get("title"))
-                k = _safe_str(c.get("key") or c.get("field") or c.get("name") or c.get("id"))
-            else:
-                h = _safe_str(getattr(c, "header", None) or getattr(c, "display_header", None) or getattr(c, "label", None) or getattr(c, "title", None))
-                k = _safe_str(getattr(c, "key", None) or getattr(c, "field", None) or getattr(c, "name", None) or getattr(c, "id", None))
-            if h or k:
-                headers.append(h or k.replace("_", " ").title())
-                keys.append(k or h.lower().replace(" ", "_"))
-        if headers and keys and len(headers) == len(keys):
-            return headers, keys, "schema_registry.get_sheet_spec"
-        if isinstance(spec, Mapping):
-            h2 = spec.get("headers") or spec.get("display_headers")
-            k2 = spec.get("keys") or spec.get("fields")
-            if isinstance(h2, list) and isinstance(k2, list) and h2 and k2 and len(h2) == len(k2):
-                headers2 = [_safe_str(x) for x in h2 if _safe_str(x)]
-                keys2 = [_safe_str(x) for x in k2 if _safe_str(x)]
-                if headers2 and keys2 and len(headers2) == len(keys2):
-                    return headers2, keys2, "schema_registry.mapping_fields"
+        from core.sheets.schema_registry import get_sheet_headers, get_sheet_keys  # type: ignore
+        headers = get_sheet_headers("Insights_Analysis")
+        keys = get_sheet_keys("Insights_Analysis")
+        if headers and keys and len(headers) == len(keys) == 10:
+            return headers, keys, "schema_registry"
     except Exception as e:
         logger.debug("get_insights_schema: schema_registry unavailable: %r", e)
+
+    # Fallback: full 10-column schema
     return list(_FALLBACK_HEADERS), list(_FALLBACK_KEYS), "fallback"
 
 
 def _get_criteria_fields() -> List[Dict[str, Any]]:
+    """Return criteria field definitions from schema_registry or hardcoded fallback."""
     try:
         from core.sheets.schema_registry import get_sheet_spec  # type: ignore
-
         spec = get_sheet_spec("Insights_Analysis")
         cfs = getattr(spec, "criteria_fields", None)
         if cfs is None and isinstance(spec, Mapping):
@@ -391,65 +447,65 @@ def _get_criteria_fields() -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
         for cf in list(cfs or []):
             if isinstance(cf, Mapping):
-                out.append({
-                    "key": _safe_str(cf.get("key", "")),
-                    "label": _safe_str(cf.get("label", "")) or _safe_str(cf.get("key", "")),
-                    "dtype": _safe_str(cf.get("dtype", "str")) or "str",
-                    "default": cf.get("default", ""),
-                    "notes": _safe_str(cf.get("notes", "")),
-                })
+                entry = {k: cf.get(k, "") for k in ("key", "label", "dtype", "default", "notes")}
             else:
-                out.append({
-                    "key": _safe_str(getattr(cf, "key", "")),
-                    "label": _safe_str(getattr(cf, "label", "")) or _safe_str(getattr(cf, "key", "")),
-                    "dtype": _safe_str(getattr(cf, "dtype", "str")) or "str",
-                    "default": getattr(cf, "default", ""),
-                    "notes": _safe_str(getattr(cf, "notes", "")),
-                })
-        out = [x for x in out if x.get("key")]
+                entry = {k: getattr(cf, k, "") for k in ("key", "label", "dtype", "default", "notes")}
+            if entry.get("key"):
+                out.append(entry)
         if out:
             return out
     except Exception:
         pass
+    # Aligned with schema_registry v3.0.0 _insights_criteria_fields()
     return [
-        {"key": "risk_level", "label": "Risk Level", "dtype": "str", "default": "Moderate", "notes": "Low / Moderate / High."},
-        {"key": "confidence_level", "label": "Confidence Level", "dtype": "str", "default": "High", "notes": "High / Medium / Low."},
-        {"key": "invest_period_days", "label": "Investment Period (Days)", "dtype": "int", "default": "90", "notes": "Always treated in DAYS internally."},
-        {"key": "required_return_pct", "label": "Required Return %", "dtype": "pct", "default": "0.10", "notes": "Minimum expected ROI threshold."},
-        {"key": "amount", "label": "Amount", "dtype": "float", "default": "0", "notes": "Investment amount (optional)."},
+        {"key": "risk_level",          "label": "Risk Level",              "dtype": "str",   "default": "Moderate", "notes": "Low / Moderate / High."},
+        {"key": "confidence_level",    "label": "Confidence Level",        "dtype": "str",   "default": "High",     "notes": "High / Medium / Low."},
+        {"key": "invest_period_days",  "label": "Investment Period (Days)", "dtype": "int",   "default": "90",       "notes": "Always treated in DAYS."},
+        {"key": "required_return_pct", "label": "Required Return %",       "dtype": "pct",   "default": "0.10",     "notes": "Minimum expected ROI."},
+        {"key": "max_risk_score",      "label": "Max Risk Score",          "dtype": "float", "default": "60",       "notes": "Risk score ceiling."},
+        {"key": "pages_selected",      "label": "Pages Selected",          "dtype": "str",   "default": "",         "notes": "CSV of pages."},
+        {"key": "amount",              "label": "Amount",                  "dtype": "float", "default": "0",        "notes": "Investment amount."},
+        {"key": "min_expected_roi_pct","label": "Min Expected ROI %",      "dtype": "pct",   "default": "0.00",     "notes": "Filter floor for ROI."},
+        {"key": "min_ai_confidence",   "label": "Min AI Confidence",       "dtype": "float", "default": "0.60",     "notes": "Filter floor for confidence."},
     ]
 
 
-# -----------------------------------------------------------------------------
-# Criteria normalization / context helpers
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Criteria normalization
+# =============================================================================
+
 def _normalize_criteria_input(criteria: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Normalize any criteria dict to canonical internal keys."""
     c = dict(criteria or {})
+
     pages = c.get("pages_selected") or c.get("pages") or c.get("selected_pages") or []
     if isinstance(pages, str):
         pages = _csv_list(pages)
     if not isinstance(pages, list):
         pages = []
     pages = [_safe_str(x) for x in pages if _safe_str(x)]
-    invest_days = _as_int(c.get("invest_period_days") or c.get("investment_period_days") or c.get("period_days") or c.get("horizon_days") or 90)
-    if invest_days is None or invest_days <= 0:
+
+    # FIX: accept both invest_period_days (new) and investment_period_days (old)
+    invest_days = _as_int(
+        c.get("invest_period_days") or c.get("investment_period_days") or
+        c.get("period_days") or c.get("horizon_days") or 90
+    )
+    if not invest_days or invest_days <= 0:
         invest_days = 90
-    min_roi = c.get("min_expected_roi")
-    if min_roi is None:
-        min_roi = c.get("min_roi")
-    if min_roi is None:
-        min_roi = c.get("required_return_pct")
+
+    # FIX: accept min_expected_roi_pct (new) and min_roi/required_return_pct (old)
+    min_roi = (
+        c.get("min_expected_roi_pct") or c.get("min_expected_roi") or
+        c.get("min_roi") or c.get("required_return_pct")
+    )
     min_roi_frac = _as_fraction(min_roi)
-    max_risk = _as_float(c.get("max_risk_score") or c.get("max_risk") or 60.0)
-    if max_risk is None:
-        max_risk = 60.0
-    min_conf = _as_fraction(c.get("min_confidence") or c.get("min_ai_confidence") or c.get("min_confidence_score") or 0.70)
-    if min_conf is None:
-        min_conf = 0.70
-    min_volume = _as_float(c.get("min_volume") or c.get("min_liquidity") or c.get("min_vol"))
-    top_n = _as_int(c.get("top_n") or c.get("limit") or 10)
-    if top_n is None or top_n <= 0:
-        top_n = 10
+
+    max_risk = _as_float(c.get("max_risk_score") or c.get("max_risk") or 60.0) or 60.0
+    min_conf = _as_fraction(
+        c.get("min_ai_confidence") or c.get("min_confidence") or c.get("min_confidence_score") or 0.60
+    ) or 0.60
+    top_n = max(1, min(50, _as_int(c.get("top_n") or c.get("limit") or 10) or 10))
+
     normalized = {
         "pages_selected": pages or ["Market_Leaders", "Global_Markets", "Mutual_Funds", "Commodities_FX", "My_Portfolio"],
         "invest_period_days": invest_days,
@@ -457,11 +513,18 @@ def _normalize_criteria_input(criteria: Optional[Dict[str, Any]]) -> Dict[str, A
         "min_expected_roi": min_roi_frac,
         "max_risk_score": max_risk,
         "min_confidence": min_conf,
-        "min_volume": min_volume,
+        "min_volume": _as_float(c.get("min_volume") or c.get("min_liquidity")),
         "use_liquidity_tiebreak": _safe_bool(c.get("use_liquidity_tiebreak", True), True),
-        "enforce_risk_confidence": _safe_bool(c.get("enforce_risk_confidence", True), True),
-        "top_n": max(1, min(50, top_n)),
+        "top_n": top_n,
         "enrich_final": _safe_bool(c.get("enrich_final", True), True),
+        # Section flags from criteria_model.AdvisorCriteria
+        "include_market_summary":     _safe_bool(c.get("include_market_summary", True), True),
+        "include_risk_scenarios":     _safe_bool(c.get("include_risk_scenarios", True), True),
+        "include_top_opportunities":  _safe_bool(c.get("include_top_opportunities", True), True),
+        "include_portfolio_health":   _safe_bool(c.get("include_portfolio_health", True), True),
+        # Risk level for scenario generation
+        "risk_level":        _safe_str(c.get("risk_level") or "Moderate"),
+        "required_return_pct": _as_fraction(c.get("required_return_pct") or c.get("required_return") or 0.10) or 0.10,
     }
     for k, v in c.items():
         if k not in normalized and v is not None:
@@ -486,131 +549,178 @@ def _criteria_summary_note(criteria: Optional[Dict[str, Any]]) -> str:
     norm = _normalize_criteria_input(criteria)
     roi = norm.get("min_expected_roi")
     roi_txt = _fmt_pct(roi) if roi is not None else "N/A"
-    conf_txt = _fmt_pct(norm.get("min_confidence"))
     return (
         f"Horizon={_days_to_horizon(int(norm['invest_period_days']))} "
         f"| Days={norm['invest_period_days']} "
         f"| Min ROI={roi_txt} "
         f"| Max Risk={_fmt_num(norm.get('max_risk_score'))} "
-        f"| Min Confidence={conf_txt}"
+        f"| Min Confidence={_fmt_pct(norm.get('min_confidence'))}"
     )
 
 
-# -----------------------------------------------------------------------------
-# Row builder
-# -----------------------------------------------------------------------------
-def _make_row(*, keys: Sequence[str], section: str, item: str, metric: str, value: Any, symbol: str = "", notes: str = "", last_updated_riyadh: Optional[str] = None) -> Dict[str, Any]:
+# =============================================================================
+# Row builder (10-column schema)
+# =============================================================================
+
+def _make_row(
+    *,
+    keys: Sequence[str],
+    section: str,
+    item: str,
+    metric: str,
+    value: Any,
+    # New in v2.0.0 (schema_registry v3.0.0 new columns)
+    category: str = "",
+    signal: str = "",
+    score: Any = "",
+    # Preserved
+    symbol: str = "",
+    notes: str = "",
+    last_updated_riyadh: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Build a single Insights_Analysis row dict aligned with the 10-column schema.
+
+    New parameters vs v1.7.0:
+      category -- sub-group within section (e.g. "Conservative", "KSA Watchlist")
+      signal   -- UP/DOWN/NEUTRAL/HIGH/MODERATE/LOW/OK/WARN/ALERT
+      score    -- numeric 0-100 score if applicable (empty string if N/A)
+    """
     ts = last_updated_riyadh or _now_riyadh_iso()
     base = {
-        "section": _safe_str(section) or "General",
-        "item": _safe_str(item) or "Item",
-        "symbol": _safe_str(symbol),
-        "metric": _safe_str(metric) or "metric",
-        "value": "" if value is None else value,
-        "notes": _safe_str(notes),
-        "last_updated_riyadh": ts,
+        "section":              _safe_str(section) or "General",
+        "category":             _safe_str(category),
+        "item":                 _safe_str(item) or "Item",
+        "symbol":               _safe_str(symbol),
+        "metric":               _safe_str(metric) or "metric",
+        "value":                "" if value is None else value,
+        "signal":               _safe_str(signal),
+        "score":                "" if score is None or _safe_str(score) == "" else score,
+        "notes":                _safe_str(notes),
+        "last_updated_riyadh":  ts,
     }
     return {k: base.get(k, "") for k in keys}
 
 
 def _warning_row(keys: Sequence[str], label: str, notes: str, ts: str) -> Dict[str, Any]:
     return _make_row(
-        keys=keys,
-        section="System",
-        item="Warning",
-        symbol="",
-        metric=label,
-        value="WARN",
-        notes=notes,
-        last_updated_riyadh=ts,
+        keys=keys, section="System", item="Warning",
+        category="", symbol="", metric=label,
+        value="WARN", signal=_SIGNAL_WARN, score="",
+        notes=notes, last_updated_riyadh=ts,
     )
 
 
-def build_criteria_rows(*, criteria: Optional[Dict[str, Any]] = None, last_updated_riyadh: Optional[str] = None) -> List[Dict[str, Any]]:
+# =============================================================================
+# Criteria block builder
+# =============================================================================
+
+def build_criteria_rows(
+    *,
+    criteria: Optional[Dict[str, Any]] = None,
+    last_updated_riyadh: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Build the criteria block rows for the top of Insights_Analysis.
+    One row per criteria field + a snapshot row.
+    API unchanged from v1.7.0.
+    """
     _, keys, _ = get_insights_schema()
     ts = last_updated_riyadh or _now_riyadh_iso()
     fields = _get_criteria_fields()
     crit = _normalize_criteria_input(criteria)
     rows: List[Dict[str, Any]] = []
+
     for f in fields:
         k = f["key"]
         label = f["label"]
         v = crit.get(k, f.get("default", ""))
         note = f.get("notes", "")
-        if k.endswith("_pct") or k.endswith("_percent") or "return" in k or "confidence" in k:
+        if k.endswith("_pct") or "return" in k or "confidence" in k or "roi" in k:
             vnum = _as_fraction(v)
             if vnum is not None:
                 note = (note + " " if note else "") + f"(display: {_fmt_pct(vnum)})"
                 v = vnum
-        rows.append(_make_row(keys=keys, section="Criteria", item=label, symbol="", metric=k, value=v, notes=note, last_updated_riyadh=ts))
-    rows.append(_make_row(keys=keys, section="Criteria", item="Criteria Snapshot", symbol="", metric="criteria_snapshot", value=_criteria_snapshot_text(crit), notes="Compact JSON snapshot used by Top10 / advisor contextual logic.", last_updated_riyadh=ts))
-    rows.append(_make_row(keys=keys, section="Criteria", item="Criteria Summary", symbol="", metric="criteria_summary", value=_days_to_horizon(int(crit["invest_period_days"])), notes=_criteria_summary_note(crit), last_updated_riyadh=ts))
+        rows.append(_make_row(
+            keys=keys, section="Criteria", category="Settings",
+            item=label, symbol="", metric=k,
+            value=v, signal="", score="",
+            notes=note, last_updated_riyadh=ts,
+        ))
+
+    rows.append(_make_row(
+        keys=keys, section="Criteria", category="Snapshot",
+        item="Criteria Summary", symbol="", metric="criteria_summary",
+        value=_days_to_horizon(int(crit["invest_period_days"])), signal="", score="",
+        notes=_criteria_summary_note(crit), last_updated_riyadh=ts,
+    ))
     return rows
 
 
-# -----------------------------------------------------------------------------
-# Engine integration
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Engine integration (preserved from v1.7.0 with minor fixes)
+# =============================================================================
+
 async def _maybe_await(v: Any) -> Any:
     return await v if inspect.isawaitable(v) else v
 
 
-async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "", timeout_sec: Optional[float] = None) -> Dict[str, Dict[str, Any]]:
+async def _fetch_quotes_map(
+    engine: Any,
+    symbols: List[str],
+    *,
+    mode: str = "",
+    timeout_sec: Optional[float] = None,
+) -> Dict[str, Dict[str, Any]]:
     if not engine or not symbols:
         return {}
     requested = _dedupe_keep_order(symbols)
 
-    def _rows_to_symbol_map(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    def _to_symbol_map(rows: Sequence[Mapping[str, Any]]) -> Dict[str, Dict[str, Any]]:
         out: Dict[str, Dict[str, Any]] = {}
         for row in rows:
-            if not isinstance(row, Mapping):
-                continue
-            sym = _safe_str(row.get("symbol") or row.get("ticker") or row.get("code"))
-            if sym:
-                out[sym] = dict(row)
+            if isinstance(row, Mapping):
+                sym = _safe_str(row.get("symbol") or row.get("ticker") or row.get("code"))
+                if sym:
+                    out[sym] = dict(row)
         return out
 
-    fn = getattr(engine, "get_enriched_quotes_batch", None)
-    if callable(fn):
+    for method_name in ("get_enriched_quotes_batch", "get_enriched_quotes"):
+        fn = getattr(engine, method_name, None)
+        if not callable(fn):
+            continue
         try:
             try:
-                res = await _await_with_timeout(_maybe_await(fn(requested, mode=mode or "")), timeout_sec, "get_enriched_quotes_batch")
+                res = await _await_with_timeout(
+                    _maybe_await(fn(requested, mode=mode or "")), timeout_sec, method_name
+                )
             except TypeError as exc:
                 if not _is_signature_mismatch_typeerror(exc):
                     raise
-                res = await _await_with_timeout(_maybe_await(fn(requested)), timeout_sec, "get_enriched_quotes_batch")
+                res = await _await_with_timeout(_maybe_await(fn(requested)), timeout_sec, method_name)
             if isinstance(res, dict):
                 rows_from_payload = _maybe_rows_from_payload(res)
                 if rows_from_payload:
-                    row_map = _rows_to_symbol_map(rows_from_payload)
+                    row_map = _to_symbol_map(rows_from_payload)
                     return {s: row_map.get(s, {"symbol": s}) for s in requested}
                 return {s: _extract_row_dict(res.get(s)) if isinstance(res.get(s), dict) else {"symbol": s} for s in requested}
-        except Exception:
-            pass
-
-    fn2 = getattr(engine, "get_enriched_quotes", None)
-    if callable(fn2):
-        try:
-            res = await _await_with_timeout(_maybe_await(fn2(requested)), timeout_sec, "get_enriched_quotes")
-            rows_from_payload = _maybe_rows_from_payload(res)
-            if rows_from_payload:
-                row_map = _rows_to_symbol_map(rows_from_payload)
-                return {s: row_map.get(s, {"symbol": s}) for s in requested}
             if isinstance(res, list):
-                return {s: _extract_row_dict(v) for s, v in zip(requested, res)}
+                row_map = _to_symbol_map([_extract_row_dict(x) for x in res])
+                return {s: row_map.get(s, {"symbol": s}) for s in requested}
         except Exception:
-            pass
+            continue
 
+    # Per-symbol fallback
     out3: Dict[str, Dict[str, Any]] = {}
     fn3 = getattr(engine, "get_enriched_quote_dict", None)
     fn4 = getattr(engine, "get_enriched_quote", None) or getattr(engine, "get_quote", None)
-    per_symbol_timeout = None if timeout_sec is None else max(0.5, timeout_sec / max(1, len(requested)))
+    per_sym_timeout = None if timeout_sec is None else max(0.5, timeout_sec / max(1, len(requested)))
     for s in requested:
         try:
             if callable(fn3):
-                out3[s] = _extract_row_dict(await _await_with_timeout(_maybe_await(fn3(s)), per_symbol_timeout, f"quote:{s}"))
+                out3[s] = _extract_row_dict(await _await_with_timeout(_maybe_await(fn3(s)), per_sym_timeout, f"quote:{s}"))
             elif callable(fn4):
-                out3[s] = _extract_row_dict(await _await_with_timeout(_maybe_await(fn4(s)), per_symbol_timeout, f"quote:{s}"))
+                out3[s] = _extract_row_dict(await _await_with_timeout(_maybe_await(fn4(s)), per_sym_timeout, f"quote:{s}"))
             else:
                 out3[s] = {"symbol": s, "warnings": "engine_missing_quote_methods"}
         except Exception as e:
@@ -618,16 +728,21 @@ async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "", 
     return out3
 
 
-async def _fetch_top10_payload(engine: Any, criteria: Optional[Dict[str, Any]] = None, *, limit: int = 10, mode: str = "", timeout_sec: Optional[float] = None) -> Dict[str, Any]:
+async def _fetch_top10_payload(
+    engine: Any,
+    criteria: Optional[Dict[str, Any]] = None,
+    *,
+    limit: int = 10,
+    mode: str = "",
+    timeout_sec: Optional[float] = None,
+) -> Dict[str, Any]:
     if not engine:
         return {}
     try:
         from core.analysis.top10_selector import build_top10_rows  # type: ignore
-
         payload = await _await_with_timeout(
             _maybe_await(build_top10_rows(engine=engine, criteria=criteria or {}, limit=limit, mode=mode or "")),
-            timeout_sec,
-            "build_top10_rows",
+            timeout_sec, "build_top10_rows",
         )
         if isinstance(payload, dict):
             return payload
@@ -637,18 +752,16 @@ async def _fetch_top10_payload(engine: Any, criteria: Optional[Dict[str, Any]] =
     except Exception:
         pass
 
-    candidate_names = ("build_top10_rows", "get_top10_rows", "top10_rows", "build_top10", "get_top10_investments", "select_top10")
-    for name in candidate_names:
+    for name in ("build_top10_rows", "get_top10_rows", "top10_rows", "build_top10", "get_top10_investments", "select_top10"):
         fn = getattr(engine, name, None)
         if not callable(fn):
             continue
-        variants = [
+        for kwargs in [
             {"criteria": criteria or {}, "limit": limit, "mode": mode or ""},
             {"criteria": criteria or {}, "limit": limit},
             {"limit": limit},
             {},
-        ]
-        for kwargs in variants:
+        ]:
             try:
                 payload = await _await_with_timeout(_maybe_await(fn(**kwargs)), timeout_sec, name)
                 if isinstance(payload, dict):
@@ -665,75 +778,53 @@ async def _fetch_top10_payload(engine: Any, criteria: Optional[Dict[str, Any]] =
     return {}
 
 
-async def _fetch_top10_symbols(engine: Any, criteria: Optional[Dict[str, Any]] = None, *, limit: int = 10, timeout_sec: Optional[float] = None) -> List[str]:
+async def _fetch_top10_symbols(
+    engine: Any,
+    criteria: Optional[Dict[str, Any]] = None,
+    *,
+    limit: int = 10,
+    timeout_sec: Optional[float] = None,
+) -> List[str]:
     if not engine:
         return []
-    try:
-        from core.analysis.top10_selector import select_top10_symbols  # type: ignore
-
-        syms = await _await_with_timeout(_maybe_await(select_top10_symbols(engine=engine, criteria=criteria or {}, limit=limit)), timeout_sec, "select_top10_symbols")
-        if isinstance(syms, (list, tuple)):
-            return _dedupe_keep_order(syms)[: max(1, limit)]
-    except Exception:
-        pass
-
-    candidates = ["get_top10_symbols", "select_top10_symbols", "top10_symbols", "get_top10_investments", "select_top10", "build_top10", "compute_top10"]
-    for name in candidates:
+    for name in ("get_top10_symbols", "select_top10_symbols", "top10_symbols", "compute_top10"):
         fn = getattr(engine, name, None)
         if not callable(fn):
             continue
-        try:
+        for kwargs in [{"criteria": criteria or {}, "limit": limit}, {"limit": limit}, {}]:
             try:
-                res = await _await_with_timeout(_maybe_await(fn(criteria=criteria or {}, limit=limit)), timeout_sec, name)
-            except TypeError as exc1:
-                if not _is_signature_mismatch_typeerror(exc1):
-                    raise
-                try:
-                    res = await _await_with_timeout(_maybe_await(fn(limit=limit)), timeout_sec, name)
-                except TypeError as exc2:
-                    if not _is_signature_mismatch_typeerror(exc2):
-                        raise
-                    res = await _await_with_timeout(_maybe_await(fn()), timeout_sec, name)
-        except Exception:
-            continue
-        if isinstance(res, (list, tuple)):
-            out_syms: List[str] = []
-            for item in res:
-                if isinstance(item, str):
-                    out_syms.append(item)
-                elif isinstance(item, dict):
-                    out_syms.append(_safe_str(item.get("symbol") or item.get("ticker") or item.get("code")))
-                else:
-                    d = _extract_row_dict(item)
-                    out_syms.append(_safe_str(d.get("symbol") or d.get("ticker") or d.get("code")))
-            return _dedupe_keep_order(out_syms)[: max(1, limit)]
-        if isinstance(res, dict):
-            if isinstance(res.get("symbols"), (list, tuple)):
-                return _dedupe_keep_order(res["symbols"])[: max(1, limit)]
-            rows = _maybe_rows_from_payload(res)
-            if rows:
-                return _dedupe_keep_order([_safe_str(r.get("symbol") or r.get("ticker") or r.get("code")) for r in rows])[: max(1, limit)]
+                res = await _await_with_timeout(_maybe_await(fn(**kwargs)), timeout_sec, name)
+            except TypeError as exc:
+                if _is_signature_mismatch_typeerror(exc):
+                    continue
+                break
+            except Exception:
+                continue
+            if isinstance(res, (list, tuple)):
+                syms: List[str] = []
+                for item in res:
+                    if isinstance(item, str):
+                        syms.append(item)
+                    else:
+                        d = _extract_row_dict(item)
+                        syms.append(_safe_str(d.get("symbol") or d.get("ticker")))
+                return _dedupe_keep_order(syms)[:limit]
+            if isinstance(res, dict):
+                rows = _maybe_rows_from_payload(res)
+                if rows:
+                    return _dedupe_keep_order([_safe_str(r.get("symbol") or r.get("ticker")) for r in rows])[:limit]
     return []
 
 
-# -----------------------------------------------------------------------------
-# Insight computations
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Quote data helpers
+# =============================================================================
+
 def _pick(d: Dict[str, Any], key: str) -> Any:
     try:
         return d.get(key)
     except Exception:
         return None
-
-
-def _coverage_count(qmap: Dict[str, Dict[str, Any]], key: str) -> int:
-    count = 0
-    for d in qmap.values():
-        v = _pick(d, key)
-        if v is None or _safe_str(v) == "":
-            continue
-        count += 1
-    return count
 
 
 def _scored_list(qmap: Dict[str, Dict[str, Any]], key: str) -> List[Tuple[str, float]]:
@@ -745,106 +836,265 @@ def _scored_list(qmap: Dict[str, Dict[str, Any]], key: str) -> List[Tuple[str, f
     return out
 
 
-def _avg(vals: List[float]) -> Optional[float]:
-    return None if not vals else (sum(vals) / float(len(vals)))
+def _coverage_count(qmap: Dict[str, Dict[str, Any]], key: str) -> int:
+    return sum(1 for d in qmap.values() if _pick(d, key) is not None and _safe_str(_pick(d, key)) != "")
 
 
-def _build_universe_snapshot_rows(*, keys: Sequence[str], section: str, symbols: List[str], qmap: Dict[str, Dict[str, Any]], ts: str) -> List[Dict[str, Any]]:
+# =============================================================================
+# Section 1: Market Summary
+# =============================================================================
+
+def _build_market_summary_rows(
+    *,
+    keys: Sequence[str],
+    section_name: str,
+    symbols: List[str],
+    qmap: Dict[str, Dict[str, Any]],
+    ts: str,
+) -> List[Dict[str, Any]]:
+    """
+    Section 1 -- Market Summary.
+
+    One header row per universe summarising:
+      - Universe size + coverage
+      - Average percent change + trend signal (UP/DOWN/NEUTRAL)
+      - Average overall_score + signal (HIGH/MODERATE/LOW)
+      - Top gainer and top loser
+      - Best expected ROI
+
+    Uses Signal column: UP/DOWN/NEUTRAL for price trend, HIGH/MODERATE/LOW for scores.
+    """
     rows: List[Dict[str, Any]] = []
-    rows.append(_make_row(keys=keys, section=section, item="Universe Size", symbol="", metric="count", value=len(symbols), notes="Number of symbols requested for this section.", last_updated_riyadh=ts))
-    rows.append(_make_row(keys=keys, section=section, item="Coverage", symbol="", metric="coverage_current_price", value=f"{_coverage_count(qmap, 'current_price')}/{len(symbols)}", notes="How many symbols returned current_price.", last_updated_riyadh=ts))
-    rows.append(_make_row(keys=keys, section=section, item="Coverage", symbol="", metric="coverage_percent_change", value=f"{_coverage_count(qmap, 'percent_change')}/{len(symbols)}", notes="How many symbols returned percent_change.", last_updated_riyadh=ts))
 
+    # Header row
+    n = len(symbols)
+    covered = _coverage_count(qmap, "current_price")
+    rows.append(_make_row(
+        keys=keys, section="Market Summary", category=section_name,
+        item="Universe", symbol="", metric="universe_size",
+        value=n, signal="", score="",
+        notes=f"{covered}/{n} symbols have current price data.",
+        last_updated_riyadh=ts,
+    ))
+
+    # Average percent change -> trend signal
     movers = _scored_list(qmap, "percent_change")
+    avg_pct = _avg([x for _, x in movers])
+    trend_signal = _signal_from_percent_change(avg_pct)
+    rows.append(_make_row(
+        keys=keys, section="Market Summary", category=section_name,
+        item="Trend", symbol="", metric="avg_percent_change",
+        value=_fmt_pct(avg_pct) if avg_pct is not None else "N/A",
+        signal=trend_signal, score="",
+        notes=f"Average percent change across {len(movers)} symbols with data.",
+        last_updated_riyadh=ts,
+    ))
+
+    # Top gainer / loser
     if movers:
         movers.sort(key=lambda t: t[1], reverse=True)
         top_sym, top_pc = movers[0]
         low_sym, low_pc = movers[-1]
-        avg_pc = _avg([x for _, x in movers])
-        rows.append(_make_row(keys=keys, section=section, item="Top Gainer", symbol=top_sym, metric="percent_change", value=_pct_points(top_pc), notes=f"Highest percent_change in this universe (display: {_fmt_pct(top_pc)}).", last_updated_riyadh=ts))
-        rows.append(_make_row(keys=keys, section=section, item="Top Loser", symbol=low_sym, metric="percent_change", value=_pct_points(low_pc), notes=f"Lowest percent_change in this universe (display: {_fmt_pct(low_pc)}).", last_updated_riyadh=ts))
-        if avg_pc is not None:
-            rows.append(_make_row(keys=keys, section=section, item="Average Change", symbol="", metric="avg_percent_change", value=_pct_points(avg_pc), notes=f"Average percent_change across symbols with data (display: {_fmt_pct(avg_pc)}).", last_updated_riyadh=ts))
-    else:
-        rows.append(_make_row(keys=keys, section=section, item="Snapshot", symbol="", metric="status", value="No movers data", notes="percent_change not available yet for this universe.", last_updated_riyadh=ts))
+        rows.append(_make_row(
+            keys=keys, section="Market Summary", category=section_name,
+            item="Top Gainer", symbol=top_sym, metric="percent_change",
+            value=_fmt_pct(top_pc), signal=_SIGNAL_UP, score="",
+            notes=f"Highest percent change in {section_name}.",
+            last_updated_riyadh=ts,
+        ))
+        if len(movers) > 1:
+            rows.append(_make_row(
+                keys=keys, section="Market Summary", category=section_name,
+                item="Top Loser", symbol=low_sym, metric="percent_change",
+                value=_fmt_pct(low_pc), signal=_SIGNAL_DOWN, score="",
+                notes=f"Lowest percent change in {section_name}.",
+                last_updated_riyadh=ts,
+            ))
 
+    # Average overall_score -> quality signal
+    scores = _scored_list(qmap, "overall_score")
+    avg_score = _avg([x for _, x in scores])
+    if avg_score is not None:
+        score_signal = _signal_from_score(avg_score)
+        rows.append(_make_row(
+            keys=keys, section="Market Summary", category=section_name,
+            item="Avg Overall Score", symbol="", metric="avg_overall_score",
+            value=round(avg_score, 1), signal=score_signal, score=round(avg_score, 1),
+            notes=f"Average overall_score across {len(scores)} scored symbols.",
+            last_updated_riyadh=ts,
+        ))
+
+    # Best expected ROI
     roi3 = _scored_list(qmap, "expected_roi_3m")
     if roi3:
         roi3.sort(key=lambda t: t[1], reverse=True)
-        sym, val = roi3[0]
-        rows.append(_make_row(keys=keys, section=section, item="Best Expected ROI (3M)", symbol=sym, metric="expected_roi_3m", value=_pct_points(val), notes=f"Highest expected_roi_3m (display: {_fmt_pct(val)}).", last_updated_riyadh=ts))
+        best_sym, best_roi = roi3[0]
+        rows.append(_make_row(
+            keys=keys, section="Market Summary", category=section_name,
+            item="Best ROI (3M)", symbol=best_sym, metric="expected_roi_3m",
+            value=_fmt_pct(best_roi), signal=_SIGNAL_UP if (best_roi or 0) > 0 else _SIGNAL_DOWN, score="",
+            notes=f"Highest expected_roi_3m in {section_name}.",
+            last_updated_riyadh=ts,
+        ))
 
-    vol90 = _scored_list(qmap, "volatility_90d")
-    if vol90:
-        vol90.sort(key=lambda t: t[1], reverse=True)
-        sym, val = vol90[0]
-        rows.append(_make_row(keys=keys, section=section, item="Highest Volatility (90D)", symbol=sym, metric="volatility_90d", value=_pct_points(val), notes=f"Highest volatility_90d (display: {_fmt_pct(val)}).", last_updated_riyadh=ts))
-
-    conf = _scored_list(qmap, "forecast_confidence")
-    if conf:
-        avg_conf = _avg([x for _, x in conf])
-        if avg_conf is not None:
-            rows.append(_make_row(keys=keys, section=section, item="Average Forecast Confidence", symbol="", metric="avg_forecast_confidence", value=avg_conf, notes="Average forecast_confidence across symbols with data.", last_updated_riyadh=ts))
     return rows
 
 
-def _build_portfolio_kpi_rows(*, keys: Sequence[str], section: str, symbols: List[str], qmap: Dict[str, Dict[str, Any]], ts: str) -> List[Dict[str, Any]]:
+# =============================================================================
+# Section 2: Risk Scenarios
+# =============================================================================
+
+def _build_risk_scenario_rows(
+    *,
+    keys: Sequence[str],
+    norm_criteria: Dict[str, Any],
+    ts: str,
+) -> List[Dict[str, Any]]:
+    """
+    Section 2 -- Risk Scenarios.
+
+    3 rows: Conservative / Moderate / Aggressive.
+    Uses criteria_model.build_scenario_specs() for consistent parameters.
+    Signal: LOW / MODERATE / HIGH per scenario.
+    Score: expected return as a score (0-100).
+    """
     rows: List[Dict[str, Any]] = []
-    total_cost = 0.0
-    total_value = 0.0
-    have_any_position = False
-    for sym in symbols:
-        d = qmap.get(sym) or {}
-        qty = _as_float(_pick(d, "position_qty"))
-        avg_cost = _as_float(_pick(d, "avg_cost"))
-        px = _as_float(_pick(d, "current_price"))
-        if qty is None or avg_cost is None:
-            continue
-        have_any_position = True
-        total_cost += float(qty) * float(avg_cost)
-        if px is not None:
-            total_value += float(qty) * float(px)
-    if not have_any_position:
-        rows.append(_make_row(keys=keys, section=section, item="Portfolio KPIs", symbol="", metric="status", value="Unavailable", notes="position_qty / avg_cost not present (or portfolio universe not provided).", last_updated_riyadh=ts))
-        return rows
-    unreal = total_value - total_cost
-    unreal_pct = (unreal / total_cost) if total_cost > 0 else None
-    rows.append(_make_row(keys=keys, section=section, item="Portfolio Cost", symbol="", metric="total_cost", value=total_cost, notes="Sum(position_qty * avg_cost).", last_updated_riyadh=ts))
-    rows.append(_make_row(keys=keys, section=section, item="Portfolio Value", symbol="", metric="total_value", value=total_value, notes="Sum(position_qty * current_price) where available.", last_updated_riyadh=ts))
-    rows.append(_make_row(keys=keys, section=section, item="Unrealized P/L", symbol="", metric="unrealized_pl", value=unreal, notes="total_value - total_cost.", last_updated_riyadh=ts))
-    if unreal_pct is not None:
-        rows.append(_make_row(keys=keys, section=section, item="Unrealized P/L %", symbol="", metric="unrealized_pl_pct", value=_pct_points(unreal_pct), notes=f"unrealized_pl / total_cost (display: {_fmt_pct(unreal_pct)}).", last_updated_riyadh=ts))
+
+    # Attempt to use criteria_model for typed scenario generation
+    scenarios_data: List[Dict[str, Any]] = []
+    try:
+        from core.analysis.criteria_model import AdvisorCriteria, build_scenario_specs  # type: ignore
+        criteria_obj = AdvisorCriteria.from_kv_map(norm_criteria)
+        specs = build_scenario_specs(criteria_obj)
+        for spec in specs:
+            scenarios_data.append({
+                "label":          spec.label,
+                "signal":         spec.signal,
+                "max_risk":       spec.max_risk,
+                "min_roi":        spec.min_roi,
+                "required_return": spec.required_return,
+                "min_confidence": spec.min_confidence,
+                "horizon":        spec.horizon,
+                "notes":          spec.notes,
+            })
+    except Exception:
+        # Hardcoded fallback aligned with criteria_model.to_scenario_variants()
+        horizon = _days_to_horizon(int(norm_criteria.get("invest_period_days", 90)))
+        scenarios_data = [
+            {
+                "label": "Conservative", "signal": _SIGNAL_LOW, "max_risk": 40.0,
+                "min_roi": 0.03, "required_return": 0.05, "min_confidence": 0.70,
+                "horizon": horizon,
+                "notes": "Risk ceiling: 40 | Min ROI: 3.0% | Min Confidence: 70% | Horizon: " + horizon,
+            },
+            {
+                "label": "Moderate", "signal": _SIGNAL_MODERATE, "max_risk": 60.0,
+                "min_roi": 0.07, "required_return": 0.10, "min_confidence": 0.60,
+                "horizon": horizon,
+                "notes": "Risk ceiling: 60 | Min ROI: 7.0% | Min Confidence: 60% | Horizon: " + horizon,
+            },
+            {
+                "label": "Aggressive", "signal": _SIGNAL_HIGH, "max_risk": 80.0,
+                "min_roi": 0.15, "required_return": 0.20, "min_confidence": 0.45,
+                "horizon": horizon,
+                "notes": "Risk ceiling: 80 | Min ROI: 15.0% | Min Confidence: 45% | Horizon: " + horizon,
+            },
+        ]
+
+    # Header row
+    rows.append(_make_row(
+        keys=keys, section="Risk Scenarios", category="Overview",
+        item="Scenarios", symbol="", metric="scenario_count",
+        value=len(scenarios_data), signal="", score="",
+        notes="Three risk profiles based on your criteria. Choose the scenario that matches your tolerance.",
+        last_updated_riyadh=ts,
+    ))
+
+    for s in scenarios_data:
+        label         = s.get("label", "Scenario")
+        signal        = s.get("signal", _SIGNAL_MODERATE)
+        max_risk      = s.get("max_risk", 60.0)
+        min_roi       = s.get("min_roi", 0.0)
+        req_return    = s.get("required_return", 0.10)
+        min_conf      = s.get("min_confidence", 0.60)
+        horizon       = s.get("horizon", "3M")
+        notes         = s.get("notes", "")
+        # Score: map required_return to 0-100 (0% return = 0, 20%+ = 100)
+        return_score  = round(min(100.0, max(0.0, float(req_return) * 500.0)), 1)
+
+        rows.append(_make_row(
+            keys=keys, section="Risk Scenarios", category=label,
+            item=label, symbol="", metric="scenario_profile",
+            value=f"Return>={_fmt_pct(req_return)} | Risk<={max_risk:.0f} | Conf>={_fmt_pct(min_conf)}",
+            signal=signal, score=return_score,
+            notes=notes or (
+                f"Max risk: {max_risk:.0f} | "
+                f"Required return: {_fmt_pct(req_return)} | "
+                f"Min confidence: {_fmt_pct(min_conf)} | "
+                f"Horizon: {horizon}"
+            ),
+            last_updated_riyadh=ts,
+        ))
+
     return rows
 
 
-def _normalize_top10_rows(top10_payload: Dict[str, Any]) -> List[Dict[str, Any]]:
-    return _maybe_rows_from_payload(top10_payload)
+# =============================================================================
+# Section 3: Top Opportunities
+# =============================================================================
 
+def _build_top_opportunities_rows(
+    *,
+    keys: Sequence[str],
+    top10_payload: Dict[str, Any],
+    norm_criteria: Dict[str, Any],
+    ts: str,
+) -> List[Dict[str, Any]]:
+    """
+    Section 3 -- Top Opportunities.
 
-def _build_top10_context_rows(*, keys: Sequence[str], top10_payload: Dict[str, Any], criteria: Optional[Dict[str, Any]], ts: str) -> List[Dict[str, Any]]:
+    Populates Score (overall_score) and Signal (from recommendation).
+    """
     rows: List[Dict[str, Any]] = []
-    norm_criteria = _normalize_criteria_input(criteria)
-    top_rows = _normalize_top10_rows(top10_payload)
+    top_rows = _maybe_rows_from_payload(top10_payload)
+
     if not top_rows:
-        rows.append(_make_row(keys=keys, section="Top 10 Investments", item="Status", symbol="", metric="top10_status", value="Unavailable", notes="Top10 payload is empty.", last_updated_riyadh=ts))
+        rows.append(_make_row(
+            keys=keys, section="Top Opportunities", category="Status",
+            item="Status", symbol="", metric="top10_status",
+            value="Unavailable", signal=_SIGNAL_WARN, score="",
+            notes="Top10 payload is empty or engine unavailable.",
+            last_updated_riyadh=ts,
+        ))
         return rows
-    rows.append(_make_row(keys=keys, section="Top 10 Investments", item="Status", symbol="", metric="top10_count", value=len(top_rows), notes="Top10 rows generated through selector/engine path.", last_updated_riyadh=ts))
-    rows.append(_make_row(keys=keys, section="Top 10 Investments", item="Criteria Snapshot", symbol="", metric="criteria_snapshot", value=_criteria_snapshot_text(norm_criteria), notes=_criteria_summary_note(norm_criteria), last_updated_riyadh=ts))
+
+    days = int(norm_criteria.get("invest_period_days", 90))
+    roi_key = "expected_roi_1m" if days <= 45 else ("expected_roi_3m" if days <= 135 else "expected_roi_12m")
+
+    rows.append(_make_row(
+        keys=keys, section="Top Opportunities", category="Summary",
+        item="Count", symbol="", metric="top10_count",
+        value=len(top_rows), signal="", score="",
+        notes=f"Top {len(top_rows)} selected by criteria. Horizon={_days_to_horizon(days)}.",
+        last_updated_riyadh=ts,
+    ))
+
     for i, raw in enumerate(top_rows[:10], start=1):
         if not isinstance(raw, dict):
             continue
-        sym = _safe_str(raw.get("symbol") or raw.get("ticker") or raw.get("code"))
-        name = _safe_str(raw.get("name"))
-        rank = _as_int(raw.get("top10_rank")) or i
-        days = int(norm_criteria["invest_period_days"])
-        roi_horizon_key = "expected_roi_1m" if days <= 45 else ("expected_roi_3m" if days <= 135 else "expected_roi_12m")
-        roi_val = raw.get(roi_horizon_key)
-        reco = _safe_str(raw.get("recommendation"))
-        sel_reason = _safe_str(raw.get("selection_reason"))
-        reco_reason = _safe_str(raw.get("recommendation_reason"))
-        conf = raw.get("forecast_confidence")
-        overall = raw.get("overall_score")
-        risk_bucket = _safe_str(raw.get("risk_bucket"))
+        sym        = _safe_str(raw.get("symbol") or raw.get("ticker"))
+        name       = _safe_str(raw.get("name") or "")
+        rank       = _as_int(raw.get("top10_rank")) or i
+        roi_val    = raw.get(roi_key)
+        reco       = _safe_str(raw.get("recommendation") or "")
+        sel_reason = _safe_str(raw.get("selection_reason") or raw.get("recommendation_reason") or "")
+        conf       = raw.get("forecast_confidence")
+        overall    = _as_float(raw.get("overall_score"))
+        risk_bkt   = _safe_str(raw.get("risk_bucket") or "")
+
+        # Signal from recommendation
+        sig = _signal_from_reco(reco) or _signal_from_score(overall)
+
         note_parts: List[str] = []
         if name:
             note_parts.append(name)
@@ -852,32 +1102,172 @@ def _build_top10_context_rows(*, keys: Sequence[str], top10_payload: Dict[str, A
             note_parts.append(f"reco={reco}")
         if conf is not None:
             note_parts.append(f"conf={_fmt_pct(conf)}")
-        if risk_bucket:
-            note_parts.append(f"risk={risk_bucket}")
+        if risk_bkt:
+            note_parts.append(f"risk={risk_bkt}")
         if sel_reason:
-            note_parts.append(f"why={sel_reason}")
-        elif reco_reason:
-            note_parts.append(f"why={reco_reason}")
-        rows.append(_make_row(keys=keys, section="Top 10 Investments", item=f"#{rank}", symbol=sym, metric=roi_horizon_key, value=_pct_points(roi_val) if roi_val is not None else "", notes=" | ".join(note_parts) if note_parts else "Top10 ranked item.", last_updated_riyadh=ts))
-        if overall is not None:
-            rows.append(_make_row(keys=keys, section="Top 10 Context", item=f"#{rank} Overall Score", symbol=sym, metric="overall_score", value=overall, notes=f"Rank={rank}" + (f" | {name}" if name else ""), last_updated_riyadh=ts))
-        if sel_reason or reco_reason:
-            rows.append(_make_row(keys=keys, section="Top 10 Context", item=f"#{rank} Selection Logic", symbol=sym, metric="selection_reason", value=rank, notes=sel_reason or reco_reason, last_updated_riyadh=ts))
+            note_parts.append(sel_reason)
+
+        rows.append(_make_row(
+            keys=keys, section="Top Opportunities", category=f"Rank {rank}",
+            item=f"#{rank} {sym}", symbol=sym, metric=roi_key,
+            value=_fmt_pct(roi_val) if roi_val is not None else "",
+            signal=sig, score=round(overall, 1) if overall is not None else "",
+            notes=" | ".join(note_parts) if note_parts else "Top10 ranked item.",
+            last_updated_riyadh=ts,
+        ))
+
     return rows
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Section 4: Portfolio Health
+# =============================================================================
+
+def _build_portfolio_health_rows(
+    *,
+    keys: Sequence[str],
+    symbols: List[str],
+    qmap: Dict[str, Dict[str, Any]],
+    ts: str,
+) -> List[Dict[str, Any]]:
+    """
+    Section 4 -- Portfolio Health.
+
+    Reads from My_Portfolio's dedicated fields (portfolio_table schema v3.0.0):
+      position_qty, avg_cost, current_price -> position_cost, position_value, unrealized_pl
+      day_pl -> today's movement
+      risk_score -> at-risk count
+
+    Signal: OK (positive P/L), WARN (small negative), ALERT (large negative).
+    Score: portfolio health score based on P/L % and at-risk count.
+    """
+    rows: List[Dict[str, Any]] = []
+
+    total_cost = 0.0
+    total_value = 0.0
+    total_day_pl = 0.0
+    at_risk_count = 0
+    position_count = 0
+    have_positions = False
+
+    for sym in symbols:
+        d = qmap.get(sym) or {}
+        qty     = _as_float(_pick(d, "position_qty"))
+        avg_c   = _as_float(_pick(d, "avg_cost"))
+        px      = _as_float(_pick(d, "current_price"))
+        day_pl  = _as_float(_pick(d, "day_pl"))
+        risk_sc = _as_float(_pick(d, "risk_score"))
+
+        if qty is None or avg_c is None or qty == 0:
+            continue
+
+        have_positions = True
+        position_count += 1
+        cost  = float(qty) * float(avg_c)
+        total_cost += cost
+        if px is not None:
+            total_value += float(qty) * float(px)
+        if day_pl is not None:
+            total_day_pl += float(day_pl)
+        if risk_sc is not None and risk_sc > 60.0:
+            at_risk_count += 1
+
+    if not have_positions:
+        rows.append(_make_row(
+            keys=keys, section="Portfolio Health", category="Status",
+            item="Portfolio", symbol="", metric="status",
+            value="No Positions", signal=_SIGNAL_NEUTRAL, score="",
+            notes="No position_qty / avg_cost found. Enter your holdings in My_Portfolio.",
+            last_updated_riyadh=ts,
+        ))
+        return rows
+
+    unrealized_pl = total_value - total_cost
+    unreal_pct    = (unrealized_pl / total_cost) if total_cost > 0 else None
+    pl_signal     = _signal_from_pl_pct(unreal_pct)
+
+    # Health score: 100 = all positive, decreases with negative P/L and at-risk positions
+    health_score = 60.0
+    if unreal_pct is not None:
+        pct_pts = _pct_points(unreal_pct) or 0.0
+        health_score += min(30.0, max(-30.0, pct_pts))
+    if position_count > 0:
+        at_risk_ratio = at_risk_count / position_count
+        health_score -= at_risk_ratio * 20.0
+    health_score = round(min(100.0, max(0.0, health_score)), 1)
+
+    rows.append(_make_row(
+        keys=keys, section="Portfolio Health", category="Summary",
+        item="Positions", symbol="", metric="position_count",
+        value=position_count, signal="", score=health_score,
+        notes=f"{at_risk_count} position(s) with risk_score > 60.",
+        last_updated_riyadh=ts,
+    ))
+    rows.append(_make_row(
+        keys=keys, section="Portfolio Health", category="Cost & Value",
+        item="Total Cost", symbol="", metric="total_cost",
+        value=round(total_cost, 2), signal="", score="",
+        notes="Sum(position_qty * avg_cost).",
+        last_updated_riyadh=ts,
+    ))
+    rows.append(_make_row(
+        keys=keys, section="Portfolio Health", category="Cost & Value",
+        item="Total Value", symbol="", metric="total_value",
+        value=round(total_value, 2), signal="", score="",
+        notes="Sum(position_qty * current_price).",
+        last_updated_riyadh=ts,
+    ))
+    rows.append(_make_row(
+        keys=keys, section="Portfolio Health", category="P/L",
+        item="Unrealized P/L", symbol="", metric="unrealized_pl",
+        value=round(unrealized_pl, 2), signal=pl_signal, score=health_score,
+        notes="total_value - total_cost.",
+        last_updated_riyadh=ts,
+    ))
+    if unreal_pct is not None:
+        rows.append(_make_row(
+            keys=keys, section="Portfolio Health", category="P/L",
+            item="Unrealized P/L %", symbol="", metric="unrealized_pl_pct",
+            value=_fmt_pct(unreal_pct), signal=pl_signal, score="",
+            notes=f"unrealized_pl / total_cost. Signal: {pl_signal}.",
+            last_updated_riyadh=ts,
+        ))
+    if total_day_pl != 0.0:
+        day_signal = _SIGNAL_UP if total_day_pl > 0 else _SIGNAL_DOWN
+        rows.append(_make_row(
+            keys=keys, section="Portfolio Health", category="P/L",
+            item="Today's P/L", symbol="", metric="day_pl",
+            value=round(total_day_pl, 2), signal=day_signal, score="",
+            notes="Sum(day_pl) from My_Portfolio positions.",
+            last_updated_riyadh=ts,
+        ))
+    if at_risk_count > 0:
+        rows.append(_make_row(
+            keys=keys, section="Portfolio Health", category="Risk",
+            item="At-Risk Positions", symbol="", metric="at_risk_count",
+            value=at_risk_count, signal=_SIGNAL_WARN if at_risk_count < position_count else _SIGNAL_ALERT,
+            score="",
+            notes=f"{at_risk_count}/{position_count} positions have risk_score > 60. Review or reduce.",
+            last_updated_riyadh=ts,
+        ))
+
+    return rows
+
+
+# =============================================================================
 # Auto-universe defaults
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 def _default_universes() -> Dict[str, List[str]]:
-    indices = _env_csv("TFB_INSIGHTS_INDICES", "TASI,NOMU,^GSPC,^IXIC,^FTSE")
-    commodities_fx = _env_csv("TFB_INSIGHTS_COMMODITIES_FX", "GC=F,BZ=F,USDSAR=X,EURUSD=X")
+    indices       = _env_csv("TFB_INSIGHTS_INDICES",       "TASI,NOMU,^GSPC,^IXIC,^FTSE")
+    commodities_fx = _env_csv("TFB_INSIGHTS_COMMODITIES_FX","GC=F,BZ=F,USDSAR=X,EURUSD=X")
     return {"Indices & Benchmarks": indices, "Commodities & FX": commodities_fx}
 
 
-# -----------------------------------------------------------------------------
-# Main builder
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Main builder (executive 4-section layout)
+# =============================================================================
+
 async def build_insights_analysis_rows(
     *,
     engine: Optional[Any] = None,
@@ -890,32 +1280,66 @@ async def build_insights_analysis_rows(
     auto_universe_when_empty: bool = True,
     include_top10_section: bool = True,
     include_portfolio_kpis: bool = True,
-    max_symbols_per_universe: int = _DEFAULT_MAX_SYMBOLS_PER_UNIVERSE,
+    max_symbols_per_universe: int = _DEFAULT_MAX_SYMBOLS_PER_UNIV,
     quotes_timeout_sec: float = _DEFAULT_QUOTES_TIMEOUT_SEC,
     top10_timeout_sec: float = _DEFAULT_TOP10_TIMEOUT_SEC,
     build_budget_sec: float = _DEFAULT_BUILD_BUDGET_SEC,
 ) -> Dict[str, Any]:
+    """
+    Build the Insights_Analysis page rows (10-column executive layout).
+
+    Generates 4 sections:
+      1. Market Summary    -- trend signals per universe (include_market_summary)
+      2. Risk Scenarios    -- Conservative/Moderate/Aggressive (include_risk_scenarios)
+      3. Top Opportunities -- Top 10 with score + signal (include_top10_section)
+      4. Portfolio Health  -- P/L KPIs with OK/WARN/ALERT (include_portfolio_kpis)
+
+    Section flags are read from both function parameters and criteria dict.
+    Criteria dict flags take precedence if explicitly set.
+    """
     headers, keys, schema_source = get_insights_schema()
     ts = _now_riyadh_iso()
     norm_criteria = _normalize_criteria_input(criteria)
     warnings: List[str] = []
     rows: List[Dict[str, Any]] = []
+
+    # Merge section flags: function params OR criteria dict
+    do_market_summary    = include_top10_section and norm_criteria.get("include_market_summary", True)
+    do_risk_scenarios    = norm_criteria.get("include_risk_scenarios", True)
+    do_top_opportunities = include_top10_section and norm_criteria.get("include_top_opportunities", True)
+    do_portfolio_health  = include_portfolio_kpis and norm_criteria.get("include_portfolio_health", True)
+
     deadline = asyncio.get_running_loop().time() + max(1.0, float(build_budget_sec))
 
+    # --- Criteria block ---
     if include_criteria_rows:
         rows.extend(build_criteria_rows(criteria=norm_criteria, last_updated_riyadh=ts))
 
+    # --- System rows ---
     if include_system_rows:
         schema_version = ""
         try:
             from core.sheets.schema_registry import SCHEMA_VERSION as _SV  # type: ignore
             schema_version = _safe_str(_SV)
         except Exception:
-            schema_version = ""
-        rows.append(_make_row(keys=keys, section="System", item="Builder Version", symbol="", metric="insights_builder_version", value=INSIGHTS_BUILDER_VERSION, notes="core/analysis/insights_builder.py", last_updated_riyadh=ts))
+            pass
+        rows.append(_make_row(
+            keys=keys, section="System", category="Version",
+            item="Builder Version", symbol="", metric="insights_builder_version",
+            value=INSIGHTS_BUILDER_VERSION, signal="", score="",
+            notes="core/analysis/insights_builder.py",
+            last_updated_riyadh=ts,
+        ))
         if schema_version:
-            rows.append(_make_row(keys=keys, section="System", item="Schema Version", symbol="", metric="schema_version", value=schema_version, notes="core/sheets/schema_registry.py", last_updated_riyadh=ts))
+            rows.append(_make_row(
+                keys=keys, section="System", category="Version",
+                item="Schema Version", symbol="", metric="schema_version",
+                value=schema_version, signal="", score="",
+                notes="core/sheets/schema_registry.py",
+                last_updated_riyadh=ts,
+            ))
 
+    # --- Resolve universes ---
     eff_universes: Dict[str, List[str]] = {}
     if universes:
         for name, seq in universes.items():
@@ -932,110 +1356,188 @@ async def build_insights_analysis_rows(
         auto_used = True
 
     build_ok = bool(engine) and bool(eff_universes)
-    rows.append(_make_row(keys=keys, section="System", item="Build Status", symbol="", metric="build_status", value="OK" if build_ok else "WARN", notes="OK = engine + universes available. WARN = criteria/system only (no engine or no universes).", last_updated_riyadh=ts))
-    rows.append(_make_row(keys=keys, section="Summary", item="Sections Included", symbol="", metric="sections", value=", ".join(list(eff_universes.keys())) if eff_universes else "None", notes="Auto-universe applied." if auto_used else "Universes provided by caller (or none).", last_updated_riyadh=ts))
-    rows.append(_make_row(keys=keys, section="Summary", item="Criteria Summary", symbol="", metric="criteria_summary", value=_days_to_horizon(int(norm_criteria["invest_period_days"])), notes=_criteria_summary_note(norm_criteria), last_updated_riyadh=ts))
+    rows.append(_make_row(
+        keys=keys, section="System", category="Status",
+        item="Build Status", symbol="", metric="build_status",
+        value="OK" if build_ok else "WARN",
+        signal=_SIGNAL_OK if build_ok else _SIGNAL_WARN, score="",
+        notes="OK = engine + universes available. WARN = criteria/system only.",
+        last_updated_riyadh=ts,
+    ))
 
+    # Early exit if engine or universes unavailable
     if not engine or not eff_universes:
-        if not engine:
-            rows.append(_make_row(keys=keys, section="Summary", item="Engine", symbol="", metric="engine_status", value="Not provided", notes="No engine passed; returning schema-correct rows (criteria/system/summary only).", last_updated_riyadh=ts))
-        elif not eff_universes:
-            rows.append(_make_row(keys=keys, section="Summary", item="Universes", symbol="", metric="universe_status", value="Empty", notes="No universes/symbols provided and auto-universe disabled.", last_updated_riyadh=ts))
-        return {
-            "status": "success",
-            "page": "Insights_Analysis",
-            "headers": headers,
-            "keys": keys,
-            "rows": rows,
-            "row_objects": rows,
-            "rows_matrix": _rows_to_matrix(rows, keys),
-            "meta": {
-                "schema_source": schema_source,
-                "generated_at_riyadh": ts,
-                "engine_used": bool(engine),
-                "auto_universe_used": auto_used,
-                "universes": list(eff_universes.keys()),
-                "mode": mode,
-                "builder_version": INSIGHTS_BUILDER_VERSION,
-                "criteria_snapshot": _criteria_snapshot_text(norm_criteria),
-                "warnings": warnings,
-            },
-        }
+        msg = "No engine passed." if not engine else "No universes/symbols provided."
+        rows.append(_make_row(
+            keys=keys, section="System", category="Status",
+            item="Engine", symbol="", metric="engine_status",
+            value="Not provided" if not engine else "Universes Empty",
+            signal=_SIGNAL_WARN, score="",
+            notes=msg + " Returning criteria/system rows only.",
+            last_updated_riyadh=ts,
+        ))
+        # Still generate Risk Scenarios even without engine
+        if do_risk_scenarios:
+            rows.extend(_build_risk_scenario_rows(keys=keys, norm_criteria=norm_criteria, ts=ts))
+        return _wrap_result(headers=headers, keys=keys, rows=rows, schema_source=schema_source,
+                            ts=ts, engine_used=bool(engine), auto_used=auto_used,
+                            eff_universes=eff_universes, mode=mode, norm_criteria=norm_criteria,
+                            warnings=warnings, quotes_timeout_sec=quotes_timeout_sec,
+                            top10_timeout_sec=top10_timeout_sec, build_budget_sec=build_budget_sec)
 
-    try:
-        cap = max(1, min(int(max_symbols_per_universe), 500))
-    except Exception:
-        cap = _DEFAULT_MAX_SYMBOLS_PER_UNIVERSE
+    cap = max(1, min(int(max_symbols_per_universe), 500))
+
+    # ===========================================================================
+    # Section 1: Market Summary (one block per universe)
+    # ===========================================================================
+    portfolio_qmap: Dict[str, Dict[str, Any]] = {}
+    portfolio_symbols: List[str] = []
 
     for section_name, sym_list in eff_universes.items():
         remaining = _remaining_budget(deadline)
         if remaining is not None and remaining <= 0.10:
-            warnings.append(f"Skipped section '{section_name}' because build budget was exhausted.")
-            rows.append(_warning_row(keys, "build_budget_exhausted", f"Skipped section '{section_name}' because build budget was exhausted.", ts))
+            warnings.append(f"Skipped '{section_name}' -- build budget exhausted.")
+            rows.append(_warning_row(keys, "build_budget_exhausted", f"Skipped '{section_name}' -- budget.", ts))
             break
+
         syms = _dedupe_keep_order(sym_list or [])[:cap]
         try:
-            qmap = await _fetch_quotes_map(engine, syms, mode=mode or "", timeout_sec=min(quotes_timeout_sec, remaining or quotes_timeout_sec))
+            qmap = await _fetch_quotes_map(engine, syms, mode=mode or "",
+                                            timeout_sec=min(quotes_timeout_sec, remaining or quotes_timeout_sec))
         except Exception as exc:
             qmap = {}
-            warnings.append(f"Quote fetch degraded for section '{section_name}': {exc}")
-            rows.append(_warning_row(keys, "quote_fetch_degraded", f"Section '{section_name}' degraded: {exc}", ts))
-        rows.extend(_build_universe_snapshot_rows(keys=keys, section=section_name, symbols=syms, qmap=qmap, ts=ts))
-        if include_portfolio_kpis and section_name.strip().lower() in {"my_portfolio", "portfolio", "my portfolio", "selected symbols"}:
-            rows.extend(_build_portfolio_kpi_rows(keys=keys, section="Portfolio KPIs", symbols=syms, qmap=qmap, ts=ts))
+            warnings.append(f"Quote fetch degraded for '{section_name}': {exc}")
+            rows.append(_warning_row(keys, "quote_fetch_degraded", f"'{section_name}': {exc}", ts))
 
-    if include_top10_section:
+        if do_market_summary:
+            rows.extend(_build_market_summary_rows(
+                keys=keys, section_name=section_name, symbols=syms, qmap=qmap, ts=ts,
+            ))
+
+        # Capture portfolio data for Section 4
+        if section_name.strip().lower() in {"my_portfolio", "portfolio", "my portfolio", "selected symbols"}:
+            portfolio_qmap = qmap
+            portfolio_symbols = syms
+
+    # ===========================================================================
+    # Section 2: Risk Scenarios
+    # ===========================================================================
+    if do_risk_scenarios:
+        rows.extend(_build_risk_scenario_rows(keys=keys, norm_criteria=norm_criteria, ts=ts))
+
+    # ===========================================================================
+    # Section 3: Top Opportunities
+    # ===========================================================================
+    if do_top_opportunities:
         remaining = _remaining_budget(deadline)
         if remaining is not None and remaining <= 0.25:
-            warnings.append("Skipped Top10 context because the remaining build budget was too small.")
-            rows.append(_warning_row(keys, "top10_skipped", "Skipped Top10 context because the remaining build budget was too small.", ts))
+            warnings.append("Skipped Top Opportunities -- build budget too small.")
+            rows.append(_warning_row(keys, "top10_skipped", "Skipped Top Opportunities -- budget.", ts))
         else:
             top10_payload: Dict[str, Any] = {}
             try:
-                top10_payload = await _fetch_top10_payload(engine, criteria=norm_criteria, limit=10, mode=mode or "", timeout_sec=min(top10_timeout_sec, remaining or top10_timeout_sec))
+                top10_payload = await _fetch_top10_payload(
+                    engine, criteria=norm_criteria, limit=norm_criteria.get("top_n", 10),
+                    mode=mode or "", timeout_sec=min(top10_timeout_sec, remaining or top10_timeout_sec),
+                )
             except Exception as exc:
                 warnings.append(f"Top10 payload degraded: {exc}")
-                rows.append(_warning_row(keys, "top10_payload_degraded", f"Top10 payload degraded: {exc}", ts))
+                rows.append(_warning_row(keys, "top10_payload_degraded", f"Top10 degraded: {exc}", ts))
+
             if top10_payload:
-                rows.extend(_build_top10_context_rows(keys=keys, top10_payload=top10_payload, criteria=norm_criteria, ts=ts))
+                rows.extend(_build_top_opportunities_rows(
+                    keys=keys, top10_payload=top10_payload, norm_criteria=norm_criteria, ts=ts,
+                ))
             else:
+                # Fallback: symbol-only top10 with quote enrichment
                 try:
-                    top10_syms = await _fetch_top10_symbols(engine, criteria=norm_criteria, limit=10, timeout_sec=min(top10_timeout_sec, _remaining_budget(deadline) or top10_timeout_sec))
+                    top10_syms = await _fetch_top10_symbols(
+                        engine, criteria=norm_criteria, limit=norm_criteria.get("top_n", 10),
+                        timeout_sec=min(top10_timeout_sec, _remaining_budget(deadline) or top10_timeout_sec),
+                    )
                 except Exception as exc:
                     top10_syms = []
                     warnings.append(f"Top10 symbols degraded: {exc}")
-                    rows.append(_warning_row(keys, "top10_symbols_degraded", f"Top10 symbols degraded: {exc}", ts))
+
                 if top10_syms:
                     try:
-                        qmap10 = await _fetch_quotes_map(engine, top10_syms, mode=mode or "", timeout_sec=min(quotes_timeout_sec, _remaining_budget(deadline) or quotes_timeout_sec))
+                        qmap10 = await _fetch_quotes_map(
+                            engine, top10_syms, mode=mode or "",
+                            timeout_sec=min(quotes_timeout_sec, _remaining_budget(deadline) or quotes_timeout_sec),
+                        )
                     except Exception as exc:
                         qmap10 = {}
                         warnings.append(f"Top10 quote enrichment degraded: {exc}")
-                        rows.append(_warning_row(keys, "top10_quote_degraded", f"Top10 quote enrichment degraded: {exc}", ts))
-                    rows.append(_make_row(keys=keys, section="Top 10 Investments", item="Status", symbol="", metric="top10_count", value=len(top10_syms), notes="Top10 symbols generated (best-effort symbol-only fallback).", last_updated_riyadh=ts))
-                    for i, sym in enumerate(top10_syms, start=1):
-                        d = qmap10.get(sym) or {}
-                        roi3 = _as_float(_pick(d, "expected_roi_3m"))
-                        conf = _as_float(_pick(d, "forecast_confidence"))
-                        reco = _safe_str(_pick(d, "recommendation"))
-                        name = _safe_str(_pick(d, "name"))
-                        note_parts: List[str] = []
-                        if name:
-                            note_parts.append(name)
-                        if conf is not None:
-                            note_parts.append(f"conf={_fmt_pct(conf)}")
-                        if reco:
-                            note_parts.append(f"reco={reco}")
-                        notes = " | ".join(note_parts) if note_parts else "Top10 item."
-                        if roi3 is not None:
-                            notes = notes + f" (display: {_fmt_pct(roi3)})"
-                        rows.append(_make_row(keys=keys, section="Top 10 Investments", item=f"#{i}", symbol=sym, metric="expected_roi_3m", value=_pct_points(roi3) if roi3 is not None else "", notes=notes, last_updated_riyadh=ts))
-                else:
-                    rows.append(_make_row(keys=keys, section="Top 10 Investments", item="Status", symbol="", metric="top10_status", value="Unavailable", notes="No Top10 method found or returned empty.", last_updated_riyadh=ts))
 
+                    rows.extend(_build_top_opportunities_rows(
+                        keys=keys, top10_payload={"rows": [
+                            {**qmap10.get(s, {"symbol": s}), "symbol": s, "top10_rank": i}
+                            for i, s in enumerate(top10_syms, 1)
+                        ]}, norm_criteria=norm_criteria, ts=ts,
+                    ))
+                else:
+                    rows.append(_make_row(
+                        keys=keys, section="Top Opportunities", category="Status",
+                        item="Status", symbol="", metric="top10_status",
+                        value="Unavailable", signal=_SIGNAL_WARN, score="",
+                        notes="No Top10 method found or returned empty.",
+                        last_updated_riyadh=ts,
+                    ))
+
+    # ===========================================================================
+    # Section 4: Portfolio Health
+    # ===========================================================================
+    if do_portfolio_health:
+        if portfolio_symbols and portfolio_qmap:
+            rows.extend(_build_portfolio_health_rows(
+                keys=keys, symbols=portfolio_symbols, qmap=portfolio_qmap, ts=ts,
+            ))
+        else:
+            # Try to fetch My_Portfolio specifically if not in universes
+            remaining = _remaining_budget(deadline)
+            if remaining and remaining > 0.5:
+                portfolio_universe = eff_universes.get("My_Portfolio") or eff_universes.get("my_portfolio")
+                if not portfolio_universe:
+                    rows.append(_make_row(
+                        keys=keys, section="Portfolio Health", category="Status",
+                        item="Status", symbol="", metric="portfolio_status",
+                        value="Not Included", signal=_SIGNAL_NEUTRAL, score="",
+                        notes="My_Portfolio not in universes. Add My_Portfolio to pages_selected criteria.",
+                        last_updated_riyadh=ts,
+                    ))
+            else:
+                rows.append(_warning_row(keys, "portfolio_health_skipped", "Portfolio Health skipped -- budget.", ts))
+
+    # Prepend warning summary if any
     if warnings:
         rows.insert(0, _warning_row(keys, "builder_warnings", " | ".join(warnings[:3]), ts))
 
+    return _wrap_result(
+        headers=headers, keys=keys, rows=rows, schema_source=schema_source,
+        ts=ts, engine_used=True, auto_used=auto_used,
+        eff_universes=eff_universes, mode=mode, norm_criteria=norm_criteria,
+        warnings=warnings, quotes_timeout_sec=quotes_timeout_sec,
+        top10_timeout_sec=top10_timeout_sec, build_budget_sec=build_budget_sec,
+    )
+
+
+def _wrap_result(
+    *,
+    headers: List[str],
+    keys: List[str],
+    rows: List[Dict[str, Any]],
+    schema_source: str,
+    ts: str,
+    engine_used: bool,
+    auto_used: bool,
+    eff_universes: Dict[str, List[str]],
+    mode: str,
+    norm_criteria: Dict[str, Any],
+    warnings: List[str],
+    quotes_timeout_sec: float,
+    top10_timeout_sec: float,
+    build_budget_sec: float,
+) -> Dict[str, Any]:
     return {
         "status": "partial" if warnings else "success",
         "page": "Insights_Analysis",
@@ -1046,13 +1548,14 @@ async def build_insights_analysis_rows(
         "rows_matrix": _rows_to_matrix(rows, keys),
         "meta": {
             "schema_source": schema_source,
+            "schema_columns": len(keys),
             "generated_at_riyadh": ts,
-            "engine_used": True,
+            "engine_used": engine_used,
             "auto_universe_used": auto_used,
             "universes": list(eff_universes.keys()),
             "mode": mode,
             "builder_version": INSIGHTS_BUILDER_VERSION,
-            "criteria_snapshot": _criteria_snapshot_text(norm_criteria),
+            "criteria_snapshot": _compact_json(norm_criteria),
             "warnings": warnings,
             "quotes_timeout_sec": quotes_timeout_sec,
             "top10_timeout_sec": top10_timeout_sec,
