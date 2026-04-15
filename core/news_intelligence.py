@@ -2,12 +2,18 @@
 """
 core/news_intelligence.py
 ================================================================================
-Advanced News Intelligence Engine — v4.0.0
+Advanced News Intelligence Engine -- v4.1.0
 ================================================================================
 RENDER-SAFE • IMPORT-SAFE • LAZY-ML • RSS/GOOGLE SAFE • CACHE-BACKED • ASYNC-SAFE
 
-Why this revision
------------------
+v4.1.0 changes vs v4.0.0
+-------------------------
+- Schema-alignment audit: confirmed clean (no schema_registry, page_catalog,
+  reco constants, or instrument-schema keys used — this module is NLP-only).
+- Version bump only; all v4.0.0 behavior preserved unchanged.
+
+Why v4.0.0 was written
+-----------------------
 - Removes import-time heavy initialization that can hurt Render startup.
 - No nltk.download() / transformer model loading / Redis connections at import-time.
 - Optional dependencies are discovered lazily and loaded only when used.
@@ -100,7 +106,7 @@ except Exception:
                 pass
         return str(obj)
 
-__version__ = "4.0.0"
+__version__ = "4.1.0"
 NEWS_VERSION = __version__
 
 logger = logging.getLogger("core.news_intelligence")
