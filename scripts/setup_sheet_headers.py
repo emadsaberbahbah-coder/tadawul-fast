@@ -2,7 +2,7 @@
 # scripts/run_sheet_init.py
 """
 ================================================================================
-TADAWUL FAST BRIDGE — SHEET INITIALIZER — v6.2.0 (STABLE / ALIGNED / FAST)
+TADAWUL FAST BRIDGE — SHEET INITIALIZER — v6.3.0 (STABLE / ALIGNED / FAST)
 ================================================================================
 
 What this script does
@@ -33,7 +33,16 @@ Usage
 Env
 - DEFAULT_SPREADSHEET_ID (recommended)
 - CORE_TRACING_ENABLED (optional)
-- TFB_PERCENT_MODE=points|fraction  (default: points)
+- TFB_PERCENT_MODE=points|fraction  (default: points — MUST match backend output format)
+
+What v6.3.0 fixes vs v6.2.0
+- FIX: DEFAULT_TABS removed KSA_Tadawul (forbidden page — sheets service blocks
+       writes to it). Added Top_10_Investments and Data_Dictionary (were missing
+       from the canonical 8-page set).
+- FIX: infer_field_type() covers ROE, ROA, Volatility, Drawdown, ROI, Payout Ratio,
+       Beta, Sharpe, VaR — previously all fell to STRING with no number format.
+- FIX: resolve_percent_mode() logs clearly what mode is in use + warns if
+       TFB_PERCENT_MODE is unset (ops visibility, avoids silent misconfiguration).
 ================================================================================
 """
 
@@ -57,7 +66,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 # Version + Logging
 # =============================================================================
 
-SCRIPT_VERSION = "6.2.0"
+SCRIPT_VERSION = "6.3.0"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -292,10 +301,45 @@ class PercentMode(str, Enum):
 
 
 def resolve_percent_mode(cli_value: Optional[str]) -> PercentMode:
-    raw = (cli_value or os.getenv("TFB_PERCENT_MODE") or "points").strip().lower()
+    """
+    Resolve the percent column format mode.
+
+    CRITICAL — get this wrong and every percent-like column explodes 100x:
+    - points (default): backend emits 1.23 meaning 1.23%.
+      Columns formatted as NUMBER "0.00" → display shows "1.23".
+      If PERCENT format were used instead, Sheets multiplies by 100 → "123%". WRONG.
+    - fraction: backend emits 0.0123 meaning 1.23%.
+      Columns formatted as PERCENT "0.00%" → display shows "1.23%". Correct.
+
+    The TFB backend currently emits percent-points, so "points" is the correct
+    mode. Only change to "fraction" if the backend data format changes.
+
+    Set via --percent-mode CLI arg or TFB_PERCENT_MODE env var.
+    """
+    env_val = os.getenv("TFB_PERCENT_MODE", "").strip().lower()
+    raw = (cli_value or env_val or "").strip().lower()
+
     if raw in {"fraction", "decimal", "dec"}:
-        return PercentMode.FRACTION
-    return PercentMode.POINTS
+        mode = PercentMode.FRACTION
+    else:
+        mode = PercentMode.POINTS
+
+    # Log clearly so ops can verify the mode in use
+    if not env_val and not cli_value:
+        logger.info(
+            "TFB_PERCENT_MODE not set — defaulting to 'points'. "
+            "Percent columns will use NUMBER format (0.00) not PERCENT format. "
+            "Set TFB_PERCENT_MODE=fraction only if the backend emits fractional values (0.0123 = 1.23%%)."
+        )
+    elif mode == PercentMode.FRACTION:
+        logger.warning(
+            "TFB_PERCENT_MODE=fraction: percent columns will use PERCENT format (Sheets multiplies by 100). "
+            "Only correct if backend emits fractions. Current TFB backend emits percent-points."
+        )
+    else:
+        logger.info("TFB_PERCENT_MODE=points: percent columns formatted as NUMBER (0.00). Correct for current TFB backend.")
+
+    return mode
 
 
 # =============================================================================
@@ -335,7 +379,13 @@ def infer_field_type(header: str) -> FieldType:
     if any(x in h for x in ("volume", "shares", "count", "points")):
         return FieldType.INT
 
-    # percent-ish fields (your schema uses lots of these)
+    # FIX v6.3.0: Extended percent-like field detection.
+    # Previously ROE, ROA, Volatility, Drawdown, ROI, Payout, Beta were all
+    # falling through to STRING, receiving no number format.
+    # - ROE/ROA: Return on Equity/Assets → percent (0-100 scale in our backend)
+    # - Volatility/Drawdown/VaR: risk metrics expressed as percent
+    # - ROI fields: Expected ROI 1M/3M/12M → percent
+    # - Payout Ratio, Beta, Sharpe: ratio/percent metrics
     if (
         "%" in h
         or "percent" in h
@@ -345,8 +395,22 @@ def infer_field_type(header: str) -> FieldType:
         or "turnover" in h
         or "upside" in h
         or "position" in h
+        # FIX: Added patterns below
+        or "roi" in h
+        or "return" in h
+        or "volatility" in h
+        or "drawdown" in h
+        or h.startswith("roe")
+        or h.startswith("roa")
+        or "payout" in h
+        or "float %" in h
+        or ("unrealized" in h and "p/l" in h)
     ):
         return FieldType.PERCENT
+
+    # FIX v6.3.0: Beta and Sharpe ratio are numeric (not percent; can be > 1)
+    if any(x in h for x in ("beta", "sharpe", "var ")):
+        return FieldType.NUMBER
 
     if any(x in h for x in ("price", "close", "open", "high", "low", "cap", "eps", "p/e", "p/b", "p/s", "ev/ebitda", "value")):
         return FieldType.NUMBER
@@ -779,13 +843,18 @@ class SheetManager:
 # =============================================================================
 
 DEFAULT_TABS = [
+    # 5 source pages — these hold live enriched data from providers
     "Market_Leaders",
-    "KSA_Tadawul",
     "Global_Markets",
     "Mutual_Funds",
     "Commodities_FX",
     "My_Portfolio",
+    # 3 derived output pages — generated by analysis/advisor/data-dictionary builders
     "Insights_Analysis",
+    "Top_10_Investments",
+    "Data_Dictionary",
+    # NOTE: KSA_Tadawul and Advisor_Criteria are FORBIDDEN/REMOVED pages.
+    # Do NOT add them here — google_sheets_service.py blocks writes to them.
 ]
 
 
