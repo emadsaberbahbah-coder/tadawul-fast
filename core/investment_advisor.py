@@ -3,29 +3,14 @@
 """
 core/investment_advisor.py
 ================================================================================
-INVESTMENT ADVISOR ORCHESTRATOR — v4.4.0
+INVESTMENT ADVISOR ORCHESTRATOR -- v4.5.0
 ================================================================================
 LIVE-BY-DEFAULT • ENGINE-FIRST • SNAPSHOT-TOLERANT • ROUTE-COMPATIBLE
 MODE-AWARE • SCHEMA-SAFE • JSON-SAFE • IMPORT-SAFE • WORKER-THREAD SAFE
 SPECIAL-PAGE SAFE • CONTRACT-PRESERVING • DICTIONARY-HARDENED
 
-What v4.4.0 revises
--------------------
-- FIX CRITICAL: _score_recommendation() returned non-canonical labels
-  ("Strong Buy", "Buy", "Hold", "Reduce", "Avoid"). "Avoid" appeared verbatim
-  in Google Sheets because no downstream normalizer recognized it. "Strong Buy"
-  and title-case variants were not matched by RECOMMENDATION_LABEL_MAP.
-  Fixed to use canonical 5-value vocabulary: STRONG_BUY/BUY/HOLD/REDUCE/SELL.
-- FIX: "Hold" hardcoded at line 1195 (fallback symbol row seed) → RECO_HOLD.
-- FIX: _criteria_fingerprint() did NOT sort symbols list before hashing.
-  ["AAPL","MSFT"] and ["MSFT","AAPL"] produced different cache keys → same
-  request with differently-ordered symbols missed the cache, inflated the
-  snapshot store, and could return inconsistent results. Fixed with sorted().
-- ENH: Added reco_normalize import with local fallback constants so this module
-  stays import-safe even if core.reco_normalize is unavailable.
-
-What v4.3.0 revised
--------------------
+What this revision fixes
+------------------------
 - FIX: keeps this module as an orchestration wrapper over the engine rather
          than becoming a second independent engine.
 - FIX: supports aligned engine output shapes including:
@@ -65,14 +50,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, MutableMapping,
 logger = logging.getLogger("core.investment_advisor")
 logger.addHandler(logging.NullHandler())
 
-INVESTMENT_ADVISOR_VERSION = "4.4.0"
-
-# ---------------------------------------------------------------------------
-# Canonical recommendation constants — import with fallback.
-# FIX v4.4.0: _score_recommendation() used non-canonical labels.
-# These constants ensure every label produced by this module is in the
-# 5-value vocabulary that downstream normalizers and Sheets display expect.
-# ---------------------------------------------------------------------------
+INVESTMENT_ADVISOR_VERSION = "4.5.0"
 try:
     from core.reco_normalize import (  # type: ignore
         RECO_STRONG_BUY,
@@ -164,11 +142,14 @@ ENGINE_OBJECT_CANDIDATES = (
 )
 ENGINE_OBJECT_METHOD_CANDIDATES = ENGINE_FUNCTION_CANDIDATES
 
+# FIX v4.5.0: added "schema_registry" and "page_catalog" repo-root fallbacks
 SCHEMA_MODULE_CANDIDATES = (
     "core.sheets.schema_registry",
     "core.sheets.page_catalog",
     "core.schema_registry",
     "core.schemas",
+    "schema_registry",   # repo-root fallback
+    "page_catalog",      # repo-root fallback
 )
 SCHEMA_FUNCTION_CANDIDATES = (
     "get_sheet_spec",
@@ -199,16 +180,20 @@ _GENERIC_FALLBACK_HEADERS = [
     "Recommendation",
 ]
 
-_INSIGHTS_HEADERS = ["Section", "Item", "Metric", "Value", "Notes", "Source", "Updated At"]
+# FIX v4.5.0: "Updated At" -> "Sort Order" (canonical Insights_Analysis schema key: sort_order)
+_INSIGHTS_HEADERS = ["Section", "Item", "Metric", "Value", "Notes", "Source", "Sort Order"]
+# FIX v4.5.0: aligned to canonical Data_Dictionary schema (schema_registry v3.0.0).
+# Previous: Column Key, Display Header, Section, Type, Description, Example
+# Canonical: Group, Header, Key, DType, Format (matches data_dictionary.py v3.3.0)
 _DICTIONARY_HEADERS = [
     "Sheet",
-    "Column Key",
-    "Display Header",
-    "Section",
-    "Type",
-    "Description",
-    "Example",
+    "Group",
+    "Header",
+    "Key",
+    "DType",
+    "Format",
     "Required",
+    "Source",
     "Notes",
 ]
 _TOP10_EXTRA_KEYS = ["top10_rank", "selection_reason", "criteria_snapshot"]
@@ -373,14 +358,10 @@ def _normalize_key_loose(key: str) -> str:
 
 
 def _criteria_fingerprint(criteria: Mapping[str, Any]) -> str:
-    # FIX v4.4.0: Sort symbols so ["AAPL","MSFT"] and ["MSFT","AAPL"] produce
-    # the same fingerprint. Previously different orderings created separate cache
-    # entries for identical requests, inflating the snapshot store and causing
-    # inconsistent results when the same symbols were requested in different order.
     payload = {
         "page": _normalize_page_name(criteria.get("page")) or DEFAULT_PAGE,
         "mode": _normalize_mode(criteria.get("advisor_data_mode") or criteria.get("mode")),
-        "symbols": sorted(_normalize_list(criteria.get("symbols") or criteria.get("tickers"))),
+        "symbols": sorted(_normalize_list(criteria.get("symbols") or criteria.get("tickers"))),  # FIX v4.4.0
         "limit": max(1, _safe_int(criteria.get("limit") or criteria.get("top_n"), DEFAULT_LIMIT)),
         "offset": max(0, _safe_int(criteria.get("offset"), DEFAULT_OFFSET)),
     }
@@ -436,17 +417,22 @@ def _normalize_page_name(page: Any) -> str:
     if not raw:
         return ""
 
-    try:
-        mod = importlib.import_module("core.sheets.page_catalog")
+    # FIX v4.5.0: try multiple page_catalog paths (same pattern as config.py v5.9.0)
+    for _pcat_mod_path in ("core.sheets.page_catalog", "core.page_catalog", "page_catalog"):
+        try:
+            mod = importlib.import_module(_pcat_mod_path)
+        except Exception:
+            continue
         for fn_name in ("normalize_page_name", "normalize_page", "resolve_page_name"):
             fn = getattr(mod, fn_name, None)
             if callable(fn):
-                out = fn(raw)
-                out_s = _s(out)
-                if out_s:
-                    return out_s
-    except Exception:
-        pass
+                try:
+                    out = fn(raw)
+                    out_s = _s(out)
+                    if out_s:
+                        return out_s
+                except Exception:
+                    continue
 
     direct = PAGE_ALIASES.get(raw.lower())
     if direct:
@@ -1011,25 +997,20 @@ def _normalize_headers_keys(result: Mapping[str, Any], page: str) -> Tuple[List[
 
 
 def _score_recommendation(row: Mapping[str, Any]) -> Tuple[str, str, float]:
-    """
-    Derive a canonical recommendation from row scores.
-
-    FIX v4.4.0: Was returning non-canonical labels ("Strong Buy", "Buy", "Hold",
-    "Reduce", "Avoid"). "Avoid" appeared verbatim in Google Sheets because no
-    downstream normalizer recognized it. Title-case variants ("Strong Buy" etc.)
-    were not matched by RECOMMENDATION_LABEL_MAP in the display pipeline.
-    Now returns canonical 5-value vocabulary: STRONG_BUY/BUY/HOLD/REDUCE/SELL.
-    """
     opportunity = _safe_float(row.get("opportunity_score") or row.get("overall_score") or row.get("score"), 0.0)
     overall = _safe_float(row.get("overall_score"), opportunity)
     risk = _safe_float(row.get("risk_score"), 50.0)
-    expected = _safe_float(
+    expected_raw = _safe_float(
         row.get("expected_roi_3m")
         or row.get("expected_roi_1m")
         or row.get("expected_roi")
         or row.get("forecast_return_pct"),
         0.0,
     )
+    # FIX v4.5.0: expected_roi fields are dtype=pct stored as fractions (0.03 = 3%).
+    # Without conversion the contribution is 0.20 * 0.03 = 0.006 (negligible).
+    # Convert fraction -> pct-points (e.g. 0.03 -> 3.0) when value looks like a fraction.
+    expected = expected_raw * 100.0 if abs(expected_raw) <= 1.5 and expected_raw != 0.0 else expected_raw
 
     composite = overall + (0.35 * opportunity) + (0.20 * expected) - (0.25 * risk)
 
@@ -1145,17 +1126,19 @@ def _build_data_dictionary_rows(criteria: Dict[str, Any]) -> List[Dict[str, Any]
     except Exception:
         pass
 
+    # FIX v4.5.0: use canonical Data_Dictionary keys (sheet, group, header, key, dtype,
+    # fmt, required, source, notes) matching schema_registry v3.0.0 and data_dictionary.py v3.3.0.
     return [
         {
-            "sheet": criteria.get("page") or DEFAULT_PAGE,
-            "column_key": "recommendation",
-            "display_header": "Recommendation",
-            "section": "Advisor",
-            "type": "string",
-            "description": "Advisor recommendation label",
-            "example": "Buy",
-            "required": "No",
-            "notes": "Fallback dictionary row generated by advisor wrapper",
+            "sheet":    criteria.get("page") or DEFAULT_PAGE,
+            "group":    "Advisor",
+            "header":   "Recommendation",
+            "key":      "recommendation",
+            "dtype":    "string",
+            "fmt":      None,
+            "required": False,
+            "source":   "core.investment_advisor",
+            "notes":    "Fallback dictionary row generated by advisor wrapper",
         }
     ]
 
@@ -1174,7 +1157,7 @@ def _build_special_fallback(page: str, criteria: Dict[str, Any]) -> Dict[str, An
                 "value": criteria.get("advisor_data_mode") or criteria.get("mode") or "live_quotes",
                 "notes": "Fallback insight generated by advisor wrapper",
                 "source": "core.investment_advisor",
-                "updated_at": now,
+                "sort_order": 1,  # FIX v4.5.0: was "updated_at" (non-canonical; canonical key is sort_order)
             },
             {
                 "section": "Summary",
@@ -1183,7 +1166,7 @@ def _build_special_fallback(page: str, criteria: Dict[str, Any]) -> Dict[str, An
                 "value": len(symbols) if isinstance(symbols, list) else 0,
                 "notes": "Symbol count from request payload",
                 "source": "core.investment_advisor",
-                "updated_at": now,
+                "sort_order": 2,  # FIX v4.5.0: was "updated_at"
             },
         ]
         headers = list(_INSIGHTS_HEADERS)
@@ -1241,7 +1224,7 @@ def _build_special_fallback(page: str, criteria: Dict[str, Any]) -> Dict[str, An
         if "name" in row:
             row["name"] = symbol
         if "recommendation" in row:
-            row["recommendation"] = RECO_HOLD  # FIX v4.4.0: was "Hold" (title-case, non-canonical)
+            row["recommendation"] = RECO_HOLD  # FIX v4.4.0: was "Hold" (non-canonical)
         if "top10_rank" in row:
             row["top10_rank"] = idx
         if "selection_reason" in row:
