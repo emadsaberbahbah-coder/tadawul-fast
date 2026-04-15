@@ -78,6 +78,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("MarketScan")
 
+# =============================================================================
+# Version
+# FIX v5.2.0: SCRIPT_VERSION was missing; version was hardcoded in 3 places.
+# =============================================================================
+SCRIPT_VERSION = "5.2.0"
+
 
 # =============================================================================
 # Optional JSON (orjson)
@@ -362,6 +368,9 @@ class ScanConfig:
     mode: str = "engine"  # engine | http
     backend_base_url: str = ""
     token: str = ""
+    # FIX v5.2.0: timeout_sec was referenced via cfg.timeout_sec but never defined
+    # in the dataclass — http mode would crash with AttributeError on every run.
+    timeout_sec: float = 60.0
 
     # filters
     min_price: float = 1.0
@@ -380,6 +389,74 @@ class ScanConfig:
     export_json: str = ""
     export_csv: str = ""
     export_html: str = ""
+
+    @classmethod
+    def from_worker_payload(cls, payload: Dict[str, Any]) -> "ScanConfig":
+        """
+        FIX v5.2.0: Build a ScanConfig from the worker.py task payload dict.
+
+        Previously there was no programmatic entry point — worker.py had to
+        construct a fake argparse.Namespace and call main() directly, which
+        broke whenever new CLI args were added.
+
+        Expected payload keys match WORKER_PAYLOAD_SCHEMA.
+        All fields are optional; sensible defaults are used for missing keys.
+        """
+        def _s(k: str, default: str = "") -> str:
+            return str(payload.get(k) or default).strip()
+
+        def _f(k: str, default: float) -> float:
+            try:
+                v = payload.get(k)
+                return float(v) if v is not None else default
+            except Exception:
+                return default
+
+        def _i(k: str, default: int) -> int:
+            try:
+                v = payload.get(k)
+                return int(v) if v is not None else default
+            except Exception:
+                return default
+
+        # spreadsheet_id: required; fall back to env
+        spreadsheet_id = _s("spreadsheet_id") or _safe_str(os.getenv("DEFAULT_SPREADSHEET_ID", ""))
+        if not spreadsheet_id:
+            raise ValueError("ScanConfig.from_worker_payload: 'spreadsheet_id' is required.")
+
+        # keys: list of page keys to scan
+        raw_keys = payload.get("keys") or ["Market_Leaders"]
+        if isinstance(raw_keys, str):
+            raw_keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
+        keys = [_canon_key(k) for k in raw_keys if k]
+        keys = [k for k in keys if k]
+        if not keys:
+            keys = ["Market_Leaders"]
+
+        return cls(
+            spreadsheet_id=spreadsheet_id,
+            keys=keys,
+            top_n=_i("top_n", 50),
+            max_symbols=_i("max_symbols", 1500),
+            chunk_size=_i("chunk_size", 60),
+            concurrency=_i("concurrency", 10),
+            mode=_s("mode", "engine"),
+            backend_base_url=(_s("backend_url") or _s("backend_base_url") or _safe_str(os.getenv("BACKEND_BASE_URL", ""))).rstrip("/"),
+            token=_s("token") or _s("app_token"),
+            timeout_sec=_f("timeout_sec", 60.0),
+            min_price=_f("min_price", 1.0),
+            min_volume=_f("min_volume", 1000.0),
+            max_risk_score=_f("max_risk_score", 60.0),
+            min_confidence=_f("min_confidence", 0.65),
+            min_expected_roi=_f("min_expected_roi", 0.00),
+            horizon=_s("horizon", "3m"),
+            w_roi=_f("w_roi", 0.55),
+            w_conf=_f("w_conf", 0.25),
+            w_score=_f("w_score", 0.20),
+            export_json=_s("export_json"),
+            export_csv=_s("export_csv"),
+            export_html=_s("export_html"),
+        )
 
 
 @dataclass(slots=True)
@@ -831,7 +908,7 @@ async def run_scan(cfg: ScanConfig) -> Tuple[List[ScanRow], Dict[str, Any]]:
 
     meta = {
         "ok": True,
-        "version": "5.1.0",
+        "version": SCRIPT_VERSION,
         "mode": cfg.mode,
         "keys": cfg.keys,
         "horizon": cfg.horizon,
@@ -852,7 +929,7 @@ async def run_scan(cfg: ScanConfig) -> Tuple[List[ScanRow], Dict[str, Any]]:
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="TFB Market Scanner v5.1.0")
+    p = argparse.ArgumentParser(description=f"TFB Market Scanner v{SCRIPT_VERSION}")
     p.add_argument("--sheet-id", default="", help="Spreadsheet ID (defaults to settings/env)")
     p.add_argument("--keys", nargs="*", default=["Market_Leaders"], help="Pages to scan (canonical keys)")
     p.add_argument("--mode", choices=["engine", "http"], default="engine", help="Fetch mode")
@@ -875,6 +952,128 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--export-html", default="", help="Write HTML to file")
 
     return p.parse_args()
+
+
+# =============================================================================
+# Worker integration API (FIX v5.2.0)
+# =============================================================================
+
+# Documents the expected task payload for worker.py dispatching task_type="market_scan".
+# Keys match ScanConfig.from_worker_payload() field names.
+WORKER_PAYLOAD_SCHEMA: Dict[str, Any] = {
+    "task_type": "market_scan",            # (required) always "market_scan"
+    "spreadsheet_id": "",                  # (required if DEFAULT_SPREADSHEET_ID not set)
+    "keys": ["Market_Leaders"],            # (optional) pages to scan
+    "top_n": 50,                           # (optional) top N results
+    "max_symbols": 1500,                   # (optional) max symbols to process
+    "chunk_size": 60,                      # (optional) batch size per fetch
+    "mode": "engine",                      # (optional) "engine" | "http"
+    "backend_url": "",                     # (optional) override BACKEND_BASE_URL
+    "token": "",                           # (optional) auth token
+    "timeout_sec": 60.0,                   # (optional) request timeout
+    "min_price": 1.0,                      # (optional) filter: min price
+    "min_volume": 1000.0,                  # (optional) filter: min volume
+    "max_risk_score": 60.0,                # (optional) filter: max risk score (0-100)
+    "min_confidence": 0.65,               # (optional) filter: min forecast confidence (0-1)
+    "min_expected_roi": 0.00,             # (optional) filter: min expected ROI (fraction)
+    "horizon": "3m",                       # (optional) "1m" | "3m" | "12m"
+    "w_roi": 0.55,                         # (optional) composite score weight: ROI
+    "w_conf": 0.25,                        # (optional) composite score weight: confidence
+    "w_score": 0.20,                       # (optional) composite score weight: overall_score
+    "export_json": "",                     # (optional) path to write JSON output
+    "export_csv": "",                      # (optional) path to write CSV output
+    "export_html": "",                     # (optional) path to write HTML output
+    # --- worker tracing fields (added by worker.py, not required here) ---
+    "task_id": "",                         # worker task UUID for correlation
+    "queued_at": "",                       # ISO timestamp when task was queued
+    "retry_count": 0,                      # retry count
+}
+
+
+async def run_from_worker_payload_async(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Programmatic async entry point for worker.py.
+
+    Accepts a task payload dict, builds ScanConfig via from_worker_payload(),
+    runs the scan, and returns a result dict for the worker to log and ACK.
+
+    Returns dict with: status, exit_code, rows_count, meta, errors, task_id.
+    """
+    task_id = str(payload.get("task_id") or "")
+    task_type = str(payload.get("task_type") or "").strip()
+    if task_type and task_type != "market_scan":
+        return {
+            "status": "failed",
+            "exit_code": 2,
+            "rows_count": 0,
+            "meta": {},
+            "errors": [f"run_from_worker_payload: expected task_type='market_scan', got {task_type!r}"],
+            "task_id": task_id,
+        }
+
+    try:
+        cfg = ScanConfig.from_worker_payload(payload)
+    except Exception as e:
+        return {
+            "status": "failed",
+            "exit_code": 2,
+            "rows_count": 0,
+            "meta": {},
+            "errors": [f"ScanConfig.from_worker_payload failed: {e}"],
+            "task_id": task_id,
+        }
+
+    try:
+        rows, meta = await run_scan(cfg)
+        # Write exports if configured
+        if rows and cfg.export_json:
+            try:
+                _write_json(cfg.export_json, {"meta": meta, "rows": [r.to_dict() for r in rows]})
+            except Exception as e:
+                logger.warning("Worker export_json failed: %s", e)
+        if rows and cfg.export_csv:
+            try:
+                _write_csv(cfg.export_csv, rows)
+            except Exception as e:
+                logger.warning("Worker export_csv failed: %s", e)
+
+        return {
+            "status": "success" if rows else "partial",
+            "exit_code": 0 if rows else 1,
+            "rows_count": len(rows),
+            "top_symbol": rows[0].symbol if rows else None,
+            "meta": meta,
+            "errors": [],
+            "task_id": task_id,
+        }
+    except Exception as e:
+        logger.exception("run_from_worker_payload scan failed: %s", e)
+        return {
+            "status": "failed",
+            "exit_code": 2,
+            "rows_count": 0,
+            "meta": {},
+            "errors": [str(e)],
+            "task_id": task_id,
+        }
+
+
+def run_from_worker_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Sync wrapper for worker.py (which runs in a sync context).
+    Calls run_from_worker_payload_async() via asyncio.run().
+    """
+    try:
+        return asyncio.run(run_from_worker_payload_async(payload))
+    except Exception as e:
+        return {
+            "status": "failed",
+            "exit_code": 2,
+            "rows_count": 0,
+            "meta": {},
+            "errors": [str(e)],
+            "task_id": str(payload.get("task_id") or ""),
+        }
 
 
 def main() -> int:
@@ -921,7 +1120,7 @@ def main() -> int:
         export_html=str(args.export_html or ""),
     )
 
-    logger.info("=== Market Scan v5.1.0 ===")
+    logger.info("=== Market Scan v%s ===", SCRIPT_VERSION)
     logger.info("Mode: %s | Sheet: %s | Keys: %s", cfg.mode, cfg.spreadsheet_id, ",".join(cfg.keys))
     logger.info(
         "Filters: min_price=%.2f | min_volume=%.0f | max_risk=%.1f | min_conf=%.2f | min_roi=%.2f%% | horizon=%s",
