@@ -2,7 +2,7 @@
 """
 core/yahoo_chart_provider.py
 ================================================================================
-YAHOO CHART COMPATIBILITY SHIM — v4.2.0
+YAHOO CHART COMPATIBILITY SHIM -- v4.3.0
 ================================================================================
 SAFE • STARTUP-FRIENDLY • CANONICAL-DELEGATING • HISTORY-AWARE •
 COMMODITY/FX-TOLERANT • ROUTE/ENGINE COMPATIBLE • PAYLOAD-RECOVERY ENHANCED
@@ -55,7 +55,7 @@ from typing import Any, Awaitable, Callable, Dict, Iterable, List, Optional, Seq
 # Versioning / constants
 # =============================================================================
 
-SHIM_VERSION = "4.2.0"
+SHIM_VERSION = "4.3.0"
 VERSION = SHIM_VERSION
 PROVIDER_VERSION = SHIM_VERSION
 DATA_SOURCE = "yahoo_chart"
@@ -945,8 +945,8 @@ def _derive_quote_from_rows(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "day_high": latest_high if latest_high is not None else current,
         "day_low": latest_low if latest_low is not None else current,
         "volume": latest_volume,
-        "52w_high": max(highs_valid) if highs_valid else None,
-        "52w_low": min(lows_valid) if lows_valid else None,
+        "week_52_high": max(highs_valid) if highs_valid else None,   # FIX v4.3.0: was "52w_high" (non-canonical)
+        "week_52_low": min(lows_valid) if lows_valid else None,    # FIX v4.3.0: was "52w_low"
         "avg_volume_30d": int(sum(vols_valid[-30:]) / len(vols_valid[-30:])) if vols_valid else None,
         "avg_volume_10d": int(sum(vols_valid[-10:]) / len(vols_valid[-10:])) if vols_valid else None,
         "history_points": len(cleaned),
@@ -961,7 +961,7 @@ def _derive_quote_from_rows(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     if current is not None and highs_valid and lows_valid and max(highs_valid) != min(lows_valid):
         lo = min(lows_valid)
         hi = max(highs_valid)
-        out["52w_position_pct"] = ((current - lo) / (hi - lo)) * 100.0
+        out["week_52_position_pct"] = ((current - lo) / (hi - lo)) * 100.0   # FIX v4.3.0: was "52w_position_pct"
 
     if len(closes_valid) >= 2:
         rets: List[float] = []
@@ -1034,8 +1034,8 @@ def _derive_quote_from_chart_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "exchange": _safe_get(meta, *EXCHANGE_ALIASES),
         "currency": _safe_get(meta, *CURRENCY_ALIASES),
         "name": _safe_get(meta, *NAME_ALIASES),
-        "52w_high": _coerce_float(_safe_get(meta, "fiftyTwoWeekHigh", "fifty_two_week_high", "52w_high")),
-        "52w_low": _coerce_float(_safe_get(meta, "fiftyTwoWeekLow", "fifty_two_week_low", "52w_low")),
+        "week_52_high": _coerce_float(_safe_get(meta, "fiftyTwoWeekHigh", "fifty_two_week_high", "52w_high")),   # FIX v4.3.0
+        "week_52_low": _coerce_float(_safe_get(meta, "fiftyTwoWeekLow", "fifty_two_week_low", "52w_low")),   # FIX v4.3.0
         "market_state": _safe_get(meta, "marketState", "market_state"),
         "instrument_type": _safe_get(meta, "instrumentType", "quoteType", "typeDisp"),
         "exchange_timezone": _safe_get(meta, "exchangeTimezoneName", "timezone"),
@@ -1108,8 +1108,8 @@ def _normalize_quote_payload(payload: Any, *, symbol: str) -> Dict[str, Any]:
                 "day_high": _coerce_float(_safe_get(candidate, *HIGH_ALIASES)),
                 "day_low": _coerce_float(_safe_get(candidate, *LOW_ALIASES)),
                 "volume": _coerce_int(_safe_get(candidate, *VOLUME_ALIASES)),
-                "52w_high": _coerce_float(_safe_get(candidate, "52w_high", "fiftyTwoWeekHigh", "fifty_two_week_high")),
-                "52w_low": _coerce_float(_safe_get(candidate, "52w_low", "fiftyTwoWeekLow", "fifty_two_week_low")),
+                "week_52_high": _coerce_float(_safe_get(candidate, "52w_high", "fiftyTwoWeekHigh", "fifty_two_week_high")),   # FIX v4.3.0
+                "week_52_low": _coerce_float(_safe_get(candidate, "52w_low", "fiftyTwoWeekLow", "fifty_two_week_low")),   # FIX v4.3.0
                 "market_cap": _coerce_float(_safe_get(candidate, "market_cap", "marketCap")),
                 "beta_5y": _coerce_float(_safe_get(candidate, "beta_5y", "beta", "beta5YMonthly")),
                 "dividend_yield": _coerce_float(_safe_get(candidate, "dividend_yield", "dividendYield")),
