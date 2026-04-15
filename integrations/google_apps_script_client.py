@@ -2,7 +2,7 @@
 """
 integrations/google_apps_script_client.py
 ===========================================================
-ADVANCED GOOGLE APPS SCRIPT CLIENT FOR TADAWUL FAST BRIDGE — v5.0.0
+ADVANCED GOOGLE APPS SCRIPT CLIENT FOR TADAWUL FAST BRIDGE -- v5.1.0
 (Emad Bahbah – Enterprise Integration Architecture)
 
 INSTITUTIONAL GRADE · ZERO DOWNTIME · COMPLETE ALIGNMENT
@@ -150,7 +150,7 @@ except ImportError:
 
 
 # Version
-CLIENT_VERSION = "5.0.0"
+CLIENT_VERSION = "5.1.0"
 _MIN_CORE_VERSION = "5.0.0"
 
 # -----------------------------------------------------------------------------
@@ -749,6 +749,17 @@ PAGE_SPECS: Dict[str, PageSpec] = {
         mode="refresh_quotes",
         description="Investment insights",
     ),
+    # FIX v5.1.0: added missing canonical pages
+    "TOP_10_INVESTMENTS": PageSpec(
+        market=MarketCategory.MIXED,
+        mode="refresh_top10",
+        description="Top 10 investment recommendations",
+    ),
+    "DATA_DICTIONARY": PageSpec(
+        market=MarketCategory.MIXED,
+        mode="refresh_dictionary",
+        description="Data dictionary / schema reference",
+    ),
 }
 
 @lru_cache(maxsize=128)
@@ -793,8 +804,14 @@ def normalize_page_key(page_key: Optional[str]) -> str:
         "COMMODITIES": "COMMODITIES_FX",
         "FX": "COMMODITIES_FX",
         "FOREX": "COMMODITIES_FX",
-        "INSIGHTS": "INSIGHTS_ANALYSIS",
-        "ANALYSIS": "INSIGHTS_ANALYSIS",
+        "INSIGHTS":          "INSIGHTS_ANALYSIS",
+        "ANALYSIS":          "INSIGHTS_ANALYSIS",
+        "TOP10":             "TOP_10_INVESTMENTS",   # FIX v5.1.0
+        "TOP_10":            "TOP_10_INVESTMENTS",   # FIX v5.1.0
+        "TOP10INVESTMENTS":  "TOP_10_INVESTMENTS",   # FIX v5.1.0
+        "ADVISOR":           "TOP_10_INVESTMENTS",   # FIX v5.1.0
+        "DICTIONARY":        "DATA_DICTIONARY",      # FIX v5.1.0
+        "DICT":              "DATA_DICTIONARY",      # FIX v5.1.0
     }
     
     return aliases.get(s, s)
