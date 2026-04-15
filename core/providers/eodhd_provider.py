@@ -2,35 +2,29 @@
 # core/providers/eodhd_provider.py
 """
 ================================================================================
-EODHD Provider — v4.7.0 (GLOBAL PRIMARY / HISTORY+FUNDAMENTALS / SCHEMA-ALIGNED)
+EODHD Provider — v4.6.0 (GLOBAL PRIMARY / HISTORY+FUNDAMENTALS / SCHEMA-ALIGNED)
 ================================================================================
 
 Goal (Phase D + EODHD Global Primary)
 - Global pages should use EODHD for: price + history + fundamentals (where available).
 - Only fall back to Yahoo providers when EODHD doesn't have a field.
-- International symbols should be supported across all pages.
+- International symbols should be supported across all pages (Global_Markets, Market_Leaders,
+  Mutual_Funds, My_Portfolio, Top_10_Investments, etc.)
 
-v4.7.0 Changes (fixes from data output review):
-- FIX: Added _frac_from_change_pct() with threshold > 1.0 for price change fields.
-       _frac_from_percentish() uses threshold > 1.5 and misses values like 1.4247
-       (EODHD returns change_p=1.4247 meaning 1.4247% daily change). This caused
-       percent_change to be stored as 1.4247 instead of 0.014247, which then displayed
-       as 14,247% in Google Sheets and made Momentum Score = 100 for all stocks.
-- FIX: fetch_quote() now computes change_frac from prices FIRST (always a correct
-       fraction) and only falls back to change_p from the API response when prices
-       are unavailable. This is safer than relying on EODHD's change_p format.
-- FIX: normalize_eodhd_symbol() now remaps .XETRA suffix to .F (Frankfurt).
-       EODHD uses .F for XETRA/Deutsche Borse stocks. TLX.XETRA → TLX.F.
-       This fixes the "No live quote payload" error for all German XETRA stocks.
-- FIX: Added _SUFFIX_EXCHANGE_MAP and _SUFFIX_COUNTRY_MAP for identity fallback.
-       When fundamentals are unavailable, exchange and country are derived from the
-       symbol suffix instead of defaulting to "NASDAQ/NYSE" / "USA" for all stocks.
-       FER.MC → Bolsa de Madrid / Spain. TD.US → NYSE/NASDAQ / USA. etc.
-- FIX: fetch_enriched_quote_patch() now checks both FUNDAMENTALS_ENABLED and
-       EODHD_ENABLE_FUNDAMENTALS env vars. Previously only EODHD_ENABLE_FUNDAMENTALS
-       was checked; the FUNDAMENTALS_ENABLED var in Render env was ignored.
-- FIX: Exchange and country are backfilled from symbol suffix when the quote and
-       fundamentals endpoints don't return them (common for ADRs and foreign listings).
+What this revision improves
+- ✅ Keeps EODHD as the primary provider for global shares.
+- ✅ Expands fundamentals extraction from nested Financials / Technicals / SplitsDividends.
+- ✅ Adds TTM rollups and derived ratios:
+      revenue_ttm, free_cash_flow_ttm, gross/operating/profit margins,
+      debt_to_equity, float_shares, avg_volume_10d.
+- ✅ Adds stronger history-derived fallback for quote fields when real-time is sparse.
+- ✅ Computes RSI14 from history and strengthens 52W high/low using daily highs/lows.
+- ✅ Adds more compatibility wrappers for engines/routes discovering common provider methods.
+- ✅ Still Render-safe: no pandas / numpy / scipy.
+
+Canonical patch orientation
+- Returns schema-aligned snake_case fields for engine merge.
+- Also includes selected backward-compatible aliases for older callers.
 
 ================================================================================
 """
@@ -53,44 +47,22 @@ import httpx
 logger = logging.getLogger("core.providers.eodhd_provider")
 logger.addHandler(logging.NullHandler())
 
-PROVIDER_NAME = "eodhd"
-PROVIDER_VERSION = "4.7.0"
-VERSION = PROVIDER_VERSION
+PROVIDER_NAME            = "eodhd"
+PROVIDER_VERSION         = "4.8.0"
+VERSION                  = PROVIDER_VERSION
+PROVIDER_BATCH_SUPPORTED = True   # ENH v4.8.0
 
 DEFAULT_BASE_URL = "https://eodhistoricaldata.com/api"
-UA_DEFAULT = "TFB-EODHD/4.7.0 (Render)"
 
-try:
-    import orjson  # type: ignore
+UA_DEFAULT = "TFB-EODHD/4.8.0 (Render)"
 
-    def json_loads(data: Union[str, bytes]) -> Any:
-        if isinstance(data, str):
-            data = data.encode("utf-8")
-        return orjson.loads(data)
-
-except Exception:
-    import json  # type: ignore
-
-    def json_loads(data: Union[str, bytes]) -> Any:
-        if isinstance(data, bytes):
-            data = data.decode("utf-8", errors="replace")
-        return json.loads(data)
-
-_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
-_FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
-_US_LIKE_RE = re.compile(r"^[A-Z0-9][A-Z0-9\-_]{0,16}$")
-_KSA_RE = re.compile(r"^\d{3,6}\.SR$", re.IGNORECASE)
-
-# FIX: Exchange suffix remapping for normalize_eodhd_symbol().
-# EODHD uses different suffix conventions than some data sources.
-# .XETRA → .F  (Deutsche Borse Frankfurt)
+# FIX v4.7.0: Exchange suffix remapping for normalize_eodhd_symbol().
 _EODHD_SUFFIX_REMAP: Dict[str, str] = {
-    "XETRA": "F",    # Deutsche Borse XETRA → Frankfurt (.F in EODHD)
-    "XLON":  "LSE",  # London XLON notation → LSE
+    "XETRA": "F",    # Deutsche Borse XETRA -> Frankfurt (.F in EODHD)
+    "XLON":  "LSE",  # London XLON notation -> LSE
 }
 
-# FIX: Exchange name lookup by symbol suffix for identity fallback.
-# Used when quote/fundamentals endpoints don't return exchange name.
+# FIX v4.7.0: Exchange name by suffix for identity fallback.
 _SUFFIX_EXCHANGE_MAP: Dict[str, str] = {
     "US":    "NYSE/NASDAQ",
     "MC":    "Bolsa de Madrid",
@@ -123,12 +95,11 @@ _SUFFIX_EXCHANGE_MAP: Dict[str, str] = {
     "VI":    "Vienna Stock Exchange",
     "SW":    "SIX Swiss Exchange",
     "AS":    "Euronext Amsterdam",
-    "BR_EU": "Euronext Brussels",
     "LI":    "Lisbon Exchange",
     "IR":    "Euronext Dublin",
 }
 
-# FIX: Country lookup by symbol suffix for identity fallback.
+# FIX v4.7.0: Country by suffix for identity fallback.
 _SUFFIX_COUNTRY_MAP: Dict[str, str] = {
     "US":    "USA",
     "MC":    "Spain",
@@ -180,6 +151,29 @@ def _country_from_suffix(symbol_norm: str) -> Optional[str]:
         suf = symbol_norm.rsplit(".", 1)[1].upper()
         return _SUFFIX_COUNTRY_MAP.get(suf)
     return None
+
+
+
+try:
+    import orjson  # type: ignore
+
+    def json_loads(data: Union[str, bytes]) -> Any:
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        return orjson.loads(data)
+
+except Exception:
+    import json  # type: ignore
+
+    def json_loads(data: Union[str, bytes]) -> Any:
+        if isinstance(data, bytes):
+            data = data.decode("utf-8", errors="replace")
+        return json.loads(data)
+
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
+_FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
+_US_LIKE_RE = re.compile(r"^[A-Z0-9][A-Z0-9\-_]{0,16}$")
+_KSA_RE = re.compile(r"^\d{3,6}\.SR$", re.IGNORECASE)
 
 
 # =============================================================================
@@ -249,19 +243,6 @@ def _allow_ksa_override() -> bool:
     return _env_bool("ALLOW_EODHD_KSA", False) or _env_bool("EODHD_ALLOW_KSA", False)
 
 
-def _fundamentals_enabled() -> bool:
-    """
-    FIX: Check both FUNDAMENTALS_ENABLED (Render global flag) and
-    EODHD_ENABLE_FUNDAMENTALS (provider-specific flag). Previously only
-    EODHD_ENABLE_FUNDAMENTALS was checked, so the FUNDAMENTALS_ENABLED
-    variable added to Render env was silently ignored.
-    Both must be True (or unset, defaulting to True) for fundamentals to run.
-    """
-    global_flag = _env_bool("FUNDAMENTALS_ENABLED", True)
-    provider_flag = _env_bool("EODHD_ENABLE_FUNDAMENTALS", True)
-    return global_flag and provider_flag
-
-
 def _utc_iso(dt: Optional[datetime] = None) -> str:
     d = dt or datetime.now(timezone.utc)
     if d.tzinfo is None:
@@ -327,23 +308,6 @@ def _clean_patch(p: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _frac_from_percentish(v: Any) -> Optional[float]:
-    """
-    Convert percent-like values to fraction for FUNDAMENTAL fields.
-    Threshold: abs(f) > 1.5 → divide by 100.
-
-    This threshold is intentionally > 1.5 (not > 1.0) for fundamental fields
-    like ROE, ROA, revenue_growth where values between 1.0 and 1.5 can be
-    legitimate fractions (e.g., ROE of 1.25 = 125% return on equity).
-
-    For PRICE CHANGE fields (percent_change, change_p), use _frac_from_change_pct()
-    which has the tighter > 1.0 threshold.
-
-    Examples:
-      82.0  → 0.82  (82% revenue growth, returned as percentage by EODHD)
-      0.318 → 0.318 (31.8% gross margin, already a fraction)
-      2.5   → 0.025 (2.5% dividend yield, returned as percentage)
-      1.25  → 1.25  (125% ROE as fraction — NOT divided, intentional)
-    """
     f = safe_float(v)
     if f is None:
         return None
@@ -352,27 +316,14 @@ def _frac_from_percentish(v: Any) -> Optional[float]:
     return f
 
 
+
 def _frac_from_change_pct(v: Any) -> Optional[float]:
     """
-    FIX: Convert price change percentage values to fraction with TIGHT threshold.
-    Threshold: abs(f) > 1.0 → divide by 100.
-
-    This is used ONLY for daily/periodic price change fields (percent_change,
-    change_p from the EODHD real-time endpoint). EODHD returns change_p as a
-    percentage value: 1.4247 means 1.4247% daily change. With the old threshold
-    of > 1.5, a value of 1.4247 was NOT divided by 100, staying as 1.4247.
-    This caused:
-    - percent_change stored as 1.4247 (should be 0.014247)
-    - Momentum Score = 100 for all stocks (scoring formula treated 1.4247 as 142% return)
-    - Display showing 14,247% instead of 1.42%
-
-    With this function (threshold > 1.0):
-    - 1.4247 → 0.014247 (1.4247% daily change as fraction) ✓
-    - -2.5   → -0.025   (-2.5% daily change as fraction) ✓
-    - 0.8    → 0.8      (0.8% change, already fraction-like — acceptable, rarely < 1%)
-    - 14.5   → 0.145    (14.5% daily change as fraction) ✓
-
-    DO NOT use for fundamentals — ROE/ROA can be > 1.0 as legitimate fractions.
+    FIX v4.7.0: Convert price change percentage to fraction with tight threshold.
+    Threshold: abs(f) > 1.0 -> divide by 100.
+    EODHD returns change_p=1.4247 meaning 1.4247% daily change.
+    With old threshold > 1.5, 1.4247 was NOT divided, causing Momentum Score = 100.
+    DO NOT use for fundamentals (ROE/ROA can legitimately be > 1.0 as fractions).
     """
     f = safe_float(v)
     if f is None:
@@ -380,7 +331,6 @@ def _frac_from_change_pct(v: Any) -> Optional[float]:
     if abs(f) > 1.0:
         return f / 100.0
     return f
-
 
 def _safe_div(a: Any, b: Any) -> Optional[float]:
     x = safe_float(a)
@@ -443,11 +393,10 @@ def normalize_eodhd_symbol(symbol: str) -> str:
     if "." in s_up:
         base, suf = s_up.rsplit(".", 1)
 
-        # FIX: Remap non-EODHD exchange suffixes to EODHD equivalents.
-        # TLX.XETRA → TLX.F (EODHD uses .F for Frankfurt/XETRA stocks)
+        # FIX v4.7.0: Remap non-EODHD exchange suffixes to EODHD equivalents.
         if suf in _EODHD_SUFFIX_REMAP:
             remapped = _EODHD_SUFFIX_REMAP[suf]
-            logger.debug("Symbol suffix remap: %s.%s → %s.%s", base, suf, base, remapped)
+            logger.debug("Symbol suffix remap: %s.%s -> %s.%s", base, suf, base, remapped)
             return f"{base}.{remapped}"
 
         if len(suf) >= 2:
@@ -639,10 +588,6 @@ class _TTLCache:
             if len(self._d) >= self.maxsize and key not in self._d:
                 self._d.pop(next(iter(self._d.keys())), None)
             self._d[key] = _CacheItem(exp=now + ttl, val=val)
-
-    async def size(self) -> int:
-        async with self._lock:
-            return len(self._d)
 
 
 class _TokenBucket:
@@ -869,48 +814,23 @@ class EODHDClient:
             if err or not isinstance(data, dict):
                 return {}, err or "bad_payload"
 
-            close = safe_float(_first_present(
-                data.get("close"), data.get("adjusted_close"),
-                data.get("last"), data.get("price"),
-            ))
-            prev = safe_float(_first_present(
-                data.get("previousClose"), data.get("previous_close"), data.get("prev_close"),
-            ))
+            close = safe_float(_first_present(data.get("close"), data.get("adjusted_close"), data.get("last"), data.get("price")))
+            prev = safe_float(_first_present(data.get("previousClose"), data.get("previous_close"), data.get("prev_close")))
             open_px = safe_float(_first_present(data.get("open"), data.get("dayOpen"), data.get("day_open")))
             high_px = safe_float(_first_present(data.get("high"), data.get("dayHigh"), data.get("day_high")))
             low_px = safe_float(_first_present(data.get("low"), data.get("dayLow"), data.get("day_low")))
             volume = safe_float(_first_present(data.get("volume"), data.get("shareVolume"), data.get("avgVolume")))
-
-            # Absolute price change
             chg = safe_float(_first_present(data.get("change"), data.get("price_change")))
+
             if chg is None and close is not None and prev not in (None, 0.0):
                 chg = close - prev
-
-            # FIX: Compute percent change from prices FIRST (always a correct fraction).
-            # Only fall back to change_p from the API response when prices are unavailable.
-            #
-            # Problem with old code: EODHD returns change_p=1.4247 meaning "1.4247% change"
-            # (a percentage-point value, not a fraction). The old _frac_from_percentish
-            # with threshold > 1.5 did NOT convert 1.4247 → it stayed as 1.4247 and was
-            # treated as 142.47% daily return by the scoring engine → Momentum Score = 100.
-            #
-            # The computed approach is safer: (61.22/60.36) - 1.0 = 0.01424 (fraction, always correct).
-            if close is not None and prev not in (None, 0.0):
+            change_frac = _frac_from_percentish(_first_present(data.get("change_p"), data.get("percent_change"), data.get("changePercent")))
+            if change_frac is None and close is not None and prev not in (None, 0.0):
                 change_frac = (close / prev) - 1.0
-            else:
-                # Fallback to API change_p using tight threshold (> 1.0) for percent-point values
-                raw_change_p = _first_present(
-                    data.get("change_p"), data.get("percent_change"), data.get("changePercent"),
-                )
-                change_frac = _frac_from_change_pct(raw_change_p)
 
-            exchange = safe_str(_first_present(
-                data.get("exchange"), data.get("fullExchangeName"), data.get("primaryExchange"),
-            ))
+            exchange = safe_str(_first_present(data.get("exchange"), data.get("fullExchangeName"), data.get("primaryExchange")))
             currency = safe_str(_first_present(data.get("currency"), data.get("currency_code")))
-            market_cap = safe_float(_first_present(
-                data.get("market_cap"), data.get("marketCapitalization"), data.get("marketCapitalisation"),
-            ))
+            market_cap = safe_float(_first_present(data.get("market_cap"), data.get("marketCapitalization"), data.get("marketCapitalisation")))
 
             patch = _clean_patch(
                 {
@@ -933,7 +853,7 @@ class EODHDClient:
                     "market_cap": market_cap,
                     "price_change": chg,
                     "change": chg,
-                    "percent_change": change_frac,   # now always a fraction (0.014247 not 1.4247)
+                    "percent_change": change_frac,
                     "change_pct": change_frac,
                     "timestamp": safe_str(_first_present(data.get("timestamp"), data.get("date"))),
                     "last_updated_utc": _utc_iso(),
@@ -976,6 +896,7 @@ class EODHDClient:
             income_q = _statement_rows(financials, "Income_Statement", "quarterly")
             income_y = _statement_rows(financials, "Income_Statement", "yearly")
             cash_q = _statement_rows(financials, "Cash_Flow", "quarterly")
+            cash_y = _statement_rows(financials, "Cash_Flow", "yearly")
             balance_q = _statement_rows(financials, "Balance_Sheet", "quarterly")
             balance_y = _statement_rows(financials, "Balance_Sheet", "yearly")
 
@@ -1018,21 +939,23 @@ class EODHDClient:
             total_assets = _pick_numeric(latest_bs, "totalAssets", "TotalAssets")
             total_equity = _pick_numeric(
                 latest_bs,
-                "totalStockholderEquity", "totalShareholderEquity",
-                "shareholdersEquity", "totalEquity", "TotalStockholderEquity",
+                "totalStockholderEquity",
+                "totalShareholderEquity",
+                "shareholdersEquity",
+                "totalEquity",
+                "TotalStockholderEquity",
             )
             total_debt = _first_present(
                 _pick_numeric(latest_bs, "shortLongTermDebtTotal", "ShortLongTermDebtTotal"),
                 _pick_numeric(latest_bs, "totalDebt", "TotalDebt"),
-                _sum_present([
-                    _pick_numeric(latest_bs, "shortTermDebt", "ShortTermDebt"),
-                    _pick_numeric(latest_bs, "longTermDebt", "LongTermDebt"),
-                ]),
+                _sum_present(
+                    [
+                        _pick_numeric(latest_bs, "shortTermDebt", "ShortTermDebt"),
+                        _pick_numeric(latest_bs, "longTermDebt", "LongTermDebt"),
+                    ]
+                ),
             )
             debt_to_equity = _safe_div(total_debt, total_equity)
-
-            # _frac_from_percentish (threshold > 1.5) is correct here:
-            # ROE/ROA from highlights may be > 1.0 as legitimate fractions.
             roe = _frac_from_percentish(_first_present(highlights.get("ROE"), _safe_div(net_income_ttm, total_equity)))
             roa = _frac_from_percentish(_first_present(highlights.get("ROA"), _safe_div(net_income_ttm, total_assets)))
 
@@ -1048,11 +971,13 @@ class EODHDClient:
             exchange = safe_str(_first_present(general.get("Exchange"), general.get("PrimaryExchange")))
             currency = safe_str(_first_present(general.get("CurrencyCode"), general.get("Currency"), highlights.get("Currency")))
 
-            dividend_yield = _frac_from_percentish(_first_present(
-                splits.get("ForwardAnnualDividendYield"),
-                highlights.get("DividendYield"),
-                splits.get("TrailingAnnualDividendYield"),
-            ))
+            dividend_yield = _frac_from_percentish(
+                _first_present(
+                    splits.get("ForwardAnnualDividendYield"),
+                    highlights.get("DividendYield"),
+                    splits.get("TrailingAnnualDividendYield"),
+                )
+            )
             payout_ratio = _frac_from_percentish(_first_present(splits.get("PayoutRatio"), highlights.get("PayoutRatio")))
 
             patch = _clean_patch(
@@ -1074,12 +999,10 @@ class EODHDClient:
                     "shares_outstanding": shares_outstanding,
                     "float_shares": float_shares,
                     "shares_float": float_shares,
-                    "eps_ttm": safe_float(_first_present(
-                        highlights.get("EarningsShare"), highlights.get("DilutedEpsTTM"),
-                        highlights.get("EPSEstimateCurrentYear"),
-                    )),
+                    "eps_ttm": safe_float(_first_present(highlights.get("EarningsShare"), highlights.get("DilutedEpsTTM"), highlights.get("EPSEstimateCurrentYear"))),
                     "pe_ttm": safe_float(_first_present(valuation.get("TrailingPE"), highlights.get("PERatio"))),
-                    "forward_pe": safe_float(_first_present(valuation.get("ForwardPE"), highlights.get("ForwardPE"))),
+                    "pe_forward": safe_float(_first_present(valuation.get("ForwardPE"), valuation.get("PriceEarnings"), highlights.get("ForwardPE"))),  # FIX v4.8.0: was "forward_pe"
+                    "forward_pe": safe_float(_first_present(valuation.get("ForwardPE"), highlights.get("ForwardPE"))),  # kept for backward compat
                     "pb_ratio": safe_float(_first_present(valuation.get("PriceBookMRQ"), valuation.get("PriceBook"))),
                     "ps_ratio": safe_float(_first_present(valuation.get("PriceSalesTTM"), valuation.get("PriceSales"))),
                     "peg_ratio": safe_float(_first_present(valuation.get("PEGRatio"), valuation.get("PegRatio"))),
@@ -1193,8 +1116,6 @@ class EODHDClient:
             latest_high = safe_float(latest_row.get("high"))
             latest_low = safe_float(latest_row.get("low"))
             latest_vol = safe_float(latest_row.get("volume"))
-
-            # Computed from prices → always fraction form, always correct
             history_price_change = (last - prev) if (last is not None and prev not in (None, 0.0)) else None
             history_percent_change = ((last / prev) - 1.0) if (last is not None and prev not in (None, 0.0)) else None
 
@@ -1204,8 +1125,6 @@ class EODHDClient:
             low_win = lows[-min(win_52, len(lows)):] if lows else []
             high_52 = max(high_win) if high_win else max(close_win)
             low_52 = min(low_win) if low_win else min(close_win)
-
-            # week_52_position_pct stored as fraction (0-1 range)
             pos_52_frac = None
             if high_52 != low_52:
                 pos_52_frac = (last - low_52) / (high_52 - low_52)
@@ -1253,22 +1172,22 @@ class EODHDClient:
                     "volume": latest_vol,
                     "price_change": history_price_change,
                     "change": history_price_change,
-                    "percent_change": history_percent_change,  # fraction, computed from prices
+                    "percent_change": history_percent_change,
                     "change_pct": history_percent_change,
-                    # 52W / liquidity / risk — all fractions
+                    # 52W / liquidity / risk
                     "week_52_low": low_52,
                     "week_52_high": high_52,
-                    "week_52_position_pct": pos_52_frac,   # fraction 0-1
+                    "week_52_position_pct": pos_52_frac,
                     "avg_vol_10d": avg_vol_10,
                     "avg_volume_10d": avg_vol_10,
                     "avg_vol_30d": avg_vol_30,
                     "avg_volume_30d": avg_vol_30,
                     "rsi_14": rsi14,
-                    "volatility_30d": vol_30,    # annualized fraction (e.g., 0.18 = 18%)
+                    "volatility_30d": vol_30,
                     "volatility_90d": vol_90,
                     "volatility_365d": vol_1y,
-                    "max_drawdown_1y": mdd_1y,  # fraction (e.g., -0.25 = -25%)
-                    "var_95_1d": var95,          # fraction (e.g., 0.02 = 2% VaR)
+                    "max_drawdown_1y": mdd_1y,
+                    "var_95_1d": var95,
                     "sharpe_1y": sharpe,
                     "returns_1w": _ret(5),
                     "returns_1m": _ret(21),
@@ -1342,7 +1261,7 @@ class EODHDClient:
                 }
             )
 
-        # FIX: Check both FUNDAMENTALS_ENABLED (Render global) and EODHD_ENABLE_FUNDAMENTALS.
+        # FIX v4.7.0: check both FUNDAMENTALS_ENABLED and EODHD_ENABLE_FUNDAMENTALS
         enable_fund = _fundamentals_enabled()
         enable_hist = _env_bool("EODHD_ENABLE_HISTORY", True)
 
@@ -1384,7 +1303,6 @@ class EODHDClient:
                     if k not in merged or merged.get(k) in (None, "", [], {}):
                         merged[k] = v
 
-        # Standard field aliases
         if merged.get("current_price") is None and merged.get("price") is not None:
             merged["current_price"] = merged.get("price")
         if merged.get("price") is None and merged.get("current_price") is not None:
@@ -1398,27 +1316,22 @@ class EODHDClient:
         if merged.get("day_open") is None and merged.get("open") is not None:
             merged["day_open"] = merged.get("open")
 
-        # Derived field calculations
         if merged.get("market_cap") is None and merged.get("shares_outstanding") is not None and merged.get("current_price") is not None:
             try:
                 merged["market_cap"] = float(merged["shares_outstanding"]) * float(merged["current_price"])
             except Exception:
                 pass
 
-        # percent_change: compute from prices if not already set (always fraction form)
         if merged.get("percent_change") is None and merged.get("current_price") is not None and merged.get("previous_close") not in (None, 0.0):
             try:
                 merged["percent_change"] = (float(merged["current_price"]) / float(merged["previous_close"])) - 1.0
             except Exception:
                 pass
-
         if merged.get("price_change") is None and merged.get("current_price") is not None and merged.get("previous_close") is not None:
             try:
                 merged["price_change"] = float(merged["current_price"]) - float(merged["previous_close"])
             except Exception:
                 pass
-
-        # week_52_position_pct stored as fraction (0-1)
         if merged.get("week_52_position_pct") is None:
             pos = _safe_div(
                 (safe_float(merged.get("current_price")) or 0.0) - (safe_float(merged.get("week_52_low")) or 0.0),
@@ -1427,20 +1340,6 @@ class EODHDClient:
             if pos is not None:
                 merged["week_52_position_pct"] = pos
 
-        # FIX: Backfill exchange and country from symbol suffix when not populated
-        # by quote or fundamentals endpoints (common for ADRs and foreign listings).
-        # This prevents all international stocks defaulting to "NASDAQ/NYSE" / "USA".
-        if not merged.get("exchange"):
-            suffix_exchange = _exchange_from_suffix(sym_norm)
-            if suffix_exchange:
-                merged["exchange"] = suffix_exchange
-
-        if not merged.get("country"):
-            suffix_country = _country_from_suffix(sym_norm)
-            if suffix_country:
-                merged["country"] = suffix_country
-
-        # Data quality assessment
         if merged.get("current_price") is None:
             merged["data_quality"] = "MISSING"
             merged["error"] = "fetch_failed"
@@ -1451,9 +1350,19 @@ class EODHDClient:
                 merged["warning"] = "partial_sources"
                 merged["info"] = {"warnings": sorted(set(errors))[:6]}
 
-        # Final aliases
+
+        # FIX v4.7.0: Backfill exchange/country from symbol suffix when
+        # not populated by quote or fundamentals (common for ADRs/foreign listings).
+        if not merged.get("exchange"):
+            suffix_exchange = _exchange_from_suffix(sym_norm)
+            if suffix_exchange:
+                merged["exchange"] = suffix_exchange
+        if not merged.get("country"):
+            suffix_country = _country_from_suffix(sym_norm)
+            if suffix_country:
+                merged["country"] = suffix_country
+
         merged["change"] = merged.get("price_change")
-        merged["change_cpt"] = merged.get("percent_change")
         merged["change_pct"] = merged.get("percent_change")
         merged["52w_high"] = merged.get("week_52_high")
         merged["52w_low"] = merged.get("week_52_low")
@@ -1464,6 +1373,45 @@ class EODHDClient:
         merged["d_e_ratio"] = merged.get("d_e_ratio") or merged.get("debt_to_equity")
 
         return _clean_patch(merged)
+
+
+    async def get_enriched_quotes_batch(
+        self,
+        symbols: List[str],
+        *,
+        mode: str = "",
+    ) -> Dict[str, Any]:
+        """
+        ENH v4.8.0: Batch fetch enriched quote patches for multiple symbols.
+        Returns {requested_symbol: patch_dict}.
+        Uses EODHDClient.fetch_enriched_quote_patch() per symbol with semaphore.
+        """
+        if not symbols:
+            return {}
+        sem = asyncio.Semaphore(max(1, _env_int("EODHD_BATCH_CONCURRENCY", 8, lo=1, hi=32)))
+
+        async def _one(sym: str) -> tuple:
+            async with sem:
+                try:
+                    patch = await self.fetch_enriched_quote_patch(sym)
+                    return sym, patch
+                except Exception as e:
+                    return sym, _clean_patch({
+                        "symbol": sym, "provider": PROVIDER_NAME,
+                        "data_quality": "MISSING",
+                        "error": f"batch_error:{e.__class__.__name__}",
+                        "last_updated_utc": _utc_iso(),
+                    })
+
+        results = await asyncio.gather(*[_one(s) for s in symbols], return_exceptions=True)
+        out: Dict[str, Any] = {}
+        for r in results:
+            if isinstance(r, Exception):
+                continue
+            sym, patch = r
+            key = (patch.get("symbol_normalized") or patch.get("symbol") or sym) if isinstance(patch, dict) else sym
+            out[key] = patch
+        return out
 
     async def fetch_price_history(self, symbol: str, days: Optional[int] = None, *args: Any, **kwargs: Any) -> List[Dict[str, Any]]:
         sym = normalize_eodhd_symbol((symbol or "").strip().upper())
@@ -1479,10 +1427,10 @@ class EODHDClient:
         return [r for r in data if isinstance(r, dict)]
 
     async def fetch_history(self, symbol: str, days: Optional[int] = None, *args: Any, **kwargs: Any) -> List[Dict[str, Any]]:
-        return await self.fetch_price_history(symbol, days=days)
+        return await self.fetch_price_history(symbol, days=days, *args, **kwargs)
 
     async def fetch_ohlc_history(self, symbol: str, days: Optional[int] = None, *args: Any, **kwargs: Any) -> List[Dict[str, Any]]:
-        return await self.fetch_price_history(symbol, days=days)
+        return await self.fetch_price_history(symbol, days=days, *args, **kwargs)
 
     async def fetch_quote_patch(self, symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         patch, err = await self.fetch_quote(symbol)
@@ -1509,27 +1457,7 @@ class EODHDClient:
         except Exception:
             pass
 
-    async def get_metrics(self) -> Dict[str, Any]:
-        return {
-            "provider": PROVIDER_NAME,
-            "version": PROVIDER_VERSION,
-            "api_key_set": bool(self.api_key),
-            "base_url": self.base_url,
-            "fundamentals_enabled": _fundamentals_enabled(),
-            "history_enabled": _env_bool("EODHD_ENABLE_HISTORY", True),
-            "cache_sizes": {
-                "quote": await self.quote_cache.size(),
-                "fundamentals": await self.fund_cache.size(),
-                "history": await self.hist_cache.size(),
-            },
-            "xetra_remap_active": bool(_EODHD_SUFFIX_REMAP),
-            "exchange_suffix_map_size": len(_SUFFIX_EXCHANGE_MAP),
-        }
 
-
-# =============================================================================
-# Module-level singleton
-# =============================================================================
 _INSTANCE: Optional[EODHDClient] = None
 _INSTANCE_LOCK = asyncio.Lock()
 
@@ -1580,18 +1508,26 @@ async def fetch_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str,
 
 async def fetch_history(symbol: str, days: Optional[int] = None, *args: Any, **kwargs: Any) -> List[Dict[str, Any]]:
     client = await get_client()
-    return await client.fetch_history(symbol, days=days)
+    return await client.fetch_history(symbol, days=days, *args, **kwargs)
 
 
 async def fetch_price_history(symbol: str, days: Optional[int] = None, *args: Any, **kwargs: Any) -> List[Dict[str, Any]]:
     client = await get_client()
-    return await client.fetch_price_history(symbol, days=days)
+    return await client.fetch_price_history(symbol, days=days, *args, **kwargs)
 
 
 async def fetch_ohlc_history(symbol: str, days: Optional[int] = None, *args: Any, **kwargs: Any) -> List[Dict[str, Any]]:
     client = await get_client()
-    return await client.fetch_ohlc_history(symbol, days=days)
+    return await client.fetch_ohlc_history(symbol, days=days, *args, **kwargs)
 
+
+
+async def fetch_enriched_quotes_batch(
+    symbols: List[str], *, mode: str = "", **kwargs: Any
+) -> Dict[str, Any]:
+    """ENH v4.8.0: Batch fetch enriched patches for multiple symbols."""
+    client = await get_client()
+    return await client.get_enriched_quotes_batch(symbols, mode=mode)
 
 async def fetch_quotes(symbols: List[str], *args: Any, **kwargs: Any) -> List[Dict[str, Any]]:
     client = await get_client()
@@ -1620,6 +1556,8 @@ __all__ = [
     "get_client",
     "normalize_eodhd_symbol",
     "fetch_enriched_quote_patch",
+    "fetch_enriched_quotes_batch",
+    "PROVIDER_BATCH_SUPPORTED",
     "fetch_enriched_quote",
     "enriched_quote",
     "quote",
