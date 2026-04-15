@@ -2,7 +2,7 @@
 # core/schemas.py
 """
 ================================================================================
-Core Schemas + Sheet Headers — v6.0.0 (CANONICAL / REGISTRY-FIRST / STARTUP-SAFE)
+Core Schemas + Sheet Headers -- v6.1.0 (CANONICAL / REGISTRY-FIRST / STARTUP-SAFE)
 ================================================================================
 
 Purpose
@@ -86,7 +86,7 @@ except Exception:  # pragma: no cover
     _PYDANTIC_V2 = False
 
 
-SCHEMAS_VERSION = "6.0.0"
+SCHEMAS_VERSION = "6.1.0"
 
 # =============================================================================
 # Enums
@@ -731,9 +731,9 @@ _FALLBACK_STANDARD_HEADERS: List[str] = [
     "Forecast Price 1M",
     "Forecast Price 3M",
     "Forecast Price 12M",
-    "Expected ROI 1M %",
-    "Expected ROI 3M %",
-    "Expected ROI 12M %",
+    "Expected ROI 1M",    # FIX v6.1.0: was "Expected ROI 1M %" (schema stores fraction)
+    "Expected ROI 3M",    # FIX v6.1.0: was "Expected ROI 3M %"
+    "Expected ROI 12M",   # FIX v6.1.0: was "Expected ROI 12M %"
     "Forecast Confidence",
     "Forecast Method",
     "Value Score",
@@ -814,9 +814,9 @@ _FALLBACK_STANDARD_KEYS: List[str] = [
     "forecast_price_1m",
     "forecast_price_3m",
     "forecast_price_12m",
-    "expected_roi_1m_pct",
-    "expected_roi_3m_pct",
-    "expected_roi_12m_pct",
+    "expected_roi_1m",    # FIX v6.1.0: was "expected_roi_1m_pct" (schema key; value is fraction)
+    "expected_roi_3m",    # FIX v6.1.0: was "expected_roi_3m_pct"
+    "expected_roi_12m",   # FIX v6.1.0: was "expected_roi_12m_pct"
     "forecast_confidence",
     "forecast_method",
     "value_score",
@@ -854,14 +854,17 @@ _FALLBACK_TOP10_KEYS: List[str] = list(_FALLBACK_STANDARD_KEYS) + [
     "criteria_snapshot",
 ]
 
+# FIX v6.1.0: aligned to canonical Insights_Analysis schema (schema_registry v3.0.0)
+# Previous: "Criteria Key"/"criteria_key", "Criteria Value"/"criteria_value"
+# Canonical: "Source"/"source", "Sort Order"/"sort_order"
 _FALLBACK_INSIGHTS_HEADERS: List[str] = [
     "Section",
     "Item",
     "Metric",
     "Value",
     "Notes",
-    "Criteria Key",
-    "Criteria Value",
+    "Source",       # FIX v6.1.0: was "Criteria Key"
+    "Sort Order",   # FIX v6.1.0: was "Criteria Value"
 ]
 _FALLBACK_INSIGHTS_KEYS: List[str] = [
     "section",
@@ -869,8 +872,8 @@ _FALLBACK_INSIGHTS_KEYS: List[str] = [
     "metric",
     "value",
     "notes",
-    "criteria_key",
-    "criteria_value",
+    "source",       # FIX v6.1.0: was "criteria_key"
+    "sort_order",   # FIX v6.1.0: was "criteria_value"
 ]
 
 _FALLBACK_DICTIONARY_HEADERS: List[str] = [
@@ -890,7 +893,7 @@ _FALLBACK_DICTIONARY_KEYS: List[str] = [
     "header",
     "key",
     "dtype",
-    "format",
+    "fmt",        # FIX v6.1.0: was "format" (canonical key is "fmt")
     "required",
     "source",
     "notes",
@@ -911,20 +914,30 @@ _FALLBACK_CONTRACTS: Dict[str, Tuple[List[str], List[str]]] = {
 # Registry bridge (preferred source)
 # ---------------------------------------------------------------------------
 
-try:  # pragma: no cover
-    from core.sheets.schema_registry import (
-        get_sheet_headers as _registry_get_sheet_headers,
-        get_sheet_keys as _registry_get_sheet_keys,
-        get_sheet_len as _registry_get_sheet_len,
-        list_sheets as _registry_list_sheets,
-    )
-    _HAS_SCHEMA_REGISTRY = True
-except Exception:  # pragma: no cover
-    _registry_get_sheet_headers = None  # type: ignore
-    _registry_get_sheet_keys = None  # type: ignore
-    _registry_get_sheet_len = None  # type: ignore
-    _registry_list_sheets = None  # type: ignore
-    _HAS_SCHEMA_REGISTRY = False
+# FIX v6.1.0: multi-path fallback for schema_registry import
+# Try core.sheets.schema_registry → core.schema_registry → schema_registry (repo-root)
+_registry_get_sheet_headers = None  # type: ignore
+_registry_get_sheet_keys    = None  # type: ignore
+_registry_get_sheet_len     = None  # type: ignore
+_registry_list_sheets       = None  # type: ignore
+_HAS_SCHEMA_REGISTRY        = False
+
+for _sreg_path in ("core.sheets.schema_registry", "core.schema_registry", "schema_registry"):
+    try:
+        import importlib as _importlib
+        _sreg_mod = _importlib.import_module(_sreg_path)
+        _f_headers = getattr(_sreg_mod, "get_sheet_headers", None)
+        _f_keys    = getattr(_sreg_mod, "get_sheet_keys",    None)
+        if callable(_f_headers) and callable(_f_keys):
+            _registry_get_sheet_headers = _f_headers
+            _registry_get_sheet_keys    = _f_keys
+            _registry_get_sheet_len     = getattr(_sreg_mod, "get_sheet_len",  None)
+            _registry_list_sheets       = getattr(_sreg_mod, "list_sheets",    None)
+            _HAS_SCHEMA_REGISTRY        = True
+            break
+    except Exception:
+        continue
+del _sreg_path
 
 
 @lru_cache(maxsize=128)
@@ -1109,6 +1122,9 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "ps_ratio": ("ps",),
     "peg_ratio": ("peg",),
     "intrinsic_value": ("fair_value",),
+    "expected_roi_1m":  ("expected_roi_1m_pct",),   # FIX v6.1.0: UnifiedQuote uses _pct suffix
+    "expected_roi_3m":  ("expected_roi_3m_pct",),
+    "expected_roi_12m": ("expected_roi_12m_pct",),
     "top10_rank": ("rank_top10",),
 }
 
