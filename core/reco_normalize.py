@@ -2,7 +2,7 @@
 """
 core/reco_normalize.py
 ------------------------------------------------------------
-Recommendation Normalization — v5.1.0
+Recommendation Normalization -- v5.1.0
 ------------------------------------------------------------
 
 Purpose
@@ -17,39 +17,20 @@ Purpose
     - confidence / score / source fields where present
 - Remain deterministic, fast, import-safe, and exception-safe.
 
-Canonical outputs (v5.1.0 — 5-value)
-- STRONG_BUY / BUY / HOLD / REDUCE / SELL
-
-What changed in v5.1.0
-- FIX: Expanded from 4-value to 5-value enum by adding STRONG_BUY.
-       Aligns with scoring.py v2.3.0 which now produces STRONG_BUY for
-       high-conviction buy signals (overall >= 80, conf >= 70, risk <= 50).
-       Previously STRONG_BUY inputs were silently downgraded to BUY, losing
-       the conviction signal through the entire display pipeline.
-- FIX: _parse_string_recommendation now returns RECO_STRONG_BUY for
-       strong-buy variants (STRONG BUY, CONVICTION BUY, TOP PICK, etc.)
-       instead of downgrading to BUY.
-- FIX: get_recommendation_score() updated — STRONG_BUY=0 (best), BUY=1,
-       HOLD=2, REDUCE=3, SELL=4. Used for sort/ranking comparisons.
-- FIX: recommendation_from_score() updated — STRONG_BUY tier added at top
-       of 1-5, 1-3, and 0-100 scales.
-- SAFE: is_valid_recommendation("STRONG_BUY") now returns True.
-- NOTE: Conservative fallback remains HOLD for unknown/ambiguous inputs.
+Canonical outputs
+- BUY / HOLD / REDUCE / SELL
 
 What changed in v5.0.0
-- Kept legacy normalize_recommendation(x) behavior
-- Added schema-safe row/payload normalization helpers
-- Preserved recommendation_reason instead of dropping it
-- Preserved and inferred horizon_days / invest_period_label
-- Supported dict rows, nested payloads, and mixed upstream formats
-- Added helper to normalize full advisor rows/canonical records
-- Never throws exceptions by design
+- ✅ Keeps legacy normalize_recommendation(x) behavior
+- ✅ Adds schema-safe row/payload normalization helpers
+- ✅ Preserves recommendation_reason instead of dropping it
+- ✅ Preserves and infers horizon_days / invest_period_label
+- ✅ Supports dict rows, nested payloads, and mixed upstream formats
+- ✅ Adds helper to normalize full advisor rows/canonical records
+- ✅ Never throws exceptions by design
 
 Notes
 - Conservative by default: unknown/ambiguous => HOLD
-- STRONG_BUY = highest conviction buy (overall >= 80, conf >= 70, risk <= 50)
-- BUY = standard buy signal
-- HOLD = hold existing position
 - REDUCE = partial sell / lighten / take profit
 - SELL = explicit exit / avoid / liquidation
 """
@@ -64,9 +45,6 @@ VERSION = "5.1.0"
 
 # ---------------------------------------------------------------------
 # Canonical recommendation enum
-# FIX v5.1.0: Expanded from 4-value to 5-value to align with scoring.py v2.3.0.
-# scoring.py now produces STRONG_BUY for highest-conviction buy signals.
-# Previously STRONG_BUY was silently downgraded to BUY here, losing signal.
 # ---------------------------------------------------------------------
 RECO_STRONG_BUY = "STRONG_BUY"
 RECO_BUY = "BUY"
@@ -687,8 +665,7 @@ def _parse_string_recommendation(s_raw: str) -> str:
 
     if su in _STRONG_SELL_LIKE or _PAT_STRONG_SELL.search(su):
         return _apply_negation(su, RECO_SELL)
-    # FIX v5.1.0: Strong buy variants now return RECO_STRONG_BUY, not RECO_BUY.
-    # Preserves the conviction signal through the normalization pipeline.
+    # FIX v5.1.0: Strong buy variants return RECO_STRONG_BUY, not RECO_BUY
     if su in _STRONG_BUY_LIKE or _PAT_STRONG_BUY.search(su):
         return _apply_negation(su, RECO_STRONG_BUY)
 
@@ -914,39 +891,30 @@ def is_valid_recommendation(value: str) -> bool:
 
 
 def get_recommendation_score(reco: str) -> int:
-    """
-    Return a sort order integer for a recommendation label.
-    Lower number = more bullish. Used for sorting/ranking.
-    FIX v5.1.0: Added STRONG_BUY = 0 (best). BUY shifts to 1, rest unchanged.
-    """
     scores = {
-        RECO_STRONG_BUY: 0,   # highest conviction
+        RECO_STRONG_BUY: 0,   # highest conviction  FIX v5.1.0
         RECO_BUY:        1,
         RECO_HOLD:       2,
         RECO_REDUCE:     3,
-        RECO_SELL:       4,   # lowest conviction
+        RECO_SELL:       4,
     }
     return scores.get(reco, 2)
 
 
 def recommendation_from_score(score: float, scale: str = "1-5") -> str:
-    """
-    Convert a numeric score to a canonical recommendation label.
-    FIX v5.1.0: Added STRONG_BUY tier at the top of each scale.
-    """
     if scale == "1-5":
         if score <= 1.5:
-            return RECO_STRONG_BUY   # ← new tier
+            return RECO_STRONG_BUY   # FIX v5.1.0
         if score <= 2.5:
             return RECO_BUY
-        if score <= 3.5:
+        if score <= 3.0:
             return RECO_HOLD
-        if score <= 4.5:
+        if score <= 4.0:
             return RECO_REDUCE
         return RECO_SELL
     if scale == "1-3":
         if score <= 1.2:
-            return RECO_STRONG_BUY   # ← new tier
+            return RECO_STRONG_BUY   # FIX v5.1.0
         if score <= 1.8:
             return RECO_BUY
         if score <= 2.5:
@@ -954,13 +922,11 @@ def recommendation_from_score(score: float, scale: str = "1-5") -> str:
         return RECO_SELL
     if scale == "0-100":
         if score >= 85:
-            return RECO_STRONG_BUY   # ← new tier
+            return RECO_STRONG_BUY   # FIX v5.1.0
         if score >= 65:
             return RECO_BUY
-        if score >= 40:
+        if score >= 45:
             return RECO_HOLD
-        if score >= 20:
-            return RECO_REDUCE
         return RECO_SELL
     return RECO_HOLD
 
@@ -975,7 +941,7 @@ __all__ = [
     "get_recommendation_score",
     "recommendation_from_score",
     "VERSION",
-    "RECO_STRONG_BUY",    # v5.1.0: new
+    "RECO_STRONG_BUY",
     "RECO_BUY",
     "RECO_HOLD",
     "RECO_REDUCE",
