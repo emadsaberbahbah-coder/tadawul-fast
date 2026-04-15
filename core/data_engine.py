@@ -2,26 +2,37 @@
 """
 core/data_engine.py
 ================================================================================
-Enterprise Data Engine — v6.7.0 (ALIGNED / SAFE / PROD-HARDENED / SHEET-ROWS+)
+Enterprise Data Engine -- v6.8.0 (ALIGNED / SAFE / PROD-HARDENED / SHEET-ROWS+)
 ================================================================================
 
 Primary goals (this revision)
-- ✅ Keep your v6.5.0 hardening (OTel correctness, async correctness, hygiene-safe debug, perf timestamps)
-- ✅ ADD (CRITICAL): Schema-correct Sheet Rows API in the adapter layer:
-    - get_sheet_rows(...)
-    - get_sheet_rows_sync(...)
-    - DataEngine.get_sheet_rows(...)
-  This aligns core.data_engine.py with:
-    - routes/analysis_sheet_rows.py
-    - routes/advanced_sheet_rows.py
-    - core/data_engine_v2.py (engine-native get_sheet_rows)
-- ✅ SPECIAL DISPATCH: Insights_Analysis / Top_10_Investments / Data_Dictionary are routed to
-  the V2 engine special builders whenever available (or schema-safe fallback).
-- ✅ Schema projection: even if a builder returns partial/misaligned keys, we normalize & project to schema keys.
+- ✅ Keep v6.5.0 hardening (OTel correctness, async correctness, hygiene-safe debug, perf timestamps)
+- ✅ Sheet Rows API added in v6.7.0: get_sheet_rows(), get_sheet_rows_sync(),
+  DataEngine.get_sheet_rows(). Aligned with routes/analysis_sheet_rows.py,
+  routes/advanced_sheet_rows.py, core/data_engine_v2.py.
+- ✅ SPECIAL DISPATCH: Insights_Analysis / Top_10_Investments / Data_Dictionary
+  routed to V2 engine special builders (or schema-safe fallback).
+- ✅ Schema projection: normalize & project to schema keys as adapter safety net.
 
-Notes on ratio/% correctness
-- This module does NOT scale percent fields globally.
-- It only computes change_pct in the EmergencyDataRescuer (as percent points).
+v6.8.0 changes vs v6.7.0
+--------------------------
+FIX: dtype=pct fraction violation in EmergencyDataRescuer and StubUnifiedQuote.finalize().
+  v6.7.0 stored percent_change / change_pct as percent POINTS (e.g. 1.42 for 1.42%).
+  The schema contract (schema_registry v3.0.0) requires dtype=pct fields to be stored
+  as FRACTIONS (0.0142 for 1.42%). This caused a 100x magnitude error on every rescued
+  or stub quote's percent_change field.
+
+  EmergencyDataRescuer: pct = (change / pc) * 100.0  ->  pct = change / pc
+  StubUnifiedQuote.finalize: (price/prev - 1) * 100.0  ->  price/prev - 1
+
+FIX: schema_registry import hardened with multi-path fallback.
+  v6.7.0: from core.sheets.schema_registry import get_sheet_spec (single path)
+  v6.8.0: try core.sheets.schema_registry -> core.schema_registry -> schema_registry
+
+Notes on ratio/% correctness (v6.8.0 FIXED)
+- dtype=pct fields (percent_change, change_pct) are stored as FRACTIONS (0.0142 = 1.42%).
+- v6.7.0 incorrectly stored these as percent points (* 100), violating the schema contract.
+- v6.8.0 fix: EmergencyDataRescuer and StubUnifiedQuote.finalize() now store fractions.
 """
 
 from __future__ import annotations
@@ -65,7 +76,7 @@ from typing import (
 # Version Information
 # =============================================================================
 
-__version__ = "6.7.0"
+__version__ = "6.8.0"
 ADAPTER_VERSION = __version__
 
 # =============================================================================
@@ -160,13 +171,21 @@ except Exception:
 # =============================================================================
 # Schema Registry (optional, safe) — used for schema-first sheet-rows enforcement
 # =============================================================================
-try:
-    from core.sheets.schema_registry import get_sheet_spec as _get_sheet_spec  # type: ignore
-
-    _SCHEMA_AVAILABLE = True
-except Exception:
-    _get_sheet_spec = None  # type: ignore
-    _SCHEMA_AVAILABLE = False
+# FIX v6.8.0: multi-path import, same pattern as data_dictionary.py v3.3.0
+_get_sheet_spec = None
+_SCHEMA_AVAILABLE = False
+for _schema_path in ("core.sheets.schema_registry", "core.schema_registry", "schema_registry"):
+    try:
+        import importlib as _ilib
+        _sreg_mod = _ilib.import_module(_schema_path)
+        _fn = getattr(_sreg_mod, "get_sheet_spec", None)
+        if callable(_fn):
+            _get_sheet_spec = _fn  # type: ignore[assignment]
+            _SCHEMA_AVAILABLE = True
+            break
+    except Exception:
+        continue
+del _schema_path
 
 # =============================================================================
 # Logging + Debug
@@ -943,7 +962,9 @@ class EmergencyDataRescuer:
 
                 if pc not in (None, 0) and p is not None:
                     change = p - float(pc)
-                    pct = (change / float(pc)) * 100.0
+                    # FIX v6.8.0: store as FRACTION (dtype=pct schema contract)
+                    # 0.0142 = 1.42%, NOT 1.42
+                    pct = change / float(pc)
                     quote_obj["price_change"] = change
                     quote_obj["change"] = change
                     quote_obj["percent_change"] = pct
@@ -964,7 +985,9 @@ class EmergencyDataRescuer:
 
                 if pc not in (None, 0) and p is not None:
                     change = p - float(pc)
-                    pct = (change / float(pc)) * 100.0
+                    # FIX v6.8.0: store as FRACTION (dtype=pct schema contract)
+                    # 0.0142 = 1.42%, NOT 1.42
+                    pct = change / float(pc)
                     if hasattr(quote_obj, "price_change"):
                         quote_obj.price_change = change
                     if hasattr(quote_obj, "change"):
@@ -1467,7 +1490,9 @@ class StubUnifiedQuote(BaseModel):
                 pass
         if self.change_pct is None and self.current_price is not None and self.previous_close not in (None, 0):
             try:
-                self.change_pct = (float(self.current_price) / float(self.previous_close) - 1.0) * 100.0
+                # FIX v6.8.0: store as FRACTION (dtype=pct schema contract)
+                # 0.0142 = 1.42%, NOT 1.42
+                self.change_pct = float(self.current_price) / float(self.previous_close) - 1.0
                 self.percent_change = self.change_pct
             except Exception:
                 pass
