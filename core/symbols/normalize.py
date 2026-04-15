@@ -2,12 +2,21 @@
 # core/symbols/normalize.py
 """
 ================================================================================
-Symbol Normalization — v5.2.0 (ENTERPRISE ALIGNED)
+Symbol Normalization -- v5.3.0 (ENTERPRISE ALIGNED / CACHE-HARDENED)
 ================================================================================
 Comprehensive Symbol Normalization for KSA + Global Markets, with provider-safe
 formatting helpers and robust handling of share-class tickers (e.g., BRK.B).
 
-Key upgrades in v5.2.0
+Key upgrades in v5.3.0 (vs v5.2.0)
+- ✅ FIX: lru_cache + keyword-only arg inconsistency resolved.
+   to_eodhd_symbol() and normalize_symbol_for_provider() had default_exchange as
+   a keyword-only arg (after *). This caused lru_cache to create two separate cache
+   entries for calls with/without explicit default_exchange=None -- same result,
+   double the cache space. Converted to regular positional arg with default=None.
+   All callers in eodhd_provider, eodhd_symbol_variants, and
+   normalize_symbol_for_provider are unaffected (None default unchanged).
+
+Preserved from v5.2.0:
 - ✅ Remove duplicate env helper definitions (single source of truth)
 - ✅ Fix EODHD formatting bug: share-class tickers like BRK.B now correctly become BRK.B.US
    (previous logic treated ".B" as an exchange suffix and returned BRK.B without .US)
@@ -44,7 +53,7 @@ except Exception:
     def json_loads(data: Union[str, bytes]) -> Any:
         return json.loads(data)
 
-__version__ = "5.2.0"
+__version__ = "5.3.0"
 
 __all__ = [
     # Core enums
@@ -1005,7 +1014,7 @@ def to_finnhub_symbol(symbol: str) -> str:
 
 
 @lru_cache(maxsize=20000)
-def to_eodhd_symbol(symbol: str, *, default_exchange: Optional[str] = None) -> str:
+def to_eodhd_symbol(symbol: str, default_exchange: Optional[str] = None) -> str:
     """
     EODHD typically expects Equity symbols as: TICKER.EXCHANGE (e.g., AAPL.US, 2222.SR)
 
@@ -1291,7 +1300,7 @@ def reuters_symbol_variants(symbol: str) -> List[str]:
 # =============================================================================
 
 @lru_cache(maxsize=40000)
-def normalize_symbol_for_provider(symbol: str, provider: str, *, default_exchange: Optional[str] = None) -> str:
+def normalize_symbol_for_provider(symbol: str, provider: str, default_exchange: Optional[str] = None) -> str:
     """
     Returns a provider-ready symbol without the caller needing to remember rules.
 
