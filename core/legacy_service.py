@@ -2,7 +2,7 @@
 """
 core/legacy_service.py
 ================================================================================
-Legacy Compatibility Service — v3.1.0 (NEXT-GEN ENTERPRISE)
+Legacy Compatibility Service -- v3.2.0 (NEXT-GEN ENTERPRISE)
 ================================================================================
 Financial Data Platform — Legacy Router with Modern Features
 
@@ -48,6 +48,15 @@ except ImportError:
     import json
     def json_dumps(obj: Any) -> str:
         return json.dumps(obj, default=str)
+
+
+# ---------------------------------------------------------------------------
+# Canonical recommendation constants — import with fallback (FIX v3.2.0)
+# ---------------------------------------------------------------------------
+try:
+    from core.reco_normalize import RECO_HOLD  # type: ignore
+except Exception:
+    RECO_HOLD = "HOLD"
 
 # ---------------------------------------------------------------------------
 # Monitoring & Tracing
@@ -109,7 +118,7 @@ class TraceContext:
 # Version Information
 # ============================================================================
 
-__version__ = "3.1.0"
+__version__ = "3.2.0"
 VERSION = __version__
 
 logger = logging.getLogger("core.legacy_service")
@@ -692,7 +701,9 @@ async def _check_auth(request: Request) -> Tuple[bool, Optional[str]]:
 
 _HEADER_MAP = {
     "change %": (("percent_change", "change_percent", "regular_market_change_percent"), _to_percent),
-    "last updated (utc)": (("last_updated_utc", "as_of_utc", "timestamp_utc"), _iso_or_none),
+    # FIX v3.2.0: removed "as_of_utc" alias (non-canonical). Canonical key is "last_updated_utc".
+    # "timestamp_utc" kept as a provider alias for backward compat with live data sources.
+    "last updated (utc)": (("last_updated_utc", "timestamp_utc"), _iso_or_none),
 }
 
 def _get_headers_for_sheet(sheet_name: str) -> List[str]:
@@ -711,7 +722,7 @@ def _quote_to_row(q: Any, headers: List[str]) -> List[Any]:
         elif "change %" in hl: row[i] = _to_percent(d.get("percent_change") or d.get("change_percent"))
         elif "volume" in hl: row[i] = d.get("volume")
         elif "market cap" in hl: row[i] = d.get("market_cap")
-        elif "recommendation" in hl: row[i] = d.get("recommendation", "HOLD")
+        elif "recommendation" in hl: row[i] = d.get("recommendation", RECO_HOLD)  # FIX v3.2.0: was "HOLD" (non-canonical literal)
         elif "last updated (utc)" in hl: row[i] = _iso_or_none(d.get("last_updated_utc"))
         elif "error" in hl: row[i] = d.get("error")
         else: row[i] = d.get(h)
