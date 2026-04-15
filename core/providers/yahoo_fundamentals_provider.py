@@ -60,8 +60,9 @@ logger = logging.getLogger("core.providers.yahoo_fundamentals_provider")
 logger.addHandler(logging.NullHandler())
 
 PROVIDER_NAME = "yahoo_fundamentals"
-PROVIDER_VERSION = "5.4.0"
-VERSION = PROVIDER_VERSION
+PROVIDER_VERSION         = "5.5.0"
+VERSION                  = PROVIDER_VERSION
+PROVIDER_BATCH_SUPPORTED = True   # ENH v5.5.0
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
@@ -1255,6 +1256,30 @@ class YahooFundamentalsProvider:
 
         return await self.singleflight.run(cache_key, _do_fetch)
 
+    async def get_enriched_quotes_batch(
+        self,
+        symbols: List[str],
+        *,
+        mode: str = "",
+    ) -> Dict[str, Dict[str, Any]]:
+        """ENH v5.5.0: Batch fetch fundamentals patches for multiple symbols."""
+        if not symbols:
+            return {}
+        results = await asyncio.gather(
+            *(self.fetch_fundamentals_patch(sym) for sym in symbols),
+            return_exceptions=True,
+        )
+        out: Dict[str, Dict[str, Any]] = {}
+        for sym, result in zip(symbols, results):
+            if isinstance(result, Exception):
+                out[sym] = {"symbol": sym, "provider": PROVIDER_NAME, "data_quality": "MISSING"}
+            elif isinstance(result, dict):
+                key = result.get("symbol") or normalize_symbol(sym) or sym
+                out[key] = result
+            else:
+                out[sym] = {"symbol": sym, "provider": PROVIDER_NAME, "data_quality": "MISSING"}
+        return out
+
     async def fetch_enriched_quote_patch(self, symbol: str, debug: bool = False, *args: Any, **kwargs: Any) -> Dict[str, Any]:
         return await self.fetch_fundamentals_patch(symbol, debug=debug, *args, **kwargs)
 
@@ -1356,6 +1381,14 @@ async def fetch_quotes(symbols: List[str], debug: bool = False, *args: Any, **kw
     return await provider.fetch_quotes(symbols, debug=debug, *args, **kwargs)
 
 
+async def fetch_enriched_quotes_batch(
+    symbols: List[str], *, mode: str = "", **kwargs: Any
+) -> Dict[str, Dict[str, Any]]:
+    """ENH v5.5.0: Batch fetch fundamentals patches for multiple symbols."""
+    prov = await get_provider()
+    return await prov.get_enriched_quotes_batch(symbols, mode=mode)
+
+
 async def get_client_metrics() -> Dict[str, Any]:
     provider = await get_provider()
     return await provider.get_metrics()
@@ -1368,11 +1401,13 @@ async def aclose_yahoo_fundamentals_client() -> None:
 __all__ = [
     "PROVIDER_NAME",
     "PROVIDER_VERSION",
+    "PROVIDER_BATCH_SUPPORTED",
     "VERSION",
     "YahooFundamentalsProvider",
     "get_provider",
     "fetch_fundamentals_patch",
     "fetch_enriched_quote_patch",
+    "fetch_enriched_quotes_batch",
     "quote",
     "get_quote",
     "fetch_quote",
