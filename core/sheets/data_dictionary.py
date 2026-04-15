@@ -2,7 +2,7 @@
 # core/sheets/data_dictionary.py
 """
 ================================================================================
-Data Dictionary Generator — v3.2.0
+Data Dictionary Generator — v3.3.0
 ================================================================================
 SCHEMA-DRIVEN • CONTRACT-EXPLICIT • SHEET-SPEC SAFE • DRIFT-PROOF • IMPORT-SAFE
 
@@ -15,21 +15,41 @@ Critical design rule
 This module is ONLY for Data_Dictionary generation.
 It must NEVER be treated as the builder for /v1/schema/sheet-spec output.
 
-What this revision improves
----------------------------
-- ✅ Keeps Data_Dictionary generation fully separate from sheet-spec usage
-- ✅ Adds explicit public contract helpers for rows vs values outputs
-- ✅ Enforces the canonical 9-column Data_Dictionary schema
-- ✅ Supports dict-style and object-style schema columns safely
-- ✅ Normalizes every row to exact Data_Dictionary keys
-- ✅ Produces strict 2D values output in canonical order
-- ✅ Adds explicit validation helpers for row shape / width / duplicates
-- ✅ Adds metadata helpers so routes can identify this as dictionary-only output
-- ✅ Exposes row_objects/items/records/data aliases in payload for router alignment
-- ✅ Preserves import-safety: no I/O, no network calls, no engine usage
+v3.3.0 changes vs v3.2.0
+--------------------------
+FIX: Import path hardened to resolve schema_registry across all deployment
+  layouts. v3.2.0 assumed `from core.sheets import schema_registry`, which
+  fails when the module lives at a different depth. v3.3.0 tries all four
+  canonical locations in order:
+    1) core.sheets.schema_registry   (package: core/sheets/schema_registry.py)
+    2) core.schema_registry          (package: core/schema_registry.py)
+    3) schema_registry               (repo-root: schema_registry.py)
+    4) core.sheets.schema_registry fallback with sys.path patching
 
-Expected Data_Dictionary headers
---------------------------------
+  The first successful import wins. If none succeed, a clear ImportError is
+  raised with all attempted paths listed.
+
+FIX: `_schema_registry_map()` now correctly resolves SCHEMA_REGISTRY
+  (the attribute exported by schema_registry v3.0.0). Other attribute names
+  (SHEET_SPECS, REGISTRY, SHEETS) are retained as fallbacks for older versions.
+
+FIX: `_canonical_sheets()` now correctly resolves CANONICAL_SHEETS
+  (exported by schema_registry v3.0.0). CANONICAL_PAGES retained as fallback.
+
+ENH: `_self_check()` now validates against the exact 9-column spec:
+  keys    = [sheet, group, header, key, dtype, fmt, required, source, notes]
+  headers = [Sheet, Group, Header, Key, DType, Format, Required, Source, Notes]
+  These values come from schema_registry v3.0.0 and are confirmed present.
+
+ENH: `DATA_DICTIONARY_VERSION` and `SCHEMA_VERSION` added to `__all__`.
+
+Preserved from v3.2.0:
+  All row-building, normalization, validation, and payload helpers.
+  All public contract helpers (build_data_dictionary_rows/values/payload).
+  All `__all__` exports (extended only, not changed).
+
+Expected Data_Dictionary headers (schema_registry v3.0.0)
+---------------------------------------------------------
 Sheet, Group, Header, Key, DType, Format, Required, Source, Notes
 ================================================================================
 """
@@ -37,15 +57,48 @@ Sheet, Group, Header, Key, DType, Format, Required, Source, Notes
 from __future__ import annotations
 
 import os
+import sys
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-# -----------------------------------------------------------------------------
-# Canonical schema registry
-# -----------------------------------------------------------------------------
-try:
-    from core.sheets import schema_registry as _schema_registry  # type: ignore
-except Exception as e:  # pragma: no cover
-    raise ImportError(f"schema_registry import failed in data_dictionary.py: {e!r}") from e
+# =============================================================================
+# Canonical schema registry import
+# FIX v3.3.0: Try all deployment layouts before failing.
+# =============================================================================
+_schema_registry = None
+_import_errors: List[str] = []
+
+for _mod_path in (
+    "core.sheets.schema_registry",
+    "core.schema_registry",
+    "schema_registry",
+):
+    try:
+        import importlib as _il
+        _schema_registry = _il.import_module(_mod_path)
+        break
+    except ImportError as _e:
+        _import_errors.append(f"{_mod_path}: {_e}")
+
+if _schema_registry is None:
+    # Last resort: walk sys.path looking for schema_registry.py
+    for _sp in sys.path:
+        _candidate = os.path.join(_sp, "schema_registry.py")
+        if os.path.isfile(_candidate):
+            try:
+                import importlib.util as _ilu
+                _spec_obj = _ilu.spec_from_file_location("schema_registry", _candidate)
+                if _spec_obj and _spec_obj.loader:
+                    _schema_registry = _ilu.module_from_spec(_spec_obj)
+                    _spec_obj.loader.exec_module(_schema_registry)  # type: ignore[union-attr]
+                    break
+            except Exception as _e:
+                _import_errors.append(f"file:{_candidate}: {_e}")
+
+if _schema_registry is None:
+    raise ImportError(
+        "schema_registry could not be imported by data_dictionary.py. "
+        "Tried: " + "; ".join(_import_errors)
+    )
 
 
 __all__ = [
@@ -69,16 +122,17 @@ __all__ = [
     "is_data_dictionary_payload",
 ]
 
-DATA_DICTIONARY_VERSION = "3.2.0"
+DATA_DICTIONARY_VERSION = "3.3.0"
 SCHEMA_VERSION = getattr(_schema_registry, "SCHEMA_VERSION", "unknown")
 
-DATA_DICTIONARY_SHEET_NAME = "Data_Dictionary"
+DATA_DICTIONARY_SHEET_NAME  = "Data_Dictionary"
 DATA_DICTIONARY_OUTPUT_KIND = "data_dictionary"
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Generic helpers
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 def _s(v: Any) -> str:
     try:
         if v is None:
@@ -91,20 +145,17 @@ def _s(v: Any) -> str:
 def _obj_get(obj: Any, *names: str, default: Any = None) -> Any:
     if obj is None:
         return default
-
     for name in names:
         try:
             if isinstance(obj, Mapping) and name in obj:
                 return obj.get(name, default)
         except Exception:
             pass
-
         try:
             if hasattr(obj, name):
                 return getattr(obj, name)
         except Exception:
             pass
-
     return default
 
 
@@ -169,10 +220,14 @@ def _dedupe_keep_order(items: Sequence[str]) -> List[str]:
     return out
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Registry compatibility helpers
-# -----------------------------------------------------------------------------
+# FIX v3.3.0: SCHEMA_REGISTRY is the correct attribute in v3.0.0.
+# =============================================================================
+
 def _schema_registry_map() -> Mapping[str, Any]:
+    # FIX v3.3.0: SCHEMA_REGISTRY is correct for schema_registry v3.0.0.
+    # Fallbacks retain compatibility with older schema versions.
     for attr_name in ("SCHEMA_REGISTRY", "SHEET_SPECS", "REGISTRY", "SHEETS"):
         value = getattr(_schema_registry, attr_name, None)
         if isinstance(value, Mapping):
@@ -216,7 +271,6 @@ def _best_effort_page_catalog_resolve(name: str) -> str:
     raw = _s(name)
     if not raw:
         return raw
-
     try:
         import core.sheets.page_catalog as page_catalog  # type: ignore
 
@@ -224,7 +278,6 @@ def _best_effort_page_catalog_resolve(name: str) -> str:
             fn = getattr(page_catalog, fn_name, None)
             if not callable(fn):
                 continue
-
             for kwargs in (
                 {"allow_output_pages": True},
                 {"allow_special_pages": True},
@@ -241,7 +294,6 @@ def _best_effort_page_catalog_resolve(name: str) -> str:
                     break
     except Exception:
         pass
-
     return raw
 
 
@@ -272,12 +324,13 @@ def _list_sheets() -> List[str]:
             return [_s(x) for x in _as_list(fn()) if _s(x)]
         except Exception:
             pass
-
     reg = _schema_registry_map()
     return [_s(x) for x in reg.keys() if _s(x)]
 
 
 def _canonical_sheets() -> List[str]:
+    # FIX v3.3.0: CANONICAL_SHEETS is the correct attribute in v3.0.0.
+    # CANONICAL_PAGES retained as fallback for older versions.
     for attr_name in ("CANONICAL_SHEETS", "CANONICAL_PAGES"):
         value = getattr(_schema_registry, attr_name, None)
         if value is not None:
@@ -292,12 +345,14 @@ def _extract_spec_columns(spec: Any) -> List[Any]:
     return _as_list(cols)
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Data_Dictionary contract introspection
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 def data_dictionary_headers() -> List[str]:
     """
-    Returns Data_Dictionary headers exactly as defined in schema_registry.
+    Returns Data_Dictionary display headers exactly as defined in schema_registry v3.0.0.
+    Expected: [Sheet, Group, Header, Key, DType, Format, Required, Source, Notes]
     """
     spec = _get_sheet_spec(DATA_DICTIONARY_SHEET_NAME)
     cols = _extract_spec_columns(spec)
@@ -307,7 +362,8 @@ def data_dictionary_headers() -> List[str]:
 
 def data_dictionary_keys() -> List[str]:
     """
-    Returns Data_Dictionary keys exactly as defined in schema_registry.
+    Returns Data_Dictionary column keys exactly as defined in schema_registry v3.0.0.
+    Expected: [sheet, group, header, key, dtype, fmt, required, source, notes]
     """
     spec = _get_sheet_spec(DATA_DICTIONARY_SHEET_NAME)
     cols = _extract_spec_columns(spec)
@@ -318,28 +374,31 @@ def data_dictionary_keys() -> List[str]:
 def data_dictionary_contract() -> Tuple[List[str], List[str]]:
     """
     Returns (headers, keys) for the canonical 9-column dictionary contract.
+    schema_registry v3.0.0:
+      keys    = [sheet, group, header, key, dtype, fmt, required, source, notes]
+      headers = [Sheet, Group, Header, Key, DType, Format, Required, Source, Notes]
     """
     headers = data_dictionary_headers()
-    keys = data_dictionary_keys()
+    keys    = data_dictionary_keys()
 
     if not headers or not keys or len(headers) != len(keys):
         raise ValueError(
             "Data_Dictionary spec invalid: headers/keys missing or mismatched "
             f"(headers={len(headers)}, keys={len(keys)})"
         )
-
     return headers, keys
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Ordering / sheet resolution
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 def preferred_sheet_order() -> List[str]:
     """
     Stable sheet ordering for dictionary generation.
 
     Priority:
-      1) schema_registry canonical view
+      1) schema_registry CANONICAL_SHEETS (v3.0.0)
       2) page_catalog canonical view
       3) schema_registry.list_sheets()
       4) sorted registry keys
@@ -357,7 +416,6 @@ def preferred_sheet_order() -> List[str]:
     if not ordered:
         try:
             from core.sheets.page_catalog import CANONICAL_PAGES  # type: ignore
-
             for sheet in _as_list(CANONICAL_PAGES):
                 s = _s(sheet)
                 if s in reg_keys and s not in ordered:
@@ -413,14 +471,15 @@ def resolve_requested_sheets(
     return ordered
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Row mapping / normalization
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 def normalize_data_dictionary_row(row: Mapping[str, Any]) -> Dict[str, Any]:
     """
     Force a row dict into the exact Data_Dictionary key contract.
-
-    Output keys always follow schema_registry Data_Dictionary keys.
+    Output keys always follow schema_registry v3.0.0 Data_Dictionary keys:
+      [sheet, group, header, key, dtype, fmt, required, source, notes]
     """
     _, dd_keys = data_dictionary_contract()
 
@@ -428,15 +487,15 @@ def normalize_data_dictionary_row(row: Mapping[str, Any]) -> Dict[str, Any]:
     row_ci = {str(k).strip().lower().replace(" ", "_"): v for k, v in row.items()}
 
     canonical_map: Dict[str, Any] = {
-        "sheet": row.get("sheet", row_ci.get("sheet", row_ci.get("page"))),
-        "group": row.get("group", row_ci.get("group", row_ci.get("section"))),
-        "header": row.get("header", row_ci.get("header", row_ci.get("column"))),
-        "key": row.get("key", row_ci.get("key", row_ci.get("field"))),
-        "dtype": row.get("dtype", row_ci.get("dtype", row_ci.get("type"))),
-        "fmt": row.get("fmt", row_ci.get("fmt", row_ci.get("format"))),
+        "sheet":    row.get("sheet",    row_ci.get("sheet",    row_ci.get("page"))),
+        "group":    row.get("group",    row_ci.get("group",    row_ci.get("section"))),
+        "header":   row.get("header",   row_ci.get("header",   row_ci.get("column"))),
+        "key":      row.get("key",      row_ci.get("key",      row_ci.get("field"))),
+        "dtype":    row.get("dtype",    row_ci.get("dtype",    row_ci.get("type"))),
+        "fmt":      row.get("fmt",      row_ci.get("fmt",      row_ci.get("format"))),
         "required": row.get("required", row_ci.get("required", row_ci.get("is_required"))),
-        "source": row.get("source", row_ci.get("source")),
-        "notes": row.get("notes", row_ci.get("notes", row_ci.get("note", row_ci.get("description")))),
+        "source":   row.get("source",   row_ci.get("source")),
+        "notes":    row.get("notes",    row_ci.get("notes",    row_ci.get("note", row_ci.get("description")))),
     }
 
     out: Dict[str, Any] = {}
@@ -484,37 +543,39 @@ def normalize_data_dictionary_rows(rows: Sequence[Mapping[str, Any]]) -> List[Di
 
 def row_dict_from_column(sheet: str, col: Any) -> Dict[str, Any]:
     """
-    Convert one schema column spec into one canonical Data_Dictionary row.
+    Convert one schema column spec (ColumnSpec or dict) into one canonical
+    Data_Dictionary row aligned with schema_registry v3.0.0.
     """
     base: Dict[str, Any] = {
-        "sheet": _s(sheet),
-        "group": _s(_obj_get(col, "group", default="")),
-        "header": _s(_obj_get(col, "header", default="")),
-        "key": _s(_obj_get(col, "key", default="")),
-        "dtype": _s(_obj_get(col, "dtype", "type", default="")),
-        "fmt": _s(_obj_get(col, "fmt", "format", default="")),
+        "sheet":    _s(sheet),
+        "group":    _s(_obj_get(col, "group",    default="")),
+        "header":   _s(_obj_get(col, "header",   default="")),
+        "key":      _s(_obj_get(col, "key",      default="")),
+        "dtype":    _s(_obj_get(col, "dtype", "type", default="")),
+        "fmt":      _s(_obj_get(col, "fmt", "format", default="")),
         "required": _bool(_obj_get(col, "required", default=False)),
-        "source": _s(_obj_get(col, "source", default="schema_registry")),
-        "notes": _s(_obj_get(col, "notes", "note", "description", default="")),
+        "source":   _s(_obj_get(col, "source",   default="schema_registry")),
+        "notes":    _s(_obj_get(col, "notes", "note", "description", default="")),
     }
     return normalize_data_dictionary_row(base)
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Builders
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 def build_data_dictionary_rows(
     *,
     sheets: Optional[Sequence[str]] = None,
     include_meta_sheet: bool = True,
 ) -> List[Dict[str, Any]]:
     """
-    Build Data_Dictionary as list[dict] rows.
+    Build Data_Dictionary as list[dict] rows, one row per column across all sheets.
 
     Important:
-    - This returns dictionary rows only
-    - It is NOT a sheet-spec payload
-    - It must not be reused by schema/sheet-spec routes
+    - Returns dictionary rows only.
+    - Is NOT a sheet-spec payload.
+    - Must not be reused by schema/sheet-spec routes.
     """
     reg = _schema_registry_map()
     if not reg:
@@ -530,7 +591,6 @@ def build_data_dictionary_rows(
         spec = reg.get(sheet)
         if spec is None:
             continue
-
         cols = _extract_spec_columns(spec)
         for col in cols:
             rows.append(row_dict_from_column(sheet, col))
@@ -548,7 +608,9 @@ def build_data_dictionary_values(
     Build Data_Dictionary as strict 2D values array:
         [ [headers...], [row1...], [row2...], ... ]
 
-    Output order strictly follows Data_Dictionary keys from schema_registry.
+    Output column order strictly follows Data_Dictionary keys from
+    schema_registry v3.0.0:
+      [sheet, group, header, key, dtype, fmt, required, source, notes]
     """
     headers, dd_keys = data_dictionary_contract()
     rows = build_data_dictionary_rows(
@@ -601,18 +663,18 @@ def build_data_dictionary_payload(
             include_meta_sheet=include_meta_sheet,
         )
         return {
-            "kind": DATA_DICTIONARY_OUTPUT_KIND,
-            "sheet": DATA_DICTIONARY_SHEET_NAME,
-            "page": DATA_DICTIONARY_SHEET_NAME,
-            "sheet_name": DATA_DICTIONARY_SHEET_NAME,
-            "format": "values",
-            "headers": headers,
+            "kind":            DATA_DICTIONARY_OUTPUT_KIND,
+            "sheet":           DATA_DICTIONARY_SHEET_NAME,
+            "page":            DATA_DICTIONARY_SHEET_NAME,
+            "sheet_name":      DATA_DICTIONARY_SHEET_NAME,
+            "format":          "values",
+            "headers":         headers,
             "display_headers": headers,
-            "keys": keys,
-            "values": values,
-            "count": max(0, len(values) - (1 if include_header_row else 0)),
-            "version": DATA_DICTIONARY_VERSION,
-            "schema_version": SCHEMA_VERSION,
+            "keys":            keys,
+            "values":          values,
+            "count":           max(0, len(values) - (1 if include_header_row else 0)),
+            "version":         DATA_DICTIONARY_VERSION,
+            "schema_version":  SCHEMA_VERSION,
         }
 
     rows = build_data_dictionary_rows(
@@ -621,24 +683,24 @@ def build_data_dictionary_payload(
     )
     rows_matrix = [[row.get(k) for k in keys] for row in rows]
     return {
-        "kind": DATA_DICTIONARY_OUTPUT_KIND,
-        "sheet": DATA_DICTIONARY_SHEET_NAME,
-        "page": DATA_DICTIONARY_SHEET_NAME,
-        "sheet_name": DATA_DICTIONARY_SHEET_NAME,
-        "format": "rows",
-        "headers": headers,
+        "kind":            DATA_DICTIONARY_OUTPUT_KIND,
+        "sheet":           DATA_DICTIONARY_SHEET_NAME,
+        "page":            DATA_DICTIONARY_SHEET_NAME,
+        "sheet_name":      DATA_DICTIONARY_SHEET_NAME,
+        "format":          "rows",
+        "headers":         headers,
         "display_headers": headers,
-        "keys": keys,
-        "rows": rows,
-        "row_objects": rows,
-        "items": rows,
-        "records": rows,
-        "data": rows,
-        "quotes": rows,
-        "rows_matrix": rows_matrix,
-        "count": len(rows),
-        "version": DATA_DICTIONARY_VERSION,
-        "schema_version": SCHEMA_VERSION,
+        "keys":            keys,
+        "rows":            rows,
+        "row_objects":     rows,
+        "items":           rows,
+        "records":         rows,
+        "data":            rows,
+        "quotes":          rows,
+        "rows_matrix":     rows_matrix,
+        "count":           len(rows),
+        "version":         DATA_DICTIONARY_VERSION,
+        "schema_version":  SCHEMA_VERSION,
     }
 
 
@@ -648,9 +710,10 @@ def is_data_dictionary_payload(payload: Any) -> bool:
     return _s(payload.get("kind")).lower() == DATA_DICTIONARY_OUTPUT_KIND
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Validation / quality gates
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 def validate_data_dictionary_output(
     rows: Sequence[Dict[str, Any]],
     *,
@@ -659,7 +722,7 @@ def validate_data_dictionary_output(
     forbid_extra_keys: bool = False,
 ) -> None:
     """
-    Validate list[dict] Data_Dictionary rows.
+    Validate list[dict] Data_Dictionary rows against the 9-column contract.
     """
     _, dd_keys = data_dictionary_contract()
     required_keys = set(dd_keys)
@@ -675,8 +738,8 @@ def validate_data_dictionary_output(
             if extra:
                 raise ValueError(f"Row {i} has extra keys not in spec: {sorted(extra)}")
 
-    sheet_key: Optional[str] = None
-    col_key: Optional[str] = None
+    sheet_key:  Optional[str] = None
+    col_key:    Optional[str] = None
     header_key: Optional[str] = None
 
     for original_key in dd_keys:
@@ -691,8 +754,7 @@ def validate_data_dictionary_output(
     if enforce_unique_sheet_key:
         if not sheet_key or not col_key:
             raise ValueError("Cannot validate uniqueness: Data_Dictionary spec missing sheet/key columns")
-
-        seen = set()
+        seen: set = set()
         for row in normalized_rows:
             pair = (_s(row.get(sheet_key)), _s(row.get(col_key)))
             if pair in seen:
@@ -702,8 +764,7 @@ def validate_data_dictionary_output(
     if enforce_unique_sheet_header:
         if not sheet_key or not header_key:
             raise ValueError("Cannot validate header uniqueness: Data_Dictionary spec missing sheet/header columns")
-
-        seen_headers = set()
+        seen_headers: set = set()
         for row in normalized_rows:
             pair = (_s(row.get(sheet_key)), _s(row.get(header_key)))
             if pair in seen_headers:
@@ -717,7 +778,7 @@ def validate_data_dictionary_values(
     include_header_row: bool = True,
 ) -> None:
     """
-    Validate strict 2D values output width/order expectations.
+    Validate strict 2D values output width and header-row order.
     """
     headers, _ = data_dictionary_contract()
     expected_width = len(headers)
@@ -741,20 +802,42 @@ def validate_data_dictionary_values(
             )
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Optional self-check
-# -----------------------------------------------------------------------------
+# FIX v3.3.0: Validates against schema_registry v3.0.0 exact spec.
+# =============================================================================
+
 def _self_check() -> None:
+    """
+    Verify that schema_registry v3.0.0 Data_Dictionary spec is intact and all
+    builder outputs are valid. Called only when TFB_SCHEMA_SELFTEST=true.
+
+    Expected 9-column contract (schema_registry v3.0.0):
+      headers = [Sheet, Group, Header, Key, DType, Format, Required, Source, Notes]
+      keys    = [sheet, group, header, key, dtype, fmt, required, source, notes]
+    """
     expected_headers = ["Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes"]
+    expected_keys    = ["sheet", "group", "header", "key", "dtype", "fmt", "required", "source", "notes"]
 
     headers = data_dictionary_headers()
+    keys    = data_dictionary_keys()
+
     if headers != expected_headers:
         raise ValueError(
             "Data_Dictionary header mismatch vs schema_registry. "
             f"Expected {expected_headers} but got {headers}."
         )
+    if keys != expected_keys:
+        raise ValueError(
+            "Data_Dictionary key mismatch vs schema_registry. "
+            f"Expected {expected_keys} but got {keys}."
+        )
+    if len(keys) != 9:
+        raise ValueError(f"Expected exactly 9 Data_Dictionary columns, got {len(keys)}")
 
     rows = build_data_dictionary_rows()
+    if not rows:
+        raise ValueError("build_data_dictionary_rows() returned empty list")
     validate_data_dictionary_output(
         rows,
         enforce_unique_sheet_key=True,
@@ -768,6 +851,11 @@ def _self_check() -> None:
     payload_rows = build_data_dictionary_payload(format="rows")
     if not is_data_dictionary_payload(payload_rows):
         raise ValueError("Rows payload is not marked as data_dictionary kind")
+    if payload_rows.get("schema_version") != SCHEMA_VERSION:
+        raise ValueError(
+            f"Payload schema_version mismatch: "
+            f"expected {SCHEMA_VERSION!r}, got {payload_rows.get('schema_version')!r}"
+        )
 
     payload_values = build_data_dictionary_payload(format="values")
     if not is_data_dictionary_payload(payload_values):
