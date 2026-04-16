@@ -10,7 +10,6 @@
 # - Fail fast if PORT is not provided by Render
 # - Conservative defaults for heavy FastAPI startup
 # ==============================================================================
-
 set -Eeuo pipefail
 
 timestamp_utc() {
@@ -65,10 +64,16 @@ pick_gunicorn_loglevel() {
   esac
 }
 
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 APP_MODULE="${TFB_APP:-${APP_MODULE:-main:app}}"
 APP_DIR="${TFB_APP_DIR:-${APP_DIR:-}}"
 
 HOST="${TFB_HOST:-0.0.0.0}"
+
+# FIX v2.5.0: Fail fast if Render does not provide PORT.
+# v2.4.0 silently defaulted to 10000 — this masked misconfiguration.
 PORT="${PORT:?Render must provide PORT}"
 
 WORKERS="$(clamp_min "${TFB_WORKERS:-${WEB_CONCURRENCY:-1}}" 1 1)"
@@ -79,9 +84,13 @@ KEEPALIVE="$(clamp_min "${TFB_KEEPALIVE:-${KEEPALIVE:-10}}" 1 10)"
 RAW_LOG_LEVEL="${TFB_LOG_LEVEL:-${LOG_LEVEL:-info}}"
 GUNICORN_LOG_LEVEL="$(pick_gunicorn_loglevel "$RAW_LOG_LEVEL")"
 
+# FIX v2.5.0: ACCESS_LOG defaults to ON (logs to stdout "-").
+# Set TFB_ACCESS_LOG=0/false/no to suppress access logs (redirected to /dev/null).
 ACCESS_LOG="${TFB_ACCESS_LOG:-1}"
 ACCESS_LOGFILE="-"
-if [ "$(lower "$ACCESS_LOG")" = "0" ] || [ "$(lower "$ACCESS_LOG")" = "false" ] || [ "$(lower "$ACCESS_LOG")" = "no" ]; then
+if [ "$(lower "$ACCESS_LOG")" = "0" ] || \
+   [ "$(lower "$ACCESS_LOG")" = "false" ] || \
+   [ "$(lower "$ACCESS_LOG")" = "no" ]; then
   ACCESS_LOGFILE="/dev/null"
 fi
 
@@ -91,6 +100,9 @@ WORKER_TMP_DIR="${TFB_WORKER_TMP_DIR:-/dev/shm}"
 MAX_REQUESTS="$(as_int "${TFB_MAX_REQUESTS:-0}" "0")"
 MAX_REQUESTS_JITTER="$(as_int "${TFB_MAX_REQUESTS_JITTER:-0}" "0")"
 
+# ---------------------------------------------------------------------------
+# Pre-flight
+# ---------------------------------------------------------------------------
 if [ -n "$APP_DIR" ]; then
   if [ -d "$APP_DIR" ]; then
     cd "$APP_DIR"
@@ -100,24 +112,30 @@ if [ -n "$APP_DIR" ]; then
   fi
 fi
 
+# Raise file descriptor limit (best-effort; not fatal if unsupported)
 ( ulimit -n 65535 >/dev/null 2>&1 ) || true
 
 export PYTHONUNBUFFERED=1
 export PORT
 export HOST
 
-log "boot config: app=$APP_MODULE host=$HOST port=$PORT workers=$WORKERS gunicorn_log_level=$GUNICORN_LOG_LEVEL timeout=$TIMEOUT graceful_timeout=$GRACEFUL_TIMEOUT keepalive=$KEEPALIVE"
+log "boot config: app=$APP_MODULE host=$HOST port=$PORT workers=$WORKERS \
+gunicorn_log_level=$GUNICORN_LOG_LEVEL timeout=$TIMEOUT \
+graceful_timeout=$GRACEFUL_TIMEOUT keepalive=$KEEPALIVE"
 
+# ---------------------------------------------------------------------------
+# Launch: Gunicorn + UvicornWorker (single path — no uvicorn fallback)
+# ---------------------------------------------------------------------------
 GUNI_ARGS=(
-  "--bind" "${HOST}:${PORT}"
-  "--worker-class" "${WORKER_CLASS}"
-  "--workers" "${WORKERS}"
-  "--timeout" "${TIMEOUT}"
-  "--graceful-timeout" "${GRACEFUL_TIMEOUT}"
-  "--keep-alive" "${KEEPALIVE}"
-  "--log-level" "${GUNICORN_LOG_LEVEL}"
-  "--error-logfile" "-"
-  "--access-logfile" "${ACCESS_LOGFILE}"
+  "--bind"                "${HOST}:${PORT}"
+  "--worker-class"        "${WORKER_CLASS}"
+  "--workers"             "${WORKERS}"
+  "--timeout"             "${TIMEOUT}"
+  "--graceful-timeout"    "${GRACEFUL_TIMEOUT}"
+  "--keep-alive"          "${KEEPALIVE}"
+  "--log-level"           "${GUNICORN_LOG_LEVEL}"
+  "--error-logfile"       "-"
+  "--access-logfile"      "${ACCESS_LOGFILE}"
   "--capture-output"
   "--forwarded-allow-ips" "*"
 )
