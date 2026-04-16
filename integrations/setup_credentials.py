@@ -2,23 +2,15 @@
 """
 integrations/google_sheets_service.py
 ===========================================================
-ADVANCED GOOGLE SHEETS SERVICE FOR TADAWUL FAST BRIDGE — v5.2.0
-(Emad Bahbah – Enterprise Integration Architecture)
+GOOGLE SHEETS SERVICE FOR TADAWUL FAST BRIDGE -- v5.5.3 (PHASE 2 ALIGNED)
 
-INSTITUTIONAL GRADE · STARTUP-SAFE · ZERO DATA LOSS · COMPLETE ALIGNMENT
-
-v5.2.0 (Enhanced / Render-safe / Production hardened)
-- ✅ STARTUP-SAFE: no Google client / httpx client / network work at import-time
-- ✅ ZERO-DATA-LOSS clear strategy:
-     - never clears before a successful write
-     - clears ONLY trailing old rows AFTER successful write (optional)
-- ✅ Stronger env parsing (coerce_int/float/bool) — avoids crash if env values are invalid
-- ✅ Expanded token resolution (APP_TOKEN / BACKEND_TOKEN / BACKUP_APP_TOKEN / ALLOWED_TOKENS)
-- ✅ Safer json_loads/json_dumps for orjson + bytes/str inputs
-- ✅ Improved response merge across chunks (header-safe mapping; no column loss)
-- ✅ Safe Mode upgraded (STRICT/PARANOID semantics clearer; Symbol column guaranteed)
-- ✅ Optional deps remain optional (httpx/orjson/otel/prometheus/core.schemas) with safe fallback
-- ✅ Exposes get_sheets_service() and keeps stable __all__
+Phase 2 Alignment Goals
+- ✅ Ensure canonical tabs exist (Top_10_Investments + Data_Dictionary + all schema pages)
+- ✅ Ensure headers EXACTLY match schema_registry (always full 60+ columns; no drift)
+- ✅ Insights_Analysis: seed Advisor Criteria block at top (A1:D4) if empty + table headers at A5
+- ✅ NEVER create/write forbidden pages (KSA_Tadawul, Advisor_Criteria)
+- ✅ Keep no-data-loss preserve columns logic (only fill blanks from existing sheet)
+- ✅ Startup-safe: no network work at import-time (all Sheets calls occur only inside refresh calls)
 """
 
 from __future__ import annotations
@@ -44,7 +36,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 # ---------------------------------------------------------------------------
-# Optional High-Performance Dependencies (safe)
+# Optional high-performance libs (safe)
 # ---------------------------------------------------------------------------
 try:
     import httpx  # type: ignore
@@ -57,8 +49,11 @@ except Exception:
 try:
     import orjson  # type: ignore
 
-    def json_dumps(v: Any, *, default: Optional[Callable] = None) -> str:
+    def json_dumps_str(v: Any, *, default: Optional[Callable] = None) -> str:
         return orjson.dumps(v, default=default or str).decode("utf-8")
+
+    def json_dumps_bytes(v: Any, *, default: Optional[Callable] = None) -> bytes:
+        return orjson.dumps(v, default=default or str)
 
     def json_loads(v: Any) -> Any:
         if isinstance(v, (bytes, bytearray)):
@@ -69,10 +64,13 @@ try:
 
     _HAS_ORJSON = True
 except Exception:
-    import json  # noqa: F401
+    import json  # type: ignore
 
-    def json_dumps(v: Any, *, default: Optional[Callable] = None) -> str:
+    def json_dumps_str(v: Any, *, default: Optional[Callable] = None) -> str:
         return json.dumps(v, default=default or str, ensure_ascii=False)
+
+    def json_dumps_bytes(v: Any, *, default: Optional[Callable] = None) -> bytes:
+        return json.dumps(v, default=default or str, ensure_ascii=False).encode("utf-8")
 
     def json_loads(v: Any) -> Any:
         if isinstance(v, (bytes, bytearray)):
@@ -82,14 +80,16 @@ except Exception:
     _HAS_ORJSON = False
 
 # ---------------------------------------------------------------------------
-# Monitoring & Tracing (Optional, Safe Fallback)
+# Monitoring & Tracing (Optional; safe fallback)
 # ---------------------------------------------------------------------------
 try:
     from prometheus_client import Counter, Histogram  # type: ignore
 
     _PROMETHEUS_AVAILABLE = True
     sheets_operations_total = Counter("sheets_operations_total", "Total Sheets operations", ["operation", "status"])
-    sheets_operation_duration = Histogram("sheets_operation_duration_seconds", "Sheets operation duration", ["operation"])
+    sheets_operation_duration = Histogram(
+        "sheets_operation_duration_seconds", "Sheets operation duration", ["operation"]
+    )
 except Exception:
     _PROMETHEUS_AVAILABLE = False
 
@@ -107,56 +107,58 @@ except Exception:
     sheets_operation_duration = DummyMetric()
 
 try:
-    from opentelemetry import trace  # type: ignore
+    from opentelemetry import trace as otel_trace  # type: ignore
     from opentelemetry.trace import Status, StatusCode  # type: ignore
 
     _OTEL_AVAILABLE = True
-    _TRACER = trace.get_tracer(__name__)
+    _TRACER = otel_trace.get_tracer(__name__)
 except Exception:
-    _OTEL_AVAILABLE = False
-    _TRACER = None
+    otel_trace = None  # type: ignore
     Status = None  # type: ignore
     StatusCode = None  # type: ignore
+    _OTEL_AVAILABLE = False
+    _TRACER = None
 
-_TRACING_ENABLED = os.getenv("CORE_TRACING_ENABLED", "").strip().lower() in {"1", "true", "yes", "y", "on"}
+_TRACING_ENABLED = (os.getenv("CORE_TRACING_ENABLED", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 class TraceContext:
-    """OpenTelemetry trace context manager (sync + async). Never raises."""
+    """OpenTelemetry context manager (sync + async). Never raises."""
 
     def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
         self.name = name
         self.attributes = attributes or {}
         self._cm = None
-        self.span = None
+        self._span = None
 
     def __enter__(self):
-        if _OTEL_AVAILABLE and _TRACING_ENABLED and _TRACER is not None:
-            try:
-                self._cm = _TRACER.start_as_current_span(self.name)
-                self.span = self._cm.__enter__()
-                if self.span and self.attributes:
-                    for k, v in self.attributes.items():
-                        try:
-                            self.span.set_attribute(k, v)
-                        except Exception:
-                            pass
-            except Exception:
-                self._cm = None
-                self.span = None
+        if not (_OTEL_AVAILABLE and _TRACING_ENABLED and _TRACER is not None):
+            return self
+        try:
+            self._cm = _TRACER.start_as_current_span(self.name)
+            self._span = self._cm.__enter__()
+            if self._span is not None and self.attributes:
+                for k, v in self.attributes.items():
+                    try:
+                        self._span.set_attribute(str(k), v)
+                    except Exception:
+                        pass
+        except Exception:
+            self._cm = None
+            self._span = None
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         try:
-            if self.span is not None and exc_val is not None:
+            if self._span is not None and exc_val is not None:
                 try:
-                    if hasattr(self.span, "record_exception"):
-                        self.span.record_exception(exc_val)
+                    if hasattr(self._span, "record_exception"):
+                        self._span.record_exception(exc_val)
                 except Exception:
                     pass
                 try:
-                    if Status and StatusCode and hasattr(self.span, "set_status"):
-                        self.span.set_status(Status(StatusCode.ERROR, str(exc_val)))
+                    if Status is not None and StatusCode is not None and hasattr(self._span, "set_status"):
+                        self._span.set_status(Status(StatusCode.ERROR, str(exc_val)))
                 except Exception:
                     pass
         finally:
@@ -175,12 +177,12 @@ class TraceContext:
 
 
 # ---------------------------------------------------------------------------
-# Module meta
+# Version
 # ---------------------------------------------------------------------------
-SERVICE_VERSION = "5.2.0"
+SERVICE_VERSION = "5.5.3"
 MIN_CORE_VERSION = "5.0.0"
 
-logger = logging.getLogger("google_sheets_service")
+logger = logging.getLogger("integrations.google_sheets_service")
 logger.addHandler(logging.NullHandler())
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
@@ -229,6 +231,7 @@ def coerce_float(v: Any, default: float, *, lo: Optional[float] = None, hi: Opti
     return x
 
 
+
 def coerce_list(v: Any, default: Optional[List[str]] = None) -> List[str]:
     if default is None:
         default = []
@@ -241,7 +244,8 @@ def coerce_list(v: Any, default: Optional[List[str]] = None) -> List[str]:
         return list(default)
     if s.startswith("[") and s.endswith("]"):
         try:
-            parsed = json_loads(s)
+            import json as _json
+            parsed = _json.loads(s)
             if isinstance(parsed, list):
                 return [_strip(x) for x in parsed if _strip(x)]
         except Exception:
@@ -260,6 +264,13 @@ def normalize_list_lower(items: Sequence[str]) -> List[str]:
         seen.add(s)
         out.append(s)
     return out
+
+
+def parse_csv_env(name: str, default: str = "") -> List[str]:
+    raw = _strip(os.getenv(name, "") or default)
+    if not raw:
+        return []
+    return [x.strip() for x in raw.split(",") if x.strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -297,17 +308,45 @@ class SafeModeLevel(str, Enum):
 
 
 # ---------------------------------------------------------------------------
-# Core Schema Integration (Optional)
+# Core schema + page catalog integration (Phase 2) — schema_registry driven
 # ---------------------------------------------------------------------------
 try:
-    from core.schemas import get_headers_for_sheet  # type: ignore
+    from core.config import (  # type: ignore
+        canonical_pages as core_canonical_pages,
+        forbidden_pages as core_forbidden_pages,
+        normalize_page as core_normalize_page,
+        schema_headers as core_schema_headers,
+    )
     from core.symbols.normalize import normalize_symbol as core_normalize_symbol  # type: ignore
 
     _HAS_CORE = True
 except Exception:
     _HAS_CORE = False
 
-    def get_headers_for_sheet(name: str) -> List[str]:
+    def core_canonical_pages() -> List[str]:
+        return [
+            "Market_Leaders",
+            "Global_Markets",
+            "Commodities_FX",
+            "Mutual_Funds",
+            "My_Portfolio",
+            "Insights_Analysis",
+            "Top_10_Investments",
+            "Data_Dictionary",
+        ]
+
+    def core_forbidden_pages() -> Set[str]:
+        return {"KSA_Tadawul", "Advisor_Criteria"}
+
+    def core_normalize_page(page: str, *, allow_output_pages: bool = True) -> str:
+        p = (page or "").strip()
+        if not p:
+            raise ValueError("Page name is empty")
+        if p in core_forbidden_pages():
+            raise ValueError(f"Forbidden/removed page: {p}")
+        return p
+
+    def core_schema_headers(name: str) -> List[str]:
         return []
 
     def core_normalize_symbol(sym: str) -> str:
@@ -315,7 +354,7 @@ except Exception:
 
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Config
 # ---------------------------------------------------------------------------
 @dataclass(slots=True)
 class SheetsServiceConfig:
@@ -331,7 +370,9 @@ class SheetsServiceConfig:
     backend_retries: int = 3
     backend_retry_sleep: float = 1.0
     backend_max_symbols_per_call: int = 200
-    backend_token_transport: Set[TokenTransport] = field(default_factory=lambda: {TokenTransport.HEADER, TokenTransport.BEARER})
+    backend_token_transport: Set[TokenTransport] = field(
+        default_factory=lambda: {TokenTransport.HEADER, TokenTransport.BEARER}
+    )
     backend_token_param_name: str = "token"
     backend_circuit_breaker_threshold: int = 5
     backend_circuit_breaker_timeout: int = 60
@@ -342,14 +383,15 @@ class SheetsServiceConfig:
     max_batch_ranges: int = 25
     clear_end_col: str = "ZZ"
     clear_end_row: int = 100000
-    smart_clear: bool = True  # applied as POST-CLEAR only (zero-data-loss)
+    smart_clear: bool = True  # used for post-clear (tail + right-side header)
 
     # SAFE MODE
     safe_mode: SafeModeLevel = SafeModeLevel.STRICT
     block_on_empty_headers: bool = True
-    block_on_empty_rows: bool = False
+    block_on_empty_rows: bool = True
     block_on_data_mismatch: bool = True
     validate_row_count: bool = True
+    require_symbol_header: bool = True
 
     # Caching
     cache_ttl_seconds: int = 300
@@ -366,15 +408,30 @@ class SheetsServiceConfig:
     # Telemetry
     enable_telemetry: bool = True
 
+    # No-data-loss
+    preserve_columns: List[str] = field(default_factory=list)
+    preserve_max_rows_scan: int = 20000
+    preserve_read_end_col: str = "ZZ"
+
+    # Phase 2 — Schema enforcement / tab management
+    ensure_tabs_exist: bool = True
+    ensure_headers_match_schema: bool = True
+    allow_extra_columns: bool = False  # strict by default
+    headers_start_cell_default: str = "A5"
+
+    # Phase 2 — Insights_Analysis criteria block (A1:D4)
+    insights_criteria_enabled: bool = True
+    insights_criteria_range: str = "A1:D4"
+
     # Env
     environment: str = "prod"
     user_agent: str = f"TadawulFastBridge-SheetsService/{SERVICE_VERSION}"
 
     @classmethod
     def from_env(cls) -> "SheetsServiceConfig":
-        env = _strip(os.getenv("APP_ENV", "prod")).lower()
+        env = (_strip(os.getenv("APP_ENV", "prod")) or "prod").lower()
 
-        safe_mode_str = _strip(os.getenv("SHEETS_SAFE_MODE", "strict")).lower()
+        safe_mode_str = (_strip(os.getenv("SHEETS_SAFE_MODE", "strict")) or "strict").lower()
         if safe_mode_str in ("off", "false", "0", "disabled"):
             safe_mode = SafeModeLevel.OFF
         elif safe_mode_str in ("basic",):
@@ -385,7 +442,7 @@ class SheetsServiceConfig:
             safe_mode = SafeModeLevel.STRICT
 
         token_transport: Set[TokenTransport] = set()
-        transport_str = _strip(os.getenv("SHEETS_BACKEND_TOKEN_TRANSPORT", "header,bearer")).lower()
+        transport_str = (_strip(os.getenv("SHEETS_BACKEND_TOKEN_TRANSPORT", "header,bearer")) or "header,bearer").lower()
         for part in transport_str.split(","):
             p = part.strip()
             if p == "header":
@@ -397,16 +454,26 @@ class SheetsServiceConfig:
             elif p == "body":
                 token_transport.add(TokenTransport.BODY)
 
+        preserve_cols = parse_csv_env("SHEETS_PRESERVE_COLUMNS", default="")
+        preserve_max_rows_scan = coerce_int(
+            os.getenv("SHEETS_PRESERVE_MAX_ROWS_SCAN", "20000"), 20000, lo=1000, hi=200000
+        )
+        preserve_end_col = (_strip(os.getenv("SHEETS_PRESERVE_READ_END_COL", "ZZ")) or "ZZ").upper()
+
         return cls(
             default_spreadsheet_id=_strip(os.getenv("DEFAULT_SPREADSHEET_ID", "")),
             sheets_api_retries=coerce_int(os.getenv("SHEETS_API_RETRIES", "4"), 4, lo=1, hi=12),
-            sheets_api_retry_base_sleep=coerce_float(os.getenv("SHEETS_API_RETRY_BASE_SLEEP", "1.0"), 1.0, lo=0.1, hi=30.0),
+            sheets_api_retry_base_sleep=coerce_float(
+                os.getenv("SHEETS_API_RETRY_BASE_SLEEP", "1.0"), 1.0, lo=0.1, hi=30.0
+            ),
             sheets_api_timeout_sec=coerce_float(os.getenv("SHEETS_API_TIMEOUT_SEC", "60"), 60.0, lo=5.0, hi=600.0),
             backend_base_url=_strip(os.getenv("BACKEND_BASE_URL", "")).rstrip("/"),
             backend_timeout_sec=coerce_float(os.getenv("SHEETS_BACKEND_TIMEOUT_SEC", "120"), 120.0, lo=5.0, hi=600.0),
             backend_retries=coerce_int(os.getenv("SHEETS_BACKEND_RETRIES", "3"), 3, lo=0, hi=10),
             backend_retry_sleep=coerce_float(os.getenv("SHEETS_BACKEND_RETRY_SLEEP", "1.0"), 1.0, lo=0.1, hi=30.0),
-            backend_max_symbols_per_call=coerce_int(os.getenv("SHEETS_BACKEND_MAX_SYMBOLS_PER_CALL", "200"), 200, lo=10, hi=2000),
+            backend_max_symbols_per_call=coerce_int(
+                os.getenv("SHEETS_BACKEND_MAX_SYMBOLS_PER_CALL", "200"), 200, lo=10, hi=5000
+            ),
             backend_token_transport=token_transport or {TokenTransport.HEADER, TokenTransport.BEARER},
             backend_token_param_name=_strip(os.getenv("SHEETS_BACKEND_TOKEN_QUERY_PARAM", "token")) or "token",
             backend_circuit_breaker_threshold=coerce_int(os.getenv("BACKEND_CIRCUIT_BREAKER_THRESHOLD", "5"), 5, lo=1, hi=100),
@@ -414,14 +481,15 @@ class SheetsServiceConfig:
             max_rows_per_write=coerce_int(os.getenv("SHEETS_MAX_ROWS_PER_WRITE", "500"), 500, lo=50, hi=5000),
             use_batch_update=coerce_bool(os.getenv("SHEETS_USE_BATCH_UPDATE", "true"), True),
             max_batch_ranges=coerce_int(os.getenv("SHEETS_MAX_BATCH_RANGES", "25"), 25, lo=1, hi=200),
-            clear_end_col=_strip(os.getenv("SHEETS_CLEAR_END_COL", "ZZ")).upper() or "ZZ",
+            clear_end_col=(_strip(os.getenv("SHEETS_CLEAR_END_COL", "ZZ")) or "ZZ").upper(),
             clear_end_row=coerce_int(os.getenv("SHEETS_CLEAR_END_ROW", "100000"), 100000, lo=1000, hi=2000000),
             smart_clear=coerce_bool(os.getenv("SHEETS_SMART_CLEAR", "true"), True),
             safe_mode=safe_mode,
             block_on_empty_headers=coerce_bool(os.getenv("SHEETS_BLOCK_ON_EMPTY_HEADERS", "true"), True),
-            block_on_empty_rows=coerce_bool(os.getenv("SHEETS_BLOCK_ON_EMPTY_ROWS", "false"), False),
+            block_on_empty_rows=coerce_bool(os.getenv("SHEETS_BLOCK_ON_EMPTY_ROWS", "true"), True),
             block_on_data_mismatch=coerce_bool(os.getenv("SHEETS_BLOCK_ON_DATA_MISMATCH", "true"), True),
             validate_row_count=coerce_bool(os.getenv("SHEETS_VALIDATE_ROW_COUNT", "true"), True),
+            require_symbol_header=coerce_bool(os.getenv("SHEETS_REQUIRE_SYMBOL_HEADER", "true"), True),
             cache_ttl_seconds=coerce_int(os.getenv("SHEETS_CACHE_TTL_SECONDS", "300"), 300, lo=5, hi=86400),
             enable_header_cache=coerce_bool(os.getenv("SHEETS_ENABLE_HEADER_CACHE", "true"), True),
             connection_pool_size=coerce_int(os.getenv("SHEETS_CONNECTION_POOL_SIZE", "20"), 20, lo=5, hi=200),
@@ -429,6 +497,15 @@ class SheetsServiceConfig:
             verify_ssl=coerce_bool(os.getenv("SHEETS_VERIFY_SSL", "true"), True),
             ssl_cert_path=_strip(os.getenv("SHEETS_SSL_CERT_PATH", "")) or None,
             enable_telemetry=coerce_bool(os.getenv("SHEETS_ENABLE_TELEMETRY", "true"), True),
+            preserve_columns=preserve_cols,
+            preserve_max_rows_scan=preserve_max_rows_scan,
+            preserve_read_end_col=preserve_end_col,
+            ensure_tabs_exist=coerce_bool(os.getenv("SHEETS_ENSURE_TABS_EXIST", "true"), True),
+            ensure_headers_match_schema=coerce_bool(os.getenv("SHEETS_ENSURE_HEADERS_MATCH_SCHEMA", "true"), True),
+            allow_extra_columns=coerce_bool(os.getenv("SHEETS_ALLOW_EXTRA_COLUMNS", "false"), False),
+            headers_start_cell_default=_strip(os.getenv("SHEETS_HEADERS_START_CELL", "A5")) or "A5",
+            insights_criteria_enabled=coerce_bool(os.getenv("SHEETS_INSIGHTS_CRITERIA_ENABLED", "true"), True),
+            insights_criteria_range=_strip(os.getenv("SHEETS_INSIGHTS_CRITERIA_RANGE", "A1:D4")) or "A1:D4",
             environment=env,
             user_agent=_strip(os.getenv("SHEETS_USER_AGENT", f"TadawulFastBridge-SheetsService/{SERVICE_VERSION}"))
             or f"TadawulFastBridge-SheetsService/{SERVICE_VERSION}",
@@ -449,8 +526,8 @@ class OperationMetrics:
     rows_processed: int = 0
     cells_updated: int = 0
     error_type: Optional[str] = None
+    error_message: Optional[str] = None
     sheet_name: Optional[str] = None
-    endpoint: Optional[str] = None
     request_id: Optional[str] = None
 
     @property
@@ -494,33 +571,16 @@ class TelemetryCollector:
                 s = sorted(lat)
                 n = len(s)
                 out["latency_by_operation"][op] = {
-                    "avg": sum(lat) / n,
-                    "p50": s[n // 2],
-                    "p95": s[min(n - 1, int(n * 0.95))],
-                    "p99": s[min(n - 1, int(n * 0.99))],
-                    "max": max(lat),
+                    "avg_ms": sum(lat) / n,
+                    "p50_ms": s[n // 2],
+                    "p95_ms": s[min(n - 1, int(n * 0.95))],
+                    "p99_ms": s[min(n - 1, int(n * 0.99))],
+                    "max_ms": max(lat),
                 }
             return out
 
-    def reset(self) -> None:
-        with self._lock:
-            self._metrics.clear()
-            self._counters.clear()
-            self._latencies.clear()
-
 
 _telemetry = TelemetryCollector()
-
-
-def _best_effort_sheet_name_from_call(args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Optional[str]:
-    # Prefer keyword
-    sn = kwargs.get("sheet_name")
-    if isinstance(sn, str) and sn.strip():
-        return sn.strip()
-    # Try positional conventions: (spreadsheet_id, sheet_name, tickers, ...)
-    if len(args) >= 2 and isinstance(args[1], str) and args[1].strip():
-        return args[1].strip()
-    return None
 
 
 def track_operation(operation: str):
@@ -528,50 +588,46 @@ def track_operation(operation: str):
         @wraps(func)
         def wrapper(*args, **kwargs):
             start = time.time()
-            rid = uuid.uuid4().hex[:12]
-            sheet_name = _best_effort_sheet_name_from_call(args, kwargs)
-            endpoint = kwargs.get("endpoint") if isinstance(kwargs.get("endpoint"), str) else None
+            request_id = uuid.uuid4().hex[:12]
+            sheet_name = kwargs.get("sheet_name") or (args[1] if len(args) >= 2 else None)
 
             try:
-                with TraceContext(
-                    f"sheets_{operation}",
-                    {"sheet_name": sheet_name or "", "request_id": rid, "endpoint": endpoint or ""},
-                ):
+                with TraceContext(f"sheets_{operation}", {"sheet_name": sheet_name or "", "request_id": request_id}):
                     result = func(*args, **kwargs)
 
-                rows_written = 0
-                cells_updated = 0
-                if isinstance(result, dict):
-                    rows_written = int(result.get("rows_written", 0) or 0)
-                    cells_updated = int(result.get("cells_updated", 0) or 0)
+                rows_written = int(result.get("rows_written", 0) or 0) if isinstance(result, dict) else 0
+                cells_updated = int(result.get("cells_updated", 0) or 0) if isinstance(result, dict) else 0
 
-                metrics = OperationMetrics(
-                    operation=operation,
-                    start_time=start,
-                    end_time=time.time(),
-                    success=True,
-                    rows_processed=rows_written,
-                    cells_updated=cells_updated,
-                    sheet_name=sheet_name,
-                    endpoint=endpoint,
-                    request_id=rid,
+                _telemetry.record_operation(
+                    OperationMetrics(
+                        operation=operation,
+                        start_time=start,
+                        end_time=time.time(),
+                        success=True,
+                        rows_processed=rows_written,
+                        cells_updated=cells_updated,
+                        sheet_name=str(sheet_name) if sheet_name else None,
+                        request_id=request_id,
+                    )
                 )
-                _telemetry.record_operation(metrics)
                 sheets_operations_total.labels(operation=operation, status="success").inc()
                 sheets_operation_duration.labels(operation=operation).observe(time.time() - start)
+                if isinstance(result, dict):
+                    result.setdefault("request_id", request_id)
                 return result
             except Exception as e:
-                metrics = OperationMetrics(
-                    operation=operation,
-                    start_time=start,
-                    end_time=time.time(),
-                    success=False,
-                    error_type=e.__class__.__name__,
-                    sheet_name=sheet_name,
-                    endpoint=endpoint,
-                    request_id=rid,
+                _telemetry.record_operation(
+                    OperationMetrics(
+                        operation=operation,
+                        start_time=start,
+                        end_time=time.time(),
+                        success=False,
+                        error_type=e.__class__.__name__,
+                        error_message=str(e),
+                        sheet_name=str(sheet_name) if sheet_name else None,
+                        request_id=request_id,
+                    )
                 )
-                _telemetry.record_operation(metrics)
                 sheets_operations_total.labels(operation=operation, status="error").inc()
                 sheets_operation_duration.labels(operation=operation).observe(time.time() - start)
                 raise
@@ -582,7 +638,7 @@ def track_operation(operation: str):
 
 
 # ---------------------------------------------------------------------------
-# Circuit Breaker
+# Circuit Breaker (backend)
 # ---------------------------------------------------------------------------
 class BackendCircuitBreaker:
     def __init__(self, threshold: int, timeout: int):
@@ -600,7 +656,6 @@ class BackendCircuitBreaker:
             if self.state == CircuitState.OPEN:
                 if self._should_attempt_recovery():
                     self.state = CircuitState.HALF_OPEN
-                    logger.info("Circuit breaker HALF_OPEN (testing recovery)")
                     return True
                 return False
             return True  # HALF_OPEN
@@ -609,7 +664,6 @@ class BackendCircuitBreaker:
         with self._lock:
             if self.state == CircuitState.HALF_OPEN:
                 self.state = CircuitState.CLOSED
-                logger.info("Circuit breaker CLOSED after recovery")
             self.failure_count = 0
 
     def record_failure(self) -> None:
@@ -618,10 +672,8 @@ class BackendCircuitBreaker:
             self.last_failure_time = time.time()
             if self.state == CircuitState.CLOSED and self.failure_count >= self.threshold:
                 self.state = CircuitState.OPEN
-                logger.warning("Circuit breaker OPEN after %s failures", self.failure_count)
             elif self.state == CircuitState.HALF_OPEN:
                 self.state = CircuitState.OPEN
-                logger.warning("Circuit breaker re-OPEN after HALF_OPEN failure")
 
     def _should_attempt_recovery(self) -> bool:
         if not self.last_failure_time:
@@ -640,17 +692,8 @@ class BackendCircuitBreaker:
 
 
 # ---------------------------------------------------------------------------
-# Credentials + Google Sheets Client (LAZY; never at import-time)
+# Credentials + Google Sheets client (lazy; startup-safe)
 # ---------------------------------------------------------------------------
-def _repair_private_key(pk: str) -> str:
-    pk2 = (pk or "").replace("\\n", "\n").replace("\\r\\n", "\n")
-    if "-----BEGIN PRIVATE KEY-----" not in pk2:
-        pk2 = "-----BEGIN PRIVATE KEY-----\n" + pk2.strip()
-    if "-----END PRIVATE KEY-----" not in pk2:
-        pk2 = pk2.strip() + "\n-----END PRIVATE KEY-----"
-    return pk2 + ("\n" if not pk2.endswith("\n") else "")
-
-
 def _maybe_b64_decode(s: str) -> Optional[str]:
     t = _strip(s)
     if not t:
@@ -673,41 +716,50 @@ def _read_text_file_if_exists(p: str) -> Optional[str]:
     return None
 
 
-class CredentialsManager:
-    """
-    Resolves service account credentials from:
-      1) GOOGLE_CREDENTIALS_DICT (JSON dict string)
-      2) GOOGLE_SHEETS_CREDENTIALS / GOOGLE_CREDENTIALS (JSON)
-      3) GOOGLE_*_B64 (base64 JSON)
-      4) GOOGLE_APPLICATION_CREDENTIALS / GOOGLE_*_FILE (file path)
-      5) core.config.get_settings() if available
-      6) env.py.get_settings() if available
-    """
+def _repair_private_key(pk: str) -> str:
+    pk2 = (pk or "").replace("\\n", "\n").replace("\\r\\n", "\n")
+    if "-----BEGIN PRIVATE KEY-----" not in pk2:
+        pk2 = "-----BEGIN PRIVATE KEY-----\n" + pk2.strip()
+    if "-----END PRIVATE KEY-----" not in pk2:
+        pk2 = pk2.strip() + "\n-----END PRIVATE KEY-----"
+    return pk2 + ("\n" if not pk2.endswith("\n") else "")
 
+
+class CredentialsManager:
     def __init__(self):
         self._creds_info: Optional[Dict[str, Any]] = None
         self._lock = threading.RLock()
+
+    def _from_env_manager_settings(self) -> Optional[Dict[str, Any]]:
+        """Try env.py global settings manager."""
+        try:
+            from env import get_settings as get_env_settings  # type: ignore
+            s = get_env_settings()
+            raw = getattr(s, "GOOGLE_SHEETS_CREDENTIALS", None)
+            if isinstance(raw, str) and raw.strip().startswith("{"):
+                obj = json_loads(raw)
+                return obj if isinstance(obj, dict) else None
+        except Exception:
+            pass
+        return None
+
+    def reset_cache(self) -> None:
+        """Flush cached credentials so next get_credentials() re-reads from env/file."""
+        with self._lock:
+            self._creds_info = None
 
     def get_credentials(self) -> Optional[Dict[str, Any]]:
         with self._lock:
             if self._creds_info is not None:
                 return dict(self._creds_info)
 
-            for src in (
-                self._from_env_dict,
-                self._from_env_json,
-                self._from_env_base64,
-                self._from_env_file,
-                self._from_core_settings,
-                self._from_env_manager_settings,
-            ):
+            for src in (self._from_env_dict, self._from_env_json, self._from_env_base64, self._from_env_file, self._from_settings, self._from_env_manager_settings):
                 creds = src()
                 if creds:
                     self._creds_info = self._normalize_credentials(creds)
-                    logger.info("Google creds loaded from %s", src.__name__)
                     return dict(self._creds_info)
 
-            logger.warning("Google creds not configured (this is OK unless Sheets operations are invoked)")
+            logger.error("No valid Google credentials found (needed only when Sheets operations are called).")
             return None
 
     def _normalize_credentials(self, creds: Dict[str, Any]) -> Dict[str, Any]:
@@ -718,6 +770,7 @@ class CredentialsManager:
         return out
 
     def _from_env_dict(self) -> Optional[Dict[str, Any]]:
+        """Try GOOGLE_CREDENTIALS_DICT (raw JSON dict string)."""
         raw = _strip(os.getenv("GOOGLE_CREDENTIALS_DICT", ""))
         if raw.startswith("{") and raw.endswith("}"):
             try:
@@ -751,7 +804,11 @@ class CredentialsManager:
             return None
 
     def _from_env_file(self) -> Optional[Dict[str, Any]]:
-        path = _strip(os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "") or os.getenv("GOOGLE_SHEETS_CREDENTIALS_FILE", "") or os.getenv("GOOGLE_CREDENTIALS_FILE", ""))
+        path = _strip(
+            os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+            or os.getenv("GOOGLE_SHEETS_CREDENTIALS_FILE", "")
+            or os.getenv("GOOGLE_CREDENTIALS_FILE", "")
+        )
         if not path:
             return None
         txt = _read_text_file_if_exists(path)
@@ -764,32 +821,21 @@ class CredentialsManager:
             logger.warning("Failed to load credentials from file %s: %s", path, e)
             return None
 
-    def _from_core_settings(self) -> Optional[Dict[str, Any]]:
+    def _from_settings(self) -> Optional[Dict[str, Any]]:
         try:
             from core.config import get_settings  # type: ignore
 
-            settings = get_settings()
-            raw = getattr(settings, "google_sheets_credentials_json", None)
+            s = get_settings()
+            raw = getattr(s, "google_sheets_credentials_json", None)
             if isinstance(raw, str) and raw.strip().startswith("{"):
-                obj = json_loads(raw)
-                return obj if isinstance(obj, dict) else None
-            d = getattr(settings, "google_credentials_dict", None)
+                try:
+                    obj = json_loads(raw)
+                    return obj if isinstance(obj, dict) else None
+                except Exception:
+                    pass
+            d = getattr(s, "google_credentials_dict", None)
             if isinstance(d, dict) and d:
                 return dict(d)
-        except Exception:
-            pass
-        return None
-
-    def _from_env_manager_settings(self) -> Optional[Dict[str, Any]]:
-        # If you use env.py as global settings manager
-        try:
-            from env import get_settings as get_env_settings  # type: ignore
-
-            s = get_env_settings()
-            raw = getattr(s, "GOOGLE_SHEETS_CREDENTIALS", None)
-            if isinstance(raw, str) and raw.strip().startswith("{"):
-                obj = json_loads(raw)
-                return obj if isinstance(obj, dict) else None
         except Exception:
             pass
         return None
@@ -797,66 +843,190 @@ class CredentialsManager:
 
 _credentials_manager = CredentialsManager()
 
+# FIX v5.5.3: Retry cooldown prevents retry storms when credentials are broken.
+# Without this, every sheet write retried on failure, flooding logs with auth errors.
+_SHEETS_INIT_RETRY_COOLDOWN_SEC: float = max(
+    5.0,
+    float((os.getenv("SHEETS_INIT_RETRY_COOLDOWN_SEC") or "30").strip() or "30"),
+)
+
 
 class SheetsAPIClient:
     """
-    LAZY Google Sheets API service:
-    - No imports / no build until first use.
+    Lazy-initialized Google Sheets API client with full recovery support.
+
+    v5.5.3 fixes vs v5.4.0:
+    - FIX CRITICAL: _failed flag no longer sticks permanently after one error.
+      v5.4.0 had `if self._failed: raise RuntimeError(...)` with NO reset path,
+      meaning a single transient credential error would brick ALL Sheets writes
+      for the entire process lifetime — requiring a full Render redeploy to recover.
+    - FIX: Added reset() method: clears _failed + _service + flushes credential
+      cache so updated credentials can be picked up without a restart.
+    - FIX: Added retry cooldown (_SHEETS_INIT_RETRY_COOLDOWN_SEC, default 30s).
+    - FIX: Added _mark_failed() and status() for operational visibility.
+    - FIX: close() now properly tears down service + clears state.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._service = None
         self._lock = threading.RLock()
-        self._failed = False
+        self._failed: bool = False
+        self._last_error: str = ""
+        self._last_failure_ts: Optional[float] = None
+        self._retry_cooldown_sec: float = _SHEETS_INIT_RETRY_COOLDOWN_SEC
 
-    def get_service(self):
+    def get_service(self, *, retry_initialize: bool = True, reset_failed: bool = False):
         with self._lock:
+            if reset_failed:
+                self.reset(reason="manual_reset_before_get")
+
             if self._service is not None:
                 return self._service
-            if self._failed:
-                raise RuntimeError("Sheets API client initialization failed previously")
 
-            self._service = self._create_service()
-            return self._service
+            if self._failed and not retry_initialize:
+                raise RuntimeError(
+                    self._last_error or "Sheets API client initialization failed previously"
+                )
+
+            if self._failed and retry_initialize:
+                elapsed = time.time() - (self._last_failure_ts or 0.0)
+                if elapsed < self._retry_cooldown_sec:
+                    remaining = self._retry_cooldown_sec - elapsed
+                    raise RuntimeError(
+                        f"Sheets API init cooldown active — retry in {remaining:.0f}s. "
+                        f"Last error: {self._last_error}"
+                    )
+                self.reset(reason=f"auto_retry_after_cooldown_{elapsed:.0f}s")
+
+            try:
+                self._service = self._create_service()
+                self._failed = False
+                self._last_error = ""
+                self._last_failure_ts = None
+                logger.info("SheetsAPIClient: initialized successfully")
+                return self._service
+            except Exception as exc:
+                self._mark_failed(exc)
+                raise
+
+    def _mark_failed(self, exc: Exception) -> None:
+        self._service = None
+        self._failed = True
+        self._last_error = f"{type(exc).__name__}: {exc}"
+        self._last_failure_ts = time.time()
+        logger.error(
+            "SheetsAPIClient init failed (cooldown=%.0fs): %s",
+            self._retry_cooldown_sec,
+            self._last_error,
+        )
+
+    def reset(self, *, reason: str = "manual_reset") -> None:
+        with self._lock:
+            try:
+                transport = getattr(self._service, "_http", None)
+                if transport is not None and hasattr(transport, "close"):
+                    transport.close()
+            except Exception:
+                pass
+            self._service = None
+            self._failed = False
+            self._last_error = ""
+            self._last_failure_ts = None
+            _credentials_manager.reset_cache()
+            logger.info("SheetsAPIClient reset: %s", reason)
 
     def _create_service(self):
         try:
             from google.oauth2.service_account import Credentials  # type: ignore
             from googleapiclient.discovery import build  # type: ignore
         except Exception as e:
-            self._failed = True
             raise RuntimeError(
-                "Google API client libraries not installed. Install: google-api-python-client google-auth"
+                "Missing Google API libs. Install: google-api-python-client google-auth"
             ) from e
 
         creds_info = _credentials_manager.get_credentials()
         if not creds_info:
-            self._failed = True
             raise RuntimeError("Missing Google service account credentials")
 
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         creds = Credentials.from_service_account_info(creds_info, scopes=scopes)
+        return build(
+            "sheets", "v4", credentials=creds,
+            cache_discovery=False, num_retries=_CONFIG.sheets_api_retries,
+        )
 
-        # NOTE: this may fetch discovery doc; that is OK at runtime, never at import-time.
-        service = build("sheets", "v4", credentials=creds, cache_discovery=False, num_retries=_CONFIG.sheets_api_retries)
-        logger.info("Google Sheets API client initialized")
-        return service
+    def close(self) -> None:
+        """Tear down and clear state. Safe to call multiple times."""
+        self.reset(reason="close")
 
-    def close(self):
-        # discovery/build doesn't expose a standard close; keep for API symmetry
-        return None
+    def status(self) -> Dict[str, Any]:
+        """Return operational status dict."""
+        with self._lock:
+            elapsed_since_failure = (
+                round(time.time() - self._last_failure_ts, 1)
+                if self._last_failure_ts else None
+            )
+            cooldown_remaining = None
+            if self._failed and self._last_failure_ts:
+                elapsed = time.time() - self._last_failure_ts
+                cooldown_remaining = max(0.0, round(self._retry_cooldown_sec - elapsed, 1))
+            return {
+                "failed": self._failed,
+                "has_service": self._service is not None,
+                "last_error": self._last_error,
+                "last_failure_ts": self._last_failure_ts,
+                "elapsed_since_failure_sec": elapsed_since_failure,
+                "cooldown_remaining_sec": cooldown_remaining,
+                "retry_cooldown_sec": self._retry_cooldown_sec,
+            }
 
 
 _sheets_client = SheetsAPIClient()
 
 
-def get_sheets_service():
-    """Public getter (stable)."""
-    return _sheets_client.get_service()
+def get_sheets_service(*, retry_initialize: bool = True, reset_failed: bool = False):
+    """
+    Public getter for the authenticated Google Sheets service object.
+    FIX v5.5.3: Added retry_initialize + reset_failed kwargs.
+    """
+    return _sheets_client.get_service(
+        retry_initialize=retry_initialize, reset_failed=reset_failed
+    )
+
+
+def reset_sheets_service(
+    *,
+    reason: str = "manual_reset",
+    clear_header_cache: bool = True,
+    close_backend_client: bool = False,
+) -> Dict[str, Any]:
+    """
+    Reset the Google Sheets service to a clean state.
+    FIX v5.5.3: public helper for credential hot-reload.
+    Useful after updating GOOGLE_SHEETS_CREDENTIALS in Render env vars.
+    """
+    _sheets_client.reset(reason=reason)
+    if clear_header_cache:
+        try:
+            _header_cache.clear()
+        except Exception:
+            pass
+    if close_backend_client:
+        try:
+            _backend_client.close()
+        except Exception:
+            pass
+    return {
+        "status": "ok",
+        "reason": reason,
+        "clear_header_cache": bool(clear_header_cache),
+        "close_backend_client": bool(close_backend_client),
+        "service_version": SERVICE_VERSION,
+    }
 
 
 # ---------------------------------------------------------------------------
-# Header Cache & Canonical Headers
+# Header cache + canonical headers (schema_registry)
 # ---------------------------------------------------------------------------
 class HeaderCache:
     def __init__(self, ttl: int):
@@ -873,7 +1043,7 @@ class HeaderCache:
             if not item:
                 return None
             headers, ts = item
-            if time.time() - ts < self.ttl:
+            if (time.time() - ts) < self.ttl:
                 return list(headers)
             self._cache.pop(key, None)
             return None
@@ -899,22 +1069,35 @@ _header_cache = HeaderCache(_CONFIG.cache_ttl_seconds)
 
 
 def get_canonical_headers(sheet_name: str) -> List[str]:
-    cached = _header_cache.get(sheet_name)
+    """
+    Phase 2: canonical headers come from schema_registry via core.config.schema_headers().
+    Must return FULL schema headers (60+).
+    """
+    try:
+        normalized = core_normalize_page(sheet_name, allow_output_pages=True) if _HAS_CORE else _strip(sheet_name)
+    except Exception:
+        normalized = _strip(sheet_name)
+
+    cached = _header_cache.get(normalized)
     if cached is not None:
         return cached
+
     headers: List[str] = []
     if _HAS_CORE:
         try:
-            headers = get_headers_for_sheet(sheet_name) or []
+            headers = core_schema_headers(normalized) or []
         except Exception as e:
-            logger.warning("Failed to get headers from core.schemas: %s", e)
+            logger.warning("Failed to get headers from schema_registry (core.config.schema_headers): %s", e)
+
+    headers = ensure_symbol_header([h for h in (headers or []) if _strip(h)])
+
     if headers:
-        _header_cache.set(sheet_name, headers)
+        _header_cache.set(normalized, headers)
     return headers
 
 
 # ---------------------------------------------------------------------------
-# A1 Notation Utilities
+# A1 utilities
 # ---------------------------------------------------------------------------
 _A1_RE = re.compile(r"^\$?([A-Za-z]+)\$?(\d+)$")
 
@@ -971,7 +1154,7 @@ def compute_clear_end_col(start_col: str, num_cols: int) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Symbol Normalization
+# Symbol normalization
 # ---------------------------------------------------------------------------
 class SymbolNormalizer:
     @staticmethod
@@ -1006,39 +1189,54 @@ def normalize_tickers(tickers: Sequence[str]) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# Header & Row Processing
+# Header & row processing helpers
 # ---------------------------------------------------------------------------
 @lru_cache(maxsize=2048)
 def _normalize_header_key(header: str) -> str:
-    s = (_strip(header) or "").lower()
+    s = _strip(header).lower()
     return re.sub(r"[^a-z0-9]", "", s)
 
 
+# IMPORTANT: include both snake_case and "pretty" field names
 _HEADER_ALIAS_MAP: Dict[str, str] = {
+    # identity
     "symbol": "Symbol",
     "ticker": "Symbol",
     "requestedsymbol": "Symbol",
-    "expectedroi1m": "Expected ROI % (1M)",
-    "expectedroi3m": "Expected ROI % (3M)",
-    "expectedroi12m": "Expected ROI % (12M)",
-    "forecastprice1m": "Forecast Price (1M)",
-    "forecastprice3m": "Forecast Price (3M)",
-    "forecastprice12m": "Forecast Price (12M)",
-    "forecastupdatedutc": "Forecast Updated (UTC)",
-    "forecastupdatedriyadh": "Forecast Updated (Riyadh)",
-    "valuescore": "Value Score",
-    "qualityscore": "Quality Score",
-    "momentumscore": "Momentum Score",
-    "riskscore": "Risk Score",
-    "opportunityscore": "Opportunity Score",
-    "overallscore": "Overall Score",
+    # errors
+    "error": "Error",
+    "errormessage": "Error",
+    # scoring_engine aligned
+    "value_score": "Value Score",
+    "quality_score": "Quality Score",
+    "momentum_score": "Momentum Score",
+    "risk_score": "Risk Score",
+    "opportunity_score": "Opportunity Score",
+    "overall_score": "Overall Score",
     "recommendation": "Recommendation",
     "rec": "Recommendation",
-    "recbadge": "Rec Badge",
-    "momentumbadge": "Momentum Badge",
-    "opportunitybadge": "Opportunity Badge",
-    "riskbadge": "Risk Badge",
-    "error": "Error",
+    # forecast aligned
+    "forecast_price_1m": "Forecast Price (1M)",
+    "forecast_price_3m": "Forecast Price (3M)",
+    "forecast_price_6m": "Forecast Price (6M)",
+    "forecast_price_12m": "Forecast Price (12M)",
+    "expected_roi_1m": "Expected ROI % (1M)",
+    "expected_roi_3m": "Expected ROI % (3M)",
+    "expected_roi_6m": "Expected ROI % (6M)",
+    "expected_roi_12m": "Expected ROI % (12M)",
+    "expected_return_1m": "Expected ROI % (1M)",
+    "expected_return_3m": "Expected ROI % (3M)",
+    "expected_return_6m": "Expected ROI % (6M)",
+    "expected_return_12m": "Expected ROI % (12M)",
+    "forecast_updated_utc": "Forecast Updated (UTC)",
+    "forecast_updated_riyadh": "Forecast Updated (Riyadh)",
+    # badges
+    "rec_badge": "Rec Badge",
+    "momentum_badge": "Momentum Badge",
+    "opportunity_badge": "Opportunity Badge",
+    "risk_badge": "Risk Badge",
+    "value_badge": "Value Badge",
+    "quality_badge": "Quality Badge",
 }
 _HEADER_ALIAS_MAP_NORM = {_normalize_header_key(k): v for k, v in _HEADER_ALIAS_MAP.items()}
 
@@ -1072,9 +1270,7 @@ def find_error_col(headers: List[str]) -> int:
 
 
 def ensure_symbol_header(headers: List[str]) -> List[str]:
-    if find_symbol_col(headers) >= 0:
-        return headers
-    return ["Symbol"] + list(headers)
+    return headers if find_symbol_col(headers) >= 0 else ["Symbol"] + list(headers)
 
 
 def rows_to_grid(headers: List[str], rows: Any) -> Tuple[List[str], List[List[Any]]]:
@@ -1085,7 +1281,7 @@ def rows_to_grid(headers: List[str], rows: Any) -> Tuple[List[str], List[List[An
     if not rows:
         return headers, fixed_rows
 
-    # rows is list of dicts
+    # dict rows
     if isinstance(rows, list) and rows and isinstance(rows[0], dict):
         header_lookup = {_normalize_header_key(h): i for i, h in enumerate(headers)}
         for row_dict in rows:
@@ -1105,7 +1301,7 @@ def rows_to_grid(headers: List[str], rows: Any) -> Tuple[List[str], List[List[An
             fixed_rows.append(row_data)
         return headers, fixed_rows
 
-    # rows is list of lists
+    # list rows
     if isinstance(rows, list):
         for row in rows:
             if not isinstance(row, (list, tuple)):
@@ -1132,10 +1328,15 @@ def reorder_to_canonical(sheet_name: str, headers: List[str], rows: List[List[An
         return headers, rows
 
     src_index = {_normalize_header_key(h): i for i, h in enumerate(headers)}
-    canonical_norm = {_normalize_header_key(h) for h in canonical}
-    extra_headers = [h for h in headers if _normalize_header_key(h) not in canonical_norm]
 
-    new_headers = ensure_symbol_header(list(canonical) + extra_headers)
+    # Strict schema by default (Phase 2)
+    new_headers = ensure_symbol_header(list(canonical))
+
+    if _CONFIG.allow_extra_columns:
+        canonical_norm = {_normalize_header_key(h) for h in canonical}
+        extra_headers = [h for h in headers if _normalize_header_key(h) not in canonical_norm]
+        new_headers = ensure_symbol_header(list(canonical) + extra_headers)
+
     new_rows: List[List[Any]] = []
     for row in rows:
         new_row = [None] * len(new_headers)
@@ -1150,12 +1351,54 @@ def reorder_to_canonical(sheet_name: str, headers: List[str], rows: List[List[An
     return new_headers, new_rows
 
 
+def remap_rows_to_headers(src_headers: List[str], src_rows: Any, dst_headers: List[str]) -> List[List[Any]]:
+    """
+    Convert (src_headers, src_rows) into rows aligned to dst_headers order,
+    using normalized header keys + alias map.
+    """
+    sh, sr = rows_to_grid(src_headers, src_rows)
+    dst_headers = ensure_symbol_header(list(dst_headers))
+
+    dst_key_to_idx = {_normalize_header_key(h): i for i, h in enumerate(dst_headers)}
+    src_key_to_idx = {_normalize_header_key(h): i for i, h in enumerate(sh)}
+
+    out: List[List[Any]] = []
+    for row in sr:
+        new_row = [None] * len(dst_headers)
+        for src_k_norm, si in src_key_to_idx.items():
+            if si >= len(row):
+                continue
+            if src_k_norm in dst_key_to_idx:
+                new_row[dst_key_to_idx[src_k_norm]] = row[si]
+                continue
+            alias_dst = _HEADER_ALIAS_MAP_NORM.get(src_k_norm)
+            if alias_dst:
+                alias_dst_norm = _normalize_header_key(alias_dst)
+                if alias_dst_norm in dst_key_to_idx:
+                    new_row[dst_key_to_idx[alias_dst_norm]] = row[si]
+        out.append(new_row)
+    return out
+
+
+def pad_rows(rows: List[List[Any]], new_len: int) -> List[List[Any]]:
+    if new_len <= 0:
+        return rows
+    out: List[List[Any]] = []
+    for r in rows:
+        rr = list(r)
+        if len(rr) < new_len:
+            rr += [None] * (new_len - len(rr))
+        elif len(rr) > new_len:
+            rr = rr[:new_len]
+        out.append(rr)
+    return out
+
+
 # ---------------------------------------------------------------------------
-# Google Sheets Operations (Retry + Full Jitter)
+# Google Sheets operations (Retry + Full Jitter)
 # ---------------------------------------------------------------------------
-def _sleep_full_jitter(base: float, cap: float = 15.0) -> None:
-    t = random.uniform(0.0, min(cap, base))
-    time.sleep(max(0.0, t))
+def _sleep_full_jitter(base_sleep: float, cap: float = 30.0) -> None:
+    time.sleep(random.uniform(0.0, min(cap, base_sleep)))
 
 
 def _retry_sheet_op(operation_name: str, func: Callable, *args, **kwargs):
@@ -1169,8 +1412,8 @@ def _retry_sheet_op(operation_name: str, func: Callable, *args, **kwargs):
             last_exc = e
             if attempt >= retries - 1:
                 raise
-            base = float(_CONFIG.sheets_api_retry_base_sleep) * (2 ** attempt)
-            logger.warning("Sheets API %s retry %s/%s in jitter (base=%.2fs): %s", operation_name, attempt + 1, retries, base, e)
+            base = float(_CONFIG.sheets_api_retry_base_sleep) * (2**attempt)
+            logger.warning("Sheets API %s retry %s/%s (base=%.2fs)", operation_name, attempt + 1, retries, base)
             _sleep_full_jitter(base, cap=15.0)
     raise last_exc  # type: ignore
 
@@ -1179,10 +1422,38 @@ def read_range(spreadsheet_id: str, range_name: str) -> List[List[Any]]:
     service = get_sheets_service()
 
     def _read():
-        result = service.spreadsheets().values().get(spreadsheetId=spreadsheet_id, range=range_name, majorDimension="ROWS").execute()
+        result = (
+            service.spreadsheets()
+            .values()
+            .get(spreadsheetId=spreadsheet_id, range=range_name, majorDimension="ROWS")
+            .execute()
+        )
         return result.get("values", []) or []
 
     return _retry_sheet_op("Read Range", _read)
+
+
+def read_ranges_batch(spreadsheet_id: str, ranges: List[str], major_dimension: str = "COLUMNS") -> List[List[List[Any]]]:
+    """
+    Returns list of "values" per range. Each is a list-of-lists per majorDimension.
+    major_dimension="COLUMNS" makes each range return: [ [col_values...] ].
+    """
+    service = get_sheets_service()
+
+    def _batch_get():
+        result = (
+            service.spreadsheets()
+            .values()
+            .batchGet(spreadsheetId=spreadsheet_id, ranges=ranges, majorDimension=major_dimension)
+            .execute()
+        )
+        vals = result.get("valueRanges", []) or []
+        out = []
+        for vr in vals:
+            out.append(vr.get("values", []) or [])
+        return out
+
+    return _retry_sheet_op("Batch Get", _batch_get)
 
 
 def write_range(spreadsheet_id: str, range_name: str, values: List[List[Any]], value_input: str = "RAW") -> int:
@@ -1190,7 +1461,17 @@ def write_range(spreadsheet_id: str, range_name: str, values: List[List[Any]], v
     body = {"values": values or [[]]}
 
     def _write():
-        result = service.spreadsheets().values().update(spreadsheetId=spreadsheet_id, range=range_name, valueInputOption=value_input, body=body).execute()
+        result = (
+            service.spreadsheets()
+            .values()
+            .update(
+                spreadsheetId=spreadsheet_id,
+                range=range_name,
+                valueInputOption=value_input,
+                body=body,
+            )
+            .execute()
+        )
         return int(result.get("updatedCells", 0) or 0)
 
     return _retry_sheet_op("Write Range", _write)
@@ -1205,7 +1486,13 @@ def clear_range(spreadsheet_id: str, range_name: str) -> None:
     _retry_sheet_op("Clear Range", _clear)
 
 
-def write_grid_chunked(spreadsheet_id: str, sheet_name: str, start_cell: str, grid: List[List[Any]], value_input: str = "RAW") -> int:
+def write_grid_chunked(
+    spreadsheet_id: str,
+    sheet_name: str,
+    start_cell: str,
+    grid: List[List[Any]],
+    value_input: str = "RAW",
+) -> int:
     if not grid:
         return 0
 
@@ -1214,8 +1501,8 @@ def write_grid_chunked(spreadsheet_id: str, sheet_name: str, start_cell: str, gr
 
     header = list(grid[0] if grid else [])
     data_rows = grid[1:] if len(grid) > 1 else []
-    header_len = len(header)
 
+    header_len = len(header)
     fixed_rows: List[List[Any]] = []
     for row in data_rows:
         if not isinstance(row, (list, tuple)):
@@ -1227,19 +1514,21 @@ def write_grid_chunked(spreadsheet_id: str, sheet_name: str, start_cell: str, gr
             row_list = row_list[:header_len]
         fixed_rows.append(row_list)
 
-    chunks = [fixed_rows[i : i + _CONFIG.max_rows_per_write] for i in range(0, len(fixed_rows), _CONFIG.max_rows_per_write)]
+    chunks = [
+        fixed_rows[i : i + _CONFIG.max_rows_per_write]
+        for i in range(0, len(fixed_rows), _CONFIG.max_rows_per_write)
+    ]
     total_cells = 0
 
-    # Batch update path
-    if _CONFIG.use_batch_update and chunks:
+    if _CONFIG.use_batch_update:
         try:
             service = get_sheets_service()
             batch_data = []
 
             rng0 = f"{sheet_a1}!{a1(start_col, start_row)}"
-            batch_data.append({"range": rng0, "values": [header] + chunks[0]})
+            batch_data.append({"range": rng0, "values": [header] + (chunks[0] if chunks else [])})
 
-            current_row = start_row + 1 + len(chunks[0])
+            current_row = start_row + 1 + (len(chunks[0]) if chunks else 0)
             for chunk in chunks[1:]:
                 rng = f"{sheet_a1}!{a1(start_col, current_row)}"
                 batch_data.append({"range": rng, "values": chunk})
@@ -1250,7 +1539,12 @@ def write_grid_chunked(spreadsheet_id: str, sheet_name: str, start_cell: str, gr
 
                 def _batch_update():
                     body = {"valueInputOption": value_input, "data": batch}
-                    result = service.spreadsheets().values().batchUpdate(spreadsheetId=spreadsheet_id, body=body).execute()
+                    result = (
+                        service.spreadsheets()
+                        .values()
+                        .batchUpdate(spreadsheetId=spreadsheet_id, body=body)
+                        .execute()
+                    )
                     responses = result.get("responses", []) or []
                     return sum(int(resp.get("updatedCells", 0) or 0) for resp in responses)
 
@@ -1260,7 +1554,6 @@ def write_grid_chunked(spreadsheet_id: str, sheet_name: str, start_cell: str, gr
         except Exception as e:
             logger.warning("Batch update failed, falling back to sequential: %s", e)
 
-    # Sequential fallback
     rng0 = f"{sheet_a1}!{a1(start_col, start_row)}"
     total_cells += write_range(spreadsheet_id, rng0, [header] + (chunks[0] if chunks else []), value_input=value_input)
 
@@ -1274,7 +1567,207 @@ def write_grid_chunked(spreadsheet_id: str, sheet_name: str, start_cell: str, gr
 
 
 # ---------------------------------------------------------------------------
-# SAFE MODE Validation
+# Phase 2 — Ensure tabs exist + seed headers + minimal formatting
+# ---------------------------------------------------------------------------
+def _get_sheet_title_to_id(spreadsheet_id: str) -> Dict[str, int]:
+    service = get_sheets_service()
+
+    def _get():
+        meta = (
+            service.spreadsheets()
+            .get(spreadsheetId=spreadsheet_id, fields="sheets(properties(sheetId,title,gridProperties))")
+            .execute()
+        )
+        out: Dict[str, int] = {}
+        for s in (meta.get("sheets") or []):
+            props = (s or {}).get("properties") or {}
+            title = _strip(props.get("title"))
+            sid = props.get("sheetId")
+            if title and isinstance(sid, int):
+                out[title] = sid
+        return out
+
+    return _retry_sheet_op("Get Spreadsheet Meta", _get)
+
+
+def _batch_update(spreadsheet_id: str, requests: List[Dict[str, Any]]) -> None:
+    if not requests:
+        return
+    service = get_sheets_service()
+
+    def _do():
+        service.spreadsheets().batchUpdate(spreadsheetId=spreadsheet_id, body={"requests": requests}).execute()
+
+    _retry_sheet_op("BatchUpdate", _do)
+
+
+def ensure_canonical_tabs_exist(spreadsheet_id: str) -> None:
+    """
+    Creates missing canonical tabs from page_catalog.
+    NEVER creates forbidden pages (KSA_Tadawul / Advisor_Criteria).
+    """
+    spreadsheet_id = _strip(spreadsheet_id or _CONFIG.default_spreadsheet_id)
+    if not spreadsheet_id:
+        return
+
+    existing = _get_sheet_title_to_id(spreadsheet_id)
+    canonical = list(core_canonical_pages() or [])
+    forbidden = set(core_forbidden_pages() or set())
+
+    reqs: List[Dict[str, Any]] = []
+    for title in canonical:
+        if title in forbidden:
+            continue
+        if title not in existing:
+            reqs.append({"addSheet": {"properties": {"title": title}}})
+
+    if reqs:
+        _batch_update(spreadsheet_id, reqs)
+
+
+def _read_header_row(spreadsheet_id: str, sheet_name: str, start_cell: str, end_col: str = "ZZ") -> List[str]:
+    start_col, start_row = parse_a1_cell(start_cell)
+    rng = f"{safe_sheet_name(sheet_name)}!{a1(start_col, start_row)}:{end_col}{start_row}"
+    vals = read_range(spreadsheet_id, rng)
+    if not vals or not vals[0]:
+        return []
+    return [str(x).strip() for x in vals[0] if str(x).strip()]
+
+
+def _seed_insights_criteria_if_empty(spreadsheet_id: str, sheet_name: str) -> None:
+    if not _CONFIG.insights_criteria_enabled:
+        return
+    if sheet_name != "Insights_Analysis":
+        return
+    try:
+        existing = read_range(spreadsheet_id, f"{safe_sheet_name(sheet_name)}!{_CONFIG.insights_criteria_range}")
+        has_any = False
+        for row in existing or []:
+            for v in row or []:
+                if _strip(v):
+                    has_any = True
+                    break
+            if has_any:
+                break
+        if has_any:
+            return
+
+        block = [
+            ["Advisor Criteria", "", "", ""],
+            ["Risk Level", "Moderate", "Confidence Level", "High"],
+            ["Invest Period (days)", "90", "Min Expected ROI %", "3"],
+            ["Max Risk", "Moderate", "Pages Selected", "Market_Leaders,Global_Markets,Commodities_FX,Mutual_Funds,My_Portfolio"],
+        ]
+        write_range(spreadsheet_id, f"{safe_sheet_name(sheet_name)}!A1", block, value_input="RAW")
+    except Exception as e:
+        logger.warning("Insights criteria seed skipped (non-fatal): %s", e)
+
+
+def ensure_headers_and_formatting(spreadsheet_id: str, sheet_name: str, start_cell: str) -> None:
+    """
+    Ensures:
+    - tab exists (if enabled)
+    - header row EXACTLY matches schema headers
+    - Insights_Analysis criteria block seeded (optional)
+    - basic freeze + filter + baseline column widths (best-effort)
+    """
+    spreadsheet_id = _strip(spreadsheet_id or _CONFIG.default_spreadsheet_id)
+    if not spreadsheet_id:
+        return
+
+    # Normalize + block forbidden
+    sheet_name = core_normalize_page(sheet_name, allow_output_pages=True)
+    if sheet_name in set(core_forbidden_pages() or set()):
+        raise ValueError(f"Forbidden/removed sheet: {sheet_name}")
+
+    if _CONFIG.ensure_tabs_exist:
+        ensure_canonical_tabs_exist(spreadsheet_id)
+
+    # Data_Dictionary headers recommended at A1 (not A5)
+    effective_start_cell = start_cell
+    if sheet_name == "Data_Dictionary" and _strip(start_cell).upper() == "A5":
+        effective_start_cell = "A1"
+
+    canonical = get_canonical_headers(sheet_name) or []
+    canonical = ensure_symbol_header([h for h in canonical if _strip(h)])
+
+    current = _read_header_row(spreadsheet_id, sheet_name, effective_start_cell)
+    current_norm = [_normalize_header_key(h) for h in current]
+    canon_norm = [_normalize_header_key(h) for h in canonical]
+
+    if current_norm != canon_norm:
+        write_range(spreadsheet_id, f"{safe_sheet_name(sheet_name)}!{effective_start_cell}", [canonical], value_input="RAW")
+        _header_cache.invalidate(sheet_name)
+
+    _seed_insights_criteria_if_empty(spreadsheet_id, sheet_name)
+
+    # Minimal formatting (best-effort)
+    try:
+        title_to_id = _get_sheet_title_to_id(spreadsheet_id)
+        sid = title_to_id.get(sheet_name)
+        if sid is None:
+            return
+
+        start_col, start_row = parse_a1_cell(effective_start_cell)
+        frozen_rows = max(1, int(start_row))
+        ncols = max(1, len(canonical))
+        end_col_idx = col_to_index(start_col) + ncols - 1
+
+        reqs: List[Dict[str, Any]] = []
+
+        # Freeze rows
+        reqs.append(
+            {
+                "updateSheetProperties": {
+                    "properties": {"sheetId": sid, "gridProperties": {"frozenRowCount": frozen_rows}},
+                    "fields": "gridProperties.frozenRowCount",
+                }
+            }
+        )
+
+        # Clear previous filter if exists (best effort)
+        reqs.append({"clearBasicFilter": {"sheetId": sid}})
+
+        # Filter on header row
+        reqs.append(
+            {
+                "setBasicFilter": {
+                    "filter": {
+                        "range": {
+                            "sheetId": sid,
+                            "startRowIndex": frozen_rows - 1,
+                            "endRowIndex": min(_CONFIG.clear_end_row, frozen_rows - 1 + 50000),
+                            "startColumnIndex": col_to_index(start_col) - 1,
+                            "endColumnIndex": end_col_idx,
+                        }
+                    }
+                }
+            }
+        )
+
+        # Baseline column width
+        reqs.append(
+            {
+                "updateDimensionProperties": {
+                    "range": {
+                        "sheetId": sid,
+                        "dimension": "COLUMNS",
+                        "startIndex": col_to_index(start_col) - 1,
+                        "endIndex": end_col_idx,
+                    },
+                    "properties": {"pixelSize": 140},
+                    "fields": "pixelSize",
+                }
+            }
+        )
+
+        _batch_update(spreadsheet_id, reqs)
+    except Exception as e:
+        logger.warning("Formatting skipped (non-fatal): %s", e)
+
+
+# ---------------------------------------------------------------------------
+# SAFE MODE validation
 # ---------------------------------------------------------------------------
 class SafeModeValidator:
     def __init__(self, config: SheetsServiceConfig):
@@ -1289,6 +1782,9 @@ class SafeModeValidator:
         allow_empty_headers: bool = False,
         allow_empty_rows: bool = False,
     ) -> Optional[str]:
+        if not isinstance(response, dict):
+            return "SAFE MODE: Backend response is not a dict"
+
         headers = response.get("headers", []) or []
         rows = response.get("rows", []) or []
 
@@ -1301,33 +1797,30 @@ class SafeModeValidator:
         if self.config.block_on_empty_rows and (not rows) and (not allow_empty_rows):
             return "SAFE MODE: Backend returned empty rows"
 
+        if headers and self.config.require_symbol_header and find_symbol_col(list(headers)) < 0:
+            return "SAFE MODE: Backend headers missing 'Symbol' column"
+
         if self.config.safe_mode == SafeModeLevel.BASIC:
             return None
 
-        # STRICT+: minimal structural checks
         if self.config.block_on_data_mismatch and headers and rows:
             for i, row in enumerate(rows[:10]):
-                try:
-                    if isinstance(row, list) and len(row) != len(headers):
-                        return f"SAFE MODE: Row {i+1} length ({len(row)}) doesn't match headers ({len(headers)})"
-                except Exception:
-                    continue
+                if isinstance(row, list) and len(row) != len(headers):
+                    return f"SAFE MODE: Row {i+1} length ({len(row)}) doesn't match headers ({len(headers)})"
 
         if self.config.safe_mode == SafeModeLevel.STRICT:
             return None
 
-        # PARANOID: symbol coverage heuristic
         if self.config.validate_row_count and headers and requested_symbols:
-            h2, r2 = rows_to_grid(headers, rows)
-            sym_idx = find_symbol_col(h2)
-            if sym_idx >= 0:
+            symbol_col = find_symbol_col(list(headers))
+            if symbol_col >= 0:
                 returned: Set[str] = set()
-                for row in r2:
-                    if isinstance(row, list) and sym_idx < len(row):
-                        sym = _strip(row[sym_idx]).upper()
+                for row in rows:
+                    if isinstance(row, list) and symbol_col < len(row):
+                        sym = _strip(row[symbol_col]).upper()
                         if sym:
                             returned.add(sym)
-                req = set(requested_symbols)
+                req = set([_strip(x).upper() for x in requested_symbols if _strip(x)])
                 missing = req - returned
                 if missing and len(missing) > max(1, int(len(req) * 0.5)):
                     return f"SAFE MODE: Missing >50% of requested symbols ({len(missing)}/{len(req)}) for {sheet_name}"
@@ -1337,15 +1830,13 @@ class SafeModeValidator:
 
 _safe_mode_validator = SafeModeValidator(_CONFIG)
 
-
 # ---------------------------------------------------------------------------
-# Backend API Client (httpx preferred, urllib fallback) — LAZY httpx init
+# Backend API client (httpx preferred, urllib fallback) — LAZY httpx init
 # ---------------------------------------------------------------------------
 class BackendAPIClient:
     def __init__(self):
         self.circuit_breaker = BackendCircuitBreaker(
-            threshold=_CONFIG.backend_circuit_breaker_threshold,
-            timeout=_CONFIG.backend_circuit_breaker_timeout,
+            _CONFIG.backend_circuit_breaker_threshold, _CONFIG.backend_circuit_breaker_timeout
         )
         self._ssl_ctx = self._create_ssl_context()
         self._httpx_client = None
@@ -1397,28 +1888,33 @@ class BackendAPIClient:
             pass
 
     def _resolve_token_candidates(self) -> List[str]:
-        """
-        Resolve tokens in priority order.
-        - ALLOWED_TOKENS / TFB_ALLOWED_TOKENS / APP_TOKENS (list)
-        - APP_TOKEN / BACKEND_TOKEN / BACKUP_APP_TOKEN
-        """
-        toks = normalize_list_lower(coerce_list(os.getenv("ALLOWED_TOKENS") or os.getenv("TFB_ALLOWED_TOKENS") or os.getenv("APP_TOKENS") or "", []))
-        # These list sources are not lowercased tokens; re-pull original list safely:
-        toks_raw = coerce_list(os.getenv("ALLOWED_TOKENS") or os.getenv("TFB_ALLOWED_TOKENS") or os.getenv("APP_TOKENS") or "", [])
-        toks_out = [_strip(t) for t in toks_raw if _strip(t)]
-
-        for k in ("APP_TOKEN", "BACKEND_TOKEN", "BACKUP_APP_TOKEN", "TFB_APP_TOKEN"):
-            v = _strip(os.getenv(k, ""))
-            if v and v not in toks_out:
-                toks_out.append(v)
-        return toks_out
+        toks: List[str] = []
+        for name in ("ALLOWED_TOKENS", "TFB_ALLOWED_TOKENS", "APP_TOKENS"):
+            toks.extend(parse_csv_env(name, default=""))
+        for name in ("APP_TOKEN", "BACKEND_TOKEN", "BACKUP_APP_TOKEN", "TFB_APP_TOKEN"):
+            v = _strip(os.getenv(name, ""))
+            if v:
+                toks.append(v)
+        out: List[str] = []
+        seen: Set[str] = set()
+        for t in toks:
+            if not t or t in seen:
+                continue
+            seen.add(t)
+            out.append(t)
+        return out
 
     def _get_token(self) -> str:
         toks = self._resolve_token_candidates()
         return toks[0] if toks else ""
 
     def _build_headers(self, token: str, request_id: str) -> Dict[str, str]:
-        headers = {"Content-Type": "application/json", "Accept": "application/json", "User-Agent": _CONFIG.user_agent, "X-Request-Id": request_id}
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": _CONFIG.user_agent,
+            "X-Request-Id": request_id,
+        }
         if not token:
             return headers
         if TokenTransport.HEADER in _CONFIG.backend_token_transport:
@@ -1428,10 +1924,7 @@ class BackendAPIClient:
         return headers
 
     def _compose_url_and_params(
-        self,
-        endpoint: str,
-        token: str,
-        query_params: Optional[Dict[str, Any]],
+        self, endpoint: str, token: str, query_params: Optional[Dict[str, Any]]
     ) -> Tuple[str, Dict[str, Any]]:
         base_url = _CONFIG.backend_base_url.rstrip("/")
         url = f"{base_url}{endpoint}"
@@ -1440,35 +1933,42 @@ class BackendAPIClient:
             params[_CONFIG.backend_token_param_name] = token
         return url, params
 
+    def _error_payload(self, symbols: List[str], error: str, request_id: str) -> Dict[str, Any]:
+        return {
+            "status": "error",
+            "error": error,
+            "headers": ["Symbol", "Error"],
+            "rows": [[s, error] for s in (symbols or [])],
+            "request_id": request_id,
+        }
+
     def call_api(self, endpoint: str, payload: Dict[str, Any], query_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         request_id = uuid.uuid4().hex[:12]
         with TraceContext("backend_api_call", {"endpoint": endpoint, "request_id": request_id}):
+            symbols = payload.get("symbols", []) or payload.get("tickers", []) or []
             if not self.circuit_breaker.can_execute():
-                return {"status": "error", "error": f"Circuit breaker {self.circuit_breaker.get_state()['state']}", "headers": ["Symbol", "Error"], "rows": []}
+                st = self.circuit_breaker.get_state()
+                return self._error_payload(symbols, f"Circuit breaker {st['state']}", request_id)
 
             base_url = _CONFIG.backend_base_url.rstrip("/")
             if not base_url:
-                return {"status": "error", "error": "No backend URL configured", "headers": ["Symbol", "Error"], "rows": []}
+                return self._error_payload(symbols, "No backend URL configured", request_id)
 
-            symbols = payload.get("symbols", []) or payload.get("tickers", []) or []
             token = self._get_token()
             url, params = self._compose_url_and_params(endpoint, token, query_params)
 
             try:
-                body_bytes = json_dumps(payload, default=str).encode("utf-8")
+                body_bytes = json_dumps_bytes(payload, default=str)
             except Exception as e:
                 self.circuit_breaker.record_failure()
-                err = f"JSON encode error: {e}"
-                return {"status": "error", "error": err, "headers": ["Symbol", "Error"], "rows": [[s, err] for s in symbols]}
+                return self._error_payload(symbols, f"JSON encode error: {e}", request_id)
 
             last_error: Optional[str] = None
-            max_attempts = max(1, int(_CONFIG.backend_retries) + 1)
+            retries = max(0, int(_CONFIG.backend_retries))
 
-            for attempt in range(max_attempts):
+            for attempt in range(retries + 1):
                 try:
                     client = self._get_httpx_client()
-
-                    # Preferred: httpx
                     if client is not None:
                         resp = client.post(
                             url,
@@ -1477,14 +1977,14 @@ class BackendAPIClient:
                             headers=self._build_headers(token, request_id),
                         )
                         status = int(resp.status_code)
-                        raw = resp.text
-
                         if 200 <= status < 300:
                             try:
                                 data = resp.json()
                             except Exception:
-                                data = json_loads(raw)
-
+                                try:
+                                    data = json_loads(resp.content)
+                                except Exception:
+                                    data = {}
                             self.circuit_breaker.record_success()
                             if not isinstance(data, dict):
                                 data = {}
@@ -1494,23 +1994,32 @@ class BackendAPIClient:
                             data.setdefault("request_id", request_id)
                             return data
 
-                        last_error = f"HTTP {status}: {raw[:400]}"
-                        if status in (429, 500, 502, 503, 504) and attempt < max_attempts - 1:
-                            base_sleep = float(_CONFIG.backend_retry_sleep) * (2 ** attempt)
-                            _sleep_full_jitter(base_sleep, cap=30.0)
+                        snip = ""
+                        try:
+                            snip = (resp.text or "")[:400]
+                        except Exception:
+                            snip = ""
+                        last_error = f"HTTP {status}: {snip}"
+                        if status in (429, 500, 502, 503, 504) and attempt < retries:
+                            _sleep_full_jitter(float(_CONFIG.backend_retry_sleep) * (2**attempt), cap=30.0)
                             continue
-
                         self.circuit_breaker.record_failure()
-                        return {"status": "error", "error": last_error, "headers": ["Symbol", "Error"], "rows": [[s, last_error] for s in symbols], "request_id": request_id}
+                        return self._error_payload(symbols, last_error, request_id)
 
-                    # Fallback: urllib
+                    # urllib fallback
                     request_url = url
                     if params:
                         parsed = urllib.parse.urlsplit(request_url)
                         q = dict(urllib.parse.parse_qsl(parsed.query, keep_blank_values=True))
                         q.update(params)
                         request_url = urllib.parse.urlunsplit(
-                            (parsed.scheme, parsed.netloc, parsed.path, urllib.parse.urlencode(q, doseq=True), parsed.fragment)
+                            (
+                                parsed.scheme,
+                                parsed.netloc,
+                                parsed.path,
+                                urllib.parse.urlencode(q, doseq=True),
+                                parsed.fragment,
+                            )
                         )
 
                     req = urllib.request.Request(
@@ -1519,58 +2028,77 @@ class BackendAPIClient:
                         headers=self._build_headers(token, request_id),
                         method="POST",
                     )
-                    with urllib.request.urlopen(req, timeout=float(_CONFIG.backend_timeout_sec), context=self._ssl_ctx) as resp2:
-                        raw2 = resp2.read().decode("utf-8", errors="replace")
-                        status2 = int(getattr(resp2, "status", 200) or 200)
+                    try:
+                        with urllib.request.urlopen(
+                            req,
+                            timeout=float(_CONFIG.backend_timeout_sec),
+                            context=self._ssl_ctx,
+                        ) as resp2:
+                            raw2 = resp2.read()
+                            status2 = int(getattr(resp2, "status", 200) or 200)
+                    except urllib.error.HTTPError as he:
+                        raw2 = he.read() if hasattr(he, "read") else b""
+                        status2 = int(getattr(he, "code", 500) or 500)
 
-                        if 200 <= status2 < 300:
-                            try:
-                                data2 = json_loads(raw2)
-                            except Exception as e:
-                                self.circuit_breaker.record_failure()
-                                err = f"Invalid JSON: {e}"
-                                return {"status": "error", "error": err, "headers": ["Symbol", "Error"], "rows": [[s, err] for s in symbols], "request_id": request_id}
+                    if 200 <= status2 < 300:
+                        try:
+                            data2 = json_loads(raw2)
+                        except Exception as e:
+                            self.circuit_breaker.record_failure()
+                            return self._error_payload(symbols, f"Invalid JSON: {e}", request_id)
 
-                            self.circuit_breaker.record_success()
-                            if not isinstance(data2, dict):
-                                data2 = {}
-                            data2.setdefault("status", "success")
-                            data2.setdefault("headers", [])
-                            data2.setdefault("rows", [])
-                            data2.setdefault("request_id", request_id)
-                            return data2
+                        self.circuit_breaker.record_success()
+                        if not isinstance(data2, dict):
+                            data2 = {}
+                        data2.setdefault("status", "success")
+                        data2.setdefault("headers", [])
+                        data2.setdefault("rows", [])
+                        data2.setdefault("request_id", request_id)
+                        return data2
 
-                        last_error = f"HTTP {status2}: {raw2[:400]}"
-                        if status2 in (429, 500, 502, 503, 504) and attempt < max_attempts - 1:
-                            base_sleep = float(_CONFIG.backend_retry_sleep) * (2 ** attempt)
-                            _sleep_full_jitter(base_sleep, cap=30.0)
-                            continue
+                    try:
+                        snip2 = raw2.decode("utf-8", errors="replace")[:400]
+                    except Exception:
+                        snip2 = ""
+                    last_error = f"HTTP {status2}: {snip2}"
 
-                        self.circuit_breaker.record_failure()
-                        return {"status": "error", "error": last_error, "headers": ["Symbol", "Error"], "rows": [[s, last_error] for s in symbols], "request_id": request_id}
+                    if status2 in (429, 500, 502, 503, 504) and attempt < retries:
+                        _sleep_full_jitter(float(_CONFIG.backend_retry_sleep) * (2**attempt), cap=30.0)
+                        continue
+
+                    self.circuit_breaker.record_failure()
+                    return self._error_payload(symbols, last_error, request_id)
 
                 except Exception as e:
                     last_error = f"Request error: {e}"
-                    if attempt < max_attempts - 1:
-                        base_sleep = float(_CONFIG.backend_retry_sleep) * (2 ** attempt)
-                        _sleep_full_jitter(base_sleep, cap=30.0)
+                    if attempt < retries:
+                        _sleep_full_jitter(float(_CONFIG.backend_retry_sleep) * (2**attempt), cap=30.0)
                         continue
                     self.circuit_breaker.record_failure()
-                    return {"status": "error", "error": last_error, "headers": ["Symbol", "Error"], "rows": [[s, last_error] for s in symbols], "request_id": request_id}
+                    return self._error_payload(symbols, last_error, request_id)
 
             self.circuit_breaker.record_failure()
-            return {"status": "error", "error": last_error or "Max retries exceeded", "headers": ["Symbol", "Error"], "rows": [[s, last_error or "Max retries exceeded"] for s in symbols], "request_id": request_id}
+            return self._error_payload(symbols, last_error or "Max retries exceeded", request_id)
 
-    def call_api_chunked(self, endpoint: str, symbols: List[str], base_payload: Dict[str, Any], query_params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        symbols = list(symbols or [])
+    def call_api_chunked(
+        self,
+        endpoint: str,
+        symbols: List[str],
+        base_payload: Dict[str, Any],
+        query_params: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         if len(symbols) <= _CONFIG.backend_max_symbols_per_call:
             payload = dict(base_payload)
             payload["symbols"] = symbols
             payload["tickers"] = symbols
             return self.call_api(endpoint, payload, query_params)
 
-        chunks = [symbols[i : i + _CONFIG.backend_max_symbols_per_call] for i in range(0, len(symbols), _CONFIG.backend_max_symbols_per_call)]
+        chunks = [
+            symbols[i : i + _CONFIG.backend_max_symbols_per_call]
+            for i in range(0, len(symbols), _CONFIG.backend_max_symbols_per_call)
+        ]
         responses: List[Dict[str, Any]] = []
+        first_headers: List[str] = []
 
         for chunk in chunks:
             payload = dict(base_payload)
@@ -1578,29 +2106,26 @@ class BackendAPIClient:
             payload["tickers"] = chunk
             resp = self.call_api(endpoint, payload, query_params)
             responses.append(resp)
+            if not first_headers:
+                first_headers = list(resp.get("headers") or [])
 
-        return self._merge_responses(symbols, responses)
+        return self._merge_responses(symbols, first_headers, responses)
 
-    def _merge_responses(self, requested_symbols: List[str], responses: List[Dict[str, Any]]) -> Dict[str, Any]:
-        # Merge headers union, then map each response row into final header positions.
+    def _merge_responses(self, requested_symbols: List[str], first_headers: List[str], responses: List[Dict[str, Any]]) -> Dict[str, Any]:
         status = "success"
         error_msg: Optional[str] = None
 
-        all_headers: List[str] = []
+        all_headers = list(first_headers)
         for resp in responses:
-            hs = resp.get("headers", []) or []
-            all_headers = append_missing_headers(all_headers, hs)
-
+            all_headers = append_missing_headers(all_headers, resp.get("headers", []) or [])
         all_headers = ensure_symbol_header(all_headers or ["Symbol", "Error"])
-        all_hdr_idx = {_normalize_header_key(h): i for i, h in enumerate(all_headers)}
-        sym_col_final = find_symbol_col(all_headers)
-        err_col_final = find_error_col(all_headers)
 
-        # Build row map by symbol
+        sym_idx = find_symbol_col(all_headers)
+        err_idx = find_error_col(all_headers)
         row_map: Dict[str, List[Any]] = {}
 
         for resp in responses:
-            resp_status = (_strip(resp.get("status", "success")) or "success").lower()
+            resp_status = (_strip(resp.get("status")) or "success").lower()
             if resp_status in ("error", "partial"):
                 status = "partial"
             if resp_status == "error" and not error_msg:
@@ -1611,52 +2136,31 @@ class BackendAPIClient:
             if not h or not r:
                 continue
 
-            h2, r2 = rows_to_grid(list(h), r)
-            h2 = ensure_symbol_header(h2)
-            src_idx = {_normalize_header_key(x): i for i, x in enumerate(h2)}
-            sym_idx = find_symbol_col(h2)
+            remapped_rows = remap_rows_to_headers(list(h), r, all_headers)
+            if sym_idx < 0:
+                continue
 
-            for row in r2:
-                if sym_idx < 0 or sym_idx >= len(row):
-                    continue
-                sym = _strip(row[sym_idx]).upper()
-                if not sym:
-                    continue
+            for row in remapped_rows:
+                if sym_idx < len(row):
+                    sym = _strip(row[sym_idx]).upper()
+                    if sym:
+                        row_map[sym] = row
 
-                out_row = [None] * len(all_headers)
-                for key_norm, src_pos in src_idx.items():
-                    if src_pos >= len(row):
-                        continue
-                    # direct mapping
-                    if key_norm in all_hdr_idx:
-                        out_row[all_hdr_idx[key_norm]] = row[src_pos]
-                        continue
-                    # alias mapping
-                    alias = _HEADER_ALIAS_MAP_NORM.get(key_norm)
-                    if alias:
-                        a_norm = _normalize_header_key(alias)
-                        if a_norm in all_hdr_idx:
-                            out_row[all_hdr_idx[a_norm]] = row[src_pos]
-
-                # ensure Symbol column
-                if sym_col_final >= 0:
-                    out_row[sym_col_final] = sym
-                row_map[sym] = out_row
-
-        # Final ordered rows aligned to requested_symbols
         final_rows: List[List[Any]] = []
         for sym in requested_symbols:
             sym_u = _strip(sym).upper()
             if sym_u and sym_u in row_map:
-                final_rows.append(row_map[sym_u])
+                row = list(row_map[sym_u])
+                row = pad_rows([row], len(all_headers))[0]
+                final_rows.append(row)
             else:
-                status = "partial"
                 placeholder = [None] * len(all_headers)
-                if sym_col_final >= 0:
-                    placeholder[sym_col_final] = sym_u or sym
-                if err_col_final >= 0:
-                    placeholder[err_col_final] = "No data from backend"
+                if sym_idx >= 0:
+                    placeholder[sym_idx] = sym_u or sym
+                if err_idx >= 0:
+                    placeholder[err_idx] = "No data from backend"
                 final_rows.append(placeholder)
+                status = "partial"
 
         return {"status": status, "headers": all_headers, "rows": final_rows, "error": error_msg}
 
@@ -1664,7 +2168,145 @@ class BackendAPIClient:
 _backend_client = BackendAPIClient()
 
 # ---------------------------------------------------------------------------
-# Refresh Logic (ZERO-DATA-LOSS clear)
+# Preserve Columns (No Data Loss) — by Symbol (batchGet minimal columns)
+# ---------------------------------------------------------------------------
+def _is_blank(v: Any) -> bool:
+    if v is None:
+        return True
+    if isinstance(v, str) and not v.strip():
+        return True
+    return False
+
+
+def _build_preserve_map(
+    spreadsheet_id: str,
+    sheet_name: str,
+    start_cell: str,
+    preserve_cols: List[str],
+    *,
+    max_rows_scan: int,
+    read_end_col: str,
+) -> Dict[str, Dict[str, Any]]:
+    preserve_norm = {_normalize_header_key(c) for c in preserve_cols if _strip(c)}
+    if not preserve_norm:
+        return {}
+
+    start_col, start_row = parse_a1_cell(start_cell)
+    hdr_row = start_row
+    data_start = hdr_row + 1
+    data_end = data_start + max(1, int(max_rows_scan)) - 1
+
+    header_range = f"{safe_sheet_name(sheet_name)}!{a1(start_col, hdr_row)}:{read_end_col}{hdr_row}"
+    header_vals = read_range(spreadsheet_id, header_range)
+    if not header_vals or not header_vals[0]:
+        return {}
+
+    headers = [str(x).strip() for x in header_vals[0] if str(x).strip()]
+    if not headers:
+        return {}
+
+    sym_idx = find_symbol_col(headers)
+    if sym_idx < 0:
+        return {}
+
+    preserve_indices: List[Tuple[int, str]] = []
+    for i, h in enumerate(headers):
+        nh = _normalize_header_key(h)
+        if nh in preserve_norm:
+            preserve_indices.append((i, nh))
+
+    if not preserve_indices:
+        return {}
+
+    start_col_idx = col_to_index(start_col)
+    sym_col_letter = index_to_col(start_col_idx + sym_idx)
+    ranges = [f"{safe_sheet_name(sheet_name)}!{sym_col_letter}{data_start}:{sym_col_letter}{data_end}"]
+
+    col_letter_by_norm: Dict[str, str] = {}
+    for i, nh in preserve_indices:
+        col_letter = index_to_col(start_col_idx + i)
+        col_letter_by_norm[nh] = col_letter
+        ranges.append(f"{safe_sheet_name(sheet_name)}!{col_letter}{data_start}:{col_letter}{data_end}")
+
+    values_by_range = read_ranges_batch(spreadsheet_id, ranges, major_dimension="COLUMNS")
+    if not values_by_range or len(values_by_range) != len(ranges):
+        return {}
+
+    sym_col_values = values_by_range[0][0] if values_by_range[0] else []
+    preserve_values_map: Dict[str, List[Any]] = {}
+    items = list(col_letter_by_norm.items())
+    for idx, (nh, _) in enumerate(items, start=1):
+        preserve_values_map[nh] = values_by_range[idx][0] if values_by_range[idx] else []
+
+    out: Dict[str, Dict[str, Any]] = {}
+    row_count = max(len(sym_col_values), max((len(v) for v in preserve_values_map.values()), default=0))
+    for r in range(row_count):
+        sym = ""
+        if r < len(sym_col_values):
+            sym = str(sym_col_values[r] or "").strip().upper()
+        if not sym:
+            continue
+        d: Dict[str, Any] = {}
+        for nh, col_vals in preserve_values_map.items():
+            if r < len(col_vals):
+                v = col_vals[r]
+                if not _is_blank(v):
+                    d[nh] = v
+        if d:
+            out[sym] = d
+
+    return out
+
+
+def _ensure_preserve_headers(headers: List[str], preserve_cols: List[str]) -> List[str]:
+    if not preserve_cols:
+        return headers
+    return append_missing_headers(list(headers), list(preserve_cols))
+
+
+def _apply_preserve_map(
+    headers: List[str],
+    rows: List[List[Any]],
+    preserve_map: Dict[str, Dict[str, Any]],
+    preserve_cols: List[str],
+) -> List[List[Any]]:
+    if not preserve_map or not preserve_cols:
+        return rows
+
+    headers = ensure_symbol_header(headers)
+    sym_idx = find_symbol_col(headers)
+    if sym_idx < 0:
+        return rows
+
+    tgt_idx_by_norm = {_normalize_header_key(h): i for i, h in enumerate(headers)}
+    preserve_norm = [_normalize_header_key(c) for c in preserve_cols if _strip(c)]
+    preserve_norm = [nh for nh in preserve_norm if nh in tgt_idx_by_norm]
+
+    if not preserve_norm:
+        return rows
+
+    out_rows: List[List[Any]] = []
+    for row in rows:
+        r = list(row)
+        if len(r) < len(headers):
+            r += [None] * (len(headers) - len(r))
+        if len(r) > len(headers):
+            r = r[: len(headers)]
+
+        sym = _strip(r[sym_idx]).upper() if sym_idx < len(r) else ""
+        if sym and sym in preserve_map:
+            saved = preserve_map[sym]
+            for nh in preserve_norm:
+                ti = tgt_idx_by_norm[nh]
+                if ti < len(r) and _is_blank(r[ti]) and nh in saved:
+                    r[ti] = saved[nh]
+        out_rows.append(r)
+
+    return out_rows
+
+
+# ---------------------------------------------------------------------------
+# Refresh core logic
 # ---------------------------------------------------------------------------
 def _payload_for_endpoint(symbols: List[str], sheet_name: str, extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     payload: Dict[str, Any] = {
@@ -1683,6 +2325,37 @@ def _payload_for_endpoint(symbols: List[str], sheet_name: str, extra: Optional[D
     return payload
 
 
+def _post_clear_trailing(
+    spreadsheet_id: str,
+    sheet_name: str,
+    start_cell: str,
+    headers_len: int,
+    rows_written: int,
+) -> None:
+    try:
+        start_col, start_row = parse_a1_cell(start_cell)
+        end_col = compute_clear_end_col(start_col, headers_len) if _CONFIG.smart_clear else _CONFIG.clear_end_col
+
+        last_written_row = start_row + rows_written
+        tail_start = last_written_row + 1
+        if tail_start <= _CONFIG.clear_end_row:
+            tail_range = f"{safe_sheet_name(sheet_name)}!{a1(start_col, tail_start)}:{end_col}{_CONFIG.clear_end_row}"
+            clear_range(spreadsheet_id, tail_range)
+
+        if _CONFIG.smart_clear:
+            try:
+                end_idx = col_to_index(end_col)
+                cfg_end_idx = col_to_index(_CONFIG.clear_end_col)
+                if cfg_end_idx > end_idx:
+                    right_start = index_to_col(end_idx + 1)
+                    hdr_right_range = f"{safe_sheet_name(sheet_name)}!{a1(right_start, start_row)}:{_CONFIG.clear_end_col}{start_row}"
+                    clear_range(spreadsheet_id, hdr_right_range)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.warning("Post-clear failed (continuing): %s", e)
+
+
 def _refresh_logic(
     endpoint: str,
     spreadsheet_id: str,
@@ -1698,28 +2371,36 @@ def _refresh_logic(
     allow_empty_headers: bool = False,
     allow_empty_rows: bool = False,
 ) -> Dict[str, Any]:
-    start_time = time.time()
-    rid = uuid.uuid4().hex[:12]
+    t0 = time.time()
+    request_id = uuid.uuid4().hex[:12]
+    spreadsheet_id = _strip(spreadsheet_id or _CONFIG.default_spreadsheet_id)
+    sheet_name = _strip(sheet_name)
+    start_cell = _strip(start_cell or _CONFIG.headers_start_cell_default) or "A5"
 
     try:
-        spreadsheet_id = _strip(spreadsheet_id or _CONFIG.default_spreadsheet_id)
-        sheet_name = _strip(sheet_name)
-
         if not spreadsheet_id:
-            return {"status": "error", "error": "No spreadsheet ID provided", "service_version": SERVICE_VERSION, "request_id": rid}
+            return {"status": "error", "error": "No spreadsheet ID provided", "service_version": SERVICE_VERSION, "request_id": request_id}
         if not sheet_name:
-            return {"status": "error", "error": "No sheet name provided", "service_version": SERVICE_VERSION, "request_id": rid}
+            return {"status": "error", "error": "No sheet name provided", "service_version": SERVICE_VERSION, "request_id": request_id}
+
+        # Phase 2: normalize & block forbidden
+        try:
+            sheet_name = core_normalize_page(sheet_name, allow_output_pages=True)
+            if sheet_name in set(core_forbidden_pages() or set()):
+                return {"status": "blocked", "reason": f"Forbidden/removed page: {sheet_name}", "service_version": SERVICE_VERSION, "request_id": request_id}
+        except Exception as e:
+            return {"status": "blocked", "reason": f"Invalid sheet name: {e}", "service_version": SERVICE_VERSION, "request_id": request_id}
+
+        # Phase 2: ensure tab exists + headers exactly match schema
+        if _CONFIG.ensure_headers_match_schema:
+            try:
+                ensure_headers_and_formatting(spreadsheet_id, sheet_name, start_cell)
+            except Exception as e:
+                return {"status": "blocked", "reason": f"Schema/tab/header ensure failed: {e}", "sheet": sheet_name, "service_version": SERVICE_VERSION, "request_id": request_id}
 
         symbols = normalize_tickers(tickers)
         if not symbols:
-            return {
-                "status": "skipped",
-                "reason": "No valid tickers provided",
-                "endpoint": endpoint,
-                "sheet": sheet_name,
-                "service_version": SERVICE_VERSION,
-                "request_id": rid,
-            }
+            return {"status": "skipped", "reason": "No valid tickers provided", "endpoint": endpoint, "sheet": sheet_name, "service_version": SERVICE_VERSION, "request_id": request_id}
 
         query_params = dict(backend_query_params or {})
         if mode:
@@ -1729,11 +2410,7 @@ def _refresh_logic(
         response = _backend_client.call_api_chunked(endpoint, symbols, payload, query_params=query_params or None)
 
         validation_error = _safe_mode_validator.validate_backend_response(
-            response,
-            symbols,
-            sheet_name,
-            allow_empty_headers=allow_empty_headers,
-            allow_empty_rows=allow_empty_rows,
+            response, symbols, sheet_name, allow_empty_headers=allow_empty_headers, allow_empty_rows=allow_empty_rows
         )
         if validation_error:
             return {
@@ -1741,67 +2418,51 @@ def _refresh_logic(
                 "reason": validation_error,
                 "endpoint": endpoint,
                 "sheet": sheet_name,
-                "service_version": SERVICE_VERSION,
-                "request_id": rid,
+                "safe_mode": _CONFIG.safe_mode.value,
                 "backend_status": response.get("status"),
                 "backend_error": response.get("error"),
+                "service_version": SERVICE_VERSION,
+                "request_id": request_id,
             }
 
         headers = response.get("headers", []) or []
         rows = response.get("rows", []) or []
 
+        # If backend headers missing, fall back to schema headers
         if not headers:
             headers = get_canonical_headers(sheet_name)
 
-        headers2, rows2 = rows_to_grid(headers, rows)
+        headers2, rows2 = rows_to_grid(list(headers), rows)
         headers3, rows3 = reorder_to_canonical(sheet_name, headers2, rows2)
+
+        # Ensure preserve headers exist (appended, then padded)
+        headers3 = _ensure_preserve_headers(headers3, _CONFIG.preserve_columns)
         headers3 = ensure_symbol_header(headers3 or ["Symbol", "Error"])
+        rows3 = pad_rows(rows3, len(headers3))
+
+        preserve_map: Dict[str, Dict[str, Any]] = {}
+        if _CONFIG.preserve_columns:
+            try:
+                preserve_map = _build_preserve_map(
+                    spreadsheet_id,
+                    sheet_name,
+                    start_cell,
+                    _CONFIG.preserve_columns,
+                    max_rows_scan=_CONFIG.preserve_max_rows_scan,
+                    read_end_col=_CONFIG.preserve_read_end_col,
+                )
+            except Exception as e:
+                logger.warning("Preserve scan failed (continuing): %s", e)
+
+        if preserve_map:
+            rows3 = _apply_preserve_map(headers3, rows3, preserve_map, _CONFIG.preserve_columns)
 
         grid = [headers3] + rows3
 
-        # 1) WRITE first (no clear before write)
-        try:
-            cells_updated = write_grid_chunked(spreadsheet_id, sheet_name, start_cell, grid, value_input=value_input)
-        except Exception as e:
-            return {
-                "status": "error",
-                "error": f"Write failed: {e}",
-                "sheet": sheet_name,
-                "endpoint": endpoint,
-                "rows": len(rows3),
-                "headers": len(headers3),
-                "service_version": SERVICE_VERSION,
-                "request_id": rid,
-            }
+        cells_updated = write_grid_chunked(spreadsheet_id, sheet_name, start_cell, grid, value_input=value_input)
 
-        # 2) POST-CLEAR trailing rows ONLY after successful write (zero-data-loss)
         if clear:
-            try:
-                start_col, start_row = parse_a1_cell(start_cell)
-                end_col = compute_clear_end_col(start_col, len(headers3)) if _CONFIG.smart_clear else _CONFIG.clear_end_col
-
-                # Clear only AFTER last written row to remove old leftovers (never clears new data).
-                last_written_row = start_row + len(grid) - 1  # includes header row
-                tail_start_row = last_written_row + 1
-                if tail_start_row <= _CONFIG.clear_end_row:
-                    tail_range = f"{safe_sheet_name(sheet_name)}!{a1(start_col, tail_start_row)}:{end_col}{_CONFIG.clear_end_row}"
-                    clear_range(spreadsheet_id, tail_range)
-
-                # Also clear header row extra columns to the right (optional, conservative)
-                # (We only clear from end_col+1 to configured clear_end_col if smart_clear is ON)
-                if _CONFIG.smart_clear:
-                    try:
-                        end_idx = col_to_index(end_col)
-                        cfg_end_idx = col_to_index(_CONFIG.clear_end_col)
-                        if cfg_end_idx > end_idx:
-                            right_start_col = index_to_col(end_idx + 1)
-                            hdr_right_range = f"{safe_sheet_name(sheet_name)}!{a1(right_start_col, start_row)}:{_CONFIG.clear_end_col}{start_row}"
-                            clear_range(spreadsheet_id, hdr_right_range)
-                    except Exception:
-                        pass
-
-            except Exception as e:
-                logger.warning("Post-clear failed (continuing): %s", e)
+            _post_clear_trailing(spreadsheet_id, sheet_name, start_cell, headers_len=len(headers3), rows_written=len(rows3))
 
         backend_status = (_strip(response.get("status")) or "success").lower()
         final_status = "partial" if backend_status in ("error", "partial") else "skipped" if backend_status == "skipped" else "success"
@@ -1813,26 +2474,27 @@ def _refresh_logic(
             "mode": mode or "",
             "rows_written": len(rows3),
             "headers_count": len(headers3),
-            "cells_updated": cells_updated,
+            "cells_updated": int(cells_updated or 0),
             "backend_status": backend_status,
             "backend_error": response.get("error"),
             "backend_chunk_size": _CONFIG.backend_max_symbols_per_call,
             "safe_mode": _CONFIG.safe_mode.value,
-            "elapsed_ms": int((time.time() - start_time) * 1000),
+            "preserve_columns": list(_CONFIG.preserve_columns),
+            "elapsed_ms": int((time.time() - t0) * 1000),
             "service_version": SERVICE_VERSION,
-            "request_id": rid,
+            "request_id": request_id,
         }
 
     except Exception as e:
-        logger.exception("Refresh logic failed: %s", e)
+        logger.exception("Refresh failed: %s", e)
         return {
             "status": "error",
             "error": str(e),
             "endpoint": endpoint,
             "sheet": sheet_name,
-            "elapsed_ms": int((time.time() - start_time) * 1000),
+            "elapsed_ms": int((time.time() - t0) * 1000),
             "service_version": SERVICE_VERSION,
-            "request_id": rid,
+            "request_id": request_id,
         }
 
 
@@ -1841,11 +2503,7 @@ def _refresh_logic(
 # ---------------------------------------------------------------------------
 @track_operation("refresh_enriched")
 def refresh_sheet_with_enriched_quotes(
-    spreadsheet_id: str = "",
-    sheet_name: str = "",
-    tickers: Sequence[str] = (),
-    sid: str = "",
-    **kwargs,
+    spreadsheet_id: str = "", sheet_name: str = "", tickers: Sequence[str] = (), sid: str = "", **kwargs
 ) -> Dict[str, Any]:
     spreadsheet_id = _strip(spreadsheet_id or sid or _CONFIG.default_spreadsheet_id)
     return _refresh_logic("/v1/enriched/sheet-rows", spreadsheet_id, sheet_name, tickers, **kwargs)
@@ -1853,11 +2511,7 @@ def refresh_sheet_with_enriched_quotes(
 
 @track_operation("refresh_ai")
 def refresh_sheet_with_ai_analysis(
-    spreadsheet_id: str = "",
-    sheet_name: str = "",
-    tickers: Sequence[str] = (),
-    sid: str = "",
-    **kwargs,
+    spreadsheet_id: str = "", sheet_name: str = "", tickers: Sequence[str] = (), sid: str = "", **kwargs
 ) -> Dict[str, Any]:
     spreadsheet_id = _strip(spreadsheet_id or sid or _CONFIG.default_spreadsheet_id)
     return _refresh_logic("/v1/analysis/sheet-rows", spreadsheet_id, sheet_name, tickers, **kwargs)
@@ -1865,17 +2519,13 @@ def refresh_sheet_with_ai_analysis(
 
 @track_operation("refresh_advanced")
 def refresh_sheet_with_advanced_analysis(
-    spreadsheet_id: str = "",
-    sheet_name: str = "",
-    tickers: Sequence[str] = (),
-    sid: str = "",
-    **kwargs,
+    spreadsheet_id: str = "", sheet_name: str = "", tickers: Sequence[str] = (), sid: str = "", **kwargs
 ) -> Dict[str, Any]:
     spreadsheet_id = _strip(spreadsheet_id or sid or _CONFIG.default_spreadsheet_id)
     return _refresh_logic("/v1/advanced/sheet-rows", spreadsheet_id, sheet_name, tickers, **kwargs)
 
 
-# Thread-isolated async execution (reused pool; no per-call pool creation)
+# Thread-isolated async execution (reused pool)
 _ASYNC_EXECUTOR = None
 _ASYNC_EXECUTOR_LOCK = threading.Lock()
 
@@ -1886,7 +2536,9 @@ def _get_async_executor():
         if _ASYNC_EXECUTOR is None:
             import concurrent.futures
 
-            _ASYNC_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=coerce_int(os.getenv("SHEETS_ASYNC_MAX_WORKERS", "5"), 5, lo=1, hi=50))
+            _ASYNC_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+                max_workers=coerce_int(os.getenv("SHEETS_ASYNC_MAX_WORKERS", "5"), 5, lo=1, hi=50)
+            )
         return _ASYNC_EXECUTOR
 
 
@@ -1907,6 +2559,78 @@ async def refresh_sheet_with_advanced_analysis_async(*args, **kwargs) -> Any:
     return await _run_async(refresh_sheet_with_advanced_analysis, *args, **kwargs)
 
 
+
+def get_rows_for_sheet(
+    sheet_name: str,
+    spreadsheet_id: str = "",
+    *,
+    limit: int = 5000,
+    start_cell: str = "A5",
+    sheet: Optional[str] = None,
+    page: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Read data rows from a Google Sheets tab and return as a list of dicts.
+    Discoverable by data_engine_v2.py external rows reader.
+    """
+    effective_name = _strip(sheet_name or sheet or page or "")
+    if not effective_name:
+        return []
+
+    spreadsheet_id = _strip(spreadsheet_id or _CONFIG.default_spreadsheet_id)
+    if not spreadsheet_id:
+        logger.debug("get_rows_for_sheet: no spreadsheet_id configured")
+        return []
+
+    try:
+        effective_name = core_normalize_page(effective_name, allow_output_pages=True)
+    except Exception:
+        pass
+
+    try:
+        start_col, start_row = parse_a1_cell(_strip(start_cell) or "A5")
+        sheet_a1 = safe_sheet_name(effective_name)
+
+        header_range = f"{sheet_a1}!{a1(start_col, start_row)}:{_CONFIG.clear_end_col}{start_row}"
+        header_vals = read_range(spreadsheet_id, header_range)
+        if not header_vals or not header_vals[0]:
+            return []
+        headers = [str(x).strip() for x in header_vals[0] if str(x).strip()]
+        if not headers:
+            return []
+
+        data_start = start_row + 1
+        data_end = data_start + max(1, min(int(limit or 5000), 5000)) - 1
+        data_range = f"{sheet_a1}!{a1(start_col, data_start)}:{_CONFIG.clear_end_col}{data_end}"
+        data_vals = read_range(spreadsheet_id, data_range)
+
+        rows_out: List[Dict[str, Any]] = []
+        for row_cells in (data_vals or []):
+            if not any(str(x).strip() for x in (row_cells or [])):
+                continue
+            row_dict: Dict[str, Any] = {}
+            for i, h in enumerate(headers):
+                val = row_cells[i] if i < len(row_cells) else None
+                if val is not None and str(val).strip():
+                    row_dict[h] = val
+            if row_dict:
+                rows_out.append(row_dict)
+            if len(rows_out) >= int(limit or 5000):
+                break
+
+        logger.debug("get_rows_for_sheet: %s -> %d rows", effective_name, len(rows_out))
+        return rows_out
+
+    except Exception as e:
+        logger.warning("get_rows_for_sheet failed for '%s': %s", effective_name, e)
+        return []
+
+
+# Aliases for data_engine_v2.py rows reader discovery
+read_rows_for_sheet = get_rows_for_sheet
+get_sheet_rows = get_rows_for_sheet
+
+
 def get_service_status() -> Dict[str, Any]:
     client = None
     try:
@@ -1924,14 +2648,22 @@ def get_service_status() -> Dict[str, Any]:
             "max_rows_per_write": _CONFIG.max_rows_per_write,
             "use_batch_update": _CONFIG.use_batch_update,
             "httpx_enabled": bool(client is not None),
-            "orjson_enabled": bool(_HAS_ORJSON),
+            "preserve_columns": list(_CONFIG.preserve_columns),
+            "preserve_max_rows_scan": _CONFIG.preserve_max_rows_scan,
+            "ensure_tabs_exist": _CONFIG.ensure_tabs_exist,
+            "ensure_headers_match_schema": _CONFIG.ensure_headers_match_schema,
+            "init_retry_cooldown_sec": _SHEETS_INIT_RETRY_COOLDOWN_SEC,
+            "allow_extra_columns": _CONFIG.allow_extra_columns,
+            "insights_criteria_enabled": _CONFIG.insights_criteria_enabled,
         },
         "circuit_breaker": _backend_client.circuit_breaker.get_state(),
+        "sheets_client": _sheets_client.status(),   # FIX v5.5.3: expose failure/cooldown state
         "telemetry": _telemetry.get_stats() if _CONFIG.enable_telemetry else {},
-        "has_core_schemas": _HAS_CORE,
+        "has_orjson": _HAS_ORJSON,
         "has_httpx": _HAS_HTTPX,
         "has_prometheus": _PROMETHEUS_AVAILABLE,
         "has_otel": _OTEL_AVAILABLE,
+        "has_schema_core": _HAS_CORE,
     }
 
 
@@ -1951,7 +2683,6 @@ def close() -> None:
         _sheets_client.close()
     except Exception:
         pass
-    # Executor intentionally kept alive for process lifetime
 
 
 __all__ = [
@@ -1963,10 +2694,17 @@ __all__ = [
     "SafeModeLevel",
     "SheetsServiceConfig",
     "get_sheets_service",
+    "reset_sheets_service",       # v5.5.3
+    "get_rows_for_sheet",         # v5.5.3
+    "read_rows_for_sheet",        # alias
+    "get_sheet_rows",             # alias
     "read_range",
+    "read_ranges_batch",
     "write_range",
     "clear_range",
     "write_grid_chunked",
+    "ensure_canonical_tabs_exist",
+    "ensure_headers_and_formatting",
     "refresh_sheet_with_enriched_quotes",
     "refresh_sheet_with_ai_analysis",
     "refresh_sheet_with_advanced_analysis",
