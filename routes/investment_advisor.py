@@ -2,31 +2,26 @@
 """
 routes/investment_advisor.py
 ================================================================================
-ADVANCED INVESTMENT ADVISOR ROUTER — v2.14.0
+ADVANCED INVESTMENT ADVISOR ROUTER — v2.13.1
 ================================================================================
-BRIDGE-FIRST • ROOT-OWNER ALIGNED • PAGE-AWARE TIMEOUTS • FAIL-SOFT
-AUTH-TOLERANT • GET+POST CANONICAL ALIASES • JSON-SAFE • STARTUP-SAFE
+BRIDGE-FIRST • ROOT-OWNER ALIGNED • TOP10 FAIL-SOFT • STARTUP-SAFE
+AUTH-TOLERANT • GET+POST CANONICAL ALIASES • JSON-SAFE
 
 Purpose
 -------
-Own the /v1/advanced family while delegating sheet-row execution to the canonical
-root owner in routes.advanced_analysis. This router should never turn a bridge
-slowdown into a hard 502 for the caller when a schema-safe partial payload can
-be returned instead.
+This router is the /v1/advanced owner, but it now delegates sheet-row execution
+to the canonical root owner in routes.advanced_analysis instead of trying to
+rebuild Top_10_Investments locally.
 
-What this revision improves
----------------------------
-- FIX: adds page-aware timeout defaults with per-page env overrides so the outer
-       /v1/advanced timeout does not undercut the inner root-owner fail-soft path.
-- FIX: supports X-API-Key as an auth header alias in addition to X-APP-TOKEN and
-       Authorization: Bearer.
-- FIX: retries alternate bridge call signatures only for real signature-mismatch
-       TypeErrors; non-signature exceptions bubble to the bounded partial handler.
-- FIX: preserves bridge detail/error text in bounded partial payloads for easier
-       diagnostics.
-- FIX: normalizes empty special-page payloads (Insights / Top10 / Data Dictionary)
-       to stable partial/schema envelopes instead of ambiguous empty-success shapes.
-- FIX: propagates mode / include_matrix / schema_only / headers_only consistently.
+Why this revision
+-----------------
+- FIX: keeps the canonical root-owner bridge first while preserving bounded
+       partial payloads instead of bubbling 502/5xx on bridge failure.
+- FIX: stops masking non-TypeError bridge exceptions during signature probing.
+- FIX: downgrades empty bridge payloads for Top_10_Investments,
+       Insights_Analysis, and Data_Dictionary to partial with warnings.
+- FIX: aligns fallback schema keys with the canonical engine contract
+       (for example open_price, week_52_high, pb_ratio, ps_ratio, peg_ratio).
 - SAFE: no import-time network work and no hard dependency on optional modules.
 """
 
@@ -34,6 +29,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
 import logging
 import math
 import os
@@ -74,10 +70,16 @@ KNOWN_CANONICAL_HEADER_COUNTS: Dict[str, int] = {
     "Commodities_FX": 80,
     "Mutual_Funds": 80,
     "My_Portfolio": 80,
-    INSIGHTS_PAGE_NAME: 7,
-    TOP10_PAGE_NAME: 83,
-    DATA_DICTIONARY_PAGE_NAME: 9,
+    "Insights_Analysis": 7,
+    "Top_10_Investments": 83,
+    "Data_Dictionary": 9,
 }
+
+TOP10_SPECIAL_FIELDS: Tuple[str, ...] = (
+    "top10_rank",
+    "selection_reason",
+    "criteria_snapshot",
+)
 
 PAGE_ALIAS_MAP: Dict[str, str] = {
     "top10": TOP10_PAGE_NAME,
@@ -149,9 +151,7 @@ except Exception:  # pragma: no cover
     def get_settings_cached(*args: Any, **kwargs: Any) -> Any:  # type: ignore
         return None
 
-# -----------------------------------------------------------------------------
-# Minimal schema fallbacks
-# -----------------------------------------------------------------------------
+
 _CANONICAL_TOP10_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("symbol", "Symbol"),
     ("name", "Name"),
@@ -258,12 +258,10 @@ _CANONICAL_DATA_DICTIONARY_SCHEMA_FALLBACK: List[Tuple[str, str]] = [
     ("source", "Source"),
     ("notes", "Notes"),
 ]
+
 _SCHEMA_CACHE: Dict[str, Tuple[List[str], List[str]]] = {}
 
 
-# -----------------------------------------------------------------------------
-# Generic helpers
-# -----------------------------------------------------------------------------
 def _s(v: Any) -> str:
     if v is None:
         return ""
@@ -292,15 +290,6 @@ def _safe_int(v: Any, default: int) -> int:
         if v is None or isinstance(v, bool):
             return default
         return int(float(v))
-    except Exception:
-        return default
-
-
-def _safe_float(v: Any, default: float) -> float:
-    try:
-        if v is None or isinstance(v, bool):
-            return default
-        return float(v)
     except Exception:
         return default
 
@@ -338,7 +327,14 @@ def _normalize_symbol_list(value: Any) -> List[str]:
     if isinstance(value, str):
         return _dedupe_keep_order(x for x in re.split(r"[\s,;]+", value) if _s(x))
     if isinstance(value, (list, tuple, set)):
-        return _dedupe_keep_order(_s(item) for item in value)
+        out: List[str] = []
+        seen = set()
+        for item in value:
+            part = _s(item)
+            if part and part not in seen:
+                seen.add(part)
+                out.append(part)
+        return out
     s = _s(value)
     return [s] if s else []
 
@@ -407,29 +403,6 @@ def _json_safe(value: Any) -> Any:
     return _clean(value)
 
 
-def _canonicalize_name(raw: str) -> str:
-    text = _s(raw).lower()
-    text = re.sub(r"[\s\-]+", "_", text)
-    text = re.sub(r"_+", "_", text)
-    return text.strip("_")
-
-
-def _normalize_page_name(value: Any) -> str:
-    raw = _s(value)
-    if not raw:
-        return TOP10_PAGE_NAME
-    try:
-        from core.sheets.page_catalog import normalize_page_name as normalize_from_catalog  # type: ignore
-
-        normalized = _s(normalize_from_catalog(raw))
-        if normalized:
-            return normalized
-    except Exception:
-        pass
-    compact = _canonicalize_name(raw)
-    return PAGE_ALIAS_MAP.get(compact, PAGE_ALIAS_MAP.get(raw.strip().lower(), raw))
-
-
 def _page_family(page: str) -> str:
     normalized = _normalize_page_name(page)
     if normalized == TOP10_PAGE_NAME:
@@ -443,6 +416,36 @@ def _page_family(page: str) -> str:
     return ROUTE_FAMILY_NAME
 
 
+def _canonicalize_name(raw: str) -> str:
+    text = _s(raw).lower()
+    text = re.sub(r"[\s\-]+", "_", text)
+    text = re.sub(r"_+", "_", text)
+    return text.strip("_")
+
+
+def _normalize_page_name(value: Any) -> str:
+    raw = _s(value)
+    if not raw:
+        return TOP10_PAGE_NAME
+
+    # FIX v2.14.0: multi-path fallback for page_catalog
+    for _pcat_path in ("core.sheets.page_catalog", "core.page_catalog", "page_catalog"):
+        try:
+            import importlib as _il2
+            _pcat = _il2.import_module(_pcat_path)
+            _normalize_fn = getattr(_pcat, "normalize_page_name", None)
+            if callable(_normalize_fn):
+                normalized = _s(_normalize_fn(raw))
+                if normalized:
+                    return normalized
+            break
+        except Exception:
+            continue
+
+    compact = _canonicalize_name(raw)
+    return PAGE_ALIAS_MAP.get(compact, PAGE_ALIAS_MAP.get(raw.strip().lower(), raw))
+
+
 def _source_pages_only(values: Sequence[str]) -> List[str]:
     out: List[str] = []
     seen = set()
@@ -454,35 +457,6 @@ def _source_pages_only(values: Sequence[str]) -> List[str]:
     return out
 
 
-def _is_signature_mismatch_typeerror(exc: TypeError) -> bool:
-    msg = _s(exc).lower()
-    if not msg:
-        return False
-    markers = (
-        "unexpected keyword",
-        "positional argument",
-        "required positional argument",
-        "takes no keyword",
-        "takes from",
-        "takes exactly",
-        "got an unexpected keyword",
-        "got multiple values for argument",
-        "missing 1 required positional argument",
-        "missing required positional argument",
-        "keyword-only argument",
-    )
-    return any(marker in msg for marker in markers)
-
-
-def _extract_error_text(exc: Exception) -> str:
-    base = exc.__class__.__name__
-    detail = _s(exc)
-    return f"{base}: {detail}" if detail else base
-
-
-# -----------------------------------------------------------------------------
-# Schema helpers
-# -----------------------------------------------------------------------------
 def _schema_fallback_for_page(page: str) -> Tuple[List[str], List[str]]:
     family = _page_family(page)
     if family == "top10":
@@ -499,11 +473,13 @@ def _schema_fallback_for_page(page: str) -> Tuple[List[str], List[str]]:
 def _extract_schema_headers_keys_from_spec(spec: Any) -> Tuple[List[str], List[str]]:
     if spec is None:
         return [], []
+
     if isinstance(spec, Mapping):
         headers = spec.get("headers") or spec.get("display_headers") or spec.get("sheet_headers") or []
         keys = spec.get("keys") or spec.get("fields") or []
         if isinstance(headers, list) and isinstance(keys, list) and headers and keys:
             return [_s(x) for x in headers if _s(x)], [_s(x) for x in keys if _s(x)]
+
         columns = spec.get("columns")
         if isinstance(columns, list) and columns:
             headers_out: List[str] = []
@@ -525,29 +501,39 @@ def _extract_schema_headers_keys_from_spec(spec: Any) -> Tuple[List[str], List[s
                 headers_out.append(header)
             if headers_out and keys_out:
                 return headers_out, keys_out
+
         for nested_key in ("sheet", "spec", "schema", "contract", "definition"):
             nested = spec.get(nested_key)
-            h2, k2 = _extract_schema_headers_keys_from_spec(nested)
-            if h2 and k2:
-                return h2, k2
+            headers2, keys2 = _extract_schema_headers_keys_from_spec(nested)
+            if headers2 and keys2:
+                return headers2, keys2
+
     return [], []
 
 
 def _load_schema_defaults(page: str) -> Tuple[List[str], List[str]]:
     page = _normalize_page_name(page)
-    cached = _SCHEMA_CACHE.get(page)
-    if cached:
-        return list(cached[0]), list(cached[1])
-    try:
-        from core.sheets.schema_registry import get_sheet_spec  # type: ignore
+    if page in _SCHEMA_CACHE:
+        headers, keys = _SCHEMA_CACHE[page]
+        return list(headers), list(keys)
 
-        spec = get_sheet_spec(page)
-        headers, keys = _extract_schema_headers_keys_from_spec(spec)
-        if headers and keys:
-            _SCHEMA_CACHE[page] = (list(headers), list(keys))
-            return headers, keys
-    except Exception:
-        pass
+    # FIX v2.14.0: multi-path fallback for schema_registry
+    for _sreg_path in ("core.sheets.schema_registry", "core.schema_registry", "schema_registry"):
+        try:
+            import importlib as _il
+            _sreg = _il.import_module(_sreg_path)
+            get_sheet_spec = getattr(_sreg, "get_sheet_spec", None)
+            if not callable(get_sheet_spec):
+                continue
+            spec = get_sheet_spec(page)
+            headers, keys = _extract_schema_headers_keys_from_spec(spec)
+            if headers and keys:
+                _SCHEMA_CACHE[page] = (list(headers), list(keys))
+                return headers, keys
+            break
+        except Exception:
+            continue
+
     headers, keys = _schema_fallback_for_page(page)
     _SCHEMA_CACHE[page] = (list(headers), list(keys))
     return headers, keys
@@ -556,6 +542,7 @@ def _load_schema_defaults(page: str) -> Tuple[List[str], List[str]]:
 def _rows_present(payload: Any) -> bool:
     if not isinstance(payload, Mapping):
         return False
+
     for key in ("rows", "row_objects", "records", "results", "items", "quotes", "data", "rows_matrix"):
         value = payload.get(key)
         if isinstance(value, list) and len(value) > 0:
@@ -563,9 +550,6 @@ def _rows_present(payload: Any) -> bool:
     return False
 
 
-# -----------------------------------------------------------------------------
-# Stable envelope helpers
-# -----------------------------------------------------------------------------
 def _make_meta(
     *,
     request_id: str,
@@ -606,6 +590,7 @@ def _make_schema_only_response(
     headers, keys = _load_schema_defaults(page)
     rows: List[Dict[str, Any]] = []
     matrix: Optional[List[List[Any]]] = [] if include_matrix else None
+
     return jsonable_encoder(
         {
             "status": "success",
@@ -643,13 +628,6 @@ def _make_schema_only_response(
     )
 
 
-def _append_warning(meta: Dict[str, Any], warning: str) -> None:
-    warnings = _normalize_list(meta.get("warnings"))
-    if warning and warning not in warnings:
-        warnings.append(warning)
-    meta["warnings"] = warnings
-
-
 def _make_partial_response(
     page: str,
     *,
@@ -658,23 +636,24 @@ def _make_partial_response(
     bridge_source: str,
     bridge_name: str,
     warning: str,
-    detail: str = "",
     extra_meta: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     headers, keys = _load_schema_defaults(page)
     rows: List[Dict[str, Any]] = []
     matrix: Optional[List[List[Any]]] = [] if include_matrix else None
+
     meta = _make_meta(
         request_id=request_id,
         page=page,
         status_out="partial",
         bridge_source=bridge_source,
         bridge_name=bridge_name,
-        warnings=[warning] if warning else [],
+        warnings=[warning],
         timeout_sec=0.0,
     )
     if isinstance(extra_meta, Mapping):
         meta.update(jsonable_encoder(extra_meta))
+
     return jsonable_encoder(
         {
             "status": "partial",
@@ -697,8 +676,6 @@ def _make_partial_response(
             "items": rows,
             "quotes": rows,
             "rows_matrix": matrix,
-            "detail": detail or warning,
-            "error": detail or warning,
             "version": INVESTMENT_ADVISOR_VERSION,
             "request_id": request_id,
             "meta": meta,
@@ -706,9 +683,6 @@ def _make_partial_response(
     )
 
 
-# -----------------------------------------------------------------------------
-# Auth helpers
-# -----------------------------------------------------------------------------
 def _is_public_path(path: str) -> bool:
     p = _s(path)
     if not p:
@@ -727,13 +701,7 @@ def _is_public_path(path: str) -> bool:
     return False
 
 
-def _extract_auth_token(
-    *,
-    token_query: Optional[str],
-    x_app_token: Optional[str],
-    x_api_key: Optional[str],
-    authorization: Optional[str],
-) -> str:
+def _extract_auth_token(*, token_query: Optional[str], x_app_token: Optional[str], x_api_key: Optional[str] = None, authorization: Optional[str]) -> str:  # FIX v2.14.0
     token = _s(x_app_token) or _s(x_api_key)
     authz = _s(authorization)
     if authz.lower().startswith("bearer "):
@@ -759,6 +727,7 @@ def _is_open_mode_enabled() -> bool:
             return bool(result)
     except Exception:
         pass
+
     for name in ("OPEN_MODE", "TFB_OPEN_MODE", "AUTH_DISABLED"):
         env_v = _s(os.getenv(name))
         if env_v:
@@ -766,36 +735,30 @@ def _is_open_mode_enabled() -> bool:
     return False
 
 
-def _auth_passed(
-    *,
-    request: Request,
-    token_query: Optional[str],
-    x_app_token: Optional[str],
-    x_api_key: Optional[str],
-    authorization: Optional[str],
-) -> bool:
+def _auth_passed(*, request: Request, token_query: Optional[str], x_app_token: Optional[str], authorization: Optional[str]) -> bool:
     if _is_open_mode_enabled():
         return True
+
     try:
         path = str(getattr(getattr(request, "url", None), "path", "") or "")
     except Exception:
         path = ""
+
     if _is_public_path(path):
         return True
+
     if auth_ok is None:
         return True
-    auth_token = _extract_auth_token(
-        token_query=token_query,
-        x_app_token=x_app_token,
-        x_api_key=x_api_key,
-        authorization=authorization,
-    )
+
+    auth_token = _extract_auth_token(token_query=token_query, x_app_token=x_app_token, authorization=authorization)
     headers_dict = dict(request.headers)
+
     settings = None
     try:
         settings = get_settings_cached()
     except Exception:
         settings = None
+
     attempts = [
         {
             "token": auth_token or None,
@@ -812,6 +775,7 @@ def _auth_passed(
         {"token": auth_token or None},
         {},
     ]
+
     for kwargs in attempts:
         try:
             return bool(auth_ok(**kwargs))
@@ -819,30 +783,15 @@ def _auth_passed(
             continue
         except Exception:
             return False
+
     return False
 
 
-def _require_auth_or_401(
-    *,
-    request: Request,
-    token_query: Optional[str],
-    x_app_token: Optional[str],
-    x_api_key: Optional[str],
-    authorization: Optional[str],
-) -> None:
-    if not _auth_passed(
-        request=request,
-        token_query=token_query,
-        x_app_token=x_app_token,
-        x_api_key=x_api_key,
-        authorization=authorization,
-    ):
+def _require_auth_or_401(*, request: Request, token_query: Optional[str], x_app_token: Optional[str], authorization: Optional[str]) -> None:
+    if not _auth_passed(request=request, token_query=token_query, x_app_token=x_app_token, authorization=authorization):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
 
-# -----------------------------------------------------------------------------
-# Engine + bridge helpers
-# -----------------------------------------------------------------------------
 async def _get_engine(request: Request) -> Optional[Any]:
     try:
         st = getattr(request.app, "state", None)
@@ -852,6 +801,7 @@ async def _get_engine(request: Request) -> Optional[Any]:
             return st.data_engine
     except Exception:
         pass
+
     for modpath in ("core.data_engine_v2", "core.data_engine", "core.investment_advisor_engine"):
         try:
             mod = import_module(modpath)
@@ -888,67 +838,23 @@ async def _resolve_bridge_impl() -> Tuple[Optional[Any], str, str]:
     return None, "", ""
 
 
-async def _call_candidate(
-    fn: Any,
-    *,
-    body: Dict[str, Any],
-    request: Request,
-    page: str,
-    limit: int,
-    offset: int,
-    schema_only: bool,
-    headers_only: bool,
-    mode: str,
-) -> Any:
+async def _call_candidate(fn: Any, *, body: Dict[str, Any], request: Request, page: str, limit: int, offset: int, schema_only: bool) -> Any:
     if not callable(fn):
         return None
+
     kwargs_variants = [
-        {
-            "request": request,
-            "body": body,
-            "page": page,
-            "limit": limit,
-            "offset": offset,
-            "schema_only": schema_only,
-            "headers_only": headers_only,
-            "mode": mode,
-        },
-        {
-            "request": request,
-            "payload": body,
-            "page": page,
-            "limit": limit,
-            "offset": offset,
-            "schema_only": schema_only,
-            "headers_only": headers_only,
-            "mode": mode,
-        },
-        {
-            "request": request,
-            "page": page,
-            "limit": limit,
-            "offset": offset,
-            "schema_only": schema_only,
-            "headers_only": headers_only,
-            "mode": mode,
-            **body,
-        },
-        {
-            "page": page,
-            "limit": limit,
-            "offset": offset,
-            "schema_only": schema_only,
-            "headers_only": headers_only,
-            "mode": mode,
-            **body,
-        },
-        {"request": request, "body": body, "mode": mode},
-        {"payload": body, "mode": mode},
+        {"request": request, "body": body, "page": page, "limit": limit, "offset": offset, "schema_only": schema_only},
+        {"request": request, "payload": body, "page": page, "limit": limit, "offset": offset, "schema_only": schema_only},
+        {"request": request, "page": page, "limit": limit, "offset": offset, "schema_only": schema_only, **body},
+        {"page": page, "limit": limit, "offset": offset, "schema_only": schema_only, **body},
+        {"request": request, "body": body},
+        {"payload": body},
         {"request": request, **body},
         body,
         {},
     ]
-    last_type_error: Optional[TypeError] = None
+
+    last_type_error: Optional[Exception] = None
     for kwargs in kwargs_variants:
         try:
             result = fn(**kwargs)
@@ -956,53 +862,39 @@ async def _call_candidate(
                 result = await result
             return result
         except TypeError as exc:
-            if _is_signature_mismatch_typeerror(exc):
-                last_type_error = exc
-                continue
-            raise
+            last_type_error = exc
+            continue
         except Exception:
             raise
+
     if last_type_error is not None:
         raise last_type_error
     return None
 
 
-def _page_timeout_env_candidates(page: str) -> List[str]:
-    family = _page_family(page).upper()
-    page_norm = _normalize_page_name(page).upper()
-    page_norm = re.sub(r"[^A-Z0-9]+", "_", page_norm)
-    return [
-        f"TFB_ADV_BRIDGE_TIMEOUT_SEC_{page_norm}",
-        f"TFB_ADV_BRIDGE_TIMEOUT_SEC_{family}",
-        "TFB_ADV_BRIDGE_TIMEOUT_SEC",
-    ]
-
-
 def _bridge_timeout_for_page(page: str) -> float:
     page = _normalize_page_name(page)
-    family = _page_family(page)
-    defaults = {
-        "top10": 26.0,
-        "insights": 24.0,
-        "data_dictionary": 8.0,
-        "source": 18.0,
-        ROUTE_FAMILY_NAME: 18.0,
-    }
-    default = defaults.get(family, 18.0)
-    for env_name in _page_timeout_env_candidates(page):
-        raw = os.getenv(env_name)
-        if not _s(raw):
-            continue
-        try:
-            return max(0.5, float(raw))
-        except Exception:
-            continue
-    return default
+    if page == TOP10_PAGE_NAME:
+        default = 20.0
+    elif page == DATA_DICTIONARY_PAGE_NAME:
+        default = 12.0
+    else:
+        default = 15.0
+
+    try:
+        env_value = float(os.getenv("TFB_ADV_BRIDGE_TIMEOUT_SEC", str(default)))
+        return max(0.5, env_value)
+    except Exception:
+        return default
 
 
-# -----------------------------------------------------------------------------
-# Bridge payload normalization
-# -----------------------------------------------------------------------------
+def _append_warning(meta: Dict[str, Any], warning: str) -> None:
+    warnings = _normalize_list(meta.get("warnings"))
+    if warning not in warnings:
+        warnings.append(warning)
+    meta["warnings"] = warnings
+
+
 def _normalize_payload_from_bridge(
     payload: Any,
     *,
@@ -1014,6 +906,7 @@ def _normalize_payload_from_bridge(
     timeout_sec: float,
 ) -> Dict[str, Any]:
     page = _normalize_page_name(page)
+
     if not isinstance(payload, Mapping):
         return _make_partial_response(
             page,
@@ -1022,11 +915,10 @@ def _normalize_payload_from_bridge(
             bridge_source=bridge_source,
             bridge_name=bridge_name,
             warning="bridge returned non-mapping payload",
-            detail="bridge returned non-mapping payload",
             extra_meta={"bridge_timeout_sec": timeout_sec},
         )
 
-    out = dict(_json_safe(payload))
+    out = dict(jsonable_encoder(payload))
     out["page"] = out.get("page") or page
     out["sheet"] = out.get("sheet") or page
     out["sheet_name"] = out.get("sheet_name") or page
@@ -1047,10 +939,12 @@ def _normalize_payload_from_bridge(
 
     headers = out.get("headers") or out.get("display_headers") or []
     keys = out.get("keys") or out.get("fields") or []
+
     if not isinstance(headers, list) or not headers:
-        headers, fallback_keys = _load_schema_defaults(page)
+        headers, keys_from_schema = _load_schema_defaults(page)
         if not isinstance(keys, list) or not keys:
-            keys = fallback_keys
+            keys = keys_from_schema
+
     if not isinstance(keys, list) or not keys:
         _, keys = _load_schema_defaults(page)
 
@@ -1063,10 +957,13 @@ def _normalize_payload_from_bridge(
     out["columns"] = out.get("columns") or keys
 
     if include_matrix and out.get("rows_matrix") is None:
-        rows = out.get("row_objects") or out.get("records") or out.get("items") or out.get("data") or out.get("quotes") or out.get("results") or out.get("rows") or []
+        rows = out.get("rows") or out.get("row_objects") or out.get("records") or out.get("results") or []
         if isinstance(rows, list) and rows and isinstance(rows[0], Mapping):
-            out["rows_matrix"] = [[row.get(k) for k in keys] for row in rows]
-        else:
+            matrix = []
+            for row in rows:
+                matrix.append([row.get(k) for k in keys])
+            out["rows_matrix"] = matrix
+        elif out.get("rows_matrix") is None:
             out["rows_matrix"] = []
 
     has_rows = _rows_present(out)
@@ -1080,18 +977,12 @@ def _normalize_payload_from_bridge(
             _append_warning(out["meta"], "Data Dictionary bridge returned no rows.")
         else:
             _append_warning(out["meta"], "Bridge returned no rows.")
-        if not _s(out.get("detail")) and not _s(out.get("error")):
-            out["detail"] = "bridge returned no rows"
-            out["error"] = "bridge returned no rows"
     elif not out.get("status"):
         out["status"] = "success"
 
-    return jsonable_encoder(out)
+    return out
 
 
-# -----------------------------------------------------------------------------
-# Main bridge execution
-# -----------------------------------------------------------------------------
 async def _execute_via_bridge(
     *,
     request: Request,
@@ -1112,9 +1003,8 @@ async def _execute_via_bridge(
     include_matrix_final = _boolish(include_matrix if include_matrix is not None else body.get("include_matrix"), False)
     schema_only_final = _boolish(schema_only if schema_only is not None else body.get("schema_only"), False)
     headers_only_final = _boolish(headers_only if headers_only is not None else body.get("headers_only"), False)
-    limit_final = max(1, min(5000, _safe_int(limit if limit is not None else body.get("limit") or body.get("top_n"), 20)))
-    offset_final = max(0, _safe_int(offset if offset is not None else body.get("offset"), 0))
-    mode_final = _s(body.get("mode"))
+    limit_final = _safe_int(limit if limit is not None else body.get("limit") or body.get("top_n"), 20)
+    offset_final = _safe_int(offset if offset is not None else body.get("offset"), 0)
 
     body["limit"] = limit_final
     body["top_n"] = limit_final
@@ -1122,10 +1012,9 @@ async def _execute_via_bridge(
     body["include_matrix"] = include_matrix_final
     body["schema_only"] = schema_only_final
     body["headers_only"] = headers_only_final
-    if mode_final:
-        body["mode"] = mode_final
 
     request_id = _request_id(request, x_request_id)
+
     bridge_impl, bridge_source, bridge_name = await _resolve_bridge_impl()
 
     if schema_only_final or headers_only_final:
@@ -1135,7 +1024,7 @@ async def _execute_via_bridge(
             request_id=request_id,
             bridge_source=bridge_source,
             bridge_name=bridge_name,
-            warnings=( ["headers_only"] if headers_only_final else None ),
+            warnings=(["headers_only"] if headers_only_final else None),
         )
 
     if bridge_impl is None:
@@ -1146,10 +1035,10 @@ async def _execute_via_bridge(
             bridge_source="",
             bridge_name="",
             warning="canonical root bridge unavailable",
-            detail="canonical root bridge unavailable",
         )
 
     timeout_sec = _bridge_timeout_for_page(page)
+
     try:
         payload = await asyncio.wait_for(
             _call_candidate(
@@ -1160,8 +1049,6 @@ async def _execute_via_bridge(
                 limit=limit_final,
                 offset=offset_final,
                 schema_only=schema_only_final,
-                headers_only=headers_only_final,
-                mode=mode_final,
             ),
             timeout=timeout_sec,
         )
@@ -1173,11 +1060,9 @@ async def _execute_via_bridge(
             bridge_source=bridge_source,
             bridge_name=bridge_name,
             warning=f"bridge timeout after {timeout_sec:.1f}s",
-            detail=f"bridge timeout after {timeout_sec:.1f}s",
             extra_meta={"bridge_timeout_sec": timeout_sec},
         )
     except Exception as exc:
-        detail = _extract_error_text(exc)
         return _make_partial_response(
             page,
             include_matrix=include_matrix_final,
@@ -1185,7 +1070,6 @@ async def _execute_via_bridge(
             bridge_source=bridge_source,
             bridge_name=bridge_name,
             warning=f"bridge exception: {exc.__class__.__name__}",
-            detail=detail,
             extra_meta={"bridge_timeout_sec": timeout_sec},
         )
 
@@ -1200,9 +1084,6 @@ async def _execute_via_bridge(
     )
 
 
-# -----------------------------------------------------------------------------
-# Request-body helpers
-# -----------------------------------------------------------------------------
 def _advanced_get_body(
     *,
     page: Optional[str],
@@ -1233,6 +1114,7 @@ def _advanced_get_body(
     target_page = _normalize_page_name(page or sheet or sheet_name or name or tab or TOP10_PAGE_NAME)
     direct_symbols = _normalize_symbol_list(symbols) or _normalize_symbol_list(tickers)
     selected_pages = _normalize_list(pages) or _normalize_list(sources)
+
     return {
         "page": target_page,
         "sheet": target_page,
@@ -1260,8 +1142,62 @@ def _advanced_get_body(
     }
 
 
-def _advanced_root_has_request_filters(**kwargs: Any) -> bool:
-    for value in kwargs.values():
+def _advanced_root_has_request_filters(
+    *,
+    page: Optional[str],
+    sheet: Optional[str],
+    sheet_name: Optional[str],
+    name: Optional[str],
+    tab: Optional[str],
+    symbols: Optional[str],
+    tickers: Optional[str],
+    pages: Optional[str],
+    sources: Optional[str],
+    risk_level: Optional[str],
+    risk_profile: Optional[str],
+    confidence_level: Optional[str],
+    confidence_bucket: Optional[str],
+    investment_period_days: Optional[int],
+    horizon_days: Optional[int],
+    min_expected_roi: Optional[float],
+    min_roi: Optional[float],
+    min_confidence: Optional[float],
+    top_n: Optional[int],
+    limit: Optional[int],
+    offset: Optional[int],
+    mode: str,
+    include_matrix: Optional[bool],
+    schema_only: Optional[bool],
+    headers_only: Optional[bool],
+) -> bool:
+    values = [
+        page,
+        sheet,
+        sheet_name,
+        name,
+        tab,
+        symbols,
+        tickers,
+        pages,
+        sources,
+        risk_level,
+        risk_profile,
+        confidence_level,
+        confidence_bucket,
+        investment_period_days,
+        horizon_days,
+        min_expected_roi,
+        min_roi,
+        min_confidence,
+        top_n,
+        limit,
+        offset,
+        mode,
+        include_matrix,
+        schema_only,
+        headers_only,
+    ]
+    for value in values:
         if value is None:
             continue
         if isinstance(value, str) and not value.strip():
@@ -1273,6 +1209,7 @@ def _advanced_root_has_request_filters(**kwargs: Any) -> bool:
 async def _advanced_root_summary(request: Request) -> Dict[str, Any]:
     engine = await _get_engine(request)
     bridge_impl, bridge_source, bridge_name = await _resolve_bridge_impl()
+
     return jsonable_encoder(
         {
             "status": "success" if bridge_impl else "degraded",
@@ -1305,9 +1242,6 @@ async def _advanced_root_summary(request: Request) -> Dict[str, Any]:
     )
 
 
-# -----------------------------------------------------------------------------
-# Endpoints
-# -----------------------------------------------------------------------------
 @router.get("")
 async def advanced_root_get(
     request: Request,
@@ -1339,17 +1273,11 @@ async def advanced_root_get(
     headers_only: Optional[bool] = Query(default=None),
     token: Optional[str] = Query(default=None),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),  # FIX v2.14.0
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
-    _require_auth_or_401(
-        request=request,
-        token_query=token,
-        x_app_token=x_app_token,
-        x_api_key=x_api_key,
-        authorization=authorization,
-    )
+    _require_auth_or_401(request=request, token_query=token, x_app_token=x_app_token, authorization=authorization)
 
     has_filters = _advanced_root_has_request_filters(
         page=page,
@@ -1410,8 +1338,6 @@ async def advanced_root_get(
         schema_only=schema_only,
         headers_only=headers_only,
     )
-    if mode:
-        body["mode"] = mode
 
     payload = await _execute_via_bridge(
         request=request,
@@ -1440,23 +1366,14 @@ async def advanced_root_post(
     headers_only: Optional[bool] = Query(default=None),
     token: Optional[str] = Query(default=None),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),  # FIX v2.14.0
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
-    _require_auth_or_401(
-        request=request,
-        token_query=token,
-        x_app_token=x_app_token,
-        x_api_key=x_api_key,
-        authorization=authorization,
-    )
-    body = dict(body or {})
-    if mode and not body.get("mode"):
-        body["mode"] = mode
+    _require_auth_or_401(request=request, token_query=token, x_app_token=x_app_token, authorization=authorization)
     payload = await _execute_via_bridge(
         request=request,
-        body=body,
+        body=dict(body or {}),
         include_matrix=include_matrix,
         limit=limit,
         offset=offset,
@@ -1536,20 +1453,15 @@ async def advanced_request_post(
     headers_only: Optional[bool] = Query(default=None),
     token: Optional[str] = Query(default=None),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),  # FIX v2.14.0
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
-    _require_auth_or_401(
-        request=request,
-        token_query=token,
-        x_app_token=x_app_token,
-        x_api_key=x_api_key,
-        authorization=authorization,
-    )
+    _require_auth_or_401(request=request, token_query=token, x_app_token=x_app_token, authorization=authorization)
     body = dict(body or {})
     if mode and not body.get("mode"):
         body["mode"] = mode
+
     payload = await _execute_via_bridge(
         request=request,
         body=body,
@@ -1596,17 +1508,12 @@ async def advanced_request_get(
     headers_only: Optional[bool] = Query(default=None),
     token: Optional[str] = Query(default=None),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
-    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),  # FIX v2.14.0
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
-    _require_auth_or_401(
-        request=request,
-        token_query=token,
-        x_app_token=x_app_token,
-        x_api_key=x_api_key,
-        authorization=authorization,
-    )
+    _require_auth_or_401(request=request, token_query=token, x_app_token=x_app_token, authorization=authorization)
+
     body = _advanced_get_body(
         page=page,
         sheet=sheet,
@@ -1635,6 +1542,7 @@ async def advanced_request_get(
     )
     if mode:
         body["mode"] = mode
+
     payload = await _execute_via_bridge(
         request=request,
         body=body,
