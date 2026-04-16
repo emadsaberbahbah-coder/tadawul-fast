@@ -55,7 +55,7 @@ except Exception:  # pragma: no cover
     BestJSONResponse = JSONResponse  # type: ignore
 
 
-SCHEMA_ROUTE_VERSION = "2.5.0"
+SCHEMA_ROUTE_VERSION = "2.6.0"
 router = APIRouter(prefix="/v1/schema", tags=["Schema"])
 
 
@@ -140,9 +140,27 @@ def _safe_import(module_name: str) -> Any:
         return None
 
 
-_schema_registry_mod = _safe_import("core.sheets.schema_registry")
-_data_dictionary_mod = _safe_import("core.sheets.data_dictionary")
-_page_catalog_mod = _safe_import("core.sheets.page_catalog")
+# FIX v2.6.0: multi-path fallback for schema_registry
+_schema_registry_mod = None
+for _p in ("core.sheets.schema_registry", "core.schema_registry", "schema_registry"):
+    _schema_registry_mod = _safe_import(_p)
+    if _schema_registry_mod is not None:
+        break
+
+# FIX v2.6.0: multi-path fallback for data_dictionary
+_data_dictionary_mod = None
+for _p in ("core.sheets.data_dictionary", "core.data_dictionary", "data_dictionary"):
+    _data_dictionary_mod = _safe_import(_p)
+    if _data_dictionary_mod is not None:
+        break
+
+# FIX v2.6.0: multi-path fallback for page_catalog
+_page_catalog_mod = None
+for _p in ("core.sheets.page_catalog", "core.page_catalog", "page_catalog"):
+    _page_catalog_mod = _safe_import(_p)
+    if _page_catalog_mod is not None:
+        break
+
 _config_mod = _safe_import("core.config")
 
 
