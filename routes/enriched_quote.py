@@ -41,7 +41,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 logger = logging.getLogger("routes.enriched_quote")
 logger.addHandler(logging.NullHandler())
 
-ROUTER_VERSION = "8.3.0"
+ROUTER_VERSION = "8.4.0"
 
 TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
     "top10_rank",
@@ -386,7 +386,7 @@ def _static_contract(page: str) -> Tuple[List[str], List[str]]:
 
 
 def _extract_contract_from_schema(page: str) -> Tuple[List[str], List[str]]:
-    for module_name in ("core.sheets.schema_registry",):
+    for module_name in ("core.sheets.schema_registry", "core.schema_registry", "schema_registry"):  # FIX v8.4.0: multi-path
         try:
             mod = importlib.import_module(module_name)
             get_sheet_spec = getattr(mod, "get_sheet_spec", None)
@@ -581,7 +581,7 @@ def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int)
     if kk in {"last_updated_utc", "last_updated_riyadh"}:
         return datetime.utcnow().isoformat()
     if kk == "recommendation":
-        return "Watch" if row_index > 3 else "Accumulate"
+        return "HOLD" if row_index > 3 else "BUY"  # FIX v8.4.0: canonical values
     if kk == "recommendation_reason":
         return "Local fail-soft row because canonical owner returned no usable rows."
     if kk in {"top10_rank", "rank_overall"}:
@@ -710,7 +710,7 @@ def _build_insights_fallback_rows(symbols: Sequence[str], limit: int, offset: in
                 "item": f"Fallback signal {idx}",
                 "symbol": sym,
                 "metric": "recommendation",
-                "value": "Watch" if idx > 2 else "Accumulate",
+                "value": "HOLD" if idx > 2 else "BUY",  # FIX v8.4.0: canonical values
                 "notes": "Generated locally because canonical owner payload was unavailable",
                 "last_updated_riyadh": stamp,
             }
@@ -755,13 +755,21 @@ class _Service:
         self._get_settings_cached = get_settings_cached
         self._is_open_mode = is_open_mode
 
-        try:
-            from core.sheets.page_catalog import get_route_family, normalize_page_name  # type: ignore
-            self.get_route_family = get_route_family
-            self.normalize_page_name = normalize_page_name
-        except Exception:
-            self.get_route_family = None
-            self.normalize_page_name = None
+        # FIX v8.4.0: multi-path fallback for page_catalog
+        self.get_route_family = None
+        self.normalize_page_name = None
+        for _pcat_path in ("core.sheets.page_catalog", "core.page_catalog", "page_catalog"):
+            try:
+                import importlib as _il
+                _pcat = _il.import_module(_pcat_path)
+                _grf = getattr(_pcat, "get_route_family", None)
+                _np  = getattr(_pcat, "normalize_page_name", None)
+                if callable(_grf):
+                    self.get_route_family   = _grf
+                    self.normalize_page_name = _np
+                    break
+            except Exception:
+                continue
 
     @staticmethod
     def _env_float(name: str, default: float) -> float:
