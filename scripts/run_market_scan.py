@@ -2,7 +2,7 @@
 """
 scripts/run_market_scan.py
 ================================================================================
-TADAWUL FAST BRIDGE — MARKET SCANNER (v5.1.0) — SCHEMA/ENGINE ALIGNED
+TADAWUL FAST BRIDGE — MARKET SCANNER (v5.2.0) — SCHEMA/ENGINE ALIGNED
 ================================================================================
 
 What this scanner does (aligned with your Phase 3–7 architecture):
@@ -368,9 +368,6 @@ class ScanConfig:
     mode: str = "engine"  # engine | http
     backend_base_url: str = ""
     token: str = ""
-    # FIX v5.2.0: timeout_sec was referenced via cfg.timeout_sec but never defined
-    # in the dataclass — http mode would crash with AttributeError on every run.
-    timeout_sec: float = 60.0
 
     # filters
     min_price: float = 1.0
@@ -419,12 +416,10 @@ class ScanConfig:
             except Exception:
                 return default
 
-        # spreadsheet_id: required; fall back to env
         spreadsheet_id = _s("spreadsheet_id") or _safe_str(os.getenv("DEFAULT_SPREADSHEET_ID", ""))
         if not spreadsheet_id:
             raise ValueError("ScanConfig.from_worker_payload: 'spreadsheet_id' is required.")
 
-        # keys: list of page keys to scan
         raw_keys = payload.get("keys") or ["Market_Leaders"]
         if isinstance(raw_keys, str):
             raw_keys = [k.strip() for k in raw_keys.split(",") if k.strip()]
@@ -441,7 +436,10 @@ class ScanConfig:
             chunk_size=_i("chunk_size", 60),
             concurrency=_i("concurrency", 10),
             mode=_s("mode", "engine"),
-            backend_base_url=(_s("backend_url") or _s("backend_base_url") or _safe_str(os.getenv("BACKEND_BASE_URL", ""))).rstrip("/"),
+            backend_base_url=(
+                _s("backend_url") or _s("backend_base_url")
+                or _safe_str(os.getenv("BACKEND_BASE_URL", ""))
+            ).rstrip("/"),
             token=_s("token") or _s("app_token"),
             timeout_sec=_f("timeout_sec", 60.0),
             min_price=_f("min_price", 1.0),
@@ -954,6 +952,7 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+
 # =============================================================================
 # Worker integration API (FIX v5.2.0)
 # =============================================================================
@@ -961,32 +960,32 @@ def _parse_args() -> argparse.Namespace:
 # Documents the expected task payload for worker.py dispatching task_type="market_scan".
 # Keys match ScanConfig.from_worker_payload() field names.
 WORKER_PAYLOAD_SCHEMA: Dict[str, Any] = {
-    "task_type": "market_scan",            # (required) always "market_scan"
-    "spreadsheet_id": "",                  # (required if DEFAULT_SPREADSHEET_ID not set)
-    "keys": ["Market_Leaders"],            # (optional) pages to scan
-    "top_n": 50,                           # (optional) top N results
-    "max_symbols": 1500,                   # (optional) max symbols to process
-    "chunk_size": 60,                      # (optional) batch size per fetch
-    "mode": "engine",                      # (optional) "engine" | "http"
-    "backend_url": "",                     # (optional) override BACKEND_BASE_URL
-    "token": "",                           # (optional) auth token
-    "timeout_sec": 60.0,                   # (optional) request timeout
-    "min_price": 1.0,                      # (optional) filter: min price
-    "min_volume": 1000.0,                  # (optional) filter: min volume
-    "max_risk_score": 60.0,                # (optional) filter: max risk score (0-100)
-    "min_confidence": 0.65,               # (optional) filter: min forecast confidence (0-1)
-    "min_expected_roi": 0.00,             # (optional) filter: min expected ROI (fraction)
-    "horizon": "3m",                       # (optional) "1m" | "3m" | "12m"
-    "w_roi": 0.55,                         # (optional) composite score weight: ROI
-    "w_conf": 0.25,                        # (optional) composite score weight: confidence
-    "w_score": 0.20,                       # (optional) composite score weight: overall_score
-    "export_json": "",                     # (optional) path to write JSON output
-    "export_csv": "",                      # (optional) path to write CSV output
-    "export_html": "",                     # (optional) path to write HTML output
+    "task_type": "market_scan",        # (required) always "market_scan"
+    "spreadsheet_id": "",              # (required if DEFAULT_SPREADSHEET_ID not set)
+    "keys": ["Market_Leaders"],        # (optional) pages to scan
+    "top_n": 50,                       # (optional) top N results
+    "max_symbols": 1500,               # (optional) max symbols to process
+    "chunk_size": 60,                  # (optional) batch size per fetch
+    "mode": "engine",                  # (optional) "engine" | "http"
+    "backend_url": "",                 # (optional) override BACKEND_BASE_URL
+    "token": "",                       # (optional) auth token
+    "timeout_sec": 60.0,               # (optional) request timeout
+    "min_price": 1.0,                  # (optional) filter: min price
+    "min_volume": 1000.0,              # (optional) filter: min volume
+    "max_risk_score": 60.0,            # (optional) filter: max risk score (0-100)
+    "min_confidence": 0.65,            # (optional) filter: min forecast confidence (0-1)
+    "min_expected_roi": 0.00,          # (optional) filter: min expected ROI (fraction)
+    "horizon": "3m",                   # (optional) "1m" | "3m" | "12m"
+    "w_roi": 0.55,                     # (optional) composite score weight: ROI
+    "w_conf": 0.25,                    # (optional) composite score weight: confidence
+    "w_score": 0.20,                   # (optional) composite score weight: overall_score
+    "export_json": "",                 # (optional) path to write JSON output
+    "export_csv": "",                  # (optional) path to write CSV output
+    "export_html": "",                 # (optional) path to write HTML output
     # --- worker tracing fields (added by worker.py, not required here) ---
-    "task_id": "",                         # worker task UUID for correlation
-    "queued_at": "",                       # ISO timestamp when task was queued
-    "retry_count": 0,                      # retry count
+    "task_id": "",                     # worker task UUID for correlation
+    "queued_at": "",                   # ISO timestamp when task was queued
+    "retry_count": 0,                  # retry count
 }
 
 
@@ -1007,7 +1006,9 @@ async def run_from_worker_payload_async(payload: Dict[str, Any]) -> Dict[str, An
             "exit_code": 2,
             "rows_count": 0,
             "meta": {},
-            "errors": [f"run_from_worker_payload: expected task_type='market_scan', got {task_type!r}"],
+            "errors": [
+                f"run_from_worker_payload: expected task_type='market_scan', got {task_type!r}"
+            ],
             "task_id": task_id,
         }
 
@@ -1025,7 +1026,6 @@ async def run_from_worker_payload_async(payload: Dict[str, Any]) -> Dict[str, An
 
     try:
         rows, meta = await run_scan(cfg)
-        # Write exports if configured
         if rows and cfg.export_json:
             try:
                 _write_json(cfg.export_json, {"meta": meta, "rows": [r.to_dict() for r in rows]})
@@ -1074,7 +1074,6 @@ def run_from_worker_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             "errors": [str(e)],
             "task_id": str(payload.get("task_id") or ""),
         }
-
 
 def main() -> int:
     args = _parse_args()
