@@ -81,7 +81,9 @@ except Exception:
     _OTEL_AVAILABLE = False
     _TRACER = None
 
-_TRACING_ENABLED = os.getenv("CORE_TRACING_ENABLED", "").strip().lower() in {"1", "true", "yes", "y", "on"}
+_TRACING_ENABLED = os.getenv("CORE_TRACING_ENABLED", "").strip().lower() in {
+    "1", "true", "yes", "y", "on"
+}
 
 
 class TraceContext:
@@ -119,7 +121,11 @@ class TraceContext:
                 except Exception:
                     pass
                 try:
-                    if Status is not None and StatusCode is not None and hasattr(self._span, "set_status"):
+                    if (
+                        Status is not None
+                        and StatusCode is not None
+                        and hasattr(self._span, "set_status")
+                    ):
                         self._span.set_status(Status(StatusCode.ERROR, str(exc_val)))
                 except Exception:
                     pass
@@ -139,7 +145,7 @@ class TraceContext:
 
 
 # ---------------------------------------------------------------------------
-# Redis client resolution
+# Redis client resolution — prefer redis.asyncio, fall back to aioredis
 # ---------------------------------------------------------------------------
 _REDIS_LIB = "none"
 try:
@@ -168,7 +174,9 @@ logging.basicConfig(
 logger = logging.getLogger("Worker")
 
 
-def _safe_int(v: Any, default: int, *, lo: Optional[int] = None, hi: Optional[int] = None) -> int:
+def _safe_int(
+    v: Any, default: int, *, lo: Optional[int] = None, hi: Optional[int] = None
+) -> int:
     try:
         x = int(float(str(v).strip()))
     except Exception:
@@ -180,7 +188,9 @@ def _safe_int(v: Any, default: int, *, lo: Optional[int] = None, hi: Optional[in
     return x
 
 
-def _safe_float(v: Any, default: float, *, lo: Optional[float] = None, hi: Optional[float] = None) -> float:
+def _safe_float(
+    v: Any, default: float, *, lo: Optional[float] = None, hi: Optional[float] = None
+) -> float:
     try:
         x = float(str(v).strip())
     except Exception:
@@ -197,17 +207,34 @@ class WorkerConfig:
     queue_name: str = os.getenv("TFB_WORKER_QUEUE_NAME", "tfb_background_jobs")
     dead_letter_queue: str = os.getenv("TFB_WORKER_DLQ_NAME", "tfb_background_jobs_dead")
     redis_url: str = os.getenv("REDIS_URL", "").strip()
-    redis_block_timeout_sec: int = _safe_int(os.getenv("TFB_WORKER_REDIS_BLOCK_TIMEOUT_SEC", "5"), 5, lo=1, hi=60)
-    idle_sleep_sec: float = _safe_float(os.getenv("TFB_WORKER_IDLE_SLEEP_SEC", "5"), 5.0, lo=0.5, hi=60.0)
-    max_retries: int = _safe_int(os.getenv("TFB_WORKER_MAX_RETRIES", "5"), 5, lo=1, hi=20)
-    backoff_base_sec: float = _safe_float(os.getenv("TFB_WORKER_BACKOFF_BASE_SEC", "1.0"), 1.0, lo=0.1, hi=30.0)
-    backoff_max_sec: float = _safe_float(os.getenv("TFB_WORKER_BACKOFF_MAX_SEC", "30.0"), 30.0, lo=1.0, hi=300.0)
-    cpu_workers: int = _safe_int(os.getenv("TFB_WORKER_CPU_WORKERS", "4"), 4, lo=1, hi=32)
-    fail_fast_if_no_redis: bool = os.getenv("TFB_WORKER_FAIL_FAST_NO_REDIS", "false").strip().lower() in {"1", "true", "yes", "y", "on"}
+    redis_block_timeout_sec: int = _safe_int(
+        os.getenv("TFB_WORKER_REDIS_BLOCK_TIMEOUT_SEC", "5"), 5, lo=1, hi=60
+    )
+    idle_sleep_sec: float = _safe_float(
+        os.getenv("TFB_WORKER_IDLE_SLEEP_SEC", "5"), 5.0, lo=0.5, hi=60.0
+    )
+    max_retries: int = _safe_int(
+        os.getenv("TFB_WORKER_MAX_RETRIES", "5"), 5, lo=1, hi=20
+    )
+    backoff_base_sec: float = _safe_float(
+        os.getenv("TFB_WORKER_BACKOFF_BASE_SEC", "1.0"), 1.0, lo=0.1, hi=30.0
+    )
+    backoff_max_sec: float = _safe_float(
+        os.getenv("TFB_WORKER_BACKOFF_MAX_SEC", "30.0"), 30.0, lo=1.0, hi=300.0
+    )
+    cpu_workers: int = _safe_int(
+        os.getenv("TFB_WORKER_CPU_WORKERS", "4"), 4, lo=1, hi=32
+    )
+    fail_fast_if_no_redis: bool = (
+        os.getenv("TFB_WORKER_FAIL_FAST_NO_REDIS", "false").strip().lower()
+        in {"1", "true", "yes", "y", "on"}
+    )
 
 
 CONFIG = WorkerConfig()
-_CPU_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=CONFIG.cpu_workers, thread_name_prefix="TFBWorker")
+_CPU_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=CONFIG.cpu_workers, thread_name_prefix="TFBWorker"
+)
 SHUTDOWN_EVENT = asyncio.Event()
 
 
@@ -215,7 +242,9 @@ SHUTDOWN_EVENT = asyncio.Event()
 # Full jitter exponential backoff
 # =============================================================================
 class FullJitterBackoff:
-    def __init__(self, max_retries: int = 5, base_delay: float = 1.0, max_delay: float = 30.0):
+    def __init__(
+        self, max_retries: int = 5, base_delay: float = 1.0, max_delay: float = 30.0
+    ):
         self.max_retries = max_retries
         self.base_delay = base_delay
         self.max_delay = max_delay
@@ -233,7 +262,10 @@ class FullJitterBackoff:
                     raise
                 ceiling = min(self.max_delay, self.base_delay * (2 ** attempt))
                 sleep_time = random.uniform(0.0, ceiling)
-                logger.warning("Task failed on attempt %s/%s: %s. Retrying in %.2fs", attempt + 1, self.max_retries, e, sleep_time)
+                logger.warning(
+                    "Task failed on attempt %s/%s: %s. Retrying in %.2fs",
+                    attempt + 1, self.max_retries, e, sleep_time,
+                )
                 await asyncio.sleep(sleep_time)
         raise last_exc if last_exc is not None else RuntimeError("backoff_exhausted")
 
@@ -241,7 +273,7 @@ class FullJitterBackoff:
 # =============================================================================
 # Generic import / execution helpers
 # =============================================================================
-def _import_first(candidates: Sequence[str]):
+def _import_first(candidates: Sequence[str]) -> Any:
     last_exc: Optional[Exception] = None
     for name in candidates:
         try:
@@ -267,7 +299,9 @@ async def _maybe_call(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
     return result
 
 
-async def _call_first_callable(module: Any, names: Sequence[str], *args: Any, **kwargs: Any) -> Tuple[bool, Any]:
+async def _call_first_callable(
+    module: Any, names: Sequence[str], *args: Any, **kwargs: Any
+) -> Tuple[bool, Any]:
     for name in names:
         fn = getattr(module, name, None)
         if callable(fn):
@@ -303,7 +337,9 @@ async def _run_dashboard_sync_task(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     sheet_name = str(payload.get("sheet_name") or "").strip()
     symbols = _as_list(payload.get("symbols") or [])
-    spreadsheet_id = str(payload.get("spreadsheet_id") or os.getenv("DEFAULT_SPREADSHEET_ID", "")).strip()
+    spreadsheet_id = str(
+        payload.get("spreadsheet_id") or os.getenv("DEFAULT_SPREADSHEET_ID", "")
+    ).strip()
     limit = _safe_int(payload.get("limit") or 800, 800, lo=1, hi=50000)
 
     kwargs: Dict[str, Any] = {"spreadsheet_id": spreadsheet_id, "limit": limit}
@@ -331,7 +367,9 @@ async def _run_market_scan_task(payload: Dict[str, Any]) -> Dict[str, Any]:
         logger.exception("run_market_scan module not found")
         return {"ok": False, "error": "module_not_found", "task_type": "market_scan"}
 
-    spreadsheet_id = str(payload.get("spreadsheet_id") or os.getenv("DEFAULT_SPREADSHEET_ID", "")).strip()
+    spreadsheet_id = str(
+        payload.get("spreadsheet_id") or os.getenv("DEFAULT_SPREADSHEET_ID", "")
+    ).strip()
     keys = _as_list(payload.get("keys") or payload.get("sheet_names") or ["Market_Leaders"])
     top_n = _safe_int(payload.get("limit") or payload.get("top_n") or 10, 10, lo=1, hi=1000)
     horizon = str(payload.get("horizon") or "3m").strip().lower()
@@ -352,7 +390,11 @@ async def _run_market_scan_task(payload: Dict[str, Any]) -> Dict[str, Any]:
             min_expected_roi=min_roi,
             mode=mode,
         )
-        found, result = await _call_first_callable(mod, ("run_scan_async", "run_async", "main_async", "run_scan", "run", "main"), cfg)
+        found, result = await _call_first_callable(
+            mod,
+            ("run_scan_async", "run_async", "main_async", "run_scan", "run", "main"),
+            cfg,
+        )
         if not found:
             logger.error("run_market_scan: no callable entrypoint found")
             return {"ok": False, "error": "no_callable_found", "task_type": "market_scan"}
@@ -371,7 +413,11 @@ async def _run_market_scan_task(payload: Dict[str, Any]) -> Dict[str, Any]:
         "min_roi": min_roi,
         "mode": mode,
     }
-    found, result = await _call_first_callable(mod, ("run_scan_async", "run_async", "main_async", "run_scan", "run", "main"), **kwargs)
+    found, result = await _call_first_callable(
+        mod,
+        ("run_scan_async", "run_async", "main_async", "run_scan", "run", "main"),
+        **kwargs,
+    )
     if not found:
         logger.error("run_market_scan: no callable entrypoint found")
         return {"ok": False, "error": "no_callable_found", "task_type": "market_scan"}
@@ -393,7 +439,9 @@ async def _run_refresh_data_task(payload: Dict[str, Any]) -> Dict[str, Any]:
     if symbols:
         kwargs["symbols"] = symbols
 
-    found, result = await _call_first_callable(mod, ("run_async", "main_async", "run", "main"), **kwargs)
+    found, result = await _call_first_callable(
+        mod, ("run_async", "main_async", "run", "main"), **kwargs
+    )
     if not found:
         logger.error("refresh_data: no callable entrypoint found")
         return {"ok": False, "error": "no_callable_found", "task_type": "refresh_data"}
@@ -417,15 +465,24 @@ async def _process_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         elif task_type == "refresh_data":
             result = await _run_refresh_data_task(payload)
         else:
-            logger.warning("[%s] Unknown task_type=%r. Supported: dashboard_sync, market_scan, refresh_data", task_id, task_type)
+            logger.warning(
+                "[%s] Unknown task_type=%r. Supported: dashboard_sync, market_scan, refresh_data",
+                task_id, task_type,
+            )
             return {"ok": False, "error": "unknown_task_type", "task_type": task_type}
 
         elapsed = round(time.time() - started, 2)
         ok = bool(result.get("ok", True)) if isinstance(result, dict) else True
         if ok:
-            logger.info("[%s] Task type=%r completed in %ss. result=%s", task_id, task_type, elapsed, json_dumps(result))
+            logger.info(
+                "[%s] Task type=%r completed in %ss. result=%s",
+                task_id, task_type, elapsed, json_dumps(result),
+            )
         else:
-            logger.error("[%s] Task type=%r failed in %ss. result=%s", task_id, task_type, elapsed, json_dumps(result))
+            logger.error(
+                "[%s] Task type=%r failed in %ss. result=%s",
+                task_id, task_type, elapsed, json_dumps(result),
+            )
             raise RuntimeError(json_dumps(result))
         return _result_dict(result)
 
@@ -433,7 +490,7 @@ async def _process_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 # =============================================================================
 # Redis helpers
 # =============================================================================
-async def _create_redis_client(redis_url: str):
+async def _create_redis_client(redis_url: str) -> Any:
     if not (_REDIS_AVAILABLE and redis_async is not None and redis_url):
         return None
     try:
@@ -447,6 +504,7 @@ async def _create_redis_client(redis_url: str):
 async def _close_redis_client(client: Any) -> None:
     if client is None:
         return
+    # Try aclose() first (redis-py >= 4.2)
     try:
         close_fn = getattr(client, "aclose", None)
         if callable(close_fn):
@@ -454,6 +512,7 @@ async def _close_redis_client(client: Any) -> None:
             return
     except Exception:
         pass
+    # Fall back to close()
     try:
         close_fn = getattr(client, "close", None)
         if callable(close_fn):
@@ -462,6 +521,7 @@ async def _close_redis_client(client: Any) -> None:
                 await result
     except Exception:
         pass
+    # aioredis compat
     try:
         wait_closed = getattr(client, "wait_closed", None)
         if callable(wait_closed):
@@ -501,7 +561,9 @@ async def _poll_redis_queue(redis_url: str) -> None:
     try:
         while not SHUTDOWN_EVENT.is_set():
             try:
-                result = await redis_client.blpop(CONFIG.queue_name, timeout=CONFIG.redis_block_timeout_sec)
+                result = await redis_client.blpop(
+                    CONFIG.queue_name, timeout=CONFIG.redis_block_timeout_sec
+                )
                 if not result:
                     continue
 
@@ -514,7 +576,10 @@ async def _poll_redis_queue(redis_url: str) -> None:
                     if not isinstance(payload, dict):
                         raise ValueError("payload_not_dict")
                 except Exception as parse_err:
-                    logger.error("Failed to parse queue payload: %s | raw=%r", parse_err, str(data_raw)[:300])
+                    logger.error(
+                        "Failed to parse queue payload: %s | raw=%r",
+                        parse_err, str(data_raw)[:300],
+                    )
                     await _push_dead_letter(redis_client, str(data_raw), f"parse_error:{parse_err}")
                     continue
 
@@ -542,7 +607,10 @@ async def _idle_loop() -> None:
 
 async def main_async(args: argparse.Namespace) -> int:
     del args
-    logger.info("🚀 Starting TFB Worker v%s | redis_lib=%s | has_orjson=%s", SCRIPT_VERSION, _REDIS_LIB, _HAS_ORJSON)
+    logger.info(
+        "🚀 Starting TFB Worker v%s | redis_lib=%s | has_orjson=%s",
+        SCRIPT_VERSION, _REDIS_LIB, _HAS_ORJSON,
+    )
 
     tasks: List[asyncio.Task[Any]] = []
     if _REDIS_AVAILABLE and CONFIG.redis_url:
@@ -563,7 +631,10 @@ async def main_async(args: argparse.Namespace) -> int:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
 
-    _CPU_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+    try:
+        _CPU_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+    except TypeError:
+        _CPU_EXECUTOR.shutdown(wait=False)
     logger.info("Worker stopped cleanly")
     return 0
 
@@ -574,7 +645,9 @@ def _handle_signal(sig: int, _frame: Any) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=f"Tadawul Distributed Worker v{SCRIPT_VERSION}")
+    parser = argparse.ArgumentParser(
+        description=f"Tadawul Distributed Worker v{SCRIPT_VERSION}"
+    )
     args = parser.parse_args()
 
     signal.signal(signal.SIGINT, _handle_signal)
