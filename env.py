@@ -2,25 +2,11 @@
 """
 env.py
 ================================================================================
-TADAWUL FAST BRIDGE – ENTERPRISE ENVIRONMENT MANAGER (v7.7.0)
+TADAWUL FAST BRIDGE – ENTERPRISE ENVIRONMENT MANAGER (v7.8.0)
 ================================================================================
 RENDER-SAFE | STARTUP-SAFE | GLOBAL-FIRST | HOT-RELOAD | SECRETS-SAFE | ROUTE-AUTH-AWARE
 
-Why this revision (v7.8.0)
-- FIX: PROVIDERS env var fallback removed from provider resolution. In v7.7.0
-  `get_first_env_list("ENABLED_PROVIDERS", "PROVIDERS", ...)` silently used a
-  dead Render env var if ENABLED_PROVIDERS wasn't set. Now warns and ignores it.
-- FIX: PRIMARY_PROVIDER re-ordering now logs a warning when it overrides the
-  ENABLED_PROVIDERS list order. Previously silent conflicts caused unexpected
-  provider priority without any diagnostic trace.
-- ENH: Added missing critical env vars to Settings:
-  FUNDAMENTALS_ENABLED, TFB_PERCENT_MODE, CACHE_BACKEND,
-  COMPUTATIONS_ENABLED, SCORING_ENABLED, TECHNICALS_ENABLED, FORECASTING_ENABLED.
-  These are all in the Render Env Audit action list — missing here meant they
-  were never validated, documented, or exported to dependent modules.
-- ENH: validate() now warns when FUNDAMENTALS_ENABLED is False (causes all
-  fundamentals to be blank in Google Sheets output).
-Why v7.7.0
+Why this revision
 - ✅ Aligned with core/config.py route-aware auth model
 - ✅ Added PUBLIC_EXACT_PATHS / PUBLIC_PATH_PREFIXES / PROTECTED_EXACT_PATHS / PROTECTED_PATH_PREFIXES
 - ✅ Added path-aware helpers:
@@ -846,16 +832,12 @@ class Settings:
             tokens_exist=tokens_exist,
         )
 
-        # FIX v7.8.0: Read ENABLED_PROVIDERS directly. Do NOT fall back to the
-        # dead `PROVIDERS` env var. In v7.7.0, `get_first_env_list("ENABLED_PROVIDERS",
-        # "PROVIDERS", ...)` silently used PROVIDERS if ENABLED_PROVIDERS wasn't set,
-        # creating invisible provider misconfiguration on Render.
-        # PROVIDERS is documented as deprecated in the Render Env Audit.
+        # FIX v7.8.0: Read ENABLED_PROVIDERS directly — dead PROVIDERS fallback removed
         _raw_providers_env = get_first_env_list("ENABLED_PROVIDERS", default=[])
         _dead_providers_env = get_first_env("PROVIDERS")
         if _dead_providers_env and not _raw_providers_env:
             logger.warning(
-                "env.py: PROVIDERS env var is deprecated — rename it to ENABLED_PROVIDERS. "
+                "env.py: PROVIDERS env var is deprecated — rename it to ENABLED_PROVIDERS. "  # v7.8.0: dead-var warning
                 "Using PROVIDERS as fallback this boot but this will stop working."
             )
             _raw_providers_env = coerce_list(_dead_providers_env)
@@ -866,10 +848,7 @@ class Settings:
             get_first_env("PRIMARY_PROVIDER") or (enabled_providers[0] if enabled_providers else "eodhd")
         ).lower()
 
-        # FIX v7.8.0: Warn when PRIMARY_PROVIDER re-orders ENABLED_PROVIDERS.
-        # In v7.7.0 this was silent — you could set ENABLED_PROVIDERS=finnhub,eodhd
-        # and PRIMARY_PROVIDER=eodhd and the final list would be eodhd,finnhub
-        # with no log entry explaining why provider priority changed.
+        # FIX v7.8.0: Warn when PRIMARY_PROVIDER re-orders ENABLED_PROVIDERS
         if primary_provider and primary_provider not in enabled_providers:
             logger.warning(
                 "PRIMARY_PROVIDER=%r not in ENABLED_PROVIDERS=%r — prepending it. "
@@ -991,6 +970,9 @@ class Settings:
         if "finnhub" in (self.ENABLED_PROVIDERS or []) and not self.FINNHUB_API_KEY:
             warns.append("Provider 'finnhub' enabled but FINNHUB_API_KEY missing.")
 
+        if self.BACKEND_BASE_URL and not is_valid_url(self.BACKEND_BASE_URL):
+            warns.append(f"BACKEND_BASE_URL does not look like a URL: {self.BACKEND_BASE_URL!r}")
+
         # FIX v7.8.0: Warn on critical missing flags that cause blank output
         if not self.FUNDAMENTALS_ENABLED:
             warns.append(
@@ -1010,9 +992,6 @@ class Settings:
                 "CACHE_BACKEND=redis but REDIS_URL is not set. "
                 "Redis cache will fail silently; set REDIS_URL or use CACHE_BACKEND=memory."
             )
-
-        if self.BACKEND_BASE_URL and not is_valid_url(self.BACKEND_BASE_URL):
-            warns.append(f"BACKEND_BASE_URL does not look like a URL: {self.BACKEND_BASE_URL!r}")
 
         overlap = set(self.PUBLIC_EXACT_PATHS or []) & set(self.PROTECTED_EXACT_PATHS or [])
         if overlap:
