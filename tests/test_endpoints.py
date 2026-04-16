@@ -77,11 +77,11 @@ class Colors:
 
 def log(msg: str, typ: str = "info") -> None:
     prefix = {
-        "info": f"{Colors.OKBLUE}[INFO]{Colors.ENDC}",
+        "info":    f"{Colors.OKBLUE}[INFO]{Colors.ENDC}",
         "success": f"{Colors.OKGREEN}[PASS]{Colors.ENDC}",
-        "warn": f"{Colors.WARNING}[WARN]{Colors.ENDC}",
-        "fail": f"{Colors.FAIL}[FAIL]{Colors.ENDC}",
-        "header": f"\n{Colors.HEADER}---",
+        "warn":    f"{Colors.WARNING}[WARN]{Colors.ENDC}",
+        "fail":    f"{Colors.FAIL}[FAIL]{Colors.ENDC}",
+        "header":  f"\n{Colors.HEADER}---",
     }.get(typ, "")
 
     if typ == "header":
@@ -162,7 +162,14 @@ def sheet_rows_summary(data: Dict[str, Any]) -> str:
     return f"status={status} headers={headers_n} keys={keys_n} rows={rows_n}"
 
 
-def request_json(method: str, path: str, *, params: Optional[Dict[str, Any]] = None, payload: Optional[Dict[str, Any]] = None, timeout: float = TIMEOUT_MED) -> Tuple[int, Optional[Any], float, str]:
+def request_json(
+    method: str,
+    path: str,
+    *,
+    params: Optional[Dict[str, Any]] = None,
+    payload: Optional[Dict[str, Any]] = None,
+    timeout: float = TIMEOUT_MED,
+) -> Tuple[int, Optional[Any], float, str]:
     url = f"{BASE_URL}{path}"
     t0 = time.time()
     resp = requests.request(
@@ -226,13 +233,20 @@ def check_meta_and_health() -> None:
 
             if ep == "/openapi.json":
                 if isinstance(data, dict) and isinstance(data.get("paths"), dict):
-                    log(f"{ep.ljust(18)} -> paths={len(data.get('paths') or {})} ({fmt_dt(dt)})", "success")
+                    log(
+                        f"{ep.ljust(18)} -> paths={len(data.get('paths') or {})} ({fmt_dt(dt)})",
+                        "success",
+                    )
                 else:
                     log(f"{ep.ljust(18)} -> 200 but invalid OpenAPI body ({fmt_dt(dt)})", "warn")
                 continue
 
             status = (data or {}).get("status", "ok") if isinstance(data, dict) else "ok"
-            ver = (data or {}).get("entry_version") or (data or {}).get("app_version") if isinstance(data, dict) else ""
+            ver = (
+                (data or {}).get("entry_version") or (data or {}).get("app_version")
+                if isinstance(data, dict)
+                else ""
+            )
             eng = (data or {}).get("engine_source") if isinstance(data, dict) else ""
             msg = f"{ep.ljust(18)} -> {status} ({fmt_dt(dt)})"
             if ver:
@@ -249,7 +263,11 @@ def check_analysis_market_leaders_get() -> None:
     status, data, dt, raw = request_json(
         "GET",
         "/v1/analysis/sheet-rows",
-        params={"page": "Market_Leaders", "limit": 5, "symbols": f"{KSA_TEST_SYMBOL},{GLOBAL_TEST_SYMBOL}"},
+        params={
+            "page": "Market_Leaders",
+            "limit": 5,
+            "symbols": f"{KSA_TEST_SYMBOL},{GLOBAL_TEST_SYMBOL}",
+        },
         timeout=TIMEOUT_LONG,
     )
     data = unwrap_payload(data)
@@ -263,7 +281,12 @@ def check_analysis_market_leaders_get() -> None:
 
     headers_n = count_safe(data.get("headers"))
     keys_n = count_safe(data.get("keys"))
-    rows_n = max(count_safe(data.get("rows")), count_safe(data.get("row_objects")), count_safe(data.get("data")), count_safe(data.get("quotes")))
+    rows_n = max(
+        count_safe(data.get("rows")),
+        count_safe(data.get("row_objects")),
+        count_safe(data.get("data")),
+        count_safe(data.get("quotes")),
+    )
 
     if headers_n >= 70 and keys_n >= 70 and rows_n > 0:
         log(f"OK ({fmt_dt(dt)}) | {sheet_rows_summary(data)}", "success")
@@ -299,7 +322,12 @@ def check_analysis_global_markets_post() -> None:
 
     headers_n = count_safe(data.get("headers"))
     keys_n = count_safe(data.get("keys"))
-    rows_n = max(count_safe(data.get("rows")), count_safe(data.get("row_objects")), count_safe(data.get("data")), count_safe(data.get("quotes")))
+    rows_n = max(
+        count_safe(data.get("rows")),
+        count_safe(data.get("row_objects")),
+        count_safe(data.get("data")),
+        count_safe(data.get("quotes")),
+    )
 
     if headers_n >= 70 and keys_n >= 70 and rows_n > 0:
         log(f"OK ({fmt_dt(dt)}) | {sheet_rows_summary(data)}", "success")
@@ -333,12 +361,17 @@ def check_advanced_insights_post() -> None:
 
     headers_n = count_safe(data.get("headers"))
     keys_n = count_safe(data.get("keys"))
-    rows_n = max(count_safe(data.get("rows")), count_safe(data.get("row_objects")), count_safe(data.get("data")))
+    rows_n = max(
+        count_safe(data.get("rows")),
+        count_safe(data.get("row_objects")),
+        count_safe(data.get("data")),
+    )
     warn_txt = warnings_text(data)
 
     if headers_n >= 7 and keys_n >= 7 and rows_n > 0:
         log(f"OK ({fmt_dt(dt)}) | {sheet_rows_summary(data)}", "success")
     elif headers_n >= 7 and keys_n >= 7 and "timeout" in warn_txt.lower():
+        # FIX v2.2.0: partial timeout with contract present is WARN not FAIL
         log(f"Partial timeout but contract OK ({fmt_dt(dt)}) | warnings={warn_txt}", "warn")
     elif headers_n >= 7 and keys_n >= 7:
         log(f"Contract OK but empty rows ({fmt_dt(dt)}) | {sheet_rows_summary(data)}", "warn")
@@ -370,7 +403,11 @@ def check_advisor_portfolio_post() -> None:
 
     headers_n = count_safe(data.get("headers"))
     keys_n = count_safe(data.get("keys"))
-    rows_n = max(count_safe(data.get("rows")), count_safe(data.get("row_objects")), count_safe(data.get("data")))
+    rows_n = max(
+        count_safe(data.get("rows")),
+        count_safe(data.get("row_objects")),
+        count_safe(data.get("data")),
+    )
 
     if headers_n >= 70 and keys_n >= 70 and rows_n > 0:
         log(f"OK ({fmt_dt(dt)}) | {sheet_rows_summary(data)}", "success")
@@ -404,7 +441,12 @@ def check_root_sheet_rows_top10() -> None:
 
     headers_n = count_safe(data.get("headers"))
     keys_n = count_safe(data.get("keys"))
-    rows_n = max(count_safe(data.get("rows")), count_safe(data.get("row_objects")), count_safe(data.get("data")), count_safe(data.get("items")))
+    rows_n = max(
+        count_safe(data.get("rows")),
+        count_safe(data.get("row_objects")),
+        count_safe(data.get("data")),
+        count_safe(data.get("items")),
+    )
 
     if headers_n >= 80 and keys_n >= 80 and rows_n > 0:
         log(f"OK ({fmt_dt(dt)}) | {sheet_rows_summary(data)}", "success")
@@ -422,7 +464,10 @@ def check_schema_routes() -> None:
     payload = unwrap_payload(data)
     if status == 200:
         if isinstance(payload, dict) and isinstance(payload.get("pages"), list):
-            log(f"/v1/schema/pages -> pages={len(payload.get('pages') or [])} ({fmt_dt(dt)})", "success")
+            log(
+                f"/v1/schema/pages -> pages={len(payload.get('pages') or [])} ({fmt_dt(dt)})",
+                "success",
+            )
         elif isinstance(payload, list):
             log(f"/v1/schema/pages -> pages={len(payload)} ({fmt_dt(dt)})", "success")
         else:
@@ -442,11 +487,16 @@ def check_schema_routes() -> None:
         headers_n = count_safe(payload.get("headers"))
         keys_n = count_safe(payload.get("keys"))
         if max(headers_n, keys_n) >= 7:
-            log(f"/v1/schema/sheet-spec -> headers={headers_n} keys={keys_n} ({fmt_dt(dt)})", "success")
+            log(
+                f"/v1/schema/sheet-spec -> headers={headers_n} keys={keys_n} ({fmt_dt(dt)})",
+                "success",
+            )
         else:
             log(f"/v1/schema/sheet-spec -> weak contract ({fmt_dt(dt)})", "warn")
     else:
-        log(f"/v1/schema/sheet-spec -> HTTP {status} ({fmt_dt(dt)}) | body={raw!r}", "fail")
+        log(
+            f"/v1/schema/sheet-spec -> HTTP {status} ({fmt_dt(dt)}) | body={raw!r}", "fail"
+        )
 
     # /v1/schema/data-dictionary and alias fallback
     for path in ("/v1/schema/data-dictionary", "/v1/schema/data_dictionary"):
@@ -457,7 +507,11 @@ def check_schema_routes() -> None:
             continue
         if status == 200 and isinstance(payload, dict):
             headers_n = count_safe(payload.get("headers"))
-            rows_n = max(count_safe(payload.get("rows")), count_safe(payload.get("data")), count_safe(payload.get("items")))
+            rows_n = max(
+                count_safe(payload.get("rows")),
+                count_safe(payload.get("data")),
+                count_safe(payload.get("items")),
+            )
             if headers_n == 9 and rows_n > 0:
                 log(f"{path} -> 9-column contract rows={rows_n} ({fmt_dt(dt)})", "success")
             elif headers_n == 9:
@@ -473,9 +527,16 @@ def check_schema_routes() -> None:
 # Main
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
-    sys.stdout.write(f"{Colors.HEADER}TADAWUL FAST BRIDGE - ENDPOINT TESTER v2.2.0{Colors.ENDC}\n")
-    sys.stdout.write(f"BASE_URL={BASE_URL} | TOKEN={'SET' if TOKEN else 'NOT SET'}\n")
-    sys.stdout.write(f"KSA_TEST_SYMBOL={KSA_TEST_SYMBOL} | GLOBAL_TEST_SYMBOL={GLOBAL_TEST_SYMBOL} | TOP10_SYMBOL={TOP10_SYMBOL}\n")
+    sys.stdout.write(
+        f"{Colors.HEADER}TADAWUL FAST BRIDGE - ENDPOINT TESTER v2.2.0{Colors.ENDC}\n"
+    )
+    sys.stdout.write(
+        f"BASE_URL={BASE_URL} | TOKEN={'SET' if TOKEN else 'NOT SET'}\n"
+    )
+    sys.stdout.write(
+        f"KSA_TEST_SYMBOL={KSA_TEST_SYMBOL} | GLOBAL_TEST_SYMBOL={GLOBAL_TEST_SYMBOL} "
+        f"| TOP10_SYMBOL={TOP10_SYMBOL}\n"
+    )
 
     if check_server():
         check_meta_and_health()
@@ -486,4 +547,6 @@ if __name__ == "__main__":
         check_root_sheet_rows_top10()
         check_schema_routes()
     else:
-        sys.stdout.write("\nCannot proceed. Run your API first (or set TFB_BASE_URL).\n")
+        sys.stdout.write(
+            "\nCannot proceed. Run your API first (or set TFB_BASE_URL).\n"
+        )
