@@ -63,47 +63,75 @@ logger.addHandler(logging.NullHandler())
 # -----------------------------------------------------------------------------
 # Schema registry (authoritative)
 # -----------------------------------------------------------------------------
-try:
-    from core.sheets.schema_registry import get_sheet_spec  # type: ignore
-except Exception as e:  # pragma: no cover
-    get_sheet_spec = None  # type: ignore
-    _SCHEMA_IMPORT_ERROR = repr(e)
-else:
-    _SCHEMA_IMPORT_ERROR = None
+# FIX v2.5.0: multi-path fallback for schema_registry
+get_sheet_spec = None  # type: ignore
+_SCHEMA_IMPORT_ERROR: Optional[str] = None
+
+for _sreg_path in ("core.sheets.schema_registry", "core.schema_registry", "schema_registry"):
+    try:
+        import importlib as _il
+        _sreg = _il.import_module(_sreg_path)
+        _fgs = getattr(_sreg, "get_sheet_spec", None)
+        if callable(_fgs):
+            get_sheet_spec = _fgs
+            _SCHEMA_IMPORT_ERROR = None
+            break
+    except Exception as _e:
+        _SCHEMA_IMPORT_ERROR = repr(_e)
+        continue
+del _sreg_path
 
 # -----------------------------------------------------------------------------
 # Page catalog helpers (authoritative normalization / dispatch)
 # -----------------------------------------------------------------------------
-try:
-    from core.sheets.page_catalog import (  # type: ignore
-        CANONICAL_PAGES,
-        FORBIDDEN_PAGES,
-        allowed_pages,
-        get_route_family,
-        is_instrument_page,
-        normalize_page_name,
-    )
-except Exception:  # pragma: no cover
-    CANONICAL_PAGES = []  # type: ignore
-    FORBIDDEN_PAGES = {"KSA_Tadawul", "Advisor_Criteria"}  # type: ignore
+# FIX v2.5.0: multi-path fallback for page_catalog
+CANONICAL_PAGES: List[str] = []
+FORBIDDEN_PAGES: set = {"KSA_Tadawul", "Advisor_Criteria"}
 
-    def allowed_pages() -> List[str]:  # type: ignore
-        return list(CANONICAL_PAGES) if CANONICAL_PAGES else []
 
-    def normalize_page_name(name: str, allow_output_pages: bool = True) -> str:  # type: ignore
-        return (name or "").strip().replace(" ", "_")
+def allowed_pages() -> List[str]:
+    return list(CANONICAL_PAGES) if CANONICAL_PAGES else []
 
-    def get_route_family(name: str) -> str:  # type: ignore
-        if name == "Insights_Analysis":
-            return "insights"
-        if name == "Top_10_Investments":
-            return "top10"
-        if name == "Data_Dictionary":
-            return "dictionary"
-        return "instrument"
 
-    def is_instrument_page(name: str) -> bool:  # type: ignore
-        return get_route_family(name) == "instrument"
+def normalize_page_name(name: str, allow_output_pages: bool = True) -> str:
+    return (name or "").strip().replace(" ", "_")
+
+
+def get_route_family(name: str) -> str:
+    if name == "Insights_Analysis":
+        return "insights"
+    if name == "Top_10_Investments":
+        return "top10"
+    if name == "Data_Dictionary":
+        return "dictionary"
+    return "instrument"
+
+
+def is_instrument_page(name: str) -> bool:
+    return get_route_family(name) == "instrument"
+
+
+for _pcat_path in ("core.sheets.page_catalog", "core.page_catalog", "page_catalog"):
+    try:
+        import importlib as _il2
+        _pcat = _il2.import_module(_pcat_path)
+        _ap = getattr(_pcat, "allowed_pages", None)
+        _np = getattr(_pcat, "normalize_page_name", None)
+        _grf = getattr(_pcat, "get_route_family", None)
+        _iip = getattr(_pcat, "is_instrument_page", None)
+        if callable(_ap):
+            _cp = getattr(_pcat, "CANONICAL_PAGES", None)
+            _fp = getattr(_pcat, "FORBIDDEN_PAGES", None)
+            if _cp is not None: CANONICAL_PAGES[:] = list(_cp)
+            if _fp is not None: FORBIDDEN_PAGES.clear(); FORBIDDEN_PAGES.update(_fp)
+            allowed_pages       = _ap
+            normalize_page_name = _np or normalize_page_name
+            get_route_family    = _grf or get_route_family
+            is_instrument_page  = _iip or is_instrument_page
+            break
+    except Exception:
+        continue
+del _pcat_path
 
 # -----------------------------------------------------------------------------
 # Optional auth/config
@@ -126,7 +154,7 @@ try:
 except Exception:  # pragma: no cover
     core_get_sheet_rows = None  # type: ignore
 
-ADVANCED_SHEET_ROWS_VERSION = "2.4.0"
+ADVANCED_SHEET_ROWS_VERSION = "2.5.0"
 ROOT_OWNER = "advanced_sheet_rows"
 router = APIRouter(prefix="/v1/advanced", tags=["Advanced Sheet Rows"])
 
@@ -866,7 +894,7 @@ def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int)
     if kk == "last_updated_riyadh":
         return datetime.utcnow().isoformat()
     if kk == "recommendation":
-        return "Watch"
+        return "HOLD"  # FIX v2.5.0: canonical value (was "Watch")
     if kk == "recommendation_reason":
         return "Placeholder fallback because live engine returned no usable rows."
     if kk in {"top10_rank", "rank_overall", "sort_order"}:
