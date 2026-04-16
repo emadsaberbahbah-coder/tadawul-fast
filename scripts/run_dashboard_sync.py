@@ -165,7 +165,11 @@ def _is_forbidden_key(k: str) -> bool:
 
 
 def _default_backend_url() -> str:
-    return (os.getenv("BACKEND_BASE_URL") or os.getenv("DEFAULT_BACKEND_URL") or "http://127.0.0.1:8000").rstrip("/")
+    return (
+        os.getenv("BACKEND_BASE_URL")
+        or os.getenv("DEFAULT_BACKEND_URL")
+        or "http://127.0.0.1:8000"
+    ).rstrip("/")
 
 
 def _default_spreadsheet_id(cli_id: Optional[str]) -> str:
@@ -207,7 +211,6 @@ def _coerce_jsonable(v: Any) -> Any:
         return {str(k): _coerce_jsonable(x) for k, x in v.items()}
     if isinstance(v, (list, tuple, set)):
         return [_coerce_jsonable(x) for x in v]
-    # pydantic-ish
     try:
         if hasattr(v, "model_dump"):
             return _coerce_jsonable(v.model_dump(mode="python"))  # type: ignore
@@ -231,7 +234,6 @@ def _parse_keys_tokens(raw_tokens: Sequence[str]) -> List[str]:
         s = str(t or "").strip()
         if not s:
             continue
-        # JSON array
         if s.startswith("[") and s.endswith("]"):
             try:
                 arr = json.loads(s)
@@ -243,15 +245,13 @@ def _parse_keys_tokens(raw_tokens: Sequence[str]) -> List[str]:
                     continue
             except Exception:
                 pass
-        # split by common separators
         parts = re.split(r"[,\s;|]+", s)
         for p in parts:
             pp = (p or "").strip()
             if pp:
                 flat.append(pp)
-    # canonicalize + de-dup
     out: List[str] = []
-    seen: set[str] = set()
+    seen: set = set()
     for k in flat:
         ck = _canon_key(k)
         if not ck or ck in seen:
@@ -391,7 +391,9 @@ class BackendClient:
         except Exception as e:
             return None, str(e), 0
 
-    async def post_json(self, path: str, payload: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
+    async def post_json(
+        self, path: str, payload: Dict[str, Any]
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
         url = f"{self.base_url}{path}"
         max_retries = 3
         for attempt in range(max_retries):
@@ -508,7 +510,11 @@ class SheetsWriter:
         return d
 
     def _load_credentials_dict(self) -> Optional[Dict[str, Any]]:
-        raw = (os.getenv("GOOGLE_SHEETS_CREDENTIALS") or os.getenv("GOOGLE_CREDENTIALS") or "").strip()
+        raw = (
+            os.getenv("GOOGLE_SHEETS_CREDENTIALS")
+            or os.getenv("GOOGLE_CREDENTIALS")
+            or ""
+        ).strip()
 
         # Prefer GOOGLE_APPLICATION_CREDENTIALS file path (GitHub Actions pattern)
         path = (os.getenv("GOOGLE_APPLICATION_CREDENTIALS") or "").strip()
@@ -550,7 +556,6 @@ class SheetsWriter:
         return self._service
 
     def _safe_sheet_a1(self, sheet_name: str) -> str:
-        # Always quote if not safe
         if _SHEET_SAFE_RE.match(sheet_name or ""):
             return sheet_name
         name = (sheet_name or "").replace("'", "''")
@@ -566,7 +571,9 @@ class SheetsWriter:
         col = m.group(1).upper()
         row = int(m.group(2))
         rng = f"{self._safe_sheet_a1(sheet_name)}!{col}{row}:ZZ"
-        svc.spreadsheets().values().clear(spreadsheetId=spreadsheet_id, range=rng, body={}).execute()
+        svc.spreadsheets().values().clear(
+            spreadsheetId=spreadsheet_id, range=rng, body={}
+        ).execute()
 
     def write_table(
         self,
@@ -580,7 +587,6 @@ class SheetsWriter:
         if not svc:
             return 0
 
-        # Ensure rectangular rows matching header length (Sheets-friendly)
         hdr = [str(h) for h in (headers or [])]
         width = len(hdr)
 
@@ -637,7 +643,7 @@ def _read_symbols(task_key: str, spreadsheet_id: str, max_symbols: int) -> List[
         symbols = data
 
     out: List[str] = []
-    seen: set[str] = set()
+    seen: set = set()
     for s in symbols:
         t = str(s or "").strip().upper()
         if not t or t in {"SYMBOL", "TICKER"}:
@@ -651,25 +657,24 @@ def _read_symbols(task_key: str, spreadsheet_id: str, max_symbols: int) -> List[
 
 
 # -----------------------------------------------------------------------------
-# Task definitions (aligned with your dashboard tabs + canonical schema)
+# Task definitions (aligned with canonical schema pages)
 # -----------------------------------------------------------------------------
 def _default_tasks() -> List[TaskSpec]:
     return [
-        TaskSpec(key="MY_PORTFOLIO", sheet_name="My_Portfolio", gateway="enriched", priority=1, max_symbols=800, allow_empty_symbols=True),
-        TaskSpec(key="MARKET_LEADERS", sheet_name="Market_Leaders", gateway="enriched", priority=2, max_symbols=800, allow_empty_symbols=True),
-        TaskSpec(key="GLOBAL_MARKETS", sheet_name="Global_Markets", gateway="enriched", priority=3, max_symbols=800, allow_empty_symbols=True),
-        TaskSpec(key="COMMODITIES_FX", sheet_name="Commodities_FX", gateway="enriched", priority=4, max_symbols=400, allow_empty_symbols=True),
-        TaskSpec(key="MUTUAL_FUNDS", sheet_name="Mutual_Funds", gateway="enriched", priority=5, max_symbols=400, allow_empty_symbols=True),
+        TaskSpec(key="MY_PORTFOLIO",       sheet_name="My_Portfolio",       gateway="enriched",  priority=1, max_symbols=800, allow_empty_symbols=True),
+        TaskSpec(key="MARKET_LEADERS",     sheet_name="Market_Leaders",     gateway="enriched",  priority=2, max_symbols=800, allow_empty_symbols=True),
+        TaskSpec(key="GLOBAL_MARKETS",     sheet_name="Global_Markets",     gateway="enriched",  priority=3, max_symbols=800, allow_empty_symbols=True),
+        TaskSpec(key="COMMODITIES_FX",     sheet_name="Commodities_FX",     gateway="enriched",  priority=4, max_symbols=400, allow_empty_symbols=True),
+        TaskSpec(key="MUTUAL_FUNDS",       sheet_name="Mutual_Funds",       gateway="enriched",  priority=5, max_symbols=400, allow_empty_symbols=True),
         # Special/meta pages — do NOT require symbols
-        TaskSpec(key="INSIGHTS_ANALYSIS", sheet_name="Insights_Analysis", gateway="analysis", priority=6, max_symbols=0, allow_empty_symbols=True),
-        TaskSpec(key="TOP_10_INVESTMENTS", sheet_name="Top_10_Investments", gateway="analysis", priority=7, max_symbols=0, allow_empty_symbols=True),
-        TaskSpec(key="DATA_DICTIONARY", sheet_name="Data_Dictionary", gateway="analysis", priority=8, max_symbols=0, allow_empty_symbols=True),
+        TaskSpec(key="INSIGHTS_ANALYSIS",  sheet_name="Insights_Analysis",  gateway="analysis",  priority=6, max_symbols=0, allow_empty_symbols=True),
+        TaskSpec(key="TOP_10_INVESTMENTS", sheet_name="Top_10_Investments", gateway="analysis",  priority=7, max_symbols=0, allow_empty_symbols=True),
+        TaskSpec(key="DATA_DICTIONARY",    sheet_name="Data_Dictionary",    gateway="analysis",  priority=8, max_symbols=0, allow_empty_symbols=True),
     ]
 
 
 def _endpoint_candidates_for_gateway(gw: str) -> List[str]:
     gw = (gw or "enriched").strip().lower()
-    # include ai aliases because route naming can vary
     if gw in {"analysis", "ai"}:
         return [
             "/v1/analysis/sheet-rows",
@@ -756,7 +761,6 @@ def _extract_table_payload(resp: Dict[str, Any]) -> Tuple[List[Any], List[List[A
         matrix = [[_coerce_jsonable(r.get(k)) for k in keys_list] for r in dict_rows]
         return headers_list, matrix
 
-    # empty rows, but headers exist
     if headers_list:
         return headers_list, []
 
@@ -795,12 +799,16 @@ async def _run_one_task(
     sheets: Optional[SheetsWriter],
 ) -> TaskResult:
     t0 = time.perf_counter()
-    res = TaskResult(key=task.key, sheet_name=task.sheet_name, status="pending", start_utc=_utc_now().isoformat())
+    res = TaskResult(
+        key=task.key,
+        sheet_name=task.sheet_name,
+        status="pending",
+        start_utc=_utc_now().isoformat(),
+    )
 
     try:
         canon_task_key = _canon_key(task.key)
 
-        # Hard filters
         if _is_forbidden_key(canon_task_key):
             res.status = "skipped"
             res.warnings.append("Forbidden legacy key; skipped.")
@@ -818,7 +826,6 @@ async def _run_one_task(
 
         res.symbols_requested = len(symbols)
 
-        # Dry run: still success-ish but no backend call and no write
         if dry_run:
             res.status = "skipped"
             res.warnings.append("Dry run: no backend call, no sheet write.")
@@ -832,25 +839,20 @@ async def _run_one_task(
         if not symbols:
             res.warnings.append("No symbols found; requesting schema-only payload (headers + empty rows).")
 
-        # Some handlers clamp limit >= 1, so never send 0
         safe_limit = 1 if not symbols else min(5000, max(1, len(symbols)))
 
         payload: Dict[str, Any] = {
-            # identifiers (compat)
             "sheet": task.sheet_name,
             "sheet_name": task.sheet_name,
             "page": task.sheet_name,
             "name": task.sheet_name,
             "tab": task.sheet_name,
-            # symbols
             "tickers": symbols,
             "symbols": symbols,
-            # behavior
             "refresh": True,
             "include_meta": True,
             "include_matrix": True,
             "limit": safe_limit,
-            # tracing
             "request_id": res.request_id,
         }
 
@@ -888,11 +890,9 @@ async def _run_one_task(
         # FIX v6.4.0: Dedup guard before Sheets write.
         # When the backend returns duplicate symbol rows (e.g. a symbol appears
         # in two source pages, or data_engine_v2 emits the same symbol twice
-        # before its v5.48.0 dedup fix is deployed), we drop all but the first
-        # occurrence here to prevent duplicate rows in Google Sheets.
+        # before its dedup fix is deployed), drop all but the first occurrence
+        # to prevent duplicate rows in Google Sheets.
         if rows_matrix:
-            # Find the symbol column index (column 0 is almost always Symbol,
-            # but check headers to be safe — look for "symbol" or "ticker")
             sym_col_idx: Optional[int] = None
             for col_idx, h in enumerate(headers):
                 if str(h).strip().lower() in ("symbol", "ticker", "requestedsymbol"):
@@ -902,21 +902,32 @@ async def _run_one_task(
                 seen_syms: set = set()
                 deduped: List[List[Any]] = []
                 for row in rows_matrix:
-                    sym_val = str(row[sym_col_idx] or "").strip().upper() if sym_col_idx < len(row) else ""
+                    sym_val = (
+                        str(row[sym_col_idx] or "").strip().upper()
+                        if sym_col_idx < len(row)
+                        else ""
+                    )
                     if not sym_val or sym_val not in seen_syms:
                         if sym_val:
                             seen_syms.add(sym_val)
                         deduped.append(row)
                 dropped = len(rows_matrix) - len(deduped)
                 if dropped > 0:
-                    logger.info("Dedup: dropped %d duplicate symbol rows for %s", dropped, task.sheet_name)
-                    res.warnings.append(f"Dedup: dropped {dropped} duplicate symbol rows before write.")
+                    logger.info(
+                        "Dedup: dropped %d duplicate symbol rows for %s",
+                        dropped,
+                        task.sheet_name,
+                    )
+                    res.warnings.append(
+                        f"Dedup: dropped {dropped} duplicate symbol rows before write."
+                    )
                 rows_matrix = deduped
 
-        # No creds => partial (data fetched but not written)
         if sheets is None or sheets._get_service() is None:
             res.status = "partial"
-            res.warnings.append("No Google Sheets credentials. Backend data fetched but not written.")
+            res.warnings.append(
+                "No Google Sheets credentials. Backend data fetched but not written."
+            )
             res.rows_written = 0
             res.rows_failed = len(rows_matrix or [])
             return res
@@ -928,16 +939,21 @@ async def _run_one_task(
                 res.warnings.append(f"Clear failed: {e}")
 
         try:
-            written = sheets.write_table(spreadsheet_id, task.sheet_name, start_cell, headers, rows_matrix)
+            written = sheets.write_table(
+                spreadsheet_id, task.sheet_name, start_cell, headers, rows_matrix
+            )
             res.rows_written = int(written)
 
-            # schema-only (0 rows) => success
             if not rows_matrix:
                 res.rows_failed = 0
                 res.status = "success"
             else:
                 res.rows_failed = max(0, len(rows_matrix) - res.rows_written)
-                res.status = "success" if res.rows_failed == 0 else ("partial" if res.rows_written > 0 else "failed")
+                res.status = (
+                    "success"
+                    if res.rows_failed == 0
+                    else ("partial" if res.rows_written > 0 else "failed")
+                )
         except Exception as e:
             res.status = "failed"
             res.error = f"Write failed: {e}"
@@ -958,16 +974,37 @@ async def _run_one_task(
 # Main runner
 # -----------------------------------------------------------------------------
 async def main_async(argv: Optional[Sequence[str]] = None) -> int:
-    parser = argparse.ArgumentParser(description=f"TFB Dashboard Sync Runner v{SCRIPT_VERSION}")
+    parser = argparse.ArgumentParser(
+        description=f"TFB Dashboard Sync Runner v{SCRIPT_VERSION}"
+    )
     parser.add_argument("--sheet-id", default="", help="Spreadsheet ID override")
-    parser.add_argument("--backend", default="", help="Backend base URL override (e.g. https://... )")
-    parser.add_argument("--keys", nargs="*", default=[], help="Specific keys (space/comma/semicolon/JSON-array supported)")
-    parser.add_argument("--start-cell", default="A5", help="Top-left A1 cell where headers will be written (e.g. A5)")
-    parser.add_argument("--max-symbols", default="-1", help="Override max symbols for all tasks (-1 = per task default)")
+    parser.add_argument("--backend", default="", help="Backend base URL override")
+    parser.add_argument(
+        "--keys",
+        nargs="*",
+        default=[],
+        help="Specific keys (space/comma/semicolon/JSON-array supported)",
+    )
+    parser.add_argument(
+        "--start-cell",
+        default="A5",
+        help="Top-left A1 cell where headers will be written (e.g. A5)",
+    )
+    parser.add_argument(
+        "--max-symbols",
+        default="-1",
+        help="Override max symbols for all tasks (-1 = per task default)",
+    )
     parser.add_argument("--workers", default="4", help="Parallel workers")
-    parser.add_argument("--clear", action="store_true", help="Clear from start-cell down before writing")
-    parser.add_argument("--dry-run", action="store_true", help="Do not call backend or write sheets")
-    parser.add_argument("--no-lock", action="store_true", help="Disable Redis lock even if REDIS_URL exists")
+    parser.add_argument(
+        "--clear", action="store_true", help="Clear from start-cell down before writing"
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Do not call backend or write sheets"
+    )
+    parser.add_argument(
+        "--no-lock", action="store_true", help="Disable Redis lock even if REDIS_URL exists"
+    )
     parser.add_argument("--json-out", default="", help="Write JSON report to this file path")
     parser.add_argument("--timeout", default="30", help="Backend timeout seconds")
     args = parser.parse_args(list(argv) if argv is not None else None)
@@ -985,14 +1022,20 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
 
     token = _env_token()
     if not token:
-        logger.warning("No backend token found (TFB_TOKEN/X_APP_TOKEN/APP_TOKEN/BACKEND_TOKEN). Requests may 401 if protected.")
+        logger.warning(
+            "No backend token found (TFB_TOKEN/X_APP_TOKEN/APP_TOKEN/BACKEND_TOKEN). "
+            "Requests may 401 if protected."
+        )
 
     tasks = _default_tasks()
 
     wanted = _parse_keys_tokens(args.keys or [])
     forbidden_requested = [k for k in wanted if _is_forbidden_key(k)]
     if forbidden_requested:
-        logger.warning("Forbidden keys requested and will be ignored: %s", ", ".join(forbidden_requested))
+        logger.warning(
+            "Forbidden keys requested and will be ignored: %s",
+            ", ".join(forbidden_requested),
+        )
 
     wanted_ok = [k for k in wanted if (k in _ALLOWED_KEYS and not _is_forbidden_key(k))]
     if wanted_ok:
@@ -1003,7 +1046,6 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
         logger.warning("No tasks selected.")
         return 0
 
-    # clamp workers to tasks count
     workers = max(1, min(workers, len(tasks)))
 
     summary = RunSummary()
@@ -1013,12 +1055,13 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
     backend = BackendClient(backend_url, timeout_sec=timeout_sec, token=token)
     sheets = SheetsWriter()
 
-    lock_name = f"{spreadsheet_id}:{','.join([_canon_key(t.key) for t in tasks])}"
+    lock_name = (
+        f"{spreadsheet_id}:{','.join([_canon_key(t.key) for t in tasks])}"
+    )
     lock = RedisLock(lock_name, ttl_sec=600)
 
     results: List[TaskResult] = []
     try:
-        # Preflight health (best-effort)
         for hp in ("/readyz", "/health", "/livez"):
             data, err, _code = await backend.get_json(hp)
             if err:
@@ -1028,7 +1071,6 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
             logger.info("Backend preflight %s -> %s", hp, status_val or "ok")
             break
 
-        # Acquire lock
         acquired = True if args.no_lock else await lock.acquire()
         if not acquired:
             logger.error("Could not acquire Redis lock. Use --no-lock to bypass.")
@@ -1049,7 +1091,9 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
                     sheets=sheets,
                 )
 
-        out = await asyncio.gather(*[_guarded(t) for t in tasks], return_exceptions=True)
+        out = await asyncio.gather(
+            *[_guarded(t) for t in tasks], return_exceptions=True
+        )
 
         for i, r in enumerate(out):
             if isinstance(r, Exception):
@@ -1081,9 +1125,10 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
         summary.end_utc = _utc_now().isoformat()
         summary.duration_ms = (time.perf_counter() - t0) * 1000.0
 
-        logger.info("============================================================")
+        logger.info("=" * 60)
         logger.info(
-            "SYNC DONE | success=%d partial=%d failed=%d skipped=%d | rows_written=%d | duration_ms=%.2f",
+            "SYNC DONE | success=%d partial=%d failed=%d skipped=%d "
+            "| rows_written=%d | duration_ms=%.2f",
             summary.success,
             summary.partial,
             summary.failed,
@@ -1094,7 +1139,10 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
 
         for r in results:
             if r.status == "success":
-                logger.info("✅ %s -> %s | rows=%d | %.1fms", _canon_key(r.key), r.sheet_name, r.rows_written, r.duration_ms)
+                logger.info(
+                    "✅ %s -> %s | rows=%d | %.1fms",
+                    _canon_key(r.key), r.sheet_name, r.rows_written, r.duration_ms,
+                )
             elif r.status == "partial":
                 logger.info(
                     "⚠️  %s -> %s | rows=%d failed=%d | %.1fms | %s",
@@ -1106,16 +1154,29 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
                     "; ".join(r.warnings[:2]),
                 )
             elif r.status == "failed":
-                logger.info("❌ %s -> %s | %s", _canon_key(r.key), r.sheet_name, r.error or "failed")
+                logger.info(
+                    "❌ %s -> %s | %s",
+                    _canon_key(r.key), r.sheet_name, r.error or "failed",
+                )
             else:
-                logger.info("⏭️  %s -> %s | %s", _canon_key(r.key), r.sheet_name, "; ".join(r.warnings[:2]) if r.warnings else "skipped")
+                logger.info(
+                    "⏭️  %s -> %s | %s",
+                    _canon_key(r.key),
+                    r.sheet_name,
+                    "; ".join(r.warnings[:2]) if r.warnings else "skipped",
+                )
 
         if args.json_out:
-            report = {"summary": summary.to_dict(), "results": [x.to_dict() for x in results]}
-            Path(args.json_out).write_text(json.dumps(_coerce_jsonable(report), indent=2, ensure_ascii=False), encoding="utf-8")
+            report = {
+                "summary": summary.to_dict(),
+                "results": [x.to_dict() for x in results],
+            }
+            Path(args.json_out).write_text(
+                json.dumps(_coerce_jsonable(report), indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
             logger.info("Report saved: %s", args.json_out)
 
-        # Exit codes
         if summary.failed > 0:
             return 2
         if summary.partial > 0:
@@ -1143,30 +1204,30 @@ def main() -> int:
 
 
 # =============================================================================
-# Worker integration API
+# Worker integration API (FIX v6.4.0)
 # =============================================================================
 
-# FIX v6.4.0: Documents the expected task payload schema for worker.py.
+# Documents the expected task payload schema for worker.py.
 # When worker.py dispatches task_type="dashboard_sync", it should send a dict
 # matching these fields. Previously undocumented, causing silent schema drift.
 WORKER_PAYLOAD_SCHEMA: Dict[str, Any] = {
-    "task_type": "dashboard_sync",        # (required) always "dashboard_sync"
-    "keys": [],                           # (optional) list[str] — subset of ALLOWED_KEYS to sync
-                                          #   e.g. ["MARKET_LEADERS", "GLOBAL_MARKETS"]
-                                          #   omit or empty = sync all default tasks
-    "spreadsheet_id": "",                 # (optional) override DEFAULT_SPREADSHEET_ID
-    "backend_url": "",                    # (optional) override BACKEND_BASE_URL
-    "start_cell": "A5",                   # (optional) header start cell, default A5
-    "max_symbols": -1,                    # (optional) -1 = use per-task defaults
-    "workers": 4,                         # (optional) parallel task workers
-    "clear_before_write": False,          # (optional) clear sheet range before writing
-    "dry_run": False,                     # (optional) fetch data but don't write sheets
-    "timeout_sec": 30,                    # (optional) backend request timeout
-    "no_lock": False,                     # (optional) skip Redis distributed lock
+    "task_type": "dashboard_sync",   # (required) always "dashboard_sync"
+    "keys": [],                      # (optional) list[str] — subset of ALLOWED_KEYS to sync
+                                     #   e.g. ["MARKET_LEADERS", "GLOBAL_MARKETS"]
+                                     #   omit or empty = sync all default tasks
+    "spreadsheet_id": "",            # (optional) override DEFAULT_SPREADSHEET_ID
+    "backend_url": "",               # (optional) override BACKEND_BASE_URL
+    "start_cell": "A5",              # (optional) header start cell, default A5
+    "max_symbols": -1,               # (optional) -1 = use per-task defaults
+    "workers": 4,                    # (optional) parallel task workers
+    "clear_before_write": False,     # (optional) clear sheet range before writing
+    "dry_run": False,                # (optional) fetch data but don't write sheets
+    "timeout_sec": 30,               # (optional) backend request timeout
+    "no_lock": False,                # (optional) skip Redis distributed lock
     # --- worker tracing fields (added by worker.py, not required here) ---
-    "task_id": "",                        # worker task UUID for correlation
-    "queued_at": "",                      # ISO timestamp when task was queued
-    "retry_count": 0,                     # number of times this task has been retried
+    "task_id": "",                   # worker task UUID for correlation
+    "queued_at": "",                 # ISO timestamp when task was queued
+    "retry_count": 0,                # number of times this task has been retried
 }
 
 
@@ -1189,19 +1250,19 @@ async def run_from_worker_payload_async(payload: Dict[str, Any]) -> Dict[str, An
     task_id = str(payload.get("task_id") or uuid.uuid4())
     logger.info("run_from_worker_payload: task_id=%s", task_id)
 
-    # Validate required fields
     task_type = str(payload.get("task_type") or "").strip()
     if task_type and task_type != "dashboard_sync":
         return {
             "status": "failed",
             "exit_code": 2,
-            "errors": [f"run_from_worker_payload: expected task_type='dashboard_sync', got {task_type!r}"],
+            "errors": [
+                f"run_from_worker_payload: expected task_type='dashboard_sync', "
+                f"got {task_type!r}"
+            ],
             "summary": {},
             "task_id": task_id,
         }
 
-    # Build a minimal argv list from payload so main_async() stays the single
-    # source of truth for arg parsing. This avoids duplicating logic here.
     argv: List[str] = []
 
     spreadsheet_id = str(payload.get("spreadsheet_id") or "").strip()
