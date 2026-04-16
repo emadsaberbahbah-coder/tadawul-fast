@@ -2,7 +2,7 @@
 """
 routes/config.py
 ================================================================================
-TFB Config Routes — v5.8.0
+TFB Config Routes — v5.7.0
 ================================================================================
 CONFIG-ONLY • SCHEMA-DECOUPLED • PROMETHEUS-SAFE • RENDER-SAFE • AUTH-COMPATIBLE
 
@@ -17,18 +17,6 @@ Why this revision
 - SAFE: no network calls at import time.
 - SAFE: defensive compatibility with older/newer `core.config` variants.
 
-v5.8.0 Changes (fixes from code review):
-- FIX: `author` and `comment` parameters in reload_config are now explicitly
-       declared as Query(...) parameters. Previously they were bare `str = ""`
-       defaults which FastAPI handles implicitly as query params — but this
-       is ambiguous and can behave differently across FastAPI versions.
-       Explicit Query() declarations make the contract clear and stable.
-- FIX: Added `router = config_router` module-level alias. main.py's
-       _router_from_module() looks for a `router` attribute first. Without
-       this alias, the config router may fail route discovery on some
-       code paths, causing /v1/config/* to not mount correctly.
-- FIX: Version bumped to 5.8.0 to align with core.config v5.8.0.
-
 Endpoints kept
 --------------
 - GET  /v1/config/health
@@ -39,7 +27,7 @@ Endpoints kept
 Important note
 --------------
 This file intentionally does NOT mount `/v1/schema/*`.
-Those endpoints are owned and mounted by `routes.advanced_analysis`.
+Those endpoints should be owned and mounted by `routes.advanced_analysis`.
 """
 
 from __future__ import annotations
@@ -66,8 +54,8 @@ ROUTE_FAMILY_NAME = "config"
 
 config_router = APIRouter(prefix="/v1/config", tags=["config"])
 
-# FIX: router alias so main.py's _router_from_module() can discover this router
-# regardless of which attribute name it checks first (router vs config_router).
+# FIX v5.8.0: router alias so main.py router discovery finds this module
+# regardless of which attribute name it checks (router vs config_router).
 router = config_router
 
 
@@ -143,7 +131,7 @@ def _as_list(value: Any) -> List[Any]:
 
 
 # =============================================================================
-# Auth/config helpers (lazy imports — safe at import time)
+# Auth/config helpers
 # =============================================================================
 def _get_settings_cached(force_reload: bool = False) -> Any:
     try:
@@ -188,11 +176,7 @@ def _extract_token_from_request(
     return {"token": token, "authorization": authorization}
 
 
-def _check_auth(request: Request, *, query_token: Optional[str] = None) -> bool:
-    """
-    Returns True if the request is authenticated.
-    Uses core.config.auth_ok() with open_mode short-circuit.
-    """
+def _auth_ok(request: Request, *, query_token: Optional[str] = None) -> bool:
     try:
         from core.config import auth_ok, is_open_mode  # type: ignore
 
@@ -212,7 +196,7 @@ def _check_auth(request: Request, *, query_token: Optional[str] = None) -> bool:
 
 
 # =============================================================================
-# /v1/config/health
+# /v1/config/*
 # =============================================================================
 @config_router.get("/health", include_in_schema=False)
 async def config_health() -> Any:
@@ -249,10 +233,7 @@ async def config_health() -> Any:
     return data
 
 
-# =============================================================================
-# /v1/config  (root — serves both /v1/config and /v1/config/)
-# =============================================================================
-@config_router.get("", include_in_schema=False)
+@config_router.get("")
 @config_router.get("/", include_in_schema=False)
 async def config_root() -> Dict[str, Any]:
     return {
@@ -273,9 +254,6 @@ async def config_root() -> Dict[str, Any]:
     }
 
 
-# =============================================================================
-# /v1/config/settings
-# =============================================================================
 @config_router.get("/settings")
 async def get_masked_settings(
     request: Request,
@@ -283,7 +261,7 @@ async def get_masked_settings(
     token: Optional[str] = Query(None, description="Query token if allow_query_token is enabled"),
 ) -> BestJSONResponse:
     request_id = _get_request_id(request)
-    if not _check_auth(request, query_token=token):
+    if not _auth_ok(request, query_token=token):
         return _error(401, request_id, "unauthorized")
 
     try:
@@ -308,21 +286,17 @@ async def get_masked_settings(
         return _error(500, request_id, f"{type(e).__name__}: {e}")
 
 
-# =============================================================================
-# /v1/config/reload
-# =============================================================================
 @config_router.post("/reload")
 async def reload_config(
     request: Request,
-    # FIX: author and comment are now explicit Query() parameters.
-    # Previously bare `str = ""` defaults were ambiguous — FastAPI handled them
-    # implicitly as query params but this behavior varies across versions.
+    # FIX v5.8.0: explicit Query() declarations — previously bare `str = ""`
+    # was ambiguous and behaves differently across FastAPI versions.
     token: Optional[str] = Query(None, description="Query token if allow_query_token is enabled"),
-    author: str = Query("", description="Author label for this config reload (audit trail)"),
+    author: str  = Query("", description="Author label for this config reload (audit trail)"),
     comment: str = Query("", description="Comment/reason for this config reload (audit trail)"),
 ) -> BestJSONResponse:
     request_id = _get_request_id(request)
-    if not _check_auth(request, query_token=token):
+    if not _auth_ok(request, query_token=token):
         return _error(401, request_id, "unauthorized")
 
     try:
@@ -365,9 +339,6 @@ async def reload_config(
         return _error(500, request_id, f"{type(e).__name__}: {e}")
 
 
-# =============================================================================
-# /v1/config/versions
-# =============================================================================
 @config_router.get("/versions", include_in_schema=False)
 async def config_versions(
     request: Request,
@@ -375,7 +346,7 @@ async def config_versions(
     limit: int = Query(10, ge=1, le=50),
 ) -> BestJSONResponse:
     request_id = _get_request_id(request)
-    if not _check_auth(request, query_token=token):
+    if not _auth_ok(request, query_token=token):
         return _error(401, request_id, "unauthorized")
 
     try:
@@ -417,7 +388,6 @@ def mount(app: Any) -> None:
 
 
 def get_settings() -> Any:
-    """Compat shim — wraps core.config.get_settings_cached() for route callers."""
     return _get_settings_cached(force_reload=False)
 
 
@@ -469,7 +439,7 @@ __all__ = [
     "ROUTE_OWNER_NAME",
     "ROUTE_FAMILY_NAME",
     "config_router",
-    "router",        # FIX: added so main.py router discovery finds this module
+    "router",        # FIX v5.8.0: added for main.py router discovery
     "mount",
     "get_settings",
     "allowed_tokens",
