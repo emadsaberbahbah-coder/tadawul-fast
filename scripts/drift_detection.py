@@ -73,7 +73,7 @@ from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, Awaitable
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union, Awaitable
 
 # ---------------------------------------------------------------------------
 # High-Performance JSON fallback
@@ -138,7 +138,6 @@ except Exception:
 # ---------------------------------------------------------------------------
 try:
     import aiohttp  # type: ignore
-
     _AIOHTTP_AVAILABLE = True
 except Exception:
     aiohttp = None  # type: ignore
@@ -150,7 +149,6 @@ except Exception:
 try:
     from opentelemetry import trace  # type: ignore
     from opentelemetry.trace import Status, StatusCode  # type: ignore
-
     _OTEL_AVAILABLE = True
 except Exception:
     trace = None  # type: ignore
@@ -158,7 +156,10 @@ except Exception:
     StatusCode = None  # type: ignore
     _OTEL_AVAILABLE = False
 
-_TRACING_ENABLED = (os.getenv("CORE_TRACING_ENABLED", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+_TRACING_ENABLED = (os.getenv("CORE_TRACING_ENABLED", "") or "").strip().lower() in {
+    "1", "true", "yes", "y", "on"
+}
+
 
 class TraceContext:
     """
@@ -168,10 +169,15 @@ class TraceContext:
     tracer.start_as_current_span() returns a context manager.
     We must enter it to obtain the span instance.
     """
+
     def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
         self.name = name
         self.attributes = attributes or {}
-        self._tracer = trace.get_tracer(__name__) if (_OTEL_AVAILABLE and _TRACING_ENABLED and trace) else None
+        self._tracer = (
+            trace.get_tracer(__name__)
+            if (_OTEL_AVAILABLE and _TRACING_ENABLED and trace)
+            else None
+        )
         self._cm = None
         self.span = None
 
@@ -207,6 +213,7 @@ class TraceContext:
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         return self.__exit__(exc_type, exc_val, exc_tb)
 
+
 # =============================================================================
 # Core Configuration & Logging
 # =============================================================================
@@ -219,7 +226,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger("DriftDetector")
 
-_CPU_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="DriftWorker")
+_CPU_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="DriftWorker"
+)
+
 
 # =============================================================================
 # Enums and Data Models
@@ -229,6 +239,7 @@ class DriftSeverity(str, Enum):
     NONE = "none"
     WARNING = "warning"
     CRITICAL = "critical"
+
 
 @dataclass(slots=True)
 class FeatureDriftStat:
@@ -240,6 +251,7 @@ class FeatureDriftStat:
     is_drifted: bool
     severity: DriftSeverity
 
+
 @dataclass(slots=True)
 class ModelDriftReport:
     model_name: str
@@ -250,7 +262,7 @@ class ModelDriftReport:
     feature_stats: List[FeatureDriftStat]
     confidence_drop: float
     anomaly_rate: float
-    recommendation: str
+    recommendation: str          # ML retraining action (not a financial signal)
     top_drift_features: List[str]
 
     def to_dict(self) -> Dict[str, Any]:
@@ -268,17 +280,25 @@ class ModelDriftReport:
             "version": SCRIPT_VERSION,
         }
 
+
 # =============================================================================
 # Full Jitter Exponential Backoff
 # =============================================================================
 
 class FullJitterBackoff:
-    def __init__(self, max_retries: int = 3, base_delay: float = 0.8, max_delay: float = 15.0):
+    def __init__(
+        self,
+        max_retries: int = 3,
+        base_delay: float = 0.8,
+        max_delay: float = 15.0,
+    ):
         self.max_retries = max(1, int(max_retries))
         self.base_delay = max(0.05, float(base_delay))
         self.max_delay = max(0.2, float(max_delay))
 
-    async def execute_async(self, func: Callable[..., Awaitable[Any]], *args: Any, **kwargs: Any) -> Any:
+    async def execute_async(
+        self, func: Callable[..., Awaitable[Any]], *args: Any, **kwargs: Any
+    ) -> Any:
         last_exc: Optional[BaseException] = None
         for attempt in range(self.max_retries):
             try:
@@ -289,43 +309,49 @@ class FullJitterBackoff:
                     raise
                 cap = min(self.max_delay, self.base_delay * (2 ** attempt))
                 sleep_time = random.uniform(0.0, cap)
-                logger.warning(f"Operation failed: {e}. Retry in {sleep_time:.2f}s ({attempt+1}/{self.max_retries})")
+                logger.warning(
+                    "Operation failed: %s. Retry in %.2fs (%d/%d)",
+                    e, sleep_time, attempt + 1, self.max_retries,
+                )
                 await asyncio.sleep(sleep_time)
         raise last_exc  # type: ignore
+
 
 # =============================================================================
 # Utility: Signed audit log entry (HMAC)
 # =============================================================================
 
 def _audit_secret() -> bytes:
-    # Set DRIFT_AUDIT_SECRET in Render env for real use
     s = (os.getenv("DRIFT_AUDIT_SECRET") or os.getenv("AUDIT_SECRET") or "").strip()
     if not s:
-        # non-empty default prevents crashes; do NOT rely on this for real auditing
         s = "CHANGE_ME_DRIFT_AUDIT_SECRET"
     return s.encode("utf-8")
 
+
 def sign_audit(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Produces a deterministic signature over canonical JSON bytes.
-    """
+    """Produces a deterministic signature over canonical JSON bytes."""
     canonical = json_dumps(payload, indent=0)
     sig = hmac.new(_audit_secret(), canonical.encode("utf-8"), hashlib.sha256).hexdigest()
     return {"signature": sig, "algo": "HMAC-SHA256", "canonical": canonical}
+
 
 # =============================================================================
 # Drift Core
 # =============================================================================
 
 def _to_np(x: Any) -> "np.ndarray":
-    # safe conversion; caller guarantees numpy exists
     return np.asarray(x, dtype=float)  # type: ignore
 
+
 def _finite(arr: "np.ndarray") -> "np.ndarray":
-    # remove NaN/Inf
     return arr[np.isfinite(arr)]  # type: ignore
 
-def calculate_psi(expected: "np.ndarray", actual: "np.ndarray", buckets: int = 10) -> float:
+
+def calculate_psi(
+    expected: "np.ndarray",
+    actual: "np.ndarray",
+    buckets: int = 10,
+) -> float:
     """
     PSI using quantile buckets based on expected distribution.
     Robust for constant arrays.
@@ -335,7 +361,6 @@ def calculate_psi(expected: "np.ndarray", actual: "np.ndarray", buckets: int = 1
     if expected.size == 0 or actual.size == 0:
         return 0.0
 
-    # If expected is constant, PSI is not meaningful; return 0 unless actual differs a lot
     if float(np.std(expected)) < 1e-12:  # type: ignore
         return 0.25 if float(np.std(actual)) > 1e-6 else 0.0
 
@@ -361,6 +386,7 @@ def calculate_psi(expected: "np.ndarray", actual: "np.ndarray", buckets: int = 1
         return 0.0
     return psi
 
+
 def detect_feature_drift(
     baseline: "np.ndarray",
     current: "np.ndarray",
@@ -373,7 +399,6 @@ def detect_feature_drift(
     baseline = _finite(baseline)
     current = _finite(current)
 
-    # Defaults when SciPy not available
     ks_stat = 0.0
     p_value = 1.0
     wd = 0.0
@@ -391,7 +416,6 @@ def detect_feature_drift(
     is_drifted = False
     severity = DriftSeverity.NONE
 
-    # Decision: PSI is primary, KS p-value is secondary (when available)
     if psi >= psi_crit or (p_value < ks_p_crit and psi >= psi_warn):
         is_drifted = True
         severity = DriftSeverity.CRITICAL if psi >= psi_crit else DriftSeverity.WARNING
@@ -408,6 +432,7 @@ def detect_feature_drift(
         is_drifted=is_drifted,
         severity=severity,
     )
+
 
 def analyze_model_drift(
     model_name: str,
@@ -433,11 +458,15 @@ def analyze_model_drift(
     drift_pct = drifted_count / max(1, total)
 
     overall = DriftSeverity.NONE
-    if any(f.severity == DriftSeverity.CRITICAL for f in feature_stats) or drift_pct >= 0.30:
+    if (
+        any(f.severity == DriftSeverity.CRITICAL for f in feature_stats)
+        or drift_pct >= 0.30
+    ):
         overall = DriftSeverity.CRITICAL
     elif drift_pct >= 0.15:
         overall = DriftSeverity.WARNING
 
+    # ML retraining action text — not a financial recommendation
     recommendation = "No action required."
     if overall == DriftSeverity.CRITICAL:
         recommendation = "IMMEDIATE RETRAINING REQUIRED. Model degraded."
@@ -446,10 +475,14 @@ def analyze_model_drift(
 
     # IsolationForest anomaly on current (optional)
     anomaly_rate = 0.0
-    if _SKLEARN_AVAILABLE and IsolationForest is not None and total > 0 and len(current_df) >= max(80, min_samples):
+    if (
+        _SKLEARN_AVAILABLE
+        and IsolationForest is not None
+        and total > 0
+        and len(current_df) >= max(80, min_samples)
+    ):
         try:
             use_df = current_df[features].copy()
-            # keep numeric only; coerce
             use_df = use_df.apply(pd.to_numeric, errors="coerce")  # type: ignore
             use_df = use_df.fillna(use_df.mean(numeric_only=True))
             X = use_df.values
@@ -459,9 +492,12 @@ def analyze_model_drift(
         except Exception:
             anomaly_rate = 0.0
 
-    # top drift features by PSI
     top = sorted(feature_stats, key=lambda x: x.psi_score, reverse=True)[:top_k]
-    top_names = [f"{t.feature_name} (PSI={t.psi_score:.3f}, p={t.p_value:.3g})" for t in top if t.is_drifted][:top_k]
+    top_names = [
+        f"{t.feature_name} (PSI={t.psi_score:.3f}, p={t.p_value:.3g})"
+        for t in top
+        if t.is_drifted
+    ][:top_k]
 
     return ModelDriftReport(
         model_name=model_name,
@@ -470,17 +506,22 @@ def analyze_model_drift(
         drifted_features=drifted_count,
         overall_severity=overall,
         feature_stats=feature_stats,
-        confidence_drop=0.0,  # placeholder: wire to your prediction logs later
+        confidence_drop=0.0,
         anomaly_rate=anomaly_rate,
         recommendation=recommendation,
         top_drift_features=top_names,
     )
 
+
 # =============================================================================
 # Webhook Alerting
 # =============================================================================
 
-async def send_slack_alert(webhook_url: str, report: ModelDriftReport, audit_sig: Dict[str, Any]) -> None:
+async def send_slack_alert(
+    webhook_url: str,
+    report: ModelDriftReport,
+    audit_sig: Dict[str, Any],
+) -> None:
     if not _AIOHTTP_AVAILABLE or not webhook_url:
         return
 
@@ -504,7 +545,8 @@ async def send_slack_alert(webhook_url: str, report: ModelDriftReport, audit_sig
             await session.post(webhook_url, json=payload)
         logger.info("Sent drift alert to Slack.")
     except Exception as e:
-        logger.error(f"Failed to send Slack alert: {e}")
+        logger.error("Failed to send Slack alert: %s", e)
+
 
 # =============================================================================
 # Data loading
@@ -527,7 +569,7 @@ def _load_df(path: str) -> "pd.DataFrame":
 # FIX v4.2.0: Live data source loader.
 # Pulls real rows from Google Sheets using integrations.google_sheets_service,
 # which is the module we maintain at v5.5.3. Uses get_rows_for_sheet() — the
-# method we specifically added to that module for external reader discovery.
+# method specifically added to that module for external reader discovery.
 def _load_from_live_source(
     pages: List[str],
     spreadsheet_id: str,
@@ -559,7 +601,9 @@ def _load_from_live_source(
                     continue
 
             if mod is None:
-                logger.warning("Cannot import google_sheets_service — skipping live page %s", page)
+                logger.warning(
+                    "Cannot import google_sheets_service — skipping live page %s", page
+                )
                 continue
 
             reader = (
@@ -568,7 +612,9 @@ def _load_from_live_source(
                 or getattr(mod, "get_sheet_rows", None)
             )
             if not callable(reader):
-                logger.warning("google_sheets_service has no get_rows_for_sheet — skipping %s", page)
+                logger.warning(
+                    "google_sheets_service has no get_rows_for_sheet — skipping %s", page
+                )
                 continue
 
             page_rows = reader(page, spreadsheet_id, limit=limit)
@@ -596,9 +642,13 @@ def _load_from_live_source(
             numeric_df = numeric_df[keep]
 
     if numeric_df.empty:
-        raise RuntimeError("Live data loaded but no numeric columns found for drift analysis.")
+        raise RuntimeError(
+            "Live data loaded but no numeric columns found for drift analysis."
+        )
 
-    logger.info("Live data: %d rows × %d numeric columns", len(numeric_df), len(numeric_df.columns))
+    logger.info(
+        "Live data: %d rows × %d numeric columns", len(numeric_df), len(numeric_df.columns)
+    )
     return numeric_df
 
 
@@ -614,17 +664,14 @@ def _resolve_mode_and_sources(args: "argparse.Namespace") -> str:
        - If DEFAULT_SPREADSHEET_ID is set → live
        - Otherwise → mock (with a clear warning)
     """
-    # 1. Explicit CLI override
     mode_arg = getattr(args, "mode", "").strip().lower()
     if mode_arg in ("mock", "file", "live"):
         return mode_arg
 
-    # 2. Env var
     mode_env = (os.getenv("DRIFT_MODE") or "").strip().lower()
     if mode_env in ("mock", "file", "live"):
         return mode_env
 
-    # 3. Auto-detect
     has_file_paths = bool(
         (getattr(args, "baseline", "") or os.getenv("DRIFT_BASELINE_PATH", "")).strip()
         and (getattr(args, "current", "") or os.getenv("DRIFT_CURRENT_PATH", "")).strip()
@@ -632,7 +679,10 @@ def _resolve_mode_and_sources(args: "argparse.Namespace") -> str:
     has_spreadsheet = bool((os.getenv("DEFAULT_SPREADSHEET_ID") or "").strip())
 
     if has_file_paths:
-        logger.info("Auto-detected mode: file (--baseline/--current or DRIFT_BASELINE_PATH/DRIFT_CURRENT_PATH set)")
+        logger.info(
+            "Auto-detected mode: file "
+            "(--baseline/--current or DRIFT_BASELINE_PATH/DRIFT_CURRENT_PATH set)"
+        )
         return "file"
     if has_spreadsheet:
         logger.info("Auto-detected mode: live (DEFAULT_SPREADSHEET_ID set)")
@@ -645,27 +695,37 @@ def _resolve_mode_and_sources(args: "argparse.Namespace") -> str:
     )
     return "mock"
 
-def generate_mock_data(drift: bool = False) -> Tuple["pd.DataFrame", "pd.DataFrame"]:
+
+def generate_mock_data(
+    drift: bool = False,
+) -> Tuple["pd.DataFrame", "pd.DataFrame"]:
     np.random.seed(42)  # type: ignore
     n = 1000
-    baseline = pd.DataFrame({  # type: ignore
-        "pe_ratio": np.random.normal(15, 5, n),  # type: ignore
-        "volatility": np.random.lognormal(0, 0.5, n),  # type: ignore
-        "rsi": np.random.uniform(30, 70, n),  # type: ignore
-    })
+    baseline = pd.DataFrame(  # type: ignore
+        {
+            "pe_ratio":   np.random.normal(15, 5, n),      # type: ignore
+            "volatility": np.random.lognormal(0, 0.5, n),  # type: ignore
+            "rsi":        np.random.uniform(30, 70, n),     # type: ignore
+        }
+    )
     if drift:
-        current = pd.DataFrame({  # type: ignore
-            "pe_ratio": np.random.normal(25, 8, n),  # type: ignore
-            "volatility": np.random.lognormal(0.5, 0.8, n),  # type: ignore
-            "rsi": np.random.uniform(30, 70, n),  # type: ignore
-        })
+        current = pd.DataFrame(  # type: ignore
+            {
+                "pe_ratio":   np.random.normal(25, 8, n),      # type: ignore
+                "volatility": np.random.lognormal(0.5, 0.8, n),  # type: ignore
+                "rsi":        np.random.uniform(30, 70, n),     # type: ignore
+            }
+        )
     else:
-        current = pd.DataFrame({  # type: ignore
-            "pe_ratio": np.random.normal(15.2, 5.1, n),  # type: ignore
-            "volatility": np.random.lognormal(0.05, 0.52, n),  # type: ignore
-            "rsi": np.random.uniform(29, 71, n),  # type: ignore
-        })
+        current = pd.DataFrame(  # type: ignore
+            {
+                "pe_ratio":   np.random.normal(15.2, 5.1, n),  # type: ignore
+                "volatility": np.random.lognormal(0.05, 0.52, n),  # type: ignore
+                "rsi":        np.random.uniform(29, 71, n),    # type: ignore
+            }
+        )
     return baseline, current
+
 
 # =============================================================================
 # Orchestrator
@@ -691,14 +751,16 @@ async def run_drift_analysis(
             current_df,
         )
 
-    logger.info(f"Drift Analysis Complete: {report.overall_severity.value.upper()}")
-    logger.info(f"Drifted Features: {report.drifted_features}/{report.total_features}")
-    logger.info(f"Anomaly Rate: {report.anomaly_rate:.2%}")
-    logger.info(f"Recommendation: {report.recommendation}")
+    logger.info("Drift Analysis Complete: %s", report.overall_severity.value.upper())
+    logger.info("Drifted Features: %d/%d", report.drifted_features, report.total_features)
+    logger.info("Anomaly Rate: %.2f%%", report.anomaly_rate * 100)
+    logger.info("Recommendation: %s", report.recommendation)
 
     os.makedirs(export_dir, exist_ok=True)
     ts = int(time.time())
-    export_path = os.path.join(export_dir, f"drift_report_{model_name}_{ts}.json")
+    export_path = os.path.join(
+        export_dir, f"drift_report_{model_name}_{ts}.json"
+    )
 
     audit_payload = {
         "event": "model_drift_report",
@@ -712,27 +774,32 @@ async def run_drift_analysis(
     }
     audit_sig = sign_audit(audit_payload)
 
-    def _write():
+    def _write() -> None:
         payload = report.to_dict()
         payload["audit"] = audit_payload | audit_sig
         with open(export_path, "w", encoding="utf-8") as f:
             f.write(json_dumps(payload, indent=2))
 
     await loop.run_in_executor(_CPU_EXECUTOR, _write)
-    logger.info(f"Report exported to {export_path}")
+    logger.info("Report exported to %s", export_path)
 
     if export_audit:
-        audit_path = os.path.join(export_dir, f"drift_audit_{model_name}_{ts}.json")
-        def _write_audit():
+        audit_path = os.path.join(
+            export_dir, f"drift_audit_{model_name}_{ts}.json"
+        )
+
+        def _write_audit() -> None:
             with open(audit_path, "w", encoding="utf-8") as f:
                 f.write(json_dumps(audit_payload | audit_sig, indent=2))
+
         await loop.run_in_executor(_CPU_EXECUTOR, _write_audit)
-        logger.info(f"Audit exported to {audit_path}")
+        logger.info("Audit exported to %s", audit_path)
 
     if report.overall_severity != DriftSeverity.NONE and webhook_url:
         await send_slack_alert(webhook_url, report, audit_sig)
 
     return report
+
 
 async def main_async(args: argparse.Namespace) -> int:
     if not _ML_AVAILABLE:
@@ -740,8 +807,6 @@ async def main_async(args: argparse.Namespace) -> int:
         return 1
 
     # FIX v4.2.0: Resolve data source mode before loading anything.
-    # Previously this block always fell through to mock data if --baseline/--current
-    # were not provided, even when a live spreadsheet was available.
     mode = _resolve_mode_and_sources(args)
     logger.info("Drift detection mode: %s", mode)
 
@@ -749,9 +814,12 @@ async def main_async(args: argparse.Namespace) -> int:
     current_df: "pd.DataFrame"
 
     if mode == "file":
-        # Support both CLI args and env vars for headless/cron operation
-        baseline_path = getattr(args, "baseline", "") or os.getenv("DRIFT_BASELINE_PATH", "")
-        current_path = getattr(args, "current", "") or os.getenv("DRIFT_CURRENT_PATH", "")
+        baseline_path = (
+            getattr(args, "baseline", "") or os.getenv("DRIFT_BASELINE_PATH", "")
+        )
+        current_path = (
+            getattr(args, "current", "") or os.getenv("DRIFT_CURRENT_PATH", "")
+        )
         if not baseline_path or not current_path:
             logger.error(
                 "mode=file but no baseline/current paths. "
@@ -764,7 +832,6 @@ async def main_async(args: argparse.Namespace) -> int:
         current_df = _load_df(current_path)
 
     elif mode == "live":
-        # Pull real data from Google Sheets via google_sheets_service
         spreadsheet_id = (
             getattr(args, "spreadsheet_id", "")
             or os.getenv("DEFAULT_SPREADSHEET_ID", "")
@@ -777,7 +844,6 @@ async def main_async(args: argparse.Namespace) -> int:
             )
             return 1
 
-        # Which pages to compare (default: the 3 main source pages)
         raw_pages = (
             getattr(args, "source_pages", "")
             or os.getenv("DRIFT_SOURCE_PAGES", "")
@@ -786,15 +852,12 @@ async def main_async(args: argparse.Namespace) -> int:
         pages = [p.strip() for p in raw_pages.split(",") if p.strip()]
         logger.info("Loading live data from sheets: %s", pages)
 
-        # Load current (live) data from Google Sheets
         loop = asyncio.get_running_loop()
         current_df = await loop.run_in_executor(
             _CPU_EXECUTOR,
             lambda: _load_from_live_source(pages, spreadsheet_id, limit=2000),
         )
 
-        # Baseline: try DRIFT_BASELINE_SNAPSHOT file first, otherwise use current as both
-        # (first-run bootstrap: baseline = current; next run compares against stored snapshot)
         snapshot_path = (
             getattr(args, "baseline_snapshot", "")
             or os.getenv("DRIFT_BASELINE_SNAPSHOT", "")
@@ -803,8 +866,9 @@ async def main_async(args: argparse.Namespace) -> int:
         if snapshot_path and Path(snapshot_path).exists():
             logger.info("Loading baseline snapshot from: %s", snapshot_path)
             baseline_df = _load_df(snapshot_path)
-            # Align columns — only keep columns present in both
-            common_cols = [c for c in current_df.columns if c in baseline_df.columns]
+            common_cols = [
+                c for c in current_df.columns if c in baseline_df.columns
+            ]
             if not common_cols:
                 logger.warning(
                     "Baseline snapshot has no overlapping columns with live data. "
@@ -822,19 +886,25 @@ async def main_async(args: argparse.Namespace) -> int:
                 snapshot_path or "not set",
             )
             baseline_df = current_df.copy()
-            # Save current as the baseline snapshot for future runs
             if snapshot_path:
                 current_df.to_csv(snapshot_path, index=False)
                 logger.info("Saved baseline snapshot to: %s", snapshot_path)
 
     else:  # mode == "mock"
-        logger.info("Using synthetic mock data (drift=%s)", bool(getattr(args, "force_drift", False)))
-        baseline_df, current_df = generate_mock_data(drift=bool(getattr(args, "force_drift", False)))
+        logger.info(
+            "Using synthetic mock data (drift=%s)",
+            bool(getattr(args, "force_drift", False)),
+        )
+        baseline_df, current_df = generate_mock_data(
+            drift=bool(getattr(args, "force_drift", False))
+        )
 
-    # Select features if specified
     if args.features:
         cols = [c.strip() for c in args.features.split(",") if c.strip()]
-        keep = [c for c in cols if c in baseline_df.columns and c in current_df.columns]
+        keep = [
+            c for c in cols
+            if c in baseline_df.columns and c in current_df.columns
+        ]
         if keep:
             baseline_df = baseline_df[keep]
             current_df = current_df[keep]
@@ -851,14 +921,28 @@ async def main_async(args: argparse.Namespace) -> int:
     _CPU_EXECUTOR.shutdown(wait=False)
     return 0
 
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description=f"Tadawul ML Drift Detector v{SCRIPT_VERSION}")
-    parser.add_argument("--model-name", default="ensemble_v1", help="Model name label for reporting")
-    parser.add_argument("--export-dir", default="reports", help="Directory to save drift reports")
-    parser.add_argument("--webhook", default=os.getenv("DRIFT_SLACK_WEBHOOK", ""), help="Slack webhook URL (optional)")
-    parser.add_argument("--force-drift", action="store_true", help="Force synthetic drift (mock mode only)")
-    # FIX v4.2.0: Explicit mode argument — previously no --mode existed so
-    # the script silently ran on mock data whenever --baseline/--current weren't set.
+    parser = argparse.ArgumentParser(
+        description=f"Tadawul ML Drift Detector v{SCRIPT_VERSION}"
+    )
+    parser.add_argument(
+        "--model-name", default="ensemble_v1",
+        help="Model name label for reporting",
+    )
+    parser.add_argument(
+        "--export-dir", default="reports",
+        help="Directory to save drift reports",
+    )
+    parser.add_argument(
+        "--webhook", default=os.getenv("DRIFT_SLACK_WEBHOOK", ""),
+        help="Slack webhook URL (optional)",
+    )
+    parser.add_argument(
+        "--force-drift", action="store_true",
+        help="Force synthetic drift (mock mode only)",
+    )
+    # FIX v4.2.0: Explicit mode argument
     parser.add_argument(
         "--mode",
         default=os.getenv("DRIFT_MODE", ""),
@@ -884,16 +968,27 @@ def main() -> None:
     )
     parser.add_argument(
         "--source-pages",
-        default=os.getenv("DRIFT_SOURCE_PAGES", "Market_Leaders,Global_Markets,Mutual_Funds"),
+        default=os.getenv(
+            "DRIFT_SOURCE_PAGES", "Market_Leaders,Global_Markets,Mutual_Funds"
+        ),
         help="Comma-separated sheet tabs for live mode. Also: DRIFT_SOURCE_PAGES env var.",
     )
     parser.add_argument(
         "--baseline-snapshot",
         default=os.getenv("DRIFT_BASELINE_SNAPSHOT", ""),
-        help="JSON/CSV path for live-mode baseline cache. Also: DRIFT_BASELINE_SNAPSHOT env var.",
+        help=(
+            "JSON/CSV path for live-mode baseline cache. "
+            "Also: DRIFT_BASELINE_SNAPSHOT env var."
+        ),
     )
-    parser.add_argument("--features", default="", help="Comma-separated feature whitelist (optional)")
-    parser.add_argument("--no-audit", action="store_true", help="Disable audit signature export files")
+    parser.add_argument(
+        "--features", default="",
+        help="Comma-separated feature whitelist (optional)",
+    )
+    parser.add_argument(
+        "--no-audit", action="store_true",
+        help="Disable audit signature export files",
+    )
 
     args = parser.parse_args()
 
@@ -903,6 +998,7 @@ def main() -> None:
         logger.info("Drift detection interrupted by user.")
         _CPU_EXECUTOR.shutdown(wait=False)
         sys.exit(130)
+
 
 if __name__ == "__main__":
     main()
