@@ -28,7 +28,6 @@ from importlib.util import find_spec
 from typing import Dict, List
 
 __all__ = ["is_provider_available", "available_providers"]
-
 __version__ = "1.0.1"
 
 # Provider module names used by your repo (add more if you create new providers)
@@ -47,21 +46,18 @@ def is_provider_available(module_name: str) -> bool:
     Return True if a provider module appears importable without actually importing it.
 
     Example:
-        is_provider_available("argaam_provider") -> checks providers.argaam_provider
+        is_provider_available("argaam_provider")  # checks providers.argaam_provider
     """
     name = (module_name or "").strip()
     if not name:
         return False
-    if name.startswith("providers."):
-        fq = name
-    else:
-        fq = f"providers.{name}"
+    fq = name if name.startswith("providers.") else f"providers.{name}"
     return find_spec(fq) is not None
 
 
 def available_providers() -> Dict[str, bool]:
     """
-    Returns a dict {provider_module: available_bool} for known providers.
-    This is a lightweight discovery helper (no imports).
+    Return a dict {provider_module: available_bool} for all known providers.
+    Lightweight discovery helper — performs no imports.
     """
     return {m: is_provider_available(m) for m in _KNOWN_PROVIDERS}
