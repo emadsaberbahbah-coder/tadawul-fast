@@ -1,5 +1,5 @@
 # =============================================================================
-# TADAWUL FAST BRIDGE – ENTERPRISE GITIGNORE (v7.0.0)
+# TADAWUL FAST BRIDGE – ENTERPRISE GITIGNORE (v7.0.1)
 # =============================================================================
 # QUANTUM EDITION | ZERO-TRUST SECURITY | CLOUD-NATIVE | NARROW-IGNORE POLICY
 #
@@ -9,7 +9,7 @@
 # • Keep source and schema files tracked
 # • Ignore generated outputs, runtime state, credentials, and local-only artifacts
 #
-# Version: 7.0.0
+# Version: 7.0.1
 # =============================================================================
 
 
@@ -30,6 +30,8 @@ sync_*.log
 sync_execution.log
 app_*.log
 worker_*.log
+drift_*.json
+drift_*.log
 
 # Runtime caches / temp
 /models/
@@ -470,11 +472,20 @@ Dockerfile.local
 !examples/
 !migrations/
 !notebooks/
+!.github/
 !main.py
 !app.py
 !config.py
+!env.py
+!worker.py
 !requirements.txt
 !requirements-*.txt
+!render.yaml
+!Procfile
+!runtime.txt
+!start_web.sh
+!*.sh
+!daily_sync*.yml
 !.gitignore
 !.dockerignore
 !docker-compose.example.yml
@@ -486,5 +497,5 @@ Dockerfile.local
 # =============================================================================
 # FINAL SAFEGUARD
 # =============================================================================
-# This file is part of TADAWUL FAST BRIDGE v7.0.0
+# This file is part of TADAWUL FAST BRIDGE v7.0.1
 # Do not remove without understanding the security implications.
