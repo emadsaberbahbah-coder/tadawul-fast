@@ -39,6 +39,8 @@ v7.2.0 Changes
        considered as valid candidates.
 - FIX: token comparison now uses constant-time matching via hmac.compare_digest
        instead of plain membership checks.
+- FIX: auth_ok() returns False (not True) when require_auth=True but no tokens
+       are configured — previously this was an unsafe open fallback.
 - ENH: supports additional common auth transports:
        X-API-Key / Api-Key headers and request.query_params when allowed.
 - ENH: settings public/runtime metadata now expose settings_cache_ttl_sec.
@@ -158,6 +160,22 @@ def _mask_secret(value: str, keep: int = 4) -> str:
     return f"{'*' * max(4, len(text) - keep)}{text[-keep:]}"
 
 
+def _safe_compare_token(candidate: str, allowed: str) -> bool:
+    """Constant-time token comparison using hmac.compare_digest."""
+    c = _strip(candidate)
+    a = _strip(allowed)
+    if not c or not a:
+        return False
+    try:
+        return hmac.compare_digest(c, a)
+    except Exception:
+        return c == a
+
+
+def _allow_query_transport(settings: "TFBSettings") -> bool:
+    return bool(settings.allow_query_token)
+
+
 def _coerce_headers(headers: Any) -> Dict[str, str]:
     if headers is None:
         return {}
@@ -210,21 +228,6 @@ def _unique_keep_order(values: Iterable[str]) -> List[str]:
             seen.add(item)
             out.append(item)
     return out
-
-
-def _safe_compare_token(candidate: str, allowed: str) -> bool:
-    c = _strip(candidate)
-    a = _strip(allowed)
-    if not c or not a:
-        return False
-    try:
-        return hmac.compare_digest(c, a)
-    except Exception:
-        return c == a
-
-
-def _allow_query_transport(settings: "TFBSettings") -> bool:
-    return bool(settings.allow_query_token)
 
 
 # =============================================================================
@@ -474,6 +477,7 @@ def reload_settings() -> TFBSettings:
 # Auth helpers
 # =============================================================================
 def _query_token_candidates_from_request(request: Any, allow_query_token: bool) -> List[str]:
+    """Extract token candidates from request.query_params — only when allowed."""
     if request is None or not allow_query_token:
         return []
     out: List[str] = []
@@ -532,6 +536,7 @@ def _token_candidates(
             pass
         candidates.extend(_query_token_candidates_from_request(request, allow_query_token))
 
+    # kwargs-based query token transport (only when explicitly allowed)
     if allow_query_token:
         for key in ("app_token", "auth_token", "api_token", "query_token", "api_key"):
             if key in kwargs:
@@ -559,6 +564,8 @@ def auth_ok(
 
     allowed = [t for t in s.allowed_tokens if _strip(t)]
     if not allowed:
+        # FIX v7.2.0: require_auth=True but no tokens configured → deny
+        # (v7.0.0 returned True here, which was an unsafe open fallback)
         return False
 
     candidates = _token_candidates(
@@ -576,6 +583,7 @@ def auth_ok(
         if not candidate:
             continue
         for allowed_token in allowed:
+            # FIX v7.2.0: constant-time comparison (was plain set membership)
             if _safe_compare_token(candidate, allowed_token):
                 return True
     return False
