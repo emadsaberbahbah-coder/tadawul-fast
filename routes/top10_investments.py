@@ -56,7 +56,7 @@ from fastapi.encoders import jsonable_encoder
 logger = logging.getLogger("routes.investment_advisor")
 logger.addHandler(logging.NullHandler())
 
-INVESTMENT_ADVISOR_VERSION = "2.0.0"
+INVESTMENT_ADVISOR_VERSION = "2.1.0"
 TOP10_PAGE_NAME = "Top_10_Investments"
 
 router = APIRouter(prefix="/v1/advanced", tags=["advanced"])
@@ -463,18 +463,26 @@ def _ensure_top10_keys_present(keys: List[str], headers: List[str]) -> tuple[Lis
 
 
 def _load_schema_defaults() -> tuple[List[str], List[str]]:
-    try:
-        from core.sheets.schema_registry import get_sheet_spec  # type: ignore
-
-        spec = get_sheet_spec(TOP10_PAGE_NAME)
-        cols = getattr(spec, "columns", None) or []
-        keys = [getattr(c, "key", "") for c in cols]
-        headers = [getattr(c, "header", "") for c in cols]
-        keys = [k for k in keys if isinstance(k, str) and k]
-        headers = [h for h in headers if isinstance(h, str) and h]
-        return headers, keys
-    except Exception:
-        return [], []
+    # FIX v2.1.0: multi-path fallback for schema_registry
+    for _sreg_path in ("core.sheets.schema_registry", "core.schema_registry", "schema_registry"):
+        try:
+            import importlib as _il
+            _sreg = _il.import_module(_sreg_path)
+            get_sheet_spec = getattr(_sreg, "get_sheet_spec", None)
+            if not callable(get_sheet_spec):
+                continue
+            spec = get_sheet_spec(TOP10_PAGE_NAME)
+            cols = getattr(spec, "columns", None) or []
+            keys = [getattr(c, "key", "") for c in cols]
+            headers = [getattr(c, "header", "") for c in cols]
+            keys = [k for k in keys if isinstance(k, str) and k]
+            headers = [h for h in headers if isinstance(h, str) and h]
+            if keys and headers:
+                return headers, keys
+            break
+        except Exception:
+            continue
+    return [], []
 
 
 def _schema_only_payload(
