@@ -10,11 +10,11 @@ JSON-SAFE • GET+POST SAFE • FAIL-SOFT • CONTRACT-PROJECTED • ENGINE-TOLE
 What this revision improves
 --------------------------
 - FIX: special pages now prefer the canonical sheet-rows owners first:
-      analysis wrapper -> advanced root owner -> engine fallback.
+       analysis wrapper -> advanced root owner -> engine fallback.
 - FIX: advisor short family no longer depends on buggy downstream derived-page
-      runners before trying the already-working root/analysis routes.
+       runners before trying the already-working root/analysis routes.
 - FIX: Insights_Analysis, Top_10_Investments, and Data_Dictionary are handled
-      with bridge-first logic so advisor routes align with proven live paths.
+       with bridge-first logic so advisor routes align with proven live paths.
 - FIX: tabular payloads are projected to canonical headers when available.
 - FIX: responses remain fail-soft and JSON-safe, exposing resolver metadata.
 """
@@ -52,6 +52,7 @@ def _secure_equals(a: str, b: str) -> bool:
         return hmac.compare_digest(str(a), str(b))
     except Exception:
         return str(a) == str(b)
+
 router = APIRouter(prefix="/v1/advisor", tags=["advisor"])
 
 DEFAULT_ADVISOR_PAGE = "Top_10_Investments"
