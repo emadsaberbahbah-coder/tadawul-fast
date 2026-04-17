@@ -55,6 +55,7 @@ import json
 import os
 import re
 import sys
+import uuid
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -294,7 +295,6 @@ def _plan_legacy_actions(
 
 
 def uuid4_short() -> str:
-    import uuid
     return uuid.uuid4().hex[:8]
 
 
@@ -302,77 +302,6 @@ def _plan_missing_canonical_sheets(existing_titles: Sequence[str]) -> List[str]:
     existing_set = set(existing_titles)
     missing = [s for s in CANONICAL_PAGES if s not in existing_set]
     return missing
-
-
-# =============================================================================
-# Execution: apply plan
-# =============================================================================
-
-def _apply_rename(service, spreadsheet_id: str, sheets_props: Dict[str, Dict[str, Any]], old_title: str, new_title: str) -> int:
-    props = sheets_props.get(old_title)
-    if not props:
-        return 0
-    sid = _sheet_id(props)
-    req = {
-        "updateSheetProperties": {
-            "properties": {"sheetId": sid, "title": new_title},
-            "fields": "title",
-        }
-    }
-    _batch_update(service, spreadsheet_id, [req])
-    return 1
-
-
-def _apply_delete(service, spreadsheet_id: str, sheets_props: Dict[str, Dict[str, Any]], title: str) -> int:
-    props = sheets_props.get(title)
-    if not props:
-        return 0
-    sid = _sheet_id(props)
-    req = {"deleteSheet": {"sheetId": sid}}
-    _batch_update(service, spreadsheet_id, [req])
-    return 1
-
-
-def _apply_add_sheet(service, spreadsheet_id: str, title: str) -> int:
-    req = {"addSheet": {"properties": {"title": title}}}
-    _batch_update(service, spreadsheet_id, [req])
-    return 1
-
-
-def _apply_freeze_row1_and_filter(service, spreadsheet_id: str, sheet_id: int) -> int:
-    """
-    Freeze row 1 and set a basic filter over row 1 across a wide column range.
-    """
-    requests: List[Dict[str, Any]] = []
-
-    requests.append(
-        {
-            "updateSheetProperties": {
-                "properties": {"sheetId": sheet_id, "gridProperties": {"frozenRowCount": 1}},
-                "fields": "gridProperties.frozenRowCount",
-            }
-        }
-    )
-
-    # Set basic filter for row 1 (endColumnIndex left large; Sheets will clamp)
-    requests.append(
-        {
-            "setBasicFilter": {
-                "filter": {
-                    "range": {
-                        "sheetId": sheet_id,
-                        "startRowIndex": 0,
-                        "endRowIndex": 1,
-                        "startColumnIndex": 0,
-                        "endColumnIndex": 200,  # generous
-                    }
-                }
-            }
-        }
-    )
-
-    _batch_update(service, spreadsheet_id, requests)
-    return len(requests)
 
 
 # =============================================================================
@@ -514,40 +443,58 @@ def run_migration(plan: MigrationPlan) -> int:
 
     request_count = 0
 
-    # Refresh props each time after structural changes (rename/add/delete)
     def refresh_props() -> Dict[str, Dict[str, Any]]:
         m = _get_spreadsheet_metadata(service, plan.spreadsheet_id)
         return _sheets_by_title(m)
 
+    # --- BATCH OPTIMIZATION ---
+    # Combine structural changes into logical batches to minimize API metadata refreshes
+
     # 1) Renames/archives
-    props_by_title = refresh_props()
+    rename_requests = []
     for old, new, reason in rename_ops:
-        if old not in props_by_title:
-            continue
-        _apply_rename(service, plan.spreadsheet_id, props_by_title, old, new)
+        if old in props_by_title:
+            sid = _sheet_id(props_by_title[old])
+            rename_requests.append({
+                "updateSheetProperties": {
+                    "properties": {"sheetId": sid, "title": new},
+                    "fields": "title",
+                }
+            })
+
+    if rename_requests:
+        _batch_update(service, plan.spreadsheet_id, rename_requests)
         request_count += 1
-        props_by_title = refresh_props()
 
     # 2) Deletes (if enabled)
-    props_by_title = refresh_props()
+    delete_requests = []
     for t in delete_titles:
-        if t not in props_by_title:
-            continue
-        _apply_delete(service, plan.spreadsheet_id, props_by_title, t)
+        if t in props_by_title:
+            sid = _sheet_id(props_by_title[t])
+            delete_requests.append({"deleteSheet": {"sheetId": sid}})
+            
+    if delete_requests:
+        _batch_update(service, plan.spreadsheet_id, delete_requests)
         request_count += 1
+
+    # Refresh props once if structural changes were made to current sheets
+    if rename_requests or delete_requests:
         props_by_title = refresh_props()
 
-    # 3) Ensure canonical sheets exist
-    props_by_title = refresh_props()
+    # 3) Ensure canonical sheets exist (Add missing)
+    add_requests = []
     for t in CANONICAL_PAGES:
         if t not in props_by_title:
-            _apply_add_sheet(service, plan.spreadsheet_id, t)
-            request_count += 1
-            props_by_title = refresh_props()
+            add_requests.append({"addSheet": {"properties": {"title": t}}})
+            
+    if add_requests:
+        _batch_update(service, plan.spreadsheet_id, add_requests)
+        request_count += 1
+        # Need to refresh props one final time to get the sheetIds of the newly created sheets
+        props_by_title = refresh_props()
 
     # 4) Seed headers + format
-    props_by_title = refresh_props()
-
+    formatting_requests = []
     for sheet_title in CANONICAL_PAGES:
         spec = SCHEMA_REGISTRY.get(sheet_title)
         if not spec:
@@ -564,16 +511,40 @@ def run_migration(plan: MigrationPlan) -> int:
         # Instrument tables incl Top_10_Investments and My_Portfolio etc.
         request_count += _seed_instrument_headers(service, plan.spreadsheet_id, sheet_title)
 
-        # Minimal formatting (freeze + filter)
+        # Build Minimal formatting requests (freeze + filter) to batch at the end
         props = props_by_title.get(sheet_title)
         if props:
-            request_count += _apply_freeze_row1_and_filter(service, plan.spreadsheet_id, _sheet_id(props))
+            sheet_id = _sheet_id(props)
+            formatting_requests.append({
+                "updateSheetProperties": {
+                    "properties": {"sheetId": sheet_id, "gridProperties": {"frozenRowCount": 1}},
+                    "fields": "gridProperties.frozenRowCount",
+                }
+            })
+            formatting_requests.append({
+                "setBasicFilter": {
+                    "filter": {
+                        "range": {
+                            "sheetId": sheet_id,
+                            "startRowIndex": 0,
+                            "endRowIndex": 1,
+                            "startColumnIndex": 0,
+                            "endColumnIndex": 200,
+                        }
+                    }
+                }
+            })
+            
+    # Apply all formatting at once
+    if formatting_requests:
+        _batch_update(service, plan.spreadsheet_id, formatting_requests)
+        request_count += 1
 
     # 5) Rebuild Data_Dictionary immediately
     request_count += _seed_data_dictionary(service, plan.spreadsheet_id, "Data_Dictionary")
 
     print("\n✅ Migration complete.")
-    print(f"Total API request batches (approx): {request_count}")
+    print(f"Total API request batches: {request_count}")
     return 0
 
 
@@ -626,4 +597,4 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
