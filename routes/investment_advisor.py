@@ -466,7 +466,7 @@ def _ensure_top10_keys_present(
         ("top10_rank",            "Top 10 Rank"),
         ("selection_reason",      "Selection Reason"),
         ("criteria_snapshot",     "Criteria Snapshot"),
-        ("entry_price",           "Entry Price"),           # v2.2.0
+        ("entry_price",           "Entry Price"),            # v2.2.0
         ("stop_loss_suggested",   "Stop Loss (AI)"),        # v2.2.0
         ("take_profit_suggested", "Take Profit (AI)"),      # v2.2.0
         ("risk_reward_ratio",     "Risk/Reward"),           # v2.2.0
