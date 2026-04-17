@@ -1,5 +1,4 @@
-from __future__ import annotations
-
+#!/usr/bin/env python3
 """
 routes/ai_analysis.py
 ================================================================================
@@ -196,17 +195,17 @@ class _SchemaAdapter:
     Insights_Analysis fallback updated to 9-col v3.4.0 canonical schema.
     """
     def __init__(self) -> None:
-        self._get_schema        = _import_attr_multi(_SR_MODULES, "get_schema")
-        self._get_headers       = _import_attr_multi(_SR_MODULES, "get_headers") \
-                                  or _import_attr_multi(_SR_MODULES, "get_sheet_headers")
+        self._get_schema          = _import_attr_multi(_SR_MODULES, "get_schema")
+        self._get_headers         = _import_attr_multi(_SR_MODULES, "get_headers") \
+                                    or _import_attr_multi(_SR_MODULES, "get_sheet_headers")
         self._get_display_headers = _import_attr_multi(_SR_MODULES, "get_display_headers") \
                                     or _import_attr_multi(_SR_MODULES, "get_sheet_headers")
-        self._get_keys          = _import_attr_multi(_SR_MODULES, "get_keys") \
-                                  or _import_attr_multi(_SR_MODULES, "get_sheet_keys")
-        self._project_rows      = _import_attr_multi(_SR_MODULES, "project_rows_to_schema")
-        self._rows_to_matrix    = _import_attr_multi(_SR_MODULES, "rows_to_matrix")
-        self._supported_pages   = _import_attr_multi(_SR_MODULES, "get_supported_pages") \
-                                  or _import_attr_multi(_SR_MODULES, "list_sheets")
+        self._get_keys            = _import_attr_multi(_SR_MODULES, "get_keys") \
+                                    or _import_attr_multi(_SR_MODULES, "get_sheet_keys")
+        self._project_rows        = _import_attr_multi(_SR_MODULES, "project_rows_to_schema")
+        self._rows_to_matrix      = _import_attr_multi(_SR_MODULES, "rows_to_matrix")
+        self._supported_pages     = _import_attr_multi(_SR_MODULES, "get_supported_pages") \
+                                    or _import_attr_multi(_SR_MODULES, "list_sheets")
 
     def supported_pages(self) -> List[str]:
         if callable(self._supported_pages):
@@ -645,8 +644,8 @@ def _build_insights_from_rows(
     avg_score = round(sum(scores) / max(1, len(scores)), 2)
     avg_fill  = round(sum(_nonempty_ratio(row) for row in source_rows) / max(1, row_count), 2)
 
-    roi3_list       = [v for v in (_safe_float(row.get("expected_roi_3m"))           for row in source_rows) if v is not None]
-    risk_list       = [v for v in (_safe_float(row.get("risk_score"))                for row in source_rows) if v is not None]
+    roi3_list       = [v for v in (_safe_float(row.get("expected_roi_3m"))            for row in source_rows) if v is not None]
+    risk_list       = [v for v in (_safe_float(row.get("risk_score"))                 for row in source_rows) if v is not None]
     confidence_list = [v for v in (_safe_float(_coalesce(row.get("forecast_confidence"), row.get("confidence"))) for row in source_rows) if v is not None]
 
     best_row    = max(source_rows, key=_calc_score)
