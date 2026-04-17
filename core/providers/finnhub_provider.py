@@ -13,18 +13,18 @@ FIX CRITICAL: 11 field names corrected to match schema_registry v3.0.0 keys.
 
   Provider key (v4.2.0) -> Schema key (v4.3.0)   Direction
   ----------------------------------------------------------
-  change               -> price_change            quote
-  change_pct           -> percent_change          quote
-  day_open             -> open_price              quote
-  high_52w             -> week_52_high            metrics + history
-  low_52w              -> week_52_low             metrics + history
-  avg_vol_30d          -> avg_volume_30d          history
-  pb                   -> pb_ratio                metrics
-  ps                   -> ps_ratio                metrics
-  beta                 -> beta_5y                 metrics
-  net_margin           -> profit_margin           metrics (+ roe/roa kept)
+  change               -> price_change           quote
+  change_pct           -> percent_change         quote
+  day_open             -> open_price             quote
+  high_52w             -> week_52_high           metrics + history
+  low_52w              -> week_52_low            metrics + history
+  avg_vol_30d          -> avg_volume_30d         history
+  pb                   -> pb_ratio               metrics
+  ps                   -> ps_ratio               metrics
+  beta                 -> beta_5y                metrics
+  net_margin           -> profit_margin          metrics (+ roe/roa kept)
   position_52w_pct     already aliased to
-                          week_52_position_pct    history (no change needed)
+                          week_52_position_pct   history (no change needed)
 
   Old keys kept as backward-compat aliases in every patch dict.
 
