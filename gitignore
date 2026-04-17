@@ -1,39 +1,52 @@
-# =============================================================================
-# TADAWUL FAST BRIDGE – ENTERPRISE GITIGNORE (v7.0.1)
-# =============================================================================
-# QUANTUM EDITION | ZERO-TRUST SECURITY | CLOUD-NATIVE | NARROW-IGNORE POLICY
-#
-# Core Principles:
-# • Track templates, never secrets
-# • Prefer narrow ignores over broad ignores
-# • Keep source and schema files tracked
-# • Ignore generated outputs, runtime state, credentials, and local-only artifacts
-#
-# Version: 7.0.1
-# =============================================================================
+=============================================================================
 
+TADAWUL FAST BRIDGE – ENTERPRISE GITIGNORE (v7.0.1)
 
-# =============================================================================
-# TFB-SPECIFIC GENERATED ARTIFACTS
-# =============================================================================
-# Analytics / profiling reports
-profile_*.json
-performance_report_*.json
-performance_report_*.html
-performance_report_*.csv
-test_report_*.html
-test_report_*.xml
+=============================================================================
+
+QUANTUM EDITION | ZERO-TRUST SECURITY | CLOUD-NATIVE | NARROW-IGNORE POLICY
+
+Core Principles:
+
+• Track templates, never secrets
+
+• Prefer narrow ignores over broad ignores
+
+• Keep source and schema files tracked
+
+• Ignore generated outputs, runtime state, credentials, and local-only artifacts
+
+Version: 7.0.1
+
+=============================================================================
+
+=============================================================================
+
+TFB-SPECIFIC GENERATED ARTIFACTS
+
+=============================================================================
+
+Analytics / profiling reports
+
+profile_.json
+performance_report_.json
+performance_report_.html
+performance_report_.csv
+test_report_.html
+test_report_.xml
 test_report_*.json
 
-# App / worker / sync logs
-sync_*.log
+App / worker / sync logs
+
+sync_.log
 sync_execution.log
-app_*.log
-worker_*.log
-drift_*.json
+app_.log
+worker_.log
+drift_.json
 drift_*.log
 
-# Runtime caches / temp
+Runtime caches / temp
+
 /models/
 /tmp/cache_*/
 .cache/
@@ -41,14 +54,17 @@ redis_data/
 tmp/
 temp/
 
-# Transient credentials
+Transient credentials
+
 google_credentials.json
 
+=============================================================================
 
-# =============================================================================
-# PYTHON BYTECODE / COMPILED EXTENSIONS
-# =============================================================================
-__pycache__/
+PYTHON BYTECODE / COMPILED EXTENSIONS
+
+=============================================================================
+
+pycache/
 *.py[cod]
 *$py.class
 *.pyd
@@ -59,10 +75,12 @@ __pycache__/
 *.pyo
 *.pyz
 
+=============================================================================
 
-# =============================================================================
-# PYTHON VIRTUAL ENVIRONMENTS / TOOLING
-# =============================================================================
+PYTHON VIRTUAL ENVIRONMENTS / TOOLING
+
+=============================================================================
+
 venv/
 .venv/
 env/
@@ -74,7 +92,8 @@ virtualenv/
 pyenv/
 .pyenv/
 
-# Conda
+Conda
+
 .conda/
 conda/
 miniconda/
@@ -83,10 +102,12 @@ anaconda/
 anaconda3/
 .anaconda/
 
-# Python version files
+Python version files
+
 .python-version
 
-# Package/tool caches
+Package/tool caches
+
 pip-wheel-metadata/
 pip-selfcheck.json
 .pip/
@@ -110,7 +131,8 @@ var/
 MANIFEST
 .installed.cfg
 
-# Keep dependency manifests tracked
+Keep dependency manifests tracked
+
 !requirements.txt
 !requirements-*.txt
 !poetry.lock
@@ -120,18 +142,20 @@ MANIFEST
 !setup.py
 !setup.cfg
 
+=============================================================================
 
-# =============================================================================
-# TESTS / COVERAGE / LINTERS / TYPE CHECKERS
-# =============================================================================
+TESTS / COVERAGE / LINTERS / TYPE CHECKERS
+
+=============================================================================
+
 .pytest_cache/
 .tox/
 .nox/
 .hypothesis/
 tests/.hypothesis/
-*.cover
+.cover
 .coverage
-.coverage.*
+.coverage.
 .coverage.xml
 .coverage.lcov
 htmlcov/
@@ -149,12 +173,14 @@ pytestdebug.log
 .pyrightconfig.local
 dmypy.json
 
+=============================================================================
 
-# =============================================================================
-# LOGS / RUNTIME / OBSERVABILITY
-# =============================================================================
+LOGS / RUNTIME / OBSERVABILITY
+
+=============================================================================
+
 *.log
-*.log.*
+.log.
 logs/
 log/
 *.out
@@ -186,11 +212,14 @@ flamegraph.svg
 gunicorn.conf.local.py
 uvicorn.conf.local.py
 
+=============================================================================
 
-# =============================================================================
-# LOCAL DATABASES / SNAPSHOTS / EXPORTS
-# =============================================================================
-# Databases
+LOCAL DATABASES / SNAPSHOTS / EXPORTS
+
+=============================================================================
+
+Databases
+
 *.sqlite
 *.sqlite3
 *.db
@@ -203,7 +232,8 @@ uvicorn.conf.local.py
 dump.rdb
 appendonly.aof
 
-# Data directories (generated/local)
+Data directories (generated/local)
+
 data/*
 !data/.gitkeep
 !data/README.md
@@ -212,7 +242,8 @@ data/*
 !data/examples/
 !data/examples/**
 
-# Generated exports / reports / artifacts directories
+Generated exports / reports / artifacts directories
+
 exports/
 reports/
 artifacts/
@@ -220,68 +251,73 @@ output/
 generated/
 generated_exports/
 
-# Ignore generated flat files only inside generated/output-style dirs
-exports/**/*.csv
-exports/**/*.xlsx
-exports/**/*.xls
-exports/**/*.parquet
-exports/**/*.feather
-exports/**/*.arrow
-exports/**/*.h5
-exports/**/*.hdf5
+Ignore generated flat files only inside generated/output-style dirs
 
-reports/**/*.csv
-reports/**/*.xlsx
-reports/**/*.xls
-reports/**/*.parquet
-reports/**/*.feather
-reports/**/*.arrow
-reports/**/*.h5
-reports/**/*.hdf5
+exports//*.csv
+exports//.xlsx
+exports/**/.xls
+exports//*.parquet
+exports//.feather
+exports/**/.arrow
+exports//*.h5
+exports//*.hdf5
 
-artifacts/**/*.csv
-artifacts/**/*.xlsx
-artifacts/**/*.xls
-artifacts/**/*.parquet
-artifacts/**/*.feather
-artifacts/**/*.arrow
-artifacts/**/*.h5
-artifacts/**/*.hdf5
+reports//*.csv
+reports//.xlsx
+reports/**/.xls
+reports//*.parquet
+reports//.feather
+reports/**/.arrow
+reports//*.h5
+reports//*.hdf5
 
-output/**/*.csv
-output/**/*.xlsx
-output/**/*.xls
-output/**/*.parquet
-output/**/*.feather
-output/**/*.arrow
-output/**/*.h5
-output/**/*.hdf5
+artifacts//*.csv
+artifacts//.xlsx
+artifacts/**/.xls
+artifacts//*.parquet
+artifacts//.feather
+artifacts/**/.arrow
+artifacts//*.h5
+artifacts//*.hdf5
 
-# Allow tracked sample/example data anywhere explicit
-!**/samples/**/*.csv
-!**/samples/**/*.xlsx
-!**/examples/**/*.csv
-!**/examples/**/*.xlsx
-!**/*.example.csv
-!**/*.example.xlsx
-!example_*.csv
+output//*.csv
+output//.xlsx
+output/**/.xls
+output//*.parquet
+output//.feather
+output/**/.arrow
+output//*.h5
+output//*.hdf5
+
+Allow tracked sample/example data anywhere explicit
+
+!/samples//.csv
+!/samples//.xlsx
+!/examples//.csv
+!/examples//.xlsx
+!/*.example.csv
+!/.example.xlsx
+!example_.csv
 !example_*.xlsx
 
+=============================================================================
 
-# =============================================================================
-# NOTEBOOKS / DATA SCIENCE / ML
-# =============================================================================
+NOTEBOOKS / DATA SCIENCE / ML
+
+=============================================================================
+
 .ipynb_checkpoints/
-*.ipynb
-!notebooks/**/*.ipynb
-!*.example.ipynb
-!example_*.ipynb
+.ipynb
+!notebooks/**/.ipynb
+!.example.ipynb
+!example_.ipynb
 
 .jupyter/
 jupyter_notebook_config.json
 jupyter_runtime/
 
-# ML artifacts
+ML artifacts
+
 *.pth
 *.pt
 *.pkl
@@ -297,7 +333,8 @@ jupyter_runtime/
 *.tflite
 *.mlmodel
 
-# ML logs
+ML logs
+
 lightning_logs/
 mlruns/
 wandb/
@@ -306,13 +343,16 @@ wandb/
 .sacred/
 .tensorboard/
 tensorboard/
-*.tfevents.*
+.tfevents.
 
+=============================================================================
 
-# =============================================================================
-# SECURITY & SECRETS (CRITICAL)
-# =============================================================================
-# Environment files - track only examples/templates
+SECURITY & SECRETS (CRITICAL)
+
+=============================================================================
+
+Environment files - track only examples/templates
+
 .env
 .env.*
 !.env.example
@@ -321,7 +361,8 @@ tensorboard/
 !.env.local.example
 .envrc
 
-# Secrets directories
+Secrets directories
+
 secrets/
 .credentials/
 .creds/
@@ -340,7 +381,8 @@ secure/
 certificates/
 certs/
 
-# Google Cloud / Firebase / OAuth
+Google Cloud / Firebase / OAuth
+
 credentials.json
 service-account.json
 service_account.json
@@ -352,13 +394,14 @@ gcp-credentials.json
 gcp-sa.json
 sa_key.json
 client_secret.json
-client_secret_*.json
-oauth*.json
+client_secret_.json
+oauth.json
 token.json
 tokens.json
 firebase-*.json
 
-# AWS / Azure / GCP local config
+AWS / Azure / GCP local config
+
 .aws/
 .azure/
 .gcp/
@@ -366,7 +409,8 @@ firebase-*.json
 aws-credentials.json
 azure-credentials.json
 
-# Cryptographic material
+Cryptographic material
+
 *.pem
 *.key
 *.crt
@@ -381,7 +425,8 @@ azure-credentials.json
 *.keystore
 *.truststore
 
-# Tokens / encrypted blobs
+Tokens / encrypted blobs
+
 *.token
 *.tokens
 *.secret
@@ -391,11 +436,14 @@ azure-credentials.json
 *.enc
 *.encrypted
 
+=============================================================================
 
-# =============================================================================
-# IDE / EDITOR / OS
-# =============================================================================
-# VS Code
+IDE / EDITOR / OS
+
+=============================================================================
+
+VS Code
+
 .vscode/
 !.vscode/settings.json.example
 !.vscode/tasks.json.example
@@ -403,18 +451,21 @@ azure-credentials.json
 !.vscode/extensions.json
 *.code-workspace
 
-# JetBrains
+JetBrains
+
 .idea/
 *.iml
 *.iws
 *.ipr
 
-# Cursor / AI editors
+Cursor / AI editors
+
 .cursor/
 .cursorrules.local
 *.cursor.md
 
-# OS files
+OS files
+
 .DS_Store
 .DS_Store?
 ._*
@@ -424,10 +475,12 @@ Thumbs.db
 ehthumbs.db
 $RECYCLE.BIN/
 
+=============================================================================
 
-# =============================================================================
-# LLM / AI / COPY-PASTE ARTIFACTS
-# =============================================================================
+LLM / AI / COPY-PASTE ARTIFACTS
+
+=============================================================================
+
 *.chatgpt.md
 *.claude.md
 *.gemini.md
@@ -439,10 +492,12 @@ $RECYCLE.BIN/
 *.md.backup
 *.py.backup
 
+=============================================================================
 
-# =============================================================================
-# DEPLOYMENT / LOCAL-ONLY OVERRIDES
-# =============================================================================
+DEPLOYMENT / LOCAL-ONLY OVERRIDES
+
+=============================================================================
+
 .render/
 .vercel/
 .netlify/
@@ -453,15 +508,18 @@ terraform.tfstate.*
 *.tfvars
 *.tfvars.json
 
-# Docker local overrides
+Docker local overrides
+
 docker-compose.override.yml
 docker-compose.local.yml
 Dockerfile.local
 
+=============================================================================
 
-# =============================================================================
-# DO NOT IGNORE SOURCE / CONFIG / PROJECT STRUCTURE
-# =============================================================================
+DO NOT IGNORE SOURCE / CONFIG / PROJECT STRUCTURE
+
+=============================================================================
+
 !core/
 !routes/
 !schemas/
@@ -479,12 +537,12 @@ Dockerfile.local
 !env.py
 !worker.py
 !requirements.txt
-!requirements-*.txt
+!requirements-.txt
 !render.yaml
 !Procfile
 !runtime.txt
 !start_web.sh
-!*.sh
+!.sh
 !daily_sync*.yml
 !.gitignore
 !.dockerignore
@@ -493,9 +551,12 @@ Dockerfile.local
 !config.example.json
 !.env.example
 
+=============================================================================
 
-# =============================================================================
-# FINAL SAFEGUARD
-# =============================================================================
-# This file is part of TADAWUL FAST BRIDGE v7.0.1
-# Do not remove without understanding the security implications.
+FINAL SAFEGUARD
+
+=============================================================================
+
+This file is part of TADAWUL FAST BRIDGE v7.0.1
+
+Do not remove without understanding the security implications.
