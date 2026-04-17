@@ -9,17 +9,18 @@ REQUEST-ID SAFE • ENGINE-STATE AWARE • CONTROLLED-ROUTE-OWNERSHIP SAFE
 STRICT-JSON SAFE • HEALTH / META ALIAS SAFE • DEBUG ROUTE SAFE
 INVESTMENT-ADVISOR CANONICAL OWNER PROTECTION • ADVANCED ROUTE PRIORITY SAFE
 
-Why this revision (v8.10.0)
+Why this revision (v8.11.0)
 ---------------------------
 - FIX: makes routes.investment_advisor the canonical owner of
        /v1/advanced/sheet-rows so the revised advanced router is the effective
        public owner after deployment.
 - FIX: reorders the controlled mount plan so routes.investment_advisor mounts
        before routes.advanced_sheet_rows, reducing overlap risk.
+- FIX: respects allow_query_token in _auth_ok (aligned with config.py v7.2.0).
+- FIX: implements constant-time comparison via _secure_equals for token checks.
+- FIX: adds support for X-API-Key and Api-Key headers in the entrypoint auth guard.
 - FIX: preserves exact canonical-path protection during filtered router cloning
        so later routers cannot steal owner-locked public paths.
-- FIX: keeps prestart/startup route mounting, OpenAPI cache refresh, and live
-       ownership diagnostics aligned.
 - SAFE: engine init remains timeout-aware and non-fatal unless strict mode is enabled.
 """
 from __future__ import annotations
@@ -633,12 +634,10 @@ def _auth_ok(request: Request) -> bool:
         pass
 
     x_app_token = request.headers.get(_SETTINGS.AUTH_HEADER_NAME, "") or request.headers.get("X-APP-TOKEN", "")
-    # FIX v8.11.0: also check X-API-Key and Api-Key (aligned with config.py v7.2.0)
     api_key_value = request.headers.get("X-API-Key", "") or request.headers.get("Api-Key", "")
     auth = request.headers.get("Authorization", "")
 
     token_value = str(x_app_token or api_key_value or "").strip()
-    # FIX v8.11.0: query token only when ALLOW_QUERY_TOKEN is enabled
     query_token = ""
     if bool(getattr(_SETTINGS, "ALLOW_QUERY_TOKEN", False)):
         try:
@@ -673,7 +672,6 @@ def _auth_ok(request: Request) -> bool:
     if not allowed:
         return False
 
-    # FIX v8.11.0: constant-time comparison via _secure_equals
     if token_value and any(_secure_equals(token_value, t) for t in allowed):
         return True
     if query_token and bool(getattr(_SETTINGS, "ALLOW_QUERY_TOKEN", False)):
@@ -1502,7 +1500,6 @@ def create_app() -> FastAPI:
     _install_builtin_routes(app)
     _install_custom_openapi(app)
 
-    # FIX v8.11.0: honor PRESTART_MOUNT_ROUTES instead of always forcing prestart mount
     if bool(_SETTINGS.PRESTART_MOUNT_ROUTES):
         try:
             snap = _mount_routes_once(app, phase="prestart")
