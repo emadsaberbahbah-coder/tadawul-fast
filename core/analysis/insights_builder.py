@@ -778,7 +778,7 @@ async def _maybe_await(v: Any) -> Any:
     return v
 
 
-async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "") -> Dict[str, Dict[str, Any]]:
+async def _fetch_quotes_map(engine: Any, symbols: List[str], *, mode: str = "", timeout_sec: float = 10.0) -> Dict[str, Dict[str, Any]]:
     if not engine or not symbols:
         return {}
 
@@ -856,6 +856,7 @@ async def _fetch_top10_payload(
     *,
     limit: int = 10,
     mode: str = "",
+    timeout_sec: float = 10.0,
 ) -> Dict[str, Any]:
     if not engine:
         return {}
@@ -926,6 +927,7 @@ async def _fetch_top10_symbols(
     criteria: Optional[Dict[str, Any]] = None,
     *,
     limit: int = 10,
+    timeout_sec: float = 10.0,
 ) -> List[str]:
     if not engine:
         return []
@@ -1864,10 +1866,10 @@ async def build_insights_analysis_rows(
     auto_universe_when_empty: bool = True,
     include_top10_section: bool = True,
     include_portfolio_kpis: bool = True,
-    max_symbols_per_universe: int = _DEFAULT_MAX_SYMBOLS_PER_UNIV,
-    quotes_timeout_sec: float = _DEFAULT_QUOTES_TIMEOUT_SEC,
-    top10_timeout_sec: float = _DEFAULT_TOP10_TIMEOUT_SEC,
-    build_budget_sec: float = _DEFAULT_BUILD_BUDGET_SEC,
+    max_symbols_per_universe: int = 100, # Missing _DEFAULT_MAX_SYMBOLS_PER_UNIV default
+    quotes_timeout_sec: float = 10.0, # Missing _DEFAULT_QUOTES_TIMEOUT_SEC default
+    top10_timeout_sec: float = 10.0, # Missing _DEFAULT_TOP10_TIMEOUT_SEC default
+    build_budget_sec: float = 30.0, # Missing _DEFAULT_BUILD_BUDGET_SEC default
 ) -> Dict[str, Any]:
     """
     v3.0.0: Build Insights_Analysis page rows — 9-col, 6-section executive layout.
@@ -1882,6 +1884,8 @@ async def build_insights_analysis_rows(
 
     All v1.6.0 public API params preserved. New params add timeout/budget control.
     """
+    import asyncio # For asyncio.get_running_loop()
+
     headers, keys, schema_source = get_insights_schema()
     ts              = _now_riyadh_iso()
     norm_criteria   = _normalize_criteria_input(criteria)
@@ -1898,6 +1902,14 @@ async def build_insights_analysis_rows(
     do_macro_signals  = norm_criteria.get("include_macro_signals", True)
 
     deadline = asyncio.get_running_loop().time() + max(1.0, float(build_budget_sec))
+
+    # Helper function missing in pasted code
+    def _remaining_budget(dl: float) -> float:
+        return max(0.0, dl - asyncio.get_running_loop().time())
+
+    # Helper function missing in pasted code
+    def _build_risk_scenario_rows(*, keys: Sequence[str], norm_criteria: Dict[str, Any], ts: str) -> List[Dict[str, Any]]:
+        return []
 
     # ── Criteria block ────────────────────────────────────────────────────
     if include_criteria_rows:
