@@ -1339,4 +1339,4 @@ def run_from_worker_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
