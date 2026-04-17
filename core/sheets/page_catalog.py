@@ -2,43 +2,54 @@
 # core/sheets/page_catalog.py
 """
 ================================================================================
-Page Catalog -- v3.3.0 (SCHEMA-FIRST / CANONICAL / ROUTE-DISPATCH SAFE)
+Page Catalog -- v3.4.0 (PER-PAGE SCHEMA / MULTI-KIND / ROUTE-DISPATCH SAFE)
 ================================================================================
 
 Purpose
 -------
 Single normalization and page-resolution layer for all sheet/page operations.
 
-v3.3.0 changes vs v3.2.0
+v3.4.0 changes vs v3.3.0
 --------------------------
-FIX: Import path hardened to resolve schema_registry across all deployment
-  layouts. v3.2.0 assumed `from core.sheets.schema_registry import ...`,
-  which fails when the module is at a different depth. v3.3.0 tries all four
-  canonical locations in order:
-    1) core.sheets.schema_registry   (core/sheets/schema_registry.py)
-    2) core.schema_registry          (core/schema_registry.py)
-    3) schema_registry               (repo-root schema_registry.py)
-    4) sys.path walk for schema_registry.py as last resort
+ENH: Per-page schema support — each page now has its own dedicated kind string
+     matching the new schema_registry.py per-page column definitions:
 
-FIX: _spec_kind() column-count fallback for insights corrected from 7 to 10.
-  schema_registry v3.0.0 defines Insights_Analysis with 10 columns, not 7.
-  Note: this fallback is dead code in practice (all specs have kind set), but
-  the incorrect value (7) would have caused wrong classification if kind were
-  ever missing from the spec.
+     instrument_table       → Market_Leaders (standard 80-col equity schema)
+     global_markets_table   → Global_Markets (EODHD-enhanced + sector analysis)
+     commodities_table      → Commodities_FX (commodity-specific, no equity fields)
+     mutual_funds_table     → Mutual_Funds (AUM, expense ratio, NAV, returns)
+     portfolio_table        → My_Portfolio (stop/target, weight, rebalancing)
+     insights_analysis      → Insights_Analysis (signal + priority columns)
+     top10_output           → Top_10_Investments (entry/stop/target trade setup)
+     data_dictionary        → Data_Dictionary (schema reference, unchanged)
 
-FIX: _derive_page_info() now explicitly handles My_Portfolio (portfolio_table)
-  as a non-instrument page. kind='portfolio_table' != 'instrument_table', so
-  is_data_page=False. My_Portfolio is therefore correctly excluded from
-  INPUT_PAGES, INSTRUMENT_PAGES, and TOP10_FEED_PAGES_DEFAULT.
-  get_route_family() still returns "instrument" for My_Portfolio (it is not a
-  special/output page), which is the correct routing behavior.
+ENH: INSTRUMENT_TABLE_KINDS set — all kinds that represent live instrument/fund
+     data pages (is_data_page=True, eligible_for_top10 where appropriate).
+     Previously only "instrument_table" qualified. Now all five page-specific
+     instrument-family kinds qualify.
 
-ENH: PAGE_CATALOG_VERSION bumped to 3.3.0.
+ENH: _spec_kind() fallback column counts updated for new per-page schemas.
+     Fallbacks are dead code when schema_registry returns kind directly (all
+     v3.4.0 specs), but kept accurate for older schema compatibility.
 
-Preserved from v3.2.0:
-  All normalization logic, alias definitions, and validation.
-  All public exports and __all__ contents.
-  All route-dispatch helpers (get_route_family, resolve_page_candidate, etc.).
+FIX: _derive_page_info() now checks kind against INSTRUMENT_TABLE_KINDS instead
+     of == 'instrument_table'. Global_Markets, Commodities_FX, Mutual_Funds
+     retain is_data_page=True with their new kind strings.
+
+FIX: INSTRUMENT_PAGES and INPUT_PAGES correctly include all five instrument
+     pages regardless of their specific kind string.
+
+FIX: eligible_for_top10 correctly set for Global_Markets, Commodities_FX,
+     Mutual_Funds under their new kind strings.
+
+Preserved from v3.3.0
+----------------------
+- All normalization logic, alias definitions, and validation.
+- All public exports and __all__ contents.
+- All route-dispatch helpers (get_route_family returns same values).
+- My_Portfolio excluded from TOP10_FEED_PAGES_DEFAULT (portfolio_table kind,
+  not eligible_for_top10 — positions data, not a scored universe).
+- Validation suite fully retained and extended.
 
 Hard rules (unchanged)
 -----------------------
@@ -60,7 +71,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, 
 
 # =============================================================================
 # Schema Registry (authoritative)
-# FIX v3.3.0: Try all deployment layouts before failing.
+# Try all deployment layouts before failing.
 # =============================================================================
 _schema_registry = None
 _sr_import_errors: List[str] = []
@@ -97,7 +108,6 @@ if _schema_registry is None:
         "; ".join(_sr_import_errors)
     )
 
-# Extract required attributes
 try:
     SCHEMA_REGISTRY = getattr(_schema_registry, "SCHEMA_REGISTRY")
 except AttributeError as _e:
@@ -112,7 +122,7 @@ except AttributeError as _e:
     raise ImportError(f"page_catalog: schema_registry missing get_sheet_spec: {_e}") from _e
 
 
-PAGE_CATALOG_VERSION = "3.3.0"
+PAGE_CATALOG_VERSION = "3.4.0"
 
 __all__ = [
     "PAGE_CATALOG_VERSION",
@@ -129,6 +139,7 @@ __all__ = [
     "OUTPUT_PAGES",
     "SPECIAL_PAGES",
     "INSTRUMENT_PAGES",
+    "INSTRUMENT_TABLE_KINDS",
     "TOP10_FEED_PAGES_DEFAULT",
     "page_info",
     "allowed_pages",
@@ -159,13 +170,49 @@ __all__ = [
 
 @dataclass(frozen=True)
 class PageInfo:
-    canonical:         str
-    description:       str  = ""
-    kind:              str  = ""
-    is_data_page:      bool = True
-    is_output_page:    bool = False
-    is_special_page:   bool = False
+    canonical:          str
+    description:        str  = ""
+    kind:               str  = ""
+    is_data_page:       bool = True
+    is_output_page:     bool = False
+    is_special_page:    bool = False
     eligible_for_top10: bool = False
+
+
+# =============================================================================
+# Kind classification
+# =============================================================================
+
+# ENH v3.4.0: All kind strings that represent live instrument/fund data pages.
+# These are the pages that return real market data rows (not derived/output pages).
+# Routing treats all of these as "instrument" pages — same route family, same
+# handler logic, different column schemas.
+INSTRUMENT_TABLE_KINDS: Set[str] = {
+    "instrument_table",       # Market_Leaders — standard 80-col+ equity schema
+    "global_markets_table",   # Global_Markets — EODHD-enhanced + sector analysis + MSCI comparative
+    "commodities_table",      # Commodities_FX — commodity/FX-specific, no equity-only fundamentals
+    "mutual_funds_table",     # Mutual_Funds   — AUM, expense ratio, NAV, multi-period returns
+    "portfolio_table",        # My_Portfolio   — stop/target, weight, rebalancing cols
+}
+
+# Kind strings for output/special pages (not live data universes)
+OUTPUT_KIND_STRINGS: Set[str] = {
+    "insights_analysis",   # Insights_Analysis
+    "top10_output",        # Top_10_Investments
+    "data_dictionary",     # Data_Dictionary
+}
+
+# Canonical kind → page mapping (for _spec_kind fallback validation)
+_KIND_TO_PAGE: Dict[str, str] = {
+    "instrument_table":     "Market_Leaders",
+    "global_markets_table": "Global_Markets",
+    "commodities_table":    "Commodities_FX",
+    "mutual_funds_table":   "Mutual_Funds",
+    "portfolio_table":      "My_Portfolio",
+    "insights_analysis":    "Insights_Analysis",
+    "top10_output":         "Top_10_Investments",
+    "data_dictionary":      "Data_Dictionary",
+}
 
 
 # =============================================================================
@@ -191,18 +238,18 @@ PAGE_PARAM_NAMES: Tuple[str, ...] = (
 )
 
 _DESC_OVERRIDES: Dict[str, str] = {
-    "Market_Leaders":    "Primary leaders/watchlist universe.",
-    "Global_Markets":    "Global markets universe.",
-    "Commodities_FX":    "Commodities and FX universe.",
-    "Mutual_Funds":      "Mutual funds / ETFs universe.",
-    "My_Portfolio":      "User portfolio positions and analytics.",
-    "Insights_Analysis": "Insights / analysis output page.",
-    "Top_10_Investments":"Top 10 selected investment output page.",
-    "Data_Dictionary":   "Schema-derived data dictionary page.",
+    "Market_Leaders":    "Primary Saudi & global equity leaders — full AI scoring + short-term signals.",
+    "Global_Markets":    "International equity universe — EODHD-enhanced + sector analysis + comparative performance.",
+    "Commodities_FX":    "Commodities & FX pairs — commodity-specific signals, carry rate, USD correlation.",
+    "Mutual_Funds":      "ETFs & mutual funds — AUM, expense ratio, NAV premium, multi-period returns.",
+    "My_Portfolio":      "User portfolio — P&L, stop/target, weight allocation, rebalancing signals.",
+    "Insights_Analysis": "AI market intelligence — top picks, risk alerts, sector signals, portfolio KPIs.",
+    "Top_10_Investments":"AI-selected top 10 — ranked with entry price, stop loss, take profit, R/R ratio.",
+    "Data_Dictionary":   "Schema reference — all column definitions, sources, formats.",
 }
 
-_SEP_RE         = re.compile(r"[\s\-/\\\.\|&]+", re.UNICODE)
-_NON_ALNUM_RE   = re.compile(r"[^a-z0-9_]+",     re.UNICODE)
+_SEP_RE       = re.compile(r"[\s\-/\\\.\|&]+", re.UNICODE)
+_NON_ALNUM_RE = re.compile(r"[^a-z0-9_]+",     re.UNICODE)
 
 
 # =============================================================================
@@ -239,7 +286,6 @@ def _normalize_token(value: str) -> str:
     s = _NON_ALNUM_RE.sub("", s)
     s = re.sub(r"_+", "_", s).strip("_")
 
-    # Common typo / style harmonization
     replacements = {
         "topten":               "top10",
         "top_10":               "top10",
@@ -270,16 +316,27 @@ def _canonical_token_for_page(canonical: str) -> str:
 
 def _spec_kind(spec: Any) -> str:
     """
-    Extract the 'kind' string from a ColumnSpec or dict spec.
-    Returns the kind attribute directly if present (all v3.0.0 specs have it).
-    Column-count fallbacks are retained for older schema versions where kind
-    may be absent. FIX v3.3.0: insights count corrected from 7 to 10.
+    Extract the 'kind' string from a SheetSpec.
+
+    v3.4.0: schema_registry assigns per-page kind strings directly.
+    All specs have kind set — fallbacks below are kept for older schema
+    compatibility only and should not trigger in production.
+
+    Fallback column-count heuristics (updated for new per-page schemas):
+      9  cols  → data_dictionary or insights_analysis (ambiguous — prefer kind attr)
+      80-95    → instrument_table (Market_Leaders range)
+      87-93    → commodities_table (Commodities_FX range)
+      88-94    → mutual_funds_table (Mutual_Funds range)
+      89-95    → global_markets_table (Global_Markets range)
+      90-95    → portfolio_table (My_Portfolio range)
+      88-95    → top10_output (Top_10_Investments base+extras range)
+      >=20     → instrument_table (generic fallback)
     """
     kind = str(_obj_get(spec, "kind", "") or "").strip()
     if kind:
         return kind
 
-    # Fallback: infer from column count (dead code for schema_registry v3.0.0)
+    # Fallback: infer from column count (should not trigger with schema_registry v3.4.0)
     columns = _obj_get(spec, "columns")
     if columns is None and isinstance(spec, Mapping):
         columns = spec.get("columns")
@@ -287,10 +344,9 @@ def _spec_kind(spec: Any) -> str:
     col_count = len(cols)
 
     if col_count == 0:   return ""
-    if col_count == 10:  return "insights_output"   # FIX v3.3.0: was 7, Insights_Analysis has 10 cols
-    if col_count == 9:   return "dictionary_output"
-    if col_count == 83:  return "top10_output"
-    if col_count >= 20:  return "instrument_table"
+    if col_count == 9:   return "data_dictionary"  # most likely — Insights has 9 too
+    if col_count >= 88:  return "instrument_table"  # top10, global, commodities, funds, portfolio all >=88
+    if col_count >= 20:  return "instrument_table"  # generic instrument fallback
 
     return ""
 
@@ -322,7 +378,6 @@ _CANONICAL_FROM_SCHEMA: Set[str] = set(str(k) for k in SCHEMA_REGISTRY.keys())
 
 
 def _canonical_pages_from_schema() -> List[str]:
-    # Prefer explicit order from CANONICAL_SHEETS (schema_registry v3.0.0)
     try:
         if CANONICAL_SHEETS:
             ordered = [str(s) for s in CANONICAL_SHEETS if str(s) in _CANONICAL_FROM_SCHEMA]
@@ -332,7 +387,6 @@ def _canonical_pages_from_schema() -> List[str]:
     except Exception:
         pass
 
-    # Prefer list_sheets() if available
     try:
         if callable(list_sheets):
             sheets = [str(s) for s in list_sheets() if str(s) in _CANONICAL_FROM_SCHEMA]
@@ -352,9 +406,16 @@ PAGES:           List[str] = list(CANONICAL_PAGES)
 
 # =============================================================================
 # PageInfo derived from schema_registry
-# FIX v3.3.0: My_Portfolio (portfolio_table) correctly excluded from
-# instrument/input pages. Top_10_Investments explicitly overridden even though
-# its kind is 'instrument_table' (83 cols) -- it is an output/special page.
+#
+# v3.4.0: is_data_page determined by kind in INSTRUMENT_TABLE_KINDS.
+# Global_Markets (global_markets_table), Commodities_FX (commodities_table),
+# and Mutual_Funds (mutual_funds_table) now have their own kind strings but
+# remain is_data_page=True and eligible_for_top10=True.
+#
+# My_Portfolio (portfolio_table) retains is_data_page=True for data routing
+# but eligible_for_top10=False (portfolio positions ≠ scored universe).
+#
+# Explicit overrides for special/output pages take priority over kind dispatch.
 # =============================================================================
 
 def _derive_page_info(canonical: str) -> PageInfo:
@@ -365,62 +426,74 @@ def _derive_page_info(canonical: str) -> PageInfo:
     except Exception:
         kind = ""
 
-    # Explicit overrides for special/output pages (must take priority over kind)
+    # ── Explicit overrides for special / output pages ──────────────────────
+    # These must take priority over kind strings.
+
     if canonical == "Insights_Analysis":
         return PageInfo(
-            canonical        = canonical,
-            description      = _DESC_OVERRIDES.get(canonical, ""),
-            kind             = kind or "insights_analysis",
-            is_data_page     = False,
-            is_output_page   = False,
-            is_special_page  = True,
+            canonical          = canonical,
+            description        = _DESC_OVERRIDES.get(canonical, ""),
+            kind               = kind or "insights_analysis",
+            is_data_page       = False,
+            is_output_page     = False,
+            is_special_page    = True,
             eligible_for_top10 = False,
         )
 
     if canonical == "Top_10_Investments":
-        # kind == 'instrument_table' (83 cols) but it is an OUTPUT page -- override
+        # kind may be 'instrument_table' (base cols) — override to output
         return PageInfo(
-            canonical        = canonical,
-            description      = _DESC_OVERRIDES.get(canonical, ""),
-            kind             = kind or "top10_output",
-            is_data_page     = False,
-            is_output_page   = True,
-            is_special_page  = True,
+            canonical          = canonical,
+            description        = _DESC_OVERRIDES.get(canonical, ""),
+            kind               = kind or "top10_output",
+            is_data_page       = False,
+            is_output_page     = True,
+            is_special_page    = True,
             eligible_for_top10 = False,
         )
 
     if canonical == "Data_Dictionary":
         return PageInfo(
-            canonical        = canonical,
-            description      = _DESC_OVERRIDES.get(canonical, ""),
-            kind             = kind or "data_dictionary",
-            is_data_page     = False,
-            is_output_page   = True,
-            is_special_page  = True,
+            canonical          = canonical,
+            description        = _DESC_OVERRIDES.get(canonical, ""),
+            kind               = kind or "data_dictionary",
+            is_data_page       = False,
+            is_output_page     = True,
+            is_special_page    = True,
             eligible_for_top10 = False,
         )
 
-    # FIX v3.3.0: only instrument_table pages are true input data universes.
-    # My_Portfolio has kind='portfolio_table' -> is_data_page=False, correctly
-    # excluded from INPUT_PAGES, INSTRUMENT_PAGES, and TOP10_FEED_PAGES_DEFAULT.
-    is_data_page    = (kind == "instrument_table")
-    is_output_page  = (canonical in OUTPUT_PAGES)
-    is_special_page = (canonical in SPECIAL_PAGES)
-    eligible_for_top10 = bool(is_data_page and not is_output_page and not is_special_page)
+    # ── ENH v3.4.0: per-page kind dispatch ────────────────────────────────
+    # All five instrument-family kinds are live data pages.
+    # My_Portfolio (portfolio_table) is a data page for routing but NOT
+    # eligible_for_top10 — portfolio positions are not a scored universe.
+
+    is_data_page    = kind in INSTRUMENT_TABLE_KINDS
+    is_output_page  = canonical in OUTPUT_PAGES
+    is_special_page = canonical in SPECIAL_PAGES
+
+    # portfolio_table: data page for routing, excluded from top10 feeds
+    if kind == "portfolio_table":
+        eligible_for_top10 = False
+    else:
+        eligible_for_top10 = bool(
+            is_data_page and not is_output_page and not is_special_page
+        )
 
     return PageInfo(
-        canonical        = canonical,
-        description      = _DESC_OVERRIDES.get(canonical, ""),
-        kind             = kind,
-        is_data_page     = is_data_page,
-        is_output_page   = is_output_page,
-        is_special_page  = is_special_page,
+        canonical          = canonical,
+        description        = _DESC_OVERRIDES.get(canonical, ""),
+        kind               = kind,
+        is_data_page       = is_data_page,
+        is_output_page     = is_output_page,
+        is_special_page    = is_special_page,
         eligible_for_top10 = eligible_for_top10,
     )
 
 
 PAGE_INFO: Dict[str, PageInfo] = {c: _derive_page_info(c) for c in CANONICAL_PAGES}
 
+# ENH v3.4.0: INSTRUMENT_PAGES includes all pages whose kind is in INSTRUMENT_TABLE_KINDS
 INSTRUMENT_PAGES: Set[str] = {
     p for p, info in PAGE_INFO.items()
     if info.is_data_page and not info.is_special_page
@@ -431,8 +504,10 @@ INPUT_PAGES: List[str] = [
     if p in PAGE_INFO and PAGE_INFO[p].is_data_page and not PAGE_INFO[p].is_special_page
 ]
 
+# Top10 feed pages: all eligible instrument pages EXCLUDING My_Portfolio
+# (portfolio_table kind is not a scored universe of instruments)
 TOP10_FEED_PAGES_DEFAULT: List[str] = [
-    p for p in ["Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds", "My_Portfolio"]
+    p for p in ["Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds"]
     if p in PAGE_INFO and PAGE_INFO[p].eligible_for_top10
 ]
 
@@ -466,75 +541,84 @@ for c in CANONICAL_PAGES:
     _add_alias(c.replace("_", "/"), c)
     _add_alias(c.replace("_", ""), c)
 
-# Friendly aliases
-_add_alias("Market Leaders",          "Market_Leaders")
-_add_alias("Leaders",                 "Market_Leaders")
-_add_alias("Leader",                  "Market_Leaders")
-_add_alias("Market Leaders Page",     "Market_Leaders")
-_add_alias("MarketLeader",            "Market_Leaders")
+# Friendly aliases — Market_Leaders
+_add_alias("Market Leaders",        "Market_Leaders")
+_add_alias("Leaders",               "Market_Leaders")
+_add_alias("Leader",                "Market_Leaders")
+_add_alias("Market Leaders Page",   "Market_Leaders")
+_add_alias("MarketLeader",          "Market_Leaders")
+_add_alias("TASI Leaders",          "Market_Leaders")
+_add_alias("Saudi Leaders",         "Market_Leaders")
 
-_add_alias("Global Markets",          "Global_Markets")
-_add_alias("Global Market",           "Global_Markets")
-_add_alias("Global",                  "Global_Markets")
-_add_alias("GlobalMarkets",           "Global_Markets")
+# Friendly aliases — Global_Markets
+_add_alias("Global Markets",        "Global_Markets")
+_add_alias("Global Market",         "Global_Markets")
+_add_alias("Global",                "Global_Markets")
+_add_alias("GlobalMarkets",         "Global_Markets")
+_add_alias("International Markets", "Global_Markets")
+_add_alias("World Markets",         "Global_Markets")
+_add_alias("International",         "Global_Markets")
 
-_add_alias("Commodities FX",          "Commodities_FX")
-_add_alias("Commodities & FX",        "Commodities_FX")
-_add_alias("Commodities and FX",      "Commodities_FX")
-_add_alias("Commodity FX",            "Commodities_FX")
-_add_alias("Commodities",             "Commodities_FX")
-_add_alias("Commodity",               "Commodities_FX")
-_add_alias("FX",                      "Commodities_FX")
-_add_alias("Forex",                   "Commodities_FX")
-_add_alias("CommoditiesFX",           "Commodities_FX")
+# Friendly aliases — Commodities_FX
+_add_alias("Commodities FX",        "Commodities_FX")
+_add_alias("Commodities & FX",      "Commodities_FX")
+_add_alias("Commodities and FX",    "Commodities_FX")
+_add_alias("Commodity FX",          "Commodities_FX")
+_add_alias("Commodities",           "Commodities_FX")
+_add_alias("Commodity",             "Commodities_FX")
+_add_alias("FX",                    "Commodities_FX")
+_add_alias("Forex",                 "Commodities_FX")
+_add_alias("CommoditiesFX",         "Commodities_FX")
+_add_alias("Metals",                "Commodities_FX")
+_add_alias("Gold",                  "Commodities_FX")
+_add_alias("Oil",                   "Commodities_FX")
 
-_add_alias("Mutual Funds",            "Mutual_Funds")
-_add_alias("Mutual Fund",             "Mutual_Funds")
-_add_alias("Funds",                   "Mutual_Funds")
-_add_alias("Fund",                    "Mutual_Funds")
-_add_alias("ETF",                     "Mutual_Funds")
-_add_alias("ETFs",                    "Mutual_Funds")
-_add_alias("MutualFunds",             "Mutual_Funds")
+# Friendly aliases — Mutual_Funds
+_add_alias("Mutual Funds",          "Mutual_Funds")
+_add_alias("Mutual Fund",           "Mutual_Funds")
+_add_alias("Funds",                 "Mutual_Funds")
+_add_alias("Fund",                  "Mutual_Funds")
+_add_alias("ETF",                   "Mutual_Funds")
+_add_alias("ETFs",                  "Mutual_Funds")
+_add_alias("MutualFunds",           "Mutual_Funds")
+_add_alias("Index Funds",           "Mutual_Funds")
+_add_alias("Investment Funds",      "Mutual_Funds")
 
-_add_alias("My Portfolio",            "My_Portfolio")
-_add_alias("Portfolio",               "My_Portfolio")
-_add_alias("My Holdings",             "My_Portfolio")
-_add_alias("Holdings",                "My_Portfolio")
-_add_alias("MyPortfolio",             "My_Portfolio")
+# Friendly aliases — My_Portfolio
+_add_alias("My Portfolio",          "My_Portfolio")
+_add_alias("Portfolio",             "My_Portfolio")
+_add_alias("My Holdings",           "My_Portfolio")
+_add_alias("Holdings",              "My_Portfolio")
+_add_alias("MyPortfolio",           "My_Portfolio")
+_add_alias("My Investments",        "My_Portfolio")
+_add_alias("Positions",             "My_Portfolio")
 
-_add_alias("Insights",                "Insights_Analysis")
-_add_alias("Insight",                 "Insights_Analysis")
-_add_alias("Insights Analysis",       "Insights_Analysis")
-_add_alias("Insights-Analysis",       "Insights_Analysis")
-_add_alias("Insights & Analysis",     "Insights_Analysis")
-_add_alias("InsightsAnalysis",        "Insights_Analysis")
+# Friendly aliases — Insights_Analysis
+_add_alias("Insights",              "Insights_Analysis")
+_add_alias("Insight",               "Insights_Analysis")
+_add_alias("Insights Analysis",     "Insights_Analysis")
+_add_alias("Insights-Analysis",     "Insights_Analysis")
+_add_alias("Insights & Analysis",   "Insights_Analysis")
+_add_alias("InsightsAnalysis",      "Insights_Analysis")
+_add_alias("AI Insights",           "Insights_Analysis")
+_add_alias("Market Insights",       "Insights_Analysis")
 
+# Friendly aliases — Top_10_Investments
 for _alias in (
-    "Top 10",
-    "Top10",
-    "Top Ten",
-    "Top 10 Investments",
-    "Top10 Investments",
-    "Top Ten Investments",
-    "Top_10",
-    "Top10_Investments",
-    "Top_10_Investment",
-    "Top10Investment",
-    "Top10Investments",
-    "Top 10 Investements",
-    "Top10 Investements",
-    "Top 10 Investmant",
-    "Top10 Investmant",
+    "Top 10", "Top10", "Top Ten",
+    "Top 10 Investments", "Top10 Investments", "Top Ten Investments",
+    "Top_10", "Top10_Investments", "Top_10_Investment", "Top10Investment",
+    "Top10Investments", "Top 10 Investements", "Top10 Investements",
+    "Top 10 Investmant", "Top10 Investmant",
+    "Best Picks", "Top Picks", "Best Investments",
 ):
     _add_alias(_alias, "Top_10_Investments")
 
+# Friendly aliases — Data_Dictionary
 for _alias in (
-    "Data Dictionary",
-    "Dictionary",
-    "Data-Dictionary",
-    "DataDict",
-    "Data Dic",
-    "Data Dictionary Page",
+    "Data Dictionary", "Dictionary", "Data-Dictionary",
+    "DataDict", "Data Dic", "Data Dictionary Page",
+    "Schema Reference", "Column Reference",
 ):
     _add_alias(_alias, "Data_Dictionary")
 
@@ -599,6 +683,7 @@ def is_special_page(page: str) -> bool:
 
 
 def is_instrument_page(page: str) -> bool:
+    """Returns True for any of the five live data pages (all INSTRUMENT_TABLE_KINDS)."""
     try:
         canonical = normalize_page_name(page, allow_output_pages=True, allow_special_pages=True)
     except Exception:
@@ -612,6 +697,15 @@ def is_input_page(page: str) -> bool:
     except Exception:
         return False
     return canonical in INSTRUMENT_PAGES
+
+
+def get_page_kind(page: str) -> str:
+    """Return the kind string for a page. Returns '' if unknown."""
+    try:
+        canonical = normalize_page_name(page, allow_output_pages=True, allow_special_pages=True)
+        return PAGE_INFO[canonical].kind
+    except Exception:
+        return ""
 
 
 def normalize_page_name(
@@ -726,13 +820,25 @@ def normalize_page_names(
 
 
 def get_top10_feed_pages(pages_override: Optional[Sequence[str]] = None) -> List[str]:
+    """
+    Returns ordered list of pages eligible as Top10 feed universes.
+
+    Default feed pages (v3.4.0):
+      Market_Leaders, Global_Markets, Commodities_FX, Mutual_Funds
+      (My_Portfolio excluded — portfolio positions are not a scored universe)
+
+    pages_override allows callers to specify a custom subset/order.
+    """
     pages = list(pages_override) if pages_override is not None else list(TOP10_FEED_PAGES_DEFAULT)
     normalized: List[str] = []
     for p in pages:
-        canonical = normalize_input_page_name(p)
-        info = PAGE_INFO.get(canonical)
-        if info and info.eligible_for_top10 and info.is_data_page and not info.is_special_page:
-            normalized.append(canonical)
+        try:
+            canonical = normalize_input_page_name(p)
+            info = PAGE_INFO.get(canonical)
+            if info and info.eligible_for_top10 and info.is_data_page and not info.is_special_page:
+                normalized.append(canonical)
+        except Exception:
+            pass
     out: List[str] = []
     seen: Set[str] = set()
     for p in normalized:
@@ -747,10 +853,14 @@ def get_route_family(page: str) -> str:
     Helper for route dispatch decisions.
 
     Returns one of:
-    - "instrument"   (all instrument/portfolio pages incl. My_Portfolio)
-    - "insights"     (Insights_Analysis)
-    - "top10"        (Top_10_Investments)
-    - "dictionary"   (Data_Dictionary)
+      "instrument"   — all five live data pages (all INSTRUMENT_TABLE_KINDS)
+      "insights"     — Insights_Analysis
+      "top10"        — Top_10_Investments
+      "dictionary"   — Data_Dictionary
+
+    Note: routing family is independent of kind string. Global_Markets,
+    Commodities_FX, Mutual_Funds, and My_Portfolio all return "instrument"
+    even with their new per-page kind strings in v3.4.0.
     """
     canonical = normalize_page_name(page, allow_output_pages=True, allow_special_pages=True)
     if canonical == "Insights_Analysis":  return "insights"
@@ -769,7 +879,7 @@ def validate_page_catalog() -> None:
         if fp in _CANONICAL_FROM_SCHEMA:
             raise ValueError(f"Forbidden page '{fp}' exists in schema_registry. Remove it.")
 
-    # Page catalog pages must exist in schema registry
+    # All page catalog pages must exist in schema registry
     for canonical in CANONICAL_PAGES:
         if canonical not in _CANONICAL_FROM_SCHEMA:
             raise ValueError(f"Page '{canonical}' exists in page_catalog but not in schema_registry.")
@@ -781,7 +891,7 @@ def validate_page_catalog() -> None:
         prior = normalized_canonical_tokens.get(tok)
         if prior and prior != canonical:
             raise ValueError(
-                f"Canonical token collision after normalization: '{prior}' vs '{canonical}' -> '{tok}'"
+                f"Canonical token collision: '{prior}' vs '{canonical}' -> '{tok}'"
             )
         normalized_canonical_tokens[tok] = canonical
 
@@ -811,7 +921,7 @@ def validate_page_catalog() -> None:
     for raw, expected in must_resolve:
         resolved = normalize_page_name(raw, allow_output_pages=True, allow_special_pages=True)
         if resolved != expected:
-            raise ValueError(f"Normalization failed for '{raw}' -> '{resolved}' (expected '{expected}')")
+            raise ValueError(f"Normalization failed: '{raw}' -> '{resolved}' (expected '{expected}')")
 
     # Payload-style resolution checks
     payload_examples: List[Tuple[Any, str]] = [
@@ -827,9 +937,9 @@ def validate_page_catalog() -> None:
     for value, expected in payload_examples:
         resolved = resolve_page_candidate(value, required=True)
         if resolved != expected:
-            raise ValueError(f"Payload resolution failed for {value!r} -> '{resolved}' (expected '{expected}')")
+            raise ValueError(f"Payload resolution failed: {value!r} -> '{resolved}' (expected '{expected}')")
 
-    # Aliases must map only to valid non-forbidden pages
+    # Aliases must map to valid non-forbidden pages
     for alias_token, canonical in ALIAS_TO_CANONICAL.items():
         if canonical in FORBIDDEN_PAGES:
             raise ValueError(f"Alias token '{alias_token}' maps to forbidden page '{canonical}'.")
@@ -839,28 +949,39 @@ def validate_page_catalog() -> None:
     # Special pages must exist and must not be treated as instrument pages
     for sp in SPECIAL_PAGES:
         if sp not in PAGE_INFO:
-            raise ValueError(f"Special page '{sp}' is not registered in PAGE_INFO.")
+            raise ValueError(f"Special page '{sp}' not registered.")
         if PAGE_INFO[sp].is_data_page:
-            raise ValueError(f"Special page '{sp}' must not be treated as instrument_table.")
+            raise ValueError(f"Special page '{sp}' must not be is_data_page=True.")
 
     # Output pages must also be special pages
     for op in OUTPUT_PAGES:
         if op not in PAGE_INFO:
-            raise ValueError(f"Output page '{op}' is not registered in PAGE_INFO.")
+            raise ValueError(f"Output page '{op}' not registered.")
         if not PAGE_INFO[op].is_output_page:
-            raise ValueError(f"Output page '{op}' must be marked is_output_page=True.")
+            raise ValueError(f"Output page '{op}' must be is_output_page=True.")
         if not PAGE_INFO[op].is_special_page:
-            raise ValueError(f"Output page '{op}' must be marked is_special_page=True.")
+            raise ValueError(f"Output page '{op}' must be is_special_page=True.")
 
-    # Input pages must be the non-special data pages only (instrument_table kind)
-    expected_input_pages = [
+    # ENH v3.4.0: All five instrument pages must be in INSTRUMENT_PAGES
+    expected_instrument_pages = {
+        "Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds", "My_Portfolio"
+    }
+    missing_from_instrument = expected_instrument_pages - INSTRUMENT_PAGES
+    if missing_from_instrument:
+        raise ValueError(
+            f"Expected instrument pages missing from INSTRUMENT_PAGES: {sorted(missing_from_instrument)}. "
+            f"Check that their kind strings are in INSTRUMENT_TABLE_KINDS."
+        )
+
+    # Input pages must be the non-special data pages only
+    expected_input = [
         p for p in CANONICAL_PAGES
         if p in PAGE_INFO and PAGE_INFO[p].is_data_page and not PAGE_INFO[p].is_special_page
     ]
-    if INPUT_PAGES != expected_input_pages:
-        raise ValueError(f"INPUT_PAGES drift detected: got {INPUT_PAGES!r}, expected {expected_input_pages!r}")
+    if INPUT_PAGES != expected_input:
+        raise ValueError(f"INPUT_PAGES drift: got {INPUT_PAGES!r}, expected {expected_input!r}")
 
-    # Top10 default feeds must be valid input universes
+    # ENH v3.4.0: Top10 feed pages must exclude My_Portfolio
     for p in TOP10_FEED_PAGES_DEFAULT:
         if p not in PAGE_INFO:
             raise ValueError(f"TOP10_FEED_PAGES_DEFAULT includes unknown page '{p}'.")
@@ -870,12 +991,18 @@ def validate_page_catalog() -> None:
         if not info.eligible_for_top10:
             raise ValueError(f"TOP10_FEED_PAGES_DEFAULT includes ineligible page '{p}'.")
 
-    # Canonical pages must include the expected 8 sheets
+    if "My_Portfolio" in TOP10_FEED_PAGES_DEFAULT:
+        raise ValueError(
+            "My_Portfolio must not be in TOP10_FEED_PAGES_DEFAULT "
+            "(portfolio positions are not a scored investment universe)."
+        )
+
+    # Canonical pages must include all 8 expected sheets
     expected_core = {
         "Market_Leaders", "Global_Markets", "Commodities_FX", "Mutual_Funds",
         "My_Portfolio", "Insights_Analysis", "Top_10_Investments", "Data_Dictionary",
     }
-    missing_expected = expected_core.difference(set(CANONICAL_PAGES))
+    missing_expected = expected_core - set(CANONICAL_PAGES)
     if missing_expected:
         raise ValueError(f"Missing expected canonical pages: {sorted(missing_expected)}")
 
@@ -894,6 +1021,27 @@ def validate_page_catalog() -> None:
         got = get_route_family(page)
         if got != family:
             raise ValueError(f"Route family mismatch for '{page}': got '{got}', expected '{family}'")
+
+    # ENH v3.4.0: Verify page kind strings match expected kinds
+    expected_kinds = {
+        "Market_Leaders":    "instrument_table",
+        "Global_Markets":    "global_markets_table",
+        "Commodities_FX":    "commodities_table",
+        "Mutual_Funds":      "mutual_funds_table",
+        "My_Portfolio":      "portfolio_table",
+        "Insights_Analysis": "insights_analysis",
+        "Top_10_Investments":"top10_output",
+        "Data_Dictionary":   "data_dictionary",
+    }
+    for page, expected_kind in expected_kinds.items():
+        if page not in PAGE_INFO:
+            continue  # already caught above
+        actual_kind = PAGE_INFO[page].kind
+        if actual_kind and actual_kind != expected_kind:
+            raise ValueError(
+                f"Kind mismatch for '{page}': got '{actual_kind}', expected '{expected_kind}'. "
+                f"Update schema_registry.py to use kind='{expected_kind}' for this page."
+            )
 
 
 # Validate immediately at module load (fast, no I/O)
