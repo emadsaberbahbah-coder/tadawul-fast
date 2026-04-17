@@ -76,6 +76,7 @@ except Exception:
 
 _TRACING_ENABLED = (os.getenv("CORE_TRACING_ENABLED", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
+
 class TraceContext:
     """
     Safe OTEL wrapper:
@@ -129,6 +130,7 @@ try:
 except Exception:
     get_engine = None  # type: ignore
     _ENGINE_AVAILABLE = False
+
 
 SCRIPT_VERSION = "5.1.0"
 
@@ -387,6 +389,7 @@ async def main_async(args: argparse.Namespace) -> int:
     _CPU_EXECUTOR.shutdown(wait=False)
     return 1 if stats.failed > 0 else 0
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=f"Tadawul Distributed Data Refresher v{SCRIPT_VERSION}")
     parser.add_argument("--symbols", type=str, default="", help="Comma-separated list of symbols to refresh")
@@ -404,6 +407,7 @@ def main() -> None:
         logger.info("Refresh interrupted by user.")
         _CPU_EXECUTOR.shutdown(wait=False)
         sys.exit(130)
+
 
 if __name__ == "__main__":
     main()
