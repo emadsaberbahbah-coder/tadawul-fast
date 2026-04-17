@@ -2,7 +2,7 @@
 """
 tests/test_schema_alignment.py
 --------------------------------------------------------------------------------
-PHASE 9 — Schema Alignment & Route Contract Regression Suite (v9.1.0)
+PHASE 9 — Schema Alignment & Route Contract Regression Suite
 
 What this test suite enforces
 1) schema_registry has all required sheets (single canonical list)
@@ -53,9 +53,28 @@ REQUIRED_SHEETS: List[str] = [
     "Data_Dictionary",
 ]
 
-TOP10_REQUIRED_KEYS = {"top10_rank", "selection_reason", "criteria_snapshot"}
+# v9.2.0: added 4 trade setup keys from top10_selector v4.9.0
+TOP10_REQUIRED_KEYS = {
+    "top10_rank", "selection_reason", "criteria_snapshot",
+    "entry_price", "stop_loss_suggested", "take_profit_suggested", "risk_reward_ratio",
+}
 TOP10_RECOMMENDATION_KEYS = {"recommendation", "recommendation_reason"}
-DATA_DICTIONARY_EXPECTED_COLS = 9
+TOP10_TRADE_SETUP_KEYS = {
+    "entry_price", "stop_loss_suggested", "take_profit_suggested", "risk_reward_ratio",
+}
+TOP10_TECHNICAL_KEYS = {"technical_score", "short_term_signal", "rsi_signal", "volume_ratio"}
+
+# v9.2.0: per-page expected column counts (schema_registry v3.4.0)
+EXPECTED_SHEET_COLUMN_COUNTS: Dict[str, int] = {
+    "Market_Leaders":    99,
+    "Global_Markets":    112,
+    "Commodities_FX":    86,
+    "Mutual_Funds":      94,
+    "My_Portfolio":      110,
+    "Top_10_Investments":106,
+    "Insights_Analysis": 9,
+    "Data_Dictionary":   9,
+}
 
 
 # =============================================================================
@@ -153,12 +172,7 @@ def _dedupe_keep_order(values: Iterable[Any]) -> List[str]:
 # Schema registry access (authoritative)
 # =============================================================================
 def _load_schema_module():
-    return _import_any(
-        "core.sheets.schema_registry",
-        "sheets.schema_registry",
-        "schema_registry",
-        "core.schema_registry",
-    )
+    return _import_any("core.sheets.schema_registry")
 
 
 def _schema_sheet_headers(sr: Any, sheet: str) -> List[str]:
@@ -219,12 +233,10 @@ def _load_data_dictionary_rows_dicts() -> List[Dict[str, Any]]:
       core.data_dictionary.*
       values builders (2D arrays)
     """
-    mod = _import_any(
-        "core.sheets.data_dictionary",
-        "sheets.data_dictionary",
-        "core.data_dictionary",
-        "data_dictionary",
-    )
+    try:
+        mod = _import_any("core.sheets.data_dictionary")
+    except Exception:
+        mod = _import_any("core.data_dictionary")
 
     fn = _first_callable(
         mod,
@@ -793,3 +805,83 @@ def test_top10_sheet_rows_includes_special_headers(monkeypatch: pytest.MonkeyPat
 
             reco_missing = sorted(TOP10_RECOMMENDATION_KEYS - got_keys)
             assert not reco_missing, f"{method} {path} Top_10_Investments missing recommendation keys: {reco_missing}"
+
+
+def test_top10_schema_has_trade_setup_fields():
+    """
+    v9.2.0: Asserts that Top_10_Investments schema contains all 4 AI trade setup
+    fields introduced in top10_selector v4.9.0 and schema_registry v3.4.0.
+    """
+    sr = _load_schema_module()
+    keys = set(_schema_sheet_keys(sr, "Top_10_Investments"))
+    missing = sorted(TOP10_TRADE_SETUP_KEYS - keys)
+    assert not missing, (
+        f"Top_10_Investments missing trade setup keys: {missing}. "
+        "These are required by top10_selector v4.9.0 (_compute_trade_setup)."
+    )
+
+
+def test_top10_schema_has_technical_signal_fields():
+    """
+    v9.2.0: Asserts that Top_10_Investments schema contains key technical signals
+    introduced in scoring.py v3.0.0.
+    """
+    sr = _load_schema_module()
+    keys = set(_schema_sheet_keys(sr, "Top_10_Investments"))
+    missing = sorted(TOP10_TECHNICAL_KEYS - keys)
+    assert not missing, (
+        f"Top_10_Investments missing technical signal keys: {missing}. "
+        "These are required by scoring.py v3.0.0."
+    )
+
+
+def test_per_page_column_counts_match_schema_registry():
+    """
+    v9.2.0: Validates that each sheet's live column count matches the expected
+    per-page contract from schema_registry v3.4.0.
+
+    Failure here means either:
+     (a) schema_registry was not updated to v3.4.0, or
+     (b) EXPECTED_SHEET_COLUMN_COUNTS is out of date.
+
+    Note: column counts are checked as minimum — a registry with MORE columns
+    than expected passes (future-proof). An exact match is enforced for special
+    pages (Insights_Analysis, Data_Dictionary) to prevent schema drift.
+    """
+    sr = _load_schema_module()
+    for sheet, expected_count in EXPECTED_SHEET_COLUMN_COUNTS.items():
+        keys = _schema_sheet_keys(sr, sheet)
+        actual = len(keys)
+
+        # Special pages must be exact — they have fixed canonical schemas
+        if sheet in ("Insights_Analysis", "Data_Dictionary"):
+            assert actual == expected_count, (
+                f"Sheet '{sheet}' column count mismatch: "
+                f"expected exactly {expected_count}, got {actual}."
+            )
+        else:
+            # Instrument pages: at minimum the expected count
+            assert actual >= expected_count, (
+                f"Sheet '{sheet}' has fewer columns than expected: "
+                f"expected >= {expected_count}, got {actual}. "
+                f"schema_registry v3.4.0 may not be deployed."
+            )
+
+
+def test_insights_schema_has_priority_and_signal():
+    """
+    v9.2.0: Asserts that Insights_Analysis schema contains the new
+    'signal' and 'priority' columns from insights_builder v3.0.0.
+    """
+    sr = _load_schema_module()
+    keys = set(_schema_sheet_keys(sr, "Insights_Analysis"))
+    for required_key in ("signal", "priority", "as_of_riyadh"):
+        assert required_key in keys, (
+            f"Insights_Analysis missing key '{required_key}'. "
+            "Schema must be schema_registry v3.4.0 (9-col Insights schema)."
+        )
+    for old_key in ("source", "sort_order", "last_updated_riyadh"):
+        assert old_key not in keys, (
+            f"Insights_Analysis still has old key '{old_key}' — "
+            "should have been replaced in schema_registry v3.4.0."
+        )
