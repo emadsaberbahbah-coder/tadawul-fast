@@ -1262,7 +1262,7 @@ class EODHDClient:
             )
 
         # FIX v4.7.0: check both FUNDAMENTALS_ENABLED and EODHD_ENABLE_FUNDAMENTALS
-        enable_fund = _fundamentals_enabled()
+        enable_fund = _env_bool("FUNDAMENTALS_ENABLED", True) or _env_bool("EODHD_ENABLE_FUNDAMENTALS", True)
         enable_hist = _env_bool("EODHD_ENABLE_HISTORY", True)
 
         tasks: List[asyncio.Task] = [asyncio.create_task(self.fetch_quote(sym_raw))]
