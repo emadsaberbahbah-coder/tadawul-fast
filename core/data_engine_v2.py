@@ -5090,8 +5090,41 @@ __all__ = [
     "QuoteQuality",
     "DataSource",
     "UnifiedQuote",
-    "__version__",
-    "STATIC_CANONICAL_SHEET_CONTRACTS",
-    "get_sheet_spec",
-    "normalize_row_to_schema",
+    "StubUnifiedQuote",
+    "SymbolInfo",
+    "BatchProgress",
+    "PerfMetrics",
+    "normalize_symbol",
+    "get_symbol_info",
+    "get_engine",
+    "get_engine_sync",
+    "close_engine",
+    "get_cache",
+    "get_quote",
+    "get_quotes",
+    "get_enriched_quote",
+    "get_enriched_quotes",
+    # NEW (sheet rows)
+    "get_sheet_rows",
+    "get_sheet_rows_sync",
+    "process_batch",
+    "health_check",
+    "engine_context",
+    "EngineSession",
+    "DataEngine",
+    "DistributedCache",
+    "DynamicCircuitBreaker",
+    "TokenBucket",
+    "get_perf_metrics",
+    "get_perf_stats",
+    "reset_perf_metrics",
+    "get_engine_meta",
+    "MetricsRegistry",
+    "_METRICS",
 ]
+
+# safe default
+try:
+    _METRICS.set("active_requests", 0)
+except Exception:
+    pass
