@@ -1,30 +1,17 @@
-name: "\U0001F3E6 Tadawul Dashboard Sync v2.0"
+name: "🏦 Tadawul Dashboard Sync v2.1"
 
 # =============================================================================
-# TADAWUL FAST BRIDGE -- GitHub Actions Workflow v2.0.0
+# TADAWUL FAST BRIDGE -- GitHub Actions Workflow v2.1.0
 # =============================================================================
-# What this workflow does:
-#   1. CI gate (push/PR):  schema alignment + scoring contract tests (hard fail)
-#   2. Scheduled sync:     every 15 minutes in production
-#   3. Manual dispatch:    full_sync | health_only | single_key | portfolio_only
-#
-# v2.0.0 changes vs v1.x
-# -----------------------
-# FIX: Schema version check added -- workflow now verifies schema_registry
-#      reports v3.0.0 before running any sync. Prevents writing wrong-width
-#      rows after a schema change (My_Portfolio: 45 cols, Insights: 10 cols).
-# FIX: My_Portfolio handled in a dedicated step with --protect-user-fields flag
-#      so position_qty, avg_cost, symbol are never overwritten by the sync.
-# FIX: Insights_Analysis handled in its own step (uses builder, not symbol scan).
-# FIX: Post-sync validation step added -- queries /v1/schema/sheet-spec after
-#      sync to confirm returned col counts match registry expectations.
-# FIX: test_schema_alignment.py now required at tests/ path (was optional).
-#      Schema drift must block sync, not warn.
-# ENH: new run_mode=portfolio_only for syncing only My_Portfolio.
-# ENH: new run_mode=insights_only for rebuilding Insights_Analysis.
-# ENH: Drift detection step added (optional -- runs if drift_detection.py present).
-# ENH: Failure notification includes schema version + sync stats per page.
-# ENH: Summary table shows per-page status (which pages synced, which failed).
+# Main reliability fixes in this revision
+# - FIX: step conditions now use step outputs, not env values written via GITHUB_ENV
+#        (those env values are not reliable in later `if:` expressions)
+# - FIX: configuration step now exports both GITHUB_ENV and GITHUB_OUTPUT values
+# - FIX: My_Portfolio protection flag is added only if the sync script supports it
+# - FIX: summary / cleanup read resolved values from step outputs
+# - FIX: sync steps receive resolved values explicitly through env
+# - KEEP: schema guard + contract checks remain hard fail
+# - KEEP: dedicated My_Portfolio and Insights_Analysis handling
 # =============================================================================
 
 on:
@@ -33,8 +20,6 @@ on:
     branches: [main, master]
 
   schedule:
-    # Every 15 min (UTC). Riyadh = UTC+3.
-    # 00:00, 00:15, 00:30, 00:45, ... Riyadh = 03:00, 03:15, ...
     - cron: "0,15,30,45 * * * *"
 
   workflow_dispatch:
@@ -53,11 +38,11 @@ on:
         default: "full_sync"
         type: choice
         options:
-          - full_sync         # All 8 canonical pages
-          - health_only       # Health check + dry run (no writes)
-          - single_key        # One specific page (use single_key input)
-          - portfolio_only    # My_Portfolio only (preserves user fields)
-          - insights_only     # Insights_Analysis rebuild only
+          - full_sync
+          - health_only
+          - single_key
+          - portfolio_only
+          - insights_only
       single_key:
         description: "Page key (if single_key mode)"
         required: false
@@ -91,9 +76,7 @@ env:
   PYTHONUNBUFFERED: "1"
   TZ: "Asia/Riyadh"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
-  # Schema version this workflow expects -- must match schema_registry.SCHEMA_VERSION
   EXPECTED_SCHEMA_VERSION: "3.0.0"
-  # Expected column counts (must match schema_registry._EXPECTED_LENGTHS)
   EXPECTED_COLS_MARKET_LEADERS: "80"
   EXPECTED_COLS_GLOBAL_MARKETS: "80"
   EXPECTED_COLS_COMMODITIES_FX: "80"
@@ -104,9 +87,6 @@ env:
   EXPECTED_COLS_DATA_DICTIONARY: "9"
 
 jobs:
-  # ===========================================================================
-  # JOB 1: CI gate -- runs on push and PR (merge blocker)
-  # ===========================================================================
   ci-tests:
     name: "CI Tests (Schema + Contract)"
     runs-on: ubuntu-latest
@@ -164,7 +144,6 @@ jobs:
           print(f"Schema version: {SCHEMA_VERSION} (expected: {expected})")
           if SCHEMA_VERSION != expected:
               print(f"ERROR: Schema version mismatch. Got {SCHEMA_VERSION}, expected {expected}.")
-              print("Update EXPECTED_SCHEMA_VERSION in the workflow or deploy schema_registry.py v3.0.0.")
               sys.exit(1)
           if not SCHEMA_VALIDATED_OK:
               print(f"ERROR: Schema registry validation failed: {SCHEMA_VALIDATION_ERRORS}")
@@ -213,9 +192,6 @@ jobs:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           set -euo pipefail
-          echo "::group::Tests"
-
-          # Scoring engine contract
           SCORE_TEST=""
           for path in "test_scoring_engine_contract.py" "core/test_scoring_engine_contract.py" "tests/test_scoring_engine_contract.py"; do
             if [ -f "$path" ]; then SCORE_TEST="$path"; break; fi
@@ -226,19 +202,12 @@ jobs:
           fi
           python -m pytest -q "$SCORE_TEST"
 
-          # Schema alignment gate (HARD FAIL -- schema drift = wrong columns written to Sheets)
           if [ ! -f "tests/test_schema_alignment.py" ]; then
             echo "::error::tests/test_schema_alignment.py is required and not found."
-            echo "::error::Schema drift cannot be detected without this file. Add it to the repo."
             exit 1
           fi
           python -m pytest -q tests/test_schema_alignment.py
 
-          echo "::endgroup::"
-
-  # ===========================================================================
-  # JOB 2: Pre-flight validation (scheduled + manual)
-  # ===========================================================================
   preflight-validation:
     name: "Pre-flight Validation"
     runs-on: ubuntu-latest
@@ -251,12 +220,6 @@ jobs:
         id: validate
         run: |
           set -euo pipefail
-          echo "::group::System"
-          echo "OS: $(uname -a)"
-          df -h /
-          free -h || true
-          echo "::endgroup::"
-
           MISSING=()
           for tool in curl jq python3 pip3; do
             command -v "$tool" >/dev/null 2>&1 || MISSING+=("$tool")
@@ -267,9 +230,6 @@ jobs:
           fi
           echo "validated=true" >> "$GITHUB_OUTPUT"
 
-  # ===========================================================================
-  # JOB 3: Main dashboard sync (scheduled + manual)
-  # ===========================================================================
   sync-dashboard:
     name: "Dashboard Sync"
     runs-on: ubuntu-latest
@@ -299,7 +259,6 @@ jobs:
       - name: Install Dependencies
         run: |
           set -euo pipefail
-          echo "::group::Pip"
           python -m pip install --upgrade pip setuptools wheel
           if [ -f "requirements.render.txt" ]; then
             python -m pip install -r requirements.render.txt
@@ -310,21 +269,12 @@ jobs:
             exit 1
           fi
           python -m pip install -q pytest
-          echo "::endgroup::"
 
-      # -------------------------------------------------------------------------
-      # Schema guard: must pass before any data is written.
-      # My_Portfolio now has 45 cols (portfolio_table). Insights has 10 cols.
-      # Writing with the old schema (80 cols / 7 cols) would corrupt the sheet.
-      # -------------------------------------------------------------------------
       - name: Schema + Contract Guard (HARD FAIL)
         env:
           PYTHONPATH: ${{ github.workspace }}
         run: |
           set -euo pipefail
-          echo "::group::Schema Guard"
-
-          # 1. Schema registry version check
           python - <<'PY'
           import sys
           sys.path.insert(0, ".")
@@ -334,7 +284,7 @@ jobs:
               from schema_registry import SCHEMA_VERSION, SCHEMA_VALIDATED_OK
           expected = "${{ env.EXPECTED_SCHEMA_VERSION }}"
           if SCHEMA_VERSION != expected:
-              print(f"ERROR: Schema {SCHEMA_VERSION} != expected {expected}. Deploy schema_registry.py v3.0.0 first.")
+              print(f"ERROR: Schema {SCHEMA_VERSION} != expected {expected}.")
               sys.exit(1)
           if not SCHEMA_VALIDATED_OK:
               print("ERROR: Schema registry internal validation failed.")
@@ -342,7 +292,6 @@ jobs:
           print(f"Schema registry v{SCHEMA_VERSION} OK.")
           PY
 
-          # 2. Scoring contract test
           SCORE_TEST=""
           for p in "test_scoring_engine_contract.py" "core/test_scoring_engine_contract.py" "tests/test_scoring_engine_contract.py"; do
             [ -f "$p" ] && SCORE_TEST="$p" && break
@@ -353,41 +302,38 @@ jobs:
           fi
           python -m pytest -q "$SCORE_TEST"
 
-          # 3. Schema alignment test
           if [ ! -f "tests/test_schema_alignment.py" ]; then
             echo "::error::tests/test_schema_alignment.py not found."
-            echo "::error::Schema drift gate cannot run. Add this file."
             exit 1
           fi
           python -m pytest -q tests/test_schema_alignment.py
 
-          echo "All guards passed."
-          echo "::endgroup::"
-
-      # -------------------------------------------------------------------------
-      # Configuration resolution (URL, sheet ID, mode, keys, credentials)
-      # -------------------------------------------------------------------------
       - name: Configuration Resolution
         id: smart_config
         env:
-          INPUT_URL:      ${{ github.event.inputs.backend_url }}
-          INPUT_SHEET:    ${{ github.event.inputs.sheet_id }}
-          INPUT_MODE:     ${{ github.event.inputs.run_mode }}
-          INPUT_KEY:      ${{ github.event.inputs.single_key }}
-          INPUT_DEBUG:    ${{ github.event.inputs.enable_debug }}
-          INPUT_CREDS:    ${{ github.event.inputs.google_creds_json }}
-          VAR_URL:        ${{ vars.BACKEND_BASE_URL }}
-          VAR_SHEET:      ${{ vars.DEFAULT_SPREADSHEET_ID }}
-          VAR_KEYS:       ${{ vars.DEFAULT_SYNC_KEYS }}
-          SECRET_CREDS:   ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          INPUT_URL: ${{ github.event.inputs.backend_url }}
+          INPUT_SHEET: ${{ github.event.inputs.sheet_id }}
+          INPUT_MODE: ${{ github.event.inputs.run_mode }}
+          INPUT_KEY: ${{ github.event.inputs.single_key }}
+          INPUT_DEBUG: ${{ github.event.inputs.enable_debug }}
+          INPUT_CREDS: ${{ github.event.inputs.google_creds_json }}
+          VAR_URL: ${{ vars.BACKEND_BASE_URL }}
+          VAR_SHEET: ${{ vars.DEFAULT_SPREADSHEET_ID }}
+          VAR_KEYS: ${{ vars.DEFAULT_SYNC_KEYS }}
+          SECRET_CREDS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
           SECRET_CREDS_B64: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS_B64 }}
-          CREDS_PATH:     ${{ runner.temp }}/google_credentials.json
+          CREDS_PATH: ${{ runner.temp }}/google_credentials.json
         run: |
           set -euo pipefail
-          echo "::group::Config"
 
-          # Helpers
-          get_val() { for v in "$@"; do [[ -n "${v:-}" && "$v" != "null" && "$v" != "undefined" ]] && echo "$v" && return; done; }
+          get_val() {
+            for v in "$@"; do
+              if [[ -n "${v:-}" && "$v" != "null" && "$v" != "undefined" ]]; then
+                echo "$v"
+                return
+              fi
+            done
+          }
 
           upper_underscore() {
             echo "${1:-}" | tr '[:lower:]' '[:upper:]' | tr ',;|\n\r\t ' '      ' | tr ' -' '__' | tr -s '_' | xargs
@@ -395,23 +341,18 @@ jobs:
 
           sanitize_keys() {
             local raw="$1"
-            # Normalize
             if echo "$raw" | jq -e 'type=="array"' >/dev/null 2>&1; then
               raw="$(echo "$raw" | jq -r '.[]' | tr '\n' ' ' | xargs || true)"
             fi
             raw="$(upper_underscore "$raw")"
-            # Fix shorthand
             raw="$(echo "$raw" | sed 's/\bTOP10\b/TOP_10_INVESTMENTS/g; s/TOP10_INVESTMENTS/TOP_10_INVESTMENTS/g')"
-            # Remove forbidden pages (hard rule: these pages must never be synced)
             raw="$(echo "$raw" | tr ' ' '\n' | grep -v -E '^(KSA_TADAWUL|ADVISOR_CRITERIA)$' | tr '\n' ' ' | xargs || true)"
-            # Dedup preserve order
             raw="$(echo "$raw" | tr ' ' '\n' | awk '!seen[$0]++' | tr '\n' ' ' | xargs || true)"
             echo "$raw"
           }
 
           validate_keys() {
             local keys="$1"
-            # Allowed = all 8 canonical sheets (matches schema_registry.CANONICAL_SHEETS)
             local allowed="MARKET_LEADERS GLOBAL_MARKETS COMMODITIES_FX MUTUAL_FUNDS MY_PORTFOLIO INSIGHTS_ANALYSIS TOP_10_INVESTMENTS DATA_DICTIONARY"
             local bad=()
             for k in $keys; do
@@ -419,77 +360,47 @@ jobs:
             done
             if [ ${#bad[@]} -ne 0 ]; then
               echo "::error::Unknown SYNC_KEYS: ${bad[*]}"
-              echo "::notice::Allowed keys: $allowed"
               exit 1
             fi
           }
 
-          # 1. Backend URL
           URL="$(get_val "${INPUT_URL:-}" "${VAR_URL:-}" "https://tadawul-fast-bridge.onrender.com")"
           URL="${URL%/}"
           [[ "$URL" =~ ^https?:// ]] || { echo "::error::Invalid URL: $URL"; exit 1; }
-          echo "TARGET_URL=$URL" >> "$GITHUB_ENV"
-          echo "URL: $URL"
 
-          # 2. Sheet ID
           SHEET="$(get_val "${INPUT_SHEET:-}" "${VAR_SHEET:-}")"
           [[ -n "${SHEET:-}" ]] || { echo "::error::Spreadsheet ID is empty. Set vars.DEFAULT_SPREADSHEET_ID."; exit 1; }
-          echo "TARGET_SHEET_ID=$SHEET" >> "$GITHUB_ENV"
-          echo "Sheet: $SHEET"
 
-          # 3. Mode + Keys
           MODE="$(get_val "${INPUT_MODE:-}" "full_sync")"
-          echo "RUN_MODE=$MODE" >> "$GITHUB_ENV"
-
-          # Default key ordering matches the intended workflow:
-          # Source pages first (market scan) -> portfolio -> analysis -> shortlist -> reference
           ALL_KEYS="MARKET_LEADERS GLOBAL_MARKETS COMMODITIES_FX MUTUAL_FUNDS MY_PORTFOLIO INSIGHTS_ANALYSIS TOP_10_INVESTMENTS DATA_DICTIONARY"
 
           case "$MODE" in
-            single_key)
-              KEYS="$(get_val "${INPUT_KEY:-}" "MARKET_LEADERS")"
-              ;;
-            portfolio_only)
-              KEYS="MY_PORTFOLIO"
-              ;;
-            insights_only)
-              KEYS="INSIGHTS_ANALYSIS"
-              ;;
-            health_only)
-              KEYS="$ALL_KEYS"
-              ;;
-            *)
-              # full_sync: use configured keys or all canonical pages
-              KEYS="$(get_val "${VAR_KEYS:-}" "$ALL_KEYS")"
-              ;;
+            single_key)     KEYS="$(get_val "${INPUT_KEY:-}" "MARKET_LEADERS")" ;;
+            portfolio_only) KEYS="MY_PORTFOLIO" ;;
+            insights_only)  KEYS="INSIGHTS_ANALYSIS" ;;
+            health_only)    KEYS="$ALL_KEYS" ;;
+            *)              KEYS="$(get_val "${VAR_KEYS:-}" "$ALL_KEYS")" ;;
           esac
 
-          export _SANITIZE_KEYS="$KEYS"
           KEYS="$(sanitize_keys "$KEYS")"
           [[ -n "${KEYS:-}" ]] || { echo "::error::SYNC_KEYS is empty after sanitization."; exit 1; }
           validate_keys "$KEYS"
 
-          echo "SYNC_KEYS=$KEYS" >> "$GITHUB_ENV"
-          echo "Mode: $MODE | Keys: $KEYS"
-
-          # 4. Debug flag
           DEBUG="$(get_val "${INPUT_DEBUG:-}" "false")"
-          echo "ENABLE_DEBUG=$DEBUG" >> "$GITHUB_ENV"
 
-          # 5. Credentials
           RAW_CREDS="$(get_val "${INPUT_CREDS:-}" "${SECRET_CREDS:-}")"
           if [[ -z "${RAW_CREDS:-}" && -n "${SECRET_CREDS_B64:-}" ]]; then
             RAW_CREDS="$(printf '%s' "$SECRET_CREDS_B64" | base64 --decode 2>/dev/null || true)"
           fi
 
+          CREDS_CONFIGURED="false"
           if [[ -n "${RAW_CREDS:-}" ]]; then
             SA_EMAIL="$(echo "$RAW_CREDS" | jq -r '.client_email // empty' 2>/dev/null || true)"
             [[ -n "${SA_EMAIL:-}" ]] && echo "::add-mask::$SA_EMAIL"
             if echo "$RAW_CREDS" | jq empty >/dev/null 2>&1; then
               echo "$RAW_CREDS" > "$CREDS_PATH"
               chmod 600 "$CREDS_PATH"
-              echo "GOOGLE_APPLICATION_CREDENTIALS=$CREDS_PATH" >> "$GITHUB_ENV"
-              echo "Service account: ${SA_EMAIL:-unknown}"
+              CREDS_CONFIGURED="true"
             else
               echo "::error::Credentials JSON is invalid."
               exit 1
@@ -499,68 +410,69 @@ jobs:
             exit 1
           fi
 
-          echo "::endgroup::"
+          {
+            echo "TARGET_URL=$URL"
+            echo "TARGET_SHEET_ID=$SHEET"
+            echo "RUN_MODE=$MODE"
+            echo "SYNC_KEYS=$KEYS"
+            echo "ENABLE_DEBUG=$DEBUG"
+            echo "GOOGLE_APPLICATION_CREDENTIALS=$CREDS_PATH"
+          } >> "$GITHUB_ENV"
 
-      # -------------------------------------------------------------------------
-      # Backend health check
-      # -------------------------------------------------------------------------
+          {
+            echo "target_url=$URL"
+            echo "target_sheet_id=$SHEET"
+            echo "run_mode=$MODE"
+            echo "sync_keys=$KEYS"
+            echo "enable_debug=$DEBUG"
+            echo "creds_path=$CREDS_PATH"
+            echo "creds_configured=$CREDS_CONFIGURED"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Backend Health Check
         id: health_check
+        env:
+          TARGET_URL: ${{ steps.smart_config.outputs.target_url }}
         run: |
           set -euo pipefail
-          echo "::group::Health"
           RETRIES=4
-
           for endpoint in "/readyz" "/health" "/livez"; do
             for attempt in $(seq 1 $RETRIES); do
               BACKOFF=$(( 2 ** attempt ))
               RESP="$(curl -sf -w "\n%{http_code}" --max-time 12 "$TARGET_URL$endpoint" 2>/dev/null || echo -e "\n000")"
               CODE="$(echo "$RESP" | tail -n1)"
               BODY="$(echo "$RESP" | sed '$d')"
-
               if [[ "$CODE" =~ ^2 ]]; then
                 VERSION="$(echo "$BODY" | jq -r '.app_version // .version // "unknown"' 2>/dev/null || echo "unknown")"
-                SCHEMA_VER="$(echo "$BODY" | jq -r '.schema_version // "unknown"' 2>/dev/null || echo "unknown")"
-                echo "::notice::Backend healthy via $endpoint (HTTP $CODE, app=$VERSION, schema=$SCHEMA_VER)"
                 echo "health_status=healthy" >> "$GITHUB_OUTPUT"
                 echo "health_version=$VERSION" >> "$GITHUB_OUTPUT"
-                echo "::endgroup::"
                 exit 0
               fi
-
-              echo "Attempt $attempt/$RETRIES via $endpoint: HTTP $CODE (retry in ${BACKOFF}s)"
               sleep "$BACKOFF"
             done
           done
-
-          echo "::warning::All health endpoints failed. Backend may be starting up (Render cold start)."
+          echo "::warning::All health endpoints failed. Backend may be starting up."
           echo "health_status=degraded" >> "$GITHUB_OUTPUT"
-          echo "::endgroup::"
 
-      # -------------------------------------------------------------------------
-      # Market scan pages: Market_Leaders, Global_Markets, Commodities_FX,
-      # Mutual_Funds, Top_10_Investments, Data_Dictionary
-      # These are standard instrument_table pages (80/83/9 cols).
-      # -------------------------------------------------------------------------
       - name: Sync Market Pages
         id: sync_market
         if: >
-          env.RUN_MODE != 'portfolio_only' &&
-          env.RUN_MODE != 'insights_only' &&
-          env.RUN_MODE != 'health_only'
+          steps.smart_config.outputs.run_mode != 'portfolio_only' &&
+          steps.smart_config.outputs.run_mode != 'insights_only' &&
+          steps.smart_config.outputs.run_mode != 'health_only'
         env:
           PYTHONPATH: ${{ github.workspace }}
+          TARGET_URL: ${{ steps.smart_config.outputs.target_url }}
+          TARGET_SHEET_ID: ${{ steps.smart_config.outputs.target_sheet_id }}
+          SYNC_KEYS: ${{ steps.smart_config.outputs.sync_keys }}
+          ENABLE_DEBUG: ${{ steps.smart_config.outputs.enable_debug }}
         run: |
           set -euo pipefail
-          echo "::group::Market Pages Sync"
-
           if [ ! -f "scripts/run_dashboard_sync.py" ]; then
             echo "::error::scripts/run_dashboard_sync.py not found."
             exit 1
           fi
 
-          # Filter to market pages only (excludes My_Portfolio + Insights_Analysis
-          # which have dedicated steps below for correct handling)
           MARKET_KEYS=""
           for k in $SYNC_KEYS; do
             case "$k" in
@@ -569,16 +481,17 @@ jobs:
             esac
           done
           MARKET_KEYS="$(echo "$MARKET_KEYS" | xargs)"
-
           if [[ -z "$MARKET_KEYS" ]]; then
             echo "No market pages in SYNC_KEYS -- skipping."
-            echo "::endgroup::"
+            echo "market_exit=0" >> "$GITHUB_OUTPUT"
+            echo "market_duration=0" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           [[ "${ENABLE_DEBUG:-false}" == "true" ]] && export LOG_LEVEL=DEBUG
 
           START="$(date +%s)"
+          set +e
           python scripts/run_dashboard_sync.py \
             --backend "$TARGET_URL" \
             --sheet-id "$TARGET_SHEET_ID" \
@@ -586,95 +499,89 @@ jobs:
             --workers 4 \
             --start-cell "A5" \
             2>&1 | tee sync_market.log
-          EXIT_CODE=$?
+          EXIT_CODE=${PIPESTATUS[0]}
+          set -e
           DURATION=$(( $(date +%s) - START ))
-
           echo "market_exit=$EXIT_CODE" >> "$GITHUB_OUTPUT"
           echo "market_duration=$DURATION" >> "$GITHUB_OUTPUT"
-          echo "Market pages done in ${DURATION}s (exit=$EXIT_CODE)"
-          echo "::endgroup::"
+          [ "$EXIT_CODE" -eq 0 ] || [ "$EXIT_CODE" -eq 1 ] || exit "$EXIT_CODE"
 
-          [ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 1 ] || exit $EXIT_CODE
-
-      # -------------------------------------------------------------------------
-      # My_Portfolio -- dedicated step.
-      # Uses --protect-user-fields to prevent symbol/position_qty/avg_cost
-      # from being overwritten. This flag tells the sync to read existing
-      # values from the sheet before writing, and preserve them.
-      # Schema: portfolio_table, 45 columns (v3.0.0).
-      # -------------------------------------------------------------------------
       - name: Sync My_Portfolio (User Fields Protected)
         id: sync_portfolio
         if: >
-          (env.RUN_MODE == 'full_sync' ||
-           env.RUN_MODE == 'portfolio_only' ||
-           (env.RUN_MODE == 'single_key' && contains(env.SYNC_KEYS, 'MY_PORTFOLIO')))
+          steps.smart_config.outputs.run_mode == 'full_sync' ||
+          steps.smart_config.outputs.run_mode == 'portfolio_only' ||
+          (steps.smart_config.outputs.run_mode == 'single_key' && contains(steps.smart_config.outputs.sync_keys, 'MY_PORTFOLIO'))
         env:
           PYTHONPATH: ${{ github.workspace }}
+          TARGET_URL: ${{ steps.smart_config.outputs.target_url }}
+          TARGET_SHEET_ID: ${{ steps.smart_config.outputs.target_sheet_id }}
+          SYNC_KEYS: ${{ steps.smart_config.outputs.sync_keys }}
+          ENABLE_DEBUG: ${{ steps.smart_config.outputs.enable_debug }}
         run: |
           set -euo pipefail
-          echo "::group::My_Portfolio Sync"
-
           if ! echo "$SYNC_KEYS" | grep -q "MY_PORTFOLIO"; then
             echo "MY_PORTFOLIO not in SYNC_KEYS -- skipping."
-            echo "::endgroup::"
+            echo "portfolio_exit=0" >> "$GITHUB_OUTPUT"
+            echo "portfolio_duration=0" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           [[ "${ENABLE_DEBUG:-false}" == "true" ]] && export LOG_LEVEL=DEBUG
 
+          PROTECT_FLAG=""
+          if python scripts/run_dashboard_sync.py --help 2>&1 | grep -q -- '--protect-user-fields'; then
+            PROTECT_FLAG="--protect-user-fields"
+          fi
+
           START="$(date +%s)"
+          set +e
           python scripts/run_dashboard_sync.py \
             --backend "$TARGET_URL" \
             --sheet-id "$TARGET_SHEET_ID" \
             --keys MY_PORTFOLIO \
             --workers 1 \
             --start-cell "A5" \
+            ${PROTECT_FLAG} \
             2>&1 | tee sync_portfolio.log
-          EXIT_CODE=$?
+          EXIT_CODE=${PIPESTATUS[0]}
+          set -e
           DURATION=$(( $(date +%s) - START ))
-
           echo "portfolio_exit=$EXIT_CODE" >> "$GITHUB_OUTPUT"
           echo "portfolio_duration=$DURATION" >> "$GITHUB_OUTPUT"
 
-          # Verify user fields were not clobbered -- check sync log
           if grep -qiE "position_qty.*overwritten|avg_cost.*overwritten|user field.*overwritten" sync_portfolio.log; then
-            echo "::error::My_Portfolio sync appears to have overwritten user fields. Check portfolio_engine.py."
+            echo "::error::My_Portfolio sync appears to have overwritten user fields."
             exit 2
           fi
 
-          echo "My_Portfolio done in ${DURATION}s (exit=$EXIT_CODE)"
-          echo "::endgroup::"
-          [ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 1 ] || exit $EXIT_CODE
+          [ "$EXIT_CODE" -eq 0 ] || [ "$EXIT_CODE" -eq 1 ] || exit "$EXIT_CODE"
 
-      # -------------------------------------------------------------------------
-      # Insights_Analysis -- dedicated step.
-      # Uses the insights builder (4 sections: Market Summary, Risk Scenarios,
-      # Top Opportunities, Portfolio Health). Runs after market pages and
-      # portfolio sync so it can pull fresh data from all pages.
-      # Schema: insights_analysis, 10 columns (v3.0.0).
-      # -------------------------------------------------------------------------
       - name: Sync Insights_Analysis (Builder Mode)
         id: sync_insights
         if: >
-          (env.RUN_MODE == 'full_sync' ||
-           env.RUN_MODE == 'insights_only' ||
-           (env.RUN_MODE == 'single_key' && contains(env.SYNC_KEYS, 'INSIGHTS_ANALYSIS')))
+          steps.smart_config.outputs.run_mode == 'full_sync' ||
+          steps.smart_config.outputs.run_mode == 'insights_only' ||
+          (steps.smart_config.outputs.run_mode == 'single_key' && contains(steps.smart_config.outputs.sync_keys, 'INSIGHTS_ANALYSIS'))
         env:
           PYTHONPATH: ${{ github.workspace }}
+          TARGET_URL: ${{ steps.smart_config.outputs.target_url }}
+          TARGET_SHEET_ID: ${{ steps.smart_config.outputs.target_sheet_id }}
+          SYNC_KEYS: ${{ steps.smart_config.outputs.sync_keys }}
+          ENABLE_DEBUG: ${{ steps.smart_config.outputs.enable_debug }}
         run: |
           set -euo pipefail
-          echo "::group::Insights_Analysis Sync"
-
           if ! echo "$SYNC_KEYS" | grep -q "INSIGHTS_ANALYSIS"; then
             echo "INSIGHTS_ANALYSIS not in SYNC_KEYS -- skipping."
-            echo "::endgroup::"
+            echo "insights_exit=0" >> "$GITHUB_OUTPUT"
+            echo "insights_duration=0" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           [[ "${ENABLE_DEBUG:-false}" == "true" ]] && export LOG_LEVEL=DEBUG
 
           START="$(date +%s)"
+          set +e
           python scripts/run_dashboard_sync.py \
             --backend "$TARGET_URL" \
             --sheet-id "$TARGET_SHEET_ID" \
@@ -682,29 +589,25 @@ jobs:
             --workers 1 \
             --start-cell "A5" \
             2>&1 | tee sync_insights.log
-          EXIT_CODE=$?
+          EXIT_CODE=${PIPESTATUS[0]}
+          set -e
           DURATION=$(( $(date +%s) - START ))
-
           echo "insights_exit=$EXIT_CODE" >> "$GITHUB_OUTPUT"
           echo "insights_duration=$DURATION" >> "$GITHUB_OUTPUT"
-          echo "Insights_Analysis done in ${DURATION}s (exit=$EXIT_CODE)"
-          echo "::endgroup::"
-          [ $EXIT_CODE -eq 0 ] || [ $EXIT_CODE -eq 1 ] || exit $EXIT_CODE
+          [ "$EXIT_CODE" -eq 0 ] || [ "$EXIT_CODE" -eq 1 ] || exit "$EXIT_CODE"
 
-      # -------------------------------------------------------------------------
-      # Post-sync validation: query the schema endpoint to confirm each synced
-      # page returned the correct number of columns.
-      # -------------------------------------------------------------------------
       - name: Post-Sync Schema Validation
         id: post_validate
         if: >
           always() &&
           steps.health_check.outputs.health_status == 'healthy' &&
-          env.RUN_MODE != 'health_only'
+          steps.smart_config.outputs.run_mode != 'health_only'
+        env:
+          TARGET_URL: ${{ steps.smart_config.outputs.target_url }}
+          SYNC_KEYS: ${{ steps.smart_config.outputs.sync_keys }}
+          APP_TOKEN: ${{ secrets.APP_TOKEN }}
         run: |
           set -euo pipefail
-          echo "::group::Post-Sync Validation"
-
           declare -A EXPECTED_COLS=(
             ["Market_Leaders"]="${{ env.EXPECTED_COLS_MARKET_LEADERS }}"
             ["Global_Markets"]="${{ env.EXPECTED_COLS_GLOBAL_MARKETS }}"
@@ -718,9 +621,6 @@ jobs:
 
           FAILURES=0
           for PAGE in $SYNC_KEYS; do
-            # Convert MARKET_LEADERS -> Market_Leaders using bash
-            CANONICAL_PAGE="$(echo "$PAGE" | tr '[:upper:]' '[:lower:]' | sed 's/_\([a-z]\)/\U\1/g; s/^\([a-z]\)/\U\1/')"
-            # Fallback lookup table for tricky cases
             case "$PAGE" in
               MARKET_LEADERS)     CANONICAL_PAGE="Market_Leaders" ;;
               GLOBAL_MARKETS)     CANONICAL_PAGE="Global_Markets" ;;
@@ -730,12 +630,11 @@ jobs:
               INSIGHTS_ANALYSIS)  CANONICAL_PAGE="Insights_Analysis" ;;
               TOP_10_INVESTMENTS) CANONICAL_PAGE="Top_10_Investments" ;;
               DATA_DICTIONARY)    CANONICAL_PAGE="Data_Dictionary" ;;
+              *)                  CANONICAL_PAGE="" ;;
             esac
+            [[ -n "$CANONICAL_PAGE" ]] || continue
             EXP="${EXPECTED_COLS[$CANONICAL_PAGE]:-}"
-            if [[ -z "$EXP" ]]; then
-              echo "  SKIP $CANONICAL_PAGE (no expected col count)"
-              continue
-            fi
+            [[ -n "$EXP" ]] || continue
 
             RESP="$(curl -sf --max-time 15 \
               -X POST "$TARGET_URL/v1/schema/sheet-spec" \
@@ -744,52 +643,33 @@ jobs:
               -d "{\"page\": \"$CANONICAL_PAGE\"}" 2>/dev/null || echo "{}")"
 
             ACTUAL_COLS="$(echo "$RESP" | jq '.headers | length // 0' 2>/dev/null || echo "0")"
-
-            if [[ "$ACTUAL_COLS" == "$EXP" ]]; then
-              echo "  OK  $CANONICAL_PAGE: $ACTUAL_COLS cols"
-            elif [[ "$ACTUAL_COLS" == "0" ]]; then
-              echo "  SKIP $CANONICAL_PAGE: schema endpoint returned 0 (may need auth)"
-            else
-              echo "  WARN $CANONICAL_PAGE: got $ACTUAL_COLS cols, expected $EXP"
-              echo "::warning::$CANONICAL_PAGE returned $ACTUAL_COLS columns, expected $EXP. Schema may be stale."
+            if [[ "$ACTUAL_COLS" != "$EXP" && "$ACTUAL_COLS" != "0" ]]; then
+              echo "::warning::$CANONICAL_PAGE returned $ACTUAL_COLS columns, expected $EXP."
               FAILURES=$((FAILURES + 1))
             fi
           done
-
           echo "post_validate_failures=$FAILURES" >> "$GITHUB_OUTPUT"
-          echo "Validation complete ($FAILURES warnings)"
-          echo "::endgroup::"
-        env:
-          APP_TOKEN: ${{ secrets.APP_TOKEN }}
 
-      # -------------------------------------------------------------------------
-      # Drift detection (optional -- runs if drift_detection.py exists)
-      # -------------------------------------------------------------------------
       - name: Run Drift Detection (optional)
         id: drift_detection
         if: always()
         env:
           PYTHONPATH: ${{ github.workspace }}
-          DEFAULT_SPREADSHEET_ID: ${{ env.TARGET_SHEET_ID }}
+          DEFAULT_SPREADSHEET_ID: ${{ steps.smart_config.outputs.target_sheet_id }}
           DRIFT_MODE: ${{ vars.DRIFT_MODE || 'mock' }}
           DRIFT_SLACK_WEBHOOK: ${{ secrets.DRIFT_SLACK_WEBHOOK || secrets.SLACK_WEBHOOK_URL }}
           DRIFT_BASELINE_SNAPSHOT: ${{ vars.DRIFT_BASELINE_SNAPSHOT || '' }}
-          GOOGLE_APPLICATION_CREDENTIALS: ${{ env.GOOGLE_APPLICATION_CREDENTIALS }}
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ steps.smart_config.outputs.creds_path }}
         run: |
           set -euo pipefail
-
           DRIFT_SCRIPT=""
           for p in "scripts/drift_detection.py" "drift_detection.py"; do
             [ -f "$p" ] && DRIFT_SCRIPT="$p" && break
           done
-
           if [[ -z "$DRIFT_SCRIPT" ]]; then
-            echo "drift_detection.py not found -- skipping."
             echo "drift_ran=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-
-          echo "::group::Drift Detection"
           python "$DRIFT_SCRIPT" \
             --mode "${DRIFT_MODE:-mock}" \
             --model-name "tfb_production" \
@@ -797,11 +677,7 @@ jobs:
             --no-audit \
             2>&1 | tail -20 || true
           echo "drift_ran=true" >> "$GITHUB_OUTPUT"
-          echo "::endgroup::"
 
-      # -------------------------------------------------------------------------
-      # Upload all logs as artifacts
-      # -------------------------------------------------------------------------
       - name: Upload Logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -813,59 +689,64 @@ jobs:
           retention-days: 7
           if-no-files-found: warn
 
-      # -------------------------------------------------------------------------
-      # Job summary
-      # -------------------------------------------------------------------------
       - name: Generate Summary
         if: always()
+        env:
+          RUN_MODE: ${{ steps.smart_config.outputs.run_mode }}
+          TARGET_URL: ${{ steps.smart_config.outputs.target_url }}
+          SYNC_KEYS: ${{ steps.smart_config.outputs.sync_keys }}
+          HEALTH_STATUS: ${{ steps.health_check.outputs.health_status }}
+          MARKET_EXIT: ${{ steps.sync_market.outputs.market_exit }}
+          MARKET_DURATION: ${{ steps.sync_market.outputs.market_duration }}
+          PORTFOLIO_EXIT: ${{ steps.sync_portfolio.outputs.portfolio_exit }}
+          PORTFOLIO_DURATION: ${{ steps.sync_portfolio.outputs.portfolio_duration }}
+          INSIGHTS_EXIT: ${{ steps.sync_insights.outputs.insights_exit }}
+          INSIGHTS_DURATION: ${{ steps.sync_insights.outputs.insights_duration }}
+          POST_WARNINGS: ${{ steps.post_validate.outputs.post_validate_failures }}
+          DRIFT_RAN: ${{ steps.drift_detection.outputs.drift_ran }}
         run: |
           RIYADH_TIME="$(TZ=Asia/Riyadh date '+%Y-%m-%d %H:%M:%S %Z')"
-          STATUS_ICON="$([ "${{ job.status }}" == "success" ] && echo "SUCCESS" || echo "FAILED")"
+          STATUS_ICON="$([ "${{ job.status }}" = "success" ] && echo "SUCCESS" || echo "FAILED")"
+          {
+            echo "# Tadawul Dashboard Sync Report"
+            echo
+            echo "| Field | Value |"
+            echo "| :---- | :---- |"
+            echo "| Status | ${STATUS_ICON} |"
+            echo "| Trigger | ${{ github.event_name }} |"
+            echo "| Time (Riyadh) | ${RIYADH_TIME} |"
+            echo "| Mode | ${RUN_MODE:-unknown} |"
+            echo "| Backend | ${TARGET_URL:-unknown} |"
+            echo "| Health | ${HEALTH_STATUS:-unknown} |"
+            echo "| Schema | v${{ env.EXPECTED_SCHEMA_VERSION }} |"
+            echo
+            echo "## Pages Synced"
+            echo
+            echo "${SYNC_KEYS:-none}"
+            echo
+            echo "## Per-Step Results"
+            echo
+            echo "| Step | Exit | Duration |"
+            echo "| :--- | :--- | :------- |"
+            echo "| Market Pages | ${MARKET_EXIT:-skipped} | ${MARKET_DURATION:-0}s |"
+            echo "| My_Portfolio | ${PORTFOLIO_EXIT:-skipped} | ${PORTFOLIO_DURATION:-0}s |"
+            echo "| Insights_Analysis | ${INSIGHTS_EXIT:-skipped} | ${INSIGHTS_DURATION:-0}s |"
+            echo "| Post-Validation Warnings | ${POST_WARNINGS:-0} | - |"
+            echo "| Drift Detection | ${DRIFT_RAN:-false} | - |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
-          cat >> "$GITHUB_STEP_SUMMARY" << EOF
-          # Tadawul Dashboard Sync Report
-
-          | Field | Value |
-          | :---- | :---- |
-          | Status | $STATUS_ICON |
-          | Trigger | \`${{ github.event_name }}\` |
-          | Time (Riyadh) | \`$RIYADH_TIME\` |
-          | Mode | \`${{ env.RUN_MODE }}\` |
-          | Backend | \`${{ env.TARGET_URL }}\` |
-          | Health | \`${{ steps.health_check.outputs.health_status }}\` |
-          | Schema | \`v${{ env.EXPECTED_SCHEMA_VERSION }}\` |
-
-          ## Pages Synced
-          \`\`\`
-          ${{ env.SYNC_KEYS }}
-          \`\`\`
-
-          ## Per-Step Results
-          | Step | Exit | Duration |
-          | :--- | :--- | :------- |
-          | Market Pages | \`${{ steps.sync_market.outputs.market_exit || 'skipped' }}\` | \`${{ steps.sync_market.outputs.market_duration || '-' }}s\` |
-          | My_Portfolio | \`${{ steps.sync_portfolio.outputs.portfolio_exit || 'skipped' }}\` | \`${{ steps.sync_portfolio.outputs.portfolio_duration || '-' }}s\` |
-          | Insights_Analysis | \`${{ steps.sync_insights.outputs.insights_exit || 'skipped' }}\` | \`${{ steps.sync_insights.outputs.insights_duration || '-' }}s\` |
-          | Post-Validation Warnings | \`${{ steps.post_validate.outputs.post_validate_failures || '0' }}\` | - |
-          | Drift Detection | \`${{ steps.drift_detection.outputs.drift_ran || 'false' }}\` | - |
-          EOF
-
-      # -------------------------------------------------------------------------
-      # Failure notification (Slack/webhook)
-      # -------------------------------------------------------------------------
       - name: Notify on Failure
         if: failure()
         env:
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          RUN_MODE: ${{ steps.smart_config.outputs.run_mode }}
+          SYNC_KEYS: ${{ steps.smart_config.outputs.sync_keys }}
         run: |
           if [[ -z "${SLACK_WEBHOOK_URL:-}" ]]; then
-            echo "::notice::SLACK_WEBHOOK_URL not set. Add it to GitHub Secrets for failure alerts."
             exit 0
           fi
-
           RIYADH_TIME="$(TZ=Asia/Riyadh date '+%Y-%m-%d %H:%M:%S %Z')"
           RUN_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-
           curl -sf -X POST "$SLACK_WEBHOOK_URL" \
             -H "Content-Type: application/json" \
             -d "{
@@ -873,25 +754,21 @@ jobs:
               \"attachments\": [{
                 \"color\": \"danger\",
                 \"fields\": [
-                  {\"title\": \"Trigger\",         \"value\": \"${{ github.event_name }}\",            \"short\": true},
-                  {\"title\": \"Time (Riyadh)\",   \"value\": \"$RIYADH_TIME\",                        \"short\": true},
-                  {\"title\": \"Mode\",             \"value\": \"${RUN_MODE:-unknown}\",               \"short\": true},
-                  {\"title\": \"Schema\",           \"value\": \"v${{ env.EXPECTED_SCHEMA_VERSION }}\",\"short\": true},
-                  {\"title\": \"Pages\",            \"value\": \"${SYNC_KEYS:-unknown}\",              \"short\": false},
-                  {\"title\": \"Details\",          \"value\": \"<$RUN_URL|View Logs>\",               \"short\": false}
+                  {\"title\": \"Trigger\", \"value\": \"${{ github.event_name }}\", \"short\": true},
+                  {\"title\": \"Time (Riyadh)\", \"value\": \"$RIYADH_TIME\", \"short\": true},
+                  {\"title\": \"Mode\", \"value\": \"${RUN_MODE:-unknown}\", \"short\": true},
+                  {\"title\": \"Schema\", \"value\": \"v${{ env.EXPECTED_SCHEMA_VERSION }}\", \"short\": true},
+                  {\"title\": \"Pages\", \"value\": \"${SYNC_KEYS:-unknown}\", \"short\": false},
+                  {\"title\": \"Details\", \"value\": \"<$RUN_URL|View Logs>\", \"short\": false}
                 ]
               }]
-            }" || echo "::warning::Slack notification failed to deliver."
+            }" || true
 
-      # -------------------------------------------------------------------------
-      # Secure cleanup (always runs)
-      # -------------------------------------------------------------------------
       - name: Secure Cleanup
         if: always()
+        env:
+          CREDS_PATH: ${{ steps.smart_config.outputs.creds_path }}
         run: |
-          if [[ -n "${GOOGLE_APPLICATION_CREDENTIALS:-}" && -f "${GOOGLE_APPLICATION_CREDENTIALS:-}" ]]; then
-            command -v shred >/dev/null 2>&1 \
-              && shred -u -z "$GOOGLE_APPLICATION_CREDENTIALS" 2>/dev/null \
-              || rm -f "$GOOGLE_APPLICATION_CREDENTIALS"
-            echo "Google credentials removed from runner."
+          if [[ -n "${CREDS_PATH:-}" && -f "${CREDS_PATH:-}" ]]; then
+            command -v shred >/dev/null 2>&1 && shred -u -z "$CREDS_PATH" 2>/dev/null || rm -f "$CREDS_PATH"
           fi
