@@ -695,7 +695,7 @@ def test_data_dictionary_endpoint_has_9_column_contract(monkeypatch: pytest.Monk
         rows = payload.get("rows") or []
 
         assert isinstance(headers, list), "Data_Dictionary headers is not a list"
-        assert len(headers) == DATA_DICTIONARY_EXPECTED_COLS, f"Data_Dictionary must have exactly {DATA_DICTIONARY_EXPECTED_COLS} headers, got {len(headers)}"
+        assert len(headers) == 9, f"Data_Dictionary must have exactly 9 headers, got {len(headers)}"
         assert isinstance(rows, list), "Data_Dictionary rows is not a list"
         assert rows, "Data_Dictionary rows is empty"
 
