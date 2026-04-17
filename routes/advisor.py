@@ -2,7 +2,7 @@
 """
 routes/advisor.py
 ================================================================================
-ADVISOR ROUTER — v6.7.0
+ADVISOR ROUTER — v6.6.0
 ================================================================================
 SPECIAL-PAGE PROXY-FIRST • ROOT/ANALYSIS ALIGNED • SHORT-ADVISOR HARDENED •
 JSON-SAFE • GET+POST SAFE • FAIL-SOFT • CONTRACT-PROJECTED • ENGINE-TOLERANT
@@ -43,7 +43,7 @@ from fastapi.routing import APIRouter
 logger = logging.getLogger("routes.advisor")
 logger.addHandler(logging.NullHandler())
 
-ADVISOR_VERSION = "6.7.0"
+ADVISOR_VERSION = "6.8.0"
 
 
 def _secure_equals(a: str, b: str) -> bool:
@@ -64,17 +64,24 @@ BASE_PAGES = {
     "My_Portfolio",
 }
 DERIVED_PAGES = {"Top_10_Investments", "Insights_Analysis", "Data_Dictionary"}
+# v6.8.0: updated to schema_registry v3.4.0 per-page column counts
+# Used as hardcoded fallback only when schema_registry is unavailable.
+# Primary source is _contract_header_count() → _resolve_contract_headers() → schema_registry.
 KNOWN_CANONICAL_HEADER_COUNTS: Dict[str, int] = {
-    "Market_Leaders": 80,
-    "Global_Markets": 80,
-    "Commodities_FX": 80,
-    "Mutual_Funds": 80,
-    "My_Portfolio": 80,
-    "Insights_Analysis": 7,
-    "Top_10_Investments": 83,
-    "Data_Dictionary": 9,
+    "Market_Leaders":    99,
+    "Global_Markets":    112,
+    "Commodities_FX":    86,
+    "Mutual_Funds":      94,
+    "My_Portfolio":      110,
+    "Insights_Analysis": 9,
+    "Top_10_Investments":106,
+    "Data_Dictionary":   9,
 }
-TOP10_SPECIAL_FIELDS: Tuple[str, ...] = ("top10_rank", "selection_reason", "criteria_snapshot")
+# v6.8.0: added 4 trade setup fields from top10_selector v4.9.0
+TOP10_SPECIAL_FIELDS: Tuple[str, ...] = (
+    "top10_rank", "selection_reason", "criteria_snapshot",
+    "entry_price", "stop_loss_suggested", "take_profit_suggested", "risk_reward_ratio",
+)
 TOP10_BUSINESS_SIGNAL_FIELDS: Tuple[str, ...] = (
     "symbol", "name", "asset_class", "exchange", "currency", "country", "sector", "industry",
     "current_price", "price_change", "percent_change", "risk_score", "valuation_score",
@@ -304,21 +311,14 @@ def _is_open_mode_enabled() -> bool:
     return False
 
 
-def _auth_ok_via_hook(
-    token_query: Optional[str],
-    x_app_token: Optional[str],
-    x_api_key: Optional[str] = None,
-    authorization: Optional[str] = None,
-) -> bool:
+def _auth_ok_via_hook(token_query: Optional[str], x_app_token: Optional[str], x_api_key: Optional[str] = None, authorization: Optional[str] = None) -> bool:
     if auth_ok is None:
         return False
     token = _strip(token_query)
-    # FIX v6.7.0: X-API-Key / Api-Key as additional token source
+    # v6.8.0: X-API-Key accepted alongside X-APP-TOKEN
     x_token = _strip(x_app_token) or _strip(x_api_key)
     authz = _strip(authorization)
     candidate_kwargs: Tuple[Dict[str, Any], ...] = (
-        {"token": token or None, "x_app_token": x_token or None, "authorization": authz or None,
-         "api_key": _strip(x_api_key) or None},
         {"token": token or None, "x_app_token": x_token or None, "authorization": authz or None},
         {"token_query": token or None, "x_app_token": x_token or None, "authorization": authz or None},
         {"token": token or None, "authorization": authz or None},
@@ -351,35 +351,15 @@ def _candidate_tokens_from_env() -> List[str]:
     return out
 
 
-def _auth_ok_via_env_match(
-    token_query: Optional[str],
-    x_app_token: Optional[str],
-    x_api_key: Optional[str] = None,
-    authorization: Optional[str] = None,
-) -> bool:
+def _auth_ok_via_env_match(token_query: Optional[str], x_app_token: Optional[str], x_api_key: Optional[str] = None, authorization: Optional[str] = None) -> bool:
     env_tokens = _candidate_tokens_from_env()
     if not env_tokens:
         return False
     presented: List[str] = []
-
-    # FIX v6.7.0: X-API-Key / Api-Key accepted alongside X-APP-TOKEN
-    for value in (x_app_token, x_api_key):
+    for value in (token_query, x_app_token):
         token = _strip(value)
         if token:
             presented.append(token)
-
-    # FIX v6.7.0: query token only when ALLOW_QUERY_TOKEN is enabled
-    _allow_query = False
-    try:
-        settings = get_settings_cached() if callable(get_settings_cached) else None
-        _allow_query = bool(getattr(settings, "allow_query_token", False)) if settings else False
-    except Exception:
-        _allow_query = False
-    if _allow_query:
-        tq = _strip(token_query)
-        if tq:
-            presented.append(tq)
-
     authz = _strip(authorization)
     if authz:
         lowered = authz.lower()
@@ -389,21 +369,13 @@ def _auth_ok_via_env_match(
                 presented.append(bearer)
         else:
             presented.append(authz)
-
-    # FIX v6.7.0: constant-time comparison via _secure_equals
+    # v6.8.0: constant-time comparison via _secure_equals (prevents timing attacks)
     return any(_secure_equals(t, env_t) for t in presented for env_t in env_tokens)
 
 
-def _require_auth_or_401(
-    *,
-    token_query: Optional[str],
-    x_app_token: Optional[str],
-    x_api_key: Optional[str] = None,
-    authorization: Optional[str] = None,
-) -> None:
+def _require_auth_or_401(*, token_query: Optional[str], x_app_token: Optional[str], x_api_key: Optional[str] = None, authorization: Optional[str] = None) -> None:
     if _is_open_mode_enabled():
         return
-    # FIX v6.7.0: pass x_api_key through both auth paths
     if _auth_ok_via_hook(token_query=token_query, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization):
         return
     if _auth_ok_via_env_match(token_query=token_query, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization):
@@ -464,7 +436,7 @@ def _canonicalize_page_name(value: Any) -> str:
     raw = _strip(value)
     if not raw:
         return ""
-    # FIX v6.7.0: 3-path fallback for page_catalog
+    # v6.8.0: 3-path fallback for page_catalog
     page_catalog = None
     for _pcat_path in ("core.sheets.page_catalog", "core.page_catalog", "page_catalog"):
         try:
@@ -792,6 +764,11 @@ def _project_to_contract_headers(*, page: str, headers: List[str], row_objects: 
             row.setdefault("top10_rank", idx)
             row.setdefault("selection_reason", row.get("selection_reason") or None)
             row.setdefault("criteria_snapshot", row.get("criteria_snapshot") or None)
+            # v6.8.0: init trade setup fields from top10_selector v4.9.0
+            row.setdefault("entry_price",           row.get("entry_price"))
+            row.setdefault("stop_loss_suggested",   row.get("stop_loss_suggested"))
+            row.setdefault("take_profit_suggested", row.get("take_profit_suggested"))
+            row.setdefault("risk_reward_ratio",     row.get("risk_reward_ratio"))
     if row_objects and effective_headers:
         rows_matrix = _mapping_list_to_rows(row_objects, effective_headers)
     elif rows_matrix and effective_headers:
@@ -1168,9 +1145,9 @@ def _prefer_runner(page: str, *, operation: str) -> bool:
     return operation in {"recommendations", "run"}
 
 
-async def _run_advisor_logic(*, request: Request, payload: Dict[str, Any], token: Optional[str], x_app_token: Optional[str], x_api_key: Optional[str] = None, authorization: Optional[str], x_request_id: Optional[str], operation: str = "sheet_rows") -> Dict[str, Any]:
+async def _run_advisor_logic(*, request: Request, payload: Dict[str, Any], token: Optional[str], x_app_token: Optional[str], authorization: Optional[str], x_request_id: Optional[str], operation: str = "sheet_rows") -> Dict[str, Any]:
     started_at = time.perf_counter()
-    _require_auth_or_401(token_query=token, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization)
+    _require_auth_or_401(token_query=token, x_app_token=x_app_token, authorization=authorization)
     request_id = _request_id(request, x_request_id)
     payload = _prepare_payload_for_downstream(payload, request_id=request_id, operation=operation)
     page = _extract_page(payload, default_page=DEFAULT_ADVISOR_PAGE)
@@ -1182,10 +1159,10 @@ async def _run_advisor_logic(*, request: Request, payload: Dict[str, Any], token
             return _envelope_from_payload_result(result=top10_result, page=page, request_id=request_id, started_at=started_at, resolver_meta=top10_meta or {"source": "top10_builder", "kind": "direct"}, operation=operation)
 
     if _prefer_direct_bridge(page, operation=operation):
-        analysis_result = await _delegate_to_analysis_bridge(request=request, payload=payload, token=token, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization, x_request_id=request_id)
+        analysis_result = await _delegate_to_analysis_bridge(request=request, payload=payload, token=token, x_app_token=x_app_token, authorization=authorization, x_request_id=request_id)
         if analysis_result is not None:
             return _envelope_from_payload_result(result=analysis_result, page=page, request_id=request_id, started_at=started_at, resolver_meta=_extract_meta_mapping(analysis_result).get("resolver"), operation=operation)
-        advanced_result = await _delegate_to_advanced_bridge(request=request, payload=payload, token=token, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization, x_request_id=request_id)
+        advanced_result = await _delegate_to_advanced_bridge(request=request, payload=payload, token=token, x_app_token=x_app_token, authorization=authorization, x_request_id=request_id)
         if advanced_result is not None:
             return _envelope_from_payload_result(result=advanced_result, page=page, request_id=request_id, started_at=started_at, resolver_meta=_extract_meta_mapping(advanced_result).get("resolver"), operation=operation)
         engine_result = await _run_engine_sheet_rows_fallback(request=request, payload=payload, request_id=request_id)
@@ -1197,10 +1174,10 @@ async def _run_advisor_logic(*, request: Request, payload: Dict[str, Any], token
         if runner_result is not None:
             return _envelope_from_payload_result(result=runner_result, page=page, request_id=request_id, started_at=started_at, resolver_meta=runner_meta, operation=operation)
 
-    analysis_result = await _delegate_to_analysis_bridge(request=request, payload=payload, token=token, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization, x_request_id=request_id)
+    analysis_result = await _delegate_to_analysis_bridge(request=request, payload=payload, token=token, x_app_token=x_app_token, authorization=authorization, x_request_id=request_id)
     if analysis_result is not None:
         return _envelope_from_payload_result(result=analysis_result, page=page, request_id=request_id, started_at=started_at, resolver_meta=_extract_meta_mapping(analysis_result).get("resolver"), operation=operation)
-    advanced_result = await _delegate_to_advanced_bridge(request=request, payload=payload, token=token, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization, x_request_id=request_id)
+    advanced_result = await _delegate_to_advanced_bridge(request=request, payload=payload, token=token, x_app_token=x_app_token, authorization=authorization, x_request_id=request_id)
     if advanced_result is not None:
         return _envelope_from_payload_result(result=advanced_result, page=page, request_id=request_id, started_at=started_at, resolver_meta=_extract_meta_mapping(advanced_result).get("resolver"), operation=operation)
     engine_result = await _run_engine_sheet_rows_fallback(request=request, payload=payload, request_id=request_id)
