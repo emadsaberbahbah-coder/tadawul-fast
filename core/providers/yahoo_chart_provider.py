@@ -835,4 +835,291 @@ def _infer_exchange(symbol: str, info: Any = None, meta: Optional[Dict[str, Any]
         if ex: return ex
     s = symbol.upper()
     if s.endswith(".SR"): return "Tadawul"
-    if s
+    if s.endswith("=F"): return "NYMEX"
+    if s.endswith("=X"): return "CCY"
+    if s.startswith("^"): return "INDEX"
+    return None
+
+
+def _fetch_ticker_sync(symbol: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+    """Blocking fetch. Should run in ThreadPool."""
+    if not _HAS_YFINANCE or yf is None:
+        return {}, []
+
+    try:
+        t = yf.Ticker(symbol)
+        
+        info_dict = {}
+        try:
+            fast_info = getattr(t, "fast_info", None)
+            if fast_info:
+                info_dict = dict(fast_info)
+        except Exception:
+            pass
+            
+        try:
+            info = getattr(t, "info", None)
+            if isinstance(info, dict):
+                info_dict.update(info)
+        except Exception:
+            pass
+
+        history_list = []
+        try:
+            hist_df = t.history(period=_history_period(), interval=_history_interval())
+            if _HAS_PANDAS and pd is not None and isinstance(hist_df, pd.DataFrame) and not hist_df.empty:
+                hist_df = hist_df.reset_index()
+                for _, row in hist_df.iterrows():
+                    d = row.to_dict()
+                    dt_val = d.get("Date") or d.get("Datetime")
+                    if hasattr(dt_val, "to_pydatetime"):
+                        dt_val = dt_val.to_pydatetime()
+                    
+                    history_list.append({
+                        "timestamp": _utc_iso(dt_val) if isinstance(dt_val, datetime) else str(dt_val),
+                        "open": safe_float(d.get("Open")),
+                        "high": safe_float(d.get("High")),
+                        "low": safe_float(d.get("Low")),
+                        "close": safe_float(d.get("Close")),
+                        "volume": safe_float(d.get("Volume")),
+                    })
+        except Exception:
+            pass
+
+        return info_dict, history_list
+    except Exception as e:
+        logger.warning(f"[{PROVIDER_NAME}] Sync fetch failed for {symbol}: {e}")
+        return {}, []
+
+
+def _enrich_data(symbol: str, info: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Combine quote/fundamentals and history stats into the canonical format."""
+    
+    # 1. Quote Core
+    price = _first_number(info.get("currentPrice"), info.get("regularMarketPrice"), info.get("lastPrice"))
+    prev_close = _first_number(info.get("previousClose"), info.get("regularMarketPreviousClose"))
+    
+    if not price and history:
+        last_hist = history[-1]
+        price = last_hist.get("close")
+        if not prev_close and len(history) > 1:
+            prev_close = history[-2].get("close")
+
+    # FIX v6.9.0: pct-change fraction
+    pct_change = None
+    if price and prev_close and prev_close > 0:
+        pct_change = (price / prev_close) - 1.0
+        
+    change = None
+    if price and prev_close:
+        change = price - prev_close
+
+    # 2. Volumes and Caps
+    vol = _first_number(info.get("volume"), info.get("regularMarketVolume"))
+    if not vol and history:
+        vol = history[-1].get("volume")
+
+    mcap = _first_number(info.get("marketCap"))
+    
+    # 3. 52 Week Extrema
+    w52_hi = _first_number(info.get("fiftyTwoWeekHigh"))
+    w52_lo = _first_number(info.get("fiftyTwoWeekLow"))
+    if not w52_hi and history:
+        closes = [h["close"] for h in history[-252:] if h.get("close")]
+        w52_hi = max(closes) if closes else None
+        w52_lo = min(closes) if closes else None
+
+    # FIX v6.9.0: position pct fraction
+    w52_pos = None
+    if price and w52_hi and w52_lo and (w52_hi > w52_lo):
+        w52_pos = (price - w52_lo) / (w52_hi - w52_lo)
+
+    # 4. History Stats
+    closes_list = [h["close"] for h in history if h.get("close")]
+    vol30 = _volatility_nd(closes_list, 30)
+    rsi = _rsi_14(closes_list)
+    dd_1y = _max_drawdown_1y(closes_list)
+    sharpe = _sharpe_1y(closes_list)
+    var95 = _var_95_1d(closes_list)
+
+    # 5. Forecasts
+    fc_12m, roi_12m, conf_12m = _simple_forecast(closes_list, 252)
+
+    # 6. Fundamentals Light (using _first_fraction where schema expects pct)
+    div_yield = _first_fraction(info.get("dividendYield"), info.get("trailingAnnualDividendYield"))
+    gross_margin = _first_fraction(info.get("grossMargins"))
+    op_margin = _first_fraction(info.get("operatingMargins"))
+    profit_margin = _first_fraction(info.get("profitMargins"))
+    
+    pe_ttm = _first_number(info.get("trailingPE"))
+    pb = _first_number(info.get("priceToBook"))
+    roe = _first_fraction(info.get("returnOnEquity"))
+    eps = _first_number(info.get("trailingEps"))
+
+    out = {
+        "symbol": symbol,
+        "price": price,
+        "previous_close": prev_close,
+        "change": change,
+        "percent_change": pct_change,
+        "open": _first_number(info.get("open"), info.get("regularMarketOpen")),
+        "high": _first_number(info.get("dayHigh"), info.get("regularMarketDayHigh")),
+        "low": _first_number(info.get("dayLow"), info.get("regularMarketDayLow")),
+        "volume": vol,
+        "market_cap": mcap,
+        "currency": _first_str(info.get("currency"), info.get("financialCurrency")),
+        "asset_class": _infer_asset_class(symbol, info),
+        "exchange": _infer_exchange(symbol, info),
+        
+        "week_52_high": w52_hi,
+        "week_52_low": w52_lo,
+        "week_52_position_pct": w52_pos,
+        
+        "dividend_yield": div_yield,
+        "pe_ttm": pe_ttm,
+        "pb_ratio": pb,
+        "roe": roe,
+        "eps_ttm": eps,
+        "gross_margin": gross_margin,
+        "operating_margin": op_margin,
+        "profit_margin": profit_margin,
+
+        "volatility_30d": vol30,
+        "rsi_14d": rsi,
+        "max_drawdown_1y": dd_1y,
+        "sharpe_ratio_1y": sharpe,
+        "value_at_risk_95_1d": var95,
+        
+        "forecast_price_12m": fc_12m,
+        "expected_roi_12m": roi_12m,
+        "forecast_confidence": conf_12m,
+
+        "updated_at_utc": _utc_iso(),
+        "provider": PROVIDER_NAME,
+        "data_quality": "EXCELLENT" if price and history else "GOOD" if price else "STALE"
+    }
+    return clean_dict(out)
+
+
+class YahooChartProvider:
+    """Async wrapper for Yahoo Finance."""
+    def __init__(self) -> None:
+        self.enabled = _configured()
+        self._tb = TokenBucket(rate_per_sec=_rate_limit_per_sec(), burst=_rate_limit_burst())
+        self._cb = CircuitBreaker(fail_threshold=_cb_fail_threshold(), cooldown_sec=_cb_cooldown_sec(), success_threshold=_cb_success_threshold())
+        self._sf = SingleFlight()
+        self._cache = AdvancedCache(name="yahoo", ttl_sec=_quote_ttl_sec())
+
+    async def get_enriched_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
+        if not self.enabled or not symbol:
+            return None
+            
+        sym = normalize_symbol(symbol)
+        
+        cached = await self._cache.get(sym, kind="enriched")
+        if cached:
+            metrics().cache_hits_total.labels(symbol=sym).inc()
+            return cached
+            
+        metrics().cache_misses_total.labels(symbol=sym).inc()
+        
+        if not await self._cb.allow():
+            return None
+            
+        await self._tb.acquire()
+        
+        async def _do_fetch() -> Optional[Dict[str, Any]]:
+            loop = asyncio.get_running_loop()
+            t0 = time.monotonic()
+            try:
+                info, hist = await loop.run_in_executor(_CPU_EXECUTOR, _fetch_ticker_sync, sym)
+                if not info and not hist:
+                    await self._cb.record_failure()
+                    metrics().requests_total.labels(symbol=sym, op="enriched", status="error").inc()
+                    return None
+                    
+                result = _enrich_data(sym, info, hist)
+                
+                await self._cb.record_success()
+                metrics().requests_total.labels(symbol=sym, op="enriched", status="ok").inc()
+                metrics().request_duration.labels(symbol=sym, op="enriched").observe(time.monotonic() - t0)
+                
+                if result.get("price"):
+                    await self._cache.set(sym, result, kind="enriched")
+                    
+                return result
+            except Exception as e:
+                await self._cb.record_failure()
+                metrics().requests_total.labels(symbol=sym, op="enriched", status="error").inc()
+                logger.error(f"[{PROVIDER_NAME}] Error fetching {sym}: {e}")
+                return None
+
+        return await self._sf.run(f"enrich:{sym}", _do_fetch)
+
+
+# =============================================================================
+# Module Exports / Async Helpers
+# =============================================================================
+_PROVIDER_INSTANCE = YahooChartProvider()
+
+
+async def fetch_quote(symbol: str) -> Optional[Dict[str, Any]]:
+    return await _PROVIDER_INSTANCE.get_enriched_quote(symbol)
+
+
+async def fetch_history(symbol: str, period: str = "1mo", interval: str = "1d") -> List[Dict[str, Any]]:
+    # Left lightweight as get_enriched_quote computes stats over standard history automatically
+    if not _HAS_YFINANCE or yf is None or not _configured():
+        return []
+    try:
+        loop = asyncio.get_running_loop()
+        def _sync_hist() -> List[Dict[str, Any]]:
+            df = yf.Ticker(normalize_symbol(symbol)).history(period=period, interval=interval)
+            out = []
+            if not df.empty:
+                df = df.reset_index()
+                for _, row in df.iterrows():
+                    d = row.to_dict()
+                    dt_val = d.get("Date") or d.get("Datetime")
+                    out.append({
+                        "timestamp": _utc_iso(dt_val) if hasattr(dt_val, "to_pydatetime") else str(dt_val),
+                        "close": safe_float(d.get("Close")),
+                        "volume": safe_float(d.get("Volume")),
+                    })
+            return out
+        return await loop.run_in_executor(_CPU_EXECUTOR, _sync_hist)
+    except Exception:
+        return []
+
+
+async def fetch_enriched_quote(symbol: str) -> Optional[Dict[str, Any]]:
+    return await _PROVIDER_INSTANCE.get_enriched_quote(symbol)
+
+
+async def fetch_enriched_quotes_batch(symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+    """ENH v6.9.0: Concurrently fetch enriched quotes for a list of symbols."""
+    results = {}
+    tasks = {sym: asyncio.create_task(fetch_enriched_quote(sym)) for sym in symbols if sym}
+    
+    for sym, task in tasks.items():
+        try:
+            res = await task
+            if res:
+                results[sym] = res
+        except Exception as e:
+            logger.warning(f"[{PROVIDER_NAME}] Batch failed for {sym}: {e}")
+            
+    return results
+
+
+__all__ = [
+    "YahooChartProvider",
+    "fetch_quote",
+    "fetch_history",
+    "fetch_enriched_quote",
+    "fetch_enriched_quotes_batch",
+    "normalize_symbol",
+    "PROVIDER_NAME",
+    "PROVIDER_VERSION",
+    "PROVIDER_BATCH_SUPPORTED",
+]
