@@ -1,0 +1,619 @@
+#!/usr/bin/env python3
+"""
+tests/test_scoring_engine_contract.py
+================================================================================
+Scoring Engine Contract Tests — v2.0.0
+================================================================================
+
+What this test suite enforces
+------------------------------
+1) scoring module is importable from the expected paths
+2) SCORING_VERSION is present and semver-shaped
+3) compute_scores / score_row / enrich_with_scores are callable
+4) AssetScores dataclass has all required fields
+5) ScoreWeights dataclass has correct default weights
+6) ForecastParameters dataclass is importable
+7) ScoringEngine wrapper is callable (object-style API)
+8) Recommendation vocabulary is canonical (STRONG_BUY/BUY/HOLD/REDUCE/SELL)
+9) Risk bucket vocabulary is canonical (Low/Moderate/High)
+10) Confidence bucket vocabulary is canonical (Low/Medium/High)
+11) Score output fields are float in [0, 100] when present
+12) Expected ROI fields are fractions when present (abs <= 1.5 for normal values)
+13) Deterministic: same input → same output
+14) Sparse row (minimal fields): does not raise, returns sensible defaults
+15) Rich row (full instrument data): all score fields populated
+16) rank_rows_by_overall / assign_rank_overall: correct ordering
+17) score_and_rank_rows: end-to-end list scoring
+18) enrich_with_scores: merges scores into the original row dict
+
+Design goals
+- No network calls.
+- No FastAPI / async test infrastructure needed.
+- Compatible with plain pytest.
+- Import-safe: falls back gracefully when scoring module lives at different paths.
+- Uses the v2.x project scoring.py API (compute_scores returns dict).
+"""
+from __future__ import annotations
+
+import importlib
+import inspect
+import math
+from dataclasses import fields as dc_fields
+from typing import Any, Dict, List, Optional, Sequence
+
+import pytest
+
+# =============================================================================
+# Scoring module loader — multi-path fallback
+# =============================================================================
+_SCORING_MODULE_CANDIDATES = (
+    "core.scoring",
+    "core.sheets.scoring",
+    "scoring",
+)
+
+
+def _load_scoring() -> Any:
+    last: Optional[Exception] = None
+    for path in _SCORING_MODULE_CANDIDATES:
+        try:
+            return importlib.import_module(path)
+        except Exception as e:
+            last = e
+    raise RuntimeError(
+        f"Cannot import scoring module from any of {_SCORING_MODULE_CANDIDATES}. "
+        f"Last error: {last!r}"
+    )
+
+
+@pytest.fixture(scope="module")
+def scoring():
+    return _load_scoring()
+
+
+# =============================================================================
+# Canonical vocabulary constants
+# =============================================================================
+VALID_RECOMMENDATIONS = {"STRONG_BUY", "BUY", "HOLD", "REDUCE", "SELL", "STRONG_SELL"}
+VALID_RISK_BUCKETS     = {"Low", "Moderate", "High"}
+VALID_CONF_BUCKETS     = {"Low", "Medium", "High"}
+
+# Fields that must exist in every compute_scores() output
+REQUIRED_OUTPUT_KEYS = {
+    "overall_score",
+    "recommendation",
+    "recommendation_reason",
+    "risk_score",
+    "risk_bucket",
+    "confidence_score",
+    "confidence_bucket",
+    "forecast_confidence",
+    "scoring_updated_utc",
+    "scoring_updated_riyadh",
+    "scoring_errors",
+}
+
+# Optional score fields — present when inputs allow derivation
+SCORE_FLOAT_FIELDS = {
+    "valuation_score",
+    "momentum_score",
+    "quality_score",
+    "growth_score",
+    "value_score",
+    "opportunity_score",
+    "confidence_score",
+    "risk_score",
+    "overall_score",
+    "overall_score_raw",
+    "overall_penalty_factor",
+    "forecast_confidence",
+}
+
+# ROI / forecast fields expected as fractions
+FRACTION_FIELDS = {
+    "expected_roi_1m",
+    "expected_roi_3m",
+    "expected_roi_12m",
+    "expected_return_1m",
+    "expected_return_3m",
+    "expected_return_12m",
+    "forecast_confidence",   # stored as fraction 0.0–1.0
+}
+
+# =============================================================================
+# Representative test inputs
+# =============================================================================
+SPARSE_ROW: Dict[str, Any] = {"symbol": "0001.SR", "name": "ACME Corp"}
+
+MINIMAL_ROW: Dict[str, Any] = {
+    "symbol": "2222.SR",
+    "current_price": 35.0,
+    "previous_close": 34.0,
+    "rsi_14": 58.0,
+    "volatility_30d": 0.18,
+    "volatility_90d": 0.22,
+}
+
+RICH_ROW: Dict[str, Any] = {
+    "symbol":               "2222.SR",
+    "name":                 "Saudi Aramco",
+    "current_price":        35.0,
+    "previous_close":       34.2,
+    "open_price":           34.5,
+    "day_high":             35.8,
+    "day_low":              34.1,
+    "week_52_high":         42.0,
+    "week_52_low":          28.5,
+    "price_change":         0.8,
+    "percent_change":       0.023,
+    "volume":               12_000_000,
+    "market_cap":           7_000_000_000_000,
+    "rsi_14":               62.0,
+    "volatility_30d":       0.15,
+    "volatility_90d":       0.18,
+    "max_drawdown_1y":      -0.22,
+    "var_95_1d":            0.023,
+    "sharpe_1y":            1.4,
+    "pe_ttm":               14.5,
+    "pb_ratio":             2.3,
+    "ps_ratio":             4.1,
+    "peg_ratio":            1.8,
+    "ev_ebitda":            9.2,
+    "intrinsic_value":      40.0,
+    "forecast_price_3m":    38.0,
+    "expected_roi_3m":      0.085,
+    "forecast_confidence":  0.72,
+    "dividend_yield":       0.045,
+    "revenue_growth_yoy":   0.08,
+    "data_quality":         "HIGH",
+}
+
+STRONG_BUY_ROW: Dict[str, Any] = {
+    **RICH_ROW,
+    "expected_roi_3m":      0.28,
+    "expected_roi_12m":     0.60,
+    "forecast_confidence":  0.82,
+    "volatility_90d":       0.12,
+    "max_drawdown_1y":      -0.10,
+    "sharpe_1y":            2.0,
+    "overall_score":        85.0,
+}
+
+SELL_ROW: Dict[str, Any] = {
+    "symbol":               "9999.SR",
+    "current_price":        5.0,
+    "expected_roi_3m":      -0.30,
+    "forecast_confidence":  0.65,
+    "volatility_90d":       0.75,
+    "max_drawdown_1y":      -0.65,
+    "var_95_1d":            0.09,
+    "sharpe_1y":            -0.8,
+    "pe_ttm":               120.0,
+    "data_quality":         "LOW",
+}
+
+
+# =============================================================================
+# 1. Import / version contract
+# =============================================================================
+def test_scoring_module_is_importable():
+    sm = _load_scoring()
+    assert sm is not None
+
+
+def test_scoring_version_present(scoring):
+    v = getattr(scoring, "SCORING_VERSION", None) or getattr(scoring, "__version__", None)
+    assert v is not None, "SCORING_VERSION / __version__ not found in scoring module"
+    parts = str(v).split(".")
+    assert len(parts) >= 2, f"Version '{v}' does not look like semver"
+    for part in parts:
+        digits = "".join(c for c in part if c.isdigit())
+        assert digits, f"Version part '{part}' contains no digits"
+
+
+def test_scoring_all_exports(scoring):
+    """All expected public names are exported."""
+    required = [
+        "compute_scores", "score_row", "enrich_with_scores",
+        "AssetScores", "ScoreWeights", "DEFAULT_WEIGHTS",
+        "rank_rows_by_overall", "score_and_rank_rows", "SCORING_VERSION",
+    ]
+    missing = [name for name in required if not hasattr(scoring, name)]
+    assert not missing, f"scoring module missing exports: {missing}"
+
+
+# =============================================================================
+# 2. AssetScores dataclass contract
+# =============================================================================
+def test_asset_scores_is_dataclass(scoring):
+    AssetScores = scoring.AssetScores
+    assert hasattr(AssetScores, "__dataclass_fields__"), "AssetScores is not a dataclass"
+
+
+def test_asset_scores_required_fields(scoring):
+    AssetScores = scoring.AssetScores
+    names = {f.name for f in dc_fields(AssetScores)}
+    required = {
+        "overall_score", "recommendation", "recommendation_reason",
+        "risk_score", "risk_bucket", "confidence_score", "confidence_bucket",
+        "forecast_confidence", "valuation_score", "momentum_score",
+        "quality_score", "growth_score", "opportunity_score",
+        "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
+        "forecast_price_1m", "forecast_price_3m", "forecast_price_12m",
+        "scoring_updated_utc", "scoring_updated_riyadh", "scoring_errors",
+    }
+    missing = required - names
+    assert not missing, f"AssetScores missing fields: {sorted(missing)}"
+
+
+def test_asset_scores_default_recommendation(scoring):
+    AssetScores = scoring.AssetScores
+    inst = AssetScores()
+    assert inst.recommendation in VALID_RECOMMENDATIONS, (
+        f"Default recommendation '{inst.recommendation}' not in {VALID_RECOMMENDATIONS}"
+    )
+
+
+def test_asset_scores_to_dict(scoring):
+    AssetScores = scoring.AssetScores
+    inst = AssetScores()
+    d = inst.to_dict()
+    assert isinstance(d, dict)
+    assert "overall_score"    in d
+    assert "recommendation"   in d
+    assert "scoring_errors"   in d
+
+
+# =============================================================================
+# 3. ScoreWeights contract
+# =============================================================================
+def test_score_weights_is_dataclass(scoring):
+    SW = scoring.ScoreWeights
+    assert hasattr(SW, "__dataclass_fields__"), "ScoreWeights is not a dataclass"
+
+
+def test_score_weights_default_sum(scoring):
+    """Primary score weights sum to 1.0 (allowing tolerance for float arithmetic)."""
+    w = scoring.DEFAULT_WEIGHTS
+    total = (
+        getattr(w, "w_valuation",  0.0) +
+        getattr(w, "w_momentum",   0.0) +
+        getattr(w, "w_quality",    0.0) +
+        getattr(w, "w_growth",     0.0) +
+        getattr(w, "w_opportunity",0.0)
+    )
+    assert abs(total - 1.0) < 1e-6, f"ScoreWeights primary fields sum to {total}, expected 1.0"
+
+
+def test_score_weights_each_positive(scoring):
+    w = scoring.DEFAULT_WEIGHTS
+    for name in ("w_valuation", "w_momentum", "w_quality", "w_growth", "w_opportunity"):
+        val = getattr(w, name, None)
+        assert val is not None, f"ScoreWeights.{name} missing"
+        assert val >= 0.0, f"ScoreWeights.{name} is negative: {val}"
+
+
+def test_score_weights_penalty_bounds(scoring):
+    w = scoring.DEFAULT_WEIGHTS
+    for name in ("risk_penalty_strength", "confidence_penalty_strength"):
+        val = getattr(w, name, None)
+        if val is not None:  # optional in future versions
+            assert 0.0 <= val <= 1.0, f"ScoreWeights.{name} = {val} out of [0,1]"
+
+
+# =============================================================================
+# 4. compute_scores / score_row / enrich_with_scores contract
+# =============================================================================
+def test_compute_scores_returns_dict(scoring):
+    result = scoring.compute_scores(MINIMAL_ROW)
+    assert isinstance(result, dict), f"Expected dict, got {type(result)}"
+
+
+def test_compute_scores_required_keys_present(scoring):
+    result = scoring.compute_scores(RICH_ROW)
+    missing = REQUIRED_OUTPUT_KEYS - set(result.keys())
+    assert not missing, f"compute_scores missing required keys: {sorted(missing)}"
+
+
+def test_compute_scores_score_fields_are_float_or_none(scoring):
+    result = scoring.compute_scores(RICH_ROW)
+    for key in SCORE_FLOAT_FIELDS:
+        val = result.get(key)
+        if val is not None:
+            assert isinstance(val, (int, float)), f"Field '{key}' = {val!r} is not numeric"
+            assert not math.isnan(float(val)),   f"Field '{key}' is NaN"
+            assert not math.isinf(float(val)),   f"Field '{key}' is Inf"
+
+
+def test_compute_scores_scores_in_0_100(scoring):
+    """Score fields (except forecast_confidence/penalty_factor) should be in [0, 100]."""
+    result = scoring.compute_scores(RICH_ROW)
+    skip = {"forecast_confidence", "overall_penalty_factor"}
+    for key in SCORE_FLOAT_FIELDS - skip:
+        val = result.get(key)
+        if val is not None:
+            assert 0.0 <= float(val) <= 100.0, (
+                f"Score field '{key}' = {val} is outside [0, 100]"
+            )
+
+
+def test_compute_scores_forecast_confidence_is_fraction(scoring):
+    """forecast_confidence is stored as a fraction 0.0–1.0."""
+    result = scoring.compute_scores(RICH_ROW)
+    fc = result.get("forecast_confidence")
+    if fc is not None:
+        assert 0.0 <= float(fc) <= 1.0, (
+            f"forecast_confidence = {fc} is not a fraction [0, 1]. "
+            "Schema stores fractions, not percent."
+        )
+
+
+def test_compute_scores_roi_fields_are_fractions(scoring):
+    """Expected ROI fields must be fractions (not percent points)."""
+    result = scoring.compute_scores(RICH_ROW)
+    for key in ("expected_roi_1m", "expected_roi_3m", "expected_roi_12m"):
+        val = result.get(key)
+        if val is not None:
+            assert abs(float(val)) <= 1.5, (
+                f"'{key}' = {val} looks like percent points, expected fraction. "
+                "Schema dtype=pct stores fractions (0.085 = 8.5%, not 8.5)."
+            )
+
+
+def test_compute_scores_recommendation_is_canonical(scoring):
+    for row in (SPARSE_ROW, MINIMAL_ROW, RICH_ROW):
+        result = scoring.compute_scores(row)
+        rec = result.get("recommendation", "HOLD")
+        assert rec in VALID_RECOMMENDATIONS, (
+            f"recommendation '{rec}' for {row.get('symbol')} not in {VALID_RECOMMENDATIONS}"
+        )
+
+
+def test_compute_scores_risk_bucket_canonical(scoring):
+    result = scoring.compute_scores(RICH_ROW)
+    rb = result.get("risk_bucket")
+    if rb is not None:
+        assert rb in VALID_RISK_BUCKETS, (
+            f"risk_bucket '{rb}' not in {VALID_RISK_BUCKETS}"
+        )
+
+
+def test_compute_scores_confidence_bucket_canonical(scoring):
+    result = scoring.compute_scores(RICH_ROW)
+    cb = result.get("confidence_bucket")
+    if cb is not None:
+        assert cb in VALID_CONF_BUCKETS, (
+            f"confidence_bucket '{cb}' not in {VALID_CONF_BUCKETS}"
+        )
+
+
+def test_score_row_alias(scoring):
+    """score_row must be an alias for compute_scores."""
+    r1 = scoring.compute_scores(RICH_ROW)
+    r2 = scoring.score_row(RICH_ROW)
+    assert r1.get("overall_score") == r2.get("overall_score")
+    assert r1.get("recommendation") == r2.get("recommendation")
+
+
+def test_enrich_with_scores_merges_into_row(scoring):
+    base = dict(MINIMAL_ROW)
+    enriched = scoring.enrich_with_scores(base)
+    assert "overall_score"  in enriched
+    assert "recommendation" in enriched
+    assert enriched.get("symbol") == MINIMAL_ROW["symbol"], "Original fields must be preserved"
+
+
+def test_enrich_with_scores_in_place(scoring):
+    base = dict(MINIMAL_ROW)
+    result = scoring.enrich_with_scores(base, in_place=True)
+    assert result is base, "in_place=True must return the same dict object"
+    assert "overall_score" in base
+
+
+# =============================================================================
+# 5. Sparse / edge-case inputs
+# =============================================================================
+def test_sparse_row_does_not_raise(scoring):
+    result = scoring.compute_scores(SPARSE_ROW)
+    assert isinstance(result, dict)
+    assert result.get("recommendation") in VALID_RECOMMENDATIONS
+
+
+def test_empty_row_does_not_raise(scoring):
+    result = scoring.compute_scores({})
+    assert isinstance(result, dict)
+    assert "overall_score" in result
+
+
+def test_none_prices_handled(scoring):
+    row = {"symbol": "TEST", "current_price": None, "previous_close": None}
+    result = scoring.compute_scores(row)
+    assert isinstance(result, dict)
+    # forecast fields should be None, not raise
+    for key in ("forecast_price_1m", "forecast_price_3m", "forecast_price_12m"):
+        val = result.get(key)
+        assert val is None or isinstance(val, (int, float)), f"{key} = {val!r} unexpected"
+
+
+def test_inf_nan_prices_handled(scoring):
+    row = {"symbol": "TEST", "current_price": float("nan"), "volatility_30d": float("inf")}
+    # Must not raise
+    result = scoring.compute_scores(row)
+    assert isinstance(result, dict)
+
+
+# =============================================================================
+# 6. Determinism
+# =============================================================================
+def test_compute_scores_is_deterministic(scoring):
+    r1 = scoring.compute_scores(RICH_ROW)
+    r2 = scoring.compute_scores(RICH_ROW)
+    assert r1.get("overall_score")   == r2.get("overall_score")
+    assert r1.get("recommendation")  == r2.get("recommendation")
+    assert r1.get("risk_score")      == r2.get("risk_score")
+
+
+# =============================================================================
+# 7. Rich row — all score fields populated
+# =============================================================================
+def test_rich_row_all_score_fields_populated(scoring):
+    """A richly-populated row should produce all component scores."""
+    result = scoring.compute_scores(RICH_ROW)
+    populated = {k: result.get(k) for k in SCORE_FLOAT_FIELDS}
+    none_fields = [k for k, v in populated.items() if v is None]
+    # Allow at most 2 None fields (e.g. growth if revenue_growth not given)
+    assert len(none_fields) <= 2, (
+        f"Too many None score fields for a rich row: {none_fields}"
+    )
+
+
+def test_rich_row_overall_score_reasonable(scoring):
+    result = scoring.compute_scores(RICH_ROW)
+    overall = result.get("overall_score")
+    assert overall is not None
+    # A solid row with positive ROI and controlled risk should score > 40
+    assert float(overall) > 40.0, (
+        f"overall_score = {overall} unexpectedly low for a well-populated row"
+    )
+
+
+def test_sell_row_lower_than_rich(scoring):
+    r_rich = scoring.compute_scores(RICH_ROW)
+    r_sell = scoring.compute_scores(SELL_ROW)
+    rich_score = float(r_rich.get("overall_score") or 0)
+    sell_score = float(r_sell.get("overall_score") or 0)
+    assert rich_score > sell_score, (
+        f"Rich row score ({rich_score}) should exceed sell-signal row score ({sell_score})"
+    )
+
+
+# =============================================================================
+# 8. ScoringEngine wrapper
+# =============================================================================
+def test_scoring_engine_instantiable(scoring):
+    engine = scoring.ScoringEngine()
+    assert engine is not None
+
+
+def test_scoring_engine_compute_scores(scoring):
+    engine = scoring.ScoringEngine()
+    result = engine.compute_scores(RICH_ROW)
+    assert isinstance(result, dict)
+    assert "overall_score" in result
+
+
+def test_scoring_engine_version_attr(scoring):
+    engine = scoring.ScoringEngine()
+    # version attribute should match module version
+    v = getattr(engine, "version", None) or getattr(engine, "scoring_version", None)
+    assert v is not None, "ScoringEngine has no version attribute"
+
+
+# =============================================================================
+# 9. Ranking functions
+# =============================================================================
+def _make_rows(n: int) -> List[Dict[str, Any]]:
+    rows = []
+    for i in range(n):
+        base = dict(MINIMAL_ROW)
+        base["symbol"]       = f"TICK{i:03d}.SR"
+        base["overall_score"] = float(i * 10)
+        rows.append(base)
+    return rows
+
+
+def test_rank_rows_by_overall_ordering(scoring):
+    rows = _make_rows(5)
+    ranked = scoring.rank_rows_by_overall(rows)
+    scores = [float(r.get("overall_score") or 0) for r in ranked]
+    assert scores == sorted(scores, reverse=True), "rank_rows_by_overall should be descending"
+
+
+def test_assign_rank_overall_adds_rank(scoring):
+    rows = _make_rows(3)
+    ranked = scoring.assign_rank_overall(rows)
+    for idx, row in enumerate(ranked, start=1):
+        assert row.get("rank_overall") == idx, (
+            f"row {idx}: rank_overall = {row.get('rank_overall')}, expected {idx}"
+        )
+
+
+def test_score_and_rank_rows_end_to_end(scoring):
+    rows = [dict(RICH_ROW), dict(MINIMAL_ROW), dict(SPARSE_ROW)]
+    results = scoring.score_and_rank_rows(rows)
+    assert isinstance(results, list)
+    assert len(results) == 3
+    for row in results:
+        assert "overall_score" in row
+        assert "recommendation" in row
+        assert row.get("recommendation") in VALID_RECOMMENDATIONS
+
+
+def test_score_and_rank_rows_rank_is_contiguous(scoring):
+    rows = [dict(RICH_ROW), dict(MINIMAL_ROW), dict(SPARSE_ROW)]
+    results = scoring.score_and_rank_rows(rows)
+    ranks = [r.get("rank_overall") for r in results if r.get("rank_overall") is not None]
+    if ranks:
+        assert sorted(ranks) == list(range(1, len(ranks) + 1)), (
+            f"rank_overall values are not contiguous 1..N: {ranks}"
+        )
+
+
+def test_score_and_rank_rows_empty_input(scoring):
+    results = scoring.score_and_rank_rows([])
+    assert results == []
+
+
+# =============================================================================
+# 10. Settings override
+# =============================================================================
+def test_custom_weights_accepted(scoring):
+    """Passing a custom settings dict must not raise."""
+    settings = {
+        "score_w_valuation": 0.40,
+        "score_w_momentum":  0.20,
+        "score_w_quality":   0.20,
+        "score_w_growth":    0.10,
+        "score_w_opportunity": 0.10,
+    }
+    result = scoring.compute_scores(RICH_ROW, settings=settings)
+    assert isinstance(result, dict)
+    assert "overall_score" in result
+
+
+def test_scoring_engine_custom_weights(scoring):
+    sw = scoring.ScoreWeights(
+        w_valuation=0.40, w_momentum=0.20, w_quality=0.20,
+        w_growth=0.10, w_opportunity=0.10,
+    )
+    engine = scoring.ScoringEngine(weights=sw)
+    result = engine.compute_scores(RICH_ROW)
+    assert isinstance(result, dict)
+    assert "overall_score" in result
+
+
+# =============================================================================
+# 11. scoring_errors field
+# =============================================================================
+def test_scoring_errors_is_list(scoring):
+    result = scoring.compute_scores(SPARSE_ROW)
+    errs = result.get("scoring_errors")
+    assert isinstance(errs, list), f"scoring_errors = {errs!r}, expected list"
+
+
+def test_scoring_errors_items_are_strings(scoring):
+    result = scoring.compute_scores(SPARSE_ROW)
+    for item in result.get("scoring_errors", []):
+        assert isinstance(item, str), f"scoring_errors item {item!r} is not a string"
+
+
+# =============================================================================
+# 12. Timestamp fields
+# =============================================================================
+def test_scoring_timestamps_present(scoring):
+    result = scoring.compute_scores(MINIMAL_ROW)
+    for key in ("scoring_updated_utc", "scoring_updated_riyadh"):
+        val = result.get(key)
+        assert val is not None, f"'{key}' missing from compute_scores output"
+        assert isinstance(val, str), f"'{key}' = {val!r} is not a string"
+        assert len(val) >= 10, f"'{key}' = {val!r} looks too short for ISO datetime"
