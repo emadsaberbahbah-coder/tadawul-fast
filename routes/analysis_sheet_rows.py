@@ -55,70 +55,45 @@ logger.addHandler(logging.NullHandler())
 # -----------------------------------------------------------------------------
 # Optional imports
 # -----------------------------------------------------------------------------
-# FIX v4.0.0: multi-path fallback for schema_registry
-get_sheet_headers = None  # type: ignore
-get_sheet_keys    = None  # type: ignore
-get_sheet_len     = None  # type: ignore
-get_sheet_spec    = None  # type: ignore
+try:
+    from core.sheets.schema_registry import (  # type: ignore
+        get_sheet_headers,
+        get_sheet_keys,
+        get_sheet_len,
+        get_sheet_spec,
+    )
+except Exception:
+    get_sheet_headers = None  # type: ignore
+    get_sheet_keys = None  # type: ignore
+    get_sheet_len = None  # type: ignore
+    get_sheet_spec = None  # type: ignore
 
-for _sreg_path in ("core.sheets.schema_registry", "core.schema_registry", "schema_registry"):
-    try:
-        import importlib as _il
-        _sreg = _il.import_module(_sreg_path)
-        _fh = getattr(_sreg, "get_sheet_headers", None)
-        _fk = getattr(_sreg, "get_sheet_keys",    None)
-        if callable(_fh) and callable(_fk):
-            get_sheet_headers = _fh
-            get_sheet_keys    = _fk
-            get_sheet_len     = getattr(_sreg, "get_sheet_len",  None)
-            get_sheet_spec    = getattr(_sreg, "get_sheet_spec", None)
-            break
-    except Exception:
-        continue
-del _sreg_path
+try:
+    from core.sheets.page_catalog import (  # type: ignore
+        CANONICAL_PAGES,
+        FORBIDDEN_PAGES,
+        allowed_pages,
+        get_route_family,
+        normalize_page_name,
+    )
+except Exception:
+    CANONICAL_PAGES = []  # type: ignore
+    FORBIDDEN_PAGES = {"KSA_Tadawul", "Advisor_Criteria"}  # type: ignore
 
-# FIX v4.0.0: multi-path fallback for page_catalog
-CANONICAL_PAGES: List[str] = []
-FORBIDDEN_PAGES: set = {"KSA_Tadawul", "Advisor_Criteria"}
+    def allowed_pages() -> List[str]:  # type: ignore
+        return list(CANONICAL_PAGES) if CANONICAL_PAGES else []
 
+    def normalize_page_name(name: str, allow_output_pages: bool = True) -> str:  # type: ignore
+        return (name or "").strip().replace(" ", "_")
 
-def allowed_pages() -> List[str]:
-    return list(CANONICAL_PAGES) if CANONICAL_PAGES else []
-
-
-def normalize_page_name(name: str, allow_output_pages: bool = True) -> str:
-    return (name or "").strip().replace(" ", "_")
-
-
-def get_route_family(name: str) -> str:
-    if name == "Top_10_Investments":
-        return "top10"
-    if name == "Insights_Analysis":
-        return "insights"
-    if name == "Data_Dictionary":
-        return "dictionary"
-    return "instrument"
-
-
-for _pcat_path in ("core.sheets.page_catalog", "core.page_catalog", "page_catalog"):
-    try:
-        import importlib as _il2
-        _pcat = _il2.import_module(_pcat_path)
-        _ap = getattr(_pcat, "allowed_pages", None)
-        _np = getattr(_pcat, "normalize_page_name", None)
-        _grf = getattr(_pcat, "get_route_family", None)
-        if callable(_ap):
-            _cp = getattr(_pcat, "CANONICAL_PAGES", None)
-            _fp = getattr(_pcat, "FORBIDDEN_PAGES", None)
-            if _cp is not None: CANONICAL_PAGES[:] = list(_cp)
-            if _fp is not None: FORBIDDEN_PAGES.clear(); FORBIDDEN_PAGES.update(_fp)
-            allowed_pages       = _ap
-            normalize_page_name = _np or normalize_page_name
-            get_route_family    = _grf or get_route_family
-            break
-    except Exception:
-        continue
-del _pcat_path
+    def get_route_family(name: str) -> str:  # type: ignore
+        if name == "Top_10_Investments":
+            return "top10"
+        if name == "Insights_Analysis":
+            return "insights"
+        if name == "Data_Dictionary":
+            return "dictionary"
+        return "instrument"
 
 try:
     from core.config import auth_ok, get_settings_cached, is_open_mode, mask_settings  # type: ignore
@@ -142,7 +117,7 @@ except Exception:
         core_get_sheet_rows = None  # type: ignore
 
 
-ANALYSIS_SHEET_ROWS_VERSION = "4.0.0"
+ANALYSIS_SHEET_ROWS_VERSION = "3.10.0"
 router = APIRouter(prefix="/v1/analysis", tags=["Analysis Sheet Rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -150,27 +125,39 @@ _INSIGHTS_PAGE = "Insights_Analysis"
 _DICTIONARY_PAGE = "Data_Dictionary"
 _SPECIAL_PAGES = {_TOP10_PAGE, _INSIGHTS_PAGE, _DICTIONARY_PAGE}
 
+# v3.10.0: Per-page column counts matching schema_registry v3.4.0
+# schema_registry is authoritative — these are used as fallback when the
+# registry cannot be reached. Prefer _expected_len() which queries live registry.
 _EXPECTED_SHEET_LENGTHS: Dict[str, int] = {
-    "Market_Leaders": 80,
-    "Global_Markets": 80,
-    "Commodities_FX": 80,
-    "Mutual_Funds": 80,
-    "My_Portfolio": 80,
-    _TOP10_PAGE: 83,
-    _INSIGHTS_PAGE: 7,
-    _DICTIONARY_PAGE: 9,
+    "Market_Leaders":    99,   # 80 base + 19 new (roe, roa, vol_ratio, tech signals, etc.)
+    "Global_Markets":    112,  # 99 base + 19 sector/comparative/EODHD cols (no My_Portfolio fields)
+    "Commodities_FX":    86,   # 99 − 13 equity-only + 6 commodity-specific
+    "Mutual_Funds":      94,   # 99 − 13 equity-only + 14 fund-specific
+    "My_Portfolio":      110,  # 99 + 11 advanced portfolio management
+    _TOP10_PAGE:         106,  # 99 + 3 top10 extras + 4 trade setup
+    _INSIGHTS_PAGE:      9,    # 7 original + signal + priority
+    _DICTIONARY_PAGE:    9,    # unchanged
 }
 
+# v3.10.0: Top10 required fields now include trade setup columns
 _TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
     "top10_rank",
     "selection_reason",
     "criteria_snapshot",
+    "entry_price",
+    "stop_loss_suggested",
+    "take_profit_suggested",
+    "risk_reward_ratio",
 )
 
 _TOP10_REQUIRED_HEADERS: Dict[str, str] = {
-    "top10_rank": "Top10 Rank",
-    "selection_reason": "Selection Reason",
-    "criteria_snapshot": "Criteria Snapshot",
+    "top10_rank":           "Top 10 Rank",
+    "selection_reason":     "Selection Reason",
+    "criteria_snapshot":    "Criteria Snapshot",
+    "entry_price":          "Entry Price",
+    "stop_loss_suggested":  "Stop Loss (AI)",
+    "take_profit_suggested":"Take Profit (AI)",
+    "risk_reward_ratio":    "Risk/Reward",
 }
 
 _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
@@ -220,46 +207,168 @@ _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
     "fmt": ["format"],
     "dtype": ["type", "data_type"],
     "notes": ["description", "commentary"],
+    # ── v3.10.0: new schema_registry v3.4.0 fields ────────────────────────
+    "price_change_5d":     ["priceChange5d", "change5d", "five_day_change", "5d_change"],
+    "volume_ratio":        ["volumeRatio", "vol_ratio", "volume_surge"],
+    "roe":                 ["returnOnEquity", "return_on_equity", "ROE"],
+    "roa":                 ["returnOnAssets", "return_on_assets", "ROA"],
+    "rsi_signal":          ["rsiSignal", "rsi_zone", "rsi_label"],
+    "technical_score":     ["technicalScore", "tech_score", "techScore"],
+    "day_range_position":  ["dayRangePosition", "day_range_pos", "range_position"],
+    "atr_14":              ["atr", "averageTrueRange", "ATR", "average_true_range"],
+    "upside_pct":          ["upsidePct", "upside_percent", "upside_downside"],
+    "short_term_signal":   ["shortTermSignal", "st_signal", "day_week_signal"],
+    "ma_50d":              ["fiftyDayAverage", "sma50", "ma50", "50d_ma"],
+    "ma_200d":             ["twoHundredDayAverage", "sma200", "ma200", "200d_ma"],
+    "ema_signal":          ["emaSignal", "ema_50_signal"],
+    "macd_signal":         ["macdSignal", "macd", "MACD"],
+    "region":              ["Region", "market_region"],
+    "market_status":       ["marketState", "market_state", "trading_status"],
+    "price_usd":           ["priceUSD", "price_in_usd"],
+    "sector_pe_avg":       ["sectorPE", "sector_avg_pe", "sector_pe"],
+    "vs_sector_pe_pct":    ["vsSectorPE", "sector_pe_premium", "stock_vs_sector"],
+    "sector_ytd_pct":      ["sectorYTD", "sector_performance"],
+    "sector_signal":       ["sectorSignal", "sector_momentum"],
+    "sector_rank":         ["sectorRank", "rank_in_sector"],
+    "sector_vs_msci_pct":  ["sectorVsMSCI", "sector_vs_benchmark"],
+    "vs_sp500_ytd":        ["vsSP500", "vs_sp500", "relative_to_sp500"],
+    "vs_msci_world_ytd":   ["vsMSCI", "vs_msci_world"],
+    "wall_st_target":      ["wallStTarget", "analyst_target", "WallStreetTargetPrice"],
+    "upside_to_target_pct":["upsideToTarget", "analyst_upside"],
+    "analyst_consensus":   ["analystConsensus", "analyst_rating_consensus"],
+    "country_risk":        ["countryRisk", "sovereign_rating"],
+    "commodity_type":      ["commodityType", "asset_type_commodity"],
+    "contract_expiry":     ["contractExpiry", "expiry_date", "expireDate"],
+    "spot_price":          ["spotPrice", "underlying_spot"],
+    "usd_correlation":     ["usdCorrelation", "corr_usd"],
+    "seasonal_signal":     ["seasonalSignal", "seasonal_pattern"],
+    "carry_rate":          ["carryRate", "interest_diff"],
+    "fund_type":           ["fundType", "quoteType", "fund_category"],
+    "benchmark_name":      ["benchmarkName", "fund_benchmark", "category"],
+    "holdings_count":      ["holdingsCount", "number_of_holdings"],
+    "aum":                 ["totalAssets", "AUM", "fund_aum"],
+    "expense_ratio":       ["expenseRatio", "annual_expense_ratio"],
+    "nav":                 ["navPrice", "net_asset_value", "NAV"],
+    "nav_premium_pct":     ["navPremiumPct", "premium_discount", "nav_discount"],
+    "distribution_yield":  ["distributionYield"],
+    "ytd_return":          ["ytdReturn", "year_to_date_return"],
+    "return_1y":           ["oneYearReturn", "annual_return", "1y_return"],
+    "return_3y_ann":       ["threeYearAverageReturn", "3y_annualized", "return_3y"],
+    "return_5y_ann":       ["fiveYearAverageReturn", "5y_annualized", "return_5y"],
+    "tracking_error":      ["trackingError", "tracking_err"],
+    "alpha_1y":            ["alpha", "alphaJensen", "1y_alpha"],
+    "portfolio_weight_pct":["portfolioWeight", "weight_pct", "allocation_pct"],
+    "target_weight_pct":   ["targetWeight", "target_allocation"],
+    "weight_deviation":    ["weightDeviation", "deviation_from_target"],
+    "rebalance_signal":    ["rebalanceSignal", "rebal_signal"],
+    "stop_loss":           ["stopLoss", "stop_loss_price"],
+    "take_profit":         ["takeProfit", "take_profit_price"],
+    "distance_to_sl_pct":  ["distToSL", "distance_stop_loss"],
+    "distance_to_tp_pct":  ["distToTP", "distance_take_profit"],
+    "days_held":           ["daysHeld", "holding_days"],
+    "annual_dividend_income": ["annualDividendIncome", "annual_div_income"],
+    "beta_contribution":   ["betaContribution", "beta_contrib"],
+    "entry_price":         ["entryPrice", "suggested_entry"],
+    "stop_loss_suggested": ["stopLossSuggested", "ai_stop_loss"],
+    "take_profit_suggested":["takeProfitSuggested", "ai_take_profit"],
+    "risk_reward_ratio":   ["riskRewardRatio", "rr_ratio"],
+    "signal":              ["Signal", "action_signal", "trade_signal"],
+    "priority":            ["Priority", "alert_priority", "urgency"],
 }
 
-_CANONICAL_80_HEADERS: List[str] = [
+# v3.10.0: Updated to 99-column Market_Leaders schema (schema_registry v3.4.0).
+# _CANONICAL_80_HEADERS/KEYS kept as backward-compat aliases.
+_CANONICAL_99_HEADERS: List[str] = [
+    # Identity (8)
     "Symbol", "Name", "Asset Class", "Exchange", "Currency", "Country", "Sector", "Industry",
-    "Current Price", "Previous Close", "Open", "Day High", "Day Low", "52W High", "52W Low",
-    "Price Change", "Percent Change", "52W Position %", "Volume", "Avg Volume 10D", "Avg Volume 30D",
-    "Market Cap", "Float Shares", "Beta (5Y)", "P/E (TTM)", "P/E (Forward)", "EPS (TTM)",
-    "Dividend Yield", "Payout Ratio", "Revenue (TTM)", "Revenue Growth YoY", "Gross Margin",
-    "Operating Margin", "Profit Margin", "Debt/Equity", "Free Cash Flow (TTM)", "RSI (14)",
-    "Volatility 30D", "Volatility 90D", "Max Drawdown 1Y", "VaR 95% (1D)", "Sharpe (1Y)",
-    "Risk Score", "Risk Bucket", "P/B", "P/S", "EV/EBITDA", "PEG", "Intrinsic Value",
-    "Valuation Score", "Forecast Price 1M", "Forecast Price 3M", "Forecast Price 12M",
-    "Expected ROI 1M", "Expected ROI 3M", "Expected ROI 12M", "Forecast Confidence",
-    "Confidence Score", "Confidence Bucket", "Value Score", "Quality Score", "Momentum Score",
-    "Growth Score", "Overall Score", "Opportunity Score", "Rank (Overall)", "Recommendation",
-    "Recommendation Reason", "Horizon Days", "Invest Period Label", "Position Qty", "Avg Cost",
-    "Position Cost", "Position Value", "Unrealized P/L", "Unrealized P/L %", "Data Provider",
-    "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
+    # Price base (10)
+    "Current Price", "Previous Close", "Open", "Day High", "Day Low",
+    "52W High", "52W Low", "Price Change", "Change %", "52W Position %",
+    # Price new (1)
+    "5D Change %",
+    # Volume (6)
+    "Volume", "Avg Vol 10D", "Avg Vol 30D", "Market Cap", "Float Shares", "Volume Ratio",
+    # Fundamentals equity (13)
+    "Beta (5Y)", "P/E (TTM)", "P/E (Fwd)", "EPS (TTM)", "Div Yield %", "Payout Ratio %",
+    "Revenue TTM", "Rev Growth YoY %", "Gross Margin %", "Op Margin %",
+    "Net Margin %", "D/E Ratio", "FCF (TTM)",
+    # Fundamentals quality (2)
+    "ROE %", "ROA %",
+    # Risk (8)
+    "RSI (14)", "Volatility 30D %", "Volatility 90D %", "Max DD 1Y %",
+    "VaR 95% (1D)", "Sharpe (1Y)", "Risk Score", "Risk Bucket",
+    # Technicals new (4)
+    "RSI Signal", "Tech Score", "Day Range Pos %", "ATR 14",
+    # Valuation (7)
+    "P/B", "P/S", "EV/EBITDA", "PEG Ratio", "Intrinsic Value", "Valuation Score", "Upside %",
+    # Forecast (9)
+    "Price Tgt 1M", "Price Tgt 3M", "Price Tgt 12M",
+    "ROI 1M %", "ROI 3M %", "ROI 12M %",
+    "AI Confidence", "Confidence Score", "Confidence",
+    # Scores (6)
+    "Value Score", "Quality Score", "Momentum Score", "Growth Score", "Overall Score", "Opportunity Score",
+    # Decision (8)
+    "Analyst Rating", "Target Price", "Upside/Downside %",
+    "Recommendation", "Signal", "Trend 1M", "Trend 3M", "Trend 12M",
+    # Recommendation new (4)
+    "ST Signal", "Reason", "Horizon", "Horizon Days",
+    # Rank
+    "Rank (Overall)",
+    # Portfolio light (6)
+    "Qty", "Avg Cost", "Position Cost", "Position Value", "Unrealized P/L", "Unrealized P/L %",
+    # Provenance (4)
+    "Data Provider", "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
 ]
 
-_CANONICAL_80_KEYS: List[str] = [
+_CANONICAL_99_KEYS: List[str] = [
+    # Identity (8)
     "symbol", "name", "asset_class", "exchange", "currency", "country", "sector", "industry",
-    "current_price", "previous_close", "open_price", "day_high", "day_low", "week_52_high",
-    "week_52_low", "price_change", "percent_change", "week_52_position_pct", "volume",
-    "avg_volume_10d", "avg_volume_30d", "market_cap", "float_shares", "beta_5y", "pe_ttm",
-    "pe_forward", "eps_ttm", "dividend_yield", "payout_ratio", "revenue_ttm", "revenue_growth_yoy",
-    "gross_margin", "operating_margin", "profit_margin", "debt_to_equity", "free_cash_flow_ttm",
-    "rsi_14", "volatility_30d", "volatility_90d", "max_drawdown_1y", "var_95_1d", "sharpe_1y",
-    "risk_score", "risk_bucket", "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio",
-    "intrinsic_value", "valuation_score", "forecast_price_1m", "forecast_price_3m",
-    "forecast_price_12m", "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
-    "forecast_confidence", "confidence_score", "confidence_bucket", "value_score", "quality_score",
-    "momentum_score", "growth_score", "overall_score", "opportunity_score", "rank_overall",
-    "recommendation", "recommendation_reason", "horizon_days", "invest_period_label", "position_qty",
-    "avg_cost", "position_cost", "position_value", "unrealized_pl", "unrealized_pl_pct",
+    # Price base (10)
+    "current_price", "previous_close", "open_price", "day_high", "day_low",
+    "week_52_high", "week_52_low", "price_change", "percent_change", "week_52_position_pct",
+    # Price new (1)
+    "price_change_5d",
+    # Volume (6)
+    "volume", "avg_volume_10d", "avg_volume_30d", "market_cap", "float_shares", "volume_ratio",
+    # Fundamentals equity (13)
+    "beta_5y", "pe_ttm", "pe_forward", "eps_ttm", "dividend_yield", "payout_ratio",
+    "revenue_ttm", "revenue_growth_yoy", "gross_margin", "operating_margin",
+    "profit_margin", "debt_to_equity", "free_cash_flow_ttm",
+    # Fundamentals quality (2)
+    "roe", "roa",
+    # Risk (8)
+    "rsi_14", "volatility_30d", "volatility_90d", "max_drawdown_1y",
+    "var_95_1d", "sharpe_1y", "risk_score", "risk_bucket",
+    # Technicals new (4)
+    "rsi_signal", "technical_score", "day_range_position", "atr_14",
+    # Valuation (7)
+    "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio", "intrinsic_value", "valuation_score", "upside_pct",
+    # Forecast (9)
+    "forecast_price_1m", "forecast_price_3m", "forecast_price_12m",
+    "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
+    "forecast_confidence", "confidence_score", "confidence_bucket",
+    # Scores (6)
+    "value_score", "quality_score", "momentum_score", "growth_score", "overall_score", "opportunity_score",
+    # Decision (8)
+    "analyst_rating", "target_price", "upside_downside_pct",
+    "recommendation", "signal", "trend_1m", "trend_3m", "trend_12m",
+    # Recommendation new (4)
+    "short_term_signal", "recommendation_reason", "invest_period_label", "horizon_days",
+    # Rank
+    "rank_overall",
+    # Portfolio light (6)
+    "position_qty", "avg_cost", "position_cost", "position_value", "unrealized_pl", "unrealized_pl_pct",
+    # Provenance (4)
     "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
 ]
 
-_INSIGHTS_HEADERS = ["Section", "Item", "Symbol", "Metric", "Value", "Notes", "Last Updated (Riyadh)"]
-_INSIGHTS_KEYS = ["section", "item", "symbol", "metric", "value", "notes", "last_updated_riyadh"]
+# Backward-compat aliases (old name → new 99-col list)
+_CANONICAL_80_HEADERS = _CANONICAL_99_HEADERS
+_CANONICAL_80_KEYS    = _CANONICAL_99_KEYS
+
+# v3.10.0: Insights updated to 9 cols — adds signal + priority
+_INSIGHTS_HEADERS = ["Section", "Item", "Symbol", "Metric", "Value", "Signal", "Priority", "Notes", "Last Updated (Riyadh)"]
+_INSIGHTS_KEYS    = ["section", "item", "symbol", "metric", "value", "signal", "priority", "notes", "last_updated_riyadh"]
 
 _DICTIONARY_HEADERS = ["Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes"]
 _DICTIONARY_KEYS = ["sheet", "group", "header", "key", "dtype", "fmt", "required", "source", "notes"]
@@ -728,7 +837,7 @@ def _ensure_top10_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple
         if field not in ks:
             ks.append(field)
             hdrs.append(_TOP10_REQUIRED_HEADERS[field])
-    return _pad_contract(hdrs, ks, 83)
+    return _pad_contract(hdrs, ks, _EXPECTED_SHEET_LENGTHS.get(_TOP10_PAGE, 106))  # v3.10.0: 106
 
 
 def _static_contract(page: str) -> Tuple[List[str], List[str], str]:
@@ -736,13 +845,15 @@ def _static_contract(page: str) -> Tuple[List[str], List[str], str]:
         h, k = _ensure_top10_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS)
         return h, k, "static_canonical_top10"
     if page == _INSIGHTS_PAGE:
-        h, k = _pad_contract(_INSIGHTS_HEADERS, _INSIGHTS_KEYS, 7)
+        h, k = _pad_contract(_INSIGHTS_HEADERS, _INSIGHTS_KEYS, 9)  # v3.10.0: 9 cols
         return h, k, "static_canonical_insights"
     if page == _DICTIONARY_PAGE:
         h, k = _pad_contract(_DICTIONARY_HEADERS, _DICTIONARY_KEYS, 9)
         return h, k, "static_canonical_dictionary"
-    h, k = _pad_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS, 80)
-    return h, k, "static_canonical_instrument"
+    # v3.10.0: per-page expected lengths from schema_registry v3.4.0
+    expected = _EXPECTED_SHEET_LENGTHS.get(page, 99)
+    h, k = _pad_contract(_CANONICAL_99_HEADERS, _CANONICAL_99_KEYS, expected)
+    return h, k, "static_canonical_instrument_v34"
 
 
 def _expected_len(page: str) -> int:
@@ -1446,7 +1557,7 @@ def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int)
     if kk == "last_updated_riyadh":
         return datetime.utcnow().isoformat()
     if kk == "recommendation":
-        return "HOLD" if row_index > 3 else "BUY"  # FIX v4.0.0: canonical values
+        return "Watch" if row_index > 3 else "Accumulate"
     if kk == "recommendation_reason":
         return "Placeholder fallback because live engine returned no usable rows."
     if kk in {"top10_rank", "rank_overall"}:
@@ -1599,7 +1710,7 @@ def _build_insights_fallback_rows(*, requested_symbols: Sequence[str], limit: in
             "item": f"Fallback signal {idx}",
             "symbol": sym,
             "metric": "recommendation",
-            "value": "HOLD" if idx > 2 else "BUY",  # FIX v4.0.0: canonical values
+            "value": "Watch" if idx > 2 else "Accumulate",
             "notes": "Generated locally because upstream insights payload was unavailable",
             "last_updated_riyadh": stamp,
         })
