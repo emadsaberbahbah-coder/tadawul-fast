@@ -1158,4 +1158,96 @@ class YahooFundamentalsProvider:
                     out["forecast_price_12m"] = float(target_mean_price)
                     out["expected_roi_12m"] = roi12
                     out["forecast_method"] = "analyst_consensus"
-                    ac = analyst_count or
+                    ac = analyst_count or 1
+                    out["forecast_confidence"] = min(0.95, 0.40 + (ac * 0.05))
+
+                dq, score = data_quality_score(out)
+                out["data_quality"] = dq.value
+                out["data_quality_score"] = score
+                return clean_patch(out)
+
+            except Exception as e:
+                last_err = e
+                time.sleep(0.5)
+
+        return {"error": str(last_err), "data_quality": DataQuality.ERROR.value}
+
+    async def fetch_fundamentals(self, symbol: str) -> Dict[str, Any]:
+        if not self.enabled or not symbol:
+            return {}
+        norm = normalize_symbol(symbol)
+        
+        cached = await self.fund_cache.get(norm)
+        if cached:
+            return cached
+
+        if not await self.circuit_breaker.allow_request():
+            return {}
+
+        await self.rate_limiter.wait_and_acquire()
+
+        async def _do() -> Dict[str, Any]:
+            loop = asyncio.get_running_loop()
+            try:
+                res = await loop.run_in_executor(None, self._blocking_fetch, norm)
+                if "error" in res and res.get("data_quality") == DataQuality.ERROR.value:
+                    await self.circuit_breaker.on_failure()
+                    return {}
+                await self.circuit_breaker.on_success()
+                
+                if res.get("current_price") is not None:
+                    await self.fund_cache.set(norm, res)
+                return res
+            except Exception as e:
+                await self.circuit_breaker.on_failure()
+                return {}
+
+        return await self.singleflight.run(norm, _do)
+
+    async def fetch_fundamentals_batch(self, symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+        tasks = {s: asyncio.create_task(self.fetch_fundamentals(s)) for s in symbols if s}
+        results = {}
+        for s, t in tasks.items():
+            res = await t
+            if res:
+                results[s] = res
+        return results
+
+_INSTANCE = YahooFundamentalsProvider()
+
+async def fetch_fundamentals_patch(symbol: str) -> Dict[str, Any]:
+    return await _INSTANCE.fetch_fundamentals(symbol)
+
+async def fetch_enriched_quote_patch(symbol: str) -> Dict[str, Any]:
+    return await _INSTANCE.fetch_fundamentals(symbol)
+
+async def fetch_quote(symbol: str) -> Dict[str, Any]:
+    return await _INSTANCE.fetch_fundamentals(symbol)
+
+async def get_quote(symbol: str) -> Dict[str, Any]:
+    return await _INSTANCE.fetch_fundamentals(symbol)
+
+async def quote(symbol: str) -> Dict[str, Any]:
+    return await _INSTANCE.fetch_fundamentals(symbol)
+
+async def enriched_quote(symbol: str) -> Dict[str, Any]:
+    return await _INSTANCE.fetch_fundamentals(symbol)
+
+async def fetch_quotes(symbols: List[str]) -> Dict[str, Dict[str, Any]]:
+    return await _INSTANCE.fetch_fundamentals_batch(symbols)
+
+__all__ = [
+    "YahooFundamentalsProvider",
+    "DataQuality",
+    "data_quality_score",
+    "fetch_fundamentals_patch",
+    "fetch_enriched_quote_patch",
+    "fetch_quote",
+    "get_quote",
+    "quote",
+    "enriched_quote",
+    "fetch_quotes",
+    "PROVIDER_NAME",
+    "PROVIDER_VERSION",
+    "PROVIDER_BATCH_SUPPORTED",
+]
