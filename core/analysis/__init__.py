@@ -8,16 +8,16 @@ Tadawul Fast Bridge (TFB)
 
 This package contains the analysis and selection engines:
 
-  insights_builder.py   -- Insights_Analysis page builder (executive layout)
-                           4 sections: Market Summary, Risk Scenarios,
-                           Top Opportunities, Portfolio Health.
-                           Schema: 10 columns (Section/Category/Item/Symbol/
-                                               Metric/Value/Signal/Score/
-                                               Notes/Last Updated)
+  insights_builder.py    -- Insights_Analysis page builder (executive layout)
+                            4 sections: Market Summary, Risk Scenarios,
+                            Top Opportunities, Portfolio Health.
+                            Schema: 10 columns (Section/Category/Item/Symbol/
+                                                Metric/Value/Signal/Score/
+                                                Notes/Last Updated)
 
-  top10_selector.py     -- Top_10_Investments selector engine
-                           Criteria-driven composite scoring and ranking.
-                           Schema: 83 columns (80 canonical + 3 Top10 extras)
+  top10_selector.py      -- Top_10_Investments selector engine
+                            Criteria-driven composite scoring and ranking.
+                            Schema: 83 columns (80 canonical + 3 Top10 extras)
 
 Public API (lazy-imported to keep startup safe):
 
