@@ -1,7 +1,6 @@
-from __future__ import annotations
-
+#!/usr/bin/env python3
+# core/sheets/schema_registry.py
 """
-core/sheets/schema_registry.py
 ===============================================================================
 Schema Registry — v3.4.0  (PER-PAGE SCHEMAS / WORLD-CLASS COLUMNS)
 ===============================================================================
@@ -279,7 +278,7 @@ _IDENTITY: Tuple[FieldSpec, ...] = (
        description="Ticker / trading symbol.", aliases=("ticker",)),
     _f("name",         "Name",       required=True, group="Identity",
        description="Instrument or fund name."),
-    _f("asset_class",  "Asset Class",              group="Identity",
+    _f("asset_class",  "Asset Class",               group="Identity",
        description="Equity, ETF, commodity, FX, fund, etc."),
     _f("exchange",     "Exchange",                  group="Identity",
        description="Primary exchange or market."),
@@ -350,33 +349,33 @@ _VOLUME: Tuple[FieldSpec, ...] = (
 
 # ── Fundamentals — equity ─────────────────────────────────────────────────────
 _FUNDAMENTALS_EQUITY: Tuple[FieldSpec, ...] = (
-    _f("beta_5y",              "Beta (5Y)",          "number",
+    _f("beta_5y",               "Beta (5Y)",          "number",
        group="Fundamentals", format_hint="0.00"),
-    _f("pe_ttm",               "P/E (TTM)",          "number",
+    _f("pe_ttm",                "P/E (TTM)",          "number",
        group="Fundamentals", format_hint="0.00",
        description="Trailing price-to-earnings."),
-    _f("pe_forward",           "P/E (Fwd)",          "number",
+    _f("pe_forward",            "P/E (Fwd)",          "number",
        group="Fundamentals", format_hint="0.00",
        description="Forward price-to-earnings."),
-    _f("eps_ttm",              "EPS (TTM)",          "number",
+    _f("eps_ttm",               "EPS (TTM)",          "number",
        group="Fundamentals", format_hint="0.00"),
-    _f("dividend_yield",       "Div Yield %",        "percent",
+    _f("dividend_yield",        "Div Yield %",        "percent",
        group="Fundamentals", format_hint="0.00%"),
-    _f("payout_ratio",         "Payout Ratio %",     "percent",
+    _f("payout_ratio",          "Payout Ratio %",     "percent",
        group="Fundamentals", format_hint="0.00%"),
-    _f("revenue_ttm",          "Revenue TTM",        "number",
+    _f("revenue_ttm",           "Revenue TTM",        "number",
        group="Fundamentals", format_hint="#,##0"),
-    _f("revenue_growth_yoy",   "Rev Growth YoY %",   "percent",
+    _f("revenue_growth_yoy",    "Rev Growth YoY %",   "percent",
        group="Fundamentals", format_hint="0.00%"),
-    _f("gross_margin",         "Gross Margin %",     "percent",
+    _f("gross_margin",          "Gross Margin %",     "percent",
        group="Fundamentals", format_hint="0.00%"),
-    _f("operating_margin",     "Op Margin %",        "percent",
+    _f("operating_margin",      "Op Margin %",        "percent",
        group="Fundamentals", format_hint="0.00%"),
-    _f("profit_margin",        "Net Margin %",       "percent",
+    _f("profit_margin",         "Net Margin %",       "percent",
        group="Fundamentals", format_hint="0.00%"),
-    _f("debt_to_equity",       "D/E Ratio",          "number",
+    _f("debt_to_equity",        "D/E Ratio",          "number",
        group="Fundamentals", format_hint="0.00"),
-    _f("free_cash_flow_ttm",   "FCF (TTM)",          "number",
+    _f("free_cash_flow_ttm",    "FCF (TTM)",          "number",
        group="Fundamentals", format_hint="#,##0"),
 )
 
@@ -560,7 +559,7 @@ _RECOMMENDATION_NEW: Tuple[FieldSpec, ...] = (
 
 # ── Provenance ────────────────────────────────────────────────────────────────
 _PROVENANCE: Tuple[FieldSpec, ...] = (
-    _f("provider_primary",  "Provider",           group="Provenance",
+    _f("provider_primary",  "Provider",            group="Provenance",
        aliases=("provider", "data_provider"),
        description="Primary data provider for this row."),
     _f("provider_secondary","Provider Secondary",  group="Provenance"),
@@ -932,15 +931,15 @@ DATA_DICTIONARY_FIELDS: Tuple[FieldSpec, ...] = (
        description="User-facing column header shown in Google Sheets."),
     _f("data_type",      "Data Type",      required=True, group="Dictionary",
        description="Expected data type: string / number / percent / datetime / boolean."),
-    _f("group",          "Group",                         group="Dictionary",
+    _f("group",          "Group",                                 group="Dictionary",
        description="Logical column grouping."),
-    _f("required",       "Required",                      group="Dictionary",
+    _f("required",       "Required",                              group="Dictionary",
        description="Whether the field is required for the page to function."),
-    _f("description",    "Description",                   group="Dictionary",
+    _f("description",    "Description",                           group="Dictionary",
        description="Field description, business meaning, and derivation notes."),
-    _f("format_hint",    "Format Hint",                   group="Dictionary",
+    _f("format_hint",    "Format Hint",                           group="Dictionary",
        description="Suggested Google Sheets format (e.g. 0.00%, #,##0)."),
-    _f("aliases",        "Aliases",                       group="Dictionary",
+    _f("aliases",        "Aliases",                               group="Dictionary",
        description="Alternative accepted input key names for this field."),
 )
 
