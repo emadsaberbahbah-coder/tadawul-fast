@@ -2,7 +2,7 @@
 # core/schemas.py
 """
 ================================================================================
-Core Schemas + Sheet Headers -- v6.1.0 (CANONICAL / REGISTRY-FIRST / STARTUP-SAFE)
+Core Schemas + Sheet Headers — v6.1.0 (CANONICAL / REGISTRY-FIRST / STARTUP-SAFE)
 ================================================================================
 
 Purpose
@@ -18,11 +18,15 @@ The canonical source of truth is `core.sheets.schema_registry` whenever it is
 available. This file mirrors that registry and only falls back to deterministic,
 fixed-width contracts when the registry cannot be imported.
 
-Canonical targets
------------------
-- Standard sheets: 80 columns
-- Top_10_Investments: 83 columns
-- Insights_Analysis: 7 columns
+Canonical targets (schema_registry v3.4.0)
+------------------------------------------
+- Standard instrument sheets (Market_Leaders): 99 columns
+- Global_Markets: 112 columns
+- Commodities_FX: 86 columns
+- Mutual_Funds: 94 columns
+- My_Portfolio: 110 columns
+- Top_10_Investments: 106 columns (99 base + 3 top10 extras + 4 trade setup)
+- Insights_Analysis: 9 columns
 - Data_Dictionary: 9 columns
 
 Compatibility
@@ -678,225 +682,120 @@ def resolve_sheet_key(sheet_name: Optional[str]) -> str:
 # ---------------------------------------------------------------------------
 
 _FALLBACK_STANDARD_HEADERS: List[str] = [
-    "Symbol",
-    "Name",
-    "Asset Class",
-    "Exchange",
-    "Currency",
-    "Country",
-    "Sector",
-    "Industry",
-    "Current Price",
-    "Previous Close",
-    "Open",
-    "Day High",
-    "Day Low",
-    "52W High",
-    "52W Low",
-    "Price Change",
-    "Percent Change",
-    "52W Position %",
-    "Volume",
-    "Avg Volume 10D",
-    "Avg Volume 30D",
-    "Market Cap",
-    "Float Shares",
-    "Beta 5Y",
-    "P/E TTM",
-    "Forward P/E",
-    "EPS TTM",
-    "Dividend Yield",
-    "Payout Ratio",
-    "Revenue TTM",
-    "Revenue YoY Growth",
-    "Gross Margin",
-    "Operating Margin",
-    "Profit Margin",
-    "Debt/Equity",
-    "Free Cash Flow TTM",
-    "RSI 14",
-    "Volatility 30D",
-    "Volatility 90D",
-    "Max Drawdown 1Y",
-    "VaR 95% 1D",
-    "Sharpe 1Y",
-    "Risk Score",
-    "Risk Bucket",
-    "P/B",
-    "P/S",
-    "EV/EBITDA",
-    "PEG",
-    "Intrinsic Value",
-    "Valuation Score",
-    "Forecast Price 1M",
-    "Forecast Price 3M",
-    "Forecast Price 12M",
-    "Expected ROI 1M",    # FIX v6.1.0: was "Expected ROI 1M %" (schema stores fraction)
-    "Expected ROI 3M",    # FIX v6.1.0: was "Expected ROI 3M %"
-    "Expected ROI 12M",   # FIX v6.1.0: was "Expected ROI 12M %"
-    "Forecast Confidence",
-    "Forecast Method",
-    "Value Score",
-    "Quality Score",
-    "Momentum Score",
-    "Growth Score",
-    "Overall Score",
-    "Opportunity Score",
-    "Rank Overall",
-    "Confidence Bucket",
-    "Recommendation",
-    "Recommendation Reason",
-    "Data Source",
-    "Data Quality",
-    "Last Updated UTC",
-    "Last Updated Riyadh",
-    "Rank",
-    "Origin",
-    "Requested Symbol",
-    "Symbol Normalized",
-    "Liquidity Score",
-    "Turnover %",
-    "Value Traded",
-    "Error",
-]
+    # Identity (8)
+    "Symbol", "Name", "Asset Class", "Exchange", "Currency", "Country", "Sector", "Industry",
+    # Price base (10)
+    "Current Price", "Previous Close", "Open", "Day High", "Day Low",
+    "52W High", "52W Low", "Price Change", "Change %", "52W Position %",
+    # Price new (1)
+    "5D Change %",
+    # Volume (6)
+    "Volume", "Avg Vol 10D", "Avg Vol 30D", "Market Cap", "Float Shares", "Volume Ratio",
+    # Fundamentals equity (13)
+    "Beta (5Y)", "P/E (TTM)", "P/E (Fwd)", "EPS (TTM)", "Div Yield %", "Payout Ratio %",
+    "Revenue TTM", "Rev Growth YoY %", "Gross Margin %", "Op Margin %",
+    "Net Margin %", "D/E Ratio", "FCF (TTM)",
+    # Fundamentals quality (2)
+    "ROE %", "ROA %",
+    # Risk (8)
+    "RSI (14)", "Volatility 30D %", "Volatility 90D %", "Max DD 1Y %",
+    "VaR 95% (1D)", "Sharpe (1Y)", "Risk Score", "Risk Bucket",
+    # Technicals new (4)
+    "RSI Signal", "Tech Score", "Day Range Pos %", "ATR 14",
+    # Valuation (7)
+    "P/B", "P/S", "EV/EBITDA", "PEG Ratio", "Intrinsic Value", "Valuation Score", "Upside %",
+    # Forecast (9)
+    "Price Tgt 1M", "Price Tgt 3M", "Price Tgt 12M",
+    "ROI 1M %", "ROI 3M %", "ROI 12M %",
+    "AI Confidence", "Confidence Score", "Confidence",
+    # Scores (6)
+    "Value Score", "Quality Score", "Momentum Score", "Growth Score", "Overall Score", "Opportunity Score",
+    # Decision (8)
+    "Analyst Rating", "Target Price", "Upside/Downside %",
+    "Recommendation", "Signal", "Trend 1M", "Trend 3M", "Trend 12M",
+    # Recommendation new (4)
+    "ST Signal", "Reason", "Horizon", "Horizon Days",
+    # Rank (1)
+    "Rank (Overall)",
+    # Portfolio light (6)
+    "Qty", "Avg Cost", "Position Cost", "Position Value", "Unrealized P/L", "Unrealized P/L %",
+    # Provenance (4)
+    "Data Provider", "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
+]  # 99 columns — schema_registry v3.4.0 Market_Leaders canonical
 
 _FALLBACK_STANDARD_KEYS: List[str] = [
-    "symbol",
-    "name",
-    "asset_class",
-    "exchange",
-    "currency",
-    "country",
-    "sector",
-    "industry",
-    "current_price",
-    "previous_close",
-    "open_price",
-    "day_high",
-    "day_low",
-    "week_52_high",
-    "week_52_low",
-    "price_change",
-    "percent_change",
-    "week_52_position_pct",
-    "volume",
-    "avg_volume_10d",
-    "avg_volume_30d",
-    "market_cap",
-    "float_shares",
-    "beta_5y",
-    "pe_ttm",
-    "forward_pe",
-    "eps_ttm",
-    "dividend_yield",
-    "payout_ratio",
-    "revenue_ttm",
-    "revenue_yoy_growth",
-    "gross_margin",
-    "operating_margin",
-    "profit_margin",
-    "debt_to_equity",
-    "free_cash_flow_ttm",
-    "rsi_14",
-    "volatility_30d",
-    "volatility_90d",
-    "max_drawdown_1y",
-    "var_95_1d",
-    "sharpe_1y",
-    "risk_score",
-    "risk_bucket",
-    "pb_ratio",
-    "ps_ratio",
-    "ev_ebitda",
-    "peg_ratio",
-    "intrinsic_value",
-    "valuation_score",
-    "forecast_price_1m",
-    "forecast_price_3m",
-    "forecast_price_12m",
-    "expected_roi_1m",    # FIX v6.1.0: was "expected_roi_1m_pct" (schema key; value is fraction)
-    "expected_roi_3m",    # FIX v6.1.0: was "expected_roi_3m_pct"
-    "expected_roi_12m",   # FIX v6.1.0: was "expected_roi_12m_pct"
-    "forecast_confidence",
-    "forecast_method",
-    "value_score",
-    "quality_score",
-    "momentum_score",
-    "growth_score",
-    "overall_score",
-    "opportunity_score",
+    # Identity (8)
+    "symbol", "name", "asset_class", "exchange", "currency", "country", "sector", "industry",
+    # Price base (10)
+    "current_price", "previous_close", "open_price", "day_high", "day_low",
+    "week_52_high", "week_52_low", "price_change", "percent_change", "week_52_position_pct",
+    # Price new (1)
+    "price_change_5d",
+    # Volume (6)
+    "volume", "avg_volume_10d", "avg_volume_30d", "market_cap", "float_shares", "volume_ratio",
+    # Fundamentals equity (13)
+    "beta_5y", "pe_ttm", "pe_forward", "eps_ttm", "dividend_yield", "payout_ratio",
+    "revenue_ttm", "revenue_growth_yoy", "gross_margin", "operating_margin",
+    "profit_margin", "debt_to_equity", "free_cash_flow_ttm",
+    # Fundamentals quality (2)
+    "roe", "roa",
+    # Risk (8)
+    "rsi_14", "volatility_30d", "volatility_90d", "max_drawdown_1y",
+    "var_95_1d", "sharpe_1y", "risk_score", "risk_bucket",
+    # Technicals new (4)
+    "rsi_signal", "technical_score", "day_range_position", "atr_14",
+    # Valuation (7)
+    "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio", "intrinsic_value", "valuation_score", "upside_pct",
+    # Forecast (9)
+    "forecast_price_1m", "forecast_price_3m", "forecast_price_12m",
+    "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
+    "forecast_confidence", "confidence_score", "confidence_bucket",
+    # Scores (6)
+    "value_score", "quality_score", "momentum_score", "growth_score", "overall_score", "opportunity_score",
+    # Decision (8)
+    "analyst_rating", "target_price", "upside_downside_pct",
+    "recommendation", "signal", "trend_1m", "trend_3m", "trend_12m",
+    # Recommendation new (4)
+    "short_term_signal", "recommendation_reason", "invest_period_label", "horizon_days",
+    # Rank (1)
     "rank_overall",
-    "confidence_bucket",
-    "recommendation",
-    "recommendation_reason",
-    "data_source",
-    "data_quality",
-    "last_updated_utc",
-    "last_updated_riyadh",
-    "rank",
-    "origin",
-    "requested_symbol",
-    "symbol_normalized",
-    "liquidity_score",
-    "turnover_pct",
-    "value_traded",
-    "error",
-]
+    # Portfolio light (6)
+    "position_qty", "avg_cost", "position_cost", "position_value", "unrealized_pl", "unrealized_pl_pct",
+    # Provenance (4)
+    "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
+]  # 99 columns — schema_registry v3.4.0 _CANONICAL_99_KEYS
 
 _FALLBACK_TOP10_HEADERS: List[str] = list(_FALLBACK_STANDARD_HEADERS) + [
-    "Top10 Rank",
-    "Selection Reason",
-    "Criteria Snapshot",
-]
+    # Top10 extras (3)
+    "Top 10 Rank", "Selection Reason", "Criteria Snapshot",
+    # Trade setup (4) — top10_selector v4.9.0
+    "Entry Price", "Stop Loss (AI)", "Take Profit (AI)", "Risk/Reward",
+]  # 106 columns
 _FALLBACK_TOP10_KEYS: List[str] = list(_FALLBACK_STANDARD_KEYS) + [
-    "top10_rank",
-    "selection_reason",
-    "criteria_snapshot",
-]
+    # Top10 extras (3)
+    "top10_rank", "selection_reason", "criteria_snapshot",
+    # Trade setup (4) — top10_selector v4.9.0
+    "entry_price", "stop_loss_suggested", "take_profit_suggested", "risk_reward_ratio",
+]  # 106 columns
 
-# FIX v6.1.0: aligned to canonical Insights_Analysis schema (schema_registry v3.0.0)
-# Previous: "Criteria Key"/"criteria_key", "Criteria Value"/"criteria_value"
-# Canonical: "Source"/"source", "Sort Order"/"sort_order"
+# v6.1.0: 9-col schema (schema_registry v3.4.0 / insights_builder v3.0.0)
+# OLD (v6.0.0): section/item/metric/value/notes/criteria_key/criteria_value (7 non-canonical cols)
+# NEW (v6.1.0): section/item/symbol/metric/value/signal/priority/notes/as_of_riyadh (9 canonical cols)
 _FALLBACK_INSIGHTS_HEADERS: List[str] = [
-    "Section",
-    "Item",
-    "Metric",
-    "Value",
-    "Notes",
-    "Source",       # FIX v6.1.0: was "Criteria Key"
-    "Sort Order",   # FIX v6.1.0: was "Criteria Value"
+    "Section", "Item", "Symbol", "Metric", "Value",
+    "Signal", "Priority", "Notes", "Last Updated (Riyadh)",
 ]
 _FALLBACK_INSIGHTS_KEYS: List[str] = [
-    "section",
-    "item",
-    "metric",
-    "value",
-    "notes",
-    "source",       # FIX v6.1.0: was "criteria_key"
-    "sort_order",   # FIX v6.1.0: was "criteria_value"
+    "section", "item", "symbol", "metric", "value",
+    "signal", "priority", "notes", "as_of_riyadh",
 ]
 
 _FALLBACK_DICTIONARY_HEADERS: List[str] = [
-    "Sheet",
-    "Group",
-    "Header",
-    "Key",
-    "DType",
-    "Format",
-    "Required",
-    "Source",
-    "Notes",
+    "Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes",
 ]
 _FALLBACK_DICTIONARY_KEYS: List[str] = [
-    "sheet",
-    "group",
-    "header",
-    "key",
-    "dtype",
-    "fmt",        # FIX v6.1.0: was "format" (canonical key is "fmt")
-    "required",
-    "source",
-    "notes",
+    "sheet", "group", "header", "key", "dtype", "fmt",  # v6.1.0: "format" → "fmt" (canonical)
+    "required", "source", "notes",
 ]
 
 _FALLBACK_CONTRACTS: Dict[str, Tuple[List[str], List[str]]] = {
@@ -914,30 +813,20 @@ _FALLBACK_CONTRACTS: Dict[str, Tuple[List[str], List[str]]] = {
 # Registry bridge (preferred source)
 # ---------------------------------------------------------------------------
 
-# FIX v6.1.0: multi-path fallback for schema_registry import
-# Try core.sheets.schema_registry → core.schema_registry → schema_registry (repo-root)
-_registry_get_sheet_headers = None  # type: ignore
-_registry_get_sheet_keys    = None  # type: ignore
-_registry_get_sheet_len     = None  # type: ignore
-_registry_list_sheets       = None  # type: ignore
-_HAS_SCHEMA_REGISTRY        = False
-
-for _sreg_path in ("core.sheets.schema_registry", "core.schema_registry", "schema_registry"):
-    try:
-        import importlib as _importlib
-        _sreg_mod = _importlib.import_module(_sreg_path)
-        _f_headers = getattr(_sreg_mod, "get_sheet_headers", None)
-        _f_keys    = getattr(_sreg_mod, "get_sheet_keys",    None)
-        if callable(_f_headers) and callable(_f_keys):
-            _registry_get_sheet_headers = _f_headers
-            _registry_get_sheet_keys    = _f_keys
-            _registry_get_sheet_len     = getattr(_sreg_mod, "get_sheet_len",  None)
-            _registry_list_sheets       = getattr(_sreg_mod, "list_sheets",    None)
-            _HAS_SCHEMA_REGISTRY        = True
-            break
-    except Exception:
-        continue
-del _sreg_path
+try:  # pragma: no cover
+    from core.sheets.schema_registry import (
+        get_sheet_headers as _registry_get_sheet_headers,
+        get_sheet_keys as _registry_get_sheet_keys,
+        get_sheet_len as _registry_get_sheet_len,
+        list_sheets as _registry_list_sheets,
+    )
+    _HAS_SCHEMA_REGISTRY = True
+except Exception:  # pragma: no cover
+    _registry_get_sheet_headers = None  # type: ignore
+    _registry_get_sheet_keys = None  # type: ignore
+    _registry_get_sheet_len = None  # type: ignore
+    _registry_list_sheets = None  # type: ignore
+    _HAS_SCHEMA_REGISTRY = False
 
 
 @lru_cache(maxsize=128)
@@ -1122,9 +1011,6 @@ FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "ps_ratio": ("ps",),
     "peg_ratio": ("peg",),
     "intrinsic_value": ("fair_value",),
-    "expected_roi_1m":  ("expected_roi_1m_pct",),   # FIX v6.1.0: UnifiedQuote uses _pct suffix
-    "expected_roi_3m":  ("expected_roi_3m_pct",),
-    "expected_roi_12m": ("expected_roi_12m_pct",),
     "top10_rank": ("rank_top10",),
 }
 
@@ -1354,15 +1240,18 @@ def validate_sheet_data(sheet_name: str, data: Mapping[str, Any]) -> Tuple[bool,
     canonical = resolve_sheet_key(sheet_name)
     headers, keys = get_sheet_contract(canonical)
 
+    # v6.1.0: updated to schema_registry v3.4.0 per-page column counts.
+    # OLD: ML=80, GM=80, CF=80, MF=80, MP=80, T10=83, IA=7, DD=9
+    # NEW: ML=99, GM=112, CF=86, MF=94, MP=110, T10=106, IA=9, DD=9
     expected = {
-        "Market_Leaders": 80,
-        "Global_Markets": 80,
-        "Commodities_FX": 80,
-        "Mutual_Funds": 80,
-        "My_Portfolio": 80,
-        "Top_10_Investments": 83,
-        "Insights_Analysis": 7,
-        "Data_Dictionary": 9,
+        "Market_Leaders":    99,
+        "Global_Markets":    112,
+        "Commodities_FX":    86,
+        "Mutual_Funds":      94,
+        "My_Portfolio":      110,
+        "Top_10_Investments":106,
+        "Insights_Analysis": 9,
+        "Data_Dictionary":   9,
     }[canonical]
 
     ok_headers, header_errors = validate_headers(headers, expected_len=expected)
@@ -1372,7 +1261,11 @@ def validate_sheet_data(sheet_name: str, data: Mapping[str, Any]) -> Tuple[bool,
     if canonical not in {"Insights_Analysis", "Data_Dictionary"}:
         required_fields = [keys[0] if keys else "symbol"]
         if canonical == "Top_10_Investments":
-            required_fields += ["top10_rank", "selection_reason", "criteria_snapshot"]
+            # v6.1.0: 7 required fields (was 3); added 4 trade setup from top10_selector v4.9.0
+            required_fields += [
+                "top10_rank", "selection_reason", "criteria_snapshot",
+                "entry_price", "stop_loss_suggested", "take_profit_suggested", "risk_reward_ratio",
+            ]
         for field in required_fields:
             if data.get(field) in (None, "", []):
                 errors.append(f"Missing required field: {field}")
