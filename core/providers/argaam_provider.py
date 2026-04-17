@@ -71,6 +71,7 @@ logger = logging.getLogger("core.providers.argaam_provider")
 PROVIDER_NAME = "argaam"
 PROVIDER_VERSION         = "4.6.0"
 VERSION = PROVIDER_VERSION
+PROVIDER_BATCH_SUPPORTED = True
 
 # ---------------------------------------------------------------------------
 # Config
@@ -796,6 +797,18 @@ class ArgaamClient:
             if patch.get("data_quality") == "GOOD":
                 patch["data_quality"] = "DEGRADED"
         return patch
+        
+    async def get_enriched_quotes_batch(self, symbols: List[str], *, mode: str = "") -> Dict[str, Dict[str, Any]]:
+        """Batch fetch implementation utilizing asyncio.gather on individual get_enriched_patch calls."""
+        tasks = [self.get_enriched_patch(sym) for sym in symbols]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        out = {}
+        for sym, res in zip(symbols, results):
+            if isinstance(res, Exception):
+                out[sym] = _error_patch(sym, f"batch_failed: {type(res).__name__}")
+            else:
+                out[sym] = res
+        return out
 
     async def close(self) -> None:
         try:
