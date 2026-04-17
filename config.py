@@ -55,7 +55,7 @@ import os
 import socket
 import threading
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import datacdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set
 
@@ -565,7 +565,6 @@ def auth_ok(
     allowed = [t for t in s.allowed_tokens if _strip(t)]
     if not allowed:
         # FIX v7.2.0: require_auth=True but no tokens configured → deny
-        # (v7.0.0 returned True here, which was an unsafe open fallback)
         return False
 
     candidates = _token_candidates(
@@ -583,7 +582,6 @@ def auth_ok(
         if not candidate:
             continue
         for allowed_token in allowed:
-            # FIX v7.2.0: constant-time comparison (was plain set membership)
             if _safe_compare_token(candidate, allowed_token):
                 return True
     return False
