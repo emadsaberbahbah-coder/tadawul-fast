@@ -336,7 +336,8 @@ jobs:
           }
 
           upper_underscore() {
-            echo "${1:-}" | tr '[:lower:]' '[:upper:]' | tr ',;|\n\r\t ' '      ' | tr ' -' '__' | tr -s '_' | xargs
+            # Convert to uppercase, map common delimiters to underscore, squeeze duplicates
+            echo "${1:-}" | tr '[:lower:]' '[:upper:]' | tr ',;|\n\r\t -' '________' | tr -s '_' | xargs
           }
 
           sanitize_keys() {
