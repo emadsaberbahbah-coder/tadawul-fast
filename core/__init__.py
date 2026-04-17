@@ -322,10 +322,10 @@ _ENGINE_CANDIDATES = [
 
 @dataclass
 class EngineInfo:
-    module_path:    Optional[str]      = None
+    module_path:     Optional[str]      = None
     get_engine_func: Optional[Callable] = None
-    engine_class:   Optional[Type]     = None
-    error:          Optional[str]      = None
+    engine_class:    Optional[Type]     = None
+    error:           Optional[str]      = None
 
 
 def _resolve_engine_info() -> EngineInfo:
