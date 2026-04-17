@@ -15,7 +15,7 @@ HORIZON-AWARE SCORING
 
   HORIZON_DAY   (≤5 days):  technical=50%, momentum=30%, quality=10%, opp=10%
   HORIZON_WEEK  (6-14 days): technical=25%, momentum=25%, valuation=20%,
-                              quality=20%, opportunity=10%
+                             quality=20%, opportunity=10%
   HORIZON_MONTH (15-90 days): valuation=30%, momentum=25%, quality=20%,
                               growth=15%, opportunity=10%  (unchanged from v2.4.0)
   HORIZON_LONG  (>90 days): valuation=35%, quality=25%, growth=20%,
@@ -313,7 +313,7 @@ class ScoreWeights:
     w_technical:  float = 0.00  # NEW v3.0.0 — non-zero only for day/week horizons
 
     # Penalty multipliers applied to the raw overall_score
-    risk_penalty_strength:       float = 0.55
+    risk_penalty_strength:        float = 0.55
     confidence_penalty_strength: float = 0.45
 
 
@@ -1374,7 +1374,7 @@ def compute_scores(row: Dict[str, Any], *, settings: Any = None) -> Dict[str, An
         risk01       = (risk   / 100.0) if risk   is not None else 0.50
         conf01_used  = conf01           if conf01 is not None else 0.55
 
-        risk_pen = _clamp(1.0 - weights.risk_penalty_strength       * (risk01        * 0.70), 0.0, 1.0)
+        risk_pen = _clamp(1.0 - weights.risk_penalty_strength       * (risk01         * 0.70), 0.0, 1.0)
         conf_pen = _clamp(1.0 - weights.confidence_penalty_strength * ((1.0 - conf01_used) * 0.80), 0.0, 1.0)
         penalty_factor = _round(risk_pen * conf_pen, 4)
 
