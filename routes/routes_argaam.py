@@ -7,7 +7,7 @@ Argaam Routes — v2.0.0 (PROMETHEUS-SAFE / STARTUP-SAFE / CORE-CONFIG-ALIGNED)
 
 Why this router exists:
 - ✅ Exposes lightweight Argaam debug endpoints (single-symbol + batch) without
-  interfering with Phase 3 schema-driven sheet-rows endpoints.
+     interfering with Phase 3 schema-driven sheet-rows endpoints.
 - ✅ Startup-safe: NO network calls at import-time; provider imports are lazy.
 - ✅ Prometheus-safe: NO prometheus_client metric creation here (prevents duplicate timeseries).
 - ✅ Auth aligned with core.config (best-effort; secure fallback if missing).
