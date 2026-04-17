@@ -386,7 +386,7 @@ def _static_contract(page: str) -> Tuple[List[str], List[str]]:
 
 
 def _extract_contract_from_schema(page: str) -> Tuple[List[str], List[str]]:
-    for module_name in ("core.sheets.schema_registry", "core.schema_registry", "schema_registry"):  # FIX v8.4.0: multi-path
+    for module_name in ("core.sheets.schema_registry", "core.schema_registry", "schema_registry"):
         try:
             mod = importlib.import_module(module_name)
             get_sheet_spec = getattr(mod, "get_sheet_spec", None)
