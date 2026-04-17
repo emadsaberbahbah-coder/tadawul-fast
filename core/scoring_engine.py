@@ -392,7 +392,7 @@ class ScoringEngine:
             try:
                 native_kwargs: Dict[str, Any] = {}
                 if settings is not None:         native_kwargs["settings"]  = settings
-                if weights is not None:           native_kwargs["weights"]   = weights
+                if weights is not None:          native_kwargs["weights"]   = weights
                 if self.forecast_parameters is not None:
                     native_kwargs["forecasts"] = self.forecast_parameters
                 self._native_engine = NativeEngine(**native_kwargs)
