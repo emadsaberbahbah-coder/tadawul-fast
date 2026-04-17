@@ -682,7 +682,35 @@ def build_data_dictionary_payload(
         include_meta_sheet=include_meta_sheet,
     )
     rows_matrix = [[row.get(k) for k in keys] for row in rows]
+    
     return {
         "kind":            DATA_DICTIONARY_OUTPUT_KIND,
         "sheet":           DATA_DICTIONARY_SHEET_NAME,
-        "page":            DATA_DICTIONARY_SHEET
+        "page":            DATA_DICTIONARY_SHEET_NAME,
+        "sheet_name":      DATA_DICTIONARY_SHEET_NAME,
+        "format":          "rows",
+        "headers":         headers,
+        "display_headers": headers,
+        "keys":            keys,
+        "rows":            rows,
+        "row_objects":     rows,
+        "rows_matrix":     rows_matrix,
+        "count":           len(rows),
+        "version":         DATA_DICTIONARY_VERSION,
+        "schema_version":  SCHEMA_VERSION,
+    }
+
+
+def validate_data_dictionary_output(payload: Any) -> bool:
+    """Validate if a given payload matches the dictionary structure."""
+    return is_data_dictionary_payload(payload) and isinstance(payload, dict) and ("rows" in payload or "values" in payload)
+
+
+def validate_data_dictionary_values(values: Any) -> bool:
+    """Validate if a 2D array matches dictionary expectations."""
+    return isinstance(values, list) and (not values or isinstance(values[0], list))
+
+
+def is_data_dictionary_payload(payload: Any) -> bool:
+    """Check if dict is flagged as a data dictionary output kind."""
+    return isinstance(payload, dict) and payload.get("kind") == DATA_DICTIONARY_OUTPUT_KIND
