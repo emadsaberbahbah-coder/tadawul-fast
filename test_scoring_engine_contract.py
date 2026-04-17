@@ -26,7 +26,7 @@ import os
 import sys
 import time
 import unittest
-from typing import Any, Dict
+from typing import Any
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +79,7 @@ def _to_float(x: Any, default: float = 0.0) -> float:
         return default
 
 
-def _as_dict(obj: Any) -> Dict[str, Any]:
+def _as_dict(obj: Any) -> dict[str, Any]:
     """
     Robust object->dict conversion:
     - dict
