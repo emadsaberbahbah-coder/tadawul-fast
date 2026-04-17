@@ -75,8 +75,8 @@ def scoring():
 # Canonical vocabulary constants
 # =============================================================================
 VALID_RECOMMENDATIONS = {"STRONG_BUY", "BUY", "HOLD", "REDUCE", "SELL", "STRONG_SELL"}
-VALID_RISK_BUCKETS     = {"Low", "Moderate", "High"}
-VALID_CONF_BUCKETS     = {"Low", "Medium", "High"}
+VALID_RISK_BUCKETS      = {"Low", "Moderate", "High"}
+VALID_CONF_BUCKETS      = {"Low", "Medium", "High"}
 
 # Fields that must exist in every compute_scores() output
 REQUIRED_OUTPUT_KEYS = {
