@@ -1,5 +1,4 @@
-from __future__ import annotations
-
+#!/usr/bin/env python3
 """
 routes/top10_investments.py
 ===============================================================================
@@ -631,9 +630,9 @@ def _dedupe_by_symbol_best(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any
         symbol = _safe_text(row.get("symbol")) or _safe_text(row.get("name"))
         if not symbol:
             continue
-        current       = best.get(symbol)
-        current_score = _to_float(current.get("_blended_score")) if current else None
-        row_score     = _to_float(row.get("_blended_score"))
+        current        = best.get(symbol)
+        current_score  = _to_float(current.get("_blended_score")) if current else None
+        row_score      = _to_float(row.get("_blended_score"))
         if current is None or (
             (row_score if row_score is not None else float("-inf"))
             > (current_score if current_score is not None else float("-inf"))
@@ -791,8 +790,7 @@ async def _build_top10_from_request(req: Top10Request) -> Dict[str, Any]:
             meta["candidate_rows"]  = len(filtered_engine_rows)
             return _build_envelope(top_rows, meta=meta, include_validation=req.include_validation)
 
-    candidate_rows: List[Dict[str, Any]] = {}  # type: ignore[assignment]
-    candidate_rows = []
+    candidate_rows: List[Dict[str, Any]] = []
     per_page_fetch_meta: Dict[str, Any] = {}
 
     for page in source_pages:
