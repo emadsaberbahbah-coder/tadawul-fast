@@ -1,43 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-# core/analysis/top10_selector.py
 """
+core/analysis/top10_selector.py
 ================================================================================
-Top 10 Selector -- v5.1.0
+Top 10 Selector — v4.8.0
 ================================================================================
-LIVE * SCHEMA-FIRST * ROUTE-COMPATIBLE * ENGINE-SELF-RESOLVING * JSON-SAFE
-TOP10-METADATA GUARANTEED * SOURCE-PAGE SAFE * SNAPSHOT FALLBACK SAFE
-SYNC+ASYNC CALLER TOLERANT * DISPLAY-HEADER TOLERANT * WRAPPER-PAYLOAD SAFE
-PARTIAL-DEGRADATION SAFE * DIRECT-SYMBOLS SAFE * TIMEOUT-GUARDED
-RECOMMENDATION-NORMALIZED * SELECTOR-WEIGHTS DOCUMENTED
+LIVE • SCHEMA-FIRST • ROUTE-COMPATIBLE • ENGINE-SELF-RESOLVING • JSON-SAFE
+TOP10-METADATA GUARANTEED • SOURCE-PAGE SAFE • SNAPSHOT FALLBACK SAFE
+SYNC+ASYNC CALLER TOLERANT • DISPLAY-HEADER TOLERANT • WRAPPER-PAYLOAD SAFE
+PARTIAL-DEGRADATION SAFE • DIRECT-SYMBOLS SAFE • TIMEOUT-GUARDED
 
-v5.1.0 changes vs v5.0.0 (schema_registry v3.0.0 alignment)
--------------------------------------------------------------
-FIX: _load_schema_defaults() uses get_sheet_keys() / get_sheet_headers() from
-  schema_registry v3.0.0 directly. Top_10_Investments = 83 cols confirmed.
-  Logs warning if column count differs. Falls back to hardcoded defaults.
-
-FIX: _collect_criteria_from_inputs() accepts criteria_model v1.1.0 field names:
-    min_expected_roi_pct  (was min_roi / min_expected_roi -- both still accepted)
-    required_return_pct   (was required_return -- still accepted)
-    invest_period_days    (was investment_period_days -- both accepted)
-  All old names still work; normalization is fully backward-compatible.
-
-FIX: _criteria_signature() resolves min_expected_roi from all accepted aliases.
-
-FIX: Schema import block imports get_sheet_keys / get_sheet_headers alongside
-  get_sheet_spec. Falls back gracefully if schema_registry unavailable.
-
-v5.0.0 changes (preserved)
----------------------------
-FIX CRITICAL: Fallback _normalize_recommendation_label() now returns canonical
-  uppercase codes: STRONG_BUY / BUY / HOLD / REDUCE / SELL.
-FIX: "AVOID" -> "SELL". Unknown labels -> "HOLD" (not raw passthrough).
-FIX: Import chain: reco_normalize -> core.scoring -> local fallback.
-FIX: Normalization applied in _normalize_candidate_row and _rank_and_project_rows.
-FIX: Deterministic criteria signatures with sorted symbols.
-ENH: SelectorScoreWeights dataclass (env-overridable weights).
-ENH: _selector_score() explicitly separated from core.scoring layer.
+Why v4.8.0
+----------
+- FIX: recognizes singular wrapper payloads like `quote`, `record`, and `item`
+  in addition to plural envelopes, so valid single-row results are not dropped.
+- FIX: lets sparse live page rows merge with snapshot rows instead of choosing
+  one or the other, improving resilience when one source is only partially filled.
+- FIX: allows Top10 output-page fallback to supplement sparse candidate pools,
+  not only completely empty pools, reducing zero-row or under-filled results.
+- FIX: preserves direct-symbol intent during final selection when the ranked
+  result set is smaller than the requested limit.
+- FIX: retains the earlier protections around signature-safe retries, wrapper
+  payload safety, partial degradation, and emergency symbol fallback.
 """
 
 from __future__ import annotations
@@ -52,14 +36,13 @@ import os
 import re
 import sys
 import time
-from dataclasses import asdict, dataclass
 from decimal import Decimal
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 logger = logging.getLogger("core.analysis.top10_selector")
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "5.1.0"
+TOP10_SELECTOR_VERSION = "4.9.0"
 OUTPUT_PAGE = "Top_10_Investments"
 
 DEFAULT_SOURCE_PAGES = [
@@ -79,54 +62,102 @@ DERIVED_OR_NON_SOURCE_PAGES = {
     "Data_Dictionary",
 }
 
+# v4.9.0: added trade setup fields (entry/stop/target/R/R)
 TOP10_REQUIRED_FIELDS = (
     "top10_rank",
     "selection_reason",
     "criteria_snapshot",
+    "entry_price",
+    "stop_loss_suggested",
+    "take_profit_suggested",
+    "risk_reward_ratio",
 )
 
 TOP10_REQUIRED_HEADERS = {
-    "top10_rank": "Top10 Rank",
-    "selection_reason": "Selection Reason",
-    "criteria_snapshot": "Criteria Snapshot",
+    "top10_rank":            "Top 10 Rank",
+    "selection_reason":      "Selection Reason",
+    "criteria_snapshot":     "Criteria Snapshot",
+    "entry_price":           "Entry Price",
+    "stop_loss_suggested":   "Stop Loss (AI)",
+    "take_profit_suggested": "Take Profit (AI)",
+    "risk_reward_ratio":     "Risk/Reward",
 }
 
+# v4.9.0: Updated to 106 cols = Market_Leaders(99) + top10(3) + trade_setup(4)
 DEFAULT_FALLBACK_KEYS = [
+    # Identity (8)
     "symbol", "name", "asset_class", "exchange", "currency", "country", "sector", "industry",
+    # Price (11)
     "current_price", "previous_close", "open_price", "day_high", "day_low",
-    "week_52_high", "week_52_low", "price_change", "percent_change", "week_52_position_pct",
-    "volume", "avg_volume_10d", "avg_volume_30d", "market_cap", "float_shares", "beta_5y",
-    "pe_ttm", "pe_forward", "eps_ttm", "dividend_yield", "payout_ratio", "revenue_ttm",
-    "revenue_growth_yoy", "gross_margin", "operating_margin", "profit_margin", "debt_to_equity",
-    "free_cash_flow_ttm", "rsi_14", "volatility_30d", "volatility_90d", "max_drawdown_1y",
-    "var_95_1d", "sharpe_1y", "risk_score", "risk_bucket", "pb_ratio", "ps_ratio", "ev_ebitda",
-    "peg_ratio", "intrinsic_value", "valuation_score", "forecast_price_1m", "forecast_price_3m",
-    "forecast_price_12m", "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
-    "forecast_confidence", "confidence_score", "confidence_bucket", "value_score", "quality_score",
-    "momentum_score", "growth_score", "overall_score", "opportunity_score", "rank_overall",
-    "recommendation", "recommendation_reason", "horizon_days", "invest_period_label",
-    "position_qty", "avg_cost", "position_cost", "position_value", "unrealized_pl",
-    "unrealized_pl_pct", "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
+    "week_52_high", "week_52_low", "price_change", "percent_change",
+    "week_52_position_pct", "price_change_5d",
+    # Volume (6)
+    "volume", "avg_volume_10d", "avg_volume_30d", "market_cap", "float_shares", "volume_ratio",
+    # Fundamentals equity (13)
+    "beta_5y", "pe_ttm", "pe_forward", "eps_ttm", "dividend_yield", "payout_ratio",
+    "revenue_ttm", "revenue_growth_yoy", "gross_margin", "operating_margin",
+    "profit_margin", "debt_to_equity", "free_cash_flow_ttm",
+    # Fundamentals quality (2)
+    "roe", "roa",
+    # Risk (8)
+    "rsi_14", "volatility_30d", "volatility_90d", "max_drawdown_1y",
+    "var_95_1d", "sharpe_1y", "risk_score", "risk_bucket",
+    # Technicals (4)
+    "rsi_signal", "technical_score", "day_range_position", "atr_14",
+    # Valuation (7)
+    "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio",
+    "intrinsic_value", "valuation_score", "upside_pct",
+    # Forecast (9)
+    "forecast_price_1m", "forecast_price_3m", "forecast_price_12m",
+    "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
+    "forecast_confidence", "confidence_score", "confidence_bucket",
+    # Scores (6)
+    "value_score", "quality_score", "momentum_score", "growth_score",
+    "overall_score", "opportunity_score",
+    # Decision (8)
+    "analyst_rating", "target_price", "upside_downside_pct",
+    "recommendation", "signal", "trend_1m", "trend_3m", "trend_12m",
+    # Recommendation new (4)
+    "short_term_signal", "recommendation_reason", "invest_period_label", "horizon_days",
+    # Rank
+    "rank_overall",
+    # Portfolio light (6)
+    "position_qty", "avg_cost", "position_cost", "position_value",
+    "unrealized_pl", "unrealized_pl_pct",
+    # Provenance (4)
+    "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
+    # Top10 extras (3) + trade setup (4)
     "top10_rank", "selection_reason", "criteria_snapshot",
+    "entry_price", "stop_loss_suggested", "take_profit_suggested", "risk_reward_ratio",
 ]
 
+# v4.9.0: 106 headers matching DEFAULT_FALLBACK_KEYS
 DEFAULT_FALLBACK_HEADERS = [
     "Symbol", "Name", "Asset Class", "Exchange", "Currency", "Country", "Sector", "Industry",
     "Current Price", "Previous Close", "Open", "Day High", "Day Low", "52W High", "52W Low",
-    "Price Change", "Percent Change", "52W Position %", "Volume", "Avg Volume 10D",
-    "Avg Volume 30D", "Market Cap", "Float Shares", "Beta (5Y)", "P/E (TTM)", "P/E (Forward)",
-    "EPS (TTM)", "Dividend Yield", "Payout Ratio", "Revenue (TTM)", "Revenue Growth YoY",
-    "Gross Margin", "Operating Margin", "Profit Margin", "Debt/Equity", "Free Cash Flow (TTM)",
-    "RSI (14)", "Volatility 30D", "Volatility 90D", "Max Drawdown 1Y", "VaR 95% (1D)",
-    "Sharpe (1Y)", "Risk Score", "Risk Bucket", "P/B", "P/S", "EV/EBITDA", "PEG",
-    "Intrinsic Value", "Valuation Score", "Forecast Price 1M", "Forecast Price 3M",
-    "Forecast Price 12M", "Expected ROI 1M", "Expected ROI 3M", "Expected ROI 12M",
-    "Forecast Confidence", "Confidence Score", "Confidence Bucket", "Value Score", "Quality Score",
-    "Momentum Score", "Growth Score", "Overall Score", "Opportunity Score", "Rank (Overall)",
-    "Recommendation", "Recommendation Reason", "Horizon Days", "Invest Period Label",
-    "Position Qty", "Avg Cost", "Position Cost", "Position Value", "Unrealized P/L",
-    "Unrealized P/L %", "Data Provider", "Last Updated (UTC)", "Last Updated (Riyadh)",
-    "Warnings", "Top10 Rank", "Selection Reason", "Criteria Snapshot",
+    "Price Change", "Change %", "52W Position %", "5D Change %",
+    "Volume", "Avg Vol 10D", "Avg Vol 30D", "Market Cap", "Float Shares", "Volume Ratio",
+    "Beta (5Y)", "P/E (TTM)", "P/E (Fwd)", "EPS (TTM)", "Div Yield %", "Payout Ratio %",
+    "Revenue TTM", "Rev Growth YoY %", "Gross Margin %", "Op Margin %",
+    "Net Margin %", "D/E Ratio", "FCF (TTM)",
+    "ROE %", "ROA %",
+    "RSI (14)", "Volatility 30D %", "Volatility 90D %", "Max DD 1Y %",
+    "VaR 95% (1D)", "Sharpe (1Y)", "Risk Score", "Risk Bucket",
+    "RSI Signal", "Tech Score", "Day Range Pos %", "ATR 14",
+    "P/B", "P/S", "EV/EBITDA", "PEG Ratio", "Intrinsic Value", "Valuation Score", "Upside %",
+    "Price Tgt 1M", "Price Tgt 3M", "Price Tgt 12M",
+    "ROI 1M %", "ROI 3M %", "ROI 12M %",
+    "AI Confidence", "Confidence Score", "Confidence",
+    "Value Score", "Quality Score", "Momentum Score", "Growth Score",
+    "Overall Score", "Opportunity Score",
+    "Analyst Rating", "Target Price", "Upside/Downside %",
+    "Recommendation", "Signal", "Trend 1M", "Trend 3M", "Trend 12M",
+    "ST Signal", "Reason", "Horizon", "Horizon Days",
+    "Rank (Overall)",
+    "Qty", "Avg Cost", "Position Cost", "Position Value", "Unrealized P/L", "Unrealized P/L %",
+    "Data Provider", "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
+    "Top 10 Rank", "Selection Reason", "Criteria Snapshot",
+    "Entry Price", "Stop Loss (AI)", "Take Profit (AI)", "Risk/Reward",
 ]
 
 ROW_KEY_ALIASES: Dict[str, Tuple[str, ...]] = {
@@ -215,9 +246,32 @@ ROW_KEY_ALIASES: Dict[str, Tuple[str, ...]] = {
     "top10_rank": ("top10_rank", "rank"),
     "criteria_snapshot": ("criteria_snapshot", "criteria_json"),
     "source_page": ("source_page", "page", "sheet", "sheet_name"),
+    # ── v4.9.0 new schema_registry v3.4.0 fields ─────────────────────────────
+    "price_change_5d":     ("price_change_5d", "change5d", "five_day_change"),
+    "volume_ratio":        ("volume_ratio", "vol_ratio"),
+    "roe":                 ("roe", "return_on_equity", "returnOnEquity"),
+    "roa":                 ("roa", "return_on_assets", "returnOnAssets"),
+    "rsi_signal":          ("rsi_signal", "rsiSignal"),
+    "technical_score":     ("technical_score", "tech_score", "technicalScore"),
+    "day_range_position":  ("day_range_position", "dayRangePosition"),
+    "atr_14":              ("atr_14", "atr"),
+    "upside_pct":          ("upside_pct", "upside_percent"),
+    "short_term_signal":   ("short_term_signal", "st_signal", "shortTermSignal"),
+    "analyst_rating":      ("analyst_rating", "analyst_consensus"),
+    "target_price":        ("target_price", "wall_st_target"),
+    "upside_downside_pct": ("upside_downside_pct", "upside_to_target_pct"),
+    "signal":              ("signal", "trade_signal"),
+    "trend_1m":            ("trend_1m",),
+    "trend_3m":            ("trend_3m",),
+    "trend_12m":           ("trend_12m",),
+    # ── trade setup ───────────────────────────────────────────────────────────
+    "entry_price":           ("entry_price", "entryPrice", "suggested_entry"),
+    "stop_loss_suggested":   ("stop_loss_suggested", "stopLossSuggested", "ai_stop_loss"),
+    "take_profit_suggested": ("take_profit_suggested", "takeProfitSuggested", "ai_take_profit"),
+    "risk_reward_ratio":     ("risk_reward_ratio", "riskRewardRatio", "rr_ratio"),
 }
 
-CANONICAL_KEY_SET = set(DEFAULT_FALLBACK_KEYS)
+CANONICAL_KEY_SET = set(DEFAULT_FALLBACK_KEYS)  # v4.9.0: 106 keys
 WRAPPER_KEYS = {
     "status", "page", "sheet", "sheet_name", "route_family", "headers", "display_headers", "sheet_headers",
     "column_headers", "keys", "columns", "fields", "rows", "rows_matrix", "matrix", "row_objects", "records",
@@ -266,179 +320,15 @@ EMERGENCY_SYMBOLS = [
 
 # =============================================================================
 # Optional schema/page catalog
-
-# ---------------------------------------------------------------------------
-# Recommendation normalization -- import chain with fallback.
-# FIX v5.0.0: v4.8.0 had no normalization. This is the single authoritative
-# normalization point. Chain: reco_normalize -> core.scoring -> local fallback.
-# ---------------------------------------------------------------------------
-
-_RECO_FALLBACK_MAP: Dict[str, str] = {
-    "STRONG_BUY": "STRONG_BUY", "STRONGBUY": "STRONG_BUY", "STRONG BUY": "STRONG_BUY",
-    "CONVICTION_BUY": "STRONG_BUY", "TOP_PICK": "STRONG_BUY", "MUST_BUY": "STRONG_BUY",
-    "BUY": "BUY", "ACCUMULATE": "BUY", "ADD": "BUY", "OUTPERFORM": "BUY",
-    "MARKET_OUTPERFORM": "BUY", "OVERWEIGHT": "BUY", "UPGRADE": "BUY",
-    "SPECULATIVE_BUY": "BUY", "BULLISH": "BUY", "POSITIVE": "BUY",
-    "HOLD": "HOLD", "NEUTRAL": "HOLD", "MAINTAIN": "HOLD", "MARKET_PERFORM": "HOLD",
-    "EQUAL_WEIGHT": "HOLD", "IN_LINE": "HOLD", "WATCH": "HOLD", "FAIR_VALUE": "HOLD",
-    "REDUCE": "REDUCE", "TRIM": "REDUCE", "LIGHTEN": "REDUCE",
-    "UNDERWEIGHT": "REDUCE", "TAKE_PROFIT": "REDUCE", "TAKE_PROFITS": "REDUCE",
-    "SELL": "SELL", "AVOID": "SELL", "EXIT": "SELL", "UNDERPERFORM": "SELL",
-    "MARKET_UNDERPERFORM": "SELL", "SHORT": "SELL", "BEARISH": "SELL",
-    "STRONG_SELL": "SELL", "LIQUIDATE": "SELL",
-}
-
-
-def _normalize_reco_fallback(label: Any) -> str:
-    """Local fallback: returns canonical codes. Defaults to HOLD for unknowns."""
-    if label is None:
-        return "HOLD"
-    s = str(label).strip()
-    if not s or s.lower() in {"none", "null", ""}:
-        return "HOLD"
-    probe = s.upper().replace("-", "_").replace(" ", "_")
-    while "__" in probe:
-        probe = probe.replace("__", "_")
-    return _RECO_FALLBACK_MAP.get(probe, "HOLD")
-
-
-# Build import chain at module load: reco_normalize -> scoring -> local fallback
-_normalize_recommendation_label = _normalize_reco_fallback
-
+# =============================================================================
 try:
-    from core.reco_normalize import normalize_recommendation as _normalize_recommendation_label  # type: ignore
+    from core.sheets.schema_registry import get_sheet_spec as _get_sheet_spec  # type: ignore
 except Exception:
-    try:
-        from core.scoring import normalize_recommendation_label as _normalize_recommendation_label  # type: ignore
-    except Exception:
-        pass  # keep local fallback
-
-
-@dataclass(slots=True)
-class SelectorScoreWeights:
-    """
-    Weights for the Top10 SELECTION score (separate from core.scoring layer).
-    ROI is a fraction multiplied by 100 in _selector_score for scale alignment.
-    Weights are additive-only-when-present, not normalized to sum=1.0.
-    Override any weight via TOP10_SELECTOR_W_<FIELD_NAME_UPPER> env var.
-    """
-    overall:      float = 0.35
-    opportunity:  float = 0.20
-    roi:          float = 0.20
-    risk_inverted: float = 0.08
-    value:        float = 0.08
-    quality:      float = 0.08
-    momentum:     float = 0.08
-    growth:       float = 0.08
-    confidence:   float = 0.08
-    liquidity:    float = 0.05
-    row_richness: float = 0.03
-
-
-_ENGINE_CACHE: Optional[Any] = None
-_ENGINE_CACHE_SOURCE: str = ""
-_ENGINE_LOCK = asyncio.Lock()
+    _get_sheet_spec = None  # type: ignore
 
 try:
     from core.sheets.page_catalog import normalize_page_name as _normalize_page_name  # type: ignore
 except Exception:
-    _normalize_page_name = None  # type: ignore
-
-
-# =============================================================================
-# Basic helpers
-# =============================================================================
-def _s(v: Any) -> str:
-    try:
-        if v is None:
-            return ""
-        s = str(v).strip()
-        return "" if s.lower() in {"none", "null", "nil"} else s
-    except Exception:
-        return ""
-
-
-def _is_blank(v: Any) -> bool:
-    return v is None or (isinstance(v, str) and not v.strip())
-
-
-def _safe_int(v: Any, default: int) -> int:
-    try:
-        if isinstance(v, bool):
-            return default
-        return int(float(v))
-    except Exception:
-        return default
-
-
-def _safe_float(v: Any, default: Optional[float] = None) -> Optional[float]:
-    try:
-        if v is None or isinstance(v, bool):
-            return default
-        if isinstance(v, (int, float)):
-            f = float(v)
-            if math.isnan(f) or math.isinf(f):
-                return default
-            return f
-        s = _s(v).replace(",", "")
-        if not s:
-            return default
-        if s.endswith("%"):
-            f = float(s[:-1].strip()) / 100.0
-        else:
-            f = float(s)
-        if math.isnan(f) or math.isinf(f):
-            return default
-        return f
-    except Exception:
-        return default
-
-
-def _selector_weights_from_env() -> SelectorScoreWeights:
-    base = SelectorScoreWeights()
-    for field_name in base.__dataclass_fields__.keys():
-        env_name = f"TOP10_SELECTOR_W_{field_name.upper()}"
-        try:
-            value = float(os.getenv(env_name, str(getattr(base, field_name))).strip())
-            if not math.isnan(value) and not math.isinf(value) and value >= 0.0:
-                setattr(base, field_name, value)
-        except Exception:
-            continue
-    return base
-
-
-SELECTOR_WEIGHTS = _selector_weights_from_env()
-
-# =============================================================================
-# Optional schema / page catalog
-# v5.1.0: extended to import get_sheet_keys / get_sheet_headers directly.
-# =============================================================================
-_get_sheet_spec    = None  # type: ignore
-_get_sheet_keys    = None  # type: ignore
-_get_sheet_headers = None  # type: ignore
-
-try:
-    from core.sheets.schema_registry import (  # type: ignore
-        get_sheet_spec    as _get_sheet_spec,
-        get_sheet_keys    as _get_sheet_keys,
-        get_sheet_headers as _get_sheet_headers,
-    )
-except ImportError:
-    try:
-        from schema_registry import (  # type: ignore
-            get_sheet_spec    as _get_sheet_spec,
-            get_sheet_keys    as _get_sheet_keys,
-            get_sheet_headers as _get_sheet_headers,
-        )
-    except Exception:
-        pass
-except Exception:
-    pass
-
-try:
-    from core.sheets.page_catalog import normalize_page_name as _normalize_page_name  # type: ignore
-except Exception:
-    _normalize_page_name = None  # type: ignore
     _normalize_page_name = None  # type: ignore
 
 
@@ -891,30 +781,6 @@ def _ensure_top10_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple
 
 
 def _load_schema_defaults() -> Tuple[List[str], List[str]]:
-    """
-    Load Top_10_Investments column keys and headers.
-    v5.1.0: Uses get_sheet_keys() / get_sheet_headers() from schema_registry
-    directly (simpler than parsing get_sheet_spec() column objects).
-    Expected: 83 columns. Logs warning if count differs.
-    Falls back to DEFAULT_FALLBACK_KEYS / HEADERS if registry unavailable.
-    """
-    # Primary: schema_registry v3.0.0 direct accessors
-    if callable(_get_sheet_keys) and callable(_get_sheet_headers):
-        try:
-            keys    = _get_sheet_keys(OUTPUT_PAGE)
-            headers = _get_sheet_headers(OUTPUT_PAGE)
-            if keys and headers and len(keys) == len(headers):
-                headers, keys = _ensure_top10_contract(list(headers), list(keys))
-                if len(keys) != 83:
-                    logger.warning(
-                        "_load_schema_defaults: %s has %d cols, expected 83.",
-                        OUTPUT_PAGE, len(keys),
-                    )
-                return list(headers), list(keys)
-        except Exception as exc:
-            logger.debug("_load_schema_defaults get_sheet_keys failed: %s", exc)
-
-    # Secondary: get_sheet_spec legacy path
     if callable(_get_sheet_spec):
         try:
             spec = _get_sheet_spec(OUTPUT_PAGE)
@@ -922,12 +788,12 @@ def _load_schema_defaults() -> Tuple[List[str], List[str]]:
             if keys:
                 headers, keys = _ensure_top10_contract(headers, keys)
                 return list(headers), list(keys)
-        except Exception as exc:
-            logger.debug("_load_schema_defaults get_sheet_spec failed: %s", exc)
-
-    # Fallback: hardcoded defaults
+        except Exception:
+            pass
     headers, keys = _ensure_top10_contract(DEFAULT_FALLBACK_HEADERS, DEFAULT_FALLBACK_KEYS)
     return list(headers), list(keys)
+
+
 # =============================================================================
 # Engine detection / resolution
 # =============================================================================
@@ -1437,26 +1303,6 @@ def _collect_symbol_keys_from_mapping(mapping: Mapping[str, Any]) -> List[str]:
     return _dedupe_keep_order(out)
 
 
-
-# =============================================================================
-# Criteria normalization
-# =============================================================================
-def _merge_mapping_like(*parts: Any) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for part in parts:
-        if isinstance(part, Mapping):
-            out.update(dict(part))
-    return out
-
-
-def _collect_symbol_keys_from_mapping(mapping: Mapping[str, Any]) -> List[str]:
-    out: List[str] = []
-    for k, v in mapping.items():
-        if isinstance(v, Mapping) and _looks_like_symbol_token(k):
-            out.append(_normalize_symbol(k))
-    return _dedupe_keep_order(out)
-
-
 def _collect_criteria_from_inputs(*args: Any, **kwargs: Any) -> Dict[str, Any]:
     positional_maps = [arg for arg in args if isinstance(arg, Mapping)]
     body = _merge_mapping_like(
@@ -1480,15 +1326,11 @@ def _collect_criteria_from_inputs(*args: Any, **kwargs: Any) -> Dict[str, Any]:
             criteria.setdefault(k, v)
 
     for k in (
-        "pages_selected", "pages", "selected_pages", "sources", "page", "page_name",
-        "sheet", "sheet_name", "symbols", "tickers", "direct_symbols", "top_n", "limit",
-        "risk_level", "risk_profile", "confidence_bucket", "confidence_level",
-        "invest_period_days", "investment_period_days",    # both accepted
-        "horizon_days", "invest_period_label",
-        "min_expected_roi", "min_expected_roi_pct",        # FIX v5.1.0: new alias
-        "min_roi", "required_return_pct",                  # FIX v5.1.0: new alias
-        "min_confidence", "min_ai_confidence",
-        "max_risk_score", "min_volume", "enrich_final", "schema_only",
+        "pages_selected", "pages", "selected_pages", "sources", "page", "page_name", "sheet", "sheet_name",
+        "symbols", "tickers", "direct_symbols", "top_n", "limit", "risk_level", "risk_profile",
+        "confidence_bucket", "confidence_level", "invest_period_days", "investment_period_days",
+        "horizon_days", "invest_period_label", "min_expected_roi", "min_roi", "min_confidence",
+        "min_ai_confidence", "max_risk_score", "min_volume", "enrich_final", "schema_only",
         "headers_only", "include_headers", "include_matrix", "mode", "emergency_symbols",
     ):
         if kwargs.get(k) is not None:
@@ -1508,9 +1350,7 @@ def _collect_criteria_from_inputs(*args: Any, **kwargs: Any) -> Dict[str, Any]:
     if not pages:
         pages = _safe_source_pages(DEFAULT_SOURCE_PAGES)
 
-    direct_symbols = _normalize_list(
-        criteria.get("direct_symbols") or criteria.get("symbols") or criteria.get("tickers")
-    )
+    direct_symbols = _normalize_list(criteria.get("direct_symbols") or criteria.get("symbols") or criteria.get("tickers"))
     if not direct_symbols and isinstance(body, Mapping):
         direct_symbols = _collect_symbol_keys_from_mapping(body)
     direct_symbols = [_normalize_symbol(s) for s in direct_symbols if _normalize_symbol(s)]
@@ -1522,102 +1362,40 @@ def _collect_criteria_from_inputs(*args: Any, **kwargs: Any) -> Dict[str, Any]:
     limit = max(1, min(limit, MAX_LIMIT))
 
     horizon_days = _safe_int(
-        criteria.get("horizon_days")
-        or criteria.get("invest_period_days")
-        or criteria.get("investment_period_days"),
+        criteria.get("horizon_days") or criteria.get("invest_period_days") or criteria.get("investment_period_days"),
         90,
     )
 
-    risk_level        = _s(criteria.get("risk_level")        or criteria.get("risk_profile")       or "").lower()
-    confidence_bucket = _s(criteria.get("confidence_bucket") or criteria.get("confidence_level")   or "").lower()
+    risk_level = _s(criteria.get("risk_level") or criteria.get("risk_profile") or "").lower()
+    confidence_bucket = _s(criteria.get("confidence_bucket") or criteria.get("confidence_level") or "").lower()
 
-    # FIX v5.1.0: accept new criteria_model v1.1.0 field names alongside old names
-    min_roi = (
-        criteria.get("min_expected_roi")
-        or criteria.get("min_expected_roi_pct")
-        or criteria.get("min_roi")
-        or criteria.get("required_return_pct")
-    )
+    min_roi = criteria.get("min_expected_roi")
+    if min_roi is None:
+        min_roi = criteria.get("min_roi")
     min_roi_ratio = _safe_ratio(min_roi, None)
 
     normalized = dict(criteria)
-    normalized["pages_selected"]      = pages
-    normalized["direct_symbols"]      = direct_symbols
+    normalized["pages_selected"] = pages
+    normalized["direct_symbols"] = direct_symbols
     normalized["direct_symbol_order"] = list(direct_symbols)
-    normalized["emergency_symbols"]   = emergency_symbols
-    normalized["limit"]               = limit
-    normalized["top_n"]               = limit
-    normalized["risk_level"]          = risk_level
-    normalized["risk_profile"]        = risk_level
-    normalized["confidence_bucket"]   = confidence_bucket
-    normalized["confidence_level"]    = confidence_bucket
-    normalized["horizon_days"]        = horizon_days
-    normalized["invest_period_days"]  = horizon_days
-    normalized["min_expected_roi"]    = min_roi_ratio
-    normalized["min_roi"]             = min_roi_ratio
-    normalized["schema_only"]         = _coerce_bool(normalized.get("schema_only"), False)
-    normalized["headers_only"]        = _coerce_bool(normalized.get("headers_only"), False)
-    normalized["include_headers"]     = _coerce_bool(normalized.get("include_headers", True), True)
-    normalized["include_matrix"]      = _coerce_bool(normalized.get("include_matrix", True), True)
+    normalized["emergency_symbols"] = emergency_symbols
+    normalized["limit"] = limit
+    normalized["top_n"] = limit
+    normalized["risk_level"] = risk_level
+    normalized["risk_profile"] = risk_level
+    normalized["confidence_bucket"] = confidence_bucket
+    normalized["confidence_level"] = confidence_bucket
+    normalized["horizon_days"] = horizon_days
+    normalized["invest_period_days"] = horizon_days
+    normalized["min_expected_roi"] = min_roi_ratio
+    normalized["min_roi"] = min_roi_ratio
+    normalized["schema_only"] = _coerce_bool(normalized.get("schema_only"), False)
+    normalized["headers_only"] = _coerce_bool(normalized.get("headers_only"), False)
+    normalized["include_headers"] = _coerce_bool(normalized.get("include_headers", True), True)
+    normalized["include_matrix"] = _coerce_bool(normalized.get("include_matrix", True), True)
     normalized.setdefault("enrich_final", True)
     return normalized
 
-
-def _criteria_signature(criteria: Mapping[str, Any]) -> str:
-    """
-    Deterministic hash of criteria affecting Top10 selection.
-    Symbols are sorted so list order does not affect the key.
-    v5.1.0: resolves min_expected_roi from all accepted aliases.
-    """
-    min_roi_raw = (
-        criteria.get("min_expected_roi")
-        or criteria.get("min_expected_roi_pct")
-        or criteria.get("min_roi")
-    )
-    payload = {
-        "pages_selected":    sorted(_normalize_list(criteria.get("pages_selected"))),
-        "direct_symbols":    sorted(_normalize_list(criteria.get("direct_symbols"))),
-        "emergency_symbols": sorted(_normalize_list(criteria.get("emergency_symbols"))),
-        "limit":             _safe_int(criteria.get("limit"), 10),
-        "horizon_days":      _safe_int(criteria.get("horizon_days") or criteria.get("invest_period_days"), 90),
-        "risk_level":        _s(criteria.get("risk_level") or criteria.get("risk_profile")).lower(),
-        "confidence_bucket": _s(criteria.get("confidence_bucket") or criteria.get("confidence_level")).lower(),
-        "min_expected_roi":  _safe_ratio(min_roi_raw, None),
-        "min_confidence":    _safe_float(criteria.get("min_confidence") or criteria.get("min_ai_confidence"), None),
-        "max_risk_score":    _safe_float(criteria.get("max_risk_score"), None),
-        "min_volume":        _safe_float(criteria.get("min_volume"), None),
-        "include_headers":   _coerce_bool(criteria.get("include_headers", True), True),
-        "include_matrix":    _coerce_bool(criteria.get("include_matrix", True), True),
-        "mode":              _s(criteria.get("mode")).lower(),
-    }
-    return _json_compact(payload)
-
-
-def _selector_weights_snapshot() -> Dict[str, float]:
-    return asdict(SELECTOR_WEIGHTS)
-
-
-def _looks_like_row_dict(d: Any) -> bool:
-    if not isinstance(d, Mapping) or not d:
-        return False
-    row = _coerce_mapping(d)
-    if not row:
-        return False
-    lookup = _row_lookup(row)
-    if any(token in lookup for token in ("symbol", "ticker", "requested_symbol", "code", "instrument")):
-        return True
-    if "top10rank" in lookup or "selectionreason" in lookup:
-        return True
-    matched = 0
-    for key in ("name", "current_price", "overall_score", "recommendation", "risk_score", "forecast_confidence"):
-        for token in _canonical_key_variants(key):
-            if token in lookup:
-                matched += 1
-                break
-    if matched >= 2:
-        return True
-    non_meta = [k for k in row.keys() if _s(k) not in WRAPPER_KEYS]
-    return len(non_meta) >= 4
 
 # =============================================================================
 # Row normalization / ranking
@@ -1639,35 +1417,43 @@ def _normalize_candidate_row(raw: Mapping[str, Any]) -> Dict[str, Any]:
             value = _extract_value_by_aliases(row, key)
             if value is not None:
                 row[key] = value
-    sym = _normalize_symbol(
-        row.get("symbol") or row.get("ticker") or row.get("requested_symbol") or row.get("code")
-    )
+    sym = _normalize_symbol(row.get("symbol") or row.get("ticker") or row.get("requested_symbol") or row.get("code"))
     if sym:
         row["symbol"] = sym
         row.setdefault("ticker", sym)
-
-    # FIX v5.0.0: normalize on ingestion so provider labels never reach the sheet
-    recommendation = _s(row.get("recommendation"))
-    if recommendation:
-        row["recommendation"] = _normalize_recommendation_label(recommendation)
-
-    source_page = _normalize_page_name_safe(
-        row.get("source_page") or row.get("page") or row.get("sheet") or row.get("sheet_name")
-    )
-    if source_page:
-        row["source_page"] = source_page
     return row
+
 
 def _row_richness(row: Mapping[str, Any]) -> int:
     return _count_nonblank_fields(row)
 
 
 def _choose_horizon_roi(row: Mapping[str, Any], horizon_days: int) -> Optional[float]:
-    if horizon_days <= 31:
-        return _safe_ratio(row.get("expected_roi_1m"), None) or _safe_ratio(row.get("expected_roi_3m"), None) or _safe_ratio(row.get("expected_roi_12m"), None)
-    if horizon_days <= 92:
-        return _safe_ratio(row.get("expected_roi_3m"), None) or _safe_ratio(row.get("expected_roi_12m"), None) or _safe_ratio(row.get("expected_roi_1m"), None)
-    return _safe_ratio(row.get("expected_roi_12m"), None) or _safe_ratio(row.get("expected_roi_3m"), None) or _safe_ratio(row.get("expected_roi_1m"), None)
+    """
+    v4.9.0: supports scoring.py v3.0.0 horizon labels (day/week/month/long).
+    Short horizons (≤14d): prefer 1M ROI; medium (≤92d): prefer 3M; long: prefer 12M.
+    """
+    # Also accept horizon label strings from scoring.py v3.0.0
+    label = _s(row.get("horizon_label") or row.get("invest_period_label") or "").lower()
+    if label in ("1d", "day") or horizon_days <= 7:
+        return (_safe_ratio(row.get("expected_roi_1m"), None) or
+                _safe_ratio(row.get("expected_roi_3m"), None) or
+                _safe_ratio(row.get("expected_roi_12m"), None))
+    if label in ("1w", "week") or horizon_days <= 14:
+        return (_safe_ratio(row.get("expected_roi_1m"), None) or
+                _safe_ratio(row.get("expected_roi_3m"), None) or
+                _safe_ratio(row.get("expected_roi_12m"), None))
+    if label in ("1m", "month") or horizon_days <= 31:
+        return (_safe_ratio(row.get("expected_roi_1m"), None) or
+                _safe_ratio(row.get("expected_roi_3m"), None) or
+                _safe_ratio(row.get("expected_roi_12m"), None))
+    if label in ("3m",) or horizon_days <= 92:
+        return (_safe_ratio(row.get("expected_roi_3m"), None) or
+                _safe_ratio(row.get("expected_roi_12m"), None) or
+                _safe_ratio(row.get("expected_roi_1m"), None))
+    return (_safe_ratio(row.get("expected_roi_12m"), None) or
+            _safe_ratio(row.get("expected_roi_3m"), None) or
+            _safe_ratio(row.get("expected_roi_1m"), None))
 
 
 def _confidence_bucket_match(row: Mapping[str, Any], wanted: str) -> bool:
@@ -1744,6 +1530,27 @@ def _passes_filters(row: Mapping[str, Any], criteria: Mapping[str, Any]) -> bool
     if min_volume is not None and volume is not None and volume < min_volume:
         return False
 
+    # v4.9.0: technical_score filter (short-horizon criteria only)
+    min_tech = _safe_float(criteria.get("min_technical_score"), None)
+    if min_tech is not None:
+        tech = _safe_float(row.get("technical_score"), None)
+        if tech is None or tech < min_tech:
+            return False
+
+    # v4.9.0: short_term_signal filter
+    req_st_signal = _s(criteria.get("short_term_signal_required") or criteria.get("min_short_term_signal")).upper()
+    if req_st_signal in ("BUY", "STRONG_BUY"):
+        st_sig = _s(row.get("short_term_signal")).upper()
+        if st_sig not in ("BUY", "STRONG_BUY"):
+            return False
+
+    # v4.9.0: upside_pct filter
+    min_upside = _safe_float(criteria.get("min_upside_pct"), None)
+    if min_upside is not None:
+        upside = _safe_float(row.get("upside_pct"), None)
+        if upside is not None and upside < min_upside:
+            return False
+
     return True
 
 
@@ -1760,104 +1567,236 @@ def _direct_symbol_order_index(row: Mapping[str, Any], criteria: Mapping[str, An
         return None
 
 
-
 def _selector_score(row: Mapping[str, Any], criteria: Mapping[str, Any]) -> float:
     """
-    SELECTION score -- separate from core.scoring.compute_scores().
-    core.scoring computes fundamental per-asset scores (overall_score etc.).
-    This adds request-specific selection preferences on top:
-    liquidity, direct-symbol priority, horizon ROI, row richness.
-    ROI fraction is multiplied by 100 for scale alignment with score fields.
-    Weights are additive-only-when-present via SELECTOR_WEIGHTS (env-overridable).
-    """
-    weights = SELECTOR_WEIGHTS
+    v4.9.0: horizon-aware composite score.
 
-    overall     = _safe_float(row.get("overall_score"),     None)
+    Weight sets by horizon:
+      DAY/WEEK (≤14d):  technical_score×0.30, momentum×0.25, overall×0.20,
+                        opportunity×0.10, roi×0.15
+      MONTH (≤90d):     overall×0.35, opportunity×0.20, roi×0.20, scores×0.25
+      LONG (>90d):      overall×0.35, opportunity×0.20, roi×0.20, scores×0.25
+
+    Always: upside_pct bonus, risk penalty, richness micro-boost.
+    """
+    overall     = _safe_float(row.get("overall_score"), None)
     opportunity = _safe_float(row.get("opportunity_score"), None)
-    value       = _safe_float(row.get("value_score"),       None)
-    quality     = _safe_float(row.get("quality_score"),     None)
-    momentum    = _safe_float(row.get("momentum_score"),    None)
-    growth      = _safe_float(row.get("growth_score"),      None)
-    risk        = _safe_float(row.get("risk_score"),        None)
+    value       = _safe_float(row.get("value_score"), None)
+    quality     = _safe_float(row.get("quality_score"), None)
+    momentum    = _safe_float(row.get("momentum_score"), None)
+    growth      = _safe_float(row.get("growth_score"), None)
+    risk        = _safe_float(row.get("risk_score"), None)
     conf        = _safe_float(row.get("forecast_confidence") or row.get("confidence_score"), None)
-    liquidity   = _safe_float(row.get("liquidity_score"),   None)
+    liquidity   = _safe_float(row.get("liquidity_score"), None)
+    tech        = _safe_float(row.get("technical_score"), None)
+    upside      = _safe_float(row.get("upside_pct"), None)
+    st_signal   = _s(row.get("short_term_signal")).upper()
+
     horizon_days = _safe_int(criteria.get("horizon_days") or criteria.get("invest_period_days"), 90)
-    roi         = _choose_horizon_roi(row, horizon_days)
+    roi = _choose_horizon_roi(row, horizon_days)
 
     if conf is not None and conf <= 1.0:
         conf *= 100.0
 
     score = 0.0
-    if overall     is not None: score += overall     * weights.overall
-    if opportunity is not None: score += opportunity * weights.opportunity
-    if value       is not None: score += value       * weights.value
-    if quality     is not None: score += quality     * weights.quality
-    if momentum    is not None: score += momentum    * weights.momentum
-    if growth      is not None: score += growth      * weights.growth
-    if conf        is not None: score += conf        * weights.confidence
-    if liquidity   is not None: score += liquidity   * weights.liquidity
-    if risk        is not None: score += (100.0 - risk) * weights.risk_inverted
-    if roi         is not None: score += roi * 100.0 * weights.roi
 
+    # ── Horizon-aware base scoring ─────────────────────────────────────────
+    if horizon_days <= 14:
+        # Short horizon: technical + momentum dominate
+        if tech      is not None: score += tech * 0.30
+        if momentum  is not None: score += momentum * 0.25
+        if overall   is not None: score += overall * 0.20
+        if opportunity is not None: score += opportunity * 0.10
+        if roi       is not None: score += roi * 100.0 * 0.15
+        if conf      is not None: score += conf * 0.05
+        if risk      is not None: score += (100.0 - risk) * 0.08
+        # short_term_signal BUY/STRONG_BUY bonus
+        if st_signal in ("BUY", "STRONG_BUY"):
+            score += 15.0 if st_signal == "STRONG_BUY" else 8.0
+    else:
+        # Month / Long: fundamental + overall scoring (original logic)
+        if overall      is not None: score += overall * 0.35
+        if opportunity  is not None: score += opportunity * 0.20
+        if value        is not None: score += value * 0.08
+        if quality      is not None: score += quality * 0.08
+        if momentum     is not None: score += momentum * 0.08
+        if growth       is not None: score += growth * 0.08
+        if conf         is not None: score += conf * 0.08
+        if liquidity    is not None: score += liquidity * 0.05
+        if risk         is not None: score += (100.0 - risk) * 0.08
+        if roi          is not None: score += roi * 100.0 * 0.20
+        # technical_score still gives a small boost even for medium-term
+        if tech         is not None: score += tech * 0.05
+
+    # ── Universal bonuses ─────────────────────────────────────────────────
+    # upside_pct bonus: (intrinsic - price) / price. Reward deep value.
+    if upside is not None and upside > 0:
+        score += min(upside * 100.0, 20.0) * 0.15  # max +30 points for 20%+ upside
+
+    # Direct symbol priority override
     direct_order_index = _direct_symbol_order_index(row, criteria)
     if direct_order_index is not None:
         score += max(0.0, 140.0 - float(direct_order_index * 2))
 
-    score += min(_row_richness(row), 120) * weights.row_richness
+    score += min(_row_richness(row), 120) * 0.03
     return float(score)
 
 
 def _canonical_selection_reason(row: Dict[str, Any], criteria: Mapping[str, Any]) -> str:
-    # FIX v5.0.0: uses canonical normalized recommendation
-    recommendation    = _normalize_recommendation_label(_s(row.get("recommendation")))
+    recommendation = _s(row.get("recommendation"))
     confidence_bucket = _s(row.get("confidence_bucket"))
-    risk_bucket       = _s(row.get("risk_bucket"))
-    source_page       = _s(row.get("source_page"))
-    horizon_days      = _safe_int(criteria.get("horizon_days") or criteria.get("invest_period_days"), 90)
-    horizon_roi       = _choose_horizon_roi(row, horizon_days)
+    risk_bucket = _s(row.get("risk_bucket"))
+    source_page = _s(row.get("source_page"))
+    horizon_days = _safe_int(criteria.get("horizon_days") or criteria.get("invest_period_days"), 90)
+    horizon_roi = _choose_horizon_roi(row, horizon_days)
 
     score_parts: List[str] = []
     for label, key in (
-        ("overall",     "overall_score"),
+        ("overall", "overall_score"),
         ("opportunity", "opportunity_score"),
-        ("value",       "value_score"),
-        ("quality",     "quality_score"),
-        ("momentum",    "momentum_score"),
-        ("growth",      "growth_score"),
+        ("value", "value_score"),
+        ("quality", "quality_score"),
+        ("momentum", "momentum_score"),
+        ("growth", "growth_score"),
     ):
         val = row.get(key)
         if isinstance(val, (int, float)):
             score_parts.append(f"{label}={round(float(val), 2)}")
 
     parts: List[str] = []
-    if recommendation:    parts.append(f"Recommendation={recommendation}")
-    if confidence_bucket: parts.append(f"Confidence={confidence_bucket}")
-    if risk_bucket:       parts.append(f"Risk={risk_bucket}")
-    if horizon_roi is not None: parts.append(f"Horizon ROI={round(horizon_roi * 100.0, 2)}%")
-    if source_page:       parts.append(f"Source={source_page}")
-    if score_parts:       parts.append(", ".join(score_parts[:3]))
+    if recommendation:
+        parts.append(f"Recommendation={recommendation}")
+    if confidence_bucket:
+        parts.append(f"Confidence={confidence_bucket}")
+    if risk_bucket:
+        parts.append(f"Risk={risk_bucket}")
+    if horizon_roi is not None:
+        parts.append(f"Horizon ROI={round(horizon_roi * 100.0, 2)}%")
+    if source_page:
+        parts.append(f"Source={source_page}")
+    if score_parts:
+        parts.append(", ".join(score_parts[:3]))
+
+    # v4.9.0: include technical_score and short_term_signal
+    tech = row.get("technical_score")
+    if isinstance(tech, (int, float)):
+        parts.append(f"Tech={round(float(tech), 1)}")
+    st_sig = _s(row.get("short_term_signal"))
+    if st_sig and st_sig.upper() not in ("HOLD", "N/A", ""):
+        parts.append(f"ST={st_sig}")
+    upside = row.get("upside_pct")
+    if isinstance(upside, (int, float)):
+        parts.append(f"Upside={round(float(upside)*100.0, 1)}%")
+
     return " | ".join(parts) if parts else "Selected by Top10 composite scoring."
 
 
-def _rank_and_project_rows(
-    rows: Sequence[Mapping[str, Any]],
-    keys: Sequence[str],
-    criteria: Mapping[str, Any],
-) -> List[Dict[str, Any]]:
+def _compute_trade_setup(row: Dict[str, Any], criteria: Mapping[str, Any]) -> None:
+    """
+    v4.9.0: Compute entry_price, stop_loss_suggested, take_profit_suggested,
+    risk_reward_ratio in-place.
+
+    Entry price strategy:
+      If price is near the bottom of the day range (day_range_position < 0.40),
+      use current_price directly (already a good entry zone).
+      Otherwise suggest slightly below current price toward support.
+
+    Stop loss:
+      entry − (atr_14 × 1.5)
+      Fallback: entry × (1 − volatility_30d × 0.5)
+      Min distance: 2% below entry.
+
+    Take profit:
+      entry × (1 + upside_pct) using intrinsic value gap.
+      Fallback: forecast_price_3m, then entry × (1 + 0.08).
+      Min distance: 4% above entry.
+
+    R/R ratio:
+      (take_profit − entry) / (entry − stop_loss).
+      Only write if R/R ≥ 1.0 (otherwise leave as computed for transparency).
+    """
+    if not _is_blank(row.get("entry_price")) and not _is_blank(row.get("risk_reward_ratio")):
+        return  # already set upstream
+
+    price = _safe_float(row.get("current_price"), None)
+    if price is None or price <= 0:
+        return
+
+    # ── Entry price ───────────────────────────────────────────────────────
+    drp = _safe_float(row.get("day_range_position"), None)
+    if drp is not None and drp < 0.40:
+        entry = price  # already near support
+    elif drp is not None:
+        entry = round(price * (1.0 - drp * 0.008), 4)  # subtle discount toward range bottom
+    else:
+        entry = price
+    row["entry_price"] = entry
+
+    # ── Stop loss ─────────────────────────────────────────────────────────
+    if _is_blank(row.get("stop_loss_suggested")):
+        atr = _safe_float(row.get("atr_14"), None)
+        if atr is not None and atr > 0:
+            sl = round(entry - atr * 1.5, 4)
+        else:
+            vol30 = _safe_float(row.get("volatility_30d"), None)
+            if vol30 is not None:
+                # vol30 is annualized fraction; daily ≈ vol30/sqrt(252)
+                daily_move = (vol30 / 15.87) * entry if vol30 <= 1.5 else (vol30 / 1587.0) * entry
+                sl = round(entry - max(daily_move * 3.0, entry * 0.025), 4)
+            else:
+                sl = round(entry * 0.975, 4)  # 2.5% hard stop
+        sl = min(sl, entry * 0.98)  # never closer than 2%
+        row["stop_loss_suggested"] = sl
+
+    # ── Take profit ───────────────────────────────────────────────────────
+    if _is_blank(row.get("take_profit_suggested")):
+        upside = _safe_float(row.get("upside_pct"), None)
+        if upside is not None and upside > 0.01:
+            tp = round(entry * (1.0 + min(upside, 0.80)), 4)  # cap at 80% upside
+        else:
+            fp3 = _safe_float(row.get("forecast_price_3m"), None)
+            if fp3 is not None and fp3 > entry * 1.03:
+                tp = round(fp3, 4)
+            else:
+                tp = round(entry * 1.08, 4)  # default 8% target
+        tp = max(tp, entry * 1.04)  # never closer than 4%
+        row["take_profit_suggested"] = tp
+
+    # ── Risk/Reward ratio ─────────────────────────────────────────────────
+    if _is_blank(row.get("risk_reward_ratio")):
+        entry_v = _safe_float(row.get("entry_price"), None)
+        sl_v    = _safe_float(row.get("stop_loss_suggested"), None)
+        tp_v    = _safe_float(row.get("take_profit_suggested"), None)
+        if entry_v and sl_v and tp_v and entry_v > sl_v:
+            rr = round((tp_v - entry_v) / (entry_v - sl_v), 2)
+            row["risk_reward_ratio"] = rr
+
+
+def _rank_and_project_rows(rows: Sequence[Mapping[str, Any]], keys: Sequence[str], criteria: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """v4.9.0: adds trade setup computation for every selected row."""
     criteria_snapshot = _json_compact(criteria)
     out: List[Dict[str, Any]] = []
     for idx, raw in enumerate(rows, start=1):
         row = dict(raw)
-        # FIX v5.0.0: normalize recommendation one final time before sheet write
-        if not _is_blank(row.get("recommendation")):
-            row["recommendation"] = _normalize_recommendation_label(row.get("recommendation"))
-        if _is_blank(row.get("top10_rank")):        row["top10_rank"]       = idx
-        if _is_blank(row.get("rank_overall")):      row["rank_overall"]     = idx
-        if _is_blank(row.get("selection_reason")):  row["selection_reason"] = _canonical_selection_reason(row, criteria)
-        if _is_blank(row.get("criteria_snapshot")): row["criteria_snapshot"] = criteria_snapshot
+        if _is_blank(row.get("top10_rank")):
+            row["top10_rank"] = idx
+        if _is_blank(row.get("rank_overall")):
+            row["rank_overall"] = idx
+
+        # Compute trade setup before writing selection_reason (reason includes R/R)
+        _compute_trade_setup(row, criteria)
+
+        if _is_blank(row.get("selection_reason")):
+            row["selection_reason"] = _canonical_selection_reason(row, criteria)
+        if _is_blank(row.get("criteria_snapshot")):
+            row["criteria_snapshot"] = criteria_snapshot
         projected = {k: _json_safe(row.get(k)) for k in keys}
         out.append(projected)
     return out
+
+
+# =============================================================================
+# Candidate collection
 # =============================================================================
 def _page_priority_symbol_limit(criteria: Mapping[str, Any]) -> int:
     limit = _safe_int(criteria.get("limit"), 10)
