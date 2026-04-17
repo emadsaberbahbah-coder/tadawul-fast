@@ -679,14 +679,14 @@ def _mount_one(
             )
             if owner_conflicts:
                 return True, None, "conflict_skip", {
-                    "reason":              "protected_prefix_owner_conflict",
-                    "route_count":         len(getattr(router, "routes", []) or []),
-                    "claimed_prefixes":    claimed_prefixes,
-                    "owner_conflicts":     owner_conflicts,
+                    "reason":               "protected_prefix_owner_conflict",
+                    "route_count":          len(getattr(router, "routes", []) or []),
+                    "claimed_prefixes":     claimed_prefixes,
+                    "owner_conflicts":      owner_conflicts,
                     "policy_filtered_routes": [],
-                    "duplicate_skips":     0,
+                    "duplicate_skips":      0,
                     "partial_duplicate_skips": 0,
-                    "filtered_out":        0,
+                    "filtered_out":         0,
                 }
 
             existing_before = _app_route_signature_set(app)
@@ -763,14 +763,14 @@ def _mount_one(
             if owner_conflicts:
                 _remove_added_routes(app, kept_routes)
                 return True, None, "conflict_skip", {
-                    "reason":              "mount_fn_protected_prefix_owner_conflict",
-                    "route_count":         len(kept_routes),
-                    "claimed_prefixes":    claimed_prefixes,
+                    "reason":               "mount_fn_protected_prefix_owner_conflict",
+                    "route_count":          len(kept_routes),
+                    "claimed_prefixes":     claimed_prefixes,
                     "policy_filtered_routes": _route_paths_from_routes(disallowed_routes),
-                    "owner_conflicts":     owner_conflicts,
-                    "duplicate_skips":     len(duplicate_routes),
+                    "owner_conflicts":      owner_conflicts,
+                    "duplicate_skips":      len(duplicate_routes),
                     "partial_duplicate_skips": len(partial_duplicate_routes),
-                    "filtered_out":        len(disallowed_routes),
+                    "filtered_out":         len(disallowed_routes),
                 }
 
             kept_sigs = _route_signature_set_from_routes(kept_routes)
@@ -854,7 +854,7 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
         module_name = entry.get("module")
         priority    = int(entry.get("priority", 100))
         if module_name:
-            resolved_map[key]            = str(module_name)
+            resolved_map[key]             = str(module_name)
             priority_map[str(module_name)] = priority
             plan_modules.append(str(module_name))
 
