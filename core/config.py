@@ -1089,7 +1089,7 @@ class Settings:
         backend_base_url = strip_value(os.getenv("BACKEND_BASE_URL") or os.getenv("DEFAULT_BACKEND_URL") or "http://localhost:8000")
 
         advanced_analysis_enabled  = coerce_bool(os.getenv("ADVANCED_ANALYSIS_ENABLED"),  True)
-        ai_analysis_enabled        = coerce_bool(os.getenv("AI_ANALYSIS_ENABLED"),         True)
+        ai_analysis_enabled        = coerce_bool(os.getenv("AI_ANALYSIS_ENABLED"),        True)
         tadawul_market_enabled     = coerce_bool(os.getenv("TADAWUL_MARKET_ENABLED"),      True)
         ksa_disallow_eodhd         = coerce_bool(os.getenv("KSA_DISALLOW_EODHD"),          False)
         computations_enabled       = coerce_bool(os.getenv("COMPUTATIONS_ENABLED"),        True)
