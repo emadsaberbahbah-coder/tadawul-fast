@@ -231,7 +231,6 @@ def coerce_float(v: Any, default: float, *, lo: Optional[float] = None, hi: Opti
     return x
 
 
-
 def coerce_list(v: Any, default: Optional[List[str]] = None) -> List[str]:
     if default is None:
         default = []
