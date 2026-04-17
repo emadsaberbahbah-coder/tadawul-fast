@@ -881,4 +881,5 @@ def validate_page_catalog() -> None:
 
     # All page catalog pages must exist in schema registry
     for canonical in CANONICAL_PAGES:
-        if canonical not
+        if canonical not in _CANONICAL_FROM_SCHEMA:
+            raise ValueError(f"Canonical page '{canonical}' is missing from schema_registry.")
