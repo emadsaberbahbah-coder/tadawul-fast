@@ -1139,7 +1139,7 @@ def _normalize_rows(rows: Sequence[Mapping[str, Any]], keys: Sequence[str], page
                 if roi  is not None: reason_parts.append(f"ROI 3M={roi}")
                 if conf is not None: reason_parts.append(f"Confidence={conf}")
                 if tech is not None: reason_parts.append(f"Tech={round(float(tech), 1)}")
-                if st_sig:           reason_parts.append(f"ST={st_sig}")
+                if st_sig:            reason_parts.append(f"ST={st_sig}")
                 if reco or roi is not None or conf is not None:
                     rd["selection_reason"] = " | ".join(reason_parts)
             if rd.get("criteria_snapshot") in {None, ""}:
