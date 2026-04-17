@@ -2,7 +2,7 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 -- GLOBAL-FIRST ORCHESTRATOR -- v5.49.0
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.47.2
 ================================================================================
 
 WHY v5.47.2
@@ -113,7 +113,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.49.0"
+__version__ = "5.50.0"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -142,170 +142,98 @@ class UnifiedQuote(BaseModel):
 # =============================================================================
 # Canonical page contracts
 # =============================================================================
+# v5.50.0: Updated to 99 cols matching schema_registry v3.4.0 MARKET_LEADERS_FIELDS.
+# New fields: price_change_5d, volume_ratio, roe, roa, rsi_signal, technical_score,
+#             day_range_position, atr_14, upside_pct, short_term_signal,
+#             recommendation_reason (explicit), + restructured from 80→99.
 INSTRUMENT_CANONICAL_KEYS: List[str] = [
-    "symbol",
-    "name",
-    "asset_class",
-    "exchange",
-    "currency",
-    "country",
-    "sector",
-    "industry",
-    "current_price",
-    "previous_close",
-    "open_price",
-    "day_high",
-    "day_low",
-    "week_52_high",
-    "week_52_low",
-    "price_change",
-    "percent_change",
-    "week_52_position_pct",
-    "volume",
-    "avg_volume_10d",
-    "avg_volume_30d",
-    "market_cap",
-    "float_shares",
-    "beta_5y",
-    "pe_ttm",
-    "pe_forward",
-    "eps_ttm",
-    "dividend_yield",
-    "payout_ratio",
-    "revenue_ttm",
-    "revenue_growth_yoy",
-    "gross_margin",
-    "operating_margin",
-    "profit_margin",
-    "debt_to_equity",
-    "free_cash_flow_ttm",
-    "rsi_14",
-    "volatility_30d",
-    "volatility_90d",
-    "max_drawdown_1y",
-    "var_95_1d",
-    "sharpe_1y",
-    "risk_score",
-    "risk_bucket",
-    "pb_ratio",
-    "ps_ratio",
-    "ev_ebitda",
-    "peg_ratio",
-    "intrinsic_value",
-    "valuation_score",
-    "forecast_price_1m",
-    "forecast_price_3m",
-    "forecast_price_12m",
-    "expected_roi_1m",
-    "expected_roi_3m",
-    "expected_roi_12m",
-    "forecast_confidence",
-    "confidence_score",
-    "confidence_bucket",
-    "value_score",
-    "quality_score",
-    "momentum_score",
-    "growth_score",
-    "overall_score",
-    "opportunity_score",
+    # Identity (8)
+    "symbol", "name", "asset_class", "exchange", "currency", "country", "sector", "industry",
+    # Price base (10)
+    "current_price", "previous_close", "open_price", "day_high", "day_low",
+    "week_52_high", "week_52_low", "price_change", "percent_change", "week_52_position_pct",
+    # Price new (1)
+    "price_change_5d",
+    # Volume (6) — includes volume_ratio
+    "volume", "avg_volume_10d", "avg_volume_30d", "market_cap", "float_shares", "volume_ratio",
+    # Fundamentals equity (13)
+    "beta_5y", "pe_ttm", "pe_forward", "eps_ttm", "dividend_yield", "payout_ratio",
+    "revenue_ttm", "revenue_growth_yoy", "gross_margin", "operating_margin",
+    "profit_margin", "debt_to_equity", "free_cash_flow_ttm",
+    # Fundamentals quality (2) — NEW
+    "roe", "roa",
+    # Risk (8)
+    "rsi_14", "volatility_30d", "volatility_90d", "max_drawdown_1y",
+    "var_95_1d", "sharpe_1y", "risk_score", "risk_bucket",
+    # Technicals new (4) — NEW
+    "rsi_signal", "technical_score", "day_range_position", "atr_14",
+    # Valuation (7) — includes upside_pct
+    "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio",
+    "intrinsic_value", "valuation_score", "upside_pct",
+    # Forecast (9)
+    "forecast_price_1m", "forecast_price_3m", "forecast_price_12m",
+    "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
+    "forecast_confidence", "confidence_score", "confidence_bucket",
+    # Scores (6)
+    "value_score", "quality_score", "momentum_score", "growth_score",
+    "overall_score", "opportunity_score",
+    # Decision (8)
+    "analyst_rating", "target_price", "upside_downside_pct",
+    "recommendation", "signal", "trend_1m", "trend_3m", "trend_12m",
+    # Recommendation new (4) — NEW (short_term_signal replaces old signal for ST)
+    "short_term_signal", "recommendation_reason", "invest_period_label", "horizon_days",
+    # Rank
     "rank_overall",
-    "recommendation",
-    "recommendation_reason",
-    "horizon_days",
-    "invest_period_label",
-    "position_qty",
-    "avg_cost",
-    "position_cost",
-    "position_value",
-    "unrealized_pl",
-    "unrealized_pl_pct",
-    "data_provider",
-    "last_updated_utc",
-    "last_updated_riyadh",
-    "warnings",
+    # Portfolio light (6)
+    "position_qty", "avg_cost", "position_cost", "position_value",
+    "unrealized_pl", "unrealized_pl_pct",
+    # Provenance (4)
+    "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
 ]
 
 INSTRUMENT_CANONICAL_HEADERS: List[str] = [
-    "Symbol",
-    "Name",
-    "Asset Class",
-    "Exchange",
-    "Currency",
-    "Country",
-    "Sector",
-    "Industry",
-    "Current Price",
-    "Previous Close",
-    "Open",
-    "Day High",
-    "Day Low",
-    "52W High",
-    "52W Low",
-    "Price Change",
-    "Percent Change",
-    "52W Position %",
-    "Volume",
-    "Avg Volume 10D",
-    "Avg Volume 30D",
-    "Market Cap",
-    "Float Shares",
-    "Beta (5Y)",
-    "P/E (TTM)",
-    "P/E (Forward)",
-    "EPS (TTM)",
-    "Dividend Yield",
-    "Payout Ratio",
-    "Revenue (TTM)",
-    "Revenue Growth YoY",
-    "Gross Margin",
-    "Operating Margin",
-    "Profit Margin",
-    "Debt/Equity",
-    "Free Cash Flow (TTM)",
-    "RSI (14)",
-    "Volatility 30D",
-    "Volatility 90D",
-    "Max Drawdown 1Y",
-    "VaR 95% (1D)",
-    "Sharpe (1Y)",
-    "Risk Score",
-    "Risk Bucket",
-    "P/B",
-    "P/S",
-    "EV/EBITDA",
-    "PEG",
-    "Intrinsic Value",
-    "Valuation Score",
-    "Forecast Price 1M",
-    "Forecast Price 3M",
-    "Forecast Price 12M",
-    "Expected ROI 1M",
-    "Expected ROI 3M",
-    "Expected ROI 12M",
-    "Forecast Confidence",
-    "Confidence Score",
-    "Confidence Bucket",
-    "Value Score",
-    "Quality Score",
-    "Momentum Score",
-    "Growth Score",
-    "Overall Score",
-    "Opportunity Score",
+    # Identity (8)
+    "Symbol", "Name", "Asset Class", "Exchange", "Currency", "Country", "Sector", "Industry",
+    # Price base (10)
+    "Current Price", "Previous Close", "Open", "Day High", "Day Low",
+    "52W High", "52W Low", "Price Change", "Change %", "52W Position %",
+    # Price new (1)
+    "5D Change %",
+    # Volume (6)
+    "Volume", "Avg Vol 10D", "Avg Vol 30D", "Market Cap", "Float Shares", "Volume Ratio",
+    # Fundamentals equity (13)
+    "Beta (5Y)", "P/E (TTM)", "P/E (Fwd)", "EPS (TTM)", "Div Yield %", "Payout Ratio %",
+    "Revenue TTM", "Rev Growth YoY %", "Gross Margin %", "Op Margin %",
+    "Net Margin %", "D/E Ratio", "FCF (TTM)",
+    # Fundamentals quality (2)
+    "ROE %", "ROA %",
+    # Risk (8)
+    "RSI (14)", "Volatility 30D %", "Volatility 90D %", "Max DD 1Y %",
+    "VaR 95% (1D)", "Sharpe (1Y)", "Risk Score", "Risk Bucket",
+    # Technicals new (4)
+    "RSI Signal", "Tech Score", "Day Range Pos %", "ATR 14",
+    # Valuation (7)
+    "P/B", "P/S", "EV/EBITDA", "PEG Ratio",
+    "Intrinsic Value", "Valuation Score", "Upside %",
+    # Forecast (9)
+    "Price Tgt 1M", "Price Tgt 3M", "Price Tgt 12M",
+    "ROI 1M %", "ROI 3M %", "ROI 12M %",
+    "AI Confidence", "Confidence Score", "Confidence",
+    # Scores (6)
+    "Value Score", "Quality Score", "Momentum Score", "Growth Score",
+    "Overall Score", "Opportunity Score",
+    # Decision (8)
+    "Analyst Rating", "Target Price", "Upside/Downside %",
+    "Recommendation", "Signal", "Trend 1M", "Trend 3M", "Trend 12M",
+    # Recommendation new (4)
+    "ST Signal", "Reason", "Horizon", "Horizon Days",
+    # Rank
     "Rank (Overall)",
-    "Recommendation",
-    "Recommendation Reason",
-    "Horizon Days",
-    "Invest Period Label",
-    "Position Qty",
-    "Avg Cost",
-    "Position Cost",
-    "Position Value",
-    "Unrealized P/L",
-    "Unrealized P/L %",
-    "Data Provider",
-    "Last Updated (UTC)",
-    "Last Updated (Riyadh)",
-    "Warnings",
+    # Portfolio light (6)
+    "Qty", "Avg Cost", "Position Cost", "Position Value",
+    "Unrealized P/L", "Unrealized P/L %",
+    # Provenance (4)
+    "Data Provider", "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
 ]
 
 TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
@@ -361,19 +289,170 @@ DATA_DICTIONARY_KEYS: List[str] = [
     "notes",
 ]
 
+# v5.50.0: Per-page canonical contracts matching schema_registry v3.4.0.
+# schema_registry v3.4.0 is the authoritative source — these are emergency fallbacks.
+
+# Global_Markets extra keys beyond base instrument keys
+_GM_EXTRA_KEYS: List[str] = [
+    "region", "market_status", "price_usd",
+    "sector_pe_avg", "vs_sector_pe_pct", "sector_ytd_pct",
+    "sector_signal", "sector_rank", "sector_vs_msci_pct",
+    "vs_sp500_ytd", "vs_msci_world_ytd", "wall_st_target",
+    "upside_to_target_pct", "analyst_consensus", "country_risk",
+    "ma_50d", "ma_200d", "ema_signal", "macd_signal",
+]
+_GM_EXTRA_HEADERS: List[str] = [
+    "Region", "Market Status", "Price (USD)",
+    "Sector P/E Avg", "vs Sector P/E %", "Sector YTD %",
+    "Sector Signal", "Sector Rank", "Sector vs MSCI %",
+    "vs S&P 500 YTD %", "vs MSCI World %", "Wall St Target",
+    "Upside to Tgt %", "Analyst Consensus", "Country Risk",
+    "50D MA", "200D MA", "EMA Signal", "MACD Signal",
+]
+
+# Commodities_FX: remove equity-only fundamentals, add commodity signals
+_CF_REMOVE_KEYS: set = {
+    "pe_ttm", "pe_forward", "eps_ttm", "peg_ratio",
+    "revenue_ttm", "payout_ratio", "gross_margin",
+    "operating_margin", "profit_margin", "debt_to_equity",
+    "free_cash_flow_ttm", "roe", "roa",
+}
+_CF_ADD_KEYS: List[str] = [
+    "commodity_type", "contract_expiry", "spot_price",
+    "usd_correlation", "seasonal_signal", "carry_rate",
+]
+_CF_ADD_HEADERS: List[str] = [
+    "Asset Type", "Contract Expiry", "Spot Price",
+    "USD Correlation", "Seasonal Signal", "Carry Rate %",
+]
+
+# Mutual_Funds: remove equity-only, add fund-specific
+_MF_REMOVE_KEYS: set = {
+    "pe_ttm", "pe_forward", "eps_ttm", "peg_ratio",
+    "revenue_ttm", "revenue_growth_yoy", "gross_margin",
+    "operating_margin", "profit_margin", "debt_to_equity",
+    "free_cash_flow_ttm", "roe", "roa",
+}
+_MF_ADD_KEYS: List[str] = [
+    "fund_type", "benchmark_name", "holdings_count",
+    "aum", "expense_ratio", "nav", "nav_premium_pct", "distribution_yield",
+    "ytd_return", "return_1y", "return_3y_ann", "return_5y_ann",
+    "tracking_error", "alpha_1y",
+]
+_MF_ADD_HEADERS: List[str] = [
+    "Fund Type", "Benchmark", "Holdings Count",
+    "AUM (B USD)", "Expense Ratio %", "NAV", "NAV Prem/Disc %", "Distribution Yield %",
+    "YTD Return %", "1Y Return %", "3Y Return (Ann) %", "5Y Return (Ann) %",
+    "Tracking Error %", "Alpha (1Y)",
+]
+
+# My_Portfolio: full base + advanced portfolio management
+_MP_ADD_KEYS: List[str] = [
+    "portfolio_weight_pct", "target_weight_pct", "weight_deviation", "rebalance_signal",
+    "stop_loss", "take_profit", "distance_to_sl_pct", "distance_to_tp_pct",
+    "days_held", "annual_dividend_income", "beta_contribution",
+]
+_MP_ADD_HEADERS: List[str] = [
+    "Weight %", "Target Weight %", "Weight Deviation %", "Rebal Signal",
+    "Stop Loss", "Take Profit", "Dist to SL %", "Dist to TP %",
+    "Days Held", "Ann Div Income", "Beta Contribution",
+]
+
+# Top10 extras (rank + trade setup)
+_T10_EXTRA_KEYS: List[str] = [
+    "top10_rank", "selection_reason", "criteria_snapshot",
+    "entry_price", "stop_loss_suggested", "take_profit_suggested", "risk_reward_ratio",
+]
+_T10_EXTRA_HEADERS: List[str] = [
+    "Top 10 Rank", "Selection Reason", "Criteria Snapshot",
+    "Entry Price", "Stop Loss (AI)", "Take Profit (AI)", "Risk/Reward",
+]
+
+# Insights v3.4.0 (9 cols — adds signal + priority)
+_INSIGHTS_KEYS_V34: List[str] = [
+    "section", "item", "symbol", "metric", "value",
+    "signal", "priority", "notes", "as_of_riyadh",
+]
+_INSIGHTS_HEADERS_V34: List[str] = [
+    "Section", "Item", "Symbol", "Metric", "Value",
+    "Signal", "Priority", "Notes", "Last Updated (Riyadh)",
+]
+
+
+def _build_page_keys(
+    base_keys: List[str],
+    base_headers: List[str],
+    remove: set,
+    add_keys: List[str],
+    add_headers: List[str],
+) -> Tuple[List[str], List[str]]:
+    keys: List[str] = []
+    headers: List[str] = []
+    for k, h in zip(base_keys, base_headers):
+        if k not in remove:
+            keys.append(k)
+            headers.append(h)
+    keys.extend(add_keys)
+    headers.extend(add_headers)
+    return keys, headers
+
+
+_GM_KEYS, _GM_HEADERS = _build_page_keys(
+    INSTRUMENT_CANONICAL_KEYS, INSTRUMENT_CANONICAL_HEADERS,
+    set(), _GM_EXTRA_KEYS, _GM_EXTRA_HEADERS,
+)
+_CF_KEYS, _CF_HEADERS = _build_page_keys(
+    INSTRUMENT_CANONICAL_KEYS, INSTRUMENT_CANONICAL_HEADERS,
+    _CF_REMOVE_KEYS, _CF_ADD_KEYS, _CF_ADD_HEADERS,
+)
+_MF_KEYS, _MF_HEADERS = _build_page_keys(
+    INSTRUMENT_CANONICAL_KEYS, INSTRUMENT_CANONICAL_HEADERS,
+    _MF_REMOVE_KEYS, _MF_ADD_KEYS, _MF_ADD_HEADERS,
+)
+_MP_KEYS, _MP_HEADERS = _build_page_keys(
+    INSTRUMENT_CANONICAL_KEYS, INSTRUMENT_CANONICAL_HEADERS,
+    set(), _MP_ADD_KEYS, _MP_ADD_HEADERS,
+)
+_T10_KEYS = list(INSTRUMENT_CANONICAL_KEYS) + _T10_EXTRA_KEYS
+_T10_HEADERS = list(INSTRUMENT_CANONICAL_HEADERS) + _T10_EXTRA_HEADERS
+
 STATIC_CANONICAL_SHEET_CONTRACTS: Dict[str, Dict[str, List[str]]] = {
-    "Market_Leaders": {"headers": list(INSTRUMENT_CANONICAL_HEADERS), "keys": list(INSTRUMENT_CANONICAL_KEYS)},
-    "Global_Markets": {"headers": list(INSTRUMENT_CANONICAL_HEADERS), "keys": list(INSTRUMENT_CANONICAL_KEYS)},
-    "Commodities_FX": {"headers": list(INSTRUMENT_CANONICAL_HEADERS), "keys": list(INSTRUMENT_CANONICAL_KEYS)},
-    "Mutual_Funds": {"headers": list(INSTRUMENT_CANONICAL_HEADERS), "keys": list(INSTRUMENT_CANONICAL_KEYS)},
-    "My_Portfolio": {"headers": list(INSTRUMENT_CANONICAL_HEADERS), "keys": list(INSTRUMENT_CANONICAL_KEYS)},
-    "My_Investments": {"headers": list(INSTRUMENT_CANONICAL_HEADERS), "keys": list(INSTRUMENT_CANONICAL_KEYS)},
-    "Top_10_Investments": {
-        "headers": list(INSTRUMENT_CANONICAL_HEADERS) + [TOP10_REQUIRED_HEADERS[k] for k in TOP10_REQUIRED_FIELDS],
-        "keys": list(INSTRUMENT_CANONICAL_KEYS) + list(TOP10_REQUIRED_FIELDS),
+    "Market_Leaders": {
+        "headers": list(INSTRUMENT_CANONICAL_HEADERS),
+        "keys":    list(INSTRUMENT_CANONICAL_KEYS),
     },
-    "Insights_Analysis": {"headers": list(INSIGHTS_HEADERS), "keys": list(INSIGHTS_KEYS)},
-    "Data_Dictionary": {"headers": list(DATA_DICTIONARY_HEADERS), "keys": list(DATA_DICTIONARY_KEYS)},
+    "Global_Markets": {
+        "headers": _GM_HEADERS,
+        "keys":    _GM_KEYS,
+    },
+    "Commodities_FX": {
+        "headers": _CF_HEADERS,
+        "keys":    _CF_KEYS,
+    },
+    "Mutual_Funds": {
+        "headers": _MF_HEADERS,
+        "keys":    _MF_KEYS,
+    },
+    "My_Portfolio": {
+        "headers": _MP_HEADERS,
+        "keys":    _MP_KEYS,
+    },
+    "My_Investments": {
+        "headers": list(INSTRUMENT_CANONICAL_HEADERS),
+        "keys":    list(INSTRUMENT_CANONICAL_KEYS),
+    },
+    "Top_10_Investments": {
+        "headers": _T10_HEADERS,
+        "keys":    _T10_KEYS,
+    },
+    "Insights_Analysis": {
+        "headers": _INSIGHTS_HEADERS_V34,
+        "keys":    _INSIGHTS_KEYS_V34,
+    },
+    "Data_Dictionary": {
+        "headers": list(DATA_DICTIONARY_HEADERS),
+        "keys":    list(DATA_DICTIONARY_KEYS),
+    },
 }
 
 INSTRUMENT_SHEETS: Set[str] = {
@@ -525,9 +604,8 @@ def _dedupe_keep_order(items: Sequence[Any]) -> List[Any]:
 
 
 def _page_catalog_candidates() -> List[Any]:
-    # FIX v5.49.0: added "page_catalog" repo-root fallback (3rd candidate)
     modules: List[Any] = []
-    for mod_path in ("core.sheets.page_catalog", "sheets.page_catalog", "page_catalog"):
+    for mod_path in ("core.sheets.page_catalog", "sheets.page_catalog"):
         try:
             modules.append(import_module(mod_path))
         except Exception:
@@ -1239,6 +1317,82 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "last_updated_utc": ("last_updated_utc", "lastUpdated", "updatedAt", "timestamp", "asOf"),
     "last_updated_riyadh": ("last_updated_riyadh",),
     "warnings": ("warnings", "warning", "messages", "errors"),
+    # ── NEW v5.50.0: quality fundamentals ────────────────────────────────────
+    "roe": ("roe", "returnOnEquity", "ReturnOnEquityTTM", "ROE", "return_on_equity"),
+    "roa": ("roa", "returnOnAssets", "ReturnOnAssetsTTM", "ROA", "return_on_assets"),
+    # ── NEW v5.50.0: derived / technical signals ──────────────────────────────
+    "price_change_5d":    ("price_change_5d", "priceChange5d", "change5d", "fiveDayChange"),
+    "volume_ratio":       ("volume_ratio", "volumeRatio", "volRatio"),
+    "rsi_signal":         ("rsi_signal", "rsiSignal"),
+    "technical_score":    ("technical_score", "technicalScore", "techScore"),
+    "day_range_position": ("day_range_position", "dayRangePosition", "dayRangePos"),
+    "atr_14":             ("atr_14", "atr", "averageTrueRange", "ATR"),
+    "upside_pct":         ("upside_pct", "upsidePct", "upsidePercent", "upside_percent"),
+    "short_term_signal":  ("short_term_signal", "shortTermSignal", "stSignal"),
+    # ── NEW v5.50.0: EODHD technicals ─────────────────────────────────────────
+    "ma_50d":    ("ma_50d", "fiftyDayAverage", "sma50", "ma50", "movingAverage50", "50DayMA"),
+    "ma_200d":   ("ma_200d", "twoHundredDayAverage", "sma200", "ma200", "movingAverage200", "200DayMA"),
+    "ema_signal":  ("ema_signal", "emaSignal", "ema50Signal"),
+    "macd_signal": ("macd_signal", "macdSignal", "MACDSignal", "macd"),
+    # ── NEW v5.50.0: Global_Markets context ───────────────────────────────────
+    "region":       ("region", "Region", "marketRegion"),
+    "market_status":("market_status", "marketState", "marketStatus", "tradingStatus"),
+    "price_usd":    ("price_usd", "priceUSD", "priceInUSD"),
+    # ── NEW v5.50.0: Sector analysis ──────────────────────────────────────────
+    "sector_pe_avg":      ("sector_pe_avg", "sectorPE", "sectorAvgPE", "sector_avg_pe"),
+    "vs_sector_pe_pct":   ("vs_sector_pe_pct", "vsSectorPE", "stockVsSectorPE"),
+    "sector_ytd_pct":     ("sector_ytd_pct", "sectorYTD", "sector_ytd"),
+    "sector_signal":      ("sector_signal", "sectorSignal", "sectorMomentum"),
+    "sector_rank":        ("sector_rank", "sectorRank"),
+    "sector_vs_msci_pct": ("sector_vs_msci_pct", "sectorVsMSCI"),
+    "vs_sp500_ytd":       ("vs_sp500_ytd", "vsSP500YTD", "vs_sp500"),
+    "vs_msci_world_ytd":  ("vs_msci_world_ytd", "vsMSCIWorld"),
+    "wall_st_target":     ("wall_st_target", "wallStTarget", "WallStreetTargetPrice", "analystTargetPrice"),
+    "upside_to_target_pct": ("upside_to_target_pct", "upsideToTarget"),
+    "analyst_consensus":  ("analyst_consensus", "analystConsensus", "analystRatingConsensus"),
+    "country_risk":       ("country_risk", "countryRisk", "sovereignRating"),
+    # ── NEW v5.50.0: Commodities_FX ───────────────────────────────────────────
+    "commodity_type":  ("commodity_type", "commodityType", "assetType"),
+    "contract_expiry": ("contract_expiry", "contractExpiry", "expireDate", "expiryDate"),
+    "spot_price":      ("spot_price", "spotPrice"),
+    "usd_correlation": ("usd_correlation", "usdCorrelation", "corrWithDXY"),
+    "seasonal_signal": ("seasonal_signal", "seasonalSignal"),
+    "carry_rate":      ("carry_rate", "carryRate", "interestRateDiff"),
+    # ── NEW v5.50.0: Mutual_Funds / ETFs ──────────────────────────────────────
+    "fund_type":           ("fund_type", "fundType", "quoteType", "fundCategory"),
+    "benchmark_name":      ("benchmark_name", "benchmarkName", "category", "fundBenchmark"),
+    "holdings_count":      ("holdings_count", "holdingsCount", "numberOfHoldings"),
+    "aum":                 ("aum", "totalAssets", "AUM", "fundAUM"),
+    "expense_ratio":       ("expense_ratio", "expenseRatio", "annualReportExpenseRatio"),
+    "nav":                 ("nav", "navPrice", "netAssetValue", "NAV"),
+    "nav_premium_pct":     ("nav_premium_pct", "navPremiumPct", "premiumDiscount"),
+    "distribution_yield":  ("distribution_yield", "distributionYield"),
+    "ytd_return":          ("ytd_return", "ytdReturn", "yearToDateReturn"),
+    "return_1y":           ("return_1y", "oneYearReturn", "annualReturn", "trailingReturn1Y"),
+    "return_3y_ann":       ("return_3y_ann", "threeYearAverageReturn", "return3Year"),
+    "return_5y_ann":       ("return_5y_ann", "fiveYearAverageReturn", "return5Year"),
+    "tracking_error":      ("tracking_error", "trackingError"),
+    "alpha_1y":            ("alpha_1y", "alpha", "alphaJensen"),
+    # ── NEW v5.50.0: My_Portfolio advanced ────────────────────────────────────
+    "portfolio_weight_pct":("portfolio_weight_pct", "portfolioWeight", "weightPct"),
+    "target_weight_pct":   ("target_weight_pct", "targetWeight"),
+    "weight_deviation":    ("weight_deviation", "weightDeviation"),
+    "rebalance_signal":    ("rebalance_signal", "rebalanceSignal"),
+    "stop_loss":           ("stop_loss", "stopLoss", "stopLossPrice"),
+    "take_profit":         ("take_profit", "takeProfit", "takeProfitPrice"),
+    "distance_to_sl_pct":  ("distance_to_sl_pct", "distToSL", "distanceToStopLoss"),
+    "distance_to_tp_pct":  ("distance_to_tp_pct", "distToTP", "distanceToTakeProfit"),
+    "days_held":           ("days_held", "daysHeld", "holdingPeriodDays"),
+    "annual_dividend_income": ("annual_dividend_income", "annualDividendIncome"),
+    "beta_contribution":   ("beta_contribution", "betaContribution"),
+    # ── NEW v5.50.0: Top10 trade setup ────────────────────────────────────────
+    "entry_price":           ("entry_price", "entryPrice", "suggestedEntry"),
+    "stop_loss_suggested":   ("stop_loss_suggested", "stopLossSuggested", "aiStopLoss"),
+    "take_profit_suggested": ("take_profit_suggested", "takeProfitSuggested", "aiTakeProfit"),
+    "risk_reward_ratio":     ("risk_reward_ratio", "riskRewardRatio", "rrRatio"),
+    # ── NEW v5.50.0: Insights v3.4.0 ─────────────────────────────────────────
+    "signal":   ("signal", "Signal", "actionSignal"),
+    "priority": ("priority", "Priority", "alertPriority"),
 }
 
 _COMMODITY_SYMBOL_HINTS: Tuple[str, ...] = ("GC=F", "SI=F", "BZ=F", "CL=F", "NG=F", "HG=F")
@@ -1572,14 +1726,7 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
 
     high52 = _as_float(out.get("week_52_high"))
     low52 = _as_float(out.get("week_52_low"))
-    # FIX v5.48.0/v5.49.0: normalize week_52_position_pct to pct-points.
-    # Providers (eodhd, history patch) supply fractions (0-1). Convert here so
-    # TFB_PERCENT_MODE=points displays 91.48 not 0.91.
-    pos52 = _as_float(out.get("week_52_position_pct"))
-    if pos52 is not None:
-        if abs(pos52) <= 1.5:
-            out["week_52_position_pct"] = round(pos52 * 100.0, 6)
-    elif price is not None and high52 is not None and low52 is not None and high52 > low52:
+    if price is not None and high52 is not None and low52 is not None and high52 > low52 and out.get("week_52_position_pct") is None:
         out["week_52_position_pct"] = round(((price - low52) / (high52 - low52)) * 100.0, 6)
 
     qty = _as_float(out.get("position_qty"))
@@ -1594,9 +1741,7 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
         out["unrealized_pl"] = round(pos_val - pos_cost, 6)
     upl = _as_float(out.get("unrealized_pl"))
     if upl is not None and pos_cost not in (None, 0) and out.get("unrealized_pl_pct") is None:
-        # FIX v5.49.0: store as FRACTION (dtype=pct schema contract).
-        # 0.0142 = 1.42% unrealized P/L, NOT 1.42.
-        out["unrealized_pl_pct"] = round(upl / pos_cost, 6)
+        out["unrealized_pl_pct"] = round((upl / pos_cost) * 100.0, 6)
 
     out = _apply_symbol_context_defaults(out, symbol=inferred_symbol)
     if _as_float(out.get("current_price")) is not None and _safe_str(out.get("warnings")).lower() == "no live provider data available":
@@ -1625,6 +1770,169 @@ def _normalize_to_schema_keys(keys: Sequence[str], headers: Sequence[str], row: 
     return out
 
 
+
+# =============================================================================
+# Static lookup tables (v5.50.0)
+# =============================================================================
+
+_COMMODITY_TYPE_LOOKUP: Dict[str, str] = {
+    "GC=F": "Metal", "SI=F": "Metal", "HG=F": "Metal", "PL=F": "Metal", "PA=F": "Metal",
+    "CL=F": "Energy", "BZ=F": "Energy", "NG=F": "Energy", "RB=F": "Energy", "HO=F": "Energy",
+    "ZC=F": "Agriculture", "ZW=F": "Agriculture", "ZS=F": "Agriculture",
+    "KC=F": "Agriculture", "CT=F": "Agriculture", "CC=F": "Agriculture", "SB=F": "Agriculture",
+    "BTC-USD": "Crypto", "ETH-USD": "Crypto",
+}
+
+_SEASONAL_SIGNAL_LOOKUP: Dict[str, Dict[int, str]] = {
+    "GC=F":  {9: "Bullish", 10: "Bullish", 11: "Bullish", 12: "Bullish", 1: "Bullish", 6: "Bearish"},
+    "SI=F":  {9: "Bullish", 10: "Bullish", 11: "Bullish", 12: "Bullish"},
+    "CL=F":  {6: "Bullish", 7: "Bullish", 8: "Bullish", 12: "Bearish", 1: "Bearish"},
+    "BZ=F":  {5: "Bullish", 6: "Bullish", 7: "Bullish", 8: "Bullish"},
+    "NG=F":  {11: "Bullish", 12: "Bullish", 1: "Bullish", 2: "Bullish"},
+}
+
+_REGION_LOOKUP: Dict[str, str] = {
+    "USA": "Americas", "US": "Americas", "United States": "Americas",
+    "Canada": "Americas", "Brazil": "Americas", "Mexico": "Americas",
+    "United Kingdom": "Europe", "UK": "Europe", "Germany": "Europe",
+    "France": "Europe", "Switzerland": "Europe", "Netherlands": "Europe",
+    "Sweden": "Europe", "Spain": "Europe", "Italy": "Europe",
+    "Japan": "Asia-Pacific", "China": "Asia-Pacific", "South Korea": "Asia-Pacific",
+    "Australia": "Asia-Pacific", "India": "Asia-Pacific", "Hong Kong": "Asia-Pacific",
+    "Singapore": "Asia-Pacific", "Taiwan": "Asia-Pacific",
+    "Saudi Arabia": "MENA", "UAE": "MENA", "United Arab Emirates": "MENA",
+    "Qatar": "MENA", "Kuwait": "MENA", "Bahrain": "MENA",
+    "Egypt": "MENA", "Israel": "MENA", "Turkey": "MENA",
+    "Global": "Global", "Multi-Country": "Global", "Multi": "Global",
+}
+
+
+def _get_seasonal_signal(symbol: str) -> str:
+    month = datetime.now().month
+    signals = _SEASONAL_SIGNAL_LOOKUP.get(normalize_symbol(symbol), {})
+    return signals.get(month, "Neutral")
+
+
+# =============================================================================
+# Scoring module integration (v5.50.0)
+# =============================================================================
+
+_scoring_mod: Any = None
+_scoring_mod_tried = False
+
+
+def _get_scoring_mod() -> Any:
+    global _scoring_mod, _scoring_mod_tried
+    if _scoring_mod_tried:
+        return _scoring_mod
+    _scoring_mod_tried = True
+    for _path in ("core.scoring", "scoring"):
+        try:
+            _scoring_mod = import_module(_path)
+            if callable(getattr(_scoring_mod, "compute_scores", None)):
+                break
+            _scoring_mod = None
+        except Exception:
+            _scoring_mod = None
+    return _scoring_mod
+
+
+def _try_scoring_module(row: Dict[str, Any], settings: Any = None) -> None:
+    """
+    Enrich row in-place using scoring.py v3.0.0 if available.
+    Only writes fields that are currently None or empty.
+    Falls back to _compute_scores_fallback() when unavailable.
+    """
+    mod = _get_scoring_mod()
+    if mod is not None:
+        try:
+            patch = mod.compute_scores(row, settings=settings)
+            if isinstance(patch, dict):
+                for k, v in patch.items():
+                    if v is not None and row.get(k) in (None, "", [], {}):
+                        row[k] = v
+            return
+        except Exception:
+            pass
+    _try_scoring_module(row)
+
+
+# =============================================================================
+# Derived column computation (v5.50.0)
+# =============================================================================
+
+def _derive_new_columns(row: Dict[str, Any], page: str = "") -> None:
+    """
+    Compute derived schema_registry v3.4.0 columns in-place.
+    No network calls — pure math on existing row data.
+    Called after provider data is merged and before scoring.
+    """
+    target = _canonicalize_sheet_name(page) if page else ""
+
+    # volume_ratio
+    if row.get("volume_ratio") in (None, ""):
+        vol = _as_float(row.get("volume"))
+        avg_vol = _as_float(row.get("avg_volume_10d")) or _as_float(row.get("avg_volume_30d"))
+        if vol is not None and avg_vol is not None and avg_vol > 0:
+            row["volume_ratio"] = round(vol / avg_vol, 4)
+
+    # day_range_position
+    if row.get("day_range_position") in (None, ""):
+        price = _as_float(row.get("current_price"))
+        low   = _as_float(row.get("day_low"))
+        high  = _as_float(row.get("day_high"))
+        if price is not None and low is not None and high is not None:
+            rng = high - low
+            if rng > 0:
+                row["day_range_position"] = round(_clamp((price - low) / rng, 0.0, 1.0), 4)
+
+    # upside_pct
+    if row.get("upside_pct") in (None, ""):
+        price     = _as_float(row.get("current_price"))
+        intrinsic = _as_float(row.get("intrinsic_value")) or _as_float(row.get("target_price"))
+        if price is not None and price > 0 and intrinsic is not None and intrinsic > 0:
+            row["upside_pct"] = round((intrinsic - price) / price, 4)
+
+    # rsi_signal
+    if row.get("rsi_signal") in (None, ""):
+        rsi = _as_float(row.get("rsi_14"))
+        if rsi is not None:
+            row["rsi_signal"] = "Oversold" if rsi < 30 else "Overbought" if rsi > 70 else "Neutral"
+
+    # price_change_5d: ensure pct-points (not fraction)
+    p5d = _as_float(row.get("price_change_5d"))
+    if p5d is not None and abs(p5d) <= 1.5:
+        row["price_change_5d"] = round(p5d * 100.0, 4)
+
+    # nav_premium_pct (funds)
+    if row.get("nav_premium_pct") in (None, "") and target in {"Mutual_Funds", "mutual_funds_table"}:
+        price = _as_float(row.get("current_price"))
+        nav   = _as_float(row.get("nav"))
+        if price is not None and nav is not None and nav > 0:
+            row["nav_premium_pct"] = round((price - nav) / nav, 4)
+
+    # region (global/fund pages)
+    if row.get("region") in (None, "") and target in {"Global_Markets", "Mutual_Funds", "global_markets_table", "mutual_funds_table"}:
+        country = _safe_str(row.get("country"))
+        row["region"] = _REGION_LOOKUP.get(country, "Global")
+
+    # commodity_type + seasonal_signal (commodities page)
+    if target in {"Commodities_FX", "commodities_table"} or _safe_str(row.get("asset_class")).lower() in {"commodity", "fx", "currency", "futures"}:
+        sym = normalize_symbol(_safe_str(row.get("symbol") or row.get("requested_symbol")))
+        if row.get("commodity_type") in (None, ""):
+            if sym in _COMMODITY_TYPE_LOOKUP:
+                row["commodity_type"] = _COMMODITY_TYPE_LOOKUP[sym]
+            elif sym.endswith("=X"):
+                row["commodity_type"] = "FX Pair"
+            elif sym.endswith("=F"):
+                row["commodity_type"] = "Futures"
+            elif "-USD" in sym:
+                row["commodity_type"] = "Crypto"
+        if row.get("seasonal_signal") in (None, ""):
+            row["seasonal_signal"] = _get_seasonal_signal(sym)
+        if row.get("contract_expiry") in (None, "") and sym.endswith("=X"):
+            row["contract_expiry"] = "Spot"
+
 def _apply_page_row_backfill(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
     target = _canonicalize_sheet_name(sheet)
     out = _apply_symbol_context_defaults(dict(row or {}), page=target)
@@ -1647,7 +1955,10 @@ def _apply_page_row_backfill(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
             conf = conf_fraction * 100.0 if conf_fraction <= 1.5 else conf_fraction
             out.setdefault("confidence_score", round(_clamp(conf, 0.0, 100.0), 2))
     if conf is not None and out.get("confidence_bucket") in (None, ""):
-        out["confidence_bucket"] = "HIGH" if conf >= 75 else "MODERATE" if conf >= 55 else "LOW"
+        out["confidence_bucket"] = "High" if conf >= 75 else "Moderate" if conf >= 55 else "Low"
+
+    # ── v5.50.0: compute all new derived columns ──────────────────────────────
+    _derive_new_columns(out, page=target)
 
     if target == "Commodities_FX" or sym.endswith("=F") or sym.endswith("=X"):
         out.setdefault("data_provider", _safe_str(out.get("data_provider"), "history_or_fallback"))
@@ -1657,9 +1968,15 @@ def _apply_page_row_backfill(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
             out["confidence_score"] = 55.0
         if out.get("forecast_confidence") not in (None, "") and out.get("confidence_bucket") in (None, ""):
             conf = _as_float(out.get("confidence_score")) or ((_as_float(out.get("forecast_confidence")) or 0.55) * 100.0)
-            out["confidence_bucket"] = "HIGH" if conf >= 75 else "MODERATE" if conf >= 55 else "LOW"
+            out["confidence_bucket"] = "High" if conf >= 75 else "Moderate" if conf >= 55 else "Low"
         if out.get("warnings") in (None, "") and _as_float(out.get("current_price")) is None:
             out["warnings"] = "Live quote sparse; chart/history fallback unavailable"
+        # Commodity-specific: clear equity-only fields that have no meaning
+        for _eq_key in ("pe_ttm", "pe_forward", "eps_ttm", "peg_ratio", "revenue_ttm",
+                        "payout_ratio", "gross_margin", "operating_margin",
+                        "profit_margin", "debt_to_equity", "free_cash_flow_ttm", "roe", "roa"):
+            if _eq_key in out and out[_eq_key] is None:
+                pass  # leave None — don't fabricate
 
     if target == "Mutual_Funds":
         if out.get("asset_class") in (None, ""):
@@ -1678,6 +1995,72 @@ def _apply_page_row_backfill(sheet: str, row: Dict[str, Any]) -> Dict[str, Any]:
             out["invest_period_label"] = "1Y"
         if out.get("horizon_days") in (None, ""):
             out["horizon_days"] = 365
+        # Fund type defaults
+        if out.get("fund_type") in (None, "") and sym in _ETF_SYMBOL_HINTS:
+            out["fund_type"] = "ETF"
+        if out.get("distribution_yield") in (None, ""):
+            dy = _as_float(out.get("dividend_yield"))
+            if dy is not None:
+                out["distribution_yield"] = dy
+
+    # ── v5.50.0: Global_Markets page defaults ─────────────────────────────────
+    if target == "Global_Markets":
+        if out.get("region") in (None, ""):
+            country = _safe_str(out.get("country"))
+            out["region"] = _REGION_LOOKUP.get(country, "Global")
+        if out.get("market_status") in (None, ""):
+            # Yahoo provides marketState — default Closed if unknown
+            ms = _safe_str(out.get("marketState") or out.get("market_state") or "")
+            if ms.upper() in {"REGULAR", "OPEN"}:
+                out["market_status"] = "Open"
+            elif ms.upper() in {"PRE", "PREMARKET"}:
+                out["market_status"] = "Pre-Market"
+            elif ms.upper() in {"POST", "POSTMARKET"}:
+                out["market_status"] = "After-Hours"
+            else:
+                out["market_status"] = "Closed"
+        if out.get("price_usd") in (None, ""):
+            price = _as_float(out.get("current_price"))
+            ccy   = _safe_str(out.get("currency", "USD")).upper()
+            if price is not None and ccy == "USD":
+                out["price_usd"] = price
+            # Non-USD requires FX rate — leave None for provider to fill
+        # country_risk defaults
+        if out.get("country_risk") in (None, ""):
+            country = _safe_str(out.get("country", ""))
+            # Simple heuristic: Saudi/UAE/Gulf = Inv Grade, others default
+            if country in {"Saudi Arabia", "UAE", "Qatar", "Kuwait", "USA",
+                           "United States", "Germany", "Japan", "Australia",
+                           "United Kingdom", "France", "Switzerland", "Canada"}:
+                out["country_risk"] = "Inv Grade"
+            elif country in {"Global", "Multi-Country", "Multi", ""}:
+                out["country_risk"] = "Mixed"
+
+    # ── v5.50.0: My_Portfolio page defaults ───────────────────────────────────
+    if target == "My_Portfolio":
+        # Position P/L derivation
+        qty       = _as_float(out.get("position_qty"))
+        avg_cost  = _as_float(out.get("avg_cost"))
+        price     = _as_float(out.get("current_price"))
+        if qty is not None and avg_cost is not None and out.get("position_cost") in (None, ""):
+            out["position_cost"] = round(qty * avg_cost, 4)
+        if qty is not None and price is not None and out.get("position_value") in (None, ""):
+            out["position_value"] = round(qty * price, 4)
+        pos_val  = _as_float(out.get("position_value"))
+        pos_cost = _as_float(out.get("position_cost"))
+        if pos_val is not None and pos_cost is not None and out.get("unrealized_pl") in (None, ""):
+            out["unrealized_pl"] = round(pos_val - pos_cost, 4)
+        upl = _as_float(out.get("unrealized_pl"))
+        if upl is not None and pos_cost not in (None, 0) and out.get("unrealized_pl_pct") in (None, ""):
+            out["unrealized_pl_pct"] = round(upl / pos_cost, 4)
+        # Distance to stop/take profit
+        sl = _as_float(out.get("stop_loss"))
+        tp = _as_float(out.get("take_profit"))
+        if price is not None and sl is not None and price > 0 and out.get("distance_to_sl_pct") in (None, ""):
+            out["distance_to_sl_pct"] = round((price - sl) / price, 4)
+        if price is not None and tp is not None and price > 0 and out.get("distance_to_tp_pct") in (None, ""):
+            out["distance_to_tp_pct"] = round((tp - price) / price, 4)
+        # Beta contribution (needs weight — left for page-level aggregation)
 
     if target in {"Global_Markets", "Market_Leaders", "My_Portfolio", "Top_10_Investments"}:
         asset_class = _safe_str(out.get("asset_class"))
@@ -1775,9 +2158,11 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         row["quality_score"] = round(_clamp(float(quality_score), 0.0, 100.0), 2)
 
     if row.get("momentum_score") is None:
-        # FIX v5.48.0/v5.49.0: percent_change is pct-points after _canonicalize_provider_row.
-        # Using _as_pct_points doubled values <= 1.5 (e.g. 1.42 → 142) → score = 100 for all.
-        pct = _as_float(row.get("percent_change")) or _as_float(row.get("change_cpt")) or _as_float(row.get("change_pct")) or 0.0
+        pct = _as_pct_points(row.get("percent_change"))
+        if pct is None:
+            pct = _as_pct_points(row.get("change_pct"))
+        if pct is None:
+            pct = 0.0
         row["momentum_score"] = round(_clamp(50.0 + pct, 0.0, 100.0), 2)
 
     if row.get("growth_score") is None:
@@ -1869,22 +2254,22 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
 
 
 def _compute_recommendation(row: Dict[str, Any]) -> None:
-    _CANONICAL_RECO_MAP: Dict[str, str] = {
-        "ACCUMULATE": "BUY", "ADD": "BUY", "OUTPERFORM": "BUY", "OVERWEIGHT": "BUY",
-        "STRONG BUY": "STRONG_BUY", "STRONGBUY": "STRONG_BUY", "STRONG_BUY": "STRONG_BUY",
-        "BUY": "BUY", "HOLD": "HOLD", "NEUTRAL": "HOLD", "MARKET PERFORM": "HOLD",
-        "REDUCE": "REDUCE", "UNDERPERFORM": "REDUCE", "UNDERWEIGHT": "REDUCE", "AVOID": "REDUCE",
-        "SELL": "SELL", "STRONG SELL": "SELL", "STRONG_SELL": "SELL",
-    }
+    # v5.50.0: use canonical codes matching scoring.py v3.0.0 CANONICAL_RECOMMENDATION_CODES
     if row.get("recommendation"):
         return
     overall = _as_float(row.get("overall_score")) or 50.0
-    conf = _as_float(row.get("confidence_score")) or 55.0
-    risk = _as_float(row.get("risk_score")) or 50.0
-    if overall >= 75 and conf >= 65 and risk <= 60:
+    conf    = _as_float(row.get("confidence_score")) or 55.0
+    risk    = _as_float(row.get("risk_score")) or 50.0
+    tech    = _as_float(row.get("technical_score"))
+
+    if overall >= 78 and conf >= 70 and risk <= 45:
+        rec = "STRONG_BUY"
+    elif overall >= 72 and conf >= 65 and risk <= 60:
         rec = "BUY"
     elif overall >= 60 and conf >= 55:
-        rec = "BUY"          # FIX v5.48.0/v5.49.0: ACCUMULATE was non-canonical, now BUY
+        rec = "BUY"
+    elif tech is not None and tech >= 65 and conf >= 55:
+        rec = "BUY"  # strong technical setup
     elif overall <= 35 or risk >= 85:
         rec = "REDUCE"
     else:
@@ -1892,7 +2277,8 @@ def _compute_recommendation(row: Dict[str, Any]) -> None:
     row["recommendation"] = rec
     row.setdefault(
         "recommendation_reason",
-        f"overall={round(overall,1)} confidence={round(conf,1)} risk={round(risk,1)}",
+        f"overall={round(overall,1)} conf={round(conf,1)} risk={round(risk,1)}" +
+        (f" tech={round(tech,1)}" if tech is not None else ""),
     )
 
 
@@ -1979,23 +2365,14 @@ async def _call_maybe_async(fn: Any, *args: Any, **kwargs: Any) -> Any:
 # =============================================================================
 # Schema registry helpers
 # =============================================================================
-# FIX v5.49.0: multi-path import, same pattern as data_dictionary.py v3.3.0
-_RAW_SCHEMA_REGISTRY: dict = {}
-_RAW_GET_SHEET_SPEC = None
-_SCHEMA_AVAILABLE = False
-for _sreg_path in ("core.sheets.schema_registry", "core.schema_registry", "schema_registry"):
-    try:
-        _sreg_mod = import_module(_sreg_path)
-        _cand_reg = getattr(_sreg_mod, "SCHEMA_REGISTRY", None)
-        _cand_fn  = getattr(_sreg_mod, "get_sheet_spec", None)
-        if isinstance(_cand_reg, dict) or callable(_cand_fn):
-            _RAW_SCHEMA_REGISTRY = _cand_reg if isinstance(_cand_reg, dict) else {}
-            _RAW_GET_SHEET_SPEC   = _cand_fn if callable(_cand_fn) else None
-            _SCHEMA_AVAILABLE     = True
-            break
-    except Exception:
-        continue
-del _sreg_path
+try:
+    from core.sheets.schema_registry import SCHEMA_REGISTRY as _RAW_SCHEMA_REGISTRY  # type: ignore
+    from core.sheets.schema_registry import get_sheet_spec as _RAW_GET_SHEET_SPEC  # type: ignore
+    _SCHEMA_AVAILABLE = True
+except Exception:
+    _RAW_SCHEMA_REGISTRY = {}
+    _RAW_GET_SHEET_SPEC = None
+    _SCHEMA_AVAILABLE = False
 
 SCHEMA_REGISTRY = _RAW_SCHEMA_REGISTRY if isinstance(_RAW_SCHEMA_REGISTRY, dict) else {}
 
@@ -3390,9 +3767,7 @@ class DataEngineV5:
             "sharpe_1y": sharpe,
             "rsi_14": rsi,
             "price_change": closes[-1] - closes[-2],
-            # FIX v5.48.0/v5.49.0: store as FRACTION (dtype=pct schema contract).
-            # _canonicalize_provider_row will convert to percent-points.
-            "percent_change": ((closes[-1] - closes[-2]) / closes[-2]) if closes[-2] not in (None, 0) else None,
+            "percent_change": ((closes[-1] - closes[-2]) / closes[-2]) * 100.0 if closes[-2] not in (None, 0) else None,
             "volume": volumes[-1] if volumes else None,
         }
         if patch.get("current_price") is not None and patch.get("week_52_high") is not None and patch.get("week_52_low") is not None:
@@ -3400,8 +3775,7 @@ class DataEngineV5:
             lo = _as_float(patch.get("week_52_low"))
             cp = _as_float(patch.get("current_price"))
             if hi is not None and lo is not None and cp is not None and hi > lo:
-                # FIX v5.48.0/v5.49.0: store as fraction (0-1). _canonicalize_provider_row converts to pct-points.
-                patch["week_52_position_pct"] = (cp - lo) / (hi - lo)
+                patch["week_52_position_pct"] = ((cp - lo) / (hi - lo)) * 100.0
         return {k: v for k, v in patch.items() if v is not None}
 
     async def _fetch_history_patch(self, provider: str, symbol: str) -> Dict[str, Any]:
@@ -3546,7 +3920,7 @@ class DataEngineV5:
                 "last_updated_riyadh": _now_riyadh_iso(),
             }
             row = _apply_symbol_context_defaults(row, symbol=_safe_str(symbol))
-            _compute_scores_fallback(row)
+            _try_scoring_module(row)
             _compute_recommendation(row)
             return UnifiedQuote(**row)
 
@@ -3622,7 +3996,8 @@ class DataEngineV5:
         elif _as_float(row.get("current_price")) is None and not row.get("warnings"):
             row["warnings"] = "No live quote payload and no usable history fallback"
 
-        _compute_scores_fallback(row)
+        _derive_new_columns(row, page=page_context)
+        _try_scoring_module(row)
         _compute_recommendation(row)
         row["data_quality"] = self._data_quality(row)
         row["data_provider"] = row.get("data_provider") or ((row.get("data_sources") or [""])[0] if isinstance(row.get("data_sources"), list) else "")
@@ -3964,7 +4339,7 @@ class DataEngineV5:
         for q in quotes:
             row = _model_to_dict(q)
             row = _apply_page_row_backfill("Top_10_Investments", row)
-            _compute_scores_fallback(row)
+            _try_scoring_module(row)
             _compute_recommendation(row)
             rows.append(row)
 
@@ -4490,23 +4865,16 @@ class DataEngineV5:
         if requested_symbols:
             snapshot_map = self._get_cached_snapshot_symbol_map(target_sheet)
             quotes = await self.get_enriched_quotes(requested_symbols, schema=None, page=target_sheet, body=body)
-            # FIX v5.48.0/v5.49.0: deduplicate by normalized symbol before assembling rows.
-            _seen_row_symbols: Set[str] = set()
             for q in quotes:
                 row = _model_to_dict(q)
                 sym = normalize_symbol(_safe_str(row.get("symbol") or row.get("requested_symbol")))
-                if sym and sym in _seen_row_symbols:
-                    logger.debug("data_engine_v2: skipping duplicate symbol %s for sheet %s", sym, target_sheet)
-                    continue
-                if sym:
-                    _seen_row_symbols.add(sym)
                 if sym and sym in snapshot_map:
                     row = _merge_missing_fields(row, snapshot_map[sym])
                 best_snapshot_row = self._get_best_cached_snapshot_row_for_symbol(sym, prefer_sheet=target_sheet) if sym else None
                 if best_snapshot_row:
                     row = _merge_missing_fields(row, best_snapshot_row)
                 row = _apply_page_row_backfill(target_sheet, row)
-                _compute_scores_fallback(row)
+                _try_scoring_module(row)
                 _compute_recommendation(row)
                 rows_full.append(_strict_project_row(out_keys, _normalize_to_schema_keys(out_keys, out_headers, row)))
             _apply_rank_overall(rows_full)
