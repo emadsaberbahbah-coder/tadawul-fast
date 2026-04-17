@@ -420,7 +420,7 @@ def main() -> int:
             logger.info("=" * 60)
             logger.info("CACHE CLEANUP COMPLETE (v%s)", SCRIPT_VERSION)
             logger.info("=" * 60)
-            logger.info("Duration:     %.2fs", stats.duration_sec)
+            logger.info("Duration:    %.2fs", stats.duration_sec)
             logger.info("Redis Keys:   %s", stats.keys_deleted)
             logger.info("Disk Freed:   %.2f MB", stats.disk_freed_mb)
             logger.info("Namespaces:   %s", ", ".join(stats.namespaces_cleared) if stats.namespaces_cleared else "None")
