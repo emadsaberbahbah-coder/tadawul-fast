@@ -514,6 +514,7 @@ class UnifiedQuote(BaseModel):
             if self.symbol and not self.symbol_normalized:
                 self.symbol_normalized = self.symbol.upper()
             if self.recommendation is None and self.info and isinstance(self.info, str):
+                from core.reco_normalize import normalize_recommendation
                 self.recommendation = normalize_recommendation(self.info)
             return self
     else:  # pragma: no cover
@@ -598,6 +599,11 @@ _RECOMMENDATION_ALIASES = {
 
 
 def normalize_recommendation(v: Any) -> Optional[Recommendation]:
+    from core.reco_normalize import normalize_recommendation as rn
+    try:
+        return Recommendation(rn(v))
+    except Exception:
+        pass
     if v is None:
         return None
     if isinstance(v, Recommendation):
