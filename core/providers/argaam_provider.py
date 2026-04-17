@@ -2,44 +2,35 @@
 """
 core/providers/argaam_provider.py
 ===============================================================
-Argaam Provider (KSA Market Data) -- v4.5.0
+Argaam Provider (KSA Market Data) — v4.6.0
 PROFILE + CLASSIFICATION + HISTORY FALLBACK + ROUTER/ENGINE COMPAT
 
-v4.5.0 changes vs v4.4.0
---------------------------
-FIX CRITICAL: All dtype=pct fields now stored as fractions (0.0142 = 1.42%).
-  v4.4.0 used _safe_float() which returned raw API values (e.g. 1.42 for 1.42%
-  change) causing a 100x display error in Google Sheets.
-  Fixed fields: percent_change, week_52_position_pct, dividend_yield,
-    gross_margin, operating_margin, profit_margin, volatility_30d/90d,
-    expected_roi_1m/3m/12m, payout_ratio.
-  New helper: _as_fraction(v) -- normalises any percent-like value to fraction:
-    "1.42%" -> 0.0142  |  1.42 -> 0.0142  |  0.0142 -> 0.0142
+What this revision improves
+---------------------------
+- Keeps env-driven URL templates (no hard-coded endpoints)
+- Uses profile + quote + optional history together
+- Adds stronger KSA classification/profile mapping:
+    - exchange / market / country / currency / asset_class
+    - sector / industry / name
+- Adds history-derived fallback for:
+    - current_price / previous_close / open_price / day_high / day_low / volume
+    - avg_volume_10d / avg_volume_30d
+    - week_52_high / week_52_low / week_52_position_pct
+- Returns engine-friendly patches with explicit error payloads on failure
+- Broadens compatibility methods for routers / engines / legacy callers
 
-FIX: _history_stats() now returns week_52_position_pct as fraction (0.0142).
-  v4.4.0 returned it as percent (0..100) from _week_52_position_pct().
+Required env templates
+----------------------
+- ARGAAM_QUOTE_URL
+- ARGAAM_PROFILE_URL   (optional but recommended)
+- ARGAAM_HISTORY_URL   (optional but recommended)
 
-FIX: percent_change computed from price_change/previous_close is now stored
-  as fraction, not percent points.
-
-FIX: price_change derived from percent_change now correctly back-converts
-  from fraction (fraction * previous_close = price change in currency).
-
-ENH: get_enriched_quotes_batch() added to ArgaamClient and ArgaamProvider
-  for engine batch-fetch compatibility (single semaphore-guarded gather).
-
-ENH: PROVIDER_BATCH_SUPPORTED = True exported for engine capability detection.
-
-ENH: fetch_enriched_quotes_batch() module-level function added.
-
-ENH: data_quality logic tightened -- GOOD requires current_price; DEGRADED
-  means some data but no price; MISSING means empty fetch.
-
-Preserved from v4.4.0:
-  All env-driven URL templates, TTL cache, retry/backoff logic.
-  Profile + quote + history parallel fetch pattern.
-  KSA symbol normalisation (numeric code <-> .SR suffix).
-  router/engine compatibility aliases.
+Notes
+-----
+- Templates may use {symbol}; both "2222" and "2222.SR" are tried.
+- This provider is best used as KSA profile/classification enrichment over the
+  Tadawul price/history path, but it now also contributes meaningful fallback
+  history fields when Argaam history is configured.
 """
 
 from __future__ import annotations
@@ -58,7 +49,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 # ---------------------------------------------------------------------------
-# Optional deps
+# Optional deps (keep PROD safe)
 # ---------------------------------------------------------------------------
 try:
     import httpx  # type: ignore
@@ -77,23 +68,22 @@ except Exception:
 
 logger = logging.getLogger("core.providers.argaam_provider")
 
-PROVIDER_NAME            = "argaam"
-PROVIDER_VERSION         = "4.5.0"
-VERSION                  = PROVIDER_VERSION
-PROVIDER_BATCH_SUPPORTED = True   # ENH v4.5.0
+PROVIDER_NAME = "argaam"
+PROVIDER_VERSION         = "4.6.0"
+VERSION = PROVIDER_VERSION
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-DEFAULT_TIMEOUT_SEC       = float(os.getenv("ARGAAM_TIMEOUT_SEC",           "20")  or "20")
-DEFAULT_RETRY_ATTEMPTS    = int(  os.getenv("ARGAAM_RETRY_ATTEMPTS",        "3")   or "3")
-DEFAULT_MAX_CONCURRENCY   = int(  os.getenv("ARGAAM_MAX_CONCURRENCY",       "10")  or "10")
-DEFAULT_CACHE_TTL_SEC     = float(os.getenv("ARGAAM_CACHE_TTL_SEC",         "20")  or "20")
-DEFAULT_HISTORY_TTL_SEC   = float(os.getenv("ARGAAM_HISTORY_CACHE_TTL_SEC", "120") or "120")
+DEFAULT_TIMEOUT_SEC = float(os.getenv("ARGAAM_TIMEOUT_SEC", "20") or "20")
+DEFAULT_RETRY_ATTEMPTS = int(os.getenv("ARGAAM_RETRY_ATTEMPTS", "3") or "3")
+DEFAULT_MAX_CONCURRENCY = int(os.getenv("ARGAAM_MAX_CONCURRENCY", "10") or "10")
+DEFAULT_CACHE_TTL_SEC = float(os.getenv("ARGAAM_CACHE_TTL_SEC", "20") or "20")
+DEFAULT_HISTORY_TTL_SEC = float(os.getenv("ARGAAM_HISTORY_CACHE_TTL_SEC", "120") or "120")
 
-_TRUTHY        = {"1", "true", "yes", "y", "on", "t", "enabled"}
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled"}
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
-_KSA_CODE_RE   = re.compile(r"^\d{3,6}$")
+_KSA_CODE_RE = re.compile(r"^\d{3,6}$")
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -101,12 +91,12 @@ USER_AGENT = (
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-ARGAAM_QUOTE_URL   = (os.getenv("ARGAAM_QUOTE_URL")   or "").strip()
+ARGAAM_QUOTE_URL = (os.getenv("ARGAAM_QUOTE_URL") or "").strip()
 ARGAAM_PROFILE_URL = (os.getenv("ARGAAM_PROFILE_URL") or "").strip()
 ARGAAM_HISTORY_URL = (os.getenv("ARGAAM_HISTORY_URL") or "").strip()
 
 # ---------------------------------------------------------------------------
-# Numeric helpers
+# Helpers
 # ---------------------------------------------------------------------------
 
 def _now_utc_iso() -> str:
@@ -121,12 +111,6 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 
 def _safe_float(val: Any) -> Optional[float]:
-    """
-    Parse any numeric-like value to float.
-    Strips "%", commas, Arabic digits, SAR/ريال suffixes.
-    Returns None for NaN/Inf/blank/sentinel strings.
-    Does NOT normalise percent-to-fraction -- use _as_fraction() for pct fields.
-    """
     if val is None:
         return None
     try:
@@ -153,7 +137,8 @@ def _safe_float(val: Any) -> Optional[float]:
         m = re.match(r"^(-?\d+(?:\.\d+)?)([KMB])$", s, re.IGNORECASE)
         mult = 1.0
         if m:
-            num, suf = m.group(1), m.group(2).upper()
+            num = m.group(1)
+            suf = m.group(2).upper()
             mult = 1_000.0 if suf == "K" else 1_000_000.0 if suf == "M" else 1_000_000_000.0
             s = num
 
@@ -168,17 +153,7 @@ def _safe_float(val: Any) -> Optional[float]:
 def _as_fraction(val: Any) -> Optional[float]:
     """
     FIX v4.5.0: Normalise any percent-like value to a fraction (0.0142 = 1.42%).
-
-    Accepted input formats:
-      "1.42%"  -> 0.0142   (strips %, divides by 100)
-      1.42     -> 0.0142   (value > 1.5: treat as percent points, divide by 100)
-      0.0142   -> 0.0142   (value <= 1.5: already a fraction, return as-is)
-      "-1.5"   -> -0.015
-      "142%"   -> 1.42     (large percent)
-      None     -> None
-
     Rule: if abs(value) > 1.5 after stripping, divide by 100.
-    This is the same convention used throughout the TFB engine.
     """
     f = _safe_float(val)
     if f is None:
@@ -198,10 +173,6 @@ def _safe_str(val: Any) -> Optional[str]:
         return None
 
 
-# ---------------------------------------------------------------------------
-# KSA symbol helpers
-# ---------------------------------------------------------------------------
-
 def normalize_ksa_symbol(symbol: str) -> str:
     raw = (symbol or "").strip()
     if not raw:
@@ -211,7 +182,7 @@ def normalize_ksa_symbol(symbol: str) -> str:
     if raw.startswith("TADAWUL:"):
         raw = raw.split(":", 1)[1].strip()
     if raw.endswith(".TADAWUL"):
-        raw = raw[: -len(".TADAWUL")].strip()
+        raw = raw[:-len(".TADAWUL")].strip()
 
     if raw.endswith(".SR"):
         code = raw[:-3].strip()
@@ -226,10 +197,6 @@ def _ksa_code(symbol_norm: str) -> str:
     s = (symbol_norm or "").strip().upper()
     return s[:-3] if s.endswith(".SR") else s
 
-
-# ---------------------------------------------------------------------------
-# Data extraction helpers
-# ---------------------------------------------------------------------------
 
 def _unwrap_common_envelopes(data: Any) -> Any:
     cur = data
@@ -279,58 +246,63 @@ def _find_value_any(data: Any, keys: List[str]) -> Any:
 
 
 def _normalize_patch_keys(patch: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Apply canonical key aliases and ensure KSA defaults are always set.
-    Exchange/country/currency/market are always forced to KSA values
-    for symbols validated through normalize_ksa_symbol().
-    """
     aliases = {
-        "price":           "current_price",
-        "last_price":      "current_price",
-        "last":            "current_price",
-        "close":           "previous_close",
-        "prev_close":      "previous_close",
-        "change":          "price_change",
-        "change_pct":      "percent_change",
-        "change_percent":  "percent_change",
-        "pct_change":      "percent_change",
-        "open":            "open_price",
-        "day_open":        "open_price",
-        "high":            "day_high",
-        "low":             "day_low",
+        "price": "current_price",
+        "last_price": "current_price",
+        "last": "current_price",
+        "close": "previous_close",
+        "prev_close": "previous_close",
+        "change": "price_change",
+        "change_pct": "percent_change",
+        "change_percent": "percent_change",
+        "pct_change": "percent_change",
+        "open": "open_price",
+        "day_open": "open_price",
+        "high": "day_high",
+        "low": "day_low",
         "fifty_two_week_high": "week_52_high",
         "fifty_two_week_low":  "week_52_low",
-        "avg_vol_10d":     "avg_volume_10d",
-        "avg_vol_30d":     "avg_volume_30d",
-        "company_name":    "name",
+        "avg_vol_10d": "avg_volume_10d",
+        "avg_vol_30d": "avg_volume_30d",
+        "company_name": "name",
+        # v4.6.0: ROE / ROA aliases
+        "return_on_equity": "roe",
+        "returnonequity":   "roe",
+        "returnOnEquity":   "roe",
+        "return_on_assets": "roa",
+        "returnonassets":   "roa",
+        "returnOnAssets":   "roa",
+        # v4.6.0: new technical aliases
+        "atr":              "atr_14",
+        "average_true_range": "atr_14",
+        "averageTrueRange": "atr_14",
+        "rsi":              "rsi_14",
+        "RSI":              "rsi_14",
+        "vol_ratio":        "volume_ratio",
+        "volumeRatio":      "volume_ratio",
+        "day_position":     "day_range_position",
+        "priceChange5d":    "price_change_5d",
+        "change_5d":        "price_change_5d",
     }
     out = dict(patch or {})
     for src, dst in aliases.items():
         if src in out and (dst not in out or out.get(dst) in (None, "", 0)):
             out[dst] = out.pop(src)
-
-    # Sync current_price <-> price alias
     if out.get("current_price") is not None and out.get("price") in (None, "", 0):
-        out["price"] = out["current_price"]
+        out["price"] = out.get("current_price")
     if out.get("price") is not None and out.get("current_price") in (None, "", 0):
-        out["current_price"] = out["price"]
-
-    # KSA identity always wins for validated symbols
-    out["country"]  = "Saudi Arabia"
-    out["currency"] = out.get("currency") or "SAR"
-    out["exchange"] = "TADAWUL"
-    out["market"]   = "KSA"
+        out["current_price"] = out.get("price")
+    if out.get("country") in (None, ""):   out["country"]  = "Saudi Arabia"
+    if out.get("currency") in (None, ""):  out["currency"] = "SAR"
+    if out.get("exchange") in (None, ""):  out["exchange"] = "TADAWUL"
+    if out.get("market")   in (None, ""):  out["market"]   = "KSA"
     return out
 
 
-def _week_52_position_pct(
-    price: Optional[float],
-    lo: Optional[float],
-    hi: Optional[float],
-) -> Optional[float]:
+def _week_52_position_pct(price: Optional[float], lo: Optional[float], hi: Optional[float]) -> Optional[float]:
     """
-    Returns 52-week position as a FRACTION (0.0 .. 1.0).
-    FIX v4.5.0: v4.4.0 returned 0..100 percent. Schema dtype=pct expects fraction.
+    Returns 52-week range position as a FRACTION (0.0 .. 1.0).
+    FIX v4.5.0+: returns fraction, not percent.
     """
     try:
         if price is None or lo is None or hi is None:
@@ -342,30 +314,80 @@ def _week_52_position_pct(
         return None
 
 
-def _error_patch(
-    symbol: str,
-    message: str,
-    *,
-    requested_symbol: Optional[str] = None,
-) -> Dict[str, Any]:
+def _day_range_position(
+    price: Optional[float],
+    low:   Optional[float],
+    high:  Optional[float],
+) -> Optional[float]:
+    """
+    v4.6.0: Day range position as fraction 0.0 (at day_low) .. 1.0 (at day_high).
+    Same formula as week_52_position_pct but uses today's intraday range.
+    Used by scoring.py v3.0.0 to compute technical_score.
+    """
+    return _week_52_position_pct(price, low, high)
+
+
+def _compute_rsi14(closes: List[float]) -> Optional[float]:
+    """
+    v4.6.0: Compute RSI(14) from close price series (most recent last).
+    Returns 0..100 float, or None if fewer than 15 data points.
+    """
+    if len(closes) < 15:
+        return None
+    deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains  = [d for d in deltas if d > 0]
+    losses = [-d for d in deltas if d < 0]
+    # Seed with simple 14-period average
+    period = 14
+    seed_gains  = deltas[-period:]
+    seed_losses = deltas[-period:]
+    avg_gain = sum(g for g in seed_gains  if g > 0) / period
+    avg_loss = sum(-l for l in seed_losses if l < 0) / period
+    if avg_loss == 0:
+        return 100.0
+    rs  = avg_gain / avg_loss
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    return round(max(0.0, min(100.0, rsi)), 2)
+
+
+def _compute_atr14(
+    highs:  List[float],
+    lows:   List[float],
+    closes: List[float],
+) -> Optional[float]:
+    """
+    v4.6.0: Compute ATR(14) from OHLC series (most recent last).
+    True Range = max(high-low, abs(high-prev_close), abs(low-prev_close)).
+    Returns the 14-period simple average of TR, or None if insufficient data.
+    """
+    n = min(len(highs), len(lows), len(closes))
+    if n < 15:
+        return None
+    trs: List[float] = []
+    for i in range(n - 14, n):
+        h = highs[i]; l = lows[i]; c_prev = closes[i - 1]
+        tr = max(h - l, abs(h - c_prev), abs(l - c_prev))
+        trs.append(tr)
+    if not trs:
+        return None
+    return round(sum(trs) / len(trs), 4)
+
+
+def _error_patch(symbol: str, message: str, *, requested_symbol: Optional[str] = None) -> Dict[str, Any]:
     return {
-        "symbol":           normalize_ksa_symbol(symbol) or symbol,
+        "symbol": normalize_ksa_symbol(symbol) or symbol,
         "requested_symbol": requested_symbol or symbol,
-        "provider":         PROVIDER_NAME,
+        "provider": PROVIDER_NAME,
         "provider_version": PROVIDER_VERSION,
-        "data_quality":     "MISSING",
-        "error":            message,
+        "data_quality": "MISSING",
+        "error": message,
         "last_updated_utc": _now_utc_iso(),
-        "country":          "Saudi Arabia",
-        "currency":         "SAR",
-        "exchange":         "TADAWUL",
-        "market":           "KSA",
+        "country": "Saudi Arabia",
+        "currency": "SAR",
+        "exchange": "TADAWUL",
+        "market": "KSA",
     }
 
-
-# ---------------------------------------------------------------------------
-# History helpers
-# ---------------------------------------------------------------------------
 
 def _as_history_rows(history_data: Any) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
@@ -386,8 +408,8 @@ def _as_history_rows(history_data: Any) -> List[Dict[str, Any]]:
 
 def _history_stats(history_data: Any) -> Dict[str, Any]:
     """
-    Derive OHLCV stats from history rows.
-    FIX v4.5.0: week_52_position_pct returned as fraction (was percent in v4.4.0).
+    v4.6.0: Derive OHLCV stats + RSI(14) + ATR(14) + price_change_5d from history rows.
+    All percent-like fields returned as fractions.
     """
     rows = _as_history_rows(history_data)
     if not rows:
@@ -416,6 +438,12 @@ def _history_stats(history_data: Any) -> Dict[str, Any]:
         out["current_price"] = closes[-1]
         if len(closes) >= 2:
             out["previous_close"] = closes[-2]
+        # v4.6.0: 5-day price change as fraction
+        if len(closes) >= 6:
+            price_5d_ago = closes[-6]
+            if price_5d_ago > 0:
+                out["price_change_5d"] = round((closes[-1] - price_5d_ago) / price_5d_ago, 6)
+
     if opens:
         out["open_price"] = opens[-1]
     if highs:
@@ -431,29 +459,37 @@ def _history_stats(history_data: Any) -> Dict[str, Any]:
         out["avg_volume_10d"] = sum(last10) / len(last10) if last10 else None
         out["avg_volume_30d"] = sum(last30) / len(last30) if last30 else None
 
-    # FIX v4.5.0: fraction (0.0..1.0) not percent (0..100)
+    # 52-week position (fraction)
     out["week_52_position_pct"] = _week_52_position_pct(
-        out.get("current_price"),
-        out.get("week_52_low"),
-        out.get("week_52_high"),
+        out.get("current_price"), out.get("week_52_low"), out.get("week_52_high"),
     )
+
+    # v4.6.0: RSI(14) and ATR(14) from history
+    if closes:
+        rsi = _compute_rsi14(closes)
+        if rsi is not None:
+            out["rsi_14"] = rsi
+    if highs and lows and closes and len(highs) == len(lows) == len(closes):
+        atr = _compute_atr14(highs, lows, closes)
+        if atr is not None:
+            out["atr_14"] = atr
+
     return {k: v for k, v in out.items() if v is not None}
 
-
 # ---------------------------------------------------------------------------
-# Simple TTL cache
+# Simple TTL cache (in-memory)
 # ---------------------------------------------------------------------------
 
 @dataclass
 class _CacheItem:
-    exp:   float
+    exp: float
     value: Any
 
 
 class _TTLCache:
     def __init__(self, max_size: int = 2000) -> None:
-        self._max  = max_size
-        self._d:   Dict[str, _CacheItem] = {}
+        self._max = max_size
+        self._d: Dict[str, _CacheItem] = {}
         self._lock = asyncio.Lock()
 
     async def get(self, key: str) -> Any:
@@ -475,23 +511,22 @@ class _TTLCache:
                     self._d.pop(k, None)
             self._d[key] = _CacheItem(exp=now + max(1.0, ttl), value=value)
 
-
 # ---------------------------------------------------------------------------
-# HTTP client
+# Client
 # ---------------------------------------------------------------------------
 
 class ArgaamClient:
     def __init__(self) -> None:
-        self.client_id    = str(uuid.uuid4())[:8]
-        self.quote_url    = ARGAAM_QUOTE_URL
-        self.profile_url  = ARGAAM_PROFILE_URL
-        self.history_url  = ARGAAM_HISTORY_URL
-        self.timeout_sec  = DEFAULT_TIMEOUT_SEC
+        self.client_id = str(uuid.uuid4())[:8]
+        self.quote_url = ARGAAM_QUOTE_URL
+        self.profile_url = ARGAAM_PROFILE_URL
+        self.history_url = ARGAAM_HISTORY_URL
+
+        self.timeout_sec = DEFAULT_TIMEOUT_SEC
         self.retry_attempts = max(1, DEFAULT_RETRY_ATTEMPTS)
-        self._sem   = asyncio.Semaphore(max(1, DEFAULT_MAX_CONCURRENCY))
-        self._cache = _TTLCache(
-            max_size=int(os.getenv("ARGAAM_CACHE_MAX", "2000") or "2000")
-        )
+        self._sem = asyncio.Semaphore(max(1, DEFAULT_MAX_CONCURRENCY))
+        self._cache = _TTLCache(max_size=int(os.getenv("ARGAAM_CACHE_MAX", "2000") or "2000"))
+
         self._client = None
         if _HTTPX_AVAILABLE:
             self._client = httpx.AsyncClient(
@@ -499,7 +534,7 @@ class ArgaamClient:
                 limits=httpx.Limits(max_keepalive_connections=20, max_connections=40),
                 headers={
                     "User-Agent": USER_AGENT,
-                    "Accept":     "application/json",
+                    "Accept": "application/json",
                     "X-Client-ID": self.client_id,
                 },
             )
@@ -521,17 +556,15 @@ class ArgaamClient:
             urls.append(template.rstrip("/") + "/" + code)
             if full != code:
                 urls.append(template.rstrip("/") + "/" + full)
-        seen: set = set()
-        out: List[str] = []
+        seen = set()
+        out = []
         for u in urls:
             if u and u not in seen:
                 seen.add(u)
                 out.append(u)
         return out
 
-    async def _get_json(
-        self, url: str, cache_key: str, ttl: float
-    ) -> Tuple[Optional[Any], Optional[str]]:
+    async def _get_json(self, url: str, cache_key: str, ttl: float) -> Tuple[Optional[Any], Optional[str]]:
         cached = await self._cache.get(cache_key)
         if cached is not None:
             return cached, None
@@ -547,13 +580,17 @@ class ArgaamClient:
                     sc = int(getattr(r, "status_code", 0) or 0)
 
                     if sc == 429:
-                        await asyncio.sleep(min(15.0, (2 ** attempt) + random.uniform(0, 1.0)))
+                        wait = min(15.0, (2 ** attempt) + random.uniform(0, 1.0))
+                        await asyncio.sleep(wait)
                         last_err = "rate_limited_429"
                         continue
+
                     if 500 <= sc < 600:
-                        await asyncio.sleep(min(10.0, (2 ** attempt) + random.uniform(0, 1.0)))
+                        wait = min(10.0, (2 ** attempt) + random.uniform(0, 1.0))
+                        await asyncio.sleep(wait)
                         last_err = f"server_error_{sc}"
                         continue
+
                     if sc >= 400:
                         return None, f"http_{sc}"
 
@@ -564,17 +601,15 @@ class ArgaamClient:
 
                     await self._cache.set(cache_key, payload, ttl)
                     return payload, None
-
                 except Exception as e:
                     last_err = f"network_error:{e.__class__.__name__}"
-                    await asyncio.sleep(min(10.0, (2 ** attempt) + random.uniform(0, 1.0)))
+                    wait = min(10.0, (2 ** attempt) + random.uniform(0, 1.0))
+                    await asyncio.sleep(wait)
             return None, last_err or "max_retries_exceeded"
 
-    async def _fetch_first(
-        self, urls: List[str], prefix: str, ttl: float
-    ) -> Tuple[Optional[Any], Optional[str], Optional[str]]:
+    async def _fetch_first(self, urls: List[str], prefix: str, ttl: float) -> Tuple[Optional[Any], Optional[str], Optional[str]]:
         data = None
-        err  = None
+        err = None
         used = None
         for u in urls:
             data, err = await self._get_json(u, f"{prefix}:{u}", ttl=ttl)
@@ -583,69 +618,57 @@ class ArgaamClient:
                 break
         return data, err, used
 
-    # ------------------------------------------------------------------
-    # Patch parsers
-    # ------------------------------------------------------------------
-
-    def _parse_profile_patch(
-        self, symbol_norm: str, profile_data: Any
-    ) -> Dict[str, Any]:
+    def _parse_profile_patch(self, symbol_norm: str, profile_data: Any) -> Dict[str, Any]:
         p = profile_data if isinstance(profile_data, dict) else {}
         out: Dict[str, Any] = {
-            "symbol":           symbol_norm,
+            "symbol": symbol_norm,
             "symbol_normalized": symbol_norm,
-            "provider":         PROVIDER_NAME,
+            "provider": PROVIDER_NAME,
             "provider_version": PROVIDER_VERSION,
-            "exchange":         "TADAWUL",
-            "market":           "KSA",
-            "country":          "Saudi Arabia",
-            "currency":         "SAR",
-            "asset_class":      "Equity",
+            "exchange": "TADAWUL",
+            "market": "KSA",
+            "country": "Saudi Arabia",
+            "currency": "SAR",
+            "asset_class": "Equity",
             "last_updated_utc": _now_utc_iso(),
         }
-        out["name"]       = _safe_str(_find_value_any(p, ["name", "companyname", "company_name", "longname", "securityname", "displayname"]))
-        out["sector"]     = _safe_str(_find_value_any(p, ["sector", "sectorname"]))
-        out["industry"]   = _safe_str(_find_value_any(p, ["industry", "industryname", "subsector", "subsectorname"]))
-        out["currency"]   = _safe_str(_find_value_any(p, ["currency"])) or "SAR"
-        out["country"]    = _safe_str(_find_value_any(p, ["country"])) or "Saudi Arabia"
-        out["exchange"]   = "TADAWUL"   # always TADAWUL for KSA symbols
-        out["asset_class"] = _safe_str(_find_value_any(p, ["assetclass","asset_class","type","instrumenttype","securitytype"])) or "Equity"
+        out["name"] = _safe_str(_find_value_any(p, ["name", "companyname", "company_name", "longname", "securityname", "displayname"]))
+        out["sector"] = _safe_str(_find_value_any(p, ["sector", "sectorname"]))
+        out["industry"] = _safe_str(_find_value_any(p, ["industry", "industryname", "subsector", "subsectorname"]))
+        out["currency"] = _safe_str(_find_value_any(p, ["currency"])) or "SAR"
+        out["country"] = _safe_str(_find_value_any(p, ["country"])) or "Saudi Arabia"
+        out["exchange"] = _safe_str(_find_value_any(p, ["exchange", "marketname"])) or "TADAWUL"
+        out["asset_class"] = _safe_str(_find_value_any(p, ["assetclass", "asset_class", "type", "instrumenttype", "securitytype"])) or "Equity"
         return {k: v for k, v in out.items() if v not in (None, "")}
 
-    def _parse_quote_patch(
-        self,
-        symbol_norm: str,
-        quote_data: Any,
-        profile_data: Any = None,
-        history_data: Any = None,
-    ) -> Dict[str, Any]:
+    def _parse_quote_patch(self, symbol_norm: str, quote_data: Any, profile_data: Any = None, history_data: Any = None) -> Dict[str, Any]:
         out: Dict[str, Any] = {
-            "symbol":           symbol_norm,
+            "symbol": symbol_norm,
             "symbol_normalized": symbol_norm,
-            "provider":         PROVIDER_NAME,
+            "provider": PROVIDER_NAME,
             "provider_version": PROVIDER_VERSION,
             "last_updated_utc": _now_utc_iso(),
-            "exchange":         "TADAWUL",
-            "market":           "KSA",
-            "country":          "Saudi Arabia",
-            "currency":         "SAR",
-            "asset_class":      "Equity",
+            "exchange": "TADAWUL",
+            "market": "KSA",
+            "country": "Saudi Arabia",
+            "currency": "SAR",
+            "asset_class": "Equity",
         }
 
         q = quote_data   if isinstance(quote_data,   dict) else {}
         p = profile_data if isinstance(profile_data, dict) else {}
 
-        # Profile / classification (name, sector, industry, asset_class)
+        # Profile / classification
         out.update(self._parse_profile_patch(symbol_norm, p))
 
-        # Name / sector / industry from quote as fallback
+        # Name / sector / industry (quote fills gaps)
         out["name"]     = out.get("name")     or _safe_str(_find_value_any(q, ["name","companyname","company_name","longname"]))
         out["sector"]   = out.get("sector")   or _safe_str(_find_value_any(q, ["sector"]))
         out["industry"] = out.get("industry") or _safe_str(_find_value_any(q, ["industry"]))
 
-        # --- Price fields (dtype=float, raw value) ---
+        # ── Price fields (dtype=float) ──────────────────────────────────────
         out["current_price"]  = _safe_float(_find_value_any(q, ["current_price","price","last","lastprice","closeprice","tradeprice","lasttradepriceonly"]))
-        out["price"]          = out["current_price"]
+        out["price"]          = out.get("current_price")
         out["previous_close"] = _safe_float(_find_value_any(q, ["previous_close","prev_close","previousclose","close","yesterdayclose"]))
         out["open_price"]     = _safe_float(_find_value_any(q, ["open_price","open","openingprice","dayopen"]))
         out["day_high"]       = _safe_float(_find_value_any(q, ["day_high","high","highprice","sessionhigh"]))
@@ -659,11 +682,8 @@ class ArgaamClient:
         out["avg_volume_10d"] = _safe_float(_find_value_any(q, ["avg_volume_10d","averagevolume10days","avgvol10d"]))
         out["avg_volume_30d"] = _safe_float(_find_value_any(q, ["avg_volume_30d","averagevolume","avgvolume","avgvol30d"]))
 
-        # --- Percent / ratio fields (dtype=pct -- MUST be stored as fraction) ---
-        # FIX v4.5.0: use _as_fraction() not _safe_float() for all pct fields
-        out["percent_change"] = _as_fraction(
-            _find_value_any(q, ["percent_change","change_percent","changepercent","changepct","pct_change"])
-        )
+        # ── Percent fields (dtype=pct — MUST be fraction) ───────────────────
+        out["percent_change"]     = _as_fraction(_find_value_any(q, ["percent_change","change_percent","changepercent","changepct","pct_change"]))
         out["dividend_yield"]     = _as_fraction(_find_value_any(q, ["dividend_yield","dividendyield","yieldpct"]))
         out["gross_margin"]       = _as_fraction(_find_value_any(q, ["gross_margin","grossmargin"]))
         out["operating_margin"]   = _as_fraction(_find_value_any(q, ["operating_margin","operatingmargin"]))
@@ -671,42 +691,62 @@ class ArgaamClient:
         out["payout_ratio"]       = _as_fraction(_find_value_any(q, ["payout_ratio","payoutratio"]))
         out["revenue_growth_yoy"] = _as_fraction(_find_value_any(q, ["revenue_growth_yoy","revenuegrowth","revenue_growth"]))
 
-        # --- History fallback (fills gaps from OHLCV history) ---
+        # ── v4.6.0: ROE / ROA — from quote or profile (dtype=pct → fraction) ──
+        out["roe"] = _as_fraction(
+            _find_value_any(q, ["roe","return_on_equity","returnonequity","returnOnEquity"]) or
+            _find_value_any(p, ["roe","return_on_equity","returnonequity","returnOnEquity"])
+        )
+        out["roa"] = _as_fraction(
+            _find_value_any(q, ["roa","return_on_assets","returnonassets","returnOnAssets"]) or
+            _find_value_any(p, ["roa","return_on_assets","returnonassets","returnOnAssets"])
+        )
+
+        # ── v4.6.0: 5-day price change (from quote direct if available) ──────
+        out["price_change_5d"] = _as_fraction(
+            _find_value_any(q, ["price_change_5d","priceChange5d","change5d","five_day_change","5d_change"])
+        )
+
+        # ── History fallback (fills gaps from OHLCV history) ─────────────────
+        # v4.6.0: history now also yields rsi_14, atr_14, price_change_5d
         hist_patch = _history_stats(history_data) if history_data is not None else {}
         for k, v in hist_patch.items():
             if out.get(k) in (None, "", 0):
                 out[k] = v
 
-        # --- Derived: week_52_position_pct (fraction) ---
+        # ── Derived: week_52_position_pct (fraction) ─────────────────────────
         if out.get("week_52_position_pct") is None:
             out["week_52_position_pct"] = _week_52_position_pct(
-                out.get("current_price"),
-                out.get("week_52_low"),
-                out.get("week_52_high"),
+                out.get("current_price"), out.get("week_52_low"), out.get("week_52_high"),
             )
 
-        # --- Derived: price_change / percent_change cross-fill ---
-        #
-        # If percent_change is missing, derive from price_change / previous_close.
-        # FIX v4.5.0: result is stored as FRACTION, not percent points.
-        if out.get("percent_change") is None and out.get("price_change") is not None:
-            prev = out.get("previous_close")
-            if prev not in (None, 0):
-                try:
-                    out["percent_change"] = float(out["price_change"]) / float(prev)
-                except Exception:
-                    pass
+        # ── v4.6.0: day_range_position (fraction) ────────────────────────────
+        # (price - day_low) / (day_high - day_low) — used by scoring.py v3.0.0
+        if out.get("day_range_position") is None:
+            out["day_range_position"] = _day_range_position(
+                out.get("current_price"), out.get("day_low"), out.get("day_high"),
+            )
 
-        # If price_change is missing, derive from percent_change (fraction) * previous_close.
-        if out.get("price_change") is None and out.get("percent_change") is not None:
-            prev = out.get("previous_close")
-            if prev not in (None, 0):
-                try:
-                    out["price_change"] = float(out["percent_change"]) * float(prev)
-                except Exception:
-                    pass
+        # ── v4.6.0: volume_ratio ─────────────────────────────────────────────
+        # volume / avg_volume_10d — used by scoring.py v3.0.0 for volume_surge detection
+        if out.get("volume_ratio") is None:
+            vol   = _safe_float(out.get("volume"))
+            avgv  = _safe_float(out.get("avg_volume_10d"))
+            if vol is not None and avgv is not None and avgv > 0:
+                out["volume_ratio"] = round(vol / avgv, 4)
 
-        # --- data_quality ---
+        # ── Derived: price_change / percent_change cross-fill ────────────────
+        if out.get("price_change") is None and out.get("current_price") is not None and out.get("previous_close") is not None:
+            try:
+                out["price_change"] = float(out["current_price"]) - float(out["previous_close"])
+            except Exception:
+                pass
+        if out.get("percent_change") is None and out.get("price_change") is not None and out.get("previous_close") not in (None, 0):
+            try:
+                out["percent_change"] = float(out["price_change"]) / float(out["previous_close"])
+            except Exception:
+                pass
+
+        # ── data_quality ─────────────────────────────────────────────────────
         if out.get("current_price") is not None:
             out["data_quality"] = "GOOD"
         elif hist_patch or profile_data is not None:
@@ -716,10 +756,6 @@ class ArgaamClient:
 
         return _normalize_patch_keys({k: v for k, v in out.items() if v is not None})
 
-    # ------------------------------------------------------------------
-    # Single-symbol fetch
-    # ------------------------------------------------------------------
-
     async def get_enriched_patch(self, symbol: str) -> Dict[str, Any]:
         symbol_norm = normalize_ksa_symbol(symbol)
         if not symbol_norm:
@@ -728,84 +764,38 @@ class ArgaamClient:
         if not self._has_any_config():
             return _error_patch(symbol_norm, "ARGAAM provider URLs not configured (set env vars)")
 
-        quote_urls = self._build_url_candidates(self.quote_url,   symbol_norm) if self.quote_url   else []
-        prof_urls  = self._build_url_candidates(self.profile_url, symbol_norm) if self.profile_url else []
-        hist_urls  = self._build_url_candidates(self.history_url, symbol_norm) if self.history_url else []
+        quote_urls = self._build_url_candidates(self.quote_url, symbol_norm) if self.quote_url else []
+        prof_urls = self._build_url_candidates(self.profile_url, symbol_norm) if self.profile_url else []
+        hist_urls = self._build_url_candidates(self.history_url, symbol_norm) if self.history_url else []
 
-        quote_data,   quote_err,   quote_used   = None, None, None
-        profile_data, _,           profile_used = None, None, None
-        history_data, _,           history_used = None, None, None
-
-        tasks = []
+        quote_data, quote_err, quote_used = (None, None, None)
         if quote_urls:
-            tasks.append(self._fetch_first(quote_urls, f"q:{symbol_norm}", DEFAULT_CACHE_TTL_SEC))
-        if prof_urls:
-            tasks.append(self._fetch_first(prof_urls, f"p:{symbol_norm}", max(60.0, DEFAULT_CACHE_TTL_SEC)))
-        if hist_urls:
-            tasks.append(self._fetch_first(hist_urls, f"h:{symbol_norm}", DEFAULT_HISTORY_TTL_SEC))
+            quote_data, quote_err, quote_used = await self._fetch_first(quote_urls, f"q:{symbol_norm}", DEFAULT_CACHE_TTL_SEC)
 
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        idx = 0
-        if quote_urls:
-            r = results[idx]; idx += 1
-            if not isinstance(r, Exception):
-                quote_data, quote_err, quote_used = r
+        profile_data, _, profile_used = (None, None, None)
         if prof_urls:
-            r = results[idx]; idx += 1
-            if not isinstance(r, Exception):
-                profile_data, _, profile_used = r
+            profile_data, _, profile_used = await self._fetch_first(prof_urls, f"p:{symbol_norm}", max(60.0, DEFAULT_CACHE_TTL_SEC))
+
+        history_data, _, history_used = (None, None, None)
         if hist_urls:
-            r = results[idx]; idx += 1
-            if not isinstance(r, Exception):
-                history_data, _, history_used = r
+            history_data, _, history_used = await self._fetch_first(hist_urls, f"h:{symbol_norm}", DEFAULT_HISTORY_TTL_SEC)
 
         if quote_data is None and profile_data is None and history_data is None:
             return _error_patch(symbol_norm, f"fetch_failed: {quote_err or 'no_data'}", requested_symbol=symbol)
 
         patch = self._parse_quote_patch(symbol_norm, quote_data, profile_data, history_data)
         patch["requested_symbol"] = symbol
-        patch["data_sources"]     = [PROVIDER_NAME]
-        patch["provider_origin"]  = {
-            "quote_url_used":   quote_used,
+        patch["data_sources"] = [PROVIDER_NAME]
+        patch["provider_origin"] = {
+            "quote_url_used": quote_used,
             "profile_url_used": profile_used,
             "history_url_used": history_used,
         }
-        if quote_data is None and patch.get("data_quality") == "GOOD":
-            patch["data_quality"] = "DEGRADED"
-            patch["warning"]      = patch.get("warning") or "quote_missing_used_profile_and_or_history_fallback"
+        if quote_data is None:
+            patch["warning"] = (patch.get("warning") or "quote_missing_used_profile_and_or_history_fallback")
+            if patch.get("data_quality") == "GOOD":
+                patch["data_quality"] = "DEGRADED"
         return patch
-
-    # ------------------------------------------------------------------
-    # Batch fetch (ENH v4.5.0)
-    # ------------------------------------------------------------------
-
-    async def get_enriched_quotes_batch(
-        self,
-        symbols: List[str],
-        *,
-        mode: str = "",
-    ) -> Dict[str, Dict[str, Any]]:
-        """
-        Fetch enriched patches for multiple KSA symbols concurrently.
-        Returns {symbol_norm: patch_dict}.
-        Non-KSA symbols or fetch failures return error_patch entries.
-        """
-        if not symbols:
-            return {}
-        results = await asyncio.gather(
-            *(self.get_enriched_patch(sym) for sym in symbols),
-            return_exceptions=True,
-        )
-        out: Dict[str, Dict[str, Any]] = {}
-        for sym, result in zip(symbols, results):
-            if isinstance(result, Exception):
-                out[sym] = _error_patch(sym, f"batch_gather_error: {result}")
-            elif isinstance(result, dict):
-                key = result.get("symbol") or normalize_ksa_symbol(sym) or sym
-                out[key] = result
-            else:
-                out[sym] = _error_patch(sym, "batch_invalid_result")
-        return out
 
     async def close(self) -> None:
         try:
@@ -814,15 +804,13 @@ class ArgaamClient:
         except Exception:
             pass
 
-
 # ---------------------------------------------------------------------------
-# Provider class (router / engine compatible)
+# Provider object for router compatibility
 # ---------------------------------------------------------------------------
 
 class ArgaamProvider:
-    name    = PROVIDER_NAME
+    name = PROVIDER_NAME
     version = PROVIDER_VERSION
-    batch_supported = True
 
     def __init__(self) -> None:
         self._client: Optional[ArgaamClient] = None
@@ -838,14 +826,13 @@ class ArgaamProvider:
         c = await self._get_client()
         return await c.get_enriched_patch(symbol)
 
-    # ENH v4.5.0: batch method
     async def get_enriched_quotes_batch(
         self, symbols: List[str], *, mode: str = ""
     ) -> Dict[str, Dict[str, Any]]:
+        """v4.6.0: batch fetch for engine compatibility."""
         c = await self._get_client()
         return await c.get_enriched_quotes_batch(symbols, mode=mode)
 
-    # Aliases for router compatibility
     async def quote(self, symbol: str) -> Dict[str, Any]:
         return await self.get_quote(symbol)
 
@@ -875,15 +862,15 @@ class ArgaamProvider:
             await self._client.close()
             self._client = None
 
-
 # ---------------------------------------------------------------------------
-# Singletons
+# Singleton exports
 # ---------------------------------------------------------------------------
 
-_CLIENT_INSTANCE:   Optional[ArgaamClient]   = None
-_CLIENT_LOCK                                  = asyncio.Lock()
+_CLIENT_INSTANCE: Optional[ArgaamClient] = None
+_CLIENT_LOCK = asyncio.Lock()
+
 _PROVIDER_INSTANCE: Optional[ArgaamProvider] = None
-_PROVIDER_LOCK                                = asyncio.Lock()
+_PROVIDER_LOCK = asyncio.Lock()
 
 
 async def get_client() -> ArgaamClient:
@@ -913,12 +900,11 @@ async def get_provider() -> ArgaamProvider:
 
 provider = ArgaamProvider()
 
-
 # ---------------------------------------------------------------------------
-# Module-level engine-facing functions
+# Engine-facing functions
 # ---------------------------------------------------------------------------
 
-async def fetch_enriched_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+async def fetch_enriched_quote_patch(symbol: str, *args, **kwargs) -> Dict[str, Any]:
     c = await get_client()
     patch = await c.get_enriched_patch(symbol)
     if not isinstance(patch, dict) or not patch:
@@ -926,23 +912,13 @@ async def fetch_enriched_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> 
     return patch
 
 
-async def fetch_enriched_quotes_batch(
-    symbols: List[str], *, mode: str = "", **kwargs: Any
-) -> Dict[str, Dict[str, Any]]:
-    """ENH v4.5.0: batch engine fetch."""
-    c = await get_client()
-    return await c.get_enriched_quotes_batch(symbols, mode=mode)
-
-
-# Aliases
-fetch_patch              = fetch_enriched_quote_patch
-fetch_quote_patch        = fetch_enriched_quote_patch
-fetch_quote              = fetch_enriched_quote_patch
-quote                    = fetch_enriched_quote_patch
-get_quote                = fetch_enriched_quote_patch
-fetch_profile_patch      = fetch_enriched_quote_patch
-fetch_history_patch      = fetch_enriched_quote_patch
-
+fetch_patch = fetch_enriched_quote_patch
+fetch_quote_patch = fetch_enriched_quote_patch
+fetch_quote = fetch_enriched_quote_patch
+quote = fetch_enriched_quote_patch
+get_quote = fetch_enriched_quote_patch
+fetch_profile_patch = fetch_enriched_quote_patch
+fetch_history_patch = fetch_enriched_quote_patch
 
 __all__ = [
     "PROVIDER_NAME",
@@ -951,7 +927,6 @@ __all__ = [
     "VERSION",
     "normalize_ksa_symbol",
     "fetch_enriched_quote_patch",
-    "fetch_enriched_quotes_batch",
     "fetch_patch",
     "fetch_quote_patch",
     "fetch_quote",
@@ -961,7 +936,6 @@ __all__ = [
     "fetch_history_patch",
     "get_client",
     "close_client",
-    "ArgaamClient",
     "ArgaamProvider",
     "get_provider",
     "provider",
