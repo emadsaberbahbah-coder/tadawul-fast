@@ -2,7 +2,7 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.12.0)
+TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.12.1)
 ================================================================================
 FASTAPI-NATIVE ROUTER INCLUDE • PRESTART-FIRST ROUTE MOUNT • OPENAPI CACHE SAFE
 REQUEST-ID SAFE • ENGINE-STATE AWARE • CONTROLLED-ROUTE-OWNERSHIP SAFE
@@ -10,17 +10,18 @@ STRICT-JSON SAFE • HEALTH / META ALIAS SAFE • DEBUG ROUTE SAFE
 INVESTMENT-ADVISOR CANONICAL OWNER PROTECTION • ADVANCED ROUTE PRIORITY SAFE
 CUSTOM OPENAPI / DOCS SAFE • JSON CONTRACT HARDENING
 
-Why this revision (v8.12.0)
+Why this revision (v8.12.1)
 ---------------------------
-- FIX: replaces built-in OpenAPI/docs exposure with explicit custom routes so
-       /openapi.json always returns parseable JSON and docs point to that route.
-- FIX: guarantees OpenAPI has a valid "paths" object; if generation fails, a
-       minimal fallback schema is returned instead of an empty/non-JSON payload.
-- FIX: adds ALLOW_QUERY_TOKEN to settings model so auth behavior can match config.
-- FIX: extends canonical owner protection and diagnostics to underscore aliases.
-- FIX: improves route family presence detection for hyphen + underscore aliases.
-- FIX: keeps strict JSON output across meta/health/debug/OpenAPI paths.
-- SAFE: preserves controlled route mounting and render-safe startup behavior.
+- KEEP: custom OpenAPI/docs routes so /openapi.json always returns parseable JSON.
+- KEEP: controlled route mounting with canonical owner protection.
+- IMPROVE: OpenAPI cache now also carries a generated timestamp and optional servers
+           entry when BACKEND_BASE_URL is configured.
+- IMPROVE: /openapi.json explicitly returns no-store cache headers to avoid stale
+           proxies during Render deployments and route changes.
+- IMPROVE: routes snapshot normalization is recalculated more defensively from live
+           app state so meta/debug diagnostics stay aligned with the real router set.
+- IMPROVE: startup warnings are deduplicated and protected from noisy repeats.
+- SAFE: preserves current public routing, auth, health/meta aliases, and render-safe startup.
 """
 from __future__ import annotations
 
@@ -168,7 +169,7 @@ class _StrictJSONResponse(JSONResponse):
         ).encode("utf-8")
 
 
-APP_ENTRY_VERSION = "8.12.0"
+APP_ENTRY_VERSION = "8.12.1"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
@@ -374,6 +375,16 @@ def _secure_equals(left: str, right: str) -> bool:
         return hmac.compare_digest(str(left), str(right))
     except Exception:
         return str(left) == str(right)
+
+
+def _append_startup_warning(app: FastAPI, message: str) -> None:
+    try:
+        warnings = list(getattr(app.state, "startup_warnings", []) or [])
+        if message not in warnings:
+            warnings.append(message)
+        app.state.startup_warnings = warnings
+    except Exception:
+        pass
 
 
 # =============================================================================
@@ -1035,14 +1046,14 @@ def _normalize_routes_snapshot(ret: Any, *, used_strategy: str, app: Optional[Fa
 
     out = {
         "mounted": mounted,
-        "mounted_count": int(src.get("mounted_count", len(mounted)) or len(mounted)),
+        "mounted_count": len(mounted),
         "duplicate_skips": duplicate_skips,
-        "duplicate_skips_count": int(src.get("duplicate_skips_count", len(duplicate_skips)) or len(duplicate_skips)),
+        "duplicate_skips_count": len(duplicate_skips),
         "partial_duplicate_skips": partial_duplicate_skips,
-        "partial_duplicate_skips_count": int(src.get("partial_duplicate_skips_count", len(partial_duplicate_skips)) or len(partial_duplicate_skips)),
+        "partial_duplicate_skips_count": len(partial_duplicate_skips),
         "filtered_out_routes": filtered_out_routes,
         "missing": missing,
-        "missing_count": int(src.get("missing_count", len(missing)) or len(missing)),
+        "missing_count": len(missing),
         "import_errors": import_errors,
         "mount_errors": mount_errors,
         "no_router": no_router,
@@ -1199,7 +1210,7 @@ def _mount_routes_controlled(app: FastAPI) -> Dict[str, Any]:
 
         routes_to_add = list(_iter_router_api_routes(filtered_router))
         if not routes_to_add:
-            snap["no_router"][module_name] = "router filtered to 0 routes"
+            snap["no_router"][module_name] = "router filtered to 0 allowed routes"
             continue
 
         existing_sigs = _app_route_signature_set(app, include_builtin=True)
@@ -1323,6 +1334,7 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
         "engine_source": engine_source,
         "engine_init_error": engine_init_error,
         "startup_warnings": startup_warnings,
+        "openapi_cached_route_signature_count": int(getattr(getattr(app, "state", None), "_openapi_route_signature_count", -1) or -1) if app is not None else -1,
     }
 
 
@@ -1445,6 +1457,12 @@ def _install_custom_openapi(app: FastAPI) -> None:
                 schema["paths"] = _minimal_openapi_paths(app)
                 schema["x-openapi-rebuilt-paths"] = True
 
+        backend_base = str(_SETTINGS.BACKEND_BASE_URL or "").strip()
+        if backend_base:
+            schema["servers"] = [{"url": backend_base}]
+        schema["x-generated-at-utc"] = datetime.now(timezone.utc).isoformat()
+        schema["x-route-signature-count"] = current_signature_count
+
         app.openapi_schema = schema
         app.state._openapi_route_signature_count = current_signature_count
         return schema
@@ -1457,8 +1475,8 @@ def _install_custom_openapi(app: FastAPI) -> None:
     @app.api_route("/openapi.json", methods=["GET", "HEAD"], include_in_schema=False)
     async def openapi_json(request: Request):
         if request.method == "HEAD":
-            return Response(status_code=200, media_type="application/json")
-        return _StrictJSONResponse(content=build_openapi_schema())
+            return Response(status_code=200, media_type="application/json", headers={"Cache-Control": "no-store"})
+        return _StrictJSONResponse(content=build_openapi_schema(), headers={"Cache-Control": "no-store"})
 
     if bool(_SETTINGS.ENABLE_SWAGGER):
         @app.get("/docs", include_in_schema=False)
@@ -1589,26 +1607,17 @@ def create_app() -> FastAPI:
             if missing_required:
                 warning = f"missing_required_route_families: {', '.join(missing_required)}"
                 logger.warning(warning)
-                try:
-                    app.state.startup_warnings.append(warning)
-                except Exception:
-                    pass
+                _append_startup_warning(app, warning)
 
             owner_mismatches = dict(snap.get("canonical_path_owner_mismatches", {}) or {})
             if owner_mismatches:
                 warning = f"canonical_path_owner_mismatches: {json.dumps(owner_mismatches, ensure_ascii=False)}"
                 logger.warning(warning)
-                try:
-                    app.state.startup_warnings.append(warning)
-                except Exception:
-                    pass
+                _append_startup_warning(app, warning)
         except Exception as e:
             msg = f"Route mounting crashed during startup: {_err_to_str(e)}"
             logger.error(msg, exc_info=True)
-            try:
-                app.state.startup_warnings.append(msg)
-            except Exception:
-                pass
+            _append_startup_warning(app, msg)
             if _env_bool("ROUTES_STRICT_IMPORT", False):
                 raise
 
@@ -1619,10 +1628,7 @@ def create_app() -> FastAPI:
                 logger.error("Engine init failed (strict): %s", err)
                 raise RuntimeError(f"Engine init failed: {err}")
             logger.warning("Engine init failed (non-fatal): %s", err)
-            try:
-                app.state.startup_warnings.append(f"engine_init_warning: {err}")
-            except Exception:
-                pass
+            _append_startup_warning(app, f"engine_init_warning: {err}")
 
         logger.info("Startup complete: %s", json.dumps(_runtime_meta(app), ensure_ascii=False))
         try:
@@ -1708,17 +1714,11 @@ def create_app() -> FastAPI:
             )
         except Exception as e:
             logger.error("Prestart route mounting failed: %s", e, exc_info=True)
-            try:
-                app.state.startup_warnings.append(f"prestart_route_mount_failed: {_err_to_str(e)}")
-            except Exception:
-                pass
+            _append_startup_warning(app, f"prestart_route_mount_failed: {_err_to_str(e)}")
             if _env_bool("ROUTES_STRICT_IMPORT", False):
                 raise
     else:
-        try:
-            app.state.startup_warnings.append("prestart_route_mount_disabled")
-        except Exception:
-            pass
+        _append_startup_warning(app, "prestart_route_mount_disabled")
         logger.info("Prestart route mounting disabled by PRESTART_MOUNT_ROUTES")
 
     _install_custom_openapi(app)
@@ -1745,7 +1745,7 @@ def create_app() -> FastAPI:
 
         return {
             "status": "ok",
-            "routes_snapshot": getattr(request.app.state, "routes_snapshot", {}),
+            "routes_snapshot": _normalize_routes_snapshot(getattr(request.app.state, "routes_snapshot", {}), used_strategy="main.controlled_priority_plan", app=request.app),
             "app_route_count": len(getattr(request.app, "routes", []) or []),
             "app_route_signature_count": _route_signature_count(request.app, include_builtin=True),
             "route_paths": route_paths,
