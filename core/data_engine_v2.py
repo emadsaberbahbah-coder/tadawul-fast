@@ -1,19 +1,27 @@
+
 #!/usr/bin/env python3
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.51.1
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.52.0
 ================================================================================
 
-This revision is a clean, import-safe replacement focused on route compatibility,
-schema-first sheet rows, and stable exports.
+This revision is a full replacement focused on three practical goals:
 
-Key improvements versus the uploaded script:
-- fixes the scoring fallback recursion bug
-- restores the missing module-level compatibility exports referenced in __all__
-- preserves page-aware provider routing (EODHD-first for configured non-KSA pages)
-- preserves schema-first envelopes for sheet rows and special pages
-- keeps import-time behavior lightweight and failure-tolerant
+- Keep the same public API/export surface already expected by routes/importers.
+- Build real sheet rows more reliably by combining:
+    schema contract
+    requested symbols / page symbols
+    external sheet rows (when available)
+    live enriched quote hydration
+    cached snapshot backfill
+- Stay import-safe and failure-tolerant on Render.
+
+Compared with the uploaded v5.51.1, this version adds:
+- external rows reader discovery and hydration
+- better page symbol resolution from rows/snapshots/env/page defaults
+- row-first + quote-hydration flow for instrument pages
+- stronger schema normalization / output envelopes
 ================================================================================
 """
 
@@ -28,7 +36,6 @@ import os
 import re
 import sys
 import time
-import uuid
 from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import date, datetime, time as dt_time, timezone
@@ -60,11 +67,11 @@ except Exception:  # pragma: no cover
         return dict(kwargs)
 
 
-ROOT_DIR = Path(__file__).resolve().parents[0]
+ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.51.1"
+__version__ = "5.52.0"
 VERSION = __version__
 
 logger = logging.getLogger("core.data_engine_v2")
@@ -1662,6 +1669,9 @@ class DataEngineV5:
         self._sheet_symbol_resolution_meta: Dict[str, Dict[str, Any]] = {}
         self._symbols_reader_source = ""
         self._rows_reader_source = ""
+        self._rows_reader_obj: Any = None
+        self._rows_reader_ready = False
+        self._rows_reader_lock = asyncio.Lock()
         self.flags = {
             "computations_enabled": True,
             "forecasting_enabled": True,
@@ -1682,6 +1692,7 @@ class DataEngineV5:
             "timestamp_utc": _now_utc_iso(),
             "providers": list(self.enabled_providers),
             "provider_stats": await self._registry.get_stats(),
+            "rows_reader_source": self._rows_reader_source or "",
         }
 
     async def health_check(self) -> Dict[str, Any]:
@@ -1701,6 +1712,7 @@ class DataEngineV5:
             "rows_hydrate_external": bool(self.rows_hydrate_external),
             "snapshot_sheets": sorted(self._sheet_snapshots.keys()),
             "sheet_symbol_resolution_meta": dict(self._sheet_symbol_resolution_meta),
+            "rows_reader_source": self._rows_reader_source or "",
         }
 
     def _store_sheet_snapshot(self, sheet: str, payload: Dict[str, Any]) -> None:
@@ -1732,6 +1744,24 @@ class DataEngineV5:
         meta = self._sheet_symbol_resolution_meta.get(target)
         return dict(meta) if isinstance(meta, dict) else {}
 
+    def _get_best_cached_snapshot_row_for_symbol(self, symbol: str, prefer_sheet: str = "") -> Optional[Dict[str, Any]]:
+        sym = normalize_symbol(symbol)
+        preferred = _canonicalize_sheet_name(prefer_sheet) if prefer_sheet else ""
+        best_row: Optional[Dict[str, Any]] = None
+        best_score = -1
+        for sheet_name, snap in self._sheet_snapshots.items():
+            rows = _coerce_rows_list(snap)
+            for row in rows:
+                if normalize_symbol(_extract_row_symbol(row)) != sym:
+                    continue
+                score = sum(1 for v in row.values() if v not in (None, "", [], {}))
+                if preferred and _canonicalize_sheet_name(sheet_name) == preferred:
+                    score += 1000
+                if score > best_score:
+                    best_score = score
+                    best_row = dict(row)
+        return best_row
+
     def _finalize_payload(self, *, sheet: str, headers: List[str], keys: List[str], row_objects: List[Dict[str, Any]], include_matrix: bool, status: str = "success", meta: Optional[Dict[str, Any]] = None, error: Optional[str] = None) -> Dict[str, Any]:
         headers, keys = _complete_schema_contract(headers, keys)
         dict_rows = [_strict_project_row(keys, r) for r in row_objects or []]
@@ -1762,6 +1792,79 @@ class DataEngineV5:
         if error is not None:
             payload["error"] = error
         return _json_safe(payload)
+
+    async def _init_rows_reader(self) -> Tuple[Any, str]:
+        if self._rows_reader_ready:
+            return self._rows_reader_obj, self._rows_reader_source
+        async with self._rows_reader_lock:
+            if self._rows_reader_ready:
+                return self._rows_reader_obj, self._rows_reader_source
+            obj = None
+            source = ""
+            for mod_path in (
+                "integrations.google_sheets_service",
+                "core.integrations.google_sheets_service",
+                "google_sheets_service",
+                "core.google_sheets_service",
+                "integrations.symbols_reader",
+                "core.integrations.symbols_reader",
+            ):
+                try:
+                    mod = import_module(mod_path)
+                except Exception:
+                    continue
+                if any(callable(getattr(mod, nm, None)) for nm in ("get_rows_for_sheet", "read_rows_for_sheet", "get_sheet_rows", "fetch_sheet_rows", "sheet_rows", "get_rows")):
+                    obj = mod
+                    source = mod_path
+                    break
+                for attr_name in ("service", "reader", "rows_reader", "google_sheets_service"):
+                    candidate = getattr(mod, attr_name, None)
+                    if candidate is not None:
+                        obj = candidate
+                        source = f"{mod_path}.{attr_name}"
+                        break
+                if obj is not None:
+                    break
+            self._rows_reader_obj = obj
+            self._rows_reader_source = source
+            self._rows_reader_ready = True
+            return obj, source
+
+    async def _call_rows_reader(self, obj: Any, sheet: str, limit: int) -> List[Dict[str, Any]]:
+        if obj is None:
+            return []
+        for name in ("get_rows_for_sheet", "read_rows_for_sheet", "get_sheet_rows", "fetch_sheet_rows", "sheet_rows", "get_rows"):
+            fn = getattr(obj, name, None)
+            if not callable(fn):
+                continue
+            variants = [
+                ((), {"sheet": sheet, "limit": limit}),
+                ((), {"sheet_name": sheet, "limit": limit}),
+                ((), {"page": sheet, "limit": limit}),
+                ((sheet,), {"limit": limit}),
+                ((sheet,), {}),
+            ]
+            for args, kwargs in variants:
+                try:
+                    async with asyncio.timeout(_get_env_float("ROWS_READER_TIMEOUT_SECONDS", 15.0)):
+                        if inspect.iscoroutinefunction(fn):
+                            result = await fn(*args, **kwargs)
+                        else:
+                            result = await asyncio.to_thread(fn, *args, **kwargs)
+                    rows = _coerce_rows_list(result)
+                    if rows:
+                        return rows[:limit]
+                except TypeError:
+                    continue
+                except Exception:
+                    continue
+        return []
+
+    async def _get_rows_from_external_reader(self, sheet: str, limit: int) -> List[Dict[str, Any]]:
+        obj, _ = await self._init_rows_reader()
+        if obj is None:
+            return []
+        return await self._call_rows_reader(obj, sheet, limit)
 
     def _providers_for(self, symbol: str, page: str = "") -> List[str]:
         info = get_symbol_info(symbol)
@@ -1892,6 +1995,9 @@ class DataEngineV5:
                 "data_sources": [],
                 "provider_latency": {},
             }
+        cached_row = self._get_best_cached_snapshot_row_for_symbol(norm, prefer_sheet=page_ctx)
+        if cached_row:
+            row = _merge_missing_fields(row, cached_row)
         row = _apply_page_row_backfill(page_ctx or "Market_Leaders", row)
         _try_scoring_module(row)
         _compute_recommendation(row)
@@ -2062,6 +2168,14 @@ class DataEngineV5:
             syms = _normalize_symbol_list(cached, limit=effective_limit)
             self._set_sheet_symbols_meta(target_sheet, "symbols_cache", len(syms))
             return syms
+        if self.rows_hydrate_external:
+            ext_rows = await self._get_rows_from_external_reader(target_sheet, limit=max(50, effective_limit))
+            if ext_rows:
+                syms = _extract_symbols_from_rows(ext_rows, limit=effective_limit)
+                if syms:
+                    self._set_sheet_symbols_meta(target_sheet, f"external_rows:{self._rows_reader_source or 'reader'}", len(syms))
+                    await self._symbols_cache.set(syms, sheet=target_sheet, limit=effective_limit)
+                    return syms
         specific = PAGE_SYMBOL_ENV_KEYS.get(target_sheet)
         if specific:
             raw = os.getenv(specific, "") or ""
@@ -2117,6 +2231,7 @@ class DataEngineV5:
         headers, keys = _complete_schema_contract(headers, keys)
         if target_sheet == "Top_10_Investments" and self.top10_force_full_schema:
             headers, keys = _ensure_top10_contract(headers, keys)
+
         contract_level = "canonical" if _usable_contract(headers, keys, target_sheet) else "partial"
         base_meta = {
             "schema_source": schema_src,
@@ -2126,11 +2241,14 @@ class DataEngineV5:
             "target_sheet_known": target_sheet in STATIC_CANONICAL_SHEET_CONTRACTS,
             "route_input_keys": sorted([str(k) for k in body.keys()]) if isinstance(body, dict) else [],
             "request_input_keys": sorted([str(k) for k in request_parts.keys()]) if isinstance(request_parts, dict) else [],
+            "rows_reader_source": self._rows_reader_source or "",
         }
+
         if _safe_bool(body.get("schema_only"), False) or _safe_bool(body.get("headers_only"), False):
             payload = self._finalize_payload(sheet=target_sheet, headers=headers, keys=keys, row_objects=[], include_matrix=include_matrix, status="success", meta={**base_meta, "rows": 0, "limit": limit, "offset": offset, "mode": mode, "built_from": "schema_only_fast_path"})
             _PERF_METRICS.append({"name": "get_sheet_rows", "duration_ms": round((time.time() - started) * 1000.0, 3), "success": True, "sheet": target_sheet})
             return payload
+
         if target_sheet == "Data_Dictionary":
             rows = [_strict_project_row(keys, _normalize_to_schema_keys(keys, headers, r)) for r in await self._build_data_dictionary_rows()]
             payload_full = self._finalize_payload(sheet=target_sheet, headers=headers, keys=keys, row_objects=rows, include_matrix=include_matrix, status="success", meta={**base_meta, "rows": len(rows), "limit": limit, "offset": offset, "mode": mode, "built_from": "internal_data_dictionary"})
@@ -2138,6 +2256,7 @@ class DataEngineV5:
             out = self._finalize_payload(sheet=target_sheet, headers=headers, keys=keys, row_objects=rows[offset:offset + limit], include_matrix=include_matrix, status="success", meta={**payload_full.get("meta", {}), "rows": len(rows[offset:offset + limit])})
             _PERF_METRICS.append({"name": "get_sheet_rows", "duration_ms": round((time.time() - started) * 1000.0, 3), "success": True, "sheet": target_sheet})
             return out
+
         if target_sheet == "Insights_Analysis":
             rows = [_strict_project_row(keys, _normalize_to_schema_keys(keys, headers, r)) for r in await self._build_insights_rows_fallback(body, limit=max(limit + offset, 10))]
             payload_full = self._finalize_payload(sheet=target_sheet, headers=headers, keys=keys, row_objects=rows, include_matrix=include_matrix, status="success" if rows else "warn", meta={**base_meta, "rows": len(rows), "limit": limit, "offset": offset, "mode": mode, "built_from": "engine_insights_fallback"})
@@ -2145,6 +2264,7 @@ class DataEngineV5:
             out = self._finalize_payload(sheet=target_sheet, headers=headers, keys=keys, row_objects=rows[offset:offset + limit], include_matrix=include_matrix, status=payload_full.get("status", "success"), meta={**payload_full.get("meta", {}), "rows": len(rows[offset:offset + limit])})
             _PERF_METRICS.append({"name": "get_sheet_rows", "duration_ms": round((time.time() - started) * 1000.0, 3), "success": True, "sheet": target_sheet})
             return out
+
         if target_sheet == "Top_10_Investments":
             out_headers, out_keys, rows = await self._build_top10_rows_fallback(headers, keys, body, limit=max(limit + offset, 10), mode=mode)
             payload_full = self._finalize_payload(sheet=target_sheet, headers=out_headers, keys=out_keys, row_objects=rows, include_matrix=include_matrix, status="success" if rows else "warn", meta={**base_meta, "rows": len(rows), "limit": limit, "offset": offset, "mode": mode, "built_from": "top10_fallback_ranker"})
@@ -2152,24 +2272,89 @@ class DataEngineV5:
             out = self._finalize_payload(sheet=target_sheet, headers=out_headers, keys=out_keys, row_objects=rows[offset:offset + limit], include_matrix=include_matrix, status=payload_full.get("status", "warn"), meta={**payload_full.get("meta", {}), "rows": len(rows[offset:offset + limit])})
             _PERF_METRICS.append({"name": "get_sheet_rows", "duration_ms": round((time.time() - started) * 1000.0, 3), "success": True, "sheet": target_sheet})
             return out
+
         requested_symbols = _extract_requested_symbols_from_body(body, limit=limit + offset)
         built_from = "body_symbols" if requested_symbols else "auto_sheet_symbols"
+        ext_rows: List[Dict[str, Any]] = []
+
+        if self.rows_hydrate_external and target_sheet in INSTRUMENT_SHEETS:
+            ext_rows = await self._get_rows_from_external_reader(target_sheet, limit=max(limit + offset, 250))
+            if ext_rows and not requested_symbols:
+                requested_symbols = _extract_symbols_from_rows(ext_rows, limit=max(limit + offset, 250))
+                built_from = f"external_rows:{self._rows_reader_source or 'reader'}"
+
         if not requested_symbols and target_sheet in INSTRUMENT_SHEETS:
-            requested_symbols = await self.get_sheet_symbols(target_sheet, limit=limit + offset, body=body)
+            requested_symbols = await self.get_sheet_symbols(target_sheet, limit=max(limit + offset, 250), body=body)
+            if requested_symbols:
+                built_from = "sheet_symbols"
+
         rows_full: List[Dict[str, Any]] = []
+        quotes_by_symbol: Dict[str, Dict[str, Any]] = {}
+
         if requested_symbols:
             quotes = await self.get_enriched_quotes(requested_symbols, schema=None, page=target_sheet, body=body)
             for q in quotes:
-                row = _model_to_dict(q)
+                qd = _model_to_dict(q)
+                sym = normalize_symbol(_safe_str(qd.get("symbol") or qd.get("requested_symbol")))
+                if sym:
+                    quotes_by_symbol[sym] = qd
+
+        if ext_rows:
+            for base_row in ext_rows:
+                sym = normalize_symbol(_extract_row_symbol(base_row))
+                quote_row = quotes_by_symbol.get(sym) if sym else None
+                row = _normalize_to_schema_keys(keys, headers, base_row)
+                row = _apply_page_row_backfill(target_sheet, row)
+                if quote_row:
+                    row = _merge_missing_fields(row, _normalize_to_schema_keys(keys, headers, quote_row))
                 row = _apply_page_row_backfill(target_sheet, row)
                 _try_scoring_module(row)
                 _compute_recommendation(row)
-                rows_full.append(_strict_project_row(keys, _normalize_to_schema_keys(keys, headers, row)))
+                rows_full.append(_strict_project_row(keys, row))
+
+        else:
+            for sym in requested_symbols:
+                qd = quotes_by_symbol.get(sym) or {}
+                row = _normalize_to_schema_keys(keys, headers, qd)
+                row = _apply_page_row_backfill(target_sheet, row)
+                _try_scoring_module(row)
+                _compute_recommendation(row)
+                rows_full.append(_strict_project_row(keys, row))
+
+        if rows_full:
             _apply_rank_overall(rows_full)
-        payload_full = self._finalize_payload(sheet=target_sheet, headers=headers, keys=keys, row_objects=rows_full, include_matrix=include_matrix, status="success" if rows_full or target_sheet in STATIC_CANONICAL_SHEET_CONTRACTS else "warn", meta={**base_meta, "rows": len(rows_full), "limit": limit, "offset": offset, "mode": mode, "built_from": built_from, "resolved_symbols_count": len(requested_symbols), "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet)})
+
+        payload_full = self._finalize_payload(
+            sheet=target_sheet,
+            headers=headers,
+            keys=keys,
+            row_objects=rows_full,
+            include_matrix=include_matrix,
+            status="success" if rows_full or target_sheet in STATIC_CANONICAL_SHEET_CONTRACTS else "warn",
+            meta={
+                **base_meta,
+                "rows": len(rows_full),
+                "limit": limit,
+                "offset": offset,
+                "mode": mode,
+                "built_from": built_from,
+                "resolved_symbols_count": len(requested_symbols),
+                "external_rows_count": len(ext_rows),
+                "symbol_resolution_meta": self._get_sheet_symbols_meta(target_sheet),
+            },
+        )
         if rows_full:
             self._store_sheet_snapshot(target_sheet, payload_full)
-        out = self._finalize_payload(sheet=target_sheet, headers=headers, keys=keys, row_objects=rows_full[offset:offset + limit], include_matrix=include_matrix, status=payload_full.get("status", "success"), meta={**payload_full.get("meta", {}), "rows": len(rows_full[offset:offset + limit])})
+
+        out = self._finalize_payload(
+            sheet=target_sheet,
+            headers=headers,
+            keys=keys,
+            row_objects=rows_full[offset:offset + limit],
+            include_matrix=include_matrix,
+            status=payload_full.get("status", "success"),
+            meta={**payload_full.get("meta", {}), "rows": len(rows_full[offset:offset + limit])},
+        )
         _PERF_METRICS.append({"name": "get_sheet_rows", "duration_ms": round((time.time() - started) * 1000.0, 3), "success": True, "sheet": target_sheet})
         return out
 
@@ -2389,6 +2574,7 @@ def get_engine_meta() -> Dict[str, Any]:
         "schema_strict_sheet_rows": bool(getattr(inst, "schema_strict_sheet_rows", _get_env_bool("SCHEMA_STRICT_SHEET_ROWS", True))) if inst is not None else _get_env_bool("SCHEMA_STRICT_SHEET_ROWS", True),
         "top10_force_full_schema": bool(getattr(inst, "top10_force_full_schema", _get_env_bool("TOP10_FORCE_FULL_SCHEMA", True))) if inst is not None else _get_env_bool("TOP10_FORCE_FULL_SCHEMA", True),
         "perf_stats": get_perf_stats(),
+        "rows_reader_source": getattr(inst, "_rows_reader_source", "") if inst is not None else "",
     }
 
 
