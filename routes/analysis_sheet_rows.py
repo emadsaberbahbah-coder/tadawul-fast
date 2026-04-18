@@ -1,38 +1,31 @@
+
 #!/usr/bin/env python3
 # routes/analysis_sheet_rows.py
 """
 ================================================================================
-Analysis Sheet-Rows Router — v3.9.0
+Analysis Sheet-Rows Router — v4.0.0
 ================================================================================
-ROOT-PROXY FIRST • ADVANCED-ROUTE ALIGNED • ADAPTER-FIRST FALLBACK • SPECIAL-
-PAGE SAFE • SCHEMA-FIRST • STABLE ENVELOPE • GET+POST MERGED • FAIL-SOFT
+ENGINE-FIRST • ADAPTER-SECOND • ROOT-PROXY COMPAT • PLACEHOLDER FILTER
+SCHEMA-FIRST • STABLE ENVELOPE • GET+POST MERGED • FAIL-SOFT • JSON-SAFE
 
 What this revision improves
 --------------------------
-- ALIGN: tries the canonical root owner first (routes.advanced_analysis) and
-         then the advanced route owner before doing local fallback work.
-- ALIGN: prefers core.data_engine.get_sheet_rows as the adapter-level fallback
-         before dropping down to symbol-level engine calls.
-- ALIGN: emits the same stable response contract used by the aligned routes:
-         headers/display_headers/sheet_headers/column_headers/keys/rows/
-         rows_matrix/row_objects/items/records/data/quotes.
-- FIX: supports schema_only / headers_only in both GET and POST flows.
-- FIX: accepts page aliases plus direct symbol aliases (symbol/ticker/code/
-         requested_symbol/direct_symbols/selected_symbols) consistently.
-- FIX: preserves canonical widths for instrument, Top_10_Investments,
-         Insights_Analysis, and Data_Dictionary even when upstream wraps payloads.
-- FIX: keeps Top10 required fields filled in fail-soft scenarios.
-- SAFE: if every upstream path degrades, returns a schema-shaped partial payload
-         instead of bubbling a wrapper-specific 5xx.
-- ENHANCE: prefers the canonical root owner first for Top10 and only accepts
-         special-page upstream payloads when they contain real rows.
-- ENHANCE: keeps local non-empty fallbacks for Top10 / Insights / Data_Dictionary
-         when upstream returns empty success/partial envelopes.
+- FIX: prefers app.state.engine.get_sheet_rows / get_sheet_rows_sync before any
+       proxy route, so /v1/analysis/sheet-rows no longer inherits degraded
+       wrapper payloads when the engine can answer directly.
+- FIX: rejects placeholder / fail-soft payloads from upstream instead of
+       treating them as successful live results.
+- FIX: keeps schema_registry widths authoritative and preserves the canonical
+       response envelope across direct engine, adapter, proxy, and fallback paths.
+- FIX: accepts special pages only when they contain real non-placeholder rows.
+- ENHANCE: keeps compatibility with routes.advanced_analysis and
+          routes.advanced_sheet_rows as late compatibility fallbacks.
 ================================================================================
 """
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import inspect
 import json
@@ -116,8 +109,7 @@ except Exception:
     except Exception:
         core_get_sheet_rows = None  # type: ignore
 
-
-ANALYSIS_SHEET_ROWS_VERSION = "3.10.0"
+ANALYSIS_SHEET_ROWS_VERSION = "4.0.0"
 router = APIRouter(prefix="/v1/analysis", tags=["Analysis Sheet Rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -125,21 +117,17 @@ _INSIGHTS_PAGE = "Insights_Analysis"
 _DICTIONARY_PAGE = "Data_Dictionary"
 _SPECIAL_PAGES = {_TOP10_PAGE, _INSIGHTS_PAGE, _DICTIONARY_PAGE}
 
-# v3.10.0: Per-page column counts matching schema_registry v3.4.0
-# schema_registry is authoritative — these are used as fallback when the
-# registry cannot be reached. Prefer _expected_len() which queries live registry.
 _EXPECTED_SHEET_LENGTHS: Dict[str, int] = {
-    "Market_Leaders":    99,   # 80 base + 19 new (roe, roa, vol_ratio, tech signals, etc.)
-    "Global_Markets":    112,  # 99 base + 19 sector/comparative/EODHD cols (no My_Portfolio fields)
-    "Commodities_FX":    86,   # 99 − 13 equity-only + 6 commodity-specific
-    "Mutual_Funds":      94,   # 99 − 13 equity-only + 14 fund-specific
-    "My_Portfolio":      110,  # 99 + 11 advanced portfolio management
-    _TOP10_PAGE:         106,  # 99 + 3 top10 extras + 4 trade setup
-    _INSIGHTS_PAGE:      9,    # 7 original + signal + priority
-    _DICTIONARY_PAGE:    9,    # unchanged
+    "Market_Leaders": 99,
+    "Global_Markets": 112,
+    "Commodities_FX": 86,
+    "Mutual_Funds": 94,
+    "My_Portfolio": 110,
+    _TOP10_PAGE: 106,
+    _INSIGHTS_PAGE: 9,
+    _DICTIONARY_PAGE: 9,
 }
 
-# v3.10.0: Top10 required fields now include trade setup columns
 _TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
     "top10_rank",
     "selection_reason",
@@ -151,14 +139,19 @@ _TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
 )
 
 _TOP10_REQUIRED_HEADERS: Dict[str, str] = {
-    "top10_rank":           "Top 10 Rank",
-    "selection_reason":     "Selection Reason",
-    "criteria_snapshot":    "Criteria Snapshot",
-    "entry_price":          "Entry Price",
-    "stop_loss_suggested":  "Stop Loss (AI)",
-    "take_profit_suggested":"Take Profit (AI)",
-    "risk_reward_ratio":    "Risk/Reward",
+    "top10_rank": "Top 10 Rank",
+    "selection_reason": "Selection Reason",
+    "criteria_snapshot": "Criteria Snapshot",
+    "entry_price": "Entry Price",
+    "stop_loss_suggested": "Stop Loss (AI)",
+    "take_profit_suggested": "Take Profit (AI)",
+    "risk_reward_ratio": "Risk/Reward",
 }
+
+_DEFAULT_UPSTREAM_TIMEOUT_SEC = 10.0
+_DEFAULT_SPECIAL_TIMEOUT_SEC = 8.0
+_DEFAULT_INSIGHTS_TIMEOUT_SEC = 6.0
+_DEFAULT_TOP10_TIMEOUT_SEC = 8.0
 
 _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
     "symbol": ["ticker", "code", "instrument", "security", "requested_symbol", "symbol_code"],
@@ -186,8 +179,8 @@ _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
     "float_shares": ["floatShares", "sharesFloat", "free_float_shares"],
     "overall_score": ["score", "composite_score", "total_score"],
     "opportunity_score": ["opportunity", "opportunity_rank_score", "conviction_score"],
-    "forecast_confidence": ["confidence", "confidence_pct"],
-    "confidence_score": ["confidence", "confidence_pct"],
+    "forecast_confidence": ["confidence", "confidence_pct", "ai_confidence"],
+    "confidence_score": ["confidence", "confidence_pct", "ai_confidence"],
     "expected_roi_1m": ["roi_1m", "expected_return_1m", "target_return_1m"],
     "expected_roi_3m": ["roi_3m", "expected_return_3m", "target_return_3m"],
     "expected_roi_12m": ["roi_12m", "expected_return_12m", "target_return_12m"],
@@ -206,169 +199,120 @@ _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
     "group": ["section"],
     "fmt": ["format"],
     "dtype": ["type", "data_type"],
-    "notes": ["description", "commentary"],
-    # ── v3.10.0: new schema_registry v3.4.0 fields ────────────────────────
-    "price_change_5d":     ["priceChange5d", "change5d", "five_day_change", "5d_change"],
-    "volume_ratio":        ["volumeRatio", "vol_ratio", "volume_surge"],
-    "roe":                 ["returnOnEquity", "return_on_equity", "ROE"],
-    "roa":                 ["returnOnAssets", "return_on_assets", "ROA"],
-    "rsi_signal":          ["rsiSignal", "rsi_zone", "rsi_label"],
-    "technical_score":     ["technicalScore", "tech_score", "techScore"],
-    "day_range_position":  ["dayRangePosition", "day_range_pos", "range_position"],
-    "atr_14":              ["atr", "averageTrueRange", "ATR", "average_true_range"],
-    "upside_pct":          ["upsidePct", "upside_percent", "upside_downside"],
-    "short_term_signal":   ["shortTermSignal", "st_signal", "day_week_signal"],
-    "ma_50d":              ["fiftyDayAverage", "sma50", "ma50", "50d_ma"],
-    "ma_200d":             ["twoHundredDayAverage", "sma200", "ma200", "200d_ma"],
-    "ema_signal":          ["emaSignal", "ema_50_signal"],
-    "macd_signal":         ["macdSignal", "macd", "MACD"],
-    "region":              ["Region", "market_region"],
-    "market_status":       ["marketState", "market_state", "trading_status"],
-    "price_usd":           ["priceUSD", "price_in_usd"],
-    "sector_pe_avg":       ["sectorPE", "sector_avg_pe", "sector_pe"],
-    "vs_sector_pe_pct":    ["vsSectorPE", "sector_pe_premium", "stock_vs_sector"],
-    "sector_ytd_pct":      ["sectorYTD", "sector_performance"],
-    "sector_signal":       ["sectorSignal", "sector_momentum"],
-    "sector_rank":         ["sectorRank", "rank_in_sector"],
-    "sector_vs_msci_pct":  ["sectorVsMSCI", "sector_vs_benchmark"],
-    "vs_sp500_ytd":        ["vsSP500", "vs_sp500", "relative_to_sp500"],
-    "vs_msci_world_ytd":   ["vsMSCI", "vs_msci_world"],
-    "wall_st_target":      ["wallStTarget", "analyst_target", "WallStreetTargetPrice"],
-    "upside_to_target_pct":["upsideToTarget", "analyst_upside"],
-    "analyst_consensus":   ["analystConsensus", "analyst_rating_consensus"],
-    "country_risk":        ["countryRisk", "sovereign_rating"],
-    "commodity_type":      ["commodityType", "asset_type_commodity"],
-    "contract_expiry":     ["contractExpiry", "expiry_date", "expireDate"],
-    "spot_price":          ["spotPrice", "underlying_spot"],
-    "usd_correlation":     ["usdCorrelation", "corr_usd"],
-    "seasonal_signal":     ["seasonalSignal", "seasonal_pattern"],
-    "carry_rate":          ["carryRate", "interest_diff"],
-    "fund_type":           ["fundType", "quoteType", "fund_category"],
-    "benchmark_name":      ["benchmarkName", "fund_benchmark", "category"],
-    "holdings_count":      ["holdingsCount", "number_of_holdings"],
-    "aum":                 ["totalAssets", "AUM", "fund_aum"],
-    "expense_ratio":       ["expenseRatio", "annual_expense_ratio"],
-    "nav":                 ["navPrice", "net_asset_value", "NAV"],
-    "nav_premium_pct":     ["navPremiumPct", "premium_discount", "nav_discount"],
-    "distribution_yield":  ["distributionYield"],
-    "ytd_return":          ["ytdReturn", "year_to_date_return"],
-    "return_1y":           ["oneYearReturn", "annual_return", "1y_return"],
-    "return_3y_ann":       ["threeYearAverageReturn", "3y_annualized", "return_3y"],
-    "return_5y_ann":       ["fiveYearAverageReturn", "5y_annualized", "return_5y"],
-    "tracking_error":      ["trackingError", "tracking_err"],
-    "alpha_1y":            ["alpha", "alphaJensen", "1y_alpha"],
-    "portfolio_weight_pct":["portfolioWeight", "weight_pct", "allocation_pct"],
-    "target_weight_pct":   ["targetWeight", "target_allocation"],
-    "weight_deviation":    ["weightDeviation", "deviation_from_target"],
-    "rebalance_signal":    ["rebalanceSignal", "rebal_signal"],
-    "stop_loss":           ["stopLoss", "stop_loss_price"],
-    "take_profit":         ["takeProfit", "take_profit_price"],
-    "distance_to_sl_pct":  ["distToSL", "distance_stop_loss"],
-    "distance_to_tp_pct":  ["distToTP", "distance_take_profit"],
-    "days_held":           ["daysHeld", "holding_days"],
+    "notes": ["description", "commentary", "detail", "message"],
+    "signal": ["trade_signal", "action_signal"],
+    "priority": ["urgency", "alert_priority"],
+    "price_change_5d": ["priceChange5d", "change5d", "five_day_change", "5d_change"],
+    "volume_ratio": ["volumeRatio", "vol_ratio", "volume_surge"],
+    "roe": ["returnOnEquity", "return_on_equity", "ROE"],
+    "roa": ["returnOnAssets", "return_on_assets", "ROA"],
+    "rsi_signal": ["rsiSignal", "rsi_zone", "rsi_label"],
+    "technical_score": ["technicalScore", "tech_score", "techScore"],
+    "day_range_position": ["dayRangePosition", "day_range_pos", "range_position"],
+    "atr_14": ["atr", "averageTrueRange", "ATR", "average_true_range"],
+    "upside_pct": ["upsidePct", "upside_percent", "upside_downside"],
+    "short_term_signal": ["shortTermSignal", "st_signal", "day_week_signal"],
+    "ma_50d": ["fiftyDayAverage", "sma50", "ma50", "50d_ma"],
+    "ma_200d": ["twoHundredDayAverage", "sma200", "ma200", "200d_ma"],
+    "ema_signal": ["emaSignal", "ema_50_signal"],
+    "macd_signal": ["macdSignal", "macd", "MACD"],
+    "region": ["Region", "market_region"],
+    "market_status": ["marketState", "market_state", "trading_status"],
+    "price_usd": ["priceUSD", "price_in_usd"],
+    "sector_pe_avg": ["sectorPE", "sector_avg_pe", "sector_pe"],
+    "vs_sector_pe_pct": ["vsSectorPE", "sector_pe_premium", "stock_vs_sector"],
+    "sector_ytd_pct": ["sectorYTD", "sector_performance"],
+    "sector_signal": ["sectorSignal", "sector_momentum"],
+    "sector_rank": ["sectorRank", "rank_in_sector"],
+    "sector_vs_msci_pct": ["sectorVsMSCI", "sector_vs_benchmark"],
+    "vs_sp500_ytd": ["vsSP500", "vs_sp500", "relative_to_sp500"],
+    "vs_msci_world_ytd": ["vsMSCI", "vs_msci_world"],
+    "wall_st_target": ["wallStTarget", "analyst_target", "WallStreetTargetPrice"],
+    "upside_to_target_pct": ["upsideToTarget", "analyst_upside"],
+    "analyst_consensus": ["analystConsensus", "analyst_rating_consensus"],
+    "country_risk": ["countryRisk", "sovereign_rating"],
+    "commodity_type": ["commodityType", "asset_type_commodity"],
+    "contract_expiry": ["contractExpiry", "expiry_date", "expireDate"],
+    "spot_price": ["spotPrice", "underlying_spot"],
+    "usd_correlation": ["usdCorrelation", "corr_usd"],
+    "seasonal_signal": ["seasonalSignal", "seasonal_pattern"],
+    "carry_rate": ["carryRate", "interest_diff"],
+    "fund_type": ["fundType", "quoteType", "fund_category"],
+    "benchmark_name": ["benchmarkName", "fund_benchmark", "category"],
+    "holdings_count": ["holdingsCount", "number_of_holdings"],
+    "aum": ["totalAssets", "AUM", "fund_aum"],
+    "expense_ratio": ["expenseRatio", "annual_expense_ratio"],
+    "nav": ["navPrice", "net_asset_value", "NAV"],
+    "nav_premium_pct": ["navPremiumPct", "premium_discount", "nav_discount"],
+    "distribution_yield": ["distributionYield"],
+    "ytd_return": ["ytdReturn", "year_to_date_return"],
+    "return_1y": ["oneYearReturn", "annual_return", "1y_return"],
+    "return_3y_ann": ["threeYearAverageReturn", "3y_annualized", "return_3y"],
+    "return_5y_ann": ["fiveYearAverageReturn", "5y_annualized", "return_5y"],
+    "tracking_error": ["trackingError", "tracking_err"],
+    "alpha_1y": ["alpha", "alphaJensen", "1y_alpha"],
+    "portfolio_weight_pct": ["portfolioWeight", "weight_pct", "allocation_pct"],
+    "target_weight_pct": ["targetWeight", "target_allocation"],
+    "weight_deviation": ["weightDeviation", "deviation_from_target"],
+    "rebalance_signal": ["rebalanceSignal", "rebal_signal"],
+    "stop_loss": ["stopLoss", "stop_loss_price"],
+    "take_profit": ["takeProfit", "take_profit_price"],
+    "distance_to_sl_pct": ["distToSL", "distance_stop_loss"],
+    "distance_to_tp_pct": ["distToTP", "distance_take_profit"],
+    "days_held": ["daysHeld", "holding_days"],
     "annual_dividend_income": ["annualDividendIncome", "annual_div_income"],
-    "beta_contribution":   ["betaContribution", "beta_contrib"],
-    "entry_price":         ["entryPrice", "suggested_entry"],
+    "beta_contribution": ["betaContribution", "beta_contrib"],
+    "entry_price": ["entryPrice", "suggested_entry"],
     "stop_loss_suggested": ["stopLossSuggested", "ai_stop_loss"],
-    "take_profit_suggested":["takeProfitSuggested", "ai_take_profit"],
-    "risk_reward_ratio":   ["riskRewardRatio", "rr_ratio"],
-    "signal":              ["Signal", "action_signal", "trade_signal"],
-    "priority":            ["Priority", "alert_priority", "urgency"],
+    "take_profit_suggested": ["takeProfitSuggested", "ai_take_profit"],
+    "risk_reward_ratio": ["riskRewardRatio", "rr_ratio"],
 }
 
-# v3.10.0: Updated to 99-column Market_Leaders schema (schema_registry v3.4.0).
-# _CANONICAL_80_HEADERS/KEYS kept as backward-compat aliases.
 _CANONICAL_99_HEADERS: List[str] = [
-    # Identity (8)
     "Symbol", "Name", "Asset Class", "Exchange", "Currency", "Country", "Sector", "Industry",
-    # Price base (10)
-    "Current Price", "Previous Close", "Open", "Day High", "Day Low",
-    "52W High", "52W Low", "Price Change", "Change %", "52W Position %",
-    # Price new (1)
-    "5D Change %",
-    # Volume (6)
+    "Current Price", "Previous Close", "Open", "Day High", "Day Low", "52W High", "52W Low",
+    "Price Change", "Change %", "52W Position %", "5D Change %",
     "Volume", "Avg Vol 10D", "Avg Vol 30D", "Market Cap", "Float Shares", "Volume Ratio",
-    # Fundamentals equity (13)
     "Beta (5Y)", "P/E (TTM)", "P/E (Fwd)", "EPS (TTM)", "Div Yield %", "Payout Ratio %",
-    "Revenue TTM", "Rev Growth YoY %", "Gross Margin %", "Op Margin %",
-    "Net Margin %", "D/E Ratio", "FCF (TTM)",
-    # Fundamentals quality (2)
-    "ROE %", "ROA %",
-    # Risk (8)
-    "RSI (14)", "Volatility 30D %", "Volatility 90D %", "Max DD 1Y %",
-    "VaR 95% (1D)", "Sharpe (1Y)", "Risk Score", "Risk Bucket",
-    # Technicals new (4)
-    "RSI Signal", "Tech Score", "Day Range Pos %", "ATR 14",
-    # Valuation (7)
+    "Revenue TTM", "Rev Growth YoY %", "Gross Margin %", "Op Margin %", "Net Margin %",
+    "D/E Ratio", "FCF (TTM)", "ROE %", "ROA %",
+    "RSI (14)", "Volatility 30D %", "Volatility 90D %", "Max DD 1Y %", "VaR 95% (1D)", "Sharpe (1Y)",
+    "Risk Score", "Risk Bucket", "RSI Signal", "Tech Score", "Day Range Pos %", "ATR 14",
     "P/B", "P/S", "EV/EBITDA", "PEG Ratio", "Intrinsic Value", "Valuation Score", "Upside %",
-    # Forecast (9)
-    "Price Tgt 1M", "Price Tgt 3M", "Price Tgt 12M",
-    "ROI 1M %", "ROI 3M %", "ROI 12M %",
+    "Price Tgt 1M", "Price Tgt 3M", "Price Tgt 12M", "ROI 1M %", "ROI 3M %", "ROI 12M %",
     "AI Confidence", "Confidence Score", "Confidence",
-    # Scores (6)
     "Value Score", "Quality Score", "Momentum Score", "Growth Score", "Overall Score", "Opportunity Score",
-    # Decision (8)
-    "Analyst Rating", "Target Price", "Upside/Downside %",
-    "Recommendation", "Signal", "Trend 1M", "Trend 3M", "Trend 12M",
-    # Recommendation new (4)
-    "ST Signal", "Reason", "Horizon", "Horizon Days",
-    # Rank
-    "Rank (Overall)",
-    # Portfolio light (6)
+    "Analyst Rating", "Target Price", "Upside/Downside %", "Recommendation", "Signal", "Trend 1M", "Trend 3M", "Trend 12M",
+    "ST Signal", "Reason", "Horizon", "Horizon Days", "Rank (Overall)",
     "Qty", "Avg Cost", "Position Cost", "Position Value", "Unrealized P/L", "Unrealized P/L %",
-    # Provenance (4)
     "Data Provider", "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
 ]
 
 _CANONICAL_99_KEYS: List[str] = [
-    # Identity (8)
     "symbol", "name", "asset_class", "exchange", "currency", "country", "sector", "industry",
-    # Price base (10)
-    "current_price", "previous_close", "open_price", "day_high", "day_low",
-    "week_52_high", "week_52_low", "price_change", "percent_change", "week_52_position_pct",
-    # Price new (1)
-    "price_change_5d",
-    # Volume (6)
+    "current_price", "previous_close", "open_price", "day_high", "day_low", "week_52_high", "week_52_low",
+    "price_change", "percent_change", "week_52_position_pct", "price_change_5d",
     "volume", "avg_volume_10d", "avg_volume_30d", "market_cap", "float_shares", "volume_ratio",
-    # Fundamentals equity (13)
     "beta_5y", "pe_ttm", "pe_forward", "eps_ttm", "dividend_yield", "payout_ratio",
-    "revenue_ttm", "revenue_growth_yoy", "gross_margin", "operating_margin",
-    "profit_margin", "debt_to_equity", "free_cash_flow_ttm",
-    # Fundamentals quality (2)
-    "roe", "roa",
-    # Risk (8)
-    "rsi_14", "volatility_30d", "volatility_90d", "max_drawdown_1y",
-    "var_95_1d", "sharpe_1y", "risk_score", "risk_bucket",
-    # Technicals new (4)
-    "rsi_signal", "technical_score", "day_range_position", "atr_14",
-    # Valuation (7)
+    "revenue_ttm", "revenue_growth_yoy", "gross_margin", "operating_margin", "profit_margin",
+    "debt_to_equity", "free_cash_flow_ttm", "roe", "roa",
+    "rsi_14", "volatility_30d", "volatility_90d", "max_drawdown_1y", "var_95_1d", "sharpe_1y",
+    "risk_score", "risk_bucket", "rsi_signal", "technical_score", "day_range_position", "atr_14",
     "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio", "intrinsic_value", "valuation_score", "upside_pct",
-    # Forecast (9)
-    "forecast_price_1m", "forecast_price_3m", "forecast_price_12m",
-    "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
+    "forecast_price_1m", "forecast_price_3m", "forecast_price_12m", "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
     "forecast_confidence", "confidence_score", "confidence_bucket",
-    # Scores (6)
     "value_score", "quality_score", "momentum_score", "growth_score", "overall_score", "opportunity_score",
-    # Decision (8)
-    "analyst_rating", "target_price", "upside_downside_pct",
-    "recommendation", "signal", "trend_1m", "trend_3m", "trend_12m",
-    # Recommendation new (4)
-    "short_term_signal", "recommendation_reason", "invest_period_label", "horizon_days",
-    # Rank
-    "rank_overall",
-    # Portfolio light (6)
+    "analyst_rating", "target_price", "upside_downside_pct", "recommendation", "signal", "trend_1m", "trend_3m", "trend_12m",
+    "short_term_signal", "recommendation_reason", "invest_period_label", "horizon_days", "rank_overall",
     "position_qty", "avg_cost", "position_cost", "position_value", "unrealized_pl", "unrealized_pl_pct",
-    # Provenance (4)
     "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
 ]
 
-# Backward-compat aliases (old name → new 99-col list)
 _CANONICAL_80_HEADERS = _CANONICAL_99_HEADERS
-_CANONICAL_80_KEYS    = _CANONICAL_99_KEYS
+_CANONICAL_80_KEYS = _CANONICAL_99_KEYS
 
-# v3.10.0: Insights updated to 9 cols — adds signal + priority
 _INSIGHTS_HEADERS = ["Section", "Item", "Symbol", "Metric", "Value", "Signal", "Priority", "Notes", "Last Updated (Riyadh)"]
-_INSIGHTS_KEYS    = ["section", "item", "symbol", "metric", "value", "signal", "priority", "notes", "last_updated_riyadh"]
+_INSIGHTS_KEYS = ["section", "item", "symbol", "metric", "value", "signal", "priority", "notes", "last_updated_riyadh"]
 
 _DICTIONARY_HEADERS = ["Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes"]
 _DICTIONARY_KEYS = ["sheet", "group", "header", "key", "dtype", "fmt", "required", "source", "notes"]
@@ -379,8 +323,8 @@ EMERGENCY_PAGE_SYMBOLS: Dict[str, List[str]] = {
     "Commodities_FX": ["GC=F", "BZ=F", "SI=F", "EURUSD=X", "GBPUSD=X", "JPY=X", "SAR=X", "CL=F"],
     "Mutual_Funds": ["SPY", "QQQ", "VTI", "VOO", "IWM"],
     "My_Portfolio": ["2222.SR", "AAPL", "MSFT", "QQQ", "GC=F"],
-    "Insights_Analysis": ["2222.SR", "AAPL", "GC=F"],
-    "Top_10_Investments": ["2222.SR", "1120.SR", "AAPL", "MSFT", "NVDA"],
+    _INSIGHTS_PAGE: ["2222.SR", "AAPL", "GC=F"],
+    _TOP10_PAGE: ["2222.SR", "1120.SR", "AAPL", "MSFT", "NVDA"],
 }
 
 # =============================================================================
@@ -430,6 +374,11 @@ def _json_safe(value: Any) -> Any:
     except Exception:
         pass
     try:
+        if is_dataclass(value):
+            return _json_safe(getattr(value, "__dict__", {}))
+    except Exception:
+        pass
+    try:
         return _json_safe(vars(value))
     except Exception:
         return str(value)
@@ -450,13 +399,6 @@ def _to_plain_dict(obj: Any) -> Dict[str, Any]:
         if hasattr(obj, "dict") and callable(getattr(obj, "dict")):
             d = obj.dict()  # type: ignore[attr-defined]
             return d if isinstance(d, dict) else {}
-    except Exception:
-        pass
-    try:
-        if is_dataclass(obj):
-            dd = getattr(obj, "__dict__", None)
-            if isinstance(dd, dict):
-                return {k: v for k, v in dd.items() if not str(k).startswith("_")}
     except Exception:
         pass
     try:
@@ -536,6 +478,31 @@ def _maybe_bool(v: Any, default: bool) -> bool:
     if s in {"0", "false", "no", "n", "off"}:
         return False
     return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = _strip(os.getenv(name))
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+        return value if value > 0 else default
+    except Exception:
+        return default
+
+
+def _page_upstream_timeout(page: str) -> float:
+    page_key = _strip(page).upper()
+    specific_name = f"ANALYSIS_SHEET_ROWS_TIMEOUT_{page_key}_SEC"
+    if _strip(os.getenv(specific_name)):
+        return _env_float(specific_name, _DEFAULT_SPECIAL_TIMEOUT_SEC)
+    if page == _INSIGHTS_PAGE:
+        return _env_float("ANALYSIS_SHEET_ROWS_INSIGHTS_TIMEOUT_SEC", _DEFAULT_INSIGHTS_TIMEOUT_SEC)
+    if page == _TOP10_PAGE:
+        return _env_float("ANALYSIS_SHEET_ROWS_TOP10_TIMEOUT_SEC", _DEFAULT_TOP10_TIMEOUT_SEC)
+    if page in _SPECIAL_PAGES:
+        return _env_float("ANALYSIS_SHEET_ROWS_SPECIAL_TIMEOUT_SEC", _DEFAULT_SPECIAL_TIMEOUT_SEC)
+    return _env_float("ANALYSIS_SHEET_ROWS_UPSTREAM_TIMEOUT_SEC", _DEFAULT_UPSTREAM_TIMEOUT_SEC)
 
 
 def _split_symbols_string(v: str) -> List[str]:
@@ -630,9 +597,9 @@ def _collect_get_body(request: Request) -> Dict[str, Any]:
         if vals:
             body[key] = _split_symbols_string(vals[0]) if len(vals) == 1 else [s.strip() for s in vals if _strip(s)]
     for key in (
-        "limit", "offset", "top_n", "include_matrix", "risk_level", "risk_profile", "confidence_level",
-        "investment_period_days", "horizon_days", "min_expected_roi", "min_roi", "min_confidence",
-        "schema_only", "headers_only",
+        "limit", "offset", "top_n", "include_matrix", "schema_only", "headers_only",
+        "risk_level", "risk_profile", "confidence_level", "investment_period_days",
+        "horizon_days", "min_expected_roi", "min_roi", "min_confidence",
     ):
         v = qp.get(key)
         if v is not None:
@@ -646,7 +613,6 @@ def _merge_body_with_query(body: Optional[Dict[str, Any]], request: Request) -> 
         if k not in out or out.get(k) in (None, "", []):
             out[k] = v
     return out
-
 
 # =============================================================================
 # Auth
@@ -732,7 +698,6 @@ def _auth_passed(*, request: Request, settings: Any, auth_token: str, authorizat
         except Exception:
             return False
     return False
-
 
 # =============================================================================
 # Schema / contract helpers
@@ -837,7 +802,7 @@ def _ensure_top10_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple
         if field not in ks:
             ks.append(field)
             hdrs.append(_TOP10_REQUIRED_HEADERS[field])
-    return _pad_contract(hdrs, ks, _EXPECTED_SHEET_LENGTHS.get(_TOP10_PAGE, 106))  # v3.10.0: 106
+    return _pad_contract(hdrs, ks, _EXPECTED_SHEET_LENGTHS.get(_TOP10_PAGE, 106))
 
 
 def _static_contract(page: str) -> Tuple[List[str], List[str], str]:
@@ -845,15 +810,14 @@ def _static_contract(page: str) -> Tuple[List[str], List[str], str]:
         h, k = _ensure_top10_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS)
         return h, k, "static_canonical_top10"
     if page == _INSIGHTS_PAGE:
-        h, k = _pad_contract(_INSIGHTS_HEADERS, _INSIGHTS_KEYS, 9)  # v3.10.0: 9 cols
+        h, k = _pad_contract(_INSIGHTS_HEADERS, _INSIGHTS_KEYS, 9)
         return h, k, "static_canonical_insights"
     if page == _DICTIONARY_PAGE:
         h, k = _pad_contract(_DICTIONARY_HEADERS, _DICTIONARY_KEYS, 9)
         return h, k, "static_canonical_dictionary"
-    # v3.10.0: per-page expected lengths from schema_registry v3.4.0
     expected = _EXPECTED_SHEET_LENGTHS.get(page, 99)
     h, k = _pad_contract(_CANONICAL_99_HEADERS, _CANONICAL_99_KEYS, expected)
-    return h, k, "static_canonical_instrument_v34"
+    return h, k, "static_canonical_instrument_v40"
 
 
 def _expected_len(page: str) -> int:
@@ -864,7 +828,7 @@ def _expected_len(page: str) -> int:
                 return n
         except Exception:
             pass
-    return _EXPECTED_SHEET_LENGTHS.get(page, 80)
+    return _EXPECTED_SHEET_LENGTHS.get(page, 99)
 
 
 def _schema_columns_from_any(spec: Any) -> List[Any]:
@@ -956,7 +920,6 @@ def _resolve_contract(page: str) -> Tuple[List[str], List[str], Any, str]:
     sh, sk, ssrc = _static_contract(page)
     return sh, sk, {"source": ssrc, "page": page}, ssrc
 
-
 # =============================================================================
 # Payload extraction / normalization helpers
 # =============================================================================
@@ -1003,7 +966,7 @@ def _extract_from_raw(raw: Dict[str, Any], candidates: Sequence[str]) -> Any:
 
 
 def _extract_from_nested_raw(raw: Any, candidates: Sequence[str], depth: int = 0) -> Any:
-    if raw is None or depth > 3:
+    if raw is None or depth > 4:
         return None
     if isinstance(raw, Mapping):
         direct = _extract_from_raw(dict(raw), candidates)
@@ -1038,7 +1001,7 @@ def _normalize_to_schema_keys(*, schema_keys: Sequence[str], schema_headers: Seq
             h = header_by_key.get(ks, "")
             if h:
                 v = _extract_from_nested_raw(raw, [h, h.lower(), h.upper()])
-        if ks in {"warnings", "recommendation_reason", "selection_reason"} and isinstance(v, (list, tuple, set)):
+        if ks in {"warnings", "recommendation_reason", "selection_reason", "notes"} and isinstance(v, (list, tuple, set)):
             v = "; ".join([_strip(x) for x in v if _strip(x)])
         out[ks] = _json_safe(v)
     if "symbol" in out and not out.get("symbol"):
@@ -1122,11 +1085,10 @@ def _top10_criteria_snapshot(row: Mapping[str, Any]) -> str:
 
 
 def _ensure_top10_rows(rows: Sequence[Mapping[str, Any]], *, requested_symbols: Sequence[str], top_n: int, schema_keys: Sequence[str], schema_headers: Sequence[str]) -> List[Dict[str, Any]]:
-    normalized_rows: List[Dict[str, Any]] = []
-    for raw_row in rows or []:
-        normalized = _normalize_to_schema_keys(schema_keys=schema_keys, schema_headers=schema_headers, raw=(raw_row or {}))
-        normalized_rows.append(normalized)
-
+    normalized_rows = [
+        _normalize_to_schema_keys(schema_keys=schema_keys, schema_headers=schema_headers, raw=(r or {}))
+        for r in rows or []
+    ]
     deduped: List[Dict[str, Any]] = []
     seen = set()
     for row in sorted(normalized_rows, key=_top10_sort_key, reverse=True):
@@ -1144,14 +1106,11 @@ def _ensure_top10_rows(rows: Sequence[Mapping[str, Any]], *, requested_symbols: 
             key=lambda r: (
                 0 if _strip(r.get("symbol")) in requested else 1,
                 requested.get(_strip(r.get("symbol")), 10**6),
-                -_top10_sort_key(r)[0], -_top10_sort_key(r)[1], -_top10_sort_key(r)[2],
-                -_top10_sort_key(r)[3], -_top10_sort_key(r)[4], -_top10_sort_key(r)[5],
-                -_top10_sort_key(r)[6], -_top10_sort_key(r)[7], -_top10_sort_key(r)[8],
-                -_top10_sort_key(r)[9], -_top10_sort_key(r)[10],
+                tuple([-x for x in _top10_sort_key(r)]),
             )
         )
 
-    final_rows = deduped[: max(1, int(top_n))]
+    final_rows = deduped[:max(1, int(top_n))]
     for idx, row in enumerate(final_rows, start=1):
         row["top10_rank"] = idx
         if not _strip(row.get("selection_reason")):
@@ -1236,11 +1195,6 @@ def _extract_contract_from_payload(payload: Any, depth: int = 0) -> Tuple[List[s
             nested = payload.get(nested_name)
             if isinstance(nested, Mapping):
                 hh, kk = _extract_contract_from_payload(nested, depth + 1)
-                if hh or kk:
-                    return hh, kk
-        for v in payload.values():
-            if isinstance(v, Mapping):
-                hh, kk = _extract_contract_from_payload(v, depth + 1)
                 if hh or kk:
                     return hh, kk
     return [], []
@@ -1352,7 +1306,7 @@ def _extract_rows_like(payload: Any, depth: int = 0, page: str = "") -> List[Dic
 def _extract_matrix_like(payload: Any, depth: int = 0, page: str = "") -> Optional[List[List[Any]]]:
     if payload is None or depth > 8:
         return None
-    if isinstance(payload, dict):
+    if isinstance(payload, Mapping):
         for name in ("rows_matrix", "matrix", "values"):
             value = payload.get(name)
             if isinstance(value, list):
@@ -1369,7 +1323,7 @@ def _extract_matrix_like(payload: Any, depth: int = 0, page: str = "") -> Option
                         return mx
         for name in ("data", "payload", "result", "response", "output", "content", "body", "value", "dataset", "sheet_rows", "page_rows"):
             nested = payload.get(name)
-            if isinstance(nested, dict):
+            if isinstance(nested, Mapping):
                 mx = _extract_matrix_like(nested, depth + 1, page=page)
                 if mx is not None:
                     return mx
@@ -1384,51 +1338,92 @@ def _extract_matrix_like(payload: Any, depth: int = 0, page: str = "") -> Option
 
 
 def _extract_status_error(payload: Any) -> Tuple[str, Optional[str], Dict[str, Any]]:
-    if not isinstance(payload, dict):
+    if not isinstance(payload, Mapping):
         return "success", None, {}
     status_out = _strip(payload.get("status")) or "success"
     error_out = payload.get("error") or payload.get("detail") or payload.get("message")
+    if isinstance(error_out, Mapping):
+        try:
+            error_out = json.dumps(_json_safe(error_out), ensure_ascii=False)
+        except Exception:
+            error_out = str(error_out)
     meta_out = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
     return status_out, (str(error_out) if error_out is not None else None), meta_out
 
 
+def _row_has_signal(row: Mapping[str, Any], schema_keys: Sequence[str]) -> bool:
+    preferred = (
+        "symbol", "name", "current_price", "current_value", "recommendation",
+        "overall_score", "opportunity_score", "confidence", "notes", "header", "key",
+        "section", "item",
+    )
+    for key in preferred:
+        if key in row:
+            value = row.get(key)
+            if value not in (None, "", [], {}, ()):
+                return True
+    for key in schema_keys:
+        value = row.get(key)
+        if value not in (None, "", [], {}, ()):
+            return True
+    return False
+
+
+def _payload_looks_like_placeholder(payload: Mapping[str, Any], rows: Sequence[Mapping[str, Any]]) -> bool:
+    status_text = _strip(payload.get("status")).lower()
+    detail_text = _strip(payload.get("detail")).lower()
+    error_text = _strip(payload.get("error")).lower()
+    meta = payload.get("meta") if isinstance(payload.get("meta"), Mapping) else {}
+    dispatch = _strip(meta.get("dispatch")).lower()
+    upstream_error = _strip(meta.get("upstream_error")).lower()
+    proxy_status = _strip(meta.get("proxy_status")).lower()
+    obvious_text = " ".join([status_text, detail_text, error_text, dispatch, upstream_error, proxy_status])
+
+    markers = (
+        "placeholder",
+        "fail_soft",
+        "local non-empty fallback",
+        "upstream degradation",
+        "no usable rows",
+        "generated locally because upstream",
+        "local insights fallback",
+    )
+    if any(marker in obvious_text for marker in markers):
+        return True
+
+    if not rows:
+        return True
+
+    flagged = 0
+    for row in rows:
+        provider = _strip(row.get("data_provider")).lower()
+        warnings = _strip(row.get("warnings")).lower()
+        reasons = " ".join([
+            _strip(row.get("recommendation_reason")).lower(),
+            _strip(row.get("selection_reason")).lower(),
+            _strip(row.get("notes")).lower(),
+        ])
+        if (
+            "placeholder" in provider
+            or "placeholder" in warnings
+            or "placeholder fallback" in reasons
+            or "generated locally because upstream" in reasons
+            or "local insights fallback" in reasons
+        ):
+            flagged += 1
+    return flagged >= max(1, len(rows))
+
+
 def _payload_has_real_rows(payload: Any, page: str = "") -> bool:
-    return bool(_extract_rows_like(payload, page=page) or _extract_matrix_like(payload, page=page))
-
-
-def _payload_quality_score(payload: Any, page: str = "") -> int:
-    if payload is None:
-        return -100
-    if isinstance(payload, list):
-        return 100 + min(25, len(payload))
     if not isinstance(payload, Mapping):
-        return 0
-    score = 0
-    rows_like = _extract_rows_like(payload, page=page)
-    matrix_like = _extract_matrix_like(payload, page=page)
-    headers_like, keys_like = _extract_contract_from_payload(payload)
-    if rows_like:
-        score += 100 + min(25, len(rows_like))
-    if matrix_like:
-        score += 85 + min(15, len(matrix_like))
-    if headers_like:
-        score += 8
-    if keys_like:
-        score += 8
-    if page == _TOP10_PAGE and rows_like:
-        for field in _TOP10_REQUIRED_FIELDS:
-            if any(isinstance(r, Mapping) and r.get(field) not in (None, "", [], {}) for r in rows_like):
-                score += 10
-    status_out, error_out, _ = _extract_status_error(payload)
-    if status_out.lower() == "success":
-        score += 4
-    elif status_out.lower() == "partial":
-        score += 2
-    elif status_out.lower() in {"error", "failed", "fail"}:
-        score -= 4
-    if _strip(error_out):
-        score -= 6
-    return score
+        return False
+    rows = _extract_rows_like(payload, page=page)
+    if not rows:
+        matrix = _extract_matrix_like(payload, page=page)
+        rows = _rows_from_matrix(matrix, _extract_contract_from_payload(payload)[1]) if matrix else []
+    if not rows:
+        return False
+    return not _payload_looks_like_placeholder(dict(payload), rows)
 
 
 def _project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
@@ -1482,13 +1477,36 @@ def _payload_envelope(*, page: str, route_family: str, headers: Sequence[str], k
             "count": len(rows_dict),
             "row_object_count": len(rows_dict),
             "matrix_row_count": len(matrix),
+            "route_family": route_family,
             **(meta or {}),
         },
     })
 
 
-def _normalize_external_payload(*, external_payload: Mapping[str, Any], page: str, headers: Sequence[str], keys: Sequence[str], include_matrix: bool, request_id: str, started_at: float, mode: str, route_family: str, meta_extra: Optional[Dict[str, Any]] = None, limit: int = 2000, offset: int = 0, top_n: int = 2000, requested_symbols: Optional[Sequence[str]] = None) -> Dict[str, Any]:
-    ext = dict(external_payload or {})
+def _normalize_external_payload(
+    *,
+    external_payload: Any,
+    page: str,
+    headers: Sequence[str],
+    keys: Sequence[str],
+    include_matrix: bool,
+    request_id: str,
+    started_at: float,
+    mode: str,
+    route_family: str,
+    meta_extra: Optional[Dict[str, Any]] = None,
+    limit: int = 2000,
+    offset: int = 0,
+    top_n: int = 2000,
+    requested_symbols: Optional[Sequence[str]] = None,
+) -> Tuple[Dict[str, Any], bool]:
+    if isinstance(external_payload, Mapping):
+        ext = dict(external_payload)
+    elif isinstance(external_payload, list):
+        ext = {"row_objects": external_payload}
+    else:
+        ext = {}
+
     payload_headers, payload_keys = _extract_contract_from_payload(ext)
     hdrs = list(headers or payload_headers or [])
     ks = list(keys or payload_keys or [])
@@ -1499,22 +1517,44 @@ def _normalize_external_payload(*, external_payload: Mapping[str, Any], page: st
         hdrs, ks = _pad_contract(hdrs, ks, _expected_len(page))
 
     rows = _extract_rows_like(ext, page=page)
-    matrix = _extract_matrix_like(ext, page=page)
-    if not rows and matrix:
-        rows = _rows_from_matrix(matrix, ks)
+    if not rows:
+        matrix = _extract_matrix_like(ext, page=page)
+        if matrix:
+            rows = _rows_from_matrix(matrix, ks)
 
-    normalized_rows = [_normalize_to_schema_keys(schema_keys=ks, schema_headers=hdrs, raw=(r or {})) for r in rows]
+    normalized_rows = [
+        _normalize_to_schema_keys(schema_keys=ks, schema_headers=hdrs, raw=(r or {}))
+        for r in rows
+    ]
+    normalized_rows = [row for row in normalized_rows if _row_has_signal(row, ks)]
+
     if page == _TOP10_PAGE:
-        normalized_rows = _ensure_top10_rows(normalized_rows, requested_symbols=requested_symbols or [], top_n=top_n, schema_keys=ks, schema_headers=hdrs)
+        normalized_rows = _ensure_top10_rows(
+            normalized_rows,
+            requested_symbols=requested_symbols or [],
+            top_n=top_n,
+            schema_keys=ks,
+            schema_headers=hdrs,
+        )
+
+    degraded = _payload_looks_like_placeholder(ext, normalized_rows)
 
     normalized_rows = _slice(normalized_rows, limit=limit, offset=offset)
     status_out, error_out, ext_meta = _extract_status_error(ext)
+
+    if not normalized_rows:
+        degraded = True
+        status_out = "partial"
+        error_out = error_out or "No usable rows returned"
+
     final_meta = dict(ext_meta or {})
     if meta_extra:
         final_meta.update(meta_extra)
     final_meta["source_route_family"] = _strip(ext.get("route_family")) or None
-    final_meta.setdefault("dispatch", "external_proxy")
-    return _payload_envelope(
+    final_meta["best_has_rows"] = bool(normalized_rows)
+    final_meta["best_status"] = status_out
+
+    envelope = _payload_envelope(
         page=page,
         route_family=route_family,
         headers=hdrs,
@@ -1528,8 +1568,11 @@ def _normalize_external_payload(*, external_payload: Mapping[str, Any], page: st
         error_out=error_out,
         meta=final_meta,
     )
+    return envelope, degraded
 
-
+# =============================================================================
+# Fallback row builders
+# =============================================================================
 def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int) -> Any:
     kk = _normalize_key_name(key)
     if kk in {"symbol", "ticker"}:
@@ -1552,9 +1595,7 @@ def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int)
         return "Saudi Arabia" if symbol.endswith(".SR") else "Global"
     if kk == "data_provider":
         return "analysis_sheet_rows.placeholder_fallback"
-    if kk == "last_updated_utc":
-        return datetime.utcnow().isoformat()
-    if kk == "last_updated_riyadh":
+    if kk in {"last_updated_utc", "last_updated_riyadh"}:
         return datetime.utcnow().isoformat()
     if kk == "recommendation":
         return "Watch" if row_index > 3 else "Accumulate"
@@ -1570,72 +1611,11 @@ def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int)
         return "placeholder"
     if kk in {"current_price", "previous_close", "open_price", "day_high", "day_low", "forecast_price_1m", "forecast_price_3m", "forecast_price_12m", "avg_cost", "position_cost", "position_value", "intrinsic_value"}:
         base = 100.0 + float(row_index)
-        if kk == "previous_close":
-            return round(base - 0.5, 2)
-        if kk == "open_price":
-            return round(base - 0.25, 2)
-        if kk == "day_high":
-            return round(base + 1.0, 2)
-        if kk == "day_low":
-            return round(base - 1.0, 2)
-        if kk == "forecast_price_1m":
-            return round(base * 1.02, 2)
-        if kk == "forecast_price_3m":
-            return round(base * 1.05, 2)
-        if kk == "forecast_price_12m":
-            return round(base * 1.10, 2)
-        if kk == "intrinsic_value":
-            return round(base * 1.04, 2)
         return round(base, 2)
-    if kk in {"price_change", "percent_change", "expected_roi_1m", "expected_roi_3m", "expected_roi_12m", "week_52_position_pct", "unrealized_pl_pct", "dividend_yield", "payout_ratio", "forecast_confidence", "confidence_score", "overall_score", "opportunity_score", "value_score", "quality_score", "momentum_score", "growth_score", "valuation_score", "risk_score", "beta_5y", "rsi_14", "gross_margin", "operating_margin", "profit_margin", "sharpe_1y", "var_95_1d", "volatility_30d", "volatility_90d", "max_drawdown_1y"}:
-        score_base = max(1.0, 100.0 - float(row_index * 3))
-        mapping = {
-            "price_change": round(0.5 + row_index * 0.1, 2),
-            "percent_change": round(0.75 + row_index * 0.15, 2),
-            "expected_roi_1m": round(2.0 + row_index * 0.2, 2),
-            "expected_roi_3m": round(5.0 + row_index * 0.35, 2),
-            "expected_roi_12m": round(12.0 + row_index * 0.5, 2),
-            "forecast_confidence": round(min(99.0, score_base), 2),
-            "confidence_score": round(min(99.0, score_base - 2), 2),
-            "overall_score": round(min(99.0, score_base), 2),
-            "opportunity_score": round(min(99.0, score_base - 1), 2),
-            "value_score": round(min(99.0, score_base - 3), 2),
-            "quality_score": round(min(99.0, score_base - 4), 2),
-            "momentum_score": round(min(99.0, score_base - 5), 2),
-            "growth_score": round(min(99.0, score_base - 6), 2),
-            "valuation_score": round(min(99.0, score_base - 7), 2),
-            "risk_score": round(20 + row_index * 2, 2),
-            "beta_5y": round(0.8 + row_index * 0.03, 2),
-            "rsi_14": round(48 + row_index, 2),
-            "gross_margin": round(32 + row_index * 0.5, 2),
-            "operating_margin": round(18 + row_index * 0.3, 2),
-            "profit_margin": round(14 + row_index * 0.25, 2),
-            "sharpe_1y": round(1.1 + row_index * 0.05, 2),
-            "var_95_1d": round(-1.5 - row_index * 0.1, 2),
-            "volatility_30d": round(18 + row_index * 0.4, 2),
-            "volatility_90d": round(22 + row_index * 0.5, 2),
-            "max_drawdown_1y": round(-12 - row_index * 0.5, 2),
-            "week_52_position_pct": round(40 + row_index * 3, 2),
-            "unrealized_pl_pct": round(1.5 + row_index * 0.2, 2),
-            "dividend_yield": round(2.5 + row_index * 0.1, 2),
-            "payout_ratio": round(35 + row_index, 2),
-        }
-        return mapping.get(kk, round(score_base, 2))
+    if kk in {"price_change", "percent_change", "expected_roi_1m", "expected_roi_3m", "expected_roi_12m", "week_52_position_pct", "unrealized_pl_pct", "dividend_yield", "payout_ratio", "forecast_confidence", "confidence_score", "overall_score", "opportunity_score", "value_score", "quality_score", "momentum_score", "growth_score", "valuation_score", "risk_score", "beta_5y", "rsi_14"}:
+        return round(max(1.0, 100.0 - float(row_index * 3)), 2)
     if kk in {"market_cap", "revenue_ttm", "free_cash_flow_ttm", "position_qty", "position_value", "unrealized_pl", "volume", "avg_volume_10d", "avg_volume_30d", "float_shares"}:
-        scale = float(row_index)
-        mapping = {
-            "market_cap": 1000000000 + int(scale * 25000000),
-            "revenue_ttm": 500000000 + int(scale * 15000000),
-            "free_cash_flow_ttm": 100000000 + int(scale * 5000000),
-            "position_qty": 10 + int(scale),
-            "position_value": round(1000 + scale * 75, 2),
-            "unrealized_pl": round(25 + scale * 3, 2),
-            "volume": 100000 + int(scale * 5000),
-            "avg_volume_10d": 90000 + int(scale * 4500),
-            "avg_volume_30d": 85000 + int(scale * 4000),
-            "float_shares": 50000000 + int(scale * 1000000),
-        }
-        return mapping.get(kk)
+        return 1000 * row_index
     if kk in {"risk_bucket", "confidence_bucket"}:
         return "Moderate" if row_index > 3 else "High Confidence"
     if kk == "invest_period_label":
@@ -1649,7 +1629,7 @@ def _build_placeholder_rows(*, page: str, keys: Sequence[str], requested_symbols
     symbols = [_normalize_symbol_token(x) for x in requested_symbols if _normalize_symbol_token(x)]
     if not symbols:
         symbols = [_normalize_symbol_token(x) for x in EMERGENCY_PAGE_SYMBOLS.get(page, []) if _normalize_symbol_token(x)]
-    symbols = symbols[offset : offset + limit] if (offset or len(symbols) > limit) else symbols[:limit]
+    symbols = symbols[offset: offset + limit] if (offset or len(symbols) > limit) else symbols[:limit]
     rows: List[Dict[str, Any]] = []
     for idx, sym in enumerate(symbols, start=offset + 1):
         row = {str(k): _placeholder_value_for_key(page, str(k), sym, idx) for k in keys}
@@ -1691,7 +1671,7 @@ def _build_insights_fallback_rows(*, requested_symbols: Sequence[str], limit: in
             "symbol": "",
             "metric": "count",
             "value": len(symbols),
-            "notes": "Local insights fallback summary",
+            "notes": f"Local insights fallback summary | count={len(symbols)}",
             "last_updated_riyadh": stamp,
         },
         {
@@ -1700,7 +1680,7 @@ def _build_insights_fallback_rows(*, requested_symbols: Sequence[str], limit: in
             "symbol": "",
             "metric": "symbols",
             "value": ", ".join(symbols[:5]),
-            "notes": "Sample of the symbols used by fallback mode",
+            "notes": "Generated locally because upstream insights payload was unavailable",
             "last_updated_riyadh": stamp,
         },
     ]
@@ -1727,22 +1707,6 @@ def _build_nonempty_failsoft_rows(*, page: str, headers: Sequence[str], keys: Se
         rows = _ensure_top10_rows(rows, requested_symbols=requested_symbols, top_n=top_n, schema_keys=keys, schema_headers=headers)
         return _slice(rows, limit=limit, offset=offset)
     return _build_placeholder_rows(page=page, keys=keys, requested_symbols=requested_symbols or EMERGENCY_PAGE_SYMBOLS.get(page, []), limit=limit, offset=offset)
-
-
-def _ordered_payload_candidates(page: str, root_payload: Optional[Dict[str, Any]], root_meta: Dict[str, Any], adv_payload: Optional[Dict[str, Any]], adv_meta: Dict[str, Any], adapter_payload: Optional[Dict[str, Any]], adapter_meta: Dict[str, Any]) -> List[Tuple[Optional[Dict[str, Any]], Dict[str, Any], str]]:
-    mapping = {
-        "root_proxy": (root_payload, root_meta, "root_proxy"),
-        "advanced_proxy": (adv_payload, adv_meta, "advanced_proxy"),
-        "adapter": (adapter_payload, adapter_meta, "adapter"),
-    }
-    if page == _TOP10_PAGE:
-        order = ("root_proxy", "advanced_proxy", "adapter")
-    elif page in {_INSIGHTS_PAGE, _DICTIONARY_PAGE}:
-        order = ("root_proxy", "advanced_proxy", "adapter")
-    else:
-        order = ("root_proxy", "adapter", "advanced_proxy")
-    return [mapping[name] for name in order]
-
 
 # =============================================================================
 # Engine / proxy access
@@ -1771,115 +1735,90 @@ async def _get_engine(request: Request) -> Tuple[Optional[Any], str]:
     return None, "unavailable"
 
 
-async def _call_engine(fn: Any, *args: Any, **kwargs: Any) -> Any:
-    return await _maybe_await(fn(*args, **kwargs))
+async def _call_callable_maybe_sync(fn: Any, *args: Any, timeout_sec: float = 10.0, **kwargs: Any) -> Any:
+    if inspect.iscoroutinefunction(fn):
+        return await asyncio.wait_for(fn(*args, **kwargs), timeout=timeout_sec)
+    async def _run_sync() -> Any:
+        return await asyncio.to_thread(fn, *args, **kwargs)
+    return await asyncio.wait_for(_run_sync(), timeout=timeout_sec)
 
 
-def _dict_is_symbol_map(d: Dict[str, Any], symbols: Sequence[str]) -> bool:
-    if not isinstance(d, dict) or not symbols:
-        return False
-    symset = set(symbols)
-    keys = [k for k in d.keys() if isinstance(k, str)]
-    if not keys:
-        return False
-    hit = sum(1 for k in keys if k in symset)
-    return hit == len(symset) if symset else False
-
-
-async def _fetch_analysis_rows(engine: Any, symbols: List[str], *, mode: str, settings: Any, schema: Any) -> Dict[str, Any]:
-    if not symbols or engine is None:
-        return {}
-    preferred = [
-        "get_analysis_rows_batch", "get_analysis_quotes_batch", "get_enriched_quotes_batch",
-        "get_quotes_batch", "quotes_batch", "get_enriched_quotes", "get_quotes",
-    ]
-    for method in preferred:
-        fn = getattr(engine, method, None)
-        if not callable(fn):
-            continue
-        try:
-            for kwargs in ({"mode": mode, "schema": schema}, {"schema": schema}, {"mode": mode}, {}):
-                try:
-                    res = await _call_engine(fn, symbols, **kwargs)
-                    break
-                except TypeError:
-                    res = None
-                    continue
-            else:
-                res = None
-            if isinstance(res, dict):
-                if _dict_is_symbol_map(res, symbols):
-                    return res
-                data = res.get("data") or res.get("rows") or res.get("items") or res.get("quotes")
-                if isinstance(data, dict) and _dict_is_symbol_map(data, symbols):
-                    return data
-                if isinstance(data, list):
-                    return {s: r for s, r in zip(symbols, data)}
-            elif isinstance(res, list):
-                return {s: r for s, r in zip(symbols, res)}
-        except Exception:
-            continue
-
-    out: Dict[str, Any] = {}
-    per_dict_fn = getattr(engine, "get_enriched_quote_dict", None) or getattr(engine, "get_analysis_row_dict", None) or getattr(engine, "get_quote_dict", None)
-    per_fn = getattr(engine, "get_enriched_quote", None) or getattr(engine, "get_analysis_row", None) or getattr(engine, "get_quote", None)
-    for s in symbols:
-        try:
-            if callable(per_dict_fn):
-                for kwargs in ({"mode": mode, "schema": schema}, {"schema": schema}, {"mode": mode}, {}):
-                    try:
-                        out[s] = await _call_engine(per_dict_fn, s, **kwargs)
-                        break
-                    except TypeError:
-                        continue
-                else:
-                    out[s] = {"symbol": s, "error": "per_symbol_dict_call_failed"}
-            elif callable(per_fn):
-                for kwargs in ({"mode": mode, "schema": schema}, {"schema": schema}, {"mode": mode}, {}):
-                    try:
-                        out[s] = await _call_engine(per_fn, s, **kwargs)
-                        break
-                    except TypeError:
-                        continue
-                else:
-                    out[s] = {"symbol": s, "error": "per_symbol_call_failed"}
-            else:
-                out[s] = {"symbol": s, "error": "engine_missing_quote_method"}
-        except Exception as e:
-            out[s] = {"symbol": s, "error": str(e)}
-    return out
-
-
-async def _call_core_sheet_rows_best_effort(*, page: str, limit: int, offset: int, mode: str, body: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    if core_get_sheet_rows is None:
-        return None, None
-    candidates = [
-        ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode, "body": body}),
-        ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode}),
-        ((), {"sheet": page, "limit": limit, "offset": offset}),
-        ((page,), {"limit": limit, "offset": offset, "mode": mode, "body": body}),
-        ((page,), {"limit": limit, "offset": offset, "mode": mode}),
-        ((page,), {"limit": limit, "offset": offset}),
-        ((page,), {}),
-    ]
+async def _try_call_method(method: Any, candidates: Sequence[Tuple[Tuple[Any, ...], Dict[str, Any]]], timeout_sec: float) -> Tuple[Optional[Any], Optional[Exception]]:
     last_err: Optional[Exception] = None
     for args, kwargs in candidates:
         try:
-            res = core_get_sheet_rows(*args, **kwargs)
-            res = await _maybe_await(res)
-            if isinstance(res, dict):
-                return res, "core:get_sheet_rows"
-            if isinstance(res, list):
-                return {"row_objects": res}, "core:get_sheet_rows"
+            result = await _call_callable_maybe_sync(method, *args, timeout_sec=timeout_sec, **kwargs)
+            return result, None
         except TypeError as e:
             last_err = e
             continue
         except Exception as e:
             last_err = e
             break
-    if last_err is not None:
-        return {"status": "error", "error": str(last_err), "row_objects": []}, "core:get_sheet_rows"
-    return None, None
+    return None, last_err
+
+
+async def _call_engine_sheet_rows_best_effort(*, request: Request, page: str, limit: int, offset: int, mode: str, body: Dict[str, Any], include_matrix: bool, timeout_sec: float) -> Tuple[Optional[Any], Optional[str], Optional[str]]:
+    engine, _ = await _get_engine(request)
+    if engine is None:
+        return None, None, None
+
+    methods: List[Tuple[str, Any]] = []
+    for name in ("get_sheet_rows", "get_sheet_rows_sync"):
+        method = getattr(engine, name, None)
+        if callable(method):
+            methods.append((name, method))
+
+    if not methods:
+        return None, None, None
+
+    candidates = [
+        ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode, "body": body, "include_matrix": include_matrix}),
+        ((), {"page": page, "limit": limit, "offset": offset, "mode": mode, "body": body, "include_matrix": include_matrix}),
+        ((), {"sheet_name": page, "limit": limit, "offset": offset, "mode": mode, "body": body, "include_matrix": include_matrix}),
+        ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode, "body": body}),
+        ((), {"page": page, "limit": limit, "offset": offset, "mode": mode, "body": body}),
+        ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode}),
+        ((), {"page": page, "limit": limit, "offset": offset, "mode": mode}),
+        ((page,), {"limit": limit, "offset": offset, "mode": mode, "body": body}),
+        ((page,), {"limit": limit, "offset": offset, "mode": mode}),
+        ((page,), {"limit": limit, "offset": offset}),
+        ((page,), {}),
+    ]
+
+    last_error: Optional[str] = None
+    for name, method in methods:
+        result, err = await _try_call_method(method, candidates, timeout_sec)
+        if err is not None:
+            last_error = str(err)
+            continue
+        return result, f"app.state.engine.{name}", None
+
+    return None, None, last_error
+
+
+async def _call_core_sheet_rows_best_effort(*, page: str, limit: int, offset: int, mode: str, body: Dict[str, Any], timeout_sec: float) -> Tuple[Optional[Any], Optional[str], Optional[str]]:
+    if core_get_sheet_rows is None:
+        return None, None, None
+
+    candidates = [
+        ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode, "body": body}),
+        ((), {"page": page, "limit": limit, "offset": offset, "mode": mode, "body": body}),
+        ((), {"sheet_name": page, "limit": limit, "offset": offset, "mode": mode, "body": body}),
+        ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode}),
+        ((), {"page": page, "limit": limit, "offset": offset, "mode": mode}),
+        ((), {"sheet": page, "limit": limit, "offset": offset}),
+        ((), {"page": page, "limit": limit, "offset": offset}),
+        ((page,), {"limit": limit, "offset": offset, "mode": mode, "body": body}),
+        ((page,), {"limit": limit, "offset": offset, "mode": mode}),
+        ((page,), {"limit": limit, "offset": offset}),
+        ((page,), {}),
+    ]
+
+    result, err = await _try_call_method(core_get_sheet_rows, candidates, timeout_sec)
+    if err is not None:
+        return None, None, str(err)
+    return result, CORE_GET_SHEET_ROWS_SOURCE, None
 
 
 async def _proxy_callable(*, module_names: Sequence[str], function_name: str, request: Request, body: Dict[str, Any], mode: str, include_matrix_q: Optional[bool], token: Optional[str], x_app_token: Optional[str], x_api_key: Optional[str], authorization: Optional[str], x_request_id: Optional[str], page: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
@@ -1937,20 +1876,67 @@ async def _proxy_callable(*, module_names: Sequence[str], function_name: str, re
         return None, meta
 
 
-def _pick_best_payload(candidates: Sequence[Tuple[Optional[Dict[str, Any]], Dict[str, Any], str]], page: str) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any], str]:
-    best_payload: Optional[Dict[str, Any]] = None
-    best_meta: Dict[str, Any] = {}
-    best_name = ""
-    best_score = -10**9
-    for payload, meta, name in candidates:
-        score = _payload_quality_score(payload, page=page) if isinstance(payload, dict) else -10**9
-        if score > best_score:
-            best_payload = payload
-            best_meta = dict(meta or {})
-            best_name = name
-            best_score = score
-    return best_payload, best_meta, best_name
+async def _fetch_analysis_rows(engine: Any, symbols: List[str], *, mode: str, schema: Any) -> Dict[str, Any]:
+    if not symbols or engine is None:
+        return {}
+    preferred = [
+        "get_analysis_rows_batch", "get_analysis_quotes_batch", "get_enriched_quotes_batch",
+        "get_quotes_batch", "quotes_batch", "get_enriched_quotes", "get_quotes",
+    ]
+    for method in preferred:
+        fn = getattr(engine, method, None)
+        if not callable(fn):
+            continue
+        try:
+            for kwargs in ({"mode": mode, "schema": schema}, {"schema": schema}, {"mode": mode}, {}):
+                try:
+                    res = await _call_callable_maybe_sync(fn, symbols, timeout_sec=_DEFAULT_UPSTREAM_TIMEOUT_SEC, **kwargs)
+                    break
+                except TypeError:
+                    res = None
+                    continue
+            else:
+                res = None
+            if isinstance(res, dict):
+                data = res.get("data") if isinstance(res.get("data"), (dict, list)) else None
+                if isinstance(data, dict):
+                    return data
+                if isinstance(data, list):
+                    return {s: r for s, r in zip(symbols, data)}
+                return res
+            if isinstance(res, list):
+                return {s: r for s, r in zip(symbols, res)}
+        except Exception:
+            continue
 
+    out: Dict[str, Any] = {}
+    per_dict_fn = getattr(engine, "get_enriched_quote_dict", None) or getattr(engine, "get_analysis_row_dict", None) or getattr(engine, "get_quote_dict", None)
+    per_fn = getattr(engine, "get_enriched_quote", None) or getattr(engine, "get_analysis_row", None) or getattr(engine, "get_quote", None)
+    for s in symbols:
+        try:
+            if callable(per_dict_fn):
+                for kwargs in ({"mode": mode, "schema": schema}, {"schema": schema}, {"mode": mode}, {}):
+                    try:
+                        out[s] = await _call_callable_maybe_sync(per_dict_fn, s, timeout_sec=_DEFAULT_UPSTREAM_TIMEOUT_SEC, **kwargs)
+                        break
+                    except TypeError:
+                        continue
+                else:
+                    out[s] = {"symbol": s, "error": "per_symbol_dict_call_failed"}
+            elif callable(per_fn):
+                for kwargs in ({"mode": mode, "schema": schema}, {"schema": schema}, {"mode": mode}, {}):
+                    try:
+                        out[s] = await _call_callable_maybe_sync(per_fn, s, timeout_sec=_DEFAULT_UPSTREAM_TIMEOUT_SEC, **kwargs)
+                        break
+                    except TypeError:
+                        continue
+                else:
+                    out[s] = {"symbol": s, "error": "per_symbol_call_failed"}
+            else:
+                out[s] = {"symbol": s, "error": "engine_missing_quote_method"}
+        except Exception as e:
+            out[s] = {"symbol": s, "error": str(e)}
+    return out
 
 # =============================================================================
 # Health
@@ -1984,13 +1970,13 @@ async def analysis_sheet_rows_health(request: Request) -> Dict[str, Any]:
         ],
     })
 
-
 # =============================================================================
 # Internal implementation
 # =============================================================================
 async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any], mode: str, include_matrix_q: Optional[bool], token: Optional[str], x_app_token: Optional[str], x_api_key: Optional[str], authorization: Optional[str], x_request_id: Optional[str]) -> Dict[str, Any]:
     start = time.time()
     request_id = _request_id(request, x_request_id)
+
     try:
         settings = get_settings_cached()
     except Exception:
@@ -2011,7 +1997,6 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
     schema_only = _maybe_bool(merged_body.get("schema_only"), False)
     headers_only = _maybe_bool(merged_body.get("headers_only"), False)
     requested_symbols = _extract_requested_symbols(merged_body, max(top_n, limit + offset, 50))
-
     headers, keys, spec, schema_source = _resolve_contract(page)
     engine, engine_source = await _get_engine(request)
 
@@ -2038,6 +2023,28 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
             },
         )
 
+    timeout_sec = _page_upstream_timeout(page)
+    fetch_limit = min(5000, max(limit + offset, top_n, 1))
+
+    engine_payload, engine_source_name, engine_call_error = await _call_engine_sheet_rows_best_effort(
+        request=request,
+        page=page,
+        limit=fetch_limit,
+        offset=0,
+        mode=mode or "",
+        body=merged_body,
+        include_matrix=include_matrix,
+        timeout_sec=timeout_sec,
+    )
+    adapter_payload, adapter_source_name, adapter_call_error = await _call_core_sheet_rows_best_effort(
+        page=page,
+        limit=fetch_limit,
+        offset=0,
+        mode=mode or "",
+        body=merged_body,
+        timeout_sec=timeout_sec,
+    )
+
     root_payload, root_meta = await _proxy_callable(
         module_names=("routes.advanced_analysis",),
         function_name="_run_advanced_sheet_rows_impl",
@@ -2052,7 +2059,6 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
         x_request_id=x_request_id,
         page=page,
     )
-
     adv_payload, adv_meta = await _proxy_callable(
         module_names=("routes.advanced_sheet_rows",),
         function_name="_run_advanced_sheet_rows_impl",
@@ -2068,127 +2074,129 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
         page=page,
     )
 
-    fetch_limit = min(5000, max(limit + offset, top_n, 1))
-    adapter_payload, adapter_source = await _call_core_sheet_rows_best_effort(
-        page=page,
-        limit=fetch_limit,
-        offset=0,
-        mode=mode or "",
-        body=merged_body,
-    )
-    adapter_meta = {
-        "adapter_attempted": True,
-        "adapter_source": adapter_source or CORE_GET_SHEET_ROWS_SOURCE,
-        "adapter_has_rows": _payload_has_real_rows(adapter_payload, page=page) if isinstance(adapter_payload, dict) else False,
-    }
+    candidates: List[Tuple[str, Any, Dict[str, Any]]] = [
+        ("direct_engine", engine_payload, {
+            "schema_source": schema_source,
+            "engine_source": engine_source,
+            "best_source": "direct_engine",
+            "source": engine_source_name or engine_source or "app.state.engine",
+            "requested_symbols_count": len(requested_symbols),
+            "upstream_timeout_sec": timeout_sec,
+            **({"upstream_call_error": engine_call_error} if engine_call_error else {}),
+        }),
+        ("core_adapter", adapter_payload, {
+            "schema_source": schema_source,
+            "engine_source": engine_source,
+            "best_source": "core_adapter",
+            "source": adapter_source_name or CORE_GET_SHEET_ROWS_SOURCE,
+            "requested_symbols_count": len(requested_symbols),
+            "upstream_timeout_sec": timeout_sec,
+            **({"upstream_call_error": adapter_call_error} if adapter_call_error else {}),
+        }),
+        ("root_proxy", root_payload, {
+            "schema_source": schema_source,
+            "engine_source": engine_source,
+            "best_source": "root_proxy",
+            "source": "routes.advanced_analysis",
+            "requested_symbols_count": len(requested_symbols),
+            "upstream_timeout_sec": timeout_sec,
+            **dict(root_meta or {}),
+        }),
+        ("advanced_proxy", adv_payload, {
+            "schema_source": schema_source,
+            "engine_source": engine_source,
+            "best_source": "advanced_proxy",
+            "source": "routes.advanced_sheet_rows",
+            "requested_symbols_count": len(requested_symbols),
+            "upstream_timeout_sec": timeout_sec,
+            **dict(adv_meta or {}),
+        }),
+    ]
 
-    best_payload, best_meta, best_name = _pick_best_payload(
-        _ordered_payload_candidates(page, root_payload, root_meta, adv_payload, adv_meta, adapter_payload, adapter_meta),
-        page=page,
-    )
-
-    if isinstance(best_payload, dict):
-        best_has_rows = _payload_has_real_rows(best_payload, page=page)
-        best_status, best_error, _ = _extract_status_error(best_payload)
-        best_status_lc = _strip(best_status).lower()
-        best_is_usable = best_has_rows or (best_status_lc == "success" and page not in _SPECIAL_PAGES)
-        if best_is_usable:
-            meta_extra = {
-                "schema_source": schema_source,
-                "engine_source": engine_source,
-                "best_source": best_name,
-                "requested_symbols_count": len(requested_symbols),
-                "preferred_order": [name for _payload, _meta, name in _ordered_payload_candidates(page, root_payload, root_meta, adv_payload, adv_meta, adapter_payload, adapter_meta)],
-                **(best_meta or {}),
-            }
-            meta_extra["best_status"] = best_status_lc or "unknown"
-            meta_extra["best_has_rows"] = best_has_rows
-            if best_error:
-                meta_extra.setdefault("upstream_error", best_error)
-            return _normalize_external_payload(
-                external_payload=best_payload,
-                page=page,
-                headers=headers,
-                keys=keys,
-                include_matrix=include_matrix,
-                request_id=request_id,
-                started_at=start,
-                mode=mode,
-                route_family=route_family,
-                meta_extra=meta_extra,
-                limit=limit,
-                offset=offset,
-                top_n=top_n,
-                requested_symbols=requested_symbols,
-            )
-
-    # Symbol-mode instrument fallback.
-    if requested_symbols and page not in {_INSIGHTS_PAGE, _DICTIONARY_PAGE}:
-        if engine is not None:
-            data_map = await _fetch_analysis_rows(engine, requested_symbols, mode=(mode or ""), settings=settings, schema=spec)
-            normalized_rows: List[Dict[str, Any]] = []
-            errors = 0
-            for sym in requested_symbols:
-                raw = _to_plain_dict(data_map.get(sym))
-                if not raw:
-                    raw = {"symbol": sym, "error": "missing_row"}
-                    errors += 1
-                elif isinstance(raw, dict) and raw.get("error"):
-                    errors += 1
-                normalized = _normalize_to_schema_keys(schema_keys=keys, schema_headers=headers, raw=raw)
-                if "symbol" in keys and not normalized.get("symbol"):
-                    normalized["symbol"] = sym
-                normalized_rows.append(normalized)
-
-            if page == _TOP10_PAGE:
-                normalized_rows = _ensure_top10_rows(
-                    normalized_rows,
-                    requested_symbols=requested_symbols,
-                    top_n=top_n,
-                    schema_keys=keys,
-                    schema_headers=headers,
-                )
-
-            normalized_rows = _slice(normalized_rows, limit=limit, offset=offset)
-            status_out = "success" if errors == 0 else ("partial" if errors < len(requested_symbols) else "error")
-            return _payload_envelope(
-                page=page,
-                route_family=route_family,
-                headers=headers,
-                keys=keys,
-                row_objects=normalized_rows,
-                include_matrix=include_matrix,
-                request_id=request_id,
-                started_at=start,
-                mode=mode,
-                status_out=status_out,
-                error_out=f"{errors} errors" if errors else None,
-                meta={
-                    "requested_total": len(requested_symbols),
-                    "returned": len(normalized_rows),
-                    "errors": errors,
-                    "dispatch": "instrument_mode",
-                    "schema_source": schema_source,
-                    "engine_source": engine_source,
-                    "best_source": best_name or "engine",
-                    "root_meta": root_meta,
-                    "advanced_meta": adv_meta,
-                    "adapter_meta": adapter_meta,
-                },
-            )
-
-    # Non-empty local fail-soft fallback, especially for special pages.
-    degraded_upstream_meta = {
+    best_degraded_meta: Dict[str, Any] = {
         "schema_source": schema_source,
         "engine_source": engine_source,
-        "best_source": best_name or "none",
-        "root_meta": root_meta,
-        "advanced_meta": adv_meta,
-        "adapter_meta": adapter_meta,
+        "upstream_timeout_sec": timeout_sec,
     }
-    if isinstance(best_payload, dict):
-        degraded_upstream_meta["best_payload_status"] = _strip(best_payload.get("status"))
-        degraded_upstream_meta["best_payload_had_rows"] = _payload_has_real_rows(best_payload, page=page)
+
+    for name, payload, meta_extra in candidates:
+        if payload is None:
+            continue
+        normalized, degraded = _normalize_external_payload(
+            external_payload=payload,
+            page=page,
+            headers=headers,
+            keys=keys,
+            include_matrix=include_matrix,
+            request_id=request_id,
+            started_at=start,
+            mode=mode,
+            route_family=route_family,
+            meta_extra=meta_extra,
+            limit=limit,
+            offset=offset,
+            top_n=top_n,
+            requested_symbols=requested_symbols,
+        )
+        if normalized.get("count", 0) and not degraded:
+            return normalized
+        best_degraded_meta.update({
+            "upstream_degraded": True,
+            "upstream_candidate": name,
+            "upstream_status": normalized.get("status"),
+            "upstream_error": normalized.get("error") or normalized.get("detail"),
+        })
+
+    if requested_symbols and page not in {_INSIGHTS_PAGE, _DICTIONARY_PAGE} and engine is not None:
+        data_map = await _fetch_analysis_rows(engine, requested_symbols, mode=(mode or ""), schema=spec)
+        normalized_rows: List[Dict[str, Any]] = []
+        errors = 0
+        for sym in requested_symbols:
+            raw = _to_plain_dict(data_map.get(sym))
+            if not raw:
+                raw = {"symbol": sym, "error": "missing_row"}
+                errors += 1
+            elif isinstance(raw, dict) and raw.get("error"):
+                errors += 1
+            normalized = _normalize_to_schema_keys(schema_keys=keys, schema_headers=headers, raw=raw)
+            if "symbol" in keys and not normalized.get("symbol"):
+                normalized["symbol"] = sym
+            normalized_rows.append(normalized)
+
+        if page == _TOP10_PAGE:
+            normalized_rows = _ensure_top10_rows(
+                normalized_rows,
+                requested_symbols=requested_symbols,
+                top_n=top_n,
+                schema_keys=keys,
+                schema_headers=headers,
+            )
+
+        normalized_rows = _slice(normalized_rows, limit=limit, offset=offset)
+        status_out = "success" if errors == 0 else ("partial" if errors < len(requested_symbols) else "error")
+        return _payload_envelope(
+            page=page,
+            route_family=route_family,
+            headers=headers,
+            keys=keys,
+            row_objects=normalized_rows,
+            include_matrix=include_matrix,
+            request_id=request_id,
+            started_at=start,
+            mode=mode,
+            status_out=status_out,
+            error_out=f"{errors} errors" if errors else None,
+            meta={
+                "requested_total": len(requested_symbols),
+                "returned": len(normalized_rows),
+                "errors": errors,
+                "dispatch": "instrument_mode",
+                "schema_source": schema_source,
+                "engine_source": engine_source,
+                **best_degraded_meta,
+            },
+        )
+
     fallback_rows = _build_nonempty_failsoft_rows(
         page=page,
         headers=headers,
@@ -2214,8 +2222,7 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
         error_out=fallback_error,
         meta={
             "dispatch": "analysis_wrapper_fail_soft_nonempty" if fallback_rows else "analysis_wrapper_fail_soft",
-            "adapter_source": adapter_source or CORE_GET_SHEET_ROWS_SOURCE,
-            **degraded_upstream_meta,
+            **best_degraded_meta,
         },
     )
 
@@ -2257,7 +2264,6 @@ async def _analysis_sheet_rows_impl(request: Request, body: Dict[str, Any], mode
             meta={"dispatch": "analysis_sheet_rows_emergency_fallback", "schema_source": schema_source, "exception_type": type(e).__name__},
         )
 
-
 # =============================================================================
 # Routes
 # =============================================================================
@@ -2283,6 +2289,8 @@ async def analysis_sheet_rows_get(
     top_n: Optional[int] = Query(default=None),
     mode: str = Query(default="", description="Optional mode hint for engine/provider"),
     include_matrix_q: Optional[bool] = Query(default=None, alias="include_matrix"),
+    schema_only: Optional[bool] = Query(default=None),
+    headers_only: Optional[bool] = Query(default=None),
     token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
     x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
@@ -2308,6 +2316,8 @@ async def analysis_sheet_rows_get(
         "limit": limit,
         "offset": offset,
         "top_n": top_n,
+        "schema_only": schema_only,
+        "headers_only": headers_only,
     }.items():
         if v not in (None, ""):
             body[k] = v
