@@ -2,26 +2,25 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.11.0)
+TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.12.0)
 ================================================================================
 FASTAPI-NATIVE ROUTER INCLUDE • PRESTART-FIRST ROUTE MOUNT • OPENAPI CACHE SAFE
 REQUEST-ID SAFE • ENGINE-STATE AWARE • CONTROLLED-ROUTE-OWNERSHIP SAFE
 STRICT-JSON SAFE • HEALTH / META ALIAS SAFE • DEBUG ROUTE SAFE
 INVESTMENT-ADVISOR CANONICAL OWNER PROTECTION • ADVANCED ROUTE PRIORITY SAFE
+CUSTOM OPENAPI / DOCS SAFE • JSON CONTRACT HARDENING
 
-Why this revision (v8.11.0)
+Why this revision (v8.12.0)
 ---------------------------
-- FIX: makes routes.investment_advisor the canonical owner of
-       /v1/advanced/sheet-rows so the revised advanced router is the effective
-       public owner after deployment.
-- FIX: reorders the controlled mount plan so routes.investment_advisor mounts
-       before routes.advanced_sheet_rows, reducing overlap risk.
-- FIX: respects allow_query_token in _auth_ok (aligned with config.py v7.2.0).
-- FIX: implements constant-time comparison via _secure_equals for token checks.
-- FIX: adds support for X-API-Key and Api-Key headers in the entrypoint auth guard.
-- FIX: preserves exact canonical-path protection during filtered router cloning
-       so later routers cannot steal owner-locked public paths.
-- SAFE: engine init remains timeout-aware and non-fatal unless strict mode is enabled.
+- FIX: replaces built-in OpenAPI/docs exposure with explicit custom routes so
+       /openapi.json always returns parseable JSON and docs point to that route.
+- FIX: guarantees OpenAPI has a valid "paths" object; if generation fails, a
+       minimal fallback schema is returned instead of an empty/non-JSON payload.
+- FIX: adds ALLOW_QUERY_TOKEN to settings model so auth behavior can match config.
+- FIX: extends canonical owner protection and diagnostics to underscore aliases.
+- FIX: improves route family presence detection for hyphen + underscore aliases.
+- FIX: keeps strict JSON output across meta/health/debug/OpenAPI paths.
+- SAFE: preserves controlled route mounting and render-safe startup behavior.
 """
 from __future__ import annotations
 
@@ -44,6 +43,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, 
 
 from fastapi import APIRouter, FastAPI, Request, Response
 from fastapi.encoders import jsonable_encoder
+from fastapi.openapi.docs import get_redoc_html, get_swagger_ui_html
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
@@ -168,7 +168,7 @@ class _StrictJSONResponse(JSONResponse):
         ).encode("utf-8")
 
 
-APP_ENTRY_VERSION = "8.11.0"
+APP_ENTRY_VERSION = "8.12.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
@@ -193,29 +193,50 @@ _CONTROLLED_PROTECTED_PREFIXES: Tuple[str, ...] = (
     "/quote",
     "/quotes",
     "/sheet-rows",
+    "/sheet_rows",
 )
 
-# Canonical owners are the route-family keys used in the controlled plan.
 _CONTROLLED_CANONICAL_OWNER_MAP: Dict[str, str] = {
     "/v1/advisor": "advisor",
     "/v1/advisor/sheet-rows": "advisor",
+    "/v1/advisor/sheet_rows": "advisor",
+
     "/v1/investment_advisor": "investment_advisor",
+    "/v1/investment_advisor/sheet-rows": "investment_advisor",
+    "/v1/investment_advisor/sheet_rows": "investment_advisor",
     "/v1/investment-advisor": "investment_advisor",
+    "/v1/investment-advisor/sheet-rows": "investment_advisor",
+    "/v1/investment-advisor/sheet_rows": "investment_advisor",
+
     "/v1/advanced": "investment_advisor",
     "/v1/advanced/sheet-rows": "investment_advisor",
+    "/v1/advanced/sheet_rows": "investment_advisor",
+
     "/v1/analysis": "analysis_sheet_rows",
     "/v1/analysis/sheet-rows": "analysis_sheet_rows",
+    "/v1/analysis/sheet_rows": "analysis_sheet_rows",
+
     "/v1/schema": "advanced_analysis",
     "/v1/schema/sheet-spec": "advanced_analysis",
+    "/v1/schema/sheet_spec": "advanced_analysis",
+    "/v1/schema/pages": "advanced_analysis",
+    "/v1/schema/data-dictionary": "advanced_analysis",
+    "/v1/schema/data_dictionary": "advanced_analysis",
     "/schema": "advanced_analysis",
     "/schema/sheet-spec": "advanced_analysis",
+    "/schema/sheet_spec": "advanced_analysis",
     "/sheet-rows": "advanced_analysis",
+    "/sheet_rows": "advanced_analysis",
+
     "/v1/enriched": "enriched_quote",
     "/v1/enriched/sheet-rows": "enriched_quote",
+    "/v1/enriched/sheet_rows": "enriched_quote",
     "/v1/enriched_quote": "enriched_quote",
     "/v1/enriched_quote/sheet-rows": "enriched_quote",
+    "/v1/enriched_quote/sheet_rows": "enriched_quote",
     "/v1/enriched-quote": "enriched_quote",
     "/v1/enriched-quote/sheet-rows": "enriched_quote",
+    "/v1/enriched-quote/sheet_rows": "enriched_quote",
     "/quote": "enriched_quote",
     "/quotes": "enriched_quote",
 }
@@ -316,6 +337,10 @@ def _to_bool(value: Any, default: bool = False) -> bool:
 
 def _paths_start_with_any(paths: Set[str], *prefixes: str) -> bool:
     return any(any(path.startswith(prefix) for prefix in prefixes) for path in paths)
+
+
+def _path_present_any(paths: Set[str], *candidates: str) -> bool:
+    return any(c in paths for c in candidates)
 
 
 def _request_id_from_request(request: Request) -> str:
@@ -419,6 +444,7 @@ class _SettingsView:
     REQUIRE_AUTH: bool = True
     OPEN_MODE: bool = False
     AUTH_HEADER_NAME: str = "X-APP-TOKEN"
+    ALLOW_QUERY_TOKEN: bool = False
 
     ENABLE_CORS_ALL_ORIGINS: bool = False
     CORS_ORIGINS: str = ""
@@ -446,6 +472,7 @@ def _settings_from_generic_object(s: Any, source: str) -> _SettingsView:
         REQUIRE_AUTH=_to_bool(_pick_attr(s, "REQUIRE_AUTH", "require_auth", default=_env_bool("REQUIRE_AUTH", True)), _env_bool("REQUIRE_AUTH", True)),
         OPEN_MODE=_to_bool(_pick_attr(s, "OPEN_MODE", "open_mode", default=_env_bool("OPEN_MODE", False)), _env_bool("OPEN_MODE", False)),
         AUTH_HEADER_NAME=str(_pick_attr(s, "AUTH_HEADER_NAME", "auth_header_name", default=_env_str("AUTH_HEADER_NAME", "X-APP-TOKEN"))),
+        ALLOW_QUERY_TOKEN=_to_bool(_pick_attr(s, "ALLOW_QUERY_TOKEN", "allow_query_token", default=_env_bool("ALLOW_QUERY_TOKEN", False)), _env_bool("ALLOW_QUERY_TOKEN", False)),
         ENABLE_CORS_ALL_ORIGINS=_to_bool(_pick_attr(s, "ENABLE_CORS_ALL_ORIGINS", "enable_cors_all_origins", default=_env_bool("ENABLE_CORS_ALL_ORIGINS", False)), _env_bool("ENABLE_CORS_ALL_ORIGINS", False)),
         CORS_ORIGINS=str(_pick_attr(s, "CORS_ORIGINS", "cors_origins", default=_env_str("CORS_ORIGINS", ""))),
         BACKEND_BASE_URL=str(_pick_attr(s, "BACKEND_BASE_URL", "backend_base_url", default=_env_str("BACKEND_BASE_URL", ""))),
@@ -485,6 +512,7 @@ def _load_settings() -> _SettingsView:
         REQUIRE_AUTH=_env_bool("REQUIRE_AUTH", True),
         OPEN_MODE=_env_bool("OPEN_MODE", False),
         AUTH_HEADER_NAME=_env_str("AUTH_HEADER_NAME", "X-APP-TOKEN"),
+        ALLOW_QUERY_TOKEN=_env_bool("ALLOW_QUERY_TOKEN", False),
         ENABLE_CORS_ALL_ORIGINS=_env_bool("ENABLE_CORS_ALL_ORIGINS", False),
         CORS_ORIGINS=_env_str("CORS_ORIGINS", ""),
         BACKEND_BASE_URL=_env_str("BACKEND_BASE_URL", ""),
@@ -704,18 +732,36 @@ class NoResponseGuardMiddleware(BaseHTTPMiddleware):
         try:
             response = await call_next(request)
             if response is None:
-                logger.error("Downstream returned None response", extra={"request_id": request_id, "path": str(request.url.path), "status_code": 500})
+                logger.error(
+                    "Downstream returned None response",
+                    extra={"request_id": request_id, "path": str(request.url.path), "status_code": 500},
+                )
                 return _StrictJSONResponse(
                     status_code=500,
-                    content={"status": "error", "error": "RuntimeError: No response returned.", "path": str(request.url.path), "request_id": request_id, "ts_utc": datetime.now(timezone.utc).isoformat()},
+                    content={
+                        "status": "error",
+                        "error": "RuntimeError: No response returned.",
+                        "path": str(request.url.path),
+                        "request_id": request_id,
+                        "ts_utc": datetime.now(timezone.utc).isoformat(),
+                    },
                 )
             return response
         except RuntimeError as exc:
             if "No response returned" in str(exc):
-                logger.error("Caught downstream no-response runtime error", extra={"request_id": request_id, "path": str(request.url.path), "status_code": 500})
+                logger.error(
+                    "Caught downstream no-response runtime error",
+                    extra={"request_id": request_id, "path": str(request.url.path), "status_code": 500},
+                )
                 return _StrictJSONResponse(
                     status_code=500,
-                    content={"status": "error", "error": f"{type(exc).__name__}: {str(exc)}", "path": str(request.url.path), "request_id": request_id, "ts_utc": datetime.now(timezone.utc).isoformat()},
+                    content={
+                        "status": "error",
+                        "error": f"{type(exc).__name__}: {str(exc)}",
+                        "path": str(request.url.path),
+                        "request_id": request_id,
+                        "ts_utc": datetime.now(timezone.utc).isoformat(),
+                    },
                 )
             raise
 
@@ -759,27 +805,47 @@ def _invalidate_openapi_cache(app: FastAPI) -> None:
 
 def _route_family_presence_from_paths(paths: Set[str]) -> Dict[str, bool]:
     advisor_short = _paths_start_with_any(paths, "/v1/advisor")
+    advisor_short_rows = _path_present_any(paths, "/v1/advisor/sheet-rows", "/v1/advisor/sheet_rows")
+
     advisor_long_underscore = _paths_start_with_any(paths, "/v1/investment_advisor")
     advisor_long_hyphen = _paths_start_with_any(paths, "/v1/investment-advisor")
-    enriched_primary = "/v1/enriched/sheet-rows" in paths
-    enriched_underscore = "/v1/enriched_quote/sheet-rows" in paths
-    enriched_hyphen = "/v1/enriched-quote/sheet-rows" in paths
+
+    advanced_rows = _path_present_any(paths, "/v1/advanced/sheet-rows", "/v1/advanced/sheet_rows")
+    analysis_rows = _path_present_any(paths, "/v1/analysis/sheet-rows", "/v1/analysis/sheet_rows")
+
+    schema_rows = _path_present_any(paths, "/v1/schema/sheet-spec", "/v1/schema/sheet_spec", "/schema/sheet-spec", "/schema/sheet_spec")
+    schema_dict = _path_present_any(paths, "/v1/schema/data-dictionary", "/v1/schema/data_dictionary")
+
+    enriched_primary = _path_present_any(paths, "/v1/enriched/sheet-rows", "/v1/enriched/sheet_rows")
+    enriched_underscore = _path_present_any(paths, "/v1/enriched_quote/sheet-rows", "/v1/enriched_quote/sheet_rows")
+    enriched_hyphen = _path_present_any(paths, "/v1/enriched-quote/sheet-rows", "/v1/enriched-quote/sheet_rows")
+
+    root_sheet_rows = _path_present_any(paths, "/sheet-rows", "/sheet_rows")
 
     return {
         "advisor_short": advisor_short,
+        "advisor_short_sheet_rows": advisor_short_rows,
         "advisor_long_underscore": advisor_long_underscore,
         "advisor_long_hyphen": advisor_long_hyphen,
         "advisor_any": advisor_short or advisor_long_underscore or advisor_long_hyphen,
-        "advanced_sheet_rows": "/v1/advanced/sheet-rows" in paths,
+
+        "advanced_sheet_rows": advanced_rows,
         "advanced_any": _paths_start_with_any(paths, "/v1/advanced"),
+
         "analysis": _paths_start_with_any(paths, "/v1/analysis"),
+        "analysis_sheet_rows": analysis_rows,
+
         "schema": _paths_start_with_any(paths, "/v1/schema", "/schema"),
+        "schema_sheet_spec": schema_rows,
+        "schema_data_dictionary": schema_dict,
+
         "enriched": _paths_start_with_any(paths, "/v1/enriched", "/v1/enriched_quote", "/v1/enriched-quote"),
         "enriched_sheet_rows_primary": enriched_primary,
         "enriched_sheet_rows_underscore": enriched_underscore,
         "enriched_sheet_rows_hyphen": enriched_hyphen,
         "enriched_sheet_rows_any": enriched_primary or enriched_underscore or enriched_hyphen,
-        "root_sheet_rows": "/sheet-rows" in paths,
+
+        "root_sheet_rows": root_sheet_rows,
         "root_health_alias": "/health" in paths and "/v1/health" in paths,
         "root_meta_alias": "/meta" in paths and "/v1/meta" in paths,
     }
@@ -843,7 +909,11 @@ def _canonical_path_owner_mismatches(path_owners: Mapping[str, str]) -> Dict[str
             continue
         actual_owner = actual_module.rsplit(".", 1)[-1] if actual_module else ""
         if actual_owner and actual_owner != expected_owner:
-            mismatches[path] = {"expected_owner": expected_owner, "actual_module": actual_module, "actual_owner": actual_owner}
+            mismatches[path] = {
+                "expected_owner": expected_owner,
+                "actual_module": actual_module,
+                "actual_owner": actual_owner,
+            }
     return mismatches
 
 
@@ -867,7 +937,9 @@ def _verify_required_route_families(app: FastAPI) -> List[str]:
         "advisor_any": presence.get("advisor_any", False),
         "advanced_sheet_rows": presence.get("advanced_sheet_rows", False),
         "analysis": presence.get("analysis", False),
+        "analysis_sheet_rows": presence.get("analysis_sheet_rows", False),
         "schema": presence.get("schema", False),
+        "schema_sheet_spec": presence.get("schema_sheet_spec", False),
         "enriched": presence.get("enriched", False),
         "enriched_sheet_rows_any": presence.get("enriched_sheet_rows_any", False),
         "root_sheet_rows": presence.get("root_sheet_rows", False),
@@ -955,7 +1027,11 @@ def _normalize_routes_snapshot(ret: Any, *, used_strategy: str, app: Optional[Fa
         except Exception:
             pass
 
-    effective_failed_modules = _effective_failed_modules({"import_errors": import_errors, "mount_errors": mount_errors, "no_router": no_router})
+    effective_failed_modules = _effective_failed_modules({
+        "import_errors": import_errors,
+        "mount_errors": mount_errors,
+        "no_router": no_router,
+    })
 
     out = {
         "mounted": mounted,
@@ -1001,7 +1077,7 @@ def _normalize_routes_snapshot(ret: Any, *, used_strategy: str, app: Optional[Fa
 def _allowed_prefixes_for_key(key: str) -> Tuple[str, ...]:
     mapping = {
         "config": ("/v1/config",),
-        "advanced_analysis": ("/v1/schema", "/schema", "/sheet-rows"),
+        "advanced_analysis": ("/v1/schema", "/schema", "/sheet-rows", "/sheet_rows"),
         "advanced_sheet_rows": ("/v1/advanced",),
         "analysis_sheet_rows": ("/v1/analysis",),
         "investment_advisor": ("/v1/advanced", "/v1/investment_advisor", "/v1/investment-advisor"),
@@ -1068,7 +1144,13 @@ def _clone_filtered_router(router: APIRouter, *, key: str) -> Tuple[APIRouter, L
             added_paths.append(path)
         except Exception:
             try:
-                out.add_api_route(path=path, endpoint=route.endpoint, methods=list(route.methods or []), name=route.name, include_in_schema=route.include_in_schema)
+                out.add_api_route(
+                    path=path,
+                    endpoint=route.endpoint,
+                    methods=list(route.methods or []),
+                    name=route.name,
+                    include_in_schema=route.include_in_schema,
+                )
                 added_paths.append(path)
             except Exception:
                 filtered_out.append(path)
@@ -1125,11 +1207,20 @@ def _mount_routes_controlled(app: FastAPI) -> Dict[str, Any]:
         overlap = router_sigs & existing_sigs
 
         if router_sigs and overlap == router_sigs:
-            snap["duplicate_skips"].append({"module": module_name, "paths": sorted(set(added_paths)), "signature_count": len(router_sigs)})
+            snap["duplicate_skips"].append({
+                "module": module_name,
+                "paths": sorted(set(added_paths)),
+                "signature_count": len(router_sigs),
+            })
             continue
 
         if overlap:
-            snap["partial_duplicate_skips"].append({"module": module_name, "paths": sorted(set(added_paths)), "overlap_count": len(overlap), "signature_count": len(router_sigs)})
+            snap["partial_duplicate_skips"].append({
+                "module": module_name,
+                "paths": sorted(set(added_paths)),
+                "overlap_count": len(overlap),
+                "signature_count": len(router_sigs),
+            })
 
         try:
             app.include_router(filtered_router)
@@ -1147,7 +1238,11 @@ def _mount_routes_controlled(app: FastAPI) -> Dict[str, Any]:
 def _mount_routes_once(app: FastAPI, *, phase: str) -> Dict[str, Any]:
     _ensure_app_state_defaults(app)
     if bool(getattr(app.state, "routes_mounted", False)) and isinstance(getattr(app.state, "routes_snapshot", None), dict):
-        snap = _normalize_routes_snapshot(getattr(app.state, "routes_snapshot", {}), used_strategy="main.controlled_priority_plan", app=app)
+        snap = _normalize_routes_snapshot(
+            getattr(app.state, "routes_snapshot", {}),
+            used_strategy="main.controlled_priority_plan",
+            app=app,
+        )
         app.state.routes_mount_phase = str(getattr(app.state, "routes_mount_phase", phase) or phase)
         return snap
 
@@ -1278,27 +1373,108 @@ def _install_builtin_routes(app: FastAPI) -> None:
 
 
 # =============================================================================
-# OpenAPI
+# OpenAPI / Docs
 # =============================================================================
+def _minimal_openapi_paths(app: FastAPI) -> Dict[str, Any]:
+    paths: Dict[str, Any] = {}
+    for route in getattr(app, "routes", []) or []:
+        if not isinstance(route, APIRoute):
+            continue
+        if not bool(getattr(route, "include_in_schema", False)):
+            continue
+
+        path = str(getattr(route, "path", "") or "")
+        methods = sorted(
+            str(m).upper()
+            for m in (getattr(route, "methods", None) or set())
+            if str(m).upper() not in {"HEAD", "OPTIONS"}
+        )
+        if not path or not methods:
+            continue
+
+        path_item = paths.setdefault(path, {})
+        for method in methods:
+            operation_id = str(getattr(route, "operation_id", "") or f"{route.name}_{method.lower()}")
+            path_item[method.lower()] = {
+                "summary": _scrub_text(getattr(route, "summary", None) or getattr(route, "name", None) or f"{method} {path}"),
+                "operationId": _scrub_text(operation_id),
+                "responses": {
+                    "200": {"description": "Successful Response"}
+                },
+            }
+    return paths
+
+
 def _install_custom_openapi(app: FastAPI) -> None:
-    def custom_openapi() -> Dict[str, Any]:
+    def build_openapi_schema() -> Dict[str, Any]:
         current_signature_count = _route_signature_count(app, include_builtin=True)
         cached_signature_count = int(getattr(app.state, "_openapi_route_signature_count", -1) or -1)
         cached_schema = getattr(app, "openapi_schema", None)
-        if cached_schema is not None and cached_signature_count == current_signature_count:
-            return cached_schema  # type: ignore[return-value]
+        if isinstance(cached_schema, dict) and cached_signature_count == current_signature_count:
+            return cached_schema
 
-        schema = get_openapi(
-            title=_SETTINGS.APP_NAME,
-            version=str(_SETTINGS.APP_VERSION),
-            routes=app.routes,
-            description="Tadawul Fast Bridge API",
-        )
+        schema: Dict[str, Any]
+        try:
+            generated = get_openapi(
+                title=_SETTINGS.APP_NAME,
+                version=str(_SETTINGS.APP_VERSION),
+                routes=app.routes,
+                description="Tadawul Fast Bridge API",
+            )
+            schema = generated if isinstance(generated, dict) else {}
+        except Exception as e:
+            logger.warning("OpenAPI generation failed; using fallback schema: %s", _err_to_str(e))
+            schema = {
+                "openapi": "3.1.0",
+                "info": {
+                    "title": _SETTINGS.APP_NAME,
+                    "version": str(_SETTINGS.APP_VERSION),
+                    "description": "Fallback schema generated by main.py",
+                },
+                "paths": _minimal_openapi_paths(app),
+                "x-openapi-fallback": True,
+                "x-openapi-error": _err_to_str(e),
+            }
+        else:
+            schema.setdefault("openapi", "3.1.0")
+            schema.setdefault("info", {
+                "title": _SETTINGS.APP_NAME,
+                "version": str(_SETTINGS.APP_VERSION),
+            })
+            if not isinstance(schema.get("paths"), dict) or not schema.get("paths"):
+                schema["paths"] = _minimal_openapi_paths(app)
+                schema["x-openapi-rebuilt-paths"] = True
+
         app.openapi_schema = schema
         app.state._openapi_route_signature_count = current_signature_count
         return schema
 
+    def custom_openapi() -> Dict[str, Any]:
+        return build_openapi_schema()
+
     app.openapi = custom_openapi  # type: ignore[assignment]
+
+    @app.api_route("/openapi.json", methods=["GET", "HEAD"], include_in_schema=False)
+    async def openapi_json(request: Request):
+        if request.method == "HEAD":
+            return Response(status_code=200, media_type="application/json")
+        return _StrictJSONResponse(content=build_openapi_schema())
+
+    if bool(_SETTINGS.ENABLE_SWAGGER):
+        @app.get("/docs", include_in_schema=False)
+        async def custom_docs():
+            return get_swagger_ui_html(
+                openapi_url="/openapi.json",
+                title=f"{_SETTINGS.APP_NAME} - Swagger UI",
+            )
+
+    if bool(_SETTINGS.ENABLE_REDOC):
+        @app.get("/redoc", include_in_schema=False)
+        async def custom_redoc():
+            return get_redoc_html(
+                openapi_url="/openapi.json",
+                title=f"{_SETTINGS.APP_NAME} - ReDoc",
+            )
 
 
 # =============================================================================
@@ -1392,10 +1568,6 @@ async def _maybe_close_google_sheets_service() -> None:
 # App factory
 # =============================================================================
 def create_app() -> FastAPI:
-    docs_url = "/docs" if bool(_SETTINGS.ENABLE_SWAGGER) else None
-    redoc_url = "/redoc" if bool(_SETTINGS.ENABLE_REDOC) else None
-    openapi_url = "/openapi.json" if (docs_url or redoc_url) else None
-
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         _ensure_app_state_defaults(app)
@@ -1469,9 +1641,9 @@ def create_app() -> FastAPI:
         title=_SETTINGS.APP_NAME,
         version=str(_SETTINGS.APP_VERSION),
         debug=bool(_SETTINGS.DEBUG),
-        docs_url=docs_url,
-        redoc_url=redoc_url,
-        openapi_url=openapi_url,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
         default_response_class=_StrictJSONResponse,
         lifespan=lifespan,
     )
@@ -1482,23 +1654,44 @@ def create_app() -> FastAPI:
     app.add_middleware(GZipMiddleware, minimum_size=1024)
 
     if bool(_SETTINGS.ENABLE_CORS_ALL_ORIGINS):
-        app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
     else:
         origins = _parse_csv(_SETTINGS.CORS_ORIGINS)
         if origins:
-            app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+            app.add_middleware(
+                CORSMiddleware,
+                allow_origins=origins,
+                allow_credentials=True,
+                allow_methods=["*"],
+                allow_headers=["*"],
+            )
 
     @app.exception_handler(Exception)
     async def unhandled_exception_handler(request: Request, exc: Exception):
         request_id = _request_id_from_request(request)
-        logger.error("Unhandled exception", exc_info=True, extra={"request_id": request_id, "path": str(request.url.path), "status_code": 500})
+        logger.error(
+            "Unhandled exception",
+            exc_info=True,
+            extra={"request_id": request_id, "path": str(request.url.path), "status_code": 500},
+        )
         return _StrictJSONResponse(
             status_code=500,
-            content={"status": "error", "error": f"{type(exc).__name__}: {str(exc)}", "path": str(request.url.path), "request_id": request_id, "ts_utc": datetime.now(timezone.utc).isoformat()},
+            content={
+                "status": "error",
+                "error": f"{type(exc).__name__}: {str(exc)}",
+                "path": str(request.url.path),
+                "request_id": request_id,
+                "ts_utc": datetime.now(timezone.utc).isoformat(),
+            },
         )
 
     _install_builtin_routes(app)
-    _install_custom_openapi(app)
 
     if bool(_SETTINGS.PRESTART_MOUNT_ROUTES):
         try:
@@ -1528,6 +1721,8 @@ def create_app() -> FastAPI:
             pass
         logger.info("Prestart route mounting disabled by PRESTART_MOUNT_ROUTES")
 
+    _install_custom_openapi(app)
+
     @app.get("/_debug/routes", include_in_schema=False)
     async def debug_routes(request: Request):
         if _SETTINGS.APP_ENV == "production" and bool(_SETTINGS.REQUIRE_AUTH) and not _auth_ok(request):
@@ -1537,11 +1732,15 @@ def create_app() -> FastAPI:
         route_sigs = sorted([f"{path} [{method}]" for path, method in _app_route_signature_set(request.app, include_builtin=True)])
         path_owners = _canonical_path_owners_from_routes(request.app)
         owner_mismatches = _canonical_path_owner_mismatches(path_owners)
+        openapi_schema = request.app.openapi()
 
         enriched_alias_presence = {
             "/v1/enriched/sheet-rows": "/v1/enriched/sheet-rows" in route_paths,
+            "/v1/enriched/sheet_rows": "/v1/enriched/sheet_rows" in route_paths,
             "/v1/enriched_quote/sheet-rows": "/v1/enriched_quote/sheet-rows" in route_paths,
+            "/v1/enriched_quote/sheet_rows": "/v1/enriched_quote/sheet_rows" in route_paths,
             "/v1/enriched-quote/sheet-rows": "/v1/enriched-quote/sheet-rows" in route_paths,
+            "/v1/enriched-quote/sheet_rows": "/v1/enriched-quote/sheet_rows" in route_paths,
         }
 
         return {
@@ -1554,6 +1753,8 @@ def create_app() -> FastAPI:
             "canonical_path_owners": path_owners,
             "canonical_path_owner_mismatches": owner_mismatches,
             "enriched_alias_presence": enriched_alias_presence,
+            "openapi_paths_count": len((openapi_schema.get("paths", {}) if isinstance(openapi_schema, dict) else {}) or {}),
+            "openapi_has_paths": bool((openapi_schema.get("paths", {}) if isinstance(openapi_schema, dict) else {}) or {}),
             **_runtime_meta(app),
         }
 
