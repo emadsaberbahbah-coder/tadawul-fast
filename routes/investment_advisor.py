@@ -2,39 +2,47 @@
 """
 routes/investment_advisor.py
 --------------------------------------------------------------------------------
-ADVANCED TOP10 / INVESTMENT ADVISOR ROUTER — v2.2.0
+ADVANCED TOP10 / INVESTMENT ADVISOR ROUTER — v5.1.0
 --------------------------------------------------------------------------------
-STABILITY-FIRST • TIMEOUT-GUARDED • SCHEMA-FIRST • TOP10-FIELD-HARDENED
-UNCONSTRAINED-REQUEST SAFE • FALLBACK SAFE • GATEWAY-ESCALATION RESISTANT
-SCHEMA-CHAIN v3.4.0 ALIGNED • TRADE-SETUP EQUIPPED
+CANONICAL ADVANCED OWNER • ADVANCED SHEET-ROWS OWNER • STABILITY-FIRST
+TIMEOUT-GUARDED • SCHEMA-FIRST • TOP10-FIELD-HARDENED • DELEGATION SAFE
+UNCONSTRAINED-REQUEST SAFE • FALLBACK SAFE • TRADE-SETUP EQUIPPED
 
-Why this revision (v2.2.0 vs v2.1.0)
---------------------------------------
-- FIX: _ensure_top10_keys_present now appends all 7 required Top10 fields.
-  v2.1.0 only backfilled 3 (top10_rank, selection_reason, criteria_snapshot).
-  v2.2.0 adds the 4 trade setup fields from top10_selector v4.9.0:
-    entry_price, stop_loss_suggested, take_profit_suggested, risk_reward_ratio.
-  Without this, schema_projection stripped these fields from every row even
-  when top10_selector had already computed them.
-
-- FIX: _apply_top10_field_backfill now initialises trade setup fields to None
-  if absent so schema projection never produces shorter-than-expected rows.
-
-- SAFE: _load_schema_defaults() already reads from schema_registry dynamically
-  and automatically picks up the v3.4.0 106-column Top10 schema. No changes
-  needed there.
-
-Preserved from v2.1.0 (no other behavioral changes):
-  All timeout guards, fallback retry logic, engine resolution, auth helpers,
-  criteria preparation, and route endpoint definitions.
+Why this revision (v5.1.0)
+--------------------------
+- FIX: adds canonical advanced family ownership for:
+    /v1/advanced
+    /v1/advanced/sheet-rows
+    /v1/advanced/sheet_rows
+- FIX: adds long-form aliases:
+    /v1/investment_advisor
+    /v1/investment_advisor/sheet-rows
+    /v1/investment_advisor/sheet_rows
+    /v1/investment-advisor
+    /v1/investment-advisor/sheet-rows
+    /v1/investment-advisor/sheet_rows
+- FIX: delegates advanced sheet-rows contract to routes.advanced_analysis
+  so /v1/advanced/* returns the same stable schema/data envelope as root schema.
+- KEEP: preserves your existing advanced Top10/advisor endpoints and logic:
+    /v1/advanced/top10-investments
+    /v1/advanced/top10
+    /v1/advanced/investment-advisor
+    /v1/advanced/advisor
+- KEEP: preserves timeout guards, fallback retry logic, engine resolution,
+  auth helpers, criteria preparation, and schema projection.
 
 Primary endpoints
 -----------------
+- GET  /v1/advanced
+- GET  /v1/advanced/health
+- GET  /v1/advanced/sheet-rows
+- GET  /v1/advanced/sheet_rows
+- POST /v1/advanced/sheet-rows
+- POST /v1/advanced/sheet_rows
 - POST /v1/advanced/top10-investments
 - POST /v1/advanced/top10
 - POST /v1/advanced/investment-advisor
 - POST /v1/advanced/advisor
-- GET  /v1/advanced/health
 """
 
 from __future__ import annotations
@@ -54,14 +62,17 @@ from fastapi.encoders import jsonable_encoder
 logger = logging.getLogger("routes.investment_advisor")
 logger.addHandler(logging.NullHandler())
 
-INVESTMENT_ADVISOR_VERSION = "2.2.0"
+INVESTMENT_ADVISOR_VERSION = "5.1.0"
 TOP10_PAGE_NAME = "Top_10_Investments"
 
-router = APIRouter(prefix="/v1/advanced", tags=["advanced"])
+# IMPORTANT:
+# No router prefix here. main.py controlled mounting filters by allowed prefixes
+# for this module, and we expose the exact canonical public paths explicitly.
+router = APIRouter(tags=["advanced", "investment-advisor"])
 
 
 # =============================================================================
-# Auth (best-effort, consistent with other routers)
+# Auth (best-effort, aligned with other routers)
 # =============================================================================
 try:
     from core.config import auth_ok, get_settings_cached, is_open_mode  # type: ignore
@@ -77,9 +88,10 @@ def _extract_auth_token(
     *,
     token_query: Optional[str],
     x_app_token: Optional[str],
+    x_api_key: Optional[str],
     authorization: Optional[str],
 ) -> str:
-    auth_token = (x_app_token or "").strip()
+    auth_token = (x_app_token or "").strip() or (x_api_key or "").strip()
 
     if authorization and authorization.strip().lower().startswith("bearer "):
         auth_token = authorization.strip().split(" ", 1)[1].strip()
@@ -88,7 +100,10 @@ def _extract_auth_token(
         allow_query = False
         try:
             settings = get_settings_cached()
-            allow_query = bool(getattr(settings, "allow_query_token", False))
+            allow_query = bool(
+                getattr(settings, "ALLOW_QUERY_TOKEN", False)
+                or getattr(settings, "allow_query_token", False)
+            )
         except Exception:
             allow_query = False
         if allow_query:
@@ -101,6 +116,7 @@ def _require_auth_or_401(
     *,
     token_query: Optional[str],
     x_app_token: Optional[str],
+    x_api_key: Optional[str],
     authorization: Optional[str],
 ) -> None:
     try:
@@ -115,18 +131,57 @@ def _require_auth_or_401(
     auth_token = _extract_auth_token(
         token_query=token_query,
         x_app_token=x_app_token,
+        x_api_key=x_api_key,
         authorization=authorization,
     )
 
-    if not auth_ok(
-        token=auth_token,
-        authorization=authorization,
-        headers={"X-APP-TOKEN": x_app_token, "Authorization": authorization},
-    ):
+    attempts = [
+        {
+            "token": auth_token,
+            "authorization": authorization,
+            "headers": {
+                "X-APP-TOKEN": x_app_token,
+                "X-API-Key": x_api_key,
+                "Authorization": authorization,
+            },
+        },
+        {
+            "token": auth_token,
+            "authorization": authorization,
+        },
+        {
+            "token": auth_token,
+        },
+    ]
+
+    ok = False
+    for kwargs in attempts:
+        try:
+            ok = bool(auth_ok(**kwargs))
+            break
+        except TypeError:
+            continue
+        except Exception:
+            ok = False
+            break
+
+    if not ok:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid token",
         )
+
+
+# =============================================================================
+# Delegate import for advanced sheet-rows
+# =============================================================================
+try:
+    from routes.advanced_analysis import _run_advanced_sheet_rows_impl  # type: ignore
+except Exception as e:
+    _run_advanced_sheet_rows_impl = None  # type: ignore
+    _ADVANCED_ANALYSIS_IMPORT_ERROR = f"{type(e).__name__}: {e}"
+else:
+    _ADVANCED_ANALYSIS_IMPORT_ERROR = ""
 
 
 # =============================================================================
@@ -425,8 +480,6 @@ def _apply_top10_field_backfill(
         if "criteria_snapshot" in keys and _is_blank(r.get("criteria_snapshot")) and criteria_snapshot is not None:
             r["criteria_snapshot"] = criteria_snapshot
 
-        # v2.2.0: initialise trade setup fields to None if absent
-        # so schema_projection never produces shorter-than-expected rows
         for _ts_key in (
             "entry_price",
             "stop_loss_suggested",
@@ -456,23 +509,17 @@ def _ensure_schema_projection(rows: List[Dict[str, Any]], keys: List[str]) -> Li
 def _ensure_top10_keys_present(
     keys: List[str], headers: List[str]
 ) -> Tuple[List[str], List[str]]:
-    """
-    v2.2.0: appends all 7 required Top10 fields if absent.
-    v2.1.0 only appended 3 (top10_rank, selection_reason, criteria_snapshot).
-    v2.2.0 adds 4 trade setup fields from top10_selector v4.9.0.
-    """
-    # (key, display_header) pairs — order matters for column alignment
     extras = [
-        ("top10_rank",            "Top 10 Rank"),
-        ("selection_reason",      "Selection Reason"),
-        ("criteria_snapshot",     "Criteria Snapshot"),
-        ("entry_price",           "Entry Price"),            # v2.2.0
-        ("stop_loss_suggested",   "Stop Loss (AI)"),        # v2.2.0
-        ("take_profit_suggested", "Take Profit (AI)"),      # v2.2.0
-        ("risk_reward_ratio",     "Risk/Reward"),           # v2.2.0
+        ("top10_rank", "Top 10 Rank"),
+        ("selection_reason", "Selection Reason"),
+        ("criteria_snapshot", "Criteria Snapshot"),
+        ("entry_price", "Entry Price"),
+        ("stop_loss_suggested", "Stop Loss (AI)"),
+        ("take_profit_suggested", "Take Profit (AI)"),
+        ("risk_reward_ratio", "Risk/Reward"),
     ]
 
-    out_keys    = list(keys    or [])
+    out_keys = list(keys or [])
     out_headers = list(headers or [])
 
     for key, header in extras:
@@ -498,9 +545,9 @@ def _load_schema_defaults() -> Tuple[List[str], List[str]]:
                 continue
             spec = get_sheet_spec(TOP10_PAGE_NAME)
             cols = getattr(spec, "columns", None) or []
-            keys    = [getattr(c, "key",    "") for c in cols]
+            keys = [getattr(c, "key", "") for c in cols]
             headers = [getattr(c, "header", "") for c in cols]
-            keys    = [k for k in keys    if isinstance(k, str) and k]
+            keys = [k for k in keys if isinstance(k, str) and k]
             headers = [h for h in headers if isinstance(h, str) and h]
             if keys and headers:
                 return headers, keys
@@ -518,16 +565,16 @@ def _schema_only_payload(
     meta: Dict[str, Any],
 ) -> Dict[str, Any]:
     return {
-        "status":      "partial",
-        "page":        TOP10_PAGE_NAME,
-        "sheet":       TOP10_PAGE_NAME,
-        "headers":     headers,
-        "keys":        keys,
-        "rows":        [],
+        "status": "partial",
+        "page": TOP10_PAGE_NAME,
+        "sheet": TOP10_PAGE_NAME,
+        "headers": headers,
+        "keys": keys,
+        "rows": [],
         "rows_matrix": [] if (include_matrix and keys) else None,
-        "version":     INVESTMENT_ADVISOR_VERSION,
-        "request_id":  request_id,
-        "meta":        meta,
+        "version": INVESTMENT_ADVISOR_VERSION,
+        "request_id": request_id,
+        "meta": meta,
     }
 
 
@@ -537,27 +584,32 @@ def _normalize_selector_payload(
     criteria_used: Dict[str, Any],
     eff_limit: int,
 ) -> Tuple[List[str], List[str], List[Dict[str, Any]], Dict[str, Any], str]:
-    headers    = payload.get("headers") or []
-    keys       = payload.get("keys")    or []
-    rows       = payload.get("rows")    or []
+    headers = payload.get("headers") or []
+    keys = payload.get("keys") or []
+    rows = payload.get("rows") or []
     status_out = _s(payload.get("status")) or "success"
 
-    if not isinstance(headers, list): headers = []
-    if not isinstance(keys,    list): keys    = []
-    if not isinstance(rows,    list): rows    = []
+    if not isinstance(headers, list):
+        headers = []
+    if not isinstance(keys, list):
+        keys = []
+    if not isinstance(rows, list):
+        rows = []
 
     if not headers or not keys:
         schema_headers, schema_keys = _load_schema_defaults()
-        if not headers: headers = schema_headers
-        if not keys:    keys    = schema_keys
+        if not headers:
+            headers = schema_headers
+        if not keys:
+            keys = schema_keys
 
     keys, headers = _ensure_top10_keys_present(list(keys), list(headers))
 
     dict_rows = [dict(r) for r in rows if isinstance(r, dict)]
     dict_rows = _apply_top10_field_backfill(dict_rows, keys=keys, criteria=criteria_used)
     dict_rows = _rank_rows_in_order(dict_rows)
-    norm_rows  = _ensure_schema_projection(dict_rows, keys)
-    norm_rows  = norm_rows[:eff_limit]
+    norm_rows = _ensure_schema_projection(dict_rows, keys)
+    norm_rows = norm_rows[:eff_limit]
 
     meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
     return headers, keys, norm_rows, dict(meta), status_out
@@ -569,7 +621,7 @@ def _load_top10_builder() -> Any:
 
 
 def _effective_limit(body: Dict[str, Any], limit_q: Optional[int]) -> int:
-    max_limit     = max(1, _env_int("ADV_TOP10_MAX_LIMIT",     50))
+    max_limit = max(1, _env_int("ADV_TOP10_MAX_LIMIT", 50))
     default_limit = max(1, _env_int("ADV_TOP10_DEFAULT_LIMIT", 10))
 
     if isinstance(limit_q, int):
@@ -584,31 +636,21 @@ def _effective_limit(body: Dict[str, Any], limit_q: Optional[int]) -> int:
     return max(1, min(max_limit, int(eff)))
 
 
-def _is_request_unconstrained(criteria: Dict[str, Any]) -> bool:
-    pages  = _normalize_list(
-        criteria.get("pages_selected") or criteria.get("pages") or criteria.get("selected_pages")
-    )
-    direct = _normalize_list(
-        criteria.get("direct_symbols") or criteria.get("symbols") or criteria.get("tickers")
-    )
-    return (not pages) and (not direct)
-
-
 def _prepare_effective_criteria(
     body: Dict[str, Any], eff_limit: int
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    crit           = _flatten_criteria(body or {})
-    pages          = _normalize_list(crit.get("pages_selected") or crit.get("pages") or crit.get("selected_pages"))
+    crit = _flatten_criteria(body or {})
+    pages = _normalize_list(crit.get("pages_selected") or crit.get("pages") or crit.get("selected_pages"))
     direct_symbols = _normalize_list(crit.get("direct_symbols") or crit.get("symbols") or crit.get("tickers"))
 
     request_unconstrained = (not pages) and (not direct_symbols)
-    pages_explicit        = bool(pages)
+    pages_explicit = bool(pages)
 
     if request_unconstrained:
         pages = _env_csv("ADV_TOP10_DEFAULT_PAGES", ["Market_Leaders", "Global_Markets"])
         crit["pages_selected"] = pages
 
-    max_pages     = max(1, _env_int("ADV_TOP10_MAX_PAGES", 5))
+    max_pages = max(1, _env_int("ADV_TOP10_MAX_PAGES", 5))
     pages_trimmed = False
     if pages and len(pages) > max_pages:
         pages = pages[:max_pages]
@@ -634,11 +676,11 @@ def _prepare_effective_criteria(
 
     prep_meta = {
         "request_unconstrained": request_unconstrained,
-        "pages_explicit":        pages_explicit,
-        "pages_effective":       list(pages),
-        "direct_symbols_count":  len(direct_symbols),
-        "pages_trimmed":         pages_trimmed,
-        "allow_row_fallback":    True,
+        "pages_explicit": pages_explicit,
+        "pages_effective": list(pages),
+        "direct_symbols_count": len(direct_symbols),
+        "pages_trimmed": pages_trimmed,
+        "allow_row_fallback": True,
     }
 
     return crit, prep_meta
@@ -648,7 +690,7 @@ def _narrow_criteria_for_fallback(criteria: Dict[str, Any], eff_limit: int) -> D
     narrowed = copy.deepcopy(criteria)
 
     fallback_pages_cap = max(1, _env_int("ADV_TOP10_FALLBACK_MAX_PAGES", 2))
-    fallback_top_n     = max(1, min(eff_limit, _env_int("ADV_TOP10_FALLBACK_TOP_N", min(3, eff_limit))))
+    fallback_top_n = max(1, min(eff_limit, _env_int("ADV_TOP10_FALLBACK_TOP_N", min(3, eff_limit))))
 
     direct_symbols = _normalize_list(
         narrowed.get("direct_symbols") or narrowed.get("symbols") or narrowed.get("tickers")
@@ -665,7 +707,7 @@ def _narrow_criteria_for_fallback(criteria: Dict[str, Any], eff_limit: int) -> D
             pages = _env_csv("ADV_TOP10_DEFAULT_PAGES", ["Market_Leaders"])
         pages = pages[:fallback_pages_cap]
         narrowed["pages_selected"] = pages
-        narrowed["top_n"]          = fallback_top_n
+        narrowed["top_n"] = fallback_top_n
 
     narrowed["enrich_final"] = False
     return narrowed
@@ -690,29 +732,257 @@ async def _run_selector_with_timeout(
 
 
 # =============================================================================
-# Health
+# Advanced sheet-rows delegation
 # =============================================================================
-@router.get("/health")
+def _build_get_body(
+    *,
+    page: str,
+    sheet: str,
+    sheet_name: str,
+    name: str,
+    tab: str,
+    symbols: str,
+    tickers: str,
+    direct_symbols: str,
+    symbol: str,
+    ticker: str,
+    code: str,
+    requested_symbol: str,
+    limit: Optional[int],
+    offset: Optional[int],
+    top_n: Optional[int],
+    schema_only: Optional[bool],
+    headers_only: Optional[bool],
+) -> Dict[str, Any]:
+    body: Dict[str, Any] = {}
+    for k, v in {
+        "page": page,
+        "sheet": sheet,
+        "sheet_name": sheet_name,
+        "name": name,
+        "tab": tab,
+        "symbols": symbols,
+        "tickers": tickers,
+        "direct_symbols": direct_symbols,
+        "symbol": symbol,
+        "ticker": ticker,
+        "code": code,
+        "requested_symbol": requested_symbol,
+        "limit": limit,
+        "offset": offset,
+        "top_n": top_n,
+        "schema_only": schema_only,
+        "headers_only": headers_only,
+    }.items():
+        if v not in (None, ""):
+            body[k] = v
+    return body
+
+
+async def _delegate_advanced_sheet_rows(
+    *,
+    request: Request,
+    body: Dict[str, Any],
+    mode: str = "",
+    include_matrix_q: Optional[bool] = None,
+    token: Optional[str] = None,
+    x_app_token: Optional[str] = None,
+    x_api_key: Optional[str] = None,
+    authorization: Optional[str] = None,
+    x_request_id: Optional[str] = None,
+):
+    if _run_advanced_sheet_rows_impl is None:
+        return {
+            "status": "error",
+            "error": "advanced_analysis delegate unavailable",
+            "detail": _ADVANCED_ANALYSIS_IMPORT_ERROR,
+            "route_family": "advanced",
+            "version": INVESTMENT_ADVISOR_VERSION,
+        }
+
+    payload = await _run_advanced_sheet_rows_impl(
+        request=request,
+        body=body,
+        mode=mode,
+        include_matrix_q=include_matrix_q,
+        token=token,
+        x_app_token=x_app_token,
+        x_api_key=x_api_key,
+        authorization=authorization,
+        x_request_id=x_request_id,
+    )
+
+    if isinstance(payload, dict):
+        payload.setdefault("meta", {})
+        try:
+            payload["meta"]["advanced_delegate"] = "routes.advanced_analysis._run_advanced_sheet_rows_impl"
+            payload["meta"]["advanced_family_owner"] = "routes.investment_advisor"
+        except Exception:
+            pass
+        payload["route_family"] = "advanced"
+        payload["advanced_owner"] = "routes.investment_advisor"
+
+    return payload
+
+
+# =============================================================================
+# Root / health
+# =============================================================================
+@router.get("/v1/advanced")
+@router.get("/v1/investment_advisor")
+@router.get("/v1/investment-advisor")
+async def advanced_root() -> Dict[str, Any]:
+    return {
+        "status": "ok",
+        "service": "investment_advisor",
+        "version": INVESTMENT_ADVISOR_VERSION,
+        "delegate_available": _run_advanced_sheet_rows_impl is not None,
+        "canonical_paths": [
+            "/v1/advanced",
+            "/v1/advanced/sheet-rows",
+            "/v1/advanced/sheet_rows",
+        ],
+        "alias_paths": [
+            "/v1/investment_advisor",
+            "/v1/investment_advisor/sheet-rows",
+            "/v1/investment_advisor/sheet_rows",
+            "/v1/investment-advisor",
+            "/v1/investment-advisor/sheet-rows",
+            "/v1/investment-advisor/sheet_rows",
+        ],
+        "top10_paths": [
+            "/v1/advanced/top10-investments",
+            "/v1/advanced/top10",
+            "/v1/advanced/investment-advisor",
+            "/v1/advanced/advisor",
+        ],
+    }
+
+
+@router.get("/v1/advanced/health")
+@router.get("/v1/investment_advisor/health")
+@router.get("/v1/investment-advisor/health")
 async def advanced_health(request: Request) -> Dict[str, Any]:
     engine = await _get_engine(request)
     return jsonable_encoder(
         {
-            "status":         "ok" if engine else "degraded",
-            "version":        INVESTMENT_ADVISOR_VERSION,
+            "status": "ok" if engine else "degraded",
+            "version": INVESTMENT_ADVISOR_VERSION,
             "engine_available": bool(engine),
-            "engine_type":    type(engine).__name__ if engine else "none",
-            "service":        "advanced_top10",
+            "engine_type": type(engine).__name__ if engine else "none",
+            "service": "advanced_top10",
+            "delegate_available": _run_advanced_sheet_rows_impl is not None,
+            "path": str(getattr(getattr(request, "url", None), "path", "")),
         }
     )
 
 
 # =============================================================================
-# Main endpoint
+# Advanced sheet-rows endpoints
 # =============================================================================
-@router.post("/top10-investments")
-@router.post("/top10")
-@router.post("/investment-advisor")
-@router.post("/advisor")
+@router.get("/v1/advanced/sheet-rows")
+@router.get("/v1/advanced/sheet_rows")
+@router.get("/v1/investment_advisor/sheet-rows")
+@router.get("/v1/investment_advisor/sheet_rows")
+@router.get("/v1/investment-advisor/sheet-rows")
+@router.get("/v1/investment-advisor/sheet_rows")
+async def advanced_sheet_rows_get(
+    request: Request,
+    page: str = Query(default=""),
+    sheet: str = Query(default=""),
+    sheet_name: str = Query(default=""),
+    name: str = Query(default=""),
+    tab: str = Query(default=""),
+    symbols: str = Query(default=""),
+    tickers: str = Query(default=""),
+    direct_symbols: str = Query(default=""),
+    symbol: str = Query(default=""),
+    ticker: str = Query(default=""),
+    code: str = Query(default=""),
+    requested_symbol: str = Query(default=""),
+    limit: Optional[int] = Query(default=None),
+    offset: Optional[int] = Query(default=None),
+    top_n: Optional[int] = Query(default=None),
+    mode: str = Query(default=""),
+    include_matrix_q: Optional[bool] = Query(default=None, alias="include_matrix"),
+    schema_only: Optional[bool] = Query(default=None),
+    headers_only: Optional[bool] = Query(default=None),
+    token: Optional[str] = Query(default=None),
+    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+):
+    body = _build_get_body(
+        page=page,
+        sheet=sheet,
+        sheet_name=sheet_name,
+        name=name,
+        tab=tab,
+        symbols=symbols,
+        tickers=tickers,
+        direct_symbols=direct_symbols,
+        symbol=symbol,
+        ticker=ticker,
+        code=code,
+        requested_symbol=requested_symbol,
+        limit=limit,
+        offset=offset,
+        top_n=top_n,
+        schema_only=schema_only,
+        headers_only=headers_only,
+    )
+
+    return await _delegate_advanced_sheet_rows(
+        request=request,
+        body=body,
+        mode=mode,
+        include_matrix_q=include_matrix_q,
+        token=token,
+        x_app_token=x_app_token,
+        x_api_key=x_api_key,
+        authorization=authorization,
+        x_request_id=x_request_id,
+    )
+
+
+@router.post("/v1/advanced/sheet-rows")
+@router.post("/v1/advanced/sheet_rows")
+@router.post("/v1/investment_advisor/sheet-rows")
+@router.post("/v1/investment_advisor/sheet_rows")
+@router.post("/v1/investment-advisor/sheet-rows")
+@router.post("/v1/investment-advisor/sheet_rows")
+async def advanced_sheet_rows_post(
+    request: Request,
+    body: Dict[str, Any] = Body(default_factory=dict),
+    mode: str = Query(default=""),
+    include_matrix_q: Optional[bool] = Query(default=None, alias="include_matrix"),
+    token: Optional[str] = Query(default=None),
+    x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
+    authorization: Optional[str] = Header(default=None, alias="Authorization"),
+    x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
+):
+    return await _delegate_advanced_sheet_rows(
+        request=request,
+        body=body,
+        mode=mode,
+        include_matrix_q=include_matrix_q,
+        token=token,
+        x_app_token=x_app_token,
+        x_api_key=x_api_key,
+        authorization=authorization,
+        x_request_id=x_request_id,
+    )
+
+
+# =============================================================================
+# Existing Top10 endpoints
+# =============================================================================
+@router.post("/v1/advanced/top10-investments")
+@router.post("/v1/advanced/top10")
+@router.post("/v1/advanced/investment-advisor")
+@router.post("/v1/advanced/advisor")
 async def advanced_top10_investments(
     request: Request,
     body: Dict[str, Any] = Body(default_factory=dict),
@@ -722,18 +992,19 @@ async def advanced_top10_investments(
     schema_only: Optional[bool] = Query(default=None, description="Return schema with no rows"),
     token: Optional[str] = Query(default=None, description="Auth token (query only if allowed)"),
     x_app_token: Optional[str] = Header(default=None, alias="X-APP-TOKEN"),
+    x_api_key: Optional[str] = Header(default=None, alias="X-API-Key"),
     authorization: Optional[str] = Header(default=None, alias="Authorization"),
     x_request_id: Optional[str] = Header(default=None, alias="X-Request-ID"),
 ) -> Dict[str, Any]:
-    t0         = time.perf_counter()
-    stages:    Dict[str, float] = {}
+    t0 = time.perf_counter()
+    stages: Dict[str, float] = {}
     request_id = x_request_id or getattr(request.state, "request_id", None) or str(uuid.uuid4())
 
-    # ---------------- Auth ----------------
     s0 = time.perf_counter()
     _require_auth_or_401(
         token_query=token,
         x_app_token=x_app_token,
+        x_api_key=x_api_key,
         authorization=authorization,
     )
     stages["auth_ms"] = round((time.perf_counter() - s0) * 1000.0, 3)
@@ -751,22 +1022,21 @@ async def advanced_top10_investments(
     schema_headers, schema_keys = _load_schema_defaults()
     schema_keys, schema_headers = _ensure_top10_keys_present(schema_keys, schema_headers)
 
-    # ---------------- Engine ----------------
-    s1     = time.perf_counter()
+    s1 = time.perf_counter()
     engine = await _get_engine(request)
     stages["engine_ms"] = round((time.perf_counter() - s1) * 1000.0, 3)
 
     if schema_only_final:
         meta = {
             "route_version": INVESTMENT_ADVISOR_VERSION,
-            "request_id":    request_id,
-            "limit":         eff_limit,
-            "mode":          mode or "",
+            "request_id": request_id,
+            "limit": eff_limit,
+            "mode": mode or "",
             "schema_aligned": bool(schema_keys),
-            "build_status":  "SCHEMA_ONLY",
-            "dispatch":      "advanced_top10",
+            "build_status": "SCHEMA_ONLY",
+            "dispatch": "advanced_top10",
             "stage_durations_ms": stages,
-            "duration_ms":   round((time.perf_counter() - t0) * 1000.0, 3),
+            "duration_ms": round((time.perf_counter() - t0) * 1000.0, 3),
         }
         return jsonable_encoder(
             _schema_only_payload(
@@ -781,15 +1051,15 @@ async def advanced_top10_investments(
     if engine is None:
         meta = {
             "route_version": INVESTMENT_ADVISOR_VERSION,
-            "request_id":    request_id,
-            "limit":         eff_limit,
-            "mode":          mode or "",
+            "request_id": request_id,
+            "limit": eff_limit,
+            "mode": mode or "",
             "schema_aligned": bool(schema_keys),
-            "build_status":  "DEGRADED",
-            "dispatch":      "advanced_top10",
-            "warning":       "engine_unavailable",
+            "build_status": "DEGRADED",
+            "dispatch": "advanced_top10",
+            "warning": "engine_unavailable",
             "stage_durations_ms": stages,
-            "duration_ms":   round((time.perf_counter() - t0) * 1000.0, 3),
+            "duration_ms": round((time.perf_counter() - t0) * 1000.0, 3),
         }
         return jsonable_encoder(
             _schema_only_payload(
@@ -801,29 +1071,28 @@ async def advanced_top10_investments(
             )
         )
 
-    # ---------------- Builder import ----------------
     s2 = time.perf_counter()
     try:
-        build_top10_rows    = _load_top10_builder()
+        build_top10_rows = _load_top10_builder()
         builder_import_error = None
     except Exception as e:
-        build_top10_rows    = None
+        build_top10_rows = None
         builder_import_error = f"{type(e).__name__}: {e}"
     stages["builder_import_ms"] = round((time.perf_counter() - s2) * 1000.0, 3)
 
     if build_top10_rows is None:
         meta = {
             "route_version": INVESTMENT_ADVISOR_VERSION,
-            "request_id":    request_id,
-            "limit":         eff_limit,
-            "mode":          mode or "",
+            "request_id": request_id,
+            "limit": eff_limit,
+            "mode": mode or "",
             "schema_aligned": bool(schema_keys),
-            "build_status":  "DEGRADED",
-            "dispatch":      "advanced_top10",
-            "warning":       "top10_builder_unavailable",
-            "detail":        builder_import_error,
+            "build_status": "DEGRADED",
+            "dispatch": "advanced_top10",
+            "warning": "top10_builder_unavailable",
+            "detail": builder_import_error,
             "stage_durations_ms": stages,
-            "duration_ms":   round((time.perf_counter() - t0) * 1000.0, 3),
+            "duration_ms": round((time.perf_counter() - t0) * 1000.0, 3),
         }
         return jsonable_encoder(
             _schema_only_payload(
@@ -835,21 +1104,19 @@ async def advanced_top10_investments(
             )
         )
 
-    # ---------------- Criteria preparation ----------------
     s3 = time.perf_counter()
     effective_criteria, prep_meta = _prepare_effective_criteria(body or {}, eff_limit)
     stages["criteria_prepare_ms"] = round((time.perf_counter() - s3) * 1000.0, 3)
 
-    primary_timeout_sec  = max(3.0, _env_float("ADV_TOP10_TIMEOUT_SEC",          45.0))
+    primary_timeout_sec = max(3.0, _env_float("ADV_TOP10_TIMEOUT_SEC", 45.0))
     fallback_timeout_sec = max(2.0, _env_float("ADV_TOP10_FALLBACK_TIMEOUT_SEC", 15.0))
 
     selected_payload: Optional[Dict[str, Any]] = None
-    selected_criteria  = copy.deepcopy(effective_criteria)
-    fallback_used      = False
-    fallback_reason    = ""
+    selected_criteria = copy.deepcopy(effective_criteria)
+    fallback_used = False
+    fallback_reason = ""
     warnings: List[str] = []
 
-    # ---------------- Primary run ----------------
     s4 = time.perf_counter()
     try:
         payload_primary = await _run_selector_with_timeout(
@@ -864,32 +1131,30 @@ async def advanced_top10_investments(
             raise ValueError("selector returned non-dict payload")
         selected_payload = payload_primary
     except asyncio.TimeoutError:
-        fallback_used   = True
+        fallback_used = True
         fallback_reason = f"primary_timeout_{primary_timeout_sec}s"
         warnings.append("primary_selector_timeout")
     except Exception as e:
-        fallback_used   = True
+        fallback_used = True
         fallback_reason = f"primary_error:{type(e).__name__}"
         warnings.append(f"primary_selector_error:{type(e).__name__}:{e}")
     stages["primary_selector_ms"] = round((time.perf_counter() - s4) * 1000.0, 3)
 
-    # If primary returned empty rows on an unconstrained request, narrow automatically
     try:
         if isinstance(selected_payload, dict):
             rows_candidate = selected_payload.get("rows")
             if prep_meta.get("request_unconstrained") and (
                 not isinstance(rows_candidate, list) or len(rows_candidate) == 0
             ):
-                fallback_used    = True
-                fallback_reason  = "primary_empty_unconstrained"
+                fallback_used = True
+                fallback_reason = "primary_empty_unconstrained"
                 selected_payload = None
                 warnings.append("primary_empty_for_unconstrained_request")
     except Exception:
         pass
 
-    # ---------------- Fallback run ----------------
     if selected_payload is None:
-        s5               = time.perf_counter()
+        s5 = time.perf_counter()
         narrowed_criteria = _narrow_criteria_for_fallback(effective_criteria, eff_limit)
         try:
             payload_fallback = await _run_selector_with_timeout(
@@ -902,7 +1167,7 @@ async def advanced_top10_investments(
             )
             if not isinstance(payload_fallback, dict):
                 raise ValueError("fallback selector returned non-dict payload")
-            selected_payload  = payload_fallback
+            selected_payload = payload_fallback
             selected_criteria = narrowed_criteria
         except asyncio.TimeoutError:
             warnings.append("fallback_selector_timeout")
@@ -918,28 +1183,27 @@ async def advanced_top10_investments(
             )
         stages["fallback_selector_ms"] = round((time.perf_counter() - s5) * 1000.0, 3)
 
-    # ---------------- Final safe output ----------------
     if not isinstance(selected_payload, dict):
         meta = {
-            "route_version":        INVESTMENT_ADVISOR_VERSION,
-            "request_id":           request_id,
-            "limit":                eff_limit,
-            "mode":                 mode or "",
-            "schema_aligned":       bool(schema_keys),
-            "build_status":         "DEGRADED",
-            "dispatch":             "advanced_top10",
+            "route_version": INVESTMENT_ADVISOR_VERSION,
+            "request_id": request_id,
+            "limit": eff_limit,
+            "mode": mode or "",
+            "schema_aligned": bool(schema_keys),
+            "build_status": "DEGRADED",
+            "dispatch": "advanced_top10",
             "request_unconstrained": prep_meta.get("request_unconstrained", False),
-            "pages_explicit":       prep_meta.get("pages_explicit",         False),
-            "pages_effective":      prep_meta.get("pages_effective",        []),
-            "direct_symbols_count": prep_meta.get("direct_symbols_count",   0),
-            "fallback_used":        fallback_used,
-            "fallback_reason":      fallback_reason,
-            "criteria_used":        _jsonable_snapshot(selected_criteria),
-            "warnings":             warnings,
-            "stage_durations_ms":   stages,
-            "engine_present":       True,
-            "engine_type":          type(engine).__name__,
-            "duration_ms":          round((time.perf_counter() - t0) * 1000.0, 3),
+            "pages_explicit": prep_meta.get("pages_explicit", False),
+            "pages_effective": prep_meta.get("pages_effective", []),
+            "direct_symbols_count": prep_meta.get("direct_symbols_count", 0),
+            "fallback_used": fallback_used,
+            "fallback_reason": fallback_reason,
+            "criteria_used": _jsonable_snapshot(selected_criteria),
+            "warnings": warnings,
+            "stage_durations_ms": stages,
+            "engine_present": True,
+            "engine_type": type(engine).__name__,
+            "duration_ms": round((time.perf_counter() - t0) * 1000.0, 3),
         }
         return jsonable_encoder(
             _schema_only_payload(
@@ -951,7 +1215,6 @@ async def advanced_top10_investments(
             )
         )
 
-    # ---------------- Normalize selector payload ----------------
     s6 = time.perf_counter()
     headers, keys, norm_rows, meta_in, status_out = _normalize_selector_payload(
         selected_payload,
@@ -964,13 +1227,13 @@ async def advanced_top10_investments(
     if not build_status:
         build_status = "OK" if norm_rows else "WARN"
 
-    meta_warnings   = meta_in.get("warnings")
+    meta_warnings = meta_in.get("warnings")
     merged_warnings: List[str] = []
     if isinstance(meta_warnings, list):
         merged_warnings.extend([_s(x) for x in meta_warnings if _s(x)])
     merged_warnings.extend([_s(x) for x in warnings if _s(x)])
 
-    seen_warn:      set       = set()
+    seen_warn: set = set()
     dedup_warnings: List[str] = []
     for w in merged_warnings:
         if w and w not in seen_warn:
@@ -980,42 +1243,42 @@ async def advanced_top10_investments(
     meta = dict(meta_in)
     meta.update(
         {
-            "route_version":        INVESTMENT_ADVISOR_VERSION,
-            "request_id":           request_id,
-            "limit":                eff_limit,
-            "mode":                 mode or "",
-            "duration_ms":          round((time.perf_counter() - t0) * 1000.0, 3),
-            "schema_aligned":       bool(keys),
+            "route_version": INVESTMENT_ADVISOR_VERSION,
+            "request_id": request_id,
+            "limit": eff_limit,
+            "mode": mode or "",
+            "duration_ms": round((time.perf_counter() - t0) * 1000.0, 3),
+            "schema_aligned": bool(keys),
             "top10_fields_backfilled": True,
-            "criteria_used":        _jsonable_snapshot(selected_criteria),
+            "criteria_used": _jsonable_snapshot(selected_criteria),
             "request_unconstrained": prep_meta.get("request_unconstrained", False),
-            "pages_explicit":       prep_meta.get("pages_explicit",         False),
-            "pages_effective":      prep_meta.get("pages_effective",        []),
-            "direct_symbols_count": prep_meta.get("direct_symbols_count",   0),
-            "pages_trimmed":        prep_meta.get("pages_trimmed",          False),
-            "allow_row_fallback":   prep_meta.get("allow_row_fallback",     True),
-            "fallback_used":        fallback_used,
-            "fallback_reason":      fallback_reason,
-            "engine_present":       True,
-            "engine_type":          type(engine).__name__,
-            "warnings":             dedup_warnings,
-            "build_status":         build_status,
-            "dispatch":             _s(meta_in.get("dispatch")) or "advanced_top10",
-            "stage_durations_ms":   stages,
+            "pages_explicit": prep_meta.get("pages_explicit", False),
+            "pages_effective": prep_meta.get("pages_effective", []),
+            "direct_symbols_count": prep_meta.get("direct_symbols_count", 0),
+            "pages_trimmed": prep_meta.get("pages_trimmed", False),
+            "allow_row_fallback": prep_meta.get("allow_row_fallback", True),
+            "fallback_used": fallback_used,
+            "fallback_reason": fallback_reason,
+            "engine_present": True,
+            "engine_type": type(engine).__name__,
+            "warnings": dedup_warnings,
+            "build_status": build_status,
+            "dispatch": _s(meta_in.get("dispatch")) or "advanced_top10",
+            "stage_durations_ms": stages,
         }
     )
 
     response = {
-        "status":      status_out or ("success" if norm_rows else "partial"),
-        "page":        TOP10_PAGE_NAME,
-        "sheet":       TOP10_PAGE_NAME,
-        "headers":     headers,
-        "keys":        keys,
-        "rows":        norm_rows,
+        "status": status_out or ("success" if norm_rows else "partial"),
+        "page": TOP10_PAGE_NAME,
+        "sheet": TOP10_PAGE_NAME,
+        "headers": headers,
+        "keys": keys,
+        "rows": norm_rows,
         "rows_matrix": _rows_to_matrix(norm_rows, keys) if (include_matrix_final and keys) else None,
-        "version":     INVESTMENT_ADVISOR_VERSION,
-        "request_id":  request_id,
-        "meta":        meta,
+        "version": INVESTMENT_ADVISOR_VERSION,
+        "request_id": request_id,
+        "meta": meta,
     }
 
     return jsonable_encoder(response)
