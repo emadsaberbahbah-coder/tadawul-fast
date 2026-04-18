@@ -2,37 +2,37 @@
 """
 core/data_engine.py
 ================================================================================
-Enterprise Data Engine -- v6.8.0 (ALIGNED / SAFE / PROD-HARDENED / SHEET-ROWS+)
+Enterprise Data Engine -- v6.9.0 (ALIGNED / SAFE / PROD-HARDENED / SHEET-ROWS++)
 ================================================================================
 
 Primary goals (this revision)
-- ✅ Keep v6.5.0 hardening (OTel correctness, async correctness, hygiene-safe debug, perf timestamps)
-- ✅ Sheet Rows API added in v6.7.0: get_sheet_rows(), get_sheet_rows_sync(),
-  DataEngine.get_sheet_rows(). Aligned with routes/analysis_sheet_rows.py,
-  routes/advanced_sheet_rows.py, core/data_engine_v2.py.
-- ✅ SPECIAL DISPATCH: Insights_Analysis / Top_10_Investments / Data_Dictionary
-  routed to V2 engine special builders (or schema-safe fallback).
-- ✅ Schema projection: normalize & project to schema keys as adapter safety net.
+- ✅ Keep v6.8.0 hardening and pct-fraction correctness
+- ✅ FIX: generic sheet-rows adapter now tries MODULE-LEVEL V2 sheet-rows functions,
+  not only engine methods / special builders
+- ✅ FIX: adapter now provides richer normalized sheet-rows contract:
+  headers/display_headers/sheet_headers/column_headers/keys/columns/fields/
+  rows/row_objects/data/items/records/quotes/rows_matrix/matrix/count
+- ✅ FIX: when sheet builders are unavailable for instrument pages, adapter can
+  build NON-EMPTY rows from live quote batch fallback instead of schema-only empty rows
+- ✅ Keep special dispatch for Insights_Analysis / Top_10_Investments / Data_Dictionary
+- ✅ Keep schema projection as final safety net
 
-v6.8.0 changes vs v6.7.0
---------------------------
-FIX: dtype=pct fraction violation in EmergencyDataRescuer and StubUnifiedQuote.finalize().
-  v6.7.0 stored percent_change / change_pct as percent POINTS (e.g. 1.42 for 1.42%).
-  The schema contract (schema_registry v3.0.0) requires dtype=pct fields to be stored
-  as FRACTIONS (0.0142 for 1.42%). This caused a 100x magnitude error on every rescued
-  or stub quote's percent_change field.
+Why v6.9.0
+----------
+Your routing layer is already fixed, but live advanced routes still reported:
+  source = core.data_engine.get_sheet_rows
+  error  = Local non-empty fallback emitted after upstream degradation
 
-  EmergencyDataRescuer: pct = (change / pc) * 100.0  ->  pct = change / pc
-  StubUnifiedQuote.finalize: (price/prev - 1) * 100.0  ->  price/prev - 1
+That means the sheet-rows adapter was not surfacing usable upstream rows for
+generic pages. In v6.8.0, generic dispatch only tried:
+  1) special builders for special pages
+  2) engine.get_sheet_rows / sheet_rows / build_sheet_rows
+  3) schema-only fallback
 
-FIX: schema_registry import hardened with multi-path fallback.
-  v6.7.0: from core.sheets.schema_registry import get_sheet_spec (single path)
-  v6.8.0: try core.sheets.schema_registry -> core.schema_registry -> schema_registry
+It did NOT try module-level V2 generic sheet-rows functions for normal pages,
+and it did not attempt a quote-batch row fallback for instrument pages.
 
-Notes on ratio/% correctness (v6.8.0 FIXED)
-- dtype=pct fields (percent_change, change_pct) are stored as FRACTIONS (0.0142 = 1.42%).
-- v6.7.0 incorrectly stored these as percent points (* 100), violating the schema contract.
-- v6.8.0 fix: EmergencyDataRescuer and StubUnifiedQuote.finalize() now store fractions.
+v6.9.0 fixes both.
 """
 
 from __future__ import annotations
@@ -52,7 +52,7 @@ import zlib
 import pickle
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, is_dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from importlib import import_module
@@ -76,7 +76,7 @@ from typing import (
 # Version Information
 # =============================================================================
 
-__version__ = "6.8.0"
+__version__ = "6.9.0"
 ADAPTER_VERSION = __version__
 
 # =============================================================================
@@ -108,7 +108,6 @@ except Exception:
 # Optional Dependencies (safe)
 # =============================================================================
 
-# Pydantic
 try:
     from pydantic import BaseModel, Field, ConfigDict  # type: ignore
     from pydantic import ValidationError as PydanticValidationError  # type: ignore
@@ -127,7 +126,6 @@ except Exception:
     ConfigDict = None  # type: ignore
     PydanticValidationError = Exception  # type: ignore
 
-# Redis (optional)
 try:
     import aioredis  # type: ignore
     from aioredis import Redis  # type: ignore
@@ -138,7 +136,6 @@ except Exception:
     Redis = None  # type: ignore
     _REDIS_AVAILABLE = False
 
-# Memcached (optional)
 try:
     import aiomcache  # type: ignore
 
@@ -147,7 +144,6 @@ except Exception:
     aiomcache = None  # type: ignore
     _MEMCACHED_AVAILABLE = False
 
-# Prometheus (optional)
 try:
     from prometheus_client import Counter, Histogram, Gauge  # type: ignore
     from prometheus_client import generate_latest, REGISTRY  # type: ignore
@@ -156,7 +152,6 @@ try:
 except Exception:
     _PROMETHEUS_AVAILABLE = False
 
-# OpenTelemetry (optional)
 try:
     from opentelemetry import trace as otel_trace  # type: ignore
     from opentelemetry.trace import Status, StatusCode  # type: ignore
@@ -169,9 +164,9 @@ except Exception:
     _OTEL_AVAILABLE = False
 
 # =============================================================================
-# Schema Registry (optional, safe) — used for schema-first sheet-rows enforcement
+# Schema Registry (optional, safe)
 # =============================================================================
-# FIX v6.8.0: multi-path import, same pattern as data_dictionary.py v3.3.0
+
 _get_sheet_spec = None
 _SCHEMA_AVAILABLE = False
 for _schema_path in ("core.sheets.schema_registry", "core.schema_registry", "schema_registry"):
@@ -209,7 +204,6 @@ _V2_DISABLED = (os.getenv("DATA_ENGINE_V2_DISABLED", "") or "").strip().lower() 
 _PERF_MONITORING = (os.getenv("DATA_ENGINE_PERF_MONITORING", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 _TRACING_ENABLED = (os.getenv("DATA_ENGINE_TRACING", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
 
-# strict sheet-rows (adapter-level safety net)
 _SCHEMA_STRICT_SHEET_ROWS = (os.getenv("SCHEMA_STRICT_SHEET_ROWS", "") or "").strip().lower() not in {"0", "false", "no", "n", "off"}
 
 _LOG_LEVEL = LogLevel.INFO
@@ -227,8 +221,6 @@ def _dbg(msg: str, level: str = "info") -> None:
             return
     except Exception:
         return
-
-    # Hygiene-safe: avoid built-in output calls
     try:
         ts = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
         sys.stderr.write(f"[{ts}] [data_engine:{level.upper()}] {msg}\n")
@@ -253,11 +245,6 @@ def _utc_now_iso() -> str:
 # =============================================================================
 
 class TraceContext:
-    """
-    OpenTelemetry context manager (sync + async).
-    Uses start_as_current_span when available.
-    """
-
     def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
         self.name = name
         self.attributes = attributes or {}
@@ -313,9 +300,6 @@ class TraceContext:
         return self.__exit__(exc_type, exc_val, exc_tb)
 
 def otel_traced(name: Optional[str] = None):
-    """
-    Decorator for async functions.
-    """
     def decorator(func: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
         @functools.wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -326,7 +310,7 @@ def otel_traced(name: Optional[str] = None):
     return decorator
 
 # =============================================================================
-# Perf Monitoring (fixed timestamps)
+# Perf Monitoring
 # =============================================================================
 
 @dataclass(slots=True)
@@ -415,17 +399,17 @@ def monitor_perf(operation: str, metadata: Optional[Dict[str, Any]] = None):
     return decorator
 
 # =============================================================================
-# Prometheus Metrics (safe)
+# Prometheus Metrics
 # =============================================================================
 
 class _DummyMetric:
-    def labels(self, *args, **kwargs):  # noqa
+    def labels(self, *args, **kwargs):
         return self
-    def inc(self, *args, **kwargs):  # noqa
+    def inc(self, *args, **kwargs):
         return None
-    def observe(self, *args, **kwargs):  # noqa
+    def observe(self, *args, **kwargs):
         return None
-    def set(self, *args, **kwargs):  # noqa
+    def set(self, *args, **kwargs):
         return None
 
 class MetricsRegistry:
@@ -650,7 +634,7 @@ class DynamicCircuitBreaker:
         }
 
 # =============================================================================
-# Distributed Cache (multi-backend, safe init)
+# Distributed Cache
 # =============================================================================
 
 class CacheBackend(Enum):
@@ -893,14 +877,10 @@ class DistributedCache:
         }
 
 # =============================================================================
-# Emergency Data Rescuer (missing prices)
+# Emergency Data Rescuer
 # =============================================================================
 
 class EmergencyDataRescuer:
-    """
-    If upstream returns missing/invalid price, try to patch via direct endpoints.
-    """
-
     @classmethod
     async def rescue_quote(cls, quote_obj: Any, symbol: str) -> Any:
         norm_symbol = normalize_symbol(symbol) or (symbol or "").strip()
@@ -962,8 +942,6 @@ class EmergencyDataRescuer:
 
                 if pc not in (None, 0) and p is not None:
                     change = p - float(pc)
-                    # FIX v6.8.0: store as FRACTION (dtype=pct schema contract)
-                    # 0.0142 = 1.42%, NOT 1.42
                     pct = change / float(pc)
                     quote_obj["price_change"] = change
                     quote_obj["change"] = change
@@ -985,8 +963,6 @@ class EmergencyDataRescuer:
 
                 if pc not in (None, 0) and p is not None:
                     change = p - float(pc)
-                    # FIX v6.8.0: store as FRACTION (dtype=pct schema contract)
-                    # 0.0142 = 1.42%, NOT 1.42
                     pct = change / float(pc)
                     if hasattr(quote_obj, "price_change"):
                         quote_obj.price_change = change
@@ -1133,7 +1109,19 @@ class V2Discovery:
                 engine_v5_class = getattr(mod, "DataEngineV5", None)
 
                 uq_class = getattr(mod, "UnifiedQuote", None)
-                has_funcs = any(callable(getattr(mod, n, None)) for n in ("get_quote", "get_quotes", "get_enriched_quote", "get_enriched_quotes", "get_engine"))
+                has_funcs = any(
+                    callable(getattr(mod, n, None))
+                    for n in (
+                        "get_quote",
+                        "get_quotes",
+                        "get_enriched_quote",
+                        "get_enriched_quotes",
+                        "get_engine",
+                        "get_sheet_rows",
+                        "sheet_rows",
+                        "build_sheet_rows",
+                    )
+                )
 
                 if uq_class is None:
                     try:
@@ -1250,8 +1238,17 @@ def _is_missing(obj: Any) -> bool:
     except Exception:
         return False
 
+def _jsonable_snapshot(value: Any) -> Any:
+    try:
+        return jsonable_encoder(value)
+    except Exception:
+        try:
+            return json_loads(json_dumps(value))
+        except Exception:
+            return value
+
 # =============================================================================
-# Sync bridge (safe when loop already running)
+# Sync bridge
 # =============================================================================
 
 def _run_coro_sync(coro: Awaitable[Any]) -> Any:
@@ -1284,7 +1281,7 @@ def _run_coro_sync(coro: Awaitable[Any]) -> Any:
     return result_box.get("value")
 
 # =============================================================================
-# Symbol Normalization (provider routing)
+# Symbol Normalization
 # =============================================================================
 
 @dataclass(slots=True)
@@ -1490,8 +1487,6 @@ class StubUnifiedQuote(BaseModel):
                 pass
         if self.change_pct is None and self.current_price is not None and self.previous_close not in (None, 0):
             try:
-                # FIX v6.8.0: store as FRACTION (dtype=pct schema contract)
-                # 0.0142 = 1.42%, NOT 1.42
                 self.change_pct = float(self.current_price) / float(self.previous_close) - 1.0
                 self.percent_change = self.change_pct
             except Exception:
@@ -1525,7 +1520,6 @@ class StubEngine:
         return await self.get_quotes(symbols)
 
     async def get_sheet_rows(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-        # schema-only fallback for stub mode
         sheet = _safe_str(kwargs.get("sheet") or (args[0] if args else ""))
         return {
             "status": "error",
@@ -1535,6 +1529,11 @@ class StubEngine:
             "keys": [],
             "rows": [],
             "rows_matrix": [],
+            "row_objects": [],
+            "data": [],
+            "items": [],
+            "records": [],
+            "quotes": [],
             "error": "Engine V2 Missing (stub)",
             "meta": {"mode": "stub"},
             "version": __version__,
@@ -1745,7 +1744,7 @@ def get_cache() -> DistributedCache:
     return _ENGINE_MANAGER.get_cache()
 
 # =============================================================================
-# Schema helpers for sheet-rows (adapter-level enforcement)
+# Schema helpers for sheet-rows
 # =============================================================================
 
 def _schema_headers_keys(sheet: str) -> Tuple[List[str], List[str], Any]:
@@ -1836,7 +1835,175 @@ def _candidate_method_names(enriched: bool, batch: bool) -> List[str]:
     return ["get_quote", "fetch_quote", "quote", "fetch", "get"]
 
 def _candidate_sheet_rows_methods() -> List[str]:
-    return ["get_sheet_rows", "sheet_rows", "build_sheet_rows"]
+    return [
+        "get_sheet_rows",
+        "sheet_rows",
+        "build_sheet_rows",
+    ]
+
+# =============================================================================
+# V2 default symbols for instrument fallback
+# =============================================================================
+
+_DEFAULT_SHEET_SYMBOLS: Dict[str, List[str]] = {
+    "Market_Leaders": ["2222.SR", "1120.SR", "2010.SR", "7010.SR", "AAPL", "MSFT", "NVDA", "GOOGL"],
+    "Global_Markets": ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AVGO"],
+    "Commodities_FX": ["GC=F", "BZ=F", "SI=F", "EURUSD=X", "GBPUSD=X", "JPY=X", "SAR=X", "CL=F"],
+    "Mutual_Funds": ["SPY", "QQQ", "VTI", "VOO", "IWM"],
+    "My_Portfolio": ["2222.SR", "AAPL", "MSFT", "QQQ", "GC=F"],
+    "My_Investments": ["2222.SR", "AAPL", "MSFT"],
+    "Insights_Analysis": ["2222.SR", "AAPL", "GC=F"],
+    "Top_10_Investments": ["2222.SR", "1120.SR", "AAPL", "MSFT", "NVDA"],
+}
+
+def _extract_requested_symbols_from_body(body: Dict[str, Any], limit: int = 50) -> List[str]:
+    out: List[str] = []
+    seen: Set[str] = set()
+
+    def _append_many(v: Any) -> None:
+        if v is None:
+            return
+        seq: List[str] = []
+        if isinstance(v, str):
+            seq = [x.strip() for x in v.replace(";", ",").replace("\n", ",").split(",") if x.strip()]
+        elif isinstance(v, (list, tuple, set)):
+            seq = [_safe_str(x) for x in v if _safe_str(x)]
+        else:
+            s = _safe_str(v)
+            if s:
+                seq = [s]
+
+        for item in seq:
+            norm = normalize_symbol(item)
+            if norm and norm not in seen:
+                seen.add(norm)
+                out.append(norm)
+                if len(out) >= limit:
+                    return
+
+    for key in (
+        "direct_symbols",
+        "symbols",
+        "tickers",
+        "tickers_list",
+        "selected_symbols",
+        "selected_tickers",
+        "requested_symbol",
+        "symbol",
+        "ticker",
+        "code",
+    ):
+        _append_many(body.get(key))
+        if len(out) >= limit:
+            break
+
+    return out[:limit]
+
+def _model_to_dict(obj: Any) -> Dict[str, Any]:
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return dict(obj)
+    if isinstance(obj, Mapping):
+        return dict(obj)
+    try:
+        if hasattr(obj, "model_dump") and callable(getattr(obj, "model_dump")):
+            dumped = obj.model_dump(mode="python")  # type: ignore[attr-defined]
+            if isinstance(dumped, dict):
+                return dumped
+    except Exception:
+        pass
+    try:
+        if hasattr(obj, "dict") and callable(getattr(obj, "dict")):
+            dumped = obj.dict()  # type: ignore[attr-defined]
+            if isinstance(dumped, dict):
+                return dumped
+    except Exception:
+        pass
+    try:
+        if is_dataclass(obj):
+            dumped = asdict(obj)
+            if isinstance(dumped, dict):
+                return dumped
+    except Exception:
+        pass
+    try:
+        dd = getattr(obj, "__dict__", None)
+        if isinstance(dd, dict):
+            return dict(dd)
+    except Exception:
+        pass
+    snap = _jsonable_snapshot(obj)
+    if isinstance(snap, dict):
+        return snap
+    return {}
+
+def _enrich_row_identity(row: Dict[str, Any], symbol: str) -> Dict[str, Any]:
+    rr = dict(row or {})
+    if not rr.get("symbol"):
+        rr["symbol"] = symbol
+
+    info = get_symbol_info(symbol)
+    rr.setdefault("market", info.market)
+    rr.setdefault("asset_class", info.asset_class)
+    if info.provider_hint:
+        rr.setdefault("provider_hint", info.provider_hint)
+
+    if symbol.endswith(".SR"):
+        rr.setdefault("exchange", "Tadawul")
+        rr.setdefault("currency", "SAR")
+        rr.setdefault("country", "Saudi Arabia")
+    elif symbol.endswith("=F"):
+        rr.setdefault("exchange", "Futures")
+        rr.setdefault("currency", "USD")
+        rr.setdefault("country", "Global")
+    elif symbol.endswith("=X"):
+        rr.setdefault("exchange", "FX")
+        rr.setdefault("currency", "USD")
+        rr.setdefault("country", "Global")
+    else:
+        rr.setdefault("exchange", "NASDAQ/NYSE")
+        rr.setdefault("currency", "USD")
+        rr.setdefault("country", "Global")
+
+    return rr
+
+async def _build_quote_fallback_rows(
+    engine: Any,
+    *,
+    sheet: str,
+    limit: int,
+    offset: int,
+    body: Dict[str, Any],
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    symbols = _extract_requested_symbols_from_body(body, limit=max(50, limit + offset))
+    if not symbols:
+        symbols = [normalize_symbol(s) for s in _DEFAULT_SHEET_SYMBOLS.get(sheet, []) if normalize_symbol(s)]
+
+    if not symbols:
+        return [], None
+
+    sliced = symbols[offset: offset + limit] if (offset or len(symbols) > limit) else symbols[:limit]
+    if not sliced:
+        return [], None
+
+    try:
+        results = await _call_engine_batch(engine, sliced, enriched=True, use_cache=False, ttl=None)
+        aligned = _align_batch_results(results, sliced)
+    except Exception as e:
+        _dbg(f"quote fallback batch failed for {sheet}: {e}", "debug")
+        return [], None
+
+    rows: List[Dict[str, Any]] = []
+    for sym, item in zip(sliced, aligned):
+        if item is None:
+            continue
+        fin = _finalize_quote(_unwrap_payload(item))
+        row = _model_to_dict(fin)
+        row = _enrich_row_identity(row, sym)
+        rows.append(row)
+
+    return rows, ("quote_batch_fallback" if rows else None)
 
 async def _call_engine_method(engine: Any, method_name: str, *args: Any, **kwargs: Any) -> Any:
     method = getattr(engine, method_name, None)
@@ -1879,7 +2046,7 @@ def _align_batch_results(results: Any, requested_symbols: List[str]) -> List[Any
     return arr + [None] * (len(requested_symbols) - len(arr))
 
 # =============================================================================
-# Sheet Rows (NEW in v6.7.0) — adapter-level API
+# Sheet Rows — adapter-level API
 # =============================================================================
 
 _SPECIAL_SHEET_CANONICAL: Dict[str, str] = {
@@ -1978,7 +2145,7 @@ def _rows_from_matrix(matrix: Any, keys: Sequence[str]) -> List[Dict[str, Any]]:
     return out
 
 def _extract_payload_rows(payload: Dict[str, Any], keys_hint: Sequence[str], headers_hint: Sequence[str]) -> List[Dict[str, Any]]:
-    for bucket in ("rows", "data", "items", "records", "quotes", "results"):
+    for bucket in ("row_objects", "rows", "data", "items", "records", "quotes", "results"):
         rr = payload.get(bucket)
         if isinstance(rr, list):
             dict_rows = [r for r in rr if isinstance(r, dict)]
@@ -2029,6 +2196,9 @@ async def _invoke_callable_candidates(target: Any, method_names: Sequence[str], 
                 res = attempt()
                 if inspect.isawaitable(res):
                     res = await res
+                res = _unwrap_payload(res)
+                if not isinstance(res, (dict, list)):
+                    res = _jsonable_snapshot(res)
                 if isinstance(res, dict):
                     return res, method_name
                 if isinstance(res, list):
@@ -2088,8 +2258,8 @@ def _normalize_sheet_payload(
     sheet2 = _canonicalize_sheet_name(sheet)
     headers_schema, keys_schema, _spec = _schema_headers_keys(sheet2)
 
-    payload_headers = payload.get("headers") or payload.get("display_headers") or payload.get("columns") or []
-    payload_keys = payload.get("keys") or payload.get("field_names") or payload.get("fields") or []
+    payload_headers = payload.get("headers") or payload.get("display_headers") or payload.get("sheet_headers") or payload.get("column_headers") or []
+    payload_keys = payload.get("keys") or payload.get("columns") or payload.get("fields") or payload.get("field_names") or []
 
     out_headers = [str(x) for x in payload_headers] if isinstance(payload_headers, list) else []
     out_keys = [str(x) for x in payload_keys] if isinstance(payload_keys, list) else []
@@ -2127,11 +2297,13 @@ def _normalize_sheet_payload(
 
     rows_matrix = _rows_to_matrix(rows_norm, out_keys) if (include_matrix and out_keys and not (headers_only or schema_only)) else ([] if include_matrix and out_keys and (headers_only or schema_only) else None)
 
-    status = payload.get("status") or "success"
+    status = payload.get("status") or ("partial" if not rows_norm and out_keys else "success")
     if _SCHEMA_STRICT_SHEET_ROWS and _SCHEMA_AVAILABLE and (not out_headers or not out_keys):
         status = "error"
 
     meta_in = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+
+    count = 0 if headers_only else len(rows_norm)
 
     return {
         "status": status,
@@ -2139,11 +2311,20 @@ def _normalize_sheet_payload(
         "page": payload.get("page") or sheet2,
         "headers": out_headers,
         "display_headers": out_headers,
+        "sheet_headers": out_headers,
+        "column_headers": out_headers,
         "keys": out_keys,
+        "columns": out_keys,
+        "fields": out_keys,
         "rows": [] if headers_only else rows_norm,
+        "row_objects": [] if headers_only else rows_norm,
         "rows_matrix": rows_matrix,
+        "matrix": rows_matrix,
         "data": [] if headers_only else rows_norm,
         "items": [] if headers_only else rows_norm,
+        "records": [] if headers_only else rows_norm,
+        "quotes": [] if headers_only else rows_norm,
+        "count": count,
         "error": payload.get("error"),
         "meta": {
             **meta_in,
@@ -2155,19 +2336,20 @@ def _normalize_sheet_payload(
             "mode": mode,
             "headers_only": headers_only,
             "schema_only": schema_only,
-            "row_count": 0 if headers_only else len(rows_norm),
+            "row_count": count,
         },
         "version": payload.get("version") or __version__,
     }
 
 async def _call_engine_sheet_rows(engine: Any, *, sheet: str, limit: int, offset: int, mode: str, body: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Call sheet-rows on:
-      1) Special sheet builders for Insights_Analysis / Top_10_Investments / Data_Dictionary
-      2) Engine methods: get_sheet_rows / sheet_rows / build_sheet_rows
-      3) Schema-only fallback when builders are unavailable
-
-    Then enforce schema projection in this adapter as the final safety net.
+    Dispatch order in v6.9.0:
+      1) Special sheet builders on engine
+      2) Special sheet builders on V2 module
+      3) Generic sheet-rows methods on engine
+      4) Generic sheet-rows methods on V2 module
+      5) Quote-batch fallback rows for instrument pages
+      6) Schema-only fallback
     """
     sheet2 = _resolve_sheet_from_inputs(sheet, body)
     limit = max(1, min(5000, int(limit or 2000)))
@@ -2184,11 +2366,20 @@ async def _call_engine_sheet_rows(engine: Any, *, sheet: str, limit: int, offset
             "page": sheet2,
             "headers": [],
             "display_headers": [],
+            "sheet_headers": [],
+            "column_headers": [],
             "keys": [],
+            "columns": [],
+            "fields": [],
             "rows": [],
+            "row_objects": [],
             "rows_matrix": [],
+            "matrix": [],
             "data": [],
             "items": [],
+            "records": [],
+            "quotes": [],
+            "count": 0,
             "error": f"Unknown sheet or schema missing for '{sheet2}'",
             "meta": {"strict": True, "builder": "schema_guard"},
             "version": __version__,
@@ -2220,17 +2411,72 @@ async def _call_engine_sheet_rows(engine: Any, *, sheet: str, limit: int, offset
         used = used or (f"engine.{method_used}" if method_used else None)
 
     if payload is None:
+        mode2, info, _ = _V2_DISCOVERY.discover()
+        if mode2 in (EngineMode.V2, EngineMode.LEGACY) and info and info.module is not None:
+            payload, method_used = await _invoke_callable_candidates(
+                info.module,
+                _candidate_sheet_rows_methods(),
+                sheet=sheet2,
+                limit=limit,
+                offset=offset,
+                mode=mode,
+                body=body,
+            )
+            if payload is not None:
+                used = used or (f"module.{method_used}" if method_used else None)
+
+    if payload is None and not _is_special_sheet(sheet2):
+        quote_rows, builder_name = await _build_quote_fallback_rows(
+            engine,
+            sheet=sheet2,
+            limit=limit,
+            offset=offset,
+            body=body,
+        )
+        if quote_rows:
+            payload = {
+                "status": "partial",
+                "sheet": sheet2,
+                "page": sheet2,
+                "headers": headers or [],
+                "display_headers": headers or [],
+                "sheet_headers": headers or [],
+                "column_headers": headers or [],
+                "keys": keys or [],
+                "columns": keys or [],
+                "fields": keys or [],
+                "rows": quote_rows,
+                "row_objects": quote_rows,
+                "data": quote_rows,
+                "items": quote_rows,
+                "records": quote_rows,
+                "quotes": quote_rows,
+                "meta": {"path": "quote_batch_fallback", "builder": builder_name or "quote_batch_fallback"},
+                "version": __version__,
+            }
+            used = used or builder_name or "quote_batch_fallback"
+
+    if payload is None:
         payload = {
-            "status": "success",
+            "status": "partial",
             "sheet": sheet2,
             "page": sheet2,
             "headers": headers or [],
             "display_headers": headers or [],
+            "sheet_headers": headers or [],
+            "column_headers": headers or [],
             "keys": keys or [],
+            "columns": keys or [],
+            "fields": keys or [],
             "rows": [],
+            "row_objects": [],
             "rows_matrix": [] if (headers and keys and _boolish(body.get("include_matrix", True), True)) else None,
+            "matrix": [] if (headers and keys and _boolish(body.get("include_matrix", True), True)) else None,
             "data": [],
             "items": [],
+            "records": [],
+            "quotes": [],
+            "count": 0,
             "meta": {"path": "schema_only_fallback", "builder": "none"},
             "version": __version__,
         }
@@ -2256,14 +2502,6 @@ async def get_sheet_rows(
     use_cache: bool = False,
     ttl: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """
-    Public adapter-level Sheet Rows API.
-
-    - Resolves sheet aliases from both explicit arguments and request body.
-    - Uses special builders for Insights_Analysis / Top_10_Investments / Data_Dictionary when available.
-    - Enforces schema projection as the final adapter safety net.
-    - Optional caching is supported (off by default; sheet-rows often dynamic).
-    """
     body = dict(body or {})
     sheet2 = _resolve_sheet_from_inputs(sheet, body)
 
@@ -2276,7 +2514,7 @@ async def get_sheet_rows(
     engine = await get_engine()
     payload = await _call_engine_sheet_rows(engine, sheet=sheet2, limit=limit, offset=offset, mode=mode, body=body)
 
-    if use_cache and payload.get("status") == "success":
+    if use_cache and payload.get("status") in {"success", "partial"}:
         await _ENGINE_MANAGER.get_cache().set("sheet_rows", cache_key, payload, ttl)
 
     return payload
@@ -2303,7 +2541,7 @@ def get_sheet_rows_sync(
     )
 
 # =============================================================================
-# Quote calling internals (unchanged)
+# Quote calling internals
 # =============================================================================
 
 async def _call_engine_single(engine: Any, symbol: str, *, enriched: bool, use_cache: bool, ttl: Optional[int]) -> Any:
@@ -2560,7 +2798,7 @@ async def get_quotes(symbols: List[str], use_cache: bool = True, ttl: Optional[i
     return await get_enriched_quotes(symbols, use_cache=use_cache, ttl=ttl)
 
 # =============================================================================
-# Batch Processing (progress)
+# Batch Processing
 # =============================================================================
 
 @dataclass(slots=True)
@@ -2701,7 +2939,6 @@ async def health_check() -> Dict[str, Any]:
             health["status"] = "unhealthy"
             health["errors"].append(f"Quote test error: {e}")
 
-        # quick sheet-rows smoke test (schema-only is acceptable)
         try:
             sr = await get_sheet_rows("Data_Dictionary", limit=1, offset=0, mode="", body={"include_matrix": False}, use_cache=False)
             health["checks"]["sheet_rows_test"] = "passed" if isinstance(sr, dict) else "failed"
@@ -2734,9 +2971,6 @@ class EngineSession:
         _run_coro_sync(close_engine())
 
 class DataEngine:
-    """
-    Backward-compatible wrapper that delegates to shared engine API.
-    """
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self._engine: Optional[Any] = None
         self._request_id = str(uuid.uuid4())
@@ -2786,7 +3020,6 @@ class DataEngine:
         use_cache: bool = False,
         ttl: Optional[int] = None,
     ) -> Dict[str, Any]:
-        # Use the adapter-level API (routes can rely on this)
         return await get_sheet_rows(sheet, limit=limit, offset=offset, mode=mode, body=body, use_cache=use_cache, ttl=ttl)
 
     async def aclose(self) -> None:
@@ -2858,7 +3091,6 @@ __all__ = [
     "get_quotes",
     "get_enriched_quote",
     "get_enriched_quotes",
-    # NEW (sheet rows)
     "get_sheet_rows",
     "get_sheet_rows_sync",
     "process_batch",
@@ -2877,7 +3109,6 @@ __all__ = [
     "_METRICS",
 ]
 
-# safe default
 try:
     _METRICS.set("active_requests", 0)
 except Exception:
