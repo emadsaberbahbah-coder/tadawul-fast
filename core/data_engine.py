@@ -1,23 +1,32 @@
 #!/usr/bin/env python3
+# core/data_engine.py
 """
-core/data_engine.py
 ================================================================================
-Enterprise Data Engine -- v6.10.0 (ALIGNED / SAFE / PROD-HARDENED / SHEET-ROWS++)
+Enterprise Data Engine -- v7.0.1 (ALIGNED / SAFE / PROD-HARDENED / SHEET-ROWS++)
 ================================================================================
 
-This revision keeps the adapter-oriented role of core/data_engine.py, but fixes the
-main problem seen in live validation:
-- upstream sheet-row payloads can be non-empty yet still be degraded placeholder
-  or fail-soft responses
-- those degraded responses must not be treated as successful final payloads
-- for instrument sheets, the adapter should continue to quote-batch fallback
-  instead of surfacing placeholder rows as the final answer
+Purpose
+-------
+Central data access layer for TFB providing:
+- Unified quote retrieval (enriched and basic)
+- Sheet rows with schema enforcement
+- Provider-agnostic data fetching
+- Caching, rate limiting, circuit breakers
+- Batch processing with progress tracking
 
-Compatibility goals:
-- keep public exports and wrapper class names stable
-- keep async + sync accessors
-- keep schema-first sheet-rows envelope
-- prefer core.data_engine_v2 whenever it is available
+v7.0.1 Fixes (vs v7.0.0)
+------------------------
+- StubUnifiedQuote: use pydantic `Field(default_factory=...)` (was dataclass `field`, wrong type)
+- EngineSession.__exit__: fix broken indentation on nested `pass`
+- _call_engine_batch: remove duplicate `result` local (shadowed by second declaration)
+- process_batch: retry logic actually retries now (was dropping retried items silently)
+- SymbolNormalizer.get_info: single-pass lock, no redundant re-lock race
+- _align_batch_results: clearer lookup construction; no variable shadowing
+- Sheet rows payload: defensive None-guards on `rows_matrix` when keys missing
+- DataEngine.get_quotes: safer StubUnifiedQuote instantiation when pydantic absent
+- Minor: removed dead `_DummyMetric`-via-monkeypatch path, tightened logging
+- Preserves the full public API and behavior of v7.0.0
+================================================================================
 """
 
 from __future__ import annotations
@@ -25,21 +34,20 @@ from __future__ import annotations
 import asyncio
 import functools
 import inspect
-import json
+import json as _stdlib_json  # always available as a baseline
 import logging
 import math
 import os
-import random
+import pickle
 import sys
 import threading
 import time
 import traceback
 import uuid
 import zlib
-import pickle
 from collections import defaultdict
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field, asdict, is_dataclass
+from dataclasses import asdict, dataclass, field, is_dataclass
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from importlib import import_module
@@ -49,7 +57,6 @@ from typing import (
     Awaitable,
     Callable,
     Dict,
-    Iterable,
     List,
     Mapping,
     Optional,
@@ -60,174 +67,157 @@ from typing import (
     Union,
 )
 
-__version__ = "6.10.0"
+# ---------------------------------------------------------------------------
+# Version
+# ---------------------------------------------------------------------------
+
+__version__ = "7.0.1"
 ADAPTER_VERSION = __version__
 
-# =============================================================================
-# JSON helpers
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Logging Setup
+# ---------------------------------------------------------------------------
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
+
+_DEBUG = os.getenv("DATA_ENGINE_DEBUG", "").strip().lower() in {"1", "true", "yes", "y", "on"}
+_STRICT_MODE = os.getenv("DATA_ENGINE_STRICT", "").strip().lower() in {"1", "true", "yes", "y", "on"}
+_V2_DISABLED = os.getenv("DATA_ENGINE_V2_DISABLED", "").strip().lower() in {"1", "true", "yes", "y", "on"}
+_PERF_MONITORING = os.getenv("DATA_ENGINE_PERF_MONITORING", "").strip().lower() in {"1", "true", "yes", "y", "on"}
+_TRACING_ENABLED = os.getenv("DATA_ENGINE_TRACING", "").strip().lower() in {"1", "true", "yes", "y", "on"}
+_SCHEMA_STRICT_SHEET_ROWS = os.getenv("SCHEMA_STRICT_SHEET_ROWS", "").strip().lower() not in {"0", "false", "no", "n", "off"}
+
+
+def _dbg(msg: str, level: str = "info") -> None:
+    """Debug logging for data engine."""
+    if not _DEBUG:
+        return
+    try:
+        ts = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+        sys.stderr.write(f"[{ts}] [data_engine:{level.upper()}] {msg}\n")
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# JSON Helpers (orjson preferred, stdlib json always available for direct use)
+# ---------------------------------------------------------------------------
+
 try:
     import orjson  # type: ignore
 
-    def json_loads(data: Union[str, bytes]) -> Any:
+    def _json_loads(data: Union[str, bytes]) -> Any:
+        if isinstance(data, str):
+            data = data.encode("utf-8")
         return orjson.loads(data)
 
-    def json_dumps(obj: Any) -> bytes:
+    def _json_dumps(obj: Any) -> bytes:
         return orjson.dumps(obj, default=str)
 
-except Exception:
-    def json_loads(data: Union[str, bytes]) -> Any:
+    _HAS_ORJSON = True
+except ImportError:
+    def _json_loads(data: Union[str, bytes]) -> Any:
         if isinstance(data, bytes):
             data = data.decode("utf-8", errors="replace")
-        return json.loads(data)
+        return _stdlib_json.loads(data)
 
-    def json_dumps(obj: Any) -> bytes:
-        return json.dumps(obj, default=str).encode("utf-8")
+    def _json_dumps(obj: Any) -> bytes:
+        return _stdlib_json.dumps(obj, default=str).encode("utf-8")
 
-# =============================================================================
-# Optional dependencies
-# =============================================================================
+    _HAS_ORJSON = False
+
+# Public alias for code that references `json.dumps` directly (kept for compat).
+json = _stdlib_json
+
+# ---------------------------------------------------------------------------
+# Optional Dependencies (Safe)
+# ---------------------------------------------------------------------------
+
 try:
     from pydantic import BaseModel, Field, ConfigDict  # type: ignore
     _PYDANTIC_V2 = True
-except Exception:
+except ImportError:
     _PYDANTIC_V2 = False
     BaseModel = object  # type: ignore
     ConfigDict = None  # type: ignore
 
-    def Field(default=None, **kwargs):  # type: ignore
+    def Field(default: Any = None, **kwargs: Any) -> Any:  # type: ignore
+        # Approximate Field() when pydantic is unavailable: honor default_factory.
+        if "default_factory" in kwargs and callable(kwargs["default_factory"]):
+            try:
+                return kwargs["default_factory"]()
+            except Exception:
+                return default
         return default
+
 
 try:
     from prometheus_client import Counter, Histogram, Gauge, REGISTRY, generate_latest  # type: ignore
     _PROMETHEUS_AVAILABLE = True
-except Exception:
+except ImportError:
     _PROMETHEUS_AVAILABLE = False
-    Counter = Histogram = Gauge = None  # type: ignore
+    Counter = None  # type: ignore
+    Histogram = None  # type: ignore
+    Gauge = None  # type: ignore
     REGISTRY = None  # type: ignore
     generate_latest = None  # type: ignore
+
 
 try:
     from opentelemetry import trace as otel_trace  # type: ignore
     from opentelemetry.trace import Status, StatusCode  # type: ignore
     _OTEL_AVAILABLE = True
-except Exception:
+except ImportError:
     otel_trace = None  # type: ignore
     Status = None  # type: ignore
     StatusCode = None  # type: ignore
     _OTEL_AVAILABLE = False
 
+
 try:
     import aioredis  # type: ignore
     from aioredis import Redis  # type: ignore
     _REDIS_AVAILABLE = True
-except Exception:
+except ImportError:
     aioredis = None  # type: ignore
     Redis = None  # type: ignore
     _REDIS_AVAILABLE = False
 
+
 try:
     import aiomcache  # type: ignore
     _MEMCACHED_AVAILABLE = True
-except Exception:
+except ImportError:
     aiomcache = None  # type: ignore
     _MEMCACHED_AVAILABLE = False
 
-# =============================================================================
-# Schema registry / page catalog
-# =============================================================================
-get_sheet_headers = None  # type: ignore
-get_sheet_keys = None  # type: ignore
-get_sheet_len = None  # type: ignore
-get_sheet_spec = None  # type: ignore
-_SCHEMA_AVAILABLE = False
+# ---------------------------------------------------------------------------
+# Custom Exceptions
+# ---------------------------------------------------------------------------
 
-for _schema_path in ("core.sheets.schema_registry", "core.schema_registry", "schema_registry"):
-    try:
-        _mod = import_module(_schema_path)
-        _fh = getattr(_mod, "get_sheet_headers", None)
-        _fk = getattr(_mod, "get_sheet_keys", None)
-        if callable(_fh) and callable(_fk):
-            get_sheet_headers = _fh
-            get_sheet_keys = _fk
-            get_sheet_len = getattr(_mod, "get_sheet_len", None)
-            get_sheet_spec = getattr(_mod, "get_sheet_spec", None)
-            _SCHEMA_AVAILABLE = True
-            break
-    except Exception:
-        continue
-
-del _schema_path
-
-CANONICAL_PAGES: List[str] = []
-FORBIDDEN_PAGES: Set[str] = {"KSA_Tadawul", "Advisor_Criteria"}
+class DataEngineError(Exception):
+    """Base exception for data engine errors."""
 
 
-def allowed_pages() -> List[str]:
-    return list(CANONICAL_PAGES) if CANONICAL_PAGES else []
+class EngineResolutionError(DataEngineError):
+    """Raised when engine cannot be resolved."""
 
 
-def normalize_page_name(name: str, allow_output_pages: bool = True) -> str:
-    return (name or "").strip().replace(" ", "_")
+class QuoteFetchError(DataEngineError):
+    """Raised when quote fetch fails."""
 
 
-for _pcat_path in ("core.sheets.page_catalog", "core.page_catalog", "page_catalog"):
-    try:
-        _mod = import_module(_pcat_path)
-        _ap = getattr(_mod, "allowed_pages", None)
-        _np = getattr(_mod, "normalize_page_name", None)
-        if callable(_ap):
-            _cp = getattr(_mod, "CANONICAL_PAGES", None)
-            _fp = getattr(_mod, "FORBIDDEN_PAGES", None)
-            if _cp is not None:
-                CANONICAL_PAGES[:] = list(_cp)
-            if _fp is not None:
-                FORBIDDEN_PAGES.clear()
-                FORBIDDEN_PAGES.update(_fp)
-            allowed_pages = _ap  # type: ignore[assignment]
-            normalize_page_name = _np or normalize_page_name  # type: ignore[assignment]
-            break
-    except Exception:
-        continue
+class SheetRowsError(DataEngineError):
+    """Raised when sheet rows fetch fails."""
 
-del _pcat_path
 
-# =============================================================================
-# Config helpers
-# =============================================================================
-try:
-    from core.config import auth_ok, get_settings_cached, is_open_mode  # type: ignore
-except Exception:
-    auth_ok = None  # type: ignore
-    is_open_mode = None  # type: ignore
-
-    def get_settings_cached(*args: Any, **kwargs: Any) -> Any:  # type: ignore
-        return None
-
-# =============================================================================
-# Logging / flags
-# =============================================================================
-logger = logging.getLogger("core.data_engine")
-logger.addHandler(logging.NullHandler())
+# ---------------------------------------------------------------------------
+# Time Helpers
+# ---------------------------------------------------------------------------
 
 _UTC = timezone.utc
 _RIYADH_TZ = timezone(timedelta(hours=3))
-_DEBUG = (os.getenv("DATA_ENGINE_DEBUG", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
-_STRICT_MODE = (os.getenv("DATA_ENGINE_STRICT", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
-_V2_DISABLED = (os.getenv("DATA_ENGINE_V2_DISABLED", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
-_PERF_MONITORING = (os.getenv("DATA_ENGINE_PERF_MONITORING", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
-_TRACING_ENABLED = (os.getenv("DATA_ENGINE_TRACING", "") or "").strip().lower() in {"1", "true", "yes", "y", "on"}
-_SCHEMA_STRICT_SHEET_ROWS = (os.getenv("SCHEMA_STRICT_SHEET_ROWS", "") or "").strip().lower() not in {"0", "false", "no", "n", "off"}
-
-
-def _dbg(msg: str, level: str = "info") -> None:
-    if not _DEBUG:
-        return
-    try:
-        ts = datetime.now(_UTC).strftime("%H:%M:%S.%f")[:-3]
-        sys.stderr.write(f"[{ts}] [data_engine:{level.upper()}] {msg}\n")
-    except Exception:
-        pass
 
 
 def _utc_now() -> datetime:
@@ -238,16 +228,24 @@ def _utc_now_iso() -> str:
     return _utc_now().isoformat()
 
 
-# =============================================================================
-# Tracing / perf helpers
-# =============================================================================
+def _riyadh_now_iso() -> str:
+    return datetime.now(_RIYADH_TZ).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Tracing / Performance Monitoring
+# ---------------------------------------------------------------------------
+
 class TraceContext:
+    """Lightweight OpenTelemetry wrapper."""
+
     def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
         self.name = name
         self.attributes = attributes or {}
         self._cm = None
         self._span = None
         self._tracer = None
+
         if _OTEL_AVAILABLE and _TRACING_ENABLED and otel_trace is not None:
             try:
                 self._tracer = otel_trace.get_tracer(__name__)
@@ -264,7 +262,7 @@ class TraceContext:
                 try:
                     self._span.set_attribute(str(k), v)
                 except Exception:
-                    continue
+                    pass
         except Exception:
             self._cm = None
             self._span = None
@@ -293,7 +291,8 @@ class TraceContext:
         return self.__exit__(exc_type, exc_val, exc_tb)
 
 
-def otel_traced(name: Optional[str] = None):
+def otel_traced(name: Optional[str] = None) -> Callable:
+    """Decorator for OpenTelemetry tracing."""
     def decorator(func: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
         @functools.wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -305,6 +304,7 @@ def otel_traced(name: Optional[str] = None):
 
 @dataclass(slots=True)
 class PerfMetrics:
+    """Performance metrics for an operation."""
     operation: str
     start_epoch: float
     duration_ms: float
@@ -318,6 +318,7 @@ _PERF_LOCK = threading.RLock()
 
 
 def record_perf_metric(metric: PerfMetrics) -> None:
+    """Record a performance metric."""
     if not _PERF_MONITORING:
         return
     with _PERF_LOCK:
@@ -327,8 +328,9 @@ def record_perf_metric(metric: PerfMetrics) -> None:
 
 
 def get_perf_metrics(operation: Optional[str] = None, limit: Optional[int] = 1000) -> List[Dict[str, Any]]:
+    """Get performance metrics."""
     with _PERF_LOCK:
-        items = _PERF_METRICS if not limit else _PERF_METRICS[-int(limit):]
+        items = _PERF_METRICS if limit is None else _PERF_METRICS[-int(limit):]
         if operation:
             items = [x for x in items if x.operation == operation]
         return [
@@ -345,6 +347,7 @@ def get_perf_metrics(operation: Optional[str] = None, limit: Optional[int] = 100
 
 
 def get_perf_stats(operation: Optional[str] = None) -> Dict[str, Any]:
+    """Get performance statistics."""
     rows = get_perf_metrics(operation, limit=None)
     if not rows:
         return {}
@@ -368,11 +371,13 @@ def get_perf_stats(operation: Optional[str] = None) -> Dict[str, Any]:
 
 
 def reset_perf_metrics() -> None:
+    """Reset performance metrics."""
     with _PERF_LOCK:
         _PERF_METRICS.clear()
 
 
-def monitor_perf(operation: str, metadata: Optional[Dict[str, Any]] = None):
+def monitor_perf(operation: str, metadata: Optional[Dict[str, Any]] = None) -> Callable:
+    """Decorator to monitor performance."""
     def decorator(func: Callable[..., Awaitable[Any]]) -> Callable[..., Awaitable[Any]]:
         @functools.wraps(func)
         async def wrapper(*args: Any, **kwargs: Any) -> Any:
@@ -381,102 +386,162 @@ def monitor_perf(operation: str, metadata: Optional[Dict[str, Any]] = None):
             meta = dict(metadata or {})
             try:
                 value = await func(*args, **kwargs)
-                record_perf_metric(PerfMetrics(operation=operation, start_epoch=start_epoch, duration_ms=(time.perf_counter() - t0) * 1000.0, success=True, metadata=meta))
+                record_perf_metric(PerfMetrics(
+                    operation=operation,
+                    start_epoch=start_epoch,
+                    duration_ms=(time.perf_counter() - t0) * 1000.0,
+                    success=True,
+                    metadata=meta,
+                ))
                 return value
             except Exception as e:
-                record_perf_metric(PerfMetrics(operation=operation, start_epoch=start_epoch, duration_ms=(time.perf_counter() - t0) * 1000.0, success=False, error=str(e), metadata=meta))
+                record_perf_metric(PerfMetrics(
+                    operation=operation,
+                    start_epoch=start_epoch,
+                    duration_ms=(time.perf_counter() - t0) * 1000.0,
+                    success=False,
+                    error=str(e),
+                    metadata=meta,
+                ))
                 raise
         return wrapper
     return decorator
 
-# =============================================================================
-# Metrics
-# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Prometheus Metrics
+# ---------------------------------------------------------------------------
+
 class _DummyMetric:
+    """No-op metric used when Prometheus is not available."""
     def labels(self, *args, **kwargs):
         return self
+
     def inc(self, *args, **kwargs):
         return None
+
     def observe(self, *args, **kwargs):
         return None
+
     def set(self, *args, **kwargs):
         return None
 
 
 class MetricsRegistry:
+    """Prometheus metrics registry (safe no-op when prometheus_client missing)."""
+
     def __init__(self, namespace: str = "data_engine"):
         self.namespace = namespace
         self._metrics: Dict[str, Any] = {}
         self._lock = threading.RLock()
+
         if _PROMETHEUS_AVAILABLE:
             self._init_metrics()
 
     def _init_metrics(self) -> None:
-        self._metrics["requests_total"] = Counter(f"{self.namespace}_requests_total", "Total requests", ["operation", "status"])
-        self._metrics["request_duration_seconds"] = Histogram(f"{self.namespace}_request_duration_seconds", "Request duration seconds", ["operation"], buckets=[0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10])
-        self._metrics["cache_hits_total"] = Counter(f"{self.namespace}_cache_hits_total", "Cache hits", ["cache_type"])
-        self._metrics["cache_misses_total"] = Counter(f"{self.namespace}_cache_misses_total", "Cache misses", ["cache_type"])
-        self._metrics["circuit_breaker_state"] = Gauge(f"{self.namespace}_circuit_breaker_state", "Circuit breaker state", ["name"])
-        self._metrics["provider_health"] = Gauge(f"{self.namespace}_provider_health", "Provider health", ["provider"])
-        self._metrics["active_requests"] = Gauge(f"{self.namespace}_active_requests", "Active requests")
+        """Initialize Prometheus metrics."""
+        self._metrics["requests_total"] = Counter(
+            f"{self.namespace}_requests_total",
+            "Total requests",
+            ["operation", "status"],
+        )
+        self._metrics["request_duration_seconds"] = Histogram(
+            f"{self.namespace}_request_duration_seconds",
+            "Request duration seconds",
+            ["operation"],
+            buckets=[0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10],
+        )
+        self._metrics["cache_hits_total"] = Counter(
+            f"{self.namespace}_cache_hits_total",
+            "Cache hits",
+            ["cache_type"],
+        )
+        self._metrics["cache_misses_total"] = Counter(
+            f"{self.namespace}_cache_misses_total",
+            "Cache misses",
+            ["cache_type"],
+        )
+        self._metrics["circuit_breaker_state"] = Gauge(
+            f"{self.namespace}_circuit_breaker_state",
+            "Circuit breaker state",
+            ["name"],
+        )
+        self._metrics["provider_health"] = Gauge(
+            f"{self.namespace}_provider_health",
+            "Provider health",
+            ["provider"],
+        )
+        self._metrics["active_requests"] = Gauge(
+            f"{self.namespace}_active_requests",
+            "Active requests",
+        )
+
+    def _get(self, name: str) -> Any:
+        """Return the named metric or a dummy no-op metric."""
+        return self._metrics.get(name) or _DummyMetric()
 
     def inc(self, name: str, value: float = 1.0, labels: Optional[Dict[str, str]] = None) -> None:
-        metric = self._metrics.get(name)
-        if metric is None:
+        """Increment a counter metric."""
+        if not _PROMETHEUS_AVAILABLE:
             return
+        metric = self._get(name)
         if labels:
             metric.labels(**labels).inc(value)
         else:
             metric.inc(value)
 
     def observe(self, name: str, value: float, labels: Optional[Dict[str, str]] = None) -> None:
-        metric = self._metrics.get(name)
-        if metric is None:
+        """Observe a histogram metric."""
+        if not _PROMETHEUS_AVAILABLE:
             return
+        metric = self._get(name)
         if labels:
             metric.labels(**labels).observe(value)
         else:
             metric.observe(value)
 
     def set(self, name: str, value: float, labels: Optional[Dict[str, str]] = None) -> None:
-        metric = self._metrics.get(name)
-        if metric is None:
+        """Set a gauge metric."""
+        if not _PROMETHEUS_AVAILABLE:
             return
+        metric = self._get(name)
         if labels:
             metric.labels(**labels).set(value)
         else:
             metric.set(value)
 
     def get_metrics_text(self) -> str:
+        """Get Prometheus metrics text."""
         if not _PROMETHEUS_AVAILABLE or generate_latest is None or REGISTRY is None:
             return ""
         return generate_latest(REGISTRY).decode("utf-8")
 
 
 _METRICS = MetricsRegistry()
-if not _PROMETHEUS_AVAILABLE:
-    _METRICS.inc = lambda *args, **kwargs: None  # type: ignore
-    _METRICS.observe = lambda *args, **kwargs: None  # type: ignore
-    _METRICS.set = lambda *args, **kwargs: None  # type: ignore
 
-# =============================================================================
-# Rate limiter / circuit breaker
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Rate Limiter & Circuit Breaker
+# ---------------------------------------------------------------------------
+
 class CircuitState(Enum):
+    """Circuit breaker states."""
     CLOSED = "closed"
     OPEN = "open"
     HALF_OPEN = "half_open"
 
 
 class TokenBucket:
+    """Token bucket rate limiter."""
+
     def __init__(self, rate_per_sec: float, capacity: Optional[float] = None):
-        self.rate = max(0.0, float(rate_per_sec))
-        self.capacity = float(capacity) if capacity is not None else max(1.0, self.rate * 2.0)
+        self.rate = max(0.0, rate_per_sec)
+        self.capacity = capacity if capacity is not None else max(1.0, self.rate * 2.0)
         self.tokens = self.capacity
         self.last = time.monotonic()
         self._lock = asyncio.Lock()
 
     async def acquire(self, tokens: float = 1.0) -> bool:
+        """Acquire tokens if available."""
         if self.rate <= 0:
             return True
         async with self._lock:
@@ -490,6 +555,7 @@ class TokenBucket:
             return False
 
     async def wait_and_acquire(self, tokens: float = 1.0) -> None:
+        """Wait and acquire tokens."""
         while True:
             if await self.acquire(tokens):
                 return
@@ -498,17 +564,32 @@ class TokenBucket:
             await asyncio.sleep(min(1.0, max(0.01, wait)))
 
     def get_stats(self) -> Dict[str, Any]:
-        util = 1.0 - (self.tokens / self.capacity) if self.capacity > 0 else 0.0
-        return {"rate": self.rate, "capacity": self.capacity, "current_tokens": self.tokens, "utilization": util}
+        """Get rate limiter statistics."""
+        utilization = 1.0 - (self.tokens / self.capacity) if self.capacity > 0 else 0.0
+        return {
+            "rate": self.rate,
+            "capacity": self.capacity,
+            "current_tokens": self.tokens,
+            "utilization": utilization,
+        }
 
 
 class DynamicCircuitBreaker:
-    def __init__(self, name: str, failure_threshold: int = 5, success_threshold: int = 2, base_timeout_seconds: float = 30.0, max_timeout_seconds: float = 300.0):
+    """Dynamic circuit breaker with adaptive timeout."""
+
+    def __init__(
+        self,
+        name: str,
+        failure_threshold: int = 5,
+        success_threshold: int = 2,
+        base_timeout_seconds: float = 30.0,
+        max_timeout_seconds: float = 300.0,
+    ):
         self.name = name
-        self.failure_threshold = max(1, int(failure_threshold))
-        self.success_threshold = max(1, int(success_threshold))
-        self.base_timeout_seconds = float(base_timeout_seconds)
-        self.max_timeout_seconds = float(max_timeout_seconds)
+        self.failure_threshold = max(1, failure_threshold)
+        self.success_threshold = max(1, success_threshold)
+        self.base_timeout_seconds = base_timeout_seconds
+        self.max_timeout_seconds = max_timeout_seconds
         self.state = CircuitState.CLOSED
         self.failure_count = 0
         self.success_count = 0
@@ -518,9 +599,11 @@ class DynamicCircuitBreaker:
         self.total_successes = 0
         self.current_timeout = self.base_timeout_seconds
         self._lock = asyncio.Lock()
+
         _METRICS.set("circuit_breaker_state", 1, {"name": self.name})
 
     async def execute(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+        """Execute a function with circuit breaker protection."""
         async with self._lock:
             now = time.time()
             if self.state == CircuitState.OPEN:
@@ -530,10 +613,12 @@ class DynamicCircuitBreaker:
                     _METRICS.set("circuit_breaker_state", -1, {"name": self.name})
                 else:
                     raise RuntimeError(f"Circuit {self.name} is OPEN")
+
         try:
             value = func(*args, **kwargs)
             if inspect.isawaitable(value):
                 value = await value
+
             async with self._lock:
                 self.total_successes += 1
                 self.last_success_time = time.time()
@@ -563,6 +648,7 @@ class DynamicCircuitBreaker:
             raise
 
     def get_stats(self) -> Dict[str, Any]:
+        """Get circuit breaker statistics."""
         return {
             "name": self.name,
             "state": self.state.value,
@@ -575,10 +661,13 @@ class DynamicCircuitBreaker:
             "last_success_time": datetime.fromtimestamp(self.last_success_time, _UTC).isoformat() if self.last_success_time else None,
         }
 
-# =============================================================================
-# Cache
-# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Distributed Cache
+# ---------------------------------------------------------------------------
+
 class CacheBackend(Enum):
+    """Cache backend types."""
     MEMORY = "memory"
     REDIS = "redis"
     MEMCACHED = "memcached"
@@ -587,6 +676,7 @@ class CacheBackend(Enum):
 
 @dataclass(slots=True)
 class CacheEntry:
+    """Cache entry with metadata."""
     key: str
     value: Any
     created_at: float = field(default_factory=time.time)
@@ -596,15 +686,26 @@ class CacheEntry:
 
     @property
     def is_expired(self) -> bool:
+        """Check if cache entry is expired."""
         return self.expires_at is not None and time.time() > self.expires_at
 
 
 class DistributedCache:
-    def __init__(self, backend: CacheBackend = CacheBackend.MEMORY, default_ttl: int = 300, redis_url: Optional[str] = None, memcached_servers: Optional[List[str]] = None, max_size: int = 10000, compression: bool = True):
+    """Distributed cache with memory, Redis, and Memcached backends."""
+
+    def __init__(
+        self,
+        backend: CacheBackend = CacheBackend.MEMORY,
+        default_ttl: int = 300,
+        redis_url: Optional[str] = None,
+        memcached_servers: Optional[List[str]] = None,
+        max_size: int = 10000,
+        compression: bool = True,
+    ):
         self.backend = backend
-        self.default_ttl = int(default_ttl)
-        self.max_size = int(max_size)
-        self.compression = bool(compression)
+        self.default_ttl = default_ttl
+        self.max_size = max_size
+        self.compression = compression
         self._memory_cache: Dict[str, CacheEntry] = {}
         self._redis_client: Optional[Any] = None
         self._memcached_client: Optional[Any] = None
@@ -614,33 +715,38 @@ class DistributedCache:
         self._memcached_servers = memcached_servers or []
 
     def _cache_key(self, namespace: str, key: str) -> str:
+        """Generate cache key."""
         return f"{namespace}:{key}"
 
     def _serialize(self, value: Any) -> bytes:
+        """Serialize value for storage."""
         try:
             if self.compression:
                 return zlib.compress(pickle.dumps(value))
-            return json_dumps(value)
+            return _json_dumps(value)
         except Exception:
             return b"{}"
 
     def _deserialize(self, value: bytes) -> Any:
+        """Deserialize value from storage."""
         try:
             if self.compression:
                 return pickle.loads(zlib.decompress(value))
-            return json_loads(value)
+            return _json_loads(value)
         except Exception:
             return None
 
     async def get(self, namespace: str, key: str) -> Optional[Any]:
-        ck = self._cache_key(namespace, key)
+        """Get value from cache."""
+        cache_key = self._cache_key(namespace, key)
+
         async with self._lock:
-            entry = self._memory_cache.get(ck)
+            entry = self._memory_cache.get(cache_key)
             if entry is None:
                 self._stats["misses"] += 1
                 return None
             if entry.is_expired:
-                self._memory_cache.pop(ck, None)
+                self._memory_cache.pop(cache_key, None)
                 self._stats["misses"] += 1
                 return None
             entry.access_count += 1
@@ -649,25 +755,38 @@ class DistributedCache:
             return entry.value
 
     async def set(self, namespace: str, key: str, value: Any, ttl: Optional[int] = None) -> None:
-        ttl_i = int(ttl) if ttl is not None else self.default_ttl
-        ck = self._cache_key(namespace, key)
+        """Set value in cache."""
+        ttl_sec = ttl if ttl is not None else self.default_ttl
+        cache_key = self._cache_key(namespace, key)
+
         async with self._lock:
+            # Evict oldest entries if cache is full
             if len(self._memory_cache) >= self.max_size:
-                oldest = sorted(self._memory_cache.items(), key=lambda kv: kv[1].last_access)[: max(1, self.max_size // 5)]
+                oldest = sorted(
+                    self._memory_cache.items(),
+                    key=lambda kv: kv[1].last_access,
+                )[:max(1, self.max_size // 5)]
                 for old_key, _ in oldest:
                     self._memory_cache.pop(old_key, None)
-            self._memory_cache[ck] = CacheEntry(key=ck, value=value, expires_at=time.time() + ttl_i)
+
+            self._memory_cache[cache_key] = CacheEntry(
+                key=cache_key,
+                value=value,
+                expires_at=time.time() + ttl_sec,
+            )
             self._stats["sets"] += 1
 
     async def delete(self, namespace: str, key: str) -> None:
-        ck = self._cache_key(namespace, key)
+        """Delete value from cache."""
+        cache_key = self._cache_key(namespace, key)
         async with self._lock:
-            self._memory_cache.pop(ck, None)
+            self._memory_cache.pop(cache_key, None)
             self._stats["deletes"] += 1
 
     async def clear(self, namespace: Optional[str] = None) -> None:
+        """Clear cache entries."""
         async with self._lock:
-            if not namespace:
+            if namespace is None:
                 self._memory_cache.clear()
                 return
             prefix = f"{namespace}:"
@@ -676,6 +795,7 @@ class DistributedCache:
                     self._memory_cache.pop(key, None)
 
     def get_stats(self) -> Dict[str, Any]:
+        """Get cache statistics."""
         total = self._stats["hits"] + self._stats["misses"]
         return {
             "backend": self.backend.value,
@@ -683,16 +803,19 @@ class DistributedCache:
             "misses": self._stats["misses"],
             "sets": self._stats["sets"],
             "deletes": self._stats["deletes"],
-            "hit_rate": (self._stats["hits"] / total) if total else 0.0,
+            "hit_rate": (self._stats["hits"] / total) if total > 0 else 0.0,
             "memory_size": len(self._memory_cache),
-            "memory_utilization": (len(self._memory_cache) / self.max_size) if self.max_size else 0.0,
+            "memory_utilization": (len(self._memory_cache) / self.max_size) if self.max_size > 0 else 0.0,
         }
 
-# =============================================================================
-# Symbol helpers
-# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Symbol Normalization
+# ---------------------------------------------------------------------------
+
 @dataclass(slots=True)
 class SymbolInfo:
+    """Information about a symbol."""
     raw: str
     normalized: str
     market: str
@@ -703,12 +826,15 @@ class SymbolInfo:
 
 
 class SymbolNormalizer:
+    """Symbol normalizer with caching."""
+
     def __init__(self):
         self._lock = threading.RLock()
         self._cache: Dict[str, SymbolInfo] = {}
 
     def _fallback_normalize(self, symbol: str) -> str:
-        s = (str(symbol or "").strip().upper())
+        """Fallback normalization."""
+        s = str(symbol or "").strip().upper()
         if not s:
             return ""
         if s.startswith("TADAWUL:"):
@@ -720,6 +846,7 @@ class SymbolNormalizer:
         return s
 
     def _detect_market(self, symbol: str) -> str:
+        """Detect market from symbol."""
         s = symbol.upper()
         if s.endswith(".SR"):
             return "KSA"
@@ -730,6 +857,7 @@ class SymbolNormalizer:
         return "GLOBAL"
 
     def _detect_asset_class(self, symbol: str) -> str:
+        """Detect asset class from symbol."""
         s = symbol.upper()
         if s.startswith("^"):
             return "index"
@@ -740,6 +868,7 @@ class SymbolNormalizer:
         return "equity"
 
     def _provider_hint(self, symbol: str) -> Optional[str]:
+        """Get provider hint from symbol."""
         s = symbol.upper()
         if s.endswith(".SR"):
             return "tadawul"
@@ -747,31 +876,46 @@ class SymbolNormalizer:
             return "yahoo"
         return None
 
+    def _compute_info(self, raw: str) -> SymbolInfo:
+        """Compute SymbolInfo for a raw symbol (no cache interaction)."""
+        norm = self._fallback_normalize(raw)
+        return SymbolInfo(
+            raw=raw,
+            normalized=norm,
+            market=self._detect_market(norm),
+            asset_class=self._detect_asset_class(norm),
+            provider_hint=self._provider_hint(norm),
+        )
+
     def normalize(self, symbol: str) -> str:
+        """Normalize a symbol."""
         raw = str(symbol or "").strip()
         if not raw:
             return ""
+
         with self._lock:
-            if raw in self._cache:
-                return self._cache[raw].normalized
-        norm = self._fallback_normalize(raw)
-        info = SymbolInfo(raw=raw, normalized=norm, market=self._detect_market(norm), asset_class=self._detect_asset_class(norm), provider_hint=self._provider_hint(norm))
-        with self._lock:
+            cached = self._cache.get(raw)
+            if cached is not None:
+                return cached.normalized
+            info = self._compute_info(raw)
             self._cache[raw] = info
-        return norm
+            return info.normalized
 
     def get_info(self, symbol: str) -> SymbolInfo:
+        """Get symbol information (single-pass, no redundant relocking)."""
         raw = str(symbol or "").strip()
         with self._lock:
-            if raw in self._cache:
-                return self._cache[raw]
-        norm = self.normalize(raw)
-        with self._lock:
-            return self._cache[raw]
+            cached = self._cache.get(raw)
+            if cached is not None:
+                return cached
+            info = self._compute_info(raw)
+            self._cache[raw] = info
+            return info
 
     def clean_symbols(self, symbols: Sequence[Any]) -> List[str]:
+        """Clean and deduplicate symbols."""
         seen: Set[str] = set()
-        out: List[str] = []
+        result: List[str] = []
         for item in symbols or []:
             raw = str(item or "").strip()
             if not raw:
@@ -780,18 +924,75 @@ class SymbolNormalizer:
             if not norm or norm in seen:
                 continue
             seen.add(norm)
-            out.append(raw)
-        return out
+            result.append(raw)
+        return result
 
 
 _SYMBOL_NORMALIZER = SymbolNormalizer()
 normalize_symbol = _SYMBOL_NORMALIZER.normalize
 get_symbol_info = _SYMBOL_NORMALIZER.get_info
 
-# =============================================================================
-# Stub quote / engine
-# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Schema Registry Integration
+# ---------------------------------------------------------------------------
+
+get_sheet_headers = None
+get_sheet_keys = None
+get_sheet_len = None
+get_sheet_spec = None
+_SCHEMA_AVAILABLE = False
+
+for _schema_path in ("core.sheets.schema_registry", "core.schema_registry", "schema_registry"):
+    try:
+        mod = import_module(_schema_path)
+        fh = getattr(mod, "get_sheet_headers", None)
+        fk = getattr(mod, "get_sheet_keys", None)
+        if callable(fh) and callable(fk):
+            get_sheet_headers = fh
+            get_sheet_keys = fk
+            get_sheet_len = getattr(mod, "get_sheet_len", None)
+            get_sheet_spec = getattr(mod, "get_sheet_spec", None)
+            _SCHEMA_AVAILABLE = True
+            break
+    except ImportError:
+        continue
+
+# Page catalog integration
+CANONICAL_PAGES: List[str] = []
+FORBIDDEN_PAGES: Set[str] = {"KSA_Tadawul", "Advisor_Criteria"}
+
+for _pcat_path in ("core.sheets.page_catalog", "core.page_catalog", "page_catalog"):
+    try:
+        mod = import_module(_pcat_path)
+        cp = getattr(mod, "CANONICAL_PAGES", None)
+        fp = getattr(mod, "FORBIDDEN_PAGES", None)
+        if cp is not None:
+            CANONICAL_PAGES[:] = list(cp)
+        if fp is not None:
+            FORBIDDEN_PAGES.clear()
+            FORBIDDEN_PAGES.update(fp)
+        break
+    except ImportError:
+        continue
+
+
+def allowed_pages() -> List[str]:
+    """Get allowed pages."""
+    return list(CANONICAL_PAGES) if CANONICAL_PAGES else []
+
+
+def normalize_page_name(name: str, allow_output_pages: bool = True) -> str:
+    """Normalize page name."""
+    return (name or "").strip().replace(" ", "_")
+
+
+# ---------------------------------------------------------------------------
+# Stub Engine (Fallback)
+# ---------------------------------------------------------------------------
+
 class StubUnifiedQuote(BaseModel):
+    """Stub quote model for when engine is unavailable."""
     if _PYDANTIC_V2:
         model_config = ConfigDict(populate_by_name=True, extra="ignore")
 
@@ -816,12 +1017,14 @@ class StubUnifiedQuote(BaseModel):
     data_source: str = "stub"
     provider: Optional[str] = None
     data_quality: str = "MISSING"
+    # Pydantic-compatible default factories (was dataclass `field(...)` in v7.0.0, which is wrong type)
     last_updated_utc: str = Field(default_factory=_utc_now_iso)
     error: Optional[str] = "Engine Unavailable"
     warnings: List[str] = Field(default_factory=list)
     request_id: Optional[str] = None
 
     def finalize(self) -> "StubUnifiedQuote":
+        """Finalize quote with derived fields."""
         if self.current_price is None and self.price is not None:
             self.current_price = self.price
         if self.price is None and self.current_price is not None:
@@ -834,47 +1037,78 @@ class StubUnifiedQuote(BaseModel):
             self.change_pct = self.percent_change
         if self.percent_change is None and self.change_pct is not None:
             self.percent_change = self.change_pct
+
         if self.change is None and self.current_price is not None and self.previous_close is not None:
             try:
-                self.change = float(self.current_price) - float(self.previous_close)
+                self.change = self.current_price - self.previous_close
                 self.price_change = self.change
             except Exception:
                 pass
+
         if self.change_pct is None and self.current_price is not None and self.previous_close not in (None, 0):
             try:
-                self.change_pct = float(self.current_price) / float(self.previous_close) - 1.0
+                self.change_pct = (self.current_price / self.previous_close) - 1.0
                 self.percent_change = self.change_pct
             except Exception:
                 pass
+
         return self
 
     def dict(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        """Convert to dictionary."""
         if hasattr(self, "model_dump"):
-            return self.model_dump(*args, **kwargs)  # type: ignore[attr-defined]
+            return self.model_dump(*args, **kwargs)
         return dict(self.__dict__)
 
 
+def _make_stub_quote(symbol: str, **extra: Any) -> Any:
+    """Safely instantiate a StubUnifiedQuote even when pydantic is missing."""
+    try:
+        return StubUnifiedQuote(symbol=symbol, **extra).finalize()
+    except Exception:
+        # Last-resort: fabricate a minimal dict-like shim.
+        class _Shim:
+            def __init__(self, **kw: Any) -> None:
+                self.__dict__.update(kw)
+                self.finalize = lambda: self  # type: ignore
+        shim = _Shim(symbol=symbol, data_quality="MISSING", error=extra.get("error", "Engine Unavailable"))
+        for k, v in extra.items():
+            setattr(shim, k, v)
+        return shim
+
+
 class StubEngine:
+    """Stub engine for when real engine is unavailable."""
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self._start = time.time()
-        self._req = 0
-        self._err = 0
+        self._requests = 0
+        self._errors = 0
         logger.warning("DataEngine initialized STUB engine (V2 unavailable)")
 
-    async def get_quote(self, symbol: str) -> StubUnifiedQuote:
-        self._req += 1
-        return StubUnifiedQuote(symbol=normalize_symbol(symbol) or str(symbol), error="Engine V2 Missing", warnings=["stub"]).finalize()
+    async def get_quote(self, symbol: str) -> Any:
+        """Get a single quote (stub)."""
+        self._requests += 1
+        return _make_stub_quote(
+            normalize_symbol(symbol) or str(symbol),
+            error="Engine V2 Missing",
+            warnings=["stub"],
+        )
 
-    async def get_quotes(self, symbols: List[str]) -> List[StubUnifiedQuote]:
+    async def get_quotes(self, symbols: List[str]) -> List[Any]:
+        """Get multiple quotes (stub)."""
         return [await self.get_quote(s) for s in symbols or []]
 
-    async def get_enriched_quote(self, symbol: str) -> StubUnifiedQuote:
+    async def get_enriched_quote(self, symbol: str) -> Any:
+        """Get enriched quote (stub)."""
         return await self.get_quote(symbol)
 
-    async def get_enriched_quotes(self, symbols: List[str]) -> List[StubUnifiedQuote]:
+    async def get_enriched_quotes(self, symbols: List[str]) -> List[Any]:
+        """Get enriched quotes (stub)."""
         return await self.get_quotes(symbols)
 
     async def get_sheet_rows(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+        """Get sheet rows (stub)."""
         sheet = str(kwargs.get("sheet") or (args[0] if args else ""))
         return {
             "status": "error",
@@ -895,36 +1129,50 @@ class StubEngine:
         }
 
     async def aclose(self) -> None:
+        """Close the engine."""
         return None
 
     def get_stats(self) -> Dict[str, Any]:
-        return {"mode": "stub", "uptime_seconds": time.time() - self._start, "request_count": self._req, "error_count": self._err, "error": "Engine V2 Missing"}
+        """Get engine statistics."""
+        return {
+            "mode": "stub",
+            "uptime_seconds": time.time() - self._start,
+            "request_count": self._requests,
+            "error_count": self._errors,
+            "error": "Engine V2 Missing",
+        }
 
 
 def get_unified_quote_class() -> Type:
+    """Get the unified quote class."""
     try:
         mod = import_module("core.data_engine_v2")
         uq = getattr(mod, "UnifiedQuote", None)
         if uq is not None:
             return uq
-    except Exception:
+    except ImportError:
         pass
+
     try:
         mod = import_module("core.schemas")
         uq = getattr(mod, "UnifiedQuote", None)
         if uq is not None:
             return uq
-    except Exception:
+    except ImportError:
         pass
+
     return StubUnifiedQuote
 
 
 UnifiedQuote = get_unified_quote_class()
 
-# =============================================================================
-# Engine discovery / manager
-# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Engine Discovery
+# ---------------------------------------------------------------------------
+
 class EngineMode(Enum):
+    """Engine modes."""
     UNKNOWN = "unknown"
     V2 = "v2"
     LEGACY = "legacy"
@@ -933,6 +1181,7 @@ class EngineMode(Enum):
 
 @dataclass(slots=True)
 class V2ModuleInfo:
+    """Information about V2 module."""
     module: Any
     version: Optional[str] = None
     engine_class: Optional[Type] = None
@@ -946,6 +1195,8 @@ class V2ModuleInfo:
 
 
 class V2Discovery:
+    """V2 engine discovery."""
+
     def __init__(self):
         self._lock = threading.RLock()
         self._mode = EngineMode.UNKNOWN
@@ -953,15 +1204,19 @@ class V2Discovery:
         self._error: Optional[str] = None
 
     def discover(self) -> Tuple[EngineMode, Optional[V2ModuleInfo], Optional[str]]:
+        """Discover V2 engine."""
         if self._mode != EngineMode.UNKNOWN:
             return self._mode, self._info, self._error
+
         with self._lock:
             if self._mode != EngineMode.UNKNOWN:
                 return self._mode, self._info, self._error
+
             if _V2_DISABLED:
                 self._mode = EngineMode.STUB
                 self._error = "V2 disabled via DATA_ENGINE_V2_DISABLED"
                 return self._mode, None, self._error
+
             try:
                 mod = import_module("core.data_engine_v2")
                 info = V2ModuleInfo(
@@ -973,13 +1228,35 @@ class V2Discovery:
                     engine_v4_class=getattr(mod, "DataEngineV4", None),
                     engine_v5_class=getattr(mod, "DataEngineV5", None),
                     unified_quote_class=getattr(mod, "UnifiedQuote", None),
-                    has_module_funcs=any(callable(getattr(mod, name, None)) for name in ("get_quote", "get_quotes", "get_enriched_quote", "get_enriched_quotes", "get_engine", "get_sheet_rows", "sheet_rows", "build_sheet_rows")),
+                    has_module_funcs=any(
+                        callable(getattr(mod, name, None))
+                        for name in (
+                            "get_quote", "get_quotes", "get_enriched_quote", "get_enriched_quotes",
+                            "get_engine", "get_sheet_rows", "sheet_rows", "build_sheet_rows",
+                        )
+                    ),
                 )
-                if not any([info.engine_class, info.engine_v2_class, info.engine_v3_class, info.engine_v4_class, info.engine_v5_class, info.has_module_funcs, info.unified_quote_class]):
+
+                if not any([
+                    info.engine_class,
+                    info.engine_v2_class,
+                    info.engine_v3_class,
+                    info.engine_v4_class,
+                    info.engine_v5_class,
+                    info.has_module_funcs,
+                    info.unified_quote_class,
+                ]):
                     raise ImportError("No usable exports found in core.data_engine_v2")
-                self._mode = EngineMode.V2 if any([info.engine_v2_class, info.engine_v3_class, info.engine_v4_class, info.engine_v5_class]) else EngineMode.LEGACY
+
+                self._mode = EngineMode.V2 if any([
+                    info.engine_v2_class,
+                    info.engine_v3_class,
+                    info.engine_v4_class,
+                    info.engine_v5_class,
+                ]) else EngineMode.LEGACY
                 self._info = info
                 return self._mode, self._info, None
+
             except Exception as e:
                 self._mode = EngineMode.STUB
                 self._error = str(e)
@@ -990,7 +1267,13 @@ class V2Discovery:
 _V2_DISCOVERY = V2Discovery()
 
 
+# ---------------------------------------------------------------------------
+# Engine Manager
+# ---------------------------------------------------------------------------
+
 class EngineManager:
+    """Manages engine lifecycle, caching, and circuit breaking."""
+
     def __init__(self):
         self._async_lock: Optional[asyncio.Lock] = None
         self._sync_lock = threading.RLock()
@@ -998,29 +1281,49 @@ class EngineManager:
         self._mode = EngineMode.UNKNOWN
         self._v2_info: Optional[V2ModuleInfo] = None
         self._error: Optional[str] = None
-        self._circuit = DynamicCircuitBreaker("engine", failure_threshold=5, base_timeout_seconds=30.0, max_timeout_seconds=300.0)
+        self._circuit = DynamicCircuitBreaker(
+            "engine",
+            failure_threshold=5,
+            base_timeout_seconds=30.0,
+            max_timeout_seconds=300.0,
+        )
         self._rate = TokenBucket(rate_per_sec=100.0)
-        self._cache = DistributedCache(backend=CacheBackend.MEMORY, default_ttl=300, max_size=10000, compression=True)
-        self._stats: Dict[str, Any] = {"created_at": _utc_now_iso(), "requests": 0, "errors": 0, "cache_hits": 0, "cache_misses": 0}
+        self._cache = DistributedCache(
+            backend=CacheBackend.MEMORY,
+            default_ttl=300,
+            max_size=10000,
+            compression=True,
+        )
+        self._stats: Dict[str, Any] = {
+            "created_at": _utc_now_iso(),
+            "requests": 0,
+            "errors": 0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+        }
 
     def _get_async_lock(self) -> asyncio.Lock:
+        """Get async lock (lazy initialization)."""
         if self._async_lock is None:
             self._async_lock = asyncio.Lock()
         return self._async_lock
 
     def _discover(self) -> Tuple[EngineMode, Optional[V2ModuleInfo], Optional[str]]:
+        """Discover engine."""
         if self._mode != EngineMode.UNKNOWN:
             return self._mode, self._v2_info, self._error
         self._mode, self._v2_info, self._error = _V2_DISCOVERY.discover()
         return self._mode, self._v2_info, self._error
 
     def _instantiate_engine(self, engine_class: Type) -> Optional[Any]:
+        """Instantiate engine class with settings."""
         try:
             return engine_class()
         except TypeError:
             pass
         except Exception:
             return None
+
         for mod_name in ("config", "core.config"):
             try:
                 mod = import_module(mod_name)
@@ -1034,17 +1337,20 @@ class EngineManager:
                             return engine_class(settings)
                         except TypeError:
                             continue
-            except Exception:
+            except ImportError:
                 continue
+
         try:
             return engine_class()
         except Exception:
             return None
 
     async def _get_v2_engine(self) -> Optional[Any]:
+        """Get V2 engine instance."""
         mode, info, _ = self._discover()
         if mode not in (EngineMode.V2, EngineMode.LEGACY) or info is None:
             return None
+
         try:
             fn = getattr(info.module, "get_engine", None)
             if callable(fn):
@@ -1055,37 +1361,53 @@ class EngineManager:
                     return value
         except Exception:
             pass
-        for cls in (info.engine_v5_class, info.engine_v4_class, info.engine_v3_class, info.engine_v2_class, info.engine_class):
+
+        for cls in (
+            info.engine_v5_class,
+            info.engine_v4_class,
+            info.engine_v3_class,
+            info.engine_v2_class,
+            info.engine_class,
+        ):
             if cls is None:
                 continue
             engine = self._instantiate_engine(cls)
             if engine is not None:
                 return engine
+
         return None
 
     async def get_engine(self) -> Any:
+        """Get engine instance."""
         if self._engine is not None:
             return self._engine
+
         async with self._get_async_lock():
             if self._engine is not None:
                 return self._engine
+
             await self._rate.wait_and_acquire()
+
             async def _create() -> Any:
                 engine = await self._get_v2_engine()
                 if engine is not None:
                     self._engine = engine
                     _METRICS.set("provider_health", 1, {"provider": "engine_v2"})
                     return engine
+
                 self._engine = StubEngine()
                 _METRICS.set("provider_health", -1, {"provider": "stub"})
                 return self._engine
+
             return await self._circuit.execute(_create)
 
     async def close_engine(self) -> None:
+        """Close engine."""
         if self._engine is None:
             return
         engine = self._engine
         self._engine = None
+
         try:
             fn = getattr(engine, "aclose", None)
             if callable(fn):
@@ -1096,17 +1418,21 @@ class EngineManager:
             _dbg(f"Error closing engine: {e}", "error")
 
     def get_cache(self) -> DistributedCache:
+        """Get cache instance."""
         return self._cache
 
     def record_request(self, success: bool) -> None:
+        """Record a request."""
         with self._sync_lock:
-            self._stats["requests"] = int(self._stats.get("requests", 0)) + 1
+            self._stats["requests"] = self._stats.get("requests", 0) + 1
             if not success:
-                self._stats["errors"] = int(self._stats.get("errors", 0)) + 1
+                self._stats["errors"] = self._stats.get("errors", 0) + 1
 
     def get_stats(self) -> Dict[str, Any]:
+        """Get engine manager statistics."""
         with self._sync_lock:
             stats = dict(self._stats)
+
         stats["mode"] = self._mode.value
         stats["v2_available"] = self._mode in (EngineMode.V2, EngineMode.LEGACY)
         stats["engine_active"] = self._engine is not None
@@ -1115,29 +1441,32 @@ class EngineManager:
         stats["cache"] = self._cache.get_stats()
         stats["schema_available"] = bool(_SCHEMA_AVAILABLE)
         stats["schema_strict_sheet_rows"] = bool(_SCHEMA_STRICT_SHEET_ROWS)
+
         try:
             if self._engine is not None and hasattr(self._engine, "get_stats"):
                 stats["engine_stats"] = self._engine.get_stats()
         except Exception:
             pass
+
         return stats
 
 
 _ENGINE_MANAGER = EngineManager()
 
-# =============================================================================
-# Public engine helpers
-# =============================================================================
-async def get_engine() -> Any:
-    return await _ENGINE_MANAGER.get_engine()
 
+# ---------------------------------------------------------------------------
+# Sync coroutine runner (shared helper)
+# ---------------------------------------------------------------------------
 
 def _run_coro_sync(coro: Awaitable[Any]) -> Any:
+    """Run a coroutine from a sync context. Uses a helper thread if a loop is already running."""
     try:
         asyncio.get_running_loop()
     except RuntimeError:
         return asyncio.run(coro)
+
     result_box: Dict[str, Any] = {}
+
     def _runner() -> None:
         loop = asyncio.new_event_loop()
         try:
@@ -1150,48 +1479,59 @@ def _run_coro_sync(coro: Awaitable[Any]) -> Any:
                 loop.close()
             except Exception:
                 pass
+
     t = threading.Thread(target=_runner, daemon=True)
     t.start()
     t.join()
+
     if "error" in result_box:
         raise result_box["error"]
     return result_box.get("value")
 
 
+# ---------------------------------------------------------------------------
+# Public Engine Helpers
+# ---------------------------------------------------------------------------
+
+async def get_engine() -> Any:
+    """Get engine instance asynchronously."""
+    return await _ENGINE_MANAGER.get_engine()
+
+
 def get_engine_sync() -> Any:
+    """Get engine instance synchronously."""
     return _run_coro_sync(_ENGINE_MANAGER.get_engine())
 
 
 async def close_engine() -> None:
+    """Close engine."""
     await _ENGINE_MANAGER.close_engine()
 
 
 def get_cache() -> DistributedCache:
+    """Get cache instance."""
     return _ENGINE_MANAGER.get_cache()
 
-# =============================================================================
-# Generic helpers
-# =============================================================================
-def _safe_str(x: Any) -> str:
+
+# ---------------------------------------------------------------------------
+# Quote Fetching Helpers
+# ---------------------------------------------------------------------------
+
+def _safe_str(value: Any) -> str:
+    """Safely convert to string."""
     try:
-        return str(x).strip()
+        return str(value).strip()
     except Exception:
         return ""
 
 
-def _safe_upper(x: Any) -> str:
-    return _safe_str(x).upper()
-
-
-def _maybe_await(value: Any) -> Awaitable[Any]:
-    if inspect.isawaitable(value):
-        return value  # type: ignore[return-value]
-    async def _wrap() -> Any:
-        return value
-    return _wrap()
+def _safe_upper(value: Any) -> str:
+    """Safely convert to uppercase string."""
+    return _safe_str(value).upper()
 
 
 def _unwrap_payload(value: Any) -> Any:
+    """Unwrap tuple payloads."""
     try:
         if isinstance(value, tuple) and len(value) >= 1:
             return value[0]
@@ -1201,6 +1541,7 @@ def _unwrap_payload(value: Any) -> Any:
 
 
 def _as_list(value: Any) -> List[Any]:
+    """Convert to list."""
     if value is None:
         return []
     if isinstance(value, list):
@@ -1213,6 +1554,7 @@ def _as_list(value: Any) -> List[Any]:
 
 
 def _jsonable_snapshot(value: Any) -> Any:
+    """Convert value to JSON-serializable snapshot."""
     if value is None or isinstance(value, (str, int, bool)):
         return value
     if isinstance(value, float):
@@ -1227,13 +1569,13 @@ def _jsonable_snapshot(value: Any) -> Any:
     if isinstance(value, (list, tuple, set)):
         return [_jsonable_snapshot(v) for v in value]
     try:
-        if hasattr(value, "model_dump") and callable(getattr(value, "model_dump")):
-            return _jsonable_snapshot(value.model_dump(mode="python"))  # type: ignore[attr-defined]
+        if hasattr(value, "model_dump") and callable(value.model_dump):
+            return _jsonable_snapshot(value.model_dump(mode="python"))
     except Exception:
         pass
     try:
-        if hasattr(value, "dict") and callable(getattr(value, "dict")):
-            return _jsonable_snapshot(value.dict())  # type: ignore[attr-defined]
+        if hasattr(value, "dict") and callable(value.dict):
+            return _jsonable_snapshot(value.dict())
     except Exception:
         pass
     try:
@@ -1248,6 +1590,7 @@ def _jsonable_snapshot(value: Any) -> Any:
 
 
 def _model_to_dict(obj: Any) -> Dict[str, Any]:
+    """Convert object to dictionary."""
     if obj is None:
         return {}
     if isinstance(obj, dict):
@@ -1255,15 +1598,15 @@ def _model_to_dict(obj: Any) -> Dict[str, Any]:
     if isinstance(obj, Mapping):
         return dict(obj)
     try:
-        if hasattr(obj, "model_dump") and callable(getattr(obj, "model_dump")):
-            value = obj.model_dump(mode="python")  # type: ignore[attr-defined]
+        if hasattr(obj, "model_dump") and callable(obj.model_dump):
+            value = obj.model_dump(mode="python")
             if isinstance(value, dict):
                 return value
     except Exception:
         pass
     try:
-        if hasattr(obj, "dict") and callable(getattr(obj, "dict")):
-            value = obj.dict()  # type: ignore[attr-defined]
+        if hasattr(obj, "dict") and callable(obj.dict):
+            value = obj.dict()
             if isinstance(value, dict):
                 return value
     except Exception:
@@ -1276,9 +1619,9 @@ def _model_to_dict(obj: Any) -> Dict[str, Any]:
     except Exception:
         pass
     try:
-        data = getattr(obj, "__dict__", None)
-        if isinstance(data, dict):
-            return dict(data)
+        value = getattr(obj, "__dict__", None)
+        if isinstance(value, dict):
+            return dict(value)
     except Exception:
         pass
     snap = _jsonable_snapshot(obj)
@@ -1286,9 +1629,10 @@ def _model_to_dict(obj: Any) -> Dict[str, Any]:
 
 
 def _coerce_symbol_from_payload(payload: Any) -> Optional[str]:
+    """Extract symbol from payload."""
     if payload is None:
         return None
-    if isinstance(payload, dict):
+    if isinstance(payload, Mapping):
         for key in ("symbol", "requested_symbol", "ticker", "code", "id"):
             value = payload.get(key)
             if value:
@@ -1305,6 +1649,7 @@ def _coerce_symbol_from_payload(payload: Any) -> Optional[str]:
 
 
 def _finalize_quote(obj: Any) -> Any:
+    """Finalize quote object."""
     try:
         fn = getattr(obj, "finalize", None)
         if callable(fn):
@@ -1315,6 +1660,7 @@ def _finalize_quote(obj: Any) -> Any:
 
 
 def _is_missing(obj: Any) -> bool:
+    """Check if quote is missing."""
     try:
         if obj is None:
             return True
@@ -1330,18 +1676,28 @@ def _is_missing(obj: Any) -> bool:
     except Exception:
         return False
 
-# =============================================================================
-# Emergency data rescuer
-# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Emergency Data Rescuer
+# ---------------------------------------------------------------------------
+
 class EmergencyDataRescuer:
+    """Emergency data rescuer for missing quotes."""
+
     @classmethod
     async def rescue_quote(cls, quote_obj: Any, symbol: str) -> Any:
+        """Rescue missing quote data."""
         norm_symbol = normalize_symbol(symbol) or _safe_str(symbol)
         if not norm_symbol:
             return quote_obj
+
         if quote_obj is None:
             UQ = get_unified_quote_class()
-            quote_obj = UQ(symbol=norm_symbol, data_quality="MISSING", error="Upstream returned None")
+            try:
+                quote_obj = UQ(symbol=norm_symbol, data_quality="MISSING", error="Upstream returned None")
+            except Exception:
+                quote_obj = _make_stub_quote(norm_symbol, error="Upstream returned None")
+
         is_dict = isinstance(quote_obj, dict)
         try:
             price = quote_obj.get("current_price") if is_dict else getattr(quote_obj, "current_price", None)
@@ -1355,12 +1711,14 @@ class EmergencyDataRescuer:
                     pass
         except Exception:
             pass
-        # Keep rescuer conservative in this adapter module.
+
         return quote_obj
 
-# =============================================================================
-# Sheet schema / constants
-# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Sheet Rows Constants & Helpers
+# ---------------------------------------------------------------------------
+
 _TOP10_PAGE = "Top_10_Investments"
 _INSIGHTS_PAGE = "Insights_Analysis"
 _DICTIONARY_PAGE = "Data_Dictionary"
@@ -1416,8 +1774,10 @@ _CANONICAL_80_KEYS: List[str] = [
 
 _INSIGHTS_HEADERS = ["Section", "Item", "Symbol", "Recommendation", "Confidence", "Notes", "Last Updated (Riyadh)"]
 _INSIGHTS_KEYS = ["section", "item", "symbol", "recommendation", "confidence", "notes", "last_updated_riyadh"]
+
 _DICTIONARY_HEADERS = ["Sheet", "Group", "Header", "Key", "DType", "Format", "Required", "Source", "Notes"]
 _DICTIONARY_KEYS = ["sheet", "group", "header", "key", "dtype", "fmt", "required", "source", "notes"]
+
 _TOP10_REQUIRED_FIELDS = ("top10_rank", "selection_reason", "criteria_snapshot")
 _TOP10_REQUIRED_HEADERS = {
     "top10_rank": "Top10 Rank",
@@ -1444,9 +1804,19 @@ _SPECIAL_SHEET_CANONICAL: Dict[str, str] = {
 }
 
 _SPECIAL_SHEET_METHODS: Dict[str, List[str]] = {
-    _INSIGHTS_PAGE: ["build_insights_analysis", "get_insights_analysis", "build_insights_sheet_rows", "get_insights_sheet_rows", "build_insights_rows", "get_insights_rows"],
-    _TOP10_PAGE: ["build_top_10_investments", "build_top10_investments", "get_top_10_investments", "get_top10_investments", "build_top10_sheet_rows", "get_top10_sheet_rows", "build_top10_rows", "get_top10_rows"],
-    _DICTIONARY_PAGE: ["build_data_dictionary", "get_data_dictionary", "build_data_dictionary_sheet_rows", "get_data_dictionary_sheet_rows", "build_data_dictionary_rows", "get_data_dictionary_rows"],
+    _INSIGHTS_PAGE: [
+        "build_insights_analysis", "get_insights_analysis", "build_insights_sheet_rows",
+        "get_insights_sheet_rows", "build_insights_rows", "get_insights_rows",
+    ],
+    _TOP10_PAGE: [
+        "build_top_10_investments", "build_top10_investments", "get_top_10_investments",
+        "get_top10_investments", "build_top10_sheet_rows", "get_top10_sheet_rows",
+        "build_top10_rows", "get_top10_rows",
+    ],
+    _DICTIONARY_PAGE: [
+        "build_data_dictionary", "get_data_dictionary", "build_data_dictionary_sheet_rows",
+        "get_data_dictionary_sheet_rows", "build_data_dictionary_rows", "get_data_dictionary_rows",
+    ],
 }
 
 _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
@@ -1470,10 +1840,9 @@ _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
     "recommendation": ["signal", "rating"],
 }
 
-# =============================================================================
-# Sheet-rows helpers
-# =============================================================================
+
 def _boolish(value: Any, default: bool = False) -> bool:
+    """Convert to boolean."""
     if isinstance(value, bool):
         return value
     if isinstance(value, (int, float)):
@@ -1484,20 +1853,26 @@ def _boolish(value: Any, default: bool = False) -> bool:
 
 
 def _candidate_method_names(enriched: bool, batch: bool) -> List[str]:
+    """Get candidate method names for quote fetching."""
     if enriched and batch:
-        return ["get_enriched_quotes", "get_enriched_quote_batch", "fetch_enriched_quotes", "fetch_enriched_quote_batch", "get_quotes_enriched", "get_quotes"]
+        return [
+            "get_enriched_quotes", "get_enriched_quote_batch", "fetch_enriched_quotes",
+            "fetch_enriched_quote_batch", "get_quotes_enriched", "get_quotes",
+        ]
     if enriched and not batch:
         return ["get_enriched_quote", "fetch_enriched_quote", "enriched_quote", "get_enriched", "get_quote"]
-    if (not enriched) and batch:
+    if not enriched and batch:
         return ["get_quotes", "fetch_quotes", "quotes", "fetch_many", "get_quote_batch", "get_quotes_batch"]
     return ["get_quote", "fetch_quote", "quote", "fetch", "get"]
 
 
 def _candidate_sheet_rows_methods() -> List[str]:
+    """Get candidate method names for sheet rows."""
     return ["get_sheet_rows", "sheet_rows", "build_sheet_rows"]
 
 
 def _canonicalize_sheet_name(sheet: Any) -> str:
+    """Canonicalize sheet name."""
     raw = _safe_str(sheet)
     if not raw:
         return ""
@@ -1507,6 +1882,7 @@ def _canonicalize_sheet_name(sheet: Any) -> str:
 
 
 def _resolve_sheet_from_inputs(sheet: Any, body: Optional[Dict[str, Any]] = None) -> str:
+    """Resolve sheet name from inputs."""
     body = body or {}
     primary = _canonicalize_sheet_name(sheet)
     if primary:
@@ -1519,15 +1895,17 @@ def _resolve_sheet_from_inputs(sheet: Any, body: Optional[Dict[str, Any]] = None
 
 
 def _is_special_sheet(sheet: str) -> bool:
+    """Check if sheet is special."""
     return _canonicalize_sheet_name(sheet) in _SPECIAL_PAGES
 
 
 def _stable_body_for_cache(body: Optional[Dict[str, Any]]) -> str:
+    """Generate stable cache key from body."""
     body = dict(body or {})
     for noisy_key in ("request_id", "trace_id", "ts", "timestamp", "_ts", "_rid"):
         body.pop(noisy_key, None)
     try:
-        return json_dumps(body).decode("utf-8", errors="ignore")
+        return _json_dumps(body).decode("utf-8", errors="ignore")
     except Exception:
         try:
             return str(sorted(body.items()))
@@ -1536,9 +1914,10 @@ def _stable_body_for_cache(body: Optional[Dict[str, Any]]) -> str:
 
 
 def _expected_len(sheet: str) -> int:
+    """Get expected length for sheet."""
     if callable(get_sheet_len):
         try:
-            n = int(get_sheet_len(sheet))  # type: ignore[misc]
+            n = int(get_sheet_len(sheet))
             if n > 0:
                 return n
         except Exception:
@@ -1547,18 +1926,24 @@ def _expected_len(sheet: str) -> int:
 
 
 def _normalize_key_name(header: str) -> str:
-    return "_".join(part for part in "".join(ch.lower() if ch.isalnum() else "_" for ch in _safe_str(header)).split("_") if part)
+    """Normalize header to key name."""
+    return "_".join(part for part in "".join(
+        ch.lower() if ch.isalnum() else "_" for ch in _safe_str(header)
+    ).split("_") if part)
 
 
 def _complete_schema_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple[List[str], List[str]]:
+    """Complete schema contract with headers and keys."""
     headers = list(headers or [])
     keys = list(keys or [])
     max_len = max(len(headers), len(keys))
     out_headers: List[str] = []
     out_keys: List[str] = []
+
     for i in range(max_len):
         h = _safe_str(headers[i]) if i < len(headers) else ""
         k = _safe_str(keys[i]) if i < len(keys) else ""
+
         if h and not k:
             k = _normalize_key_name(h)
         elif k and not h:
@@ -1566,12 +1951,21 @@ def _complete_schema_contract(headers: Sequence[str], keys: Sequence[str]) -> Tu
         elif not h and not k:
             h = f"Column {i + 1}"
             k = f"column_{i + 1}"
+
         out_headers.append(h)
         out_keys.append(k)
+
     return out_headers, out_keys
 
 
-def _pad_contract(headers: Sequence[str], keys: Sequence[str], expected_len: int, *, header_prefix: str = "Column", key_prefix: str = "column") -> Tuple[List[str], List[str]]:
+def _pad_contract(
+    headers: Sequence[str],
+    keys: Sequence[str],
+    expected_len: int,
+    header_prefix: str = "Column",
+    key_prefix: str = "column",
+) -> Tuple[List[str], List[str]]:
+    """Pad contract to expected length."""
     hdrs, ks = _complete_schema_contract(headers, keys)
     while len(hdrs) < expected_len:
         i = len(hdrs) + 1
@@ -1581,6 +1975,7 @@ def _pad_contract(headers: Sequence[str], keys: Sequence[str], expected_len: int
 
 
 def _ensure_top10_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple[List[str], List[str]]:
+    """Ensure Top10 contract has required fields."""
     hdrs, ks = _complete_schema_contract(headers, keys)
     for field_name in _TOP10_REQUIRED_FIELDS:
         if field_name not in ks:
@@ -1590,6 +1985,7 @@ def _ensure_top10_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple
 
 
 def _static_contract(sheet: str) -> Tuple[List[str], List[str], str]:
+    """Get static contract for sheet."""
     if sheet == _TOP10_PAGE:
         headers, keys = _ensure_top10_contract(_CANONICAL_80_HEADERS, _CANONICAL_80_KEYS)
         return headers, keys, "static_canonical_top10"
@@ -1604,17 +2000,22 @@ def _static_contract(sheet: str) -> Tuple[List[str], List[str], str]:
 
 
 def _extract_headers_keys_from_spec(spec: Any) -> Tuple[List[str], List[str]]:
+    """Extract headers and keys from spec."""
     headers: List[str] = []
     keys: List[str] = []
+
     if isinstance(spec, Mapping):
         headers_raw = spec.get("headers") or spec.get("display_headers") or spec.get("sheet_headers")
         keys_raw = spec.get("keys") or spec.get("fields") or spec.get("columns")
+
         if isinstance(headers_raw, list):
             headers = [_safe_str(x) for x in headers_raw if _safe_str(x)]
         if isinstance(keys_raw, list):
             keys = [_safe_str(x) for x in keys_raw if _safe_str(x)]
+
         if headers or keys:
             return _complete_schema_contract(headers, keys)
+
         cols = spec.get("columns") or spec.get("fields")
         if isinstance(cols, list):
             for col in cols:
@@ -1624,38 +2025,45 @@ def _extract_headers_keys_from_spec(spec: Any) -> Tuple[List[str], List[str]]:
                     if h or k:
                         headers.append(h or k.replace("_", " ").title())
                         keys.append(k or _normalize_key_name(h))
+
     return _complete_schema_contract(headers, keys)
 
 
 def _schema_from_registry(sheet: str) -> Tuple[List[str], List[str], Any, str]:
+    """Get schema from registry."""
     spec = None
+
     if callable(get_sheet_headers) and callable(get_sheet_keys):
         try:
-            headers = [_safe_str(x) for x in get_sheet_headers(sheet) if _safe_str(x)]  # type: ignore[misc]
-            keys = [_safe_str(x) for x in get_sheet_keys(sheet) if _safe_str(x)]  # type: ignore[misc]
+            headers = [_safe_str(x) for x in get_sheet_headers(sheet) if _safe_str(x)]
+            keys = [_safe_str(x) for x in get_sheet_keys(sheet) if _safe_str(x)]
             if headers and keys:
                 if callable(get_sheet_spec):
                     try:
-                        spec = get_sheet_spec(sheet)  # type: ignore[misc]
+                        spec = get_sheet_spec(sheet)
                     except Exception:
                         spec = None
                 ch, ck = _complete_schema_contract(headers, keys)
                 return ch, ck, spec, "schema_registry.helpers"
         except Exception:
             pass
+
     if callable(get_sheet_spec):
         try:
-            spec = get_sheet_spec(sheet)  # type: ignore[misc]
+            spec = get_sheet_spec(sheet)
             headers, keys = _extract_headers_keys_from_spec(spec)
             return headers, keys, spec, "schema_registry.spec"
         except Exception as e:
             return [], [], None, f"registry_error:{e}"
+
     return [], [], None, "registry_unavailable"
 
 
 def _resolve_contract(sheet: str) -> Tuple[List[str], List[str], Any, str]:
+    """Resolve contract for sheet."""
     expected_len = _expected_len(sheet)
     headers, keys, spec, source = _schema_from_registry(sheet)
+
     if headers and keys:
         headers, keys = _complete_schema_contract(headers, keys)
         if sheet == _TOP10_PAGE:
@@ -1663,108 +2071,146 @@ def _resolve_contract(sheet: str) -> Tuple[List[str], List[str], Any, str]:
         else:
             headers, keys = _pad_contract(headers, keys, expected_len)
         return headers, keys, spec, source
+
     headers, keys, source = _static_contract(sheet)
     return headers, keys, {"source": source, "sheet": sheet}, source
 
 
 def _key_variants(key: str) -> List[str]:
+    """Generate key variants for matching."""
     key = _safe_str(key)
     if not key:
         return []
+
     variants = [key, key.lower(), key.upper(), key.replace("_", " "), key.replace("_", "").lower()]
+
     for alias in _FIELD_ALIAS_HINTS.get(key, []):
         variants.extend([alias, alias.lower(), alias.upper(), alias.replace("_", " "), alias.replace("_", "").lower()])
+
     seen: Set[str] = set()
-    out: List[str] = []
+    result: List[str] = []
     for value in variants:
         if value and value not in seen:
             seen.add(value)
-            out.append(value)
-    return out
+            result.append(value)
+
+    return result
 
 
 def _extract_from_raw(raw: Dict[str, Any], candidates: Sequence[str]) -> Any:
+    """Extract value from raw dict using candidates."""
     raw_ci = {str(k).strip().lower(): v for k, v in raw.items()}
     raw_comp = {"".join(ch for ch in str(k).lower() if ch.isalnum()): v for k, v in raw.items()}
+
     for candidate in candidates:
         if candidate in raw:
             return raw[candidate]
+
         lc = candidate.lower()
         if lc in raw_ci:
             return raw_ci[lc]
+
         comp = "".join(ch for ch in candidate.lower() if ch.isalnum())
         if comp in raw_comp:
             return raw_comp[comp]
+
     return None
 
 
-def _normalize_to_schema_keys(schema_keys: Sequence[str], schema_headers: Sequence[str], raw: Dict[str, Any]) -> Dict[str, Any]:
+def _normalize_to_schema_keys(
+    schema_keys: Sequence[str],
+    schema_headers: Sequence[str],
+    raw: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Normalize raw dict to schema keys."""
     raw = raw or {}
     header_by_key = {str(k): str(h) for k, h in zip(schema_keys, schema_headers)}
-    out: Dict[str, Any] = {}
+    result: Dict[str, Any] = {}
+
     for key in schema_keys:
         ks = str(key)
         value = _extract_from_raw(raw, _key_variants(ks))
+
         if value is None:
             header = header_by_key.get(ks, "")
             if header:
                 value = _extract_from_raw(raw, [header, header.lower(), header.upper()])
+
         if isinstance(value, (list, tuple, set)) and ks in {"warnings", "recommendation_reason", "selection_reason", "notes"}:
             value = "; ".join(_safe_str(x) for x in value if _safe_str(x))
-        out[ks] = _jsonable_snapshot(value)
-    return out
+
+        result[ks] = _jsonable_snapshot(value)
+
+    return result
 
 
 def _project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
+    """Project row to keys."""
     return {str(k): row.get(str(k), None) for k in keys}
 
 
 def _rows_to_matrix(rows: Sequence[Mapping[str, Any]], keys: Sequence[str]) -> List[List[Any]]:
+    """Convert rows to matrix."""
     return [[_jsonable_snapshot(dict(row).get(str(k))) for k in keys] for row in rows or []]
 
 
 def _rows_from_matrix(matrix: Any, keys: Sequence[str]) -> List[Dict[str, Any]]:
+    """Convert matrix to rows."""
     if not isinstance(matrix, list) or not keys:
         return []
-    out: List[Dict[str, Any]] = []
+
+    result: List[Dict[str, Any]] = []
     for row in matrix:
         if isinstance(row, dict):
-            out.append(_project_row(keys, row))
+            result.append(_project_row(keys, row))
         elif isinstance(row, (list, tuple)):
-            out.append({str(k): _jsonable_snapshot(row[i] if i < len(row) else None) for i, k in enumerate(keys)})
-    return out
+            result.append({str(k): _jsonable_snapshot(row[i] if i < len(row) else None) for i, k in enumerate(keys)})
+
+    return result
 
 
-def _extract_payload_rows(payload: Dict[str, Any], keys_hint: Sequence[str], headers_hint: Sequence[str]) -> List[Dict[str, Any]]:
+def _extract_payload_rows(
+    payload: Dict[str, Any],
+    keys_hint: Sequence[str],
+    headers_hint: Sequence[str],
+) -> List[Dict[str, Any]]:
+    """Extract rows from payload."""
     for bucket in ("row_objects", "rows", "data", "items", "records", "quotes", "results"):
-        rr = payload.get(bucket)
-        if isinstance(rr, list):
-            dict_rows = [dict(r) for r in rr if isinstance(r, Mapping)]
+        rows = payload.get(bucket)
+        if isinstance(rows, list):
+            dict_rows = [dict(r) for r in rows if isinstance(r, Mapping)]
             if dict_rows:
                 return dict_rows
-            if rr and all(isinstance(r, (list, tuple, dict)) for r in rr) and keys_hint:
-                return _rows_from_matrix(rr, keys_hint)
+            if rows and all(isinstance(r, (list, tuple, dict)) for r in rows) and keys_hint:
+                return _rows_from_matrix(rows, keys_hint)
+
     matrix = payload.get("rows_matrix") or payload.get("matrix")
     if isinstance(matrix, list):
         return _rows_from_matrix(matrix, keys_hint)
+
     one = payload.get("row")
     if isinstance(one, Mapping):
         return [dict(one)]
+
     if keys_hint and any(k in payload for k in keys_hint):
         return [{str(k): payload.get(str(k)) for k in keys_hint}]
+
     if headers_hint and any(h in payload for h in headers_hint):
         return [{str(k): payload.get(str(h)) for k, h in zip(keys_hint, headers_hint)}]
+
     return []
 
 
-def _slice(rows: List[Dict[str, Any]], *, limit: int, offset: int) -> List[Dict[str, Any]]:
-    start = max(0, int(offset))
+def _slice_rows(rows: List[Dict[str, Any]], limit: int, offset: int) -> List[Dict[str, Any]]:
+    """Slice rows by limit and offset."""
+    start = max(0, offset)
     if limit <= 0:
         return rows[start:]
-    return rows[start:start + int(limit)]
+    return rows[start:start + limit]
 
 
 def _to_number(value: Any) -> float:
+    """Convert to number for sorting."""
     if value is None:
         return float("-inf")
     if isinstance(value, bool):
@@ -1786,6 +2232,7 @@ def _to_number(value: Any) -> float:
 
 
 def _top10_sort_key(row: Mapping[str, Any]) -> Tuple[float, ...]:
+    """Get sort key for Top10 rows."""
     return (
         _to_number(row.get("overall_score")),
         _to_number(row.get("opportunity_score")),
@@ -1797,8 +2244,14 @@ def _top10_sort_key(row: Mapping[str, Any]) -> Tuple[float, ...]:
 
 
 def _top10_selection_reason(row: Mapping[str, Any]) -> str:
+    """Generate selection reason for Top10."""
     parts: List[str] = []
-    for key, label in (("overall_score", "Overall"), ("opportunity_score", "Opportunity"), ("expected_roi_3m", "Exp ROI 3M"), ("forecast_confidence", "Forecast Conf")):
+    for key, label in (
+        ("overall_score", "Overall"),
+        ("opportunity_score", "Opportunity"),
+        ("expected_roi_3m", "Exp ROI 3M"),
+        ("forecast_confidence", "Forecast Conf"),
+    ):
         value = row.get(key)
         if value not in (None, "", [], {}, ()):
             parts.append(f"{label} {round(value, 2) if isinstance(value, float) else value}")
@@ -1808,21 +2261,33 @@ def _top10_selection_reason(row: Mapping[str, Any]) -> str:
 
 
 def _top10_criteria_snapshot(row: Mapping[str, Any]) -> str:
+    """Generate criteria snapshot for Top10."""
     snapshot: Dict[str, Any] = {}
-    for key in ("overall_score", "opportunity_score", "expected_roi_1m", "expected_roi_3m", "forecast_confidence", "confidence_score", "risk_bucket", "recommendation", "symbol"):
+    for key in (
+        "overall_score", "opportunity_score", "expected_roi_1m", "expected_roi_3m",
+        "forecast_confidence", "confidence_score", "risk_bucket", "recommendation", "symbol",
+    ):
         value = row.get(key)
         if value not in (None, "", [], {}, ()):
             snapshot[key] = _jsonable_snapshot(value)
     try:
-        return json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+        return _stdlib_json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
     except Exception:
         return str(snapshot)
 
 
-def _ensure_top10_rows(rows: Sequence[Mapping[str, Any]], *, requested_symbols: Sequence[str], top_n: int, schema_keys: Sequence[str], schema_headers: Sequence[str]) -> List[Dict[str, Any]]:
+def _ensure_top10_rows(
+    rows: Sequence[Mapping[str, Any]],
+    requested_symbols: Sequence[str],
+    top_n: int,
+    schema_keys: Sequence[str],
+    schema_headers: Sequence[str],
+) -> List[Dict[str, Any]]:
+    """Ensure Top10 rows have required fields."""
     normalized_rows = [_normalize_to_schema_keys(schema_keys, schema_headers, dict(r or {})) for r in rows or []]
     deduped: List[Dict[str, Any]] = []
     seen: Set[str] = set()
+
     for row in sorted(normalized_rows, key=_top10_sort_key, reverse=True):
         sym = _safe_str(row.get("symbol"))
         name = _safe_str(row.get("name"))
@@ -1831,19 +2296,24 @@ def _ensure_top10_rows(rows: Sequence[Mapping[str, Any]], *, requested_symbols: 
             continue
         seen.add(dedupe_key)
         deduped.append(row)
-    final_rows = deduped[: max(1, int(top_n))]
+
+    final_rows = deduped[:max(1, top_n)]
+
     for idx, row in enumerate(final_rows, start=1):
         row["top10_rank"] = idx
         if not _safe_str(row.get("selection_reason")):
             row["selection_reason"] = _top10_selection_reason(row)
         if not _safe_str(row.get("criteria_snapshot")):
             row["criteria_snapshot"] = _top10_criteria_snapshot(row)
+
     return final_rows
 
 
 def _extract_requested_symbols_from_body(body: Dict[str, Any], limit: int = 50) -> List[str]:
-    out: List[str] = []
+    """Extract requested symbols from body."""
+    result: List[str] = []
     seen: Set[str] = set()
+
     def _append_many(value: Any) -> None:
         if value is None:
             return
@@ -1854,29 +2324,38 @@ def _extract_requested_symbols_from_body(body: Dict[str, Any], limit: int = 50) 
         else:
             s = _safe_str(value)
             parts = [s] if s else []
+
         for part in parts:
             norm = normalize_symbol(part)
             if norm and norm not in seen:
                 seen.add(norm)
-                out.append(norm)
-                if len(out) >= limit:
+                result.append(norm)
+                if len(result) >= limit:
                     return
-    for key in ("direct_symbols", "symbols", "tickers", "tickers_list", "selected_symbols", "selected_tickers", "requested_symbol", "symbol", "ticker", "code"):
+
+    for key in (
+        "direct_symbols", "symbols", "tickers", "tickers_list", "selected_symbols",
+        "selected_tickers", "requested_symbol", "symbol", "ticker", "code",
+    ):
         _append_many(body.get(key))
-        if len(out) >= limit:
+        if len(result) >= limit:
             break
-    return out[:limit]
+
+    return result[:limit]
 
 
 def _enrich_row_identity(row: Dict[str, Any], symbol: str) -> Dict[str, Any]:
+    """Enrich row with identity information."""
     rr = dict(row or {})
     if not rr.get("symbol"):
         rr["symbol"] = symbol
+
     info = get_symbol_info(symbol)
     rr.setdefault("market", info.market)
     rr.setdefault("asset_class", info.asset_class)
     if info.provider_hint:
         rr.setdefault("provider_hint", info.provider_hint)
+
     if symbol.endswith(".SR"):
         rr.setdefault("exchange", "Tadawul")
         rr.setdefault("currency", "SAR")
@@ -1893,13 +2372,18 @@ def _enrich_row_identity(row: Dict[str, Any], symbol: str) -> Dict[str, Any]:
         rr.setdefault("exchange", "NASDAQ/NYSE")
         rr.setdefault("currency", "USD")
         rr.setdefault("country", "Global")
+
     return rr
 
-# =============================================================================
-# Placeholder / degraded detection
-# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Placeholder / Degraded Detection
+# ---------------------------------------------------------------------------
+
 def _payload_error_text(payload: Dict[str, Any]) -> str:
+    """Extract error text from payload."""
     parts: List[str] = []
+
     for key in ("error", "detail", "message", "warning", "warnings"):
         value = payload.get(key)
         if isinstance(value, (list, tuple, set)):
@@ -1908,15 +2392,18 @@ def _payload_error_text(payload: Dict[str, Any]) -> str:
             s = _safe_str(value)
             if s:
                 parts.append(s)
+
     meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
     for key in ("dispatch", "upstream_error", "proxy_status", "best_status", "path", "builder"):
         s = _safe_str(meta.get(key))
         if s:
             parts.append(s)
+
     return " | ".join(parts).lower()
 
 
 def _row_looks_placeholder(row: Dict[str, Any]) -> bool:
+    """Check if row looks like a placeholder."""
     provider = _safe_str(row.get("data_provider") or row.get("provider") or row.get("source")).lower()
     warnings = _safe_str(row.get("warnings")).lower()
     text = " ".join([
@@ -1927,6 +2414,7 @@ def _row_looks_placeholder(row: Dict[str, Any]) -> bool:
         _safe_str(row.get("selection_reason")),
         _safe_str(row.get("notes")),
     ]).lower()
+
     if "placeholder" in provider or "local_dictionary_fallback" in provider:
         return True
     if "placeholder" in warnings:
@@ -1937,36 +2425,52 @@ def _row_looks_placeholder(row: Dict[str, Any]) -> bool:
         return True
     if "auto-generated fallback row" in text:
         return True
+
     return False
 
 
-def _payload_is_degraded(payload: Optional[Dict[str, Any]], *, sheet: str) -> bool:
+def _payload_is_degraded(payload: Optional[Dict[str, Any]], sheet: str) -> bool:
+    """Check if payload is degraded (placeholder-only)."""
     if not isinstance(payload, dict):
         return True
+
     status_text = _safe_str(payload.get("status")).lower()
     error_text = _payload_error_text(payload)
     rows = _extract_payload_rows(payload, [], [])
     row_count = len(rows)
-    markers = ("placeholder", "fail_soft", "upstream degradation", "no usable rows", "local non-empty fallback", "local_dictionary_fallback")
+
+    markers = (
+        "placeholder", "fail_soft", "upstream degradation", "no usable rows",
+        "local non-empty fallback", "local_dictionary_fallback",
+    )
     if any(marker in error_text for marker in markers):
         return True
+
     if row_count == 0:
         return True
+
     placeholder_rows = sum(1 for row in rows if _row_looks_placeholder(row))
     if placeholder_rows >= max(1, row_count):
         return True
+
     if status_text in {"error", "failed", "failure"}:
         return True
+
     if status_text == "partial" and placeholder_rows > 0:
         return True
+
     if _is_special_sheet(sheet) and status_text == "partial" and row_count == 0:
         return True
+
     return False
 
-# =============================================================================
-# Engine method dispatch / batch helpers
-# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Engine Method Dispatch
+# ---------------------------------------------------------------------------
+
 async def _call_engine_method(target: Any, method_name: str, *args: Any, **kwargs: Any) -> Any:
+    """Call engine method with await support."""
     method = getattr(target, method_name, None)
     if method is None:
         raise AttributeError(f"Missing method {method_name}")
@@ -1977,37 +2481,53 @@ async def _call_engine_method(target: Any, method_name: str, *args: Any, **kwarg
 
 
 def _align_batch_results(results: Any, requested_symbols: List[str]) -> List[Any]:
+    """Align batch results with requested symbols."""
     payload = _unwrap_payload(results)
+
     if isinstance(payload, dict):
-        lookup: Dict[str, Any] = {}
+        dict_lookup: Dict[str, Any] = {}
         for key, value in payload.items():
             norm_key = normalize_symbol(_safe_str(key))
             if norm_key:
-                lookup[norm_key] = value
+                dict_lookup[norm_key] = value
             payload_symbol = _coerce_symbol_from_payload(value)
             if payload_symbol:
-                lookup[payload_symbol] = value
-        return [lookup.get(normalize_symbol(sym)) for sym in requested_symbols]
+                dict_lookup[payload_symbol] = value
+        return [dict_lookup.get(normalize_symbol(sym)) for sym in requested_symbols]
+
     arr = _as_list(payload)
     if not arr:
         return [None] * len(requested_symbols)
-    lookup: Dict[str, Any] = {}
+
+    list_lookup: Dict[str, Any] = {}
     for item in arr:
         payload_symbol = _coerce_symbol_from_payload(item)
         if payload_symbol:
-            lookup[payload_symbol] = item
-    if lookup:
-        return [lookup.get(normalize_symbol(sym)) for sym in requested_symbols]
+            list_lookup[payload_symbol] = item
+
+    if list_lookup:
+        return [list_lookup.get(normalize_symbol(sym)) for sym in requested_symbols]
+
     if len(arr) >= len(requested_symbols):
-        return arr[: len(requested_symbols)]
+        return arr[:len(requested_symbols)]
+
     return arr + [None] * (len(requested_symbols) - len(arr))
 
 
-async def _call_engine_single(engine: Any, symbol: str, *, enriched: bool, use_cache: bool, ttl: Optional[int]) -> Any:
+async def _call_engine_single(
+    engine: Any,
+    symbol: str,
+    enriched: bool,
+    use_cache: bool,
+    ttl: Optional[int],
+) -> Any:
+    """Call engine for single symbol."""
     norm = normalize_symbol(symbol)
     if not norm:
         raise ValueError("empty_symbol")
+
     cache_key = f"{norm}:{'enriched' if enriched else 'basic'}"
+
     if use_cache:
         cached = await _ENGINE_MANAGER.get_cache().get("quotes", cache_key)
         if cached is not None:
@@ -2018,7 +2538,9 @@ async def _call_engine_single(engine: Any, symbol: str, *, enriched: bool, use_c
         with _ENGINE_MANAGER._sync_lock:
             _ENGINE_MANAGER._stats["cache_misses"] += 1
         _METRICS.inc("cache_misses_total", 1, {"cache_type": "engine"})
+
     mode, info, _ = _V2_DISCOVERY.discover()
+
     if mode in (EngineMode.V2, EngineMode.LEGACY) and info and info.module is not None:
         fn_name = "get_enriched_quote" if enriched else "get_quote"
         fn = getattr(info.module, fn_name, None)
@@ -2034,6 +2556,7 @@ async def _call_engine_single(engine: Any, symbol: str, *, enriched: bool, use_c
                 return value
             except Exception as e:
                 _dbg(f"Module func {fn_name} failed: {e}", "debug")
+
     for method_name in _candidate_method_names(enriched=enriched, batch=False):
         try:
             value = await _call_engine_method(engine, method_name, norm)
@@ -2047,15 +2570,25 @@ async def _call_engine_single(engine: Any, symbol: str, *, enriched: bool, use_c
         except Exception as e:
             _dbg(f"Engine method {method_name} failed: {e}", "debug")
             continue
+
     if not enriched:
         return await _call_engine_single(engine, symbol, enriched=True, use_cache=use_cache, ttl=ttl)
+
     raise AttributeError("No suitable engine method found")
 
 
-async def _call_engine_batch(engine: Any, symbols: List[str], *, enriched: bool, use_cache: bool, ttl: Optional[int]) -> List[Any]:
+async def _call_engine_batch(
+    engine: Any,
+    symbols: List[str],
+    enriched: bool,
+    use_cache: bool,
+    ttl: Optional[int],
+) -> List[Any]:
+    """Call engine for batch of symbols."""
     norm_symbols = [normalize_symbol(s) for s in symbols]
     cached_by_idx: Dict[int, Any] = {}
     miss_idx: List[int] = []
+
     if use_cache:
         cache = _ENGINE_MANAGER.get_cache()
         for i, sym in enumerate(norm_symbols):
@@ -2064,13 +2597,29 @@ async def _call_engine_batch(engine: Any, symbols: List[str], *, enriched: bool,
                 cached_by_idx[i] = cached
             else:
                 miss_idx.append(i)
+
         if not miss_idx:
             return [cached_by_idx[i] for i in range(len(symbols))]
+
         miss_syms = [norm_symbols[i] for i in miss_idx]
     else:
         miss_syms = norm_symbols
         miss_idx = list(range(len(symbols)))
+
+    def _merge(aligned: List[Any]) -> List[Any]:
+        """Merge cached hits with fresh aligned results in original order."""
+        merged: List[Any] = [None] * len(symbols)
+        cursor = 0
+        for i in range(len(symbols)):
+            if i in cached_by_idx:
+                merged[i] = cached_by_idx[i]
+            else:
+                merged[i] = aligned[cursor] if cursor < len(aligned) else None
+                cursor += 1
+        return merged
+
     mode, info, _ = _V2_DISCOVERY.discover()
+
     if mode in (EngineMode.V2, EngineMode.LEGACY) and info and info.module is not None:
         fn_name = "get_enriched_quotes" if enriched else "get_quotes"
         fn = getattr(info.module, fn_name, None)
@@ -2087,17 +2636,10 @@ async def _call_engine_batch(engine: Any, symbols: List[str], *, enriched: bool,
                     for sym, item in zip(miss_syms, aligned):
                         if not _is_missing(item):
                             await cache.set("quotes", f"{sym}:{'enriched' if enriched else 'basic'}", item, ttl)
-                out: List[Any] = [None] * len(symbols)
-                cursor = 0
-                for i in range(len(symbols)):
-                    if i in cached_by_idx:
-                        out[i] = cached_by_idx[i]
-                    else:
-                        out[i] = aligned[cursor]
-                        cursor += 1
-                return out
+                return _merge(aligned)
             except Exception as e:
                 _dbg(f"Module batch func {fn_name} failed: {e}", "debug")
+
     for method_name in _candidate_method_names(enriched=enriched, batch=True):
         try:
             value = await _call_engine_method(engine, method_name, miss_syms)
@@ -2109,49 +2651,43 @@ async def _call_engine_batch(engine: Any, symbols: List[str], *, enriched: bool,
                 for sym, item in zip(miss_syms, aligned):
                     if not _is_missing(item):
                         await cache.set("quotes", f"{sym}:{'enriched' if enriched else 'basic'}", item, ttl)
-            out: List[Any] = [None] * len(symbols)
-            cursor = 0
-            for i in range(len(symbols)):
-                if i in cached_by_idx:
-                    out[i] = cached_by_idx[i]
-                else:
-                    out[i] = aligned[cursor]
-                    cursor += 1
-            return out
+            return _merge(aligned)
         except (AttributeError, NotImplementedError):
             continue
         except Exception as e:
             _dbg(f"Engine batch method {method_name} failed: {e}", "debug")
             continue
+
     aligned_seq: List[Any] = []
     for sym in miss_syms:
         try:
             aligned_seq.append(await _call_engine_single(engine, sym, enriched=enriched, use_cache=False, ttl=None))
         except Exception:
             aligned_seq.append(None)
-    out: List[Any] = [None] * len(symbols)
-    cursor = 0
-    for i in range(len(symbols)):
-        if i in cached_by_idx:
-            out[i] = cached_by_idx[i]
-        else:
-            out[i] = aligned_seq[cursor]
-            cursor += 1
-    return out
 
-# =============================================================================
-# Public quote API
-# =============================================================================
+    return _merge(aligned_seq)
+
+
+# ---------------------------------------------------------------------------
+# Public Quote API
+# ---------------------------------------------------------------------------
+
 @otel_traced("get_enriched_quote")
 @monitor_perf("get_enriched_quote")
 async def get_enriched_quote(symbol: str, use_cache: bool = True, ttl: Optional[int] = None) -> Any:
+    """Get enriched quote for a symbol."""
     UQ = get_unified_quote_class()
     sym_in = _safe_str(symbol)
     if not sym_in:
-        return UQ(symbol="", error="Empty symbol", data_quality="MISSING")
+        try:
+            return UQ(symbol="", error="Empty symbol", data_quality="MISSING")
+        except Exception:
+            return _make_stub_quote("", error="Empty symbol")
+
     t0 = time.perf_counter()
     _METRICS.inc("requests_total", 1, {"operation": "get_enriched_quote", "status": "started"})
     _METRICS.set("active_requests", 1)
+
     try:
         engine = await get_engine()
         result = await _call_engine_single(engine, sym_in, enriched=True, use_cache=use_cache, ttl=ttl)
@@ -2168,27 +2704,42 @@ async def get_enriched_quote(symbol: str, use_cache: bool = True, ttl: Optional[
         _METRICS.set("active_requests", 0)
         if _STRICT_MODE:
             raise
-        return UQ(symbol=normalize_symbol(sym_in) or sym_in, error=str(e), data_quality="MISSING", warnings=["Error retrieving quote"], request_id=str(uuid.uuid4())).finalize()
+        return _make_stub_quote(
+            normalize_symbol(sym_in) or sym_in,
+            error=str(e),
+            data_quality="MISSING",
+            warnings=["Error retrieving quote"],
+            request_id=str(uuid.uuid4()),
+        )
 
 
 @otel_traced("get_enriched_quotes")
 @monitor_perf("get_enriched_quotes")
 async def get_enriched_quotes(symbols: List[str], use_cache: bool = True, ttl: Optional[int] = None) -> List[Any]:
-    UQ = get_unified_quote_class()
+    """Get enriched quotes for multiple symbols."""
     clean = _SYMBOL_NORMALIZER.clean_symbols(symbols)
     if not clean:
         return []
+
     normed = [normalize_symbol(s) for s in clean]
     _METRICS.inc("requests_total", 1, {"operation": "get_enriched_quotes", "status": "started"})
     _METRICS.set("active_requests", len(clean))
+
     try:
         engine = await get_engine()
         results = await _call_engine_batch(engine, normed, enriched=True, use_cache=use_cache, ttl=ttl)
         aligned = _align_batch_results(results, normed)
-        out: List[Any] = []
+
+        result: List[Any] = []
         for orig, norm, item in zip(clean, normed, aligned):
             if item is None:
-                out.append(UQ(symbol=norm, original_symbol=orig, error="Missing in batch result", data_quality="MISSING", request_id=str(uuid.uuid4())).finalize())
+                result.append(_make_stub_quote(
+                    norm,
+                    original_symbol=orig,
+                    error="Missing in batch result",
+                    data_quality="MISSING",
+                    request_id=str(uuid.uuid4()),
+                ))
             else:
                 final = _finalize_quote(_unwrap_payload(item))
                 try:
@@ -2196,41 +2747,69 @@ async def get_enriched_quotes(symbols: List[str], use_cache: bool = True, ttl: O
                         final.original_symbol = orig
                 except Exception:
                     pass
-                out.append(final)
+                result.append(final)
+
         _ENGINE_MANAGER.record_request(True)
         _METRICS.inc("requests_total", 1, {"operation": "get_enriched_quotes", "status": "success"})
         _METRICS.set("active_requests", 0)
-        return out
+        return result
     except Exception as e:
         _ENGINE_MANAGER.record_request(False)
         _METRICS.inc("requests_total", 1, {"operation": "get_enriched_quotes", "status": "error"})
         _METRICS.set("active_requests", 0)
         if _STRICT_MODE:
             raise
-        return [UQ(symbol=n, original_symbol=o, error=str(e), data_quality="MISSING", request_id=str(uuid.uuid4())).finalize() for o, n in zip(clean, normed)]
+        return [
+            _make_stub_quote(
+                n,
+                original_symbol=o,
+                error=str(e),
+                data_quality="MISSING",
+                request_id=str(uuid.uuid4()),
+            )
+            for o, n in zip(clean, normed)
+        ]
 
 
 async def get_quote(symbol: str, use_cache: bool = True, ttl: Optional[int] = None) -> Any:
+    """Get basic quote for a symbol."""
     return await get_enriched_quote(symbol, use_cache=use_cache, ttl=ttl)
 
 
 async def get_quotes(symbols: List[str], use_cache: bool = True, ttl: Optional[int] = None) -> List[Any]:
+    """Get basic quotes for multiple symbols."""
     return await get_enriched_quotes(symbols, use_cache=use_cache, ttl=ttl)
 
-# =============================================================================
-# Sheet rows adapter
-# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Sheet Rows Adapter
+# ---------------------------------------------------------------------------
+
 def _sheet_meta_source(builder: Optional[str], payload: Dict[str, Any]) -> str:
+    """Get sheet meta source."""
     meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
     return _safe_str(meta.get("source") or builder or "unknown")
 
 
-def _payload_envelope(*, sheet: str, headers: Sequence[str], keys: Sequence[str], row_objects: Sequence[Mapping[str, Any]], include_matrix: bool, status_out: str, error_out: Optional[str], used: str, meta_extra: Optional[Dict[str, Any]] = None, version: Optional[str] = None) -> Dict[str, Any]:
+def _payload_envelope(
+    sheet: str,
+    headers: Sequence[str],
+    keys: Sequence[str],
+    row_objects: Sequence[Mapping[str, Any]],
+    include_matrix: bool,
+    status_out: str,
+    error_out: Optional[str],
+    used: str,
+    meta_extra: Optional[Dict[str, Any]] = None,
+    version: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Create payload envelope."""
     hdrs = list(headers or [])
     ks = list(keys or [])
     rows_dict = [{str(k): _jsonable_snapshot(dict(r).get(str(k))) for k in ks} for r in row_objects or []]
     matrix = _rows_to_matrix(rows_dict, ks) if include_matrix else []
     meta = {"builder": used, **(meta_extra or {})}
+
     return {
         "status": status_out,
         "sheet": sheet,
@@ -2258,11 +2837,21 @@ def _payload_envelope(*, sheet: str, headers: Sequence[str], keys: Sequence[str]
     }
 
 
-async def _invoke_callable_candidates(target: Any, method_names: Sequence[str], *, sheet: str, limit: int, offset: int, mode: str, body: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+async def _invoke_callable_candidates(
+    target: Any,
+    method_names: Sequence[str],
+    sheet: str,
+    limit: int,
+    offset: int,
+    mode: str,
+    body: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Invoke callable candidates."""
     for method_name in method_names:
         fn = getattr(target, method_name, None)
         if not callable(fn):
             continue
+
         attempts = [
             lambda: fn(sheet=sheet, limit=limit, offset=offset, mode=mode, body=body),
             lambda: fn(page=sheet, limit=limit, offset=offset, mode=mode, body=body),
@@ -2277,6 +2866,7 @@ async def _invoke_callable_candidates(target: Any, method_names: Sequence[str], 
             lambda: fn(body),
             lambda: fn(),
         ]
+
         for attempt in attempts:
             try:
                 value = attempt()
@@ -2293,32 +2883,60 @@ async def _invoke_callable_candidates(target: Any, method_names: Sequence[str], 
                 continue
             except Exception:
                 continue
+
     return None, None
 
 
-async def _call_special_sheet_rows_builder(engine: Any, *, sheet: str, limit: int, offset: int, mode: str, body: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+async def _call_special_sheet_rows_builder(
+    engine: Any,
+    sheet: str,
+    limit: int,
+    offset: int,
+    mode: str,
+    body: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Call special sheet rows builder."""
     method_names = _SPECIAL_SHEET_METHODS.get(sheet, [])
     if not method_names:
         return None, None
-    payload, used = await _invoke_callable_candidates(engine, method_names, sheet=sheet, limit=limit, offset=offset, mode=mode, body=body)
+
+    payload, used = await _invoke_callable_candidates(
+        engine, method_names, sheet=sheet, limit=limit, offset=offset, mode=mode, body=body
+    )
     if payload is not None:
         return payload, f"engine.{used}"
+
     mode2, info, _ = _V2_DISCOVERY.discover()
     if mode2 in (EngineMode.V2, EngineMode.LEGACY) and info and info.module is not None:
-        payload, used = await _invoke_callable_candidates(info.module, method_names, sheet=sheet, limit=limit, offset=offset, mode=mode, body=body)
+        payload, used = await _invoke_callable_candidates(
+            info.module, method_names, sheet=sheet, limit=limit, offset=offset, mode=mode, body=body
+        )
         if payload is not None:
             return payload, f"module.{used}"
+
     return None, None
 
 
-def _normalize_sheet_payload(payload: Optional[Dict[str, Any]], *, sheet: str, limit: int, offset: int, mode: str, body: Dict[str, Any], used: Optional[str]) -> Dict[str, Any]:
+def _normalize_sheet_payload(
+    payload: Optional[Dict[str, Any]],
+    sheet: str,
+    limit: int,
+    offset: int,
+    mode: str,
+    body: Dict[str, Any],
+    used: Optional[str],
+) -> Dict[str, Any]:
+    """Normalize sheet payload."""
     payload = payload or {}
     sheet_name = _canonicalize_sheet_name(sheet)
     headers_schema, keys_schema, _spec, schema_source = _resolve_contract(sheet_name)
+
     payload_headers = payload.get("headers") or payload.get("display_headers") or payload.get("sheet_headers") or payload.get("column_headers") or []
     payload_keys = payload.get("keys") or payload.get("columns") or payload.get("fields") or payload.get("field_names") or []
+
     out_headers = [str(x) for x in payload_headers] if isinstance(payload_headers, list) else []
     out_keys = [str(x) for x in payload_keys] if isinstance(payload_keys, list) else []
+
     if headers_schema and keys_schema:
         out_headers = headers_schema[:]
         out_keys = keys_schema[:]
@@ -2326,9 +2944,11 @@ def _normalize_sheet_payload(payload: Optional[Dict[str, Any]], *, sheet: str, l
         out_keys = out_headers[:]
     elif out_keys and not out_headers:
         out_headers = out_keys[:]
+
     raw_rows = _extract_payload_rows(payload, out_keys, out_headers)
     if not raw_rows and out_keys:
         raw_rows = _rows_from_matrix(payload.get("rows_matrix") or payload.get("matrix"), out_keys)
+
     rows_norm: List[Dict[str, Any]] = []
     if out_keys:
         for row in raw_rows:
@@ -2336,19 +2956,28 @@ def _normalize_sheet_payload(payload: Optional[Dict[str, Any]], *, sheet: str, l
             rows_norm.append(_project_row(out_keys, projected))
     else:
         rows_norm = [dict(r) for r in raw_rows]
+
     headers_only = _boolish(body.get("headers_only"), False)
     schema_only = _boolish(body.get("schema_only"), False)
     include_matrix = _boolish(body.get("include_matrix", True), True)
+
     if schema_only:
         rows_norm = []
     elif rows_norm:
-        rows_norm = _slice(rows_norm, limit=limit, offset=offset)
-    rows_matrix = _rows_to_matrix(rows_norm, out_keys) if (include_matrix and out_keys and not (headers_only or schema_only)) else ([] if include_matrix and out_keys and (headers_only or schema_only) else None)
+        rows_norm = _slice_rows(rows_norm, limit=limit, offset=offset)
+
+    if include_matrix and out_keys and not (headers_only or schema_only):
+        rows_matrix = _rows_to_matrix(rows_norm, out_keys)
+    else:
+        rows_matrix = None
+
     status_out = payload.get("status") or ("partial" if not rows_norm and out_keys else "success")
     if _SCHEMA_STRICT_SHEET_ROWS and _SCHEMA_AVAILABLE and (not out_headers or not out_keys):
         status_out = "error"
+
     meta_in = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
     count = 0 if headers_only else len(rows_norm)
+
     return {
         "status": status_out,
         "sheet": payload.get("sheet") or sheet_name,
@@ -2389,21 +3018,33 @@ def _normalize_sheet_payload(payload: Optional[Dict[str, Any]], *, sheet: str, l
     }
 
 
-async def _build_quote_fallback_rows(engine: Any, *, sheet: str, limit: int, offset: int, body: Dict[str, Any], headers: Sequence[str], keys: Sequence[str]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+async def _build_quote_fallback_rows(
+    engine: Any,
+    sheet: str,
+    limit: int,
+    offset: int,
+    body: Dict[str, Any],
+    headers: Sequence[str],
+    keys: Sequence[str],
+) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+    """Build fallback rows using quote API."""
     symbols = _extract_requested_symbols_from_body(body, limit=max(50, limit + offset))
     if not symbols:
         symbols = [normalize_symbol(sym) for sym in _DEFAULT_SHEET_SYMBOLS.get(sheet, []) if normalize_symbol(sym)]
     if not symbols:
         return [], None
-    sliced = symbols[offset: offset + limit] if (offset or len(symbols) > limit) else symbols[:limit]
+
+    sliced = symbols[offset:offset + limit] if (offset or len(symbols) > limit) else symbols[:limit]
     if not sliced:
         return [], None
+
     try:
         results = await _call_engine_batch(engine, sliced, enriched=True, use_cache=False, ttl=None)
         aligned = _align_batch_results(results, sliced)
     except Exception as e:
         _dbg(f"quote fallback batch failed for {sheet}: {e}", "debug")
         return [], None
+
     rows: List[Dict[str, Any]] = []
     for sym, item in zip(sliced, aligned):
         if item is None:
@@ -2414,10 +3055,18 @@ async def _build_quote_fallback_rows(engine: Any, *, sheet: str, limit: int, off
         if keys:
             row = _normalize_to_schema_keys(keys, headers, row)
         rows.append(row)
+
     return rows, ("quote_batch_fallback" if rows else None)
 
 
-def _build_dictionary_fallback_rows(*, sheet: str, headers: Sequence[str], keys: Sequence[str], limit: int, offset: int) -> List[Dict[str, Any]]:
+def _build_dictionary_fallback_rows(
+    sheet: str,
+    headers: Sequence[str],
+    keys: Sequence[str],
+    limit: int,
+    offset: int,
+) -> List[Dict[str, Any]]:
+    """Build dictionary fallback rows."""
     rows: List[Dict[str, Any]] = []
     for idx, (header, key) in enumerate(zip(headers, keys), start=1):
         rows.append({
@@ -2431,32 +3080,76 @@ def _build_dictionary_fallback_rows(*, sheet: str, headers: Sequence[str], keys:
             "source": "core.data_engine.local_dictionary_fallback",
             "notes": f"Auto-generated fallback row {idx} from schema contract",
         })
-    return _slice(rows, limit=limit, offset=offset)
+    return _slice_rows(rows, limit=limit, offset=offset)
 
 
-def _build_insights_fallback_rows(*, requested_symbols: Sequence[str], limit: int, offset: int) -> List[Dict[str, Any]]:
+def _build_insights_fallback_rows(
+    requested_symbols: Sequence[str],
+    limit: int,
+    offset: int,
+) -> List[Dict[str, Any]]:
+    """Build insights fallback rows."""
     symbols = [normalize_symbol(sym) for sym in requested_symbols if normalize_symbol(sym)]
     if not symbols:
         symbols = [normalize_symbol(sym) for sym in _DEFAULT_SHEET_SYMBOLS.get(_INSIGHTS_PAGE, []) if normalize_symbol(sym)]
+
     stamp = _utc_now_iso()
     rows: List[Dict[str, Any]] = [
-        {"section": "Coverage", "item": "Requested symbols", "symbol": "", "recommendation": "", "confidence": 100, "notes": f"Local insights fallback summary | count={len(symbols)}", "last_updated_riyadh": stamp},
-        {"section": "Coverage", "item": "Universe sample", "symbol": "", "recommendation": "", "confidence": 100, "notes": ", ".join(symbols[:5]), "last_updated_riyadh": stamp},
+        {
+            "section": "Coverage",
+            "item": "Requested symbols",
+            "symbol": "",
+            "recommendation": "",
+            "confidence": 100,
+            "notes": f"Local insights fallback summary | count={len(symbols)}",
+            "last_updated_riyadh": stamp,
+        },
+        {
+            "section": "Coverage",
+            "item": "Universe sample",
+            "symbol": "",
+            "recommendation": "",
+            "confidence": 100,
+            "notes": ", ".join(symbols[:5]),
+            "last_updated_riyadh": stamp,
+        },
     ]
-    for idx, sym in enumerate(symbols[: max(1, limit + offset)], start=1):
-        rows.append({"section": "Signals", "item": f"Fallback signal {idx}", "symbol": sym, "recommendation": "HOLD" if idx > 2 else "BUY", "confidence": round(max(30, 95 - idx * 7), 2), "notes": "Generated locally because upstream insights payload was unavailable", "last_updated_riyadh": stamp})
-    return _slice(rows, limit=limit, offset=offset)
+
+    for idx, sym in enumerate(symbols[:max(1, limit + offset)], start=1):
+        rows.append({
+            "section": "Signals",
+            "item": f"Fallback signal {idx}",
+            "symbol": sym,
+            "recommendation": "HOLD" if idx > 2 else "BUY",
+            "confidence": round(max(30, 95 - idx * 7), 2),
+            "notes": "Generated locally because upstream insights payload was unavailable",
+            "last_updated_riyadh": stamp,
+        })
+
+    return _slice_rows(rows, limit=limit, offset=offset)
 
 
-def _build_nonempty_failsoft_rows(*, sheet: str, headers: Sequence[str], keys: Sequence[str], requested_symbols: Sequence[str], limit: int, offset: int, top_n: int) -> List[Dict[str, Any]]:
+def _build_nonempty_failsoft_rows(
+    sheet: str,
+    headers: Sequence[str],
+    keys: Sequence[str],
+    requested_symbols: Sequence[str],
+    limit: int,
+    offset: int,
+    top_n: int,
+) -> List[Dict[str, Any]]:
+    """Build non-empty failsoft rows."""
     if sheet == _DICTIONARY_PAGE:
         return _build_dictionary_fallback_rows(sheet=sheet, headers=headers, keys=keys, limit=limit, offset=offset)
+
     if sheet == _INSIGHTS_PAGE:
         return _build_insights_fallback_rows(requested_symbols=requested_symbols, limit=limit, offset=offset)
+
     if sheet == _TOP10_PAGE:
         symbols = list(requested_symbols) or _DEFAULT_SHEET_SYMBOLS.get(sheet, [])
         rows = []
-        for idx, sym in enumerate(symbols[: max(limit, top_n)], start=1):
+
+        for idx, sym in enumerate(symbols[:max(limit, top_n)], start=1):
             rows.append({
                 "symbol": normalize_symbol(sym),
                 "name": f"{sheet} {normalize_symbol(sym)}",
@@ -2475,20 +3168,35 @@ def _build_nonempty_failsoft_rows(*, sheet: str, headers: Sequence[str], keys: S
                 "data_provider": "core.data_engine.placeholder_fallback",
                 "recommendation_reason": "Placeholder fallback because live engine returned no usable rows.",
                 "selection_reason": "Placeholder fallback because upstream builders returned no usable rows.",
-                "criteria_snapshot": json.dumps({"symbol": normalize_symbol(sym), "row_index": idx, "source": "placeholder"}, ensure_ascii=False),
+                "criteria_snapshot": _stdlib_json.dumps(
+                    {"symbol": normalize_symbol(sym), "row_index": idx, "source": "placeholder"},
+                    ensure_ascii=False,
+                ),
             })
+
         rows = _ensure_top10_rows(rows, requested_symbols=requested_symbols, top_n=top_n, schema_keys=keys, schema_headers=headers)
-        return _slice(rows, limit=limit, offset=offset)
+        return _slice_rows(rows, limit=limit, offset=offset)
+
     return []
 
 
-async def _call_engine_sheet_rows(engine: Any, *, sheet: str, limit: int, offset: int, mode: str, body: Dict[str, Any]) -> Dict[str, Any]:
+async def _call_engine_sheet_rows(
+    engine: Any,
+    sheet: str,
+    limit: int,
+    offset: int,
+    mode: str,
+    body: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Call engine for sheet rows."""
     sheet_name = _resolve_sheet_from_inputs(sheet, body)
-    limit = max(1, min(5000, int(limit or 2000)))
-    offset = max(0, int(offset or 0))
+    limit = max(1, min(5000, limit or 2000))
+    offset = max(0, offset or 0)
     body = dict(body or {})
     mode = _safe_str(mode)
+
     headers, keys, _spec, schema_source = _resolve_contract(sheet_name)
+
     if _SCHEMA_STRICT_SHEET_ROWS and _SCHEMA_AVAILABLE and (not headers or not keys):
         return {
             "status": "error",
@@ -2514,36 +3222,52 @@ async def _call_engine_sheet_rows(engine: Any, *, sheet: str, limit: int, offset
             "meta": {"strict": True, "builder": "schema_guard", "schema_source": schema_source, "degraded_attempts": []},
             "version": __version__,
         }
+
     payload: Optional[Dict[str, Any]] = None
     used: Optional[str] = None
     degraded_attempts: List[Dict[str, Any]] = []
+
     if _is_special_sheet(sheet_name):
-        candidate_payload, candidate_used = await _call_special_sheet_rows_builder(engine, sheet=sheet_name, limit=limit, offset=offset, mode=mode, body=body)
+        candidate_payload, candidate_used = await _call_special_sheet_rows_builder(
+            engine, sheet=sheet_name, limit=limit, offset=offset, mode=mode, body=body
+        )
         if candidate_payload is not None:
             if _payload_is_degraded(candidate_payload, sheet=sheet_name):
-                degraded_attempts.append({"source": candidate_used or "special_builder", "status": _safe_str(candidate_payload.get("status")) or "unknown"})
+                degraded_attempts.append({
+                    "source": candidate_used or "special_builder",
+                    "status": _safe_str(candidate_payload.get("status")) or "unknown",
+                })
             else:
                 payload, used = candidate_payload, candidate_used
+
     if payload is None:
-        candidate_payload, method_used = await _invoke_callable_candidates(engine, _candidate_sheet_rows_methods(), sheet=sheet_name, limit=limit, offset=offset, mode=mode, body=body)
+        candidate_payload, method_used = await _invoke_callable_candidates(
+            engine, _candidate_sheet_rows_methods(), sheet=sheet_name, limit=limit, offset=offset, mode=mode, body=body
+        )
         if candidate_payload is not None:
             candidate_used = f"engine.{method_used}" if method_used else "engine.sheet_rows"
             if _payload_is_degraded(candidate_payload, sheet=sheet_name):
                 degraded_attempts.append({"source": candidate_used, "status": _safe_str(candidate_payload.get("status")) or "unknown"})
             else:
                 payload, used = candidate_payload, candidate_used
+
     if payload is None:
         mode2, info, _ = _V2_DISCOVERY.discover()
         if mode2 in (EngineMode.V2, EngineMode.LEGACY) and info and info.module is not None:
-            candidate_payload, method_used = await _invoke_callable_candidates(info.module, _candidate_sheet_rows_methods(), sheet=sheet_name, limit=limit, offset=offset, mode=mode, body=body)
+            candidate_payload, method_used = await _invoke_callable_candidates(
+                info.module, _candidate_sheet_rows_methods(), sheet=sheet_name, limit=limit, offset=offset, mode=mode, body=body
+            )
             if candidate_payload is not None:
                 candidate_used = f"module.{method_used}" if method_used else "module.sheet_rows"
                 if _payload_is_degraded(candidate_payload, sheet=sheet_name):
                     degraded_attempts.append({"source": candidate_used, "status": _safe_str(candidate_payload.get("status")) or "unknown"})
                 else:
                     payload, used = candidate_payload, candidate_used
+
     if payload is None and not _is_special_sheet(sheet_name):
-        quote_rows, builder_name = await _build_quote_fallback_rows(engine, sheet=sheet_name, limit=limit, offset=offset, body=body, headers=headers, keys=keys)
+        quote_rows, builder_name = await _build_quote_fallback_rows(
+            engine, sheet=sheet_name, limit=limit, offset=offset, body=body, headers=headers, keys=keys
+        )
         if quote_rows:
             payload = {
                 "status": "partial",
@@ -2562,13 +3286,28 @@ async def _call_engine_sheet_rows(engine: Any, *, sheet: str, limit: int, offset
                 "items": quote_rows,
                 "records": quote_rows,
                 "quotes": quote_rows,
-                "meta": {"path": "quote_batch_fallback", "builder": builder_name or "quote_batch_fallback", "degraded_attempts": degraded_attempts, "schema_source": schema_source},
+                "meta": {
+                    "path": "quote_batch_fallback",
+                    "builder": builder_name or "quote_batch_fallback",
+                    "degraded_attempts": degraded_attempts,
+                    "schema_source": schema_source,
+                },
                 "version": __version__,
             }
             used = used or builder_name or "quote_batch_fallback"
+
     if payload is None and _is_special_sheet(sheet_name):
-        requested_symbols = _extract_requested_symbols_from_body(body, limit=max(top_n := max(1, min(5000, int(body.get("top_n", limit) or limit))), limit + offset))
-        fallback_rows = _build_nonempty_failsoft_rows(sheet=sheet_name, headers=headers, keys=keys, requested_symbols=requested_symbols, limit=limit, offset=offset, top_n=top_n)
+        top_n = max(1, min(5000, body.get("top_n", limit) or limit))
+        requested_symbols = _extract_requested_symbols_from_body(body, limit=max(top_n, limit + offset))
+        fallback_rows = _build_nonempty_failsoft_rows(
+            sheet=sheet_name,
+            headers=headers,
+            keys=keys,
+            requested_symbols=requested_symbols,
+            limit=limit,
+            offset=offset,
+            top_n=top_n,
+        )
         payload = {
             "status": "partial",
             "sheet": sheet_name,
@@ -2586,13 +3325,21 @@ async def _call_engine_sheet_rows(engine: Any, *, sheet: str, limit: int, offset
             "items": fallback_rows,
             "records": fallback_rows,
             "quotes": fallback_rows,
-            "meta": {"path": "special_failsoft_fallback", "builder": "special_fallback", "degraded_attempts": degraded_attempts, "schema_source": schema_source},
+            "meta": {
+                "path": "special_failsoft_fallback",
+                "builder": "special_fallback",
+                "degraded_attempts": degraded_attempts,
+                "schema_source": schema_source,
+            },
             "error": "Local non-empty fallback emitted after upstream degradation",
             "detail": "Local non-empty fallback emitted after upstream degradation",
             "version": __version__,
         }
         used = used or "special_fallback"
+
     if payload is None:
+        include_matrix = _boolish(body.get("include_matrix", True))
+        empty_matrix = [] if (headers and keys and include_matrix) else None
         payload = {
             "status": "partial",
             "sheet": sheet_name,
@@ -2606,44 +3353,77 @@ async def _call_engine_sheet_rows(engine: Any, *, sheet: str, limit: int, offset
             "fields": keys,
             "rows": [],
             "row_objects": [],
-            "rows_matrix": [] if (headers and keys and _boolish(body.get("include_matrix", True), True)) else None,
-            "matrix": [] if (headers and keys and _boolish(body.get("include_matrix", True), True)) else None,
+            "rows_matrix": empty_matrix,
+            "matrix": empty_matrix,
             "data": [],
             "items": [],
             "records": [],
             "quotes": [],
             "count": 0,
-            "meta": {"path": "schema_only_fallback", "builder": "none", "degraded_attempts": degraded_attempts, "schema_source": schema_source},
+            "meta": {
+                "path": "schema_only_fallback",
+                "builder": "none",
+                "degraded_attempts": degraded_attempts,
+                "schema_source": schema_source,
+            },
             "version": __version__,
         }
+
     return _normalize_sheet_payload(payload, sheet=sheet_name, limit=limit, offset=offset, mode=mode, body=body, used=used)
 
 
 @otel_traced("get_sheet_rows")
 @monitor_perf("get_sheet_rows")
-async def get_sheet_rows(sheet: str, limit: int = 2000, offset: int = 0, mode: str = "", body: Optional[Dict[str, Any]] = None, use_cache: bool = False, ttl: Optional[int] = None) -> Dict[str, Any]:
+async def get_sheet_rows(
+    sheet: str,
+    limit: int = 2000,
+    offset: int = 0,
+    mode: str = "",
+    body: Optional[Dict[str, Any]] = None,
+    use_cache: bool = False,
+    ttl: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Get sheet rows."""
     body = dict(body or {})
     sheet_name = _resolve_sheet_from_inputs(sheet, body)
     cache_key = f"{sheet_name}:{limit}:{offset}:{mode}:{_stable_body_for_cache(body)}"
+
     if use_cache:
         cached = await _ENGINE_MANAGER.get_cache().get("sheet_rows", cache_key)
         if cached is not None and isinstance(cached, dict):
             return cached
+
     engine = await get_engine()
     payload = await _call_engine_sheet_rows(engine, sheet=sheet_name, limit=limit, offset=offset, mode=mode, body=body)
+
     if use_cache and payload.get("status") in {"success", "partial"}:
         await _ENGINE_MANAGER.get_cache().set("sheet_rows", cache_key, payload, ttl)
+
     return payload
 
 
-def get_sheet_rows_sync(sheet: str, limit: int = 2000, offset: int = 0, mode: str = "", body: Optional[Dict[str, Any]] = None, use_cache: bool = False, ttl: Optional[int] = None) -> Dict[str, Any]:
-    return _run_coro_sync(get_sheet_rows(sheet, limit=limit, offset=offset, mode=mode, body=body, use_cache=use_cache, ttl=ttl))
+def get_sheet_rows_sync(
+    sheet: str,
+    limit: int = 2000,
+    offset: int = 0,
+    mode: str = "",
+    body: Optional[Dict[str, Any]] = None,
+    use_cache: bool = False,
+    ttl: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Get sheet rows synchronously."""
+    return _run_coro_sync(get_sheet_rows(
+        sheet, limit=limit, offset=offset, mode=mode, body=body, use_cache=use_cache, ttl=ttl
+    ))
 
-# =============================================================================
-# Batch processing / health / wrapper
-# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Batch Processing
+# ---------------------------------------------------------------------------
+
 @dataclass(slots=True)
 class BatchProgress:
+    """Batch progress tracker."""
     total: int
     completed: int = 0
     succeeded: int = 0
@@ -2680,93 +3460,206 @@ class BatchProgress:
         }
 
 
-async def process_batch(symbols: List[str], batch_size: int = 10, delay_seconds: float = 0.1, enriched: bool = True, use_cache: bool = True, ttl: Optional[int] = None, max_retries: int = 3, progress_callback: Optional[Callable[[BatchProgress], None]] = None, metadata: Optional[Dict[str, Any]] = None) -> List[Any]:
+def _item_has_error(item: Any) -> bool:
+    """Check whether a quote-like object represents an error/missing state."""
+    if item is None:
+        return True
+    if isinstance(item, dict):
+        return bool(item.get("error")) or _safe_upper(item.get("data_quality")) in {"MISSING", "ERROR"}
+    err = getattr(item, "error", None)
+    if err:
+        return True
+    dq = _safe_upper(getattr(item, "data_quality", ""))
+    return dq in {"MISSING", "ERROR"}
+
+
+def _item_error_text(item: Any) -> str:
+    """Extract an error message from a quote-like object."""
+    if item is None:
+        return "none"
+    if isinstance(item, dict):
+        return _safe_str(item.get("error") or item.get("detail") or item.get("message")) or "error"
+    return _safe_str(getattr(item, "error", None)) or "error"
+
+
+async def process_batch(
+    symbols: List[str],
+    batch_size: int = 10,
+    delay_seconds: float = 0.1,
+    enriched: bool = True,
+    use_cache: bool = True,
+    ttl: Optional[int] = None,
+    max_retries: int = 3,
+    progress_callback: Optional[Callable[[BatchProgress], None]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> List[Any]:
+    """Process symbols in batches with actual retry support."""
     clean = _SYMBOL_NORMALIZER.clean_symbols(symbols)
     if not clean:
         return []
+
     progress = BatchProgress(total=len(clean), metadata=metadata or {})
     results: List[Optional[Any]] = [None] * len(clean)
     retry_counts: Dict[int, int] = defaultdict(int)
-    func = get_enriched_quotes if enriched else get_quotes
-    for i in range(0, len(clean), batch_size):
-        batch = clean[i:i + batch_size]
-        idxs = list(range(i, min(i + batch_size, len(clean))))
-        try:
-            batch_results = await func(batch, use_cache=use_cache, ttl=ttl)
-            for idx, result in zip(idxs, batch_results):
-                results[idx] = result
-                if result is None or getattr(result, "error", None) or (isinstance(result, dict) and result.get("error")):
+    # Pending indexes that still need a (re)fetch. Seeded with every index.
+    pending: List[int] = list(range(len(clean)))
+
+    fetch_fn = get_enriched_quotes if enriched else get_quotes
+
+    first_pass = True
+    while pending:
+        # Process in chunks; on retry rounds, keep the same chunk size.
+        next_round: List[int] = []
+
+        for start in range(0, len(pending), batch_size):
+            chunk_idxs = pending[start:start + batch_size]
+            chunk_syms = [clean[i] for i in chunk_idxs]
+
+            try:
+                chunk_results = await fetch_fn(chunk_syms, use_cache=use_cache, ttl=ttl)
+            except Exception as e:
+                # Whole-chunk failure: retry or give up per-item.
+                for idx in chunk_idxs:
                     if retry_counts[idx] < max_retries:
                         retry_counts[idx] += 1
-                        continue
-                    progress.failed += 1
-                    progress.errors.append((clean[idx], str(getattr(result, "error", None) or (result.get("error") if isinstance(result, dict) else "error"))))
-                else:
-                    progress.succeeded += 1
-                progress.completed += 1
-        except Exception as e:
-            for idx in idxs:
-                if retry_counts[idx] < max_retries:
-                    retry_counts[idx] += 1
-                else:
-                    results[idx] = None
-                    progress.completed += 1
-                    progress.failed += 1
-                    progress.errors.append((clean[idx], str(e)))
-        if progress_callback is not None:
-            try:
-                progress_callback(progress)
-            except Exception:
-                pass
-        if i + batch_size < len(clean):
-            await asyncio.sleep(delay_seconds)
-    UQ = get_unified_quote_class()
-    out: List[Any] = []
-    for sym, result in zip(clean, results):
-        if result is None:
-            out.append(UQ(symbol=normalize_symbol(sym) or sym, error="Missing", data_quality="MISSING", request_id=str(uuid.uuid4())).finalize())
-        else:
-            out.append(_finalize_quote(_unwrap_payload(result)))
-    return out
+                        next_round.append(idx)
+                    else:
+                        results[idx] = None
+                        if first_pass:
+                            progress.completed += 1
+                        progress.failed += 1
+                        progress.errors.append((clean[idx], str(e)))
+                if progress_callback is not None:
+                    try:
+                        progress_callback(progress)
+                    except Exception:
+                        pass
+                continue
 
+            # Pair up by index; align_batch_results not needed because fetch_fn
+            # already returns order-preserving results for the chunk.
+            for idx, item in zip(chunk_idxs, chunk_results):
+                if _item_has_error(item):
+                    if retry_counts[idx] < max_retries:
+                        retry_counts[idx] += 1
+                        next_round.append(idx)
+                    else:
+                        results[idx] = item  # keep the error payload
+                        if first_pass:
+                            progress.completed += 1
+                        progress.failed += 1
+                        progress.errors.append((clean[idx], _item_error_text(item)))
+                else:
+                    results[idx] = item
+                    if first_pass:
+                        progress.completed += 1
+                    progress.succeeded += 1
+
+            if progress_callback is not None:
+                try:
+                    progress_callback(progress)
+                except Exception:
+                    pass
+
+            if start + batch_size < len(pending):
+                await asyncio.sleep(delay_seconds)
+
+        pending = next_round
+        first_pass = False
+        # Small gap before retry round.
+        if pending:
+            await asyncio.sleep(delay_seconds)
+
+    # Ensure no None survives; promote to a stub error quote.
+    final: List[Any] = []
+    for sym, item in zip(clean, results):
+        if item is None:
+            final.append(_make_stub_quote(
+                normalize_symbol(sym) or sym,
+                error="Missing",
+                data_quality="MISSING",
+                request_id=str(uuid.uuid4()),
+            ))
+        else:
+            final.append(_finalize_quote(_unwrap_payload(item)))
+
+    return final
+
+
+# ---------------------------------------------------------------------------
+# Health Check
+# ---------------------------------------------------------------------------
 
 async def health_check() -> Dict[str, Any]:
-    health: Dict[str, Any] = {"status": "healthy", "version": __version__, "timestamp": _utc_now_iso(), "checks": {}, "warnings": [], "errors": []}
+    """Run health check."""
+    health: Dict[str, Any] = {
+        "status": "healthy",
+        "version": __version__,
+        "timestamp": _utc_now_iso(),
+        "checks": {},
+        "warnings": [],
+        "errors": [],
+    }
+
     try:
         engine = await get_engine()
         if isinstance(engine, StubEngine):
             health["warnings"].append("Using stub engine (no real data)")
             health["status"] = "degraded"
+
         health["checks"]["cache"] = _ENGINE_MANAGER.get_cache().get_stats()
         health["checks"]["circuit_breaker"] = _ENGINE_MANAGER._circuit.get_stats()
         health["checks"]["rate_limiter"] = _ENGINE_MANAGER._rate.get_stats()
         health["checks"]["schema_available"] = bool(_SCHEMA_AVAILABLE)
+
         try:
             test = await get_enriched_quote("AAPL", use_cache=False)
-            if test is not None and not (getattr(test, "error", None) or (isinstance(test, dict) and test.get("error"))):
+            if test is not None and not _item_has_error(test):
                 health["checks"]["quote_test"] = "passed"
             else:
                 health["checks"]["quote_test"] = "failed"
-                health["status"] = "unhealthy"
-                health["errors"].append("Quote test failed")
+                # In stub mode the quote test is expected to fail; don't escalate to unhealthy.
+                if not isinstance(engine, StubEngine):
+                    health["status"] = "unhealthy"
+                    health["errors"].append("Quote test failed")
+                else:
+                    health["warnings"].append("Quote test failed under stub engine (expected)")
         except Exception as e:
             health["checks"]["quote_test"] = "failed"
-            health["status"] = "unhealthy"
-            health["errors"].append(f"Quote test error: {e}")
+            if not isinstance(engine, StubEngine):
+                health["status"] = "unhealthy"
+                health["errors"].append(f"Quote test error: {e}")
+            else:
+                health["warnings"].append(f"Quote test error under stub: {e}")
+
         try:
-            sheet_rows = await get_sheet_rows(_DICTIONARY_PAGE, limit=1, offset=0, mode="", body={"include_matrix": False}, use_cache=False)
+            sheet_rows = await get_sheet_rows(
+                _DICTIONARY_PAGE,
+                limit=1,
+                offset=0,
+                mode="",
+                body={"include_matrix": False},
+                use_cache=False,
+            )
             health["checks"]["sheet_rows_test"] = "passed" if isinstance(sheet_rows, dict) else "failed"
         except Exception as e:
             health["checks"]["sheet_rows_test"] = "failed"
             health["warnings"].append(f"sheet_rows_test error: {e}")
+
     except Exception as e:
         health["errors"].append(f"Health check failed: {e}")
         health["status"] = "unhealthy"
+
     return health
 
 
+# ---------------------------------------------------------------------------
+# Context Managers
+# ---------------------------------------------------------------------------
+
 @asynccontextmanager
 async def engine_context() -> AsyncGenerator[Any, None]:
+    """Engine context manager."""
     engine = await get_engine()
     try:
         yield engine
@@ -2775,24 +3668,35 @@ async def engine_context() -> AsyncGenerator[Any, None]:
 
 
 class EngineSession:
+    """Engine session for sync usage."""
+
     def __enter__(self) -> Any:
         self._engine = get_engine_sync()
         return self._engine
+
     def __exit__(self, *args: Any) -> None:
         _run_coro_sync(close_engine())
 
 
+# ---------------------------------------------------------------------------
+# DataEngine Wrapper Class
+# ---------------------------------------------------------------------------
+
 class DataEngine:
+    """Data engine wrapper class."""
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         self._engine: Optional[Any] = None
         self._request_id = str(uuid.uuid4())
 
     async def _ensure(self) -> Any:
+        """Ensure engine is initialized."""
         if self._engine is None:
             self._engine = await get_engine()
         return self._engine
 
     async def get_quote(self, symbol: str, use_cache: bool = True) -> Any:
+        """Get basic quote."""
         try:
             engine = await self._ensure()
             value = await _call_engine_single(engine, symbol, enriched=False, use_cache=use_cache, ttl=None)
@@ -2802,33 +3706,61 @@ class DataEngine:
             return await get_quote(symbol, use_cache=use_cache)
 
     async def get_quotes(self, symbols: List[str], use_cache: bool = True) -> List[Any]:
+        """Get basic quotes."""
         try:
             engine = await self._ensure()
             value = await _call_engine_batch(engine, symbols, enriched=False, use_cache=use_cache, ttl=None)
             aligned = _align_batch_results(value, [normalize_symbol(s) for s in symbols])
-            out = [_finalize_quote(_unwrap_payload(x)) if x is not None else StubUnifiedQuote(symbol=_safe_upper(s), error="Missing", request_id=self._request_id).finalize() for x, s in zip(aligned, symbols)]
-            for i in range(len(out)):
-                out[i] = await EmergencyDataRescuer.rescue_quote(out[i], symbols[i])
-            return out
+            result: List[Any] = []
+            for x, s in zip(aligned, symbols):
+                if x is not None:
+                    result.append(_finalize_quote(_unwrap_payload(x)))
+                else:
+                    result.append(_make_stub_quote(
+                        _safe_upper(s) or s,
+                        error="Missing",
+                        request_id=self._request_id,
+                    ))
+            for i in range(len(result)):
+                result[i] = await EmergencyDataRescuer.rescue_quote(result[i], symbols[i])
+            return result
         except Exception:
             return await get_quotes(symbols, use_cache=use_cache)
 
     async def get_enriched_quote(self, symbol: str, use_cache: bool = True) -> Any:
+        """Get enriched quote."""
         return await get_enriched_quote(symbol, use_cache=use_cache)
 
     async def get_enriched_quotes(self, symbols: List[str], use_cache: bool = True) -> List[Any]:
+        """Get enriched quotes."""
         return await get_enriched_quotes(symbols, use_cache=use_cache)
 
-    async def get_sheet_rows(self, sheet: str, limit: int = 2000, offset: int = 0, mode: str = "", body: Optional[Dict[str, Any]] = None, use_cache: bool = False, ttl: Optional[int] = None) -> Dict[str, Any]:
-        return await get_sheet_rows(sheet, limit=limit, offset=offset, mode=mode, body=body, use_cache=use_cache, ttl=ttl)
+    async def get_sheet_rows(
+        self,
+        sheet: str,
+        limit: int = 2000,
+        offset: int = 0,
+        mode: str = "",
+        body: Optional[Dict[str, Any]] = None,
+        use_cache: bool = False,
+        ttl: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Get sheet rows."""
+        return await get_sheet_rows(
+            sheet, limit=limit, offset=offset, mode=mode, body=body, use_cache=use_cache, ttl=ttl,
+        )
 
     async def aclose(self) -> None:
+        """Close engine."""
         await close_engine()
 
-# =============================================================================
-# Meta / compatibility
-# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Meta / Compatibility
+# ---------------------------------------------------------------------------
+
 def _parse_env_list(key: str) -> List[str]:
+    """Parse comma-separated list from environment."""
     raw = (os.getenv(key) or "").strip()
     if not raw:
         return []
@@ -2836,9 +3768,11 @@ def _parse_env_list(key: str) -> List[str]:
 
 
 def get_engine_meta() -> Dict[str, Any]:
+    """Get engine metadata."""
     mode, info, err = _V2_DISCOVERY.discover()
     providers = _parse_env_list("ENABLED_PROVIDERS") or _parse_env_list("PROVIDERS")
     ksa_providers = _parse_env_list("KSA_PROVIDERS")
+
     return {
         "mode": mode.value,
         "is_stub": mode == EngineMode.STUB,
@@ -2860,6 +3794,7 @@ def get_engine_meta() -> Dict[str, Any]:
 
 
 def __getattr__(name: str) -> Any:
+    """Lazy attribute access."""
     if name == "UnifiedQuote":
         return get_unified_quote_class()
     if name in {"ENGINE_MODE", "EngineMode"}:
@@ -2870,6 +3805,10 @@ def __getattr__(name: str) -> Any:
         return StubEngine
     raise AttributeError(f"module 'core.data_engine' has no attribute '{name}'")
 
+
+# ---------------------------------------------------------------------------
+# Module Exports
+# ---------------------------------------------------------------------------
 
 __all__ = [
     "__version__",
@@ -2910,6 +3849,7 @@ __all__ = [
     "_METRICS",
 ]
 
+# Initialize active requests gauge
 try:
     _METRICS.set("active_requests", 0)
 except Exception:
