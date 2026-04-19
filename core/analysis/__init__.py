@@ -2,14 +2,14 @@
 # core/analysis/__init__.py
 """
 ================================================================================
-core.analysis -- Analysis Package Initializer v1.1.0
+core.analysis -- Analysis Package Initializer v3.0.0
 ================================================================================
 Tadawul Fast Bridge (TFB)
 
 This package contains the analysis and selection engines:
 
   insights_builder.py    -- Insights_Analysis page builder (executive layout)
-                            4 sections: Market Summary, Risk Scenarios,
+                            Sections: Market Summary, Risk Scenarios,
                             Top Opportunities, Portfolio Health.
                             Schema: 10 columns (Section/Category/Item/Symbol/
                                                 Metric/Value/Signal/Score/
@@ -19,185 +19,287 @@ This package contains the analysis and selection engines:
                             Criteria-driven composite scoring and ranking.
                             Schema: 83 columns (80 canonical + 3 Top10 extras)
 
-Public API (lazy-imported to keep startup safe):
+Public API (all lazy-loaded on first access):
 
-  from core.analysis import build_insights_analysis_rows
-  from core.analysis import build_top10_rows
-  from core.analysis import get_insights_schema
-  from core.analysis import INSIGHTS_BUILDER_VERSION
-  from core.analysis import TOP10_SELECTOR_VERSION
+  # Insights Builder (core.analysis.insights_builder)
+  build_insights_analysis_rows(engine, criteria=None, universes=None, ...) -> List[Dict]
+  get_insights_schema() -> Tuple[List[str], List[str], str]
+  build_criteria_rows(engine, criteria) -> List[Dict[str, Any]]
 
-Design rules:
-  - Import-safe: no network calls, no heavy I/O at import time.
-  - Lazy imports: submodule code only executes when a function is called.
-  - Never raises at import time.
+  # Top 10 Selector (core.analysis.top10_selector)
+  build_top10_rows(engine, symbols=None, criteria=None, ...) -> List[Dict]
+
+  # Version constants
+  INSIGHTS_BUILDER_VERSION -> str
+  TOP10_SELECTOR_VERSION   -> str
+  __version__              -> str ("3.0.0")
+
+  # Introspection
+  get_available_engines()  -> List[str]
+  is_engine_available(engine_name) -> bool
+  get_package_metadata()   -> Dict[str, Any]
+
+Design:
+  - Import-safe: submodules load on first access, not at `import core.analysis`.
+  - PEP 562 module __getattr__/__dir__ for natural lazy resolution -- the real
+    callable is returned (not a proxy), preserving __name__, __doc__, signature,
+    inspect compatibility, and IDE autocomplete.
+  - Once a lazy name is resolved it is cached in module globals, so subsequent
+    accesses bypass __getattr__ entirely (zero overhead).
+  - Thread safety is delegated to CPython's import lock and functools.lru_cache.
+  - No network I/O, no heavy imports, no runtime exceptions at package import.
 ================================================================================
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, List, Optional, Tuple
+import importlib
+import importlib.util
+import logging
+import sys
+import warnings
+from functools import lru_cache
+from typing import TYPE_CHECKING, Any, Dict, List, Tuple
 
-__version__ = "1.1.0"
+# ---------------------------------------------------------------------------
+# Type-checker-only imports
+# ---------------------------------------------------------------------------
+# These imports are erased at runtime. Their purpose is to let Pylance / mypy /
+# pyright see the real signatures of our lazy-loaded names so autocomplete and
+# type checking work exactly as if the functions were imported eagerly.
+if TYPE_CHECKING:
+    from core.analysis.insights_builder import (  # noqa: F401
+        build_criteria_rows,
+        build_insights_analysis_rows,
+        get_insights_schema,
+    )
+    from core.analysis.top10_selector import build_top10_rows  # noqa: F401
+
+
+# ---------------------------------------------------------------------------
+# Package metadata
+# ---------------------------------------------------------------------------
+
+__version__ = "3.0.0"
+
 __all__ = [
-    # insights_builder public API
+    # Insights Builder API
     "build_insights_analysis_rows",
     "get_insights_schema",
     "build_criteria_rows",
-    "INSIGHTS_BUILDER_VERSION",
-    # top10_selector public API
+    # Top 10 Selector API
     "build_top10_rows",
+    # Version constants
+    "INSIGHTS_BUILDER_VERSION",
     "TOP10_SELECTOR_VERSION",
-    # package version
     "__version__",
+    # Introspection helpers
+    "get_available_engines",
+    "is_engine_available",
+    "get_package_metadata",
 ]
 
-# ---------------------------------------------------------------------------
-# Lazy loader helper
-# ---------------------------------------------------------------------------
-
-def _lazy(module_path: str, attr: str) -> Any:
-    """
-    Returns a lazy proxy that imports `attr` from `module_path` on first call.
-    Keeps import time fast and prevents circular import issues.
-    """
-    _cache: Dict[str, Any] = {}
-
-    def _get() -> Any:
-        if "value" not in _cache:
-            import importlib
-            mod = importlib.import_module(module_path)
-            _cache["value"] = getattr(mod, attr)
-        return _cache["value"]
-
-    return _get
+_log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# insights_builder lazy proxies
+# Lazy attribute routing tables
 # ---------------------------------------------------------------------------
+# Map: public_name -> (submodule_dotted_path, attribute_name_in_submodule)
+# Adding a new lazy export = one line in the appropriate table.
 
-def build_insights_analysis_rows(*args: Any, **kwargs: Any) -> Any:
-    """
-    Build the Insights_Analysis page rows.
+_LAZY_CALLABLES: Dict[str, Tuple[str, str]] = {
+    "build_insights_analysis_rows": (
+        "core.analysis.insights_builder", "build_insights_analysis_rows",
+    ),
+    "get_insights_schema": (
+        "core.analysis.insights_builder", "get_insights_schema",
+    ),
+    "build_criteria_rows": (
+        "core.analysis.insights_builder", "build_criteria_rows",
+    ),
+    "build_top10_rows": (
+        "core.analysis.top10_selector", "build_top10_rows",
+    ),
+}
 
-    Returns a dict with keys: status, page, headers, keys, rows,
-    row_objects, rows_matrix, meta.
+_LAZY_VERSIONS: Dict[str, Tuple[str, str]] = {
+    "INSIGHTS_BUILDER_VERSION": (
+        "core.analysis.insights_builder", "INSIGHTS_BUILDER_VERSION",
+    ),
+    "TOP10_SELECTOR_VERSION": (
+        "core.analysis.top10_selector", "TOP10_SELECTOR_VERSION",
+    ),
+}
 
-    Sections generated (v2.0.0):
-      1. Market Summary    -- trend signals per universe/page
-      2. Risk Scenarios    -- 3 proposals (Conservative/Moderate/Aggressive)
-      3. Top Opportunities -- Top 10 shortlist with ROI and confidence
-      4. Portfolio Health  -- P/L summary from My_Portfolio
-
-    Args:
-      engine:    data engine instance (optional but recommended)
-      criteria:  dict of advisor criteria (risk_level, invest_period_days, etc.)
-      universes: dict of {section_name: [symbols]} to override auto-universe
-      symbols:   flat list of symbols (alternative to universes)
-      mode:      fetch mode string
-    """
-    import importlib
-    mod = importlib.import_module("core.analysis.insights_builder")
-    return mod.build_insights_analysis_rows(*args, **kwargs)
-
-
-def get_insights_schema() -> Tuple[List[str], List[str], str]:
-    """
-    Return (headers, keys, source_marker) for the Insights_Analysis schema.
-    Safe to call at import time -- no engine access.
-    """
-    import importlib
-    mod = importlib.import_module("core.analysis.insights_builder")
-    return mod.get_insights_schema()
-
-
-def build_criteria_rows(*args: Any, **kwargs: Any) -> List[Dict[str, Any]]:
-    """
-    Build the criteria block rows for the top of Insights_Analysis.
-    """
-    import importlib
-    mod = importlib.import_module("core.analysis.insights_builder")
-    return mod.build_criteria_rows(*args, **kwargs)
-
-
-def build_top10_rows(*args: Any, **kwargs: Any) -> Any:
-    """
-    Build Top_10_Investments page rows.
-
-    Returns a dict with keys: status, headers, keys, rows, meta.
-    Supports both sync and async call patterns.
-    """
-    import importlib
-    mod = importlib.import_module("core.analysis.top10_selector")
-    return mod.build_top10_rows(*args, **kwargs)
+_ENGINE_MODULES: Dict[str, str] = {
+    "insights_builder": "core.analysis.insights_builder",
+    "top10_selector":   "core.analysis.top10_selector",
+}
 
 
 # ---------------------------------------------------------------------------
-# Version constants (resolved lazily at first access)
+# Core resolvers (memoized, thread-safe via lru_cache)
 # ---------------------------------------------------------------------------
 
-def _get_insights_version() -> str:
+@lru_cache(maxsize=None)
+def _resolve_attribute(module_path: str, attr_name: str) -> Any:
+    """
+    Import `module_path` and return its `attr_name`.
+
+    Raises ImportError if the module cannot be imported, or AttributeError if
+    the module is loaded but does not expose `attr_name`. Successful lookups
+    are cached for the lifetime of the process.
+    """
+    module = importlib.import_module(module_path)
     try:
-        import importlib
-        mod = importlib.import_module("core.analysis.insights_builder")
-        return str(getattr(mod, "INSIGHTS_BUILDER_VERSION", "unknown"))
-    except Exception:
+        return getattr(module, attr_name)
+    except AttributeError as exc:
+        raise AttributeError(
+            f"module {module_path!r} has no attribute {attr_name!r}"
+        ) from exc
+
+
+@lru_cache(maxsize=None)
+def _resolve_version(module_path: str, attr_name: str) -> str:
+    """
+    Return a version string from a submodule, degrading to 'unknown' on any
+    failure. Never raises. Cached after first lookup.
+    """
+    try:
+        return str(_resolve_attribute(module_path, attr_name))
+    except (ImportError, AttributeError) as exc:
+        _log.debug("Could not load %s from %s: %s", attr_name, module_path, exc)
+        return "unknown"
+    except Exception as exc:  # noqa: BLE001 -- defensive: never let version lookup crash callers
+        _log.warning(
+            "Unexpected error loading %s from %s: %s", attr_name, module_path, exc
+        )
         return "unknown"
 
 
-def _get_top10_version() -> str:
-    try:
-        import importlib
-        mod = importlib.import_module("core.analysis.top10_selector")
-        return str(getattr(mod, "TOP10_SELECTOR_VERSION", "unknown"))
-    except Exception:
-        return "unknown"
-
-
-class _LazyVersionDescriptor:
-    """Descriptor that fetches the version string on first access."""
-    def __init__(self, getter: Callable[[], str]):
-        self._getter = getter
-        self._value: Optional[str] = None
-
-    def __get__(self, obj: Any, objtype: Any = None) -> str:
-        if self._value is None:
-            self._value = self._getter()
-        return self._value
-
-
-class _Versions:
-    """Namespace for package version strings -- resolved lazily."""
-    insights_builder = _LazyVersionDescriptor(_get_insights_version)
-    top10_selector   = _LazyVersionDescriptor(_get_top10_version)
-
-
-versions = _Versions()
-
-# Module-level version aliases (resolve on access via module __getattr__)
-_INSIGHTS_VERSION_CACHE: Optional[str] = None
-_TOP10_VERSION_CACHE:    Optional[str] = None
-
+# ---------------------------------------------------------------------------
+# PEP 562 module protocol: __getattr__ + __dir__
+# ---------------------------------------------------------------------------
 
 def __getattr__(name: str) -> Any:
     """
-    Module-level __getattr__ for lazy version constant resolution.
-    Allows:
-        from core.analysis import INSIGHTS_BUILDER_VERSION
-        from core.analysis import TOP10_SELECTOR_VERSION
-    without importing the submodules at package load time.
+    Lazily resolve package-level attributes on first access.
+
+    After resolution, the value is written to module globals so subsequent
+    accesses bypass this hook entirely. This is the standard CPython behaviour
+    for PEP 562 modules and gives us zero-overhead lookup after warm-up.
     """
-    global _INSIGHTS_VERSION_CACHE, _TOP10_VERSION_CACHE
+    if name in _LAZY_CALLABLES:
+        module_path, attr_name = _LAZY_CALLABLES[name]
+        value = _resolve_attribute(module_path, attr_name)
+        globals()[name] = value
+        return value
 
-    if name == "INSIGHTS_BUILDER_VERSION":
-        if _INSIGHTS_VERSION_CACHE is None:
-            _INSIGHTS_VERSION_CACHE = _get_insights_version()
-        return _INSIGHTS_VERSION_CACHE
+    if name in _LAZY_VERSIONS:
+        module_path, attr_name = _LAZY_VERSIONS[name]
+        value = _resolve_version(module_path, attr_name)
+        globals()[name] = value
+        return value
 
-    if name == "TOP10_SELECTOR_VERSION":
-        if _TOP10_VERSION_CACHE is None:
-            _TOP10_VERSION_CACHE = _get_top10_version()
-        return _TOP10_VERSION_CACHE
+    raise AttributeError(
+        f"module {__name__!r} has no attribute {name!r}. "
+        f"Available: {', '.join(sorted(__all__))}"
+    )
 
-    raise AttributeError(f"module 'core.analysis' has no attribute {name!r}")
+
+def __dir__() -> List[str]:
+    """Expose lazy names to `dir()` and IDE introspection."""
+    return sorted(set(__all__) | set(globals()))
+
+
+# ---------------------------------------------------------------------------
+# Introspection helpers (eager -- cheap, no heavy imports)
+# ---------------------------------------------------------------------------
+
+def is_engine_available(engine_name: str) -> bool:
+    """
+    Return True if the named engine module can be located without importing it.
+
+    Args:
+        engine_name: 'insights_builder' or 'top10_selector'.
+
+    Returns:
+        True if importlib.util.find_spec locates the module, False otherwise.
+    """
+    module_path = _ENGINE_MODULES.get(engine_name)
+    if module_path is None:
+        return False
+    try:
+        return importlib.util.find_spec(module_path) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def get_available_engines() -> List[str]:
+    """Return the names of engines that are importable in this environment."""
+    return [name for name in _ENGINE_MODULES if is_engine_available(name)]
+
+
+def get_package_metadata() -> Dict[str, Any]:
+    """
+    Return a snapshot of package version info and engine availability.
+
+    Note: triggers version resolution for both submodules (cached afterwards).
+    """
+    return {
+        "package_version": __version__,
+        "insights_builder_version": _resolve_version(
+            *_LAZY_VERSIONS["INSIGHTS_BUILDER_VERSION"]
+        ),
+        "top10_selector_version": _resolve_version(
+            *_LAZY_VERSIONS["TOP10_SELECTOR_VERSION"]
+        ),
+        "available_engines": get_available_engines(),
+        "public_api": list(__all__),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Optional import-time sanity check (non-fatal, silenced under test/docs)
+# ---------------------------------------------------------------------------
+
+def _verify_submodule_specs() -> None:
+    """
+    Emit an ImportWarning if any declared submodule cannot be located.
+
+    This is purely diagnostic -- it never raises, and lazy access still works
+    for any modules that ARE present. Skipped entirely under pytest and Sphinx
+    to avoid noise in test output and generated docs.
+    """
+    missing: List[str] = []
+    for module_path in _ENGINE_MODULES.values():
+        try:
+            if importlib.util.find_spec(module_path) is None:
+                missing.append(module_path)
+        except (ImportError, ValueError):
+            missing.append(module_path)
+
+    if missing:
+        warnings.warn(
+            f"core.analysis: submodules not importable: {missing}. "
+            f"Lazy access to their APIs will raise ImportError on first use.",
+            ImportWarning,
+            stacklevel=2,
+        )
+
+
+def _should_skip_verification() -> bool:
+    """Skip the sanity check under test runners and doc builders."""
+    return (
+        getattr(sys, "_called_from_test", False)
+        or "sphinx" in sys.modules
+        or "pytest" in sys.modules
+    )
+
+
+if not _should_skip_verification():
+    try:
+        _verify_submodule_specs()
+    except Exception as _exc:  # noqa: BLE001 -- defensive: never break package import
+        _log.debug("submodule verification skipped: %s", _exc)
