@@ -2,42 +2,62 @@
 # core/providers/yahoo_chart_provider.py
 """
 ================================================================================
-Yahoo Chart Provider (Global + KSA History) -- v6.9.0
+Yahoo Chart Provider (Global + KSA History) -- v8.0.0
 ================================================================================
-QUOTE/HISTORY HARDENED * COMMODITIES/FX FALLBACKS * CANONICAL FIELD ENRICHMENT
-FUNDAMENTALS-LIGHT * HISTORY-DERIVED AVG VOLUME / 52W / RISK STATS * IMPORT-SAFE
-SCHEMA-ALIGNED * BATCH-CAPABLE
 
-v6.9.0 changes vs v6.8.0 (schema_registry v3.0.0 alignment)
--------------------------------------------------------------
-FIX CRITICAL: _percentish() converted fractions -> percent-points (wrong direction).
-  Yahoo returns dtype=pct values (dividendYield, grossMargins, etc.) as fractions
-  (0.02 = 2%). The old helper multiplied fractions <= 1.0 by 100, turning 0.02
-  into 2.0, causing all margin/yield fields to be stored as percent-points instead
-  of fractions. Schema dtype=pct expects fractions.
-  Fixed: _percentish() removed. New _as_fraction() uses abs(f)>1.5 -> /100 rule.
-         _first_percentish() renamed to _first_fraction() with correct logic.
+Purpose
+-------
+Provides financial market data from Yahoo Finance:
+  - Real-time quotes for global stocks, ETFs, indices, forex, commodities
+  - Historical OHLCV data with technical indicators
+  - Fundamental data (light) and financial metrics
+  - KSA symbol support (.SR suffix)
+  - Risk statistics (volatility, drawdown, VaR, Sharpe, RSI)
+  - Price forecasts using log-linear regression
 
-FIX: percent_change stored as fraction (was percent-points).
-  Old: (chg / prev) * 100.0 -> 1.42 (1.42% stored as percent-points)
-  New: chg / prev -> 0.0142 (1.42% as fraction, dtype=pct)
+v8.0.0 Changes (from v7.0.0)
+----------------------------
+Bug fixes:
+  - `_fetch_ticker_sync` now accepts period/interval from config. v7.0.0
+    had the fossil expression
+      period=_HAS_PANDAS and pd is not None and "YAHOO_HISTORY_PERIOD"
+             in globals() or "2y"
+    which always evaluated to the string literal "2y" -- regardless of
+    YahooConfig.history_period, YAHOO_HISTORY_PERIOD env var, or anything
+    else. `interval` was hardcoded "1d" too. Both are now config-driven.
+  - `_safe_history_metadata(None)` placeholder removed. v7.0.0 called this
+    with None (comment: "Placeholder"), got back {} every time, and fed
+    an empty dict to `_infer_asset_class` / `_infer_exchange`. Metadata is
+    now extracted from the live ticker inside `_fetch_ticker_sync` and
+    flowed through the pipeline.
+  - `fetch_history` no longer leaks a fresh `ThreadPoolExecutor` on every
+    call. Uses the provider's shared executor instead, and respects the
+    config's thread-pool sizing and shutdown semantics.
+  - Module-level `_PROVIDER_LOCK` is now lazy-initialized (parity with
+    other v6 providers).
+  - The `_trace` decorator used `@functools.wraps` without importing
+    `functools`. It was never applied, so this never fired -- but any
+    attempt to use it would raise NameError. Removed (was dead code).
 
-FIX: week_52_position_pct stored as fraction (was percent-points).
-  Old: ((cur-lo)/(hi-lo)) * 100.0
-  New: (cur-lo)/(hi-lo)
+Cleanup:
+  - Removed unused imports: `cast`, `Union`, `functools`.
+  - Removed dead helpers: `_trace` decorator, `_TraceContext` class,
+    `_json_dumps` (defined but never called anywhere).
+  - `_safe_history_metadata` simplified: no longer loops over
+    single-element tuples.
+  - `_enrich_data` deduplicates the `_first_number` calls for
+    `open_price`/`open` (computed once).
+  - Early-return from `get_enriched_quote` when `normalize_symbol("")`
+    yields an empty string (avoids a pointless cache lookup).
 
-FIX: _simple_forecast() expected_roi_1m/3m/12m stored as fraction (was pct-points).
-  Old: (price/last - 1.0) * 100.0
-  New: (price/last) - 1.0
-
-ENH: PROVIDER_BATCH_SUPPORTED = True exported.
-ENH: fetch_enriched_quotes_batch() added (module-level).
-ENH: __all__ updated with new exports.
-
-Preserved from v6.8.0:
-  All quote/history extraction logic, commodity/FX fallbacks.
-  All risk stats helpers (volatility, drawdown, VaR, Sharpe -- already correct fractions).
-  All async infrastructure (cache, circuit breaker, rate limiter, singleflight).
+Preserved for backward compatibility:
+  - Every name in __all__.
+  - All environment variable names and defaults.
+  - Patch shape (all price, fundamentals, risk, forecast fields).
+  - Prometheus metrics integration (with DummyMetric fallback).
+  - Optional numpy/pandas/yfinance/orjson/prometheus/opentelemetry support.
+  - Provider singleton + engine-facing functions.
+  - KSA `.SR` symbol handling and Arabic-digit parsing.
 ================================================================================
 """
 
@@ -49,7 +69,6 @@ import json
 import logging
 import math
 import os
-import random
 import re
 import statistics
 import time
@@ -58,82 +77,218 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 # =============================================================================
-# Optional deps (safe)
+# Optional Dependencies (prod-safe)
 # =============================================================================
+
 try:
     import numpy as np  # type: ignore
     _HAS_NUMPY = True
-except Exception:
-    np = None  # type: ignore
+except ImportError:
+    np = None  # type: ignore[assignment]
     _HAS_NUMPY = False
 
 try:
     import pandas as pd  # type: ignore
     _HAS_PANDAS = True
-except Exception:
-    pd = None  # type: ignore
+except ImportError:
+    pd = None  # type: ignore[assignment]
     _HAS_PANDAS = False
 
 try:
     import yfinance as yf  # type: ignore
     _HAS_YFINANCE = True
-except Exception:
-    yf = None  # type: ignore
+except ImportError:
+    yf = None  # type: ignore[assignment]
     _HAS_YFINANCE = False
 
-# =============================================================================
-# Prometheus (optional) -- LAZY + DUPLICATE-SAFE
-# =============================================================================
+# Prometheus metrics (optional)
 try:
     from prometheus_client import Counter, Gauge, Histogram, REGISTRY  # type: ignore
     _HAS_PROM = True
-except Exception:
-    Counter = Gauge = Histogram = None  # type: ignore
-    REGISTRY = None  # type: ignore
+except ImportError:
+    Counter = None  # type: ignore[assignment]
+    Gauge = None  # type: ignore[assignment]
+    Histogram = None  # type: ignore[assignment]
+    REGISTRY = None  # type: ignore[assignment]
     _HAS_PROM = False
 
+# OpenTelemetry (optional)
+try:
+    from opentelemetry import trace  # type: ignore
+    _HAS_OTEL = True
+except ImportError:
+    trace = None  # type: ignore[assignment]
+    _HAS_OTEL = False
+
+# =============================================================================
+# Logging
+# =============================================================================
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
+
+# =============================================================================
+# Constants
+# =============================================================================
+
+PROVIDER_NAME = "yahoo_chart"
+PROVIDER_VERSION = "8.0.0"
+VERSION = PROVIDER_VERSION
+PROVIDER_BATCH_SUPPORTED = True
+
+_RIYADH_TZ = timezone(timedelta(hours=3))
+
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
+_FALSY = {"0", "false", "no", "n", "off", "f", "disable", "disabled"}
+
+_KSA_CODE_RE = re.compile(r"^\d{3,6}$", re.IGNORECASE)
+_FX_PAIR_RE = re.compile(r"^([A-Z]{6})=X$")
+_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
+_K_M_B_T_RE = re.compile(r"^(-?\d+(?:\.\d+)?)([KMBT])$", re.IGNORECASE)
+_K_M_B_T_MULT = {"K": 1_000.0, "M": 1_000_000.0, "B": 1_000_000_000.0, "T": 1_000_000_000_000.0}
+
+DEFAULT_TIMEOUT_SEC = 20.0
+DEFAULT_QUOTE_TTL_SEC = 15.0
+DEFAULT_HISTORY_TTL_SEC = 300.0
+DEFAULT_MAX_CONCURRENCY = 24
+DEFAULT_RATE_LIMIT_PER_SEC = 10.0
+DEFAULT_RATE_LIMIT_BURST = 20
+DEFAULT_CB_FAIL_THRESHOLD = 6
+DEFAULT_CB_COOLDOWN_SEC = 30.0
+DEFAULT_CB_SUCCESS_THRESHOLD = 3
+DEFAULT_THREADPOOL_WORKERS = 6
+DEFAULT_HISTORY_PERIOD = "2y"
+DEFAULT_HISTORY_INTERVAL = "1d"
+
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+@dataclass(frozen=True)
+class YahooConfig:
+    """Immutable configuration for Yahoo provider."""
+
+    enabled: bool = True
+    timeout_sec: float = DEFAULT_TIMEOUT_SEC
+    quote_ttl_sec: float = DEFAULT_QUOTE_TTL_SEC
+    history_ttl_sec: float = DEFAULT_HISTORY_TTL_SEC
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY
+    rate_limit_per_sec: float = DEFAULT_RATE_LIMIT_PER_SEC
+    rate_limit_burst: int = DEFAULT_RATE_LIMIT_BURST
+    cb_fail_threshold: int = DEFAULT_CB_FAIL_THRESHOLD
+    cb_cooldown_sec: float = DEFAULT_CB_COOLDOWN_SEC
+    cb_success_threshold: int = DEFAULT_CB_SUCCESS_THRESHOLD
+    threadpool_workers: int = DEFAULT_THREADPOOL_WORKERS
+    history_period: str = DEFAULT_HISTORY_PERIOD
+    history_interval: str = DEFAULT_HISTORY_INTERVAL
+    tracing_enabled: bool = False
+    metrics_enabled: bool = False
+
+    @classmethod
+    def from_env(cls) -> "YahooConfig":
+        """Load configuration from environment variables."""
+
+        def _env_str(name: str, default: str = "") -> str:
+            v = os.getenv(name)
+            return str(v).strip() if v is not None and str(v).strip() else default
+
+        def _env_bool(name: str, default: bool) -> bool:
+            raw = (os.getenv(name) or "").strip().lower()
+            if not raw:
+                return default
+            if raw in _FALSY:
+                return False
+            if raw in _TRUTHY:
+                return True
+            return default
+
+        def _env_int(name: str, default: int) -> int:
+            try:
+                return int(float(str(os.getenv(name, str(default))).strip()))
+            except Exception:
+                return default
+
+        def _env_float(name: str, default: float) -> float:
+            try:
+                return float(str(os.getenv(name, str(default))).strip())
+            except Exception:
+                return default
+
+        enabled = _env_bool("YAHOO_ENABLED", True) and _HAS_YFINANCE
+
+        return cls(
+            enabled=enabled,
+            timeout_sec=max(5.0, _env_float("YAHOO_TIMEOUT_SEC", DEFAULT_TIMEOUT_SEC)),
+            quote_ttl_sec=max(5.0, _env_float("YAHOO_QUOTE_TTL_SEC", DEFAULT_QUOTE_TTL_SEC)),
+            history_ttl_sec=max(30.0, _env_float("YAHOO_HISTORY_TTL_SEC", DEFAULT_HISTORY_TTL_SEC)),
+            max_concurrency=max(2, _env_int("YAHOO_MAX_CONCURRENCY", DEFAULT_MAX_CONCURRENCY)),
+            rate_limit_per_sec=max(0.0, _env_float("YAHOO_RATE_LIMIT_PER_SEC", DEFAULT_RATE_LIMIT_PER_SEC)),
+            rate_limit_burst=max(1, _env_int("YAHOO_RATE_LIMIT_BURST", DEFAULT_RATE_LIMIT_BURST)),
+            cb_fail_threshold=max(2, _env_int("YAHOO_CB_FAIL_THRESHOLD", DEFAULT_CB_FAIL_THRESHOLD)),
+            cb_cooldown_sec=max(5.0, _env_float("YAHOO_CB_COOLDOWN_SEC", DEFAULT_CB_COOLDOWN_SEC)),
+            cb_success_threshold=max(1, _env_int("YAHOO_CB_SUCCESS_THRESHOLD", DEFAULT_CB_SUCCESS_THRESHOLD)),
+            threadpool_workers=max(2, _env_int("YAHOO_THREADPOOL_WORKERS", DEFAULT_THREADPOOL_WORKERS)),
+            history_period=_env_str("YAHOO_HISTORY_PERIOD", DEFAULT_HISTORY_PERIOD),
+            history_interval=_env_str("YAHOO_HISTORY_INTERVAL", DEFAULT_HISTORY_INTERVAL),
+            tracing_enabled=_env_bool("CORE_TRACING_ENABLED", False) or _env_bool("TRACING_ENABLED", False),
+            metrics_enabled=_env_bool("PROMETHEUS_ENABLED", False) or _env_bool("METRICS_ENABLED", False),
+        )
+
+    @property
+    def is_available(self) -> bool:
+        """Return True if the provider can serve requests."""
+        return self.enabled and _HAS_YFINANCE
+
+
+# =============================================================================
+# Custom Exceptions
+# =============================================================================
+
+class YahooProviderError(Exception):
+    """Base exception for Yahoo provider errors."""
+
+
+class YahooFetchError(YahooProviderError):
+    """Raised when a data fetch fails."""
+
+
+# =============================================================================
+# Metrics (Optional)
+# =============================================================================
 
 class _DummyMetric:
-    def __init__(self, *args: Any, **kwargs: Any) -> None: pass
-    def labels(self, *args: Any, **kwargs: Any) -> "_DummyMetric": return self
-    def inc(self, *args: Any, **kwargs: Any) -> None: return None
-    def observe(self, *args: Any, **kwargs: Any) -> None: return None
-    def set(self, *args: Any, **kwargs: Any) -> None: return None
+    """No-op metric used when Prometheus isn't available."""
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        pass
 
-def _prom_enabled() -> bool:
-    raw = (os.getenv("PROMETHEUS_ENABLED") or os.getenv("METRICS_ENABLED") or "").strip().lower()
-    if raw in {"0", "false", "no", "n", "off", "disabled"}:
-        return False
-    return bool(_HAS_PROM)
+    def labels(self, *args: Any, **kwargs: Any) -> "_DummyMetric":
+        return self
 
+    def inc(self, *args: Any, **kwargs: Any) -> None:
+        pass
 
-def _safe_get_existing_collector(name: str) -> Optional[Any]:
-    try:
-        if REGISTRY is None:
-            return None
-        m = getattr(REGISTRY, "_names_to_collectors", None)
-        if isinstance(m, dict):
-            return m.get(name)
-    except Exception:
-        return None
-    return None
+    def observe(self, *args: Any, **kwargs: Any) -> None:
+        pass
+
+    def set(self, *args: Any, **kwargs: Any) -> None:
+        pass
 
 
 def _safe_create_metric(ctor: Any, name: str, doc: str, labelnames: List[str]) -> Any:
-    if not _prom_enabled() or ctor is None:
+    """Create a Prometheus metric or return a DummyMetric if unavailable/duplicate."""
+    if not _HAS_PROM or ctor is None:
         return _DummyMetric()
     try:
-        return ctor(name, doc, labelnames)  # type: ignore[misc]
-    except ValueError:
-        existing = _safe_get_existing_collector(name)
-        return existing if existing is not None else _DummyMetric()
+        return ctor(name, doc, labelnames)
     except Exception:
         return _DummyMetric()
 
 
 @dataclass(slots=True)
 class _Metrics:
+    """Container for Prometheus metrics."""
     requests_total: Any
     request_duration: Any
     cache_hits_total: Any
@@ -141,254 +296,128 @@ class _Metrics:
     circuit_state: Any
 
 
-_METRICS: Optional[_Metrics] = None
+_METRICS_INSTANCE: Optional[_Metrics] = None
 
 
-def metrics() -> _Metrics:
-    global _METRICS
-    if _METRICS is not None:
-        return _METRICS
-    _METRICS = _Metrics(
-        requests_total     = _safe_create_metric(Counter,   "yahoo_requests_total",           "Total Yahoo requests",     ["symbol", "op", "status"]),
-        request_duration   = _safe_create_metric(Histogram, "yahoo_request_duration_seconds", "Yahoo request duration",   ["symbol", "op"]),
-        cache_hits_total   = _safe_create_metric(Counter,   "yahoo_cache_hits_total",         "Yahoo cache hits",         ["symbol"]),
-        cache_misses_total = _safe_create_metric(Counter,   "yahoo_cache_misses_total",       "Yahoo cache misses",       ["symbol"]),
-        circuit_state      = _safe_create_metric(Gauge,     "yahoo_circuit_state",            "Yahoo circuit breaker",    ["state"]),
-    )
-    return _METRICS
-
-
-# =============================================================================
-# OpenTelemetry (optional) -- SAFE
-# =============================================================================
-try:
-    from opentelemetry import trace  # type: ignore
-    _HAS_OTEL = True
-except Exception:
-    trace = None  # type: ignore
-    _HAS_OTEL = False
-
-try:
-    from core.config import TraceContext as CoreTraceContext  # type: ignore
-    TraceContext = CoreTraceContext  # type: ignore
-except Exception:
-    class TraceContext:  # type: ignore
-        def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
-            self.name = name
-            self.attributes = attributes or {}
-        async def __aenter__(self): return self
-        async def __aexit__(self, exc_type, exc_val, exc_tb): return False
+def _get_metrics() -> _Metrics:
+    """Get or create the module-level metrics instance."""
+    global _METRICS_INSTANCE
+    if _METRICS_INSTANCE is None:
+        _METRICS_INSTANCE = _Metrics(
+            requests_total=_safe_create_metric(
+                Counter, "yahoo_requests_total", "Total Yahoo requests", ["symbol", "op", "status"],
+            ),
+            request_duration=_safe_create_metric(
+                Histogram, "yahoo_request_duration_seconds", "Yahoo request duration", ["symbol", "op"],
+            ),
+            cache_hits_total=_safe_create_metric(
+                Counter, "yahoo_cache_hits_total", "Yahoo cache hits", ["symbol"],
+            ),
+            cache_misses_total=_safe_create_metric(
+                Counter, "yahoo_cache_misses_total", "Yahoo cache misses", ["symbol"],
+            ),
+            circuit_state=_safe_create_metric(
+                Gauge, "yahoo_circuit_state", "Yahoo circuit breaker", ["state"],
+            ),
+        )
+    return _METRICS_INSTANCE
 
 
 # =============================================================================
-# JSON helper (orjson optional, safe)
+# Pure Utility Functions
 # =============================================================================
-try:
-    import orjson  # type: ignore
-    def json_dumps(v: Any) -> str:
-        return orjson.dumps(v, default=str).decode("utf-8")
-    _HAS_ORJSON = True
-except Exception:
-    def json_dumps(v: Any) -> str:
-        return json.dumps(v, default=str, ensure_ascii=False)
-    _HAS_ORJSON = False
-
-
-# =============================================================================
-# Logging + constants
-# =============================================================================
-logger = logging.getLogger("core.providers.yahoo_chart_provider")
-logger.addHandler(logging.NullHandler())
-
-PROVIDER_NAME            = "yahoo_chart"
-PROVIDER_VERSION         = "6.9.0"
-VERSION                  = PROVIDER_VERSION
-PROVIDER_BATCH_SUPPORTED = True   # ENH v6.9.0
-
-# =============================================================================
-# Env helpers (safe)
-# =============================================================================
-_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enable", "enabled"}
-_FALSY  = {"0", "false", "no", "n", "off", "f", "disable", "disabled"}
-
-_KSA_CODE_RE   = re.compile(r"^\d{3,6}$", re.IGNORECASE)
-_FX_PAIR_RE    = re.compile(r"^([A-Z]{6})=X$")
-_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
-
-
-def _env_str(name: str, default: str = "") -> str:
-    v = os.getenv(name)
-    if v is None: return default
-    s = str(v).strip()
-    return s if s else default
-
-
-def _env_int(name: str, default: int) -> int:
-    try:
-        return int(float(str(os.getenv(name, str(default))).strip()))
-    except Exception:
-        return default
-
-
-def _env_float(name: str, default: float) -> float:
-    try:
-        return float(str(os.getenv(name, str(default))).strip())
-    except Exception:
-        return default
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = (os.getenv(name) or "").strip().lower()
-    if not raw:   return default
-    if raw in _FALSY:  return False
-    if raw in _TRUTHY: return True
-    return default
-
-
-def _configured() -> bool:
-    if not _env_bool("YAHOO_ENABLED", True):
-        return False
-    return bool(_HAS_YFINANCE)
-
-
-def _timeout_sec() -> float:
-    return max(5.0, _env_float("YAHOO_TIMEOUT_SEC", 20.0))
-
-
-def _quote_ttl_sec() -> float:
-    return max(5.0, _env_float("YAHOO_QUOTE_TTL_SEC", 15.0))
-
-
-def _history_ttl_sec() -> float:
-    return max(30.0, _env_float("YAHOO_HISTORY_TTL_SEC", 300.0))
-
-
-def _history_period() -> str:
-    return _env_str("YAHOO_HISTORY_PERIOD", "2y")
-
-
-def _history_interval() -> str:
-    return _env_str("YAHOO_HISTORY_INTERVAL", "1d")
-
-
-def _max_concurrency() -> int:
-    return max(2, _env_int("YAHOO_MAX_CONCURRENCY", 24))
-
-
-def _rate_limit_per_sec() -> float:
-    return max(0.0, _env_float("YAHOO_RATE_LIMIT_PER_SEC", 10.0))
-
-
-def _rate_limit_burst() -> int:
-    return max(1, _env_int("YAHOO_RATE_LIMIT_BURST", 20))
-
-
-def _cb_fail_threshold() -> int:
-    return max(2, _env_int("YAHOO_CB_FAIL_THRESHOLD", 6))
-
-
-def _cb_cooldown_sec() -> float:
-    return max(5.0, _env_float("YAHOO_CB_COOLDOWN_SEC", 30.0))
-
-
-def _cb_success_threshold() -> int:
-    return max(1, _env_int("YAHOO_CB_SUCCESS_THRESHOLD", 3))
-
-
-def _tracing_enabled() -> bool:
-    return (os.getenv("CORE_TRACING_ENABLED", "") or os.getenv("TRACING_ENABLED", "")).strip().lower() in _TRUTHY
-
-
-# =============================================================================
-# Time helpers (UTC + Riyadh)
-# =============================================================================
-_RIYADH_TZ = timezone(timedelta(hours=3))
-
 
 def _utc_now() -> datetime:
+    """Get current UTC time."""
     return datetime.now(timezone.utc)
 
 
 def _utc_iso(dt: Optional[datetime] = None) -> str:
+    """Get UTC time in ISO format."""
     d = dt or _utc_now()
-    if d.tzinfo is None: d = d.replace(tzinfo=timezone.utc)
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
     return d.astimezone(timezone.utc).isoformat()
 
 
 def _riyadh_iso(dt: Optional[datetime] = None) -> str:
+    """Get Riyadh time (UTC+3) in ISO format."""
     d = dt or datetime.now(_RIYADH_TZ)
-    if d.tzinfo is None: d = d.replace(tzinfo=_RIYADH_TZ)
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=_RIYADH_TZ)
     return d.astimezone(_RIYADH_TZ).isoformat()
 
 
-# =============================================================================
-# Safe type helpers
-# =============================================================================
-
-def safe_str(x: Any) -> Optional[str]:
-    if x is None: return None
-    s = str(x).strip()
-    return s if s else None
-
-
-def safe_float(x: Any) -> Optional[float]:
+def _safe_str(value: Any) -> Optional[str]:
+    """Safely convert to non-empty stripped string; None for empty."""
+    if value is None:
+        return None
     try:
-        if x is None: return None
-        if isinstance(x, (int, float)) and not isinstance(x, bool):
-            f = float(x)
-            if math.isnan(f) or math.isinf(f): return None
-            return f
-        s = str(x).strip()
-        if not s or s.lower() in {"-", "—", "n/a", "na", "null", "none", "nan"}:
-            return None
-        s = s.translate(_ARABIC_DIGITS)
-        s = s.replace(",", "").replace("%", "").replace("+", "")
-        s = s.replace("$", "").replace("£", "").replace("€", "")
-        s = s.replace("SAR", "").replace("USD", "").replace("EUR", "").strip()
-        if s.startswith("(") and s.endswith(")"):
-            s = "-" + s[1:-1].strip()
-        m = re.match(r"^(-?\d+(\.\d+)?)([KMBT])$", s, re.IGNORECASE)
-        mult = 1.0
-        if m:
-            num = m.group(1)
-            suf = m.group(3).upper()
-            mult = {"K": 1_000, "M": 1_000_000, "B": 1_000_000_000, "T": 1_000_000_000_000}.get(suf, 1.0)
-            s = num
-        f = float(s) * mult
-        if math.isnan(f) or math.isinf(f): return None
-        return f
+        s = str(value).strip()
+        return s if s else None
     except Exception:
         return None
 
 
-def _as_fraction(x: Any) -> Optional[float]:
+def _safe_float(value: Any) -> Optional[float]:
+    """Safely convert to float; handles Arabic digits, K/M/B/T, parens-negative."""
+    if value is None:
+        return None
+
+    try:
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            f = float(value)
+            return None if (math.isnan(f) or math.isinf(f)) else f
+
+        s = str(value).strip()
+        if not s or s.lower() in {"-", "—", "n/a", "na", "null", "none", "nan"}:
+            return None
+
+        s = s.translate(_ARABIC_DIGITS)
+        s = s.replace(",", "").replace("%", "").replace("+", "")
+        s = s.replace("$", "").replace("£", "").replace("€", "")
+        s = s.replace("SAR", "").replace("USD", "").replace("EUR", "").strip()
+
+        if s.startswith("(") and s.endswith(")"):
+            s = "-" + s[1:-1].strip()
+
+        match = _K_M_B_T_RE.match(s)
+        if match:
+            f = float(match.group(1)) * _K_M_B_T_MULT[match.group(2).upper()]
+        else:
+            f = float(s)
+
+        return None if (math.isnan(f) or math.isinf(f)) else f
+    except (ValueError, TypeError):
+        return None
+
+
+def _as_fraction(value: Any) -> Optional[float]:
     """
-    FIX v6.9.0: Normalise any percent-like value to a fraction (0.0142 = 1.42%).
-    Yahoo returns dtype=pct fields (dividendYield, grossMargins, etc.) as fractions
-    (0.02 = 2%). The old _percentish() helper wrongly multiplied these by 100.
-    Rule: abs(f) > 1.5 -> divide by 100. Else keep as-is (already a fraction).
+    Convert percent-like value to ratio using the abs>1.5 heuristic.
+
+    Used for Yahoo's percent-ish fields (dividendYield, margins, ROE).
+    Yahoo sometimes returns ratios (0.025) and sometimes percents (2.5),
+    so the heuristic is defensible here. Low-magnitude values <1.5 are
+    left as-is (treated as ratios).
     """
-    f = safe_float(x)
+    f = _safe_float(value)
     if f is None:
         return None
-    if abs(f) > 1.5:
-        return f / 100.0
-    return f
+    return f / 100.0 if abs(f) > 1.5 else f
 
 
 def _first_number(*values: Any) -> Optional[float]:
+    """Return the first non-None numeric value."""
     for v in values:
-        f = safe_float(v)
+        f = _safe_float(v)
         if f is not None:
             return f
     return None
 
 
 def _first_fraction(*values: Any) -> Optional[float]:
-    """
-    FIX v6.9.0: Return the first non-None value as a fraction.
-    Replaces _first_percentish() which was converting fractions to percent-points.
-    """
+    """Return the first non-None value coerced to a fraction."""
     for v in values:
         f = _as_fraction(v)
         if f is not None:
@@ -397,105 +426,141 @@ def _first_fraction(*values: Any) -> Optional[float]:
 
 
 def _first_str(*values: Any) -> Optional[str]:
+    """Return the first non-None string value."""
     for v in values:
-        s = safe_str(v)
+        s = _safe_str(v)
         if s is not None:
             return s
     return None
 
 
 def normalize_symbol(symbol: str) -> str:
+    """
+    Normalize symbol to Yahoo Finance format.
+
+    Examples:
+        "2222"     -> "2222.SR"
+        "2222.SR"  -> "2222.SR"
+        "AAPL"     -> "AAPL"
+        "GC=F"     -> "GC=F"
+        "^GSPC"    -> "^GSPC"
+        "EURUSD=X" -> "EURUSD=X"
+    """
     s = (symbol or "").strip()
-    if not s: return ""
+    if not s:
+        return ""
+
     s = s.translate(_ARABIC_DIGITS).strip().upper()
+
     if _KSA_CODE_RE.match(s):
         return f"{s}.SR"
+
     return s
 
 
 def clean_dict(d: Dict[str, Any]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for k, v in (d or {}).items():
-        if v is None: continue
-        if isinstance(v, str) and not v.strip(): continue
+    """Remove None, empty strings, and recursively empty containers from a dict."""
+    result: Dict[str, Any] = {}
+    for k, v in d.items():
+        if v is None:
+            continue
+        if isinstance(v, str) and not v.strip():
+            continue
         if isinstance(v, dict):
-            vv = clean_dict(v)
-            if vv: out[k] = vv
+            cleaned = clean_dict(v)
+            if cleaned:
+                result[k] = cleaned
         elif isinstance(v, (list, tuple)):
-            lst = []
+            cleaned_list = []
             for item in v:
                 if isinstance(item, dict):
-                    it = clean_dict(item)
-                    if it: lst.append(it)
-                elif item is not None: lst.append(item)
-            if lst: out[k] = lst
+                    cleaned_item = clean_dict(item)
+                    if cleaned_item:
+                        cleaned_list.append(cleaned_item)
+                elif item is not None:
+                    cleaned_list.append(item)
+            if cleaned_list:
+                result[k] = cleaned_list
         else:
-            out[k] = v
-    return out
+            result[k] = v
+    return result
 
 
 # =============================================================================
-# Rate limiter (token bucket)
+# Async Primitives: TokenBucket, CircuitBreaker, SingleFlight, AdvancedCache
 # =============================================================================
+
 @dataclass(slots=True)
 class TokenBucket:
+    """Token bucket rate limiter."""
+
     rate_per_sec: float
-    burst:        float
-    tokens:       float = 0.0
-    last:         float = 0.0
-    lock:         asyncio.Lock = field(default_factory=asyncio.Lock)
+    burst: float
+    tokens: float = 0.0
+    last: float = 0.0
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def acquire(self, n: float = 1.0) -> None:
-        if self.rate_per_sec <= 0: return
+        """Acquire `n` tokens (blocking until available)."""
+        if self.rate_per_sec <= 0:
+            return
+
         async with self.lock:
             now = time.monotonic()
             if self.last <= 0:
                 self.last = now
                 self.tokens = float(self.burst)
+
             elapsed = max(0.0, now - self.last)
             self.tokens = min(float(self.burst), self.tokens + elapsed * float(self.rate_per_sec))
             self.last = now
+
             if self.tokens >= n:
                 self.tokens -= n
                 return
+
             need = n - self.tokens
             wait = need / float(self.rate_per_sec)
             self.tokens = 0.0
+
         await asyncio.sleep(min(5.0, max(0.0, wait)))
 
 
-# =============================================================================
-# Circuit breaker
-# =============================================================================
 @dataclass(slots=True)
 class CircuitBreaker:
-    fail_threshold:    int
-    cooldown_sec:      float
+    """Circuit breaker for failure isolation."""
+
+    fail_threshold: int
+    cooldown_sec: float
     success_threshold: int
-    failures:          int   = 0
-    successes:         int   = 0
-    opened_at:         float = 0.0
-    state:             str   = "closed"
-    lock:              asyncio.Lock = field(default_factory=asyncio.Lock)
+    failures: int = 0
+    successes: int = 0
+    opened_at: float = 0.0
+    state: str = "closed"
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     async def allow(self) -> bool:
-        m = metrics()
+        """Return True if a request is allowed through."""
+        metrics = _get_metrics()
         async with self.lock:
             if self.state == "closed":
-                m.circuit_state.labels(state="closed").set(0.0)
+                metrics.circuit_state.labels(state="closed").set(0.0)
                 return True
+
             if self.state == "open":
                 if time.monotonic() - self.opened_at >= self.cooldown_sec:
                     self.state = "half_open"
                     self.successes = 0
-                    m.circuit_state.labels(state="half_open").set(1.0)
+                    metrics.circuit_state.labels(state="half_open").set(1.0)
                     return True
-                m.circuit_state.labels(state="open").set(2.0)
+                metrics.circuit_state.labels(state="open").set(2.0)
                 return False
-            m.circuit_state.labels(state="half_open").set(1.0)
+
+            metrics.circuit_state.labels(state="half_open").set(1.0)
             return True
 
     async def record_success(self) -> None:
+        """Record a successful request."""
         async with self.lock:
             if self.state == "half_open":
                 self.successes += 1
@@ -507,6 +572,7 @@ class CircuitBreaker:
                 self.failures = max(0, self.failures - 1)
 
     async def record_failure(self) -> None:
+        """Record a failed request (may open the breaker)."""
         async with self.lock:
             self.failures += 1
             if self.state == "half_open":
@@ -518,608 +584,884 @@ class CircuitBreaker:
                 self.opened_at = time.monotonic()
 
 
-# =============================================================================
-# SingleFlight
-# =============================================================================
 class SingleFlight:
+    """Deduplicate concurrent requests for the same key."""
+
     def __init__(self) -> None:
-        self._lock    = asyncio.Lock()
+        self._lock = asyncio.Lock()
         self._futures: Dict[str, asyncio.Future] = {}
 
     async def run(self, key: str, coro_fn: Callable[[], Awaitable[Any]]) -> Any:
+        """Execute coroutine; concurrent callers for the same key share the result."""
         async with self._lock:
-            fut = self._futures.get(key)
-            if fut is not None:
-                return await fut
+            future = self._futures.get(key)
+            if future is not None:
+                return await future
+
             loop = asyncio.get_running_loop()
-            fut = loop.create_future()
-            self._futures[key] = fut
+            future = loop.create_future()
+            self._futures[key] = future
+
         try:
-            res = await coro_fn()
-            if not fut.cancelled() and not fut.done():
-                fut.set_result(res)
-            return res
-        except Exception as e:
-            if not fut.cancelled() and not fut.done():
-                fut.set_exception(e)
+            result = await coro_fn()
+            if not future.cancelled() and not future.done():
+                future.set_result(result)
+            return result
+        except Exception as exc:
+            if not future.cancelled() and not future.done():
+                future.set_exception(exc)
             raise
         finally:
             async with self._lock:
                 self._futures.pop(key, None)
 
 
-# =============================================================================
-# AdvancedCache (async TTL + clear)
-# =============================================================================
 @dataclass(slots=True)
 class AdvancedCache:
-    name:     str
-    ttl_sec:  float
-    maxsize:  int = 5000
-    _data:    Dict[str, Tuple[Any, float]] = field(default_factory=dict)
-    _lock:    asyncio.Lock = field(default_factory=asyncio.Lock)
+    """Async TTL cache with size limit (mass eviction on overflow)."""
+
+    name: str
+    ttl_sec: float
+    max_size: int = 5000
+    _data: Dict[str, Tuple[Any, float]] = field(default_factory=dict)
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def _make_key(self, symbol: str, kind: str) -> str:
         return f"{self.name}:{kind}:{symbol}"
 
     async def get(self, symbol: str, kind: str = "quote") -> Optional[Any]:
+        """Get value from cache if not expired."""
         key = self._make_key(symbol, kind)
         now = time.monotonic()
+
         async with self._lock:
             item = self._data.get(key)
-            if not item: return None
-            value, exp = item
-            if now <= exp: return value
+            if not item:
+                return None
+            value, expires_at = item
+            if now <= expires_at:
+                return value
             self._data.pop(key, None)
             return None
 
-    async def set(self, symbol: str, value: Any, kind: str = "quote", ttl_sec: Optional[float] = None) -> None:
+    async def set(
+        self,
+        symbol: str,
+        value: Any,
+        kind: str = "quote",
+        ttl_sec: Optional[float] = None,
+    ) -> None:
+        """Set value in cache with TTL; mass-evicts on overflow."""
         key = self._make_key(symbol, kind)
-        ttl = float(ttl_sec if ttl_sec is not None else self.ttl_sec)
-        exp = time.monotonic() + max(0.5, ttl)
+        ttl = ttl_sec if ttl_sec is not None else self.ttl_sec
+        expires_at = time.monotonic() + max(0.5, ttl)
+
         async with self._lock:
-            if len(self._data) >= self.maxsize and key not in self._data:
-                n = max(1, self.maxsize // 10)
+            if len(self._data) >= self.max_size and key not in self._data:
+                n = max(1, self.max_size // 10)
                 for k in list(self._data.keys())[:n]:
                     self._data.pop(k, None)
-            self._data[key] = (value, exp)
+            self._data[key] = (value, expires_at)
 
     async def clear(self) -> None:
+        """Clear cache."""
         async with self._lock:
             self._data.clear()
 
     async def size(self) -> int:
+        """Get current cache size."""
         async with self._lock:
             return len(self._data)
 
 
 # =============================================================================
-# Risk / Stats helpers (all return fractions -- dtype=pct)
+# Technical Indicators (Pure Python with NumPy acceleration)
 # =============================================================================
 
 def _simple_returns(closes: List[float]) -> List[float]:
-    out: List[float] = []
+    """Simple returns from close prices."""
+    returns: List[float] = []
     for i in range(1, len(closes)):
-        p0 = closes[i - 1]
-        p1 = closes[i]
-        if p0 and p0 > 0:
-            out.append((p1 / p0) - 1.0)
-    return out
+        prev, curr = closes[i - 1], closes[i]
+        if prev and prev > 0:
+            returns.append((curr / prev) - 1.0)
+    return returns
 
 
 def _log_returns(closes: List[float]) -> List[float]:
-    out: List[float] = []
+    """Log returns from close prices."""
+    returns: List[float] = []
     for i in range(1, len(closes)):
-        p0 = closes[i - 1]
-        p1 = closes[i]
-        if p0 and p0 > 0 and p1 and p1 > 0:
-            out.append(math.log(p1 / p0))
-    return out
+        prev, curr = closes[i - 1], closes[i]
+        if prev and prev > 0 and curr and curr > 0:
+            returns.append(math.log(curr / prev))
+    return returns
 
 
-def _annualized_vol_from_logrets(logrets: List[float]) -> Optional[float]:
-    if len(logrets) < 2: return None
+def _annualized_vol_from_log_returns(log_returns: List[float]) -> Optional[float]:
+    """Annualized volatility from log returns."""
+    if len(log_returns) < 2:
+        return None
     try:
         if _HAS_NUMPY and np is not None:
-            v = float(np.std(np.asarray(logrets, dtype=float), ddof=1) * math.sqrt(252.0))
-            if math.isnan(v) or math.isinf(v): return None
-            return v
-        std = statistics.stdev(logrets)
+            vol = float(np.std(np.asarray(log_returns, dtype=float), ddof=1) * math.sqrt(252.0))
+            return None if (math.isnan(vol) or math.isinf(vol)) else vol
+        std = statistics.stdev(log_returns)
         return float(std * math.sqrt(252.0))
     except Exception:
         return None
 
 
 def _volatility_nd(closes: List[float], days: int) -> Optional[float]:
-    """Returns annualized volatility as fraction (0.18 = 18%). dtype=pct correct."""
-    if len(closes) < days + 1: return None
+    """N-day annualized volatility as a fraction."""
+    if len(closes) < days + 1:
+        return None
     window = closes[-(days + 1):]
-    return _annualized_vol_from_logrets(_log_returns(window))
+    return _annualized_vol_from_log_returns(_log_returns(window))
 
 
 def _max_drawdown_1y(closes: List[float]) -> Optional[float]:
-    """Returns fraction (0.25 = 25% drawdown). dtype=pct correct."""
-    if len(closes) < 20: return None
+    """Maximum drawdown over ~1 year as a positive fraction."""
+    if len(closes) < 20:
+        return None
     window = closes[-252:] if len(closes) >= 252 else closes[:]
-    peak   = None
+    peak: Optional[float] = None
     max_dd = 0.0
     for p in window:
-        if p is None or p <= 0: continue
-        if peak is None or p > peak: peak = p
+        if p is None or p <= 0:
+            continue
+        if peak is None or p > peak:
+            peak = p
         if peak and peak > 0:
             dd = (p / peak) - 1.0
-            if dd < max_dd: max_dd = dd
+            if dd < max_dd:
+                max_dd = dd
     return float(abs(max_dd)) if max_dd < 0 else 0.0
 
 
 def _var_95_1d(closes: List[float]) -> Optional[float]:
-    """Returns fraction (0.02 = 2% VaR). dtype=pct correct."""
-    rets = _simple_returns(closes)
-    if len(rets) < 30: return None
+    """95% daily VaR as a positive fraction."""
+    returns = _simple_returns(closes)
+    if len(returns) < 30:
+        return None
     try:
         if _HAS_NUMPY and np is not None:
-            q = float(np.quantile(np.asarray(rets, dtype=float), 0.05))
+            q = float(np.quantile(np.asarray(returns, dtype=float), 0.05))
         else:
-            s   = sorted(rets)
-            idx = max(0, int(0.05 * (len(s) - 1)))
-            q   = float(s[idx])
+            sorted_returns = sorted(returns)
+            idx = max(0, int(0.05 * (len(sorted_returns) - 1)))
+            q = float(sorted_returns[idx])
         return float(abs(q)) if q < 0 else 0.0
     except Exception:
         return None
 
 
 def _sharpe_1y(closes: List[float]) -> Optional[float]:
-    """Returns dimensionless Sharpe ratio (not pct)."""
-    rets = _simple_returns(closes)
-    if len(rets) < 60: return None
-    w = rets[-252:] if len(rets) >= 252 else rets[:]
-    if len(w) < 30: return None
+    """Annualized Sharpe ratio (dimensionless)."""
+    returns = _simple_returns(closes)
+    if len(returns) < 60:
+        return None
+    window = returns[-252:] if len(returns) >= 252 else returns[:]
+    if len(window) < 30:
+        return None
     try:
         if _HAS_NUMPY and np is not None:
-            arr = np.asarray(w, dtype=float)
-            mu  = float(np.mean(arr))
-            sd  = float(np.std(arr, ddof=1))
+            arr = np.asarray(window, dtype=float)
+            mu = float(np.mean(arr))
+            sd = float(np.std(arr, ddof=1))
         else:
-            mu = float(sum(w) / len(w))
-            sd = float(statistics.stdev(w))
-        if sd <= 0 or math.isnan(sd) or math.isinf(sd): return None
+            mu = float(sum(window) / len(window))
+            sd = float(statistics.stdev(window))
+        if sd <= 0 or math.isnan(sd) or math.isinf(sd):
+            return None
         return float((mu * 252.0) / (sd * math.sqrt(252.0)))
     except Exception:
         return None
 
 
 def _rsi_14(closes: List[float]) -> Optional[float]:
-    if len(closes) < 15: return None
-    try:
-        if _HAS_NUMPY and np is not None:
-            arr   = np.asarray(closes, dtype=float)
-            diff  = np.diff(arr)
-            gains  = np.where(diff > 0, diff, 0.0)
-            losses = np.where(diff < 0, -diff, 0.0)
-            n = 14
-            avg_gain = float(gains[:n].mean())
-            avg_loss = float(losses[:n].mean())
-            for i in range(n, len(gains)):
-                avg_gain = (avg_gain * (n - 1) + float(gains[i])) / n
-                avg_loss = (avg_loss * (n - 1) + float(losses[i])) / n
-            if avg_loss == 0: return 100.0
-            rs = avg_gain / avg_loss
-            return float(100.0 - (100.0 / (1.0 + rs)))
-        n = 14
-        diffs  = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
-        gains  = [d if d > 0 else 0.0 for d in diffs]
-        losses = [-d if d < 0 else 0.0 for d in diffs]
-        avg_gain = sum(gains[:n])  / n
-        avg_loss = sum(losses[:n]) / n
-        for i in range(n, len(gains)):
-            avg_gain = (avg_gain * (n - 1) + gains[i])  / n
-            avg_loss = (avg_loss * (n - 1) + losses[i]) / n
-        if avg_loss == 0: return 100.0
-        rs = avg_gain / avg_loss
-        return 100.0 - (100.0 / (1.0 + rs))
-    except Exception:
+    """RSI(14) with Wilder's smoothing (NumPy-accelerated with pure-Python fallback)."""
+    if len(closes) < 15:
         return None
 
+    period = 14
 
-def _simple_forecast(closes: List[float], horizon_days: int) -> Tuple[Optional[float], Optional[float], float]:
-    """
-    Returns (forecast_price, expected_roi, confidence).
-    FIX v6.9.0: expected_roi returned as FRACTION (0.15 = 15%).
-    Was: (price/last - 1.0) * 100.0 -> percent-points
-    Now: (price/last) - 1.0 -> fraction (dtype=pct)
-    """
+    if _HAS_NUMPY and np is not None:
+        try:
+            arr = np.asarray(closes, dtype=float)
+            diff = np.diff(arr)
+            gains = np.where(diff > 0, diff, 0.0)
+            losses = np.where(diff < 0, -diff, 0.0)
+
+            avg_gain = float(gains[:period].mean())
+            avg_loss = float(losses[:period].mean())
+
+            for i in range(period, len(gains)):
+                avg_gain = (avg_gain * (period - 1) + float(gains[i])) / period
+                avg_loss = (avg_loss * (period - 1) + float(losses[i])) / period
+
+            if avg_loss == 0:
+                return 100.0
+            rs = avg_gain / avg_loss
+            return 100.0 - (100.0 / (1.0 + rs))
+        except Exception:
+            pass
+
+    # Pure Python fallback
+    diffs = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+    gains = [d if d > 0 else 0.0 for d in diffs]
+    losses = [-d if d < 0 else 0.0 for d in diffs]
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _simple_forecast(
+    closes: List[float],
+    horizon_days: int,
+) -> Tuple[Optional[float], Optional[float], float]:
+    """Simple price forecast via log-linear regression. Returns (price, roi_frac, confidence)."""
     if len(closes) < 60 or horizon_days <= 0:
         return None, None, 0.0
+
     try:
         n = min(len(closes), 252)
         y = closes[-n:]
         if any(p <= 0 for p in y):
             return None, None, 0.0
 
+        last = float(closes[-1])
+
         if _HAS_NUMPY and np is not None:
-            arr  = np.asarray(y, dtype=float)
-            x    = np.arange(len(arr), dtype=float)
-            logy = np.log(arr)
-            slope, intercept = np.polyfit(x, logy, 1)
-            pred   = slope * x + intercept
-            ss_res = float(np.sum((logy - pred) ** 2))
-            ss_tot = float(np.sum((logy - float(np.mean(logy))) ** 2))
-            r2     = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+            arr = np.asarray(y, dtype=float)
+            x = np.arange(len(arr), dtype=float)
+            log_y = np.log(arr)
+            slope, intercept = np.polyfit(x, log_y, 1)
+            pred = slope * x + intercept
+            ss_res = float(np.sum((log_y - pred) ** 2))
+            ss_tot = float(np.sum((log_y - float(np.mean(log_y))) ** 2))
+            r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
             future_x = float(len(arr) - 1 + horizon_days)
             forecast_price = float(math.exp(float(slope) * future_x + float(intercept)))
         else:
-            start = y[0]
-            end   = y[-1]
+            # CAGR-based fallback
+            start, end = y[0], y[-1]
             years = max(1e-6, len(y) / 252.0)
-            cagr  = (end / start) ** (1 / years) - 1
+            cagr = (end / start) ** (1 / years) - 1
             forecast_price = end * ((1 + cagr) ** (horizon_days / 252.0))
             r2 = 0.25
 
-        last = float(closes[-1])
-        # FIX v6.9.0: fraction not percent-points (was * 100.0)
-        roi_frac = (forecast_price / last) - 1.0
-
+        roi_fraction = (forecast_price / last) - 1.0
         vol30 = _volatility_nd(closes, 30) or 0.25
-        conf  = max(0.05, min(0.95,
-            (max(0.0, min(1.0, r2)) * 0.8 + 0.2) *
-            (1.0 / (1.0 + max(0.0, vol30 - 0.25)))
+        confidence = max(0.05, min(0.95,
+            (max(0.0, min(1.0, r2)) * 0.8 + 0.2)
+            * (1.0 / (1.0 + max(0.0, vol30 - 0.25)))
         ))
-        return forecast_price, roi_frac, conf
+        return forecast_price, roi_fraction, confidence
     except Exception:
         return None, None, 0.0
 
 
 # =============================================================================
-# Provider implementation
+# Yahoo Finance Sync Fetcher (runs in ThreadPool)
 # =============================================================================
-_CPU_WORKERS  = max(2, _env_int("YAHOO_THREADPOOL_WORKERS", 6))
-_CPU_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=_CPU_WORKERS, thread_name_prefix="YahooWorker")
-
-
-def _get_attr(obj: Any, *names: str) -> Any:
-    for n in names:
-        try:
-            if obj is None: continue
-            if isinstance(obj, dict) and n in obj: return obj.get(n)
-            if hasattr(obj, n): return getattr(obj, n)
-        except Exception:
-            continue
-    return None
-
 
 def _safe_history_metadata(ticker: Any) -> Dict[str, Any]:
-    for attr_name in ("history_metadata",):
-        try:
-            meta = getattr(ticker, attr_name)
+    """
+    Safely extract history metadata from a yfinance Ticker.
+
+    yfinance populates `ticker.history_metadata` after `.history()` is called.
+    v7.0.0 had a dead placeholder that always returned {} -- v8.0.0 reads
+    the real attribute, then falls back to the `get_history_metadata()`
+    method if present.
+    """
+    if ticker is None:
+        return {}
+
+    try:
+        meta = getattr(ticker, "history_metadata", None)
+        if isinstance(meta, dict) and meta:
+            return meta
+    except Exception:
+        pass
+
+    try:
+        fn = getattr(ticker, "get_history_metadata", None)
+        if callable(fn):
+            meta = fn()
             if isinstance(meta, dict) and meta:
                 return meta
-        except Exception:
-            pass
-    for fn_name in ("get_history_metadata",):
-        try:
-            fn = getattr(ticker, fn_name, None)
-            if callable(fn):
-                meta = fn()
-                if isinstance(meta, dict) and meta:
-                    return meta
-        except Exception:
-            pass
+    except Exception:
+        pass
+
     return {}
 
 
 def _infer_asset_class(symbol: str, info: Any = None, meta: Optional[Dict[str, Any]] = None) -> Optional[str]:
-    qt = None
+    """Infer asset class from symbol + info + metadata."""
+    quote_type = None
     if isinstance(info, dict):
-        qt = safe_str(info.get("quoteType") or info.get("quote_type") or info.get("type"))
-    if qt is None and isinstance(meta, dict):
-        qt = safe_str(meta.get("instrumentType") or meta.get("quoteType"))
-    if qt:
-        qtu = qt.upper()
-        if qtu in {"CURRENCY", "FOREX", "FX"}: return "FX"
-        if qtu in {"ETF", "MUTUALFUND", "MUTUAL FUND"}: return qtu
-        return qtu
+        quote_type = _safe_str(info.get("quoteType") or info.get("quote_type") or info.get("type"))
+    if quote_type is None and isinstance(meta, dict):
+        quote_type = _safe_str(meta.get("instrumentType") or meta.get("quoteType"))
+
+    if quote_type:
+        qt_upper = quote_type.upper()
+        if qt_upper in {"CURRENCY", "FOREX", "FX"}:
+            return "FX"
+        if qt_upper in {"ETF", "MUTUALFUND", "MUTUAL FUND"}:
+            return qt_upper
+        return qt_upper
+
     s = symbol.upper()
-    if s.endswith(".SR"): return "EQUITY"
-    if s.endswith("=F"):  return "FUTURE"
-    if s.endswith("=X"):  return "FX"
-    if s.startswith("^"): return "INDEX"
+    if s.endswith(".SR"):
+        return "EQUITY"
+    if s.endswith("=F"):
+        return "FUTURE"
+    if s.endswith("=X"):
+        return "FX"
+    if s.startswith("^"):
+        return "INDEX"
     return None
 
 
 def _infer_exchange(symbol: str, info: Any = None, meta: Optional[Dict[str, Any]] = None) -> Optional[str]:
+    """Infer exchange from symbol + info + metadata."""
     if isinstance(info, dict):
-        ex = _first_str(info.get("exchange"), info.get("fullExchangeName"), info.get("exchangeName"))
-        if ex: return ex
+        exchange = _first_str(
+            info.get("exchange"), info.get("fullExchangeName"), info.get("exchangeName"),
+        )
+        if exchange:
+            return exchange
     if isinstance(meta, dict):
-        ex = _first_str(meta.get("exchangeName"), meta.get("exchangeTimezoneName"))
-        if ex: return ex
+        exchange = _first_str(meta.get("exchangeName"), meta.get("exchangeTimezoneName"))
+        if exchange:
+            return exchange
+
     s = symbol.upper()
-    if s.endswith(".SR"): return "Tadawul"
-    if s.endswith("=F"): return "NYMEX"
-    if s.endswith("=X"): return "CCY"
-    if s.startswith("^"): return "INDEX"
+    if s.endswith(".SR"):
+        return "Tadawul"
+    if s.endswith("=F"):
+        return "NYMEX"
+    if s.endswith("=X"):
+        return "CCY"
+    if s.startswith("^"):
+        return "INDEX"
     return None
 
 
-def _fetch_ticker_sync(symbol: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-    """Blocking fetch. Should run in ThreadPool."""
+def _fetch_ticker_sync(
+    symbol: str,
+    period: str = DEFAULT_HISTORY_PERIOD,
+    interval: str = DEFAULT_HISTORY_INTERVAL,
+) -> Tuple[Dict[str, Any], Dict[str, Any], List[Dict[str, Any]]]:
+    """
+    Blocking fetch of ticker data. Runs in ThreadPoolExecutor.
+
+    v8.0.0 bug fix: `period` and `interval` are now proper parameters.
+    v7.0.0 hardcoded interval="1d" and had the nonsense expression
+      period=_HAS_PANDAS and pd is not None and "YAHOO_HISTORY_PERIOD"
+             in globals() or "2y"
+    which always evaluated to "2y" regardless of config / env var.
+
+    Returns:
+        Tuple of (info_dict, history_metadata, history_list)
+    """
     if not _HAS_YFINANCE or yf is None:
-        return {}, []
+        return {}, {}, []
 
     try:
-        t = yf.Ticker(symbol)
-        
-        info_dict = {}
+        ticker = yf.Ticker(symbol)
+
+        # Info: fast_info first, then full .info
+        info_dict: Dict[str, Any] = {}
         try:
-            fast_info = getattr(t, "fast_info", None)
+            fast_info = getattr(ticker, "fast_info", None)
             if fast_info:
                 info_dict = dict(fast_info)
         except Exception:
             pass
-            
+
         try:
-            info = getattr(t, "info", None)
+            info = getattr(ticker, "info", None)
             if isinstance(info, dict):
                 info_dict.update(info)
         except Exception:
             pass
 
-        history_list = []
+        # History (respects config-provided period/interval)
+        history_list: List[Dict[str, Any]] = []
         try:
-            hist_df = t.history(period=_history_period(), interval=_history_interval())
-            if _HAS_PANDAS and pd is not None and isinstance(hist_df, pd.DataFrame) and not hist_df.empty:
+            hist_df = ticker.history(period=period, interval=interval)
+            if (_HAS_PANDAS and pd is not None
+                    and isinstance(hist_df, pd.DataFrame) and not hist_df.empty):
                 hist_df = hist_df.reset_index()
                 for _, row in hist_df.iterrows():
-                    d = row.to_dict()
-                    dt_val = d.get("Date") or d.get("Datetime")
+                    row_dict = row.to_dict()
+                    dt_val = row_dict.get("Date") or row_dict.get("Datetime")
                     if hasattr(dt_val, "to_pydatetime"):
                         dt_val = dt_val.to_pydatetime()
-                    
+
                     history_list.append({
                         "timestamp": _utc_iso(dt_val) if isinstance(dt_val, datetime) else str(dt_val),
-                        "open": safe_float(d.get("Open")),
-                        "high": safe_float(d.get("High")),
-                        "low": safe_float(d.get("Low")),
-                        "close": safe_float(d.get("Close")),
-                        "volume": safe_float(d.get("Volume")),
+                        "open": _safe_float(row_dict.get("Open")),
+                        "high": _safe_float(row_dict.get("High")),
+                        "low": _safe_float(row_dict.get("Low")),
+                        "close": _safe_float(row_dict.get("Close")),
+                        "volume": _safe_float(row_dict.get("Volume")),
                     })
         except Exception:
             pass
 
-        return info_dict, history_list
-    except Exception as e:
-        logger.warning(f"[{PROVIDER_NAME}] Sync fetch failed for {symbol}: {e}")
-        return {}, []
+        # v8.0.0: capture history_metadata *after* calling .history() (it's
+        # populated lazily by yfinance). v7.0.0 passed None to the helper
+        # and got {} back every time.
+        meta = _safe_history_metadata(ticker)
+
+        return info_dict, meta, history_list
+    except Exception as exc:
+        logger.warning("Sync fetch failed for %s: %s", symbol, exc)
+        return {}, {}, []
 
 
-def _enrich_data(symbol: str, info: Dict[str, Any], history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Combine quote/fundamentals and history stats into the canonical format."""
-    
-    # 1. Quote Core
-    price = _first_number(info.get("currentPrice"), info.get("regularMarketPrice"), info.get("lastPrice"))
-    prev_close = _first_number(info.get("previousClose"), info.get("regularMarketPreviousClose"))
-    
+def _enrich_data(
+    symbol: str,
+    info: Dict[str, Any],
+    meta: Dict[str, Any],
+    history: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Enrich raw Yahoo data into the canonical patch shape."""
+    # 1. Quote core
+    price = _first_number(
+        info.get("currentPrice"),
+        info.get("regularMarketPrice"),
+        info.get("lastPrice"),
+    )
+    prev_close = _first_number(
+        info.get("previousClose"),
+        info.get("regularMarketPreviousClose"),
+    )
+
+    # Fallback to history when live fields are missing
     if not price and history:
-        last_hist = history[-1]
-        price = last_hist.get("close")
+        price = history[-1].get("close")
         if not prev_close and len(history) > 1:
             prev_close = history[-2].get("close")
 
-    # FIX v6.9.0: pct-change fraction
-    pct_change = None
+    percent_change = None
     if price and prev_close and prev_close > 0:
-        pct_change = (price / prev_close) - 1.0
-        
+        percent_change = (price / prev_close) - 1.0
+
     change = None
     if price and prev_close:
         change = price - prev_close
 
-    # 2. Volumes and Caps
-    vol = _first_number(info.get("volume"), info.get("regularMarketVolume"))
-    if not vol and history:
-        vol = history[-1].get("volume")
+    # 2. Volume + market cap
+    volume = _first_number(info.get("volume"), info.get("regularMarketVolume"))
+    if not volume and history:
+        volume = history[-1].get("volume")
 
-    mcap = _first_number(info.get("marketCap"))
-    
-    # 3. 52 Week Extrema
-    w52_hi = _first_number(info.get("fiftyTwoWeekHigh"))
-    w52_lo = _first_number(info.get("fiftyTwoWeekLow"))
-    if not w52_hi and history:
-        closes = [h["close"] for h in history[-252:] if h.get("close")]
-        w52_hi = max(closes) if closes else None
-        w52_lo = min(closes) if closes else None
+    market_cap = _first_number(info.get("marketCap"))
 
-    # FIX v6.9.0: position pct fraction
-    w52_pos = None
-    if price and w52_hi and w52_lo and (w52_hi > w52_lo):
-        w52_pos = (price - w52_lo) / (w52_hi - w52_lo)
+    # 3. 52-week range
+    week_52_high = _first_number(info.get("fiftyTwoWeekHigh"))
+    week_52_low = _first_number(info.get("fiftyTwoWeekLow"))
 
-    # 4. History Stats
+    if not week_52_high and history:
+        closes_252 = [h["close"] for h in history[-252:] if h.get("close")]
+        if closes_252:
+            week_52_high = max(closes_252)
+            week_52_low = min(closes_252)
+
+    week_52_position = None
+    if price and week_52_high and week_52_low and week_52_high > week_52_low:
+        week_52_position = (price - week_52_low) / (week_52_high - week_52_low)
+
+    # 4. History-derived stats
     closes_list = [h["close"] for h in history if h.get("close")]
-    vol30 = _volatility_nd(closes_list, 30)
-    rsi = _rsi_14(closes_list)
-    dd_1y = _max_drawdown_1y(closes_list)
-    sharpe = _sharpe_1y(closes_list)
-    var95 = _var_95_1d(closes_list)
+    volatility_30d = _volatility_nd(closes_list, 30)
+    rsi_14 = _rsi_14(closes_list)
+    max_drawdown_1y = _max_drawdown_1y(closes_list)
+    sharpe_1y = _sharpe_1y(closes_list)
+    var_95_1d = _var_95_1d(closes_list)
 
-    # 5. Forecasts
-    fc_12m, roi_12m, conf_12m = _simple_forecast(closes_list, 252)
+    # 5. Forecast
+    forecast_price_12m, expected_roi_12m, forecast_confidence = _simple_forecast(closes_list, 252)
 
-    # 6. Fundamentals Light (using _first_fraction where schema expects pct)
-    div_yield = _first_fraction(info.get("dividendYield"), info.get("trailingAnnualDividendYield"))
+    # 6. Fundamentals (light)
+    dividend_yield = _first_fraction(
+        info.get("dividendYield"),
+        info.get("trailingAnnualDividendYield"),
+    )
     gross_margin = _first_fraction(info.get("grossMargins"))
-    op_margin = _first_fraction(info.get("operatingMargins"))
+    operating_margin = _first_fraction(info.get("operatingMargins"))
     profit_margin = _first_fraction(info.get("profitMargins"))
-    
-    pe_ttm = _first_number(info.get("trailingPE"))
-    pb = _first_number(info.get("priceToBook"))
     roe = _first_fraction(info.get("returnOnEquity"))
-    eps = _first_number(info.get("trailingEps"))
 
-    out = {
+    # 7. Valuation
+    pe_ttm = _first_number(info.get("trailingPE"))
+    pb_ratio = _first_number(info.get("priceToBook"))
+    eps_ttm = _first_number(info.get("trailingEps"))
+
+    # 8. Identity (v8.0.0: `meta` is now the REAL ticker metadata, not an
+    # empty placeholder -- so asset class / exchange inference actually
+    # benefits from yfinance's history_metadata field.)
+    asset_class = _infer_asset_class(symbol, info, meta)
+    exchange = _infer_exchange(symbol, info, meta)
+    currency = _first_str(info.get("currency"), info.get("financialCurrency"))
+
+    # v8.0.0 minor: compute open_price once instead of twice
+    open_price = _first_number(info.get("open"), info.get("regularMarketOpen"))
+    day_high = _first_number(info.get("dayHigh"), info.get("regularMarketDayHigh"))
+    day_low = _first_number(info.get("dayLow"), info.get("regularMarketDayLow"))
+
+    # Data quality
+    if price and history:
+        data_quality = "EXCELLENT"
+    elif price:
+        data_quality = "GOOD"
+    else:
+        data_quality = "STALE"
+
+    result = {
         "symbol": symbol,
+        "symbol_normalized": symbol,
+        "provider": PROVIDER_NAME,
+        "provider_version": PROVIDER_VERSION,
+        "data_source": PROVIDER_NAME,
+        "data_quality": data_quality,
+        "last_updated_utc": _utc_iso(),
+        "last_updated_riyadh": _riyadh_iso(),
+        # Price fields
+        "current_price": price,
         "price": price,
         "previous_close": prev_close,
+        "prev_close": prev_close,
+        "price_change": change,
         "change": change,
-        "percent_change": pct_change,
-        "open": _first_number(info.get("open"), info.get("regularMarketOpen")),
-        "high": _first_number(info.get("dayHigh"), info.get("regularMarketDayHigh")),
-        "low": _first_number(info.get("dayLow"), info.get("regularMarketDayLow")),
-        "volume": vol,
-        "market_cap": mcap,
-        "currency": _first_str(info.get("currency"), info.get("financialCurrency")),
-        "asset_class": _infer_asset_class(symbol, info),
-        "exchange": _infer_exchange(symbol, info),
-        
-        "week_52_high": w52_hi,
-        "week_52_low": w52_lo,
-        "week_52_position_pct": w52_pos,
-        
-        "dividend_yield": div_yield,
+        "percent_change": percent_change,
+        "change_pct": percent_change,
+        "open_price": open_price,
+        "open": open_price,
+        "day_high": day_high,
+        "day_low": day_low,
+        "volume": volume,
+        "market_cap": market_cap,
+        # 52-week
+        "week_52_high": week_52_high,
+        "week_52_low": week_52_low,
+        "week_52_position_pct": week_52_position,
+        # Fundamentals
+        "dividend_yield": dividend_yield,
         "pe_ttm": pe_ttm,
-        "pb_ratio": pb,
+        "pb_ratio": pb_ratio,
         "roe": roe,
-        "eps_ttm": eps,
+        "eps_ttm": eps_ttm,
         "gross_margin": gross_margin,
-        "operating_margin": op_margin,
+        "operating_margin": operating_margin,
         "profit_margin": profit_margin,
-
-        "volatility_30d": vol30,
-        "rsi_14d": rsi,
-        "max_drawdown_1y": dd_1y,
-        "sharpe_ratio_1y": sharpe,
-        "value_at_risk_95_1d": var95,
-        
-        "forecast_price_12m": fc_12m,
-        "expected_roi_12m": roi_12m,
-        "forecast_confidence": conf_12m,
-
-        "updated_at_utc": _utc_iso(),
-        "provider": PROVIDER_NAME,
-        "data_quality": "EXCELLENT" if price and history else "GOOD" if price else "STALE"
+        # Risk metrics
+        "volatility_30d": volatility_30d,
+        "rsi_14": rsi_14,
+        "max_drawdown_1y": max_drawdown_1y,
+        "sharpe_1y": sharpe_1y,
+        "var_95_1d": var_95_1d,
+        # Forecast
+        "forecast_price_12m": forecast_price_12m,
+        "expected_roi_12m": expected_roi_12m,
+        "forecast_confidence": forecast_confidence,
+        # Identity
+        "currency": currency,
+        "asset_class": asset_class,
+        "exchange": exchange,
     }
-    return clean_dict(out)
 
+    return clean_dict(result)
+
+
+# =============================================================================
+# Yahoo Chart Provider (async wrapper)
+# =============================================================================
 
 class YahooChartProvider:
     """Async wrapper for Yahoo Finance."""
-    def __init__(self) -> None:
-        self.enabled = _configured()
-        self._tb = TokenBucket(rate_per_sec=_rate_limit_per_sec(), burst=_rate_limit_burst())
-        self._cb = CircuitBreaker(fail_threshold=_cb_fail_threshold(), cooldown_sec=_cb_cooldown_sec(), success_threshold=_cb_success_threshold())
-        self._sf = SingleFlight()
-        self._cache = AdvancedCache(name="yahoo", ttl_sec=_quote_ttl_sec())
+
+    def __init__(self, config: Optional[YahooConfig] = None):
+        self.config = config or YahooConfig.from_env()
+        self._token_bucket = TokenBucket(
+            rate_per_sec=self.config.rate_limit_per_sec,
+            burst=self.config.rate_limit_burst,
+        )
+        self._circuit_breaker = CircuitBreaker(
+            fail_threshold=self.config.cb_fail_threshold,
+            cooldown_sec=self.config.cb_cooldown_sec,
+            success_threshold=self.config.cb_success_threshold,
+        )
+        self._single_flight = SingleFlight()
+        self._cache = AdvancedCache(
+            name="yahoo",
+            ttl_sec=self.config.quote_ttl_sec,
+            max_size=5000,
+        )
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.config.threadpool_workers,
+            thread_name_prefix="YahooWorker",
+        )
 
     async def get_enriched_quote(self, symbol: str) -> Optional[Dict[str, Any]]:
-        if not self.enabled or not symbol:
+        """Get an enriched quote for a single symbol."""
+        if not self.config.is_available or not symbol:
             return None
-            
+
         sym = normalize_symbol(symbol)
-        
-        cached = await self._cache.get(sym, kind="enriched")
-        if cached:
-            metrics().cache_hits_total.labels(symbol=sym).inc()
-            return cached
-            
-        metrics().cache_misses_total.labels(symbol=sym).inc()
-        
-        if not await self._cb.allow():
+        # v8.0.0: early-return on empty normalized symbol, avoiding a pointless cache lookup
+        if not sym:
             return None
-            
-        await self._tb.acquire()
-        
+
+        cached = await self._cache.get(sym, kind="enriched")
+        metrics = _get_metrics()
+        if cached:
+            metrics.cache_hits_total.labels(symbol=sym).inc()
+            return cached
+
+        metrics.cache_misses_total.labels(symbol=sym).inc()
+
+        if not await self._circuit_breaker.allow():
+            return None
+
+        await self._token_bucket.acquire()
+
         async def _do_fetch() -> Optional[Dict[str, Any]]:
             loop = asyncio.get_running_loop()
-            t0 = time.monotonic()
+            start_time = time.monotonic()
+
             try:
-                info, hist = await loop.run_in_executor(_CPU_EXECUTOR, _fetch_ticker_sync, sym)
-                if not info and not hist:
-                    await self._cb.record_failure()
-                    metrics().requests_total.labels(symbol=sym, op="enriched", status="error").inc()
+                # v8.0.0: pass config-provided period/interval to the worker.
+                info, meta, history = await loop.run_in_executor(
+                    self._executor,
+                    _fetch_ticker_sync,
+                    sym,
+                    self.config.history_period,
+                    self.config.history_interval,
+                )
+
+                if not info and not history:
+                    await self._circuit_breaker.record_failure()
+                    metrics.requests_total.labels(symbol=sym, op="enriched", status="error").inc()
                     return None
-                    
-                result = _enrich_data(sym, info, hist)
-                
-                await self._cb.record_success()
-                metrics().requests_total.labels(symbol=sym, op="enriched", status="ok").inc()
-                metrics().request_duration.labels(symbol=sym, op="enriched").observe(time.monotonic() - t0)
-                
-                if result.get("price"):
+
+                result = _enrich_data(sym, info, meta, history)
+
+                await self._circuit_breaker.record_success()
+                metrics.requests_total.labels(symbol=sym, op="enriched", status="ok").inc()
+                metrics.request_duration.labels(symbol=sym, op="enriched").observe(
+                    time.monotonic() - start_time
+                )
+
+                if result.get("current_price"):
                     await self._cache.set(sym, result, kind="enriched")
-                    
+
                 return result
-            except Exception as e:
-                await self._cb.record_failure()
-                metrics().requests_total.labels(symbol=sym, op="enriched", status="error").inc()
-                logger.error(f"[{PROVIDER_NAME}] Error fetching {sym}: {e}")
+            except Exception as exc:
+                await self._circuit_breaker.record_failure()
+                metrics.requests_total.labels(symbol=sym, op="enriched", status="error").inc()
+                logger.error("Error fetching %s: %s", sym, exc)
                 return None
 
-        return await self._sf.run(f"enrich:{sym}", _do_fetch)
+        return await self._single_flight.run(f"enriched:{sym}", _do_fetch)
 
+    async def get_enriched_quotes_batch(
+        self,
+        symbols: List[str],
+        concurrency: Optional[int] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Batch fetch enriched quotes for multiple symbols."""
+        if not symbols:
+            return {}
 
-# =============================================================================
-# Module Exports / Async Helpers
-# =============================================================================
-_PROVIDER_INSTANCE = YahooChartProvider()
+        semaphore = asyncio.Semaphore(concurrency or self.config.max_concurrency)
 
+        async def _fetch_one(sym: str) -> Tuple[str, Optional[Dict[str, Any]]]:
+            async with semaphore:
+                result = await self.get_enriched_quote(sym)
+                return sym, result
 
-async def fetch_quote(symbol: str) -> Optional[Dict[str, Any]]:
-    return await _PROVIDER_INSTANCE.get_enriched_quote(symbol)
+        results = await asyncio.gather(
+            *(_fetch_one(sym) for sym in symbols if sym),
+            return_exceptions=True,
+        )
 
+        output: Dict[str, Dict[str, Any]] = {}
+        for result in results:
+            if isinstance(result, Exception):
+                continue
+            sym, data = result
+            if data:
+                output[sym] = data
+        return output
 
-async def fetch_history(symbol: str, period: str = "1mo", interval: str = "1d") -> List[Dict[str, Any]]:
-    # Left lightweight as get_enriched_quote computes stats over standard history automatically
-    if not _HAS_YFINANCE or yf is None or not _configured():
-        return []
-    try:
-        loop = asyncio.get_running_loop()
-        def _sync_hist() -> List[Dict[str, Any]]:
-            df = yf.Ticker(normalize_symbol(symbol)).history(period=period, interval=interval)
-            out = []
-            if not df.empty:
+    async def fetch_history_raw(
+        self,
+        symbol: str,
+        period: str = "1mo",
+        interval: str = "1d",
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch raw history rows for a symbol.
+
+        v8.0.0: this runs on the provider's SHARED executor instead of
+        allocating a fresh ThreadPoolExecutor per call (v7.0.0 leaked threads).
+        """
+        if not _HAS_YFINANCE or yf is None:
+            return []
+
+        sym = normalize_symbol(symbol)
+        if not sym:
+            return []
+
+        def _sync_fetch() -> List[Dict[str, Any]]:
+            try:
+                ticker = yf.Ticker(sym)
+                df = ticker.history(period=period, interval=interval)
+                if not _HAS_PANDAS or pd is None or df is None or df.empty:
+                    return []
                 df = df.reset_index()
+                rows: List[Dict[str, Any]] = []
                 for _, row in df.iterrows():
-                    d = row.to_dict()
-                    dt_val = d.get("Date") or d.get("Datetime")
-                    out.append({
-                        "timestamp": _utc_iso(dt_val) if hasattr(dt_val, "to_pydatetime") else str(dt_val),
-                        "close": safe_float(d.get("Close")),
-                        "volume": safe_float(d.get("Volume")),
+                    row_dict = row.to_dict()
+                    dt_val = row_dict.get("Date") or row_dict.get("Datetime")
+                    ts = _utc_iso(dt_val) if hasattr(dt_val, "to_pydatetime") else str(dt_val)
+                    rows.append({
+                        "timestamp": ts,
+                        "open": _safe_float(row_dict.get("Open")),
+                        "high": _safe_float(row_dict.get("High")),
+                        "low": _safe_float(row_dict.get("Low")),
+                        "close": _safe_float(row_dict.get("Close")),
+                        "volume": _safe_float(row_dict.get("Volume")),
                     })
-            return out
-        return await loop.run_in_executor(_CPU_EXECUTOR, _sync_hist)
-    except Exception:
-        return []
+                return rows
+            except Exception as exc:
+                logger.warning("History fetch failed for %s: %s", sym, exc)
+                return []
 
+        try:
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(self._executor, _sync_fetch)
+        except Exception as exc:
+            logger.warning("History executor failed for %s: %s", sym, exc)
+            return []
+
+    async def close(self) -> None:
+        """Close the provider and shut down the thread pool."""
+        try:
+            self._executor.shutdown(wait=False)
+        except Exception as exc:
+            logger.debug("yahoo provider close failed: %s", exc)
+
+
+# =============================================================================
+# Singleton Instance (lazy lock)
+# =============================================================================
+
+_PROVIDER_INSTANCE: Optional[YahooChartProvider] = None
+_PROVIDER_LOCK: Optional[asyncio.Lock] = None
+
+
+def _get_provider_lock() -> asyncio.Lock:
+    global _PROVIDER_LOCK
+    if _PROVIDER_LOCK is None:
+        _PROVIDER_LOCK = asyncio.Lock()
+    return _PROVIDER_LOCK
+
+
+async def get_provider() -> YahooChartProvider:
+    """Get the singleton YahooChartProvider instance."""
+    global _PROVIDER_INSTANCE
+    if _PROVIDER_INSTANCE is not None:
+        return _PROVIDER_INSTANCE
+    async with _get_provider_lock():
+        if _PROVIDER_INSTANCE is None:
+            _PROVIDER_INSTANCE = YahooChartProvider()
+    return _PROVIDER_INSTANCE
+
+
+async def close_provider() -> None:
+    """Close and reset the singleton provider."""
+    global _PROVIDER_INSTANCE
+    if _PROVIDER_INSTANCE is not None:
+        await _PROVIDER_INSTANCE.close()
+        _PROVIDER_INSTANCE = None
+
+
+# =============================================================================
+# Engine-Facing Functions
+# =============================================================================
 
 async def fetch_enriched_quote(symbol: str) -> Optional[Dict[str, Any]]:
-    return await _PROVIDER_INSTANCE.get_enriched_quote(symbol)
+    """Fetch enriched quote for a symbol."""
+    provider = await get_provider()
+    return await provider.get_enriched_quote(symbol)
 
 
 async def fetch_enriched_quotes_batch(symbols: List[str]) -> Dict[str, Dict[str, Any]]:
-    """ENH v6.9.0: Concurrently fetch enriched quotes for a list of symbols."""
-    results = {}
-    tasks = {sym: asyncio.create_task(fetch_enriched_quote(sym)) for sym in symbols if sym}
-    
-    for sym, task in tasks.items():
-        try:
-            res = await task
-            if res:
-                results[sym] = res
-        except Exception as e:
-            logger.warning(f"[{PROVIDER_NAME}] Batch failed for {sym}: {e}")
-            
-    return results
+    """Batch fetch enriched quotes for multiple symbols."""
+    provider = await get_provider()
+    return await provider.get_enriched_quotes_batch(symbols)
 
+
+async def fetch_quote(symbol: str) -> Optional[Dict[str, Any]]:
+    """Alias for fetch_enriched_quote."""
+    return await fetch_enriched_quote(symbol)
+
+
+async def fetch_history(
+    symbol: str,
+    period: str = "1mo",
+    interval: str = "1d",
+) -> List[Dict[str, Any]]:
+    """
+    Fetch raw history for a symbol.
+
+    v8.0.0: delegates to the provider's shared ThreadPoolExecutor, so
+    repeated calls no longer leak a fresh executor per invocation.
+    """
+    provider = await get_provider()
+    return await provider.fetch_history_raw(symbol, period=period, interval=interval)
+
+
+# =============================================================================
+# Module Exports
+# =============================================================================
 
 __all__ = [
-    "YahooChartProvider",
-    "fetch_quote",
-    "fetch_history",
-    "fetch_enriched_quote",
-    "fetch_enriched_quotes_batch",
-    "normalize_symbol",
+    # Metadata
     "PROVIDER_NAME",
     "PROVIDER_VERSION",
+    "VERSION",
     "PROVIDER_BATCH_SUPPORTED",
+    # Classes
+    "YahooChartProvider",
+    "YahooConfig",
+    # Singletons
+    "get_provider",
+    "close_provider",
+    # Engine-facing
+    "fetch_enriched_quote",
+    "fetch_enriched_quotes_batch",
+    "fetch_quote",
+    "fetch_history",
+    # Symbol helper
+    "normalize_symbol",
+    # Exceptions (kept for defensive back-compat even though unraised internally)
+    "YahooProviderError",
+    "YahooFetchError",
 ]
