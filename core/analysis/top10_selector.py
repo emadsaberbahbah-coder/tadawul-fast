@@ -3,25 +3,51 @@
 """
 core/analysis/top10_selector.py
 ================================================================================
-Top 10 Selector — v4.8.0
+Top 10 Selector -- v6.0.0
 ================================================================================
-LIVE • SCHEMA-FIRST • ROUTE-COMPATIBLE • ENGINE-SELF-RESOLVING • JSON-SAFE
-TOP10-METADATA GUARANTEED • SOURCE-PAGE SAFE • SNAPSHOT FALLBACK SAFE
-SYNC+ASYNC CALLER TOLERANT • DISPLAY-HEADER TOLERANT • WRAPPER-PAYLOAD SAFE
-PARTIAL-DEGRADATION SAFE • DIRECT-SYMBOLS SAFE • TIMEOUT-GUARDED
+LIVE | SCHEMA-FIRST | ROUTE-COMPATIBLE | ENGINE-SELF-RESOLVING | JSON-SAFE
+TOP10-METADATA GUARANTEED | SOURCE-PAGE SAFE | SNAPSHOT FALLBACK SAFE
+SYNC+ASYNC CALLER TOLERANT | DISPLAY-HEADER TOLERANT | WRAPPER-PAYLOAD SAFE
+PARTIAL-DEGRADATION SAFE | DIRECT-SYMBOLS SAFE | TIMEOUT-GUARDED
 
-Why v4.8.0
-----------
-- FIX: recognizes singular wrapper payloads like `quote`, `record`, and `item`
-  in addition to plural envelopes, so valid single-row results are not dropped.
-- FIX: lets sparse live page rows merge with snapshot rows instead of choosing
-  one or the other, improving resilience when one source is only partially filled.
-- FIX: allows Top10 output-page fallback to supplement sparse candidate pools,
-  not only completely empty pools, reducing zero-row or under-filled results.
-- FIX: preserves direct-symbol intent during final selection when the ranked
-  result set is smaller than the requested limit.
-- FIX: retains the earlier protections around signature-safe retries, wrapper
-  payload safety, partial degradation, and emergency symbol fallback.
+v6.0.0 Changes (from v5.0.0)
+----------------------------
+Bug fixes:
+  - min_confidence filter was broken: comparing a ratio (0.70) to a
+    percent-scaled row value (70). Both sides now normalize to a ratio
+    before comparison.
+  - Scoring horizon buckets (<=14d / else) now match choose_horizon_roi
+    (1M / 3M / 12M via criteria_model) so a 60-day horizon scores with the
+    right weights for its ROI field.
+  - _ENGINE_LOCK is lazy-initialized inside the resolver instead of being
+    an asyncio.Lock() constructed at module import -- safer across threads
+    with distinct event loops.
+
+Alignment with criteria_model.py v3.0.0:
+  - choose_horizon_roi delegates to map_days_to_horizon / horizon_to_
+    expected_roi_key so the three modules in core.analysis agree on
+    horizon thresholds (45 / 120 days).
+
+Consolidation:
+  - Three near-identical retry loops (~20 attempts each) in fetch_page_rows,
+    fetch_page_snapshot, fetch_direct_symbol_rows collapsed into one helper
+    `_try_engine_calls(engine, calls, timeout_sec)`. Net ~80 lines removed.
+  - Magic numbers in compute_trade_setup promoted to named constants
+    (_STOP_LOSS_ATR_MULT, _SQRT_TRADING_DAYS, etc.)
+
+Dead code removed:
+  - DataEngineProtocol (never used; code duck-types via _looks_like_engine)
+  - CANONICAL_KEY_SET (defined, never referenced)
+  - Top10SelectorError / EngineResolutionError / CandidateCollectionError
+    (defined, never raised)
+  - Unused imports: sys, TypeVar, Union, cast, Awaitable, Protocol,
+    runtime_checkable
+
+Added:
+  - `build_top10_rows_async` is now publicly exported for callers that want
+    an async-only contract (no polymorphic return). The sync-tolerant
+    `build_top10_rows` is preserved for backward compatibility.
+================================================================================
 """
 
 from __future__ import annotations
@@ -34,18 +60,36 @@ import logging
 import math
 import os
 import re
-import sys
 import time
+from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
-logger = logging.getLogger("core.analysis.top10_selector")
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
-TOP10_SELECTOR_VERSION = "4.9.0"
+# ---------------------------------------------------------------------------
+# Version and Constants
+# ---------------------------------------------------------------------------
+
+TOP10_SELECTOR_VERSION = "6.0.0"
 OUTPUT_PAGE = "Top_10_Investments"
 
-DEFAULT_SOURCE_PAGES = [
+DEFAULT_SOURCE_PAGES: List[str] = [
     "Market_Leaders",
     "Global_Markets",
     "Mutual_Funds",
@@ -53,7 +97,7 @@ DEFAULT_SOURCE_PAGES = [
     "My_Portfolio",
 ]
 
-DERIVED_OR_NON_SOURCE_PAGES = {
+DERIVED_OR_NON_SOURCE_PAGES: set = {
     "KSA_TADAWUL",
     "Advisor_Criteria",
     "AI_Opportunity_Report",
@@ -62,8 +106,7 @@ DERIVED_OR_NON_SOURCE_PAGES = {
     "Data_Dictionary",
 }
 
-# v4.9.0: added trade setup fields (entry/stop/target/R/R)
-TOP10_REQUIRED_FIELDS = (
+TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
     "top10_rank",
     "selection_reason",
     "criteria_snapshot",
@@ -73,18 +116,36 @@ TOP10_REQUIRED_FIELDS = (
     "risk_reward_ratio",
 )
 
-TOP10_REQUIRED_HEADERS = {
-    "top10_rank":            "Top 10 Rank",
-    "selection_reason":      "Selection Reason",
-    "criteria_snapshot":     "Criteria Snapshot",
-    "entry_price":           "Entry Price",
-    "stop_loss_suggested":   "Stop Loss (AI)",
+TOP10_REQUIRED_HEADERS: Dict[str, str] = {
+    "top10_rank": "Top 10 Rank",
+    "selection_reason": "Selection Reason",
+    "criteria_snapshot": "Criteria Snapshot",
+    "entry_price": "Entry Price",
+    "stop_loss_suggested": "Stop Loss (AI)",
     "take_profit_suggested": "Take Profit (AI)",
-    "risk_reward_ratio":     "Risk/Reward",
+    "risk_reward_ratio": "Risk/Reward",
 }
 
-# v4.9.0: Updated to 106 cols = Market_Leaders(99) + top10(3) + trade_setup(4)
-DEFAULT_FALLBACK_KEYS = [
+# ---------------------------------------------------------------------------
+# Trade-setup constants (previously magic numbers in v5.0.0)
+# ---------------------------------------------------------------------------
+
+_SQRT_TRADING_DAYS = 15.874507866387544            # sqrt(252); annualized-vol -> daily
+_STOP_LOSS_ATR_MULT = 1.5                          # stop = entry - ATR * mult
+_STOP_LOSS_VOL_DAILY_MULT = 3.0                    # stop = entry - (daily_move * mult)
+_STOP_LOSS_MIN_PCT = 0.025                         # floor when no ATR / vol
+_STOP_LOSS_MAX_CLOSENESS = 0.98                    # never closer than 2% below entry
+_TAKE_PROFIT_MIN_CLOSENESS = 1.04                  # never closer than 4% above entry
+_TAKE_PROFIT_DEFAULT = 1.08                        # default 8% when no data
+_TAKE_PROFIT_UPSIDE_CAP = 0.80                     # cap upside-derived TP at 80%
+_DAY_RANGE_ENTRY_THRESHOLD = 0.40                  # below this, use current price as entry
+_DAY_RANGE_ENTRY_DISCOUNT = 0.008                  # discount factor for higher positions
+
+# ---------------------------------------------------------------------------
+# Schema Fallbacks (106 columns)
+# ---------------------------------------------------------------------------
+
+DEFAULT_FALLBACK_KEYS: List[str] = [
     # Identity (8)
     "symbol", "name", "asset_class", "exchange", "currency", "country", "sector", "industry",
     # Price (11)
@@ -131,8 +192,7 @@ DEFAULT_FALLBACK_KEYS = [
     "entry_price", "stop_loss_suggested", "take_profit_suggested", "risk_reward_ratio",
 ]
 
-# v4.9.0: 106 headers matching DEFAULT_FALLBACK_KEYS
-DEFAULT_FALLBACK_HEADERS = [
+DEFAULT_FALLBACK_HEADERS: List[str] = [
     "Symbol", "Name", "Asset Class", "Exchange", "Currency", "Country", "Sector", "Industry",
     "Current Price", "Previous Close", "Open", "Day High", "Day Low", "52W High", "52W Low",
     "Price Change", "Change %", "52W Position %", "5D Change %",
@@ -159,6 +219,10 @@ DEFAULT_FALLBACK_HEADERS = [
     "Top 10 Rank", "Selection Reason", "Criteria Snapshot",
     "Entry Price", "Stop Loss (AI)", "Take Profit (AI)", "Risk/Reward",
 ]
+
+# ---------------------------------------------------------------------------
+# Field Aliases for Row Normalization
+# ---------------------------------------------------------------------------
 
 ROW_KEY_ALIASES: Dict[str, Tuple[str, ...]] = {
     "symbol": ("symbol", "ticker", "code", "instrument", "security", "symbol_normalized", "requested_symbol"),
@@ -246,268 +310,192 @@ ROW_KEY_ALIASES: Dict[str, Tuple[str, ...]] = {
     "top10_rank": ("top10_rank", "rank"),
     "criteria_snapshot": ("criteria_snapshot", "criteria_json"),
     "source_page": ("source_page", "page", "sheet", "sheet_name"),
-    # ── v4.9.0 new schema_registry v3.4.0 fields ─────────────────────────────
-    "price_change_5d":     ("price_change_5d", "change5d", "five_day_change"),
-    "volume_ratio":        ("volume_ratio", "vol_ratio"),
-    "roe":                 ("roe", "return_on_equity", "returnOnEquity"),
-    "roa":                 ("roa", "return_on_assets", "returnOnAssets"),
-    "rsi_signal":          ("rsi_signal", "rsiSignal"),
-    "technical_score":     ("technical_score", "tech_score", "technicalScore"),
-    "day_range_position":  ("day_range_position", "dayRangePosition"),
-    "atr_14":              ("atr_14", "atr"),
-    "upside_pct":          ("upside_pct", "upside_percent"),
-    "short_term_signal":   ("short_term_signal", "st_signal", "shortTermSignal"),
-    "analyst_rating":      ("analyst_rating", "analyst_consensus"),
-    "target_price":        ("target_price", "wall_st_target"),
+    "price_change_5d": ("price_change_5d", "change5d", "five_day_change"),
+    "volume_ratio": ("volume_ratio", "vol_ratio"),
+    "roe": ("roe", "return_on_equity", "returnOnEquity"),
+    "roa": ("roa", "return_on_assets", "returnOnAssets"),
+    "rsi_signal": ("rsi_signal", "rsiSignal"),
+    "technical_score": ("technical_score", "tech_score", "technicalScore"),
+    "day_range_position": ("day_range_position", "dayRangePosition"),
+    "atr_14": ("atr_14", "atr"),
+    "upside_pct": ("upside_pct", "upside_percent"),
+    "short_term_signal": ("short_term_signal", "st_signal", "shortTermSignal"),
+    "analyst_rating": ("analyst_rating", "analyst_consensus"),
+    "target_price": ("target_price", "wall_st_target"),
     "upside_downside_pct": ("upside_downside_pct", "upside_to_target_pct"),
-    "signal":              ("signal", "trade_signal"),
-    "trend_1m":            ("trend_1m",),
-    "trend_3m":            ("trend_3m",),
-    "trend_12m":           ("trend_12m",),
-    # ── trade setup ───────────────────────────────────────────────────────────
-    "entry_price":           ("entry_price", "entryPrice", "suggested_entry"),
-    "stop_loss_suggested":   ("stop_loss_suggested", "stopLossSuggested", "ai_stop_loss"),
+    "signal": ("signal", "trade_signal"),
+    "trend_1m": ("trend_1m",),
+    "trend_3m": ("trend_3m",),
+    "trend_12m": ("trend_12m",),
+    "entry_price": ("entry_price", "entryPrice", "suggested_entry"),
+    "stop_loss_suggested": ("stop_loss_suggested", "stopLossSuggested", "ai_stop_loss"),
     "take_profit_suggested": ("take_profit_suggested", "takeProfitSuggested", "ai_take_profit"),
-    "risk_reward_ratio":     ("risk_reward_ratio", "riskRewardRatio", "rr_ratio"),
+    "risk_reward_ratio": ("risk_reward_ratio", "riskRewardRatio", "rr_ratio"),
 }
 
-CANONICAL_KEY_SET = set(DEFAULT_FALLBACK_KEYS)  # v4.9.0: 106 keys
-WRAPPER_KEYS = {
-    "status", "page", "sheet", "sheet_name", "route_family", "headers", "display_headers", "sheet_headers",
-    "column_headers", "keys", "columns", "fields", "rows", "rows_matrix", "matrix", "row_objects", "records",
-    "items", "item", "quotes", "quote", "data", "record", "result", "payload", "response", "output", "meta", "count", "version",
-    "snapshot", "envelope", "content", "schema", "sheet_spec", "spec",
+# Keys that indicate wrapper/metadata rather than data rows
+WRAPPER_KEYS: set = {
+    "status", "page", "sheet", "sheet_name", "route_family", "headers", "display_headers",
+    "sheet_headers", "column_headers", "keys", "columns", "fields", "rows", "rows_matrix",
+    "matrix", "row_objects", "records", "items", "item", "quotes", "quote", "data", "record",
+    "result", "payload", "response", "output", "meta", "count", "version", "snapshot",
+    "envelope", "content", "schema", "sheet_spec", "spec",
 }
 
-_ENGINE_CACHE: Optional[Any] = None
-_ENGINE_CACHE_SOURCE: str = ""
-_ENGINE_LOCK = asyncio.Lock()
+# ---------------------------------------------------------------------------
+# Configuration (Environment Variables)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Top10Config:
+    """Immutable configuration for Top10 selector (loaded once at import)."""
+    engine_call_timeout_sec: float = 8.0
+    page_total_timeout_sec: float = 12.0
+    builder_total_timeout_sec: float = 32.0
+    source_page_limit: int = 80
+    hydration_symbol_cap: int = 30
+    max_source_pages: int = 5
+    max_limit: int = 50
+    early_stop_multiplier: int = 6
+    emergency_symbols: List[str] = field(default_factory=list)
+
+    @classmethod
+    def from_env(cls) -> "Top10Config":
+        """Load configuration from environment variables."""
+        def _env_float(name: str, default: float) -> float:
+            try:
+                value = float(os.getenv(name, str(default)).strip())
+                if math.isnan(value) or math.isinf(value):
+                    return default
+                return max(0.1, value)
+            except Exception:
+                return default
+
+        def _env_int(name: str, default: int, minimum: int = 1, maximum: int = 100000) -> int:
+            try:
+                value = int(float(os.getenv(name, str(default)).strip()))
+                return max(minimum, min(value, maximum))
+            except Exception:
+                return default
+
+        emergency = [
+            s for s in (x.strip() for x in os.getenv("TOP10_SELECTOR_EMERGENCY_SYMBOLS", "").replace(";", ",").split(","))
+            if s
+        ]
+
+        return cls(
+            engine_call_timeout_sec=_env_float("TFB_TOP10_ENGINE_CALL_TIMEOUT_SEC", 8.0),
+            page_total_timeout_sec=_env_float("TFB_TOP10_PAGE_TIMEOUT_SEC", 12.0),
+            builder_total_timeout_sec=_env_float("TFB_TOP10_TOTAL_TIMEOUT_SEC", 32.0),
+            source_page_limit=_env_int("TOP10_SELECTOR_SOURCE_PAGE_LIMIT", 80, 10, 1000),
+            hydration_symbol_cap=_env_int("TOP10_SELECTOR_HYDRATION_SYMBOL_CAP", 30, 5, 250),
+            max_source_pages=_env_int("TOP10_SELECTOR_MAX_SOURCE_PAGES", 5, 1, 20),
+            max_limit=_env_int("TOP10_SELECTOR_MAX_LIMIT", 50, 1, 200),
+            early_stop_multiplier=_env_int("TOP10_SELECTOR_EARLY_STOP_MULTIPLIER", 6, 2, 20),
+            emergency_symbols=emergency,
+        )
 
 
-# =============================================================================
-# Runtime knobs
-# =============================================================================
-def _env_float(name: str, default: float) -> float:
+_CONFIG = Top10Config.from_env()
+
+
+# ---------------------------------------------------------------------------
+# Pure Utility Functions
+# ---------------------------------------------------------------------------
+
+def _to_string(value: Any) -> str:
+    """Safely convert any value to string; null-like sentinels become ''."""
+    if value is None:
+        return ""
     try:
-        value = float(os.getenv(name, str(default)).strip())
-        if math.isnan(value) or math.isinf(value):
-            return default
-        return max(0.1, value)
-    except Exception:
-        return default
-
-
-def _env_int(name: str, default: int, minimum: int = 1, maximum: int = 100000) -> int:
-    try:
-        value = int(float(os.getenv(name, str(default)).strip()))
-        return max(minimum, min(value, maximum))
-    except Exception:
-        return default
-
-
-ENGINE_CALL_TIMEOUT_SEC = _env_float("TFB_TOP10_ENGINE_CALL_TIMEOUT_SEC", 8.0)
-PAGE_TOTAL_TIMEOUT_SEC = _env_float("TFB_TOP10_PAGE_TIMEOUT_SEC", 12.0)
-BUILDER_TOTAL_TIMEOUT_SEC = _env_float("TFB_TOP10_TOTAL_TIMEOUT_SEC", 32.0)
-SOURCE_PAGE_LIMIT = _env_int("TOP10_SELECTOR_SOURCE_PAGE_LIMIT", 80, minimum=10, maximum=1000)
-HYDRATION_SYMBOL_CAP = _env_int("TOP10_SELECTOR_HYDRATION_SYMBOL_CAP", 30, minimum=5, maximum=250)
-MAX_SOURCE_PAGES = _env_int("TOP10_SELECTOR_MAX_SOURCE_PAGES", 5, minimum=1, maximum=20)
-MAX_LIMIT = _env_int("TOP10_SELECTOR_MAX_LIMIT", 50, minimum=1, maximum=200)
-EARLY_STOP_MULTIPLIER = _env_int("TOP10_SELECTOR_EARLY_STOP_MULTIPLIER", 6, minimum=2, maximum=20)
-EMERGENCY_SYMBOLS = [
-    s for s in [x.strip() for x in os.getenv("TOP10_SELECTOR_EMERGENCY_SYMBOLS", "").replace(";", ",").split(",")] if s
-]
-
-
-# =============================================================================
-# Optional schema/page catalog
-# =============================================================================
-try:
-    from core.sheets.schema_registry import get_sheet_spec as _get_sheet_spec  # type: ignore
-except Exception:
-    _get_sheet_spec = None  # type: ignore
-
-try:
-    from core.sheets.page_catalog import normalize_page_name as _normalize_page_name  # type: ignore
-except Exception:
-    _normalize_page_name = None  # type: ignore
-
-
-# =============================================================================
-# Basic helpers
-# =============================================================================
-def _s(v: Any) -> str:
-    try:
-        if v is None:
-            return ""
-        s = str(v).strip()
+        s = str(value).strip()
         return "" if s.lower() in {"none", "null", "nil"} else s
     except Exception:
         return ""
 
 
-def _is_blank(v: Any) -> bool:
-    return v is None or (isinstance(v, str) and not v.strip())
+def _is_blank(value: Any) -> bool:
+    """Check if value is None, empty, or whitespace-only string."""
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    return False
 
 
-def _safe_int(v: Any, default: int) -> int:
+def _to_int(value: Any, default: int = 0) -> int:
+    """Safely convert to int."""
     try:
-        if isinstance(v, bool):
+        if isinstance(value, bool):
             return default
-        return int(float(v))
-    except Exception:
+        return int(float(value))
+    except (ValueError, TypeError):
         return default
 
 
-def _safe_float(v: Any, default: Optional[float] = None) -> Optional[float]:
+def _to_float(value: Any, default: Optional[float] = None) -> Optional[float]:
+    """Safely convert to float; strips commas; handles '%'. Returns default for NaN/inf."""
     try:
-        if v is None or isinstance(v, bool):
+        if value is None or isinstance(value, bool):
             return default
-        if isinstance(v, (int, float)):
-            f = float(v)
-            if math.isnan(f) or math.isinf(f):
-                return default
-            return f
-        s = _s(v).replace(",", "")
+        if isinstance(value, (int, float)):
+            f = float(value)
+            return default if (math.isnan(f) or math.isinf(f)) else f
+        s = _to_string(value).replace(",", "")
         if not s:
             return default
         if s.endswith("%"):
             f = float(s[:-1].strip()) / 100.0
         else:
             f = float(s)
-        if math.isnan(f) or math.isinf(f):
-            return default
-        return f
-    except Exception:
+        return default if (math.isnan(f) or math.isinf(f)) else f
+    except (ValueError, TypeError):
         return default
 
 
-def _safe_ratio(v: Any, default: Optional[float] = None) -> Optional[float]:
-    f = _safe_float(v, default)
+def _to_ratio(value: Any, default: Optional[float] = None) -> Optional[float]:
+    """Convert percent-like value to ratio (0.12 = 12%). abs > 1.5 treated as percent."""
+    f = _to_float(value, default)
     if f is None:
         return default
-    if abs(f) > 1.5:
-        return f / 100.0
-    return f
+    return f / 100.0 if abs(f) > 1.5 else f
 
 
-def _coerce_bool(v: Any, default: bool = False) -> bool:
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, str):
-        s = v.strip().lower()
-        if s in {"1", "true", "yes", "y", "on"}:
+def _to_bool(value: Any, default: bool = False) -> bool:
+    """Convert various representations to boolean."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in {"1", "true", "yes", "y", "on", "enabled", "enable"}:
             return True
-        if s in {"0", "false", "no", "n", "off"}:
+        if s in {"0", "false", "no", "n", "off", "disabled", "disable"}:
             return False
-    if isinstance(v, (int, float)):
-        try:
-            return bool(int(v))
-        except Exception:
-            return default
+    if isinstance(value, (int, float)):
+        return bool(int(value))
     return default
 
 
-def _is_signature_mismatch_typeerror(exc: TypeError) -> bool:
-    msg = _s(exc).lower()
-    if not msg:
-        return False
-    signature_markers = (
-        "unexpected keyword argument",
-        "positional argument",
-        "required positional argument",
-        "takes ",
-        "got an unexpected keyword",
-        "multiple values for argument",
-        "missing 1 required positional argument",
-        "missing required positional argument",
-        "too many positional arguments",
-        "not enough positional arguments",
-    )
-    return any(marker in msg for marker in signature_markers)
+def _clamp(value: float, min_val: float, max_val: float) -> float:
+    """Clamp value between min and max."""
+    return max(min_val, min(value, max_val))
 
 
-def _json_safe(value: Any) -> Any:
-    if value is None:
-        return None
-    if isinstance(value, (bool, int, str)):
-        return value
-    if isinstance(value, float):
-        if math.isnan(value) or math.isinf(value):
-            return None
-        return value
-    if isinstance(value, Decimal):
-        try:
-            f = float(value)
-            if math.isnan(f) or math.isinf(f):
-                return None
-            return f
-        except Exception:
-            return str(value)
-    if isinstance(value, Mapping):
-        return {str(k): _json_safe(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_json_safe(v) for v in value]
-    try:
-        if hasattr(value, "model_dump") and callable(getattr(value, "model_dump")):
-            return _json_safe(value.model_dump(mode="python"))
-    except Exception:
-        pass
-    try:
-        if hasattr(value, "dict") and callable(getattr(value, "dict")):
-            return _json_safe(value.dict())
-    except Exception:
-        pass
-    try:
-        if hasattr(value, "__dict__"):
-            return _json_safe(dict(value.__dict__))
-    except Exception:
-        pass
-    try:
-        return str(value)
-    except Exception:
-        return None
-
-
-def _json_compact(value: Any) -> str:
-    try:
-        return json.dumps(_json_safe(value), ensure_ascii=False, separators=(",", ":"))
-    except Exception:
-        return str(value)
-
-
-def _normalize_list(value: Any) -> List[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        seq = [x.strip() for x in value.replace(";", ",").replace("\n", ",").split(",") if x.strip()]
-    elif isinstance(value, (list, tuple, set)):
-        seq = list(value)
-    else:
-        seq = [value]
-    out: List[str] = []
-    seen = set()
-    for item in seq:
-        s = _s(item)
+def _dedupe_keep_order(items: Iterable[Any]) -> List[str]:
+    """Deduplicate items while preserving order; stringifies."""
+    seen: set = set()
+    result: List[str] = []
+    for item in items:
+        s = _to_string(item)
         if s and s not in seen:
             seen.add(s)
-            out.append(s)
-    return out
+            result.append(s)
+    return result
 
 
-def _dedupe_keep_order(values: Iterable[Any]) -> List[str]:
-    out: List[str] = []
-    seen = set()
-    for value in values:
-        s = _s(value)
-        if not s or s in seen:
-            continue
-        seen.add(s)
-        out.append(s)
-    return out
-
-
-def _normalize_symbol(sym: Any) -> str:
-    s = _s(sym).upper().replace(" ", "")
+def _normalize_symbol(symbol: Any) -> str:
+    """Normalize symbol to canonical format (e.g., 2222 -> 2222.SR, .SA -> .SR)."""
+    s = _to_string(symbol).upper().replace(" ", "")
     if not s:
         return ""
     if s.startswith("TADAWUL:"):
@@ -519,45 +507,103 @@ def _normalize_symbol(sym: Any) -> str:
     return s
 
 
-def _looks_like_symbol_token(x: Any) -> bool:
-    s = _s(x).upper()
+def _looks_like_symbol(value: Any) -> bool:
+    """Check if value looks like a stock symbol."""
+    s = _to_string(value).upper()
     if not s or " " in s or len(s) > 24:
         return False
     return bool(re.fullmatch(r"[A-Z0-9\.\=\-\^:_/]{1,24}", s))
 
 
-def _safe_source_pages(values: Sequence[str]) -> List[str]:
-    out: List[str] = []
-    seen = set()
-    for item in values:
-        s = _s(item)
+def _is_signature_mismatch(error: TypeError) -> bool:
+    """Check if TypeError is due to function-signature mismatch (vs real bug)."""
+    msg = _to_string(error).lower()
+    markers = (
+        "unexpected keyword argument", "positional argument", "required positional",
+        "takes ", "got an unexpected keyword", "multiple values for argument",
+        "missing 1 required positional", "missing required positional",
+        "too many positional arguments", "not enough positional arguments",
+        "keyword-only argument",
+    )
+    return any(marker in msg for marker in markers)
+
+
+def _json_safe(value: Any) -> Any:
+    """Convert value to JSON-safe format."""
+    if value is None:
+        return None
+    if isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return None if (math.isnan(value) or math.isinf(value)) else value
+    if isinstance(value, Decimal):
+        try:
+            f = float(value)
+            return None if (math.isnan(f) or math.isinf(f)) else f
+        except Exception:
+            return str(value)
+    if isinstance(value, Mapping):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(v) for v in value]
+    # Pydantic v2
+    try:
+        if hasattr(value, "model_dump") and callable(value.model_dump):
+            return _json_safe(value.model_dump(mode="python"))
+    except Exception:
+        pass
+    # Pydantic v1 (or any .dict())
+    try:
+        if hasattr(value, "dict") and callable(value.dict):
+            return _json_safe(value.dict())
+    except Exception:
+        pass
+    try:
+        if hasattr(value, "__dict__"):
+            return _json_safe(dict(value.__dict__))
+    except Exception:
+        pass
+    return str(value)
+
+
+def _compact_json(value: Any) -> str:
+    """Convert value to compact JSON string."""
+    try:
+        return json.dumps(_json_safe(value), ensure_ascii=False, separators=(",", ":"))
+    except Exception:
+        return str(value)
+
+
+def _normalize_list(value: Any) -> List[str]:
+    """Convert various inputs to normalized list of strings."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items = [x.strip() for x in value.replace(";", ",").replace("\n", ",").split(",") if x.strip()]
+    elif isinstance(value, (list, tuple, set)):
+        items = list(value)
+    else:
+        items = [value]
+    return _dedupe_keep_order(items)
+
+
+def _safe_source_pages(pages: Sequence[str]) -> List[str]:
+    """Filter and deduplicate source pages; caps at config.max_source_pages."""
+    result: List[str] = []
+    seen: set = set()
+    for page in pages:
+        s = _to_string(page)
         if not s or s in DERIVED_OR_NON_SOURCE_PAGES:
             continue
         if s not in seen:
             seen.add(s)
-            out.append(s)
-    return out[:MAX_SOURCE_PAGES]
+            result.append(s)
+    return result[:_CONFIG.max_source_pages]
 
 
-def _normalize_page_name_safe(name: str) -> str:
-    s = _s(name)
-    if not s:
-        return ""
-    if callable(_normalize_page_name):
-        try:
-            return _normalize_page_name(s, allow_output_pages=False)
-        except TypeError:
-            try:
-                return _normalize_page_name(s)
-            except Exception:
-                return s
-        except Exception:
-            return s
-    return s
-
-
-def _header_to_key(header: Any) -> str:
-    s = _s(header)
+def _header_to_key(header: str) -> str:
+    """Convert display header to internal key."""
+    s = _to_string(header)
     if not s:
         return ""
     out: List[str] = []
@@ -573,6 +619,7 @@ def _header_to_key(header: Any) -> str:
     key = "".join(out).strip("_")
     while "__" in key:
         key = key.replace("__", "_")
+    # Special replacements
     key = key.replace("52w", "week_52")
     key = key.replace("week52", "week_52")
     key = key.replace("p_e_", "pe_")
@@ -581,8 +628,9 @@ def _header_to_key(header: Any) -> str:
     return key
 
 
-def _compact_key(value: Any) -> str:
-    s = _s(value).lower()
+def _compact_key(value: str) -> str:
+    """Remove non-alphanumeric characters for compact fuzzy matching."""
+    s = _to_string(value).lower()
     if not s:
         return ""
     s = s.replace("52w", "week52")
@@ -590,7 +638,8 @@ def _compact_key(value: Any) -> str:
 
 
 def _canonical_key_variants(name: str) -> List[str]:
-    base = _s(name)
+    """Generate variants of a key for fuzzy matching."""
+    base = _to_string(name)
     variants = {base, base.lower(), _header_to_key(base), _compact_key(base)}
     if base.endswith("_pct"):
         variants.add(base[:-4] + "_percent")
@@ -604,9 +653,10 @@ def _canonical_key_variants(name: str) -> List[str]:
 
 
 def _row_lookup(row: Mapping[str, Any]) -> Dict[str, Any]:
+    """Build a lookup dict from a row keyed by every variant of its original keys."""
     lookup: Dict[str, Any] = {}
     for k, v in row.items():
-        raw = _s(k)
+        raw = _to_string(k)
         if not raw:
             continue
         for token in {raw, raw.lower(), _header_to_key(raw), _compact_key(raw)}:
@@ -615,7 +665,36 @@ def _row_lookup(row: Mapping[str, Any]) -> Dict[str, Any]:
     return lookup
 
 
+def _extract_value_by_aliases(row: Mapping[str, Any], key: str) -> Any:
+    """Extract value from row using known aliases for `key`."""
+    aliases = ROW_KEY_ALIASES.get(key, (key,))
+    lookup = _row_lookup(row)
+    for alias in aliases:
+        for token in _canonical_key_variants(alias):
+            if token in lookup:
+                return lookup[token]
+    return None
+
+
+def _count_nonblank_fields(row: Mapping[str, Any]) -> int:
+    """Count non-blank fields in a row."""
+    count = 0
+    for value in row.values():
+        if isinstance(value, str):
+            if value.strip():
+                count += 1
+        elif value not in (None, [], {}, ()):
+            count += 1
+    return count
+
+
+def _rows_to_matrix(rows: Sequence[Mapping[str, Any]], keys: Sequence[str]) -> List[List[Any]]:
+    """Convert list of row dicts to a matrix (list of lists) in `keys` order."""
+    return [[_json_safe(row.get(k)) for k in keys] for row in rows]
+
+
 def _coerce_mapping(obj: Any) -> Dict[str, Any]:
+    """Coerce object to dictionary (pydantic v1/v2, dataclass, __dict__)."""
     if obj is None:
         return {}
     if isinstance(obj, dict):
@@ -626,14 +705,14 @@ def _coerce_mapping(obj: Any) -> Dict[str, Any]:
         except Exception:
             return {}
     try:
-        if hasattr(obj, "model_dump") and callable(getattr(obj, "model_dump")):
+        if hasattr(obj, "model_dump") and callable(obj.model_dump):
             d = obj.model_dump(mode="python")
             if isinstance(d, Mapping):
                 return dict(d)
     except Exception:
         pass
     try:
-        if hasattr(obj, "dict") and callable(getattr(obj, "dict")):
+        if hasattr(obj, "dict") and callable(obj.dict):
             d = obj.dict()
             if isinstance(d, Mapping):
                 return dict(d)
@@ -648,25 +727,11 @@ def _coerce_mapping(obj: Any) -> Dict[str, Any]:
     return {}
 
 
-def _count_nonblank_fields(row: Mapping[str, Any]) -> int:
-    count = 0
-    for value in row.values():
-        if isinstance(value, str):
-            if value.strip():
-                count += 1
-        elif value not in (None, [], {}, ()):
-            count += 1
-    return count
-
-
-def _rows_to_matrix(rows: Sequence[Mapping[str, Any]], keys: Sequence[str]) -> List[List[Any]]:
-    return [[_json_safe(row.get(k)) for k in keys] for row in rows]
-
-
-def _looks_like_row_dict(d: Any) -> bool:
-    if not isinstance(d, Mapping) or not d:
+def _looks_like_row(obj: Any) -> bool:
+    """Check if object looks like a data row (vs. wrapper/metadata)."""
+    if not isinstance(obj, Mapping) or not obj:
         return False
-    row = _coerce_mapping(d)
+    row = _coerce_mapping(obj)
     if not row:
         return False
     lookup = _row_lookup(row)
@@ -682,22 +747,24 @@ def _looks_like_row_dict(d: Any) -> bool:
                 break
     if matched >= 2:
         return True
-    non_meta = [k for k in row.keys() if _s(k) not in WRAPPER_KEYS]
+    non_meta = [k for k in row.keys() if _to_string(k) not in WRAPPER_KEYS]
     return len(non_meta) >= 4
 
 
-# =============================================================================
-# Schema helpers
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Schema Helpers
+# ---------------------------------------------------------------------------
+
 def _complete_schema_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple[List[str], List[str]]:
+    """Ensure headers and keys have the same length; fill gaps by inferring from each other."""
     raw_headers = list(headers or [])
     raw_keys = list(keys or [])
     max_len = max(len(raw_headers), len(raw_keys))
     out_headers: List[str] = []
     out_keys: List[str] = []
     for i in range(max_len):
-        h = _s(raw_headers[i]) if i < len(raw_headers) else ""
-        k = _s(raw_keys[i]) if i < len(raw_keys) else ""
+        h = _to_string(raw_headers[i]) if i < len(raw_headers) else ""
+        k = _to_string(raw_keys[i]) if i < len(raw_keys) else ""
         if h and not k:
             k = _header_to_key(h)
         elif k and not h:
@@ -710,11 +777,23 @@ def _complete_schema_contract(headers: Sequence[str], keys: Sequence[str]) -> Tu
     return out_headers, out_keys
 
 
-def _schema_columns_from_any(spec: Any) -> List[Any]:
+def _ensure_top10_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple[List[str], List[str]]:
+    """Ensure Top10-required fields are appended if missing."""
+    out_headers = list(headers or [])
+    out_keys = list(keys or [])
+    for required in TOP10_REQUIRED_FIELDS:
+        if required not in out_keys:
+            out_keys.append(required)
+            out_headers.append(TOP10_REQUIRED_HEADERS[required])
+    return _complete_schema_contract(out_headers, out_keys)
+
+
+def _schema_columns_from_spec(spec: Any) -> List[Any]:
+    """Extract a columns list from a schema spec (dict or object), including nested specs."""
     if spec is None:
         return []
     if isinstance(spec, dict) and len(spec) == 1 and "columns" not in spec and "fields" not in spec:
-        first_val = list(spec.values())[0]
+        first_val = next(iter(spec.values()))
         if isinstance(first_val, dict) and ("columns" in first_val or "fields" in first_val):
             spec = first_val
     cols = getattr(spec, "columns", None)
@@ -727,742 +806,328 @@ def _schema_columns_from_any(spec: Any) -> List[Any]:
         cols2 = spec.get("columns") or spec.get("fields")
         if isinstance(cols2, list) and cols2:
             return cols2
-    try:
-        d = getattr(spec, "__dict__", None)
-        if isinstance(d, dict):
-            cols3 = d.get("columns") or d.get("fields")
-            if isinstance(cols3, list) and cols3:
-                return cols3
-    except Exception:
-        pass
     return []
 
 
 def _schema_keys_headers_from_spec(spec: Any) -> Tuple[List[str], List[str]]:
-    if isinstance(spec, dict) and len(spec) == 1 and not any(
-        k in spec for k in ("columns", "fields", "headers", "keys", "display_headers")
-    ):
-        first_val = list(spec.values())[0]
+    """Extract (headers, keys) from a schema spec."""
+    if isinstance(spec, dict) and len(spec) == 1 and not any(k in spec for k in ("columns", "fields", "headers", "keys")):
+        first_val = next(iter(spec.values()))
         if isinstance(first_val, dict):
             spec = first_val
+
     headers: List[str] = []
     keys: List[str] = []
-    cols = _schema_columns_from_any(spec)
-    for c in cols:
-        if isinstance(c, Mapping):
-            h = _s(c.get("header") or c.get("display_header") or c.get("displayHeader") or c.get("label") or c.get("title"))
-            k = _s(c.get("key") or c.get("field") or c.get("name") or c.get("id"))
+    cols = _schema_columns_from_spec(spec)
+
+    for col in cols:
+        if isinstance(col, Mapping):
+            h = _to_string(col.get("header") or col.get("display_header") or col.get("label") or col.get("title"))
+            k = _to_string(col.get("key") or col.get("field") or col.get("name") or col.get("id"))
         else:
-            h = _s(
-                getattr(c, "header", getattr(c, "display_header", getattr(c, "displayHeader", getattr(c, "label", getattr(c, "title", None)))))
-            )
-            k = _s(getattr(c, "key", getattr(c, "field", getattr(c, "name", getattr(c, "id", None)))))
+            h = _to_string(getattr(col, "header", getattr(col, "display_header", getattr(col, "label", getattr(col, "title", None)))))
+            k = _to_string(getattr(col, "key", getattr(col, "field", getattr(col, "name", getattr(col, "id", None)))))
         if h or k:
             headers.append(h or k.replace("_", " ").title())
             keys.append(k or _header_to_key(h))
+
+    # Fallback to direct headers/keys fields on the spec
     if not headers and not keys and isinstance(spec, Mapping):
         headers2 = spec.get("headers") or spec.get("display_headers")
         keys2 = spec.get("keys") or spec.get("columns") or spec.get("fields")
         if isinstance(headers2, list):
-            headers = [_s(x) for x in headers2 if _s(x)]
+            headers = [_to_string(x) for x in headers2 if _to_string(x)]
         if isinstance(keys2, list):
-            keys = [_s(x) for x in keys2 if _s(x)]
+            keys = [_to_string(x) for x in keys2 if _to_string(x)]
+
     return _complete_schema_contract(headers, keys)
 
 
-def _ensure_top10_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple[List[str], List[str]]:
-    out_headers = list(headers or [])
-    out_keys = list(keys or [])
-    for field in TOP10_REQUIRED_FIELDS:
-        if field not in out_keys:
-            out_keys.append(field)
-            out_headers.append(TOP10_REQUIRED_HEADERS[field])
-    return _complete_schema_contract(out_headers, out_keys)
-
-
 def _load_schema_defaults() -> Tuple[List[str], List[str]]:
-    if callable(_get_sheet_spec):
-        try:
-            spec = _get_sheet_spec(OUTPUT_PAGE)
-            headers, keys = _schema_keys_headers_from_spec(spec)
-            if keys:
-                headers, keys = _ensure_top10_contract(headers, keys)
-                return list(headers), list(keys)
-        except Exception:
-            pass
+    """Load schema from registry with Top10 contract, or fall back to hardcoded defaults."""
+    try:
+        from core.sheets.schema_registry import get_sheet_spec  # type: ignore
+        spec = get_sheet_spec(OUTPUT_PAGE)
+        headers, keys = _schema_keys_headers_from_spec(spec)
+        if keys:
+            headers, keys = _ensure_top10_contract(headers, keys)
+            return list(headers), list(keys)
+    except Exception as exc:
+        logger.debug("Failed to load schema from registry: %s", exc)
+
     headers, keys = _ensure_top10_contract(DEFAULT_FALLBACK_HEADERS, DEFAULT_FALLBACK_KEYS)
     return list(headers), list(keys)
 
 
-# =============================================================================
-# Engine detection / resolution
-# =============================================================================
-_ENGINE_METHOD_NAMES = (
-    "get_sheet_rows", "get_page_rows", "sheet_rows", "build_sheet_rows", "execute_sheet_rows",
-    "run_sheet_rows", "build_analysis_sheet_rows", "run_analysis_sheet_rows", "get_rows_for_sheet",
-    "get_rows_for_page", "get_page_data", "get_sheet_data", "build_page_rows", "build_page_data",
-    "get_cached_sheet_snapshot", "get_sheet_snapshot", "get_cached_sheet_rows", "get_page_snapshot",
-    "get_enriched_quotes_batch", "get_analysis_quotes_batch", "get_quotes_batch", "quotes_batch",
-    "get_quotes", "get_quote", "get_quote_dict", "get_enriched_quote",
-)
+# ---------------------------------------------------------------------------
+# Criteria Context
+# ---------------------------------------------------------------------------
 
-_ENGINE_HOLDER_ATTRS = (
-    "engine", "data_engine", "quote_engine", "cache_engine", "_engine", "_data_engine",
-    "service", "runner", "advisor_engine",
-)
+@dataclass
+class CriteriaContext:
+    """Normalized criteria context for ranking."""
+    pages_selected: List[str] = field(default_factory=list)
+    direct_symbols: List[str] = field(default_factory=list)
+    direct_symbol_order: List[str] = field(default_factory=list)
+    emergency_symbols: List[str] = field(default_factory=list)
+    limit: int = 10
+    horizon_days: int = 90
+    risk_level: str = ""
+    confidence_bucket: str = ""
+    min_expected_roi: Optional[float] = None        # stored as ratio
+    min_confidence: Optional[float] = None          # stored as ratio (fixed in v6.0.0)
+    max_risk_score: Optional[float] = None          # 0-100
+    min_volume: Optional[float] = None
+    min_technical_score: Optional[float] = None
+    short_term_signal_required: str = ""
+    min_upside_pct: Optional[float] = None          # ratio
+    enrich_final: bool = True
+    schema_only: bool = False
+    headers_only: bool = False
+    include_headers: bool = True
+    include_matrix: bool = True
+    mode: str = ""
+    raw: Dict[str, Any] = field(default_factory=dict)
 
-_APP_ATTRS = ("app", "application", "fastapi_app", "api")
-_STATE_ATTRS = ("state", "app_state")
+    @classmethod
+    def from_inputs(cls, *args: Any, **kwargs: Any) -> "CriteriaContext":
+        """Build CriteriaContext from arbitrary call-site arguments."""
+        mappings: List[Dict[str, Any]] = [dict(a) for a in args if isinstance(a, Mapping)]
+        body: Dict[str, Any] = {}
+        for mapping in mappings:
+            body.update(mapping)
+        for key in ("body", "payload", "request_data", "params"):
+            if isinstance(kwargs.get(key), Mapping):
+                body.update(dict(kwargs[key]))
 
+        criteria: Dict[str, Any] = {}
+        if isinstance(kwargs.get("criteria"), Mapping):
+            criteria.update(dict(kwargs["criteria"]))
+        if isinstance(body.get("criteria"), Mapping):
+            criteria.update(dict(body["criteria"]))
+        if isinstance(body.get("filters"), Mapping):
+            criteria.update(dict(body["filters"]))
+        for k, v in body.items():
+            if v is not None and k not in {"criteria", "filters"}:
+                criteria.setdefault(k, v)
 
-def _safe_getattr(obj: Any, name: str, default: Any = None) -> Any:
-    try:
-        return getattr(obj, name, default)
-    except Exception:
-        return default
+        # Direct kwargs override
+        for k in ("pages_selected", "pages", "selected_pages", "sources", "page", "page_name", "sheet", "sheet_name"):
+            if kwargs.get(k) is not None:
+                criteria[k] = kwargs[k]
+        for k in ("symbols", "tickers", "direct_symbols"):
+            if kwargs.get(k) is not None:
+                criteria[k] = kwargs[k]
+        for k in ("limit", "top_n", "risk_level", "confidence_bucket", "horizon_days", "invest_period_days", "mode"):
+            if kwargs.get(k) is not None:
+                criteria[k] = kwargs[k]
 
-
-def _looks_like_engine(obj: Any) -> bool:
-    if obj is None:
-        return False
-    if isinstance(obj, (str, bytes, int, float, bool, list, tuple, set)):
-        return False
-    if isinstance(obj, Mapping):
-        return False
-    return any(callable(getattr(obj, m, None)) for m in _ENGINE_METHOD_NAMES)
-
-
-def _iter_mapping_values(mapping: Mapping[str, Any]) -> Iterable[Tuple[str, Any]]:
-    try:
-        for k, v in mapping.items():
-            yield _s(k), v
-    except Exception:
-        return
-
-
-def _iter_object_values(obj: Any) -> Iterable[Tuple[str, Any]]:
-    if obj is None:
-        return
-    if isinstance(obj, Mapping):
-        yield from _iter_mapping_values(obj)
-        return
-    names: List[str] = []
-    try:
-        if hasattr(obj, "__dict__") and isinstance(getattr(obj, "__dict__", None), dict):
-            names.extend([n for n in obj.__dict__.keys() if isinstance(n, str)])
-    except Exception:
-        pass
-    preferred = list(_ENGINE_HOLDER_ATTRS) + list(_APP_ATTRS) + list(_STATE_ATTRS)
-    names = preferred + [n for n in names if n not in preferred]
-    seen = set()
-    for name in names:
-        if not name or name in seen:
-            continue
-        seen.add(name)
-        try:
-            yield name, getattr(obj, name)
-        except Exception:
-            continue
-
-
-def _collect_engine_candidates_from_object(
-    obj: Any,
-    prefix: str = "",
-    seen: Optional[set] = None,
-    depth: int = 0,
-) -> List[Tuple[Any, str]]:
-    if seen is None:
-        seen = set()
-    out: List[Tuple[Any, str]] = []
-    if obj is None or depth > 4:
-        return out
-    obj_id = id(obj)
-    if obj_id in seen:
-        return out
-    seen.add(obj_id)
-    if _looks_like_engine(obj):
-        out.append((obj, prefix or type(obj).__name__))
-    if isinstance(obj, Mapping):
-        for name, value in _iter_mapping_values(obj):
-            if name in set(_ENGINE_HOLDER_ATTRS + _APP_ATTRS + _STATE_ATTRS) or _looks_like_engine(value):
-                out.extend(_collect_engine_candidates_from_object(value, f"{prefix}.{name}" if prefix else name, seen, depth + 1))
-        return out
-    for attr in _ENGINE_HOLDER_ATTRS + _APP_ATTRS + _STATE_ATTRS:
-        val = _safe_getattr(obj, attr, None)
-        if val is not None:
-            out.extend(_collect_engine_candidates_from_object(val, f"{prefix}.{attr}" if prefix else attr, seen, depth + 1))
-    for name, value in _iter_object_values(obj):
-        if value is None:
-            continue
-        if name in set(_ENGINE_HOLDER_ATTRS + _APP_ATTRS + _STATE_ATTRS) or _looks_like_engine(value):
-            out.extend(_collect_engine_candidates_from_object(value, f"{prefix}.{name}" if prefix else name, seen, depth + 1))
-    return out
-
-
-async def _call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
-    if inspect.iscoroutinefunction(fn):
-        result = fn(*args, **kwargs)
-        return await result
-    result = await asyncio.to_thread(fn, *args, **kwargs)
-    if inspect.isawaitable(result):
-        return await result
-    return result
-
-
-async def _call_with_timeout(fn: Callable[..., Any], *args: Any, timeout: float, **kwargs: Any) -> Any:
-    return await asyncio.wait_for(_call_maybe_async(fn, *args, **kwargs), timeout=timeout)
-
-
-async def _safe_call_zero_arg(fn: Callable[..., Any]) -> Any:
-    try:
-        return await _call_with_timeout(fn, timeout=min(ENGINE_CALL_TIMEOUT_SEC, 6.0))
-    except TypeError:
-        return None
-    except Exception:
-        return None
-
-
-async def _scan_module_for_engine(module: Any, module_name: str) -> List[Tuple[Any, str]]:
-    out: List[Tuple[Any, str]] = []
-    if module is None:
-        return out
-    if _looks_like_engine(module):
-        out.append((module, module_name))
-    for fn_name in ("get_engine", "resolve_engine", "load_engine", "build_engine", "create_engine"):
-        fn = _safe_getattr(module, fn_name, None)
-        if callable(fn):
-            result = await _safe_call_zero_arg(fn)
-            if _looks_like_engine(result):
-                out.append((result, f"{module_name}.{fn_name}"))
-    for attr in _ENGINE_HOLDER_ATTRS + _APP_ATTRS + _STATE_ATTRS + ("ENGINE", "engine", "_ENGINE"):
-        value = _safe_getattr(module, attr, None)
-        if value is not None:
-            out.extend(_collect_engine_candidates_from_object(value, f"{module_name}.{attr}"))
-    return out
-
-
-async def _resolve_engine_from_modules() -> Tuple[Optional[Any], str]:
-    global _ENGINE_CACHE, _ENGINE_CACHE_SOURCE
-    if _looks_like_engine(_ENGINE_CACHE):
-        return _ENGINE_CACHE, _ENGINE_CACHE_SOURCE or "engine_cache"
-    async with _ENGINE_LOCK:
-        if _looks_like_engine(_ENGINE_CACHE):
-            return _ENGINE_CACHE, _ENGINE_CACHE_SOURCE or "engine_cache"
-        candidates: List[Tuple[Any, str]] = []
-        module_candidates = (
-            "main", "app", "core.data_engine_v2", "core.data_engine",
-            "routes.analysis_sheet_rows", "routes.investment_advisor",
-            "routes.advanced_analysis", "routes.enriched_quote", "routes.advisor",
+        pages = (
+            _normalize_list(criteria.get("pages_selected"))
+            or _normalize_list(criteria.get("pages"))
+            or _normalize_list(criteria.get("selected_pages"))
+            or _normalize_list(criteria.get("sources"))
+            or _normalize_list(criteria.get("page"))
+            or _normalize_list(criteria.get("page_name"))
+            or _normalize_list(criteria.get("sheet"))
+            or _normalize_list(criteria.get("sheet_name"))
         )
-        for module_name in module_candidates:
-            try:
-                mod = importlib.import_module(module_name)
-            except Exception:
-                mod = None
-            if mod is not None:
-                candidates.extend(await _scan_module_for_engine(mod, module_name))
-        loaded_names = sorted(
-            name for name in sys.modules.keys()
-            if isinstance(name, str) and (name == "main" or name == "app" or name.startswith("core.") or name.startswith("routes."))
+        pages = _safe_source_pages(pages) or _safe_source_pages(DEFAULT_SOURCE_PAGES)
+
+        direct_symbols = _normalize_list(
+            criteria.get("direct_symbols") or criteria.get("symbols") or criteria.get("tickers")
         )
-        seen_sources = {src for _, src in candidates}
-        for module_name in loaded_names:
-            mod = sys.modules.get(module_name)
-            if mod is None:
-                continue
-            scanned = await _scan_module_for_engine(mod, module_name)
-            for candidate, source in scanned:
-                if source not in seen_sources:
-                    seen_sources.add(source)
-                    candidates.append((candidate, source))
-        if candidates:
-            _ENGINE_CACHE, _ENGINE_CACHE_SOURCE = candidates[0]
-            return _ENGINE_CACHE, _ENGINE_CACHE_SOURCE
-    return None, "engine_unavailable"
+        direct_symbols = [_normalize_symbol(s) for s in direct_symbols if _normalize_symbol(s)]
 
+        emergency_symbols = _normalize_list(criteria.get("emergency_symbols")) or list(_CONFIG.emergency_symbols)
+        emergency_symbols = [_normalize_symbol(s) for s in emergency_symbols if _normalize_symbol(s)]
 
-async def _resolve_engine(*args: Any, **kwargs: Any) -> Tuple[Optional[Any], str]:
-    for key in ("engine", "data_engine", "quote_engine", "cache_engine", "service", "runner", "request", "req", "app", "context"):
-        if kwargs.get(key) is not None:
-            candidates = _collect_engine_candidates_from_object(kwargs.get(key), key)
-            if candidates:
-                return candidates[0]
-    for i, arg in enumerate(args):
-        candidates = _collect_engine_candidates_from_object(arg, f"arg{i}")
-        if candidates:
-            return candidates[0]
-    for key in ("body", "payload", "request_data", "params", "criteria"):
-        val = kwargs.get(key)
-        if isinstance(val, Mapping):
-            candidates = _collect_engine_candidates_from_object(val, key)
-            if candidates:
-                return candidates[0]
-    for i, arg in enumerate(args):
-        if isinstance(arg, Mapping):
-            candidates = _collect_engine_candidates_from_object(arg, f"arg{i}")
-            if candidates:
-                return candidates[0]
-    return await _resolve_engine_from_modules()
+        limit_int = int(_clamp(
+            float(_to_int(criteria.get("limit") or criteria.get("top_n") or kwargs.get("limit"), 10)),
+            1.0, float(_CONFIG.max_limit),
+        ))
 
-
-# =============================================================================
-# Envelope / row extraction helpers
-# =============================================================================
-def _payload_keys_like(payload: Any, depth: int = 0) -> List[str]:
-    if payload is None or depth > 6:
-        return []
-    mapping = _coerce_mapping(payload)
-    if not mapping:
-        return []
-    for name in ("keys", "columns", "fields"):
-        keys = mapping.get(name)
-        if isinstance(keys, list):
-            out = [_s(k) for k in keys if _s(k)]
-            if out:
-                return out
-    for name in ("headers", "display_headers", "sheet_headers", "column_headers"):
-        headers = mapping.get(name)
-        if isinstance(headers, list):
-            out = [_header_to_key(h) for h in headers if _header_to_key(h)]
-            if out:
-                return out
-    for name in ("spec", "sheet_spec", "schema", "payload", "result", "response", "output", "data", "quote", "record", "item"):
-        nested = mapping.get(name)
-        if nested is not None and nested is not payload:
-            out = _payload_keys_like(nested, depth + 1)
-            if out:
-                return out
-    return []
-
-
-def _rows_from_matrix(rows_matrix: Any, cols: Sequence[str]) -> List[Dict[str, Any]]:
-    if not isinstance(rows_matrix, list) or not rows_matrix or not cols:
-        return []
-    keys = [_s(c) for c in cols if _s(c)]
-    if not keys:
-        return []
-    out: List[Dict[str, Any]] = []
-    for row in rows_matrix:
-        if not isinstance(row, (list, tuple)):
-            continue
-        vals = list(row)
-        out.append({keys[i]: (vals[i] if i < len(vals) else None) for i in range(len(keys))})
-    return out
-
-
-def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
-    if payload is None or depth > 8:
-        return []
-
-    if isinstance(payload, list):
-        if not payload:
-            return []
-        if all(isinstance(x, Mapping) or _coerce_mapping(x) for x in payload):
-            rows = [_coerce_mapping(x) for x in payload]
-            rows = [r for r in rows if r]
-            if rows:
-                return rows
-        if any(isinstance(x, (list, tuple)) for x in payload):
-            return []
-        return []
-
-    mapping = _coerce_mapping(payload)
-    if not mapping:
-        return []
-
-    if _looks_like_row_dict(mapping):
-        return [mapping]
-
-    # Symbol-keyed dict of row payloads. Only accept when values themselves look
-    # like rows or can unwrap into a single row. Avoid treating diagnostics/meta
-    # dicts as candidate rows.
-    rows_from_symbol_map: List[Dict[str, Any]] = []
-    maybe_symbol_map = True
-    symbol_like_keys = 0
-    for k, v in mapping.items():
-        if not isinstance(v, Mapping):
-            maybe_symbol_map = False
-            break
-        if not _looks_like_symbol_token(k):
-            maybe_symbol_map = False
-            break
-        symbol_like_keys += 1
-        nested_rows = _extract_rows_like(v, depth + 1)
-        row = nested_rows[0] if len(nested_rows) == 1 else _coerce_mapping(v)
-        if not row or not _looks_like_row_dict(row):
-            maybe_symbol_map = False
-            break
-        if _is_blank(row.get("symbol")) and _is_blank(row.get("ticker")):
-            row["symbol"] = _normalize_symbol(k)
-            row["ticker"] = _normalize_symbol(k)
-        rows_from_symbol_map.append(row)
-    if maybe_symbol_map and symbol_like_keys > 0 and rows_from_symbol_map:
-        return rows_from_symbol_map
-
-    for key in ("row_objects", "rows", "records", "record", "items", "item", "results", "recommendations", "quotes", "quote", "data"):
-        value = mapping.get(key)
-        if isinstance(value, list):
-            rows = _extract_rows_like(value, depth + 1)
-            if rows:
-                return rows
-            if value and any(isinstance(x, (list, tuple)) for x in value):
-                keys_like = _payload_keys_like(mapping)
-                rows = _rows_from_matrix(value, keys_like)
-                if rows:
-                    return rows
-        elif isinstance(value, Mapping):
-            rows = _extract_rows_like(value, depth + 1)
-            if rows:
-                return rows
-
-    for key in ("rows_matrix", "matrix"):
-        value = mapping.get(key)
-        if isinstance(value, list):
-            keys_like = _payload_keys_like(mapping)
-            rows = _rows_from_matrix(value, keys_like)
-            if rows:
-                return rows
-
-    for key in ("payload", "result", "response", "output", "snapshot", "content", "envelope", "spec", "schema", "sheet_spec"):
-        value = mapping.get(key)
-        if value is not None and value is not payload:
-            rows = _extract_rows_like(value, depth + 1)
-            if rows:
-                return rows
-
-    return []
-
-
-async def _call_engine_method(
-    engine: Any,
-    method_names: Sequence[str],
-    attempts: Sequence[Tuple[Tuple[Any, ...], Dict[str, Any]]],
-    *,
-    timeout_seconds: float = ENGINE_CALL_TIMEOUT_SEC,
-) -> Any:
-    if engine is None:
-        return None
-    last_exc: Optional[Exception] = None
-    for method_name in method_names:
-        fn = getattr(engine, method_name, None)
-        if not callable(fn):
-            continue
-        for args, kwargs in attempts:
-            try:
-                return await _call_with_timeout(fn, *args, timeout=timeout_seconds, **kwargs)
-            except asyncio.TimeoutError as exc:
-                last_exc = exc
-                logger.debug("Engine method timed out: %s", method_name)
-                continue
-            except TypeError as exc:
-                last_exc = exc
-                if _is_signature_mismatch_typeerror(exc):
-                    continue
-                logger.debug("Engine method raised non-signature TypeError: %s", method_name, exc_info=True)
-                raise
-            except Exception as exc:
-                last_exc = exc
-                continue
-    if last_exc is not None:
-        logger.debug("Engine call attempts exhausted: %s", last_exc)
-    return None
-
-
-async def _fetch_page_rows(engine: Any, page: str, limit: int, mode: str) -> List[Dict[str, Any]]:
-    body = {
-        "page": page, "page_name": page, "sheet": page, "sheet_name": page,
-        "tab": page, "worksheet": page, "name": page, "limit": limit, "top_n": limit,
-        "mode": mode or "", "include_headers": True, "include_matrix": True,
-        "schema_only": False, "headers_only": False,
-    }
-    attempts = [
-        ((), {"page": page, "sheet": page, "sheet_name": page, "limit": limit, "mode": mode or "", "body": body}),
-        ((), {"page_name": page, "sheet_name": page, "limit": limit, "mode": mode or "", "body": body}),
-        ((), {"payload": body}),
-        ((), {"body": body}),
-        ((), {"page": page, "sheet": page, "sheet_name": page, "limit": limit, "mode": mode or ""}),
-        ((), {"page_name": page, "sheet_name": page, "limit": limit, "mode": mode or ""}),
-        ((), {"page": page, "sheet": page, "limit": limit, "mode": mode or ""}),
-        ((), {"page": page, "limit": limit, "mode": mode or ""}),
-        ((page,), {"limit": limit, "mode": mode or ""}),
-        ((page,), {"limit": limit}),
-        ((page,), {}),
-    ]
-    payload = await _call_engine_method(
-        engine,
-        (
-            "get_sheet_rows", "get_page_rows", "sheet_rows", "build_sheet_rows",
-            "execute_sheet_rows", "run_sheet_rows", "build_analysis_sheet_rows",
-            "run_analysis_sheet_rows", "get_rows_for_sheet", "get_rows_for_page",
-            "get_page_data", "get_sheet_data", "build_page_rows", "build_page_data",
-        ),
-        attempts,
-    )
-    return _extract_rows_like(payload)
-
-
-async def _fetch_page_snapshot_rows(engine: Any, page: str) -> List[Dict[str, Any]]:
-    attempts = [
-        ((), {"sheet_name": page}),
-        ((), {"sheet": page}),
-        ((), {"page": page}),
-        ((), {"page_name": page}),
-        ((page,), {}),
-    ]
-    payload = await _call_engine_method(
-        engine,
-        ("get_cached_sheet_snapshot", "get_sheet_snapshot", "get_cached_sheet_rows", "get_page_snapshot", "get_sheet_cache"),
-        attempts,
-        timeout_seconds=min(ENGINE_CALL_TIMEOUT_SEC, 6.0),
-    )
-    return _extract_rows_like(payload)
-
-
-async def _fetch_direct_symbol_rows(engine: Any, symbols: Sequence[str], mode: str) -> List[Dict[str, Any]]:
-    syms = [_normalize_symbol(s) for s in symbols if _normalize_symbol(s)]
-    if not syms:
-        return []
-    attempts = [
-        ((), {"symbols": syms, "mode": mode or "", "schema": OUTPUT_PAGE}),
-        ((), {"symbols": syms, "mode": mode or ""}),
-        ((), {"symbols": syms}),
-        ((syms,), {"mode": mode or "", "schema": OUTPUT_PAGE}),
-        ((syms,), {"mode": mode or ""}),
-        ((syms,), {}),
-        ((), {"tickers": syms, "mode": mode or ""}),
-        ((), {"tickers": syms}),
-    ]
-    payload = await _call_engine_method(
-        engine,
-        (
-            "get_enriched_quotes_batch", "get_analysis_quotes_batch", "get_quotes_batch", "quotes_batch",
-            "get_quotes", "get_enriched_quote_batch", "get_symbol_quotes", "get_live_quotes",
-        ),
-        attempts,
-        timeout_seconds=min(ENGINE_CALL_TIMEOUT_SEC, 7.0),
-    )
-    rows = _extract_rows_like(payload)
-    if rows:
-        return rows
-
-    if isinstance(payload, Mapping):
-        direct_rows: List[Dict[str, Any]] = []
-        for sym in syms:
-            candidate = payload.get(sym) or payload.get(_normalize_symbol(sym))
-            if isinstance(candidate, Mapping):
-                direct_rows.append(_coerce_mapping(candidate))
-        if direct_rows:
-            return direct_rows
-
-    out: List[Dict[str, Any]] = []
-    for sym in syms[:HYDRATION_SYMBOL_CAP]:
-        single_attempts = [
-            ((sym,), {"mode": mode or "", "schema": OUTPUT_PAGE}),
-            ((sym,), {"mode": mode or ""}),
-            ((sym,), {}),
-            ((), {"symbol": sym, "mode": mode or ""}),
-            ((), {"symbol": sym}),
-            ((), {"ticker": sym, "mode": mode or ""}),
-        ]
-        row_payload = await _call_engine_method(
-            engine,
-            ("get_enriched_quote", "get_quote", "get_quote_dict", "get_live_quote", "get_symbol_quote"),
-            single_attempts,
-            timeout_seconds=min(ENGINE_CALL_TIMEOUT_SEC, 5.0),
+        horizon_days = _to_int(
+            criteria.get("horizon_days")
+            or criteria.get("invest_period_days")
+            or criteria.get("investment_period_days"),
+            90,
         )
-        single_rows = _extract_rows_like(row_payload)
-        if single_rows:
-            out.extend(single_rows)
-        elif isinstance(row_payload, Mapping):
-            d = _coerce_mapping(row_payload)
-            if d:
-                out.append(d)
-        else:
-            d = _coerce_mapping(row_payload)
-            if d:
-                out.append(d)
-    return out
+
+        return cls(
+            pages_selected=pages,
+            direct_symbols=direct_symbols,
+            direct_symbol_order=list(direct_symbols),
+            emergency_symbols=emergency_symbols,
+            limit=limit_int,
+            horizon_days=horizon_days,
+            risk_level=_to_string(criteria.get("risk_level") or criteria.get("risk_profile")),
+            confidence_bucket=_to_string(criteria.get("confidence_bucket") or criteria.get("confidence_level")),
+            min_expected_roi=_to_ratio(criteria.get("min_expected_roi") or criteria.get("min_roi")),
+            # v6.0.0 bug fix: normalize to RATIO to match row-side normalization
+            min_confidence=_to_ratio(criteria.get("min_confidence") or criteria.get("min_ai_confidence")),
+            max_risk_score=_to_float(criteria.get("max_risk_score")),
+            min_volume=_to_float(criteria.get("min_volume")),
+            min_technical_score=_to_float(criteria.get("min_technical_score")),
+            short_term_signal_required=_to_string(
+                criteria.get("short_term_signal_required") or criteria.get("min_short_term_signal")
+            ).upper(),
+            min_upside_pct=_to_ratio(criteria.get("min_upside_pct")),
+            enrich_final=_to_bool(criteria.get("enrich_final", True), True),
+            schema_only=_to_bool(criteria.get("schema_only"), False),
+            headers_only=_to_bool(criteria.get("headers_only"), False),
+            include_headers=_to_bool(criteria.get("include_headers", True), True),
+            include_matrix=_to_bool(criteria.get("include_matrix", True), True),
+            mode=_to_string(kwargs.get("mode") or criteria.get("mode") or ""),
+            raw=criteria,
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary for serialization into `criteria_snapshot`."""
+        return {
+            "pages_selected": self.pages_selected,
+            "direct_symbols": self.direct_symbols,
+            "limit": self.limit,
+            "horizon_days": self.horizon_days,
+            "risk_level": self.risk_level,
+            "confidence_bucket": self.confidence_bucket,
+            "min_expected_roi": self.min_expected_roi,
+            "min_confidence": self.min_confidence,
+            "max_risk_score": self.max_risk_score,
+            "min_volume": self.min_volume,
+            "min_technical_score": self.min_technical_score,
+            "short_term_signal_required": self.short_term_signal_required,
+            "min_upside_pct": self.min_upside_pct,
+            "enrich_final": self.enrich_final,
+            "mode": self.mode,
+        }
 
 
-# =============================================================================
-# Criteria normalization
-# =============================================================================
-def _merge_mapping_like(*parts: Any) -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
-    for part in parts:
-        if isinstance(part, Mapping):
-            out.update(dict(part))
-    return out
+# ---------------------------------------------------------------------------
+# Row Normalization
+# ---------------------------------------------------------------------------
 
-
-def _collect_symbol_keys_from_mapping(mapping: Mapping[str, Any]) -> List[str]:
-    out: List[str] = []
-    for k, v in mapping.items():
-        if isinstance(v, Mapping) and _looks_like_symbol_token(k):
-            out.append(_normalize_symbol(k))
-    return _dedupe_keep_order(out)
-
-
-def _collect_criteria_from_inputs(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    positional_maps = [arg for arg in args if isinstance(arg, Mapping)]
-    body = _merge_mapping_like(
-        *positional_maps,
-        kwargs.get("body"),
-        kwargs.get("payload"),
-        kwargs.get("request_data"),
-        kwargs.get("params"),
-    )
-
-    criteria: Dict[str, Any] = {}
-    if isinstance(kwargs.get("criteria"), Mapping):
-        criteria.update(dict(kwargs["criteria"]))
-    if isinstance(body.get("criteria"), Mapping):
-        criteria.update(dict(body["criteria"]))
-    if isinstance(body.get("filters"), Mapping):
-        criteria.update(dict(body["filters"]))
-
-    for k, v in body.items():
-        if v is not None and k not in {"criteria", "filters"}:
-            criteria.setdefault(k, v)
-
-    for k in (
-        "pages_selected", "pages", "selected_pages", "sources", "page", "page_name", "sheet", "sheet_name",
-        "symbols", "tickers", "direct_symbols", "top_n", "limit", "risk_level", "risk_profile",
-        "confidence_bucket", "confidence_level", "invest_period_days", "investment_period_days",
-        "horizon_days", "invest_period_label", "min_expected_roi", "min_roi", "min_confidence",
-        "min_ai_confidence", "max_risk_score", "min_volume", "enrich_final", "schema_only",
-        "headers_only", "include_headers", "include_matrix", "mode", "emergency_symbols",
-    ):
-        if kwargs.get(k) is not None:
-            criteria[k] = kwargs.get(k)
-
-    pages = (
-        _normalize_list(criteria.get("pages_selected"))
-        or _normalize_list(criteria.get("pages"))
-        or _normalize_list(criteria.get("selected_pages"))
-        or _normalize_list(criteria.get("sources"))
-        or _normalize_list(criteria.get("page"))
-        or _normalize_list(criteria.get("page_name"))
-        or _normalize_list(criteria.get("sheet"))
-        or _normalize_list(criteria.get("sheet_name"))
-    )
-    pages = _safe_source_pages([_normalize_page_name_safe(p) for p in pages])
-    if not pages:
-        pages = _safe_source_pages(DEFAULT_SOURCE_PAGES)
-
-    direct_symbols = _normalize_list(criteria.get("direct_symbols") or criteria.get("symbols") or criteria.get("tickers"))
-    if not direct_symbols and isinstance(body, Mapping):
-        direct_symbols = _collect_symbol_keys_from_mapping(body)
-    direct_symbols = [_normalize_symbol(s) for s in direct_symbols if _normalize_symbol(s)]
-
-    emergency_symbols = _normalize_list(criteria.get("emergency_symbols")) or list(EMERGENCY_SYMBOLS)
-    emergency_symbols = [_normalize_symbol(s) for s in emergency_symbols if _normalize_symbol(s)]
-
-    limit = _safe_int(criteria.get("limit") or criteria.get("top_n") or kwargs.get("limit"), 10)
-    limit = max(1, min(limit, MAX_LIMIT))
-
-    horizon_days = _safe_int(
-        criteria.get("horizon_days") or criteria.get("invest_period_days") or criteria.get("investment_period_days"),
-        90,
-    )
-
-    risk_level = _s(criteria.get("risk_level") or criteria.get("risk_profile") or "").lower()
-    confidence_bucket = _s(criteria.get("confidence_bucket") or criteria.get("confidence_level") or "").lower()
-
-    min_roi = criteria.get("min_expected_roi")
-    if min_roi is None:
-        min_roi = criteria.get("min_roi")
-    min_roi_ratio = _safe_ratio(min_roi, None)
-
-    normalized = dict(criteria)
-    normalized["pages_selected"] = pages
-    normalized["direct_symbols"] = direct_symbols
-    normalized["direct_symbol_order"] = list(direct_symbols)
-    normalized["emergency_symbols"] = emergency_symbols
-    normalized["limit"] = limit
-    normalized["top_n"] = limit
-    normalized["risk_level"] = risk_level
-    normalized["risk_profile"] = risk_level
-    normalized["confidence_bucket"] = confidence_bucket
-    normalized["confidence_level"] = confidence_bucket
-    normalized["horizon_days"] = horizon_days
-    normalized["invest_period_days"] = horizon_days
-    normalized["min_expected_roi"] = min_roi_ratio
-    normalized["min_roi"] = min_roi_ratio
-    normalized["schema_only"] = _coerce_bool(normalized.get("schema_only"), False)
-    normalized["headers_only"] = _coerce_bool(normalized.get("headers_only"), False)
-    normalized["include_headers"] = _coerce_bool(normalized.get("include_headers", True), True)
-    normalized["include_matrix"] = _coerce_bool(normalized.get("include_matrix", True), True)
-    normalized.setdefault("enrich_final", True)
-    return normalized
-
-
-# =============================================================================
-# Row normalization / ranking
-# =============================================================================
-def _extract_value_by_aliases(row: Mapping[str, Any], key: str) -> Any:
-    aliases = ROW_KEY_ALIASES.get(key, (key,))
-    lookup = _row_lookup(row)
-    for alias in aliases:
-        for token in _canonical_key_variants(alias):
-            if token in lookup:
-                return lookup[token]
-    return None
-
-
-def _normalize_candidate_row(raw: Mapping[str, Any]) -> Dict[str, Any]:
-    row: Dict[str, Any] = dict(raw)
+def normalize_candidate_row(raw: Mapping[str, Any]) -> Dict[str, Any]:
+    """Normalize a candidate row by resolving aliases and canonicalizing the symbol."""
+    row = dict(raw)
     for key in ROW_KEY_ALIASES.keys():
         if key not in row or row.get(key) is None or row.get(key) == "":
             value = _extract_value_by_aliases(row, key)
             if value is not None:
                 row[key] = value
-    sym = _normalize_symbol(row.get("symbol") or row.get("ticker") or row.get("requested_symbol") or row.get("code"))
+    sym = _normalize_symbol(
+        row.get("symbol") or row.get("ticker") or row.get("requested_symbol") or row.get("code")
+    )
     if sym:
         row["symbol"] = sym
         row.setdefault("ticker", sym)
     return row
 
 
-def _row_richness(row: Mapping[str, Any]) -> int:
-    return _count_nonblank_fields(row)
+def merge_rows(base: Mapping[str, Any], update: Mapping[str, Any]) -> Dict[str, Any]:
+    """Merge two rows, preferring non-blank values from update."""
+    merged = dict(base)
+    for key, value in dict(update).items():
+        if value not in (None, "", [], {}, ()):
+            merged[key] = value
+    return merged
 
 
-def _choose_horizon_roi(row: Mapping[str, Any], horizon_days: int) -> Optional[float]:
+def merge_symbol_rows(
+    primary: Sequence[Mapping[str, Any]],
+    secondary: Sequence[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Merge two lists of rows by symbol, keeping richer rows."""
+    merged: Dict[str, Dict[str, Any]] = {}
+
+    def _add(row: Mapping[str, Any]) -> None:
+        normalized = normalize_candidate_row(row)
+        sym = _normalize_symbol(normalized.get("symbol") or normalized.get("ticker"))
+        if not sym:
+            return
+        existing = merged.get(sym)
+        if existing is None:
+            merged[sym] = dict(normalized)
+            return
+        if _count_nonblank_fields(normalized) >= _count_nonblank_fields(existing):
+            merged[sym] = merge_rows(existing, normalized)
+        else:
+            merged[sym] = merge_rows(normalized, existing)
+
+    for row in primary:
+        _add(row)
+    for row in secondary:
+        _add(row)
+    return list(merged.values())
+
+
+# ---------------------------------------------------------------------------
+# Horizon Helpers (aligned with criteria_model.py)
+# ---------------------------------------------------------------------------
+
+def _horizon_label_for_days(days: int) -> str:
+    """Return 1M / 3M / 12M using criteria_model thresholds (45 / 120)."""
+    try:
+        from core.analysis.criteria_model import map_days_to_horizon  # type: ignore
+        return map_days_to_horizon(days)
+    except Exception:
+        d = max(1, int(days) if days else 1)
+        if d <= 45:
+            return "1M"
+        if d <= 120:
+            return "3M"
+        return "12M"
+
+
+def _primary_roi_key_for_horizon(horizon: str) -> str:
+    """Return the expected_roi_* field for a horizon label."""
+    try:
+        from core.analysis.criteria_model import horizon_to_expected_roi_key  # type: ignore
+        return horizon_to_expected_roi_key(horizon)
+    except Exception:
+        return {"1M": "expected_roi_1m", "3M": "expected_roi_3m"}.get(horizon, "expected_roi_12m")
+
+
+def choose_horizon_roi(row: Mapping[str, Any], horizon_days: int) -> Optional[float]:
     """
-    v4.9.0: supports scoring.py v3.0.0 horizon labels (day/week/month/long).
-    Short horizons (≤14d): prefer 1M ROI; medium (≤92d): prefer 3M; long: prefer 12M.
+    Choose the appropriate ROI field based on the horizon, with fallbacks.
+
+    Uses `criteria_model.map_days_to_horizon` / `horizon_to_expected_roi_key`
+    so horizons line up across the core.analysis package.
     """
-    # Also accept horizon label strings from scoring.py v3.0.0
-    label = _s(row.get("horizon_label") or row.get("invest_period_label") or "").lower()
-    if label in ("1d", "day") or horizon_days <= 7:
-        return (_safe_ratio(row.get("expected_roi_1m"), None) or
-                _safe_ratio(row.get("expected_roi_3m"), None) or
-                _safe_ratio(row.get("expected_roi_12m"), None))
-    if label in ("1w", "week") or horizon_days <= 14:
-        return (_safe_ratio(row.get("expected_roi_1m"), None) or
-                _safe_ratio(row.get("expected_roi_3m"), None) or
-                _safe_ratio(row.get("expected_roi_12m"), None))
-    if label in ("1m", "month") or horizon_days <= 31:
-        return (_safe_ratio(row.get("expected_roi_1m"), None) or
-                _safe_ratio(row.get("expected_roi_3m"), None) or
-                _safe_ratio(row.get("expected_roi_12m"), None))
-    if label in ("3m",) or horizon_days <= 92:
-        return (_safe_ratio(row.get("expected_roi_3m"), None) or
-                _safe_ratio(row.get("expected_roi_12m"), None) or
-                _safe_ratio(row.get("expected_roi_1m"), None))
-    return (_safe_ratio(row.get("expected_roi_12m"), None) or
-            _safe_ratio(row.get("expected_roi_3m"), None) or
-            _safe_ratio(row.get("expected_roi_1m"), None))
+    label = _to_string(row.get("horizon_label") or row.get("invest_period_label")).upper()
+    if label in ("1M", "3M", "12M"):
+        primary_horizon = label
+    else:
+        primary_horizon = _horizon_label_for_days(horizon_days)
+
+    primary_key = _primary_roi_key_for_horizon(primary_horizon)
+    primary = _to_ratio(row.get(primary_key))
+    if primary is not None:
+        return primary
+
+    # Fall through the other horizons (3M -> 1M -> 12M preference)
+    for fallback_key in ("expected_roi_3m", "expected_roi_1m", "expected_roi_12m"):
+        if fallback_key == primary_key:
+            continue
+        val = _to_ratio(row.get(fallback_key))
+        if val is not None:
+            return val
+    return None
 
 
-def _confidence_bucket_match(row: Mapping[str, Any], wanted: str) -> bool:
+# ---------------------------------------------------------------------------
+# Filtering
+# ---------------------------------------------------------------------------
+
+def confidence_bucket_match(row: Mapping[str, Any], wanted: str) -> bool:
+    """Check if row's confidence bucket matches the wanted label."""
     if not wanted:
         return True
-    row_bucket = _s(row.get("confidence_bucket") or row.get("confidence_level")).lower()
+    row_bucket = _to_string(row.get("confidence_bucket") or row.get("confidence_level")).lower()
     if row_bucket:
         return wanted in row_bucket or row_bucket in wanted
-    score = _safe_float(row.get("forecast_confidence") or row.get("confidence_score"), None)
+    score = _to_float(row.get("forecast_confidence") or row.get("confidence_score"))
     if score is None:
         return True
     if score <= 1.0:
@@ -1476,13 +1141,14 @@ def _confidence_bucket_match(row: Mapping[str, Any], wanted: str) -> bool:
     return True
 
 
-def _risk_level_match(row: Mapping[str, Any], wanted: str) -> bool:
+def risk_level_match(row: Mapping[str, Any], wanted: str) -> bool:
+    """Check if row's risk level matches the wanted label."""
     if not wanted:
         return True
-    row_bucket = _s(row.get("risk_bucket") or row.get("risk_level")).lower()
+    row_bucket = _to_string(row.get("risk_bucket") or row.get("risk_level")).lower()
     if row_bucket:
         return wanted in row_bucket or row_bucket in wanted
-    risk = _safe_float(row.get("risk_score"), None)
+    risk = _to_float(row.get("risk_score"))
     if risk is None:
         return True
     if "low" in wanted or "conservative" in wanted:
@@ -1494,161 +1160,192 @@ def _risk_level_match(row: Mapping[str, Any], wanted: str) -> bool:
     return True
 
 
-def _passes_filters(row: Mapping[str, Any], criteria: Mapping[str, Any]) -> bool:
-    wanted_conf = _s(criteria.get("confidence_bucket") or criteria.get("confidence_level")).lower()
-    wanted_risk = _s(criteria.get("risk_level") or criteria.get("risk_profile")).lower()
-    horizon_days = _safe_int(criteria.get("horizon_days") or criteria.get("invest_period_days"), 90)
-
-    if not _confidence_bucket_match(row, wanted_conf):
+def passes_filters(row: Mapping[str, Any], ctx: CriteriaContext) -> bool:
+    """Check if row passes all criteria filters."""
+    if not confidence_bucket_match(row, ctx.confidence_bucket):
         return False
-    if not _risk_level_match(row, wanted_risk):
+    if not risk_level_match(row, ctx.risk_level):
         return False
 
-    min_roi = _safe_ratio(criteria.get("min_expected_roi") or criteria.get("min_roi"), None)
-    roi = _choose_horizon_roi(row, horizon_days)
-    if min_roi is not None:
-        if roi is None:
-            return False
-        if roi < min_roi:
+    if ctx.min_expected_roi is not None:
+        roi = choose_horizon_roi(row, ctx.horizon_days)
+        if roi is None or roi < ctx.min_expected_roi:
             return False
 
-    min_conf = _safe_float(criteria.get("min_confidence") or criteria.get("min_ai_confidence"), None)
-    row_conf = _safe_float(row.get("forecast_confidence") or row.get("confidence_score"), None)
-    if row_conf is not None and row_conf <= 1.0:
-        row_conf *= 100.0
-    if min_conf is not None:
-        if row_conf is None or row_conf < min_conf:
+    # v6.0.0 bug fix: both sides now on the ratio scale.
+    if ctx.min_confidence is not None:
+        conf = _to_float(row.get("forecast_confidence") or row.get("confidence_score"))
+        if conf is None:
+            return False
+        if abs(conf) > 1.5:
+            conf /= 100.0
+        if conf < ctx.min_confidence:
             return False
 
-    max_risk = _safe_float(criteria.get("max_risk_score"), None)
-    risk = _safe_float(row.get("risk_score"), None)
-    if max_risk is not None and risk is not None and risk > max_risk:
-        return False
-
-    min_volume = _safe_float(criteria.get("min_volume"), None)
-    volume = _safe_float(row.get("volume"), None)
-    if min_volume is not None and volume is not None and volume < min_volume:
-        return False
-
-    # v4.9.0: technical_score filter (short-horizon criteria only)
-    min_tech = _safe_float(criteria.get("min_technical_score"), None)
-    if min_tech is not None:
-        tech = _safe_float(row.get("technical_score"), None)
-        if tech is None or tech < min_tech:
+    if ctx.max_risk_score is not None:
+        risk = _to_float(row.get("risk_score"))
+        if risk is not None and risk > ctx.max_risk_score:
             return False
 
-    # v4.9.0: short_term_signal filter
-    req_st_signal = _s(criteria.get("short_term_signal_required") or criteria.get("min_short_term_signal")).upper()
-    if req_st_signal in ("BUY", "STRONG_BUY"):
-        st_sig = _s(row.get("short_term_signal")).upper()
-        if st_sig not in ("BUY", "STRONG_BUY"):
+    if ctx.min_volume is not None:
+        volume = _to_float(row.get("volume"))
+        if volume is not None and volume < ctx.min_volume:
             return False
 
-    # v4.9.0: upside_pct filter
-    min_upside = _safe_float(criteria.get("min_upside_pct"), None)
-    if min_upside is not None:
-        upside = _safe_float(row.get("upside_pct"), None)
-        if upside is not None and upside < min_upside:
+    if ctx.min_technical_score is not None:
+        tech = _to_float(row.get("technical_score"))
+        if tech is None or tech < ctx.min_technical_score:
+            return False
+
+    if ctx.short_term_signal_required in ("BUY", "STRONG_BUY"):
+        st_signal = _to_string(row.get("short_term_signal")).upper()
+        if st_signal not in ("BUY", "STRONG_BUY"):
+            return False
+
+    if ctx.min_upside_pct is not None:
+        upside = _to_ratio(row.get("upside_pct"))
+        if upside is not None and upside < ctx.min_upside_pct:
             return False
 
     return True
 
 
-def _direct_symbol_order_index(row: Mapping[str, Any], criteria: Mapping[str, Any]) -> Optional[int]:
-    direct_symbols = [_normalize_symbol(s) for s in _normalize_list(criteria.get("direct_symbol_order") or criteria.get("direct_symbols"))]
-    if not direct_symbols:
+def direct_symbol_order_index(row: Mapping[str, Any], ctx: CriteriaContext) -> Optional[int]:
+    """Return the index of this row's symbol in the user-supplied direct-symbol order."""
+    if not ctx.direct_symbol_order:
         return None
     sym = _normalize_symbol(row.get("symbol") or row.get("ticker") or row.get("requested_symbol"))
     if not sym:
         return None
     try:
-        return direct_symbols.index(sym)
+        return ctx.direct_symbol_order.index(sym)
     except ValueError:
         return None
 
 
-def _selector_score(row: Mapping[str, Any], criteria: Mapping[str, Any]) -> float:
+# ---------------------------------------------------------------------------
+# Scoring (horizon buckets aligned with criteria_model: 1M / 3M / 12M)
+# ---------------------------------------------------------------------------
+
+def compute_selector_score(row: Mapping[str, Any], ctx: CriteriaContext) -> float:
     """
-    v4.9.0: horizon-aware composite score.
+    Compute composite selection score.
 
-    Weight sets by horizon:
-      DAY/WEEK (≤14d):  technical_score×0.30, momentum×0.25, overall×0.20,
-                        opportunity×0.10, roi×0.15
-      MONTH (≤90d):     overall×0.35, opportunity×0.20, roi×0.20, scores×0.25
-      LONG (>90d):      overall×0.35, opportunity×0.20, roi×0.20, scores×0.25
-
-    Always: upside_pct bonus, risk penalty, richness micro-boost.
+    v6.0.0 fix: horizon buckets now match `choose_horizon_roi` (1M / 3M / 12M
+    via criteria_model thresholds 45 / 120), so the weights align with the
+    ROI field being scored.
     """
-    overall     = _safe_float(row.get("overall_score"), None)
-    opportunity = _safe_float(row.get("opportunity_score"), None)
-    value       = _safe_float(row.get("value_score"), None)
-    quality     = _safe_float(row.get("quality_score"), None)
-    momentum    = _safe_float(row.get("momentum_score"), None)
-    growth      = _safe_float(row.get("growth_score"), None)
-    risk        = _safe_float(row.get("risk_score"), None)
-    conf        = _safe_float(row.get("forecast_confidence") or row.get("confidence_score"), None)
-    liquidity   = _safe_float(row.get("liquidity_score"), None)
-    tech        = _safe_float(row.get("technical_score"), None)
-    upside      = _safe_float(row.get("upside_pct"), None)
-    st_signal   = _s(row.get("short_term_signal")).upper()
+    overall = _to_float(row.get("overall_score"))
+    opportunity = _to_float(row.get("opportunity_score"))
+    value_score = _to_float(row.get("value_score"))
+    quality_score = _to_float(row.get("quality_score"))
+    momentum_score = _to_float(row.get("momentum_score"))
+    growth_score = _to_float(row.get("growth_score"))
+    risk_score = _to_float(row.get("risk_score"))
+    confidence = _to_float(row.get("forecast_confidence") or row.get("confidence_score"))
+    liquidity = _to_float(row.get("liquidity_score"))
+    technical = _to_float(row.get("technical_score"))
+    upside = _to_ratio(row.get("upside_pct"))
+    st_signal = _to_string(row.get("short_term_signal")).upper()
 
-    horizon_days = _safe_int(criteria.get("horizon_days") or criteria.get("invest_period_days"), 90)
-    roi = _choose_horizon_roi(row, horizon_days)
+    if confidence is not None and confidence <= 1.0:
+        confidence *= 100.0
 
-    if conf is not None and conf <= 1.0:
-        conf *= 100.0
-
+    horizon = _horizon_label_for_days(ctx.horizon_days)
+    roi = choose_horizon_roi(row, ctx.horizon_days)
     score = 0.0
 
-    # ── Horizon-aware base scoring ─────────────────────────────────────────
-    if horizon_days <= 14:
-        # Short horizon: technical + momentum dominate
-        if tech      is not None: score += tech * 0.30
-        if momentum  is not None: score += momentum * 0.25
-        if overall   is not None: score += overall * 0.20
-        if opportunity is not None: score += opportunity * 0.10
-        if roi       is not None: score += roi * 100.0 * 0.15
-        if conf      is not None: score += conf * 0.05
-        if risk      is not None: score += (100.0 - risk) * 0.08
-        # short_term_signal BUY/STRONG_BUY bonus
-        if st_signal in ("BUY", "STRONG_BUY"):
-            score += 15.0 if st_signal == "STRONG_BUY" else 8.0
+    if horizon == "1M":
+        # Short horizon: technical + momentum + ST signal dominate
+        if technical is not None:
+            score += technical * 0.30
+        if momentum_score is not None:
+            score += momentum_score * 0.25
+        if overall is not None:
+            score += overall * 0.20
+        if opportunity is not None:
+            score += opportunity * 0.10
+        if roi is not None:
+            score += roi * 100.0 * 0.15
+        if confidence is not None:
+            score += confidence * 0.05
+        if risk_score is not None:
+            score += (100.0 - risk_score) * 0.08
+        if st_signal == "STRONG_BUY":
+            score += 15.0
+        elif st_signal == "BUY":
+            score += 8.0
+    elif horizon == "3M":
+        # Medium horizon: balanced weights -- overall + roi + fundamentals
+        if overall is not None:
+            score += overall * 0.30
+        if opportunity is not None:
+            score += opportunity * 0.15
+        if momentum_score is not None:
+            score += momentum_score * 0.12
+        if technical is not None:
+            score += technical * 0.10
+        if value_score is not None:
+            score += value_score * 0.08
+        if quality_score is not None:
+            score += quality_score * 0.08
+        if growth_score is not None:
+            score += growth_score * 0.08
+        if confidence is not None:
+            score += confidence * 0.08
+        if liquidity is not None:
+            score += liquidity * 0.05
+        if risk_score is not None:
+            score += (100.0 - risk_score) * 0.08
+        if roi is not None:
+            score += roi * 100.0 * 0.20
     else:
-        # Month / Long: fundamental + overall scoring (original logic)
-        if overall      is not None: score += overall * 0.35
-        if opportunity  is not None: score += opportunity * 0.20
-        if value        is not None: score += value * 0.08
-        if quality      is not None: score += quality * 0.08
-        if momentum     is not None: score += momentum * 0.08
-        if growth       is not None: score += growth * 0.08
-        if conf         is not None: score += conf * 0.08
-        if liquidity    is not None: score += liquidity * 0.05
-        if risk         is not None: score += (100.0 - risk) * 0.08
-        if roi          is not None: score += roi * 100.0 * 0.20
-        # technical_score still gives a small boost even for medium-term
-        if tech         is not None: score += tech * 0.05
+        # Long horizon (12M): fundamentals dominate
+        if overall is not None:
+            score += overall * 0.35
+        if opportunity is not None:
+            score += opportunity * 0.20
+        if value_score is not None:
+            score += value_score * 0.10
+        if quality_score is not None:
+            score += quality_score * 0.10
+        if growth_score is not None:
+            score += growth_score * 0.10
+        if momentum_score is not None:
+            score += momentum_score * 0.06
+        if confidence is not None:
+            score += confidence * 0.08
+        if liquidity is not None:
+            score += liquidity * 0.05
+        if risk_score is not None:
+            score += (100.0 - risk_score) * 0.08
+        if roi is not None:
+            score += roi * 100.0 * 0.20
+        if technical is not None:
+            score += technical * 0.05
 
-    # ── Universal bonuses ─────────────────────────────────────────────────
-    # upside_pct bonus: (intrinsic - price) / price. Reward deep value.
+    # Upside bonus (ratio scale)
     if upside is not None and upside > 0:
-        score += min(upside * 100.0, 20.0) * 0.15  # max +30 points for 20%+ upside
+        score += min(upside * 100.0, 20.0) * 0.15
 
-    # Direct symbol priority override
-    direct_order_index = _direct_symbol_order_index(row, criteria)
-    if direct_order_index is not None:
-        score += max(0.0, 140.0 - float(direct_order_index * 2))
+    # Direct symbol priority -- user-supplied order comes first
+    order_idx = direct_symbol_order_index(row, ctx)
+    if order_idx is not None:
+        score += max(0.0, 140.0 - float(order_idx * 2))
 
-    score += min(_row_richness(row), 120) * 0.03
+    # Richness micro-boost (break ties toward rows with more data)
+    score += min(_count_nonblank_fields(row), 120) * 0.03
+
     return float(score)
 
 
-def _canonical_selection_reason(row: Dict[str, Any], criteria: Mapping[str, Any]) -> str:
-    recommendation = _s(row.get("recommendation"))
-    confidence_bucket = _s(row.get("confidence_bucket"))
-    risk_bucket = _s(row.get("risk_bucket"))
-    source_page = _s(row.get("source_page"))
-    horizon_days = _safe_int(criteria.get("horizon_days") or criteria.get("invest_period_days"), 90)
-    horizon_roi = _choose_horizon_roi(row, horizon_days)
+def generate_selection_reason(row: Dict[str, Any], ctx: CriteriaContext) -> str:
+    """Generate a one-line, human-readable selection reason."""
+    recommendation = _to_string(row.get("recommendation"))
+    confidence_bucket = _to_string(row.get("confidence_bucket"))
+    risk_bucket = _to_string(row.get("risk_bucket"))
+    source_page = _to_string(row.get("source_page"))
+    horizon_roi = choose_horizon_roi(row, ctx.horizon_days)
 
     score_parts: List[str] = []
     for label, key in (
@@ -1677,105 +1374,105 @@ def _canonical_selection_reason(row: Dict[str, Any], criteria: Mapping[str, Any]
     if score_parts:
         parts.append(", ".join(score_parts[:3]))
 
-    # v4.9.0: include technical_score and short_term_signal
     tech = row.get("technical_score")
     if isinstance(tech, (int, float)):
         parts.append(f"Tech={round(float(tech), 1)}")
-    st_sig = _s(row.get("short_term_signal"))
-    if st_sig and st_sig.upper() not in ("HOLD", "N/A", ""):
-        parts.append(f"ST={st_sig}")
-    upside = row.get("upside_pct")
-    if isinstance(upside, (int, float)):
-        parts.append(f"Upside={round(float(upside)*100.0, 1)}%")
+    st_signal = _to_string(row.get("short_term_signal"))
+    if st_signal and st_signal.upper() not in ("HOLD", "N/A", ""):
+        parts.append(f"ST={st_signal}")
+    upside = _to_ratio(row.get("upside_pct"))
+    if upside is not None:
+        parts.append(f"Upside={round(upside * 100.0, 1)}%")
 
     return " | ".join(parts) if parts else "Selected by Top10 composite scoring."
 
 
-def _compute_trade_setup(row: Dict[str, Any], criteria: Mapping[str, Any]) -> None:
+# ---------------------------------------------------------------------------
+# Trade Setup (entry / stop / take-profit / R:R)
+# ---------------------------------------------------------------------------
+
+def compute_trade_setup(row: Dict[str, Any], ctx: CriteriaContext) -> None:
     """
-    v4.9.0: Compute entry_price, stop_loss_suggested, take_profit_suggested,
-    risk_reward_ratio in-place.
+    Compute entry_price, stop_loss_suggested, take_profit_suggested, risk_reward_ratio
+    in place on `row`.
 
-    Entry price strategy:
-      If price is near the bottom of the day range (day_range_position < 0.40),
-      use current_price directly (already a good entry zone).
-      Otherwise suggest slightly below current price toward support.
-
-    Stop loss:
-      entry − (atr_14 × 1.5)
-      Fallback: entry × (1 − volatility_30d × 0.5)
-      Min distance: 2% below entry.
-
-    Take profit:
-      entry × (1 + upside_pct) using intrinsic value gap.
-      Fallback: forecast_price_3m, then entry × (1 + 0.08).
-      Min distance: 4% above entry.
-
-    R/R ratio:
-      (take_profit − entry) / (entry − stop_loss).
-      Only write if R/R ≥ 1.0 (otherwise leave as computed for transparency).
+    Heuristics:
+      Entry: if day_range_position < _DAY_RANGE_ENTRY_THRESHOLD, use current price.
+             Otherwise slight discount toward range bottom.
+      Stop:  entry - ATR * _STOP_LOSS_ATR_MULT, or vol-based, or _STOP_LOSS_MIN_PCT.
+             Never closer than (1 - _STOP_LOSS_MAX_CLOSENESS) below entry.
+      TP:    entry * (1 + upside), capped at _TAKE_PROFIT_UPSIDE_CAP; or forecast_price_3m;
+             or _TAKE_PROFIT_DEFAULT. Never closer than _TAKE_PROFIT_MIN_CLOSENESS above entry.
     """
     if not _is_blank(row.get("entry_price")) and not _is_blank(row.get("risk_reward_ratio")):
-        return  # already set upstream
+        return
 
-    price = _safe_float(row.get("current_price"), None)
+    price = _to_float(row.get("current_price"))
     if price is None or price <= 0:
         return
 
-    # ── Entry price ───────────────────────────────────────────────────────
-    drp = _safe_float(row.get("day_range_position"), None)
-    if drp is not None and drp < 0.40:
-        entry = price  # already near support
-    elif drp is not None:
-        entry = round(price * (1.0 - drp * 0.008), 4)  # subtle discount toward range bottom
+    # Entry price
+    day_range_pos = _to_float(row.get("day_range_position"))
+    if day_range_pos is not None and day_range_pos < _DAY_RANGE_ENTRY_THRESHOLD:
+        entry = price
+    elif day_range_pos is not None:
+        entry = round(price * (1.0 - day_range_pos * _DAY_RANGE_ENTRY_DISCOUNT), 4)
     else:
         entry = price
     row["entry_price"] = entry
 
-    # ── Stop loss ─────────────────────────────────────────────────────────
+    # Stop loss
     if _is_blank(row.get("stop_loss_suggested")):
-        atr = _safe_float(row.get("atr_14"), None)
+        atr = _to_float(row.get("atr_14"))
         if atr is not None and atr > 0:
-            sl = round(entry - atr * 1.5, 4)
+            sl = round(entry - atr * _STOP_LOSS_ATR_MULT, 4)
         else:
-            vol30 = _safe_float(row.get("volatility_30d"), None)
+            vol30 = _to_float(row.get("volatility_30d"))
             if vol30 is not None:
-                # vol30 is annualized fraction; daily ≈ vol30/sqrt(252)
-                daily_move = (vol30 / 15.87) * entry if vol30 <= 1.5 else (vol30 / 1587.0) * entry
-                sl = round(entry - max(daily_move * 3.0, entry * 0.025), 4)
+                # Convert annualized vol to daily move, handling both ratio and percent input
+                vol_ratio = vol30 if abs(vol30) <= 1.5 else vol30 / 100.0
+                daily_move = (vol_ratio / _SQRT_TRADING_DAYS) * entry
+                sl = round(
+                    entry - max(daily_move * _STOP_LOSS_VOL_DAILY_MULT, entry * _STOP_LOSS_MIN_PCT),
+                    4,
+                )
             else:
-                sl = round(entry * 0.975, 4)  # 2.5% hard stop
-        sl = min(sl, entry * 0.98)  # never closer than 2%
+                sl = round(entry * (1.0 - _STOP_LOSS_MIN_PCT), 4)
+        sl = min(sl, entry * _STOP_LOSS_MAX_CLOSENESS)
         row["stop_loss_suggested"] = sl
 
-    # ── Take profit ───────────────────────────────────────────────────────
+    # Take profit
     if _is_blank(row.get("take_profit_suggested")):
-        upside = _safe_float(row.get("upside_pct"), None)
+        upside = _to_ratio(row.get("upside_pct"))
         if upside is not None and upside > 0.01:
-            tp = round(entry * (1.0 + min(upside, 0.80)), 4)  # cap at 80% upside
+            tp = round(entry * (1.0 + min(upside, _TAKE_PROFIT_UPSIDE_CAP)), 4)
         else:
-            fp3 = _safe_float(row.get("forecast_price_3m"), None)
+            fp3 = _to_float(row.get("forecast_price_3m"))
             if fp3 is not None and fp3 > entry * 1.03:
                 tp = round(fp3, 4)
             else:
-                tp = round(entry * 1.08, 4)  # default 8% target
-        tp = max(tp, entry * 1.04)  # never closer than 4%
+                tp = round(entry * _TAKE_PROFIT_DEFAULT, 4)
+        tp = max(tp, entry * _TAKE_PROFIT_MIN_CLOSENESS)
         row["take_profit_suggested"] = tp
 
-    # ── Risk/Reward ratio ─────────────────────────────────────────────────
+    # Risk/Reward ratio
     if _is_blank(row.get("risk_reward_ratio")):
-        entry_v = _safe_float(row.get("entry_price"), None)
-        sl_v    = _safe_float(row.get("stop_loss_suggested"), None)
-        tp_v    = _safe_float(row.get("take_profit_suggested"), None)
+        entry_v = _to_float(row.get("entry_price"))
+        sl_v = _to_float(row.get("stop_loss_suggested"))
+        tp_v = _to_float(row.get("take_profit_suggested"))
         if entry_v and sl_v and tp_v and entry_v > sl_v:
-            rr = round((tp_v - entry_v) / (entry_v - sl_v), 2)
-            row["risk_reward_ratio"] = rr
+            row["risk_reward_ratio"] = round((tp_v - entry_v) / (entry_v - sl_v), 2)
 
 
-def _rank_and_project_rows(rows: Sequence[Mapping[str, Any]], keys: Sequence[str], criteria: Mapping[str, Any]) -> List[Dict[str, Any]]:
-    """v4.9.0: adds trade setup computation for every selected row."""
-    criteria_snapshot = _json_compact(criteria)
-    out: List[Dict[str, Any]] = []
+def rank_and_project_rows(
+    rows: Sequence[Mapping[str, Any]],
+    keys: Sequence[str],
+    ctx: CriteriaContext,
+) -> List[Dict[str, Any]]:
+    """Rank rows, compute trade setups, and project to the output schema keys."""
+    criteria_snapshot = _compact_json(ctx.to_dict())
+    result: List[Dict[str, Any]] = []
+
     for idx, raw in enumerate(rows, start=1):
         row = dict(raw)
         if _is_blank(row.get("top10_rank")):
@@ -1783,68 +1480,429 @@ def _rank_and_project_rows(rows: Sequence[Mapping[str, Any]], keys: Sequence[str
         if _is_blank(row.get("rank_overall")):
             row["rank_overall"] = idx
 
-        # Compute trade setup before writing selection_reason (reason includes R/R)
-        _compute_trade_setup(row, criteria)
+        compute_trade_setup(row, ctx)
 
         if _is_blank(row.get("selection_reason")):
-            row["selection_reason"] = _canonical_selection_reason(row, criteria)
+            row["selection_reason"] = generate_selection_reason(row, ctx)
         if _is_blank(row.get("criteria_snapshot")):
             row["criteria_snapshot"] = criteria_snapshot
+
         projected = {k: _json_safe(row.get(k)) for k in keys}
-        out.append(projected)
-    return out
+        result.append(projected)
+
+    return result
 
 
-# =============================================================================
-# Candidate collection
-# =============================================================================
-def _page_priority_symbol_limit(criteria: Mapping[str, Any]) -> int:
-    limit = _safe_int(criteria.get("limit"), 10)
-    return max(min(limit * 3, HYDRATION_SYMBOL_CAP), min(HYDRATION_SYMBOL_CAP, 12))
+# ---------------------------------------------------------------------------
+# Engine Resolution (lazy lock, consolidated retry helper)
+# ---------------------------------------------------------------------------
+
+_ENGINE_CACHE: Optional[Any] = None
+_ENGINE_CACHE_SOURCE: str = ""
+_ENGINE_LOCK: Optional[asyncio.Lock] = None  # v6.0.0: lazy init
+
+_ENGINE_METHOD_NAMES: Tuple[str, ...] = (
+    "get_sheet_rows", "get_page_rows", "sheet_rows", "build_sheet_rows", "execute_sheet_rows",
+    "run_sheet_rows", "build_analysis_sheet_rows", "run_analysis_sheet_rows", "get_rows_for_sheet",
+    "get_rows_for_page", "get_page_data", "get_sheet_data", "build_page_rows", "build_page_data",
+    "get_cached_sheet_snapshot", "get_sheet_snapshot", "get_cached_sheet_rows", "get_page_snapshot",
+    "get_enriched_quotes_batch", "get_analysis_quotes_batch", "get_quotes_batch", "quotes_batch",
+    "get_quotes", "get_quote", "get_quote_dict", "get_enriched_quote",
+)
+
+_ENGINE_HOLDER_ATTRS: Tuple[str, ...] = (
+    "engine", "data_engine", "quote_engine", "cache_engine", "_engine", "_data_engine",
+    "service", "runner", "advisor_engine",
+)
 
 
-def _merge_symbol_row_lists(primary: Sequence[Mapping[str, Any]], secondary: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
-    merged: Dict[str, Dict[str, Any]] = {}
-
-    def _put(raw: Mapping[str, Any]) -> None:
-        row = _normalize_candidate_row(raw)
-        sym = _normalize_symbol(row.get("symbol") or row.get("ticker"))
-        if not sym:
-            return
-        existing = merged.get(sym)
-        if existing is None:
-            merged[sym] = dict(row)
-            return
-        richer, poorer = (row, existing) if _row_richness(row) >= _row_richness(existing) else (existing, row)
-        merged[sym] = _merge_row_prefer_richer(poorer, richer)
-
-    for row in primary:
-        _put(row)
-    for row in secondary:
-        _put(row)
-    return list(merged.values())
+def _get_engine_lock() -> asyncio.Lock:
+    """Lazy-init the engine resolution lock so it binds to the live event loop."""
+    global _ENGINE_LOCK
+    if _ENGINE_LOCK is None:
+        _ENGINE_LOCK = asyncio.Lock()
+    return _ENGINE_LOCK
 
 
-def _merge_row_prefer_richer(base: Mapping[str, Any], update: Mapping[str, Any]) -> Dict[str, Any]:
-    merged = dict(base)
-    for key, value in dict(update).items():
-        if value not in (None, "", [], {}, ()):
-            merged[key] = value
-    return merged
+def _looks_like_engine(obj: Any) -> bool:
+    """Duck-type check: does this object have any of the known engine methods?"""
+    if obj is None:
+        return False
+    if isinstance(obj, (str, bytes, int, float, bool, list, tuple, set)):
+        return False
+    if isinstance(obj, Mapping):
+        return False
+    return any(callable(getattr(obj, m, None)) for m in _ENGINE_METHOD_NAMES)
 
 
-async def _collect_page_rows_with_fallback(engine: Any, page: str, mode: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    meta: Dict[str, Any] = {
-        "page": page,
-        "rows": 0,
-        "snapshot_rows": 0,
-        "used_snapshot": False,
-        "merged_snapshot": False,
-        "timed_out": False,
-        "error": "",
+async def _call_maybe_async(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Call fn, awaiting if coroutine; offload sync calls to a thread."""
+    if inspect.iscoroutinefunction(fn):
+        return await fn(*args, **kwargs)
+    result = await asyncio.to_thread(fn, *args, **kwargs)
+    if inspect.isawaitable(result):
+        return await result
+    return result
+
+
+async def _call_with_timeout(
+    fn: Callable[..., Any],
+    *args: Any,
+    timeout: float,
+    **kwargs: Any,
+) -> Any:
+    """Call fn with a timeout; raises asyncio.TimeoutError on expiry."""
+    return await asyncio.wait_for(_call_maybe_async(fn, *args, **kwargs), timeout=timeout)
+
+
+async def _try_engine_calls(
+    engine: Any,
+    calls: Sequence[Tuple[str, Tuple[Any, ...], Dict[str, Any]]],
+    timeout_sec: float,
+) -> List[Dict[str, Any]]:
+    """
+    Try a sequence of (method_name, args, kwargs) calls against `engine`.
+
+    Returns the first non-empty row list produced by `_extract_rows_from_payload`,
+    or [] if every call failed, timed out, or returned no rows.
+
+    v6.0.0: Replaces three near-identical retry loops in v5.0.0.
+    """
+    for method_name, args, kwargs in calls:
+        fn = getattr(engine, method_name, None)
+        if not callable(fn):
+            continue
+        try:
+            result = await _call_with_timeout(fn, *args, timeout=timeout_sec, **kwargs)
+        except TypeError as exc:
+            if not _is_signature_mismatch(exc):
+                logger.debug("engine.%s raised non-signature TypeError: %s", method_name, exc)
+            continue
+        except asyncio.TimeoutError:
+            logger.debug("engine.%s timed out after %.1fs", method_name, timeout_sec)
+            continue
+        except Exception as exc:
+            logger.debug("engine.%s failed: %s", method_name, exc)
+            continue
+
+        rows = _extract_rows_from_payload(result)
+        if rows:
+            return rows
+    return []
+
+
+async def _resolve_engine_from_modules() -> Tuple[Optional[Any], str]:
+    """Scan known modules looking for an engine instance or factory."""
+    global _ENGINE_CACHE, _ENGINE_CACHE_SOURCE
+
+    if _looks_like_engine(_ENGINE_CACHE):
+        return _ENGINE_CACHE, _ENGINE_CACHE_SOURCE or "engine_cache"
+
+    async with _get_engine_lock():
+        if _looks_like_engine(_ENGINE_CACHE):
+            return _ENGINE_CACHE, _ENGINE_CACHE_SOURCE or "engine_cache"
+
+        module_names = (
+            "main", "app", "core.data_engine_v2", "core.data_engine",
+            "routes.analysis_sheet_rows", "routes.investment_advisor",
+            "routes.advanced_analysis", "routes.enriched_quote", "routes.advisor",
+        )
+
+        candidates: List[Tuple[Any, str]] = []
+        for module_name in module_names:
+            try:
+                mod = importlib.import_module(module_name)
+            except Exception:
+                continue
+            if mod is None:
+                continue
+            if _looks_like_engine(mod):
+                candidates.append((mod, module_name))
+            for fn_name in ("get_engine", "resolve_engine", "load_engine", "build_engine", "create_engine"):
+                fn = getattr(mod, fn_name, None)
+                if callable(fn):
+                    try:
+                        result = await _call_with_timeout(
+                            fn, timeout=min(_CONFIG.engine_call_timeout_sec, 6.0),
+                        )
+                        if _looks_like_engine(result):
+                            candidates.append((result, f"{module_name}.{fn_name}"))
+                    except Exception:
+                        continue
+            for attr in _ENGINE_HOLDER_ATTRS:
+                val = getattr(mod, attr, None)
+                if val is not None and _looks_like_engine(val):
+                    candidates.append((val, f"{module_name}.{attr}"))
+
+        if candidates:
+            _ENGINE_CACHE, _ENGINE_CACHE_SOURCE = candidates[0]
+            return _ENGINE_CACHE, _ENGINE_CACHE_SOURCE
+
+    return None, "engine_unavailable"
+
+
+async def resolve_engine(*args: Any, **kwargs: Any) -> Tuple[Optional[Any], str]:
+    """Resolve a data engine from call args, kwargs, nested bodies, or module scan."""
+    for key in ("engine", "data_engine", "quote_engine", "cache_engine", "service", "runner", "request", "app", "context"):
+        val = kwargs.get(key)
+        if val and _looks_like_engine(val):
+            return val, f"kwarg:{key}"
+
+    for i, arg in enumerate(args):
+        if arg and _looks_like_engine(arg):
+            return arg, f"arg:{i}"
+
+    for key in ("body", "payload", "request_data", "params", "criteria"):
+        val = kwargs.get(key)
+        if isinstance(val, Mapping):
+            for subkey in _ENGINE_HOLDER_ATTRS:
+                subval = val.get(subkey)
+                if subval and _looks_like_engine(subval):
+                    return subval, f"{key}.{subkey}"
+
+    return await _resolve_engine_from_modules()
+
+
+# ---------------------------------------------------------------------------
+# Data Fetching (via consolidated _try_engine_calls)
+# ---------------------------------------------------------------------------
+
+def _extract_rows_from_payload(payload: Any) -> List[Dict[str, Any]]:
+    """Extract a list of row dicts from a variety of payload shapes."""
+    if payload is None:
+        return []
+
+    if isinstance(payload, list):
+        if not payload:
+            return []
+        if all(isinstance(x, dict) for x in payload):
+            return [dict(x) for x in payload]
+        return []
+
+    if isinstance(payload, dict):
+        # Symbol map form: {"AAPL": {...}, "MSFT": {...}}
+        if payload:
+            is_symbol_map = True
+            symbol_rows: List[Dict[str, Any]] = []
+            for key, value in payload.items():
+                if not isinstance(value, dict) or not _looks_like_symbol(key):
+                    is_symbol_map = False
+                    break
+                row = dict(value)
+                if not row.get("symbol"):
+                    row["symbol"] = _normalize_symbol(key)
+                symbol_rows.append(row)
+            if is_symbol_map and symbol_rows:
+                return symbol_rows
+
+        # Common container keys
+        for key in ("row_objects", "rows", "records", "items", "data", "quotes", "results"):
+            value = payload.get(key)
+            if not isinstance(value, list) or not value:
+                continue
+            if isinstance(value[0], dict):
+                return [dict(row) for row in value if isinstance(row, dict)]
+            if isinstance(value[0], (list, tuple)):
+                columns = payload.get("keys") or payload.get("headers") or payload.get("columns") or []
+                if isinstance(columns, list) and columns:
+                    matrix_rows = _rows_from_matrix(value, columns)
+                    if matrix_rows:
+                        return matrix_rows
+
+        if _looks_like_row(payload):
+            return [dict(payload)]
+
+        for key in ("result", "payload", "response", "output", "snapshot", "content", "envelope"):
+            nested = payload.get(key)
+            nested_rows = _extract_rows_from_payload(nested)
+            if nested_rows:
+                return nested_rows
+
+    return []
+
+
+def _rows_from_matrix(matrix: Any, columns: Sequence[str]) -> List[Dict[str, Any]]:
+    """Convert a matrix (list of lists) to list of dicts using the given column order."""
+    if not isinstance(matrix, list) or not matrix or not columns:
+        return []
+    keys = [_to_string(c) for c in columns if _to_string(c)]
+    if not keys:
+        return []
+    result: List[Dict[str, Any]] = []
+    for row in matrix:
+        if not isinstance(row, (list, tuple)):
+            continue
+        vals = list(row)
+        result.append({keys[i]: (vals[i] if i < len(vals) else None) for i in range(len(keys))})
+    return result
+
+
+def _page_fetch_calls(page: str, limit: int, mode: str) -> List[Tuple[str, Tuple[Any, ...], Dict[str, Any]]]:
+    """Build the call sequence for fetching rows from a source page."""
+    body = {
+        "page": page, "page_name": page, "sheet": page, "sheet_name": page,
+        "tab": page, "worksheet": page, "name": page,
+        "limit": limit, "top_n": limit, "mode": mode or "",
+        "include_headers": True, "include_matrix": True,
+        "schema_only": False, "headers_only": False,
     }
+    kwargs_variants: List[Dict[str, Any]] = [
+        {"page": page, "sheet": page, "sheet_name": page, "limit": limit, "mode": mode, "body": body},
+        {"page_name": page, "sheet_name": page, "limit": limit, "mode": mode, "body": body},
+        {"payload": body},
+        {"body": body},
+        {"page": page, "sheet": page, "sheet_name": page, "limit": limit, "mode": mode},
+        {"page_name": page, "sheet_name": page, "limit": limit, "mode": mode},
+        {"page": page, "sheet": page, "limit": limit, "mode": mode},
+        {"page": page, "limit": limit, "mode": mode},
+    ]
+    args_variants: List[Tuple[Tuple[Any, ...], Dict[str, Any]]] = [
+        ((page,), {"limit": limit, "mode": mode}),
+        ((page,), {"limit": limit}),
+        ((page,), {}),
+    ]
+    method_names = (
+        "get_sheet_rows", "get_page_rows", "sheet_rows", "build_sheet_rows",
+        "execute_sheet_rows", "run_sheet_rows", "build_analysis_sheet_rows",
+        "run_analysis_sheet_rows", "get_rows_for_sheet", "get_rows_for_page",
+        "get_page_data", "get_sheet_data", "build_page_rows", "build_page_data",
+    )
+    calls: List[Tuple[str, Tuple[Any, ...], Dict[str, Any]]] = []
+    for method in method_names:
+        for kw in kwargs_variants:
+            calls.append((method, (), kw))
+        for args, kw in args_variants:
+            calls.append((method, args, kw))
+    return calls
+
+
+def _snapshot_fetch_calls(page: str) -> List[Tuple[str, Tuple[Any, ...], Dict[str, Any]]]:
+    """Build the call sequence for fetching a cached page snapshot."""
+    method_names = (
+        "get_cached_sheet_snapshot", "get_sheet_snapshot", "get_cached_sheet_rows",
+        "get_page_snapshot", "get_sheet_cache",
+    )
+    variants = [
+        ((), {"sheet_name": page}),
+        ((), {"sheet": page}),
+        ((), {"page": page}),
+        ((), {"page_name": page}),
+        ((page,), {}),
+    ]
+    return [(m, a, k) for m in method_names for a, k in variants]
+
+
+def _direct_symbol_batch_calls(
+    syms: List[str], mode: str,
+) -> List[Tuple[str, Tuple[Any, ...], Dict[str, Any]]]:
+    """Build the call sequence for batch-fetching direct symbol rows."""
+    method_names = (
+        "get_enriched_quotes_batch", "get_analysis_quotes_batch", "get_quotes_batch", "quotes_batch",
+        "get_quotes", "get_enriched_quote_batch", "get_symbol_quotes", "get_live_quotes",
+    )
+    variants = [
+        ((), {"symbols": syms, "mode": mode, "schema": OUTPUT_PAGE}),
+        ((), {"symbols": syms, "mode": mode}),
+        ((), {"symbols": syms}),
+        ((syms,), {"mode": mode, "schema": OUTPUT_PAGE}),
+        ((syms,), {"mode": mode}),
+        ((syms,), {}),
+        ((), {"tickers": syms, "mode": mode}),
+        ((), {"tickers": syms}),
+    ]
+    return [(m, a, k) for m in method_names for a, k in variants]
+
+
+def _direct_symbol_single_calls(
+    sym: str, mode: str,
+) -> List[Tuple[str, Tuple[Any, ...], Dict[str, Any]]]:
+    """Build the call sequence for per-symbol fallback fetches."""
+    method_names = (
+        "get_enriched_quote", "get_quote", "get_quote_dict", "get_live_quote", "get_symbol_quote",
+    )
+    variants = [
+        ((sym,), {"mode": mode, "schema": OUTPUT_PAGE}),
+        ((sym,), {"mode": mode}),
+        ((sym,), {}),
+        ((), {"symbol": sym, "mode": mode}),
+        ((), {"symbol": sym}),
+        ((), {"ticker": sym, "mode": mode}),
+    ]
+    return [(m, a, k) for m in method_names for a, k in variants]
+
+
+async def fetch_page_rows(engine: Any, page: str, limit: int, mode: str) -> List[Dict[str, Any]]:
+    """Fetch rows from a source page, trying many method/kwarg combinations."""
+    if engine is None:
+        return []
+    return await _try_engine_calls(
+        engine,
+        _page_fetch_calls(page, limit, mode),
+        timeout_sec=min(_CONFIG.engine_call_timeout_sec, 8.0),
+    )
+
+
+async def fetch_page_snapshot(engine: Any, page: str) -> List[Dict[str, Any]]:
+    """Fetch cached snapshot of a page."""
+    if engine is None:
+        return []
+    return await _try_engine_calls(
+        engine,
+        _snapshot_fetch_calls(page),
+        timeout_sec=min(_CONFIG.engine_call_timeout_sec, 6.0),
+    )
+
+
+async def fetch_direct_symbol_rows(engine: Any, symbols: List[str], mode: str) -> List[Dict[str, Any]]:
+    """Fetch rows directly by symbols (batch, then per-symbol fallback)."""
+    if engine is None or not symbols:
+        return []
+    syms = [_normalize_symbol(s) for s in symbols if _normalize_symbol(s)]
+    if not syms:
+        return []
+
+    rows = await _try_engine_calls(
+        engine,
+        _direct_symbol_batch_calls(syms, mode),
+        timeout_sec=min(_CONFIG.engine_call_timeout_sec, 7.0),
+    )
+    if rows:
+        return rows
+
+    # Per-symbol fallback
+    result_rows: List[Dict[str, Any]] = []
+    for sym in syms[:_CONFIG.hydration_symbol_cap]:
+        single_rows = await _try_engine_calls(
+            engine,
+            _direct_symbol_single_calls(sym, mode),
+            timeout_sec=min(_CONFIG.engine_call_timeout_sec, 5.0),
+        )
+        if single_rows:
+            result_rows.extend(single_rows)
+    return result_rows
+
+
+# ---------------------------------------------------------------------------
+# Collection Pipeline
+# ---------------------------------------------------------------------------
+
+async def collect_page_rows_with_fallback(
+    engine: Any,
+    page: str,
+    mode: str,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Collect rows from a page, falling back to the cached snapshot if needed."""
+    meta: Dict[str, Any] = {
+        "page": page, "rows": 0, "snapshot_rows": 0,
+        "used_snapshot": False, "merged_snapshot": False,
+        "timed_out": False, "error": "",
+    }
+
     try:
-        rows = await asyncio.wait_for(_fetch_page_rows(engine, page, SOURCE_PAGE_LIMIT, mode), timeout=PAGE_TOTAL_TIMEOUT_SEC)
+        rows = await asyncio.wait_for(
+            fetch_page_rows(engine, page, _CONFIG.source_page_limit, mode),
+            timeout=_CONFIG.page_total_timeout_sec,
+        )
         meta["rows"] = len(rows)
     except asyncio.TimeoutError:
         rows = []
@@ -1854,20 +1912,26 @@ async def _collect_page_rows_with_fallback(engine: Any, page: str, mode: str) ->
         rows = []
         meta["error"] = f"page_rows_failed:{type(exc).__name__}"
 
-    should_try_snapshot_merge = bool(rows) and (len(rows) < 5 or max((_row_richness(r) for r in rows), default=0) < 10)
-    if rows and not should_try_snapshot_merge:
+    should_try_snapshot = bool(rows) and (
+        len(rows) < 5
+        or max((_count_nonblank_fields(r) for r in rows), default=0) < 10
+    )
+    if rows and not should_try_snapshot:
         return rows, meta
 
     try:
-        snap_rows = await asyncio.wait_for(_fetch_page_snapshot_rows(engine, page), timeout=min(PAGE_TOTAL_TIMEOUT_SEC, 8.0))
-        meta["snapshot_rows"] = len(snap_rows)
-        meta["used_snapshot"] = bool(snap_rows)
-        if rows and snap_rows:
-            merged_rows = _merge_symbol_row_lists(rows, snap_rows)
+        snapshot = await asyncio.wait_for(
+            fetch_page_snapshot(engine, page),
+            timeout=min(_CONFIG.page_total_timeout_sec, 8.0),
+        )
+        meta["snapshot_rows"] = len(snapshot)
+        meta["used_snapshot"] = bool(snapshot)
+        if rows and snapshot:
+            merged = merge_symbol_rows(rows, snapshot)
             meta["merged_snapshot"] = True
-            return merged_rows, meta
-        if snap_rows:
-            return snap_rows, meta
+            return merged, meta
+        if snapshot:
+            return snapshot, meta
         return rows, meta
     except asyncio.TimeoutError:
         if not meta["error"]:
@@ -1879,37 +1943,46 @@ async def _collect_page_rows_with_fallback(engine: Any, page: str, mode: str) ->
         return rows if rows else [], meta
 
 
-async def _hydrate_page_rows(engine: Any, rows: List[Dict[str, Any]], mode: str, criteria: Mapping[str, Any]) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+async def hydrate_page_rows(
+    engine: Any,
+    rows: List[Dict[str, Any]],
+    mode: str,
+    ctx: CriteriaContext,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Hydrate the top-scoring rows with enriched data via direct-symbol fetch."""
     meta: Dict[str, Any] = {
-        "requested_symbols": 0,
-        "enriched_rows": 0,
-        "hydration_used": False,
-        "hydration_error": "",
+        "requested_symbols": 0, "enriched_rows": 0,
+        "hydration_used": False, "hydration_error": "",
     }
     if not rows:
         return rows, meta
 
-    ranked_candidates: List[Tuple[float, Dict[str, Any]]] = []
+    # Score rows to prioritize which to hydrate first
+    scored: List[Tuple[float, Dict[str, Any]]] = []
     for row in rows:
-        normalized = _normalize_candidate_row(row)
+        normalized = normalize_candidate_row(row)
         sym = _normalize_symbol(normalized.get("symbol") or normalized.get("ticker"))
         if not sym:
             continue
-        ranked_candidates.append((_selector_score(normalized, criteria), normalized))
+        scored.append((compute_selector_score(normalized, ctx), normalized))
+    scored.sort(key=lambda x: (x[0], _count_nonblank_fields(x[1])), reverse=True)
 
-    ranked_candidates.sort(key=lambda x: (x[0], _row_richness(x[1])), reverse=True)
     symbols = _dedupe_keep_order(
-        _normalize_symbol(item[1].get("symbol") or item[1].get("ticker")) for item in ranked_candidates
-    )[: _page_priority_symbol_limit(criteria)]
+        _normalize_symbol(item[1].get("symbol") or item[1].get("ticker"))
+        for item in scored
+    )[:_CONFIG.hydration_symbol_cap]
 
     meta["requested_symbols"] = len(symbols)
     if not symbols:
         return rows, meta
 
     try:
-        enriched_rows = await asyncio.wait_for(_fetch_direct_symbol_rows(engine, symbols, mode), timeout=min(PAGE_TOTAL_TIMEOUT_SEC, 10.0))
-        meta["enriched_rows"] = len(enriched_rows)
-        meta["hydration_used"] = bool(enriched_rows)
+        enriched = await asyncio.wait_for(
+            fetch_direct_symbol_rows(engine, symbols, mode),
+            timeout=min(_CONFIG.page_total_timeout_sec, 10.0),
+        )
+        meta["enriched_rows"] = len(enriched)
+        meta["hydration_used"] = bool(enriched)
     except asyncio.TimeoutError:
         meta["hydration_error"] = "hydration_timeout"
         return rows, meta
@@ -1917,37 +1990,38 @@ async def _hydrate_page_rows(engine: Any, rows: List[Dict[str, Any]], mode: str,
         meta["hydration_error"] = f"hydration_failed:{type(exc).__name__}"
         return rows, meta
 
-    if not enriched_rows:
+    if not enriched:
         return rows, meta
 
     row_map: Dict[str, Dict[str, Any]] = {}
     for row in rows:
-        normalized = _normalize_candidate_row(row)
+        normalized = normalize_candidate_row(row)
         sym = _normalize_symbol(normalized.get("symbol") or normalized.get("ticker"))
         if sym:
             row_map[sym] = normalized
 
-    for er in enriched_rows:
-        normalized = _normalize_candidate_row(er)
+    for er in enriched:
+        normalized = normalize_candidate_row(er)
         sym = _normalize_symbol(normalized.get("symbol") or normalized.get("ticker"))
         if not sym:
             continue
-        if sym in row_map:
-            row_map[sym] = _merge_row_prefer_richer(row_map[sym], normalized)
-        else:
-            row_map[sym] = normalized
+        row_map[sym] = merge_rows(row_map[sym], normalized) if sym in row_map else normalized
 
     return list(row_map.values()), meta
 
 
-async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    direct_symbols = [_normalize_symbol(s) for s in _normalize_list(criteria.get("direct_symbols")) if _normalize_symbol(s)]
-    emergency_symbols = _normalize_list(criteria.get("emergency_symbols"))
-    pages = _safe_source_pages(_normalize_list(criteria.get("pages_selected")))
+async def collect_candidate_rows(
+    engine: Any,
+    ctx: CriteriaContext,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Collect candidate rows from direct symbols, source pages, and fallbacks."""
+    direct_symbols = ctx.direct_symbols
+    emergency_symbols = ctx.emergency_symbols
+    pages = ctx.pages_selected
+
     direct_symbol_index_map = {sym: idx for idx, sym in enumerate(direct_symbols)}
 
     meta: Dict[str, Any] = {
-        "engine_source": _ENGINE_CACHE_SOURCE or "",
         "source_pages": pages,
         "direct_symbols_count": len(direct_symbols),
         "direct_symbols_requested": list(direct_symbols),
@@ -1962,117 +2036,138 @@ async def _collect_candidate_rows(engine: Any, criteria: Mapping[str, Any], mode
 
     candidates: Dict[str, Dict[str, Any]] = {}
 
-    def _put_row(raw: Mapping[str, Any], source_page: str = "") -> None:
-        row = _normalize_candidate_row(raw)
-        sym = _normalize_symbol(row.get("symbol") or row.get("ticker"))
+    def add_candidate(row: Mapping[str, Any], source_page: str = "") -> None:
+        normalized = normalize_candidate_row(row)
+        sym = _normalize_symbol(normalized.get("symbol") or normalized.get("ticker"))
         if not sym:
             return
-        if source_page and _is_blank(row.get("source_page")):
-            row["source_page"] = source_page
+        if source_page and _is_blank(normalized.get("source_page")):
+            normalized["source_page"] = source_page
         if sym in direct_symbol_index_map:
-            row["_direct_symbol_priority"] = True
-            row["_direct_symbol_index"] = direct_symbol_index_map[sym]
-            if _is_blank(row.get("source_page")):
-                row["source_page"] = "Direct"
+            normalized["_direct_symbol_priority"] = True
+            normalized["_direct_symbol_index"] = direct_symbol_index_map[sym]
+            if _is_blank(normalized.get("source_page")):
+                normalized["source_page"] = "Direct"
+
         existing = candidates.get(sym)
         if existing is None:
-            candidates[sym] = row
+            candidates[sym] = normalized
             return
-        richer, poorer = (row, existing) if _row_richness(row) >= _row_richness(existing) else (existing, row)
-        candidates[sym] = _merge_row_prefer_richer(poorer, richer)
+        if _count_nonblank_fields(normalized) >= _count_nonblank_fields(existing):
+            candidates[sym] = merge_rows(existing, normalized)
+        else:
+            candidates[sym] = merge_rows(normalized, existing)
 
+    # Direct symbols first
     if direct_symbols:
         try:
-            direct_rows = await asyncio.wait_for(_fetch_direct_symbol_rows(engine, direct_symbols[:HYDRATION_SYMBOL_CAP], mode), timeout=min(BUILDER_TOTAL_TIMEOUT_SEC / 2.0, 12.0))
+            direct_rows = await asyncio.wait_for(
+                fetch_direct_symbol_rows(
+                    engine, direct_symbols[:_CONFIG.hydration_symbol_cap], ctx.mode,
+                ),
+                timeout=min(_CONFIG.builder_total_timeout_sec / 2.0, 12.0),
+            )
             meta["direct_symbol_rows"] = len(direct_rows)
             meta["partial_success"] = meta["partial_success"] or bool(direct_rows)
             for row in direct_rows:
-                _put_row(row, "")
+                add_candidate(row, "")
         except asyncio.TimeoutError:
             meta["direct_symbol_error"] = "direct_symbol_timeout"
         except Exception as exc:
             meta["direct_symbol_error"] = f"direct_symbol_failed:{type(exc).__name__}"
 
-    early_stop_target = max(10, _safe_int(criteria.get("limit"), 10) * EARLY_STOP_MULTIPLIER)
+    early_stop_target = max(10, ctx.limit * _CONFIG.early_stop_multiplier)
 
     for page in pages:
-        page_rows, page_meta = await _collect_page_rows_with_fallback(engine, page, mode)
+        page_rows, page_meta = await collect_page_rows_with_fallback(engine, page, ctx.mode)
         meta["source_page_rows"][page] = page_meta.get("rows", 0)
         meta["snapshot_rows"][page] = page_meta.get("snapshot_rows", 0)
 
         hydrated_rows = page_rows
         hydration_meta: Dict[str, Any] = {"page": page}
         if page_rows:
-            hydrated_rows, hydration_meta = await _hydrate_page_rows(engine, page_rows, mode, criteria)
+            hydrated_rows, hydration_meta = await hydrate_page_rows(engine, page_rows, ctx.mode, ctx)
             hydration_meta["page"] = page
 
         meta["page_diagnostics"].append(_json_safe(page_meta))
         meta["hydration_diagnostics"].append(_json_safe(hydration_meta))
         if hydrated_rows:
             meta["partial_success"] = True
-
         for row in hydrated_rows:
-            _put_row(row, page)
+            add_candidate(row, page)
 
+        # Early stop, but never skip My_Portfolio (portfolio positions always included)
         if len(candidates) >= early_stop_target and page != "My_Portfolio":
             meta["early_stop"] = True
             meta["early_stop_after_page"] = page
             break
 
+    # Emergency fallback
     if not candidates and emergency_symbols:
         try:
             emergency_rows = await asyncio.wait_for(
-                _fetch_direct_symbol_rows(engine, emergency_symbols[:HYDRATION_SYMBOL_CAP], mode),
-                timeout=min(BUILDER_TOTAL_TIMEOUT_SEC / 2.0, 12.0),
+                fetch_direct_symbol_rows(
+                    engine, emergency_symbols[:_CONFIG.hydration_symbol_cap], ctx.mode,
+                ),
+                timeout=min(_CONFIG.builder_total_timeout_sec / 2.0, 12.0),
             )
             meta["used_emergency_symbols"] = bool(emergency_rows)
             meta["emergency_symbol_rows"] = len(emergency_rows)
             for row in emergency_rows:
-                _put_row(row, "Emergency")
+                add_candidate(row, "Emergency")
         except Exception as exc:
             meta["emergency_symbol_error"] = f"emergency_symbol_failed:{type(exc).__name__}"
 
-    fallback_target = max(1, _safe_int(criteria.get("limit"), 10))
-    if len(candidates) < fallback_target:
+    # Top10 output-page fallback (read yesterday's Top10 if we still have nothing)
+    if len(candidates) < max(1, ctx.limit):
+        fallback_rows: List[Dict[str, Any]] = []
         try:
             fallback_rows = await asyncio.wait_for(
-                _fetch_page_rows(engine, OUTPUT_PAGE, max(30, fallback_target * 2), mode),
-                timeout=min(PAGE_TOTAL_TIMEOUT_SEC, 10.0),
+                fetch_page_rows(engine, OUTPUT_PAGE, max(30, ctx.limit * 2), ctx.mode),
+                timeout=min(_CONFIG.page_total_timeout_sec, 10.0),
             )
             meta["top10_output_fallback_rows"] = len(fallback_rows)
         except asyncio.TimeoutError:
-            fallback_rows = []
             meta["top10_output_fallback_error"] = "top10_output_timeout"
         except Exception as exc:
-            fallback_rows = []
             meta["top10_output_fallback_error"] = f"top10_output_failed:{type(exc).__name__}"
 
         if not fallback_rows:
             try:
-                fallback_rows = await asyncio.wait_for(_fetch_page_snapshot_rows(engine, OUTPUT_PAGE), timeout=min(PAGE_TOTAL_TIMEOUT_SEC, 8.0))
+                fallback_rows = await asyncio.wait_for(
+                    fetch_page_snapshot(engine, OUTPUT_PAGE),
+                    timeout=min(_CONFIG.page_total_timeout_sec, 8.0),
+                )
                 meta["top10_output_snapshot_rows"] = len(fallback_rows)
             except asyncio.TimeoutError:
-                fallback_rows = []
                 meta["top10_output_snapshot_error"] = "top10_output_snapshot_timeout"
             except Exception as exc:
-                fallback_rows = []
                 meta["top10_output_snapshot_error"] = f"top10_output_snapshot_failed:{type(exc).__name__}"
 
         if fallback_rows:
             meta["top10_output_fallback_used"] = True
-        for row in fallback_rows:
-            _put_row(row, OUTPUT_PAGE)
+            for row in fallback_rows:
+                add_candidate(row, OUTPUT_PAGE)
 
     meta["deduped_candidate_count"] = len(candidates)
     return list(candidates.values()), meta
 
 
-# =============================================================================
-# Payload builder
-# =============================================================================
-def _build_payload(*, status: str, headers: List[str], keys: List[str], rows: List[Dict[str, Any]], meta: Dict[str, Any]) -> Dict[str, Any]:
-    include_headers = _coerce_bool(meta.get("include_headers", True), True)
-    include_matrix = _coerce_bool(meta.get("include_matrix", True), True)
+# ---------------------------------------------------------------------------
+# Payload Builder
+# ---------------------------------------------------------------------------
+
+def build_payload(
+    status: str,
+    headers: List[str],
+    keys: List[str],
+    rows: List[Dict[str, Any]],
+    meta: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Build the final payload for the Top10 output."""
+    include_headers = _to_bool(meta.get("include_headers", True), True)
+    include_matrix = _to_bool(meta.get("include_matrix", True), True)
+
     payload = {
         "status": status,
         "page": OUTPUT_PAGE,
@@ -2100,176 +2195,181 @@ def _build_payload(*, status: str, headers: List[str], keys: List[str], rows: Li
     return _json_safe(payload)
 
 
-# =============================================================================
-# Core async implementation
-# =============================================================================
-async def _build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
-    async def _inner() -> Dict[str, Any]:
-        started = time.perf_counter()
-        headers, keys = _load_schema_defaults()
-        criteria = _collect_criteria_from_inputs(*args, **kwargs)
-        mode = _s(kwargs.get("mode") or criteria.get("mode") or "")
-        limit = max(1, _safe_int(criteria.get("limit") or kwargs.get("limit"), 10))
+# ---------------------------------------------------------------------------
+# Core Async Implementation
+# ---------------------------------------------------------------------------
 
-        if criteria.get("schema_only") or criteria.get("headers_only"):
-            return _build_payload(
-                status="success",
-                headers=headers,
-                keys=keys,
-                rows=[],
-                meta={
-                    "build_status": "OK",
-                    "dispatch": "top10_selector",
-                    "selector_version": TOP10_SELECTOR_VERSION,
-                    "schema_only": bool(criteria.get("schema_only")),
-                    "headers_only": bool(criteria.get("headers_only")),
-                    "criteria_used": _json_safe(criteria),
-                    "include_headers": criteria.get("include_headers", True),
-                    "include_matrix": criteria.get("include_matrix", True),
-                    "duration_ms": round((time.perf_counter() - started) * 1000.0, 3),
-                },
-            )
+async def build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
+    """
+    Core async implementation of Top10 selector.
 
-        engine, engine_source = await _resolve_engine(*args, **kwargs)
-        if engine is None:
-            return _build_payload(
-                status="warn",
-                headers=headers,
-                keys=keys,
-                rows=[],
-                meta={
-                    "build_status": "DEGRADED",
-                    "dispatch": "top10_selector",
-                    "selector_version": TOP10_SELECTOR_VERSION,
-                    "warning": "engine_unavailable",
-                    "criteria_used": _json_safe(criteria),
-                    "include_headers": criteria.get("include_headers", True),
-                    "include_matrix": criteria.get("include_matrix", True),
-                    "engine_source": engine_source,
-                    "duration_ms": round((time.perf_counter() - started) * 1000.0, 3),
-                },
-            )
+    Call directly from async code when you want a clean `Awaitable[dict]`
+    contract (no polymorphic return). The sync-tolerant `build_top10_rows`
+    wraps this and handles event-loop detection.
+    """
+    start_time = time.perf_counter()
+    headers, keys = _load_schema_defaults()
+    ctx = CriteriaContext.from_inputs(*args, **kwargs)
 
-        try:
-            candidates, collect_meta = await _collect_candidate_rows(engine, criteria, mode)
-        except Exception as exc:
-            logger.warning("Top10 candidate collection failed: %s", exc, exc_info=True)
-            return _build_payload(
-                status="warn",
-                headers=headers,
-                keys=keys,
-                rows=[],
-                meta={
-                    "build_status": "DEGRADED",
-                    "dispatch": "top10_selector",
-                    "selector_version": TOP10_SELECTOR_VERSION,
-                    "warning": f"candidate_collection_failed:{type(exc).__name__}",
-                    "criteria_used": _json_safe(criteria),
-                    "include_headers": criteria.get("include_headers", True),
-                    "include_matrix": criteria.get("include_matrix", True),
-                    "engine_source": engine_source,
-                    "duration_ms": round((time.perf_counter() - started) * 1000.0, 3),
-                },
-            )
-
-        normalized_candidates = [_normalize_candidate_row(r) for r in candidates]
-        filtered = [r for r in normalized_candidates if _passes_filters(r, criteria)]
-        filter_relaxed = False
-        selected_pool = filtered
-        if not selected_pool and normalized_candidates:
-            selected_pool = list(normalized_candidates)
-            filter_relaxed = True
-
-        horizon_days = _safe_int(criteria.get("horizon_days") or criteria.get("invest_period_days"), 90)
-        scored: List[Tuple[float, Dict[str, Any]]] = []
-        for row in selected_pool:
-            scored.append((_selector_score(row, criteria), dict(row)))
-
-        scored.sort(
-            key=lambda x: (
-                x[0],
-                _choose_horizon_roi(x[1], horizon_days) or 0.0,
-                _safe_float(x[1].get("opportunity_score"), 0.0) or 0.0,
-                _safe_float(x[1].get("overall_score"), 0.0) or 0.0,
-                _safe_float(x[1].get("forecast_confidence"), 0.0) or 0.0,
-                -(_safe_float(x[1].get("risk_score"), 999.0) or 999.0),
-                _safe_float(x[1].get("liquidity_score"), 0.0) or 0.0,
-                _row_richness(x[1]),
-            ),
-            reverse=True,
+    # Schema-only short-circuit
+    if ctx.schema_only or ctx.headers_only:
+        return build_payload(
+            status="success", headers=headers, keys=keys, rows=[],
+            meta={
+                "build_status": "OK",
+                "dispatch": "top10_selector",
+                "selector_version": TOP10_SELECTOR_VERSION,
+                "schema_only": ctx.schema_only,
+                "headers_only": ctx.headers_only,
+                "criteria_used": _json_safe(ctx.to_dict()),
+                "include_headers": ctx.include_headers,
+                "include_matrix": ctx.include_matrix,
+                "duration_ms": round((time.perf_counter() - start_time) * 1000.0, 3),
+            },
         )
 
-        top_rows = [row for _, row in scored[:limit]]
-
-        if len(top_rows) < limit:
-            seen_symbols = {_normalize_symbol(r.get("symbol") or r.get("ticker")) for r in top_rows if _normalize_symbol(r.get("symbol") or r.get("ticker"))}
-            direct_rows = [row for _, row in scored if _direct_symbol_order_index(row, criteria) is not None]
-            direct_rows.sort(key=lambda row: _direct_symbol_order_index(row, criteria) if _direct_symbol_order_index(row, criteria) is not None else 999999)
-            for row in direct_rows:
-                sym = _normalize_symbol(row.get("symbol") or row.get("ticker"))
-                if not sym or sym in seen_symbols:
-                    continue
-                top_rows.append(row)
-                seen_symbols.add(sym)
-                if len(top_rows) >= limit:
-                    break
-
-        projected_rows = _rank_and_project_rows(top_rows[:limit], keys, criteria)
-
-        status = "success" if projected_rows else "warn"
-        meta = {
-            "build_status": "OK" if projected_rows else "WARN",
-            "dispatch": "top10_selector",
-            "selector_version": TOP10_SELECTOR_VERSION,
-            "criteria_used": _json_safe(criteria),
-            "candidate_count": len(normalized_candidates),
-            "filtered_count": len(filtered),
-            "selected_count": len(projected_rows),
-            "filter_relaxed": filter_relaxed,
-            "selected_symbols": [_s(r.get("symbol")) for r in projected_rows if _s(r.get("symbol"))],
-            "selected_direct_symbols": [
-                _s(r.get("symbol"))
-                for r in projected_rows
-                if _direct_symbol_order_index(r, criteria) is not None and _s(r.get("symbol"))
-            ],
-            "include_headers": criteria.get("include_headers", True),
-            "include_matrix": criteria.get("include_matrix", True),
-            "engine_source": engine_source,
-            "duration_ms": round((time.perf_counter() - started) * 1000.0, 3),
-            **collect_meta,
-        }
-        if not projected_rows:
-            meta["warning"] = "no_top10_rows_after_filtering"
-
-        return _build_payload(status=status, headers=headers, keys=keys, rows=projected_rows, meta=meta)
-
-    try:
-        return await asyncio.wait_for(_inner(), timeout=BUILDER_TOTAL_TIMEOUT_SEC)
-    except asyncio.TimeoutError:
-        headers, keys = _load_schema_defaults()
-        criteria = _collect_criteria_from_inputs(*args, **kwargs)
-        return _build_payload(
-            status="warn",
-            headers=headers,
-            keys=keys,
-            rows=[],
+    # Engine resolution
+    engine, engine_source = await resolve_engine(*args, **kwargs)
+    if engine is None:
+        return build_payload(
+            status="warn", headers=headers, keys=keys, rows=[],
             meta={
                 "build_status": "DEGRADED",
                 "dispatch": "top10_selector",
                 "selector_version": TOP10_SELECTOR_VERSION,
-                "warning": "builder_total_timeout",
-                "criteria_used": _json_safe(criteria),
-                "include_headers": criteria.get("include_headers", True),
-                "include_matrix": criteria.get("include_matrix", True),
+                "warning": "engine_unavailable",
+                "criteria_used": _json_safe(ctx.to_dict()),
+                "include_headers": ctx.include_headers,
+                "include_matrix": ctx.include_matrix,
+                "engine_source": engine_source,
+                "duration_ms": round((time.perf_counter() - start_time) * 1000.0, 3),
             },
         )
 
+    # Candidate collection
+    try:
+        candidates, collect_meta = await collect_candidate_rows(engine, ctx)
+    except Exception as exc:
+        logger.warning("Top10 candidate collection failed: %s", exc, exc_info=True)
+        return build_payload(
+            status="warn", headers=headers, keys=keys, rows=[],
+            meta={
+                "build_status": "DEGRADED",
+                "dispatch": "top10_selector",
+                "selector_version": TOP10_SELECTOR_VERSION,
+                "warning": f"candidate_collection_failed:{type(exc).__name__}",
+                "criteria_used": _json_safe(ctx.to_dict()),
+                "include_headers": ctx.include_headers,
+                "include_matrix": ctx.include_matrix,
+                "engine_source": engine_source,
+                "duration_ms": round((time.perf_counter() - start_time) * 1000.0, 3),
+            },
+        )
 
-# =============================================================================
-# Public API (sync+async tolerant)
-# =============================================================================
+    # Normalize, filter, score
+    normalized = [normalize_candidate_row(r) for r in candidates]
+    filtered = [r for r in normalized if passes_filters(r, ctx)]
+    filter_relaxed = False
+    selected_pool = filtered
+    if not selected_pool and normalized:
+        selected_pool = list(normalized)
+        filter_relaxed = True
+
+    scored: List[Tuple[float, Dict[str, Any]]] = [
+        (compute_selector_score(row, ctx), dict(row)) for row in selected_pool
+    ]
+    scored.sort(
+        key=lambda x: (
+            x[0],
+            choose_horizon_roi(x[1], ctx.horizon_days) or 0.0,
+            _to_float(x[1].get("opportunity_score"), 0.0) or 0.0,
+            _to_float(x[1].get("overall_score"), 0.0) or 0.0,
+            _to_float(x[1].get("forecast_confidence"), 0.0) or 0.0,
+            -(_to_float(x[1].get("risk_score"), 999.0) or 999.0),
+            _to_float(x[1].get("liquidity_score"), 0.0) or 0.0,
+            _count_nonblank_fields(x[1]),
+        ),
+        reverse=True,
+    )
+
+    top_rows = [row for _, row in scored[:ctx.limit]]
+
+    # Top up with direct symbols if still under limit
+    if len(top_rows) < ctx.limit:
+        seen_symbols = {
+            _normalize_symbol(r.get("symbol") or r.get("ticker"))
+            for r in top_rows
+            if _normalize_symbol(r.get("symbol") or r.get("ticker"))
+        }
+        direct_rows = [row for _, row in scored if direct_symbol_order_index(row, ctx) is not None]
+        direct_rows.sort(key=lambda row: direct_symbol_order_index(row, ctx) or 999999)
+        for row in direct_rows:
+            sym = _normalize_symbol(row.get("symbol") or row.get("ticker"))
+            if not sym or sym in seen_symbols:
+                continue
+            top_rows.append(row)
+            seen_symbols.add(sym)
+            if len(top_rows) >= ctx.limit:
+                break
+
+    projected_rows = rank_and_project_rows(top_rows[:ctx.limit], keys, ctx)
+
+    status = "success" if projected_rows else "warn"
+    meta = {
+        "build_status": "OK" if projected_rows else "WARN",
+        "dispatch": "top10_selector",
+        "selector_version": TOP10_SELECTOR_VERSION,
+        "criteria_used": _json_safe(ctx.to_dict()),
+        "candidate_count": len(normalized),
+        "filtered_count": len(filtered),
+        "selected_count": len(projected_rows),
+        "filter_relaxed": filter_relaxed,
+        "selected_symbols": [
+            _to_string(r.get("symbol")) for r in projected_rows if _to_string(r.get("symbol"))
+        ],
+        "selected_direct_symbols": [
+            _to_string(r.get("symbol"))
+            for r in projected_rows
+            if direct_symbol_order_index(r, ctx) is not None and _to_string(r.get("symbol"))
+        ],
+        "include_headers": ctx.include_headers,
+        "include_matrix": ctx.include_matrix,
+        "engine_source": engine_source,
+        "duration_ms": round((time.perf_counter() - start_time) * 1000.0, 3),
+        **collect_meta,
+    }
+    if not projected_rows:
+        meta["warning"] = "no_top10_rows_after_filtering"
+
+    return build_payload(status=status, headers=headers, keys=keys, rows=projected_rows, meta=meta)
+
+
+# ---------------------------------------------------------------------------
+# Public API (sync-tolerant wrapper; polymorphic return for back-compat)
+# ---------------------------------------------------------------------------
+
 def build_top10_rows(*args: Any, **kwargs: Any) -> Any:
-    coro = _build_top10_rows_async(*args, **kwargs)
+    """
+    Build Top 10 Investments rows.
+
+    Sync/async tolerant by design:
+      - Called from sync code -> runs `asyncio.run(...)` and returns a dict.
+      - Called from async code -> returns an awaitable (coroutine) that must
+        be awaited.
+
+    WARNING: the return type varies with caller context. When calling from
+    async code, use `await build_top10_rows(...)`. If you want a clean
+    always-awaitable contract, call `build_top10_rows_async(...)` directly.
+
+    Examples:
+        # Sync
+        result = build_top10_rows(engine=my_engine, limit=10)
+
+        # Async -- both work
+        result = await build_top10_rows(engine=my_engine, limit=10)
+        result = await build_top10_rows_async(engine=my_engine, limit=10)
+    """
+    coro = build_top10_rows_async(*args, **kwargs)
     try:
         asyncio.get_running_loop()
         return coro
@@ -2277,55 +2377,24 @@ def build_top10_rows(*args: Any, **kwargs: Any) -> Any:
         return asyncio.run(coro)
 
 
-def build_top10_output_rows(*args: Any, **kwargs: Any) -> Any:
-    return build_top10_rows(*args, **kwargs)
-
-
-def build_top10_investments_rows(*args: Any, **kwargs: Any) -> Any:
-    return build_top10_rows(*args, **kwargs)
-
-
-def build_top_10_investments_rows(*args: Any, **kwargs: Any) -> Any:
-    return build_top10_rows(*args, **kwargs)
-
-
-def build_top10(*args: Any, **kwargs: Any) -> Any:
-    return build_top10_rows(*args, **kwargs)
-
-
-def build_top10_investments(*args: Any, **kwargs: Any) -> Any:
-    return build_top10_rows(*args, **kwargs)
-
-
-def build_top10_output(*args: Any, **kwargs: Any) -> Any:
-    return build_top10_rows(*args, **kwargs)
-
-
-def build_top10_payload(*args: Any, **kwargs: Any) -> Any:
-    return build_top10_rows(*args, **kwargs)
-
-
-def get_top10_rows(*args: Any, **kwargs: Any) -> Any:
-    return build_top10_rows(*args, **kwargs)
-
-
-def select_top10(*args: Any, **kwargs: Any) -> Any:
-    return build_top10_rows(*args, **kwargs)
-
-
 def select_top10_symbols(*args: Any, **kwargs: Any) -> Any:
+    """
+    Extract just the selected symbols from a Top10 build.
+
+    Sync/async tolerant (same contract as build_top10_rows).
+    """
     async def _inner() -> List[str]:
-        payload = await _build_top10_rows_async(*args, **kwargs)
+        payload = await build_top10_rows_async(*args, **kwargs)
         rows = payload.get("rows") if isinstance(payload, dict) else []
         if not isinstance(rows, list):
             return []
-        out: List[str] = []
+        result: List[str] = []
         for row in rows:
             if isinstance(row, dict):
                 sym = _normalize_symbol(row.get("symbol") or row.get("ticker"))
                 if sym:
-                    out.append(sym)
-        return _dedupe_keep_order(out)
+                    result.append(sym)
+        return _dedupe_keep_order(result)
 
     try:
         asyncio.get_running_loop()
@@ -2334,9 +2403,29 @@ def select_top10_symbols(*args: Any, **kwargs: Any) -> Any:
         return asyncio.run(_inner())
 
 
+# ---------------------------------------------------------------------------
+# Convenience Aliases (preserved from v5.0.0 for backward compatibility)
+# ---------------------------------------------------------------------------
+
+build_top10_output_rows = build_top10_rows
+build_top10_investments_rows = build_top10_rows
+build_top_10_investments_rows = build_top10_rows
+build_top10 = build_top10_rows
+build_top10_investments = build_top10_rows
+build_top10_output = build_top10_rows
+build_top10_payload = build_top10_rows
+get_top10_rows = build_top10_rows
+select_top10 = build_top10_rows
+
+
+# ---------------------------------------------------------------------------
+# Module Exports
+# ---------------------------------------------------------------------------
+
 __all__ = [
     "TOP10_SELECTOR_VERSION",
     "build_top10_rows",
+    "build_top10_rows_async",              # new in v6.0.0: always-async contract
     "build_top10_output_rows",
     "build_top10_investments_rows",
     "build_top_10_investments_rows",
@@ -2347,4 +2436,15 @@ __all__ = [
     "get_top10_rows",
     "select_top10",
     "select_top10_symbols",
+    # Public helpers used by insights_builder and tests
+    "CriteriaContext",
+    "Top10Config",
+    "normalize_candidate_row",
+    "merge_rows",
+    "merge_symbol_rows",
+    "choose_horizon_roi",
+    "compute_selector_score",
+    "compute_trade_setup",
+    "passes_filters",
+    "resolve_engine",
 ]
