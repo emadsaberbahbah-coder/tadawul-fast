@@ -1,50 +1,54 @@
 #!/usr/bin/env python3
-# core/providers/finnhub_provider.py
 """
+core/providers/finnhub_provider.py
 ================================================================================
-Finnhub Provider -- v4.3.0 (SCHEMA-ALIGNED / BATCH-CAPABLE)
+Finnhub Provider -- v6.0.0 (SCHEMA-ALIGNED / BATCH-CAPABLE / FULLY TYPED)
 ================================================================================
 
-v4.3.0 changes vs v4.2.0
---------------------------
-FIX CRITICAL: 11 field names corrected to match schema_registry v3.0.0 keys.
-  v4.2.0 used wrong keys so data silently fell outside the schema and never
-  reached Google Sheets columns:
+Purpose
+-------
+Provides financial market data from Finnhub API:
+  - Real-time quotes for global stocks
+  - Company profiles and fundamentals
+  - Historical OHLCV data with technical indicators
+  - Financial metrics and ratios
 
-  Provider key (v4.2.0) -> Schema key (v4.3.0)   Direction
-  ----------------------------------------------------------
-  change               -> price_change           quote
-  change_pct           -> percent_change         quote
-  day_open             -> open_price             quote
-  high_52w             -> week_52_high           metrics + history
-  low_52w              -> week_52_low            metrics + history
-  avg_vol_30d          -> avg_volume_30d         history
-  pb                   -> pb_ratio               metrics
-  ps                   -> ps_ratio               metrics
-  beta                 -> beta_5y                metrics
-  net_margin           -> profit_margin          metrics (+ roe/roa kept)
-  position_52w_pct     already aliased to
-                          week_52_position_pct   history (no change needed)
+v6.0.0 Changes (from v5.0.0)
+----------------------------
+Bug fixes:
+  - Fundamentals percent-conversion bug: `_percentish_to_fraction` only
+    divides by 100 when |value| > 1.5, so a stock with a 0.8% dividend
+    yield had `dividend_yield=0.8` (i.e., 80%). v5.0.0 applied this to
+    five Finnhub fields that are documented as percent-points:
+    dividendYieldIndicatedAnnual, roeTTM, roaTTM, payoutRatioTTM, netMargin.
+    v6.0.0 uses the existing `_percent_points_to_fraction` (unconditional
+    /100) for these known-percent fields. `_percentish_to_fraction` is
+    retained for any ambiguous callers.
+  - All asyncio primitives (Lock, Semaphore) are now lazily initialized
+    inside async methods rather than in __init__ or at module top level.
+    Affected: TokenBucket._lock, TTLCache._lock, SingleFlight._lock,
+    CircuitBreaker._lock, FinnhubClient._semaphore, module _CLIENT_LOCK.
+  - Retry-After header parsing now accepts decimal seconds (HTTP spec
+    allows both integer and delta-seconds). v5.0.0 used `.isdigit()`
+    which rejects "1.5".
 
-  Old keys kept as backward-compat aliases in every patch dict.
+Cleanup:
+  - Removed unused imports: `cast`, `field`.
+  - TTLCache eviction uses OrderedDict.popitem(last=False) for explicit FIFO.
+  - Engine-facing functions log a debug line when extra args/kwargs are
+    dropped (parity with other v6 providers).
+  - Added VERSION alias export (parity with argaam/eodhd).
 
-FIX: percent_change now computed from prices first ((cur/prev)-1.0).
-  Falls back to _pct_points_to_fraction(dp) only when prices unavailable.
-  Same pattern as eodhd_provider v4.8.0 and argaam_provider v4.5.0.
-
-FIX: FUNDAMENTALS_ENABLED global flag now checked alongside
-  FINNHUB_ENABLE_METRIC and FINNHUB_ENABLE_PROFILE, consistent with
-  eodhd_provider.py v4.7.0+ behavior.
-
-ENH: PROVIDER_BATCH_SUPPORTED = True exported.
-ENH: fetch_enriched_quotes_batch() added (module-level + FinnhubClient method).
-ENH: __all__ updated with new exports.
-
-Preserved from v4.2.0:
-  All network reliability features (token-bucket, circuit-breaker, retries).
-  All blocking rules (KSA, special symbols).
-  All fraction-safe helpers (_pct_points_to_fraction, _percentish_to_fraction).
-  Symbol variants / normalization logic.
+Preserved for backward compatibility:
+  - Every name in __all__.
+  - All environment variable names and defaults.
+  - Patch shape (every field + alias).
+  - Exception classes (FinnhubAuthError/NotFound/RateLimit/CircuitOpen/Fetch) --
+    unused but kept because external code may `except` on them.
+  - Two-tier semaphore layering in batch: max_concurrency gates HTTP
+    requests, batch_concurrency gates symbols-in-flight. These are
+    intentionally different limits serving different layers.
+  - RSI/volatility implementations unchanged to preserve numeric output.
 ================================================================================
 """
 
@@ -57,205 +61,329 @@ import os
 import random
 import re
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import httpx
 
-logger = logging.getLogger("core.providers.finnhub_provider")
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 
-PROVIDER_NAME            = "finnhub"
-PROVIDER_VERSION         = "4.3.0"
-PROVIDER_BATCH_SUPPORTED = True   # ENH v4.3.0
-DEFAULT_BASE_URL         = "https://finnhub.io/api/v1"
-
-_TRUTHY = {"1", "true", "yes", "y", "on", "t"}
-_FALSY  = {"0", "false", "no", "n", "off", "f"}
-
-_KSA_CODE_RE        = re.compile(r"^\d{3,6}(\.SR)?$", re.IGNORECASE)
-_SPECIAL_SYMBOL_RE  = re.compile(r"(\^|=|/|:)", re.IGNORECASE)
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 # ---------------------------------------------------------------------------
-# Optional fast JSON
+# Constants
 # ---------------------------------------------------------------------------
+
+PROVIDER_NAME = "finnhub"
+PROVIDER_VERSION = "6.0.0"
+VERSION = PROVIDER_VERSION
+PROVIDER_BATCH_SUPPORTED = True
+
+DEFAULT_BASE_URL = "https://finnhub.io/api/v1"
+DEFAULT_USER_AGENT = "TFB-Finnhub/6.0.0"
+
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
+_FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
+
+_KSA_CODE_RE = re.compile(r"^\d{3,6}(\.SR)?$", re.IGNORECASE)
+_SPECIAL_SYMBOL_RE = re.compile(r"(\^|=|/|:)", re.IGNORECASE)
+
+# Matches an integer or decimal Retry-After header (delta-seconds per HTTP spec)
+_RETRY_AFTER_NUMERIC_RE = re.compile(r"^\d+(?:\.\d+)?$")
+
+
+# ---------------------------------------------------------------------------
+# JSON Parser (orjson preferred)
+# ---------------------------------------------------------------------------
+
 try:
     import orjson  # type: ignore
 
-    def json_loads(data: Union[str, bytes]) -> Any:
+    def _json_loads(data: Union[str, bytes]) -> Any:
         if isinstance(data, str):
             data = data.encode("utf-8")
         return orjson.loads(data)
+except ImportError:
+    import json
 
-except Exception:
-    import json  # type: ignore
-
-    def json_loads(data: Union[str, bytes]) -> Any:
+    def _json_loads(data: Union[str, bytes]) -> Any:
         if isinstance(data, bytes):
             data = data.decode("utf-8", errors="replace")
         return json.loads(data)
 
 
-# =============================================================================
-# Env helpers
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
 
-def _env_str(name: str, default: str = "") -> str:
-    return (os.getenv(name) or default).strip()
+@dataclass(frozen=True)
+class FinnhubConfig:
+    """Immutable configuration for Finnhub provider."""
 
+    api_key: str
+    base_url: str = DEFAULT_BASE_URL
+    timeout_sec: float = 15.0
+    retry_attempts: int = 4
+    retry_base_delay: float = 0.6
+    max_concurrency: int = 25
+    rate_limit_rps: float = 20.0
+    rate_limit_burst: float = 40.0
+    circuit_breaker_threshold: int = 6
+    circuit_breaker_cooldown_sec: float = 45.0
+    quote_ttl_sec: float = 10.0
+    profile_ttl_sec: float = 21600.0
+    metric_ttl_sec: float = 21600.0
+    history_ttl_sec: float = 1800.0
+    history_days: int = 500
+    history_window_52w: int = 252
+    batch_concurrency: int = 8
+    enabled: bool = True
+    enable_profile: bool = True
+    enable_metric: bool = True
+    enable_history: bool = True
+    fundamentals_enabled: bool = True
+    user_agent: str = DEFAULT_USER_AGENT
 
-def _env_int(name: str, default: int, lo: Optional[int] = None, hi: Optional[int] = None) -> int:
-    try:
-        v = int(float((os.getenv(name) or str(default)).strip()))
-    except Exception:
-        v = default
-    if lo is not None and v < lo: v = lo
-    if hi is not None and v > hi: v = hi
-    return v
+    @classmethod
+    def from_env(cls) -> "FinnhubConfig":
+        """Load configuration from environment variables."""
 
+        def _env_str(name: str, default: str = "") -> str:
+            return (os.getenv(name) or default).strip()
 
-def _env_float(name: str, default: float, lo: Optional[float] = None, hi: Optional[float] = None) -> float:
-    try:
-        v = float((os.getenv(name) or str(default)).strip())
-    except Exception:
-        v = default
-    if lo is not None and v < lo: v = lo
-    if hi is not None and v > hi: v = hi
-    return v
+        def _env_bool(name: str, default: bool = False) -> bool:
+            raw = (os.getenv(name) or "").strip().lower()
+            if not raw:
+                return default
+            if raw in _TRUTHY:
+                return True
+            if raw in _FALSY:
+                return False
+            return default
 
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    raw = (os.getenv(name) or "").strip().lower()
-    if not raw:
-        return default
-    if raw in _TRUTHY: return True
-    if raw in _FALSY:  return False
-    return default
-
-
-def _token() -> Optional[str]:
-    for k in ("FINNHUB_API_KEY", "FINNHUB_API_TOKEN", "FINNHUB_TOKEN"):
-        v = (os.getenv(k) or "").strip()
-        if v:
+        def _env_int(name: str, default: int, lo: Optional[int] = None, hi: Optional[int] = None) -> int:
+            try:
+                v = int(float((os.getenv(name) or str(default)).strip()))
+            except Exception:
+                v = default
+            if lo is not None and v < lo:
+                v = lo
+            if hi is not None and v > hi:
+                v = hi
             return v
-    return None
+
+        def _env_float(name: str, default: float, lo: Optional[float] = None, hi: Optional[float] = None) -> float:
+            try:
+                v = float((os.getenv(name) or str(default)).strip())
+            except Exception:
+                v = default
+            if lo is not None and v < lo:
+                v = lo
+            if hi is not None and v > hi:
+                v = hi
+            return v
+
+        api_key = ""
+        for key in ("FINNHUB_API_KEY", "FINNHUB_API_TOKEN", "FINNHUB_TOKEN"):
+            val = _env_str(key)
+            if val:
+                api_key = val
+                break
+
+        fundamentals_enabled = _env_bool("FUNDAMENTALS_ENABLED", True)
+
+        return cls(
+            api_key=api_key,
+            base_url=_env_str("FINNHUB_BASE_URL", DEFAULT_BASE_URL).rstrip("/"),
+            timeout_sec=_env_float("FINNHUB_TIMEOUT_SEC", 15.0, lo=3.0, hi=120.0),
+            retry_attempts=_env_int("FINNHUB_RETRY_ATTEMPTS", 4, lo=0, hi=10),
+            retry_base_delay=_env_float("FINNHUB_RETRY_BASE_DELAY", 0.6, lo=0.0, hi=10.0),
+            max_concurrency=_env_int("FINNHUB_MAX_CONCURRENCY", 25, lo=1, hi=100),
+            rate_limit_rps=_env_float("FINNHUB_RATE_LIMIT_RPS", 20.0, lo=0.0, hi=200.0),
+            rate_limit_burst=_env_float("FINNHUB_RATE_LIMIT_BURST", 40.0, lo=1.0, hi=500.0),
+            circuit_breaker_threshold=_env_int("FINNHUB_CB_THRESHOLD", 6, lo=1, hi=100),
+            circuit_breaker_cooldown_sec=_env_float("FINNHUB_CB_COOLDOWN_SEC", 45.0, lo=1.0, hi=600.0),
+            quote_ttl_sec=_env_float("FINNHUB_QUOTE_TTL_SEC", 10.0, lo=1.0, hi=600.0),
+            profile_ttl_sec=_env_float("FINNHUB_PROFILE_TTL_SEC", 21600.0, lo=60.0, hi=86400.0),
+            metric_ttl_sec=_env_float("FINNHUB_METRIC_TTL_SEC", 21600.0, lo=60.0, hi=86400.0),
+            history_ttl_sec=_env_float("FINNHUB_HISTORY_TTL_SEC", 1800.0, lo=60.0, hi=86400.0),
+            history_days=_env_int("FINNHUB_HISTORY_DAYS", 500, lo=60, hi=3000),
+            history_window_52w=_env_int("FINNHUB_WINDOW_52W", 252, lo=60, hi=800),
+            batch_concurrency=_env_int("FINNHUB_BATCH_CONCURRENCY", 8, lo=1, hi=32),
+            enabled=_env_bool("FINNHUB_ENABLED", True),
+            enable_profile=fundamentals_enabled and _env_bool("FINNHUB_ENABLE_PROFILE", True),
+            enable_metric=fundamentals_enabled and _env_bool("FINNHUB_ENABLE_METRIC", True),
+            enable_history=_env_bool("FINNHUB_ENABLE_HISTORY", True),
+            fundamentals_enabled=fundamentals_enabled,
+            user_agent=_env_str("FINNHUB_USER_AGENT", DEFAULT_USER_AGENT),
+        )
+
+    @property
+    def is_available(self) -> bool:
+        """Return True if the provider is enabled and has an API key."""
+        return self.enabled and bool(self.api_key)
+
+    def should_block_ksa(self, symbol: str) -> bool:
+        """Return True if this is a KSA symbol (Finnhub does not cover Tadawul)."""
+        return looks_like_ksa(symbol)
+
+    def should_block_special(self, symbol: str) -> bool:
+        """Return True if this is a special symbol (index/forex/crypto)."""
+        return is_blocked_special(symbol)
 
 
-def _base_url() -> str:
-    return _env_str("FINNHUB_BASE_URL", DEFAULT_BASE_URL).rstrip("/")
+# ---------------------------------------------------------------------------
+# Custom Exceptions (kept for defensive back-compat even though unraised)
+# ---------------------------------------------------------------------------
 
+class FinnhubProviderError(Exception):
+    """Base exception for Finnhub provider errors."""
+
+
+class FinnhubAuthError(FinnhubProviderError):
+    """Raised when API key is missing or invalid."""
+
+
+class FinnhubNotFoundError(FinnhubProviderError):
+    """Raised when symbol is not found."""
+
+
+class FinnhubRateLimitError(FinnhubProviderError):
+    """Raised when rate limit is exceeded."""
+
+
+class FinnhubCircuitOpenError(FinnhubProviderError):
+    """Raised when circuit breaker is open."""
+
+
+class FinnhubFetchError(FinnhubProviderError):
+    """Raised when a fetch fails."""
+
+
+# ---------------------------------------------------------------------------
+# Pure Utility Functions
+# ---------------------------------------------------------------------------
 
 def _utc_iso(dt: Optional[datetime] = None) -> str:
+    """Get UTC time in ISO format."""
     d = dt or datetime.now(timezone.utc)
-    if d.tzinfo is None: d = d.replace(tzinfo=timezone.utc)
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
     return d.astimezone(timezone.utc).isoformat()
 
 
 def _riyadh_iso(dt: Optional[datetime] = None) -> str:
+    """Get Riyadh time (UTC+3) in ISO format."""
     tz = timezone(timedelta(hours=3))
     d = dt or datetime.now(timezone.utc)
-    if d.tzinfo is None: d = d.replace(tzinfo=timezone.utc)
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
     return d.astimezone(tz).isoformat()
 
 
-def _fundamentals_enabled() -> bool:
-    """
-    FIX v4.3.0: Check FUNDAMENTALS_ENABLED global flag alongside provider flags.
-    Consistent with eodhd_provider v4.7.0+ behavior.
-    """
-    return _env_bool("FUNDAMENTALS_ENABLED", True)
-
-
-# =============================================================================
-# Safe coercion + ratio-safe percent normalization
-# =============================================================================
-
-def safe_float(x: Any) -> Optional[float]:
-    if x is None:
+def _safe_float(value: Any) -> Optional[float]:
+    """Safely convert value to float; handles %, commas, None, NaN, inf."""
+    if value is None:
         return None
     try:
-        if isinstance(x, (int, float)) and not isinstance(x, bool):
-            f = float(x)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            f = float(value)
         else:
-            s = str(x).strip().replace(",", "")
+            s = str(value).strip().replace(",", "")
             if not s:
                 return None
             if s.endswith("%"):
-                f = float(s[:-1].strip()) / 100.0
+                s = s[:-1].strip()
+                f = float(s) / 100.0
             else:
                 f = float(s)
-        if math.isnan(f) or math.isinf(f):
-            return None
-        return f
-    except Exception:
+        return None if (math.isnan(f) or math.isinf(f)) else f
+    except (ValueError, TypeError):
         return None
 
 
-def safe_int(x: Any) -> Optional[int]:
-    f = safe_float(x)
+def _safe_int(value: Any) -> Optional[int]:
+    """Safely convert value to int."""
+    f = _safe_float(value)
     return int(round(f)) if f is not None else None
 
 
-def safe_str(x: Any) -> Optional[str]:
-    if x is None:
+def _safe_str(value: Any) -> Optional[str]:
+    """Safely convert to non-empty stripped string; None for empty."""
+    if value is None:
         return None
     try:
-        s = str(x).strip()
+        s = str(value).strip()
         return s if s else None
     except Exception:
         return None
 
 
-def _pct_points_to_fraction(x: Any) -> Optional[float]:
+def _percent_points_to_fraction(value: Any) -> Optional[float]:
     """
-    Finnhub 'dp' is percent-points (0.79 = 0.79% change).
-    Divides by 100 unconditionally -- correct for Finnhub dp field only.
-    For generic percent-ish values use _percentish_to_fraction().
+    Convert a KNOWN-PERCENT value to a fraction by dividing by 100.
+
+    Use this for fields whose API docs confirm percent units -- Finnhub's
+    quote `dp`, and metrics like roeTTM, roaTTM, netMargin, payoutRatioTTM,
+    dividendYieldIndicatedAnnual, which are all documented percent-points.
     """
-    f = safe_float(x)
+    f = _safe_float(value)
+    return f / 100.0 if f is not None else None
+
+
+def _percentish_to_fraction(value: Any) -> Optional[float]:
+    """
+    Convert a percent-ISH value using the abs>1.5 heuristic.
+
+    LEGACY: divides by 100 only when |value| > 1.5. Kept for ambiguous
+    external callers that may import it. The provider itself no longer
+    uses this for fundamentals fields -- see `_percent_points_to_fraction`.
+    """
+    f = _safe_float(value)
     if f is None:
         return None
-    return f / 100.0
+    return f / 100.0 if abs(f) > 1.5 else f
 
 
-def _percentish_to_fraction(x: Any) -> Optional[float]:
-    """
-    Generic: abs(f) > 1.5 -> divide by 100, else return as-is.
-    Use for fundamentals (ROE, margins, yields) from Finnhub metrics.
-    """
-    f = safe_float(x)
-    if f is None:
-        return None
-    if abs(f) > 1.5:
-        return f / 100.0
-    return f
+def _clean_patch(patch: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove None and whitespace-only-string values from a patch dict."""
+    return {
+        k: v for k, v in patch.items()
+        if v is not None and not (isinstance(v, str) and not v.strip())
+    }
 
-
-def _clean_patch(p: Dict[str, Any]) -> Dict[str, Any]:
-    return {k: v for k, v in (p or {}).items() if v is not None and not (isinstance(v, str) and not v.strip())}
-
-
-# =============================================================================
-# Symbol handling
-# =============================================================================
 
 def looks_like_ksa(symbol: str) -> bool:
+    """Return True if the symbol looks like a KSA (Saudi) symbol."""
     s = (symbol or "").strip().upper()
     if not s:
         return False
+
+    # Delegate to shared normalizer if available
     try:
         from core.symbols.normalize import looks_like_ksa as _lk  # type: ignore
+
         if callable(_lk):
             return bool(_lk(s))
-    except Exception:
+    except ImportError:
         pass
-    if s.startswith("TADAWUL:"): return True
-    if s.endswith(".SR"):         return True
-    if _KSA_CODE_RE.match(s):    return True
+
+    if s.startswith("TADAWUL:"):
+        return True
+    if s.endswith(".SR"):
+        return True
+    if _KSA_CODE_RE.match(s):
+        return True
     return False
 
 
 def is_blocked_special(symbol: str) -> bool:
+    """Return True if the symbol is an index/forex/crypto (or empty)."""
     s = (symbol or "").strip().upper()
     if not s:
         return True
@@ -263,168 +391,228 @@ def is_blocked_special(symbol: str) -> bool:
 
 
 def normalize_finnhub_symbol(symbol: str) -> str:
-    """Strip .US suffix; delegate to shared normalizer if available."""
+    """Normalize symbol to Finnhub format (strips `.US` suffix)."""
     s = (symbol or "").strip().upper()
     if not s:
         return ""
+
     try:
         from core.symbols.normalize import to_finnhub_symbol as _to  # type: ignore
+
         if callable(_to):
-            out = _to(s)
-            if isinstance(out, str) and out.strip():
-                s = out.strip().upper()
-    except Exception:
+            result = _to(s)
+            if isinstance(result, str) and result.strip():
+                s = result.strip().upper()
+    except ImportError:
         pass
+
     if s.endswith(".US"):
         s = s[:-3]
+
     return s
 
 
 def symbol_variants(symbol: str) -> List[str]:
+    """
+    Generate symbol variants for fallback lookups.
+
+    Examples:
+        "BRK-B" -> ["BRK-B", "BRK.B"]    (hyphen→dot)
+        "VOD.L" -> ["VOD.L", "VOD"]      (strip suffix)
+        "AAPL"  -> ["AAPL"]
+    """
     s = normalize_finnhub_symbol(symbol)
     if not s:
         return []
-    out = [s]
+
+    variants = [s]
+
     if "-" in s and "." not in s:
-        out.append(s.replace("-", "."))
+        variants.append(s.replace("-", "."))
+
     if "." in s:
         base = s.split(".", 1)[0]
-        if base and base not in out:
-            out.append(base)
-    dedup: List[str] = []
+        if base and base not in variants:
+            variants.append(base)
+
     seen: set = set()
-    for x in out:
-        if x and x not in seen:
-            seen.add(x)
-            dedup.append(x)
-    return dedup
+    result: List[str] = []
+    for v in variants:
+        if v and v not in seen:
+            seen.add(v)
+            result.append(v)
+    return result
 
 
-# =============================================================================
-# Async primitives
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Async Primitives: TokenBucket, TTLCache, SingleFlight, CircuitBreaker
+# ---------------------------------------------------------------------------
 
 class TokenBucket:
+    """Token bucket rate limiter."""
+
     def __init__(self, rate_per_sec: float, burst: float):
-        self.rate     = max(0.0, float(rate_per_sec))
-        self.capacity = max(1.0, float(burst))
-        self.tokens   = self.capacity
-        self.last     = time.monotonic()
-        self._lock    = asyncio.Lock()
+        self.rate = max(0.0, rate_per_sec)
+        self.capacity = max(1.0, burst)
+        self.tokens = self.capacity
+        self.last = time.monotonic()
+        self._lock: Optional[asyncio.Lock] = None  # lazy
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     async def wait(self, amount: float = 1.0) -> None:
+        """Wait until `amount` tokens are available."""
         if self.rate <= 0:
             return
-        amount = max(0.0001, float(amount))
+        amount = max(0.0001, amount)
         while True:
-            async with self._lock:
-                now     = time.monotonic()
+            async with self._get_lock():
+                now = time.monotonic()
                 elapsed = max(0.0, now - self.last)
-                self.last   = now
+                self.last = now
                 self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
                 if self.tokens >= amount:
                     self.tokens -= amount
                     return
                 deficit = amount - self.tokens
-                sleep_s = deficit / self.rate if self.rate > 0 else 0.25
-            await asyncio.sleep(min(1.0, max(0.05, sleep_s)))
+                sleep_sec = deficit / self.rate if self.rate > 0 else 0.25
+            await asyncio.sleep(min(1.0, max(0.05, sleep_sec)))
 
 
 @dataclass
 class _CacheItem:
-    exp: float
-    val: Any
+    """Cache item with expiration timestamp."""
+    expires_at: float
+    value: Any
 
 
 class TTLCache:
-    def __init__(self, maxsize: int, ttl_sec: float):
-        self.maxsize = max(128, int(maxsize))
-        self.ttl_sec = max(1.0, float(ttl_sec))
-        self._d:    Dict[str, _CacheItem] = {}
-        self._lock  = asyncio.Lock()
+    """Async-safe TTL cache with FIFO eviction on overflow."""
 
-    async def get(self, key: str) -> Any:
+    def __init__(self, max_size: int, ttl_sec: float):
+        self.max_size = max(128, max_size)
+        self.ttl_sec = max(1.0, ttl_sec)
+        self._cache: "OrderedDict[str, _CacheItem]" = OrderedDict()
+        self._lock: Optional[asyncio.Lock] = None  # lazy
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    async def get(self, key: str) -> Optional[Any]:
+        """Get value from cache if not expired."""
         now = time.monotonic()
-        async with self._lock:
-            it = self._d.get(key)
-            if not it: return None
-            if it.exp > now: return it.val
-            self._d.pop(key, None)
+        async with self._get_lock():
+            item = self._cache.get(key)
+            if not item:
+                return None
+            if item.expires_at > now:
+                return item.value
+            self._cache.pop(key, None)
             return None
 
-    async def set(self, key: str, val: Any, ttl_sec: Optional[float] = None) -> None:
+    async def set(self, key: str, value: Any, ttl_sec: Optional[float] = None) -> None:
+        """Set value in cache with TTL; FIFO-evicts on overflow."""
         now = time.monotonic()
-        ttl = self.ttl_sec if ttl_sec is None else max(1.0, float(ttl_sec))
-        async with self._lock:
-            if len(self._d) >= self.maxsize and key not in self._d:
-                self._d.pop(next(iter(self._d.keys())), None)
-            self._d[key] = _CacheItem(exp=now + ttl, val=val)
+        ttl = self.ttl_sec if ttl_sec is None else max(1.0, ttl_sec)
+        async with self._get_lock():
+            if key not in self._cache and len(self._cache) >= self.max_size:
+                self._cache.popitem(last=False)
+            self._cache[key] = _CacheItem(expires_at=now + ttl, value=value)
 
 
 class SingleFlight:
+    """Deduplicate concurrent requests for the same key."""
+
     def __init__(self) -> None:
-        self._lock  = asyncio.Lock()
+        self._lock: Optional[asyncio.Lock] = None  # lazy
         self._calls: Dict[str, asyncio.Future] = {}
 
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
     async def do(self, key: str, coro_factory: Callable[[], Any]) -> Any:
-        async with self._lock:
-            fut = self._calls.get(key)
-            if fut is None:
-                fut = asyncio.get_running_loop().create_future()
-                self._calls[key] = fut
+        """Execute coroutine; concurrent callers for the same key share the result."""
+        lock = self._get_lock()
+        async with lock:
+            future = self._calls.get(key)
+            if future is None:
+                future = asyncio.get_running_loop().create_future()
+                self._calls[key] = future
                 owner = True
             else:
                 owner = False
+
         if not owner:
-            return await fut  # type: ignore
+            return await future
+
         try:
-            res = await coro_factory()
-            if not fut.done(): fut.set_result(res)
-            return res
-        except Exception as e:
-            if not fut.done(): fut.set_exception(e)
+            result = await coro_factory()
+            if not future.done():
+                future.set_result(result)
+            return result
+        except Exception as exc:
+            if not future.done():
+                future.set_exception(exc)
             raise
         finally:
-            async with self._lock:
+            async with lock:
                 self._calls.pop(key, None)
 
 
 class CircuitBreaker:
+    """Circuit breaker to short-circuit repeated failures."""
+
     def __init__(self, threshold: int, cooldown_sec: float):
-        self.threshold   = max(1, int(threshold))
-        self.cooldown_sec = max(1.0, float(cooldown_sec))
-        self.failures    = 0
-        self.open_until  = 0.0
-        self._lock       = asyncio.Lock()
+        self.threshold = max(1, threshold)
+        self.cooldown_sec = max(1.0, cooldown_sec)
+        self.failures = 0
+        self.open_until = 0.0
+        self._lock: Optional[asyncio.Lock] = None  # lazy
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     async def allow(self) -> bool:
-        async with self._lock:
+        """Return True if requests are allowed (breaker closed or cooled down)."""
+        async with self._get_lock():
             return time.monotonic() >= self.open_until
 
     async def on_success(self) -> None:
-        async with self._lock:
-            self.failures   = 0
+        """Record a success; resets failure count."""
+        async with self._get_lock():
+            self.failures = 0
             self.open_until = 0.0
 
     async def on_failure(self) -> None:
-        async with self._lock:
+        """Record a failure; may open the circuit."""
+        async with self._get_lock():
             self.failures += 1
             if self.failures >= self.threshold:
                 self.open_until = time.monotonic() + self.cooldown_sec
 
 
-# =============================================================================
-# Technicals (pure Python, no numpy)
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Technical Indicators (Pure Python, no numpy)
+# ---------------------------------------------------------------------------
 
 def _sma(values: List[float], window: int) -> Optional[float]:
+    """Simple moving average over the last `window` values; None if insufficient."""
     if window <= 0 or len(values) < window:
         return None
     return sum(values[-window:]) / float(window)
 
 
 def _returns(values: List[float], days: int) -> Optional[float]:
-    """Fraction return over `days` trading days."""
+    """Return over N days as a fraction; None if insufficient data."""
     if len(values) <= days:
         return None
     base = values[-1 - days]
@@ -434,210 +622,250 @@ def _returns(values: List[float], days: int) -> Optional[float]:
 
 
 def _volatility_30d_annualized_fraction(closes: List[float]) -> Optional[float]:
-    """Annualized volatility as fraction (0.18 = 18%)."""
+    """Annualized volatility from the last 30 days of daily returns."""
     if len(closes) < 31:
         return None
-    rets: List[float] = []
+
+    returns: List[float] = []
     for i in range(len(closes) - 30, len(closes)):
-        if i <= 0: continue
-        prev, cur = closes[i - 1], closes[i]
-        if prev: rets.append((cur / prev) - 1.0)
-    if len(rets) < 5:
+        if i <= 0:
+            continue
+        prev = closes[i - 1]
+        curr = closes[i]
+        if prev:
+            returns.append((curr / prev) - 1.0)
+
+    if len(returns) < 5:
         return None
-    m = sum(rets) / len(rets)
-    var = sum((x - m) ** 2 for x in rets) / max(1, len(rets) - 1)
-    return math.sqrt(var) * math.sqrt(252.0)
+
+    mean = sum(returns) / len(returns)
+    variance = sum((r - mean) ** 2 for r in returns) / max(1, len(returns) - 1)
+    return math.sqrt(variance) * math.sqrt(252.0)
 
 
 def _rsi_14(closes: List[float]) -> Optional[float]:
+    """RSI(14) using simple period averaging; 0-100 or None."""
     if len(closes) < 15:
         return None
-    gains = losses = 0.0
-    for i in range(len(closes) - 14, len(closes)):
-        if i <= 0: continue
-        d = closes[i] - closes[i - 1]
-        if d > 0: gains  +=  d
-        else:     losses += -d
-    avg_gain = gains  / 14.0
-    avg_loss = losses / 14.0
+
+    period = 14
+    gains = 0.0
+    losses = 0.0
+
+    for i in range(len(closes) - period, len(closes)):
+        if i <= 0:
+            continue
+        delta = closes[i] - closes[i - 1]
+        if delta > 0:
+            gains += delta
+        else:
+            losses += -delta
+
+    avg_gain = gains / period
+    avg_loss = losses / period
+
     if avg_loss == 0:
         return 100.0
+
     rs = avg_gain / avg_loss
     return 100.0 - (100.0 / (1.0 + rs))
 
 
-# =============================================================================
-# Finnhub HTTP client
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Finnhub HTTP Client
+# ---------------------------------------------------------------------------
 
 class FinnhubClient:
-    def __init__(self) -> None:
-        self.api_key          = _token()
-        self.base_url         = _base_url()
-        self.timeout_sec      = _env_float("FINNHUB_TIMEOUT_SEC",       15.0, lo=3.0,  hi=120.0)
-        self.retry_attempts   = _env_int(  "FINNHUB_RETRY_ATTEMPTS",     4,   lo=0,    hi=10)
-        self.retry_base_delay = _env_float("FINNHUB_RETRY_BASE_DELAY",   0.6, lo=0.0,  hi=10.0)
-        self.max_concurrency  = _env_int(  "FINNHUB_MAX_CONCURRENCY",    25,  lo=1,    hi=100)
-        self._sem             = asyncio.Semaphore(self.max_concurrency)
-        self._bucket          = TokenBucket(
-            rate_per_sec = _env_float("FINNHUB_RATE_LIMIT_RPS",   20.0, lo=0.0, hi=200.0),
-            burst        = _env_float("FINNHUB_RATE_LIMIT_BURST", 40.0, lo=1.0, hi=500.0),
-        )
-        self._cb = CircuitBreaker(
-            threshold   = _env_int(  "FINNHUB_CB_THRESHOLD",    6,    lo=1,   hi=100),
-            cooldown_sec= _env_float("FINNHUB_CB_COOLDOWN_SEC", 45.0, lo=1.0, hi=600.0),
-        )
-        self._sf = SingleFlight()
+    """Async client for Finnhub API."""
 
-        self.quote_cache   = TTLCache(8000, _env_float("FINNHUB_QUOTE_TTL_SEC",   10.0,    lo=1.0, hi=600.0))
-        self.profile_cache = TTLCache(4000, _env_float("FINNHUB_PROFILE_TTL_SEC", 21600.0, lo=60.0, hi=86400.0))
-        self.metric_cache  = TTLCache(4000, _env_float("FINNHUB_METRIC_TTL_SEC",  21600.0, lo=60.0, hi=86400.0))
-        self.history_cache = TTLCache(2500, _env_float("FINNHUB_HISTORY_TTL_SEC", 1800.0,  lo=60.0, hi=86400.0))
+    def __init__(self, config: Optional[FinnhubConfig] = None):
+        self.config = config or FinnhubConfig.from_env()
+        self._semaphore: Optional[asyncio.Semaphore] = None  # lazy
+        self._bucket = TokenBucket(
+            rate_per_sec=self.config.rate_limit_rps,
+            burst=self.config.rate_limit_burst,
+        )
+        self._circuit_breaker = CircuitBreaker(
+            threshold=self.config.circuit_breaker_threshold,
+            cooldown_sec=self.config.circuit_breaker_cooldown_sec,
+        )
+        self._single_flight = SingleFlight()
+
+        self._quote_cache = TTLCache(max_size=8000, ttl_sec=self.config.quote_ttl_sec)
+        self._profile_cache = TTLCache(max_size=4000, ttl_sec=self.config.profile_ttl_sec)
+        self._metric_cache = TTLCache(max_size=4000, ttl_sec=self.config.metric_ttl_sec)
+        self._history_cache = TTLCache(max_size=2500, ttl_sec=self.config.history_ttl_sec)
 
         self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(self.timeout_sec),
-            headers={"User-Agent": _env_str("FINNHUB_USER_AGENT", "TFB-Finnhub/4.3.0")},
+            timeout=httpx.Timeout(self.config.timeout_sec),
+            headers={"User-Agent": self.config.user_agent},
             limits=httpx.Limits(max_keepalive_connections=30, max_connections=60),
             follow_redirects=True,
             http2=True,
         )
 
+    def _get_semaphore(self) -> asyncio.Semaphore:
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self.config.max_concurrency)
+        return self._semaphore
+
+    @staticmethod
+    def _parse_retry_after(value: Optional[str]) -> Optional[float]:
+        """
+        Parse a Retry-After header value.
+
+        HTTP spec allows integer or decimal delta-seconds. v5.0.0 used
+        `.isdigit()` which rejects "1.5".
+        """
+        if not value:
+            return None
+        cleaned = value.strip()
+        if _RETRY_AFTER_NUMERIC_RE.match(cleaned):
+            try:
+                return float(cleaned)
+            except (ValueError, TypeError):
+                return None
+        return None
+
     async def _request_json(
-        self, endpoint: str, params: Optional[Dict[str, Any]] = None
+        self,
+        endpoint: str,
+        params: Optional[Dict[str, Any]] = None,
     ) -> Tuple[Optional[Any], Optional[str]]:
-        if not self.api_key:
+        """Make JSON request to Finnhub API."""
+        if not self.config.api_key:
             return None, "FINNHUB_API_KEY missing"
-        if not await self._cb.allow():
+
+        if not await self._circuit_breaker.allow():
             return None, "circuit_open"
 
-        url = f"{self.base_url}/{endpoint.lstrip('/')}"
-        p   = dict(params or {})
-        p["token"] = self.api_key
-        last_err: Optional[str] = None
+        url = f"{self.config.base_url}/{endpoint.lstrip('/')}"
+        query_params = dict(params or {})
+        query_params["token"] = self.config.api_key
+        last_error: Optional[str] = None
 
-        async with self._sem:
-            for attempt in range(max(1, self.retry_attempts + 1)):
+        async with self._get_semaphore():
+            for attempt in range(max(1, self.config.retry_attempts + 1)):
                 await self._bucket.wait(1.0)
-                try:
-                    r  = await self._client.get(url, params=p)
-                    sc = int(r.status_code)
 
-                    if sc == 429:
-                        ra   = r.headers.get("Retry-After")
-                        wait = float(ra) if ra and ra.isdigit() else min(15.0, 1.0 + attempt)
-                        last_err = "HTTP 429"
-                        await self._cb.on_failure()
+                try:
+                    response = await self._client.get(url, params=query_params)
+                    status_code = response.status_code
+
+                    if status_code == 429:
+                        retry_after = self._parse_retry_after(response.headers.get("Retry-After"))
+                        wait = retry_after if retry_after is not None else min(15.0, 1.0 + attempt)
+                        last_error = "HTTP 429"
+                        await self._circuit_breaker.on_failure()
                         await asyncio.sleep(wait)
                         continue
-                    if 500 <= sc < 600:
-                        last_err = f"HTTP {sc}"
-                        await self._cb.on_failure()
-                        base = self.retry_base_delay * (2 ** (attempt - 1))
-                        await asyncio.sleep(min(12.0, random.uniform(0, base + 0.25)))
+
+                    if 500 <= status_code < 600:
+                        last_error = f"HTTP {status_code}"
+                        await self._circuit_breaker.on_failure()
+                        base_delay = self.config.retry_base_delay * (2 ** max(0, attempt - 1))
+                        await asyncio.sleep(min(12.0, random.uniform(0, base_delay + 0.25)))
                         continue
-                    if sc == 404:
-                        await self._cb.on_failure()
+
+                    if status_code == 404:
+                        await self._circuit_breaker.on_failure()
                         return None, "HTTP 404 not_found"
-                    if sc >= 400:
-                        await self._cb.on_failure()
-                        return None, f"HTTP {sc}"
+
+                    if status_code >= 400:
+                        await self._circuit_breaker.on_failure()
+                        return None, f"HTTP {status_code}"
 
                     try:
-                        data = json_loads(r.content)
+                        data = _json_loads(response.content)
                     except Exception:
-                        await self._cb.on_failure()
+                        await self._circuit_breaker.on_failure()
                         return None, "invalid_json"
 
-                    await self._cb.on_success()
+                    await self._circuit_breaker.on_success()
                     return data, None
 
-                except httpx.RequestError as e:
-                    last_err = f"network_error:{e.__class__.__name__}"
-                    await self._cb.on_failure()
-                    base = self.retry_base_delay * (2 ** (attempt - 1))
-                    await asyncio.sleep(min(12.0, random.uniform(0, base + 0.25)))
-                except Exception as e:
-                    last_err = f"unexpected_error:{e.__class__.__name__}"
-                    await self._cb.on_failure()
+                except httpx.RequestError as exc:
+                    last_error = f"network_error:{exc.__class__.__name__}"
+                    await self._circuit_breaker.on_failure()
+                    base_delay = self.config.retry_base_delay * (2 ** max(0, attempt - 1))
+                    await asyncio.sleep(min(12.0, random.uniform(0, base_delay + 0.25)))
+                except Exception as exc:
+                    last_error = f"unexpected_error:{exc.__class__.__name__}"
+                    await self._circuit_breaker.on_failure()
                     break
 
-        return None, last_err or "request_failed"
+        return None, last_error or "request_failed"
 
-    # ------------------------------------------------------------------
-    # Quote
-    # ------------------------------------------------------------------
+    # -- Quote ---------------------------------------------------------
 
-    async def fetch_quote(self, symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
+    async def _fetch_quote(self, symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
+        """Fetch real-time quote for a symbol."""
         sym = normalize_finnhub_symbol(symbol)
         if not sym:
             return {}, "invalid_symbol"
 
-        ck = f"q:{sym}"
-        cached = await self.quote_cache.get(ck)
+        cache_key = f"q:{sym}"
+        cached = await self._quote_cache.get(cache_key)
         if cached:
             return cached, None
 
-        async def _do():
+        async def _fetch() -> Tuple[Dict[str, Any], Optional[str]]:
             data, err = await self._request_json("quote", params={"symbol": sym})
             if err or not isinstance(data, dict):
                 return {}, err or "bad_payload"
 
-            cur  = safe_float(data.get("c"))
-            prev = safe_float(data.get("pc"))
-            chg  = safe_float(data.get("d"))
+            current = _safe_float(data.get("c"))
+            previous = _safe_float(data.get("pc"))
+            price_change = _safe_float(data.get("d"))
 
-            # FIX v4.3.0: compute percent_change from prices first (always correct fraction).
-            # Fall back to dp (percent-points) only when prices unavailable.
-            if cur is not None and prev not in (None, 0.0):
-                change_frac = (cur / prev) - 1.0
+            # Prefer computing percent_change from prices (always correct fraction);
+            # fall back to Finnhub's dp which is percent-points.
+            if current is not None and previous is not None and previous != 0:
+                percent_change = (current / previous) - 1.0
             else:
-                change_frac = _pct_points_to_fraction(data.get("dp"))
+                percent_change = _percent_points_to_fraction(data.get("dp"))
 
-            # Derived price_change if not provided
-            if chg is None and cur is not None and prev is not None:
-                chg = cur - prev
+            if price_change is None and current is not None and previous is not None:
+                price_change = current - previous
 
             patch = _clean_patch({
-                "provider":    PROVIDER_NAME,
+                "provider": PROVIDER_NAME,
                 "data_source": PROVIDER_NAME,
-                # --- Schema-aligned keys (primary) ---
-                "current_price":  cur,
-                "previous_close": prev,
-                "price_change":   chg,          # FIX: was "change"
-                "percent_change": change_frac,  # FIX: was "change_pct"; dtype=pct fraction
-                "open_price":     safe_float(data.get("o")),  # FIX: was "day_open"
-                "day_high":       safe_float(data.get("h")),
-                "day_low":        safe_float(data.get("l")),
-                "volume":         safe_float(data.get("v")),
-                # --- Backward-compat aliases ---
-                "change":         chg,
-                "change_pct":     change_frac,
-                "day_open":       safe_float(data.get("o")),
-                "price":          cur,
-                # --- Meta ---
-                "last_updated_utc":     _utc_iso(),
-                "last_updated_riyadh":  _riyadh_iso(),
+                "current_price": current,
+                "previous_close": previous,
+                "price_change": price_change,
+                "percent_change": percent_change,
+                "open_price": _safe_float(data.get("o")),
+                "day_high": _safe_float(data.get("h")),
+                "day_low": _safe_float(data.get("l")),
+                "volume": _safe_float(data.get("v")),
+                # Backward-compat aliases
+                "change": price_change,
+                "change_pct": percent_change,
+                "day_open": _safe_float(data.get("o")),
+                "price": current,
+                "last_updated_utc": _utc_iso(),
+                "last_updated_riyadh": _riyadh_iso(),
             })
-            await self.quote_cache.set(ck, patch)
+            await self._quote_cache.set(cache_key, patch)
             return patch, None
 
-        return await self._sf.do(ck, _do)
+        return await self._single_flight.do(cache_key, _fetch)
 
-    # ------------------------------------------------------------------
-    # Profile
-    # ------------------------------------------------------------------
+    # -- Profile -------------------------------------------------------
 
-    async def fetch_profile(self, symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
+    async def _fetch_profile(self, symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
+        """Fetch company profile for a symbol."""
         sym = normalize_finnhub_symbol(symbol)
         if not sym:
             return {}, "invalid_symbol"
 
-        ck = f"p:{sym}"
-        cached = await self.profile_cache.get(ck)
+        cache_key = f"p:{sym}"
+        cached = await self._profile_cache.get(cache_key)
         if cached:
             return cached, None
 
-        async def _do():
+        async def _fetch() -> Tuple[Dict[str, Any], Optional[str]]:
             data, err = await self._request_json("stock/profile2", params={"symbol": sym})
             if err or not isinstance(data, dict):
                 return {}, err or "bad_payload"
@@ -645,40 +873,39 @@ class FinnhubClient:
                 return {}, "empty_profile"
 
             patch = _clean_patch({
-                "provider":           PROVIDER_NAME,
-                "data_source":        PROVIDER_NAME,
-                "name":               safe_str(data.get("name")),
-                "currency":           safe_str(data.get("currency")),
-                "exchange":           safe_str(data.get("exchange")),
-                "country":            safe_str(data.get("country")),
-                "sector":             safe_str(data.get("finnhubIndustry")),  # best available
-                "listing_date":       safe_str(data.get("ipo")),
-                "market_cap":         safe_float(data.get("marketCapitalization")),
-                "float_shares":       safe_float(data.get("shareOutstanding")),
-                "shares_outstanding": safe_float(data.get("shareOutstanding")),
-                "last_updated_utc":   _utc_iso(),
+                "provider": PROVIDER_NAME,
+                "data_source": PROVIDER_NAME,
+                "name": _safe_str(data.get("name")),
+                "currency": _safe_str(data.get("currency")),
+                "exchange": _safe_str(data.get("exchange")),
+                "country": _safe_str(data.get("country")),
+                "sector": _safe_str(data.get("finnhubIndustry")),
+                "listing_date": _safe_str(data.get("ipo")),
+                "market_cap": _safe_float(data.get("marketCapitalization")),
+                "float_shares": _safe_float(data.get("shareOutstanding")),
+                "shares_outstanding": _safe_float(data.get("shareOutstanding")),
+                "last_updated_utc": _utc_iso(),
                 "last_updated_riyadh": _riyadh_iso(),
             })
-            await self.profile_cache.set(ck, patch)
+            await self._profile_cache.set(cache_key, patch)
             return patch, None
 
-        return await self._sf.do(ck, _do)
+        return await self._single_flight.do(cache_key, _fetch)
 
-    # ------------------------------------------------------------------
-    # Metrics (fundamentals)
-    # ------------------------------------------------------------------
+    # -- Metrics -------------------------------------------------------
 
-    async def fetch_metrics(self, symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
+    async def _fetch_metrics(self, symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
+        """Fetch financial metrics for a symbol."""
         sym = normalize_finnhub_symbol(symbol)
         if not sym:
             return {}, "invalid_symbol"
 
-        ck = f"m:{sym}"
-        cached = await self.metric_cache.get(ck)
+        cache_key = f"m:{sym}"
+        cached = await self._metric_cache.get(cache_key)
         if cached:
             return cached, None
 
-        async def _do():
+        async def _fetch() -> Tuple[Dict[str, Any], Optional[str]]:
             data, err = await self._request_json("stock/metric", params={"symbol": sym, "metric": "all"})
             if err or not isinstance(data, dict):
                 return {}, err or "bad_payload"
@@ -687,67 +914,70 @@ class FinnhubClient:
             if not isinstance(metric, dict) or not metric:
                 return {}, "empty_metric"
 
-            # dtype=pct fields -- stored as fractions
-            div_yield    = _percentish_to_fraction(metric.get("dividendYieldIndicatedAnnual"))
-            payout       = _percentish_to_fraction(metric.get("payoutRatioTTM"))
-            roe          = _percentish_to_fraction(metric.get("roeTTM"))
-            roa          = _percentish_to_fraction(metric.get("roaTTM"))
-            net_margin_f = _percentish_to_fraction(metric.get("netMargin"))
+            # v6.0.0 bug fix: Finnhub /stock/metric returns these five fields as
+            # percent-points (e.g., 2.47 for 2.47% dividend yield, 15.5 for
+            # 15.5% ROE). v5.0.0 used `_percentish_to_fraction` whose abs>1.5
+            # heuristic left small values (<1.5%) unconverted -- a 0.8%
+            # dividend yield became a ratio of 0.8 (i.e., 80%). Unconditional
+            # /100 is correct for these known-percent fields.
+            dividend_yield = _percent_points_to_fraction(metric.get("dividendYieldIndicatedAnnual"))
+            payout_ratio = _percent_points_to_fraction(metric.get("payoutRatioTTM"))
+            roe = _percent_points_to_fraction(metric.get("roeTTM"))
+            roa = _percent_points_to_fraction(metric.get("roaTTM"))
+            profit_margin = _percent_points_to_fraction(metric.get("netMargin"))
 
-            # 52W from metrics
-            high_52 = safe_float(metric.get("52WeekHigh"))
-            low_52  = safe_float(metric.get("52WeekLow"))
+            high_52 = _safe_float(metric.get("52WeekHigh"))
+            low_52 = _safe_float(metric.get("52WeekLow"))
+            pb_value = _safe_float(metric.get("pbAnnual")) or _safe_float(metric.get("pbQuarterly"))
 
             patch = _clean_patch({
-                "provider":    PROVIDER_NAME,
+                "provider": PROVIDER_NAME,
                 "data_source": PROVIDER_NAME,
-                # --- Schema-aligned keys (primary) ---
-                "eps_ttm":        safe_float(metric.get("epsTTM")),
-                "pe_ttm":         safe_float(metric.get("peTTM")),
-                "pb_ratio":       safe_float(metric.get("pbAnnual")) or safe_float(metric.get("pbQuarterly")),  # FIX: was "pb"
-                "ps_ratio":       safe_float(metric.get("psTTM")),                                              # FIX: was "ps"
-                "beta_5y":        safe_float(metric.get("beta")),                                               # FIX: was "beta"
-                "week_52_high":   high_52,                                                                      # FIX: was "high_52w"
-                "week_52_low":    low_52,                                                                       # FIX: was "low_52w"
-                # dtype=pct fields (fractions)
-                "dividend_yield": div_yield,
-                "payout_ratio":   payout,
-                "roe":            roe,
-                "roa":            roa,
-                "profit_margin":  net_margin_f,   # FIX: was "net_margin"; schema key is profit_margin
-                # --- Backward-compat aliases ---
-                "pb":             safe_float(metric.get("pbAnnual")) or safe_float(metric.get("pbQuarterly")),
-                "ps":             safe_float(metric.get("psTTM")),
-                "beta":           safe_float(metric.get("beta")),
-                "high_52w":       high_52,
-                "low_52w":        low_52,
-                "net_margin":     net_margin_f,
-                # --- Meta ---
-                "last_updated_utc":    _utc_iso(),
+                # Schema-aligned keys
+                "eps_ttm": _safe_float(metric.get("epsTTM")),
+                "pe_ttm": _safe_float(metric.get("peTTM")),
+                "pb_ratio": pb_value,
+                "ps_ratio": _safe_float(metric.get("psTTM")),
+                "beta_5y": _safe_float(metric.get("beta")),
+                "week_52_high": high_52,
+                "week_52_low": low_52,
+                # Percent fields (fractions)
+                "dividend_yield": dividend_yield,
+                "payout_ratio": payout_ratio,
+                "roe": roe,
+                "roa": roa,
+                "profit_margin": profit_margin,
+                # Backward-compat aliases
+                "pb": pb_value,
+                "ps": _safe_float(metric.get("psTTM")),
+                "beta": _safe_float(metric.get("beta")),
+                "high_52w": high_52,
+                "low_52w": low_52,
+                "net_margin": profit_margin,
+                "last_updated_utc": _utc_iso(),
                 "last_updated_riyadh": _riyadh_iso(),
             })
-            await self.metric_cache.set(ck, patch)
+            await self._metric_cache.set(cache_key, patch)
             return patch, None
 
-        return await self._sf.do(ck, _do)
+        return await self._single_flight.do(cache_key, _fetch)
 
-    # ------------------------------------------------------------------
-    # History stats
-    # ------------------------------------------------------------------
+    # -- History + derived stats --------------------------------------
 
-    async def fetch_history_stats(self, symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
-        sym  = normalize_finnhub_symbol(symbol)
+    async def _fetch_history_stats(self, symbol: str) -> Tuple[Dict[str, Any], Optional[str]]:
+        """Fetch historical OHLCV data and derive technical statistics."""
+        sym = normalize_finnhub_symbol(symbol)
         if not sym:
             return {}, "invalid_symbol"
 
-        days = _env_int("FINNHUB_HISTORY_DAYS", 500, lo=60, hi=3000)
-        ck   = f"h:{sym}:{days}"
-        cached = await self.history_cache.get(ck)
+        days = self.config.history_days
+        cache_key = f"h:{sym}:{days}"
+        cached = await self._history_cache.get(cache_key)
         if cached:
             return cached, None
 
-        async def _do():
-            to_ts   = int(time.time())
+        async def _fetch() -> Tuple[Dict[str, Any], Optional[str]]:
+            to_ts = int(time.time())
             from_ts = to_ts - int(days * 86400)
 
             data, err = await self._request_json(
@@ -757,39 +987,36 @@ class FinnhubClient:
             if err or not isinstance(data, dict):
                 return {}, err or "bad_payload"
             if data.get("s") != "ok":
-                return {}, f"candle_status:{safe_str(data.get('s')) or 'bad'}"
+                return {}, f"candle_status:{_safe_str(data.get('s')) or 'bad'}"
 
             closes_raw = data.get("c") or []
-            vols_raw   = data.get("v") or []
-            times_raw  = data.get("t") or []
+            volumes_raw = data.get("v") or []
+            times_raw = data.get("t") or []
 
-            closes = [x for x in (safe_float(v) for v in closes_raw) if x is not None]
-            vols   = [x for x in (safe_float(v) for v in vols_raw)   if x is not None]
+            closes = [x for x in (_safe_float(v) for v in closes_raw) if x is not None]
+            volumes = [x for x in (_safe_float(v) for v in volumes_raw) if x is not None]
 
             if len(closes) < 25:
                 return {"history_points": len(closes)}, None
 
-            # 52W
-            win    = min(_env_int("FINNHUB_WINDOW_52W", 252, lo=60, hi=800), len(closes))
-            last   = closes[-1]
-            high_52 = max(closes[-win:])
-            low_52  = min(closes[-win:])
-            # week_52_position_pct stored as fraction (0..1) -- dtype=pct
+            window = min(self.config.history_window_52w, len(closes))
+            last = closes[-1]
+            high_52 = max(closes[-window:])
+            low_52 = min(closes[-window:])
             pos_52_frac = ((last - low_52) / (high_52 - low_52)) if high_52 != low_52 else None
 
-            avg_vol_30 = (sum(vols[-30:]) / 30.0) if len(vols) >= 30 else None
-            vol_30     = _volatility_30d_annualized_fraction(closes)  # annualized fraction
+            avg_vol_30 = (sum(volumes[-30:]) / 30.0) if len(volumes) >= 30 else None
+            vol_30 = _volatility_30d_annualized_fraction(closes)
 
-            ma20  = _sma(closes, 20)
-            ma50  = _sma(closes, 50)
+            ma20 = _sma(closes, 20)
+            ma50 = _sma(closes, 50)
             ma200 = _sma(closes, 200)
             rsi14 = _rsi_14(closes)
 
-            # Returns stored as fractions
-            r1w  = _returns(closes, 5)
-            r1m  = _returns(closes, 21)
-            r3m  = _returns(closes, 63)
-            r6m  = _returns(closes, 126)
+            r1w = _returns(closes, 5)
+            r1m = _returns(closes, 21)
+            r3m = _returns(closes, 63)
+            r6m = _returns(closes, 126)
             r12m = _returns(closes, 252)
 
             last_dt = None
@@ -800,233 +1027,252 @@ class FinnhubClient:
                     pass
 
             patch = _clean_patch({
-                "provider":    PROVIDER_NAME,
+                "provider": PROVIDER_NAME,
                 "data_source": PROVIDER_NAME,
-                # --- Schema-aligned keys (primary) ---
-                "week_52_high":          high_52,        # FIX: was "high_52w"
-                "week_52_low":           low_52,         # FIX: was "low_52w"
-                "week_52_position_pct":  pos_52_frac,    # fraction 0..1, dtype=pct
-                "avg_volume_30d":        avg_vol_30,     # FIX: was "avg_vol_30d"
-                "volatility_30d":        vol_30,         # annualized fraction, dtype=pct
-                "rsi_14":                rsi14,
-                "ma20":                  ma20,
-                "ma50":                  ma50,
-                "ma200":                 ma200,
-                # Returns as fractions (dtype=pct)
-                "returns_1w":   r1w,
-                "returns_1m":   r1m,
-                "returns_3m":   r3m,
-                "returns_6m":   r6m,
-                "returns_12m":  r12m,
-                # --- Backward-compat aliases ---
-                "high_52w":       high_52,
-                "low_52w":        low_52,
+                "week_52_high": high_52,
+                "week_52_low": low_52,
+                "week_52_position_pct": pos_52_frac,
+                "avg_volume_30d": avg_vol_30,
+                "volatility_30d": vol_30,
+                "rsi_14": rsi14,
+                "ma20": ma20,
+                "ma50": ma50,
+                "ma200": ma200,
+                "returns_1w": r1w,
+                "returns_1m": r1m,
+                "returns_3m": r3m,
+                "returns_6m": r6m,
+                "returns_12m": r12m,
+                # Backward-compat aliases
+                "high_52w": high_52,
+                "low_52w": low_52,
                 "position_52w_pct": pos_52_frac,
-                "avg_vol_30d":    avg_vol_30,
-                # --- Meta ---
-                "history_points":        len(closes),
-                "history_last_utc":      _utc_iso(last_dt) if last_dt else None,
-                "last_updated_utc":      _utc_iso(),
-                "last_updated_riyadh":   _riyadh_iso(),
+                "avg_vol_30d": avg_vol_30,
+                "history_points": len(closes),
+                "history_last_utc": _utc_iso(last_dt) if last_dt else None,
+                "last_updated_utc": _utc_iso(),
+                "last_updated_riyadh": _riyadh_iso(),
             })
-            await self.history_cache.set(ck, patch)
+            await self._history_cache.set(cache_key, patch)
             return patch, None
 
-        return await self._sf.do(ck, _do)
+        return await self._single_flight.do(cache_key, _fetch)
 
-    # ------------------------------------------------------------------
-    # Batch (ENH v4.3.0)
-    # ------------------------------------------------------------------
+    # -- Enriched patch (merged quote + profile + metrics + history) --
+
+    async def fetch_enriched_quote_patch(self, symbol: str) -> Dict[str, Any]:
+        """Fetch the enriched quote patch combining all available sources."""
+        now_utc = _utc_iso()
+        now_riy = _riyadh_iso()
+        raw_symbol = (symbol or "").strip()
+
+        def _error_patch(reason: str, quality: str = "MISSING") -> Dict[str, Any]:
+            return _clean_patch({
+                "provider": PROVIDER_NAME,
+                "data_source": PROVIDER_NAME,
+                "data_quality": quality,
+                "error": reason,
+                "last_updated_utc": now_utc,
+                "last_updated_riyadh": now_riy,
+            })
+
+        if not raw_symbol:
+            return _error_patch("empty_symbol")
+        if not self.config.is_available:
+            return _error_patch("provider_disabled_or_missing_key", "DISABLED")
+        if self.config.should_block_ksa(raw_symbol):
+            return _error_patch("ksa_blocked", "BLOCKED")
+        if self.config.should_block_special(raw_symbol):
+            return _error_patch("special_symbol_blocked", "BLOCKED")
+
+        variants = symbol_variants(raw_symbol) or [normalize_finnhub_symbol(raw_symbol)]
+        errors: List[str] = []
+
+        merged: Dict[str, Any] = {
+            "provider": PROVIDER_NAME,
+            "data_source": PROVIDER_NAME,
+            "last_updated_utc": now_utc,
+            "last_updated_riyadh": now_riy,
+        }
+
+        # Fetch quote with variant fallback
+        used_variant = variants[0]
+        quote_ok = False
+
+        for variant in variants[:3]:
+            patch, err = await self._fetch_quote(variant)
+            if err:
+                errors.append(f"quote:{variant}:{err}")
+                continue
+            if patch and patch.get("current_price") is not None:
+                merged.update(patch)
+                used_variant = normalize_finnhub_symbol(variant)
+                quote_ok = True
+                break
+
+        # Fetch profile / metrics / history in parallel
+        tasks: List[asyncio.Task] = []
+        if self.config.enable_profile:
+            tasks.append(asyncio.create_task(self._fetch_profile(used_variant)))
+        if self.config.enable_metric:
+            tasks.append(asyncio.create_task(self._fetch_metrics(used_variant)))
+        if self.config.enable_history:
+            tasks.append(asyncio.create_task(self._fetch_history_stats(used_variant)))
+
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    errors.append(f"exception:{result.__class__.__name__}")
+                    continue
+                patch, err = result
+                if err:
+                    errors.append(str(err))
+                if isinstance(patch, dict) and patch:
+                    for k, v in patch.items():
+                        if v is None:
+                            continue
+                        if k not in merged or merged.get(k) in (None, "", [], {}):
+                            merged[k] = v
+
+        if not quote_ok:
+            merged["data_quality"] = "MISSING"
+            merged["error"] = "fetch_failed"
+            merged["error_detail"] = ",".join(sorted(set(errors))) if errors else "no_data"
+        else:
+            merged["data_quality"] = "OK"
+            if errors:
+                merged["warning"] = "partial_sources"
+                merged["info"] = {"warnings": errors[:5]}
+
+        return _clean_patch(merged)
 
     async def get_enriched_quotes_batch(
         self,
         symbols: List[str],
-        *,
         mode: str = "",
     ) -> Dict[str, Dict[str, Any]]:
         """
-        Fetch enriched patches for multiple symbols concurrently.
-        Returns {requested_symbol: patch_dict}.
+        Batch fetch enriched quote patches for multiple symbols.
+
+        Note: batch_concurrency gates symbols-in-flight; max_concurrency
+        (inside _request_json) gates HTTP requests. These are intentionally
+        different layers -- NOT double-gating the same thing.
         """
         if not symbols:
             return {}
-        sem = asyncio.Semaphore(max(1, _env_int("FINNHUB_BATCH_CONCURRENCY", 8, lo=1, hi=32)))
 
-        async def _one(sym: str) -> Tuple[str, Dict[str, Any]]:
-            async with sem:
+        semaphore = asyncio.Semaphore(max(1, self.config.batch_concurrency))
+
+        async def _fetch_one(sym: str) -> Tuple[str, Dict[str, Any]]:
+            async with semaphore:
                 try:
-                    patch = await fetch_enriched_quote_patch(sym)
+                    patch = await self.fetch_enriched_quote_patch(sym)
                     return sym, patch
-                except Exception as e:
+                except Exception as exc:
                     return sym, _clean_patch({
-                        "symbol":       sym,
-                        "provider":     PROVIDER_NAME,
+                        "symbol": sym,
+                        "provider": PROVIDER_NAME,
                         "data_quality": "MISSING",
-                        "error":        f"batch_error:{e.__class__.__name__}",
+                        "error": f"batch_error:{exc.__class__.__name__}",
                         "last_updated_utc": _utc_iso(),
                     })
 
-        results = await asyncio.gather(*[_one(s) for s in symbols], return_exceptions=True)
-        out: Dict[str, Dict[str, Any]] = {}
-        for r in results:
-            if isinstance(r, Exception):
-                continue
-            sym, patch = r
-            key = sym
-            if isinstance(patch, dict):
-                key = patch.get("symbol") or sym
-            out[key] = patch
-        return out
+        results = await asyncio.gather(
+            *(_fetch_one(sym) for sym in symbols),
+            return_exceptions=True,
+        )
 
-    async def aclose(self) -> None:
+        output: Dict[str, Dict[str, Any]] = {}
+        for result in results:
+            if isinstance(result, Exception):
+                continue
+            sym, patch = result
+            key = patch.get("symbol") or sym
+            output[key] = patch
+        return output
+
+    async def close(self) -> None:
+        """Close the underlying httpx client."""
         try:
             await self._client.aclose()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("finnhub client close failed: %s", exc)
 
 
-# =============================================================================
-# Singleton
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Singleton Client (lazy lock)
+# ---------------------------------------------------------------------------
 
-_INSTANCE:      Optional[FinnhubClient] = None
-_INSTANCE_LOCK  = asyncio.Lock()
+_CLIENT_INSTANCE: Optional[FinnhubClient] = None
+_CLIENT_LOCK: Optional[asyncio.Lock] = None
+
+
+def _get_client_lock() -> asyncio.Lock:
+    global _CLIENT_LOCK
+    if _CLIENT_LOCK is None:
+        _CLIENT_LOCK = asyncio.Lock()
+    return _CLIENT_LOCK
 
 
 async def get_client() -> FinnhubClient:
-    global _INSTANCE
-    if _INSTANCE is None:
-        async with _INSTANCE_LOCK:
-            if _INSTANCE is None:
-                _INSTANCE = FinnhubClient()
-    return _INSTANCE
+    """Get the singleton FinnhubClient instance."""
+    global _CLIENT_INSTANCE
+    if _CLIENT_INSTANCE is not None:
+        return _CLIENT_INSTANCE
+    async with _get_client_lock():
+        if _CLIENT_INSTANCE is None:
+            _CLIENT_INSTANCE = FinnhubClient()
+    return _CLIENT_INSTANCE
 
 
 async def close_client() -> None:
-    global _INSTANCE
-    if _INSTANCE is not None:
-        await _INSTANCE.aclose()
-        _INSTANCE = None
+    """Close and reset the singleton client."""
+    global _CLIENT_INSTANCE
+    if _CLIENT_INSTANCE is not None:
+        await _CLIENT_INSTANCE.close()
+        _CLIENT_INSTANCE = None
 
 
-def _enabled() -> bool:
-    if not _env_bool("FINNHUB_ENABLED", True):
-        return False
-    return bool(_token())
-
-
-# =============================================================================
-# Main provider entrypoint
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Engine-Facing Functions
+# ---------------------------------------------------------------------------
 
 async def fetch_enriched_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    """
-    Main provider entrypoint used by DataEngine.
-    Returns a mergeable patch aligned with schema_registry v3.0.0.
-    Never raises.
-    """
-    now_utc = _utc_iso()
-    now_riy = _riyadh_iso()
-    raw = (symbol or "").strip()
-
-    def _err(reason: str, quality: str = "MISSING") -> Dict[str, Any]:
-        return _clean_patch({
-            "provider":          PROVIDER_NAME,
-            "data_source":       PROVIDER_NAME,
-            "data_quality":      quality,
-            "error":             reason,
-            "last_updated_utc":  now_utc,
-            "last_updated_riyadh": now_riy,
-        })
-
-    if not raw:             return _err("empty_symbol")
-    if not _enabled():      return _err("provider_disabled_or_missing_key", "DISABLED")
-    if looks_like_ksa(raw): return _err("ksa_blocked", "BLOCKED")
-    if is_blocked_special(raw): return _err("special_symbol_blocked", "BLOCKED")
-
+    """Fetch enriched quote patch for a symbol. Extra args/kwargs ignored."""
+    if args or kwargs:
+        logger.debug(
+            "fetch_enriched_quote_patch(%s): ignoring args=%r kwargs=%r",
+            symbol, args, kwargs,
+        )
     client = await get_client()
+    return await client.fetch_enriched_quote_patch(symbol)
 
-    # FIX v4.3.0: respect global FUNDAMENTALS_ENABLED flag
-    global_fund  = _fundamentals_enabled()
-    enable_profile  = global_fund and _env_bool("FINNHUB_ENABLE_PROFILE", True)
-    enable_metric   = global_fund and _env_bool("FINNHUB_ENABLE_METRIC",  True)
-    enable_history  = _env_bool("FINNHUB_ENABLE_HISTORY", True)
-
-    variants   = symbol_variants(raw) or [normalize_finnhub_symbol(raw)]
-    errors:    List[str] = []
-    merged: Dict[str, Any] = {
-        "provider":          PROVIDER_NAME,
-        "data_source":       PROVIDER_NAME,
-        "last_updated_utc":  now_utc,
-        "last_updated_riyadh": now_riy,
-    }
-
-    # Quote -- try symbol variants
-    used_variant = variants[0]
-    quote_ok = False
-    for v in variants[:3]:
-        patch, err = await client.fetch_quote(v)
-        if err:
-            errors.append(f"quote:{v}:{err}")
-            continue
-        if patch and patch.get("current_price") is not None:
-            merged.update(patch)
-            used_variant = normalize_finnhub_symbol(v)
-            quote_ok = True
-            break
-
-    # Profile / metrics / history (best-effort)
-    tasks: List[asyncio.Task] = []
-    if enable_profile: tasks.append(asyncio.create_task(client.fetch_profile(used_variant)))
-    if enable_metric:  tasks.append(asyncio.create_task(client.fetch_metrics(used_variant)))
-    if enable_history: tasks.append(asyncio.create_task(client.fetch_history_stats(used_variant)))
-
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    for r in results:
-        if isinstance(r, Exception):
-            errors.append(f"exception:{r.__class__.__name__}")
-            continue
-        patch, err = r  # type: ignore
-        if err: errors.append(str(err))
-        if isinstance(patch, dict) and patch:
-            for k, v in patch.items():
-                if v is None: continue
-                if k not in merged or merged.get(k) in (None, "", [], {}):
-                    merged[k] = v
-
-    if not quote_ok:
-        merged["data_quality"] = "MISSING"
-        merged["error"]        = "fetch_failed"
-        merged["error_detail"] = ",".join(sorted(set(errors))) if errors else "no_data"
-    else:
-        merged["data_quality"] = "OK"
-        if errors:
-            merged["warning"] = "partial_sources"
-
-    return _clean_patch(merged)
-
-
-# =============================================================================
-# Additional module-level functions
-# =============================================================================
 
 async def fetch_enriched_quotes_batch(
-    symbols: List[str], *, mode: str = "", **kwargs: Any
+    symbols: List[str],
+    mode: str = "",
+    **kwargs: Any,
 ) -> Dict[str, Dict[str, Any]]:
-    """ENH v4.3.0: Batch fetch enriched patches for multiple symbols."""
+    """Batch fetch enriched quote patches for multiple symbols."""
+    if kwargs:
+        logger.debug("fetch_enriched_quotes_batch: ignoring kwargs=%r", kwargs)
     client = await get_client()
     return await client.get_enriched_quotes_batch(symbols, mode=mode)
 
 
 async def fetch_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    """Fetch quote patch (quote only, no enrichment)."""
+    if args or kwargs:
+        logger.debug("fetch_quote_patch(%s): ignoring args=%r kwargs=%r", symbol, args, kwargs)
     client = await get_client()
-    v      = normalize_finnhub_symbol(symbol)
-    patch, err = await client.fetch_quote(v)
+    sym = normalize_finnhub_symbol(symbol)
+    patch, err = await client._fetch_quote(sym)
     if err:
         return _clean_patch({
-            "provider":     PROVIDER_NAME,
-            "data_source":  PROVIDER_NAME,
-            "error":        err,
+            "provider": PROVIDER_NAME,
+            "data_source": PROVIDER_NAME,
+            "error": err,
             "data_quality": "MISSING",
         })
     patch.setdefault("data_quality", "OK")
@@ -1034,18 +1280,41 @@ async def fetch_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str,
 
 
 async def fetch_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    """Alias for fetch_enriched_quote_patch."""
     return await fetch_enriched_quote_patch(symbol, *args, **kwargs)
 
 
+# ---------------------------------------------------------------------------
+# Module Exports
+# ---------------------------------------------------------------------------
+
 __all__ = [
+    # Metadata
     "PROVIDER_NAME",
     "PROVIDER_VERSION",
+    "VERSION",
     "PROVIDER_BATCH_SUPPORTED",
+    # Classes
+    "FinnhubConfig",
+    "FinnhubClient",
+    # Singletons
+    "get_client",
+    "close_client",
+    # Engine-facing
     "fetch_enriched_quote_patch",
     "fetch_enriched_quotes_batch",
     "fetch_quote_patch",
     "fetch_patch",
-    "get_client",
-    "close_client",
+    # Symbol helpers
     "normalize_finnhub_symbol",
+    "symbol_variants",
+    "looks_like_ksa",
+    "is_blocked_special",
+    # Exceptions (kept for back-compat even though unraised internally)
+    "FinnhubProviderError",
+    "FinnhubAuthError",
+    "FinnhubNotFoundError",
+    "FinnhubRateLimitError",
+    "FinnhubCircuitOpenError",
+    "FinnhubFetchError",
 ]
