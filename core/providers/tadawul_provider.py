@@ -2,27 +2,58 @@
 # core/providers/tadawul_provider.py
 """
 ================================================================================
-Tadawul Provider (KSA Market Data) — v4.4.0
+Tadawul Provider (KSA Market Data) -- v6.0.0
 ================================================================================
 
-Why this revision
------------------
-- Stronger KSA quote/profile extraction from sparse Tadawul payloads
-- History parser now supports OHLCV arrays and list-of-dict payloads
-- History patch can now backfill quote fields when real-time payload is sparse:
-    current_price, previous_close, open_price, day_high, day_low, volume
-- Adds history-derived:
-    avg_volume_10d, avg_volume_30d,
-    week_52_high, week_52_low, week_52_position_pct,
-    rsi_14, volatility_30d
-- Keeps KSA defaults guaranteed:
-    country=SAU, currency=SAR, exchange=Tadawul
-- Keeps startup-safe import behavior and async-compatible public exports
+Purpose
+-------
+Provides KSA market data from Tadawul API:
+  - Real-time quotes for Saudi symbols
+  - Company profiles and classification
+  - Fundamental data and financial metrics
+  - Historical OHLCV data with technical indicators
+  - KSA-specific symbol normalization and defaults
 
-Notes
------
-- This provider remains KSA-only.
-- Argaam should still be the next fallback for missing classification/profile fields.
+v6.0.0 Changes (from v5.0.0)
+----------------------------
+Bug fixes:
+  - 404 responses no longer fall through to JSON parsing. v5.0.0 had
+    `if status_code >= 400 and status_code != 404: return ...` which
+    means a 404 with a JSON error body was parsed and returned as
+    *successful* data. Now handled explicitly, matching EODHD/Finnhub.
+  - `percent_change` is computed from current/previous FIRST, falling
+    back to the API field only when prices aren't available. v5.0.0
+    used `_pick_ratio` on the API field, which applied the `|v| > 1.5`
+    heuristic -- so a 0.75% daily move (raw value 0.75) was kept as a
+    ratio of 0.75 (i.e., 75%). The fallback in `_fill_derived_quote_fields`
+    only fires when the field is None, so the poisoned value never got
+    corrected. Same class of fix as Finnhub v6.
+  - All asyncio primitives (Lock, Semaphore) lazy-initialized in async
+    methods rather than constructors. Affected: TokenBucket._lock,
+    SmartCache._lock, SingleFlight._lock, TadawulClient._semaphore,
+    module _CLIENT_LOCK.
+
+Cleanup:
+  - Removed unused imports: `cast`, `numpy` (+ `_HAS_NUMPY` flag).
+    numpy was imported with a try/except but never actually called.
+  - Removed dead `self._closing` flag (set but never read).
+  - Engine-facing functions log a debug line when extra args/kwargs are
+    dropped (parity with other v6 providers).
+
+Preserved for backward compatibility:
+  - Every name in __all__.
+  - All environment variable names and defaults.
+  - Patch shape (including the lowercase DataQuality values
+    "excellent"/"good"/"fair"/"poor"/"bad" that are unique to this
+    provider -- other providers use "OK"/"MISSING"/"BLOCKED").
+  - Provider adapter + singleton (`provider`, `get_provider`,
+    `build_provider`).
+  - MarketRegime enum (exported but unused internally; external code
+    may import it).
+  - Optional OpenTelemetry / Prometheus integration.
+  - _map_fundamentals still uses the `_to_ratio` heuristic because
+    Tadawul's data source is configurable via env URLs -- could be
+    any aggregator with any scale convention. Conservative default.
 ================================================================================
 """
 
@@ -36,99 +67,100 @@ import math
 import os
 import random
 import re
-import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import httpx
 
-# =============================================================================
-# Optional numeric stack (never crash if missing)
-# =============================================================================
-try:
-    import numpy as _np  # type: ignore
-    _HAS_NUMPY = True
-except Exception:
-    _np = None  # type: ignore
-    _HAS_NUMPY = False
+# ---------------------------------------------------------------------------
+# Optional Dependencies (prod-safe)
+# ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# High-performance JSON fallback
-# ---------------------------------------------------------------------------
+# JSON parser (orjson preferred)
 try:
     import orjson  # type: ignore
 
-    def json_loads(data: Union[str, bytes]) -> Any:
+    def _json_loads(data: Union[str, bytes]) -> Any:
+        if isinstance(data, str):
+            data = data.encode("utf-8")
         return orjson.loads(data)
-
-except Exception:
-
-    def json_loads(data: Union[str, bytes]) -> Any:
-        if isinstance(data, (bytes, bytearray)):
+except ImportError:
+    def _json_loads(data: Union[str, bytes]) -> Any:
+        if isinstance(data, bytes):
             data = data.decode("utf-8", errors="replace")
         return json.loads(data)
 
-# ---------------------------------------------------------------------------
-# Optional tracing/metrics (safe)
-# ---------------------------------------------------------------------------
+# OpenTelemetry (optional)
 try:
     from opentelemetry import trace  # type: ignore
     from opentelemetry.trace import Status, StatusCode  # type: ignore
-
     _OTEL_AVAILABLE = True
-except Exception:
-    trace = None  # type: ignore
-    Status = None  # type: ignore
-    StatusCode = None  # type: ignore
+except ImportError:
+    trace = None  # type: ignore[assignment]
+    Status = None  # type: ignore[assignment]
+    StatusCode = None  # type: ignore[assignment]
     _OTEL_AVAILABLE = False
 
+# Prometheus (optional)
 try:
     from prometheus_client import Counter, Gauge  # type: ignore
-
     _PROM_AVAILABLE = True
-except Exception:
-    Counter = Gauge = None  # type: ignore
+except ImportError:
+    Counter = None  # type: ignore[assignment]
+    Gauge = None  # type: ignore[assignment]
     _PROM_AVAILABLE = False
 
-logger = logging.getLogger("core.providers.tadawul_provider")
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+logger = logging.getLogger(__name__)
 logger.addHandler(logging.NullHandler())
 
-PROVIDER_NAME = "tadawul"
-PROVIDER_VERSION         = "4.5.0"
-PROVIDER_BATCH_SUPPORTED = True   # ENH v4.5.0
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
-USER_AGENT_DEFAULT = (
+PROVIDER_NAME = "tadawul"
+PROVIDER_VERSION = "6.0.0"
+VERSION = PROVIDER_VERSION
+PROVIDER_BATCH_SUPPORTED = True
+
+# KSA defaults
+KSA_COUNTRY_CODE = "SAU"
+KSA_COUNTRY_NAME = "Saudi Arabia"
+KSA_EXCHANGE_NAME = "Tadawul"
+KSA_CURRENCY = "SAR"
+KSA_TIMEZONE = timezone(timedelta(hours=3))
+
+# Default configuration values
+DEFAULT_TIMEOUT_SEC = 25.0
+DEFAULT_RETRY_ATTEMPTS = 4
+DEFAULT_MAX_CONCURRENCY = 30
+DEFAULT_RATE_LIMIT = 15.0
+DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/124.0.0.0 Safari/537.36"
 )
 
-DEFAULT_TIMEOUT_SEC = 25.0
-DEFAULT_RETRY_ATTEMPTS = 4
-DEFAULT_MAX_CONCURRENCY = 30
-DEFAULT_RATE_LIMIT = 15.0
-
-_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
+_ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _KSA_CODE_RE = re.compile(r"^\d{3,6}$", re.IGNORECASE)
-
-_TRACING_ENABLED = os.getenv("TADAWUL_TRACING_ENABLED", "").strip().lower() in _TRUTHY
-_METRICS_ENABLED = os.getenv("TADAWUL_METRICS_ENABLED", "").strip().lower() in _TRUTHY
-
-KSA_COUNTRY_CODE = "SAU"
-KSA_COUNTRY_NAME = "Saudi Arabia"
-KSA_EXCHANGE_NAME = "Tadawul"
-KSA_CURRENCY = "SAR"
+_K_M_B_RE = re.compile(r"^(-?\d+(?:\.\d+)?)([KMB])$", re.IGNORECASE)
+_K_M_B_MULT = {"K": 1_000.0, "M": 1_000_000.0, "B": 1_000_000_000.0}
 
 
-# =============================================================================
-# Enums & data classes
-# =============================================================================
-class MarketRegime(Enum):
+# ---------------------------------------------------------------------------
+# Enums
+# ---------------------------------------------------------------------------
+
+class MarketRegime(str, Enum):
+    """Market regime classification (exported for external consumers)."""
     BULL = "bull"
     BEAR = "bear"
     VOLATILE = "volatile"
@@ -136,7 +168,8 @@ class MarketRegime(Enum):
     UNKNOWN = "unknown"
 
 
-class DataQuality(Enum):
+class DataQuality(str, Enum):
+    """Data quality levels (Tadawul-specific; other providers use different scales)."""
     EXCELLENT = "excellent"
     GOOD = "good"
     FAIR = "fair"
@@ -144,167 +177,144 @@ class DataQuality(Enum):
     BAD = "bad"
 
 
-@dataclass
-class RequestQueueItem:
-    priority: int
-    url: str
-    future: asyncio.Future
-    created_at: float = field(default_factory=time.time)
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TadawulConfig:
+    """Immutable configuration for Tadawul provider."""
+
+    enabled: bool = True
+    quote_url: str = ""
+    fundamentals_url: str = ""
+    history_url: str = ""
+    profile_url: str = ""
+    timeout_sec: float = DEFAULT_TIMEOUT_SEC
+    retry_attempts: int = DEFAULT_RETRY_ATTEMPTS
+    max_concurrency: int = DEFAULT_MAX_CONCURRENCY
+    rate_limit: float = DEFAULT_RATE_LIMIT
+    user_agent: str = DEFAULT_USER_AGENT
+    extra_headers: Dict[str, str] = field(default_factory=dict)
+    verbose_warnings: bool = False
+    enable_fundamentals: bool = True
+    enable_history: bool = True
+    enable_profile: bool = True
+    enable_forecast: bool = True
+    history_days: int = 500
+    history_points_max: int = 1000
+    quote_ttl_sec: float = 15.0
+    fund_ttl_sec: float = 21600.0
+    hist_ttl_sec: float = 1800.0
+    profile_ttl_sec: float = 43200.0
+    error_ttl_sec: float = 10.0
+    tracing_enabled: bool = False
+    metrics_enabled: bool = False
+
+    @classmethod
+    def from_env(cls) -> "TadawulConfig":
+        """Load configuration from environment variables."""
+
+        def _env_str(name: str, default: str = "") -> str:
+            v = os.getenv(name)
+            return str(v).strip() if v is not None and str(v).strip() else default
+
+        def _env_int(name: str, default: int) -> int:
+            v = os.getenv(name)
+            try:
+                return int(str(v).strip()) if v is not None else default
+            except Exception:
+                return default
+
+        def _env_float(name: str, default: float) -> float:
+            v = os.getenv(name)
+            try:
+                return float(str(v).strip()) if v is not None else default
+            except Exception:
+                return default
+
+        def _env_bool(name: str, default: bool) -> bool:
+            raw = (os.getenv(name) or "").strip().lower()
+            if not raw:
+                return default
+            if raw in _TRUTHY:
+                return True
+            if raw in _FALSY:
+                return False
+            return default
+
+        def _extra_headers() -> Dict[str, str]:
+            raw = _env_str("TADAWUL_HEADERS_JSON", "")
+            if not raw:
+                return {}
+            try:
+                obj = json.loads(raw)
+                if isinstance(obj, dict):
+                    return {
+                        str(k).strip(): str(v).strip()
+                        for k, v in obj.items()
+                        if str(k).strip() and str(v).strip()
+                    }
+            except Exception:
+                pass
+            return {}
+
+        return cls(
+            enabled=_env_bool("TADAWUL_ENABLED", True),
+            quote_url=_env_str("TADAWUL_QUOTE_URL", ""),
+            fundamentals_url=_env_str("TADAWUL_FUNDAMENTALS_URL", ""),
+            history_url=_env_str("TADAWUL_HISTORY_URL", "") or _env_str("TADAWUL_CANDLES_URL", ""),
+            profile_url=_env_str("TADAWUL_PROFILE_URL", ""),
+            timeout_sec=max(5.0, _env_float("TADAWUL_TIMEOUT_SEC", DEFAULT_TIMEOUT_SEC)),
+            retry_attempts=max(1, _env_int("TADAWUL_RETRY_ATTEMPTS", DEFAULT_RETRY_ATTEMPTS)),
+            max_concurrency=max(2, _env_int("TADAWUL_MAX_CONCURRENCY", DEFAULT_MAX_CONCURRENCY)),
+            rate_limit=max(0.0, _env_float("TADAWUL_RATE_LIMIT", DEFAULT_RATE_LIMIT)),
+            user_agent=_env_str("TADAWUL_USER_AGENT", DEFAULT_USER_AGENT),
+            extra_headers=_extra_headers(),
+            verbose_warnings=_env_bool("TADAWUL_VERBOSE_WARNINGS", False),
+            enable_fundamentals=_env_bool("TADAWUL_ENABLE_FUNDAMENTALS", True),
+            enable_history=_env_bool("TADAWUL_ENABLE_HISTORY", True),
+            enable_profile=_env_bool("TADAWUL_ENABLE_PROFILE", True),
+            enable_forecast=_env_bool("TADAWUL_ENABLE_FORECAST", True),
+            history_days=max(60, _env_int("TADAWUL_HISTORY_DAYS", 500)),
+            history_points_max=max(100, _env_int("TADAWUL_HISTORY_POINTS_MAX", 1000)),
+            quote_ttl_sec=max(5.0, _env_float("TADAWUL_QUOTE_TTL_SEC", 15.0)),
+            fund_ttl_sec=max(300.0, _env_float("TADAWUL_FUNDAMENTALS_TTL_SEC", 21600.0)),
+            hist_ttl_sec=max(300.0, _env_float("TADAWUL_HISTORY_TTL_SEC", 1800.0)),
+            profile_ttl_sec=max(3600.0, _env_float("TADAWUL_PROFILE_TTL_SEC", 43200.0)),
+            error_ttl_sec=max(5.0, _env_float("TADAWUL_ERROR_TTL_SEC", 10.0)),
+            tracing_enabled=_env_bool("TADAWUL_TRACING_ENABLED", False),
+            metrics_enabled=_env_bool("TADAWUL_METRICS_ENABLED", False),
+        )
+
+    @property
+    def is_configured(self) -> bool:
+        """Return True if the provider has at least the quote URL configured."""
+        return self.enabled and bool(self.quote_url)
 
 
-@dataclass
-class ParsedHistory:
-    rows: List[Dict[str, Any]]
-    last_dt: Optional[datetime]
+# ---------------------------------------------------------------------------
+# Custom Exceptions
+# ---------------------------------------------------------------------------
+
+class TadawulProviderError(Exception):
+    """Base exception for Tadawul provider errors."""
 
 
-# =============================================================================
-# Shared normalizer integration (optional)
-# =============================================================================
-def _try_import_shared_ksa_helpers() -> Tuple[Optional[Any], Optional[Any]]:
-    try:
-        from core.symbols.normalize import normalize_ksa_symbol as _nksa  # type: ignore
-        from core.symbols.normalize import looks_like_ksa as _lk  # type: ignore
-        return _nksa, _lk
-    except Exception:
-        return None, None
+class TadawulConfigurationError(TadawulProviderError):
+    """Raised when provider is not properly configured."""
 
 
-_SHARED_NORM_KSA, _SHARED_LOOKS_KSA = _try_import_shared_ksa_helpers()
+class TadawulFetchError(TadawulProviderError):
+    """Raised when a data fetch fails."""
 
 
-# =============================================================================
-# Environment helpers
-# =============================================================================
-def _env_str(name: str, default: str = "") -> str:
-    v = os.getenv(name)
-    return str(v).strip() if v is not None and str(v).strip() else default
-
-
-def _env_int(name: str, default: int) -> int:
-    v = os.getenv(name)
-    try:
-        return int(str(v).strip()) if v is not None else default
-    except Exception:
-        return default
-
-
-def _env_float(name: str, default: float) -> float:
-    v = os.getenv(name)
-    try:
-        return float(str(v).strip()) if v is not None else default
-    except Exception:
-        return default
-
-
-def _env_bool(name: str, default: bool) -> bool:
-    raw = (os.getenv(name) or "").strip().lower()
-    if not raw:
-        return default
-    if raw in _TRUTHY:
-        return True
-    if raw in _FALSY:
-        return False
-    return default
-
-
-def _safe_str(x: Any) -> Optional[str]:
-    if x is None:
-        return None
-    s = str(x).strip()
-    return s if s else None
-
-
-def _configured() -> bool:
-    if not _env_bool("TADAWUL_ENABLED", True):
-        return False
-    return bool(_safe_str(_env_str("TADAWUL_QUOTE_URL", "")))
-
-
-def _emit_warnings() -> bool:
-    return _env_bool("TADAWUL_VERBOSE_WARNINGS", False)
-
-
-def _enable_fundamentals() -> bool:
-    return _env_bool("TADAWUL_ENABLE_FUNDAMENTALS", True)
-
-
-def _enable_history() -> bool:
-    return _env_bool("TADAWUL_ENABLE_HISTORY", True)
-
-
-def _enable_profile() -> bool:
-    return _env_bool("TADAWUL_ENABLE_PROFILE", True)
-
-
-def _enable_forecast() -> bool:
-    return _env_bool("TADAWUL_ENABLE_FORECAST", True)
-
-
-def _timeout_sec() -> float:
-    return max(5.0, _env_float("TADAWUL_TIMEOUT_SEC", DEFAULT_TIMEOUT_SEC))
-
-
-def _retry_attempts() -> int:
-    return max(1, _env_int("TADAWUL_RETRY_ATTEMPTS", DEFAULT_RETRY_ATTEMPTS))
-
-
-def _rate_limit() -> float:
-    return max(0.0, _env_float("TADAWUL_RATE_LIMIT", DEFAULT_RATE_LIMIT))
-
-
-def _max_concurrency() -> int:
-    return max(2, _env_int("TADAWUL_MAX_CONCURRENCY", DEFAULT_MAX_CONCURRENCY))
-
-
-def _quote_ttl_sec() -> float:
-    return max(5.0, _env_float("TADAWUL_QUOTE_TTL_SEC", 15.0))
-
-
-def _fund_ttl_sec() -> float:
-    return max(300.0, _env_float("TADAWUL_FUNDAMENTALS_TTL_SEC", 21600.0))
-
-
-def _hist_ttl_sec() -> float:
-    return max(300.0, _env_float("TADAWUL_HISTORY_TTL_SEC", 1800.0))
-
-
-def _profile_ttl_sec() -> float:
-    return max(3600.0, _env_float("TADAWUL_PROFILE_TTL_SEC", 43200.0))
-
-
-def _err_ttl_sec() -> float:
-    return max(5.0, _env_float("TADAWUL_ERROR_TTL_SEC", 10.0))
-
-
-def _history_days() -> int:
-    return max(60, _env_int("TADAWUL_HISTORY_DAYS", 500))
-
-
-def _history_points_max() -> int:
-    return max(100, _env_int("TADAWUL_HISTORY_POINTS_MAX", 1000))
-
-
-def _extra_headers() -> Dict[str, str]:
-    raw = _env_str("TADAWUL_HEADERS_JSON", "")
-    if not raw:
-        return {}
-    try:
-        obj = json.loads(raw)
-        if isinstance(obj, dict):
-            return {str(k).strip(): str(v).strip() for k, v in obj.items() if str(k).strip() and str(v).strip()}
-    except Exception:
-        pass
-    return {}
-
-
-# =============================================================================
-# Time helpers
-# =============================================================================
-_RIYADH_TZ = timezone(timedelta(hours=3))
-
+# ---------------------------------------------------------------------------
+# Pure Utility Functions
+# ---------------------------------------------------------------------------
 
 def _utc_iso(dt: Optional[datetime] = None) -> str:
+    """Get UTC time in ISO format."""
     d = dt or datetime.now(timezone.utc)
     if d.tzinfo is None:
         d = d.replace(tzinfo=timezone.utc)
@@ -312,248 +322,131 @@ def _utc_iso(dt: Optional[datetime] = None) -> str:
 
 
 def _riyadh_iso(dt: Optional[datetime] = None) -> str:
-    d = dt or datetime.now(_RIYADH_TZ)
+    """Get Riyadh time (UTC+3) in ISO format."""
+    d = dt or datetime.now(KSA_TIMEZONE)
     if d.tzinfo is None:
-        d = d.replace(tzinfo=_RIYADH_TZ)
-    return d.astimezone(_RIYADH_TZ).isoformat()
+        d = d.replace(tzinfo=KSA_TIMEZONE)
+    return d.astimezone(KSA_TIMEZONE).isoformat()
 
 
 def _to_riyadh_iso(dt: Optional[datetime]) -> Optional[str]:
+    """Convert datetime to Riyadh ISO format; returns None for None input."""
     if not dt:
         return None
     d = dt
     if d.tzinfo is None:
         d = d.replace(tzinfo=timezone.utc)
-    return d.astimezone(_RIYADH_TZ).isoformat()
+    return d.astimezone(KSA_TIMEZONE).isoformat()
 
 
-# =============================================================================
-# Symbol normalization (strict KSA)
-# =============================================================================
-def normalize_ksa_symbol(symbol: str) -> str:
-    raw = (symbol or "").strip()
-    if not raw:
-        return ""
-    raw = raw.translate(_ARABIC_DIGITS).strip()
+def _safe_float(value: Any) -> Optional[float]:
+    """
+    Safely convert value to float with Arabic digit support.
 
-    if callable(_SHARED_NORM_KSA):
-        try:
-            s = (_SHARED_NORM_KSA(raw) or "").strip().upper()
-            if s.endswith(".SR"):
-                code = s[:-3].strip()
-                return f"{code}.SR" if _KSA_CODE_RE.match(code) else ""
-            return ""
-        except Exception:
-            pass
-
-    s = raw.strip().upper()
-    if s.startswith("TADAWUL:"):
-        s = s.split(":", 1)[1].strip()
-    if s.endswith(".SR"):
-        code = s[:-3].strip()
-        return f"{code}.SR" if _KSA_CODE_RE.match(code) else ""
-    if _KSA_CODE_RE.match(s):
-        return f"{s}.SR"
-    return ""
-
-
-def format_url(template: str, symbol: str, *, days: Optional[int] = None) -> str:
-    sym = normalize_ksa_symbol(symbol)
-    if not sym:
-        return template
-    code = sym[:-3] if sym.endswith(".SR") else sym
-    url = template.replace("{symbol}", sym).replace("{code}", code)
-    if days is not None:
-        url = url.replace("{days}", str(int(days)))
-    return url
-
-
-# =============================================================================
-# Small helpers
-# =============================================================================
-def _diff(arr: List[float]) -> List[float]:
-    if len(arr) < 2:
-        return []
-    return [arr[i] - arr[i - 1] for i in range(1, len(arr))]
-
-
-def _std(arr: List[float]) -> float:
-    if len(arr) < 2:
-        return 0.0
-    mean = sum(arr) / len(arr)
-    var = sum((x - mean) ** 2 for x in arr) / (len(arr) - 1)
-    return math.sqrt(max(0.0, var))
-
-
-def _mean(arr: List[float]) -> float:
-    return sum(arr) / len(arr) if arr else 0.0
-
-
-def safe_float(val: Any) -> Optional[float]:
-    if val is None:
+    Handles Arabic digits (٠-٩), Arabic separators (٬ ٫), currency labels
+    (SAR, ريال), percentage signs, K/M/B suffixes, and parentheses for
+    negatives.
+    """
+    if value is None:
         return None
+
     try:
-        if isinstance(val, (int, float)) and not isinstance(val, bool):
-            f = float(val)
-            return f if not math.isnan(f) and not math.isinf(f) else None
-        s = str(val).strip()
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            f = float(value)
+            return None if (math.isnan(f) or math.isinf(f)) else f
+
+        s = str(value).strip()
         if not s or s.lower() in {"-", "—", "n/a", "na", "null", "none"}:
             return None
-        s = s.translate(_ARABIC_DIGITS).replace("٬", ",").replace("٫", ".").replace("−", "-")
-        s = s.replace("SAR", "").replace("ريال", "").replace("%", "").replace(",", "").replace("+", "").strip()
+
+        s = s.translate(_ARABIC_DIGITS)
+        s = s.replace("٬", ",").replace("٫", ".").replace("−", "-")
+        s = s.replace("SAR", "").replace("ريال", "")
+        s = s.replace("%", "").replace(",", "").replace("+", "").strip()
+
         if s.startswith("(") and s.endswith(")"):
             s = "-" + s[1:-1].strip()
-        m = re.match(r"^(-?\d+(\.\d+)?)([KMB])$", s, re.IGNORECASE)
-        mult = 1.0
-        if m:
-            s = m.group(1)
-            suf = m.group(3).upper()
-            mult = 1_000.0 if suf == "K" else 1_000_000.0 if suf == "M" else 1_000_000_000.0
-        f = float(s) * mult
-        return f if not math.isnan(f) and not math.isinf(f) else None
+
+        match = _K_M_B_RE.match(s)
+        if match:
+            f = float(match.group(1)) * _K_M_B_MULT[match.group(2).upper()]
+        else:
+            f = float(s)
+
+        return None if (math.isnan(f) or math.isinf(f)) else f
+    except (ValueError, TypeError):
+        return None
+
+
+def _safe_int(value: Any) -> Optional[int]:
+    """Safely convert value to int."""
+    f = _safe_float(value)
+    return int(round(f)) if f is not None else None
+
+
+def _safe_str(value: Any) -> Optional[str]:
+    """Safely convert to non-empty stripped string; None for empty."""
+    if value is None:
+        return None
+    try:
+        s = str(value).strip()
+        return s if s else None
     except Exception:
         return None
 
 
-def safe_int(val: Any) -> Optional[int]:
-    f = safe_float(val)
-    return int(round(f)) if f is not None else None
-
-
-def safe_str(val: Any) -> Optional[str]:
-    return str(val).strip() if val is not None and str(val).strip() else None
-
-
-def unwrap_common_envelopes(js: Union[dict, list]) -> Union[dict, list]:
-    current = js
-    for _ in range(5):
-        if not isinstance(current, dict):
-            break
-        for key in ("data", "result", "payload", "quote", "profile", "response", "content", "results", "items"):
-            nxt = current.get(key)
-            if isinstance(nxt, (dict, list)):
-                current = nxt
-                break
-        else:
-            break
-    return current
-
-
-def coerce_dict(data: Union[dict, list]) -> dict:
-    if isinstance(data, dict):
-        return data
-    if isinstance(data, list) and data and isinstance(data[0], dict):
-        return data[0]
-    return {}
-
-
-def find_first_value(obj: Any, keys: Sequence[str], max_depth: int = 8, max_nodes: int = 5000) -> Any:
-    if obj is None:
-        return None
-    keys_lower = {str(k).strip().lower() for k in keys if k}
-    if not keys_lower:
-        return None
-
-    queue: List[Tuple[Any, int]] = [(obj, 0)]
-    seen: Set[int] = set()
-    nodes = 0
-
-    while queue:
-        current, depth = queue.pop(0)
-        if current is None or depth > max_depth:
-            continue
-
-        current_id = id(current)
-        if current_id in seen:
-            continue
-        seen.add(current_id)
-
-        nodes += 1
-        if nodes > max_nodes:
-            return None
-
-        if isinstance(current, dict):
-            for k, v in current.items():
-                if str(k).strip().lower() in keys_lower:
-                    return v
-                queue.append((v, depth + 1))
-        elif isinstance(current, list):
-            for item in current:
-                queue.append((item, depth + 1))
-    return None
-
-
-def pick_num(obj: Any, *keys: str) -> Optional[float]:
-    return safe_float(find_first_value(obj, keys))
-
-
-def pick_str(obj: Any, *keys: str) -> Optional[str]:
-    return safe_str(find_first_value(obj, keys))
-
-
-def pick_pct(obj: Any, *keys: str) -> Optional[float]:
-    """LEGACY: converts fraction->percent-points. Do NOT use for dtype=pct fields."""
-    v = safe_float(find_first_value(obj, keys))
-    if v is None:
-        return None
-    return v * 100.0 if abs(v) <= 1.0 else v
-
-
-def pick_frac(obj: Any, *keys: str) -> Optional[float]:  # FIX v4.5.0: fraction
+def _to_ratio(value: Any) -> Optional[float]:
     """
-    FIX v4.5.0: dtype=pct fields must be stored as FRACTIONS (0.0142 = 1.42%).
-    Uses _percentish_to_fraction logic: abs(v) > 1.5 -> divide by 100.
-    Use this for all schema dtype=pct fields (percent_change, week_52_position_pct,
-    dividend_yield, gross_margin, etc.).
+    Convert percent-like value to ratio using the abs>1.5 heuristic.
+
+    WARNING: ambiguous for values between 0 and 1.5 (treated as ratios even
+    if they were meant as percents). Kept for use on Tadawul fundamentals
+    fields where the source scale is unknown (URLs are env-configurable).
     """
-    v = safe_float(find_first_value(obj, keys))
-    if v is None:
+    f = _safe_float(value)
+    if f is None:
         return None
-    if abs(v) > 1.5:
-        return v / 100.0
-    return v
+    return f / 100.0 if abs(f) > 1.5 else f
 
 
-def clean_patch(patch: Dict[str, Any]) -> Dict[str, Any]:
-    return {k: v for k, v in (patch or {}).items() if v is not None and not (isinstance(v, str) and not v.strip())}
+def _clean_patch(patch: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove None and whitespace-only-string values from a patch dict."""
+    return {
+        k: v for k, v in patch.items()
+        if v is not None and not (isinstance(v, str) and not v.strip())
+    }
 
 
-def merge_into(dst: Dict[str, Any], src: Dict[str, Any], *, force_keys: Sequence[str] = ()) -> None:
-    force = set(force_keys or ())
-    for k, v in (src or {}).items():
-        if v is None:
-            continue
-        if k in force or k not in dst or dst.get(k) is None or (isinstance(dst.get(k), str) and not str(dst.get(k)).strip()):
-            dst[k] = v
-
-
-def _ensure_ksa_identity(patch: Dict[str, Any], *, symbol: str) -> None:
-    patch["country"] = KSA_COUNTRY_CODE
-    patch["currency"] = patch.get("currency") or KSA_CURRENCY
-    patch["exchange"] = patch.get("exchange") or KSA_EXCHANGE_NAME
-    patch["asset_class"] = patch.get("asset_class") or "EQUITY"
+def _ensure_ksa_identity(patch: Dict[str, Any], symbol: str) -> None:
+    """Ensure KSA default identity fields are set."""
+    patch.setdefault("country", KSA_COUNTRY_CODE)
+    patch.setdefault("currency", KSA_CURRENCY)
+    patch.setdefault("exchange", KSA_EXCHANGE_NAME)
+    patch.setdefault("asset_class", "EQUITY")
     if not patch.get("name"):
         patch["name"] = symbol
 
 
-def fill_derived_quote_fields(patch: Dict[str, Any]) -> None:
-    cur = safe_float(patch.get("current_price"))
-    prev = safe_float(patch.get("previous_close"))
-    w52h = safe_float(patch.get("week_52_high"))
-    w52l = safe_float(patch.get("week_52_low"))
+def _fill_derived_quote_fields(patch: Dict[str, Any]) -> None:
+    """Fill derived quote fields from existing data (idempotent)."""
+    current = _safe_float(patch.get("current_price"))
+    previous = _safe_float(patch.get("previous_close"))
+    week_52_high = _safe_float(patch.get("week_52_high"))
+    week_52_low = _safe_float(patch.get("week_52_low"))
 
-    if patch.get("price_change") is None and cur is not None and prev is not None:
-        patch["price_change"] = cur - prev
+    if patch.get("price_change") is None and current is not None and previous is not None:
+        patch["price_change"] = current - previous
 
-    if patch.get("percent_change") is None and cur is not None and prev not in (None, 0.0):
-        try:
-            patch["percent_change"] = (cur - prev) / prev  # FIX v4.5.0: fraction (dtype=pct)
-        except Exception:
-            pass
+    if (patch.get("percent_change") is None
+            and current is not None and previous is not None and previous != 0):
+        patch["percent_change"] = (current - previous) / previous
 
-    if patch.get("week_52_position_pct") is None and cur is not None and w52h is not None and w52l is not None and w52h != w52l:
-        patch["week_52_position_pct"] = (cur - w52l) / (w52h - w52l)  # FIX v4.5.0: fraction (dtype=pct)
+    if (patch.get("week_52_position_pct") is None
+            and current is not None and week_52_high is not None and week_52_low is not None
+            and week_52_high != week_52_low):
+        patch["week_52_position_pct"] = (current - week_52_low) / (week_52_high - week_52_low)
 
+    # Aliases
     if patch.get("price") is None and patch.get("current_price") is not None:
         patch["price"] = patch["current_price"]
     if patch.get("prev_close") is None and patch.get("previous_close") is not None:
@@ -564,22 +457,24 @@ def fill_derived_quote_fields(patch: Dict[str, Any]) -> None:
         patch["change_pct"] = patch["percent_change"]
 
 
-def data_quality_score(patch: Dict[str, Any]) -> Tuple[DataQuality, float]:
+def _data_quality_score(patch: Dict[str, Any]) -> Tuple[DataQuality, float]:
+    """Calculate data quality score based on field completeness."""
     score = 100.0
-    if safe_float(patch.get("current_price")) is None:
+    if _safe_float(patch.get("current_price")) is None:
         score -= 30
-    if safe_float(patch.get("previous_close")) is None:
+    if _safe_float(patch.get("previous_close")) is None:
         score -= 10
-    if safe_float(patch.get("volume")) is None:
+    if _safe_float(patch.get("volume")) is None:
         score -= 8
-    if safe_str(patch.get("name")) is None:
+    if _safe_str(patch.get("name")) is None:
         score -= 10
-    if safe_str(patch.get("sector")) is None:
+    if _safe_str(patch.get("sector")) is None:
         score -= 8
-    if safe_str(patch.get("industry")) is None:
+    if _safe_str(patch.get("industry")) is None:
         score -= 8
-    if safe_str(patch.get("country")) is None:
+    if _safe_str(patch.get("country")) is None:
         score -= 8
+
     score = max(0.0, min(100.0, score))
     if score >= 80:
         return DataQuality.EXCELLENT, score
@@ -592,101 +487,252 @@ def data_quality_score(patch: Dict[str, Any]) -> Tuple[DataQuality, float]:
     return DataQuality.BAD, score
 
 
-# =============================================================================
-# Tracing
-# =============================================================================
-class TraceContext:
-    def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
-        self.name = name
-        self.attributes = attributes or {}
-        self.tracer = trace.get_tracer(__name__) if _OTEL_AVAILABLE and _TRACING_ENABLED else None  # type: ignore
-        self._span_cm = None
-        self.span = None
+# ---------------------------------------------------------------------------
+# Symbol Normalization (Strict KSA)
+# ---------------------------------------------------------------------------
 
-    async def __aenter__(self):
-        if self.tracer:
-            try:
-                start_as_current = getattr(self.tracer, "start_as_current_span", None)
-                if callable(start_as_current):
-                    self._span_cm = start_as_current(self.name)
-                    self.span = self._span_cm.__enter__()
-                else:
-                    self.span = self.tracer.start_span(self.name)  # type: ignore
-                if self.span:
-                    for k, v in self.attributes.items():
-                        try:
-                            self.span.set_attribute(str(k), v)  # type: ignore
-                        except Exception:
-                            pass
-            except Exception:
-                self._span_cm = None
-                self.span = None
-        return self
+def normalize_ksa_symbol(symbol: str) -> str:
+    """
+    Normalize KSA symbol to canonical format (e.g., "2222.SR").
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.span and _OTEL_AVAILABLE:
-            try:
-                if exc_val and Status and StatusCode:
-                    if hasattr(self.span, "record_exception"):
-                        self.span.record_exception(exc_val)  # type: ignore
-                    if hasattr(self.span, "set_status"):
-                        self.span.set_status(Status(StatusCode.ERROR, str(exc_val)))  # type: ignore
-            except Exception:
-                pass
-        if self._span_cm:
-            try:
-                self._span_cm.__exit__(exc_type, exc_val, exc_tb)
-            except Exception:
-                pass
-        elif self.span:
-            try:
-                self.span.end()  # type: ignore
-            except Exception:
-                pass
+    Examples:
+        "2222"         -> "2222.SR"
+        "2222.SR"      -> "2222.SR"
+        "TADAWUL:2222" -> "2222.SR"
+        "٢٢٢٢"         -> "2222.SR"
+    """
+    raw = (symbol or "").strip()
+    if not raw:
+        return ""
+
+    raw = raw.translate(_ARABIC_DIGITS).strip().upper()
+
+    try:
+        from core.symbols.normalize import normalize_ksa_symbol as _norm  # type: ignore
+
+        if callable(_norm):
+            result = _norm(raw)
+            if result:
+                return result
+    except ImportError:
+        pass
+
+    if raw.startswith("TADAWUL:"):
+        raw = raw.split(":", 1)[1].strip()
+
+    if raw.endswith(".SR"):
+        code = raw[:-3].strip()
+        return f"{code}.SR" if _KSA_CODE_RE.match(code) else ""
+
+    if _KSA_CODE_RE.match(raw):
+        return f"{raw}.SR"
+
+    return ""
 
 
-def _trace(name: Optional[str] = None):
-    def decorator(func):
-        @functools.wraps(func)
-        async def wrapper(*args, **kwargs):
-            async with TraceContext(name or func.__name__, {"function": func.__name__}):
-                return await func(*args, **kwargs)
-        return wrapper
-    return decorator
+def format_url(template: str, symbol: str, days: Optional[int] = None) -> str:
+    """Format URL template with {symbol}, {code}, and optional {days} placeholders."""
+    sym = normalize_ksa_symbol(symbol)
+    if not sym:
+        return template
+    code = sym[:-3] if sym.endswith(".SR") else sym
+    url = template.replace("{symbol}", sym).replace("{code}", code)
+    if days is not None:
+        url = url.replace("{days}", str(days))
+    return url
 
 
-# =============================================================================
-# Metrics (optional)
-# =============================================================================
-if _PROM_AVAILABLE and _METRICS_ENABLED and Counter and Gauge:
-    tadawul_requests_total = Counter("tadawul_requests_total", "Tadawul provider requests", ["status"])
-    tadawul_queue_size = Gauge("tadawul_queue_size", "Tadawul request queue size")
-else:
-    class _DummyMetric:
-        def labels(self, *args: Any, **kwargs: Any):
-            return self
-        def inc(self, *args: Any, **kwargs: Any) -> None:
-            return None
-        def set(self, *args: Any, **kwargs: Any) -> None:
-            return None
-    tadawul_requests_total = _DummyMetric()
-    tadawul_queue_size = _DummyMetric()
+# ---------------------------------------------------------------------------
+# History Analytics (pure Python)
+# ---------------------------------------------------------------------------
+
+def _rsi_14(closes: List[float]) -> Optional[float]:
+    """RSI(14) using Wilder's smoothing; 0-100 or None."""
+    if len(closes) < 15:
+        return None
+
+    period = 14
+    gains: List[float] = []
+    losses: List[float] = []
+
+    for i in range(1, len(closes)):
+        delta = closes[i] - closes[i - 1]
+        gains.append(delta if delta > 0 else 0.0)
+        losses.append(-delta if delta < 0 else 0.0)
+
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+
+    if avg_loss == 0:
+        return 100.0
+
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1.0 + rs))
 
 
-# =============================================================================
-# Lightweight async primitives
-# =============================================================================
+def _volatility_30d(closes: List[float]) -> Optional[float]:
+    """Annualized volatility from 30-day log returns."""
+    if len(closes) < 31:
+        return None
+
+    window = closes[-31:]
+    returns: List[float] = []
+
+    for i in range(1, len(window)):
+        prev, curr = window[i - 1], window[i]
+        if prev > 0 and curr > 0:
+            returns.append(math.log(curr / prev))
+
+    if len(returns) < 2:
+        return None
+
+    mean = sum(returns) / len(returns)
+    variance = sum((r - mean) ** 2 for r in returns) / (len(returns) - 1)
+    std = math.sqrt(max(0.0, variance))
+    return std * math.sqrt(252.0)
+
+
+def _avg_last(values: List[float], n: int) -> Optional[float]:
+    """Average of the last n values; None if empty."""
+    if not values:
+        return None
+    window = values[-n:] if len(values) >= n else values
+    valid = [v for v in window if v is not None]
+    return sum(valid) / len(valid) if valid else None
+
+
+def _compute_history_analytics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Compute analytics (prices, 52w range, volumes, RSI, volatility) from history rows."""
+    if not rows or len(rows) < 2:
+        return {}
+
+    closes = [_safe_float(r.get("close")) for r in rows]
+    highs = [_safe_float(r.get("high")) for r in rows]
+    lows = [_safe_float(r.get("low")) for r in rows]
+    volumes = [_safe_float(r.get("volume")) for r in rows]
+
+    closes_f = [x for x in closes if x is not None]
+    highs_f = [x for x in highs if x is not None]
+    lows_f = [x for x in lows if x is not None]
+    vols_f = [x for x in volumes if x is not None]
+
+    if len(closes_f) < 2:
+        return {}
+
+    result: Dict[str, Any] = {}
+
+    # Quote fallbacks from latest bars
+    latest = rows[-1]
+    prev = rows[-2] if len(rows) >= 2 else None
+
+    if _safe_float(latest.get("close")) is not None:
+        result["current_price"] = _safe_float(latest.get("close"))
+    if prev and _safe_float(prev.get("close")) is not None:
+        result["previous_close"] = _safe_float(prev.get("close"))
+    if _safe_float(latest.get("open")) is not None:
+        result["open_price"] = _safe_float(latest.get("open"))
+    if _safe_float(latest.get("high")) is not None:
+        result["day_high"] = _safe_float(latest.get("high"))
+    if _safe_float(latest.get("low")) is not None:
+        result["day_low"] = _safe_float(latest.get("low"))
+    if _safe_float(latest.get("volume")) is not None:
+        result["volume"] = _safe_float(latest.get("volume"))
+
+    # 52-week range
+    last_252_highs = highs_f[-252:] if highs_f else []
+    last_252_lows = lows_f[-252:] if lows_f else []
+
+    if last_252_highs:
+        result["week_52_high"] = max(last_252_highs)
+    elif closes_f:
+        result["week_52_high"] = max(closes_f[-252:])
+
+    if last_252_lows:
+        result["week_52_low"] = min(last_252_lows)
+    elif closes_f:
+        result["week_52_low"] = min(closes_f[-252:])
+
+    # Volume averages
+    avg10 = _avg_last(vols_f, 10)
+    avg30 = _avg_last(vols_f, 30)
+    if avg10 is not None:
+        result["avg_volume_10d"] = avg10
+    if avg30 is not None:
+        result["avg_volume_30d"] = avg30
+
+    rsi = _rsi_14(closes_f)
+    if rsi is not None:
+        result["rsi_14"] = rsi
+
+    vol30 = _volatility_30d(closes_f)
+    if vol30 is not None:
+        result["volatility_30d"] = vol30
+
+    return _clean_patch(result)
+
+
+# ---------------------------------------------------------------------------
+# Async Primitives: TokenBucket, SmartCache, SingleFlight (lazy locks)
+# ---------------------------------------------------------------------------
+
+class TokenBucket:
+    """Token bucket rate limiter."""
+
+    def __init__(self, rate_per_sec: float, capacity: Optional[float] = None):
+        self.rate = max(0.0, rate_per_sec)
+        self.capacity = capacity if capacity is not None else max(1.0, self.rate)
+        self.tokens = self.capacity
+        self.last = time.monotonic()
+        self._lock: Optional[asyncio.Lock] = None  # lazy
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    async def wait_and_acquire(self, tokens: float = 1.0) -> None:
+        """Wait until `tokens` tokens are available, then deduct them."""
+        if self.rate <= 0:
+            return
+
+        while True:
+            async with self._get_lock():
+                now = time.monotonic()
+                elapsed = max(0.0, now - self.last)
+                self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
+                self.last = now
+
+                if self.tokens >= tokens:
+                    self.tokens -= tokens
+                    return
+
+                wait = (tokens - self.tokens) / self.rate if self.rate > 0 else 0.1
+            await asyncio.sleep(min(1.0, max(0.05, wait)))
+
+
 class SmartCache:
-    def __init__(self, maxsize: int = 5000, ttl: float = 300.0):
-        self.maxsize = maxsize
-        self.ttl = ttl
+    """Async-safe TTL cache with LRU-on-access eviction."""
+
+    def __init__(self, max_size: int = 5000, ttl_sec: float = 300.0):
+        self.max_size = max_size
+        self.ttl_sec = ttl_sec
         self._cache: Dict[str, Any] = {}
         self._expires: Dict[str, float] = {}
         self._access_times: Dict[str, float] = {}
-        self._lock = asyncio.Lock()
+        self._lock: Optional[asyncio.Lock] = None  # lazy
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     async def get(self, key: str) -> Optional[Any]:
-        async with self._lock:
+        """Get value from cache if not expired; refreshes access time."""
+        async with self._get_lock():
             now = time.monotonic()
             if key in self._cache:
                 if now < self._expires.get(key, 0):
@@ -697,423 +743,613 @@ class SmartCache:
                 self._access_times.pop(key, None)
             return None
 
-    async def set(self, key: str, value: Any, ttl: Optional[float] = None) -> None:
-        async with self._lock:
-            if len(self._cache) >= self.maxsize and key not in self._cache:
-                oldest = min(self._access_times.items(), key=lambda x: x[1])[0] if self._access_times else None
-                if oldest:
+    async def set(self, key: str, value: Any, ttl_sec: Optional[float] = None) -> None:
+        """Set value in cache with TTL; LRU-evicts least-recently-accessed on overflow."""
+        async with self._get_lock():
+            if len(self._cache) >= self.max_size and key not in self._cache:
+                if self._access_times:
+                    oldest = min(self._access_times.items(), key=lambda x: x[1])[0]
                     self._cache.pop(oldest, None)
                     self._expires.pop(oldest, None)
                     self._access_times.pop(oldest, None)
+
+            now = time.monotonic()
             self._cache[key] = value
-            self._expires[key] = time.monotonic() + (ttl or self.ttl)
-            self._access_times[key] = time.monotonic()
+            self._expires[key] = now + (ttl_sec or self.ttl_sec)
+            self._access_times[key] = now
 
     async def size(self) -> int:
-        async with self._lock:
+        """Get current cache size."""
+        async with self._get_lock():
             return len(self._cache)
 
 
-class TokenBucket:
-    def __init__(self, rate_per_sec: float, capacity: Optional[float] = None):
-        self.rate = max(0.0, float(rate_per_sec))
-        self.capacity = float(capacity) if capacity is not None else max(1.0, self.rate)
-        self.tokens = self.capacity
-        self.last = time.monotonic()
-        self._lock = asyncio.Lock()
-
-    async def wait_and_acquire(self, tokens: float = 1.0) -> None:
-        if self.rate <= 0:
-            return
-        while True:
-            async with self._lock:
-                now = time.monotonic()
-                self.tokens = min(self.capacity, self.tokens + max(0.0, now - self.last) * self.rate)
-                self.last = now
-                if self.tokens >= tokens:
-                    self.tokens -= tokens
-                    return
-                wait = (tokens - self.tokens) / self.rate if self.rate > 0 else 0.1
-            await asyncio.sleep(min(1.0, max(0.05, wait)))
-
-
 class SingleFlight:
+    """Deduplicate concurrent requests for the same key."""
+
     def __init__(self) -> None:
-        self._lock = asyncio.Lock()
+        self._lock: Optional[asyncio.Lock] = None  # lazy
         self._futures: Dict[str, asyncio.Future] = {}
 
-    async def run(self, key: str, coro_fn):
-        async with self._lock:
-            fut = self._futures.get(key)
-            if fut is not None:
-                return await fut
+    def _get_lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    async def run(self, key: str, coro_fn: Callable[[], Any]) -> Any:
+        """Execute coroutine; concurrent callers for the same key share the result."""
+        lock = self._get_lock()
+        async with lock:
+            future = self._futures.get(key)
+            if future is not None:
+                return await future
+
             loop = asyncio.get_running_loop()
-            fut = loop.create_future()
-            self._futures[key] = fut
+            future = loop.create_future()
+            self._futures[key] = future
+
         try:
             result = await coro_fn()
-            if not fut.done():
-                fut.set_result(result)
+            if not future.done():
+                future.set_result(result)
             return result
-        except Exception as e:
-            if not fut.done():
-                fut.set_exception(e)
+        except Exception as exc:
+            if not future.done():
+                future.set_exception(exc)
             raise
         finally:
-            async with self._lock:
+            async with lock:
                 self._futures.pop(key, None)
 
 
-# =============================================================================
-# History analytics
-# =============================================================================
-def _rsi_14(closes: List[float]) -> Optional[float]:
-    if len(closes) < 15:
-        return None
-    diffs = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
-    gains = [d if d > 0 else 0.0 for d in diffs]
-    losses = [-d if d < 0 else 0.0 for d in diffs]
-    n = 14
-    avg_gain = sum(gains[:n]) / n
-    avg_loss = sum(losses[:n]) / n
-    for i in range(n, len(gains)):
-        avg_gain = (avg_gain * (n - 1) + gains[i]) / n
-        avg_loss = (avg_loss * (n - 1) + losses[i]) / n
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return float(100.0 - (100.0 / (1.0 + rs)))
+# ---------------------------------------------------------------------------
+# Tracing and Metrics Decorators
+# ---------------------------------------------------------------------------
+
+def _trace(name: Optional[str] = None):
+    """OpenTelemetry tracing decorator (no-op when OTEL unavailable)."""
+    def decorator(func):
+        @functools.wraps(func)
+        async def wrapper(*args, **kwargs):
+            if not (_OTEL_AVAILABLE and trace):
+                return await func(*args, **kwargs)
+
+            tracer = trace.get_tracer(__name__)
+            span_name = name or func.__name__
+            with tracer.start_as_current_span(span_name) as span:
+                try:
+                    return await func(*args, **kwargs)
+                except Exception as exc:
+                    if span and Status and StatusCode:
+                        span.set_status(Status(StatusCode.ERROR, str(exc)))
+                    raise
+        return wrapper
+    return decorator
 
 
-def _volatility_30d(closes: List[float]) -> Optional[float]:
-    if len(closes) < 31:
-        return None
-    window = closes[-31:]
-    rets: List[float] = []
-    for i in range(1, len(window)):
-        if window[i - 1] > 0 and window[i] > 0:
-            rets.append(math.log(window[i] / window[i - 1]))
-    if len(rets) < 2:
-        return None
-    return float(_std(rets) * math.sqrt(252))  # FIX v4.5.0: fraction not percent points
+# Prometheus metrics
+if _PROM_AVAILABLE and Counter and Gauge:
+    _tadawul_requests_total = Counter(
+        "tadawul_requests_total", "Tadawul provider requests", ["status"],
+    )
+    _tadawul_queue_size = Gauge("tadawul_queue_size", "Tadawul request queue size")
+else:
+    class _DummyMetric:
+        def labels(self, *args, **kwargs):
+            return self
+
+        def inc(self, *args, **kwargs):
+            pass
+
+        def set(self, *args, **kwargs):
+            pass
+
+    _tadawul_requests_total = _DummyMetric()
+    _tadawul_queue_size = _DummyMetric()
 
 
-def _avg_last(values: List[float], n: int) -> Optional[float]:
-    if not values:
-        return None
-    window = values[-n:] if len(values) >= n else values
-    vals = [v for v in window if v is not None]
-    return float(_mean(vals)) if vals else None
+# ---------------------------------------------------------------------------
+# Tadawul HTTP Client
+# ---------------------------------------------------------------------------
 
-
-def compute_history_analytics(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    if not rows or len(rows) < 2:
-        return {}
-    closes = [safe_float(r.get("close")) for r in rows]
-    highs = [safe_float(r.get("high")) for r in rows]
-    lows = [safe_float(r.get("low")) for r in rows]
-    volumes = [safe_float(r.get("volume")) for r in rows]
-
-    closes_f = [x for x in closes if x is not None]
-    highs_f = [x for x in highs if x is not None]
-    lows_f = [x for x in lows if x is not None]
-    vols_f = [x for x in volumes if x is not None]
-
-    if len(closes_f) < 2:
-        return {}
-
-    out: Dict[str, Any] = {}
-
-    # Quote fallbacks from latest two bars
-    latest = rows[-1]
-    prev = rows[-2] if len(rows) >= 2 else None
-    if safe_float(latest.get("close")) is not None:
-        out["current_price"] = safe_float(latest.get("close"))
-    if prev and safe_float(prev.get("close")) is not None:
-        out["previous_close"] = safe_float(prev.get("close"))
-    if safe_float(latest.get("open")) is not None:
-        out["open_price"] = safe_float(latest.get("open"))
-    if safe_float(latest.get("high")) is not None:
-        out["day_high"] = safe_float(latest.get("high"))
-    if safe_float(latest.get("low")) is not None:
-        out["day_low"] = safe_float(latest.get("low"))
-    if safe_float(latest.get("volume")) is not None:
-        out["volume"] = safe_float(latest.get("volume"))
-
-    # 52W and liquidity
-    last_252_highs = highs_f[-252:] if highs_f else []
-    last_252_lows = lows_f[-252:] if lows_f else []
-    if last_252_highs:
-        out["week_52_high"] = max(last_252_highs)
-    elif closes_f:
-        out["week_52_high"] = max(closes_f[-252:])
-    if last_252_lows:
-        out["week_52_low"] = min(last_252_lows)
-    elif closes_f:
-        out["week_52_low"] = min(closes_f[-252:])
-
-    avg10 = _avg_last(vols_f, 10)
-    avg30 = _avg_last(vols_f, 30)
-    if avg10 is not None:
-        out["avg_volume_10d"] = avg10
-    if avg30 is not None:
-        out["avg_volume_30d"] = avg30
-
-    rsi = _rsi_14(closes_f)
-    if rsi is not None:
-        out["rsi_14"] = rsi
-
-    vol30 = _volatility_30d(closes_f)
-    if vol30 is not None:
-        out["volatility_30d"] = vol30
-
-    if _enable_forecast() and len(closes_f) >= 90:
-        last = float(closes_f[-1])
-
-        def _forecast(h: int) -> Tuple[Optional[float], Optional[float]]:
-            if len(closes_f) < 60 or last <= 0:
-                return None, None
-            window = closes_f[-61:]
-            rets = []
-            for i in range(1, len(window)):
-                if window[i - 1] > 0:
-                    rets.append((window[i] / window[i - 1]) - 1.0)
-            mu = _mean(rets) if rets else 0.0
-            price = last * ((1.0 + mu) ** h)
-            roi = (price / last) - 1.0  # FIX v4.5.0: fraction (dtype=pct)
-            return float(price), float(roi)
-
-        p1, r1 = _forecast(21)
-        p3, r3 = _forecast(63)
-        p12, r12 = _forecast(252)
-
-        if p1 is not None:
-            out["forecast_price_1m"] = p1
-            out["expected_roi_1m"] = r1
-        if p3 is not None:
-            out["forecast_price_3m"] = p3
-            out["expected_roi_3m"] = r3
-        if p12 is not None:
-            out["forecast_price_12m"] = p12
-            out["expected_roi_12m"] = r12
-
-        conf = 0.70
-        if vol30 is not None:
-            vol = vol30 / 100.0
-            conf = max(0.20, min(0.85, 0.70 * (1.0 / (1.0 + max(0.0, vol - 0.30)))))
-        out["forecast_confidence"] = float(conf)
-
-    fill_derived_quote_fields(out)
-    return clean_patch(out)
-
-
-# =============================================================================
-# Tadawul client
-# =============================================================================
 class TadawulClient:
-    def __init__(self) -> None:
-        self.timeout_sec = _timeout_sec()
-        self.retry_attempts = _retry_attempts()
-        self.quote_url = _safe_str(_env_str("TADAWUL_QUOTE_URL", ""))
-        self.fundamentals_url = _safe_str(_env_str("TADAWUL_FUNDAMENTALS_URL", ""))
-        self.history_url = _safe_str(_env_str("TADAWUL_HISTORY_URL", "")) or _safe_str(_env_str("TADAWUL_CANDLES_URL", ""))
-        self.profile_url = _safe_str(_env_str("TADAWUL_PROFILE_URL", ""))
+    """Async client for Tadawul API."""
+
+    def __init__(self, config: Optional[TadawulConfig] = None):
+        self.config = config or TadawulConfig.from_env()
+        self._semaphore: Optional[asyncio.Semaphore] = None  # lazy
+        self._rate_limiter = TokenBucket(self.config.rate_limit)
+        self._single_flight = SingleFlight()
+
+        self._quote_cache = SmartCache(max_size=7000, ttl_sec=self.config.quote_ttl_sec)
+        self._fund_cache = SmartCache(max_size=4000, ttl_sec=self.config.fund_ttl_sec)
+        self._history_cache = SmartCache(max_size=2500, ttl_sec=self.config.hist_ttl_sec)
+        self._profile_cache = SmartCache(max_size=4000, ttl_sec=self.config.profile_ttl_sec)
+        self._error_cache = SmartCache(max_size=4000, ttl_sec=self.config.error_ttl_sec)
 
         headers = {
-            "User-Agent": _env_str("TADAWUL_USER_AGENT", USER_AGENT_DEFAULT),
+            "User-Agent": self.config.user_agent,
             "Accept": "application/json",
             "Accept-Language": "ar,en;q=0.9",
+            **self.config.extra_headers,
         }
-        headers.update(_extra_headers())
 
         self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(self.timeout_sec),
+            timeout=httpx.Timeout(self.config.timeout_sec),
             follow_redirects=True,
             headers=headers,
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=50),
             http2=True,
         )
 
-        self.quote_cache = SmartCache(maxsize=7000, ttl=_quote_ttl_sec())
-        self.fund_cache = SmartCache(maxsize=4000, ttl=_fund_ttl_sec())
-        self.history_cache = SmartCache(maxsize=2500, ttl=_hist_ttl_sec())
-        self.profile_cache = SmartCache(maxsize=4000, ttl=_profile_ttl_sec())
-        self.error_cache = SmartCache(maxsize=4000, ttl=_err_ttl_sec())
-
-        self.semaphore = asyncio.Semaphore(_max_concurrency())
-        self.rate_limiter = TokenBucket(_rate_limit())
-        self.singleflight = SingleFlight()
-        self._closing = False
-
         logger.info(
             "TadawulClient v%s initialized | configured=%s | has_profile=%s | has_history=%s",
-            PROVIDER_VERSION, _configured(), bool(self.profile_url), bool(self.history_url)
+            PROVIDER_VERSION,
+            self.config.is_configured,
+            bool(self.config.profile_url),
+            bool(self.config.history_url),
         )
+
+    def _get_semaphore(self) -> asyncio.Semaphore:
+        if self._semaphore is None:
+            self._semaphore = asyncio.Semaphore(self.config.max_concurrency)
+        return self._semaphore
+
+    # -- HTTP layer -----------------------------------------------------
 
     @_trace("tadawul_request")
     async def _request(self, url: str) -> Tuple[Optional[Union[dict, list]], Optional[str]]:
-        await self.rate_limiter.wait_and_acquire()
-        async with self.semaphore:
-            last_err = None
-            for attempt in range(self.retry_attempts):
+        """Make HTTP request to Tadawul API."""
+        await self._rate_limiter.wait_and_acquire()
+
+        async with self._get_semaphore():
+            last_error: Optional[str] = None
+
+            for attempt in range(self.config.retry_attempts):
                 try:
-                    resp = await self._client.get(url)
-                    status = resp.status_code
-                    if status == 429:
-                        retry_after = safe_float(resp.headers.get("Retry-After")) or 3.0
+                    response = await self._client.get(url)
+                    status_code = response.status_code
+
+                    if status_code == 429:
+                        retry_after = _safe_float(response.headers.get("Retry-After")) or 3.0
                         await asyncio.sleep(min(30.0, max(1.0, retry_after)))
-                        last_err = "http_429"
+                        last_error = "http_429"
                         continue
-                    if 500 <= status < 600:
+
+                    if 500 <= status_code < 600:
                         base = 2 ** attempt
                         await asyncio.sleep(min(8.0, base + random.uniform(0, base)))
-                        last_err = f"http_{status}"
+                        last_error = f"http_{status_code}"
                         continue
-                    if status >= 400 and status != 404:
-                        tadawul_requests_total.labels(status="error").inc()
-                        return None, f"HTTP {status}"
+
+                    # v6.0.0 bug fix: 404 is now returned as an error immediately
+                    # rather than falling through to JSON parsing. v5.0.0 had
+                    # `if status_code >= 400 and status_code != 404: return ...`
+                    # which meant a 404 with a JSON error body was parsed and
+                    # returned as *successful* data. Matches EODHD/Finnhub.
+                    if status_code == 404:
+                        _tadawul_requests_total.labels(status="error").inc()
+                        return None, "HTTP 404 not_found"
+
+                    if status_code >= 400:
+                        _tadawul_requests_total.labels(status="error").inc()
+                        return None, f"HTTP {status_code}"
 
                     try:
-                        data = json_loads(resp.content)
-                        data = unwrap_common_envelopes(data)
+                        data = _json_loads(response.content)
+                        data = self._unwrap_envelope(data)
                     except Exception:
-                        tadawul_requests_total.labels(status="error").inc()
+                        _tadawul_requests_total.labels(status="error").inc()
                         return None, "invalid_json"
 
                     if not isinstance(data, (dict, list)):
-                        tadawul_requests_total.labels(status="error").inc()
+                        _tadawul_requests_total.labels(status="error").inc()
                         return None, "unexpected_response_type"
 
-                    tadawul_requests_total.labels(status="success").inc()
+                    _tadawul_requests_total.labels(status="success").inc()
                     return data, None
-                except httpx.RequestError as e:
-                    last_err = f"network_error_{e.__class__.__name__}"
+
+                except httpx.RequestError as exc:
+                    last_error = f"network_error_{exc.__class__.__name__}"
                     base = 2 ** attempt
                     await asyncio.sleep(min(8.0, base + random.uniform(0, base)))
-            tadawul_requests_total.labels(status="error").inc()
-            return None, last_err or "max_retries_exceeded"
 
-    # -------------------------------------------------------------------------
-    # Mapping helpers
-    # -------------------------------------------------------------------------
-    def _map_identity_from_any(self, root: Any) -> Dict[str, Any]:
+            _tadawul_requests_total.labels(status="error").inc()
+            return None, last_error or "max_retries_exceeded"
+
+    def _unwrap_envelope(self, data: Any) -> Any:
+        """Unwrap common API envelope structures."""
+        current = data
+        for _ in range(5):
+            if not isinstance(current, dict):
+                break
+            for key in ("data", "result", "payload", "quote", "profile", "response",
+                        "content", "results", "items"):
+                if key in current and isinstance(current[key], (dict, list)):
+                    current = current[key]
+                    break
+            else:
+                break
+        return current
+
+    def _coerce_dict(self, data: Any) -> Dict[str, Any]:
+        """Coerce data to a dict; handles list-of-dicts by taking the first element."""
+        if isinstance(data, dict):
+            return data
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            return data[0]
+        return {}
+
+    def _find_value(self, obj: Any, keys: Sequence[str], max_depth: int = 8) -> Any:
+        """BFS through nested structure for the first value matching any of `keys`."""
+        if obj is None:
+            return None
+
+        keys_lower = {str(k).strip().lower() for k in keys if k}
+        if not keys_lower:
+            return None
+
+        queue: List[Tuple[Any, int]] = [(obj, 0)]
+        seen: Set[int] = set()
+
+        while queue:
+            current, depth = queue.pop(0)
+            if current is None or depth > max_depth:
+                continue
+
+            current_id = id(current)
+            if current_id in seen:
+                continue
+            seen.add(current_id)
+
+            if isinstance(current, dict):
+                for k, v in current.items():
+                    if str(k).strip().lower() in keys_lower:
+                        return v
+                    queue.append((v, depth + 1))
+            elif isinstance(current, list):
+                for item in current:
+                    queue.append((item, depth + 1))
+
+        return None
+
+    def _pick_num(self, obj: Any, *keys: str) -> Optional[float]:
+        """Pick numeric value by keys."""
+        return _safe_float(self._find_value(obj, keys))
+
+    def _pick_str(self, obj: Any, *keys: str) -> Optional[str]:
+        """Pick string value by keys."""
+        return _safe_str(self._find_value(obj, keys))
+
+    def _pick_ratio(self, obj: Any, *keys: str) -> Optional[float]:
+        """Pick percent-ish value and convert to ratio via the abs>1.5 heuristic."""
+        return _to_ratio(self._find_value(obj, keys))
+
+    # -- Mapping methods ------------------------------------------------
+
+    def _map_identity(self, root: Any) -> Dict[str, Any]:
+        """Map identity fields (name/sector/industry/exchange/currency) from response."""
         patch: Dict[str, Any] = {}
-        patch["name"] = pick_str(
+        patch["name"] = self._pick_str(
             root,
             "name", "company_name", "companyName", "securityName", "securityNameEn",
-            "securityNameAr", "instrumentName", "symbolName", "shortName", "longName"
+            "securityNameAr", "instrumentName", "symbolName", "shortName", "longName",
         )
-        patch["sector"] = pick_str(
+        patch["sector"] = self._pick_str(
             root,
             "sector", "sectorName", "sector_name", "sectorEn", "sectorAr",
-            "gicsSector", "sector_description", "classificationSector", "sectorDesc"
+            "gicsSector", "sector_description", "classificationSector", "sectorDesc",
         )
-        patch["industry"] = pick_str(
+        patch["industry"] = self._pick_str(
             root,
             "industry", "industryName", "industry_name", "industryEn", "industryAr",
             "gicsIndustry", "industry_description", "subSectorName", "sub_sector",
-            "subSector", "classificationIndustry", "industryDesc"
+            "subSector", "classificationIndustry", "industryDesc",
         )
-        patch["exchange"] = pick_str(root, "exchange", "exchangeName", "market", "marketName", "mic")
-        patch["currency"] = pick_str(root, "currency", "ccy", "tradingCurrency")
-        return clean_patch(patch)
+        patch["exchange"] = self._pick_str(root, "exchange", "exchangeName", "market", "marketName", "mic")
+        patch["currency"] = self._pick_str(root, "currency", "ccy", "tradingCurrency")
+        return _clean_patch(patch)
 
     def _map_quote(self, root: Any) -> Dict[str, Any]:
-        patch: Dict[str, Any] = {}
-        merge_into(patch, self._map_identity_from_any(root))
+        """Map quote fields from response."""
+        patch = self._map_identity(root)
 
-        patch["current_price"] = pick_num(
+        patch["current_price"] = self._pick_num(
             root,
             "last", "last_price", "lastPrice", "price", "close", "c", "tradingPrice",
-            "regularMarketPrice", "tradePrice", "ltp", "lastTradePrice", "value"
+            "regularMarketPrice", "tradePrice", "ltp", "lastTradePrice", "value",
         )
-        patch["previous_close"] = pick_num(
+        patch["previous_close"] = self._pick_num(
             root,
             "previous_close", "prev_close", "pc", "PreviousClose", "prevClose",
-            "regularMarketPreviousClose", "yesterdayClose", "closePrev"
+            "regularMarketPreviousClose", "yesterdayClose", "closePrev",
         )
-        patch["open_price"] = pick_num(
+        patch["open_price"] = self._pick_num(
             root,
-            "open", "open_price", "regularMarketOpen", "o", "Open", "openPrice",
-            "sessionOpen"
+            "open", "open_price", "regularMarketOpen", "o", "Open", "openPrice", "sessionOpen",
         )
-        patch["day_high"] = pick_num(
-            root,
-            "high", "day_high", "h", "High", "dayHigh", "sessionHigh", "highPrice"
+        patch["day_high"] = self._pick_num(
+            root, "high", "day_high", "h", "High", "dayHigh", "sessionHigh", "highPrice",
         )
-        patch["day_low"] = pick_num(
-            root,
-            "low", "day_low", "l", "Low", "dayLow", "sessionLow", "lowPrice"
+        patch["day_low"] = self._pick_num(
+            root, "low", "day_low", "l", "Low", "dayLow", "sessionLow", "lowPrice",
         )
-        patch["volume"] = pick_num(
-            root,
-            "volume", "v", "Volume", "tradedVolume", "qty", "quantity",
-            "totalVolume", "tradeVolume"
+        patch["volume"] = self._pick_num(
+            root, "volume", "v", "Volume", "tradedVolume", "qty", "quantity",
+            "totalVolume", "tradeVolume",
         )
-        patch["market_cap"] = pick_num(root, "market_cap", "marketCap", "marketCapitalization", "MarketCap")
-        patch["week_52_high"] = pick_num(root, "week_52_high", "fiftyTwoWeekHigh", "52w_high", "yearHigh", "week52High")
-        patch["week_52_low"] = pick_num(root, "week_52_low", "fiftyTwoWeekLow", "52w_low", "yearLow", "week52Low")
-        patch["price_change"] = pick_num(root, "change", "d", "price_change", "Change", "diff", "delta")
-        patch["percent_change"] = pick_frac(root, "change_pct", "change_percent", "dp", "percent_change", "pctChange", "changePercent")  # FIX v4.5.0: fraction
-        patch["beta_5y"] = pick_num(root, "beta", "beta5y", "beta_5y")
-        patch["asset_class"] = pick_str(root, "asset_class", "assetClass", "type", "securityType")
+        patch["market_cap"] = self._pick_num(
+            root, "market_cap", "marketCap", "marketCapitalization", "MarketCap",
+        )
+        patch["week_52_high"] = self._pick_num(
+            root, "week_52_high", "fiftyTwoWeekHigh", "52w_high", "yearHigh", "week52High",
+        )
+        patch["week_52_low"] = self._pick_num(
+            root, "week_52_low", "fiftyTwoWeekLow", "52w_low", "yearLow", "week52Low",
+        )
+        patch["price_change"] = self._pick_num(
+            root, "change", "d", "price_change", "Change", "diff", "delta",
+        )
 
-        fill_derived_quote_fields(patch)
-        return clean_patch(patch)
+        # v6.0.0 bug fix: compute percent_change from current/previous FIRST,
+        # falling back to the API field only when prices aren't available.
+        # v5.0.0 always pulled the API field via `_pick_ratio`, whose abs>1.5
+        # heuristic leaves small values (<1.5%) unconverted -- so a 0.75%
+        # daily move (raw value 0.75) became a ratio of 0.75 (75% gain).
+        # `_fill_derived_quote_fields`'s fallback only fires when the field
+        # is None, so the poisoned value from the API was never corrected.
+        current = patch.get("current_price")
+        previous = patch.get("previous_close")
+        if current is not None and previous is not None and previous != 0:
+            patch["percent_change"] = (current - previous) / previous
+        else:
+            patch["percent_change"] = self._pick_ratio(
+                root, "change_pct", "change_percent", "dp",
+                "percent_change", "pctChange", "changePercent",
+            )
+
+        patch["beta_5y"] = self._pick_num(root, "beta", "beta5y", "beta_5y")
+        patch["asset_class"] = self._pick_str(root, "asset_class", "assetClass", "type", "securityType")
+
+        _fill_derived_quote_fields(patch)
+        return _clean_patch(patch)
 
     def _map_fundamentals(self, root: Any) -> Dict[str, Any]:
-        patch: Dict[str, Any] = {}
-        merge_into(patch, self._map_identity_from_any(root), force_keys=("sector", "industry", "name"))
+        """
+        Map fundamental fields from response.
 
-        patch["market_cap"] = pick_num(root, "market_cap", "marketCap", "marketCapitalization", "MarketCap")
-        patch["float_shares"] = pick_num(root, "floatShares", "float_shares", "freeFloatShares", "free_float_shares")
-        patch["shares_outstanding"] = pick_num(root, "shares", "shares_outstanding", "shareOutstanding", "SharesOutstanding")
-        patch["pe_ttm"] = pick_num(root, "pe", "pe_ttm", "trailingPE", "PE", "priceEarnings")
-        patch["pb_ratio"] = pick_num(root, "pb", "pb_ratio", "priceToBook", "PBR", "price_book")
-        patch["ps_ratio"] = pick_num(root, "ps", "ps_ratio", "priceToSales")
-        patch["eps_ttm"] = pick_num(root, "eps", "eps_ttm", "trailingEps", "EPS")
-        patch["dividend_yield"] = pick_frac(root, "dividend_yield", "divYield", "yield", "DividendYield")  # FIX v4.5.0: fraction
-        patch["payout_ratio"] = pick_frac(root, "payout_ratio", "payoutRatio")  # FIX v4.5.0: fraction
-        patch["beta_5y"] = pick_num(root, "beta", "beta5y", "beta_5y")
-        patch["revenue_ttm"] = pick_num(root, "revenue_ttm", "revenue", "sales", "totalRevenue")
-        patch["revenue_growth_yoy"] = pick_frac(root, "revenue_growth_yoy", "revenueGrowth", "salesGrowth")  # FIX v4.5.0: fraction
-        patch["gross_margin"] = pick_frac(root, "gross_margin", "grossMargin")  # FIX v4.5.0: fraction
-        patch["operating_margin"] = pick_frac(root, "operating_margin", "operatingMargin")  # FIX v4.5.0: fraction
-        patch["profit_margin"] = pick_frac(root, "profit_margin", "netMargin", "profitMargin")  # FIX v4.5.0: fraction
-        return clean_patch(patch)
+        Note: uses `_pick_ratio` (heuristic) for percent fields. Tadawul's data
+        source is configurable via env URLs -- could be any aggregator with
+        any scale convention. Conservative default; switch to explicit /100
+        if your aggregator is known to return percent-points.
+        """
+        patch = self._map_identity(root)
+
+        patch["market_cap"] = self._pick_num(root, "market_cap", "marketCap", "marketCapitalization", "MarketCap")
+        patch["float_shares"] = self._pick_num(root, "floatShares", "float_shares", "freeFloatShares", "free_float_shares")
+        patch["shares_outstanding"] = self._pick_num(root, "shares", "shares_outstanding", "shareOutstanding", "SharesOutstanding")
+        patch["pe_ttm"] = self._pick_num(root, "pe", "pe_ttm", "trailingPE", "PE", "priceEarnings")
+        patch["pb_ratio"] = self._pick_num(root, "pb", "pb_ratio", "priceToBook", "PBR", "price_book")
+        patch["ps_ratio"] = self._pick_num(root, "ps", "ps_ratio", "priceToSales")
+        patch["eps_ttm"] = self._pick_num(root, "eps", "eps_ttm", "trailingEps", "EPS")
+        patch["dividend_yield"] = self._pick_ratio(root, "dividend_yield", "divYield", "yield", "DividendYield")
+        patch["payout_ratio"] = self._pick_ratio(root, "payout_ratio", "payoutRatio")
+        patch["beta_5y"] = self._pick_num(root, "beta", "beta5y", "beta_5y")
+        patch["revenue_ttm"] = self._pick_num(root, "revenue_ttm", "revenue", "sales", "totalRevenue")
+        patch["revenue_growth_yoy"] = self._pick_ratio(root, "revenue_growth_yoy", "revenueGrowth", "salesGrowth")
+        patch["gross_margin"] = self._pick_ratio(root, "gross_margin", "grossMargin")
+        patch["operating_margin"] = self._pick_ratio(root, "operating_margin", "operatingMargin")
+        patch["profit_margin"] = self._pick_ratio(root, "profit_margin", "netMargin", "profitMargin")
+
+        return _clean_patch(patch)
 
     def _map_profile(self, root: Any) -> Dict[str, Any]:
-        patch = self._map_identity_from_any(root)
-        if "sector" not in patch:
-            patch["sector"] = pick_str(root, "sectorClassification", "classificationSector", "sectorDesc")
-        if "industry" not in patch:
-            patch["industry"] = pick_str(root, "industryClassification", "classificationIndustry", "industryDesc")
-        if "name" not in patch:
-            patch["name"] = pick_str(root, "issuerName", "issuer_name")
-        return clean_patch(patch)
+        """Map profile fields from response."""
+        patch = self._map_identity(root)
 
-    def _parse_history_payload(self, js: Any) -> ParsedHistory:
+        if "sector" not in patch:
+            patch["sector"] = self._pick_str(
+                root, "sectorClassification", "classificationSector", "sectorDesc",
+            )
+        if "industry" not in patch:
+            patch["industry"] = self._pick_str(
+                root, "industryClassification", "classificationIndustry", "industryDesc",
+            )
+        if "name" not in patch:
+            patch["name"] = self._pick_str(root, "issuerName", "issuer_name")
+
+        return _clean_patch(patch)
+
+    # -- Fetch methods --------------------------------------------------
+
+    async def fetch_quote_patch(self, symbol: str) -> Dict[str, Any]:
+        """Fetch quote patch for a symbol."""
+        if not self.config.is_configured:
+            return {} if not self.config.verbose_warnings else {"_warn": "provider_not_configured"}
+
+        sym = normalize_ksa_symbol(symbol)
+        if not sym or not self.config.quote_url:
+            return {} if not self.config.verbose_warnings else {"_warn": "invalid_symbol_or_url"}
+
+        cache_key = f"quote:{sym}"
+        cached = await self._quote_cache.get(cache_key)
+        if cached is not None:
+            return dict(cached)
+
+        async def _fetch() -> Dict[str, Any]:
+            url = format_url(self.config.quote_url, sym)
+            data, err = await self._request(url)
+            if data is None:
+                await self._error_cache.set(cache_key, True)
+                return {} if not self.config.verbose_warnings else {"_warn": f"quote_failed: {err}"}
+
+            mapped = self._map_quote(self._coerce_dict(data))
+            if (_safe_float(mapped.get("current_price")) is None
+                    and _safe_float(mapped.get("day_high")) is None):
+                return {} if not self.config.verbose_warnings else {"_warn": "quote_payload_sparse"}
+
+            _ensure_ksa_identity(mapped, symbol=sym)
+            result = {
+                "requested_symbol": symbol,
+                "symbol": sym,
+                "symbol_normalized": sym,
+                "provider": PROVIDER_NAME,
+                "data_source": PROVIDER_NAME,
+                "provider_version": PROVIDER_VERSION,
+                "last_updated_utc": _utc_iso(),
+                "last_updated_riyadh": _riyadh_iso(),
+                **mapped,
+            }
+            _fill_derived_quote_fields(result)
+            await self._quote_cache.set(cache_key, result)
+            return result
+
+        return await self._single_flight.run(cache_key, _fetch)
+
+    async def fetch_fundamentals_patch(self, symbol: str) -> Dict[str, Any]:
+        """Fetch fundamentals patch for a symbol."""
+        if not (self.config.is_configured and self.config.enable_fundamentals):
+            return {}
+
+        sym = normalize_ksa_symbol(symbol)
+        if not sym or not self.config.fundamentals_url:
+            return {}
+
+        cache_key = f"fund:{sym}"
+        cached = await self._fund_cache.get(cache_key)
+        if cached is not None:
+            return dict(cached)
+
+        async def _fetch() -> Dict[str, Any]:
+            url = format_url(self.config.fundamentals_url, sym)
+            data, err = await self._request(url)
+            if data is None:
+                await self._error_cache.set(cache_key, True)
+                return {}
+
+            mapped = self._map_fundamentals(self._coerce_dict(data))
+            if not mapped:
+                return {}
+
+            _ensure_ksa_identity(mapped, symbol=sym)
+            result = {
+                "provider": PROVIDER_NAME,
+                "data_source": PROVIDER_NAME,
+                "provider_version": PROVIDER_VERSION,
+                **mapped,
+            }
+            await self._fund_cache.set(cache_key, result)
+            return result
+
+        return await self._single_flight.run(cache_key, _fetch)
+
+    async def fetch_profile_patch(self, symbol: str) -> Dict[str, Any]:
+        """Fetch profile patch for a symbol."""
+        if not (self.config.is_configured and self.config.enable_profile):
+            return {}
+
+        sym = normalize_ksa_symbol(symbol)
+        if not sym or not self.config.profile_url:
+            return {}
+
+        cache_key = f"profile:{sym}"
+        cached = await self._profile_cache.get(cache_key)
+        if cached is not None:
+            return dict(cached)
+
+        async def _fetch() -> Dict[str, Any]:
+            url = format_url(self.config.profile_url, sym)
+            data, err = await self._request(url)
+            if data is None:
+                return {}
+
+            mapped = self._map_profile(self._coerce_dict(data))
+            if not mapped:
+                return {}
+
+            _ensure_ksa_identity(mapped, symbol=sym)
+            result = {
+                "provider": PROVIDER_NAME,
+                "data_source": PROVIDER_NAME,
+                "provider_version": PROVIDER_VERSION,
+                **mapped,
+            }
+            await self._profile_cache.set(cache_key, result)
+            return result
+
+        return await self._single_flight.run(cache_key, _fetch)
+
+    async def fetch_history_patch(self, symbol: str) -> Dict[str, Any]:
+        """Fetch history patch for a symbol."""
+        if not (self.config.is_configured and self.config.enable_history):
+            return {}
+
+        sym = normalize_ksa_symbol(symbol)
+        if not sym or not self.config.history_url:
+            return {}
+
+        days = self.config.history_days
+        cache_key = f"history:{sym}:{days}"
+        cached = await self._history_cache.get(cache_key)
+        if cached is not None:
+            return dict(cached)
+
+        async def _fetch() -> Dict[str, Any]:
+            url = format_url(self.config.history_url, sym, days=days)
+            data, err = await self._request(url)
+            if data is None:
+                await self._error_cache.set(cache_key, True)
+                return {}
+
+            rows, last_dt = self._parse_history_payload(data)
+            if len(rows) < 2:
+                return {}
+
+            analytics = _compute_history_analytics(rows)
+            result = {
+                "requested_symbol": symbol,
+                "normalized_symbol": sym,
+                "history_points": len(rows),
+                "history_last_utc": _utc_iso(last_dt),
+                "history_last_riyadh": _to_riyadh_iso(last_dt),
+                "provider": PROVIDER_NAME,
+                "data_source": PROVIDER_NAME,
+                "provider_version": PROVIDER_VERSION,
+                **analytics,
+            }
+            _ensure_ksa_identity(result, symbol=sym)
+            _fill_derived_quote_fields(result)
+            await self._history_cache.set(cache_key, result)
+            return result
+
+        return await self._single_flight.run(cache_key, _fetch)
+
+    def _parse_history_payload(
+        self,
+        data: Any,
+    ) -> Tuple[List[Dict[str, Any]], Optional[datetime]]:
+        """Parse history payload into (rows, last_dt)."""
         rows: List[Dict[str, Any]] = []
         last_dt: Optional[datetime] = None
 
-        # Case 1: dict of aligned arrays
-        if isinstance(js, dict):
-            t_raw = js.get("t") or js.get("time") or js.get("timestamp") or js.get("dates")
-            o_raw = js.get("o") or js.get("open")
-            h_raw = js.get("h") or js.get("high")
-            l_raw = js.get("l") or js.get("low")
-            c_raw = js.get("c") or js.get("close")
-            v_raw = js.get("v") or js.get("volume")
+        # Case 1: dict with aligned arrays
+        if isinstance(data, dict):
+            t_raw = data.get("t") or data.get("time") or data.get("timestamp") or data.get("dates")
+            o_raw = data.get("o") or data.get("open")
+            h_raw = data.get("h") or data.get("high")
+            l_raw = data.get("l") or data.get("low")
+            c_raw = data.get("c") or data.get("close")
+            v_raw = data.get("v") or data.get("volume")
 
             if isinstance(c_raw, list):
                 n = len(c_raw)
                 for i in range(n):
                     row: Dict[str, Any] = {
-                        "open": safe_float(o_raw[i]) if isinstance(o_raw, list) and i < len(o_raw) else None,
-                        "high": safe_float(h_raw[i]) if isinstance(h_raw, list) and i < len(h_raw) else None,
-                        "low": safe_float(l_raw[i]) if isinstance(l_raw, list) and i < len(l_raw) else None,
-                        "close": safe_float(c_raw[i]),
-                        "volume": safe_float(v_raw[i]) if isinstance(v_raw, list) and i < len(v_raw) else None,
+                        "open": _safe_float(o_raw[i]) if isinstance(o_raw, list) and i < len(o_raw) else None,
+                        "high": _safe_float(h_raw[i]) if isinstance(h_raw, list) and i < len(h_raw) else None,
+                        "low": _safe_float(l_raw[i]) if isinstance(l_raw, list) and i < len(l_raw) else None,
+                        "close": _safe_float(c_raw[i]),
+                        "volume": _safe_float(v_raw[i]) if isinstance(v_raw, list) and i < len(v_raw) else None,
                     }
                     t = t_raw[i] if isinstance(t_raw, list) and i < len(t_raw) else None
                     if t is not None:
@@ -1130,21 +1366,21 @@ class TadawulClient:
 
             if not rows:
                 for key in ("candles", "data", "items", "prices", "history", "rows"):
-                    if isinstance(js.get(key), list):
-                        js = js[key]
+                    if isinstance(data.get(key), list):
+                        data = data[key]
                         break
 
         # Case 2: list of dict bars
-        if isinstance(js, list):
-            for item in js:
+        if isinstance(data, list):
+            for item in data:
                 if not isinstance(item, dict):
                     continue
                 row = {
-                    "open": safe_float(item.get("o") if "o" in item else item.get("open")),
-                    "high": safe_float(item.get("h") if "h" in item else item.get("high")),
-                    "low": safe_float(item.get("l") if "l" in item else item.get("low")),
-                    "close": safe_float(item.get("c") if "c" in item else item.get("close")),
-                    "volume": safe_float(item.get("v") if "v" in item else item.get("volume")),
+                    "open": _safe_float(item.get("o") if "o" in item else item.get("open")),
+                    "high": _safe_float(item.get("h") if "h" in item else item.get("high")),
+                    "low": _safe_float(item.get("l") if "l" in item else item.get("low")),
+                    "close": _safe_float(item.get("c") if "c" in item else item.get("close")),
+                    "volume": _safe_float(item.get("v") if "v" in item else item.get("volume")),
                 }
                 t = item.get("t") or item.get("time") or item.get("timestamp") or item.get("date")
                 if t is not None:
@@ -1159,163 +1395,18 @@ class TadawulClient:
                         pass
                 rows.append(row)
 
-        maxp = _history_points_max()
-        rows = rows[-maxp:]
-        return ParsedHistory(rows=rows, last_dt=last_dt)
-
-    # -------------------------------------------------------------------------
-    # Public fetchers
-    # -------------------------------------------------------------------------
-    async def fetch_quote_patch(self, symbol: str) -> Dict[str, Any]:
-        if not _configured():
-            return {}
-        sym = normalize_ksa_symbol(symbol)
-        if not sym or not self.quote_url:
-            return {} if not _emit_warnings() else {"_warn": "invalid_symbol_or_url"}
-
-        cache_key = f"quote:{sym}"
-        cached = await self.quote_cache.get(cache_key)
-        if cached is not None:
-            return dict(cached)
-
-        async def _fetch():
-            js, err = await self._request(format_url(self.quote_url or "", sym))
-            if js is None:
-                await self.error_cache.set(cache_key, True)
-                return {} if not _emit_warnings() else {"_warn": f"quote_failed: {err}"}
-
-            mapped = self._map_quote(coerce_dict(js))
-            if safe_float(mapped.get("current_price")) is None and safe_float(mapped.get("day_high")) is None and safe_float(mapped.get("day_low")) is None:
-                return {} if not _emit_warnings() else {"_warn": "quote_payload_sparse"}
-
-            _ensure_ksa_identity(mapped, symbol=sym)
-            result = {
-                "requested_symbol": symbol,
-                "symbol": sym,
-                "symbol_normalized": sym,
-                "provider": PROVIDER_NAME,
-                "data_source": PROVIDER_NAME,
-                "provider_version": PROVIDER_VERSION,
-                "last_updated_utc": _utc_iso(),
-                "last_updated_riyadh": _riyadh_iso(),
-                **mapped,
-            }
-            fill_derived_quote_fields(result)
-            await self.quote_cache.set(cache_key, result)
-            return result
-
-        return await self.singleflight.run(cache_key, _fetch)
-
-    async def fetch_fundamentals_patch(self, symbol: str) -> Dict[str, Any]:
-        if not (_configured() and _enable_fundamentals()):
-            return {}
-        sym = normalize_ksa_symbol(symbol)
-        if not sym or not self.fundamentals_url:
-            return {}
-
-        cache_key = f"fund:{sym}"
-        cached = await self.fund_cache.get(cache_key)
-        if cached is not None:
-            return dict(cached)
-
-        async def _fetch():
-            js, err = await self._request(format_url(self.fundamentals_url or "", sym))
-            if js is None:
-                await self.error_cache.set(cache_key, True)
-                return {}
-            mapped = self._map_fundamentals(coerce_dict(js))
-            if not mapped:
-                return {}
-            _ensure_ksa_identity(mapped, symbol=sym)
-            out = {
-                "provider": PROVIDER_NAME,
-                "data_source": PROVIDER_NAME,
-                "provider_version": PROVIDER_VERSION,
-                **mapped,
-            }
-            await self.fund_cache.set(cache_key, out)
-            return out
-
-        return await self.singleflight.run(cache_key, _fetch)
-
-    async def fetch_profile_patch(self, symbol: str) -> Dict[str, Any]:
-        if not (_configured() and _enable_profile()):
-            return {}
-        sym = normalize_ksa_symbol(symbol)
-        if not sym or not self.profile_url:
-            return {}
-
-        cache_key = f"profile:{sym}"
-        cached = await self.profile_cache.get(cache_key)
-        if cached is not None:
-            return dict(cached)
-
-        async def _fetch():
-            js, err = await self._request(format_url(self.profile_url or "", sym))
-            if js is None:
-                return {}
-            mapped = self._map_profile(coerce_dict(js))
-            if not mapped:
-                return {}
-            _ensure_ksa_identity(mapped, symbol=sym)
-            out = {
-                "provider": PROVIDER_NAME,
-                "data_source": PROVIDER_NAME,
-                "provider_version": PROVIDER_VERSION,
-                **mapped,
-            }
-            await self.profile_cache.set(cache_key, out)
-            return out
-
-        return await self.singleflight.run(cache_key, _fetch)
-
-    async def fetch_history_patch(self, symbol: str) -> Dict[str, Any]:
-        if not (_configured() and _enable_history()):
-            return {}
-        sym = normalize_ksa_symbol(symbol)
-        if not sym or not self.history_url:
-            return {}
-
-        days = _history_days()
-        cache_key = f"history:{sym}:{days}"
-        cached = await self.history_cache.get(cache_key)
-        if cached is not None:
-            return dict(cached)
-
-        async def _fetch():
-            js, err = await self._request(format_url(self.history_url or "", sym, days=days))
-            if js is None:
-                await self.error_cache.set(cache_key, True)
-                return {}
-            parsed = self._parse_history_payload(js)
-            rows = parsed.rows
-            if len(rows) < 2:
-                return {}
-            analytics = compute_history_analytics(rows)
-            out = {
-                "requested_symbol": symbol,
-                "normalized_symbol": sym,
-                "history_points": len(rows),
-                "history_last_utc": _utc_iso(parsed.last_dt),
-                "history_last_riyadh": _to_riyadh_iso(parsed.last_dt),
-                "provider": PROVIDER_NAME,
-                "data_source": PROVIDER_NAME,
-                "provider_version": PROVIDER_VERSION,
-                **analytics,
-            }
-            _ensure_ksa_identity(out, symbol=sym)
-            fill_derived_quote_fields(out)
-            await self.history_cache.set(cache_key, out)
-            return out
-
-        return await self.singleflight.run(cache_key, _fetch)
+        max_points = self.config.history_points_max
+        rows = rows[-max_points:]
+        return rows, last_dt
 
     async def fetch_enriched_quote_patch(self, symbol: str) -> Dict[str, Any]:
-        if not _configured():
+        """Fetch enriched quote patch merging all available sources."""
+        if not self.config.is_configured:
             return {}
+
         sym = normalize_ksa_symbol(symbol)
         if not sym:
-            return {} if not _emit_warnings() else {"_warn": "invalid_ksa_symbol"}
+            return {} if not self.config.verbose_warnings else {"_warn": "invalid_ksa_symbol"}
 
         quote_data, fund_data, hist_data, prof_data = await asyncio.gather(
             self.fetch_quote_patch(symbol),
@@ -1330,97 +1421,113 @@ class TadawulClient:
         hist_data = hist_data if isinstance(hist_data, dict) else {}
         prof_data = prof_data if isinstance(prof_data, dict) else {}
 
-        result: Dict[str, Any] = dict(quote_data) if quote_data else {
-            "requested_symbol": symbol,
-            "symbol": sym,
-            "symbol_normalized": sym,
-            "provider": PROVIDER_NAME,
-            "data_source": PROVIDER_NAME,
-            "provider_version": PROVIDER_VERSION,
-            "last_updated_utc": _utc_iso(),
-            "last_updated_riyadh": _riyadh_iso(),
-        }
+        if quote_data:
+            result = dict(quote_data)
+        else:
+            result = {
+                "requested_symbol": symbol,
+                "symbol": sym,
+                "symbol_normalized": sym,
+                "provider": PROVIDER_NAME,
+                "data_source": PROVIDER_NAME,
+                "provider_version": PROVIDER_VERSION,
+                "last_updated_utc": _utc_iso(),
+                "last_updated_riyadh": _riyadh_iso(),
+            }
 
-        # Classification/profile before fundamentals; history mainly as fallback for quote/52w/avg vol
+        # Merge in precedence order: profile (classification), fund (financials), history (technicals)
         if prof_data:
-            merge_into(result, prof_data, force_keys=("name", "sector", "industry", "exchange", "currency", "country"))
+            for k in ("name", "sector", "industry", "exchange", "currency", "country"):
+                if k in prof_data and prof_data[k] is not None:
+                    if k not in result or result.get(k) in (None, ""):
+                        result[k] = prof_data[k]
+
         if fund_data:
-            merge_into(
-                result,
-                fund_data,
-                force_keys=("market_cap", "pe_ttm", "eps_ttm", "pb_ratio", "ps_ratio", "dividend_yield", "beta_5y"),
-            )
+            for k in ("market_cap", "pe_ttm", "eps_ttm", "pb_ratio", "ps_ratio",
+                      "dividend_yield", "beta_5y"):
+                if k in fund_data and fund_data[k] is not None:
+                    if k not in result or result.get(k) in (None, ""):
+                        result[k] = fund_data[k]
+
         if hist_data:
-            merge_into(
-                result,
-                hist_data,
-                force_keys=(
-                    "week_52_high", "week_52_low", "week_52_position_pct",
-                    "avg_volume_10d", "avg_volume_30d", "rsi_14", "volatility_30d",
-                    "forecast_confidence", "forecast_price_1m", "forecast_price_3m", "forecast_price_12m",
-                    "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
-                ),
-            )
+            for k in (
+                "week_52_high", "week_52_low", "week_52_position_pct",
+                "avg_volume_10d", "avg_volume_30d", "rsi_14", "volatility_30d",
+            ):
+                if k in hist_data and hist_data[k] is not None:
+                    if k not in result or result.get(k) in (None, ""):
+                        result[k] = hist_data[k]
 
         _ensure_ksa_identity(result, symbol=sym)
-        fill_derived_quote_fields(result)
+        _fill_derived_quote_fields(result)
 
-        cat, score = data_quality_score(result)
-        result["data_quality"] = cat.value
-        result["data_quality_score"] = float(score)
+        quality, score = _data_quality_score(result)
+        result["data_quality"] = quality.value
+        result["data_quality_score"] = score
 
-        if _emit_warnings():
-            warns = []
-            for src in (quote_data, fund_data, hist_data, prof_data):
+        if self.config.verbose_warnings:
+            warnings = []
+            for src, name in [(quote_data, "quote"), (fund_data, "fund"),
+                              (hist_data, "hist"), (prof_data, "prof")]:
                 if isinstance(src, dict) and "_warn" in src:
-                    warns.append(str(src["_warn"]))
-            if warns:
-                result["_warnings"] = " | ".join(warns[:3])
+                    warnings.append(f"{name}:{src['_warn']}")
+            if warnings:
+                result["_warnings"] = " | ".join(warnings[:3])
 
-        return clean_patch(result)
-
+        return _clean_patch(result)
 
     async def get_enriched_quotes_batch(
         self,
         symbols: List[str],
-        *,
         mode: str = "",
     ) -> Dict[str, Dict[str, Any]]:
-        """ENH v4.5.0: Batch fetch for multiple KSA symbols."""
+        """Batch fetch enriched quotes for multiple symbols."""
         if not symbols:
             return {}
+
         results = await asyncio.gather(
             *(self.fetch_enriched_quote_patch(sym) for sym in symbols),
             return_exceptions=True,
         )
-        out: Dict[str, Dict[str, Any]] = {}
+
+        output: Dict[str, Dict[str, Any]] = {}
         for sym, result in zip(symbols, results):
             if isinstance(result, Exception):
-                out[sym] = {"symbol": sym, "provider": PROVIDER_NAME, "data_quality": "MISSING"}
+                output[sym] = {
+                    "symbol": sym,
+                    "provider": PROVIDER_NAME,
+                    "data_quality": "MISSING",
+                    "error": str(result),
+                }
             elif isinstance(result, dict):
                 key = result.get("symbol") or normalize_ksa_symbol(sym) or sym
-                out[key] = result
+                output[key] = result
             else:
-                out[sym] = {"symbol": sym, "provider": PROVIDER_NAME, "data_quality": "MISSING"}
-        return out
+                output[sym] = {
+                    "symbol": sym,
+                    "provider": PROVIDER_NAME,
+                    "data_quality": "MISSING",
+                }
+        return output
 
     async def get_metrics(self) -> Dict[str, Any]:
+        """Get client metrics snapshot."""
         return {
             "provider": PROVIDER_NAME,
             "version": PROVIDER_VERSION,
-            "configured": _configured(),
+            "configured": self.config.is_configured,
             "urls": {
-                "quote": bool(self.quote_url),
-                "fundamentals": bool(self.fundamentals_url),
-                "history": bool(self.history_url),
-                "profile": bool(self.profile_url),
+                "quote": bool(self.config.quote_url),
+                "fundamentals": bool(self.config.fundamentals_url),
+                "history": bool(self.config.history_url),
+                "profile": bool(self.config.profile_url),
             },
             "cache_sizes": {
-                "quote": await self.quote_cache.size(),
-                "fund": await self.fund_cache.size(),
-                "history": await self.history_cache.size(),
-                "profile": await self.profile_cache.size(),
-                "error": await self.error_cache.size(),
+                "quote": await self._quote_cache.size(),
+                "fund": await self._fund_cache.size(),
+                "history": await self._history_cache.size(),
+                "profile": await self._profile_cache.size(),
+                "error": await self._error_cache.size(),
             },
             "ksa_defaults": {
                 "country": KSA_COUNTRY_CODE,
@@ -1430,108 +1537,152 @@ class TadawulClient:
         }
 
     async def close(self) -> None:
-        self._closing = True
-        await self._client.aclose()
+        """Close the underlying httpx client."""
+        try:
+            await self._client.aclose()
+        except Exception as exc:
+            logger.debug("tadawul client close failed: %s", exc)
 
 
-# =============================================================================
-# Public API (singleton)
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Singleton Client (lazy lock)
+# ---------------------------------------------------------------------------
+
 _CLIENT_INSTANCE: Optional[TadawulClient] = None
-_CLIENT_LOCK = asyncio.Lock()
+_CLIENT_LOCK: Optional[asyncio.Lock] = None
+
+
+def _get_client_lock() -> asyncio.Lock:
+    global _CLIENT_LOCK
+    if _CLIENT_LOCK is None:
+        _CLIENT_LOCK = asyncio.Lock()
+    return _CLIENT_LOCK
 
 
 async def get_client() -> TadawulClient:
+    """Get the singleton TadawulClient instance."""
     global _CLIENT_INSTANCE
-    if _CLIENT_INSTANCE is None:
-        async with _CLIENT_LOCK:
-            if _CLIENT_INSTANCE is None:
-                _CLIENT_INSTANCE = TadawulClient()
+    if _CLIENT_INSTANCE is not None:
+        return _CLIENT_INSTANCE
+    async with _get_client_lock():
+        if _CLIENT_INSTANCE is None:
+            _CLIENT_INSTANCE = TadawulClient()
     return _CLIENT_INSTANCE
 
 
 async def close_client() -> None:
+    """Close and reset the singleton client."""
     global _CLIENT_INSTANCE
-    if _CLIENT_INSTANCE:
+    if _CLIENT_INSTANCE is not None:
         await _CLIENT_INSTANCE.close()
         _CLIENT_INSTANCE = None
 
 
-async def fetch_enriched_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return await (await get_client()).fetch_enriched_quote_patch(symbol)
+# ---------------------------------------------------------------------------
+# Engine-Facing Functions
+# ---------------------------------------------------------------------------
 
+async def fetch_enriched_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    """Fetch enriched quote patch for a symbol. Extra args/kwargs ignored."""
+    if args or kwargs:
+        logger.debug(
+            "fetch_enriched_quote_patch(%s): ignoring args=%r kwargs=%r",
+            symbol, args, kwargs,
+        )
+    client = await get_client()
+    return await client.fetch_enriched_quote_patch(symbol)
 
 
 async def fetch_enriched_quotes_batch(
-    symbols: List[str], *, mode: str = "", **kwargs: Any
+    symbols: List[str],
+    mode: str = "",
+    **kwargs: Any,
 ) -> Dict[str, Dict[str, Any]]:
-    """ENH v4.5.0: Batch fetch enriched patches for multiple KSA symbols."""
+    """Batch fetch enriched quotes for multiple symbols."""
+    if kwargs:
+        logger.debug("fetch_enriched_quotes_batch: ignoring kwargs=%r", kwargs)
     client = await get_client()
     return await client.get_enriched_quotes_batch(symbols, mode=mode)
 
+
 async def fetch_quote_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return await (await get_client()).fetch_quote_patch(symbol)
+    """Fetch quote patch (quote only)."""
+    if args or kwargs:
+        logger.debug("fetch_quote_patch(%s): ignoring args=%r kwargs=%r", symbol, args, kwargs)
+    client = await get_client()
+    return await client.fetch_quote_patch(symbol)
 
 
 async def fetch_fundamentals_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return await (await get_client()).fetch_fundamentals_patch(symbol)
+    """Fetch fundamentals patch."""
+    if args or kwargs:
+        logger.debug("fetch_fundamentals_patch(%s): ignoring args=%r kwargs=%r", symbol, args, kwargs)
+    client = await get_client()
+    return await client.fetch_fundamentals_patch(symbol)
 
 
 async def fetch_history_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return await (await get_client()).fetch_history_patch(symbol)
+    """Fetch history patch."""
+    if args or kwargs:
+        logger.debug("fetch_history_patch(%s): ignoring args=%r kwargs=%r", symbol, args, kwargs)
+    client = await get_client()
+    return await client.fetch_history_patch(symbol)
 
 
 async def fetch_profile_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    return await (await get_client()).fetch_profile_patch(symbol)
-
-
-async def fetch_quote_and_fundamentals_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    """Fetch profile patch."""
+    if args or kwargs:
+        logger.debug("fetch_profile_patch(%s): ignoring args=%r kwargs=%r", symbol, args, kwargs)
     client = await get_client()
-    result = dict(await client.fetch_quote_patch(symbol))
-    merge_into(result, await client.fetch_fundamentals_patch(symbol))
-    _ensure_ksa_identity(result, symbol=normalize_ksa_symbol(symbol) or symbol)
-    fill_derived_quote_fields(result)
-    return clean_patch(result)
+    return await client.fetch_profile_patch(symbol)
 
 
-async def fetch_quote_and_history_patch(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
-    client = await get_client()
-    result = dict(await client.fetch_quote_patch(symbol))
-    merge_into(result, await client.fetch_history_patch(symbol))
-    _ensure_ksa_identity(result, symbol=normalize_ksa_symbol(symbol) or symbol)
-    fill_derived_quote_fields(result)
-    return clean_patch(result)
-
-
-# Extra compatibility aliases
 async def fetch_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    """Alias for fetch_enriched_quote_patch."""
     return await fetch_enriched_quote_patch(symbol, *args, **kwargs)
 
 
 async def get_quote(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    """Alias for fetch_enriched_quote_patch."""
     return await fetch_enriched_quote_patch(symbol, *args, **kwargs)
 
 
 async def fetch_history(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    """Alias for fetch_history_patch."""
     return await fetch_history_patch(symbol, *args, **kwargs)
 
 
 async def get_history(symbol: str, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+    """Alias for fetch_history_patch."""
     return await fetch_history_patch(symbol, *args, **kwargs)
 
 
 async def get_client_metrics() -> Dict[str, Any]:
-    return await (await get_client()).get_metrics()
+    """Get client metrics snapshot."""
+    client = await get_client()
+    return await client.get_metrics()
 
 
 async def aclose_tadawul_client() -> None:
+    """Close the Tadawul client."""
     await close_client()
 
 
-# =============================================================================
-# Provider adapter
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Provider Adapter (singleton)
+# ---------------------------------------------------------------------------
+
 class _TadawulProviderAdapter:
+    """Provider adapter for engine compatibility."""
+
+    @property
+    def name(self) -> str:
+        return PROVIDER_NAME
+
+    @property
+    def version(self) -> str:
+        return PROVIDER_VERSION
+
     async def get_quote(self, symbol: str) -> Dict[str, Any]:
         return await fetch_enriched_quote_patch(symbol)
 
@@ -1562,68 +1713,68 @@ class _TadawulProviderAdapter:
     async def get_history(self, symbol: str) -> Dict[str, Any]:
         return await fetch_history_patch(symbol)
 
-
     async def get_enriched_quotes_batch(
         self,
         symbols: List[str],
-        *,
         mode: str = "",
     ) -> Dict[str, Dict[str, Any]]:
-        """ENH v4.5.0: Batch fetch for multiple KSA symbols."""
-        if not symbols:
-            return {}
-        results = await asyncio.gather(
-            *(self.fetch_enriched_quote_patch(sym) for sym in symbols),
-            return_exceptions=True,
-        )
-        out: Dict[str, Dict[str, Any]] = {}
-        for sym, result in zip(symbols, results):
-            if isinstance(result, Exception):
-                out[sym] = {"symbol": sym, "provider": PROVIDER_NAME, "data_quality": "MISSING"}
-            elif isinstance(result, dict):
-                key = result.get("symbol") or normalize_ksa_symbol(sym) or sym
-                out[key] = result
-            else:
-                out[sym] = {"symbol": sym, "provider": PROVIDER_NAME, "data_quality": "MISSING"}
-        return out
+        return await fetch_enriched_quotes_batch(symbols, mode=mode)
 
     async def get_metrics(self) -> Dict[str, Any]:
         return await get_client_metrics()
 
 
+# Singleton provider instance
 provider = _TadawulProviderAdapter()
 
 
-def get_provider():
+def get_provider() -> _TadawulProviderAdapter:
+    """Get the singleton provider instance."""
     return provider
 
 
-def build_provider():
+def build_provider() -> _TadawulProviderAdapter:
+    """Alias for get_provider (back-compat)."""
     return provider
 
+
+# ---------------------------------------------------------------------------
+# Module Exports
+# ---------------------------------------------------------------------------
 
 __all__ = [
+    # Metadata
     "PROVIDER_NAME",
     "PROVIDER_VERSION",
+    "VERSION",
+    "PROVIDER_BATCH_SUPPORTED",
+    # Symbol normalization
     "normalize_ksa_symbol",
+    # Engine-facing functions
     "fetch_enriched_quote_patch",
     "fetch_enriched_quotes_batch",
-    "PROVIDER_BATCH_SUPPORTED",
     "fetch_quote_patch",
     "fetch_fundamentals_patch",
     "fetch_history_patch",
     "fetch_profile_patch",
-    "fetch_quote_and_fundamentals_patch",
-    "fetch_quote_and_history_patch",
     "fetch_quote",
     "get_quote",
     "fetch_history",
     "get_history",
     "get_client_metrics",
     "aclose_tadawul_client",
-    "MarketRegime",
-    "DataQuality",
+    # Provider adapter
     "provider",
     "get_provider",
     "build_provider",
+    # Enums
+    "MarketRegime",
+    "DataQuality",
+    # Classes (newly exported for clarity)
+    "TadawulConfig",
+    "TadawulClient",
+    # Exceptions
+    "TadawulProviderError",
+    "TadawulConfigurationError",
+    "TadawulFetchError",
 ]
