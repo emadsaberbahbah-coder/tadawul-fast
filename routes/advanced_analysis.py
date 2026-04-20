@@ -2,24 +2,51 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.4.0
+Advanced Analysis Root Owner — v4.4.1
 ================================================================================
 ROOT SHEET-ROWS OWNER • ENGINE-FIRST • SCHEMA-FIRST • FAIL-SOFT • STABLE ENVELOPE
 GET+POST MERGED • HEADERS-ONLY / SCHEMA-ONLY • CANONICAL WIDTHS • OWNER-ALIGNED
 HYPHEN + UNDERSCORE ALIASES • JSON-SAFE • PLACEHOLDER-DEGRADATION FILTER
 
-Key fixes in this revision
---------------------------
-- FIX: Prefer app.state.engine get_sheet_rows / get_sheet_rows_sync before the
-       adapter import path. This avoids false degradation through proxy loops.
-- FIX: Align widths with live validator expectations:
-       My_Portfolio=80, Insights_Analysis=7, Top_10_Investments=83, Data_Dictionary=9.
-- FIX: Reject upstream payloads that are already known placeholder/fail-soft
-       outputs, instead of treating them as successful live data.
-- FIX: Support more upstream payload shapes: row_objects, records, items, data,
-       quotes, rows, rows_matrix, matrix, nested payload/result/response.
-- FIX: Preserve stable schema envelopes and non-empty local fallbacks only as the
-       final safety layer.
+v4.4.1 Fixes (vs v4.4.0)
+------------------------
+- FIX: _extract_rows_like no longer early-returns on an empty list at the first
+  probed key. Previously, a payload like
+  {"row_objects": [], "records": [...real data...]} would return [] because
+  row_objects was empty but passed the permissive guard. Now each probe must
+  be a non-empty list of Mappings; otherwise we fall through to the next key.
+  This cascaded into _payload_looks_like_placeholder marking the response
+  degraded and emitting the local fallback, losing real upstream data.
+- FIX: _extract_rows_matrix_like has the same early-return bug fixed in
+  parallel.
+- FIX: datetime.utcnow() replaced with datetime.now(timezone.utc) (deprecated
+  in Python 3.12+, scheduled for removal) in _placeholder_value_for_key and
+  _build_insights_fallback_rows. Added timezone to the datetime import.
+- FIX: Top10 rows are no longer normalized twice. _normalize_external_payload
+  feeds already-normalized rows to _ensure_top10_rows, which now accepts an
+  `already_normalized=True` flag to skip its internal normalization pass.
+- FIX: _normalize_page_flexible now tries BOTH kwargs shapes before falling
+  back to the trivial replacement. v4.4.0 used `except Exception: break`
+  which aborted on the first non-TypeError raised by the canonical form.
+- CLEAN: Module-scope namespace pollution removed. The two module-discovery
+  loops (schema_registry and page_catalog) are now encapsulated in functions
+  so their local bindings don't leak into the module namespace.
+- CLEAN: _build_placeholder_rows no longer calls _normalize_symbol_token
+  twice per item in the filter-then-construct pattern.
+- Public API, __all__, route paths, and all signatures preserved.
+
+v4.4.0 Notes (unchanged)
+------------------------
+- Prefer app.state.engine get_sheet_rows / get_sheet_rows_sync before the
+  adapter import path. This avoids false degradation through proxy loops.
+- Align widths with live validator expectations:
+  My_Portfolio=80, Insights_Analysis=7, Top_10_Investments=83, Data_Dictionary=9.
+- Reject upstream payloads that are already known placeholder/fail-soft
+  outputs, instead of treating them as successful live data.
+- Support more upstream payload shapes: row_objects, records, items, data,
+  quotes, rows, rows_matrix, matrix, nested payload/result/response.
+- Preserve stable schema envelopes and non-empty local fallbacks only as the
+  final safety layer.
 ================================================================================
 """
 
@@ -35,7 +62,7 @@ import re
 import time
 import uuid
 from dataclasses import is_dataclass
-from datetime import date, datetime, time as dt_time
+from datetime import date, datetime, time as dt_time, timezone
 from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
@@ -44,7 +71,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
-ADVANCED_ANALYSIS_VERSION = "4.4.0"
+ADVANCED_ANALYSIS_VERSION = "4.4.1"
 router = APIRouter(tags=["schema", "root-sheet-rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -84,21 +111,29 @@ get_sheet_keys = None     # type: ignore
 get_sheet_len = None      # type: ignore
 get_sheet_spec = None     # type: ignore
 
-for _sreg_path in ("core.sheets.schema_registry", "core.schema_registry", "schema_registry"):
-    try:
-        import importlib as _il
-        _sreg = _il.import_module(_sreg_path)
-        _fh = getattr(_sreg, "get_sheet_headers", None)
-        _fk = getattr(_sreg, "get_sheet_keys", None)
-        if callable(_fh) and callable(_fk):
-            get_sheet_headers = _fh
-            get_sheet_keys = _fk
-            get_sheet_len = getattr(_sreg, "get_sheet_len", None)
-            get_sheet_spec = getattr(_sreg, "get_sheet_spec", None)
-            break
-    except Exception:
-        continue
-del _sreg_path
+
+def _discover_schema_registry() -> Tuple[Any, Any, Any, Any]:
+    """v4.4.1: encapsulated so loop locals don't pollute the module namespace."""
+    import importlib
+    for path in ("core.sheets.schema_registry", "core.schema_registry", "schema_registry"):
+        try:
+            mod = importlib.import_module(path)
+        except Exception:
+            continue
+        fh = getattr(mod, "get_sheet_headers", None)
+        fk = getattr(mod, "get_sheet_keys", None)
+        if callable(fh) and callable(fk):
+            return (
+                fh,
+                fk,
+                getattr(mod, "get_sheet_len", None),
+                getattr(mod, "get_sheet_spec", None),
+            )
+    return None, None, None, None
+
+
+get_sheet_headers, get_sheet_keys, get_sheet_len, get_sheet_spec = _discover_schema_registry()
+
 
 CANONICAL_PAGES: List[str] = []
 FORBIDDEN_PAGES: set[str] = {"KSA_Tadawul", "Advisor_Criteria"}
@@ -112,26 +147,38 @@ def normalize_page_name(name: str, allow_output_pages: bool = True) -> str:
     return (name or "").strip().replace(" ", "_")
 
 
-for _pcat_path in ("core.sheets.page_catalog", "core.page_catalog", "page_catalog"):
-    try:
-        import importlib as _il2
-        _pcat = _il2.import_module(_pcat_path)
-        _ap = getattr(_pcat, "allowed_pages", None)
-        _np = getattr(_pcat, "normalize_page_name", None)
-        if callable(_ap):
-            _cp = getattr(_pcat, "CANONICAL_PAGES", None)
-            _fp = getattr(_pcat, "FORBIDDEN_PAGES", None)
-            if _cp is not None:
-                CANONICAL_PAGES[:] = list(_cp)
-            if _fp is not None:
+def _discover_page_catalog() -> None:
+    """v4.4.1: encapsulated so loop locals don't pollute the module namespace.
+
+    Rebinds the module-level `allowed_pages` / `normalize_page_name` and
+    populates CANONICAL_PAGES / FORBIDDEN_PAGES from the first importable
+    page_catalog module found.
+    """
+    global allowed_pages, normalize_page_name
+    import importlib
+    for path in ("core.sheets.page_catalog", "core.page_catalog", "page_catalog"):
+        try:
+            mod = importlib.import_module(path)
+        except Exception:
+            continue
+        ap = getattr(mod, "allowed_pages", None)
+        np_ = getattr(mod, "normalize_page_name", None)
+        if callable(ap):
+            cp = getattr(mod, "CANONICAL_PAGES", None)
+            fp = getattr(mod, "FORBIDDEN_PAGES", None)
+            if cp is not None:
+                CANONICAL_PAGES[:] = list(cp)
+            if fp is not None:
                 FORBIDDEN_PAGES.clear()
-                FORBIDDEN_PAGES.update(_fp)
-            allowed_pages = _ap
-            normalize_page_name = _np or normalize_page_name
-            break
-    except Exception:
-        continue
-del _pcat_path
+                FORBIDDEN_PAGES.update(fp)
+            allowed_pages = ap
+            if callable(np_):
+                normalize_page_name = np_
+            return
+
+
+_discover_page_catalog()
+
 
 try:
     from core.config import auth_ok, get_settings_cached, is_open_mode  # type: ignore
@@ -532,6 +579,9 @@ def _auth_passed(*, request: Request, settings: Any, auth_token: str, authorizat
 
 
 def _normalize_page_flexible(page_raw: str) -> str:
+    """v4.4.1: use `continue` instead of `break` on non-TypeError so we try
+    BOTH kwargs shapes (with and without allow_output_pages) before falling
+    back to the trivial underscore-replacement."""
     raw = _strip(page_raw)
     if not raw:
         return "Market_Leaders"
@@ -544,7 +594,7 @@ def _normalize_page_flexible(page_raw: str) -> str:
         except TypeError:
             continue
         except Exception:
-            break
+            continue
     return raw.replace(" ", "_")
 
 
@@ -618,10 +668,10 @@ def _pad_contract(
 
 def _ensure_top10_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple[List[str], List[str]]:
     hdrs, ks = _complete_schema_contract(headers, keys)
-    for field in _TOP10_REQUIRED_FIELDS:
-        if field not in ks:
-            ks.append(field)
-            hdrs.append(_TOP10_REQUIRED_HEADERS[field])
+    for fld in _TOP10_REQUIRED_FIELDS:
+        if fld not in ks:
+            ks.append(fld)
+            hdrs.append(_TOP10_REQUIRED_HEADERS[fld])
     return _pad_contract(hdrs, ks, 83)
 
 
@@ -857,11 +907,21 @@ def _ensure_top10_rows(
     top_n: int,
     schema_keys: Sequence[str],
     schema_headers: Sequence[str],
+    already_normalized: bool = False,
 ) -> List[Dict[str, Any]]:
-    normalized_rows = [
-        _normalize_to_schema_keys(schema_keys=schema_keys, schema_headers=schema_headers, raw=(r or {}))
-        for r in rows or []
-    ]
+    """v4.4.1: added `already_normalized` so callers that have already run
+    _normalize_to_schema_keys on the rows can skip the redundant second pass."""
+    # `requested_symbols` is accepted for API/signature stability; not yet used
+    # in the ranking logic but kept so callers don't need to change.
+    _ = requested_symbols
+
+    if already_normalized:
+        normalized_rows = [dict(r) for r in rows or [] if r is not None]
+    else:
+        normalized_rows = [
+            _normalize_to_schema_keys(schema_keys=schema_keys, schema_headers=schema_headers, raw=(r or {}))
+            for r in rows or []
+        ]
 
     deduped: List[Dict[str, Any]] = []
     seen = set()
@@ -908,7 +968,8 @@ def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int)
     if kk == "data_provider":
         return "advanced_analysis.placeholder_fallback"
     if kk in {"last_updated_utc", "last_updated_riyadh"}:
-        return datetime.utcnow().isoformat()
+        # v4.4.1: datetime.utcnow() is deprecated; use timezone-aware now().
+        return datetime.now(timezone.utc).isoformat()
     if kk == "recommendation":
         return "HOLD" if row_index > 3 else "BUY"
     if kk == "recommendation_reason":
@@ -949,9 +1010,11 @@ def _build_placeholder_rows(
     limit: int,
     offset: int,
 ) -> List[Dict[str, Any]]:
-    symbols = [_normalize_symbol_token(x) for x in requested_symbols if _normalize_symbol_token(x)]
+    # v4.4.1: avoid calling _normalize_symbol_token twice per item (was once
+    # in the predicate and once in the projection). Single-pass generator.
+    symbols = [s for s in (_normalize_symbol_token(x) for x in requested_symbols) if s]
     if not symbols:
-        symbols = [_normalize_symbol_token(x) for x in EMERGENCY_PAGE_SYMBOLS.get(page, []) if _normalize_symbol_token(x)]
+        symbols = [s for s in (_normalize_symbol_token(x) for x in EMERGENCY_PAGE_SYMBOLS.get(page, [])) if s]
     symbols = symbols[offset: offset + limit] if (offset or len(symbols) > limit) else symbols[:limit]
 
     rows: List[Dict[str, Any]] = []
@@ -986,11 +1049,12 @@ def _build_dictionary_fallback_rows(*, page: str, headers: Sequence[str], keys: 
 
 
 def _build_insights_fallback_rows(*, requested_symbols: Sequence[str], limit: int, offset: int) -> List[Dict[str, Any]]:
-    symbols = [_normalize_symbol_token(x) for x in requested_symbols if _normalize_symbol_token(x)]
+    symbols = [s for s in (_normalize_symbol_token(x) for x in requested_symbols) if s]
     if not symbols:
-        symbols = [_normalize_symbol_token(x) for x in EMERGENCY_PAGE_SYMBOLS.get(_INSIGHTS_PAGE, []) if _normalize_symbol_token(x)]
+        symbols = [s for s in (_normalize_symbol_token(x) for x in EMERGENCY_PAGE_SYMBOLS.get(_INSIGHTS_PAGE, [])) if s]
 
-    stamp = datetime.utcnow().isoformat()
+    # v4.4.1: datetime.utcnow() deprecated; use timezone-aware now().
+    stamp = datetime.now(timezone.utc).isoformat()
     rows: List[Dict[str, Any]] = [
         {
             "section": "Coverage",
@@ -1134,6 +1198,9 @@ def _payload_envelope(
 # Upstream normalization / quality filters
 # =============================================================================
 def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
+    """v4.4.1 fix: each probe now requires a NON-EMPTY list. In v4.4.0 an empty
+    list at an early-probed key (e.g. `{"row_objects": []}`) would short-circuit
+    the lookup and hide real data in a later key (e.g. `records`)."""
     if payload is None or depth > 6:
         return []
 
@@ -1147,11 +1214,11 @@ def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
 
     for name in ("row_objects", "records", "items", "data", "quotes", "results"):
         value = payload.get(name)
-        if isinstance(value, list) and (not value or isinstance(value[0], Mapping)):
+        if isinstance(value, list) and value and isinstance(value[0], Mapping):
             return [dict(x) for x in value]
 
     rows_value = payload.get("rows")
-    if isinstance(rows_value, list) and (not rows_value or isinstance(rows_value[0], Mapping)):
+    if isinstance(rows_value, list) and rows_value and isinstance(rows_value[0], Mapping):
         return [dict(x) for x in rows_value]
 
     for name in ("payload", "result", "response", "output", "data"):
@@ -1165,17 +1232,18 @@ def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
 
 
 def _extract_rows_matrix_like(payload: Any, depth: int = 0) -> List[List[Any]]:
+    """v4.4.1 fix: same non-empty-list requirement as _extract_rows_like."""
     if payload is None or depth > 6:
         return []
 
     if isinstance(payload, Mapping):
         for name in ("rows_matrix", "matrix"):
             value = payload.get(name)
-            if isinstance(value, list) and (not value or isinstance(value[0], list)):
+            if isinstance(value, list) and value and isinstance(value[0], list):
                 return [list(x) for x in value]
 
         rows_value = payload.get("rows")
-        if isinstance(rows_value, list) and (not rows_value or isinstance(rows_value[0], list)):
+        if isinstance(rows_value, list) and rows_value and isinstance(rows_value[0], list):
             return [list(x) for x in rows_value]
 
         for name in ("payload", "result", "response", "output", "data"):
@@ -1459,12 +1527,15 @@ def _normalize_external_payload(
     normalized_rows = [row for row in normalized_rows if _row_has_signal(row, ks)]
 
     if page == _TOP10_PAGE:
+        # v4.4.1: rows are already normalized above; tell _ensure_top10_rows
+        # to skip its redundant internal normalization pass.
         normalized_rows = _ensure_top10_rows(
             normalized_rows,
             requested_symbols=requested_symbols or [],
             top_n=top_n,
             schema_keys=ks,
             schema_headers=hdrs,
+            already_normalized=True,
         )
 
     degraded = _payload_looks_like_placeholder(payload_obj, normalized_rows)
