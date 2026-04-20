@@ -2,7 +2,7 @@
 # routes/advanced_sheet_rows.py
 """
 ================================================================================
-Advanced Sheet-Rows Router — v2.4.0
+Advanced Sheet-Rows Router — v2.5.1
 ================================================================================
 SCHEMA-FIRST • ADAPTER-FIRST • ROOT-ANALYSIS ALIGNED • SPECIAL-PAGE SAFE
 PATH-AWARE AUTH • PUBLIC-PATH AWARE • STABLE RESPONSE SHAPE • LIVE-TEST READY
@@ -13,28 +13,51 @@ GET  /v1/advanced/health
 GET  /v1/advanced/sheet-rows
 POST /v1/advanced/sheet-rows
 
-Primary role
-------------
-Advanced sheet-rows behavior aligned with the rest of the TFB stack so that:
-- page normalization is identical
-- schema headers/keys are always authoritative
-- special pages never fall back to the generic 80-column instrument schema
-- instrument pages use engine-backed retrieval consistently
-- adapter-level get_sheet_rows is preferred when available
-- response envelopes stay stable for live validators and completeness tests
+v2.5.1 Fixes (vs v2.5.0)
+------------------------
+- FIX: _ensure_authorized now converts ANY exception from auth_ok into a clean
+  HTTP 401 instead of letting non-TypeError errors escape uncaught. v2.5.0
+  nested retries inside `except TypeError:` handlers — exceptions thrown from
+  those inner retries bypassed the outer `except Exception as e:` sibling and
+  propagated out of the function. Rewritten as a linear attempt-loop.
+- FIX: _extract_matrix_like no longer early-returns on an EMPTY list at the
+  first probed key. A payload like {"rows_matrix": [], "matrix": [[real]]}
+  previously returned [] and never checked `matrix`, silently dropping real
+  matrix-shaped data. Each probe now requires a non-empty list of row-like
+  items.
+- FIX: _extract_keys_like no longer stringifies dict entries in its scalar
+  fallback branch. When keys=[{"foo": "bar"}] (a dict with no key/field/name/
+  id), v2.5.0 fell through and produced ["{'foo': 'bar'}"]. The scalar branch
+  now runs only when the list is NOT a list of Mappings.
+- FIX: _canonicalize_page rewritten as a linear attempt-loop so the fallback
+  normalize_page_name(s) call is protected the same way the primary one is.
+- FIX: datetime.utcnow() replaced with datetime.now(timezone.utc) (deprecated
+  in Python 3.12+, scheduled for removal). Added timezone to the datetime
+  import.
+- PERF: normalize_row_to_schema is now imported once at module load instead
+  of on every request.
+- CLEAN: Schema-registry and page-catalog discovery loops are encapsulated
+  in _discover_schema_registry() / _discover_page_catalog() functions so
+  their temporary loop locals (_sreg, _fh, _fgs, _il, _pcat, _ap, etc.) no
+  longer leak into the module namespace.
+- CLEAN: _build_placeholder_rows no longer calls _normalize_symbol_token
+  twice per item in its filter-then-construct pattern.
+- Public API, __all__, route paths, and all signatures preserved.
 
-What this revision improves
----------------------------
-- ✅ ALIGN: prefers core.data_engine.get_sheet_rows adapter path before raw engine table helpers
-- ✅ ALIGN: emits advanced_analysis-style envelopes (headers/display_headers/keys/rows/row_objects/items/records/data/quotes)
-- ✅ FIX: accepts page aliases and direct symbol aliases in both GET and POST
-- ✅ FIX: supports schema_only and headers_only in advanced route too
-- ✅ FIX: table-mode payload extraction accepts rows / row_objects / items / records / quotes / results / rows_matrix
-- ✅ FIX: special pages use best-effort builder + adapter/engine payload comparison instead of a single source
-- ✅ FIX: Data_Dictionary fails soft with guaranteed schema-driven rows
-- ✅ FIX: preserves adapter/engine meta and dispatch source for easier live diagnostics
-- ✅ SAFE: No network I/O at import time
-- ✅ SAFE: Optional auth only if core.config.auth_ok exists
+v2.5.0 Notes (unchanged)
+------------------------
+- ALIGN: prefers core.data_engine.get_sheet_rows adapter path before raw
+  engine table helpers
+- ALIGN: emits advanced_analysis-style envelopes (headers/display_headers/
+  keys/rows/row_objects/items/records/data/quotes)
+- Supports schema_only / headers_only on advanced route
+- Table-mode payload extraction accepts rows / row_objects / items / records
+  / quotes / results / rows_matrix
+- Special pages use best-effort builder + adapter/engine payload comparison
+- Data_Dictionary fails soft with guaranteed schema-driven rows
+- Preserves adapter/engine meta and dispatch source for easier live
+  diagnostics
+- No network I/O at import time
 ================================================================================
 """
 
@@ -49,7 +72,7 @@ import re
 import time
 import uuid
 from dataclasses import asdict, is_dataclass
-from datetime import date, datetime, time as dt_time
+from datetime import date, datetime, time as dt_time, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
@@ -63,28 +86,31 @@ logger.addHandler(logging.NullHandler())
 # -----------------------------------------------------------------------------
 # Schema registry (authoritative)
 # -----------------------------------------------------------------------------
-# FIX v2.5.0: multi-path fallback for schema_registry
 get_sheet_spec = None  # type: ignore
 _SCHEMA_IMPORT_ERROR: Optional[str] = None
 
-for _sreg_path in ("core.sheets.schema_registry", "core.schema_registry", "schema_registry"):
-    try:
-        import importlib as _il
-        _sreg = _il.import_module(_sreg_path)
-        _fgs = getattr(_sreg, "get_sheet_spec", None)
-        if callable(_fgs):
-            get_sheet_spec = _fgs
-            _SCHEMA_IMPORT_ERROR = None
-            break
-    except Exception as _e:
-        _SCHEMA_IMPORT_ERROR = repr(_e)
-        continue
-del _sreg_path
+
+def _discover_schema_registry() -> Tuple[Any, Optional[str]]:
+    """v2.5.1: encapsulated so loop locals don't leak into module namespace."""
+    last_err: Optional[str] = None
+    for path in ("core.sheets.schema_registry", "core.schema_registry", "schema_registry"):
+        try:
+            mod = importlib.import_module(path)
+        except Exception as e:
+            last_err = repr(e)
+            continue
+        fgs = getattr(mod, "get_sheet_spec", None)
+        if callable(fgs):
+            return fgs, None
+    return None, last_err
+
+
+get_sheet_spec, _SCHEMA_IMPORT_ERROR = _discover_schema_registry()
+
 
 # -----------------------------------------------------------------------------
 # Page catalog helpers (authoritative normalization / dispatch)
 # -----------------------------------------------------------------------------
-# FIX v2.5.0: multi-path fallback for page_catalog
 CANONICAL_PAGES: List[str] = []
 FORBIDDEN_PAGES: set = {"KSA_Tadawul", "Advisor_Criteria"}
 
@@ -111,27 +137,43 @@ def is_instrument_page(name: str) -> bool:
     return get_route_family(name) == "instrument"
 
 
-for _pcat_path in ("core.sheets.page_catalog", "core.page_catalog", "page_catalog"):
-    try:
-        import importlib as _il2
-        _pcat = _il2.import_module(_pcat_path)
-        _ap = getattr(_pcat, "allowed_pages", None)
-        _np = getattr(_pcat, "normalize_page_name", None)
-        _grf = getattr(_pcat, "get_route_family", None)
-        _iip = getattr(_pcat, "is_instrument_page", None)
-        if callable(_ap):
-            _cp = getattr(_pcat, "CANONICAL_PAGES", None)
-            _fp = getattr(_pcat, "FORBIDDEN_PAGES", None)
-            if _cp is not None: CANONICAL_PAGES[:] = list(_cp)
-            if _fp is not None: FORBIDDEN_PAGES.clear(); FORBIDDEN_PAGES.update(_fp)
-            allowed_pages       = _ap
-            normalize_page_name = _np or normalize_page_name
-            get_route_family    = _grf or get_route_family
-            is_instrument_page  = _iip or is_instrument_page
-            break
-    except Exception:
-        continue
-del _pcat_path
+def _discover_page_catalog() -> None:
+    """v2.5.1: encapsulated discovery.
+
+    Rebinds module-level allowed_pages / normalize_page_name /
+    get_route_family / is_instrument_page and populates CANONICAL_PAGES /
+    FORBIDDEN_PAGES from the first importable page_catalog module.
+    """
+    global allowed_pages, normalize_page_name, get_route_family, is_instrument_page
+    for path in ("core.sheets.page_catalog", "core.page_catalog", "page_catalog"):
+        try:
+            mod = importlib.import_module(path)
+        except Exception:
+            continue
+        ap = getattr(mod, "allowed_pages", None)
+        np_ = getattr(mod, "normalize_page_name", None)
+        grf = getattr(mod, "get_route_family", None)
+        iip = getattr(mod, "is_instrument_page", None)
+        if callable(ap):
+            cp = getattr(mod, "CANONICAL_PAGES", None)
+            fp = getattr(mod, "FORBIDDEN_PAGES", None)
+            if cp is not None:
+                CANONICAL_PAGES[:] = list(cp)
+            if fp is not None:
+                FORBIDDEN_PAGES.clear()
+                FORBIDDEN_PAGES.update(fp)
+            allowed_pages = ap
+            if callable(np_):
+                normalize_page_name = np_
+            if callable(grf):
+                get_route_family = grf
+            if callable(iip):
+                is_instrument_page = iip
+            return
+
+
+_discover_page_catalog()
+
 
 # -----------------------------------------------------------------------------
 # Optional auth/config
@@ -154,7 +196,15 @@ try:
 except Exception:  # pragma: no cover
     core_get_sheet_rows = None  # type: ignore
 
-ADVANCED_SHEET_ROWS_VERSION = "2.5.0"
+# v2.5.1: hoisted out of _run_advanced_sheet_rows_impl so we don't re-import
+# on every request. Falls back to None when unavailable.
+try:
+    from core.data_engine_v2 import normalize_row_to_schema as _NORMALIZE_ROW_TO_SCHEMA  # type: ignore
+except Exception:  # pragma: no cover
+    _NORMALIZE_ROW_TO_SCHEMA = None  # type: ignore
+
+
+ADVANCED_SHEET_ROWS_VERSION = "2.5.1"
 ROOT_OWNER = "advanced_sheet_rows"
 router = APIRouter(prefix="/v1/advanced", tags=["Advanced Sheet Rows"])
 
@@ -377,15 +427,22 @@ def _extract_requested_symbols(body: Mapping[str, Any], limit: int) -> List[str]
 
 
 def _canonicalize_page(page_raw: str) -> str:
+    """v2.5.1: linear attempt-loop so the fallback call is protected the same
+    way the primary call is. Previously an unexpected non-TypeError raised by
+    the kwargless form would propagate uncaught."""
     s = _strip(page_raw)
     if not s:
         return s
-    try:
-        return normalize_page_name(s, allow_output_pages=True)
-    except TypeError:
-        return normalize_page_name(s)
-    except Exception:
-        return s.replace("-", "_").replace(" ", "_")
+    for kwargs in ({"allow_output_pages": True}, {}):
+        try:
+            result = normalize_page_name(s, **kwargs)
+            if isinstance(result, str) and result:
+                return result
+        except TypeError:
+            continue
+        except Exception:
+            continue
+    return s.replace("-", "_").replace(" ", "_")
 
 
 def _settings_get_bool(settings: Any, *names: str, default: bool = False) -> bool:
@@ -456,6 +513,10 @@ def _extract_auth_token(*, token_query: Optional[str], x_app_token: Optional[str
 
 
 def _ensure_authorized(*, request: Request, settings: Any, token_query: Optional[str], x_app_token: Optional[str], x_api_key: Optional[str], authorization: Optional[str]) -> None:
+    """v2.5.1: rewritten as a linear attempt-loop so every auth_ok call is
+    protected. v2.5.0 nested retries inside `except TypeError:` handlers;
+    non-TypeError exceptions thrown from those inner calls bypassed the outer
+    `except Exception as e:` sibling and propagated out of the function."""
     path = str(getattr(getattr(request, "url", None), "path", "") or "")
     try:
         if callable(is_open_mode) and bool(is_open_mode()):
@@ -469,15 +530,26 @@ def _ensure_authorized(*, request: Request, settings: Any, token_query: Optional
     if auth_ok is None:
         return
     auth_token = _extract_auth_token(token_query=token_query, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization, settings=settings, request=request)
-    try:
-        ok = auth_ok(token=auth_token, authorization=authorization, headers=request.headers, path=path, request=request, settings=settings)
-    except TypeError:
+
+    attempts = (
+        {"token": auth_token, "authorization": authorization, "headers": request.headers, "path": path, "request": request, "settings": settings},
+        {"token": auth_token, "authorization": authorization, "headers": request.headers, "path": path},
+        {"token": auth_token, "authorization": authorization, "headers": request.headers},
+    )
+    ok: Any = False
+    last_err: Optional[BaseException] = None
+    for kwargs in attempts:
         try:
-            ok = auth_ok(token=auth_token, authorization=authorization, headers=request.headers, path=path)
+            ok = auth_ok(**kwargs)
+            last_err = None
+            break
         except TypeError:
-            ok = auth_ok(token=auth_token, authorization=authorization, headers=request.headers)
-    except Exception as e:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"error": "Auth check failed", "detail": str(e)})
+            continue
+        except Exception as e:
+            last_err = e
+            break
+    if last_err is not None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail={"error": "Auth check failed", "detail": str(last_err)})
     if not ok:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
@@ -540,6 +612,17 @@ def _safe_engine_type(engine: Any) -> str:
         return type(engine).__name__
     except Exception:
         return "unknown"
+
+
+def _matrix_to_rows(matrix: Sequence[Sequence[Any]], keys: Sequence[str]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for row in matrix or []:
+        row_list = list(row or [])
+        obj: Dict[str, Any] = {}
+        for idx, key in enumerate(keys):
+            obj[str(key)] = _json_safe(row_list[idx] if idx < len(row_list) else None)
+        out.append(obj)
+    return out
 
 
 # =============================================================================
@@ -677,11 +760,14 @@ def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
 
 
 def _extract_matrix_like(payload: Any, depth: int = 0) -> Optional[List[List[Any]]]:
+    """v2.5.1: each probe now requires a NON-EMPTY list. v2.5.0 returned [] on
+    the first list-shaped key even if empty, so {"rows_matrix": [],
+    "matrix": [[real]]} silently lost the matrix data."""
     if depth > 8 or not isinstance(payload, Mapping):
         return None
     for name in ("rows_matrix", "matrix"):
         value = payload.get(name)
-        if isinstance(value, list):
+        if isinstance(value, list) and value:
             return [list(r) if isinstance(r, (list, tuple)) else [r] for r in value]
     rows_value = payload.get("rows")
     if isinstance(rows_value, list) and rows_value and isinstance(rows_value[0], (list, tuple)):
@@ -696,6 +782,9 @@ def _extract_matrix_like(payload: Any, depth: int = 0) -> Optional[List[List[Any
 
 
 def _extract_keys_like(payload: Any, depth: int = 0) -> List[str]:
+    """v2.5.1: the scalar-list fallback no longer runs on a list of dicts
+    (which previously produced bogus str(dict)-valued entries when the dict
+    form had no recognizable key/field/name/id field)."""
     if depth > 8 or not isinstance(payload, Mapping):
         return []
     for name in ("keys", "fields", "column_keys", "schema_keys", "columns"):
@@ -706,9 +795,12 @@ def _extract_keys_like(payload: Any, depth: int = 0) -> List[str]:
                 keys = [k for k in keys if k]
                 if keys:
                     return keys
-            out = [_strip(x) for x in value if _strip(x)]
-            if out:
-                return out
+                # v2.5.1: do NOT fall through to the scalar branch — stringifying
+                # dict entries would produce garbage like "{'foo': 'bar'}".
+            else:
+                out = [_strip(x) for x in value if _strip(x)]
+                if out:
+                    return out
     for name in ("payload", "result", "response", "output", "data"):
         nested = payload.get(name)
         if isinstance(nested, Mapping):
@@ -890,11 +982,13 @@ def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int)
     if kk == "data_provider":
         return "advanced_sheet_rows.placeholder_fallback"
     if kk == "last_updated_utc":
-        return datetime.utcnow().isoformat()
+        # v2.5.1: datetime.utcnow() is deprecated; use timezone-aware now().
+        return datetime.now(timezone.utc).isoformat()
     if kk == "last_updated_riyadh":
-        return datetime.utcnow().isoformat()
+        # v2.5.1: datetime.utcnow() is deprecated; use timezone-aware now().
+        return datetime.now(timezone.utc).isoformat()
     if kk == "recommendation":
-        return "HOLD"  # FIX v2.5.0: canonical value (was "Watch")
+        return "HOLD"
     if kk == "recommendation_reason":
         return "Placeholder fallback because live engine returned no usable rows."
     if kk in {"top10_rank", "rank_overall", "sort_order"}:
@@ -909,9 +1003,11 @@ def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int)
 
 
 def _build_placeholder_rows(*, page: str, keys: Sequence[str], requested_symbols: Sequence[str], limit: int, offset: int) -> List[Dict[str, Any]]:
-    symbols = [_normalize_symbol_token(x) for x in requested_symbols if _normalize_symbol_token(x)]
+    # v2.5.1: single-pass generator — was calling _normalize_symbol_token twice
+    # per item (once in the predicate, once in the projection).
+    symbols = [s for s in (_normalize_symbol_token(x) for x in requested_symbols) if s]
     if not symbols:
-        symbols = [_normalize_symbol_token(x) for x in EMERGENCY_PAGE_SYMBOLS.get(page, []) if _normalize_symbol_token(x)]
+        symbols = [s for s in (_normalize_symbol_token(x) for x in EMERGENCY_PAGE_SYMBOLS.get(page, [])) if s]
     symbols = symbols[offset : offset + limit] if (offset or len(symbols) > limit) else symbols[:limit]
     rows: List[Dict[str, Any]] = []
     for idx, sym in enumerate(symbols, start=offset + 1):
@@ -1361,12 +1457,8 @@ async def _run_advanced_sheet_rows_impl(*, request: Request, body: Dict[str, Any
 
     symbols = _slice_values(requested_symbols, limit=limit, offset=offset)
     data_map = await _fetch_advanced_rows(engine, symbols, mode=(mode or ""), settings=settings, schema=spec)
-    normalize_fn = None
-    try:
-        from core.data_engine_v2 import normalize_row_to_schema as _n  # type: ignore
-        normalize_fn = _n
-    except Exception:
-        normalize_fn = None
+    # v2.5.1: normalize_fn hoisted to module load as _NORMALIZE_ROW_TO_SCHEMA.
+    normalize_fn = _NORMALIZE_ROW_TO_SCHEMA
     normalized_rows: List[Dict[str, Any]] = []
     errors = 0
     for sym in symbols:
