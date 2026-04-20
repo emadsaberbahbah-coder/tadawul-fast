@@ -2,21 +2,40 @@
 """
 routes/advisor.py
 ================================================================================
-ADVISOR ROUTER — v6.6.0
+ADVISOR ROUTER — v6.8.1
 ================================================================================
 SPECIAL-PAGE PROXY-FIRST • ROOT/ANALYSIS ALIGNED • SHORT-ADVISOR HARDENED •
 JSON-SAFE • GET+POST SAFE • FAIL-SOFT • CONTRACT-PROJECTED • ENGINE-TOLERANT
 
-What this revision improves
---------------------------
-- FIX: special pages now prefer the canonical sheet-rows owners first:
-       analysis wrapper -> advanced root owner -> engine fallback.
-- FIX: advisor short family no longer depends on buggy downstream derived-page
-       runners before trying the already-working root/analysis routes.
-- FIX: Insights_Analysis, Top_10_Investments, and Data_Dictionary are handled
-       with bridge-first logic so advisor routes align with proven live paths.
-- FIX: tabular payloads are projected to canonical headers when available.
-- FIX: responses remain fail-soft and JSON-safe, exposing resolver metadata.
+v6.8.1 Fixes (vs v6.8.0)
+------------------------
+- CRITICAL FIX: _run_advisor_logic now accepts x_api_key. In v6.8.0 all six
+  route handlers passed x_api_key=x_api_key as a keyword argument, but the
+  private implementation's signature did not declare it — so EVERY request
+  to every advisor endpoint failed immediately with:
+      TypeError: _run_advisor_logic() got an unexpected keyword argument
+      'x_api_key'
+  The kwarg is now declared and forwarded to _require_auth_or_401 and to
+  both delegate calls.
+- FIX: _auth_ok_via_env_match now includes x_api_key in the list of presented
+  credentials. v6.8.0 accepted the parameter but never read it, so a caller
+  authenticating only via the X-API-Key header (with the auth_ok hook
+  unavailable) could never pass env-match auth.
+- FIX: _delegate_to_analysis_bridge and _delegate_to_advanced_bridge now
+  accept and forward x_api_key into the bridge call's kwargs. The upstream
+  bridges already accept this parameter; v6.8.0 was dropping the value so
+  the bridge's own auth check couldn't see the X-API-Key header.
+- Public API, __all__, route paths, and all public-route signatures preserved.
+
+v6.8.0 Notes (unchanged)
+------------------------
+- Special pages prefer canonical sheet-rows owners first:
+  analysis wrapper -> advanced root owner -> engine fallback.
+- Insights_Analysis, Top_10_Investments, and Data_Dictionary use bridge-first
+  logic so advisor routes align with proven live paths.
+- Tabular payloads are projected to canonical headers when available.
+- Responses remain fail-soft and JSON-safe, exposing resolver metadata.
+- Constant-time token comparison via hmac.compare_digest (_secure_equals).
 """
 
 from __future__ import annotations
@@ -43,7 +62,7 @@ from fastapi.routing import APIRouter
 logger = logging.getLogger("routes.advisor")
 logger.addHandler(logging.NullHandler())
 
-ADVISOR_VERSION = "6.8.0"
+ADVISOR_VERSION = "6.8.1"
 
 
 def _secure_equals(a: str, b: str) -> bool:
@@ -357,7 +376,10 @@ def _auth_ok_via_env_match(token_query: Optional[str], x_app_token: Optional[str
     if not env_tokens:
         return False
     presented: List[str] = []
-    for value in (token_query, x_app_token):
+    # v6.8.1: include x_api_key in the presented-credentials iteration. v6.8.0
+    # accepted it as a parameter but never read it, so callers authenticating
+    # solely via the X-API-Key header would fail env-match auth.
+    for value in (token_query, x_app_token, x_api_key):
         token = _strip(value)
         if token:
             presented.append(token)
@@ -973,7 +995,9 @@ async def _resolve_top10_builder(request: Request) -> Tuple[Optional[Callable[..
     return None, {}
 
 
-async def _delegate_to_analysis_bridge(*, request: Request, payload: Dict[str, Any], token: Optional[str], x_app_token: Optional[str], authorization: Optional[str], x_request_id: Optional[str]) -> Optional[Dict[str, Any]]:
+async def _delegate_to_analysis_bridge(*, request: Request, payload: Dict[str, Any], token: Optional[str], x_app_token: Optional[str], x_api_key: Optional[str] = None, authorization: Optional[str], x_request_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    """v6.8.1: now accepts and forwards x_api_key to the bridge call so the
+    bridge's own auth check can see the X-API-Key header value."""
     impl, meta = await _resolve_analysis_bridge_impl()
     if impl is None:
         return None
@@ -989,6 +1013,7 @@ async def _delegate_to_analysis_bridge(*, request: Request, payload: Dict[str, A
                 "include_matrix_q": _boolish(payload.get("include_matrix"), True),
                 "token": token,
                 "x_app_token": x_app_token,
+                "x_api_key": x_api_key,
                 "authorization": authorization,
                 "x_request_id": x_request_id,
             },
@@ -1002,7 +1027,8 @@ async def _delegate_to_analysis_bridge(*, request: Request, payload: Dict[str, A
         return None
 
 
-async def _delegate_to_advanced_bridge(*, request: Request, payload: Dict[str, Any], token: Optional[str], x_app_token: Optional[str], authorization: Optional[str], x_request_id: Optional[str]) -> Optional[Dict[str, Any]]:
+async def _delegate_to_advanced_bridge(*, request: Request, payload: Dict[str, Any], token: Optional[str], x_app_token: Optional[str], x_api_key: Optional[str] = None, authorization: Optional[str], x_request_id: Optional[str]) -> Optional[Dict[str, Any]]:
+    """v6.8.1: now accepts and forwards x_api_key to the bridge call."""
     impl, meta = await _resolve_advanced_bridge_impl()
     if impl is None:
         return None
@@ -1018,6 +1044,7 @@ async def _delegate_to_advanced_bridge(*, request: Request, payload: Dict[str, A
                 "include_matrix_q": _boolish(payload.get("include_matrix"), True),
                 "token": token,
                 "x_app_token": x_app_token,
+                "x_api_key": x_api_key,
                 "authorization": authorization,
                 "x_request_id": x_request_id,
                 "page": page,
@@ -1146,9 +1173,12 @@ def _prefer_runner(page: str, *, operation: str) -> bool:
     return operation in {"recommendations", "run"}
 
 
-async def _run_advisor_logic(*, request: Request, payload: Dict[str, Any], token: Optional[str], x_app_token: Optional[str], authorization: Optional[str], x_request_id: Optional[str], operation: str = "sheet_rows") -> Dict[str, Any]:
+async def _run_advisor_logic(*, request: Request, payload: Dict[str, Any], token: Optional[str], x_app_token: Optional[str], x_api_key: Optional[str] = None, authorization: Optional[str], x_request_id: Optional[str], operation: str = "sheet_rows") -> Dict[str, Any]:
+    """v6.8.1 CRITICAL FIX: accepts x_api_key. v6.8.0 was missing this parameter
+    even though every route handler passes it — so every request raised
+    TypeError before any work happened."""
     started_at = time.perf_counter()
-    _require_auth_or_401(token_query=token, x_app_token=x_app_token, authorization=authorization)
+    _require_auth_or_401(token_query=token, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization)
     request_id = _request_id(request, x_request_id)
     payload = _prepare_payload_for_downstream(payload, request_id=request_id, operation=operation)
     page = _extract_page(payload, default_page=DEFAULT_ADVISOR_PAGE)
@@ -1160,10 +1190,10 @@ async def _run_advisor_logic(*, request: Request, payload: Dict[str, Any], token
             return _envelope_from_payload_result(result=top10_result, page=page, request_id=request_id, started_at=started_at, resolver_meta=top10_meta or {"source": "top10_builder", "kind": "direct"}, operation=operation)
 
     if _prefer_direct_bridge(page, operation=operation):
-        analysis_result = await _delegate_to_analysis_bridge(request=request, payload=payload, token=token, x_app_token=x_app_token, authorization=authorization, x_request_id=request_id)
+        analysis_result = await _delegate_to_analysis_bridge(request=request, payload=payload, token=token, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization, x_request_id=request_id)
         if analysis_result is not None:
             return _envelope_from_payload_result(result=analysis_result, page=page, request_id=request_id, started_at=started_at, resolver_meta=_extract_meta_mapping(analysis_result).get("resolver"), operation=operation)
-        advanced_result = await _delegate_to_advanced_bridge(request=request, payload=payload, token=token, x_app_token=x_app_token, authorization=authorization, x_request_id=request_id)
+        advanced_result = await _delegate_to_advanced_bridge(request=request, payload=payload, token=token, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization, x_request_id=request_id)
         if advanced_result is not None:
             return _envelope_from_payload_result(result=advanced_result, page=page, request_id=request_id, started_at=started_at, resolver_meta=_extract_meta_mapping(advanced_result).get("resolver"), operation=operation)
         engine_result = await _run_engine_sheet_rows_fallback(request=request, payload=payload, request_id=request_id)
@@ -1175,10 +1205,10 @@ async def _run_advisor_logic(*, request: Request, payload: Dict[str, Any], token
         if runner_result is not None:
             return _envelope_from_payload_result(result=runner_result, page=page, request_id=request_id, started_at=started_at, resolver_meta=runner_meta, operation=operation)
 
-    analysis_result = await _delegate_to_analysis_bridge(request=request, payload=payload, token=token, x_app_token=x_app_token, authorization=authorization, x_request_id=request_id)
+    analysis_result = await _delegate_to_analysis_bridge(request=request, payload=payload, token=token, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization, x_request_id=request_id)
     if analysis_result is not None:
         return _envelope_from_payload_result(result=analysis_result, page=page, request_id=request_id, started_at=started_at, resolver_meta=_extract_meta_mapping(analysis_result).get("resolver"), operation=operation)
-    advanced_result = await _delegate_to_advanced_bridge(request=request, payload=payload, token=token, x_app_token=x_app_token, authorization=authorization, x_request_id=request_id)
+    advanced_result = await _delegate_to_advanced_bridge(request=request, payload=payload, token=token, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization, x_request_id=request_id)
     if advanced_result is not None:
         return _envelope_from_payload_result(result=advanced_result, page=page, request_id=request_id, started_at=started_at, resolver_meta=_extract_meta_mapping(advanced_result).get("resolver"), operation=operation)
     engine_result = await _run_engine_sheet_rows_fallback(request=request, payload=payload, request_id=request_id)
