@@ -2,25 +2,42 @@
 # routes/__init__.py
 """
 ================================================================================
-TADAWUL FAST BRIDGE — ROUTER DISCOVERY & MOUNT LOGIC (v3.6.0)
+TADAWUL FAST BRIDGE — ROUTER DISCOVERY & MOUNT LOGIC (v3.6.1)
 ================================================================================
 MAIN-PY-ALIGNED • IMPORT-SAFE • RENDER-SAFE • DETERMINISTIC • DUPLICATE-AWARE
 CONTROLLED-OWNER SAFE • ROUTE-LEVEL FILTER SAFE • PREFIX-OWNER ENFORCED
 PACKAGE-MOUNT COMPATIBLE • CONFLICT-ROLLBACK SAFE • SNAPSHOT-RICH
 
-Why this revision
------------------
+v3.6.1 Fixes (vs v3.6.0)
+------------------------
+- FIX: router_signatures is now actually persisted into the final snapshot
+  stored on app.state. v3.6.0 wrote it to a local scratch dict that was never
+  merged into the returned/stored snapshot, so readers always saw it missing.
+- FIX: router factory functions (get_router / build_router / create_router)
+  are no longer invoked twice per mount. v3.6.0 called
+  _get_router_from_module once during _mount_one and AGAIN in mount_all_routers
+  to record the signature, doubling any factory side effects. Signature info
+  is now computed inside _mount_one and reused.
+- FIX: the mount_fn path's disallowed-id set is now built once instead of
+  being rebuilt on every element of the list comprehension (O(n+m) vs O(n*m)).
+- FIX: on the router-path protected-prefix conflict early return,
+  policy_filtered_routes now reports the paths blocked by the per-module
+  policy instead of an empty list.
+- FIX: owner-conflict record now defaults existing_owner_module to "" (same
+  as existing_owner_key) for JSON-serialization consistency.
+- Public API, __all__, and all signatures preserved.
+
+v3.6.0 Notes (unchanged)
+------------------------
 - ALIGN: canonical owner map stays aligned with the controlled runtime policy
          used by main.py.
-- FIX: mount(app) additions are now filtered for disallowed AND duplicate routes
+- FIX: mount(app) additions are filtered for disallowed AND duplicate routes
        at route level, instead of only rolling back the all-duplicate case.
-- FIX: snapshot now records partial duplicate skips and count fields explicitly.
-- FIX: route-level append diagnostics track the exact route objects added,
-       improving overlap and route-count reporting.
-- FIX: package-level policy blocks now also fence root/advanced sheet-row
-       reclaim attempts more consistently for data-dictionary style modules.
-- FIX: route/debug snapshots include route_signature_count_after_mount to align
-       better with main.py diagnostics.
+- FIX: snapshot records partial duplicate skips and count fields explicitly.
+- FIX: route-level append diagnostics track the exact route objects added.
+- FIX: package-level policy blocks also fence root/advanced sheet-row reclaim
+       attempts more consistently for data-dictionary style modules.
+- FIX: route/debug snapshots include route_signature_count_after_mount.
 
 Optional env controls
 ---------------------
@@ -305,6 +322,9 @@ def _get_router_from_module(mod: Any) -> Tuple[Optional[Any], str]:
     - module.get_router()
     - module.build_router()
     - module.create_router()
+
+    NOTE: For factory-function modules this calls the factory. Callers should
+    invoke this at most once per mount (see v3.6.1 fix re: doubled side effects).
     """
     router = getattr(mod, "router", None)
     if router is not None:
@@ -445,14 +465,17 @@ def _owner_conflicts_for_claimed_prefixes(
     for prefix in claimed_prefixes:
         canonical_owner_key = _canonical_owner_for_prefix(prefix, canonical_owner_map)
         if canonical_owner_key and canonical_owner_key != module_key:
+            # v3.6.1: normalize existing_owner_module default to "" (was None) so
+            # the record is uniformly string-valued and JSON-safe.
+            existing_owner_module = prefix_owners.get(prefix, "")
             conflicts.append({
-                "prefix":               prefix,
-                "reason":               "canonical_owner_mismatch",
-                "candidate_module":     module_name,
-                "candidate_key":        module_key,
-                "canonical_owner_key":  canonical_owner_key,
-                "existing_owner_module": prefix_owners.get(prefix),
-                "existing_owner_key":   module_to_key.get(prefix_owners.get(prefix, ""), ""),
+                "prefix":                prefix,
+                "reason":                "canonical_owner_mismatch",
+                "candidate_module":      module_name,
+                "candidate_key":         module_key,
+                "canonical_owner_key":   canonical_owner_key,
+                "existing_owner_module": existing_owner_module,
+                "existing_owner_key":    module_to_key.get(existing_owner_module, ""),
             })
             continue
 
@@ -460,13 +483,13 @@ def _owner_conflicts_for_claimed_prefixes(
         existing_owner_key = module_to_key.get(existing_owner_module, "") if existing_owner_module else ""
         if existing_owner_module and existing_owner_module != module_name:
             conflicts.append({
-                "prefix":               prefix,
-                "reason":               "prefix_already_owned",
-                "candidate_module":     module_name,
-                "candidate_key":        module_key,
+                "prefix":                prefix,
+                "reason":                "prefix_already_owned",
+                "candidate_module":      module_name,
+                "candidate_key":         module_key,
                 "existing_owner_module": existing_owner_module,
-                "existing_owner_key":   existing_owner_key,
-                "canonical_owner_key":  canonical_owner_key or existing_owner_key or module_key,
+                "existing_owner_key":    existing_owner_key,
+                "canonical_owner_key":   canonical_owner_key or existing_owner_key or module_key,
             })
 
     return conflicts
@@ -542,6 +565,9 @@ def _remove_added_routes(app: Any, added_routes: Sequence[Any]) -> None:
         pass
     try:
         if hasattr(app, "routes"):
+            # Note: on FastAPI this is a read-only property; the assignment is
+            # defensive for non-FastAPI ASGI frameworks and will silently fail
+            # on FastAPI (handled by the except below).
             app.routes = [r for r in list(app.routes) if id(r) not in added_ids]
     except Exception:
         pass
@@ -654,6 +680,10 @@ def _mount_one(
     - module.get_router()/build_router()/create_router() -> filtered route append
     - module.mount(app) -> route-level diff/rollback filtering
 
+    v3.6.1: when a router object is obtained (either via attribute or factory),
+    its signature info is captured into details["router_signature_info"] so
+    the outer loop does NOT need to re-invoke the factory to record it.
+
     Returns: (success, error_message, mode, details)
     """
     mod, exc = _import_module(module_name)
@@ -665,9 +695,23 @@ def _mount_one(
 
     try:
         if router is not None:
+            # v3.6.1: capture signature info once, here, so mount_all_routers
+            # can populate router_signatures without calling the factory again.
+            router_signature_info = {
+                "signature":   _router_signature(router),
+                "route_count": len(getattr(router, "routes", []) or []),
+                "prefix":      str(getattr(router, "prefix", "") or ""),
+            }
+
             router_paths = _router_route_paths(router)
             allowed_paths = [p for p in router_paths if _path_allowed_for_module(module_name, p)]
             claimed_prefixes = _claimed_protected_prefixes_from_paths(allowed_paths, protected_prefixes)
+
+            # v3.6.1: report the actual policy-filtered paths on conflict_skip
+            # instead of stubbing as [].
+            policy_filtered_paths_router = _dedupe_keep_order(
+                [p for p in router_paths if p not in set(allowed_paths)]
+            )
 
             owner_conflicts = _owner_conflicts_for_claimed_prefixes(
                 module_key=module_key,
@@ -679,14 +723,15 @@ def _mount_one(
             )
             if owner_conflicts:
                 return True, None, "conflict_skip", {
-                    "reason":               "protected_prefix_owner_conflict",
-                    "route_count":          len(getattr(router, "routes", []) or []),
-                    "claimed_prefixes":     claimed_prefixes,
-                    "owner_conflicts":      owner_conflicts,
-                    "policy_filtered_routes": [],
-                    "duplicate_skips":      0,
+                    "reason":                 "protected_prefix_owner_conflict",
+                    "route_count":            len(getattr(router, "routes", []) or []),
+                    "claimed_prefixes":       claimed_prefixes,
+                    "owner_conflicts":        owner_conflicts,
+                    "policy_filtered_routes": policy_filtered_paths_router,
+                    "duplicate_skips":        0,
                     "partial_duplicate_skips": 0,
-                    "filtered_out":         0,
+                    "filtered_out":           len(policy_filtered_paths_router),
+                    "router_signature_info":  router_signature_info,
                 }
 
             existing_before = _app_route_signature_set(app)
@@ -703,6 +748,7 @@ def _mount_one(
                 "duplicate_skips":         int(append_stats.get("duplicate_skips", 0) or 0),
                 "partial_duplicate_skips": int(append_stats.get("partial_duplicate_skips", 0) or 0),
                 "filtered_out":            int(append_stats.get("filtered_out", 0) or 0),
+                "router_signature_info":   router_signature_info,
                 **_overlap_details(existing_before, added_sigs, protected_prefixes),
             }
 
@@ -738,9 +784,10 @@ def _mount_one(
             if disallowed_routes:
                 _remove_added_routes(app, disallowed_routes)
 
-            remaining_routes = [
-                r for r in added_routes if id(r) not in {id(x) for x in disallowed_routes}
-            ]
+            # v3.6.1: build the disallowed-id set ONCE (was rebuilt per element).
+            disallowed_ids = {id(x) for x in disallowed_routes}
+            remaining_routes = [r for r in added_routes if id(r) not in disallowed_ids]
+
             kept_routes, duplicate_routes, partial_duplicate_routes = \
                 _split_added_routes_by_duplicate(before_sigs, remaining_routes)
 
@@ -763,14 +810,14 @@ def _mount_one(
             if owner_conflicts:
                 _remove_added_routes(app, kept_routes)
                 return True, None, "conflict_skip", {
-                    "reason":               "mount_fn_protected_prefix_owner_conflict",
-                    "route_count":          len(kept_routes),
-                    "claimed_prefixes":     claimed_prefixes,
+                    "reason":                 "mount_fn_protected_prefix_owner_conflict",
+                    "route_count":            len(kept_routes),
+                    "claimed_prefixes":       claimed_prefixes,
                     "policy_filtered_routes": _route_paths_from_routes(disallowed_routes),
-                    "owner_conflicts":      owner_conflicts,
-                    "duplicate_skips":      len(duplicate_routes),
+                    "owner_conflicts":        owner_conflicts,
+                    "duplicate_skips":        len(duplicate_routes),
                     "partial_duplicate_skips": len(partial_duplicate_routes),
-                    "filtered_out":         len(disallowed_routes),
+                    "filtered_out":           len(disallowed_routes),
                 }
 
             kept_sigs = _route_signature_set_from_routes(kept_routes)
@@ -847,6 +894,9 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
     claimed_prefixes_by_module: Dict[str, List[str]] = {}
     owner_conflicts:          Dict[str, Any]     = {}
     policy_filtered_routes:   Dict[str, List[str]] = {}
+    # v3.6.1: seed from any prior signatures stored on app.state so repeat
+    # calls preserve history, then add/overwrite entries from this run.
+    router_signatures:        Dict[str, Any]     = dict(snap.get("router_signatures", {}) or {})
 
     plan_modules: List[str] = []
     for entry in resolved_entries:
@@ -888,6 +938,13 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
         )
 
         if details:
+            # v3.6.1: lift router_signature_info out of details into the
+            # top-level router_signatures map and drop it from overlap_details
+            # (the signature tuple isn't needed per-module inside overlap_details).
+            rsi = details.pop("router_signature_info", None)
+            if isinstance(rsi, dict):
+                router_signatures[module_name] = {**rsi, "priority": priority}
+
             overlap_details[module_name]          = details
             claimed_prefixes_by_module[module_name] = list(details.get("claimed_prefixes", []) or [])
             policy_filtered_routes[module_name]   = list(details.get("policy_filtered_routes", []) or [])
@@ -909,19 +966,6 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
                     prefix_owners[prefix] = module_name
 
             mount_modes[module_name] = mode
-
-            try:
-                mod = importlib.import_module(module_name)
-                router, _source = _get_router_from_module(mod)
-                if router is not None:
-                    snap.setdefault("router_signatures", {})[module_name] = {
-                        "signature":   _router_signature(router),
-                        "route_count": len(getattr(router, "routes", []) or []),
-                        "prefix":      str(getattr(router, "prefix", "") or ""),
-                        "priority":    priority,
-                    }
-            except Exception:
-                pass
             continue
 
         if mode == "import_error" or (err and "modulenotfounderror" in err.lower()):
@@ -975,6 +1019,9 @@ def mount_all_routers(app: Any) -> Dict[str, Any]:
         "owner_conflicts":                owner_conflicts,
         "policy_filtered_routes":         policy_filtered_routes,
         "overlap_details":                overlap_details,
+        # v3.6.1: actually persist router_signatures into the stored snapshot.
+        "router_signatures":              router_signatures,
+        "router_signatures_count":        len(router_signatures),
     }
 
     logger.info(
