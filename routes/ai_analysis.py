@@ -2,36 +2,45 @@
 """
 routes/ai_analysis.py
 ================================================================================
-AI Analysis Routes — v4.2.0
+AI Analysis Routes — v4.2.1
 ================================================================================
 
-v4.2.0 changes vs v4.1.0
---------------------------
-FIX CRITICAL: _SchemaAdapter fallback keys/headers for Insights_Analysis updated
-  to the canonical 9-column schema (schema_registry v3.4.0):
-    OLD (v4.1.0): section/metric/value/unit/direction/commentary/updated_at (7 cols)
-    NEW (v4.2.0): section/item/symbol/metric/value/signal/priority/notes/as_of_riyadh
-  When schema_registry is unavailable, the fallback now produces valid 9-col rows
-  instead of misaligned 7-col rows that fail the test_schema_alignment suite.
+v4.2.1 Fixes (vs v4.2.0)
+------------------------
+FIX CRITICAL: _SchemaAdapter.keys() / headers() / display_headers() no longer
+  leak the old v4.1.0 Insights-shaped 7-col schema as the fallback for
+  non-Insights pages. In v4.2.0, when schema_registry was unavailable, a call
+  like SCHEMA.keys("Top_10_Investments") returned
+    ["section","metric","value","unit","direction","commentary","updated_at"]
+  — clearly wrong. The v4.2.0 docstring correctly advertised a fix for the
+  Insights_Analysis case but left the old schema as the generic default for
+  every other page. This cascaded into project_rows / rows_to_matrix /
+  response envelope, producing Top10 payloads with Insights fields.
+  v4.2.1 returns [] for unknown pages so downstream callers see an empty
+  (and thus recognisable) schema rather than a confidently-wrong one.
 
-FIX: _build_insights_from_rows rewritten to produce v3.4.0 canonical fields:
-  - added: item (display label), symbol ("" for aggregate rows), priority
-  - added: as_of_riyadh (was updated_at)
-  - replaced: direction → signal (Positive→BUY, Negative→SELL, Neutral→HOLD)
-  - merged:   commentary + unit → notes (single field)
-  - removed:  unit, direction, commentary, updated_at (old non-canonical fields)
+FIX: _build_recommendations sort-key now preserves 0.0 values. v4.2.0 used
+  `_safe_float(...) or -999999`, which evaluates `0.0 or -999999` as -999999
+  (0.0 is falsy). A row with expected_roi_3m=0.0 (neutral return) sorted
+  BELOW a row with expected_roi_3m=-0.50 (a 50% loss). The same bug applied
+  to the two-level `or`-chain on confidence / forecast_confidence. Fix:
+  explicit None-check helper _sort_value that keeps 0.0 as-is and only
+  substitutes the default sentinel when the value is genuinely None.
 
-FIX: _SchemaAdapter imports use multi-path fallback chains so the adapter
-  resolves correctly regardless of module layout:
-    core.sheets.schema_registry → core.schema_registry → schema_registry
+Public API, __all__, route paths, and all handler signatures preserved.
 
-ENH: _build_recommendations now initialises trade setup fields
-  (entry_price, stop_loss_suggested, take_profit_suggested, risk_reward_ratio)
-  to None so downstream Top10 schema projection never produces short rows.
-
-Preserved from v4.1.0 (no other behavioral changes):
-  _calc_score, _selection_reason, _criteria_snapshot, _load_source_rows,
-  all route endpoints, request config parsing, engine resolution.
+v4.2.0 Notes (unchanged)
+------------------------
+_SchemaAdapter fallback keys/headers for Insights_Analysis use the canonical
+9-column schema (schema_registry v3.4.0):
+  section / item / symbol / metric / value / signal / priority / notes / as_of_riyadh
+_build_insights_from_rows produces v3.4.0 canonical fields (signal instead
+of direction, notes instead of commentary+unit, as_of_riyadh instead of
+updated_at). Multi-path schema_registry fallback chain:
+  core.sheets.schema_registry → core.schema_registry → schema_registry
+Trade-setup fields (entry_price, stop_loss_suggested, take_profit_suggested,
+risk_reward_ratio) initialised to None in _build_recommendations so Top10
+schema projection never produces short rows.
 """
 
 from dataclasses import dataclass
@@ -44,7 +53,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from fastapi import APIRouter, Body, HTTPException, Query
 
 
-VERSION = "4.2.0"
+VERSION = "4.2.1"
 ROUTE_FAMILY = "ai_analysis"
 DEFAULT_ANALYSIS_SOURCE_PAGE = os.getenv("TFB_ANALYSIS_SOURCE_PAGE", "Market_Leaders")
 DEFAULT_LIMIT  = max(1, min(int(os.getenv("TFB_AI_ANALYSIS_DEFAULT_LIMIT", "50")), 500))
@@ -107,6 +116,27 @@ def _coalesce(*values: Any) -> Any:
     return None
 
 
+def _sort_value(value: Optional[float], default: float = -math.inf) -> float:
+    """
+    v4.2.1: None-safe coalesce for numeric sort keys.
+
+    Preserves 0.0 (and other truthy-false numbers) as their actual value.
+    Only substitutes `default` when `value` is genuinely None.
+
+    Replaces the v4.2.0 `_safe_float(...) or -999999` idiom, which treated
+    0.0 as missing and ranked it below negative values.
+    """
+    return default if value is None else value
+
+
+def _first_not_none(*values: Optional[float]) -> Optional[float]:
+    """v4.2.1: explicit None-aware coalesce (unlike `or`, this preserves 0.0)."""
+    for v in values:
+        if v is not None:
+            return v
+    return None
+
+
 def _import_attr_multi(module_names: Sequence[str], attr_name: str) -> Any:
     """Try each module in order; return first successful attr lookup."""
     for module_name in module_names:
@@ -127,6 +157,8 @@ def _import_attr(module_name: str, attr_name: str) -> Any:
 # =============================================================================
 # Schema adapter — multi-path fallback
 # v4.2.0: Insights_Analysis fallback schema updated to 9-col v3.4.0 canonical.
+# v4.2.1: generic fallback for non-Insights pages now returns [] rather than
+#         leaking Insights-shaped keys (old v4.1.0 schema).
 # =============================================================================
 _SR_MODULES = (
     "core.sheets.schema_registry",
@@ -191,8 +223,10 @@ class RequestConfig:
 
 class _SchemaAdapter:
     """
-    v4.2.0: All schema_registry imports now use 3-path multi-fallback.
-    Insights_Analysis fallback updated to 9-col v3.4.0 canonical schema.
+    v4.2.0: All schema_registry imports use 3-path multi-fallback.
+            Insights_Analysis fallback returns 9-col v3.4.0 canonical schema.
+    v4.2.1: Unknown pages now return [] instead of the stale v4.1.0 Insights
+            schema when schema_registry is unavailable.
     """
     def __init__(self) -> None:
         self._get_schema          = _import_attr_multi(_SR_MODULES, "get_schema")
@@ -227,7 +261,12 @@ class _SchemaAdapter:
         # v4.2.0: 9-col canonical fallback for Insights_Analysis
         if page == "Insights_Analysis":
             return list(_INSIGHTS_FALLBACK_KEYS)
-        return ["section", "metric", "value", "unit", "direction", "commentary", "updated_at"]
+        # v4.2.1: return [] for unknown pages rather than leaking the old
+        # v4.1.0 Insights 7-col schema. An empty list is a truthful "unknown"
+        # signal; v4.2.0's non-empty wrong-schema fallback cascaded into
+        # project_rows/rows_to_matrix and produced e.g. Top10 payloads with
+        # Insights fields.
+        return []
 
     def headers(self, page: str) -> List[str]:
         if callable(self._get_headers):
@@ -240,7 +279,9 @@ class _SchemaAdapter:
         # v4.2.0: 9-col canonical fallback for Insights_Analysis
         if page == "Insights_Analysis":
             return list(_INSIGHTS_FALLBACK_HEADERS)
-        return self.keys(page)
+        # v4.2.1: mirror the keys() fallback. Previously this called
+        # self.keys(page), which propagated the wrong schema.
+        return []
 
     def display_headers(self, page: str) -> List[str]:
         if callable(self._get_display_headers):
@@ -253,7 +294,8 @@ class _SchemaAdapter:
         # v4.2.0: 9-col canonical fallback for Insights_Analysis
         if page == "Insights_Analysis":
             return list(_INSIGHTS_FALLBACK_HEADERS)
-        return self.headers(page)
+        # v4.2.1: return [] for unknown pages.
+        return []
 
     def normalize_page(self, page: Optional[str]) -> str:
         if not page:
@@ -279,6 +321,9 @@ class _SchemaAdapter:
         out: List[Dict[str, Any]] = []
         for row in rows_list:
             if isinstance(row, Mapping):
+                # v4.2.1 note: when keys == [] (unknown page, registry down),
+                # projected is {}; this preserves no-data semantics rather
+                # than silently re-shaping rows into the old Insights schema.
                 projected = {key: row.get(key) for key in keys}
             elif isinstance(row, (list, tuple)):
                 projected = {key: row[i] if i < len(row) else None for i, key in enumerate(keys)}
@@ -725,11 +770,20 @@ def _build_recommendations(
         base["_blended_score"] = blended
         ranked.append((blended, base))
 
+    # v4.2.1: use _sort_value / _first_not_none so 0.0 is preserved as its own
+    # value. v4.2.0 used `_safe_float(...) or -999999`, which collapsed 0.0
+    # to the sentinel — a row with expected_roi_3m=0.0 ranked BELOW a row
+    # with expected_roi_3m=-0.50 (big loss).
     ranked.sort(
         key=lambda item: (
             item[0],
-            _safe_float(item[1].get("expected_roi_3m"))  or -999999,
-            _safe_float(item[1].get("confidence")) or _safe_float(item[1].get("forecast_confidence")) or -999999,
+            _sort_value(_safe_float(item[1].get("expected_roi_3m"))),
+            _sort_value(
+                _first_not_none(
+                    _safe_float(item[1].get("confidence")),
+                    _safe_float(item[1].get("forecast_confidence")),
+                )
+            ),
         ),
         reverse=True,
     )
