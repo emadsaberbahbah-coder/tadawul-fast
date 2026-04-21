@@ -3,35 +3,100 @@
 """
 scripts/run_dashboard_sync.py
 ================================================================================
-TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.4.0)
+TADAWUL FAST BRIDGE — DASHBOARD SYNC RUNNER (v6.5.0)
 ================================================================================
 PRODUCTION-HARDENED | ASYNC | NON-BLOCKING | COMPILEALL-SAFE | SCHEMA-FIRST
 
-v6.4.0 fixes
-- FIX: Added dedup guard before Sheets write. When the backend returns duplicate
-  symbol rows (e.g. a symbol appears on two source pages), all duplicates after
-  the first occurrence are dropped before writing to Google Sheets.
-- FIX: Added run_from_worker_payload() — programmatic entry point for worker.py.
-  In v6.3.0, worker.py had to construct a fake argparse.Namespace to call
-  main_async(), which broke whenever new CLI args were added. Now worker.py
-  calls run_from_worker_payload(payload) directly.
-- ENH: Added WORKER_PAYLOAD_SCHEMA dict — documents the contract for the
-  task_type="dashboard_sync" payload sent by worker.py. Prevents silent schema
-  drift between worker.py and this module.
+Why this revision (v6.5.0 vs v6.4.0)
+-------------------------------------
+- 🔑 FIX CRITICAL: `import sys` was MISSING in v6.4.0 but the module bottom
+     had `sys.exit(main())`. Every CLI invocation (`python run_dashboard_sync.py
+     ...`) crashed with `NameError: name 'sys' is not defined` before returning
+     an exit code. Only the worker integration path (`run_from_worker_payload`)
+     continued to work. v6.5.0 adds `import sys` at the top so CLI usage
+     actually functions.
 
-v6.3.0 fixes
-- Sheets-safe ALWAYS: backend rows (dicts or lists) -> strict 2D matrix
-- JSON-safe value coercion for Google API
-- Key parsing is robust: supports space, comma, semicolon, JSON array-like tokens
-- Stronger backend compatibility: sends sheet/page/name/tab + tickers/symbols
-- Health preflight probes /readyz + /health + /livez
-- Credentials loader hardened
-- Never runs forbidden legacy keys (KSA_TADAWUL / ADVISOR_CRITERIA)
-- Exit codes: 0 = success, 1 = partial, 2 = failed
+- 🔑 FIX HIGH: `_TRUTHY` / `_FALSY` realigned to exact `main._TRUTHY` /
+     `_FALSY` vocabulary. Previously v6.4.0 missing `t`, `enabled`, `enable`
+     (truthy) and `f`, `disabled`, `disable` (falsy). This broke env-var
+     parity with other project scripts where e.g. `SYNC_DRY_RUN=enabled` or
+     `SYNC_CLEAR=t` is expected to work.
+
+- FIX: Added `SCRIPT_VERSION` + `SERVICE_VERSION` alias (cross-script
+     convention with `audit_data_quality.py v4.5.0` / `cleanup_cache.py
+     v4.1.0` / `drift_detection.py v4.3.0` / `migrate_schema_v2.py v2.1.0` /
+     `refresh_data.py v5.2.0` / `repo_hygiene_check.py v5.1.0`).
+
+- FIX: Added `_env_bool`, `_env_int`, `_env_int_bool`, `_env_csv` helpers
+     using the canonical project vocabulary.
+
+- FIX: Added `SYNC_*` env var defaults for every CLI flag, so the runner
+     can be driven purely from the environment in cron/CI without argv:
+       SYNC_SHEET_ID, SYNC_BACKEND, SYNC_KEYS, SYNC_START_CELL,
+       SYNC_MAX_SYMBOLS, SYNC_WORKERS, SYNC_CLEAR, SYNC_DRY_RUN,
+       SYNC_NO_LOCK, SYNC_TIMEOUT, SYNC_JSON_OUT, SYNC_JSON
+     (Backward-compatible: older env names still honored — DEFAULT_SPREADSHEET_ID,
+     SPREADSHEET_ID, BACKEND_BASE_URL, DEFAULT_BACKEND_URL.)
+
+- FIX: Added `--json` flag for stdout JSON output. Previously v6.4.0 only
+     supported `--json-out <file>`. Now `--json` prints the report to stdout
+     (useful for piping; skipped in worker integration to avoid contaminating
+     worker logs).
+
+- FIX: `_extract_table_payload` now has a recursion depth guard (max 8
+     levels). Defensive against malicious or malformed payloads that would
+     previously trigger RecursionError.
+
+- FIX: Exit codes documented comprehensively — 0 (success) / 1 (partial) /
+     2 (failed / missing config) / 130 (SIGINT).
+
+v6.4.0 fixes (preserved)
+- Dedup guard before Sheets write (duplicate symbols dropped, first-wins).
+- `run_from_worker_payload` programmatic entry point for worker.py.
+- `WORKER_PAYLOAD_SCHEMA` dict documents the contract.
+
+v6.3.0 fixes (preserved)
+- Sheets-safe ALWAYS: backend rows (dicts or lists) → strict 2D matrix.
+- JSON-safe value coercion for Google API.
+- Key parsing robust: space, comma, semicolon, JSON array-like tokens.
+- Stronger backend compatibility: sends sheet/page/name/tab + tickers/symbols.
+- Health preflight probes /readyz + /health + /livez.
+- Credentials loader hardened.
+- Never runs forbidden legacy keys (KSA_TADAWUL / ADVISOR_CRITERIA).
 
 Design rules
 - No network calls at import-time.
 - Conservative: warnings instead of crashes.
+
+Env vars
+--------
+  SYNC_SHEET_ID                 spreadsheet id (also DEFAULT_SPREADSHEET_ID)
+  SYNC_BACKEND                  backend base URL (also BACKEND_BASE_URL)
+  SYNC_KEYS                     comma-sep keys to sync (subset of ALLOWED)
+  SYNC_START_CELL               header start cell (default A5)
+  SYNC_MAX_SYMBOLS              override max symbols (-1 = per-task default)
+  SYNC_WORKERS                  parallel workers (default 4)
+  SYNC_CLEAR                    clear before write (truthy)
+  SYNC_DRY_RUN                  dry-run (truthy)
+  SYNC_NO_LOCK                  disable Redis lock (truthy)
+  SYNC_TIMEOUT                  backend timeout seconds (default 30)
+  SYNC_JSON                     print JSON report to stdout (truthy)
+  SYNC_JSON_OUT                 write JSON report to this file path
+  LOG_LEVEL                     logger level (default INFO)
+  REDIS_URL                     Redis URL for distributed lock (optional)
+  TFB_TOKEN / X_APP_TOKEN /
+  APP_TOKEN / BACKEND_TOKEN     backend auth token (any one)
+  GOOGLE_SHEETS_CREDENTIALS /
+  GOOGLE_CREDENTIALS /
+  GOOGLE_APPLICATION_CREDENTIALS Google service account credentials
+
+Exit codes
+----------
+  0 = all tasks succeeded
+  1 = at least one task returned partial
+  2 = at least one task failed OR missing config (spreadsheet id / creds)
+  130 = interrupted by user (SIGINT)
+================================================================================
 """
 
 from __future__ import annotations
@@ -44,6 +109,7 @@ import logging
 import os
 import random
 import re
+import sys  # v6.5.0 FIX: was missing, causing NameError on every CLI invocation
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -55,7 +121,55 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # -----------------------------------------------------------------------------
 # Version
 # -----------------------------------------------------------------------------
-SCRIPT_VERSION = "6.4.0"
+SCRIPT_VERSION = "6.5.0"
+SERVICE_VERSION = SCRIPT_VERSION  # v6.5.0: cross-script alias
+
+# -----------------------------------------------------------------------------
+# Project-wide truthy/falsy vocabulary (matches main._TRUTHY / _FALSY)
+# -----------------------------------------------------------------------------
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
+_FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Project-aligned env bool parser."""
+    try:
+        raw = (os.getenv(name, "") or "").strip().lower()
+    except Exception:
+        return bool(default)
+    if not raw:
+        return bool(default)
+    if raw in _TRUTHY:
+        return True
+    if raw in _FALSY:
+        return False
+    return bool(default)
+
+
+def _env_int(
+    name: str, default: int, *, lo: Optional[int] = None, hi: Optional[int] = None
+) -> int:
+    try:
+        raw = (os.getenv(name, "") or "").strip()
+        if not raw:
+            return default
+        v = int(float(raw))
+    except Exception:
+        return default
+    if lo is not None and v < lo:
+        v = lo
+    if hi is not None and v > hi:
+        v = hi
+    return v
+
+
+def _env_csv(name: str, default: Optional[List[str]] = None) -> Optional[List[str]]:
+    raw = (os.getenv(name, "") or "").strip()
+    if not raw:
+        return default
+    items = [x.strip() for x in raw.split(",") if x.strip()]
+    return items or default
+
 
 # -----------------------------------------------------------------------------
 # Logging (Render-safe)
@@ -73,8 +187,7 @@ logger = logging.getLogger("DashboardSync")
 # -----------------------------------------------------------------------------
 _A1_CELL_RE = re.compile(r"^\$?[A-Za-z]+\$?\d+$")
 _SHEET_SAFE_RE = re.compile(r"^[A-Za-z0-9_]+$")
-_TRUTHY = {"1", "true", "yes", "y", "on"}
-_FALSY = {"0", "false", "no", "n", "off"}
+_MAX_PAYLOAD_RECURSION = 8  # v6.5.0: guard for _extract_table_payload
 
 _ALLOWED_KEYS = {
     "MARKET_LEADERS",
@@ -94,6 +207,7 @@ def _utc_now() -> datetime:
 
 
 def _safe_bool(v: Any, default: bool = False) -> bool:
+    """Value-based bool coercion (distinct from _env_bool which reads os.environ)."""
     if v is None:
         return default
     if isinstance(v, bool):
@@ -133,7 +247,7 @@ def _canon_key(user_key: str) -> str:
     """
     Normalizes SYNC_KEYS tokens to canonical runner keys.
 
-    Canonical runner keys (March 2026):
+    Canonical runner keys:
       MARKET_LEADERS, GLOBAL_MARKETS, COMMODITIES_FX, MUTUAL_FUNDS,
       MY_PORTFOLIO, INSIGHTS_ANALYSIS, TOP_10_INVESTMENTS, DATA_DICTIONARY
     """
@@ -166,7 +280,8 @@ def _is_forbidden_key(k: str) -> bool:
 
 def _default_backend_url() -> str:
     return (
-        os.getenv("BACKEND_BASE_URL")
+        os.getenv("SYNC_BACKEND")
+        or os.getenv("BACKEND_BASE_URL")
         or os.getenv("DEFAULT_BACKEND_URL")
         or "http://127.0.0.1:8000"
     ).rstrip("/")
@@ -175,7 +290,12 @@ def _default_backend_url() -> str:
 def _default_spreadsheet_id(cli_id: Optional[str]) -> str:
     if cli_id and cli_id.strip():
         return cli_id.strip()
-    return (os.getenv("DEFAULT_SPREADSHEET_ID") or os.getenv("SPREADSHEET_ID") or "").strip()
+    return (
+        os.getenv("SYNC_SHEET_ID")
+        or os.getenv("DEFAULT_SPREADSHEET_ID")
+        or os.getenv("SPREADSHEET_ID")
+        or ""
+    ).strip()
 
 
 def _env_token() -> str:
@@ -621,6 +741,12 @@ class SheetsWriter:
 # Symbols reading (uses repo module if present)
 # -----------------------------------------------------------------------------
 def _read_symbols(task_key: str, spreadsheet_id: str, max_symbols: int) -> List[str]:
+    """
+    Calls `symbols_reader.get_page_symbols(key, spreadsheet_id=...)`.
+    Per project contract (symbols_reader v10+), returns Dict[str, Any] with
+    keys {"symbols", "all", "ksa", "global", "by_type", "metadata",
+          "status", "error"}.
+    """
     try:
         import importlib
 
@@ -709,7 +835,9 @@ def _endpoint_candidates_for_gateway(gw: str) -> List[str]:
     ]
 
 
-def _extract_table_payload(resp: Dict[str, Any]) -> Tuple[List[Any], List[List[Any]]]:
+def _extract_table_payload(
+    resp: Dict[str, Any], _depth: int = 0
+) -> Tuple[List[Any], List[List[Any]]]:
     """
     Returns (headers, rows_matrix) ALWAYS as list[list] for Sheets writing.
 
@@ -717,13 +845,25 @@ def _extract_table_payload(resp: Dict[str, Any]) -> Tuple[List[Any], List[List[A
       - {"headers":[...], "rows":[list|dict]}
       - {"headers":[...], "rows_matrix":[...]}
       - {"keys":[...]} for dict->matrix conversion
-      - {"data": {...}} nested
+      - {"data": {...}} nested (depth-bounded)
+
+    v6.5.0: Added `_depth` guard (max _MAX_PAYLOAD_RECURSION levels) so
+    malicious or malformed payloads with deeply nested `"data"` keys don't
+    trigger RecursionError.
     """
     if not isinstance(resp, dict):
         return [], []
 
+    # v6.5.0: guard against pathological nesting
+    if _depth >= _MAX_PAYLOAD_RECURSION:
+        logger.warning(
+            "Payload nesting exceeded _MAX_PAYLOAD_RECURSION=%d; bailing out",
+            _MAX_PAYLOAD_RECURSION,
+        )
+        return [], []
+
     if isinstance(resp.get("data"), dict):
-        return _extract_table_payload(resp["data"])  # type: ignore[index]
+        return _extract_table_payload(resp["data"], _depth + 1)  # type: ignore[index]
 
     headers = resp.get("headers")
     keys = resp.get("keys")
@@ -887,11 +1027,9 @@ async def _run_one_task(
         res.gateway_used = f"{task.gateway}:{used_endpoint}" if used_endpoint else task.gateway
         res.symbols_processed = len(symbols)
 
-        # FIX v6.4.0: Dedup guard before Sheets write.
-        # When the backend returns duplicate symbol rows (e.g. a symbol appears
-        # in two source pages, or data_engine_v2 emits the same symbol twice
-        # before its dedup fix is deployed), drop all but the first occurrence
-        # to prevent duplicate rows in Google Sheets.
+        # Dedup guard before Sheets write (v6.4.0).
+        # When the backend returns duplicate symbol rows, drop all but the
+        # first occurrence to prevent duplicate rows in Google Sheets.
         if rows_matrix:
             sym_col_idx: Optional[int] = None
             for col_idx, h in enumerate(headers):
@@ -977,41 +1115,82 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description=f"TFB Dashboard Sync Runner v{SCRIPT_VERSION}"
     )
-    parser.add_argument("--sheet-id", default="", help="Spreadsheet ID override")
-    parser.add_argument("--backend", default="", help="Backend base URL override")
+    parser.add_argument(
+        "--sheet-id",
+        default="",
+        help="Spreadsheet ID override (also SYNC_SHEET_ID / DEFAULT_SPREADSHEET_ID env).",
+    )
+    parser.add_argument(
+        "--backend",
+        default="",
+        help="Backend base URL override (also SYNC_BACKEND / BACKEND_BASE_URL env).",
+    )
     parser.add_argument(
         "--keys",
         nargs="*",
-        default=[],
-        help="Specific keys (space/comma/semicolon/JSON-array supported)",
+        default=_env_csv("SYNC_KEYS") or [],
+        help="Specific keys (space/comma/semicolon/JSON-array supported). "
+             "Also: SYNC_KEYS env (comma-separated).",
     )
     parser.add_argument(
         "--start-cell",
-        default="A5",
-        help="Top-left A1 cell where headers will be written (e.g. A5)",
+        default=os.getenv("SYNC_START_CELL") or "A5",
+        help="Top-left A1 cell where headers will be written (e.g. A5). "
+             "Also: SYNC_START_CELL env.",
     )
     parser.add_argument(
         "--max-symbols",
-        default="-1",
-        help="Override max symbols for all tasks (-1 = per task default)",
-    )
-    parser.add_argument("--workers", default="4", help="Parallel workers")
-    parser.add_argument(
-        "--clear", action="store_true", help="Clear from start-cell down before writing"
+        default=str(_env_int("SYNC_MAX_SYMBOLS", -1, lo=-1, hi=5000)),
+        help="Override max symbols for all tasks (-1 = per task default). "
+             "Also: SYNC_MAX_SYMBOLS env.",
     )
     parser.add_argument(
-        "--dry-run", action="store_true", help="Do not call backend or write sheets"
+        "--workers",
+        default=str(_env_int("SYNC_WORKERS", 4, lo=1, hi=32)),
+        help="Parallel workers. Also: SYNC_WORKERS env.",
     )
     parser.add_argument(
-        "--no-lock", action="store_true", help="Disable Redis lock even if REDIS_URL exists"
+        "--clear",
+        action="store_true",
+        default=_env_bool("SYNC_CLEAR", False),
+        help="Clear from start-cell down before writing. Also: SYNC_CLEAR env.",
     )
-    parser.add_argument("--json-out", default="", help="Write JSON report to this file path")
-    parser.add_argument("--timeout", default="30", help="Backend timeout seconds")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        default=_env_bool("SYNC_DRY_RUN", False),
+        help="Do not call backend or write sheets. Also: SYNC_DRY_RUN env.",
+    )
+    parser.add_argument(
+        "--no-lock",
+        action="store_true",
+        default=_env_bool("SYNC_NO_LOCK", False),
+        help="Disable Redis lock even if REDIS_URL exists. Also: SYNC_NO_LOCK env.",
+    )
+    parser.add_argument(
+        "--json-out",
+        default=os.getenv("SYNC_JSON_OUT") or "",
+        help="Write JSON report to this file path. Also: SYNC_JSON_OUT env.",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        default=_env_bool("SYNC_JSON", False),
+        help="Print JSON report to stdout at end. Also: SYNC_JSON env.",
+    )
+    parser.add_argument(
+        "--timeout",
+        default=str(_env_int("SYNC_TIMEOUT", 30, lo=5, hi=180)),
+        help="Backend timeout seconds. Also: SYNC_TIMEOUT env.",
+    )
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     spreadsheet_id = _default_spreadsheet_id(args.sheet_id)
     if not spreadsheet_id:
-        logger.error("DEFAULT_SPREADSHEET_ID is missing and --sheet-id not provided.")
+        logger.error(
+            "Missing spreadsheet id. "
+            "Provide --sheet-id or set SYNC_SHEET_ID / DEFAULT_SPREADSHEET_ID env."
+        )
         return 2
 
     backend_url = (args.backend or _default_backend_url()).rstrip("/")
@@ -1166,16 +1345,23 @@ async def main_async(argv: Optional[Sequence[str]] = None) -> int:
                     "; ".join(r.warnings[:2]) if r.warnings else "skipped",
                 )
 
-        if args.json_out:
+        # v6.5.0: emit JSON to file and/or stdout per flags
+        if args.json_out or args.json:
             report = {
                 "summary": summary.to_dict(),
                 "results": [x.to_dict() for x in results],
             }
-            Path(args.json_out).write_text(
-                json.dumps(_coerce_jsonable(report), indent=2, ensure_ascii=False),
-                encoding="utf-8",
+            report_json = json.dumps(
+                _coerce_jsonable(report), indent=2, ensure_ascii=False
             )
-            logger.info("Report saved: %s", args.json_out)
+            if args.json_out:
+                try:
+                    Path(args.json_out).write_text(report_json, encoding="utf-8")
+                    logger.info("Report saved: %s", args.json_out)
+                except Exception as e:
+                    logger.warning("Failed to write JSON report: %s", e)
+            if args.json:
+                sys.stdout.write(report_json + "\n")
 
         if summary.failed > 0:
             return 2
@@ -1204,7 +1390,7 @@ def main() -> int:
 
 
 # =============================================================================
-# Worker integration API (FIX v6.4.0)
+# Worker integration API (v6.4.0)
 # =============================================================================
 
 # Documents the expected task payload schema for worker.py.
@@ -1235,15 +1421,16 @@ async def run_from_worker_payload_async(payload: Dict[str, Any]) -> Dict[str, An
     """
     Programmatic entry point for worker.py (async version).
 
-    FIX v6.4.0: In v6.3.0, worker.py had to call main_async() by constructing
-    a fake argparse.Namespace. This broke whenever new --args were added to the
-    CLI parser. Now worker.py calls this function directly with the task payload.
+    v6.4.0: In v6.3.0, worker.py had to call main_async() by constructing a
+    fake argparse.Namespace. This broke whenever new --args were added to
+    the CLI parser. Now worker.py calls this function directly with the task
+    payload.
 
     Args:
         payload: Dict matching WORKER_PAYLOAD_SCHEMA.
 
     Returns:
-        Dict with keys: status, exit_code, summary, errors.
+        Dict with keys: status, exit_code, summary, errors, task_id.
         status: "success" | "partial" | "failed"
         exit_code: 0 | 1 | 2
     """
@@ -1300,6 +1487,10 @@ async def run_from_worker_payload_async(payload: Dict[str, Any]) -> Dict[str, An
     if payload.get("no_lock"):
         argv.append("--no-lock")
 
+    # v6.5.0 note: deliberately do NOT pass --json from worker payloads.
+    # Worker stdout is captured by the queue/worker process and must not
+    # contain report JSON. Use --json-out if the caller wants a file.
+
     try:
         exit_code = await main_async(argv)
         status = "success" if exit_code == 0 else ("partial" if exit_code == 1 else "failed")
@@ -1336,6 +1527,23 @@ def run_from_worker_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             "summary": {},
             "task_id": str(payload.get("task_id") or ""),
         }
+
+
+__all__ = [
+    "SCRIPT_VERSION",
+    "SERVICE_VERSION",
+    "TaskSpec",
+    "TaskResult",
+    "RunSummary",
+    "BackendClient",
+    "RedisLock",
+    "SheetsWriter",
+    "WORKER_PAYLOAD_SCHEMA",
+    "main_async",
+    "main",
+    "run_from_worker_payload",
+    "run_from_worker_payload_async",
+]
 
 
 if __name__ == "__main__":
