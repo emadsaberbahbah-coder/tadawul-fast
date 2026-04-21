@@ -2,27 +2,74 @@
 """
 scripts/worker.py
 ===========================================================
-TADAWUL FAST BRIDGE – ENTERPRISE WORKER ORCHESTRATOR (v4.2.0)
+TADAWUL FAST BRIDGE – ENTERPRISE WORKER ORCHESTRATOR (v4.3.0)
 ===========================================================
 RECOVERY-ALIGNED • REDIS-COMPATIBLE • TRACE-SAFE • STARTUP-SAFE
 
-What v4.2.0 revises
-- FIX: supports modern `redis.asyncio` first, with `aioredis` fallback.
-       This matches environments where `redis` is installed but `aioredis`
-       is not.
-- FIX: TraceContext now uses OpenTelemetry context managers correctly.
-- FIX: clean Redis shutdown across both client variants.
-- FIX: dead-letter support for exhausted jobs.
-- ENH: central worker config via env vars.
-- ENH: deterministic pipeline dispatch helpers for dashboard_sync,
-       market_scan, and refresh_data.
-- SAFE: preserves idle fallback when Redis is unavailable, unless fail-fast
-       is explicitly enabled.
+Why this revision (v4.3.0 vs v4.2.0)
+-------------------------------------
+- 🔑 FIX HIGH: Dispatch now calls the canonical worker entrypoints that
+    `run_dashboard_sync v6.5.0` and `run_market_scan v5.3.0` expose:
+        run_from_worker_payload_async(payload: Dict[str, Any]) -> Dict
+    v4.2.0 duplicated payload parsing in the worker and probed through
+    a list of legacy function names. Since the canonical scripts now own
+    the payload->config normalization logic, delegating the full payload
+    to them eliminates:
+      - drift between worker and script when new payload keys are added
+      - silently dropped fields (v4.2.0 e.g. passed top_n/horizon/mode but
+        missed `timeout_sec` and `concurrency` which are ScanConfig fields)
+      - error-handling that differed between worker and script
+    For `market_scan`, worker now just forwards the payload. For
+    `dashboard_sync`, same. For `refresh_data` (which does NOT yet expose
+    a worker entrypoint), the legacy name-probing is retained.
+
+- 🔑 FIX MEDIUM: `SHUTDOWN_EVENT` is no longer created at module import
+    time. `asyncio.Event()` binds to whichever event loop is "current" at
+    creation, which may not be the loop `main_async` actually runs under.
+    v4.3.0 creates the event inside `main_async()` and uses
+    `loop.add_signal_handler()` — the canonical asyncio pattern.
+
+- 🔑 FIX MEDIUM: `_CPU_EXECUTOR` is now lazy-initialized. v4.2.0 spawned
+    `cpu_workers` threads at module-import time. v4.3.0 uses
+    `_get_executor()` that creates the pool only on first use and
+    shuts down cleanly (wait=True) on exit.
+
+- FIX: Added project-standard `_TRUTHY`/`_FALSY` vocabulary (matches
+    `main._TRUTHY`/`_FALSY`). `_TRACING_ENABLED` and
+    `fail_fast_if_no_redis` now use the 8-value set including
+    `t`/`enabled`/`enable`.
+
+- FIX: Added `_env_bool`/`_env_int`/`_env_float` helpers.
+- FIX: Added `SERVICE_VERSION = SCRIPT_VERSION` alias.
+- FIX: Removed dead `Sequence` import from typing (unused after the
+    dispatch refactor).
 
 Supported task_type values in Redis queue payload:
-  - "dashboard_sync"
-  - "market_scan"
-  - "refresh_data"
+  - "dashboard_sync"   -> scripts.run_dashboard_sync v6.5.0
+  - "market_scan"      -> scripts.run_market_scan v5.3.0
+  - "refresh_data"     -> scripts.refresh_data v5.2.0 (legacy dispatch)
+
+Environment
+-----------
+  TFB_WORKER_QUEUE_NAME              Redis queue name (default tfb_background_jobs)
+  TFB_WORKER_DLQ_NAME                Dead-letter queue name
+  REDIS_URL                          Redis connection URL
+  TFB_WORKER_REDIS_BLOCK_TIMEOUT_SEC BLPOP block timeout (default 5)
+  TFB_WORKER_IDLE_SLEEP_SEC          idle mode poll interval (default 5.0)
+  TFB_WORKER_MAX_RETRIES             per-task retry count (default 5)
+  TFB_WORKER_BACKOFF_BASE_SEC        retry base delay (default 1.0)
+  TFB_WORKER_BACKOFF_MAX_SEC         retry max delay (default 30.0)
+  TFB_WORKER_CPU_WORKERS             thread pool size (default 4)
+  TFB_WORKER_FAIL_FAST_NO_REDIS      truthy = exit 2 if Redis missing
+  CORE_TRACING_ENABLED / TRACING_ENABLED  OpenTelemetry tracing (truthy)
+  LOG_LEVEL                          logger level (default INFO)
+
+Exit codes
+----------
+  0   success / clean shutdown
+  1   fatal crash
+  2   Redis unavailable + fail-fast enabled
+  130 SIGINT
 """
 
 from __future__ import annotations
@@ -37,8 +84,75 @@ import random
 import signal
 import sys
 import time
-from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+from dataclasses import dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+
+
+# ---------------------------------------------------------------------------
+# Version
+# ---------------------------------------------------------------------------
+SCRIPT_VERSION = "4.3.0"
+SERVICE_VERSION = SCRIPT_VERSION  # v4.3.0: cross-script alias
+
+
+# ---------------------------------------------------------------------------
+# Project-wide truthy/falsy vocabulary (matches main._TRUTHY / _FALSY)
+# ---------------------------------------------------------------------------
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
+_FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    try:
+        raw = (os.getenv(name, "") or "").strip().lower()
+    except Exception:
+        return bool(default)
+    if not raw:
+        return bool(default)
+    if raw in _TRUTHY:
+        return True
+    if raw in _FALSY:
+        return False
+    return bool(default)
+
+
+def _env_int(
+    name: str, default: int, *, lo: Optional[int] = None, hi: Optional[int] = None
+) -> int:
+    try:
+        raw = (os.getenv(name, "") or "").strip()
+        if not raw:
+            return default
+        v = int(float(raw))
+    except Exception:
+        return default
+    if lo is not None and v < lo:
+        v = lo
+    if hi is not None and v > hi:
+        v = hi
+    return v
+
+
+def _env_float(
+    name: str,
+    default: float,
+    *,
+    lo: Optional[float] = None,
+    hi: Optional[float] = None,
+) -> float:
+    try:
+        raw = (os.getenv(name, "") or "").strip()
+        if not raw:
+            return default
+        v = float(raw)
+    except Exception:
+        return default
+    if lo is not None and v < lo:
+        v = lo
+    if hi is not None and v > hi:
+        v = hi
+    return v
+
 
 # ---------------------------------------------------------------------------
 # High-performance JSON fallback
@@ -55,18 +169,23 @@ try:
 
     _HAS_ORJSON = True
 except Exception:
-    import json
+    import json as _json
 
     def json_dumps(v: Any, *, indent: int = 0) -> str:
-        return json.dumps(v, indent=indent if indent else None, default=str)
+        return _json.dumps(
+            v, indent=(indent if indent else None), default=str, ensure_ascii=False
+        )
 
     def json_loads(data: Union[str, bytes]) -> Any:
-        return json.loads(data)
+        if isinstance(data, (bytes, bytearray)):
+            data = data.decode("utf-8", errors="replace")
+        return _json.loads(data)
 
     _HAS_ORJSON = False
 
+
 # ---------------------------------------------------------------------------
-# Optional tracing
+# Optional tracing (OpenTelemetry)
 # ---------------------------------------------------------------------------
 try:
     from opentelemetry import trace  # type: ignore
@@ -81,9 +200,10 @@ except Exception:
     _OTEL_AVAILABLE = False
     _TRACER = None
 
-_TRACING_ENABLED = os.getenv("CORE_TRACING_ENABLED", "").strip().lower() in {
-    "1", "true", "yes", "y", "on"
-}
+# v4.3.0: uses project-canonical _env_bool
+_TRACING_ENABLED = _env_bool("CORE_TRACING_ENABLED", False) or _env_bool(
+    "TRACING_ENABLED", False
+)
 
 
 class TraceContext:
@@ -164,16 +284,20 @@ except Exception:
         _REDIS_AVAILABLE = False
 
 
-SCRIPT_VERSION = "4.2.0"
-
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
 logging.basicConfig(
-    level=logging.INFO,
+    level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
     format="%(asctime)s | %(levelname)8s | %(name)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("Worker")
 
 
+# =============================================================================
+# Small helpers preserved for call-site compat
+# =============================================================================
 def _safe_int(
     v: Any, default: int, *, lo: Optional[int] = None, hi: Optional[int] = None
 ) -> int:
@@ -202,44 +326,87 @@ def _safe_float(
     return x
 
 
+# =============================================================================
+# Worker config
+# =============================================================================
 @dataclass(slots=True)
 class WorkerConfig:
-    queue_name: str = os.getenv("TFB_WORKER_QUEUE_NAME", "tfb_background_jobs")
-    dead_letter_queue: str = os.getenv("TFB_WORKER_DLQ_NAME", "tfb_background_jobs_dead")
-    redis_url: str = os.getenv("REDIS_URL", "").strip()
-    redis_block_timeout_sec: int = _safe_int(
-        os.getenv("TFB_WORKER_REDIS_BLOCK_TIMEOUT_SEC", "5"), 5, lo=1, hi=60
+    queue_name: str = field(
+        default_factory=lambda: os.getenv("TFB_WORKER_QUEUE_NAME", "tfb_background_jobs")
     )
-    idle_sleep_sec: float = _safe_float(
-        os.getenv("TFB_WORKER_IDLE_SLEEP_SEC", "5"), 5.0, lo=0.5, hi=60.0
+    dead_letter_queue: str = field(
+        default_factory=lambda: os.getenv("TFB_WORKER_DLQ_NAME", "tfb_background_jobs_dead")
     )
-    max_retries: int = _safe_int(
-        os.getenv("TFB_WORKER_MAX_RETRIES", "5"), 5, lo=1, hi=20
+    redis_url: str = field(default_factory=lambda: (os.getenv("REDIS_URL") or "").strip())
+    redis_block_timeout_sec: int = field(
+        default_factory=lambda: _env_int(
+            "TFB_WORKER_REDIS_BLOCK_TIMEOUT_SEC", 5, lo=1, hi=60
+        )
     )
-    backoff_base_sec: float = _safe_float(
-        os.getenv("TFB_WORKER_BACKOFF_BASE_SEC", "1.0"), 1.0, lo=0.1, hi=30.0
+    idle_sleep_sec: float = field(
+        default_factory=lambda: _env_float(
+            "TFB_WORKER_IDLE_SLEEP_SEC", 5.0, lo=0.5, hi=60.0
+        )
     )
-    backoff_max_sec: float = _safe_float(
-        os.getenv("TFB_WORKER_BACKOFF_MAX_SEC", "30.0"), 30.0, lo=1.0, hi=300.0
+    max_retries: int = field(
+        default_factory=lambda: _env_int("TFB_WORKER_MAX_RETRIES", 5, lo=1, hi=20)
     )
-    cpu_workers: int = _safe_int(
-        os.getenv("TFB_WORKER_CPU_WORKERS", "4"), 4, lo=1, hi=32
+    backoff_base_sec: float = field(
+        default_factory=lambda: _env_float(
+            "TFB_WORKER_BACKOFF_BASE_SEC", 1.0, lo=0.1, hi=30.0
+        )
     )
-    fail_fast_if_no_redis: bool = (
-        os.getenv("TFB_WORKER_FAIL_FAST_NO_REDIS", "false").strip().lower()
-        in {"1", "true", "yes", "y", "on"}
+    backoff_max_sec: float = field(
+        default_factory=lambda: _env_float(
+            "TFB_WORKER_BACKOFF_MAX_SEC", 30.0, lo=1.0, hi=300.0
+        )
+    )
+    cpu_workers: int = field(
+        default_factory=lambda: _env_int("TFB_WORKER_CPU_WORKERS", 4, lo=1, hi=32)
+    )
+    fail_fast_if_no_redis: bool = field(
+        default_factory=lambda: _env_bool("TFB_WORKER_FAIL_FAST_NO_REDIS", False)
     )
 
 
 CONFIG = WorkerConfig()
-_CPU_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=CONFIG.cpu_workers, thread_name_prefix="TFBWorker"
-)
-SHUTDOWN_EVENT = asyncio.Event()
 
 
 # =============================================================================
-# Full jitter exponential backoff
+# Lazy CPU executor (v4.3.0: was module-level eager)
+# =============================================================================
+_CPU_EXECUTOR: Optional[concurrent.futures.ThreadPoolExecutor] = None
+
+
+def _get_executor() -> concurrent.futures.ThreadPoolExecutor:
+    global _CPU_EXECUTOR
+    if _CPU_EXECUTOR is None:
+        _CPU_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+            max_workers=CONFIG.cpu_workers, thread_name_prefix="TFBWorker"
+        )
+    return _CPU_EXECUTOR
+
+
+def _shutdown_executor() -> None:
+    global _CPU_EXECUTOR
+    if _CPU_EXECUTOR is None:
+        return
+    try:
+        _CPU_EXECUTOR.shutdown(wait=True, cancel_futures=True)
+    except TypeError:
+        # Python 3.8 has no cancel_futures
+        try:
+            _CPU_EXECUTOR.shutdown(wait=True)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    finally:
+        _CPU_EXECUTOR = None
+
+
+# =============================================================================
+# Full-jitter exponential backoff
 # =============================================================================
 class FullJitterBackoff:
     def __init__(
@@ -249,7 +416,9 @@ class FullJitterBackoff:
         self.base_delay = base_delay
         self.max_delay = max_delay
 
-    async def execute_async(self, func: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    async def execute_async(
+        self, func: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any:
         last_exc: Optional[Exception] = None
         for attempt in range(self.max_retries):
             try:
@@ -264,16 +433,19 @@ class FullJitterBackoff:
                 sleep_time = random.uniform(0.0, ceiling)
                 logger.warning(
                     "Task failed on attempt %s/%s: %s. Retrying in %.2fs",
-                    attempt + 1, self.max_retries, e, sleep_time,
+                    attempt + 1,
+                    self.max_retries,
+                    e,
+                    sleep_time,
                 )
                 await asyncio.sleep(sleep_time)
         raise last_exc if last_exc is not None else RuntimeError("backoff_exhausted")
 
 
 # =============================================================================
-# Generic import / execution helpers
+# Generic import / execution helpers (legacy — used only by refresh_data path)
 # =============================================================================
-def _import_first(candidates: Sequence[str]) -> Any:
+def _import_first(candidates: Tuple[str, ...]) -> Any:
     last_exc: Optional[Exception] = None
     for name in candidates:
         try:
@@ -285,9 +457,13 @@ def _import_first(candidates: Sequence[str]) -> Any:
     raise ImportError("No module candidates provided")
 
 
-async def _run_sync_in_pool(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+async def _run_sync_in_pool(
+    fn: Callable[..., Any], *args: Any, **kwargs: Any
+) -> Any:
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_CPU_EXECUTOR, lambda: fn(*args, **kwargs))
+    return await loop.run_in_executor(
+        _get_executor(), lambda: fn(*args, **kwargs)
+    )
 
 
 async def _maybe_call(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
@@ -300,7 +476,7 @@ async def _maybe_call(fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
 
 
 async def _call_first_callable(
-    module: Any, names: Sequence[str], *args: Any, **kwargs: Any
+    module: Any, names: Tuple[str, ...], *args: Any, **kwargs: Any
 ) -> Tuple[bool, Any]:
     for name in names:
         fn = getattr(module, name, None)
@@ -328,13 +504,44 @@ def _result_dict(result: Any, *, ok_default: bool = True) -> Dict[str, Any]:
 # =============================================================================
 # Pipeline dispatchers
 # =============================================================================
+# v4.3.0: dashboard_sync and market_scan use the canonical
+# run_from_worker_payload_async(payload) entrypoint that the respective
+# scripts now own. This collapses the worker's payload-parsing duplication
+# and ensures new fields added to payloads don't require worker updates.
+# Legacy name-probing retained for refresh_data (no worker entrypoint yet).
+
+
 async def _run_dashboard_sync_task(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """v4.3.0: delegates to run_dashboard_sync.run_from_worker_payload_async."""
     try:
         mod = _import_first(("scripts.run_dashboard_sync", "run_dashboard_sync"))
     except Exception:
         logger.exception("run_dashboard_sync module not found")
-        return {"ok": False, "error": "module_not_found", "task_type": "dashboard_sync"}
+        return {
+            "ok": False,
+            "error": "module_not_found",
+            "task_type": "dashboard_sync",
+        }
 
+    # Ensure task_type is set (v6.5.0 validates this)
+    payload = dict(payload)
+    payload["task_type"] = "dashboard_sync"
+
+    # Preferred: canonical worker entrypoint
+    worker_fn = getattr(mod, "run_from_worker_payload_async", None)
+    if callable(worker_fn):
+        try:
+            result = await worker_fn(payload)
+            return _normalize_worker_result(result, "dashboard_sync")
+        except Exception as e:
+            logger.exception("run_dashboard_sync worker entrypoint failed: %s", e)
+            return {
+                "ok": False,
+                "error": f"entrypoint_failed:{e}",
+                "task_type": "dashboard_sync",
+            }
+
+    # Legacy fallback: name-probe (for pre-v6.5 run_dashboard_sync)
     sheet_name = str(payload.get("sheet_name") or "").strip()
     symbols = _as_list(payload.get("symbols") or [])
     spreadsheet_id = str(
@@ -351,45 +558,107 @@ async def _run_dashboard_sync_task(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     found, result = await _call_first_callable(
         mod,
-        ("run_async", "run_dashboard_sync_async", "main_async", "run", "run_dashboard_sync", "main"),
+        (
+            "run_async",
+            "run_dashboard_sync_async",
+            "main_async",
+            "run",
+            "run_dashboard_sync",
+            "main",
+        ),
         **kwargs,
     )
     if not found:
-        logger.error("run_dashboard_sync: no callable entrypoint found")
-        return {"ok": False, "error": "no_callable_found", "task_type": "dashboard_sync"}
+        logger.error(
+            "run_dashboard_sync: no callable entrypoint found "
+            "(tried run_from_worker_payload_async + legacy names)"
+        )
+        return {
+            "ok": False,
+            "error": "no_callable_found",
+            "task_type": "dashboard_sync",
+        }
     return _result_dict(result)
 
 
 async def _run_market_scan_task(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """v4.3.0: delegates to run_market_scan.run_from_worker_payload_async."""
     try:
         mod = _import_first(("scripts.run_market_scan", "run_market_scan"))
     except Exception:
         logger.exception("run_market_scan module not found")
-        return {"ok": False, "error": "module_not_found", "task_type": "market_scan"}
+        return {
+            "ok": False,
+            "error": "module_not_found",
+            "task_type": "market_scan",
+        }
 
-    spreadsheet_id = str(
-        payload.get("spreadsheet_id") or os.getenv("DEFAULT_SPREADSHEET_ID", "")
-    ).strip()
-    keys = _as_list(payload.get("keys") or payload.get("sheet_names") or ["Market_Leaders"])
-    top_n = _safe_int(payload.get("limit") or payload.get("top_n") or 10, 10, lo=1, hi=1000)
-    horizon = str(payload.get("horizon") or "3m").strip().lower()
-    min_confidence = _safe_float(payload.get("min_confidence") or 0.65, 0.65, lo=0.0, hi=1.0)
-    max_risk = _safe_float(payload.get("max_risk") or 60.0, 60.0, lo=0.0, hi=100.0)
-    min_roi = _safe_float(payload.get("min_roi") or 0.0, 0.0, lo=-1000.0, hi=1000.0)
-    mode = str(payload.get("mode") or "engine").strip()
+    # Ensure task_type is set (v5.3.0 validates this)
+    payload = dict(payload)
+    payload["task_type"] = "market_scan"
 
+    # Preferred: canonical worker entrypoint.
+    # v5.3.0 fixes: ScanConfig now has timeout_sec + concurrency fields,
+    # and ScanConfig.from_worker_payload() handles all normalization. By
+    # delegating the whole payload we avoid v4.2.0's bug where the worker
+    # built ScanConfig() manually and missed these fields.
+    worker_fn = getattr(mod, "run_from_worker_payload_async", None)
+    if callable(worker_fn):
+        try:
+            result = await worker_fn(payload)
+            return _normalize_worker_result(result, "market_scan")
+        except Exception as e:
+            logger.exception("run_market_scan worker entrypoint failed: %s", e)
+            return {
+                "ok": False,
+                "error": f"entrypoint_failed:{e}",
+                "task_type": "market_scan",
+            }
+
+    # Legacy fallback: use ScanConfig + run_scan
     scan_config_cls = getattr(mod, "ScanConfig", None)
     if scan_config_cls is not None:
-        cfg = scan_config_cls(
-            spreadsheet_id=spreadsheet_id,
-            keys=keys,
-            top_n=top_n,
-            horizon=horizon,
-            min_confidence=min_confidence,
-            max_risk_score=max_risk,
-            min_expected_roi=min_roi,
-            mode=mode,
+        spreadsheet_id = str(
+            payload.get("spreadsheet_id")
+            or os.getenv("SCAN_SHEET_ID")
+            or os.getenv("DEFAULT_SPREADSHEET_ID", "")
+        ).strip()
+        keys = _as_list(
+            payload.get("keys") or payload.get("sheet_names") or ["Market_Leaders"]
         )
+        # Prefer from_worker_payload classmethod if exposed (v5.3.0+)
+        from_payload = getattr(scan_config_cls, "from_worker_payload", None)
+        if callable(from_payload):
+            try:
+                cfg = from_payload(payload)
+            except Exception as e:
+                logger.exception("ScanConfig.from_worker_payload failed: %s", e)
+                return {
+                    "ok": False,
+                    "error": f"scan_config_build_failed:{e}",
+                    "task_type": "market_scan",
+                }
+        else:
+            # Pre-v5.3 ScanConfig signature (no timeout_sec/concurrency)
+            cfg = scan_config_cls(
+                spreadsheet_id=spreadsheet_id,
+                keys=keys,
+                top_n=_safe_int(
+                    payload.get("limit") or payload.get("top_n") or 10, 10, lo=1, hi=1000
+                ),
+                horizon=str(payload.get("horizon") or "3m").strip().lower(),
+                min_confidence=_safe_float(
+                    payload.get("min_confidence") or 0.65, 0.65, lo=0.0, hi=1.0
+                ),
+                max_risk_score=_safe_float(
+                    payload.get("max_risk") or 60.0, 60.0, lo=0.0, hi=100.0
+                ),
+                min_expected_roi=_safe_float(
+                    payload.get("min_roi") or 0.0, 0.0, lo=-1000.0, hi=1000.0
+                ),
+                mode=str(payload.get("mode") or "engine").strip(),
+            )
+
         found, result = await _call_first_callable(
             mod,
             ("run_scan_async", "run_async", "main_async", "run_scan", "run", "main"),
@@ -397,39 +666,55 @@ async def _run_market_scan_task(payload: Dict[str, Any]) -> Dict[str, Any]:
         )
         if not found:
             logger.error("run_market_scan: no callable entrypoint found")
-            return {"ok": False, "error": "no_callable_found", "task_type": "market_scan"}
+            return {
+                "ok": False,
+                "error": "no_callable_found",
+                "task_type": "market_scan",
+            }
         if isinstance(result, tuple) and len(result) == 2:
             rows, meta = result
             return {"ok": True, "rows": len(rows or []), "meta": meta}
         return _result_dict(result)
 
-    kwargs = {
-        "spreadsheet_id": spreadsheet_id,
-        "keys": keys,
-        "top_n": top_n,
-        "horizon": horizon,
-        "min_confidence": min_confidence,
-        "max_risk": max_risk,
-        "min_roi": min_roi,
-        "mode": mode,
+    logger.error("run_market_scan: no ScanConfig class found")
+    return {
+        "ok": False,
+        "error": "scan_config_not_found",
+        "task_type": "market_scan",
     }
-    found, result = await _call_first_callable(
-        mod,
-        ("run_scan_async", "run_async", "main_async", "run_scan", "run", "main"),
-        **kwargs,
-    )
-    if not found:
-        logger.error("run_market_scan: no callable entrypoint found")
-        return {"ok": False, "error": "no_callable_found", "task_type": "market_scan"}
-    return _result_dict(result)
 
 
 async def _run_refresh_data_task(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    v4.3.0: refresh_data v5.2.0 does NOT yet expose a worker entrypoint, so
+    this dispatcher retains the legacy name-probe pattern. When refresh_data
+    adds run_from_worker_payload_async, prefer it here like the other two.
+    """
     try:
         mod = _import_first(("scripts.refresh_data", "refresh_data"))
     except Exception:
         logger.exception("refresh_data module not found")
-        return {"ok": False, "error": "module_not_found", "task_type": "refresh_data"}
+        return {
+            "ok": False,
+            "error": "module_not_found",
+            "task_type": "refresh_data",
+        }
+
+    # v4.3.0 future-proof: prefer canonical entrypoint if it appears
+    worker_fn = getattr(mod, "run_from_worker_payload_async", None)
+    if callable(worker_fn):
+        payload = dict(payload)
+        payload["task_type"] = "refresh_data"
+        try:
+            result = await worker_fn(payload)
+            return _normalize_worker_result(result, "refresh_data")
+        except Exception as e:
+            logger.exception("refresh_data worker entrypoint failed: %s", e)
+            return {
+                "ok": False,
+                "error": f"entrypoint_failed:{e}",
+                "task_type": "refresh_data",
+            }
 
     kwargs: Dict[str, Any] = {}
     sheet_name = str(payload.get("sheet_name") or "").strip()
@@ -440,12 +725,47 @@ async def _run_refresh_data_task(payload: Dict[str, Any]) -> Dict[str, Any]:
         kwargs["symbols"] = symbols
 
     found, result = await _call_first_callable(
-        mod, ("run_async", "main_async", "run", "main"), **kwargs
+        mod, ("run_refresh", "run_async", "main_async", "run", "main"), **kwargs
     )
     if not found:
         logger.error("refresh_data: no callable entrypoint found")
-        return {"ok": False, "error": "no_callable_found", "task_type": "refresh_data"}
+        return {
+            "ok": False,
+            "error": "no_callable_found",
+            "task_type": "refresh_data",
+        }
     return _result_dict(result)
+
+
+def _normalize_worker_result(result: Any, task_type: str) -> Dict[str, Any]:
+    """
+    v4.3.0: normalize result from canonical run_from_worker_payload_async.
+    These entrypoints return {status, exit_code, summary, errors, task_id}.
+    Map to the worker's internal {ok, ...} shape.
+    """
+    if not isinstance(result, dict):
+        return {"ok": True, "result": str(result), "task_type": task_type}
+
+    out = dict(result)
+    out.setdefault("task_type", task_type)
+
+    # Translate status/exit_code -> ok if not already set
+    if "ok" not in out:
+        status = str(out.get("status") or "").strip().lower()
+        exit_code = out.get("exit_code", 0)
+        if status == "success" or exit_code == 0:
+            out["ok"] = True
+        elif status in {"failed", "error"}:
+            out["ok"] = False
+        elif status == "partial":
+            # "partial" is a soft failure — the worker treats as ok=True
+            # so retries aren't triggered for already-partial results
+            out["ok"] = True
+        else:
+            # Be conservative: exit_code determines
+            out["ok"] = int(exit_code or 0) == 0
+
+    return out
 
 
 # =============================================================================
@@ -456,7 +776,9 @@ async def _process_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     task_type = str(payload.get("task_type") or "dashboard_sync").strip().lower()
     started = time.time()
 
-    with TraceContext("worker_process_task", {"task_id": task_id, "task_type": task_type}):
+    with TraceContext(
+        "worker_process_task", {"task_id": task_id, "task_type": task_type}
+    ):
         logger.info("[%s] Starting task type=%r", task_id, task_type)
         if task_type == "dashboard_sync":
             result = await _run_dashboard_sync_task(payload)
@@ -466,8 +788,10 @@ async def _process_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             result = await _run_refresh_data_task(payload)
         else:
             logger.warning(
-                "[%s] Unknown task_type=%r. Supported: dashboard_sync, market_scan, refresh_data",
-                task_id, task_type,
+                "[%s] Unknown task_type=%r. Supported: dashboard_sync, "
+                "market_scan, refresh_data",
+                task_id,
+                task_type,
             )
             return {"ok": False, "error": "unknown_task_type", "task_type": task_type}
 
@@ -476,12 +800,18 @@ async def _process_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         if ok:
             logger.info(
                 "[%s] Task type=%r completed in %ss. result=%s",
-                task_id, task_type, elapsed, json_dumps(result),
+                task_id,
+                task_type,
+                elapsed,
+                json_dumps(result),
             )
         else:
             logger.error(
                 "[%s] Task type=%r failed in %ss. result=%s",
-                task_id, task_type, elapsed, json_dumps(result),
+                task_id,
+                task_type,
+                elapsed,
+                json_dumps(result),
             )
             raise RuntimeError(json_dumps(result))
         return _result_dict(result)
@@ -532,13 +862,16 @@ async def _close_redis_client(client: Any) -> None:
         pass
 
 
-async def _push_dead_letter(client: Any, raw_payload: str, error_text: str) -> None:
+async def _push_dead_letter(
+    client: Any, raw_payload: str, error_text: str
+) -> None:
     if client is None or not CONFIG.dead_letter_queue:
         return
     envelope = {
         "failed_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "error": error_text,
         "raw_payload": raw_payload,
+        "worker_version": SCRIPT_VERSION,
     }
     try:
         await client.rpush(CONFIG.dead_letter_queue, json_dumps(envelope))
@@ -546,7 +879,7 @@ async def _push_dead_letter(client: Any, raw_payload: str, error_text: str) -> N
         logger.exception("Failed to push payload to dead-letter queue")
 
 
-async def _poll_redis_queue(redis_url: str) -> None:
+async def _poll_redis_queue(redis_url: str, shutdown: asyncio.Event) -> None:
     logger.info("Connecting to Redis via %s using %s", redis_url, _REDIS_LIB)
     redis_client = await _create_redis_client(redis_url)
     if redis_client is None:
@@ -559,7 +892,7 @@ async def _poll_redis_queue(redis_url: str) -> None:
     )
 
     try:
-        while not SHUTDOWN_EVENT.is_set():
+        while not shutdown.is_set():
             try:
                 result = await redis_client.blpop(
                     CONFIG.queue_name, timeout=CONFIG.redis_block_timeout_sec
@@ -578,9 +911,12 @@ async def _poll_redis_queue(redis_url: str) -> None:
                 except Exception as parse_err:
                     logger.error(
                         "Failed to parse queue payload: %s | raw=%r",
-                        parse_err, str(data_raw)[:300],
+                        parse_err,
+                        str(data_raw)[:300],
                     )
-                    await _push_dead_letter(redis_client, str(data_raw), f"parse_error:{parse_err}")
+                    await _push_dead_letter(
+                        redis_client, str(data_raw), f"parse_error:{parse_err}"
+                    )
                     continue
 
                 try:
@@ -589,7 +925,9 @@ async def _poll_redis_queue(redis_url: str) -> None:
                     raise
                 except Exception as exec_err:
                     logger.exception("Task exhausted retries: %s", exec_err)
-                    await _push_dead_letter(redis_client, str(data_raw), f"task_failed:{exec_err}")
+                    await _push_dead_letter(
+                        redis_client, str(data_raw), f"task_failed:{exec_err}"
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception as poll_err:
@@ -600,48 +938,78 @@ async def _poll_redis_queue(redis_url: str) -> None:
         logger.info("Redis connection closed")
 
 
-async def _idle_loop() -> None:
-    while not SHUTDOWN_EVENT.is_set():
-        await asyncio.sleep(CONFIG.idle_sleep_sec)
+async def _idle_loop(shutdown: asyncio.Event) -> None:
+    while not shutdown.is_set():
+        try:
+            await asyncio.wait_for(shutdown.wait(), timeout=CONFIG.idle_sleep_sec)
+        except asyncio.TimeoutError:
+            continue
 
 
+# =============================================================================
+# Main entry
+# =============================================================================
 async def main_async(args: argparse.Namespace) -> int:
     del args
     logger.info(
-        "🚀 Starting TFB Worker v%s | redis_lib=%s | has_orjson=%s",
-        SCRIPT_VERSION, _REDIS_LIB, _HAS_ORJSON,
+        "🚀 Starting TFB Worker v%s | redis_lib=%s | has_orjson=%s "
+        "| queue=%s | dlq=%s | cpu_workers=%d",
+        SCRIPT_VERSION,
+        _REDIS_LIB,
+        _HAS_ORJSON,
+        CONFIG.queue_name,
+        CONFIG.dead_letter_queue,
+        CONFIG.cpu_workers,
     )
 
-    tasks: List[asyncio.Task[Any]] = []
+    # v4.3.0: create the shutdown event INSIDE the running loop, not at
+    # module import time (which could bind to a different loop).
+    shutdown = asyncio.Event()
+
+    # v4.3.0: use loop signal handlers where possible; fall back to
+    # signal.signal() on platforms that don't support add_signal_handler
+    # (e.g. Windows).
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, shutdown.set)
+        except (NotImplementedError, RuntimeError, AttributeError):
+            # Windows / non-main-thread — fall back to signal.signal()
+            try:
+                signal.signal(sig, lambda *_: shutdown.set())
+            except Exception:
+                pass
+
+    tasks: List[asyncio.Task] = []
     if _REDIS_AVAILABLE and CONFIG.redis_url:
         logger.info("Redis available. Polling queue=%s", CONFIG.queue_name)
-        tasks.append(asyncio.create_task(_poll_redis_queue(CONFIG.redis_url), name="redis-poller"))
+        tasks.append(
+            asyncio.create_task(
+                _poll_redis_queue(CONFIG.redis_url, shutdown), name="redis-poller"
+            )
+        )
     else:
-        message = "Redis not available or REDIS_URL is empty. Worker is in idle mode."
+        message = (
+            "Redis not available or REDIS_URL is empty. Worker is in idle mode."
+        )
         if CONFIG.fail_fast_if_no_redis:
             logger.error(message)
             return 2
         logger.warning(message)
-        tasks.append(asyncio.create_task(_idle_loop(), name="idle-loop"))
+        tasks.append(
+            asyncio.create_task(_idle_loop(shutdown), name="idle-loop")
+        )
 
-    await SHUTDOWN_EVENT.wait()
+    await shutdown.wait()
     logger.info("Shutdown signal received. Draining tasks...")
 
     for task in tasks:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
 
-    try:
-        _CPU_EXECUTOR.shutdown(wait=False, cancel_futures=True)
-    except TypeError:
-        _CPU_EXECUTOR.shutdown(wait=False)
+    _shutdown_executor()
     logger.info("Worker stopped cleanly")
     return 0
-
-
-def _handle_signal(sig: int, _frame: Any) -> None:
-    logger.info("Signal %s received. Initiating graceful shutdown...", sig)
-    SHUTDOWN_EVENT.set()
 
 
 def main() -> None:
@@ -650,18 +1018,30 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
-
     try:
         raise SystemExit(asyncio.run(main_async(args)))
     except KeyboardInterrupt:
+        _shutdown_executor()
         raise SystemExit(130)
     except SystemExit:
+        _shutdown_executor()
         raise
     except Exception as e:
         logger.exception("Fatal worker crash: %s", e)
+        _shutdown_executor()
         raise SystemExit(1)
+
+
+__all__ = [
+    "SCRIPT_VERSION",
+    "SERVICE_VERSION",
+    "WorkerConfig",
+    "CONFIG",
+    "FullJitterBackoff",
+    "TraceContext",
+    "main_async",
+    "main",
+]
 
 
 if __name__ == "__main__":
