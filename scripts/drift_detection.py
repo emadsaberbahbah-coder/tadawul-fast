@@ -2,57 +2,81 @@
 # scripts/drift_detection.py
 """
 ================================================================================
-TADAWUL FAST BRIDGE – ML MODEL DRIFT DETECTOR (v4.2.0)
+TADAWUL FAST BRIDGE — ML MODEL DRIFT DETECTOR (v4.3.0)
 ================================================================================
 QUANTUM EDITION | ISOLATION FOREST | KS/PSI | SAFE OTEL | SAMA AUDIT SIGNATURE
 
-Fixes & upgrades in v4.2.0
-- FIX CRITICAL: Was always running on synthetic mock data when --baseline and
-  --current file paths were not provided. Added --mode argument with 3 options:
-    mock  — synthetic data (previous default behaviour, now explicit)
-    file  — load from --baseline / --current paths (CSV/JSON/Parquet)
-    live  — pull real data from Google Sheets via DEFAULT_SPREADSHEET_ID.
-             Uses integrations.google_sheets_service.get_rows_for_sheet() to
-             read the live schema pages (Market_Leaders, Global_Markets, etc.)
-             and compares the last N rows against a stored baseline snapshot.
-- FIX: --mode defaults to 'mock' ONLY if no source data is discoverable.
-       If DRIFT_BASELINE_PATH / DRIFT_CURRENT_PATH env vars are set it uses
-       file mode automatically. If DEFAULT_SPREADSHEET_ID is set it uses live
-       mode automatically unless --mode is overridden.
-- FIX: env-var data source: DRIFT_BASELINE_PATH / DRIFT_CURRENT_PATH for
-       headless/cron operation without CLI arguments.
-- ENH: _load_from_live_source() fetches from Google Sheets using the existing
-       google_sheets_service module (works with our v5.5.3 version).
-- ENH: Added DRIFT_SOURCE_PAGES env var to specify which schema pages to
-       compare (default: Market_Leaders,Global_Markets,Mutual_Funds).
+Why this revision (v4.3.0 vs v4.2.0)
+-------------------------------------
+- 🔑 FIX CRITICAL: `_load_from_live_source` probed
+     `integrations.google_sheets_service.get_rows_for_sheet` /
+     `read_rows_for_sheet` / `get_sheet_rows`. Per
+     `google_sheets_service v5.5.3`'s `__all__`, none of those functions
+     are public — the module exposes `read_range()`, `read_ranges_batch()`,
+     `refresh_sheet_with_*`, etc., but NO row-oriented reader.
+     v4.2.0 would therefore log "google_sheets_service has no
+     get_rows_for_sheet — skipping" for every page, collect zero rows,
+     and exit with "No live data loaded from Google Sheets."
+     v4.3.0 uses `core.data_engine.get_sheet_rows(sheet, limit, ...)` as
+     the canonical async reader (matches `data_engine v6.x __all__` and
+     `core.data_engine_v2 v7` which uses the same discovery contract),
+     with fallbacks to `core.data_engine_v2.get_sheet_rows`, then
+     `google_sheets_service.read_range()` as a last resort.
 
-Fixes & upgrades in v4.1.0
-- Fix OTEL bug: start_as_current_span() returns a context manager, not a span
-- Robust optional-ML handling (runs even if SciPy/Sklearn are missing)
-- Safer PSI (quantile buckets, avoids divide-by-zero, handles constant arrays)
-- Signed audit log entry (HMAC-SHA256) with canonical JSON
-- Baseline/current loading from CSV/Parquet (optional)
-- Slack/Webhook alert hardened (timeout + silent fail if aiohttp missing)
+- 🔑 FIX HIGH: v4.2.0 called `reader(page, spreadsheet_id, limit=limit)`
+     with `spreadsheet_id` as a positional 2nd arg. Per
+     `core.data_engine_v2 v7._call_rows_reader`, the canonical signature
+     variants are `(sheet=..., limit=...)` / `(sheet_name=..., limit=...)`
+     / `(page=..., limit=...)` — none accept `spreadsheet_id` positional.
+     v4.3.0 invokes the canonical signature correctly and lets the reader
+     module resolve `spreadsheet_id` internally via its default config.
 
-Core Capabilities
-- Concept drift detection: KS-test (if available), PSI, Wasserstein (if available)
-- Regime anomaly: IsolationForest (if available)
-- Signed audit record for alerts/events (SAMA-style integrity)
+- FIX: Module discovery in live mode is cached ONCE at function entry
+     instead of re-importing inside the per-page loop.
+
+- FIX: `_TRUTHY` / `_FALSY` realigned to exact `main._TRUTHY` / `_FALSY`
+     vocabulary. Added `_env_bool` helper. Matches `cleanup_cache.py v4.1.0`
+     and `audit_data_quality.py v4.5.0`.
+
+- FIX: `SERVICE_VERSION = SCRIPT_VERSION` alias (cross-script consistency).
+
+- FIX: `_CPU_EXECUTOR.shutdown()` wrapped in `try/finally` in main_async
+     AND main. Leak-proof on all exception paths.
+
+- FIX: `_shutdown_executor(wait)` idempotent helper (matches
+     `audit_data_quality.py v4.5.0` / `cleanup_cache.py v4.1.0`).
+
+- FIX: Mock data generation uses a local `np.random.default_rng(42)`
+     instead of `np.random.seed(42)` which pollutes the global state.
+
+- FIX: Live-mode bootstrap (first run with no snapshot) now SKIPS analysis
+     after saving the baseline snapshot. v4.2.0 ran full KS/PSI analysis on
+     baseline == current, producing an all-zeros report which is misleading.
+
+- KEEP: All 4.2.0 CLI flags (`--mode`, `--baseline`, `--current`,
+     `--spreadsheet-id`, `--source-pages`, `--baseline-snapshot`,
+     `--features`, `--no-audit`, `--force-drift`). All env var semantics.
+     Auto-detect logic for `_resolve_mode_and_sources`. PSI / KS /
+     Wasserstein / IsolationForest analysis. HMAC SAMA audit signing.
+     Slack webhook. TraceContext OTEL. File loading (.csv/.json/.parquet).
 
 Modes
+-----
     mock  python drift_detection.py --mode mock --force-drift
     file  python drift_detection.py --mode file --baseline b.csv --current c.csv
     live  python drift_detection.py --mode live --source-pages Market_Leaders,Global_Markets
 
 Env vars (for headless/cron)
+----------------------------
     DRIFT_MODE                mock|file|live  (default: auto-detect)
     DRIFT_BASELINE_PATH       file path for baseline dataset
     DRIFT_CURRENT_PATH        file path for current dataset
     DEFAULT_SPREADSHEET_ID    Google Sheets ID (for live mode)
     DRIFT_SOURCE_PAGES        comma-separated sheet tabs for live mode
-    DRIFT_BASELINE_SNAPSHOT   JSON file for live-mode baseline cache
+    DRIFT_BASELINE_SNAPSHOT   JSON/CSV file for live-mode baseline cache
     DRIFT_SLACK_WEBHOOK       Slack webhook URL
     DRIFT_AUDIT_SECRET        HMAC signing secret
+    CORE_TRACING_ENABLED      enable OTEL spans
 ================================================================================
 """
 
@@ -63,6 +87,8 @@ import asyncio
 import concurrent.futures
 import hashlib
 import hmac
+import importlib
+import inspect
 import logging
 import math
 import os
@@ -99,6 +125,34 @@ except Exception:
         return json.loads(data)
 
     _HAS_ORJSON = False
+
+# ---------------------------------------------------------------------------
+# Version
+# ---------------------------------------------------------------------------
+SCRIPT_VERSION = "4.3.0"
+SERVICE_VERSION = SCRIPT_VERSION  # v4.3.0: cross-script alias
+
+# ---------------------------------------------------------------------------
+# Project-wide truthy/falsy vocabulary (matches main._TRUTHY / _FALSY)
+# ---------------------------------------------------------------------------
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
+_FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Project-aligned env bool parser."""
+    try:
+        raw = (os.getenv(name, "") or "").strip().lower()
+    except Exception:
+        return bool(default)
+    if not raw:
+        return bool(default)
+    if raw in _TRUTHY:
+        return True
+    if raw in _FALSY:
+        return False
+    return bool(default)
+
 
 # ---------------------------------------------------------------------------
 # Optional ML stack
@@ -156,18 +210,15 @@ except Exception:
     StatusCode = None  # type: ignore
     _OTEL_AVAILABLE = False
 
-_TRACING_ENABLED = (os.getenv("CORE_TRACING_ENABLED", "") or "").strip().lower() in {
-    "1", "true", "yes", "y", "on"
-}
+_TRACING_ENABLED = _env_bool("CORE_TRACING_ENABLED", False)
 
 
 class TraceContext:
     """
     Safe OTEL context wrapper.
 
-    IMPORTANT:
-    tracer.start_as_current_span() returns a context manager.
-    We must enter it to obtain the span instance.
+    tracer.start_as_current_span() returns a context manager; we must
+    enter it to obtain the span instance.
     """
 
     def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
@@ -217,8 +268,6 @@ class TraceContext:
 # =============================================================================
 # Core Configuration & Logging
 # =============================================================================
-SCRIPT_VERSION = "4.2.0"
-
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)8s | %(name)s | %(message)s",
@@ -231,10 +280,30 @@ _CPU_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
 )
 
 
+def _shutdown_executor(wait: bool = False) -> None:
+    """Idempotent shutdown helper. Safe to call multiple times."""
+    try:
+        _CPU_EXECUTOR.shutdown(wait=wait, cancel_futures=True)
+    except TypeError:
+        # python < 3.9 fallback
+        try:
+            _CPU_EXECUTOR.shutdown(wait=wait)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+async def _maybe_await(x: Any) -> Any:
+    """Project-aligned awaitable probe via inspect.isawaitable."""
+    if inspect.isawaitable(x):
+        return await x
+    return x
+
+
 # =============================================================================
 # Enums and Data Models
 # =============================================================================
-
 class DriftSeverity(str, Enum):
     NONE = "none"
     WARNING = "warning"
@@ -282,9 +351,8 @@ class ModelDriftReport:
 
 
 # =============================================================================
-# Full Jitter Exponential Backoff
+# Full Jitter Exponential Backoff (kept for future retry paths)
 # =============================================================================
-
 class FullJitterBackoff:
     def __init__(
         self,
@@ -320,7 +388,6 @@ class FullJitterBackoff:
 # =============================================================================
 # Utility: Signed audit log entry (HMAC)
 # =============================================================================
-
 def _audit_secret() -> bytes:
     s = (os.getenv("DRIFT_AUDIT_SECRET") or os.getenv("AUDIT_SECRET") or "").strip()
     if not s:
@@ -338,7 +405,6 @@ def sign_audit(payload: Dict[str, Any]) -> Dict[str, Any]:
 # =============================================================================
 # Drift Core
 # =============================================================================
-
 def _to_np(x: Any) -> "np.ndarray":
     return np.asarray(x, dtype=float)  # type: ignore
 
@@ -516,7 +582,6 @@ def analyze_model_drift(
 # =============================================================================
 # Webhook Alerting
 # =============================================================================
-
 async def send_slack_alert(
     webhook_url: str,
     report: ModelDriftReport,
@@ -549,9 +614,8 @@ async def send_slack_alert(
 
 
 # =============================================================================
-# Data loading
+# File-based data loading
 # =============================================================================
-
 def _load_df(path: str) -> "pd.DataFrame":
     p = Path(path)
     if not p.exists():
@@ -566,11 +630,192 @@ def _load_df(path: str) -> "pd.DataFrame":
     raise ValueError(f"Unsupported file type: {suf} (use .csv/.json/.parquet)")
 
 
-# FIX v4.2.0: Live data source loader.
-# Pulls real rows from Google Sheets using integrations.google_sheets_service,
-# which is the module we maintain at v5.5.3. Uses get_rows_for_sheet() — the
-# method specifically added to that module for external reader discovery.
-def _load_from_live_source(
+# =============================================================================
+# Live data source loader (v4.3.0: canonical core.data_engine.get_sheet_rows)
+# =============================================================================
+# v4.2.0 probed `integrations.google_sheets_service.get_rows_for_sheet` which
+# does not exist in that module's `__all__`. The canonical rows-fetching API
+# is `core.data_engine.get_sheet_rows(sheet, limit, ...)` (async) per
+# `data_engine v6.x __all__`. v4.3.0 uses it, with fallbacks.
+# =============================================================================
+
+@dataclass(slots=True)
+class _LiveReaderInfo:
+    """Records which module + function succeeded on first probe."""
+    module_path: str = ""
+    function_name: str = ""
+    is_async: bool = False
+    source: str = ""  # "engine_v1" | "engine_v2" | "sheets_raw"
+
+
+async def _discover_engine_reader() -> Optional[Tuple[_LiveReaderInfo, Callable]]:
+    """
+    Probe `core.data_engine.get_sheet_rows` first, then
+    `core.data_engine_v2.get_sheet_rows`.
+    Both are async per their `__all__` definitions.
+    """
+    for mod_path, source_label in (
+        ("core.data_engine", "engine_v1"),
+        ("core.data_engine_v2", "engine_v2"),
+    ):
+        try:
+            mod = importlib.import_module(mod_path)
+        except Exception as e:
+            logger.debug("drift live reader: %s import failed: %s", mod_path, e)
+            continue
+
+        fn = getattr(mod, "get_sheet_rows", None)
+        if callable(fn):
+            info = _LiveReaderInfo(
+                module_path=mod_path,
+                function_name="get_sheet_rows",
+                is_async=inspect.iscoroutinefunction(fn),
+                source=source_label,
+            )
+            return info, fn
+
+        # Also probe sync variant
+        fn_sync = getattr(mod, "get_sheet_rows_sync", None)
+        if callable(fn_sync):
+            info = _LiveReaderInfo(
+                module_path=mod_path,
+                function_name="get_sheet_rows_sync",
+                is_async=False,
+                source=source_label,
+            )
+            return info, fn_sync
+
+    return None
+
+
+def _extract_rows_from_engine_payload(payload: Any) -> List[Dict[str, Any]]:
+    """
+    core.data_engine.get_sheet_rows returns a dict with keys like
+    `rows`, `data`, `items`, `records`, `quotes` — all the same list of
+    dict-rows. Extract in priority order.
+    """
+    if payload is None:
+        return []
+    if isinstance(payload, list):
+        return [r for r in payload if isinstance(r, dict)]
+    if isinstance(payload, dict):
+        for key in ("rows", "data", "items", "records", "quotes"):
+            seq = payload.get(key)
+            if isinstance(seq, list) and seq and isinstance(seq[0], dict):
+                return [r for r in seq if isinstance(r, dict)]
+    return []
+
+
+async def _call_engine_reader(
+    fn: Callable,
+    info: _LiveReaderInfo,
+    sheet: str,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """Invoke get_sheet_rows with canonical kw-first signature."""
+    attempts: Tuple[Tuple[Tuple, Dict[str, Any]], ...] = (
+        ((), {"sheet": sheet, "limit": limit}),
+        ((), {"sheet_name": sheet, "limit": limit}),
+        ((), {"page": sheet, "limit": limit}),
+        ((sheet,), {"limit": limit}),
+        ((sheet,), {}),
+    )
+
+    for args, kwargs in attempts:
+        try:
+            if info.is_async:
+                result = await fn(*args, **kwargs)
+            else:
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(
+                    _CPU_EXECUTOR, lambda: fn(*args, **kwargs)
+                )
+                result = await _maybe_await(result)
+
+            rows = _extract_rows_from_engine_payload(result)
+            if rows:
+                return rows
+            # Empty but successful → return empty (sheet has no data)
+            return []
+        except TypeError:
+            # Signature mismatch — try next variant
+            continue
+        except Exception as e:
+            logger.warning(
+                "drift live reader: %s.%s failed on %s: %s",
+                info.module_path, info.function_name, sheet, e,
+            )
+            return []
+
+    return []
+
+
+async def _fallback_read_range(
+    spreadsheet_id: str,
+    page: str,
+    limit: int,
+) -> List[Dict[str, Any]]:
+    """
+    Last-resort fallback: use `google_sheets_service.read_range()` to pull
+    raw cell values for `<page>!A1:CC<limit+1>`, then manually extract
+    headers from row 0 and build dict-rows.
+    """
+    mod = None
+    for mod_path in (
+        "integrations.google_sheets_service",
+        "core.integrations.google_sheets_service",
+        "google_sheets_service",
+        "core.google_sheets_service",
+    ):
+        try:
+            mod = importlib.import_module(mod_path)
+            break
+        except Exception:
+            continue
+
+    if mod is None:
+        return []
+
+    read_range = getattr(mod, "read_range", None)
+    if not callable(read_range):
+        return []
+
+    # Build A1 range: up to 81 columns (AA..CC) is safe for 80-col sheets.
+    end_col = "CC"
+    max_rows = max(2, int(limit) + 1)  # +1 for header
+    range_str = f"{page}!A1:{end_col}{max_rows}"
+
+    loop = asyncio.get_running_loop()
+    try:
+        grid = await loop.run_in_executor(
+            _CPU_EXECUTOR,
+            lambda: read_range(spreadsheet_id, range_str),
+        )
+    except Exception as e:
+        logger.warning("drift live reader raw fallback failed for %s: %s", page, e)
+        return []
+
+    if not isinstance(grid, list) or len(grid) < 2:
+        return []
+
+    headers_row = grid[0]
+    if not isinstance(headers_row, list):
+        return []
+
+    headers = [str(h).strip() if h is not None else "" for h in headers_row]
+    dict_rows: List[Dict[str, Any]] = []
+    for row in grid[1:]:
+        if not isinstance(row, list):
+            continue
+        padded = list(row) + [None] * max(0, len(headers) - len(row))
+        padded = padded[: len(headers)]
+        dict_rows.append(
+            {headers[i]: padded[i] for i in range(len(headers)) if headers[i]}
+        )
+    return dict_rows
+
+
+async def _load_from_live_source(
     pages: List[str],
     spreadsheet_id: str,
     *,
@@ -578,56 +823,54 @@ def _load_from_live_source(
     numeric_cols: Optional[List[str]] = None,
 ) -> "pd.DataFrame":
     """
-    Pull live data from Google Sheets schema pages and return a numeric DataFrame.
-    Only float-coercible columns are retained for drift analysis.
+    Pull live data from Google Sheets via `core.data_engine.get_sheet_rows`
+    and return a numeric-only DataFrame.
     """
     if pd is None or np is None:
         raise ImportError("pandas and numpy are required for live data loading")
 
+    # v4.3.0: discover reader ONCE, cache for all pages.
+    reader_bundle = await _discover_engine_reader()
     rows_all: List[Dict[str, Any]] = []
-    for page in pages:
-        try:
-            mod = None
-            for mod_path in (
-                "integrations.google_sheets_service",
-                "core.integrations.google_sheets_service",
-                "google_sheets_service",
-            ):
-                try:
-                    import importlib
-                    mod = importlib.import_module(mod_path)
-                    break
-                except Exception:
-                    continue
 
-            if mod is None:
-                logger.warning(
-                    "Cannot import google_sheets_service — skipping live page %s", page
-                )
-                continue
+    if reader_bundle is not None:
+        info, fn = reader_bundle
+        logger.info(
+            "Live reader: %s.%s (source=%s, async=%s)",
+            info.module_path, info.function_name, info.source, info.is_async,
+        )
+        for page in pages:
+            try:
+                page_rows = await _call_engine_reader(fn, info, page, limit)
+                if page_rows:
+                    rows_all.extend(page_rows)
+                    logger.info("  Live: loaded %d rows from %s", len(page_rows), page)
+                else:
+                    logger.warning("  Live: 0 rows from %s via engine reader", page)
+            except Exception as e:
+                logger.warning("Failed loading live data from %s: %s", page, e)
 
-            reader = (
-                getattr(mod, "get_rows_for_sheet", None)
-                or getattr(mod, "read_rows_for_sheet", None)
-                or getattr(mod, "get_sheet_rows", None)
-            )
-            if not callable(reader):
-                logger.warning(
-                    "google_sheets_service has no get_rows_for_sheet — skipping %s", page
-                )
-                continue
-
-            page_rows = reader(page, spreadsheet_id, limit=limit)
-            if isinstance(page_rows, list):
-                rows_all.extend(page_rows)
-                logger.info("  Live: loaded %d rows from %s", len(page_rows), page)
-        except Exception as e:
-            logger.warning("Failed loading live data from %s: %s", page, e)
+    # Fallback: try raw read_range + manual header extraction
+    if not rows_all:
+        logger.warning(
+            "Engine reader yielded no rows. "
+            "Falling back to google_sheets_service.read_range() for raw cells."
+        )
+        for page in pages:
+            try:
+                page_rows = await _fallback_read_range(spreadsheet_id, page, limit)
+                if page_rows:
+                    rows_all.extend(page_rows)
+                    logger.info("  Live(raw): loaded %d rows from %s", len(page_rows), page)
+            except Exception as e:
+                logger.warning("Raw-fallback failed on %s: %s", page, e)
 
     if not rows_all:
         raise RuntimeError(
             "No live data loaded from Google Sheets. "
-            "Check DEFAULT_SPREADSHEET_ID, GOOGLE_SHEETS_CREDENTIALS, and page names."
+            "Check DEFAULT_SPREADSHEET_ID, credentials, and page names. "
+            "Tried: core.data_engine.get_sheet_rows → core.data_engine_v2.get_sheet_rows → "
+            "google_sheets_service.read_range"
         )
 
     df = pd.DataFrame(rows_all)  # type: ignore
@@ -647,14 +890,18 @@ def _load_from_live_source(
         )
 
     logger.info(
-        "Live data: %d rows × %d numeric columns", len(numeric_df), len(numeric_df.columns)
+        "Live data: %d rows × %d numeric columns",
+        len(numeric_df), len(numeric_df.columns),
     )
     return numeric_df
 
 
+# =============================================================================
+# Mode resolution
+# =============================================================================
 def _resolve_mode_and_sources(args: "argparse.Namespace") -> str:
     """
-    FIX v4.2.0: Determine the data source mode.
+    Determine the data source mode.
 
     Priority:
     1. --mode CLI arg (explicit)
@@ -664,7 +911,7 @@ def _resolve_mode_and_sources(args: "argparse.Namespace") -> str:
        - If DEFAULT_SPREADSHEET_ID is set → live
        - Otherwise → mock (with a clear warning)
     """
-    mode_arg = getattr(args, "mode", "").strip().lower()
+    mode_arg = (getattr(args, "mode", "") or "").strip().lower()
     if mode_arg in ("mock", "file", "live"):
         return mode_arg
 
@@ -696,32 +943,35 @@ def _resolve_mode_and_sources(args: "argparse.Namespace") -> str:
     return "mock"
 
 
-def generate_mock_data(
-    drift: bool = False,
-) -> Tuple["pd.DataFrame", "pd.DataFrame"]:
-    np.random.seed(42)  # type: ignore
+# =============================================================================
+# Mock data generator (v4.3.0: local RNG, no global seed pollution)
+# =============================================================================
+def generate_mock_data(drift: bool = False) -> Tuple["pd.DataFrame", "pd.DataFrame"]:
+    # v4.3.0: np.random.default_rng(seed) creates an isolated generator
+    # and does NOT set the global numpy random state.
+    rng = np.random.default_rng(42)  # type: ignore
     n = 1000
     baseline = pd.DataFrame(  # type: ignore
         {
-            "pe_ratio":   np.random.normal(15, 5, n),      # type: ignore
-            "volatility": np.random.lognormal(0, 0.5, n),  # type: ignore
-            "rsi":        np.random.uniform(30, 70, n),     # type: ignore
+            "pe_ratio":   rng.normal(15, 5, n),
+            "volatility": rng.lognormal(0, 0.5, n),
+            "rsi":        rng.uniform(30, 70, n),
         }
     )
     if drift:
         current = pd.DataFrame(  # type: ignore
             {
-                "pe_ratio":   np.random.normal(25, 8, n),      # type: ignore
-                "volatility": np.random.lognormal(0.5, 0.8, n),  # type: ignore
-                "rsi":        np.random.uniform(30, 70, n),     # type: ignore
+                "pe_ratio":   rng.normal(25, 8, n),
+                "volatility": rng.lognormal(0.5, 0.8, n),
+                "rsi":        rng.uniform(30, 70, n),
             }
         )
     else:
         current = pd.DataFrame(  # type: ignore
             {
-                "pe_ratio":   np.random.normal(15.2, 5.1, n),  # type: ignore
-                "volatility": np.random.lognormal(0.05, 0.52, n),  # type: ignore
-                "rsi":        np.random.uniform(29, 71, n),    # type: ignore
+                "pe_ratio":   rng.normal(15.2, 5.1, n),
+                "volatility": rng.lognormal(0.05, 0.52, n),
+                "rsi":        rng.uniform(29, 71, n),
             }
         )
     return baseline, current
@@ -730,7 +980,6 @@ def generate_mock_data(
 # =============================================================================
 # Orchestrator
 # =============================================================================
-
 async def run_drift_analysis(
     model_name: str,
     baseline_df: "pd.DataFrame",
@@ -806,120 +1055,134 @@ async def main_async(args: argparse.Namespace) -> int:
         logger.error("numpy + pandas are required for drift detection.")
         return 1
 
-    # FIX v4.2.0: Resolve data source mode before loading anything.
-    mode = _resolve_mode_and_sources(args)
-    logger.info("Drift detection mode: %s", mode)
+    exit_code = 0
+    try:
+        # Resolve data source mode BEFORE loading anything.
+        mode = _resolve_mode_and_sources(args)
+        logger.info("Drift detection mode: %s", mode)
 
-    baseline_df: "pd.DataFrame"
-    current_df: "pd.DataFrame"
+        baseline_df: "pd.DataFrame"
+        current_df: "pd.DataFrame"
+        bootstrap_only = False  # v4.3.0: signals first-run snapshot save
 
-    if mode == "file":
-        baseline_path = (
-            getattr(args, "baseline", "") or os.getenv("DRIFT_BASELINE_PATH", "")
-        )
-        current_path = (
-            getattr(args, "current", "") or os.getenv("DRIFT_CURRENT_PATH", "")
-        )
-        if not baseline_path or not current_path:
-            logger.error(
-                "mode=file but no baseline/current paths. "
-                "Provide --baseline + --current or set DRIFT_BASELINE_PATH + DRIFT_CURRENT_PATH."
+        if mode == "file":
+            baseline_path = (
+                getattr(args, "baseline", "") or os.getenv("DRIFT_BASELINE_PATH", "")
             )
-            return 1
-        logger.info("Loading baseline from: %s", baseline_path)
-        logger.info("Loading current from:  %s", current_path)
-        baseline_df = _load_df(baseline_path)
-        current_df = _load_df(current_path)
-
-    elif mode == "live":
-        spreadsheet_id = (
-            getattr(args, "spreadsheet_id", "")
-            or os.getenv("DEFAULT_SPREADSHEET_ID", "")
-            or os.getenv("SPREADSHEET_ID", "")
-        ).strip()
-        if not spreadsheet_id:
-            logger.error(
-                "mode=live but DEFAULT_SPREADSHEET_ID not set. "
-                "Set it in Render env vars or pass --spreadsheet-id."
+            current_path = (
+                getattr(args, "current", "") or os.getenv("DRIFT_CURRENT_PATH", "")
             )
-            return 1
-
-        raw_pages = (
-            getattr(args, "source_pages", "")
-            or os.getenv("DRIFT_SOURCE_PAGES", "")
-            or "Market_Leaders,Global_Markets,Mutual_Funds"
-        )
-        pages = [p.strip() for p in raw_pages.split(",") if p.strip()]
-        logger.info("Loading live data from sheets: %s", pages)
-
-        loop = asyncio.get_running_loop()
-        current_df = await loop.run_in_executor(
-            _CPU_EXECUTOR,
-            lambda: _load_from_live_source(pages, spreadsheet_id, limit=2000),
-        )
-
-        snapshot_path = (
-            getattr(args, "baseline_snapshot", "")
-            or os.getenv("DRIFT_BASELINE_SNAPSHOT", "")
-        ).strip()
-
-        if snapshot_path and Path(snapshot_path).exists():
-            logger.info("Loading baseline snapshot from: %s", snapshot_path)
-            baseline_df = _load_df(snapshot_path)
-            common_cols = [
-                c for c in current_df.columns if c in baseline_df.columns
-            ]
-            if not common_cols:
-                logger.warning(
-                    "Baseline snapshot has no overlapping columns with live data. "
-                    "Saving current as new baseline snapshot and exiting."
+            if not baseline_path or not current_path:
+                logger.error(
+                    "mode=file but no baseline/current paths. "
+                    "Provide --baseline + --current or set "
+                    "DRIFT_BASELINE_PATH + DRIFT_CURRENT_PATH."
                 )
-                current_df.to_csv(snapshot_path, index=False)
-                return 0
-            baseline_df = baseline_df[common_cols]
-            current_df = current_df[common_cols]
-        else:
-            logger.warning(
-                "No baseline snapshot found (DRIFT_BASELINE_SNAPSHOT=%r). "
-                "Using current live data as both baseline and current (first-run bootstrap). "
-                "No drift will be detected this run — a snapshot will be saved to use next time.",
-                snapshot_path or "not set",
+                return 1
+            logger.info("Loading baseline from: %s", baseline_path)
+            logger.info("Loading current from:  %s", current_path)
+            baseline_df = _load_df(baseline_path)
+            current_df = _load_df(current_path)
+
+        elif mode == "live":
+            spreadsheet_id = (
+                getattr(args, "spreadsheet_id", "")
+                or os.getenv("DEFAULT_SPREADSHEET_ID", "")
+                or os.getenv("SPREADSHEET_ID", "")
+            ).strip()
+            if not spreadsheet_id:
+                logger.error(
+                    "mode=live but DEFAULT_SPREADSHEET_ID not set. "
+                    "Set it in the environment or pass --spreadsheet-id."
+                )
+                return 1
+
+            raw_pages = (
+                getattr(args, "source_pages", "")
+                or os.getenv("DRIFT_SOURCE_PAGES", "")
+                or "Market_Leaders,Global_Markets,Mutual_Funds"
             )
-            baseline_df = current_df.copy()
-            if snapshot_path:
-                current_df.to_csv(snapshot_path, index=False)
-                logger.info("Saved baseline snapshot to: %s", snapshot_path)
+            pages = [p.strip() for p in raw_pages.split(",") if p.strip()]
+            logger.info("Loading live data from sheets: %s", pages)
 
-    else:  # mode == "mock"
-        logger.info(
-            "Using synthetic mock data (drift=%s)",
-            bool(getattr(args, "force_drift", False)),
+            current_df = await _load_from_live_source(
+                pages, spreadsheet_id, limit=2000
+            )
+
+            snapshot_path = (
+                getattr(args, "baseline_snapshot", "")
+                or os.getenv("DRIFT_BASELINE_SNAPSHOT", "")
+            ).strip()
+
+            if snapshot_path and Path(snapshot_path).exists():
+                logger.info("Loading baseline snapshot from: %s", snapshot_path)
+                baseline_df = _load_df(snapshot_path)
+                common_cols = [
+                    c for c in current_df.columns if c in baseline_df.columns
+                ]
+                if not common_cols:
+                    logger.warning(
+                        "Baseline snapshot has no overlapping columns with live data. "
+                        "Saving current as new baseline snapshot and exiting."
+                    )
+                    current_df.to_csv(snapshot_path, index=False)
+                    return 0
+                baseline_df = baseline_df[common_cols]
+                current_df = current_df[common_cols]
+            else:
+                # v4.3.0: first-run bootstrap — save snapshot, skip analysis.
+                logger.warning(
+                    "No baseline snapshot found (DRIFT_BASELINE_SNAPSHOT=%r). "
+                    "First-run bootstrap: saving current live data as baseline "
+                    "and SKIPPING analysis. Next run will detect drift.",
+                    snapshot_path or "not set",
+                )
+                baseline_df = current_df.copy()
+                if snapshot_path:
+                    current_df.to_csv(snapshot_path, index=False)
+                    logger.info("Saved baseline snapshot to: %s", snapshot_path)
+                bootstrap_only = True
+
+        else:  # mode == "mock"
+            logger.info(
+                "Using synthetic mock data (drift=%s)",
+                bool(getattr(args, "force_drift", False)),
+            )
+            baseline_df, current_df = generate_mock_data(
+                drift=bool(getattr(args, "force_drift", False))
+            )
+
+        if bootstrap_only:
+            # v4.3.0: don't run analysis on baseline == current (all-zeros noise)
+            logger.info("Bootstrap complete. Run again to detect drift vs saved snapshot.")
+            return 0
+
+        if args.features:
+            cols = [c.strip() for c in args.features.split(",") if c.strip()]
+            keep = [
+                c for c in cols
+                if c in baseline_df.columns and c in current_df.columns
+            ]
+            if keep:
+                baseline_df = baseline_df[keep]
+                current_df = current_df[keep]
+
+        await run_drift_analysis(
+            model_name=args.model_name,
+            baseline_df=baseline_df,
+            current_df=current_df,
+            webhook_url=args.webhook,
+            export_dir=args.export_dir,
+            export_audit=not args.no_audit,
         )
-        baseline_df, current_df = generate_mock_data(
-            drift=bool(getattr(args, "force_drift", False))
-        )
+    except Exception as e:
+        logger.exception("Drift detection failed: %s", e)
+        exit_code = 1
+    finally:
+        # v4.3.0: executor shutdown always runs (even on exceptions)
+        _shutdown_executor(wait=False)
 
-    if args.features:
-        cols = [c.strip() for c in args.features.split(",") if c.strip()]
-        keep = [
-            c for c in cols
-            if c in baseline_df.columns and c in current_df.columns
-        ]
-        if keep:
-            baseline_df = baseline_df[keep]
-            current_df = current_df[keep]
-
-    await run_drift_analysis(
-        model_name=args.model_name,
-        baseline_df=baseline_df,
-        current_df=current_df,
-        webhook_url=args.webhook,
-        export_dir=args.export_dir,
-        export_audit=not args.no_audit,
-    )
-
-    _CPU_EXECUTOR.shutdown(wait=False)
-    return 0
+    return exit_code
 
 
 def main() -> None:
@@ -942,7 +1205,6 @@ def main() -> None:
         "--force-drift", action="store_true",
         help="Force synthetic drift (mock mode only)",
     )
-    # FIX v4.2.0: Explicit mode argument
     parser.add_argument(
         "--mode",
         default=os.getenv("DRIFT_MODE", ""),
@@ -953,33 +1215,35 @@ def main() -> None:
     parser.add_argument(
         "--baseline",
         default=os.getenv("DRIFT_BASELINE_PATH", ""),
-        help="Baseline dataset path (.csv/.json/.parquet). Also: DRIFT_BASELINE_PATH env var.",
+        help="Baseline dataset path (.csv/.json/.parquet). "
+             "Also: DRIFT_BASELINE_PATH env var.",
     )
     parser.add_argument(
         "--current",
         default=os.getenv("DRIFT_CURRENT_PATH", ""),
-        help="Current dataset path (.csv/.json/.parquet). Also: DRIFT_CURRENT_PATH env var.",
+        help="Current dataset path (.csv/.json/.parquet). "
+             "Also: DRIFT_CURRENT_PATH env var.",
     )
     # Live mode
     parser.add_argument(
         "--spreadsheet-id",
         default=os.getenv("DEFAULT_SPREADSHEET_ID", ""),
-        help="Google Sheets spreadsheet ID for live mode. Also: DEFAULT_SPREADSHEET_ID env var.",
+        help="Google Sheets spreadsheet ID for live mode. "
+             "Also: DEFAULT_SPREADSHEET_ID env var.",
     )
     parser.add_argument(
         "--source-pages",
         default=os.getenv(
             "DRIFT_SOURCE_PAGES", "Market_Leaders,Global_Markets,Mutual_Funds"
         ),
-        help="Comma-separated sheet tabs for live mode. Also: DRIFT_SOURCE_PAGES env var.",
+        help="Comma-separated sheet tabs for live mode. "
+             "Also: DRIFT_SOURCE_PAGES env var.",
     )
     parser.add_argument(
         "--baseline-snapshot",
         default=os.getenv("DRIFT_BASELINE_SNAPSHOT", ""),
-        help=(
-            "JSON/CSV path for live-mode baseline cache. "
-            "Also: DRIFT_BASELINE_SNAPSHOT env var."
-        ),
+        help="JSON/CSV path for live-mode baseline cache. "
+             "Also: DRIFT_BASELINE_SNAPSHOT env var.",
     )
     parser.add_argument(
         "--features", default="",
@@ -996,8 +1260,30 @@ def main() -> None:
         sys.exit(asyncio.run(main_async(args)))
     except KeyboardInterrupt:
         logger.info("Drift detection interrupted by user.")
-        _CPU_EXECUTOR.shutdown(wait=False)
+        _shutdown_executor(wait=False)
         sys.exit(130)
+    except Exception:
+        _shutdown_executor(wait=False)
+        raise
+
+
+__all__ = [
+    "SCRIPT_VERSION",
+    "SERVICE_VERSION",
+    "DriftSeverity",
+    "FeatureDriftStat",
+    "ModelDriftReport",
+    "FullJitterBackoff",
+    "TraceContext",
+    "calculate_psi",
+    "detect_feature_drift",
+    "analyze_model_drift",
+    "generate_mock_data",
+    "run_drift_analysis",
+    "sign_audit",
+    "main_async",
+    "main",
+]
 
 
 if __name__ == "__main__":
