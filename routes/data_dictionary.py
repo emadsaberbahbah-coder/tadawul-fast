@@ -2,7 +2,7 @@
 # routes/data_dictionary.py
 """
 ================================================================================
-Schema Router — v2.5.0 (UNIFIED / REGISTRY-FIRST / FORMAT-COMPATIBLE)
+Schema Router — v2.7.0 (UNIFIED / REGISTRY-FIRST / FORMAT-COMPATIBLE)
 ================================================================================
 
 Endpoints
@@ -13,28 +13,56 @@ GET /v1/schema/spec                  (alias of /sheet-spec)
 GET /v1/schema/pages
 GET /v1/schema/health
 
+Canonical-owner note (read first)
+---------------------------------
+Per `main._CONTROLLED_CANONICAL_OWNER_MAP`, the canonical owner of `/v1/schema`
+and `/v1/schema/sheet-spec` is `routes.advanced_analysis`. `routes.data_dictionary`
+is listed in `main._OPTIONAL_ROUTE_MODULES` but NOT in `_CONTROLLED_ROUTE_PLAN`,
+so it is NOT mounted by the controlled mount path. This file is kept as a
+compatibility standby — if mounted directly (outside the controlled plan), it
+will produce a registry-equivalent response surface that matches the canonical
+owner's contract (headers, keys, column counts).
+
 Purpose
 -------
 Single schema router that exposes:
-- authoritative Data_Dictionary output
+- authoritative Data_Dictionary output (canonical 9-column contract)
 - true sheet-spec output (grouped per sheet, never flattened by mistake)
 - supported pages and aliases metadata
 - stable, PowerShell / Apps Script / API-friendly response contracts
 
-Why this revision
------------------
-- ✅ FIX: accepts format=json for backward compatibility in /data-dictionary
-          and /sheet-spec /spec so PowerShell sweeps do not fail with 400
-- ✅ FIX: /v1/schema/sheet-spec works with sheet / page / sheet_name / name /
-          tab / worksheet aliases
-- ✅ FIX: /v1/schema/spec remains a full alias of /sheet-spec
-- ✅ FIX: single-sheet requests always project top-level headers/keys/columns
-- ✅ FIX: grouped all-sheets response is stable and JSON-safe
-- ✅ FIX: registry-first resolution with graceful Data_Dictionary inference fallback
-- ✅ FIX: handles dict-style, object-style, list-style, headers/keys-style schema safely
-- ✅ FIX: safer auth calling across multiple core.config.auth_ok signatures
-- ✅ SAFE: no quote engine / provider / network calls
-- ✅ SAFE: import-hardened for partial repo states
+Why this revision (vs v2.6.0)
+-----------------------------
+- ✅ FIX: `_DATA_DICTIONARY_HEADERS` fallback now matches the canonical Title-Case
+         contract from `core.sheets.schema_registry._data_dictionary_columns()`:
+            Sheet, Group, Header, Key, DType, Format, Required, Source, Notes
+         Previously the fallback used lowercase for BOTH headers and keys,
+         which would corrupt downstream validators (they compare against the
+         registry's Title-Case header row).
+- ✅ FIX: `_DATA_DICTIONARY_KEYS` is now a separate lowercase list (not a
+         copy of headers). Previous `= list(_DATA_DICTIONARY_HEADERS)` made
+         `dtype` appear as `DType` in row dicts when the registry fallback
+         path was hit.
+- ✅ FIX: `_get_request_id` now prefers `request.state.request_id` (set by
+         `main.RequestIDMiddleware`) BEFORE falling back to the X-Request-ID
+         header. v2.6.0 had these reversed, which dropped the middleware's
+         server-generated UUID when the client didn't send a header.
+- ✅ FIX: all JSON responses now echo `X-Request-ID` so clients can
+         correlate. Consistent with `routes.config`, `routes.advanced_analysis`,
+         `routes.investment_advisor`.
+- ✅ FIX: `/sheet-spec` and `/spec` now also accept `page_name` as a query
+         alias (main.py, advanced_analysis, enriched_quote all accept it).
+- ✅ FIX: missing-request fallback id is now a UUID12 instead of the literal
+         string "schema", so per-request logs remain distinguishable.
+- ✅ KEEP: `format=json` backward compatibility on /data-dictionary and
+          /sheet-spec/spec so PowerShell sweeps don't 400.
+- ✅ KEEP: sheet / page / sheet_name / name / tab / worksheet aliases.
+- ✅ KEEP: single-sheet requests always project top-level headers/keys/columns.
+- ✅ KEEP: grouped all-sheets response is stable and JSON-safe.
+- ✅ KEEP: registry-first resolution with Data_Dictionary inference fallback.
+- ✅ KEEP: flexible `auth_ok` multi-signature calling.
+- ✅ SAFE: no quote engine / provider / network calls.
+- ✅ SAFE: import-hardened for partial repo states.
 ================================================================================
 """
 
@@ -42,6 +70,7 @@ from __future__ import annotations
 
 import importlib
 import os
+import uuid
 from datetime import date, datetime, time as dt_time, timezone
 from decimal import Decimal
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -55,12 +84,12 @@ except Exception:  # pragma: no cover
     BestJSONResponse = JSONResponse  # type: ignore
 
 
-SCHEMA_ROUTE_VERSION = "2.6.0"
+SCHEMA_ROUTE_VERSION = "2.7.0"
 router = APIRouter(prefix="/v1/schema", tags=["Schema"])
 
 
 # --------------------------------------------------------------------------------------
-# Canonical fallbacks
+# Canonical fallbacks (used only when core.sheets.* modules are not importable)
 # --------------------------------------------------------------------------------------
 _CANONICAL_PAGES_FALLBACK: List[str] = [
     "Market_Leaders",
@@ -78,7 +107,30 @@ _FORBIDDEN_PAGES_FALLBACK: List[str] = [
     "KSA_Tadawul",
 ]
 
+# FIX v2.7.0: Data_Dictionary canonical contract — matches exactly
+# core.sheets.schema_registry._data_dictionary_columns():
+#   ColumnSpec("Dictionary", "Sheet",    "sheet",    "str",  ..., True)
+#   ColumnSpec("Dictionary", "Group",    "group",    "str",  ..., True)
+#   ColumnSpec("Dictionary", "Header",   "header",   "str",  ..., True)
+#   ColumnSpec("Dictionary", "Key",      "key",      "str",  ..., True)
+#   ColumnSpec("Dictionary", "DType",    "dtype",    "str",  ..., True)
+#   ColumnSpec("Dictionary", "Format",   "fmt",      "str",  ..., False)
+#   ColumnSpec("Dictionary", "Required", "required", "bool", ..., False)
+#   ColumnSpec("Dictionary", "Source",   "source",   "str",  ..., False)
+#   ColumnSpec("Dictionary", "Notes",    "notes",    "str",  ..., False)
 _DATA_DICTIONARY_HEADERS: List[str] = [
+    "Sheet",
+    "Group",
+    "Header",
+    "Key",
+    "DType",
+    "Format",
+    "Required",
+    "Source",
+    "Notes",
+]
+
+_DATA_DICTIONARY_KEYS: List[str] = [
     "sheet",
     "group",
     "header",
@@ -89,8 +141,6 @@ _DATA_DICTIONARY_HEADERS: List[str] = [
     "source",
     "notes",
 ]
-
-_DATA_DICTIONARY_KEYS: List[str] = list(_DATA_DICTIONARY_HEADERS)
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled"}
@@ -131,7 +181,7 @@ _SHEET_SPEC_FORMAT_ALIASES: Dict[str, str] = {
 
 
 # --------------------------------------------------------------------------------------
-# Optional modules (kept defensive)
+# Optional modules (kept defensive, multi-path fallback for partial layouts)
 # --------------------------------------------------------------------------------------
 def _safe_import(module_name: str) -> Any:
     try:
@@ -140,21 +190,18 @@ def _safe_import(module_name: str) -> Any:
         return None
 
 
-# FIX v2.6.0: multi-path fallback for schema_registry
 _schema_registry_mod = None
 for _p in ("core.sheets.schema_registry", "core.schema_registry", "schema_registry"):
     _schema_registry_mod = _safe_import(_p)
     if _schema_registry_mod is not None:
         break
 
-# FIX v2.6.0: multi-path fallback for data_dictionary
 _data_dictionary_mod = None
 for _p in ("core.sheets.data_dictionary", "core.data_dictionary", "data_dictionary"):
     _data_dictionary_mod = _safe_import(_p)
     if _data_dictionary_mod is not None:
         break
 
-# FIX v2.6.0: multi-path fallback for page_catalog
 _page_catalog_mod = None
 for _p in ("core.sheets.page_catalog", "core.page_catalog", "page_catalog"):
     _page_catalog_mod = _safe_import(_p)
@@ -276,17 +323,26 @@ def _normalize_choice(raw: Optional[str], mapping: Dict[str, str], default: str)
 
 
 def _get_request_id(request: Optional[Request]) -> str:
+    """
+    FIX v2.7.0: prefer the request_id set by main.RequestIDMiddleware
+    (stored on request.state). Fall back to the X-Request-ID header only if the
+    middleware didn't set state.request_id. Final fallback is a UUID12 hex.
+    """
     try:
         if request is not None:
-            rid = request.headers.get("X-Request-ID")
-            if rid:
-                return str(rid).strip()
             state_rid = getattr(getattr(request, "state", None), "request_id", None)
             if state_rid:
-                return str(state_rid).strip()
+                s = str(state_rid).strip()
+                if s:
+                    return s
+            rid = request.headers.get("X-Request-ID")
+            if rid:
+                s = str(rid).strip()
+                if s:
+                    return s
     except Exception:
         pass
-    return "schema"
+    return uuid.uuid4().hex[:12]
 
 
 def _dedupe_keep_order(values: Iterable[Any]) -> List[str]:
@@ -374,6 +430,11 @@ def _json_safe(value: Any) -> Any:
         return None
 
 
+def _response_headers(request_id: str) -> Dict[str, str]:
+    """FIX v2.7.0: attach X-Request-ID on every response for client correlation."""
+    return {"X-Request-ID": request_id}
+
+
 def _response(
     *,
     status_code: int,
@@ -391,7 +452,11 @@ def _response(
         "request_id": request_id,
         **content,
     }
-    return BestJSONResponse(status_code=status_code, content=_json_safe(payload))
+    return BestJSONResponse(
+        status_code=status_code,
+        content=_json_safe(payload),
+        headers=_response_headers(request_id),
+    )
 
 
 def _error(status_code: int, message: str, *, endpoint: str, request_id: str) -> BestJSONResponse:
@@ -471,6 +536,9 @@ def _auth_passed(
     except Exception:
         settings = None
 
+    # Flexible dispatch — matches main._call_auth_ok_flexible /
+    # analysis_sheet_rows._auth_passed / config._call_auth_ok_flexible.
+    # Start with the richest signature and degrade.
     call_attempts = [
         {
             "token": auth_token or None,
@@ -609,11 +677,12 @@ def _resolve_requested_sheet_name(
     sheet: Optional[str] = None,
     page: Optional[str] = None,
     sheet_name: Optional[str] = None,
+    page_name: Optional[str] = None,  # FIX v2.7.0: added project-wide alias
     name: Optional[str] = None,
     tab: Optional[str] = None,
     worksheet: Optional[str] = None,
 ) -> Optional[str]:
-    for candidate in (sheet, page, sheet_name, name, tab, worksheet):
+    for candidate in (sheet, page, sheet_name, page_name, name, tab, worksheet):
         normalized = _normalize_page_candidate(candidate)
         if normalized:
             return normalized
@@ -975,6 +1044,10 @@ def _get_all_sheet_specs() -> Dict[str, Dict[str, Any]]:
 # Data dictionary helpers
 # --------------------------------------------------------------------------------------
 def _get_data_dictionary_headers_and_keys() -> Tuple[List[str], List[str]]:
+    """
+    Prefer the live registry contract. If unavailable, fall back to the canonical
+    9-column Title-Case headers + lowercase keys from v2.7.0.
+    """
     try:
         spec = _get_sheet_spec_safe("Data_Dictionary")
         headers = list(spec["headers"])
@@ -1191,6 +1264,10 @@ def get_schema_health(request: Request) -> BestJSONResponse:
             "inferred_specs_count": len(inferred_specs),
             "fallback_pages_count": len(_CANONICAL_PAGES_FALLBACK),
         },
+        # Note: per main._CONTROLLED_CANONICAL_OWNER_MAP, /v1/schema/* is
+        # canonically owned by routes.advanced_analysis. This router is a
+        # registry-equivalent compatibility standby.
+        canonical_owner="routes.advanced_analysis",
         response_contract={
             "data_dictionary_rows_shape": "headers + keys + rows + rows_matrix",
             "sheet_spec_grouped_shape": "data + optional top-level headers/keys/columns for single sheet",
@@ -1296,6 +1373,7 @@ def _sheet_spec_response(
     sheet: Optional[str],
     page: Optional[str],
     sheet_name: Optional[str],
+    page_name: Optional[str],
     name: Optional[str],
     tab: Optional[str],
     worksheet: Optional[str],
@@ -1325,6 +1403,7 @@ def _sheet_spec_response(
             sheet=sheet,
             page=page,
             sheet_name=sheet_name,
+            page_name=page_name,
             name=name,
             tab=tab,
             worksheet=worksheet,
@@ -1357,6 +1436,7 @@ def _sheet_spec_response(
             "sheet": normalized_sheet,
             "page": normalized_sheet,
             "sheet_name": normalized_sheet,
+            "page_name": normalized_sheet,
             "name": normalized_sheet,
             "tab": normalized_sheet,
             "worksheet": normalized_sheet,
@@ -1412,10 +1492,11 @@ def get_sheet_spec_route(
     request: Request,
     sheet: Optional[str] = Query(
         default=None,
-        description="Optional canonical sheet name or alias. Also accepts page/sheet_name/name/tab/worksheet aliases.",
+        description="Optional canonical sheet name or alias. Also accepts page/sheet_name/page_name/name/tab/worksheet aliases.",
     ),
     page: Optional[str] = Query(default=None, description="Alias of 'sheet'"),
     sheet_name: Optional[str] = Query(default=None, description="Alias of 'sheet'"),
+    page_name: Optional[str] = Query(default=None, description="Alias of 'sheet'"),  # FIX v2.7.0
     name: Optional[str] = Query(default=None, description="Alias of 'sheet'"),
     tab: Optional[str] = Query(default=None, description="Alias of 'sheet'"),
     worksheet: Optional[str] = Query(default=None, description="Alias of 'sheet'"),
@@ -1437,6 +1518,7 @@ def get_sheet_spec_route(
         sheet=sheet,
         page=page,
         sheet_name=sheet_name,
+        page_name=page_name,
         name=name,
         tab=tab,
         worksheet=worksheet,
@@ -1453,10 +1535,11 @@ def get_spec_alias_route(
     request: Request,
     sheet: Optional[str] = Query(
         default=None,
-        description="Optional canonical sheet name or alias. Also accepts page/sheet_name/name/tab/worksheet aliases.",
+        description="Optional canonical sheet name or alias. Also accepts page/sheet_name/page_name/name/tab/worksheet aliases.",
     ),
     page: Optional[str] = Query(default=None, description="Alias of 'sheet'"),
     sheet_name: Optional[str] = Query(default=None, description="Alias of 'sheet'"),
+    page_name: Optional[str] = Query(default=None, description="Alias of 'sheet'"),  # FIX v2.7.0
     name: Optional[str] = Query(default=None, description="Alias of 'sheet'"),
     tab: Optional[str] = Query(default=None, description="Alias of 'sheet'"),
     worksheet: Optional[str] = Query(default=None, description="Alias of 'sheet'"),
@@ -1478,6 +1561,7 @@ def get_spec_alias_route(
         sheet=sheet,
         page=page,
         sheet_name=sheet_name,
+        page_name=page_name,
         name=name,
         tab=tab,
         worksheet=worksheet,
