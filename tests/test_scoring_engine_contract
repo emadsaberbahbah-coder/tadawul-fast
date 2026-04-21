@@ -2,31 +2,85 @@
 """
 tests/test_scoring_engine_contract.py
 ================================================================================
-Scoring Engine Contract Tests — v2.0.0
+Scoring Engine Contract Tests — v2.1.0
 ================================================================================
 
-What this test suite enforces
-------------------------------
+Why this revision (v2.1.0 vs v2.0.0)
+-------------------------------------
+- FIX: `test_scoring_all_exports` now checks every name in `scoring.__all__`,
+    not just a subset. v2.0.0 missed `assign_rank_overall`,
+    `ForecastParameters`, `ScoringEngine`, `DEFAULT_FORECASTS`, `score_quote`,
+    `ScoringWeights`, `__version__`.
+- FIX: Added `test_score_quote_alias` — actual scoring.py exposes THREE
+    aliases (compute_scores / score_row / score_quote) but v2.0.0 only
+    tested score_row.
+- FIX: Added `test_scoring_weights_alias` — documented compat alias
+    `ScoringWeights = ScoreWeights` was unchecked.
+- FIX: Added `test_default_forecasts_instantiable` — `DEFAULT_FORECASTS` is
+    exported from `__all__` but v2.0.0 never exercised it.
+- FIX: Added `test_asset_scores_to_dict_returns_all_fields` — v2.0.0's
+    check only verified 3 keys out of 30+, letting silent field deletion
+    regressions through.
+- FIX: Added `test_overall_score_raw_bounds` and
+    `test_overall_penalty_factor_bounds` — v2.0.0 tested float-ness via
+    SCORE_FLOAT_FIELDS but never the semantic bounds. `overall_score_raw`
+    must be in [0, 100], `overall_penalty_factor` must be in [0, 1].
+- FIX: Added `test_compute_scores_does_not_mutate_input` — defensive
+    check that `compute_scores({...})` doesn't touch the caller's dict.
+- FIX: Added `test_score_and_rank_rows_does_not_mutate_input_by_default`
+    — `score_and_rank_rows` defaults to `inplace=False`; verify it.
+- 🔑 FIX CORRECTNESS: `test_rank_rows_by_overall_ordering` (renamed to
+    `test_rank_rows_by_overall_assigns_rank_field`) in v2.0.0 asserted
+    that the output list was sorted descending. But scoring.py v2.2.0's
+    actual implementation preserves input order and only assigns
+    `rank_overall` to each row. The v2.0.0 test would fail against the
+    real scoring module. v2.1.0 rewrites it to verify the correct
+    contract: order preserved, rank_overall reflects sorted-desc position.
+- 🔑 FIX CORRECTNESS: `test_assign_rank_overall_adds_rank` in v2.0.0 used
+    `enumerate(ranked, start=1)` and asserted `rank_overall == idx`,
+    which only holds if the input is already sorted desc. But
+    `_make_rows(3)` produces ascending scores (0, 10, 20), so position-0
+    gets rank 3 (lowest), not rank 1. v2.1.0 fixes the assertion to
+    match the actual score-to-rank mapping.
+- FIX: Added `test_assign_rank_overall_rank_contiguous` — verifies that
+    assigned ranks form a contiguous {1..N} set with no duplicates/gaps.
+- FIX: Added `test_assign_rank_overall_inplace_false_copies` — v2.0.0
+    only tested the default `inplace=True` path.
+- FIX: Added `test_scoring_engine_enrich_with_scores` — the engine
+    wrapper exposes BOTH `compute_scores` and `enrich_with_scores`;
+    v2.0.0 only tested the first.
+- FIX: Added `test_rank_rows_by_overall_empty_input` — empty-list edge
+    case for the standalone ranker (v2.0.0 only tested
+    `score_and_rank_rows([])`).
+- FIX: Added `test_expected_return_fields_are_fractions` — covers
+    `expected_return_1m/3m/12m` (same shape as `expected_roi_*`) which
+    v2.0.0 missed.
+- FIX: Dead imports removed (`inspect`, `Sequence`).
+
+What this test suite enforces (scope unchanged from v2.0.0)
+------------------------------------------------------------
 1) scoring module is importable from the expected paths
-2) SCORING_VERSION is present and semver-shaped
-3) compute_scores / score_row / enrich_with_scores are callable
+2) SCORING_VERSION / __version__ present and semver-shaped
+3) compute_scores / score_row / score_quote / enrich_with_scores callable
 4) AssetScores dataclass has all required fields
-5) ScoreWeights dataclass has correct default weights
-6) ForecastParameters dataclass is importable
-7) ScoringEngine wrapper is callable (object-style API)
-8) Recommendation vocabulary is canonical (STRONG_BUY/BUY/HOLD/REDUCE/SELL)
+5) ScoreWeights dataclass has correct default weights (sum == 1.0)
+6) ForecastParameters dataclass is importable + DEFAULT_FORECASTS instantiable
+7) ScoringEngine wrapper is callable (compute_scores + enrich_with_scores)
+8) Recommendation vocabulary is canonical
+   (STRONG_BUY/BUY/HOLD/REDUCE/SELL; STRONG_SELL allowed but not emitted)
 9) Risk bucket vocabulary is canonical (Low/Moderate/High)
 10) Confidence bucket vocabulary is canonical (Low/Medium/High)
 11) Score output fields are float in [0, 100] when present
-12) Expected ROI fields are fractions when present (abs <= 1.5 for normal values)
-13) Deterministic: same input → same output
-14) Sparse row (minimal fields): does not raise, returns sensible defaults
-15) Rich row (full instrument data): all score fields populated
-16) rank_rows_by_overall / assign_rank_overall: correct ordering
-17) score_and_rank_rows: end-to-end list scoring
-18) enrich_with_scores: merges scores into the original row dict
+12) overall_penalty_factor is a fraction in [0, 1]
+13) Expected ROI fields are fractions (abs <= 1.5)
+14) Deterministic: same input → same output
+15) compute_scores does NOT mutate its input dict
+16) Sparse row: does not raise, returns sensible defaults
+17) Rich row: all score fields populated
+18) rank_rows_by_overall / assign_rank_overall: correct ordering (+ inplace=False)
+19) score_and_rank_rows: end-to-end list scoring + rank_overall contiguous
 
-Design goals
+Design goals (preserved from v2.0.0)
 - No network calls.
 - No FastAPI / async test infrastructure needed.
 - Compatible with plain pytest.
@@ -36,12 +90,12 @@ Design goals
 from __future__ import annotations
 
 import importlib
-import inspect
 import math
 from dataclasses import fields as dc_fields
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional
 
 import pytest
+
 
 # =============================================================================
 # Scoring module loader — multi-path fallback
@@ -74,9 +128,12 @@ def scoring():
 # =============================================================================
 # Canonical vocabulary constants
 # =============================================================================
+# v2.1.0: STRONG_SELL is allowed as a forward-compat superset; the current
+# `_recommendation` in scoring.py v2.2.0 emits only {STRONG_BUY, BUY, HOLD,
+# REDUCE, SELL}. Tests accept both.
 VALID_RECOMMENDATIONS = {"STRONG_BUY", "BUY", "HOLD", "REDUCE", "SELL", "STRONG_SELL"}
-VALID_RISK_BUCKETS      = {"Low", "Moderate", "High"}
-VALID_CONF_BUCKETS      = {"Low", "Medium", "High"}
+VALID_RISK_BUCKETS = {"Low", "Moderate", "High"}
+VALID_CONF_BUCKETS = {"Low", "Medium", "High"}
 
 # Fields that must exist in every compute_scores() output
 REQUIRED_OUTPUT_KEYS = {
@@ -109,7 +166,7 @@ SCORE_FLOAT_FIELDS = {
     "forecast_confidence",
 }
 
-# ROI / forecast fields expected as fractions
+# Fields that are stored as fractions (not percent points)
 FRACTION_FIELDS = {
     "expected_roi_1m",
     "expected_roi_3m",
@@ -117,7 +174,45 @@ FRACTION_FIELDS = {
     "expected_return_1m",
     "expected_return_3m",
     "expected_return_12m",
-    "forecast_confidence",   # stored as fraction 0.0–1.0
+    "forecast_confidence",
+    # v2.1.0: penalty factor is a multiplicative factor in [0, 1]
+    "overall_penalty_factor",
+}
+
+# v2.1.0: complete AssetScores field set (30 fields)
+# Used by test_asset_scores_to_dict_returns_all_fields
+ASSET_SCORES_ALL_FIELDS = {
+    "valuation_score",
+    "momentum_score",
+    "quality_score",
+    "growth_score",
+    "value_score",
+    "opportunity_score",
+    "confidence_score",
+    "forecast_confidence",
+    "confidence_bucket",
+    "risk_score",
+    "risk_bucket",
+    "overall_score",
+    "overall_score_raw",
+    "overall_penalty_factor",
+    "recommendation",
+    "recommendation_reason",
+    "forecast_price_1m",
+    "forecast_price_3m",
+    "forecast_price_12m",
+    "expected_roi_1m",
+    "expected_roi_3m",
+    "expected_roi_12m",
+    "expected_return_1m",
+    "expected_return_3m",
+    "expected_return_12m",
+    "expected_price_1m",
+    "expected_price_3m",
+    "expected_price_12m",
+    "scoring_updated_utc",
+    "scoring_updated_riyadh",
+    "scoring_errors",
 }
 
 # =============================================================================
@@ -211,12 +306,44 @@ def test_scoring_version_present(scoring):
         assert digits, f"Version part '{part}' contains no digits"
 
 
+def test_scoring_version_and_dunder_match(scoring):
+    """v2.1.0: SCORING_VERSION and __version__ must match if both present."""
+    sv = getattr(scoring, "SCORING_VERSION", None)
+    dv = getattr(scoring, "__version__", None)
+    if sv is not None and dv is not None:
+        assert str(sv) == str(dv), (
+            f"SCORING_VERSION ({sv}) != __version__ ({dv})"
+        )
+
+
 def test_scoring_all_exports(scoring):
-    """All expected public names are exported."""
+    """
+    v2.1.0: Checks every name in scoring.__all__ (not just a subset).
+    v2.0.0 missed: assign_rank_overall, ForecastParameters, ScoringEngine,
+    DEFAULT_FORECASTS, score_quote, ScoringWeights, __version__.
+    """
     required = [
-        "compute_scores", "score_row", "enrich_with_scores",
-        "AssetScores", "ScoreWeights", "DEFAULT_WEIGHTS",
-        "rank_rows_by_overall", "score_and_rank_rows", "SCORING_VERSION",
+        # Core public API
+        "compute_scores",
+        "score_row",
+        "score_quote",          # v2.1.0: added (third alias)
+        "enrich_with_scores",
+        # Ranking
+        "rank_rows_by_overall",
+        "assign_rank_overall",  # v2.1.0: added
+        "score_and_rank_rows",
+        # Dataclasses + wrapper
+        "AssetScores",
+        "ScoreWeights",
+        "ScoringWeights",       # v2.1.0: added (compat alias)
+        "ForecastParameters",   # v2.1.0: added
+        "ScoringEngine",        # v2.1.0: added
+        # Defaults
+        "DEFAULT_WEIGHTS",
+        "DEFAULT_FORECASTS",    # v2.1.0: added
+        # Version
+        "SCORING_VERSION",
+        "__version__",          # v2.1.0: added
     ]
     missing = [name for name in required if not hasattr(scoring, name)]
     assert not missing, f"scoring module missing exports: {missing}"
@@ -259,9 +386,25 @@ def test_asset_scores_to_dict(scoring):
     inst = AssetScores()
     d = inst.to_dict()
     assert isinstance(d, dict)
-    assert "overall_score"    in d
-    assert "recommendation"   in d
-    assert "scoring_errors"   in d
+    assert "overall_score" in d
+    assert "recommendation" in d
+    assert "scoring_errors" in d
+
+
+def test_asset_scores_to_dict_returns_all_fields(scoring):
+    """
+    v2.1.0: Strict check that to_dict() exposes every field in the
+    dataclass (v2.0.0 only verified 3 keys, letting silent regressions pass).
+    """
+    AssetScores = scoring.AssetScores
+    inst = AssetScores()
+    d = inst.to_dict()
+    names = {f.name for f in dc_fields(AssetScores)}
+    missing = names - set(d.keys())
+    assert not missing, (
+        f"AssetScores.to_dict() missing fields: {sorted(missing)}. "
+        "Every dataclass field must appear in the dict representation."
+    )
 
 
 # =============================================================================
@@ -276,13 +419,15 @@ def test_score_weights_default_sum(scoring):
     """Primary score weights sum to 1.0 (allowing tolerance for float arithmetic)."""
     w = scoring.DEFAULT_WEIGHTS
     total = (
-        getattr(w, "w_valuation",  0.0) +
-        getattr(w, "w_momentum",   0.0) +
-        getattr(w, "w_quality",    0.0) +
-        getattr(w, "w_growth",     0.0) +
-        getattr(w, "w_opportunity",0.0)
+        getattr(w, "w_valuation", 0.0)
+        + getattr(w, "w_momentum", 0.0)
+        + getattr(w, "w_quality", 0.0)
+        + getattr(w, "w_growth", 0.0)
+        + getattr(w, "w_opportunity", 0.0)
     )
-    assert abs(total - 1.0) < 1e-6, f"ScoreWeights primary fields sum to {total}, expected 1.0"
+    assert abs(total - 1.0) < 1e-6, (
+        f"ScoreWeights primary fields sum to {total}, expected 1.0"
+    )
 
 
 def test_score_weights_each_positive(scoring):
@@ -301,8 +446,37 @@ def test_score_weights_penalty_bounds(scoring):
             assert 0.0 <= val <= 1.0, f"ScoreWeights.{name} = {val} out of [0,1]"
 
 
+def test_scoring_weights_alias(scoring):
+    """
+    v2.1.0: `ScoringWeights` is a documented alias for `ScoreWeights`.
+    """
+    assert scoring.ScoringWeights is scoring.ScoreWeights, (
+        "scoring.ScoringWeights must be an alias of scoring.ScoreWeights "
+        "(see __all__ in scoring.py)."
+    )
+
+
 # =============================================================================
-# 4. compute_scores / score_row / enrich_with_scores contract
+# 4. ForecastParameters + DEFAULT_FORECASTS
+# =============================================================================
+def test_forecast_parameters_is_dataclass(scoring):
+    """v2.1.0: ForecastParameters is exported; must be a dataclass."""
+    FP = scoring.ForecastParameters
+    assert hasattr(FP, "__dataclass_fields__"), "ForecastParameters is not a dataclass"
+
+
+def test_default_forecasts_instantiable(scoring):
+    """v2.1.0: DEFAULT_FORECASTS is exported from __all__."""
+    df = scoring.DEFAULT_FORECASTS
+    assert df is not None
+    # Must be an instance of ForecastParameters
+    assert isinstance(df, scoring.ForecastParameters), (
+        f"DEFAULT_FORECASTS is not a ForecastParameters instance: {type(df)}"
+    )
+
+
+# =============================================================================
+# 5. compute_scores / score_row / score_quote / enrich_with_scores contract
 # =============================================================================
 def test_compute_scores_returns_dict(scoring):
     result = scoring.compute_scores(MINIMAL_ROW)
@@ -321,8 +495,8 @@ def test_compute_scores_score_fields_are_float_or_none(scoring):
         val = result.get(key)
         if val is not None:
             assert isinstance(val, (int, float)), f"Field '{key}' = {val!r} is not numeric"
-            assert not math.isnan(float(val)),   f"Field '{key}' is NaN"
-            assert not math.isinf(float(val)),   f"Field '{key}' is Inf"
+            assert not math.isnan(float(val)), f"Field '{key}' is NaN"
+            assert not math.isinf(float(val)), f"Field '{key}' is Inf"
 
 
 def test_compute_scores_scores_in_0_100(scoring):
@@ -335,6 +509,33 @@ def test_compute_scores_scores_in_0_100(scoring):
             assert 0.0 <= float(val) <= 100.0, (
                 f"Score field '{key}' = {val} is outside [0, 100]"
             )
+
+
+def test_overall_score_raw_bounds(scoring):
+    """
+    v2.1.0: `overall_score_raw` must be in [0, 100] (same as overall_score;
+    only difference is it lacks the risk/confidence penalty applied).
+    """
+    result = scoring.compute_scores(RICH_ROW)
+    val = result.get("overall_score_raw")
+    if val is not None:
+        assert 0.0 <= float(val) <= 100.0, (
+            f"overall_score_raw = {val} is outside [0, 100]"
+        )
+
+
+def test_overall_penalty_factor_bounds(scoring):
+    """
+    v2.1.0: `overall_penalty_factor` is a multiplicative factor in [0, 1].
+    It's the product of risk_pen and conf_pen, both clamped to [0, 1].
+    """
+    result = scoring.compute_scores(RICH_ROW)
+    val = result.get("overall_penalty_factor")
+    if val is not None:
+        assert 0.0 <= float(val) <= 1.0, (
+            f"overall_penalty_factor = {val} is outside [0, 1] "
+            "(should be a multiplicative factor)"
+        )
 
 
 def test_compute_scores_forecast_confidence_is_fraction(scoring):
@@ -357,6 +558,20 @@ def test_compute_scores_roi_fields_are_fractions(scoring):
             assert abs(float(val)) <= 1.5, (
                 f"'{key}' = {val} looks like percent points, expected fraction. "
                 "Schema dtype=pct stores fractions (0.085 = 8.5%, not 8.5)."
+            )
+
+
+def test_expected_return_fields_are_fractions(scoring):
+    """
+    v2.1.0: `expected_return_1m/3m/12m` follow the same fraction convention
+    as `expected_roi_*`. v2.0.0 didn't cover these.
+    """
+    result = scoring.compute_scores(RICH_ROW)
+    for key in ("expected_return_1m", "expected_return_3m", "expected_return_12m"):
+        val = result.get(key)
+        if val is not None:
+            assert abs(float(val)) <= 1.5, (
+                f"'{key}' = {val} looks like percent points, expected fraction."
             )
 
 
@@ -395,10 +610,21 @@ def test_score_row_alias(scoring):
     assert r1.get("recommendation") == r2.get("recommendation")
 
 
+def test_score_quote_alias(scoring):
+    """
+    v2.1.0: `score_quote` is the third alias (alongside compute_scores
+    and score_row). v2.0.0 didn't test this one.
+    """
+    r1 = scoring.compute_scores(RICH_ROW)
+    r3 = scoring.score_quote(RICH_ROW)
+    assert r1.get("overall_score") == r3.get("overall_score")
+    assert r1.get("recommendation") == r3.get("recommendation")
+
+
 def test_enrich_with_scores_merges_into_row(scoring):
     base = dict(MINIMAL_ROW)
     enriched = scoring.enrich_with_scores(base)
-    assert "overall_score"  in enriched
+    assert "overall_score" in enriched
     assert "recommendation" in enriched
     assert enriched.get("symbol") == MINIMAL_ROW["symbol"], "Original fields must be preserved"
 
@@ -410,8 +636,29 @@ def test_enrich_with_scores_in_place(scoring):
     assert "overall_score" in base
 
 
+def test_compute_scores_does_not_mutate_input(scoring):
+    """
+    v2.1.0: Defensive invariant — `compute_scores(row)` must not touch the
+    caller's dict. It returns a patch dict; merging is the caller's job.
+    """
+    original = dict(RICH_ROW)
+    snapshot_before = dict(original)
+    _ = scoring.compute_scores(original)
+    # Every key should still have the original value
+    for k, v in snapshot_before.items():
+        assert original.get(k) == v, (
+            f"compute_scores mutated input: key '{k}' changed from {v!r} "
+            f"to {original.get(k)!r}"
+        )
+    # No new keys should have been added either
+    extra_keys = set(original.keys()) - set(snapshot_before.keys())
+    assert not extra_keys, (
+        f"compute_scores added keys to input dict: {extra_keys}"
+    )
+
+
 # =============================================================================
-# 5. Sparse / edge-case inputs
+# 6. Sparse / edge-case inputs
 # =============================================================================
 def test_sparse_row_does_not_raise(scoring):
     result = scoring.compute_scores(SPARSE_ROW)
@@ -443,18 +690,18 @@ def test_inf_nan_prices_handled(scoring):
 
 
 # =============================================================================
-# 6. Determinism
+# 7. Determinism
 # =============================================================================
 def test_compute_scores_is_deterministic(scoring):
     r1 = scoring.compute_scores(RICH_ROW)
     r2 = scoring.compute_scores(RICH_ROW)
-    assert r1.get("overall_score")   == r2.get("overall_score")
-    assert r1.get("recommendation")  == r2.get("recommendation")
-    assert r1.get("risk_score")      == r2.get("risk_score")
+    assert r1.get("overall_score") == r2.get("overall_score")
+    assert r1.get("recommendation") == r2.get("recommendation")
+    assert r1.get("risk_score") == r2.get("risk_score")
 
 
 # =============================================================================
-# 7. Rich row — all score fields populated
+# 8. Rich row — all score fields populated
 # =============================================================================
 def test_rich_row_all_score_fields_populated(scoring):
     """A richly-populated row should produce all component scores."""
@@ -488,7 +735,7 @@ def test_sell_row_lower_than_rich(scoring):
 
 
 # =============================================================================
-# 8. ScoringEngine wrapper
+# 9. ScoringEngine wrapper
 # =============================================================================
 def test_scoring_engine_instantiable(scoring):
     engine = scoring.ScoringEngine()
@@ -502,6 +749,28 @@ def test_scoring_engine_compute_scores(scoring):
     assert "overall_score" in result
 
 
+def test_scoring_engine_enrich_with_scores(scoring):
+    """
+    v2.1.0: ScoringEngine exposes BOTH compute_scores AND enrich_with_scores.
+    v2.0.0 only tested the first.
+    """
+    engine = scoring.ScoringEngine()
+    base = dict(MINIMAL_ROW)
+    enriched = engine.enrich_with_scores(base)
+    assert isinstance(enriched, dict)
+    assert "overall_score" in enriched
+    assert enriched.get("symbol") == MINIMAL_ROW["symbol"]
+
+
+def test_scoring_engine_enrich_with_scores_in_place(scoring):
+    """v2.1.0: ScoringEngine.enrich_with_scores(..., in_place=True)."""
+    engine = scoring.ScoringEngine()
+    base = dict(MINIMAL_ROW)
+    result = engine.enrich_with_scores(base, in_place=True)
+    assert result is base, "in_place=True must return the same dict object"
+    assert "overall_score" in base
+
+
 def test_scoring_engine_version_attr(scoring):
     engine = scoring.ScoringEngine()
     # version attribute should match module version
@@ -510,31 +779,122 @@ def test_scoring_engine_version_attr(scoring):
 
 
 # =============================================================================
-# 9. Ranking functions
+# 10. Ranking functions
 # =============================================================================
 def _make_rows(n: int) -> List[Dict[str, Any]]:
     rows = []
     for i in range(n):
         base = dict(MINIMAL_ROW)
-        base["symbol"]       = f"TICK{i:03d}.SR"
+        base["symbol"] = f"TICK{i:03d}.SR"
         base["overall_score"] = float(i * 10)
         rows.append(base)
     return rows
 
 
-def test_rank_rows_by_overall_ordering(scoring):
-    rows = _make_rows(5)
+def test_rank_rows_by_overall_assigns_rank_field(scoring):
+    """
+    v2.1.0 FIX: Renamed from `test_rank_rows_by_overall_ordering`.
+
+    v2.0.0 incorrectly asserted that `rank_rows_by_overall` RETURNS rows
+    sorted by score descending. But scoring.py v2.2.0's implementation
+    preserves original order and only ASSIGNS `rank_overall` to each row:
+
+        def rank_rows_by_overall(rows, *, key_overall="overall_score"):
+            return assign_rank_overall(rows, ..., inplace=True,
+                                        rank_key="rank_overall")
+            # target is returned in ORIGINAL order; only rank_overall
+            # is computed from sorted-desc position.
+
+    Correct contract: rows stay in original order, but each row carries
+    a `rank_overall` corresponding to its rank when sorted by
+    overall_score descending.
+    """
+    rows = _make_rows(5)  # scores 0, 10, 20, 30, 40 (ascending by construction)
     ranked = scoring.rank_rows_by_overall(rows)
+
+    # Order preserved (NOT reordered)
     scores = [float(r.get("overall_score") or 0) for r in ranked]
-    assert scores == sorted(scores, reverse=True), "rank_rows_by_overall should be descending"
+    assert scores == [0.0, 10.0, 20.0, 30.0, 40.0], (
+        f"rank_rows_by_overall must preserve input order, got scores {scores}"
+    )
+
+    # But rank_overall reflects sorted-descending position
+    # score=40 (index 4) → rank 1 (highest)
+    # score=0  (index 0) → rank 5 (lowest)
+    expected_ranks = [5, 4, 3, 2, 1]
+    actual_ranks = [r.get("rank_overall") for r in ranked]
+    assert actual_ranks == expected_ranks, (
+        f"rank_overall must reflect sorted-desc position. "
+        f"Expected {expected_ranks}, got {actual_ranks}"
+    )
+
+
+def test_rank_rows_by_overall_empty_input(scoring):
+    """v2.1.0: empty-list edge case for the standalone ranker."""
+    result = scoring.rank_rows_by_overall([])
+    assert result == []
 
 
 def test_assign_rank_overall_adds_rank(scoring):
-    rows = _make_rows(3)
+    """
+    v2.1.0 FIX: v2.0.0 used `enumerate(ranked, start=1)` and asserted
+    `rank_overall == idx`, which only holds if the list is already sorted
+    desc by score. But `_make_rows(3)` produces ASCENDING scores (0, 10,
+    20), and `assign_rank_overall` preserves order — so position-0 gets
+    the LOWEST score and thus rank 3, not rank 1.
+
+    Correct contract: rank_overall reflects the row's rank when sorted
+    by overall_score descending, but the output list preserves input
+    order.
+    """
+    rows = _make_rows(3)  # scores 0, 10, 20 (ascending)
     ranked = scoring.assign_rank_overall(rows)
-    for idx, row in enumerate(ranked, start=1):
-        assert row.get("rank_overall") == idx, (
-            f"row {idx}: rank_overall = {row.get('rank_overall')}, expected {idx}"
+    # assign_rank_overall preserves order; each row gets rank by sorted-desc position
+    assert ranked[0].get("rank_overall") == 3, (
+        f"row 0 (score=0, lowest) should have rank 3, "
+        f"got {ranked[0].get('rank_overall')}"
+    )
+    assert ranked[1].get("rank_overall") == 2, (
+        f"row 1 (score=10, middle) should have rank 2, "
+        f"got {ranked[1].get('rank_overall')}"
+    )
+    assert ranked[2].get("rank_overall") == 1, (
+        f"row 2 (score=20, highest) should have rank 1, "
+        f"got {ranked[2].get('rank_overall')}"
+    )
+
+
+def test_assign_rank_overall_rank_contiguous(scoring):
+    """
+    v2.1.0: Regardless of input order, the set of assigned ranks must be
+    {1, 2, ..., N} — no duplicates, no gaps.
+    """
+    rows = _make_rows(7)
+    ranked = scoring.assign_rank_overall(rows)
+    ranks = sorted(r.get("rank_overall") for r in ranked)
+    assert ranks == list(range(1, 8)), (
+        f"Ranks must be contiguous 1..N, got {ranks}"
+    )
+
+
+def test_assign_rank_overall_inplace_false_copies(scoring):
+    """
+    v2.1.0: `assign_rank_overall(..., inplace=False)` must NOT mutate the
+    input rows. v2.0.0 only tested the default inplace=True path.
+    """
+    rows = _make_rows(3)
+    # Snapshot the rows BEFORE ranking
+    snapshots = [dict(r) for r in rows]
+    ranked = scoring.assign_rank_overall(rows, inplace=False)
+    # Returned list should contain new dicts with rank_overall
+    assert all("rank_overall" in r for r in ranked)
+    # Original rows must not have rank_overall (weren't mutated)
+    for original, snap in zip(rows, snapshots):
+        assert "rank_overall" not in original or original.get("rank_overall") == snap.get(
+            "rank_overall"
+        ), (
+            "inplace=False should not mutate input rows, but rank_overall appeared: "
+            f"{original.get('rank_overall')}"
         )
 
 
@@ -564,16 +924,33 @@ def test_score_and_rank_rows_empty_input(scoring):
     assert results == []
 
 
+def test_score_and_rank_rows_does_not_mutate_input_by_default(scoring):
+    """
+    v2.1.0: `score_and_rank_rows` defaults to `inplace=False`. Input rows
+    must not be mutated.
+    """
+    originals = [dict(RICH_ROW), dict(MINIMAL_ROW)]
+    # Snapshot what they look like now
+    snapshots = [dict(r) for r in originals]
+    _ = scoring.score_and_rank_rows(originals)
+    # Original dicts should not have rank_overall or score keys added
+    for idx, (original, snap) in enumerate(zip(originals, snapshots)):
+        assert set(original.keys()) == set(snap.keys()), (
+            f"row {idx}: score_and_rank_rows mutated input dict "
+            f"(keys added: {set(original.keys()) - set(snap.keys())})"
+        )
+
+
 # =============================================================================
-# 10. Settings override
+# 11. Settings override
 # =============================================================================
 def test_custom_weights_accepted(scoring):
     """Passing a custom settings dict must not raise."""
     settings = {
         "score_w_valuation": 0.40,
-        "score_w_momentum":  0.20,
-        "score_w_quality":   0.20,
-        "score_w_growth":    0.10,
+        "score_w_momentum": 0.20,
+        "score_w_quality": 0.20,
+        "score_w_growth": 0.10,
         "score_w_opportunity": 0.10,
     }
     result = scoring.compute_scores(RICH_ROW, settings=settings)
@@ -583,8 +960,11 @@ def test_custom_weights_accepted(scoring):
 
 def test_scoring_engine_custom_weights(scoring):
     sw = scoring.ScoreWeights(
-        w_valuation=0.40, w_momentum=0.20, w_quality=0.20,
-        w_growth=0.10, w_opportunity=0.10,
+        w_valuation=0.40,
+        w_momentum=0.20,
+        w_quality=0.20,
+        w_growth=0.10,
+        w_opportunity=0.10,
     )
     engine = scoring.ScoringEngine(weights=sw)
     result = engine.compute_scores(RICH_ROW)
@@ -593,7 +973,7 @@ def test_scoring_engine_custom_weights(scoring):
 
 
 # =============================================================================
-# 11. scoring_errors field
+# 12. scoring_errors field
 # =============================================================================
 def test_scoring_errors_is_list(scoring):
     result = scoring.compute_scores(SPARSE_ROW)
@@ -608,7 +988,7 @@ def test_scoring_errors_items_are_strings(scoring):
 
 
 # =============================================================================
-# 12. Timestamp fields
+# 13. Timestamp fields
 # =============================================================================
 def test_scoring_timestamps_present(scoring):
     result = scoring.compute_scores(MINIMAL_ROW)
