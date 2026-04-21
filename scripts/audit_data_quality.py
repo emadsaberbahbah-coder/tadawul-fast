@@ -2,20 +2,48 @@
 """
 scripts/audit_data_quality.py
 ================================================================================
-TADAWUL FAST BRIDGE — ENTERPRISE DATA QUALITY AUDITOR (v4.4.0)
+TADAWUL FAST BRIDGE — ENTERPRISE DATA QUALITY AUDITOR (v4.5.0)
 ================================================================================
 Aligned • Production-safe • Engine-compatible • Async-safe exports • Deterministic
 
-What’s improved vs v4.3.0
-- ✅ Stronger timestamp parsing (ISO + common formats + epoch sec/ms)
-- ✅ More robust engine compatibility (dict/list/tuple/None; input-order fallback)
-- ✅ Safer anomaly/issue handling (stable dedupe, consistent enums)
-- ✅ Better export safety (single event-loop per phase, async-safe file I/O)
-- ✅ Cleaner CLI UX (alerts-only, include-ok, json indent, top-N console summary)
+What's improved vs v4.4.0
+- 🔑 FIX CRITICAL: `_get_page_symbols` now correctly handles the DICT payload
+      returned by `integrations.symbols_reader.get_page_symbols(key,
+      spreadsheet_id=...)`. Per the canonical contract of
+      `core.symbols_reader` (re-exported via `integrations.symbols_reader`
+      v3.0.0), `get_page_symbols()` returns
+      `{"symbols": [...], "all": [...], "ksa": [...], "global": [...],
+       "by_type": {...}, "metadata": [...], "status": "...", "error": "..."}`
+      — NOT a plain list. v4.4.0's isinstance(res, (list, tuple, set)) check
+      silently dropped these dict payloads to an empty list, so the auditor
+      reported "No symbols for page=..." for every page on any deployment
+      where `get_symbols_for_page` isn't also exposed as a sync wrapper.
+      v4.5.0 prefers dict["symbols"] then dict["all"] then dict["ksa"+
+      "global"], then falls back to the sibling functions
+      `get_symbols_for_page` / `list_symbols_for_page` / `get_symbols` /
+      `list_symbols` / `read_page_symbols`.
+- FIX: `_TRUTHY` realigned to exact `main._TRUTHY` vocabulary (drops
+      `"active"` outlier). `_FALSY` added for symmetry.
+- FIX: `_load_deps` now records which symbols_reader module variant
+      succeeded (exposed in the diagnostic log line).
+- FIX: `SCRIPT_VERSION` alias exposed alongside `SERVICE_VERSION` for
+      cross-script consistency.
+- FIX: `_CPU_EXECUTOR` shutdown now also runs in a `try/finally` around
+      `run_audit()` library usage — not just `main()`. Prevents thread-pool
+      leaks when this module is imported and orchestrated from elsewhere.
+- FIX: `_get_page_symbols` preserves input order when extracting symbol
+      lists from dict payloads (previously mixed order from by_type buckets).
+- ALIGN: docstring names the canonical deps:
+      - integrations.symbols_reader v3.0.0 (bridge to core.symbols_reader)
+      - core.data_engine v6.x (get_enriched_quotes batch / get_enriched_quote)
+- KEEP: stable CLI contract, exit-code policy, JSON/CSV/Parquet/Excel export
+      formats, timestamp parsing, HMAC signing, all audit heuristics.
 
 CLI examples
-- python scripts/audit_data_quality.py --keys MARKET_LEADERS MY_PORTFOLIO --sheet-id "<SID>" --refresh 1 --json-out report.json --csv-out alerts.csv
-- python scripts/audit_data_quality.py --keys MARKET_LEADERS --max-symbols 200 --refresh 0 --alerts-only 1
+- python scripts/audit_data_quality.py --keys MARKET_LEADERS MY_PORTFOLIO \
+    --sheet-id "<SID>" --refresh 1 --json-out report.json --csv-out alerts.csv
+- python scripts/audit_data_quality.py --keys MARKET_LEADERS --max-symbols 200 \
+    --refresh 0 --alerts-only 1
 - python scripts/audit_data_quality.py --keys MARKET_LEADERS --include-ok 1 --top 20
 
 Environment
@@ -23,6 +51,15 @@ Environment
 - AUDIT_BATCH_SIZE       : default 200
 - AUDIT_MAX_WORKERS      : thread pool size for file exports
 - AUDIT_HMAC_KEY         : optional HMAC signing for exported JSON
+
+Canonical dependencies
+- integrations.symbols_reader (or symbols_reader / core.symbols_reader)
+  - `get_page_symbols(key, spreadsheet_id=...)` → returns Dict
+  - `get_symbols_for_page(page=..., spreadsheet_id=..., limit=...)` → returns List[str]
+  - `list_symbols_for_page(...)` / `get_symbols(...)` / `list_symbols(...)` → List[str]
+- core.data_engine  (or core.data_engine_v2)
+  - `get_enriched_quotes(symbols, use_cache=True, ttl=None)` → List[UnifiedQuote|dict]
+  - `get_enriched_quote(symbol, use_cache=True, ttl=None)` → UnifiedQuote|dict
 
 Exit codes (stable)
 - 0 = no MEDIUM/HIGH/CRITICAL
@@ -107,7 +144,9 @@ except Exception:
 # -----------------------------------------------------------------------------
 # Logging
 # -----------------------------------------------------------------------------
-SERVICE_VERSION = "4.4.0"
+SERVICE_VERSION = "4.5.0"
+SCRIPT_VERSION = SERVICE_VERSION  # v4.5.0: alias for cross-script consistency
+
 logger = logging.getLogger("TFB.Audit")
 logging.basicConfig(
     level=logging.INFO,
@@ -121,11 +160,24 @@ logging.basicConfig(
 def _clamp_int(v: int, lo: int, hi: int) -> int:
     return max(lo, min(hi, v))
 
+
 _MAX_WORKERS = _clamp_int(int(os.getenv("AUDIT_MAX_WORKERS", "8") or "8"), 2, 32)
 _CPU_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
     max_workers=_MAX_WORKERS,
     thread_name_prefix="AuditWorker",
 )
+
+
+def _shutdown_executor(wait: bool = False) -> None:
+    """Idempotent shutdown helper. Safe to call multiple times / in finally."""
+    try:
+        _CPU_EXECUTOR.shutdown(wait=wait, cancel_futures=True)  # py3.9+
+    except Exception:
+        try:
+            _CPU_EXECUTOR.shutdown(wait=wait)
+        except Exception:
+            pass
+
 
 # -----------------------------------------------------------------------------
 # Enums
@@ -303,6 +355,11 @@ class AuditSummary:
 # -----------------------------------------------------------------------------
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _RIYADH_TZ = timezone(timedelta(hours=3))
+
+# v4.5.0: project-wide truthy/falsy vocabulary — matches main._TRUTHY / _FALSY.
+# (v4.4.0 had `"active"` as an outlier in _TRUTHY and no _FALSY set.)
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
+_FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
 
 
 def safe_str(x: Any, default: str = "") -> str:
@@ -496,71 +553,190 @@ def _chunk(lst: List[str], n: int) -> List[List[str]]:
 class Deps:
     ok: bool
     symbols_reader: Any
+    symbols_reader_module_name: str
     data_engine: Any
     err: Optional[str] = None
 
 
 def _load_deps() -> Deps:
     sr = None
+    sr_name = ""
     de = None
     err = None
 
-    # symbols reader: try a few known locations
-    for mod_name in ("integrations.symbols_reader", "symbols_reader", "integrations.symbols", "core.symbols_reader"):
+    # symbols reader: try known locations in priority order.
+    # integrations.symbols_reader v3.0.0 is the canonical bridge; the other
+    # names are fallbacks for partial-repo states.
+    for mod_name in (
+        "integrations.symbols_reader",
+        "symbols_reader",
+        "integrations.symbols",
+        "core.symbols_reader",
+    ):
         try:
             sr = __import__(mod_name, fromlist=["*"])
+            sr_name = mod_name
             break
         except Exception:
             sr = None
 
-    # data engine wrapper (preferred)
-    try:
-        from core import data_engine as _de  # type: ignore
-
-        de = _de
-    except Exception as e:
-        de = None
-        err = f"core.data_engine import failed: {e}"
+    # data engine wrapper: core.data_engine v6.x is canonical; v2 is the
+    # legacy variant. Try both.
+    for de_name in ("core.data_engine", "core.data_engine_v2"):
+        try:
+            de = __import__(de_name, fromlist=["*"])
+            break
+        except Exception as e:
+            de = None
+            err = f"{de_name} import failed: {e}"
 
     ok = bool(sr and de)
-    return Deps(ok=ok, symbols_reader=sr, data_engine=de, err=err)
+    return Deps(
+        ok=ok,
+        symbols_reader=sr,
+        symbols_reader_module_name=sr_name,
+        data_engine=de,
+        err=err,
+    )
 
 
 DEPS = _load_deps()
 
 
+def _extract_symbols_from_reader_payload(res: Any) -> List[str]:
+    """
+    v4.5.0: canonical extractor for symbols_reader return payloads.
+    Handles both list-style and dict-style returns.
+
+    The canonical dict shape (per integrations.symbols_reader v3.0.0,
+    which re-exports core.symbols_reader) is:
+        {
+            "all":     [...],   # canonical all
+            "symbols": [...],   # canonical preferred (CLI default)
+            "ksa":     [...],
+            "global":  [...],
+            "by_type": {...},
+            "metadata": [...],
+            "status":  "success" | "error",
+            "error":   "...",
+            "version": "x.y.z",
+        }
+    """
+    if res is None:
+        return []
+
+    # List-style: legacy and some sibling wrappers (get_symbols_for_page, etc.)
+    if isinstance(res, (list, tuple, set)):
+        return [_norm_symbol(x) for x in res if _norm_symbol(x)]
+
+    # Dict-style: canonical get_page_symbols / get_universe shape.
+    if isinstance(res, dict):
+        # Preferred order: `symbols` (CLI default), then `all`, then
+        # union of `ksa` + `global` preserving order.
+        for key in ("symbols", "all"):
+            seq = res.get(key)
+            if isinstance(seq, (list, tuple, set)) and seq:
+                return [_norm_symbol(x) for x in seq if _norm_symbol(x)]
+
+        # Fallback: combine ksa + global (preserve input order, dedupe)
+        merged: List[str] = []
+        seen: Set[str] = set()
+        for key in ("ksa", "global"):
+            seq = res.get(key)
+            if not isinstance(seq, (list, tuple, set)):
+                continue
+            for x in seq:
+                nx = _norm_symbol(x)
+                if nx and nx not in seen:
+                    seen.add(nx)
+                    merged.append(nx)
+        if merged:
+            return merged
+
+        # Last resort: inspect by_type buckets
+        by_type = res.get("by_type")
+        if isinstance(by_type, dict):
+            out: List[str] = []
+            seen2: Set[str] = set()
+            for _bucket, seq in by_type.items():
+                if not isinstance(seq, (list, tuple, set)):
+                    continue
+                for x in seq:
+                    nx = _norm_symbol(x)
+                    if nx and nx not in seen2:
+                        seen2.add(nx)
+                        out.append(nx)
+            if out:
+                return out
+
+    return []
+
+
 def _get_page_symbols(symbols_reader: Any, page_key: str, spreadsheet_id: str) -> List[str]:
     """
-    Supports:
-      - symbols_reader.get_page_symbols(key, spreadsheet_id=...)
-      - symbols_reader.get_symbols_for_page(...)
-      - symbols_reader.read_page_symbols(...)
+    v4.5.0: handles both dict-style (`get_page_symbols`) and list-style
+    (`get_symbols_for_page`, etc.) return types.
+
+    Candidate resolution order (first callable that yields a non-empty
+    extraction wins):
+      1. get_page_symbols(key, spreadsheet_id=...)  → DICT payload
+      2. get_symbols_for_page(page=..., spreadsheet_id=..., limit=...)  → LIST
+      3. list_symbols_for_page(page=..., spreadsheet_id=..., limit=...)  → LIST
+      4. get_symbols(page=..., spreadsheet_id=..., limit=...)  → LIST
+      5. list_symbols(page=..., spreadsheet_id=..., limit=...)  → LIST
+      6. read_page_symbols(key, spreadsheet_id=...)  → LIST (legacy)
     """
     if symbols_reader is None:
         return []
 
-    candidates = [
-        getattr(symbols_reader, "get_page_symbols", None),
-        getattr(symbols_reader, "get_symbols_for_page", None),
-        getattr(symbols_reader, "read_page_symbols", None),
-    ]
+    # Order matters: get_page_symbols is the canonical entry per
+    # core.symbols_reader / integrations.symbols_reader v3.0.0.
+    named_candidates: Tuple[Tuple[str, Dict[str, Any]], ...] = (
+        ("get_page_symbols", {"call_style": "positional_key"}),
+        ("get_symbols_for_page", {"call_style": "kw_page"}),
+        ("list_symbols_for_page", {"call_style": "kw_page"}),
+        ("get_symbols", {"call_style": "kw_page"}),
+        ("list_symbols", {"call_style": "kw_page"}),
+        ("read_page_symbols", {"call_style": "positional_key"}),
+    )
 
-    for fn in candidates:
+    for attr_name, meta in named_candidates:
+        fn = getattr(symbols_reader, attr_name, None)
         if not callable(fn):
             continue
+
+        call_style = meta.get("call_style")
+        res: Any = None
         try:
-            res = fn(page_key, spreadsheet_id=spreadsheet_id)
-            if isinstance(res, (list, tuple, set)):
-                return [_norm_symbol(x) for x in res if _norm_symbol(x)]
-        except TypeError:
-            try:
-                res = fn(spreadsheet_id, page_key)
-                if isinstance(res, (list, tuple, set)):
-                    return [_norm_symbol(x) for x in res if _norm_symbol(x)]
-            except Exception:
-                pass
+            if call_style == "positional_key":
+                # Canonical: fn(page_key, spreadsheet_id=...)
+                try:
+                    res = fn(page_key, spreadsheet_id=spreadsheet_id)
+                except TypeError:
+                    # Some legacy variants take (spreadsheet_id, key)
+                    try:
+                        res = fn(spreadsheet_id, page_key)
+                    except Exception:
+                        res = None
+            elif call_style == "kw_page":
+                # Canonical: fn(page=..., spreadsheet_id=..., limit=...)
+                try:
+                    res = fn(page=page_key, spreadsheet_id=spreadsheet_id)
+                except TypeError:
+                    # Some variants use `sheet=` or positional
+                    try:
+                        res = fn(sheet=page_key, spreadsheet_id=spreadsheet_id)
+                    except TypeError:
+                        try:
+                            res = fn(page_key, spreadsheet_id=spreadsheet_id)
+                        except Exception:
+                            res = None
         except Exception:
-            pass
+            res = None
+
+        extracted = _extract_symbols_from_reader_payload(res)
+        if extracted:
+            return _dedupe_preserve(extracted)
 
     return []
 
@@ -630,7 +806,12 @@ async def _fetch_quotes_map(
     batch_size: int,
 ) -> Dict[str, Dict[str, Any]]:
     """
-    Uses `core.data_engine.get_enriched_quotes()` if available; otherwise falls back to per-symbol calls.
+    Uses `core.data_engine.get_enriched_quotes()` if available; otherwise falls
+    back to per-symbol calls.
+
+    Per core.data_engine v6.x contract:
+      - get_enriched_quotes(symbols, use_cache=True, ttl=None) → List[UnifiedQuote]
+      - get_enriched_quote(symbol, use_cache=True, ttl=None)   → UnifiedQuote
     Returns: { SYMBOL: quote_dict }
     """
     de = DEPS.data_engine
@@ -657,7 +838,7 @@ async def _fetch_quotes_map(
                         out[s] = {"error": "engine returned None"}
                     continue
 
-                # dict mapping
+                # dict mapping (rare for core.data_engine, common for stubs)
                 if isinstance(res, dict):
                     for k, v in res.items():
                         kk = _norm_symbol(k)
@@ -668,7 +849,7 @@ async def _fetch_quotes_map(
                         out.setdefault(s, {"error": "missing quote row"})
                     continue
 
-                # list/tuple result
+                # list/tuple result (canonical for core.data_engine v6.x)
                 if isinstance(res, (list, tuple)):
                     # Prefer embedded symbol mapping
                     temp: Dict[str, Dict[str, Any]] = {}
@@ -1119,12 +1300,19 @@ async def run_audit(
 ) -> Tuple[List[AuditResult], AuditSummary]:
     if not DEPS.ok:
         logger.error(
-            "Dependencies not loaded. symbols_reader=%s, data_engine=%s, err=%s",
+            "Dependencies not loaded. symbols_reader=%s (%s), data_engine=%s, err=%s",
             bool(DEPS.symbols_reader),
+            DEPS.symbols_reader_module_name or "n/a",
             bool(DEPS.data_engine),
             DEPS.err,
         )
         return [], AuditSummary()
+
+    logger.info(
+        "Deps OK | symbols_reader=%s | data_engine=%s",
+        DEPS.symbols_reader_module_name or "(anon)",
+        getattr(DEPS.data_engine, "__name__", "core.data_engine"),
+    )
 
     sid = (spreadsheet_id or os.getenv("DEFAULT_SPREADSHEET_ID", "")).strip()
     if not sid:
@@ -1187,7 +1375,7 @@ def _severity_rank(s: AuditSeverity) -> int:
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="TFB Data Quality Auditor")
+    p = argparse.ArgumentParser(description=f"TFB Data Quality Auditor v{SERVICE_VERSION}")
     p.add_argument("--keys", nargs="*", default=["MARKET_LEADERS"], help="Sheet page keys to audit")
     p.add_argument("--sheet-id", dest="sheet_id", default="", help="Google Sheet ID (fallback: DEFAULT_SPREADSHEET_ID)")
     p.add_argument("--refresh", type=int, default=1, help="1=bypass cache (fresh), 0=use cache")
@@ -1207,87 +1395,82 @@ def main() -> None:
 
     config = AuditConfig()
 
-    t0 = time.time()
-    results, summary = asyncio.run(
-        run_audit(
-            keys=list(args.keys or []),
-            spreadsheet_id=args.sheet_id,
-            refresh=bool(args.refresh),
-            concurrency=int(args.concurrency),
-            max_symbols_per_page=int(args.max_symbols),
-            config=config,
-        )
-    )
-    summary.audit_duration_ms = (time.time() - t0) * 1000.0
-
-    # Alerts
-    alerts = [r for r in results if r.severity != AuditSeverity.OK]
-
-    # Console snapshot (optional, safe)
-    try:
-        top_n = max(0, int(args.top))
-        if top_n > 0:
-            view = results if int(args.include_ok) == 1 else alerts
-            view_sorted = sorted(
-                view,
-                key=lambda r: (_severity_rank(r.severity), r.page, r.symbol),
-            )
-            logger.info("Top findings (n=%s):", min(top_n, len(view_sorted)))
-            for r in view_sorted[:top_n]:
-                msg = f"{r.severity.value:<8} | {r.page:<18} | {r.symbol:<12} | age_h={r.age_hours if r.age_hours is not None else 'NA'} | issues={','.join(r.issues[:3])}"
-                if r.error:
-                    msg += f" | err={r.error[:120]}"
-                logger.info(msg)
-    except Exception:
-        pass
-
-    # Exports (run gather inside event loop)
-    export_tasks: List[Awaitable[None]] = []
-
-    if args.json_out:
-        if int(args.alerts_only) == 1:
-            payload = {"summary": summary.to_dict(), "alerts": [r.to_dict() for r in alerts]}
-        else:
-            payload = {"summary": summary.to_dict(), "results": [r.to_dict() for r in results], "alerts": [r.to_dict() for r in alerts]}
-        export_tasks.append(_export_json(args.json_out, payload, indent=int(args.json_indent)))
-
-    if args.csv_out:
-        export_tasks.append(_export_csv(args.csv_out, alerts))
-
-    if args.parquet_out:
-        export_tasks.append(_export_parquet(args.parquet_out, results))
-
-    if args.excel_out:
-        export_tasks.append(_export_excel(args.excel_out, results, summary))
-
-    if export_tasks:
-        asyncio.run(_run_exports(export_tasks))
-
-    logger.info(
-        "Audit Complete | assets=%s | critical=%s | high=%s | medium=%s | duration_ms=%.0f",
-        summary.total_assets,
-        summary.by_severity.get("CRITICAL", 0),
-        summary.by_severity.get("HIGH", 0),
-        summary.by_severity.get("MEDIUM", 0),
-        summary.audit_duration_ms,
-    )
-
-    # Exit code policy (stable)
     exit_code = 0
-    if summary.by_severity.get("CRITICAL", 0) > 0:
-        exit_code = 3
-    elif summary.by_severity.get("HIGH", 0) > 0:
-        exit_code = 2
-    elif summary.by_severity.get("MEDIUM", 0) > 0:
-        exit_code = 1
-
     try:
-        _CPU_EXECUTOR.shutdown(wait=False, cancel_futures=True)  # py3.9+
-    except Exception:
+        t0 = time.time()
+        results, summary = asyncio.run(
+            run_audit(
+                keys=list(args.keys or []),
+                spreadsheet_id=args.sheet_id,
+                refresh=bool(args.refresh),
+                concurrency=int(args.concurrency),
+                max_symbols_per_page=int(args.max_symbols),
+                config=config,
+            )
+        )
+        summary.audit_duration_ms = (time.time() - t0) * 1000.0
+
+        # Alerts
+        alerts = [r for r in results if r.severity != AuditSeverity.OK]
+
+        # Console snapshot (optional, safe)
         try:
-            _CPU_EXECUTOR.shutdown(wait=False)
+            top_n = max(0, int(args.top))
+            if top_n > 0:
+                view = results if int(args.include_ok) == 1 else alerts
+                view_sorted = sorted(
+                    view,
+                    key=lambda r: (_severity_rank(r.severity), r.page, r.symbol),
+                )
+                logger.info("Top findings (n=%s):", min(top_n, len(view_sorted)))
+                for r in view_sorted[:top_n]:
+                    msg = f"{r.severity.value:<8} | {r.page:<18} | {r.symbol:<12} | age_h={r.age_hours if r.age_hours is not None else 'NA'} | issues={','.join(r.issues[:3])}"
+                    if r.error:
+                        msg += f" | err={r.error[:120]}"
+                    logger.info(msg)
         except Exception:
             pass
+
+        # Exports (run gather inside event loop)
+        export_tasks: List[Awaitable[None]] = []
+
+        if args.json_out:
+            if int(args.alerts_only) == 1:
+                payload = {"summary": summary.to_dict(), "alerts": [r.to_dict() for r in alerts]}
+            else:
+                payload = {"summary": summary.to_dict(), "results": [r.to_dict() for r in results], "alerts": [r.to_dict() for r in alerts]}
+            export_tasks.append(_export_json(args.json_out, payload, indent=int(args.json_indent)))
+
+        if args.csv_out:
+            export_tasks.append(_export_csv(args.csv_out, alerts))
+
+        if args.parquet_out:
+            export_tasks.append(_export_parquet(args.parquet_out, results))
+
+        if args.excel_out:
+            export_tasks.append(_export_excel(args.excel_out, results, summary))
+
+        if export_tasks:
+            asyncio.run(_run_exports(export_tasks))
+
+        logger.info(
+            "Audit Complete | assets=%s | critical=%s | high=%s | medium=%s | duration_ms=%.0f",
+            summary.total_assets,
+            summary.by_severity.get("CRITICAL", 0),
+            summary.by_severity.get("HIGH", 0),
+            summary.by_severity.get("MEDIUM", 0),
+            summary.audit_duration_ms,
+        )
+
+        # Exit code policy (stable)
+        if summary.by_severity.get("CRITICAL", 0) > 0:
+            exit_code = 3
+        elif summary.by_severity.get("HIGH", 0) > 0:
+            exit_code = 2
+        elif summary.by_severity.get("MEDIUM", 0) > 0:
+            exit_code = 1
+    finally:
+        _shutdown_executor(wait=False)
 
     raise SystemExit(exit_code)
 
