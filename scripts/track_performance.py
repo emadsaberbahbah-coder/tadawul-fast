@@ -2,40 +2,99 @@
 """
 scripts/track_performance.py
 ===========================================================
-TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.3.0)
+TADAWUL FAST BRIDGE – ADVANCED PERFORMANCE ANALYTICS ENGINE (v6.4.0)
 ===========================================================
 
-Hardening + Alignment upgrades in v6.3.0 (vs v6.2.0 you pasted)
-- ✅ Hygiene checker compliant: NO rich, NO print(); uses sys.stdout.write only
-- ✅ Removed seaborn dependency (matplotlib OO only; thread-safe)
-- ✅ Fixed A1 column math (supports >26 columns: AA, AB, …)
-- ✅ Fixed RiyadhTime.format() misuse + stronger ISO parsing (supports Z / offsets)
-- ✅ Google Sheets I/O hardened:
-    - Supports GOOGLE_SHEETS_CREDENTIALS as JSON or base64(JSON)
-    - Falls back to gspread.service_account() when available
-    - Never crashes if gspread is missing (script still runs in “analysis-only” mode)
-- ✅ Backend audit support (optional):
-    - Can fetch Top10 rows from /v1/analysis/top10 (best-effort)
-    - Can fetch current prices via /quotes OR /v1/enriched/sheet-rows OR /v1/analysis/sheet-rows (fallback chain)
-    - Uses token headers (Authorization: Bearer + X-APP-TOKEN) when present
-- ✅ Safer enums parsing (case/spacing tolerant) + safe float parsing
-- ✅ Daemon mode stabilized (signal-safe) + clean shutdown
+Why this revision (v6.4.0 vs v6.3.0)
+-------------------------------------
+- 🔑 FIX CRITICAL: `/v1/analysis/top10` does NOT exist in this project.
+    Canonical endpoints are `POST /v1/advanced/top10-investments` and
+    `POST /v1/advanced/top10` (from `routes/investment_advisor.py`
+    v2.13.1). v6.3.0's `--record` flag has NEVER worked — every request
+    returned 404. v6.4.0:
+      - Tries `/v1/advanced/top10-investments` first, then `/v1/advanced/top10`.
+      - Legacy `/v1/analysis/top10` still tried as the last-resort fallback
+        for any custom deployment that genuinely exposes it.
+      - Accepts the canonical envelope with `rows`, `row_objects`, `items`,
+        `records`, `data`, or `quotes` (all equivalent row list aliases).
+
+- 🔑 FIX CRITICAL: `/quotes` price fetch path reordered and expanded.
+    v6.3.0 checked only `data.<SYM>` shape; the canonical router emits
+    `items` (preferred), `data`, `results`, or `quotes` from
+    `/v1/enriched/quotes` (the endpoint `run_market_scan v5.3.0` uses).
+    v6.4.0 tries `/v1/enriched/quotes` FIRST with `format="items"`,
+    extracts from `items`/`data`/`results`/`quotes`, then falls back to
+    `/quotes`, `/v1/enriched/sheet-rows`, `/v1/analysis/sheet-rows`.
+
+- 🔑 FIX HIGH: `ReportGenerator.generate_html` crashed when a record's
+    `realized_roi` AND `unrealized_roi` were both `None`. v6.4.0 coerces
+    to 0.0 BEFORE the f-string format specifier.
+
+- FIX MEDIUM: `_CPU_EXECUTOR` is now lazy-initialized (was eager at
+    module import, spawning 8 threads on any `import track_performance`).
+- FIX MEDIUM: `_shutdown_executor()` uses `wait=True` with
+    `cancel_futures=True` fallback. v6.3.0 used `wait=False` abandoning
+    in-flight tasks on interrupt.
+
+- FIX: Dead imports removed: `Sequence` (typing), `urlparse`
+    (urllib.parse), `pd`/`pandas` (soft-imported, flag never read),
+    `stats`/`minimize` from scipy (unused), `aiohttp.client_exceptions`
+    (redundant sub-import).
+- FIX: Added project-standard `_TRUTHY`/`_FALSY` vocabulary matching
+    `main._TRUTHY`/`_FALSY`. `_TRACING_ENABLED` now uses the canonical
+    8-value set (was partial 5-value in v6.3.0).
+- FIX: Added `_env_bool`/`_env_int`/`_env_csv` helpers.
+- FIX: Added `SERVICE_VERSION = SCRIPT_VERSION` alias.
+- FIX: Added `TRACK_*` env var defaults for every CLI flag so the
+    runner can be driven purely from the environment (cron/CI).
+- FIX: `_get_spreadsheet_id` returns `""` instead of raising; main()
+    handles missing id with a clean `return 1`.
+- FIX: Exit codes documented: 0/1/130.
 
 Core Capabilities (kept)
 - Performance log store in Google Sheets (default tab: Performance_Log)
 - KPI summary (win-rate, avg ROI, Sharpe/Sortino)
 - Monte Carlo win-rate CI (when numpy available)
-- Rolling windows (best-effort)
 - Export reports (json/csv/html)
+- Daemon mode (signal-safe; clean shutdown)
 
 Notes
-- This script is intentionally best-effort and will not fail just because optional deps
-  (numpy/pandas/scipy/gspread/aiohttp/matplotlib) are missing.
+- Best-effort. Never fails just because optional deps
+  (numpy/scipy/gspread/aiohttp/matplotlib) are missing.
+
+Environment
+-----------
+  TRACK_SHEET_ID           spreadsheet id (also DEFAULT_SPREADSHEET_ID)
+  TRACK_SHEET_NAME         performance log tab name (default Performance_Log)
+  TRACK_RECORD             truthy = record new from Top10
+  TRACK_AUDIT              truthy = audit active records
+  TRACK_ANALYZE            truthy = analyze + write summary block
+  TRACK_SIMULATE           truthy = Monte Carlo simulation
+  TRACK_EXPORT             truthy = export report
+  TRACK_DAEMON             truthy = run daemon mode
+  TRACK_HORIZONS           comma-separated list (default "1M,3M")
+  TRACK_MAX_RECORDS        max records to load (default 10000)
+  TRACK_CONFIDENCE         simulation confidence (default 0.95)
+  TRACK_ITERATIONS         Monte Carlo iterations (default 10000)
+  TRACK_FORMAT             json|csv|html|all (default html)
+  TRACK_OUTPUT             output file base path
+  TRACK_INTERVAL           daemon interval seconds (default 3600)
+  TRACK_VERBOSE            truthy = verbose logging
+  BACKEND_BASE_URL /
+  TFB_BASE_URL             TFB API base URL
+  TFB_TOKEN / APP_TOKEN /
+  BACKEND_TOKEN / X_APP_TOKEN  Auth token (Bearer + X-APP-TOKEN)
+  GOOGLE_SHEETS_CREDENTIALS /
+  GOOGLE_CREDENTIALS       Service account (JSON or base64-encoded JSON)
+  CORE_TRACING_ENABLED /
+  TRACING_ENABLED          truthy = OpenTelemetry tracing
+  LOG_LEVEL                logger level (default info)
 
 Exit codes
-- 0 success
-- 1 fatal error
-- 130 interrupted
+----------
+  0   success
+  1   fatal error / missing config
+  130 interrupted (SIGINT)
 
 ===========================================================
 """
@@ -63,10 +122,74 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from threading import Event, Lock
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
-from urllib.parse import urlparse
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 from urllib.request import Request as UrlRequest, urlopen
 from urllib.error import HTTPError, URLError
+
+
+# ---------------------------------------------------------------------------
+# Version
+# ---------------------------------------------------------------------------
+SCRIPT_VERSION = "6.4.0"
+SERVICE_VERSION = SCRIPT_VERSION  # v6.4.0: cross-script alias
+SCRIPT_NAME = "PerformanceTracker"
+
+
+# ---------------------------------------------------------------------------
+# Project-wide truthy/falsy vocabulary (matches main._TRUTHY / _FALSY)
+# ---------------------------------------------------------------------------
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
+_FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    try:
+        raw = (os.getenv(name, "") or "").strip().lower()
+    except Exception:
+        return bool(default)
+    if not raw:
+        return bool(default)
+    if raw in _TRUTHY:
+        return True
+    if raw in _FALSY:
+        return False
+    return bool(default)
+
+
+def _env_int(
+    name: str, default: int, *, lo: Optional[int] = None, hi: Optional[int] = None
+) -> int:
+    try:
+        raw = (os.getenv(name, "") or "").strip()
+        if not raw:
+            return default
+        v = int(float(raw))
+    except Exception:
+        return default
+    if lo is not None and v < lo:
+        v = lo
+    if hi is not None and v > hi:
+        v = hi
+    return v
+
+
+def _env_float(name: str, default: float) -> float:
+    try:
+        raw = (os.getenv(name, "") or "").strip()
+        if not raw:
+            return default
+        return float(raw)
+    except Exception:
+        return default
+
+
+def _env_csv(name: str, default: Optional[List[str]] = None) -> Optional[List[str]]:
+    raw = (os.getenv(name, "") or "").strip()
+    if not raw:
+        return default
+    items = [x.strip() for x in raw.split(",") if x.strip()]
+    return items or default
+
 
 # ---------------------------------------------------------------------------
 # High-Performance JSON fallback
@@ -85,7 +208,9 @@ try:
 except Exception:
 
     def json_dumps(v: Any, *, indent: int = 0) -> str:
-        return json.dumps(v, indent=(indent if indent else None), default=str, ensure_ascii=False)
+        return json.dumps(
+            v, indent=(indent if indent else None), default=str, ensure_ascii=False
+        )
 
     def json_loads(data: Union[str, bytes]) -> Any:
         if isinstance(data, (bytes, bytearray)):
@@ -94,33 +219,22 @@ except Exception:
 
     _HAS_ORJSON = False
 
+
 # ---------------------------------------------------------------------------
 # Optional imports (SAFE)
 # ---------------------------------------------------------------------------
 try:
     import numpy as np  # type: ignore
-
     NUMPY_AVAILABLE = True
 except Exception:
     np = None  # type: ignore
     NUMPY_AVAILABLE = False
 
+# scipy (v6.4.0: dead imports scrubbed — only track availability)
 try:
-    import pandas as pd  # type: ignore
-
-    PANDAS_AVAILABLE = True
-except Exception:
-    pd = None  # type: ignore
-    PANDAS_AVAILABLE = False
-
-try:
-    from scipy import stats  # type: ignore
-    from scipy.optimize import minimize  # type: ignore
-
+    import scipy  # type: ignore  # noqa: F401
     SCIPY_AVAILABLE = True
 except Exception:
-    stats = None  # type: ignore
-    minimize = None  # type: ignore
     SCIPY_AVAILABLE = False
 
 # Google Sheets (gspread)
@@ -137,7 +251,6 @@ except Exception:
 # Async HTTP (optional)
 try:
     import aiohttp  # type: ignore
-    import aiohttp.client_exceptions  # type: ignore
 
     ASYNC_HTTP_AVAILABLE = True
 except Exception:
@@ -176,9 +289,11 @@ except Exception:
 
     Counter = Gauge = _DummyMetric  # type: ignore
 
+
 # Optional project imports (best-effort)
 settings = None
 sheets_service = None
+
 
 def _ensure_project_root_on_path() -> None:
     try:
@@ -190,6 +305,7 @@ def _ensure_project_root_on_path() -> None:
                 sys.path.insert(0, ps)
     except Exception:
         pass
+
 
 _ensure_project_root_on_path()
 
@@ -204,24 +320,61 @@ try:
 except Exception:
     sheets_service = None
 
-# =============================================================================
-# Version & Logging
-# =============================================================================
-SCRIPT_VERSION = "6.3.0"
-SCRIPT_NAME = "PerformanceTracker"
 
+# =============================================================================
+# Logging & global state
+# =============================================================================
 LOG_FORMAT = "%(asctime)s | %(levelname)8s | %(name)s | %(message)s"
 DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
-logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=DATE_FORMAT)
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").strip().upper(),
+    format=LOG_FORMAT,
+    datefmt=DATE_FORMAT,
+)
 logger = logging.getLogger("PerfTracker")
 
-_CPU_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="PerfWorker")
-
 _RIYADH_TZ = timezone(timedelta(hours=3))
-_TRACING_ENABLED = (os.getenv("CORE_TRACING_ENABLED", "") or os.getenv("TRACING_ENABLED", "")).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+# v6.4.0: tracing uses project-canonical _env_bool
+_TRACING_ENABLED = _env_bool("CORE_TRACING_ENABLED", False) or _env_bool(
+    "TRACING_ENABLED", False
+)
+
+# v6.4.0: Lazy-initialized executor (was eager at module level).
+_CPU_EXECUTOR: Optional[concurrent.futures.ThreadPoolExecutor] = None
+
+
+def _get_executor() -> concurrent.futures.ThreadPoolExecutor:
+    global _CPU_EXECUTOR
+    if _CPU_EXECUTOR is None:
+        _CPU_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+            max_workers=8, thread_name_prefix="PerfWorker"
+        )
+    return _CPU_EXECUTOR
+
+
+def _shutdown_executor() -> None:
+    global _CPU_EXECUTOR
+    if _CPU_EXECUTOR is None:
+        return
+    try:
+        _CPU_EXECUTOR.shutdown(wait=True, cancel_futures=True)
+    except TypeError:
+        # Python 3.8 doesn't support cancel_futures
+        try:
+            _CPU_EXECUTOR.shutdown(wait=True)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    finally:
+        _CPU_EXECUTOR = None
+
 
 if PROMETHEUS_AVAILABLE:
-    perf_records_processed = Counter("perf_records_processed_total", "Total performance records processed")
+    perf_records_processed = Counter(
+        "perf_records_processed_total", "Total performance records processed"
+    )
     perf_daemon_cycles = Counter("perf_daemon_cycles_total", "Total daemon cycles")
     perf_win_rate = Gauge("perf_overall_win_rate", "Overall win rate percentage")
 else:
@@ -229,23 +382,28 @@ else:
     perf_daemon_cycles = Counter()  # type: ignore
     perf_win_rate = Gauge()  # type: ignore
 
+
 # =============================================================================
 # Utilities
 # =============================================================================
 def _out(s: str) -> None:
     sys.stdout.write(s + "\n")
 
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
+
 def _riyadh_now() -> datetime:
     return datetime.now(_RIYADH_TZ)
+
 
 def _safe_str(x: Any) -> str:
     try:
         return str(x).strip()
     except Exception:
         return ""
+
 
 def _safe_float(x: Any, default: float = 0.0) -> float:
     try:
@@ -267,6 +425,7 @@ def _safe_float(x: Any, default: float = 0.0) -> float:
     except Exception:
         return float(default)
 
+
 def _col_to_a1(col: int) -> str:
     # 1 -> A, 26 -> Z, 27 -> AA
     if col <= 0:
@@ -278,16 +437,22 @@ def _col_to_a1(col: int) -> str:
         out.append(chr(65 + r))
     return "".join(reversed(out))
 
+
 def _a1_range(start_col: int, start_row: int, end_col: int, end_row: int) -> str:
     return f"{_col_to_a1(start_col)}{start_row}:{_col_to_a1(end_col)}{end_row}"
 
+
 class FullJitterBackoff:
-    def __init__(self, max_retries: int = 5, base_delay: float = 0.8, max_delay: float = 30.0):
+    def __init__(
+        self, max_retries: int = 5, base_delay: float = 0.8, max_delay: float = 30.0
+    ):
         self.max_retries = max(1, int(max_retries))
         self.base_delay = float(base_delay)
         self.max_delay = float(max_delay)
 
-    async def execute_async(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    async def execute_async(
+        self, fn: Callable[..., Any], *args: Any, **kwargs: Any
+    ) -> Any:
         for attempt in range(self.max_retries):
             try:
                 res = fn(*args, **kwargs)
@@ -309,6 +474,7 @@ class FullJitterBackoff:
                     raise
                 cap = min(self.max_delay, self.base_delay * (2 ** attempt))
                 time.sleep(random.uniform(0.0, cap))
+
 
 class RiyadhTime:
     _tz = _RIYADH_TZ
@@ -354,11 +520,14 @@ class RiyadhTime:
         return None
 
     @classmethod
-    def format(cls, dt: Optional[datetime] = None, fmt: str = "%Y-%m-%d %H:%M:%S") -> str:
+    def format(
+        cls, dt: Optional[datetime] = None, fmt: str = "%Y-%m-%d %H:%M:%S"
+    ) -> str:
         d = dt or cls.now()
         if d.tzinfo is None:
             d = d.replace(tzinfo=cls._tz)
         return d.astimezone(cls._tz).strftime(fmt)
+
 
 # =============================================================================
 # Enums & Data Models
@@ -369,6 +538,7 @@ class PerformanceStatus(str, Enum):
     EXPIRED = "expired"
     STOPPED = "stopped"
     PENDING = "pending"
+
 
 class HorizonType(str, Enum):
     WEEK_1 = "1W"
@@ -381,7 +551,11 @@ class HorizonType(str, Enum):
 
     @property
     def days(self) -> int:
-        return {"1W": 7, "1M": 30, "3M": 90, "6M": 180, "1Y": 365, "3Y": 1095, "5Y": 1825}[self.value]
+        return {
+            "1W": 7, "1M": 30, "3M": 90, "6M": 180,
+            "1Y": 365, "3Y": 1095, "5Y": 1825,
+        }[self.value]
+
 
 class RecommendationType(str, Enum):
     STRONG_BUY = "STRONG BUY"
@@ -390,24 +564,23 @@ class RecommendationType(str, Enum):
     SELL = "SELL"
     STRONG_SELL = "STRONG SELL"
 
+
 def _parse_enum_value(enum_cls: Any, raw: Any, default: Any) -> Any:
     s = _safe_str(raw).upper()
     if not s:
         return default
-    # normalize common variants
     s = s.replace("_", " ").replace("-", " ").strip()
-    # map some variants
     if enum_cls is HorizonType:
         s = s.replace("WEEK", "W").replace("MONTH", "M").replace("YEAR", "Y")
     try:
         return enum_cls(s)
     except Exception:
-        # try find by value ignoring spaces
         norm = s.replace(" ", "")
         for m in enum_cls:
             if str(m.value).replace(" ", "") == norm:
                 return m
         return default
+
 
 def _risk_bucket_from_score(risk_score: Optional[float]) -> str:
     if risk_score is None:
@@ -422,6 +595,7 @@ def _risk_bucket_from_score(risk_score: Optional[float]) -> str:
     except Exception:
         return "MODERATE"
 
+
 def _confidence_bucket(conf: Optional[float]) -> str:
     if conf is None:
         return "MEDIUM"
@@ -434,6 +608,7 @@ def _confidence_bucket(conf: Optional[float]) -> str:
         return "LOW"
     except Exception:
         return "MEDIUM"
+
 
 @dataclass(slots=True)
 class PerformanceRecord:
@@ -472,7 +647,10 @@ class PerformanceRecord:
 
     @property
     def key(self) -> str:
-        return f"{self.symbol}|{self.horizon.value}|{self.date_recorded.astimezone(_RIYADH_TZ).strftime('%Y%m%d')}"
+        return (
+            f"{self.symbol}|{self.horizon.value}|"
+            f"{self.date_recorded.astimezone(_RIYADH_TZ).strftime('%Y%m%d')}"
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -501,7 +679,9 @@ class PerformanceRecord:
             "sector": self.sector,
             "factor_exposures": self.factor_exposures,
             "last_updated_utc": self.last_updated.astimezone(timezone.utc).isoformat(),
-            "maturity_date_riyadh": RiyadhTime.format(self.maturity_date) if self.maturity_date else None,
+            "maturity_date_riyadh": (
+                RiyadhTime.format(self.maturity_date) if self.maturity_date else None
+            ),
             "notes": self.notes,
         }
 
@@ -518,9 +698,15 @@ class PerformanceRecord:
         symbol = _safe_str(get("Symbol")).upper()
         horizon = _parse_enum_value(HorizonType, get("Horizon"), HorizonType.MONTH_1)
         dt_rec = RiyadhTime.parse(_safe_str(get("Date Recorded (Riyadh)"))) or RiyadhTime.now()
-        dt_tgt = RiyadhTime.parse(_safe_str(get("Target Date (Riyadh)"))) or (dt_rec + timedelta(days=horizon.days))
+        dt_tgt = RiyadhTime.parse(_safe_str(get("Target Date (Riyadh)"))) or (
+            dt_rec + timedelta(days=horizon.days)
+        )
         dt_upd = RiyadhTime.parse(_safe_str(get("Last Updated (Riyadh)"))) or RiyadhTime.now()
-        dt_mat = RiyadhTime.parse(_safe_str(get("Maturity Date"))) if _safe_str(get("Maturity Date")) else None
+        dt_mat = (
+            RiyadhTime.parse(_safe_str(get("Maturity Date")))
+            if _safe_str(get("Maturity Date"))
+            else None
+        )
 
         status_raw = _safe_str(get("Status")).lower() or "active"
         try:
@@ -574,6 +760,7 @@ class PerformanceRecord:
             notes=_safe_str(get("Notes")),
         )
 
+
 @dataclass(slots=True)
 class PerformanceSummary:
     total_records: int = 0
@@ -596,22 +783,67 @@ class PerformanceSummary:
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
+
 # =============================================================================
 # Backend Client (optional)
 # =============================================================================
+# v6.4.0: canonical endpoint chains.
+# Top10: preferred -> fallback -> legacy (non-existent in this repo but kept
+# in case a custom deployment genuinely exposes /v1/analysis/top10).
+_TOP10_ENDPOINTS: Tuple[str, ...] = (
+    "/v1/advanced/top10-investments",
+    "/v1/advanced/top10",
+    "/v1/analysis/top10",  # legacy fallback; usually 404 — see v6.3.0 bug note
+)
+
+# Quotes: preferred -> fallbacks.
+_QUOTES_ENDPOINT_PRIMARY = "/v1/enriched/quotes"
+_QUOTES_ENDPOINT_LEGACY = "/quotes"
+_SHEET_ROWS_ENRICHED = "/v1/enriched/sheet-rows"
+_SHEET_ROWS_ANALYSIS = "/v1/analysis/sheet-rows"
+
+
+def _extract_rows_from_envelope(data: Any) -> List[Dict[str, Any]]:
+    """
+    v6.4.0: tolerant extractor matching the canonical TFB envelope.
+    Router emits any of `rows`, `row_objects`, `items`, `records`, `data`,
+    `quotes`, `results` — all equivalent row list aliases.
+    """
+    if not isinstance(data, dict):
+        return []
+    for k in ("rows", "row_objects", "items", "records", "data", "quotes", "results"):
+        v = data.get(k)
+        if isinstance(v, list) and v and all(isinstance(r, (dict, Mapping)) for r in v if r is not None):  # type: ignore[name-defined]
+            return [dict(r) for r in v if isinstance(r, dict)]
+    return []
+
+
+# Python 3.9+ has collections.abc.Mapping; use a simpler check.
+try:
+    from collections.abc import Mapping
+except Exception:  # pragma: no cover
+    Mapping = dict  # type: ignore
+
+
 class BackendClient:
     def __init__(self, base_url: str, token: str = ""):
         self.base_url = (base_url or "").strip().rstrip("/")
         self.token = (token or "").strip()
 
     def _headers(self) -> Dict[str, str]:
-        h = {"Accept": "application/json", "Content-Type": "application/json", "User-Agent": f"TFB-PerfTracker/{SCRIPT_VERSION}"}
+        h = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": f"TFB-PerfTracker/{SCRIPT_VERSION}",
+        }
         if self.token:
             h["Authorization"] = f"Bearer {self.token}"
             h["X-APP-TOKEN"] = self.token
         return h
 
-    async def post_json(self, path: str, payload: Dict[str, Any], timeout_sec: float = 30.0) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
+    async def post_json(
+        self, path: str, payload: Dict[str, Any], timeout_sec: float = 30.0
+    ) -> Tuple[Optional[Dict[str, Any]], Optional[str], int]:
         url = f"{self.base_url}{path}"
         if not self.base_url:
             return None, "BACKEND_BASE_URL not set", 0
@@ -650,28 +882,41 @@ class BackendClient:
                 raw = e.read()
             except Exception:
                 raw = b""
-            return None, f"HTTPError {e.code}: {raw[:200]!r}", int(getattr(e, "code", 0) or 0)
+            return None, f"HTTPError {e.code}: {raw[:200]!r}", int(
+                getattr(e, "code", 0) or 0
+            )
         except URLError as e:
             return None, f"URLError: {e}", 0
         except Exception as e:
             return None, str(e), 0
 
-    async def get_top10_rows(self, criteria_overrides: Optional[Dict[str, Any]] = None) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-        # Prefer GET /v1/analysis/top10 via POST with overrides (keeps one method)
-        if criteria_overrides:
-            data, err, _ = await self.post_json("/v1/analysis/top10", criteria_overrides, timeout_sec=45.0)
-        else:
-            data, err, _ = await self.post_json("/v1/analysis/top10", {}, timeout_sec=45.0)
-        if not isinstance(data, dict):
-            return [], {"ok": False, "error": err or "no_data"}
-        rows = data.get("rows") or []
-        if not isinstance(rows, list):
-            rows = []
-        meta = data.get("meta") or {}
-        meta["ok"] = True if not err else False
-        if err:
-            meta["error"] = err
-        return [r for r in rows if isinstance(r, dict)], meta
+    async def get_top10_rows(
+        self, criteria_overrides: Optional[Dict[str, Any]] = None
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """
+        v6.4.0: tries canonical endpoints in order.
+          1) /v1/advanced/top10-investments  (preferred)
+          2) /v1/advanced/top10              (alias of 1)
+          3) /v1/analysis/top10              (legacy fallback)
+        """
+        body = dict(criteria_overrides or {})
+        last_err: Optional[str] = None
+        for endpoint in _TOP10_ENDPOINTS:
+            data, err, code = await self.post_json(endpoint, body, timeout_sec=45.0)
+            if isinstance(data, dict) and not err:
+                rows = _extract_rows_from_envelope(data)
+                meta = dict(data.get("meta") or {})
+                meta["ok"] = True
+                meta["endpoint"] = endpoint
+                meta["count"] = len(rows)
+                return rows, meta
+            if err:
+                last_err = f"{endpoint}: {err}"
+                # Only keep trying on 404 (not-found) — other errors (auth,
+                # 500) likely mean the endpoint exists but errored.
+                if code and code not in (0, 404):
+                    return [], {"ok": False, "error": last_err, "endpoint": endpoint}
+        return [], {"ok": False, "error": last_err or "no_data", "endpoint": None}
 
     async def fetch_prices(self, symbols: List[str]) -> Dict[str, float]:
         syms = [s.strip().upper() for s in (symbols or []) if s and str(s).strip()]
@@ -679,59 +924,122 @@ class BackendClient:
         if not syms:
             return {}
 
-        # 1) /quotes (if exists in your main)
-        data, err, code = await self.post_json("/quotes", {"symbols": syms, "include_raw": False}, timeout_sec=30.0)
+        # v6.4.0: preferred canonical endpoint — /v1/enriched/quotes
+        # (same one used by run_market_scan v5.3.0).
+        data, err, code = await self.post_json(
+            _QUOTES_ENDPOINT_PRIMARY,
+            {"symbols": syms, "format": "items", "include_raw": False, "debug": False},
+            timeout_sec=30.0,
+        )
         if isinstance(data, dict) and code == 200 and not err:
-            # common shape: {"data": {SYM: {...}}} OR {SYM:{...}}
-            blob = data.get("data") if isinstance(data.get("data"), dict) else data
-            if isinstance(blob, dict):
+            rows = _extract_rows_from_envelope(data)
+            if rows:
                 out: Dict[str, float] = {}
+                for r in rows:
+                    sym = _safe_str(r.get("symbol")).upper()
+                    price = _safe_float(
+                        r.get("current_price")
+                        or r.get("price")
+                        or r.get("last")
+                        or r.get("last_price"),
+                        default=0.0,
+                    )
+                    if sym and price > 0:
+                        out[sym] = price
+                if out:
+                    return out
+            # shape 2: {"data": {SYM: {...}}}
+            blob = data.get("data") if isinstance(data.get("data"), dict) else None
+            if isinstance(blob, dict):
+                out = {}
                 for k, v in blob.items():
                     if isinstance(v, dict):
-                        p = v.get("current_price") or v.get("price") or v.get("last") or v.get("last_price")
+                        p = (
+                            v.get("current_price")
+                            or v.get("price")
+                            or v.get("last")
+                            or v.get("last_price")
+                        )
                         fv = _safe_float(p, default=0.0)
                         if fv > 0:
                             out[str(k).upper()] = fv
                 if out:
                     return out
 
-        # 2) /v1/enriched/sheet-rows (fallback)
+        # Legacy /quotes endpoint
         data, err, code = await self.post_json(
-            "/v1/enriched/sheet-rows",
-            {"page": "Global_Markets", "symbols": syms, "include_matrix": False, "top_n": len(syms)},
+            _QUOTES_ENDPOINT_LEGACY,
+            {"symbols": syms, "include_raw": False},
+            timeout_sec=30.0,
+        )
+        if isinstance(data, dict) and code == 200 and not err:
+            blob = data.get("data") if isinstance(data.get("data"), dict) else data
+            if isinstance(blob, dict):
+                out = {}
+                for k, v in blob.items():
+                    if isinstance(v, dict):
+                        p = (
+                            v.get("current_price")
+                            or v.get("price")
+                            or v.get("last")
+                            or v.get("last_price")
+                        )
+                        fv = _safe_float(p, default=0.0)
+                        if fv > 0:
+                            out[str(k).upper()] = fv
+                if out:
+                    return out
+
+        # /v1/enriched/sheet-rows fallback
+        data, err, code = await self.post_json(
+            _SHEET_ROWS_ENRICHED,
+            {
+                "page": "Global_Markets",
+                "symbols": syms,
+                "include_matrix": False,
+                "top_n": len(syms),
+            },
             timeout_sec=45.0,
         )
         if isinstance(data, dict) and code == 200 and not err:
-            rows = data.get("rows") if isinstance(data.get("rows"), list) else []
+            rows = _extract_rows_from_envelope(data)
             out = {}
             for r in rows:
-                if isinstance(r, dict):
-                    sym = _safe_str(r.get("symbol")).upper()
-                    price = _safe_float(r.get("current_price") or r.get("price"), default=0.0)
-                    if sym and price > 0:
-                        out[sym] = price
+                sym = _safe_str(r.get("symbol")).upper()
+                price = _safe_float(
+                    r.get("current_price") or r.get("price"), default=0.0
+                )
+                if sym and price > 0:
+                    out[sym] = price
             if out:
                 return out
 
-        # 3) /v1/analysis/sheet-rows (fallback)
+        # /v1/analysis/sheet-rows fallback
         data, err, code = await self.post_json(
-            "/v1/analysis/sheet-rows",
-            {"page": "Global_Markets", "symbols": syms, "include_matrix": False, "top_n": len(syms)},
+            _SHEET_ROWS_ANALYSIS,
+            {
+                "page": "Global_Markets",
+                "symbols": syms,
+                "include_matrix": False,
+                "top_n": len(syms),
+            },
             timeout_sec=45.0,
         )
         if isinstance(data, dict) and code == 200 and not err:
-            rows = data.get("rows") if isinstance(data.get("rows"), list) else []
+            rows = _extract_rows_from_envelope(data)
             out = {}
             for r in rows:
-                if isinstance(r, dict):
-                    sym = _safe_str(r.get("symbol")).upper()
-                    price = _safe_float(r.get("current_price") or r.get("price"), default=0.0)
-                    if sym and price > 0:
-                        out[sym] = price
+                sym = _safe_str(r.get("symbol")).upper()
+                price = _safe_float(
+                    r.get("current_price") or r.get("price"), default=0.0
+                )
+                if sym and price > 0:
+                    out[sym] = price
             if out:
                 return out
 
         return {}
+
 
 # =============================================================================
 # Store (Google Sheets) — best-effort, gspread-based
@@ -785,7 +1093,11 @@ class PerformanceStore:
 
     def _load_sa_credentials_best_effort(self) -> Optional[Any]:
         # Accept GOOGLE_SHEETS_CREDENTIALS as JSON or base64(JSON)
-        raw = (os.getenv("GOOGLE_SHEETS_CREDENTIALS") or os.getenv("GOOGLE_CREDENTIALS") or "").strip()
+        raw = (
+            os.getenv("GOOGLE_SHEETS_CREDENTIALS")
+            or os.getenv("GOOGLE_CREDENTIALS")
+            or ""
+        ).strip()
         if not raw:
             return None
         s = raw
@@ -822,7 +1134,9 @@ class PerformanceStore:
             try:
                 self.ws = self.sheet.worksheet(self.sheet_name)
             except Exception:
-                self.ws = self.sheet.add_worksheet(title=self.sheet_name, rows=2000, cols=80)
+                self.ws = self.sheet.add_worksheet(
+                    title=self.sheet_name, rows=2000, cols=80
+                )
 
             self.backoff.execute_sync(self._ensure_headers)
         except Exception as e:
@@ -834,7 +1148,6 @@ class PerformanceStore:
     def _ensure_headers(self) -> None:
         if not self.ws:
             return
-        # check row 5 headers
         try:
             existing = self.ws.row_values(self.START_ROW)
         except Exception:
@@ -844,7 +1157,6 @@ class PerformanceStore:
             rng = _a1_range(1, self.START_ROW, end_col, self.START_ROW)
             self.ws.update(rng, [self.HEADERS])
 
-            # light summary block A1:E15
             summary = [
                 ["Performance Summary", "", "", f"Generated: {RiyadhTime.format()}", ""],
                 ["Total Records", "0", "", "", ""],
@@ -891,49 +1203,51 @@ class PerformanceStore:
             logger.error("Failed to load records: %s", e)
             return []
 
+    def _record_to_row(self, r: PerformanceRecord) -> List[Any]:
+        return [
+            r.record_id,
+            r.key,
+            r.symbol,
+            r.horizon.value,
+            RiyadhTime.format(r.date_recorded),
+            r.entry_price,
+            r.entry_recommendation.value,
+            r.entry_score,
+            r.entry_risk_bucket,
+            r.entry_confidence,
+            r.origin_tab,
+            r.target_price,
+            r.target_roi,
+            RiyadhTime.format(r.target_date),
+            r.status.value,
+            r.current_price,
+            r.unrealized_roi,
+            "" if r.realized_roi is None else r.realized_roi,
+            r.outcome or "",
+            r.volatility,
+            r.max_drawdown,
+            r.sharpe_ratio,
+            r.sector or "",
+            json_dumps(r.factor_exposures) if r.factor_exposures else "{}",
+            RiyadhTime.format(r.last_updated.astimezone(_RIYADH_TZ)),
+            RiyadhTime.format(r.maturity_date) if r.maturity_date else "",
+            r.notes or "",
+        ]
+
     def save_records(self, records: List[PerformanceRecord]) -> bool:
         if not self.ws:
             return False
         end_col = len(self.HEADERS)
 
-        data: List[List[Any]] = []
-        for r in records:
-            data.append([
-                r.record_id,
-                r.key,
-                r.symbol,
-                r.horizon.value,
-                RiyadhTime.format(r.date_recorded),
-                r.entry_price,
-                r.entry_recommendation.value,
-                r.entry_score,
-                r.entry_risk_bucket,
-                r.entry_confidence,
-                r.origin_tab,
-                r.target_price,
-                r.target_roi,
-                RiyadhTime.format(r.target_date),
-                r.status.value,
-                r.current_price,
-                r.unrealized_roi,
-                "" if r.realized_roi is None else r.realized_roi,
-                r.outcome or "",
-                r.volatility,
-                r.max_drawdown,
-                r.sharpe_ratio,
-                r.sector or "",
-                json_dumps(r.factor_exposures) if r.factor_exposures else "{}",
-                RiyadhTime.format(r.last_updated.astimezone(_RIYADH_TZ)),
-                RiyadhTime.format(r.maturity_date) if r.maturity_date else "",
-                r.notes or "",
-            ])
+        data: List[List[Any]] = [self._record_to_row(r) for r in records]
 
         def _save() -> None:
-            # clear old data region
             clear_rng = _a1_range(1, self.DATA_ROW0, end_col, 10000)
             self.ws.batch_clear([clear_rng])  # type: ignore
             if data:
-                write_rng = _a1_range(1, self.DATA_ROW0, end_col, self.DATA_ROW0 + len(data) - 1)
+                write_rng = _a1_range(
+                    1, self.DATA_ROW0, end_col, self.DATA_ROW0 + len(data) - 1
+                )
                 self.ws.update(write_rng, data)  # type: ignore
 
         try:
@@ -954,40 +1268,12 @@ class PerformanceStore:
         if not new:
             return True
 
-        rows: List[List[Any]] = []
-        for r in new:
-            rows.append([
-                r.record_id,
-                r.key,
-                r.symbol,
-                r.horizon.value,
-                RiyadhTime.format(r.date_recorded),
-                r.entry_price,
-                r.entry_recommendation.value,
-                r.entry_score,
-                r.entry_risk_bucket,
-                r.entry_confidence,
-                r.origin_tab,
-                r.target_price,
-                r.target_roi,
-                RiyadhTime.format(r.target_date),
-                r.status.value,
-                r.current_price,
-                r.unrealized_roi,
-                "" if r.realized_roi is None else r.realized_roi,
-                r.outcome or "",
-                r.volatility,
-                r.max_drawdown,
-                r.sharpe_ratio,
-                r.sector or "",
-                json_dumps(r.factor_exposures) if r.factor_exposures else "{}",
-                RiyadhTime.format(r.last_updated.astimezone(_RIYADH_TZ)),
-                RiyadhTime.format(r.maturity_date) if r.maturity_date else "",
-                r.notes or "",
-            ])
+        rows: List[List[Any]] = [self._record_to_row(r) for r in new]
 
         try:
-            self.backoff.execute_sync(lambda: self.ws.append_rows(rows, value_input_option="RAW"))  # type: ignore
+            self.backoff.execute_sync(
+                lambda: self.ws.append_rows(rows, value_input_option="RAW")  # type: ignore
+            )
             with self.cache_lock:
                 for r in new:
                     self.cache[r.key] = r
@@ -1019,6 +1305,7 @@ class PerformanceStore:
             return True
         except Exception:
             return False
+
 
 # =============================================================================
 # Analytics
@@ -1054,18 +1341,30 @@ class RiskCalculator:
             return 0.0
         return float(np.mean(excess) / np.std(downside) * math.sqrt(252))
 
+
 class MonteCarloSimulator:
     def __init__(self, seed: Optional[int] = None):
         self.seed = seed
         if NUMPY_AVAILABLE and np is not None and seed is not None:
             np.random.seed(seed)
 
-    def simulate_win_rate(self, outcomes: List[bool], iterations: int = 10000, confidence: float = 0.95) -> Dict[str, float]:
+    def simulate_win_rate(
+        self, outcomes: List[bool], iterations: int = 10000, confidence: float = 0.95
+    ) -> Dict[str, float]:
         if not outcomes or not NUMPY_AVAILABLE or np is None:
-            return {"mean": 0.0, "median": 0.0, "std": 0.0, "ci_lower": 0.0, "ci_upper": 0.0, "observed": 0.0}
+            return {
+                "mean": 0.0, "median": 0.0, "std": 0.0,
+                "ci_lower": 0.0, "ci_upper": 0.0, "observed": 0.0,
+            }
         n = len(outcomes)
         observed = sum(1 for x in outcomes if x) / n
-        sims = np.array([np.mean(np.random.choice(outcomes, size=n, replace=True)) for _ in range(max(100, int(iterations)))], dtype=float)
+        sims = np.array(
+            [
+                np.mean(np.random.choice(outcomes, size=n, replace=True))
+                for _ in range(max(100, int(iterations)))
+            ],
+            dtype=float,
+        )
         lo = float(np.percentile(sims, ((1 - confidence) / 2) * 100))
         hi = float(np.percentile(sims, ((1 + confidence) / 2) * 100))
         return {
@@ -1077,8 +1376,11 @@ class MonteCarloSimulator:
             "observed": float(observed),
         }
 
+
 class AttributionAnalyzer:
-    def by_sector(self, records: List[PerformanceRecord]) -> Dict[str, Dict[str, float]]:
+    def by_sector(
+        self, records: List[PerformanceRecord]
+    ) -> Dict[str, Dict[str, float]]:
         bucket: Dict[str, Dict[str, float]] = {}
         for r in records:
             if not r.sector or r.realized_roi is None:
@@ -1106,6 +1408,7 @@ class AttributionAnalyzer:
             }
         return out
 
+
 class PerformanceAnalyzer:
     def __init__(self):
         self.risk = RiskCalculator()
@@ -1114,8 +1417,14 @@ class PerformanceAnalyzer:
 
     def analyze(self, records: List[PerformanceRecord]) -> PerformanceSummary:
         s = PerformanceSummary(total_records=len(records))
-        s.active_records = sum(1 for r in records if r.status == PerformanceStatus.ACTIVE)
-        matured = [r for r in records if r.status == PerformanceStatus.MATURED and r.realized_roi is not None]
+        s.active_records = sum(
+            1 for r in records if r.status == PerformanceStatus.ACTIVE
+        )
+        matured = [
+            r
+            for r in records
+            if r.status == PerformanceStatus.MATURED and r.realized_roi is not None
+        ]
         s.matured_records = len(matured)
 
         if matured:
@@ -1142,11 +1451,9 @@ class PerformanceAnalyzer:
                 s.worst_roi = min(rois_sorted)
 
             if len(rois) > 2:
-                # treat ROI as daily returns proxy (best-effort)
                 s.sharpe_ratio = self.risk.sharpe_ratio(rois)
                 s.sortino_ratio = self.risk.sortino_ratio(rois)
 
-            # hit rate by horizon
             groups: Dict[str, List[PerformanceRecord]] = defaultdict(list)
             for r in matured:
                 groups[r.horizon.value].append(r)
@@ -1164,6 +1471,7 @@ class PerformanceAnalyzer:
 
         return s
 
+
 # =============================================================================
 # Reporting
 # =============================================================================
@@ -1171,10 +1479,22 @@ class ReportGenerator:
     def __init__(self, analyzer: PerformanceAnalyzer):
         self.analyzer = analyzer
 
-    def generate_json(self, records: List[PerformanceRecord], summary: PerformanceSummary) -> str:
-        matured = [r for r in records if r.status == PerformanceStatus.MATURED and r.realized_roi is not None]
+    def generate_json(
+        self, records: List[PerformanceRecord], summary: PerformanceSummary
+    ) -> str:
+        matured = [
+            r
+            for r in records
+            if r.status == PerformanceStatus.MATURED and r.realized_roi is not None
+        ]
         outcomes = [(r.realized_roi or 0.0) > 0 for r in matured]
-        ci = self.analyzer.sim.simulate_win_rate(outcomes, iterations=10000, confidence=0.95) if outcomes else {}
+        ci = (
+            self.analyzer.sim.simulate_win_rate(
+                outcomes, iterations=10000, confidence=0.95
+            )
+            if outcomes
+            else {}
+        )
         report = {
             "generated_at_riyadh": RiyadhTime.format(),
             "version": SCRIPT_VERSION,
@@ -1184,7 +1504,9 @@ class ReportGenerator:
         }
         return json_dumps(report, indent=2)
 
-    def generate_csv(self, records: List[PerformanceRecord], filepath: str) -> None:
+    def generate_csv(
+        self, records: List[PerformanceRecord], filepath: str
+    ) -> None:
         if not records:
             return
         rows = [r.to_dict() for r in records]
@@ -1199,19 +1521,33 @@ class ReportGenerator:
         fig.savefig(buf, format="png", dpi=110, bbox_inches="tight")
         return base64.b64encode(buf.getvalue()).decode("utf-8")
 
-    def generate_html(self, records: List[PerformanceRecord], summary: PerformanceSummary, filepath: str) -> None:
+    def generate_html(
+        self,
+        records: List[PerformanceRecord],
+        summary: PerformanceSummary,
+        filepath: str,
+    ) -> None:
         plots: Dict[str, str] = {}
         if PLOT_AVAILABLE and Figure is not None and NUMPY_AVAILABLE and np is not None:
             try:
-                matured = [r for r in records if r.status == PerformanceStatus.MATURED and r.realized_roi is not None]
+                matured = [
+                    r
+                    for r in records
+                    if r.status == PerformanceStatus.MATURED
+                    and r.realized_roi is not None
+                ]
                 matured.sort(key=lambda x: (x.maturity_date or x.date_recorded))
 
                 if matured:
-                    # win-rate over time
                     fig1 = Figure(figsize=(10, 5))
                     ax1 = fig1.add_subplot(111)
-                    dates = [(r.maturity_date or r.date_recorded).astimezone(_RIYADH_TZ) for r in matured]
-                    wins = np.cumsum([1 if (r.realized_roi or 0.0) > 0 else 0 for r in matured])
+                    dates = [
+                        (r.maturity_date or r.date_recorded).astimezone(_RIYADH_TZ)
+                        for r in matured
+                    ]
+                    wins = np.cumsum(
+                        [1 if (r.realized_roi or 0.0) > 0 else 0 for r in matured]
+                    )
                     denom = np.arange(1, len(matured) + 1, dtype=float)
                     win_rate = (wins / denom) * 100.0
                     ax1.plot(dates, win_rate, linewidth=2)
@@ -1221,8 +1557,9 @@ class ReportGenerator:
                     ax1.grid(True, alpha=0.25)
                     plots["win_rate"] = self._plot_png_base64(fig1)
 
-                    # ROI histogram (matplotlib only)
-                    roi = np.asarray([float(r.realized_roi or 0.0) for r in matured], dtype=float)
+                    roi = np.asarray(
+                        [float(r.realized_roi or 0.0) for r in matured], dtype=float
+                    )
                     fig2 = Figure(figsize=(10, 5))
                     ax2 = fig2.add_subplot(111)
                     ax2.hist(roi, bins=30)
@@ -1275,9 +1612,20 @@ class ReportGenerator:
 """
         recs = sorted(records, key=lambda r: r.date_recorded, reverse=True)[:30]
         for r in recs:
-            roi = r.realized_roi if r.realized_roi is not None else r.unrealized_roi
-            cls = "pos" if (roi or 0.0) > 0 else "neg" if (roi or 0.0) < 0 else ""
-            html += f"<tr><td><b>{r.symbol}</b></td><td>{r.horizon.value}</td><td>{RiyadhTime.format(r.date_recorded, '%Y-%m-%d')}</td><td>{r.status.value}</td><td class='{cls}'>{roi:.2f}%</td><td>{r.outcome or ''}</td></tr>\n"
+            # v6.4.0: coerce to 0.0 BEFORE format spec to avoid TypeError
+            roi_raw = (
+                r.realized_roi if r.realized_roi is not None else r.unrealized_roi
+            )
+            roi = float(roi_raw) if roi_raw is not None else 0.0
+            cls = "pos" if roi > 0 else "neg" if roi < 0 else ""
+            html += (
+                f"<tr><td><b>{r.symbol}</b></td>"
+                f"<td>{r.horizon.value}</td>"
+                f"<td>{RiyadhTime.format(r.date_recorded, '%Y-%m-%d')}</td>"
+                f"<td>{r.status.value}</td>"
+                f"<td class='{cls}'>{roi:.2f}%</td>"
+                f"<td>{r.outcome or ''}</td></tr>\n"
+            )
 
         html += """  </table>
 </div>
@@ -1286,14 +1634,18 @@ class ReportGenerator:
 """
         Path(filepath).write_text(html, encoding="utf-8")
 
+
 # =============================================================================
 # Orchestrator
 # =============================================================================
 class PerformanceTrackerApp:
     def __init__(self, args: argparse.Namespace):
         self.args = args
-        self.spreadsheet_id = self._get_spreadsheet_id()
-        self.store = PerformanceStore(self.spreadsheet_id, args.sheet_name or PerformanceStore.SHEET_DEFAULT)
+        # v6.4.0: don't raise here; let main() check and return 1
+        self.spreadsheet_id = self._resolve_spreadsheet_id()
+        self.store = PerformanceStore(
+            self.spreadsheet_id, args.sheet_name or PerformanceStore.SHEET_DEFAULT
+        )
         self.analyzer = PerformanceAnalyzer()
         self.reporter = ReportGenerator(self.analyzer)
 
@@ -1304,25 +1656,37 @@ class PerformanceTrackerApp:
 
         self.stop_event = Event()
 
-    def _get_spreadsheet_id(self) -> str:
+    def _resolve_spreadsheet_id(self) -> str:
         if self.args.sheet_id and str(self.args.sheet_id).strip():
             return str(self.args.sheet_id).strip()
+
+        sid = (os.getenv("TRACK_SHEET_ID") or "").strip()
+        if sid:
+            return sid
 
         sid = (os.getenv("DEFAULT_SPREADSHEET_ID") or "").strip()
         if sid:
             return sid
 
-        sid = (getattr(settings, "default_spreadsheet_id", None) or "").strip() if settings else ""
+        sid = (
+            (getattr(settings, "default_spreadsheet_id", None) or "").strip()
+            if settings
+            else ""
+        )
         if sid:
             return sid
 
-        raise ValueError("No spreadsheet ID provided (use --sheet-id or DEFAULT_SPREADSHEET_ID env).")
+        return ""
 
     def _backend_base_url(self) -> str:
         env_url = (os.getenv("BACKEND_BASE_URL") or "").strip()
         if env_url:
             return env_url.rstrip("/")
-        cfg_url = (getattr(settings, "backend_base_url", None) or "").strip() if settings else ""
+        cfg_url = (
+            (getattr(settings, "backend_base_url", None) or "").strip()
+            if settings
+            else ""
+        )
         if cfg_url:
             return cfg_url.rstrip("/")
         return (os.getenv("TFB_BASE_URL") or "").strip().rstrip("/")
@@ -1338,7 +1702,6 @@ class PerformanceTrackerApp:
         out: List[HorizonType] = []
         for raw in (self.args.horizons or ["1M", "3M"]):
             out.append(_parse_enum_value(HorizonType, raw, HorizonType.MONTH_1))
-        # dedup preserve order
         seen = set()
         final = []
         for h in out:
@@ -1347,9 +1710,18 @@ class PerformanceTrackerApp:
                 final.append(h)
         return final
 
-    def _derive_target(self, row: Dict[str, Any], horizon: HorizonType, entry_price: float) -> Tuple[float, float]:
-        # returns (target_price, target_roi_pct)
-        suffix = "1m" if horizon.value == "1M" else "3m" if horizon.value == "3M" else "12m" if horizon.value == "1Y" else ""
+    def _derive_target(
+        self, row: Dict[str, Any], horizon: HorizonType, entry_price: float
+    ) -> Tuple[float, float]:
+        suffix = (
+            "1m"
+            if horizon.value == "1M"
+            else "3m"
+            if horizon.value == "3M"
+            else "12m"
+            if horizon.value == "1Y"
+            else ""
+        )
         fkey = f"forecast_price_{suffix}" if suffix else ""
         rkey = f"expected_roi_{suffix}" if suffix else ""
 
@@ -1377,13 +1749,24 @@ class PerformanceTrackerApp:
             return RecommendationType.HOLD
         return RecommendationType.HOLD
 
-    async def record_from_top10(self, existing: List[PerformanceRecord]) -> List[PerformanceRecord]:
+    async def record_from_top10(
+        self, existing: List[PerformanceRecord]
+    ) -> List[PerformanceRecord]:
         if not self.backend.base_url:
             return []
 
         rows, meta = await self.backend.get_top10_rows(criteria_overrides=None)
         if not rows:
+            if meta.get("error"):
+                logger.warning(
+                    "record_from_top10: no rows (%s)", meta.get("error")
+                )
             return []
+        logger.info(
+            "record_from_top10: %d rows from %s",
+            len(rows),
+            meta.get("endpoint") or "unknown",
+        )
 
         existing_keys = set(r.key for r in existing)
         now = RiyadhTime.now()
@@ -1394,22 +1777,32 @@ class PerformanceTrackerApp:
             sym = _safe_str(row.get("symbol")).upper()
             if not sym:
                 continue
-            entry_price = _safe_float(row.get("current_price") or row.get("price"), default=0.0)
+            entry_price = _safe_float(
+                row.get("current_price") or row.get("price"), default=0.0
+            )
             if entry_price <= 0.0:
                 continue
 
             score = _safe_float(row.get("overall_score"), default=0.0)
             risk_score = row.get("risk_score")
             conf = row.get("forecast_confidence")
-            risk_bucket = _risk_bucket_from_score(_safe_float(risk_score, default=0.0) if risk_score is not None else None)
-            conf_bucket = _confidence_bucket(_safe_float(conf, default=0.0) if conf is not None else None)
+            risk_bucket = _risk_bucket_from_score(
+                _safe_float(risk_score, default=0.0) if risk_score is not None else None
+            )
+            conf_bucket = _confidence_bucket(
+                _safe_float(conf, default=0.0) if conf is not None else None
+            )
             rec = self._recommendation_from_row(row)
-            origin = _safe_str(row.get("source_page") or row.get("origin") or "Top_10_Investments") or "Top_10_Investments"
+            origin = (
+                _safe_str(
+                    row.get("source_page") or row.get("origin") or "Top_10_Investments"
+                )
+                or "Top_10_Investments"
+            )
 
             for h in horizons:
                 tgt_price, tgt_roi = self._derive_target(row, h, entry_price)
                 if tgt_price <= 0.0:
-                    # still track, but keep target at entry
                     tgt_price = entry_price
                     tgt_roi = 0.0
 
@@ -1439,14 +1832,21 @@ class PerformanceTrackerApp:
 
         return new_records
 
-    async def audit_active_records(self, records: List[PerformanceRecord]) -> List[PerformanceRecord]:
-        # Update current_price/unrealized; mature if target_date passed
-        active = [r for r in records if r.status == PerformanceStatus.ACTIVE and r.symbol]
+    async def audit_active_records(
+        self, records: List[PerformanceRecord]
+    ) -> List[PerformanceRecord]:
+        active = [
+            r for r in records if r.status == PerformanceStatus.ACTIVE and r.symbol
+        ]
         if not active:
             return records
 
         syms = list(dict.fromkeys([r.symbol for r in active]))
-        price_map = await self.backend.fetch_prices(syms) if self.backend.base_url else {}
+        price_map = (
+            await self.backend.fetch_prices(syms)
+            if self.backend.base_url
+            else {}
+        )
         now_r = RiyadhTime.now()
 
         for r in active:
@@ -1456,7 +1856,6 @@ class PerformanceTrackerApp:
                 if r.entry_price > 0:
                     r.unrealized_roi = (px / r.entry_price - 1.0) * 100.0
 
-            # maturity check
             if r.target_date and now_r >= r.target_date:
                 r.status = PerformanceStatus.MATURED
                 r.maturity_date = now_r
@@ -1473,28 +1872,39 @@ class PerformanceTrackerApp:
         return records
 
     async def run_once(self) -> int:
-        # Load records (if store missing, we can still export analysis-only from backend)
         loop = asyncio.get_running_loop()
         records: List[PerformanceRecord] = []
 
         if self.store.is_available():
-            records = await loop.run_in_executor(_CPU_EXECUTOR, self.store.load_records, int(self.args.max_records or 10000))
+            records = await loop.run_in_executor(
+                _get_executor(),
+                self.store.load_records,
+                int(self.args.max_records or 10000),
+            )
         else:
             records = []
 
         if self.args.record:
             new = await self.record_from_top10(records)
             if new and self.store.is_available():
-                ok = await loop.run_in_executor(_CPU_EXECUTOR, self.store.append_records, new)
+                ok = await loop.run_in_executor(
+                    _get_executor(), self.store.append_records, new
+                )
                 if ok:
                     records.extend(new)
 
         if self.args.audit:
             records = await self.audit_active_records(records)
             if self.store.is_available():
-                await loop.run_in_executor(_CPU_EXECUTOR, self.store.save_records, records)
+                await loop.run_in_executor(
+                    _get_executor(), self.store.save_records, records
+                )
 
-        summary = self.analyzer.analyze(records) if self.args.analyze or self.args.export else PerformanceSummary(total_records=len(records))
+        summary = (
+            self.analyzer.analyze(records)
+            if self.args.analyze or self.args.export
+            else PerformanceSummary(total_records=len(records))
+        )
         try:
             perf_records_processed.inc(len(records))
         except Exception:
@@ -1502,28 +1912,58 @@ class PerformanceTrackerApp:
 
         if self.args.analyze:
             if self.store.is_available():
-                await loop.run_in_executor(_CPU_EXECUTOR, self.store.update_summary, summary)
+                await loop.run_in_executor(
+                    _get_executor(), self.store.update_summary, summary
+                )
             _out("=" * 66)
             _out("📊 PERFORMANCE SUMMARY")
             _out("=" * 66)
-            _out(f"Total: {summary.total_records} | Active: {summary.active_records} | Matured: {summary.matured_records}")
-            _out(f"Wins: {summary.wins} | Losses: {summary.losses} | WinRate: {summary.win_rate:.1f}%")
-            _out(f"Avg ROI: {summary.avg_roi:.2f}% | Sharpe: {summary.sharpe_ratio:.2f} | Sortino: {summary.sortino_ratio:.2f}")
+            _out(
+                f"Total: {summary.total_records} | Active: {summary.active_records} "
+                f"| Matured: {summary.matured_records}"
+            )
+            _out(
+                f"Wins: {summary.wins} | Losses: {summary.losses} "
+                f"| WinRate: {summary.win_rate:.1f}%"
+            )
+            _out(
+                f"Avg ROI: {summary.avg_roi:.2f}% "
+                f"| Sharpe: {summary.sharpe_ratio:.2f} "
+                f"| Sortino: {summary.sortino_ratio:.2f}"
+            )
 
         if self.args.simulate:
-            matured = [r for r in records if r.status == PerformanceStatus.MATURED and r.realized_roi is not None]
+            matured = [
+                r
+                for r in records
+                if r.status == PerformanceStatus.MATURED
+                and r.realized_roi is not None
+            ]
             outcomes = [(r.realized_roi or 0.0) > 0 for r in matured]
             if outcomes:
-                ci = self.analyzer.sim.simulate_win_rate(outcomes, iterations=int(self.args.iterations or 10000), confidence=float(self.args.confidence or 0.95))
-                _out(f"Win-Rate Simulation (mean): {ci['mean']*100:.1f}% | CI: [{ci['ci_lower']*100:.1f}%, {ci['ci_upper']*100:.1f}%] | observed: {ci['observed']*100:.1f}%")
+                ci = self.analyzer.sim.simulate_win_rate(
+                    outcomes,
+                    iterations=int(self.args.iterations or 10000),
+                    confidence=float(self.args.confidence or 0.95),
+                )
+                _out(
+                    f"Win-Rate Simulation (mean): {ci['mean']*100:.1f}% "
+                    f"| CI: [{ci['ci_lower']*100:.1f}%, {ci['ci_upper']*100:.1f}%] "
+                    f"| observed: {ci['observed']*100:.1f}%"
+                )
             else:
                 _out("Simulation skipped: no matured outcomes.")
 
         if self.args.export:
-            out_base = (self.args.output or f"performance_report_{RiyadhTime.format(fmt='%Y%m%d_%H%M%S')}").strip()
+            out_base = (
+                self.args.output
+                or f"performance_report_{RiyadhTime.format(fmt='%Y%m%d_%H%M%S')}"
+            ).strip()
             fmt = (self.args.format or "html").lower()
             if fmt in {"json", "all"}:
-                Path(out_base + ".json").write_text(self.reporter.generate_json(records, summary), encoding="utf-8")
+                Path(out_base + ".json").write_text(
+                    self.reporter.generate_json(records, summary), encoding="utf-8"
+                )
             if fmt in {"csv", "all"}:
                 self.reporter.generate_csv(records, out_base + ".csv")
             if fmt in {"html", "all"}:
@@ -1554,28 +1994,116 @@ class PerformanceTrackerApp:
     def stop(self) -> None:
         self.stop_event.set()
 
+
 # =============================================================================
 # CLI
 # =============================================================================
 def create_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(description=f"Tadawul Fast Bridge - Performance Tracker v{SCRIPT_VERSION}")
-    p.add_argument("--sheet-id", help="Spreadsheet ID (or DEFAULT_SPREADSHEET_ID env)")
-    p.add_argument("--sheet-name", default="Performance_Log", help="Performance log tab name")
-    p.add_argument("--record", action="store_true", help="Record new recommendations (best-effort from /v1/analysis/top10)")
-    p.add_argument("--audit", action="store_true", help="Audit/update active records (fetch current prices from backend if configured)")
-    p.add_argument("--analyze", action="store_true", help="Analyze performance + write summary block in sheet")
-    p.add_argument("--simulate", action="store_true", help="Run Monte Carlo win-rate simulation (needs numpy)")
-    p.add_argument("--export", action="store_true", help="Export performance report")
-    p.add_argument("--daemon", action="store_true", help="Run continuously (daemon)")
-    p.add_argument("--horizons", nargs="+", default=["1M", "3M"], help="Horizons to track (e.g., 1W 1M 3M 6M 1Y)")
-    p.add_argument("--max-records", type=int, default=10000, help="Max records to load from sheet")
-    p.add_argument("--confidence", type=float, default=0.95, help="Confidence level (simulation)")
-    p.add_argument("--iterations", type=int, default=10000, help="Monte Carlo iterations")
-    p.add_argument("--format", choices=["json", "csv", "html", "all"], default="html", help="Export format")
-    p.add_argument("--output", help="Output file base path (without extension)")
-    p.add_argument("--interval", type=int, default=3600, help="Daemon interval seconds")
-    p.add_argument("--verbose", "-v", action="store_true", help="Verbose logs")
+    p = argparse.ArgumentParser(
+        description=f"Tadawul Fast Bridge - Performance Tracker v{SCRIPT_VERSION}"
+    )
+    p.add_argument(
+        "--sheet-id",
+        default=os.getenv("TRACK_SHEET_ID") or None,
+        help="Spreadsheet ID (also TRACK_SHEET_ID / DEFAULT_SPREADSHEET_ID env).",
+    )
+    p.add_argument(
+        "--sheet-name",
+        default=os.getenv("TRACK_SHEET_NAME", "Performance_Log"),
+        help="Performance log tab name (also TRACK_SHEET_NAME env; default Performance_Log).",
+    )
+    p.add_argument(
+        "--record",
+        action="store_true",
+        default=_env_bool("TRACK_RECORD", False),
+        help=(
+            "Record new recommendations from /v1/advanced/top10-investments "
+            "(also TRACK_RECORD env)."
+        ),
+    )
+    p.add_argument(
+        "--audit",
+        action="store_true",
+        default=_env_bool("TRACK_AUDIT", False),
+        help="Audit/update active records (also TRACK_AUDIT env).",
+    )
+    p.add_argument(
+        "--analyze",
+        action="store_true",
+        default=_env_bool("TRACK_ANALYZE", False),
+        help="Analyze performance + write summary block in sheet (also TRACK_ANALYZE env).",
+    )
+    p.add_argument(
+        "--simulate",
+        action="store_true",
+        default=_env_bool("TRACK_SIMULATE", False),
+        help="Monte Carlo win-rate simulation (requires numpy; also TRACK_SIMULATE env).",
+    )
+    p.add_argument(
+        "--export",
+        action="store_true",
+        default=_env_bool("TRACK_EXPORT", False),
+        help="Export performance report (also TRACK_EXPORT env).",
+    )
+    p.add_argument(
+        "--daemon",
+        action="store_true",
+        default=_env_bool("TRACK_DAEMON", False),
+        help="Run continuously (daemon; also TRACK_DAEMON env).",
+    )
+    p.add_argument(
+        "--horizons",
+        nargs="+",
+        default=_env_csv("TRACK_HORIZONS", ["1M", "3M"]),
+        help=(
+            "Horizons to track, space- or comma-separated "
+            "(e.g., 1W 1M 3M 6M 1Y; also TRACK_HORIZONS env as CSV)."
+        ),
+    )
+    p.add_argument(
+        "--max-records",
+        type=int,
+        default=_env_int("TRACK_MAX_RECORDS", 10000, lo=1),
+        help="Max records to load from sheet (also TRACK_MAX_RECORDS env).",
+    )
+    p.add_argument(
+        "--confidence",
+        type=float,
+        default=_env_float("TRACK_CONFIDENCE", 0.95),
+        help="Confidence level for simulation (also TRACK_CONFIDENCE env).",
+    )
+    p.add_argument(
+        "--iterations",
+        type=int,
+        default=_env_int("TRACK_ITERATIONS", 10000, lo=100),
+        help="Monte Carlo iterations (also TRACK_ITERATIONS env).",
+    )
+    p.add_argument(
+        "--format",
+        choices=["json", "csv", "html", "all"],
+        default=(os.getenv("TRACK_FORMAT", "html") or "html").lower(),
+        help="Export format (also TRACK_FORMAT env).",
+    )
+    p.add_argument(
+        "--output",
+        default=os.getenv("TRACK_OUTPUT") or None,
+        help="Output file base path without extension (also TRACK_OUTPUT env).",
+    )
+    p.add_argument(
+        "--interval",
+        type=int,
+        default=_env_int("TRACK_INTERVAL", 3600, lo=30),
+        help="Daemon interval seconds (also TRACK_INTERVAL env).",
+    )
+    p.add_argument(
+        "--verbose",
+        "-v",
+        action="store_true",
+        default=_env_bool("TRACK_VERBOSE", False),
+        help="Verbose logs (also TRACK_VERBOSE env).",
+    )
     return p
+
 
 async def async_main() -> int:
     args = create_parser().parse_args()
@@ -1583,11 +2111,25 @@ async def async_main() -> int:
         logging.getLogger().setLevel(logging.DEBUG)
 
     # If nothing selected, show help
-    if not any([args.record, args.audit, args.analyze, args.simulate, args.export, args.daemon]):
+    if not any(
+        [args.record, args.audit, args.analyze, args.simulate, args.export, args.daemon]
+    ):
         _out(create_parser().format_help())
         return 0
 
-    app = PerformanceTrackerApp(args)
+    try:
+        app = PerformanceTrackerApp(args)
+    except Exception as e:
+        logger.error("Failed to initialize PerformanceTrackerApp: %s", e)
+        return 1
+
+    # v6.4.0: clean diagnostic instead of raised exception
+    if not app.spreadsheet_id:
+        logger.error(
+            "No spreadsheet ID provided. Use --sheet-id or set "
+            "TRACK_SHEET_ID / DEFAULT_SPREADSHEET_ID."
+        )
+        return 1
 
     def _sig_handler(_signum, _frame):
         app.stop()
@@ -1603,10 +2145,8 @@ async def async_main() -> int:
             return await app.run_daemon()
         return await app.run_once()
     finally:
-        try:
-            _CPU_EXECUTOR.shutdown(wait=False)
-        except Exception:
-            pass
+        _shutdown_executor()
+
 
 def main() -> int:
     if sys.platform == "win32":
@@ -1621,6 +2161,28 @@ def main() -> int:
     except Exception as e:
         logger.exception("Fatal error: %s", e)
         return 1
+    finally:
+        _shutdown_executor()
+
+
+__all__ = [
+    "SCRIPT_VERSION",
+    "SERVICE_VERSION",
+    "SCRIPT_NAME",
+    "PerformanceStatus",
+    "HorizonType",
+    "RecommendationType",
+    "PerformanceRecord",
+    "PerformanceSummary",
+    "BackendClient",
+    "PerformanceStore",
+    "PerformanceAnalyzer",
+    "ReportGenerator",
+    "PerformanceTrackerApp",
+    "create_parser",
+    "main",
+]
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
