@@ -2,38 +2,91 @@
 """
 scripts/test_sheets_auth.py
 ===========================================================
-TADAWUL FAST BRIDGE – ENTERPRISE SHEETS AUTH DIAGNOSTIC (v6.3.0)
+TADAWUL FAST BRIDGE – ENTERPRISE SHEETS AUTH DIAGNOSTIC (v6.4.0)
 ===========================================================
 
 Design goals (TFB aligned)
 - ✅ Hygiene-checker friendly: NO rich UI, NO print(); uses sys.stdout.write only
-- ✅ Startup-safe: optional deps are soft (script still runs and reports what’s missing)
+- ✅ Startup-safe: optional deps are soft (script still runs and reports what's missing)
 - ✅ Credential discovery: env JSON / env base64 / file path (GOOGLE_APPLICATION_CREDENTIALS)
 - ✅ Private key repair: fixes "\\n" and wrapping issues safely
 - ✅ Auth + access diagnostics:
     - Builds Google Sheets API client
     - Optional Drive API permission audit (if scopes allow)
     - Read / BatchUpdate sanity checks
-    - Optional write test (explicit flag)
+    - Optional write test (explicit flag + confirmation)
 - ✅ Network diagnostics (DNS/TCP/TLS/latency) best-effort
 - ✅ Outputs: console + optional JSON/HTML/JUnit XML artifacts
 - ✅ Exit codes:
-    0 = all good
-    1 = any CRITICAL failure
-    2 = any HIGH failure (no critical)
-    3 = other failures only
+    0   = all good
+    1   = any CRITICAL failure
+    2   = any HIGH failure (no critical)
+    3   = other failures only
+    130 = interrupted (SIGINT)
 
-Notes
-- This script is intentionally “best effort”. It never hides errors, and it never crashes
-  just because an optional library is missing.
+Why this revision (v6.4.0 vs v6.3.0)
+-------------------------------------
+- FIX: Removed dead code that was defined but never called:
+    * `CIDetector` class (detect + annotate_error + annotate_warning) —
+      ~30 lines, zero call sites anywhere in the script.
+    * `PermissionLevel` enum — defined, never instantiated.
+    * `CIProvider` enum (only used internally by the dead CIDetector).
+- FIX: Removed dead imports: `uuid`, `re`, `urlparse`, and the `requests`
+    soft-import with its availability flag (never referenced after import).
+- 🔑 FIX MEDIUM: `_IO_EXECUTOR` is no longer created at module import time.
+    v6.3.0 eagerly spawned 8 worker threads on `import` — noisy for
+    downstream callers that just wanted to exec as a subprocess. v6.4.0
+    uses a lazy `_get_executor()` helper that creates the pool only when
+    needed and shuts it down cleanly with `wait=True` in the finally block.
+- 🔑 FIX MEDIUM: `_IO_EXECUTOR.shutdown(wait=False)` abandoned in-flight
+    tasks on interrupt. v6.4.0 uses `wait=True` in the finally block so
+    exit doesn't leave orphaned threads.
+- FIX: Added project-standard `_TRUTHY`/`_FALSY` vocabulary matching
+    `main._TRUTHY`/`_FALSY`. v6.3.0's `_TRACING_ENABLED` and `REQUIRE_AUTH`
+    checks used partial vocabularies (missing `t`/`enabled`/`enable` etc.).
+- FIX: Added `_env_bool`, `_env_int` helpers.
+- FIX: Added `SERVICE_VERSION = SCRIPT_VERSION` alias.
+- FIX: Added `SHEETS_AUTH_*` env var defaults for all CLI flags so the
+    runner works headlessly in cron/CI.
+- 🔑 FIX SAFETY: `--write` now requires `--write-confirm` (or
+    `SHEETS_AUTH_WRITE_CONFIRM=true`) to actually write to the sheet,
+    matching the `cleanup_cache.py --confirm-flushdb` safety pattern.
+    Prevents accidental writes from `--write` combined with a shared
+    production spreadsheet id.
+- FIX: Exit code 130 (SIGINT) now documented in header.
 
 Usage examples
-- python scripts/test_sheets_auth.py --sheet-id <ID> --sheet-name "Market Leaders" --read-range "A1:C5"
-- python scripts/test_sheets_auth.py --sheet-id <ID> --write --cell "A1"
-- python scripts/test_sheets_auth.py --network-only
-- python scripts/test_sheets_auth.py --sheet-id <ID> --output report.json
-- python scripts/test_sheets_auth.py --sheet-id <ID> --output report.html
-- python scripts/test_sheets_auth.py --sheet-id <ID> --output report.xml
+--------------
+  python scripts/test_sheets_auth.py --sheet-id <ID> --sheet-name "Market Leaders" --read-range "A1:C5"
+  python scripts/test_sheets_auth.py --sheet-id <ID> --write --write-confirm --cell "A1"
+  python scripts/test_sheets_auth.py --network-only
+  python scripts/test_sheets_auth.py --sheet-id <ID> --output report.json
+  python scripts/test_sheets_auth.py --sheet-id <ID> --output report.html
+  python scripts/test_sheets_auth.py --sheet-id <ID> --output report.xml
+
+Environment
+-----------
+  SHEETS_AUTH_SHEET_ID       spreadsheet id (also DEFAULT_SPREADSHEET_ID /
+                             TFB_SPREADSHEET_ID / SPREADSHEET_ID /
+                             GOOGLE_SHEETS_ID / SHEET_ID)
+  SHEETS_AUTH_SHEET_NAME     tab name (default "Sheet1")
+  SHEETS_AUTH_READ_RANGE     read range (default "A1:B2")
+  SHEETS_AUTH_CELL           cell for write test (default "A1")
+  SHEETS_AUTH_WRITE          truthy = run write test
+  SHEETS_AUTH_WRITE_CONFIRM  truthy = acknowledge write destruction
+  SHEETS_AUTH_NETWORK_ONLY   truthy = network diagnostics only
+  SHEETS_AUTH_OUTPUT         output file path (.json/.html/.xml)
+  SHEETS_AUTH_CI_MODE        truthy = CI-friendly output
+  SHEETS_AUTH_QUIET          truthy = minimal output
+  SHEETS_AUTH_VERBOSE        truthy = verbose logging
+  SHEETS_AUTH_RATE_BURST     number of requests in rate-limit burst (default 10)
+  SHEETS_AUTH_RATE_DELAY_MS  delay between burst requests in ms (default 100)
+  GOOGLE_SHEETS_CREDENTIALS /
+  GOOGLE_CREDENTIALS /
+  GOOGLE_APPLICATION_CREDENTIALS  Google service account credentials
+  CORE_TRACING_ENABLED /
+  TRACING_ENABLED            OpenTelemetry tracing (truthy)
+  LOG_LEVEL                  logger level (default info)
 
 ===========================================================
 """
@@ -49,18 +102,67 @@ import logging
 import logging.config
 import os
 import platform
-import re
 import socket
 import ssl
 import sys
 import time
-import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
-from urllib.parse import urlparse
+
+
+# ---------------------------------------------------------------------------
+# Version (declared early so it can be used in _TRACING_ENABLED etc.)
+# ---------------------------------------------------------------------------
+SCRIPT_VERSION = "6.4.0"
+SERVICE_VERSION = SCRIPT_VERSION  # v6.4.0: cross-script alias
+SCRIPT_NAME = "SheetsAuthDiagnostic"
+MIN_PYTHON = (3, 8)
+
+if sys.version_info < MIN_PYTHON:
+    sys.stdout.write(f"❌ Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ required\n")
+    raise SystemExit(1)
+
+
+# ---------------------------------------------------------------------------
+# Project-wide truthy/falsy vocabulary (matches main._TRUTHY / _FALSY)
+# ---------------------------------------------------------------------------
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
+_FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    try:
+        raw = (os.getenv(name, "") or "").strip().lower()
+    except Exception:
+        return bool(default)
+    if not raw:
+        return bool(default)
+    if raw in _TRUTHY:
+        return True
+    if raw in _FALSY:
+        return False
+    return bool(default)
+
+
+def _env_int(
+    name: str, default: int, *, lo: Optional[int] = None, hi: Optional[int] = None
+) -> int:
+    try:
+        raw = (os.getenv(name, "") or "").strip()
+        if not raw:
+            return default
+        v = int(float(raw))
+    except Exception:
+        return default
+    if lo is not None and v < lo:
+        v = lo
+    if hi is not None and v > hi:
+        v = hi
+    return v
+
 
 # ---------------------------------------------------------------------------
 # High-Performance JSON fallback
@@ -79,7 +181,9 @@ try:
 except Exception:
 
     def json_dumps(v: Any, *, indent: int = 0) -> str:
-        return json.dumps(v, indent=(indent if indent else None), default=str, ensure_ascii=False)
+        return json.dumps(
+            v, indent=(indent if indent else None), default=str, ensure_ascii=False
+        )
 
     def json_loads(data: Union[str, bytes]) -> Any:
         if isinstance(data, (bytes, bytearray)):
@@ -88,16 +192,10 @@ except Exception:
 
     _HAS_ORJSON = False
 
+
 # ---------------------------------------------------------------------------
 # Optional dependencies (ALL SAFE)
 # ---------------------------------------------------------------------------
-try:
-    import requests  # type: ignore
-    REQUESTS_AVAILABLE = True
-except Exception:
-    requests = None  # type: ignore
-    REQUESTS_AVAILABLE = False
-
 try:
     import dns.resolver  # type: ignore
     DNS_AVAILABLE = True
@@ -128,6 +226,7 @@ except Exception:
 
     GOOGLE_API_AVAILABLE = False
 
+
 # ---------------------------------------------------------------------------
 # Prometheus (optional) — SAFE dummy
 # ---------------------------------------------------------------------------
@@ -149,6 +248,7 @@ except Exception:
 
     Counter = Histogram = _DummyMetric  # type: ignore
 
+
 # ---------------------------------------------------------------------------
 # OpenTelemetry (optional) — SAFE dummy
 # ---------------------------------------------------------------------------
@@ -162,19 +262,47 @@ except Exception:
     StatusCode = None  # type: ignore
     OTEL_AVAILABLE = False
 
-# =============================================================================
-# Version & Constants
-# =============================================================================
-SCRIPT_VERSION = "6.3.0"
-SCRIPT_NAME = "SheetsAuthDiagnostic"
-MIN_PYTHON = (3, 8)
 
-if sys.version_info < MIN_PYTHON:
-    sys.stdout.write(f"❌ Python {MIN_PYTHON[0]}.{MIN_PYTHON[1]}+ required\n")
-    raise SystemExit(1)
+# =============================================================================
+# Module-level constants
+# =============================================================================
+# v6.4.0: Use project-canonical _TRUTHY for tracing-enabled parsing.
+_TRACING_ENABLED = _env_bool("CORE_TRACING_ENABLED", False) or _env_bool(
+    "TRACING_ENABLED", False
+)
 
-_IO_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=8, thread_name_prefix="AuthDiagWorker")
-_TRACING_ENABLED = (os.getenv("CORE_TRACING_ENABLED", "") or os.getenv("TRACING_ENABLED", "")).strip().lower() in {"1", "true", "yes", "y", "on"}
+# v6.4.0: Lazy-initialized ThreadPoolExecutor (was eager at module level).
+_IO_EXECUTOR: Optional[concurrent.futures.ThreadPoolExecutor] = None
+
+
+def _get_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """Lazily create the I/O executor on first use."""
+    global _IO_EXECUTOR
+    if _IO_EXECUTOR is None:
+        _IO_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+            max_workers=8, thread_name_prefix="AuthDiagWorker"
+        )
+    return _IO_EXECUTOR
+
+
+def _shutdown_executor(timeout: float = 5.0) -> None:
+    """Cleanly shut down the executor. Safe to call multiple times."""
+    global _IO_EXECUTOR
+    if _IO_EXECUTOR is None:
+        return
+    try:
+        _IO_EXECUTOR.shutdown(wait=True, cancel_futures=True)
+    except TypeError:
+        # Python 3.8 doesn't support cancel_futures
+        try:
+            _IO_EXECUTOR.shutdown(wait=True)
+        except Exception:
+            pass
+    except Exception:
+        pass
+    finally:
+        _IO_EXECUTOR = None
+
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -191,6 +319,7 @@ ENV_CRED_KEYS = [
 ]
 
 ENV_SHEET_ID_KEYS = [
+    "SHEETS_AUTH_SHEET_ID",  # v6.4.0: canonical SHEETS_AUTH_* prefix
     "DEFAULT_SPREADSHEET_ID",
     "TFB_SPREADSHEET_ID",
     "SPREADSHEET_ID",
@@ -200,6 +329,7 @@ ENV_SHEET_ID_KEYS = [
 
 _RIYADH_TZ = timezone(timedelta(hours=3))
 
+
 # =============================================================================
 # Tracing & Metrics
 # =============================================================================
@@ -207,6 +337,7 @@ class TraceContext:
     """
     Lightweight tracing context that never breaks if OpenTelemetry is missing.
     """
+
     def __init__(self, name: str, attributes: Optional[Dict[str, Any]] = None):
         self.name = name
         self.attributes = attributes or {}
@@ -232,7 +363,13 @@ class TraceContext:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self._span_cm:
             try:
-                if exc_val and OTEL_AVAILABLE and Status is not None and StatusCode is not None and self._span is not None:
+                if (
+                    exc_val
+                    and OTEL_AVAILABLE
+                    and Status is not None
+                    and StatusCode is not None
+                    and self._span is not None
+                ):
                     try:
                         self._span.record_exception(exc_val)
                         self._span.set_status(Status(StatusCode.ERROR, str(exc_val)))
@@ -247,8 +384,16 @@ class TraceContext:
 
 
 if PROMETHEUS_AVAILABLE:
-    diag_tests_total = Counter("sheets_diag_tests_total", "Total diagnostic tests run", ["status", "category"])
-    diag_duration = Histogram("sheets_diag_duration_seconds", "Diagnostic test duration", ["category"])
+    diag_tests_total = Counter(
+        "sheets_diag_tests_total",
+        "Total diagnostic tests run",
+        ["status", "category"],
+    )
+    diag_duration = Histogram(
+        "sheets_diag_duration_seconds",
+        "Diagnostic test duration",
+        ["category"],
+    )
 else:
     diag_tests_total = Counter()  # type: ignore
     diag_duration = Histogram()  # type: ignore
@@ -275,13 +420,6 @@ class TestSeverity(str, Enum):
     INFO = "info"
 
 
-class PermissionLevel(str, Enum):
-    OWNER = "owner"
-    WRITER = "writer"
-    READER = "reader"
-    NONE = "none"
-
-
 class CredentialType(str, Enum):
     SERVICE_ACCOUNT = "service_account"
     OAUTH2 = "oauth2"
@@ -300,16 +438,6 @@ class AuthMethod(str, Enum):
     NONE = "none"
 
 
-class CIProvider(str, Enum):
-    GITHUB_ACTIONS = "github_actions"
-    GITLAB_CI = "gitlab_ci"
-    JENKINS = "jenkins"
-    CIRCLECI = "circleci"
-    TRAVIS = "travis"
-    AZURE_DEVOPS = "azure_devops"
-    UNKNOWN = "unknown"
-
-
 # =============================================================================
 # Data Models
 # =============================================================================
@@ -321,7 +449,9 @@ class TestResult:
     status: bool
     message: str
     duration_ms: float
-    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    timestamp: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
     details: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -340,7 +470,9 @@ class TestResult:
 @dataclass(slots=True)
 class DiagnosticReport:
     version: str = SCRIPT_VERSION
-    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    timestamp: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
     environment: Dict[str, Any] = field(default_factory=dict)
     results: List[Dict[str, Any]] = field(default_factory=list)
     summary: Dict[str, Any] = field(default_factory=dict)
@@ -386,7 +518,14 @@ class DiagnosticReport:
 
     def to_html(self) -> str:
         self.generate_summary()
-        esc = lambda s: str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+        def esc(s: Any) -> str:
+            return (
+                str(s)
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+            )
 
         html = f"""<!DOCTYPE html>
 <html>
@@ -472,66 +611,41 @@ class DiagnosticReport:
         return html
 
     def to_junit_xml(self) -> str:
-        # minimal JUnit XML (no external deps)
         self.generate_summary()
 
         def esc(s: str) -> str:
-            return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+            return (
+                (s or "")
+                .replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace('"', "&quot;")
+            )
 
         total = int(self.summary.get("total", 0))
         failures = int(self.summary.get("failed", 0))
         ts = esc(self.timestamp)
 
-        out = [f'<testsuite name="{esc(SCRIPT_NAME)}" tests="{total}" failures="{failures}" timestamp="{ts}">']
+        out = [
+            f'<testsuite name="{esc(SCRIPT_NAME)}" tests="{total}" '
+            f'failures="{failures}" timestamp="{ts}">'
+        ]
         for r in self.results:
             name = esc(str(r.get("name") or ""))
             cls = esc(str(r.get("category") or ""))
             tsec = float(r.get("duration_ms") or 0.0) / 1000.0
-            out.append(f'  <testcase name="{name}" classname="{cls}" time="{tsec:.4f}">')
+            out.append(
+                f'  <testcase name="{name}" classname="{cls}" time="{tsec:.4f}">'
+            )
             if not r.get("status"):
                 msg = esc(str(r.get("message") or "failed"))
                 sev = esc(str(r.get("severity") or "failure"))
-                out.append(f'    <failure type="{sev}" message="{msg}"></failure>')
+                out.append(
+                    f'    <failure type="{sev}" message="{msg}"></failure>'
+                )
             out.append("  </testcase>")
         out.append("</testsuite>")
         return "\n".join(out)
-
-
-# =============================================================================
-# CI/CD Integration
-# =============================================================================
-class CIDetector:
-    @staticmethod
-    def detect() -> CIProvider:
-        if os.getenv("GITHUB_ACTIONS") == "true":
-            return CIProvider.GITHUB_ACTIONS
-        if os.getenv("GITLAB_CI") == "true":
-            return CIProvider.GITLAB_CI
-        if os.getenv("JENKINS_HOME") or os.getenv("JENKINS_URL"):
-            return CIProvider.JENKINS
-        if os.getenv("CIRCLECI") == "true":
-            return CIProvider.CIRCLECI
-        if os.getenv("TRAVIS") == "true":
-            return CIProvider.TRAVIS
-        if os.getenv("TF_BUILD") == "true":
-            return CIProvider.AZURE_DEVOPS
-        return CIProvider.UNKNOWN
-
-    @staticmethod
-    def annotate_error(file_path: str, line: int, column: int, message: str) -> None:
-        provider = CIDetector.detect()
-        if provider == CIProvider.GITHUB_ACTIONS:
-            sys.stdout.write(f"::error file={file_path},line={line},col={column}::{message}\n")
-        else:
-            sys.stdout.write(f"ERROR: {file_path}:{line}:{column} - {message}\n")
-
-    @staticmethod
-    def annotate_warning(file_path: str, line: int, column: int, message: str) -> None:
-        provider = CIDetector.detect()
-        if provider == CIProvider.GITHUB_ACTIONS:
-            sys.stdout.write(f"::warning file={file_path},line={line},col={column}::{message}\n")
-        else:
-            sys.stdout.write(f"WARNING: {file_path}:{line}:{column} - {message}\n")
 
 
 # =============================================================================
@@ -559,7 +673,10 @@ class CredentialManager:
             ok, msg = self._parse_credentials(raw, source_hint=source or "")
             return ok, msg
 
-        return False, "No credentials found in env or file. Set GOOGLE_SHEETS_CREDENTIALS / GOOGLE_CREDENTIALS or GOOGLE_APPLICATION_CREDENTIALS."
+        return False, (
+            "No credentials found in env or file. Set GOOGLE_SHEETS_CREDENTIALS / "
+            "GOOGLE_CREDENTIALS or GOOGLE_APPLICATION_CREDENTIALS."
+        )
 
     def _from_env(self) -> Tuple[Optional[str], Optional[str]]:
         for key in ENV_CRED_KEYS:
@@ -580,14 +697,18 @@ class CredentialManager:
                 try:
                     return Path(s).read_text(encoding="utf-8"), f"file:{s}"
                 except Exception as e:
-                    self.logger.debug("Failed reading GOOGLE_APPLICATION_CREDENTIALS file: %s", e)
+                    self.logger.debug(
+                        "Failed reading GOOGLE_APPLICATION_CREDENTIALS file: %s", e
+                    )
 
         common_paths = [
             "credentials.json",
             "service-account.json",
             "config/credentials.json",
             "secrets/credentials.json",
-            os.path.expanduser("~/.config/gcloud/application_default_credentials.json"),
+            os.path.expanduser(
+                "~/.config/gcloud/application_default_credentials.json"
+            ),
         ]
         for p in common_paths:
             if os.path.exists(p):
@@ -622,17 +743,27 @@ class CredentialManager:
         # Detect type
         if "client_email" in data and "private_key" in data:
             self.credential_type = CredentialType.SERVICE_ACCOUNT
-            self.auth_method = AuthMethod.SERVICE_ACCOUNT_JSON if "env:" in source_hint else AuthMethod.SERVICE_ACCOUNT_FILE
+            self.auth_method = (
+                AuthMethod.SERVICE_ACCOUNT_JSON
+                if "env:" in source_hint
+                else AuthMethod.SERVICE_ACCOUNT_FILE
+            )
         elif "access_token" in data:
             self.credential_type = CredentialType.OAUTH2
-            self.auth_method = AuthMethod.OAUTH2_TOKEN if "refresh_token" in data else AuthMethod.OAUTH2_CLIENT
+            self.auth_method = (
+                AuthMethod.OAUTH2_TOKEN
+                if "refresh_token" in data
+                else AuthMethod.OAUTH2_CLIENT
+            )
         elif "api_key" in data:
             self.credential_type = CredentialType.API_KEY
             self.auth_method = AuthMethod.API_KEY
         else:
             self.credential_type = CredentialType.NONE
             self.auth_method = AuthMethod.NONE
-            return False, "Unknown credentials format (expected service account JSON or OAuth token)"
+            return False, (
+                "Unknown credentials format (expected service account JSON or OAuth token)"
+            )
 
         # Validate service account minimum fields + repair private key
         if self.credential_type == CredentialType.SERVICE_ACCOUNT:
@@ -641,14 +772,18 @@ class CredentialManager:
             if missing:
                 return False, f"Missing required service account fields: {missing}"
 
-            data["private_key"] = self._repair_private_key(str(data.get("private_key") or ""))
+            data["private_key"] = self._repair_private_key(
+                str(data.get("private_key") or "")
+            )
             if "BEGIN PRIVATE KEY" not in data["private_key"]:
                 return False, "Private key does not look valid after repair"
             if "@" not in str(data.get("client_email", "")):
                 return False, "client_email is invalid"
 
         self.credential_data = data
-        return True, f"Valid {self.credential_type.value} credentials from {source_hint}"
+        return True, (
+            f"Valid {self.credential_type.value} credentials from {source_hint}"
+        )
 
     @staticmethod
     def _repair_private_key(key: str) -> str:
@@ -672,16 +807,23 @@ class CredentialManager:
 
     def build_credentials(self) -> Any:
         if not GOOGLE_API_AVAILABLE:
-            raise ImportError("Google API libraries not available (google-auth, google-api-python-client)")
+            raise ImportError(
+                "Google API libraries not available (google-auth, google-api-python-client)"
+            )
 
         if self.credential_type == CredentialType.SERVICE_ACCOUNT:
             if service_account is None:
                 raise ImportError("google.oauth2.service_account not available")
-            self.credentials = service_account.Credentials.from_service_account_info(self.credential_data or {}, scopes=SCOPES)
+            self.credentials = service_account.Credentials.from_service_account_info(
+                self.credential_data or {}, scopes=SCOPES
+            )
             return self.credentials
 
         # OAuth2 flows can be added later if you need them.
-        raise ValueError(f"Unsupported credential type for this diagnostic: {self.credential_type.value}")
+        raise ValueError(
+            f"Unsupported credential type for this diagnostic: "
+            f"{self.credential_type.value}"
+        )
 
     def service_account_email(self) -> Optional[str]:
         if isinstance(self.credential_data, dict):
@@ -721,7 +863,11 @@ class NetworkDiagnostics:
         return res
 
     def _dns(self) -> Dict[str, Any]:
-        hosts = ["sheets.googleapis.com", "www.googleapis.com", "oauth2.googleapis.com"]
+        hosts = [
+            "sheets.googleapis.com",
+            "www.googleapis.com",
+            "oauth2.googleapis.com",
+        ]
         ips: Dict[str, List[str]] = {}
         cnames: Dict[str, str] = {}
         ok_any = False
@@ -746,7 +892,11 @@ class NetworkDiagnostics:
         return {"ok": ok_any, "ips": ips, "cnames": cnames, "dns_available": DNS_AVAILABLE}
 
     def _tcp(self) -> Dict[str, Any]:
-        endpoints = [("sheets.googleapis.com", 443), ("www.googleapis.com", 443), ("oauth2.googleapis.com", 443)]
+        endpoints = [
+            ("sheets.googleapis.com", 443),
+            ("www.googleapis.com", 443),
+            ("oauth2.googleapis.com", 443),
+        ]
         ok_any = False
         ok_list: List[str] = []
         failed: List[str] = []
@@ -765,16 +915,20 @@ class NetworkDiagnostics:
     def _tls(self) -> Dict[str, Any]:
         try:
             ctx = ssl.create_default_context()
-            with socket.create_connection(("sheets.googleapis.com", 443), timeout=5) as sock:
-                with ctx.wrap_socket(sock, server_hostname="sheets.googleapis.com") as ssock:
+            with socket.create_connection(
+                ("sheets.googleapis.com", 443), timeout=5
+            ) as sock:
+                with ctx.wrap_socket(
+                    sock, server_hostname="sheets.googleapis.com"
+                ) as ssock:
                     cert = ssock.getpeercert()
                     return {
                         "ok": True,
                         "protocol": ssock.version(),
                         "cipher": ssock.cipher(),
-                        "cert_subject": cert.get("subject"),
-                        "cert_issuer": cert.get("issuer"),
-                        "cert_notAfter": cert.get("notAfter"),
+                        "cert_subject": cert.get("subject") if cert else None,
+                        "cert_issuer": cert.get("issuer") if cert else None,
+                        "cert_notAfter": cert.get("notAfter") if cert else None,
                     }
         except Exception as e:
             return {"ok": False, "error": str(e)}
@@ -831,6 +985,8 @@ class DiagnosticEngine:
         self.sheets = None
         self.drive = None
         self.sheet_id = _get_sheet_id_from_env_or_args(args.sheet_id)
+        # v6.4.0: effective write flag requires both --write AND --write-confirm
+        self.write_enabled = bool(args.write) and bool(args.write_confirm)
         self._capture_environment()
 
     def _setup_logging(self) -> logging.Logger:
@@ -871,23 +1027,27 @@ class DiagnosticEngine:
             "riyadh_now": _now_riyadh_iso(),
             "has_orjson": _HAS_ORJSON,
             "google_api_available": GOOGLE_API_AVAILABLE,
-            "requests_available": REQUESTS_AVAILABLE,
             "dns_available": DNS_AVAILABLE,
             "prometheus_available": PROMETHEUS_AVAILABLE,
             "otel_available": OTEL_AVAILABLE,
             "tracing_enabled": _TRACING_ENABLED,
             "sheet_id_provided": bool(self.sheet_id),
+            "write_test_requested": bool(self.args.write),
+            "write_test_confirmed": bool(self.args.write_confirm),
+            "write_test_will_run": self.write_enabled,
         }
 
     async def _run_in_pool(self, fn: Callable[[], TestResult]) -> TestResult:
         with TraceContext(f"diag_{getattr(fn, '__name__', 'fn')}"):
             t0 = time.time()
             loop = asyncio.get_running_loop()
-            result: TestResult = await loop.run_in_executor(_IO_EXECUTOR, fn)
+            result: TestResult = await loop.run_in_executor(_get_executor(), fn)
             try:
                 cat = result.category.value
                 diag_duration.labels(category=cat).observe(max(0.0, time.time() - t0))
-                diag_tests_total.labels(status=("success" if result.status else "error"), category=cat).inc()
+                diag_tests_total.labels(
+                    status=("success" if result.status else "error"), category=cat
+                ).inc()
             except Exception:
                 pass
             return result
@@ -899,7 +1059,9 @@ class DiagnosticEngine:
         if self.args.network_only:
             self.report.add_result(self.test_network_connectivity())
             self.report.summary["total_duration_ms"] = (time.time() - started) * 1000.0
-            await asyncio.get_running_loop().run_in_executor(_IO_EXECUTOR, self._output_results)
+            await asyncio.get_running_loop().run_in_executor(
+                _get_executor(), self._output_results
+            )
             return 0 if all(r.get("status") for r in self.report.results) else 1
 
         # Phase 1: network + credential discovery
@@ -924,8 +1086,24 @@ class DiagnosticEngine:
                     self._run_in_pool(self.test_permissions),
                     self._run_in_pool(self.test_rate_limits),
                 ]
-                if self.args.write:
+                if self.write_enabled:
                     tasks.append(self._run_in_pool(self.test_write_operations))
+                elif self.args.write and not self.args.write_confirm:
+                    # v6.4.0: surface the blocked write explicitly
+                    self.report.add_result(
+                        TestResult(
+                            name="Write Operations",
+                            category=TestCategory.INTEGRATION,
+                            severity=TestSeverity.LOW,
+                            status=True,
+                            message=(
+                                "Write skipped: --write requires --write-confirm "
+                                "(or SHEETS_AUTH_WRITE_CONFIRM=true) to actually write."
+                            ),
+                            duration_ms=0.0,
+                            details={"skipped_reason": "missing_write_confirm"},
+                        )
+                    )
                 results = await asyncio.gather(*tasks)
                 for r in results:
                     self.report.add_result(r)
@@ -935,11 +1113,21 @@ class DiagnosticEngine:
         self.report.add_result(comp)
 
         self.report.summary["total_duration_ms"] = (time.time() - started) * 1000.0
-        await asyncio.get_running_loop().run_in_executor(_IO_EXECUTOR, self._output_results)
+        await asyncio.get_running_loop().run_in_executor(
+            _get_executor(), self._output_results
+        )
 
         # Exit code logic
-        critical = any((not r.get("status")) and str(r.get("severity")) == TestSeverity.CRITICAL.value for r in self.report.results)
-        high = any((not r.get("status")) and str(r.get("severity")) == TestSeverity.HIGH.value for r in self.report.results)
+        critical = any(
+            (not r.get("status"))
+            and str(r.get("severity")) == TestSeverity.CRITICAL.value
+            for r in self.report.results
+        )
+        high = any(
+            (not r.get("status"))
+            and str(r.get("severity")) == TestSeverity.HIGH.value
+            for r in self.report.results
+        )
         any_fail = any((not r.get("status")) for r in self.report.results)
 
         if critical:
@@ -963,7 +1151,11 @@ class DiagnosticEngine:
                 ok = False
             if not bool(details.get("tls", {}).get("ok")):
                 ok = False
-            msg = "Network connectivity looks OK" if ok else "Network issues detected (tcp/tls)"
+            msg = (
+                "Network connectivity looks OK"
+                if ok
+                else "Network issues detected (tcp/tls)"
+            )
             return TestResult(
                 name="Network Connectivity",
                 category=TestCategory.NETWORK,
@@ -1012,7 +1204,10 @@ class DiagnosticEngine:
                 category=TestCategory.AUTHENTICATION,
                 severity=TestSeverity.CRITICAL,
                 status=False,
-                message="Google API libraries not available (google-auth, google-api-python-client).",
+                message=(
+                    "Google API libraries not available "
+                    "(google-auth, google-api-python-client)."
+                ),
                 duration_ms=(time.time() - t0) * 1000.0,
                 details={},
             )
@@ -1022,7 +1217,11 @@ class DiagnosticEngine:
 
             # Refresh token if needed
             try:
-                if hasattr(creds, "expired") and creds.expired and GoogleAuthRequest is not None:
+                if (
+                    hasattr(creds, "expired")
+                    and creds.expired
+                    and GoogleAuthRequest is not None
+                ):
                     creds.refresh(GoogleAuthRequest())
             except Exception:
                 pass
@@ -1030,7 +1229,9 @@ class DiagnosticEngine:
             # Build clients
             self.sheets = build("sheets", "v4", credentials=creds, cache_discovery=False)
             try:
-                self.drive = build("drive", "v3", credentials=creds, cache_discovery=False)
+                self.drive = build(
+                    "drive", "v3", credentials=creds, cache_discovery=False
+                )
             except Exception:
                 self.drive = None
 
@@ -1050,22 +1251,31 @@ class DiagnosticEngine:
                     proof_details["sheet_title"] = (meta.get("properties") or {}).get("title")
                     proof_details["sheet_timezone"] = (meta.get("properties") or {}).get("timeZone")
                 except HttpError as he:
-                    # 403/404 are still "authenticated" but not authorized; we report separately later
+                    # 403/404 are still "authenticated" but not authorized
                     proof_ok = True
-                    proof_details["sheets_get_http_status"] = getattr(getattr(he, "resp", None), "status", None)
+                    proof_details["sheets_get_http_status"] = getattr(
+                        getattr(he, "resp", None), "status", None
+                    )
                     proof_details["sheets_get_error"] = str(he)[:300]
             else:
                 if self.drive is not None:
                     try:
-                        about = self.drive.about().get(fields="user(emailAddress),storageQuota").execute()  # type: ignore
+                        about = self.drive.about().get(  # type: ignore
+                            fields="user(emailAddress),storageQuota"
+                        ).execute()
                         proof_ok = True
-                        proof_details["drive_user"] = (about.get("user") or {}).get("emailAddress")
+                        proof_details["drive_user"] = (
+                            about.get("user") or {}
+                        ).get("emailAddress")
                     except Exception as e:
                         proof_ok = False
                         proof_details["drive_about_error"] = str(e)[:300]
                 else:
                     proof_ok = True
-                    proof_details["note"] = "No sheet_id provided; Drive client not available; built Sheets client OK"
+                    proof_details["note"] = (
+                        "No sheet_id provided; Drive client not available; "
+                        "built Sheets client OK"
+                    )
 
             details = {
                 "auth_method": self.cred.auth_method.value,
@@ -1081,7 +1291,11 @@ class DiagnosticEngine:
                 category=TestCategory.AUTHENTICATION,
                 severity=TestSeverity.CRITICAL,
                 status=proof_ok,
-                message="Successfully built Google API clients" if proof_ok else "Failed to prove auth via API call",
+                message=(
+                    "Successfully built Google API clients"
+                    if proof_ok
+                    else "Failed to prove auth via API call"
+                ),
                 duration_ms=(time.time() - t0) * 1000.0,
                 details=details,
             )
@@ -1114,7 +1328,10 @@ class DiagnosticEngine:
                 category=TestCategory.AUTHORIZATION,
                 severity=TestSeverity.HIGH,
                 status=False,
-                message="No spreadsheet ID provided (use --sheet-id or DEFAULT_SPREADSHEET_ID env).",
+                message=(
+                    "No spreadsheet ID provided (use --sheet-id or "
+                    "SHEETS_AUTH_SHEET_ID / DEFAULT_SPREADSHEET_ID env)."
+                ),
                 duration_ms=(time.time() - t0) * 1000.0,
                 details={},
             )
@@ -1122,7 +1339,10 @@ class DiagnosticEngine:
         try:
             meta = self.sheets.spreadsheets().get(  # type: ignore
                 spreadsheetId=self.sheet_id,
-                fields="spreadsheetId,properties.title,properties.timeZone,sheets.properties(title,sheetId,hidden)",
+                fields=(
+                    "spreadsheetId,properties.title,properties.timeZone,"
+                    "sheets.properties(title,sheetId,hidden)"
+                ),
             ).execute()
             title = (meta.get("properties") or {}).get("title")
             tz = (meta.get("properties") or {}).get("timeZone")
@@ -1144,7 +1364,12 @@ class DiagnosticEngine:
             )
         except HttpError as he:
             code = getattr(getattr(he, "resp", None), "status", None)
-            msg = "Permission denied (share sheet with service account)" if code == 403 else "Spreadsheet not found (check ID)" if code == 404 else f"HTTP {code}: {he}"
+            if code == 403:
+                msg = "Permission denied (share sheet with service account)"
+            elif code == 404:
+                msg = "Spreadsheet not found (check ID)"
+            else:
+                msg = f"HTTP {code}: {he}"
             return TestResult(
                 name="Spreadsheet Access",
                 category=TestCategory.AUTHORIZATION,
@@ -1195,8 +1420,8 @@ class DiagnosticEngine:
                     sa_role = p.get("role")
 
             ok = True
-            if self.args.write:
-                ok = (sa_role in {"owner", "writer"})
+            if self.write_enabled:
+                ok = sa_role in {"owner", "writer"}
 
             details = {
                 "service_account": sa,
@@ -1206,7 +1431,7 @@ class DiagnosticEngine:
                 "permissions_sample": plist[:10],
             }
             msg = f"Service account role: {sa_role or 'not_found'}"
-            if self.args.write and not ok:
+            if self.write_enabled and not ok:
                 msg = msg + " (write requires writer/owner)"
             return TestResult(
                 name="Permission Audit",
@@ -1276,7 +1501,11 @@ class DiagnosticEngine:
             )
         except HttpError as he:
             code = getattr(getattr(he, "resp", None), "status", None)
-            msg = "Permission denied for range read" if code == 403 else f"HTTP {code}: {he}"
+            msg = (
+                "Permission denied for range read"
+                if code == 403
+                else f"HTTP {code}: {he}"
+            )
             return TestResult(
                 name="Read Operations",
                 category=TestCategory.INTEGRATION,
@@ -1299,13 +1528,16 @@ class DiagnosticEngine:
 
     def test_write_operations(self) -> TestResult:
         t0 = time.time()
-        if not self.args.write:
+        # v6.4.0: honor write_enabled (both flags required)
+        if not self.write_enabled:
             return TestResult(
                 name="Write Operations",
                 category=TestCategory.INTEGRATION,
                 severity=TestSeverity.LOW,
                 status=True,
-                message="Write tests skipped (use --write to enable).",
+                message=(
+                    "Write tests skipped (use --write AND --write-confirm to enable)."
+                ),
                 duration_ms=(time.time() - t0) * 1000.0,
                 details={"skipped": True},
             )
@@ -1335,7 +1567,7 @@ class DiagnosticEngine:
                 spreadsheetId=self.sheet_id,
                 range=cell,
             ).execute()
-            ok = (got.get("values") == payload)
+            ok = got.get("values") == payload
             return TestResult(
                 name="Write Operations",
                 category=TestCategory.INTEGRATION,
@@ -1353,7 +1585,11 @@ class DiagnosticEngine:
             )
         except HttpError as he:
             code = getattr(getattr(he, "resp", None), "status", None)
-            msg = "Write permission denied (need writer/owner)" if code == 403 else f"HTTP {code}: {he}"
+            msg = (
+                "Write permission denied (need writer/owner)"
+                if code == 403
+                else f"HTTP {code}: {he}"
+            )
             return TestResult(
                 name="Write Operations",
                 category=TestCategory.INTEGRATION,
@@ -1424,21 +1660,26 @@ class DiagnosticEngine:
                 details={},
             )
 
-        # Quick burst test (best-effort). We do not try to hit limits; just detect immediate 429.
+        # v6.4.0: burst size + delay now configurable via CLI / env
+        burst = int(self.args.rate_burst)
+        delay_ms = int(self.args.rate_delay_ms)
+        delay_s = max(0.0, delay_ms / 1000.0)
+
         ok = True
         hit_429 = False
         errors: List[str] = []
         n_ok = 0
 
         try:
-            for i in range(10):
+            for i in range(burst):
                 try:
                     self.sheets.spreadsheets().get(  # type: ignore
                         spreadsheetId=self.sheet_id,
                         fields="spreadsheetId",
                     ).execute()
                     n_ok += 1
-                    time.sleep(0.1)
+                    if delay_s > 0:
+                        time.sleep(delay_s)
                 except HttpError as he:
                     code = getattr(getattr(he, "resp", None), "status", None)
                     if code == 429:
@@ -1453,7 +1694,11 @@ class DiagnosticEngine:
             ok = False
             errors.append(str(e)[:200])
 
-        msg = f"No 429 observed ({n_ok} OK requests)" if ok else "Rate limiting or errors observed"
+        msg = (
+            f"No 429 observed ({n_ok}/{burst} OK requests)"
+            if ok
+            else "Rate limiting or errors observed"
+        )
         return TestResult(
             name="Rate Limits",
             category=TestCategory.PERFORMANCE,
@@ -1461,32 +1706,85 @@ class DiagnosticEngine:
             status=ok,
             message=msg,
             duration_ms=(time.time() - t0) * 1000.0,
-            details={"ok_requests": n_ok, "hit_429": hit_429, "errors": errors[:10]},
+            details={
+                "burst": burst,
+                "delay_ms": delay_ms,
+                "ok_requests": n_ok,
+                "hit_429": hit_429,
+                "errors": errors[:10],
+            },
         )
 
     def test_compliance(self) -> TestResult:
         t0 = time.time()
         checks: List[Dict[str, Any]] = []
 
-        # Simple compliance heuristics: no secrets printing + env location hint
-        require_auth = (os.getenv("REQUIRE_AUTH", "true") or "true").strip().lower() in {"1", "true", "yes", "y", "on"}
-        token_present = bool((os.getenv("TFB_TOKEN", "") or os.getenv("BACKEND_TOKEN", "") or os.getenv("X_APP_TOKEN", "")).strip())
+        # v6.4.0: use project-canonical _env_bool
+        require_auth = _env_bool("REQUIRE_AUTH", True)
+        token_present = bool(
+            (
+                os.getenv("TFB_TOKEN", "")
+                or os.getenv("BACKEND_TOKEN", "")
+                or os.getenv("X_APP_TOKEN", "")
+            ).strip()
+        )
 
-        checks.append({"check": "require_auth_env", "passed": True, "message": f"REQUIRE_AUTH={require_auth}"})
+        checks.append(
+            {
+                "check": "require_auth_env",
+                "passed": True,
+                "message": f"REQUIRE_AUTH={require_auth}",
+            }
+        )
         if require_auth:
-            checks.append({"check": "backend_token_present", "passed": token_present, "message": "Backend token present" if token_present else "No backend token detected"})
+            checks.append(
+                {
+                    "check": "backend_token_present",
+                    "passed": token_present,
+                    "message": (
+                        "Backend token present"
+                        if token_present
+                        else "No backend token detected"
+                    ),
+                }
+            )
         else:
-            checks.append({"check": "open_mode_warning", "passed": True, "message": "Auth not required (open mode) - ensure this is intentional"})
+            checks.append(
+                {
+                    "check": "open_mode_warning",
+                    "passed": True,
+                    "message": "Auth not required (open mode) - ensure this is intentional",
+                }
+            )
 
         # Credentials sanity
-        if self.cred.credential_type == CredentialType.SERVICE_ACCOUNT and isinstance(self.cred.credential_data, dict):
+        if (
+            self.cred.credential_type == CredentialType.SERVICE_ACCOUNT
+            and isinstance(self.cred.credential_data, dict)
+        ):
             pk = str(self.cred.credential_data.get("private_key") or "")
-            checks.append({"check": "private_key_present", "passed": bool(pk.strip()), "message": "Private key present"})
-            # We cannot ensure encryption of SA keys; we only warn if it looks malformed
-            checks.append({"check": "private_key_format", "passed": ("BEGIN PRIVATE KEY" in pk and "END PRIVATE KEY" in pk), "message": "Private key appears well-formed"})
+            checks.append(
+                {
+                    "check": "private_key_present",
+                    "passed": bool(pk.strip()),
+                    "message": "Private key present",
+                }
+            )
+            checks.append(
+                {
+                    "check": "private_key_format",
+                    "passed": (
+                        "BEGIN PRIVATE KEY" in pk and "END PRIVATE KEY" in pk
+                    ),
+                    "message": "Private key appears well-formed",
+                }
+            )
 
         ok = all(bool(c.get("passed")) for c in checks)
-        msg = f"Compliance checks: {sum(1 for c in checks if c.get('passed'))}/{len(checks)} passed"
+        msg = (
+            f"Compliance checks: "
+            f"{sum(1 for c in checks if c.get('passed'))}/{len(checks)} passed"
+        )
         return TestResult(
             name="Compliance Check",
             category=TestCategory.COMPLIANCE,
@@ -1513,7 +1811,10 @@ class DiagnosticEngine:
             else:
                 out(f"✅ All {summary.get('total', 0)} tests passed")
         elif self.args.quiet:
-            out(f"Passed: {summary.get('passed', 0)}, Failed: {summary.get('failed', 0)}")
+            out(
+                f"Passed: {summary.get('passed', 0)}, "
+                f"Failed: {summary.get('failed', 0)}"
+            )
         else:
             out("")
             out("=" * 88)
@@ -1524,7 +1825,10 @@ class DiagnosticEngine:
                 sev = str(r.get("severity") or "").upper()
                 out(f"{status} [{sev:8}] {r.get('name')}: {r.get('message')}")
             out("-" * 88)
-            out(f"SUMMARY: {summary.get('passed', 0)}/{summary.get('total', 0)} passed ({summary.get('success_rate', 0.0):.1f}%)")
+            out(
+                f"SUMMARY: {summary.get('passed', 0)}/{summary.get('total', 0)} "
+                f"passed ({summary.get('success_rate', 0.0):.1f}%)"
+            )
             if self.report.recommendations:
                 out("")
                 out("📋 RECOMMENDATIONS:")
@@ -1566,16 +1870,98 @@ def create_parser() -> argparse.ArgumentParser:
         description=f"Google Sheets Authentication Diagnostic Tool v{SCRIPT_VERSION}",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("--sheet-id", default="", help="Spreadsheet ID to test (or use DEFAULT_SPREADSHEET_ID env)")
-    p.add_argument("--sheet-name", default="Sheet1", help='Tab name (default: "Sheet1")')
-    p.add_argument("--read-range", default="A1:B2", help='Range to read (default: "A1:B2")')
-    p.add_argument("--cell", default="A1", help='Cell for write test (default: "A1")')
-    p.add_argument("--write", action="store_true", help="Include write test (DANGEROUS: writes to the sheet)")
-    p.add_argument("--network-only", action="store_true", help="Only run network diagnostics and exit")
-    p.add_argument("--output", default="", help="Output file path (.json / .html / .xml)")
-    p.add_argument("--ci-mode", action="store_true", help="CI-friendly output")
-    p.add_argument("--quiet", action="store_true", help="Minimal output")
-    p.add_argument("--verbose", action="store_true", help="Verbose logging")
+    p.add_argument(
+        "--sheet-id",
+        default=os.getenv("SHEETS_AUTH_SHEET_ID", ""),
+        help=(
+            "Spreadsheet ID to test (or set SHEETS_AUTH_SHEET_ID / "
+            "DEFAULT_SPREADSHEET_ID env)"
+        ),
+    )
+    p.add_argument(
+        "--sheet-name",
+        default=os.getenv("SHEETS_AUTH_SHEET_NAME", "Sheet1"),
+        help='Tab name (default: "Sheet1"; also SHEETS_AUTH_SHEET_NAME env)',
+    )
+    p.add_argument(
+        "--read-range",
+        default=os.getenv("SHEETS_AUTH_READ_RANGE", "A1:B2"),
+        help='Range to read (default: "A1:B2"; also SHEETS_AUTH_READ_RANGE env)',
+    )
+    p.add_argument(
+        "--cell",
+        default=os.getenv("SHEETS_AUTH_CELL", "A1"),
+        help='Cell for write test (default: "A1"; also SHEETS_AUTH_CELL env)',
+    )
+    p.add_argument(
+        "--write",
+        action="store_true",
+        default=_env_bool("SHEETS_AUTH_WRITE", False),
+        help=(
+            "Enable write test (DANGEROUS; also needs --write-confirm). "
+            "Also: SHEETS_AUTH_WRITE env."
+        ),
+    )
+    p.add_argument(
+        "--write-confirm",
+        action="store_true",
+        default=_env_bool("SHEETS_AUTH_WRITE_CONFIRM", False),
+        help=(
+            "Confirm destructive write test. Required alongside --write. "
+            "Also: SHEETS_AUTH_WRITE_CONFIRM env."
+        ),
+    )
+    p.add_argument(
+        "--network-only",
+        action="store_true",
+        default=_env_bool("SHEETS_AUTH_NETWORK_ONLY", False),
+        help="Only run network diagnostics and exit. Also: SHEETS_AUTH_NETWORK_ONLY env.",
+    )
+    p.add_argument(
+        "--output",
+        default=os.getenv("SHEETS_AUTH_OUTPUT", ""),
+        help=(
+            "Output file path (.json / .html / .xml). "
+            "Also: SHEETS_AUTH_OUTPUT env."
+        ),
+    )
+    p.add_argument(
+        "--ci-mode",
+        action="store_true",
+        default=_env_bool("SHEETS_AUTH_CI_MODE", False),
+        help="CI-friendly output. Also: SHEETS_AUTH_CI_MODE env.",
+    )
+    p.add_argument(
+        "--quiet",
+        action="store_true",
+        default=_env_bool("SHEETS_AUTH_QUIET", False),
+        help="Minimal output. Also: SHEETS_AUTH_QUIET env.",
+    )
+    p.add_argument(
+        "--verbose",
+        action="store_true",
+        default=_env_bool("SHEETS_AUTH_VERBOSE", False),
+        help="Verbose logging. Also: SHEETS_AUTH_VERBOSE env.",
+    )
+    # v6.4.0: rate-limit burst knobs
+    p.add_argument(
+        "--rate-burst",
+        type=int,
+        default=_env_int("SHEETS_AUTH_RATE_BURST", 10, lo=1, hi=100),
+        help=(
+            "Number of requests in the rate-limit burst test (default 10). "
+            "Also: SHEETS_AUTH_RATE_BURST env."
+        ),
+    )
+    p.add_argument(
+        "--rate-delay-ms",
+        type=int,
+        default=_env_int("SHEETS_AUTH_RATE_DELAY_MS", 100, lo=0, hi=10000),
+        help=(
+            "Delay between burst requests in ms (default 100). "
+            "Also: SHEETS_AUTH_RATE_DELAY_MS env."
+        ),
+    )
     return p
 
 
@@ -1588,10 +1974,28 @@ def main() -> int:
         sys.stdout.write("Interrupted.\n")
         return 130
     finally:
-        try:
-            _IO_EXECUTOR.shutdown(wait=False)
-        except Exception:
-            pass
+        _shutdown_executor(timeout=5.0)
+
+
+__all__ = [
+    "SCRIPT_VERSION",
+    "SERVICE_VERSION",
+    "SCRIPT_NAME",
+    "SCOPES",
+    "ENV_CRED_KEYS",
+    "ENV_SHEET_ID_KEYS",
+    "TestCategory",
+    "TestSeverity",
+    "CredentialType",
+    "AuthMethod",
+    "TestResult",
+    "DiagnosticReport",
+    "CredentialManager",
+    "NetworkDiagnostics",
+    "DiagnosticEngine",
+    "create_parser",
+    "main",
+]
 
 
 if __name__ == "__main__":
