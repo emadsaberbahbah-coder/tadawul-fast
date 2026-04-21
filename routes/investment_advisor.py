@@ -2,34 +2,73 @@
 """
 routes/investment_advisor.py
 --------------------------------------------------------------------------------
-ADVANCED TOP10 / INVESTMENT ADVISOR ROUTER — v5.1.0
+ADVANCED TOP10 / INVESTMENT ADVISOR ROUTER — v5.2.0
 --------------------------------------------------------------------------------
 CANONICAL ADVANCED OWNER • ADVANCED SHEET-ROWS OWNER • STABILITY-FIRST
 TIMEOUT-GUARDED • SCHEMA-FIRST • TOP10-FIELD-HARDENED • DELEGATION SAFE
 UNCONSTRAINED-REQUEST SAFE • FALLBACK SAFE • TRADE-SETUP EQUIPPED
 
-Why this revision (v5.1.0)
---------------------------
-- FIX: adds canonical advanced family ownership for:
+Canonical-owner note (read first)
+---------------------------------
+Per `main._CONTROLLED_CANONICAL_OWNER_MAP`, this module is the canonical owner
+of:
     /v1/advanced
     /v1/advanced/sheet-rows
-    /v1/advanced/sheet_rows
-- FIX: adds long-form aliases:
     /v1/investment_advisor
-    /v1/investment_advisor/sheet-rows
-    /v1/investment_advisor/sheet_rows
     /v1/investment-advisor
-    /v1/investment-advisor/sheet-rows
-    /v1/investment-advisor/sheet_rows
-- FIX: delegates advanced sheet-rows contract to routes.advanced_analysis
-  so /v1/advanced/* returns the same stable schema/data envelope as root schema.
-- KEEP: preserves your existing advanced Top10/advisor endpoints and logic:
-    /v1/advanced/top10-investments
-    /v1/advanced/top10
-    /v1/advanced/investment-advisor
-    /v1/advanced/advisor
-- KEEP: preserves timeout guards, fallback retry logic, engine resolution,
-  auth helpers, criteria preparation, and schema projection.
+
+Per `main._CONTROLLED_ROUTE_PLAN`, this module mounts BEFORE
+`routes.advanced_sheet_rows`, so any signature collision on /v1/advanced/*
+resolves in this module's favor (the later router is signature-skipped by
+`_mount_routes_controlled`).
+
+Per `main._allowed_prefixes_for_key["investment_advisor"]`, all paths this
+module declares MUST start with one of:
+    /v1/advanced
+    /v1/investment_advisor
+    /v1/investment-advisor
+Otherwise they get filtered out by `_clone_filtered_router`.
+
+Why this revision (v5.2.0 vs v5.1.0)
+------------------------------------
+- FIX: `_require_auth_or_401` now matches the project-wide flexible auth
+       dispatch pattern — 6-level signature fallback that includes `path`,
+       `request`, `settings`, `api_key`. Matches
+       `main._call_auth_ok_flexible`, `analysis_sheet_rows._auth_passed`,
+       `data_dictionary._auth_passed`, `config._call_auth_ok_flexible`.
+       v5.1.0 had only a 3-level dispatch and couldn't pass `request`/`path`,
+       which made it brittle against modern `core.config.auth_ok`.
+- FIX: delegate resolution is now lazy + cached via `_resolve_delegate()`.
+       Previously the module-level `try: from routes.advanced_analysis import
+       _run_advanced_sheet_rows_impl` captured None if the order-of-imports
+       was unlucky (e.g. reloaded in tests). Now a missed import is retried
+       at the next call.
+- FIX: `_get_engine` now checks the full engine-state chain
+       (`engine`, `data_engine`, `quote_engine`, `cache_engine`) matching
+       `analysis_sheet_rows`, `enriched_quote`, `advisor`. v5.1.0 only
+       checked `engine`.
+- FIX: `_coerce_bool` now matches the project-wide _TRUTHY/_FALSY sets used
+       in main.py — adds `t`, `f`, `enabled`, `disabled`.
+- FIX: `_load_top10_builder` now tries multiple module paths
+       (`core.analysis.top10_selector` → `core.selectors.top10_selector` →
+       `core.top10_selector` → `top10_selector`) with caching.
+       v5.1.0 hard-imported a single path.
+- FIX: `/health` and root responses now expose `route_owner`,
+       `route_family`, `timestamp_utc`, `request_id` — consistent with other
+       revised routers (config v5.9.0, data_dictionary v2.7.0, analysis
+       v4.1.0) and aids `main`'s canonical-path owner diagnostics.
+- FIX: `/health` now reports `delegate_import_error` when the
+       advanced_analysis delegate is unavailable — aids operator diagnosis.
+- FIX: Top10 endpoint meta now includes `route_owner`, `route_family` for
+       consistency with the delegated sheet-rows path.
+- KEEP: all existing advanced sheet-rows endpoints delegate to
+       `routes.advanced_analysis._run_advanced_sheet_rows_impl` (which
+       handles its own auth, so these endpoints don't need a separate
+       `_require_auth_or_401` call).
+- KEEP: full Top10/advisor local logic — selector, fallback retry, criteria
+       preparation, schema projection, timeout guards.
+- KEEP: `inspect.isawaitable` for coroutine detection (replaces v5.1.0's
+       `hasattr(..., "__await__")` for consistency).
 
 Primary endpoints
 -----------------
@@ -43,17 +82,27 @@ Primary endpoints
 - POST /v1/advanced/top10
 - POST /v1/advanced/investment-advisor
 - POST /v1/advanced/advisor
+
+Long-form aliases
+-----------------
+- GET /v1/investment_advisor, /v1/investment_advisor/health
+- GET/POST /v1/investment_advisor/sheet-rows, /sheet_rows
+- GET /v1/investment-advisor, /v1/investment-advisor/health
+- GET/POST /v1/investment-advisor/sheet-rows, /sheet_rows
 """
 
 from __future__ import annotations
 
 import asyncio
 import copy
+import importlib
+import inspect
 import json
 import logging
 import os
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, status
@@ -62,17 +111,20 @@ from fastapi.encoders import jsonable_encoder
 logger = logging.getLogger("routes.investment_advisor")
 logger.addHandler(logging.NullHandler())
 
-INVESTMENT_ADVISOR_VERSION = "5.1.0"
+INVESTMENT_ADVISOR_VERSION = "5.2.0"
+ROUTE_OWNER_NAME = "investment_advisor"
+ROUTE_FAMILY_NAME = "advanced"
 TOP10_PAGE_NAME = "Top_10_Investments"
 
-# IMPORTANT:
-# No router prefix here. main.py controlled mounting filters by allowed prefixes
-# for this module, and we expose the exact canonical public paths explicitly.
+# IMPORTANT: no router prefix. main.py controlled mounting filters by allowed
+# prefixes for this module, and we expose the exact canonical public paths
+# explicitly. Paths must start with /v1/advanced, /v1/investment_advisor, or
+# /v1/investment-advisor to survive `_clone_filtered_router`.
 router = APIRouter(tags=["advanced", "investment-advisor"])
 
 
 # =============================================================================
-# Auth (best-effort, aligned with other routers)
+# Auth (best-effort, aligned with the project-wide flexible dispatch pattern)
 # =============================================================================
 try:
     from core.config import auth_ok, get_settings_cached, is_open_mode  # type: ignore
@@ -114,11 +166,19 @@ def _extract_auth_token(
 
 def _require_auth_or_401(
     *,
+    request: Optional[Request],
     token_query: Optional[str],
     x_app_token: Optional[str],
     x_api_key: Optional[str],
     authorization: Optional[str],
 ) -> None:
+    """
+    Flexible multi-signature dispatch for `core.config.auth_ok`. Matches the
+    pattern used by main._call_auth_ok_flexible / analysis_sheet_rows /
+    data_dictionary / config. Starts with the richest signature (path +
+    request + settings + api_key) and degrades to {token} only.
+    """
+    # Open-mode short-circuit
     try:
         if callable(is_open_mode) and bool(is_open_mode()):
             return
@@ -126,6 +186,8 @@ def _require_auth_or_401(
         pass
 
     if auth_ok is None:
+        # Auth module not importable — fail open (matches v5.1.0 behavior
+        # and the broader project convention for optional auth).
         return
 
     auth_token = _extract_auth_token(
@@ -135,24 +197,70 @@ def _require_auth_or_401(
         authorization=authorization,
     )
 
-    attempts = [
+    # Build rich context for the richest signature attempts
+    path = ""
+    headers_dict: Dict[str, str] = {}
+    if request is not None:
+        try:
+            path = str(getattr(getattr(request, "url", None), "path", "") or "")
+        except Exception:
+            path = ""
+        try:
+            headers_dict = dict(request.headers)
+        except Exception:
+            headers_dict = {}
+
+    # Make sure the auth-relevant headers are present even when request is None
+    # or when the client used non-standard casing.
+    if x_app_token:
+        headers_dict.setdefault("X-APP-TOKEN", x_app_token)
+    if x_api_key:
+        headers_dict.setdefault("X-API-Key", x_api_key)
+    if authorization:
+        headers_dict.setdefault("Authorization", authorization)
+
+    settings = None
+    try:
+        settings = get_settings_cached()
+    except Exception:
+        settings = None
+
+    attempts: Tuple[Dict[str, Any], ...] = (
         {
-            "token": auth_token,
+            "token": auth_token or None,
             "authorization": authorization,
-            "headers": {
-                "X-APP-TOKEN": x_app_token,
-                "X-API-Key": x_api_key,
-                "Authorization": authorization,
-            },
+            "headers": headers_dict,
+            "api_key": x_api_key,
+            "path": path,
+            "request": request,
+            "settings": settings,
         },
         {
-            "token": auth_token,
+            "token": auth_token or None,
+            "authorization": authorization,
+            "headers": headers_dict,
+            "path": path,
+            "request": request,
+        },
+        {
+            "token": auth_token or None,
+            "authorization": authorization,
+            "headers": headers_dict,
+            "path": path,
+        },
+        {
+            "token": auth_token or None,
+            "authorization": authorization,
+            "headers": headers_dict,
+        },
+        {
+            "token": auth_token or None,
             "authorization": authorization,
         },
         {
-            "token": auth_token,
+            "token": auth_token or None,
         },
-    ]
+    )
 
     ok = False
     for kwargs in attempts:
@@ -173,37 +281,96 @@ def _require_auth_or_401(
 
 
 # =============================================================================
-# Delegate import for advanced sheet-rows
+# Lazy + cached delegate resolution (routes.advanced_analysis)
 # =============================================================================
-try:
-    from routes.advanced_analysis import _run_advanced_sheet_rows_impl  # type: ignore
-except Exception as e:
-    _run_advanced_sheet_rows_impl = None  # type: ignore
-    _ADVANCED_ANALYSIS_IMPORT_ERROR = f"{type(e).__name__}: {e}"
-else:
-    _ADVANCED_ANALYSIS_IMPORT_ERROR = ""
+_DELEGATE_CACHE: Dict[str, Any] = {
+    "impl": None,
+    "module": None,
+    "callable_name": None,
+    "import_error": "",
+    "attempted": False,
+}
+
+
+def _resolve_delegate() -> Tuple[Optional[Any], Dict[str, str]]:
+    """
+    Resolve `_run_advanced_sheet_rows_impl` from `routes.advanced_analysis`,
+    retrying at call time if an earlier attempt failed. Keeps the first
+    successful import cached.
+    """
+    cached = _DELEGATE_CACHE.get("impl")
+    if callable(cached):
+        return cached, {
+            "delegate_module": str(_DELEGATE_CACHE.get("module") or ""),
+            "delegate_callable": str(_DELEGATE_CACHE.get("callable_name") or ""),
+        }
+
+    # Try a primary path first, then a couple of obvious alternatives. In
+    # practice only the first should succeed inside this project; the
+    # alternatives exist for partial-repo diagnostics.
+    probe_order: Tuple[Tuple[str, str], ...] = (
+        ("routes.advanced_analysis", "_run_advanced_sheet_rows_impl"),
+        ("routes.advanced_sheet_rows", "_run_advanced_sheet_rows_impl"),
+    )
+
+    last_error = ""
+    for module_name, callable_name in probe_order:
+        try:
+            mod = importlib.import_module(module_name)
+        except Exception as e:
+            last_error = f"{module_name}: {type(e).__name__}: {e}"
+            continue
+        fn = getattr(mod, callable_name, None)
+        if callable(fn):
+            _DELEGATE_CACHE["impl"] = fn
+            _DELEGATE_CACHE["module"] = module_name
+            _DELEGATE_CACHE["callable_name"] = callable_name
+            _DELEGATE_CACHE["import_error"] = ""
+            _DELEGATE_CACHE["attempted"] = True
+            return fn, {
+                "delegate_module": module_name,
+                "delegate_callable": callable_name,
+            }
+
+    _DELEGATE_CACHE["import_error"] = last_error or "delegate not found"
+    _DELEGATE_CACHE["attempted"] = True
+    return None, {
+        "delegate_module": "",
+        "delegate_callable": "",
+        "delegate_import_error": _DELEGATE_CACHE["import_error"],
+    }
 
 
 # =============================================================================
 # Engine accessor (lazy + safe)
 # =============================================================================
 async def _get_engine(request: Request) -> Optional[Any]:
+    """
+    Resolve a data engine from:
+      1) request.app.state.{engine, data_engine, quote_engine, cache_engine}
+      2) core.data_engine_v2.get_engine()
+      3) core.data_engine.get_engine()
+    """
     try:
         st = getattr(request.app, "state", None)
-        if st and getattr(st, "engine", None):
-            return st.engine
+        if st is not None:
+            for attr in ("engine", "data_engine", "quote_engine", "cache_engine"):
+                value = getattr(st, attr, None)
+                if value is not None:
+                    return value
     except Exception:
         pass
 
     for modpath in ("core.data_engine_v2", "core.data_engine"):
         try:
-            mod = __import__(modpath, fromlist=["get_engine"])
+            mod = importlib.import_module(modpath)
             get_engine = getattr(mod, "get_engine", None)
             if callable(get_engine):
                 eng = get_engine()
-                if hasattr(eng, "__await__"):
+                if inspect.isawaitable(eng):
                     eng = await eng
-                return eng
+                if eng is not None:
+                    return eng
         except Exception:
             continue
 
@@ -213,6 +380,14 @@ async def _get_engine(request: Request) -> Optional[Any]:
 # =============================================================================
 # Generic helpers
 # =============================================================================
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
+_FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
+
+
+def _now_utc() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def _safe_int(v: Any, default: int) -> int:
     try:
         if isinstance(v, bool):
@@ -236,9 +411,9 @@ def _coerce_bool(v: Any, default: bool = False) -> bool:
         return v
     if isinstance(v, str):
         s = v.strip().lower()
-        if s in {"1", "true", "yes", "y", "on"}:
+        if s in _TRUTHY:
             return True
-        if s in {"0", "false", "no", "n", "off"}:
+        if s in _FALSY:
             return False
     if isinstance(v, (int, float)):
         try:
@@ -533,13 +708,14 @@ def _ensure_top10_keys_present(
 def _load_schema_defaults() -> Tuple[List[str], List[str]]:
     """
     Read Top_10_Investments schema headers and keys from schema_registry.
-    Multi-path fallback: core.sheets.schema_registry → core.schema_registry → schema_registry.
-    Returns ([], []) if unavailable — callers fall back to _ensure_top10_keys_present.
+    Multi-path fallback:
+      core.sheets.schema_registry → core.schema_registry → schema_registry.
+    Returns ([], []) if unavailable — callers fall back to
+    _ensure_top10_keys_present.
     """
     for _sreg_path in ("core.sheets.schema_registry", "core.schema_registry", "schema_registry"):
         try:
-            import importlib as _il
-            _sreg = _il.import_module(_sreg_path)
+            _sreg = importlib.import_module(_sreg_path)
             get_sheet_spec = getattr(_sreg, "get_sheet_spec", None)
             if not callable(get_sheet_spec):
                 continue
@@ -573,6 +749,8 @@ def _schema_only_payload(
         "rows": [],
         "rows_matrix": [] if (include_matrix and keys) else None,
         "version": INVESTMENT_ADVISOR_VERSION,
+        "route_owner": ROUTE_OWNER_NAME,
+        "route_family": ROUTE_FAMILY_NAME,
         "request_id": request_id,
         "meta": meta,
     }
@@ -615,9 +793,48 @@ def _normalize_selector_payload(
     return headers, keys, norm_rows, dict(meta), status_out
 
 
+# Top10 builder cache (multi-path, retry-on-miss)
+_TOP10_BUILDER_CACHE: Dict[str, Any] = {"fn": None, "module": "", "error": ""}
+
+
 def _load_top10_builder() -> Any:
-    from core.analysis.top10_selector import build_top10_rows  # type: ignore
-    return build_top10_rows
+    """
+    Multi-path fallback for the Top10 selector builder:
+      core.analysis.top10_selector.build_top10_rows
+      core.selectors.top10_selector.build_top10_rows
+      core.top10_selector.build_top10_rows
+      top10_selector.build_top10_rows
+    Caches first success; retries at each call if still unresolved.
+    Raises the last error if all paths fail (preserves v5.1.0 contract that
+    the caller catches and degrades gracefully).
+    """
+    cached = _TOP10_BUILDER_CACHE.get("fn")
+    if callable(cached):
+        return cached
+
+    last_error: Optional[Exception] = None
+    for module_name in (
+        "core.analysis.top10_selector",
+        "core.selectors.top10_selector",
+        "core.top10_selector",
+        "top10_selector",
+    ):
+        try:
+            mod = importlib.import_module(module_name)
+            fn = getattr(mod, "build_top10_rows", None)
+            if callable(fn):
+                _TOP10_BUILDER_CACHE["fn"] = fn
+                _TOP10_BUILDER_CACHE["module"] = module_name
+                _TOP10_BUILDER_CACHE["error"] = ""
+                return fn
+        except Exception as e:
+            last_error = e
+            continue
+
+    _TOP10_BUILDER_CACHE["error"] = f"{type(last_error).__name__}: {last_error}" if last_error else "build_top10_rows not found"
+    if last_error is not None:
+        raise last_error
+    raise ImportError("Could not resolve build_top10_rows in any known path")
 
 
 def _effective_limit(body: Dict[str, Any], limit_q: Optional[int]) -> int:
@@ -791,16 +1008,21 @@ async def _delegate_advanced_sheet_rows(
     authorization: Optional[str] = None,
     x_request_id: Optional[str] = None,
 ):
-    if _run_advanced_sheet_rows_impl is None:
+    impl, impl_meta = _resolve_delegate()
+
+    if impl is None:
         return {
             "status": "error",
             "error": "advanced_analysis delegate unavailable",
-            "detail": _ADVANCED_ANALYSIS_IMPORT_ERROR,
-            "route_family": "advanced",
+            "detail": _DELEGATE_CACHE.get("import_error", "") or impl_meta.get("delegate_import_error", ""),
+            "route_family": ROUTE_FAMILY_NAME,
+            "route_owner": ROUTE_OWNER_NAME,
             "version": INVESTMENT_ADVISOR_VERSION,
+            "timestamp_utc": _now_utc(),
+            "advanced_delegate_import_error": _DELEGATE_CACHE.get("import_error", ""),
         }
 
-    payload = await _run_advanced_sheet_rows_impl(
+    payload = await impl(
         request=request,
         body=body,
         mode=mode,
@@ -813,13 +1035,17 @@ async def _delegate_advanced_sheet_rows(
     )
 
     if isinstance(payload, dict):
-        payload.setdefault("meta", {})
-        try:
-            payload["meta"]["advanced_delegate"] = "routes.advanced_analysis._run_advanced_sheet_rows_impl"
-            payload["meta"]["advanced_family_owner"] = "routes.investment_advisor"
-        except Exception:
-            pass
-        payload["route_family"] = "advanced"
+        meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
+        meta = dict(meta)
+        meta.setdefault("advanced_delegate", f"{impl_meta.get('delegate_module')}.{impl_meta.get('delegate_callable')}")
+        meta.setdefault("advanced_family_owner", "routes.investment_advisor")
+        meta.setdefault("delegate_module", impl_meta.get("delegate_module"))
+        meta.setdefault("delegate_callable", impl_meta.get("delegate_callable"))
+        meta.setdefault("route_owner", ROUTE_OWNER_NAME)
+        meta.setdefault("route_family", ROUTE_FAMILY_NAME)
+        payload["meta"] = meta
+        payload["route_family"] = ROUTE_FAMILY_NAME
+        payload["route_owner"] = ROUTE_OWNER_NAME
         payload["advanced_owner"] = "routes.investment_advisor"
 
     return payload
@@ -831,32 +1057,42 @@ async def _delegate_advanced_sheet_rows(
 @router.get("/v1/advanced")
 @router.get("/v1/investment_advisor")
 @router.get("/v1/investment-advisor")
-async def advanced_root() -> Dict[str, Any]:
-    return {
-        "status": "ok",
-        "service": "investment_advisor",
-        "version": INVESTMENT_ADVISOR_VERSION,
-        "delegate_available": _run_advanced_sheet_rows_impl is not None,
-        "canonical_paths": [
-            "/v1/advanced",
-            "/v1/advanced/sheet-rows",
-            "/v1/advanced/sheet_rows",
-        ],
-        "alias_paths": [
-            "/v1/investment_advisor",
-            "/v1/investment_advisor/sheet-rows",
-            "/v1/investment_advisor/sheet_rows",
-            "/v1/investment-advisor",
-            "/v1/investment-advisor/sheet-rows",
-            "/v1/investment-advisor/sheet_rows",
-        ],
-        "top10_paths": [
-            "/v1/advanced/top10-investments",
-            "/v1/advanced/top10",
-            "/v1/advanced/investment-advisor",
-            "/v1/advanced/advisor",
-        ],
-    }
+async def advanced_root(request: Request) -> Dict[str, Any]:
+    impl, impl_meta = _resolve_delegate()
+    request_id = _s(getattr(getattr(request, "state", None), "request_id", "")) or uuid.uuid4().hex[:12]
+    return jsonable_encoder(
+        {
+            "status": "ok",
+            "service": "investment_advisor",
+            "version": INVESTMENT_ADVISOR_VERSION,
+            "route_owner": ROUTE_OWNER_NAME,
+            "route_family": ROUTE_FAMILY_NAME,
+            "delegate_available": impl is not None,
+            "delegate_module": impl_meta.get("delegate_module"),
+            "delegate_callable": impl_meta.get("delegate_callable"),
+            "canonical_paths": [
+                "/v1/advanced",
+                "/v1/advanced/sheet-rows",
+                "/v1/advanced/sheet_rows",
+            ],
+            "alias_paths": [
+                "/v1/investment_advisor",
+                "/v1/investment_advisor/sheet-rows",
+                "/v1/investment_advisor/sheet_rows",
+                "/v1/investment-advisor",
+                "/v1/investment-advisor/sheet-rows",
+                "/v1/investment-advisor/sheet_rows",
+            ],
+            "top10_paths": [
+                "/v1/advanced/top10-investments",
+                "/v1/advanced/top10",
+                "/v1/advanced/investment-advisor",
+                "/v1/advanced/advisor",
+            ],
+            "request_id": request_id,
+            "timestamp_utc": _now_utc(),
+        }
+    )
 
 
 @router.get("/v1/advanced/health")
@@ -864,21 +1100,42 @@ async def advanced_root() -> Dict[str, Any]:
 @router.get("/v1/investment-advisor/health")
 async def advanced_health(request: Request) -> Dict[str, Any]:
     engine = await _get_engine(request)
+    impl, impl_meta = _resolve_delegate()
+    request_id = _s(getattr(getattr(request, "state", None), "request_id", "")) or uuid.uuid4().hex[:12]
+
+    # Capability flags for core.config integration (mirrors config router health)
+    capabilities = {
+        "auth_ok_callable": callable(auth_ok),
+        "is_open_mode_callable": callable(is_open_mode),
+        "get_settings_cached_callable": callable(get_settings_cached),
+    }
+
     return jsonable_encoder(
         {
             "status": "ok" if engine else "degraded",
+            "service": "advanced_top10",
             "version": INVESTMENT_ADVISOR_VERSION,
+            "route_owner": ROUTE_OWNER_NAME,
+            "route_family": ROUTE_FAMILY_NAME,
             "engine_available": bool(engine),
             "engine_type": type(engine).__name__ if engine else "none",
-            "service": "advanced_top10",
-            "delegate_available": _run_advanced_sheet_rows_impl is not None,
+            "delegate_available": impl is not None,
+            "delegate_module": impl_meta.get("delegate_module"),
+            "delegate_callable": impl_meta.get("delegate_callable"),
+            "delegate_import_error": _DELEGATE_CACHE.get("import_error", "") if impl is None else "",
+            "top10_builder_cached": bool(_TOP10_BUILDER_CACHE.get("fn")),
+            "top10_builder_module": _TOP10_BUILDER_CACHE.get("module", ""),
+            "capabilities": capabilities,
             "path": str(getattr(getattr(request, "url", None), "path", "")),
+            "request_id": request_id,
+            "timestamp_utc": _now_utc(),
         }
     )
 
 
 # =============================================================================
-# Advanced sheet-rows endpoints
+# Advanced sheet-rows endpoints — delegate to routes.advanced_analysis
+# (auth is handled inside the delegate; no _require_auth_or_401 here)
 # =============================================================================
 @router.get("/v1/advanced/sheet-rows")
 @router.get("/v1/advanced/sheet_rows")
@@ -977,7 +1234,7 @@ async def advanced_sheet_rows_post(
 
 
 # =============================================================================
-# Existing Top10 endpoints
+# Existing Top10 endpoints (local selector pipeline — NOT delegated)
 # =============================================================================
 @router.post("/v1/advanced/top10-investments")
 @router.post("/v1/advanced/top10")
@@ -998,10 +1255,11 @@ async def advanced_top10_investments(
 ) -> Dict[str, Any]:
     t0 = time.perf_counter()
     stages: Dict[str, float] = {}
-    request_id = x_request_id or getattr(request.state, "request_id", None) or str(uuid.uuid4())
+    request_id = x_request_id or _s(getattr(getattr(request, "state", None), "request_id", "")) or uuid.uuid4().hex[:12]
 
     s0 = time.perf_counter()
     _require_auth_or_401(
+        request=request,
         token_query=token,
         x_app_token=x_app_token,
         x_api_key=x_api_key,
@@ -1029,6 +1287,8 @@ async def advanced_top10_investments(
     if schema_only_final:
         meta = {
             "route_version": INVESTMENT_ADVISOR_VERSION,
+            "route_owner": ROUTE_OWNER_NAME,
+            "route_family": ROUTE_FAMILY_NAME,
             "request_id": request_id,
             "limit": eff_limit,
             "mode": mode or "",
@@ -1037,6 +1297,7 @@ async def advanced_top10_investments(
             "dispatch": "advanced_top10",
             "stage_durations_ms": stages,
             "duration_ms": round((time.perf_counter() - t0) * 1000.0, 3),
+            "timestamp_utc": _now_utc(),
         }
         return jsonable_encoder(
             _schema_only_payload(
@@ -1051,6 +1312,8 @@ async def advanced_top10_investments(
     if engine is None:
         meta = {
             "route_version": INVESTMENT_ADVISOR_VERSION,
+            "route_owner": ROUTE_OWNER_NAME,
+            "route_family": ROUTE_FAMILY_NAME,
             "request_id": request_id,
             "limit": eff_limit,
             "mode": mode or "",
@@ -1060,6 +1323,7 @@ async def advanced_top10_investments(
             "warning": "engine_unavailable",
             "stage_durations_ms": stages,
             "duration_ms": round((time.perf_counter() - t0) * 1000.0, 3),
+            "timestamp_utc": _now_utc(),
         }
         return jsonable_encoder(
             _schema_only_payload(
@@ -1083,6 +1347,8 @@ async def advanced_top10_investments(
     if build_top10_rows is None:
         meta = {
             "route_version": INVESTMENT_ADVISOR_VERSION,
+            "route_owner": ROUTE_OWNER_NAME,
+            "route_family": ROUTE_FAMILY_NAME,
             "request_id": request_id,
             "limit": eff_limit,
             "mode": mode or "",
@@ -1093,6 +1359,7 @@ async def advanced_top10_investments(
             "detail": builder_import_error,
             "stage_durations_ms": stages,
             "duration_ms": round((time.perf_counter() - t0) * 1000.0, 3),
+            "timestamp_utc": _now_utc(),
         }
         return jsonable_encoder(
             _schema_only_payload(
@@ -1186,6 +1453,8 @@ async def advanced_top10_investments(
     if not isinstance(selected_payload, dict):
         meta = {
             "route_version": INVESTMENT_ADVISOR_VERSION,
+            "route_owner": ROUTE_OWNER_NAME,
+            "route_family": ROUTE_FAMILY_NAME,
             "request_id": request_id,
             "limit": eff_limit,
             "mode": mode or "",
@@ -1204,6 +1473,7 @@ async def advanced_top10_investments(
             "engine_present": True,
             "engine_type": type(engine).__name__,
             "duration_ms": round((time.perf_counter() - t0) * 1000.0, 3),
+            "timestamp_utc": _now_utc(),
         }
         return jsonable_encoder(
             _schema_only_payload(
@@ -1244,6 +1514,8 @@ async def advanced_top10_investments(
     meta.update(
         {
             "route_version": INVESTMENT_ADVISOR_VERSION,
+            "route_owner": ROUTE_OWNER_NAME,
+            "route_family": ROUTE_FAMILY_NAME,
             "request_id": request_id,
             "limit": eff_limit,
             "mode": mode or "",
@@ -1265,6 +1537,7 @@ async def advanced_top10_investments(
             "build_status": build_status,
             "dispatch": _s(meta_in.get("dispatch")) or "advanced_top10",
             "stage_durations_ms": stages,
+            "timestamp_utc": _now_utc(),
         }
     )
 
@@ -1277,6 +1550,8 @@ async def advanced_top10_investments(
         "rows": norm_rows,
         "rows_matrix": _rows_to_matrix(norm_rows, keys) if (include_matrix_final and keys) else None,
         "version": INVESTMENT_ADVISOR_VERSION,
+        "route_owner": ROUTE_OWNER_NAME,
+        "route_family": ROUTE_FAMILY_NAME,
         "request_id": request_id,
         "meta": meta,
     }
@@ -1284,4 +1559,9 @@ async def advanced_top10_investments(
     return jsonable_encoder(response)
 
 
-__all__ = ["router", "INVESTMENT_ADVISOR_VERSION"]
+__all__ = [
+    "router",
+    "INVESTMENT_ADVISOR_VERSION",
+    "ROUTE_OWNER_NAME",
+    "ROUTE_FAMILY_NAME",
+]
