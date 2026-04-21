@@ -2,37 +2,107 @@
 """
 scripts/run_market_scan.py
 ================================================================================
-TADAWUL FAST BRIDGE — MARKET SCANNER (v5.2.0) — SCHEMA/ENGINE ALIGNED
+TADAWUL FAST BRIDGE — MARKET SCANNER (v5.3.0) — SCHEMA/ENGINE ALIGNED
 ================================================================================
 
-What this scanner does (aligned with your Phase 3–7 architecture):
-- Reads symbols from your Google Sheet pages via symbols_reader (single source of truth).
+What this scanner does (aligned with Phase 3–7 architecture):
+- Reads symbols from Google Sheet pages via symbols_reader (single source of truth).
 - Fetches enriched quotes in BULK using:
-    (A) Local Engine mode (preferred when running inside repo): core.data_engine_v2.get_engine()
-    (B) HTTP mode (fallback when running outside): POST /v1/enriched/quotes
-- Ranks instruments using your canonical fields when present:
+    (A) Local Engine mode (preferred when running inside repo):
+        core.data_engine_v2.get_engine()
+    (B) HTTP mode (fallback when running outside):
+        POST /v1/enriched/quotes
+- Ranks instruments using canonical fields when present:
     overall_score, risk_score, value_score, quality_score, momentum_score,
-    expected_roi_1m/3m/12m, forecast_confidence, rsi_14, volatility_30d, market_cap, volume
+    expected_roi_1m/3m/12m, forecast_confidence, rsi_14, volatility_30d,
+    market_cap, volume
 - Filters using CFO-safe constraints:
     min_price, min_volume, max_risk_score, min_confidence, min_expected_roi
 - Exports top N to JSON/CSV/HTML (optional).
 
+Why this revision (v5.3.0 vs v5.2.0)
+-------------------------------------
+- 🔑 FIX CRITICAL: `ScanConfig` has NO `timeout_sec` field, but v5.2.0
+     `from_worker_payload()` passed `timeout_sec=_f("timeout_sec", 60.0)` to
+     the constructor. Every worker invocation crashed with:
+       `TypeError: __init__() got unexpected keyword argument 'timeout_sec'`
+     Separately, `run_scan()` accessed `cfg.timeout_sec` in HTTP mode with a
+     `# type: ignore[attr-defined]` comment (the author knew it was broken).
+     Any HTTP mode run raised `AttributeError`. v5.3.0 adds `timeout_sec:
+     float = 60.0` to the dataclass.
+
+- 🔑 FIX HIGH: `cfg.concurrency` field was defined but never used. The
+     per-symbol fallback semaphore was hardcoded `asyncio.Semaphore(12)`.
+     v5.3.0 wires `cfg.concurrency` through to the semaphore so the
+     worker-supplied `concurrency` actually takes effect.
+
+- 🔑 FIX HIGH: `asyncio.gather(..., return_exceptions=False)` in the per-
+     symbol fallback meant one bad quote aborted the whole scan. v5.3.0
+     uses `return_exceptions=True` and filters out exceptions, logging them
+     as warnings.
+
+- FIX: Added project-standard `_TRUTHY`/`_FALSY` vocabulary (matches
+     `main._TRUTHY`/`_FALSY`), plus `_env_bool`, `_env_int`, `_env_float`,
+     `_env_csv` helpers.
+- FIX: Added `SERVICE_VERSION = SCRIPT_VERSION` alias (cross-script
+     convention with `run_dashboard_sync v6.5.0`, `refresh_data v5.2.0`,
+     `repo_hygiene_check v5.1.0`, etc.).
+- FIX: Added `SCAN_*` env var defaults for all CLI flags so the runner can
+     be driven purely from environment in cron/CI.
+- FIX: Removed dead imports (`field` from dataclasses, `Sequence` from
+     typing) and dead code (`_maybe_await`, `_HAS_ORJSON`).
+- FIX: Added `--concurrency` and `--timeout` CLI flags (worker payload
+     already accepts them; CLI was missing).
+- FIX: `run_from_worker_payload_async` now writes HTML export too (was
+     JSON+CSV only).
+- FIX: Engine instance is now closed in `run_scan`'s `finally` block if it
+     exposes `.close()` or `.aclose()` — prevents resource leaks.
+
 Phase alignment:
 - ✅ No KSA_Tadawul dependency.
 - ✅ Uses canonical page keys:
-    Market_Leaders, Global_Markets, Commodities_FX, Mutual_Funds, My_Portfolio, Insights_Analysis (optional)
+    Market_Leaders, Global_Markets, Commodities_FX, Mutual_Funds,
+    My_Portfolio, Insights_Analysis (optional)
 - ✅ Startup-safe (no network calls at import-time).
 - ✅ Defensive: optional deps (numpy/pandas/aiohttp/orjson) are safe.
 
-Environment:
-  BACKEND_BASE_URL=https://tadawul-fast-bridge.onrender.com
-  TFB_TOKEN=<token>   (or APP_TOKEN / BACKUP_APP_TOKEN)
+Environment
+-----------
+  SCAN_SHEET_ID / DEFAULT_SPREADSHEET_ID   spreadsheet id
+  SCAN_BACKEND / BACKEND_BASE_URL          backend URL (http mode)
+  SCAN_TOKEN / TFB_TOKEN / APP_TOKEN /
+    BACKUP_APP_TOKEN / TFB_APP_TOKEN /
+    BACKEND_TOKEN                          auth token (http mode)
+  SCAN_KEYS                                comma-separated pages
+  SCAN_MODE                                engine | http
+  SCAN_TOP                                 top N results
+  SCAN_MAX_SYMBOLS                         max symbols
+  SCAN_CHUNK_SIZE                          batch chunk size
+  SCAN_CONCURRENCY                         per-symbol semaphore size
+  SCAN_TIMEOUT                             HTTP timeout seconds
+  SCAN_HORIZON                             1m | 3m | 12m
+  SCAN_MIN_PRICE                           min price filter
+  SCAN_MIN_VOLUME                          min volume filter
+  SCAN_MAX_RISK                            max risk score (<=60 recommended)
+  SCAN_MIN_CONFIDENCE                      min forecast confidence (0..1)
+  SCAN_MIN_ROI                             min expected ROI (fraction)
+  SCAN_EXPORT_JSON                         write JSON to this path
+  SCAN_EXPORT_CSV                          write CSV to this path
+  SCAN_EXPORT_HTML                         write HTML to this path
+  LOG_LEVEL                                logger level (default INFO)
 
-CLI examples:
+CLI examples
+------------
   python scripts/run_market_scan.py --keys Market_Leaders Global_Markets --top 50 --mode engine
   python scripts/run_market_scan.py --keys My_Portfolio --top 30 --min-confidence 0.65 --max-risk 60
   python scripts/run_market_scan.py --mode http --backend https://... --top 25 --export-json scan.json
 
+Exit codes
+----------
+  0 = rows produced
+  1 = scan ran but returned no rows (all filtered out / no symbols)
+  2 = config/runtime error (missing sheet id, missing deps, etc.)
+  130 = interrupted (SIGINT)
 """
 
 from __future__ import annotations
@@ -46,10 +116,10 @@ import math
 import os
 import sys
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 
 # =============================================================================
@@ -70,6 +140,80 @@ _ensure_project_root_on_path()
 
 
 # =============================================================================
+# Version
+# =============================================================================
+SCRIPT_VERSION = "5.3.0"
+SERVICE_VERSION = SCRIPT_VERSION  # v5.3.0: cross-script alias
+
+
+# =============================================================================
+# Project-wide truthy/falsy vocabulary (matches main._TRUTHY / _FALSY)
+# =============================================================================
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
+_FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    try:
+        raw = (os.getenv(name, "") or "").strip().lower()
+    except Exception:
+        return bool(default)
+    if not raw:
+        return bool(default)
+    if raw in _TRUTHY:
+        return True
+    if raw in _FALSY:
+        return False
+    return bool(default)
+
+
+def _env_int(
+    name: str, default: int, *, lo: Optional[int] = None, hi: Optional[int] = None
+) -> int:
+    try:
+        raw = (os.getenv(name, "") or "").strip()
+        if not raw:
+            return default
+        v = int(float(raw))
+    except Exception:
+        return default
+    if lo is not None and v < lo:
+        v = lo
+    if hi is not None and v > hi:
+        v = hi
+    return v
+
+
+def _env_float(
+    name: str,
+    default: float,
+    *,
+    lo: Optional[float] = None,
+    hi: Optional[float] = None,
+) -> float:
+    try:
+        raw = (os.getenv(name, "") or "").strip()
+        if not raw:
+            return default
+        v = float(raw)
+    except Exception:
+        return default
+    if lo is not None and v < lo:
+        v = lo
+    if hi is not None and v > hi:
+        v = hi
+    return v
+
+
+def _env_csv(name: str, default: Optional[List[str]] = None) -> Optional[List[str]]:
+    raw = (os.getenv(name, "") or "").strip()
+    if not raw:
+        return default
+    items = [x.strip() for x in raw.split(",") if x.strip()]
+    return items or default
+
+
+# =============================================================================
 # Logging
 # =============================================================================
 logging.basicConfig(
@@ -77,12 +221,6 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)7s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("MarketScan")
-
-# =============================================================================
-# Version
-# FIX v5.2.0: SCRIPT_VERSION was missing; version was hardcoded in 3 places.
-# =============================================================================
-SCRIPT_VERSION = "5.2.0"
 
 
 # =============================================================================
@@ -100,19 +238,18 @@ try:
             b = b.encode("utf-8")
         return orjson.loads(b)
 
-    _HAS_ORJSON = True
 except Exception:
     import json  # type: ignore
 
     def json_dumps(v: Any, *, indent: int = 0) -> str:
-        return json.dumps(v, indent=indent if indent else None, default=str, ensure_ascii=False)
+        return json.dumps(
+            v, indent=indent if indent else None, default=str, ensure_ascii=False
+        )
 
     def json_loads(b: Union[str, bytes]) -> Any:
         if isinstance(b, (bytes, bytearray)):
             b = b.decode("utf-8", errors="replace")
         return json.loads(b)
-
-    _HAS_ORJSON = False
 
 
 # =============================================================================
@@ -204,10 +341,6 @@ def _pct_to_fraction(x: Any) -> Optional[float]:
 
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
-
-
-def _maybe_await(v: Any) -> Any:
-    return v
 
 
 def _as_dict(obj: Any) -> Dict[str, Any]:
@@ -336,11 +469,16 @@ class HTTPClient:
 
     async def post_json(self, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         if not _AIOHTTP_AVAILABLE:
-            raise RuntimeError("aiohttp not available for HTTP mode (install aiohttp or use --mode engine).")
+            raise RuntimeError(
+                "aiohttp not available for HTTP mode "
+                "(install aiohttp or use --mode engine)."
+            )
 
         if self._session is None:
             timeout = aiohttp.ClientTimeout(total=self.timeout_sec)  # type: ignore
-            self._session = aiohttp.ClientSession(timeout=timeout, headers=self._headers())  # type: ignore
+            self._session = aiohttp.ClientSession(  # type: ignore
+                timeout=timeout, headers=self._headers()
+            )
 
         url = f"{self.base_url}{path}"
         async with self._session.post(url, json=payload) as resp:  # type: ignore
@@ -368,6 +506,7 @@ class ScanConfig:
     mode: str = "engine"  # engine | http
     backend_base_url: str = ""
     token: str = ""
+    timeout_sec: float = 60.0  # v5.3.0 FIX CRITICAL: was missing; TypeError in worker
 
     # filters
     min_price: float = 1.0
@@ -390,15 +529,13 @@ class ScanConfig:
     @classmethod
     def from_worker_payload(cls, payload: Dict[str, Any]) -> "ScanConfig":
         """
-        FIX v5.2.0: Build a ScanConfig from the worker.py task payload dict.
+        Build a ScanConfig from the worker.py task payload dict.
 
-        Previously there was no programmatic entry point — worker.py had to
-        construct a fake argparse.Namespace and call main() directly, which
-        broke whenever new CLI args were added.
-
-        Expected payload keys match WORKER_PAYLOAD_SCHEMA.
-        All fields are optional; sensible defaults are used for missing keys.
+        Worker contract: task_type="market_scan". See WORKER_PAYLOAD_SCHEMA
+        for all accepted keys. All fields are optional with sensible defaults;
+        only `spreadsheet_id` (or DEFAULT_SPREADSHEET_ID env) is required.
         """
+
         def _s(k: str, default: str = "") -> str:
             return str(payload.get(k) or default).strip()
 
@@ -416,9 +553,13 @@ class ScanConfig:
             except Exception:
                 return default
 
-        spreadsheet_id = _s("spreadsheet_id") or _safe_str(os.getenv("DEFAULT_SPREADSHEET_ID", ""))
+        spreadsheet_id = _s("spreadsheet_id") or _safe_str(
+            os.getenv("SCAN_SHEET_ID") or os.getenv("DEFAULT_SPREADSHEET_ID", "")
+        )
         if not spreadsheet_id:
-            raise ValueError("ScanConfig.from_worker_payload: 'spreadsheet_id' is required.")
+            raise ValueError(
+                "ScanConfig.from_worker_payload: 'spreadsheet_id' is required."
+            )
 
         raw_keys = payload.get("keys") or ["Market_Leaders"]
         if isinstance(raw_keys, str):
@@ -437,11 +578,14 @@ class ScanConfig:
             concurrency=_i("concurrency", 10),
             mode=_s("mode", "engine"),
             backend_base_url=(
-                _s("backend_url") or _s("backend_base_url")
-                or _safe_str(os.getenv("BACKEND_BASE_URL", ""))
+                _s("backend_url")
+                or _s("backend_base_url")
+                or _safe_str(
+                    os.getenv("SCAN_BACKEND") or os.getenv("BACKEND_BASE_URL", "")
+                )
             ).rstrip("/"),
             token=_s("token") or _s("app_token"),
-            timeout_sec=_f("timeout_sec", 60.0),
+            timeout_sec=_f("timeout_sec", 60.0),  # v5.3.0: field now exists
             min_price=_f("min_price", 1.0),
             min_volume=_f("min_volume", 1000.0),
             max_risk_score=_f("max_risk_score", 60.0),
@@ -490,11 +634,14 @@ class ScanRow:
 
 
 # =============================================================================
-# Symbols reader
+# Resolvers (settings / env / CLI)
 # =============================================================================
 def _resolve_spreadsheet_id(cli: str) -> str:
     if cli:
         return cli.strip()
+    v = _safe_str(os.getenv("SCAN_SHEET_ID", ""))
+    if v:
+        return v
     if settings is not None:
         sid = _safe_str(getattr(settings, "default_spreadsheet_id", ""))
         if sid:
@@ -505,9 +652,10 @@ def _resolve_spreadsheet_id(cli: str) -> str:
 def _resolve_backend_url(cli: str) -> str:
     if cli:
         return cli.rstrip("/")
-    env = _safe_str(os.getenv("BACKEND_BASE_URL", "")).rstrip("/")
-    if env:
-        return env
+    for env_name in ("SCAN_BACKEND", "BACKEND_BASE_URL"):
+        env = _safe_str(os.getenv(env_name, "")).rstrip("/")
+        if env:
+            return env
     if settings is not None:
         s_url = _safe_str(getattr(settings, "backend_base_url", "")).rstrip("/")
         if s_url:
@@ -518,18 +666,38 @@ def _resolve_backend_url(cli: str) -> str:
 def _resolve_token(cli: str) -> str:
     if cli:
         return cli.strip()
-    for k in ("TFB_TOKEN", "APP_TOKEN", "BACKUP_APP_TOKEN", "TFB_APP_TOKEN", "BACKEND_TOKEN"):
+    for k in (
+        "SCAN_TOKEN",
+        "TFB_TOKEN",
+        "APP_TOKEN",
+        "BACKUP_APP_TOKEN",
+        "TFB_APP_TOKEN",
+        "BACKEND_TOKEN",
+    ):
         v = _safe_str(os.getenv(k, ""))
         if v:
             return v
     if settings is not None:
-        v2 = _safe_str(getattr(settings, "app_token", "") or getattr(settings, "token", ""))
+        v2 = _safe_str(
+            getattr(settings, "app_token", "") or getattr(settings, "token", "")
+        )
         if v2:
             return v2
     return ""
 
 
-def _read_symbols_from_keys(spreadsheet_id: str, keys: List[str], max_symbols: int) -> List[str]:
+# =============================================================================
+# Symbols reader
+# =============================================================================
+def _read_symbols_from_keys(
+    spreadsheet_id: str, keys: List[str], max_symbols: int
+) -> List[str]:
+    """
+    Per project contract (symbols_reader v10+), `get_page_symbols(key,
+    spreadsheet_id=...)` returns Dict[str, Any] with keys:
+      {"symbols", "all", "ksa", "global", "by_type", "metadata",
+       "status", "error"}
+    """
     if symbols_reader is None:
         raise RuntimeError("symbols_reader not available (run inside repo).")
 
@@ -550,20 +718,25 @@ def _read_symbols_from_keys(spreadsheet_id: str, keys: List[str], max_symbols: i
                 "My_Portfolio": "MY_PORTFOLIO",
                 "Insights_Analysis": "INSIGHTS_ANALYSIS",
             }.get(page, page)
-            data = symbols_reader.get_page_symbols(legacy, spreadsheet_id=spreadsheet_id)
+            try:
+                data = symbols_reader.get_page_symbols(
+                    legacy, spreadsheet_id=spreadsheet_id
+                )
+            except Exception as e:
+                logger.warning("symbols_reader failed for page %s: %s", page, e)
+                data = None
 
         syms: List[str] = []
         if isinstance(data, dict):
-            syms = data.get("all") or data.get("symbols") or []
+            v = data.get("all") or data.get("symbols") or []
+            syms = v if isinstance(v, list) else []
         elif isinstance(data, list):
             syms = data
-        else:
-            syms = []
 
         all_syms.extend([_safe_str(s) for s in syms if _safe_str(s)])
 
     # normalize + dedup
-    normed = []
+    normed: List[str] = []
     for s in all_syms:
         try:
             normed.append(normalize_symbol(s))
@@ -579,7 +752,14 @@ def _read_symbols_from_keys(spreadsheet_id: str, keys: List[str], max_symbols: i
 # =============================================================================
 # Quote fetch (engine)
 # =============================================================================
-async def _fetch_quotes_engine(engine: Any, symbols: List[str]) -> List[Dict[str, Any]]:
+async def _fetch_quotes_engine(
+    engine: Any, symbols: List[str], concurrency: int = 10
+) -> List[Dict[str, Any]]:
+    """
+    v5.3.0 FIX: `concurrency` now threaded through from cfg (was hardcoded 12).
+    v5.3.0 FIX: per-symbol `asyncio.gather` uses `return_exceptions=True` —
+    previously one failure killed the entire batch.
+    """
     if engine is None:
         return []
 
@@ -587,19 +767,26 @@ async def _fetch_quotes_engine(engine: Any, symbols: List[str]) -> List[Dict[str
     for m in ("get_enriched_quotes", "get_quotes", "fetch_quotes"):
         fn = getattr(engine, m, None)
         if callable(fn):
-            res = fn(symbols)
-            if inspect.isawaitable(res):
-                res = await res
-            if isinstance(res, list):
-                return [_as_dict(x) for x in res]
+            try:
+                res = fn(symbols)
+                if inspect.isawaitable(res):
+                    res = await res
+                if isinstance(res, list):
+                    return [_as_dict(x) for x in res]
+            except Exception as e:
+                logger.warning(
+                    "Engine batch API %s failed: %s; falling back to per-symbol", m, e
+                )
+                break  # one batch API failure -> try per-symbol
 
-    # fallback: per-symbol
-    out: List[Dict[str, Any]] = []
-    single = getattr(engine, "get_enriched_quote", None) or getattr(engine, "get_quote", None)
+    # Fallback: per-symbol
+    single = getattr(engine, "get_enriched_quote", None) or getattr(
+        engine, "get_quote", None
+    )
     if not callable(single):
-        return out
+        return []
 
-    sem = asyncio.Semaphore(12)
+    sem = asyncio.Semaphore(max(1, int(concurrency)))
 
     async def one(sym: str) -> Dict[str, Any]:
         async with sem:
@@ -608,15 +795,49 @@ async def _fetch_quotes_engine(engine: Any, symbols: List[str]) -> List[Dict[str
                 r = await r
             return _as_dict(r)
 
-    out = await asyncio.gather(*[one(s) for s in symbols], return_exceptions=False)
+    # v5.3.0 FIX: return_exceptions=True + filter to avoid aborting on one bad symbol
+    raw = await asyncio.gather(
+        *[one(s) for s in symbols], return_exceptions=True
+    )
+    out: List[Dict[str, Any]] = []
+    err_count = 0
+    for sym, r in zip(symbols, raw):
+        if isinstance(r, Exception):
+            err_count += 1
+            logger.debug("Engine per-symbol error for %s: %s", sym, r)
+            continue
+        if isinstance(r, dict):
+            out.append(r)
+    if err_count:
+        logger.warning(
+            "Engine per-symbol fetch: %d/%d symbols errored", err_count, len(symbols)
+        )
     return out
+
+
+async def _maybe_close_engine(engine: Any) -> None:
+    """v5.3.0: best-effort cleanup of engine instance (close/aclose)."""
+    if engine is None:
+        return
+    for attr in ("aclose", "close"):
+        fn = getattr(engine, attr, None)
+        if callable(fn):
+            try:
+                res = fn()
+                if inspect.isawaitable(res):
+                    await res
+                return
+            except Exception as e:
+                logger.debug("Engine cleanup %s failed: %s", attr, e)
 
 
 # =============================================================================
 # Quote fetch (http)
 # =============================================================================
-async def _fetch_quotes_http(http: HTTPClient, symbols: List[str]) -> List[Dict[str, Any]]:
-    # Use /v1/enriched/quotes (your router supports POST)
+async def _fetch_quotes_http(
+    http: HTTPClient, symbols: List[str]
+) -> List[Dict[str, Any]]:
+    """POST to /v1/enriched/quotes (router supports POST)."""
     payload = {
         "symbols": symbols,
         "format": "items",
@@ -653,9 +874,18 @@ def _extract_expected_roi(q: Dict[str, Any], horizon: str) -> Optional[float]:
     if v is None:
         # some engines use expected_roi_1m/3m/12m, others percent keys
         alt = {
-            "expected_roi_1m": ("expected_roi_1m", "roi_1m", "expected_roi_pct_1m", "expected_roi_percent_1m"),
-            "expected_roi_3m": ("expected_roi_3m", "roi_3m", "expected_roi_pct_3m", "expected_roi_percent_3m"),
-            "expected_roi_12m": ("expected_roi_12m", "roi_12m", "expected_roi_pct_12m", "expected_roi_percent_12m"),
+            "expected_roi_1m": (
+                "expected_roi_1m", "roi_1m",
+                "expected_roi_pct_1m", "expected_roi_percent_1m",
+            ),
+            "expected_roi_3m": (
+                "expected_roi_3m", "roi_3m",
+                "expected_roi_pct_3m", "expected_roi_percent_3m",
+            ),
+            "expected_roi_12m": (
+                "expected_roi_12m", "roi_12m",
+                "expected_roi_pct_12m", "expected_roi_percent_12m",
+            ),
         }.get(k, ())
         for a in alt:
             if a in q and q.get(a) is not None:
@@ -734,7 +964,11 @@ def _build_rows(quotes: List[Dict[str, Any]], cfg: ScanConfig) -> List[ScanRow]:
     for q in quotes:
         if not isinstance(q, dict):
             continue
-        sym = _safe_str(q.get("symbol") or q.get("symbol_normalized") or q.get("requested_symbol")).upper()
+        sym = _safe_str(
+            q.get("symbol")
+            or q.get("symbol_normalized")
+            or q.get("requested_symbol")
+        ).upper()
         if not sym:
             continue
 
@@ -744,7 +978,9 @@ def _build_rows(quotes: List[Dict[str, Any]], cfg: ScanConfig) -> List[ScanRow]:
 
         price = _safe_float(q.get("current_price") or q.get("price"))
         volume = _safe_float(q.get("volume"))
-        market = _safe_str(q.get("market") or q.get("exchange") or q.get("origin") or "")
+        market = _safe_str(
+            q.get("market") or q.get("exchange") or q.get("origin") or ""
+        )
         currency = _safe_str(q.get("currency") or "")
         name = _safe_str(q.get("name") or q.get("company_name") or "")
 
@@ -758,10 +994,10 @@ def _build_rows(quotes: List[Dict[str, Any]], cfg: ScanConfig) -> List[ScanRow]:
 
         rsi_14 = _safe_float(q.get("rsi_14"))
         vol30 = _pct_to_fraction(q.get("volatility_30d"))
-        if vol30 is not None:
-            vol30 = float(vol30)  # fraction
 
-        comp = _composite_score(roi=roi, conf=conf, overall=overall, risk=risk, cfg=cfg)
+        comp = _composite_score(
+            roi=roi, conf=conf, overall=overall, risk=risk, cfg=cfg
+        )
 
         rows.append(
             ScanRow(
@@ -782,7 +1018,9 @@ def _build_rows(quotes: List[Dict[str, Any]], cfg: ScanConfig) -> List[ScanRow]:
                 rsi_14=rsi_14,
                 volatility_30d=vol30,
                 data_quality=_safe_str(q.get("data_quality") or ""),
-                data_source=_safe_str(q.get("data_source") or q.get("engine_source") or ""),
+                data_source=_safe_str(
+                    q.get("data_source") or q.get("engine_source") or ""
+                ),
                 last_updated_utc=_safe_str(q.get("last_updated_utc") or ""),
                 composite_rank_score=comp,
             )
@@ -822,11 +1060,6 @@ def _write_csv(path: str, rows: List[ScanRow]) -> None:
         w.writeheader()
         for r in rows:
             d = r.to_dict()
-            # pretty ROI/conf
-            if d.get("expected_roi") is not None:
-                d["expected_roi"] = float(d["expected_roi"])  # fraction
-            if d.get("forecast_confidence") is not None:
-                d["forecast_confidence"] = float(d["forecast_confidence"])
             w.writerow(d)
 
 
@@ -836,7 +1069,7 @@ def _write_html(path: str, rows: List[ScanRow], cfg: ScanConfig) -> None:
             return ""
         return f"{x*100:.1f}%"
 
-    html = [
+    html: List[str] = [
         "<!DOCTYPE html>",
         "<html><head><meta charset='utf-8'/>",
         "<title>TFB Market Scan</title>",
@@ -847,10 +1080,16 @@ def _write_html(path: str, rows: List[ScanRow], cfg: ScanConfig) -> None:
         "th{background:#f2f2f2;}",
         ".num{text-align:right;}",
         "</style></head><body>",
-        f"<h2>TFB Market Scan — Top {len(rows)} (horizon={cfg.horizon.upper()})</h2>",
+        f"<h2>TFB Market Scan v{SCRIPT_VERSION} — "
+        f"Top {len(rows)} (horizon={cfg.horizon.upper()})</h2>",
         f"<p>Generated: {_utc_iso()}</p>",
         "<table>",
-        "<tr><th>#</th><th>Symbol</th><th>Name</th><th>Market</th><th class='num'>Price</th><th class='num'>ROI</th><th class='num'>Confidence</th><th class='num'>Overall</th><th class='num'>Risk</th><th class='num'>Composite</th></tr>",
+        "<tr>"
+        "<th>#</th><th>Symbol</th><th>Name</th><th>Market</th>"
+        "<th class='num'>Price</th><th class='num'>ROI</th>"
+        "<th class='num'>Confidence</th><th class='num'>Overall</th>"
+        "<th class='num'>Risk</th><th class='num'>Composite</th>"
+        "</tr>",
     ]
     for r in rows:
         html.append(
@@ -872,35 +1111,59 @@ def _write_html(path: str, rows: List[ScanRow], cfg: ScanConfig) -> None:
 
 
 # =============================================================================
-# Main
+# Main scan
 # =============================================================================
 async def run_scan(cfg: ScanConfig) -> Tuple[List[ScanRow], Dict[str, Any]]:
     t0 = time.time()
 
     symbols = _read_symbols_from_keys(cfg.spreadsheet_id, cfg.keys, cfg.max_symbols)
     if not symbols:
-        return [], {"ok": False, "error": "no_symbols", "symbols": 0}
+        meta = {
+            "ok": False,
+            "version": SCRIPT_VERSION,
+            "error": "no_symbols",
+            "symbols_in": 0,
+            "quotes_fetched": 0,
+            "rows_out": 0,
+            "timing_ms": round((time.time() - t0) * 1000.0, 2),
+            "generated_utc": _utc_iso(),
+        }
+        return [], meta
 
     # fetch quotes
     quotes: List[Dict[str, Any]] = []
-    if cfg.mode == "engine":
-        eng = await get_engine()
-        if eng is None:
-            raise RuntimeError("Engine mode selected but core.data_engine_v2.get_engine() returned None.")
-        # chunk to reduce memory and improve responsiveness
-        for i in range(0, len(symbols), max(10, cfg.chunk_size)):
-            chunk = symbols[i : i + cfg.chunk_size]
-            got = await _fetch_quotes_engine(eng, chunk)
-            quotes.extend(got)
-    else:
-        http = HTTPClient(cfg.backend_base_url, cfg.token, timeout_sec=cfg.timeout_sec)  # type: ignore[attr-defined]
-        try:
+    engine_instance: Any = None
+
+    try:
+        if cfg.mode == "engine":
+            engine_instance = await get_engine()
+            if engine_instance is None:
+                raise RuntimeError(
+                    "Engine mode selected but core.data_engine_v2.get_engine() "
+                    "returned None."
+                )
+            # chunk to reduce memory and improve responsiveness
             for i in range(0, len(symbols), max(10, cfg.chunk_size)):
                 chunk = symbols[i : i + cfg.chunk_size]
-                got = await _fetch_quotes_http(http, chunk)
+                got = await _fetch_quotes_engine(
+                    engine_instance, chunk, concurrency=cfg.concurrency
+                )
                 quotes.extend(got)
-        finally:
-            await http.close()
+        else:
+            http = HTTPClient(
+                cfg.backend_base_url, cfg.token, timeout_sec=cfg.timeout_sec
+            )  # v5.3.0: cfg.timeout_sec now exists
+            try:
+                for i in range(0, len(symbols), max(10, cfg.chunk_size)):
+                    chunk = symbols[i : i + cfg.chunk_size]
+                    got = await _fetch_quotes_http(http, chunk)
+                    quotes.extend(got)
+            finally:
+                await http.close()
+    finally:
+        # v5.3.0: best-effort engine cleanup (close/aclose)
+        if engine_instance is not None:
+            await _maybe_close_engine(engine_instance)
 
     rows = _build_rows(quotes, cfg)
 
@@ -926,46 +1189,140 @@ async def run_scan(cfg: ScanConfig) -> Tuple[List[ScanRow], Dict[str, Any]]:
     return rows, meta
 
 
+# =============================================================================
+# CLI
+# =============================================================================
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=f"TFB Market Scanner v{SCRIPT_VERSION}")
-    p.add_argument("--sheet-id", default="", help="Spreadsheet ID (defaults to settings/env)")
-    p.add_argument("--keys", nargs="*", default=["Market_Leaders"], help="Pages to scan (canonical keys)")
-    p.add_argument("--mode", choices=["engine", "http"], default="engine", help="Fetch mode")
-    p.add_argument("--backend", default="", help="Backend base URL for http mode")
-    p.add_argument("--token", default="", help="Auth token for http mode")
+    p.add_argument(
+        "--sheet-id",
+        default="",
+        help="Spreadsheet ID (also SCAN_SHEET_ID / DEFAULT_SPREADSHEET_ID env).",
+    )
+    p.add_argument(
+        "--keys",
+        nargs="*",
+        default=_env_csv("SCAN_KEYS") or ["Market_Leaders"],
+        help="Pages to scan (canonical keys). Also: SCAN_KEYS env (comma-separated).",
+    )
+    p.add_argument(
+        "--mode",
+        choices=["engine", "http"],
+        default=os.getenv("SCAN_MODE", "engine"),
+        help="Fetch mode. Also: SCAN_MODE env.",
+    )
+    p.add_argument(
+        "--backend",
+        default="",
+        help="Backend base URL for http mode (also SCAN_BACKEND / BACKEND_BASE_URL env).",
+    )
+    p.add_argument(
+        "--token",
+        default="",
+        help="Auth token for http mode (also SCAN_TOKEN / TFB_TOKEN / APP_TOKEN env).",
+    )
 
-    p.add_argument("--top", type=int, default=50, help="Top N results")
-    p.add_argument("--max-symbols", type=int, default=1500, help="Max symbols to scan")
-    p.add_argument("--chunk-size", type=int, default=60, help="Batch chunk size for fetches")
+    p.add_argument(
+        "--top",
+        type=int,
+        default=_env_int("SCAN_TOP", 50, lo=1),
+        help="Top N results. Also: SCAN_TOP env.",
+    )
+    p.add_argument(
+        "--max-symbols",
+        type=int,
+        default=_env_int("SCAN_MAX_SYMBOLS", 1500, lo=0),
+        help="Max symbols to scan. Also: SCAN_MAX_SYMBOLS env.",
+    )
+    p.add_argument(
+        "--chunk-size",
+        type=int,
+        default=_env_int("SCAN_CHUNK_SIZE", 60, lo=10),
+        help="Batch chunk size for fetches. Also: SCAN_CHUNK_SIZE env.",
+    )
+    p.add_argument(
+        "--concurrency",
+        type=int,
+        default=_env_int("SCAN_CONCURRENCY", 10, lo=1, hi=64),
+        help="Per-symbol semaphore size (engine fallback). Also: SCAN_CONCURRENCY env.",
+    )
+    p.add_argument(
+        "--timeout",
+        type=float,
+        default=_env_float("SCAN_TIMEOUT", 60.0, lo=5.0, hi=600.0),
+        help="HTTP request timeout in seconds. Also: SCAN_TIMEOUT env.",
+    )
 
-    p.add_argument("--horizon", choices=["1m", "3m", "12m"], default="3m", help="ROI horizon to rank/filter")
-    p.add_argument("--min-price", type=float, default=1.0, help="Minimum price")
-    p.add_argument("--min-volume", type=float, default=1000.0, help="Minimum volume")
-    p.add_argument("--max-risk", type=float, default=60.0, help="Max risk_score (<=60 recommended)")
-    p.add_argument("--min-confidence", type=float, default=0.65, help="Min forecast_confidence (0..1)")
-    p.add_argument("--min-roi", type=float, default=0.0, help="Min expected ROI as FRACTION (0.10=10%)")
+    p.add_argument(
+        "--horizon",
+        choices=["1m", "3m", "12m"],
+        default=os.getenv("SCAN_HORIZON", "3m"),
+        help="ROI horizon to rank/filter. Also: SCAN_HORIZON env.",
+    )
+    p.add_argument(
+        "--min-price",
+        type=float,
+        default=_env_float("SCAN_MIN_PRICE", 1.0),
+        help="Minimum price. Also: SCAN_MIN_PRICE env.",
+    )
+    p.add_argument(
+        "--min-volume",
+        type=float,
+        default=_env_float("SCAN_MIN_VOLUME", 1000.0),
+        help="Minimum volume. Also: SCAN_MIN_VOLUME env.",
+    )
+    p.add_argument(
+        "--max-risk",
+        type=float,
+        default=_env_float("SCAN_MAX_RISK", 60.0),
+        help="Max risk_score (<=60 recommended). Also: SCAN_MAX_RISK env.",
+    )
+    p.add_argument(
+        "--min-confidence",
+        type=float,
+        default=_env_float("SCAN_MIN_CONFIDENCE", 0.65),
+        help="Min forecast_confidence (0..1). Also: SCAN_MIN_CONFIDENCE env.",
+    )
+    p.add_argument(
+        "--min-roi",
+        type=float,
+        default=_env_float("SCAN_MIN_ROI", 0.0),
+        help="Min expected ROI as FRACTION (0.10=10%%). Also: SCAN_MIN_ROI env.",
+    )
 
-    p.add_argument("--export-json", default="", help="Write JSON to file")
-    p.add_argument("--export-csv", default="", help="Write CSV to file")
-    p.add_argument("--export-html", default="", help="Write HTML to file")
+    p.add_argument(
+        "--export-json",
+        default=os.getenv("SCAN_EXPORT_JSON", ""),
+        help="Write JSON to file. Also: SCAN_EXPORT_JSON env.",
+    )
+    p.add_argument(
+        "--export-csv",
+        default=os.getenv("SCAN_EXPORT_CSV", ""),
+        help="Write CSV to file. Also: SCAN_EXPORT_CSV env.",
+    )
+    p.add_argument(
+        "--export-html",
+        default=os.getenv("SCAN_EXPORT_HTML", ""),
+        help="Write HTML to file. Also: SCAN_EXPORT_HTML env.",
+    )
 
     return p.parse_args()
 
 
-
 # =============================================================================
-# Worker integration API (FIX v5.2.0)
+# Worker integration API
 # =============================================================================
 
-# Documents the expected task payload for worker.py dispatching task_type="market_scan".
-# Keys match ScanConfig.from_worker_payload() field names.
+# Documents the expected task payload for worker.py dispatching
+# task_type="market_scan". Keys match ScanConfig.from_worker_payload() fields.
 WORKER_PAYLOAD_SCHEMA: Dict[str, Any] = {
     "task_type": "market_scan",        # (required) always "market_scan"
-    "spreadsheet_id": "",              # (required if DEFAULT_SPREADSHEET_ID not set)
+    "spreadsheet_id": "",              # (required unless SCAN_SHEET_ID / DEFAULT_SPREADSHEET_ID env set)
     "keys": ["Market_Leaders"],        # (optional) pages to scan
     "top_n": 50,                       # (optional) top N results
     "max_symbols": 1500,               # (optional) max symbols to process
     "chunk_size": 60,                  # (optional) batch size per fetch
+    "concurrency": 10,                 # (optional) per-symbol semaphore (engine fallback)
     "mode": "engine",                  # (optional) "engine" | "http"
     "backend_url": "",                 # (optional) override BACKEND_BASE_URL
     "token": "",                       # (optional) auth token
@@ -996,7 +1353,11 @@ async def run_from_worker_payload_async(payload: Dict[str, Any]) -> Dict[str, An
     Accepts a task payload dict, builds ScanConfig via from_worker_payload(),
     runs the scan, and returns a result dict for the worker to log and ACK.
 
-    Returns dict with: status, exit_code, rows_count, meta, errors, task_id.
+    Returns dict with: status, exit_code, rows_count, top_symbol, meta,
+    errors, task_id.
+
+    v5.3.0: from_worker_payload() no longer crashes with TypeError due to
+    missing `timeout_sec` field. HTML export now also written from worker path.
     """
     task_id = str(payload.get("task_id") or "")
     task_type = str(payload.get("task_type") or "").strip()
@@ -1007,7 +1368,8 @@ async def run_from_worker_payload_async(payload: Dict[str, Any]) -> Dict[str, An
             "rows_count": 0,
             "meta": {},
             "errors": [
-                f"run_from_worker_payload: expected task_type='market_scan', got {task_type!r}"
+                f"run_from_worker_payload: expected task_type='market_scan', "
+                f"got {task_type!r}"
             ],
             "task_id": task_id,
         }
@@ -1026,9 +1388,13 @@ async def run_from_worker_payload_async(payload: Dict[str, Any]) -> Dict[str, An
 
     try:
         rows, meta = await run_scan(cfg)
+
         if rows and cfg.export_json:
             try:
-                _write_json(cfg.export_json, {"meta": meta, "rows": [r.to_dict() for r in rows]})
+                _write_json(
+                    cfg.export_json,
+                    {"meta": meta, "rows": [r.to_dict() for r in rows]},
+                )
             except Exception as e:
                 logger.warning("Worker export_json failed: %s", e)
         if rows and cfg.export_csv:
@@ -1036,6 +1402,12 @@ async def run_from_worker_payload_async(payload: Dict[str, Any]) -> Dict[str, An
                 _write_csv(cfg.export_csv, rows)
             except Exception as e:
                 logger.warning("Worker export_csv failed: %s", e)
+        # v5.3.0 FIX: HTML export was missing from worker path
+        if rows and cfg.export_html:
+            try:
+                _write_html(cfg.export_html, rows, cfg)
+            except Exception as e:
+                logger.warning("Worker export_html failed: %s", e)
 
         return {
             "status": "success" if rows else "partial",
@@ -1075,11 +1447,18 @@ def run_from_worker_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             "task_id": str(payload.get("task_id") or ""),
         }
 
+
+# =============================================================================
+# CLI main
+# =============================================================================
 def main() -> int:
     args = _parse_args()
 
     if args.mode == "engine" and not _CORE_AVAILABLE:
-        logger.error("Engine mode requires running inside the repo (core.* imports missing). Use --mode http instead.")
+        logger.error(
+            "Engine mode requires running inside the repo (core.* imports missing). "
+            "Use --mode http instead."
+        )
         return 2
     if args.mode == "http" and not _AIOHTTP_AVAILABLE:
         logger.error("HTTP mode requires aiohttp installed.")
@@ -1087,7 +1466,10 @@ def main() -> int:
 
     sid = _resolve_spreadsheet_id(args.sheet_id)
     if not sid:
-        logger.error("Missing spreadsheet id. Use --sheet-id or set DEFAULT_SPREADSHEET_ID / settings.default_spreadsheet_id")
+        logger.error(
+            "Missing spreadsheet id. Use --sheet-id, or set SCAN_SHEET_ID / "
+            "DEFAULT_SPREADSHEET_ID / settings.default_spreadsheet_id."
+        )
         return 2
 
     keys = [_canon_key(k) for k in (args.keys or [])]
@@ -1104,10 +1486,11 @@ def main() -> int:
         top_n=max(1, int(args.top)),
         max_symbols=max(0, int(args.max_symbols)),
         chunk_size=max(10, int(args.chunk_size)),
-        concurrency=10,
+        concurrency=max(1, int(args.concurrency)),
         mode=args.mode,
         backend_base_url=backend,
         token=token,
+        timeout_sec=float(args.timeout),
         min_price=float(args.min_price),
         min_volume=float(args.min_volume),
         max_risk_score=float(args.max_risk),
@@ -1120,9 +1503,13 @@ def main() -> int:
     )
 
     logger.info("=== Market Scan v%s ===", SCRIPT_VERSION)
-    logger.info("Mode: %s | Sheet: %s | Keys: %s", cfg.mode, cfg.spreadsheet_id, ",".join(cfg.keys))
     logger.info(
-        "Filters: min_price=%.2f | min_volume=%.0f | max_risk=%.1f | min_conf=%.2f | min_roi=%.2f%% | horizon=%s",
+        "Mode: %s | Sheet: %s | Keys: %s",
+        cfg.mode, cfg.spreadsheet_id, ",".join(cfg.keys),
+    )
+    logger.info(
+        "Filters: min_price=%.2f | min_volume=%.0f | max_risk=%.1f | "
+        "min_conf=%.2f | min_roi=%.2f%% | horizon=%s",
         cfg.min_price,
         cfg.min_volume,
         cfg.max_risk_score,
@@ -1132,8 +1519,10 @@ def main() -> int:
     )
     if cfg.mode == "http":
         if not cfg.token:
-            logger.warning("No token found. If backend requires auth, request may fail with 401.")
-        logger.info("Backend: %s", cfg.backend_base_url)
+            logger.warning(
+                "No token found. If backend requires auth, request may fail with 401."
+            )
+        logger.info("Backend: %s | Timeout: %.1fs", cfg.backend_base_url, cfg.timeout_sec)
 
     try:
         rows, meta = asyncio.run(run_scan(cfg))
@@ -1142,10 +1531,13 @@ def main() -> int:
         return 130
     except Exception as e:
         logger.error("Scan failed: %s", e)
-        return 1
+        return 2
 
     # Console summary
-    logger.info("Result: rows=%d | symbols=%s | ms=%s", len(rows), meta.get("symbols_in"), meta.get("timing_ms"))
+    logger.info(
+        "Result: rows=%d | symbols=%s | ms=%s",
+        len(rows), meta.get("symbols_in"), meta.get("timing_ms"),
+    )
     if rows:
         top = rows[0]
         logger.info(
@@ -1156,6 +1548,11 @@ def main() -> int:
             "" if top.overall_score is None else f"{top.overall_score:.1f}",
             "" if top.risk_score is None else f"{top.risk_score:.1f}",
             top.composite_rank_score,
+        )
+    else:
+        logger.warning(
+            "No rows produced (no symbols or all filtered out). Meta: %s",
+            {k: meta.get(k) for k in ("symbols_in", "quotes_fetched", "error")},
         )
 
     # Exports
@@ -1173,8 +1570,24 @@ def main() -> int:
     except Exception as e:
         logger.warning("Export failed: %s", e)
 
-    return 0
+    # v5.3.0: exit 1 if no rows (aligns with worker path's "partial" status)
+    return 0 if rows else 1
+
+
+__all__ = [
+    "SCRIPT_VERSION",
+    "SERVICE_VERSION",
+    "ScanConfig",
+    "ScanRow",
+    "HTTPClient",
+    "CANON_PAGES",
+    "WORKER_PAYLOAD_SCHEMA",
+    "run_scan",
+    "run_from_worker_payload",
+    "run_from_worker_payload_async",
+    "main",
+]
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
