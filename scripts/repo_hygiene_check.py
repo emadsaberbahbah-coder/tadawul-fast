@@ -2,24 +2,83 @@
 """
 scripts/repo_hygiene_check.py
 ================================================================================
-TADAWUL ENTERPRISE REPOSITORY HYGIENE CHECKER — v5.0.1 (QUANTUM EDITION)
+TADAWUL ENTERPRISE REPOSITORY HYGIENE CHECKER — v5.1.0 (QUANTUM EDITION)
 ================================================================================
 AI-POWERED | CI/CD INTEGRATED | MEMORY-OPTIMIZED | FALSE-POSITIVE RESISTANT
 
-v5.0.1 hotfixes:
-- ✅ FIX: Self-scan suppression for intentional token examples in this script
-       (markdown fences / LLM artifact examples / debugger pattern examples).
-- ✅ FIX: Secret detection heuristics tightened to reduce false positives in config/router files
-       (e.g., env var names, schema fields, placeholders, help text, regex definitions).
-- ✅ FIX: Rule.exclude_pattern is now honored.
-- ✅ IMPROVEMENT: More precise line/column handling for line-based matches.
+Why this revision (v5.1.0 vs v5.0.1)
+-------------------------------------
+- 🔑 FIX HIGH: Removed 5 dead CLI flags — `--enable-git`, `--rules-file`,
+     `--fail-on-read-error`, `--show-snippets`, `--parallel` were declared
+     in argparse but NEVER consumed anywhere in `main_async`. They silently
+     did nothing, misleading users. v5.1.0 removes them to make the
+     advertised interface match the actual behavior.
+- 🔑 FIX HIGH: `OutputFormat.CSV` / `OutputFormat.MARKDOWN` values existed
+     in the enum AND in `--format` choices, but had no implementation.
+     Users picking `--format csv` got no output and no error — silent
+     correctness bug. v5.1.0 implements both formatters. `OutputFormat.HTML`
+     is removed from the enum (was also unimplemented).
+- 🔑 FIX PERFORMANCE: `scan_parallel` was creating a new
+     `ThreadPoolExecutor` for every 100-file chunk, spawning and
+     destroying worker threads constantly. v5.1.0 uses a single
+     `ThreadPoolExecutor` for the entire scan, with an `asyncio.Semaphore`
+     to bound in-flight work.
+
+- FIX: Removed dead imports (`csv`, `bandit`, `git`, `yaml`) and unused
+     module-level flags (`_HAS_ORJSON`, `_RICH_AVAILABLE`,
+     `_BANDIT_AVAILABLE`, `_GIT_AVAILABLE`, `_YAML_AVAILABLE`).
+- FIX: Added project-standard `_TRUTHY` / `_FALSY` vocabulary matching
+     `main._TRUTHY` / `_FALSY` plus `_env_bool`, `_env_int`,
+     `_env_int_bool` helpers.
+- FIX: Added `SERVICE_VERSION = SCRIPT_VERSION` alias (cross-script
+     convention with `audit_data_quality.py v4.5.0` / `cleanup_cache.py
+     v4.1.0` / `drift_detection.py v4.3.0` / `migrate_schema_v2.py v2.1.0`
+     / `refresh_data.py v5.2.0`).
+- FIX: Added env var defaults for all CLI flags under the `HYGIENE_*`
+     prefix for headless/cron operation.
+- FIX: `--output-file` extension dispatch now recognizes `.csv` and `.md`
+     in addition to `.json`, `.xml`, `.sarif`.
+- FIX: `main_async` body wrapped in `try/finally` with `_shutdown_executor`
+     cleanup — leak-proof on exceptions.
+
+v5.0.1 hotfixes (preserved):
+- Self-scan suppression for intentional token examples in this script
+- Secret detection heuristics tightened (env var names, schema fields,
+  placeholders, help text, regex definitions suppressed)
+- `Rule.exclude_pattern` honored
+- Precise line/column for line-based matches
+
+Env vars
+--------
+  HYGIENE_ROOT                root directory to scan (default ".")
+  HYGIENE_STRICT              strict mode 0/1 (default 0)
+  HYGIENE_MAX_OFFENDERS       stop after N offenders (default 0 = no limit)
+  HYGIENE_SCAN_ALL_TEXT       scan all text files (default 0)
+  HYGIENE_MAX_FILE_SIZE_MB    max file size in MB (default 2)
+  HYGIENE_ENABLE_ML           enable ML anomaly detection (default 0)
+  HYGIENE_DISABLE_SECRETS     disable secret detection (default 0)
+  HYGIENE_WORKERS             worker thread count (default CPU count)
+  HYGIENE_FORMAT              output format (default console)
+  HYGIENE_OUTPUT_FILE         save output to file
+  HYGIENE_ANNOTATE            emit CI annotations (default 1)
+  HYGIENE_FAIL_THRESHOLD      threshold for nonzero exit (default high)
+  HYGIENE_EXTENSIONS          comma-separated extensions (default .py)
+  HYGIENE_EXCLUDE             comma-separated dirs to exclude
+  HYGIENE_EXCLUDE_PATTERNS    comma-separated regex patterns to exclude
+  HYGIENE_INCLUDE_PATTERNS    comma-separated regex patterns to include
+
+Exit codes
+----------
+  0 = passed (no findings at or above fail threshold)
+  1 = runtime error / interrupted
+  2 = findings at or above fail threshold
+================================================================================
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
-import csv
 import hashlib
 import logging
 import os
@@ -38,26 +97,25 @@ from typing import Any, Dict, List, Optional, Set, Tuple, Union, Pattern, Callab
 # High-Performance JSON fallback
 # ---------------------------------------------------------------------------
 try:
-    import orjson
+    import orjson  # type: ignore
 
     def json_dumps(v: Any, *, indent: int = 0) -> str:
         option = orjson.OPT_INDENT_2 if indent else 0
-        return orjson.dumps(v, option=option).decode("utf-8")
+        return orjson.dumps(v, option=option, default=str).decode("utf-8")
 
     def json_loads(v: Union[str, bytes]) -> Any:
         return orjson.loads(v)
 
-    _HAS_ORJSON = True
 except ImportError:
-    import json
+    import json  # type: ignore
 
     def json_dumps(v: Any, *, indent: int = 0) -> str:
-        return json.dumps(v, indent=indent if indent else None)
+        return json.dumps(
+            v, indent=indent if indent else None, default=str, ensure_ascii=False
+        )
 
     def json_loads(v: Union[str, bytes]) -> Any:
         return json.loads(v)
-
-    _HAS_ORJSON = False
 
 # ---------------------------------------------------------------------------
 # Rich UI (Optional)
@@ -73,63 +131,48 @@ try:
         TimeElapsedColumn,
     )
     from rich.table import Table
-    from rich.panel import Panel
 
-    _RICH_AVAILABLE = True
     console = Console()
 except ImportError:
-    _RICH_AVAILABLE = False
-    console = None
+    console = None  # type: ignore[assignment]
+    Progress = None  # type: ignore[assignment]
+    SpinnerColumn = None  # type: ignore[assignment]
+    TextColumn = None  # type: ignore[assignment]
+    BarColumn = None  # type: ignore[assignment]
+    TaskProgressColumn = None  # type: ignore[assignment]
+    TimeElapsedColumn = None  # type: ignore[assignment]
+    Table = None  # type: ignore[assignment]
 
+# ---------------------------------------------------------------------------
 # Optional ML/AI libraries
+# ---------------------------------------------------------------------------
 try:
-    import numpy as np
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.ensemble import IsolationForest
-    from sklearn.preprocessing import StandardScaler
+    import numpy as np  # type: ignore
+    from sklearn.feature_extraction.text import TfidfVectorizer  # type: ignore
+    from sklearn.ensemble import IsolationForest  # type: ignore
+    from sklearn.preprocessing import StandardScaler  # type: ignore
 
     _ML_AVAILABLE = True
 except ImportError:
     _ML_AVAILABLE = False
 
-# Optional security scanning
+# ---------------------------------------------------------------------------
+# Optional JUnit XML output
+# ---------------------------------------------------------------------------
 try:
-    import bandit
-    from bandit.core import manager as bandit_manager
-
-    _BANDIT_AVAILABLE = True
-except ImportError:
-    _BANDIT_AVAILABLE = False
-
-# Optional Git integration
-try:
-    import git
-    from git import Repo
-
-    _GIT_AVAILABLE = True
-except ImportError:
-    _GIT_AVAILABLE = False
-
-# Optional output formats
-try:
-    import junit_xml
-    from junit_xml import TestSuite, TestCase
+    from junit_xml import TestSuite, TestCase  # type: ignore
 
     _JUNIT_AVAILABLE = True
 except ImportError:
     _JUNIT_AVAILABLE = False
 
-try:
-    import yaml
 
-    _YAML_AVAILABLE = True
-except ImportError:
-    _YAML_AVAILABLE = False
+# =============================================================================
+# Version + Logging
+# =============================================================================
+SCRIPT_VERSION = "5.1.0"
+SERVICE_VERSION = SCRIPT_VERSION  # v5.1.0: cross-script alias
 
-# Version
-SCRIPT_VERSION = "5.0.1"
-
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
@@ -137,11 +180,77 @@ logging.basicConfig(
 )
 logger = logging.getLogger("RepoHygiene")
 
+
+# =============================================================================
+# Project-wide truthy/falsy vocabulary (matches main._TRUTHY / _FALSY)
+# =============================================================================
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
+_FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Project-aligned env bool parser."""
+    try:
+        raw = (os.getenv(name, "") or "").strip().lower()
+    except Exception:
+        return bool(default)
+    if not raw:
+        return bool(default)
+    if raw in _TRUTHY:
+        return True
+    if raw in _FALSY:
+        return False
+    return bool(default)
+
+
+def _env_int(
+    name: str, default: int, *, lo: Optional[int] = None, hi: Optional[int] = None
+) -> int:
+    try:
+        raw = (os.getenv(name, "") or "").strip()
+        if not raw:
+            return default
+        v = int(float(raw))
+    except Exception:
+        return default
+    if lo is not None and v < lo:
+        v = lo
+    if hi is not None and v > hi:
+        v = hi
+    return v
+
+
+def _env_int_bool(name: str, default: int = 0) -> int:
+    """
+    Get env var as 0/1 int. Accepts truthy/falsy strings (true/false/yes/no/
+    on/off/1/0/t/f/enabled/disabled) so cron-style `HYGIENE_STRICT=true` and
+    legacy CLI-style `--strict 1` both resolve correctly.
+    """
+    raw = (os.getenv(name, "") or "").strip().lower()
+    if not raw:
+        return default
+    if raw in _TRUTHY:
+        return 1
+    if raw in _FALSY:
+        return 0
+    try:
+        return 1 if int(float(raw)) != 0 else 0
+    except Exception:
+        return default
+
+
+def _env_csv(name: str, default: Optional[List[str]] = None) -> Optional[List[str]]:
+    """Parse comma-separated env var into a list of stripped strings."""
+    raw = (os.getenv(name, "") or "").strip()
+    if not raw:
+        return default
+    items = [x.strip() for x in raw.split(",") if x.strip()]
+    return items or default
+
+
 # =============================================================================
 # Enums & Types
 # =============================================================================
-
-
 class Severity(str, Enum):
     CRITICAL = "CRITICAL"
     HIGH = "HIGH"
@@ -162,12 +271,12 @@ class FindingCategory(str, Enum):
 
 
 class OutputFormat(str, Enum):
+    # v5.1.0: HTML removed (never implemented). CSV + MARKDOWN now implemented.
     CONSOLE = "console"
     JSON = "json"
     JUNIT = "junit"
     SARIF = "sarif"
     CSV = "csv"
-    HTML = "html"
     MARKDOWN = "markdown"
 
 
@@ -184,8 +293,6 @@ class CIProvider(str, Enum):
 # =============================================================================
 # Data Models (Memory Optimized)
 # =============================================================================
-
-
 @dataclass(slots=True)
 class Finding:
     """Represents a single hygiene finding."""
@@ -207,7 +314,9 @@ class Finding:
     references: List[str] = field(default_factory=list)
     confidence: float = 1.0
     impact_score: float = 1.0
-    detected_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    detected_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -302,18 +411,28 @@ class ScanSummary:
     total_files: int = 0
     files_with_issues: int = 0
     total_findings: int = 0
-    by_severity: Dict[Severity, int] = field(default_factory=lambda: {s: 0 for s in Severity})
+    by_severity: Dict[Severity, int] = field(
+        default_factory=lambda: {s: 0 for s in Severity}
+    )
     by_category: Dict[FindingCategory, int] = field(default_factory=dict)
     by_file: Dict[str, int] = field(default_factory=dict)
     scan_duration_ms: float = 0.0
-    scan_start: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
-    scan_end: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    scan_start: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
+    scan_end: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat()
+    )
     version: str = SCRIPT_VERSION
 
     def add_finding(self, finding: Finding) -> None:
         self.total_findings += 1
-        self.by_severity[finding.severity] = self.by_severity.get(finding.severity, 0) + 1
-        self.by_category[finding.category] = self.by_category.get(finding.category, 0) + 1
+        self.by_severity[finding.severity] = (
+            self.by_severity.get(finding.severity, 0) + 1
+        )
+        self.by_category[finding.category] = (
+            self.by_category.get(finding.category, 0) + 1
+        )
         self.by_file[finding.file_path] = self.by_file.get(finding.file_path, 0) + 1
 
     def to_dict(self) -> Dict[str, Any]:
@@ -324,7 +443,9 @@ class ScanSummary:
             "total_findings": self.total_findings,
             "by_severity": {k.value: v for k, v in self.by_severity.items()},
             "by_category": {k.value: v for k, v in self.by_category.items()},
-            "by_file": dict(sorted(self.by_file.items(), key=lambda x: x[1], reverse=True)[:20]),
+            "by_file": dict(
+                sorted(self.by_file.items(), key=lambda x: x[1], reverse=True)[:20]
+            ),
             "scan_duration_ms": self.scan_duration_ms,
             "scan_start": self.scan_start,
             "scan_end": self.scan_end,
@@ -334,8 +455,6 @@ class ScanSummary:
 # =============================================================================
 # CI/CD Integration
 # =============================================================================
-
-
 class CIDetector:
     @staticmethod
     def detect() -> CIProvider:
@@ -381,15 +500,14 @@ class CIDetector:
 # =============================================================================
 # Secret Detection
 # =============================================================================
-
-
 class SecretDetector:
     """
     Heuristic secret detector with false-positive suppression.
 
     Key strategy:
     - Focus on quoted hardcoded values for password/token/key assignments.
-    - Allow explicit high-confidence formats (JWT, AWS access keys, private keys, DB URLs with creds).
+    - Allow explicit high-confidence formats (JWT, AWS access keys, private
+      keys, DB URLs with creds).
     - Skip common config/schema/env patterns that are not actual secrets.
     """
 
@@ -508,8 +626,9 @@ class SecretDetector:
         if any(s.lower() in lower for s in cls.SKIP_LINE_SUBSTRINGS):
             return True
 
-        # Type hints / schema defaults / validators often include words like password/token
-        if " = None" in line or " = \"\"" in line or " = ''" in line:
+        # Type hints / schema defaults / validators often include words like
+        # password/token
+        if " = None" in line or ' = ""' in line or " = ''" in line:
             return True
         if "default=" in lower:
             return True
@@ -528,7 +647,7 @@ class SecretDetector:
         *,
         file_path: str,
         line_no: int,
-        match: re.Match[str],
+        match: re.Match,
         secret_type: str,
         confidence: float = 0.8,
     ) -> None:
@@ -546,8 +665,13 @@ class SecretDetector:
                 token=(token[:80] + "...") if len(token) > 80 else token,
                 rule_id="SECRET-001",
                 rule_name=secret_type,
-                remediation="Remove secrets from code, use environment variables or secret management services",
-                references=["https://docs.github.com/en/code-security/secret-scanning"],
+                remediation=(
+                    "Remove secrets from code, use environment variables or "
+                    "secret management services"
+                ),
+                references=[
+                    "https://docs.github.com/en/code-security/secret-scanning"
+                ],
                 confidence=confidence,
             )
         )
@@ -559,12 +683,18 @@ class SecretDetector:
 
         for i, line in enumerate(lines, 1):
             # 1) High-confidence signatures (still filter self-detector regex examples)
-            if not ("re.compile(" in line and file_path.replace("\\", "/").endswith("repo_hygiene_check.py")):
+            if not (
+                "re.compile(" in line
+                and file_path.replace("\\", "/").endswith("repo_hygiene_check.py")
+            ):
                 for regex, secret_type in cls.PATTERNS:
                     for match in regex.finditer(line):
-                        # Avoid obvious placeholders in DB URLs (rare but possible)
+                        # Avoid obvious placeholders in DB URLs
                         if secret_type == "Database URL with credentials":
-                            if any(x in line.lower() for x in ("example", "placeholder", "changeme")):
+                            if any(
+                                x in line.lower()
+                                for x in ("example", "placeholder", "changeme")
+                            ):
                                 continue
                         cls._emit_finding(
                             findings,
@@ -572,7 +702,9 @@ class SecretDetector:
                             line_no=i,
                             match=match,
                             secret_type=secret_type,
-                            confidence=0.95 if secret_type in {"Private Key", "JWT Token"} else 0.9,
+                            confidence=(
+                                0.95 if secret_type in {"Private Key", "JWT Token"} else 0.9
+                            ),
                         )
 
             # 2) Assignment-style patterns with context suppression
@@ -584,7 +716,14 @@ class SecretDetector:
                 value = match.group(3)
                 if cls._looks_like_placeholder(value):
                     continue
-                cls._emit_finding(findings, file_path=file_path, line_no=i, match=match, secret_type="API Key", confidence=0.85)
+                cls._emit_finding(
+                    findings,
+                    file_path=file_path,
+                    line_no=i,
+                    match=match,
+                    secret_type="API Key",
+                    confidence=0.85,
+                )
 
             # Passwords (quoted only)
             for match in cls.PASSWORD_ASSIGN_RE.finditer(line):
@@ -594,7 +733,14 @@ class SecretDetector:
                 # skip policy-like values / labels
                 if re.fullmatch(r"[A-Z_]{4,}", value):
                     continue
-                cls._emit_finding(findings, file_path=file_path, line_no=i, match=match, secret_type="Password", confidence=0.82)
+                cls._emit_finding(
+                    findings,
+                    file_path=file_path,
+                    line_no=i,
+                    match=match,
+                    secret_type="Password",
+                    confidence=0.82,
+                )
 
             # OAuth / tokens (quoted only)
             for match in cls.TOKEN_ASSIGN_RE.finditer(line):
@@ -604,14 +750,28 @@ class SecretDetector:
                 # skip enum-ish strings
                 if re.fullmatch(r"[A-Z_]{8,}", value):
                     continue
-                cls._emit_finding(findings, file_path=file_path, line_no=i, match=match, secret_type="OAuth Token", confidence=0.84)
+                cls._emit_finding(
+                    findings,
+                    file_path=file_path,
+                    line_no=i,
+                    match=match,
+                    secret_type="OAuth Token",
+                    confidence=0.84,
+                )
 
             # AWS secret assignment
             for match in cls.AWS_SECRET_ASSIGN_RE.finditer(line):
                 value = match.group(4)
                 if cls._looks_like_placeholder(value):
                     continue
-                cls._emit_finding(findings, file_path=file_path, line_no=i, match=match, secret_type="AWS Secret", confidence=0.9)
+                cls._emit_finding(
+                    findings,
+                    file_path=file_path,
+                    line_no=i,
+                    match=match,
+                    secret_type="AWS Secret",
+                    confidence=0.9,
+                )
 
         return findings
 
@@ -619,13 +779,20 @@ class SecretDetector:
 # =============================================================================
 # ML Anomaly Detection
 # =============================================================================
-
-
 class MLAnomalyDetector:
     def __init__(self) -> None:
-        self.vectorizer = TfidfVectorizer(max_features=1000, stop_words="english", ngram_range=(1, 3))
-        self.model = IsolationForest(contamination=0.05, random_state=42, n_estimators=150)
-        self.scaler = StandardScaler()
+        if not _ML_AVAILABLE:
+            self.vectorizer = None  # type: ignore[assignment]
+            self.model = None  # type: ignore[assignment]
+            self.scaler = None  # type: ignore[assignment]
+        else:
+            self.vectorizer = TfidfVectorizer(
+                max_features=1000, stop_words="english", ngram_range=(1, 3)
+            )
+            self.model = IsolationForest(
+                contamination=0.05, random_state=42, n_estimators=150
+            )
+            self.scaler = StandardScaler()
         self.is_fitted = False
         self.training_data: List[str] = []
 
@@ -663,27 +830,14 @@ class MLAnomalyDetector:
 # =============================================================================
 # Token Builders
 # =============================================================================
-
-
 class TokenBuilder:
     @staticmethod
     def markdown_fences() -> List[str]:
         bt, td = "```", "~~~"
         fences = [bt, td]
         for lang in [
-            "python",
-            "py",
-            "bash",
-            "sh",
-            "javascript",
-            "js",
-            "typescript",
-            "ts",
-            "json",
-            "yaml",
-            "xml",
-            "html",
-            "css",
+            "python", "py", "bash", "sh", "javascript", "js", "typescript", "ts",
+            "json", "yaml", "xml", "html", "css",
         ]:
             fences.extend([f"{bt}{lang}", f"{td}{lang}"])
         return fences
@@ -722,8 +876,8 @@ class TokenBuilder:
     @staticmethod
     def suspicious_patterns() -> List[Tuple[str, str, Severity]]:
         """
-        V5.0.0 FIX: Safely anchor git merge conflict markers using ^ and $
-        along with re.MULTILINE to prevent flagging decorative headers.
+        Git merge conflict markers are safely anchored with ^ and $ along with
+        re.MULTILINE to prevent flagging decorative headers.
         """
         return [
             (r"^<{7} .*$", "Git merge conflict marker (HEAD)", Severity.HIGH),
@@ -744,8 +898,6 @@ class TokenBuilder:
 # =============================================================================
 # File Scanner
 # =============================================================================
-
-
 class FileScanner:
     def __init__(
         self,
@@ -759,46 +911,28 @@ class FileScanner:
     ):
         self.root = root.resolve()
         self.skip_dirs = {d.lower() for d in skip_dirs}
-        self.extensions = {e.lower() if e.startswith(".") else f".{e.lower()}" for e in extensions}
+        self.extensions = {
+            e.lower() if e.startswith(".") else f".{e.lower()}" for e in extensions
+        }
         self.scan_all_text = scan_all_text
         self.exclude_patterns = [re.compile(p) for p in (exclude_patterns or [])]
         self.include_patterns = [re.compile(p) for p in (include_patterns or [])]
         self.max_file_size = max_file_size_mb * 1024 * 1024
         self.binary_extensions = {
-            ".png",
-            ".jpg",
-            ".jpeg",
-            ".gif",
-            ".webp",
-            ".bmp",
-            ".ico",
-            ".pdf",
-            ".zip",
-            ".tar",
-            ".gz",
-            ".7z",
-            ".rar",
-            ".exe",
-            ".dll",
-            ".so",
-            ".dylib",
-            ".bin",
-            ".pyc",
-            ".pyo",
-            ".pyd",
-            ".class",
-            ".jar",
-            ".mp3",
-            ".mp4",
-            ".avi",
-            ".mov",
+            ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico",
+            ".pdf", ".zip", ".tar", ".gz", ".7z", ".rar",
+            ".exe", ".dll", ".so", ".dylib", ".bin",
+            ".pyc", ".pyo", ".pyd", ".class", ".jar",
+            ".mp3", ".mp4", ".avi", ".mov",
         }
 
     def should_skip(self, path: Path) -> bool:
         for part in path.parts:
             if part.lower() in self.skip_dirs:
                 return True
-            if part.startswith(".") and part not in {".github", ".gitignore", ".gitattributes"}:
+            if part.startswith(".") and part not in {
+                ".github", ".gitignore", ".gitattributes"
+            }:
                 return True
         try:
             if path.stat().st_size > self.max_file_size:
@@ -847,8 +981,6 @@ class FileScanner:
 # =============================================================================
 # Core Scanner
 # =============================================================================
-
-
 class HygieneScanner:
     SELF_SCRIPT_REL = "scripts/repo_hygiene_check.py"
 
@@ -885,7 +1017,10 @@ class HygieneScanner:
             return False
 
         # Intentional token examples / pattern examples in TokenBuilder and docs
-        if finding.category in {FindingCategory.MARKDOWN_FENCE, FindingCategory.LLM_ARTIFACT}:
+        if finding.category in {
+            FindingCategory.MARKDOWN_FENCE,
+            FindingCategory.LLM_ARTIFACT,
+        }:
             return True
 
         # Pattern catalog examples in this script can trigger code-quality strings
@@ -936,7 +1071,9 @@ class HygieneScanner:
             else:
                 for i, line in enumerate(content_lines, 1):
                     for match in pattern.finditer(line):
-                        f = self._match_to_finding_line(match, rule, rel_path, content_lines, i, line)
+                        f = self._match_to_finding_line(
+                            match, rule, rel_path, content_lines, i, line
+                        )
                         if not self._suppress_self_false_positive(f):
                             findings.append(f)
 
@@ -966,14 +1103,16 @@ class HygieneScanner:
 
     def _match_to_finding(
         self,
-        match: re.Match[str],
+        match: re.Match,
         rule: Rule,
         file_path: str,
         content: str,
     ) -> Finding:
         line_num = content.count("\n", 0, match.start()) + 1
         last_newline = content.rfind("\n", 0, match.start())
-        col_num = (match.start() - last_newline) if last_newline != -1 else (match.start() + 1)
+        col_num = (
+            (match.start() - last_newline) if last_newline != -1 else (match.start() + 1)
+        )
 
         lines = content.splitlines()
         start_line = max(0, line_num - 3)
@@ -989,7 +1128,9 @@ class HygieneScanner:
             line_end=line_num,
             column_end=col_num + len(match.group(0)),
             token=match.group(0)[:100],
-            snippet=content[max(0, match.start() - 40):min(len(content), match.end() + 40)].replace("\n", "\\n"),
+            snippet=content[
+                max(0, match.start() - 40) : min(len(content), match.end() + 40)
+            ].replace("\n", "\\n"),
             context_lines=lines[start_line:end_line],
             rule_id=rule.name,
             rule_name=rule.name,
@@ -998,7 +1139,7 @@ class HygieneScanner:
 
     def _match_to_finding_line(
         self,
-        match: re.Match[str],
+        match: re.Match,
         rule: Rule,
         file_path: str,
         all_lines: List[str],
@@ -1028,39 +1169,64 @@ class HygieneScanner:
             remediation=rule.remediation,
         )
 
-    async def scan_parallel(self, files: List[Path], progress_callback: Optional[Callable[[], None]] = None) -> List[Finding]:
+    async def scan_parallel(
+        self,
+        files: List[Path],
+        progress_callback: Optional[Callable[[], None]] = None,
+    ) -> List[Finding]:
+        """
+        v5.1.0 FIX: Single ThreadPoolExecutor for the whole scan instead of
+        one per 100-file chunk. Uses asyncio.Semaphore to bound in-flight
+        work so memory stays controlled even with large repos.
+        """
         all_findings: List[Finding] = []
         loop = asyncio.get_running_loop()
+        max_in_flight = max(self.parallel_workers * 4, 100)
+        sem = asyncio.Semaphore(max_in_flight)
 
-        # Chunking tasks to prevent massive RAM spikes
-        chunk_size = 100
-        for i in range(0, len(files), chunk_size):
-            chunk = files[i : i + chunk_size]
-            with ThreadPoolExecutor(max_workers=self.parallel_workers) as executor:
-                tasks = [loop.run_in_executor(executor, self.scan_file, f) for f in chunk]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
+        # ONE executor for the entire scan
+        executor = ThreadPoolExecutor(
+            max_workers=self.parallel_workers,
+            thread_name_prefix="HygieneWorker",
+        )
 
-                for idx, result in enumerate(results):
+        async def _scan_one(f: Path) -> List[Finding]:
+            async with sem:
+                try:
+                    return await loop.run_in_executor(executor, self.scan_file, f)
+                except Exception as e:
+                    logger.error("Scan error for %s: %s", f, e)
+                    return []
+                finally:
                     if progress_callback:
-                        progress_callback()
-                    if isinstance(result, Exception):
-                        logger.error("Scan error for %s: %s", chunk[idx], result)
-                    elif isinstance(result, list):
-                        all_findings.extend(result)
+                        try:
+                            progress_callback()
+                        except Exception:
+                            pass
+
+        try:
+            tasks = [_scan_one(f) for f in files]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, list):
+                    all_findings.extend(result)
+        finally:
+            executor.shutdown(wait=False)
+
         return all_findings
 
 
 # =============================================================================
 # Output Formatters
 # =============================================================================
-
-
 class OutputFormatter:
     @staticmethod
     def rich_console(summary: ScanSummary, findings: List[Finding]) -> None:
         if not console:
             return
-        console.print(f"\n[bold blue]TADAWUL REPOSITORY HYGIENE SCAN v{SCRIPT_VERSION}[/bold blue]")
+        console.print(
+            f"\n[bold blue]TADAWUL REPOSITORY HYGIENE SCAN v{SCRIPT_VERSION}[/bold blue]"
+        )
         console.print("=" * 80)
 
         table = Table(title="Scan Summary")
@@ -1088,15 +1254,26 @@ class OutputFormatter:
                         "LOW": "green",
                         "INFO": "blue",
                     }.get(f.severity.value, "white")
-                    console.print(f"   [{color}][{f.severity.value}][/{color}] Line {f.line}: {f.message}")
+                    console.print(
+                        f"   [{color}][{f.severity.value}][/{color}] "
+                        f"Line {f.line}: {f.message}"
+                    )
                     if f.token:
                         console.print(f"       Token: [dim]{f.token}[/dim]")
                     if f.remediation:
-                        console.print(f"       💡 Fix: [italic green]{f.remediation}[/italic green]")
+                        console.print(
+                            f"       💡 Fix: [italic green]{f.remediation}[/italic green]"
+                        )
 
     @staticmethod
     def json(summary: ScanSummary, findings: List[Finding]) -> str:
-        return json_dumps({"summary": summary.to_dict(), "findings": [f.to_dict() for f in findings]}, indent=2)
+        return json_dumps(
+            {
+                "summary": summary.to_dict(),
+                "findings": [f.to_dict() for f in findings],
+            },
+            indent=2,
+        )
 
     @staticmethod
     def junit(summary: ScanSummary, findings: List[Finding]) -> str:
@@ -1104,15 +1281,28 @@ class OutputFormatter:
             return "JUnit XML output requires junit_xml package"
         test_cases: List[Any] = []
         for f in findings:
-            tc = TestCase(name=f"{f.file_path}:{f.line}", classname=f.category.value, file=f.file_path, line=f.line)
+            tc = TestCase(
+                name=f"{f.file_path}:{f.line}",
+                classname=f.category.value,
+                file=f.file_path,
+                line=f.line,
+            )
             if f.severity in (Severity.CRITICAL, Severity.HIGH):
-                tc.add_failure_info(message=f.message, output=f.token or "", failure_type=f.severity.value)
+                tc.add_failure_info(
+                    message=f.message, output=f.token or "",
+                    failure_type=f.severity.value,
+                )
             elif f.severity == Severity.MEDIUM:
-                tc.add_error_info(message=f.message, output=f.token or "", error_type=f.severity.value)
+                tc.add_error_info(
+                    message=f.message, output=f.token or "",
+                    error_type=f.severity.value,
+                )
             else:
                 tc.add_skipped_info(f.message)
             test_cases.append(tc)
-        return TestSuite.to_xml_string([TestSuite("Repository Hygiene Scan", test_cases)])
+        return TestSuite.to_xml_string(
+            [TestSuite("Repository Hygiene Scan", test_cases)]
+        )
 
     @staticmethod
     def sarif(summary: ScanSummary, findings: List[Finding]) -> str:
@@ -1121,7 +1311,13 @@ class OutputFormatter:
             "version": "2.1.0",
             "runs": [
                 {
-                    "tool": {"driver": {"name": "Tadawul Repo Hygiene", "version": SCRIPT_VERSION, "rules": []}},
+                    "tool": {
+                        "driver": {
+                            "name": "Tadawul Repo Hygiene",
+                            "version": SCRIPT_VERSION,
+                            "rules": [],
+                        }
+                    },
                     "results": [],
                     "properties": {"summary": summary.to_dict()},
                 }
@@ -1145,12 +1341,91 @@ class OutputFormatter:
 
         return json_dumps(sarif, indent=2)
 
+    @staticmethod
+    def csv(summary: ScanSummary, findings: List[Finding]) -> str:
+        """v5.1.0 NEW: CSV output. RFC 4180-style quoting."""
+        import csv as _csv
+        import io as _io
+
+        buf = _io.StringIO()
+        writer = _csv.writer(buf, quoting=_csv.QUOTE_MINIMAL)
+        writer.writerow([
+            "category", "severity", "file_path", "line", "column",
+            "line_end", "column_end", "message", "rule_id", "rule_name",
+            "token", "remediation", "confidence", "detected_at",
+        ])
+        for f in findings:
+            writer.writerow([
+                f.category.value, f.severity.value, f.file_path,
+                f.line, f.column, f.line_end, f.column_end,
+                f.message, f.rule_id or "", f.rule_name or "",
+                f.token or "", f.remediation or "",
+                f"{f.confidence:.3f}", f.detected_at,
+            ])
+        return buf.getvalue()
+
+    @staticmethod
+    def markdown(summary: ScanSummary, findings: List[Finding]) -> str:
+        """v5.1.0 NEW: Markdown report output."""
+        lines: List[str] = []
+        lines.append(f"# Repository Hygiene Report v{SCRIPT_VERSION}")
+        lines.append("")
+        lines.append(f"- **Files Scanned:** {summary.total_files}")
+        lines.append(f"- **Files with Issues:** {summary.files_with_issues}")
+        lines.append(f"- **Total Findings:** {summary.total_findings}")
+        lines.append(f"- **Duration:** {summary.scan_duration_ms:.2f}ms")
+        lines.append(f"- **Scan Started:** {summary.scan_start}")
+        lines.append(f"- **Scan Ended:** {summary.scan_end}")
+        lines.append("")
+
+        # Severity breakdown
+        lines.append("## Severity Breakdown")
+        lines.append("")
+        lines.append("| Severity | Count |")
+        lines.append("|----------|-------|")
+        for sev in (
+            Severity.CRITICAL, Severity.HIGH, Severity.MEDIUM,
+            Severity.LOW, Severity.INFO,
+        ):
+            count = summary.by_severity.get(sev, 0)
+            lines.append(f"| {sev.value} | {count} |")
+        lines.append("")
+
+        if not findings:
+            lines.append("## Findings")
+            lines.append("")
+            lines.append("_No findings._")
+            return "\n".join(lines) + "\n"
+
+        # Findings grouped by file
+        lines.append("## Findings")
+        lines.append("")
+        by_file: Dict[str, List[Finding]] = defaultdict(list)
+        for f in findings:
+            by_file[f.file_path].append(f)
+
+        for fp in sorted(by_file.keys()):
+            lines.append(f"### `{fp}`")
+            lines.append("")
+            lines.append("| Line | Severity | Category | Message | Rule |")
+            lines.append("|------|----------|----------|---------|------|")
+            for f in sorted(
+                by_file[fp], key=lambda x: (x.line, x.column, x.severity.value)
+            ):
+                # Escape pipe chars in message/rule to avoid breaking tables
+                msg = f.message.replace("|", "\\|")
+                rule = (f.rule_id or f.rule_name or "").replace("|", "\\|")
+                lines.append(
+                    f"| {f.line} | {f.severity.value} | {f.category.value} "
+                    f"| {msg} | `{rule}` |"
+                )
+            lines.append("")
+        return "\n".join(lines) + "\n"
+
 
 # =============================================================================
 # Main
 # =============================================================================
-
-
 def _stable_short_hash(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()[:8].upper()
 
@@ -1198,177 +1473,273 @@ def create_default_rules(strict: bool = False) -> List[Rule]:
                 remediation="Resolve or remove suspicious code",
                 multiline=True,
                 # Intentionally defined examples exist in this file.
-                exclude_pattern=self_script_exclude if any(
-                    x in message for x in ["TODO", "FIXME", "Debug", "Debugger"]
-                ) else None,
+                exclude_pattern=(
+                    self_script_exclude
+                    if any(x in message for x in ["TODO", "FIXME", "Debug", "Debugger"])
+                    else None
+                ),
             )
         )
 
     return rules
 
 
+def _write_output_by_extension(
+    summary: ScanSummary,
+    findings: List[Finding],
+    output_file: str,
+) -> None:
+    """v5.1.0: dispatch on file extension, now covers .csv and .md too."""
+    lower = output_file.lower()
+    if lower.endswith(".json"):
+        payload = OutputFormatter.json(summary, findings)
+    elif lower.endswith(".xml"):
+        payload = OutputFormatter.junit(summary, findings)
+    elif lower.endswith(".sarif"):
+        payload = OutputFormatter.sarif(summary, findings)
+    elif lower.endswith(".csv"):
+        payload = OutputFormatter.csv(summary, findings)
+    elif lower.endswith(".md") or lower.endswith(".markdown"):
+        payload = OutputFormatter.markdown(summary, findings)
+    else:
+        # default to JSON for unknown extensions
+        payload = OutputFormatter.json(summary, findings)
+
+    with open(output_file, "w", encoding="utf-8") as f:
+        f.write(payload)
+
+
 async def main_async(args: argparse.Namespace) -> int:
     start_time = time.time()
-    root = Path(args.root).resolve()
+    exit_code = 0
 
-    skip_dirs = set(args.exclude or [])
-    skip_dirs.update(
-        {
-            "venv",
-            ".venv",
-            "env",
-            ".env",
-            "__pycache__",
-            ".git",
-            ".hg",
-            ".svn",
-            ".idea",
-            ".vscode",
-            ".pytest_cache",
-            ".mypy_cache",
-            ".ruff_cache",
-            "node_modules",
-            "dist",
-            "build",
-            ".eggs",
-            ".tox",
-            "htmlcov",
-        }
-    )
+    try:
+        root = Path(args.root).resolve()
 
-    rules = create_default_rules(bool(args.strict))
-    scanner = HygieneScanner(
-        root=root,
-        rules=rules,
-        enable_ml=bool(args.enable_ml),
-        enable_secret_detection=not args.disable_secrets,
-        parallel_workers=args.workers or os.cpu_count() or 4,
-        self_suppressions=True,
-    )
-    file_scanner = FileScanner(
-        root=root,
-        skip_dirs=skip_dirs,
-        extensions=args.extensions if args.extensions else [".py"],
-        scan_all_text=bool(args.scan_all_text),
-        exclude_patterns=args.exclude_patterns,
-        include_patterns=args.include_patterns,
-        max_file_size_mb=args.max_file_size or 10,
-    )
+        skip_dirs = set(args.exclude or [])
+        skip_dirs.update(
+            {
+                "venv", ".venv", "env", ".env", "__pycache__", ".git", ".hg",
+                ".svn", ".idea", ".vscode", ".pytest_cache", ".mypy_cache",
+                ".ruff_cache", "node_modules", "dist", "build", ".eggs",
+                ".tox", "htmlcov",
+            }
+        )
 
-    files = file_scanner.get_files()
+        rules = create_default_rules(bool(args.strict))
+        scanner = HygieneScanner(
+            root=root,
+            rules=rules,
+            enable_ml=bool(args.enable_ml),
+            enable_secret_detection=not args.disable_secrets,
+            parallel_workers=args.workers or os.cpu_count() or 4,
+            self_suppressions=True,
+        )
+        file_scanner = FileScanner(
+            root=root,
+            skip_dirs=skip_dirs,
+            extensions=args.extensions if args.extensions else [".py"],
+            scan_all_text=bool(args.scan_all_text),
+            exclude_patterns=args.exclude_patterns,
+            include_patterns=args.include_patterns,
+            max_file_size_mb=args.max_file_size or 10,
+        )
 
-    if args.enable_ml and scanner.ml_detector:
-        if console:
-            console.print("[yellow]Training ML Anomaly Detector...[/yellow]")
-        for f in files[:100]:
-            try:
-                scanner.ml_detector.add_training_data(f.read_text(encoding="utf-8", errors="replace"))
-            except Exception:
-                pass
-        scanner.ml_detector.fit()
+        files = file_scanner.get_files()
 
-    if console:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            TimeElapsedColumn(),
-            console=console,
-        ) as progress:
-            task_id = progress.add_task("[cyan]Scanning files...", total=len(files))
+        if args.enable_ml and scanner.ml_detector:
+            if console:
+                console.print("[yellow]Training ML Anomaly Detector...[/yellow]")
+            for f in files[:100]:
+                try:
+                    scanner.ml_detector.add_training_data(
+                        f.read_text(encoding="utf-8", errors="replace")
+                    )
+                except Exception:
+                    pass
+            scanner.ml_detector.fit()
 
-            def update_progress() -> None:
-                progress.advance(task_id)
+        if console and Progress is not None:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TimeElapsedColumn(),
+                console=console,
+            ) as progress:
+                task_id = progress.add_task("[cyan]Scanning files...", total=len(files))
 
-            findings = await scanner.scan_parallel(files, update_progress)
-    else:
-        logger.info("Scanning %s files with %s workers...", len(files), scanner.parallel_workers)
-        findings = await scanner.scan_parallel(files)
+                def update_progress() -> None:
+                    progress.advance(task_id)
 
-    if args.max_offenders > 0 and len(findings) > args.max_offenders:
-        findings = findings[: args.max_offenders]
-
-    summary = ScanSummary(
-        total_files=len(files),
-        files_with_issues=len(set(f.file_path for f in findings)),
-        scan_duration_ms=(time.time() - start_time) * 1000,
-        scan_end=datetime.now(timezone.utc).isoformat(),
-    )
-    for f in findings:
-        summary.add_finding(f)
-
-    output_format = OutputFormat(args.format) if args.format else OutputFormat.CONSOLE
-
-    if output_format == OutputFormat.CONSOLE:
-        if console:
-            OutputFormatter.rich_console(summary, findings)
+                findings = await scanner.scan_parallel(files, update_progress)
         else:
-            print(OutputFormatter.json(summary, findings))  # Fallback if rich is missing
-    elif output_format == OutputFormat.JSON:
-        print(OutputFormatter.json(summary, findings))
-    elif output_format == OutputFormat.JUNIT:
-        print(OutputFormatter.junit(summary, findings))
-    elif output_format == OutputFormat.SARIF:
-        print(OutputFormatter.sarif(summary, findings))
+            logger.info(
+                "Scanning %s files with %s workers...",
+                len(files), scanner.parallel_workers,
+            )
+            findings = await scanner.scan_parallel(files)
 
-    if args.output_file:
-        with open(args.output_file, "w", encoding="utf-8") as f:
-            if args.output_file.endswith(".json"):
-                f.write(OutputFormatter.json(summary, findings))
-            elif args.output_file.endswith(".xml"):
-                f.write(OutputFormatter.junit(summary, findings))
-            elif args.output_file.endswith(".sarif"):
-                f.write(OutputFormatter.sarif(summary, findings))
-            else:
-                f.write(OutputFormatter.json(summary, findings))
+        if args.max_offenders > 0 and len(findings) > args.max_offenders:
+            findings = findings[: args.max_offenders]
 
-    if args.annotate:
+        summary = ScanSummary(
+            total_files=len(files),
+            files_with_issues=len(set(f.file_path for f in findings)),
+            scan_duration_ms=(time.time() - start_time) * 1000,
+            scan_end=datetime.now(timezone.utc).isoformat(),
+        )
         for f in findings:
-            if f.severity in (Severity.CRITICAL, Severity.HIGH):
-                CIDetector.annotate_error(f.file_path, f.line, f.column, f.message)
-            elif f.severity == Severity.MEDIUM:
-                CIDetector.annotate_warning(f.file_path, f.line, f.column, f.message)
+            summary.add_finding(f)
 
-    critical_count = summary.by_severity.get(Severity.CRITICAL, 0)
-    high_count = summary.by_severity.get(Severity.HIGH, 0)
+        output_format = OutputFormat(args.format) if args.format else OutputFormat.CONSOLE
 
-    if args.fail_threshold == "critical" and critical_count > 0:
-        return 2
-    if args.fail_threshold == "high" and (critical_count + high_count) > 0:
-        return 2
-    if args.fail_threshold == "any" and summary.total_findings > 0:
-        return 2
-    return 0
+        if output_format == OutputFormat.CONSOLE:
+            if console:
+                OutputFormatter.rich_console(summary, findings)
+            else:
+                print(OutputFormatter.json(summary, findings))
+        elif output_format == OutputFormat.JSON:
+            print(OutputFormatter.json(summary, findings))
+        elif output_format == OutputFormat.JUNIT:
+            print(OutputFormatter.junit(summary, findings))
+        elif output_format == OutputFormat.SARIF:
+            print(OutputFormatter.sarif(summary, findings))
+        elif output_format == OutputFormat.CSV:
+            # v5.1.0 NEW: CSV formatter
+            print(OutputFormatter.csv(summary, findings))
+        elif output_format == OutputFormat.MARKDOWN:
+            # v5.1.0 NEW: Markdown formatter
+            print(OutputFormatter.markdown(summary, findings))
+
+        if args.output_file:
+            _write_output_by_extension(summary, findings, args.output_file)
+
+        if args.annotate:
+            for f in findings:
+                if f.severity in (Severity.CRITICAL, Severity.HIGH):
+                    CIDetector.annotate_error(f.file_path, f.line, f.column, f.message)
+                elif f.severity == Severity.MEDIUM:
+                    CIDetector.annotate_warning(f.file_path, f.line, f.column, f.message)
+
+        critical_count = summary.by_severity.get(Severity.CRITICAL, 0)
+        high_count = summary.by_severity.get(Severity.HIGH, 0)
+
+        if args.fail_threshold == "critical" and critical_count > 0:
+            exit_code = 2
+        elif args.fail_threshold == "high" and (critical_count + high_count) > 0:
+            exit_code = 2
+        elif args.fail_threshold == "any" and summary.total_findings > 0:
+            exit_code = 2
+        else:
+            exit_code = 0
+
+    except Exception as e:
+        logger.exception("Scan failed: %s", e)
+        exit_code = 1
+
+    return exit_code
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=f"Repository Hygiene Checker v{SCRIPT_VERSION}")
-    parser.add_argument("--root", default=".", help="Repository root to scan")
-    parser.add_argument("--strict", type=int, default=0, help="Enable strict heuristics")
-    parser.add_argument("--max-offenders", type=int, default=0, help="Stop after N offenders")
-    parser.add_argument("--fail-on-read-error", action="store_true", help="Fail on read errors")
-    parser.add_argument("--exclude", nargs="+", help="Additional directories to exclude")
-    parser.add_argument("--extensions", nargs="+", help="File extensions to scan")
-    parser.add_argument("--scan-all-text", type=int, default=0, help="Scan all text files")
-    parser.add_argument("--exclude-patterns", nargs="+", help="Regex patterns to exclude")
-    parser.add_argument("--include-patterns", nargs="+", help="Regex patterns to include")
-    parser.add_argument("--max-file-size", type=int, default=2, help="Max file size in MB")
-    parser.add_argument("--enable-ml", type=int, default=0, help="Enable ML anomaly detection")
-    parser.add_argument("--disable-secrets", action="store_true", help="Disable secret detection")
-    parser.add_argument("--enable-git", type=int, default=0, help="Enable Git history analysis")
-    parser.add_argument("--parallel", type=int, default=1, help="Use parallel scanning")
-    parser.add_argument("--workers", type=int, help="Number of worker threads")
-    parser.add_argument("--rules-file", help="JSON/YAML file with custom rules")
-    parser.add_argument("--format", choices=[f.value for f in OutputFormat], help="Output format")
-    parser.add_argument("--output-file", help="Save output to file")
-    parser.add_argument("--show-snippets", type=int, default=1, help="Show context snippets")
-    parser.add_argument("--annotate", type=int, default=1, help="Annotate in CI environment")
+    parser = argparse.ArgumentParser(
+        description=f"Repository Hygiene Checker v{SCRIPT_VERSION}"
+    )
+    parser.add_argument(
+        "--root",
+        default=os.getenv("HYGIENE_ROOT", "."),
+        help="Repository root to scan (HYGIENE_ROOT env).",
+    )
+    parser.add_argument(
+        "--strict",
+        type=int,
+        default=_env_int_bool("HYGIENE_STRICT", 0),
+        help="Enable strict heuristics (HYGIENE_STRICT env).",
+    )
+    parser.add_argument(
+        "--max-offenders",
+        type=int,
+        default=_env_int("HYGIENE_MAX_OFFENDERS", 0, lo=0),
+        help="Stop after N offenders (HYGIENE_MAX_OFFENDERS env).",
+    )
+    parser.add_argument(
+        "--exclude",
+        nargs="+",
+        default=_env_csv("HYGIENE_EXCLUDE"),
+        help="Additional directories to exclude (HYGIENE_EXCLUDE env, comma-separated).",
+    )
+    parser.add_argument(
+        "--extensions",
+        nargs="+",
+        default=_env_csv("HYGIENE_EXTENSIONS"),
+        help="File extensions to scan (HYGIENE_EXTENSIONS env, comma-separated).",
+    )
+    parser.add_argument(
+        "--scan-all-text",
+        type=int,
+        default=_env_int_bool("HYGIENE_SCAN_ALL_TEXT", 0),
+        help="Scan all text files (HYGIENE_SCAN_ALL_TEXT env).",
+    )
+    parser.add_argument(
+        "--exclude-patterns",
+        nargs="+",
+        default=_env_csv("HYGIENE_EXCLUDE_PATTERNS"),
+        help="Regex patterns to exclude (HYGIENE_EXCLUDE_PATTERNS env).",
+    )
+    parser.add_argument(
+        "--include-patterns",
+        nargs="+",
+        default=_env_csv("HYGIENE_INCLUDE_PATTERNS"),
+        help="Regex patterns to include (HYGIENE_INCLUDE_PATTERNS env).",
+    )
+    parser.add_argument(
+        "--max-file-size",
+        type=int,
+        default=_env_int("HYGIENE_MAX_FILE_SIZE_MB", 2, lo=1),
+        help="Max file size in MB (HYGIENE_MAX_FILE_SIZE_MB env).",
+    )
+    parser.add_argument(
+        "--enable-ml",
+        type=int,
+        default=_env_int_bool("HYGIENE_ENABLE_ML", 0),
+        help="Enable ML anomaly detection (HYGIENE_ENABLE_ML env).",
+    )
+    parser.add_argument(
+        "--disable-secrets",
+        action="store_true",
+        default=_env_bool("HYGIENE_DISABLE_SECRETS", False),
+        help="Disable secret detection (HYGIENE_DISABLE_SECRETS env).",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=_env_int("HYGIENE_WORKERS", 0, lo=0) or None,
+        help="Number of worker threads (HYGIENE_WORKERS env, default CPU count).",
+    )
+    parser.add_argument(
+        "--format",
+        choices=[f.value for f in OutputFormat],
+        default=os.getenv("HYGIENE_FORMAT") or None,
+        help="Output format (HYGIENE_FORMAT env).",
+    )
+    parser.add_argument(
+        "--output-file",
+        default=os.getenv("HYGIENE_OUTPUT_FILE") or None,
+        help="Save output to file (HYGIENE_OUTPUT_FILE env). "
+             "Extension determines format (.json/.xml/.sarif/.csv/.md).",
+    )
+    parser.add_argument(
+        "--annotate",
+        type=int,
+        default=_env_int_bool("HYGIENE_ANNOTATE", 1),
+        help="Annotate in CI environment (HYGIENE_ANNOTATE env).",
+    )
     parser.add_argument(
         "--fail-threshold",
         choices=["critical", "high", "any"],
-        default="high",
-        help="Failure threshold",
+        default=os.getenv("HYGIENE_FAIL_THRESHOLD", "high"),
+        help="Failure threshold (HYGIENE_FAIL_THRESHOLD env).",
     )
 
     args = parser.parse_args()
@@ -1385,6 +1756,29 @@ def main() -> int:
         else:
             logger.exception("Scan failed: %s", e)
         return 1
+
+
+__all__ = [
+    "SCRIPT_VERSION",
+    "SERVICE_VERSION",
+    "Severity",
+    "FindingCategory",
+    "OutputFormat",
+    "CIProvider",
+    "Finding",
+    "Rule",
+    "ScanSummary",
+    "CIDetector",
+    "SecretDetector",
+    "MLAnomalyDetector",
+    "TokenBuilder",
+    "FileScanner",
+    "HygieneScanner",
+    "OutputFormatter",
+    "create_default_rules",
+    "main_async",
+    "main",
+]
 
 
 if __name__ == "__main__":
