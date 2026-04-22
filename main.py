@@ -2,26 +2,65 @@
 """
 main.py
 ================================================================================
-TADAWUL FAST BRIDGE — RENDER-SAFE FASTAPI ENTRYPOINT (v8.12.1)
+TADAWUL FAST BRIDGE -- RENDER-SAFE FASTAPI ENTRYPOINT (v8.12.2)
 ================================================================================
-FASTAPI-NATIVE ROUTER INCLUDE • PRESTART-FIRST ROUTE MOUNT • OPENAPI CACHE SAFE
-REQUEST-ID SAFE • ENGINE-STATE AWARE • CONTROLLED-ROUTE-OWNERSHIP SAFE
-STRICT-JSON SAFE • HEALTH / META ALIAS SAFE • DEBUG ROUTE SAFE
-INVESTMENT-ADVISOR CANONICAL OWNER PROTECTION • ADVANCED ROUTE PRIORITY SAFE
-CUSTOM OPENAPI / DOCS SAFE • JSON CONTRACT HARDENING
+FASTAPI-NATIVE ROUTER INCLUDE / PRESTART-FIRST ROUTE MOUNT / OPENAPI CACHE SAFE
+REQUEST-ID SAFE / ENGINE-STATE AWARE / CONTROLLED-ROUTE-OWNERSHIP SAFE
+STRICT-JSON SAFE / HEALTH / META ALIAS SAFE / DEBUG ROUTE SAFE
+INVESTMENT-ADVISOR CANONICAL OWNER PROTECTION / ADVANCED ROUTE PRIORITY SAFE
+CUSTOM OPENAPI / DOCS SAFE / JSON CONTRACT HARDENING
 
-Why this revision (v8.12.1)
----------------------------
-- KEEP: custom OpenAPI/docs routes so /openapi.json always returns parseable JSON.
-- KEEP: controlled route mounting with canonical owner protection.
-- IMPROVE: OpenAPI cache now also carries a generated timestamp and optional servers
-           entry when BACKEND_BASE_URL is configured.
-- IMPROVE: /openapi.json explicitly returns no-store cache headers to avoid stale
-           proxies during Render deployments and route changes.
-- IMPROVE: routes snapshot normalization is recalculated more defensively from live
-           app state so meta/debug diagnostics stay aligned with the real router set.
-- IMPROVE: startup warnings are deduplicated and protected from noisy repeats.
-- SAFE: preserves current public routing, auth, health/meta aliases, and render-safe startup.
+Why this revision (v8.12.2 vs v8.12.1)
+--------------------------------------
+- FIX MEDIUM: Middleware ordering. v8.12.1 added RequestIDMiddleware FIRST,
+    NoResponseGuard second, GZip third. Starlette applies middleware in LIFO
+    stack order, so the OUTERMOST wrapper is the last added. In v8.12.1 that
+    put GZip outermost and RequestID innermost, meaning NoResponseGuard's
+    logger call could not see `request.state.request_id` (RequestID hadn't
+    run yet on the request path) and had to fall back to reading the
+    X-Request-ID header directly. v8.12.2 reorders: GZip added first,
+    NoResponseGuard second, RequestID LAST (outermost). This ensures
+    request_id is set on `request.state` before any other middleware sees
+    the request, and the X-Request-ID header is guaranteed on every
+    response -- including errors caught by NoResponseGuard.
+
+- FIX MEDIUM: Exception handler now sets `X-Request-ID` HEADER on 500
+    responses. v8.12.1 included request_id in the JSON body but not as a
+    response header, breaking header-based log-correlation for clients
+    that rely on the standard tracing header. Same fix applied to
+    NoResponseGuardMiddleware's synthesized 500 responses.
+
+- FIX LOW: Fallback auth env-var list (used when `config.auth_ok` can't be
+    imported) expanded to include `TFB_BEARER_TOKEN`, `TFB_API_KEY`,
+    `X_API_KEY`, `API_KEY`, `BEARER_TOKEN`. This brings parity with
+    `config.py v7.3.0`'s `from_env()` token harvest, so a deployment that
+    works with `config.py` also works if `config.py` import fails at
+    startup.
+
+- FIX LOW: Strict mode now raises on "0 routes after filtering" for
+    non-optional modules. v8.12.1 silently recorded the condition under
+    `no_router` but didn't fail fast in strict mode, allowing a partially-
+    wired service to boot.
+
+- ADD: `SERVICE_VERSION = APP_ENTRY_VERSION` alias. Cross-module canonical
+    (worker.py v4.3.0, config.py v7.3.0, env.py v7.8.1, track_performance
+    v6.4.0, run_dashboard_sync v6.5.0). Callers probing `getattr(main,
+    "SERVICE_VERSION")` now get a consistent answer.
+
+- ADD: `SERVICE_VERSION` exported in `_runtime_meta()` output alongside
+    `entry_version`, so telemetry payloads show both names (backward
+    compat + new canonical).
+
+- CLEANUP: `Sequence` removed from the `typing` import -- dead since
+    v8.10.0. No behavioral change.
+
+- CLEANUP: `_append_startup_warning` now also truncates very long
+    warnings (>2000 chars) to keep `/meta` payload under sensible limits.
+
+- SAFE: All v8.12.1 behavior preserved: custom OpenAPI/docs, controlled
+    route mounting, canonical owner protection, `/openapi.json` no-store
+    cache headers, OpenAPI cache with timestamp + servers entry, routes
+    snapshot normalization, startup warnings dedup.
 """
 from __future__ import annotations
 
@@ -40,7 +79,7 @@ from dataclasses import asdict, dataclass, is_dataclass
 from datetime import date, datetime, time as dt_time, timezone
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Set, Tuple
 
 from fastapi import APIRouter, FastAPI, Request, Response
 from fastapi.encoders import jsonable_encoder
@@ -169,8 +208,16 @@ class _StrictJSONResponse(JSONResponse):
         ).encode("utf-8")
 
 
-APP_ENTRY_VERSION = "8.12.1"
+# =============================================================================
+# Version
+# =============================================================================
+APP_ENTRY_VERSION = "8.12.2"
+# v8.12.2: Cross-module canonical alias (matches worker.py v4.3.0,
+# config.py v7.3.0, env.py v7.8.1, track_performance v6.4.0, etc.)
+SERVICE_VERSION = APP_ENTRY_VERSION
 
+# v8.12.2: Project-canonical 8-value boolean vocabulary (matches
+# main.py v8.10.0 + config.py v7.3.0 + env.py v7.8.1).
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
 
@@ -378,10 +425,14 @@ def _secure_equals(left: str, right: str) -> bool:
 
 
 def _append_startup_warning(app: FastAPI, message: str) -> None:
+    """v8.12.2: Deduplicates + truncates overly long messages."""
     try:
+        msg = str(message or "")
+        if len(msg) > 2000:
+            msg = msg[:2000] + "...(truncated)"
         warnings = list(getattr(app.state, "startup_warnings", []) or [])
-        if message not in warnings:
-            warnings.append(message)
+        if msg not in warnings:
+            warnings.append(msg)
         app.state.startup_warnings = warnings
     except Exception:
         pass
@@ -411,7 +462,9 @@ class _JsonFormatter(logging.Formatter):
 
 def _setup_logging() -> logging.Logger:
     level = _env_str("LOG_LEVEL", "INFO").upper()
-    log_json = _env_bool("LOG_JSON", False) or (_env_str("LOG_FORMAT", "").lower() == "json")
+    log_json = _env_bool("LOG_JSON", False) or (
+        _env_str("LOG_FORMAT", "").lower() == "json"
+    )
 
     root = logging.getLogger()
     root.handlers.clear()
@@ -421,10 +474,17 @@ def _setup_logging() -> logging.Logger:
     if log_json:
         handler.setFormatter(_JsonFormatter())
     else:
-        handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"))
+        handler.setFormatter(
+            logging.Formatter(
+                "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+            )
+        )
     root.addHandler(handler)
 
-    for name in ("uvicorn", "uvicorn.error", "uvicorn.access", "gunicorn", "gunicorn.error"):
+    for name in (
+        "uvicorn", "uvicorn.error", "uvicorn.access",
+        "gunicorn", "gunicorn.error",
+    ):
         logging.getLogger(name).setLevel(getattr(logging, level, logging.INFO))
 
     logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -469,26 +529,85 @@ class _SettingsView:
 
 def _settings_from_generic_object(s: Any, source: str) -> _SettingsView:
     return _SettingsView(
-        APP_NAME=str(_pick_attr(s, "APP_NAME", "app_name", "service_name", default=_env_str("APP_NAME", "Tadawul Fast Bridge"))),
-        APP_VERSION=str(_pick_attr(s, "APP_VERSION", "app_version", default=_env_str("APP_VERSION", "dev"))),
-        APP_ENV=str(_pick_attr(s, "APP_ENV", "app_env", "environment", "env", default=_env_str("APP_ENV", "production"))),
-        TIMEZONE_DEFAULT=str(_pick_attr(s, "TIMEZONE_DEFAULT", "timezone_default", "timezone", default=_env_str("TZ", "Asia/Riyadh"))),
-        DEBUG=_to_bool(_pick_attr(s, "DEBUG", "debug", default=_env_bool("DEBUG", False)), _env_bool("DEBUG", False)),
-        ENABLE_SWAGGER=_to_bool(_pick_attr(s, "ENABLE_SWAGGER", "enable_swagger", default=_env_bool("ENABLE_SWAGGER", True)), _env_bool("ENABLE_SWAGGER", True)),
-        ENABLE_REDOC=_to_bool(_pick_attr(s, "ENABLE_REDOC", "enable_redoc", default=_env_bool("ENABLE_REDOC", True)), _env_bool("ENABLE_REDOC", True)),
-        INIT_ENGINE_ON_BOOT=_to_bool(_pick_attr(s, "INIT_ENGINE_ON_BOOT", "init_engine_on_boot", default=_env_bool("INIT_ENGINE_ON_BOOT", True)), _env_bool("INIT_ENGINE_ON_BOOT", True)),
-        INIT_ENGINE_STRICT=_to_bool(_pick_attr(s, "INIT_ENGINE_STRICT", "init_engine_strict", default=_env_bool("INIT_ENGINE_STRICT", False)), _env_bool("INIT_ENGINE_STRICT", False)),
-        ENGINE_INIT_TIMEOUT_SEC=float(_pick_attr(s, "ENGINE_INIT_TIMEOUT_SEC", "engine_init_timeout_sec", default=_env_float("ENGINE_INIT_TIMEOUT_SEC", 12.0))),
-        PRESTART_MOUNT_ROUTES=_to_bool(_pick_attr(s, "PRESTART_MOUNT_ROUTES", "prestart_mount_routes", default=_env_bool("PRESTART_MOUNT_ROUTES", True)), _env_bool("PRESTART_MOUNT_ROUTES", True)),
-        REQUIRE_AUTH=_to_bool(_pick_attr(s, "REQUIRE_AUTH", "require_auth", default=_env_bool("REQUIRE_AUTH", True)), _env_bool("REQUIRE_AUTH", True)),
-        OPEN_MODE=_to_bool(_pick_attr(s, "OPEN_MODE", "open_mode", default=_env_bool("OPEN_MODE", False)), _env_bool("OPEN_MODE", False)),
-        AUTH_HEADER_NAME=str(_pick_attr(s, "AUTH_HEADER_NAME", "auth_header_name", default=_env_str("AUTH_HEADER_NAME", "X-APP-TOKEN"))),
-        ALLOW_QUERY_TOKEN=_to_bool(_pick_attr(s, "ALLOW_QUERY_TOKEN", "allow_query_token", default=_env_bool("ALLOW_QUERY_TOKEN", False)), _env_bool("ALLOW_QUERY_TOKEN", False)),
-        ENABLE_CORS_ALL_ORIGINS=_to_bool(_pick_attr(s, "ENABLE_CORS_ALL_ORIGINS", "enable_cors_all_origins", default=_env_bool("ENABLE_CORS_ALL_ORIGINS", False)), _env_bool("ENABLE_CORS_ALL_ORIGINS", False)),
-        CORS_ORIGINS=str(_pick_attr(s, "CORS_ORIGINS", "cors_origins", default=_env_str("CORS_ORIGINS", ""))),
-        BACKEND_BASE_URL=str(_pick_attr(s, "BACKEND_BASE_URL", "backend_base_url", default=_env_str("BACKEND_BASE_URL", ""))),
-        ENGINE_CACHE_TTL_SEC=int(_pick_attr(s, "ENGINE_CACHE_TTL_SEC", "engine_cache_ttl_sec", default=_env_int("ENGINE_CACHE_TTL_SEC", 20))),
-        MAX_REQUESTS_PER_MINUTE=int(_pick_attr(s, "MAX_REQUESTS_PER_MINUTE", "max_requests_per_minute", default=_env_int("MAX_REQUESTS_PER_MINUTE", 240))),
+        APP_NAME=str(_pick_attr(
+            s, "APP_NAME", "app_name", "service_name",
+            default=_env_str("APP_NAME", "Tadawul Fast Bridge"),
+        )),
+        APP_VERSION=str(_pick_attr(
+            s, "APP_VERSION", "app_version",
+            default=_env_str("APP_VERSION", "dev"),
+        )),
+        APP_ENV=str(_pick_attr(
+            s, "APP_ENV", "app_env", "environment", "env",
+            default=_env_str("APP_ENV", "production"),
+        )),
+        TIMEZONE_DEFAULT=str(_pick_attr(
+            s, "TIMEZONE_DEFAULT", "timezone_default", "timezone",
+            default=_env_str("TZ", "Asia/Riyadh"),
+        )),
+        DEBUG=_to_bool(_pick_attr(
+            s, "DEBUG", "debug", default=_env_bool("DEBUG", False),
+        ), _env_bool("DEBUG", False)),
+        ENABLE_SWAGGER=_to_bool(_pick_attr(
+            s, "ENABLE_SWAGGER", "enable_swagger",
+            default=_env_bool("ENABLE_SWAGGER", True),
+        ), _env_bool("ENABLE_SWAGGER", True)),
+        ENABLE_REDOC=_to_bool(_pick_attr(
+            s, "ENABLE_REDOC", "enable_redoc",
+            default=_env_bool("ENABLE_REDOC", True),
+        ), _env_bool("ENABLE_REDOC", True)),
+        INIT_ENGINE_ON_BOOT=_to_bool(_pick_attr(
+            s, "INIT_ENGINE_ON_BOOT", "init_engine_on_boot",
+            default=_env_bool("INIT_ENGINE_ON_BOOT", True),
+        ), _env_bool("INIT_ENGINE_ON_BOOT", True)),
+        INIT_ENGINE_STRICT=_to_bool(_pick_attr(
+            s, "INIT_ENGINE_STRICT", "init_engine_strict",
+            default=_env_bool("INIT_ENGINE_STRICT", False),
+        ), _env_bool("INIT_ENGINE_STRICT", False)),
+        ENGINE_INIT_TIMEOUT_SEC=float(_pick_attr(
+            s, "ENGINE_INIT_TIMEOUT_SEC", "engine_init_timeout_sec",
+            default=_env_float("ENGINE_INIT_TIMEOUT_SEC", 12.0),
+        )),
+        PRESTART_MOUNT_ROUTES=_to_bool(_pick_attr(
+            s, "PRESTART_MOUNT_ROUTES", "prestart_mount_routes",
+            default=_env_bool("PRESTART_MOUNT_ROUTES", True),
+        ), _env_bool("PRESTART_MOUNT_ROUTES", True)),
+        REQUIRE_AUTH=_to_bool(_pick_attr(
+            s, "REQUIRE_AUTH", "require_auth",
+            default=_env_bool("REQUIRE_AUTH", True),
+        ), _env_bool("REQUIRE_AUTH", True)),
+        OPEN_MODE=_to_bool(_pick_attr(
+            s, "OPEN_MODE", "open_mode",
+            default=_env_bool("OPEN_MODE", False),
+        ), _env_bool("OPEN_MODE", False)),
+        AUTH_HEADER_NAME=str(_pick_attr(
+            s, "AUTH_HEADER_NAME", "auth_header_name",
+            default=_env_str("AUTH_HEADER_NAME", "X-APP-TOKEN"),
+        )),
+        ALLOW_QUERY_TOKEN=_to_bool(_pick_attr(
+            s, "ALLOW_QUERY_TOKEN", "allow_query_token",
+            default=_env_bool("ALLOW_QUERY_TOKEN", False),
+        ), _env_bool("ALLOW_QUERY_TOKEN", False)),
+        ENABLE_CORS_ALL_ORIGINS=_to_bool(_pick_attr(
+            s, "ENABLE_CORS_ALL_ORIGINS", "enable_cors_all_origins",
+            default=_env_bool("ENABLE_CORS_ALL_ORIGINS", False),
+        ), _env_bool("ENABLE_CORS_ALL_ORIGINS", False)),
+        CORS_ORIGINS=str(_pick_attr(
+            s, "CORS_ORIGINS", "cors_origins",
+            default=_env_str("CORS_ORIGINS", ""),
+        )),
+        BACKEND_BASE_URL=str(_pick_attr(
+            s, "BACKEND_BASE_URL", "backend_base_url",
+            default=_env_str("BACKEND_BASE_URL", ""),
+        )),
+        ENGINE_CACHE_TTL_SEC=int(_pick_attr(
+            s, "ENGINE_CACHE_TTL_SEC", "engine_cache_ttl_sec",
+            default=_env_int("ENGINE_CACHE_TTL_SEC", 20),
+        )),
+        MAX_REQUESTS_PER_MINUTE=int(_pick_attr(
+            s, "MAX_REQUESTS_PER_MINUTE", "max_requests_per_minute",
+            default=_env_int("MAX_REQUESTS_PER_MINUTE", 240),
+        )),
         CONFIG_SOURCE=source,
     )
 
@@ -576,7 +695,9 @@ def _default_routes_snapshot() -> Dict[str, Any]:
 
 
 def _ensure_app_state_defaults(app: FastAPI) -> None:
-    if not hasattr(app.state, "routes_snapshot") or not isinstance(getattr(app.state, "routes_snapshot", None), dict):
+    if not hasattr(app.state, "routes_snapshot") or not isinstance(
+        getattr(app.state, "routes_snapshot", None), dict
+    ):
         app.state.routes_snapshot = _default_routes_snapshot()
     if not hasattr(app.state, "routes_mounted"):
         app.state.routes_mounted = False
@@ -601,7 +722,13 @@ def _ensure_app_state_defaults(app: FastAPI) -> None:
 # =============================================================================
 # Auth
 # =============================================================================
-def _call_auth_ok_flexible(fn: Any, request: Request, token_value: str, authorization: str, api_key_value: str = "") -> bool:
+def _call_auth_ok_flexible(
+    fn: Any,
+    request: Request,
+    token_value: str,
+    authorization: str,
+    api_key_value: str = "",
+) -> bool:
     path = str(getattr(getattr(request, "url", None), "path", "") or "")
     headers_dict = dict(request.headers)
 
@@ -609,7 +736,9 @@ def _call_auth_ok_flexible(fn: Any, request: Request, token_value: str, authoriz
     for mod_name in ("config", "core.config"):
         try:
             cfg = importlib.import_module(mod_name)
-            getter = getattr(cfg, "get_settings_cached", None) or getattr(cfg, "get_settings", None)
+            getter = getattr(cfg, "get_settings_cached", None) or getattr(
+                cfg, "get_settings", None,
+            )
             if callable(getter):
                 settings = getter()
                 break
@@ -633,6 +762,7 @@ def _call_auth_ok_flexible(fn: Any, request: Request, token_value: str, authoriz
             "settings": settings,
             "x_app_token": token_value or None,
             "api_token": api_key_value or None,
+            "api_key": api_key_value or None,   # v8.12.2: config.py v7.3.0 has api_key kwarg
             "query_token": query_token or None,
         },
         {
@@ -672,8 +802,13 @@ def _auth_ok(request: Request) -> bool:
     except Exception:
         pass
 
-    x_app_token = request.headers.get(_SETTINGS.AUTH_HEADER_NAME, "") or request.headers.get("X-APP-TOKEN", "")
-    api_key_value = request.headers.get("X-API-Key", "") or request.headers.get("Api-Key", "")
+    x_app_token = (
+        request.headers.get(_SETTINGS.AUTH_HEADER_NAME, "")
+        or request.headers.get("X-APP-TOKEN", "")
+    )
+    api_key_value = (
+        request.headers.get("X-API-Key", "") or request.headers.get("Api-Key", "")
+    )
     auth = request.headers.get("Authorization", "")
 
     token_value = str(x_app_token or api_key_value or "").strip()
@@ -691,10 +826,13 @@ def _auth_ok(request: Request) -> bool:
             cfg = importlib.import_module(mod_name)
             fn = getattr(cfg, "auth_ok", None)
             if callable(fn):
-                return _call_auth_ok_flexible(fn, request, token_value, auth, api_key_value)
+                return _call_auth_ok_flexible(
+                    fn, request, token_value, auth, api_key_value,
+                )
         except Exception:
             continue
 
+    # v8.12.2: Expanded fallback env var list for parity with config.py v7.3.0
     allowed = [
         x for x in (
             _env_str("APP_TOKEN", ""),
@@ -706,6 +844,12 @@ def _auth_ok(request: Request) -> bool:
             _env_str("TFB_APP_TOKEN", ""),
             _env_str("TFB_TOKEN", ""),
             _env_str("API_TOKEN", ""),
+            # v8.12.2 additions:
+            _env_str("TFB_BEARER_TOKEN", ""),
+            _env_str("BEARER_TOKEN", ""),
+            _env_str("TFB_API_KEY", ""),
+            _env_str("API_KEY", ""),
+            _env_str("X_API_KEY", ""),
         ) if x
     ]
     if not allowed:
@@ -745,10 +889,16 @@ class NoResponseGuardMiddleware(BaseHTTPMiddleware):
             if response is None:
                 logger.error(
                     "Downstream returned None response",
-                    extra={"request_id": request_id, "path": str(request.url.path), "status_code": 500},
+                    extra={
+                        "request_id": request_id,
+                        "path": str(request.url.path),
+                        "status_code": 500,
+                    },
                 )
                 return _StrictJSONResponse(
                     status_code=500,
+                    # v8.12.2: also set X-Request-ID on header
+                    headers={"X-Request-ID": request_id},
                     content={
                         "status": "error",
                         "error": "RuntimeError: No response returned.",
@@ -762,10 +912,16 @@ class NoResponseGuardMiddleware(BaseHTTPMiddleware):
             if "No response returned" in str(exc):
                 logger.error(
                     "Caught downstream no-response runtime error",
-                    extra={"request_id": request_id, "path": str(request.url.path), "status_code": 500},
+                    extra={
+                        "request_id": request_id,
+                        "path": str(request.url.path),
+                        "status_code": 500,
+                    },
                 )
                 return _StrictJSONResponse(
                     status_code=500,
+                    # v8.12.2: also set X-Request-ID on header
+                    headers={"X-Request-ID": request_id},
                     content={
                         "status": "error",
                         "error": f"{type(exc).__name__}: {str(exc)}",
@@ -816,20 +972,38 @@ def _invalidate_openapi_cache(app: FastAPI) -> None:
 
 def _route_family_presence_from_paths(paths: Set[str]) -> Dict[str, bool]:
     advisor_short = _paths_start_with_any(paths, "/v1/advisor")
-    advisor_short_rows = _path_present_any(paths, "/v1/advisor/sheet-rows", "/v1/advisor/sheet_rows")
+    advisor_short_rows = _path_present_any(
+        paths, "/v1/advisor/sheet-rows", "/v1/advisor/sheet_rows",
+    )
 
     advisor_long_underscore = _paths_start_with_any(paths, "/v1/investment_advisor")
     advisor_long_hyphen = _paths_start_with_any(paths, "/v1/investment-advisor")
 
-    advanced_rows = _path_present_any(paths, "/v1/advanced/sheet-rows", "/v1/advanced/sheet_rows")
-    analysis_rows = _path_present_any(paths, "/v1/analysis/sheet-rows", "/v1/analysis/sheet_rows")
+    advanced_rows = _path_present_any(
+        paths, "/v1/advanced/sheet-rows", "/v1/advanced/sheet_rows",
+    )
+    analysis_rows = _path_present_any(
+        paths, "/v1/analysis/sheet-rows", "/v1/analysis/sheet_rows",
+    )
 
-    schema_rows = _path_present_any(paths, "/v1/schema/sheet-spec", "/v1/schema/sheet_spec", "/schema/sheet-spec", "/schema/sheet_spec")
-    schema_dict = _path_present_any(paths, "/v1/schema/data-dictionary", "/v1/schema/data_dictionary")
+    schema_rows = _path_present_any(
+        paths,
+        "/v1/schema/sheet-spec", "/v1/schema/sheet_spec",
+        "/schema/sheet-spec", "/schema/sheet_spec",
+    )
+    schema_dict = _path_present_any(
+        paths, "/v1/schema/data-dictionary", "/v1/schema/data_dictionary",
+    )
 
-    enriched_primary = _path_present_any(paths, "/v1/enriched/sheet-rows", "/v1/enriched/sheet_rows")
-    enriched_underscore = _path_present_any(paths, "/v1/enriched_quote/sheet-rows", "/v1/enriched_quote/sheet_rows")
-    enriched_hyphen = _path_present_any(paths, "/v1/enriched-quote/sheet-rows", "/v1/enriched-quote/sheet_rows")
+    enriched_primary = _path_present_any(
+        paths, "/v1/enriched/sheet-rows", "/v1/enriched/sheet_rows",
+    )
+    enriched_underscore = _path_present_any(
+        paths, "/v1/enriched_quote/sheet-rows", "/v1/enriched_quote/sheet_rows",
+    )
+    enriched_hyphen = _path_present_any(
+        paths, "/v1/enriched-quote/sheet-rows", "/v1/enriched-quote/sheet_rows",
+    )
 
     root_sheet_rows = _path_present_any(paths, "/sheet-rows", "/sheet_rows")
 
@@ -850,7 +1024,9 @@ def _route_family_presence_from_paths(paths: Set[str]) -> Dict[str, bool]:
         "schema_sheet_spec": schema_rows,
         "schema_data_dictionary": schema_dict,
 
-        "enriched": _paths_start_with_any(paths, "/v1/enriched", "/v1/enriched_quote", "/v1/enriched-quote"),
+        "enriched": _paths_start_with_any(
+            paths, "/v1/enriched", "/v1/enriched_quote", "/v1/enriched-quote",
+        ),
         "enriched_sheet_rows_primary": enriched_primary,
         "enriched_sheet_rows_underscore": enriched_underscore,
         "enriched_sheet_rows_hyphen": enriched_hyphen,
@@ -874,7 +1050,9 @@ def _endpoint_module_name(route: Any) -> str:
         return ""
 
 
-_CANONICAL_DIAGNOSTIC_PATHS: Tuple[str, ...] = tuple(sorted(set(_CONTROLLED_CANONICAL_OWNER_MAP.keys())))
+_CANONICAL_DIAGNOSTIC_PATHS: Tuple[str, ...] = tuple(
+    sorted(set(_CONTROLLED_CANONICAL_OWNER_MAP.keys()))
+)
 
 
 def _route_matches_canonical_target(route_path: str, canonical_path: str) -> bool:
@@ -887,7 +1065,9 @@ def _route_matches_canonical_target(route_path: str, canonical_path: str) -> boo
     return rp.startswith(cp.rstrip("/") + "/")
 
 
-def _canonical_route_match_rank(route_path: str, canonical_path: str) -> Tuple[int, int, int]:
+def _canonical_route_match_rank(
+    route_path: str, canonical_path: str,
+) -> Tuple[int, int, int]:
     rp = str(route_path or "").strip()
     cp = str(canonical_path or "").strip()
     exact_flag = 0 if rp == cp else 1
@@ -904,7 +1084,11 @@ def _canonical_path_owners_from_routes(app: FastAPI) -> Dict[str, str]:
         for idx, route in enumerate(routes):
             path = str(getattr(route, "path", "") or "")
             if _route_matches_canonical_target(path, canonical_path):
-                candidates.append((_canonical_route_match_rank(path, canonical_path), idx, route))
+                candidates.append((
+                    _canonical_route_match_rank(path, canonical_path),
+                    idx,
+                    route,
+                ))
         if not candidates:
             continue
         _, _, best_route = sorted(candidates, key=lambda item: (item[0], item[1]))[0]
@@ -912,13 +1096,17 @@ def _canonical_path_owners_from_routes(app: FastAPI) -> Dict[str, str]:
     return owners
 
 
-def _canonical_path_owner_mismatches(path_owners: Mapping[str, str]) -> Dict[str, Dict[str, str]]:
+def _canonical_path_owner_mismatches(
+    path_owners: Mapping[str, str],
+) -> Dict[str, Dict[str, str]]:
     mismatches: Dict[str, Dict[str, str]] = {}
     for path, expected_owner in _CONTROLLED_CANONICAL_OWNER_MAP.items():
         actual_module = str(path_owners.get(path, "") or "")
         if not actual_module:
             continue
-        actual_owner = actual_module.rsplit(".", 1)[-1] if actual_module else ""
+        actual_owner = (
+            actual_module.rsplit(".", 1)[-1] if actual_module else ""
+        )
         if actual_owner and actual_owner != expected_owner:
             mismatches[path] = {
                 "expected_owner": expected_owner,
@@ -942,7 +1130,10 @@ def _effective_failed_modules(src: Dict[str, Any]) -> List[str]:
 
 
 def _verify_required_route_families(app: FastAPI) -> List[str]:
-    paths = {str(getattr(r, "path", "") or "") for r in (getattr(app, "routes", []) or [])}
+    paths = {
+        str(getattr(r, "path", "") or "")
+        for r in (getattr(app, "routes", []) or [])
+    }
     presence = _route_family_presence_from_paths(paths)
     required = {
         "advisor_any": presence.get("advisor_any", False),
@@ -984,7 +1175,9 @@ def _prefer_live_metric(raw_value: Any, live_value: int) -> int:
     return max(0, parsed)
 
 
-def _normalize_routes_snapshot(ret: Any, *, used_strategy: str, app: Optional[FastAPI] = None) -> Dict[str, Any]:
+def _normalize_routes_snapshot(
+    ret: Any, *, used_strategy: str, app: Optional[FastAPI] = None,
+) -> Dict[str, Any]:
     base_from_state: Dict[str, Any] = {}
     if app is not None:
         try:
@@ -1018,19 +1211,32 @@ def _normalize_routes_snapshot(ret: Any, *, used_strategy: str, app: Optional[Fa
     expected_router_modules = list(src.get("expected_router_modules", []) or [])
     plan = list(src.get("plan", []) or [])
     resolved_entries = list(src.get("resolved_entries", []) or [])
-    protected_prefixes = list(src.get("protected_prefixes", list(_CONTROLLED_PROTECTED_PREFIXES)) or list(_CONTROLLED_PROTECTED_PREFIXES))
-    canonical_owner_map = dict(src.get("canonical_owner_map", dict(_CONTROLLED_CANONICAL_OWNER_MAP)) or dict(_CONTROLLED_CANONICAL_OWNER_MAP))
+    protected_prefixes = list(
+        src.get("protected_prefixes", list(_CONTROLLED_PROTECTED_PREFIXES))
+        or list(_CONTROLLED_PROTECTED_PREFIXES)
+    )
+    canonical_owner_map = dict(
+        src.get("canonical_owner_map", dict(_CONTROLLED_CANONICAL_OWNER_MAP))
+        or dict(_CONTROLLED_CANONICAL_OWNER_MAP)
+    )
 
     live_route_count, live_signature_count = _live_route_metrics(app)
-    openapi_route_count_after_mount = _prefer_live_metric(src.get("openapi_route_count_after_mount", 0), live_route_count)
-    route_signature_count_after_mount = _prefer_live_metric(src.get("route_signature_count_after_mount", 0), live_signature_count)
+    openapi_route_count_after_mount = _prefer_live_metric(
+        src.get("openapi_route_count_after_mount", 0), live_route_count,
+    )
+    route_signature_count_after_mount = _prefer_live_metric(
+        src.get("route_signature_count_after_mount", 0), live_signature_count,
+    )
 
     path_owners: Dict[str, str] = {}
     path_owner_mismatches: Dict[str, Dict[str, str]] = {}
     route_family_presence = dict(src.get("route_family_presence", {}) or {})
     if app is not None:
         try:
-            all_paths = {str(getattr(r, "path", "") or "") for r in (getattr(app, "routes", []) or [])}
+            all_paths = {
+                str(getattr(r, "path", "") or "")
+                for r in (getattr(app, "routes", []) or [])
+            }
             route_family_presence = _route_family_presence_from_paths(all_paths)
             path_owners = _canonical_path_owners_from_routes(app)
             path_owner_mismatches = _canonical_path_owner_mismatches(path_owners)
@@ -1088,18 +1294,32 @@ def _normalize_routes_snapshot(ret: Any, *, used_strategy: str, app: Optional[Fa
 def _allowed_prefixes_for_key(key: str) -> Tuple[str, ...]:
     mapping = {
         "config": ("/v1/config",),
-        "advanced_analysis": ("/v1/schema", "/schema", "/sheet-rows", "/sheet_rows"),
+        "advanced_analysis": (
+            "/v1/schema", "/schema", "/sheet-rows", "/sheet_rows",
+        ),
         "advanced_sheet_rows": ("/v1/advanced",),
         "analysis_sheet_rows": ("/v1/analysis",),
-        "investment_advisor": ("/v1/advanced", "/v1/investment_advisor", "/v1/investment-advisor"),
+        "investment_advisor": (
+            "/v1/advanced",
+            "/v1/investment_advisor",
+            "/v1/investment-advisor",
+        ),
         "advisor": ("/v1/advisor",),
-        "enriched_quote": ("/v1/enriched", "/v1/enriched_quote", "/v1/enriched-quote", "/quote", "/quotes"),
+        "enriched_quote": (
+            "/v1/enriched",
+            "/v1/enriched_quote",
+            "/v1/enriched-quote",
+            "/quote",
+            "/quotes",
+        ),
     }
     return mapping.get(key, tuple())
 
 
 def _canonical_owner_for_exact_path(path: str) -> str:
-    return str(_CONTROLLED_CANONICAL_OWNER_MAP.get(str(path or "").strip(), "") or "")
+    return str(
+        _CONTROLLED_CANONICAL_OWNER_MAP.get(str(path or "").strip(), "") or ""
+    )
 
 
 def _router_from_module(mod: Any) -> Optional[APIRouter]:
@@ -1116,7 +1336,9 @@ def _iter_router_api_routes(router: APIRouter) -> Iterable[APIRoute]:
             yield route
 
 
-def _clone_filtered_router(router: APIRouter, *, key: str) -> Tuple[APIRouter, List[str], List[str]]:
+def _clone_filtered_router(
+    router: APIRouter, *, key: str,
+) -> Tuple[APIRouter, List[str], List[str]]:
     allowed = _allowed_prefixes_for_key(key)
     out = APIRouter()
     filtered_out: List[str] = []
@@ -1144,7 +1366,9 @@ def _clone_filtered_router(router: APIRouter, *, key: str) -> Tuple[APIRouter, L
             "tags": list(getattr(route, "tags", []) or []),
             "summary": getattr(route, "summary", None),
             "description": getattr(route, "description", None),
-            "response_description": getattr(route, "response_description", "Successful Response"),
+            "response_description": getattr(
+                route, "response_description", "Successful Response",
+            ),
             "deprecated": getattr(route, "deprecated", None),
             "operation_id": getattr(route, "operation_id", None),
             "responses": getattr(route, "responses", None),
@@ -1182,7 +1406,9 @@ def _mount_routes_controlled(app: FastAPI) -> Dict[str, Any]:
     snap["strict"] = strict
     snap["strategy"] = "main.controlled_priority_plan"
     snap["plan"] = [key for key, _ in _CONTROLLED_ROUTE_PLAN]
-    snap["expected_router_modules"] = [module_name for _, module_name in _CONTROLLED_ROUTE_PLAN]
+    snap["expected_router_modules"] = [
+        module_name for _, module_name in _CONTROLLED_ROUTE_PLAN
+    ]
 
     for key, module_name in _CONTROLLED_ROUTE_PLAN:
         snap["module_to_key"][module_name] = key
@@ -1204,13 +1430,23 @@ def _mount_routes_controlled(app: FastAPI) -> Dict[str, Any]:
                 raise RuntimeError(f"{module_name} has no APIRouter")
             continue
 
-        filtered_router, filtered_out, added_paths = _clone_filtered_router(router, key=key)
+        filtered_router, filtered_out, added_paths = _clone_filtered_router(
+            router, key=key,
+        )
         if filtered_out:
             snap["filtered_out_routes"][module_name] = filtered_out
 
         routes_to_add = list(_iter_router_api_routes(filtered_router))
         if not routes_to_add:
-            snap["no_router"][module_name] = "router filtered to 0 allowed routes"
+            snap["no_router"][module_name] = (
+                "router filtered to 0 allowed routes"
+            )
+            # v8.12.2: fail-fast in strict mode on this branch too
+            if strict and module_name not in _OPTIONAL_ROUTE_MODULES:
+                raise RuntimeError(
+                    f"{module_name}: 0 routes after filtering "
+                    f"(expected prefixes: {_allowed_prefixes_for_key(key)})"
+                )
             continue
 
         existing_sigs = _app_route_signature_set(app, include_builtin=True)
@@ -1241,20 +1477,26 @@ def _mount_routes_controlled(app: FastAPI) -> Dict[str, Any]:
             if strict and module_name not in _OPTIONAL_ROUTE_MODULES:
                 raise
 
-    snap = _normalize_routes_snapshot(snap, used_strategy="main.controlled_priority_plan", app=app)
+    snap = _normalize_routes_snapshot(
+        snap, used_strategy="main.controlled_priority_plan", app=app,
+    )
     _invalidate_openapi_cache(app)
     return snap
 
 
 def _mount_routes_once(app: FastAPI, *, phase: str) -> Dict[str, Any]:
     _ensure_app_state_defaults(app)
-    if bool(getattr(app.state, "routes_mounted", False)) and isinstance(getattr(app.state, "routes_snapshot", None), dict):
+    if bool(getattr(app.state, "routes_mounted", False)) and isinstance(
+        getattr(app.state, "routes_snapshot", None), dict,
+    ):
         snap = _normalize_routes_snapshot(
             getattr(app.state, "routes_snapshot", {}),
             used_strategy="main.controlled_priority_plan",
             app=app,
         )
-        app.state.routes_mount_phase = str(getattr(app.state, "routes_mount_phase", phase) or phase)
+        app.state.routes_mount_phase = str(
+            getattr(app.state, "routes_mount_phase", phase) or phase
+        )
         return snap
 
     snap = _mount_routes_controlled(app)
@@ -1283,17 +1525,28 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
             snap = dict(getattr(app.state, "routes_snapshot", {}) or {})
             engine_obj = getattr(app.state, "engine", None)
             engine_source = str(getattr(app.state, "engine_source", "") or "")
-            engine_init_error = str(getattr(app.state, "engine_init_error", "") or "")
+            engine_init_error = str(
+                getattr(app.state, "engine_init_error", "") or ""
+            )
             routes_mounted = bool(getattr(app.state, "routes_mounted", False))
-            routes_mount_phase = str(getattr(app.state, "routes_mount_phase", "") or "")
-            config_source = str(getattr(app.state, "config_source", _SETTINGS.CONFIG_SOURCE) or _SETTINGS.CONFIG_SOURCE)
-            startup_warnings = list(getattr(app.state, "startup_warnings", []) or [])
+            routes_mount_phase = str(
+                getattr(app.state, "routes_mount_phase", "") or ""
+            )
+            config_source = str(
+                getattr(app.state, "config_source", _SETTINGS.CONFIG_SOURCE)
+                or _SETTINGS.CONFIG_SOURCE
+            )
+            startup_warnings = list(
+                getattr(app.state, "startup_warnings", []) or []
+            )
     except Exception:
         pass
 
     live_route_count, live_signature_count = _live_route_metrics(app)
     path_owners = dict(snap.get("canonical_path_owners", {}) or {})
-    path_owner_mismatches = dict(snap.get("canonical_path_owner_mismatches", {}) or {})
+    path_owner_mismatches = dict(
+        snap.get("canonical_path_owner_mismatches", {}) or {}
+    )
     route_family_presence = dict(snap.get("route_family_presence", {}) or {})
     missing_required_keys = list(snap.get("missing_required_keys", []) or [])
 
@@ -1301,7 +1554,10 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
         try:
             path_owners = _canonical_path_owners_from_routes(app)
             path_owner_mismatches = _canonical_path_owner_mismatches(path_owners)
-            all_paths = {str(getattr(r, "path", "") or "") for r in (getattr(app, "routes", []) or [])}
+            all_paths = {
+                str(getattr(r, "path", "") or "")
+                for r in (getattr(app, "routes", []) or [])
+            }
             route_family_presence = _route_family_presence_from_paths(all_paths)
             missing_required_keys = _verify_required_route_families(app)
         except Exception:
@@ -1311,22 +1567,46 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
         "service": _SETTINGS.APP_NAME,
         "app_version": _SETTINGS.APP_VERSION,
         "entry_version": APP_ENTRY_VERSION,
+        "service_version": SERVICE_VERSION,          # v8.12.2: cross-module alias
         "env": _SETTINGS.APP_ENV,
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
         "python": sys.version.split()[0],
         "config_source": config_source,
         "routes_mounted": routes_mounted,
         "routes_mount_phase": routes_mount_phase,
-        "routes_mounted_count": int(snap.get("mounted_count", len(snap.get("mounted", []) or [])) or 0),
-        "routes_duplicate_skips_count": int(snap.get("duplicate_skips_count", len(snap.get("duplicate_skips", []) or [])) or 0),
-        "routes_partial_duplicate_skips_count": int(snap.get("partial_duplicate_skips_count", len(snap.get("partial_duplicate_skips", []) or [])) or 0),
-        "routes_failed_count": int(snap.get("failed_count", len(snap.get("effective_failed_modules", []) or [])) or 0),
+        "routes_mounted_count": int(
+            snap.get("mounted_count", len(snap.get("mounted", []) or [])) or 0
+        ),
+        "routes_duplicate_skips_count": int(
+            snap.get(
+                "duplicate_skips_count",
+                len(snap.get("duplicate_skips", []) or []),
+            ) or 0
+        ),
+        "routes_partial_duplicate_skips_count": int(
+            snap.get(
+                "partial_duplicate_skips_count",
+                len(snap.get("partial_duplicate_skips", []) or []),
+            ) or 0
+        ),
+        "routes_failed_count": int(
+            snap.get(
+                "failed_count",
+                len(snap.get("effective_failed_modules", []) or []),
+            ) or 0
+        ),
         "routes_strategy": str(snap.get("strategy", "") or ""),
-        "route_signature_count": live_signature_count if live_signature_count > 0 else int(snap.get("route_signature_count_after_mount", 0) or 0),
+        "route_signature_count": (
+            live_signature_count
+            if live_signature_count > 0
+            else int(snap.get("route_signature_count_after_mount", 0) or 0)
+        ),
         "route_count_live": live_route_count,
         "missing_required_keys": missing_required_keys,
         "route_family_presence": route_family_presence,
-        "effective_failed_modules": list(snap.get("effective_failed_modules", []) or []),
+        "effective_failed_modules": list(
+            snap.get("effective_failed_modules", []) or []
+        ),
         "canonical_path_owners": path_owners,
         "canonical_path_owner_mismatches": path_owner_mismatches,
         "engine_present": engine_obj is not None,
@@ -1334,7 +1614,15 @@ def _runtime_meta(app: Optional[FastAPI] = None) -> Dict[str, Any]:
         "engine_source": engine_source,
         "engine_init_error": engine_init_error,
         "startup_warnings": startup_warnings,
-        "openapi_cached_route_signature_count": int(getattr(getattr(app, "state", None), "_openapi_route_signature_count", -1) or -1) if app is not None else -1,
+        "openapi_cached_route_signature_count": (
+            int(getattr(
+                getattr(app, "state", None),
+                "_openapi_route_signature_count",
+                -1,
+            ) or -1)
+            if app is not None
+            else -1
+        ),
     }
 
 
@@ -1345,8 +1633,12 @@ def _install_builtin_routes(app: FastAPI) -> None:
     def _status_payload(label: str) -> Dict[str, Any]:
         return {"status": label, **_runtime_meta(app)}
 
-    def _add_status_route(path: str, label: str, *, include_in_schema: bool = False) -> None:
-        @app.api_route(path, methods=["GET", "HEAD"], include_in_schema=include_in_schema)
+    def _add_status_route(
+        path: str, label: str, *, include_in_schema: bool = False,
+    ) -> None:
+        @app.api_route(
+            path, methods=["GET", "HEAD"], include_in_schema=include_in_schema,
+        )
         async def _status_route(request: Request, _label: str = label):
             if request.method == "HEAD":
                 return Response(status_code=200)
@@ -1406,9 +1698,16 @@ def _minimal_openapi_paths(app: FastAPI) -> Dict[str, Any]:
 
         path_item = paths.setdefault(path, {})
         for method in methods:
-            operation_id = str(getattr(route, "operation_id", "") or f"{route.name}_{method.lower()}")
+            operation_id = str(
+                getattr(route, "operation_id", "")
+                or f"{route.name}_{method.lower()}"
+            )
             path_item[method.lower()] = {
-                "summary": _scrub_text(getattr(route, "summary", None) or getattr(route, "name", None) or f"{method} {path}"),
+                "summary": _scrub_text(
+                    getattr(route, "summary", None)
+                    or getattr(route, "name", None)
+                    or f"{method} {path}"
+                ),
                 "operationId": _scrub_text(operation_id),
                 "responses": {
                     "200": {"description": "Successful Response"}
@@ -1419,10 +1718,17 @@ def _minimal_openapi_paths(app: FastAPI) -> Dict[str, Any]:
 
 def _install_custom_openapi(app: FastAPI) -> None:
     def build_openapi_schema() -> Dict[str, Any]:
-        current_signature_count = _route_signature_count(app, include_builtin=True)
-        cached_signature_count = int(getattr(app.state, "_openapi_route_signature_count", -1) or -1)
+        current_signature_count = _route_signature_count(
+            app, include_builtin=True,
+        )
+        cached_signature_count = int(
+            getattr(app.state, "_openapi_route_signature_count", -1) or -1
+        )
         cached_schema = getattr(app, "openapi_schema", None)
-        if isinstance(cached_schema, dict) and cached_signature_count == current_signature_count:
+        if (
+            isinstance(cached_schema, dict)
+            and cached_signature_count == current_signature_count
+        ):
             return cached_schema
 
         schema: Dict[str, Any]
@@ -1435,7 +1741,10 @@ def _install_custom_openapi(app: FastAPI) -> None:
             )
             schema = generated if isinstance(generated, dict) else {}
         except Exception as e:
-            logger.warning("OpenAPI generation failed; using fallback schema: %s", _err_to_str(e))
+            logger.warning(
+                "OpenAPI generation failed; using fallback schema: %s",
+                _err_to_str(e),
+            )
             schema = {
                 "openapi": "3.1.0",
                 "info": {
@@ -1453,7 +1762,10 @@ def _install_custom_openapi(app: FastAPI) -> None:
                 "title": _SETTINGS.APP_NAME,
                 "version": str(_SETTINGS.APP_VERSION),
             })
-            if not isinstance(schema.get("paths"), dict) or not schema.get("paths"):
+            if (
+                not isinstance(schema.get("paths"), dict)
+                or not schema.get("paths")
+            ):
                 schema["paths"] = _minimal_openapi_paths(app)
                 schema["x-openapi-rebuilt-paths"] = True
 
@@ -1462,6 +1774,7 @@ def _install_custom_openapi(app: FastAPI) -> None:
             schema["servers"] = [{"url": backend_base}]
         schema["x-generated-at-utc"] = datetime.now(timezone.utc).isoformat()
         schema["x-route-signature-count"] = current_signature_count
+        schema["x-service-version"] = SERVICE_VERSION   # v8.12.2
 
         app.openapi_schema = schema
         app.state._openapi_route_signature_count = current_signature_count
@@ -1475,8 +1788,15 @@ def _install_custom_openapi(app: FastAPI) -> None:
     @app.api_route("/openapi.json", methods=["GET", "HEAD"], include_in_schema=False)
     async def openapi_json(request: Request):
         if request.method == "HEAD":
-            return Response(status_code=200, media_type="application/json", headers={"Cache-Control": "no-store"})
-        return _StrictJSONResponse(content=build_openapi_schema(), headers={"Cache-Control": "no-store"})
+            return Response(
+                status_code=200,
+                media_type="application/json",
+                headers={"Cache-Control": "no-store"},
+            )
+        return _StrictJSONResponse(
+            content=build_openapi_schema(),
+            headers={"Cache-Control": "no-store"},
+        )
 
     if bool(_SETTINGS.ENABLE_SWAGGER):
         @app.get("/docs", include_in_schema=False)
@@ -1507,17 +1827,25 @@ async def _call_zeroarg_maybe_async(fn: Any) -> Any:
     return result
 
 
-async def _try_init_engine_module(app: FastAPI, module_name: str) -> Optional[str]:
+async def _try_init_engine_module(
+    app: FastAPI, module_name: str,
+) -> Optional[str]:
     mod = importlib.import_module(module_name)
     init_fn = getattr(mod, "get_engine", None) or getattr(mod, "init_engine", None)
     if not callable(init_fn):
         return None
 
-    timeout_sec = _coerce_positive_timeout(float(_SETTINGS.ENGINE_INIT_TIMEOUT_SEC), 12.0)
+    timeout_sec = _coerce_positive_timeout(
+        float(_SETTINGS.ENGINE_INIT_TIMEOUT_SEC), 12.0,
+    )
     try:
-        engine = await asyncio.wait_for(_call_zeroarg_maybe_async(init_fn), timeout=timeout_sec)
+        engine = await asyncio.wait_for(
+            _call_zeroarg_maybe_async(init_fn), timeout=timeout_sec,
+        )
     except asyncio.TimeoutError as e:
-        raise TimeoutError(f"{module_name} init exceeded {timeout_sec:.1f}s") from e
+        raise TimeoutError(
+            f"{module_name} init exceeded {timeout_sec:.1f}s"
+        ) from e
 
     if engine is None:
         return None
@@ -1549,7 +1877,10 @@ async def _maybe_init_engine(app: FastAPI) -> Optional[str]:
         except Exception as e:
             attempts.append((module_name, _err_to_str(e)))
 
-    err = " | ".join([f"{name} failed: {msg}" for name, msg in attempts]) or "engine init failed"
+    err = (
+        " | ".join([f"{name} failed: {msg}" for name, msg in attempts])
+        or "engine init failed"
+    )
     app.state.engine_init_error = err
     return err
 
@@ -1558,7 +1889,9 @@ async def _maybe_close_engine() -> None:
     for mod_name in ("core.data_engine_v2", "core.data_engine"):
         try:
             mod = importlib.import_module(mod_name)
-            fn = getattr(mod, "close_engine", None) or getattr(mod, "shutdown_engine", None)
+            fn = getattr(mod, "close_engine", None) or getattr(
+                mod, "shutdown_engine", None,
+            )
             if callable(fn):
                 await _call_zeroarg_maybe_async(fn)
         except Exception:
@@ -1593,7 +1926,9 @@ def create_app() -> FastAPI:
         try:
             snap = _mount_routes_once(app, phase="startup")
             logger.info(
-                "Routes verified at startup: mounted=%s duplicate_skips=%s partial_duplicate_skips=%s missing=%s failed=%s strategy=%s route_signatures=%s",
+                "Routes verified at startup: mounted=%s duplicate_skips=%s "
+                "partial_duplicate_skips=%s missing=%s failed=%s strategy=%s "
+                "route_signatures=%s",
                 snap.get("mounted_count", 0),
                 snap.get("duplicate_skips_count", 0),
                 snap.get("partial_duplicate_skips_count", 0),
@@ -1605,13 +1940,21 @@ def create_app() -> FastAPI:
 
             missing_required = list(snap.get("missing_required_keys", []) or [])
             if missing_required:
-                warning = f"missing_required_route_families: {', '.join(missing_required)}"
+                warning = (
+                    f"missing_required_route_families: "
+                    f"{', '.join(missing_required)}"
+                )
                 logger.warning(warning)
                 _append_startup_warning(app, warning)
 
-            owner_mismatches = dict(snap.get("canonical_path_owner_mismatches", {}) or {})
+            owner_mismatches = dict(
+                snap.get("canonical_path_owner_mismatches", {}) or {}
+            )
             if owner_mismatches:
-                warning = f"canonical_path_owner_mismatches: {json.dumps(owner_mismatches, ensure_ascii=False)}"
+                warning = (
+                    f"canonical_path_owner_mismatches: "
+                    f"{json.dumps(owner_mismatches, ensure_ascii=False)}"
+                )
                 logger.warning(warning)
                 _append_startup_warning(app, warning)
         except Exception as e:
@@ -1630,14 +1973,19 @@ def create_app() -> FastAPI:
             logger.warning("Engine init failed (non-fatal): %s", err)
             _append_startup_warning(app, f"engine_init_warning: {err}")
 
-        logger.info("Startup complete: %s", json.dumps(_runtime_meta(app), ensure_ascii=False))
+        logger.info(
+            "Startup complete: %s",
+            json.dumps(_runtime_meta(app), ensure_ascii=False),
+        )
         try:
             yield
         finally:
             try:
                 await _maybe_close_google_sheets_service()
             except Exception:
-                logger.warning("Google Sheets service shutdown failed", exc_info=True)
+                logger.warning(
+                    "Google Sheets service shutdown failed", exc_info=True,
+                )
             try:
                 await _maybe_close_engine()
             except Exception:
@@ -1655,9 +2003,17 @@ def create_app() -> FastAPI:
     )
     _ensure_app_state_defaults(app)
 
-    app.add_middleware(RequestIDMiddleware)
-    app.add_middleware(NoResponseGuardMiddleware)
+    # v8.12.2: Middleware ordering FIX -- Starlette applies add_middleware in
+    # LIFO stack order, so the LAST added is the OUTERMOST wrapper.
+    # Order we want (outermost to innermost):
+    #   RequestIDMiddleware -> NoResponseGuardMiddleware -> GZipMiddleware -> route
+    # So we must add them in REVERSE: GZip first, NoResponseGuard second,
+    # RequestID LAST. This ensures request.state.request_id is set BEFORE any
+    # other middleware sees the request, and X-Request-ID header is set on
+    # every response (including errors caught by NoResponseGuardMiddleware).
     app.add_middleware(GZipMiddleware, minimum_size=1024)
+    app.add_middleware(NoResponseGuardMiddleware)
+    app.add_middleware(RequestIDMiddleware)
 
     if bool(_SETTINGS.ENABLE_CORS_ALL_ORIGINS):
         app.add_middleware(
@@ -1684,10 +2040,16 @@ def create_app() -> FastAPI:
         logger.error(
             "Unhandled exception",
             exc_info=True,
-            extra={"request_id": request_id, "path": str(request.url.path), "status_code": 500},
+            extra={
+                "request_id": request_id,
+                "path": str(request.url.path),
+                "status_code": 500,
+            },
         )
         return _StrictJSONResponse(
             status_code=500,
+            # v8.12.2: set X-Request-ID header on error responses too
+            headers={"X-Request-ID": request_id},
             content={
                 "status": "error",
                 "error": f"{type(exc).__name__}: {str(exc)}",
@@ -1703,7 +2065,9 @@ def create_app() -> FastAPI:
         try:
             snap = _mount_routes_once(app, phase="prestart")
             logger.info(
-                "Routes mounted at app creation: mounted=%s duplicate_skips=%s partial_duplicate_skips=%s missing=%s failed=%s strategy=%s route_signatures=%s",
+                "Routes mounted at app creation: mounted=%s duplicate_skips=%s "
+                "partial_duplicate_skips=%s missing=%s failed=%s strategy=%s "
+                "route_signatures=%s",
                 snap.get("mounted_count", 0),
                 snap.get("duplicate_skips_count", 0),
                 snap.get("partial_duplicate_skips_count", 0),
@@ -1713,23 +2077,44 @@ def create_app() -> FastAPI:
                 snap.get("route_signature_count_after_mount", 0),
             )
         except Exception as e:
-            logger.error("Prestart route mounting failed: %s", e, exc_info=True)
-            _append_startup_warning(app, f"prestart_route_mount_failed: {_err_to_str(e)}")
+            logger.error(
+                "Prestart route mounting failed: %s", e, exc_info=True,
+            )
+            _append_startup_warning(
+                app, f"prestart_route_mount_failed: {_err_to_str(e)}",
+            )
             if _env_bool("ROUTES_STRICT_IMPORT", False):
                 raise
     else:
         _append_startup_warning(app, "prestart_route_mount_disabled")
-        logger.info("Prestart route mounting disabled by PRESTART_MOUNT_ROUTES")
+        logger.info(
+            "Prestart route mounting disabled by PRESTART_MOUNT_ROUTES"
+        )
 
     _install_custom_openapi(app)
 
     @app.get("/_debug/routes", include_in_schema=False)
     async def debug_routes(request: Request):
-        if _SETTINGS.APP_ENV == "production" and bool(_SETTINGS.REQUIRE_AUTH) and not _auth_ok(request):
-            return JSONResponse(status_code=401, content={"status": "error", "error": "unauthorized"})
+        if (
+            _SETTINGS.APP_ENV == "production"
+            and bool(_SETTINGS.REQUIRE_AUTH)
+            and not _auth_ok(request)
+        ):
+            return JSONResponse(
+                status_code=401,
+                content={"status": "error", "error": "unauthorized"},
+            )
 
-        route_paths = sorted({str(getattr(r, "path", "") or "") for r in (getattr(request.app, "routes", []) or [])})
-        route_sigs = sorted([f"{path} [{method}]" for path, method in _app_route_signature_set(request.app, include_builtin=True)])
+        route_paths = sorted({
+            str(getattr(r, "path", "") or "")
+            for r in (getattr(request.app, "routes", []) or [])
+        })
+        route_sigs = sorted([
+            f"{path} [{method}]"
+            for path, method in _app_route_signature_set(
+                request.app, include_builtin=True,
+            )
+        ])
         path_owners = _canonical_path_owners_from_routes(request.app)
         owner_mismatches = _canonical_path_owner_mismatches(path_owners)
         openapi_schema = request.app.openapi()
@@ -1745,16 +2130,28 @@ def create_app() -> FastAPI:
 
         return {
             "status": "ok",
-            "routes_snapshot": _normalize_routes_snapshot(getattr(request.app.state, "routes_snapshot", {}), used_strategy="main.controlled_priority_plan", app=request.app),
+            "routes_snapshot": _normalize_routes_snapshot(
+                getattr(request.app.state, "routes_snapshot", {}),
+                used_strategy="main.controlled_priority_plan",
+                app=request.app,
+            ),
             "app_route_count": len(getattr(request.app, "routes", []) or []),
-            "app_route_signature_count": _route_signature_count(request.app, include_builtin=True),
+            "app_route_signature_count": _route_signature_count(
+                request.app, include_builtin=True,
+            ),
             "route_paths": route_paths,
             "route_signatures": route_sigs,
             "canonical_path_owners": path_owners,
             "canonical_path_owner_mismatches": owner_mismatches,
             "enriched_alias_presence": enriched_alias_presence,
-            "openapi_paths_count": len((openapi_schema.get("paths", {}) if isinstance(openapi_schema, dict) else {}) or {}),
-            "openapi_has_paths": bool((openapi_schema.get("paths", {}) if isinstance(openapi_schema, dict) else {}) or {}),
+            "openapi_paths_count": len(
+                (openapi_schema.get("paths", {}) if isinstance(openapi_schema, dict) else {})
+                or {}
+            ),
+            "openapi_has_paths": bool(
+                (openapi_schema.get("paths", {}) if isinstance(openapi_schema, dict) else {})
+                or {}
+            ),
             **_runtime_meta(app),
         }
 
@@ -1767,4 +2164,9 @@ application = app
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "10000")), reload=False)
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=int(os.getenv("PORT", "10000")),
+        reload=False,
+    )
