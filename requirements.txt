@@ -1,11 +1,10 @@
 # ============================================================================
-# TADAWUL FAST BRIDGE -- requirements.txt (v1.1.1)
+# TADAWUL FAST BRIDGE -- requirements.txt (v1.1.2)
 # ============================================================================
-# Revised notes
-# -------------
-# Main fix:
-# - protobuf pin updated from 4.25.8 to 5.26.1 to resolve conflict with
-#   grpcio-status==1.64.3 during Render deploy.
+# Main fix in this revision:
+# - Keep protobuf 5.26.1 for grpcio-status 1.64.3 compatibility
+# - Upgrade OpenTelemetry family from 1.27.0 / 0.48b0 to 1.28.0 / 0.49b0
+#   so protobuf 5.x is supported consistently
 # ============================================================================
 
 # ----------------------------------------------------------------------------
@@ -94,15 +93,15 @@ hiredis==3.3.1
 aiomcache==0.8.2
 
 # ----------------------------------------------------------------------------
-# Observability
+# Observability (upgraded for protobuf 5.x compatibility)
 # ----------------------------------------------------------------------------
 prometheus-client==0.21.1
-opentelemetry-api==1.27.0
-opentelemetry-sdk==1.27.0
-opentelemetry-instrumentation==0.48b0
-opentelemetry-instrumentation-asgi==0.48b0
-opentelemetry-instrumentation-fastapi==0.48b0
-opentelemetry-exporter-otlp==1.27.0
+opentelemetry-api==1.28.0
+opentelemetry-sdk==1.28.0
+opentelemetry-instrumentation==0.49b0
+opentelemetry-instrumentation-asgi==0.49b0
+opentelemetry-instrumentation-fastapi==0.49b0
+opentelemetry-exporter-otlp==1.28.0
 
 # ----------------------------------------------------------------------------
 # Config / env file loading
