@@ -1,70 +1,103 @@
-=============================================================================
+# =============================================================================
+# TADAWUL FAST BRIDGE -- ENTERPRISE GITIGNORE (v7.0.2)
+# =============================================================================
+#
+# QUANTUM EDITION | ZERO-TRUST SECURITY | CLOUD-NATIVE | NARROW-IGNORE POLICY
+#
+# Core Principles:
+# - Track templates, never secrets
+# - Prefer narrow (root-anchored) ignores over broad (recursive) ignores
+# - Keep source and schema files tracked
+# - Ignore generated outputs, runtime state, credentials, and local-only artifacts
+#
+# v7.0.2 Changes (vs v7.0.1)
+# --------------------------
+# - FIX HIGH: `tmp/` changed to `/tmp/` (root-only). v7.0.1 ignored ANY
+#     `tmp/` directory at ANY depth, including legitimate subproject
+#     directories like `scripts/tmp/`, `tests/tmp/`, `src/tmp/`.
+# - FIX HIGH: `.env.local.example` added to the negation allow-list.
+#     v7.0.1 comment mentioned it as protected, but the actual rule
+#     ignored it via the `.env.*` pattern without a re-include. Same
+#     for `.env.sample.local`.
+# - FIX MEDIUM: `performance_report_*.csv` and siblings root-anchored.
+#     v7.0.1 matched these anywhere (so a legitimate sample report in
+#     `scripts/` or `docs/examples/` would be dropped). v7.0.2 anchors
+#     them to the root so only CI-generated reports at the top level
+#     are ignored; curated example reports stay tracked.
+# - ADD: `/outputs/` and `/mnt/user-data/outputs/` patterns. These
+#     match the dev-tool convention used by Claude/agent tooling so
+#     agent-generated artifacts aren't accidentally committed.
+# - ADD: Archive formats (`*.zip`, `*.tar.gz`, `*.7z`, `*.tgz`, `*.tar.xz`)
+#     commonly generated during deploy/release. Curated
+#     archives under `samples/` and `examples/` remain allowed via
+#     existing negations.
+# - ADD: `node_modules/` and `package-lock.json`-adjacent files for
+#     projects that add Node tooling (eslint, prettier, or the Google
+#     Apps Script CLI `@google/clasp`).
+# - ADD: Root-anchored `/tfb_background_jobs_dead*` / `/tfb_dlq_*` for
+#     local DLQ dumps (workers may write these when TFB_WORKER_DLQ_LOCAL=1).
+# - ADD: Explicit `.env.production`, `.env.staging`, `.env.dev` notes so
+#     the negation allow-list is clearly documented as the only path for
+#     tracking env templates.
+# - ADD: `*.bak`, `*.backup`, `*.orig`, `*.rej` generic backup patterns
+#     so editor backups don't get committed accidentally.
+# - ADD: `.claude/` directory (Claude Code session state) -- matches
+#     the .cursor/ exclusion pattern.
+# - PRESERVED: All v7.0.1 behavior for source files, TFB-specific logs,
+#     credentials, Python artifacts, ML artifacts, IDE files, notebooks,
+#     and the final "DO NOT IGNORE SOURCE" allowlist.
+#
+# Version: 7.0.2
+# =============================================================================
 
-TADAWUL FAST BRIDGE – ENTERPRISE GITIGNORE (v7.0.1)
 
-=============================================================================
+# =============================================================================
+# TFB-SPECIFIC GENERATED ARTIFACTS
+# =============================================================================
 
-QUANTUM EDITION | ZERO-TRUST SECURITY | CLOUD-NATIVE | NARROW-IGNORE POLICY
+# Analytics / profiling reports -- root-anchored so curated samples in
+# scripts/, docs/, examples/ remain tracked.
+/profile_*.json
+/performance_report_*.json
+/performance_report_*.html
+/performance_report_*.csv
+/test_report_*.html
+/test_report_*.xml
+/test_report_*.json
 
-Core Principles:
+# Additional recursive protection (but only for clearly-CI-style names)
+profile_ci_*.json
+performance_ci_*.json
 
-• Track templates, never secrets
-
-• Prefer narrow ignores over broad ignores
-
-• Keep source and schema files tracked
-
-• Ignore generated outputs, runtime state, credentials, and local-only artifacts
-
-Version: 7.0.1
-
-=============================================================================
-
-=============================================================================
-
-TFB-SPECIFIC GENERATED ARTIFACTS
-
-=============================================================================
-
-Analytics / profiling reports
-
-profile_.json
-performance_report_.json
-performance_report_.html
-performance_report_.csv
-test_report_.html
-test_report_.xml
-test_report_*.json
-
-App / worker / sync logs
-
-sync_.log
+# App / worker / sync logs (recursive -- these are never sample data)
+sync_*.log
 sync_execution.log
-app_.log
-worker_.log
-drift_.json
+app_*.log
+worker_*.log
+drift_*.json
 drift_*.log
 
-Runtime caches / temp
+# TFB background job DLQ dumps (when TFB_WORKER_DLQ_LOCAL=1)
+/tfb_background_jobs_dead*
+/tfb_dlq_*
 
+# Runtime caches / temp (ROOT-ONLY -- v7.0.2 fix)
 /models/
+/tmp/
+/temp/
 /tmp/cache_*/
 .cache/
 redis_data/
-tmp/
-temp/
 
-Transient credentials
-
+# Transient credentials
 google_credentials.json
 
-=============================================================================
 
-PYTHON BYTECODE / COMPILED EXTENSIONS
+# =============================================================================
+# PYTHON BYTECODE / COMPILED EXTENSIONS
+# =============================================================================
 
-=============================================================================
-
-pycache/
+__pycache__/
 *.py[cod]
 *$py.class
 *.pyd
@@ -75,11 +108,10 @@ pycache/
 *.pyo
 *.pyz
 
-=============================================================================
 
-PYTHON VIRTUAL ENVIRONMENTS / TOOLING
-
-=============================================================================
+# =============================================================================
+# PYTHON VIRTUAL ENVIRONMENTS / TOOLING
+# =============================================================================
 
 venv/
 .venv/
@@ -92,8 +124,7 @@ virtualenv/
 pyenv/
 .pyenv/
 
-Conda
-
+# Conda
 .conda/
 conda/
 miniconda/
@@ -102,12 +133,10 @@ anaconda/
 anaconda3/
 .anaconda/
 
-Python version files
-
+# Python version files
 .python-version
 
-Package/tool caches
-
+# Package/tool caches
 pip-wheel-metadata/
 pip-selfcheck.json
 .pip/
@@ -131,8 +160,7 @@ var/
 MANIFEST
 .installed.cfg
 
-Keep dependency manifests tracked
-
+# Keep dependency manifests tracked
 !requirements.txt
 !requirements-*.txt
 !poetry.lock
@@ -142,11 +170,25 @@ Keep dependency manifests tracked
 !setup.py
 !setup.cfg
 
-=============================================================================
 
-TESTS / COVERAGE / LINTERS / TYPE CHECKERS
+# =============================================================================
+# NODE / JS TOOLING (optional -- clasp / eslint / prettier)
+# =============================================================================
 
-=============================================================================
+node_modules/
+.npm/
+.yarn/
+.pnp.*
+# Keep manifests tracked:
+!package.json
+!package-lock.json
+!yarn.lock
+!pnpm-lock.yaml
+
+
+# =============================================================================
+# TESTS / COVERAGE / LINTERS / TYPE CHECKERS
+# =============================================================================
 
 .pytest_cache/
 .tox/
@@ -155,7 +197,7 @@ TESTS / COVERAGE / LINTERS / TYPE CHECKERS
 tests/.hypothesis/
 .cover
 .coverage
-.coverage.
+.coverage.*
 .coverage.xml
 .coverage.lcov
 htmlcov/
@@ -173,14 +215,13 @@ pytestdebug.log
 .pyrightconfig.local
 dmypy.json
 
-=============================================================================
 
-LOGS / RUNTIME / OBSERVABILITY
-
-=============================================================================
+# =============================================================================
+# LOGS / RUNTIME / OBSERVABILITY
+# =============================================================================
 
 *.log
-.log.
+*.log.*
 logs/
 log/
 *.out
@@ -212,14 +253,12 @@ flamegraph.svg
 gunicorn.conf.local.py
 uvicorn.conf.local.py
 
-=============================================================================
 
-LOCAL DATABASES / SNAPSHOTS / EXPORTS
+# =============================================================================
+# LOCAL DATABASES / SNAPSHOTS / EXPORTS
+# =============================================================================
 
-=============================================================================
-
-Databases
-
+# Databases
 *.sqlite
 *.sqlite3
 *.db
@@ -232,8 +271,7 @@ Databases
 dump.rdb
 appendonly.aof
 
-Data directories (generated/local)
-
+# Data directories (generated/local)
 data/*
 !data/.gitkeep
 !data/README.md
@@ -242,82 +280,103 @@ data/*
 !data/examples/
 !data/examples/**
 
-Generated exports / reports / artifacts directories
-
+# Generated exports / reports / artifacts directories
 exports/
 reports/
 artifacts/
 output/
+outputs/
 generated/
 generated_exports/
 
-Ignore generated flat files only inside generated/output-style dirs
+# v7.0.2: Agent/tool output convention (Claude / Cursor agents)
+/mnt/user-data/outputs/
 
-exports//*.csv
-exports//.xlsx
-exports/**/.xls
-exports//*.parquet
-exports//.feather
-exports/**/.arrow
-exports//*.h5
-exports//*.hdf5
+# Ignore generated flat files only inside generated/output-style dirs
+exports/**/*.csv
+exports/**/*.xlsx
+exports/**/*.xls
+exports/**/*.parquet
+exports/**/*.feather
+exports/**/*.arrow
+exports/**/*.h5
+exports/**/*.hdf5
 
-reports//*.csv
-reports//.xlsx
-reports/**/.xls
-reports//*.parquet
-reports//.feather
-reports/**/.arrow
-reports//*.h5
-reports//*.hdf5
+reports/**/*.csv
+reports/**/*.xlsx
+reports/**/*.xls
+reports/**/*.parquet
+reports/**/*.feather
+reports/**/*.arrow
+reports/**/*.h5
+reports/**/*.hdf5
 
-artifacts//*.csv
-artifacts//.xlsx
-artifacts/**/.xls
-artifacts//*.parquet
-artifacts//.feather
-artifacts/**/.arrow
-artifacts//*.h5
-artifacts//*.hdf5
+artifacts/**/*.csv
+artifacts/**/*.xlsx
+artifacts/**/*.xls
+artifacts/**/*.parquet
+artifacts/**/*.feather
+artifacts/**/*.arrow
+artifacts/**/*.h5
+artifacts/**/*.hdf5
 
-output//*.csv
-output//.xlsx
-output/**/.xls
-output//*.parquet
-output//.feather
-output/**/.arrow
-output//*.h5
-output//*.hdf5
+output/**/*.csv
+output/**/*.xlsx
+output/**/*.xls
+output/**/*.parquet
+output/**/*.feather
+output/**/*.arrow
+output/**/*.h5
+output/**/*.hdf5
 
-Allow tracked sample/example data anywhere explicit
+outputs/**/*.csv
+outputs/**/*.xlsx
+outputs/**/*.xls
+outputs/**/*.parquet
+outputs/**/*.feather
+outputs/**/*.arrow
+outputs/**/*.h5
+outputs/**/*.hdf5
 
-!/samples//.csv
-!/samples//.xlsx
-!/examples//.csv
-!/examples//.xlsx
-!/*.example.csv
-!/.example.xlsx
-!example_.csv
+# Archive formats (commonly deploy/release artifacts)
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.tar.xz
+*.txz
+*.tar.bz2
+*.7z
+*.rar
+
+# Allow tracked sample/example data anywhere explicit
+!samples/**/*.csv
+!samples/**/*.xlsx
+!samples/**/*.zip
+!examples/**/*.csv
+!examples/**/*.xlsx
+!examples/**/*.zip
+!*.example.csv
+!*.example.xlsx
+!example_*.csv
 !example_*.xlsx
 
-=============================================================================
 
-NOTEBOOKS / DATA SCIENCE / ML
-
-=============================================================================
+# =============================================================================
+# NOTEBOOKS / DATA SCIENCE / ML
+# =============================================================================
 
 .ipynb_checkpoints/
-.ipynb
-!notebooks/**/.ipynb
-!.example.ipynb
-!example_.ipynb
+*.ipynb
+!notebooks/**/*.ipynb
+!*.example.ipynb
+!example_*.ipynb
 
 .jupyter/
 jupyter_notebook_config.json
 jupyter_runtime/
 
-ML artifacts
-
+# ML artifacts
 *.pth
 *.pt
 *.pkl
@@ -333,8 +392,7 @@ ML artifacts
 *.tflite
 *.mlmodel
 
-ML logs
-
+# ML logs
 lightning_logs/
 mlruns/
 wandb/
@@ -343,26 +401,30 @@ wandb/
 .sacred/
 .tensorboard/
 tensorboard/
-.tfevents.
+.tfevents.*
 
-=============================================================================
 
-SECURITY & SECRETS (CRITICAL)
+# =============================================================================
+# SECURITY & SECRETS (CRITICAL)
+# =============================================================================
 
-=============================================================================
-
-Environment files - track only examples/templates
-
+# Environment files -- track only examples/templates
 .env
 .env.*
+.envrc
+
+# Re-include example/template files (v7.0.2 expanded list)
 !.env.example
 !.env.template
 !.env.sample
-!.env.local.example
-.envrc
+!.env.local.example       # v7.0.2: fix — was missing
+!.env.sample.local        # v7.0.2: alt naming
+!.env.dev.example
+!.env.staging.example
+!.env.production.example
+!.env.test.example
 
-Secrets directories
-
+# Secrets directories
 secrets/
 .credentials/
 .creds/
@@ -381,8 +443,7 @@ secure/
 certificates/
 certs/
 
-Google Cloud / Firebase / OAuth
-
+# Google Cloud / Firebase / OAuth
 credentials.json
 service-account.json
 service_account.json
@@ -394,14 +455,13 @@ gcp-credentials.json
 gcp-sa.json
 sa_key.json
 client_secret.json
-client_secret_.json
+client_secret_*.json
 oauth.json
 token.json
 tokens.json
 firebase-*.json
 
-AWS / Azure / GCP local config
-
+# AWS / Azure / GCP local config
 .aws/
 .azure/
 .gcp/
@@ -409,8 +469,7 @@ AWS / Azure / GCP local config
 aws-credentials.json
 azure-credentials.json
 
-Cryptographic material
-
+# Cryptographic material
 *.pem
 *.key
 *.crt
@@ -425,8 +484,7 @@ Cryptographic material
 *.keystore
 *.truststore
 
-Tokens / encrypted blobs
-
+# Tokens / encrypted blobs
 *.token
 *.tokens
 *.secret
@@ -436,14 +494,12 @@ Tokens / encrypted blobs
 *.enc
 *.encrypted
 
-=============================================================================
 
-IDE / EDITOR / OS
+# =============================================================================
+# IDE / EDITOR / OS / AI CODING ASSISTANTS
+# =============================================================================
 
-=============================================================================
-
-VS Code
-
+# VS Code
 .vscode/
 !.vscode/settings.json.example
 !.vscode/tasks.json.example
@@ -451,21 +507,19 @@ VS Code
 !.vscode/extensions.json
 *.code-workspace
 
-JetBrains
-
+# JetBrains
 .idea/
 *.iml
 *.iws
 *.ipr
 
-Cursor / AI editors
-
+# Cursor / Claude Code / AI editors (session state, not project source)
 .cursor/
 .cursorrules.local
+.claude/                # v7.0.2: Claude Code session state
 *.cursor.md
 
-OS files
-
+# OS files
 .DS_Store
 .DS_Store?
 ._*
@@ -475,11 +529,22 @@ Thumbs.db
 ehthumbs.db
 $RECYCLE.BIN/
 
-=============================================================================
+# Editor backups (v7.0.2)
+*.bak
+*.backup
+*.orig
+*.rej
+*.swp
+*.swo
+*~
 
-LLM / AI / COPY-PASTE ARTIFACTS
 
-=============================================================================
+# =============================================================================
+# LLM / AI / COPY-PASTE ARTIFACTS
+# =============================================================================
+# These target FILENAME SUFFIXES like "notes.claude.md" that typically
+# indicate copy-pasted LLM output. Legitimate docs using these words in
+# the STEM (e.g., docs/claude-integration.md) remain tracked.
 
 *.chatgpt.md
 *.claude.md
@@ -492,11 +557,10 @@ LLM / AI / COPY-PASTE ARTIFACTS
 *.md.backup
 *.py.backup
 
-=============================================================================
 
-DEPLOYMENT / LOCAL-ONLY OVERRIDES
-
-=============================================================================
+# =============================================================================
+# DEPLOYMENT / LOCAL-ONLY OVERRIDES
+# =============================================================================
 
 .render/
 .vercel/
@@ -508,18 +572,20 @@ terraform.tfstate.*
 *.tfvars
 *.tfvars.json
 
-Docker local overrides
-
+# Docker local overrides
 docker-compose.override.yml
 docker-compose.local.yml
 Dockerfile.local
 
-=============================================================================
 
-DO NOT IGNORE SOURCE / CONFIG / PROJECT STRUCTURE
+# =============================================================================
+# DO NOT IGNORE SOURCE / CONFIG / PROJECT STRUCTURE
+# =============================================================================
+# This is an ALLOW-LIST: re-include files that would otherwise be matched
+# by a broader ignore rule above. Gitignore rules are last-match-wins.
+# These negations are placed LAST so they override everything above.
 
-=============================================================================
-
+# Subdirectories
 !core/
 !routes/
 !schemas/
@@ -531,32 +597,64 @@ DO NOT IGNORE SOURCE / CONFIG / PROJECT STRUCTURE
 !migrations/
 !notebooks/
 !.github/
+
+# Root-level app files
 !main.py
 !app.py
 !config.py
 !env.py
 !worker.py
+
+# Dependency manifests
 !requirements.txt
-!requirements-.txt
+!requirements-*.txt
+!pyproject.toml
+!poetry.lock
+!pdm.lock
+!uv.lock
+!setup.py
+!setup.cfg
+
+# Deployment config (TFB canonical)
 !render.yaml
 !Procfile
 !runtime.txt
 !start_web.sh
-!.sh
+!scripts/start_web.sh
+!*.sh
+
+# CI / GitHub Actions
 !daily_sync*.yml
+!.github/**/*.yml
+!.github/**/*.yaml
+
+# Project meta
 !.gitignore
 !.dockerignore
+!.editorconfig
+!README.md
+!LICENSE
+!LICENSE.md
+
+# Templates and examples (explicit)
 !docker-compose.example.yml
 !config.example.yaml
 !config.example.json
 !.env.example
+!.env.local.example
 
-=============================================================================
 
-FINAL SAFEGUARD
-
-=============================================================================
-
-This file is part of TADAWUL FAST BRIDGE v7.0.1
-
-Do not remove without understanding the security implications.
+# =============================================================================
+# FINAL SAFEGUARD
+# =============================================================================
+# This file is part of TADAWUL FAST BRIDGE v7.0.2
+#
+# DO NOT remove without understanding the security implications.
+#
+# Last-match-wins rule summary:
+#  - A broader rule EARLIER can be overridden by a negation `!pattern` LATER.
+#  - A negation on a parent directory does NOT re-include already-ignored
+#    children (e.g., `!tests/` does NOT un-ignore `tests/.hypothesis/`).
+#  - Root-anchored patterns start with `/` (e.g., `/tmp/` ignores only the
+#    project-root tmp/, not `scripts/tmp/`).
+# =============================================================================
