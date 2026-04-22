@@ -2,7 +2,7 @@
 # routes/advanced_sheet_rows.py
 """
 ================================================================================
-Advanced Sheet-Rows Router — v2.5.1
+Advanced Sheet-Rows Router — v2.5.2
 ================================================================================
 SCHEMA-FIRST • ADAPTER-FIRST • ROOT-ANALYSIS ALIGNED • SPECIAL-PAGE SAFE
 PATH-AWARE AUTH • PUBLIC-PATH AWARE • STABLE RESPONSE SHAPE • LIVE-TEST READY
@@ -13,8 +13,23 @@ GET  /v1/advanced/health
 GET  /v1/advanced/sheet-rows
 POST /v1/advanced/sheet-rows
 
-v2.5.1 Fixes (vs v2.5.0)
+v2.5.2 Fixes (vs v2.5.1)
 ------------------------
+- FIX [MEDIUM]: _ensure_authorized now passes `auth_token or None` to
+  auth_ok rather than a raw empty string. When no token was present in
+  any header / query slot, v2.5.1's `_extract_auth_token` returned
+  `""`, which was then forwarded verbatim to every attempt in the
+  dispatch loop. Strict auth_ok implementations treat `""` as a
+  supplied-but-invalid token (→ rejected) whereas `None` is correctly
+  interpreted as "no token supplied" (→ falls through to public-path
+  logic or open-mode fallback, as intended). This matches the
+  project-wide convention already used by
+  `routes/investment_advisor.py::_require_auth_or_401` —
+  `{"token": auth_token or None, ...}`. The two sibling routers now
+  send auth_ok identically-shaped attempts.
+
+v2.5.1 Fixes (vs v2.5.0) — preserved
+------------------------------------
 - FIX: _ensure_authorized now converts ANY exception from auth_ok into a clean
   HTTP 401 instead of letting non-TypeError errors escape uncaught. v2.5.0
   nested retries inside `except TypeError:` handlers — exceptions thrown from
@@ -75,7 +90,7 @@ from dataclasses import asdict, is_dataclass
 from datetime import date, datetime, time as dt_time, timezone
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, status
 from fastapi.encoders import jsonable_encoder
@@ -204,7 +219,7 @@ except Exception:  # pragma: no cover
     _NORMALIZE_ROW_TO_SCHEMA = None  # type: ignore
 
 
-ADVANCED_SHEET_ROWS_VERSION = "2.5.1"
+ADVANCED_SHEET_ROWS_VERSION = "2.5.2"
 ROOT_OWNER = "advanced_sheet_rows"
 router = APIRouter(prefix="/v1/advanced", tags=["Advanced Sheet Rows"])
 
@@ -513,10 +528,20 @@ def _extract_auth_token(*, token_query: Optional[str], x_app_token: Optional[str
 
 
 def _ensure_authorized(*, request: Request, settings: Any, token_query: Optional[str], x_app_token: Optional[str], x_api_key: Optional[str], authorization: Optional[str]) -> None:
-    """v2.5.1: rewritten as a linear attempt-loop so every auth_ok call is
+    """Auth gate with flexible auth_ok signature dispatch.
+
+    v2.5.1: rewritten as a linear attempt-loop so every auth_ok call is
     protected. v2.5.0 nested retries inside `except TypeError:` handlers;
     non-TypeError exceptions thrown from those inner calls bypassed the outer
-    `except Exception as e:` sibling and propagated out of the function."""
+    `except Exception as e:` sibling and propagated out of the function.
+
+    v2.5.2: normalize empty auth_token to None before dispatching. Strict
+    auth_ok implementations treat `""` as a supplied-but-invalid token
+    (→ reject) whereas `None` correctly signals "no token supplied"
+    (→ fall through to public-path / open-mode logic). The local
+    `_tok` binding makes this behavior identical to the sister router
+    `routes/investment_advisor.py::_require_auth_or_401`.
+    """
     path = str(getattr(getattr(request, "url", None), "path", "") or "")
     try:
         if callable(is_open_mode) and bool(is_open_mode()):
@@ -531,10 +556,13 @@ def _ensure_authorized(*, request: Request, settings: Any, token_query: Optional
         return
     auth_token = _extract_auth_token(token_query=token_query, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization, settings=settings, request=request)
 
+    # v2.5.2: empty string -> None for auth_ok compatibility
+    _tok = auth_token or None
+
     attempts = (
-        {"token": auth_token, "authorization": authorization, "headers": request.headers, "path": path, "request": request, "settings": settings},
-        {"token": auth_token, "authorization": authorization, "headers": request.headers, "path": path},
-        {"token": auth_token, "authorization": authorization, "headers": request.headers},
+        {"token": _tok, "authorization": authorization, "headers": request.headers, "path": path, "request": request, "settings": settings},
+        {"token": _tok, "authorization": authorization, "headers": request.headers, "path": path},
+        {"token": _tok, "authorization": authorization, "headers": request.headers},
     )
     ok: Any = False
     last_err: Optional[BaseException] = None
