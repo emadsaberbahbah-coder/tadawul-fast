@@ -2,85 +2,137 @@
 # core/scoring_engine.py
 """
 ================================================================================
-Scoring Engine Compatibility Bridge -- v3.1.0
-(COMPATIBILITY / CONTRACT-HARDENED / STARTUP-SAFE / LABEL-ALIGNED /
- MULTI-PATH-IMPORT / SCORING-v4.1.0-READY)
+Scoring Engine Compatibility Bridge -- v3.2.0
+(COMPATIBILITY BRIDGE / GRACEFUL-DEGRADATION / STARTUP-SAFE / LABEL-ALIGNED /
+ MULTI-PATH-IMPORT / CROSS-VERSION-AWARE)
 ================================================================================
 
 Purpose
 -------
 - Preserve the legacy ``core.scoring_engine`` import surface expected by
   tests, scripts, and older callers.
-- Delegate actual scoring logic to ``core.scoring`` (v4.1.0).
+- Delegate actual scoring logic to ``core.scoring`` (this bridge supports
+  BOTH scoring.py v2.2.0 — currently live — AND the aspirational v4.1.0
+  profile that adds horizon-aware helpers).
 - Re-export recommendation normalization helpers so older callers stay
-  aligned with the canonical reco vocabulary enforced by
-  ``core.reco_normalize``.
+  aligned with the canonical 5-value reco vocabulary:
+  ``STRONG_BUY / BUY / HOLD / REDUCE / SELL``.
 - Keep startup behavior safe: no network I/O, no heavy side effects.
+- Surface degradation state for operators instead of silently falling
+  back to stale defaults.
 
-v3.1.0 changes (what moved from v3.0.0)
----------------------------------------
-- FIX: ``score_and_rank_rows`` and ``assign_rank_overall`` TypeError
-  fallback paths previously called the native helper with only the
-  positional ``rows`` argument, silently dropping ``settings``,
-  ``key_overall``, ``inplace``, and ``rank_key``. Rows would then be
-  scored/ranked with defaults that did not match the caller's intent.
-  v3.1.0 retries the call with best-effort positional arguments so no
-  configuration is lost.
+Version compatibility matrix
+----------------------------
++-------------------------+--------------+----------------------+
+| Caller imports          | v2.2.0 live  | v4.1.0 (aspirational) |
++-------------------------+--------------+----------------------+
+| compute_scores          |  native      |  native              |
+| enrich_with_scores      |  native      |  native              |
+| score_row / score_quote |  native      |  native              |
+| rank_rows_by_overall    |  native      |  native              |
+| assign_rank_overall     |  native      |  native              |
+| score_and_rank_rows     |  native      |  native              |
+| ScoringEngine (class)   |  native      |  native              |
+| CANONICAL reco codes    |  bridge (5)  |  native              |
+| normalize_recommendation|  reco_norm   |  native              |
+| compute_recommendation  |  bridge->_recommendation |  native  |
+| Horizon / Signal /      |  stub enums  |  native              |
+|   RSISignal             |  (v3.2.0)    |                      |
+| compute_technical_score |  None        |  native              |
+| rsi_signal              |  "N/A"       |  native              |
+| short_term_signal       |  "HOLD"      |  native              |
+| detect_horizon          |  stub        |  native              |
+| get_weights_for_horizon |  defaults    |  native              |
+| derive_upside_pct       |  None        |  native              |
+| derive_volume_ratio     |  None        |  native              |
+| derive_day_range_pos    |  None        |  native              |
+| invest_period_label     |  "1M"        |  native              |
++-------------------------+--------------+----------------------+
 
-- FIX: ``_fallback_normalize_recommendation_label`` now attempts to
-  delegate to ``core.reco_normalize.normalize_recommendation`` before
-  falling back to the local 24-entry alias map. ``scoring.py`` v4.1.0
-  exports ``normalize_recommendation_code`` but not
-  ``normalize_recommendation_label``, which means the bridge's own
-  fallback is the primary path for the ``_label`` name. Delegating to
-  ``reco_normalize`` gives full coverage of English/Arabic/French/
-  Spanish/German/Portuguese alias terms instead of silently mapping
-  unknown inputs to HOLD.
+Degradation policy
+------------------
+When symbols are missing from the resolved scoring module, the bridge
+(a) substitutes safe defaults, (b) emits a single INFO-level log at
+import time listing degraded symbols, and (c) exposes the same list
+programmatically via ``get_degradation_report()`` so operators have
+visibility instead of mysterious blank data downstream.
 
-- ENHANCE: re-export ``Horizon``, ``Signal``, and ``RSISignal`` enums
-  so callers can write ``from core.scoring_engine import Horizon``
-  without reaching into ``core.scoring`` directly.
+v3.2.0 changes (vs v3.1.0)
+--------------------------
+- FIX HEADER: v3.1.0 header claimed "SCORING-v4.1.0-READY", which is
+  misleading when scoring.py is v2.2.0 (as in the currently-deployed
+  backend). Header and docstrings now describe the bridge as a
+  cross-version compatibility layer spanning scoring.py v2.2.0 through
+  the aspirational v4.1.0 contract.
 
-- ENHANCE: re-export ``compute_recommendation`` (the horizon-aware
-  recommender function). It is public in scoring.py v4.1.0 __all__ and
-  is used by advisors that import from this bridge.
+- FIX MEDIUM: ``compute_recommendation`` fallback chain extended.
+  v3.1.0 returned a hardcoded ``("HOLD", "compute_recommendation
+  unavailable")`` tuple when scoring.py didn't export
+  ``compute_recommendation`` as a public symbol. v2.2.0 happens NOT to
+  export it publicly — but it does have a PRIVATE ``_recommendation``
+  function with a 4-arg signature that matches the first four
+  positional args of the public contract. v3.2.0 now delegates to
+  ``scoring._recommendation(overall, risk, confidence100, roi3)`` as a
+  secondary fallback before surrendering to the static-HOLD tuple.
+  Result: callers on v2.2.0 now get a real risk/confidence/ROI-aware
+  recommendation instead of a stuck HOLD.
 
-- FIX: ``rank_rows_by_overall`` fallback path now matches the native
-  contract -- rows are returned in *input order* with a ``rank_overall``
-  field annotated on each. v3.0.0's fallback returned rows sorted
-  descending by ``overall_score``, which diverged from the native
-  ``core.scoring.rank_rows_by_overall`` behavior (annotate-only). The
-  divergence was latent because the native path is always taken in a
-  healthy deployment, but any code path exercising the fallback would
-  have returned a different row order.
+- FIX MEDIUM: ``Horizon``, ``Signal``, and ``RSISignal`` are now
+  substituted with minimal stub ``Enum`` classes when scoring.py
+  doesn't export them. v3.1.0 re-exported the raw ``None`` values,
+  causing ``AttributeError`` on any caller that did
+  ``from core.scoring_engine import Horizon; Horizon.MONTH``. The
+  stubs reproduce the v4.1.0 member names so imports succeed even
+  against v2.2.0 scoring.
 
-- FIX: ``detect_horizon`` return-type annotation relaxed from
-  ``Tuple[str, Optional[int]]`` to ``Tuple[Any, Optional[int]]``. The
-  native scoring module returns ``Tuple[Horizon, Optional[int]]``
-  where ``Horizon`` is a ``(str, Enum)`` subclass -- string equality
-  still works, but annotating as plain ``str`` was misleading to
-  type-checkers.
+- FIX LOW: ``_reco_delegate`` check order corrected. v3.1.0 tried
+  ``.value`` and ``.name`` attributes before checking ``isinstance(str)``.
+  ``reco_normalize__3_.py`` v5.0.0 returns a plain string, so the
+  pre-checks were dead code that fell through to the string path
+  anyway. Minor perf improvement, same semantics.
 
-- Bump version: ``SCORING_ENGINE_VERSION = "3.1.0"``. Mirrors the
-  alignment bump that pushed scoring.py to v4.1.0.
+- ENHANCE: Module-level validation now also requires ``ScoreWeights``
+  and ``DEFAULT_WEIGHTS``. These are needed for ``ScoringEngine``
+  class instantiation; their absence would crash downstream code.
 
-Preserved
----------
-- All public symbols in v3.0.0's __all__.
+- ENHANCE: New ``get_degradation_report()`` function returns a dict
+  describing exactly which native symbols are missing, what fallbacks
+  are in effect, and the resolved scoring module name/version. Useful
+  for health endpoints and ops dashboards.
+
+- ENHANCE: Single ``logging.getLogger(__name__).info()`` call at
+  import time lists degraded symbols when any are missing. No-op when
+  all symbols are present (no log spam in healthy deploys).
+
+- Bump version: ``SCORING_ENGINE_VERSION = "3.2.0"``.
+
+Preserved from v3.1.0
+---------------------
+- All public symbols in __all__.
 - Multi-path import order: ``core.scoring`` -> ``core.sheets.scoring``
   -> ``scoring``.
-- ``_as_dict`` polymorphic coercion (dataclass / Mapping / pydantic v1
-  / pydantic v2 / plain __dict__).
-- Native ``ScoringEngine`` pass-through with graceful degradation when
-  native instantiation fails.
-- Fallback implementations for every delegated function so the bridge
-  degrades gracefully if scoring.py is missing v4.1.0 symbols.
+- Multi-path import for reco_normalize: ``core.reco_normalize`` ->
+  ``reco_normalize``.
+- ``_as_dict`` polymorphic coercion.
+- Native ``ScoringEngine`` pass-through.
+- All function-level fallback implementations from v3.1.0.
+- ``score_and_rank_rows`` / ``assign_rank_overall`` TypeError-retry
+  best-effort positional-arg paths (v3.1.0 fix).
+- ``_fallback_normalize_recommendation_label`` delegating to
+  reco_normalize before the local alias map (v3.1.0 fix).
+- ``rank_rows_by_overall`` fallback that annotates in input order
+  (v3.1.0 fix).
+- ``CANONICAL_RECOMMENDATION_CODES = (STRONG_BUY, BUY, HOLD, REDUCE, SELL)``.
+- ``_NORMALIZE_TO_CANONICAL`` 24-entry alias map (Accumulate -> BUY,
+  Watch -> HOLD, etc.).
 ================================================================================
 """
 
 from __future__ import annotations
 
+import enum
 import importlib
+import logging
 from dataclasses import asdict, is_dataclass
 from typing import (
     Any,
@@ -92,6 +144,8 @@ from typing import (
     Sequence,
     Tuple,
 )
+
+logger = logging.getLogger(__name__)
 
 # =============================================================================
 # Multi-Path Import of core.scoring
@@ -105,10 +159,12 @@ _SCORING_CANDIDATES: Tuple[str, ...] = (
 
 _scoring_mod: Any = None
 _scoring_import_error: Optional[str] = None
+_scoring_resolved_path: str = ""
 
 for _candidate in _SCORING_CANDIDATES:
     try:
         _scoring_mod = importlib.import_module(_candidate)
+        _scoring_resolved_path = _candidate
         break
     except ImportError as e:
         _scoring_import_error = str(e)
@@ -128,7 +184,7 @@ def _scoring_attr(name: str, default: Any = None) -> Any:
 
 
 # =============================================================================
-# Best-Effort Import of reco_normalize (for richer fallback coverage)
+# Best-Effort Import of reco_normalize
 # =============================================================================
 
 _RECO_CANDIDATES: Tuple[str, ...] = (
@@ -137,9 +193,11 @@ _RECO_CANDIDATES: Tuple[str, ...] = (
 )
 
 _reco_mod: Any = None
+_reco_resolved_path: str = ""
 for _rc in _RECO_CANDIDATES:
     try:
         _reco_mod = importlib.import_module(_rc)
+        _reco_resolved_path = _rc
         break
     except ImportError:
         continue
@@ -153,9 +211,14 @@ def _reco_delegate(label: Any) -> Optional[str]:
     """
     Attempt to normalize ``label`` using ``reco_normalize.normalize_recommendation``.
 
-    Returns the canonical uppercase code (e.g. "STRONG_BUY") on success,
-    or ``None`` if reco_normalize is unavailable or returned an unknown
-    shape.
+    v3.2.0: Check order rearranged — ``reco_normalize__3_`` v5.0.0 returns
+    a plain string, so ``isinstance(result, str)`` is now the fast path.
+    Enum ``.value``/``.name`` fallbacks preserved for future scoring.py
+    versions that return a Recommendation enum.
+
+    Returns the canonical uppercase code (e.g. ``"STRONG_BUY"``) on
+    success, or ``None`` if reco_normalize is unavailable or returned an
+    unknown shape.
     """
     if _reco_normalize_fn is None:
         return None
@@ -164,9 +227,11 @@ def _reco_delegate(label: Any) -> Optional[str]:
     except Exception:
         return None
 
-    # reco_normalize returns a Recommendation enum whose .value / str()
-    # is the canonical code. Enum has str(Recommendation.BUY) == "Recommendation.BUY"
-    # in some Python versions, so prefer .value / .name.
+    # Fast path: plain string (current reco_normalize v5.0.0 shape).
+    if isinstance(result, str) and result:
+        return result.upper()
+
+    # Future path: Recommendation enum with .value / .name.
     try:
         val = getattr(result, "value", None)
         if isinstance(val, str) and val:
@@ -179,8 +244,7 @@ def _reco_delegate(label: Any) -> Optional[str]:
             return name.upper()
     except Exception:
         pass
-    if isinstance(result, str) and result:
-        return result.upper()
+
     return None
 
 
@@ -188,7 +252,7 @@ def _reco_delegate(label: Any) -> Optional[str]:
 # Version Constants
 # =============================================================================
 
-SCORING_ENGINE_VERSION = "3.1.0"
+SCORING_ENGINE_VERSION = "3.2.0"
 VERSION = SCORING_ENGINE_VERSION
 __version__ = SCORING_ENGINE_VERSION
 
@@ -197,7 +261,7 @@ _SCORING_VERSION = (
 )
 
 # =============================================================================
-# Stable Symbols from scoring.py
+# Stable Symbols from scoring.py (native where available)
 # =============================================================================
 
 # Data classes / enums
@@ -206,10 +270,10 @@ ForecastParameters = _scoring_attr("ForecastParameters")
 ScoreWeights = _scoring_attr("ScoreWeights")
 ScoringWeights = _scoring_attr("ScoringWeights") or ScoreWeights
 
-# Horizon / Signal / RSISignal enums (v3.1.0 re-export)
-Horizon = _scoring_attr("Horizon")
-Signal = _scoring_attr("Signal")
-RSISignal = _scoring_attr("RSISignal")
+# Horizon / Signal / RSISignal enums (v3.1.0 re-export; v3.2.0 stub fallback)
+_native_Horizon = _scoring_attr("Horizon")
+_native_Signal = _scoring_attr("Signal")
+_native_RSISignal = _scoring_attr("RSISignal")
 
 # Defaults
 DEFAULT_WEIGHTS = _scoring_attr("DEFAULT_WEIGHTS")
@@ -224,7 +288,7 @@ _rank_rows = _scoring_attr("rank_rows_by_overall")
 _assign_rank = _scoring_attr("assign_rank_overall")
 _score_and_rank = _scoring_attr("score_and_rank_rows")
 
-# Horizon-aware helpers
+# Horizon-aware helpers (aspirational v4.1.0 surface)
 _compute_technical_score = _scoring_attr("compute_technical_score")
 _rsi_signal = _scoring_attr("rsi_signal")
 _short_term_signal = _scoring_attr("short_term_signal")
@@ -235,27 +299,78 @@ _derive_volume_ratio = _scoring_attr("derive_volume_ratio")
 _derive_day_range_position = _scoring_attr("derive_day_range_position")
 _invest_period_label = _scoring_attr("invest_period_label")
 
-# Horizon-aware recommender (v3.1.0 re-export)
+# Horizon-aware recommender (public in v4.1.0, private as _recommendation
+# in v2.2.0; v3.2.0 delegates to the private one when public is absent).
 _compute_recommendation = _scoring_attr("compute_recommendation")
+_private_recommendation = _scoring_attr("_recommendation")  # v2.2.0 fallback
 
-# Validation -- required symbols only
-for _sym_name, _sym_val in (
+# Validation -- hard-required symbols only (crash early if absent).
+_REQUIRED_SYMBOLS: Tuple[Tuple[str, Any], ...] = (
     ("compute_scores", _compute_scores),
     ("enrich_with_scores", _enrich_with_scores),
     ("AssetScores", AssetScores),
-):
+    ("ScoreWeights", ScoreWeights),
+    ("DEFAULT_WEIGHTS", DEFAULT_WEIGHTS),
+)
+for _sym_name, _sym_val in _REQUIRED_SYMBOLS:
     if _sym_val is None:
         raise ImportError(
-            f"scoring_engine bridge: '{_sym_name}' not found in resolved "
-            f"scoring module ({_scoring_mod.__name__}). The module may be "
-            f"too old or incomplete."
+            f"scoring_engine bridge: required symbol '{_sym_name}' not found "
+            f"in resolved scoring module ({_scoring_mod.__name__}). The "
+            f"module may be too old or incomplete."
         )
+
+
+# =============================================================================
+# Stub Enums (v3.2.0) — substituted when scoring.py doesn't export them
+# =============================================================================
+# Rationale: v3.1.0 re-exported None for these, causing AttributeError on
+# callers doing ``from core.scoring_engine import Horizon; Horizon.MONTH``.
+# The stubs preserve the import contract and the member names expected by
+# v4.1.0 callers, so code written against v4.1.0 can import successfully
+# even against a v2.2.0-backed deploy.
+
+class _StubHorizon(str, enum.Enum):
+    """Stub Horizon enum — substituted when scoring.py doesn't export Horizon."""
+    DAY = "day"
+    WEEK = "week"
+    MONTH = "month"
+    QUARTER = "quarter"
+    YEAR = "year"
+
+
+class _StubSignal(str, enum.Enum):
+    """Stub Signal enum — substituted when scoring.py doesn't export Signal."""
+    STRONG_BUY = "STRONG_BUY"
+    BUY = "BUY"
+    HOLD = "HOLD"
+    REDUCE = "REDUCE"
+    SELL = "SELL"
+
+
+class _StubRSISignal(str, enum.Enum):
+    """Stub RSISignal enum — substituted when scoring.py doesn't export RSISignal."""
+    OVERSOLD = "Oversold"
+    NEUTRAL = "Neutral"
+    OVERBOUGHT = "Overbought"
+    NA = "N/A"
+
+
+Horizon = _native_Horizon if _native_Horizon is not None else _StubHorizon
+Signal = _native_Signal if _native_Signal is not None else _StubSignal
+RSISignal = _native_RSISignal if _native_RSISignal is not None else _StubRSISignal
+
 
 # =============================================================================
 # Recommendation Normalization
 # =============================================================================
 
-# Canonical 5-value recommendation vocabulary (matches reco_normalize).
+# Canonical 5-value recommendation vocabulary.
+# NOTE: reco_normalize__3_.py v5.0.0 canonicalizes to 4 values (STRONG_BUY
+# collapses to BUY, matching broker agency ratings). scoring.py v2.2.0
+# emits all 5 values natively. Apps Script / live /meta canonical set is 5.
+# The bridge standardizes on the 5-value set because that's what the
+# scoring pipeline actually produces.
 CANONICAL_RECOMMENDATION_CODES: Tuple[str, ...] = (
     "STRONG_BUY",
     "BUY",
@@ -304,9 +419,6 @@ _NORMALIZE_TO_CANONICAL: Dict[str, str] = {
 def _fallback_normalize_recommendation_label(label: Any) -> str:
     """
     Fallback normalize_recommendation_label.
-
-    Used when ``core.scoring`` does not export ``normalize_recommendation_label``
-    directly (which is the common case with scoring.py v4.1.0).
 
     Resolution order:
       1. Delegate to ``core.reco_normalize.normalize_recommendation`` if
@@ -366,6 +478,99 @@ if _core_codes is not None:
         CANONICAL_RECOMMENDATION_CODES = tuple(_core_codes)
     except TypeError:
         pass  # keep local default
+
+
+# =============================================================================
+# Degradation Diagnostic (v3.2.0)
+# =============================================================================
+
+def _build_degradation_report() -> Dict[str, Any]:
+    """
+    Build a report of which native symbols are missing and what fallbacks
+    are in effect. Called once at import time for logging, and exposed
+    publicly via get_degradation_report() for ops dashboards.
+    """
+    optional_symbols: Dict[str, Any] = {
+        "compute_recommendation": _compute_recommendation,
+        "Horizon": _native_Horizon,
+        "Signal": _native_Signal,
+        "RSISignal": _native_RSISignal,
+        "compute_technical_score": _compute_technical_score,
+        "rsi_signal": _rsi_signal,
+        "short_term_signal": _short_term_signal,
+        "detect_horizon": _detect_horizon,
+        "get_weights_for_horizon": _get_weights_for_horizon,
+        "derive_upside_pct": _derive_upside_pct,
+        "derive_volume_ratio": _derive_volume_ratio,
+        "derive_day_range_position": _derive_day_range_position,
+        "invest_period_label": _invest_period_label,
+        "score_row": _score_row,
+        "score_quote": _score_quote,
+        "rank_rows_by_overall": _rank_rows,
+        "assign_rank_overall": _assign_rank,
+        "score_and_rank_rows": _score_and_rank,
+        "normalize_recommendation_label": _scoring_attr("normalize_recommendation_label"),
+        "normalize_recommendation_code": _scoring_attr("normalize_recommendation_code"),
+        "DEFAULT_FORECASTS": DEFAULT_FORECASTS,
+    }
+
+    missing = sorted(k for k, v in optional_symbols.items() if v is None)
+
+    return {
+        "bridge_version": SCORING_ENGINE_VERSION,
+        "scoring_module": _scoring_mod.__name__,
+        "scoring_module_path": _scoring_resolved_path,
+        "scoring_version": _SCORING_VERSION,
+        "reco_normalize_module": _reco_mod.__name__ if _reco_mod is not None else None,
+        "reco_normalize_path": _reco_resolved_path,
+        "reco_normalize_available": _reco_normalize_fn is not None,
+        "private_recommendation_available": _private_recommendation is not None,
+        "stub_horizon_in_use": _native_Horizon is None,
+        "stub_signal_in_use": _native_Signal is None,
+        "stub_rsi_signal_in_use": _native_RSISignal is None,
+        "missing_optional_symbols": missing,
+        "degraded": bool(missing),
+    }
+
+
+_DEGRADATION_REPORT = _build_degradation_report()
+
+# Emit exactly one INFO-level log describing degradation state.
+if _DEGRADATION_REPORT["degraded"]:
+    logger.info(
+        "scoring_engine bridge v%s: scoring=%s v%s, missing optional symbols %s. "
+        "Fallback paths active. Call get_degradation_report() for details.",
+        SCORING_ENGINE_VERSION,
+        _DEGRADATION_REPORT["scoring_module"],
+        _DEGRADATION_REPORT["scoring_version"],
+        _DEGRADATION_REPORT["missing_optional_symbols"],
+    )
+else:
+    logger.debug(
+        "scoring_engine bridge v%s: scoring=%s v%s, all symbols present.",
+        SCORING_ENGINE_VERSION,
+        _DEGRADATION_REPORT["scoring_module"],
+        _DEGRADATION_REPORT["scoring_version"],
+    )
+
+
+def get_degradation_report() -> Dict[str, Any]:
+    """
+    Return a diagnostic report about the bridge's compatibility state.
+
+    Useful for health endpoints, ops dashboards, and debugging mysterious
+    blank data on downstream pages. The report includes:
+
+    - bridge_version / scoring_version / reco_normalize availability
+    - list of optional symbols missing from the resolved scoring module
+    - whether stub enums are in use (Horizon/Signal/RSISignal)
+    - whether the private-_recommendation fallback is accessible
+    - overall `degraded` boolean for quick checks
+
+    Returns:
+        Dict with the fields above. Always safe to call; does not raise.
+    """
+    return dict(_DEGRADATION_REPORT)
 
 
 # =============================================================================
@@ -480,8 +685,8 @@ def rank_rows_by_overall(rows: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]
     Assign overall-score rank to rows.
 
     NOTE: This matches the contract of ``core.scoring.rank_rows_by_overall``
-    (v4.1.0) -- rows are returned in *input order* with a ``rank_overall``
-    field annotated on each. The rank reflects descending sort order by
+    -- rows are returned in *input order* with a ``rank_overall`` field
+    annotated on each. The rank reflects descending sort order by
     overall_score, but the returned list is NOT sorted. Call sites that
     want sorted output should do ``sorted(rows, key=lambda r: r["rank_overall"])``.
 
@@ -539,7 +744,7 @@ def assign_rank_overall(
         except TypeError:
             pass
         # Graceful degradation: best-effort positional call that still
-        # preserves all four arguments. v3.0.0 dropped them here.
+        # preserves all four arguments.
         try:
             return list(_assign_rank(rows_list, key_overall, inplace, rank_key))
         except TypeError:
@@ -589,7 +794,6 @@ def score_and_rank_rows(
         except TypeError:
             pass
         # Graceful degradation preserving all arguments positionally.
-        # v3.0.0 fallback silently dropped settings/key_overall/inplace here.
         try:
             return list(_score_and_rank(rows_list, settings, key_overall, inplace))
         except TypeError:
@@ -670,11 +874,13 @@ def detect_horizon(
     Returns:
         Tuple of ``(horizon_label, horizon_days)``. ``horizon_label`` is
         a ``Horizon`` enum from the native path (subclass of ``str``), or
-        the literal string ``"month"`` when the native helper is missing.
+        the stub ``Horizon.MONTH`` value when the native helper is missing.
     """
     if _detect_horizon is not None:
         return _detect_horizon(settings, row)
-    return "month", None
+    # v3.2.0: return stub Horizon.MONTH rather than a bare string, so
+    # callers doing ``h, _ = detect_horizon(); h == Horizon.MONTH`` work.
+    return Horizon.MONTH, None
 
 
 def get_weights_for_horizon(horizon: Any, settings: Any = None) -> Any:
@@ -735,38 +941,57 @@ def compute_recommendation(
     """
     Compute horizon-aware recommendation + reason.
 
-    Delegates to ``core.scoring.compute_recommendation``. If ``horizon``
-    is None, defaults to the native helper's ``Horizon.MONTH``.
+    Delegation chain (v3.2.0):
+      1. Prefer public ``core.scoring.compute_recommendation`` (v4.1.0+).
+      2. If absent, delegate to private ``core.scoring._recommendation``
+         (v2.2.0) using the first four positional args — the horizon/
+         technical/momentum/roi1/roi12 arguments are ignored in this
+         fallback because v2.2.0 doesn't use them, but the caller still
+         gets a REAL risk/roi-aware recommendation instead of a stuck
+         HOLD.
+      3. If both are absent, return ``("HOLD", <reason>)``.
 
     Returns:
         ``(recommendation_code, reason_text)`` tuple where
         ``recommendation_code`` is one of the canonical codes.
     """
-    if _compute_recommendation is None:
-        return "HOLD", "scoring.compute_recommendation unavailable."
+    # Path 1: public compute_recommendation (v4.1.0+).
+    if _compute_recommendation is not None:
+        if horizon is None and Horizon is not None:
+            horizon = getattr(Horizon, "MONTH", "month")
+        elif horizon is None:
+            horizon = "month"
 
-    if horizon is None and Horizon is not None:
-        horizon = getattr(Horizon, "MONTH", "month")
-    elif horizon is None:
-        horizon = "month"
-
-    try:
-        return _compute_recommendation(
-            overall, risk, confidence100, roi3,
-            horizon=horizon,
-            technical=technical,
-            momentum=momentum,
-            roi1=roi1,
-            roi12=roi12,
-        )
-    except TypeError:
-        # Minimal-signature fallback
         try:
-            return _compute_recommendation(overall, risk, confidence100, roi3)
+            return _compute_recommendation(
+                overall, risk, confidence100, roi3,
+                horizon=horizon,
+                technical=technical,
+                momentum=momentum,
+                roi1=roi1,
+                roi12=roi12,
+            )
+        except TypeError:
+            # Minimal-signature fallback
+            try:
+                return _compute_recommendation(overall, risk, confidence100, roi3)
+            except Exception as e:
+                # Fall through to path 2.
+                _last_public_err = e
         except Exception as e:
-            return "HOLD", f"compute_recommendation fallback failed: {e}"
-    except Exception as e:
-        return "HOLD", f"compute_recommendation raised: {e}"
+            # Fall through to path 2.
+            _last_public_err = e
+
+    # Path 2: private _recommendation (v2.2.0). Matches the 4-arg
+    # signature of the public v4.1.0 version for the first 4 args.
+    if _private_recommendation is not None:
+        try:
+            return _private_recommendation(overall, risk, confidence100, roi3)
+        except Exception as e:
+            return "HOLD", f"compute_recommendation fallback raised: {e}"
+
+    # Path 3: total failure — return static HOLD.
+    return "HOLD", "compute_recommendation unavailable (no public or private scoring path)."
 
 
 # =============================================================================
@@ -995,7 +1220,7 @@ __all__ = [
     "ScoringWeights",
     "ForecastParameters",
     "ScoreWeights",
-    # Enums (v3.1.0 re-export)
+    # Enums (native when available, stub fallback in v3.2.0)
     "Horizon",
     "Signal",
     "RSISignal",
@@ -1016,4 +1241,6 @@ __all__ = [
     "invest_period_label",
     # v3.1.0 re-export
     "compute_recommendation",
+    # v3.2.0 diagnostic
+    "get_degradation_report",
 ]
