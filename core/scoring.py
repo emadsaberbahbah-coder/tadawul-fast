@@ -2,55 +2,58 @@
 # core/scoring.py
 """
 ================================================================================
-Scoring Module — v4.1.0
+Scoring Module — v4.1.1
 (HORIZON-AWARE / TECHNICAL-SIGNALS / SHORT-TERM READY / SCHEMA-ALIGNED)
 ================================================================================
 
-v4.1.0 changes (what moved from v4.0.0)
+v4.1.1 changes (what moved from v4.1.0)
 ---------------------------------------
-- FIX: `normalize_recommendation_code` no longer has a duplicate "STRONG_BUY"
-  dict literal and now delegates to `core.reco_normalize.normalize_recommendation`
-  (the canonical source of truth). v4.0.0 reimplemented its own 13-entry
-  alias table and silently collapsed unknown terms like "OUTPERFORM",
-  "OVERWEIGHT", and "STRONG SELL" to HOLD.
+- FIX [HIGH]: `normalize_recommendation_code` no longer loses STRONG_BUY.
+  v4.1.0 delegated to `core.reco_normalize.normalize_recommendation`
+  unconditionally, but reco_normalize__3_.py v5.0.0 canonicalizes to a
+  4-value vocabulary {BUY, HOLD, REDUCE, SELL} — it intentionally
+  collapses STRONG_BUY into BUY (matching broker agency ratings).
+  The scoring module emits a 5-value vocabulary including STRONG_BUY,
+  and `compute_scores` pipes its result through this function right
+  before writing to AssetScores.recommendation. Net effect on v4.1.0:
+  the scoring engine could never emit STRONG_BUY — every STRONG_BUY
+  call from `compute_recommendation` was silently demoted to BUY.
 
-- FIX: consistent ROI coercion across all paths. v4.0.0 used `_as_fraction`
-  (threshold abs >= 1.5) for `expected_roi_1m` and `_as_roi_fraction`
-  (threshold abs > 1.0) for `expected_roi_3m` and `expected_roi_12m` in
-  `derive_forecast_patch`. Same inconsistency appeared in `compute_scores`
-  where all three ROIs went through `_as_fraction`, while
-  `compute_opportunity_score` and `compute_valuation_score` used
-  `_as_roi_fraction`. Net effect: a row with `expected_roi_3m: 1.2` was
-  interpreted as 120% in the recommendation path and 1.2% in the scoring
-  path. v4.1.0 uses `_as_roi_fraction` throughout for all ROI fields.
+  v4.1.1 fixes this with a 3-step resolution:
+    1. Fast path: if input is already canonical (one of the 5 codes),
+       return it as-is. No delegation, no lossy normalization.
+    2. Try local alias table first (covers the common display-label
+       cases like "Strong Buy", "Accumulate", "Outperform", etc.).
+    3. Only delegate to reco_normalize for inputs that neither the
+       canonical set nor the local table recognizes. This path may
+       return one of the 4 collapsed codes — acceptable because the
+       input was already non-canonical.
 
-- FIX: honest recommendation when scoring inputs are insufficient. v4.0.0
-  defaulted `overall=50.0` and then fell into `compute_recommendation`,
-  which hit the "overall >= 50" branch and returned REDUCE with reason
-  "Weak overall score (50.0)". The row was explicitly marked
-  `insufficient_scoring_inputs` yet produced a confident REDUCE call.
-  v4.1.0 short-circuits: when no scoring inputs are available, the
-  recommendation is HOLD with reason "Insufficient scoring inputs".
+- IMPROVEMENT: `_CANONICAL_RECO` is now also exported as
+  `CANONICAL_RECOMMENDATION_CODES` (tuple form) so the
+  scoring_engine bridge can pick it up via `_scoring_attr`.
 
-- FIX: `_riyadh_iso` now treats naive datetime input as UTC (same as
-  `_utc_iso`) rather than stamping it with +03:00. v4.0.0's asymmetry
-  only mattered when callers passed naive datetimes — the default
-  `field(default_factory=_riyadh_iso)` usage is safe either way — but
-  the bug was real and would double-shift on conversion.
+- CLEANUP: removed unused imports (`Callable`, `cast`, `Union`,
+  `lru_cache`). v4.1.0 imported these but never referenced them.
 
-- IMPROVEMENT: `score_and_rank_rows` now records per-row scoring errors
-  in `row["scoring_errors"]` instead of silently swallowing exceptions
-  with `except Exception: pass`. Behaviour on the happy path is
-  identical; failures are now traceable via debug log and the per-row
-  error list.
+- DOC: `compute_recommendation` low-confidence threshold of `c < 40`
+  is explicitly called out. This differs from scoring.py v2.2.0's
+  `c < 45`. The reason string "Low AI confidence (X%)" is the
+  canonical post-v4.0.0 signature used throughout the project.
 
-- CLEANUP: `compute_recommendation` MONTH branch simplified — redundant
-  `roi_3m is not None` checks removed (the variable is assigned from
-  `roi3 if roi3 is not None else 0.0` and can never be None inside the
-  function).
+Public API preserved. All v4.1.0 callable signatures and happy-path
+semantics are identical.
 
-Public API preserved. All v4.0.0 exports remain available with the same
-signatures and semantics on the happy path.
+v4.1.0 changes (from v4.0.0) — preserved
+-----------------------------------------
+- FIX: consistent ROI coercion via `_as_roi_fraction` for all
+  `expected_roi_*` fields.
+- FIX: honest recommendation when scoring inputs are insufficient
+  (explicit HOLD + "Insufficient scoring inputs" reason, no phantom
+  REDUCE at overall=50).
+- FIX: `_riyadh_iso` treats naive datetime as UTC (matches `_utc_iso`).
+- IMPROVEMENT: `score_and_rank_rows` records per-row scoring errors.
+- CLEANUP: `compute_recommendation` MONTH branch simplified.
 ================================================================================
 """
 
@@ -59,22 +62,17 @@ from __future__ import annotations
 import logging
 import math
 import os
-import re
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from functools import lru_cache
 from typing import (
     Any,
-    Callable,
     Dict,
     List,
     Mapping,
     Optional,
     Sequence,
     Tuple,
-    Union,
-    cast,
 )
 
 logger = logging.getLogger(__name__)
@@ -84,7 +82,7 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-__version__ = "4.1.0"
+__version__ = "4.1.1"
 SCORING_VERSION = __version__
 
 # =============================================================================
@@ -96,10 +94,7 @@ _RIYADH_TZ = timezone(timedelta(hours=3))
 
 
 def _utc_iso(dt: Optional[datetime] = None) -> str:
-    """Get UTC time in ISO format.
-
-    Naive datetimes are treated as UTC.
-    """
+    """Get UTC time in ISO format. Naive datetimes are treated as UTC."""
     d = dt or datetime.now(_UTC)
     if d.tzinfo is None:
         d = d.replace(tzinfo=_UTC)
@@ -109,10 +104,8 @@ def _utc_iso(dt: Optional[datetime] = None) -> str:
 def _riyadh_iso(dt: Optional[datetime] = None) -> str:
     """Get Riyadh time in ISO format.
 
-    v4.1.0: naive datetimes are treated as UTC (same policy as `_utc_iso`)
-    and then converted to Riyadh. v4.0.0 stamped naive datetimes with
-    `+03:00` directly, which would double-shift on any subsequent
-    comparison with a real UTC timestamp.
+    Naive datetimes are treated as UTC (matches `_utc_iso` policy) and
+    then converted to Riyadh.
     """
     if dt is None:
         return datetime.now(_RIYADH_TZ).isoformat()
@@ -473,15 +466,9 @@ def _norm_confidence_0_1(value: Any) -> Optional[float]:
 # =============================================================================
 
 def detect_horizon(settings: Any = None, row: Optional[Mapping[str, Any]] = None) -> Tuple[Horizon, Optional[int]]:
-    """
-    Detect investment horizon from settings or row data.
-
-    Returns:
-        Tuple of (horizon_label, horizon_days_int)
-    """
+    """Detect investment horizon from settings or row data."""
     horizon_days: Optional[float] = None
 
-    # Check settings
     if settings is not None:
         if isinstance(settings, Mapping):
             horizon_days = _safe_float(settings.get("horizon_days") or settings.get("invest_period_days"))
@@ -491,7 +478,6 @@ def detect_horizon(settings: Any = None, row: Optional[Mapping[str, Any]] = None
                 getattr(settings, "invest_period_days", None)
             )
 
-    # Check row
     if horizon_days is None and row is not None:
         horizon_days = _get_float(row, "horizon_days", "invest_period_days")
 
@@ -506,15 +492,7 @@ def detect_horizon(settings: Any = None, row: Optional[Mapping[str, Any]] = None
 
 
 def get_weights_for_horizon(horizon: Horizon, settings: Any = None) -> ScoreWeights:
-    """
-    Get weights tuned for a specific horizon.
-
-    Weight philosophy:
-      DAY:   Technical dominates — price action, volume, RSI zone
-      WEEK:  Technical + value blend — oversold quality stocks
-      MONTH: Balanced original TFB weights
-      LONG:  Fundamentals dominate — valuation + quality + growth
-    """
+    """Get weights tuned for a specific horizon."""
     presets = {
         Horizon.DAY: ScoreWeights(
             w_technical=0.50, w_momentum=0.30, w_quality=0.10,
@@ -536,7 +514,6 @@ def get_weights_for_horizon(horizon: Horizon, settings: Any = None) -> ScoreWeig
 
     base = presets.get(horizon, presets[Horizon.MONTH])
 
-    # Apply overrides from settings
     if settings is None:
         return base.normalize()
 
@@ -562,11 +539,7 @@ def get_weights_for_horizon(horizon: Horizon, settings: Any = None) -> ScoreWeig
 # =============================================================================
 
 def derive_volume_ratio(row: Mapping[str, Any]) -> Optional[float]:
-    """
-    Compute volume_ratio = volume / avg_volume_10d.
-
-    Returns existing value if already in row, otherwise derives it.
-    """
+    """Compute volume_ratio = volume / avg_volume_10d."""
     vr = _get_float(row, "volume_ratio")
     if vr is not None and vr > 0:
         return _round(vr, 4)
@@ -583,12 +556,7 @@ def derive_volume_ratio(row: Mapping[str, Any]) -> Optional[float]:
 
 
 def derive_day_range_position(row: Mapping[str, Any]) -> Optional[float]:
-    """
-    Compute day_range_position = (price - day_low) / (day_high - day_low).
-
-    0 = price at bottom of range (buy signal)
-    1 = price at top of range (caution)
-    """
+    """Compute day_range_position = (price - day_low) / (day_high - day_low)."""
     drp = _get_float(row, "day_range_position")
     if drp is not None:
         return _round(_clamp(drp, 0.0, 1.0), 4)
@@ -608,12 +576,7 @@ def derive_day_range_position(row: Mapping[str, Any]) -> Optional[float]:
 
 
 def derive_upside_pct(row: Mapping[str, Any]) -> Optional[float]:
-    """
-    Compute upside_pct = (intrinsic_value - current_price) / current_price.
-
-    Positive = trading below intrinsic value (buy signal)
-    Negative = trading above intrinsic value (caution)
-    """
+    """Compute upside_pct = (intrinsic_value - current_price) / current_price."""
     usp = _get_float(row, "upside_pct")
     if usp is not None:
         return usp
@@ -656,61 +619,51 @@ def _rsi_to_zone_score(rsi: Optional[float]) -> Optional[float]:
     """Map RSI to buy-signal strength score (0-1)."""
     if rsi is None:
         return None
-
     if rsi <= 25:
-        return 0.95   # deeply oversold — strong contrarian buy
+        return 0.95
     if rsi <= 35:
-        return 0.88   # oversold
+        return 0.88
     if rsi <= 45:
-        return 0.78   # mildly oversold — good entry
+        return 0.78
     if rsi <= 55:
-        return 0.68   # neutral — acceptable
+        return 0.68
     if rsi <= 60:
-        return 0.58   # slightly elevated — hold
+        return 0.58
     if rsi <= 65:
-        return 0.45   # getting stretched
+        return 0.45
     if rsi <= 70:
-        return 0.30   # approaching overbought
+        return 0.30
     if rsi <= 75:
-        return 0.18   # overbought
-    return 0.08       # very overbought — avoid
+        return 0.18
+    return 0.08
 
 
 def _volume_ratio_to_score(ratio: Optional[float]) -> Optional[float]:
     """Map volume_ratio to score (0-1)."""
     if ratio is None or ratio < 0:
         return None
-
     if ratio >= 3.0:
-        return 1.00   # extreme surge
+        return 1.00
     if ratio >= 2.0:
-        return 0.90   # strong surge
+        return 0.90
     if ratio >= 1.5:
-        return 0.75   # moderate surge
+        return 0.75
     if ratio >= 1.0:
-        return 0.55   # normal activity
+        return 0.55
     if ratio >= 0.7:
-        return 0.40   # below average
-    return 0.20       # low volume = weak signal
+        return 0.40
+    return 0.20
 
 
 def _day_range_to_score(drp: Optional[float]) -> Optional[float]:
-    """Map day_range_position to score (0-1)."""
+    """Map day_range_position to score (0-1). Near bottom = high score."""
     if drp is None:
         return None
-    # Invert: near bottom = high score
     return _clamp(1.0 - (drp ** 0.7), 0.0, 1.0)
 
 
 def compute_technical_score(row: Mapping[str, Any]) -> Optional[float]:
-    """
-    Composite short-term technical signal 0-100.
-
-    Formula:
-      0.40 × RSI_zone_score
-      0.30 × volume_ratio_score
-      0.30 × day_range_position_score
-    """
+    """Composite short-term technical signal 0-100."""
     rsi = _get_float(row, "rsi_14", "rsi", "rsi14")
     vol_ratio = derive_volume_ratio(row)
     drp = derive_day_range_position(row)
@@ -754,20 +707,7 @@ def short_term_signal(
     risk: Optional[float],
     horizon: Horizon,
 ) -> str:
-    """
-    Generate short-term trading signal from technical + momentum.
-
-    Day horizon thresholds (tight — only strong setups get BUY):
-      STRONG_BUY: technical≥75 AND momentum≥70 AND risk≤50
-      BUY:        technical≥60 AND momentum≥55 AND risk≤65
-      SELL:       technical<38 OR momentum<30
-
-    Week horizon thresholds (slightly looser):
-      BUY:        technical≥65 AND momentum≥60 AND risk≤60
-      SELL:       technical<35 OR momentum<30
-
-    Month/Long: signal based on momentum alone.
-    """
+    """Generate short-term trading signal from technical + momentum."""
     t = technical if technical is not None else 50.0
     m = momentum if momentum is not None else 50.0
     r = risk if risk is not None else 50.0
@@ -788,7 +728,7 @@ def short_term_signal(
             return Signal.SELL.value
         return Signal.HOLD.value
 
-    # Month / Long — less reliable for ST signal
+    # Month / Long
     if m >= 70 and t >= 55:
         return Signal.BUY.value
     if m <= 30 or t <= 35:
@@ -833,13 +773,7 @@ def derive_forecast_patch(
     row: Mapping[str, Any],
     forecasts: ForecastParameters,
 ) -> Tuple[Dict[str, Any], List[str]]:
-    """Derive forecast fields from row data.
-
-    v4.1.0: all three ROI fields go through `_as_roi_fraction`. v4.0.0
-    used `_as_fraction` for `roi1` and `_as_roi_fraction` for `roi3` and
-    `roi12`, producing different interpretations of the same raw value
-    depending on which horizon was queried.
-    """
+    """Derive forecast fields from row data (consistent ROI coercion)."""
     patch: Dict[str, Any] = {}
     errors: List[str] = []
 
@@ -851,7 +785,6 @@ def derive_forecast_patch(
         "forecast_price_3m", "forecast_price_1m"
     )
 
-    # v4.1.0: consistent fraction coercion across all three horizons.
     roi1 = _as_roi_fraction(_get(row, "expected_roi_1m", "expected_return_1m"))
     roi3 = _as_roi_fraction(_get(row, "expected_roi_3m", "expected_return_3m"))
     roi12 = _as_roi_fraction(_get(row, "expected_roi_12m", "expected_return_12m"))
@@ -860,7 +793,6 @@ def derive_forecast_patch(
     fp3 = _get_float(row, "forecast_price_3m", "expected_price_3m")
     fp12 = _get_float(row, "forecast_price_12m", "expected_price_12m")
 
-    # Calculate from price if needed
     if price is not None and price > 0:
         if roi12 is None and fp12 is not None and fp12 > 0:
             roi12 = (fp12 / price) - 1.0
@@ -869,11 +801,9 @@ def derive_forecast_patch(
         if roi1 is None and fp1 is not None and fp1 > 0:
             roi1 = (fp1 / price) - 1.0
 
-    # Fallback to fair value
     if price is not None and price > 0 and roi12 is None and fair is not None and fair > 0:
         roi12 = (fair / price) - 1.0
 
-    # Clamp and derive missing
     if roi12 is not None:
         roi12 = _clamp(roi12, forecasts.min_roi_12m, forecasts.max_roi_12m)
     if roi3 is None and roi12 is not None:
@@ -886,7 +816,6 @@ def derive_forecast_patch(
     if roi1 is not None:
         roi1 = _clamp(roi1, forecasts.min_roi_1m, forecasts.max_roi_1m)
 
-    # Calculate forecast prices
     if price is not None and price > 0:
         if fp12 is None and roi12 is not None:
             fp12 = price * (1.0 + roi12)
@@ -904,7 +833,6 @@ def derive_forecast_patch(
     patch["expected_roi_3m"] = _round(roi3, 6)
     patch["expected_roi_12m"] = _round(roi12, 6)
 
-    # Aliases
     patch["expected_return_1m"] = patch["expected_roi_1m"]
     patch["expected_return_3m"] = patch["expected_roi_3m"]
     patch["expected_return_12m"] = patch["expected_roi_12m"]
@@ -950,16 +878,11 @@ def _completeness_factor(row: Mapping[str, Any]) -> float:
 
 
 def compute_quality_score(row: Mapping[str, Any]) -> Optional[float]:
-    """
-    Compute quality score (0-100).
-
-    Blends real financial quality metrics with data quality.
-    """
+    """Compute quality score (0-100). Blends financial metrics with data quality."""
     dq = _data_quality_factor(row)
     comp = _completeness_factor(row)
     data_quality_proxy = _clamp(0.55 * dq + 0.45 * comp, 0.0, 1.0)
 
-    # Financial quality metrics
     roe = _as_fraction(_get(row, "roe", "return_on_equity", "returnOnEquity"))
     roa = _as_fraction(_get(row, "roa", "return_on_assets", "returnOnAssets"))
     op_margin = _as_fraction(_get(row, "operating_margin", "operatingMarginTTM"))
@@ -969,24 +892,15 @@ def compute_quality_score(row: Mapping[str, Any]) -> Optional[float]:
     fin_parts: List[Tuple[float, float]] = []
 
     if roe is not None:
-        roe_score = _clamp((roe - 0.05) / 0.30, 0.0, 1.0)
-        fin_parts.append((0.30, roe_score))
-
+        fin_parts.append((0.30, _clamp((roe - 0.05) / 0.30, 0.0, 1.0)))
     if roa is not None:
-        roa_score = _clamp((roa - 0.02) / 0.16, 0.0, 1.0)
-        fin_parts.append((0.25, roa_score))
-
+        fin_parts.append((0.25, _clamp((roa - 0.02) / 0.16, 0.0, 1.0)))
     if op_margin is not None:
-        op_score = _clamp((op_margin - 0.05) / 0.35, 0.0, 1.0)
-        fin_parts.append((0.25, op_score))
-
+        fin_parts.append((0.25, _clamp((op_margin - 0.05) / 0.35, 0.0, 1.0)))
     if net_margin is not None:
-        nm_score = _clamp((net_margin - 0.02) / 0.28, 0.0, 1.0)
-        fin_parts.append((0.15, nm_score))
-
+        fin_parts.append((0.15, _clamp((net_margin - 0.02) / 0.28, 0.0, 1.0)))
     if de is not None and de >= 0:
-        de_score = _clamp(1.0 - (de / 2.5), 0.0, 1.0)
-        fin_parts.append((0.05, de_score))
+        fin_parts.append((0.05, _clamp(1.0 - (de / 2.5), 0.0, 1.0)))
 
     if fin_parts:
         wsum = sum(w for w, _ in fin_parts)
@@ -1096,16 +1010,7 @@ def compute_growth_score(row: Mapping[str, Any]) -> Optional[float]:
 
 
 def compute_momentum_score(row: Mapping[str, Any]) -> Optional[float]:
-    """
-    Compute momentum score (0-100).
-
-    Weights:
-      0.30 — RSI zone score
-      0.25 — 1D percent change
-      0.20 — 5D price change
-      0.15 — 52-week position
-      0.10 — volume ratio
-    """
+    """Compute momentum score (0-100)."""
     pct = _as_roi_fraction(_get(row, "percent_change", "change_pct", "change_percent"))
     rsi = _get_float(row, "rsi_14", "rsi", "rsi14")
     pos = _as_fraction(_get(row, "week_52_position_pct", "position_52w_pct", "week52_position_pct"))
@@ -1114,24 +1019,19 @@ def compute_momentum_score(row: Mapping[str, Any]) -> Optional[float]:
 
     parts: List[Tuple[float, float]] = []
 
-    # RSI zone score (bell curve centered at 55)
     if rsi is not None:
         x = (rsi - 55.0) / 12.0
         parts.append((0.30, _clamp(math.exp(-(x * x)), 0.0, 1.0)))
 
-    # 1D change
     if pct is not None:
         parts.append((0.25, _clamp((pct + 0.10) / 0.20, 0.0, 1.0)))
 
-    # 5D change
     if pct_5d is not None:
         parts.append((0.20, _clamp((pct_5d + 0.08) / 0.16, 0.0, 1.0)))
 
-    # 52-week position
     if pos is not None:
         parts.append((0.15, _clamp(pos, 0.0, 1.0)))
 
-    # Volume ratio
     if vol_r is not None:
         parts.append((0.10, _clamp((vol_r - 0.5) / 1.5, 0.0, 1.0)))
 
@@ -1257,13 +1157,11 @@ def compute_recommendation(
     roi1: Optional[float] = None,
     roi12: Optional[float] = None,
 ) -> Tuple[str, str]:
-    """
-    Compute recommendation based on scores and horizon.
+    """Compute recommendation based on scores and horizon.
 
-    DAY horizon   — primary signal: technical_score
-    WEEK horizon  — primary signal: technical_score + momentum
-    MONTH horizon — primary signal: roi_3m + overall_score
-    LONG horizon  — primary signal: roi_12m + overall_score
+    Confidence < 40 short-circuits to HOLD. This differs from
+    scoring.py v2.2.0 which used < 45. The threshold was lowered in
+    v4.0.0 to reduce false-HOLDs on borderline-confidence signals.
     """
     if overall is None:
         return "HOLD", "Insufficient data to score reliably."
@@ -1273,7 +1171,6 @@ def compute_recommendation(
     t = technical if technical is not None else 50.0
     m = momentum if momentum is not None else 50.0
 
-    # Low confidence → hold
     if c < 40:
         return "HOLD", f"Low AI confidence ({_round(c, 1)}%) — insufficient signal quality."
 
@@ -1336,8 +1233,6 @@ def compute_recommendation(
         return "SELL", f"Poor long-term fundamentals (score={_round(overall, 1)})."
 
     # MONTH horizon (default)
-    # v4.1.0: dropped redundant `roi_3m is not None` checks — roi_3m is
-    # always a float here (falls back to 0.0 when the input was None).
     roi_3m = roi3 if roi3 is not None else 0.0
     if r >= 75 and overall < 75:
         return "REDUCE", f"High risk ({_round(r, 1)}) with moderate score ({_round(overall, 1)})."
@@ -1354,8 +1249,15 @@ def compute_recommendation(
     return "SELL", f"Very weak overall score ({_round(overall, 1)})."
 
 
-# Local fallback alias table — used only when core.reco_normalize is
-# unavailable. core.reco_normalize is the authoritative canonical source.
+# =============================================================================
+# Recommendation Normalization  (v4.1.1 — BUG #2 FIX)
+# =============================================================================
+# The local alias table is authoritative for this module. It preserves the
+# 5-value vocabulary that `compute_recommendation` emits. reco_normalize is
+# only consulted for inputs that match neither the canonical set nor the
+# local aliases — at which point its lossy 4-value collapse is acceptable
+# because the input was non-canonical anyway.
+
 _LOCAL_RECO_ALIASES: Dict[str, str] = {
     "STRONG_BUY": "STRONG_BUY",
     "STRONGBUY": "STRONG_BUY",
@@ -1370,6 +1272,7 @@ _LOCAL_RECO_ALIASES: Dict[str, str] = {
     "NEUTRAL": "HOLD",
     "MAINTAIN": "HOLD",
     "MARKET_PERFORM": "HOLD",
+    "WATCH": "HOLD",
     "REDUCE": "REDUCE",
     "TRIM": "REDUCE",
     "UNDERWEIGHT": "REDUCE",
@@ -1377,42 +1280,85 @@ _LOCAL_RECO_ALIASES: Dict[str, str] = {
     "AVOID": "SELL",
     "EXIT": "SELL",
     "UNDERPERFORM": "SELL",
-    "STRONG_SELL": "SELL",  # scoring enum only has 5 levels; map STRONG_SELL -> SELL
+    "STRONG_SELL": "SELL",  # scoring enum has only 5 levels; map down to SELL
 }
 
-_CANONICAL_RECO = {"STRONG_BUY", "BUY", "HOLD", "REDUCE", "SELL"}
+CANONICAL_RECOMMENDATION_CODES: Tuple[str, ...] = (
+    "STRONG_BUY", "BUY", "HOLD", "REDUCE", "SELL",
+)
+_CANONICAL_RECO = set(CANONICAL_RECOMMENDATION_CODES)
+
+
+def _normalize_key(label: Any) -> str:
+    """Canonicalize a raw label for alias lookup."""
+    s = _safe_str(label).upper()
+    if not s:
+        return ""
+    s = s.replace("-", "_").replace(" ", "_")
+    while "__" in s:
+        s = s.replace("__", "_")
+    return s.strip("_")
 
 
 def normalize_recommendation_code(label: Any) -> str:
     """Normalize recommendation label to canonical uppercase enum.
 
-    v4.1.0: delegates to `core.reco_normalize.normalize_recommendation`
-    (the canonical source of truth across the project). Falls back to a
-    local alias table when reco_normalize is unavailable. v4.0.0 had
-    a duplicate `STRONG_BUY` literal in its mapping dict and only
-    13 entries — silently collapsed OUTPERFORM/OVERWEIGHT/UNDERPERFORM
-    to HOLD.
+    v4.1.1 resolution order (FIXES BUG #2 — STRONG_BUY collapse):
+
+      1. FAST PATH: if the normalized input is already a canonical
+         5-value code (STRONG_BUY / BUY / HOLD / REDUCE / SELL),
+         return it as-is. This is the primary path when this function
+         receives values that `compute_recommendation` produced.
+
+      2. LOCAL ALIAS TABLE: try to resolve via the local 22-entry
+         alias table. Covers display labels ("Strong Buy", "Accumulate"),
+         broker-speak ("Outperform", "Overweight"), and several
+         synonyms ("Avoid", "Exit", "Trim"). This path correctly
+         preserves STRONG_BUY for inputs like "Strong Buy",
+         "STRONGBUY", "Conviction Buy", "Top Pick".
+
+      3. RECO_NORMALIZE DELEGATION: only reached for inputs that match
+         neither the canonical set nor the local aliases. At this point,
+         reco_normalize's 4-value collapsed vocab is acceptable because
+         the input was non-canonical to begin with — downgrading an
+         unknown "accumulate strongly" to BUY is the correct behavior.
+
+      4. Default to HOLD if all three fail.
+
+    This ordering fixes v4.1.0's BUG: previously reco_normalize was
+    tried FIRST, and since it canonicalizes STRONG_BUY → BUY (matching
+    agency ratings), every STRONG_BUY from the scoring engine was
+    silently demoted to BUY before reaching the sheet.
     """
-    # Try the authoritative normalizer first
+    # Step 1: canonical fast path
+    key = _normalize_key(label)
+    if not key:
+        return "HOLD"
+    if key in _CANONICAL_RECO:
+        return key
+
+    # Step 2: local alias table
+    if key in _LOCAL_RECO_ALIASES:
+        return _LOCAL_RECO_ALIASES[key]
+
+    # Step 3: delegate to reco_normalize for unknown inputs
     try:
         from core.reco_normalize import normalize_recommendation as _reco_norm  # noqa: WPS433
         normalized = _reco_norm(label)
         if normalized in _CANONICAL_RECO:
             return normalized
+        # reco_normalize might return a non-canonical string; try our
+        # local map on its output as a second-chance before defaulting.
+        normalized_key = _normalize_key(normalized)
+        if normalized_key in _CANONICAL_RECO:
+            return normalized_key
+        if normalized_key in _LOCAL_RECO_ALIASES:
+            return _LOCAL_RECO_ALIASES[normalized_key]
     except Exception:
         pass
 
-    # Local fallback
-    s = _safe_str(label).upper()
-    if not s:
-        return "HOLD"
-
-    s = s.replace("-", "_").replace(" ", "_")
-    while "__" in s:
-        s = s.replace("__", "_")
-    s = s.strip("_")
-
-    return _LOCAL_RECO_ALIASES.get(s, "HOLD")
+    # Step 4: default
+    return "HOLD"
 
 
 # =============================================================================
@@ -1420,22 +1366,10 @@ def normalize_recommendation_code(label: Any) -> str:
 # =============================================================================
 
 def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
-    """
-    Main entrypoint for score computation.
-
-    Returns a patch dict to merge into the row.
-
-    Args:
-        row: Input data row
-        settings: Optional settings object
-
-    Returns:
-        Dictionary with all computed scores
-    """
+    """Main entrypoint for score computation. Returns patch dict to merge into row."""
     source = dict(row or {})
     scoring_errors: List[str] = []
 
-    # Forecasts
     forecasts = _forecast_params_from_settings(settings)
     forecast_patch, forecast_errors = derive_forecast_patch(source, forecasts)
     scoring_errors.extend(forecast_errors)
@@ -1443,11 +1377,9 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
     working = dict(source)
     working.update({k: v for k, v in forecast_patch.items() if v is not None})
 
-    # Horizon detection
     horizon, hdays = detect_horizon(settings, working)
     weights = get_weights_for_horizon(horizon, settings)
 
-    # Component scores
     valuation = compute_valuation_score(working)
     momentum = compute_momentum_score(working)
     quality = compute_quality_score(working)
@@ -1457,7 +1389,6 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
     opportunity = compute_opportunity_score(working, valuation, momentum)
     value_score = valuation
 
-    # Technical signals
     tech_score = compute_technical_score(working)
     vol_ratio = derive_volume_ratio(working)
     drp = derive_day_range_position(working)
@@ -1465,7 +1396,6 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
     rsi_val = _get_float(working, "rsi_14", "rsi", "rsi14")
     rsi_sig = rsi_signal(rsi_val)
 
-    # Weighted overall score
     base_parts: List[Tuple[float, float]] = []
     if weights.w_technical > 0 and tech_score is not None:
         base_parts.append((weights.w_technical, tech_score / 100.0))
@@ -1500,9 +1430,6 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
         base01 *= (risk_pen * conf_pen)
         overall = _round(100.0 * _clamp(base01, 0.0, 1.0), 2)
     else:
-        # v4.1.0: mark as insufficient but don't pretend we scored 50/100.
-        # Keep overall at a nominal 50 for callers that expect a number,
-        # but flag the condition so we can override the recommendation.
         overall = 50.0
         overall_raw = 50.0
         penalty_factor = 1.0
@@ -1512,20 +1439,11 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
     rb = risk_bucket(risk)
     cb = confidence_bucket(conf01)
 
-    # v4.1.0: consistent ROI coercion with the rest of the module.
-    # v4.0.0 used `_as_fraction` here (threshold 1.5) while
-    # compute_valuation_score/compute_opportunity_score used
-    # `_as_roi_fraction` (threshold 1.0), producing different
-    # interpretations of the same raw value.
     roi3 = _as_roi_fraction(working.get("expected_roi_3m"))
     roi1 = _as_roi_fraction(working.get("expected_roi_1m"))
     roi12 = _as_roi_fraction(working.get("expected_roi_12m"))
 
     if insufficient_inputs:
-        # v4.1.0: honest recommendation when we explicitly couldn't score.
-        # v4.0.0 fell through to compute_recommendation with overall=50,
-        # which returned "REDUCE: Weak overall score (50.0)" — a confident
-        # call on data we just flagged as insufficient.
         rec, reason = "HOLD", "Insufficient scoring inputs available."
     else:
         rec, reason = compute_recommendation(
@@ -1538,7 +1456,6 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
     period_label = invest_period_label(horizon, hdays)
 
     scores = AssetScores(
-        # Component scores
         valuation_score=valuation,
         momentum_score=momentum,
         quality_score=quality,
@@ -1553,7 +1470,6 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
         overall_score=overall,
         overall_score_raw=overall_raw,
         overall_penalty_factor=penalty_factor,
-        # Technical signals
         technical_score=tech_score,
         rsi_signal=rsi_sig,
         short_term_signal=st_signal_val,
@@ -1563,10 +1479,8 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
         invest_period_label=period_label,
         horizon_label=horizon.value,
         horizon_days_effective=hdays,
-        # Recommendation
-        recommendation=normalize_recommendation_code(rec),
+        recommendation=normalize_recommendation_code(rec),  # v4.1.1: preserves STRONG_BUY
         recommendation_reason=reason,
-        # Forecasts
         forecast_price_1m=forecast_patch.get("forecast_price_1m"),
         forecast_price_3m=forecast_patch.get("forecast_price_3m"),
         forecast_price_12m=forecast_patch.get("forecast_price_12m"),
@@ -1681,12 +1595,7 @@ def score_and_rank_rows(
     key_overall: str = "overall_score",
     inplace: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Score and rank rows.
-
-    v4.1.0: per-row scoring failures are now recorded in
-    `row["scoring_errors"]` and logged at debug, instead of being
-    silently swallowed by `except Exception: pass`.
-    """
+    """Score and rank rows. Per-row errors are recorded, not swallowed."""
     prepared = list(rows) if inplace else [dict(r or {}) for r in rows]
     for row in prepared:
         try:
@@ -1707,14 +1616,11 @@ def score_and_rank_rows(
 # =============================================================================
 
 __all__ = [
-    # Version
     "__version__",
     "SCORING_VERSION",
-    # Horizon constants
     "Horizon",
     "Signal",
     "RSISignal",
-    # Core API
     "compute_scores",
     "score_row",
     "score_quote",
@@ -1722,18 +1628,15 @@ __all__ = [
     "rank_rows_by_overall",
     "assign_rank_overall",
     "score_and_rank_rows",
-    # Types
     "AssetScores",
     "ScoreWeights",
     "ScoringWeights",
     "ForecastParameters",
     "ScoringEngine",
-    # Defaults
     "DEFAULT_WEIGHTS",
     "DEFAULT_FORECASTS",
-    # Recommendation helpers
     "normalize_recommendation_code",
-    # Derived helpers
+    "CANONICAL_RECOMMENDATION_CODES",  # v4.1.1 new export
     "detect_horizon",
     "get_weights_for_horizon",
     "compute_technical_score",
@@ -1743,7 +1646,6 @@ __all__ = [
     "derive_volume_ratio",
     "derive_day_range_position",
     "invest_period_label",
-    # Exceptions
     "ScoringError",
     "InvalidHorizonError",
     "MissingDataError",
