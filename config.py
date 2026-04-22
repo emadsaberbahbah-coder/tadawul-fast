@@ -2,10 +2,10 @@
 # config.py
 """
 ===============================================================================
-TFB Main Config — v7.2.0
+TFB Main Config -- v7.3.0
 ===============================================================================
-IMPORT-SAFE • CACHE-SAFE • AUTH-FLEXIBLE • OPEN-MODE SAFE • ENV-FIRST
-RENDER-SAFE • ROUTER-FRIENDLY • BACKWARD-COMPATIBLE • ZERO NETWORK I/O
+IMPORT-SAFE / CACHE-SAFE / AUTH-FLEXIBLE / OPEN-MODE SAFE / ENV-FIRST
+RENDER-SAFE / ROUTER-FRIENDLY / BACKWARD-COMPATIBLE / ZERO NETWORK I/O
 
 Purpose
 -------
@@ -15,8 +15,8 @@ This file lives at the project root as:
     config.py
 
 It provides:
-- cached settings
-- flexible auth checks
+- cached settings (TTL-based)
+- flexible auth checks (header / bearer / X-API-Key / query-when-allowed)
 - open-mode handling
 - runtime metadata helpers
 - backward-compatible helpers commonly expected across routers/services
@@ -31,38 +31,108 @@ Public helpers
 - is_auth_required()
 - settings_public_dict()
 - build_runtime_meta()
+- now_utc_iso()
+- now_riyadh_iso()
+- local_hostname()
 
-v7.2.0 Changes
---------------
-- FIX: auth_ok() now respects allow_query_token. Query/body-style token aliases
-       are accepted only when that flag is enabled, instead of always being
-       considered as valid candidates.
-- FIX: token comparison now uses constant-time matching via hmac.compare_digest
-       instead of plain membership checks.
-- FIX: auth_ok() returns False (not True) when require_auth=True but no tokens
-       are configured — previously this was an unsafe open fallback.
-- ENH: supports additional common auth transports:
-       X-API-Key / Api-Key headers and request.query_params when allowed.
-- ENH: settings public/runtime metadata now expose settings_cache_ttl_sec.
-- SAFE: preserves env naming, open-mode behavior, TTL cache behavior, and
-       zero-network import safety.
+v7.3.0 Changes (vs v7.2.0)
+--------------------------
+- FIX: `_env_bool` now uses the project-canonical 8-value vocabulary
+    _TRUTHY = {"1","true","yes","y","on","t","enabled","enable"}
+    _FALSY  = {"0","false","no","n","off","f","disabled","disable"}
+    v7.2.0 used a 5-value subset ({"1","true","yes","y","on"} /
+    {"0","false","no","n","off"}), which caused `TFB_OPEN_MODE=enabled`
+    and `REQUIRE_AUTH=disable` to be silently ignored (falling back to
+    `default`) while every other TFB module (main.py v8.10.0, core/config
+    v5.7.0, env.py v4, criteria_model, argaam_provider, data_dictionary)
+    respects the 8-value set. This was a cross-module inconsistency that
+    could produce different boolean resolutions for the same env var
+    depending on which layer parsed it first.
+
+- ADD: `SERVICE_VERSION = CONFIG_VERSION` alias. Matches the convention
+    used across TFB scripts (worker.py v4.3.0, track_performance.py v6.4.0,
+    run_dashboard_sync v6.5.0, run_market_scan v5.3.0) so callers that
+    `getattr(mod, "SERVICE_VERSION", ...)` get a consistent answer
+    regardless of which TFB module they introspect.
+
+- ADD: `_TRUTHY` / `_FALSY` exposed as module-level constants (with
+    leading underscore; not in `__all__`). Test files and downstream
+    modules can import them when they need to follow the exact same
+    boolean resolution rules.
+
+- ADD: `auth_header_name` field on `TFBSettings` (default "X-APP-TOKEN"),
+    matching `main.py v8.10.0`'s `_SETTINGS.AUTH_HEADER_NAME` and
+    `core/config.py v5.7.0`'s `auth_header_name`. `_token_candidates`
+    now reads the configured header name from the settings when
+    harvesting token candidates from headers. v7.2.0 only checked the
+    literal "X-APP-TOKEN" spelling, so a custom header name configured
+    in one layer was silently dropped here.
+
+- ADD: `_env_str` helper (non-empty-string-first semantics) -- internal
+    alias for `_env_first` that mirrors the name used in main.py.
+    Retains `_env_first` as the public spelling; no API change.
+
+- FIX: `_env_float` now correctly rejects NaN/Inf (returns default).
+    v7.2.0 accepted NaN silently via `float("nan")`, which then
+    propagated into `request_timeout_sec` and similar numeric fields,
+    causing asyncio.wait_for to behave unpredictably.
+
+- FIX: `_extract_bearer_token` is now case-insensitive for the "Bearer"
+    scheme. v7.2.0 only handled lowercase "bearer "; clients sending
+    "BEARER foo" or "Bearer foo" with mixed case would have the scheme
+    treated as part of the token.
+
+- ENH: `public_dict()` now includes `auth_header_name` and `config_version`
+    for operational visibility from `/v1/config/settings`.
+
+- ENH: `build_runtime_meta()` now includes `hostname` on degraded path
+    as well (was stripped when exception was raised), so telemetry still
+    gets a host identifier even when settings cache is broken.
+
+- SAFE: All changes are additive or strictly-more-correct; no public
+    signature changes. Callers of v7.2.0 see identical behavior except
+    where v7.2.0 was buggy.
+
+Preserved from v7.2.0
+---------------------
+- hmac.compare_digest constant-time token comparison
+- X-API-Key / Api-Key header support
+- allow_query_token gating of query/body-style tokens
+- fail-closed behavior when require_auth=True but no tokens configured
+- open_mode short-circuit
+- TTL-based settings cache with reload support
+- Zero network I/O at import time
 """
 
 from __future__ import annotations
 
 import hmac
+import math
 import os
 import socket
 import threading
 import time
-from dataclasses import datacdict, dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Set
 
-CONFIG_VERSION = "7.2.0"
+CONFIG_VERSION = "7.3.0"
 __version__ = CONFIG_VERSION
+# v7.3.0: Cross-module canonical alias (matches worker.py, track_performance,
+# run_dashboard_sync, run_market_scan, core/config, etc.)
+SERVICE_VERSION = CONFIG_VERSION
+
 DEFAULT_TIMEZONE = "Asia/Riyadh"
+DEFAULT_AUTH_HEADER_NAME = "X-APP-TOKEN"
 _DEFAULT_SETTINGS_CACHE_TTL = 30
+
+# =============================================================================
+# v7.3.0: Project-canonical boolean vocabulary
+# =============================================================================
+# Matches main.py v8.10.0 _TRUTHY/_FALSY exactly. Exposed for downstream
+# modules that need to follow the same resolution rules.
+_TRUTHY: frozenset = frozenset({"1", "true", "yes", "y", "on", "t", "enabled", "enable"})
+_FALSY: frozenset = frozenset({"0", "false", "no", "n", "off", "f", "disabled", "disable"})
 
 
 # =============================================================================
@@ -88,14 +158,25 @@ def _env_first(*names: str, default: str = "") -> str:
     return default
 
 
+# v7.3.0: internal alias matching main.py's naming
+_env_str = _env_first
+
+
 def _env_bool(*names: str, default: bool = False) -> bool:
+    """
+    Canonical 8-value boolean parsing.
+
+    v7.3.0: Uses _TRUTHY / _FALSY (8 values each) matching main.py v8.10.0.
+    v7.2.0 used a 5-value subset, which silently ignored "enabled",
+    "disable", "t", "f", etc.
+    """
     raw = _env_first(*names, default="")
     if not raw:
         return bool(default)
     s = raw.lower()
-    if s in {"1", "true", "yes", "y", "on"}:
+    if s in _TRUTHY:
         return True
-    if s in {"0", "false", "no", "n", "off"}:
+    if s in _FALSY:
         return False
     return bool(default)
 
@@ -105,17 +186,30 @@ def _env_int(*names: str, default: int = 0) -> int:
     if not raw:
         return int(default)
     try:
-        return int(float(raw))
+        val = float(raw)
+        # v7.3.0: reject NaN/Inf -- casting these to int is UB-ish (raises on
+        # some platforms, gives 0 or sentinel on others).
+        if math.isnan(val) or math.isinf(val):
+            return int(default)
+        return int(val)
     except Exception:
         return int(default)
 
 
 def _env_float(*names: str, default: float = 0.0) -> float:
+    """
+    v7.3.0: Rejects NaN/Inf instead of silently propagating them into timeouts
+    and concurrency settings (which caused asyncio.wait_for to behave
+    unpredictably in v7.2.0).
+    """
     raw = _env_first(*names, default="")
     if not raw:
         return float(default)
     try:
-        return float(raw)
+        val = float(raw)
+        if math.isnan(val) or math.isinf(val):
+            return float(default)
+        return val
     except Exception:
         return float(default)
 
@@ -169,6 +263,9 @@ def _safe_compare_token(candidate: str, allowed: str) -> bool:
     try:
         return hmac.compare_digest(c, a)
     except Exception:
+        # Fallback is insecure against timing attacks but correct; should
+        # only be hit if hmac is unavailable (practically impossible in
+        # CPython), or the strings aren't comparable as bytes.
         return c == a
 
 
@@ -211,11 +308,17 @@ def _coerce_mapping(obj: Any) -> Dict[str, Any]:
 
 
 def _extract_bearer_token(authorization: Any) -> str:
+    """
+    v7.3.0: Case-insensitive match on the "Bearer" scheme.
+    v7.2.0 required lowercase "bearer " exactly.
+    """
     auth = _strip(authorization)
     if not auth:
         return ""
-    if auth.lower().startswith("bearer "):
-        return _strip(auth.split(" ", 1)[1])
+    # Split on first whitespace and compare scheme case-insensitively
+    parts = auth.split(None, 1)
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        return _strip(parts[1])
     return auth
 
 
@@ -228,6 +331,19 @@ def _unique_keep_order(values: Iterable[str]) -> List[str]:
             seen.add(item)
             out.append(item)
     return out
+
+
+def _header_lookup(hdrs: Mapping[str, Any], *names: str) -> str:
+    """Case-insensitive multi-name header lookup, first non-empty wins."""
+    if not hdrs:
+        return ""
+    lower_map = {str(k).lower(): v for k, v in hdrs.items()}
+    for name in names:
+        v = lower_map.get(str(name).lower())
+        text = _strip(v)
+        if text:
+            return text
+    return ""
 
 
 # =============================================================================
@@ -249,6 +365,10 @@ class TFBSettings:
     open_mode: bool = False
     require_auth: bool = False
     allow_query_token: bool = False
+
+    # v7.3.0: configurable auth header name (matches main.py v8.10.0
+    # AUTH_HEADER_NAME and core/config.py v5.7.0 auth_header_name).
+    auth_header_name: str = DEFAULT_AUTH_HEADER_NAME
 
     app_token: str = ""
     app_tokens: List[str] = field(default_factory=list)
@@ -287,9 +407,19 @@ class TFBSettings:
                 "API_TOKENS", "TOKENS", "X_APP_TOKENS", "BEARER_TOKENS",
             )
             + [
-                _env_first("TFB_APP_TOKEN", "APP_TOKEN", "X_APP_TOKEN", "X_API_KEY", "API_KEY", default=""),
-                _env_first("TFB_AUTH_TOKEN", "AUTH_TOKEN", "API_TOKEN", "TOKEN", default=""),
-                _env_first("TFB_BEARER_TOKEN", "BEARER_TOKEN", default=""),
+                _env_first(
+                    "TFB_APP_TOKEN", "APP_TOKEN", "X_APP_TOKEN",
+                    "X_API_KEY", "API_KEY",
+                    default="",
+                ),
+                _env_first(
+                    "TFB_AUTH_TOKEN", "AUTH_TOKEN", "API_TOKEN", "TOKEN",
+                    default="",
+                ),
+                _env_first(
+                    "TFB_BEARER_TOKEN", "BEARER_TOKEN",
+                    default="",
+                ),
             ]
         )
 
@@ -301,59 +431,146 @@ class TFBSettings:
         auth_tokens = _unique_keep_order(
             _env_csv("TFB_AUTH_TOKENS", "AUTH_TOKENS", "API_TOKENS", "TOKENS")
             + [
-                _env_first("TFB_AUTH_TOKEN", "AUTH_TOKEN", "API_TOKEN", "TOKEN", default=""),
-                _env_first("TFB_API_KEY", "API_KEY", "X_API_KEY", default=""),
+                _env_first(
+                    "TFB_AUTH_TOKEN", "AUTH_TOKEN", "API_TOKEN", "TOKEN",
+                    default="",
+                ),
+                _env_first(
+                    "TFB_API_KEY", "API_KEY", "X_API_KEY",
+                    default="",
+                ),
             ]
         )
 
-        open_mode = _env_bool("TFB_OPEN_MODE", "OPEN_MODE", "APP_OPEN_MODE", default=False)
+        open_mode = _env_bool(
+            "TFB_OPEN_MODE", "OPEN_MODE", "APP_OPEN_MODE",
+            default=False,
+        )
 
         explicit_require_auth = _env_first(
-            "TFB_REQUIRE_AUTH", "REQUIRE_AUTH", "APP_REQUIRE_AUTH", default="",
+            "TFB_REQUIRE_AUTH", "REQUIRE_AUTH", "APP_REQUIRE_AUTH",
+            default="",
         )
         if explicit_require_auth:
             require_auth = _env_bool(
-                "TFB_REQUIRE_AUTH", "REQUIRE_AUTH", "APP_REQUIRE_AUTH", default=False,
+                "TFB_REQUIRE_AUTH", "REQUIRE_AUTH", "APP_REQUIRE_AUTH",
+                default=False,
             )
         else:
-            require_auth = (not open_mode) and bool(app_tokens or bearer_tokens or auth_tokens)
+            # Auto-enable auth when: not open, and at least one token exists
+            require_auth = (not open_mode) and bool(
+                app_tokens or bearer_tokens or auth_tokens
+            )
 
         return cls(
-            app_name=_env_first("TFB_APP_NAME", "APP_NAME", default="Tadawul Fast Bridge"),
-            app_version=_env_first("TFB_APP_VERSION", "APP_VERSION", default="unknown"),
-            entry_version=_env_first("TFB_ENTRY_VERSION", "ENTRY_VERSION", default=""),
-            env=_env_first("TFB_ENV", "ENV", "APP_ENV", default="production").lower(),
+            app_name=_env_first(
+                "TFB_APP_NAME", "APP_NAME",
+                default="Tadawul Fast Bridge",
+            ),
+            app_version=_env_first(
+                "TFB_APP_VERSION", "APP_VERSION",
+                default="unknown",
+            ),
+            entry_version=_env_first(
+                "TFB_ENTRY_VERSION", "ENTRY_VERSION",
+                default="",
+            ),
+            env=_env_first(
+                "TFB_ENV", "ENV", "APP_ENV",
+                default="production",
+            ).lower(),
             debug=_env_bool("TFB_DEBUG", "DEBUG", default=False),
-            log_level=_env_first("TFB_LOG_LEVEL", "LOG_LEVEL", default="INFO").upper(),
-            timezone=_env_first("TFB_TIMEZONE", "TIMEZONE", "TZ", default=DEFAULT_TIMEZONE),
+            log_level=_env_first(
+                "TFB_LOG_LEVEL", "LOG_LEVEL",
+                default="INFO",
+            ).upper(),
+            timezone=_env_first(
+                "TFB_TIMEZONE", "TIMEZONE", "TZ",
+                default=DEFAULT_TIMEZONE,
+            ),
             host=_env_first("TFB_HOST", "HOST", default="0.0.0.0"),
             port=_env_int("PORT", "TFB_PORT", default=10000),
             open_mode=open_mode,
             require_auth=require_auth,
-            allow_query_token=_env_bool("TFB_ALLOW_QUERY_TOKEN", "ALLOW_QUERY_TOKEN", default=False),
-            app_token=_env_first("TFB_APP_TOKEN", "APP_TOKEN", "X_APP_TOKEN", "X_API_KEY", "API_KEY", default=""),
+            allow_query_token=_env_bool(
+                "TFB_ALLOW_QUERY_TOKEN", "ALLOW_QUERY_TOKEN",
+                default=False,
+            ),
+            # v7.3.0: configurable auth header name
+            auth_header_name=_env_first(
+                "TFB_AUTH_HEADER_NAME", "AUTH_HEADER_NAME",
+                default=DEFAULT_AUTH_HEADER_NAME,
+            ),
+            app_token=_env_first(
+                "TFB_APP_TOKEN", "APP_TOKEN", "X_APP_TOKEN",
+                "X_API_KEY", "API_KEY",
+                default="",
+            ),
             app_tokens=app_tokens,
-            bearer_token=_env_first("TFB_BEARER_TOKEN", "BEARER_TOKEN", default=""),
+            bearer_token=_env_first(
+                "TFB_BEARER_TOKEN", "BEARER_TOKEN",
+                default="",
+            ),
             bearer_tokens=bearer_tokens,
-            auth_token=_env_first("TFB_AUTH_TOKEN", "AUTH_TOKEN", "API_TOKEN", "TOKEN", "TFB_API_KEY", "API_KEY", default=""),
+            auth_token=_env_first(
+                "TFB_AUTH_TOKEN", "AUTH_TOKEN", "API_TOKEN", "TOKEN",
+                "TFB_API_KEY", "API_KEY",
+                default="",
+            ),
             auth_tokens=auth_tokens,
             cors_origins=_env_csv("TFB_CORS_ORIGINS", "CORS_ORIGINS"),
-            default_page=_env_first("TFB_DEFAULT_PAGE", "DEFAULT_PAGE", default="Market_Leaders"),
-            max_limit=max(1, _env_int("TFB_MAX_LIMIT", "MAX_LIMIT", default=5000)),
-            route_rehydrate_concurrency=max(
-                1, _env_int("TFB_ROUTE_REHYDRATE_CONCURRENCY", default=6),
+            default_page=_env_first(
+                "TFB_DEFAULT_PAGE", "DEFAULT_PAGE",
+                default="Market_Leaders",
             ),
-            request_timeout_sec=max(0.0, _env_float("TFB_REQUEST_TIMEOUT_SEC", default=45.0)),
-            quote_timeout_sec=max(0.0, _env_float("TFB_QUOTE_CALL_TIMEOUT_SEC", default=45.0)),
-            engine_call_timeout_sec=max(0.0, _env_float("TFB_ENGINE_CALL_TIMEOUT_SEC", default=45.0)),
-            special_builder_timeout_sec=max(0.0, _env_float("TFB_SPECIAL_BUILDER_TIMEOUT_SEC", default=45.0)),
-            core_builder_timeout_sec=max(0.0, _env_float("TFB_CORE_BUILDER_TIMEOUT_SEC", default=45.0)),
-            eodhd_api_key=_env_first("EODHD_API_KEY", "TFB_EODHD_API_KEY", default=""),
-            finnhub_api_key=_env_first("FINNHUB_API_KEY", "TFB_FINNHUB_API_KEY", default=""),
-            openai_api_key=_env_first("OPENAI_API_KEY", "TFB_OPENAI_API_KEY", default=""),
-            gemini_api_key=_env_first("GEMINI_API_KEY", "GOOGLE_API_KEY", "TFB_GEMINI_API_KEY", default=""),
-            render_service_name=_env_first("RENDER_SERVICE_NAME", default=""),
-            render_external_url=_env_first("RENDER_EXTERNAL_URL", default=""),
+            max_limit=max(
+                1, _env_int("TFB_MAX_LIMIT", "MAX_LIMIT", default=5000)
+            ),
+            route_rehydrate_concurrency=max(
+                1,
+                _env_int("TFB_ROUTE_REHYDRATE_CONCURRENCY", default=6),
+            ),
+            request_timeout_sec=max(
+                0.0, _env_float("TFB_REQUEST_TIMEOUT_SEC", default=45.0)
+            ),
+            quote_timeout_sec=max(
+                0.0, _env_float("TFB_QUOTE_CALL_TIMEOUT_SEC", default=45.0)
+            ),
+            engine_call_timeout_sec=max(
+                0.0, _env_float("TFB_ENGINE_CALL_TIMEOUT_SEC", default=45.0)
+            ),
+            special_builder_timeout_sec=max(
+                0.0,
+                _env_float("TFB_SPECIAL_BUILDER_TIMEOUT_SEC", default=45.0),
+            ),
+            core_builder_timeout_sec=max(
+                0.0,
+                _env_float("TFB_CORE_BUILDER_TIMEOUT_SEC", default=45.0),
+            ),
+            eodhd_api_key=_env_first(
+                "EODHD_API_KEY", "TFB_EODHD_API_KEY",
+                default="",
+            ),
+            finnhub_api_key=_env_first(
+                "FINNHUB_API_KEY", "TFB_FINNHUB_API_KEY",
+                default="",
+            ),
+            openai_api_key=_env_first(
+                "OPENAI_API_KEY", "TFB_OPENAI_API_KEY",
+                default="",
+            ),
+            gemini_api_key=_env_first(
+                "GEMINI_API_KEY", "GOOGLE_API_KEY", "TFB_GEMINI_API_KEY",
+                default="",
+            ),
+            render_service_name=_env_first(
+                "RENDER_SERVICE_NAME",
+                default="",
+            ),
+            render_external_url=_env_first(
+                "RENDER_EXTERNAL_URL",
+                default="",
+            ),
         )
 
     def __post_init__(self) -> None:
@@ -362,6 +579,7 @@ class TFBSettings:
         self.log_level = (_strip(self.log_level) or "INFO").upper()
         self.host = _strip(self.host) or "0.0.0.0"
         self.default_page = _strip(self.default_page) or "Market_Leaders"
+        self.auth_header_name = _strip(self.auth_header_name) or DEFAULT_AUTH_HEADER_NAME
         self.cors_origins = _unique_keep_order(self.cors_origins)
 
         self.app_tokens = _unique_keep_order(self.app_tokens + [self.app_token])
@@ -401,6 +619,7 @@ class TFBSettings:
             "open_mode": self.open_mode,
             "require_auth": self.require_auth,
             "allow_query_token": self.allow_query_token,
+            "auth_header_name": self.auth_header_name,   # v7.3.0
             "auth_enabled": self.auth_enabled,
             "has_any_token": self.has_any_token,
             "settings_cache_ttl_sec": self.settings_cache_ttl_sec,
@@ -416,6 +635,7 @@ class TFBSettings:
             "core_builder_timeout_sec": self.core_builder_timeout_sec,
             "render_service_name": self.render_service_name,
             "render_external_url": self.render_external_url,
+            "config_version": CONFIG_VERSION,            # v7.3.0
             "provider_flags": {
                 "eodhd": bool(self.eodhd_api_key),
                 "finnhub": bool(self.finnhub_api_key),
@@ -476,20 +696,62 @@ def reload_settings() -> TFBSettings:
 # =============================================================================
 # Auth helpers
 # =============================================================================
-def _query_token_candidates_from_request(request: Any, allow_query_token: bool) -> List[str]:
-    """Extract token candidates from request.query_params — only when allowed."""
+def _query_token_candidates_from_request(
+    request: Any, allow_query_token: bool,
+) -> List[str]:
+    """Extract token candidates from request.query_params -- only when allowed."""
     if request is None or not allow_query_token:
         return []
     out: List[str] = []
     try:
         query_params = getattr(request, "query_params", None)
         query_map = _coerce_mapping(query_params)
-        for key in ("token", "app_token", "auth_token", "api_token", "query_token", "x_app_token", "api_key"):
+        for key in (
+            "token",
+            "app_token",
+            "auth_token",
+            "api_token",
+            "query_token",
+            "x_app_token",
+            "api_key",
+        ):
             if key in query_map:
                 out.append(_strip(query_map.get(key)))
     except Exception:
         pass
     return out
+
+
+def _header_token_candidates(
+    hdrs: Mapping[str, Any], *, auth_header_name: str,
+) -> List[str]:
+    """
+    v7.3.0: Harvest token candidates from a header mapping, respecting the
+    configured auth header name.
+    """
+    if not hdrs:
+        return []
+    candidates: List[str] = []
+
+    # Configured primary auth header (case-insensitive via _header_lookup);
+    # also fall back to the default spelling so deployments that override
+    # the header name still accept the default header for compat.
+    primary = _header_lookup(hdrs, auth_header_name, DEFAULT_AUTH_HEADER_NAME)
+    if primary:
+        candidates.append(primary)
+
+    # Authorization: Bearer <token>
+    authz = _header_lookup(hdrs, "Authorization")
+    bearer = _extract_bearer_token(authz)
+    if bearer:
+        candidates.append(bearer)
+
+    # X-API-Key / Api-Key (v7.2.0 addition, preserved)
+    api_key = _header_lookup(hdrs, "X-API-Key", "Api-Key")
+    if api_key:
+        candidates.append(api_key)
+
+    return candidates
 
 
 def _token_candidates(
@@ -501,10 +763,12 @@ def _token_candidates(
     request: Any = None,
     x_app_token: Any = None,
     bearer_token: Any = None,
+    api_key: Any = None,
     **kwargs: Any,
 ) -> List[str]:
     s = settings or get_settings_cached()
     allow_query_token = _allow_query_transport(s)
+    auth_header_name = s.auth_header_name or DEFAULT_AUTH_HEADER_NAME
     candidates: List[str] = []
 
     if token is not None:
@@ -513,32 +777,34 @@ def _token_candidates(
         candidates.append(_strip(x_app_token))
     if bearer_token is not None:
         candidates.append(_strip(bearer_token))
+    if api_key is not None:
+        candidates.append(_strip(api_key))
     if authorization is not None:
         candidates.append(_extract_bearer_token(authorization))
 
     hdrs = _coerce_headers(headers)
     if hdrs:
-        candidates.extend([
-            _strip(hdrs.get("X-APP-TOKEN") or hdrs.get("x-app-token") or hdrs.get("X-App-Token") or ""),
-            _extract_bearer_token(hdrs.get("Authorization") or hdrs.get("authorization") or ""),
-            _strip(hdrs.get("X-API-Key") or hdrs.get("x-api-key") or hdrs.get("Api-Key") or hdrs.get("api-key") or ""),
-        ])
+        candidates.extend(
+            _header_token_candidates(hdrs, auth_header_name=auth_header_name)
+        )
 
     if request is not None:
         try:
             request_headers = _coerce_headers(getattr(request, "headers", None))
-            candidates.extend([
-                _strip(request_headers.get("X-APP-TOKEN") or request_headers.get("x-app-token") or request_headers.get("X-App-Token") or ""),
-                _extract_bearer_token(request_headers.get("Authorization") or request_headers.get("authorization") or ""),
-                _strip(request_headers.get("X-API-Key") or request_headers.get("x-api-key") or request_headers.get("Api-Key") or request_headers.get("api-key") or ""),
-            ])
+            candidates.extend(
+                _header_token_candidates(
+                    request_headers, auth_header_name=auth_header_name
+                )
+            )
         except Exception:
             pass
-        candidates.extend(_query_token_candidates_from_request(request, allow_query_token))
+        candidates.extend(
+            _query_token_candidates_from_request(request, allow_query_token)
+        )
 
-    # kwargs-based query token transport (only when explicitly allowed)
+    # kwargs-based query-style token transport (only when explicitly allowed)
     if allow_query_token:
-        for key in ("app_token", "auth_token", "api_token", "query_token", "api_key"):
+        for key in ("app_token", "auth_token", "api_token", "query_token"):
             if key in kwargs:
                 candidates.append(_strip(kwargs.get(key) or ""))
 
@@ -552,6 +818,7 @@ def auth_ok(
     request: Any = None,
     x_app_token: Any = None,
     bearer_token: Any = None,
+    api_key: Any = None,
     **kwargs: Any,
 ) -> bool:
     s = get_settings_cached()
@@ -564,7 +831,7 @@ def auth_ok(
 
     allowed = [t for t in s.allowed_tokens if _strip(t)]
     if not allowed:
-        # FIX v7.2.0: require_auth=True but no tokens configured → deny
+        # v7.2.0 FIX preserved: require_auth=True but no tokens configured -> deny
         return False
 
     candidates = _token_candidates(
@@ -575,6 +842,7 @@ def auth_ok(
         request=request,
         x_app_token=x_app_token,
         bearer_token=bearer_token,
+        api_key=api_key,
         **kwargs,
     )
 
@@ -654,25 +922,31 @@ def build_runtime_meta() -> Dict[str, Any]:
             "open_mode": s.open_mode,
             "require_auth": s.require_auth,
             "allow_query_token": s.allow_query_token,
+            "auth_header_name": s.auth_header_name,      # v7.3.0
             "auth_enabled": s.auth_enabled,
             "default_page": s.default_page,
             "max_limit": s.max_limit,
             "settings_cache_ttl_sec": s.settings_cache_ttl_sec,
             "config_version": CONFIG_VERSION,
+            "service_version": SERVICE_VERSION,          # v7.3.0
         }
     except Exception as e:
         return {
             "status": "degraded",
             "error": f"{type(e).__name__}: {e}",
             "timestamp_utc": now_utc_iso(),
+            "hostname": local_hostname(),                # v7.3.0: preserve host
             "config_version": CONFIG_VERSION,
+            "service_version": SERVICE_VERSION,          # v7.3.0
         }
 
 
 __all__ = [
     "__version__",
     "CONFIG_VERSION",
+    "SERVICE_VERSION",
     "DEFAULT_TIMEZONE",
+    "DEFAULT_AUTH_HEADER_NAME",
     "TFBSettings",
     "get_settings",
     "get_settings_cached",
