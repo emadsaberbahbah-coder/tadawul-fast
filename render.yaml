@@ -1,51 +1,12 @@
 # ============================================================================
-# TADAWUL FAST BRIDGE -- RENDER BLUEPRINT (v1.1.0)
+# TADAWUL FAST BRIDGE -- RENDER BLUEPRINT (v1.1.1)
 # ============================================================================
-# Aligned with:
-#   - main.py v8.11.1        (SERVICE_VERSION, LOG_JSON reader, canonical auth)
-#   - config.py v7.3.0       (8-value _TRUTHY/_FALSY, auth env vars)
-#   - env.py v7.8.1          (feature flags, cache backend, percent mode)
-#   - worker.py v4.3.0       (SERVICE_VERSION cross-module alias)
-#   - Procfile, start_web.sh (canonical entrypoints)
-#
-# Changes vs v1.0.0 (uploaded baseline)
-# --------------------------------------
-#   [CRITICAL] JSON_LOGS -> LOG_JSON (main.py/config.py read LOG_JSON, the old
-#              name silently did NOTHING).
-#   [CRITICAL] GOOGLE_SERVICE_ACCOUNT_JSON -> GOOGLE_SHEETS_CREDENTIALS
-#              (env.py v7.8.1 doesn't recognize the old name; Google Sheets
-#              auth was failing silently). See migration notes at end.
-#   [CRITICAL] Added FUNDAMENTALS_ENABLED="true". Default in env.py is False;
-#              unset means all P/E, Market Cap, Sector, ROE columns render as
-#              blank in Google Sheets output.
-#   [HIGH]     Added CACHE_BACKEND=redis. Default is "memory"; with Redis
-#              provisioned but the flag unset, the service paid for Redis but
-#              never used it.
-#   [HIGH]     Added SERVICE_VERSION (cross-module canonical alias).
-#   [MEDIUM]   Made COMPUTATIONS/SCORING/TECHNICALS/FORECASTING explicit
-#              (defaults already true but explicit = audit-friendly).
-#   [MEDIUM]   Added TFB_PERCENT_MODE=points explicit.
-#   [MEDIUM]   Added DEFAULT_SPREADSHEET_ID (sync:false).
-#   [MEDIUM]   Added buildFilter to skip rebuilds on docs-only changes.
-#   [LOW]      Added AUTH_HEADER_NAME explicit.
-#   [LOW]      Added BACKUP_APP_TOKEN (sync:false) for zero-downtime rotation.
-#   [LOW]      Added APP_VERSION to match SERVICE_VERSION.
-#   [LOW]      Added PRESTART_MOUNT_ROUTES / INIT_ENGINE_ON_BOOT explicit.
-#   [LOW]      Added ROUTES_STRICT_IMPORT=false (explicit default; flip to
-#              "true" once you've verified all routes mount cleanly).
-#   [INFO]     Added header comment block + inline section comments.
-#
-# Preserved from v1.0.0
-# ---------------------
-#   - Redis keyvalue service (Frankfurt, starter plan, allkeys-lru)
-#   - Web service (python runtime, Frankfurt, starter plan, main branch)
-#   - Build command (pip upgrade + install + chmod +x)
-#   - startCommand: ./scripts/start_web.sh
-#   - healthCheckPath: /readyz
-#   - autoDeployTrigger: commit
-#   - Redis URL/host/port wired via fromService
-#   - All sync:false secrets (APP_TOKEN, API keys)
-#   - PYTHONUNBUFFERED, PIP_NO_CACHE_DIR, WEB_CONCURRENCY, GUNICORN_* tuning
+# Revised notes
+# -------------
+# - Keeps your current Render-safe deployment structure
+# - Preserves Redis wiring, startup command, health check, and feature flags
+# - Keeps LOG_JSON and GOOGLE_SHEETS_CREDENTIALS naming aligned
+# - No structural issue found here; main deploy blocker was requirements.txt
 # ============================================================================
 
 previews:
@@ -54,7 +15,7 @@ previews:
 services:
 
   # --------------------------------------------------------------------------
-  # Redis keyvalue store (used by cache backend + deduplication)
+  # Redis keyvalue store
   # --------------------------------------------------------------------------
   - type: keyvalue
     name: tadawul-fast-bridge-redis
@@ -64,7 +25,7 @@ services:
     maxmemoryPolicy: allkeys-lru
 
   # --------------------------------------------------------------------------
-  # Web service -- FastAPI entrypoint (main.py)
+  # Web service
   # --------------------------------------------------------------------------
   - type: web
     name: tadawul-fast-bridge
@@ -75,8 +36,6 @@ services:
     rootDir: .
     autoDeployTrigger: commit
 
-    # v1.1.0: skip rebuilds on docs-only + example-file commits to save
-    # build minutes and deploy time.
     buildFilter:
       paths:
         - "**/*.py"
@@ -111,7 +70,6 @@ services:
     healthCheckPath: /readyz
 
     envVars:
-
       # ----------------------------------------------------------------------
       # Core app identity
       # ----------------------------------------------------------------------
@@ -121,9 +79,6 @@ services:
         value: Tadawul Fast Bridge
       - key: APP_VERSION
         value: "8.11.1"
-      # v1.1.0: cross-module canonical alias (main.py v8.11.1, config.py v7.3.0,
-      # env.py v7.8.1, worker.py v4.3.0). env.py from_env() reads this as a
-      # fallback for APP_VERSION too.
       - key: SERVICE_VERSION
         value: "8.11.1"
       - key: TZ
@@ -140,7 +95,7 @@ services:
         value: "1"
 
       # ----------------------------------------------------------------------
-      # Logging (v1.1.0 FIX: JSON_LOGS -> LOG_JSON)
+      # Logging
       # ----------------------------------------------------------------------
       - key: LOG_LEVEL
         value: INFO
@@ -148,7 +103,7 @@ services:
         value: "true"
 
       # ----------------------------------------------------------------------
-      # Gunicorn / Uvicorn concurrency
+      # Gunicorn / Uvicorn
       # ----------------------------------------------------------------------
       - key: WEB_CONCURRENCY
         value: "2"
@@ -158,7 +113,7 @@ services:
         value: "30"
 
       # ----------------------------------------------------------------------
-      # Redis connection (auto-populated from the keyvalue service above)
+      # Redis connection
       # ----------------------------------------------------------------------
       - key: REDIS_URL
         fromService:
@@ -175,19 +130,12 @@ services:
           type: keyvalue
           name: tadawul-fast-bridge-redis
           property: port
-
-      # v1.1.0: use Redis for the app cache since it's provisioned above.
-      # env.py v7.8.1 validate() warns if CACHE_BACKEND=redis but REDIS_URL
-      # is missing, so this pairing is the explicit-correct setup.
       - key: CACHE_BACKEND
         value: redis
 
       # ----------------------------------------------------------------------
-      # Feature flags (v1.1.0: explicit values per env.py v7.8.1 audit)
+      # Feature flags
       # ----------------------------------------------------------------------
-      # CRITICAL: FUNDAMENTALS_ENABLED default is False in env.py. Without
-      # this set to "true", all fundamentals (P/E, Market Cap, Sector, ROE,
-      # etc.) render as BLANK in Google Sheets output.
       - key: FUNDAMENTALS_ENABLED
         value: "true"
       - key: COMPUTATIONS_ENABLED
@@ -204,14 +152,11 @@ services:
         value: "true"
       - key: ADVISOR_ENABLED
         value: "true"
-
-      # Percent display format used by setup_sheet_headers v1 +
-      # downstream sheet rendering. "points" (e.g., 125) vs "fraction" (1.25).
       - key: TFB_PERCENT_MODE
         value: points
 
       # ----------------------------------------------------------------------
-      # Rate limiting + HTTP tuning (explicit defaults for audit)
+      # Rate limiting + HTTP tuning
       # ----------------------------------------------------------------------
       - key: RATE_LIMIT_ENABLED
         value: "true"
@@ -221,15 +166,12 @@ services:
         value: "45"
 
       # ----------------------------------------------------------------------
-      # FastAPI entrypoint behavior (main.py v8.11.1)
+      # FastAPI entrypoint behavior
       # ----------------------------------------------------------------------
       - key: PRESTART_MOUNT_ROUTES
         value: "true"
       - key: INIT_ENGINE_ON_BOOT
         value: "true"
-      # Flip to "true" once you've verified all route modules mount cleanly
-      # on a previous deploy. Leaving "false" keeps boots non-fatal on route
-      # mounting edge cases.
       - key: INIT_ENGINE_STRICT
         value: "false"
       - key: ROUTES_STRICT_IMPORT
@@ -252,13 +194,11 @@ services:
         value: "false"
       - key: APP_TOKEN
         sync: false
-      # Optional rotation token -- both APP_TOKEN and BACKUP_APP_TOKEN are
-      # accepted simultaneously, enabling zero-downtime key rotation.
       - key: BACKUP_APP_TOKEN
         sync: false
 
       # ----------------------------------------------------------------------
-      # Provider API keys (all sync:false -- set in the Render dashboard)
+      # Provider API keys
       # ----------------------------------------------------------------------
       - key: EODHD_API_KEY
         sync: false
@@ -266,50 +206,23 @@ services:
         sync: false
       - key: ALPHA_VANTAGE_API_KEY
         sync: false
-      # Optional additional providers (env.py auto-detects ENABLED_PROVIDERS
-      # based on which keys are present; no need to set ENABLED_PROVIDERS
-      # explicitly unless you want a specific order).
-      # - key: FMP_API_KEY
-      #   sync: false
-      # - key: TWELVEDATA_API_KEY
-      #   sync: false
-      # - key: MARKETSTACK_API_KEY
-      #   sync: false
-
-      # KSA-region providers (auto-detected if URLs are set)
-      # - key: ARGAAM_QUOTE_URL
-      #   sync: false
-      # - key: TADAWUL_QUOTE_URL
-      #   sync: false
 
       # ----------------------------------------------------------------------
-      # OpenAI (currently unused by any TFB module -- kept for future work)
+      # OpenAI
       # ----------------------------------------------------------------------
       - key: OPENAI_API_KEY
         sync: false
 
       # ----------------------------------------------------------------------
       # Google Sheets integration
-      # (v1.1.0 FIX: GOOGLE_SERVICE_ACCOUNT_JSON -> GOOGLE_SHEETS_CREDENTIALS)
-      # env.py v7.8.1 resolve_google_credentials() accepts these keys:
-      #   GOOGLE_CREDENTIALS_DICT, GOOGLE_SHEETS_CREDENTIALS, GOOGLE_CREDENTIALS,
-      #   GOOGLE_SHEETS_CREDENTIALS_B64, GOOGLE_CREDENTIALS_B64,
-      #   GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_SHEETS_CREDENTIALS_FILE,
-      #   GOOGLE_CREDENTIALS_FILE.
-      # `GOOGLE_SERVICE_ACCOUNT_JSON` (old v1.0.0 name) was NOT in the list,
-      # so Google auth was failing silently.
       # ----------------------------------------------------------------------
       - key: GOOGLE_SHEETS_CREDENTIALS
         sync: false
       - key: DEFAULT_SPREADSHEET_ID
         sync: false
-      # Optional Apps Script webhook (for push-style sheet updates)
-      # - key: GOOGLE_APPS_SCRIPT_URL
-      #   sync: false
 
       # ----------------------------------------------------------------------
-      # CORS (empty = closed; set to "*" via ENABLE_CORS_ALL_ORIGINS=true if
-      # you need browser access from other origins)
+      # CORS
       # ----------------------------------------------------------------------
       - key: ENABLE_CORS_ALL_ORIGINS
         value: "false"
