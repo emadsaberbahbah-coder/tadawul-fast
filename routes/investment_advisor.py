@@ -2,7 +2,7 @@
 """
 routes/investment_advisor.py
 --------------------------------------------------------------------------------
-ADVANCED TOP10 / INVESTMENT ADVISOR ROUTER — v5.2.0
+ADVANCED TOP10 / INVESTMENT ADVISOR ROUTER — v5.2.1
 --------------------------------------------------------------------------------
 CANONICAL ADVANCED OWNER • ADVANCED SHEET-ROWS OWNER • STABILITY-FIRST
 TIMEOUT-GUARDED • SCHEMA-FIRST • TOP10-FIELD-HARDENED • DELEGATION SAFE
@@ -29,46 +29,51 @@ module declares MUST start with one of:
     /v1/investment-advisor
 Otherwise they get filtered out by `_clone_filtered_router`.
 
-Why this revision (v5.2.0 vs v5.1.0)
+Why this revision (v5.2.1 vs v5.2.0)
 ------------------------------------
-- FIX: `_require_auth_or_401` now matches the project-wide flexible auth
-       dispatch pattern — 6-level signature fallback that includes `path`,
-       `request`, `settings`, `api_key`. Matches
-       `main._call_auth_ok_flexible`, `analysis_sheet_rows._auth_passed`,
-       `data_dictionary._auth_passed`, `config._call_auth_ok_flexible`.
-       v5.1.0 had only a 3-level dispatch and couldn't pass `request`/`path`,
-       which made it brittle against modern `core.config.auth_ok`.
-- FIX: delegate resolution is now lazy + cached via `_resolve_delegate()`.
-       Previously the module-level `try: from routes.advanced_analysis import
-       _run_advanced_sheet_rows_impl` captured None if the order-of-imports
-       was unlucky (e.g. reloaded in tests). Now a missed import is retried
-       at the next call.
-- FIX: `_get_engine` now checks the full engine-state chain
-       (`engine`, `data_engine`, `quote_engine`, `cache_engine`) matching
-       `analysis_sheet_rows`, `enriched_quote`, `advisor`. v5.1.0 only
-       checked `engine`.
-- FIX: `_coerce_bool` now matches the project-wide _TRUTHY/_FALSY sets used
-       in main.py — adds `t`, `f`, `enabled`, `disabled`.
-- FIX: `_load_top10_builder` now tries multiple module paths
-       (`core.analysis.top10_selector` → `core.selectors.top10_selector` →
-       `core.top10_selector` → `top10_selector`) with caching.
-       v5.1.0 hard-imported a single path.
-- FIX: `/health` and root responses now expose `route_owner`,
-       `route_family`, `timestamp_utc`, `request_id` — consistent with other
-       revised routers (config v5.9.0, data_dictionary v2.7.0, analysis
-       v4.1.0) and aids `main`'s canonical-path owner diagnostics.
-- FIX: `/health` now reports `delegate_import_error` when the
-       advanced_analysis delegate is unavailable — aids operator diagnosis.
-- FIX: Top10 endpoint meta now includes `route_owner`, `route_family` for
-       consistency with the delegated sheet-rows path.
-- KEEP: all existing advanced sheet-rows endpoints delegate to
-       `routes.advanced_analysis._run_advanced_sheet_rows_impl` (which
-       handles its own auth, so these endpoints don't need a separate
-       `_require_auth_or_401` call).
-- KEEP: full Top10/advisor local logic — selector, fallback retry, criteria
-       preparation, schema projection, timeout guards.
-- KEEP: `inspect.isawaitable` for coroutine detection (replaces v5.1.0's
-       `hasattr(..., "__await__")` for consistency).
+- FIX [MEDIUM]: `_delegate_advanced_sheet_rows` error envelope when the
+  advanced_analysis delegate is unavailable now carries the full
+  schema-stub shape (headers/keys/rows/rows_matrix/row_objects/count/
+  meta/request_id). v5.2.0 returned a partial envelope with just
+  {status, error, detail, route_family, route_owner, version,
+  timestamp_utc, advanced_delegate_import_error} — missing the
+  schema-first fields that every Apps Script parser downstream depends
+  on. Apps Script code written against the canonical envelope shape
+  (e.g. 05_Refresh.gs v1.5.0's payload validation) would trip on the
+  missing `headers`/`keys`/`rows` fields and either throw or produce
+  a blank sheet with no diagnostic context. v5.2.1 now returns an
+  envelope that matches the shape returned by the delegate on its
+  own partial/degraded paths — so downstream consumers get a
+  uniform contract regardless of whether the delegate was reachable.
+  The error surface (status="error", meta.dispatch="delegate_unavailable",
+  plus advanced_delegate_import_error) is preserved so diagnostics
+  still bubble up.
+
+- FIX [LOW]: `_resolve_delegate` probe-order docstring no longer
+  misleads. v5.2.0's comment claimed the FIRST probe
+  (`routes.advanced_analysis`) should succeed in this project, but
+  the actual repo layout ships only `routes.advanced_sheet_rows`
+  (no `advanced_analysis` module). The docstring now accurately
+  describes both probe paths and explains the historical reason
+  for the dual probe (legacy deploys vs current repo layout).
+
+- KEEP: all v5.2.0 improvements:
+    - 6-level flexible auth dispatch in `_require_auth_or_401`
+    - Lazy + cached delegate resolution (retry-on-miss)
+    - `_get_engine` full engine-state chain
+    - `_coerce_bool` aligned with project-wide _TRUTHY/_FALSY sets
+    - Multi-path Top10 builder loading
+    - /health reports `delegate_import_error` when delegate unavailable
+    - Top10 endpoint meta includes route_owner/route_family
+    - `inspect.isawaitable` for coroutine detection
+
+v5.2.0 notes (preserved)
+------------------------
+- All existing advanced sheet-rows endpoints delegate to the advanced
+  analysis implementation (which handles its own auth, so these
+  endpoints don't need a separate `_require_auth_or_401` call).
+- Full Top10/advisor local logic — selector, fallback retry,
+  criteria preparation, schema projection, timeout guards.
 
 Primary endpoints
 -----------------
@@ -111,7 +116,7 @@ from fastapi.encoders import jsonable_encoder
 logger = logging.getLogger("routes.investment_advisor")
 logger.addHandler(logging.NullHandler())
 
-INVESTMENT_ADVISOR_VERSION = "5.2.0"
+INVESTMENT_ADVISOR_VERSION = "5.2.1"
 ROUTE_OWNER_NAME = "investment_advisor"
 ROUTE_FAMILY_NAME = "advanced"
 TOP10_PAGE_NAME = "Top_10_Investments"
@@ -281,7 +286,7 @@ def _require_auth_or_401(
 
 
 # =============================================================================
-# Lazy + cached delegate resolution (routes.advanced_analysis)
+# Lazy + cached delegate resolution (advanced analysis sheet-rows impl)
 # =============================================================================
 _DELEGATE_CACHE: Dict[str, Any] = {
     "impl": None,
@@ -294,9 +299,29 @@ _DELEGATE_CACHE: Dict[str, Any] = {
 
 def _resolve_delegate() -> Tuple[Optional[Any], Dict[str, str]]:
     """
-    Resolve `_run_advanced_sheet_rows_impl` from `routes.advanced_analysis`,
-    retrying at call time if an earlier attempt failed. Keeps the first
-    successful import cached.
+    Resolve `_run_advanced_sheet_rows_impl` from the advanced-analysis
+    delegate module, retrying at call time if an earlier attempt failed.
+    Keeps the first successful import cached.
+
+    v5.2.1 note — probe-order rationale (corrected from v5.2.0):
+    Two probe paths exist for historical/compat reasons:
+
+      1. `routes.advanced_analysis` — the long-form module name used
+         in OLDER deploys where the advanced_analysis feature was
+         split off as its own router. NOT present in the current
+         repo layout — this probe is preserved only to support
+         rollback deploys and legacy branches.
+
+      2. `routes.advanced_sheet_rows` — the short-form module name
+         in the CURRENT repo. Exports the same
+         `_run_advanced_sheet_rows_impl` callable with the same
+         contract. THIS is the probe that succeeds in the shipped
+         repo.
+
+    The first-probe-first order is preserved so that legacy deploys
+    that still ship `advanced_analysis` continue to resolve against
+    it; shipped/current deploys fall through to `advanced_sheet_rows`
+    and cache that binding.
     """
     cached = _DELEGATE_CACHE.get("impl")
     if callable(cached):
@@ -305,9 +330,6 @@ def _resolve_delegate() -> Tuple[Optional[Any], Dict[str, str]]:
             "delegate_callable": str(_DELEGATE_CACHE.get("callable_name") or ""),
         }
 
-    # Try a primary path first, then a couple of obvious alternatives. In
-    # practice only the first should succeed inside this project; the
-    # alternatives exist for partial-repo diagnostics.
     probe_order: Tuple[Tuple[str, str], ...] = (
         ("routes.advanced_analysis", "_run_advanced_sheet_rows_impl"),
         ("routes.advanced_sheet_rows", "_run_advanced_sheet_rows_impl"),
@@ -996,6 +1018,83 @@ def _build_get_body(
     return body
 
 
+def _delegate_unavailable_envelope(
+    *,
+    request: Optional[Request],
+    body: Dict[str, Any],
+    impl_meta: Dict[str, str],
+) -> Dict[str, Any]:
+    """
+    v5.2.1: schema-stub envelope for the delegate-unavailable case.
+
+    Returns the same envelope SHAPE as the delegate's happy/partial paths
+    (headers/keys/rows/rows_matrix/row_objects/count/meta/request_id), so
+    downstream Apps Script parsers don't trip on missing fields when they
+    receive an envelope from this error branch. Status is "error" and
+    `meta.dispatch` is `"delegate_unavailable"` — Apps Script can key off
+    those two fields to render a diagnostic message instead of silently
+    producing a blank sheet.
+
+    The error surface is preserved: `error`, `detail`, and
+    `advanced_delegate_import_error` all carry the import failure so
+    diagnostics still bubble up through the existing channels.
+    """
+    request_id = uuid.uuid4().hex[:12]
+    try:
+        if request is not None:
+            rid = _s(getattr(getattr(request, "state", None), "request_id", ""))
+            if rid:
+                request_id = rid
+    except Exception:
+        pass
+
+    page_guess = _s(body.get("page")) or _s(body.get("sheet")) or _s(body.get("sheet_name")) or ""
+    import_err = _DELEGATE_CACHE.get("import_error", "") or impl_meta.get("delegate_import_error", "")
+
+    return {
+        "status": "error",
+        "page": page_guess,
+        "sheet": page_guess,
+        "sheet_name": page_guess,
+        "route_family": ROUTE_FAMILY_NAME,
+        "route_owner": ROUTE_OWNER_NAME,
+        "headers": [],
+        "display_headers": [],
+        "keys": [],
+        "columns": [],
+        "fields": [],
+        "rows": [],
+        "rows_matrix": [],
+        "matrix": [],
+        "row_objects": [],
+        "items": [],
+        "records": [],
+        "data": [],
+        "count": 0,
+        "error": "advanced_analysis delegate unavailable",
+        "detail": import_err,
+        "version": INVESTMENT_ADVISOR_VERSION,
+        "request_id": request_id,
+        "timestamp_utc": _now_utc(),
+        "advanced_delegate_import_error": import_err,
+        "advanced_owner": "routes.investment_advisor",
+        "meta": {
+            "dispatch": "delegate_unavailable",
+            "delegate_available": False,
+            "delegate_module": "",
+            "delegate_callable": "",
+            "delegate_import_error": import_err,
+            "advanced_family_owner": "routes.investment_advisor",
+            "route_owner": ROUTE_OWNER_NAME,
+            "route_family": ROUTE_FAMILY_NAME,
+            "count": 0,
+            "row_object_count": 0,
+            "matrix_row_count": 0,
+            "timestamp_utc": _now_utc(),
+        },
+    }
+
+
 async def _delegate_advanced_sheet_rows(
     *,
     request: Request,
@@ -1011,16 +1110,14 @@ async def _delegate_advanced_sheet_rows(
     impl, impl_meta = _resolve_delegate()
 
     if impl is None:
-        return {
-            "status": "error",
-            "error": "advanced_analysis delegate unavailable",
-            "detail": _DELEGATE_CACHE.get("import_error", "") or impl_meta.get("delegate_import_error", ""),
-            "route_family": ROUTE_FAMILY_NAME,
-            "route_owner": ROUTE_OWNER_NAME,
-            "version": INVESTMENT_ADVISOR_VERSION,
-            "timestamp_utc": _now_utc(),
-            "advanced_delegate_import_error": _DELEGATE_CACHE.get("import_error", ""),
-        }
+        # v5.2.1: return full schema-stub envelope so downstream parsers
+        # don't choke on missing headers/keys/rows fields. See docstring
+        # on _delegate_unavailable_envelope for rationale.
+        return _delegate_unavailable_envelope(
+            request=request,
+            body=body,
+            impl_meta=impl_meta,
+        )
 
     payload = await impl(
         request=request,
@@ -1134,7 +1231,7 @@ async def advanced_health(request: Request) -> Dict[str, Any]:
 
 
 # =============================================================================
-# Advanced sheet-rows endpoints — delegate to routes.advanced_analysis
+# Advanced sheet-rows endpoints — delegate to advanced analysis impl
 # (auth is handled inside the delegate; no _require_auth_or_401 here)
 # =============================================================================
 @router.get("/v1/advanced/sheet-rows")
