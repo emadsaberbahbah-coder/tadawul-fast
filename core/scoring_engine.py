@@ -2,7 +2,7 @@
 # core/scoring_engine.py
 """
 ================================================================================
-Scoring Engine Compatibility Bridge -- v3.2.0
+Scoring Engine Compatibility Bridge -- v3.3.0
 (COMPATIBILITY BRIDGE / GRACEFUL-DEGRADATION / STARTUP-SAFE / LABEL-ALIGNED /
  MULTI-PATH-IMPORT / CROSS-VERSION-AWARE)
 ================================================================================
@@ -11,9 +11,10 @@ Purpose
 -------
 - Preserve the legacy ``core.scoring_engine`` import surface expected by
   tests, scripts, and older callers.
-- Delegate actual scoring logic to ``core.scoring`` (this bridge supports
-  BOTH scoring.py v2.2.0 — currently live — AND the aspirational v4.1.0
-  profile that adds horizon-aware helpers).
+- Delegate actual scoring logic to ``core.scoring`` (currently v4.1.1).
+  The bridge remains cross-version tolerant: it works against any
+  scoring.py from v2.2.0 upwards through v4.1.x and will keep working
+  if scoring.py adds more native exports in future releases.
 - Re-export recommendation normalization helpers so older callers stay
   aligned with the canonical 5-value reco vocabulary:
   ``STRONG_BUY / BUY / HOLD / REDUCE / SELL``.
@@ -23,31 +24,36 @@ Purpose
 
 Version compatibility matrix
 ----------------------------
-+-------------------------+--------------+----------------------+
-| Caller imports          | v2.2.0 live  | v4.1.0 (aspirational) |
-+-------------------------+--------------+----------------------+
-| compute_scores          |  native      |  native              |
-| enrich_with_scores      |  native      |  native              |
-| score_row / score_quote |  native      |  native              |
-| rank_rows_by_overall    |  native      |  native              |
-| assign_rank_overall     |  native      |  native              |
-| score_and_rank_rows     |  native      |  native              |
-| ScoringEngine (class)   |  native      |  native              |
-| CANONICAL reco codes    |  bridge (5)  |  native              |
-| normalize_recommendation|  reco_norm   |  native              |
-| compute_recommendation  |  bridge->_recommendation |  native  |
-| Horizon / Signal /      |  stub enums  |  native              |
-|   RSISignal             |  (v3.2.0)    |                      |
-| compute_technical_score |  None        |  native              |
-| rsi_signal              |  "N/A"       |  native              |
-| short_term_signal       |  "HOLD"      |  native              |
-| detect_horizon          |  stub        |  native              |
-| get_weights_for_horizon |  defaults    |  native              |
-| derive_upside_pct       |  None        |  native              |
-| derive_volume_ratio     |  None        |  native              |
-| derive_day_range_pos    |  None        |  native              |
-| invest_period_label     |  "1M"        |  native              |
-+-------------------------+--------------+----------------------+
++-------------------------+---------------------+----------------------+
+| Caller imports          | v2.2.0 (legacy)     | v4.1.x (current)     |
++-------------------------+---------------------+----------------------+
+| compute_scores          |  native             |  native              |
+| enrich_with_scores      |  native             |  native              |
+| score_row / score_quote |  native             |  native              |
+| rank_rows_by_overall    |  native             |  native              |
+| assign_rank_overall     |  native             |  native              |
+| score_and_rank_rows     |  native             |  native              |
+| ScoringEngine (class)   |  native             |  native              |
+| CANONICAL reco codes    |  bridge (5)         |  native              |
+| normalize_recommendation|  reco_norm delegate |  native              |
+| compute_recommendation  |  bridge->_recommendation |  native          |
+| Horizon / Signal /      |  stub enums         |  native              |
+|   RSISignal             |  (bridge-provided)  |                      |
+| compute_technical_score |  None               |  native              |
+| rsi_signal              |  "N/A"              |  native              |
+| short_term_signal       |  "HOLD"             |  native              |
+| detect_horizon          |  stub               |  native              |
+| get_weights_for_horizon |  defaults           |  native              |
+| derive_upside_pct       |  None               |  native              |
+| derive_volume_ratio     |  None               |  native              |
+| derive_day_range_pos    |  None               |  native              |
+| invest_period_label     |  "1M"               |  native              |
++-------------------------+---------------------+----------------------+
+
+Currently deployed: scoring.py v4.1.1 — every row in the matrix resolves
+to ``native`` at runtime. The "legacy" column is kept for operators who
+may need to roll back, and the bridge's fallback code below covers that
+case without a code change on this side.
 
 Degradation policy
 ------------------
@@ -57,74 +63,38 @@ import time listing degraded symbols, and (c) exposes the same list
 programmatically via ``get_degradation_report()`` so operators have
 visibility instead of mysterious blank data downstream.
 
-v3.2.0 changes (vs v3.1.0)
+v3.3.0 changes (vs v3.2.0)
 --------------------------
-- FIX HEADER: v3.1.0 header claimed "SCORING-v4.1.0-READY", which is
-  misleading when scoring.py is v2.2.0 (as in the currently-deployed
-  backend). Header and docstrings now describe the bridge as a
-  cross-version compatibility layer spanning scoring.py v2.2.0 through
-  the aspirational v4.1.0 contract.
+- DOC: Header and version matrix updated to reflect the live scoring.py
+  version (v4.1.1). v3.2.0's docstring said "scoring.py v2.2.0 —
+  currently live" which was accurate when v3.2.0 shipped but became
+  stale after scoring.py was upgraded. This revision is documentation-
+  only; no functional code changes.
+- Bump: ``SCORING_ENGINE_VERSION = "3.3.0"``.
 
-- FIX MEDIUM: ``compute_recommendation`` fallback chain extended.
-  v3.1.0 returned a hardcoded ``("HOLD", "compute_recommendation
-  unavailable")`` tuple when scoring.py didn't export
-  ``compute_recommendation`` as a public symbol. v2.2.0 happens NOT to
-  export it publicly — but it does have a PRIVATE ``_recommendation``
-  function with a 4-arg signature that matches the first four
-  positional args of the public contract. v3.2.0 now delegates to
-  ``scoring._recommendation(overall, risk, confidence100, roi3)`` as a
-  secondary fallback before surrendering to the static-HOLD tuple.
-  Result: callers on v2.2.0 now get a real risk/confidence/ROI-aware
-  recommendation instead of a stuck HOLD.
-
-- FIX MEDIUM: ``Horizon``, ``Signal``, and ``RSISignal`` are now
-  substituted with minimal stub ``Enum`` classes when scoring.py
-  doesn't export them. v3.1.0 re-exported the raw ``None`` values,
-  causing ``AttributeError`` on any caller that did
-  ``from core.scoring_engine import Horizon; Horizon.MONTH``. The
-  stubs reproduce the v4.1.0 member names so imports succeed even
-  against v2.2.0 scoring.
-
-- FIX LOW: ``_reco_delegate`` check order corrected. v3.1.0 tried
-  ``.value`` and ``.name`` attributes before checking ``isinstance(str)``.
-  ``reco_normalize__3_.py`` v5.0.0 returns a plain string, so the
-  pre-checks were dead code that fell through to the string path
-  anyway. Minor perf improvement, same semantics.
-
-- ENHANCE: Module-level validation now also requires ``ScoreWeights``
-  and ``DEFAULT_WEIGHTS``. These are needed for ``ScoringEngine``
-  class instantiation; their absence would crash downstream code.
-
-- ENHANCE: New ``get_degradation_report()`` function returns a dict
-  describing exactly which native symbols are missing, what fallbacks
-  are in effect, and the resolved scoring module name/version. Useful
-  for health endpoints and ops dashboards.
-
-- ENHANCE: Single ``logging.getLogger(__name__).info()`` call at
-  import time lists degraded symbols when any are missing. No-op when
-  all symbols are present (no log spam in healthy deploys).
-
-- Bump version: ``SCORING_ENGINE_VERSION = "3.2.0"``.
-
-Preserved from v3.1.0
----------------------
-- All public symbols in __all__.
+Preserved from v3.2.0 (unchanged)
+---------------------------------
+- All fallback implementations for v2.2.0-style scoring modules.
 - Multi-path import order: ``core.scoring`` -> ``core.sheets.scoring``
   -> ``scoring``.
 - Multi-path import for reco_normalize: ``core.reco_normalize`` ->
   ``reco_normalize``.
 - ``_as_dict`` polymorphic coercion.
 - Native ``ScoringEngine`` pass-through.
-- All function-level fallback implementations from v3.1.0.
+- ``compute_recommendation`` fallback chain: public symbol ->
+  ``_recommendation`` private -> static HOLD tuple (v3.2.0 fix).
+- ``Horizon`` / ``Signal`` / ``RSISignal`` stub enums when native ones
+  absent (v3.2.0 fix).
 - ``score_and_rank_rows`` / ``assign_rank_overall`` TypeError-retry
-  best-effort positional-arg paths (v3.1.0 fix).
+  positional-arg paths.
 - ``_fallback_normalize_recommendation_label`` delegating to
-  reco_normalize before the local alias map (v3.1.0 fix).
-- ``rank_rows_by_overall`` fallback that annotates in input order
-  (v3.1.0 fix).
+  reco_normalize before the local alias map.
+- ``rank_rows_by_overall`` fallback that annotates in input order.
 - ``CANONICAL_RECOMMENDATION_CODES = (STRONG_BUY, BUY, HOLD, REDUCE, SELL)``.
 - ``_NORMALIZE_TO_CANONICAL`` 24-entry alias map (Accumulate -> BUY,
   Watch -> HOLD, etc.).
+- ``get_degradation_report()`` + INFO log at import on missing symbols.
+- All public symbols in ``__all__``.
 ================================================================================
 """
 
@@ -252,7 +222,7 @@ def _reco_delegate(label: Any) -> Optional[str]:
 # Version Constants
 # =============================================================================
 
-SCORING_ENGINE_VERSION = "3.2.0"
+SCORING_ENGINE_VERSION = "3.3.0"
 VERSION = SCORING_ENGINE_VERSION
 __version__ = SCORING_ENGINE_VERSION
 
