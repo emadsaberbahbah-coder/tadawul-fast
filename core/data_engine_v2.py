@@ -2,41 +2,58 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — v6.1.0 (SCHEMA-ALIGNED / REGISTRY-FIRST / CANONICAL)
+Data Engine V2 — v6.1.1 (SCHEMA-ALIGNED / REGISTRY-FIRST / CANONICAL)
 ================================================================================
 Tadawul Fast Bridge (TFB)
 
-v6.1.0 — Alignment rewrite
---------------------------
-This release aligns the engine with the authoritative source-of-truth modules:
+v6.1.1 — Scoring completeness fix
+---------------------------------
+Root cause of the "scoring columns partially blank" sheet symptom:
 
+    v6.1.0's `_try_scoring_module` returned early as soon as the scorer
+    returned a dict, even when critical fields (overall_score,
+    confidence_score, recommendation) came back as None. That caused
+    rows to show Risk Score / Valuation Score populated but Overall
+    Score / Recommendation blank.
+
+Fix (surgical — one function + one constant):
+
+  * Added `_SCORING_CRITICAL_FIELDS`: the fields that MUST be populated
+    for the sheet to look healthy (overall_score, confidence_score,
+    recommendation, risk_score, valuation_score).
+  * `_try_scoring_module` now merges the scorer's non-None values as
+    before, then runs the non-destructive `_compute_scores_fallback`
+    when any critical field is still None.
+  * The fallback itself is unchanged — each branch gates on
+    `row.get(field) is None` so it cannot overwrite good values the
+    scorer produced.
+
+Net effect: rows that previously landed with partial scoring now get
+topped up. Rows that score cleanly are unaffected.
+
+No other behaviour changes in this release. All v6.1.0 alignment
+guarantees (schema_registry-first, 80-column instrument contract,
+83-column Top_10, 7-column Insights, 9-column Dictionary) are
+preserved exactly.
+
+v6.1.0 — Alignment rewrite (preserved)
+--------------------------------------
 - core.sheets.schema_registry      → single source of truth for columns
 - core.sheets.page_catalog         → single source of truth for page names
 - core.symbols_reader              → single source of truth for sheet symbols
 - core.scoring                     → single source of truth for scoring
 
-Key changes from v6.0.0:
-
-1. Schema contracts are derived from schema_registry at import time (with a
-   hardcoded fallback that matches the registry exactly). All 5 instrument
-   pages now share the canonical 80-column schema as the registry requires.
-2. Top_10_Investments is exactly 80 + 3 = 83 columns.
-3. Insights_Analysis is exactly 7 columns (section, item, symbol, metric,
-   value, notes, last_updated_riyadh) — previous 9-column shape with signal
-   and priority has been removed.
-4. Data_Dictionary stays at 9 columns (matches registry).
-5. My_Investments aliases to My_Portfolio (registry does not carry it).
-6. Sheet name canonicalization delegates to page_catalog.normalize_page_name
-   when available.
-7. Symbol resolution delegates to core.symbols_reader.SymbolsReader when
-   available, instead of looping back through the engine.
-8. Scoring patches are always merged (the previous "only fill blanks" guard
-   silently dropped scorer-owned fields such as scoring_updated_utc,
-   overall_score_raw, expected_return_*, expected_price_*).
-9. Provider callable discovery now covers *_patch variants exposed by the
-   provider shims (fetch_quote_patch, fetch_enriched_quote_patch, etc.).
-10. Public API surface is preserved — callers continue to use DataEngineV2/V3
-    /V4/V5, get_engine, get_quote, get_sheet_rows unchanged.
+Key guarantees from v6.1.0 (unchanged):
+1. Schema contracts are derived from schema_registry at import time
+2. Top_10_Investments is exactly 80 + 3 = 83 columns
+3. Insights_Analysis is exactly 7 columns
+4. Data_Dictionary stays at 9 columns
+5. My_Investments aliases to My_Portfolio
+6. Sheet name canonicalization delegates to page_catalog
+7. Symbol resolution delegates to core.symbols_reader
+8. Scoring patches are always merged
+9. Provider callable discovery covers *_patch variants
+10. Public API surface is preserved
 ================================================================================
 """
 
@@ -86,7 +103,7 @@ if str(ROOT_DIR) not in sys.path:
 # Version
 # ---------------------------------------------------------------------------
 
-__version__ = "6.1.0"
+__version__ = "6.1.1"
 VERSION = __version__
 
 # ---------------------------------------------------------------------------
@@ -579,6 +596,20 @@ TOP10_REQUIRED_HEADERS: Dict[str, str] = {
     "selection_reason": "Selection Reason",
     "criteria_snapshot": "Criteria Snapshot",
 }
+
+# ---------------------------------------------------------------------------
+# v6.1.1 — Scoring completeness fields
+# ---------------------------------------------------------------------------
+# These are the fields that MUST be populated for a row to look healthy in
+# the sheet. If the scorer returns a dict but leaves any of these as None,
+# we run the fallback to top them up.
+_SCORING_CRITICAL_FIELDS: Tuple[str, ...] = (
+    "overall_score",
+    "confidence_score",
+    "recommendation",
+    "risk_score",
+    "valuation_score",
+)
 
 # Public exports (derived at module load — see _load_canonical_from_registry below)
 INSTRUMENT_CANONICAL_KEYS: List[str] = list(_FALLBACK_INSTRUMENT_KEYS)
@@ -1753,7 +1784,7 @@ def _derive_new_columns(row: Dict[str, Any], page: str = "") -> None:
 
 
 def _compute_scores_fallback(row: Dict[str, Any]) -> None:
-    """Local fallback scoring — used only if core.scoring is unavailable."""
+    """Local fallback scoring — non-destructive (only fills None fields)."""
     price = _safe_float(row.get("current_price"))
     pe = _safe_float(row.get("pe_ttm"))
     pb = _safe_float(row.get("pb_ratio"))
@@ -1826,9 +1857,12 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         )
 
     if price is not None:
-        row.setdefault("forecast_price_1m", round(price * 1.01, 4))
-        row.setdefault("forecast_price_3m", round(price * 1.03, 4))
-        row.setdefault("forecast_price_12m", round(price * 1.08, 4))
+        if row.get("forecast_price_1m") is None:
+            row["forecast_price_1m"] = round(price * 1.01, 4)
+        if row.get("forecast_price_3m") is None:
+            row["forecast_price_3m"] = round(price * 1.03, 4)
+        if row.get("forecast_price_12m") is None:
+            row["forecast_price_12m"] = round(price * 1.08, 4)
 
         if row.get("expected_roi_1m") is None:
             row["expected_roi_1m"] = round((row["forecast_price_1m"] - price) / price, 6)
@@ -1840,14 +1874,34 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
 
 def _try_scoring_module(row: Dict[str, Any], settings: Any = None) -> None:
     """
-    Apply core.scoring patch to the row, always merging.
+    Apply core.scoring patch to the row, always merging; top up with the
+    fallback if any critical scoring fields are still empty afterwards.
 
-    IMPORTANT: merges every non-None key from the scorer into the row,
-    regardless of whether the row already held a value. This preserves
-    scorer-owned provenance fields such as scoring_updated_utc,
-    scoring_updated_riyadh, scoring_errors, overall_score_raw,
-    overall_penalty_factor, expected_return_*, expected_price_*.
+    v6.1.1 — Root-cause fix for "scoring columns partially blank":
+    ------------------------------------------------------------------
+    Previously this function returned as soon as the scorer returned a
+    dict, even if the dict contained None for overall_score, confidence_score
+    or recommendation. That caused the sheet to show partially-filled
+    scoring columns (e.g. Risk Score and Valuation Score populated but
+    Overall Score, Confidence Score, and Recommendation blank).
+
+    Now: merge whatever the scorer provides (still skipping None values
+    so the scorer cannot erase existing good data), then run the
+    fallback to fill any critical field that is still None. The fallback
+    itself is non-destructive — each branch checks `row.get(k) is None`
+    before writing.
+
+    Critical fields topped up: see `_SCORING_CRITICAL_FIELDS`.
+
+    IMPORTANT (preserved from v6.1.0): merges every non-None key from
+    the scorer into the row, regardless of whether the row already held
+    a value. This preserves scorer-owned provenance fields such as
+    scoring_updated_utc, scoring_updated_riyadh, scoring_errors,
+    overall_score_raw, overall_penalty_factor, expected_return_*,
+    expected_price_*.
     """
+    scorer_ran = False
+
     mod = _get_scoring_mod()
     if mod is not None:
         try:
@@ -1861,14 +1915,17 @@ def _try_scoring_module(row: Dict[str, Any], settings: Any = None) -> None:
             patch = None
 
         if isinstance(patch, dict):
+            scorer_ran = True
             for k, v in patch.items():
                 if v is None:
                     continue
                 row[k] = v
-            return
 
-    # Fallback path — only when core.scoring couldn't be reached
-    _compute_scores_fallback(row)
+    # v6.1.1: Top up with fallback if scorer didn't run OR left any
+    # critical field None. The fallback is non-destructive — it only
+    # writes to fields that are currently None.
+    if (not scorer_ran) or any(row.get(field) is None for field in _SCORING_CRITICAL_FIELDS):
+        _compute_scores_fallback(row)
 
 
 def _compute_recommendation(row: Dict[str, Any]) -> None:
@@ -2250,6 +2307,7 @@ class DataEngineV5:
             "symbols_reader_source": self._symbols_reader_source or "",
             "scoring_module": _safe_str(getattr(_get_scoring_mod(), "__name__", "")),
             "schema_source": "schema_registry" if SCHEMA_REGISTRY else "fallback",
+            "scoring_critical_fields": list(_SCORING_CRITICAL_FIELDS),
         }
 
     async def health(self) -> Dict[str, Any]:
@@ -2275,6 +2333,7 @@ class DataEngineV5:
             "rows_reader_source": self._rows_reader_source or "",
             "symbols_reader_source": self._symbols_reader_source or "",
             "schema_source": "schema_registry" if SCHEMA_REGISTRY else "fallback",
+            "scoring_critical_fields": list(_SCORING_CRITICAL_FIELDS),
         }
 
     # -----------------------------------------------------------------------
@@ -3982,6 +4041,7 @@ async def health_check() -> Dict[str, Any]:
         health["checks"]["scoring_module"] = _safe_str(
             getattr(_get_scoring_mod(), "__name__", "")
         ) or "fallback"
+        health["checks"]["scoring_critical_fields"] = list(_SCORING_CRITICAL_FIELDS)
 
         try:
             sr = await get_sheet_rows(
@@ -4075,6 +4135,7 @@ def get_engine_meta() -> Dict[str, Any]:
             else _get_env_int("SHEET_ROWS_HYDRATION_CAP", 30)
         ),
         "schema_source": "schema_registry" if SCHEMA_REGISTRY else "fallback",
+        "scoring_critical_fields": list(_SCORING_CRITICAL_FIELDS),
         "perf_stats": get_perf_stats(),
         "rows_reader_source": getattr(inst, "_rows_reader_source", "") if inst is not None else "",
         "symbols_reader_source": getattr(inst, "_symbols_reader_source", "") if inst is not None else "",
