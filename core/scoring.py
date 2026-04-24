@@ -2,12 +2,54 @@
 # core/scoring.py
 """
 ================================================================================
-Scoring Module — v4.1.1
+Scoring Module — v4.1.2
 (HORIZON-AWARE / TECHNICAL-SIGNALS / SHORT-TERM READY / SCHEMA-ALIGNED)
 ================================================================================
 
-v4.1.1 changes (what moved from v4.1.0)
+v4.1.2 changes (what moved from v4.1.1)
 ---------------------------------------
+- FIX [MEDIUM]: `compute_valuation_score` no longer produces misleading
+  near-zero scores when only valuation anchors (PE/PB/PS/PEG/EV) are
+  available and the one anchor present sits at the unfavorable end of
+  its band.
+
+  Symptom: AAPL refresh today returned:
+      intrinsic_value=null, target_price=null,
+      forecast_price_1m/3m/12m=null, expected_roi_1m/3m/12m=null,
+      pe_ttm=34.65  (right at the top of the 8.0-35.0 anchor band)
+  The only signal reaching the valuation scorer was one anchor mapped
+  to 0.013, which was then the sole contributor to a weighted sum —
+  producing valuation_score ≈ 0.64 on the 0-100 scale. This dragged
+  Overall Score down to 31.84 and triggered a "SELL" recommendation
+  on a perfectly healthy stock. Same mechanic would punish any stock
+  whose providers omit forward-looking valuation data for a single
+  refresh cycle.
+
+  Fix: require at least one forward-looking signal (upside implied by
+  intrinsic/target/forecast, or an explicit 3M/12M expected ROI)
+  before computing a valuation score. When none is present, return
+  None. `compute_scores` already handles None components gracefully
+  by skipping the component and renormalizing weights, so Overall
+  Score stays on a sensible scale driven by the remaining components
+  (momentum, quality, growth, opportunity) instead of being dragged
+  down by an artificially low valuation.
+
+  Net effect: stocks with sparse provider data get a more honest
+  Overall Score and recommendation. Stocks with rich data (anchors
+  PLUS forward signals) score identically to v4.1.1 — the change
+  only alters behavior in the anchors-only edge case.
+
+- DOC: Note that this fix does NOT address the separate issue of
+  upstream provider latency (occasionally 20+ seconds per symbol,
+  which can cause 502s on batch refreshes). That concern lives in
+  data_engine_v2.py provider timeouts and is outside the scorer's
+  scope.
+
+Public API preserved. All v4.1.1 callable signatures and happy-path
+semantics are identical. Only the specific edge case above changes.
+
+v4.1.1 changes (what moved from v4.1.0) — preserved
+---------------------------------------------------
 - FIX [HIGH]: `normalize_recommendation_code` no longer loses STRONG_BUY.
   v4.1.0 delegated to `core.reco_normalize.normalize_recommendation`
   unconditionally, but reco_normalize__3_.py v5.0.0 canonicalizes to a
@@ -40,9 +82,6 @@ v4.1.1 changes (what moved from v4.1.0)
   is explicitly called out. This differs from scoring.py v2.2.0's
   `c < 45`. The reason string "Low AI confidence (X%)" is the
   canonical post-v4.0.0 signature used throughout the project.
-
-Public API preserved. All v4.1.0 callable signatures and happy-path
-semantics are identical.
 
 v4.1.0 changes (from v4.0.0) — preserved
 -----------------------------------------
@@ -82,7 +121,7 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-__version__ = "4.1.1"
+__version__ = "4.1.2"
 SCORING_VERSION = __version__
 
 # =============================================================================
@@ -983,6 +1022,18 @@ def compute_valuation_score(row: Mapping[str, Any]) -> Optional[float]:
     upside_n = _roi_norm(upside, 0.50)
     roi3_n = _roi_norm(roi3, 0.35)
     roi12_n = _roi_norm(roi12, 0.80)
+
+    # v4.1.2: require at least one forward-looking signal before scoring.
+    # Valuation anchors alone (PE/PB/PS/PEG/EV) are not sufficient to
+    # judge valuation — using them alone produces misleading near-zero
+    # scores when the only available anchor sits at the "expensive" end
+    # of its band (e.g. AAPL with PE≈35 and no intrinsic_value/target/
+    # forecasts/ROI returned by the provider). Absence of forward data
+    # should be treated as "unknown", not "bad". Downstream scoring in
+    # compute_scores handles None gracefully by skipping the component
+    # and renormalizing weights across the remaining components.
+    if upside_n is None and roi3_n is None and roi12_n is None:
+        return None
 
     if upside_n is not None:
         parts.append((0.40, upside_n))
