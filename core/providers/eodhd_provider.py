@@ -2,7 +2,7 @@
 """
 core/providers/eodhd_provider.py
 ================================================================================
-EODHD Provider -- v6.0.0 (GLOBAL PRIMARY / HISTORY+FUNDAMENTALS / SCHEMA-ALIGNED)
+EODHD Provider -- v6.1.0 (GLOBAL PRIMARY / HISTORY+FUNDAMENTALS / SCHEMA-ALIGNED)
 ================================================================================
 
 Purpose
@@ -13,34 +13,25 @@ Primary provider for global market data:
   - Fundamental data (financials, ratios, company info)
   - Symbol normalization across exchanges
 
-v6.0.0 Changes (from v5.0.0)
+v6.1.0 Changes (from v6.0.0)
 ----------------------------
-Bug fixes:
-  - fetch_price_history / fetch_ohlc_history no longer forward
-    `*args` after a keyword (`days=days, *args, **kwargs`). That pattern
-    raises `TypeError: got multiple values for 'days'` if any caller passes
-    a single extra positional argument, because the unpacked *args binds
-    positionally BEFORE the keyword — colliding with `days`.
-  - change_p percent-to-ratio bug: EODHD's /real-time `change_p` is
-    documented in percent units. v5.0.0 passed it through `_to_ratio`, which
-    leaves values with |v| <= 1.5 untouched — so a typical 1.25% daily move
-    became a ratio of 1.25 (i.e., 125%). Fixed via explicit `_pct_to_ratio`
-    for this known-percent field.
-  - `merged["beta_5y"] = merged.get("beta_5y") or merged.get("beta")` would
-    overwrite a legitimate `beta_5y=0.0` (market-neutral) with `beta`.
-    Replaced with an explicit None check. Same pattern fixed for the other
-    alias assignments.
-  - All asyncio primitives (Lock, Semaphore, TokenBucket's Lock) are now
-    lazily initialized inside async methods rather than in __init__, so
-    module import stays event-loop-free.
+Bug fixes continuing the v6.0.0 percent-vs-ratio hardening:
+  - EODHD's Highlights.RevenueGrowth is documented as a DECIMAL (e.g.
+    0.25 for 25%) but the v6.0.0 code piped it through _to_ratio, whose
+    heuristic correctly leaves small decimals alone — however, a tiny
+    value like 0.02 (2% growth) is also a ratio that doesn't need
+    conversion. The heuristic is safe here but we tighten the code path
+    by explicitly using _safe_float (no conversion) for fields that the
+    EODHD docs confirm are always decimals.
+  - Same treatment for DividendYield, PayoutRatio, ProfitMargin,
+    GrossMargin, OperatingMargin, ROE, ROA — all documented as decimals
+    in EODHD's fundamentals schema. Using _safe_float prevents the
+    silent 100× error if EODHD ever changes a field to percent units
+    (we'd rather see a visible anomaly than a silent overwrite).
 
 Cleanup:
-  - Removed unused imports: `cast`, `field`.
-  - Removed unused exception classes (EODHDAuthError, EODHDNotFoundError,
-    EODHDRateLimitError -- defined, never raised, not in __all__).
-  - Batch method no longer creates a second semaphore on top of
-    self._semaphore -- single-tier gating.
-  - _TTLCache eviction uses OrderedDict.popitem(last=False) for explicit FIFO.
+  - Added EODHD_MAX_PROVIDER_ATTEMPTS reference note (used by
+    data_engine_v2; placed here for operator documentation).
 
 Preserved for backward compatibility:
   - Every name in __all__.
@@ -78,12 +69,12 @@ logger.addHandler(logging.NullHandler())
 # ---------------------------------------------------------------------------
 
 PROVIDER_NAME = "eodhd"
-PROVIDER_VERSION = "6.0.0"
+PROVIDER_VERSION = "6.1.0"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
 DEFAULT_BASE_URL = "https://eodhistoricaldata.com/api"
-DEFAULT_USER_AGENT = "TFB-EODHD/6.0.0 (Render)"
+DEFAULT_USER_AGENT = "TFB-EODHD/6.1.0 (Render)"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
@@ -337,7 +328,8 @@ def _to_ratio(value: Any) -> Optional[float]:
 
     WARNING: ambiguous for values between 0 and 1.5 (treated as ratios even
     if they were meant as percents). Use `_pct_to_ratio` for fields you
-    KNOW are in percent units.
+    KNOW are in percent units, or `_safe_float` for fields you KNOW are
+    already decimals.
     """
     f = _safe_float(value)
     if f is None:
@@ -840,9 +832,7 @@ class EODHDClient:
                 chg = close - prev
 
             # v6.0.0 bug fix: EODHD's `change_p` is documented as PERCENT
-            # (e.g., 1.25 for 1.25%). v5.0.0 piped it through `_to_ratio`,
-            # which treats values with |v| <= 1.5 as ratios -- so a 1.25%
-            # daily move became a 125% ratio. Use explicit /100 here.
+            # (e.g., 1.25 for 1.25%). Use explicit /100 here.
             change_frac: Optional[float] = _pct_to_ratio(data.get("change_p"))
             if change_frac is None:
                 # Fall back to the ambiguous keys via the heuristic
@@ -1034,8 +1024,14 @@ class EODHDClient:
             )
             debt_to_equity = _safe_div(total_debt, total_equity)
 
-            roe = _to_ratio(_first_present(highlights.get("ROE"), _safe_div(net_income_ttm, total_equity)))
-            roa = _to_ratio(_first_present(highlights.get("ROA"), _safe_div(net_income_ttm, total_assets)))
+            # v6.1.0: EODHD Highlights.ROE / ROA are documented as DECIMALS.
+            # Use _safe_float (no conversion); fall back to computed ratio.
+            roe = _safe_float(highlights.get("ROE"))
+            if roe is None:
+                roe = _safe_div(net_income_ttm, total_equity)
+            roa = _safe_float(highlights.get("ROA"))
+            if roa is None:
+                roa = _safe_div(net_income_ttm, total_assets)
 
             shares_outstanding = _safe_float(_first_present(
                 shares.get("SharesOutstanding"), highlights.get("SharesOutstanding"),
@@ -1080,14 +1076,22 @@ class EODHDClient:
                 general.get("CurrencyCode"), general.get("Currency"), highlights.get("Currency"),
             ))
 
-            dividend_yield = _to_ratio(_first_present(
+            # v6.1.0: EODHD dividend yield and payout ratio are DECIMALS in
+            # both SplitsDividends and Highlights. Use _safe_float.
+            dividend_yield = _safe_float(_first_present(
                 splits.get("ForwardAnnualDividendYield"),
                 highlights.get("DividendYield"),
                 splits.get("TrailingAnnualDividendYield"),
             ))
-            payout_ratio = _to_ratio(_first_present(
+            payout_ratio = _safe_float(_first_present(
                 splits.get("PayoutRatio"), highlights.get("PayoutRatio"),
             ))
+
+            # v6.1.0: EODHD margins and revenue growth are DECIMALS.
+            net_margin_src = _safe_float(highlights.get("ProfitMargin"))
+            gross_margin_src = _safe_float(highlights.get("GrossMargin"))
+            operating_margin_src = _safe_float(highlights.get("OperatingMargin"))
+            revenue_growth_src = _safe_float(highlights.get("RevenueGrowth"))
 
             patch = _clean_patch({
                 "symbol": symbol,
@@ -1127,22 +1131,18 @@ class EODHDClient:
                 "payout_ratio": payout_ratio,
                 "roe": roe,
                 "roa": roa,
-                "net_margin": _to_ratio(_first_present(highlights.get("ProfitMargin"), profit_margin)),
-                "revenue_growth": _to_ratio(_first_present(
-                    highlights.get("RevenueGrowth"), revenue_growth_yoy,
-                )),
-                "revenue_growth_yoy": _to_ratio(_first_present(
-                    highlights.get("RevenueGrowth"), revenue_growth_yoy,
-                )),
+                "net_margin": _first_non_none(net_margin_src, profit_margin),
+                "revenue_growth": _first_non_none(revenue_growth_src, revenue_growth_yoy),
+                "revenue_growth_yoy": _first_non_none(revenue_growth_src, revenue_growth_yoy),
                 "beta": _safe_float(_first_present(tech.get("Beta"), highlights.get("Beta"))),
                 "beta_5y": _safe_float(_first_present(tech.get("Beta"), highlights.get("Beta"))),
                 "week_52_high": week_52_high,
                 "week_52_low": week_52_low,
                 "revenue_ttm": revenue_ttm,
                 "revenue": revenue_ttm,
-                "gross_margin": _to_ratio(_first_present(highlights.get("GrossMargin"), gross_margin)),
-                "operating_margin": _to_ratio(_first_present(highlights.get("OperatingMargin"), operating_margin)),
-                "profit_margin": _to_ratio(_first_present(highlights.get("ProfitMargin"), profit_margin)),
+                "gross_margin": _first_non_none(gross_margin_src, gross_margin),
+                "operating_margin": _first_non_none(operating_margin_src, operating_margin),
+                "profit_margin": _first_non_none(net_margin_src, profit_margin),
                 "free_cash_flow_ttm": fcf_ttm,
                 "fcf_ttm": fcf_ttm,
                 "debt_to_equity": debt_to_equity,
@@ -1462,12 +1462,11 @@ class EODHDClient:
             if suffix_country:
                 merged["country"] = suffix_country
 
-        # v6.0.0: use explicit None-check rather than `a or b` so zero values
-        # (e.g. a genuine beta of 0.0 for a market-neutral ETF) survive.
-        merged["change"] = merged.get("price_change")
-        merged["change_pct"] = merged.get("percent_change")
-        merged["52w_high"] = merged.get("week_52_high")
-        merged["52w_low"] = merged.get("week_52_low")
+        # v6.0.0: use explicit None-check rather than `a or b` so zero values survive.
+        merged["change"] = _first_non_none(merged.get("change"), merged.get("price_change"))
+        merged["change_pct"] = _first_non_none(merged.get("change_pct"), merged.get("percent_change"))
+        merged["52w_high"] = _first_non_none(merged.get("52w_high"), merged.get("week_52_high"))
+        merged["52w_low"] = _first_non_none(merged.get("52w_low"), merged.get("week_52_low"))
         merged["beta_5y"] = _first_non_none(merged.get("beta_5y"), merged.get("beta"))
         merged["avg_volume_10d"] = _first_non_none(merged.get("avg_volume_10d"), merged.get("avg_vol_10d"))
         merged["avg_volume_30d"] = _first_non_none(merged.get("avg_volume_30d"), merged.get("avg_vol_30d"))
@@ -1495,8 +1494,7 @@ class EODHDClient:
         Batch fetch enriched quote patches for multiple symbols.
 
         v6.0.0: the per-call semaphore inside `_request_json` already gates
-        concurrency to `config.max_concurrency`. v5.0.0 also created a batch-
-        level semaphore on top of that -- redundant double-gating.
+        concurrency to `config.max_concurrency`. No extra batch-level gate.
         """
         if not symbols:
             return {}
@@ -1683,15 +1681,7 @@ async def fetch_price_history(
     *args: Any,
     **kwargs: Any,
 ) -> List[Dict[str, Any]]:
-    """
-    Alias for fetch_history.
-
-    v6.0.0 bug fix: drops `*args, **kwargs` from the forward call. v5.0.0 had
-    `await fetch_history(symbol, days=days, *args, **kwargs)` which raises
-    `TypeError: got multiple values for 'days'` whenever any extra positional
-    arg is passed, because the unpacked *args binds positionally BEFORE the
-    kwarg at the call site.
-    """
+    """Alias for fetch_history."""
     if args or kwargs:
         logger.debug("fetch_price_history(%s): ignoring args=%r kwargs=%r", symbol, args, kwargs)
     return await fetch_history(symbol, days=days)
@@ -1703,7 +1693,7 @@ async def fetch_ohlc_history(
     *args: Any,
     **kwargs: Any,
 ) -> List[Dict[str, Any]]:
-    """Alias for fetch_history. v6.0.0 bug fix: see fetch_price_history."""
+    """Alias for fetch_history."""
     if args or kwargs:
         logger.debug("fetch_ohlc_history(%s): ignoring args=%r kwargs=%r", symbol, args, kwargs)
     return await fetch_history(symbol, days=days)
