@@ -2,12 +2,58 @@
 # core/scoring.py
 """
 ================================================================================
-Scoring Module — v4.1.2
+Scoring Module — v4.1.3
 (HORIZON-AWARE / TECHNICAL-SIGNALS / SHORT-TERM READY / SCHEMA-ALIGNED)
 ================================================================================
 
-v4.1.2 changes (what moved from v4.1.1)
+v4.1.3 changes (what moved from v4.1.2)
 ---------------------------------------
+- FIX [HIGH]: Blue-chip guard added to `compute_recommendation`. Stocks
+  with strong fundamentals but missing forward-looking data (no 1M/3M/
+  12M ROI and no valuation_score) no longer produce false "SELL" or
+  "REDUCE" recommendations solely because their Overall Score is
+  arithmetically suppressed by the absent component.
+
+  Symptom: AAPL with quality_score=75.81, growth_score=76.09,
+  risk_score=36.36, but valuation_score=None and all forecast ROIs
+  None, produced overall=49.55 → "SELL" with reason "Poor long-term
+  fundamentals (score=49.5)". That reason text was semantically wrong
+  — AAPL has excellent fundamentals; only the forward outlook was
+  unavailable. The same pattern would flag any blue-chip stock on a
+  refresh where upstream forecast providers are silent.
+
+  Fix: `compute_recommendation` now accepts three optional parameters
+  (quality, growth, valuation) and computes a `blue_chip_guard` flag
+  when ALL of the following hold:
+    * roi1 is None AND roi3 is None AND roi12 is None (no ROI signal)
+    * valuation is None (no valuation component)
+    * quality >= 65 AND growth >= 65 (strong fundamentals)
+    * risk <= 55 (controlled risk)
+  In LONG and MONTH horizons, when the guard fires, the usual SELL /
+  REDUCE fallbacks (below the HOLD-at-65 threshold) are replaced with
+  a HOLD verdict and a reason that names the blue-chip protection.
+  DAY and WEEK horizons are unchanged — short-term technical SELL
+  signals are still allowed to fire regardless of fundamentals.
+
+  Net effect: blue-chip stocks with temporarily sparse provider data
+  receive HOLD instead of SELL/REDUCE. Stocks with legitimately weak
+  fundamentals (quality < 65 or growth < 65), elevated risk
+  (risk > 55), or available forward data that points negative are
+  unaffected — they still receive SELL/REDUCE as appropriate.
+
+- DOC: `blue_chip_guard` requires fundamentals to pass the 65-floor
+  simultaneously. A stock with quality=75 and growth=50 will NOT
+  trigger the guard (growth too weak). This is intentional — we want
+  both dimensions strong before suppressing a SELL based on data
+  absence alone.
+
+Public API preserved. `compute_recommendation`'s new parameters are
+keyword-only with None defaults, so every existing caller continues
+to work. Callers that do not pass quality/growth/valuation simply
+never trigger the new guard (equivalent to v4.1.2 behavior).
+
+v4.1.2 changes (what moved from v4.1.1) — preserved
+---------------------------------------------------
 - FIX [MEDIUM]: `compute_valuation_score` no longer produces misleading
   near-zero scores when only valuation anchors (PE/PB/PS/PEG/EV) are
   available and the one anchor present sits at the unfavorable end of
@@ -121,7 +167,7 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-__version__ = "4.1.2"
+__version__ = "4.1.3"
 SCORING_VERSION = __version__
 
 # =============================================================================
@@ -1207,12 +1253,31 @@ def compute_recommendation(
     momentum: Optional[float] = None,
     roi1: Optional[float] = None,
     roi12: Optional[float] = None,
+    *,
+    quality: Optional[float] = None,
+    growth: Optional[float] = None,
+    valuation: Optional[float] = None,
 ) -> Tuple[str, str]:
     """Compute recommendation based on scores and horizon.
 
     Confidence < 40 short-circuits to HOLD. This differs from
     scoring.py v2.2.0 which used < 45. The threshold was lowered in
     v4.0.0 to reduce false-HOLDs on borderline-confidence signals.
+
+    v4.1.3 blue-chip guard:
+        In LONG and MONTH horizons, when forward-looking data is entirely
+        missing (no 1M/3M/12M ROI, no valuation score) AND fundamentals
+        are strong (quality >= 65, growth >= 65) AND risk is controlled
+        (risk <= 55), suppress SELL/REDUCE recommendations and return HOLD
+        instead. This prevents false-negative SELL signals on blue-chip
+        stocks whose forward-looking providers (EODHD targets, analyst
+        forecasts) are empty or unavailable — the Overall Score is
+        artificially suppressed in such cases because the missing
+        valuation/opportunity components can't contribute positive weight.
+
+        The new parameters (quality, growth, valuation) are keyword-only
+        and default to None, preserving backward compatibility with any
+        existing caller that still uses the v4.1.2 signature.
     """
     if overall is None:
         return "HOLD", "Insufficient data to score reliably."
@@ -1221,11 +1286,30 @@ def compute_recommendation(
     c = confidence100 if confidence100 is not None else 55.0
     t = technical if technical is not None else 50.0
     m = momentum if momentum is not None else 50.0
+    q = quality if quality is not None else 0.0
+    g = growth if growth is not None else 0.0
 
     if c < 40:
         return "HOLD", f"Low AI confidence ({_round(c, 1)}%) — insufficient signal quality."
 
-    # DAY horizon
+    # v4.1.3: blue-chip guard. Active when forward-looking signals are
+    # entirely silent but the fundamentals-and-risk picture is strong.
+    # Caller must pass quality + growth for the guard to fire; if either
+    # is None, the guard cannot fire (behavior equals v4.1.2).
+    no_forward_data = (
+        roi1 is None
+        and roi3 is None
+        and roi12 is None
+        and valuation is None
+    )
+    blue_chip_guard = (
+        no_forward_data
+        and quality is not None and q >= 65.0
+        and growth is not None and g >= 65.0
+        and r <= 55.0
+    )
+
+    # DAY horizon (short-term technical — blue-chip guard intentionally NOT applied)
     if horizon == Horizon.DAY:
         if t >= 80 and m >= 75 and r <= 45:
             return "STRONG_BUY", (
@@ -1246,7 +1330,7 @@ def compute_recommendation(
             )
         return "HOLD", f"Day trade setup inconclusive (Tech={_round(t, 1)}, Risk={_round(r, 1)})."
 
-    # WEEK horizon
+    # WEEK horizon (short-term technical — blue-chip guard intentionally NOT applied)
     if horizon == Horizon.WEEK:
         roi_1m = roi1 if roi1 is not None else 0.0
         if t >= 72 and m >= 65 and r <= 50:
@@ -1279,6 +1363,14 @@ def compute_recommendation(
             return "BUY", f"Strong long-term score ({_round(overall, 1)}) with controlled risk."
         if overall >= 65:
             return "HOLD", f"Moderate long-term profile (score={_round(overall, 1)})."
+        # v4.1.3: blue-chip guard fires BEFORE REDUCE/SELL when forward
+        # data is silent but fundamentals + risk are strong.
+        if blue_chip_guard:
+            return "HOLD", (
+                f"Strong fundamentals (Quality={_round(q, 0)}, "
+                f"Growth={_round(g, 0)}, Risk={_round(r, 0)}) with forward "
+                f"outlook unavailable — holding pending provider signal."
+            )
         if overall >= 50:
             return "REDUCE", f"Weak long-term outlook (score={_round(overall, 1)})."
         return "SELL", f"Poor long-term fundamentals (score={_round(overall, 1)})."
@@ -1295,6 +1387,14 @@ def compute_recommendation(
         return "BUY", f"Strong overall score ({_round(overall, 1)}) with controlled risk ({_round(r, 1)})."
     if overall >= 65:
         return "HOLD", f"Moderate overall score ({_round(overall, 1)})."
+    # v4.1.3: blue-chip guard fires BEFORE REDUCE/SELL when forward
+    # data is silent but fundamentals + risk are strong.
+    if blue_chip_guard:
+        return "HOLD", (
+            f"Strong fundamentals (Quality={_round(q, 0)}, "
+            f"Growth={_round(g, 0)}, Risk={_round(r, 0)}) with forward "
+            f"outlook unavailable — holding pending provider signal."
+        )
     if overall >= 50:
         return "REDUCE", f"Weak overall score ({_round(overall, 1)})."
     return "SELL", f"Very weak overall score ({_round(overall, 1)})."
@@ -1501,6 +1601,11 @@ def compute_scores(row: Dict[str, Any], settings: Any = None) -> Dict[str, Any]:
             overall, risk, confidence100, roi3,
             horizon=horizon, technical=tech_score, momentum=momentum,
             roi1=roi1, roi12=roi12,
+            # v4.1.3: feed the blue-chip guard so strong fundamentals with
+            # silent forward data don't get a false SELL/REDUCE label.
+            quality=quality,
+            growth=growth,
+            valuation=valuation,
         )
 
     st_signal_val = short_term_signal(tech_score, momentum, risk, horizon)
