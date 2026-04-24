@@ -2,12 +2,58 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — v6.1.1 (SCHEMA-ALIGNED / REGISTRY-FIRST / CANONICAL)
+Data Engine V2 — v6.1.2 (SCHEMA-ALIGNED / REGISTRY-FIRST / CANONICAL)
 ================================================================================
 Tadawul Fast Bridge (TFB)
 
-v6.1.1 — Scoring completeness fix
----------------------------------
+v6.1.2 — Respect scoring.py's intentional None for valuation_score
+------------------------------------------------------------------
+Paired with scoring.py v4.1.2.
+
+scoring.py v4.1.2 changed `compute_valuation_score` to return None
+(instead of a misleading near-zero number) when no forward-looking
+signal is available — intrinsic_value/target_price/forecast_price_*/
+expected_roi_* all missing from the provider row. Downstream, the
+scorer's `compute_scores` already handles None components gracefully
+by skipping them and renormalizing weights across the remaining
+components.
+
+Problem this created in v6.1.1 (without this fix):
+    v6.1.1 listed `valuation_score` in `_SCORING_CRITICAL_FIELDS`.
+    After scoring.py v4.1.2 the scorer legitimately returns None
+    for that field on sparse-data rows — which triggered v6.1.1's
+    completeness fallback. The fallback then wrote:
+      * valuation_score = 50.0  (phantom neutral placeholder)
+      * value_score     = ~55   (PE-only guess)
+      * forecast_price_1m = price × 1.01
+      * forecast_price_3m = price × 1.03
+      * forecast_price_12m = price × 1.08
+      * expected_roi_1m/3m/12m = 1%, 3%, 8%  (arbitrary)
+    i.e. it subverted the scoring.py v4.1.2 change and polluted
+    the sheet with phantom forecasts on any row where the provider
+    hadn't returned forward valuation data.
+
+Fix (one-line constant change):
+    Remove `valuation_score` from `_SCORING_CRITICAL_FIELDS`. The
+    scorer now has a legitimate reason to return None for this
+    field, and the fallback must not override that signal. The
+    fallback is still triggered when the scorer genuinely failed
+    (detected via overall_score / recommendation / confidence_score /
+    risk_score being None) — those remaining four critical fields
+    are enough to catch a real scorer failure, because scoring.py
+    always populates them when it runs successfully.
+
+Net effect: rows with sparse provider data (like AAPL today:
+intrinsic/target/forecast/ROI all null from providers) now display
+blank Valuation Score / Value Score / Forecast Price / Expected ROI
+cells instead of misleading phantoms. Overall Score and
+Recommendation remain correct and are driven by the other
+scoring components the scorer COULD compute.
+
+No other behaviour changes. All v6.1.1 / v6.1.0 guarantees preserved.
+
+v6.1.1 — Scoring completeness fix (preserved)
+---------------------------------------------
 Root cause of the "scoring columns partially blank" sheet symptom:
 
     v6.1.0's `_try_scoring_module` returned early as soon as the scorer
@@ -19,8 +65,9 @@ Root cause of the "scoring columns partially blank" sheet symptom:
 Fix (surgical — one function + one constant):
 
   * Added `_SCORING_CRITICAL_FIELDS`: the fields that MUST be populated
-    for the sheet to look healthy (overall_score, confidence_score,
-    recommendation, risk_score, valuation_score).
+    for the sheet to look healthy. v6.1.2 trimmed this to four fields
+    (overall_score, confidence_score, recommendation, risk_score) —
+    see the v6.1.2 note above for why valuation_score was removed.
   * `_try_scoring_module` now merges the scorer's non-None values as
     before, then runs the non-destructive `_compute_scores_fallback`
     when any critical field is still None.
@@ -31,7 +78,7 @@ Fix (surgical — one function + one constant):
 Net effect: rows that previously landed with partial scoring now get
 topped up. Rows that score cleanly are unaffected.
 
-No other behaviour changes in this release. All v6.1.0 alignment
+No other behaviour changes in that release. All v6.1.0 alignment
 guarantees (schema_registry-first, 80-column instrument contract,
 83-column Top_10, 7-column Insights, 9-column Dictionary) are
 preserved exactly.
@@ -103,7 +150,7 @@ if str(ROOT_DIR) not in sys.path:
 # Version
 # ---------------------------------------------------------------------------
 
-__version__ = "6.1.1"
+__version__ = "6.1.2"
 VERSION = __version__
 
 # ---------------------------------------------------------------------------
@@ -598,17 +645,26 @@ TOP10_REQUIRED_HEADERS: Dict[str, str] = {
 }
 
 # ---------------------------------------------------------------------------
-# v6.1.1 — Scoring completeness fields
+# v6.1.2 — Scoring completeness fields (updated from v6.1.1)
 # ---------------------------------------------------------------------------
 # These are the fields that MUST be populated for a row to look healthy in
 # the sheet. If the scorer returns a dict but leaves any of these as None,
 # we run the fallback to top them up.
+#
+# v6.1.2 note: `valuation_score` was REMOVED from this list. scoring.py
+# v4.1.2 legitimately returns None for valuation_score when no
+# forward-looking signal is available — we must not override that with
+# a phantom fallback value. The remaining four fields are still enough
+# to detect real scorer failures because scoring.py always populates
+# them (overall_score/recommendation default to 50.0/"HOLD" even when
+# inputs are insufficient; confidence_score is derived from data
+# quality which is always computable; risk_score only returns None
+# when zero risk signals are available, which is rare).
 _SCORING_CRITICAL_FIELDS: Tuple[str, ...] = (
     "overall_score",
     "confidence_score",
     "recommendation",
     "risk_score",
-    "valuation_score",
 )
 
 # Public exports (derived at module load — see _load_canonical_from_registry below)
@@ -1877,6 +1933,15 @@ def _try_scoring_module(row: Dict[str, Any], settings: Any = None) -> None:
     Apply core.scoring patch to the row, always merging; top up with the
     fallback if any critical scoring fields are still empty afterwards.
 
+    v6.1.2 — Respect scoring.py v4.1.2's intentional None for valuation:
+    -------------------------------------------------------------------
+    `_SCORING_CRITICAL_FIELDS` no longer includes `valuation_score`.
+    scoring.py v4.1.2 returns None for valuation_score when no
+    forward-looking signal is available, and we must honor that
+    decision rather than override it with a phantom fallback value.
+    The remaining four critical fields still catch real scorer
+    failures. See the module docstring for details.
+
     v6.1.1 — Root-cause fix for "scoring columns partially blank":
     ------------------------------------------------------------------
     Previously this function returned as soon as the scorer returned a
@@ -1921,9 +1986,10 @@ def _try_scoring_module(row: Dict[str, Any], settings: Any = None) -> None:
                     continue
                 row[k] = v
 
-    # v6.1.1: Top up with fallback if scorer didn't run OR left any
+    # v6.1.1/v6.1.2: Top up with fallback if scorer didn't run OR left any
     # critical field None. The fallback is non-destructive — it only
-    # writes to fields that are currently None.
+    # writes to fields that are currently None. valuation_score was
+    # removed from the critical fields in v6.1.2 (see module docstring).
     if (not scorer_ran) or any(row.get(field) is None for field in _SCORING_CRITICAL_FIELDS):
         _compute_scores_fallback(row)
 
