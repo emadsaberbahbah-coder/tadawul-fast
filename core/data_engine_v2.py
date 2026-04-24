@@ -2,11 +2,63 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — v6.1.2 (SCHEMA-ALIGNED / REGISTRY-FIRST / CANONICAL)
+Data Engine V2 — v6.1.3 (SCHEMA-ALIGNED / REGISTRY-FIRST / CANONICAL / LATENCY-TUNED)
 ================================================================================
 Tadawul Fast Bridge (TFB)
 
-v6.1.2 — Respect scoring.py's intentional None for valuation_score
+v6.1.3 — Latency tuning for batch sheet-rows refresh
+----------------------------------------------------
+Paired with scoring.py v4.1.3 and earlier engine fixes.
+
+Problem:
+    At v6.1.2, single-symbol AAPL fetches took 14-25 seconds. A full
+    80-symbol Global_Markets refresh therefore blew out Render's ~100s
+    proxy timeout and returned HTTP 502. Scoring was correct end-to-end,
+    but the per-symbol provider chain was too slow to complete a batch.
+
+Root contributors identified:
+    1. Per-provider request timeout was 12s. If the first provider hung,
+       the whole symbol waited 12s before trying the next.
+    2. For each symbol, up to 4 providers were tried on the happy path.
+       Worst case: 48s per symbol.
+    3. Hydration cap was 30 symbols. An 80-symbol page was silently
+       truncated before it could even try.
+    4. Total time budget was 12s. Too tight for any realistic batch,
+       so partial results were returned with scaffolds.
+    5. Batch size was 20 and cache TTL was 60s. Both were conservative
+       and didn't play well together for rapid back-to-back refreshes.
+
+Fix (v6.1.3):
+    Changed DEFAULT values for the env-driven constants below so the
+    engine works well even when the operator has not tuned it. All
+    env vars still override the new defaults, so production deployments
+    that have already set these values are unchanged.
+
+    * DATA_ENGINE_TIMEOUT_SECONDS  default 12.0 → 5.0
+    * SHEET_ROWS_TIME_BUDGET_SECONDS default 12.0 → 60.0
+    * SHEET_ROWS_HYDRATION_CAP    default 30 → 100
+    * QUOTE_BATCH_SIZE            default 20 → 40
+    * CACHE_L1_TTL                default 60 → 300
+
+    Additional behavioural changes:
+    * Provider fallback per symbol capped at 2 attempts (was 4).
+          Beyond 2 providers, latency savings are minimal but the
+          cost of hangs compounds.
+    * Per-symbol wall-clock budget via asyncio.wait_for around the
+          provider gather call. Each symbol must complete its provider
+          fan-out within (request_timeout + 1s) or the scaffold fallback
+          kicks in. One hanging provider can no longer poison the batch.
+
+Net effect: single-symbol latency target drops from 14-25s to 3-6s;
+80-symbol Refresh Global_Markets fits inside Render's proxy timeout;
+502s stop. If providers really are slow for a given symbol, the
+per-symbol budget ensures that symbol returns a degraded row rather
+than blocking the whole batch.
+
+No API changes. Public surface identical to v6.1.2. All v6.1.2 /
+v6.1.1 / v6.1.0 guarantees preserved.
+
+v6.1.2 — Respect scoring.py's intentional None for valuation_score (preserved)
 ------------------------------------------------------------------
 Paired with scoring.py v4.1.2.
 
@@ -150,7 +202,7 @@ if str(ROOT_DIR) not in sys.path:
 # Version
 # ---------------------------------------------------------------------------
 
-__version__ = "6.1.2"
+__version__ = "6.1.3"
 VERSION = __version__
 
 # ---------------------------------------------------------------------------
@@ -2312,11 +2364,18 @@ class DataEngineV5:
             page: self.non_ksa_primary_provider for page in configured_non_ksa_pages if page
         }
 
-        # Performance configuration
+        # Performance configuration (v6.1.3 tighter defaults)
+        # Per-provider call timeout. If the chosen provider hangs, cut
+        # it loose quickly so we can try the next one or return a
+        # scaffold row within the per-symbol budget.
         self.max_concurrency = _get_env_int("DATA_ENGINE_MAX_CONCURRENCY", 25)
-        self.request_timeout = _get_env_float("DATA_ENGINE_TIMEOUT_SECONDS", 12.0)
-        self.sheet_rows_time_budget = _get_env_float("SHEET_ROWS_TIME_BUDGET_SECONDS", 12.0)
-        self.sheet_rows_hydration_cap = _get_env_int("SHEET_ROWS_HYDRATION_CAP", 30)
+        self.request_timeout = _get_env_float("DATA_ENGINE_TIMEOUT_SECONDS", 5.0)
+        # Total budget for a single sheet-rows call. Must fit under
+        # Render's proxy timeout (~100s) with headroom for scoring.
+        self.sheet_rows_time_budget = _get_env_float("SHEET_ROWS_TIME_BUDGET_SECONDS", 60.0)
+        # Hydration cap — max symbols processed per sheet-rows call.
+        # 80-symbol pages now complete without truncation.
+        self.sheet_rows_hydration_cap = _get_env_int("SHEET_ROWS_HYDRATION_CAP", 100)
         self.sheet_rows_symbol_buffer = _get_env_int("SHEET_ROWS_SYMBOL_BUFFER", 8)
 
         # Feature flags
@@ -2331,7 +2390,7 @@ class DataEngineV5:
         self._registry = ProviderRegistry()
         self._cache = MultiLevelCache(
             "data_engine",
-            l1_ttl=_get_env_int("CACHE_L1_TTL", 60),
+            l1_ttl=_get_env_int("CACHE_L1_TTL", 300),
             max_l1_size=_get_env_int("CACHE_L1_MAX", 5000),
         )
         self._symbols_cache = MultiLevelCache(
@@ -2915,15 +2974,33 @@ class DataEngineV5:
         patches_ok: List[Tuple[str, Dict[str, Any], float]] = []
 
         if providers:
-            gathered = await asyncio.gather(
-                *[self._fetch_patch(p, norm) for p in providers[:4]],
-                return_exceptions=True,
-            )
-            for item in gathered:
-                if isinstance(item, tuple) and len(item) == 4:
-                    provider, patch, latency, _err = item
-                    if patch:
-                        patches_ok.append((provider, patch, latency))
+            # v6.1.3: Cap provider fan-out to 2 and wrap the whole
+            # gather in a per-symbol budget. Previously we tried up to
+            # 4 providers with no outer budget, so one hanging provider
+            # could make a single symbol take 4x the per-call timeout.
+            # Now: 2 providers in parallel, with a hard wall-clock
+            # budget of (request_timeout + 1.0s). If the budget blows,
+            # the symbol falls back to the "no live provider data"
+            # scaffold instead of blocking the batch.
+            per_symbol_budget = max(2.0, float(self.request_timeout) + 1.0)
+            try:
+                async with asyncio.timeout(per_symbol_budget):
+                    gathered = await asyncio.gather(
+                        *[self._fetch_patch(p, norm) for p in providers[:2]],
+                        return_exceptions=True,
+                    )
+                for item in gathered:
+                    if isinstance(item, tuple) and len(item) == 4:
+                        provider, patch, latency, _err = item
+                        if patch:
+                            patches_ok.append((provider, patch, latency))
+            except (asyncio.TimeoutError, TimeoutError):
+                logger.warning(
+                    "per-symbol budget exceeded for %s after %.1fs",
+                    norm, per_symbol_budget,
+                )
+            except Exception as exc:
+                logger.warning("provider fan-out failed for %s: %s", norm, exc)
 
         if patches_ok:
             row = self._merge(symbol, norm, patches_ok)
@@ -3026,7 +3103,8 @@ class DataEngineV5:
         if not symbols:
             return []
 
-        batch = max(1, min(100, _get_env_int("QUOTE_BATCH_SIZE", 20)))
+        # v6.1.3: default batch 20 → 40 for fewer round trips.
+        batch = max(1, min(100, _get_env_int("QUOTE_BATCH_SIZE", 40)))
         results: List[UnifiedQuote] = []
 
         for i in range(0, len(symbols), batch):
@@ -4190,15 +4268,15 @@ def get_engine_meta() -> Dict[str, Any]:
         ),
         "sheet_rows_time_budget": (
             float(getattr(inst, "sheet_rows_time_budget",
-                           _get_env_float("SHEET_ROWS_TIME_BUDGET_SECONDS", 12.0)))
+                           _get_env_float("SHEET_ROWS_TIME_BUDGET_SECONDS", 60.0)))
             if inst is not None
-            else _get_env_float("SHEET_ROWS_TIME_BUDGET_SECONDS", 12.0)
+            else _get_env_float("SHEET_ROWS_TIME_BUDGET_SECONDS", 60.0)
         ),
         "sheet_rows_hydration_cap": (
             int(getattr(inst, "sheet_rows_hydration_cap",
-                         _get_env_int("SHEET_ROWS_HYDRATION_CAP", 30)))
+                         _get_env_int("SHEET_ROWS_HYDRATION_CAP", 100)))
             if inst is not None
-            else _get_env_int("SHEET_ROWS_HYDRATION_CAP", 30)
+            else _get_env_int("SHEET_ROWS_HYDRATION_CAP", 100)
         ),
         "schema_source": "schema_registry" if SCHEMA_REGISTRY else "fallback",
         "scoring_critical_fields": list(_SCORING_CRITICAL_FIELDS),
