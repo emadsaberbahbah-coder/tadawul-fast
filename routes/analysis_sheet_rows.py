@@ -2,68 +2,67 @@
 # routes/analysis_sheet_rows.py
 """
 ================================================================================
-Analysis Sheet-Rows Router — v4.1.1
+Analysis Sheet-Rows Router — v4.1.2
 ================================================================================
 ENGINE-FIRST • ADAPTER-SECOND • ROOT-PROXY COMPAT • PLACEHOLDER FILTER
 SCHEMA-FIRST • STABLE ENVELOPE • GET+POST MERGED • FAIL-SOFT • JSON-SAFE
 
-v4.1.1 changes (from v4.1.0)
+v4.1.2 changes (from v4.1.1)
 ----------------------------
-- FIX [HIGH]: adapter import preference flipped. v4.1.0 (and earlier) tried
-    `from core.data_engine import get_sheet_rows` FIRST and only fell
-    back to `core.data_engine_v2` if the import raised. Since the repo
-    still contains the legacy `core.data_engine` module (v7.x), the
-    first import always succeeded — which meant the Tier-2 core-adapter
-    path in `_analysis_sheet_rows_impl_core` was calling the LEGACY
-    engine, not `core.data_engine_v2` (the primary engine loaded into
-    `app.state.engine`). Scoring.py v4.1.2 and data_engine_v2.py v6.1.2
-    were deployed but never reached through this route.
+- FIX [HIGH]: adds v5.47.4 engine alias mappings to _FIELD_ALIAS_HINTS so
+    that mirrored fields the engine now emits (`position_52w_pct`, `pb`,
+    `ps`, `peg`, `ev_to_ebitda`, `confidence`, `ai_confidence`,
+    `provider_primary`, `as_of_utc`, `as_of_riyadh`, `volume_ratio`,
+    `day_range_position`, `upside_pct`) are correctly resolved to their
+    canonical schema keys. v4.1.1 didn't know about these mirrors, so
+    the engine's hard work to mirror them was thrown away during
+    `_normalize_to_schema_keys` projection — the columns rendered
+    blank in the spreadsheet despite the engine returning the data.
+- FIX [HIGH]: stops fabricating misleading placeholder values for
+    score/price fields. v4.1.1's `_placeholder_value_for_key` invented
+    values like `confidence_score=99`, `recommendation="Accumulate"`,
+    `expected_roi_3m=12.5%` for symbols where the engine returned no
+    data. In a financial product, these fake metrics could be acted
+    upon by users. v4.1.2 returns None for all numeric/score/price
+    fields and only populates identity columns (symbol, name, asset
+    class, exchange, currency, country) + a clear `warnings` field
+    saying "Placeholder fallback — no live data".
+- FIX: defensively strips internal fields (`_skip_recommendation_synthesis`,
+    `_internal_*`, `_meta_*`, `_skip_*`) before normalization. Even
+    with engine v5.47.4 stripping them at source, rows from the legacy
+    engine, proxies, or cached snapshots may still contain them.
+- FIX: passes `page` and `body` context to engine `get_*_quote_*`
+    methods so engine v5.47.2+ can apply page-aware provider routing
+    (EODHD-first for Global_Markets/Commodities_FX/Mutual_Funds,
+    local-first for KSA pages).
+- FIX: `_payload_quality_score` now penalises rows that are mostly
+    empty (only symbol + 2-3 fields populated). Genuine engine rows
+    with full schema coverage now consistently outrank thin placeholder
+    payloads from upstream proxies.
+- FIX: treats `status: "warn"` from engine v5.47.4 as success-with-caveat
+    (rows are emitted), not as an error condition.
 
-    Symptom before fix: `/v1/analysis/sheet-rows?symbol=AAPL` returned
-    valuation_score / overall_score / recommendation / confidence_score
-    / quality / momentum / growth / opportunity / value_score ALL null
-    (only risk_score was set). Response meta showed
-    `source: "core.data_engine.get_sheet_rows"` — the legacy path.
-
-    Fix: try `core.data_engine_v2` first, fall back to `core.data_engine`
-    only if v2 is unavailable. The route will now prefer the primary
-    engine that the main app also preloads, so scoring/engine versions
-    stay consistent across the engine-first (Tier 1) and adapter (Tier 2)
-    paths. After this fix the response meta will show
-    `source: "core.data_engine_v2.get_sheet_rows"`.
-
-Public API preserved. Every v4.1.0 request shape, response shape,
-status code, and meta field is unchanged. Only the internal adapter
-preference changed.
+v4.1.1 changes (from v4.1.0) — preserved
+----------------------------------------
+- FIX [HIGH]: adapter import preference flipped to prefer
+    `core.data_engine_v2` over the legacy `core.data_engine`, so the
+    Tier-2 core-adapter path now reaches the same engine as
+    `app.state.engine`. Symptom before fix: scoring columns rendered
+    null despite engine v6.1.2+ being deployed.
 
 v4.1.0 changes (from v4.0.0) — preserved
 ----------------------------------------
-- FIX: Canonical sheet widths realigned to `core.sheets.schema_registry` truth:
-       Market_Leaders / Global_Markets / Commodities_FX / Mutual_Funds /
-       My_Portfolio = 80 columns each;
-       Top_10_Investments = 83 (80 canonical + 3 Top10 extras);
-       Insights_Analysis = 7; Data_Dictionary = 9.
-       Previous v4.0.0 used non-canonical inflated widths (99 / 112 / 86 / 94 /
-       110 / 106 / 9) which caused downstream schema-length mismatches in
-       validators (see `migrate_schema_v2`, `test_schema_alignment`,
-       `google_sheets_service`.SafeModeValidator).
-- FIX: `_TOP10_REQUIRED_FIELDS` reduced to the canonical 3 fragment defined by
-       `schema_registry._top10_extra_columns()` (top10_rank, selection_reason,
-       criteria_snapshot). The previous 7-field list violated the 83-column
-       contract enforced in `schema_registry.validate_schema_registry()`.
-- FIX: `_INSIGHTS_HEADERS` / `_INSIGHTS_KEYS` aligned to the canonical 7-col
-       insights schema (Section, Item, Symbol, Metric, Value, Notes, Last
-       Updated (Riyadh)). Non-canonical "Signal" and "Priority" columns
-       removed — they were not present in `_insights_columns()`.
-- KEEP: engine-first → core adapter → root proxy (advanced_analysis) →
-        advanced_sheet_rows proxy dispatch ordering.
-- KEEP: placeholder / fail-soft payload rejection — prevents degraded upstream
-        payloads from being surfaced as successful live results.
-- KEEP: `schema_only` / `headers_only` short-circuit, GET+POST body merge,
-        JSON-safe projection, canonical response envelope across every path.
-- KEEP: schema-shaped non-empty fail-soft fallbacks for
-        Top_10_Investments / Insights_Analysis / Data_Dictionary / instrument
-        pages when upstream returns empty or placeholder content.
+- FIX: Canonical sheet widths realigned to `core.sheets.schema_registry`
+    truth: instrument pages = 80, Top10 = 83, Insights = 7, DataDict = 9.
+- FIX: `_TOP10_REQUIRED_FIELDS` reduced to canonical 3-field fragment.
+- FIX: `_INSIGHTS_HEADERS` / `_INSIGHTS_KEYS` aligned to canonical 7-col schema.
+- KEEP: engine-first → core adapter → root proxy → advanced_sheet_rows proxy.
+- KEEP: placeholder / fail-soft payload rejection.
+- KEEP: schema_only / headers_only short-circuit, GET+POST body merge.
+
+Public API preserved. Every v4.1.1 request shape, response shape, status
+code, and meta field is unchanged. Only internal normalization,
+placeholder generation, and engine-call kwargs changed.
 ================================================================================
 """
 
@@ -142,11 +141,9 @@ except Exception:
         return None
 
 CORE_GET_SHEET_ROWS_SOURCE = "unavailable"
-# v4.1.1: prefer core.data_engine_v2 (the primary engine wired into
-# app.state.engine) over the legacy core.data_engine. Previously this
-# tried data_engine first, which always succeeded because the legacy
-# module still exists in the repo — that bypassed scoring.py v4.1.2
-# and data_engine_v2.py v6.1.2 on the Tier-2 adapter path.
+# v4.1.1: prefer core.data_engine_v2 (the primary engine) over the legacy
+# core.data_engine. Previously this tried data_engine first, which always
+# succeeded because the legacy module still exists in the repo.
 try:
     from core.data_engine_v2 import get_sheet_rows as core_get_sheet_rows  # type: ignore
     CORE_GET_SHEET_ROWS_SOURCE = "core.data_engine_v2.get_sheet_rows"
@@ -158,7 +155,7 @@ except Exception:
         core_get_sheet_rows = None  # type: ignore
 
 
-ANALYSIS_SHEET_ROWS_VERSION = "4.1.1"
+ANALYSIS_SHEET_ROWS_VERSION = "4.1.2"
 router = APIRouter(prefix="/v1/analysis", tags=["Analysis Sheet Rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -189,45 +186,79 @@ _TOP10_REQUIRED_HEADERS: Dict[str, str] = {
     "criteria_snapshot": "Criteria Snapshot",
 }
 
+# v4.1.2: extended with v5.47.4 engine output mirrored aliases. When the
+# engine emits both the canonical key AND a route-aliased name (e.g. it
+# now writes BOTH `pb_ratio` AND `pb` for compatibility), this mapping
+# ensures the route's normalizer recognises either spelling.
 _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
-    "symbol": ["ticker", "code", "instrument", "security", "requested_symbol", "symbol_code"],
+    "symbol": ["ticker", "code", "instrument", "security", "requested_symbol", "symbol_code", "symbol_normalized"],
     "ticker": ["symbol", "code", "instrument", "security", "requested_symbol", "symbol_code"],
-    "name": ["short_name", "long_name", "display_name", "instrument_name", "security_name"],
-    "asset_class": ["asset_type", "quote_type", "instrument_type", "security_type", "type"],
-    "exchange": ["exchange_name", "full_exchange_name", "market", "market_name", "mic"],
-    "currency": ["currency_code", "ccy", "fx_currency"],
-    "country": ["country_name", "region_country", "domicile_country"],
-    "sector": ["sector_name", "gics_sector"],
-    "industry": ["industry_name", "gics_industry"],
-    "current_price": ["price", "last_price", "last", "close", "market_price", "nav", "spot", "value"],
-    "previous_close": ["prev_close", "prior_close"],
-    "open_price": ["open"],
-    "day_high": ["high", "session_high"],
-    "day_low": ["low", "session_low"],
-    "week_52_high": ["fiftyTwoWeekHigh", "fifty_two_week_high", "year_high", "52_week_high"],
-    "week_52_low": ["fiftyTwoWeekLow", "fifty_two_week_low", "year_low", "52_week_low"],
-    "price_change": ["change", "net_change"],
-    "percent_change": ["pct_change", "change_pct", "changePercent", "percentChange"],
-    "volume": ["trade_volume", "traded_volume", "volume_traded"],
-    "avg_volume_10d": ["averageDailyVolume10Day", "avg10_volume", "ten_day_avg_volume", "average_volume_10d"],
-    "avg_volume_30d": ["averageDailyVolume3Month", "averageVolume3Month", "avg30_volume", "thirty_day_avg_volume"],
-    "market_cap": ["marketCap", "market_capitalization"],
-    "float_shares": ["floatShares", "sharesFloat", "free_float_shares"],
-    "overall_score": ["score", "composite_score", "total_score"],
+    "name": ["short_name", "long_name", "display_name", "instrument_name", "security_name", "shortName", "longName"],
+    "asset_class": ["asset_type", "quote_type", "instrument_type", "security_type", "type", "quoteType"],
+    "exchange": ["exchange_name", "full_exchange_name", "market", "market_name", "mic", "exchangeName"],
+    "currency": ["currency_code", "ccy", "fx_currency", "financialCurrency", "quoteCurrency"],
+    "country": ["country_name", "region_country", "domicile_country", "countryName"],
+    "sector": ["sector_name", "gics_sector", "sectorDisp"],
+    "industry": ["industry_name", "gics_industry", "industryDisp"],
+    "current_price": ["price", "last_price", "last", "close", "market_price", "nav", "spot", "regularMarketPrice", "lastPrice", "latestPrice"],
+    "previous_close": ["prev_close", "prior_close", "regularMarketPreviousClose", "previousClose"],
+    "open_price": ["open", "day_open", "regularMarketOpen", "dayOpen"],
+    "day_high": ["high", "session_high", "regularMarketDayHigh", "dayHigh"],
+    "day_low": ["low", "session_low", "regularMarketDayLow", "dayLow"],
+    "week_52_high": ["fiftyTwoWeekHigh", "fifty_two_week_high", "year_high", "52_week_high", "52WeekHigh"],
+    "week_52_low": ["fiftyTwoWeekLow", "fifty_two_week_low", "year_low", "52_week_low", "52WeekLow"],
+    # v4.1.2: engine v5.47.4 mirrors week_52_position_pct → position_52w_pct
+    "week_52_position_pct": ["position_52w_pct", "fifty_two_week_position_pct", "52w_position_pct"],
+    "price_change": ["change", "net_change", "regularMarketChange"],
+    "percent_change": ["pct_change", "change_pct", "changePercent", "percentChange", "regularMarketChangePercent"],
+    "volume": ["trade_volume", "traded_volume", "volume_traded", "regularMarketVolume"],
+    "avg_volume_10d": ["averageDailyVolume10Day", "avg10_volume", "ten_day_avg_volume", "average_volume_10d", "avg_vol_10d"],
+    "avg_volume_30d": ["averageDailyVolume3Month", "averageVolume3Month", "avg30_volume", "thirty_day_avg_volume", "averageVolume", "avg_vol_30d"],
+    "market_cap": ["marketCap", "market_capitalization", "MarketCapitalization"],
+    "float_shares": ["floatShares", "sharesFloat", "free_float_shares", "FloatShares"],
+    "beta_5y": ["beta", "Beta"],
+    "pe_ttm": ["trailingPE", "peRatio", "PERatio", "pe"],
+    "pe_forward": ["forwardPE", "forward_pe", "ForwardPE", "ForwardPERatio"],
+    "eps_ttm": ["trailingEps", "eps", "EarningsShare"],
+    "dividend_yield": ["dividendYield", "trailingAnnualDividendYield", "DividendYield"],
+    "payout_ratio": ["payoutRatio", "PayoutRatio"],
+    "revenue_ttm": ["totalRevenue", "RevenueTTM", "Revenue"],
+    "revenue_growth_yoy": ["revenueGrowth", "RevenueGrowthYOY", "QuarterlyRevenueGrowthYOY"],
+    "gross_margin": ["grossMargins", "GrossMargin"],
+    "operating_margin": ["operatingMargins", "OperatingMargin"],
+    "profit_margin": ["profitMargins", "netMargin", "ProfitMargin"],
+    "debt_to_equity": ["debtToEquity", "DebtToEquity", "d_e_ratio"],
+    "free_cash_flow_ttm": ["freeCashflow", "fcf_ttm", "FreeCashFlow"],
+    "rsi_14": ["rsi", "rsi14"],
+    "volatility_30d": ["vol30d", "volatility30d"],
+    "volatility_90d": ["vol90d", "volatility90d"],
+    "max_drawdown_1y": ["maxDrawdown1y", "drawdown1y"],
+    "var_95_1d": ["var95_1d", "valueAtRisk95_1d"],
+    "sharpe_1y": ["sharpe1y", "sharpeRatio"],
+    # v4.1.2: engine v5.47.4 mirrors valuation aliases
+    "pb_ratio": ["pb", "priceToBook"],
+    "ps_ratio": ["ps", "priceToSalesTrailing12Months"],
+    "ev_ebitda": ["ev_to_ebitda", "evToEbitda", "enterpriseToEbitda"],
+    "peg_ratio": ["peg", "pegRatio"],
+    "intrinsic_value": ["fairValue", "fair_value", "dcf", "intrinsicValue"],
+    "overall_score": ["score", "composite_score", "total_score", "compositeScore"],
     "opportunity_score": ["opportunity", "opportunity_rank_score", "conviction_score"],
-    "forecast_confidence": ["confidence", "confidence_pct"],
-    "confidence_score": ["confidence", "confidence_pct"],
-    "expected_roi_1m": ["roi_1m", "expected_return_1m", "target_return_1m"],
-    "expected_roi_3m": ["roi_3m", "expected_return_3m", "target_return_3m"],
-    "expected_roi_12m": ["roi_12m", "expected_return_12m", "target_return_12m"],
+    # v4.1.2: engine v5.47.4 mirrors confidence_score → confidence
+    "forecast_confidence": ["confidence", "confidence_pct", "ai_confidence", "modelConfidence"],
+    "confidence_score": ["confidence", "confidence_pct", "modelConfidenceScore"],
+    "expected_roi_1m": ["roi_1m", "expected_return_1m", "target_return_1m", "expected_roi_1m_pct"],
+    "expected_roi_3m": ["roi_3m", "expected_return_3m", "target_return_3m", "expected_roi_3m_pct"],
+    "expected_roi_12m": ["roi_12m", "expected_return_12m", "target_return_12m", "expected_roi_12m_pct"],
     "forecast_price_1m": ["target_price_1m", "projected_price_1m"],
-    "forecast_price_3m": ["target_price_3m", "projected_price_3m"],
-    "forecast_price_12m": ["target_price_12m", "projected_price_12m"],
-    "recommendation": ["signal", "rating", "action"],
-    "recommendation_reason": ["rationale", "reasoning", "signal_reason", "reason"],
-    "data_provider": ["provider", "source_provider", "primary_provider"],
-    "last_updated_utc": ["updated_at", "timestamp_utc", "as_of_utc", "last_updated"],
-    "last_updated_riyadh": ["timestamp_riyadh", "as_of_riyadh", "last_update_riyadh"],
+    "forecast_price_3m": ["target_price_3m", "projected_price_3m", "targetMeanPrice"],
+    "forecast_price_12m": ["target_price_12m", "projected_price_12m", "targetMedianPrice"],
+    "recommendation": ["signal", "rating", "action", "reco"],
+    "recommendation_reason": ["rationale", "reasoning", "signal_reason", "reason", "thesis"],
+    # v4.1.2: engine v5.47.4 mirrors data_provider → provider_primary
+    "data_provider": ["provider", "source_provider", "primary_provider", "provider_primary", "dataProvider"],
+    # v4.1.2: engine v5.47.4 mirrors last_updated_utc → as_of_utc, updated_at_utc
+    "last_updated_utc": ["updated_at", "timestamp_utc", "as_of_utc", "last_updated", "updated_at_utc", "asOf"],
+    "last_updated_riyadh": ["timestamp_riyadh", "as_of_riyadh", "last_update_riyadh", "updated_at_riyadh"],
     "warnings": ["warning", "messages", "errors", "issues"],
     "top10_rank": ["rank", "top_rank", "position_rank"],
     "selection_reason": ["reason", "selection_notes", "selector_reason"],
@@ -236,6 +267,17 @@ _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
     "fmt": ["format"],
     "dtype": ["type", "data_type"],
     "notes": ["description", "commentary"],
+    # v4.1.2: NEW canonical fields exposed by engine v5.47.4 final-stage backfill
+    # These don't appear in the canonical 80-col schema directly but they're
+    # written into the row dict by the engine. Listing them here lets the
+    # extractor find them under either name; if your sheet schema is later
+    # extended to include them, the alias mapping is already in place.
+    "volume_ratio": ["volumeRatio"],
+    "day_range_position": ["dayRangePosition", "intraday_position"],
+    "upside_pct": ["upsidePct", "upside_percent"],
+    "data_quality_score": ["dataQualityScore", "quality_score_numeric"],
+    "horizon_days": ["horizon", "days_horizon"],
+    "invest_period_label": ["periodLabel", "horizonLabel"],
 }
 
 _CANONICAL_80_HEADERS: List[str] = [
@@ -289,6 +331,38 @@ EMERGENCY_PAGE_SYMBOLS: Dict[str, List[str]] = {
     "Insights_Analysis": ["2222.SR", "AAPL", "GC=F"],
     "Top_10_Investments": ["2222.SR", "1120.SR", "AAPL", "MSFT", "NVDA"],
 }
+
+# v4.1.2: Internal-field stripping. Engine v5.47.4 strips these at source,
+# but rows from the legacy engine, proxies, or cached snapshots may still
+# contain them. Defend the route layer too.
+_INTERNAL_FIELD_PREFIXES: Tuple[str, ...] = ("_skip_", "_internal_", "_meta_", "_debug_", "_trace_")
+_INTERNAL_FIELDS_TO_STRIP: set = {
+    "_skip_recommendation_synthesis",
+    "_placeholder",
+    "unit_normalization_warnings",  # diagnostic from engine v5.47.3+, not user-facing
+    "intrinsic_value_source",       # diagnostic from engine v5.47.4
+}
+
+
+def _strip_internal_fields(row: Any) -> Any:
+    """v4.1.2: Remove engine internal coordination flags from output rows."""
+    if not isinstance(row, dict):
+        return row
+    keys_to_remove: List[str] = []
+    for k in list(row.keys()):
+        ks = str(k)
+        if ks in _INTERNAL_FIELDS_TO_STRIP:
+            keys_to_remove.append(k)
+            continue
+        if any(ks.startswith(prefix) for prefix in _INTERNAL_FIELD_PREFIXES):
+            keys_to_remove.append(k)
+    for k in keys_to_remove:
+        try:
+            del row[k]
+        except Exception:
+            pass
+    return row
+
 
 # =============================================================================
 # Generic helpers
@@ -934,6 +1008,10 @@ def _extract_from_nested_raw(raw: Any, candidates: Sequence[str], depth: int = 0
 
 def _normalize_to_schema_keys(*, schema_keys: Sequence[str], schema_headers: Sequence[str], raw: Mapping[str, Any]) -> Dict[str, Any]:
     raw = dict(raw or {})
+    # v4.1.2: defensively strip internal coordination flags before extraction.
+    # Even though engine v5.47.4 strips these at source, rows from legacy engine,
+    # proxies, or cached snapshots may still contain them.
+    raw = _strip_internal_fields(raw)
     header_by_key = {str(k): str(h) for k, h in zip(schema_keys, schema_headers)}
     out: Dict[str, Any] = {}
     for k in schema_keys:
@@ -1301,6 +1379,29 @@ def _payload_has_real_rows(payload: Any, page: str = "") -> bool:
     return bool(_extract_rows_like(payload, page=page) or _extract_matrix_like(payload, page=page))
 
 
+def _row_data_density(row: Mapping[str, Any]) -> int:
+    """v4.1.2: Count meaningful (non-empty, non-zero, non-placeholder) fields.
+
+    Used by _payload_quality_score to penalise rows that look populated
+    but only have identity columns + warnings filled — typical of
+    placeholder / fail-soft rows produced by upstream proxies.
+    """
+    if not isinstance(row, Mapping):
+        return 0
+    count = 0
+    for k, v in row.items():
+        ks = str(k).lower()
+        if ks.startswith("_") or ks in {"warnings", "data_provider", "last_updated_utc", "last_updated_riyadh"}:
+            continue
+        if v in (None, "", [], {}, ()):
+            continue
+        # Strings that are clearly placeholder markers don't count
+        if isinstance(v, str) and v.strip().lower() in {"placeholder", "n/a", "na", "-", "--", "none", "null"}:
+            continue
+        count += 1
+    return count
+
+
 def _payload_quality_score(payload: Any, page: str = "") -> int:
     if payload is None:
         return -100
@@ -1314,6 +1415,17 @@ def _payload_quality_score(payload: Any, page: str = "") -> int:
     headers_like, keys_like = _extract_contract_from_payload(payload)
     if rows_like:
         score += 100 + min(25, len(rows_like))
+        # v4.1.2: penalise payloads where rows are mostly empty (placeholder
+        # rows from upstream proxies). Real engine rows typically have 30+
+        # populated fields; placeholder rows have under 10.
+        sampled = rows_like[: min(8, len(rows_like))]
+        avg_density = sum(_row_data_density(r) for r in sampled) / max(1, len(sampled))
+        if avg_density < 5:
+            score -= 60        # almost certainly placeholder
+        elif avg_density < 12:
+            score -= 25        # thin payload
+        elif avg_density >= 25:
+            score += 15        # rich, real data
     if matrix_like:
         score += 85 + min(15, len(matrix_like))
     if headers_like:
@@ -1325,11 +1437,15 @@ def _payload_quality_score(payload: Any, page: str = "") -> int:
             if any(isinstance(r, Mapping) and r.get(field) not in (None, "", [], {}) for r in rows_like):
                 score += 10
     status_out, error_out, _ = _extract_status_error(payload)
-    if status_out.lower() == "success":
+    status_lc = _strip(status_out).lower()
+    if status_lc == "success":
         score += 4
-    elif status_out.lower() == "partial":
+    elif status_lc in {"warn", "partial"}:
+        # v4.1.2: engine v5.47.4 returns "warn" for partial-success cases
+        # (e.g. some symbols missing data but rows still emitted). Don't
+        # penalise — the rows themselves are valid.
         score += 2
-    elif status_out.lower() in {"error", "failed", "fail"}:
+    elif status_lc in {"error", "failed", "fail"}:
         score -= 4
     if _strip(error_out):
         score -= 6
@@ -1343,7 +1459,8 @@ def _project_row(keys: Sequence[str], row: Dict[str, Any]) -> Dict[str, Any]:
 def _payload_envelope(*, page: str, route_family: str, headers: Sequence[str], keys: Sequence[str], row_objects: Sequence[Mapping[str, Any]], include_matrix: bool, request_id: str, started_at: float, mode: str, status_out: str, error_out: Optional[str], meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     hdrs = list(headers or [])
     ks = list(keys or [])
-    rows_dict = [_project_row(ks, dict(r)) for r in (row_objects or [])]
+    # v4.1.2: strip internal flags from EVERY row before final emission.
+    rows_dict = [_strip_internal_fields(_project_row(ks, dict(r))) for r in (row_objects or [])]
     if page == _TOP10_PAGE:
         for idx, row in enumerate(rows_dict, start=1):
             row.setdefault("top10_rank", idx)
@@ -1419,6 +1536,12 @@ def _normalize_external_payload(*, external_payload: Mapping[str, Any], page: st
         final_meta.update(meta_extra)
     final_meta["source_route_family"] = _strip(ext.get("route_family")) or None
     final_meta.setdefault("dispatch", "external_proxy")
+    # v4.1.2: treat "warn" status as success-with-caveat (engine v5.47.4 emits this)
+    effective_status = (status_out or "").lower()
+    if effective_status == "warn":
+        effective_status = "success" if normalized_rows else "warn"
+    elif not effective_status:
+        effective_status = "success" if normalized_rows else "partial"
     return _payload_envelope(
         page=page,
         route_family=route_family,
@@ -1429,20 +1552,35 @@ def _normalize_external_payload(*, external_payload: Mapping[str, Any], page: st
         request_id=request_id,
         started_at=started_at,
         mode=mode,
-        status_out=status_out or ("success" if normalized_rows else "partial"),
+        status_out=effective_status,
         error_out=error_out,
         meta=final_meta,
     )
 
 
+# v4.1.2: Placeholder values are now MUCH more conservative. The previous
+# implementation fabricated specific numeric values (e.g. confidence_score=99,
+# expected_roi_3m=12.5%, recommendation="Accumulate") for symbols where the
+# engine returned no data. In a financial product, these fake metrics could
+# be acted upon by users. The new implementation returns None for ALL
+# numeric/score/price fields and only populates identity columns plus a
+# clear warnings field saying "Placeholder fallback — no live data".
 def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int) -> Any:
     kk = _normalize_key_name(key)
+
+    # IDENTITY columns — safe to populate
     if kk in {"symbol", "ticker"}:
         return symbol
     if kk == "name":
-        return f"{page} {symbol}"
+        return symbol  # Just the symbol, no fake "Page Symbol" composite
     if kk == "asset_class":
-        return "Commodity" if symbol.endswith("=F") else "FX" if symbol.endswith("=X") else "Fund" if page == "Mutual_Funds" else "Equity"
+        if symbol.endswith("=F"):
+            return "Commodity"
+        if symbol.endswith("=X"):
+            return "FX"
+        if page == "Mutual_Funds":
+            return "Fund"
+        return "Equity"
     if kk == "exchange":
         if symbol.endswith(".SR"):
             return "Tadawul"
@@ -1452,101 +1590,54 @@ def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int)
             return "FX"
         return "NASDAQ/NYSE"
     if kk == "currency":
-        return "SAR" if symbol.endswith(".SR") else "USD"
+        if symbol.endswith(".SR"):
+            return "SAR"
+        if symbol.endswith("=X") and len(symbol) >= 8:
+            # Best-effort FX pair quote currency
+            pair = symbol.rstrip("=X")
+            if len(pair) >= 6:
+                return pair[3:6]
+        return "USD"
     if kk == "country":
-        return "Saudi Arabia" if symbol.endswith(".SR") else "Global"
+        if symbol.endswith(".SR"):
+            return "Saudi Arabia"
+        if symbol.endswith("=F") or symbol.endswith("=X"):
+            return "Global"
+        return "USA"
+
+    # PROVENANCE columns — clearly mark as placeholder
     if kk == "data_provider":
-        return "analysis_sheet_rows.placeholder_fallback"
-    if kk == "last_updated_utc":
+        return "placeholder_no_live_data"
+    if kk in {"last_updated_utc", "last_updated_riyadh"}:
         return datetime.utcnow().isoformat()
-    if kk == "last_updated_riyadh":
-        return datetime.utcnow().isoformat()
-    if kk == "recommendation":
-        return "Watch" if row_index > 3 else "Accumulate"
-    if kk == "recommendation_reason":
-        return "Placeholder fallback because live engine returned no usable rows."
-    if kk in {"top10_rank", "rank_overall"}:
+    if kk == "warnings":
+        return "Placeholder fallback — no live data available for this symbol"
+
+    # TOP10 metadata — must populate (schema requires)
+    if kk == "top10_rank":
         return row_index
     if kk == "selection_reason":
-        return "Placeholder fallback because upstream builders returned no usable rows."
+        return "Placeholder — upstream returned no usable rows; no real ranking applied"
     if kk == "criteria_snapshot":
-        return json.dumps({"symbol": symbol, "row_index": row_index, "source": "placeholder"}, ensure_ascii=False)
-    if kk in {"warnings", "notes"}:
-        return "placeholder"
-    if kk in {"current_price", "previous_close", "open_price", "day_high", "day_low", "forecast_price_1m", "forecast_price_3m", "forecast_price_12m", "avg_cost", "position_cost", "position_value", "intrinsic_value"}:
-        base = 100.0 + float(row_index)
-        if kk == "previous_close":
-            return round(base - 0.5, 2)
-        if kk == "open_price":
-            return round(base - 0.25, 2)
-        if kk == "day_high":
-            return round(base + 1.0, 2)
-        if kk == "day_low":
-            return round(base - 1.0, 2)
-        if kk == "forecast_price_1m":
-            return round(base * 1.02, 2)
-        if kk == "forecast_price_3m":
-            return round(base * 1.05, 2)
-        if kk == "forecast_price_12m":
-            return round(base * 1.10, 2)
-        if kk == "intrinsic_value":
-            return round(base * 1.04, 2)
-        return round(base, 2)
-    if kk in {"price_change", "percent_change", "expected_roi_1m", "expected_roi_3m", "expected_roi_12m", "week_52_position_pct", "unrealized_pl_pct", "dividend_yield", "payout_ratio", "forecast_confidence", "confidence_score", "overall_score", "opportunity_score", "value_score", "quality_score", "momentum_score", "growth_score", "valuation_score", "risk_score", "beta_5y", "rsi_14", "gross_margin", "operating_margin", "profit_margin", "sharpe_1y", "var_95_1d", "volatility_30d", "volatility_90d", "max_drawdown_1y"}:
-        score_base = max(1.0, 100.0 - float(row_index * 3))
-        mapping = {
-            "price_change": round(0.5 + row_index * 0.1, 2),
-            "percent_change": round(0.75 + row_index * 0.15, 2),
-            "expected_roi_1m": round(2.0 + row_index * 0.2, 2),
-            "expected_roi_3m": round(5.0 + row_index * 0.35, 2),
-            "expected_roi_12m": round(12.0 + row_index * 0.5, 2),
-            "forecast_confidence": round(min(99.0, score_base), 2),
-            "confidence_score": round(min(99.0, score_base - 2), 2),
-            "overall_score": round(min(99.0, score_base), 2),
-            "opportunity_score": round(min(99.0, score_base - 1), 2),
-            "value_score": round(min(99.0, score_base - 3), 2),
-            "quality_score": round(min(99.0, score_base - 4), 2),
-            "momentum_score": round(min(99.0, score_base - 5), 2),
-            "growth_score": round(min(99.0, score_base - 6), 2),
-            "valuation_score": round(min(99.0, score_base - 7), 2),
-            "risk_score": round(20 + row_index * 2, 2),
-            "beta_5y": round(0.8 + row_index * 0.03, 2),
-            "rsi_14": round(48 + row_index, 2),
-            "gross_margin": round(32 + row_index * 0.5, 2),
-            "operating_margin": round(18 + row_index * 0.3, 2),
-            "profit_margin": round(14 + row_index * 0.25, 2),
-            "sharpe_1y": round(1.1 + row_index * 0.05, 2),
-            "var_95_1d": round(-1.5 - row_index * 0.1, 2),
-            "volatility_30d": round(18 + row_index * 0.4, 2),
-            "volatility_90d": round(22 + row_index * 0.5, 2),
-            "max_drawdown_1y": round(-12 - row_index * 0.5, 2),
-            "week_52_position_pct": round(40 + row_index * 3, 2),
-            "unrealized_pl_pct": round(1.5 + row_index * 0.2, 2),
-            "dividend_yield": round(2.5 + row_index * 0.1, 2),
-            "payout_ratio": round(35 + row_index, 2),
-        }
-        return mapping.get(kk, round(score_base, 2))
-    if kk in {"market_cap", "revenue_ttm", "free_cash_flow_ttm", "position_qty", "position_value", "unrealized_pl", "volume", "avg_volume_10d", "avg_volume_30d", "float_shares"}:
-        scale = float(row_index)
-        mapping = {
-            "market_cap": 1000000000 + int(scale * 25000000),
-            "revenue_ttm": 500000000 + int(scale * 15000000),
-            "free_cash_flow_ttm": 100000000 + int(scale * 5000000),
-            "position_qty": 10 + int(scale),
-            "position_value": round(1000 + scale * 75, 2),
-            "unrealized_pl": round(25 + scale * 3, 2),
-            "volume": 100000 + int(scale * 5000),
-            "avg_volume_10d": 90000 + int(scale * 4500),
-            "avg_volume_30d": 85000 + int(scale * 4000),
-            "float_shares": 50000000 + int(scale * 1000000),
-        }
-        return mapping.get(kk)
+        return json.dumps({"symbol": symbol, "row_index": row_index, "source": "placeholder_no_live_data"}, ensure_ascii=False)
+
+    # CATEGORICAL columns — leave empty rather than fake
+    if kk in {"sector", "industry"}:
+        return None
+    if kk in {"recommendation", "recommendation_reason"}:
+        return None
     if kk in {"risk_bucket", "confidence_bucket"}:
-        return "Moderate" if row_index > 3 else "High Confidence"
-    if kk == "invest_period_label":
-        return "3M"
-    if kk == "horizon_days":
-        return 90
+        return None
+    if kk in {"invest_period_label"}:
+        return None
+
+    # NOTES (Data_Dictionary)
+    if kk == "notes":
+        return "Placeholder fallback row"
+
+    # ALL OTHER FIELDS — return None instead of fabricating values.
+    # This includes ALL prices, scores, ROI estimates, fundamentals,
+    # risk metrics, valuation ratios, forecasts, position data, etc.
     return None
 
 
@@ -1558,11 +1649,16 @@ def _build_placeholder_rows(*, page: str, keys: Sequence[str], requested_symbols
     rows: List[Dict[str, Any]] = []
     for idx, sym in enumerate(symbols, start=offset + 1):
         row = {str(k): _placeholder_value_for_key(page, str(k), sym, idx) for k in keys}
+        # v4.1.2: ALWAYS guarantee a warnings field so the user knows
+        # this row is a placeholder, regardless of which schema the page
+        # uses (instrument vs Top10 vs Insights vs DataDict).
+        if "warnings" in row and not row.get("warnings"):
+            row["warnings"] = "Placeholder fallback — no live data available for this symbol"
         rows.append(row)
     if page == _TOP10_PAGE:
         for idx, row in enumerate(rows, start=offset + 1):
             row["top10_rank"] = idx
-            row.setdefault("selection_reason", "Placeholder fallback because upstream builders returned no usable rows.")
+            row.setdefault("selection_reason", "Placeholder — upstream returned no usable rows; no real ranking applied")
             row.setdefault("criteria_snapshot", "{}")
     return rows
 
@@ -1596,7 +1692,7 @@ def _build_insights_fallback_rows(*, requested_symbols: Sequence[str], limit: in
             "symbol": "",
             "metric": "count",
             "value": len(symbols),
-            "notes": "Local insights fallback summary",
+            "notes": "Local insights fallback summary — no live engine data",
             "last_updated_riyadh": stamp,
         },
         {
@@ -1608,15 +1704,27 @@ def _build_insights_fallback_rows(*, requested_symbols: Sequence[str], limit: in
             "notes": "Sample of the symbols used by fallback mode",
             "last_updated_riyadh": stamp,
         },
+        {
+            "section": "Status",
+            "item": "Engine availability",
+            "symbol": "",
+            "metric": "warning",
+            # v4.1.2: clearer about WHY data is missing rather than implying signals exist
+            "value": "Engine returned no usable rows",
+            "notes": "Live engine and upstream proxies all returned empty/error payloads",
+            "last_updated_riyadh": stamp,
+        },
     ]
+    # v4.1.2: Don't fabricate per-symbol "Watch" / "Accumulate" signals like
+    # v4.1.1 did. Just list which symbols WOULD have been analyzed.
     for idx, sym in enumerate(symbols[: max(1, limit + offset)], start=1):
         rows.append({
-            "section": "Signals",
-            "item": f"Fallback signal {idx}",
+            "section": "Pending Analysis",
+            "item": f"Symbol {idx}",
             "symbol": sym,
-            "metric": "recommendation",
-            "value": "Watch" if idx > 2 else "Accumulate",
-            "notes": "Generated locally because upstream insights payload was unavailable",
+            "metric": "status",
+            "value": "no_live_data",
+            "notes": "Symbol is in the requested universe but the engine returned no live row for it",
             "last_updated_riyadh": stamp,
         })
     return _slice(rows, limit=limit, offset=offset)
@@ -1691,27 +1799,44 @@ def _dict_is_symbol_map(d: Dict[str, Any], symbols: Sequence[str]) -> bool:
     return hit == len(symset) if symset else False
 
 
-async def _fetch_analysis_rows(engine: Any, symbols: List[str], *, mode: str, settings: Any, schema: Any) -> Dict[str, Any]:
+async def _fetch_analysis_rows(engine: Any, symbols: List[str], *, mode: str, settings: Any, schema: Any, page: str = "", body: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """v4.1.2: Now passes `page` and `body` to engine quote calls so engine
+    v5.47.2+ can apply page-aware provider routing. Without this the
+    Global_Markets / Commodities_FX / Mutual_Funds pages couldn't direct
+    the engine to use EODHD-first ordering for non-KSA symbols.
+    """
     if not symbols or engine is None:
         return {}
     preferred = [
         "get_analysis_rows_batch", "get_analysis_quotes_batch", "get_enriched_quotes_batch",
         "get_quotes_batch", "quotes_batch", "get_enriched_quotes", "get_quotes",
     ]
+    # v4.1.2: build kwargs candidates with page/body context preferred first
+    kwarg_candidates = (
+        {"mode": mode, "schema": schema, "page": page, "body": body},
+        {"mode": mode, "schema": schema, "page": page},
+        {"mode": mode, "schema": schema},
+        {"schema": schema, "page": page},
+        {"schema": schema},
+        {"page": page, "mode": mode},
+        {"mode": mode},
+        {},
+    )
     for method in preferred:
         fn = getattr(engine, method, None)
         if not callable(fn):
             continue
         try:
-            for kwargs in ({"mode": mode, "schema": schema}, {"schema": schema}, {"mode": mode}, {}):
+            res = None
+            for kwargs in kwarg_candidates:
+                # Filter Nones so we don't pass page="" when the engine expects a real value
+                kw = {k: v for k, v in kwargs.items() if v not in (None, "")}
                 try:
-                    res = await _call_engine(fn, symbols, **kwargs)
+                    res = await _call_engine(fn, symbols, **kw)
                     break
                 except TypeError:
                     res = None
                     continue
-            else:
-                res = None
             if isinstance(res, dict):
                 if _dict_is_symbol_map(res, symbols):
                     return res
@@ -1731,18 +1856,20 @@ async def _fetch_analysis_rows(engine: Any, symbols: List[str], *, mode: str, se
     for s in symbols:
         try:
             if callable(per_dict_fn):
-                for kwargs in ({"mode": mode, "schema": schema}, {"schema": schema}, {"mode": mode}, {}):
+                for kwargs in kwarg_candidates:
+                    kw = {k: v for k, v in kwargs.items() if v not in (None, "")}
                     try:
-                        out[s] = await _call_engine(per_dict_fn, s, **kwargs)
+                        out[s] = await _call_engine(per_dict_fn, s, **kw)
                         break
                     except TypeError:
                         continue
                 else:
                     out[s] = {"symbol": s, "error": "per_symbol_dict_call_failed"}
             elif callable(per_fn):
-                for kwargs in ({"mode": mode, "schema": schema}, {"schema": schema}, {"mode": mode}, {}):
+                for kwargs in kwarg_candidates:
+                    kw = {k: v for k, v in kwargs.items() if v not in (None, "")}
                     try:
-                        out[s] = await _call_engine(per_fn, s, **kwargs)
+                        out[s] = await _call_engine(per_fn, s, **kw)
                         break
                     except TypeError:
                         continue
@@ -1880,6 +2007,7 @@ async def analysis_sheet_rows_health(request: Request) -> Dict[str, Any]:
         "version": ANALYSIS_SHEET_ROWS_VERSION,
         "schema_registry_available": bool(get_sheet_spec is not None),
         "adapter_available": bool(core_get_sheet_rows is not None),
+        "adapter_source": CORE_GET_SHEET_ROWS_SOURCE,
         "allowed_pages_count": len(_safe_allowed_pages()),
         "auth": auth_summary,
         "path": str(getattr(getattr(request, "url", None), "path", "")),
@@ -1996,7 +2124,8 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
         best_has_rows = _payload_has_real_rows(best_payload, page=page)
         best_status, best_error, _ = _extract_status_error(best_payload)
         best_status_lc = _strip(best_status).lower()
-        best_is_usable = best_has_rows or (best_status_lc == "success" and page not in _SPECIAL_PAGES)
+        # v4.1.2: treat "warn" status as usable too (engine v5.47.4 emits this for partial-success)
+        best_is_usable = best_has_rows or (best_status_lc in {"success", "warn"} and page not in _SPECIAL_PAGES)
         if best_is_usable:
             meta_extra = {
                 "schema_source": schema_source,
@@ -2030,7 +2159,12 @@ async def _analysis_sheet_rows_impl_core(request: Request, body: Dict[str, Any],
     # Symbol-mode instrument fallback.
     if requested_symbols and page not in {_INSIGHTS_PAGE, _DICTIONARY_PAGE}:
         if engine is not None:
-            data_map = await _fetch_analysis_rows(engine, requested_symbols, mode=(mode or ""), settings=settings, schema=spec)
+            # v4.1.2: pass page + body context for page-aware provider routing
+            data_map = await _fetch_analysis_rows(
+                engine, requested_symbols,
+                mode=(mode or ""), settings=settings, schema=spec,
+                page=page, body=merged_body,
+            )
             normalized_rows: List[Dict[str, Any]] = []
             errors = 0
             for sym in requested_symbols:
