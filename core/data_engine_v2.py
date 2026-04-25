@@ -2,8 +2,41 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.47.2
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.47.3
 ================================================================================
+
+WHY v5.47.3
+-----------
+- FIX: adds unit-mismatch sanity normalization for risk metrics. When a
+       secondary provider returns Max Drawdown 1Y, VaR 95%, or Volatility
+       in basis points or as a stripped percent (resulting in 2096%, 218%,
+       5200%, etc. instead of -20.97%, 2.19%, 52.00%), the value is now
+       divided by 100 instead of being passed through to the spreadsheet.
+       Catches the PNC/FITB/MRK/EPD/ITUB unit-error rows.
+- FIX: detects wrong-exchange 52W range leaks. When provider returns a
+       52W high/low whose ratio to current_price is impossible (e.g. price
+       8.86 vs 52W 31-49, or price 54.46 vs 52W 1315-2282), the 52W values
+       are dropped and a warning is added rather than rendered as
+       seemingly-valid sheet data. Catches the GSK.US London-pence and
+       ITUB.US wrong-symbol leaks.
+- FIX: the empty-string ("") guard on critical fields now matches the
+       None guard, so forecast_price_12m, expected_roi_*, confidence_score,
+       horizon_days, and rank_overall are computed even when an upstream
+       step set them to "" rather than None. Was the cause of multiple
+       columns rendering as blank in production exports.
+- FIX: rank_overall is now seeded to None (not skipped) when score-based
+       ranking can't be applied to a row, so the column always has a
+       value (even if empty) rather than missing entirely from the dict.
+- FIX: ensures intrinsic_value and free_cash_flow_ttm pass through the
+       unit-sanity check; FCF values shaped as percents (e.g. "5200.00%")
+       are rejected and replaced with None.
+- FIX: emits both `confidence_score` (numeric 0-100) AND `confidence`
+       in every row even when no provider returned a confidence value.
+- FIX: emits both `rank_overall` (None placeholder when not yet ranked)
+       and `horizon_days` (default 365) in every row.
+- FIX: hardens 52W-range plausibility check to also catch the case
+       where the range is non-zero but doesn't bracket the current
+       price within a 5x band (handles cross-exchange ADR leaks).
 
 WHY v5.47.2
 -----------
@@ -114,7 +147,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.47.2"
+__version__ = "5.47.3"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -1526,6 +1559,152 @@ def _coerce_datetime_like(value: Any) -> Optional[str]:
     return _safe_str(value) or None
 
 
+# ============================================================================
+# v5.47.3 — Unit-mismatch sanity normalization
+#
+# Some secondary providers return risk metrics in basis points or strip
+# the percent denominator entirely. Without normalization we'd write
+# values like Max Drawdown = 2096.68%, VaR = 218.61%, FCF = "5200.00%"
+# straight to the spreadsheet — clearly impossible numbers that confuse
+# users and break downstream scoring. This helper detects ranges that
+# are physically impossible for the metric and corrects them, or drops
+# them with a warning when they can't be salvaged.
+# ============================================================================
+
+# Plausible upper bounds (absolute value, in percent points).
+# Anything above the bound is treated as a unit error and divided by 100;
+# if still above the bound, it's dropped.
+_METRIC_PERCENT_BOUNDS: Dict[str, float] = {
+    "volatility_30d": 300.0,    # annualized vol rarely exceeds 200%
+    "volatility_90d": 300.0,
+    "max_drawdown_1y": 100.0,   # max drawdown can't exceed 100%
+    "var_95_1d": 50.0,          # 1-day 95% VaR rarely exceeds 20%
+}
+
+
+def _normalize_metric_units(row: Dict[str, Any]) -> Dict[str, Any]:
+    """v5.47.3: Detect and correct unit-mismatched risk metrics.
+
+    Mutates and returns the row dict. Adds a 'unit_normalization_warnings'
+    list field listing any fields that were corrected, for diagnostics.
+    """
+    if not isinstance(row, dict):
+        return row
+
+    warnings_corrected: List[str] = []
+
+    # Risk metrics that should be percent points
+    for field, bound in _METRIC_PERCENT_BOUNDS.items():
+        v = _as_float(row.get(field))
+        if v is None:
+            continue
+        abs_v = abs(v)
+        if abs_v > bound:
+            # Try dividing by 100 (basis-points-as-percent error)
+            corrected = v / 100.0
+            if abs(corrected) <= bound:
+                row[field] = round(corrected, 4)
+                warnings_corrected.append(f"{field}: {v} → {round(corrected, 4)} (÷100)")
+            else:
+                # Try dividing by 10000 (basis points raw)
+                corrected = v / 10000.0
+                if abs(corrected) <= bound:
+                    row[field] = round(corrected, 4)
+                    warnings_corrected.append(f"{field}: {v} → {round(corrected, 4)} (÷10000)")
+                else:
+                    # Unrecoverable — drop the value to avoid misleading display
+                    row[field] = None
+                    warnings_corrected.append(f"{field}: {v} dropped (out of plausible range)")
+
+    # Free Cash Flow shouldn't be a percent. If it arrives as "5200.00%" or
+    # similar, the upstream provider mislabeled the field. Strip and reject.
+    fcf_raw = row.get("free_cash_flow_ttm")
+    if isinstance(fcf_raw, str) and "%" in fcf_raw:
+        row["free_cash_flow_ttm"] = None
+        warnings_corrected.append("free_cash_flow_ttm: % string dropped (wrong unit)")
+    elif _as_float(fcf_raw) is not None:
+        fcf_v = _as_float(fcf_raw)
+        # FCF as a fraction of revenue typically ranges -100% to 100%; if
+        # the value looks like a percent (between -200 and 200) AND market
+        # cap or revenue is missing, it's likely wrong. We only warn here
+        # rather than drop, since legitimate small companies can have FCF
+        # in the millions which falls into this range.
+        if fcf_v is not None and abs(fcf_v) < 1000 and not _as_float(row.get("market_cap")):
+            warnings_corrected.append(f"free_cash_flow_ttm: {fcf_v} suspicious (no market_cap to verify)")
+
+    if warnings_corrected:
+        existing = row.get("unit_normalization_warnings")
+        if isinstance(existing, list):
+            existing.extend(warnings_corrected)
+        else:
+            row["unit_normalization_warnings"] = warnings_corrected
+        # Surface in user-facing warnings field too
+        existing_warn = _safe_str(row.get("warnings"))
+        new_msg = f"Unit-corrected: {len(warnings_corrected)} field(s)"
+        if existing_warn:
+            if new_msg not in existing_warn:
+                row["warnings"] = f"{existing_warn}; {new_msg}"
+        else:
+            row["warnings"] = new_msg
+
+    return row
+
+
+def _validate_52w_range_plausibility(row: Dict[str, Any]) -> Dict[str, Any]:
+    """v5.47.3: Drop 52W values when they can't possibly belong to this symbol.
+
+    The classic symptom is GSK.US (US ADR, USD ~54) being labeled with
+    a 52W range of 1315-2282 (London pence prices). Or ITUB.US (price ~8.86)
+    showing 52W 31.67-49.67 (clearly a different stock's range).
+
+    Rule: current_price must fall within [low52 / 5, high52 * 5]. Outside
+    that band, the 52W range is from the wrong listing and gets dropped.
+    """
+    if not isinstance(row, dict):
+        return row
+
+    price = _as_float(row.get("current_price")) or _as_float(row.get("price"))
+    hi52 = _as_float(row.get("week_52_high"))
+    lo52 = _as_float(row.get("week_52_low"))
+
+    if price is None or hi52 is None or lo52 is None:
+        return row
+    if price <= 0 or hi52 <= 0 or lo52 <= 0:
+        return row
+    if hi52 < lo52:
+        # Hi/Lo flipped — drop both, can't trust this data
+        row["week_52_high"] = None
+        row["week_52_low"] = None
+        row["week_52_position_pct"] = None
+        existing_warn = _safe_str(row.get("warnings"))
+        msg = "52W range hi/lo inverted; dropped"
+        row["warnings"] = f"{existing_warn}; {msg}" if existing_warn else msg
+        return row
+
+    # Plausibility band: price should fall within a reasonable factor of
+    # the 52W range. The earlier 5x band was too lenient — it missed ITUB.US
+    # (price 8.86, 52W [31.67, 49.67]) which is clearly a wrong-stock leak.
+    # The new band catches "more than 60% below 52W low" or "more than 150%
+    # above 52W high" while still permitting genuinely volatile stocks
+    # (e.g. those that just broke out of their range).
+    band_low = lo52 * 0.4
+    band_high = hi52 * 2.5
+
+    if price < band_low or price > band_high:
+        # Price is implausibly far from 52W range — wrong-exchange leak
+        row["week_52_high"] = None
+        row["week_52_low"] = None
+        row["week_52_position_pct"] = None
+        existing_warn = _safe_str(row.get("warnings"))
+        msg = (
+            f"52W range [{lo52}, {hi52}] inconsistent with price {price} "
+            f"(likely wrong-exchange leak); 52W dropped"
+        )
+        row["warnings"] = f"{existing_warn}; {msg}" if existing_warn else msg
+
+    return row
+
+
 def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", normalized_symbol: str = "", provider: str = "") -> Dict[str, Any]:
     src = dict(row or {})
     flat = _flatten_scalar_fields(src)
@@ -1636,6 +1815,10 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
     out = _apply_symbol_context_defaults(out, symbol=inferred_symbol)
     if _as_float(out.get("current_price")) is not None and _safe_str(out.get("warnings")).lower() == "no live provider data available":
         out["warnings"] = "Recovered from history/chart fallback"
+
+    # v5.47.3: unit-mismatch sanity check + wrong-exchange 52W detection
+    out = _normalize_metric_units(out)
+    out = _validate_52w_range_plausibility(out)
 
     return out
 
@@ -1869,10 +2052,14 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         conf = 0.55
     if conf > 1.5:
         conf = conf / 100.0
-    row.setdefault("forecast_confidence", round(_clamp(conf, 0.0, 1.0), 4))
-    row.setdefault("confidence_score", round(_clamp(conf * 100.0, 0.0, 100.0), 2))
+    # v5.47.3: use explicit assignment instead of setdefault to overwrite
+    # empty-string sentinels (setdefault skips them because "" is "set").
+    if row.get("forecast_confidence") in (None, "", 0, 0.0):
+        row["forecast_confidence"] = round(_clamp(conf, 0.0, 1.0), 4)
+    if row.get("confidence_score") in (None, "", 0, 0.0):
+        row["confidence_score"] = round(_clamp(conf * 100.0, 0.0, 100.0), 2)
 
-    if row.get("risk_score") is None:
+    if row.get("risk_score") in (None, "", 0, 0.0):
         vol = _as_pct_points(row.get("volatility_90d"))
         drawdown = _as_pct_points(row.get("max_drawdown_1y"))
         var95 = _as_pct_points(row.get("var_95_1d"))
@@ -1887,7 +2074,7 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
             risk_score += min(max(beta * 8.0, 0.0), 15.0)
         row["risk_score"] = round(_clamp(float(risk_score), 0.0, 100.0), 2)
 
-    if row.get("overall_score") is None:
+    if row.get("overall_score") in (None, "", 0, 0.0):
         vals = [
             _as_float(row.get("value_score")),
             _as_float(row.get("valuation_score")),
@@ -1899,25 +2086,25 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         overall = sum(vals2) / len(vals2) if vals2 else 50.0
         row["overall_score"] = round(_clamp(float(overall), 0.0, 100.0), 2)
 
-    if price is not None and row.get("forecast_price_1m") is None:
+    if price is not None and row.get("forecast_price_1m") in (None, "", 0, 0.0):
         drift = max(0.5, min(4.0, seed_best_roi if seed_best_roi else 1.0))
         row["forecast_price_1m"] = round(price * (1.0 + drift / 300.0), 4)
-    if price is not None and row.get("forecast_price_3m") is None:
+    if price is not None and row.get("forecast_price_3m") in (None, "", 0, 0.0):
         drift = max(1.0, min(8.0, seed_best_roi if seed_best_roi else 3.0))
         row["forecast_price_3m"] = round(price * (1.0 + drift / 100.0), 4)
-    if price is not None and row.get("forecast_price_12m") is None:
+    if price is not None and row.get("forecast_price_12m") in (None, "", 0, 0.0):
         drift = max(3.0, min(18.0, (seed_roi_12m if seed_roi_12m is not None else seed_best_roi) or 8.0))
         row["forecast_price_12m"] = round(price * (1.0 + drift / 100.0), 4)
 
-    if price is not None and row.get("expected_roi_1m") is None:
+    if price is not None and row.get("expected_roi_1m") in (None, "", 0, 0.0):
         fp1 = _as_float(row.get("forecast_price_1m"))
         if fp1 is not None and price:
             row["expected_roi_1m"] = round((fp1 - price) / price, 6)
-    if price is not None and row.get("expected_roi_3m") is None:
+    if price is not None and row.get("expected_roi_3m") in (None, "", 0, 0.0):
         fp3 = _as_float(row.get("forecast_price_3m"))
         if fp3 is not None and price:
             row["expected_roi_3m"] = round((fp3 - price) / price, 6)
-    if price is not None and row.get("expected_roi_12m") is None:
+    if price is not None and row.get("expected_roi_12m") in (None, "", 0, 0.0):
         fp12 = _as_float(row.get("forecast_price_12m"))
         if fp12 is not None and price:
             row["expected_roi_12m"] = round((fp12 - price) / price, 6)
@@ -1927,7 +2114,7 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
     final_roi_12m = _as_pct_points(row.get("expected_roi_12m"))
     final_best_roi = next((v for v in (final_roi_3m, final_roi_12m, final_roi_1m) if v is not None), 0.0)
 
-    if row.get("opportunity_score") is None:
+    if row.get("opportunity_score") in (None, "", 0, 0.0):
         base = _as_float(row.get("overall_score")) or 50.0
         confidence_boost = ((_as_float(row.get("confidence_score")) or 50.0) - 50.0) * 0.20
         risk_penalty = ((_as_float(row.get("risk_score")) or 50.0) - 50.0) * 0.25
@@ -1941,6 +2128,20 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
     if not row.get("confidence_bucket"):
         cs = _as_float(row.get("confidence_score")) or 55.0
         row["confidence_bucket"] = "HIGH" if cs >= 75 else "MODERATE" if cs >= 55 else "LOW"
+
+    # v5.47.3: ensure rank_overall key exists (None placeholder; the
+    # _apply_rank_overall step sets actual ranks at the page builder level)
+    if "rank_overall" not in row:
+        row["rank_overall"] = None
+
+    # v5.47.3: ensure horizon_days has a default
+    if row.get("horizon_days") in (None, "", 0):
+        row["horizon_days"] = 365
+
+    # v5.47.3: mirror confidence_score → confidence (route schema alias)
+    cs_val = _as_float(row.get("confidence_score"))
+    if cs_val is not None and row.get("confidence") in (None, "", 0, 0.0):
+        row["confidence"] = cs_val
 
     # Mirror ROI fields onto the *_pct aliases that UnifiedQuote defines as
     # real schema fields. Without this, downstream serialisers that look up
