@@ -417,9 +417,9 @@ PAGE_SYMBOL_ENV_KEYS: Dict[str, str] = {
     "Top_10_Investments": "TOP10_FALLBACK_SYMBOLS",
 }
 
-DEFAULT_PROVIDERS = ["eodhd", "yahoo", "finnhub", "yahoo_fundamentals", "yahoo_chart"]
-DEFAULT_KSA_PROVIDERS = ["tadawul", "argaam", "yahoo", "yahoo_fundamentals", "yahoo_chart"]
-DEFAULT_GLOBAL_PROVIDERS = ["eodhd", "yahoo", "finnhub", "yahoo_fundamentals", "yahoo_chart"]
+DEFAULT_PROVIDERS = ["eodhd", "yahoo", "finnhub"]
+DEFAULT_KSA_PROVIDERS = ["tadawul", "argaam", "yahoo"]
+DEFAULT_GLOBAL_PROVIDERS = ["eodhd", "yahoo", "finnhub"]
 NON_KSA_EODHD_PRIMARY_PAGES = {"Global_Markets", "Commodities_FX", "Mutual_Funds"}
 PAGE_PRIMARY_PROVIDER_DEFAULTS = {page: "eodhd" for page in NON_KSA_EODHD_PRIMARY_PAGES}
 PROVIDER_PRIORITIES = {
@@ -1750,8 +1750,14 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
             row["warnings"] = f"{existing}; {msg}"
         elif not existing:
             row["warnings"] = msg
-        row.setdefault("recommendation", "")
-        row.setdefault("recommendation_reason", "Insufficient data — provider returned no payload.")
+        # Recommendation is a strict Pydantic enum (BUY/HOLD/REDUCE/SELL/etc.)
+        # so we can't insert a "NO_DATA" sentinel. Leave it as None and rely
+        # on the empty `recommendation_reason` to signal data-absence.
+        row["recommendation"] = None
+        row["recommendation_reason"] = "Insufficient data — provider returned no payload."
+        # Set a sentinel that _compute_recommendation respects so it doesn't
+        # synthesise a misleading HOLD from default 50/55/50 scores.
+        row["_skip_recommendation_synthesis"] = True
         return
 
     price = _as_float(row.get("current_price")) or _as_float(row.get("price"))
@@ -1927,6 +1933,10 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
 
 def _compute_recommendation(row: Dict[str, Any]) -> None:
     if row.get("recommendation"):
+        return
+    # Empty-data rows set this sentinel; respect it so we don't fabricate
+    # HOLD ratings from default 50/55/50 scores.
+    if row.get("_skip_recommendation_synthesis"):
         return
     overall = _as_float(row.get("overall_score")) or 50.0
     conf = _as_float(row.get("confidence_score")) or 55.0
@@ -3147,21 +3157,22 @@ class DataEngineV5:
                 ((), {"symbol": symbol, "settings": self.settings}),
             ]
 
-            # One retry pass on transient failures. We only retry timeouts,
-            # connection errors, and JSON-decode-style errors — anything that
-            # smells transient — never on TypeError (signature mismatch) or
-            # explicit auth/permission errors.
-            transient_exc_names = {
-                "TimeoutError", "asyncio.TimeoutError", "ConnectionError",
-                "ClientConnectorError", "ServerDisconnectedError", "ClientOSError",
-                "ReadTimeout", "ConnectTimeout", "RemoteProtocolError",
-                "JSONDecodeError", "SSLError",
+            # One retry pass on FAST-FAIL transient errors only. We never
+            # retry timeouts — retrying a 20s timeout means waiting another
+            # 20s, which compounds across providers and pushes the whole
+            # request past Render's edge timeout (~100s). JSON-decode and
+            # SSL handshake failures fail in milliseconds, so retrying
+            # them is cheap and frequently succeeds on the second try.
+            fast_fail_exc_names = {
+                "JSONDecodeError", "SSLError", "ContentTypeError",
+                "ServerDisconnectedError", "RemoteProtocolError",
+                "ClientPayloadError",
             }
             max_attempts = 2
 
             result = None
             collected_errs: List[str] = []
-            last_was_transient = False
+            last_was_fast_fail = False
 
             for attempt in range(max_attempts):
                 attempt_succeeded = False
@@ -3172,28 +3183,30 @@ class DataEngineV5:
                         attempt_succeeded = True
                         break
                     except TypeError:
-                        # signature mismatch — try the next variant, don't count as transient
+                        # signature mismatch — try the next variant
                         continue
-                    except asyncio.TimeoutError as exc:
+                    except asyncio.TimeoutError:
+                        # NEVER retry timeouts — they cost the full per-provider
+                        # timeout window and would compound across providers.
                         collected_errs.append(f"TimeoutError: attempt {attempt+1}")
-                        last_was_transient = True
+                        last_was_fast_fail = False
                         break
                     except Exception as exc:
                         name = type(exc).__name__
                         collected_errs.append(f"{name}: {str(exc)[:120]}")
-                        last_was_transient = name in transient_exc_names
-                        if not last_was_transient:
-                            # Non-transient: try next call variant in case it's a signature thing
+                        last_was_fast_fail = name in fast_fail_exc_names
+                        if not last_was_fast_fail:
                             continue
                         break
 
                 if attempt_succeeded and result is not None:
                     break
-                if not last_was_transient:
-                    break  # don't retry signature/auth/etc errors
+                if not last_was_fast_fail:
+                    break
                 if attempt < max_attempts - 1:
-                    # short backoff before retry — ~250-500ms with jitter
-                    await asyncio.sleep(0.25 + 0.25 * random.random())
+                    # tiny backoff for fast-fail retries — these errors are
+                    # near-instant so we don't need much spacing
+                    await asyncio.sleep(0.15 + 0.15 * random.random())
 
             latency = (time.time() - start) * 1000.0
             patch = _model_to_dict(result)
@@ -3666,10 +3679,11 @@ class DataEngineV5:
         providers = self._providers_for(norm, page=page_context)
         patches_ok: List[Tuple[str, Dict[str, Any], float]] = []
         if providers:
-            # Allow up to 6 providers to fan out concurrently (was 4). This
-            # makes room for yahoo_fundamentals / yahoo_chart as additional
-            # fallbacks alongside the eodhd / yahoo / finnhub base set.
-            fanout_limit = max(3, _get_env_int("PROVIDER_FANOUT_LIMIT", 6))
+            # Fan out to up to 4 providers concurrently. Stays at the
+            # original limit — raising it amplifies per-symbol latency
+            # because each provider's enriched method may itself trigger
+            # multiple sub-requests (quote + fundamentals + history).
+            fanout_limit = max(2, _get_env_int("PROVIDER_FANOUT_LIMIT", 4))
             gathered = await asyncio.gather(*[self._fetch_patch(p, norm) for p in providers[:fanout_limit]], return_exceptions=True)
             for item in gathered:
                 if isinstance(item, tuple) and len(item) == 4:
@@ -3700,9 +3714,17 @@ class DataEngineV5:
             row = _merge_missing_fields(row, cached_best_row)
             row = _apply_page_row_backfill(page_context or sheet or "", row)
 
-        # Risk-metric fields are *almost never* on live quote payloads; they
-        # come from history. Always run the history fallback if any of these
-        # are missing — not only when the live quote also failed.
+        # Risk-metric fields are almost never on live quote payloads; they
+        # come from history. EODHD's enriched_quote_patch already calls
+        # fetch_history_stats internally, so when EODHD is in the response
+        # the row should have them. We only need a separate history fallback
+        # when:
+        #   (a) every provider's enriched call failed to supply them, OR
+        #   (b) the live providers don't fetch history at all (KSA on tadawul/argaam).
+        # We also gate it behind an env var so it can be turned off entirely
+        # if it's still pushing requests over the edge timeout.
+        history_fallback_enabled = _get_env_bool("HISTORY_FALLBACK_ENABLED", True)
+
         risk_metric_fields = (
             "volatility_30d",
             "volatility_90d",
@@ -3714,23 +3736,43 @@ class DataEngineV5:
         price_history_fields = (
             "current_price",
             "previous_close",
-            "day_high",
-            "day_low",
             "week_52_high",
             "week_52_low",
-            "avg_volume_10d",
-            "avg_volume_30d",
-            "open_price",
         )
-        missing_history_fields = list(price_history_fields) + list(risk_metric_fields)
 
-        needs_history = any(row.get(k) in (None, "", [], {}) for k in missing_history_fields)
+        # Only trigger history fallback if BOTH:
+        #   - core price data (price + 52w hi/lo) is incomplete, OR
+        #   - ALL risk metrics are missing AND we have a price (meaning the
+        #     enriched call worked but didn't include history stats).
+        # Previously this fired whenever ANY field was missing, which is too
+        # aggressive — most rows that get a live quote are missing at least
+        # one minor field.
+        missing_core_price = any(row.get(k) in (None, "", [], {}) for k in price_history_fields)
+        all_risk_missing = all(row.get(k) in (None, "", [], {}) for k in risk_metric_fields)
+        has_price = _as_float(row.get("current_price")) is not None
+
+        needs_history = history_fallback_enabled and (
+            missing_core_price or (all_risk_missing and has_price)
+        )
+
         if needs_history:
-            hist_patch = await self._get_history_patch_best_effort(norm, providers, page=page_context)
+            try:
+                # Cap the history-fallback at a tight timeout — it's a
+                # secondary enrichment, not the primary path. Better to skip
+                # it than to time out the whole request.
+                hist_timeout = max(3.0, _get_env_float("HISTORY_FALLBACK_TIMEOUT_SECONDS", 8.0))
+                hist_patch = await asyncio.wait_for(
+                    self._get_history_patch_best_effort(norm, providers, page=page_context),
+                    timeout=hist_timeout,
+                )
+            except asyncio.TimeoutError:
+                hist_patch = None
+            except Exception:
+                hist_patch = None
+
             if hist_patch:
                 # Only fill MISSING fields from history — don't overwrite
-                # live-quote values (e.g. don't replace today's open with a
-                # stale daily-bar open if the live feed already gave us one).
+                # live-quote values.
                 history_fill = {k: v for k, v in hist_patch.items() if row.get(k) in (None, "", [], {})}
                 if history_fill:
                     history_fill["data_provider"] = hist_patch.get("data_provider") or "history"
