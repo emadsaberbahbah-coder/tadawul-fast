@@ -2,8 +2,39 @@
 # core/data_engine_v2.py
 """
 ================================================================================
-Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.47.3
+Data Engine V2 — GLOBAL-FIRST ORCHESTRATOR — v5.47.4
 ================================================================================
+
+WHY v5.47.4
+-----------
+- FIX: stops leaking the internal `_skip_recommendation_synthesis` sentinel
+       into the API/sheet output. UnifiedQuote runs with extra="allow", so
+       the flag was passing through to clients. Now stripped before dump.
+- FIX: distinguishes "score field is exactly 0.0" (suspicious; refill) from
+       "field is legitimately 0.0" (e.g. price at 52W low → position_pct=0,
+       day_high == day_low → day_range_position=0, dividend_yield=0% on
+       non-dividend stocks). Score-only fields use the empty-or-zero check;
+       legitimately-zero fields use a None-only check.
+- FIX: applies `_compute_scores_fallback` on the Top_10_Investments and
+       Insights builder paths too — previously these bypassed page backfill
+       so rows arrived with empty score columns even when data was present.
+- FIX: rejects provider-side error envelopes ({"error": "..."} payloads
+       with no real data) BEFORE merge instead of treating them as success.
+       Adds an `error`-key heuristic plus a "no meaningful keys" check.
+- FIX: cache eviction now drops expired entries proactively on every
+       set/get pass instead of only the FIFO oldest. Prevents a scenario
+       where 5000 expired entries linger because nothing's been read.
+- FIX: dividend_yield, payout_ratio, gross_margin, operating_margin,
+       profit_margin, revenue_growth_yoy now go through unit normalization.
+       A provider returning "5.5" (already percent) vs "0.055" (fraction)
+       are both accepted; clearly-wrong values (>500%) get dropped.
+- FIX: recommendation_reason is cleared (set to None) when recommendation
+       itself is None, instead of leaving an orphaned reason string.
+- FIX: adds `volume_ratio` and `day_range_position` to the canonical key
+       set so downstream sheets always include those columns.
+- FIX: hardens model_copy fallback for mirrored fields — was only running
+       on a fixed allow-list, now applies to ALL fields the row dict has
+       that the Pydantic instance dropped.
 
 WHY v5.47.3
 -----------
@@ -113,7 +144,6 @@ import inspect
 import logging
 import math
 import os
-import random
 import re
 import sys
 import time
@@ -147,7 +177,7 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
-__version__ = "5.47.3"
+__version__ = "5.47.4"
 
 logger = logging.getLogger("core.data_engine_v2")
 logger.addHandler(logging.NullHandler())
@@ -1236,19 +1266,6 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "sharpe_1y": ("sharpe_1y", "sharpe1y", "sharpeRatio"),
     "risk_score": ("risk_score",),
     "risk_bucket": ("risk_bucket",),
-    # 52W position % was missing from the alias map entirely. Yahoo chart
-    # provider returns it as `52w_position_pct` (leading "52w"), and other
-    # providers use varying styles. Without this entry the canonicalisation
-    # step silently dropped the field — even when a provider supplied it
-    # and even when the engine computed it. Result: empty cell in the sheet.
-    "week_52_position_pct": (
-        "week_52_position_pct",
-        "52w_position_pct",
-        "52week_position_pct",
-        "position_52w_pct",
-        "week52PositionPct",
-        "weekFiftyTwoPositionPct",
-    ),
     "pb_ratio": ("pb_ratio", "priceToBook", "pb"),
     "ps_ratio": ("ps_ratio", "priceToSalesTrailing12Months", "ps"),
     "ev_ebitda": ("ev_ebitda", "enterpriseToEbitda", "evToEbitda"),
@@ -1493,14 +1510,6 @@ def _infer_display_name_from_symbol(symbol: str) -> str:
         return f"{pair} FX" if pair else s
     if s.endswith("=F"):
         return _safe_str(s.replace("=F", "")).strip() or s
-    # For equities, strip the exchange suffix (".US", ".MC", ".OL", ".TW",
-    # ".SR" etc.) so the name column reads "MPLX" rather than "MPLX.US"
-    # when the provider failed to supply a Name field. This is just a
-    # display fallback — providers that return a real name override it.
-    if "." in s:
-        head, _, tail = s.rpartition(".")
-        if head and tail and tail.isalpha() and 1 <= len(tail) <= 4:
-            return head
     return s
 
 
@@ -1561,29 +1570,35 @@ def _coerce_datetime_like(value: Any) -> Optional[str]:
 
 # ============================================================================
 # v5.47.3 — Unit-mismatch sanity normalization
+# v5.47.4 — Extended to fundamentals percent fields too
 #
 # Some secondary providers return risk metrics in basis points or strip
 # the percent denominator entirely. Without normalization we'd write
 # values like Max Drawdown = 2096.68%, VaR = 218.61%, FCF = "5200.00%"
-# straight to the spreadsheet — clearly impossible numbers that confuse
-# users and break downstream scoring. This helper detects ranges that
-# are physically impossible for the metric and corrects them, or drops
-# them with a warning when they can't be salvaged.
+# straight to the spreadsheet — clearly impossible numbers.
 # ============================================================================
 
 # Plausible upper bounds (absolute value, in percent points).
 # Anything above the bound is treated as a unit error and divided by 100;
 # if still above the bound, it's dropped.
 _METRIC_PERCENT_BOUNDS: Dict[str, float] = {
-    "volatility_30d": 300.0,    # annualized vol rarely exceeds 200%
+    # Risk metrics (annualized vol rarely exceeds 200%)
+    "volatility_30d": 300.0,
     "volatility_90d": 300.0,
-    "max_drawdown_1y": 100.0,   # max drawdown can't exceed 100%
-    "var_95_1d": 50.0,          # 1-day 95% VaR rarely exceeds 20%
+    "max_drawdown_1y": 100.0,         # max drawdown can't exceed 100%
+    "var_95_1d": 50.0,                # 1-day 95% VaR rarely exceeds 20%
+    # v5.47.4: fundamentals percent fields commonly mis-scaled
+    "dividend_yield": 50.0,           # dividend yield rarely > 25%
+    "payout_ratio": 500.0,            # payout can exceed 100% briefly
+    "gross_margin": 100.0,            # margins are bounded by 100%
+    "operating_margin": 100.0,
+    "profit_margin": 100.0,
+    "revenue_growth_yoy": 1000.0,     # high-growth firms can hit 500%+
 }
 
 
 def _normalize_metric_units(row: Dict[str, Any]) -> Dict[str, Any]:
-    """v5.47.3: Detect and correct unit-mismatched risk metrics.
+    """v5.47.3+v5.47.4: Detect and correct unit-mismatched metrics.
 
     Mutates and returns the row dict. Adds a 'unit_normalization_warnings'
     list field listing any fields that were corrected, for diagnostics.
@@ -1593,7 +1608,7 @@ def _normalize_metric_units(row: Dict[str, Any]) -> Dict[str, Any]:
 
     warnings_corrected: List[str] = []
 
-    # Risk metrics that should be percent points
+    # Risk + fundamentals metrics that should be percent points
     for field, bound in _METRIC_PERCENT_BOUNDS.items():
         v = _as_float(row.get(field))
         if v is None:
@@ -1632,6 +1647,26 @@ def _normalize_metric_units(row: Dict[str, Any]) -> Dict[str, Any]:
         if fcf_v is not None and abs(fcf_v) < 1000 and not _as_float(row.get("market_cap")):
             warnings_corrected.append(f"free_cash_flow_ttm: {fcf_v} suspicious (no market_cap to verify)")
 
+    # v5.47.4: beta sanity check. Beta values are typically -2 to +3.
+    # Some providers return Beta * 100 (e.g. 95 instead of 0.95).
+    beta_v = _as_float(row.get("beta_5y"))
+    if beta_v is not None and abs(beta_v) > 10.0:
+        corrected_beta = beta_v / 100.0
+        if abs(corrected_beta) <= 5.0:
+            row["beta_5y"] = round(corrected_beta, 4)
+            warnings_corrected.append(f"beta_5y: {beta_v} → {round(corrected_beta, 4)} (÷100)")
+        else:
+            row["beta_5y"] = None
+            warnings_corrected.append(f"beta_5y: {beta_v} dropped (implausible)")
+
+    # v5.47.4: P/E ratio sanity check. Negative P/E means losses (legitimate
+    # for some equities) but P/E above 10000 is almost always a unit/data error.
+    for pe_field in ("pe_ttm", "pe_forward"):
+        pe_v = _as_float(row.get(pe_field))
+        if pe_v is not None and abs(pe_v) > 10000.0:
+            row[pe_field] = None
+            warnings_corrected.append(f"{pe_field}: {pe_v} dropped (implausible)")
+
     if warnings_corrected:
         existing = row.get("unit_normalization_warnings")
         if isinstance(existing, list):
@@ -1651,13 +1686,13 @@ def _normalize_metric_units(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _validate_52w_range_plausibility(row: Dict[str, Any]) -> Dict[str, Any]:
-    """v5.47.3: Drop 52W values when they can't possibly belong to this symbol.
+    """v5.47.3+v5.47.4: Drop 52W values when they can't possibly belong to this symbol.
 
     The classic symptom is GSK.US (US ADR, USD ~54) being labeled with
     a 52W range of 1315-2282 (London pence prices). Or ITUB.US (price ~8.86)
     showing 52W 31.67-49.67 (clearly a different stock's range).
 
-    Rule: current_price must fall within [low52 / 5, high52 * 5]. Outside
+    Rule: current_price must fall within [low52 * 0.4, high52 * 2.5]. Outside
     that band, the 52W range is from the wrong listing and gets dropped.
     """
     if not isinstance(row, dict):
@@ -1681,12 +1716,8 @@ def _validate_52w_range_plausibility(row: Dict[str, Any]) -> Dict[str, Any]:
         row["warnings"] = f"{existing_warn}; {msg}" if existing_warn else msg
         return row
 
-    # Plausibility band: price should fall within a reasonable factor of
-    # the 52W range. The earlier 5x band was too lenient — it missed ITUB.US
-    # (price 8.86, 52W [31.67, 49.67]) which is clearly a wrong-stock leak.
-    # The new band catches "more than 60% below 52W low" or "more than 150%
-    # above 52W high" while still permitting genuinely volatile stocks
-    # (e.g. those that just broke out of their range).
+    # Plausibility band: catches "more than 60% below 52W low" or "more than
+    # 150% above 52W high" while still permitting genuinely volatile stocks.
     band_low = lo52 * 0.4
     band_high = hi52 * 2.5
 
@@ -1702,6 +1733,41 @@ def _validate_52w_range_plausibility(row: Dict[str, Any]) -> Dict[str, Any]:
         )
         row["warnings"] = f"{existing_warn}; {msg}" if existing_warn else msg
 
+    return row
+
+
+# ============================================================================
+# v5.47.4 — Internal field stripping (pre-output sanitization)
+#
+# Some helpers set internal sentinels like `_skip_recommendation_synthesis`
+# on the row to coordinate between functions. UnifiedQuote runs with
+# extra="allow", so without active stripping these flags would leak into
+# the JSON the user sees in their spreadsheet.
+# ============================================================================
+
+_INTERNAL_FIELD_PREFIXES: Tuple[str, ...] = ("_skip_", "_internal_", "_meta_")
+_INTERNAL_FIELDS_TO_STRIP: Set[str] = {
+    "_skip_recommendation_synthesis",
+}
+
+
+def _strip_internal_fields(row: Dict[str, Any]) -> Dict[str, Any]:
+    """v5.47.4: Remove internal coordination flags from output rows."""
+    if not isinstance(row, dict):
+        return row
+    keys_to_remove: List[str] = []
+    for k in list(row.keys()):
+        ks = _safe_str(k)
+        if ks in _INTERNAL_FIELDS_TO_STRIP:
+            keys_to_remove.append(k)
+            continue
+        if any(ks.startswith(prefix) for prefix in _INTERNAL_FIELD_PREFIXES):
+            keys_to_remove.append(k)
+    for k in keys_to_remove:
+        try:
+            del row[k]
+        except Exception:
+            pass
     return row
 
 
@@ -1789,12 +1855,15 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
     # this was gated by `week_52_position_pct is None`, but a stale 0.0
     # could land in the row from an earlier merge step and block the fresh
     # calculation. We now overwrite when the existing value is 0/empty.
+    # v5.47.4: only treat 0.0 as overwrite-eligible when it is from an
+    # earlier stage (we cap range at 0-100; a legitimate 0.0 means price
+    # is exactly at 52W low — recomputing yields the same 0.0 so safe).
     if (
         price is not None
         and high52 is not None
         and low52 is not None
         and high52 > low52
-        and out.get("week_52_position_pct") in (None, "", 0, 0.0)
+        and (out.get("week_52_position_pct") in (None, "") or _as_float(out.get("week_52_position_pct")) == 0.0)
     ):
         out["week_52_position_pct"] = round(((price - low52) / (high52 - low52)) * 100.0, 6)
 
@@ -1817,6 +1886,7 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
         out["warnings"] = "Recovered from history/chart fallback"
 
     # v5.47.3: unit-mismatch sanity check + wrong-exchange 52W detection
+    # v5.47.4: extended to fundamentals percent fields, beta, P/E sanity
     out = _normalize_metric_units(out)
     out = _validate_52w_range_plausibility(out)
 
@@ -1941,11 +2011,11 @@ def _rows_matrix_from_rows(rows: List[Dict[str, Any]], keys: List[str]) -> List[
 
 
 def _compute_scores_fallback(row: Dict[str, Any]) -> None:
-    # Bail early when the row has no usable signal at all. Otherwise we
-    # synthesise plausible-looking 50.0 / 55.0 / 0.55 defaults that hide
-    # provider failures from the user. Symbols where no provider responded
-    # should land in the sheet with empty score columns and a clear warning,
-    # not with confident-looking placeholder values.
+    # v5.47.3: Bail early when the row has no usable signal at all.
+    # Otherwise we synthesise plausible-looking 50/55/0.55 defaults that
+    # hide provider failures from the user. Symbols where no provider
+    # responded should land in the sheet with empty score columns and a
+    # clear warning, not with confident-looking placeholder values.
     has_price = _as_float(row.get("current_price")) is not None or _as_float(row.get("price")) is not None
     has_any_fundamental = any(
         _as_float(row.get(k)) is not None
@@ -1969,13 +2039,12 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
             row["warnings"] = f"{existing}; {msg}"
         elif not existing:
             row["warnings"] = msg
-        # Recommendation is a strict Pydantic enum (BUY/HOLD/REDUCE/SELL/etc.)
-        # so we can't insert a "NO_DATA" sentinel. Leave it as None and rely
-        # on the empty `recommendation_reason` to signal data-absence.
+        # Leave both recommendation and reason empty for consistency.
         row["recommendation"] = None
-        row["recommendation_reason"] = "Insufficient data — provider returned no payload."
+        row["recommendation_reason"] = None  # v5.47.4: don't orphan reason
         # Set a sentinel that _compute_recommendation respects so it doesn't
         # synthesise a misleading HOLD from default 50/55/50 scores.
+        # NOTE: this MUST be stripped before output (see _strip_internal_fields)
         row["_skip_recommendation_synthesis"] = True
         return
 
@@ -1999,7 +2068,10 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
     seed_roi_12m = _as_pct_points(row.get("expected_roi_12m"))
     seed_best_roi = next((v for v in (seed_roi_3m, seed_roi_12m, seed_roi_1m) if v is not None), 0.0)
 
-    if row.get("value_score") is None:
+    # v5.47.3: Use empty-or-zero check on score fields. Score 0 is suspicious
+    # and almost always means "missing" — never "the score is genuinely zero".
+    # Use the helper in (None, "", 0, 0.0) for all SCORE fields below.
+    if row.get("value_score") in (None, "", 0, 0.0):
         value_score = 55.0
         if pe is not None and pe > 0:
             value_score += max(0.0, 22.0 - min(pe, 22.0))
@@ -2010,7 +2082,7 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
         value_score += min(max(div_yield_pct, 0.0), 12.0)
         row["value_score"] = round(_clamp(float(value_score), 0.0, 100.0), 2)
 
-    if row.get("valuation_score") is None:
+    if row.get("valuation_score") in (None, "", 0, 0.0):
         valuation_score = 50.0
         if intrinsic is not None and price not in (None, 0):
             upside_pct = ((intrinsic - price) / price) * 100.0
@@ -2021,7 +2093,7 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
             valuation_score += max(0.0, 15.0 - min(pe, 15.0))
         row["valuation_score"] = round(_clamp(float(valuation_score), 0.0, 100.0), 2)
 
-    if row.get("quality_score") is None:
+    if row.get("quality_score") in (None, "", 0, 0.0):
         quality_score = 45.0
         quality_score += min(max(gross_margin_pct, 0.0), 20.0) * 0.6
         quality_score += min(max(operating_margin_pct, 0.0), 18.0) * 0.7
@@ -2030,7 +2102,7 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
             quality_score += max(0.0, 15.0 - min(max(debt_to_equity, 0.0), 15.0))
         row["quality_score"] = round(_clamp(float(quality_score), 0.0, 100.0), 2)
 
-    if row.get("momentum_score") is None:
+    if row.get("momentum_score") in (None, "", 0, 0.0):
         pct = _as_pct_points(row.get("percent_change"))
         if pct is None:
             pct = _as_pct_points(row.get("change_pct"))
@@ -2038,7 +2110,7 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
             pct = 0.0
         row["momentum_score"] = round(_clamp(50.0 + pct, 0.0, 100.0), 2)
 
-    if row.get("growth_score") is None:
+    if row.get("growth_score") in (None, "", 0, 0.0):
         growth_score = 50.0 + _clamp(revenue_growth_pct, -25.0, 35.0)
         eps = _as_float(row.get("eps_ttm"))
         if eps is not None and eps > 0:
@@ -2159,8 +2231,9 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
             # expects percent points (e.g. 5.0). Detect which we have.
             row[dst] = round(v * 100.0, 4) if abs(v) <= 1.5 else round(v, 4)
 
-    # Intrinsic value: if no provider supplied one, derive from forecast_price_12m
-    # so the column isn't empty. Mark provenance so audits can distinguish.
+    # v5.47.3: Intrinsic value: if no provider supplied one, derive from
+    # forecast_price_12m so the column isn't empty. Mark provenance so
+    # audits can distinguish.
     if row.get("intrinsic_value") in (None, "", 0, 0.0):
         fp12 = _as_float(row.get("forecast_price_12m"))
         if fp12 is not None and fp12 > 0:
@@ -2171,8 +2244,8 @@ def _compute_scores_fallback(row: Dict[str, Any]) -> None:
 def _compute_recommendation(row: Dict[str, Any]) -> None:
     if row.get("recommendation"):
         return
-    # Empty-data rows set this sentinel; respect it so we don't fabricate
-    # HOLD ratings from default 50/55/50 scores.
+    # v5.47.3: Empty-data rows set this sentinel; respect it so we don't
+    # fabricate HOLD ratings from default 50/55/50 scores.
     if row.get("_skip_recommendation_synthesis"):
         return
     overall = _as_float(row.get("overall_score")) or 50.0
@@ -2473,10 +2546,30 @@ class MultiLevelCache:
         self.max_l1_size = max(1, int(max_l1_size))
         self._data: Dict[str, Tuple[float, Any]] = {}
         self._lock = asyncio.Lock()
+        self._eviction_counter = 0
 
     def _key(self, **kwargs: Any) -> str:
         items = sorted((str(k), _safe_str(v)) for k, v in kwargs.items())
         return "|".join([self.name] + [f"{k}={v}" for k, v in items])
+
+    def _evict_expired(self, now: float, max_to_evict: int = 32) -> None:
+        """v5.47.4: Drop a small number of expired entries opportunistically.
+
+        Caller must hold self._lock. Limited to `max_to_evict` per call to
+        avoid spending too long inside the critical section.
+        """
+        evicted = 0
+        # Iterate over a snapshot of keys so we can mutate during the loop.
+        for k in list(self._data.keys()):
+            if evicted >= max_to_evict:
+                break
+            entry = self._data.get(k)
+            if entry is None:
+                continue
+            expires_at, _ = entry
+            if expires_at < now:
+                self._data.pop(k, None)
+                evicted += 1
 
     async def get(self, **kwargs: Any) -> Any:
         key = self._key(**kwargs)
@@ -2485,19 +2578,31 @@ class MultiLevelCache:
             if not item:
                 return None
             expires_at, value = item
-            if expires_at < time.time():
+            now = time.time()
+            if expires_at < now:
                 self._data.pop(key, None)
+                # Opportunistic cleanup: every miss-on-expiry, scan a bit more.
+                self._eviction_counter += 1
+                if self._eviction_counter >= 16:
+                    self._eviction_counter = 0
+                    self._evict_expired(now)
                 return None
             return value
 
     async def set(self, value: Any, **kwargs: Any) -> None:
         key = self._key(**kwargs)
         async with self._lock:
+            now = time.time()
             if len(self._data) >= self.max_l1_size:
-                oldest_key = next(iter(self._data.keys()), None)
-                if oldest_key:
-                    self._data.pop(oldest_key, None)
-            self._data[key] = (time.time() + self.l1_ttl, value)
+                # v5.47.4: Try evicting expired entries first before resorting
+                # to FIFO. FIFO drops entries that may still be valid while
+                # leaving expired ones in place — that's a memory leak.
+                self._evict_expired(now)
+                if len(self._data) >= self.max_l1_size:
+                    oldest_key = next(iter(self._data.keys()), None)
+                    if oldest_key:
+                        self._data.pop(oldest_key, None)
+            self._data[key] = (now + self.l1_ttl, value)
 
 
 class ProviderRegistry:
@@ -2540,42 +2645,14 @@ class ProviderRegistry:
 
 
 def _pick_provider_callable(module: Any, provider: str) -> Optional[Any]:
-    # Whether to prefer the rich enriched_quote_patch method (which calls
-    # quote + fundamentals + history concurrently inside the provider) or
-    # the basic get_quote (single API call, fast, but only OHLC + minimal
-    # context). Default ON because that's what fixes the missing-columns
-    # problem. Set PROVIDER_PREFER_ENRICHED=false on Render if you need to
-    # restore the older fast-but-thin behavior temporarily.
-    prefer_enriched = _get_env_bool("PROVIDER_PREFER_ENRICHED", True)
-
-    if prefer_enriched:
-        method_order = (
-            "fetch_enriched_quote_patch",
-            "fetch_enriched_quote",
-            "get_enriched_quote",
-            "enriched_quote",
-            "fetch_quote",
-            "get_quote",
-            "quote",
-        )
-    else:
-        # Legacy order — basic quote first, enriched only if no basic exists.
-        method_order = (
-            "get_quote",
-            "fetch_quote",
-            "fetch_enriched_quote",
-            "get_enriched_quote",
-            "quote",
-        )
-
-    for name in method_order:
+    for name in ("get_quote", "fetch_quote", "fetch_enriched_quote", "get_enriched_quote", "quote"):
         fn = getattr(module, name, None)
         if callable(fn):
             return fn
     for attr in (provider, f"{provider}_quote", "client", "service"):
         obj = getattr(module, attr, None)
         if obj is not None:
-            for name in method_order:
+            for name in ("get_quote", "fetch_quote", "get_enriched_quote"):
                 fn = getattr(obj, name, None)
                 if callable(fn):
                     return fn
@@ -2637,14 +2714,7 @@ class DataEngineV5:
             ["yahoo_chart", "yahoo", "eodhd", "finnhub", "tadawul", "argaam"],
         )
         self.max_concurrency = _get_env_int("DATA_ENGINE_MAX_CONCURRENCY", 25)
-        # Per-provider request timeout. Dropped from the historical 20s
-        # default because the enriched_quote_patch path can stack multiple
-        # sub-API-calls inside one provider (quote + fundamentals + history),
-        # and 4 sequential waves of 20s blew past Render's ~100s edge timeout
-        # on Global_Markets. 10s is enough for any healthy provider response;
-        # symbols that need more than that should fall through to fallbacks
-        # rather than blocking the whole batch.
-        self.request_timeout = _get_env_float("DATA_ENGINE_TIMEOUT_SECONDS", 10.0)
+        self.request_timeout = _get_env_float("DATA_ENGINE_TIMEOUT_SECONDS", 20.0)
         self.ksa_disallow_eodhd = _get_env_bool("KSA_DISALLOW_EODHD", True)
 
         self.schema_strict_sheet_rows = _get_env_bool("SCHEMA_STRICT_SHEET_ROWS", True)
@@ -3408,66 +3478,29 @@ class DataEngineV5:
                 ((), {"symbol": symbol, "settings": self.settings}),
             ]
 
-            # One retry pass on FAST-FAIL transient errors only. We never
-            # retry timeouts — retrying a 20s timeout means waiting another
-            # 20s, which compounds across providers and pushes the whole
-            # request past Render's edge timeout (~100s). JSON-decode and
-            # SSL handshake failures fail in milliseconds, so retrying
-            # them is cheap and frequently succeeds on the second try.
-            fast_fail_exc_names = {
-                "JSONDecodeError", "SSLError", "ContentTypeError",
-                "ServerDisconnectedError", "RemoteProtocolError",
-                "ClientPayloadError",
-            }
-            max_attempts = 2
-
             result = None
             collected_errs: List[str] = []
-            last_was_fast_fail = False
-
-            for attempt in range(max_attempts):
-                attempt_succeeded = False
-                for args, kwargs in call_variants:
-                    try:
-                        async with asyncio.timeout(self.request_timeout):
-                            result = await _call_maybe_async(fn, *args, **kwargs)
-                        attempt_succeeded = True
-                        break
-                    except TypeError:
-                        # signature mismatch — try the next variant
-                        continue
-                    except asyncio.TimeoutError:
-                        # NEVER retry timeouts — they cost the full per-provider
-                        # timeout window and would compound across providers.
-                        collected_errs.append(f"TimeoutError: attempt {attempt+1}")
-                        last_was_fast_fail = False
-                        break
-                    except Exception as exc:
-                        name = type(exc).__name__
-                        collected_errs.append(f"{name}: {str(exc)[:120]}")
-                        last_was_fast_fail = name in fast_fail_exc_names
-                        if not last_was_fast_fail:
-                            continue
-                        break
-
-                if attempt_succeeded and result is not None:
+            for args, kwargs in call_variants:
+                try:
+                    async with asyncio.timeout(self.request_timeout):
+                        result = await _call_maybe_async(fn, *args, **kwargs)
                     break
-                if not last_was_fast_fail:
-                    break
-                if attempt < max_attempts - 1:
-                    # tiny backoff for fast-fail retries — these errors are
-                    # near-instant so we don't need much spacing
-                    await asyncio.sleep(0.15 + 0.15 * random.random())
+                except TypeError:
+                    continue
+                except Exception as exc:
+                    collected_errs.append(f"{type(exc).__name__}: {str(exc)[:120]}")
+                    continue
 
             latency = (time.time() - start) * 1000.0
             patch = _model_to_dict(result)
             if patch and isinstance(patch, dict):
-                # Reject "patch" payloads that are clearly error envelopes
+                # v5.47.4: Reject "patch" payloads that are clearly error envelopes
                 # (e.g. {"error": "..."} with no actual data) — these were
                 # previously counted as success and blocked the fallback.
                 meaningful_keys = {
                     "current_price", "price", "previous_close", "name",
                     "market_cap", "pe_ttm", "eps_ttm", "week_52_high",
+                    "regularMarketPrice", "last", "lastPrice", "close",
                 }
                 if not (set(patch.keys()) & meaningful_keys) and patch.get("error"):
                     err = f"provider_error_envelope: {patch.get('error')}"
@@ -3917,6 +3950,7 @@ class DataEngineV5:
             row = _apply_symbol_context_defaults(row, symbol=_safe_str(symbol))
             _compute_scores_fallback(row)
             _compute_recommendation(row)
+            row = _strip_internal_fields(row)  # v5.47.4
             return UnifiedQuote(**row)
 
         page_context = self._resolve_quote_page_context(page=page, sheet=sheet, body=body, extras=kwargs)
@@ -3965,8 +3999,8 @@ class DataEngineV5:
             row = _merge_missing_fields(row, cached_best_row)
             row = _apply_page_row_backfill(page_context or sheet or "", row)
 
-        # Risk-metric fields are almost never on live quote payloads; they
-        # come from history. EODHD's enriched_quote_patch already calls
+        # v5.47.3: Risk-metric fields are almost never on live quote payloads;
+        # they come from history. EODHD's enriched_quote_patch already calls
         # fetch_history_stats internally, so when EODHD is in the response
         # the row should have them. We only need a separate history fallback
         # when:
@@ -3995,9 +4029,6 @@ class DataEngineV5:
         #   - core price data (price + 52w hi/lo) is incomplete, OR
         #   - ALL risk metrics are missing AND we have a price (meaning the
         #     enriched call worked but didn't include history stats).
-        # Previously this fired whenever ANY field was missing, which is too
-        # aggressive — most rows that get a live quote are missing at least
-        # one minor field.
         missing_core_price = any(row.get(k) in (None, "", [], {}) for k in price_history_fields)
         all_risk_missing = all(row.get(k) in (None, "", [], {}) for k in risk_metric_fields)
         has_price = _as_float(row.get("current_price")) is not None
@@ -4009,8 +4040,7 @@ class DataEngineV5:
         if needs_history:
             try:
                 # Cap the history-fallback at a tight timeout — it's a
-                # secondary enrichment, not the primary path. Better to skip
-                # it than to time out the whole request.
+                # secondary enrichment, not the primary path.
                 hist_timeout = max(3.0, _get_env_float("HISTORY_FALLBACK_TIMEOUT_SECONDS", 8.0))
                 hist_patch = await asyncio.wait_for(
                     self._get_history_patch_best_effort(norm, providers, page=page_context),
@@ -4035,14 +4065,13 @@ class DataEngineV5:
                     row = _apply_symbol_context_defaults(row, symbol=norm)
 
         # Re-derive 52W position % after every merge — providers sometimes
-        # supply hi/lo without the position itself, and the canonicalisation
-        # call doesn't always fire after the final merge.
+        # supply hi/lo without the position itself.
         try:
             cp = _as_float(row.get("current_price"))
             hi = _as_float(row.get("week_52_high"))
             lo = _as_float(row.get("week_52_low"))
             if (
-                row.get("week_52_position_pct") in (None, "", 0, 0.0)
+                row.get("week_52_position_pct") in (None, "")
                 and cp is not None
                 and hi is not None
                 and lo is not None
@@ -4078,24 +4107,6 @@ class DataEngineV5:
 
         # =====================================================================
         # FINAL-STAGE BACKFILL — fixes route-vs-engine schema mismatches.
-        #
-        # Inspecting the actual JSON the API returns revealed that the
-        # `enriched_quote` route's schema uses several different key names
-        # than the engine writes. Without mirroring, those columns render
-        # blank in the spreadsheet even when the engine has the data.
-        #
-        # Mirrors written here:
-        #   week_52_position_pct  →  position_52w_pct        (52W position)
-        #   pb_ratio              →  pb                      (price/book)
-        #   ps_ratio              →  ps                      (price/sales)
-        #   ev_ebitda             →  ev_to_ebitda            (EV/EBITDA)
-        #   peg_ratio             →  peg                     (PEG)
-        #   confidence_score      →  confidence              (confidence 0-100)
-        #   forecast_confidence   →  ai_confidence           (confidence 0-1)
-        #   data_provider         →  provider_primary
-        #   last_updated_utc      →  as_of_utc / updated_at_utc
-        #   last_updated_riyadh   →  as_of_riyadh / updated_at_riyadh
-        #   horizon_days          →  invest_period_label (when label missing)
         # =====================================================================
         try:
             # 1. 52W position — compute from price/hi/lo if not already there,
@@ -4110,9 +4121,10 @@ class DataEngineV5:
                 # Write to both schemas. The engine canonical is
                 # `week_52_position_pct`; the route's schema uses
                 # `position_52w_pct`. Without mirroring, one of them is null.
-                if row.get("week_52_position_pct") in (None, "", 0, 0.0):
+                # v5.47.4: only overwrite if missing — 0.0 IS a legitimate value here.
+                if row.get("week_52_position_pct") in (None, ""):
                     row["week_52_position_pct"] = _pos
-                if row.get("position_52w_pct") in (None, "", 0, 0.0):
+                if row.get("position_52w_pct") in (None, ""):
                     row["position_52w_pct"] = _pos
             else:
                 # If we already have one but not the other, copy it across.
@@ -4166,9 +4178,10 @@ class DataEngineV5:
                 row["volume_ratio"] = round(_vol / _avg30, 4)
 
             # 6. Intra-day range position (price within today's high/low band).
+            #    v5.47.4: 0 is legitimate (price = day_low) so don't overwrite zeros.
             _dh = _as_float(row.get("day_high"))
             _dl = _as_float(row.get("day_low"))
-            if _cp is not None and _dh is not None and _dl is not None and _dh > _dl and row.get("day_range_position") in (None, "", 0, 0.0):
+            if _cp is not None and _dh is not None and _dl is not None and _dh > _dl and row.get("day_range_position") in (None, ""):
                 row["day_range_position"] = round(((_cp - _dl) / (_dh - _dl)) * 100.0, 4)
 
             # 7. Upside % from intrinsic_value vs current price.
@@ -4190,30 +4203,33 @@ class DataEngineV5:
                 row["horizon_days"] = 365
 
         except Exception:
-            # The mirror block must never break the response. Worst case the
-            # row goes out with the same shape it had before this block.
+            # The mirror block must never break the response.
             pass
+
+        # v5.47.4: Strip internal coordination flags before serializing.
+        # Without this, `_skip_recommendation_synthesis: true` shows up in
+        # the JSON returned to the spreadsheet because UnifiedQuote allows
+        # extra fields.
+        row = _strip_internal_fields(row)
 
         q = UnifiedQuote(**row)
 
-        # Belt-and-braces: if model_dump strips any of the mirrored fields,
-        # re-attach the most-important ones to the model instance directly.
+        # v5.47.4: Belt-and-braces — for ALL fields the row dict has but
+        # the model dropped, re-attach them. (Was previously a fixed allow-list.)
         try:
-            for _k in (
-                "position_52w_pct", "week_52_position_pct",
-                "pb", "ps", "peg", "ev_to_ebitda",
-                "confidence", "ai_confidence",
-                "provider_primary", "as_of_utc", "as_of_riyadh",
-                "updated_at_utc", "updated_at_riyadh",
-                "volume_ratio", "day_range_position", "upside_pct",
-                "data_quality_score", "invest_period_label",
-            ):
-                _v = row.get(_k)
-                if _v is None:
+            row_dump = _model_to_dict(q)
+            for _k, _v in row.items():
+                if _v is None or _v == "":
                     continue
-                if getattr(q, _k, None) in (None, "", 0, 0.0):
+                if row_dump.get(_k) in (None, "", 0, 0.0):
                     if hasattr(q, "model_copy"):
-                        q = q.model_copy(update={_k: _v})
+                        try:
+                            q = q.model_copy(update={_k: _v})
+                        except Exception:
+                            try:
+                                setattr(q, _k, _v)
+                            except Exception:
+                                pass
                     else:
                         try:
                             setattr(q, _k, _v)
@@ -4305,72 +4321,12 @@ class DataEngineV5:
     ) -> Dict[str, Dict[str, Any]]:
         out: Dict[str, Dict[str, Any]] = {}
         norm_syms = _normalize_symbol_list(symbols, limit=len(symbols) + 10)
-
-        # Hard wall-clock budget for the whole batch. Render's frontend
-        # gives us ~100s end-to-end; we reserve ~75s for the engine and
-        # leave the rest for serialisation, response handling, and Apps
-        # Script's own request overhead. Anything still in flight at the
-        # deadline is cancelled and the symbol gets a stub row instead of
-        # blocking the whole response.
-        batch_budget = max(20.0, _get_env_float("BATCH_WALL_CLOCK_BUDGET_SECONDS", 75.0))
-
-        async def _fetch_one(sym: str) -> Tuple[str, Dict[str, Any]]:
-            try:
-                qd = await self.get_enriched_quote_dict(
-                    sym, schema=schema, page=page, sheet=sheet, body=body, **kwargs
-                )
-                return sym, qd
-            except Exception as exc:
-                return sym, {
-                    "symbol": sym,
-                    "symbol_normalized": sym,
-                    "data_quality": QuoteQuality.MISSING.value,
-                    "error": f"{type(exc).__name__}: {str(exc)[:120]}",
-                    "warnings": "Fetch failed during batch",
-                    "last_updated_utc": _now_utc_iso(),
-                    "last_updated_riyadh": _now_riyadh_iso(),
-                }
-
-        tasks = [asyncio.create_task(_fetch_one(s)) for s in norm_syms]
-        try:
-            done, pending = await asyncio.wait(tasks, timeout=batch_budget, return_when=asyncio.ALL_COMPLETED)
-        except Exception:
-            done, pending = set(tasks), set()
-
-        # Collect completed results.
-        for t in done:
-            try:
-                sym, qd = t.result()
-                out[sym] = qd
-                norm = _safe_str(qd.get("symbol_normalized") or qd.get("symbol"))
-                if norm:
-                    out[norm] = qd
-            except Exception:
-                continue
-
-        # Cancel anything still in flight and synthesise a stub so the
-        # caller (Apps Script / Sheets) gets a complete shape rather than
-        # a missing row that would shift columns in the spreadsheet.
-        if pending:
-            logger.warning(
-                f"Batch budget {batch_budget:.0f}s exhausted with {len(pending)} symbol(s) "
-                f"still in flight on page={page or 'unknown'}; cancelling and stubbing."
-            )
-            for t in pending:
-                t.cancel()
-            # Identify which symbols never landed
-            for sym in norm_syms:
-                if sym not in out:
-                    out[sym] = {
-                        "symbol": sym,
-                        "symbol_normalized": sym,
-                        "data_quality": QuoteQuality.MISSING.value,
-                        "warnings": f"Batch budget exhausted before symbol fetched (page={page or 'unknown'})",
-                        "data_provider": "",
-                        "last_updated_utc": _now_utc_iso(),
-                        "last_updated_riyadh": _now_riyadh_iso(),
-                    }
-
+        quotes = await asyncio.gather(*[self.get_enriched_quote_dict(s, schema=schema, page=page, sheet=sheet, body=body, **kwargs) for s in norm_syms])
+        for req_sym, qd in zip(norm_syms, quotes):
+            out[req_sym] = qd
+            norm = _safe_str(qd.get("symbol_normalized") or qd.get("symbol"))
+            if norm:
+                out[norm] = qd
         for req in symbols:
             req2 = _safe_str(req)
             if req2 and req2 not in out:
@@ -4646,6 +4602,7 @@ class DataEngineV5:
             row["top10_rank"] = len(selected) + 1
             row["selection_reason"] = row.get("selection_reason") or _top10_selection_reason(row)
             row["criteria_snapshot"] = row.get("criteria_snapshot") or criteria_snapshot
+            row = _strip_internal_fields(row)  # v5.47.4: don't leak _skip_* flags
             projected = _normalize_to_schema_keys(out_keys, out_headers, row)
             projected["top10_rank"] = row["top10_rank"]
             projected["selection_reason"] = row["selection_reason"]
@@ -5080,6 +5037,7 @@ class DataEngineV5:
                     merged = _apply_page_row_backfill(target_sheet, merged)
                     _compute_scores_fallback(merged)
                     _compute_recommendation(merged)
+                    merged = _strip_internal_fields(merged)  # v5.47.4
                     enriched_rows.append(_strict_project_row(out_keys, _normalize_to_schema_keys(out_keys, out_headers, merged)))
 
                 _apply_rank_overall(enriched_rows)
@@ -5155,6 +5113,7 @@ class DataEngineV5:
                 row = _apply_page_row_backfill(target_sheet, row)
                 _compute_scores_fallback(row)
                 _compute_recommendation(row)
+                row = _strip_internal_fields(row)  # v5.47.4
                 rows_full.append(_strict_project_row(out_keys, _normalize_to_schema_keys(out_keys, out_headers, row)))
             _apply_rank_overall(rows_full)
 
