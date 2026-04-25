@@ -2303,35 +2303,42 @@ class ProviderRegistry:
 
 
 def _pick_provider_callable(module: Any, provider: str) -> Optional[Any]:
-    # IMPORTANT: prefer the *enriched* methods first. They return fundamentals
-    # (P/B, P/S, EV/EBITDA, PEG, intrinsic value, margins) and history-derived
-    # stats (volatility, drawdown, VaR, Sharpe, 52W position) in a single call.
-    # The plain `get_quote` / `fetch_quote` methods on most providers only
-    # return basic OHLC, which is why downstream rows were missing those
-    # columns even when a provider clearly responded.
-    for name in (
-        "fetch_enriched_quote_patch",
-        "fetch_enriched_quote",
-        "get_enriched_quote",
-        "enriched_quote",
-        "fetch_quote",
-        "get_quote",
-        "quote",
-    ):
+    # Whether to prefer the rich enriched_quote_patch method (which calls
+    # quote + fundamentals + history concurrently inside the provider) or
+    # the basic get_quote (single API call, fast, but only OHLC + minimal
+    # context). Default ON because that's what fixes the missing-columns
+    # problem. Set PROVIDER_PREFER_ENRICHED=false on Render if you need to
+    # restore the older fast-but-thin behavior temporarily.
+    prefer_enriched = _get_env_bool("PROVIDER_PREFER_ENRICHED", True)
+
+    if prefer_enriched:
+        method_order = (
+            "fetch_enriched_quote_patch",
+            "fetch_enriched_quote",
+            "get_enriched_quote",
+            "enriched_quote",
+            "fetch_quote",
+            "get_quote",
+            "quote",
+        )
+    else:
+        # Legacy order — basic quote first, enriched only if no basic exists.
+        method_order = (
+            "get_quote",
+            "fetch_quote",
+            "fetch_enriched_quote",
+            "get_enriched_quote",
+            "quote",
+        )
+
+    for name in method_order:
         fn = getattr(module, name, None)
         if callable(fn):
             return fn
     for attr in (provider, f"{provider}_quote", "client", "service"):
         obj = getattr(module, attr, None)
         if obj is not None:
-            for name in (
-                "fetch_enriched_quote_patch",
-                "fetch_enriched_quote",
-                "get_enriched_quote",
-                "enriched_quote",
-                "fetch_quote",
-                "get_quote",
-            ):
+            for name in method_order:
                 fn = getattr(obj, name, None)
                 if callable(fn):
                     return fn
@@ -2393,7 +2400,14 @@ class DataEngineV5:
             ["yahoo_chart", "yahoo", "eodhd", "finnhub", "tadawul", "argaam"],
         )
         self.max_concurrency = _get_env_int("DATA_ENGINE_MAX_CONCURRENCY", 25)
-        self.request_timeout = _get_env_float("DATA_ENGINE_TIMEOUT_SECONDS", 20.0)
+        # Per-provider request timeout. Dropped from the historical 20s
+        # default because the enriched_quote_patch path can stack multiple
+        # sub-API-calls inside one provider (quote + fundamentals + history),
+        # and 4 sequential waves of 20s blew past Render's ~100s edge timeout
+        # on Global_Markets. 10s is enough for any healthy provider response;
+        # symbols that need more than that should fall through to fallbacks
+        # rather than blocking the whole batch.
+        self.request_timeout = _get_env_float("DATA_ENGINE_TIMEOUT_SECONDS", 10.0)
         self.ksa_disallow_eodhd = _get_env_bool("KSA_DISALLOW_EODHD", True)
 
         self.schema_strict_sheet_rows = _get_env_bool("SCHEMA_STRICT_SHEET_ROWS", True)
@@ -3909,12 +3923,72 @@ class DataEngineV5:
     ) -> Dict[str, Dict[str, Any]]:
         out: Dict[str, Dict[str, Any]] = {}
         norm_syms = _normalize_symbol_list(symbols, limit=len(symbols) + 10)
-        quotes = await asyncio.gather(*[self.get_enriched_quote_dict(s, schema=schema, page=page, sheet=sheet, body=body, **kwargs) for s in norm_syms])
-        for req_sym, qd in zip(norm_syms, quotes):
-            out[req_sym] = qd
-            norm = _safe_str(qd.get("symbol_normalized") or qd.get("symbol"))
-            if norm:
-                out[norm] = qd
+
+        # Hard wall-clock budget for the whole batch. Render's frontend
+        # gives us ~100s end-to-end; we reserve ~75s for the engine and
+        # leave the rest for serialisation, response handling, and Apps
+        # Script's own request overhead. Anything still in flight at the
+        # deadline is cancelled and the symbol gets a stub row instead of
+        # blocking the whole response.
+        batch_budget = max(20.0, _get_env_float("BATCH_WALL_CLOCK_BUDGET_SECONDS", 75.0))
+
+        async def _fetch_one(sym: str) -> Tuple[str, Dict[str, Any]]:
+            try:
+                qd = await self.get_enriched_quote_dict(
+                    sym, schema=schema, page=page, sheet=sheet, body=body, **kwargs
+                )
+                return sym, qd
+            except Exception as exc:
+                return sym, {
+                    "symbol": sym,
+                    "symbol_normalized": sym,
+                    "data_quality": QuoteQuality.MISSING.value,
+                    "error": f"{type(exc).__name__}: {str(exc)[:120]}",
+                    "warnings": "Fetch failed during batch",
+                    "last_updated_utc": _now_utc_iso(),
+                    "last_updated_riyadh": _now_riyadh_iso(),
+                }
+
+        tasks = [asyncio.create_task(_fetch_one(s)) for s in norm_syms]
+        try:
+            done, pending = await asyncio.wait(tasks, timeout=batch_budget, return_when=asyncio.ALL_COMPLETED)
+        except Exception:
+            done, pending = set(tasks), set()
+
+        # Collect completed results.
+        for t in done:
+            try:
+                sym, qd = t.result()
+                out[sym] = qd
+                norm = _safe_str(qd.get("symbol_normalized") or qd.get("symbol"))
+                if norm:
+                    out[norm] = qd
+            except Exception:
+                continue
+
+        # Cancel anything still in flight and synthesise a stub so the
+        # caller (Apps Script / Sheets) gets a complete shape rather than
+        # a missing row that would shift columns in the spreadsheet.
+        if pending:
+            logger.warning(
+                f"Batch budget {batch_budget:.0f}s exhausted with {len(pending)} symbol(s) "
+                f"still in flight on page={page or 'unknown'}; cancelling and stubbing."
+            )
+            for t in pending:
+                t.cancel()
+            # Identify which symbols never landed
+            for sym in norm_syms:
+                if sym not in out:
+                    out[sym] = {
+                        "symbol": sym,
+                        "symbol_normalized": sym,
+                        "data_quality": QuoteQuality.MISSING.value,
+                        "warnings": f"Batch budget exhausted before symbol fetched (page={page or 'unknown'})",
+                        "data_provider": "",
+                        "last_updated_utc": _now_utc_iso(),
+                        "last_updated_riyadh": _now_riyadh_iso(),
+                    }
+
         for req in symbols:
             req2 = _safe_str(req)
             if req2 and req2 not in out:
