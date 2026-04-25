@@ -2,40 +2,65 @@
 """
 routes/advisor.py
 ================================================================================
-ADVISOR ROUTER — v6.8.1
+ADVISOR ROUTER — v6.8.2
 ================================================================================
 SPECIAL-PAGE PROXY-FIRST • ROOT/ANALYSIS ALIGNED • SHORT-ADVISOR HARDENED •
 JSON-SAFE • GET+POST SAFE • FAIL-SOFT • CONTRACT-PROJECTED • ENGINE-TOLERANT
 
-v6.8.1 Fixes (vs v6.8.0)
+v6.8.2 Fixes (vs v6.8.1)
 ------------------------
-- CRITICAL FIX: _run_advisor_logic now accepts x_api_key. In v6.8.0 all six
-  route handlers passed x_api_key=x_api_key as a keyword argument, but the
-  private implementation's signature did not declare it — so EVERY request
-  to every advisor endpoint failed immediately with:
-      TypeError: _run_advisor_logic() got an unexpected keyword argument
-      'x_api_key'
-  The kwarg is now declared and forwarded to _require_auth_or_401 and to
-  both delegate calls.
-- FIX: _auth_ok_via_env_match now includes x_api_key in the list of presented
-  credentials. v6.8.0 accepted the parameter but never read it, so a caller
-  authenticating only via the X-API-Key header (with the auth_ok hook
-  unavailable) could never pass env-match auth.
-- FIX: _delegate_to_analysis_bridge and _delegate_to_advanced_bridge now
-  accept and forward x_api_key into the bridge call's kwargs. The upstream
-  bridges already accept this parameter; v6.8.0 was dropping the value so
-  the bridge's own auth check couldn't see the X-API-Key header.
-- Public API, __all__, route paths, and all public-route signatures preserved.
+- FIX [HIGH]: `KNOWN_CANONICAL_HEADER_COUNTS` aligned to canonical schema
+  (matches engine v5.47.4, analysis route v4.1.2, advisor v5.1.1):
+      Market_Leaders / Global_Markets / Commodities_FX / Mutual_Funds /
+      My_Portfolio = 80 each (was 99 / 112 / 86 / 94 / 110)
+      Top_10_Investments = 83 (was 106)
+      Insights_Analysis = 7 (was 9)
+      Data_Dictionary = 9 (unchanged)
+  v6.8.1 carried inflated non-canonical counts that the analysis route's
+  v4.1.0 changelog already flagged as wrong. Downstream consumers
+  validating header count against this map were rejecting valid payloads.
 
-v6.8.0 Notes (unchanged)
+- FIX [HIGH — silent data loss]: header/key mismatch in row projection.
+  `_resolve_contract_headers` was returning DISPLAY HEADERS ("Symbol",
+  "P/B", "52W High") but row dicts in `row_objects` are keyed by
+  CANONICAL KEYS ("symbol", "pb_ratio", "week_52_high"). When
+  `_mapping_list_to_rows(rows, headers)` then did `row.get(header)`,
+  it returned None for every cell. Most rendered cells were silently
+  blank when the projection code path ran. Replaced with
+  `_resolve_contract_headers_keys()` which returns paired (headers, keys),
+  and `_mapping_list_to_rows_with_keys()` which looks up by KEY and
+  outputs in HEADER-ordered positions.
+
+- FIX: `TOP10_SPECIAL_FIELDS` split into required canonical (3) and
+  optional trade-setup (4). v6.8.1 always padded all 7 fields onto
+  Top_10 rows even when delegating to a bridge that returns the
+  canonical 83-col Top_10 contract — yielding 87 cols misaligned with
+  the downstream Sheets contract. Now: 3 canonical extras are always
+  ensured; 4 trade-setup fields are appended only if present in the
+  source data (preserves top10_selector v4.9.0 enrichment without
+  breaking bridge-delegated flows).
+
+- FIX: `_looks_like_fallback_only_top10` now also inspects `data_provider`
+  for known placeholder/fallback markers (`placeholder_no_live_data`
+  from analysis route v4.1.2, `advisor_fallback_no_live_data` from
+  investment_advisor v5.1.1). v6.8.1 only checked `selection_reason`
+  text and missed the new no-live-data markers.
+
+- FIX: defensively strips internal coordination fields
+  (`_skip_recommendation_synthesis`, `_internal_*`, `_meta_*`,
+  `_debug_*`, `_trace_*`, `unit_normalization_warnings`,
+  `intrinsic_value_source`) from every row before final emission.
+
+- FIX: bridge results' status="warn" (engine v5.47.4 emits this for
+  partial-success cases) is now treated as usable when rows are present.
+  v6.8.1's `_has_usable_payload` didn't differentiate warn from error.
+
+v6.8.1 Notes (preserved)
 ------------------------
-- Special pages prefer canonical sheet-rows owners first:
-  analysis wrapper -> advanced root owner -> engine fallback.
-- Insights_Analysis, Top_10_Investments, and Data_Dictionary use bridge-first
-  logic so advisor routes align with proven live paths.
-- Tabular payloads are projected to canonical headers when available.
-- Responses remain fail-soft and JSON-safe, exposing resolver metadata.
-- Constant-time token comparison via hmac.compare_digest (_secure_equals).
+- _run_advisor_logic accepts x_api_key and forwards to bridges + auth.
+- _auth_ok_via_env_match includes x_api_key in presented credentials.
+- Both bridge delegates accept and forward x_api_key.
+- Public API, __all__, route paths, and all public-route signatures preserved.
 """
 
 from __future__ import annotations
@@ -62,7 +87,7 @@ from fastapi.routing import APIRouter
 logger = logging.getLogger("routes.advisor")
 logger.addHandler(logging.NullHandler())
 
-ADVISOR_VERSION = "6.8.1"
+ADVISOR_VERSION = "6.8.2"
 
 
 def _secure_equals(a: str, b: str) -> bool:
@@ -84,29 +109,106 @@ BASE_PAGES = {
     "My_Portfolio",
 }
 DERIVED_PAGES = {"Top_10_Investments", "Insights_Analysis", "Data_Dictionary"}
-# v6.8.0: updated to schema_registry v3.4.0 per-page column counts
-# Used as hardcoded fallback only when schema_registry is unavailable.
-# Primary source is _contract_header_count() → _resolve_contract_headers() → schema_registry.
+
+# v6.8.2: aligned to canonical schema (engine v5.47.4 / route v4.1.2 / advisor v5.1.1).
+# Used as hardcoded fallback ONLY when schema_registry is unavailable.
+# Primary source remains _contract_header_count() → _resolve_contract_headers_keys()
+# → schema_registry.
 KNOWN_CANONICAL_HEADER_COUNTS: Dict[str, int] = {
-    "Market_Leaders":    99,
-    "Global_Markets":    112,
-    "Commodities_FX":    86,
-    "Mutual_Funds":      94,
-    "My_Portfolio":      110,
-    "Insights_Analysis": 9,
-    "Top_10_Investments":106,
-    "Data_Dictionary":   9,
+    "Market_Leaders":     80,
+    "Global_Markets":     80,
+    "Commodities_FX":     80,
+    "Mutual_Funds":       80,
+    "My_Portfolio":       80,
+    "Insights_Analysis":   7,
+    "Top_10_Investments": 83,   # 80 canonical + 3 Top10 extras
+    "Data_Dictionary":     9,
 }
-# v6.8.0: added 4 trade setup fields from top10_selector v4.9.0
-TOP10_SPECIAL_FIELDS: Tuple[str, ...] = (
+
+# v6.8.2: split TOP10 extras into REQUIRED (canonical schema contract) and
+# OPTIONAL (top10_selector v4.9.0 trade-setup enrichment). Required fields
+# are always ensured; optional fields are appended only if present in source.
+TOP10_REQUIRED_EXTRAS: Tuple[str, ...] = (
     "top10_rank", "selection_reason", "criteria_snapshot",
+)
+TOP10_REQUIRED_EXTRA_HEADERS: Dict[str, str] = {
+    "top10_rank": "Top10 Rank",
+    "selection_reason": "Selection Reason",
+    "criteria_snapshot": "Criteria Snapshot",
+}
+TOP10_OPTIONAL_TRADE_FIELDS: Tuple[str, ...] = (
     "entry_price", "stop_loss_suggested", "take_profit_suggested", "risk_reward_ratio",
 )
+TOP10_OPTIONAL_TRADE_HEADERS: Dict[str, str] = {
+    "entry_price": "Entry Price",
+    "stop_loss_suggested": "Stop Loss",
+    "take_profit_suggested": "Take Profit",
+    "risk_reward_ratio": "Risk/Reward Ratio",
+}
+
+# Backward-compat name preserved (some external code may reference it).
+# v6.8.2: now equals required + optional, but only required fields are
+# always padded. Optional fields are added per-row only if present.
+TOP10_SPECIAL_FIELDS: Tuple[str, ...] = TOP10_REQUIRED_EXTRAS + TOP10_OPTIONAL_TRADE_FIELDS
+
 TOP10_BUSINESS_SIGNAL_FIELDS: Tuple[str, ...] = (
     "symbol", "name", "asset_class", "exchange", "currency", "country", "sector", "industry",
     "current_price", "price_change", "percent_change", "risk_score", "valuation_score",
     "overall_score", "opportunity_score", "risk_bucket", "confidence_bucket", "recommendation",
 )
+
+# v6.8.2: financial signal fields — at least one of these populated indicates
+# the row contains real upstream data, not just an identity-only placeholder.
+TOP10_FINANCIAL_SIGNAL_FIELDS: Tuple[str, ...] = (
+    "current_price", "previous_close", "overall_score", "opportunity_score",
+    "value_score", "quality_score", "momentum_score", "growth_score",
+    "expected_roi_3m", "expected_roi_1m", "expected_roi_12m",
+    "forecast_confidence", "confidence_score", "pe_ttm", "market_cap",
+    "recommendation", "rsi_14", "beta_5y",
+)
+
+# v6.8.2: known placeholder/fallback data_provider markers from upstream.
+# When seen, the row is a fallback-only row with no live data.
+PLACEHOLDER_DATA_PROVIDERS: Tuple[str, ...] = (
+    "placeholder_no_live_data",
+    "advisor_fallback_no_live_data",
+    "analysis_sheet_rows.placeholder_fallback",  # legacy v4.1.1 marker
+    "advisor_fallback",
+)
+
+# v6.8.2: internal coordination flags that should be stripped from every row
+# before final emission. Engine v5.47.4 strips these at source but proxies,
+# legacy engines, and cached snapshots may still carry them.
+_INTERNAL_FIELD_PREFIXES: Tuple[str, ...] = (
+    "_skip_", "_internal_", "_meta_", "_debug_", "_trace_",
+)
+_INTERNAL_FIELDS_TO_STRIP: set = {
+    "_skip_recommendation_synthesis",
+    "_placeholder",
+    "unit_normalization_warnings",
+    "intrinsic_value_source",
+}
+
+
+def _strip_internal_fields(row: Any) -> Any:
+    """v6.8.2: Remove engine internal coordination flags from a row dict."""
+    if not isinstance(row, dict):
+        return row
+    keys_to_remove: List[str] = []
+    for k in list(row.keys()):
+        ks = str(k)
+        if ks in _INTERNAL_FIELDS_TO_STRIP:
+            keys_to_remove.append(k)
+            continue
+        if any(ks.startswith(prefix) for prefix in _INTERNAL_FIELD_PREFIXES):
+            keys_to_remove.append(k)
+    for k in keys_to_remove:
+        try:
+            del row[k]
+        except Exception:
+            pass
+    return row
+
 
 PROMETHEUS_AVAILABLE = False
 try:
@@ -124,7 +226,8 @@ except Exception:
     def get_settings_cached(*args: Any, **kwargs: Any) -> Any:  # type: ignore
         return None
 
-_SCHEMA_HEADERS_CACHE: Dict[str, List[str]] = {}
+# v6.8.2: cache stores PAIRED (headers, keys) tuples instead of just headers
+_SCHEMA_CONTRACT_CACHE: Dict[str, Tuple[List[str], List[str]]] = {}
 AUTH_ENV_TOKEN_NAMES: Tuple[str, ...] = (
     "TFB_TOKEN", "APP_TOKEN", "BACKEND_TOKEN", "BACKUP_APP_TOKEN",
     "X_APP_TOKEN", "AUTH_TOKEN", "TOKEN", "TFB_APP_TOKEN",
@@ -335,7 +438,7 @@ def _auth_ok_via_hook(token_query: Optional[str], x_app_token: Optional[str], x_
     if auth_ok is None:
         return False
     token = _strip(token_query)
-    # v6.8.0: X-API-Key accepted alongside X-APP-TOKEN
+    # X-API-Key accepted alongside X-APP-TOKEN
     x_token = _strip(x_app_token) or _strip(x_api_key)
     authz = _strip(authorization)
     candidate_kwargs: Tuple[Dict[str, Any], ...] = (
@@ -376,9 +479,7 @@ def _auth_ok_via_env_match(token_query: Optional[str], x_app_token: Optional[str
     if not env_tokens:
         return False
     presented: List[str] = []
-    # v6.8.1: include x_api_key in the presented-credentials iteration. v6.8.0
-    # accepted it as a parameter but never read it, so callers authenticating
-    # solely via the X-API-Key header would fail env-match auth.
+    # v6.8.1: include x_api_key in the presented-credentials iteration.
     for value in (token_query, x_app_token, x_api_key):
         token = _strip(value)
         if token:
@@ -392,7 +493,6 @@ def _auth_ok_via_env_match(token_query: Optional[str], x_app_token: Optional[str
                 presented.append(bearer)
         else:
             presented.append(authz)
-    # v6.8.0: constant-time comparison via _secure_equals (prevents timing attacks)
     return any(_secure_equals(t, env_t) for t in presented for env_t in env_tokens)
 
 
@@ -459,7 +559,6 @@ def _canonicalize_page_name(value: Any) -> str:
     raw = _strip(value)
     if not raw:
         return ""
-    # v6.8.0: 3-path fallback for page_catalog
     page_catalog = None
     for _pcat_path in ("core.sheets.page_catalog", "core.page_catalog", "page_catalog"):
         try:
@@ -638,28 +737,99 @@ async def _call_with_tolerant_signatures(fn: Callable[..., Any], *, timeout_seco
     return None
 
 
-def _extract_headers_from_spec(spec: Any) -> List[str]:
+# =============================================================================
+# Schema contract resolution (v6.8.2: paired headers + keys)
+# =============================================================================
+
+def _extract_headers_and_keys_from_spec(spec: Any) -> Tuple[List[str], List[str]]:
+    """v6.8.2: Extract paired (headers, keys) from a SheetSpec / dict.
+
+    Replaces v6.8.1's `_extract_headers_from_spec` which collapsed headers
+    and keys into a single list — causing downstream `row.get(header)`
+    lookups to fail because rows are keyed by canonical KEYS not headers.
+    """
     if spec is None:
-        return []
+        return [], []
+
+    headers: List[str] = []
+    keys: List[str] = []
+
+    # Try dataclass / object with `.columns` attribute (engine SheetContract style)
+    cols = getattr(spec, "columns", None)
+    if cols is None and isinstance(spec, Mapping):
+        cols = spec.get("columns") or spec.get("fields")
+
+    if isinstance(cols, (list, tuple)) and cols:
+        for col in cols:
+            if isinstance(col, Mapping):
+                h = _strip(
+                    col.get("display_header") or col.get("header")
+                    or col.get("label") or col.get("title") or col.get("name")
+                )
+                k = _strip(
+                    col.get("key") or col.get("field") or col.get("name") or col.get("id")
+                )
+            else:
+                h = _strip(getattr(col, "display_header",
+                          getattr(col, "header",
+                                  getattr(col, "label",
+                                          getattr(col, "title",
+                                                  getattr(col, "name", None))))))
+                k = _strip(getattr(col, "key",
+                          getattr(col, "field",
+                                  getattr(col, "name",
+                                          getattr(col, "id", None)))))
+            if not h and not k:
+                continue
+            if h and not k:
+                k = h.lower().replace(" ", "_").replace("/", "_").replace("(", "").replace(")", "").replace("%", "pct")
+            elif k and not h:
+                h = k.replace("_", " ").title()
+            headers.append(h)
+            keys.append(k)
+        if headers and keys and len(headers) == len(keys):
+            return headers, keys
+
+    # Try explicit `headers` / `keys` lists
     if isinstance(spec, Mapping):
-        for key in ("headers", "display_headers", "keys", "columns"):
-            value = spec.get(key)
-            if isinstance(value, list) and value:
-                return [_strip(x) for x in value if _strip(x)]
+        raw_headers = spec.get("headers") or spec.get("display_headers") or spec.get("sheet_headers")
+        raw_keys = spec.get("keys") or spec.get("fields") or spec.get("columns")
+        if isinstance(raw_headers, list):
+            headers = [_strip(x) for x in raw_headers if _strip(x)]
+        if isinstance(raw_keys, list):
+            keys = [_strip(x) for x in raw_keys if _strip(x)]
+        if headers and not keys:
+            keys = [h.lower().replace(" ", "_").replace("/", "_").replace("(", "").replace(")", "").replace("%", "pct") for h in headers]
+        elif keys and not headers:
+            headers = [k.replace("_", " ").title() for k in keys]
+        if headers and keys and len(headers) == len(keys):
+            return headers, keys
+
+    # Try nested specs
+    if isinstance(spec, Mapping):
         for key in ("sheet", "spec", "schema", "contract", "definition"):
             nested = spec.get(key)
-            headers = _extract_headers_from_spec(nested)
-            if headers:
-                return headers
-    return []
+            h, k = _extract_headers_and_keys_from_spec(nested)
+            if h and k and len(h) == len(k):
+                return h, k
+
+    return [], []
 
 
-def _resolve_contract_headers(page: str) -> List[str]:
+def _resolve_contract_headers_keys(page: str) -> Tuple[List[str], List[str]]:
+    """v6.8.2: Resolve paired (headers, keys) for a page from schema registry.
+
+    Replaces v6.8.1's `_resolve_contract_headers` which returned only
+    headers and caused silent data loss in `_mapping_list_to_rows`.
+    """
     page = _canonicalize_page_name(page)
     if not page:
-        return []
-    if page in _SCHEMA_HEADERS_CACHE:
-        return list(_SCHEMA_HEADERS_CACHE[page])
+        return [], []
+
+    if page in _SCHEMA_CONTRACT_CACHE:
+        cached_h, cached_k = _SCHEMA_CONTRACT_CACHE[page]
+        return list(cached_h), list(cached_k)
+
     for module_name in ("core.sheets.schema_registry", "core.schema_registry", "core.sheets.page_catalog"):
         module = _import_module_safely(module_name)
         if module is None:
@@ -671,10 +841,10 @@ def _resolve_contract_headers(page: str) -> List[str]:
                     hit = spec_map.get(page) or spec_map.get(page.lower()) or spec_map.get(page.upper())
                 except Exception:
                     hit = None
-                headers = _extract_headers_from_spec(hit)
-                if headers:
-                    _SCHEMA_HEADERS_CACHE[page] = headers
-                    return list(headers)
+                h, k = _extract_headers_and_keys_from_spec(hit)
+                if h and k:
+                    _SCHEMA_CONTRACT_CACHE[page] = (h, k)
+                    return list(h), list(k)
         for fn_name in ("get_sheet_spec", "get_schema_for_sheet", "get_schema", "resolve_sheet_spec", "resolve_sheet_schema", "get_contract_for_sheet"):
             fn = getattr(module, fn_name, None)
             if not callable(fn):
@@ -686,42 +856,65 @@ def _resolve_contract_headers(page: str) -> List[str]:
                     continue
                 except Exception:
                     out = None
-                headers = _extract_headers_from_spec(out)
-                if headers:
-                    _SCHEMA_HEADERS_CACHE[page] = headers
-                    return list(headers)
-    return []
+                if inspect.isawaitable(out):
+                    continue
+                h, k = _extract_headers_and_keys_from_spec(out)
+                if h and k:
+                    _SCHEMA_CONTRACT_CACHE[page] = (h, k)
+                    return list(h), list(k)
+
+    return [], []
+
+
+def _resolve_contract_headers(page: str) -> List[str]:
+    """v6.8.2 back-compat: returns only headers. Internally now uses the
+    paired resolver. External code that reads only headers still works."""
+    headers, _ = _resolve_contract_headers_keys(page)
+    return headers
 
 
 def _contract_header_count(page: str) -> int:
-    headers = _resolve_contract_headers(page)
+    headers, _ = _resolve_contract_headers_keys(page)
     if headers:
         return len(headers)
     return KNOWN_CANONICAL_HEADER_COUNTS.get(page, 0)
 
 
-def _append_missing_headers(headers: List[str], fields: Sequence[str]) -> List[str]:
-    out = list(headers)
-    for field in fields:
-        if field not in out:
-            out.append(field)
+def _append_missing(items: List[str], extras: Sequence[str]) -> List[str]:
+    out = list(items)
+    for x in extras:
+        if x not in out:
+            out.append(x)
     return out
 
 
-def _mapping_list_to_rows(rows: Iterable[Mapping[str, Any]], headers: Sequence[str]) -> List[List[Any]]:
+def _mapping_list_to_rows_with_keys(rows: Iterable[Mapping[str, Any]], keys: Sequence[str]) -> List[List[Any]]:
+    """v6.8.2: project row dicts to a matrix using KEYS for lookup.
+
+    Replaces v6.8.1's `_mapping_list_to_rows(rows, headers)` which used
+    DISPLAY HEADERS for `row.get(...)` — but rows are keyed by canonical
+    keys, so most cells came back None.
+    """
     matrix: List[List[Any]] = []
     for row in rows:
-        matrix.append([row.get(h) for h in headers])
+        matrix.append([row.get(k) for k in keys])
     return matrix
 
 
-def _rows_matrix_to_objects(matrix: Sequence[Sequence[Any]], headers: Sequence[str]) -> List[Dict[str, Any]]:
+# Back-compat shim — preserve the v6.8.1 public name for external callers.
+def _mapping_list_to_rows(rows: Iterable[Mapping[str, Any]], headers: Sequence[str]) -> List[List[Any]]:
+    """v6.8.2 back-compat. New code should call _mapping_list_to_rows_with_keys."""
+    return _mapping_list_to_rows_with_keys(rows, headers)
+
+
+def _rows_matrix_to_objects(matrix: Sequence[Sequence[Any]], keys: Sequence[str]) -> List[Dict[str, Any]]:
+    """v6.8.2: build row dicts using KEYS as dict keys (was using HEADERS)."""
     out: List[Dict[str, Any]] = []
     for row in matrix:
         row_list = list(row)
         item: Dict[str, Any] = {}
-        for idx, h in enumerate(headers):
-            item[str(h)] = row_list[idx] if idx < len(row_list) else None
+        for idx, k in enumerate(keys):
+            item[str(k)] = row_list[idx] if idx < len(row_list) else None
         out.append(item)
     return out
 
@@ -743,14 +936,27 @@ def _extract_meta_mapping(result: Mapping[str, Any]) -> Dict[str, Any]:
     return dict(meta) if isinstance(meta, Mapping) else {}
 
 
-def _effective_headers_from_result(result: Mapping[str, Any]) -> List[str]:
-    for key in ("headers", "display_headers", "keys", "columns"):
-        candidate = result.get(key)
-        if isinstance(candidate, list):
-            headers = [_strip(x) for x in candidate if _strip(x)]
+def _effective_headers_keys_from_result(result: Mapping[str, Any]) -> Tuple[List[str], List[str]]:
+    """v6.8.2: extract paired headers + keys from an upstream payload."""
+    headers: List[str] = []
+    keys: List[str] = []
+    for hk in ("display_headers", "headers", "sheet_headers", "column_headers"):
+        v = result.get(hk)
+        if isinstance(v, list) and v:
+            headers = [_strip(x) for x in v if _strip(x)]
             if headers:
-                return headers
-    return []
+                break
+    for kk in ("keys", "fields", "columns"):
+        v = result.get(kk)
+        if isinstance(v, list) and v and all(isinstance(x, str) for x in v):
+            keys = [_strip(x) for x in v if _strip(x)]
+            if keys:
+                break
+    if headers and not keys:
+        keys = [h.lower().replace(" ", "_").replace("/", "_").replace("(", "").replace(")", "").replace("%", "pct") for h in headers]
+    elif keys and not headers:
+        headers = [k.replace("_", " ").title() for k in keys]
+    return headers, keys
 
 
 def _extract_object_rows_any(result: Mapping[str, Any]) -> List[Dict[str, Any]]:
@@ -769,54 +975,107 @@ def _extract_matrix_rows_any(result: Mapping[str, Any]) -> List[List[Any]]:
     return []
 
 
-def _project_to_contract_headers(*, page: str, headers: List[str], row_objects: List[Dict[str, Any]], rows_matrix: List[List[Any]]) -> Tuple[List[str], List[Dict[str, Any]], List[List[Any]]]:
-    contract_headers = _resolve_contract_headers(page)
+def _project_to_contract_headers_keys(*, page: str, headers: List[str], keys: List[str], row_objects: List[Dict[str, Any]], rows_matrix: List[List[Any]]) -> Tuple[List[str], List[str], List[Dict[str, Any]], List[List[Any]]]:
+    """v6.8.2: project rows to paired (headers, keys) from schema registry.
+
+    Major rewrite of v6.8.1's `_project_to_contract_headers`:
+    - Uses canonical KEYS (not display headers) to extract values from row dicts
+    - Top10 required extras (3) always ensured; trade-setup optionals (4)
+      only added if any row in the source has them populated
+    """
+    contract_headers, contract_keys = _resolve_contract_headers_keys(page)
+
+    # Prefer the schema registry contract; fall back to upstream payload
     effective_headers = list(contract_headers or headers or [])
+    effective_keys = list(contract_keys or keys or [])
+
+    # If headers but no keys (or vice versa), derive the other from the one we have
+    if effective_headers and not effective_keys:
+        effective_keys = [h.lower().replace(" ", "_").replace("/", "_").replace("(", "").replace(")", "").replace("%", "pct") for h in effective_headers]
+    elif effective_keys and not effective_headers:
+        effective_headers = [k.replace("_", " ").title() for k in effective_keys]
+
+    # Top10: ensure required extras always present
     if page == "Top_10_Investments":
-        effective_headers = _append_missing_headers(effective_headers, TOP10_SPECIAL_FIELDS)
-    if not effective_headers and row_objects:
+        for extra_key in TOP10_REQUIRED_EXTRAS:
+            if extra_key not in effective_keys:
+                effective_keys.append(extra_key)
+                effective_headers.append(TOP10_REQUIRED_EXTRA_HEADERS[extra_key])
+
+        # Optional trade-setup fields: only append if any source row has them populated
+        if row_objects:
+            for opt_key in TOP10_OPTIONAL_TRADE_FIELDS:
+                if opt_key in effective_keys:
+                    continue
+                has_value = any(
+                    row.get(opt_key) not in (None, "", [], {}, ())
+                    for row in row_objects
+                )
+                if has_value:
+                    effective_keys.append(opt_key)
+                    effective_headers.append(TOP10_OPTIONAL_TRADE_HEADERS[opt_key])
+
+    # If we still have nothing, derive from observed row keys
+    if not effective_keys and row_objects:
         seen: List[str] = []
         for row in row_objects:
             for key in row.keys():
                 key_s = _strip(key)
-                if key_s and key_s not in seen:
+                if key_s and key_s not in seen and not any(key_s.startswith(p) for p in _INTERNAL_FIELD_PREFIXES):
                     seen.append(key_s)
-        effective_headers = seen
+        effective_keys = seen
+        effective_headers = [k.replace("_", " ").title() for k in effective_keys]
+
+    # Top10: backfill rank/selection_reason/criteria_snapshot using row position
     if page == "Top_10_Investments":
         for idx, row in enumerate(row_objects, start=1):
             row.setdefault("top10_rank", idx)
             row.setdefault("selection_reason", row.get("selection_reason") or None)
             row.setdefault("criteria_snapshot", row.get("criteria_snapshot") or None)
-            # v6.8.0: init trade setup fields from top10_selector v4.9.0
-            row.setdefault("entry_price",           row.get("entry_price"))
-            row.setdefault("stop_loss_suggested",   row.get("stop_loss_suggested"))
-            row.setdefault("take_profit_suggested", row.get("take_profit_suggested"))
-            row.setdefault("risk_reward_ratio",     row.get("risk_reward_ratio"))
-    if row_objects and effective_headers:
-        rows_matrix = _mapping_list_to_rows(row_objects, effective_headers)
-    elif rows_matrix and effective_headers:
-        rows_matrix = _pad_or_trim_matrix(rows_matrix, len(effective_headers))
-        row_objects = _rows_matrix_to_objects(rows_matrix, effective_headers)
-    return effective_headers, row_objects, rows_matrix
+
+    # v6.8.2: strip internal fields from every row before projection
+    for row in row_objects:
+        _strip_internal_fields(row)
+
+    # Project: build matrix using KEYS for value lookup
+    if row_objects and effective_keys:
+        rows_matrix = _mapping_list_to_rows_with_keys(row_objects, effective_keys)
+    elif rows_matrix and effective_keys:
+        rows_matrix = _pad_or_trim_matrix(rows_matrix, len(effective_keys))
+        row_objects = _rows_matrix_to_objects(rows_matrix, effective_keys)
+
+    return effective_headers, effective_keys, row_objects, rows_matrix
 
 
 def _ensure_tabular_shape(result: Dict[str, Any], *, page: str) -> Dict[str, Any]:
-    effective_headers: List[str] = _effective_headers_from_result(result)
+    """v6.8.2: now uses paired (headers, keys) projection."""
+    upstream_headers, upstream_keys = _effective_headers_keys_from_result(result)
     object_rows: List[Dict[str, Any]] = _extract_object_rows_any(result)
     matrix_rows: List[List[Any]] = _extract_matrix_rows_any(result)
-    effective_headers, object_rows, matrix_rows = _project_to_contract_headers(page=page, headers=effective_headers, row_objects=object_rows, rows_matrix=matrix_rows)
+
+    effective_headers, effective_keys, object_rows, matrix_rows = _project_to_contract_headers_keys(
+        page=page,
+        headers=upstream_headers,
+        keys=upstream_keys,
+        row_objects=object_rows,
+        rows_matrix=matrix_rows,
+    )
+
     result["headers"] = effective_headers
-    result["keys"] = list(effective_headers)
     result["display_headers"] = list(effective_headers)
+    result["keys"] = list(effective_keys)
     if object_rows:
         result["row_objects"] = object_rows
         result["items"] = object_rows
-        result["data"] = object_rows if page != "Data_Dictionary" else result.get("data", object_rows)
+        if page != "Data_Dictionary":
+            result["data"] = object_rows
+        else:
+            result.setdefault("data", object_rows)
     if matrix_rows:
         result["rows_matrix"] = matrix_rows
         result["rows"] = matrix_rows if not object_rows else object_rows
     elif object_rows:
-        result["rows_matrix"] = _mapping_list_to_rows(object_rows, effective_headers)
+        result["rows_matrix"] = _mapping_list_to_rows_with_keys(object_rows, effective_keys)
         result["rows"] = object_rows
     meta = _extract_meta_mapping(result)
     if effective_headers:
@@ -826,7 +1085,30 @@ def _ensure_tabular_shape(result: Dict[str, Any], *, page: str) -> Dict[str, Any
     return result
 
 
+def _row_data_provider_is_placeholder(row: Mapping[str, Any]) -> bool:
+    """v6.8.2: detect rows from known placeholder/fallback sources."""
+    provider = _strip(row.get("data_provider")).lower()
+    if not provider:
+        return False
+    return any(marker in provider for marker in (m.lower() for m in PLACEHOLDER_DATA_PROVIDERS))
+
+
+def _row_has_financial_signal(row: Mapping[str, Any]) -> bool:
+    """v6.8.2: True if at least one financial signal field is populated."""
+    for f in TOP10_FINANCIAL_SIGNAL_FIELDS:
+        v = row.get(f)
+        if v not in (None, "", [], {}, ()):
+            return True
+    return False
+
+
 def _looks_like_fallback_only_top10(result: Mapping[str, Any]) -> bool:
+    """v6.8.2: enhanced detection of fallback-only Top10 payloads.
+
+    Adds checks for:
+    - data_provider matching known placeholder markers
+    - absence of financial signals (current_price, scores, recommendation)
+    """
     page = _strip(result.get("page"))
     if page != "Top_10_Investments":
         return False
@@ -835,42 +1117,54 @@ def _looks_like_fallback_only_top10(result: Mapping[str, Any]) -> bool:
     reason = _strip(meta.get("reason")).lower()
     rows: List[Mapping[str, Any]] = _extract_object_rows_any(result)
     if not rows:
-        headers = _effective_headers_from_result(result)
+        _, keys = _effective_headers_keys_from_result(result)
         matrix_rows = _extract_matrix_rows_any(result)
-        if headers and matrix_rows:
-            rows = _rows_matrix_to_objects(matrix_rows, headers)
+        if keys and matrix_rows:
+            rows = _rows_matrix_to_objects(matrix_rows, keys)
     if not rows:
         return False
+
+    placeholder_provider_hits = 0
     fallback_selection_hits = 0
-    low_signal_rows = 0
+    no_financial_signal_rows = 0
+
     for row in rows:
+        if _row_data_provider_is_placeholder(row):
+            placeholder_provider_hits += 1
         selection_reason = _strip(row.get("selection_reason")).lower()
-        if "fallback candidate" in selection_reason:
+        if "fallback candidate" in selection_reason or "no live data" in selection_reason or "no live advisor data" in selection_reason:
             fallback_selection_hits += 1
-        informative = 0
-        for field in TOP10_BUSINESS_SIGNAL_FIELDS:
-            if field in {"top10_rank", "selection_reason", "criteria_snapshot"}:
-                continue
-            if row.get(field) not in (None, "", [], {}, ()):
-                informative += 1
-        if informative <= 2:
-            low_signal_rows += 1
-    mostly_fallback_selection = fallback_selection_hits >= max(1, math.ceil(len(rows) * 0.6))
-    mostly_low_signal = low_signal_rows >= max(1, math.ceil(len(rows) * 0.6))
-    if fallback_flag and (mostly_fallback_selection or mostly_low_signal):
+        if not _row_has_financial_signal(row):
+            no_financial_signal_rows += 1
+
+    threshold = max(1, math.ceil(len(rows) * 0.6))
+
+    # v6.8.2: any of these conditions individually signals "fallback only"
+    if placeholder_provider_hits >= threshold:
         return True
-    if "engine_unavailable_or_empty" in reason and mostly_low_signal:
+    if no_financial_signal_rows >= threshold:
+        return True
+    if fallback_flag and fallback_selection_hits >= threshold:
+        return True
+    if "engine_unavailable_or_empty" in reason and no_financial_signal_rows >= threshold:
         return True
     return False
 
 
 def _has_usable_payload(result: Mapping[str, Any], *, page: str) -> bool:
+    """v6.8.2: also accepts status='warn' payloads when rows are present."""
     if _boolish(result.get("schema_only"), False) or _boolish(result.get("headers_only"), False):
         return _row_count(result.get("headers")) > 0
     if page == "Data_Dictionary":
         if _row_count(result.get("rows_matrix")) > 0 or _row_count(result.get("row_objects")) > 0:
             return True
         return _row_count(result.get("headers")) > 0
+
+    # v6.8.2: explicit error status → not usable
+    status = _strip(result.get("status")).lower()
+    if status in {"error", "failed", "fail"} and _row_count(result.get("row_objects")) == 0:
+        return False
+
     has_rows = any(_row_count(result.get(k)) > 0 for k in ("rows_matrix", "row_objects", "rows", "items", "data", "quotes"))
     if not has_rows:
         return False
@@ -996,8 +1290,7 @@ async def _resolve_top10_builder(request: Request) -> Tuple[Optional[Callable[..
 
 
 async def _delegate_to_analysis_bridge(*, request: Request, payload: Dict[str, Any], token: Optional[str], x_app_token: Optional[str], x_api_key: Optional[str] = None, authorization: Optional[str], x_request_id: Optional[str]) -> Optional[Dict[str, Any]]:
-    """v6.8.1: now accepts and forwards x_api_key to the bridge call so the
-    bridge's own auth check can see the X-API-Key header value."""
+    """v6.8.1: accepts and forwards x_api_key into the bridge call."""
     impl, meta = await _resolve_analysis_bridge_impl()
     if impl is None:
         return None
@@ -1028,7 +1321,7 @@ async def _delegate_to_analysis_bridge(*, request: Request, payload: Dict[str, A
 
 
 async def _delegate_to_advanced_bridge(*, request: Request, payload: Dict[str, Any], token: Optional[str], x_app_token: Optional[str], x_api_key: Optional[str] = None, authorization: Optional[str], x_request_id: Optional[str]) -> Optional[Dict[str, Any]]:
-    """v6.8.1: now accepts and forwards x_api_key to the bridge call."""
+    """v6.8.1: accepts and forwards x_api_key into the bridge call."""
     impl, meta = await _resolve_advanced_bridge_impl()
     if impl is None:
         return None
@@ -1174,9 +1467,8 @@ def _prefer_runner(page: str, *, operation: str) -> bool:
 
 
 async def _run_advisor_logic(*, request: Request, payload: Dict[str, Any], token: Optional[str], x_app_token: Optional[str], x_api_key: Optional[str] = None, authorization: Optional[str], x_request_id: Optional[str], operation: str = "sheet_rows") -> Dict[str, Any]:
-    """v6.8.1 CRITICAL FIX: accepts x_api_key. v6.8.0 was missing this parameter
-    even though every route handler passes it — so every request raised
-    TypeError before any work happened."""
+    """v6.8.1: accepts x_api_key. v6.8.0 was missing this parameter even
+    though every route handler passes it — every request raised TypeError."""
     started_at = time.perf_counter()
     _require_auth_or_401(token_query=token, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization)
     request_id = _request_id(request, x_request_id)
