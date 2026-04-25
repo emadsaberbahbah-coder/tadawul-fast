@@ -3874,7 +3874,46 @@ class DataEngineV5:
         _compute_recommendation(row)
         row["data_quality"] = self._data_quality(row)
         row["data_provider"] = row.get("data_provider") or ((row.get("data_sources") or [""])[0] if isinstance(row.get("data_sources"), list) else "")
+
+        # FINAL-STAGE GUARANTEE: re-derive 52W position % unconditionally right
+        # before model construction, since the field has been observed missing
+        # in production output despite multiple earlier attempts to set it.
+        # This is the absolute last write before serialisation — nothing
+        # downstream can drop it. Compute as percent points (e.g. 68.77 for a
+        # price two-thirds of the way up the 52W range).
+        try:
+            _final_cp = _as_float(row.get("current_price")) or _as_float(row.get("price"))
+            _final_hi = _as_float(row.get("week_52_high"))
+            _final_lo = _as_float(row.get("week_52_low"))
+            if (
+                _final_cp is not None
+                and _final_hi is not None
+                and _final_lo is not None
+                and _final_hi > _final_lo
+            ):
+                _final_pos = ((_final_cp - _final_lo) / (_final_hi - _final_lo)) * 100.0
+                # Clamp to a reasonable display range (-50%..150%) — values
+                # beyond this almost certainly mean stale 52W bounds.
+                _final_pos = max(-50.0, min(150.0, _final_pos))
+                row["week_52_position_pct"] = round(_final_pos, 4)
+        except Exception:
+            pass
+
         q = UnifiedQuote(**row)
+
+        # Belt-and-braces: if the Pydantic model_dump path strips the field
+        # for any reason, re-attach it to the model instance directly so the
+        # subsequent _model_to_dict picks it up via __dict__ traversal.
+        try:
+            _persisted = row.get("week_52_position_pct")
+            if _persisted is not None and getattr(q, "week_52_position_pct", None) in (None, 0, 0.0):
+                # Pydantic v2 supports model_copy(update=...)
+                if hasattr(q, "model_copy"):
+                    q = q.model_copy(update={"week_52_position_pct": _persisted})
+                else:
+                    setattr(q, "week_52_position_pct", _persisted)
+        except Exception:
+            pass
 
         if use_cache:
             await self._cache.set(_model_to_dict(q), symbol=norm, provider_profile=provider_profile)
