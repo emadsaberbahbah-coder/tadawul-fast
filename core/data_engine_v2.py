@@ -1203,6 +1203,19 @@ _CANONICAL_FIELD_ALIASES: Dict[str, Tuple[str, ...]] = {
     "sharpe_1y": ("sharpe_1y", "sharpe1y", "sharpeRatio"),
     "risk_score": ("risk_score",),
     "risk_bucket": ("risk_bucket",),
+    # 52W position % was missing from the alias map entirely. Yahoo chart
+    # provider returns it as `52w_position_pct` (leading "52w"), and other
+    # providers use varying styles. Without this entry the canonicalisation
+    # step silently dropped the field — even when a provider supplied it
+    # and even when the engine computed it. Result: empty cell in the sheet.
+    "week_52_position_pct": (
+        "week_52_position_pct",
+        "52w_position_pct",
+        "52week_position_pct",
+        "position_52w_pct",
+        "week52PositionPct",
+        "weekFiftyTwoPositionPct",
+    ),
     "pb_ratio": ("pb_ratio", "priceToBook", "pb"),
     "ps_ratio": ("ps_ratio", "priceToSalesTrailing12Months", "ps"),
     "ev_ebitda": ("ev_ebitda", "enterpriseToEbitda", "evToEbitda"),
@@ -1572,15 +1585,38 @@ def _canonicalize_provider_row(row: Dict[str, Any], requested_symbol: str = "", 
     if change is None and price is not None and prev is not None:
         change = price - prev
         out["price_change"] = round(change, 6)
-    if pct is None and price is not None and prev not in (None, 0):
-        pct = ((price - prev) / prev) * 100.0
-        out["percent_change"] = round(pct, 6)
-    elif pct is not None and abs(pct) <= 1.5:
-        out["percent_change"] = round(pct * 100.0, 6)
+    # Percent-change normalisation. The previous heuristic was unsafe:
+    # `if abs(pct) <= 1.5: pct *= 100` would mangle real daily changes
+    # like -1.10% (DNB.OL got rendered as -110%). The robust fix is to
+    # always recompute from price/prev when we have both — providers
+    # disagree on whether `percent_change` is decimal (0.0049) or percent
+    # points (0.49) and the heuristic can't reliably tell which.
+    if price is not None and prev not in (None, 0):
+        recomputed_pct = ((price - prev) / prev) * 100.0
+        out["percent_change"] = round(recomputed_pct, 6)
+    elif pct is not None:
+        # No prev price to anchor against. Only convert to percent points
+        # if the value is *unambiguously* a tiny fraction (|pct| < 0.5,
+        # i.e. < 50%). Daily changes between 0.5% and 1.5% are common and
+        # already in percent points — never multiply those.
+        if abs(pct) < 0.5:
+            out["percent_change"] = round(pct * 100.0, 6)
+        else:
+            out["percent_change"] = round(pct, 6)
 
     high52 = _as_float(out.get("week_52_high"))
     low52 = _as_float(out.get("week_52_low"))
-    if price is not None and high52 is not None and low52 is not None and high52 > low52 and out.get("week_52_position_pct") is None:
+    # Always (re)compute 52W position when inputs are valid. Previously
+    # this was gated by `week_52_position_pct is None`, but a stale 0.0
+    # could land in the row from an earlier merge step and block the fresh
+    # calculation. We now overwrite when the existing value is 0/empty.
+    if (
+        price is not None
+        and high52 is not None
+        and low52 is not None
+        and high52 > low52
+        and out.get("week_52_position_pct") in (None, "", 0, 0.0)
+    ):
         out["week_52_position_pct"] = round(((price - low52) / (high52 - low52)) * 100.0, 6)
 
     qty = _as_float(out.get("position_qty"))
