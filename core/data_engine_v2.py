@@ -3875,43 +3875,149 @@ class DataEngineV5:
         row["data_quality"] = self._data_quality(row)
         row["data_provider"] = row.get("data_provider") or ((row.get("data_sources") or [""])[0] if isinstance(row.get("data_sources"), list) else "")
 
-        # FINAL-STAGE GUARANTEE: re-derive 52W position % unconditionally right
-        # before model construction, since the field has been observed missing
-        # in production output despite multiple earlier attempts to set it.
-        # This is the absolute last write before serialisation — nothing
-        # downstream can drop it. Compute as percent points (e.g. 68.77 for a
-        # price two-thirds of the way up the 52W range).
+        # =====================================================================
+        # FINAL-STAGE BACKFILL — fixes route-vs-engine schema mismatches.
+        #
+        # Inspecting the actual JSON the API returns revealed that the
+        # `enriched_quote` route's schema uses several different key names
+        # than the engine writes. Without mirroring, those columns render
+        # blank in the spreadsheet even when the engine has the data.
+        #
+        # Mirrors written here:
+        #   week_52_position_pct  →  position_52w_pct        (52W position)
+        #   pb_ratio              →  pb                      (price/book)
+        #   ps_ratio              →  ps                      (price/sales)
+        #   ev_ebitda             →  ev_to_ebitda            (EV/EBITDA)
+        #   peg_ratio             →  peg                     (PEG)
+        #   confidence_score      →  confidence              (confidence 0-100)
+        #   forecast_confidence   →  ai_confidence           (confidence 0-1)
+        #   data_provider         →  provider_primary
+        #   last_updated_utc      →  as_of_utc / updated_at_utc
+        #   last_updated_riyadh   →  as_of_riyadh / updated_at_riyadh
+        #   horizon_days          →  invest_period_label (when label missing)
+        # =====================================================================
         try:
-            _final_cp = _as_float(row.get("current_price")) or _as_float(row.get("price"))
-            _final_hi = _as_float(row.get("week_52_high"))
-            _final_lo = _as_float(row.get("week_52_low"))
-            if (
-                _final_cp is not None
-                and _final_hi is not None
-                and _final_lo is not None
-                and _final_hi > _final_lo
-            ):
-                _final_pos = ((_final_cp - _final_lo) / (_final_hi - _final_lo)) * 100.0
-                # Clamp to a reasonable display range (-50%..150%) — values
-                # beyond this almost certainly mean stale 52W bounds.
-                _final_pos = max(-50.0, min(150.0, _final_pos))
-                row["week_52_position_pct"] = round(_final_pos, 4)
+            # 1. 52W position — compute from price/hi/lo if not already there,
+            #    then mirror to BOTH key names the routes use.
+            _cp = _as_float(row.get("current_price")) or _as_float(row.get("price"))
+            _hi = _as_float(row.get("week_52_high"))
+            _lo = _as_float(row.get("week_52_low"))
+            if _cp is not None and _hi is not None and _lo is not None and _hi > _lo:
+                _pos = ((_cp - _lo) / (_hi - _lo)) * 100.0
+                _pos = max(-50.0, min(150.0, _pos))
+                _pos = round(_pos, 4)
+                # Write to both schemas. The engine canonical is
+                # `week_52_position_pct`; the route's schema uses
+                # `position_52w_pct`. Without mirroring, one of them is null.
+                if row.get("week_52_position_pct") in (None, "", 0, 0.0):
+                    row["week_52_position_pct"] = _pos
+                if row.get("position_52w_pct") in (None, "", 0, 0.0):
+                    row["position_52w_pct"] = _pos
+            else:
+                # If we already have one but not the other, copy it across.
+                _existing = (
+                    _as_float(row.get("week_52_position_pct"))
+                    or _as_float(row.get("position_52w_pct"))
+                )
+                if _existing is not None:
+                    row.setdefault("week_52_position_pct", _existing)
+                    row.setdefault("position_52w_pct", _existing)
+
+            # 2. Mirror simple aliased keys (engine name → route name).
+            _alias_pairs = (
+                ("pb_ratio", "pb"),
+                ("ps_ratio", "ps"),
+                ("ev_ebitda", "ev_to_ebitda"),
+                ("peg_ratio", "peg"),
+                ("data_provider", "provider_primary"),
+                ("last_updated_utc", "as_of_utc"),
+                ("last_updated_utc", "updated_at_utc"),
+                ("last_updated_riyadh", "as_of_riyadh"),
+                ("last_updated_riyadh", "updated_at_riyadh"),
+            )
+            for _src, _dst in _alias_pairs:
+                _v = row.get(_src)
+                if _v not in (None, "") and row.get(_dst) in (None, ""):
+                    row[_dst] = _v
+                # And reverse — if route fed in an alias name only.
+                _v2 = row.get(_dst)
+                if _v2 not in (None, "") and row.get(_src) in (None, ""):
+                    row[_src] = _v2
+
+            # 3. Confidence: route uses `confidence` (0-100) and `ai_confidence`
+            #    (0-1). Engine uses `confidence_score` and `forecast_confidence`.
+            _conf_score = _as_float(row.get("confidence_score"))
+            _fc = _as_float(row.get("forecast_confidence"))
+            if _conf_score is not None and row.get("confidence") in (None, "", 0):
+                row["confidence"] = _conf_score
+            if _fc is not None and row.get("ai_confidence") in (None, "", 0):
+                row["ai_confidence"] = _fc
+
+            # 4. Provider secondary: list 2nd entry from data_sources if available.
+            _ds = row.get("data_sources")
+            if isinstance(_ds, list) and len(_ds) >= 2 and row.get("provider_secondary") in (None, ""):
+                row["provider_secondary"] = _safe_str(_ds[1])
+
+            # 5. Volume ratio (today's volume / 30-day avg) — useful liquidity tell.
+            _vol = _as_float(row.get("volume"))
+            _avg30 = _as_float(row.get("avg_volume_30d"))
+            if _vol is not None and _avg30 not in (None, 0) and row.get("volume_ratio") in (None, "", 0, 0.0):
+                row["volume_ratio"] = round(_vol / _avg30, 4)
+
+            # 6. Intra-day range position (price within today's high/low band).
+            _dh = _as_float(row.get("day_high"))
+            _dl = _as_float(row.get("day_low"))
+            if _cp is not None and _dh is not None and _dl is not None and _dh > _dl and row.get("day_range_position") in (None, "", 0, 0.0):
+                row["day_range_position"] = round(((_cp - _dl) / (_dh - _dl)) * 100.0, 4)
+
+            # 7. Upside % from intrinsic_value vs current price.
+            _iv = _as_float(row.get("intrinsic_value"))
+            if _iv is not None and _cp not in (None, 0) and row.get("upside_pct") in (None, "", 0, 0.0):
+                row["upside_pct"] = round(((_iv - _cp) / _cp) * 100.0, 4)
+
+            # 8. Numeric data quality score from the existing string label.
+            _dq_str = _safe_str(row.get("data_quality")).upper()
+            if row.get("data_quality_score") in (None, "", 0):
+                row["data_quality_score"] = {
+                    "GOOD": 90.0, "FAIR": 65.0, "MISSING": 25.0, "BLOCKED": 10.0,
+                }.get(_dq_str, 50.0)
+
+            # 9. Default invest period label / horizon if missing.
+            if row.get("invest_period_label") in (None, ""):
+                row["invest_period_label"] = "12M"
+            if row.get("horizon_days") in (None, "", 0):
+                row["horizon_days"] = 365
+
         except Exception:
+            # The mirror block must never break the response. Worst case the
+            # row goes out with the same shape it had before this block.
             pass
 
         q = UnifiedQuote(**row)
 
-        # Belt-and-braces: if the Pydantic model_dump path strips the field
-        # for any reason, re-attach it to the model instance directly so the
-        # subsequent _model_to_dict picks it up via __dict__ traversal.
+        # Belt-and-braces: if model_dump strips any of the mirrored fields,
+        # re-attach the most-important ones to the model instance directly.
         try:
-            _persisted = row.get("week_52_position_pct")
-            if _persisted is not None and getattr(q, "week_52_position_pct", None) in (None, 0, 0.0):
-                # Pydantic v2 supports model_copy(update=...)
-                if hasattr(q, "model_copy"):
-                    q = q.model_copy(update={"week_52_position_pct": _persisted})
-                else:
-                    setattr(q, "week_52_position_pct", _persisted)
+            for _k in (
+                "position_52w_pct", "week_52_position_pct",
+                "pb", "ps", "peg", "ev_to_ebitda",
+                "confidence", "ai_confidence",
+                "provider_primary", "as_of_utc", "as_of_riyadh",
+                "updated_at_utc", "updated_at_riyadh",
+                "volume_ratio", "day_range_position", "upside_pct",
+                "data_quality_score", "invest_period_label",
+            ):
+                _v = row.get(_k)
+                if _v is None:
+                    continue
+                if getattr(q, _k, None) in (None, "", 0, 0.0):
+                    if hasattr(q, "model_copy"):
+                        q = q.model_copy(update={_k: _v})
+                    else:
+                        try:
+                            setattr(q, _k, _v)
+                        except Exception:
+                            pass
         except Exception:
             pass
 
