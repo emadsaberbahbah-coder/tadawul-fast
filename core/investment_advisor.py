@@ -3,48 +3,69 @@
 """
 core/investment_advisor.py
 ================================================================================
-INVESTMENT ADVISOR ORCHESTRATOR -- v5.1.0 (SCHEMA-ALIGNED / BUG-FIXED)
+INVESTMENT ADVISOR ORCHESTRATOR -- v5.1.1 (ENGINE v5.47.4 ALIGNED)
 ================================================================================
 LIVE-BY-DEFAULT • ENGINE-FIRST • SNAPSHOT-TOLERANT • ROUTE-COMPATIBLE
 MODE-AWARE • SCHEMA-SAFE • JSON-SAFE • IMPORT-SAFE • WORKER-THREAD SAFE
 SPECIAL-PAGE SAFE • CONTRACT-PRESERVING • DICTIONARY-HARDENED
 
-v5.1.0 changes (what moved from v5.0.0)
+v5.1.1 changes (what moved from v5.1.0)
 ---------------------------------------
-- ALIGN: Insights fallback is now the canonical 7-column shape from
-  `core.sheets.schema_registry` (Section, Item, Symbol, Metric, Value, Notes,
-  Last Updated (Riyadh)). The previous `Source` / `Sort Order` pair that
-  never existed in the registry is gone, and the fallback rows now carry
-  `symbol` and `last_updated_riyadh` instead.
-- ALIGN: `_GENERIC_FALLBACK_HEADERS` is now the canonical 80-column
-  instrument schema from the registry, with a paired `_GENERIC_FALLBACK_KEYS`
-  so fallback rows align with the real column order. Previously the list was
-  only 18 cherry-picked columns.
-- ALIGN: `_build_data_dictionary_rows()` now walks `schema_registry` directly
-  when `core.sheets.data_dictionary` isn't present. v5.0.0 returned a single
-  stub row in that case, which didn't match the 9-column Data_Dictionary
-  contract.
-- FIX: removed `"Advisor_Criteria"` and `"KSA_TADAWUL"` from
-  `ALL_KNOWN_PAGES`. Both are in `page_catalog.FORBIDDEN_PAGES` and get
-  rejected by `normalize_page_name` — carrying them here silently
-  re-admitted them when the catalog raised, directly contradicting the
-  catalog's contract.
-- FIX: `_load_headers_for_page()` is now sync (there was nothing async in its
-  body — it imports modules and calls `get_sheet_spec`). `_normalize_headers_keys()`
-  called it via `_run_sync(...)` from inside a running event loop, spawning a
-  worker thread + fresh loop on every request just to read headers. Gone.
-- FIX: `_normalize_headers_keys()` no longer duplicates the `DEFAULT_PAGE`
-  branch — `Top_10_Investments` is already in `SPECIAL_PAGES`.
-- ADD: `_now_riyadh_iso()` helper for the aligned Insights fallback.
-- ADD: `_page_canonical_schema()` returns `(headers, keys)` in registry order
-  so callers don't have to round-trip headers through `_headers_to_keys()`
-  (which loses case and punctuation).
+- ALIGN: `_FIELD_ALIAS_HINTS` extended with all engine v5.47.4 mirrored
+  aliases (`position_52w_pct` → week_52_position_pct, `pb` → pb_ratio,
+  `ps` → ps_ratio, `peg` → peg_ratio, `ev_to_ebitda` → ev_ebitda,
+  `confidence` / `ai_confidence` → confidence_score / forecast_confidence,
+  `provider_primary` → data_provider, `as_of_utc` → last_updated_utc,
+  `as_of_riyadh` → last_updated_riyadh). v5.1.0 didn't know about these
+  mirrors, so the engine's hard work mirroring fields got thrown away
+  during `_row_value_for_aliases` lookups.
+- FIX [HIGH]: `_score_recommendation` no longer applies the unsafe
+  "if abs(roi) <= 1.5: roi *= 100" heuristic. The same heuristic in the
+  data engine turned legitimate small percentages (e.g. DNB.OL -1.10%)
+  into -110%. Replaced with a safer convention: prefer the `*_pct`
+  variant of ROI fields when present (engine v5.47.4 emits both forms);
+  otherwise treat the canonical `expected_roi_*` as a fraction per the
+  schema and multiply by 100 unconditionally.
+- FIX [HIGH]: `_backfill_rows` now respects the engine's
+  `_skip_recommendation_synthesis` sentinel. When the engine explicitly
+  marks a row as "no data, don't synthesize", v5.1.0 ignored that and
+  re-fabricated a SELL/REDUCE/HOLD recommendation from all-zero scores.
+  In a financial product this surfaced "advice" for symbols where no
+  live data exists.
+- FIX [HIGH]: `_backfill_rows` only synthesises a recommendation when at
+  least one scoring signal is present (overall_score, opportunity_score,
+  value_score, quality_score, momentum_score, growth_score). Empty rows
+  no longer get a fabricated SELL just because every score defaulted to
+  zero.
+- FIX [HIGH]: `_build_special_fallback` instrument path no longer hard-
+  codes `RECO_HOLD` for symbols with no upstream data. Recommendation
+  stays None, the row is clearly marked as a fallback in `warnings` /
+  `selection_reason`.
+- FIX: defensively strips internal coordination fields
+  (`_skip_recommendation_synthesis`, `_internal_*`, `_meta_*`,
+  `_debug_*`, `unit_normalization_warnings`, `intrinsic_value_source`)
+  from every row in `_normalize_rows` and again in
+  `_normalize_engine_result`. Engine v5.47.4 strips these at source but
+  this layer should defend itself for legacy / proxy / cached rows.
+- FIX: `status="warn"` from engine v5.47.4 is now treated as success-
+  with-caveat. v5.1.0 mapped any non-success status to WARN/ERROR
+  buckets without distinction; engine v5.47.4 emits "warn" for partial-
+  success cases (some symbols have data, others don't) and the rows
+  themselves are valid.
+- CLEAN: `_load_headers_keys_for_page` awaitable detection simplified.
+  v5.1.0 had dead branches that always fell through to `continue`.
 
-Public API is preserved: `InvestmentAdvisor`, the `advisor` /
-`investment_advisor` singletons, factory functions (`get_investment_advisor`,
-`create_advisor`, …), sync wrappers (`run_investment_advisor`, `recommend`,
-…), and the `_run_investment_advisor_impl` / `_run_advisor_impl` async hooks
-all still resolve under the same names.
+v5.1.0 changes (preserved)
+--------------------------
+- Insights / Data_Dictionary / instrument fallbacks aligned to canonical
+  schema (7 / 9 / 80 columns, registry order).
+- Forbidden pages removed from `ALL_KNOWN_PAGES`.
+- `_load_headers_for_page` made sync (no more thread-spawn per request).
+
+Public API preserved: `InvestmentAdvisor`, the `advisor` /
+`investment_advisor` singletons, factory functions, sync wrappers, and
+`_run_investment_advisor_impl` / `_run_advisor_impl` async hooks all
+resolve under the same names.
 ================================================================================
 """
 
@@ -101,7 +122,7 @@ logger.addHandler(logging.NullHandler())
 # Version
 # =============================================================================
 
-INVESTMENT_ADVISOR_VERSION = "5.1.0"
+INVESTMENT_ADVISOR_VERSION = "5.1.1"
 
 
 # =============================================================================
@@ -315,23 +336,137 @@ _DICTIONARY_HEADERS: List[str] = [
 _TOP10_EXTRA_KEYS: List[str] = ["top10_rank", "selection_reason", "criteria_snapshot"]
 _TOP10_EXTRA_HEADERS: List[str] = ["Top10 Rank", "Selection Reason", "Criteria Snapshot"]
 
+# v5.1.1: extended with all engine v5.47.4 mirrored aliases. When the engine
+# emits both the canonical key AND a route-aliased name (e.g. it now writes
+# BOTH `pb_ratio` AND `pb` for compatibility), this mapping ensures the
+# advisor's row-value lookups recognise either spelling.
 _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
-    "symbol": ["ticker", "code", "requested_symbol"],
+    "symbol": ["ticker", "code", "requested_symbol", "symbol_normalized"],
     "ticker": ["symbol", "code", "requested_symbol"],
-    "name": ["company_name", "long_name", "instrument_name", "security_name", "title"],
-    "current_price": ["price", "last_price", "last", "close", "market_price", "nav"],
-    "price_change": ["change", "net_change"],
-    "percent_change": ["change_pct", "change_percent", "pct_change"],
+    "name": ["company_name", "long_name", "instrument_name", "security_name", "title", "shortName", "longName"],
+    "current_price": ["price", "last_price", "last", "close", "market_price", "nav", "regularMarketPrice", "lastPrice"],
+    "previous_close": ["prev_close", "prior_close", "regularMarketPreviousClose"],
+    "open_price": ["open", "regularMarketOpen"],
+    "day_high": ["high", "regularMarketDayHigh"],
+    "day_low": ["low", "regularMarketDayLow"],
+    "price_change": ["change", "net_change", "regularMarketChange"],
+    "percent_change": ["change_pct", "change_percent", "pct_change", "regularMarketChangePercent"],
+    # v5.1.1: engine v5.47.4 mirror
+    "week_52_position_pct": ["position_52w_pct", "fifty_two_week_position_pct", "52w_position_pct"],
+    "week_52_high": ["fiftyTwoWeekHigh", "fifty_two_week_high", "year_high", "52w_high"],
+    "week_52_low": ["fiftyTwoWeekLow", "fifty_two_week_low", "year_low", "52w_low"],
+    "market_cap": ["marketCap", "market_capitalization"],
+    "float_shares": ["floatShares", "sharesFloat"],
+    "beta_5y": ["beta"],
+    "pe_ttm": ["trailingPE", "peRatio", "pe"],
+    "pe_forward": ["forwardPE", "forward_pe"],
+    "eps_ttm": ["trailingEps", "eps"],
+    "dividend_yield": ["dividendYield", "trailingAnnualDividendYield"],
+    "payout_ratio": ["payoutRatio"],
+    "revenue_ttm": ["totalRevenue"],
+    "revenue_growth_yoy": ["revenueGrowth"],
+    "gross_margin": ["grossMargins"],
+    "operating_margin": ["operatingMargins"],
+    "profit_margin": ["profitMargins", "netMargin"],
+    "debt_to_equity": ["debtToEquity"],
+    "free_cash_flow_ttm": ["freeCashflow", "fcf_ttm"],
+    "rsi_14": ["rsi", "rsi14"],
+    "volatility_30d": ["vol30d", "volatility30d"],
+    "volatility_90d": ["vol90d", "volatility90d"],
+    "max_drawdown_1y": ["maxDrawdown1y", "drawdown1y"],
+    # v5.1.1: engine v5.47.4 valuation mirrors
+    "pb_ratio": ["pb", "priceToBook"],
+    "ps_ratio": ["ps", "priceToSalesTrailing12Months"],
+    "ev_ebitda": ["ev_to_ebitda", "evToEbitda", "enterpriseToEbitda"],
+    "peg_ratio": ["peg", "pegRatio"],
+    "intrinsic_value": ["fairValue", "fair_value", "dcf"],
     "risk_score": ["risk", "riskscore"],
     "valuation_score": ["valuation", "valuationscore"],
-    "overall_score": ["score", "overall", "totalscore"],
-    "opportunity_score": ["opportunity", "opportunityscore"],
-    "recommendation": ["signal", "rating", "action"],
+    "overall_score": ["score", "overall", "totalscore", "compositeScore"],
+    "opportunity_score": ["opportunity", "opportunityscore", "convictionScore"],
+    "value_score": ["valueScore"],
+    "quality_score": ["qualityScore"],
+    "momentum_score": ["momentumScore"],
+    "growth_score": ["growthScore"],
+    # v5.1.1: engine v5.47.4 confidence mirror — both `confidence` and `ai_confidence`
+    "confidence_score": ["confidence", "confidence_pct", "ai_confidence", "modelConfidenceScore"],
+    "forecast_confidence": ["confidence", "ai_confidence", "modelConfidence"],
+    "expected_roi_1m": ["roi_1m", "expected_return_1m", "expected_roi_1m_pct"],
+    "expected_roi_3m": ["roi_3m", "expected_return_3m", "expected_roi_3m_pct"],
+    "expected_roi_12m": ["roi_12m", "expected_return_12m", "expected_roi_12m_pct"],
+    "forecast_price_1m": ["target_price_1m", "projected_price_1m"],
+    "forecast_price_3m": ["target_price_3m", "projected_price_3m", "targetMeanPrice"],
+    "forecast_price_12m": ["target_price_12m", "projected_price_12m", "targetMedianPrice"],
+    "recommendation": ["signal", "rating", "action", "reco"],
+    "recommendation_reason": ["rationale", "reasoning", "signal_reason", "reason", "thesis"],
     "selection_reason": ["reason", "recommendation_reason", "reco_reason"],
     "criteria_snapshot": ["criteria", "criteria_json", "snapshot"],
-    "last_updated_utc": ["updated_at_utc", "last_updated", "timestamp_utc"],
+    # v5.1.1: engine v5.47.4 provenance mirrors
+    "data_provider": ["provider", "source_provider", "primary_provider", "provider_primary"],
+    "last_updated_utc": ["updated_at_utc", "last_updated", "timestamp_utc", "as_of_utc", "asOf"],
     "last_updated_riyadh": ["updated_at_riyadh", "as_of_riyadh", "timestamp_riyadh"],
+    "warnings": ["warning", "messages", "errors", "issues"],
+    # v5.1.1: NEW canonical fields from engine v5.47.4 final-stage backfill
+    "volume_ratio": ["volumeRatio"],
+    "day_range_position": ["dayRangePosition"],
+    "upside_pct": ["upsidePct"],
 }
+
+
+# =============================================================================
+# Internal field stripping (v5.1.1)
+# =============================================================================
+#
+# Engine v5.47.4 strips internal coordination flags at source, but rows from
+# legacy engine, proxies, or cached snapshots may still contain them. The
+# advisor projects rows through schema keys later, which removes unknown
+# fields, but stripping here also keeps internal flags out of intermediate
+# helpers (e.g. _backfill_rows reading _skip_recommendation_synthesis).
+
+_INTERNAL_FIELD_PREFIXES: Tuple[str, ...] = (
+    "_skip_", "_internal_", "_meta_", "_debug_", "_trace_",
+)
+_INTERNAL_FIELDS_PRESERVED_TEMPORARILY: set = {
+    # These get read by _backfill_rows / _normalize_engine_result before
+    # being stripped at the final emission stage.
+    "_skip_recommendation_synthesis",
+}
+_INTERNAL_FIELDS_TO_STRIP_HARD: set = {
+    "_placeholder",
+    "unit_normalization_warnings",
+    "intrinsic_value_source",
+}
+
+
+def _strip_internal_fields(row: Any, *, hard: bool = False) -> Any:
+    """Remove engine internal coordination flags from a row dict.
+
+    Args:
+        row: The row dict to mutate
+        hard: If True, also strip flags in `_INTERNAL_FIELDS_PRESERVED_TEMPORARILY`
+              (use after they've been consumed downstream).
+    """
+    if not isinstance(row, dict):
+        return row
+    keys_to_remove: List[str] = []
+    for k in list(row.keys()):
+        ks = str(k)
+        if ks in _INTERNAL_FIELDS_TO_STRIP_HARD:
+            keys_to_remove.append(k)
+            continue
+        if hard and ks in _INTERNAL_FIELDS_PRESERVED_TEMPORARILY:
+            keys_to_remove.append(k)
+            continue
+        if ks in _INTERNAL_FIELDS_PRESERVED_TEMPORARILY:
+            continue  # Keep for now; consumed by _backfill_rows
+        if any(ks.startswith(prefix) for prefix in _INTERNAL_FIELD_PREFIXES):
+            keys_to_remove.append(k)
+    for k in keys_to_remove:
+        try:
+            del row[k]
+        except Exception:
+            pass
+    return row
 
 
 # =============================================================================
@@ -447,6 +582,24 @@ def _to_float(value: Any, default: float = 0.0) -> float:
         return default if math.isnan(f) or math.isinf(f) else f
     except Exception:
         return default
+
+
+def _to_float_optional(value: Any) -> Optional[float]:
+    """v5.1.1: Convert to float OR return None if not convertible.
+
+    Used by `_score_recommendation` to distinguish "missing" from "zero".
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    try:
+        f = float(value)
+        if math.isnan(f) or math.isinf(f):
+            return None
+        return f
+    except Exception:
+        return None
 
 
 def _to_bool(value: Any, default: bool = False) -> bool:
@@ -863,10 +1016,9 @@ def _load_headers_keys_for_page(page: str) -> Tuple[List[str], List[str]]:
     """
     Load (headers, keys) for a page from the schema registry.
 
-    Sync on purpose — this only does module imports and sync attribute lookups.
-    The v5.0.0 version was `async` and got called via `_run_sync(...)` from
-    inside an already-running event loop, which spawned a worker thread on
-    every request.
+    Sync — only does module imports and sync attribute lookups. v5.1.1
+    cleans up the awaitable-detection branch (v5.1.0 had a dead branch
+    that always fell through to `continue`).
     """
     normalized = _normalize_page_name(page) or DEFAULT_PAGE
 
@@ -893,15 +1045,10 @@ def _load_headers_keys_for_page(page: str) -> Tuple[List[str], List[str]]:
                     continue
                 except Exception:
                     continue
-                # We don't await here — the registry is sync. If a
-                # third-party schema module ever returns a coroutine, we
-                # just skip it; the caller will fall back below.
+                # v5.1.1: skip awaitables outright. The registry is sync
+                # by contract; if a third-party schema module returns a
+                # coroutine, just fall back to the canonical schema.
                 if inspect.isawaitable(result):
-                    try:
-                        if not result.__await__:
-                            continue
-                    except Exception:
-                        continue
                     continue
                 headers, keys = _extract_headers_keys_from_spec(result)
                 if headers and keys and len(headers) == len(keys):
@@ -1365,7 +1512,12 @@ def _matrix_rows_to_dicts(matrix: Any, keys: Sequence[str]) -> List[Dict[str, An
 
 
 def _normalize_rows(result: Mapping[str, Any], keys: List[str]) -> List[Dict[str, Any]]:
-    """Normalize rows from result."""
+    """Normalize rows from result.
+
+    v5.1.1: defensively strips hard-internal fields from each row at the
+    extraction stage (preserving the `_skip_recommendation_synthesis`
+    sentinel which is consumed by `_backfill_rows`).
+    """
     rows: List[Dict[str, Any]] = []
 
     # Check common container keys
@@ -1379,24 +1531,29 @@ def _normalize_rows(result: Mapping[str, Any], keys: List[str]) -> List[Dict[str
                 rows = [dict(v) for v in value if isinstance(v, Mapping)]
                 break
             if isinstance(value[0], (list, tuple)):
-                return _matrix_rows_to_dicts(value, keys)
+                rows = _matrix_rows_to_dicts(value, keys)
+                break
 
-    if rows:
-        return rows
+    if not rows:
+        # Check matrix
+        for key in ("rows_matrix", "matrix"):
+            value = result.get(key)
+            if isinstance(value, list) and value and isinstance(value[0], (list, tuple)):
+                rows = _matrix_rows_to_dicts(value, keys)
+                break
 
-    # Check matrix
-    for key in ("rows_matrix", "matrix"):
-        value = result.get(key)
-        if isinstance(value, list) and value and isinstance(value[0], (list, tuple)):
-            return _matrix_rows_to_dicts(value, keys)
+    if not rows:
+        # Check nested
+        nested = _pick_first_mapping(result, "payload", "result", "response")
+        if nested:
+            nested_headers, nested_keys = _extract_payload_contract(dict(nested))
+            rows = _normalize_rows(dict(nested), nested_keys or nested_headers or keys)
 
-    # Check nested
-    nested = _pick_first_mapping(result, "payload", "result", "response")
-    if nested:
-        nested_headers, nested_keys = _extract_payload_contract(dict(nested))
-        return _normalize_rows(dict(nested), nested_keys or nested_headers or keys)
+    # v5.1.1: strip hard-internals from each row before downstream helpers see them
+    for row in rows:
+        _strip_internal_fields(row, hard=False)
 
-    return []
+    return rows
 
 
 def _normalize_headers_keys(
@@ -1448,28 +1605,84 @@ def _normalize_headers_keys(
     return headers, display_headers, keys
 
 
+# v5.1.1: fields whose presence indicates the engine had real scoring signal.
+# If NONE of these are populated for a row, we don't synthesise a recommendation
+# (vs. v5.1.0 which fabricated SELL/REDUCE for empty rows because every score
+# defaulted to 0.0 in `_to_float`).
+_SCORING_SIGNAL_FIELDS: Tuple[str, ...] = (
+    "overall_score", "opportunity_score", "value_score", "quality_score",
+    "momentum_score", "growth_score", "valuation_score",
+    "expected_roi_3m", "expected_roi_1m", "expected_roi_12m",
+    "forecast_confidence", "confidence_score",
+)
+
+
+def _row_has_scoring_signal(row: Mapping[str, Any]) -> bool:
+    """v5.1.1: True if at least one scoring field has a real (non-None) value."""
+    for f in _SCORING_SIGNAL_FIELDS:
+        if _to_float_optional(row.get(f)) is not None:
+            return True
+    # Check aliases too
+    for f in _SCORING_SIGNAL_FIELDS:
+        v = _row_value_for_aliases(row, _FIELD_ALIAS_HINTS.get(f, []))
+        if _to_float_optional(v) is not None:
+            return True
+    return False
+
+
+def _resolve_roi_for_scoring(row: Mapping[str, Any], horizon: str = "3m") -> Optional[float]:
+    """v5.1.1: Resolve expected ROI in PERCENT for use in the composite score.
+
+    Strategy (replaces v5.1.0's unsafe `if abs(roi) <= 1.5: roi *= 100`):
+    1. Prefer `expected_roi_<horizon>_pct` (engine v5.47.4 emits both as
+       fraction and as `_pct`); this is unambiguous percent.
+    2. Fall back to canonical `expected_roi_<horizon>` (engine schema
+       defines this as a fraction, e.g. 0.05 = 5%); multiply by 100.
+    3. Return None if neither is present.
+    """
+    pct_keys = (f"expected_roi_{horizon}_pct", f"roi_{horizon}_pct")
+    for k in pct_keys:
+        v = _to_float_optional(row.get(k))
+        if v is not None:
+            return v
+
+    frac_keys = (f"expected_roi_{horizon}", f"roi_{horizon}", f"expected_return_{horizon}")
+    for k in frac_keys:
+        v = _to_float_optional(row.get(k))
+        if v is not None:
+            # Heuristic: if magnitude > 5, the upstream is already in percent
+            # (e.g. legacy data with 12.5 meaning 12.5%). Otherwise treat as
+            # fraction and convert. This is safer than v5.1.0's heuristic
+            # because it can't turn a real -1.10% into -110%.
+            return v if abs(v) > 5.0 else (v * 100.0)
+    return None
+
+
 def _score_recommendation(row: Mapping[str, Any]) -> Tuple[str, str, float]:
-    """Score and generate a fallback recommendation."""
+    """Score and generate a fallback recommendation.
+
+    v5.1.1: replaces the unsafe `if abs(roi) <= 1.5: roi *= 100` heuristic
+    with `_resolve_roi_for_scoring`, which prefers the `_pct` mirror and
+    only converts fraction → percent when the magnitude clearly indicates
+    a fraction (abs <= 5). Prevents legitimate small percentages
+    (e.g. -1.10%) from being mangled to -110%.
+    """
     opportunity = _to_float(
         row.get("opportunity_score") or row.get("overall_score") or row.get("score"),
         0.0,
     )
     overall = _to_float(row.get("overall_score"), opportunity)
     risk = _to_float(row.get("risk_score"), 50.0)
-    expected_raw = _to_float(
-        row.get("expected_roi_3m")
-        or row.get("expected_roi_1m")
-        or row.get("expected_roi")
-        or row.get("forecast_return_pct"),
-        0.0,
-    )
 
-    # Convert fraction to percentage points if the value looks like a fraction
-    expected = (
-        expected_raw * 100.0
-        if abs(expected_raw) <= 1.5 and expected_raw != 0.0
-        else expected_raw
-    )
+    expected = _resolve_roi_for_scoring(row, horizon="3m")
+    if expected is None:
+        expected = _resolve_roi_for_scoring(row, horizon="1m")
+    if expected is None:
+        # Last-resort: try the legacy field names
+        legacy = _to_float_optional(row.get("expected_roi") or row.get("forecast_return_pct"))
+        expected = legacy if (legacy is None or abs(legacy) > 5.0) else (legacy * 100.0)
+        if expected is None:
+            expected = 0.0
 
     composite = overall + (0.35 * opportunity) + (0.20 * expected) - (0.25 * risk)
 
@@ -1490,9 +1703,9 @@ def _risk_bucket_from_row(row: MutableMapping[str, Any]) -> str:
     if existing:
         return existing
 
-    risk = _to_float(row.get("risk_score"), float("nan"))
-    if math.isnan(risk):
-        return "Moderate"
+    risk = _to_float_optional(row.get("risk_score"))
+    if risk is None:
+        return ""  # v5.1.1: don't fabricate "Moderate" for missing data
     if risk < 35:
         return "Low"
     if risk < 65:
@@ -1506,9 +1719,12 @@ def _confidence_bucket_from_row(row: MutableMapping[str, Any]) -> str:
     if existing:
         return existing
 
-    score = _to_float(row.get("overall_score") or row.get("opportunity_score"), float("nan"))
-    if math.isnan(score):
-        return "Medium"
+    score = _to_float_optional(
+        row.get("confidence_score") or row.get("forecast_confidence")
+        or row.get("overall_score") or row.get("opportunity_score")
+    )
+    if score is None:
+        return ""  # v5.1.1: don't fabricate "Medium" for missing data
     if score >= 75:
         return "High"
     if score >= 50:
@@ -1534,7 +1750,14 @@ def _backfill_rows(
     page: str,
     criteria: Dict[str, Any],
 ) -> List[Dict[str, Any]]:
-    """Backfill missing fields in rows."""
+    """Backfill missing fields in rows.
+
+    v5.1.1 changes:
+    - Respects `_skip_recommendation_synthesis` sentinel from engine v5.47.4
+    - Only synthesises a recommendation if at least one scoring field has
+      real data (no more SELL recommendations from all-zero defaults)
+    - Only fills risk/confidence buckets if the underlying score exists
+    """
     page = _normalize_page_name(page) or DEFAULT_PAGE
 
     if page == "Insights_Analysis":
@@ -1543,16 +1766,28 @@ def _backfill_rows(
         return rows
 
     for row in rows:
+        # v5.1.1: respect engine's "this row has no data, don't synthesize" flag
+        skip_sentinel = _to_bool(row.get("_skip_recommendation_synthesis"), False)
+
         reco = _to_string(row.get("recommendation"))
-        if not reco:
-            reco, reason, composite = _score_recommendation(row)
-            row["recommendation"] = reco
-            row.setdefault("selection_reason", reason)
+        if not reco and not skip_sentinel and _row_has_scoring_signal(row):
+            reco_val, reason, composite = _score_recommendation(row)
+            row["recommendation"] = reco_val
+            if not _to_string(row.get("selection_reason")):
+                row["selection_reason"] = reason
             if _is_blank(row.get("overall_score")) and not _is_blank(composite):
                 row["overall_score"] = round(composite, 2)
 
-        row.setdefault("risk_bucket", _risk_bucket_from_row(row))
-        row.setdefault("confidence_bucket", _confidence_bucket_from_row(row))
+        # Buckets — only fill if we can compute them (don't fabricate)
+        risk_bucket = _risk_bucket_from_row(row)
+        if risk_bucket and _is_blank(row.get("risk_bucket")):
+            row["risk_bucket"] = risk_bucket
+        conf_bucket = _confidence_bucket_from_row(row)
+        if conf_bucket and _is_blank(row.get("confidence_bucket")):
+            row["confidence_bucket"] = conf_bucket
+
+        # v5.1.1: hard-strip the sentinel after consuming it (it's served its purpose)
+        _strip_internal_fields(row, hard=True)
 
     if page == "Top_10_Investments":
         _ensure_top10_fields(rows, criteria)
@@ -1682,7 +1917,12 @@ def _build_data_dictionary_rows(criteria: Dict[str, Any]) -> List[Dict[str, Any]
 
 
 def _build_special_fallback(page: str, criteria: Dict[str, Any]) -> Dict[str, Any]:
-    """Build fallback response for special pages (registry-aligned)."""
+    """Build fallback response for special pages (registry-aligned).
+
+    v5.1.1: instrument fallback no longer hard-codes RECO_HOLD for symbols
+    with no upstream data. Recommendation stays None and the row is
+    clearly marked as a fallback in `warnings` / `selection_reason`.
+    """
     page = _normalize_page_name(page) or DEFAULT_PAGE
 
     if page == "Insights_Analysis":
@@ -1705,6 +1945,15 @@ def _build_special_fallback(page: str, criteria: Dict[str, Any]) -> Dict[str, An
                 "metric": "symbols_count",
                 "value": len(symbols) if isinstance(symbols, list) else 0,
                 "notes": "Symbol count from request payload",
+                "last_updated_riyadh": now_riyadh,
+            },
+            {
+                "section": "Status",
+                "item": "Engine availability",
+                "symbol": None,
+                "metric": "warning",
+                "value": "no_live_data",
+                "notes": "Engine returned no usable rows; this is a fallback summary",
                 "last_updated_riyadh": now_riyadh,
             },
         ]
@@ -1757,18 +2006,24 @@ def _build_special_fallback(page: str, criteria: Dict[str, Any]) -> Dict[str, An
     rows: List[Dict[str, Any]] = []
     symbols = _normalize_list(criteria.get("symbols") or criteria.get("tickers"))
 
+    fallback_warning = "Fallback row — engine returned no live data for this symbol"
+
     for idx, symbol in enumerate(symbols[: criteria.get("top_n", DEFAULT_LIMIT)], start=1):
         row = {k: None for k in keys}
         if "symbol" in row:
             row["symbol"] = symbol
         if "name" in row:
             row["name"] = symbol
-        if "recommendation" in row:
-            row["recommendation"] = RECO_HOLD
+        # v5.1.1: do NOT default recommendation to RECO_HOLD. Leave None.
+        # The row is clearly a fallback; the caller can render it as such.
+        if "data_provider" in row:
+            row["data_provider"] = "advisor_fallback_no_live_data"
+        if "warnings" in row:
+            row["warnings"] = fallback_warning
         if "top10_rank" in row:
             row["top10_rank"] = idx
         if "selection_reason" in row:
-            row["selection_reason"] = "Fallback candidate from supplied symbols"
+            row["selection_reason"] = "Fallback candidate from supplied symbols (no live advisor data)"
         if "criteria_snapshot" in row:
             row["criteria_snapshot"] = _json_compact(criteria)
         rows.append(row)
@@ -1802,7 +2057,11 @@ def _normalize_engine_result(
     criteria: Dict[str, Any],
     resolver_meta: Dict[str, Any],
 ) -> Dict[str, Any]:
-    """Normalize engine result."""
+    """Normalize engine result.
+
+    v5.1.1: hard-strips internal fields from every row before final emission,
+    treats engine "warn" status as success-with-caveat.
+    """
     page = _normalize_page_name(criteria.get("page")) or DEFAULT_PAGE
 
     if not isinstance(result, Mapping) or not result:
@@ -1826,16 +2085,29 @@ def _normalize_engine_result(
     rows = _backfill_rows(rows, page, criteria)
     rows = _ensure_rows_cover_keys(rows, keys, headers)
 
+    # v5.1.1: hard-strip internals one more time after backfill (defence in depth)
+    for row in rows:
+        _strip_internal_fields(row, hard=True)
+
     total_rows_before_slice = len(rows)
     offset = criteria.get("offset", DEFAULT_OFFSET)
     limit = criteria.get("limit", DEFAULT_LIMIT)
     rows = _slice_rows(rows, offset, limit)
 
+    # v5.1.1: handle engine status more carefully
+    raw_status = _to_string(result.get("status")).lower()
+    if raw_status == "warn":
+        # Engine v5.47.4 emits "warn" for partial-success — rows are usable
+        out_status = AdvisorStatus.WARN.value if rows else AdvisorStatus.ERROR.value
+    elif raw_status in {"error", "failed", "fail"} and not rows:
+        out_status = AdvisorStatus.ERROR.value
+    elif raw_status:
+        out_status = raw_status
+    else:
+        out_status = AdvisorStatus.SUCCESS.value if rows else AdvisorStatus.WARN.value
+
     out: Dict[str, Any] = {
-        "status": (
-            _to_string(result.get("status"))
-            or (AdvisorStatus.SUCCESS.value if rows else AdvisorStatus.WARN.value)
-        ),
+        "status": out_status,
         "page": page,
         "sheet": page,
         "sheet_name": page,
@@ -1858,11 +2130,13 @@ def _normalize_engine_result(
             "page": page,
             "advisor_data_mode_effective": criteria.get("advisor_data_mode"),
             "normalized_by": "core.investment_advisor",
+            "advisor_version": INVESTMENT_ADVISOR_VERSION,
             "timestamp_utc": _now_utc_iso(),
             "offset": max(0, _to_int(offset, DEFAULT_OFFSET)),
             "limit": max(1, _to_int(limit, DEFAULT_LIMIT)),
             "rows_before_local_slice": total_rows_before_slice,
             "rows_after_local_slice": len(rows),
+            "engine_status": raw_status or None,
         },
     }
 
