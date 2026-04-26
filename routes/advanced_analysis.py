@@ -2,36 +2,47 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.0.1
+Advanced Analysis Root Owner — v4.0.2
 ================================================================================
-ROOT SHEET-ROWS OWNER • SCHEMA-FIRST • FAIL-SOFT • STABLE ENVELOPE • JSON-SAFE
-GET+POST MERGED • HEADERS-ONLY / SCHEMA-ONLY • CANONICAL WIDTHS • OWNER-ALIGNED
+ROOT SHEET-ROWS OWNER • ENGINE-FIRST • HARD-TIMEOUT • SCHEMA-FIRST
+FAIL-SOFT • STABLE ENVELOPE • JSON-SAFE • GET+POST MERGED
+HEADERS-ONLY / SCHEMA-ONLY • CANONICAL WIDTHS • OWNER-ALIGNED
 
-v4.0.1 changes (from v4.0.0)
+v4.0.2 changes (from v4.0.1)
 ----------------------------
-- FIX [HIGH]: adapter import preference flipped. v4.0.0 (and earlier) tried
-    `from core.data_engine import get_sheet_rows` FIRST and only fell
-    back to `core.data_engine_v2` if the import raised. Since the repo
-    still contains the legacy `core.data_engine` module (v7.x), the
-    first import always succeeded — which meant this route always
-    delegated to the LEGACY engine, not `core.data_engine_v2` (the
-    primary engine loaded into `app.state.engine`). Scoring.py v4.1.2
-    and data_engine_v2.py v6.1.2 were deployed but never reached via
-    this route.
+- FIX [CRITICAL]: v4.0.1 promised to prefer `core.data_engine_v2` over the
+    legacy `core.data_engine` adapter, but the import strategy was wrong.
+    `core.data_engine_v2` exposes `get_sheet_rows` ONLY as a method on the
+    `DataEngine` class — not as a module-level function. So
+        `from core.data_engine_v2 import get_sheet_rows`
+    always raised ImportError and the legacy adapter was used regardless.
+    Symptoms in production:
+      - Top_10_Investments: bridge call took >25s (timeout)
+      - Insights_Analysis: bridge call took >25s (timeout)
+      - Data_Dictionary: completed in ~107s but returned 5 all-null rows
+      - Mutual_Funds: 4.3s but rows had only generic metadata
+    All five failed cases logged `source: "core.data_engine.get_sheet_rows"`.
+    Fix: call `app.state.engine.get_sheet_rows(...)` FIRST (the live v2
+    engine instance with proper special-page builders), then fall back to
+    the module-level legacy adapter, then to local fail-soft. Engine
+    instance method gives access to v2's `_build_data_dictionary_rows`,
+    `_build_top10_rows_fallback`, and `_build_insights_rows_fallback`,
+    which the legacy adapter cannot reach reliably.
 
-    Symptom before fix: when `routes.analysis_sheet_rows` fell through
-    to this route as its Tier-3 proxy, responses came back with AAPL
-    scoring fields null (overall_score / recommendation / confidence_score
-    / quality / momentum / growth / opportunity / value_score / valuation_score
-    all null — only risk_score set). That's because the legacy
-    `core.data_engine` doesn't run the full `compute_scores` pipeline
-    from core.scoring — it only populates `risk_score` via a direct
-    helper call.
+- FIX [HIGH]: added a hard timeout (`TFB_ADVANCED_ENGINE_TIMEOUT_SEC`,
+    default 20.0s) around every engine call. Without this, Data_Dictionary
+    blocked the worker for 107 seconds. The timeout is shorter than the
+    enriched_quote bridge timeout (25s), so timeouts surface here with a
+    clean status rather than appearing as bridge failures upstream.
 
-    Fix: try `core.data_engine_v2` first, fall back to `core.data_engine`
-    only if v2 is unavailable. After this fix responses meta will show
-    `source: "core.data_engine_v2.get_sheet_rows"` and scoring columns
-    populate correctly.
+- FIX [MEDIUM]: added `_rows_have_any_data()` to detect when an upstream
+    response contains rows that are all-null after schema projection
+    (the Data_Dictionary symptom). When detected, this is treated as a
+    failed engine call so the local builder fallback can produce real data.
+
+- ADD: meta now includes `engine_source` and `engine_call_duration_ms`
+    for every response, so future regressions are diagnosable from the
+    response payload alone (no log diving).
 
 Purpose
 -------
@@ -43,8 +54,8 @@ Owns the canonical root paths:
 - /schema/data-dictionary
 and their /v1/schema aliases.
 
-Why this revision (from v4.0.0, preserved)
-------------------------------------------
+Why this revision (preserved from v4.0.1)
+-----------------------------------------
 - FIX: keeps root /sheet-rows authoritative and returns a stable envelope even
        when upstream builders degrade.
 - FIX: never emits empty-success payloads for special pages.
@@ -59,6 +70,8 @@ Why this revision (from v4.0.0, preserved)
 
 from __future__ import annotations
 
+import asyncio
+import importlib
 import inspect
 import json
 import logging
@@ -77,7 +90,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
-ADVANCED_ANALYSIS_VERSION = "4.0.1"
+ADVANCED_ANALYSIS_VERSION = "4.0.2"
 router = APIRouter(tags=["schema", "root-sheet-rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -108,6 +121,23 @@ _TOP10_REQUIRED_HEADERS: Dict[str, str] = {
     "selection_reason": "Selection Reason",
     "criteria_snapshot": "Criteria Snapshot",
 }
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read a float from env var with safe fallback."""
+    try:
+        raw = (os.getenv(name, "") or "").strip()
+        return float(raw) if raw else float(default)
+    except Exception:
+        return float(default)
+
+
+# Hard timeout enforced around every engine call. Keeps requests responsive
+# even when the engine is cold/slow. Must be shorter than the upstream
+# bridge timeout in routes/enriched_quote.py (25s) so this layer surfaces
+# the timeout cleanly rather than letting it appear as a bridge failure.
+ADVANCED_ENGINE_TIMEOUT_SEC = _env_float("TFB_ADVANCED_ENGINE_TIMEOUT_SEC", 20.0)
+
 
 try:
     from core.sheets.schema_registry import (  # type: ignore
@@ -148,21 +178,16 @@ except Exception:
     def get_settings_cached(*args: Any, **kwargs: Any) -> Any:  # type: ignore
         return None
 
-CORE_GET_SHEET_ROWS_SOURCE = "unavailable"
-# v4.0.1: prefer core.data_engine_v2 (the primary engine wired into
-# app.state.engine) over the legacy core.data_engine. Previously this
-# tried data_engine first, which always succeeded because the legacy
-# module still exists in the repo — that bypassed scoring.py v4.1.2
-# and data_engine_v2.py v6.1.2 whenever this route owned the request.
+
+# Tier-2 (legacy module-level adapter) fallback. Tier-1 is the engine
+# instance from `app.state.engine`, resolved per-request below.
+LEGACY_ADAPTER_SOURCE = "unavailable"
 try:
-    from core.data_engine_v2 import get_sheet_rows as core_get_sheet_rows  # type: ignore
-    CORE_GET_SHEET_ROWS_SOURCE = "core.data_engine_v2.get_sheet_rows"
+    from core.data_engine import get_sheet_rows as _legacy_get_sheet_rows  # type: ignore
+    LEGACY_ADAPTER_SOURCE = "core.data_engine.get_sheet_rows"
 except Exception:
-    try:
-        from core.data_engine import get_sheet_rows as core_get_sheet_rows  # type: ignore
-        CORE_GET_SHEET_ROWS_SOURCE = "core.data_engine.get_sheet_rows"
-    except Exception:
-        core_get_sheet_rows = None  # type: ignore
+    _legacy_get_sheet_rows = None  # type: ignore
+
 
 _CANONICAL_80_HEADERS: List[str] = [
     "Symbol", "Name", "Asset Class", "Exchange", "Currency", "Country", "Sector", "Industry",
@@ -226,6 +251,7 @@ _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
     "selection_reason": ["reason", "selection_notes"],
     "criteria_snapshot": ["criteria", "snapshot", "criteria_json"],
 }
+
 
 def _strip(v: Any) -> str:
     try:
@@ -700,17 +726,17 @@ def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
         return []
     if isinstance(payload, list):
         if payload and isinstance(payload[0], Mapping):
-            return [dict(x) for x in payload]
+            return [{str(k): v for k, v in dict(x).items()} for x in payload]
         return []
     if not isinstance(payload, Mapping):
         return []
     for name in ("row_objects", "records", "items", "data", "quotes", "results"):
         value = payload.get(name)
         if isinstance(value, list) and value and isinstance(value[0], Mapping):
-            return [dict(x) for x in value]
+            return [{str(k): v for k, v in dict(x).items()} for x in value]
     rows_value = payload.get("rows")
     if isinstance(rows_value, list) and rows_value and isinstance(rows_value[0], Mapping):
-        return [dict(x) for x in rows_value]
+        return [{str(k): v for k, v in dict(x).items()} for x in rows_value]
     for name in ("payload", "result", "response", "output", "data"):
         nested = payload.get(name)
         if isinstance(nested, Mapping):
@@ -742,6 +768,30 @@ def _normalize_to_schema_keys(*, schema_keys: Sequence[str], schema_headers: Seq
             v = "; ".join([_strip(x) for x in v if _strip(x)])
         out[ks] = _json_safe(v)
     return out
+
+
+def _rows_have_any_data(rows: Sequence[Mapping[str, Any]]) -> bool:
+    """
+    Detect whether a list of normalized row dicts contains ANY useful data.
+    Returns False when every row has every field as None/empty — the
+    Data_Dictionary symptom from production where the legacy adapter
+    returned 5 row objects with every key set to null.
+    """
+    if not rows:
+        return False
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        for value in row.values():
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
+            if isinstance(value, (list, tuple, dict, set)) and not value:
+                continue
+            return True
+    return False
+
 
 def _to_number(value: Any) -> float:
     if value is None:
@@ -964,43 +1014,241 @@ def _payload_envelope(*, page: str, headers: Sequence[str], keys: Sequence[str],
             "mode": mode,
             "count": len(rows_dict),
             "dispatch": "advanced_analysis_root",
-            "source": CORE_GET_SHEET_ROWS_SOURCE,
             **(meta or {}),
         },
     })
 
-async def _call_core_sheet_rows_best_effort(*, page: str, limit: int, offset: int, mode: str, body: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    if core_get_sheet_rows is None:
-        return None, None
-    candidates = [
-        ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode, "body": body}),
+
+# -----------------------------------------------------------------------------
+# Engine resolution and call (NEW in v4.0.2)
+# -----------------------------------------------------------------------------
+async def _resolve_engine(request: Request) -> Tuple[Optional[Any], str]:
+    """
+    Resolve the live engine instance for this request.
+
+    Preference order:
+      1. `request.app.state.engine` — the v2 DataEngine that was loaded at
+         app startup. This is the instance that has all the proper
+         special-page builders (`_build_data_dictionary_rows`,
+         `_build_top10_rows_fallback`, `_build_insights_rows_fallback`)
+         and active caches.
+      2. Other state attributes (`data_engine_v2`, `data_engine`).
+      3. Module-level factory functions (`get_engine`, `get_data_engine`)
+         on the engine modules. Last-resort, may cold-init.
+
+    Returns (engine, source_label). Engine may be None.
+    """
+    try:
+        state = getattr(request.app, "state", None)
+        if state is not None:
+            for attr in ("engine", "data_engine_v2", "data_engine", "quote_engine", "cache_engine"):
+                value = getattr(state, attr, None)
+                if value is not None:
+                    return value, f"app.state.{attr}"
+    except Exception as exc:
+        logger.debug("app.state engine lookup failed: %s", exc)
+
+    for module_name in ("core.data_engine_v2", "core.data_engine"):
+        try:
+            mod = importlib.import_module(module_name)
+        except Exception as exc:
+            logger.debug("engine module import failed: %s (%s)", module_name, exc)
+            continue
+        for fac_name in ("get_engine", "get_data_engine", "get_or_create_engine"):
+            fac = getattr(mod, fac_name, None)
+            if not callable(fac):
+                continue
+            try:
+                eng = fac()
+                if inspect.isawaitable(eng):
+                    eng = await eng
+                if eng is not None:
+                    return eng, f"{module_name}.{fac_name}"
+            except Exception as exc:
+                logger.debug("engine factory %s.%s raised: %s", module_name, fac_name, exc)
+                continue
+
+    return None, "no_engine_available"
+
+
+async def _call_engine_sheet_rows(
+    engine: Any,
+    *,
+    page: str,
+    limit: int,
+    offset: int,
+    mode: str,
+    body: Dict[str, Any],
+    timeout_seconds: float,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """
+    Call the engine's sheet-rows method with a hard timeout.
+
+    Returns (payload, source_label). Payload is None on timeout/missing
+    method. source_label always identifies what was attempted (engine
+    callable name, or `timeout`, or `unavailable`).
+    """
+    if engine is None:
+        return None, "no_engine"
+
+    fn = (
+        getattr(engine, "get_sheet_rows", None)
+        or getattr(engine, "get_page_rows", None)
+        or getattr(engine, "get_sheet", None)
+    )
+    if not callable(fn):
+        return None, "engine_missing_get_sheet_rows"
+
+    fn_label = getattr(fn, "__qualname__", None) or "engine.get_sheet_rows"
+    safe_body = dict(body or {})
+
+    # Tolerant signature: try the richest first, then progressively coarser.
+    candidates: List[Tuple[Tuple[Any, ...], Dict[str, Any]]] = [
+        ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode, "body": safe_body}),
+        ((), {"sheet_name": page, "limit": limit, "offset": offset, "mode": mode, "body": safe_body}),
+        ((), {"page": page, "limit": limit, "offset": offset, "mode": mode, "body": safe_body}),
         ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode}),
         ((), {"sheet": page, "limit": limit, "offset": offset}),
-        ((page,), {"limit": limit, "offset": offset, "mode": mode, "body": body}),
+        ((page,), {"limit": limit, "offset": offset, "mode": mode, "body": safe_body}),
         ((page,), {"limit": limit, "offset": offset, "mode": mode}),
         ((page,), {"limit": limit, "offset": offset}),
         ((page,), {}),
     ]
-    last_err: Optional[Exception] = None
+
+    last_type_error: Optional[TypeError] = None
+
+    async def _invoke(args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Any:
+        if inspect.iscoroutinefunction(fn):
+            return await fn(*args, **kwargs)
+        result = await asyncio.to_thread(fn, *args, **kwargs)
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
     for args, kwargs in candidates:
         try:
-            res = core_get_sheet_rows(*args, **kwargs)
-            res = await _maybe_await(res)
+            if timeout_seconds > 0:
+                res = await asyncio.wait_for(_invoke(args, kwargs), timeout=timeout_seconds)
+            else:
+                res = await _invoke(args, kwargs)
             if isinstance(res, dict):
-                return res, CORE_GET_SHEET_ROWS_SOURCE
+                return res, fn_label
             if isinstance(res, list):
-                return {"row_objects": res}, CORE_GET_SHEET_ROWS_SOURCE
+                return {"row_objects": res}, fn_label
+            # Unknown shape — surface as nothing
+            return None, fn_label
+        except asyncio.TimeoutError:
+            logger.warning(
+                "engine.get_sheet_rows timed out after %.1fs page=%s callable=%s",
+                timeout_seconds, page, fn_label,
+            )
+            return None, f"timeout:{timeout_seconds}s"
+        except TypeError as exc:
+            last_type_error = exc
+            logger.debug(
+                "engine.get_sheet_rows signature mismatch (%s): %s",
+                sorted(kwargs.keys()), exc,
+            )
+            continue
+        except Exception as exc:
+            logger.error(
+                "engine.get_sheet_rows raised page=%s callable=%s: %s",
+                page, fn_label, exc,
+            )
+            return {"status": "error", "error": str(exc), "row_objects": []}, fn_label
+
+    if last_type_error is not None:
+        logger.error(
+            "engine.get_sheet_rows exhausted all signature variants page=%s callable=%s last=%s",
+            page, fn_label, last_type_error,
+        )
+        return {"status": "error", "error": str(last_type_error), "row_objects": []}, fn_label
+    return None, fn_label
+
+
+async def _call_legacy_module_sheet_rows(
+    *, page: str, limit: int, offset: int, mode: str, body: Dict[str, Any], timeout_seconds: float,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """
+    Tier-2 fallback: call the legacy module-level `core.data_engine.get_sheet_rows`.
+    Hard timeout enforced. Used only when Tier-1 (engine instance) is
+    unavailable or returns nothing useful.
+    """
+    if _legacy_get_sheet_rows is None:
+        return None, "legacy_unavailable"
+
+    candidates: List[Tuple[Tuple[Any, ...], Dict[str, Any]]] = [
+        ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode, "body": dict(body or {})}),
+        ((), {"sheet": page, "limit": limit, "offset": offset, "mode": mode}),
+        ((), {"sheet": page, "limit": limit, "offset": offset}),
+        ((page,), {"limit": limit, "offset": offset, "mode": mode, "body": dict(body or {})}),
+        ((page,), {"limit": limit, "offset": offset, "mode": mode}),
+        ((page,), {"limit": limit, "offset": offset}),
+        ((page,), {}),
+    ]
+
+    last_err: Optional[Exception] = None
+
+    async def _invoke(args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Any:
+        if inspect.iscoroutinefunction(_legacy_get_sheet_rows):
+            return await _legacy_get_sheet_rows(*args, **kwargs)  # type: ignore[misc]
+        result = await asyncio.to_thread(_legacy_get_sheet_rows, *args, **kwargs)  # type: ignore[arg-type]
+        if inspect.isawaitable(result):
+            return await result
+        return result
+
+    for args, kwargs in candidates:
+        try:
+            if timeout_seconds > 0:
+                res = await asyncio.wait_for(_invoke(args, kwargs), timeout=timeout_seconds)
+            else:
+                res = await _invoke(args, kwargs)
+            if isinstance(res, dict):
+                return res, LEGACY_ADAPTER_SOURCE
+            if isinstance(res, list):
+                return {"row_objects": res}, LEGACY_ADAPTER_SOURCE
+            return None, LEGACY_ADAPTER_SOURCE
+        except asyncio.TimeoutError:
+            logger.warning(
+                "legacy core.data_engine.get_sheet_rows timed out after %.1fs page=%s",
+                timeout_seconds, page,
+            )
+            return None, f"timeout:{timeout_seconds}s"
         except TypeError as e:
             last_err = e
             continue
         except Exception as e:
             last_err = e
             break
-    if last_err is not None:
-        return {"status": "error", "error": str(last_err), "row_objects": []}, CORE_GET_SHEET_ROWS_SOURCE
-    return None, None
 
-def _normalize_external_payload(*, external_payload: Mapping[str, Any], page: str, headers: Sequence[str], keys: Sequence[str], include_matrix: bool, request_id: str, started_at: float, mode: str, limit: int = 2000, offset: int = 0, top_n: int = 2000, requested_symbols: Optional[Sequence[str]] = None, meta_extra: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    if last_err is not None:
+        return {"status": "error", "error": str(last_err), "row_objects": []}, LEGACY_ADAPTER_SOURCE
+    return None, LEGACY_ADAPTER_SOURCE
+
+
+def _normalize_external_payload(
+    *,
+    external_payload: Mapping[str, Any],
+    page: str,
+    headers: Sequence[str],
+    keys: Sequence[str],
+    include_matrix: bool,
+    request_id: str,
+    started_at: float,
+    mode: str,
+    limit: int = 2000,
+    offset: int = 0,
+    top_n: int = 2000,
+    requested_symbols: Optional[Sequence[str]] = None,
+    meta_extra: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], bool]:
+    """
+    Normalize an upstream payload into the canonical envelope.
+
+    Returns (envelope, has_real_data). `has_real_data` is True only when the
+    normalized rows contain at least one non-null field — used by the caller
+    to decide whether to fall through to the next tier.
+    """
     ext = dict(external_payload or {})
     hdrs = list(headers or [])
     ks = list(keys or [])
@@ -1009,15 +1257,33 @@ def _normalize_external_payload(*, external_payload: Mapping[str, Any], page: st
     if page == _TOP10_PAGE:
         normalized_rows = _ensure_top10_rows(normalized_rows, requested_symbols=requested_symbols or [], top_n=top_n, schema_keys=ks, schema_headers=hdrs)
     normalized_rows = _slice(normalized_rows, limit=limit, offset=offset)
+    has_data = _rows_have_any_data(normalized_rows)
     status_out, error_out, ext_meta = _extract_status_error(ext)
-    if not normalized_rows:
+    if not normalized_rows or not has_data:
         status_out = "partial"
-        error_out = error_out or "No usable rows returned"
+        error_out = error_out or ("No usable rows returned" if not normalized_rows else "Rows returned but all fields null")
     final_meta = dict(ext_meta or {})
     if meta_extra:
         final_meta.update(meta_extra)
-    return _payload_envelope(page=page, headers=hdrs, keys=ks, row_objects=normalized_rows, include_matrix=include_matrix, request_id=request_id, started_at=started_at, mode=mode, status_out=status_out or ("success" if normalized_rows else "partial"), error_out=error_out, meta=final_meta)
+    envelope = _payload_envelope(
+        page=page,
+        headers=hdrs,
+        keys=ks,
+        row_objects=normalized_rows,
+        include_matrix=include_matrix,
+        request_id=request_id,
+        started_at=started_at,
+        mode=mode,
+        status_out=status_out or ("success" if (normalized_rows and has_data) else "partial"),
+        error_out=error_out,
+        meta=final_meta,
+    )
+    return envelope, (bool(normalized_rows) and has_data)
 
+
+# -----------------------------------------------------------------------------
+# Main impl
+# -----------------------------------------------------------------------------
 async def _run_advanced_sheet_rows_impl(
     request: Request,
     body: Dict[str, Any],
@@ -1054,31 +1320,188 @@ async def _run_advanced_sheet_rows_impl(
     headers, keys, spec, schema_source = _resolve_contract(page)
 
     if schema_only or headers_only:
-        return _payload_envelope(page=page, headers=headers, keys=keys, row_objects=[], include_matrix=include_matrix, request_id=request_id, started_at=start, mode=mode, status_out="success", error_out=None, meta={"dispatch": "schema_only", "schema_source": schema_source, "headers_only": headers_only, "schema_only": schema_only})
+        return _payload_envelope(
+            page=page, headers=headers, keys=keys, row_objects=[],
+            include_matrix=include_matrix, request_id=request_id, started_at=start, mode=mode,
+            status_out="success", error_out=None,
+            meta={
+                "dispatch": "schema_only",
+                "schema_source": schema_source,
+                "headers_only": headers_only,
+                "schema_only": schema_only,
+            },
+        )
 
-    payload, source = await _call_core_sheet_rows_best_effort(page=page, limit=max(limit + offset, top_n), offset=0, mode=mode or "", body=merged_body)
-    if isinstance(payload, dict):
-        normalized = _normalize_external_payload(external_payload=payload, page=page, headers=headers, keys=keys, include_matrix=include_matrix, request_id=request_id, started_at=start, mode=mode, limit=limit, offset=offset, top_n=top_n, requested_symbols=requested_symbols, meta_extra={"schema_source": schema_source, "source": source or CORE_GET_SHEET_ROWS_SOURCE})
-        if _extract_rows_like(normalized):
-            return normalized
+    fetch_limit = max(limit + offset, top_n)
 
-    fallback_rows = _build_nonempty_failsoft_rows(page=page, headers=headers, keys=keys, requested_symbols=requested_symbols, limit=limit, offset=offset, top_n=top_n)
+    # ---- Tier 1: live engine instance from app.state.engine ----
+    tier1_started = time.time()
+    engine, engine_source = await _resolve_engine(request)
+    payload_t1, callable_t1 = await _call_engine_sheet_rows(
+        engine,
+        page=page,
+        limit=fetch_limit,
+        offset=0,
+        mode=mode or "",
+        body=merged_body,
+        timeout_seconds=ADVANCED_ENGINE_TIMEOUT_SEC,
+    )
+    tier1_duration_ms = round((time.time() - tier1_started) * 1000.0, 3)
+
+    if isinstance(payload_t1, dict):
+        envelope, has_data = _normalize_external_payload(
+            external_payload=payload_t1,
+            page=page, headers=headers, keys=keys,
+            include_matrix=include_matrix, request_id=request_id,
+            started_at=start, mode=mode,
+            limit=limit, offset=offset, top_n=top_n,
+            requested_symbols=requested_symbols,
+            meta_extra={
+                "schema_source": schema_source,
+                "engine_source": engine_source,
+                "engine_callable": callable_t1,
+                "engine_call_duration_ms": tier1_duration_ms,
+                "tier": "tier1_engine_instance",
+                "source": f"{engine_source}.{callable_t1}",
+            },
+        )
+        if has_data:
+            return envelope
+
+    # ---- Tier 2: legacy module-level adapter (core.data_engine.get_sheet_rows) ----
+    tier2_started = time.time()
+    payload_t2, t2_source = await _call_legacy_module_sheet_rows(
+        page=page,
+        limit=fetch_limit,
+        offset=0,
+        mode=mode or "",
+        body=merged_body,
+        timeout_seconds=ADVANCED_ENGINE_TIMEOUT_SEC,
+    )
+    tier2_duration_ms = round((time.time() - tier2_started) * 1000.0, 3)
+
+    if isinstance(payload_t2, dict):
+        envelope, has_data = _normalize_external_payload(
+            external_payload=payload_t2,
+            page=page, headers=headers, keys=keys,
+            include_matrix=include_matrix, request_id=request_id,
+            started_at=start, mode=mode,
+            limit=limit, offset=offset, top_n=top_n,
+            requested_symbols=requested_symbols,
+            meta_extra={
+                "schema_source": schema_source,
+                "engine_source": engine_source,
+                "engine_callable": callable_t1,
+                "engine_call_duration_ms": tier1_duration_ms,
+                "tier2_source": t2_source,
+                "tier2_duration_ms": tier2_duration_ms,
+                "tier": "tier2_legacy_adapter",
+                "source": t2_source,
+            },
+        )
+        if has_data:
+            return envelope
+
+    # ---- Tier 3: local fail-soft (always returns non-empty for known pages) ----
+    fallback_rows = _build_nonempty_failsoft_rows(
+        page=page, headers=headers, keys=keys,
+        requested_symbols=requested_symbols,
+        limit=limit, offset=offset, top_n=top_n,
+    )
     fallback_status = "partial" if fallback_rows else "error"
-    fallback_error = "Local non-empty fallback emitted after upstream degradation" if fallback_rows else "No usable rows returned; schema-shaped fallback emitted"
-    return _payload_envelope(page=page, headers=headers, keys=keys, row_objects=fallback_rows, include_matrix=include_matrix, request_id=request_id, started_at=start, mode=mode, status_out=fallback_status, error_out=fallback_error, meta={"dispatch": "advanced_analysis_fail_soft_nonempty" if fallback_rows else "advanced_analysis_fail_soft", "schema_source": schema_source, "source": source or CORE_GET_SHEET_ROWS_SOURCE})
+    fallback_error = (
+        "Local non-empty fallback emitted after all upstream tiers degraded"
+        if fallback_rows
+        else "No usable rows returned; schema-shaped fallback emitted"
+    )
+    return _payload_envelope(
+        page=page, headers=headers, keys=keys,
+        row_objects=fallback_rows,
+        include_matrix=include_matrix, request_id=request_id,
+        started_at=start, mode=mode,
+        status_out=fallback_status,
+        error_out=fallback_error,
+        meta={
+            "dispatch": "advanced_analysis_fail_soft_nonempty" if fallback_rows else "advanced_analysis_fail_soft",
+            "schema_source": schema_source,
+            "engine_source": engine_source,
+            "engine_callable": callable_t1,
+            "engine_call_duration_ms": tier1_duration_ms,
+            "tier2_source": t2_source if 't2_source' in locals() else "not_attempted",
+            "tier2_duration_ms": tier2_duration_ms if 'tier2_duration_ms' in locals() else None,
+            "tier": "tier3_local_failsoft",
+            "source": "advanced_analysis.local_failsoft",
+        },
+    )
 
+
+# -----------------------------------------------------------------------------
+# Diagnostic + schema endpoints
+# -----------------------------------------------------------------------------
 @router.get("/health")
 @router.get("/v1/schema/health")
 async def advanced_analysis_health(request: Request) -> Dict[str, Any]:
+    engine, engine_source = await _resolve_engine(request)
+    has_get_sheet_rows = bool(engine and (
+        callable(getattr(engine, "get_sheet_rows", None))
+        or callable(getattr(engine, "get_page_rows", None))
+        or callable(getattr(engine, "get_sheet", None))
+    ))
     return _json_safe({
         "status": "ok",
         "service": "advanced_analysis",
         "version": ADVANCED_ANALYSIS_VERSION,
         "schema_registry_available": bool(get_sheet_spec is not None),
-        "adapter_available": bool(core_get_sheet_rows is not None),
+        "engine_source": engine_source,
+        "engine_resolvable": engine is not None,
+        "engine_has_get_sheet_rows": has_get_sheet_rows,
+        "legacy_adapter_available": _legacy_get_sheet_rows is not None,
+        "legacy_adapter_source": LEGACY_ADAPTER_SOURCE,
+        "engine_timeout_sec": ADVANCED_ENGINE_TIMEOUT_SEC,
         "allowed_pages_count": len(_safe_allowed_pages()),
         "path": str(getattr(getattr(request, "url", None), "path", "")),
     })
+
+
+@router.get("/v1/schema/diagnostics")
+@router.get("/diagnostics")
+async def advanced_analysis_diagnostics(request: Request) -> Dict[str, Any]:
+    """
+    Detailed diagnostics for engine+adapter wiring. Useful when /sheet-rows
+    misbehaves — shows exactly which engine instance was resolved and which
+    method is wired, without log diving.
+    """
+    engine, engine_source = await _resolve_engine(request)
+    engine_methods = {}
+    if engine is not None:
+        for name in ("get_sheet_rows", "get_page_rows", "get_sheet", "get_enriched_quotes_batch", "get_enriched_quote_dict"):
+            fn = getattr(engine, name, None)
+            if callable(fn):
+                try:
+                    sig = str(inspect.signature(fn))
+                except (TypeError, ValueError):
+                    sig = "<introspection_failed>"
+                engine_methods[name] = {
+                    "is_coroutine": inspect.iscoroutinefunction(fn),
+                    "signature": sig,
+                    "qualname": getattr(fn, "__qualname__", name),
+                }
+    return _json_safe({
+        "status": "ok",
+        "service": "advanced_analysis",
+        "version": ADVANCED_ANALYSIS_VERSION,
+        "engine_source": engine_source,
+        "engine_resolvable": engine is not None,
+        "engine_class": type(engine).__name__ if engine else None,
+        "engine_module": getattr(type(engine), "__module__", None) if engine else None,
+        "engine_methods": engine_methods,
+        "legacy_adapter_source": LEGACY_ADAPTER_SOURCE,
+        "legacy_adapter_resolvable": _legacy_get_sheet_rows is not None,
+        "engine_timeout_sec": ADVANCED_ENGINE_TIMEOUT_SEC,
+        "allowed_pages": _safe_allowed_pages(),
+        "timestamp_utc": datetime.utcnow().isoformat(),
+    })
+
 
 @router.get("/schema")
 @router.get("/v1/schema")
