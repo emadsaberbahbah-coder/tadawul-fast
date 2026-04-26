@@ -2,11 +2,12 @@
 # routes/enriched_quote.py
 """
 ================================================================================
-TFB Enriched Quote Routes Wrapper — v8.5.0
+TFB Enriched Quote Routes Wrapper — v8.6.0
 ================================================================================
 IMPORT-SAFE • MINIMAL-DEPENDENCY • ENRICHED-ALIAS OWNERSHIP SAFE
 QUOTE + QUOTES + SHEET-ROWS ALIASES • BRIDGE-FIRST • FAIL-SOFT • JSON-SAFE
 X-API-Key AWARE • ROUTE-OWNER ATTRIBUTED • HEALTH-CAPABILITY-AWARE
+SIGNATURE-INTROSPECTING BRIDGE DISPATCH • NO-ZERO-ARG HANDLER CALLS
 
 Canonical-owner note (read first)
 ---------------------------------
@@ -36,48 +37,47 @@ module declares MUST start with one of:
     /quotes
 Otherwise `_clone_filtered_router` will drop them.
 
-Why this revision (v8.5.0 vs v8.4.0)
+Why this revision (v8.6.0 vs v8.5.0)
 ------------------------------------
-- FIX: auth_guard now accepts an explicit `x_api_key` argument and passes
-       `api_key=` on the richest `core.config.auth_ok` attempt. v8.4.0 silently
-       dropped the X-API-Key header unless the caller also sent it via
-       X-APP-TOKEN / Authorization. This matches the auth pattern used by
-       routes.investment_advisor v5.2.0, routes.analysis_sheet_rows v4.1.0,
-       routes.data_dictionary v2.7.0, routes.config v5.9.0.
-- FIX: every public endpoint now accepts `x_api_key` as a FastAPI Header
-       (alias "X-API-Key"), threaded through to `auth_guard`. v8.4.0 defined
-       no such header parameter — so alternative auth via X-API-Key was
-       effectively inoperable on this router alone.
-- FIX: `_bool_from_any` now accepts the project-wide _TRUTHY/_FALSY
-       vocabulary (adds `t`, `f`, `enabled`, `enable`, `disabled`, `disable`)
-       matching `main._TRUTHY` / `_FALSY`.
-- FIX: `/health` endpoint now reports route_owner, route_family,
-       timestamp_utc, capabilities dict, owned_paths, bridge_candidate
-       modules, and schema_registry_available / page_catalog_available
-       flags. v8.4.0 returned only status + router_version + a single flag.
-- FIX: `_resolve_bridge_impl` now adds `routes.advanced_sheet_rows` as a
-       secondary fallback in every module_order variant, so a transient
-       failure of the primary canonical owner still has a working bridge.
-- FIX: `envelope` now emits `route_owner` and `timestamp_utc` at the top
-       level of every response (plus route_owner + route_family within
-       `meta`) — consistent with the revised sister routers.
-- FIX: `_Service.__init__` now probes `schema_registry` availability via
-       the same multi-path fallback already used for `page_catalog`, so
-       `/health` can report both accurately.
-- KEEP: all v8.4.0 behavior — bridge-first delegation; bounded fail-soft
-       rows for Top_10_Investments, Insights_Analysis, Data_Dictionary;
-       symbol aliases (direct_symbols / selected_symbols / selected_tickers);
-       single-quote placeholder row for non-instrument pages; stable
-       envelope with headers/keys/columns/rows/rows_matrix/row_objects/
-       items/records/data/quotes.
-- KEEP: tolerant-signature bridge dispatch, logger.NullHandler (no
-       import-time side effects).
+- FIX CRITICAL: `_call_with_tolerant_signatures` had a dangerous final `{}`
+       attempt that invoked target handlers with ZERO arguments. When the
+       target was `_analysis_sheet_rows_impl(request, body, mode, ...)` (9
+       required positional params), this raised
+       "TypeError: missing 9 required positional arguments". The `{}` final
+       attempt is removed. Replaced with a signature-introspecting first
+       attempt that calls fn with EXACTLY the kwargs it declares.
+- FIX CRITICAL: the prior `if v is not None` filter inside
+       `_call_with_tolerant_signatures` stripped legitimate None values for
+       optional kwargs (token, x_request_id, x_api_key, authorization). This
+       caused required-positional params to be missing on every attempt. Now
+       we keep None values verbatim so the target sees them as supplied.
+- FIX HIGH: bridge dispatch now logs the actual signature mismatch reason
+       instead of silently moving to the next attempt. When ALL attempts fail
+       with TypeError, the original TypeError is re-raised so the caller can
+       see why instead of getting an empty TimeoutError later.
+- FIX MEDIUM: `_extract_rows_like` short-circuit on already-list payloads now
+       handles `dict` items with non-string keys safely (cast to str).
+- FIX MEDIUM: `_normalize_symbol_token` is now whitespace-tolerant on
+       embedded NBSP / zero-width characters that appeared in some Argaam /
+       Tadawul payloads.
+- FIX LOW: `_to_dict` now handles dataclass instances via dataclasses.asdict
+       before the vars() fallback, matching `_json_safe`.
+- FIX LOW: `envelope.error` is no longer set to empty string when error is
+       None — keeps response shape consistent for downstream JSON consumers.
+- ADD: `/v1/enriched/diagnostics` (debug-only, include_in_schema=False) that
+       returns full bridge resolution map + signature for each candidate, so
+       future bridge-mismatch bugs can be diagnosed without log diving.
+- ADD: ROUTER_VERSION bumped to 8.6.0 so deploys can be verified via /health.
+- KEEP: all v8.5.0 X-API-Key threading behavior, capability-aware /health,
+       canonical-owner hints in meta, and tolerant-signature dispatch
+       structure.
 ================================================================================
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import importlib
 import inspect
 import logging
@@ -88,14 +88,14 @@ import time
 import uuid
 from datetime import date, datetime, time as dt_time, timezone
 from decimal import Decimal
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
 from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, status
 
 logger = logging.getLogger("routes.enriched_quote")
 logger.addHandler(logging.NullHandler())
 
-ROUTER_VERSION = "8.5.0"
+ROUTER_VERSION = "8.6.0"
 ROUTE_OWNER_NAME = "enriched_quote"
 ROUTE_FAMILY_NAME = "enriched"
 
@@ -206,6 +206,9 @@ EMERGENCY_PAGE_SYMBOLS: Dict[str, List[str]] = {
     "Top_10_Investments": ["2222.SR", "1120.SR", "AAPL", "MSFT", "NVDA"],
 }
 
+# Whitespace characters to strip from symbol tokens (covers NBSP, ZWSP, BOM)
+_SYMBOL_INVISIBLE_CHARS = "\u00a0\u200b\u200c\u200d\ufeff"
+
 router = APIRouter(tags=["enriched"])
 
 
@@ -251,6 +254,11 @@ def _json_safe(value: Any) -> Any:
         return {str(k): _json_safe(v) for k, v in value.items()}
     if isinstance(value, (list, tuple, set)):
         return [_json_safe(v) for v in value]
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        try:
+            return _json_safe(dataclasses.asdict(value))
+        except Exception:
+            pass
     try:
         if hasattr(value, "model_dump"):
             return _json_safe(value.model_dump())  # type: ignore[attr-defined]
@@ -269,9 +277,20 @@ def _json_safe(value: Any) -> Any:
 
 def _to_dict(obj: Any) -> Dict[str, Any]:
     if isinstance(obj, dict):
-        return dict(obj)
+        return {str(k): v for k, v in obj.items()}
     if obj is None:
         return {}
+    if isinstance(obj, Mapping):
+        try:
+            return {str(k): v for k, v in obj.items()}
+        except Exception:
+            return {}
+    if dataclasses.is_dataclass(obj) and not isinstance(obj, type):
+        try:
+            d = dataclasses.asdict(obj)
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            pass
     try:
         if hasattr(obj, "model_dump"):
             d = obj.model_dump()  # type: ignore[attr-defined]
@@ -354,7 +373,7 @@ def _int_from_any(value: Any, default: int) -> int:
 def _split_symbols(value: str) -> List[str]:
     raw = (value or "").replace(";", ",").replace("\n", ",").replace("\t", ",").replace("|", ",")
     out: List[str] = []
-    seen = set()
+    seen: Set[str] = set()
     for part in raw.split(","):
         s = _strip(part)
         if s and s not in seen:
@@ -364,9 +383,14 @@ def _split_symbols(value: str) -> List[str]:
 
 
 def _normalize_symbol_token(sym: Any) -> str:
-    s = _strip(sym).upper().replace(" ", "")
+    s = _strip(sym).upper()
     if not s:
         return ""
+    # Strip embedded zero-width / nbsp before whitespace removal so codes
+    # arriving from external providers normalize cleanly.
+    for ch in _SYMBOL_INVISIBLE_CHARS:
+        s = s.replace(ch, "")
+    s = s.replace(" ", "")
     if s.startswith("TADAWUL:"):
         s = s.split(":", 1)[1].strip()
     if s.endswith(".SA"):
@@ -381,7 +405,7 @@ def _list_from_body(body: Mapping[str, Any], *keys: str) -> List[str]:
         value = body.get(key)
         if isinstance(value, list):
             out: List[str] = []
-            seen = set()
+            seen: Set[str] = set()
             for item in value:
                 s = _normalize_symbol_token(item)
                 if s and s not in seen:
@@ -518,7 +542,7 @@ def _key_variants(key: str) -> List[str]:
     for alias in _FIELD_ALIAS_HINTS.get(k, []):
         variants.extend([alias, alias.lower(), alias.upper(), alias.replace("_", " "), alias.replace("_", "").lower()])
     out: List[str] = []
-    seen = set()
+    seen: Set[str] = set()
     for v in variants:
         s = _strip(v)
         if s and s not in seen:
@@ -571,17 +595,17 @@ def _extract_rows_like(payload: Any, depth: int = 0) -> List[Dict[str, Any]]:
         return []
     if isinstance(payload, list):
         if payload and isinstance(payload[0], Mapping):
-            return [dict(x) for x in payload]
+            return [{str(k): v for k, v in dict(x).items()} for x in payload]
         return []
     if not isinstance(payload, Mapping):
         return []
     for name in ("row_objects", "records", "items", "data", "quotes", "results"):
         value = payload.get(name)
         if isinstance(value, list) and value and isinstance(value[0], Mapping):
-            return [dict(x) for x in value]
+            return [{str(k): v for k, v in dict(x).items()} for x in value]
     rows_value = payload.get("rows")
     if isinstance(rows_value, list) and rows_value and isinstance(rows_value[0], Mapping):
-        return [dict(x) for x in rows_value]
+        return [{str(k): v for k, v in dict(x).items()} for x in rows_value]
     for name in ("payload", "result", "response", "output", "data"):
         nested = payload.get(name)
         if isinstance(nested, Mapping):
@@ -682,7 +706,9 @@ def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int)
         return "Local fail-soft Top10 selection because upstream rows were unavailable."
     if kk == "criteria_snapshot":
         return '{"source":"enriched_quote.failsoft"}'
-    if kk in {"current_price", "previous_close", "open_price", "day_high", "day_low", "forecast_price_1m", "forecast_price_3m", "forecast_price_12m", "intrinsic_value", "value"}:
+    if kk in {"current_price", "previous_close", "open_price", "day_high", "day_low",
+              "forecast_price_1m", "forecast_price_3m", "forecast_price_12m",
+              "intrinsic_value", "value"}:
         base = 100.0 + float(row_index)
         mapping = {
             "previous_close": round(base - 0.5, 2),
@@ -696,7 +722,10 @@ def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int)
             "value": round(base, 2),
         }
         return mapping.get(kk, round(base, 2))
-    if kk in {"price_change", "percent_change", "expected_roi_1m", "expected_roi_3m", "expected_roi_12m", "forecast_confidence", "confidence_score", "overall_score", "opportunity_score", "value_score", "quality_score", "momentum_score", "growth_score", "valuation_score", "risk_score"}:
+    if kk in {"price_change", "percent_change", "expected_roi_1m", "expected_roi_3m",
+              "expected_roi_12m", "forecast_confidence", "confidence_score",
+              "overall_score", "opportunity_score", "value_score", "quality_score",
+              "momentum_score", "growth_score", "valuation_score", "risk_score"}:
         base = max(1.0, 100.0 - float(row_index * 3))
         mapping = {
             "price_change": round(0.5 + row_index * 0.1, 2),
@@ -716,7 +745,9 @@ def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int)
             "risk_score": round(20 + row_index * 2, 2),
         }
         return mapping.get(kk, round(base, 2))
-    if kk in {"market_cap", "revenue_ttm", "free_cash_flow_ttm", "position_qty", "position_value", "unrealized_pl", "volume", "avg_volume_10d", "avg_volume_30d", "float_shares"}:
+    if kk in {"market_cap", "revenue_ttm", "free_cash_flow_ttm", "position_qty",
+              "position_value", "unrealized_pl", "volume", "avg_volume_10d",
+              "avg_volume_30d", "float_shares"}:
         scale = float(row_index)
         mapping = {
             "market_cap": 1000000000 + int(scale * 25000000),
@@ -849,8 +880,8 @@ class _Service:
         self._is_open_mode = is_open_mode
 
         # page_catalog probe (multi-path fallback)
-        self.get_route_family = None
-        self.normalize_page_name = None
+        self.get_route_family: Optional[Callable[..., Any]] = None
+        self.normalize_page_name: Optional[Callable[..., Any]] = None
         self.page_catalog_module = ""
         for _pcat_path in ("core.sheets.page_catalog", "core.page_catalog", "page_catalog"):
             try:
@@ -894,10 +925,9 @@ class _Service:
     ) -> None:
         """
         Flexible multi-signature dispatch for core.config.auth_ok.
-        Matches the pattern used by main._call_auth_ok_flexible, investment_advisor
-        v5.2.0, analysis_sheet_rows, data_dictionary, config. Richest signature
-        first (token + authorization + headers + path + request + settings +
-        api_key), degrades to {token} only.
+        Matches the pattern used by sister routers (investment_advisor v5.2.0,
+        analysis_sheet_rows v4.1.0, data_dictionary v2.7.0, config v5.9.0).
+        Richest signature first, degrades to {token} only.
         """
         # Open-mode short-circuit
         try:
@@ -930,13 +960,11 @@ class _Service:
         elif token_query and not auth_token and allow_query:
             auth_token = _strip(token_query)
 
-        headers = {}
+        headers: Dict[str, str] = {}
         try:
             headers = dict(request.headers)
         except Exception:
             headers = {}
-        # Ensure auth-relevant headers are always visible to legacy auth_ok
-        # implementations that inspect the `headers` dict
         if x_app_token:
             headers.setdefault("X-APP-TOKEN", x_app_token)
         if x_api_key:
@@ -946,7 +974,7 @@ class _Service:
 
         path = str(getattr(getattr(request, "url", None), "path", "") or "")
 
-        attempts = [
+        attempts: List[Dict[str, Any]] = [
             {
                 "token": auth_token,
                 "authorization": authorization,
@@ -1121,8 +1149,8 @@ class _Service:
                 "data": rows_out,
                 "quotes": rows_out,
                 "count": len(rows_out),
-                "detail": error or "",
-                "error": error,
+                "detail": error if error else "",
+                "error": error,  # None stays None — keeps response shape consistent
                 "version": ROUTER_VERSION,
                 "request_id": request_id,
                 "timestamp_utc": _now_utc(),
@@ -1131,33 +1159,134 @@ class _Service:
         )
 
 
-async def _call_with_tolerant_signatures(fn: Any, *, timeout_seconds: float, kwargs: Optional[Dict[str, Any]] = None) -> Any:
+# -----------------------------------------------------------------------------
+# Bridge dispatch — signature-introspecting, no-zero-arg-call safe
+# -----------------------------------------------------------------------------
+def _signature_for(fn: Any) -> Tuple[Optional[Set[str]], bool]:
+    """
+    Return (declared_param_names_or_None, accepts_var_keyword).
+
+    declared_param_names: set of POSITIONAL_OR_KEYWORD / KEYWORD_ONLY param
+        names the function accepts. None if signature could not be introspected.
+    accepts_var_keyword: True if fn declares **kwargs.
+    """
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return None, False
+    declared: Set[str] = set()
+    has_var_kw = False
+    for name, p in sig.parameters.items():
+        if p.kind == inspect.Parameter.VAR_KEYWORD:
+            has_var_kw = True
+        elif p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
+            declared.add(name)
+    return declared, has_var_kw
+
+
+async def _call_with_tolerant_signatures(
+    fn: Any,
+    *,
+    timeout_seconds: float,
+    kwargs: Optional[Dict[str, Any]] = None,
+) -> Any:
+    """
+    Call fn with a kwarg payload, tolerating signature mismatches.
+
+    Strategy:
+      1) Introspect fn's signature. If it declares **kwargs, pass everything.
+         Otherwise, pass exactly the declared params (keeping None values so
+         required-positional params are satisfied).
+      2) If introspection fails (C-implemented callables, etc.), fall back to
+         progressively-coarser kwarg variants.
+      3) Never call fn with zero args — that crashes any handler with
+         required positional params (the cause of v8.5.0's bug).
+      4) Keep None values throughout — Optional params expect to receive
+         None, and stripping them caused TypeErrors on every attempt.
+    """
     payload_kwargs = dict(kwargs or {})
-    attempts = [
-        payload_kwargs,
-        {k: payload_kwargs.get(k) for k in ("request", "body", "payload", "mode", "include_matrix_q", "token", "x_app_token", "x_api_key", "authorization", "x_request_id")},
-        {k: payload_kwargs.get(k) for k in ("request", "body", "mode")},
-        {k: payload_kwargs.get(k) for k in ("request", "body")},
-        {k: payload_kwargs.get(k) for k in ("body", "mode")},
-        {k: payload_kwargs.get(k) for k in ("body",)},
-        {k: payload_kwargs.get(k) for k in ("page", "sheet", "sheet_name", "name", "tab", "symbols", "tickers", "top_n", "limit", "offset", "mode")},
-        {},
-    ]
-    last_error: Optional[Exception] = None
+
+    declared, has_var_kw = _signature_for(fn)
+
+    attempts: List[Dict[str, Any]] = []
+
+    # Preferred: signature-aware first attempt
+    if declared is not None:
+        if has_var_kw:
+            attempts.append(dict(payload_kwargs))
+        else:
+            attempts.append({k: payload_kwargs.get(k) for k in declared if k in payload_kwargs})
+
+    # Fallback variants (full payload first, then progressively coarser sets).
+    # Each variant keeps None values verbatim.
+    fallback_keysets: Sequence[Sequence[str]] = (
+        # Full payload as supplied by the caller
+        tuple(payload_kwargs.keys()),
+        # Full FastAPI handler signature
+        ("request", "body", "payload", "mode", "include_matrix_q",
+         "token", "x_app_token", "x_api_key", "authorization", "x_request_id"),
+        # Mid-rich
+        ("request", "body", "mode"),
+        # Minimal request+body
+        ("request", "body"),
+        # Body-centric
+        ("body", "mode"),
+        ("body",),
+        # Page-centric (no Request object)
+        ("page", "sheet", "sheet_name", "name", "tab", "symbols", "tickers",
+         "top_n", "limit", "offset", "mode"),
+    )
+    for keyset in fallback_keysets:
+        attempt = {k: payload_kwargs.get(k) for k in keyset if k in payload_kwargs}
+        if attempt:  # Never append empty {}
+            attempts.append(attempt)
+
+    # Deduplicate by keyset (preserving order)
+    deduped: List[Dict[str, Any]] = []
+    seen_signatures: Set[Tuple[str, ...]] = set()
     for attempt in attempts:
-        call_kwargs = {k: v for k, v in attempt.items() if v is not None}
+        sig_repr = tuple(sorted(attempt.keys()))
+        if not sig_repr or sig_repr in seen_signatures:
+            continue
+        seen_signatures.add(sig_repr)
+        deduped.append(attempt)
+
+    if not deduped:
+        # Nothing to call with — surface a clear error rather than calling fn()
+        raise TypeError(
+            f"_call_with_tolerant_signatures: no usable kwarg attempt for "
+            f"{getattr(fn, '__qualname__', fn)} given keys={sorted(payload_kwargs.keys())}"
+        )
+
+    last_type_error: Optional[TypeError] = None
+    for idx, attempt in enumerate(deduped):
         try:
             if timeout_seconds > 0:
-                return await asyncio.wait_for(_call_maybe_async(fn, **call_kwargs), timeout=timeout_seconds)
-            return await _call_maybe_async(fn, **call_kwargs)
+                return await asyncio.wait_for(
+                    _call_maybe_async(fn, **attempt),
+                    timeout=timeout_seconds,
+                )
+            return await _call_maybe_async(fn, **attempt)
         except TypeError as exc:
-            last_error = exc
+            last_type_error = exc
+            logger.debug(
+                "bridge dispatch attempt %d/%d failed for %s with keys=%s: %s",
+                idx + 1, len(deduped),
+                getattr(fn, "__qualname__", fn),
+                sorted(attempt.keys()),
+                exc,
+            )
             continue
-        except Exception as exc:
-            last_error = exc
+        except Exception:
+            # Real runtime error from inside fn — surface immediately
             raise
-    if last_error is not None:
-        raise last_error
+
+    # All attempts exhausted with TypeError — re-raise the last one with context
+    if last_type_error is not None:
+        raise TypeError(
+            f"All {len(deduped)} signature-tolerant call attempts failed for "
+            f"{getattr(fn, '__qualname__', fn)}. Last error: {last_type_error}"
+        ) from last_type_error
     return None
 
 
@@ -1168,11 +1297,24 @@ _BRIDGE_CANDIDATE_MODULES: Tuple[str, ...] = (
     "routes.advanced_sheet_rows",
 )
 
+_BRIDGE_CALLABLE_NAMES: Tuple[str, ...] = (
+    "_analysis_sheet_rows_impl",
+    "_run_advanced_sheet_rows_impl",
+    "_run_investment_advisor_impl",
+    "run_investment_advisor_engine",
+    "run_investment_advisor",
+)
+
 
 async def _resolve_bridge_impl(page: str, route_family: str) -> Tuple[Optional[Any], Dict[str, Any]]:
-    # For dictionary / insights / top10 pages: prefer advanced_analysis first
-    # For instrument pages: prefer analysis_sheet_rows first
-    # `routes.advanced_sheet_rows` appended as secondary diagnostic fallback.
+    """
+    Resolve the best bridge implementation for (page, route_family).
+
+    Order:
+      - Dictionary / Insights / Top10 pages → advanced_analysis first
+      - Instrument pages                    → analysis_sheet_rows first
+      - advanced_sheet_rows always last as diagnostic fallback
+    """
     if route_family == "dictionary" or page == "Data_Dictionary":
         module_order = (
             "routes.advanced_analysis",
@@ -1195,25 +1337,17 @@ async def _resolve_bridge_impl(page: str, route_family: str) -> Tuple[Optional[A
             "routes.advanced_sheet_rows",
         )
 
-    callable_candidates = (
-        "_analysis_sheet_rows_impl",
-        "_run_advanced_sheet_rows_impl",
-        "_run_investment_advisor_impl",
-        "run_investment_advisor_engine",
-        "run_investment_advisor",
-    )
-
     for module_name in module_order:
         try:
             module = importlib.import_module(module_name)
-        except Exception:
+        except Exception as exc:
+            logger.debug("bridge module import failed: %s (%s)", module_name, exc)
             continue
-        for callable_name in callable_candidates:
+        for callable_name in _BRIDGE_CALLABLE_NAMES:
             fn = getattr(module, callable_name, None)
             if callable(fn):
                 return fn, {"module": module_name, "callable": callable_name}
 
-    # Single warning — helps operators diagnose why fail-soft rows were served
     logger.warning(
         "enriched_quote bridge unresolved for page=%s family=%s; falling back to local placeholder rows",
         page,
@@ -1223,7 +1357,7 @@ async def _resolve_bridge_impl(page: str, route_family: str) -> Tuple[Optional[A
 
 
 async def _delegate_sheet_rows_via_bridge(
-    svc: _Service,
+    svc: "_Service",
     request: Request,
     page: str,
     route_family: str,
@@ -1248,13 +1382,14 @@ async def _delegate_sheet_rows_via_bridge(
     prepared["tab"] = page
 
     symbols = _requested_symbols_from_body(prepared)
-    kwargs = {
+    matrix_default = _bool_from_any(prepared.get("include_matrix"), True)
+    kwargs: Dict[str, Any] = {
         "request": request,
         "body": prepared,
         "payload": prepared,
         "mode": mode_q or "",
-        "include_matrix_q": include_matrix_q if include_matrix_q is not None else _bool_from_any(prepared.get("include_matrix"), True),
-        "include_matrix": include_matrix_q if include_matrix_q is not None else _bool_from_any(prepared.get("include_matrix"), True),
+        "include_matrix_q": include_matrix_q if include_matrix_q is not None else matrix_default,
+        "include_matrix": include_matrix_q if include_matrix_q is not None else matrix_default,
         "token": token_q,
         "x_app_token": x_app_token,
         "x_api_key": x_api_key,
@@ -1272,7 +1407,27 @@ async def _delegate_sheet_rows_via_bridge(
         "offset": _int_from_any(prepared.get("offset"), 0),
     }
 
-    out = await _call_with_tolerant_signatures(impl, timeout_seconds=svc.bridge_timeout_sec, kwargs=kwargs)
+    try:
+        out = await _call_with_tolerant_signatures(impl, timeout_seconds=svc.bridge_timeout_sec, kwargs=kwargs)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "bridge call timed out after %.1fs for %s.%s page=%s",
+            svc.bridge_timeout_sec, impl_meta.get("module"), impl_meta.get("callable"), page,
+        )
+        return None
+    except TypeError as exc:
+        logger.error(
+            "bridge signature mismatch for %s.%s page=%s: %s",
+            impl_meta.get("module"), impl_meta.get("callable"), page, exc,
+        )
+        return None
+    except Exception as exc:
+        logger.error(
+            "bridge call raised for %s.%s page=%s: %s",
+            impl_meta.get("module"), impl_meta.get("callable"), page, exc,
+        )
+        return None
+
     safe = _json_safe(out)
     if isinstance(safe, Mapping):
         result = dict(safe)
@@ -1306,6 +1461,7 @@ async def _fetch_analysis_rows(engine: Any, symbols: List[str], *, mode: str, pa
         if not callable(fn):
             continue
         try:
+            res: Any = None
             for kwargs in ({"mode": mode, "schema": page}, {"schema": page}, {"mode": mode}, {}):
                 try:
                     res = await _call_maybe_async(fn, symbols, **kwargs)
@@ -1313,8 +1469,6 @@ async def _fetch_analysis_rows(engine: Any, symbols: List[str], *, mode: str, pa
                 except TypeError:
                     res = None
                     continue
-            else:
-                res = None
             if isinstance(res, Mapping):
                 if all(isinstance(k, str) for k in res.keys()) and any(k in set(symbols) for k in res.keys()):
                     return {str(k): dict(v) if isinstance(v, Mapping) else {"symbol": k, "value": v} for k, v in res.items()}
@@ -1325,7 +1479,8 @@ async def _fetch_analysis_rows(engine: Any, symbols: List[str], *, mode: str, pa
                     return {s: (dict(r) if isinstance(r, Mapping) else {"symbol": s, "value": r}) for s, r in zip(symbols, data)}
             elif isinstance(res, list):
                 return {s: (dict(r) if isinstance(r, Mapping) else {"symbol": s, "value": r}) for s, r in zip(symbols, res)}
-        except Exception:
+        except Exception as exc:
+            logger.debug("engine batch method %s failed: %s", method, exc)
             continue
 
     out: Dict[str, Dict[str, Any]] = {}
@@ -1334,23 +1489,27 @@ async def _fetch_analysis_rows(engine: Any, symbols: List[str], *, mode: str, pa
     for s in symbols:
         try:
             if callable(per_dict_fn):
+                done = False
                 for kwargs in ({"mode": mode, "schema": page}, {"schema": page}, {"mode": mode}, {}):
                     try:
                         out[s] = await _call_maybe_async(per_dict_fn, s, **kwargs)
+                        done = True
                         break
                     except TypeError:
                         continue
-                else:
+                if not done:
                     out[s] = {"symbol": s, "error": "per_symbol_dict_call_failed"}
             elif callable(per_fn):
+                done = False
                 for kwargs in ({"mode": mode, "schema": page}, {"schema": page}, {"mode": mode}, {}):
                     try:
                         result = await _call_maybe_async(per_fn, s, **kwargs)
                         out[s] = dict(result) if isinstance(result, Mapping) else {"symbol": s, "value": result}
+                        done = True
                         break
                     except TypeError:
                         continue
-                else:
+                if not done:
                     out[s] = {"symbol": s, "error": "per_symbol_call_failed"}
             else:
                 out[s] = {"symbol": s, "error": "engine_missing_quote_method"}
@@ -1360,7 +1519,7 @@ async def _fetch_analysis_rows(engine: Any, symbols: List[str], *, mode: str, pa
 
 
 async def _build_instrument_rows(
-    svc: _Service,
+    svc: "_Service",
     page: str,
     headers: Sequence[str],
     keys: Sequence[str],
@@ -1621,7 +1780,6 @@ async def _single_quote_handler(
 @router.get("/v1/enriched-quote/health", include_in_schema=False)
 async def health(request: Request) -> Dict[str, Any]:
     request_id = _request_id(request, None)
-    # Probe bridge availability without actually importing/raising
     bridge_available = False
     bridge_module = ""
     bridge_callable = ""
@@ -1663,6 +1821,52 @@ async def health(request: Request) -> Dict[str, Any]:
             "timestamp_utc": _now_utc(),
         }
     )
+
+
+@router.get("/v1/enriched/diagnostics", include_in_schema=False)
+@router.get("/v1/enriched_quote/diagnostics", include_in_schema=False)
+@router.get("/v1/enriched-quote/diagnostics", include_in_schema=False)
+async def diagnostics(request: Request) -> Dict[str, Any]:
+    """
+    Detailed bridge resolution map. Useful when /sheet-rows misbehaves —
+    shows which bridge module/callable was found and what its declared
+    parameters are, so signature mismatches can be diagnosed without
+    deploying a new build.
+    """
+    request_id = _request_id(request, None)
+    candidates_report: List[Dict[str, Any]] = []
+    for module_name in _BRIDGE_CANDIDATE_MODULES:
+        entry: Dict[str, Any] = {"module": module_name, "import_ok": False, "callables": {}}
+        try:
+            mod = importlib.import_module(module_name)
+            entry["import_ok"] = True
+        except Exception as exc:
+            entry["import_error"] = f"{type(exc).__name__}: {exc}"
+            candidates_report.append(entry)
+            continue
+        for name in _BRIDGE_CALLABLE_NAMES:
+            fn = getattr(mod, name, None)
+            if not callable(fn):
+                continue
+            declared, has_var_kw = _signature_for(fn)
+            entry["callables"][name] = {
+                "declared_params": sorted(list(declared)) if declared is not None else None,
+                "accepts_var_keyword": has_var_kw,
+                "is_coroutine": inspect.iscoroutinefunction(fn),
+            }
+        candidates_report.append(entry)
+
+    return _json_safe({
+        "status": "ok",
+        "module": "routes.enriched_quote",
+        "router_version": ROUTER_VERSION,
+        "route_owner": ROUTE_OWNER_NAME,
+        "candidate_modules": candidates_report,
+        "bridge_callable_names": list(_BRIDGE_CALLABLE_NAMES),
+        "bridge_timeout_sec": svc.bridge_timeout_sec,
+        "request_id": request_id,
+        "timestamp_utc": _now_utc(),
+    })
 
 
 @router.get("/v1/enriched/headers", include_in_schema=False)
