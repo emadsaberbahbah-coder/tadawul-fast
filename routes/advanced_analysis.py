@@ -2,58 +2,97 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.0.4
+Advanced Analysis Root Owner — v4.0.5
 ================================================================================
 ROOT SHEET-ROWS OWNER * ENGINE-FIRST * HARD-TIMEOUT * SCHEMA-FIRST
-DICTIONARY-FAST-PATH * TOP10/INSIGHTS-SKIP-ENGINE * FAIL-SOFT
-STABLE ENVELOPE * JSON-SAFE * GET+POST MERGED
+DICTIONARY-FAST-PATH * TOP10/INSIGHTS-SKIP-ENGINE * ENRICHED-QUOTES-FAST-PATH
+FAIL-SOFT * STABLE ENVELOPE * JSON-SAFE * GET+POST MERGED
 
-v4.0.4 changes (from v4.0.3)
+v4.0.5 changes (from v4.0.4)
 ----------------------------
-- FIX [HIGH]: Top_10_Investments still timed out at the enriched_quote
-    bridge layer (26s observed, exceeding the 25s upstream timeout) even
-    after v4.0.3 reduced per-tier timeouts to 10s/10s. Insights took
-    exactly 20s (10+10) and surfaced via advanced_analysis cleanly, but
-    Top10 normalization (sort/dedupe via _ensure_top10_rows) added
-    enough overhead to push past 25s.
+- FIX [CRITICAL]: instrument pages (Market_Leaders, Global_Markets,
+    Commodities_FX, Mutual_Funds, My_Portfolio, My_Investments) timed out
+    at exactly 20s (10s Tier 1 + 10s Tier 2) when called with explicit
+    symbols, then emitted placeholder garbage. Production diagnosis:
 
-    Root cause is the same for all three special pages: the v2 engine
-    builders (_build_top10_rows_fallback, _build_insights_rows_fallback,
-    _build_data_dictionary_rows) hang on Sheets API helpers or return
-    all-null rows. The engine path is unusable today.
+      Test A — /v1/advanced/sheet-rows?sheet=Market_Leaders
+                                       &limit=3
+                                       &symbols=2222.SR,AAPL,MSFT
+        → 20s, both tiers cancelled at 10s, placeholder rows ❌
 
-    Fix: extend v4.0.3's Data_Dictionary bypass to Top10 and Insights.
-    All three special pages now skip both engine tiers entirely and
-    emit the same schema-shaped rows the existing tier-3 fallback
-    produced — but instantly (<100ms) instead of after 20+ seconds.
-    Response shape and data quality are unchanged; only response
-    time improves dramatically.
+      Test B — /v1/enriched-quote?symbol=AAPL
+        → 4.5s, real Yahoo+EODHD data, all metrics populated ✅
 
-- ADD: env-controlled re-enable. Once the v2 engine builders are
-    repaired, the user can set
-    `TFB_ADVANCED_SKIP_ENGINE_FOR_TOP10=false` and/or
-    `TFB_ADVANCED_SKIP_ENGINE_FOR_INSIGHTS=false` to restore the
-    engine path. Defaults are True because production confirms the
-    engine path is broken today.
+    Same engine (DataEngineV5 v5.48.0). Same symbol (AAPL). Same
+    providers. Different result.
 
-- ADD: meta now includes `bypass_reason` when the fast path is taken
-    so callers can see why the engine was skipped.
+    Root cause: this module's Tier 1 calls
+        engine.get_sheet_rows(sheet="Market_Leaders", body={...})
+    which ignores the `symbols` carried in `body` and instead reads the
+    symbol universe for "Market_Leaders" from Google Sheets. That Sheets
+    read hangs.
+
+    But routes/enriched_quote.py works because it calls a DIFFERENT
+    engine method:
+        engine.get_enriched_quotes_batch(symbols=[...])
+    which skips the Sheets read entirely and fetches the requested
+    symbols directly via the provider fan-out.
+
+    Fix: introduce **Tier 0.5** between the special-page bypass (Tier 0)
+    and the legacy sheet-rows path (Tier 1). When the caller passes
+    explicit `symbols` on an instrument page, Tier 0.5 calls the engine's
+    enriched-quotes batch method — the same path that already works in
+    enriched_quote v8.6.0. If that path returns real rows we use them.
+    If it returns nothing or the engine has no batch method, we fall
+    through to Tier 1 unchanged (zero behavior regression).
+
+    This is purely additive: existing callers that don't pass symbols,
+    or that hit special pages, see identical behavior to v4.0.4.
+
+- ADD: env var TFB_ADVANCED_DIRECT_QUOTES_TIMEOUT_SEC (default 18.0)
+    controls the Tier 0.5 timeout. Set higher than the existing
+    TFB_ADVANCED_ENGINE_TIMEOUT_SEC because this is the path that
+    actually returns real data and benefits from headroom. 18s leaves a
+    7s safety margin under the upstream 25s bridge timeout; in
+    production a single symbol takes ~4.5s, so 18s comfortably fits 3-10
+    symbols.
+
+- ADD: new helper `_call_engine_enriched_quotes` introspects the engine
+    for any of the known enriched-quotes batch method names (matching
+    the order routes/enriched_quote.py uses): get_enriched_quotes_batch,
+    get_analysis_rows_batch, get_analysis_quotes_batch,
+    get_enriched_quotes, get_quotes_batch, quotes_batch. Tolerates
+    multiple kwarg signatures including (mode, schema), (schema), (mode),
+    and ().
+
+- ADD: meta now includes `tier: tier0_5_enriched_quotes_direct` and
+    `fast_path_reason` when the new path is taken, so callers and ops
+    can distinguish v4.0.5's fast path from the legacy Tier 1/2 path.
+
+- ADD: health and diagnostics endpoints expose
+    direct_quotes_timeout_sec for visibility.
+
+- KEEP: all v4.0.4 behavior verbatim. Tier 0 (special-page bypass) runs
+    first as before. Tier 1 (engine.get_sheet_rows) runs unchanged after
+    Tier 0.5. Tier 2 (legacy adapter) and Tier 3 (local fail-soft)
+    unchanged. No removal of features. No signature changes to the
+    public route handlers.
+
+v4.0.4 changes (preserved)
+--------------------------
+- FIX [HIGH]: Top10/Insights now bypass engine via Tier 0 fast path.
+- ADD: env-controlled re-enable for Top10/Insights bypass.
+- ADD: meta.bypass_reason when Tier 0 fast path is taken.
 
 v4.0.3 changes (preserved)
 --------------------------
-- FIX [CRITICAL]: Data_Dictionary fast path bypasses the engine and
-    builds rows from local schema registry. Eliminated 502s.
-
-- FIX [HIGH]: lowered default TFB_ADVANCED_ENGINE_TIMEOUT_SEC from
-    20.0 to 10.0.
+- FIX [CRITICAL]: Data_Dictionary fast path bypasses the engine.
+- FIX [HIGH]: lowered TFB_ADVANCED_ENGINE_TIMEOUT_SEC default 20→10.
 
 v4.0.2 changes (preserved)
 --------------------------
-- FIX [CRITICAL]: prefer app.state.engine.get_sheet_rows over the
-    legacy module-level adapter.
-
+- FIX [CRITICAL]: prefer app.state.engine.get_sheet_rows over legacy.
 - FIX [HIGH]: hard timeout around every engine call.
-
 - FIX [MEDIUM]: _rows_have_any_data() detects all-null payloads.
 ================================================================================
 """
@@ -80,7 +119,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
-ADVANCED_ANALYSIS_VERSION = "4.0.4"
+ADVANCED_ANALYSIS_VERSION = "4.0.5"
 router = APIRouter(tags=["schema", "root-sheet-rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -121,13 +160,23 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
-# Hard timeout around engine calls. Per tier, total worst case ~20s.
+# Hard timeout around legacy get_sheet_rows engine calls. Per tier, total
+# worst case ~20s (Tier 1 + Tier 2). v4.0.5 leaves this unchanged because
+# the new Tier 0.5 short-circuits this path for the common case (instrument
+# page + explicit symbols), so this only matters when a sheet read is
+# actually required (no symbols supplied).
 ADVANCED_ENGINE_TIMEOUT_SEC = _env_float("TFB_ADVANCED_ENGINE_TIMEOUT_SEC", 10.0)
 
-# Skip engine entirely for these special pages. Defaults to True because
-# production proves the v2 engine builders for these pages are broken
-# (hang on Sheets API or return all-null rows). Set the relevant env
-# var to false once the engine builders are repaired.
+# v4.0.5: Timeout for the new direct-enriched-quotes fast path (Tier 0.5).
+# This path mirrors routes/enriched_quote.py's engine call; it skips the
+# Google Sheets read entirely and fetches the explicit symbols via the
+# provider fan-out. Single-symbol calls take ~4.5s in production, so
+# 18s comfortably fits 3-10 symbols while leaving a 7s safety margin
+# under the upstream 25s bridge timeout. Override via env if needed.
+ADVANCED_DIRECT_QUOTES_TIMEOUT_SEC = _env_float("TFB_ADVANCED_DIRECT_QUOTES_TIMEOUT_SEC", 18.0)
+
+# Skip engine entirely for these special pages. Defaults True because
+# production proves the v2 engine builders for these pages are broken.
 SKIP_ENGINE_FOR_DICTIONARY = _env_bool("TFB_ADVANCED_SKIP_ENGINE_FOR_DICTIONARY", True)
 SKIP_ENGINE_FOR_TOP10 = _env_bool("TFB_ADVANCED_SKIP_ENGINE_FOR_TOP10", True)
 SKIP_ENGINE_FOR_INSIGHTS = _env_bool("TFB_ADVANCED_SKIP_ENGINE_FOR_INSIGHTS", True)
@@ -1070,6 +1119,139 @@ def _payload_envelope(*, page: str, headers: Sequence[str], keys: Sequence[str],
 
 
 # -----------------------------------------------------------------------------
+# v4.0.5: Direct enriched-quotes call (Tier 0.5 fast path)
+# -----------------------------------------------------------------------------
+async def _call_engine_enriched_quotes(
+    engine: Any,
+    *,
+    symbols: List[str],
+    mode: str,
+    page: str,
+    timeout_seconds: float,
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    """
+    Call the engine's enriched-quotes batch method for an explicit list
+    of symbols. Mirrors the path used successfully by routes/enriched_quote.py.
+
+    Why this exists (v4.0.5):
+        engine.get_sheet_rows(page="Market_Leaders") tries to read the
+        symbol universe for that page from Google Sheets — that read
+        hangs in production. But engine.get_enriched_quotes_batch([...])
+        skips the Sheets read entirely and goes straight to the provider
+        fan-out that already works (Test B in production: 4.5s for one
+        symbol with full real data).
+
+    The method-name list and kwarg-variant order mirror routes/
+    enriched_quote.py's `_fetch_analysis_rows` so behavior matches the
+    proven-working path.
+
+    Returns:
+        (payload_dict_or_None, callable_label)
+        - payload_dict shaped like {"row_objects": [...], "status": "success"}
+          or the engine's native envelope if it returns one
+        - None means: no engine, no symbols, timeout, or no usable method
+        - callable_label is a short string for meta logging
+    """
+    if engine is None or not symbols:
+        return None, "no_engine_or_symbols"
+
+    method_names = (
+        "get_enriched_quotes_batch",
+        "get_analysis_rows_batch",
+        "get_analysis_quotes_batch",
+        "get_enriched_quotes",
+        "get_quotes_batch",
+        "quotes_batch",
+    )
+
+    last_err: Optional[Exception] = None
+
+    for method_name in method_names:
+        fn = getattr(engine, method_name, None)
+        if not callable(fn):
+            continue
+
+        fn_label = f"engine.{method_name}"
+        method_succeeded = False
+
+        for kwargs in (
+            {"mode": mode, "schema": page},
+            {"schema": page},
+            {"mode": mode},
+            {},
+        ):
+            try:
+                async def _invoke() -> Any:
+                    if inspect.iscoroutinefunction(fn):
+                        return await fn(symbols, **kwargs)
+                    res = await asyncio.to_thread(fn, symbols, **kwargs)
+                    if inspect.isawaitable(res):
+                        return await res
+                    return res
+
+                if timeout_seconds > 0:
+                    result = await asyncio.wait_for(_invoke(), timeout=timeout_seconds)
+                else:
+                    result = await _invoke()
+
+                method_succeeded = True
+
+                # Normalize various result shapes
+                if isinstance(result, dict):
+                    # Shape A: {symbol: row_dict_or_value}
+                    # Heuristic: keys match supplied symbols and values are mappings
+                    if (
+                        result
+                        and any(s in result for s in symbols)
+                        and all(isinstance(v, (Mapping, type(None))) for v in result.values())
+                    ):
+                        rows: List[Dict[str, Any]] = []
+                        for s in symbols:
+                            v = result.get(s)
+                            if isinstance(v, Mapping):
+                                rows.append(dict(v))
+                            elif v is not None:
+                                rows.append({"symbol": s, "value": v})
+                        if rows:
+                            return {"row_objects": rows, "status": "success"}, fn_label
+
+                    # Shape B: envelope with rows/data/items/etc.
+                    return result, fn_label
+
+                if isinstance(result, list):
+                    return {"row_objects": result, "status": "success"}, fn_label
+
+                # Unrecognized shape — try next kwargs variant
+                continue
+
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Tier0.5 engine.%s timed out after %.1fs for %d symbols page=%s",
+                    method_name, timeout_seconds, len(symbols), page,
+                )
+                return None, f"timeout:{timeout_seconds}s"
+            except TypeError:
+                # Signature mismatch — try next kwargs variant
+                continue
+            except Exception as exc:
+                last_err = exc
+                logger.debug("Tier0.5 engine.%s raised: %s", method_name, exc)
+                # Don't try further kwargs for a method that raised non-TypeError
+                break
+
+        # If method succeeded but returned an unrecognized shape, try next method
+        if method_succeeded:
+            continue
+
+    if last_err is not None:
+        return (
+            {"status": "error", "error": str(last_err), "row_objects": []},
+            "all_methods_failed",
+        )
+    return None, "no_method_callable"
+
+
+# -----------------------------------------------------------------------------
 # Engine resolution and call
 # -----------------------------------------------------------------------------
 async def _resolve_engine(request: Request) -> Tuple[Optional[Any], str]:
@@ -1338,14 +1520,6 @@ async def _run_advanced_sheet_rows_impl(
         )
 
     # ---- Tier 0: Special-page fast paths (bypass engine entirely) ----
-    # Production confirms the v2 engine's special-page builders are
-    # unusable today: Data_Dictionary hangs past Render's 100s edge
-    # timeout, Insights times out at exactly 10s+10s = 20s on both
-    # tiers, and Top10 takes long enough (engine + Top10 sort overhead)
-    # to push past the upstream 25s bridge timeout. Bypassing the engine
-    # for these three pages produces the same fallback rows the existing
-    # tier-3 code already produced — but instantly, instead of after
-    # 20+ seconds of dead waiting.
     skip_engine, bypass_reason = _should_skip_engine(page)
     if skip_engine:
         if page == _DICTIONARY_PAGE:
@@ -1388,7 +1562,60 @@ async def _run_advanced_sheet_rows_impl(
 
     fetch_limit = max(limit + offset, top_n)
 
-    # ---- Tier 1: live engine instance from app.state.engine ----
+    # ---- Tier 0.5 (NEW in v4.0.5): Direct enriched-quotes for instrument
+    # pages with explicit symbols. This bypasses get_sheet_rows entirely
+    # and calls the engine's enriched-quotes batch method — the same path
+    # that routes/enriched_quote.py uses successfully (Test B in
+    # production: 4.5s for one symbol with full real data).
+    #
+    # Conditions:
+    #   - page is NOT a special page (Top10/Insights/Dictionary handled above)
+    #   - caller passed explicit symbols (no Sheets read needed)
+    #
+    # If this path returns real rows, we return immediately. If the engine
+    # has no batch method, the call returns nothing usable, or it errors
+    # out, we fall through to Tier 1 unchanged.
+    tier05_meta: Dict[str, Any] = {}
+    if (page not in _SPECIAL_PAGES) and requested_symbols:
+        tier05_started = time.time()
+        engine_t05, engine_source_t05 = await _resolve_engine(request)
+        payload_t05, callable_t05 = await _call_engine_enriched_quotes(
+            engine_t05,
+            symbols=list(requested_symbols[:fetch_limit]),
+            mode=mode or "",
+            page=page,
+            timeout_seconds=ADVANCED_DIRECT_QUOTES_TIMEOUT_SEC,
+        )
+        tier05_duration_ms = round((time.time() - tier05_started) * 1000.0, 3)
+        tier05_meta = {
+            "tier0_5_attempted": True,
+            "tier0_5_duration_ms": tier05_duration_ms,
+            "tier0_5_callable": callable_t05,
+            "tier0_5_engine_source": engine_source_t05,
+        }
+
+        if isinstance(payload_t05, dict):
+            envelope, has_data = _normalize_external_payload(
+                external_payload=payload_t05,
+                page=page, headers=headers, keys=keys,
+                include_matrix=include_matrix, request_id=request_id,
+                started_at=start, mode=mode,
+                limit=limit, offset=offset, top_n=top_n,
+                requested_symbols=requested_symbols,
+                meta_extra={
+                    "schema_source": schema_source,
+                    "engine_source": engine_source_t05,
+                    "engine_callable": callable_t05,
+                    "engine_call_duration_ms": tier05_duration_ms,
+                    "tier": "tier0_5_enriched_quotes_direct",
+                    "source": f"{engine_source_t05}.{callable_t05}",
+                    "fast_path_reason": "explicit_symbols_bypass_sheet_read",
+                },
+            )
+            if has_data:
+                return envelope
+
+    # ---- Tier 1: live engine instance via get_sheet_rows (v4.0.4 behavior) ----
     tier1_started = time.time()
     engine, engine_source = await _resolve_engine(request)
     payload_t1, callable_t1 = await _call_engine_sheet_rows(
@@ -1417,6 +1644,7 @@ async def _run_advanced_sheet_rows_impl(
                 "engine_call_duration_ms": tier1_duration_ms,
                 "tier": "tier1_engine_instance",
                 "source": f"{engine_source}.{callable_t1}",
+                **tier05_meta,
             },
         )
         if has_data:
@@ -1451,6 +1679,7 @@ async def _run_advanced_sheet_rows_impl(
                 "tier2_duration_ms": tier2_duration_ms,
                 "tier": "tier2_legacy_adapter",
                 "source": t2_source,
+                **tier05_meta,
             },
         )
         if has_data:
@@ -1485,6 +1714,7 @@ async def _run_advanced_sheet_rows_impl(
             "tier2_duration_ms": tier2_duration_ms if 'tier2_duration_ms' in locals() else None,
             "tier": "tier3_local_failsoft",
             "source": "advanced_analysis.local_failsoft",
+            **tier05_meta,
         },
     )
 
@@ -1501,6 +1731,12 @@ async def advanced_analysis_health(request: Request) -> Dict[str, Any]:
         or callable(getattr(engine, "get_page_rows", None))
         or callable(getattr(engine, "get_sheet", None))
     ))
+    has_enriched_batch = bool(engine and any(
+        callable(getattr(engine, name, None))
+        for name in ("get_enriched_quotes_batch", "get_enriched_quotes",
+                     "get_analysis_rows_batch", "get_analysis_quotes_batch",
+                     "get_quotes_batch", "quotes_batch")
+    ))
     return _json_safe({
         "status": "ok",
         "service": "advanced_analysis",
@@ -1509,9 +1745,11 @@ async def advanced_analysis_health(request: Request) -> Dict[str, Any]:
         "engine_source": engine_source,
         "engine_resolvable": engine is not None,
         "engine_has_get_sheet_rows": has_get_sheet_rows,
+        "engine_has_enriched_quotes_batch": has_enriched_batch,
         "legacy_adapter_available": _legacy_get_sheet_rows is not None,
         "legacy_adapter_source": LEGACY_ADAPTER_SOURCE,
         "engine_timeout_sec": ADVANCED_ENGINE_TIMEOUT_SEC,
+        "direct_quotes_timeout_sec": ADVANCED_DIRECT_QUOTES_TIMEOUT_SEC,
         "skip_engine_for_dictionary": SKIP_ENGINE_FOR_DICTIONARY,
         "skip_engine_for_top10": SKIP_ENGINE_FOR_TOP10,
         "skip_engine_for_insights": SKIP_ENGINE_FOR_INSIGHTS,
@@ -1526,7 +1764,13 @@ async def advanced_analysis_diagnostics(request: Request) -> Dict[str, Any]:
     engine, engine_source = await _resolve_engine(request)
     engine_methods = {}
     if engine is not None:
-        for name in ("get_sheet_rows", "get_page_rows", "get_sheet", "get_enriched_quotes_batch", "get_enriched_quote_dict"):
+        for name in (
+            "get_sheet_rows", "get_page_rows", "get_sheet",
+            "get_enriched_quotes_batch", "get_enriched_quotes",
+            "get_analysis_rows_batch", "get_analysis_quotes_batch",
+            "get_quotes_batch", "quotes_batch",
+            "get_enriched_quote_dict",
+        ):
             fn = getattr(engine, name, None)
             if callable(fn):
                 try:
@@ -1550,6 +1794,7 @@ async def advanced_analysis_diagnostics(request: Request) -> Dict[str, Any]:
         "legacy_adapter_source": LEGACY_ADAPTER_SOURCE,
         "legacy_adapter_resolvable": _legacy_get_sheet_rows is not None,
         "engine_timeout_sec": ADVANCED_ENGINE_TIMEOUT_SEC,
+        "direct_quotes_timeout_sec": ADVANCED_DIRECT_QUOTES_TIMEOUT_SEC,
         "skip_engine_for_dictionary": SKIP_ENGINE_FOR_DICTIONARY,
         "skip_engine_for_top10": SKIP_ENGINE_FOR_TOP10,
         "skip_engine_for_insights": SKIP_ENGINE_FOR_INSIGHTS,
