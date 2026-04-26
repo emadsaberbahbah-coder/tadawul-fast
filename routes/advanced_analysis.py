@@ -2,75 +2,59 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.0.3
+Advanced Analysis Root Owner — v4.0.4
 ================================================================================
-ROOT SHEET-ROWS OWNER • ENGINE-FIRST • HARD-TIMEOUT • SCHEMA-FIRST
-DICTIONARY-FAST-PATH • FAIL-SOFT • STABLE ENVELOPE • JSON-SAFE
-GET+POST MERGED • HEADERS-ONLY / SCHEMA-ONLY • CANONICAL WIDTHS
+ROOT SHEET-ROWS OWNER * ENGINE-FIRST * HARD-TIMEOUT * SCHEMA-FIRST
+DICTIONARY-FAST-PATH * TOP10/INSIGHTS-SKIP-ENGINE * FAIL-SOFT
+STABLE ENVELOPE * JSON-SAFE * GET+POST MERGED
 
-v4.0.3 changes (from v4.0.2)
+v4.0.4 changes (from v4.0.3)
 ----------------------------
-- FIX [CRITICAL]: production observed 502 errors on
-    /v1/enriched/sheet-rows?sheet=Data_Dictionary because the v2 engine's
-    `_build_data_dictionary_rows` calls Google Sheets API helpers that
-    can hang for 100+ seconds. asyncio.wait_for cannot cancel that path
-    because the engine code does CPU-bound or blocking-IO work between
-    await points, so the 20s timeout in v4.0.2 fired but the underlying
-    coroutine kept running and Render's edge proxy killed the worker.
+- FIX [HIGH]: Top_10_Investments still timed out at the enriched_quote
+    bridge layer (26s observed, exceeding the 25s upstream timeout) even
+    after v4.0.3 reduced per-tier timeouts to 10s/10s. Insights took
+    exactly 20s (10+10) and surfaced via advanced_analysis cleanly, but
+    Top10 normalization (sort/dedupe via _ensure_top10_rows) added
+    enough overhead to push past 25s.
 
-    Fix: NEW fast-path branch that builds Data_Dictionary rows locally
-    from the schema registry / canonical contracts, bypassing the engine
-    entirely. This is what the engine builder *should* do — iterate the
-    canonical pages and emit one row per (sheet, header, key) triple —
-    but executed synchronously in this process with no network I/O.
-    Eliminates the 502 and reduces Data_Dictionary response time from
-    100+ seconds (or worse) to milliseconds.
+    Root cause is the same for all three special pages: the v2 engine
+    builders (_build_top10_rows_fallback, _build_insights_rows_fallback,
+    _build_data_dictionary_rows) hang on Sheets API helpers or return
+    all-null rows. The engine path is unusable today.
 
-- FIX [HIGH]: production observed Top_10_Investments returning at 25.2s
-    (enriched_quote's own bridge timeout) and Insights_Analysis at 39.7s,
-    both via enriched_quote's local fail-soft. Root cause was the same
-    uncooperative-cancellation issue: my tier 1 + tier 2 timeouts of
-    20s each summed to ~40s for Insights, exceeding the upstream bridge
-    timeout, so enriched_quote always saw the bridge as failed.
+    Fix: extend v4.0.3's Data_Dictionary bypass to Top10 and Insights.
+    All three special pages now skip both engine tiers entirely and
+    emit the same schema-shaped rows the existing tier-3 fallback
+    produced — but instantly (<100ms) instead of after 20+ seconds.
+    Response shape and data quality are unchanged; only response
+    time improves dramatically.
 
-    Fix: lower default `TFB_ADVANCED_ENGINE_TIMEOUT_SEC` from 20.0 to
-    10.0. Total worst case across both tiers is now ~20s, well under
-    the upstream 25s bridge timeout. When tiers do degrade, advanced
-    fail-soft rows return cleanly instead of being dropped by the
-    upstream timeout.
+- ADD: env-controlled re-enable. Once the v2 engine builders are
+    repaired, the user can set
+    `TFB_ADVANCED_SKIP_ENGINE_FOR_TOP10=false` and/or
+    `TFB_ADVANCED_SKIP_ENGINE_FOR_INSIGHTS=false` to restore the
+    engine path. Defaults are True because production confirms the
+    engine path is broken today.
 
-- ADD: meta now identifies the dispatch tier explicitly
-    (`tier0_data_dictionary_local`, `tier1_engine_instance`,
-    `tier2_legacy_adapter`, `tier3_local_failsoft`) so future regressions
-    are diagnosable from the response payload alone.
+- ADD: meta now includes `bypass_reason` when the fast path is taken
+    so callers can see why the engine was skipped.
+
+v4.0.3 changes (preserved)
+--------------------------
+- FIX [CRITICAL]: Data_Dictionary fast path bypasses the engine and
+    builds rows from local schema registry. Eliminated 502s.
+
+- FIX [HIGH]: lowered default TFB_ADVANCED_ENGINE_TIMEOUT_SEC from
+    20.0 to 10.0.
 
 v4.0.2 changes (preserved)
 --------------------------
-- FIX [CRITICAL]: prefer `app.state.engine.get_sheet_rows(...)` (the live
-    DataEngineV5 instance with proper special-page builders) over the
-    legacy module-level `core.data_engine.get_sheet_rows` adapter. v2
-    exposes `get_sheet_rows` only as a method on its DataEngine class,
-    not as a module-level function, so the v4.0.1 import strategy
-    `from core.data_engine_v2 import get_sheet_rows` always failed
-    silently and the legacy adapter was used regardless.
+- FIX [CRITICAL]: prefer app.state.engine.get_sheet_rows over the
+    legacy module-level adapter.
 
-- FIX [HIGH]: hard timeout (`TFB_ADVANCED_ENGINE_TIMEOUT_SEC`) around
-    every engine call. Without this, special-page calls blocked workers
-    for 100+ seconds before Render killed them.
+- FIX [HIGH]: hard timeout around every engine call.
 
-- FIX [MEDIUM]: `_rows_have_any_data()` detects all-null payloads and
-    treats them as failed engine calls so local builder fallbacks can
-    produce real data.
-
-Purpose
--------
-Owns the canonical root paths:
-- /sheet-rows
-- /schema
-- /schema/sheet-spec
-- /schema/pages
-- /schema/data-dictionary
-and their /v1/schema aliases.
+- FIX [MEDIUM]: _rows_have_any_data() detects all-null payloads.
 ================================================================================
 """
 
@@ -96,7 +80,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
-ADVANCED_ANALYSIS_VERSION = "4.0.3"
+ADVANCED_ANALYSIS_VERSION = "4.0.4"
 router = APIRouter(tags=["schema", "root-sheet-rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -105,23 +89,12 @@ _DICTIONARY_PAGE = "Data_Dictionary"
 _SPECIAL_PAGES = {_TOP10_PAGE, _INSIGHTS_PAGE, _DICTIONARY_PAGE}
 
 _EXPECTED_SHEET_LENGTHS: Dict[str, int] = {
-    "Market_Leaders": 80,
-    "Global_Markets": 80,
-    "Commodities_FX": 80,
-    "Mutual_Funds": 80,
-    "My_Portfolio": 80,
-    "My_Investments": 80,
-    _TOP10_PAGE: 83,
-    _INSIGHTS_PAGE: 7,
-    _DICTIONARY_PAGE: 9,
+    "Market_Leaders": 80, "Global_Markets": 80, "Commodities_FX": 80,
+    "Mutual_Funds": 80, "My_Portfolio": 80, "My_Investments": 80,
+    _TOP10_PAGE: 83, _INSIGHTS_PAGE: 7, _DICTIONARY_PAGE: 9,
 }
 
-_TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
-    "top10_rank",
-    "selection_reason",
-    "criteria_snapshot",
-)
-
+_TOP10_REQUIRED_FIELDS: Tuple[str, ...] = ("top10_rank", "selection_reason", "criteria_snapshot")
 _TOP10_REQUIRED_HEADERS: Dict[str, str] = {
     "top10_rank": "Top10 Rank",
     "selection_reason": "Selection Reason",
@@ -130,7 +103,6 @@ _TOP10_REQUIRED_HEADERS: Dict[str, str] = {
 
 
 def _env_float(name: str, default: float) -> float:
-    """Read a float from env var with safe fallback."""
     try:
         raw = (os.getenv(name, "") or "").strip()
         return float(raw) if raw else float(default)
@@ -138,21 +110,32 @@ def _env_float(name: str, default: float) -> float:
         return float(default)
 
 
-# Hard timeout enforced around every engine call. v4.0.3 lowered the default
-# from 20.0 to 10.0 because production observed both Tier-1 and Tier-2 each
-# blocking past 20s when the v2 engine's special-page builders did
-# uncooperative work between await points. With 10s per tier, total worst
-# case across two tiers is ~20s — well under the upstream bridge timeout
-# (25s in routes/enriched_quote.py) so timeouts surface here cleanly.
+def _env_bool(name: str, default: bool) -> bool:
+    raw = (os.getenv(name, "") or "").strip().lower()
+    if not raw:
+        return default
+    if raw in {"1", "true", "yes", "y", "on"}:
+        return True
+    if raw in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+# Hard timeout around engine calls. Per tier, total worst case ~20s.
 ADVANCED_ENGINE_TIMEOUT_SEC = _env_float("TFB_ADVANCED_ENGINE_TIMEOUT_SEC", 10.0)
+
+# Skip engine entirely for these special pages. Defaults to True because
+# production proves the v2 engine builders for these pages are broken
+# (hang on Sheets API or return all-null rows). Set the relevant env
+# var to false once the engine builders are repaired.
+SKIP_ENGINE_FOR_DICTIONARY = _env_bool("TFB_ADVANCED_SKIP_ENGINE_FOR_DICTIONARY", True)
+SKIP_ENGINE_FOR_TOP10 = _env_bool("TFB_ADVANCED_SKIP_ENGINE_FOR_TOP10", True)
+SKIP_ENGINE_FOR_INSIGHTS = _env_bool("TFB_ADVANCED_SKIP_ENGINE_FOR_INSIGHTS", True)
 
 
 try:
     from core.sheets.schema_registry import (  # type: ignore
-        get_sheet_headers,
-        get_sheet_keys,
-        get_sheet_len,
-        get_sheet_spec,
+        get_sheet_headers, get_sheet_keys, get_sheet_len, get_sheet_spec,
     )
 except Exception:
     get_sheet_headers = None  # type: ignore
@@ -162,10 +145,7 @@ except Exception:
 
 try:
     from core.sheets.page_catalog import (  # type: ignore
-        CANONICAL_PAGES,
-        FORBIDDEN_PAGES,
-        allowed_pages,
-        normalize_page_name,
+        CANONICAL_PAGES, FORBIDDEN_PAGES, allowed_pages, normalize_page_name,
     )
 except Exception:
     CANONICAL_PAGES = []  # type: ignore
@@ -187,8 +167,6 @@ except Exception:
         return None
 
 
-# Tier-2 (legacy module-level adapter) fallback. Tier-1 is the engine
-# instance from `app.state.engine`, resolved per-request below.
 LEGACY_ADAPTER_SOURCE = "unavailable"
 try:
     from core.data_engine import get_sheet_rows as _legacy_get_sheet_rows  # type: ignore
@@ -260,8 +238,6 @@ _FIELD_ALIAS_HINTS: Dict[str, List[str]] = {
     "criteria_snapshot": ["criteria", "snapshot", "criteria_json"],
 }
 
-# Keys that the data dictionary should mark as "required: true" — minimal
-# identity columns, plus dictionary's own structural columns.
 _DICTIONARY_REQUIRED_KEYS = {
     "symbol", "name", "current_price",
     "section", "metric",
@@ -303,12 +279,12 @@ def _json_safe(value: Any) -> Any:
         return [_json_safe(v) for v in value]
     try:
         if hasattr(value, "model_dump") and callable(getattr(value, "model_dump")):
-            return _json_safe(value.model_dump(mode="python"))  # type: ignore[attr-defined]
+            return _json_safe(value.model_dump(mode="python"))
     except Exception:
         pass
     try:
         if hasattr(value, "dict") and callable(getattr(value, "dict")):
-            return _json_safe(value.dict())  # type: ignore[attr-defined]
+            return _json_safe(value.dict())
     except Exception:
         pass
     try:
@@ -328,24 +304,6 @@ async def _maybe_await(x: Any) -> Any:
     except Exception:
         pass
     return x
-
-def _as_list(v: Any) -> List[Any]:
-    if v is None:
-        return []
-    if isinstance(v, list):
-        return v
-    if isinstance(v, tuple):
-        return list(v)
-    if isinstance(v, set):
-        return list(v)
-    if isinstance(v, str):
-        return [v]
-    if isinstance(v, Iterable) and not isinstance(v, Mapping):
-        try:
-            return list(v)
-        except Exception:
-            return [v]
-    return [v]
 
 def _maybe_bool(v: Any, default: bool) -> bool:
     if isinstance(v, bool):
@@ -420,10 +378,7 @@ def _get_list(body: Mapping[str, Any], *keys: str) -> List[str]:
 
 def _extract_requested_symbols(body: Mapping[str, Any], limit: int) -> List[str]:
     symbols: List[str] = []
-    for key in (
-        "symbols", "tickers", "tickers_list", "selected_symbols", "selected_tickers", "direct_symbols",
-        "symbol", "ticker", "code", "requested_symbol",
-    ):
+    for key in ("symbols", "tickers", "tickers_list", "selected_symbols", "selected_tickers", "direct_symbols", "symbol", "ticker", "code", "requested_symbol"):
         symbols.extend(_get_list(body, key))
     out: List[str] = []
     seen = set()
@@ -523,7 +478,7 @@ def _normalize_page_flexible(page_raw: str) -> str:
         return "Market_Leaders"
     for kwargs in ({"allow_output_pages": True}, {}):
         try:
-            value = normalize_page_name(raw, **kwargs)  # type: ignore[misc]
+            value = normalize_page_name(raw, **kwargs)
             normalized = _strip(value)
             if normalized:
                 return normalized
@@ -554,6 +509,7 @@ def _ensure_page_allowed(page: str) -> None:
 
 def _normalize_key_name(header: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", _strip(header).lower()).strip("_")
+
 
 def _complete_schema_contract(headers: Sequence[str], keys: Sequence[str]) -> Tuple[List[str], List[str]]:
     raw_headers = list(headers or [])
@@ -607,7 +563,7 @@ def _static_contract(page: str) -> Tuple[List[str], List[str], str]:
 def _expected_len(page: str) -> int:
     if callable(get_sheet_len):
         try:
-            n = int(get_sheet_len(page))  # type: ignore[misc]
+            n = int(get_sheet_len(page))
             if n > 0:
                 return n
         except Exception:
@@ -641,12 +597,12 @@ def _schema_from_registry(page: str) -> Tuple[List[str], List[str], Any, str]:
     spec = None
     if callable(get_sheet_headers) and callable(get_sheet_keys):
         try:
-            headers = [_strip(x) for x in get_sheet_headers(page) if _strip(x)]  # type: ignore[misc]
-            keys = [_strip(x) for x in get_sheet_keys(page) if _strip(x)]  # type: ignore[misc]
+            headers = [_strip(x) for x in get_sheet_headers(page) if _strip(x)]
+            keys = [_strip(x) for x in get_sheet_keys(page) if _strip(x)]
             if headers and keys:
                 if callable(get_sheet_spec):
                     try:
-                        spec = get_sheet_spec(page)  # type: ignore[misc]
+                        spec = get_sheet_spec(page)
                     except Exception:
                         spec = None
                 return _complete_schema_contract(headers, keys)[0], _complete_schema_contract(headers, keys)[1], spec, "schema_registry.helpers"
@@ -655,7 +611,7 @@ def _schema_from_registry(page: str) -> Tuple[List[str], List[str], Any, str]:
     if get_sheet_spec is None:
         return [], [], None, "registry_unavailable"
     try:
-        spec = get_sheet_spec(page)  # type: ignore[misc]
+        spec = get_sheet_spec(page)
     except Exception as e:
         return [], [], None, f"registry_error:{e}"
     headers, keys = _extract_headers_keys_from_spec(spec)
@@ -676,7 +632,6 @@ def _resolve_contract(page: str) -> Tuple[List[str], List[str], Any, str]:
 
 
 def _classify_dictionary_dtype(key: str) -> str:
-    """Heuristic dtype classification for Data_Dictionary rows."""
     k = (key or "").lower()
     if any(t in k for t in ("price", "value", "cap", "volume", "shares", "score",
                              "ratio", "margin", "yield", "roi", "growth", "rsi",
@@ -692,7 +647,6 @@ def _classify_dictionary_dtype(key: str) -> str:
 
 
 def _classify_dictionary_fmt(key: str) -> str:
-    """Heuristic display-format hint for Data_Dictionary rows."""
     k = (key or "").lower()
     if "score" in k:
         return "0.00"
@@ -708,10 +662,6 @@ def _classify_dictionary_fmt(key: str) -> str:
 
 
 def _classify_dictionary_group(page: str, key: str, idx: int) -> str:
-    """
-    Logical grouping for Data_Dictionary rows. Mirrors the v2 engine's
-    grouping semantics so the output is consistent across implementations.
-    """
     if page == _TOP10_PAGE and key in _TOP10_REQUIRED_FIELDS:
         return "Top10"
     if page == _INSIGHTS_PAGE:
@@ -736,31 +686,15 @@ def _classify_dictionary_group(page: str, key: str, idx: int) -> str:
 
 
 def _build_real_data_dictionary_rows(*, limit: int, offset: int) -> List[Dict[str, Any]]:
-    """
-    Build Data_Dictionary rows by iterating ALL canonical pages and emitting
-    one row per (sheet, header, key) triple.
-
-    This mirrors what the v2 engine's `_build_data_dictionary_rows` does, but
-    executed synchronously here with no network I/O. Production observed the
-    engine path hanging for 100+ seconds (eventually 502'd by Render's edge
-    proxy) because it called Google Sheets API helpers that block when rate-
-    limited or when credentials drift. The schema is static metadata — no
-    network call is required to produce it correctly.
-    """
     rows: List[Dict[str, Any]] = []
     pages = _safe_allowed_pages() or list(_EXPECTED_SHEET_LENGTHS.keys())
     for page_name in pages:
         if page_name == _DICTIONARY_PAGE:
-            # Don't include the dictionary's own schema in itself — that's
-            # noise. Callers reference /v1/schema/data-dictionary instead.
             continue
         try:
             page_headers, page_keys, _spec, schema_source = _resolve_contract(page_name)
         except Exception as exc:
-            logger.debug(
-                "data_dictionary: resolve_contract failed page=%s exc=%s",
-                page_name, exc,
-            )
+            logger.debug("data_dictionary: resolve_contract failed page=%s exc=%s", page_name, exc)
             continue
         if not page_headers or not page_keys:
             continue
@@ -824,13 +758,13 @@ def _to_plain_dict(obj: Any) -> Dict[str, Any]:
         return dict(obj)
     try:
         if hasattr(obj, "model_dump") and callable(getattr(obj, "model_dump")):
-            d = obj.model_dump(mode="python")  # type: ignore[attr-defined]
+            d = obj.model_dump(mode="python")
             return d if isinstance(d, dict) else {}
     except Exception:
         pass
     try:
         if hasattr(obj, "dict") and callable(getattr(obj, "dict")):
-            d = obj.dict()  # type: ignore[attr-defined]
+            d = obj.dict()
             return d if isinstance(d, dict) else {}
     except Exception:
         pass
@@ -892,12 +826,6 @@ def _normalize_to_schema_keys(*, schema_keys: Sequence[str], schema_headers: Seq
 
 
 def _rows_have_any_data(rows: Sequence[Mapping[str, Any]]) -> bool:
-    """
-    Detect whether a list of normalized row dicts contains ANY useful data.
-    Returns False when every row has every field as None/empty — the
-    Data_Dictionary symptom from production where the legacy adapter
-    returned 5 row objects with every key set to null.
-    """
     if not rows:
         return False
     for row in rows:
@@ -994,6 +922,7 @@ def _ensure_top10_rows(rows: Sequence[Mapping[str, Any]], *, requested_symbols: 
             row["criteria_snapshot"] = _top10_criteria_snapshot(row)
     return final_rows
 
+
 def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int) -> Any:
     kk = _normalize_key_name(key)
     if kk in {"symbol", "ticker"}:
@@ -1060,12 +989,6 @@ def _build_placeholder_rows(*, page: str, keys: Sequence[str], requested_symbols
     return rows
 
 def _build_dictionary_failsoft_rows(*, page: str, headers: Sequence[str], keys: Sequence[str], limit: int, offset: int) -> List[Dict[str, Any]]:
-    """
-    Last-resort dictionary fallback used only if `_build_real_data_dictionary_rows`
-    returns nothing (which would only happen if the schema registry is fully
-    unavailable). Emits one row per local schema column so the response is
-    never empty.
-    """
     rows: List[Dict[str, Any]] = []
     for idx, (header, key) in enumerate(zip(headers, keys), start=1):
         rows.append({
@@ -1150,19 +1073,6 @@ def _payload_envelope(*, page: str, headers: Sequence[str], keys: Sequence[str],
 # Engine resolution and call
 # -----------------------------------------------------------------------------
 async def _resolve_engine(request: Request) -> Tuple[Optional[Any], str]:
-    """
-    Resolve the live engine instance for this request.
-
-    Preference order:
-      1. `request.app.state.engine` — the v2 DataEngine that was loaded at
-         app startup. This is the instance that has all the proper
-         special-page builders and active caches.
-      2. Other state attributes (`data_engine_v2`, `data_engine`).
-      3. Module-level factory functions (`get_engine`, `get_data_engine`)
-         on the engine modules. Last-resort, may cold-init.
-
-    Returns (engine, source_label). Engine may be None.
-    """
     try:
         state = getattr(request.app, "state", None)
         if state is not None:
@@ -1206,13 +1116,6 @@ async def _call_engine_sheet_rows(
     body: Dict[str, Any],
     timeout_seconds: float,
 ) -> Tuple[Optional[Dict[str, Any]], str]:
-    """
-    Call the engine's sheet-rows method with a hard timeout.
-
-    Returns (payload, source_label). Payload is None on timeout/missing
-    method. source_label always identifies what was attempted (engine
-    callable name, or `timeout`, or `unavailable`).
-    """
     if engine is None:
         return None, "no_engine"
 
@@ -1261,30 +1164,17 @@ async def _call_engine_sheet_rows(
                 return {"row_objects": res}, fn_label
             return None, fn_label
         except asyncio.TimeoutError:
-            logger.warning(
-                "engine.get_sheet_rows timed out after %.1fs page=%s callable=%s",
-                timeout_seconds, page, fn_label,
-            )
+            logger.warning("engine.get_sheet_rows timed out after %.1fs page=%s callable=%s", timeout_seconds, page, fn_label)
             return None, f"timeout:{timeout_seconds}s"
         except TypeError as exc:
             last_type_error = exc
-            logger.debug(
-                "engine.get_sheet_rows signature mismatch (%s): %s",
-                sorted(kwargs.keys()), exc,
-            )
             continue
         except Exception as exc:
-            logger.error(
-                "engine.get_sheet_rows raised page=%s callable=%s: %s",
-                page, fn_label, exc,
-            )
+            logger.error("engine.get_sheet_rows raised page=%s callable=%s: %s", page, fn_label, exc)
             return {"status": "error", "error": str(exc), "row_objects": []}, fn_label
 
     if last_type_error is not None:
-        logger.error(
-            "engine.get_sheet_rows exhausted all signature variants page=%s callable=%s last=%s",
-            page, fn_label, last_type_error,
-        )
+        logger.error("engine.get_sheet_rows exhausted all signature variants page=%s last=%s", page, last_type_error)
         return {"status": "error", "error": str(last_type_error), "row_objects": []}, fn_label
     return None, fn_label
 
@@ -1292,11 +1182,6 @@ async def _call_engine_sheet_rows(
 async def _call_legacy_module_sheet_rows(
     *, page: str, limit: int, offset: int, mode: str, body: Dict[str, Any], timeout_seconds: float,
 ) -> Tuple[Optional[Dict[str, Any]], str]:
-    """
-    Tier-2 fallback: call the legacy module-level `core.data_engine.get_sheet_rows`.
-    Hard timeout enforced. Used only when Tier-1 (engine instance) is
-    unavailable or returns nothing useful.
-    """
     if _legacy_get_sheet_rows is None:
         return None, "legacy_unavailable"
 
@@ -1314,8 +1199,8 @@ async def _call_legacy_module_sheet_rows(
 
     async def _invoke(args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> Any:
         if inspect.iscoroutinefunction(_legacy_get_sheet_rows):
-            return await _legacy_get_sheet_rows(*args, **kwargs)  # type: ignore[misc]
-        result = await asyncio.to_thread(_legacy_get_sheet_rows, *args, **kwargs)  # type: ignore[arg-type]
+            return await _legacy_get_sheet_rows(*args, **kwargs)
+        result = await asyncio.to_thread(_legacy_get_sheet_rows, *args, **kwargs)
         if inspect.isawaitable(result):
             return await result
         return result
@@ -1332,10 +1217,7 @@ async def _call_legacy_module_sheet_rows(
                 return {"row_objects": res}, LEGACY_ADAPTER_SOURCE
             return None, LEGACY_ADAPTER_SOURCE
         except asyncio.TimeoutError:
-            logger.warning(
-                "legacy core.data_engine.get_sheet_rows timed out after %.1fs page=%s",
-                timeout_seconds, page,
-            )
+            logger.warning("legacy core.data_engine.get_sheet_rows timed out after %.1fs page=%s", timeout_seconds, page)
             return None, f"timeout:{timeout_seconds}s"
         except TypeError as e:
             last_err = e
@@ -1365,12 +1247,6 @@ def _normalize_external_payload(
     requested_symbols: Optional[Sequence[str]] = None,
     meta_extra: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], bool]:
-    """
-    Normalize an upstream payload into the canonical envelope.
-
-    Returns (envelope, has_real_data). `has_real_data` is True only when the
-    normalized rows contain at least one non-null field.
-    """
     ext = dict(external_payload or {})
     hdrs = list(headers or [])
     ks = list(keys or [])
@@ -1388,19 +1264,26 @@ def _normalize_external_payload(
     if meta_extra:
         final_meta.update(meta_extra)
     envelope = _payload_envelope(
-        page=page,
-        headers=hdrs,
-        keys=ks,
+        page=page, headers=hdrs, keys=ks,
         row_objects=normalized_rows,
-        include_matrix=include_matrix,
-        request_id=request_id,
-        started_at=started_at,
-        mode=mode,
+        include_matrix=include_matrix, request_id=request_id,
+        started_at=started_at, mode=mode,
         status_out=status_out or ("success" if (normalized_rows and has_data) else "partial"),
         error_out=error_out,
         meta=final_meta,
     )
     return envelope, (bool(normalized_rows) and has_data)
+
+
+def _should_skip_engine(page: str) -> Tuple[bool, str]:
+    """Determine whether to bypass engine tiers for this page."""
+    if page == _DICTIONARY_PAGE and SKIP_ENGINE_FOR_DICTIONARY:
+        return True, "dictionary_static_metadata_no_engine_needed"
+    if page == _TOP10_PAGE and SKIP_ENGINE_FOR_TOP10:
+        return True, "top10_engine_builder_unreliable_in_v2"
+    if page == _INSIGHTS_PAGE and SKIP_ENGINE_FOR_INSIGHTS:
+        return True, "insights_engine_builder_unreliable_in_v2"
+    return False, ""
 
 
 # -----------------------------------------------------------------------------
@@ -1454,32 +1337,52 @@ async def _run_advanced_sheet_rows_impl(
             },
         )
 
-    # ---- Tier 0: Data_Dictionary fast path ----
-    # The data dictionary is static schema metadata. There's no need to call
-    # the engine — the canonical headers/keys for every page are available
-    # locally via the schema registry. Production observed the engine path
-    # hanging for 100+ seconds (eventually 502'd by Render) because the v2
-    # builder calls Sheets API helpers that block under rate-limit conditions.
-    # Building locally is correct, fast, and immune to upstream outages.
-    if page == _DICTIONARY_PAGE:
-        dict_rows = _build_real_data_dictionary_rows(limit=limit, offset=offset)
-        if not dict_rows:
-            dict_rows = _build_dictionary_failsoft_rows(
-                page=page, headers=headers, keys=keys, limit=limit, offset=offset,
+    # ---- Tier 0: Special-page fast paths (bypass engine entirely) ----
+    # Production confirms the v2 engine's special-page builders are
+    # unusable today: Data_Dictionary hangs past Render's 100s edge
+    # timeout, Insights times out at exactly 10s+10s = 20s on both
+    # tiers, and Top10 takes long enough (engine + Top10 sort overhead)
+    # to push past the upstream 25s bridge timeout. Bypassing the engine
+    # for these three pages produces the same fallback rows the existing
+    # tier-3 code already produced — but instantly, instead of after
+    # 20+ seconds of dead waiting.
+    skip_engine, bypass_reason = _should_skip_engine(page)
+    if skip_engine:
+        if page == _DICTIONARY_PAGE:
+            rows = _build_real_data_dictionary_rows(limit=limit, offset=offset)
+            if not rows:
+                rows = _build_dictionary_failsoft_rows(
+                    page=page, headers=headers, keys=keys, limit=limit, offset=offset,
+                )
+            tier_label = "tier0_data_dictionary_local"
+            source_label = "advanced_analysis.real_dictionary_builder"
+            status_label = "success" if rows else "partial"
+            error_label = None if rows else "Schema registry produced no rows"
+        else:
+            rows = _build_nonempty_failsoft_rows(
+                page=page, headers=headers, keys=keys,
+                requested_symbols=requested_symbols,
+                limit=limit, offset=offset, top_n=top_n,
             )
+            tier_label = "tier0_special_page_bypass"
+            source_label = "advanced_analysis.failsoft_builder"
+            status_label = "success" if rows else "partial"
+            error_label = None if rows else "Local builder produced no rows"
+
         return _payload_envelope(
             page=page, headers=headers, keys=keys,
-            row_objects=dict_rows,
+            row_objects=rows,
             include_matrix=include_matrix, request_id=request_id,
             started_at=start, mode=mode,
-            status_out="success" if dict_rows else "partial",
-            error_out=None if dict_rows else "Schema registry produced no rows",
+            status_out=status_label,
+            error_out=error_label,
             meta={
-                "dispatch": "data_dictionary_fast_path",
+                "dispatch": "advanced_analysis_special_page_fast_path",
                 "schema_source": schema_source,
-                "engine_source": "skipped_for_data_dictionary",
-                "tier": "tier0_data_dictionary_local",
-                "source": "advanced_analysis.real_dictionary_builder",
+                "engine_source": "skipped_for_special_page",
+                "tier": tier_label,
+                "source": source_label,
+                "bypass_reason": bypass_reason,
             },
         )
 
@@ -1519,7 +1422,7 @@ async def _run_advanced_sheet_rows_impl(
         if has_data:
             return envelope
 
-    # ---- Tier 2: legacy module-level adapter (core.data_engine.get_sheet_rows) ----
+    # ---- Tier 2: legacy module-level adapter ----
     tier2_started = time.time()
     payload_t2, t2_source = await _call_legacy_module_sheet_rows(
         page=page,
@@ -1553,7 +1456,7 @@ async def _run_advanced_sheet_rows_impl(
         if has_data:
             return envelope
 
-    # ---- Tier 3: local fail-soft (always returns non-empty for known pages) ----
+    # ---- Tier 3: local fail-soft ----
     fallback_rows = _build_nonempty_failsoft_rows(
         page=page, headers=headers, keys=keys,
         requested_symbols=requested_symbols,
@@ -1609,7 +1512,9 @@ async def advanced_analysis_health(request: Request) -> Dict[str, Any]:
         "legacy_adapter_available": _legacy_get_sheet_rows is not None,
         "legacy_adapter_source": LEGACY_ADAPTER_SOURCE,
         "engine_timeout_sec": ADVANCED_ENGINE_TIMEOUT_SEC,
-        "data_dictionary_fast_path": True,
+        "skip_engine_for_dictionary": SKIP_ENGINE_FOR_DICTIONARY,
+        "skip_engine_for_top10": SKIP_ENGINE_FOR_TOP10,
+        "skip_engine_for_insights": SKIP_ENGINE_FOR_INSIGHTS,
         "allowed_pages_count": len(_safe_allowed_pages()),
         "path": str(getattr(getattr(request, "url", None), "path", "")),
     })
@@ -1618,11 +1523,6 @@ async def advanced_analysis_health(request: Request) -> Dict[str, Any]:
 @router.get("/v1/schema/diagnostics")
 @router.get("/diagnostics")
 async def advanced_analysis_diagnostics(request: Request) -> Dict[str, Any]:
-    """
-    Detailed diagnostics for engine+adapter wiring. Useful when /sheet-rows
-    misbehaves — shows exactly which engine instance was resolved and which
-    method is wired, without log diving.
-    """
     engine, engine_source = await _resolve_engine(request)
     engine_methods = {}
     if engine is not None:
@@ -1650,7 +1550,9 @@ async def advanced_analysis_diagnostics(request: Request) -> Dict[str, Any]:
         "legacy_adapter_source": LEGACY_ADAPTER_SOURCE,
         "legacy_adapter_resolvable": _legacy_get_sheet_rows is not None,
         "engine_timeout_sec": ADVANCED_ENGINE_TIMEOUT_SEC,
-        "data_dictionary_fast_path_enabled": True,
+        "skip_engine_for_dictionary": SKIP_ENGINE_FOR_DICTIONARY,
+        "skip_engine_for_top10": SKIP_ENGINE_FOR_TOP10,
+        "skip_engine_for_insights": SKIP_ENGINE_FOR_INSIGHTS,
         "allowed_pages": _safe_allowed_pages(),
         "timestamp_utc": datetime.utcnow().isoformat(),
     })
@@ -1745,23 +1647,11 @@ async def root_sheet_rows_get(
 ) -> Dict[str, Any]:
     body: Dict[str, Any] = {}
     for k, v in {
-        "page": page,
-        "sheet": sheet,
-        "sheet_name": sheet_name,
-        "name": name,
-        "tab": tab,
-        "symbols": symbols,
-        "tickers": tickers,
-        "direct_symbols": direct_symbols,
-        "symbol": symbol,
-        "ticker": ticker,
-        "code": code,
-        "requested_symbol": requested_symbol,
-        "limit": limit,
-        "offset": offset,
-        "top_n": top_n,
-        "schema_only": schema_only,
-        "headers_only": headers_only,
+        "page": page, "sheet": sheet, "sheet_name": sheet_name, "name": name, "tab": tab,
+        "symbols": symbols, "tickers": tickers, "direct_symbols": direct_symbols,
+        "symbol": symbol, "ticker": ticker, "code": code, "requested_symbol": requested_symbol,
+        "limit": limit, "offset": offset, "top_n": top_n,
+        "schema_only": schema_only, "headers_only": headers_only,
     }.items():
         if v not in (None, ""):
             body[k] = v
