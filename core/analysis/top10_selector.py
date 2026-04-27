@@ -3,50 +3,99 @@
 """
 core/analysis/top10_selector.py
 ================================================================================
-Top 10 Selector -- v6.0.0
+Top 10 Selector -- v6.1.0
 ================================================================================
 LIVE | SCHEMA-FIRST | ROUTE-COMPATIBLE | ENGINE-SELF-RESOLVING | JSON-SAFE
 TOP10-METADATA GUARANTEED | SOURCE-PAGE SAFE | SNAPSHOT FALLBACK SAFE
 SYNC+ASYNC CALLER TOLERANT | DISPLAY-HEADER TOLERANT | WRAPPER-PAYLOAD SAFE
 PARTIAL-DEGRADATION SAFE | DIRECT-SYMBOLS SAFE | TIMEOUT-GUARDED
+DATA-QUALITY TRANSPARENT (v6.1.0)
 
-v6.0.0 Changes (from v5.0.0)
+v6.1.0 Changes (from v6.0.0)
 ----------------------------
+Tadawul Tracker user reported `Top_10_Investments` sheet rendering as
+empty after every refresh. Root cause analysis:
+
+  1. yfinance fails intermittently for ~30% of symbols on Render's
+     egress IP (rate-limit / soft-block). The data engine emits rows
+     with default scores (overall=50, confidence=55) and ROIs of 8%
+     baseline -- legitimate "no signal" placeholders.
+
+  2. v6.0.0's `passes_filters()` rejected those low-quality rows
+     correctly. But `build_top10_rows_async` only relaxed filters
+     when the strict pool was COMPLETELY empty (`if not selected_pool`).
+     Yahoo failures were producing a handful of HIGH-quality rows but
+     dozens of MODERATE/LOW rows -- the strict pool was small but
+     non-empty, so the relaxation never kicked in, and the final
+     `top_rows[:ctx.limit]` was 1-2 picks instead of 10. Apps Script
+     interpreted the short list as "empty sheet."
+
+  3. Even when relaxation did kick in, callers had no way to see WHICH
+     picks were based on real data versus engine defaults. Users could
+     accidentally trust a Top_10 row whose scores were all 50/55
+     placeholders.
+
+Fixes:
+  - Filter relaxation now kicks in when `len(filtered) < ctx.limit`
+    (previously: only when filtered was empty). The strict pool is
+    preferred but supplemented from the relaxed pool, so HIGH picks
+    still appear at the top while the sheet fills out to `limit`.
+
+  - New `compute_data_quality_tier(row)` classifies each row as
+    `HIGH` / `MODERATE` / `LOW` based on:
+       * forecast confidence above the 8% baseline
+       * count of real (non-None) fundamental fields
+       * whether overall_score is a default (50.0 / 55.0) or real
+    The tier is written into a new `data_quality_tier` column so users
+    can see at a glance which picks are trustworthy.
+
+  - `data_quality_tier` added to `TOP10_REQUIRED_FIELDS` /
+    `TOP10_REQUIRED_HEADERS` so it's appended automatically by
+    `_ensure_top10_contract`, regardless of whether the schema is
+    loaded from `schema_registry` or from the hardcoded fallback.
+
+  - `compute_data_quality_tier` exported in `__all__` for tests.
+
+NOT changed (deliberate scope limit):
+  - `compute_selector_score` weights and horizon buckets are unchanged.
+  - Sort order is unchanged: tier is REPORTED, not used as a ranking
+    primary. A LOW-tier row with a high selector score still ranks
+    above a HIGH-tier row with a low score. Tier is the user's
+    safeguard, not a hidden filter.
+  - Engine resolution, retry helpers, schema loading are unchanged.
+
+v6.0.0 Changes (carried over)
+-----------------------------
 Bug fixes:
   - min_confidence filter was broken: comparing a ratio (0.70) to a
     percent-scaled row value (70). Both sides now normalize to a ratio
     before comparison.
   - Scoring horizon buckets (<=14d / else) now match choose_horizon_roi
-    (1M / 3M / 12M via criteria_model) so a 60-day horizon scores with the
-    right weights for its ROI field.
-  - _ENGINE_LOCK is lazy-initialized inside the resolver instead of being
-    an asyncio.Lock() constructed at module import -- safer across threads
-    with distinct event loops.
+    (1M / 3M / 12M via criteria_model) so a 60-day horizon scores with
+    the right weights for its ROI field.
+  - _ENGINE_LOCK is lazy-initialized inside the resolver instead of
+    being an asyncio.Lock() constructed at module import.
 
 Alignment with criteria_model.py v3.0.0:
-  - choose_horizon_roi delegates to map_days_to_horizon / horizon_to_
-    expected_roi_key so the three modules in core.analysis agree on
-    horizon thresholds (45 / 120 days).
+  - choose_horizon_roi delegates to map_days_to_horizon /
+    horizon_to_expected_roi_key so the three modules in core.analysis
+    agree on horizon thresholds (45 / 120 days).
 
 Consolidation:
-  - Three near-identical retry loops (~20 attempts each) in fetch_page_rows,
-    fetch_page_snapshot, fetch_direct_symbol_rows collapsed into one helper
-    `_try_engine_calls(engine, calls, timeout_sec)`. Net ~80 lines removed.
+  - Three near-identical retry loops (~20 attempts each) in
+    fetch_page_rows, fetch_page_snapshot, fetch_direct_symbol_rows
+    collapsed into one helper `_try_engine_calls(engine, calls,
+    timeout_sec)`. Net ~80 lines removed.
   - Magic numbers in compute_trade_setup promoted to named constants
     (_STOP_LOSS_ATR_MULT, _SQRT_TRADING_DAYS, etc.)
 
 Dead code removed:
-  - DataEngineProtocol (never used; code duck-types via _looks_like_engine)
-  - CANONICAL_KEY_SET (defined, never referenced)
-  - Top10SelectorError / EngineResolutionError / CandidateCollectionError
-    (defined, never raised)
-  - Unused imports: sys, TypeVar, Union, cast, Awaitable, Protocol,
-    runtime_checkable
+  - DataEngineProtocol, CANONICAL_KEY_SET, Top10SelectorError /
+    EngineResolutionError / CandidateCollectionError, unused imports.
 
 Added:
-  - `build_top10_rows_async` is now publicly exported for callers that want
-    an async-only contract (no polymorphic return). The sync-tolerant
-    `build_top10_rows` is preserved for backward compatibility.
+  - `build_top10_rows_async` is publicly exported for callers that want
+    an async-only contract (no polymorphic return).
 ================================================================================
 """
 
@@ -86,7 +135,7 @@ logger.addHandler(logging.NullHandler())
 # Version and Constants
 # ---------------------------------------------------------------------------
 
-TOP10_SELECTOR_VERSION = "6.0.0"
+TOP10_SELECTOR_VERSION = "6.1.0"
 OUTPUT_PAGE = "Top_10_Investments"
 
 DEFAULT_SOURCE_PAGES: List[str] = [
@@ -106,6 +155,8 @@ DERIVED_OR_NON_SOURCE_PAGES: set = {
     "Data_Dictionary",
 }
 
+# v6.1.0: data_quality_tier added so users can see which picks are
+# based on real data vs engine defaults.
 TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
     "top10_rank",
     "selection_reason",
@@ -114,6 +165,7 @@ TOP10_REQUIRED_FIELDS: Tuple[str, ...] = (
     "stop_loss_suggested",
     "take_profit_suggested",
     "risk_reward_ratio",
+    "data_quality_tier",
 )
 
 TOP10_REQUIRED_HEADERS: Dict[str, str] = {
@@ -124,6 +176,7 @@ TOP10_REQUIRED_HEADERS: Dict[str, str] = {
     "stop_loss_suggested": "Stop Loss (AI)",
     "take_profit_suggested": "Take Profit (AI)",
     "risk_reward_ratio": "Risk/Reward",
+    "data_quality_tier": "Data Quality",
 }
 
 # ---------------------------------------------------------------------------
@@ -142,7 +195,32 @@ _DAY_RANGE_ENTRY_THRESHOLD = 0.40                  # below this, use current pri
 _DAY_RANGE_ENTRY_DISCOUNT = 0.008                  # discount factor for higher positions
 
 # ---------------------------------------------------------------------------
-# Schema Fallbacks (106 columns)
+# Data-quality tier constants (v6.1.0)
+# ---------------------------------------------------------------------------
+
+# Set of values commonly used by the data engine when fundamentals are
+# missing -- so the row "looks scored" but isn't actually based on
+# meaningful signal. compute_data_quality_tier flags rows whose
+# overall_score equals one of these as engine defaults.
+_DEFAULT_OVERALL_SCORES: frozenset = frozenset({50.0, 55.0})
+
+# Confidence thresholds (ratio scale, 0.0-1.0).
+_CONFIDENCE_HIGH_TIER = 0.30          # >= 30% confidence -> HIGH eligible
+_CONFIDENCE_MODERATE_TIER = 0.15      # >= 15% confidence -> MODERATE eligible
+
+# Fundamentals checked for HIGH/MODERATE classification.
+_FUNDAMENTAL_KEYS_FOR_TIER: Tuple[str, ...] = (
+    "pe_ttm", "eps_ttm", "revenue_ttm", "revenue_growth_yoy",
+    "gross_margin", "operating_margin", "profit_margin",
+    "debt_to_equity", "free_cash_flow_ttm", "roe", "market_cap",
+)
+
+# Field counts required at each tier.
+_TIER_HIGH_MIN_FUNDAMENTALS = 5
+_TIER_MODERATE_MIN_FUNDAMENTALS = 3
+
+# ---------------------------------------------------------------------------
+# Schema Fallbacks (107 columns; +1 vs v6.0.0 for data_quality_tier)
 # ---------------------------------------------------------------------------
 
 DEFAULT_FALLBACK_KEYS: List[str] = [
@@ -187,9 +265,10 @@ DEFAULT_FALLBACK_KEYS: List[str] = [
     "unrealized_pl", "unrealized_pl_pct",
     # Provenance (4)
     "data_provider", "last_updated_utc", "last_updated_riyadh", "warnings",
-    # Top10 extras (3) + trade setup (4)
+    # Top10 extras (3) + trade setup (4) + data quality (1, v6.1.0)
     "top10_rank", "selection_reason", "criteria_snapshot",
     "entry_price", "stop_loss_suggested", "take_profit_suggested", "risk_reward_ratio",
+    "data_quality_tier",
 ]
 
 DEFAULT_FALLBACK_HEADERS: List[str] = [
@@ -218,6 +297,7 @@ DEFAULT_FALLBACK_HEADERS: List[str] = [
     "Data Provider", "Last Updated (UTC)", "Last Updated (Riyadh)", "Warnings",
     "Top 10 Rank", "Selection Reason", "Criteria Snapshot",
     "Entry Price", "Stop Loss (AI)", "Take Profit (AI)", "Risk/Reward",
+    "Data Quality",
 ]
 
 # ---------------------------------------------------------------------------
@@ -331,6 +411,8 @@ ROW_KEY_ALIASES: Dict[str, Tuple[str, ...]] = {
     "stop_loss_suggested": ("stop_loss_suggested", "stopLossSuggested", "ai_stop_loss"),
     "take_profit_suggested": ("take_profit_suggested", "takeProfitSuggested", "ai_take_profit"),
     "risk_reward_ratio": ("risk_reward_ratio", "riskRewardRatio", "rr_ratio"),
+    # v6.1.0
+    "data_quality_tier": ("data_quality_tier", "dataQualityTier", "quality_tier"),
 }
 
 # Keys that indicate wrapper/metadata rather than data rows
@@ -1224,6 +1306,63 @@ def direct_symbol_order_index(row: Mapping[str, Any], ctx: CriteriaContext) -> O
 
 
 # ---------------------------------------------------------------------------
+# Data Quality Tier (v6.1.0)
+# ---------------------------------------------------------------------------
+
+def compute_data_quality_tier(row: Mapping[str, Any]) -> str:
+    """
+    Classify a candidate row's data quality.
+
+    Returns one of:
+      - "HIGH":     forecast confidence >= 30%, fundamentals >= 5 fields,
+                    overall_score is not an engine default (50.0/55.0).
+                    These picks are based on real data and are safe to
+                    treat as actionable Top 10 candidates.
+      - "MODERATE": confidence >= 15% OR fundamentals >= 3 with non-default
+                    overall. Worth researching, but verify before acting.
+      - "LOW":      mostly engine defaults. Treat as a "research candidate"
+                    only -- the underlying scores are not strong enough to
+                    drive a buy decision.
+
+    The tier is a transparency safeguard: it does NOT change ranking. A
+    LOW-tier row with a high selector score still ranks above a HIGH-tier
+    row with a low selector score. The tier just lets the user see, at a
+    glance, which Top 10 picks have the strongest evidence behind them.
+    """
+    # Confidence (normalize percent -> ratio if needed)
+    confidence = _to_float(row.get("forecast_confidence") or row.get("confidence_score"))
+    if confidence is not None and abs(confidence) > 1.5:
+        confidence /= 100.0
+
+    # Count fundamentals with real (non-None, non-zero) values
+    fundamentals_present = 0
+    for key in _FUNDAMENTAL_KEYS_FOR_TIER:
+        val = _to_float(row.get(key))
+        if val is not None and val != 0:
+            fundamentals_present += 1
+
+    # Is overall_score a real signal or an engine placeholder?
+    overall = _to_float(row.get("overall_score"))
+    has_real_overall = (
+        overall is not None and overall not in _DEFAULT_OVERALL_SCORES
+    )
+
+    # HIGH tier
+    if (confidence is not None and confidence >= _CONFIDENCE_HIGH_TIER
+            and fundamentals_present >= _TIER_HIGH_MIN_FUNDAMENTALS
+            and has_real_overall):
+        return "HIGH"
+
+    # MODERATE tier (either confidence OR fundamentals path)
+    if confidence is not None and confidence >= _CONFIDENCE_MODERATE_TIER:
+        return "MODERATE"
+    if fundamentals_present >= _TIER_MODERATE_MIN_FUNDAMENTALS and has_real_overall:
+        return "MODERATE"
+
+    return "LOW"
+
+
+# ---------------------------------------------------------------------------
 # Scoring (horizon buckets aligned with criteria_model: 1M / 3M / 12M)
 # ---------------------------------------------------------------------------
 
@@ -1469,7 +1608,7 @@ def rank_and_project_rows(
     keys: Sequence[str],
     ctx: CriteriaContext,
 ) -> List[Dict[str, Any]]:
-    """Rank rows, compute trade setups, and project to the output schema keys."""
+    """Rank rows, compute trade setups, tag data quality, and project to schema keys."""
     criteria_snapshot = _compact_json(ctx.to_dict())
     result: List[Dict[str, Any]] = []
 
@@ -1486,6 +1625,11 @@ def rank_and_project_rows(
             row["selection_reason"] = generate_selection_reason(row, ctx)
         if _is_blank(row.get("criteria_snapshot")):
             row["criteria_snapshot"] = criteria_snapshot
+
+        # v6.1.0: tag every row with its data-quality tier so users can
+        # see which Top 10 picks have real signal vs engine defaults.
+        if _is_blank(row.get("data_quality_tier")):
+            row["data_quality_tier"] = compute_data_quality_tier(row)
 
         projected = {k: _json_safe(row.get(k)) for k in keys}
         result.append(projected)
@@ -2269,9 +2413,17 @@ async def build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
     # Normalize, filter, score
     normalized = [normalize_candidate_row(r) for r in candidates]
     filtered = [r for r in normalized if passes_filters(r, ctx)]
+
+    # v6.1.0: relax filters when the strict pool can't fill `limit` rows.
+    # Previously: relaxation only kicked in when filtered was completely empty,
+    # so a small (1-2 row) strict pool produced a near-empty Top_10. Now the
+    # selector falls through to the full normalized pool whenever the strict
+    # pool is short -- HIGH-quality picks still come first via scoring +
+    # data_quality_tier ordering, and the sheet fills out with MODERATE/LOW
+    # candidates that are clearly labeled.
     filter_relaxed = False
     selected_pool = filtered
-    if not selected_pool and normalized:
+    if len(selected_pool) < ctx.limit and normalized:
         selected_pool = list(normalized)
         filter_relaxed = True
 
@@ -2314,6 +2466,12 @@ async def build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
 
     projected_rows = rank_and_project_rows(top_rows[:ctx.limit], keys, ctx)
 
+    # v6.1.0: tally tiers for transparency in meta
+    tier_counts: Dict[str, int] = {"HIGH": 0, "MODERATE": 0, "LOW": 0}
+    for r in projected_rows:
+        tier = _to_string(r.get("data_quality_tier")) or "LOW"
+        tier_counts[tier] = tier_counts.get(tier, 0) + 1
+
     status = "success" if projected_rows else "warn"
     meta = {
         "build_status": "OK" if projected_rows else "WARN",
@@ -2324,6 +2482,7 @@ async def build_top10_rows_async(*args: Any, **kwargs: Any) -> Dict[str, Any]:
         "filtered_count": len(filtered),
         "selected_count": len(projected_rows),
         "filter_relaxed": filter_relaxed,
+        "data_quality_tier_counts": tier_counts,
         "selected_symbols": [
             _to_string(r.get("symbol")) for r in projected_rows if _to_string(r.get("symbol"))
         ],
@@ -2425,7 +2584,7 @@ select_top10 = build_top10_rows
 __all__ = [
     "TOP10_SELECTOR_VERSION",
     "build_top10_rows",
-    "build_top10_rows_async",              # new in v6.0.0: always-async contract
+    "build_top10_rows_async",              # added in v6.0.0: always-async contract
     "build_top10_output_rows",
     "build_top10_investments_rows",
     "build_top_10_investments_rows",
@@ -2444,6 +2603,7 @@ __all__ = [
     "merge_symbol_rows",
     "choose_horizon_roi",
     "compute_selector_score",
+    "compute_data_quality_tier",            # v6.1.0
     "compute_trade_setup",
     "passes_filters",
     "resolve_engine",
