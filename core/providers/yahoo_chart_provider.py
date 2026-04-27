@@ -2,7 +2,7 @@
 # core/providers/yahoo_chart_provider.py
 """
 ================================================================================
-Yahoo Chart Provider (Global + KSA History) -- v8.0.0
+Yahoo Chart Provider (Global + KSA History) -- v8.1.0
 ================================================================================
 
 Purpose
@@ -15,8 +15,57 @@ Provides financial market data from Yahoo Finance:
   - Risk statistics (volatility, drawdown, VaR, Sharpe, RSI)
   - Price forecasts using log-linear regression
 
-v8.0.0 Changes (from v7.0.0)
+v8.1.0 Changes (from v8.0.0)
 ----------------------------
+Surgical FX-symbol fix. Tadawul Tracker user reported the entire
+Commodities_FX sheet was filling with placeholder rows for symbols like
+AUDCAD, EURUSD, USDSAR, NZDJPY, USDTRY -- the engine got `None` back
+from `fetch_enriched_quote` and `data_engine_v2._compute_scores_fallback`
+filled the gap with synthetic data (101/102/103-style forecasts and
+9700% ROIs).
+
+Root cause: `normalize_symbol("AUDCAD")` returned `"AUDCAD"` unchanged.
+Yahoo Finance requires the `=X` suffix for currency pairs, so
+`yf.Ticker("AUDCAD").history()` returned an empty DataFrame, which
+collapsed all the way back to the engine's placeholder fallback.
+
+Bug fix:
+  - `normalize_symbol` now detects bare 6-letter currency-pair tokens
+    (where both the base and quote are in a known-currency set) and
+    appends `=X` so yfinance can actually resolve them. KSA codes,
+    crypto pseudo-pairs (BTCUSD), already-suffixed FX (EURUSD=X),
+    futures (GC=F), indices (^GSPC), and US stocks remain untouched.
+
+New helpers:
+  - `_BARE_FX_RE`: compiled regex matching exactly six A-Z chars.
+  - `_KNOWN_CURRENCIES`: frozenset of ISO 4217 codes for currencies
+    that appear on Tadawul-tracked sheets and major global pairs.
+    Includes GCC currencies (SAR, AED, QAR, KWD, BHD, OMR), majors
+    (USD, EUR, GBP, JPY, CHF, CAD, AUD, NZD), regional emerging
+    (TRY, EGP, ILS, ZAR), and other commonly-traded codes.
+  - `_is_likely_fx_pair(symbol)`: returns True when both halves of a
+    6-letter token are recognized currencies. Two-half membership test
+    (rather than a string-prefix scan) keeps the function O(1) on the
+    32-currency table while staying safe against 6-letter US tickers
+    that happen to start with `USD` or end with `EUR`.
+
+Bumped:
+  - `PROVIDER_VERSION = "8.1.0"`.
+  - Module docstring now documents the v8.1.0 changes.
+
+NOT changed (deliberate scope limit):
+  - Direct Yahoo Chart API fallback for futures (=F symbols) is
+    deferred to v8.2.0. yfinance fails on Render's egress IP for
+    GC=F / SI=F / CL=F because Yahoo rate-limits those requests, and
+    fixing it requires adding an httpx-based fallback to
+    query1.finance.yahoo.com/v8/finance/chart/{SYMBOL} with proper
+    headers + JSON parsing. That is a 200+ line change. Keeping v8.1.0
+    surgical so the FX fix can ship and be verified independently.
+  - Placeholder injection in `data_engine_v2._compute_scores_fallback`
+    is upstream of this provider and lives in a different file.
+
+v8.0.0 Changes (carried over)
+-----------------------------
 Bug fixes:
   - `_fetch_ticker_sync` now accepts period/interval from config. v7.0.0
     had the fossil expression
@@ -132,7 +181,7 @@ logger.addHandler(logging.NullHandler())
 # =============================================================================
 
 PROVIDER_NAME = "yahoo_chart"
-PROVIDER_VERSION = "8.0.0"
+PROVIDER_VERSION = "8.1.0"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -146,6 +195,52 @@ _FX_PAIR_RE = re.compile(r"^([A-Z]{6})=X$")
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _K_M_B_T_RE = re.compile(r"^(-?\d+(?:\.\d+)?)([KMBT])$", re.IGNORECASE)
 _K_M_B_T_MULT = {"K": 1_000.0, "M": 1_000_000.0, "B": 1_000_000_000.0, "T": 1_000_000_000_000.0}
+
+# v8.1.0: bare-6-letter FX pair detection
+# ----------------------------------------
+# Regex matches symbols that are exactly six A-Z characters with nothing
+# else attached (no `=X`, no `=F`, no `.`, no digit).
+_BARE_FX_RE = re.compile(r"^[A-Z]{6}$")
+
+# ISO 4217 codes for currencies the Tadawul Tracker pages reference, plus
+# the global majors. A 6-letter token only converts to `=X` when BOTH the
+# 3-letter base and 3-letter quote are members of this set, which keeps
+# us safe from collisions with 6-letter US/global stock tickers.
+_KNOWN_CURRENCIES = frozenset({
+    # Majors
+    "USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD",
+    # GCC + regional
+    "SAR", "AED", "QAR", "KWD", "BHD", "OMR", "EGP", "TRY", "ILS",
+    # Asia
+    "CNY", "HKD", "SGD", "INR", "KRW", "THB", "MYR", "IDR", "PHP", "TWD",
+    # Other commonly-traded
+    "ZAR", "MXN", "BRL", "RUB", "PLN", "SEK", "NOK", "DKK", "CZK", "HUF",
+})
+
+
+def _is_likely_fx_pair(symbol: str) -> bool:
+    """
+    Detect a bare 6-letter currency pair token (e.g. ``AUDCAD``,
+    ``USDSAR``, ``EURJPY``). Returns True iff:
+
+      * `symbol` is exactly six A-Z characters, AND
+      * the first three (base) AND last three (quote) are both in
+        ``_KNOWN_CURRENCIES``.
+
+    Both-halves membership is what makes this safe: a 6-letter US stock
+    ticker would have to coincidentally split into two known ISO codes
+    AND both halves would have to match -- which doesn't happen for any
+    real ticker we've seen. KSA equities use the `.SR` suffix and never
+    reach this check (they hit `_KSA_CODE_RE` first). Crypto symbols
+    like ``BTCUSD`` are not matched because ``BTC`` is not an ISO 4217
+    currency code in our table.
+    """
+    if not _BARE_FX_RE.match(symbol):
+        return False
+    base = symbol[:3]
+    quote = symbol[3:]
+    return base in _KNOWN_CURRENCIES and quote in _KNOWN_CURRENCIES
+
 
 DEFAULT_TIMEOUT_SEC = 20.0
 DEFAULT_QUOTE_TTL_SEC = 15.0
@@ -438,13 +533,23 @@ def normalize_symbol(symbol: str) -> str:
     """
     Normalize symbol to Yahoo Finance format.
 
+    Detection order (first match wins):
+      1. Empty / whitespace -> ""
+      2. KSA numeric code (3-6 digits) -> append ".SR"
+      3. Bare 6-letter currency pair (v8.1.0) -> append "=X"
+      4. Anything else -> upper-cased pass-through
+
     Examples:
+        ""         -> ""
         "2222"     -> "2222.SR"
         "2222.SR"  -> "2222.SR"
         "AAPL"     -> "AAPL"
         "GC=F"     -> "GC=F"
         "^GSPC"    -> "^GSPC"
-        "EURUSD=X" -> "EURUSD=X"
+        "EURUSD=X" -> "EURUSD=X"        (already has =X, untouched)
+        "AUDCAD"   -> "AUDCAD=X"        (v8.1.0)
+        "USDSAR"   -> "USDSAR=X"        (v8.1.0)
+        "BTCUSD"   -> "BTCUSD"          (BTC not a known currency, untouched)
     """
     s = (symbol or "").strip()
     if not s:
@@ -452,9 +557,18 @@ def normalize_symbol(symbol: str) -> str:
 
     s = s.translate(_ARABIC_DIGITS).strip().upper()
 
+    # 1. KSA numeric codes get the .SR suffix.
     if _KSA_CODE_RE.match(s):
         return f"{s}.SR"
 
+    # 2. Bare 6-letter currency-pair tokens get =X. (v8.1.0)
+    #    Both halves must be in _KNOWN_CURRENCIES, so 6-letter US stock
+    #    tickers and BTCUSD-style crypto are not affected.
+    if _is_likely_fx_pair(s):
+        return f"{s}=X"
+
+    # 3. Otherwise keep the symbol as-is (ETFs, futures, indices,
+    #    already-suffixed FX, US/global equities, KSA .SR, etc).
     return s
 
 
