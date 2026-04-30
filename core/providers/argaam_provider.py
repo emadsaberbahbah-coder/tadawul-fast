@@ -2,19 +2,89 @@
 """
 core/providers/argaam_provider.py
 ================================================================================
-Argaam Provider (KSA Market Data) -- v6.0.0
+Argaam Provider (KSA Market Data) -- v6.1.0
 ================================================================================
 PROFILE + CLASSIFICATION + HISTORY FALLBACK + ROUTER/ENGINE COMPAT
 
 Purpose
 -------
-Provides KSA market data from Argaam API:
+Provides KSA market data from Argaam-compatible APIs:
   - Real-time quotes
   - Company profiles and classification
   - Historical OHLCV data
   - Derived technical indicators (RSI, ATR, volume ratio)
   - KSA-specific symbol normalization
 
+v6.1.0 Changes (from v6.0.0)
+----------------------------
+The "satisfaction problem" fix (mirrored from tadawul_provider v6.1.0):
+the provider's URL fields all defaulted to empty strings, which silently
+disabled the secondary KSA fallback. With Tadawul down or rate-limited,
+the engine had no working fallback before Yahoo, so .SR rows scored as
+HOLD/Insufficient data even on transient Tadawul outages.
+
+Operator-facing improvements:
+  - Added PROVIDER_PRESETS map for known Saudi-data APIs that can serve
+    as the Argaam fallback role: sahmk, twelvedata, stockerapi.
+    (Argaam.com itself does not publish a public quote/profile/history
+    REST API; this slot is configured for any Argaam-compatible JSON
+    feed.) Set `ARGAAM_PROVIDER_PRESET=sahmk` (or another preset name)
+    and the URLs are auto-filled with the right URL template.
+  - Added `ARGAAM_API_KEY` env var. When set, the provider auto-injects
+    an Authorization-style header (default `X-API-Key`, override via
+    `ARGAAM_API_KEY_HEADER`).
+  - Explicit URL env vars (ARGAAM_QUOTE_URL, etc.) ALWAYS win over the
+    preset.
+  - When the provider is enabled but no URLs/preset are configured,
+    a single WARNING is logged at construction time. Operators see a
+    clear message in Render logs at startup.
+  - `ArgaamConfig` gained 3 new optional fields: `provider_preset`,
+    `api_key`, `api_key_header`. The frozen dataclass keeps backward
+    compatibility because the existing 3 URL fields stay positional.
+  - Boolean vocabulary aligned with the canonical 8-value set: added
+    `enable` to `_TRUTHY` and added `_FALSY` set. v6.0.0 only had
+    `_TRUTHY` and was missing `enable`, so any operator who set
+    `ARGAAM_*=enable` saw it parsed as the default value rather than
+    True, and any FALSY value never short-circuited correctly.
+  - `get_provider().status()` now reports preset state for health.
+
+Bug-compat: the public API (functions, fetch methods, dataclass field
+order, __all__, env-var names, return shapes) is unchanged. The 3 new
+ArgaamConfig fields have safe defaults.
+
+Provider preset templates (configurable via env if a vendor changes URLs):
+  - sahmk      :  Saudi-licensed market data
+                  https://app.sahmk.sa/api/v1/quote/{code}/
+                  https://app.sahmk.sa/api/v1/history/{code}/?days={days}
+                  https://app.sahmk.sa/api/v1/profile/{code}/
+                  Auth: X-API-Key header (set ARGAAM_API_KEY)
+  - twelvedata :  Saudi exchange (XSAU) via Twelve Data REST
+                  https://api.twelvedata.com/quote?symbol={code}&exchange=XSAU&apikey={key}
+                  https://api.twelvedata.com/time_series?symbol={code}&exchange=XSAU&interval=1day&outputsize={days}&apikey={key}
+                  https://api.twelvedata.com/profile?symbol={code}&exchange=XSAU&apikey={key}
+                  Auth: in-URL apikey
+  - stockerapi :  Third-party Tadawul provider
+                  https://stockerapi.com/api/v1/saudi/quote/{code}
+                  https://stockerapi.com/api/v1/saudi/history/{code}?days={days}
+                  https://stockerapi.com/api/v1/saudi/profile/{code}
+                  Auth: Authorization Bearer
+
+Setting up KSA secondary data on Render (one-time):
+  1. Choose a provider that's DIFFERENT from your TADAWUL_PROVIDER_PRESET.
+     For example: TADAWUL_PROVIDER_PRESET=sahmk + ARGAAM_PROVIDER_PRESET=twelvedata
+     gives you genuine redundancy across two independent vendors.
+  2. In Render Dashboard -> Environment, add:
+       ARGAAM_PROVIDER_PRESET = twelvedata        (or your chosen preset)
+       ARGAAM_API_KEY         = <your key>
+  3. Trigger a deploy.
+  4. Verify Argaam now appears in the provider chain when Tadawul is
+     skipped (force this by temporarily unsetting TADAWUL_API_KEY in
+     a non-prod environment).
+
+You can still set explicit URLs (the v6.0.0 way) -- they take precedence
+over the preset.
+
+----------------------------
 v6.0.0 Changes (from v5.0.0)
 ----------------------------
 Bug fixes:
@@ -99,7 +169,7 @@ logger.addHandler(logging.NullHandler())
 # ---------------------------------------------------------------------------
 
 PROVIDER_NAME = "argaam"
-PROVIDER_VERSION = "6.0.0"
+PROVIDER_VERSION = "6.1.0"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -111,11 +181,68 @@ DEFAULT_CACHE_TTL_SEC = 20.0
 DEFAULT_HISTORY_TTL_SEC = 120.0
 DEFAULT_CACHE_MAX_SIZE = 2000
 
-_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled"}
+_TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
+_FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
 _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _KSA_CODE_RE = re.compile(r"^\d{3,6}$")
 _K_M_B_RE = re.compile(r"^(-?\d+(?:\.\d+)?)([KMB])$", re.IGNORECASE)
 _K_M_B_MULT = {"K": 1_000.0, "M": 1_000_000.0, "B": 1_000_000_000.0}
+
+
+# ---------------------------------------------------------------------------
+# Provider presets (v6.1.0)
+# ---------------------------------------------------------------------------
+# Preset names map to URL templates for known Saudi data providers that can
+# serve as Argaam's fallback role. Argaam.com itself does not publish a
+# public quote/profile/history REST API, so this slot is configured for any
+# Argaam-compatible JSON feed (typically a different vendor than the one
+# configured for TADAWUL_PROVIDER_PRESET, to give the engine real
+# cross-vendor redundancy).
+#
+# Operators set ARGAAM_PROVIDER_PRESET=<name> + ARGAAM_API_KEY=<key> and
+# the provider auto-fills URLs and headers. Explicit ARGAAM_*_URL env vars
+# still win over the preset.
+#
+# These templates use:
+#   {symbol} -> the full normalized form, e.g. "2222.SR"
+#   {code}   -> just the numeric code, e.g. "2222"
+#   {days}   -> history days, filled at request time
+# ---------------------------------------------------------------------------
+
+PROVIDER_PRESETS: Dict[str, Dict[str, str]] = {
+    # SAHMK: Saudi-licensed Tadawul market data provider (sahmk.sa).
+    # Auth: X-API-Key header.
+    "sahmk": {
+        "quote_url":      "https://app.sahmk.sa/api/v1/quote/{code}/",
+        "profile_url":    "https://app.sahmk.sa/api/v1/profile/{code}/",
+        "history_url":    "https://app.sahmk.sa/api/v1/history/{code}/?days={days}",
+        "api_key_header": "X-API-Key",
+    },
+    # Twelve Data: Saudi exchange (XSAU) via standard REST.
+    # Auth: in-URL apikey (no header needed).
+    "twelvedata": {
+        "quote_url":      "https://api.twelvedata.com/quote?symbol={code}&exchange=XSAU&apikey={api_key}",
+        "profile_url":    "https://api.twelvedata.com/profile?symbol={code}&exchange=XSAU&apikey={api_key}",
+        "history_url":    "https://api.twelvedata.com/time_series?symbol={code}&exchange=XSAU&interval=1day&outputsize={days}&apikey={api_key}",
+        "api_key_header": "",  # not needed; key is in URL
+    },
+    # StockerAPI: third-party Tadawul provider.
+    # Auth: Authorization Bearer header.
+    "stockerapi": {
+        "quote_url":      "https://stockerapi.com/api/v1/saudi/quote/{code}",
+        "profile_url":    "https://stockerapi.com/api/v1/saudi/profile/{code}",
+        "history_url":    "https://stockerapi.com/api/v1/saudi/history/{code}?days={days}",
+        "api_key_header": "Authorization",  # value will be "Bearer <key>"
+    },
+}
+
+
+def _resolve_preset(preset_name: str) -> Dict[str, str]:
+    """Return the URL template dict for a preset name, or {} if unknown."""
+    if not preset_name:
+        return {}
+    return dict(PROVIDER_PRESETS.get(preset_name.strip().lower(), {}) or {})
+
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -203,6 +330,10 @@ class ArgaamConfig:
     cache_ttl_sec: float = DEFAULT_CACHE_TTL_SEC
     history_ttl_sec: float = DEFAULT_HISTORY_TTL_SEC
     cache_max_size: int = DEFAULT_CACHE_MAX_SIZE
+    # v6.1.0: preset-driven URL filling and auth-header injection
+    provider_preset: str = ""
+    api_key: str = ""
+    api_key_header: str = ""
 
     @classmethod
     def from_env(cls) -> "ArgaamConfig":
@@ -219,17 +350,70 @@ class ArgaamConfig:
             except (ValueError, TypeError):
                 return default
 
-        return cls(
-            quote_url=os.getenv("ARGAAM_QUOTE_URL", "").strip(),
-            profile_url=os.getenv("ARGAAM_PROFILE_URL", "").strip(),
-            history_url=os.getenv("ARGAAM_HISTORY_URL", "").strip(),
+        # v6.1.0: preset support
+        preset_name = os.getenv("ARGAAM_PROVIDER_PRESET", "").strip()
+        api_key = os.getenv("ARGAAM_API_KEY", "").strip()
+        api_key_header_explicit = os.getenv("ARGAAM_API_KEY_HEADER", "").strip()
+        preset = _resolve_preset(preset_name)
+
+        # Explicit env URLs always win; preset only fills the gaps.
+        # Templates get {api_key} substituted now (e.g., Twelve Data uses
+        # in-URL keys); {symbol}/{code}/{days} are filled at request time.
+        def _from_preset(field_name: str, env_name: str) -> str:
+            explicit = (os.getenv(env_name, "") or "").strip()
+            if explicit:
+                return explicit
+            tmpl = preset.get(field_name, "")
+            if tmpl and "{api_key}" in tmpl:
+                tmpl = tmpl.replace("{api_key}", api_key)
+            return tmpl
+
+        # API-key-header resolution. Explicit env wins; otherwise the preset
+        # may declare an empty string (meaning "key goes in URL, no header
+        # needed", e.g. twelvedata). Default falls back to "X-API-Key" only
+        # if no preset declared a policy and an api_key was provided.
+        if api_key_header_explicit:
+            api_key_header = api_key_header_explicit
+        elif "api_key_header" in preset:
+            api_key_header = preset["api_key_header"]
+        elif api_key:
+            api_key_header = "X-API-Key"
+        else:
+            api_key_header = ""
+
+        cfg = cls(
+            quote_url=_from_preset("quote_url", "ARGAAM_QUOTE_URL"),
+            profile_url=_from_preset("profile_url", "ARGAAM_PROFILE_URL"),
+            history_url=_from_preset("history_url", "ARGAAM_HISTORY_URL"),
             timeout_sec=_env_float("ARGAAM_TIMEOUT_SEC", DEFAULT_TIMEOUT_SEC),
             retry_attempts=_env_int("ARGAAM_RETRY_ATTEMPTS", DEFAULT_RETRY_ATTEMPTS),
             max_concurrency=_env_int("ARGAAM_MAX_CONCURRENCY", DEFAULT_MAX_CONCURRENCY),
             cache_ttl_sec=_env_float("ARGAAM_CACHE_TTL_SEC", DEFAULT_CACHE_TTL_SEC),
             history_ttl_sec=_env_float("ARGAAM_HISTORY_CACHE_TTL_SEC", DEFAULT_HISTORY_TTL_SEC),
             cache_max_size=_env_int("ARGAAM_CACHE_MAX", DEFAULT_CACHE_MAX_SIZE),
+            provider_preset=preset_name.lower(),
+            api_key=api_key,
+            api_key_header=api_key_header,
         )
+
+        # Startup-time configuration warning. Logged ONCE per process.
+        # Mirrors the diagnostic added to tadawul_provider v6.1.0 for the
+        # same silent-empty-URL failure mode.
+        if not cfg.has_any_url():
+            try:
+                logger.warning(
+                    "Argaam provider has NO URLs configured. KSA secondary "
+                    "fallback is disabled. Fix: set ARGAAM_PROVIDER_PRESET "
+                    "(sahmk|twelvedata|stockerapi) + ARGAAM_API_KEY in Render "
+                    "env, OR set ARGAAM_QUOTE_URL/PROFILE_URL/HISTORY_URL "
+                    "explicitly. Recommended: use a different preset than "
+                    "TADAWUL_PROVIDER_PRESET so the two KSA providers give "
+                    "true cross-vendor redundancy."
+                )
+            except Exception:
+                pass
+
+        return cfg
 
     def has_any_url(self) -> bool:
         """Return True if at least one endpoint URL is configured."""
@@ -733,15 +917,45 @@ class ArgaamClient:
         self._client: Optional["httpx.AsyncClient"] = None
 
         if _HTTPX_AVAILABLE:
+            headers = {
+                "User-Agent": USER_AGENT,
+                "Accept": "application/json",
+                "X-Client-ID": self.client_id,
+            }
+
+            # v6.1.0: auto-inject API-key header from ARGAAM_API_KEY env var.
+            # Skipped when api_key_header is "" (e.g., Twelve Data preset uses
+            # in-URL key). Operator can still override via ARGAAM_API_KEY_HEADER
+            # or by setting their own headers in extra_headers (not yet
+            # exposed for Argaam, but kept symmetric with tadawul_provider).
+            api_key = self.config.api_key
+            hk = self.config.api_key_header
+            if api_key and hk:
+                if hk.lower() == "authorization" and not api_key.lower().startswith(
+                    ("bearer ", "token ", "basic ")
+                ):
+                    headers[hk] = f"Bearer {api_key}"
+                else:
+                    headers[hk] = api_key
+
             self._client = httpx.AsyncClient(
                 timeout=httpx.Timeout(self.config.timeout_sec),
                 limits=httpx.Limits(max_keepalive_connections=20, max_connections=40),
-                headers={
-                    "User-Agent": USER_AGENT,
-                    "Accept": "application/json",
-                    "X-Client-ID": self.client_id,
-                },
+                headers=headers,
             )
+
+            try:
+                logger.info(
+                    "ArgaamClient v%s initialized | preset=%s | has_api_key=%s | has_quote=%s | has_profile=%s | has_history=%s",
+                    PROVIDER_VERSION,
+                    self.config.provider_preset or "(none)",
+                    bool(api_key),
+                    bool(self.config.quote_url),
+                    bool(self.config.profile_url),
+                    bool(self.config.history_url),
+                )
+            except Exception:
+                pass
 
     def _get_semaphore(self) -> asyncio.Semaphore:
         if self._semaphore is None:
@@ -1313,6 +1527,8 @@ __all__ = [
     "PROVIDER_VERSION",
     "PROVIDER_BATCH_SUPPORTED",
     "VERSION",
+    # v6.1.0: preset registry (operators can introspect supported presets)
+    "PROVIDER_PRESETS",
     # Symbol normalization
     "normalize_ksa_symbol",
     # Engine-facing functions + aliases
