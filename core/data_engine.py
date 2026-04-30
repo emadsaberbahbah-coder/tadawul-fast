@@ -2,7 +2,7 @@
 # core/data_engine.py
 """
 ================================================================================
-Enterprise Data Engine -- v7.0.1 (ALIGNED / SAFE / PROD-HARDENED / SHEET-ROWS++)
+Enterprise Data Engine -- v7.1.0 (HONEST-PLACEHOLDERS / NO-FAKE-PRICES)
 ================================================================================
 
 Purpose
@@ -13,6 +13,67 @@ Central data access layer for TFB providing:
 - Provider-agnostic data fetching
 - Caching, rate limiting, circuit breakers
 - Batch processing with progress tracking
+
+v7.1.0 Fixes (vs v7.0.1) — CRITICAL DATA INTEGRITY FIX
+------------------------------------------------------
+- FIX [CRITICAL]: `_build_nonempty_failsoft_rows` Top10 branch no longer
+    emits synthetic numeric values that masquerade as real prices and
+    real recommendations. The previous behavior (lines 3152-3174 in
+    v7.0.1) was to fabricate:
+      * current_price = 100.0 + idx          → $101, $102, $103, ...
+      * overall_score = 100 - idx*3          → 97, 94, 91, ...
+      * opportunity_score = 100 - idx*3      → 97, 94, 91, ...
+      * forecast_confidence = 100 - idx*3
+      * confidence_score = 100 - idx*3
+      * avg_cost = 100.0 + idx
+      * position_cost = 100.0 + idx
+      * position_value = 100.0 + idx
+      * unrealized_pl = 100.0 + idx
+      * unrealized_pl_pct = 100.0 + idx
+      * recommendation = "BUY" (idx<=3) / "HOLD" (idx>3)
+      * risk_bucket = "High Confidence" / "Moderate"
+    The downstream Apps Script and Google Sheets layer happily wrote
+    these synthetic values. The scoring engine then computed
+    Expected ROI = +9700%, +9400%, +9100% from them. End users saw
+    rows showing "1320.SR up 7000% — High Confidence — Accumulate"
+    in their live investment dashboard. This is a serious data
+    quality / integrity bug that put users at risk of acting on
+    completely fabricated data.
+
+- New behavior:
+    * Numeric fields → None (was synthetic numbers)
+    * recommendation → None (was "BUY"/"HOLD")
+    * risk_bucket → None (was "High Confidence"/"Moderate")
+    * data_provider → "PLACEHOLDER_NO_LIVE_DATA"
+    * data_quality → "NO_DATA"
+    * recommendation_reason → "No live data — placeholder row..."
+    * warnings → explicit operator-visible text
+    * Identity fields (symbol, name) preserved so the user can see
+      WHICH symbols failed.
+    * top10_rank preserved as ordering hint (it's a row index, not
+      a score-derived rank).
+
+- Aligned with the same fix in routes/advanced_analysis.py v4.1.0.
+    Both files now emit identical placeholder structure.
+
+- Migration impact:
+    * Sheets that currently show $101/$102/$103 fake prices for failed
+      Top10 rows will show blank cells after this deploys. This is
+      correct behavior — the previous values were never real.
+    * Any downstream code that read placeholder current_price as a
+      real number will now see None and must handle it. The Apps
+      Script side already supports null/blank cells (this is normal
+      for any quote that fails to fetch), so no Apps Script changes
+      are needed.
+    * Any module that relied on the placeholder having recommendation
+      = "BUY" was already a bug — recommendations should never have
+      been driven by placeholder fallback rows in the first place.
+
+- Insights page placeholder (`_build_insights_fallback_rows`) was
+    NOT touched. That page's "Fallback signal" rows are explicitly
+    labeled as fallback/insights summary content, not as live
+    instrument quotes — so those don't pose the same data quality risk.
+    Reviewed but left as-is.
 
 v7.0.1 Fixes (vs v7.0.0)
 ------------------------
@@ -71,7 +132,7 @@ from typing import (
 # Version
 # ---------------------------------------------------------------------------
 
-__version__ = "7.0.1"
+__version__ = "7.1.0"
 ADAPTER_VERSION = __version__
 
 # ---------------------------------------------------------------------------
@@ -3059,6 +3120,167 @@ async def _build_quote_fallback_rows(
     return rows, ("quote_batch_fallback" if rows else None)
 
 
+# =============================================================================
+# Placeholder constants and helpers (v7.1.0 — honest placeholders)
+# =============================================================================
+#
+# Placeholder rows are emitted by `_build_nonempty_failsoft_rows` when the
+# live engine and all upstream builders return no usable data. Such rows
+# preserve identity (so the sheet can show "we tried this symbol but got
+# nothing") but MUST NOT emit numbers that look like real prices/scores.
+#
+# These constants are intentionally aligned with
+# routes/advanced_analysis.py v4.1.0 so all placeholder rows in the
+# system are visually and structurally identical regardless of which
+# fallback path produced them.
+#
+# Downstream consumers (top10_selector, scoring engine, recommendation
+# engine) should call `_is_placeholder_row(row)` to skip placeholder
+# rows when computing recommendations or rankings.
+# =============================================================================
+
+PLACEHOLDER_DATA_PROVIDER = "PLACEHOLDER_NO_LIVE_DATA"
+PLACEHOLDER_DATA_QUALITY = "NO_DATA"
+PLACEHOLDER_RECOMMENDATION_REASON = (
+    "No live data — placeholder row, do not trust numeric fields."
+)
+PLACEHOLDER_SELECTION_REASON = (
+    "Upstream builders returned no usable rows; identity-only placeholder."
+)
+PLACEHOLDER_WARNING = (
+    "PLACEHOLDER ROW: live engine returned no data for this symbol. "
+    "Numeric fields are blank by design. Re-run refresh to retry."
+)
+
+
+def _is_placeholder_row(row: Mapping[str, Any]) -> bool:
+    """Return True if a row is a placeholder (no live data).
+
+    Used by downstream consumers to filter out placeholder rows before
+    computing recommendations or rankings. Placeholders should never
+    contribute to top10 selection, score-based ranking, or any decision
+    surface that affects user investment choices.
+    """
+    if not row:
+        return False
+    provider = row.get("data_provider")
+    if isinstance(provider, str) and provider.startswith("PLACEHOLDER_"):
+        return True
+    quality = row.get("data_quality")
+    if isinstance(quality, str) and quality.upper() in {"NO_DATA", "PLACEHOLDER"}:
+        return True
+    return False
+
+
+def _build_top10_placeholder_row(
+    sheet: str,
+    sym: str,
+    idx: int,
+) -> Dict[str, Any]:
+    """Build a single honest placeholder row for the Top10 page.
+
+    v7.1.0: this function MUST NOT return synthetic numbers for price,
+    score, or forecast fields. All numeric fields are None, and the
+    row is clearly tagged so downstream code can detect it.
+
+    Why: previous v7.0.1 returned current_price=100+idx (e.g. $101,
+    $102, $103) and overall_score=100-idx*3, which downstream Apps
+    Script multiplied by 100 to compute Expected ROI = +9700%, +9400%,
+    +9100%. End users saw these synthetic values as if they were real
+    investment recommendations. This was a critical data integrity bug.
+
+    The placeholder row's purpose is now strictly: tell the user we
+    tried this symbol and got nothing back. It should be visually
+    distinguishable from real rows in the sheet (mostly blank, with
+    a clear warning string).
+    """
+    normalized = normalize_symbol(sym)
+    now_iso = _utc_now_iso()
+    return {
+        # ---------------------------------------------------------
+        # Identity fields — populated so the user can see WHICH symbols failed
+        # ---------------------------------------------------------
+        "symbol": normalized,
+        "name": normalized,
+        "asset_class": "Equity",
+        "exchange": "Tadawul" if normalized.endswith(".SR") else "NASDAQ/NYSE",
+        "currency": "SAR" if normalized.endswith(".SR") else "USD",
+        "country": "Saudi Arabia" if normalized.endswith(".SR") else "Global",
+
+        # ---------------------------------------------------------
+        # Numeric fields — ALWAYS None on placeholders
+        # ---------------------------------------------------------
+        "current_price": None,
+        "previous_close": None,
+        "open_price": None,
+        "day_high": None,
+        "day_low": None,
+        "percent_change": None,
+        "price_change": None,
+        "volume": None,
+        "market_cap": None,
+
+        "forecast_price_1m": None,
+        "forecast_price_3m": None,
+        "forecast_price_12m": None,
+        "expected_roi_1m": None,
+        "expected_roi_3m": None,
+        "expected_roi_12m": None,
+        "intrinsic_value": None,
+
+        "overall_score": None,
+        "opportunity_score": None,
+        "forecast_confidence": None,
+        "confidence_score": None,
+        "value_score": None,
+        "quality_score": None,
+        "momentum_score": None,
+        "growth_score": None,
+        "valuation_score": None,
+        "risk_score": None,
+
+        "avg_cost": None,
+        "position_cost": None,
+        "position_value": None,
+        "position_qty": None,
+        "unrealized_pl": None,
+        "unrealized_pl_pct": None,
+
+        # ---------------------------------------------------------
+        # Recommendation labels — None on placeholders
+        # (a placeholder row showing recommendation="BUY" with
+        # confidence_bucket="High Confidence" was the most dangerous
+        # part of the v7.0.1 bug.)
+        # ---------------------------------------------------------
+        "recommendation": None,
+        "risk_bucket": None,
+        "confidence_bucket": None,
+
+        # ---------------------------------------------------------
+        # Diagnostic / provenance — clearly mark as placeholder
+        # ---------------------------------------------------------
+        "data_provider": PLACEHOLDER_DATA_PROVIDER,
+        "data_quality": PLACEHOLDER_DATA_QUALITY,
+        "recommendation_reason": PLACEHOLDER_RECOMMENDATION_REASON,
+        "selection_reason": PLACEHOLDER_SELECTION_REASON,
+        "warnings": PLACEHOLDER_WARNING,
+        "last_updated_utc": now_iso,
+        "last_updated_riyadh": now_iso,
+
+        # ---------------------------------------------------------
+        # Ordering / metadata
+        # ---------------------------------------------------------
+        "top10_rank": idx,
+        "rank_overall": idx,
+        "horizon_days": 90,
+        "invest_period_label": "3M",
+        "criteria_snapshot": _stdlib_json.dumps(
+            {"symbol": normalized, "row_index": idx, "source": "placeholder"},
+            ensure_ascii=False,
+        ),
+    }
+
+
 def _build_dictionary_fallback_rows(
     sheet: str,
     headers: Sequence[str],
@@ -3149,30 +3371,11 @@ def _build_nonempty_failsoft_rows(
         symbols = list(requested_symbols) or _DEFAULT_SHEET_SYMBOLS.get(sheet, [])
         rows = []
 
+        # v7.1.0: use the honest placeholder builder. NO MORE FAKE PRICES.
+        # See module docstring for the full explanation of why the
+        # previous synthetic-numbers behavior was a critical bug.
         for idx, sym in enumerate(symbols[:max(limit, top_n)], start=1):
-            rows.append({
-                "symbol": normalize_symbol(sym),
-                "name": f"{sheet} {normalize_symbol(sym)}",
-                "current_price": 100.0 + idx,
-                "recommendation": "BUY" if idx <= 3 else "HOLD",
-                "overall_score": max(1.0, 100.0 - idx * 3),
-                "opportunity_score": max(1.0, 100.0 - idx * 3),
-                "forecast_confidence": max(1.0, 100.0 - idx * 3),
-                "confidence_score": max(1.0, 100.0 - idx * 3),
-                "risk_bucket": "High Confidence" if idx <= 3 else "Moderate",
-                "avg_cost": 100.0 + idx,
-                "position_cost": 100.0 + idx,
-                "position_value": 100.0 + idx,
-                "unrealized_pl": 100.0 + idx,
-                "unrealized_pl_pct": 100.0 + idx,
-                "data_provider": "core.data_engine.placeholder_fallback",
-                "recommendation_reason": "Placeholder fallback because live engine returned no usable rows.",
-                "selection_reason": "Placeholder fallback because upstream builders returned no usable rows.",
-                "criteria_snapshot": _stdlib_json.dumps(
-                    {"symbol": normalize_symbol(sym), "row_index": idx, "source": "placeholder"},
-                    ensure_ascii=False,
-                ),
-            })
+            rows.append(_build_top10_placeholder_row(sheet=sheet, sym=sym, idx=idx))
 
         rows = _ensure_top10_rows(rows, requested_symbols=requested_symbols, top_n=top_n, schema_keys=keys, schema_headers=headers)
         return _slice_rows(rows, limit=limit, offset=offset)
