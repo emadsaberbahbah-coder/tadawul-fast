@@ -2,12 +2,56 @@
 # routes/advanced_analysis.py
 """
 ================================================================================
-Advanced Analysis Root Owner — v4.0.5
+Advanced Analysis Root Owner — v4.1.0
 ================================================================================
 ROOT SHEET-ROWS OWNER * ENGINE-FIRST * HARD-TIMEOUT * SCHEMA-FIRST
 DICTIONARY-FAST-PATH * TOP10/INSIGHTS-SKIP-ENGINE * ENRICHED-QUOTES-FAST-PATH
 FAIL-SOFT * STABLE ENVELOPE * JSON-SAFE * GET+POST MERGED
+HONEST-PLACEHOLDERS * NO-FAKE-PRICES * USER-VISIBLE-WARNINGS
 
+v4.1.0 changes (from v4.0.5)
+----------------------------
+- FIX [CRITICAL]: placeholder fallback rows no longer emit synthetic
+    numeric values that masquerade as real prices. The previous behavior
+    was to return current_price=100+row_index (e.g. $101, $102, $103...)
+    and percent_change=100-row_index*3 (e.g. +97%, +94%, +91%...) when
+    the engine failed to return live data. The Google Sheets layer
+    happily wrote those values, and downstream scoring computed
+    Expected ROI = +9700% from them. End users saw rows showing
+    "1320.SR up 7000%" with confidence scores attached. This was a
+    serious data-quality bug masquerading as a fail-soft feature.
+- The new behavior:
+    * Numeric fields (current_price, percent_change, forecast_price_*,
+      expected_roi_*, overall_score, confidence_score, etc.) all
+      return None instead of synthetic numbers.
+    * recommendation = None (was "Accumulate"/"Watch")
+    * recommendation_reason = "No live data — placeholder row, do not
+      trust numeric fields"
+    * data_provider = "PLACEHOLDER_NO_LIVE_DATA" (was
+      "advanced_analysis.placeholder_fallback")
+    * data_quality = "NO_DATA"
+    * warnings = explicit operator-visible string
+    * Identity fields (symbol, name, exchange, currency, country) are
+      still populated so the sheet can identify which symbols failed.
+- Added _is_placeholder_row(row) helper for downstream consumers
+    (top10 selector, scoring engine) to filter out placeholders cleanly.
+- Added PLACEHOLDER_DATA_PROVIDER constant for cross-module reference.
+- Three callers had identical fake-price logic; all three now use
+    _placeholder_value_for_key with the corrected return values.
+
+Migration impact:
+    * Sheets that currently show $101/$102/$103 fake prices will show
+      blank cells after this deploys. This is correct — the data was
+      never real.
+    * Downstream code that read placeholder current_price as if it
+      were real will now see None and must handle it. The recommendation
+      engine in routesinvestment_advisor.py and coreanalysistop10_selector.py
+      already check for None on these fields, so this should be safe.
+    * If any module was relying on placeholder rows having "Accumulate"
+      recommendations, that's a bug — placeholders should never have
+      driven recommendations in the first place.
+
+----------------------------
 v4.0.5 changes (from v4.0.4)
 ----------------------------
 - FIX [CRITICAL]: instrument pages (Market_Leaders, Global_Markets,
@@ -119,7 +163,7 @@ from fastapi import APIRouter, Body, Header, HTTPException, Query, Request, stat
 logger = logging.getLogger("routes.advanced_analysis")
 logger.addHandler(logging.NullHandler())
 
-ADVANCED_ANALYSIS_VERSION = "4.0.5"
+ADVANCED_ANALYSIS_VERSION = "4.1.0"
 router = APIRouter(tags=["schema", "root-sheet-rows"])
 
 _TOP10_PAGE = "Top_10_Investments"
@@ -972,14 +1016,136 @@ def _ensure_top10_rows(rows: Sequence[Mapping[str, Any]], *, requested_symbols: 
     return final_rows
 
 
+# =============================================================================
+# Placeholder constants and helpers (v4.1.0 — honest placeholders)
+# =============================================================================
+#
+# Placeholder rows are emitted ONLY when the live engine and all builders
+# return no usable data for a symbol. They preserve identity (so the sheet
+# can show "we tried this symbol but got nothing") but they MUST NOT emit
+# numbers that look like real prices/scores.
+#
+# Downstream consumers (top10_selector, scoring engine, recommendation
+# engine) should call _is_placeholder_row(row) to filter out placeholder
+# rows before computing recommendations.
+#
+# Cross-module reference: PLACEHOLDER_DATA_PROVIDER is also used in
+# coredata_engine.py and routesanalysis_sheet_rows.py for the same purpose.
+# =============================================================================
+
+PLACEHOLDER_DATA_PROVIDER = "PLACEHOLDER_NO_LIVE_DATA"
+PLACEHOLDER_DATA_QUALITY = "NO_DATA"
+PLACEHOLDER_RECOMMENDATION_REASON = (
+    "No live data — placeholder row, do not trust numeric fields."
+)
+PLACEHOLDER_SELECTION_REASON = (
+    "Upstream builders returned no usable rows; identity-only placeholder."
+)
+PLACEHOLDER_WARNING = (
+    "PLACEHOLDER ROW: live engine returned no data for this symbol. "
+    "Numeric fields are blank by design. Re-run refresh to retry."
+)
+
+# Numeric/scoring fields that MUST be None on placeholder rows.
+# Listed exhaustively so a future field addition doesn't accidentally
+# inherit the old fake-number behavior.
+_PLACEHOLDER_NUMERIC_NONE_KEYS = frozenset({
+    # Prices
+    "current_price", "previous_close", "open_price", "day_high", "day_low",
+    "week_52_high", "week_52_low", "price_change",
+    # Forecasts
+    "forecast_price_1m", "forecast_price_3m", "forecast_price_12m",
+    "intrinsic_value",
+    # Returns / momentum
+    "percent_change", "week_52_position_pct",
+    "expected_roi_1m", "expected_roi_3m", "expected_roi_12m",
+    # Volume
+    "volume", "avg_volume_10d", "avg_volume_30d",
+    # Market data
+    "market_cap", "float_shares", "beta",
+    # Fundamentals
+    "pe_ttm", "pe_forward", "eps_ttm", "dividend_yield", "payout_ratio",
+    "revenue_ttm", "revenue_growth_yoy",
+    "gross_margin", "operating_margin", "profit_margin",
+    "debt_to_equity", "free_cash_flow_ttm",
+    "pb_ratio", "ps_ratio", "ev_ebitda", "peg_ratio",
+    # Technicals
+    "rsi_14", "volatility_30d", "volatility_90d",
+    "max_drawdown_1y", "var_95_1d", "sharpe_1y",
+    # Scoring
+    "risk_score", "valuation_score",
+    "forecast_confidence", "confidence_score",
+    "value_score", "quality_score", "momentum_score", "growth_score",
+    "overall_score", "opportunity_score",
+    # Position
+    "position_qty", "avg_cost", "position_cost", "position_value",
+    "unrealized_pl", "unrealized_pl_pct",
+})
+
+# String/categorical fields that MUST be None on placeholder rows
+# (recommendation labels, buckets — leaving these populated would
+# tell the user "we have a recommendation" when we don't).
+_PLACEHOLDER_LABEL_NONE_KEYS = frozenset({
+    "recommendation", "risk_bucket", "confidence_bucket",
+})
+
+
+def _is_placeholder_row(row: Mapping[str, Any]) -> bool:
+    """Return True if a row is a placeholder (no live data).
+
+    Used by downstream consumers to filter out placeholder rows before
+    computing recommendations or rankings. Placeholders should never
+    contribute to top10 selection, score-based ranking, or any decision
+    surface that affects user investment choices.
+    """
+    if not row:
+        return False
+    provider = row.get("data_provider")
+    if isinstance(provider, str) and provider.startswith("PLACEHOLDER_"):
+        return True
+    quality = row.get("data_quality")
+    if isinstance(quality, str) and quality.upper() in {"NO_DATA", "PLACEHOLDER"}:
+        return True
+    return False
+
+
 def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int) -> Any:
+    """Return a value for a placeholder row's column.
+
+    v4.1.0: this function MUST NOT return synthetic numbers for price,
+    score, or forecast fields. Return None for those, and let only
+    identity / classification fields be populated.
+
+    Why: previous v4.0.5 returned current_price=100+row_index (e.g. $101,
+    $102, $103) and percent_change=100-row_index*3 (e.g. +97%, +94%).
+    The Google Sheets layer happily wrote those numbers, and downstream
+    Apps Script computed Expected ROI = +9700% from them. End users saw
+    real-looking rows with absurd numbers. This was a serious data
+    integrity bug masquerading as fail-soft behavior.
+
+    The placeholder row's purpose is now strictly "tell the user we
+    tried this symbol and got nothing back." It should be visually
+    distinguishable from real rows in the sheet (mostly blank, with
+    a clear warning string).
+    """
     kk = _normalize_key_name(key)
+
+    # ----------------------------------------------------------------
+    # Identity fields — populated so the user can see WHICH symbols failed
+    # ----------------------------------------------------------------
     if kk in {"symbol", "ticker"}:
         return symbol
     if kk == "name":
-        return f"{page} {symbol}"
+        # Generic placeholder name; do not invent a company name
+        return symbol
     if kk == "asset_class":
-        return "Commodity" if symbol.endswith("=F") else "FX" if symbol.endswith("=X") else "Fund" if page == "Mutual_Funds" else "Equity"
+        if symbol.endswith("=F"):
+            return "Commodity"
+        if symbol.endswith("=X"):
+            return "FX"
+        if page == "Mutual_Funds":
+            return "Fund"
+        return "Equity"
     if kk == "exchange":
         if symbol.endswith(".SR"):
             return "Tadawul"
@@ -992,36 +1158,65 @@ def _placeholder_value_for_key(page: str, key: str, symbol: str, row_index: int)
         return "SAR" if symbol.endswith(".SR") else "USD"
     if kk == "country":
         return "Saudi Arabia" if symbol.endswith(".SR") else "Global"
+
+    # ----------------------------------------------------------------
+    # Provenance / diagnostic fields — clearly mark this row as a placeholder
+    # ----------------------------------------------------------------
     if kk == "data_provider":
-        return "advanced_analysis.placeholder_fallback"
+        return PLACEHOLDER_DATA_PROVIDER
+    if kk == "data_quality":
+        return PLACEHOLDER_DATA_QUALITY
     if kk in {"last_updated_utc", "last_updated_riyadh"}:
         return datetime.utcnow().isoformat()
-    if kk == "recommendation":
-        return "Watch" if row_index > 3 else "Accumulate"
     if kk == "recommendation_reason":
-        return "Placeholder fallback because live engine returned no usable rows."
-    if kk in {"top10_rank", "rank_overall"}:
-        return row_index
+        return PLACEHOLDER_RECOMMENDATION_REASON
     if kk == "selection_reason":
-        return "Placeholder fallback because upstream builders returned no usable rows."
-    if kk == "criteria_snapshot":
-        return json.dumps({"symbol": symbol, "row_index": row_index, "source": "placeholder"}, ensure_ascii=False)
+        return PLACEHOLDER_SELECTION_REASON
     if kk in {"warnings", "notes"}:
-        return "placeholder"
-    if kk in {"current_price", "previous_close", "open_price", "day_high", "day_low", "forecast_price_1m", "forecast_price_3m", "forecast_price_12m", "avg_cost", "position_cost", "position_value", "unrealized_pl", "intrinsic_value"}:
-        base = 100.0 + float(row_index)
-        return round(base, 2)
-    if kk in {"percent_change", "expected_roi_1m", "expected_roi_3m", "expected_roi_12m", "forecast_confidence", "confidence_score", "overall_score", "opportunity_score"}:
-        return round(max(1.0, 100.0 - float(row_index * 3)), 2)
-    if kk in {"risk_bucket", "confidence_bucket"}:
-        return "Moderate" if row_index > 3 else "High Confidence"
+        return PLACEHOLDER_WARNING
+    if kk == "criteria_snapshot":
+        return json.dumps(
+            {"symbol": symbol, "row_index": row_index, "source": "placeholder"},
+            ensure_ascii=False,
+        )
+    if kk in {"top10_rank", "rank_overall"}:
+        # Ranking is preserved so the sheet ordering stays stable; this is
+        # a row index, not a score-derived rank.
+        return row_index
+
+    # ----------------------------------------------------------------
+    # Numeric fields — ALWAYS None on placeholders. Do not emit fake numbers.
+    # ----------------------------------------------------------------
+    if kk in _PLACEHOLDER_NUMERIC_NONE_KEYS:
+        return None
+
+    # ----------------------------------------------------------------
+    # Recommendation labels and buckets — None on placeholders.
+    # A placeholder row showing recommendation="Accumulate" with
+    # confidence_bucket="High Confidence" was the most dangerous part
+    # of the v4.0.5 bug. Users would act on these as if they were real.
+    # ----------------------------------------------------------------
+    if kk in _PLACEHOLDER_LABEL_NONE_KEYS:
+        return None
+
+    # ----------------------------------------------------------------
+    # Period / horizon are categorical and safe to leave at default
+    # ----------------------------------------------------------------
     if kk == "invest_period_label":
         return "3M"
     if kk == "horizon_days":
         return 90
+
     return None
 
+
 def _build_placeholder_rows(*, page: str, keys: Sequence[str], requested_symbols: Sequence[str], limit: int, offset: int) -> List[Dict[str, Any]]:
+    """Build placeholder rows for symbols that the live engine couldn't fetch.
+
+    v4.1.0: placeholder rows are now identity-only. Numeric fields are
+    None, recommendation is None, and a clear warning is set so users
+    can see in the sheet that these rows have no live data.
+    """
     symbols = [_normalize_symbol_token(x) for x in requested_symbols if _normalize_symbol_token(x)]
     if not symbols:
         symbols = [_normalize_symbol_token(x) for x in EMERGENCY_PAGE_SYMBOLS.get(page, []) if _normalize_symbol_token(x)]
@@ -1029,11 +1224,22 @@ def _build_placeholder_rows(*, page: str, keys: Sequence[str], requested_symbols
     rows: List[Dict[str, Any]] = []
     for idx, sym in enumerate(symbols, start=offset + 1):
         row = {str(k): _placeholder_value_for_key(page, str(k), sym, idx) for k in keys}
+        # Belt-and-suspenders: enforce critical placeholder semantics even if
+        # the schema's keys list is missing one of these (e.g. due to schema
+        # drift between deploys). These setdefault calls only write if the
+        # key was already in `row` and is None — they never overwrite real
+        # values from a real engine response.
+        if "data_provider" in row and not row.get("data_provider"):
+            row["data_provider"] = PLACEHOLDER_DATA_PROVIDER
+        if "data_quality" in row and not row.get("data_quality"):
+            row["data_quality"] = PLACEHOLDER_DATA_QUALITY
+        if "warnings" in row and not row.get("warnings"):
+            row["warnings"] = PLACEHOLDER_WARNING
         rows.append(row)
     if page == _TOP10_PAGE:
         for idx, row in enumerate(rows, start=offset + 1):
             row["top10_rank"] = idx
-            row.setdefault("selection_reason", "Placeholder fallback because upstream builders returned no usable rows.")
+            row.setdefault("selection_reason", PLACEHOLDER_SELECTION_REASON)
             row.setdefault("criteria_snapshot", "{}")
     return rows
 
@@ -1916,4 +2122,15 @@ async def root_sheet_rows_post(
 ) -> Dict[str, Any]:
     return await _run_advanced_sheet_rows_impl(request=request, body=body, mode=mode, include_matrix_q=include_matrix_q, token=token, x_app_token=x_app_token, x_api_key=x_api_key, authorization=authorization, x_request_id=x_request_id)
 
-__all__ = ["router", "ADVANCED_ANALYSIS_VERSION", "_run_advanced_sheet_rows_impl"]
+__all__ = [
+    "router",
+    "ADVANCED_ANALYSIS_VERSION",
+    "_run_advanced_sheet_rows_impl",
+    # v4.1.0: placeholder constants and helper for cross-module reference
+    "PLACEHOLDER_DATA_PROVIDER",
+    "PLACEHOLDER_DATA_QUALITY",
+    "PLACEHOLDER_RECOMMENDATION_REASON",
+    "PLACEHOLDER_SELECTION_REASON",
+    "PLACEHOLDER_WARNING",
+    "_is_placeholder_row",
+]
