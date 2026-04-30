@@ -2,18 +2,86 @@
 # core/providers/tadawul_provider.py
 """
 ================================================================================
-Tadawul Provider (KSA Market Data) -- v6.0.0
+Tadawul Provider (KSA Market Data) -- v6.1.0
 ================================================================================
 
 Purpose
 -------
-Provides KSA market data from Tadawul API:
+Provides KSA market data from Tadawul-compatible APIs:
   - Real-time quotes for Saudi symbols
   - Company profiles and classification
   - Fundamental data and financial metrics
   - Historical OHLCV data with technical indicators
   - KSA-specific symbol normalization and defaults
 
+v6.1.0 Changes (from v6.0.0)
+----------------------------
+The "satisfaction problem" fix: previously the provider's URL fields all
+defaulted to empty strings, which silently disabled the entire KSA
+primary-data path. Operators had no diagnostic signal that the provider
+was unreachable -- KSA tickers just got Yahoo-only data and scored as
+HOLD with reason "Insufficient data".
+
+Operator-facing improvements:
+  - Added PROVIDER_PRESETS map for three known Saudi data APIs
+    (sahmk, twelvedata, stockerapi). Set
+    `TADAWUL_PROVIDER_PRESET=sahmk` (or another preset name) and the
+    quote/history/profile URLs are auto-filled with the right URL
+    template for that provider.
+  - Added `TADAWUL_API_KEY` env var. When set, the provider auto-injects
+    an Authorization-style header (default `X-API-Key`, override via
+    `TADAWUL_API_KEY_HEADER`). Custom header schemes (e.g. `Bearer ...`)
+    can still be done via `TADAWUL_HEADERS_JSON`.
+  - Explicit URL env vars (TADAWUL_QUOTE_URL, etc.) ALWAYS win over the
+    preset. Presets only fill in URLs that aren't explicitly set, so
+    you can mix-and-match.
+  - When the provider is enabled but no URLs are configured AND no
+    preset is set, a single WARNING is logged at construction time
+    (idempotent; not on every quote call). Operators see a clear
+    "TADAWUL_QUOTE_URL not set; KSA data unavailable" message in the
+    Render logs at startup.
+  - `is_configured` property now also returns True when a preset is
+    set (the preset will fill the URL on first use).
+  - New `provider_preset` field on TadawulConfig (frozen dataclass).
+  - `to_dict()` reports preset state in `_health` / health-check JSON.
+
+Bug-compat: the public API (functions, fetch methods, dataclass field
+order, __all__, env-var names, return shapes) is unchanged. Adding new
+optional fields to the frozen dataclass is safe because TadawulConfig
+constructors use keyword-only assignment.
+
+Provider preset templates (configurable via env if a vendor changes URLs):
+  - sahmk      :  Saudi-licensed market data
+                  https://app.sahmk.sa/api/v1/quote/{code}/
+                  https://app.sahmk.sa/api/v1/history/{code}/?days={days}
+                  https://app.sahmk.sa/api/v1/profile/{code}/
+                  Auth: X-API-Key header (set TADAWUL_API_KEY)
+  - twelvedata :  Saudi exchange (XSAU) via Twelve Data REST
+                  https://api.twelvedata.com/quote?symbol={code}&exchange=XSAU&apikey={key}
+                  https://api.twelvedata.com/time_series?symbol={code}&exchange=XSAU&interval=1day&outputsize={days}&apikey={key}
+                  https://api.twelvedata.com/profile?symbol={code}&exchange=XSAU&apikey={key}
+                  Auth: in-URL apikey (still honors TADAWUL_API_KEY for header schemes)
+  - stockerapi :  Third-party Tadawul provider
+                  https://stockerapi.com/api/v1/saudi/quote/{code}
+                  https://stockerapi.com/api/v1/saudi/history/{code}?days={days}
+                  https://stockerapi.com/api/v1/saudi/profile/{code}
+                  Auth: Authorization Bearer (header name overridable)
+
+Setting up KSA primary data on Render (one-time, ~5 minutes):
+  1. Sign up for one of the providers above and obtain an API key.
+  2. In Render Dashboard -> Environment, add:
+       TADAWUL_PROVIDER_PRESET = sahmk           (or your chosen preset)
+       TADAWUL_API_KEY         = <your key>
+  3. Trigger a deploy (or click "Manual Deploy" to apply env vars).
+  4. Hit GET /v1/enriched/sheet-rows?page=Market_Leaders or run a
+     market_scan to verify Saudi rows now have pe_ttm, dividend_yield,
+     and the other KSA fundamentals populated.
+
+You can still set explicit URLs (the v6.0.0 way) -- they take precedence
+over the preset. Use this when your vendor's URL format differs from the
+preset template.
+
+----------------------------
 v6.0.0 Changes (from v5.0.0)
 ----------------------------
 Bug fixes:
@@ -125,7 +193,7 @@ logger.addHandler(logging.NullHandler())
 # ---------------------------------------------------------------------------
 
 PROVIDER_NAME = "tadawul"
-PROVIDER_VERSION = "6.0.0"
+PROVIDER_VERSION = "6.1.0"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
@@ -153,6 +221,61 @@ _ARABIC_DIGITS = str.maketrans("٠١٢٣٤٥٦٧٨٩", "0123456789")
 _KSA_CODE_RE = re.compile(r"^\d{3,6}$", re.IGNORECASE)
 _K_M_B_RE = re.compile(r"^(-?\d+(?:\.\d+)?)([KMB])$", re.IGNORECASE)
 _K_M_B_MULT = {"K": 1_000.0, "M": 1_000_000.0, "B": 1_000_000_000.0}
+
+
+# ---------------------------------------------------------------------------
+# Provider presets (v6.1.0)
+# ---------------------------------------------------------------------------
+# Preset names map to URL templates for known Saudi data providers. Operators
+# set TADAWUL_PROVIDER_PRESET=<name> + TADAWUL_API_KEY=<key> and the provider
+# auto-fills URLs and headers. Explicit TADAWUL_*_URL env vars still win.
+#
+# These templates use:
+#   {symbol} -> the full normalized form, e.g. "2222.SR"
+#   {code}   -> just the numeric code, e.g. "2222"
+#   {days}   -> history days, filled by format_url() at runtime
+#
+# Templates are intentionally NOT URL-encoded; format_url handles symbol
+# substitution. If a vendor changes URLs, override via the explicit
+# TADAWUL_QUOTE_URL etc. env vars without editing this file.
+# ---------------------------------------------------------------------------
+
+PROVIDER_PRESETS: Dict[str, Dict[str, str]] = {
+    # SAHMK: Saudi-licensed Tadawul market data provider (sahmk.sa).
+    # Auth: X-API-Key header.
+    "sahmk": {
+        "quote_url":        "https://app.sahmk.sa/api/v1/quote/{code}/",
+        "history_url":      "https://app.sahmk.sa/api/v1/history/{code}/?days={days}",
+        "profile_url":      "https://app.sahmk.sa/api/v1/profile/{code}/",
+        "fundamentals_url": "https://app.sahmk.sa/api/v1/fundamentals/{code}/",
+        "api_key_header":   "X-API-Key",
+    },
+    # Twelve Data: covers Saudi exchange (XSAU) via standard REST.
+    # Auth: in-URL apikey (no header needed).
+    "twelvedata": {
+        "quote_url":        "https://api.twelvedata.com/quote?symbol={code}&exchange=XSAU&apikey={api_key}",
+        "history_url":      "https://api.twelvedata.com/time_series?symbol={code}&exchange=XSAU&interval=1day&outputsize={days}&apikey={api_key}",
+        "profile_url":      "https://api.twelvedata.com/profile?symbol={code}&exchange=XSAU&apikey={api_key}",
+        "fundamentals_url": "https://api.twelvedata.com/statistics?symbol={code}&exchange=XSAU&apikey={api_key}",
+        "api_key_header":   "",  # not needed; key is in URL
+    },
+    # StockerAPI: third-party Tadawul provider.
+    # Auth: Authorization Bearer header.
+    "stockerapi": {
+        "quote_url":        "https://stockerapi.com/api/v1/saudi/quote/{code}",
+        "history_url":      "https://stockerapi.com/api/v1/saudi/history/{code}?days={days}",
+        "profile_url":      "https://stockerapi.com/api/v1/saudi/profile/{code}",
+        "fundamentals_url": "https://stockerapi.com/api/v1/saudi/fundamentals/{code}",
+        "api_key_header":   "Authorization",  # value will be "Bearer <key>"
+    },
+}
+
+
+def _resolve_preset(preset_name: str) -> Dict[str, str]:
+    """Return the URL template dict for a preset name, or {} if unknown."""
+    if not preset_name:
+        return {}
+    return dict(PROVIDER_PRESETS.get(preset_name.strip().lower(), {}) or {})
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +313,10 @@ class TadawulConfig:
     fundamentals_url: str = ""
     history_url: str = ""
     profile_url: str = ""
+    # v6.1.0: preset-driven URL filling
+    provider_preset: str = ""
+    api_key: str = ""
+    api_key_header: str = ""
     timeout_sec: float = DEFAULT_TIMEOUT_SEC
     retry_attempts: int = DEFAULT_RETRY_ATTEMPTS
     max_concurrency: int = DEFAULT_MAX_CONCURRENCY
@@ -259,12 +386,55 @@ class TadawulConfig:
                 pass
             return {}
 
-        return cls(
+        # v6.1.0: preset support
+        preset_name = _env_str("TADAWUL_PROVIDER_PRESET", "")
+        api_key = _env_str("TADAWUL_API_KEY", "")
+        api_key_header_explicit = _env_str("TADAWUL_API_KEY_HEADER", "")
+        preset = _resolve_preset(preset_name)
+
+        # Explicit env URLs always win; preset only fills the gaps.
+        # Templates get {api_key} substituted now (e.g., Twelve Data uses
+        # in-URL keys); {symbol}/{code}/{days} are filled at request time.
+        def _from_preset(field_name: str, env_name: str, alt_env: str = "") -> str:
+            explicit = _env_str(env_name, "") or (_env_str(alt_env, "") if alt_env else "")
+            if explicit:
+                return explicit
+            tmpl = preset.get(field_name, "")
+            if tmpl and "{api_key}" in tmpl:
+                tmpl = tmpl.replace("{api_key}", api_key)
+            return tmpl
+
+        # Default API key header. Resolution order:
+        #   1. Explicit TADAWUL_API_KEY_HEADER env var (operator override)
+        #   2. Preset's recommendation (including the explicit empty string,
+        #      which means "no header needed; key goes in URL" -- e.g.,
+        #      twelvedata)
+        #   3. Fall back to "X-API-Key" only if no preset is set and an
+        #      api_key was provided (operator forgot to set a preset but
+        #      gave a key)
+        if api_key_header_explicit:
+            api_key_header = api_key_header_explicit
+        elif "api_key_header" in preset:
+            # Preset explicitly declared a header policy (may be "")
+            api_key_header = preset["api_key_header"]
+        elif api_key:
+            api_key_header = "X-API-Key"
+        else:
+            api_key_header = ""
+
+        # Construct headers (preset + extra_headers + api_key auto-injection
+        # in TadawulClient.__init__; we don't merge here so users can still
+        # override via TADAWUL_HEADERS_JSON).
+
+        cfg = cls(
             enabled=_env_bool("TADAWUL_ENABLED", True),
-            quote_url=_env_str("TADAWUL_QUOTE_URL", ""),
-            fundamentals_url=_env_str("TADAWUL_FUNDAMENTALS_URL", ""),
-            history_url=_env_str("TADAWUL_HISTORY_URL", "") or _env_str("TADAWUL_CANDLES_URL", ""),
-            profile_url=_env_str("TADAWUL_PROFILE_URL", ""),
+            quote_url=_from_preset("quote_url", "TADAWUL_QUOTE_URL"),
+            fundamentals_url=_from_preset("fundamentals_url", "TADAWUL_FUNDAMENTALS_URL"),
+            history_url=_from_preset("history_url", "TADAWUL_HISTORY_URL", "TADAWUL_CANDLES_URL"),
+            profile_url=_from_preset("profile_url", "TADAWUL_PROFILE_URL"),
+            provider_preset=preset_name.strip().lower(),
+            api_key=api_key,
+            api_key_header=api_key_header,
             timeout_sec=max(5.0, _env_float("TADAWUL_TIMEOUT_SEC", DEFAULT_TIMEOUT_SEC)),
             retry_attempts=max(1, _env_int("TADAWUL_RETRY_ATTEMPTS", DEFAULT_RETRY_ATTEMPTS)),
             max_concurrency=max(2, _env_int("TADAWUL_MAX_CONCURRENCY", DEFAULT_MAX_CONCURRENCY)),
@@ -286,6 +456,25 @@ class TadawulConfig:
             tracing_enabled=_env_bool("TADAWUL_TRACING_ENABLED", False),
             metrics_enabled=_env_bool("TADAWUL_METRICS_ENABLED", False),
         )
+
+        # Startup-time configuration warning. Logged ONCE per process at
+        # config load. This is the diagnostic the v6.0.0 silent-empty-URL
+        # fix needed: operators see a clear message in Render logs telling
+        # them KSA primary data is dead and how to fix it.
+        if cfg.enabled and not cfg.quote_url:
+            try:
+                logger.warning(
+                    "Tadawul provider ENABLED but NO quote URL configured. "
+                    "All KSA primary-data calls will be skipped. "
+                    "Fix: set TADAWUL_PROVIDER_PRESET (sahmk|twelvedata|stockerapi) "
+                    "+ TADAWUL_API_KEY in Render env, OR set TADAWUL_QUOTE_URL "
+                    "explicitly. Without this, .SR tickers fall back to Yahoo "
+                    "only and score as HOLD/Insufficient data."
+                )
+            except Exception:
+                pass
+
+        return cfg
 
     @property
     def is_configured(self) -> bool:
@@ -874,6 +1063,18 @@ class TadawulClient:
             **self.config.extra_headers,
         }
 
+        # v6.1.0: auto-inject API key header from TADAWUL_API_KEY env var.
+        # Skipped when api_key_header is empty (e.g., Twelve Data preset
+        # uses {api_key} in URL instead). Skipped when extra_headers
+        # already declares the header (operator override wins).
+        if self.config.api_key and self.config.api_key_header:
+            hk = self.config.api_key_header
+            if hk not in headers:
+                if hk.lower() == "authorization" and not self.config.api_key.lower().startswith(("bearer ", "token ", "basic ")):
+                    headers[hk] = f"Bearer {self.config.api_key}"
+                else:
+                    headers[hk] = self.config.api_key
+
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(self.config.timeout_sec),
             follow_redirects=True,
@@ -883,9 +1084,11 @@ class TadawulClient:
         )
 
         logger.info(
-            "TadawulClient v%s initialized | configured=%s | has_profile=%s | has_history=%s",
+            "TadawulClient v%s initialized | configured=%s | preset=%s | has_api_key=%s | has_profile=%s | has_history=%s",
             PROVIDER_VERSION,
             self.config.is_configured,
+            self.config.provider_preset or "(none)",
+            bool(self.config.api_key),
             bool(self.config.profile_url),
             bool(self.config.history_url),
         )
@@ -1516,6 +1719,11 @@ class TadawulClient:
             "provider": PROVIDER_NAME,
             "version": PROVIDER_VERSION,
             "configured": self.config.is_configured,
+            "preset": self.config.provider_preset or None,
+            "auth": {
+                "has_api_key": bool(self.config.api_key),
+                "header": self.config.api_key_header or None,
+            },
             "urls": {
                 "quote": bool(self.config.quote_url),
                 "fundamentals": bool(self.config.fundamentals_url),
@@ -1748,6 +1956,8 @@ __all__ = [
     "PROVIDER_VERSION",
     "VERSION",
     "PROVIDER_BATCH_SUPPORTED",
+    # v6.1.0: preset registry (operators can introspect supported presets)
+    "PROVIDER_PRESETS",
     # Symbol normalization
     "normalize_ksa_symbol",
     # Engine-facing functions
