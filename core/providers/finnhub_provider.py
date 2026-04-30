@@ -2,7 +2,7 @@
 """
 core/providers/finnhub_provider.py
 ================================================================================
-Finnhub Provider -- v6.0.0 (SCHEMA-ALIGNED / BATCH-CAPABLE / FULLY TYPED)
+Finnhub Provider -- v6.1.0 (SCHEMA-ALIGNED / BATCH-CAPABLE / FULLY TYPED)
 ================================================================================
 
 Purpose
@@ -13,6 +13,30 @@ Provides financial market data from Finnhub API:
   - Historical OHLCV data with technical indicators
   - Financial metrics and ratios
 
+v6.1.0 Changes (from v6.0.0)
+----------------------------
+KSA override flag (parity with EODHD / TADAWUL providers):
+  - `should_block_ksa()` now honors the FINNHUB_ALLOW_KSA env override.
+    v6.0.0 was a hard block: any .SR ticker returned `data_quality:
+    BLOCKED` with no escape hatch. If/when Finnhub adds Tadawul
+    coverage (or a regional reseller starts proxying through Finnhub),
+    operators can flip `FINNHUB_ALLOW_KSA=true` without editing source.
+  - Symmetry env var `FINNHUB_KSA_DISALLOW` (default True) lets
+    operators express the same intent positively. Default behavior is
+    unchanged: KSA tickers are still blocked unless an override is set.
+  - The new flags are read at config-load time and stored on
+    FinnhubConfig as `ksa_disallowed_by_default` and `ksa_override_allow`,
+    so should_block_ksa() doesn't re-read os.environ on every call.
+  - `is_available_for_ksa` property added for engine-side introspection
+    (lets the provider router log a clear "finnhub_ksa_allowed" tag in
+    debug output rather than guessing from the block return).
+
+Bug-compat: the public API (functions, fetch methods, dataclass field
+order, __all__, env-var names, return shapes, exception classes) is
+unchanged. Two new optional fields appended to FinnhubConfig with safe
+defaults that preserve v6.0.0 behavior exactly.
+
+----------------------------
 v6.0.0 Changes (from v5.0.0)
 ----------------------------
 Bug fixes:
@@ -80,12 +104,12 @@ logger.addHandler(logging.NullHandler())
 # ---------------------------------------------------------------------------
 
 PROVIDER_NAME = "finnhub"
-PROVIDER_VERSION = "6.0.0"
+PROVIDER_VERSION = "6.1.0"
 VERSION = PROVIDER_VERSION
 PROVIDER_BATCH_SUPPORTED = True
 
 DEFAULT_BASE_URL = "https://finnhub.io/api/v1"
-DEFAULT_USER_AGENT = "TFB-Finnhub/6.0.0"
+DEFAULT_USER_AGENT = "TFB-Finnhub/6.1.0"
 
 _TRUTHY = {"1", "true", "yes", "y", "on", "t", "enabled", "enable"}
 _FALSY = {"0", "false", "no", "n", "off", "f", "disabled", "disable"}
@@ -148,6 +172,11 @@ class FinnhubConfig:
     enable_history: bool = True
     fundamentals_enabled: bool = True
     user_agent: str = DEFAULT_USER_AGENT
+    # v6.1.0: KSA override flags (parity with EODHD provider).
+    # Defaults preserve v6.0.0 behavior exactly: KSA tickers blocked.
+    # Set FINNHUB_ALLOW_KSA=true to override.
+    ksa_disallowed_by_default: bool = True
+    ksa_override_allow: bool = False
 
     @classmethod
     def from_env(cls) -> "FinnhubConfig":
@@ -197,6 +226,17 @@ class FinnhubConfig:
 
         fundamentals_enabled = _env_bool("FUNDAMENTALS_ENABLED", True)
 
+        # v6.1.0: KSA override flags. Default behavior unchanged (block).
+        # FINNHUB_KSA_DISALLOW=true (default) means: by default, KSA is blocked.
+        # FINNHUB_ALLOW_KSA=true (default false) overrides the block when set.
+        # Aliased ALLOW_FINNHUB_KSA also accepted for parity with EODHD's
+        # ALLOW_EODHD_KSA / EODHD_ALLOW_KSA dual-name pattern.
+        ksa_disallowed_by_default = _env_bool("FINNHUB_KSA_DISALLOW", True)
+        ksa_override_allow = (
+            _env_bool("FINNHUB_ALLOW_KSA", False)
+            or _env_bool("ALLOW_FINNHUB_KSA", False)
+        )
+
         return cls(
             api_key=api_key,
             base_url=_env_str("FINNHUB_BASE_URL", DEFAULT_BASE_URL).rstrip("/"),
@@ -221,6 +261,8 @@ class FinnhubConfig:
             enable_history=_env_bool("FINNHUB_ENABLE_HISTORY", True),
             fundamentals_enabled=fundamentals_enabled,
             user_agent=_env_str("FINNHUB_USER_AGENT", DEFAULT_USER_AGENT),
+            ksa_disallowed_by_default=ksa_disallowed_by_default,
+            ksa_override_allow=ksa_override_allow,
         )
 
     @property
@@ -228,9 +270,40 @@ class FinnhubConfig:
         """Return True if the provider is enabled and has an API key."""
         return self.enabled and bool(self.api_key)
 
+    @property
+    def is_available_for_ksa(self) -> bool:
+        """
+        Return True if the provider is currently configured to attempt KSA
+        symbols. Used by the engine-side provider router for diagnostic
+        logging (so the chain shows finnhub_ksa_allowed=True/False rather
+        than just 'finnhub returned BLOCKED' for every Saudi ticker).
+        """
+        if not self.is_available:
+            return False
+        # Override always wins
+        if self.ksa_override_allow:
+            return True
+        # Default: blocked-by-default => not available for KSA
+        return not self.ksa_disallowed_by_default
+
     def should_block_ksa(self, symbol: str) -> bool:
-        """Return True if this is a KSA symbol (Finnhub does not cover Tadawul)."""
-        return looks_like_ksa(symbol)
+        """
+        Return True if this is a KSA symbol AND no override is set.
+
+        v6.1.0: previously this was a hard block (any .SR returned True).
+        Now operators can flip FINNHUB_ALLOW_KSA=true (or
+        ALLOW_FINNHUB_KSA=true, or set FINNHUB_KSA_DISALLOW=false) to
+        let Finnhub attempt KSA tickers. Default behavior is unchanged
+        because Finnhub does not currently cover Tadawul.
+        """
+        if not looks_like_ksa(symbol):
+            return False
+        # Symbol IS KSA. Block unless overridden.
+        if self.ksa_override_allow:
+            return False
+        if not self.ksa_disallowed_by_default:
+            return False
+        return True
 
     def should_block_special(self, symbol: str) -> bool:
         """Return True if this is a special symbol (index/forex/crypto)."""
